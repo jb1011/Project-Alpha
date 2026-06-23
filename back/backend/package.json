@@ -1,0 +1,50 @@
+{
+  "name": "agent-legal-body-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.2"
+  },
+  "bin": {
+    "legalbody": "src/cli/index.ts"
+  },
+  "scripts": {
+    "gen:abis": "tsx scripts/gen-abis.mts",
+    "cli": "tsx src/cli/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "authority": "tsx src/payments/main.ts",
+    "onboarding": "tsx src/onboarding/main.ts",
+    "passkey:capture": "esbuild tools/passkey-capture/capture.entry.ts --bundle --format=esm --platform=browser --outfile=tools/passkey-capture/capture.js && tsx tools/passkey-capture/main.ts",
+    "api": "tsx src/api/main.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.105.0",
+    "@circle-fin/x402-batching": "^3.1.2",
+    "@hono/node-server": "^2.0.5",
+    "@turnkey/sdk-server": "^6.1.1",
+    "@turnkey/viem": "^0.14.31",
+    "@x402/evm": "^2.15.0",
+    "better-sqlite3": "^11.3.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "hono": "^4.12.25",
+    "viem": "^2.21.0",
+    "x402": "^1.2.0",
+    "x402-fetch": "^1.2.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

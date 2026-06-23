@@ -1,0 +1,31 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*-recovery-file.json
+*-secret*
+**/secrets/
+# Allow the secrets-seam source module (no real secrets, just interface + env wrapper)
+!backend/src/secrets/
+
+# Dependencies / build
+node_modules/
+dist/
+build/
+out/
+cache/
+artifacts/
+broadcast/
+
+# Foundry
+forge-cache/
+lib/
+
+# Local Claude settings
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+*.log
+lcov.info

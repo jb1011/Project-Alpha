@@ -1,0 +1,20 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.24"
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 200
+# via_ir required: LegalManagerFactory.createEntity (9 params + 3 returns) overflows the legacy
+# stack. This enables the IR pipeline project-wide. evm_version stays "paris" (no PUSH0) so Arc
+# compatibility is preserved. NOTE: before mainnet, re-review the audited contracts at the
+# bytecode level under IR (sources unchanged; codegen differs from the pre-IR test runs).
+via_ir = true
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+]
+
+[rpc_endpoints]
+arc_testnet = "${ARC_TESTNET_RPC_URL}"

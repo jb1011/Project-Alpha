@@ -1,0 +1,22 @@
+{
+  "name": "Acme Research Agent",
+  "jurisdiction": "Wyoming-DAO-LLC",
+  "roles": {
+    "manager": "0x0000000000000000000000000000000000000001",
+    "guardian": "0x0000000000000000000000000000000000000002"
+  },
+  "treasury": {
+    "payoutAddress": "0x0000000000000000000000000000000000000003",
+    "spendingCapUsdc": "1000.00",
+    "spendingPeriod": "30d",
+    "allowlistEnabled": false
+  },
+  "governance": { "amendmentDelay": "24h" },
+  "legal": { "formationDate": "2026-06-10" },
+  "metadata": {
+    "description": "Autonomous research agent",
+    "agentType": "service",
+    "capabilities": ["research", "summarization"],
+    "version": "1"
+  }
+}

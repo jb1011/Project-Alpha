@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.env
+.env.*
+!.env.example
+test/fixtures/*.local.json
+tools/passkey-capture/capture.js

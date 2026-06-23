@@ -1,0 +1,122 @@
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import Database from "better-sqlite3";
+
+/** Open (and create dirs for) a SQLite db. Use ":memory:" in tests. */
+export function openDatabase(path: string): Database.Database {
+  if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
+  const db = new Database(path);
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  return db;
+}
+
+/** Create tables if absent. Idempotent. */
+export function migrate(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS entities (
+      idempotency_key TEXT PRIMARY KEY,
+      name            TEXT NOT NULL,
+      status          TEXT NOT NULL CHECK (status IN ('pending','provisioned','translating','created','bound','funded','failed')),
+      manager         TEXT NOT NULL,
+      guardian        TEXT NOT NULL,
+      operator        TEXT,
+      turnkey_sub_org_id TEXT,
+      turnkey_wallet_id  TEXT,
+      owner_tenant_id    TEXT,
+      error              TEXT,
+      spec_json          TEXT,
+      amendment_delay TEXT NOT NULL,
+      ein             TEXT NOT NULL,
+      formation_date  INTEGER NOT NULL,
+      oa_hash         TEXT,
+      metadata_uri    TEXT,
+      doc_path        TEXT,
+      treasury_config TEXT,             -- JSON (bigints as decimal strings)
+      agent_id        TEXT,             -- uint256 as decimal string
+      proxy           TEXT,
+      treasury        TEXT,
+      create_tx_hash  TEXT,
+      bind_tx_hash    TEXT,
+      fund_tx_hash    TEXT,
+      created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_entities_agent_id ON entities(agent_id);
+
+    -- Reserved for an optional DB-backed document index; v1 uses FileDocumentStore (filesystem).
+    CREATE TABLE IF NOT EXISTS documents (
+      id         TEXT PRIMARY KEY,
+      oa_hash    TEXT,
+      path       TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS events (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      idempotency_key TEXT NOT NULL,
+      step            TEXT NOT NULL,
+      status          TEXT NOT NULL,
+      tx_hash         TEXT,
+      detail          TEXT,
+      created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (idempotency_key) REFERENCES entities(idempotency_key)
+    );
+
+    -- Off-chain nanopayment spend-ledger: every payment the Payment Authority authorizes is recorded
+    -- here so authorized-but-not-yet-settled amounts (runningPending) count against the treasury cap
+    -- before the on-chain balance reflects them. amount is a bigint stored as a decimal string.
+    CREATE TABLE IF NOT EXISTS payments_ledger (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      payee      TEXT NOT NULL,
+      amount     TEXT NOT NULL,                -- bigint as decimal string
+      status     TEXT NOT NULL CHECK (status IN ('authorized','settled','failed')),
+      batch_ref  TEXT,
+      created_at INTEGER NOT NULL,
+      settled_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_payments_ledger_status ON payments_ledger(status);
+
+    CREATE TABLE IF NOT EXISTS auth_nonces (
+      nonce      TEXT PRIMARY KEY,
+      issued_at  INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS jobs (
+      job_key TEXT PRIMARY KEY,
+      job_id TEXT,
+      entity_key TEXT NOT NULL,
+      owner_tenant_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('pending','created','funded','submitted','completed','reputed','failed')),
+      client_address TEXT NOT NULL,
+      evaluator_address TEXT NOT NULL,
+      provider_address TEXT NOT NULL,
+      budget_amount TEXT NOT NULL,
+      description TEXT NOT NULL,
+      deliverable_hash TEXT, deliverable_path TEXT,
+      create_tx_hash TEXT, fund_tx_hash TEXT, submit_tx_hash TEXT, complete_tx_hash TEXT, sweep_tx_hash TEXT, reputation_tx_hash TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (entity_key) REFERENCES entities(idempotency_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS job_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_key TEXT NOT NULL,
+      step TEXT NOT NULL, status TEXT NOT NULL, tx_hash TEXT, detail TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (job_key) REFERENCES jobs(job_key)
+    );
+  `);
+
+  // Additive migration for pre-existing dev DBs (new tables/columns only).
+  const cols = (db.prepare("PRAGMA table_info(entities)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!cols.includes("owner_tenant_id"))
+    db.exec("ALTER TABLE entities ADD COLUMN owner_tenant_id TEXT");
+  if (!cols.includes("error")) db.exec("ALTER TABLE entities ADD COLUMN error TEXT");
+  if (!cols.includes("spec_json")) db.exec("ALTER TABLE entities ADD COLUMN spec_json TEXT");
+}

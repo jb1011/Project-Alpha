@@ -1,0 +1,22 @@
+{
+  "network": "arc-testnet",
+  "chainId": 5042002,
+  "explorer": "https://testnet.arcscan.app",
+  "deployedAt": "2026-06-12",
+  "deployer": "0xb43CbdA374e3CD2a3d67827683F81462BaCF703b",
+  "note": "Deployer is a testnet-only MetaMask key. beaconOwner == deployer for now; move to a multisig/timelock before production. Per-agent LegalManager + AgentTreasury instances are created at runtime via LegalManagerFactory.createEntity (not deployed here).",
+  "ours": {
+    "legalManagerFactory": "0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902",
+    "legalManagerImpl": "0xc2e89ABf562f2EB366e4dde42325af16EeF542a6",
+    "beacon": "0xCbE36eC37673805a185a6883f9597613ABB41c97",
+    "beaconOwner": "0xb43CbdA374e3CD2a3d67827683F81462BaCF703b"
+  },
+  "reused": {
+    "identityRegistry": "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    "reputationRegistry": "0x8004B663056A597Dffe9eCcC1965A193B7388713",
+    "validationRegistry": "0x8004Cb1BF31DAf7788923b405b754f57acEB4272",
+    "erc8183Job": "0x0747EEf0706327138c69792bF28Cd525089e4583",
+    "usdc": "0x3600000000000000000000000000000000000000",
+    "eurc": "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a"
+  }
+}

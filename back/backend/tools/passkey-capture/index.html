@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Guardian Passkey Capture</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; }
+      button { font-size: 1rem; padding: 0.6rem 1rem; cursor: pointer; }
+      #status { margin-top: 1rem; white-space: pre-wrap; }
+      .ok { color: #157f3b; }
+      .err { color: #b00020; }
+    </style>
+  </head>
+  <body>
+    <h1>Guardian Passkey Capture</h1>
+    <p>Creates one real WebAuthn passkey and saves its attestation for the live provisioning test.</p>
+    <button id="create">Create guardian passkey</button>
+    <div id="status"></div>
+    <script type="module" src="/capture.js"></script>
+  </body>
+</html>

@@ -1,0 +1,105 @@
+import type Database from "better-sqlite3";
+import { afterEach, beforeEach, expect, test } from "vitest";
+import { migrate, openDatabase } from "../src/persistence/db";
+import { SqliteEntityRepository } from "../src/persistence/entityRepository";
+import type { EntityRecord } from "../src/types";
+
+let db: Database.Database;
+let repo: SqliteEntityRepository;
+
+beforeEach(() => {
+  db = openDatabase(":memory:");
+  migrate(db);
+  repo = new SqliteEntityRepository(db);
+});
+afterEach(() => db.close());
+
+const record = (over: Partial<EntityRecord> = {}): EntityRecord => ({
+  idempotencyKey: "key-1",
+  name: "Demo Agent",
+  status: "translating",
+  manager: "0x000000000000000000000000000000000000aAaa",
+  guardian: "0x000000000000000000000000000000000000bBbb",
+  operator: null,
+  amendmentDelay: "86400",
+  ein: "STUB-NOT-FILED",
+  formationDate: 0,
+  oaHash: null,
+  metadataURI: null,
+  docPath: null,
+  treasuryConfig: null,
+  agentId: null,
+  proxy: null,
+  treasury: null,
+  createTxHash: null,
+  bindTxHash: null,
+  fundTxHash: null,
+  ...over,
+});
+
+test("upsert then findByIdempotencyKey round-trips, incl. bigint-as-string + json", () => {
+  repo.upsert(
+    record({
+      treasuryConfig: {
+        usdc: "0x3600000000000000000000000000000000000000",
+        payoutAddress: "0x000000000000000000000000000000000000cCcc",
+        cap: 1_000_000n,
+        period: 2_592_000n,
+        allowlistEnabled: false,
+      },
+    }),
+  );
+  const got = repo.findByIdempotencyKey("key-1");
+  expect(got?.name).toBe("Demo Agent");
+  expect(got?.treasuryConfig?.cap).toBe(1_000_000n);
+  expect(got?.treasuryConfig?.period).toBe(2_592_000n);
+});
+
+test("upsert updates an existing row (same idempotencyKey)", () => {
+  repo.upsert(record());
+  repo.upsert(
+    record({
+      status: "created",
+      agentId: "0",
+      proxy: "0x000000000000000000000000000000000000dEaD",
+    }),
+  );
+  const got = repo.findByIdempotencyKey("key-1");
+  expect(got?.status).toBe("created");
+  expect(got?.agentId).toBe("0");
+  expect(repo.list()).toHaveLength(1);
+});
+
+test("findByAgentId locates a created entity", () => {
+  repo.upsert(record({ status: "created", agentId: "42" }));
+  expect(repo.findByAgentId("42")?.idempotencyKey).toBe("key-1");
+});
+
+test("recordEvent + listEvents append-only audit trail", () => {
+  repo.upsert(record());
+  repo.recordEvent("key-1", "createEntity", "created", "0xabc", "{}");
+  repo.recordEvent("key-1", "setAgentWallet", "bound", "0xdef", "{}");
+  expect(repo.listEvents("key-1").map((e) => e.step)).toEqual(["createEntity", "setAgentWallet"]);
+});
+
+test("transaction rolls back all writes if the body throws (atomic upsert + event)", () => {
+  expect(() =>
+    repo.transaction(() => {
+      repo.upsert(record());
+      repo.recordEvent("key-1", "createEntity", "created", "0xabc", "{}");
+      throw new Error("boom");
+    }),
+  ).toThrow("boom");
+  // Nothing should have persisted: the entity insert and the event are rolled back together.
+  expect(repo.findByIdempotencyKey("key-1")).toBeUndefined();
+  expect(repo.listEvents("key-1")).toHaveLength(0);
+});
+
+test("transaction commits both writes on success", () => {
+  repo.transaction(() => {
+    repo.upsert(record());
+    repo.recordEvent("key-1", "createEntity", "created", "0xabc", "{}");
+  });
+  expect(repo.findByIdempotencyKey("key-1")?.status).toBe("translating");
+  expect(repo.listEvents("key-1")).toHaveLength(1);
+});
