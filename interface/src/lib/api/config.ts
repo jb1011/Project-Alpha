@@ -1,5 +1,4 @@
-export const API_URL =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://159.223.137.183:8789";
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/backend";
 
 export const SIWE_DOMAIN = process.env.NEXT_PUBLIC_SIWE_DOMAIN ?? "localhost";
 
