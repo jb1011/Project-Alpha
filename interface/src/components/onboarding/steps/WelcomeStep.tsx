@@ -95,7 +95,8 @@ export function WelcomeStep({
     setPasskeyOverride("pending");
     setError(null);
     try {
-      const { challenge, rpId } = await getPasskeyChallenge();
+      const { challenge } = await getPasskeyChallenge();
+      const rpId = window.location.hostname;
       const passkey = await createGuardianPasskey(challenge, rpId);
       onPasskey(passkey);
       setPasskeyOverride(null);
