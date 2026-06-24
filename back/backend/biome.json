@@ -8,7 +8,8 @@
       "src/abis/generated.ts",
       "node_modules",
       "tools/passkey-capture/capture.js",
-      "test/fixtures"
+      "test/fixtures",
+      "coverage"
     ]
   },
   "linter": {

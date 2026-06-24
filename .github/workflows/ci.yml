@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A newer push to the same branch/PR cancels the older in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Foundry deps are gitignored and installed pinned (see back/README.md).
+  FORGE_STD_VERSION: v1.16.1
+  OZ_VERSION: v5.1.0
+
+jobs:
+  contracts:
+    name: Contracts (forge)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: back
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so path filtering works on push events too
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Detect contract changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            contracts:
+              - 'back/src/**'
+              - 'back/test/**'
+              - 'back/foundry.toml'
+
+      - name: Cache foundry deps
+        uses: actions/cache@v4
+        with:
+          path: back/lib
+          key: foundry-lib-${{ env.FORGE_STD_VERSION }}-${{ env.OZ_VERSION }}
+
+      - name: Install pinned deps (mirrors back/README.md; lib/ is gitignored)
+        run: |
+          [ -d lib/forge-std ] || forge install foundry-rs/forge-std@${{ env.FORGE_STD_VERSION }} --no-git
+          [ -d lib/openzeppelin-contracts ] || forge install OpenZeppelin/openzeppelin-contracts@${{ env.OZ_VERSION }} --no-git
+          [ -d lib/openzeppelin-contracts-upgradeable ] || forge install OpenZeppelin/openzeppelin-contracts-upgradeable@${{ env.OZ_VERSION }} --no-git
+
+      - name: Build
+        run: forge build
+
+      - name: Test
+        run: forge test -vv
+        env:
+          # Reduced depth on routine PRs for fast feedback; full depth only when contracts change.
+          FOUNDRY_FUZZ_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '64' }}
+          FOUNDRY_INVARIANT_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '32' }}
+
+  backend:
+    name: Backend (vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Backend *.int.test.ts deploy mocks to a local anvil and read forge artifacts,
+      # so this job needs Foundry and a forge build too, not just Node.
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Cache foundry deps
+        uses: actions/cache@v4
+        with:
+          path: back/lib
+          key: foundry-lib-${{ env.FORGE_STD_VERSION }}-${{ env.OZ_VERSION }}
+
+      - name: Install pinned deps + build artifacts
+        working-directory: back
+        run: |
+          [ -d lib/forge-std ] || forge install foundry-rs/forge-std@${{ env.FORGE_STD_VERSION }} --no-git
+          [ -d lib/openzeppelin-contracts ] || forge install OpenZeppelin/openzeppelin-contracts@${{ env.OZ_VERSION }} --no-git
+          [ -d lib/openzeppelin-contracts-upgradeable ] || forge install OpenZeppelin/openzeppelin-contracts-upgradeable@${{ env.OZ_VERSION }} --no-git
+          forge build
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: back/backend/package-lock.json
+
+      - name: Install
+        working-directory: back/backend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: back/backend
+        run: npm run typecheck
+
+      - name: Lint
+        working-directory: back/backend
+        run: npm run lint
+
+      - name: Test
+        working-directory: back/backend
+        run: npm test
