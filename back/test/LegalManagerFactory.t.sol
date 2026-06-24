@@ -186,7 +186,7 @@ contract WalletBindingTest is Test {
         assertEq(registry.ownerOf(agentId), manager);
 
         address walletToBind = vm.addr(managerPk); // manager binds its own wallet
-        uint256 deadline = block.timestamp + 30 minutes;
+        uint256 deadline = block.timestamp + 5 minutes;
         bytes32 digest = registry.walletSetDigest(agentId, walletToBind, manager, deadline);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(managerPk, digest);
 
@@ -201,13 +201,29 @@ contract WalletBindingTest is Test {
             manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), _defaultTreasuryCfg()
         );
         address walletToBind = vm.addr(managerPk);
-        uint256 deadline = block.timestamp + 30 minutes;
+        uint256 deadline = block.timestamp + 5 minutes;
         bytes32 digest = registry.walletSetDigest(agentId, walletToBind, manager, deadline);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(uint256(0xDEAD), digest); // wrong key
 
         vm.prank(manager);
         // Faithful to live: a wrong ECDSA sig falls through to the ERC-1271 path on an EOA -> this.
         vm.expectRevert(bytes("invalid wallet sig"));
+        registry.setAgentWallet(agentId, walletToBind, deadline, abi.encodePacked(r, s, v));
+    }
+
+    function test_bindingRejectsDeadlineBeyondMaxWindow() public {
+        (uint256 agentId,,) = factory.createEntity(
+            manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), _defaultTreasuryCfg()
+        );
+        address walletToBind = vm.addr(managerPk);
+        // One second past the registry's MAX_DEADLINE_DELAY (mirrors the live Arc 300s cap). The
+        // signature is otherwise valid, so the deadline guard is the only reason this reverts.
+        uint256 deadline = block.timestamp + 5 minutes + 1;
+        bytes32 digest = registry.walletSetDigest(agentId, walletToBind, manager, deadline);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(managerPk, digest);
+
+        vm.prank(manager);
+        vm.expectRevert(bytes("deadline too far"));
         registry.setAgentWallet(agentId, walletToBind, deadline, abi.encodePacked(r, s, v));
     }
 }
