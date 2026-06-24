@@ -19,6 +19,11 @@ under limits it physically cannot break, be stopped/recovered when it misbehaves
 legal owner, and carry a verifiable identity counterparties can rely on. This project is that missing
 trust-and-safety layer for agentic commerce.
 
+> 📦 **This is the `back/` half of the [Project-Alpha](https://github.com/jb1011/Project-Alpha) monorepo**
+> (the frontend lives in `interface/`; live demo: https://project-alpha-pi.vercel.app). The backend's full
+> commit-by-commit engineering history — 30+ TDD/audit commits — is preserved in the archived source repo:
+> **[ArcXBayernMeca/ProjectAlpha](https://github.com/ArcXBayernMeca/ProjectAlpha)** (read-only).
+
 ## Architecture in one picture
 - **`LegalManagerFactory`** — entry point; `createEntity()` mints the agent's ERC-8004 identity and
   deploys its `LegalManager` + `AgentTreasury` in one atomic transaction.
