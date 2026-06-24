@@ -1,0 +1,59 @@
+CONTEXT
+- Core backend just got merged — the foundation's in good shape.
+- Two deadlines, in priority order: hackathon demo on the 29th, then the real
+  prize, the Circle grant. The hackathon is a milestone toward the grant, not a
+  separate goal.
+- You're joining mid-project, so these are deliberately self-contained entry
+  points — the deeper, more entangled backend stays on my side for now. Totally
+  open to you grabbing something heavier if you want.
+
+
+1 — SMART CONTRACTS: QUALITY + SECURITY PASS
+- Already well-tested (~99% line coverage, with fuzz / invariant / security
+  suites in test/), so it's a kick-the-tires job, not filling gaps.
+- Reading src/AgentTreasury.sol, LegalManager.sol, LegalManagerFactory.sol is
+  probably the fastest way to learn the on-chain core.
+- Value-add: close the last uncovered lines/branches, stress edge cases harder
+  (role transitions, sweeps, upgrade paths), and run free static analysis
+  (Slither / Aderyn / Mythril) on top of our manual audit.
+- "We're 100% sure on security" is the bar for the grant — a clean findings note
+  is a citable result.
+
+
+2 — MCP SERVER ("use the agent with your AI")
+- Cleanest separable piece on the board — doesn't exist yet, sits off to the
+  side of the main machinery.
+- It's a thin layer over the backend we already shipped — exposes
+  onboarding/funding as tools an AI assistant can call. No need to touch the
+  saga internals.
+- Good way to learn the backend's surface without inheriting all its context.
+  backend/README.md documents the brain it'd wrap.
+
+
+3 — SECOND PAIR OF EYES ON ARCHITECTURE + BUSINESS MODEL
+- Form your own view, then poke holes in mine — especially custody/treasury
+  model, stack choices, and positioning.
+- Docs worth starting with:
+  - docs/README.md (index), docs/SPEC.md (core spec) — orientation
+  - docs/PROJECT_RECAP.md, docs/POSITIONING.md — what/why it wins
+  - docs/research/ — COMPETITIVE_LANDSCAPE, LEGAL_OPERATIONS, RESEARCH_FINDINGS,
+    STACK_REFERENCE
+  - docs/design/2026-06-08-wallet-and-treasury-architecture.md (keystone) +
+    treasury vault / onboarding brain / wizard API designs
+  - docs/plans/2026-06-21-grant-backend-roadmap.md +
+    docs/V2_HARDENING_BACKLOG.md — direction + deferred items
+- You've got the repo + Claude Code, so no need for a how-to — feel free to just
+  explore.
+
+
+4 — CO-OWNER ON PRODUCT/ENGINEERING DECISIONS
+- Beyond any single task: your read on the project overall, and a real voice in
+  the calls — what to cut for the 29th vs. what the grant needs, demo-vs-real,
+  where to invest.
+- As you read, note anything off/risky/worth doing differently → let's hash it
+  out together.
+
+
+FRAMING
+- These are options, not assignments — pick any, in any order. Equal footing,
+  no hierarchy.
