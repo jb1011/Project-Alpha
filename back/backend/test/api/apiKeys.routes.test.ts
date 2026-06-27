@@ -12,6 +12,9 @@ import { OnboardingRunner } from "../../src/workflow/runner";
 const account = privateKeyToAccount(
   "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
 );
+const otherAccount = privateKeyToAccount(
+  "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba",
+);
 const DOMAIN = "wizard.local";
 const CHAIN = 5042002;
 let db: Database.Database;
@@ -103,6 +106,31 @@ test("DELETE /api-keys/:id → 204 and the key disappears from the list", async 
     await app.request("/api-keys", { headers: { authorization: `Bearer ${token}` } })
   ).json();
   expect(views[0].revokedAt).toBeTypeOf("number");
+});
+
+test("DELETE /api-keys/:id by a different tenant → 404 (cannot revoke another tenant's key)", async () => {
+  const app = makeApp();
+  const ownerToken = await login(app);
+  const { id } = await (
+    await app.request("/api-keys", {
+      method: "POST",
+      headers: { authorization: `Bearer ${ownerToken}`, "content-type": "application/json" },
+      body: JSON.stringify({}),
+    })
+  ).json();
+
+  const otherToken = await login(app, otherAccount);
+  const del = await app.request(`/api-keys/${id}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${otherToken}` },
+  });
+  expect(del.status).toBe(404);
+
+  // The owner's key must still be active (verify it was NOT revoked).
+  const views = await (
+    await app.request("/api-keys", { headers: { authorization: `Bearer ${ownerToken}` } })
+  ).json();
+  expect(views[0].revokedAt).toBeNull();
 });
 
 test("no auth → 401", async () => {
