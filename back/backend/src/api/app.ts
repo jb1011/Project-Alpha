@@ -24,6 +24,7 @@ export interface ApiDeps {
   runner: import("../workflow/runner").OnboardingRunner;
   passkeyRpId: string;
   apiKeys: import("../persistence/apiKeyStore").ApiKeyStore;
+  passkeys: import("../persistence/passkeyStore").PasskeyStore;
   jobs: import("../jobs/jobRepository").JobRepository;
   jobRunner: import("../jobs/jobRunner").JobRunner;
   jobClientAddress: string;

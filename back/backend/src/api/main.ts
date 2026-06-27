@@ -13,6 +13,7 @@ import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
+import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import type { Address } from "../types";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
@@ -32,6 +33,7 @@ async function main() {
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
+  const passkeys = new SqlitePasskeyStore(db);
   const arc = new ArcAdapter({
     publicClient: publicClientFor(cfg),
     managerWallet: managerWalletClient(cfg),
@@ -89,6 +91,7 @@ async function main() {
     runner,
     passkeyRpId: cfg.passkeyRpId,
     apiKeys,
+    passkeys,
     jobs: jobDeps.jobs,
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,
