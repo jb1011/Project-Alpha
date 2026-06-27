@@ -51,13 +51,15 @@ export interface OnboardingDeps {
  * persisted — a key at status 'created' or beyond reuses the stored agentId. Each step's two DB
  * writes (entity row + audit event) commit atomically via repo.transaction().
  *
- * v1 crash-safety limitations (KNOWN; harden before production):
- *  - create→persist gap: if the process dies AFTER the createEntity tx mines but BEFORE the 'created'
- *    upsert, a resume re-mints a SECOND agentId (the first is orphaned). repo.transaction() cannot
- *    close this — the gap is between an on-chain effect and its first persistence. The robust fix is
- *    to persist the broadcast txHash before awaiting the receipt and reconcile on resume.
- *  - single-runner only: two concurrent runs of the same key both pass findByIdempotencyKey and can
- *    double-mint. Run one onboarding worker per key (no key-claim lock yet).
+ * create→persist double-mint window CLOSED: step 4 broadcasts the createEntity tx, persists its hash
+ * at status 'translating' BEFORE awaiting the receipt, then confirms. A crash in that gap resumes by
+ * adopting the persisted tx (confirm re-reads the same agentId) instead of minting a second entity.
+ *
+ * Concurrent double-mint is guarded one level up: OnboardingRunner.start claims the idempotency key
+ * atomically (repo.claimKey, INSERT ON CONFLICT DO NOTHING) before any side effect, so two runners
+ * racing the same key cannot both reach step 4.
+ *
+ * v1 limitations still KNOWN (harden before production):
  *  - key-wins semantics: re-running a key reuses the stored record and ignores any changed spec; do
  *    not reuse an idempotencyKey with a different spec.
  */
@@ -163,7 +165,10 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       agentId: null,
       proxy: null,
       treasury: null,
-      createTxHash: null,
+      // Preserve a broadcast-but-unconfirmed create tx across a translating-resume: translate is
+      // re-derivable and re-runs while status is still 'translating', but it must NOT wipe a hash we
+      // already persisted, or step 4 would re-mint instead of adopting it.
+      createTxHash: rec?.createTxHash ?? null,
       bindTxHash: null,
       fundTxHash: null,
       // Carry the Step-0 vault ids forward (undefined on the legacy path).
@@ -176,19 +181,30 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     d.repo.upsert(rec);
   }
 
-  // ── Step 4: createEntity (atomic on-chain). Skip if already created.
+  // ── Step 4: createEntity. Split into broadcast + confirm to close the create→persist double-mint
+  //    window: persist the broadcast tx hash (status stays 'translating') BEFORE awaiting the receipt.
+  //    On resume, a record that already carries a createTxHash ADOPTS that in-flight mint via confirm
+  //    instead of broadcasting a second entity. Skip entirely once status is past 'translating'.
   if (rec.status === "translating") {
-    const res = await d.arc.createEntity({
-      manager: rec.manager,
-      guardian: rec.guardian,
-      operator: rec.operator!,
-      amendmentDelay: BigInt(rec.amendmentDelay),
-      metadataURI: rec.metadataURI!,
-      ein: rec.ein,
-      formationDate: rec.formationDate,
-      operatingAgreementHash: rec.oaHash!,
-      treasury: rec.treasuryConfig!,
-    });
+    let createTxHash = rec.createTxHash;
+    if (!createTxHash) {
+      createTxHash = await d.arc.broadcastCreateEntity({
+        manager: rec.manager,
+        guardian: rec.guardian,
+        operator: rec.operator!,
+        amendmentDelay: BigInt(rec.amendmentDelay),
+        metadataURI: rec.metadataURI!,
+        ein: rec.ein,
+        formationDate: rec.formationDate,
+        operatingAgreementHash: rec.oaHash!,
+        treasury: rec.treasuryConfig!,
+      });
+      // Persist the broadcast hash before confirming. A crash between here and 'created' resumes by
+      // adopting this tx (the line above is skipped because createTxHash is now set).
+      rec = { ...rec, createTxHash };
+      d.repo.upsert(rec);
+    }
+    const res = await d.arc.confirmCreateEntity(createTxHash);
     const created: EntityRecord = {
       ...rec,
       status: "created",

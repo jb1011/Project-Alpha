@@ -68,6 +68,44 @@ test("createEntity registers, deploys, transfers NFT to manager, and returns ids
   expect((await adapter.getAgentWallet(0n)).toLowerCase()).toBe(stack.factory.toLowerCase());
 }, 40_000);
 
+test("broadcastCreateEntity then confirmCreateEntity mints the same entity as createEntity", async () => {
+  // The saga needs to persist the tx hash BETWEEN broadcasting and reading the agentId (to close the
+  // create->persist double-mint window). So the single createEntity must decompose into two steps.
+  const params = {
+    manager: manager.address,
+    guardian,
+    operator,
+    amendmentDelay: 3_600n,
+    metadataURI: "file:///tmp/meta-split.json",
+    ein: "STUB-NOT-FILED",
+    formationDate: 0,
+    operatingAgreementHash: `0x${"cd".repeat(32)}` as `0x${string}`,
+    treasury: {
+      usdc: stack.usdc,
+      payoutAddress: payout,
+      cap: 1_000_000n,
+      period: 2_592_000n,
+      allowlistEnabled: false,
+    },
+  };
+
+  // Step 1: broadcast returns a tx hash without resolving the agentId yet.
+  const txHash = await adapter.broadcastCreateEntity(params);
+  expect(txHash).toMatch(/^0x[0-9a-fA-F]{64}$/);
+
+  // Step 2: confirm reads the receipt's events and yields the ids + the same tx hash.
+  const res = await adapter.confirmCreateEntity(txHash);
+  expect(res.txHash).toBe(txHash);
+  expect(res.proxy).toMatch(/^0x[0-9a-fA-F]{40}$/);
+  expect(res.treasury).toMatch(/^0x[0-9a-fA-F]{40}$/);
+  // The entity exists and the NFT landed with the manager, exactly like the one-shot path.
+  expect((await adapter.ownerOf(res.agentId)).toLowerCase()).toBe(manager.address.toLowerCase());
+
+  // confirm is idempotent: re-reading the SAME tx returns the SAME agentId (the adopt-on-resume path).
+  const again = await adapter.confirmCreateEntity(txHash);
+  expect(again.agentId).toBe(res.agentId);
+}, 40_000);
+
 test("createEntity reverts when the sending wallet is not the factory owner", async () => {
   // createEntity is onlyOwner; the whole flow silently depends on managerWallet == factory owner.
   // Lock that precondition: a non-owner wallet (the guardian account here) must be rejected.

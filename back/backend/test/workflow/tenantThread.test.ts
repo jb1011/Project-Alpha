@@ -32,15 +32,17 @@ const spec = {
   metadata: {},
 } as unknown as AgentSpec;
 
-// Structural fake ArcAdapter: just enough for the legacy (no-passkey) saga path.
+// Structural fake ArcAdapter: just enough for the legacy (no-passkey) saga path. The saga drives the
+// create step through the broadcast/confirm seam (broadcast a tx, persist its hash, then confirm).
 const fakeArc = {
   chainId: 5042002,
   identityRegistry: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
-  createEntity: async () => ({
+  broadcastCreateEntity: async () => "0xaa",
+  confirmCreateEntity: async (txHash: string) => ({
     agentId: 7n,
     proxy: "0x00000000000000000000000000000000000000Ef",
     treasury: "0x00000000000000000000000000000000000000Fe",
-    txHash: "0xaa",
+    txHash,
   }),
   walletSetDeadline: async () => 9999999999n,
   eip712Domain: async () => ({ name: "ERC8004IdentityRegistry", version: "1" }),
