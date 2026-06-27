@@ -83,6 +83,16 @@ export function migrate(db: Database.Database): void {
       expires_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id           TEXT PRIMARY KEY,
+      owner_tenant TEXT NOT NULL,
+      hash         TEXT NOT NULL,
+      label        TEXT,
+      created_at   INTEGER NOT NULL,
+      revoked_at   INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(hash);
+
     CREATE TABLE IF NOT EXISTS jobs (
       job_key TEXT PRIMARY KEY,
       job_id TEXT,
