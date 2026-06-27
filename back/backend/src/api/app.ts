@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { AuthVars } from "../auth/middleware";
 import { requireAuth } from "../auth/middleware";
+import { mountMcpRoute } from "../mcp/transport";
 import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
@@ -49,5 +50,6 @@ export function buildApiApp(deps: ApiDeps) {
   mountApiKeyRoutes(app, deps);
   mountProtectedRoutes(app, deps);
   mountJobRoutes(app, deps);
+  mountMcpRoute(app, deps);
   return app;
 }
