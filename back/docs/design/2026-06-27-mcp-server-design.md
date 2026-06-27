@@ -61,26 +61,34 @@ Hono app (ONE process / port)
  │     + POST /passkey                  (new, store attestation → handle, behind requireAuth)
  └── /mcp  ── mcpAuth (Bearer api-key → tenantId) ── StreamableHTTP transport ── McpServer
                                                                                    └── tools
-        │
-        ▼
-buildBackend(cfg)  →  { repo, runner, jobDeps, nonceStore, apiKeys, passkeys, ... }
-        │  (shared composition root — consumed by BOTH the REST app and the MCP route)
+        │  tools receive the SAME repo/runner already in ApiDeps (nothing new wired)
         ▼
 runner.start / runner.fund / repo.listByTenant / repo.findByIdempotencyKey   (unchanged brain)
 ```
 
-### 3.1 Composition extraction (targeted refactor)
-The wiring currently inside `main()` in `api/main.ts` moves into a new
-`backend/src/composition.ts` → `buildBackend(cfg): Backend`. `api/main.ts` becomes a thin
-entrypoint: `const backend = buildBackend(cfg); const app = buildApiApp({ ...backend });
-serve(...)`. This is the only change to existing wiring; the saga, adapters, and REST routes
-are untouched. Justified because the MCP route must reuse the exact same `runner`/`repo`
-instances (not new ones).
+`api/main.ts` composition root stays as-is; it gains only two lines (`new ApiKeyStore(db)`,
+`new PasskeyStore(db)`) passed into `buildApiApp` alongside the existing `repo`/`runner`/`jobDeps`.
+
+### 3.1 No composition refactor — reuse the app's existing deps
+`buildApiApp` already receives `repo`, `runner`, `jobs`, and `jobRunner` in its `ApiDeps`, so
+the `/mcp` route (mounted *inside* `buildApiApp`, like the other route groups) reuses those
+exact instances. **No existing wiring is extracted or relocated.** The only edits to existing
+files are additive:
+- `api/main.ts` — construct the two new stores (`new ApiKeyStore(db)`, `new PasskeyStore(db)`)
+  and pass them in the deps object (~2 lines).
+- `api/app.ts` — extend `ApiDeps` with `apiKeys`/`passkeys` and add the new route mounts
+  (`mountApiKeyRoutes`, the passkey-store route, `mountMcpRoutes`). The interface comment
+  already anticipates this ("Extended by later tasks").
+- `persistence/db.ts` — two new `CREATE TABLE` migrations (additive; existing tables untouched).
+
+No existing function's behaviour changes; the saga, `OnboardingRunner`, adapters, contracts,
+and current REST routes are never modified. `reconcileInFlight()` still runs exactly once at
+startup in `main()`, unchanged.
 
 ### 3.2 MCP module (`backend/src/mcp/`)
 - `auth.ts` — `mcpAuth(apiKeys)`: read `Authorization: Bearer`, hash, look up → `tenantId`;
   reject with 401 if missing/unknown/revoked. Produces `authInfo = { token, tenantId }`.
-- `server.ts` — `buildMcpServer(backend)`: constructs `McpServer`, registers the four tools
+- `server.ts` — `buildMcpServer({ repo, runner, passkeys })`: constructs `McpServer`, registers the four tools
   and the schema resource. Tool handlers read `tenantId` from `authInfo` (the per-request
   auth context the transport passes through), never from a tool argument.
 - `transport.ts` — mounts a stateless Streamable HTTP transport on the Hono `/mcp` route;
@@ -191,7 +199,8 @@ All tools resolve `tenantId` from `authInfo` and call the same methods the REST 
 
 ## 11. Deliverables
 
-1. `backend/src/composition.ts` (`buildBackend`) + `api/main.ts` slimmed to use it.
+1. `api/main.ts`: construct `ApiKeyStore` + `PasskeyStore`, pass into `buildApiApp` (additive,
+   no wiring relocated); `ApiDeps` extended in `api/app.ts`.
 2. `api_keys` + `passkeys` migrations; `ApiKeyStore`, `PasskeyStore`.
 3. REST routes: `/api-keys` (×3), `POST /passkey`.
 4. `backend/src/mcp/` — `auth.ts`, `server.ts`, `transport.ts`; `/mcp` mounted on the app.
