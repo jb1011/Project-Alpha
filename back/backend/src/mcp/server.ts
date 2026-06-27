@@ -84,5 +84,41 @@ export function buildMcpServer(tenantId: string, deps: McpToolDeps): McpServer {
     },
   );
 
+  server.registerTool(
+    "onboard_agent",
+    {
+      title: "Onboard agent",
+      description:
+        "Create an agent legal body. spec must match schema://agent-spec; the guardian is set " +
+        "automatically to your tenant. passkeyId references a previously stored guardian passkey " +
+        "(POST /passkey). Returns immediately with status 'pending' — poll get_entity until 'bound'.",
+      inputSchema: {
+        spec: z.record(z.unknown()),
+        passkeyId: z.string(),
+        idempotencyKey: z.string().optional(),
+      },
+    },
+    async ({ spec, passkeyId, idempotencyKey }) => {
+      const passkey = deps.passkeys.get(tenantId, passkeyId);
+      if (!passkey)
+        return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
+      try {
+        const raw = spec as Record<string, unknown>;
+        const roles = { ...((raw.roles as object) ?? {}), guardian: tenantId };
+        const parsed = AgentSpecSchema.parse({ ...raw, roles });
+        const userKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : parsed.name;
+        const { id, status } = deps.runner.start({
+          spec: parsed,
+          userKey,
+          tenantId,
+          guardianPasskey: passkey,
+        });
+        return { content: [{ type: "text", text: JSON.stringify({ id, status }) }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+      }
+    },
+  );
+
   return server;
 }
