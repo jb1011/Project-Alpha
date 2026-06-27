@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import type { AuthVars } from "../auth/middleware";
 import { requireAuth } from "../auth/middleware";
 import { apiOnError } from "./errors";
+import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountProtectedRoutes } from "./routes/onboard";
@@ -22,6 +23,7 @@ export interface ApiDeps {
   repo: import("../persistence/entityRepository").EntityRepository;
   runner: import("../workflow/runner").OnboardingRunner;
   passkeyRpId: string;
+  apiKeys: import("../persistence/apiKeyStore").ApiKeyStore;
   jobs: import("../jobs/jobRepository").JobRepository;
   jobRunner: import("../jobs/jobRunner").JobRunner;
   jobClientAddress: string;
@@ -41,6 +43,9 @@ export function buildApiApp(deps: ApiDeps) {
   app.use("/entities", requireAuth(deps.jwtSecret));
   app.use("/entities/*", requireAuth(deps.jwtSecret));
   app.use("/jobs/*", requireAuth(deps.jwtSecret));
+  app.use("/api-keys", requireAuth(deps.jwtSecret));
+  app.use("/api-keys/*", requireAuth(deps.jwtSecret));
+  mountApiKeyRoutes(app, deps);
   mountProtectedRoutes(app, deps);
   mountJobRoutes(app, deps);
   return app;
