@@ -125,6 +125,8 @@ test("findByTreasury returns the entity owning a treasury address (case-insensit
   const rec = record({ status: "bound" });
   rec.treasury = "0x000000000000000000000000000000000000000F" as `0x${string}`;
   repo.upsert(rec);
-  expect(repo.findByTreasury("0x000000000000000000000000000000000000000f")?.idempotencyKey).toBe(rec.idempotencyKey);
+  expect(repo.findByTreasury("0x000000000000000000000000000000000000000f")?.idempotencyKey).toBe(
+    rec.idempotencyKey,
+  );
   expect(repo.findByTreasury("0x0000000000000000000000000000000000000001")).toBeUndefined();
 });
