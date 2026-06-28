@@ -84,8 +84,22 @@ export class ArcAdapter {
    * the registry assigns agentId from a monotonic counter, so if another register/createEntity is
    * mined between our simulate and our inclusion, simulate's predicted id would be stale. simulate is
    * still run first to surface reverts with a decoded reason before broadcasting.
+   *
+   * One-shot composition of broadcast + confirm. The saga uses the two halves directly so it can
+   * persist the broadcast tx hash BEFORE awaiting the receipt (closing the create->persist double-mint
+   * window); callers that don't need that seam can keep using this single call unchanged.
    */
   async createEntity(p: CreateEntityParams): Promise<CreateEntityResult> {
+    const txHash = await this.broadcastCreateEntity(p);
+    return this.confirmCreateEntity(txHash);
+  }
+
+  /**
+   * Broadcast factory.createEntity and return the tx hash WITHOUT awaiting the receipt. simulate runs
+   * first to surface a decoded revert before we send. Persist the returned hash before calling
+   * confirmCreateEntity so a crash in between can adopt this tx on resume instead of re-minting.
+   */
+  async broadcastCreateEntity(p: CreateEntityParams): Promise<Hex> {
     const args = [
       p.manager,
       p.guardian,
@@ -111,7 +125,15 @@ export class ArcAdapter {
       args,
       account: this.d.managerWallet.account!,
     });
-    const txHash = await this.d.managerWallet.writeContract(request);
+    return this.d.managerWallet.writeContract(request);
+  }
+
+  /**
+   * Await the createEntity receipt and read the ids from its events. Idempotent: re-reading the same
+   * mined tx yields the same agentId, which is exactly what the saga relies on to adopt an in-flight
+   * mint on resume rather than broadcasting a second one.
+   */
+  async confirmCreateEntity(txHash: Hex): Promise<CreateEntityResult> {
     const receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
 
     // Narrow to a single event name each so viem types `.args` precisely (no casts needed).

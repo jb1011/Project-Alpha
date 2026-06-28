@@ -32,9 +32,6 @@ export class OnboardingRunner {
     status: EntityStatus;
   } {
     const id = `${p.tenantId}:${p.userKey}`;
-    if (this.inFlight.has(id) || this.deps.repo.findByIdempotencyKey(id))
-      throw new ApiError("conflict", 409, `onboarding already exists for "${p.userKey}"`);
-
     const specJson = JSON.stringify(p.spec);
     const initial: EntityRecord = {
       idempotencyKey: id,
@@ -60,7 +57,11 @@ export class OnboardingRunner {
       error: null,
       specJson,
     };
-    this.deps.repo.upsert(initial);
+    // Atomic claim: the INSERT-or-nothing is the single gate. Two concurrent starts (or processes
+    // racing the same key) can never both win — the loser sees changes()==0 and gets a 409, before
+    // any on-chain side effect. Replaces the old non-atomic inFlight/find pre-check.
+    if (!this.deps.repo.claimKey(initial))
+      throw new ApiError("conflict", 409, `onboarding already exists for "${p.userKey}"`);
     this.run(id, () =>
       this.deps.runSaga({
         spec: p.spec,
