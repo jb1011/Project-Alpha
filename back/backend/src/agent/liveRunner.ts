@@ -15,11 +15,15 @@ import { PaymentLedger } from "../payments/ledger";
 import { buildPaywall } from "../payments/seller";
 import { makeSettle } from "../payments/settle";
 import type { SettleFn } from "../payments/settle";
+import { SqliteAgentRunStore } from "../persistence/agentRunStore";
+import type { RunPaymentInput } from "../persistence/agentRunStore";
 import { migrate } from "../persistence/db";
+import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { usdToUnits } from "../policy/units";
 import type { Address, Hex } from "../types";
 import type { DemoResult } from "./demo";
 import { runDemo } from "./demo";
+import { persistAgentRun } from "./persistRun";
 import { buildVendor } from "./vendor";
 
 export interface SellParams {
@@ -195,12 +199,23 @@ export async function buildLiveAgentRunner(
     verifyingContract: arcBatchingConfig.verifyingContract,
   });
 
+  const customer = pocketSignerFromKey(cfg.customerPrivateKey).address;
+
   // recording settle shared by both legs
   const settleTransferIds: string[] = [];
+  const paymentRecords: RunPaymentInput[] = [];
   const baseSettle = makeSettle({ facilitatorUrl: cfg.gatewayFacilitatorUrl });
   const settle: SettleFn = async (header, reqs) => {
     const r = await baseSettle(header, reqs);
     if (r.ok && r.transferId) settleTransferIds.push(r.transferId);
+    const isBuy = reqs.payTo.toLowerCase() === vendorPayout.toLowerCase();
+    paymentRecords.push({
+      direction: isBuy ? "buy" : "sell",
+      counterparty: isBuy ? reqs.payTo : customer,
+      amount: reqs.amount,
+      transferId: r.ok ? (r.transferId ?? null) : null,
+      status: r.ok ? "settled" : "failed",
+    });
     return r;
   };
 
@@ -236,10 +251,12 @@ export async function buildLiveAgentRunner(
     runningPending: ledger.runningPending(),
   });
   const floatAtomic = usdToUnits(cfg.fundingFloatUsdc);
-  const customer = pocketSignerFromKey(cfg.customerPrivateKey).address;
 
-  return (query: string) =>
-    runLive(
+  const runs = new SqliteAgentRunStore(db);
+  const entities = new SqliteEntityRepository(db);
+
+  return async (query: string) => {
+    const result = await runLive(
       {
         fund: (amt) => fundPocket(cfg, treasury, amt),
         runDemo: (q) =>
@@ -272,4 +289,7 @@ export async function buildLiveAgentRunner(
       },
       query,
     );
+    persistAgentRun({ runs, entities }, treasury, query, result, paymentRecords);
+    return result;
+  };
 }
