@@ -287,6 +287,24 @@ export class ArcAdapter {
     }) as Promise<bigint>;
   }
 
+  /** Real ERC-20 USDC balance held by an address (e.g. the treasury vault) — the actual funds on hand. */
+  usdcBalanceOf(usdc: Address, owner: Address): Promise<bigint> {
+    return this.d.publicClient.readContract({
+      address: usdc,
+      abi: [
+        {
+          type: "function",
+          name: "balanceOf",
+          stateMutability: "view",
+          inputs: [{ name: "account", type: "address" }],
+          outputs: [{ name: "", type: "uint256" }],
+        },
+      ] as const,
+      functionName: "balanceOf",
+      args: [owner],
+    }) as Promise<bigint>;
+  }
+
   /** Guardian kill-switch state: true once the guardian has paused the vault (blocks all spends). */
   treasuryPaused(treasury: Address): Promise<boolean> {
     return this.d.publicClient.readContract({
