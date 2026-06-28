@@ -78,6 +78,67 @@ Multi-tenant onboarding API for the web wizard. Tenant = controller wallet (SIWE
 
 Poll `GET /entities/:id` (~2–3 s) until terminal status (`bound` / `funded` / `failed`).
 
+## MCP Server (Claude / Cursor)
+
+The API (`npm run api`) also serves `/mcp` as a Model Context Protocol server, exposing agent onboarding
+and management tools to Claude/Cursor.
+
+### Setup
+
+1. **Run the API** (same server, no new service):
+   ```bash
+   npm run api  # listens on :8789
+   ```
+
+2. **Sign in (SIWE) and mint an MCP key:**
+   - `GET /auth/nonce` → `{ nonce }`
+   - Sign the message with your wallet
+   - `POST /auth/verify { message, signature }` → `{ token, address, expiresAt }`
+   - `POST /api-keys` with `Authorization: Bearer <JWT token>` → `{ id, key, label }` — **copy the `key`** (shown once)
+
+3. **Capture the guardian passkey in your browser:**
+   - `GET /passkey/challenge` → `{ challenge, rpId }` — use these for WebAuthn registration
+   - Perform the WebAuthn ceremony in your browser
+   - `POST /passkey` with `Authorization: Bearer <JWT token>` and the attestation → `{ id }` — **copy the `id`** (handle)
+
+4. **Add the server to Claude/Cursor:**
+   Create or edit `~/.claude/mcp.json` (Claude CLI) or `.cursor/rules/mcp.json` (Cursor):
+   ```json
+   {
+     "mcpServers": {
+       "project-alpha": {
+         "url": "https://<your-host>/mcp",
+         "headers": { "Authorization": "Bearer mcp_<your-key>" }
+       }
+     }
+   }
+   ```
+   Replace `<your-host>` with the deployed/local URL and `<your-key>` with the key from step 2.
+
+### Tools
+
+| Tool | Input | Description |
+|---|---|---|
+| `whoami` | (none) | Return the authenticated tenant address |
+| `list_entities` | (none) | List all agent legal bodies owned by the caller |
+| `get_entity` | `id` (idempotency key) | Fetch one entity; poll after `onboard_agent` until status is `bound` |
+| `onboard_agent` | `spec` (object), `passkeyId` (handle from step 3), `idempotencyKey?` (optional) | Create an agent legal body; guardian is automatically set to the caller |
+| `fund_treasury` | `id` (idempotency key), `amount` (atomic USDC, 6 decimals as string) | Fund a bound entity's treasury |
+
+### Resources
+
+| Resource | URI | Description |
+|---|---|---|
+| `agent-spec` | `schema://agent-spec` | JSON Schema for `onboard_agent`'s `spec` argument |
+
+### Example Flow
+
+1. Read `schema://agent-spec` to understand the required entity structure
+2. Call `onboard_agent` with your agent spec and guardian passkey handle → returns `{ id, status: "pending" }`
+3. Poll `get_entity` with the returned `id` (~2–3 s) until `status` reaches `bound` (or `failed`)
+4. Call `fund_treasury` with `id` and amount to top up the treasury (atomic USDC)
+5. Call `list_entities` to review all owned legal bodies
+
 ## v2 hardening
 Known production-hardening items (crash-safety, concurrency, Turnkey, etc.) are tracked in
 `../docs/V2_HARDENING_BACKLOG.md`. None block the testnet demo.
