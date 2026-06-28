@@ -5,6 +5,7 @@ import type {
   AuthSession,
   EntityView,
   GuardianPasskey,
+  TreasuryView,
 } from "./types";
 import { ApiError } from "./types";
 
@@ -100,6 +101,10 @@ export async function fundEntity(
     token,
     body: { amount: amountAtomic },
   });
+}
+
+export async function getEntityTreasury(token: string, id: string): Promise<TreasuryView> {
+  return request(`/entities/${encodeURIComponent(id)}/treasury`, { token });
 }
 
 export async function fetchAgentSchema(): Promise<Record<string, unknown>> {

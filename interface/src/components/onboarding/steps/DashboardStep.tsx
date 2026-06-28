@@ -1,33 +1,14 @@
 "use client";
 
 import * as React from "react";
+import { usePublicClient, useWriteContract } from "wagmi";
+import { getEntityTreasury } from "@/lib/api/client";
+import type { EntityView, TreasuryView } from "@/lib/api/types";
+import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
+import { treasuryAbi } from "@/lib/treasuryAbi";
+import { useAuth } from "../AuthProvider";
+import { Card, cx, ExternalIcon, ShieldIcon } from "../primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "../types";
-import type { EntityView } from "@/lib/api/types";
-import { addressUrl, txUrl } from "@/lib/chain";
-import {
-  Button,
-  Callout,
-  Card,
-  CheckIcon,
-  cx,
-  ExternalIcon,
-  ShieldIcon,
-} from "../primitives";
-
-type Activity = {
-  id: string;
-  label: string;
-  detail: string;
-  amount: string;
-  time: string;
-  state: "confirmed" | "held";
-};
-
-const ACTIVITY: Activity[] = [
-  { id: "a1", label: "Paid invoice", detail: "Render · infra", amount: "-120.00", time: "2m ago", state: "confirmed" },
-  { id: "a2", label: "Rebalanced float", detail: "Internal transfer", amount: "-300.00", time: "1h ago", state: "confirmed" },
-  { id: "a3", label: "Received deposit", detail: "Operating top-up", amount: "+500.00", time: "3h ago", state: "confirmed" },
-];
 
 export function DashboardStep({
   config,
@@ -38,14 +19,79 @@ export function DashboardStep({
   entity: EntityView | null;
   onRestart: () => void;
 }) {
-  const [paused, setPaused] = React.useState(false);
-  const [pendingVetoed, setPendingVetoed] = React.useState(false);
-  const [recovered, setRecovered] = React.useState(false);
-  const [dialog, setDialog] = React.useState<null | "recover" | "veto">(null);
+  const { ensureSession } = useAuth();
+  const publicClient = usePublicClient();
+  const { writeContractAsync } = useWriteContract();
 
-  const balance = recovered ? 0 : entity?.status === "funded" ? Number(config.dailyCap) || 0 : 0;
-  const dailyCap = Number(config.dailyCap) || 0;
-  const dailySpent = recovered ? 0 : 420;
+  const [treasury, setTreasury] = React.useState<TreasuryView | null>(null);
+  const [pausing, setPausing] = React.useState(false);
+  const [pauseError, setPauseError] = React.useState<string | null>(null);
+
+  const ensureSessionRef = React.useRef(ensureSession);
+  React.useEffect(() => {
+    ensureSessionRef.current = ensureSession;
+  }, [ensureSession]);
+
+  const entityId = entity?.id ?? null;
+  const treasuryAddr = entity?.treasury ?? null;
+
+  // Read the REAL on-chain treasury state from the backend (no mocks).
+  const refresh = React.useCallback(async () => {
+    if (!entityId || !treasuryAddr) return;
+    try {
+      const auth = await ensureSessionRef.current();
+      setTreasury(await getEntityTreasury(auth.token, entityId));
+    } catch {
+      /* transient (e.g. token refresh / RPC blip) — keep the last good value */
+    }
+  }, [entityId, treasuryAddr]);
+
+  React.useEffect(() => {
+    if (!entityId || !treasuryAddr) return;
+    let cancelled = false;
+    const tick = () => {
+      if (!cancelled) void refresh();
+    };
+    tick();
+    const h = setInterval(tick, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(h);
+    };
+  }, [entityId, treasuryAddr, refresh]);
+
+  const paused = treasury?.paused ?? false;
+  // Atomic USDC (6 decimals) → human. Fall back to the typed cap only until the first fetch lands.
+  const balanceUsdc = treasury ? Number(treasury.usdcBalance) / 1e6 : null;
+  const capUsdc = treasury ? Number(treasury.cap) / 1e6 : Number(config.dailyCap) || 0;
+  const spentUsdc = treasury
+    ? Math.max(0, (Number(treasury.cap) - Number(treasury.available)) / 1e6)
+    : 0;
+
+  // Real guardian freeze: the connected (guardian) wallet signs pause()/unpause() on-chain.
+  const onTogglePause = async () => {
+    if (!treasuryAddr) return;
+    setPauseError(null);
+    setPausing(true);
+    try {
+      const hash = await writeContractAsync({
+        address: treasuryAddr as `0x${string}`,
+        abi: treasuryAbi,
+        functionName: paused ? "unpause" : "pause",
+        chainId: arcTestnet.id,
+      });
+      if (publicClient) await publicClient.waitForTransactionReceipt({ hash });
+      await refresh();
+    } catch (e) {
+      setPauseError(
+        e instanceof Error
+          ? shortenErr(e.message)
+          : "Transaction failed — is this the guardian wallet?",
+      );
+    } finally {
+      setPausing(false);
+    }
+  };
 
   return (
     <div className="anim-line" style={{ animationDuration: "0.45s" }}>
@@ -71,7 +117,7 @@ export function DashboardStep({
                   paused ? "bg-[#febc2e]" : "bg-accent animate-pulse",
                 )}
               />
-              {entity?.status === "funded" ? "Funded" : entity?.status === "bound" ? "Operational" : paused ? "Paused" : "Operational"}
+              {paused ? "Paused" : "Operational"}
             </span>
           </h1>
           <p className="mt-2 text-[14px] text-muted">
@@ -88,51 +134,40 @@ export function DashboardStep({
 
       {entity && (
         <Card className="mt-6 p-5">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">
-            On-chain identity
-          </div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">On-chain identity</div>
           <dl className="mt-4 grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
-            {entity.agentId && (
-              <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />
-            )}
+            {entity.agentId && <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />}
             {entity.treasury && (
               <OnChainRow label="Treasury" value={shortAddress(entity.treasury)} href={addressUrl(entity.treasury)} />
             )}
-            {entity.operator && (
-              <OnChainRow label="Operator" value={shortAddress(entity.operator)} />
-            )}
-            {entity.guardian && (
-              <OnChainRow label="Guardian" value={shortAddress(entity.guardian)} />
-            )}
-            {entity.oaHash && (
-              <OnChainRow label="OA hash" value={`${entity.oaHash.slice(0, 14)}…`} />
-            )}
+            {entity.operator && <OnChainRow label="Operator" value={shortAddress(entity.operator)} />}
+            {entity.guardian && <OnChainRow label="Guardian" value={shortAddress(entity.guardian)} />}
+            {entity.oaHash && <OnChainRow label="OA hash" value={`${entity.oaHash.slice(0, 14)}…`} />}
           </dl>
           <div className="mt-4 flex flex-wrap gap-3">
-            {entity.createTxHash && (
-              <TxLink hash={entity.createTxHash} label="Create tx" />
-            )}
-            {entity.bindTxHash && (
-              <TxLink hash={entity.bindTxHash} label="Bind tx" />
-            )}
-            {entity.fundTxHash && (
-              <TxLink hash={entity.fundTxHash} label="Fund tx" />
-            )}
+            {entity.createTxHash && <TxLink hash={entity.createTxHash} label="Create tx" />}
+            {entity.bindTxHash && <TxLink hash={entity.bindTxHash} label="Bind tx" />}
+            {entity.fundTxHash && <TxLink hash={entity.fundTxHash} label="Fund tx" />}
           </div>
         </Card>
       )}
 
       <div className="mt-8 grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard label="Treasury balance" value={`${formatUsdc(balance)}`} unit="USDC" emphasis />
         <StatCard
-          label="Spent today"
-          value={`${formatUsdc(dailySpent)}`}
-          unit={`/ ${formatUsdc(dailyCap)} cap`}
+          label="Treasury balance"
+          value={balanceUsdc === null ? "—" : formatUsdc(balanceUsdc)}
+          unit="USDC"
+          emphasis
+        />
+        <StatCard
+          label="Spent this period"
+          value={treasury ? formatUsdc(spentUsdc) : "—"}
+          unit={`/ ${formatUsdc(capUsdc)} cap`}
         >
           <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-paper">
             <div
               className="h-full rounded-full bg-accent"
-              style={{ width: `${dailyCap ? Math.min(100, (dailySpent / dailyCap) * 100) : 0}%` }}
+              style={{ width: `${capUsdc ? Math.min(100, (spentUsdc / capUsdc) * 100) : 0}%` }}
             />
           </div>
         </StatCard>
@@ -140,83 +175,28 @@ export function DashboardStep({
       </div>
 
       <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
-        {/* Activity log */}
+        {/* Activity log — honest empty state until the agent actually transacts (x402 settlements land here next). */}
         <Card className="overflow-hidden">
           <div className="flex items-center justify-between border-b hairline px-5 py-3.5">
             <span className="text-[13px] font-medium text-ink">Activity</span>
             <span className="text-[11.5px] text-muted-2">Agent transactions</span>
           </div>
-          <ul>
-            {!pendingVetoed && !recovered && (
-              <li className="flex items-center justify-between gap-3 border-b hairline bg-[#febc2e]/[0.05] px-5 py-3.5">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[13px] text-ink">Vendor payout</span>
-                    <span className="rounded-full border border-[#febc2e]/40 bg-[#febc2e]/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.1em] text-[#f3cd72]">
-                      Held · 11h left
-                    </span>
-                  </div>
-                  <div className="mt-0.5 text-[11.5px] text-muted-2">
-                    Above-cap · awaiting timelock — you can veto
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="font-mono text-[13px] tabular-nums text-ink">-740.00</span>
-                  <Button variant="ghost" size="md" onClick={() => setDialog("veto")}>
-                    Veto
-                  </Button>
-                </div>
-              </li>
-            )}
-            {(entity?.status === "funded" ? [] : ACTIVITY).map((a) => (
-              <li
-                key={a.id}
-                className="flex items-center justify-between gap-3 border-b hairline px-5 py-3.5 last:border-0"
-              >
-                <div className="min-w-0">
-                  <div className="text-[13px] text-ink">{a.label}</div>
-                  <div className="mt-0.5 text-[11.5px] text-muted-2">{a.detail} · {a.time}</div>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span
-                    className={cx(
-                      "font-mono text-[13px] tabular-nums",
-                      a.amount.startsWith("+") ? "text-accent-soft" : "text-ink",
-                    )}
-                  >
-                    {a.amount}
-                  </span>
-                  <a
-                    href="#"
-                    onClick={(e) => e.preventDefault()}
-                    className="text-muted-2 transition-colors hover:text-accent-soft"
-                    aria-label="View on explorer"
-                  >
-                    <ExternalIcon className="h-3.5 w-3.5" />
-                  </a>
-                </div>
-              </li>
-            ))}
-          </ul>
+          <div className="px-5 py-12 text-center text-[12.5px] text-muted-2">
+            No agent payments yet — this agent hasn’t transacted.
+          </div>
         </Card>
 
         {/* Rules + guardian controls */}
         <div className="flex flex-col gap-6">
           <Card className="p-5">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">
-              Active rules
-            </div>
+            <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">Active rules</div>
             <dl className="mt-4 flex flex-col gap-3 text-[12.5px]">
               <RuleRow k="Per-tx cap" v={`${formatUsdc(config.perTxCap)} USDC`} />
               <RuleRow k="Daily cap" v={`${formatUsdc(config.dailyCap)} USDC`} />
               <RuleRow k="Timelock" v={`${config.timelockHours || "0"}h`} />
               <RuleRow
                 k="Recipients"
-                v={
-                  config.allowlist.length
-                    ? `${config.allowlist.length} allowlisted`
-                    : "Any (within caps)"
-                }
+                v={config.allowlist.length ? `${config.allowlist.length} allowlisted` : "Any (within caps)"}
               />
             </dl>
             {config.allowlist.length > 0 && (
@@ -236,24 +216,25 @@ export function DashboardStep({
               <ShieldIcon className="h-3.5 w-3.5" /> Guardian controls
             </div>
             <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
-              Your human safety brake. Sensitive actions ask for confirmation.
+              Your human safety brake — freeze all autonomous spending on-chain, signed by your wallet.
             </p>
-            <div className="mt-4 flex flex-col gap-2.5">
+            <div className="mt-4">
               <button
-                onClick={() => setPaused((p) => !p)}
-                className="flex items-center justify-between rounded-xl border hairline-strong bg-paper px-4 py-3 text-left transition-colors hover:bg-paper-2"
+                onClick={onTogglePause}
+                disabled={pausing || !treasuryAddr}
+                className="flex w-full items-center justify-between rounded-xl border hairline-strong bg-paper px-4 py-3 text-left transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <div>
                   <div className="text-[13px] font-medium text-ink">
-                    {paused ? "Resume agent" : "Pause agent"}
+                    {pausing ? "Confirm in wallet…" : paused ? "Resume agent" : "Pause agent"}
                   </div>
                   <div className="text-[11px] text-muted-2">
-                    {paused ? "Re-enable autonomous actions" : "Freeze all autonomous actions"}
+                    {paused ? "Re-enable autonomous spending" : "Freeze all autonomous spending"}
                   </div>
                 </div>
                 <span
                   className={cx(
-                    "relative h-5 w-9 rounded-full transition-colors",
+                    "relative h-5 w-9 shrink-0 rounded-full transition-colors",
                     paused ? "bg-[#febc2e]/40" : "bg-accent/50",
                   )}
                 >
@@ -265,57 +246,22 @@ export function DashboardStep({
                   />
                 </span>
               </button>
-
-              <GuardianAction
-                title="Veto pending action"
-                desc={pendingVetoed ? "No actions held" : "Cancel the held vendor payout"}
-                onClick={() => setDialog("veto")}
-                disabled={pendingVetoed || recovered}
-              />
-
-              <GuardianAction
-                title="Recover funds"
-                desc="Sweep the full treasury back to you"
-                onClick={() => setDialog("recover")}
-                disabled={recovered}
-                danger
-              />
+              {pauseError && <p className="mt-2 text-[11.5px] leading-[1.4] text-[#ff8a84]">{pauseError}</p>}
             </div>
           </Card>
         </div>
       </div>
-
-      {recovered && (
-        <Callout tone="info" className="mt-6" title="Funds recovered">
-          The treasury was swept back to your wallet. The agent is effectively
-          wound down.
-        </Callout>
-      )}
-
-      {dialog && (
-        <ConfirmDialog
-          kind={dialog}
-          onCancel={() => setDialog(null)}
-          onConfirm={() => {
-            if (dialog === "recover") setRecovered(true);
-            if (dialog === "veto") setPendingVetoed(true);
-            setDialog(null);
-          }}
-        />
-      )}
     </div>
   );
 }
 
-function OnChainRow({
-  label,
-  value,
-  href,
-}: {
-  label: string;
-  value: string;
-  href?: string;
-}) {
+function shortenErr(msg: string): string {
+  // viem errors are verbose; surface just the first meaningful line.
+  const first = msg.split("\n")[0]?.trim() ?? "Transaction failed.";
+  return first.length > 140 ? `${first.slice(0, 140)}…` : first;
+}
+
+function OnChainRow({ label, value, href }: { label: string; value: string; href?: string }) {
   return (
     <div>
       <dt className="text-muted-2">{label}</dt>
@@ -365,12 +311,7 @@ function StatCard({
     <Card className={cx("p-5", emphasis && "border-accent/20 bg-accent/[0.04]")}>
       <div className="text-[11px] uppercase tracking-[0.16em] text-muted-2">{label}</div>
       <div className="mt-2 flex items-baseline gap-1.5">
-        <span
-          className={cx(
-            "text-[26px] font-medium tabular-nums",
-            muted ? "text-muted-2" : "text-ink",
-          )}
-        >
+        <span className={cx("text-[26px] font-medium tabular-nums", muted ? "text-muted-2" : "text-ink")}>
           {value}
         </span>
         {unit && <span className="text-[12px] text-muted-2">{unit}</span>}
@@ -385,97 +326,6 @@ function RuleRow({ k, v }: { k: string; v: string }) {
     <div className="flex items-center justify-between">
       <dt className="text-muted-2">{k}</dt>
       <dd className="text-ink">{v}</dd>
-    </div>
-  );
-}
-
-function GuardianAction({
-  title,
-  desc,
-  onClick,
-  disabled,
-  danger,
-}: {
-  title: string;
-  desc: string;
-  onClick: () => void;
-  disabled?: boolean;
-  danger?: boolean;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={cx(
-        "flex items-center justify-between rounded-xl border px-4 py-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-45",
-        danger
-          ? "border-[#ff5f57]/30 bg-[#ff5f57]/[0.05] hover:bg-[#ff5f57]/[0.1]"
-          : "hairline-strong bg-paper hover:bg-paper-2",
-      )}
-    >
-      <div>
-        <div className={cx("text-[13px] font-medium", danger ? "text-[#ff8a84]" : "text-ink")}>
-          {title}
-        </div>
-        <div className="text-[11px] text-muted-2">{desc}</div>
-      </div>
-      <span className={cx("text-[14px]", danger ? "text-[#ff8a84]" : "text-muted-2")}>→</span>
-    </button>
-  );
-}
-
-function ConfirmDialog({
-  kind,
-  onCancel,
-  onConfirm,
-}: {
-  kind: "recover" | "veto";
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  const copy = {
-    recover: {
-      title: "Recover all funds?",
-      body: "This sweeps the entire treasury balance back to your guardian wallet and halts the agent. This requires your signature on-chain.",
-      cta: "Recover funds",
-      danger: true,
-    },
-    veto: {
-      title: "Veto the held action?",
-      body: "The pending vendor payout will be cancelled before its timelock expires. The agent will be notified.",
-      cta: "Veto action",
-      danger: false,
-    },
-  }[kind];
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-5">
-      <button
-        aria-label="Close"
-        onClick={onCancel}
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-      />
-      <div className="relative w-full max-w-md rounded-2xl border hairline-strong bg-paper-2 p-6 shadow-[0_30px_80px_-30px_rgba(0,0,0,0.8)]">
-        <div
-          className={cx(
-            "flex h-10 w-10 items-center justify-center rounded-full",
-            copy.danger ? "bg-[#ff5f57]/12 text-[#ff8a84]" : "bg-[#febc2e]/12 text-[#f3cd72]",
-          )}
-        >
-          <ShieldIcon className="h-5 w-5" />
-        </div>
-        <h3 className="mt-4 text-[18px] font-medium text-ink">{copy.title}</h3>
-        <p className="mt-2 text-[13px] leading-[1.55] text-muted">{copy.body}</p>
-        <div className="mt-6 flex justify-end gap-3">
-          <Button variant="ghost" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button variant={copy.danger ? "danger" : "primary"} onClick={onConfirm}>
-            <CheckIcon className="h-4 w-4" />
-            {copy.cta}
-          </Button>
-        </div>
-      </div>
     </div>
   );
 }

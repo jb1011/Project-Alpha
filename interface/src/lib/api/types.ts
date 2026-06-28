@@ -25,6 +25,15 @@ export type EntityView = {
   error: string | null;
 };
 
+/** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */
+export type TreasuryView = {
+  usdcBalance: string;
+  available: string;
+  cap: string;
+  period: string;
+  paused: boolean;
+};
+
 export type GuardianPasskey = {
   authenticatorName?: string;
   challenge: string;
