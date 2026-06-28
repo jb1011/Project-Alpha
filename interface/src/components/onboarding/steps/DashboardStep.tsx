@@ -273,7 +273,7 @@ function RunRow({ run }: { run: AgentRun }) {
       <button onClick={() => setOpen((o) => !o)} className="flex w-full items-center justify-between gap-3 px-5 py-3.5 text-left hover:bg-paper-2/40">
         <div className="min-w-0">
           <div className="truncate text-[13px] text-ink">{run.query}</div>
-          <div className="mt-0.5 text-[11.5px] text-muted-2">spent {formatUsdc(Number(run.cost) / 1e6)} · earned {formatUsdc(Number(run.revenue) / 1e6)} USDC</div>
+          <div className="mt-0.5 text-[11.5px] text-muted-2">spent {formatUsdc(Number(run.cost) / 1e6)} USDC · earned {formatUsdc(Number(run.revenue) / 1e6)} USDC</div>
         </div>
         <span className={cx("shrink-0 font-mono text-[13px] tabular-nums", profit ? "text-accent-soft" : "text-[#ff8a84]")}>
           {profit ? "+" : "−"}{formatUsdc(Math.abs(Number(run.pnl)) / 1e6)}
@@ -281,8 +281,8 @@ function RunRow({ run }: { run: AgentRun }) {
       </button>
       {open && (
         <div className="border-t hairline bg-paper/40 px-5 py-3">
-          {run.payments.map((p, i) => (
-            <div key={i} className="flex items-center justify-between gap-3 py-1.5 text-[11.5px]">
+          {(run.payments ?? []).map((p, i) => (
+            <div key={p.transferId ?? i} className="flex items-center justify-between gap-3 py-1.5 text-[11.5px]">
               <span className="text-muted">
                 {p.direction === "buy" ? "Paid" : "Received"} {formatUsdc(Number(p.amount) / 1e6)} USDC · {shortAddress(p.counterparty)}
               </span>
