@@ -5,12 +5,18 @@ import { arcBatchingConfig } from "../../src/adapters/x402/pocket";
 import { pocketSignerFromKey } from "../../src/adapters/x402/pocket";
 import { makeSignX402 } from "../../src/adapters/x402/signX402";
 import { runDemo } from "../../src/agent/demo";
-import { sellAnswer as realSell, runLive, sellAnswer } from "../../src/agent/liveRunner";
+import {
+  sellAnswer as realSell,
+  requireVaultOperator,
+  runLive,
+  sellAnswer,
+} from "../../src/agent/liveRunner";
 import { buildVendor } from "../../src/agent/vendor";
 import { authorizePayment } from "../../src/payments/authority";
 import { PaymentLedger } from "../../src/payments/ledger";
 import type { SettleFn } from "../../src/payments/settle";
 import { migrate } from "../../src/persistence/db";
+import type { EntityRecord } from "../../src/types";
 
 const CUSTOMER = `0x${"2".repeat(64)}` as const;
 const treasury = getAddress(`0x${"ab".repeat(20)}`);
@@ -170,4 +176,30 @@ test("resolveLiveAddresses: requires treasury + vendorPayout, and they must diff
   expect(() => resolveLiveAddresses({ vendorPayout: v })).toThrow(/TREASURY_ADDRESS/);
   expect(() => resolveLiveAddresses({ treasury: t })).toThrow(/VENDOR_PAYOUT_ADDRESS/);
   expect(() => resolveLiveAddresses({ treasury: t, vendorPayout: t })).toThrow(/must differ/);
+});
+
+const vaultEntity = {
+  idempotencyKey: "tenant:agent1",
+  operator: getAddress(`0x${"33".repeat(20)}`),
+  turnkeySubOrgId: "sub-org-1",
+} as unknown as EntityRecord;
+
+test("requireVaultOperator: returns the agent's own vault {subOrgId, operator}", () => {
+  expect(requireVaultOperator(treasury, vaultEntity)).toEqual({
+    subOrgId: "sub-org-1",
+    operator: getAddress(`0x${"33".repeat(20)}`),
+  });
+});
+
+test("requireVaultOperator: throws when no onboarded agent owns the treasury", () => {
+  expect(() => requireVaultOperator(treasury, undefined)).toThrow(
+    /no onboarded agent owns treasury/,
+  );
+});
+
+test("requireVaultOperator: throws when the agent has no provisioned vault operator", () => {
+  const noSubOrg = { ...vaultEntity, turnkeySubOrgId: undefined } as unknown as EntityRecord;
+  expect(() => requireVaultOperator(treasury, noSubOrg)).toThrow(/no per-agent vault operator/);
+  const noOperator = { ...vaultEntity, operator: null } as unknown as EntityRecord;
+  expect(() => requireVaultOperator(treasury, noOperator)).toThrow(/no per-agent vault operator/);
 });
