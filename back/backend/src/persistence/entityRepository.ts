@@ -20,6 +20,7 @@ export interface EntityRepository {
   claimKey(record: EntityRecord): boolean;
   findByIdempotencyKey(key: string): EntityRecord | undefined;
   findByAgentId(agentId: string): EntityRecord | undefined;
+  findByTreasury(treasury: string): EntityRecord | undefined;
   list(): EntityRecord[];
   recordEvent(
     key: string,
@@ -205,6 +206,13 @@ export class SqliteEntityRepository implements EntityRepository {
     const r = this.db.prepare("SELECT * FROM entities WHERE agent_id = ?").get(agentId) as
       | Row
       | undefined;
+    return r ? toRecord(r) : undefined;
+  }
+
+  findByTreasury(treasury: string): EntityRecord | undefined {
+    const r = this.db
+      .prepare("SELECT * FROM entities WHERE treasury = ? COLLATE NOCASE")
+      .get(treasury) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 
