@@ -256,6 +256,9 @@ export async function buildLiveAgentRunner(
   const entities = new SqliteEntityRepository(db);
 
   return async (query: string) => {
+    // reset per-run accumulators so receipts never bleed across invocations of this runner
+    settleTransferIds.length = 0;
+    paymentRecords.length = 0;
     const result = await runLive(
       {
         fund: (amt) => fundPocket(cfg, treasury, amt),

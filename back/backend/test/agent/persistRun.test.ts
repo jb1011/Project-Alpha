@@ -85,3 +85,20 @@ test("persistAgentRun falls back to the treasury address as entityKey when no en
   persistAgentRun({ runs, entities }, "0xUnknownTreasury", "q", result, []);
   expect(runs.listByEntity("0xUnknownTreasury")).toHaveLength(1);
 });
+
+test("persistAgentRun records status 'failed' when the run did not sell", () => {
+  const TREASURY = "0x000000000000000000000000000000000000000F";
+  seedEntity("t:agent1", TREASURY);
+  const runs = new SqliteAgentRunStore(db);
+  const entities = new SqliteEntityRepository(db);
+  const result = {
+    totalCost: 80000n,
+    price: 0n,
+    pnl: -80000n,
+    sold: false,
+  } as unknown as LiveRunResult;
+  persistAgentRun({ runs, entities }, TREASURY, "q", result, []);
+  const got = runs.listByEntity("t:agent1");
+  expect(got).toHaveLength(1);
+  expect(got[0]).toMatchObject({ status: "failed", revenue: "0", pnl: "-80000" });
+});
