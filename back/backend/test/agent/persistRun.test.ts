@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { LiveRunResult } from "../../src/agent/liveRunner";
 import { persistAgentRun } from "../../src/agent/persistRun";
 import { SqliteAgentRunStore } from "../../src/persistence/agentRunStore";
@@ -82,8 +82,11 @@ test("persistAgentRun falls back to the treasury address as entityKey when no en
   const runs = new SqliteAgentRunStore(db);
   const entities = new SqliteEntityRepository(db);
   const result = { totalCost: 1n, price: 2n, pnl: 1n, sold: true } as unknown as LiveRunResult;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   persistAgentRun({ runs, entities }, "0xUnknownTreasury", "q", result, []);
   expect(runs.listByEntity("0xUnknownTreasury")).toHaveLength(1);
+  expect(warn).toHaveBeenCalledTimes(1);
+  warn.mockRestore();
 });
 
 test("persistAgentRun records status 'failed' when the run did not sell", () => {
@@ -93,8 +96,8 @@ test("persistAgentRun records status 'failed' when the run did not sell", () => 
   const entities = new SqliteEntityRepository(db);
   const result = {
     totalCost: 80000n,
-    price: 0n,
-    pnl: -80000n,
+    price: 120000n,
+    pnl: 40000n,
     sold: false,
   } as unknown as LiveRunResult;
   persistAgentRun({ runs, entities }, TREASURY, "q", result, []);
