@@ -2,8 +2,8 @@
 
 import * as React from "react";
 import { usePublicClient, useWriteContract } from "wagmi";
-import { getEntityTreasury } from "@/lib/api/client";
-import type { EntityView, TreasuryView } from "@/lib/api/types";
+import { getEntityRuns, getEntityTreasury } from "@/lib/api/client";
+import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "../AuthProvider";
@@ -24,6 +24,7 @@ export function DashboardStep({
   const { writeContractAsync } = useWriteContract();
 
   const [treasury, setTreasury] = React.useState<TreasuryView | null>(null);
+  const [runs, setRuns] = React.useState<AgentRun[]>([]);
   const [pausing, setPausing] = React.useState(false);
   const [pauseError, setPauseError] = React.useState<string | null>(null);
 
@@ -41,6 +42,7 @@ export function DashboardStep({
     try {
       const auth = await ensureSessionRef.current();
       setTreasury(await getEntityTreasury(auth.token, entityId));
+      setRuns((await getEntityRuns(auth.token, entityId)).runs);
     } catch {
       /* transient (e.g. token refresh / RPC blip) — keep the last good value */
     }
@@ -175,15 +177,23 @@ export function DashboardStep({
       </div>
 
       <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
-        {/* Activity log — honest empty state until the agent actually transacts (x402 settlements land here next). */}
+        {/* Activity log — x402 job receipts, expandable per run. */}
         <Card className="overflow-hidden">
           <div className="flex items-center justify-between border-b hairline px-5 py-3.5">
             <span className="text-[13px] font-medium text-ink">Activity</span>
-            <span className="text-[11.5px] text-muted-2">Agent transactions</span>
+            <span className="text-[11.5px] text-muted-2">Agent jobs · x402</span>
           </div>
-          <div className="px-5 py-12 text-center text-[12.5px] text-muted-2">
-            No agent payments yet — this agent hasn’t transacted.
-          </div>
+          {runs.length === 0 ? (
+            <div className="px-5 py-12 text-center text-[12.5px] text-muted-2">
+              No agent payments yet — this agent hasn’t transacted.
+            </div>
+          ) : (
+            <ul>
+              {runs.map((run) => (
+                <RunRow key={run.id} run={run} />
+              ))}
+            </ul>
+          )}
         </Card>
 
         {/* Rules + guardian controls */}
@@ -252,6 +262,36 @@ export function DashboardStep({
         </div>
       </div>
     </div>
+  );
+}
+
+function RunRow({ run }: { run: AgentRun }) {
+  const [open, setOpen] = React.useState(false);
+  const profit = Number(run.pnl) >= 0;
+  return (
+    <li className="border-b hairline last:border-0">
+      <button onClick={() => setOpen((o) => !o)} className="flex w-full items-center justify-between gap-3 px-5 py-3.5 text-left hover:bg-paper-2/40">
+        <div className="min-w-0">
+          <div className="truncate text-[13px] text-ink">{run.query}</div>
+          <div className="mt-0.5 text-[11.5px] text-muted-2">spent {formatUsdc(Number(run.cost) / 1e6)} · earned {formatUsdc(Number(run.revenue) / 1e6)} USDC</div>
+        </div>
+        <span className={cx("shrink-0 font-mono text-[13px] tabular-nums", profit ? "text-accent-soft" : "text-[#ff8a84]")}>
+          {profit ? "+" : "−"}{formatUsdc(Math.abs(Number(run.pnl)) / 1e6)}
+        </span>
+      </button>
+      {open && (
+        <div className="border-t hairline bg-paper/40 px-5 py-3">
+          {run.payments.map((p, i) => (
+            <div key={i} className="flex items-center justify-between gap-3 py-1.5 text-[11.5px]">
+              <span className="text-muted">
+                {p.direction === "buy" ? "Paid" : "Received"} {formatUsdc(Number(p.amount) / 1e6)} USDC · {shortAddress(p.counterparty)}
+              </span>
+              <span className="font-mono text-muted-2">{p.transferId ? `settle ${p.transferId.slice(0, 8)}…` : p.status}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </li>
   );
 }
 
