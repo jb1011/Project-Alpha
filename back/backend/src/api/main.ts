@@ -92,6 +92,7 @@ async function main() {
     passkeyRpId: cfg.passkeyRpId,
     apiKeys,
     passkeys,
+    arc,
     jobs: jobDeps.jobs,
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,

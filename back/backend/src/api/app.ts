@@ -10,6 +10,7 @@ import { mountJobRoutes } from "./routes/jobs";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
 import { mountSchemaRoutes } from "./routes/schema";
+import { mountTreasuryRoutes } from "./routes/treasury";
 
 /** Dependencies for the REST API. Extended by later tasks (auth/onboard routes). */
 export interface ApiDeps {
@@ -30,6 +31,7 @@ export interface ApiDeps {
   jobRunner: import("../jobs/jobRunner").JobRunner;
   jobClientAddress: string;
   jobEvaluatorAddress: string;
+  arc: import("../adapters/arc/arcAdapter").ArcAdapter;
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
@@ -49,6 +51,7 @@ export function buildApiApp(deps: ApiDeps) {
   app.use("/api-keys/*", requireAuth(deps.jwtSecret));
   mountApiKeyRoutes(app, deps);
   mountProtectedRoutes(app, deps);
+  mountTreasuryRoutes(app, deps);
   mountJobRoutes(app, deps);
   mountMcpRoute(app, deps);
   return app;
