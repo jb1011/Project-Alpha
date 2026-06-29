@@ -54,18 +54,21 @@ function makeSpec(): AgentSpec {
  * provisioned operator flowed through.
  */
 function makeFakeArc() {
-  const createEntity = vi.fn(async (p: { operator: string }) => ({
+  // The saga drives create through the broadcast/confirm seam; broadcast receives the operator, so
+  // that's where we assert the provisioned operator flowed through (was createEntity before the split).
+  const broadcastCreateEntity = vi.fn(async (_p: { operator: string }) => "0xcreate" as const);
+  const confirmCreateEntity = vi.fn(async (txHash: string) => ({
     agentId: 7n,
     proxy: "0x0000000000000000000000000000000000000abc" as const,
     treasury: "0x0000000000000000000000000000000000000def" as const,
-    txHash: "0xcreate" as const,
-    operatorSeen: p.operator,
+    txHash: txHash as `0x${string}`,
   }));
   const setAgentWallet = vi.fn(async () => "0xbind" as const);
   const arc = {
     chainId: 31337,
     identityRegistry: "0x0000000000000000000000000000000000000001" as const,
-    createEntity,
+    broadcastCreateEntity,
+    confirmCreateEntity,
     setAgentWallet,
     walletSetDeadline: vi.fn(async () => 9_999_999_999n),
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
@@ -124,13 +127,13 @@ describe("onboarding Step 0: per-agent vault provisioning", () => {
     // (1) provision called exactly once, BEFORE createEntity.
     expect(provision).toHaveBeenCalledTimes(1);
     const provisionOrder = provision.mock.invocationCallOrder[0];
-    const createOrder = arc.createEntity.mock.invocationCallOrder[0];
+    const createOrder = arc.broadcastCreateEntity.mock.invocationCallOrder[0];
     expect(provisionOrder).toBeDefined();
     expect(createOrder).toBeDefined();
     expect(provisionOrder as number).toBeLessThan(createOrder as number);
 
     // (1b) the provisioned operator flowed into createEntity (not the shared signer address).
-    expect(arc.createEntity.mock.calls[0]?.[0].operator).toBe(PROVISIONED_OPERATOR);
+    expect(arc.broadcastCreateEntity.mock.calls[0]?.[0].operator).toBe(PROVISIONED_OPERATOR);
 
     // (2) the persisted record carries the sub-org/wallet ids + the provisioned operator,
     //     and the status has progressed past 'provisioned'.
@@ -218,7 +221,7 @@ describe("onboarding Step 0: per-agent vault provisioning", () => {
     // the stored sub-org/operator are reused (no second sub-org), and flow into createEntity + bind.
     expect(rec.turnkeySubOrgId).toBe("sub-1");
     expect(rec.operator?.toLowerCase()).toBe(PROVISIONED_OPERATOR.toLowerCase());
-    expect(arc.createEntity.mock.calls[0]?.[0].operator).toBe(PROVISIONED_OPERATOR);
+    expect(arc.broadcastCreateEntity.mock.calls[0]?.[0].operator).toBe(PROVISIONED_OPERATOR);
     expect(signerForEntity).toHaveBeenCalledWith({
       subOrgId: "sub-1",
       operator: PROVISIONED_OPERATOR,

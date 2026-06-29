@@ -9,9 +9,11 @@ import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import { loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
+import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
+import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import type { Address } from "../types";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
@@ -30,6 +32,8 @@ async function main() {
   const repo = new SqliteEntityRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);
+  const apiKeys = new SqliteApiKeyStore(db);
+  const passkeys = new SqlitePasskeyStore(db);
   const arc = new ArcAdapter({
     publicClient: publicClientFor(cfg),
     managerWallet: managerWalletClient(cfg),
@@ -86,6 +90,9 @@ async function main() {
     repo,
     runner,
     passkeyRpId: cfg.passkeyRpId,
+    apiKeys,
+    passkeys,
+    arc,
     jobs: jobDeps.jobs,
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,

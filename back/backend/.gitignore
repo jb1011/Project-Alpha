@@ -11,3 +11,6 @@ documents/
 !.env.example
 test/fixtures/*.local.json
 tools/passkey-capture/capture.js
+
+# Coverage reports (vitest --coverage)
+coverage/

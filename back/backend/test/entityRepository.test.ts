@@ -103,3 +103,20 @@ test("transaction commits both writes on success", () => {
   expect(repo.findByIdempotencyKey("key-1")?.status).toBe("translating");
   expect(repo.listEvents("key-1")).toHaveLength(1);
 });
+
+test("claimKey returns true when the idempotency key is unclaimed", () => {
+  expect(repo.claimKey(record())).toBe(true);
+  // the claim persisted the row so it can be resumed/observed.
+  expect(repo.findByIdempotencyKey("key-1")?.status).toBe("translating");
+});
+
+test("claimKey returns false on a second claim and does NOT overwrite the existing row", () => {
+  expect(repo.claimKey(record({ status: "pending", name: "First" }))).toBe(true);
+  // A second runner racing the same key loses the claim...
+  expect(repo.claimKey(record({ status: "created", name: "Second", agentId: "99" }))).toBe(false);
+  // ...and crucially the first owner's row is untouched (unlike upsert, which would overwrite).
+  const got = repo.findByIdempotencyKey("key-1");
+  expect(got?.status).toBe("pending");
+  expect(got?.name).toBe("First");
+  expect(got?.agentId).toBeNull();
+});

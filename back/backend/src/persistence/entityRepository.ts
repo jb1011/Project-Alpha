@@ -11,6 +11,13 @@ export interface EventRow {
 
 export interface EntityRepository {
   upsert(record: EntityRecord): void;
+  /**
+   * Atomically claim an idempotency key by inserting the row only if absent (`ON CONFLICT DO NOTHING`).
+   * Returns true if this caller won the claim, false if the key was already owned by another runner.
+   * Unlike `upsert` (which resolves a conflict via DO UPDATE), this rejects a conflict — the primitive
+   * that makes the key a cross-process mutex before any on-chain side effect.
+   */
+  claimKey(record: EntityRecord): boolean;
   findByIdempotencyKey(key: string): EntityRecord | undefined;
   findByAgentId(agentId: string): EntityRecord | undefined;
   list(): EntityRecord[];
@@ -107,24 +114,57 @@ function toRecord(r: Row): EntityRecord {
 export class SqliteEntityRepository implements EntityRepository {
   constructor(private readonly db: Database.Database) {}
 
+  /** Map an EntityRecord to the named bind params shared by the INSERT in upsert/claimKey. */
+  private static bindings(rec: EntityRecord) {
+    return {
+      idempotency_key: rec.idempotencyKey,
+      name: rec.name,
+      status: rec.status,
+      manager: rec.manager,
+      guardian: rec.guardian,
+      operator: rec.operator,
+      turnkey_sub_org_id: rec.turnkeySubOrgId ?? null,
+      turnkey_wallet_id: rec.turnkeyWalletId ?? null,
+      owner_tenant_id: rec.ownerTenantId ?? null,
+      error: rec.error ?? null,
+      spec_json: rec.specJson ?? null,
+      amendment_delay: rec.amendmentDelay,
+      ein: rec.ein,
+      formation_date: rec.formationDate,
+      oa_hash: rec.oaHash,
+      metadata_uri: rec.metadataURI,
+      doc_path: rec.docPath,
+      treasury_config: serializeTreasury(rec.treasuryConfig),
+      agent_id: rec.agentId,
+      proxy: rec.proxy,
+      treasury: rec.treasury,
+      create_tx_hash: rec.createTxHash,
+      bind_tx_hash: rec.bindTxHash,
+      fund_tx_hash: rec.fundTxHash,
+    };
+  }
+
+  private static readonly INSERT_COLUMNS = `
+        idempotency_key, name, status, manager, guardian, operator,
+        turnkey_sub_org_id, turnkey_wallet_id,
+        owner_tenant_id, error, spec_json,
+        amendment_delay,
+        ein, formation_date, oa_hash, metadata_uri, doc_path, treasury_config,
+        agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, updated_at`;
+
+  private static readonly INSERT_VALUES = `
+        @idempotency_key, @name, @status, @manager, @guardian, @operator,
+        @turnkey_sub_org_id, @turnkey_wallet_id,
+        @owner_tenant_id, @error, @spec_json,
+        @amendment_delay,
+        @ein, @formation_date, @oa_hash, @metadata_uri, @doc_path, @treasury_config,
+        @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, CURRENT_TIMESTAMP`;
+
   upsert(rec: EntityRecord): void {
     this.db
       .prepare(`
-        INSERT INTO entities (
-          idempotency_key, name, status, manager, guardian, operator,
-          turnkey_sub_org_id, turnkey_wallet_id,
-          owner_tenant_id, error, spec_json,
-          amendment_delay,
-          ein, formation_date, oa_hash, metadata_uri, doc_path, treasury_config,
-          agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, updated_at
-        ) VALUES (
-          @idempotency_key, @name, @status, @manager, @guardian, @operator,
-          @turnkey_sub_org_id, @turnkey_wallet_id,
-          @owner_tenant_id, @error, @spec_json,
-          @amendment_delay,
-          @ein, @formation_date, @oa_hash, @metadata_uri, @doc_path, @treasury_config,
-          @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, CURRENT_TIMESTAMP
-        )
+        INSERT INTO entities (${SqliteEntityRepository.INSERT_COLUMNS})
+        VALUES (${SqliteEntityRepository.INSERT_VALUES})
         ON CONFLICT(idempotency_key) DO UPDATE SET
           name=excluded.name, status=excluded.status, manager=excluded.manager,
           guardian=excluded.guardian, operator=excluded.operator,
@@ -139,32 +179,19 @@ export class SqliteEntityRepository implements EntityRepository {
           create_tx_hash=excluded.create_tx_hash, bind_tx_hash=excluded.bind_tx_hash,
           fund_tx_hash=excluded.fund_tx_hash, updated_at=CURRENT_TIMESTAMP
       `)
-      .run({
-        idempotency_key: rec.idempotencyKey,
-        name: rec.name,
-        status: rec.status,
-        manager: rec.manager,
-        guardian: rec.guardian,
-        operator: rec.operator,
-        turnkey_sub_org_id: rec.turnkeySubOrgId ?? null,
-        turnkey_wallet_id: rec.turnkeyWalletId ?? null,
-        owner_tenant_id: rec.ownerTenantId ?? null,
-        error: rec.error ?? null,
-        spec_json: rec.specJson ?? null,
-        amendment_delay: rec.amendmentDelay,
-        ein: rec.ein,
-        formation_date: rec.formationDate,
-        oa_hash: rec.oaHash,
-        metadata_uri: rec.metadataURI,
-        doc_path: rec.docPath,
-        treasury_config: serializeTreasury(rec.treasuryConfig),
-        agent_id: rec.agentId,
-        proxy: rec.proxy,
-        treasury: rec.treasury,
-        create_tx_hash: rec.createTxHash,
-        bind_tx_hash: rec.bindTxHash,
-        fund_tx_hash: rec.fundTxHash,
-      });
+      .run(SqliteEntityRepository.bindings(rec));
+  }
+
+  claimKey(rec: EntityRecord): boolean {
+    const info = this.db
+      .prepare(`
+        INSERT INTO entities (${SqliteEntityRepository.INSERT_COLUMNS})
+        VALUES (${SqliteEntityRepository.INSERT_VALUES})
+        ON CONFLICT(idempotency_key) DO NOTHING
+      `)
+      .run(SqliteEntityRepository.bindings(rec));
+    // changes === 1 -> we inserted (won the claim); 0 -> the key already existed (another owner).
+    return info.changes === 1;
   }
 
   findByIdempotencyKey(key: string): EntityRecord | undefined {
