@@ -105,4 +105,11 @@ contract LegalManagerSecurityTest is Test {
         assertEq(evil.balanceOf(treasury), 0); // nothing leaked
         assertEq(evil.balanceOf(address(lm)), 1_000); // balance untouched (whole tx reverted)
     }
+
+    // --- branch: sweepNative rejects a caller who is neither manager nor guardian ---
+    function test_sweepNativeRevertsForUnauthorizedCaller() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(LegalManager.NotAuthorized.selector);
+        lm.sweepNative(treasury);
+    }
 }
