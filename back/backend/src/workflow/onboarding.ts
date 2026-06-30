@@ -179,7 +179,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       ownerTenantId: d.ownerTenantId ?? rec?.ownerTenantId,
       error: null,
       specJson: d.specJson ?? rec?.specJson ?? null,
-      perTxCap: d.spec.treasury.perTxCapUsdc ? usdToUnits(d.spec.treasury.perTxCapUsdc) : null,
+      perTxCap:
+        d.spec.treasury.perTxCapUsdc != null ? usdToUnits(d.spec.treasury.perTxCapUsdc) : null,
     };
     d.repo.upsert(rec);
   }

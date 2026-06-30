@@ -9,6 +9,7 @@ const Body = z.object({
   perTxCapUsdc: z
     .string()
     .regex(/^\d+(\.\d{1,6})?$/)
+    .refine((v) => Number(v) > 0, "perTxCapUsdc must be greater than 0 (use null to clear)")
     .nullable(),
 });
 

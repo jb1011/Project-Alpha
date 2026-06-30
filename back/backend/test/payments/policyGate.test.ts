@@ -64,5 +64,6 @@ test("evaluatePolicy: rejects a single payment over the per-tx cap", () => {
     reason: "over-tx-cap",
   });
   expect(evaluatePolicy({ ...base, amount: 10_000n, perTxCap: 20_000n })).toEqual({ ok: true });
+  expect(evaluatePolicy({ ...base, amount: 20_000n, perTxCap: 20_000n })).toEqual({ ok: true }); // at-boundary allowed
   expect(evaluatePolicy({ ...base, amount: 30_000n })).toEqual({ ok: true }); // no cap set → allowed
 });

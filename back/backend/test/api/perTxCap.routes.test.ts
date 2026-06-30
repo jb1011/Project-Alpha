@@ -190,3 +190,15 @@ test("PATCH with bad amount → 400", async () => {
   });
   expect(res.status).toBe(400);
 });
+
+test("PATCH with zero cap → 400 (use null to clear)", async () => {
+  const app = makeApp();
+  const token = await login(app);
+  const id = seedBound(account.address, "a1");
+  const res = await app.request(`/entities/${encodeURIComponent(id)}/per-tx-cap`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ perTxCapUsdc: "0" }),
+  });
+  expect(res.status).toBe(400);
+});
