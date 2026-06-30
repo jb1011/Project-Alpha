@@ -9,6 +9,7 @@ import { mountAuthRoutes } from "./routes/auth";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
+import { mountPerTxCapRoutes } from "./routes/perTxCap";
 import { mountPolicyRoutes } from "./routes/policy";
 import { mountReputationRoutes } from "./routes/reputation";
 import { mountRunsRoutes } from "./routes/runs";
@@ -57,6 +58,7 @@ export function buildApiApp(deps: ApiDeps) {
   mountProtectedRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);
+  mountPerTxCapRoutes(app, deps);
   mountRunsRoutes(app, deps);
   mountJobRoutes(app, deps);
   mountReputationRoutes(app, deps);
