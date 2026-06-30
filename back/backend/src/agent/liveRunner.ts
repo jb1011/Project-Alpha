@@ -157,6 +157,8 @@ export async function fundPocket(
     identityRegistry: cfg.identityRegistry,
   });
   const gateway = new PocketGateway({ pocketPrivateKey: cfg.pocketPrivateKey, rpcUrl: cfg.rpcUrl });
+  const operatorAddress = operatorWallet.account?.address;
+  if (!operatorAddress) throw new Error("fundPocket: operator wallet has no account address");
   const txs: Hex[] = [];
   await topUpPocket(
     {
@@ -164,6 +166,7 @@ export async function fundPocket(
       usdc: cfg.usdc,
       pocketAddress: gateway.address,
       available: () => adapter.treasuryAvailable(treasury),
+      operatorUsdcBalance: () => adapter.usdcBalanceOf(cfg.usdc, operatorAddress),
       fundOperator: async (t, a) => {
         const h = await adapter.fundOperator(t, a);
         txs.push(h);
