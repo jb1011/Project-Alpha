@@ -50,3 +50,20 @@ test("denies zero amount", () => {
 test("denies negative amount", () => {
   expect(evaluatePolicy({ ...base, amount: -1n })).toEqual({ ok: false, reason: "zero-amount" });
 });
+
+test("evaluatePolicy: rejects a single payment over the per-tx cap", () => {
+  const base = {
+    available: 1_000_000n,
+    paused: false,
+    allowlistEnabled: false,
+    isAllowed: true,
+    runningPending: 0n,
+  };
+  expect(evaluatePolicy({ ...base, amount: 30_000n, perTxCap: 20_000n })).toEqual({
+    ok: false,
+    reason: "over-tx-cap",
+  });
+  expect(evaluatePolicy({ ...base, amount: 10_000n, perTxCap: 20_000n })).toEqual({ ok: true });
+  expect(evaluatePolicy({ ...base, amount: 20_000n, perTxCap: 20_000n })).toEqual({ ok: true }); // at-boundary allowed
+  expect(evaluatePolicy({ ...base, amount: 30_000n })).toEqual({ ok: true }); // no cap set → allowed
+});

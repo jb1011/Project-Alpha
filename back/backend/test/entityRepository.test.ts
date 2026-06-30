@@ -120,3 +120,32 @@ test("claimKey returns false on a second claim and does NOT overwrite the existi
   expect(got?.name).toBe("First");
   expect(got?.agentId).toBeNull();
 });
+
+test("findByTreasury returns the entity owning a treasury address (case-insensitive)", () => {
+  const rec = record({ status: "bound" });
+  rec.treasury = "0x000000000000000000000000000000000000000F" as `0x${string}`;
+  repo.upsert(rec);
+  expect(repo.findByTreasury("0x000000000000000000000000000000000000000f")?.idempotencyKey).toBe(
+    rec.idempotencyKey,
+  );
+  expect(repo.findByTreasury("0x0000000000000000000000000000000000000001")).toBeUndefined();
+});
+
+test("perTxCap round-trips as bigint (set and unset)", () => {
+  // With a cap set: stored as decimal string, read back as bigint
+  repo.upsert(record({ perTxCap: 50_000n }));
+  const got = repo.findByIdempotencyKey("key-1");
+  expect(got?.perTxCap).toBe(50_000n);
+
+  // Update to null (no cap)
+  repo.upsert(record({ perTxCap: null }));
+  const got2 = repo.findByIdempotencyKey("key-1");
+  expect(got2?.perTxCap).toBeNull();
+});
+
+test("perTxCap defaults to null when not provided (backward compat)", () => {
+  // The record() helper doesn't set perTxCap — the row reads back as null
+  repo.upsert(record());
+  const got = repo.findByIdempotencyKey("key-1");
+  expect(got?.perTxCap).toBeNull();
+});

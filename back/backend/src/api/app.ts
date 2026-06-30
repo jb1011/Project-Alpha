@@ -9,6 +9,10 @@ import { mountAuthRoutes } from "./routes/auth";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
+import { mountPerTxCapRoutes } from "./routes/perTxCap";
+import { mountPolicyRoutes } from "./routes/policy";
+import { mountReputationRoutes } from "./routes/reputation";
+import { mountRunsRoutes } from "./routes/runs";
 import { mountSchemaRoutes } from "./routes/schema";
 import { mountTreasuryRoutes } from "./routes/treasury";
 
@@ -32,6 +36,7 @@ export interface ApiDeps {
   jobClientAddress: string;
   jobEvaluatorAddress: string;
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
+  agentRuns: import("../persistence/agentRunStore").AgentRunStore;
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
@@ -52,7 +57,11 @@ export function buildApiApp(deps: ApiDeps) {
   mountApiKeyRoutes(app, deps);
   mountProtectedRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
+  mountPolicyRoutes(app, deps);
+  mountPerTxCapRoutes(app, deps);
+  mountRunsRoutes(app, deps);
   mountJobRoutes(app, deps);
+  mountReputationRoutes(app, deps);
   mountMcpRoute(app, deps);
   return app;
 }

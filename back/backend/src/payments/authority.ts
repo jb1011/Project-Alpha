@@ -23,6 +23,7 @@ export interface AuthorityDeps {
   ledger: PaymentLedger;
   readTreasury: (payee: Address) => Promise<TreasuryState>;
   signX402: (req: AuthorizeRequest) => Promise<{ header: string; ledgerRef: string }>;
+  perTxCap?: bigint; // optional per-transaction cap (off-chain enforcement)
 }
 
 export type AuthorizeResult = { ok: true; header: string } | { ok: false; reason: string };
@@ -46,6 +47,7 @@ export async function authorizePayment(
     allowlistEnabled: t.allowlistEnabled,
     isAllowed: t.isAllowed,
     runningPending: d.ledger.runningPending(),
+    perTxCap: d.perTxCap,
   });
   if (!decision.ok) return { ok: false, reason: decision.reason };
 

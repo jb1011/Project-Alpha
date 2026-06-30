@@ -129,6 +129,30 @@ export function migrate(db: Database.Database): void {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (job_key) REFERENCES jobs(job_key)
     );
+
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      id          TEXT PRIMARY KEY,
+      entity_key  TEXT NOT NULL,
+      query       TEXT NOT NULL,
+      cost        TEXT NOT NULL,
+      revenue     TEXT NOT NULL,
+      pnl         TEXT NOT NULL,
+      status      TEXT NOT NULL CHECK (status IN ('completed','failed')),
+      created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_entity ON agent_runs(entity_key, created_at);
+
+    CREATE TABLE IF NOT EXISTS run_payments (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id       TEXT NOT NULL,
+      direction    TEXT NOT NULL CHECK (direction IN ('buy','sell')),
+      counterparty TEXT NOT NULL,
+      amount       TEXT NOT NULL,
+      transfer_id  TEXT,
+      status       TEXT NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES agent_runs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_run_payments_run ON run_payments(run_id);
   `);
 
   // Additive migration for pre-existing dev DBs (new tables/columns only).
@@ -139,4 +163,5 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN owner_tenant_id TEXT");
   if (!cols.includes("error")) db.exec("ALTER TABLE entities ADD COLUMN error TEXT");
   if (!cols.includes("spec_json")) db.exec("ALTER TABLE entities ADD COLUMN spec_json TEXT");
+  if (!cols.includes("per_tx_cap")) db.exec("ALTER TABLE entities ADD COLUMN per_tx_cap TEXT");
 }
