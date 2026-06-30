@@ -1,5 +1,6 @@
 import { API_URL } from "./config";
 import type {
+  AgentRun,
   AgentSpec,
   ApiErrorBody,
   AuthSession,
@@ -105,6 +106,10 @@ export async function fundEntity(
 
 export async function getEntityTreasury(token: string, id: string): Promise<TreasuryView> {
   return request(`/entities/${encodeURIComponent(id)}/treasury`, { token });
+}
+
+export async function getEntityRuns(token: string, id: string): Promise<{ runs: AgentRun[] }> {
+  return request(`/entities/${encodeURIComponent(id)}/runs`, { token });
 }
 
 export async function fetchAgentSchema(): Promise<Record<string, unknown>> {

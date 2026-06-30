@@ -1,9 +1,9 @@
 // backend/src/agent/liveRunner.ts
 import Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
-import { http, createPublicClient } from "viem";
+import { http, type WalletClient, createPublicClient } from "viem";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { buildOperatorWalletClient } from "../adapters/turnkey/operatorWallet";
+import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
 import { makeSignX402 } from "../adapters/x402/signX402";
@@ -15,11 +15,15 @@ import { PaymentLedger } from "../payments/ledger";
 import { buildPaywall } from "../payments/seller";
 import { makeSettle } from "../payments/settle";
 import type { SettleFn } from "../payments/settle";
+import { SqliteAgentRunStore } from "../persistence/agentRunStore";
+import type { RunPaymentInput } from "../persistence/agentRunStore";
 import { migrate } from "../persistence/db";
+import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { usdToUnits } from "../policy/units";
-import type { Address, Hex } from "../types";
+import type { Address, EntityRecord, Hex } from "../types";
 import type { DemoResult } from "./demo";
 import { runDemo } from "./demo";
+import { persistAgentRun } from "./persistRun";
 import { buildVendor } from "./vendor";
 
 export interface SellParams {
@@ -115,16 +119,31 @@ export function resolveLiveAddresses(env: {
   return { treasury, vendorPayout, agentPayout };
 }
 
-/** Leg 0: governed top-up treasury -> operator(enclave) -> pocket -> Gateway. Returns the on-chain tx hashes. */
+/** The per-agent vault operator identity that is authorized to pull from a treasury. The live
+ *  funding leg signs `fundOperator` as THIS agent's vault operator (not a shared root key), so it
+ *  works for treasuries created via the per-agent Turnkey vault. Throws if the treasury has no
+ *  onboarded agent or that agent lacks a provisioned vault operator. */
+export function requireVaultOperator(
+  treasury: string,
+  e: EntityRecord | undefined,
+): { subOrgId: string; operator: string } {
+  if (!e) throw new Error(`fundPocket: no onboarded agent owns treasury ${treasury}`);
+  if (!e.turnkeySubOrgId || !e.operator)
+    throw new Error(
+      `fundPocket: agent ${e.idempotencyKey} has no per-agent vault operator (turnkey_sub_org_id + operator) to fund treasury ${treasury}`,
+    );
+  return { subOrgId: e.turnkeySubOrgId, operator: e.operator };
+}
+
+/** Leg 0: governed top-up treasury -> operator(enclave) -> pocket -> Gateway. Returns the on-chain tx
+ *  hashes. `operatorWallet` must sign as the treasury's authorized operator (its per-agent vault key). */
 export async function fundPocket(
   cfg: Config,
   treasury: Address,
   floatAtomic: bigint,
+  operatorWallet: WalletClient,
 ): Promise<Hex[]> {
-  if (!cfg.turnkey)
-    throw new Error("the funding bridge needs the Turnkey enclave operator (set TURNKEY_*)");
   if (!cfg.pocketPrivateKey) throw new Error("set POCKET_PRIVATE_KEY to run the funding bridge");
-  const operatorWallet = await buildOperatorWalletClient(cfg);
   const pub = createPublicClient({
     chain: chainFor(cfg.chainId, cfg.rpcUrl),
     transport: http(cfg.rpcUrl),
@@ -195,12 +214,23 @@ export async function buildLiveAgentRunner(
     verifyingContract: arcBatchingConfig.verifyingContract,
   });
 
+  const customer = pocketSignerFromKey(cfg.customerPrivateKey).address;
+
   // recording settle shared by both legs
   const settleTransferIds: string[] = [];
+  const paymentRecords: RunPaymentInput[] = [];
   const baseSettle = makeSettle({ facilitatorUrl: cfg.gatewayFacilitatorUrl });
   const settle: SettleFn = async (header, reqs) => {
     const r = await baseSettle(header, reqs);
     if (r.ok && r.transferId) settleTransferIds.push(r.transferId);
+    const isBuy = reqs.payTo.toLowerCase() === vendorPayout.toLowerCase();
+    paymentRecords.push({
+      direction: isBuy ? "buy" : "sell",
+      counterparty: isBuy ? reqs.payTo : customer,
+      amount: reqs.amount,
+      transferId: r.ok ? (r.transferId ?? null) : null,
+      status: r.ok ? "settled" : "failed",
+    });
     return r;
   };
 
@@ -236,12 +266,23 @@ export async function buildLiveAgentRunner(
     runningPending: ledger.runningPending(),
   });
   const floatAtomic = usdToUnits(cfg.fundingFloatUsdc);
-  const customer = pocketSignerFromKey(cfg.customerPrivateKey).address;
 
-  return (query: string) =>
-    runLive(
+  const runs = new SqliteAgentRunStore(db);
+  const entities = new SqliteEntityRepository(db);
+
+  // Fund from the treasury via ITS agent's own per-agent vault operator (not a shared root key),
+  // so the governed `fundOperator` call is authorized. Resolved once; the wallet is a Turnkey API
+  // read (no signing) so building it costs no enclave signatures.
+  const vault = requireVaultOperator(treasury, entities.findByTreasury(treasury));
+  const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
+
+  return async (query: string) => {
+    // reset per-run accumulators so receipts never bleed across invocations of this runner
+    settleTransferIds.length = 0;
+    paymentRecords.length = 0;
+    const result = await runLive(
       {
-        fund: (amt) => fundPocket(cfg, treasury, amt),
+        fund: (amt) => fundPocket(cfg, treasury, amt, operatorWallet),
         runDemo: (q) =>
           runDemo(
             {
@@ -272,4 +313,7 @@ export async function buildLiveAgentRunner(
       },
       query,
     );
+    persistAgentRun({ runs, entities }, treasury, query, result, paymentRecords);
+    return result;
+  };
 }

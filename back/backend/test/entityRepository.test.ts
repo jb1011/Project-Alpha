@@ -120,3 +120,13 @@ test("claimKey returns false on a second claim and does NOT overwrite the existi
   expect(got?.name).toBe("First");
   expect(got?.agentId).toBeNull();
 });
+
+test("findByTreasury returns the entity owning a treasury address (case-insensitive)", () => {
+  const rec = record({ status: "bound" });
+  rec.treasury = "0x000000000000000000000000000000000000000F" as `0x${string}`;
+  repo.upsert(rec);
+  expect(repo.findByTreasury("0x000000000000000000000000000000000000000f")?.idempotencyKey).toBe(
+    rec.idempotencyKey,
+  );
+  expect(repo.findByTreasury("0x0000000000000000000000000000000000000001")).toBeUndefined();
+});

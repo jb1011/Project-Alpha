@@ -9,6 +9,7 @@ import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import { loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
+import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
@@ -34,6 +35,7 @@ async function main() {
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
   const passkeys = new SqlitePasskeyStore(db);
+  const agentRuns = new SqliteAgentRunStore(db);
   const arc = new ArcAdapter({
     publicClient: publicClientFor(cfg),
     managerWallet: managerWalletClient(cfg),
@@ -97,6 +99,7 @@ async function main() {
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
+    agentRuns,
   });
 
   const port = Number(process.env.PORT ?? 8789);

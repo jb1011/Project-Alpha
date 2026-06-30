@@ -81,6 +81,9 @@ export type AuthSession = {
   expiresAt: number;
 };
 
+export type RunPayment = { direction: "buy" | "sell"; counterparty: string; amount: string; transferId: string | null; status: string };
+export type AgentRun = { id: string; query: string; cost: string; revenue: string; pnl: string; status: "completed" | "failed"; createdAt: number; payments: RunPayment[] };
+
 export type ApiErrorBody = {
   error: {
     code: string;
