@@ -10,7 +10,7 @@ export function mountReputationRoutes(app: Hono<{ Variables: AuthVars }>, deps: 
     const rec = deps.repo.findByIdempotencyKey(id);
     if (!rec || rec.ownerTenantId !== c.get("tenantId"))
       throw new ApiError("not_found", 404, "entity not found");
-    const jobs = deps.jobs.listByEntity(id);
+    const jobs = deps.jobs.listByEntity(id).filter((j) => j.ownerTenantId === c.get("tenantId"));
     const totalJobs = jobs.length;
     const reputed = jobs.filter((j) => j.status === "reputed").length;
     const completed = jobs.filter((j) => j.status === "completed" || j.status === "reputed").length;

@@ -154,6 +154,7 @@ test("GET /entities/:id/reputation → 200 with the agent's job track record", a
   expect(res.status).toBe(200);
   const body = await res.json();
   expect(body.reputation).toMatchObject({ totalJobs: 2, reputed: 1 });
+  expect(body.reputation.completed).toBe(2);
 });
 
 test("cross-tenant → 404", async () => {
