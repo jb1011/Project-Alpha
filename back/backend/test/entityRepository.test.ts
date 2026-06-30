@@ -130,3 +130,22 @@ test("findByTreasury returns the entity owning a treasury address (case-insensit
   );
   expect(repo.findByTreasury("0x0000000000000000000000000000000000000001")).toBeUndefined();
 });
+
+test("perTxCap round-trips as bigint (set and unset)", () => {
+  // With a cap set: stored as decimal string, read back as bigint
+  repo.upsert(record({ perTxCap: 50_000n }));
+  const got = repo.findByIdempotencyKey("key-1");
+  expect(got?.perTxCap).toBe(50_000n);
+
+  // Update to null (no cap)
+  repo.upsert(record({ perTxCap: null }));
+  const got2 = repo.findByIdempotencyKey("key-1");
+  expect(got2?.perTxCap).toBeNull();
+});
+
+test("perTxCap defaults to null when not provided (backward compat)", () => {
+  // The record() helper doesn't set perTxCap — the row reads back as null
+  repo.upsert(record());
+  const got = repo.findByIdempotencyKey("key-1");
+  expect(got?.perTxCap).toBeNull();
+});

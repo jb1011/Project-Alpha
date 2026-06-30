@@ -234,6 +234,18 @@ export async function buildLiveAgentRunner(
     return r;
   };
 
+  const floatAtomic = usdToUnits(cfg.fundingFloatUsdc);
+
+  const runs = new SqliteAgentRunStore(db);
+  const entities = new SqliteEntityRepository(db);
+
+  // Fund from the treasury via ITS agent's own per-agent vault operator (not a shared root key),
+  // so the governed `fundOperator` call is authorized. Resolved once; the wallet is a Turnkey API
+  // read (no signing) so building it costs no enclave signatures.
+  const entity = entities.findByTreasury(treasury);
+  const vault = requireVaultOperator(treasury, entity);
+  const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
+
   const authorityDeps = {
     ledger,
     readTreasury: async (payee: Address) => ({
@@ -250,6 +262,7 @@ export async function buildLiveAgentRunner(
         network: req.network,
         maxTimeoutSeconds: req.maxTimeoutSeconds,
       }),
+    perTxCap: entity?.perTxCap ?? undefined,
   };
   const authorize = (req: Parameters<typeof authorizePayment>[1]) =>
     authorizePayment(authorityDeps, req);
@@ -265,16 +278,6 @@ export async function buildLiveAgentRunner(
     available: await adapter.treasuryAvailable(treasury),
     runningPending: ledger.runningPending(),
   });
-  const floatAtomic = usdToUnits(cfg.fundingFloatUsdc);
-
-  const runs = new SqliteAgentRunStore(db);
-  const entities = new SqliteEntityRepository(db);
-
-  // Fund from the treasury via ITS agent's own per-agent vault operator (not a shared root key),
-  // so the governed `fundOperator` call is authorized. Resolved once; the wallet is a Turnkey API
-  // read (no signing) so building it costs no enclave signatures.
-  const vault = requireVaultOperator(treasury, entities.findByTreasury(treasury));
-  const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
 
   return async (query: string) => {
     // reset per-run accumulators so receipts never bleed across invocations of this runner
