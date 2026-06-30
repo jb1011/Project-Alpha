@@ -8,6 +8,7 @@ import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import { assertOperatorDistinct, translate } from "../policy/translator";
+import { usdToUnits } from "../policy/units";
 import type { EntityRecord } from "../types";
 
 /** Result of provisioning a per-agent Turnkey vault (the saga only needs these three fields). */
@@ -111,6 +112,7 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
           ownerTenantId: d.ownerTenantId,
           error: null,
           specJson: d.specJson ?? null,
+          perTxCap: null,
         };
     rec = provisioned;
     d.repo.transaction(() => {
@@ -177,6 +179,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       ownerTenantId: d.ownerTenantId ?? rec?.ownerTenantId,
       error: null,
       specJson: d.specJson ?? rec?.specJson ?? null,
+      perTxCap:
+        d.spec.treasury.perTxCapUsdc != null ? usdToUnits(d.spec.treasury.perTxCapUsdc) : null,
     };
     d.repo.upsert(rec);
   }

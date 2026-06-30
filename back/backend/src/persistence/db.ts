@@ -163,4 +163,5 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN owner_tenant_id TEXT");
   if (!cols.includes("error")) db.exec("ALTER TABLE entities ADD COLUMN error TEXT");
   if (!cols.includes("spec_json")) db.exec("ALTER TABLE entities ADD COLUMN spec_json TEXT");
+  if (!cols.includes("per_tx_cap")) db.exec("ALTER TABLE entities ADD COLUMN per_tx_cap TEXT");
 }

@@ -58,6 +58,9 @@ export const AgentSpecSchema = z
       spendingCapUsdc: usdcAmount,
       spendingPeriod: durationInRange(1n, MAX_PERIOD_SECONDS, "must be a duration in (0, 365d]"),
       allowlistEnabled: z.boolean().default(false),
+      perTxCapUsdc: usdcAmount
+        .refine((v) => Number(v) > 0, "perTxCapUsdc must be greater than 0")
+        .optional(), // optional off-chain per-transaction cap
     }),
     governance: z.object({
       amendmentDelay: durationInRange(

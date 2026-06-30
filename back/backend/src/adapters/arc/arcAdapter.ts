@@ -194,6 +194,37 @@ export class ArcAdapter {
     return txHash;
   }
 
+  /** Schedule a treasury policy change (manager-gated, timelocked). Returns the on-chain tx hash. */
+  async schedulePolicyUpdate(
+    treasury: Address,
+    p: { newCap: bigint; newPeriod: bigint; allowlistOn: boolean; newPayout: Address },
+  ): Promise<Hex> {
+    const { request } = await this.d.publicClient.simulateContract({
+      account: this.d.managerWallet.account ?? undefined,
+      address: treasury,
+      abi: agentTreasuryAbi,
+      functionName: "schedulePolicyUpdate",
+      args: [p.newCap, p.newPeriod, p.allowlistOn, p.newPayout],
+    });
+    const hash = await this.d.managerWallet.writeContract(request);
+    await this.d.publicClient.waitForTransactionReceipt({ hash });
+    return hash;
+  }
+
+  /** Execute a previously-scheduled policy change once its timelock has elapsed (manager-gated). */
+  async executePolicyUpdate(treasury: Address, policyId: Hex): Promise<Hex> {
+    const { request } = await this.d.publicClient.simulateContract({
+      account: this.d.managerWallet.account ?? undefined,
+      address: treasury,
+      abi: agentTreasuryAbi,
+      functionName: "executePolicyUpdate",
+      args: [policyId],
+    });
+    const hash = await this.d.managerWallet.writeContract(request);
+    await this.d.publicClient.waitForTransactionReceipt({ hash });
+    return hash;
+  }
+
   /** Optional v1 step: top up the treasury vault with ERC-20 USDC from the manager wallet. */
   async fundTreasury(p: { usdc: Address; treasury: Address; amount: bigint }): Promise<Hex> {
     const { request } = await this.d.publicClient.simulateContract({

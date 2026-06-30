@@ -50,4 +50,6 @@ export interface EntityRecord {
   error?: string | null;
   /** Validated AgentSpec JSON, persisted so the reconciler/fund can re-run the saga. */
   specJson?: string | null;
+  /** Off-chain per-transaction USDC cap in base units (6 decimals). null = no cap. */
+  perTxCap?: bigint | null;
 }
