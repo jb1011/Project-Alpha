@@ -23,6 +23,7 @@ export type EntityView = {
   bindTxHash: string | null;
   fundTxHash: string | null;
   error: string | null;
+  perTxCap: string | null;
 };
 
 /** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */
@@ -59,6 +60,7 @@ export type AgentSpec = {
     spendingCapUsdc: string;
     spendingPeriod: string;
     allowlistEnabled?: boolean;
+    perTxCapUsdc?: string;
   };
   governance?: {
     amendmentDelay?: string;
@@ -83,6 +85,51 @@ export type AuthSession = {
 
 export type RunPayment = { direction: "buy" | "sell"; counterparty: string; amount: string; transferId: string | null; status: string };
 export type AgentRun = { id: string; query: string; cost: string; revenue: string; pnl: string; status: "completed" | "failed"; createdAt: number; payments: RunPayment[] };
+
+export type ReputationView = {
+  totalJobs: number;
+  completed: number;
+  reputed: number;
+};
+
+export type JobStatus =
+  | "pending"
+  | "created"
+  | "funded"
+  | "submitted"
+  | "completed"
+  | "reputed"
+  | "failed";
+
+export type JobView = {
+  jobKey: string;
+  jobId: string | null;
+  entityKey: string;
+  status: JobStatus;
+  clientAddress: string;
+  evaluatorAddress: string;
+  providerAddress: string;
+  budgetAmount: string;
+  description: string;
+  deliverableHash: string | null;
+  deliverablePath: string | null;
+  createTxHash: string | null;
+  fundTxHash: string | null;
+  submitTxHash: string | null;
+  completeTxHash: string | null;
+  sweepTxHash: string | null;
+  reputationTxHash: string | null;
+  error: string | null;
+};
+
+export type ApiKeyView = {
+  id: string;
+  label: string | null;
+  createdAt: number;
+  revokedAt: number | null;
+};
+
+export type MintedApiKey = ApiKeyView & { key: string };
 
 export type ApiErrorBody = {
   error: {

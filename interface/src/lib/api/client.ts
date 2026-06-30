@@ -3,9 +3,13 @@ import type {
   AgentRun,
   AgentSpec,
   ApiErrorBody,
+  ApiKeyView,
   AuthSession,
   EntityView,
   GuardianPasskey,
+  JobView,
+  MintedApiKey,
+  ReputationView,
   TreasuryView,
 } from "./types";
 import { ApiError } from "./types";
@@ -110,6 +114,84 @@ export async function getEntityTreasury(token: string, id: string): Promise<Trea
 
 export async function getEntityRuns(token: string, id: string): Promise<{ runs: AgentRun[] }> {
   return request(`/entities/${encodeURIComponent(id)}/runs`, { token });
+}
+
+export async function getEntityReputation(
+  token: string,
+  id: string,
+): Promise<{ reputation: ReputationView }> {
+  return request(`/entities/${encodeURIComponent(id)}/reputation`, { token });
+}
+
+export async function listEntityJobs(token: string, id: string): Promise<JobView[]> {
+  return request(`/entities/${encodeURIComponent(id)}/jobs`, { token });
+}
+
+export async function getJob(token: string, jobKey: string): Promise<JobView> {
+  return request(`/jobs/${encodeURIComponent(jobKey)}`, { token });
+}
+
+export async function schedulePolicyUpdate(
+  token: string,
+  id: string,
+  body: {
+    capUsdc: string;
+    periodSeconds: number;
+    allowlistOn: boolean;
+    payoutAddress: string;
+  },
+): Promise<{ txHash: string }> {
+  return request(`/entities/${encodeURIComponent(id)}/policy`, {
+    method: "POST",
+    token,
+    body,
+  });
+}
+
+export async function executePolicyUpdate(
+  token: string,
+  id: string,
+  policyId: string,
+): Promise<{ txHash: string }> {
+  return request(`/entities/${encodeURIComponent(id)}/policy/execute`, {
+    method: "POST",
+    token,
+    body: { policyId },
+  });
+}
+
+export async function patchPerTxCap(
+  token: string,
+  id: string,
+  perTxCapUsdc: string | null,
+): Promise<{ perTxCap: string | null }> {
+  return request(`/entities/${encodeURIComponent(id)}/per-tx-cap`, {
+    method: "PATCH",
+    token,
+    body: { perTxCapUsdc },
+  });
+}
+
+export async function mintApiKey(
+  token: string,
+  label?: string,
+): Promise<MintedApiKey> {
+  return request("/api-keys", {
+    method: "POST",
+    token,
+    body: label ? { label } : {},
+  });
+}
+
+export async function listApiKeys(token: string): Promise<ApiKeyView[]> {
+  return request("/api-keys", { token });
+}
+
+export async function revokeApiKey(token: string, id: string): Promise<void> {
+  await request(`/api-keys/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    token,
+  });
 }
 
 export async function fetchAgentSchema(): Promise<Record<string, unknown>> {

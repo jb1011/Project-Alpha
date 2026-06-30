@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Suspense,
   useCallback,
   useEffect,
   useState,
@@ -8,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   AgentConfig,
   emptyConfig,
@@ -17,88 +19,54 @@ import {
   PHASES,
 } from "./types";
 import type { EntityView } from "@/lib/api/types";
+import {
+  clearOnboardingStorage,
+  isOnboardingComplete,
+  ONBOARDING_STORAGE_KEY,
+  readPersistedOnboarding,
+  type PersistedOnboarding,
+} from "@/lib/onboarding/storage";
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
 import { DeployStep } from "./steps/DeployStep";
 import { FundStep } from "./steps/FundStep";
-import { DashboardStep } from "./steps/DashboardStep";
 import { Stepper } from "./Stepper";
 import { Wordmark } from "../landing/Wordmark";
 import { Button, cx } from "./primitives";
-import { AuthProvider, useAuth } from "./AuthProvider";
+import { AuthProvider } from "./AuthProvider";
 import { Web3Provider } from "../providers/Web3Provider";
 
-const STORAGE_KEY = "pa-onboarding-v2";
-
-type Persisted = {
-  phase: Phase;
-  config: AgentConfig;
-  done: Record<string, boolean>;
-  session: OnboardingSession;
-};
+type Persisted = PersistedOnboarding;
 
 function phaseIndex(phase: Phase): number {
   return PHASES.findIndex((p) => p.id === phase);
 }
 
-let cachedOnboardingRaw: string | null | undefined;
-let cachedOnboarding: Persisted | null = null;
-
-function readPersistedOnboarding(): Persisted | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw === cachedOnboardingRaw) return cachedOnboarding;
-    cachedOnboardingRaw = raw;
-    if (!raw) {
-      cachedOnboarding = null;
-      return null;
-    }
-    cachedOnboarding = JSON.parse(raw) as Persisted;
-    return cachedOnboarding;
-  } catch {
-    cachedOnboardingRaw = null;
-    cachedOnboarding = null;
-    return null;
-  }
-}
-
 function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
-  const { logout } = useAuth();
-  const [phase, setPhase] = useState<Phase>(() =>
-    initial?.phase && phaseIndex(initial.phase) > 0 ? initial.phase : "welcome",
-  );
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const wantsNewAgent = searchParams.get("new") === "1";
+  const [phase, setPhase] = useState<Phase>(() => {
+    if (wantsNewAgent) return "welcome";
+    return initial?.phase && phaseIndex(initial.phase) > 0 ? initial.phase : "welcome";
+  });
   const [config, setConfig] = useState<AgentConfig>(() =>
-    initial?.config ? { ...emptyConfig(), ...initial.config } : emptyConfig(),
+    wantsNewAgent ? emptyConfig() : initial?.config ? { ...emptyConfig(), ...initial.config } : emptyConfig(),
   );
   const [session, setSession] = useState<OnboardingSession>(() =>
-    initial?.session
-      ? { ...emptySession(), ...initial.session, guardianPasskey: null }
-      : emptySession(),
+    wantsNewAgent
+      ? emptySession()
+      : initial?.session
+        ? { ...emptySession(), ...initial.session, guardianPasskey: null }
+        : emptySession(),
   );
-  const [done, setDone] = useState<Record<string, boolean>>(() => initial?.done ?? {});
+  const [done, setDone] = useState<Record<string, boolean>>(() =>
+    wantsNewAgent ? {} : (initial?.done ?? {}),
+  );
   const [resumed, setResumed] = useState(
-    () => !!(initial?.phase && phaseIndex(initial.phase) > 0),
+    () => !wantsNewAgent && !!(initial?.phase && phaseIndex(initial.phase) > 0),
   );
-
-  const handleEntityUpdate = useCallback((entity: EntityView) => {
-    setSession((s) => ({ ...s, entity }));
-  }, []);
-
-  useEffect(() => {
-    const data: Persisted = {
-      phase,
-      config,
-      done,
-      session: { ...session, guardianPasskey: null },
-    };
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    } catch {
-      /* storage full / disabled */
-    }
-  }, [phase, config, done, session]);
 
   const goTo = useCallback((next: Phase) => {
     setPhase(next);
@@ -108,6 +76,55 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     }
   }, []);
 
+  const startOver = useCallback(() => {
+    clearOnboardingStorage();
+    setConfig(emptyConfig());
+    setSession(emptySession());
+    setDone({});
+    setResumed(false);
+    goTo("welcome");
+  }, [goTo]);
+
+  // ?new=1 → fresh wizard for another agent (keep wallet session).
+  useEffect(() => {
+    if (!wantsNewAgent) return;
+    clearOnboardingStorage();
+    router.replace("/onboarding");
+  }, [wantsNewAgent, router]);
+
+  // Completed wizard in storage → send to that agent's dashboard, not a stale fund step.
+  useEffect(() => {
+    if (wantsNewAgent || !initial) return;
+    if (!isOnboardingComplete(initial)) return;
+    const id = initial.session.entityId ?? initial.session.entity?.id;
+    if (id) router.replace(`/agents/${encodeURIComponent(id)}`);
+  }, [initial, wantsNewAgent, router]);
+
+  const handleEntityUpdate = useCallback((entity: EntityView) => {
+    setSession((s) => ({ ...s, entity }));
+  }, []);
+
+  useEffect(() => {
+    if (phase === "dashboard") {
+      const id = session.entityId ?? session.entity?.id;
+      if (id) router.replace(`/agents/${encodeURIComponent(id)}`);
+    }
+  }, [phase, session.entityId, session.entity?.id, router]);
+
+  useEffect(() => {
+    const data: Persisted = {
+      phase,
+      config,
+      done,
+      session: { ...session, guardianPasskey: null },
+    };
+    try {
+      window.localStorage.setItem(ONBOARDING_STORAGE_KEY, JSON.stringify(data));
+    } catch {
+      /* storage full / disabled */
+    }
+  }, [phase, config, done, session]);
+
   const completePhase = useCallback(
     (current: Phase, next: Phase) => {
       setDone((d) => ({ ...d, [current]: true }));
@@ -116,21 +133,17 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     [goTo],
   );
 
-  const resetAll = useCallback(() => {
-    logout();
-    try {
-      window.localStorage.removeItem(STORAGE_KEY);
-    } catch {
-      /* ignore */
-    }
-    setConfig(emptyConfig());
-    setSession(emptySession());
-    setDone({});
-    goTo("welcome");
-  }, [goTo, logout]);
-
   const idx = phaseIndex(phase);
-  const isDashboard = phase === "dashboard";
+
+  const finishOnboarding = useCallback(() => {
+    const id = session.entityId ?? session.entity?.id;
+    clearOnboardingStorage();
+    if (id) {
+      router.push(`/agents/${encodeURIComponent(id)}`);
+      return;
+    }
+    goTo("fund");
+  }, [session.entityId, session.entity?.id, router, goTo]);
 
   return (
     <div className="min-h-screen bg-paper font-mono text-ink">
@@ -147,108 +160,112 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
             </span>
           </div>
           <div className="flex items-center gap-2">
-            {!isDashboard && (
-              <span className="hidden text-[12px] text-muted-2 sm:inline">
-                Step {idx + 1} of {PHASES.length}
-              </span>
-            )}
+            <span className="hidden text-[12px] text-muted-2 sm:inline">
+              Step {idx + 1} of {PHASES.length - 1}
+            </span>
             <Link
               href="/"
               className="rounded-full px-3 py-1.5 text-[12.5px] text-muted transition-colors hover:bg-paper-2 hover:text-ink"
             >
               Exit
             </Link>
+            {phase !== "welcome" && (
+              <button
+                type="button"
+                onClick={startOver}
+                className="rounded-full border hairline-strong px-3 py-1.5 text-[12px] text-muted-2 transition-colors hover:bg-paper-2 hover:text-ink"
+              >
+                Start over
+              </button>
+            )}
           </div>
         </div>
       </header>
 
-      {isDashboard ? (
-        <main className="mx-auto max-w-[1180px] px-5 pb-24 pt-8 lg:px-8">
-          <DashboardStep
-            config={config}
-            entity={session.entity}
-            onRestart={resetAll}
+      <main className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
+        <div className="lg:sticky lg:top-24 lg:self-start">
+          <Stepper
+            current={phase}
+            done={done}
+            onJump={(p) => {
+              if (p === "dashboard") return;
+              if (done[p] || phaseIndex(p) < idx) goTo(p);
+            }}
           />
-        </main>
-      ) : (
-        <main className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
-          <div className="lg:sticky lg:top-24 lg:self-start">
-            <Stepper
-              current={phase}
-              done={done}
-              onJump={(p) => {
-                if (done[p] || phaseIndex(p) < idx) goTo(p);
-              }}
-            />
-          </div>
+        </div>
 
-          <div className="min-w-0">
-            {resumed && (
-              <div className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-accent/25 bg-accent/[0.06] px-4 py-2.5 text-[12.5px] text-accent-soft">
-                <span>Welcome back — we picked up your onboarding where you left off.</span>
-                <button
-                  onClick={resetAll}
-                  className="shrink-0 text-[12px] text-muted underline-offset-2 hover:text-ink hover:underline"
-                >
-                  Start over
-                </button>
+        <div className="min-w-0">
+          {resumed && (
+            <div className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-accent/25 bg-accent/[0.06] px-4 py-2.5 text-[12.5px] text-accent-soft">
+              <span>Welcome back — we picked up your onboarding where you left off.</span>
+              <button
+                onClick={startOver}
+                className="shrink-0 text-[12px] text-muted underline-offset-2 hover:text-ink hover:underline"
+              >
+                Start over
+              </button>
+            </div>
+          )}
+
+          <StepFrame phase={phase}>
+            {phase === "welcome" && (
+              <WelcomeStep
+                guardianPasskey={session.guardianPasskey}
+                onPasskey={(guardianPasskey) =>
+                  setSession((s) => ({ ...s, guardianPasskey }))
+                }
+                onComplete={() => completePhase("welcome", "configure")}
+              />
+            )}
+            {phase === "configure" && (
+              <ConfigureStep
+                config={config}
+                onChange={setConfig}
+                onBack={() => goTo("welcome")}
+                onComplete={() => completePhase("configure", "agreement")}
+              />
+            )}
+            {phase === "agreement" && (
+              <AgreementStep
+                config={config}
+                guardianPasskey={session.guardianPasskey}
+                idempotencyKey={session.idempotencyKey}
+                onBack={() => goTo("configure")}
+                onSubmitted={(entityId, idempotencyKey) => {
+                  setSession((s) => ({
+                    ...s,
+                    entityId,
+                    idempotencyKey,
+                  }));
+                  completePhase("agreement", "deploy");
+                }}
+              />
+            )}
+            {phase === "deploy" && (
+              <DeployStep
+                entityId={session.entityId}
+                config={config}
+                onEntity={handleEntityUpdate}
+                onComplete={() => completePhase("deploy", "fund")}
+              />
+            )}
+            {phase === "fund" && (
+              <FundStep
+                config={config}
+                entityId={session.entityId}
+                entity={session.entity}
+                onEntity={handleEntityUpdate}
+                onComplete={finishOnboarding}
+              />
+            )}
+            {phase === "dashboard" && (
+              <div className="py-8 text-center text-[13px] text-muted">
+                Redirecting to your agent dashboard…
               </div>
             )}
-
-            <StepFrame phase={phase}>
-              {phase === "welcome" && (
-                <WelcomeStep
-                  guardianPasskey={session.guardianPasskey}
-                  onPasskey={(guardianPasskey) =>
-                    setSession((s) => ({ ...s, guardianPasskey }))
-                  }
-                  onComplete={() => completePhase("welcome", "configure")}
-                />
-              )}
-              {phase === "configure" && (
-                <ConfigureStep
-                  config={config}
-                  onChange={setConfig}
-                  onBack={() => goTo("welcome")}
-                  onComplete={() => completePhase("configure", "agreement")}
-                />
-              )}
-              {phase === "agreement" && (
-                <AgreementStep
-                  config={config}
-                  guardianPasskey={session.guardianPasskey}
-                  idempotencyKey={session.idempotencyKey}
-                  onBack={() => goTo("configure")}
-                  onSubmitted={(entityId, idempotencyKey) => {
-                    setSession((s) => ({
-                      ...s,
-                      entityId,
-                      idempotencyKey,
-                    }));
-                    completePhase("agreement", "deploy");
-                  }}
-                />
-              )}
-              {phase === "deploy" && (
-                <DeployStep
-                  entityId={session.entityId}
-                  onEntity={handleEntityUpdate}
-                  onComplete={() => completePhase("deploy", "fund")}
-                />
-              )}
-              {phase === "fund" && (
-                <FundStep
-                  config={config}
-                  entityId={session.entityId}
-                  entity={session.entity}
-                  onEntity={handleEntityUpdate}
-                  onComplete={() => completePhase("fund", "dashboard")}
-                />
-              )}
-            </StepFrame>
-          </div>
-        </main>
-      )}
+          </StepFrame>
+        </div>
+      </main>
     </div>
   );
 }
@@ -276,7 +293,9 @@ export function OnboardingFlow() {
   return (
     <Web3Provider>
       <AuthProvider>
-        <OnboardingFlowHydrated />
+        <Suspense fallback={<div className="min-h-screen bg-paper" aria-hidden />}>
+          <OnboardingFlowHydrated />
+        </Suspense>
       </AuthProvider>
     </Web3Provider>
   );
