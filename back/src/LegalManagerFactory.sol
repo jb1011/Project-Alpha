@@ -93,16 +93,20 @@ contract LegalManagerFactory is IERC721Receiver, Ownable2Step {
         //    by the same timelock cadence as operating-agreement amendments.
         treasury = _deployTreasury(manager, guardian, operator, amendmentDelay, proxy, tcfg);
 
-        // 4. Hand the identity NFT to the agent's manager. Wallet binding (setAgentWallet)
-        //    happens later as a separate manager-signed step.
-        identityRegistry.transferFrom(address(this), manager, agentId);
-
-        // 5. Record both in the public registry. Guard against an id the registry has already
-        //    handed out, so a misbehaving/upgraded registry cannot orphan an existing entity.
+        // 4. Record both in the public registry BEFORE the NFT hand-off (checks-effects-
+        //    interactions). Guard against an id the registry has already handed out, so a
+        //    misbehaving/upgraded registry cannot orphan an existing entity.
         if (entityByAgentId[agentId] != address(0)) revert AgentIdAlreadyUsed(agentId);
         entities.push(proxy);
         entityByAgentId[agentId] = proxy;
         treasuryByAgentId[agentId] = treasury;
+
+        // 5. Hand the identity NFT to the agent's manager. Wallet binding (setAgentWallet)
+        //    happens later as a separate manager-signed step. This transferFrom is the only
+        //    external call to a caller-influenced address (manager), so it comes last, after
+        //    all state is written. transferFrom (not safeTransferFrom) fires no callback today;
+        //    ordering it last also keeps the function reentrancy-safe if that ever changes.
+        identityRegistry.transferFrom(address(this), manager, agentId);
 
         emit EntityCreated(agentId, proxy, manager);
         emit TreasuryCreated(agentId, treasury, operator);
