@@ -1,5 +1,5 @@
-import { expect, test } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
+import { expect, test } from "vitest";
 import { derivePocketKey } from "../../../src/adapters/x402/pocketDerivation";
 
 const seed = `0x${"11".repeat(32)}` as const;

@@ -6,6 +6,7 @@ import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
+import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { makeSignX402 } from "../adapters/x402/signX402";
 import { chainFor } from "../chains";
 import { type Config, loadConfig } from "../config/env";
@@ -135,15 +136,23 @@ export function requireVaultOperator(
   return { subOrgId: e.turnkeySubOrgId, operator: e.operator };
 }
 
+/** The pocket master seed is required to derive a per-agent pocket. */
+function requireMasterSeed(cfg: Config): Hex {
+  if (!cfg.pocketMasterSeed) throw new Error("set POCKET_MASTER_SEED to run the funding bridge");
+  return cfg.pocketMasterSeed;
+}
+
 /** Leg 0: governed top-up treasury -> operator(enclave) -> pocket -> Gateway. Returns the on-chain tx
- *  hashes. `operatorWallet` must sign as the treasury's authorized operator (its per-agent vault key). */
+ *  hashes. `operatorWallet` must sign as the treasury's authorized operator (its per-agent vault key).
+ *  The pocket used is derived per-agent from the master seed + `entityKey` (no per-agent key storage). */
 export async function fundPocket(
   cfg: Config,
   treasury: Address,
   floatAtomic: bigint,
   operatorWallet: WalletClient,
+  entityKey: string,
 ): Promise<Hex[]> {
-  if (!cfg.pocketPrivateKey) throw new Error("set POCKET_PRIVATE_KEY to run the funding bridge");
+  const pocketKey = derivePocketKey(requireMasterSeed(cfg), entityKey);
   const pub = createPublicClient({
     chain: chainFor(cfg.chainId, cfg.rpcUrl),
     transport: http(cfg.rpcUrl),
@@ -156,7 +165,7 @@ export async function fundPocket(
     factory: (cfg.factoryAddress ?? "0x0") as Address,
     identityRegistry: cfg.identityRegistry,
   });
-  const gateway = new PocketGateway({ pocketPrivateKey: cfg.pocketPrivateKey, rpcUrl: cfg.rpcUrl });
+  const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
   const txs: Hex[] = [];
   await topUpPocket(
     {
@@ -186,7 +195,7 @@ export async function buildLiveAgentRunner(
   cfg: Config = loadConfig(),
 ): Promise<(query: string) => Promise<LiveRunResult>> {
   if (!cfg.anthropicApiKey) throw new Error("set ANTHROPIC_API_KEY to run the agent");
-  if (!cfg.pocketPrivateKey) throw new Error("set POCKET_PRIVATE_KEY to run the agent");
+  requireMasterSeed(cfg);
   const { treasury, vendorPayout, agentPayout } = resolveLiveAddresses({
     treasury: process.env.TREASURY_ADDRESS,
     vendorPayout: process.env.VENDOR_PAYOUT_ADDRESS,
@@ -207,8 +216,20 @@ export async function buildLiveAgentRunner(
   const db = new Database(cfg.dbPath);
   migrate(db);
   const ledger = new PaymentLedger(db);
+  const runs = new SqliteAgentRunStore(db);
+  const entities = new SqliteEntityRepository(db);
+
+  // Fund from the treasury via ITS agent's own per-agent vault operator (not a shared root key),
+  // so the governed `fundOperator` call is authorized. Resolved once; the wallet is a Turnkey API
+  // read (no signing) so building it costs no enclave signatures.
+  const maybeEntity = entities.findByTreasury(treasury);
+  const vault = requireVaultOperator(treasury, maybeEntity);
+  if (!maybeEntity) throw new Error(`fundPocket: no onboarded agent owns treasury ${treasury}`);
+  const entity = maybeEntity;
+  const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
+
   const signX402 = makeSignX402({
-    signer: pocketSignerFromKey(cfg.pocketPrivateKey),
+    signer: pocketSignerFromKey(derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey)),
     chainId: cfg.chainId,
     network: arcBatchingConfig.network,
     verifyingContract: arcBatchingConfig.verifyingContract,
@@ -235,16 +256,6 @@ export async function buildLiveAgentRunner(
   };
 
   const floatAtomic = usdToUnits(cfg.fundingFloatUsdc);
-
-  const runs = new SqliteAgentRunStore(db);
-  const entities = new SqliteEntityRepository(db);
-
-  // Fund from the treasury via ITS agent's own per-agent vault operator (not a shared root key),
-  // so the governed `fundOperator` call is authorized. Resolved once; the wallet is a Turnkey API
-  // read (no signing) so building it costs no enclave signatures.
-  const entity = entities.findByTreasury(treasury);
-  const vault = requireVaultOperator(treasury, entity);
-  const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
 
   const authorityDeps = {
     ledger,
@@ -285,7 +296,7 @@ export async function buildLiveAgentRunner(
     paymentRecords.length = 0;
     const result = await runLive(
       {
-        fund: (amt) => fundPocket(cfg, treasury, amt, operatorWallet),
+        fund: (amt) => fundPocket(cfg, treasury, amt, operatorWallet, entity.idempotencyKey),
         runDemo: (q) =>
           runDemo(
             {

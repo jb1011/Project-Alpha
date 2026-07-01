@@ -23,7 +23,7 @@ const EnvSchema = z.object({
   FACTORY_ADDRESS: addressSchema.optional(),
   GUARDIAN_ADDRESS: addressSchema.optional(),
   OPERATOR_PRIVATE_KEY: privKeySchema.optional(),
-  POCKET_PRIVATE_KEY: privKeySchema.optional(),
+  POCKET_MASTER_SEED: privKeySchema.optional(),
   DATA_DIR: z.string().default("./data"),
   TURNKEY_API_PUBLIC_KEY: z.string().optional(),
   TURNKEY_API_PRIVATE_KEY: z.string().optional(),
@@ -62,7 +62,7 @@ export interface Config {
   factoryAddress?: Address;
   guardianAddress?: Address;
   operatorPrivateKey?: Hex;
-  pocketPrivateKey?: Hex;
+  pocketMasterSeed?: Hex;
   dataDir: string;
   dbPath: string;
   docStoreDir: string;
@@ -128,7 +128,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     factoryAddress: e.FACTORY_ADDRESS,
     guardianAddress: e.GUARDIAN_ADDRESS,
     operatorPrivateKey: e.OPERATOR_PRIVATE_KEY,
-    pocketPrivateKey: e.POCKET_PRIVATE_KEY,
+    pocketMasterSeed: e.POCKET_MASTER_SEED,
     dataDir: e.DATA_DIR,
     dbPath: `${e.DATA_DIR}/legalbody.db`,
     docStoreDir: `${e.DATA_DIR}/documents`,
@@ -176,7 +176,7 @@ export function redact(cfg: Config): Record<string, unknown> {
     customerPrivateKey: "REDACTED",
     authJwtSecret: "REDACTED",
     operatorPrivateKey: cfg.operatorPrivateKey ? "REDACTED" : undefined,
-    pocketPrivateKey: cfg.pocketPrivateKey ? "REDACTED" : undefined,
+    pocketMasterSeed: cfg.pocketMasterSeed ? "REDACTED" : undefined,
     circleApiKey: cfg.circleApiKey ? "REDACTED" : undefined,
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
     jobClientPrivateKey: "REDACTED",
