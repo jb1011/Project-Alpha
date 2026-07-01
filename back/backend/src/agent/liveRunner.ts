@@ -1,17 +1,20 @@
 // backend/src/agent/liveRunner.ts
 import Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
-import { http, type WalletClient, createPublicClient } from "viem";
+import { http, type WalletClient, createPublicClient, createWalletClient } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
+import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { makeSignX402 } from "../adapters/x402/signX402";
 import { chainFor } from "../chains";
 import { type Config, loadConfig } from "../config/env";
 import { authorizePayment } from "../payments/authority";
 import { topUpPocket } from "../payments/funding";
 import { PaymentLedger } from "../payments/ledger";
+import { sweepPocketToTreasury } from "../payments/pocketFloat";
 import { buildPaywall } from "../payments/seller";
 import { makeSettle } from "../payments/settle";
 import type { SettleFn } from "../payments/settle";
@@ -25,6 +28,20 @@ import type { DemoResult } from "./demo";
 import { runDemo } from "./demo";
 import { persistAgentRun } from "./persistRun";
 import { buildVendor } from "./vendor";
+
+/** Minimal ERC-20 transfer fragment for sweeping the pocket's residual USDC to the treasury. */
+const erc20TransferAbi = [
+  {
+    type: "function",
+    name: "transfer",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
 
 export interface SellParams {
   chainId: number;
@@ -135,15 +152,23 @@ export function requireVaultOperator(
   return { subOrgId: e.turnkeySubOrgId, operator: e.operator };
 }
 
+/** The pocket master seed is required to derive a per-agent pocket. */
+function requireMasterSeed(cfg: Config): Hex {
+  if (!cfg.pocketMasterSeed) throw new Error("set POCKET_MASTER_SEED to run the funding bridge");
+  return cfg.pocketMasterSeed;
+}
+
 /** Leg 0: governed top-up treasury -> operator(enclave) -> pocket -> Gateway. Returns the on-chain tx
- *  hashes. `operatorWallet` must sign as the treasury's authorized operator (its per-agent vault key). */
+ *  hashes. `operatorWallet` must sign as the treasury's authorized operator (its per-agent vault key).
+ *  The pocket used is derived per-agent from the master seed + `entityKey` (no per-agent key storage). */
 export async function fundPocket(
   cfg: Config,
   treasury: Address,
   floatAtomic: bigint,
   operatorWallet: WalletClient,
+  entityKey: string,
 ): Promise<Hex[]> {
-  if (!cfg.pocketPrivateKey) throw new Error("set POCKET_PRIVATE_KEY to run the funding bridge");
+  const pocketKey = derivePocketKey(requireMasterSeed(cfg), entityKey);
   const pub = createPublicClient({
     chain: chainFor(cfg.chainId, cfg.rpcUrl),
     transport: http(cfg.rpcUrl),
@@ -156,7 +181,7 @@ export async function fundPocket(
     factory: (cfg.factoryAddress ?? "0x0") as Address,
     identityRegistry: cfg.identityRegistry,
   });
-  const gateway = new PocketGateway({ pocketPrivateKey: cfg.pocketPrivateKey, rpcUrl: cfg.rpcUrl });
+  const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
   const txs: Hex[] = [];
   await topUpPocket(
     {
@@ -186,7 +211,7 @@ export async function buildLiveAgentRunner(
   cfg: Config = loadConfig(),
 ): Promise<(query: string) => Promise<LiveRunResult>> {
   if (!cfg.anthropicApiKey) throw new Error("set ANTHROPIC_API_KEY to run the agent");
-  if (!cfg.pocketPrivateKey) throw new Error("set POCKET_PRIVATE_KEY to run the agent");
+  requireMasterSeed(cfg);
   const { treasury, vendorPayout, agentPayout } = resolveLiveAddresses({
     treasury: process.env.TREASURY_ADDRESS,
     vendorPayout: process.env.VENDOR_PAYOUT_ADDRESS,
@@ -207,12 +232,54 @@ export async function buildLiveAgentRunner(
   const db = new Database(cfg.dbPath);
   migrate(db);
   const ledger = new PaymentLedger(db);
+  const runs = new SqliteAgentRunStore(db);
+  const entities = new SqliteEntityRepository(db);
+
+  // Fund from the treasury via ITS agent's own per-agent vault operator (not a shared root key),
+  // so the governed `fundOperator` call is authorized. Resolved once; the wallet is a Turnkey API
+  // read (no signing) so building it costs no enclave signatures.
+  const maybeEntity = entities.findByTreasury(treasury);
+  const vault = requireVaultOperator(treasury, maybeEntity);
+  if (!maybeEntity) throw new Error(`fundPocket: no onboarded agent owns treasury ${treasury}`);
+  const entity = maybeEntity;
+  const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
+
+  const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
   const signX402 = makeSignX402({
-    signer: pocketSignerFromKey(cfg.pocketPrivateKey),
+    signer: pocketSignerFromKey(pocketKey),
     chainId: cfg.chainId,
     network: arcBatchingConfig.network,
     verifyingContract: arcBatchingConfig.verifyingContract,
   });
+
+  // The pocket's own signer — used at the end of each run to sweep its residual USDC back to the
+  // treasury (keeps the per-agent float ~zero; Gateway-held balance is not swept, only the EOA's).
+  const pocketAccount = privateKeyToAccount(pocketKey);
+  const pocketAddress = pocketAccount.address;
+  const pocketWallet = createWalletClient({
+    account: pocketAccount,
+    chain: chainFor(cfg.chainId, cfg.rpcUrl),
+    transport: http(cfg.rpcUrl),
+  });
+  const sweepPocket = () =>
+    sweepPocketToTreasury({
+      treasury,
+      usdc: cfg.usdc,
+      dust: 10_000n,
+      pocketUsdcBalance: () => adapter.usdcBalanceOf(cfg.usdc, pocketAddress),
+      transferToTreasury: async (to, amount) => {
+        const { request } = await pub.simulateContract({
+          account: pocketWallet.account,
+          address: cfg.usdc,
+          abi: erc20TransferAbi,
+          functionName: "transfer",
+          args: [to, amount],
+        });
+        const hash = await pocketWallet.writeContract(request);
+        await pub.waitForTransactionReceipt({ hash });
+        return hash;
+      },
+    });
 
   const customer = pocketSignerFromKey(cfg.customerPrivateKey).address;
 
@@ -235,16 +302,6 @@ export async function buildLiveAgentRunner(
   };
 
   const floatAtomic = usdToUnits(cfg.fundingFloatUsdc);
-
-  const runs = new SqliteAgentRunStore(db);
-  const entities = new SqliteEntityRepository(db);
-
-  // Fund from the treasury via ITS agent's own per-agent vault operator (not a shared root key),
-  // so the governed `fundOperator` call is authorized. Resolved once; the wallet is a Turnkey API
-  // read (no signing) so building it costs no enclave signatures.
-  const entity = entities.findByTreasury(treasury);
-  const vault = requireVaultOperator(treasury, entity);
-  const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
 
   const authorityDeps = {
     ledger,
@@ -285,7 +342,7 @@ export async function buildLiveAgentRunner(
     paymentRecords.length = 0;
     const result = await runLive(
       {
-        fund: (amt) => fundPocket(cfg, treasury, amt, operatorWallet),
+        fund: (amt) => fundPocket(cfg, treasury, amt, operatorWallet, entity.idempotencyKey),
         runDemo: (q) =>
           runDemo(
             {
@@ -317,6 +374,14 @@ export async function buildLiveAgentRunner(
       query,
     );
     persistAgentRun({ runs, entities }, treasury, query, result, paymentRecords);
+    // Sweep is best-effort cleanup after a successful run; failure must not fail the result.
+    try {
+      await sweepPocket();
+    } catch (e) {
+      console.warn(
+        `post-run pocket sweep failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
     return result;
   };
 }

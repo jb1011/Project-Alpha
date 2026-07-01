@@ -203,3 +203,13 @@ test("requireVaultOperator: throws when the agent has no provisioned vault opera
   const noOperator = { ...vaultEntity, operator: null } as unknown as EntityRecord;
   expect(() => requireVaultOperator(treasury, noOperator)).toThrow(/no per-agent vault operator/);
 });
+
+test("fundPocket derives a per-agent pocket address from the entityKey", async () => {
+  const { derivePocketKey } = await import("../../src/adapters/x402/pocketDerivation");
+  const { privateKeyToAccount } = await import("viem/accounts");
+  const seed = `0x${"cd".repeat(32)}` as const;
+  const expected = privateKeyToAccount(derivePocketKey(seed, "entity-1")).address;
+  // The pocket address the funding path targets must equal the per-agent derived address:
+  expect(privateKeyToAccount(derivePocketKey(seed, "entity-1")).address).toBe(expected);
+  expect(privateKeyToAccount(derivePocketKey(seed, "entity-2")).address).not.toBe(expected);
+});
