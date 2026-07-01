@@ -1,7 +1,8 @@
 // backend/src/agent/liveRunner.ts
 import Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
-import { http, type WalletClient, createPublicClient } from "viem";
+import { http, type WalletClient, createPublicClient, createWalletClient } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
@@ -13,6 +14,7 @@ import { type Config, loadConfig } from "../config/env";
 import { authorizePayment } from "../payments/authority";
 import { topUpPocket } from "../payments/funding";
 import { PaymentLedger } from "../payments/ledger";
+import { sweepPocketToTreasury } from "../payments/pocketFloat";
 import { buildPaywall } from "../payments/seller";
 import { makeSettle } from "../payments/settle";
 import type { SettleFn } from "../payments/settle";
@@ -26,6 +28,20 @@ import type { DemoResult } from "./demo";
 import { runDemo } from "./demo";
 import { persistAgentRun } from "./persistRun";
 import { buildVendor } from "./vendor";
+
+/** Minimal ERC-20 transfer fragment for sweeping the pocket's residual USDC to the treasury. */
+const erc20TransferAbi = [
+  {
+    type: "function",
+    name: "transfer",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
 
 export interface SellParams {
   chainId: number;
@@ -228,12 +244,41 @@ export async function buildLiveAgentRunner(
   const entity = maybeEntity;
   const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
 
+  const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
   const signX402 = makeSignX402({
-    signer: pocketSignerFromKey(derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey)),
+    signer: pocketSignerFromKey(pocketKey),
     chainId: cfg.chainId,
     network: arcBatchingConfig.network,
     verifyingContract: arcBatchingConfig.verifyingContract,
   });
+
+  // The pocket's own signer — used at the end of each run to sweep its residual USDC back to the
+  // treasury (keeps the per-agent float ~zero; Gateway-held balance is not swept, only the EOA's).
+  const pocketAddress = privateKeyToAccount(pocketKey).address;
+  const pocketWallet = createWalletClient({
+    account: privateKeyToAccount(pocketKey),
+    chain: chainFor(cfg.chainId, cfg.rpcUrl),
+    transport: http(cfg.rpcUrl),
+  });
+  const sweepPocket = () =>
+    sweepPocketToTreasury({
+      treasury,
+      usdc: cfg.usdc,
+      dust: 10_000n,
+      pocketUsdcBalance: () => adapter.usdcBalanceOf(cfg.usdc, pocketAddress),
+      transferToTreasury: async (to, amount) => {
+        const { request } = await pub.simulateContract({
+          account: pocketWallet.account,
+          address: cfg.usdc,
+          abi: erc20TransferAbi,
+          functionName: "transfer",
+          args: [to, amount],
+        });
+        const hash = await pocketWallet.writeContract(request);
+        await pub.waitForTransactionReceipt({ hash });
+        return hash;
+      },
+    });
 
   const customer = pocketSignerFromKey(cfg.customerPrivateKey).address;
 
@@ -328,6 +373,7 @@ export async function buildLiveAgentRunner(
       query,
     );
     persistAgentRun({ runs, entities }, treasury, query, result, paymentRecords);
+    await sweepPocket(); // keep the pocket EOA's standing float ~zero between runs
     return result;
   };
 }
