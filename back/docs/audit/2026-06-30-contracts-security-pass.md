@@ -39,7 +39,7 @@ Each finding is classified into exactly one bucket: **real and actionable**, **a
 
 | # | Finding | Tool(s) | Severity | Bucket | Note |
 | --- | --- | --- | --- | --- | --- |
-| 1 | State write after external call in `createEntity` | Slither (benign) + Aderyn H-1 | High (Aderyn) / benign (Slither) | Noise / false positive | See detail below. No exploit path. |
+| 1 | State write after external call in `createEntity` | Slither (benign) + Aderyn H-1 | High (Aderyn) / benign (Slither) | Noise / false positive | See detail below. No exploit path. Confirmed benign by second reviewer (Martin) 2026-07-01. |
 | 2 | `block.timestamp` comparisons (×4) | Slither | Low | Noise (by design) | Day-scale timelocks and spend windows; ~12s validator skew is irrelevant at this granularity. |
 | 3 | External call in loop + `require` in loop (`sweep`) | Slither + Aderyn L-4 | Low | Noise (by design) | Admin supplies a bounded token list; revert-all-on-bad-token is the intended semantics. |
 | 4 | Low-level `.call{value:}()` in `sweepNative` | Slither | Informational | Noise | This is the recommended pattern for forwarding native value, with the `ok` return checked. |
@@ -67,7 +67,9 @@ Aderyn flags `LegalManagerFactory.createEntity` High for writing state (`entitie
 
 Each external call in `createEntity` therefore targets either the owner-gated, constructor-set trusted registry or a freshly deployed contract, so no attacker-controlled callback is reachable. On that reading there is no reentrancy exploit path, and Slither's "benign" classification is the correct one. An optional checks-effects-interactions tidy-up (move the writes before the `transferFrom`) would silence the detector but changes no behavior; it is not required and touches source, so it is left to Martin's discretion.
 
-> **Flagged for a second reviewer (Alex's call).** The analysis above points to a false positive, but a High-severity finding should not be downgraded on a single reviewer's read. Alex is deliberately leaving this finding OPEN pending a second set of eyes (Martin) to confirm the false-positive classification before it is treated as closed. Please review `createEntity` (`src/LegalManagerFactory.sol:73-109`) against the reasoning above and either confirm the benign assessment or challenge it in the PR.
+> **Second-reviewer sign-off (2026-07-01) — CLOSED.** The analysis above points to a false positive, but a High-severity finding should not be downgraded on a single reviewer's read, so it was held OPEN for a second set of eyes. Martin independently re-verified it adversarially against source — including `LegalManager.initialize` (makes zero external calls), the `AgentTreasury` constructor (its only external touch is `EXTCODESIZE` on the fresh proxy, not a `CALL`), the `BeaconProxy` deploy, and the `Ownable2Step` re-entry gate (re-entering `createEntity` reverts at `onlyOwner`; ownership cannot be seized or renounced) — and confirmed the benign classification. `identityRegistry` is `immutable` and a duplicate `agentId` reverts atomically via the `AgentIdAlreadyUsed` guard, so nothing moves value to a caller-controlled address. **Finding closed as a confirmed false positive.**
+>
+> **Optional CEI hardening (follow-up).** Martin noted the checks-effects-interactions tidy-up (move the three writes + the `AgentIdAlreadyUsed` guard ahead of the `transferFrom` at `:98`) is worth doing not to silence the detector but to remove a latent foot-gun: if `:98` ever became `safeTransferFrom`, today's write-after-call ordering would become reentrancy-exploitable via a `manager` callback. It is mechanical and behavior-preserving, with no live bug today. Tracked as a follow-up hardening PR (PR #TBD).
 
 ## Coverage (Phase 1, shipped in PR #9)
 
@@ -86,7 +88,7 @@ Artifacts (not real gaps, already covered behaviorally, do not chase under `--ir
 
 ## Verdict
 
-Static analysis surfaced no new actionable security issues beyond the documented backlog, with one item held open for confirmation. The one High-severity flag (createEntity reentrancy) is assessed as a false positive given the owner-gated entry, the trusted constructor-set registry, and the non-callback `transferFrom`, and that assessment was independently re-verified against source. Per Alex's call it is nonetheless left OPEN for a second reviewer (Martin) to confirm before it is treated as closed (see the flag under finding #1). The remaining findings are either intended design (centralization, timestamp-gated timelocks, bounded admin loops, the recommended native-send pattern) or low/informational source-hygiene nits.
+Static analysis surfaced no new actionable security issues beyond the documented backlog. The one High-severity flag (createEntity reentrancy) is assessed as a false positive given the owner-gated entry, the trusted constructor-set registry, and the non-callback `transferFrom`; that assessment was independently re-verified against source and then **confirmed by a second reviewer (Martin) on 2026-07-01, closing the finding** (see the sign-off under finding #1). No items remain open. The remaining findings are either intended design (centralization, timestamp-gated timelocks, bounded admin loops, the recommended native-send pattern) or low/informational source-hygiene nits. The optional CEI hardening on `createEntity` is tracked as a follow-up PR.
 
 The five hygiene nits (#6-10) are deferred as a batch to `docs/V2_HARDENING_BACKLOG.md` under "Static-analysis hygiene (Slither + Aderyn, 2026-06-30 security pass)". None is a security issue and all touch contract source, so they are Martin's call. No contract source was changed in this pass.
 
