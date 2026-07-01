@@ -3,6 +3,10 @@
 > Status: brainstormed + approved-in-conversation 2026-07-01. Model A ships first (v1); Model B is
 > documented here as v2 (§12). Backend = us; the "Connect your agent" UI + magic-link completion page =
 > the frontend colleague.
+>
+> **Architecture-audited 2026-07-01** (3 adversarial threat-models: custody/governance, app attack-surface,
+> cryptographic alternatives). The core model was found sound; the security requirements + the chosen
+> spending posture (hybrid) are in **§14**.
 
 **Goal:** Let a user **link their *existing* agent** (Claude Code, Codex, Cursor, OpenClaw, Gemini, or any
 MCP-capable agent) to a **user-custodied legal body** it can then fully operate — onboard, get funded,
@@ -67,10 +71,12 @@ human bootstrap**, after which the agent takes over.
    then calls `onboard_agent(spec, passkeyId)` itself, polls `get_entity` until `bound`, funds, and
    operates — driving everything after the bootstrap.
 
-**The magic link** = a short-lived, single-use URL carrying a bootstrap token that scopes the browser
-session to this tenant + this pending link. On completion the page shows the connection package (and, for
-the agent-first path, a one-time `link_code` the agent can exchange via a `claim_connection` tool (§4.3)
-so the human can paste one short code instead of a long key).
+**The magic link** = a short-lived, single-use, high-entropy URL carrying a bootstrap *request* id (not a
+tenant). **Binding (see §14.2):** the tenant is derived from the human's **SIWE login**, never from the
+agent-supplied link, and before anything is minted the completion page shows an explicit human-readable
+**authorization confirmation** ("you are giving agent-key …X guardian custody of body Y, funded from wallet
+Z — confirm"). The API key is delivered once on that confirmed, `no-store` page; the agent-first `link_code`
++ `claim_connection` (§4.3) return only a **binding confirmation**, never the key.
 
 ## 4. The "operate" MCP tools (full-operate)
 
@@ -81,18 +87,28 @@ caps/allowlist, and the guardian can pause on-chain at any time. Custody/governa
 ### 4.1 `run_job` — earn (ERC-8183)
 - **Input:** `{ id: string /* entity idempotency key */, budgetUsdc?: string }`.
 - **Behaviour (v1, self-contained):** runs the proven job saga (`buildJobDeps(...).runJob`) with the agent
-  as **provider**, signed by its Turnkey operator; the platform orchestrates the client + evaluator (as in
+  as **provider**, signed by its Turnkey operator; the platform stands in for the client + evaluator (temporary — see Evolution below; as in
   the live proof-of-life) so the agent can demonstrate **earning USDC + reputation** on demand. Returns
   `{ jobKey, status, jobId, txHashes… }`; the agent polls a job-status read.
-- **Design note:** v1 is a self-contained earn demonstration. A real external-counterparty job market
-  (the agent fulfilling jobs posted by *others*) is a later evolution — flagged, not built.
+- **Evolution (designed-in, not built in v1):** the client + evaluator are **pluggable seams**. In v1 the
+  platform stands in for them because of low initial traction (few registered agents). As registered agents
+  reach critical mass, **agents opt in as evaluators — and post jobs as clients** — progressively enabling
+  the **full decentralized ERC-8183 agent-to-agent flow** with no rearchitecture. Real independent
+  evaluators also strengthen reputation credibility (vs. a platform stand-in). The opt-in / matching
+  mechanics for agent-evaluators are future scope; the v1 requirement is only that these roles stay behind
+  swappable interfaces so the transition needs no rework.
 
 ### 4.2 `pay` — spend (governed x402 payment)
-- **Input:** `{ id: string, to: string /* address or x402 resource URL */, amountUsdc: string }`.
-- **Behaviour:** `authorizePayment` evaluates caps / period / allowlist / per-tx cap. If allowed, the
-  Turnkey operator signs and the payment settles via x402/Gateway. If rejected, returns the policy reason
-  (e.g. `over-tx-cap`, `not-allowlisted`) — **the agent cannot spend outside the leash.** Returns a
-  receipt `{ ok, txOrTransferId, reason? }`.
+- **Input:** `{ id: string, to: string /* address or x402 resource URL */, amountUsdc: string, idempotencyKey: string }`.
+- **Behaviour:** validate `amountUsdc` is a positive integer; if `to` is a URL, **SSRF-guard** it (https
+  only; block private/link-local/loopback + cloud-metadata hosts; no redirects to them; strict timeout;
+  optional resource-domain allowlist). `authorizePayment` evaluates per-tx + per-period caps and the
+  **hybrid allowlist rule (§14.1):** micro-payments (≤ threshold) may pay *any* payee; payments above it
+  require an **allowlisted** payee — and the payee the x402 resource returned is re-asserted against that
+  rule. If allowed, the Turnkey operator signs and it settles via x402/Gateway. If rejected, returns the
+  policy reason (`over-tx-cap`, `over-cap`, `not-allowlisted`, `over-threshold-needs-allowlist`) — **the
+  agent cannot spend outside the leash.** `idempotencyKey` dedupes retries (a repeat returns the original
+  receipt). Tenant-scoped: re-checks `ownerTenantId === tenantId`. Returns `{ ok, txOrTransferId, reason? }`.
 
 ### 4.3 Supporting reads (small additions)
 - `get_job(jobKey)` / `list_jobs(id)` — surface job progress to the agent (job HTTP/CLI already exist;
@@ -218,3 +234,84 @@ serves the crypto-native self-custody niche (Bucket 2).
 - Reuses existing surfaces (runner, api-keys, passkey, job saga, Payment Authority, Turnkey operator);
   net-new is additive. ✓
 - Model B preserved as a concrete v2 section per the decision to reference it. ✓
+- Security: audited 2026-07-01; the chosen hybrid spending posture + all findings folded into §14. ✓
+
+---
+
+## 14. Security — from the 2026-07-01 architecture audit
+
+Three adversarial threat-models (custody/governance, app attack-surface, cryptographic alternatives)
+reviewed this design against the real code. **Verdict: the core model is sound** — the agent holds no key,
+every spend funnels through the Payment Authority + on-chain caps/guardian, and the `AgentTreasury` contract
+is well-built. No finding breaks the model against a *malicious linked agent*. The requirements below close
+the gaps the audit did find — concentrated at (a) funds that *leave* governance (the pocket/Gateway float),
+(b) the backend's trust concentration, and (c) the two new BYOA seams (a bearer key that can now *spend* + a
+human bootstrap driven by an untrusted agent) — plus one latent pre-existing gap (the WebAuthn attestation
+is never verified).
+
+### 14.1 Default spending posture — CHOSEN: hybrid (option c)
+- **Micro-payments (≤ a configurable threshold — ~90% of x402 traffic): allowlist NOT required.** The agent
+  pays *any* payee/service, bounded by tight **per-tx** and **per-period** caps. Preserves "pay any x402
+  service autonomously."
+- **Payments > the threshold: an allowlisted payee is REQUIRED.**
+- Caps + `perTxCap` ship **tight by default**; the threshold + caps are guardian-set policy. Allowlist-
+  always-on was rejected because it breaks "pay any service."
+
+### 14.2 v1 security requirements (intrinsic to BYOA — build *with* the feature)
+- **Magic-link binding (audit-Critical):** the bootstrap token's tenant is derived from the **SIWE login**,
+  never the agent-supplied link; the completion page shows an explicit **human-readable authorization
+  confirmation** before minting; tokens are high-entropy, single-use (atomic consume), short-TTL, kept out
+  of query-strings/logs; `claim_connection` returns a **binding confirmation, not the key**; the connection
+  page is `no-store`/`no-referrer` and the key is copy-once.
+- **API key = spend authority (audit-High):** keys are **scoped to a single `entityId`** (not just tenant),
+  carry a **capability scope** (read / earn / spend), have a **TTL**, are one-click revocable, and every
+  `pay`/`fund` emits an **audit event** (+ guardian notification, §14.3). Ship with the tight default leash
+  (§14.1). Docs warn: treat the key like a treasury password.
+- **`pay` SSRF hardening (audit-High):** enforce the §4.2 URL guard (https; block private/link-local/
+  metadata; no redirects to them; timeout; optional resource-domain allowlist) and re-assert the returned
+  payee against §14.1.
+- **Tenant isolation in every new tool (audit-Medium):** `pay`/`run_job`/`get_job`/`list_jobs`/
+  `treasury_status` MUST re-check `ownerTenantId === tenantId` (mirroring `get_entity`) and return a uniform
+  "not found" — with explicit cross-tenant IDOR tests. The Turnkey operator is derived from the tenant-owned
+  entity, never from an `id` arg.
+- **Payment idempotency (audit-Medium):** `pay`/`fund` take a client-supplied per-payment idempotency key; a
+  repeat returns the original receipt, never a second settlement.
+- **Input validation (audit-Medium):** reject non-positive `amount`/`amountUsdc` at every new tool boundary.
+- **Chokepoint assertion:** a test proves the *only* path from an MCP tool to the Turnkey operator's signer
+  is via `authorizePayment` — no shortcut.
+- **Signed evaluator seam (cheap crypto win):** the ERC-8183 evaluator interface carries a **signature
+  field now** (evaluator signs `{jobId, deliverableHash, score}`), even though v1's platform evaluator makes
+  it trivial — so decentralizing evaluators (§4.1) needs no rework and gains non-repudiation.
+
+### 14.3 Security prerequisites (cross-cutting — harden the substrate BYOA leans on harder)
+⛔ = hard-blocker before shipping *spend-capable* BYOA; ⚠ = hardening fast-follow.
+- ⛔ **WebAuthn verification (#4):** the guardian passkey is the **root of custody** but is currently stored
+  without verifying the registration. Verify it server-side (challenge-binding + attestation signature +
+  origin/rpId) — or confirm+document that Turnkey re-verifies — before any body roots spend authority on it.
+- ⛔ **Per-agent, minimal, just-in-time float (#1):** replace the single **global shared pocket key** with a
+  per-agent float, topped up just-in-time and swept on idle, so the un-governed pocket/Gateway exposure at
+  any instant is small and never commingles tenants (keep the operator EOA balance ~zero).
+- ⚠ **Guardian alerting + auto-pause (#7):** a service watching `PolicyUpdateScheduled`/`Spent`/
+  `OperatorFunded`/`OperatorRotated` that notifies the guardian (email/push/webhook) + auto-pauses on
+  anomaly — "the user holds the leash" is only real once they're *told* to pull it. Raise the default
+  `policyDelay` for **loosening** changes (48–72h; tightening/pause stay instant).
+- ⚠ **Payload-scoped Turnkey policy (#8):** tighten the operator delegate from "SIGN anything on this wallet"
+  to the treasury contract + specific selectors/destinations, so a compromised backend can't drain the
+  operator EOA via a raw transfer. (The 2-of-2 policy-cosigner in §14.4 is the crypto-enforced version.)
+- ⚠ **Manager / operator-delegate key separation (#3):** the backend currently holds both the manager
+  (policy) key and the operator sign-delegate; a single compromise collapses 2 of 3 roles. Separate them
+  (HSM / distinct service). Make `payoutAddress` changes require guardian **consent**, not just veto.
+
+### 14.4 Cryptographic posture (honest cost/benefit)
+Security rests on **on-chain economic bounds, not key secrecy**, so most crypto is overkill here.
+- **Adopt (cheap signatures, real value):** the **signed evaluator attestation** seam (§14.2) and a **signed
+  policy-decision log** (the Payment Authority signs each decision — strengthens the legal body's
+  auditability/dispute posture; on-chain Merkle-anchor later).
+- **v2 / consider:** verifiable **KYC / agent-identity credentials** (x401 / "Know Your Agent" — *consume
+  from an issuer, don't build*; selective disclosure); a **targeted 2-of-2 policy-cosigner** (makes "must
+  pass policy" a cryptographic invariant vs. code convention); **capability/macaroon keys** for finer
+  least-privilege.
+- **Evaluated and rejected as overkill here:** zk proofs for policy-compliance / action-authorization /
+  private reputation (they re-prove what the public contract already enforces, and fight the transparency
+  the product sells); MPC / m-of-n on the operator delegate (the on-chain cap already bounds a compromised
+  delegate to a small, revocable loss); hardware attestation of the agent runtime (the agent holds no key).
