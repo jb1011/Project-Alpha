@@ -13,5 +13,5 @@ export interface SweepDeps {
 export async function sweepPocketToTreasury(d: SweepDeps): Promise<Hex | null> {
   const bal = await d.pocketUsdcBalance();
   if (bal <= d.dust) return null;
-  return d.transferToTreasury(d.treasury, bal);
+  return d.transferToTreasury(d.treasury, bal - d.dust);
 }

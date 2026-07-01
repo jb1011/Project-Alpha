@@ -14,10 +14,10 @@ function deps(balance: bigint) {
   };
 }
 
-test("sweeps the full residual when above the dust floor", async () => {
+test("sweeps the residual above the dust reserve (leaves dust for gas)", async () => {
   const d = deps(250_000n);
   const h = await sweepPocketToTreasury(d);
-  expect(d.transferToTreasury).toHaveBeenCalledWith(treasury, 250_000n);
+  expect(d.transferToTreasury).toHaveBeenCalledWith(treasury, 240_000n);
   expect(h).toBe("0xswept");
 });
 
