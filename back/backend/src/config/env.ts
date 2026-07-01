@@ -51,6 +51,7 @@ const EnvSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === "true"),
+  MCP_PUBLIC_URL: z.string().default("http://localhost:8789/mcp"),
 });
 
 export interface Config {
@@ -91,6 +92,7 @@ export interface Config {
   jobClientPrivateKey: Hex;
   jobEvaluatorPrivateKey?: Hex;
   jobSweepToTreasury: boolean;
+  mcpPublicUrl: string;
 }
 
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
@@ -149,6 +151,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     jobClientPrivateKey: e.JOB_CLIENT_PRIVATE_KEY ?? e.PLATFORM_PRIVATE_KEY,
     jobEvaluatorPrivateKey: e.JOB_EVALUATOR_PRIVATE_KEY,
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
+    mcpPublicUrl: e.MCP_PUBLIC_URL,
   };
 
   // Fail-closed: never let production boot with the insecure dev defaults.

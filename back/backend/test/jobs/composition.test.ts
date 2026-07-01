@@ -45,6 +45,7 @@ function makeConfig(): Config {
     jobClientPrivateKey: PLATFORM_KEY,
     jobEvaluatorPrivateKey: EVALUATOR_KEY,
     jobSweepToTreasury: false,
+    mcpPublicUrl: "http://localhost:8789/mcp",
   };
 }
 
