@@ -11,7 +11,7 @@ export function mountApiKeyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
       body = {};
     }
     const label = typeof body.label === "string" ? body.label : undefined;
-    const { id, key } = deps.apiKeys.mint(c.get("tenantId"), label);
+    const { id, key } = deps.apiKeys.mint(c.get("tenantId"), { label });
     return c.json({ id, key, label: label ?? null }, 201);
   });
 
