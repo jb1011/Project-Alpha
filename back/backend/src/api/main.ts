@@ -100,6 +100,7 @@ async function main() {
     jobClientAddress: jobDeps.jobClientAddress,
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
     agentRuns,
+    mcpPublicUrl: cfg.mcpPublicUrl,
   });
 
   const port = Number(process.env.PORT ?? 8789);

@@ -16,10 +16,10 @@ beforeEach(() => {
 afterEach(() => db.close());
 
 test("mint returns a prefixed plaintext key that verify maps back to the tenant", () => {
-  const { id, key } = store.mint(TENANT, "laptop");
+  const { id, key } = store.mint(TENANT, { label: "laptop" });
   expect(key.startsWith("mcp_")).toBe(true);
   const got = store.verify(key);
-  expect(got).toEqual({ tenantId: TENANT, id });
+  expect(got).toEqual({ tenantId: TENANT, id, entityId: null, capability: "spend" });
 });
 
 test("verify returns null for an unknown key", () => {
@@ -28,7 +28,7 @@ test("verify returns null for an unknown key", () => {
 });
 
 test("revoke makes the key unverifiable; list reflects revocation, never leaks secrets", () => {
-  const { id, key } = store.mint(TENANT, "ci");
+  const { id, key } = store.mint(TENANT, { label: "ci" });
   expect(store.revoke(TENANT, id)).toBe(true);
   expect(store.verify(key)).toBeNull();
   const views = store.list(TENANT);
@@ -43,4 +43,30 @@ test("revoke is tenant-scoped: another tenant cannot revoke and list is isolated
   const { id } = store.mint(TENANT);
   expect(store.revoke(OTHER, id)).toBe(false);
   expect(store.list(OTHER)).toHaveLength(0);
+});
+
+test("mint scoped to an entity + capability round-trips via verify", () => {
+  const { key } = store.mint(TENANT, { entityId: "ent-1", capability: "spend" });
+  const v = store.verify(key);
+  expect(v).toEqual({
+    tenantId: TENANT,
+    id: expect.any(String),
+    entityId: "ent-1",
+    capability: "spend",
+  });
+});
+
+test("verify rejects an expired key", () => {
+  const { key } = store.mint(TENANT, { ttlMs: -1 }); // already expired
+  expect(store.verify(key)).toBeNull();
+});
+
+test("mint with no opts stays tenant-wide with default capability (back-compat)", () => {
+  const { key } = store.mint(TENANT);
+  expect(store.verify(key)).toEqual({
+    tenantId: TENANT,
+    id: expect.any(String),
+    entityId: null,
+    capability: "spend",
+  });
 });
