@@ -79,6 +79,21 @@ Status legend: 🔴 correctness/safety · 🟠 robustness/ops · 🟡 cleanup/co
 - 🟠 **live `register()` fork-test** — exercise the real ERC-8004 registry register path on a fork.
 - 🟡 **`via_ir` bytecode re-review** — review the IR-optimized bytecode before mainnet.
 
+## Static-analysis hygiene (Slither + Aderyn, 2026-06-30 security pass)
+
+Low / informational source-level nits surfaced by the 2026-06-30 static-analysis pass. None is a security issue; all touch contract source, so they are Martin's call. Deferred as a batch rather than fixed this pass (see `docs/audit/2026-06-30-contracts-security-pass.md`).
+
+- 🟡 **index `PolicyUpdated` address param** (`AgentTreasury.sol:85`). The event has an `address` parameter that is not `indexed`, so off-chain consumers cannot filter by it.
+  *Fix:* mark the address parameter `indexed`.
+- 🟡 **local variables shadow state variables** (`AgentTreasury.sol:44-47`, the policy-setter params `cap` / `period` / `payoutAddress` / `allowlistEnabled`). Compiles correctly but hurts readability.
+  *Fix:* rename the locals (e.g. a leading underscore).
+- 🟡 **`nonReentrant` is not the first modifier** (`AgentTreasury.spend/fundOperator/emergencyWithdraw`, `LegalManager.sweep/sweepNative`). v1 ok because the preceding access modifiers (`onlyOperator` / `onlyGuardian`) make no external calls, so there is no through-modifier reentrancy.
+  *Fix:* reorder `nonReentrant` to first if adopting the defensive convention.
+- 🟡 **unspecific pragma `^0.8.24`** (all `src/*.sol`). A floating pragma can compile under an unintended compiler.
+  *Fix:* pin to `0.8.24` before mainnet.
+- 🟡 **`available()` public but unused internally** (`AgentTreasury.sol:132`).
+  *Fix:* mark `external` (minor gas / clarity).
+
 ## Deployment / ops
 
 - 🟠 **beacon owner → multisig/timelock** (`addresses.arc-testnet.json`). Today `beaconOwner == deployer`
