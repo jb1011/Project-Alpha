@@ -254,9 +254,10 @@ export async function buildLiveAgentRunner(
 
   // The pocket's own signer — used at the end of each run to sweep its residual USDC back to the
   // treasury (keeps the per-agent float ~zero; Gateway-held balance is not swept, only the EOA's).
-  const pocketAddress = privateKeyToAccount(pocketKey).address;
+  const pocketAccount = privateKeyToAccount(pocketKey);
+  const pocketAddress = pocketAccount.address;
   const pocketWallet = createWalletClient({
-    account: privateKeyToAccount(pocketKey),
+    account: pocketAccount,
     chain: chainFor(cfg.chainId, cfg.rpcUrl),
     transport: http(cfg.rpcUrl),
   });
@@ -373,7 +374,14 @@ export async function buildLiveAgentRunner(
       query,
     );
     persistAgentRun({ runs, entities }, treasury, query, result, paymentRecords);
-    await sweepPocket(); // keep the pocket EOA's standing float ~zero between runs
+    // Sweep is best-effort cleanup after a successful run; failure must not fail the result.
+    try {
+      await sweepPocket();
+    } catch (e) {
+      console.warn(
+        `post-run pocket sweep failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
     return result;
   };
 }
