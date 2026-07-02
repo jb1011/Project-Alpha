@@ -1,0 +1,162 @@
+import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
+import { derivePocketKey } from "../adapters/x402/pocketDerivation";
+import { makeSignX402 } from "../adapters/x402/signX402";
+import type { Config } from "../config/env";
+import type { PaymentReceipt } from "../persistence/paymentIdempotencyStore";
+import type { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
+import type { Address, EntityRecord, Hex } from "../types";
+import type { AuthorityDeps, AuthorizeRequest } from "./authority";
+import { authorizePayment } from "./authority";
+import { buyWithX402 } from "./buyer";
+import type { PaymentLedger } from "./ledger";
+import { assertPublicHttpsUrl } from "./ssrfGuard";
+
+/** The ArcAdapter surface this service needs — narrowed to the four treasury reads so tests can
+ *  fake it without a chain. */
+export interface TreasuryReader {
+  treasuryAvailable(t: Address): Promise<bigint>;
+  treasuryPaused(t: Address): Promise<boolean>;
+  treasuryAllowlistEnabled(t: Address): Promise<boolean>;
+  treasuryIsAllowed(t: Address, who: Address): Promise<boolean>;
+}
+
+export interface TreasuryStatusView {
+  available: string;
+  cap: string;
+  paused: boolean;
+  allowlistEnabled: boolean;
+}
+
+export interface PayArgs {
+  url: string;
+  amountUsdc: bigint;
+  idempotencyKey: string;
+  tenantId: string;
+}
+
+export interface EntityPaymentService {
+  status(entity: EntityRecord): Promise<TreasuryStatusView>;
+  pay(entity: EntityRecord, args: PayArgs): Promise<PaymentReceipt>;
+}
+
+export interface EntityPaymentDeps {
+  reader: TreasuryReader;
+  ledger: PaymentLedger;
+  idempotency: SqlitePaymentIdempotencyStore;
+  fetchImpl?: typeof fetch;
+}
+
+/** The pocket master seed is required to derive a per-agent pocket (mirrors liveRunner.ts). */
+function requireMasterSeed(cfg: Config): Hex {
+  if (!cfg.pocketMasterSeed) throw new Error("set POCKET_MASTER_SEED to run payments");
+  return cfg.pocketMasterSeed;
+}
+
+/** Best-effort settlement id surfaced by a resource server on success, per the x402
+ *  X-PAYMENT-RESPONSE convention. Not every resource sets it, so a successful pay may still
+ *  legitimately carry a null txOrTransferId. */
+function extractSettlementId(res: Response): string | null {
+  return res.headers.get("X-PAYMENT-RESPONSE");
+}
+
+/**
+ * Per-entity payment service: composes the pocket signer, the `authorizePayment` chokepoint,
+ * `buyWithX402`, the SSRF boundary, and idempotency into `{ status, pay }`. Nothing here holds
+ * state across calls — each `pay`/`status` call derives the pocket key and authority fresh from
+ * the passed `entity`, mirroring `buildLiveAgentRunner`'s per-run composition in liveRunner.ts.
+ */
+export function buildEntityPaymentService(
+  cfg: Config,
+  deps: EntityPaymentDeps,
+): EntityPaymentService {
+  const buildAuthorize = (entity: EntityRecord, treasury: Address) => {
+    const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
+    const signX402 = makeSignX402({
+      signer: pocketSignerFromKey(pocketKey),
+      chainId: cfg.chainId,
+      network: arcBatchingConfig.network,
+      verifyingContract: arcBatchingConfig.verifyingContract,
+    });
+    const authorityDeps: AuthorityDeps = {
+      ledger: deps.ledger,
+      readTreasury: async (payee: Address) => ({
+        available: await deps.reader.treasuryAvailable(treasury),
+        paused: await deps.reader.treasuryPaused(treasury),
+        allowlistEnabled: await deps.reader.treasuryAllowlistEnabled(treasury),
+        isAllowed: await deps.reader.treasuryIsAllowed(treasury, payee),
+      }),
+      signX402: async (req: AuthorizeRequest) =>
+        signX402({
+          payTo: req.payee,
+          amount: req.amount,
+          asset: req.asset,
+          network: req.network,
+          maxTimeoutSeconds: req.maxTimeoutSeconds,
+        }),
+      perTxCap: entity.perTxCap ?? undefined,
+      threshold: cfg.spendAllowlistThreshold, // §14.1 — hybrid re-assert, forwarded to evaluatePolicy
+    };
+    return (req: AuthorizeRequest) => authorizePayment(authorityDeps, req);
+  };
+
+  return {
+    async status(entity) {
+      if (!entity.treasury) {
+        return { available: "0", cap: "0", paused: false, allowlistEnabled: false };
+      }
+      const treasury = entity.treasury;
+      const [available, paused, allowlistEnabled] = await Promise.all([
+        deps.reader.treasuryAvailable(treasury),
+        deps.reader.treasuryPaused(treasury),
+        deps.reader.treasuryAllowlistEnabled(treasury),
+      ]);
+      const cap = entity.treasuryConfig?.cap ?? 0n;
+      return { available: available.toString(), cap: cap.toString(), paused, allowlistEnabled };
+    },
+
+    async pay(entity, args) {
+      // 1. SSRF boundary — always, synchronous, before any state (ledger/idempotency) is touched.
+      try {
+        assertPublicHttpsUrl(args.url);
+      } catch (e) {
+        return { ok: false, txOrTransferId: null, reason: `ssrf: ${(e as Error).message}` };
+      }
+
+      // 2. Treasury must be provisioned before this entity can spend.
+      const treasury = entity.treasury;
+      if (!treasury) {
+        return { ok: false, txOrTransferId: null, reason: "treasury-not-ready" };
+      }
+
+      // 3. Idempotency claim — a replayed key returns the original outcome without re-settling.
+      const entityKey = entity.idempotencyKey;
+      const claim = deps.idempotency.begin(args.idempotencyKey, args.tenantId, entityKey);
+      if (claim.status === "replayed") return claim.receipt;
+
+      // 4. Buy: discover the price via the 402, authorize through the chokepoint, retry with X-PAYMENT.
+      const authorize = buildAuthorize(entity, treasury);
+      let receipt: PaymentReceipt;
+      try {
+        const res = await buyWithX402({ fetchImpl: deps.fetchImpl ?? fetch, authorize }, args.url);
+        receipt =
+          res.status === 200
+            ? { ok: true, txOrTransferId: extractSettlementId(res) }
+            : { ok: false, txOrTransferId: null, reason: `resource-${res.status}` };
+      } catch (e) {
+        const m = (e as Error).message;
+        const reason = m.startsWith("policy-denied:") ? m.slice("policy-denied:".length).trim() : m;
+        receipt = { ok: false, txOrTransferId: null, reason };
+      }
+
+      // 5. Record vs release — only a SUCCESS is cached; a failed pay must remain retryable under
+      //    the same idempotency key (a client retrying after a denial should not be permanently
+      //    stuck replaying that denial).
+      if (receipt.ok) {
+        deps.idempotency.complete(args.idempotencyKey, args.tenantId, entityKey, receipt);
+      } else {
+        deps.idempotency.release(args.idempotencyKey, args.tenantId, entityKey);
+      }
+      return receipt;
+    },
+  };
+}

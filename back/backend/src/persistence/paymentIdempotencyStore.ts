@@ -50,4 +50,16 @@ export class SqlitePaymentIdempotencyStore {
       )
       .run(JSON.stringify(receipt), key, tenantId, entityKey);
   }
+
+  /** Release a claimed-but-never-completed (key,tenant,entity) so the same idempotency key can be
+   *  retried after a failed `pay` — a failed attempt must not permanently squat the key. The
+   *  `receipt_json IS NULL` guard is load-bearing: it scopes the delete to an in-flight claim only,
+   *  so a settled receipt (recorded via `complete`) can never be removed by this call. */
+  release(key: string, tenantId: string, entityKey: string): void {
+    this.db
+      .prepare(
+        "DELETE FROM payment_idempotency WHERE idem_key=? AND tenant_id=? AND entity_key=? AND receipt_json IS NULL",
+      )
+      .run(key, tenantId, entityKey);
+  }
 }
