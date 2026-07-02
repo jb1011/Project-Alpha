@@ -95,6 +95,17 @@ test("hybrid: above threshold requires an allowlisted payee", () => {
   ).toEqual({ ok: true });
 });
 
+test("hybrid: amount exactly at threshold is allowed (boundary, not >)", () => {
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: false,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(evaluatePolicy({ ...base, amount: 100_000n, threshold: 100_000n })).toEqual({ ok: true });
+});
+
 test("no threshold set → hybrid rule inactive (back-compat)", () => {
   const base = {
     available: 10_000_000n,
@@ -106,7 +117,25 @@ test("no threshold set → hybrid rule inactive (back-compat)", () => {
   expect(evaluatePolicy({ ...base, amount: 999_999n })).toEqual({ ok: true });
 });
 
-test("explicit on-chain allowlist still wins for any non-allowed payee", () => {
+test("not-allowlisted rule precedes threshold rule: proves allowlist fires first", () => {
+  // Both rules are active: allowlistEnabled && !isAllowed, AND amount > threshold with !isAllowed.
+  // This test proves "not-allowlisted" wins if evaluated first (it should be).
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: true,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n })).toEqual({
+    ok: false,
+    reason: "not-allowlisted",
+  });
+});
+
+test("over-threshold-needs-allowlist rule precedes over-tx-cap: proves threshold fires first", () => {
+  // Amount exceeds both threshold and perTxCap with isAllowed: false.
+  // This test proves "over-threshold-needs-allowlist" wins if evaluated first (it should).
   const base = {
     available: 10_000_000n,
     paused: false,
@@ -114,7 +143,7 @@ test("explicit on-chain allowlist still wins for any non-allowed payee", () => {
     isAllowed: false,
     runningPending: 0n,
   };
-  expect(evaluatePolicy({ ...base, amount: 1n, allowlistEnabled: true, isAllowed: false })).toEqual(
-    { ok: false, reason: "not-allowlisted" },
-  );
+  expect(
+    evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n, perTxCap: 150_000n }),
+  ).toEqual({ ok: false, reason: "over-threshold-needs-allowlist" });
 });
