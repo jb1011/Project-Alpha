@@ -9,7 +9,7 @@ import type { AuthorityDeps, AuthorizeRequest } from "./authority";
 import { authorizePayment } from "./authority";
 import { buyWithX402 } from "./buyer";
 import type { PaymentLedger } from "./ledger";
-import { assertPublicHttpsUrl } from "./ssrfGuard";
+import { assertPublicHttpsUrl, safeFetch } from "./ssrfGuard";
 
 /** The ArcAdapter surface this service needs — narrowed to the four treasury reads so tests can
  *  fake it without a chain. */
@@ -134,29 +134,65 @@ export function buildEntityPaymentService(
       if (claim.status === "replayed") return claim.receipt;
 
       // 4. Buy: discover the price via the 402, authorize through the chokepoint, retry with X-PAYMENT.
+      //    fetchImpl defaults to a safeFetch-wrapped fetch so production is SSRF-safe even if the
+      //    composition root doesn't wrap it itself; tests inject their own fake fetchImpl and so
+      //    bypass safeFetch (unchanged).
+      const fetchImpl =
+        deps.fetchImpl ??
+        ((u: RequestInfo | URL, i?: RequestInit) => safeFetch(fetch, u as string, i));
       const authorize = buildAuthorize(entity, treasury);
+      // Tracks whether the payment was actually authorized/"signed" by buyWithX402's onAuthorized
+      // callback. This is the load-bearing distinction for step 5 below: a failure BEFORE signing
+      // (SSRF/treasury-null checks above, policy-denied, 402-no-requirements, or the first fetch
+      // throwing) is safe to release for retry. A failure AFTER signing means the payment may have
+      // already been settled server-side even though our confirmation leg failed — releasing the
+      // claim there would let a same-key retry sign a SECOND authorization, so it must be cached
+      // instead (as an "unconfirmed" outcome) and never released.
+      let signed = false;
       let receipt: PaymentReceipt;
       try {
-        const res = await buyWithX402({ fetchImpl: deps.fetchImpl ?? fetch, authorize }, args.url);
-        receipt =
-          res.status === 200
-            ? { ok: true, txOrTransferId: extractSettlementId(res) }
-            : { ok: false, txOrTransferId: null, reason: `resource-${res.status}` };
+        const res = await buyWithX402(
+          {
+            fetchImpl,
+            authorize,
+            maxAmount: args.amountUsdc,
+            onAuthorized: () => {
+              signed = true;
+            },
+          },
+          args.url,
+        );
+        if (res.status === 200) {
+          receipt = { ok: true, txOrTransferId: extractSettlementId(res) };
+          deps.idempotency.complete(args.idempotencyKey, args.tenantId, entityKey, receipt);
+          return receipt;
+        }
+        if (!signed) {
+          deps.idempotency.release(args.idempotencyKey, args.tenantId, entityKey);
+          return { ok: false, txOrTransferId: null, reason: `resource-${res.status}` };
+        }
+        // Signed but the confirmation leg didn't come back 200 — outcome unconfirmed. Cache (do NOT
+        // release) so a same-key retry replays this instead of blindly re-signing.
+        receipt = {
+          ok: false,
+          txOrTransferId: null,
+          reason: `unconfirmed: resource-${res.status}`,
+        };
+        deps.idempotency.complete(args.idempotencyKey, args.tenantId, entityKey, receipt);
+        return receipt;
       } catch (e) {
         const m = (e as Error).message;
         const reason = m.startsWith("policy-denied:") ? m.slice("policy-denied:".length).trim() : m;
-        receipt = { ok: false, txOrTransferId: null, reason };
-      }
-
-      // 5. Record vs release — only a SUCCESS is cached; a failed pay must remain retryable under
-      //    the same idempotency key (a client retrying after a denial should not be permanently
-      //    stuck replaying that denial).
-      if (receipt.ok) {
+        if (!signed) {
+          deps.idempotency.release(args.idempotencyKey, args.tenantId, entityKey);
+          return { ok: false, txOrTransferId: null, reason };
+        }
+        // Signed, then the retry leg threw (e.g. network error) — outcome unconfirmed. Cache, don't
+        // release, for the same reason as above.
+        receipt = { ok: false, txOrTransferId: null, reason: `unconfirmed: ${reason}` };
         deps.idempotency.complete(args.idempotencyKey, args.tenantId, entityKey, receipt);
-      } else {
-        deps.idempotency.release(args.idempotencyKey, args.tenantId, entityKey);
+        return receipt;
       }
-      return receipt;
     },
   };
 }
