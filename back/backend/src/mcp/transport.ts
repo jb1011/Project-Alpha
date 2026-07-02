@@ -6,7 +6,7 @@ import { resolveKey } from "./auth";
 import { buildMcpServer } from "./server";
 
 /** Mount the stateless Streamable-HTTP MCP endpoint. A fresh server+transport per request,
- *  closing over the authenticated tenantId.
+ *  closing over the authenticated key scope (tenantId + entityId + capability).
  *
  *  Uses the SDK's web-standard transport (`handleRequest(Request): Promise<Response>`) so the
  *  Hono handler stays fully fetch-based (`c.req.raw` in, `Response` out) — no raw Node req/res
