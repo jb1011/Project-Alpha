@@ -34,6 +34,8 @@ const BLOCKED_IPV6_RANGES = new Set([
   "6to4",
   "teredo",
   "reserved",
+  "deprecatedSiteLocal", // fec0::/10 (RFC 3879) — deprecated but never a valid payment target
+  "discard", // 0100::/64 (RFC 6666) blackhole prefix
   // "unicast" (globally routable) is intentionally NOT blocked — that's public internet.
 ]);
 
