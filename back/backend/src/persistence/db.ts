@@ -172,10 +172,9 @@ export function migrate(db: Database.Database): void {
   if (!cols.includes("spec_json")) db.exec("ALTER TABLE entities ADD COLUMN spec_json TEXT");
   if (!cols.includes("per_tx_cap")) db.exec("ALTER TABLE entities ADD COLUMN per_tx_cap TEXT");
 
-  const akCols = db
-    .prepare("PRAGMA table_info(api_keys)")
-    .all()
-    .map((c: any) => c.name);
+  const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
   if (!akCols.includes("entity_id")) db.exec("ALTER TABLE api_keys ADD COLUMN entity_id TEXT");
   if (!akCols.includes("capability")) db.exec("ALTER TABLE api_keys ADD COLUMN capability TEXT");
   if (!akCols.includes("expires_at")) db.exec("ALTER TABLE api_keys ADD COLUMN expires_at INTEGER");
