@@ -32,7 +32,7 @@ const steps = [
   {
     n: "04",
     title: "Fund treasury",
-    body: "Send USDC from your own wallet to the agent's on-chain treasury. You sign the transfer yourself — projectAlpha can never move your funds.",
+    body: "Send USDC from your own wallet to the agent's on-chain treasury. You sign the transfer yourself — Novi Corpus can never move your funds.",
     bullets: ["USDC on Arc", "Your wallet signs", "Testnet faucet available"],
     glyph: <FundGlyph />,
   },

@@ -1,6 +1,11 @@
 node_modules/
 dist/
+# Local runtime data (SQLite + generated operating-agreement docs)
 data/
+legalbody.db
+legalbody.db-shm
+legalbody.db-wal
+documents/
 .env
 .env.*
 !.env.example

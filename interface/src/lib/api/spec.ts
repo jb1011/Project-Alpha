@@ -38,6 +38,7 @@ export function configToAgentSpec(
       spendingCapUsdc: toUsdcAmount(config.dailyCap || config.perTxCap),
       spendingPeriod: "24h",
       allowlistEnabled: config.allowlist.length > 0,
+      perTxCapUsdc: toUsdcAmount(config.perTxCap),
     },
     governance: {
       amendmentDelay: toAmendmentDelay(config.timelockHours),

@@ -10,12 +10,12 @@ const archivo = Archivo({
 });
 
 export const metadata: Metadata = {
-  title: "projectAlpha — A society for your agent",
+  title: "Novi Corpus — A society for your agent",
   description:
     "Create a society for your agent: passkey-secured vault, on-chain spending policy, law-to-code operating agreement, and a USDC treasury on Arc.",
-  metadataBase: new URL("https://projectalpha.example"),
+  metadataBase: new URL("https://novicorpus.example"),
   openGraph: {
-    title: "projectAlpha — A society for your agent",
+    title: "Novi Corpus — A society for your agent",
     description:
       "Passkey-secured agents with enforceable spending rules, Wyoming DAO LLC operating agreements, and guardian controls. Deploy and fund on Arc.",
     type: "website",

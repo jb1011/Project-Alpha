@@ -216,7 +216,7 @@ export function WelcomeStep({
           </Card>
 
           <Callout tone="accent" icon={<ShieldIcon className="h-4 w-4" />} title="Non-custodial">
-            projectAlpha never holds your keys or funds. Your wallet is the guardian;
+            Novi Corpus never holds your keys or funds. Your wallet is the guardian;
             your passkey is the vault root.
           </Callout>
 

@@ -82,7 +82,7 @@ export function Hero() {
           />
 
           <Terminal
-            title="projectAlpha · onboarding"
+            title="Novi Corpus · onboarding"
             lines={[
               { kind: "out", text: "→ binding passkey as vault root…", tone: "muted" },
               { kind: "out", text: "✓ Turnkey vault provisioned", tone: "ok" },

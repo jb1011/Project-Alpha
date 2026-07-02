@@ -17,6 +17,8 @@ export interface EntityView {
   bindTxHash: string | null;
   fundTxHash: string | null;
   error: string | null;
+  /** Off-chain per-transaction cap in atomic USDC (6 decimals), or null if unset. */
+  perTxCap: string | null;
 }
 
 export function toEntityView(r: EntityRecord): EntityView {
@@ -36,5 +38,6 @@ export function toEntityView(r: EntityRecord): EntityView {
     bindTxHash: r.bindTxHash,
     fundTxHash: r.fundTxHash,
     error: r.error ?? null,
+    perTxCap: r.perTxCap?.toString() ?? null,
   };
 }

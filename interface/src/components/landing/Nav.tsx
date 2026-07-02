@@ -4,6 +4,7 @@ const links = [
   { href: "#how", label: "How it works" },
   { href: "#features", label: "Features" },
   { href: "#mcp", label: "MCP" },
+  { href: "/agents", label: "My agents" },
 ];
 
 export function Nav() {

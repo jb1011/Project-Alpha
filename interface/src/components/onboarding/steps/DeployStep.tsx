@@ -1,11 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { usePublicClient, useWriteContract } from "wagmi";
 import { StepNav } from "../OnboardingFlow";
 import { useAuth } from "../AuthProvider";
 import { deployStepIndex, pollEntity } from "@/lib/api/poll";
 import type { EntityStatus, EntityView } from "@/lib/api/types";
-import { txUrl } from "@/lib/chain";
+import { arcTestnet, txUrl } from "@/lib/chain";
+import { wireAllowlistEntries } from "@/lib/treasury/allowlist";
+import type { AgentConfig } from "../types";
 import {
   Button,
   Callout,
@@ -72,17 +75,22 @@ function stepUiStatus(stepIdx: number, entity: EntityView | null): UiStatus {
 
 export function DeployStep({
   entityId,
+  config,
   onEntity,
   onComplete,
 }: {
   entityId: string | null;
+  config: AgentConfig;
   onEntity: (entity: EntityView) => void;
   onComplete: () => void;
 }) {
   const { ensureSession } = useAuth();
+  const publicClient = usePublicClient();
+  const { writeContractAsync } = useWriteContract();
   const [entity, setEntity] = useState<EntityView | null>(null);
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [wiringAllowlist, setWiringAllowlist] = useState(false);
 
   const onEntityRef = useRef(onEntity);
   const ensureSessionRef = useRef(ensureSession);
@@ -134,9 +142,42 @@ export function DeployStep({
 
   const allDone = entity?.status === "bound" || entity?.status === "funded";
   const hasFailure = entity?.status === "failed";
+  const allowlistAddrs = config.allowlist
+    .map((e) => e.address.trim())
+    .filter((a) => a.length > 0);
   const confirmedCount = STEPS.filter(
     (_, i) => stepUiStatus(i, entity) === "confirmed",
   ).length;
+
+  async function handleContinue() {
+    if (!entity?.treasury || allowlistAddrs.length === 0) {
+      onComplete();
+      return;
+    }
+    if (!publicClient) {
+      setError("Wallet client not ready — try again.");
+      return;
+    }
+    setWiringAllowlist(true);
+    setError(null);
+    try {
+      await wireAllowlistEntries({
+        treasury: entity.treasury as `0x${string}`,
+        addresses: allowlistAddrs,
+        writeContractAsync,
+        publicClient,
+      });
+      onComplete();
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? e.message
+          : "Failed to set allowlist entries — confirm with your guardian wallet.",
+      );
+    } finally {
+      setWiringAllowlist(false);
+    }
+  }
 
   if (!entityId) {
     return (
@@ -173,11 +214,7 @@ export function DeployStep({
         </div>
       )}
 
-      <ol className="relative flex flex-col">
-        <span
-          aria-hidden
-          className="absolute left-[18px] top-6 bottom-6 w-px bg-line-strong"
-        />
+      <ol className="flex flex-col">
         {STEPS.map((step, i) => (
           <ChainRow
             key={step.n}
@@ -219,6 +256,14 @@ export function DeployStep({
         </Callout>
       )}
 
+      {allDone && allowlistAddrs.length > 0 && (
+        <Callout tone="accent" className="mt-4" title="Allowlist setup">
+          {allowlistAddrs.length} recipient
+          {allowlistAddrs.length > 1 ? "s" : ""} will be registered on-chain when you continue
+          (one guardian-signed transaction per address).
+        </Callout>
+      )}
+
       {error && !hasFailure && (
         <Callout tone="warn" className="mt-6" title="Error">
           {error}
@@ -226,9 +271,17 @@ export function DeployStep({
       )}
 
       <StepNav>
-        <Button onClick={onComplete} disabled={!allDone}>
-          Continue to funding
-          <CheckIcon className="h-4 w-4" />
+        <Button onClick={() => void handleContinue()} disabled={!allDone || wiringAllowlist}>
+          {wiringAllowlist ? (
+            <>
+              <Spinner className="h-4 w-4" /> Setting allowlist…
+            </>
+          ) : (
+            <>
+              Continue to funding
+              <CheckIcon className="h-4 w-4" />
+            </>
+          )}
         </Button>
       </StepNav>
     </div>

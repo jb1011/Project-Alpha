@@ -61,14 +61,14 @@ export function Wyoming() {
 
               <figcaption className="mt-10 flex items-center gap-4 border-t hairline pt-6">
                 <div className="flex h-10 w-10 items-center justify-center rounded-full bg-ink text-paper">
-                  <span className="font-serif text-[15px]">α</span>
+                  <span className="font-serif text-[15px]">N</span>
                 </div>
                 <div>
                   <div className="text-[14px] font-medium text-ink">
                     Lena Whitfield
                   </div>
                   <div className="text-[12.5px] text-muted">
-                    Co-founder · projectAlpha
+                    Co-founder · Novi Corpus
                   </div>
                 </div>
               </figcaption>

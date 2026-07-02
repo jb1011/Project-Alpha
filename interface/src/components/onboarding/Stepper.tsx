@@ -18,12 +18,7 @@ export function Stepper({ current, done, onJump }: Props) {
       <div className="mb-5 text-[11px] uppercase tracking-[0.2em] text-muted-2">
         Create your agent
       </div>
-      <ol className="relative flex flex-col gap-1">
-        {/* vertical connector */}
-        <span
-          aria-hidden
-          className="absolute left-[13px] top-3 bottom-3 w-px bg-line-strong"
-        />
+      <ol className="flex flex-col gap-1">
         {PHASES.map((p, i) => {
           const isCurrent = p.id === current;
           const isDone = !!done[p.id];
@@ -47,8 +42,7 @@ export function Stepper({ current, done, onJump }: Props) {
                     "relative z-10 flex h-[27px] w-[27px] shrink-0 items-center justify-center rounded-full border text-[11px] tabular-nums transition-colors",
                     state === "current" &&
                       "border-accent bg-accent/15 text-accent-soft",
-                    state === "done" &&
-                      "border-accent/50 bg-accent text-paper",
+                    state === "done" && "border-accent/50 bg-accent text-paper",
                     state === "upcoming" &&
                       "hairline-strong bg-paper text-muted-2",
                   )}
@@ -59,7 +53,11 @@ export function Stepper({ current, done, onJump }: Props) {
                   <span
                     className={cx(
                       "text-[13px] leading-tight transition-colors",
-                      isCurrent ? "text-ink" : isDone ? "text-muted" : "text-muted-2",
+                      isCurrent
+                        ? "text-ink"
+                        : isDone
+                          ? "text-muted"
+                          : "text-muted-2",
                     )}
                   >
                     {p.label}
@@ -76,7 +74,7 @@ export function Stepper({ current, done, onJump }: Props) {
         })}
       </ol>
 
-      <div className="mt-7 rounded-xl border hairline bg-paper-2/40 px-3.5 py-3 text-[11.5px] leading-[1.5] text-muted-2">
+      <div className="mt-7 rounded-xl hairline bg-paper-2/40 px-3.5 py-3 text-[11.5px] leading-[1.5] text-muted-2">
         <span className="text-muted">Non-custodial.</span> You sign only twice —
         your passkey and your funding transfer. Everything else is automated.
       </div>
