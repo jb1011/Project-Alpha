@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toEntityView } from "../api/views";
+import type { JobRepository } from "../jobs/jobRepository";
+import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema } from "../policy/agentSpec";
@@ -11,10 +13,12 @@ export interface McpToolDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
+  jobs: JobRepository;
 }
 
-/** Build a fresh, tenant-scoped MCP server. tenantId is closed over — never taken from a tool arg. */
-export function buildMcpServer(tenantId: string, deps: McpToolDeps): McpServer {
+/** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
+export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
+  const tenantId = scope.tenantId;
   const { repo, runner } = deps;
   const server = new McpServer({ name: "project-alpha-brain", version: "1.0.0" });
 
