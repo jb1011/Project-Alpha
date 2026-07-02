@@ -24,7 +24,7 @@ function makeConfig(): Config {
     factoryAddress: undefined,
     guardianAddress: undefined,
     operatorPrivateKey: undefined,
-    pocketPrivateKey: undefined,
+    pocketMasterSeed: undefined,
     dataDir: "./data",
     dbPath: ":memory:",
     docStoreDir: "/tmp/test-docs",

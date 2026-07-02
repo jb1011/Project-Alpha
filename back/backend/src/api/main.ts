@@ -11,6 +11,7 @@ import { loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
+import { SqliteChallengeStore } from "../persistence/challengeStore";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
@@ -35,6 +36,7 @@ async function main() {
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
   const passkeys = new SqlitePasskeyStore(db);
+  const challenges = new SqliteChallengeStore(db);
   const agentRuns = new SqliteAgentRunStore(db);
   const arc = new ArcAdapter({
     publicClient: publicClientFor(cfg),
@@ -94,6 +96,7 @@ async function main() {
     passkeyRpId: cfg.passkeyRpId,
     apiKeys,
     passkeys,
+    challenges,
     arc,
     jobs: jobDeps.jobs,
     jobRunner: jobDeps.jobRunner,

@@ -83,6 +83,13 @@ export function migrate(db: Database.Database): void {
       expires_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS webauthn_challenges (
+      challenge TEXT PRIMARY KEY,
+      owner_tenant TEXT NOT NULL,
+      issued_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS api_keys (
       id           TEXT PRIMARY KEY,
       owner_tenant TEXT NOT NULL,

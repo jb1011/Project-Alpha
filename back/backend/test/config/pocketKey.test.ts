@@ -6,16 +6,14 @@ const base = {
   PLATFORM_PRIVATE_KEY: `0x${"1".repeat(64)}`,
 };
 
-test("POCKET_PRIVATE_KEY is parsed into cfg.pocketPrivateKey", () => {
-  const cfg = loadConfig({ ...base, POCKET_PRIVATE_KEY: `0x${"2".repeat(64)}` });
-  expect(cfg.pocketPrivateKey).toBe(`0x${"2".repeat(64)}`);
+test("POCKET_MASTER_SEED loads into cfg.pocketMasterSeed and is optional", () => {
+  const seed = `0x${"ab".repeat(32)}`;
+  expect(loadConfig({ ...base, POCKET_MASTER_SEED: seed }).pocketMasterSeed).toBe(seed);
+  expect(loadConfig(base).pocketMasterSeed).toBeUndefined();
 });
 
-test("pocketPrivateKey is redacted in the safe-to-log view", () => {
-  const cfg = loadConfig({ ...base, POCKET_PRIVATE_KEY: `0x${"2".repeat(64)}` });
-  expect(redact(cfg).pocketPrivateKey).toBe("REDACTED");
-});
-
-test("pocketPrivateKey is optional", () => {
-  expect(loadConfig(base).pocketPrivateKey).toBeUndefined();
+test("pocketMasterSeed is redacted in the safe-to-log view", () => {
+  const seed = `0x${"ab".repeat(32)}`;
+  const cfg = loadConfig({ ...base, POCKET_MASTER_SEED: seed });
+  expect(redact(cfg).pocketMasterSeed).toBe("REDACTED");
 });

@@ -54,6 +54,9 @@ export async function provisionAgentVault(
   deps: ProvisionDeps,
   p: ProvisionParams,
 ): Promise<VaultIds> {
+  // SECURITY: Turnkey is the WebAuthn RP for this sub-org and verifies the guardian attestation here — a
+  // forged/invalid attestation fails sub-org creation and can never control the vault (no private key behind
+  // it). Our POST /passkey challenge-binding (src/api/routes/passkey.ts) is defense-in-depth + freshness.
   // STEP 1 — sub-org with the delegated user (api key) + the guardian (passkey) as root users.
   const sub = await deps.parentClient.createSubOrganization({
     subOrganizationName: p.subOrgName,
