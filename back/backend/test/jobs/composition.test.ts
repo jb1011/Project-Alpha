@@ -34,6 +34,7 @@ function makeConfig(): Config {
     agentModel: "claude-sonnet-4-6",
     gatewayFacilitatorUrl: "https://gateway-api-testnet.circle.com",
     fundingFloatUsdc: "0.50",
+    spendAllowlistThreshold: 1_000_000n,
     customerPrivateKey: PLATFORM_KEY,
     authJwtSecret: "dev-insecure-secret-change-me-please",
     authJwtTtlSec: 3600,
