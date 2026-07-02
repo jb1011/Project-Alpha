@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { toJobView } from "../api/jobViews";
 import { toEntityView } from "../api/views";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
@@ -8,6 +9,7 @@ import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema } from "../policy/agentSpec";
 import type { OnboardingRunner } from "../workflow/runner";
+import { entityInScope } from "./scope";
 
 export interface McpToolDeps {
   repo: EntityRepository;
@@ -68,6 +70,42 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== tenantId)
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
+    },
+  );
+
+  server.registerTool(
+    "get_job",
+    {
+      title: "Get job",
+      description: "Fetch one job by jobKey (owned by you).",
+      inputSchema: { jobKey: z.string() },
+    },
+    async ({ jobKey }) => {
+      const rec = deps.jobs.findByKey(jobKey);
+      if (!rec || rec.ownerTenantId !== scope.tenantId || !entityInScope(scope, rec.entityKey))
+        return { content: [{ type: "text", text: "job not found" }], isError: true };
+      return { content: [{ type: "text", text: JSON.stringify(toJobView(rec)) }] };
+    },
+  );
+
+  server.registerTool(
+    "list_jobs",
+    {
+      title: "List jobs",
+      description: "List jobs for one of your entities (id = entity idempotency key).",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) => {
+      if (!entityInScope(scope, id))
+        return {
+          content: [{ type: "text", text: "entity not in this key's scope" }],
+          isError: true,
+        };
+      const views = deps.jobs
+        .listByEntity(id)
+        .filter((j) => j.ownerTenantId === scope.tenantId)
+        .map(toJobView);
+      return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );
 
