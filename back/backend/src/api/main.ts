@@ -9,6 +9,8 @@ import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import { loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
+import { buildEntityPaymentService } from "../payments/entityPayment";
+import { PaymentLedger } from "../payments/ledger";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
@@ -16,6 +18,7 @@ import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
+import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import type { Address } from "../types";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
@@ -46,6 +49,17 @@ async function main() {
     identityRegistry: cfg.identityRegistry,
   });
   const operatorSigner = await buildOperatorSigner(cfg);
+
+  // Per-entity payment service (treasury_status/pay tools) needs a pocket-derivation seed; leave
+  // it undefined on deployments that haven't set POCKET_MASTER_SEED so they keep working (the
+  // tools then return "payments unavailable" instead of failing to boot).
+  const payments = cfg.pocketMasterSeed
+    ? buildEntityPaymentService(cfg, {
+        reader: arc,
+        ledger: new PaymentLedger(db),
+        idempotency: new SqlitePaymentIdempotencyStore(db),
+      })
+    : undefined;
 
   const provision = (p: {
     subOrgName: string;
@@ -104,6 +118,7 @@ async function main() {
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
     agentRuns,
     mcpPublicUrl: cfg.mcpPublicUrl,
+    payments,
   });
 
   const port = Number(process.env.PORT ?? 8789);
