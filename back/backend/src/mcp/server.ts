@@ -9,7 +9,7 @@ import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema } from "../policy/agentSpec";
 import type { OnboardingRunner } from "../workflow/runner";
-import { entityInScope } from "./scope";
+import { entityInScope, hasCapability } from "./scope";
 
 export interface McpToolDeps {
   repo: EntityRepository;
@@ -20,14 +20,13 @@ export interface McpToolDeps {
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
 export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
-  // The ACTING tools below (whoami/list_entities/get_entity/fund_treasury/onboard_agent) enforce
-  // ONLY tenant isolation via `tenantId` — they do NOT yet honor `scope.entityId`/`scope.capability`.
-  // The read tools (get_job/list_jobs) DO enforce entityInScope. This is safe today because
-  // `POST /api-keys` only ever mints tenant-wide keys ({entityId: null, capability: "spend"}); entity-
-  // scoped keys are not yet mintable over the API. ⚠ P2b/P2c PREREQUISITE: entity+capability gating of
-  // fund_treasury/onboard_agent MUST land BEFORE the mint surface is widened to issue scoped keys —
-  // otherwise a nominally "read-only, entity-A" key would silently retain treasury-funding/onboarding
-  // power over the whole tenant. See back/docs/plans/2026-07-02-byoa-p2a-scope-and-reads.md.
+  // The ACTING tools (fund_treasury/onboard_agent) enforce capability + entity scope, on top of the
+  // tenant isolation shared by every tool below: fund_treasury requires "spend" capability and
+  // `entityInScope`; onboard_agent requires "spend" capability AND a tenant-wide key (entityId ===
+  // null), since it creates a new entity rather than acting on an existing one. The read tools
+  // (get_job/list_jobs) enforce entityInScope. The P2a prerequisite (gate the acting tools before the
+  // mint surface issues scoped keys) is resolved. See
+  // back/docs/plans/2026-07-02-byoa-p2a-scope-and-reads.md.
   const tenantId = scope.tenantId;
   const { repo, runner } = deps;
   const server = new McpServer({ name: "project-alpha-brain", version: "1.0.0" });
@@ -125,6 +124,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       inputSchema: { id: z.string(), amount: z.string() },
     },
     async ({ id, amount }) => {
+      if (!hasCapability(scope, "spend"))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      if (!entityInScope(scope, id))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
       try {
         const { id: outId, status } = runner.fund({ id, tenantId, amount: BigInt(amount) });
         return { content: [{ type: "text", text: JSON.stringify({ id: outId, status }) }] };
@@ -149,6 +152,8 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       },
     },
     async ({ spec, passkeyId, idempotencyKey }) => {
+      if (!hasCapability(scope, "spend") || scope.entityId !== null)
+        return { content: [{ type: "text", text: "not authorized" }], isError: true };
       const passkey = deps.passkeys.get(tenantId, passkeyId);
       if (!passkey)
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
