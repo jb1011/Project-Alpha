@@ -101,6 +101,45 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
   );
 
   server.registerTool(
+    "pay",
+    {
+      title: "Pay",
+      description:
+        "Pay an x402 resource URL with USDC (atomic, 6 decimals), within your treasury's leash.",
+      inputSchema: {
+        id: z.string(),
+        to: z.string(),
+        amountUsdc: z.string(),
+        idempotencyKey: z.string(),
+      },
+    },
+    async ({ id, to, amountUsdc, idempotencyKey }) => {
+      if (!hasCapability(scope, "spend"))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      const rec = repo.findByIdempotencyKey(id);
+      if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      let amount: bigint;
+      try {
+        amount = BigInt(amountUsdc);
+      } catch {
+        return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+      }
+      if (amount <= 0n)
+        return { content: [{ type: "text", text: "amountUsdc must be positive" }], isError: true };
+      if (!deps.payments)
+        return { content: [{ type: "text", text: "payments unavailable" }], isError: true };
+      const receipt = await deps.payments.pay(rec, {
+        url: to,
+        amountUsdc: amount,
+        idempotencyKey,
+        tenantId,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(receipt) }], isError: !receipt.ok };
+    },
+  );
+
+  server.registerTool(
     "get_job",
     {
       title: "Get job",
