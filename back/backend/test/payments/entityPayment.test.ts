@@ -406,6 +406,35 @@ test("post-sign failure (retry returns non-200): does NOT release the claim, cac
   expect(replay).toEqual({ status: "replayed", receipt });
 });
 
+test("authorize-build failure (missing pocket master seed): releases the idempotency claim instead of burning it", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const { fn } = fakeFetch();
+  // No pocketMasterSeed -> buildAuthorize's requireMasterSeed throws BEFORE any fetch/signing.
+  const svc = buildEntityPaymentService(makeConfig({ pocketMasterSeed: undefined }), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-authorize-throws",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "set POCKET_MASTER_SEED to run payments" });
+  expect(fn).not.toHaveBeenCalled(); // buildAuthorize threw before buyWithX402 ever ran
+
+  // Released, not burned: a subsequent begin() with the same key is "new" again (retryable),
+  // not stuck in-flight forever with a dangling receipt_json NULL row.
+  expect(idempotency.begin("k-authorize-throws", "tenantA", entity.idempotencyKey)).toEqual({
+    status: "new",
+  });
+});
+
 test("status: an entity with no treasury reads as zeroed-out/not-paused", async () => {
   const { reader } = makeReader();
   const svc = buildEntityPaymentService(makeConfig(), {

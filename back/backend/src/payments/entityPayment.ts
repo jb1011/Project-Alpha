@@ -140,17 +140,22 @@ export function buildEntityPaymentService(
       const fetchImpl =
         deps.fetchImpl ??
         ((u: RequestInfo | URL, i?: RequestInit) => safeFetch(fetch, u as string, i));
-      const authorize = buildAuthorize(entity, treasury);
       // Tracks whether the payment was actually authorized/"signed" by buyWithX402's onAuthorized
       // callback. This is the load-bearing distinction for step 5 below: a failure BEFORE signing
-      // (SSRF/treasury-null checks above, policy-denied, 402-no-requirements, or the first fetch
-      // throwing) is safe to release for retry. A failure AFTER signing means the payment may have
-      // already been settled server-side even though our confirmation leg failed — releasing the
-      // claim there would let a same-key retry sign a SECOND authorization, so it must be cached
-      // instead (as an "unconfirmed" outcome) and never released.
+      // (SSRF/treasury-null checks above, policy-denied, 402-no-requirements, buildAuthorize
+      // construction throwing, or the first fetch throwing) is safe to release for retry. A failure
+      // AFTER signing means the payment may have already been settled server-side even though our
+      // confirmation leg failed — releasing the claim there would let a same-key retry sign a
+      // SECOND authorization, so it must be cached instead (as an "unconfirmed" outcome) and never
+      // released.
       let signed = false;
       let receipt: PaymentReceipt;
       try {
+        // buildAuthorize derives the pocket key and constructs the signer (derivePocketKey /
+        // makeSignX402) — kept inside the try so a construction failure is caught below and the
+        // idempotency claim is released for retry, instead of leaking as an unhandled rejection
+        // that leaves the claim dangling (receipt_json NULL) and burns the key forever.
+        const authorize = buildAuthorize(entity, treasury);
         const res = await buyWithX402(
           {
             fetchImpl,

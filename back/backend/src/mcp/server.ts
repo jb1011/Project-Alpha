@@ -119,6 +119,12 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const rec = repo.findByIdempotencyKey(id);
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "not found" }], isError: true };
+      // Decimal integers only — rejects hex ("0x10"), whitespace (" 100 "), exponential ("1e6"),
+      // and decimals ("1.5") that BigInt() would otherwise silently accept. A leading "-" is still
+      // allowed through so a negative amount reaches the <= 0n check below and gets the more
+      // specific "must be positive" message rather than a generic format error.
+      if (!/^-?\d+$/.test(amountUsdc))
+        return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
       let amount: bigint;
       try {
         amount = BigInt(amountUsdc);
