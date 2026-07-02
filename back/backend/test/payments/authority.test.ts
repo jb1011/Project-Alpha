@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { type AuthorityDeps, authorizePayment } from "../../src/payments/authority";
 import { PaymentLedger } from "../../src/payments/ledger";
 import { migrate } from "../../src/persistence/db";
@@ -116,6 +116,31 @@ test("if signing fails after authorization, the ledger entry is marked failed an
     }),
   ).rejects.toThrow(/signer unavailable/);
   // recorded then rolled back to failed, so it no longer counts against the cap.
+  expect(d.ledger.runningPending()).toBe(0n);
+});
+
+test("denies an over-threshold payment to a non-allowlisted payee and never calls signX402", async () => {
+  const signX402 = vi.fn(async () => ({ header: "h", ledgerRef: "r" }));
+  const d = deps({
+    readTreasury: async () => ({
+      available: 1_000_000n,
+      paused: false,
+      allowlistEnabled: false,
+      isAllowed: false,
+    }),
+    signX402,
+    threshold: 100n,
+  });
+  const res = await authorizePayment(d, {
+    payee,
+    amount: 101n,
+    resource: "/x",
+    asset: "0x3600000000000000000000000000000000000000",
+    network: "eip155:5042002",
+    maxTimeoutSeconds: 60,
+  });
+  expect(res).toMatchObject({ ok: false, reason: "over-threshold-needs-allowlist" });
+  expect(signX402).not.toHaveBeenCalled();
   expect(d.ledger.runningPending()).toBe(0n);
 });
 

@@ -1,0 +1,317 @@
+import Database from "better-sqlite3";
+import { beforeEach, expect, test, vi } from "vitest";
+import type { Config } from "../../src/config/env";
+import type { TreasuryReader } from "../../src/payments/entityPayment";
+import { buildEntityPaymentService } from "../../src/payments/entityPayment";
+import { PaymentLedger } from "../../src/payments/ledger";
+import { migrate } from "../../src/persistence/db";
+import { SqlitePaymentIdempotencyStore } from "../../src/persistence/paymentIdempotencyStore";
+import type { Address, EntityRecord, Hex } from "../../src/types";
+
+// Two distinct valid secp256k1-scalar-shaped 32-byte hex values (test-only, never used on any real chain).
+const POCKET_MASTER_SEED: Hex = "0xabababababababababababababababababababababababababababababab";
+
+const TREASURY: Address = "0x000000000000000000000000000000000000000F";
+const PAY_TO: Address = "0x00000000000000000000000000000000000000AB";
+const USDC: Address = "0x3600000000000000000000000000000000000000";
+
+function makeConfig(over: Partial<Config> = {}): Config {
+  return {
+    rpcUrl: "https://rpc.testnet.arc.network",
+    chainId: 5042002,
+    platformPrivateKey: POCKET_MASTER_SEED,
+    identityRegistry: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    usdc: USDC,
+    factoryAddress: undefined,
+    guardianAddress: undefined,
+    operatorPrivateKey: undefined,
+    pocketMasterSeed: POCKET_MASTER_SEED,
+    dataDir: "./data",
+    dbPath: ":memory:",
+    docStoreDir: "/tmp/test-docs",
+    turnkey: undefined,
+    circleApiKey: undefined,
+    anthropicApiKey: undefined,
+    agentModel: "claude-sonnet-4-6",
+    gatewayFacilitatorUrl: "https://gateway-api-testnet.circle.com",
+    fundingFloatUsdc: "0.50",
+    spendAllowlistThreshold: 500n,
+    customerPrivateKey: POCKET_MASTER_SEED,
+    authJwtSecret: "dev-insecure-secret-change-me-please",
+    authJwtTtlSec: 3600,
+    webOrigin: "*",
+    siweDomain: "localhost",
+    passkeyRpId: "localhost",
+    jobContract: "0x0747EEf0706327138c69792bF28Cd525089e4583",
+    reputationRegistry: "0x8004B663056A597Dffe9eCcC1965A193B7388713",
+    jobClientPrivateKey: POCKET_MASTER_SEED,
+    jobEvaluatorPrivateKey: undefined,
+    jobSweepToTreasury: false,
+    mcpPublicUrl: "http://localhost:8789/mcp",
+    ...over,
+  };
+}
+
+function seedEntity(over: Partial<EntityRecord> = {}): EntityRecord {
+  return {
+    idempotencyKey: "tenantA:agent1",
+    name: "TestAgent",
+    status: "bound",
+    manager: "0x000000000000000000000000000000000000000A",
+    guardian: "0x000000000000000000000000000000000000000A",
+    operator: "0x000000000000000000000000000000000000000B",
+    amendmentDelay: "86400",
+    ein: "12-3456789",
+    formationDate: 1700000000,
+    oaHash: null,
+    metadataURI: null,
+    docPath: null,
+    treasuryConfig: {
+      usdc: USDC,
+      payoutAddress: "0x000000000000000000000000000000000000000E",
+      cap: 5_000_000n,
+      period: 86400n,
+      allowlistEnabled: false,
+    },
+    agentId: "42",
+    proxy: "0x000000000000000000000000000000000000000D",
+    treasury: TREASURY,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    perTxCap: undefined,
+    ...over,
+  };
+}
+
+const requirements = {
+  payTo: PAY_TO,
+  maxAmountRequired: "1000",
+  asset: USDC,
+  network: "eip155:5042002",
+  maxTimeoutSeconds: 60,
+};
+
+/** Simulates an x402 resource server: first request (no X-PAYMENT) -> 402 with requirements;
+ *  a request carrying X-PAYMENT -> 200. Records every call for assertions. */
+function fakeFetch() {
+  const calls: { url: string; init?: RequestInit }[] = [];
+  const fn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    const headers = init?.headers as Record<string, string> | undefined;
+    const xp = headers?.["X-PAYMENT"];
+    if (!xp) return new Response(JSON.stringify({ accepts: [requirements] }), { status: 402 });
+    return new Response("ok", { status: 200 });
+  });
+  return { fn, calls };
+}
+
+/** Fake TreasuryReader with scripted outcomes; records which payee treasuryIsAllowed was consulted with. */
+function makeReader(
+  over: Partial<{
+    available: bigint;
+    paused: boolean;
+    allowlistEnabled: boolean;
+    isAllowed: boolean;
+  }> = {},
+) {
+  const isAllowedCalls: Address[] = [];
+  const reader: TreasuryReader = {
+    treasuryAvailable: async () => over.available ?? 1_000_000n,
+    treasuryPaused: async () => over.paused ?? false,
+    treasuryAllowlistEnabled: async () => over.allowlistEnabled ?? false,
+    treasuryIsAllowed: async (_t, who) => {
+      isAllowedCalls.push(who);
+      return over.isAllowed ?? true;
+    },
+  };
+  return { reader, isAllowedCalls };
+}
+
+let db: Database.Database;
+let ledger: PaymentLedger;
+let idempotency: SqlitePaymentIdempotencyStore;
+
+beforeEach(() => {
+  db = new Database(":memory:");
+  migrate(db);
+  ledger = new PaymentLedger(db);
+  idempotency = new SqlitePaymentIdempotencyStore(db);
+});
+
+test("happy path (micro): settles, fetch called twice, X-PAYMENT on retry, payee re-asserted", async () => {
+  const { reader, isAllowedCalls } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const { fn, calls } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-happy",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt.ok).toBe(true);
+  expect(fn).toHaveBeenCalledTimes(2);
+  const secondHeaders = calls[1]?.init?.headers as Record<string, string> | undefined;
+  expect(secondHeaders?.["X-PAYMENT"]).toBeTruthy();
+  expect(isAllowedCalls.map((a) => a.toLowerCase())).toContain(PAY_TO.toLowerCase());
+});
+
+test("policy denial (over-cap): surfaces the reason, no retry fetch, idempotency released for retry", async () => {
+  const { reader } = makeReader({ available: 10n }); // below requirements.maxAmountRequired (1000)
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-cap",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "over-cap" });
+  expect(fn).toHaveBeenCalledTimes(1); // only the 402 probe, no retry
+  // released, not stuck: a subsequent begin() with the same key is "new" again
+  expect(idempotency.begin("k-cap", "tenantA", entity.idempotencyKey)).toEqual({ status: "new" });
+});
+
+test("hybrid: amount above threshold with a non-allowlisted payee is denied", async () => {
+  const { reader } = makeReader({
+    available: 1_000_000n,
+    isAllowed: false,
+    allowlistEnabled: false,
+  });
+  const { fn } = fakeFetch(); // requirements.maxAmountRequired = 1000 > cfg.spendAllowlistThreshold (500)
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-hybrid",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "over-threshold-needs-allowlist" });
+  expect(fn).toHaveBeenCalledTimes(1); // no retry
+});
+
+test("SSRF: rejects a private/loopback URL before any network call or idempotency claim", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "http://127.0.0.1/x",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-ssrf",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt.ok).toBe(false);
+  expect((receipt as { reason?: string }).reason).toMatch(/ssrf/i);
+  expect(fn).not.toHaveBeenCalled();
+  // no idempotency row was created for the rejected URL
+  expect(idempotency.begin("k-ssrf", "tenantA", entity.idempotencyKey)).toEqual({ status: "new" });
+});
+
+test("idempotency: replays the cached receipt on a repeated key without re-settling", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity();
+  const args = {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-replay",
+    tenantId: "tenantA",
+  };
+
+  const first = await svc.pay(entity, args);
+  expect(first.ok).toBe(true);
+  const callsAfterFirst = fn.mock.calls.length;
+
+  const second = await svc.pay(entity, args);
+  expect(second).toEqual(first);
+  expect(fn.mock.calls.length).toBe(callsAfterFirst); // no new fetch on replay
+});
+
+test("treasury-not-ready: an entity with no treasury cannot pay", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity({ treasury: null });
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-notready",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toEqual({ ok: false, txOrTransferId: null, reason: "treasury-not-ready" });
+  expect(fn).not.toHaveBeenCalled();
+});
+
+test("status: reads the four treasury fields plus the entity's configured cap", async () => {
+  const { reader } = makeReader({ available: 42_000n, paused: true, allowlistEnabled: true });
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+  });
+
+  const status = await svc.status(seedEntity());
+
+  expect(status).toEqual({
+    available: "42000",
+    cap: "5000000",
+    paused: true,
+    allowlistEnabled: true,
+  });
+});
+
+test("status: an entity with no treasury reads as zeroed-out/not-paused", async () => {
+  const { reader } = makeReader();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+  });
+
+  const status = await svc.status(seedEntity({ treasury: null }));
+
+  expect(status).toEqual({ available: "0", cap: "0", paused: false, allowlistEnabled: false });
+});

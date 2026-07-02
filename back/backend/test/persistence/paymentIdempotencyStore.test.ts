@@ -37,3 +37,17 @@ test("begin twice without complete replays as a benign in-flight duplicate", () 
     receipt: { ok: false, txOrTransferId: null, reason: "in-flight-duplicate" },
   });
 });
+
+test("release clears an in-flight claim so the same key can be retried", () => {
+  expect(store.begin("k3", "tA", "tA:e1")).toEqual({ status: "new" });
+  store.release("k3", "tA", "tA:e1");
+  expect(store.begin("k3", "tA", "tA:e1")).toEqual({ status: "new" });
+});
+
+test("release never removes a completed receipt", () => {
+  expect(store.begin("k4", "tA", "tA:e1")).toEqual({ status: "new" });
+  const r: PaymentReceipt = { ok: true, txOrTransferId: "0xdef" };
+  store.complete("k4", "tA", "tA:e1", r);
+  store.release("k4", "tA", "tA:e1");
+  expect(store.begin("k4", "tA", "tA:e1")).toEqual({ status: "replayed", receipt: r });
+});
