@@ -180,9 +180,17 @@ test("pay with an entity-scoped key calling a DIFFERENT entity is uniform not-fo
   }
 });
 
-test.each(["0", "-1", "1.5", "abc"])(
-  "pay rejects amountUsdc=%s without calling the payment service",
-  async (amountUsdc) => {
+test.each([
+  ["0", "amountUsdc must be positive"],
+  ["-1", "amountUsdc must be positive"],
+  ["1.5", "invalid amountUsdc"],
+  ["abc", "invalid amountUsdc"],
+  ["0x10", "invalid amountUsdc"], // hex — BigInt("0x10") === 16n, must not be accepted
+  [" 100 ", "invalid amountUsdc"], // whitespace — BigInt(" 100 ") === 100n, must not be accepted
+  ["1e6", "invalid amountUsdc"], // exponential notation
+])(
+  "pay rejects amountUsdc=%s without calling the payment service (%s)",
+  async (amountUsdc, expectedText) => {
     repoSeed(TENANT, "agent1");
     const { key } = apiKeys.mint(TENANT, { capability: "spend" });
     const { client, close } = await startMcpTestClient(app, key);
@@ -197,6 +205,7 @@ test.each(["0", "-1", "1.5", "abc"])(
         },
       });
       expect(res.isError).toBe(true);
+      expect((res.content as { text: string }[])[0]!.text).toBe(expectedText);
       expect(payCalls).toHaveLength(0);
     } finally {
       await close();
