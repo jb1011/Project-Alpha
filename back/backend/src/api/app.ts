@@ -6,6 +6,7 @@ import { mountMcpRoute } from "../mcp/transport";
 import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
+import { mountConnectionRoutes } from "./routes/connection";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
@@ -38,6 +39,7 @@ export interface ApiDeps {
   jobEvaluatorAddress: string;
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
   agentRuns: import("../persistence/agentRunStore").AgentRunStore;
+  mcpPublicUrl: string;
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
@@ -55,7 +57,9 @@ export function buildApiApp(deps: ApiDeps) {
   app.use("/jobs/*", requireAuth(deps.jwtSecret));
   app.use("/api-keys", requireAuth(deps.jwtSecret));
   app.use("/api-keys/*", requireAuth(deps.jwtSecret));
+  app.use("/connection-package", requireAuth(deps.jwtSecret));
   mountApiKeyRoutes(app, deps);
+  mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);
