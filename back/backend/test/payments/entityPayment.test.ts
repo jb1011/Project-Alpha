@@ -303,6 +303,109 @@ test("status: reads the four treasury fields plus the entity's configured cap", 
   });
 });
 
+test("surprise-price: 402 demands more than the caller's amountUsdc ceiling, denied before authorize/sign, claim released", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const authorizeSpy = vi.fn();
+  const fn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    if (headers?.["X-PAYMENT"]) {
+      authorizeSpy(); // would only be reached after a real authorize+retry
+      return new Response("ok", { status: 200 });
+    }
+    // requirements.maxAmountRequired = 1000 (atomic), caller's amountUsdc below is 100 — over ceiling
+    return new Response(JSON.stringify({ accepts: [requirements] }), { status: 402 });
+  });
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 100n,
+    idempotencyKey: "k-surprise",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({
+    ok: false,
+    reason: expect.stringMatching(/amount-exceeds-declared/),
+  });
+  expect(fn).toHaveBeenCalledTimes(1); // only the 402 probe, no retry — authorize/sign never reached
+  expect(authorizeSpy).not.toHaveBeenCalled();
+  // released, not stuck: a subsequent begin() with the same key is "new" again (retryable)
+  expect(idempotency.begin("k-surprise", "tenantA", entity.idempotencyKey)).toEqual({
+    status: "new",
+  });
+});
+
+test("post-sign failure (retry throws): does NOT release the claim, caches an unconfirmed receipt, blocks a blind re-sign", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const fn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    const xp = headers?.["X-PAYMENT"];
+    if (!xp) return new Response(JSON.stringify({ accepts: [requirements] }), { status: 402 });
+    throw new Error("network error: connection reset");
+  });
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-postsign-throw",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: expect.stringMatching(/^unconfirmed:/) });
+  expect(fn).toHaveBeenCalledTimes(2); // 402 probe + the retry that threw — authorize/sign DID happen
+
+  // A same-key retry must NOT be free to re-sign: begin() replays the cached unconfirmed receipt.
+  const replay = idempotency.begin("k-postsign-throw", "tenantA", entity.idempotencyKey);
+  expect(replay).toEqual({ status: "replayed", receipt });
+});
+
+test("post-sign failure (retry returns non-200): does NOT release the claim, caches unconfirmed", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const fn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    const xp = headers?.["X-PAYMENT"];
+    if (!xp) return new Response(JSON.stringify({ accepts: [requirements] }), { status: 402 });
+    return new Response("server error", { status: 500 });
+  });
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-postsign-500",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({
+    ok: false,
+    reason: expect.stringMatching(/^unconfirmed: resource-500$/),
+  });
+  expect(fn).toHaveBeenCalledTimes(2);
+
+  const replay = idempotency.begin("k-postsign-500", "tenantA", entity.idempotencyKey);
+  expect(replay).toEqual({ status: "replayed", receipt });
+});
+
 test("status: an entity with no treasury reads as zeroed-out/not-paused", async () => {
   const { reader } = makeReader();
   const svc = buildEntityPaymentService(makeConfig(), {
