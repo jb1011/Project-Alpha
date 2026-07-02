@@ -18,7 +18,7 @@ const toneClasses: Record<NonNullable<Extract<Line, { kind: "out" }>["tone"]>, s
 };
 
 export function Terminal({
-  title = "projectAlpha — console",
+  title = "Novi Corpus — console",
   lines,
   cursor = true,
   className = "",
@@ -61,7 +61,7 @@ export function Terminal({
 
           if (line.kind === "prompt") {
             const user = line.user ?? "agent";
-            const host = line.host ?? "alpha";
+            const host = line.host ?? "novicorpus";
             return (
               <div key={i} className="anim-line whitespace-pre" style={style}>
                 <span className="text-accent-soft">{user}</span>

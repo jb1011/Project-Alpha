@@ -390,7 +390,7 @@ function McpReview({
             <span className="text-accent-soft">connected · live validation</span>
           </div>
           <div className="mt-1.5 text-ink">
-            https://mcp.projectalpha.xyz/agent-policy
+            https://mcp.novicorpus.xyz/agent-policy
           </div>
         </div>
 

@@ -248,7 +248,7 @@ ARTICLE VI — LAW-TO-CODE BINDING
 6.3  Any divergence between this Agreement and the deployed policy is void.
 
 ARTICLE VII — NON-CUSTODY
-7.1  No platform, including projectAlpha, holds the keys or assets of the
+7.1  No platform, including Novi Corpus, holds the keys or assets of the
      Company. Authority originates solely from the Guardian's passkey.
 
 IN WITNESS WHEREOF, the Guardian adopts this Agreement upon on-chain confirmation.`;

@@ -9,7 +9,7 @@ export function Wordmark({ className = "", tone = "ink" }: Props) {
     <a
       href="#top"
       className={`group inline-flex items-center gap-2.5 ${className}`}
-      aria-label="projectAlpha home"
+      aria-label="Novi Corpus home"
     >
       <span
         className={`relative inline-flex h-7 w-7 items-center justify-center rounded-md border ${
@@ -18,7 +18,7 @@ export function Wordmark({ className = "", tone = "ink" }: Props) {
             : "border-line-dark-strong bg-ink-3 text-ink"
         }`}
       >
-        <span className="font-serif text-[18px] leading-none -mt-0.5">α</span>
+        <span className="font-serif text-[18px] leading-none -mt-0.5">N</span>
         <span
           aria-hidden
           className={`absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full ${
@@ -32,7 +32,7 @@ export function Wordmark({ className = "", tone = "ink" }: Props) {
             ink ? "text-ink" : "text-ink"
           }`}
         >
-          ProjectAlpha
+          Novi Corpus
         </span>
         <span
           className={`text-[10px] uppercase tracking-[0.18em] ${

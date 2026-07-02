@@ -97,7 +97,7 @@ export function CLIShowcase() {
             lines={[
               {
                 kind: "out",
-                text: "→ agent connected to mcp.projectalpha.xyz",
+                text: "→ agent connected to mcp.novicorpus.xyz",
                 tone: "muted",
               },
               {

@@ -90,7 +90,7 @@ export function Footer() {
 
         <div className="mt-14 flex flex-col items-start justify-between gap-4 border-t hairline pt-6 sm:flex-row sm:items-center">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[12px] text-muted">
-            <span>© {new Date().getFullYear()} projectAlpha Labs, Inc.</span>
+            <span>© {new Date().getFullYear()} Novi Corpus Labs, Inc.</span>
             <span className="inline-flex items-center gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-accent" />
               Arc testnet · Simulation

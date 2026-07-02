@@ -57,7 +57,7 @@ export function McpKeysPanel() {
   const snippet = mintedKey
     ? `{
   "mcpServers": {
-    "projectAlpha": {
+    "noviCorpus": {
       "url": "${absoluteMcpUrl()}",
       "headers": {
         "Authorization": "Bearer ${mintedKey}"

@@ -18,7 +18,7 @@ export async function createGuardianPasskey(
 
   const attestation = await getWebAuthnAttestation({
     publicKey: {
-      rp: { id: rpId, name: "projectAlpha Guardian" },
+      rp: { id: rpId, name: "Novi Corpus Guardian" },
       challenge,
       pubKeyCredParams: [
         { type: "public-key", alg: -7 },
