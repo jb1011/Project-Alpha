@@ -20,6 +20,14 @@ export interface McpToolDeps {
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
 export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
+  // The ACTING tools below (whoami/list_entities/get_entity/fund_treasury/onboard_agent) enforce
+  // ONLY tenant isolation via `tenantId` — they do NOT yet honor `scope.entityId`/`scope.capability`.
+  // The read tools (get_job/list_jobs) DO enforce entityInScope. This is safe today because
+  // `POST /api-keys` only ever mints tenant-wide keys ({entityId: null, capability: "spend"}); entity-
+  // scoped keys are not yet mintable over the API. ⚠ P2b/P2c PREREQUISITE: entity+capability gating of
+  // fund_treasury/onboard_agent MUST land BEFORE the mint surface is widened to issue scoped keys —
+  // otherwise a nominally "read-only, entity-A" key would silently retain treasury-funding/onboarding
+  // power over the whole tenant. See back/docs/plans/2026-07-02-byoa-p2a-scope-and-reads.md.
   const tenantId = scope.tenantId;
   const { repo, runner } = deps;
   const server = new McpServer({ name: "project-alpha-brain", version: "1.0.0" });

@@ -292,6 +292,16 @@ x402 spend (requires `hasCapability(scope, "spend")` + `entityInScope`, plus SSR
 idempotency / `treasury_status`), and **P2c (`run_job`)** adds earning (requires `hasCapability(scope,
 "earn")`). Both reuse the helpers defined here.
 
+> ⚠️ **P2b/P2c ORDERING PREREQUISITE (from the P2a whole-branch review).** The five pre-existing acting
+> tools (`whoami`/`list_entities`/`get_entity`/`fund_treasury`/`onboard_agent`) currently enforce ONLY
+> `tenantId` and ignore `scope.entityId`/`scope.capability`. This is safe today only because `POST
+> /api-keys` always mints tenant-wide keys (`{entityId: null, capability: "spend"}`) — entity-scoped keys
+> are not yet mintable over the API. Before ANY change widens the mint surface to issue entity/capability-
+> scoped keys, `fund_treasury` and `onboard_agent` MUST first be gated with `entityInScope` +
+> `hasCapability` — otherwise a nominally "read-only, entity-A" key would silently retain treasury-funding /
+> onboarding power over the whole tenant. Gate the acting tools BEFORE exposing scoped minting; never the
+> reverse.
+
 ## Self-Review
 
 **Spec coverage:** design §14.2 "keys scoped to a single entityId + capability, enforced" → Tasks 1–3 wire
