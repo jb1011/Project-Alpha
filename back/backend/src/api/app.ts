@@ -31,6 +31,7 @@ export interface ApiDeps {
   passkeyRpId: string;
   apiKeys: import("../persistence/apiKeyStore").ApiKeyStore;
   passkeys: import("../persistence/passkeyStore").PasskeyStore;
+  challenges: import("../persistence/challengeStore").ChallengeStore;
   jobs: import("../jobs/jobRepository").JobRepository;
   jobRunner: import("../jobs/jobRunner").JobRunner;
   jobClientAddress: string;

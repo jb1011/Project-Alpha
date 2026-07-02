@@ -5,17 +5,19 @@ import Database from "better-sqlite3";
 import { http, createPublicClient } from "viem";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
+import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { makeSignX402 } from "../adapters/x402/signX402";
 import { chainFor } from "../chains";
 import { loadConfig } from "../config/env";
 import { migrate } from "../persistence/db";
+import { SqliteEntityRepository } from "../persistence/entityRepository";
 import type { Address } from "../types";
 import { PaymentLedger } from "./ledger";
 import { buildAuthorityService } from "./service";
 
 async function main() {
   const cfg = loadConfig();
-  if (!cfg.pocketPrivateKey) throw new Error("POCKET_PRIVATE_KEY required to run the Authority");
+  if (!cfg.pocketMasterSeed) throw new Error("POCKET_MASTER_SEED required to run the Authority");
   const treasury = (process.env.TREASURY_ADDRESS ?? "") as Address;
   if (!treasury) throw new Error("TREASURY_ADDRESS required (the live entity's AgentTreasury)");
 
@@ -38,8 +40,12 @@ async function main() {
   const db = new Database(cfg.dbPath);
   migrate(db);
 
+  const entities = new SqliteEntityRepository(db);
+  const entity = entities.findByTreasury(treasury);
+  if (!entity) throw new Error(`no onboarded agent owns treasury ${treasury}`);
+
   const signX402 = makeSignX402({
-    signer: pocketSignerFromKey(cfg.pocketPrivateKey),
+    signer: pocketSignerFromKey(derivePocketKey(cfg.pocketMasterSeed, entity.idempotencyKey)),
     chainId: cfg.chainId,
     network: arcBatchingConfig.network,
     verifyingContract: arcBatchingConfig.verifyingContract,

@@ -5,8 +5,8 @@ import { loadConfig } from "../src/config/env";
 
 async function main() {
   const cfg = loadConfig();
-  if (!cfg.pocketPrivateKey) throw new Error("POCKET_PRIVATE_KEY required");
-  const gw = new PocketGateway({ pocketPrivateKey: cfg.pocketPrivateKey, rpcUrl: cfg.rpcUrl });
+  if (!cfg.pocketMasterSeed) throw new Error("POCKET_MASTER_SEED required");
+  const gw = new PocketGateway({ pocketPrivateKey: cfg.pocketMasterSeed, rpcUrl: cfg.rpcUrl });
 
   let balanceLine: string;
   try {

@@ -4,6 +4,7 @@ import { createSiweMessage } from "viem/siwe";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { SqliteChallengeStore } from "../../src/persistence/challengeStore";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import type { EntityRecord } from "../../src/types";
@@ -37,6 +38,7 @@ function makeApp() {
     repo,
     runner,
     passkeyRpId: "wizard.local",
+    challenges: new SqliteChallengeStore(db),
   } as never);
   return { app, runner }; // runner exposed so tests can await background work deterministically
 }
@@ -169,10 +171,17 @@ test("onboard with an invalid spec returns 400 validation_error", async () => {
   expect((await res.json()).error.code).toBe("validation_error");
 });
 
-test("GET /passkey/challenge returns a challenge + rpId (no auth required)", async () => {
-  const res = await makeApp().app.request("/passkey/challenge");
-  expect(res.status).toBe(200);
-  const body = await res.json();
+test("GET /passkey/challenge requires auth and returns a challenge + rpId", async () => {
+  const { app } = makeApp();
+  const res = await app.request("/passkey/challenge");
+  expect(res.status).toBe(401);
+
+  const token = await login(app);
+  const authed = await app.request("/passkey/challenge", {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(authed.status).toBe(200);
+  const body = await authed.json();
   expect(typeof body.challenge).toBe("string");
   expect(body.rpId).toBe("wizard.local");
 });
