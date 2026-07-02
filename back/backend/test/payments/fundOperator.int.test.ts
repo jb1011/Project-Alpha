@@ -61,7 +61,7 @@ beforeAll(async () => {
   });
   treasury = res.treasury;
   // mint USDC to the manager so it can fund the treasury
-  await managerWallet.writeContract({
+  const mintHash = await managerWallet.writeContract({
     address: usdc,
     abi: mockUsdcAbi,
     functionName: "mint",
@@ -69,6 +69,10 @@ beforeAll(async () => {
     account: manager,
     chain: anvilChain,
   });
+  // Wait for the mint to be mined before fundTreasury below: fundTreasury simulates a transfer against
+  // the manager's balance, and can otherwise race ahead of the not-yet-mined mint → ERC20InsufficientBalance
+  // (a timing-dependent CI flake, not a real failure).
+  await pub.waitForTransactionReceipt({ hash: mintHash });
   // fund the treasury so it has USDC to push to the operator
   await adapter.fundTreasury({ usdc, treasury, amount: 500_000n });
 }, 60_000);

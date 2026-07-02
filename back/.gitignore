@@ -29,3 +29,12 @@ lib/
 .DS_Store
 *.log
 lcov.info
+
+# Slither / Aderyn Security Reports
+slither-report.json
+slither-stdout.txt
+slither-findings.md
+aderyn-report.md
+# Slither / crytic auto-generated artifacts (other run modes)
+crytic-export/
+slither.db.json
