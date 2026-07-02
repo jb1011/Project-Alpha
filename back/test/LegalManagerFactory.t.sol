@@ -8,6 +8,7 @@ import {AgentTreasury} from "../src/AgentTreasury.sol";
 import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
 contract LegalManagerFactoryTest is Test {
     LegalManagerFactory internal factory;
@@ -306,6 +307,59 @@ contract ConstantIdRegistry is IIdentityRegistry {
     function getMetadata(uint256, string calldata) external pure returns (bytes memory) { return ""; }
     function setAgentWallet(uint256, address, uint256, bytes calldata) external {}
     function getAgentWallet(uint256) external pure returns (address) { return address(0); }
+}
+
+/// @dev A `manager` implemented as a contract that records whether it ever received an ERC-721
+///      transfer callback. The canonical flow hands the identity NFT to the manager via a
+///      NON-callback `transferFrom`, so this hook must never fire during createEntity.
+contract CallbackTrackingManager is IERC721Receiver {
+    bool public callbackFired;
+
+    function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4) {
+        callbackFired = true;
+        return IERC721Receiver.onERC721Received.selector;
+    }
+}
+
+contract FactoryTransferCallbackTest is Test {
+    LegalManagerFactory internal factory;
+    MockIdentityRegistry internal registry;
+    address internal guardian = makeAddr("guardian");
+    address internal operator = makeAddr("operator");
+
+    function setUp() public {
+        registry = new MockIdentityRegistry();
+        LegalManager impl = new LegalManager();
+        factory = new LegalManagerFactory(address(impl), address(registry), makeAddr("beaconOwner"));
+    }
+
+    function _cfg() internal returns (LegalManagerFactory.TreasuryConfig memory) {
+        MockUSDC u = new MockUSDC();
+        return LegalManagerFactory.TreasuryConfig({
+            usdc: address(u), payoutAddress: makeAddr("payout"), cap: 500e6, period: 1 days, allowlistEnabled: false
+        });
+    }
+
+    /// Reentrancy canary. createEntity must transfer the identity NFT to a contract manager
+    /// WITHOUT invoking its onERC721Received hook, because `:98` uses `transferFrom`, not
+    /// `safeTransferFrom`. That non-callback transfer is the load-bearing property behind the
+    /// createEntity reentrancy analysis (2026-06-30 security pass): no callback into the one
+    /// caller-influenced address (manager) means no reentrancy entry point. If a future change
+    /// swaps `:98` to `safeTransferFrom`, this callback fires and the assertion goes red, forcing
+    /// the reentrancy question to be re-examined. The checks-effects-interactions ordering (state
+    /// written before the transfer) is the belt-and-suspenders that keeps state consistent even
+    /// if that callback ever does fire.
+    function test_identityTransferFiresNoManagerCallback() public {
+        CallbackTrackingManager mgr = new CallbackTrackingManager();
+        (uint256 agentId,,) = factory.createEntity(
+            address(mgr), guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), _cfg()
+        );
+
+        // The identity NFT reached the contract manager...
+        assertEq(registry.ownerOf(agentId), address(mgr));
+        // ...but its ERC-721 receive hook was never called: the transfer is non-callback.
+        assertFalse(mgr.callbackFired());
+    }
 }
 
 contract FactoryAgentIdCollisionTest is Test {
