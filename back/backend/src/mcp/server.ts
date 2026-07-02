@@ -4,6 +4,7 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { toEntityView } from "../api/views";
 import type { JobRepository } from "../jobs/jobRepository";
+import type { EntityPaymentService } from "../payments/entityPayment";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
@@ -16,6 +17,7 @@ export interface McpToolDeps {
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
   jobs: JobRepository;
+  payments?: EntityPaymentService;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -77,6 +79,24 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== tenantId)
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
+    },
+  );
+
+  server.registerTool(
+    "treasury_status",
+    {
+      title: "Treasury status",
+      description: "Available balance, cap, paused, allowlist for one of your entities.",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) => {
+      const rec = repo.findByIdempotencyKey(id);
+      if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+        return { content: [{ type: "text", text: "entity not found" }], isError: true };
+      if (!deps.payments)
+        return { content: [{ type: "text", text: "payments unavailable" }], isError: true };
+      const view = await deps.payments.status(rec);
+      return { content: [{ type: "text", text: JSON.stringify(view) }] };
     },
   );
 
