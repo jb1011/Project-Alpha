@@ -189,3 +189,58 @@ test("optional fundAmount runs the fund step: status 'funded' and treasury holds
   });
   expect(bal).toBe(2_000_000n);
 }, 40_000);
+
+test("re-funding an already-funded entity moves more USDC (audit fix B-safe: re-fundable treasury)", async () => {
+  const key = "agent-D";
+  // The manager needs USDC for two separate fund rounds.
+  await wallet.writeContract({
+    address: stack.usdc,
+    abi: mockUsdcAbi,
+    functionName: "mint",
+    args: [manager.address, 5_000_000n],
+    account: manager,
+    chain: anvilChain,
+  });
+
+  const first = await runOnboarding({
+    spec: spec(),
+    idempotencyKey: key,
+    repo,
+    docStore,
+    arc: adapter,
+    operatorSigner,
+    usdc: stack.usdc,
+    fundAmount: 1_000_000n,
+  });
+  expect(first.status).toBe("funded");
+
+  // Re-run the saga on the now-"funded" record with a second fundAmount. Before the fix, step 7's
+  // `rec.status === "bound"` gate would skip funding entirely on a "funded" resume — a silent no-op
+  // even once OnboardingRunner.fund's 409 gate was relaxed. It must actually move more USDC.
+  const second = await runOnboarding({
+    spec: spec(),
+    idempotencyKey: key,
+    repo,
+    docStore,
+    arc: adapter,
+    operatorSigner,
+    usdc: stack.usdc,
+    fundAmount: 500_000n,
+  });
+  expect(second.status).toBe("funded");
+  expect(second.fundTxHash).not.toBe(first.fundTxHash);
+  expect(repo.listEvents(key).map((e) => e.step)).toEqual([
+    "createEntity",
+    "setAgentWallet",
+    "fundTreasury",
+    "fundTreasury",
+  ]);
+
+  const bal = await pub.readContract({
+    address: stack.usdc,
+    abi: mockUsdcAbi,
+    functionName: "balanceOf",
+    args: [second.treasury as `0x${string}`],
+  });
+  expect(bal).toBe(1_500_000n); // 1,000,000 + 500,000 — the second fund actually landed
+}, 40_000);

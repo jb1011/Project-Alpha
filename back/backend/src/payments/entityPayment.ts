@@ -1,3 +1,4 @@
+import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { makeSignX402 } from "../adapters/x402/signX402";
@@ -25,6 +26,8 @@ export interface TreasuryStatusView {
   cap: string;
   paused: boolean;
   allowlistEnabled: boolean;
+  /** Pocket's spendable Gateway balance (atomic USDC, 6 decimals) — what a `pay` preflight checks. */
+  float: string;
 }
 
 export interface PayArgs {
@@ -44,6 +47,10 @@ export interface EntityPaymentDeps {
   ledger: PaymentLedger;
   idempotency: SqlitePaymentIdempotencyStore;
   fetchImpl?: typeof fetch;
+  /** Reads the per-agent pocket's spendable Gateway balance (atomic USDC, 6 decimals). Defaults to a
+   *  real Circle Gateway read (derives the pocket key, builds a PocketGateway, converts the decimal
+   *  `getAvailable()` to atomic units) — injectable so tests can fake it without a Gateway call. */
+  readPocketFloat?: (entity: EntityRecord) => Promise<bigint>;
 }
 
 /** The pocket master seed is required to derive a per-agent pocket (mirrors liveRunner.ts). */
@@ -69,6 +76,18 @@ export function buildEntityPaymentService(
   cfg: Config,
   deps: EntityPaymentDeps,
 ): EntityPaymentService {
+  // Real Gateway read (used unless a test injects deps.readPocketFloat): derive this entity's pocket
+  // key, build a throwaway PocketGateway, and convert its decimal available balance to atomic USDC.
+  // Math.floor keeps the conversion conservative — never rounding UP into a float we don't have.
+  const readPocketFloat =
+    deps.readPocketFloat ??
+    (async (entity: EntityRecord): Promise<bigint> => {
+      const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
+      const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
+      const available = await gateway.getAvailable();
+      return BigInt(Math.floor(available * 1e6));
+    });
+
   const buildAuthorize = (entity: EntityRecord, treasury: Address) => {
     const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
     const signX402 = makeSignX402({
@@ -102,16 +121,23 @@ export function buildEntityPaymentService(
   return {
     async status(entity) {
       if (!entity.treasury) {
-        return { available: "0", cap: "0", paused: false, allowlistEnabled: false };
+        return { available: "0", cap: "0", paused: false, allowlistEnabled: false, float: "0" };
       }
       const treasury = entity.treasury;
-      const [available, paused, allowlistEnabled] = await Promise.all([
+      const [available, paused, allowlistEnabled, float] = await Promise.all([
         deps.reader.treasuryAvailable(treasury),
         deps.reader.treasuryPaused(treasury),
         deps.reader.treasuryAllowlistEnabled(treasury),
+        readPocketFloat(entity),
       ]);
       const cap = entity.treasuryConfig?.cap ?? 0n;
-      return { available: available.toString(), cap: cap.toString(), paused, allowlistEnabled };
+      return {
+        available: available.toString(),
+        cap: cap.toString(),
+        paused,
+        allowlistEnabled,
+        float: float.toString(),
+      };
     },
 
     async pay(entity, args) {
@@ -128,12 +154,31 @@ export function buildEntityPaymentService(
         return { ok: false, txOrTransferId: null, reason: "treasury-not-ready" };
       }
 
-      // 3. Idempotency claim — a replayed key returns the original outcome without re-settling.
+      // 3. Pre-sign float preflight — the per-agent pocket's Gateway balance must cover the amount
+      //    BEFORE any idempotency claim is made or anything is signed. On an empty float, the resource
+      //    server's settle would fail non-200 after signing, caching an unsettleable "unconfirmed"
+      //    receipt and permanently burning the idempotencyKey (see audit fix B-safe). Failing here
+      //    instead costs nothing: no claim taken, no signature made, so the same key stays retryable.
+      let float: bigint;
+      try {
+        float = await readPocketFloat(entity);
+      } catch (e) {
+        return {
+          ok: false,
+          txOrTransferId: null,
+          reason: `float-check-failed: ${(e as Error).message}`,
+        };
+      }
+      if (float < args.amountUsdc) {
+        return { ok: false, txOrTransferId: null, reason: "insufficient-float" };
+      }
+
+      // 4. Idempotency claim — a replayed key returns the original outcome without re-settling.
       const entityKey = entity.idempotencyKey;
       const claim = deps.idempotency.begin(args.idempotencyKey, args.tenantId, entityKey);
       if (claim.status === "replayed") return claim.receipt;
 
-      // 4. Buy: discover the price via the 402, authorize through the chokepoint, retry with X-PAYMENT.
+      // 5. Buy: discover the price via the 402, authorize through the chokepoint, retry with X-PAYMENT.
       //    fetchImpl defaults to a safeFetch-wrapped fetch so production is SSRF-safe even if the
       //    composition root doesn't wrap it itself; tests inject their own fake fetchImpl and so
       //    bypass safeFetch (unchanged).

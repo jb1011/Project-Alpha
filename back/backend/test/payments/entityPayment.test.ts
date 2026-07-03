@@ -94,6 +94,11 @@ const requirements = {
   maxTimeoutSeconds: 60,
 };
 
+/** A pocket float fake that always covers every test's amountUsdc — the default (real) reader would
+ *  make a live Circle Gateway call, so every pay()/status() test that reaches the preflight injects
+ *  this instead. */
+const SUFFICIENT_FLOAT = async () => 1_000_000_000n;
+
 /** Simulates an x402 resource server: first request (no X-PAYMENT) -> 402 with requirements;
  *  a request carrying X-PAYMENT -> 200. Records every call for assertions. */
 function fakeFetch() {
@@ -149,6 +154,7 @@ test("happy path (micro): settles, fetch called twice, X-PAYMENT on retry, payee
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
 
   const receipt = await svc.pay(seedEntity(), {
@@ -173,6 +179,7 @@ test("policy denial (over-cap): surfaces the reason, no retry fetch, idempotency
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity();
 
@@ -201,6 +208,7 @@ test("hybrid: amount above threshold with a non-allowlisted payee is denied", as
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
 
   const receipt = await svc.pay(seedEntity(), {
@@ -222,6 +230,7 @@ test("SSRF: rejects a private/loopback URL before any network call or idempotenc
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity();
 
@@ -247,6 +256,7 @@ test("idempotency: replays the cached receipt on a repeated key without re-settl
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity();
   const args = {
@@ -273,6 +283,7 @@ test("treasury-not-ready: an entity with no treasury cannot pay", async () => {
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity({ treasury: null });
 
@@ -293,6 +304,7 @@ test("status: reads the four treasury fields plus the entity's configured cap", 
     reader,
     ledger,
     idempotency,
+    readPocketFloat: async () => 250_000n,
   });
 
   const status = await svc.status(seedEntity());
@@ -302,6 +314,7 @@ test("status: reads the four treasury fields plus the entity's configured cap", 
     cap: "5000000",
     paused: true,
     allowlistEnabled: true,
+    float: "250000",
   });
 });
 
@@ -322,6 +335,7 @@ test("surprise-price: 402 demands more than the caller's amountUsdc ceiling, den
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity();
 
@@ -357,6 +371,7 @@ test("post-sign failure (retry throws): does NOT release the claim, caches an un
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity();
 
@@ -388,6 +403,7 @@ test("post-sign failure (retry returns non-200): does NOT release the claim, cac
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity();
 
@@ -412,11 +428,14 @@ test("authorize-build failure (missing pocket master seed): releases the idempot
   const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
   const { fn } = fakeFetch();
   // No pocketMasterSeed -> buildAuthorize's requireMasterSeed throws BEFORE any fetch/signing.
+  // readPocketFloat is faked (not defaulted) so the preflight — which would otherwise also hit
+  // requireMasterSeed via the real reader — doesn't mask the buildAuthorize failure under test.
   const svc = buildEntityPaymentService(makeConfig({ pocketMasterSeed: undefined }), {
     reader,
     ledger,
     idempotency,
     fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
   });
   const entity = seedEntity();
 
@@ -447,5 +466,62 @@ test("status: an entity with no treasury reads as zeroed-out/not-paused", async 
 
   const status = await svc.status(seedEntity({ treasury: null }));
 
-  expect(status).toEqual({ available: "0", cap: "0", paused: false, allowlistEnabled: false });
+  expect(status).toEqual({
+    available: "0",
+    cap: "0",
+    paused: false,
+    allowlistEnabled: false,
+    float: "0",
+  });
+});
+
+test("insufficient float: pay fails BEFORE the idempotency claim or any signing (audit fix B-safe)", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: async () => 500n, // less than the amountUsdc requested below (1000n)
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-float",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toEqual({ ok: false, txOrTransferId: null, reason: "insufficient-float" });
+  expect(fn).not.toHaveBeenCalled(); // not even the 402 probe — nothing was signed
+
+  // No idempotency row was created: the same key is still "new", nothing to release.
+  expect(idempotency.begin("k-float", "tenantA", entity.idempotencyKey)).toEqual({
+    status: "new",
+  });
+});
+
+test("sufficient float (equal to amount): pay proceeds past the preflight and settles", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: async () => 1000n, // exactly equal to amountUsdc below
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-float-equal",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt.ok).toBe(true);
+  expect(fn).toHaveBeenCalledTimes(2); // 402 probe + the paid retry — preflight didn't block it
 });
