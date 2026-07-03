@@ -95,7 +95,8 @@ export function WelcomeStep({
     setPasskeyOverride("pending");
     setError(null);
     try {
-      const { challenge } = await getPasskeyChallenge();
+      if (!session?.token) throw new Error("Sign in with your wallet first.");
+      const { challenge } = await getPasskeyChallenge(session.token);
       const rpId = window.location.hostname;
       const passkey = await createGuardianPasskey(challenge, rpId);
       onPasskey(passkey);
