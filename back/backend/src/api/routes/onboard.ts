@@ -68,4 +68,29 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     });
     return c.json({ id, status }, 202);
   });
+
+  app.post("/entities/:id/fund-pocket", async (c) => {
+    const rec = deps.repo.findByIdempotencyKey(c.req.param("id"));
+    if (!rec || rec.ownerTenantId !== c.get("tenantId"))
+      throw new ApiError("not_found", 404, "entity not found");
+
+    let body: { amountUsdc?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ApiError("validation_error", 400, "invalid JSON body");
+    }
+    if (typeof body.amountUsdc !== "string" || !/^-?\d+$/.test(body.amountUsdc))
+      throw new ApiError("validation_error", 400, "amountUsdc (atomic USDC integer) is required");
+    const amount = BigInt(body.amountUsdc);
+    if (amount <= 0n) throw new ApiError("validation_error", 400, "amountUsdc must be positive");
+
+    if (!deps.pocketFunding) throw new ApiError("unavailable", 503, "pocket funding unavailable");
+    try {
+      const txHashes = await deps.pocketFunding(rec, amount);
+      return c.json({ txHashes });
+    } catch (e) {
+      throw new ApiError("pocket_funding_failed", 502, (e as Error).message);
+    }
+  });
 }

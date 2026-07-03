@@ -7,6 +7,7 @@ import { toEntityView } from "../api/views";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import type { EntityPaymentService } from "../payments/entityPayment";
+import type { PocketFundingFn } from "../payments/pocketFunding";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
@@ -24,6 +25,10 @@ export interface McpToolDeps {
   platformManagerAddress: string;
   jobs: JobRepository;
   payments?: EntityPaymentService;
+  /** Explicit treasury->pocket Gateway top-up (fund_pocket). Optional — mirrors `payments`:
+   *  deployments without POCKET_MASTER_SEED/Turnkey configured leave this undefined and the tool
+   *  reports "pocket funding unavailable" instead of the server failing to boot. */
+  pocketFunding?: PocketFundingFn;
   jobRunner: JobRunner;
   jobClientAddress: string;
   jobEvaluatorAddress: string;
@@ -158,6 +163,49 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         tenantId,
       });
       return { content: [{ type: "text", text: JSON.stringify(receipt) }], isError: !receipt.ok };
+    },
+  );
+
+  server.registerTool(
+    "fund_pocket",
+    {
+      title: "Fund pocket",
+      description:
+        "Top up your treasury's spending float (treasury -> operator -> pocket -> Gateway) so " +
+        "`pay` can settle. Explicit only — never auto-triggered by pay. Costs on-chain gas + " +
+        "Turnkey signatures. amountUsdc is atomic USDC (6 decimals).",
+      inputSchema: { id: z.string(), amountUsdc: z.string() },
+    },
+    async ({ id, amountUsdc }) => {
+      if (!hasCapability(scope, "spend"))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      const rec = repo.findByIdempotencyKey(id);
+      if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      // Same decimal-integer + positive validation as `pay` (atomic USDC, 6 decimals).
+      if (!/^-?\d+$/.test(amountUsdc))
+        return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+      let amount: bigint;
+      try {
+        amount = BigInt(amountUsdc);
+      } catch {
+        return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+      }
+      if (amount <= 0n)
+        return { content: [{ type: "text", text: "amountUsdc must be positive" }], isError: true };
+      if (!deps.pocketFunding)
+        return { content: [{ type: "text", text: "pocket funding unavailable" }], isError: true };
+      try {
+        const txHashes = await deps.pocketFunding(rec, amount);
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, txHashes }) }] };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ ok: false, reason: (e as Error).message }) },
+          ],
+          isError: true,
+        };
+      }
     },
   );
 

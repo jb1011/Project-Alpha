@@ -11,6 +11,7 @@ import { loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
 import { buildEntityPaymentService } from "../payments/entityPayment";
 import { PaymentLedger } from "../payments/ledger";
+import { buildPocketFunding } from "../payments/pocketFunding";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
@@ -63,6 +64,10 @@ async function main() {
         idempotency: new SqlitePaymentIdempotencyStore(db),
       })
     : undefined;
+
+  // Explicit treasury->pocket top-up (fund_pocket tool/route). Same guard as `payments`: needs both
+  // POCKET_MASTER_SEED (to derive the pocket) and Turnkey config (to sign as the operator).
+  const pocketFunding = cfg.pocketMasterSeed && cfg.turnkey ? buildPocketFunding(cfg) : undefined;
 
   const provision = (p: {
     subOrgName: string;
@@ -125,6 +130,7 @@ async function main() {
     agentRuns,
     mcpPublicUrl: cfg.mcpPublicUrl,
     payments,
+    pocketFunding,
   });
 
   const port = Number(process.env.PORT ?? 8789);

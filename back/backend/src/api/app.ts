@@ -52,6 +52,10 @@ export interface ApiDeps {
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
    *  "payments unavailable" instead of throwing. */
   payments?: import("../payments/entityPayment").EntityPaymentService;
+  /** Explicit treasury->pocket Gateway top-up (fund_pocket tool/route). Optional for the same
+   *  reason as `payments`: deployments without POCKET_MASTER_SEED/Turnkey configured still build,
+   *  and the tool/route then report "unavailable" instead of throwing. */
+  pocketFunding?: import("../payments/pocketFunding").PocketFundingFn;
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
