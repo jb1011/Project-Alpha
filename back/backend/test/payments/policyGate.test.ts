@@ -67,3 +67,83 @@ test("evaluatePolicy: rejects a single payment over the per-tx cap", () => {
   expect(evaluatePolicy({ ...base, amount: 20_000n, perTxCap: 20_000n })).toEqual({ ok: true }); // at-boundary allowed
   expect(evaluatePolicy({ ...base, amount: 30_000n })).toEqual({ ok: true }); // no cap set → allowed
 });
+
+test("hybrid: micro-payment (<= threshold) needs no allowlist", () => {
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: false,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(evaluatePolicy({ ...base, amount: 50_000n, threshold: 100_000n })).toEqual({ ok: true });
+});
+
+test("hybrid: above threshold requires an allowlisted payee", () => {
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: false,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(
+    evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n, isAllowed: false }),
+  ).toEqual({ ok: false, reason: "over-threshold-needs-allowlist" });
+  expect(
+    evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n, isAllowed: true }),
+  ).toEqual({ ok: true });
+});
+
+test("hybrid: amount exactly at threshold is allowed (boundary, not >)", () => {
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: false,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(evaluatePolicy({ ...base, amount: 100_000n, threshold: 100_000n })).toEqual({ ok: true });
+});
+
+test("no threshold set → hybrid rule inactive (back-compat)", () => {
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: false,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(evaluatePolicy({ ...base, amount: 999_999n })).toEqual({ ok: true });
+});
+
+test("not-allowlisted rule precedes threshold rule: proves allowlist fires first", () => {
+  // Both rules are active: allowlistEnabled && !isAllowed, AND amount > threshold with !isAllowed.
+  // This test proves "not-allowlisted" wins if evaluated first (it should be).
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: true,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n })).toEqual({
+    ok: false,
+    reason: "not-allowlisted",
+  });
+});
+
+test("over-threshold-needs-allowlist rule precedes over-tx-cap: proves threshold fires first", () => {
+  // Amount exceeds both threshold and perTxCap with isAllowed: false.
+  // This test proves "over-threshold-needs-allowlist" wins if evaluated first (it should).
+  const base = {
+    available: 10_000_000n,
+    paused: false,
+    allowlistEnabled: false,
+    isAllowed: false,
+    runningPending: 0n,
+  };
+  expect(
+    evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n, perTxCap: 150_000n }),
+  ).toEqual({ ok: false, reason: "over-threshold-needs-allowlist" });
+});

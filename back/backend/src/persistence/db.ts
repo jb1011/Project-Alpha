@@ -160,6 +160,18 @@ export function migrate(db: Database.Database): void {
       FOREIGN KEY (run_id) REFERENCES agent_runs(id)
     );
     CREATE INDEX IF NOT EXISTS idx_run_payments_run ON run_payments(run_id);
+
+    -- Payment idempotency: claims (key,tenant,entity) so a repeated pay call with the same
+    -- idempotencyKey returns the original receipt instead of settling twice. receipt_json is
+    -- NULL while the payment is in flight (claimed but not yet completed).
+    CREATE TABLE IF NOT EXISTS payment_idempotency (
+      idem_key     TEXT NOT NULL,
+      tenant_id    TEXT NOT NULL,
+      entity_key   TEXT NOT NULL,
+      receipt_json TEXT,
+      created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (idem_key, tenant_id, entity_key)
+    );
   `);
 
   // Additive migration for pre-existing dev DBs (new tables/columns only).

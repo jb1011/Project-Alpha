@@ -23,6 +23,7 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       runner: deps.runner,
       passkeys: deps.passkeys,
       jobs: deps.jobs,
+      payments: deps.payments,
     });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

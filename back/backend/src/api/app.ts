@@ -40,6 +40,10 @@ export interface ApiDeps {
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
   agentRuns: import("../persistence/agentRunStore").AgentRunStore;
   mcpPublicUrl: string;
+  /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
+   *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
+   *  "payments unavailable" instead of throwing. */
+  payments?: import("../payments/entityPayment").EntityPaymentService;
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
