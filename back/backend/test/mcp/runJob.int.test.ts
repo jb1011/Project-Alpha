@@ -182,6 +182,7 @@ test("run_job with an entity-scoped key calling a DIFFERENT entity is uniform no
 test.each([
   ["abc", "invalid budgetUsdc"],
   ["-1", "invalid budgetUsdc"],
+  ["1.1234567", "invalid budgetUsdc"], // >6 decimals: rejected uniformly at the tool boundary
   ["0", "budgetUsdc must be positive"],
 ])(
   "run_job rejects budgetUsdc=%s without starting the saga (%s)",

@@ -167,7 +167,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "not found" }], isError: true };
       const raw = budgetUsdc ?? "1.00";
-      if (!/^\d+(\.\d+)?$/.test(raw))
+      // At most 6 decimals (USDC precision): rejecting here keeps the error message uniform instead of
+      // letting usdToUnits throw a different one deeper in.
+      if (!/^\d+(\.\d{1,6})?$/.test(raw))
         return { content: [{ type: "text", text: "invalid budgetUsdc" }], isError: true };
       const budget = usdToUnits(raw);
       if (budget <= 0n)
