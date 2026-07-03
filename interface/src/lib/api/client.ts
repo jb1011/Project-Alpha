@@ -65,11 +65,11 @@ export async function verifySiwe(
   });
 }
 
-export async function getPasskeyChallenge(): Promise<{
+export async function getPasskeyChallenge(token?: string): Promise<{
   challenge: string;
   rpId: string;
 }> {
-  return request("/passkey/challenge");
+  return request("/passkey/challenge", { token });
 }
 
 export async function onboardEntity(
