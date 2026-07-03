@@ -139,3 +139,16 @@ test("claim_connection with an unknown code fails uniformly", async () => {
     await close();
   }
 });
+
+test("claim_connection with an expired code fails uniformly", async () => {
+  const code = linkCodes.issue(TENANT, Date.now(), -1); // already past its TTL
+  const { key } = apiKeys.mint(TENANT);
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const res = await client.callTool({ name: "claim_connection", arguments: { linkCode: code } });
+    expect(res.isError).toBe(true);
+    expect((res.content as { text: string }[])[0]!.text).toBe("invalid or expired link code");
+  } finally {
+    await close();
+  }
+});
