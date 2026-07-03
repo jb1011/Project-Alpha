@@ -17,6 +17,7 @@ import { SqliteChallengeStore } from "../persistence/challengeStore";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
+import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import type { Address } from "../types";
@@ -118,6 +119,7 @@ async function main() {
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
     agentRuns,
     mcpPublicUrl: cfg.mcpPublicUrl,
+    linkCodes: new SqliteLinkCodeStore(db),
     payments,
   });
 
