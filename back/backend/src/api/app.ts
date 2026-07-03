@@ -25,6 +25,10 @@ export interface ApiDeps {
   chainId: number;
   jwtSecret: string;
   jwtTtlSec: number;
+  /** Audit fix C: the platform/manager account address (Factory owner + setAgentWallet caller,
+   *  see `managerAccount`). Force-set into `roles.manager` on onboarding so an agent-first caller
+   *  never needs to know or guess it — a wrong guess would burn the entity name on bind failure. */
+  platformManagerAddress: string;
   /** Injectable clock (ms) for tests; defaults to Date.now. */
   now?: () => number;
   repo: import("../persistence/entityRepository").EntityRepository;

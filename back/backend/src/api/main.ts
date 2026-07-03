@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
@@ -49,6 +49,9 @@ async function main() {
     identityRegistry: cfg.identityRegistry,
   });
   const operatorSigner = await buildOperatorSigner(cfg);
+  // Audit fix C: the platform manager address, force-set into `roles.manager` on onboarding so an
+  // agent-first caller never needs to know or guess it (see managerAccount doc).
+  const platformManagerAddress = managerAccount(cfg).address;
 
   // Per-entity payment service (treasury_status/pay tools) needs a pocket-derivation seed; leave
   // it undefined on deployments that haven't set POCKET_MASTER_SEED so they keep working (the
@@ -105,6 +108,7 @@ async function main() {
     chainId: cfg.chainId,
     jwtSecret: cfg.authJwtSecret,
     jwtTtlSec: cfg.authJwtTtlSec,
+    platformManagerAddress,
     repo,
     runner,
     passkeyRpId: cfg.passkeyRpId,

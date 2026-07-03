@@ -15,7 +15,10 @@ const account = privateKeyToAccount(
 );
 const DOMAIN = "wizard.local";
 const CHAIN = 5042002;
+// MANAGER is a caller-supplied guess for roles.manager — always wrong, since the server now
+// force-overrides roles.manager to PLATFORM_MANAGER (audit fix C).
 const MANAGER = "0x000000000000000000000000000000000000000A";
+const PLATFORM_MANAGER = "0x000000000000000000000000000000000000000E";
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
@@ -35,6 +38,7 @@ function makeApp() {
     chainId: CHAIN,
     jwtSecret: "s",
     jwtTtlSec: 3600,
+    platformManagerAddress: PLATFORM_MANAGER,
     repo,
     runner,
     passkeyRpId: "wizard.local",
@@ -67,7 +71,7 @@ async function login(app: ReturnType<typeof buildApiApp>) {
 const validSpec = {
   name: "WizardAgent",
   jurisdiction: "Wyoming-DAO-LLC",
-  roles: { manager: MANAGER }, // guardian filled by the server = tenant
+  roles: { manager: MANAGER }, // guardian + manager both filled by the server (audit fix C)
   treasury: {
     payoutAddress: "0x000000000000000000000000000000000000000B",
     spendingCapUsdc: "100.00",
@@ -118,6 +122,39 @@ test("onboard accepts (202 pending), then resolves to bound, guardian = tenant",
   expect(view.status).toBe("bound");
   expect(view).not.toHaveProperty("specJson");
   expect(view).not.toHaveProperty("turnkeySubOrgId");
+});
+
+test("onboard overrides a caller-supplied wrong manager with the platform manager address", async () => {
+  const { app } = makeApp();
+  const token = await login(app);
+  // validSpec.roles.manager is MANAGER — a wrong guess. The server must override it with
+  // PLATFORM_MANAGER regardless (audit fix C), never letting the caller's guess through.
+  const res = await app.request("/onboard", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ spec: validSpec, guardianPasskey: passkey }),
+  });
+  expect(res.status).toBe(202);
+  const { id } = await res.json();
+  const rec = repo.findByIdempotencyKey(id);
+  expect(rec?.manager).toBe(PLATFORM_MANAGER);
+  expect(rec?.manager).not.toBe(MANAGER);
+});
+
+test("onboard with an omitted manager still resolves to the platform manager address", async () => {
+  const { app } = makeApp();
+  const token = await login(app);
+  const { manager: _omit, ...rolesWithoutManager } = validSpec.roles;
+  const specWithoutManager = { ...validSpec, roles: rolesWithoutManager };
+  const res = await app.request("/onboard", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ spec: specWithoutManager, guardianPasskey: passkey }),
+  });
+  expect(res.status).toBe(202);
+  const { id } = await res.json();
+  const rec = repo.findByIdempotencyKey(id);
+  expect(rec?.manager).toBe(PLATFORM_MANAGER);
 });
 
 test("a different tenant cannot read another tenant's entity (404)", async () => {

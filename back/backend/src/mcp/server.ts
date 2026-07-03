@@ -19,6 +19,9 @@ export interface McpToolDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
+  /** Audit fix C: the platform/manager account address, force-set into `roles.manager` on
+   *  onboard_agent so an agent-first caller never needs to know or guess it. */
+  platformManagerAddress: string;
   jobs: JobRepository;
   payments?: EntityPaymentService;
   jobRunner: JobRunner;
@@ -274,8 +277,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       title: "Onboard agent",
       description:
         "Create an agent legal body. spec must match schema://agent-spec; the guardian is set " +
-        "automatically to your tenant. passkeyId references a previously stored guardian passkey " +
-        "(POST /passkey). Returns immediately with status 'pending' — poll get_entity until 'bound'.",
+        "automatically to your tenant and the manager is set automatically to the platform " +
+        "manager account — you don't need to know or supply either. passkeyId references a " +
+        "previously stored guardian passkey (POST /passkey). Returns immediately with status " +
+        "'pending' — poll get_entity until 'bound'.",
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
@@ -290,7 +295,11 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
       try {
         const raw = spec as Record<string, unknown>;
-        const roles = { ...((raw.roles as object) ?? {}), guardian: tenantId };
+        const roles = {
+          ...((raw.roles as object) ?? {}),
+          guardian: tenantId,
+          manager: deps.platformManagerAddress,
+        };
         const parsed = AgentSpecSchema.parse({ ...raw, roles });
         const userKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : parsed.name;
         const { id, status } = deps.runner.start({

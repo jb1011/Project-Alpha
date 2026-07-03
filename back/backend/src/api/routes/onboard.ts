@@ -19,9 +19,15 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     if (!body.guardianPasskey || typeof body.guardianPasskey !== "object")
       throw new ApiError("validation_error", 400, "guardianPasskey is required");
 
-    // Server owns the guardian: force it to the authenticated tenant before validation.
+    // Server owns the guardian + manager: force guardian to the authenticated tenant and manager
+    // to the platform manager address before validation (audit fix C — the caller can't discover
+    // or misconfigure the on-chain manager, which must equal the wallet the saga signs txs as).
     const rawSpec = (body.spec ?? {}) as Record<string, unknown>;
-    const roles = { ...((rawSpec.roles as object) ?? {}), guardian: tenantId };
+    const roles = {
+      ...((rawSpec.roles as object) ?? {}),
+      guardian: tenantId,
+      manager: deps.platformManagerAddress,
+    };
     const spec = AgentSpecSchema.parse({ ...rawSpec, roles }); // throws ZodError → 400
 
     const userKey =
