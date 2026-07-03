@@ -32,12 +32,15 @@ async function proxy(
   const res = await fetch(url, init);
   const body = await res.arrayBuffer();
 
-  return new NextResponse(body, {
-    status: res.status,
-    headers: res.headers.get("content-type")
-      ? { "content-type": res.headers.get("content-type")! }
-      : undefined,
-  });
+  const outHeaders: Record<string, string> = {};
+  const ct = res.headers.get("content-type");
+  if (ct) outHeaders["content-type"] = ct;
+  const joined = path?.join("/") ?? "";
+  if (joined === "connection-package" || joined === "bootstrap-connection") {
+    outHeaders["cache-control"] = "no-store";
+  }
+
+  return new NextResponse(body, { status: res.status, headers: outHeaders });
 }
 
 export const GET = proxy;
