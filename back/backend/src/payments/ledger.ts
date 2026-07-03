@@ -15,13 +15,13 @@ function nowSeconds(): number {
 export class PaymentLedger {
   constructor(private readonly db: Database.Database) {}
 
-  /** Record a freshly-authorized payment. Returns the ledger row id. */
-  recordAuthorized(payee: Address, amount: bigint): number {
+  /** Record a freshly-authorized payment, scoped to the owning entity. Returns the ledger row id. */
+  recordAuthorized(entityKey: string, payee: Address, amount: bigint): number {
     const info = this.db
       .prepare(
-        "INSERT INTO payments_ledger (payee, amount, status, created_at) VALUES (?, ?, 'authorized', ?)",
+        "INSERT INTO payments_ledger (entity_key, payee, amount, status, created_at) VALUES (?, ?, ?, 'authorized', ?)",
       )
-      .run(payee, amount.toString(), nowSeconds());
+      .run(entityKey, payee, amount.toString(), nowSeconds());
     return Number(info.lastInsertRowid);
   }
 
@@ -37,11 +37,13 @@ export class PaymentLedger {
     this.db.prepare("UPDATE payments_ledger SET status='failed' WHERE id=?").run(id);
   }
 
-  /** Sum of authorized-but-not-yet-settled amounts (the off-chain spend not yet reflected on-chain). */
-  runningPending(): bigint {
+  /** Sum of THIS ENTITY'S authorized-but-not-yet-settled amounts (the off-chain spend not yet
+   *  reflected on-chain). Scoped per entity so one tenant's pending spend never counts against
+   *  another's cap. */
+  runningPending(entityKey: string): bigint {
     const rows = this.db
-      .prepare("SELECT amount FROM payments_ledger WHERE status='authorized'")
-      .all() as { amount: string }[];
+      .prepare("SELECT amount FROM payments_ledger WHERE entity_key = ? AND status = 'authorized'")
+      .all(entityKey) as { amount: string }[];
     return rows.reduce((sum, r) => sum + BigInt(r.amount), 0n);
   }
 }

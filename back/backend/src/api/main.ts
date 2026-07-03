@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
@@ -11,6 +11,7 @@ import { loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
 import { buildEntityPaymentService } from "../payments/entityPayment";
 import { PaymentLedger } from "../payments/ledger";
+import { buildPocketFunding } from "../payments/pocketFunding";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
@@ -50,6 +51,9 @@ async function main() {
     identityRegistry: cfg.identityRegistry,
   });
   const operatorSigner = await buildOperatorSigner(cfg);
+  // Audit fix C: the platform manager address, force-set into `roles.manager` on onboarding so an
+  // agent-first caller never needs to know or guess it (see managerAccount doc).
+  const platformManagerAddress = managerAccount(cfg).address;
 
   // Per-entity payment service (treasury_status/pay tools) needs a pocket-derivation seed; leave
   // it undefined on deployments that haven't set POCKET_MASTER_SEED so they keep working (the
@@ -61,6 +65,10 @@ async function main() {
         idempotency: new SqlitePaymentIdempotencyStore(db),
       })
     : undefined;
+
+  // Explicit treasury->pocket top-up (fund_pocket tool/route). Same guard as `payments`: needs both
+  // POCKET_MASTER_SEED (to derive the pocket) and Turnkey config (to sign as the operator).
+  const pocketFunding = cfg.pocketMasterSeed && cfg.turnkey ? buildPocketFunding(cfg) : undefined;
 
   const provision = (p: {
     subOrgName: string;
@@ -106,6 +114,7 @@ async function main() {
     chainId: cfg.chainId,
     jwtSecret: cfg.authJwtSecret,
     jwtTtlSec: cfg.authJwtTtlSec,
+    platformManagerAddress,
     repo,
     runner,
     passkeyRpId: cfg.passkeyRpId,
@@ -117,10 +126,13 @@ async function main() {
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
+    maxJobBudget: cfg.maxJobBudget,
+    maxInflightJobsPerTenant: cfg.maxInflightJobsPerTenant,
     agentRuns,
     mcpPublicUrl: cfg.mcpPublicUrl,
     linkCodes: new SqliteLinkCodeStore(db),
     payments,
+    pocketFunding,
   });
 
   const port = Number(process.env.PORT ?? 8789);

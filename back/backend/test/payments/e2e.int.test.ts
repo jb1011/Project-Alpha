@@ -31,6 +31,7 @@ function makeStack(available: bigint) {
   migrate(db);
   const deps = {
     ledger: new PaymentLedger(db),
+    entityKey: "entityA",
     readTreasury: async () => ({
       available,
       paused: false,

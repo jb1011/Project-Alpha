@@ -25,6 +25,10 @@ export interface ApiDeps {
   chainId: number;
   jwtSecret: string;
   jwtTtlSec: number;
+  /** Audit fix C: the platform/manager account address (Factory owner + setAgentWallet caller,
+   *  see `managerAccount`). Force-set into `roles.manager` on onboarding so an agent-first caller
+   *  never needs to know or guess it — a wrong guess would burn the entity name on bind failure. */
+  platformManagerAddress: string;
   /** Injectable clock (ms) for tests; defaults to Date.now. */
   now?: () => number;
   repo: import("../persistence/entityRepository").EntityRepository;
@@ -37,6 +41,10 @@ export interface ApiDeps {
   jobRunner: import("../jobs/jobRunner").JobRunner;
   jobClientAddress: string;
   jobEvaluatorAddress: string;
+  /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
+   *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
+  maxJobBudget: bigint;
+  maxInflightJobsPerTenant: number;
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
   agentRuns: import("../persistence/agentRunStore").AgentRunStore;
   mcpPublicUrl: string;
@@ -45,6 +53,10 @@ export interface ApiDeps {
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
    *  "payments unavailable" instead of throwing. */
   payments?: import("../payments/entityPayment").EntityPaymentService;
+  /** Explicit treasury->pocket Gateway top-up (fund_pocket tool/route). Optional for the same
+   *  reason as `payments`: deployments without POCKET_MASTER_SEED/Turnkey configured still build,
+   *  and the tool/route then report "unavailable" instead of throwing. */
+  pocketFunding?: import("../payments/pocketFunding").PocketFundingFn;
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */

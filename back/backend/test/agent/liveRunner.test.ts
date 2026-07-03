@@ -76,6 +76,7 @@ test("runLive: fund -> agent buys (settles) -> customer buys answer (settles) ->
   });
   const authorityDeps = {
     ledger,
+    entityKey: "entityA",
     readTreasury: async () => ({
       available: 1_000_000n,
       paused: false,

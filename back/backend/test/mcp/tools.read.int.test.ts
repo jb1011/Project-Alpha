@@ -105,6 +105,44 @@ test("get_entity hides another tenant's entity (isError)", async () => {
   }
 });
 
+test("an entity-scoped key lists ONLY its entity (not same-tenant siblings)", async () => {
+  repoSeed(TENANT, "agent1");
+  repoSeed(TENANT, "agent2");
+  const { key } = apiKeys.mint(TENANT, { entityId: `${TENANT}:agent1`, capability: "read" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const res = await client.callTool({ name: "list_entities", arguments: {} });
+    const views = JSON.parse((res.content as { text: string }[])[0]!.text);
+    expect(views).toHaveLength(1);
+    expect(views[0].id).toBe(`${TENANT}:agent1`);
+  } finally {
+    await close();
+  }
+});
+
+test("an entity-scoped key cannot get_entity a same-tenant sibling (uniform not found)", async () => {
+  repoSeed(TENANT, "agent1");
+  repoSeed(TENANT, "agent2");
+  const { key } = apiKeys.mint(TENANT, { entityId: `${TENANT}:agent1`, capability: "read" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const sibling = await client.callTool({
+      name: "get_entity",
+      arguments: { id: `${TENANT}:agent2` },
+    });
+    expect(sibling.isError).toBe(true);
+    expect((sibling.content as { text: string }[])[0]!.text).toBe("entity not found");
+    // ...but its own entity is still reachable
+    const own = await client.callTool({
+      name: "get_entity",
+      arguments: { id: `${TENANT}:agent1` },
+    });
+    expect(own.isError).toBeFalsy();
+  } finally {
+    await close();
+  }
+});
+
 test("fund_treasury on a bound entity returns a status", async () => {
   repoSeed(TENANT, "agent1");
   const { key } = apiKeys.mint(TENANT);

@@ -35,6 +35,8 @@ const EnvSchema = z.object({
   TURNKEY_DELEGATED_API_PRIVATE_KEY: z.string().optional(),
   FUNDING_FLOAT_USDC: z.string().default("0.50"),
   SPEND_ALLOWLIST_THRESHOLD_USDC: z.string().default("1"),
+  MAX_JOB_BUDGET_USDC: z.string().default("5"),
+  MAX_INFLIGHT_JOBS_PER_TENANT: z.coerce.number().int().positive().default(3),
   CUSTOMER_PRIVATE_KEY: privKeySchema.optional(),
   CIRCLE_API_KEY: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
@@ -84,6 +86,8 @@ export interface Config {
   gatewayFacilitatorUrl: string;
   fundingFloatUsdc: string;
   spendAllowlistThreshold: bigint;
+  maxJobBudget: bigint;
+  maxInflightJobsPerTenant: number;
   customerPrivateKey: Hex;
   authJwtSecret: string;
   authJwtTtlSec: number;
@@ -144,6 +148,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     gatewayFacilitatorUrl: e.GATEWAY_FACILITATOR_URL,
     fundingFloatUsdc: e.FUNDING_FLOAT_USDC,
     spendAllowlistThreshold: usdToUnits(e.SPEND_ALLOWLIST_THRESHOLD_USDC),
+    maxJobBudget: usdToUnits(e.MAX_JOB_BUDGET_USDC),
+    maxInflightJobsPerTenant: e.MAX_INFLIGHT_JOBS_PER_TENANT,
     customerPrivateKey: e.CUSTOMER_PRIVATE_KEY ?? e.PLATFORM_PRIVATE_KEY,
     authJwtSecret: e.AUTH_JWT_SECRET,
     authJwtTtlSec: e.AUTH_JWT_TTL_SEC,
@@ -180,6 +186,7 @@ export function redact(cfg: Config): Record<string, unknown> {
   return {
     ...cfg,
     spendAllowlistThreshold: cfg.spendAllowlistThreshold.toString(),
+    maxJobBudget: cfg.maxJobBudget.toString(),
     platformPrivateKey: "REDACTED",
     customerPrivateKey: "REDACTED",
     authJwtSecret: "REDACTED",

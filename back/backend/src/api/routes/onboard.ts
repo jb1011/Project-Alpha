@@ -19,9 +19,15 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     if (!body.guardianPasskey || typeof body.guardianPasskey !== "object")
       throw new ApiError("validation_error", 400, "guardianPasskey is required");
 
-    // Server owns the guardian: force it to the authenticated tenant before validation.
+    // Server owns the guardian + manager: force guardian to the authenticated tenant and manager
+    // to the platform manager address before validation (audit fix C — the caller can't discover
+    // or misconfigure the on-chain manager, which must equal the wallet the saga signs txs as).
     const rawSpec = (body.spec ?? {}) as Record<string, unknown>;
-    const roles = { ...((rawSpec.roles as object) ?? {}), guardian: tenantId };
+    const roles = {
+      ...((rawSpec.roles as object) ?? {}),
+      guardian: tenantId,
+      manager: deps.platformManagerAddress,
+    };
     const spec = AgentSpecSchema.parse({ ...rawSpec, roles }); // throws ZodError → 400
 
     const userKey =
@@ -61,5 +67,30 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       amount: BigInt(body.amount),
     });
     return c.json({ id, status }, 202);
+  });
+
+  app.post("/entities/:id/fund-pocket", async (c) => {
+    const rec = deps.repo.findByIdempotencyKey(c.req.param("id"));
+    if (!rec || rec.ownerTenantId !== c.get("tenantId"))
+      throw new ApiError("not_found", 404, "entity not found");
+
+    let body: { amountUsdc?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ApiError("validation_error", 400, "invalid JSON body");
+    }
+    if (typeof body.amountUsdc !== "string" || !/^-?\d+$/.test(body.amountUsdc))
+      throw new ApiError("validation_error", 400, "amountUsdc (atomic USDC integer) is required");
+    const amount = BigInt(body.amountUsdc);
+    if (amount <= 0n) throw new ApiError("validation_error", 400, "amountUsdc must be positive");
+
+    if (!deps.pocketFunding) throw new ApiError("unavailable", 503, "pocket funding unavailable");
+    try {
+      const txHashes = await deps.pocketFunding(rec, amount);
+      return c.json({ txHashes });
+    } catch (e) {
+      throw new ApiError("pocket_funding_failed", 502, (e as Error).message);
+    }
   });
 }

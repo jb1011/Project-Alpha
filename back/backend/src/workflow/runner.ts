@@ -78,8 +78,15 @@ export class OnboardingRunner {
     const rec = this.deps.repo.findByIdempotencyKey(p.id);
     if (!rec || rec.ownerTenantId !== p.tenantId)
       throw new ApiError("not_found", 404, "entity not found");
-    if (rec.status !== "bound")
-      throw new ApiError("conflict", 409, `cannot fund in status "${rec.status}"`);
+    // Re-fundable: a "bound" entity can be funded for the first time, and a "funded" one can be
+    // topped up again (fundTreasury just moves more USDC in) — audit fix B-safe. Every other status
+    // (pending/provisioned/translating/created/failed) is still a 409: the entity isn't bound yet.
+    if (rec.status !== "bound" && rec.status !== "funded")
+      throw new ApiError(
+        "conflict",
+        409,
+        `cannot fund in status "${rec.status}" (must be "bound" or "funded")`,
+      );
     if (this.inFlight.has(p.id)) throw new ApiError("conflict", 409, "entity is busy");
     const spec = JSON.parse(rec.specJson ?? "{}") as AgentSpec;
     this.run(p.id, () =>

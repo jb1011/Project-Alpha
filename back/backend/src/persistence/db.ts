@@ -68,6 +68,7 @@ export function migrate(db: Database.Database): void {
     -- before the on-chain balance reflects them. amount is a bigint stored as a decimal string.
     CREATE TABLE IF NOT EXISTS payments_ledger (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_key TEXT,                         -- owning entity's idempotencyKey; scopes runningPending
       payee      TEXT NOT NULL,
       amount     TEXT NOT NULL,                -- bigint as decimal string
       status     TEXT NOT NULL CHECK (status IN ('authorized','settled','failed')),
@@ -76,6 +77,7 @@ export function migrate(db: Database.Database): void {
       settled_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_payments_ledger_status ON payments_ledger(status);
+    CREATE INDEX IF NOT EXISTS idx_payments_ledger_entity ON payments_ledger(entity_key, status);
 
     CREATE TABLE IF NOT EXISTS auth_nonces (
       nonce      TEXT PRIMARY KEY,
@@ -197,4 +199,13 @@ export function migrate(db: Database.Database): void {
   if (!akCols.includes("entity_id")) db.exec("ALTER TABLE api_keys ADD COLUMN entity_id TEXT");
   if (!akCols.includes("capability")) db.exec("ALTER TABLE api_keys ADD COLUMN capability TEXT");
   if (!akCols.includes("expires_at")) db.exec("ALTER TABLE api_keys ADD COLUMN expires_at INTEGER");
+
+  const plCols = (db.prepare("PRAGMA table_info(payments_ledger)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!plCols.includes("entity_key"))
+    db.exec("ALTER TABLE payments_ledger ADD COLUMN entity_key TEXT");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_payments_ledger_entity ON payments_ledger(entity_key, status)",
+  );
 }

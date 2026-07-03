@@ -35,6 +35,8 @@ function makeConfig(): Config {
     gatewayFacilitatorUrl: "https://gateway-api-testnet.circle.com",
     fundingFloatUsdc: "0.50",
     spendAllowlistThreshold: 1_000_000n,
+    maxJobBudget: 5_000_000n,
+    maxInflightJobsPerTenant: 3,
     customerPrivateKey: PLATFORM_KEY,
     authJwtSecret: "dev-insecure-secret-change-me-please",
     authJwtTtlSec: 3600,

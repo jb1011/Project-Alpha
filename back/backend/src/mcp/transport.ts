@@ -22,11 +22,15 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       repo: deps.repo,
       runner: deps.runner,
       passkeys: deps.passkeys,
+      platformManagerAddress: deps.platformManagerAddress,
       jobs: deps.jobs,
       payments: deps.payments,
+      pocketFunding: deps.pocketFunding,
       jobRunner: deps.jobRunner,
       jobClientAddress: deps.jobClientAddress,
       jobEvaluatorAddress: deps.jobEvaluatorAddress,
+      maxJobBudget: deps.maxJobBudget,
+      maxInflightJobsPerTenant: deps.maxInflightJobsPerTenant,
       linkCodes: deps.linkCodes,
     });
     const transport = new WebStandardStreamableHTTPServerTransport({

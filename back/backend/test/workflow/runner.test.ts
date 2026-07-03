@@ -39,6 +39,36 @@ const runSaga = async (i: {
   return bound;
 };
 
+/** Minimal EntityRecord seeder for tests that need a specific starting status without running a saga. */
+function seedRecord(over: Partial<EntityRecord> & { idempotencyKey: string }): EntityRecord {
+  const rec: EntityRecord = {
+    name: "Seed",
+    status: "pending",
+    ownerTenantId: TENANT,
+    manager: "0x00000000000000000000000000000000000000Ma",
+    guardian: TENANT,
+    operator: null,
+    amendmentDelay: "3600",
+    ein: "",
+    formationDate: 0,
+    oaHash: null,
+    metadataURI: null,
+    docPath: null,
+    treasuryConfig: null,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    specJson: JSON.stringify(spec),
+    error: null,
+    ...over,
+  };
+  repo.upsert(rec);
+  return rec;
+}
+
 test("start persists a pending record immediately and returns its id", () => {
   const runner = new OnboardingRunner({ repo, runSaga });
   const { id, status } = runner.start({
@@ -175,4 +205,61 @@ test("reconcileInFlight fails a pending record with no sub-org (cannot resume wi
   runner.reconcileInFlight();
   await runner.settled();
   expect(repo.findByIdempotencyKey(`${TENANT}:Stuck`)?.status).toBe("failed");
+});
+
+test("fund() throws 409 for statuses that aren't bound or funded yet", () => {
+  const runner = new OnboardingRunner({ repo, runSaga });
+  const pending = seedRecord({ idempotencyKey: `${TENANT}:Pending`, status: "pending" });
+  expect(() =>
+    runner.fund({ id: pending.idempotencyKey, tenantId: TENANT, amount: 1_000_000n }),
+  ).toThrowError(expect.objectContaining({ status: 409 }));
+
+  const failed = seedRecord({ idempotencyKey: `${TENANT}:Failed`, status: "failed" });
+  expect(() =>
+    runner.fund({ id: failed.idempotencyKey, tenantId: TENANT, amount: 1_000_000n }),
+  ).toThrowError(expect.objectContaining({ status: 409 }));
+});
+
+test("fund() succeeds a second time on an already-funded entity (re-fundable, no 409) — audit fix B-safe", async () => {
+  // A saga that mirrors the real onboarding.ts step 7: moves USDC and records a fresh fundTxHash from
+  // either "bound" (first fund) or "funded" (re-fund/top-up).
+  const fundingSaga = async (i: {
+    idempotencyKey: string;
+    fundAmount?: bigint;
+  }): Promise<EntityRecord> => {
+    const cur = repo.findByIdempotencyKey(i.idempotencyKey)!;
+    if (i.fundAmount && i.fundAmount > 0n && (cur.status === "bound" || cur.status === "funded")) {
+      const funded: EntityRecord = {
+        ...cur,
+        status: "funded" as const,
+        fundTxHash: `0xfund-${i.fundAmount}` as `0x${string}`,
+      };
+      repo.upsert(funded);
+      return funded;
+    }
+    return cur;
+  };
+  const runner = new OnboardingRunner({ repo, runSaga: fundingSaga });
+  const bound = seedRecord({
+    idempotencyKey: `${TENANT}:ReFund`,
+    status: "bound",
+    treasury: "0x00000000000000000000000000000000000000Fe",
+  });
+
+  // First fund: bound -> funded.
+  runner.fund({ id: bound.idempotencyKey, tenantId: TENANT, amount: 1_000_000n });
+  await runner.settled();
+  const afterFirst = repo.findByIdempotencyKey(bound.idempotencyKey)!;
+  expect(afterFirst.status).toBe("funded");
+  expect(afterFirst.fundTxHash).toBe("0xfund-1000000");
+
+  // Second fund on the now-"funded" entity: must not throw 409, and must actually move more USDC
+  // (a fresh fundTxHash), not silently no-op.
+  expect(() =>
+    runner.fund({ id: bound.idempotencyKey, tenantId: TENANT, amount: 500_000n }),
+  ).not.toThrow();
+  await runner.settled();
+  const afterSecond = repo.findByIdempotencyKey(bound.idempotencyKey)!;
+  expect(afterSecond.status).toBe("funded");
+  expect(afterSecond.fundTxHash).toBe("0xfund-500000");
 });

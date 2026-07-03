@@ -11,10 +11,14 @@ import { OnboardingRunner } from "../../src/workflow/runner";
 import { startMcpTestClient } from "./helpers";
 
 // TENANT is the authenticated tenant — the tool forces roles.guardian = TENANT.
-// MANAGER must differ from TENANT (guardian) per AgentSpecSchema superRefine.
+// PLATFORM_MANAGER is the platform manager address — the tool forces roles.manager to this,
+// regardless of what the caller supplies (audit fix C).
+// MANAGER (a WRONG guess a caller might supply) must differ from TENANT (guardian) per
+// AgentSpecSchema superRefine — it never survives the override, but it must still parse.
 const TENANT = "0x000000000000000000000000000000000000000A";
 const MANAGER = "0x000000000000000000000000000000000000000C";
 const PAYOUT = "0x000000000000000000000000000000000000000D";
+const PLATFORM_MANAGER = "0x000000000000000000000000000000000000000E";
 
 const VALID_PASSKEY: GuardianPasskey = {
   authenticatorName: "Test Key",
@@ -28,8 +32,9 @@ const VALID_PASSKEY: GuardianPasskey = {
 };
 
 // Minimal AgentSpec that passes AgentSpecSchema validation.
-// guardian is intentionally set to MANAGER here — the tool overwrites it with TENANT,
-// which is what makes it pass (TENANT !== MANAGER so roles are distinct).
+// guardian is intentionally set to MANAGER here, and manager to MANAGER too — the tool
+// overwrites guardian with TENANT and manager with PLATFORM_MANAGER before validation, which is
+// what makes it pass (TENANT !== PLATFORM_MANAGER so roles are distinct).
 const VALID_SPEC = {
   name: "TestOnboardAgent",
   roles: {
@@ -74,6 +79,7 @@ beforeEach(() => {
     passkeyRpId: "wizard.local",
     apiKeys,
     passkeys,
+    platformManagerAddress: PLATFORM_MANAGER,
   } as never);
 });
 afterEach(() => db.close());
@@ -90,6 +96,47 @@ test("onboard_agent with a stored passkey handle starts the saga and returns pen
     const out = JSON.parse((res.content as { text: string }[])[0]!.text);
     expect(out.status).toBe("pending");
     expect(typeof out.id).toBe("string");
+  } finally {
+    await close();
+  }
+});
+
+test("onboard_agent overrides a caller-supplied wrong manager with the platform manager address", async () => {
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT);
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    // VALID_SPEC.roles.manager is MANAGER — a wrong guess. The tool must override it with
+    // PLATFORM_MANAGER regardless (audit fix C), never letting the caller's guess through.
+    const res = await client.callTool({
+      name: "onboard_agent",
+      arguments: { spec: VALID_SPEC, passkeyId: handle },
+    });
+    const out = JSON.parse((res.content as { text: string }[])[0]!.text);
+    expect(out.status).toBe("pending");
+    const rec = repo.findByIdempotencyKey(out.id);
+    expect(rec?.manager).toBe(PLATFORM_MANAGER);
+    expect(rec?.manager).not.toBe(MANAGER);
+  } finally {
+    await close();
+  }
+});
+
+test("onboard_agent with an omitted manager still resolves to the platform manager address", async () => {
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT);
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const { manager: _omit, ...rolesWithoutManager } = VALID_SPEC.roles;
+    const specWithoutManager = { ...VALID_SPEC, roles: rolesWithoutManager };
+    const res = await client.callTool({
+      name: "onboard_agent",
+      arguments: { spec: specWithoutManager, passkeyId: handle },
+    });
+    const out = JSON.parse((res.content as { text: string }[])[0]!.text);
+    expect(out.status).toBe("pending");
+    const rec = repo.findByIdempotencyKey(out.id);
+    expect(rec?.manager).toBe(PLATFORM_MANAGER);
   } finally {
     await close();
   }

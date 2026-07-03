@@ -24,6 +24,7 @@ test("full cycle: agent buys sentiment, answers, prices at margin, customer pays
   });
   const deps = {
     ledger,
+    entityKey: "entityA",
     readTreasury: async () => ({
       available: 1_000_000n,
       paused: false,

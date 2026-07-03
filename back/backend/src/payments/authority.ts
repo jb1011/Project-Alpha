@@ -21,13 +21,18 @@ export interface AuthorizeRequest {
 
 export interface AuthorityDeps {
   ledger: PaymentLedger;
+  /** The owning entity's idempotencyKey — scopes runningPending/recordAuthorized so one entity's
+   *  pending spend never counts against another's cap. */
+  entityKey: string;
   readTreasury: (payee: Address) => Promise<TreasuryState>;
   signX402: (req: AuthorizeRequest) => Promise<{ header: string; ledgerRef: string }>;
   perTxCap?: bigint; // optional per-transaction cap (off-chain enforcement)
   threshold?: bigint; // §14.1 hybrid: amount > threshold requires an allowlisted payee; forwarded to evaluatePolicy
 }
 
-export type AuthorizeResult = { ok: true; header: string } | { ok: false; reason: string };
+export type AuthorizeResult =
+  | { ok: true; header: string; ledgerId: number }
+  | { ok: false; reason: string };
 
 /**
  * The single chokepoint: read on-chain treasury state, evaluate policy, then — and only then —
@@ -47,16 +52,16 @@ export async function authorizePayment(
     paused: t.paused,
     allowlistEnabled: t.allowlistEnabled,
     isAllowed: t.isAllowed,
-    runningPending: d.ledger.runningPending(),
+    runningPending: d.ledger.runningPending(d.entityKey),
     perTxCap: d.perTxCap,
     threshold: d.threshold,
   });
   if (!decision.ok) return { ok: false, reason: decision.reason };
 
-  const id = d.ledger.recordAuthorized(req.payee, req.amount);
+  const id = d.ledger.recordAuthorized(d.entityKey, req.payee, req.amount);
   try {
     const signed = await d.signX402(req);
-    return { ok: true, header: signed.header };
+    return { ok: true, header: signed.header, ledgerId: id };
   } catch (e) {
     d.ledger.markFailed(id);
     throw e;

@@ -7,6 +7,7 @@ import { toEntityView } from "../api/views";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import type { EntityPaymentService } from "../payments/entityPayment";
+import type { PocketFundingFn } from "../payments/pocketFunding";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
@@ -19,11 +20,22 @@ export interface McpToolDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
+  /** Audit fix C: the platform/manager account address, force-set into `roles.manager` on
+   *  onboard_agent so an agent-first caller never needs to know or guess it. */
+  platformManagerAddress: string;
   jobs: JobRepository;
   payments?: EntityPaymentService;
+  /** Explicit treasury->pocket Gateway top-up (fund_pocket). Optional — mirrors `payments`:
+   *  deployments without POCKET_MASTER_SEED/Turnkey configured leave this undefined and the tool
+   *  reports "pocket funding unavailable" instead of the server failing to boot. */
+  pocketFunding?: PocketFundingFn;
   jobRunner: JobRunner;
   jobClientAddress: string;
   jobEvaluatorAddress: string;
+  /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
+   *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
+  maxJobBudget: bigint;
+  maxInflightJobsPerTenant: number;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
 }
 
@@ -95,7 +107,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "list_entities",
     { title: "List entities", description: "List the caller's agent legal bodies." },
     async () => {
-      const views = repo.listByTenant(tenantId).map(toEntityView);
+      const views = repo
+        .listByTenant(tenantId)
+        .filter((e) => entityInScope(scope, e.idempotencyKey)) // an entity-scoped key lists only its entity
+        .map(toEntityView);
       return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );
@@ -109,7 +124,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     },
     async ({ id }) => {
       const rec = repo.findByIdempotencyKey(id);
-      if (!rec || rec.ownerTenantId !== tenantId)
+      if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
     },
@@ -179,6 +194,49 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
   );
 
   server.registerTool(
+    "fund_pocket",
+    {
+      title: "Fund pocket",
+      description:
+        "Top up your treasury's spending float (treasury -> operator -> pocket -> Gateway) so " +
+        "`pay` can settle. Explicit only — never auto-triggered by pay. Costs on-chain gas + " +
+        "Turnkey signatures. amountUsdc is atomic USDC (6 decimals).",
+      inputSchema: { id: z.string(), amountUsdc: z.string() },
+    },
+    async ({ id, amountUsdc }) => {
+      if (!hasCapability(scope, "spend"))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      const rec = repo.findByIdempotencyKey(id);
+      if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      // Same decimal-integer + positive validation as `pay` (atomic USDC, 6 decimals).
+      if (!/^-?\d+$/.test(amountUsdc))
+        return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+      let amount: bigint;
+      try {
+        amount = BigInt(amountUsdc);
+      } catch {
+        return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+      }
+      if (amount <= 0n)
+        return { content: [{ type: "text", text: "amountUsdc must be positive" }], isError: true };
+      if (!deps.pocketFunding)
+        return { content: [{ type: "text", text: "pocket funding unavailable" }], isError: true };
+      try {
+        const txHashes = await deps.pocketFunding(rec, amount);
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, txHashes }) }] };
+      } catch (e) {
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ ok: false, reason: (e as Error).message }) },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.registerTool(
     "run_job",
     {
       title: "Run job",
@@ -201,6 +259,21 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const budget = usdToUnits(raw);
       if (budget <= 0n)
         return { content: [{ type: "text", text: "budgetUsdc must be positive" }], isError: true };
+      // Audit fix A: escrow is funded from the platform wallet (JOB_CLIENT_PRIVATE_KEY) and swept to
+      // the caller's treasury — without these caps a loop of big-budget jobs drains platform USDC.
+      if (budget > deps.maxJobBudget)
+        return {
+          content: [{ type: "text", text: "budgetUsdc exceeds the max job budget" }],
+          isError: true,
+        };
+      const inflight = deps.jobs
+        .listByTenant(tenantId)
+        .filter((j) => !["completed", "reputed", "failed"].includes(j.status)).length;
+      if (inflight >= deps.maxInflightJobsPerTenant)
+        return {
+          content: [{ type: "text", text: "too many jobs in flight, try again later" }],
+          isError: true,
+        };
       const jobKey = `${rec.idempotencyKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
       const { status } = deps.jobRunner.start({
         jobKey,
@@ -279,8 +352,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       title: "Onboard agent",
       description:
         "Create an agent legal body. spec must match schema://agent-spec; the guardian is set " +
-        "automatically to your tenant. passkeyId references a previously stored guardian passkey " +
-        "(POST /passkey). Returns immediately with status 'pending' — poll get_entity until 'bound'.",
+        "automatically to your tenant and the manager is set automatically to the platform " +
+        "manager account — you don't need to know or supply either. passkeyId references a " +
+        "previously stored guardian passkey (POST /passkey). Returns immediately with status " +
+        "'pending' — poll get_entity until 'bound'.",
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
@@ -295,7 +370,11 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
       try {
         const raw = spec as Record<string, unknown>;
-        const roles = { ...((raw.roles as object) ?? {}), guardian: tenantId };
+        const roles = {
+          ...((raw.roles as object) ?? {}),
+          guardian: tenantId,
+          manager: deps.platformManagerAddress,
+        };
         const parsed = AgentSpecSchema.parse({ ...raw, roles });
         const userKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : parsed.name;
         const { id, status } = deps.runner.start({

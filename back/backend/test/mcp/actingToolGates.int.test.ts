@@ -15,6 +15,7 @@ import { startMcpTestClient } from "./helpers";
 const TENANT = "0x000000000000000000000000000000000000000A";
 const MANAGER = "0x000000000000000000000000000000000000000C";
 const PAYOUT = "0x000000000000000000000000000000000000000D";
+const PLATFORM_MANAGER = "0x000000000000000000000000000000000000000E";
 
 const VALID_PASSKEY: GuardianPasskey = {
   authenticatorName: "Test Key",
@@ -100,6 +101,7 @@ beforeEach(() => {
     chainId: 5042002,
     jwtSecret: "s",
     jwtTtlSec: 3600,
+    platformManagerAddress: PLATFORM_MANAGER,
     repo,
     runner,
     passkeyRpId: "wizard.local",

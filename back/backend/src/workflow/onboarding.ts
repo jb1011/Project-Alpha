@@ -280,8 +280,11 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     });
   }
 
-  // ── Step 7 (optional): fund the treasury, then mark funded. Skip if no amount or already funded.
-  if (d.fundAmount && d.fundAmount > 0n && rec.status === "bound") {
+  // ── Step 7 (optional): fund the treasury, then mark funded. Runs from "bound" (first fund) or
+  //    "funded" (re-fund/top-up — audit fix B-safe: OnboardingRunner.fund now allows both statuses,
+  //    so this must actually move USDC on a re-run instead of silently skipping it). Skip only if no
+  //    amount was requested or the entity isn't funded/fundable yet.
+  if (d.fundAmount && d.fundAmount > 0n && (rec.status === "bound" || rec.status === "funded")) {
     const txHash = await d.arc.fundTreasury({
       usdc: rec.treasuryConfig!.usdc,
       treasury: rec.treasury! as Address,

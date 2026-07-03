@@ -155,6 +155,7 @@ beforeEach(() => {
     chainId: anvilChain.id,
     jwtSecret: "s",
     jwtTtlSec: 3600,
+    platformManagerAddress: manager.address,
     repo,
     runner,
     passkeyRpId: "wizard.local",

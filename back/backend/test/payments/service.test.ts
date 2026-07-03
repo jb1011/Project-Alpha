@@ -23,6 +23,7 @@ test("buildAuthorityService wires readTreasury + signX402 + ledger behind POST /
   const ledger = new PaymentLedger(db);
   const { app } = buildAuthorityService({
     ledger,
+    entityKey: "entityA",
     readTreasury: async () => ({
       available: 1_000n,
       paused: false,
@@ -39,7 +40,7 @@ test("buildAuthorityService wires readTreasury + signX402 + ledger behind POST /
   });
   expect(ok.status).toBe(200);
   expect((await ok.json()).header).toBe("X-PAYMENT-real");
-  expect(ledger.runningPending()).toBe(100n);
+  expect(ledger.runningPending("entityA")).toBe(100n);
 
   const denied = await app.request("/authorize", {
     method: "POST",

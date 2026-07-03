@@ -53,6 +53,7 @@ async function main() {
 
   const { app } = buildAuthorityService({
     ledger: new PaymentLedger(db),
+    entityKey: entity.idempotencyKey,
     readTreasury: async (who) => ({
       available: await adapter.treasuryAvailable(treasury),
       paused: await adapter.treasuryPaused(treasury),
