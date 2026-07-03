@@ -129,11 +129,6 @@ export type ApiKeyView = {
   revokedAt: number | null;
 };
 
-// NOTE: retained despite the T4 brief's "now-unused" premise — src/components/agents/McpKeysPanel.tsx
-// is a live component that still calls mintApiKey(). Remove once that component is redesigned against
-// createConnectionPackage/bootstrapConnection in a future BYOA-screens task.
-export type MintedApiKey = ApiKeyView & { key: string };
-
 export type Capability = "read" | "earn" | "spend";
 
 export type ConnectionSnippets = {

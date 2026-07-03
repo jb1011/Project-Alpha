@@ -11,7 +11,6 @@ import type {
   EntityView,
   GuardianPasskey,
   JobView,
-  MintedApiKey,
   PasskeyView,
   ReputationView,
   TreasuryView,
@@ -172,20 +171,6 @@ export async function patchPerTxCap(
     method: "PATCH",
     token,
     body: { perTxCapUsdc },
-  });
-}
-
-// NOTE: retained despite the T4 brief's "now-unused" premise — src/components/agents/McpKeysPanel.tsx
-// still calls this. Remove once that component is redesigned against createConnectionPackage/
-// bootstrapConnection in a future BYOA-screens task.
-export async function mintApiKey(
-  token: string,
-  label?: string,
-): Promise<MintedApiKey> {
-  return request("/api-keys", {
-    method: "POST",
-    token,
-    body: label ? { label } : {},
   });
 }
 

@@ -13,7 +13,7 @@ import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { JobsReputationCard } from "@/components/agents/JobsReputationCard";
-import { McpKeysPanel } from "@/components/agents/McpKeysPanel";
+import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
 import { Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
 
@@ -314,9 +314,11 @@ export function AgentDashboard({
         </div>
       </div>
 
-      <div className="mt-8">
-        <McpKeysPanel />
-      </div>
+      {entity && (
+        <div className="mt-8">
+          <ConnectAgentPanel entity={entity} />
+        </div>
+      )}
     </div>
   );
 }
