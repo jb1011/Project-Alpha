@@ -1,14 +1,17 @@
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { toEntityView } from "../api/views";
 import type { JobRepository } from "../jobs/jobRepository";
+import type { JobRunner } from "../jobs/jobRunner";
 import type { EntityPaymentService } from "../payments/entityPayment";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema } from "../policy/agentSpec";
+import { usdToUnits } from "../policy/units";
 import type { OnboardingRunner } from "../workflow/runner";
 import { entityInScope, hasCapability } from "./scope";
 
@@ -18,6 +21,9 @@ export interface McpToolDeps {
   passkeys: PasskeyStore;
   jobs: JobRepository;
   payments?: EntityPaymentService;
+  jobRunner: JobRunner;
+  jobClientAddress: string;
+  jobEvaluatorAddress: string;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -142,6 +148,44 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         tenantId,
       });
       return { content: [{ type: "text", text: JSON.stringify(receipt) }], isError: !receipt.ok };
+    },
+  );
+
+  server.registerTool(
+    "run_job",
+    {
+      title: "Run job",
+      description:
+        "Have your agent earn USDC + reputation by running an ERC-8183 job (self-contained v1: the platform " +
+        "stands in for the client + evaluator). Returns immediately with status 'pending'; poll get_job(jobKey).",
+      inputSchema: { id: z.string(), budgetUsdc: z.string().optional() },
+    },
+    async ({ id, budgetUsdc }) => {
+      if (!hasCapability(scope, "earn"))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      const rec = repo.findByIdempotencyKey(id);
+      if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      const raw = budgetUsdc ?? "1.00";
+      // At most 6 decimals (USDC precision): rejecting here keeps the error message uniform instead of
+      // letting usdToUnits throw a different one deeper in.
+      if (!/^\d+(\.\d{1,6})?$/.test(raw))
+        return { content: [{ type: "text", text: "invalid budgetUsdc" }], isError: true };
+      const budget = usdToUnits(raw);
+      if (budget <= 0n)
+        return { content: [{ type: "text", text: "budgetUsdc must be positive" }], isError: true };
+      const jobKey = `${rec.idempotencyKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const { status } = deps.jobRunner.start({
+        jobKey,
+        entityKey: rec.idempotencyKey,
+        tenantId,
+        budget,
+        description: "agent job (mcp)",
+        clientAddress: deps.jobClientAddress,
+        evaluatorAddress: deps.jobEvaluatorAddress,
+        providerAddress: rec.operator ?? "0x",
+      });
+      return { content: [{ type: "text", text: JSON.stringify({ jobKey, status }) }] };
     },
   );
 
