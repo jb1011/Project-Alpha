@@ -38,6 +38,7 @@ export function WelcomeStep({
     connectWallet,
     login,
     session,
+    ensureSession,
   } = useAuth();
 
   const [walletOverride, setWalletOverride] = useState<"connecting" | "error" | null>(
@@ -95,8 +96,8 @@ export function WelcomeStep({
     setPasskeyOverride("pending");
     setError(null);
     try {
-      if (!session?.token) throw new Error("Sign in with your wallet first.");
-      const { challenge } = await getPasskeyChallenge(session.token);
+      const auth = await ensureSession();
+      const { challenge } = await getPasskeyChallenge(auth.token);
       const rpId = window.location.hostname;
       const passkey = await createGuardianPasskey(challenge, rpId);
       onPasskey(passkey);

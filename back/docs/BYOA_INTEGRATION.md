@@ -68,6 +68,7 @@ the flagship** (first-class, demoed, tested end-to-end):
 - **Codex**, **OpenClaw**, **Gemini CLI** — the same `mcpServers` JSON entry in their config
 - **Windsurf** — `~/.codeium/windsurf/mcp_config.json`
 - **Cline** — `cline_mcp_settings.json`
+- **Hermes** — the same `mcpServers` JSON entry (standard format)
 - **VS Code** — `.vscode/mcp.json`, which uses `servers` (not `mcpServers`) with an explicit `"type": "http"`
 - **Claude Desktop** — its config file speaks stdio, so reach the remote server through the `mcp-remote`
   bridge (`npx -y mcp-remote <mcpUrl> --header "Authorization: Bearer <apiKey>"`), or Settings > Connectors >

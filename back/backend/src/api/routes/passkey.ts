@@ -37,6 +37,16 @@ export function mountPasskeyRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     const id = deps.passkeys.store(tenantId, pk);
     return c.json({ id }, 201);
   });
+
+  app.get("/passkeys", requireAuth(deps.jwtSecret), (c) => {
+    return c.json(deps.passkeys.list(c.get("tenantId")));
+  });
+
+  app.delete("/passkeys/:id", requireAuth(deps.jwtSecret), (c) => {
+    if (!deps.passkeys.revoke(c.get("tenantId"), c.req.param("id")))
+      throw new ApiError("not_found", 404, "passkey not found"); // uniform (no exists-but-not-yours leak)
+    return c.body(null, 204);
+  });
 }
 
 /** Defense-in-depth clientDataJSON check: type, bound challenge, and rpId-matching origin host. */

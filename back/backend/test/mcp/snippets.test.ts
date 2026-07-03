@@ -16,6 +16,7 @@ test("emits a snippet for every supported agent, each embedding url + key", () =
     "vscode",
     "claudeDesktop",
     "generic",
+    "hermes",
   ] as const) {
     expect(s[k]).toContain("https://api.example/mcp");
     expect(s[k]).toContain("mcp_abc");
@@ -40,6 +41,7 @@ test("every JSON-form snippet is valid JSON (only claudeCode is a CLI string)", 
     "vscode",
     "claudeDesktop",
     "generic",
+    "hermes",
   ] as const) {
     expect(() => JSON.parse(s[k]), k).not.toThrow();
   }

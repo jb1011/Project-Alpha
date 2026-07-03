@@ -1,7 +1,5 @@
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/backend";
 
-export const MCP_URL = process.env.NEXT_PUBLIC_MCP_URL ?? "/backend/mcp";
-
 export const SIWE_DOMAIN = process.env.NEXT_PUBLIC_SIWE_DOMAIN ?? "localhost";
 
 export const MANAGER_ADDRESS =
