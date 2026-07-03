@@ -40,5 +40,6 @@ export function buildSnippets({ mcpUrl, apiKey }: ConnectionInfo) {
     // shifting — verify the client-specific snippets above against current docs; this generic form and the
     // Claude Code CLI are the most stable.
     generic: JSON.stringify({ url: mcpUrl, headers: { Authorization: auth } }, null, 2),
+    hermes: jsonBlock, // Hermes MCP config (mcpServers) — verified against Hermes docs
   };
 }
