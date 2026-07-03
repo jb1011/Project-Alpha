@@ -308,6 +308,7 @@ export async function buildLiveAgentRunner(
 
   const authorityDeps = {
     ledger,
+    entityKey: entity.idempotencyKey,
     readTreasury: async (payee: Address) => ({
       available: await adapter.treasuryAvailable(treasury),
       paused: await adapter.treasuryPaused(treasury),
@@ -336,7 +337,7 @@ export async function buildLiveAgentRunner(
   const client = new Anthropic({ apiKey: cfg.anthropicApiKey });
   const readBudget = async () => ({
     available: await adapter.treasuryAvailable(treasury),
-    runningPending: ledger.runningPending(),
+    runningPending: ledger.runningPending(entity.idempotencyKey),
   });
 
   return async (query: string) => {

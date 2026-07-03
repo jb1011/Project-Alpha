@@ -525,3 +525,76 @@ test("sufficient float (equal to amount): pay proceeds past the preflight and se
   expect(receipt.ok).toBe(true);
   expect(fn).toHaveBeenCalledTimes(2); // 402 probe + the paid retry — preflight didn't block it
 });
+
+test("audit fix E: a confirmed (200) pay settles its ledger row, so runningPending excludes it afterward", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-settle",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt.ok).toBe(true);
+  // Settled, not left dangling as "authorized" forever — the whole point of audit fix E.
+  expect(ledger.runningPending(entity.idempotencyKey)).toBe(0n);
+});
+
+test("audit fix E: pays on two different entities don't cross-count in runningPending", async () => {
+  const { reader } = makeReader({ available: 1_000_000n, isAllowed: true });
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fakeFetch().fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+  });
+  const entityA = seedEntity({ idempotencyKey: "tenantA:agent1" });
+  const entityB = seedEntity({ idempotencyKey: "tenantA:agent2" });
+
+  // entityA's pay fails post-sign (unconfirmed) so its row stays "authorized" — must not bleed
+  // into entityB's runningPending.
+  const failingFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    if (!headers?.["X-PAYMENT"]) {
+      return new Response(JSON.stringify({ accepts: [requirements] }), { status: 402 });
+    }
+    return new Response("server error", { status: 500 });
+  });
+  const svcA = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: failingFetch as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+  });
+  await svcA.pay(entityA, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-crossA",
+    tenantId: "tenantA",
+  });
+  expect(ledger.runningPending(entityA.idempotencyKey)).toBe(1000n);
+  expect(ledger.runningPending(entityB.idempotencyKey)).toBe(0n);
+
+  // entityB pays successfully and settles — still no cross-contamination either direction.
+  const receiptB = await svc.pay(entityB, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-crossB",
+    tenantId: "tenantA",
+  });
+  expect(receiptB.ok).toBe(true);
+  expect(ledger.runningPending(entityA.idempotencyKey)).toBe(1000n);
+  expect(ledger.runningPending(entityB.idempotencyKey)).toBe(0n);
+});

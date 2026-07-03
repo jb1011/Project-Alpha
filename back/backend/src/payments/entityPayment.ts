@@ -98,6 +98,7 @@ export function buildEntityPaymentService(
     });
     const authorityDeps: AuthorityDeps = {
       ledger: deps.ledger,
+      entityKey: entity.idempotencyKey,
       readTreasury: async (payee: Address) => ({
         available: await deps.reader.treasuryAvailable(treasury),
         paused: await deps.reader.treasuryPaused(treasury),
@@ -194,6 +195,7 @@ export function buildEntityPaymentService(
       // SECOND authorization, so it must be cached instead (as an "unconfirmed" outcome) and never
       // released.
       let signed = false;
+      let ledgerId: number | null = null;
       let receipt: PaymentReceipt;
       try {
         // buildAuthorize derives the pocket key and constructs the signer (derivePocketKey /
@@ -206,14 +208,18 @@ export function buildEntityPaymentService(
             fetchImpl,
             authorize,
             maxAmount: args.amountUsdc,
-            onAuthorized: () => {
+            onAuthorized: (id) => {
               signed = true;
+              ledgerId = id;
             },
           },
           args.url,
         );
         if (res.status === 200) {
           receipt = { ok: true, txOrTransferId: extractSettlementId(res) };
+          if (ledgerId !== null) {
+            deps.ledger.markSettled(ledgerId, receipt.txOrTransferId ?? "settled");
+          }
           deps.idempotency.complete(args.idempotencyKey, args.tenantId, entityKey, receipt);
           return receipt;
         }

@@ -15,7 +15,7 @@ export type AuthorizeFn = (req: {
   asset: Address;
   network: string;
   maxTimeoutSeconds: number;
-}) => Promise<{ ok: true; header: string } | { ok: false; reason: string }>;
+}) => Promise<{ ok: true; header: string; ledgerId: number } | { ok: false; reason: string }>;
 
 export interface BuyerDeps {
   fetchImpl: typeof fetch;
@@ -26,8 +26,9 @@ export interface BuyerDeps {
   /** Fires EXACTLY ONCE, right after authorize returns `ok` and before the X-PAYMENT retry fetch —
    *  i.e. the moment the payment is authorized/"signed". Callers use this to distinguish a
    *  never-signed failure (safe to release the idempotency claim) from a signed-but-unconfirmed
-   *  outcome (must NOT release, to avoid a blind re-sign on retry). */
-  onAuthorized?: () => void;
+   *  outcome (must NOT release, to avoid a blind re-sign on retry). Receives the ledger row id so
+   *  callers can settle it once the payment is confirmed. */
+  onAuthorized?: (ledgerId: number) => void;
 }
 
 /**
@@ -60,7 +61,7 @@ export async function buyWithX402(
     maxTimeoutSeconds: req.maxTimeoutSeconds,
   });
   if (!decision.ok) throw new Error(`policy-denied: ${decision.reason}`);
-  d.onAuthorized?.();
+  d.onAuthorized?.(decision.ledgerId);
 
   const headers = { ...(init.headers as Record<string, string>), "X-PAYMENT": decision.header };
   return d.fetchImpl(url, { ...init, headers });

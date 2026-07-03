@@ -87,6 +87,7 @@ beforeAll(async () => {
   // makes the off-chain Authority obey the on-chain guardian/cap/allowlist.
   deps = {
     ledger: new PaymentLedger(db),
+    entityKey: "entityA",
     readTreasury: async (who) => ({
       available: await adapter.treasuryAvailable(treasury),
       paused: await adapter.treasuryPaused(treasury),

@@ -21,7 +21,7 @@ function fetchImpl(served: unknown) {
 function deps(over: Partial<AgentToolDeps> = {}): AgentToolDeps {
   return {
     fetchImpl: fetchImpl({ body: { index: 0.62 } }),
-    authorize: async () => ({ ok: true, header: "X-PAYMENT-ok" }),
+    authorize: async () => ({ ok: true, header: "X-PAYMENT-ok", ledgerId: 1 }),
     vendorBase: "http://vendor.local",
     readBudget: async () => ({ available: 1_000_000n, runningPending: 0n }),
     ...over,

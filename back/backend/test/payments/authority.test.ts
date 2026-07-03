@@ -11,6 +11,7 @@ function deps(over: Partial<AuthorityDeps> = {}): AuthorityDeps {
   migrate(db);
   return {
     ledger: new PaymentLedger(db),
+    entityKey: "entityA",
     readTreasury: async () => ({
       available: 1_000n,
       paused: false,
@@ -34,7 +35,28 @@ test("authorizes a valid payment: records ledger + returns X-PAYMENT", async () 
   });
   expect(res.ok).toBe(true);
   expect((res as { header: string }).header).toBe("X-PAYMENT-fake");
-  expect(d.ledger.runningPending()).toBe(100n);
+  expect((res as { ledgerId: number }).ledgerId).toEqual(expect.any(Number));
+  expect(d.ledger.runningPending("entityA")).toBe(100n);
+});
+
+test("an authorized row for a DIFFERENT entityKey does not reduce this entity's headroom", async () => {
+  const db = new Database(":memory:");
+  migrate(db);
+  const ledger = new PaymentLedger(db);
+  // entityB has already burned most of the cap — should have zero effect on entityA's decision.
+  ledger.recordAuthorized("entityB", payee, 950n);
+  const d = deps({ ledger, entityKey: "entityA" });
+  const res = await authorizePayment(d, {
+    payee,
+    amount: 100n,
+    resource: "/x",
+    asset: "0x3600000000000000000000000000000000000000",
+    network: "eip155:5042002",
+    maxTimeoutSeconds: 60,
+  });
+  expect(res).toMatchObject({ ok: true });
+  expect(d.ledger.runningPending("entityA")).toBe(100n);
+  expect(d.ledger.runningPending("entityB")).toBe(950n);
 });
 
 test("denies an over-cap payment and writes nothing to the ledger", async () => {
@@ -55,7 +77,7 @@ test("denies an over-cap payment and writes nothing to the ledger", async () => 
     maxTimeoutSeconds: 60,
   });
   expect(res).toMatchObject({ ok: false, reason: "over-cap" });
-  expect(d.ledger.runningPending()).toBe(0n);
+  expect(d.ledger.runningPending("entityA")).toBe(0n);
 });
 
 test("denies when guardian-paused", async () => {
@@ -96,7 +118,7 @@ test("denies a non-allowlisted payee (allowlist on) and writes nothing to the le
     maxTimeoutSeconds: 60,
   });
   expect(res).toMatchObject({ ok: false, reason: "not-allowlisted" });
-  expect(d.ledger.runningPending()).toBe(0n);
+  expect(d.ledger.runningPending("entityA")).toBe(0n);
 });
 
 test("if signing fails after authorization, the ledger entry is marked failed and the error rethrows", async () => {
@@ -116,7 +138,7 @@ test("if signing fails after authorization, the ledger entry is marked failed an
     }),
   ).rejects.toThrow(/signer unavailable/);
   // recorded then rolled back to failed, so it no longer counts against the cap.
-  expect(d.ledger.runningPending()).toBe(0n);
+  expect(d.ledger.runningPending("entityA")).toBe(0n);
 });
 
 test("denies an over-threshold payment to a non-allowlisted payee and never calls signX402", async () => {
@@ -141,7 +163,7 @@ test("denies an over-threshold payment to a non-allowlisted payee and never call
   });
   expect(res).toMatchObject({ ok: false, reason: "over-threshold-needs-allowlist" });
   expect(signX402).not.toHaveBeenCalled();
-  expect(d.ledger.runningPending()).toBe(0n);
+  expect(d.ledger.runningPending("entityA")).toBe(0n);
 });
 
 test("threads x402 requirements (asset/network/maxTimeoutSeconds) to signX402", async () => {

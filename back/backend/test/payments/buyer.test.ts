@@ -20,7 +20,7 @@ function fakeFetch(seenHeaders: string[]) {
 
 test("on 402, authorizes then retries with X-PAYMENT and returns the body", async () => {
   const seen: string[] = [];
-  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok" }));
+  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 }));
   const res = await buyWithX402(
     { fetchImpl: fakeFetch(seen), authorize },
     "https://seller/api/insight",
@@ -46,7 +46,7 @@ test("onAuthorized fires exactly once, after authorize ok and before the X-PAYME
   const order: string[] = [];
   const authorize = vi.fn(async () => {
     order.push("authorize");
-    return { ok: true as const, header: "X-PAYMENT-ok" };
+    return { ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 };
   });
   const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
     const xp = (init?.headers as Record<string, string> | undefined)?.["X-PAYMENT"];
@@ -81,7 +81,7 @@ test("onAuthorized is never called on a policy-denied authorization", async () =
 
 test("surprise-price ceiling: maxAmountRequired above maxAmount is denied before authorize is ever called", async () => {
   const seen: string[] = [];
-  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok" }));
+  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 }));
   const onAuthorized = vi.fn();
   await expect(
     buyWithX402(
@@ -96,7 +96,7 @@ test("surprise-price ceiling: maxAmountRequired above maxAmount is denied before
 
 test("maxAmount at or under the ceiling proceeds normally", async () => {
   const seen: string[] = [];
-  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok" }));
+  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 }));
   const res = await buyWithX402(
     { fetchImpl: fakeFetch(seen), authorize, maxAmount: 100n },
     "https://seller/api/insight",

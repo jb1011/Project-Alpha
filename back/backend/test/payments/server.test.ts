@@ -5,8 +5,8 @@ import { buildAuthorityApp } from "../../src/payments/server";
 const payee = "0x0000000000000000000000000000000000000abc";
 // Structural fake of PaymentLedger — the route only needs these four methods.
 const fakeLedger = {
-  runningPending: () => 0n,
-  recordAuthorized: () => 1,
+  runningPending: (_entityKey: string) => 0n,
+  recordAuthorized: (_entityKey: string) => 1,
   markFailed: () => {},
   markSettled: () => {},
 } as unknown as AuthorityDeps["ledger"];
@@ -28,6 +28,7 @@ function post(app: ReturnType<typeof buildAuthorityApp>, amount: string) {
 test("POST /authorize returns 200 + X-PAYMENT when policy allows", async () => {
   const app = buildAuthorityApp({
     ledger: fakeLedger,
+    entityKey: "entityA",
     readTreasury: async () => ({
       available: 1_000n,
       paused: false,
@@ -44,6 +45,7 @@ test("POST /authorize returns 200 + X-PAYMENT when policy allows", async () => {
 test("POST /authorize returns 402 + reason when policy denies (over-cap)", async () => {
   const app = buildAuthorityApp({
     ledger: fakeLedger,
+    entityKey: "entityA",
     readTreasury: async () => ({
       available: 1_000n,
       paused: false,
