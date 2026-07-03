@@ -48,6 +48,7 @@ export interface ApiDeps {
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
   agentRuns: import("../persistence/agentRunStore").AgentRunStore;
   mcpPublicUrl: string;
+  linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
    *  "payments unavailable" instead of throwing. */
@@ -74,6 +75,7 @@ export function buildApiApp(deps: ApiDeps) {
   app.use("/api-keys", requireAuth(deps.jwtSecret));
   app.use("/api-keys/*", requireAuth(deps.jwtSecret));
   app.use("/connection-package", requireAuth(deps.jwtSecret));
+  app.use("/bootstrap-connection", requireAuth(deps.jwtSecret));
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);

@@ -36,6 +36,7 @@ export interface McpToolDeps {
    *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
   maxJobBudget: bigint;
   maxInflightJobsPerTenant: number;
+  linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -55,6 +56,32 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "whoami",
     { title: "Who am I", description: "Return the authenticated tenant address." },
     async () => ({ content: [{ type: "text", text: tenantId }] }),
+  );
+
+  server.registerTool(
+    "claim_connection",
+    {
+      title: "Claim connection",
+      description:
+        "Confirm this agent was intentionally linked to your legal body: submit the one-time link code from " +
+        "the bootstrap page. Returns your tenant + entities (a binding confirmation, not a key).",
+      inputSchema: { linkCode: z.string() },
+    },
+    async ({ linkCode }) => {
+      // No capability gate: the tenant-scoped single-use consume IS the gate (a wrong-tenant
+      // attempt fails uniformly and never burns the owner's code).
+      if (!deps.linkCodes.consume(scope.tenantId, linkCode, Date.now()))
+        return { content: [{ type: "text", text: "invalid or expired link code" }], isError: true };
+      const entities = repo.listByTenant(scope.tenantId).map(toEntityView);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ tenantId: scope.tenantId, entities, bound: true }),
+          },
+        ],
+      };
+    },
   );
 
   server.registerResource(
