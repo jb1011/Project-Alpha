@@ -129,7 +129,50 @@ export type ApiKeyView = {
   revokedAt: number | null;
 };
 
+// NOTE: retained despite the T4 brief's "now-unused" premise — src/components/agents/McpKeysPanel.tsx
+// is a live component that still calls mintApiKey(). Remove once that component is redesigned against
+// createConnectionPackage/bootstrapConnection in a future BYOA-screens task.
 export type MintedApiKey = ApiKeyView & { key: string };
+
+export type Capability = "read" | "earn" | "spend";
+
+export type ConnectionSnippets = {
+  claudeCode: string;
+  cursor: string;
+  codex: string;
+  openclaw: string;
+  gemini: string;
+  windsurf: string;
+  cline: string;
+  vscode: string;
+  claudeDesktop: string;
+  generic: string;
+  hermes?: string; // present only if the backend Hermes snippet shipped (T1)
+};
+
+export type ConnectionPackage = {
+  mcpUrl: string;
+  apiKey: string;
+  entityId: string;
+  capability: Capability;
+  snippets: ConnectionSnippets;
+};
+
+export type BootstrapPackage = {
+  mcpUrl: string;
+  apiKey: string;
+  passkeyId: string;
+  capability: Capability;
+  linkCode: string;
+  snippets: ConnectionSnippets;
+};
+
+export type PasskeyView = {
+  id: string;
+  name: string | null;
+  createdAt: number;
+  revokedAt: number | null;
+};
 
 export type ApiErrorBody = {
   error: {

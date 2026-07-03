@@ -5,10 +5,14 @@ import type {
   ApiErrorBody,
   ApiKeyView,
   AuthSession,
+  BootstrapPackage,
+  Capability,
+  ConnectionPackage,
   EntityView,
   GuardianPasskey,
   JobView,
   MintedApiKey,
+  PasskeyView,
   ReputationView,
   TreasuryView,
 } from "./types";
@@ -65,11 +69,10 @@ export async function verifySiwe(
   });
 }
 
-export async function getPasskeyChallenge(): Promise<{
-  challenge: string;
-  rpId: string;
-}> {
-  return request("/passkey/challenge");
+export async function getPasskeyChallenge(
+  token: string,
+): Promise<{ challenge: string; rpId: string }> {
+  return request("/passkey/challenge", { token });
 }
 
 export async function onboardEntity(
@@ -172,6 +175,9 @@ export async function patchPerTxCap(
   });
 }
 
+// NOTE: retained despite the T4 brief's "now-unused" premise — src/components/agents/McpKeysPanel.tsx
+// still calls this. Remove once that component is redesigned against createConnectionPackage/
+// bootstrapConnection in a future BYOA-screens task.
 export async function mintApiKey(
   token: string,
   label?: string,
@@ -192,6 +198,37 @@ export async function revokeApiKey(token: string, id: string): Promise<void> {
     method: "DELETE",
     token,
   });
+}
+
+export async function createConnectionPackage(
+  token: string,
+  entityId: string,
+  capability: Capability,
+): Promise<ConnectionPackage> {
+  return request("/connection-package", { method: "POST", token, body: { entityId, capability } });
+}
+
+export async function bootstrapConnection(
+  token: string,
+  passkeyId: string,
+  capability: Capability,
+): Promise<BootstrapPackage> {
+  return request("/bootstrap-connection", { method: "POST", token, body: { passkeyId, capability } });
+}
+
+export async function storePasskey(
+  token: string,
+  passkey: GuardianPasskey,
+): Promise<{ id: string }> {
+  return request("/passkey", { method: "POST", token, body: passkey });
+}
+
+export async function listPasskeys(token: string): Promise<PasskeyView[]> {
+  return request("/passkeys", { token });
+}
+
+export async function revokePasskey(token: string, id: string): Promise<void> {
+  await request(`/passkeys/${encodeURIComponent(id)}`, { method: "DELETE", token });
 }
 
 export async function fetchAgentSchema(): Promise<Record<string, unknown>> {
