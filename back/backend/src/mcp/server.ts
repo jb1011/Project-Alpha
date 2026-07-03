@@ -68,7 +68,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "list_entities",
     { title: "List entities", description: "List the caller's agent legal bodies." },
     async () => {
-      const views = repo.listByTenant(tenantId).map(toEntityView);
+      const views = repo
+        .listByTenant(tenantId)
+        .filter((e) => entityInScope(scope, e.idempotencyKey)) // an entity-scoped key lists only its entity
+        .map(toEntityView);
       return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );
@@ -82,7 +85,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     },
     async ({ id }) => {
       const rec = repo.findByIdempotencyKey(id);
-      if (!rec || rec.ownerTenantId !== tenantId)
+      if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
     },
