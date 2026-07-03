@@ -14,6 +14,26 @@ describe("Job config", () => {
     expect(cfg.jobClientPrivateKey).toBe(cfg.platformPrivateKey);
     expect(cfg.jobEvaluatorPrivateKey).toBeUndefined();
     expect(cfg.jobSweepToTreasury).toBe(false);
+    // Audit fix A: platform-wallet drain caps on run_job.
+    expect(cfg.maxJobBudget).toBe(5_000_000n);
+    expect(cfg.maxInflightJobsPerTenant).toBe(3);
+  });
+
+  test("MAX_JOB_BUDGET_USDC converts human USDC to atomic units", () => {
+    const cfg = loadConfig({ ...base, MAX_JOB_BUDGET_USDC: "12.5" });
+    expect(cfg.maxJobBudget).toBe(12_500_000n);
+  });
+
+  test("MAX_INFLIGHT_JOBS_PER_TENANT is coerced to a positive int", () => {
+    const cfg = loadConfig({ ...base, MAX_INFLIGHT_JOBS_PER_TENANT: "7" });
+    expect(cfg.maxInflightJobsPerTenant).toBe(7);
+  });
+
+  test("maxJobBudget is redacted-safe (serialized as a string, not a raw bigint)", () => {
+    const cfg = loadConfig(base);
+    const redacted = redact(cfg);
+    expect(redacted.maxJobBudget).toBe("5000000");
+    expect(() => JSON.stringify(redacted)).not.toThrow();
   });
 
   test("JOB_SWEEP_TO_TREASURY true is honored", () => {

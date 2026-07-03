@@ -116,6 +116,8 @@ async function main() {
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
+    maxJobBudget: cfg.maxJobBudget,
+    maxInflightJobsPerTenant: cfg.maxInflightJobsPerTenant,
     agentRuns,
     mcpPublicUrl: cfg.mcpPublicUrl,
     payments,

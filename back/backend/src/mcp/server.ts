@@ -24,6 +24,10 @@ export interface McpToolDeps {
   jobRunner: JobRunner;
   jobClientAddress: string;
   jobEvaluatorAddress: string;
+  /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
+   *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
+  maxJobBudget: bigint;
+  maxInflightJobsPerTenant: number;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -177,6 +181,21 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const budget = usdToUnits(raw);
       if (budget <= 0n)
         return { content: [{ type: "text", text: "budgetUsdc must be positive" }], isError: true };
+      // Audit fix A: escrow is funded from the platform wallet (JOB_CLIENT_PRIVATE_KEY) and swept to
+      // the caller's treasury — without these caps a loop of big-budget jobs drains platform USDC.
+      if (budget > deps.maxJobBudget)
+        return {
+          content: [{ type: "text", text: "budgetUsdc exceeds the max job budget" }],
+          isError: true,
+        };
+      const inflight = deps.jobs
+        .listByTenant(tenantId)
+        .filter((j) => !["completed", "reputed", "failed"].includes(j.status)).length;
+      if (inflight >= deps.maxInflightJobsPerTenant)
+        return {
+          content: [{ type: "text", text: "too many jobs in flight, try again later" }],
+          isError: true,
+        };
       const jobKey = `${rec.idempotencyKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
       const { status } = deps.jobRunner.start({
         jobKey,

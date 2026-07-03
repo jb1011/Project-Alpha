@@ -36,6 +36,8 @@ function makeConfig(over: Partial<Config> = {}): Config {
     gatewayFacilitatorUrl: "https://gateway-api-testnet.circle.com",
     fundingFloatUsdc: "0.50",
     spendAllowlistThreshold: 500n,
+    maxJobBudget: 5_000_000n,
+    maxInflightJobsPerTenant: 3,
     customerPrivateKey: POCKET_MASTER_SEED,
     authJwtSecret: "dev-insecure-secret-change-me-please",
     authJwtTtlSec: 3600,

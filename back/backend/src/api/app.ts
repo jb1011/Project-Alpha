@@ -37,6 +37,10 @@ export interface ApiDeps {
   jobRunner: import("../jobs/jobRunner").JobRunner;
   jobClientAddress: string;
   jobEvaluatorAddress: string;
+  /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
+   *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
+  maxJobBudget: bigint;
+  maxInflightJobsPerTenant: number;
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
   agentRuns: import("../persistence/agentRunStore").AgentRunStore;
   mcpPublicUrl: string;

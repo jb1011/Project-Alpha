@@ -20,6 +20,9 @@ const DOMAIN = "wizard.local";
 const CHAIN = 5042002;
 const CLIENT_ADDR = "0x000000000000000000000000000000000000000C";
 const EVALUATOR_ADDR = "0x000000000000000000000000000000000000000E";
+// Audit fix A caps, exercised below.
+const MAX_JOB_BUDGET = 5_000_000n; // 5 USDC
+const MAX_INFLIGHT_JOBS_PER_TENANT = 3;
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
@@ -57,6 +60,8 @@ function makeApp() {
     jobRunner,
     jobClientAddress: CLIENT_ADDR,
     jobEvaluatorAddress: EVALUATOR_ADDR,
+    maxJobBudget: MAX_JOB_BUDGET,
+    maxInflightJobsPerTenant: MAX_INFLIGHT_JOBS_PER_TENANT,
   } as never);
 
   return { app, jobRunner };
@@ -226,4 +231,63 @@ test("no auth → GET /jobs/anything → 401", async () => {
   const { app } = makeApp();
   const res = await app.request("/jobs/anything");
   expect(res.status).toBe(401);
+});
+
+// --- Audit fix A: run_job budget + per-tenant in-flight caps (REST twin) ---
+
+test("POST /entities/:id/jobs rejects a budget over MAX_JOB_BUDGET_USDC (400) without starting a job", async () => {
+  const { app } = makeApp();
+  const token = await login(app);
+  const entityId = seedEntity(account.address, "agent1");
+
+  const res = await app.request(`/entities/${encodeURIComponent(entityId)}/jobs`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    // MAX_JOB_BUDGET is 5_000_000n (5 USDC); 5.01 exceeds it.
+    body: JSON.stringify({ budget: "5.01" }),
+  });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.error.message).toBe("budget exceeds the max job budget");
+  expect(jobs.listByEntity(entityId)).toHaveLength(0);
+});
+
+test("POST /entities/:id/jobs accepts a budget exactly at MAX_JOB_BUDGET_USDC", async () => {
+  const { app } = makeApp();
+  const token = await login(app);
+  const entityId = seedEntity(account.address, "agent1");
+
+  const res = await app.request(`/entities/${encodeURIComponent(entityId)}/jobs`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ budget: "5.00" }),
+  });
+  expect(res.status).toBe(202);
+});
+
+test("POST /entities/:id/jobs rejects once the tenant has MAX_INFLIGHT_JOBS_PER_TENANT non-terminal jobs (429)", async () => {
+  const { app } = makeApp();
+  const token = await login(app);
+  const entityId = seedEntity(account.address, "agent1");
+
+  // Fill the cap via the real route (JobRunner's no-op runJob leaves each job "pending").
+  for (let i = 0; i < MAX_INFLIGHT_JOBS_PER_TENANT; i++) {
+    const res = await app.request(`/entities/${encodeURIComponent(entityId)}/jobs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ budget: "1.00", description: `seed ${i}` }),
+    });
+    expect(res.status).toBe(202);
+  }
+  const before = jobs.listByEntity(entityId).length;
+
+  const res = await app.request(`/entities/${encodeURIComponent(entityId)}/jobs`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ budget: "1.00", description: "over the cap" }),
+  });
+  expect(res.status).toBe(429);
+  const body = await res.json();
+  expect(body.error.message).toBe("too many jobs in flight");
+  expect(jobs.listByEntity(entityId)).toHaveLength(before);
 });

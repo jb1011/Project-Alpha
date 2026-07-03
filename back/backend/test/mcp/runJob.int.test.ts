@@ -2,6 +2,8 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { SqliteJobRepository } from "../../src/jobs/jobRepository";
+import type { JobRecord } from "../../src/jobs/types";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -16,6 +18,31 @@ const EVALUATOR_ADDR = "0x000000000000000000000000000000000000000E";
 // Distinct from every id/tenant fixture so the happy-path assertion proves providerAddress
 // came from the RESOLVED entity record's operator, not from the id argument.
 const OPERATOR = "0x00000000000000000000000000000000000000E1";
+// Audit fix A caps, exercised below.
+const MAX_JOB_BUDGET = 5_000_000n; // 5 USDC
+const MAX_INFLIGHT_JOBS_PER_TENANT = 3;
+
+const baseJob: JobRecord = {
+  jobKey: "seed:placeholder",
+  jobId: null,
+  entityKey: "",
+  ownerTenantId: TENANT,
+  status: "pending",
+  clientAddress: CLIENT_ADDR,
+  evaluatorAddress: EVALUATOR_ADDR,
+  providerAddress: OPERATOR,
+  budgetAmount: "500000",
+  description: "seed",
+  deliverableHash: null,
+  deliverablePath: null,
+  createTxHash: null,
+  fundTxHash: null,
+  submitTxHash: null,
+  completeTxHash: null,
+  sweepTxHash: null,
+  reputationTxHash: null,
+  error: null,
+};
 
 interface RecordedStartCall {
   jobKey: string;
@@ -31,6 +58,7 @@ interface RecordedStartCall {
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 let apiKeys: SqliteApiKeyStore;
+let jobs: SqliteJobRepository;
 let app: ReturnType<typeof buildApiApp>;
 let startCalls: RecordedStartCall[];
 
@@ -66,6 +94,7 @@ beforeEach(() => {
   migrate(db);
   repo = new SqliteEntityRepository(db);
   apiKeys = new SqliteApiKeyStore(db);
+  jobs = new SqliteJobRepository(db);
   startCalls = [];
   const runner = new OnboardingRunner({
     repo,
@@ -89,9 +118,12 @@ beforeEach(() => {
     passkeyRpId: "wizard.local",
     apiKeys,
     passkeys: new SqlitePasskeyStore(db),
+    jobs,
     jobRunner: FAKE_JOB_RUNNER,
     jobClientAddress: CLIENT_ADDR,
     jobEvaluatorAddress: EVALUATOR_ADDR,
+    maxJobBudget: MAX_JOB_BUDGET,
+    maxInflightJobsPerTenant: MAX_INFLIGHT_JOBS_PER_TENANT,
   } as never);
 });
 afterEach(() => db.close());
@@ -244,6 +276,96 @@ test("run_job defaults the budget to 1.00 USDC (1_000_000n) when budgetUsdc is o
     expect(res.isError).toBeFalsy();
     expect(startCalls).toHaveLength(1);
     expect(startCalls[0]!.budget).toBe(1_000_000n);
+  } finally {
+    await close();
+  }
+});
+
+// --- Audit fix A: run_job budget + per-tenant in-flight caps ---
+
+test("run_job rejects a budgetUsdc over MAX_JOB_BUDGET_USDC without starting the saga", async () => {
+  repoSeed(TENANT, "agent1");
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const res = await client.callTool({
+      name: "run_job",
+      // MAX_JOB_BUDGET is 5_000_000n (5 USDC); 5.01 exceeds it.
+      arguments: { id: `${TENANT}:agent1`, budgetUsdc: "5.01" },
+    });
+    expect(res.isError).toBe(true);
+    expect((res.content as { text: string }[])[0]!.text).toBe(
+      "budgetUsdc exceeds the max job budget",
+    );
+    expect(startCalls).toHaveLength(0);
+  } finally {
+    await close();
+  }
+});
+
+test("run_job accepts a budgetUsdc exactly at MAX_JOB_BUDGET_USDC", async () => {
+  repoSeed(TENANT, "agent1");
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const res = await client.callTool({
+      name: "run_job",
+      arguments: { id: `${TENANT}:agent1`, budgetUsdc: "5.00" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(startCalls).toHaveLength(1);
+    expect(startCalls[0]!.budget).toBe(MAX_JOB_BUDGET);
+  } finally {
+    await close();
+  }
+});
+
+test("run_job rejects when the tenant already has MAX_INFLIGHT_JOBS_PER_TENANT non-terminal jobs", async () => {
+  const entityId = repoSeed(TENANT, "agent1");
+  // Seed exactly the cap's worth of non-terminal jobs for this tenant. Statuses other than
+  // completed/reputed/failed all count as in-flight.
+  const nonTerminalStatuses = ["pending", "created", "funded"] as const;
+  expect(nonTerminalStatuses).toHaveLength(MAX_INFLIGHT_JOBS_PER_TENANT);
+  nonTerminalStatuses.forEach((status, i) => {
+    jobs.upsert({ ...baseJob, jobKey: `seed-${i}`, entityKey: entityId, status });
+  });
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const res = await client.callTool({
+      name: "run_job",
+      arguments: { id: entityId },
+    });
+    expect(res.isError).toBe(true);
+    expect((res.content as { text: string }[])[0]!.text).toBe(
+      "too many jobs in flight, try again later",
+    );
+    expect(startCalls).toHaveLength(0);
+  } finally {
+    await close();
+  }
+});
+
+test("run_job ignores terminal jobs when counting in-flight and still starts under both caps", async () => {
+  const entityId = repoSeed(TENANT, "agent1");
+  // MAX_INFLIGHT_JOBS_PER_TENANT terminal jobs must NOT count toward the cap.
+  const terminalStatuses = ["completed", "reputed", "failed"] as const;
+  expect(terminalStatuses).toHaveLength(MAX_INFLIGHT_JOBS_PER_TENANT);
+  terminalStatuses.forEach((status, i) => {
+    jobs.upsert({ ...baseJob, jobKey: `terminal-${i}`, entityKey: entityId, status });
+  });
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const res = await client.callTool({
+      name: "run_job",
+      arguments: { id: entityId, budgetUsdc: "2.00" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(startCalls).toHaveLength(1);
+    expect(startCalls[0]!.budget).toBe(2_000_000n);
   } finally {
     await close();
   }

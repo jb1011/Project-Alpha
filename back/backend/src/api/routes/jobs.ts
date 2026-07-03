@@ -20,6 +20,15 @@ export function mountJobRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps
     }
     const budget = typeof body.budget === "string" ? usdToUnits(body.budget) : usdToUnits("1.00");
     const description = typeof body.description === "string" ? body.description : "demo job";
+    // Audit fix A: escrow is funded from the platform wallet (JOB_CLIENT_PRIVATE_KEY) and swept to
+    // the caller's treasury — without these caps a loop of big-budget jobs drains platform USDC.
+    if (budget > deps.maxJobBudget)
+      throw new ApiError("validation_error", 400, "budget exceeds the max job budget");
+    const inflight = deps.jobs
+      .listByTenant(tenantId)
+      .filter((j) => !["completed", "reputed", "failed"].includes(j.status)).length;
+    if (inflight >= deps.maxInflightJobsPerTenant)
+      throw new ApiError("rate_limited", 429, "too many jobs in flight");
     const jobKey = `${entity.idempotencyKey}:${Date.now()}-${randomUUID().slice(0, 8)}`; // entity.idempotencyKey already = `${tenantId}:${userKey}`
     const { status } = deps.jobRunner.start({
       jobKey,
