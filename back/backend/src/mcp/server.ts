@@ -1,20 +1,34 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { toJobView } from "../api/jobViews";
 import { toEntityView } from "../api/views";
+import type { JobRepository } from "../jobs/jobRepository";
+import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema } from "../policy/agentSpec";
 import type { OnboardingRunner } from "../workflow/runner";
+import { entityInScope } from "./scope";
 
 export interface McpToolDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
+  jobs: JobRepository;
 }
 
-/** Build a fresh, tenant-scoped MCP server. tenantId is closed over — never taken from a tool arg. */
-export function buildMcpServer(tenantId: string, deps: McpToolDeps): McpServer {
+/** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
+export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
+  // The ACTING tools below (whoami/list_entities/get_entity/fund_treasury/onboard_agent) enforce
+  // ONLY tenant isolation via `tenantId` — they do NOT yet honor `scope.entityId`/`scope.capability`.
+  // The read tools (get_job/list_jobs) DO enforce entityInScope. This is safe today because
+  // `POST /api-keys` only ever mints tenant-wide keys ({entityId: null, capability: "spend"}); entity-
+  // scoped keys are not yet mintable over the API. ⚠ P2b/P2c PREREQUISITE: entity+capability gating of
+  // fund_treasury/onboard_agent MUST land BEFORE the mint surface is widened to issue scoped keys —
+  // otherwise a nominally "read-only, entity-A" key would silently retain treasury-funding/onboarding
+  // power over the whole tenant. See back/docs/plans/2026-07-02-byoa-p2a-scope-and-reads.md.
+  const tenantId = scope.tenantId;
   const { repo, runner } = deps;
   const server = new McpServer({ name: "project-alpha-brain", version: "1.0.0" });
 
@@ -64,6 +78,42 @@ export function buildMcpServer(tenantId: string, deps: McpToolDeps): McpServer {
       if (!rec || rec.ownerTenantId !== tenantId)
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
+    },
+  );
+
+  server.registerTool(
+    "get_job",
+    {
+      title: "Get job",
+      description: "Fetch one job by jobKey (owned by you).",
+      inputSchema: { jobKey: z.string() },
+    },
+    async ({ jobKey }) => {
+      const rec = deps.jobs.findByKey(jobKey);
+      if (!rec || rec.ownerTenantId !== scope.tenantId || !entityInScope(scope, rec.entityKey))
+        return { content: [{ type: "text", text: "job not found" }], isError: true };
+      return { content: [{ type: "text", text: JSON.stringify(toJobView(rec)) }] };
+    },
+  );
+
+  server.registerTool(
+    "list_jobs",
+    {
+      title: "List jobs",
+      description: "List jobs for one of your entities (id = entity idempotency key).",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) => {
+      if (!entityInScope(scope, id))
+        return {
+          content: [{ type: "text", text: "entity not in this key's scope" }],
+          isError: true,
+        };
+      const views = deps.jobs
+        .listByEntity(id)
+        .filter((j) => j.ownerTenantId === scope.tenantId)
+        .map(toJobView);
+      return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );
 

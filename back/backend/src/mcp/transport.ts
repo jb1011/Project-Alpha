@@ -2,11 +2,11 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import type { Hono } from "hono";
 import type { ApiDeps } from "../api/app";
 import type { AuthVars } from "../auth/middleware";
-import { resolveTenant } from "./auth";
+import { resolveKey } from "./auth";
 import { buildMcpServer } from "./server";
 
 /** Mount the stateless Streamable-HTTP MCP endpoint. A fresh server+transport per request,
- *  closing over the authenticated tenantId.
+ *  closing over the authenticated key scope (tenantId + entityId + capability).
  *
  *  Uses the SDK's web-standard transport (`handleRequest(Request): Promise<Response>`) so the
  *  Hono handler stays fully fetch-based (`c.req.raw` in, `Response` out) — no raw Node req/res
@@ -15,14 +15,14 @@ import { buildMcpServer } from "./server";
  *  adaptor (ERR_HTTP_HEADERS_SENT). See task-5-report.md. */
 export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   app.all("/mcp", async (c) => {
-    const tenantId = resolveTenant(c.req.header("authorization"), deps.apiKeys);
-    if (!tenantId)
-      return c.json({ error: { code: "unauthorized", message: "invalid api key" } }, 401);
+    const scope = resolveKey(c.req.header("authorization"), deps.apiKeys);
+    if (!scope) return c.json({ error: { code: "unauthorized", message: "invalid api key" } }, 401);
 
-    const server = buildMcpServer(tenantId, {
+    const server = buildMcpServer(scope, {
       repo: deps.repo,
       runner: deps.runner,
       passkeys: deps.passkeys,
+      jobs: deps.jobs,
     });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
