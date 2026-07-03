@@ -126,11 +126,17 @@ test("an entity-scoped key cannot get_entity a same-tenant sibling (uniform not 
   const { key } = apiKeys.mint(TENANT, { entityId: `${TENANT}:agent1`, capability: "read" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
-    const sibling = await client.callTool({ name: "get_entity", arguments: { id: `${TENANT}:agent2` } });
+    const sibling = await client.callTool({
+      name: "get_entity",
+      arguments: { id: `${TENANT}:agent2` },
+    });
     expect(sibling.isError).toBe(true);
     expect((sibling.content as { text: string }[])[0]!.text).toBe("entity not found");
     // ...but its own entity is still reachable
-    const own = await client.callTool({ name: "get_entity", arguments: { id: `${TENANT}:agent1` } });
+    const own = await client.callTool({
+      name: "get_entity",
+      arguments: { id: `${TENANT}:agent1` },
+    });
     expect(own.isError).toBeFalsy();
   } finally {
     await close();
