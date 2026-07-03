@@ -115,7 +115,8 @@ export function migrate(db: Database.Database): void {
       name         TEXT,
       challenge    TEXT NOT NULL,
       attestation  TEXT NOT NULL,
-      created_at   INTEGER NOT NULL
+      created_at   INTEGER NOT NULL,
+      revoked_at   INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_passkeys_tenant ON passkeys(owner_tenant);
 
@@ -199,6 +200,12 @@ export function migrate(db: Database.Database): void {
   if (!akCols.includes("entity_id")) db.exec("ALTER TABLE api_keys ADD COLUMN entity_id TEXT");
   if (!akCols.includes("capability")) db.exec("ALTER TABLE api_keys ADD COLUMN capability TEXT");
   if (!akCols.includes("expires_at")) db.exec("ALTER TABLE api_keys ADD COLUMN expires_at INTEGER");
+
+  const pkCols = (db.prepare("PRAGMA table_info(passkeys)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!pkCols.includes("revoked_at"))
+    db.exec("ALTER TABLE passkeys ADD COLUMN revoked_at INTEGER");
 
   const plCols = (db.prepare("PRAGMA table_info(payments_ledger)").all() as { name: string }[]).map(
     (c) => c.name,

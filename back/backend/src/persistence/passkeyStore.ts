@@ -6,12 +6,17 @@ export interface PasskeyView {
   id: string;
   name: string | null;
   createdAt: number;
+  revokedAt: number | null;
 }
 
 export interface PasskeyStore {
   store(tenantId: string, pk: GuardianPasskey): string;
   get(tenantId: string, id: string): GuardianPasskey | null;
   list(tenantId: string): PasskeyView[];
+  /** Soft-revoke. Returns true if a live passkey was revoked. Off-chain only:
+   *  prevents FUTURE onboard/bootstrap use of this passkeyId; never affects an
+   *  already-provisioned entity (its Turnkey/on-chain guardian exist independently). */
+  revoke(tenantId: string, id: string): boolean;
 }
 
 /** Server-side store of guardian WebAuthn attestations (PUBLIC credentials, not private keys),
@@ -40,7 +45,7 @@ export class SqlitePasskeyStore implements PasskeyStore {
   get(tenantId: string, id: string): GuardianPasskey | null {
     const row = this.db
       .prepare(
-        "SELECT name, challenge, attestation FROM passkeys WHERE id = ? AND owner_tenant = ?",
+        "SELECT name, challenge, attestation FROM passkeys WHERE id = ? AND owner_tenant = ? AND revoked_at IS NULL",
       )
       .get(id, tenantId) as
       | { name: string | null; challenge: string; attestation: string }
@@ -56,8 +61,17 @@ export class SqlitePasskeyStore implements PasskeyStore {
   list(tenantId: string): PasskeyView[] {
     return this.db
       .prepare(
-        "SELECT id, name, created_at AS createdAt FROM passkeys WHERE owner_tenant = ? ORDER BY created_at",
+        "SELECT id, name, created_at AS createdAt, revoked_at AS revokedAt FROM passkeys WHERE owner_tenant = ? ORDER BY created_at",
       )
       .all(tenantId) as PasskeyView[];
+  }
+
+  revoke(tenantId: string, id: string): boolean {
+    const res = this.db
+      .prepare(
+        "UPDATE passkeys SET revoked_at = ? WHERE id = ? AND owner_tenant = ? AND revoked_at IS NULL",
+      )
+      .run(Date.now(), id, tenantId);
+    return res.changes > 0;
   }
 }

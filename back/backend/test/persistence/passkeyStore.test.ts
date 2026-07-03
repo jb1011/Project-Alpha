@@ -48,3 +48,21 @@ test("list returns secret-free metadata for the tenant only", () => {
   expect(views[0]).toMatchObject({ name: "Test Key" });
   expect(JSON.stringify(views)).not.toContain("attestationObject");
 });
+
+test("revoke hides the passkey from get() but keeps it in list() with revokedAt", () => {
+  const id = store.store(TENANT, PK);
+  expect(store.get(TENANT, id)).not.toBeNull();
+  expect(store.revoke(TENANT, id)).toBe(true);
+  expect(store.get(TENANT, id)).toBeNull(); // can no longer authorize onboard/bootstrap
+  const listed = store.list(TENANT);
+  expect(listed).toHaveLength(1);
+  expect(listed[0]!.revokedAt).toBeGreaterThan(0);
+});
+
+test("revoke is tenant-scoped and idempotent-safe", () => {
+  const id = store.store(TENANT, PK);
+  expect(store.revoke(OTHER, id)).toBe(false); // wrong tenant → no-op
+  expect(store.get(TENANT, id)).not.toBeNull();
+  expect(store.revoke(TENANT, id)).toBe(true);
+  expect(store.revoke(TENANT, id)).toBe(false); // already revoked → no row updated
+});
