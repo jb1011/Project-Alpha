@@ -70,6 +70,8 @@ feedback via inline `Callout`, secrets kept in-memory only.
 - `connectTargets.ts` — ordered list mapping each snippet key → `{ label, hint }`.
 - `capabilityCopy.ts` — single source for the read/earn/spend labels + descriptions (used by both selectors),
   differentiated for entity-scoped vs tenant-wide keys (see §Capability model).
+- `GuardianPasskeysPanel.tsx` — list + revoke guardian passkeys (see §Backend hardening). Rendered on
+  `/agents/connect` beneath `BootstrapAgent` (that's where passkeys are minted).
 
 **New — route:** `src/app/agents/connect/page.tsx` — thin client page rendering
 `<RequireAuth><AgentShell title="Connect an agent"><BootstrapAgent/></AgentShell></RequireAuth>` (inherits
@@ -82,9 +84,14 @@ idiom where relevant).
   Promise<{ id: string }>` (POSTs `{ challenge, attestation }` to `/passkey`). **Fix** `getPasskeyChallenge` to
   take a `token` and forward it as `opts.token` (the route is now auth-gated — the current zero-arg version
   will 401). Remove `mintApiKey` (only `McpKeysPanel` used it). **Keep** `listApiKeys`/`revokeApiKey`
-  (now used by `ActiveConnectionsPanel`).
+  (now used by `ActiveConnectionsPanel`). Add `listPasskeys(token): Promise<PasskeyView[]>` and
+  `revokePasskey(token, id)` (see §Backend hardening).
 - `src/lib/api/types.ts` — add `Capability = "read"|"earn"|"spend"`, `ConnectionSnippets`,
-  `ConnectionPackage`, `BootstrapPackage`. Keep `ApiKeyView`. Remove `MintedApiKey` if now unused (verify).
+  `ConnectionPackage`, `BootstrapPackage`, `PasskeyView` (`{ id, label?, createdAt, revokedAt? }`). Keep
+  `ApiKeyView`. Remove `MintedApiKey` if now unused (verify).
+- `interface/src/app/backend/[[...path]]/route.ts` — set `Cache-Control: no-store` on the proxied response
+  **only** for the `connection-package` + `bootstrap-connection` paths (path-scoped, so other endpoints'
+  caching is unaffected). See §Backend hardening.
 - `src/components/onboarding/steps/WelcomeStep.tsx:98` — update the existing `getPasskeyChallenge()` call to
   pass the session token (it currently calls the soon-to-be-token-taking helper with no token).
 - `src/components/agents/AgentDashboard.tsx` — render `<ConnectAgentPanel entityId={id}/>` (which itself renders
@@ -97,6 +104,38 @@ idiom where relevant).
 
 **Retired:** `src/components/agents/McpKeysPanel.tsx` — deleted (its connect flow → `ConnectAgentPanel`, its
 list/revoke UI → `ActiveConnectionsPanel`). The backend `/api-keys` mint route is left intact but unexposed.
+
+## Backend hardening (folded in per decision)
+
+Two audit items (S1 proxy `no-store`, S6 passkey list/revoke) were pulled from "deferred" into this build.
+
+**1. Path-scoped proxy `no-store`.** In `interface/src/app/backend/[[...path]]/route.ts`, when the proxied path
+is `connection-package` or `bootstrap-connection`, add `Cache-Control: no-store` to the forwarded response
+headers (today the proxy passes through only `content-type`, `route.ts:35-40`). Path-scoped so no other
+endpoint's caching changes. This restores the protection the backend intends but the proxy currently strips.
+
+**2. Guardian passkey list/revoke.** Backend additions:
+- `PasskeyStore` (`back/backend/src/persistence/passkeyStore.ts`) — add `list(tenantId): PasskeyRow[]` and
+  `revoke(tenantId, id)` (soft-delete: set `revoked_at`; add the column via a migration). `get(tenantId, id)`
+  must return **null for a revoked passkey**.
+- New routes: `GET /passkeys` (list — id/label/createdAt/revokedAt, tenant-scoped) and `DELETE /passkeys/:id`
+  (revoke, tenant-scoped, uniform not-found), both `requireAuth`-gated; wire in `app.ts`.
+- Because `POST /bootstrap-connection` (`connection.ts:63`) and `onboard_agent` (`server.ts`) both gate on
+  `deps.passkeys.get(...)`, a revoked passkey automatically stops authorizing **new** bootstraps/onboards once
+  `get()` excludes revoked — verify both call sites reject revoked (add an explicit check if `get()` can't be
+  changed safely).
+- **Safety invariant (state in the plan + a code comment):** revoking a passkey in the store only prevents that
+  `passkeyId` from authorizing **future** onboard/bootstrap actions. It does **not** alter any already-provisioned
+  entity — that entity's Turnkey sub-org guardian + on-chain guardian already exist independently of this store
+  row. So revoke is always safe (it garbage-collects the ability to spawn *more* bodies from a stale passkey);
+  it never strands a live vault. The UI copy must say this ("Revoking stops this passkey from creating new
+  agents; existing agents are unaffected").
+- Backend tests: extend the passkey route/store tests to cover list, revoke, get-excludes-revoked, and
+  bootstrap/onboard rejecting a revoked passkey.
+
+Frontend `GuardianPasskeysPanel`: polls `listPasskeys(token)`, renders id/label/created + a Revoke button
+(`revokePasskey(token, id)` → refresh; "Revoked" when `revokedAt`), mirroring `ActiveConnectionsPanel`. Empty
+state: "No guardian passkeys yet."
 
 ## Component designs
 
@@ -218,20 +257,19 @@ Adds a `hermes` snippet, but **verified, not guessed** (a wrong config snippet i
 - API keys and link codes live **only** in React component state, never localStorage/sessionStorage, and are
   cleared on reset. (This is exposure-window hygiene — it prevents survival across reload/tabs/disk, not live
   XSS, which in-memory state is equally exposed to.) The SIWE JWT continues in `sessionStorage` as today.
-- **Correction to v1:** the backend's `Cache-Control: no-store`/`Referrer-Policy: no-referrer` on these
-  responses do **not** reach the browser — the app proxy (`interface/src/app/backend/[[...path]]/route.ts:35-40`)
-  strips all response headers except `content-type`. POST responses aren't HTTP-cached by default, and referrer
-  on a JSON response is inert, so the practical exposure is low; the real protections are not-persisting +
-  one-click revoke. *Optional hardening:* have the proxy set `Cache-Control: no-store` for the two connect
-  paths.
+- **Correction to v1 (now hardened):** the backend's `Cache-Control: no-store` did not reach the browser
+  because the app proxy strips all response headers except `content-type`. This build **restores it** by
+  path-scoping `Cache-Control: no-store` in the proxy for the two connect paths (§Backend hardening). (Referrer
+  on a JSON response is inert; the document-level referrer policy is unchanged.)
 - **XSS:** snippets render as `<pre>` text via React escaping; **no `dangerouslySetInnerHTML`** anywhere in these
   components (guard against a future syntax-highlighter regression).
 - **Revocation:** every minted key is one-click revocable via `ActiveConnectionsPanel` (§14.2 satisfied).
 - **Capability defaults** follow blast radius: entity-scoped web-first defaults to `spend` (bounded by one
   body's on-chain caps); tenant-wide bootstrap defaults to `read` with explicit opt-up + the confirm screen.
-- **Accepted risk (tracked follow-up):** guardian-passkey proliferation — every bootstrap run stores a
-  permanent guardian anchor and `PasskeyStore` has no delete. Mitigation deferred to a backend follow-up
-  (list/revoke passkeys endpoint + small UI); recorded here, not silently dropped.
+- **Passkey proliferation — addressed in this build:** guardian passkeys are now listable + revocable
+  (§Backend hardening, `GuardianPasskeysPanel`), so a stale/abandoned passkey can be revoked and can no longer
+  authorize new onboards. (Revoke is off-chain-only and never affects an already-provisioned entity — see the
+  safety invariant.)
 
 ## Testing / verification
 
@@ -240,18 +278,27 @@ The `interface/` app has **no test harness** (scripts are `dev`/`build`/`start`/
 - **Manual smoke against the live VPS:** (a) on a restored agent (e.g. TestAgentMB_1), generate a web-first
   connection, paste the Claude Code snippet, confirm a tool call (`whoami`/`list_entities`); revoke it and
   confirm the tool call now 401s. (b) run the bootstrap flow through the confirm screen, have an agent run
-  `claim_connection` then `onboard_agent { passkeyId }`, confirm a new entity reaches `bound`.
-- Backend Hermes change is covered by extending `back/backend/test/mcp/snippets.test.ts` (keeps the green suite).
+  `claim_connection` then `onboard_agent { passkeyId }`, confirm a new entity reaches `bound`. (c) revoke a
+  guardian passkey, confirm a subsequent `bootstrap-connection`/`onboard_agent` with that `passkeyId` is
+  rejected.
+- Backend changes are covered by the vitest suite (keeps it green): extend `test/mcp/snippets.test.ts` for
+  Hermes; add passkey store/route tests for list, revoke, get-excludes-revoked, and bootstrap/onboard rejecting
+  a revoked passkey.
+- Proxy header: confirm a `connection-package` response carries `Cache-Control: no-store` through
+  `/backend/...` while an unrelated endpoint does not.
 
 ## Out of scope / deferred (tracked)
 
-- Backend **list/revoke passkeys** endpoint + UI (see Accepted risk) — follow-up.
-- Optional proxy `Cache-Control: no-store` hardening for the connect paths.
 - No live "was it claimed yet?" polling on bootstrap (no endpoint); success is learned from the agent's tools.
 - Deprecating/removing the backend `/api-keys` mint route — later backend cleanup (audit Tier-2).
-- No changes to onboarding, treasury/settings, or backend routes beyond the Hermes snippet.
+- No changes to onboarding or treasury/settings screens. Backend changes are limited to: the Hermes snippet,
+  the passkey list/revoke endpoint + store method, and (frontend) the path-scoped proxy `no-store`.
 
 ## Changelog
+- **v2.1 (2026-07-03):** folded the two remaining audit items into this build (per decision): path-scoped
+  proxy `Cache-Control: no-store` (S1) + guardian-passkey list/revoke (S6 — `PasskeyStore.list`/`revoke` +
+  migration, `GET /passkeys` + `DELETE /passkeys/:id`, `GuardianPasskeysPanel`, with the off-chain-only revoke
+  safety invariant). Only `/api-keys`-route deprecation + claim-polling remain out of scope.
 - **v2 (2026-07-03):** applied the spec audit. Added `ActiveConnectionsPanel` (revoke, §14.2) + kept
   `listApiKeys`/`revokeApiKey`; added the bootstrap **confirm** phase (§14.2 authorization confirmation); surfaced
   `passkeyId` + `onboard_agent` next-steps (closes the agent-first journey); fixed `getPasskeyChallenge` auth;
