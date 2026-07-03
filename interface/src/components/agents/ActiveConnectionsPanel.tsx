@@ -6,7 +6,7 @@ import type { ApiKeyView } from "@/lib/api/types";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { cx } from "@/components/onboarding/primitives";
 
-// Note: the prod DB was deployed fresh, so there are no legacy `mintApiKey` keys;
+// Note: the prod DB was deployed fresh, so there are no pre-BYOA API keys;
 // every listed key is a `connect:`/`bootstrap:` connection. The unfiltered variant
 // (on `/agents/connect`) still lists any key for full revocability.
 export function ActiveConnectionsPanel({ entityId }: { entityId?: string }) {
@@ -23,7 +23,7 @@ export function ActiveConnectionsPanel({ entityId }: { entityId?: string }) {
         const auth = await ensureSession();
         const all = await listApiKeys(auth.token);
         if (!cancelled)
-          setKeys(entityId ? all.filter((k) => (k.label ?? "").startsWith(`connect:${entityId}`)) : all);
+          setKeys(entityId ? all.filter((k) => (k.label ?? "") === `connect:${entityId}`) : all);
       } catch {
         /* keep the prior list on a transient failure */
       }
