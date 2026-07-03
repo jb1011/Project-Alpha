@@ -34,6 +34,7 @@ export function AgentShell({
           </div>
           <nav className="flex shrink-0 items-center gap-2">
             <NavLink href="/agents">My agents</NavLink>
+            <NavLink href="/agents/connect">Connect an agent</NavLink>
             {entityId && (
               <>
                 <NavLink href={`/agents/${encodeURIComponent(entityId)}`}>Dashboard</NavLink>

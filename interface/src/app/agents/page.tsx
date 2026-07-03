@@ -63,7 +63,13 @@ function AgentsList() {
         </Card>
       ) : (
         <>
-          <div className="mb-4 flex justify-end">
+          <div className="mb-4 flex justify-end gap-2">
+            <Link
+              href="/agents/connect"
+              className="inline-flex rounded-full border hairline-strong bg-paper/40 px-5 py-2.5 text-[13px] font-medium text-ink hover:bg-paper-2"
+            >
+              Connect an agent
+            </Link>
             <Link
               href="/onboarding?new=1"
               className="inline-flex rounded-full bg-ink px-5 py-2.5 text-[13px] font-medium text-paper hover:bg-ink-hover"
