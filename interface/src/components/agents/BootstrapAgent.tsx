@@ -1,15 +1,14 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { bootstrapConnection, getPasskeyChallenge, storePasskey } from "@/lib/api/client";
 import { createGuardianPasskey } from "@/lib/api/passkey";
 import type { BootstrapPackage, Capability } from "@/lib/api/types";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { Button, Callout, Card, StepHeader } from "@/components/onboarding/primitives";
-import { ActiveConnectionsPanel } from "./ActiveConnectionsPanel";
 import { CapabilitySelector } from "./CapabilitySelector";
 import { ConnectionSnippet } from "./ConnectionSnippet";
-import { GuardianPasskeysPanel } from "./GuardianPasskeysPanel";
 import { TENANT_CAPABILITIES, TENANT_DEFAULT_CAPABILITY } from "./capabilityCopy";
 
 type Phase = "passkey" | "capability" | "confirm" | "generate";
@@ -197,10 +196,12 @@ export function BootstrapAgent() {
       </Card>
 
       <div className="mt-6">
-        <ActiveConnectionsPanel />
-      </div>
-      <div className="mt-6">
-        <GuardianPasskeysPanel />
+        <Link
+          href="/agents/account"
+          className="text-[12px] text-accent underline-offset-2 hover:underline"
+        >
+          Manage connections & passkeys → Account
+        </Link>
       </div>
     </div>
   );

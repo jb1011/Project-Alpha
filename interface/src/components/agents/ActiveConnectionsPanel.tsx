@@ -4,17 +4,20 @@ import * as React from "react";
 import { listApiKeys, revokeApiKey } from "@/lib/api/client";
 import type { ApiKeyView } from "@/lib/api/types";
 import { useAuth } from "@/components/onboarding/AuthProvider";
-import { cx } from "@/components/onboarding/primitives";
+import { CapabilityBadge, RevokeButton } from "@/components/agents/connectionRow";
 
-// Note: the prod DB was deployed fresh, so there are no pre-BYOA API keys;
-// every listed key is a `connect:`/`bootstrap:` connection. The unfiltered variant
-// (on `/agents/connect`) still lists any key for full revocability.
-export function ActiveConnectionsPanel({ entityId }: { entityId?: string }) {
+type ConnectionFilter = { mode: "entity"; entityId: string } | { mode: "tenant" };
+
+export function ActiveConnectionsPanel({ filter }: { filter: ConnectionFilter }) {
   const { ensureSession } = useAuth();
   const [keys, setKeys] = React.useState<ApiKeyView[]>([]);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [reloadKey, setReloadKey] = React.useState(0);
+
+  // Stabilize effect deps (filter is a fresh object each render).
+  const mode = filter.mode;
+  const entityId = filter.mode === "entity" ? filter.entityId : null;
 
   React.useEffect(() => {
     let cancelled = false;
@@ -22,8 +25,10 @@ export function ActiveConnectionsPanel({ entityId }: { entityId?: string }) {
       try {
         const auth = await ensureSession();
         const all = await listApiKeys(auth.token);
-        if (!cancelled)
-          setKeys(entityId ? all.filter((k) => (k.label ?? "") === `connect:${entityId}`) : all);
+        const visible = all.filter(
+          (k) => !k.revokedAt && (mode === "tenant" ? k.entityId === null : k.entityId === entityId),
+        );
+        if (!cancelled) setKeys(visible);
       } catch {
         /* keep the prior list on a transient failure */
       }
@@ -31,7 +36,7 @@ export function ActiveConnectionsPanel({ entityId }: { entityId?: string }) {
     return () => {
       cancelled = true;
     };
-  }, [ensureSession, entityId, reloadKey]);
+  }, [ensureSession, mode, entityId, reloadKey]);
 
   async function onRevoke(id: string) {
     setBusy(true);
@@ -39,7 +44,7 @@ export function ActiveConnectionsPanel({ entityId }: { entityId?: string }) {
     try {
       const auth = await ensureSession();
       await revokeApiKey(auth.token, id);
-      setReloadKey((k) => k + 1); // re-trigger the load effect
+      setReloadKey((k) => k + 1);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to revoke.");
     } finally {
@@ -59,21 +64,16 @@ export function ActiveConnectionsPanel({ entityId }: { entityId?: string }) {
               key={k.id}
               className="flex items-center justify-between gap-3 rounded-xl border hairline px-3 py-2.5 text-[12px]"
             >
-              <div className="min-w-0">
-                <div className="truncate text-ink">{k.label ?? "Unlabeled"}</div>
-                <div className="font-mono text-[10.5px] text-muted-2">{k.id.slice(0, 8)}…</div>
+              <div className="flex min-w-0 items-center gap-2">
+                <CapabilityBadge capability={k.capability} />
+                <span className="truncate text-ink">{mode === "tenant" ? "Tenant-wide" : "This agent"}</span>
+                <span className="shrink-0 font-mono text-[10.5px] text-muted-2">{k.id.slice(0, 8)}…</span>
               </div>
-              <button
-                type="button"
-                disabled={busy || !!k.revokedAt}
-                onClick={() => void onRevoke(k.id)}
-                className={cx(
-                  "shrink-0 text-[11.5px] underline-offset-2 hover:underline",
-                  k.revokedAt ? "text-muted-2" : "text-[#ff8a84]",
-                )}
-              >
-                {k.revokedAt ? "Revoked" : "Revoke"}
-              </button>
+              <RevokeButton
+                disabled={busy}
+                confirmMessage="Revoking disconnects any agent using this connection. Continue?"
+                onRevoke={() => void onRevoke(k.id)}
+              />
             </li>
           ))}
         </ul>
