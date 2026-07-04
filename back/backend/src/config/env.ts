@@ -1,4 +1,5 @@
 import { getAddress, isAddress } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 import { usdToUnits } from "../policy/units";
 import type { Address, Hex } from "../types";
@@ -57,6 +58,25 @@ const EnvSchema = z.object({
     .transform((v) => v === "true"),
   MCP_PUBLIC_URL: z.string().default("http://localhost:8789/mcp"),
   METADATA_BASE_URL: z.string().url().default("http://localhost:8789"),
+  ENABLE_X402_DEMO: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
+  X402_DEMO_PAYTO: addressSchema.optional(),
+  X402_DEMO_PRICE_USDC: z
+    .string()
+    .default("0.01")
+    .refine(
+      (v) => {
+        try {
+          const n = usdToUnits(v);
+          return n > 0n && n <= 1_000_000n;
+        } catch {
+          return false;
+        }
+      },
+      { message: "must be > 0 and <= 1.0 USDC (max 6 decimals)" },
+    ),
 });
 
 export interface Config {
@@ -102,6 +122,9 @@ export interface Config {
   jobSweepToTreasury: boolean;
   mcpPublicUrl: string;
   metadataBaseUrl: string;
+  enableX402Demo: boolean;
+  x402DemoPayTo: Address;
+  x402DemoPriceUsdc: string;
 }
 
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
@@ -165,6 +188,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
     mcpPublicUrl: e.MCP_PUBLIC_URL,
     metadataBaseUrl: e.METADATA_BASE_URL,
+    enableX402Demo: e.ENABLE_X402_DEMO,
+    x402DemoPayTo:
+      e.X402_DEMO_PAYTO ?? (privateKeyToAccount(e.PLATFORM_PRIVATE_KEY).address as Address),
+    x402DemoPriceUsdc: e.X402_DEMO_PRICE_USDC,
   };
 
   // Fail-closed: never let production boot with the insecure dev defaults.
