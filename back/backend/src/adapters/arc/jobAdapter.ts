@@ -1,5 +1,6 @@
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
 import { iErc8183JobAbi } from "../../abis/generated";
+import { USDC_TRANSFER_GAS } from "./gas";
 
 /** Minimal ERC-20 approve fragment for the approveAndFund flow. */
 const erc20ApproveAbi = [
@@ -224,7 +225,9 @@ export class JobAdapter {
       args: [to, amount],
       account: wallet.account!,
     });
-    const h = await wallet.writeContract(request);
+    // Explicit gas (see USDC_TRANSFER_GAS): sweeps ~the provider EOA's entire USDC balance, so viem's
+    // fee-fielded estimateGas would otherwise reserve it all and revert.
+    const h = await wallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
     await this.d.publicClient.waitForTransactionReceipt({ hash: h });
     return h;
   }
