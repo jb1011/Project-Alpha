@@ -49,6 +49,7 @@ function makeConfig(): Config {
     jobEvaluatorPrivateKey: EVALUATOR_KEY,
     jobSweepToTreasury: false,
     mcpPublicUrl: "http://localhost:8789/mcp",
+    metadataBaseUrl: "http://localhost:8789",
   };
 }
 
