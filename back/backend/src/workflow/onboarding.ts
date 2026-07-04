@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Address } from "viem";
 import type { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { buildWalletSetTypedData } from "../adapters/arc/walletSet";
@@ -26,6 +27,10 @@ export interface OnboardingDeps {
   arc: ArcAdapter;
   operatorSigner: OperatorSigner;
   usdc: Address; // default USDC for the translator
+  /** Public base URL for the on-chain metadataURI: ${metadataBaseUrl}/metadata/<publicId>. OPTIONAL
+   *  (default localhost) so the existing saga tests compile untouched; the REAL callers (main.ts
+   *  runSaga + cli create-entity) always pass the prod-guarded cfg.metadataBaseUrl. */
+  metadataBaseUrl?: string;
   /** Owning tenant (controller wallet address); persisted on every record the saga writes. */
   ownerTenantId?: string;
   /** Validated AgentSpec JSON; persisted so the reconciler/fund can re-run the saga. */
@@ -148,7 +153,9 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     const oaHash = computeOaHash(doc);
     const meta = renderMetadata(d.spec, resolved, oaHash);
     const docPut = d.docStore.put(`oa-${key}.md`, doc);
-    const metaPut = d.docStore.put(`meta-${key}.json`, JSON.stringify(meta, null, 2));
+    d.docStore.put(`meta-${key}.json`, JSON.stringify(meta, null, 2)); // written for the public route to serve
+    const publicId = rec?.publicId ?? randomUUID(); // minted once; preserved across a translating-resume
+    const metadataBaseUrl = d.metadataBaseUrl ?? "http://localhost:8789"; // real callers pass the guarded cfg value
 
     rec = {
       idempotencyKey: key,
@@ -161,7 +168,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       ein: r.legal.ein,
       formationDate: r.legal.formationDate,
       oaHash,
-      metadataURI: metaPut.uri,
+      metadataURI: `${metadataBaseUrl}/metadata/${publicId}`,
+      publicId,
       docPath: docPut.path,
       treasuryConfig: r.treasury,
       agentId: null,

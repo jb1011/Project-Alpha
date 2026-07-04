@@ -91,6 +91,7 @@ async function main() {
       arc,
       operatorSigner,
       usdc: cfg.usdc,
+      metadataBaseUrl: cfg.metadataBaseUrl,
       ownerTenantId: i.tenantId,
       specJson: i.specJson,
       fundAmount: i.fundAmount,
