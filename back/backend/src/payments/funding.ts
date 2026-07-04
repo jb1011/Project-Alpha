@@ -18,11 +18,54 @@ export interface TopUpOptions {
   pollAttempts?: number; // how many times to read the operator balance before giving up
   pollDelayMs?: number; // wait between reads
   sleep?: (ms: number) => Promise<void>; // injectable so tests don't spend real wall-clock
+  /** When true, the operator already holds the fundOperator credit (a retry completing a partial
+   *  bridge) — skip fundOperator + the cap check + awaitOperatorFunded so the treasury isn't
+   *  double-pulled. Returns [forward, deposit] (2 hashes) instead of [fundOperator, forward, deposit]. */
+  skipFundOperator?: boolean;
 }
 
 const DEFAULT_POLL_ATTEMPTS = 12;
 const DEFAULT_POLL_DELAY_MS = 1_500;
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Retry-safety guard: true when the operator already holds the fundOperator credit (a re-run
+ *  completing a partial bridge), so the treasury must NOT be pulled again. `operatorBalance` and
+ *  `seedTargetAtomic` are 6-dec atomic USDC; the seed lands the operator at exactly seedTargetAtomic,
+ *  and a landed credit pushes it to ~seedTargetAtomic + amount (minus small gas). The amount/2 margin
+ *  separates the two while tolerating gas — but note it FALSE-NEGATIVES (re-pulls) for tiny amounts
+ *  where gas erodes more than amount/2 (roughly amount < ~2x forward gas); acceptable per the design's
+ *  documented partial-state limitation, and it over-funds only the agent's own float within cap. */
+export function shouldSkipFundOperator(
+  operatorBalance: bigint,
+  seedTargetAtomic: bigint,
+  amount: bigint,
+): boolean {
+  return operatorBalance >= seedTargetAtomic + amount / 2n;
+}
+
+/** Retry `fn` on a transient read-after-write revert (a lagging RPC eth_call seeing stale balance).
+ *  Retry is scoped to insufficient-balance reverts ONLY — those mean the tx moved no funds (a
+ *  pre-write simulate revert, or a no-op on-chain revert), so a retry cannot double-spend. A tx that
+ *  actually transferred never produces this message; a lost-receipt/timeout is a different error and
+ *  is rethrown (not retried). */
+export async function retryOnStaleBalance<T>(
+  fn: () => Promise<T>,
+  opts: { attempts: number; delayMs: number; sleep: (ms: number) => Promise<void> },
+): Promise<T> {
+  let last: unknown;
+  for (let i = 0; i < opts.attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      const transient = /exceeds balance|insufficient|transfer amount exceeds/i.test(msg);
+      if (!transient || i === opts.attempts - 1) throw e;
+      await opts.sleep(opts.delayMs);
+    }
+  }
+  throw last ?? new Error("retryOnStaleBalance: attempts must be >= 1");
+}
 
 /**
  * Poll the operator's USDC balance until it reflects at least `min`. After `fundOperator`'s receipt is
@@ -58,17 +101,26 @@ export async function topUpPocket(
   opts: TopUpOptions = {},
 ): Promise<Hex[]> {
   if (amount <= 0n) throw new Error("top-up amount must be positive");
-  const available = await d.available();
-  if (amount > available) throw new Error(`top-up ${amount} exceeds available ${available}`);
-  const fundHash = await d.fundOperator(d.treasury, amount);
-  await awaitOperatorFunded(
-    d.operatorUsdcBalance,
-    amount,
-    opts.pollAttempts ?? DEFAULT_POLL_ATTEMPTS,
-    opts.pollDelayMs ?? DEFAULT_POLL_DELAY_MS,
-    opts.sleep ?? defaultSleep,
+  const attempts = opts.pollAttempts ?? DEFAULT_POLL_ATTEMPTS;
+  const delayMs = opts.pollDelayMs ?? DEFAULT_POLL_DELAY_MS;
+  const sleep = opts.sleep ?? defaultSleep;
+  const bridge: Hex[] = [];
+  if (!opts.skipFundOperator) {
+    const available = await d.available();
+    if (amount > available) throw new Error(`top-up ${amount} exceeds available ${available}`);
+    const fundHash = await d.fundOperator(d.treasury, amount);
+    await awaitOperatorFunded(d.operatorUsdcBalance, amount, attempts, delayMs, sleep);
+    bridge.push(fundHash);
+  }
+  const forwardHash = await retryOnStaleBalance(
+    () => d.operatorTransferUsdc(d.usdc, d.pocketAddress, amount),
+    { attempts, delayMs, sleep },
   );
-  const forwardHash = await d.operatorTransferUsdc(d.usdc, d.pocketAddress, amount);
-  const depositHash = await d.depositToGateway(formatUnits(amount, 6));
-  return [fundHash, forwardHash, depositHash];
+  const depositHash = await retryOnStaleBalance(() => d.depositToGateway(formatUnits(amount, 6)), {
+    attempts,
+    delayMs,
+    sleep,
+  });
+  bridge.push(forwardHash, depositHash);
+  return bridge;
 }
