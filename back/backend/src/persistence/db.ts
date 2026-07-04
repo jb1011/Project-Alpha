@@ -193,6 +193,8 @@ export function migrate(db: Database.Database): void {
   if (!cols.includes("error")) db.exec("ALTER TABLE entities ADD COLUMN error TEXT");
   if (!cols.includes("spec_json")) db.exec("ALTER TABLE entities ADD COLUMN spec_json TEXT");
   if (!cols.includes("per_tx_cap")) db.exec("ALTER TABLE entities ADD COLUMN per_tx_cap TEXT");
+  if (!cols.includes("public_id")) db.exec("ALTER TABLE entities ADD COLUMN public_id TEXT");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_public_id ON entities(public_id)");
 
   const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
     (c) => c.name,
