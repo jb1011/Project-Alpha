@@ -1,6 +1,6 @@
 // backend/test/payments/funding.test.ts
 import { expect, test, vi } from "vitest";
-import { type FundingDeps, topUpPocket } from "../../src/payments/funding";
+import { type FundingDeps, retryOnStaleBalance, topUpPocket } from "../../src/payments/funding";
 
 const treasury = `0x${"aa".repeat(20)}` as const;
 const usdc = `0x${"bb".repeat(20)}` as const;
@@ -75,4 +75,60 @@ test("throws loudly (without forwarding) if the funded balance never propagates"
   expect(d.fundOperator).toHaveBeenCalledOnce(); // funding still happened on-chain
   expect(d.operatorTransferUsdc).not.toHaveBeenCalled(); // but we never forward a doomed tx
   expect(operatorUsdcBalance).toHaveBeenCalledTimes(3);
+});
+
+test("retryOnStaleBalance retries a stale-balance revert then returns", async () => {
+  let n = 0;
+  const r = await retryOnStaleBalance(
+    async () => {
+      n++;
+      if (n < 3) throw new Error("ERC20: transfer amount exceeds balance");
+      return "ok";
+    },
+    { attempts: 5, delayMs: 1, sleep: noSleep },
+  );
+  expect(r).toBe("ok");
+  expect(n).toBe(3);
+});
+
+test("retryOnStaleBalance rethrows a non-transient error immediately", async () => {
+  let n = 0;
+  await expect(
+    retryOnStaleBalance(
+      async () => {
+        n++;
+        throw new Error("nonce too low");
+      },
+      { attempts: 5, delayMs: 1, sleep: noSleep },
+    ),
+  ).rejects.toThrow(/nonce too low/);
+  expect(n).toBe(1);
+});
+
+test("retryOnStaleBalance rethrows after exhausting attempts", async () => {
+  let n = 0;
+  await expect(
+    retryOnStaleBalance(
+      async () => {
+        n++;
+        throw new Error("exceeds balance");
+      },
+      { attempts: 3, delayMs: 1, sleep: noSleep },
+    ),
+  ).rejects.toThrow(/exceeds balance/);
+  expect(n).toBe(3);
+});
+
+test("topUpPocket retries the forward when it transiently reverts on a stale-balance read", async () => {
+  let calls = 0;
+  const d = deps({
+    operatorTransferUsdc: vi.fn(async () => {
+      calls++;
+      if (calls === 1) throw new Error("ERC20: transfer amount exceeds balance");
+      return "0xxfer" as const;
+    }),
+  });
+  const hashes = await topUpPocket(d, 250_000n, { sleep: noSleep });
+  expect(calls).toBe(2);
+  expect(hashes).toEqual(["0xfund", "0xxfer", "0xdeposit"]);
 });
