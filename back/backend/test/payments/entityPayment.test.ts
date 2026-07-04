@@ -51,6 +51,9 @@ function makeConfig(over: Partial<Config> = {}): Config {
     jobSweepToTreasury: false,
     mcpPublicUrl: "http://localhost:8789/mcp",
     metadataBaseUrl: "http://localhost:8789",
+    enableX402Demo: false,
+    x402DemoPayTo: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    x402DemoPriceUsdc: "0.01",
     ...over,
   };
 }

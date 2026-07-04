@@ -25,6 +25,7 @@ import type { Address } from "../types";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
+import { buildX402DemoDeps } from "./routes/x402Demo";
 
 async function main() {
   const cfg = loadConfig();
@@ -108,6 +109,10 @@ async function main() {
   const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
   if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
 
+  const x402Demo = buildX402DemoDeps(cfg);
+  if (x402Demo)
+    console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);
+
   const app = buildApiApp({
     webOrigin: cfg.webOrigin,
     nonceStore,
@@ -135,6 +140,7 @@ async function main() {
     linkCodes: new SqliteLinkCodeStore(db),
     payments,
     pocketFunding,
+    x402Demo,
   });
 
   const port = Number(process.env.PORT ?? 8789);

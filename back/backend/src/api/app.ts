@@ -17,6 +17,7 @@ import { mountReputationRoutes } from "./routes/reputation";
 import { mountRunsRoutes } from "./routes/runs";
 import { mountSchemaRoutes } from "./routes/schema";
 import { mountTreasuryRoutes } from "./routes/treasury";
+import { mountX402DemoRoutes } from "./routes/x402Demo";
 
 /** Dependencies for the REST API. Extended by later tasks (auth/onboard routes). */
 export interface ApiDeps {
@@ -59,6 +60,9 @@ export interface ApiDeps {
    *  reason as `payments`: deployments without POCKET_MASTER_SEED/Turnkey configured still build,
    *  and the tool/route then report "unavailable" instead of throwing. */
   pocketFunding?: import("../payments/pocketFunding").PocketFundingFn;
+  /** Optional flag-gated x402 demo seller (Leg 3 smoke target). Present only when
+   *  ENABLE_X402_DEMO is set; absent -> route not mounted (404). */
+  x402Demo?: import("./routes/x402Demo").X402DemoDeps;
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
@@ -75,6 +79,7 @@ export function buildApiApp(deps: ApiDeps) {
   app.get("/healthz", (c) => c.json({ ok: true }));
   mountSchemaRoutes(app);
   mountMetadataRoutes(app, deps);
+  if (deps.x402Demo) mountX402DemoRoutes(app, deps.x402Demo);
   mountAuthRoutes(app, deps);
   mountPasskeyRoutes(app, deps);
   app.use("/onboard", requireAuth(deps.jwtSecret));
