@@ -4,7 +4,7 @@ import * as React from "react";
 import { listPasskeys, revokePasskey } from "@/lib/api/client";
 import type { PasskeyView } from "@/lib/api/types";
 import { useAuth } from "@/components/onboarding/AuthProvider";
-import { cx } from "@/components/onboarding/primitives";
+import { RevokeButton } from "@/components/agents/connectionRow";
 
 export function GuardianPasskeysPanel() {
   const { ensureSession } = useAuth();
@@ -19,7 +19,7 @@ export function GuardianPasskeysPanel() {
       try {
         const auth = await ensureSession();
         const list = await listPasskeys(auth.token);
-        if (!cancelled) setPasskeys(list);
+        if (!cancelled) setPasskeys(list.filter((p) => !p.revokedAt));
       } catch {
         /* keep the prior list on a transient failure */
       }
@@ -30,12 +30,6 @@ export function GuardianPasskeysPanel() {
   }, [ensureSession, reloadKey]);
 
   async function onRevoke(id: string) {
-    if (
-      !window.confirm(
-        "Revoking stops this passkey from creating new agents. Existing agents are unaffected. Continue?",
-      )
-    )
-      return;
     setBusy(true);
     setError(null);
     try {
@@ -65,17 +59,11 @@ export function GuardianPasskeysPanel() {
                 <div className="truncate text-ink">{p.name ?? "Guardian passkey"}</div>
                 <div className="font-mono text-[10.5px] text-muted-2">{p.id.slice(0, 8)}…</div>
               </div>
-              <button
-                type="button"
-                disabled={busy || !!p.revokedAt}
-                onClick={() => void onRevoke(p.id)}
-                className={cx(
-                  "shrink-0 text-[11.5px] underline-offset-2 hover:underline",
-                  p.revokedAt ? "text-muted-2" : "text-[#ff8a84]",
-                )}
-              >
-                {p.revokedAt ? "Revoked" : "Revoke"}
-              </button>
+              <RevokeButton
+                disabled={busy}
+                confirmMessage="Revoking stops this passkey from creating new agents. Existing agents are unaffected. Continue?"
+                onRevoke={() => void onRevoke(p.id)}
+              />
             </li>
           ))}
         </ul>

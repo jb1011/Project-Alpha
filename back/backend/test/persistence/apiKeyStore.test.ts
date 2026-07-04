@@ -70,3 +70,33 @@ test("mint with no opts stays tenant-wide with default capability (back-compat)"
     capability: "spend",
   });
 });
+
+test("list() surfaces entityId + capability (per-agent and tenant-wide)", () => {
+  const tenant = "0xTEN";
+  store.mint(tenant, {
+    entityId: `${tenant}:agent-1`,
+    capability: "read",
+    label: `connect:${tenant}:agent-1`,
+  });
+  store.mint(tenant, { capability: "spend", label: "bootstrap:pk-1" }); // tenant-wide: no entityId
+  const rows = store.list(tenant);
+
+  const connect = rows.find((r) => r.label === `connect:${tenant}:agent-1`);
+  expect(connect?.entityId).toBe(`${tenant}:agent-1`);
+  expect(connect?.capability).toBe("read");
+
+  const boot = rows.find((r) => r.label === "bootstrap:pk-1");
+  expect(boot?.entityId).toBeNull();
+  expect(boot?.capability).toBe("spend");
+});
+
+test("list() defaults a legacy NULL capability row to 'spend'", () => {
+  const tenant = "0xLEGACY";
+  db.prepare(
+    "INSERT INTO api_keys (id, owner_tenant, hash, label, created_at, entity_id, capability, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+  ).run("legacy-1", tenant, "deadbeef", "legacy-key", Date.now(), null, null, null);
+
+  const rows = store.list(tenant);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.capability).toBe("spend");
+});

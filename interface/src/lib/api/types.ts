@@ -127,6 +127,8 @@ export type ApiKeyView = {
   label: string | null;
   createdAt: number;
   revokedAt: number | null;
+  entityId: string | null;
+  capability: Capability;
 };
 
 export type Capability = "read" | "earn" | "spend";

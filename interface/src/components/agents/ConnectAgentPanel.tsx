@@ -91,7 +91,7 @@ export function ConnectAgentPanel({ entity }: { entity: EntityView }) {
       {error && <p className="mt-3 text-[11.5px] text-[#ff8a84]">{error}</p>}
 
       <div className="mt-6 border-t hairline pt-4">
-        <ActiveConnectionsPanel entityId={entity.id} />
+        <ActiveConnectionsPanel filter={{ mode: "entity", entityId: entity.id }} />
       </div>
     </Card>
   );

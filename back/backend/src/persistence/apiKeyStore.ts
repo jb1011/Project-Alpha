@@ -6,6 +6,8 @@ export interface ApiKeyView {
   label: string | null;
   createdAt: number;
   revokedAt: number | null;
+  entityId: string | null;
+  capability: Capability;
 }
 
 export type Capability = "read" | "earn" | "spend";
@@ -84,7 +86,7 @@ export class SqliteApiKeyStore implements ApiKeyStore {
   list(tenantId: string): ApiKeyView[] {
     return this.db
       .prepare(
-        "SELECT id, label, created_at AS createdAt, revoked_at AS revokedAt FROM api_keys WHERE owner_tenant = ? ORDER BY created_at",
+        "SELECT id, label, entity_id AS entityId, COALESCE(capability, 'spend') AS capability, created_at AS createdAt, revoked_at AS revokedAt FROM api_keys WHERE owner_tenant = ? ORDER BY created_at",
       )
       .all(tenantId) as ApiKeyView[];
   }
