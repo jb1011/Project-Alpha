@@ -124,6 +124,7 @@ function makeReader(
     paused: boolean;
     allowlistEnabled: boolean;
     isAllowed: boolean;
+    balance: bigint;
   }> = {},
 ) {
   const isAllowedCalls: Address[] = [];
@@ -135,6 +136,7 @@ function makeReader(
       isAllowedCalls.push(who);
       return over.isAllowed ?? true;
     },
+    usdcBalanceOf: async () => over.balance ?? 0n,
   };
   return { reader, isAllowedCalls };
 }
@@ -303,7 +305,12 @@ test("treasury-not-ready: an entity with no treasury cannot pay", async () => {
 });
 
 test("status: reads the four treasury fields plus the entity's configured cap", async () => {
-  const { reader } = makeReader({ available: 42_000n, paused: true, allowlistEnabled: true });
+  const { reader } = makeReader({
+    available: 42_000n,
+    paused: true,
+    allowlistEnabled: true,
+    balance: 123n,
+  });
   const svc = buildEntityPaymentService(makeConfig(), {
     reader,
     ledger,
@@ -319,6 +326,7 @@ test("status: reads the four treasury fields plus the entity's configured cap", 
     paused: true,
     allowlistEnabled: true,
     float: "250000",
+    balance: "123",
   });
 });
 
@@ -476,6 +484,7 @@ test("status: an entity with no treasury reads as zeroed-out/not-paused", async 
     paused: false,
     allowlistEnabled: false,
     float: "0",
+    balance: "0",
   });
 });
 
