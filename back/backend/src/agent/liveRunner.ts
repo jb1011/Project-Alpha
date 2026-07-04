@@ -1,9 +1,10 @@
 // backend/src/agent/liveRunner.ts
 import Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
-import { http, type WalletClient, createPublicClient, createWalletClient } from "viem";
+import { http, type WalletClient, createPublicClient, createWalletClient, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
+import { managerWalletClient } from "../adapters/arc/clients";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
@@ -13,6 +14,7 @@ import { chainFor } from "../chains";
 import { type Config, loadConfig } from "../config/env";
 import { authorizePayment } from "../payments/authority";
 import { topUpPocket } from "../payments/funding";
+import { ensureNativeGas } from "../payments/gasSeeder";
 import { PaymentLedger } from "../payments/ledger";
 import { sweepPocketToTreasury } from "../payments/pocketFloat";
 import { buildPaywall } from "../payments/seller";
@@ -184,29 +186,42 @@ export async function fundPocket(
   const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
   const operatorAddress = operatorWallet.account?.address;
   if (!operatorAddress) throw new Error("fundPocket: operator wallet has no account address");
-  const txs: Hex[] = [];
-  await topUpPocket(
+
+  const managerWallet = managerWalletClient(cfg);
+  const seedTxs = await ensureNativeGas([operatorAddress, gateway.address], {
+    getBalance: (addr) => pub.getBalance({ address: addr }),
+    sendNative: (to, value) =>
+      managerWallet.sendTransaction({
+        to,
+        value,
+        account: managerWallet.account!,
+        chain: managerWallet.chain,
+      }),
+    // Await the seed mining before topUpPocket depends on it — sendNative only returns a mempool
+    // hash, and topUpPocket's operator-/pocket-signed txs would otherwise race an unmined seed and
+    // fail with "gas required exceeds allowance (0)".
+    confirm: (hash) => pub.waitForTransactionReceipt({ hash }).then(() => undefined),
+    floor: parseEther(cfg.gasSeedFloorUsdc),
+    target: parseEther(cfg.gasSeedTargetUsdc),
+  });
+
+  const bridgeTxs = await topUpPocket(
     {
       treasury,
+      // NOTE: uses cfg.usdc (the platform-global token). treasury_status.balance in entityPayment.ts
+      // instead reads `entity.treasuryConfig?.usdc ?? cfg.usdc` — the two token sources coincide today
+      // (onboarding sets treasuryConfig.usdc = cfg.usdc) but should not silently drift.
       usdc: cfg.usdc,
       pocketAddress: gateway.address,
       available: () => adapter.treasuryAvailable(treasury),
       operatorUsdcBalance: () => adapter.usdcBalanceOf(cfg.usdc, operatorAddress),
-      fundOperator: async (t, a) => {
-        const h = await adapter.fundOperator(t, a);
-        txs.push(h);
-        return h;
-      },
-      operatorTransferUsdc: async (u, to, a) => {
-        const h = await adapter.operatorTransferUsdc(u, to, a);
-        txs.push(h);
-        return h;
-      },
+      fundOperator: (t, a) => adapter.fundOperator(t, a),
+      operatorTransferUsdc: (u, to, a) => adapter.operatorTransferUsdc(u, to, a),
       depositToGateway: (amt) => gateway.deposit(amt),
     },
     floatAtomic,
   );
-  return txs;
+  return [...seedTxs, ...bridgeTxs];
 }
 
 /** Live composition root: wire real funding + agent + settled sell into a single runner. */

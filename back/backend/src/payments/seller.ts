@@ -131,6 +131,7 @@ export function buildPaywall(cfg: PaywallConfig) {
       });
       if (!r.ok)
         return c.json({ ...buildRequirements(cfg), error: `settle-failed:${r.reason ?? ""}` }, 402);
+      if (r.transferId) c.header("X-PAYMENT-RESPONSE", r.transferId);
     }
     return c.json((await cfg.serve(c.req.raw)) as Record<string, unknown>, 200);
   });

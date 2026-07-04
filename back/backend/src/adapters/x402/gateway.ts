@@ -20,9 +20,10 @@ export class PocketGateway {
     });
     this.address = privateKeyToAccount(opts.pocketPrivateKey).address;
   }
-  /** Deposit `amountUsdc` (decimal string, e.g. "0.5") from the pocket EOA into its Gateway balance. */
-  deposit(amountUsdc: string) {
-    return this.client.deposit(amountUsdc);
+  /** Deposit `amountUsdc` (decimal string, e.g. "0.5") from the pocket EOA into its Gateway balance.
+   *  Returns the on-chain deposit tx hash. */
+  async deposit(amountUsdc: string): Promise<Hex> {
+    return (await this.client.deposit(amountUsdc)).depositTxHash;
   }
   async getAvailable(): Promise<number> {
     const b = await this.client.getBalances();

@@ -15,7 +15,7 @@ function deps(over: Partial<FundingDeps> = {}): FundingDeps {
     fundOperator: vi.fn(async () => "0xfund" as const),
     operatorUsdcBalance: vi.fn(async () => 1_000_000n), // operator already shows the float by default
     operatorTransferUsdc: vi.fn(async () => "0xxfer" as const),
-    depositToGateway: vi.fn(async () => undefined),
+    depositToGateway: vi.fn(async () => "0xdeposit" as const),
     ...over,
   };
 }
@@ -29,6 +29,12 @@ test("a within-cap top-up runs fundOperator -> forward -> gateway deposit in ord
   expect(d.fundOperator).toHaveBeenCalledWith(treasury, 250_000n);
   expect(d.operatorTransferUsdc).toHaveBeenCalledWith(usdc, pocket, 250_000n);
   expect(d.depositToGateway).toHaveBeenCalledWith("0.25"); // 250000 atomic / 1e6, USDC has 6 decimals
+});
+
+test("returns the fundOperator, forward, and deposit tx hashes in order", async () => {
+  const d = deps();
+  const hashes = await topUpPocket(d, 250_000n, { sleep: noSleep });
+  expect(hashes).toEqual(["0xfund", "0xxfer", "0xdeposit"]);
 });
 
 test("refuses a top-up that exceeds available() and signs nothing", async () => {

@@ -50,3 +50,21 @@ test("a settle failure rejects with 402 and does not serve", async () => {
   expect(res.status).toBe(402);
   expect(served).not.toHaveBeenCalled();
 });
+
+test("a successful settle surfaces the transferId in X-PAYMENT-RESPONSE", async () => {
+  const settle = vi.fn(async () => ({ ok: true as const, transferId: "0xabc-transfer" }));
+  const app = new Hono();
+  app.route("/", buildPaywall({ ...cfgBase, settle, resourceUrl: "https://insight.local/x" }));
+  const res = await app.request("/api/insight", { headers: { "X-PAYMENT": await header(50n) } });
+  expect(res.status).toBe(200);
+  expect(res.headers.get("X-PAYMENT-RESPONSE")).toBe("0xabc-transfer");
+});
+
+test("a settle with no transferId omits the header", async () => {
+  const settle = vi.fn(async () => ({ ok: true as const }));
+  const app = new Hono();
+  app.route("/", buildPaywall({ ...cfgBase, settle, resourceUrl: "https://insight.local/x" }));
+  const res = await app.request("/api/insight", { headers: { "X-PAYMENT": await header(50n) } });
+  expect(res.status).toBe(200);
+  expect(res.headers.get("X-PAYMENT-RESPONSE")).toBeNull();
+});

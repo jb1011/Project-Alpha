@@ -19,6 +19,7 @@ export interface TreasuryReader {
   treasuryPaused(t: Address): Promise<boolean>;
   treasuryAllowlistEnabled(t: Address): Promise<boolean>;
   treasuryIsAllowed(t: Address, who: Address): Promise<boolean>;
+  usdcBalanceOf(usdc: Address, owner: Address): Promise<bigint>;
 }
 
 export interface TreasuryStatusView {
@@ -28,6 +29,8 @@ export interface TreasuryStatusView {
   allowlistEnabled: boolean;
   /** Pocket's spendable Gateway balance (atomic USDC, 6 decimals) — what a `pay` preflight checks. */
   float: string;
+  /** Actual on-chain USDC balance of the treasury (atomic, 6 decimals) — distinct from the policy `available` leash. */
+  balance: string;
 }
 
 export interface PayArgs {
@@ -122,14 +125,22 @@ export function buildEntityPaymentService(
   return {
     async status(entity) {
       if (!entity.treasury) {
-        return { available: "0", cap: "0", paused: false, allowlistEnabled: false, float: "0" };
+        return {
+          available: "0",
+          cap: "0",
+          paused: false,
+          allowlistEnabled: false,
+          float: "0",
+          balance: "0",
+        };
       }
       const treasury = entity.treasury;
-      const [available, paused, allowlistEnabled, float] = await Promise.all([
+      const [available, paused, allowlistEnabled, float, balance] = await Promise.all([
         deps.reader.treasuryAvailable(treasury),
         deps.reader.treasuryPaused(treasury),
         deps.reader.treasuryAllowlistEnabled(treasury),
         readPocketFloat(entity),
+        deps.reader.usdcBalanceOf(entity.treasuryConfig?.usdc ?? cfg.usdc, treasury),
       ]);
       const cap = entity.treasuryConfig?.cap ?? 0n;
       return {
@@ -138,6 +149,7 @@ export function buildEntityPaymentService(
         paused,
         allowlistEnabled,
         float: float.toString(),
+        balance: balance.toString(),
       };
     },
 
