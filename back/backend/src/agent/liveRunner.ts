@@ -197,6 +197,10 @@ export async function fundPocket(
         account: managerWallet.account!,
         chain: managerWallet.chain,
       }),
+    // Await the seed mining before topUpPocket depends on it — sendNative only returns a mempool
+    // hash, and topUpPocket's operator-/pocket-signed txs would otherwise race an unmined seed and
+    // fail with "gas required exceeds allowance (0)".
+    confirm: (hash) => pub.waitForTransactionReceipt({ hash }).then(() => undefined),
     floor: parseEther(cfg.gasSeedFloorUsdc),
     target: parseEther(cfg.gasSeedTargetUsdc),
   });
@@ -204,6 +208,9 @@ export async function fundPocket(
   const bridgeTxs = await topUpPocket(
     {
       treasury,
+      // NOTE: uses cfg.usdc (the platform-global token). treasury_status.balance in entityPayment.ts
+      // instead reads `entity.treasuryConfig?.usdc ?? cfg.usdc` — the two token sources coincide today
+      // (onboarding sets treasuryConfig.usdc = cfg.usdc) but should not silently drift.
       usdc: cfg.usdc,
       pocketAddress: gateway.address,
       available: () => adapter.treasuryAvailable(treasury),
