@@ -128,6 +128,7 @@ function makeReader(
   }> = {},
 ) {
   const isAllowedCalls: Address[] = [];
+  const usdcBalanceOfCalls: [Address, Address][] = [];
   const reader: TreasuryReader = {
     treasuryAvailable: async () => over.available ?? 1_000_000n,
     treasuryPaused: async () => over.paused ?? false,
@@ -136,9 +137,12 @@ function makeReader(
       isAllowedCalls.push(who);
       return over.isAllowed ?? true;
     },
-    usdcBalanceOf: async () => over.balance ?? 0n,
+    usdcBalanceOf: async (usdc, owner) => {
+      usdcBalanceOfCalls.push([usdc, owner]);
+      return over.balance ?? 0n;
+    },
   };
-  return { reader, isAllowedCalls };
+  return { reader, isAllowedCalls, usdcBalanceOfCalls };
 }
 
 let db: Database.Database;
@@ -328,6 +332,35 @@ test("status: reads the four treasury fields plus the entity's configured cap", 
     float: "250000",
     balance: "123",
   });
+});
+
+test("status: sources the balance read from the entity's own treasury USDC, not the platform-global default", async () => {
+  const ENTITY_USDC: Address = "0x00000000000000000000000000000000009999";
+  const { reader, usdcBalanceOfCalls } = makeReader({ balance: 777n });
+  const svc = buildEntityPaymentService(makeConfig({ usdc: USDC }), {
+    reader,
+    ledger,
+    idempotency,
+    readPocketFloat: SUFFICIENT_FLOAT,
+  });
+  const entity = seedEntity({
+    treasuryConfig: {
+      usdc: ENTITY_USDC,
+      payoutAddress: "0x000000000000000000000000000000000000000E",
+      cap: 5_000_000n,
+      period: 86400n,
+      allowlistEnabled: false,
+    },
+  });
+
+  const status = await svc.status(entity);
+
+  expect(status.balance).toBe("777");
+  expect(usdcBalanceOfCalls).toHaveLength(1);
+  expect(usdcBalanceOfCalls[0]?.[0].toLowerCase()).toBe(ENTITY_USDC.toLowerCase());
+  expect(usdcBalanceOfCalls[0]?.[1].toLowerCase()).toBe(TREASURY.toLowerCase());
+  // Proves the divergence: the platform-global cfg.usdc was NOT what got queried.
+  expect(usdcBalanceOfCalls[0]?.[0].toLowerCase()).not.toBe(USDC.toLowerCase());
 });
 
 test("surprise-price: 402 demands more than the caller's amountUsdc ceiling, denied before authorize/sign, claim released", async () => {

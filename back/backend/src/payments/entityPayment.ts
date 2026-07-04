@@ -140,7 +140,7 @@ export function buildEntityPaymentService(
         deps.reader.treasuryPaused(treasury),
         deps.reader.treasuryAllowlistEnabled(treasury),
         readPocketFloat(entity),
-        deps.reader.usdcBalanceOf(cfg.usdc, treasury),
+        deps.reader.usdcBalanceOf(entity.treasuryConfig?.usdc ?? cfg.usdc, treasury),
       ]);
       const cap = entity.treasuryConfig?.cap ?? 0n;
       return {
