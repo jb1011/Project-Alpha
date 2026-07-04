@@ -19,10 +19,19 @@ async function proxy(
   const url = backendUrl(path, req.nextUrl.search);
 
   const headers = new Headers();
-  const auth = req.headers.get("authorization");
-  const contentType = req.headers.get("content-type");
-  if (auth) headers.set("authorization", auth);
-  if (contentType) headers.set("content-type", contentType);
+  // MCP Streamable HTTP requires accept/mcp-* headers end-to-end; the backend 406s without them.
+  const forwarded = [
+    "authorization",
+    "content-type",
+    "accept",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "last-event-id",
+  ];
+  for (const name of forwarded) {
+    const value = req.headers.get(name);
+    if (value) headers.set(name, value);
+  }
 
   const init: RequestInit = { method: req.method, headers };
   if (req.method !== "GET" && req.method !== "HEAD") {
@@ -30,17 +39,19 @@ async function proxy(
   }
 
   const res = await fetch(url, init);
-  const body = await res.arrayBuffer();
 
   const outHeaders: Record<string, string> = {};
   const ct = res.headers.get("content-type");
   if (ct) outHeaders["content-type"] = ct;
+  const sessionId = res.headers.get("mcp-session-id");
+  if (sessionId) outHeaders["mcp-session-id"] = sessionId;
   const joined = path?.join("/") ?? "";
   if (joined === "connection-package" || joined === "bootstrap-connection") {
     outHeaders["cache-control"] = "no-store";
   }
 
-  return new NextResponse(body, { status: res.status, headers: outHeaders });
+  // Stream the body through (SSE responses must not be buffered).
+  return new NextResponse(res.body, { status: res.status, headers: outHeaders });
 }
 
 export const GET = proxy;
