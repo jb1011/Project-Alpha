@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export interface PutResult {
@@ -21,13 +21,22 @@ export class FileDocumentStore implements DocumentStore {
     mkdirSync(this.root, { recursive: true });
   }
 
+  /** Resolve id under the doc root and reject any path that escapes it (traversal guard). */
+  private safePath(id: string): string {
+    const root = resolve(this.root);
+    const p = resolve(join(root, id));
+    if (p !== root && !p.startsWith(root + sep))
+      throw new Error(`document id escapes the store root: ${id}`);
+    return p;
+  }
+
   put(name: string, contents: string): PutResult {
-    const path = join(this.root, name);
+    const path = this.safePath(name);
     writeFileSync(path, contents, "utf8");
     return { id: name, path, uri: pathToFileURL(path).href };
   }
 
   get(id: string): string {
-    return readFileSync(join(this.root, id), "utf8");
+    return readFileSync(this.safePath(id), "utf8");
   }
 }
