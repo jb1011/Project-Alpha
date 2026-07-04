@@ -19,7 +19,8 @@ async function proxy(
   const url = backendUrl(path, req.nextUrl.search);
 
   const headers = new Headers();
-  // MCP Streamable HTTP requires accept/mcp-* headers end-to-end; the backend 406s without them.
+  // MCP Streamable HTTP requires accept/mcp-* headers end-to-end (the backend 406s without them);
+  // x402 requires x-payment end-to-end (the seller re-issues its 402 challenge without it).
   const forwarded = [
     "authorization",
     "content-type",
@@ -27,6 +28,7 @@ async function proxy(
     "mcp-session-id",
     "mcp-protocol-version",
     "last-event-id",
+    "x-payment",
   ];
   for (const name of forwarded) {
     const value = req.headers.get(name);
@@ -45,6 +47,9 @@ async function proxy(
   if (ct) outHeaders["content-type"] = ct;
   const sessionId = res.headers.get("mcp-session-id");
   if (sessionId) outHeaders["mcp-session-id"] = sessionId;
+  // x402 settlement id is returned to the buyer in x-payment-response.
+  const payResponse = res.headers.get("x-payment-response");
+  if (payResponse) outHeaders["x-payment-response"] = payResponse;
   const joined = path?.join("/") ?? "";
   if (joined === "connection-package" || joined === "bootstrap-connection") {
     outHeaders["cache-control"] = "no-store";
