@@ -89,3 +89,14 @@ test("list() surfaces entityId + capability (per-agent and tenant-wide)", () => 
   expect(boot?.entityId).toBeNull();
   expect(boot?.capability).toBe("spend");
 });
+
+test("list() defaults a legacy NULL capability row to 'spend'", () => {
+  const tenant = "0xLEGACY";
+  db.prepare(
+    "INSERT INTO api_keys (id, owner_tenant, hash, label, created_at, entity_id, capability, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+  ).run("legacy-1", tenant, "deadbeef", "legacy-key", Date.now(), null, null, null);
+
+  const rows = store.list(tenant);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.capability).toBe("spend");
+});
