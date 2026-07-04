@@ -1,4 +1,4 @@
-import { getAddress, isAddress } from "viem";
+import { getAddress, isAddress, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 import { usdToUnits } from "../policy/units";
@@ -13,6 +13,17 @@ const privKeySchema = z
   .string()
   .regex(/^0x[0-9a-fA-F]{64}$/, { message: "must be 0x + 64 hex chars" })
   .transform((s) => s as Hex);
+
+const etherSchema = z.string().refine(
+  (v) => {
+    try {
+      return parseEther(v) > 0n;
+    } catch {
+      return false;
+    }
+  },
+  { message: "must be a positive decimal amount (e.g. 0.05)" },
+);
 
 const DEV_JWT_SECRET = "dev-insecure-secret-change-me-please";
 
@@ -58,6 +69,8 @@ const EnvSchema = z.object({
     .transform((v) => v === "true"),
   MCP_PUBLIC_URL: z.string().default("http://localhost:8789/mcp"),
   METADATA_BASE_URL: z.string().url().default("http://localhost:8789"),
+  GAS_SEED_FLOOR_USDC: etherSchema.default("0.05"),
+  GAS_SEED_TARGET_USDC: etherSchema.default("0.2"),
   ENABLE_X402_DEMO: z
     .string()
     .optional()
@@ -122,6 +135,8 @@ export interface Config {
   jobSweepToTreasury: boolean;
   mcpPublicUrl: string;
   metadataBaseUrl: string;
+  gasSeedFloorUsdc: string;
+  gasSeedTargetUsdc: string;
   enableX402Demo: boolean;
   x402DemoPayTo: Address;
   x402DemoPriceUsdc: string;
@@ -188,6 +203,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
     mcpPublicUrl: e.MCP_PUBLIC_URL,
     metadataBaseUrl: e.METADATA_BASE_URL,
+    gasSeedFloorUsdc: e.GAS_SEED_FLOOR_USDC,
+    gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,
     x402DemoPayTo:
       e.X402_DEMO_PAYTO ?? (privateKeyToAccount(e.PLATFORM_PRIVATE_KEY).address as Address),
@@ -213,6 +230,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       throw new Error(
         "Invalid config: METADATA_BASE_URL must be an https, non-loopback URL in production (it is baked permanently on-chain)",
       );
+  }
+
+  if (parseEther(cfg.gasSeedFloorUsdc) >= parseEther(cfg.gasSeedTargetUsdc)) {
+    throw new Error("Invalid config: GAS_SEED_FLOOR_USDC must be less than GAS_SEED_TARGET_USDC");
   }
 
   return cfg;

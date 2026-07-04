@@ -1,9 +1,10 @@
 // backend/src/agent/liveRunner.ts
 import Anthropic from "@anthropic-ai/sdk";
 import Database from "better-sqlite3";
-import { http, type WalletClient, createPublicClient, createWalletClient } from "viem";
+import { http, type WalletClient, createPublicClient, createWalletClient, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
+import { managerWalletClient } from "../adapters/arc/clients";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
@@ -13,6 +14,7 @@ import { chainFor } from "../chains";
 import { type Config, loadConfig } from "../config/env";
 import { authorizePayment } from "../payments/authority";
 import { topUpPocket } from "../payments/funding";
+import { ensureNativeGas } from "../payments/gasSeeder";
 import { PaymentLedger } from "../payments/ledger";
 import { sweepPocketToTreasury } from "../payments/pocketFloat";
 import { buildPaywall } from "../payments/seller";
@@ -184,6 +186,21 @@ export async function fundPocket(
   const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
   const operatorAddress = operatorWallet.account?.address;
   if (!operatorAddress) throw new Error("fundPocket: operator wallet has no account address");
+
+  const managerWallet = managerWalletClient(cfg);
+  const seedTxs = await ensureNativeGas([operatorAddress, gateway.address], {
+    getBalance: (addr) => pub.getBalance({ address: addr }),
+    sendNative: (to, value) =>
+      managerWallet.sendTransaction({
+        to,
+        value,
+        account: managerWallet.account!,
+        chain: managerWallet.chain,
+      }),
+    floor: parseEther(cfg.gasSeedFloorUsdc),
+    target: parseEther(cfg.gasSeedTargetUsdc),
+  });
+
   const bridgeTxs = await topUpPocket(
     {
       treasury,
@@ -197,7 +214,7 @@ export async function fundPocket(
     },
     floatAtomic,
   );
-  return bridgeTxs;
+  return [...seedTxs, ...bridgeTxs];
 }
 
 /** Live composition root: wire real funding + agent + settled sell into a single runner. */
