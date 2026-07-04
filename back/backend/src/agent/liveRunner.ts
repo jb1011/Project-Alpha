@@ -184,29 +184,20 @@ export async function fundPocket(
   const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
   const operatorAddress = operatorWallet.account?.address;
   if (!operatorAddress) throw new Error("fundPocket: operator wallet has no account address");
-  const txs: Hex[] = [];
-  await topUpPocket(
+  const bridgeTxs = await topUpPocket(
     {
       treasury,
       usdc: cfg.usdc,
       pocketAddress: gateway.address,
       available: () => adapter.treasuryAvailable(treasury),
       operatorUsdcBalance: () => adapter.usdcBalanceOf(cfg.usdc, operatorAddress),
-      fundOperator: async (t, a) => {
-        const h = await adapter.fundOperator(t, a);
-        txs.push(h);
-        return h;
-      },
-      operatorTransferUsdc: async (u, to, a) => {
-        const h = await adapter.operatorTransferUsdc(u, to, a);
-        txs.push(h);
-        return h;
-      },
+      fundOperator: (t, a) => adapter.fundOperator(t, a),
+      operatorTransferUsdc: (u, to, a) => adapter.operatorTransferUsdc(u, to, a),
       depositToGateway: (amt) => gateway.deposit(amt),
     },
     floatAtomic,
   );
-  return txs;
+  return bridgeTxs;
 }
 
 /** Live composition root: wire real funding + agent + settled sell into a single runner. */

@@ -10,7 +10,7 @@ export interface FundingDeps {
   fundOperator: (treasury: Address, amount: bigint) => Promise<Hex>; // enclave-sent
   operatorUsdcBalance: () => Promise<bigint>; // operator EOA's USDC balance — confirms fundOperator propagated
   operatorTransferUsdc: (usdc: Address, to: Address, amount: bigint) => Promise<Hex>; // enclave-sent
-  depositToGateway: (amountUsdc: string) => Promise<unknown>; // pocket-signed (free)
+  depositToGateway: (amountUsdc: string) => Promise<Hex>; // pocket-signed (free)
 }
 
 /** Tuning for the read-after-write balance poll between the fund and forward legs (overridable in tests). */
@@ -56,11 +56,11 @@ export async function topUpPocket(
   d: FundingDeps,
   amount: bigint,
   opts: TopUpOptions = {},
-): Promise<void> {
+): Promise<Hex[]> {
   if (amount <= 0n) throw new Error("top-up amount must be positive");
   const available = await d.available();
   if (amount > available) throw new Error(`top-up ${amount} exceeds available ${available}`);
-  await d.fundOperator(d.treasury, amount);
+  const fundHash = await d.fundOperator(d.treasury, amount);
   await awaitOperatorFunded(
     d.operatorUsdcBalance,
     amount,
@@ -68,6 +68,7 @@ export async function topUpPocket(
     opts.pollDelayMs ?? DEFAULT_POLL_DELAY_MS,
     opts.sleep ?? defaultSleep,
   );
-  await d.operatorTransferUsdc(d.usdc, d.pocketAddress, amount);
-  await d.depositToGateway(formatUnits(amount, 6));
+  const forwardHash = await d.operatorTransferUsdc(d.usdc, d.pocketAddress, amount);
+  const depositHash = await d.depositToGateway(formatUnits(amount, 6));
+  return [fundHash, forwardHash, depositHash];
 }
