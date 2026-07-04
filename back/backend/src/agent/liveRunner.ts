@@ -13,7 +13,7 @@ import { makeSignX402 } from "../adapters/x402/signX402";
 import { chainFor } from "../chains";
 import { type Config, loadConfig } from "../config/env";
 import { authorizePayment } from "../payments/authority";
-import { topUpPocket } from "../payments/funding";
+import { shouldSkipFundOperator, topUpPocket } from "../payments/funding";
 import { ensureNativeGas } from "../payments/gasSeeder";
 import { PaymentLedger } from "../payments/ledger";
 import { sweepPocketToTreasury } from "../payments/pocketFloat";
@@ -211,7 +211,7 @@ export async function fundPocket(
   // amount/2 margin cleanly distinguishes "seeded only" from "seeded + credit".
   const seedTargetAtomic = usdToUnits(cfg.gasSeedTargetUsdc);
   const operatorBalance = await adapter.usdcBalanceOf(cfg.usdc, operatorAddress);
-  const skipFundOperator = operatorBalance >= seedTargetAtomic + floatAtomic / 2n;
+  const skipFundOperator = shouldSkipFundOperator(operatorBalance, seedTargetAtomic, floatAtomic);
 
   const bridgeTxs = await topUpPocket(
     {

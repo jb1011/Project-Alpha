@@ -28,6 +28,21 @@ const DEFAULT_POLL_ATTEMPTS = 12;
 const DEFAULT_POLL_DELAY_MS = 1_500;
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** Retry-safety guard: true when the operator already holds the fundOperator credit (a re-run
+ *  completing a partial bridge), so the treasury must NOT be pulled again. `operatorBalance` and
+ *  `seedTargetAtomic` are 6-dec atomic USDC; the seed lands the operator at exactly seedTargetAtomic,
+ *  and a landed credit pushes it to ~seedTargetAtomic + amount (minus small gas). The amount/2 margin
+ *  separates the two while tolerating gas — but note it FALSE-NEGATIVES (re-pulls) for tiny amounts
+ *  where gas erodes more than amount/2 (roughly amount < ~2x forward gas); acceptable per the design's
+ *  documented partial-state limitation, and it over-funds only the agent's own float within cap. */
+export function shouldSkipFundOperator(
+  operatorBalance: bigint,
+  seedTargetAtomic: bigint,
+  amount: bigint,
+): boolean {
+  return operatorBalance >= seedTargetAtomic + amount / 2n;
+}
+
 /** Retry `fn` on a transient read-after-write revert (a lagging RPC eth_call seeing stale balance).
  *  Retry is scoped to insufficient-balance reverts ONLY — those mean the tx moved no funds (a
  *  pre-write simulate revert, or a no-op on-chain revert), so a retry cannot double-spend. A tx that
@@ -49,7 +64,7 @@ export async function retryOnStaleBalance<T>(
       await opts.sleep(opts.delayMs);
     }
   }
-  throw last;
+  throw last ?? new Error("retryOnStaleBalance: attempts must be >= 1");
 }
 
 /**
