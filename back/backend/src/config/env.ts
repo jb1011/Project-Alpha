@@ -56,6 +56,7 @@ const EnvSchema = z.object({
     .optional()
     .transform((v) => v === "true"),
   MCP_PUBLIC_URL: z.string().default("http://localhost:8789/mcp"),
+  METADATA_BASE_URL: z.string().url().default("http://localhost:8789"),
 });
 
 export interface Config {
@@ -100,6 +101,7 @@ export interface Config {
   jobEvaluatorPrivateKey?: Hex;
   jobSweepToTreasury: boolean;
   mcpPublicUrl: string;
+  metadataBaseUrl: string;
 }
 
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
@@ -162,6 +164,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     jobEvaluatorPrivateKey: e.JOB_EVALUATOR_PRIVATE_KEY,
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
     mcpPublicUrl: e.MCP_PUBLIC_URL,
+    metadataBaseUrl: e.METADATA_BASE_URL,
   };
 
   // Fail-closed: never let production boot with the insecure dev defaults.
@@ -171,6 +174,18 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (cfg.webOrigin === "*")
       throw new Error(
         "Invalid config: WEB_ORIGIN must be an explicit origin (not '*') in production",
+      );
+    const mbu = new URL(cfg.metadataBaseUrl);
+    const loopback =
+      mbu.hostname === "localhost" ||
+      mbu.hostname.endsWith(".localhost") ||
+      mbu.hostname === "0.0.0.0" ||
+      mbu.hostname === "::1" ||
+      mbu.hostname === "[::1]" ||
+      mbu.hostname.startsWith("127.");
+    if (mbu.protocol !== "https:" || loopback)
+      throw new Error(
+        "Invalid config: METADATA_BASE_URL must be an https, non-loopback URL in production (it is baked permanently on-chain)",
       );
   }
 
