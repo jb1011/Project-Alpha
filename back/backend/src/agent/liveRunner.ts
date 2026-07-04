@@ -5,6 +5,7 @@ import { http, type WalletClient, createPublicClient, createWalletClient, parseE
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { managerWalletClient } from "../adapters/arc/clients";
+import { USDC_TRANSFER_GAS } from "../adapters/arc/gas";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
@@ -302,7 +303,8 @@ export async function buildLiveAgentRunner(
           functionName: "transfer",
           args: [to, amount],
         });
-        const hash = await pocketWallet.writeContract(request);
+        // Explicit gas (see USDC_TRANSFER_GAS): sweeps ~the pocket's whole USDC balance.
+        const hash = await pocketWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
         await pub.waitForTransactionReceipt({ hash });
         return hash;
       },

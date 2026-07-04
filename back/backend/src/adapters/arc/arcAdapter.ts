@@ -6,6 +6,7 @@ import {
   legalManagerFactoryAbi,
 } from "../../abis/generated";
 import type { TreasuryConfig } from "../../types";
+import { USDC_TRANSFER_GAS } from "./gas";
 
 /** Minimal ERC-20 transfer fragment for funding the treasury vault with USDC. */
 const erc20TransferAbi = [
@@ -234,7 +235,9 @@ export class ArcAdapter {
       args: [p.treasury, p.amount],
       account: this.d.managerWallet.account!,
     });
-    const txHash = await this.d.managerWallet.writeContract(request);
+    // Explicit gas (see USDC_TRANSFER_GAS): the manager wallet is well-funded today, but this keeps
+    // the near-full-balance estimateGas footgun from biting if it ever runs low.
+    const txHash = await this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
     await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
     return txHash;
   }
@@ -264,7 +267,9 @@ export class ArcAdapter {
       functionName: "transfer",
       args: [to, amount],
     });
-    const hash = await operatorWallet.writeContract(request);
+    // Explicit gas so viem skips the fee-fielded eth_estimateGas footgun (see USDC_TRANSFER_GAS);
+    // simulateContract above uses a plain eth_call, which is unaffected.
+    const hash = await operatorWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
     await this.d.publicClient.waitForTransactionReceipt({ hash });
     return hash;
   }
