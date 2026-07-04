@@ -117,6 +117,7 @@ async function main() {
     jwtTtlSec: cfg.authJwtTtlSec,
     platformManagerAddress,
     repo,
+    docStore,
     runner,
     passkeyRpId: cfg.passkeyRpId,
     apiKeys,
