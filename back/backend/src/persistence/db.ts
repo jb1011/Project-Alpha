@@ -204,8 +204,7 @@ export function migrate(db: Database.Database): void {
   const pkCols = (db.prepare("PRAGMA table_info(passkeys)").all() as { name: string }[]).map(
     (c) => c.name,
   );
-  if (!pkCols.includes("revoked_at"))
-    db.exec("ALTER TABLE passkeys ADD COLUMN revoked_at INTEGER");
+  if (!pkCols.includes("revoked_at")) db.exec("ALTER TABLE passkeys ADD COLUMN revoked_at INTEGER");
 
   const plCols = (db.prepare("PRAGMA table_info(payments_ledger)").all() as { name: string }[]).map(
     (c) => c.name,
