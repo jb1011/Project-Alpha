@@ -19,7 +19,12 @@ const CHAIN = 5042002;
 const PK: GuardianPasskey = {
   authenticatorName: "Test Key",
   challenge: "Y2hhbGxlbmdl",
-  attestation: { credentialId: "cred-1", clientDataJson: "e30=", attestationObject: "o2M=", transports: ["internal"] },
+  attestation: {
+    credentialId: "cred-1",
+    clientDataJson: "e30=",
+    attestationObject: "o2M=",
+    transports: ["internal"],
+  },
 };
 
 let db: Database.Database;
@@ -28,7 +33,10 @@ let apiKeys: SqliteApiKeyStore;
 let passkeys: SqlitePasskeyStore;
 
 function makeApp() {
-  const runner = new OnboardingRunner({ repo, runSaga: async (i) => repo.findByIdempotencyKey(i.idempotencyKey)! });
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: async (i) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+  });
   return buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),
@@ -47,9 +55,22 @@ function makeApp() {
 
 async function login(app: ReturnType<typeof buildApiApp>) {
   const nonce = (await (await app.request("/auth/nonce")).json()).nonce as string;
-  const message = createSiweMessage({ address: account.address, chainId: CHAIN, domain: DOMAIN, nonce, uri: `https://${DOMAIN}`, version: "1" });
+  const message = createSiweMessage({
+    address: account.address,
+    chainId: CHAIN,
+    domain: DOMAIN,
+    nonce,
+    uri: `https://${DOMAIN}`,
+    version: "1",
+  });
   const signature = await account.signMessage({ message });
-  const body = await (await app.request("/auth/verify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message, signature }) })).json();
+  const body = await (
+    await app.request("/auth/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message, signature }),
+    })
+  ).json();
   return body.token as string;
 }
 
@@ -76,10 +97,16 @@ test("DELETE /passkeys/:id revokes (get() then excludes it); unknown → 404", a
   const app = makeApp();
   const jwt = await login(app);
   const id = passkeys.store(account.address, PK);
-  const ok = await app.request(`/passkeys/${id}`, { method: "DELETE", headers: { Authorization: `Bearer ${jwt}` } });
+  const ok = await app.request(`/passkeys/${id}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${jwt}` },
+  });
   expect(ok.status).toBe(204);
   expect(passkeys.get(account.address, id)).toBeNull(); // revoked → onboard/bootstrap reject it
-  const gone = await app.request(`/passkeys/${id}`, { method: "DELETE", headers: { Authorization: `Bearer ${jwt}` } });
+  const gone = await app.request(`/passkeys/${id}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${jwt}` },
+  });
   expect(gone.status).toBe(404);
 });
 
