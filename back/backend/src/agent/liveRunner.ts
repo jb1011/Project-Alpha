@@ -205,6 +205,14 @@ export async function fundPocket(
     target: parseEther(cfg.gasSeedTargetUsdc),
   });
 
+  // Retry-safety (#32): if the operator already holds the fundOperator credit (a re-run completing a
+  // partial bridge), skip re-pulling from the treasury. The gas-seed lands the operator at
+  // gasSeedTarget; a landed credit pushes it to ~gasSeedTarget + amount (minus small gas), so the
+  // amount/2 margin cleanly distinguishes "seeded only" from "seeded + credit".
+  const seedTargetAtomic = usdToUnits(cfg.gasSeedTargetUsdc);
+  const operatorBalance = await adapter.usdcBalanceOf(cfg.usdc, operatorAddress);
+  const skipFundOperator = operatorBalance >= seedTargetAtomic + floatAtomic / 2n;
+
   const bridgeTxs = await topUpPocket(
     {
       treasury,
@@ -220,6 +228,7 @@ export async function fundPocket(
       depositToGateway: (amt) => gateway.deposit(amt),
     },
     floatAtomic,
+    { skipFundOperator },
   );
   return [...seedTxs, ...bridgeTxs];
 }

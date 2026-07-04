@@ -132,3 +132,11 @@ test("topUpPocket retries the forward when it transiently reverts on a stale-bal
   expect(calls).toBe(2);
   expect(hashes).toEqual(["0xfund", "0xxfer", "0xdeposit"]);
 });
+
+test("skipFundOperator skips the treasury pull + cap check and returns [forward, deposit]", async () => {
+  const d = deps({ fundOperator: vi.fn(async () => "0xfund" as const) });
+  const hashes = await topUpPocket(d, 250_000n, { sleep: noSleep, skipFundOperator: true });
+  expect(d.fundOperator).not.toHaveBeenCalled();
+  expect(d.operatorTransferUsdc).toHaveBeenCalledWith(usdc, pocket, 250_000n);
+  expect(hashes).toEqual(["0xxfer", "0xdeposit"]);
+});

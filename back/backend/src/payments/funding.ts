@@ -18,6 +18,10 @@ export interface TopUpOptions {
   pollAttempts?: number; // how many times to read the operator balance before giving up
   pollDelayMs?: number; // wait between reads
   sleep?: (ms: number) => Promise<void>; // injectable so tests don't spend real wall-clock
+  /** When true, the operator already holds the fundOperator credit (a retry completing a partial
+   *  bridge) — skip fundOperator + the cap check + awaitOperatorFunded so the treasury isn't
+   *  double-pulled. Returns [forward, deposit] (2 hashes) instead of [fundOperator, forward, deposit]. */
+  skipFundOperator?: boolean;
 }
 
 const DEFAULT_POLL_ATTEMPTS = 12;
@@ -82,13 +86,17 @@ export async function topUpPocket(
   opts: TopUpOptions = {},
 ): Promise<Hex[]> {
   if (amount <= 0n) throw new Error("top-up amount must be positive");
-  const available = await d.available();
-  if (amount > available) throw new Error(`top-up ${amount} exceeds available ${available}`);
   const attempts = opts.pollAttempts ?? DEFAULT_POLL_ATTEMPTS;
   const delayMs = opts.pollDelayMs ?? DEFAULT_POLL_DELAY_MS;
   const sleep = opts.sleep ?? defaultSleep;
-  const fundHash = await d.fundOperator(d.treasury, amount);
-  await awaitOperatorFunded(d.operatorUsdcBalance, amount, attempts, delayMs, sleep);
+  const bridge: Hex[] = [];
+  if (!opts.skipFundOperator) {
+    const available = await d.available();
+    if (amount > available) throw new Error(`top-up ${amount} exceeds available ${available}`);
+    const fundHash = await d.fundOperator(d.treasury, amount);
+    await awaitOperatorFunded(d.operatorUsdcBalance, amount, attempts, delayMs, sleep);
+    bridge.push(fundHash);
+  }
   const forwardHash = await retryOnStaleBalance(
     () => d.operatorTransferUsdc(d.usdc, d.pocketAddress, amount),
     { attempts, delayMs, sleep },
@@ -98,5 +106,6 @@ export async function topUpPocket(
     delayMs,
     sleep,
   });
-  return [fundHash, forwardHash, depositHash];
+  bridge.push(forwardHash, depositHash);
+  return bridge;
 }
