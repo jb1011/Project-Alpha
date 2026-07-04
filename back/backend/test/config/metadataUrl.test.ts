@@ -20,6 +20,16 @@ test("prod rejects a loopback METADATA_BASE_URL", () => {
   ).toThrow(/METADATA_BASE_URL/);
 });
 
+test("prod rejects an https loopback METADATA_BASE_URL", () => {
+  expect(() =>
+    loadConfig({
+      ...baseEnv,
+      NODE_ENV: "production",
+      METADATA_BASE_URL: "https://localhost:8789",
+    }),
+  ).toThrow(/METADATA_BASE_URL/);
+});
+
 test("prod rejects a non-https METADATA_BASE_URL", () => {
   expect(() =>
     loadConfig({

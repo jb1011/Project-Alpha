@@ -22,6 +22,7 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
     }
     c.header("Content-Type", "application/json");
     c.header("Cache-Control", "public, max-age=300");
+    c.header("X-Content-Type-Options", "nosniff");
     return c.body(body);
   });
 }

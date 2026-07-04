@@ -180,7 +180,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       mbu.hostname === "localhost" ||
       mbu.hostname.endsWith(".localhost") ||
       mbu.hostname === "0.0.0.0" ||
-      mbu.hostname === "::1" ||
       mbu.hostname === "[::1]" ||
       mbu.hostname.startsWith("127.");
     if (mbu.protocol !== "https:" || loopback)
