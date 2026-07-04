@@ -70,3 +70,22 @@ test("mint with no opts stays tenant-wide with default capability (back-compat)"
     capability: "spend",
   });
 });
+
+test("list() surfaces entityId + capability (per-agent and tenant-wide)", () => {
+  const tenant = "0xTEN";
+  store.mint(tenant, {
+    entityId: `${tenant}:agent-1`,
+    capability: "read",
+    label: `connect:${tenant}:agent-1`,
+  });
+  store.mint(tenant, { capability: "spend", label: "bootstrap:pk-1" }); // tenant-wide: no entityId
+  const rows = store.list(tenant);
+
+  const connect = rows.find((r) => r.label === `connect:${tenant}:agent-1`);
+  expect(connect?.entityId).toBe(`${tenant}:agent-1`);
+  expect(connect?.capability).toBe("read");
+
+  const boot = rows.find((r) => r.label === "bootstrap:pk-1");
+  expect(boot?.entityId).toBeNull();
+  expect(boot?.capability).toBe("spend");
+});
