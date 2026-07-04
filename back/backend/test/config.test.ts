@@ -52,6 +52,7 @@ test("production + real secret + explicit WEB_ORIGIN does not throw", () => {
       ...prodBase,
       AUTH_JWT_SECRET: "a-real-secret-that-is-long-enough-for-prod",
       WEB_ORIGIN: "https://app.example.com",
+      METADATA_BASE_URL: "https://app.example.com",
     }),
   ).not.toThrow();
 });
