@@ -40,6 +40,7 @@ export function buildCli(
         arc: ctx.arc,
         operatorSigner: ctx.operatorSigner,
         usdc: ctx.cfg.usdc,
+        metadataBaseUrl: ctx.cfg.metadataBaseUrl,
         fundAmount: opts.fund ? usdToUnits(opts.fund) : undefined,
       });
       console.log(

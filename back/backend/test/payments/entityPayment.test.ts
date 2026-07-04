@@ -50,6 +50,7 @@ function makeConfig(over: Partial<Config> = {}): Config {
     jobEvaluatorPrivateKey: undefined,
     jobSweepToTreasury: false,
     mcpPublicUrl: "http://localhost:8789/mcp",
+    metadataBaseUrl: "http://localhost:8789",
     ...over,
   };
 }

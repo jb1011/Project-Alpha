@@ -52,4 +52,6 @@ export interface EntityRecord {
   specJson?: string | null;
   /** Off-chain per-transaction USDC cap in base units (6 decimals). null = no cap. */
   perTxCap?: bigint | null;
+  /** Opaque public slug; the on-chain metadataURI is METADATA_BASE_URL/metadata/<publicId>. */
+  publicId?: string | null;
 }

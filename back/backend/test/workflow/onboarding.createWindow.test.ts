@@ -92,6 +92,7 @@ const deps = (arc: ArcAdapter) => ({
   usdc: "0x3600000000000000000000000000000000000000" as `0x${string}`,
   ownerTenantId: "t1",
   specJson: JSON.stringify(spec),
+  metadataBaseUrl: "https://host.example/backend",
 });
 
 test("happy path: broadcasts once, persists the create tx hash, ends bound", async () => {
@@ -105,6 +106,13 @@ test("happy path: broadcasts once, persists the create tx hash, ends bound", asy
   // the create tx hash is persisted on the final record (and was written at the 'translating' step).
   expect(rec.createTxHash).toBe("0xcreate0");
   expect(repo.findByIdempotencyKey("win-A")?.createTxHash).toBe("0xcreate0");
+  // Public metadataURI: minted publicId, not a file:// path, and matches what was broadcast on-chain.
+  expect(rec.metadataURI).toMatch(/^https:\/\/host\.example\/backend\/metadata\/[0-9a-f-]{36}$/);
+  expect(rec.metadataURI).not.toContain("file://");
+  expect(rec.publicId).toBeTruthy();
+  expect(arc.broadcastCreateEntity).toHaveBeenCalledWith(
+    expect.objectContaining({ metadataURI: rec.metadataURI }),
+  );
 });
 
 test("keystone: a crash between broadcast and confirm resumes by ADOPTING the tx, never re-minting", async () => {

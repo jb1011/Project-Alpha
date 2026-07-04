@@ -59,7 +59,6 @@ export interface AgentMetadata {
   version: string;
   legalBody: {
     jurisdiction: string;
-    ein: string;
     formationDate: number;
     oaHash: Hex;
   };
@@ -81,7 +80,6 @@ export function renderMetadata(spec: AgentSpec, r: TranslateResult, oaHash: Hex)
     version: spec.metadata.version,
     legalBody: {
       jurisdiction: spec.jurisdiction,
-      ein: r.legal.ein,
       formationDate: r.legal.formationDate,
       oaHash,
     },

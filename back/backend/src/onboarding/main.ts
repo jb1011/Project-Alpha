@@ -70,6 +70,7 @@ async function main() {
       arc,
       operatorSigner,
       usdc: cfg.usdc,
+      metadataBaseUrl: cfg.metadataBaseUrl,
       guardianPasskey,
       provision,
       signerForEntity,

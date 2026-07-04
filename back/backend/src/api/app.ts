@@ -8,6 +8,7 @@ import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
 import { mountConnectionRoutes } from "./routes/connection";
 import { mountJobRoutes } from "./routes/jobs";
+import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
 import { mountPerTxCapRoutes } from "./routes/perTxCap";
@@ -32,6 +33,7 @@ export interface ApiDeps {
   /** Injectable clock (ms) for tests; defaults to Date.now. */
   now?: () => number;
   repo: import("../persistence/entityRepository").EntityRepository;
+  docStore: import("../persistence/documentStore").DocumentStore;
   runner: import("../workflow/runner").OnboardingRunner;
   passkeyRpId: string;
   apiKeys: import("../persistence/apiKeyStore").ApiKeyStore;
@@ -62,10 +64,17 @@ export interface ApiDeps {
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
 export function buildApiApp(deps: ApiDeps) {
   const app = new Hono<{ Variables: AuthVars }>();
-  app.use("*", cors({ origin: deps.webOrigin, allowHeaders: ["authorization", "content-type"] }));
+  app.use(
+    "*",
+    cors({
+      origin: (_origin, c) => (c.req.path.startsWith("/metadata/") ? "*" : deps.webOrigin),
+      allowHeaders: ["authorization", "content-type"],
+    }),
+  );
   app.onError(apiOnError);
   app.get("/healthz", (c) => c.json({ ok: true }));
   mountSchemaRoutes(app);
+  mountMetadataRoutes(app, deps);
   mountAuthRoutes(app, deps);
   mountPasskeyRoutes(app, deps);
   app.use("/onboard", requireAuth(deps.jwtSecret));
