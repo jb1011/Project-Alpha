@@ -51,6 +51,12 @@ Open [http://localhost:3000](http://localhost:3000).
 - **Turnkey** — non-custodial passkey-secured signing for the agent operator key
 - **Wyoming DAO LLC** — legal wrapper; law-to-code binding between the operating agreement and on-chain rules
 
+## Team
+
+- [**MBarralDevs**](https://github.com/MBarralDevs) (Martin · MartinBrl on Discord) — smart contracts, backend, MCP server
+- [**jb1011**](https://github.com/jb1011) (JB · Helix on Discord) — frontend, monorepo & platform
+- [**XanDev3**](https://github.com/XanDev3) (Alex · Vertiaz on Discord) — backend testing & hardening, eng-ops
+
 ## Hackathon links
 
 |              |                                                                                                                           |
