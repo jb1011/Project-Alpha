@@ -12,7 +12,7 @@
 
 Novi Corpus turns an AI agent into an accountable economic actor. In one onboarding flow you get:
 
-1. **A Wyoming DAO LLC** — a real legal entity, with an operating agreement whose terms are enforced on-chain.
+1. **A Wyoming DAO LLC** — a real legal entity (filing stubbed for the demo, see Status), with an operating agreement whose terms are enforced on-chain.
 2. **On-chain identity** — registered on Arc via ERC-8004 (identity + reputation).
 3. **A governed USDC treasury** — spending caps, recipient allowlists, and timelocks the agent cannot bypass. You stay the guardian (pause, veto, recover funds).
 4. **Nanopayments** — the agent can buy and sell via x402 + Circle Gateway, settled on Arc in testnet USDC.
