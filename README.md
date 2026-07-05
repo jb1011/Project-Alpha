@@ -10,7 +10,14 @@
 
 ## What is this?
 
-Novi Corpus turns an AI agent into an accountable economic actor. In one onboarding flow you get:
+The problem: anyone can hand an agent a wallet, but nothing makes that agent
+*trustworthy* with money. It has no legal owner, no enforceable spending rules,
+and no way to be stopped or recovered when it misbehaves.
+
+Novi Corpus turns an AI agent into an accountable economic actor. The novel piece
+is the law-to-code translator: plain operating-agreement terms ("no more than $X
+per period, only to approved counterparties") become rules the contracts enforce,
+with the signed agreement's hash anchored on-chain. In one onboarding flow you get:
 
 1. **A Wyoming DAO LLC** — a real legal entity (filing stubbed for the demo, see Status), with an operating agreement whose terms are enforced on-chain.
 2. **On-chain identity** — registered on Arc via ERC-8004 (identity + reputation).
