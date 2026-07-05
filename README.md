@@ -19,6 +19,41 @@ Novi Corpus turns an AI agent into an accountable economic actor. In one onboard
 
 The agent operates autonomously _within_ the rules you set. You keep ultimate control.
 
+## How it fits together
+
+```
+   ┌───────────────────┐                     ┌────────────────────┐
+   │  Human controller │                     │  AI agent          │
+   │  (guardian)       │                     │  (Turnkey op key)  │
+   └─────────┬─────────┘                     └──────────┬─────────┘
+             │ onboarding wizard                        │
+             ▼                                          │
+   ┌───────────────────┐                                │
+   │ interface/        │                                │
+   │ Next.js app       │                                │
+   └─────────┬─────────┘                                │
+             ▼                                          │
+   ┌───────────────────┐                                │
+   │ back/backend      │                                │
+   │ "the brain"       │                                │
+   └─────────┬─────────┘                                │
+             │ createEntity                             │ spends within
+             ▼                                          │ limits
+   ┌─────────────────────────────────────────┐          │
+   │ Arc testnet (USDC native gas)           │          │
+   │                                         │          │
+   │  LegalManagerFactory                    │          │
+   │     ├─► LegalManager                    │          │
+   │     │   agreement hash · rules ◄········│··· pause / veto / sweep
+   │     │   · timelock                      │    (human controller)
+   │     └─► AgentTreasury ◄─────────────────│──────────┘
+   │         caps + allowlist                │
+   │              │                          │
+   │              ▼ x402 + Circle Gateway    │
+   │         agentic payments                │
+   └─────────────────────────────────────────┘
+```
+
 ## Repo layout
 
 ```
