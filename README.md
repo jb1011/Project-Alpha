@@ -4,7 +4,7 @@
 
 > Anyone can give an agent a wallet. We give it a **legal owner** — so it can hold money safely, pay for services, earn revenue, and be trusted by humans and other agents.
 
-**Live demo:** [project-alpha-pi.vercel.app](https://project-alpha-pi.vercel.app)
+**Live demo:** [project-alpha-pi.vercel.app](https://project-alpha-pi.vercel.app) · **Demo video:** [watch on YouTube](https://www.youtube.com/watch?v=MYlPFlUzvhg)
 
 ---
 
