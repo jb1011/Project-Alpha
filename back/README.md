@@ -1,28 +1,14 @@
-# Agent Legal Body
+# Novi Corpus — contracts & backend (`back/`)
 
-> Working name. Giving autonomous AI agents a real **legal body** so they can own assets, get paid,
-> and act as accountable economic actors — without a human behind every signature.
+The on-chain and server half of [Novi Corpus](../README.md): the Solidity contracts
+(Foundry project at this directory's root) and the TypeScript backend "brain"
+(`backend/`) that drives onboarding, policy, payments, and the MCP server. For the
+pitch, team, demo link, and hackathon context, see the [root README](../README.md).
 
-A developer brings an AI agent; in one workflow we give it: a **legal entity** (Wyoming LLC), an
-**on-chain identity** (ERC-8004), and a **USDC treasury governed by hard, on-chain spending rules** —
-wired into the **Circle Agent Stack** and settled on **Arc** (Circle's L1, chain ID 5042002, where
-USDC is the native gas token).
-
-The agent is a **bounded operator**: it spends autonomously *within* limits it cannot exceed (cap per
-period + approved-recipient allowlist), while a **human controller** stays in ultimate control
-(pause / veto / key-rotate / sweep-to-safety). That human is also the legally-required, KYC'd
-controller-of-record that keeps the entity alive — see the legal model note below.
-
-## What can an agent not do without this?
-A raw key already lets an agent move USDC. What it *can't* do is be **trusted** with money: spend
-under limits it physically cannot break, be stopped/recovered when it misbehaves, have an accountable
-legal owner, and carry a verifiable identity counterparties can rely on. This project is that missing
-trust-and-safety layer for agentic commerce.
-
-> 📦 **This is the `back/` half of the [Project-Alpha](https://github.com/jb1011/Project-Alpha) monorepo**
-> (the frontend lives in `interface/`; live demo: https://project-alpha-pi.vercel.app). The backend's full
-> commit-by-commit engineering history — 30+ TDD/audit commits — is preserved in the archived source repo:
-> **[ArcXBayernMeca/ProjectAlpha](https://github.com/ArcXBayernMeca/ProjectAlpha)** (read-only).
+The agent is a **bounded operator**: it spends autonomously *within* limits it cannot
+exceed (rolling cap + approved-recipient allowlist), while a **human controller** stays
+in ultimate control (pause / veto / key-rotate / sweep-to-safety). That human is also the
+legally required, KYC'd controller-of-record — see the legal model note below.
 
 ## Architecture in one picture
 - **`LegalManagerFactory`** — entry point; `createEntity()` mints the agent's ERC-8004 identity and
@@ -48,27 +34,30 @@ money-transmitter licensing.
   test/                Foundry tests (unit + fuzz + invariant + security)
   script/              deploy scripts
   addresses.arc-testnet.json   deployed addresses (machine-readable)
-backend/               TypeScript "brain": the onboarding orchestrator + CLI
+backend/               TypeScript "brain": onboarding, policy, payments, agent, MCP
   src/                 config, persistence, policy (translator), oa generator,
-                       adapters (arc/viem, turnkey), workflow (onboarding saga), cli
+                       adapters (arc/viem, turnkey), workflow (onboarding saga),
+                       api + mcp (thin faces), payments (x402/Pocket), agent (demo), cli
   test/                vitest unit + anvil integration + env-gated live tests
 docs/                  all specs, designs, plans, research — see docs/README.md
 ```
 
 ## Status
 - ✅ **Phase 1 — Smart-contract layer:** built, internally audited (no Critical/High), **deployed to
-  Arc testnet (2026-06-12)**. 159 Foundry tests pass (unit + fuzz + invariant + security). Addresses below.
-- ✅ **Phase 2 — Backend "brain":** the full onboarding flow is built and tested against a local chain
-  (anvil) end-to-end — config/persistence, the law→code translator, operating-agreement generator,
-  the Arc adapter (`createEntity` + EIP-712 `setAgentWallet` binding), the Turnkey operator signer, the
-  idempotent/resumable onboarding saga, and a CLI. The first **live Arc-testnet** run (with a Turnkey
-  operator key) is the remaining step.
-- ⬜ **Phase 3 — Thin faces:** MCP server + web wizard over the same backend.
-- ⬜ **Phase 4 — Demo agent:** an autonomous ERC-8183 "proof of life" (the agent earns USDC on Arc).
+  Arc testnet (2026-06-12)**. 162 Foundry tests pass (unit + fuzz + invariant + security). Addresses below.
+- ✅ **Phase 2 — Backend "brain":** the idempotent, resumable onboarding saga runs live on Arc testnet —
+  config/persistence, the law→code translator, operating-agreement generator, the Arc adapter
+  (`createEntity` + EIP-712 `setAgentWallet` binding), the Turnkey operator signer, and a CLI.
+- ✅ **Phase 3 — Thin faces:** the wizard REST API (`src/api`) and the MCP server (`src/mcp`) run over
+  the same brain.
+- ✅ **Phase 4 — Demo agent:** the ERC-8183 "proof of life" insight agent (`src/agent`) buys and sells
+  via the x402 payments layer (`src/payments`, two-tier vault + Pocket), settled in testnet USDC.
 
 **Real vs. mocked (transparent):** everything on-chain + Circle is real on testnet. The *legal layer*
-— Wyoming filing, EIN, KYC, counsel-reviewed documents — is stubbed for the demo and becomes real with
-funding + counsel. Production-hardening items are tracked in [docs/V2_HARDENING_BACKLOG.md](./docs/V2_HARDENING_BACKLOG.md).
+(Wyoming filing, EIN, KYC, counsel-reviewed documents) is stubbed for the demo and becomes real with
+funding + counsel; the scoped path is [Doola's Company Formation API](https://www.doola.com/business-solutions/company-formation-api/)
+behind the backend's formation step (research: [docs/research/LEGAL_OPERATIONS.md](./docs/research/LEGAL_OPERATIONS.md)).
+Production-hardening items are tracked in [docs/V2_HARDENING_BACKLOG.md](./docs/V2_HARDENING_BACKLOG.md).
 
 ## ⚖️ Legal model (important — read before pitching)
 The original framing was a "Bayern mechanism / zero-member LLC" (a fully human-less entity). Research
@@ -127,7 +116,3 @@ Requires `anvil` (Foundry) on PATH for the integration tests. CLI + live-run run
 Start here: **[docs/README.md](./docs/README.md)** — an index of every spec, design, plan, and research
 doc with its current/historical status. New engineers: read this README, then the docs index, then
 [backend/README.md](./backend/README.md).
-
-## Team & funding
-Technical lead: Martin (Web3/DeFi, Arc builder). Legal/research co-founder owns the legal layer.
-Targeting Circle Developer Grants / Arc Builders Fund (agentic commerce is an official vertical).

@@ -117,3 +117,5 @@ Open [http://localhost:3000](http://localhost:3000).
 ## Status
 
 Deployed and running on **Arc testnet**. On-chain contracts, Circle Gateway settlements, and the onboarding flow are real. Wyoming filing, EIN, and counsel-reviewed legal documents are stubbed for the demo.
+
+The formation path has been scoped. The plan is to integrate [Doola](https://www.doola.com/business-solutions/company-formation-api/)'s Company Formation API behind the backend's formation step, creating the Wyoming Articles, registered agent, EIN, and the legal paperwork programmatically in the same onboarding flow. Without funding we won't be able to fully integrate Doola for the Lepton hackathon, but we have the groundwork planned out (see [the legal operations research](./back/docs/research/LEGAL_OPERATIONS.md)) to be able to do so as soon as we hit that milestone.

@@ -1,36 +1,43 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Novi Corpus — web interface (`interface/`)
 
-## Getting Started
+The Next.js app for [Novi Corpus](../README.md): the landing page, the SIWE-authenticated
+onboarding wizard, and the agent dashboard. It is a **thin face** — all real logic lives in
+the backend "brain" ([`back/backend`](../back/backend/README.md)); this app only renders
+state and calls its API. Live-demo link: see the [root README](../README.md).
 
-First, run the development server:
+## Stack
+
+Next.js 16 (App Router) · React 19 · Tailwind CSS 4 · wagmi + viem (wallet / SIWE) ·
+TanStack Query · Turnkey (passkey signing).
+
+## Getting started
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+npm run dev     # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The landing page and wizard UI run standalone, but onboarding/dashboard flows need a
+reachable backend. API calls go to the same-origin `/backend/*` route, which proxies to
+the backend (`src/app/backend/[[...path]]/route.ts`) — by default the team's hosted
+instance, which may be down. To run against your own, start the brain locally (see
+[`back/backend`](../back/backend/README.md)) and set `API_PROXY_TARGET`
+(server-side, e.g. `http://localhost:8789`), or bypass the proxy entirely with
+`NEXT_PUBLIC_API_URL`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Other env vars (all optional, sensible testnet defaults in `src/lib/chain.ts` and
+`src/lib/api/config.ts`): `NEXT_PUBLIC_CHAIN_ID`, `NEXT_PUBLIC_ARC_RPC_URL`,
+`NEXT_PUBLIC_ARC_EXPLORER`, `NEXT_PUBLIC_SIWE_DOMAIN`, `NEXT_PUBLIC_MANAGER_ADDRESS`.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Layout
 
-## Learn More
+```
+src/app/            routes: landing (/), /onboarding, /agents (+ [id], account, connect),
+                    /backend/* (API proxy to the brain)
+src/components/     landing, onboarding wizard steps, agent dashboard, providers
+src/lib/            chain config, API client + SIWE session, onboarding + treasury helpers
+```
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The proxy route forwards the MCP (`mcp-session-id`, `accept`) and x402 (`x-payment`)
+headers end-to-end — the backend 406s / re-challenges without them. Keep that list in
+sync if the backend grows new header requirements.
