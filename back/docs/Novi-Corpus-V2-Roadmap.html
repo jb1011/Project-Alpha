@@ -22,70 +22,76 @@
   p{ margin:0 0 6px; }
   em{ font-style:italic; }
   .muted{ color:var(--muted); }
+  code{ font-family:"Consolas","SF Mono",monospace; font-size:9px; color:#3a3f4d; }
 
-  /* ---------- Cover ---------- */
-  .cover{ padding:26mm 0 10mm; border-bottom:3px solid var(--accent); margin-bottom:10mm; }
+  /* Cover */
+  .cover{ padding:22mm 0 9mm; border-bottom:3px solid var(--accent); margin-bottom:9mm; }
   .kicker{ font-size:10px; letter-spacing:.28em; text-transform:uppercase; color:var(--accent); font-weight:700; }
   .cover h1{ font-size:40px; letter-spacing:-.02em; margin:10px 0 4px; }
   .cover .sub{ font-size:16px; color:var(--muted); font-weight:600; }
   .cover .meta{ margin-top:14px; font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); }
-  .cover .lede{ margin-top:16px; font-size:12.5px; color:var(--ink); max-width:150mm; line-height:1.6; }
+  .cover .lede{ margin-top:14px; font-size:12px; color:var(--ink); max-width:150mm; line-height:1.6; }
 
-  .callout{
-    margin:12px 0 0; padding:11px 14px; background:var(--accent-soft);
-    border:1px solid #d9ddf6; border-left:4px solid var(--accent); border-radius:5px;
-    font-size:11px; color:#2f2f6b;
-  }
+  .callout{ margin:12px 0 0; padding:11px 14px; background:var(--accent-soft);
+    border:1px solid #d9ddf6; border-left:4px solid var(--accent); border-radius:5px; font-size:10.5px; color:#2f2f6b; }
   .callout b{ color:var(--accent); }
+  .callout.audit-banner{ background:#fbf3f3; border-color:#f0cccc; border-left-color:#b01818; color:#5c2626; }
+  .callout.audit-banner b{ color:#b01818; }
 
-  /* ---------- Legend ---------- */
-  .legend{ display:flex; flex-wrap:wrap; gap:14px 22px; margin:14px 0 4px; font-size:10px; }
-  .legend .k{ display:flex; align-items:center; gap:7px; }
+  .legend{ display:flex; flex-wrap:wrap; gap:10px 18px; margin:14px 0 4px; font-size:9.5px; }
+  .legend .k{ display:flex; align-items:center; gap:6px; }
   .dot{ width:9px; height:9px; border-radius:50%; display:inline-block; }
   .dot.red{ background:var(--red);} .dot.amber{ background:var(--amber);} .dot.slate{ background:var(--slate);}
 
-  /* ---------- Tier banners ---------- */
-  .tier{ margin-top:16px; break-inside:avoid; }
-  .tier-head{
-    background:var(--accent); color:#fff; border-radius:6px; padding:9px 13px;
-    display:flex; align-items:baseline; gap:12px;
-  }
-  .tier-head.t1{ background:#7a2540; } .tier-head.t2{ background:#8a5a12; }
+  /* Tier banners */
+  .tier{ margin-top:15px; break-inside:avoid; }
+  .tier-head{ background:var(--accent); color:#fff; border-radius:6px; padding:9px 13px; display:flex; align-items:baseline; gap:12px; }
+  .tier-head.sec{ background:#8a1f1f; } .tier-head.t1{ background:#7a2540; } .tier-head.t2{ background:#8a5a12; }
   .tier-head.t3{ background:#3a5a6b; } .tier-head.legal{ background:#2f3e57; }
   .tier-head .n{ font-size:16px; font-weight:800; letter-spacing:.02em; }
   .tier-head .t{ font-size:13px; font-weight:700; }
-  .tier-head .d{ font-size:10px; margin-left:auto; opacity:.85; }
-  .subhead{ font-size:11px; font-weight:800; letter-spacing:.14em; text-transform:uppercase;
-    color:var(--faint); margin:12px 0 6px; }
+  .tier-head .d{ font-size:10px; margin-left:auto; opacity:.9; }
+  .subhead{ font-size:11px; font-weight:800; letter-spacing:.14em; text-transform:uppercase; color:var(--faint); margin:12px 0 6px; }
 
-  /* ---------- Items ---------- */
-  .item{ break-inside:avoid; padding:8px 0 8px; border-bottom:1px solid var(--line); display:flex; gap:11px; }
+  /* Items */
+  .item{ break-inside:avoid; padding:8px 0; border-bottom:1px solid var(--line); display:flex; gap:11px; }
   .item:last-child{ border-bottom:none; }
-  .rank{ flex:0 0 22px; font-size:15px; font-weight:800; color:var(--accent); text-align:right; padding-top:1px; }
-  .tier-head.t1 ~ * .rank, .body-red .rank{ color:var(--red); }
+  .rank{ flex:0 0 20px; font-size:15px; font-weight:800; color:var(--accent); text-align:right; padding-top:1px; }
+  .sec .rank, .body-red .rank{ color:var(--red); }
   .ic{ flex:1 1 auto; }
-  .ititle{ font-size:12px; font-weight:700; margin-bottom:2px; }
+  .ititle{ font-size:12px; font-weight:700; margin-bottom:2px; display:flex; gap:7px; align-items:baseline; flex-wrap:wrap; }
   .why{ font-size:10.5px; color:var(--muted); }
   .why b{ color:#3a3f4d; font-weight:700; }
+  .pri{ flex:0 0 auto; font-size:12px; padding-top:1px; }
+
+  /* Verdict pills */
+  .v{ font-size:8px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; padding:2px 6px; border-radius:4px; white-space:nowrap; }
+  .v.crit{ background:#fdecec; color:#b01818; border:1px solid #f3c9c9; }
+  .v.conf{ background:#ecf4ee; color:#2f6b3a; border:1px solid #cfe6d5; }
+  .v.done{ background:#eef1f6; color:#455065; border:1px solid #d8dee8; }
+  .v.rech{ background:#fff4e6; color:#9a5a10; border:1px solid #f0dcc6; }
+  .v.risk{ background:#f4ecfb; color:#7233a0; border:1px solid #e4d3f2; }
+
+  .audit{ margin-top:4px; font-size:9.5px; color:#5a4330; background:#fbf6ee; border-left:3px solid #c99a4e; padding:3px 9px; border-radius:0 3px 3px 0; }
+  .audit b{ color:#8a5a12; font-weight:800; letter-spacing:.04em; }
+
   .tags{ margin-top:4px; display:flex; flex-wrap:wrap; gap:5px; }
-  .tag{ font-size:8.5px; letter-spacing:.03em; text-transform:uppercase; font-weight:700;
-    padding:2px 6px; border-radius:4px; background:var(--panel); color:var(--slate); border:1px solid var(--line); }
+  .tag{ font-size:8.5px; letter-spacing:.03em; text-transform:uppercase; font-weight:700; padding:2px 6px; border-radius:4px; background:var(--panel); color:var(--slate); border:1px solid var(--line); }
   .tag.dep{ background:#fff5ec; color:#9a5a10; border-color:#f0dcc6; }
   .tag.sup{ background:#eef7ef; color:#2f6b3a; border-color:#d3e8d6; }
-  .pri{ flex:0 0 auto; font-size:12px; padding-top:1px; }
 
   .sectionnote{ font-size:10px; color:var(--faint); margin:6px 0 0; font-style:italic; }
 
-  /* ---------- Sequencing ---------- */
+  table.corr{ width:100%; border-collapse:collapse; margin-top:8px; font-size:9.5px; }
+  table.corr th, table.corr td{ text-align:left; padding:5px 7px; border-bottom:1px solid var(--line); vertical-align:top; }
+  table.corr th{ font-size:8.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); border-bottom:2px solid var(--line); }
+  table.corr td.it{ font-weight:700; color:var(--ink); width:34%; }
+
   .seq{ background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:13px 16px; margin-top:8px; }
-  .seq ol{ margin:0; padding-left:20px; }
-  .seq li{ margin:5px 0; font-size:11px; }
-  .seq li b{ color:var(--accent); }
+  .seq ol{ margin:0; padding-left:20px; } .seq li{ margin:5px 0; font-size:11px; } .seq li b{ color:var(--red); }
 
-  .appendix{ font-size:9.5px; color:var(--muted); }
-  .appendix code{ font-family:"Consolas","SF Mono",monospace; font-size:9px; color:#3a3f4d; }
-
-  .foot{ margin-top:14mm; padding-top:6px; border-top:1px solid var(--line); font-size:9px; color:var(--faint); }
+  .foot{ margin-top:12mm; padding-top:6px; border-top:1px solid var(--line); font-size:9px; color:var(--faint); }
+  .appendix code{ font-size:9px; }
   .pagebreak{ break-before:page; }
 </style>
 </head>
@@ -94,103 +100,185 @@
   <section class="cover">
     <div class="kicker">Novi Corpus · Agent Legal Body Platform</div>
     <h1>V2 Roadmap</h1>
-    <div class="sub">Product &amp; Hardening Plan · from proven testnet demo to production</div>
-    <div class="meta">Version 2.0 (draft) &nbsp;·&nbsp; July 2026 &nbsp;·&nbsp; compiled from repo design docs, audit notes &amp; the V2 backlog</div>
+    <div class="sub">Product &amp; Hardening Plan — audited against the live codebase</div>
+    <div class="meta">Version 2.1 &nbsp;·&nbsp; July 2026 &nbsp;·&nbsp; incorporates the 2026-07-05 four-track security audit</div>
 
     <p class="lede">Novi Corpus gives AI agents a real legal body: a Wyoming DAO LLC wrapped around a governed
     on-chain USDC treasury on Arc, with a human always holding the brake. V1 proved the full agent lifecycle
-    end-to-end on testnet — onboard, fund, pay over x402, earn USDC and on-chain reputation, all through MCP.
-    This document lists what a production-grade V2 requires, ordered by relevance: the architectural bets that
-    define the product, the hardening needed before real money moves, then scale and polish.</p>
+    end-to-end on testnet. This document lists what a production-grade V2 requires, ordered by relevance, and
+    every item has been verified against the current code by a four-track audit (contracts, backend, payments/
+    custody, product/infra).</p>
 
-    <div class="callout">
-      <b>The single highest-leverage change:</b> migrating agent wallets from raw EOAs to Circle smart accounts
-      (ERC-4337 + Gas Station). It structurally deletes at least four systems V1 had to build by hand — the gas
-      seeder, the Arc gas-estimation footgun, the fund-pocket bridge race, and the multi-step funding saga —
-      replacing them with sponsored gas and one atomic batched operation.
+    <div class="callout audit-banner">
+      <b>Audit outcome.</b> The roadmap's direction is sound, but the audit (1) surfaced <b>five security gaps the
+      original roadmap did not name</b> — now the top-priority "Security Foundations" tier below; (2) found several
+      items <b>already implemented</b> (the code had moved ahead of the backlog); and (3) <b>corrected ~10 items</b>
+      that were mischaracterized or whose naive fix would introduce a regression. Verdict tags appear on each item.
+      <br><em>Scope note: the critical items are not live exploits on today's single-tenant testnet deployment —
+      they become critical in the multi-tenant BYOA product this roadmap describes.</em>
     </div>
 
     <div class="legend">
-      <span class="k"><span class="dot red"></span> Foundational — needed before real money / mainnet</span>
+      <span class="k"><span class="dot red"></span> Foundational (before real money / mainnet)</span>
       <span class="k"><span class="dot amber"></span> Robustness &amp; scale</span>
       <span class="k"><span class="dot slate"></span> Product &amp; polish</span>
+      &nbsp; | &nbsp;
+      <span class="k"><span class="v crit">Critical</span></span>
+      <span class="k"><span class="v conf">Confirmed</span></span>
+      <span class="k"><span class="v done">Done</span></span>
+      <span class="k"><span class="v rech">Recharacterized</span></span>
+      <span class="k"><span class="v risk">Risk-in-fix</span></span>
     </div>
   </section>
 
+  <!-- ============ TIER S: SECURITY FOUNDATIONS ============ -->
+  <div class="tier sec">
+    <div class="tier-head sec">
+      <span class="n">Tier S</span><span class="t">Security foundations — surfaced by the audit</span>
+      <span class="d">Highest priority · not in the original roadmap</span>
+    </div>
+    <p class="sectionnote">These outrank the flagship bets. They are the concrete failure modes an attacker (or a
+    buggy tenant) reaches in the multi-tenant product; several are one-line trust assumptions today.</p>
+
+    <div class="item"><div class="rank">S1</div><div class="ic">
+      <div class="ititle">Unbounded <code>fund_treasury</code> drain of the shared platform wallet <span class="v crit">Critical · New</span></div>
+      <div class="why">The MCP <code>fund_treasury</code> tool moves USDC <em>from the platform manager wallet</em>
+      into the caller's treasury, gated only by the <code>spend</code> capability + ownership — with <b>no per-call
+      cap, no per-tenant quota, and no ceiling on the amount</b>. Any tenant with a spend key could pull the
+      platform wallet's balance into their own treasury, then spend it out. <b>Fix:</b> gate behind a distinct
+      <code>admin</code>/<code>provision</code> capability with a hard per-tenant funded ceiling — or require tenants
+      to fund from their own external wallet. (<code>run_job</code> already got these caps; this is the same class,
+      uncapped.)</div>
+    </div><div class="pri">🔴</div></div>
+
+    <div class="item"><div class="rank">S2</div><div class="ic">
+      <div class="ititle">The x402 spend path escapes the on-chain allowlist, per-tx cap &amp; guardian clawback <span class="v crit">Critical</span></div>
+      <div class="why">Confirmed independently by two auditors. <code>fundOperator</code> is <b>allowlist-exempt</b>
+      and moves funds to the operator's hot EOA before payment, so: the on-chain allowlist governs only direct
+      <code>spend()</code> (which x402 never uses); there is <b>no on-chain per-tx cap</b> (only a period cap — the
+      "on-chain per-tx + period caps" claim is inaccurate); and the guardian's <code>emergencyWithdraw</code>/
+      <code>pause</code> <b>cannot reach in-flight funds</b> on the operator/pocket/Gateway. <b>Fix:</b> the real
+      closer is treasury-direct signing (Tier 0 #6) — see its risk note; interim, minimize float and tighten the
+      operator bound.</div>
+    </div><div class="pri">🔴</div></div>
+
+    <div class="item"><div class="rank">S3</div><div class="ic">
+      <div class="ititle">A single <code>POCKET_MASTER_SEED</code> custodies every agent's pocket key <span class="v crit">High · New</span></div>
+      <div class="why">All pocket signing keys are derived in-process from one env seed. <b>Why it matters:</b> one
+      leak = the ability to sign x402 and drain <em>every</em> agent's Gateway float at once — the broadest-scope
+      key in the system, and not covered by the roadmap's key-separation item. <b>Fix:</b> per-agent key isolation
+      (KMS/Turnkey-derived), never a shared master seed in plaintext env.</div>
+    </div><div class="pri">🔴</div></div>
+
+    <div class="item"><div class="rank">S4</div><div class="ic">
+      <div class="ititle"><code>PLATFORM_PRIVATE_KEY</code> is one raw hot key doing five jobs <span class="v crit">High</span></div>
+      <div class="why">It is the manager <em>and</em> the factory owner <em>and</em> the upgrade-beacon owner
+      <em>and</em> the fallback for customer / job-client / evaluator / x402 payout. <b>Why it matters:</b> a single
+      leak lets an attacker mint entities, re-bind agent wallets, upgrade every manager, and drain the manager
+      wallet. <b>Fix:</b> role-separate the keys (distinct factory-owner and beacon-owner, ideally multisig) and
+      move signing to a KMS. This sharpens the roadmap's "role-separated keys" and "beacon → multisig" items into
+      one containment effort.</div>
+    </div><div class="pri">🔴</div></div>
+
+    <div class="item"><div class="rank">S5</div><div class="ic">
+      <div class="ititle">No aggregate outflow ceiling, no rate-limiting, no observability <span class="v crit">High</span></div>
+      <div class="why">Spend caps are <em>per-tenant</em> over a <em>shared</em> platform funding wallet, so N tenants
+      collectively can exceed any intended platform outflow; there is no rate-limiting on any route (auth / nonce /
+      metadata are unthrottled), the <code>auth_nonces</code> table grows unbounded (storage DoS), session JWTs have
+      no revocation, and there are no metrics/alerts on a money-custody platform. <b>Fix:</b> a platform-wide daily
+      outflow cap + alerting, request rate-limiting, a nonce-TTL sweep, and JWT revocation.</div>
+    </div><div class="pri">🔴</div></div>
+
+    <div class="item"><div class="rank">S6</div><div class="ic">
+      <div class="ititle">Contract asymmetries: no <code>MAX_CAP</code>; <code>LegalManager.sweep</code> to any address <span class="v conf">Confirmed · New</span></div>
+      <div class="why"><code>period</code> is bounded by <code>MAX_POLICY_PERIOD</code> but <code>cap</code> has no
+      upper bound, so the guardian veto is the only backstop against an unlimited-cap escalation; and
+      <code>LegalManager.sweep</code> sends residual assets to a caller-supplied address (vs the treasury's fixed
+      payout sink). <b>Why it matters:</b> both are deliberate today but should be documented and bounded before
+      multi-tenant production.</div>
+    </div><div class="pri">🟠</div></div>
+  </div>
+
   <!-- ================= TIER 0 ================= -->
-  <div class="tier">
+  <div class="tier pagebreak">
     <div class="tier-head">
       <span class="n">Tier 0</span><span class="t">Flagship bets — what the product becomes</span>
       <span class="d">Define the V2 identity</span>
     </div>
 
     <div class="item"><div class="rank">1</div><div class="ic">
-      <div class="ititle">A real multi-party economic loop</div>
-      <div class="why">Today the platform impersonates every counterparty: it funds job escrow, plays the
-      evaluator, and stands in as the paying customer, so the loop closes with no outside party.
-      <b>Why it matters:</b> this is the line between a self-contained demo and an actual marketplace where real
-      clients post jobs, independent evaluators score work, and real customers pay agents.</div>
+      <div class="ititle">A real multi-party economic loop <span class="v conf">Confirmed</span></div>
+      <div class="why">Today the platform impersonates every counterparty — it funds job escrow, plays the
+      evaluator, and stands in as the paying customer. <b>Why it matters:</b> the line between a self-contained demo
+      and an actual marketplace with real clients, independent evaluators, and paying customers.</div>
       <div class="tags"><span class="tag">Effort: L</span><span class="tag sup">Unlocks: real revenue</span></div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">2</div><div class="ic">
-      <div class="ititle">EOA → Circle smart-account migration (ERC-4337 + Gas Station)</div>
-      <div class="why">Move each agent's operator/pocket from raw externally-owned keys to Circle smart accounts
-      with sponsored gas and atomic batched UserOps. <b>Why it matters:</b> one change removes the gas seeder,
-      the Arc estimate-gas footgun (fixed by hand in #33), the fund-pocket bridge race, and the partial-state
-      funding saga — the biggest complexity reduction available.</div>
-      <div class="tags"><span class="tag dep">Dep: verify Circle SCA / Gas Station / ERC-1271 / EIP-3009 on Arc</span><span class="tag sup">Supersedes: gas-seeder, #32, #33</span></div>
+      <div class="ititle">EOA → Circle smart-account migration (ERC-4337 + Gas Station) <span class="v rech">Recharacterized</span></div>
+      <div class="why">Move each agent's operator/pocket to Circle smart accounts with sponsored gas and atomic
+      batched UserOps. <b>Why it matters:</b> removes the gas seeder, the Arc estimate-gas footgun (#33), and the
+      bridge race in one move.</div>
+      <div class="audit"><b>⚑ Audit:</b> genuine complexity win on the gas plumbing, but it is an
+      <em>invariant-neutral signing swap</em> — a Circle-controlled SCA is the same "bounded hot wallet" trust as
+      today and does <em>not</em> by itself close the allowlist/cap gap (S2). Gated on unverified Circle
+      SCA/Gas-Station/ERC-1271 support on Arc.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">3</div><div class="ic">
-      <div class="ititle">Custody choice: Circle Dev-Controlled + Agent Wallets (Model B)</div>
-      <div class="why">Offer Circle Dev-Controlled Wallets as the Model-A operator (autonomous, programmatic,
-      now confirmed on Arc) beside Turnkey, and Agent Wallets for the self-sovereign Model B where the agent
-      holds its own signing capability. <b>Why it matters:</b> serves both custody audiences and completes the
-      "built on Circle's full stack" story; the <code>custody</code> field already exists in the schema.</div>
-      <div class="tags"><span class="tag">Effort: L</span><span class="tag dep">Dep: Vivienne — Agent-Wallet Arc binding + programmatic hook</span></div>
+      <div class="ititle">Custody choice: Circle Dev-Controlled + Agent Wallets (Model B) <span class="v rech">Recharacterized</span></div>
+      <div class="why">Offer Circle Dev-Controlled Wallets as the Model-A operator beside Turnkey, and Agent Wallets
+      for the self-sovereign Model B. <b>Why it matters:</b> serves both custody audiences and completes the "full
+      Circle stack" story.</div>
+      <div class="audit"><b>⚑ Audit:</b> DevC-as-operator is confirmed feasible on Arc and invariant-neutral. Agent
+      Wallets remain gated on unverified Arc binding + a programmatic hook; Model B must still install the agent key
+      as the treasury <em>operator</em> (bounded by cap/pause) or it breaks the guardian brake. The "the
+      <code>custody</code> field already exists" claim was not found in the backend — verify.</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">4</div><div class="ic">
-      <div class="ititle">Circle policy engine as defense-in-depth</div>
-      <div class="why">Enforce spending rules (per-tx, period, allowlist, review threshold) Circle-side, in
-      addition to the on-chain caps. <b>Why it matters:</b> if policy changes are gated separately from signing,
-      the rules bound even a fully compromised backend — a strong extra guardrail next to the treasury contract.</div>
-      <div class="tags"><span class="tag">Effort: M</span><span class="tag dep">Dep: Circle policy-engine independence</span></div>
+      <div class="ititle">Circle policy engine as defense-in-depth <span class="v conf">Confirmed · conditional</span></div>
+      <div class="why">Enforce spending rules Circle-side in addition to the on-chain caps.
+      <b>Why it matters:</b> a strong extra guardrail if it bounds even a compromised backend.</div>
+      <div class="audit"><b>⚑ Audit:</b> "bounds a compromised backend" is true <em>only if</em> policy changes are
+      gated to a principal the backend does not hold (separate Console/admin credential). Today the same process
+      holds the pocket seed and the signer, so off-chain caps give <em>zero</em> protection against a compromised
+      backend — the only such bound is on-chain.</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">5</div><div class="ic">
-      <div class="ititle">Trust-minimized, always-on Payment Authority</div>
-      <div class="why">The service that checks every spend against caps/allowlist is today trusted, centralized,
-      and a single point of failure ("if it's down, the agent can't pay"). V2 adds HA/liveness, an auditable
-      off-chain ledger, and a verifiable execution path (TEE / ZK / on-chain checkpoints).
-      <b>Why it matters:</b> the governor of a governed treasury shouldn't itself be unverifiable or fragile.</div>
-      <div class="tags"><span class="tag">Effort: L</span><span class="tag sup">Hardens: the core trust story</span></div>
+      <div class="ititle">Trust-minimized, always-on Payment Authority <span class="v conf">Confirmed</span></div>
+      <div class="why">The per-spend policy checker is trusted, centralized, and a single point of failure (and of
+      compromise, since it also holds the pocket seed and reaches the signer). Add HA/liveness, an auditable ledger,
+      and a verifiable execution path (TEE / ZK / on-chain checkpoints). <b>Why it matters:</b> the governor of a
+      governed treasury shouldn't be unverifiable or fragile.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">6</div><div class="ic">
-      <div class="ititle">Treasury-direct x402 signing (EIP-1271 / ERC-7598)</div>
-      <div class="why">Let the treasury contract sign its own x402/Gateway authorizations, removing the hot
-      operator EOA entirely. <b>Why it matters:</b> no hot key means a cleaner, more trustless custody model —
-      arguably the endgame the smart-account migration points toward.</div>
-      <div class="tags"><span class="tag">Effort: M</span><span class="tag dep">Dep: facilitator support for contract signatures</span></div>
+      <div class="ititle">Treasury-direct x402 signing (EIP-1271 / ERC-7598) <span class="v risk">Risk-in-fix</span></div>
+      <div class="why">Let the treasury contract sign its own x402 authorizations, removing the hot operator EOA.
+      <b>Why it matters:</b> it is the <em>only</em> item that structurally closes S2 — payment happens from
+      governed funds, so caps/allowlist/pause apply to the real payment.</div>
+      <div class="audit"><b>⚑ Audit:</b> as naively described it would <em>bypass every on-chain cap</em> — EIP-3009
+      settles at the token contract (not via <code>spend()</code>), and a <code>view</code> <code>isValidSignature</code>
+      cannot update the rolling-cap state atomically. It needs a <em>stateful</em> settlement design (nonce-gated
+      entrypoint or a debiting 4337 validator), plus a redeployed treasury (collides with the immutable-treasury
+      migration item). Treat as design work, not a drop-in.</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">7</div><div class="ic">
-      <div class="ititle">Agent-to-agent payments</div>
-      <div class="why">Two governed agents transacting directly, and multi-source data purchases.
-      <b>Why it matters:</b> extends nanopayments beyond the buyer/seller demo into a genuine agent economy with
-      network effects — a differentiating capability, not just hardening.</div>
-      <div class="tags"><span class="tag">Effort: M</span></div>
+      <div class="ititle">Agent-to-agent payments <span class="v rech">Recharacterized</span></div>
+      <div class="why">Two governed agents transacting directly.</div>
+      <div class="audit"><b>⚑ Audit:</b> needs <em>no</em> new contract — <code>spend()</code> already pays any
+      address, and the seller already sets <code>payTo</code> to the payee's governed treasury. Much of the plumbing
+      exists; the real work is governance (enforceably allowlisting counterparties), and it inherits S2.</div>
     </div><div class="pri">🟡</div></div>
 
     <div class="item"><div class="rank">8</div><div class="ic">
-      <div class="ititle">x401 controller identity &amp; KYC</div>
+      <div class="ititle">x401 controller identity &amp; KYC <span class="v conf">Confirmed</span></div>
       <div class="why">Adopt x401 (Proof + Circle) as the onboarding controller-verification step: IAL2 KYC and a
-      verifiable "who's behind this agent" credential. <b>Why it matters:</b> satisfies the mandatory
-      natural-person-controller legal gate and sharpens the pitch — "x402 pays, x401 proves identity, Novi Corpus
-      is what the agent legally is."</div>
-      <div class="tags"><span class="tag">Effort: M</span><span class="tag sup">Consume, don't build (Proof issuer)</span></div>
+      verifiable "who's behind this agent" credential. <b>Why it matters:</b> satisfies the mandatory natural-person
+      controller gate and completes the agentic-stack story. Consume from the issuer — do not build.</div>
     </div><div class="pri">🟠</div></div>
   </div>
 
@@ -204,81 +292,96 @@
     <div class="subhead">Smart contracts &amp; on-chain security</div>
 
     <div class="item"><div class="rank">1</div><div class="ic">
-      <div class="ititle">Beacon owner → multisig / timelock</div>
-      <div class="why">Today a single testnet EOA owns the upgrade beacon for <em>every</em> agent's manager
-      contract. <b>Why it matters:</b> one compromised key could upgrade all agents at once — the highest-priority
-      centralization risk before any production deploy.</div>
+      <div class="ititle">Beacon owner → multisig / timelock <span class="v conf">Confirmed</span></div>
+      <div class="why">A single testnet EOA owns the upgrade beacon for every agent's manager contract.
+      <b>Why it matters:</b> a compromised key could upgrade all managers at once.</div>
+      <div class="audit"><b>⚑ Audit:</b> real, but fund-blast-radius is narrower than "drain all agents" — the
+      treasury is a separate immutable contract and <code>emergencyWithdraw</code> still works. Pair this with
+      separating the <em>factory-owner</em> key (same EOA today) — see S4.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">2</div><div class="ic">
-      <div class="ititle">Policy nonce &amp; signature-replay protection</div>
-      <div class="why">Policy actions and the ERC-8004 <code>AgentWalletSet</code> binding carry no nonce, so an
-      authorized signature is replayable until its deadline. <b>Why it matters:</b> replay protection is table
-      stakes for on-chain policy safety once value is at stake.</div>
-    </div><div class="pri">🔴</div></div>
+      <div class="ititle">Policy nonce &amp; signature-replay protection <span class="v rech">Recharacterized</span></div>
+      <div class="why">Replay protection for on-chain policy actions.</div>
+      <div class="audit"><b>⚑ Audit:</b> a <em>phantom</em> for the current contracts — the treasury policy path is
+      <code>msg.sender</code>/<code>onlyManager</code>-authenticated with no signatures to replay. The real half is
+      the ERC-8004 <code>AgentWalletSet</code> binding, which lives in the <em>canonical registry, not our code</em>;
+      mitigated by short deadlines. Only becomes an owned concern if a meta-tx/EIP-1271 path is added (see Tier 0 #6).</div>
+    </div><div class="pri">🟡</div></div>
 
     <div class="item"><div class="rank">3</div><div class="ic">
-      <div class="ititle">Guardian multisig + role rotation</div>
-      <div class="why">The guardian and manager are single immutable keys with no rotation path; recovery today
-      means a contract upgrade. <b>Why it matters:</b> a lost or compromised human-controller key must be
-      recoverable without redeploying the agent.</div>
+      <div class="ititle">Guardian multisig + role rotation <span class="v conf">Confirmed</span></div>
+      <div class="why">Guardian and manager are single immutable keys with no rotation path. <b>Why it matters:</b>
+      a lost manager key is unrecoverable in-place; for the treasury it means a full redeploy (it's immutable and
+      the factory can't re-point an agent to a new treasury).</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">4</div><div class="ic">
-      <div class="ititle">Live-registry fork tests + professional audit</div>
-      <div class="why">Only mocks are in CI; the deployed identity/job/reputation contracts are still
-      <code>Mock*</code> placeholders. Fork-test the real ERC-8004 <code>register()</code> and re-bind paths, and
-      commission a manual external audit. <b>Why it matters:</b> the static-analysis pass is explicitly "not a
-      substitute for manual review" before mainnet.</div>
+      <div class="ititle">Live-registry fork tests + professional external audit <span class="v rech">Recharacterized</span></div>
+      <div class="why">Commission a manual external audit and add fork tests of the real register/re-bind/8183 paths.</div>
+      <div class="audit"><b>⚑ Audit:</b> "deployed contracts are mocks" is <em>wrong</em> — the live Arc deployment
+      uses the real canonical registries; the mocks are CI-only. The genuine gap is <em>CI fork coverage</em> of the
+      real paths, plus the still-needed external audit (correctly 🔴).</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">5</div><div class="ic">
-      <div class="ititle">Pre-mainnet build gates + reputation wiring</div>
-      <div class="why"><code>via_ir</code> bytecode re-review, a Mythril run, and pinning the pragma to
-      <code>0.8.24</code>; plus wiring the ERC-8183 reputation interfaces (interface-only stubs today) into the
-      contracts, and a documented migration story for the intentionally-immutable treasury.
-      <b>Why it matters:</b> closes the known pre-production checklist and makes on-chain reputation real.</div>
-      <div class="tags"><span class="tag">Batch: incl. static-analysis nits</span></div>
+      <div class="ititle">Pre-mainnet build gates + reputation wiring <span class="v conf">Confirmed</span></div>
+      <div class="why"><code>via_ir</code> bytecode re-review, a Mythril run, pinning the pragma to
+      <code>0.8.24</code>, and wiring the ERC-8183 reputation interfaces (interface-only stubs today).
+      <b>Why it matters:</b> closes the known pre-production checklist. Keep any reputation writes off the treasury
+      spend path (new external-call surface).</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="subhead">Backend correctness &amp; safety</div>
 
     <div class="item"><div class="rank">6</div><div class="ic">
-      <div class="ititle">Onboarding saga: the create→persist double-mint window</div>
-      <div class="why">A crash after the <code>createEntity</code> tx mines but before it's persisted causes a
-      resume to mint a <em>second</em> agentId, orphaning the first. <b>Why it matters:</b> the single biggest
-      correctness bug — fix by splitting broadcast/confirm, persisting the tx hash first, and adopting the
-      existing agentId on resume.</div>
-    </div><div class="pri">🔴</div></div>
+      <div class="ititle">Onboarding create→persist double-mint window <span class="v done">Done</span></div>
+      <div class="why">A crash between mint and persistence re-minting a second agentId.</div>
+      <div class="audit"><b>⚑ Audit:</b> <em>largely fixed already</em> — the saga splits broadcast/confirm,
+      persists the tx hash first, and adopts the in-flight tx on resume. Only a razor-thin residual remains. Drop
+      from Tier 1; the backlog doc had lagged the code.</div>
+    </div><div class="pri">🟢</div></div>
 
     <div class="item"><div class="rank">7</div><div class="ic">
-      <div class="ititle">Concurrency: key-claim lock + spec-hash idempotency</div>
-      <div class="why">Two concurrent onboarding calls for the same key both mint; re-running a key silently
-      ignores a changed spec. <b>Why it matters:</b> becomes real the moment onboarding runs multi-worker — claim
-      the key atomically, and reject a conflicting spec instead of overwriting it.</div>
-    </div><div class="pri">🔴</div></div>
+      <div class="ititle">Onboarding concurrency: key-claim lock <span class="v done">Done</span></div>
+      <div class="why">Two concurrent onboarding calls both minting.</div>
+      <div class="audit"><b>⚑ Audit:</b> <em>fixed</em> — an atomic <code>claimKey</code> (INSERT ON CONFLICT DO
+      NOTHING) is taken before any side effect; the loser gets 409. Residual: the <code>fund()</code> re-entry guard
+      is per-process in-memory, so flag it before scaling to multiple app processes.</div>
+    </div><div class="pri">🟢</div></div>
 
     <div class="item"><div class="rank">8</div><div class="ic">
-      <div class="ititle">Production signer + role-separated keys</div>
-      <div class="why">The default signer is a raw local private key, and one <code>PLATFORM_PRIVATE_KEY</code>
-      doubles as manager, job client, customer, evaluator fallback, and x402 payout. <b>Why it matters:</b> make
-      Turnkey (or a KMS) the default and give each role its own key to contain blast radius.</div>
-    </div><div class="pri">🔴</div></div>
+      <div class="ititle">Spec-hash idempotency + monotonic status <span class="v conf">Latent</span></div>
+      <div class="why">Bind a spec hash to the key so a resumed/funded record can't drift; guard against backward
+      status writes. <b>Why it matters:</b> both are real hardening.</div>
+      <div class="audit"><b>⚑ Audit:</b> latent, <em>not currently exploitable</em> — a changed-spec re-run hits the
+      key-claim 409, and no caller writes status backward. Low priority.</div>
+    </div><div class="pri">🟡</div></div>
 
     <div class="item"><div class="rank">9</div><div class="ic">
-      <div class="ititle">Split the <code>spend</code> capability + cap earn</div>
-      <div class="why">The <code>spend</code> rung currently conflates paying third parties with <em>provisioning</em>
-      (<code>onboard_agent</code>, <code>fund_treasury</code>), and <code>run_job</code> earn has no budget/quota.
-      <b>Why it matters:</b> real grants need least-privilege — a separate <code>provision</code>/<code>admin</code>
-      rung and earn-side limits.</div>
+      <div class="ititle">Role-separated keys / KMS <span class="v conf">Confirmed · High</span></div>
+      <div class="why">One <code>PLATFORM_PRIVATE_KEY</code> is manager + factory owner + beacon owner + fallback for
+      customer / job-client / evaluator / x402 payout. <b>Why it matters:</b> single total-compromise point. This is
+      Tier S #4 — the highest-value key to contain.</div>
+      <div class="audit"><b>⚑ Audit:</b> supersedes the roadmap's "make Turnkey the default signer" item — Turnkey
+      is <em>already</em> the operator default; the exposure is this raw platform/manager key, not the operator.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">10</div><div class="ic">
-      <div class="ititle">Durable replay guard, SSRF fix, auth &amp; metadata hardening</div>
-      <div class="why">The x402 seller's replay guard is an in-memory set (lost on restart); a documented
-      DNS-rebinding TOCTOU can slip a blocked IP past the SSRF guard; SIWE routes need rate-limiting and
-      burn-on-attempt; the public metadata route does synchronous DB + file reads on the event loop.
-      <b>Why it matters:</b> the exposed surfaces a real attacker would probe first.</div>
+      <div class="ititle">Capability-model split + earn quota <span class="v conf">Confirmed · High</span></div>
+      <div class="why">The <code>spend</code> rung gates <em>both</em> third-party payment and provisioning
+      (<code>onboard_agent</code>, <code>fund_treasury</code>). <b>Why it matters:</b> this is the direct enabler of
+      the S1 drain — split off an <code>admin</code>/<code>provision</code> rung. (<code>run_job</code> earn is
+      already budget/inflight-capped.)</div>
+    </div><div class="pri">🔴</div></div>
+
+    <div class="item"><div class="rank">11</div><div class="ic">
+      <div class="ititle">SSRF pinning, auth hardening, metadata &amp; nonce-store limits <span class="v conf">Confirmed</span></div>
+      <div class="why">Pin the SSRF fetch to the validated IP (documented DNS-rebinding TOCTOU); add SIWE
+      rate-limiting, httpOnly cookie sessions, and nonce burn-on-attempt; add a nonce-TTL sweep and JWT revocation;
+      cache the metadata route to remove sync file reads. <b>Why it matters:</b> the exposed surfaces an attacker
+      probes first. <em>(Replay-nonce durability is lower priority — the on-chain single-use nonce is the real
+      double-settle backstop; the in-memory set only guards the demo quote.)</em></div>
     </div><div class="pri">🔴</div></div>
   </div>
 
@@ -290,46 +393,50 @@
     </div>
 
     <div class="item"><div class="rank">1</div><div class="ic">
-      <div class="ititle">SQLite → Postgres</div>
-      <div class="why">Every store is a single-file, single-process SQLite database (with an acknowledged race in
-      the idempotency store). <b>Why it matters:</b> multi-instance HA and concurrent writers are impossible until
-      this moves to a real cloud database.</div>
+      <div class="ititle">SQLite → Postgres <span class="v conf">Confirmed</span></div>
+      <div class="why">Every store is a single-file, single-process SQLite DB (with an acknowledged idempotency
+      race). <b>Why it matters:</b> multi-instance HA and concurrent writers are impossible until this moves; note
+      several in-memory guards (funding re-entry, replay set) also assume one process.</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">2</div><div class="ic">
-      <div class="ititle">Durable document storage + metadata backfill</div>
-      <div class="why">Agent metadata is served from a local file store via <code>file://</code>; move to
-      S3 / Vercel Blob (and IPFS for real decentralization), and backfill the three existing demo agents whose
-      URIs are still <code>file://</code>. <b>Why it matters:</b> the metadata URI is baked on-chain permanently,
-      so durable, public, verifiable hosting is essential.</div>
+      <div class="ititle">Durable document storage + metadata backfill <span class="v conf">Confirmed</span></div>
+      <div class="why">Metadata bytes still live on local disk (the public URL is now HTTPS, but storage is local);
+      move to S3 / Vercel Blob / IPFS and backfill the legacy demo agents whose URIs are still <code>file://</code>.
+      <b>Why it matters:</b> the metadata URI is baked on-chain permanently.</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">3</div><div class="ic">
-      <div class="ititle">Real job worker + event-sourced job IDs</div>
-      <div class="why">The job worker returns a hardcoded string; job IDs are read from a simulate call rather
-      than an emitted event. <b>Why it matters:</b> replace the placeholder with a real agent/LLM worker producing
-      content-addressed deliverables, and read IDs from logs to be concurrency-safe.</div>
+      <div class="ititle">Real job worker <span class="v conf">Confirmed</span></div>
+      <div class="why">The worker returns a hardcoded string. <b>Why it matters:</b> replace with a real agent/LLM
+      worker producing content-addressed deliverables.</div>
+      <div class="audit"><b>⚑ Audit:</b> the companion "read jobId from an event" idea is <em>infeasible</em> — the
+      ERC-8183 job contract emits no <code>JobCreated</code> event, which is exactly why the code reads the simulate
+      return. The real concurrency fix is a contract-side event or a post-mine ownership re-read.</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">4</div><div class="ic">
-      <div class="ititle">Observability &amp; alerting</div>
-      <div class="why">Structured logs, metrics, and alerts on treasury balances, failed jobs, and platform gas
-      outflow, plus an admin view. <b>Why it matters:</b> the platform custodies money today with no operational
-      visibility — a production must-have. <em>(New recommendation.)</em></div>
-    </div><div class="pri">🟠</div></div>
+      <div class="ititle">Aggregate outflow ceiling, observability &amp; alerting <span class="v conf">Confirmed · elevated</span></div>
+      <div class="why">A platform-wide daily outflow cap, plus structured logs, metrics, and alerts on treasury
+      balances / failed jobs / gas outflow. <b>Why it matters:</b> promoted by the audit — this is the amplifier
+      behind S1/S5 and the platform currently custodies money with no operational visibility.</div>
+    </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">5</div><div class="ic">
-      <div class="ititle">Withdrawable Gateway balance + aggregate outflow cap</div>
+      <div class="ititle">Withdrawable Gateway balance <span class="v conf">Confirmed</span></div>
       <div class="why">Pocket float is kept near zero because the SDK wrapper can't withdraw the Gateway-held
-      balance, and the gas seeder has no global platform-spend ceiling. <b>Why it matters:</b> reclaims stranded
-      capital (resolves with the smart-account work) and bounds worst-case platform outflow across all agents.</div>
+      balance. <b>Why it matters:</b> beyond capital efficiency, any non-zero float sits outside guardian reach
+      (S2) — so JIT float minimization is currently a security mitigation, not just an optimization. Withdrawability
+      is a Gateway-SDK capability, orthogonal to the smart-account work.</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">6</div><div class="ic">
-      <div class="ititle">Cleanup: de-scope <code>retryOnStaleBalance</code></div>
-      <div class="why">A retry loop added to survive a revert that the #33 explicit-gas fix made deterministic and
-      impossible. <b>Why it matters:</b> it's now dead defensive code that burns ~18s per attempt on paths that
-      can no longer fail that way.</div>
+      <div class="ititle">Cleanup: de-scope <code>retryOnStaleBalance</code> <span class="v risk">Risk-in-fix</span></div>
+      <div class="why">A retry loop on the funding bridge.</div>
+      <div class="audit"><b>⚑ Audit:</b> do <em>not</em> blanket-remove — it guards a <em>different</em> failure than
+      #33 fixed (RPC read-lag after a write, not the estimate-gas revert), and the deposit path has no preceding
+      poll. Safe to trim only the redundant forward-path retry after confirming the deposit path's read-lag is
+      otherwise covered.</div>
     </div><div class="pri">🟡</div></div>
   </div>
 
@@ -341,32 +448,41 @@
     </div>
 
     <div class="item"><div class="rank">1</div><div class="ic">
-      <div class="ititle">Payments-history UI</div>
-      <div class="why">Surface the x402 payments an agent makes (they persist in the ledger but appear nowhere in
-      the UI), from a narrow spend-history card to a full money-movements timeline. <b>Why it matters:</b> closes
-      the gap between "what the agent did" and "what the dashboard shows." Small, high-value.</div>
+      <div class="ititle">Payments-history UI <span class="v conf">Confirmed</span></div>
+      <div class="why">A <code>GET /entities/:id/payments</code> endpoint + dashboard card reading the ledger.
+      <b>Why it matters:</b> closes the gap between what the agent did and what the dashboard shows.</div>
+      <div class="audit"><b>⚑ Audit:</b> must enforce <em>both</em> the <code>entity_key</code> filter and the
+      <code>ownerTenantId</code> ownership check (mirror the runs route) — <code>entity_key</code> alone is
+      caller-supplied. Ledger rows carry no secret/hash, so exposure risk is otherwise low.</div>
     </div><div class="pri">🟡</div></div>
 
     <div class="item"><div class="rank">2</div><div class="ic">
-      <div class="ititle">Real x402 seller, real datasets, expanded MCP tools</div>
-      <div class="why">Replace the flag-gated demo quote and synthetic dataset catalog with a live seller, and add
-      MCP tools (<code>authorize_payment</code>, <code>agent_ask</code>, job/reputation). <b>Why it matters:</b>
-      turns demo surfaces into real capabilities agents can build on.</div>
+      <div class="ititle">Real x402 seller, real datasets, expanded MCP tools <span class="v conf">Confirmed</span></div>
+      <div class="why">Replace the flag-gated demo quote and synthetic datasets; add tools like
+      <code>authorize_payment</code> / <code>agent_ask</code> / job-reputation.</div>
+      <div class="audit"><b>⚑ Audit:</b> any new fund-moving tool must reproduce the existing gate triad —
+      <code>hasCapability</code> + <code>entityInScope</code> + <code>ownerTenantId</code>, with scope closed over
+      per connection (never read from a tool arg). This is the single most important invariant to preserve on
+      expansion.</div>
     </div><div class="pri">🟡</div></div>
 
     <div class="item"><div class="rank">3</div><div class="ic">
-      <div class="ititle">In-UI "run the agent" trigger + explicit sweep tool</div>
-      <div class="why">Add an in-dashboard trigger / autonomous background runner (this is why the Activity card is
-      empty today), and expose earnings consolidation as an explicit <code>sweep_earnings</code> tool rather than
-      an always-on flag. <b>Why it matters:</b> gives the human direct, legible control over the agent's activity.</div>
+      <div class="ititle">In-UI "run the agent" trigger + explicit sweep tool <span class="v conf">Confirmed · caution</span></div>
+      <div class="why">An in-dashboard run trigger / autonomous runner, and an explicit <code>sweep_earnings</code>
+      tool instead of the always-on flag. <b>Why it matters:</b> gives the human legible control.</div>
+      <div class="audit"><b>⚑ Audit:</b> a UI trigger authorizes autonomous spend from a browser session — require
+      the same tenant-ownership check as every entity route, an explicit per-run budget echoed to the user, and no
+      escalation beyond the treasury leash. Don't let it bypass the capability model.</div>
     </div><div class="pri">🟡</div></div>
 
     <div class="item"><div class="rank">4</div><div class="ic">
-      <div class="ititle">Onboarding &amp; developer-experience polish</div>
-      <div class="why">Server-persist onboarding progress (currently only in <code>localStorage</code>), add live
-      claim-status polling on bootstrap, generate a typed OpenAPI client from the Zod <code>AgentSpec</code>, and
-      finish small interface items (connection labels, active-nav state, <code>governance</code> default).
-      <b>Why it matters:</b> smooths the first-run and integration experience that drives adoption.</div>
+      <div class="ititle">Onboarding &amp; developer-experience polish <span class="v conf">Mostly confirmed</span></div>
+      <div class="why">Server-persist onboarding progress (only <code>localStorage</code> today), live claim-status
+      polling on bootstrap, a generated OpenAPI client from the Zod <code>AgentSpec</code> (removes a hand-written
+      drift point), an active-nav-state fix, and <code>governance.default({})</code> in the agent-spec (missing the
+      wrapper its siblings have). <b>Why it matters:</b> smooths first-run and integration.</div>
+      <div class="audit"><b>⚑ Audit:</b> the "connection copy label" sub-item appears <em>already implemented</em> —
+      drop unless a specific wording change is intended.</div>
     </div><div class="pri">🟡</div></div>
   </div>
 
@@ -376,62 +492,77 @@
       <span class="n">Track L</span><span class="t">Legal &amp; compliance</span>
       <span class="d">Parallel · counsel-gated</span>
     </div>
-    <p class="sectionnote">Core to a "legal body," not peripheral — and almost entirely simulated in V1. These run
-    in parallel with engineering and are gated on Wyoming-admitted counsel and Circle confirmations.</p>
+    <p class="sectionnote">The audit confirmed this track is core to a "legal body," not gold-plating: today
+    <code>ein</code>/<code>formationDate</code> are stubbed and the on-chain dissolution lifecycle exists but is
+    unsurfaced. A legal-body product without real filing/EIN/OA/KYC is a technical shell around a legal placeholder.</p>
 
     <div class="item"><div class="rank">1</div><div class="ic">
-      <div class="ititle">Real entity formation</div>
-      <div class="why">Actual Wyoming DAO LLC filing, a real EIN (currently <code>STUB-NOT-FILED</code>),
-      crypto-friendly banking, and legally-reviewed operating-agreement documents. <b>Why it matters:</b> without
-      real filings the "legal body" is a demonstration, not a legal entity.</div>
+      <div class="ititle">Real entity formation <span class="v conf">Confirmed</span></div>
+      <div class="why">Actual Wyoming DAO LLC filing, a real EIN, crypto-friendly banking, and legally-reviewed
+      operating-agreement documents.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">2</div><div class="ic">
-      <div class="ititle">KYC / user-of-record + OA-to-chain mapping</div>
-      <div class="why">Confirm the KYC "user-of-record" model for an algorithmically-managed LLC, and settle the
-      operating-agreement-clause → on-chain mapping, the Wyoming submission format, and upgradeability disclosure.
-      <b>Why it matters:</b> these legal-architecture questions gate a real filing (a natural-person controller is
-      already established as mandatory).</div>
+      <div class="ititle">KYC / user-of-record + OA-to-chain mapping <span class="v conf">Confirmed</span></div>
+      <div class="why">Confirm the KYC "user-of-record" model (a natural-person controller is already established as
+      mandatory), and settle the OA-clause → on-chain mapping, the Wyoming submission format, and upgradeability
+      disclosure.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">3</div><div class="ic">
-      <div class="ititle">Entity lifecycle &amp; compliance monitoring</div>
-      <div class="why">Dissolution / wind-up, the dissociation mechanic (the human settlor stepping away),
-      inter-entity contracting, and automated compliance (annual filings, sanctions screening, SAR).
-      <b>Why it matters:</b> a legal entity needs a full lifecycle and ongoing compliance, not just creation.</div>
+      <div class="ititle">Entity lifecycle &amp; compliance monitoring <span class="v conf">Confirmed</span></div>
+      <div class="why">Surface the existing dissolution/wind-up lifecycle in-product, plus the dissociation mechanic,
+      inter-entity contracting, and automated compliance (annual filings, sanctions screening, SAR).</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">4</div><div class="ic">
-      <div class="ititle">Multi-jurisdiction + fiat rails</div>
-      <div class="why">Support a second jurisdiction (e.g. Marshall Islands) with unified UX, and a fiat
-      on/off-ramp via Circle Mint. <b>Why it matters:</b> broadens addressable users beyond Wyoming and connects
-      the treasury to the traditional financial system.</div>
+      <div class="ititle">Multi-jurisdiction + fiat rails <span class="v conf">Confirmed</span></div>
+      <div class="why">A second jurisdiction (e.g. Marshall Islands) with unified UX, and a fiat on/off-ramp via
+      Circle Mint. <b>Why it matters:</b> broadens users and connects the treasury to traditional finance.</div>
     </div><div class="pri">🟡</div></div>
   </div>
 
-  <!-- ================= SEQUENCING ================= -->
+  <!-- ============ CORRECTIONS TABLE ============ -->
+  <div class="tier pagebreak">
+    <div class="subhead" style="margin-top:0">Audit corrections at a glance</div>
+    <table class="corr">
+      <tr><th>Item</th><th>Verdict</th><th>What changed</th></tr>
+      <tr><td class="it">Onboarding double-mint window</td><td>Done</td><td>Already fixed (broadcast/confirm split + resume-adopt); thin residual only.</td></tr>
+      <tr><td class="it">Key-claim concurrency lock</td><td>Done</td><td>Already fixed (atomic <code>claimKey</code>).</td></tr>
+      <tr><td class="it">Connection copy label · shadowing-locals nit</td><td>Done</td><td>Already implemented / already renamed.</td></tr>
+      <tr><td class="it">Policy nonce</td><td>Recharacterized</td><td>Phantom for current contracts — no signature path in the treasury policy to replay.</td></tr>
+      <tr><td class="it">"Deployed contracts are mocks"</td><td>Recharacterized</td><td>Live deploy uses the real canonical registries; the gap is CI fork coverage.</td></tr>
+      <tr><td class="it">"Make Turnkey the default signer"</td><td>Recharacterized</td><td>Turnkey is already the operator default; the raw-key exposure is <code>PLATFORM_PRIVATE_KEY</code> (S4).</td></tr>
+      <tr><td class="it">Agent-to-agent payments</td><td>Recharacterized</td><td>No contract work needed — <code>spend()</code> already pays any address.</td></tr>
+      <tr><td class="it">"jobId from event, not simulate"</td><td>Recharacterized</td><td>Infeasible — the job contract emits no event; simulate-return is correct.</td></tr>
+      <tr><td class="it">Treasury-direct x402 signing</td><td>Risk-in-fix</td><td>Naive EIP-1271 bypasses all on-chain caps; needs a stateful settlement design.</td></tr>
+      <tr><td class="it">De-scope <code>retryOnStaleBalance</code></td><td>Risk-in-fix</td><td>Guards RPC read-lag, not the #33 revert; partial de-scope only.</td></tr>
+    </table>
+  </div>
+
+  <!-- ============ SEQUENCING ============ -->
   <div class="tier">
-    <div class="subhead" style="margin-top:16px">Recommended sequencing — the first six</div>
+    <div class="subhead" style="margin-top:14px">Recommended sequencing — post-audit order</div>
     <div class="seq">
       <ol>
-        <li><b>Contracts foundation</b> — beacon → multisig, policy nonce, live-registry fork tests, external audit. Unblocks any real deployment.</li>
-        <li><b>Onboarding correctness</b> — the double-mint window + key-claim lock. Correctness under real, concurrent load.</li>
-        <li><b>Postgres migration</b> — nearly everything else assumes a real multi-writer database.</li>
-        <li><b>Smart-account migration</b> — deletes the gas seeder, the estimate-gas footgun, and the bridge race in one move.</li>
-        <li><b>Real multi-party loop</b> — turns the self-contained demo into an actual marketplace.</li>
-        <li><b>x401 + Circle Dev-Controlled custody</b> — completes the "full Circle stack" story and the legal identity gate.</li>
+        <li><b>S1 + capability split</b> — cap/gate <code>fund_treasury</code> behind an admin capability (same fix). The one item that is a genuine authorization bug.</li>
+        <li><b>Contain the hot-key blast radius</b> — split <code>PLATFORM_PRIVATE_KEY</code>, separate factory/beacon owners (S4), per-agent pocket keys (S3).</li>
+        <li><b>Close the on-chain governance gap (S2)</b> — the real motivation behind treasury-direct signing / removing the hot-EOA path.</li>
+        <li><b>Amplifiers (S5)</b> — aggregate outflow ceiling + rate-limiting + observability.</li>
+        <li><b>Contract pre-mainnet gates</b> — beacon → multisig, guardian rotation, fork tests, external audit.</li>
+        <li><b>Then</b> the product-defining bets (multi-party loop, custody choices, x401) and product/UX/legal tracks.</li>
       </ol>
     </div>
   </div>
 
   <div class="foot">
-    <p class="appendix"><b>Sources.</b> Compiled from the repository's design specs and plans
-    (<code>back/docs/design/*</code>, <code>back/docs/plans/*</code>), the audit notes
-    (<code>back/docs/audit/*</code>), the canonical deferred-items ledger
-    (<code>back/docs/V2_HARDENING_BACKLOG.md</code>), <code>back/docs/SPEC.md</code>, and ongoing product
-    discussions with Circle. Severity legend follows the backlog: 🔴 correctness / safety · 🟠 robustness / ops
-    · 🟡 cleanup / polish.</p>
-    <p style="margin-top:6px">Novi Corpus — V2 Roadmap · internal planning document · July 2026</p>
+    <p class="appendix"><b>Sources &amp; method.</b> Compiled from the repository design specs/plans
+    (<code>back/docs/design/*</code>, <code>back/docs/plans/*</code>), audit notes (<code>back/docs/audit/*</code>),
+    the deferred-items ledger (<code>back/docs/V2_HARDENING_BACKLOG.md</code>), and <code>back/docs/SPEC.md</code>.
+    Every item was then verified against the live code by a four-track audit (contracts, backend, payments/custody,
+    product/infra), read-only, on 2026-07-05. Two independent tracks corroborated finding S2. Severity legend:
+    🔴 correctness / safety · 🟠 robustness / ops · 🟡 cleanup / polish.</p>
+    <p style="margin-top:6px">Novi Corpus — V2 Roadmap v2.1 (audited) · internal planning document · July 2026</p>
   </div>
 
 </body>
