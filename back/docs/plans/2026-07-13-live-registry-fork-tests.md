@@ -4,7 +4,7 @@
 
 **Goal:** Close the CI fork-coverage gap (V2 roadmap Tier 1 #4): exercise the real register and wallet re-bind paths against the live canonical ERC-8004 IdentityRegistry on an Arc-testnet fork, so CI catches real-registry drift that the mocks cannot.
 
-**Architecture:** One new test contract, `test/IdentityRegistryFork.t.sol`, forks Arc testnet at the latest block via `vm.createSelectFork`, deploys the current `LegalManager` + `LegalManagerFactory` from source against the live registry proxy (`0x8004A818BFB912233c491871b3d84c89A494BD9e`), and drives `createEntity` (register path) and `setAgentWallet` (re-bind path) end-to-end. Tests self-skip (`vm.skip`) when `ARC_TESTNET_RPC_URL` is unset, so the no-env local baseline is unchanged; CI sets the public RPC URL so the fork tests always run there. No contract source changes; ERC-8183 is out of scope (interface-only stubs, nothing wired to fork-test — see the roadmap audit note on Tier 1 #4).
+**Architecture:** One new test contract, `test/IdentityRegistryFork.t.sol`, forks Arc testnet at the latest block via `vm.createSelectFork`, deploys the current `LegalManager` + `LegalManagerFactory` from source against the live registry proxy (`0x8004A818BFB912233c491871b3d84c89A494BD9e`), and drives `createEntity` (register path) and `setAgentWallet` (re-bind path) end-to-end. Tests self-skip (`vm.skip`) when `ARC_TESTNET_RPC_URL` is unset OR the local interpreter lacks PUSH0 (runtime probe; the project pins `evm_version = "paris"` while the live registry's bytecode needs shanghai+), so plain local runs are unchanged; CI runs the fork tests in a dedicated `FOUNDRY_EVM_VERSION=shanghai` step with the public RPC URL so they always run there. No contract source changes; ERC-8183 is out of scope (interface-only stubs, nothing wired to fork-test — see the roadmap audit note on Tier 1 #4).
 
 **Tech Stack:** Foundry (forge-std v1.16.1: `vm.createSelectFork`, `vm.skip`, `vm.envOr`), Solidity ^0.8.24 via_ir, OpenZeppelin v5.1.0, Arc testnet (chain id 5042002, public RPC `https://rpc.testnet.arc.network`), GitHub Actions (`.github/workflows/ci.yml`).
 
@@ -19,12 +19,14 @@
 - **Revert-string strictness calibrated to what was verified live:** assert the exact string only for `"deadline too far"` (verified against the live registry 2026-06-16). All other failure cases use a bare `vm.expectRevert()` — the property under test is "the live registry rejects this", not the exact message.
 - **If any fork test fails against the live registry, STOP: that is a real mock-drift finding, not a test bug to paper over.** Diagnose via superpowers:systematic-debugging, and surface it in the PR body for Martin instead of loosening the assertion.
 - **Worktree gotcha:** `back/lib` is gitignored (not a submodule) — copy it from the main checkout into any new worktree or `forge build` fails. Place the worktree under `~/Desktop/Solidity_Project_Files/arc-Circle/worktrees/` (NOT the session scratchpad, which wipes tracked files intermittently).
+- **EVM-version finding (Task 2 execution, 2026-07-13):** `foundry.toml` pins `evm_version = "paris"` for the project's own deployed bytecode, but the LIVE registry's deployed bytecode uses PUSH0, so simulating it under paris reverts `NotActivated` on the first opcode of every call. Design: the tests carry a runtime PUSH0 probe (`_supportsPush0`) and self-skip under a paris interpreter (so a plain local `forge test` with `ARC_TESTNET_RPC_URL` exported never fails), and CI runs them in a dedicated `FOUNDRY_EVM_VERSION=shanghai` step. The paris pin itself may be obsolete (Arc executes the registry's PUSH0 bytecode on-chain just fine); that is flagged to Martin, not changed here.
+- **Auto-bind drift finding (verified by execution 2026-07-13):** the live registry auto-binds `register()`'s caller as agentWallet (as the mock does) but CLEARS the binding on ERC-721 transfer, so after `createEntity`'s NFT hand-off `getAgentWallet` is `address(0)` where MockIdentityRegistry still reports the factory. Documented and pinned by `test_createEntityLeavesAgentWalletUnboundOnLive`; the mock's fidelity comment overstates the post-transfer behavior.
 - **Commit style:** conventional commits matching repo history (`test(...)`, `ci: ...`), body explains rationale, trailer `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Git identity is already set locally (Alex Nesta + GitHub noreply). Do not push; stop after the last commit and draft the PR text.
 
 ## File Structure
 
 - Create: `back/test/IdentityRegistryFork.t.sol` — the entire feature: fork/skip harness, register-path tests, re-bind-path tests, EIP-712 signing helper against the live domain. Flat in `test/` matching every other suite.
-- Modify: `.github/workflows/ci.yml` — add `ARC_TESTNET_RPC_URL` to the contracts job's Test step env (public URL, not a secret).
+- Modify: `.github/workflows/ci.yml` — add a dedicated fork-test step after the contracts job's Test step (`FOUNDRY_EVM_VERSION=shanghai` + the public `ARC_TESTNET_RPC_URL`, not a secret).
 - Create: `back/docs/plans/2026-07-13-live-registry-fork-tests.md` — this plan (committed with the work, precedent PR #9).
 
 ---
@@ -120,8 +122,8 @@ interface IERC5267 {
 
 /// @notice Fork tests of the REAL canonical ERC-8004 IdentityRegistry on Arc testnet
 ///         (V2 roadmap Tier 1 #4). Every other suite runs against MockIdentityRegistry;
-///         these pin the mock's fidelity claims (deadline cap, EIP-712 domain, register
-///         auto-bind) to the live contract so CI catches real-registry drift.
+///         these pin the mock's fidelity claims (deadline cap, EIP-712 domain, the
+///         wallet-binding lifecycle) to the live contract so CI catches real-registry drift.
 /// @dev    Runs only when ARC_TESTNET_RPC_URL is set (CI sets the public RPC; tests
 ///         self-skip locally without it). Forks the LATEST block deliberately: a pinned
 ///         block would never see a registry proxy upgrade. Pure local simulation — no
@@ -151,9 +153,23 @@ contract IdentityRegistryForkTest is Test {
         _;
     }
 
+    /// @dev The project pins evm_version = "paris" (Arc PUSH0 deploy note), but the LIVE
+    ///      registry's deployed bytecode uses PUSH0, so simulating it needs a shanghai+
+    ///      interpreter (CI runs these in a dedicated FOUNDRY_EVM_VERSION=shanghai step).
+    ///      Runtime probe: deploying initcode {PUSH0} succeeds only when PUSH0 is a valid
+    ///      opcode; under paris the CREATE fails and every fork test self-skips.
+    function _supportsPush0() internal returns (bool ok) {
+        bytes memory initcode = hex"5f";
+        address probe;
+        assembly {
+            probe := create(0, add(initcode, 0x20), mload(initcode))
+        }
+        ok = probe != address(0);
+    }
+
     function setUp() public {
         string memory url = vm.envOr("ARC_TESTNET_RPC_URL", string(""));
-        if (bytes(url).length == 0) return; // every test self-skips via onlyFork
+        if (bytes(url).length == 0 || !_supportsPush0()) return; // every test self-skips via onlyFork
         vm.createSelectFork(url);
         forked = true;
         manager = vm.addr(managerPk);
@@ -196,12 +212,18 @@ contract IdentityRegistryForkTest is Test {
         assertEq(storedId, agentId);
     }
 
-    /// @notice The live registry auto-binds register()'s caller — the factory — as the
-    ///         agentWallet until the manager re-binds (mock fidelity claim,
-    ///         MockIdentityRegistry.sol:33-38).
-    function test_registerAutoBindsFactoryAsAgentWallet() public onlyFork {
+    /// @notice DRIFT FINDING (verified by execution 2026-07-13): the live registry DOES
+    ///         auto-bind register()'s caller as the agentWallet (matching
+    ///         MockIdentityRegistry.sol:33-38), but it CLEARS the binding on ERC-721 transfer,
+    ///         so after createEntity's NFT hand-off to the manager both getAgentWallet and the
+    ///         "agentWallet" metadata are empty until an explicit setAgentWallet. The mock does
+    ///         not clear on transfer, so post-createEntity it reports the factory where live
+    ///         reports zero. Harmless to production (the backend always re-binds explicitly),
+    ///         but nothing may rely on a post-transfer binding; this test pins the live behavior.
+    function test_createEntityLeavesAgentWalletUnboundOnLive() public onlyFork {
         (uint256 agentId,,) = _createEntity();
-        assertEq(registry.getAgentWallet(agentId), address(factory));
+        assertEq(registry.getAgentWallet(agentId), address(0));
+        assertEq(registry.getMetadata(agentId, "agentWallet").length, 0);
     }
 
     /// @notice Two entities from one factory get distinct live agentIds and distinct records
@@ -242,9 +264,15 @@ Run: `cd <worktree>/back && env -u ARC_TESTNET_RPC_URL forge test`
 Expected: `162 tests passed, 0 failed, 4 skipped (166 total tests)` — the 4 new tests report `[SKIP]`, all pre-existing tests pass.
 (Note: Foundry auto-loads `back/.env` if present; the worktree has none, but `env -u` makes the skip-path check explicit either way.)
 
+- [ ] **Step 2b: Run WITH the env var but WITHOUT shanghai — expect all 4 to skip via the PUSH0 probe**
+
+Run: `cd <worktree>/back && ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test --match-contract IdentityRegistryForkTest`
+Expected: `0 passed, 0 failed, 4 skipped` — the project's `paris` pin means the local interpreter lacks PUSH0, so `_supportsPush0()` fails and every fork test self-skips instead of reverting.
+
 - [ ] **Step 3: Run against the live fork — all four must pass**
 
-Run: `cd <worktree>/back && ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test --match-contract IdentityRegistryForkTest -vv`
+Run: `cd <worktree>/back && FOUNDRY_EVM_VERSION=shanghai ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test --match-contract IdentityRegistryForkTest -vv`
+`FOUNDRY_EVM_VERSION=shanghai` is required because the live registry's deployed bytecode uses PUSH0; under the project's `paris` pin every call into it reverts `NotActivated`.
 Expected: `4 tests passed, 0 failed, 0 skipped`.
 If any test FAILS here, stop (Global Constraints): it is a live-registry drift finding. Diagnose, do not weaken the assertion.
 
@@ -252,14 +280,25 @@ If any test FAILS here, stop (Global Constraints): it is a live-registry drift f
 
 ```bash
 cd <worktree>
-git add back/test/IdentityRegistryFork.t.sol
+git add back/test/IdentityRegistryFork.t.sol back/docs/plans/2026-07-13-live-registry-fork-tests.md
 git commit -m "test(fork): register path against the live Arc ERC-8004 registry
 
 First fork tests in the suite (roadmap Tier 1 #4 — CI fork-coverage gap):
 createEntity end-to-end against the canonical IdentityRegistry
 (0x8004...BD9e) on an Arc-testnet fork, plus a domain-fidelity test pinning
 the EIP-712 domain / ERC-721 name the mock claims to mirror. Tests self-skip
-when ARC_TESTNET_RPC_URL is unset, so the no-env local run is unchanged.
+when ARC_TESTNET_RPC_URL is unset OR the EVM interpreter lacks PUSH0 (the
+project pins paris; the live registry bytecode needs shanghai+, so CI runs
+these in a dedicated FOUNDRY_EVM_VERSION=shanghai step).
+
+Two findings from first execution, recorded in the plan doc:
+- the live registry clears agentWallet on ERC-721 transfer: it auto-binds
+  register()'s caller like the mock, but after createEntity's NFT hand-off
+  getAgentWallet is address(0) where the mock still reports the factory
+  (mock fidelity drift, pinned by
+  test_createEntityLeavesAgentWalletUnboundOnLive);
+- the paris pin itself may be obsolete: Arc executes the registry's
+  PUSH0 bytecode on-chain. Flagged for Martin, not changed here.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```
@@ -369,7 +408,9 @@ Add inside `IdentityRegistryForkTest`, below the register-path tests:
         vm.prank(makeAddr("stranger"));
         vm.expectRevert();
         registry.setAgentWallet(agentId, wallet, deadline, sig);
-        assertEq(registry.getAgentWallet(agentId), address(factory)); // still the register()-time binding
+        // Still unbound: live clears agentWallet on createEntity's NFT hand-off (see the
+        // drift finding at test_createEntityLeavesAgentWalletUnboundOnLive).
+        assertEq(registry.getAgentWallet(agentId), address(0));
     }
 
     /// @notice A signature from a key other than the wallet being bound is rejected (ECDSA
@@ -384,13 +425,14 @@ Add inside `IdentityRegistryForkTest`, below the register-path tests:
         vm.prank(manager);
         vm.expectRevert();
         registry.setAgentWallet(agentId, wallet, deadline, sigFromWrongKey);
-        assertEq(registry.getAgentWallet(agentId), address(factory));
+        assertEq(registry.getAgentWallet(agentId), address(0)); // still unbound, same as above
     }
 ```
 
 - [ ] **Step 2: Run against the live fork — all nine must pass**
 
-Run: `cd <worktree>/back && ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test --match-contract IdentityRegistryForkTest -vv`
+Run: `cd <worktree>/back && FOUNDRY_EVM_VERSION=shanghai ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test --match-contract IdentityRegistryForkTest -vv`
+`FOUNDRY_EVM_VERSION=shanghai` is required because the live registry's deployed bytecode uses PUSH0; under the project's `paris` pin every call into it reverts `NotActivated`.
 Expected: `9 tests passed, 0 failed, 0 skipped`.
 Same stop-rule as Task 2 Step 3 on any failure.
 
@@ -399,7 +441,8 @@ Same stop-rule as Task 2 Step 3 on any failure.
 Run: `cd <worktree>/back && env -u ARC_TESTNET_RPC_URL forge test`
 Expected: `162 tests passed, 0 failed, 9 skipped (171 total tests)`
 
-Run: `cd <worktree>/back && ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test`
+Run: `cd <worktree>/back && FOUNDRY_EVM_VERSION=shanghai ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test`
+`FOUNDRY_EVM_VERSION=shanghai` here too, or the nine fork tests self-skip via the PUSH0 probe instead of running.
 Expected: `171 tests passed, 0 failed, 0 skipped (171 total tests)`
 
 - [ ] **Step 4: Commit**
@@ -429,30 +472,19 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - Consumes: the Test step at the end of the `contracts` job (currently env has only `FOUNDRY_FUZZ_RUNS` / `FOUNDRY_INVARIANT_RUNS`).
 - Produces: CI runs the fork tests on every push/PR. The URL is the public RPC already published in `.env.example` — plain env, not a secret, so fork PRs work too.
 
-- [ ] **Step 1: Add the RPC URL to the Test step**
+- [ ] **Step 1: Add a dedicated fork-test step after the existing Test step**
 
-In `.github/workflows/ci.yml`, change:
-
-```yaml
-      - name: Test
-        run: forge test -vv
-        env:
-          # Reduced depth on routine PRs for fast feedback; full depth only when contracts change.
-          FOUNDRY_FUZZ_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '64' }}
-          FOUNDRY_INVARIANT_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '32' }}
-```
-
-to:
+In `.github/workflows/ci.yml`, leave the existing Test step untouched and add a NEW step directly after it:
 
 ```yaml
-      - name: Test
-        run: forge test -vv
+      - name: Fork tests (live Arc registry)
+        run: forge test --match-contract IdentityRegistryForkTest -vv
         env:
-          # Reduced depth on routine PRs for fast feedback; full depth only when contracts change.
-          FOUNDRY_FUZZ_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '64' }}
-          FOUNDRY_INVARIANT_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '32' }}
-          # Public Arc-testnet RPC (same URL as .env.example) so the live-registry fork tests
-          # run in CI; without it they self-skip. Plain env, not a secret.
+          # The live registry's deployed bytecode uses PUSH0; the project pin stays paris
+          # (Arc deploy note), so the fork tests get their own shanghai run. The RPC URL is
+          # the public endpoint already in .env.example — plain env, not a secret; the
+          # tests self-skip anywhere it is absent.
+          FOUNDRY_EVM_VERSION: shanghai
           ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.network
 ```
 
@@ -461,22 +493,26 @@ to:
 Run: `cd <worktree> && python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/ci.yml')); print('yaml ok')"`
 Expected: `yaml ok`
 
-- [ ] **Step 3: Re-run the full suite once more exactly as CI will**
+- [ ] **Step 3: Re-run exactly as CI will, both steps**
 
-Run: `cd <worktree>/back && ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test -vv 2>&1 | tail -3`
-Expected: `171 tests passed, 0 failed, 0 skipped (171 total tests)`
+Run: `cd <worktree>/back && FOUNDRY_EVM_VERSION=shanghai ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.network forge test --match-contract IdentityRegistryForkTest -vv 2>&1 | tail -3`
+Expected: `9 tests passed, 0 failed, 0 skipped` (mirrors CI's dedicated fork-test step; shanghai because the live registry bytecode uses PUSH0).
+
+Run: `cd <worktree>/back && env -u ARC_TESTNET_RPC_URL forge test 2>&1 | tail -3`
+Expected: `162 tests passed, 0 failed, 9 skipped (171 total tests)` (mirrors CI's plain Test step, where the fork tests self-skip).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 cd <worktree>
 git add .github/workflows/ci.yml
-git commit -m "ci: run the live-registry fork tests via the public Arc RPC
+git commit -m "ci: run the live-registry fork tests in a dedicated shanghai step
 
-ARC_TESTNET_RPC_URL on the forge test step (the public URL already in
-.env.example — plain env, not a secret, so fork PRs run it too). Closes the
-roadmap Tier 1 #4 CI fork-coverage gap; the tests self-skip anywhere the
-variable is absent.
+New step after the contracts Test step: FOUNDRY_EVM_VERSION=shanghai (the
+live registry bytecode uses PUSH0; the project pin stays paris) plus
+ARC_TESTNET_RPC_URL (the public URL already in .env.example — plain env,
+not a secret, so fork PRs run it too). Closes the roadmap Tier 1 #4 CI
+fork-coverage gap; the tests self-skip anywhere the variable is absent.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```
