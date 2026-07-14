@@ -62,6 +62,16 @@ jobs:
           FOUNDRY_FUZZ_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '64' }}
           FOUNDRY_INVARIANT_RUNS: ${{ steps.changes.outputs.contracts == 'true' && '256' || '32' }}
 
+      - name: Fork tests (live Arc registry)
+        run: forge test --match-contract IdentityRegistryForkTest -vv
+        env:
+          # The live registry's deployed bytecode uses PUSH0; the project pin stays paris
+          # (Arc deploy note), so the fork tests get their own shanghai run. The RPC URL is
+          # the public endpoint already in .env.example — plain env, not a secret; the
+          # tests self-skip anywhere it is absent.
+          FOUNDRY_EVM_VERSION: shanghai
+          ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.network
+
   backend:
     name: Backend (vitest)
     runs-on: ubuntu-latest
