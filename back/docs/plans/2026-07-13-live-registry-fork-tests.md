@@ -20,7 +20,7 @@
 - **If any fork test fails against the live registry, STOP: that is a real mock-drift finding, not a test bug to paper over.** Diagnose via superpowers:systematic-debugging, and surface it in the PR body for Martin instead of loosening the assertion.
 - **Worktree gotcha:** `back/lib` is gitignored (not a submodule) — copy it from the main checkout into any new worktree or `forge build` fails. Place the worktree under `~/Desktop/Solidity_Project_Files/arc-Circle/worktrees/` (NOT the session scratchpad, which wipes tracked files intermittently).
 - **EVM-version finding (Task 2 execution, 2026-07-13):** `foundry.toml` pins `evm_version = "paris"` for the project's own deployed bytecode, but the LIVE registry's deployed bytecode uses PUSH0, so simulating it under paris reverts `NotActivated` on the first opcode of every call. Design: the tests carry a runtime PUSH0 probe (`_supportsPush0`) and self-skip under a paris interpreter (so a plain local `forge test` with `ARC_TESTNET_RPC_URL` exported never fails), and CI runs them in a dedicated `FOUNDRY_EVM_VERSION=shanghai` step. The paris pin itself may be obsolete (Arc executes the registry's PUSH0 bytecode on-chain just fine); that is flagged to Martin, not changed here.
-- **Auto-bind drift finding (verified by execution 2026-07-13):** the live registry auto-binds `register()`'s caller as agentWallet (as the mock does) but CLEARS the binding on ERC-721 transfer, so after `createEntity`'s NFT hand-off `getAgentWallet` is `address(0)` where MockIdentityRegistry still reports the factory. Documented and pinned by `test_createEntityLeavesAgentWalletUnboundOnLive`; the mock's fidelity comment overstates the post-transfer behavior.
+- **Auto-bind drift finding (verified by execution 2026-07-13):** the live registry auto-binds `register()`'s caller as agentWallet (as the mock does) but CLEARS the binding on ERC-721 transfer, so after `createEntity`'s NFT hand-off `getAgentWallet` is `address(0)` where MockIdentityRegistry still reports the factory. Documented and pinned by `test_createEntityLeavesAgentWalletUnboundOnLive`. Precisely: the mock's auto-bind (`MockIdentityRegistry.sol:33-38`) is faithful; the divergence is its `transferFrom` (`:93-98`), which forwards to ERC721 without clearing `_agentWallet`, leaving the header's "Faithful test double / Mirrors the verified on-chain implementation" claim (`:10-12`) incomplete on this point.
 - **Commit style:** conventional commits matching repo history (`test(...)`, `ci: ...`), body explains rationale, trailer `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Git identity is already set locally (Alex Nesta + GitHub noreply). Do not push; stop after the last commit and draft the PR text.
 
 ## File Structure
@@ -229,9 +229,12 @@ contract IdentityRegistryForkTest is Test {
     ///         auto-bind register()'s caller as the agentWallet (matching
     ///         MockIdentityRegistry.sol:33-38), but it CLEARS the binding on ERC-721 transfer,
     ///         so after createEntity's NFT hand-off to the manager both getAgentWallet and the
-    ///         "agentWallet" metadata are empty until an explicit setAgentWallet. The mock does
-    ///         not clear on transfer, so post-createEntity it reports the factory where live
-    ///         reports zero. Harmless to production (the backend always re-binds explicitly),
+    ///         "agentWallet" metadata are empty until an explicit setAgentWallet. The mock's
+    ///         transferFrom (MockIdentityRegistry.sol:93-98) forwards to ERC721 without clearing
+    ///         _agentWallet, so post-createEntity it reports the factory where live reports zero;
+    ///         that omission is what makes the mock's "Faithful test double / Mirrors the
+    ///         verified on-chain implementation" header (:10-12) incomplete on this point.
+    ///         Harmless to production (the backend always re-binds explicitly),
     ///         but nothing may rely on a post-transfer binding; this test pins the live behavior.
     function test_createEntityLeavesAgentWalletUnboundOnLive() public onlyFork {
         (uint256 agentId,,) = _createEntity();

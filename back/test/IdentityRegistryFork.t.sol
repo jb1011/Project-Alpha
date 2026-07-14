@@ -134,9 +134,12 @@ contract IdentityRegistryForkTest is Test {
     ///         auto-bind register()'s caller as the agentWallet (matching
     ///         MockIdentityRegistry.sol:33-38), but it CLEARS the binding on ERC-721 transfer,
     ///         so after createEntity's NFT hand-off to the manager both getAgentWallet and the
-    ///         "agentWallet" metadata are empty until an explicit setAgentWallet. The mock does
-    ///         not clear on transfer, so post-createEntity it reports the factory where live
-    ///         reports zero. Harmless to production (the backend always re-binds explicitly),
+    ///         "agentWallet" metadata are empty until an explicit setAgentWallet. The mock's
+    ///         transferFrom (MockIdentityRegistry.sol:93-98) forwards to ERC721 without clearing
+    ///         _agentWallet, so post-createEntity it reports the factory where live reports zero;
+    ///         that omission is what makes the mock's "Faithful test double / Mirrors the
+    ///         verified on-chain implementation" header (:10-12) incomplete on this point.
+    ///         Harmless to production (the backend always re-binds explicitly),
     ///         but nothing may rely on a post-transfer binding; this test pins the live behavior.
     function test_createEntityLeavesAgentWalletUnboundOnLive() public onlyFork {
         (uint256 agentId,,) = _createEntity();
