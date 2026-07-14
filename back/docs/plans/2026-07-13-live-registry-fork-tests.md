@@ -8,7 +8,7 @@
 
 **Tech Stack:** Foundry (forge-std v1.16.1: `vm.createSelectFork`, `vm.skip`, `vm.envOr`), Solidity ^0.8.24 via_ir, OpenZeppelin v5.1.0, Arc testnet (chain id 5042002, public RPC `https://rpc.testnet.arc.network`), GitHub Actions (`.github/workflows/ci.yml`).
 
-**Reference spec:** `docs/Novi-Corpus-V2-Roadmap.html` Tier 1 #4 (recharacterized: "the genuine gap is CI fork coverage of the real paths"); mock-fidelity claims to pin live in `test/mocks/MockIdentityRegistry.sol:20-31` (deadline cap "deadline too far" beyond +300s, verified live 2026-06-16; EIP-712 domain name `ERC8004IdentityRegistry` version `1`, read live 2026-06-15; ERC-721 name `AgentIdentity` deliberately different) and `register` auto-binding the caller as agentWallet (`MockIdentityRegistry.sol:33-38`). Live domain re-verified 2026-07-13 by `cast call eip712Domain()`: fields `0x0f`, name `ERC8004IdentityRegistry`, version `1`, chainId `5042002`, verifyingContract = the proxy itself.
+**Reference spec:** `docs/Novi-Corpus-V2-Roadmap.html` Tier 1 #4 (recharacterized: "the genuine gap is CI fork coverage of the real paths"); mock-fidelity claims to pin live in `test/mocks/MockIdentityRegistry.sol:20-31` (deadline cap "deadline too far" beyond +300s, verified live 2026-06-16; EIP-712 domain name `ERC8004IdentityRegistry` version `1`, read live 2026-06-15; ERC-721 name `AgentIdentity` deliberately different) and `register` auto-binding the caller as agentWallet (`MockIdentityRegistry.sol:33-38`; live additionally clears the binding on ERC-721 transfer, see the drift finding in Global Constraints). Live domain re-verified 2026-07-13 by `cast call eip712Domain()`: fields `0x0f`, name `ERC8004IdentityRegistry`, version `1`, chainId `5042002`, verifyingContract = the proxy itself.
 
 ## Global Constraints
 
@@ -102,6 +102,7 @@ import {LegalManager} from "../src/LegalManager.sol";
 import {LegalManagerFactory} from "../src/LegalManagerFactory.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 
 /// @dev EIP-5267 subset — the live registry exposes its EIP-712 domain on-chain, so the
 ///      re-bind tests can sign against the real domain instead of hardcoding it.
@@ -133,10 +134,16 @@ contract IdentityRegistryForkTest is Test {
     ///      (src/interfaces/IIdentityRegistry.sol:6, .env.example IDENTITY_REGISTRY).
     address internal constant LIVE_REGISTRY = 0x8004A818BFB912233c491871b3d84c89A494BD9e;
     uint256 internal constant ARC_TESTNET_CHAIN_ID = 5042002;
+    /// @dev Solidity cannot initialize a constant from another contract's public constant under
+    ///      this solc/via_ir config (tried; "Member ... not found" at compile time), so this
+    ///      stays a literal duplicate of MockIdentityRegistry.AGENT_WALLET_SET_TYPEHASH.
+    ///      test_liveDomainMatchesMockAssumptions asserts equality against the mock so mock
+    ///      drift still fails here.
     bytes32 internal constant AGENT_WALLET_SET_TYPEHASH =
         keccak256("AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)");
-    /// @dev Mirrors MockIdentityRegistry.MAX_DEADLINE_DELAY; the live value was verified
-    ///      2026-06-16 and is re-pinned by test_rebindDeadlineCapMatchesMock.
+    /// @dev Same constraint as above: literal duplicate of MockIdentityRegistry.MAX_DEADLINE_DELAY;
+    ///      the live value was verified 2026-06-16 and test_rebindDeadlineCapMatchesMock asserts
+    ///      equality against the mock so mock drift fails here too.
     uint256 internal constant MAX_DEADLINE_DELAY = 5 minutes;
 
     IIdentityRegistry internal registry = IIdentityRegistry(LIVE_REGISTRY);
@@ -169,7 +176,13 @@ contract IdentityRegistryForkTest is Test {
 
     function setUp() public {
         string memory url = vm.envOr("ARC_TESTNET_RPC_URL", string(""));
-        if (bytes(url).length == 0 || !_supportsPush0()) return; // every test self-skips via onlyFork
+        if (bytes(url).length == 0 || !_supportsPush0()) {
+            // Tripwire for the dedicated CI step: skipping is fine locally, but the step whose
+            // whole purpose is drift detection must never go green having run nothing. CI sets
+            // FORK_TESTS_REQUIRED=1; if either env line is later dropped, this fails loudly.
+            require(!vm.envOr("FORK_TESTS_REQUIRED", false), "fork tests required but would skip");
+            return; // every test self-skips via onlyFork
+        }
         vm.createSelectFork(url);
         forked = true;
         manager = vm.addr(managerPk);
@@ -243,6 +256,11 @@ contract IdentityRegistryForkTest is Test {
     ///         of these drift, this fails before the drift reaches production signing code.
     function test_liveDomainMatchesMockAssumptions() public onlyFork {
         assertEq(block.chainid, ARC_TESTNET_CHAIN_ID);
+        // MockIdentityRegistry.AGENT_WALLET_SET_TYPEHASH isn't reachable as a bare type-level
+        // member here (it inherits ERC721/EIP712, so solc requires an instance for the public
+        // constant's getter); a throwaway local instance still pins mock drift at this literal.
+        MockIdentityRegistry mockForConstants = new MockIdentityRegistry();
+        assertEq(AGENT_WALLET_SET_TYPEHASH, mockForConstants.AGENT_WALLET_SET_TYPEHASH());
 
         (bytes1 fields, string memory name, string memory version, uint256 chainId, address verifying,,) =
             IERC5267(LIVE_REGISTRY).eip712Domain();
@@ -330,8 +348,9 @@ Note (execution finding): signatures must be precomputed into locals before each
         view
         returns (bytes memory)
     {
-        (, string memory name, string memory version, uint256 chainId, address verifying,,) =
+        (bytes1 fields, string memory name, string memory version, uint256 chainId, address verifying,,) =
             IERC5267(LIVE_REGISTRY).eip712Domain();
+        require(fields == bytes1(0x0f), "unexpected EIP-712 domain shape");
         bytes32 domainSeparator = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -387,6 +406,11 @@ Note (execution finding): signatures must be precomputed into locals before each
         uint256 walletPk = 0xBEEF;
         address wallet = vm.addr(walletPk);
         uint256 cap = block.timestamp + MAX_DEADLINE_DELAY;
+
+        // Same reachability constraint as test_liveDomainMatchesMockAssumptions: pin via a
+        // throwaway instance rather than a bare type-level member.
+        MockIdentityRegistry mockForConstants = new MockIdentityRegistry();
+        assertEq(MAX_DEADLINE_DELAY, mockForConstants.MAX_DEADLINE_DELAY());
 
         bytes memory sigPastCap = _signWalletSet(walletPk, agentId, wallet, manager, cap + 1);
         vm.prank(manager);
@@ -490,6 +514,8 @@ In `.github/workflows/ci.yml`, leave the existing Test step untouched and add a 
           # tests self-skip anywhere it is absent.
           FOUNDRY_EVM_VERSION: shanghai
           ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.network
+          # Tripwire: fail this step instead of silently skipping if the env above is ever dropped.
+          FORK_TESTS_REQUIRED: "1"
 ```
 
 - [ ] **Step 2: Sanity-check the workflow YAML parses**
@@ -532,4 +558,4 @@ Draft the PR title + body (offer to Martin for review; note the fork-latest-vs-p
 - **Spec coverage:** Tier 1 #4's recharacterized gap is "CI fork coverage of the real paths": register path (Task 2), re-bind path (Task 3), CI execution (Task 4). The external-audit half of the roadmap item is explicitly not a code task. ERC-8183 excluded with a reason recorded in the Architecture note.
 - **Placeholder scan:** all steps carry complete code/commands and exact expected outputs; no TBDs.
 - **Type consistency:** `_signWalletSet` is defined in Task 3 with the same signature its call sites use; Task 3 consumes Task 2's helpers by the exact names Task 2 produces; `meta()` destructuring matches `LegalMeta` field order (`src/LegalManager.sol:22-27`).
-- **Known risks accepted:** public-RPC flakiness makes CI red rather than silently skipping (deliberate — a skip in CI would defeat the gap-closing); `payable(proxy)` cast needed because `LegalManager` has a `receive()`; if the live registry rejects any assumption (auto-bind, typehash, cap) the run stops and the drift is reported, per Global Constraints.
+- **Known risks accepted:** public-RPC flakiness makes CI red rather than silently skipping (deliberate — a skip in CI would defeat the gap-closing); the `FORK_TESTS_REQUIRED=1` tripwire in the dedicated CI step additionally covers the case where a future edit drops the `ARC_TESTNET_RPC_URL` or `FOUNDRY_EVM_VERSION` env line, turning what would otherwise be a silent all-skip green pass into a loud `setUp()` failure; `payable(proxy)` cast needed because `LegalManager` has a `receive()`; if the live registry rejects any assumption (auto-bind, typehash, cap) the run stops and the drift is reported, per Global Constraints.

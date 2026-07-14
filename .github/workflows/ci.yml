@@ -71,6 +71,8 @@ jobs:
           # tests self-skip anywhere it is absent.
           FOUNDRY_EVM_VERSION: shanghai
           ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.network
+          # Tripwire: fail this step instead of silently skipping if the env above is ever dropped.
+          FORK_TESTS_REQUIRED: "1"
 
   backend:
     name: Backend (vitest)

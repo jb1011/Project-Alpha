@@ -7,6 +7,7 @@ import {LegalManager} from "../src/LegalManager.sol";
 import {LegalManagerFactory} from "../src/LegalManagerFactory.sol";
 import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 
 /// @dev EIP-5267 subset — the live registry exposes its EIP-712 domain on-chain, so the
 ///      re-bind tests can sign against the real domain instead of hardcoding it.
@@ -38,10 +39,16 @@ contract IdentityRegistryForkTest is Test {
     ///      (src/interfaces/IIdentityRegistry.sol:6, .env.example IDENTITY_REGISTRY).
     address internal constant LIVE_REGISTRY = 0x8004A818BFB912233c491871b3d84c89A494BD9e;
     uint256 internal constant ARC_TESTNET_CHAIN_ID = 5042002;
+    /// @dev Solidity cannot initialize a constant from another contract's public constant under
+    ///      this solc/via_ir config (tried; "Member ... not found" at compile time), so this
+    ///      stays a literal duplicate of MockIdentityRegistry.AGENT_WALLET_SET_TYPEHASH.
+    ///      test_liveDomainMatchesMockAssumptions asserts equality against the mock so mock
+    ///      drift still fails here.
     bytes32 internal constant AGENT_WALLET_SET_TYPEHASH =
         keccak256("AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)");
-    /// @dev Mirrors MockIdentityRegistry.MAX_DEADLINE_DELAY; the live value was verified
-    ///      2026-06-16 and is re-pinned by test_rebindDeadlineCapMatchesMock.
+    /// @dev Same constraint as above: literal duplicate of MockIdentityRegistry.MAX_DEADLINE_DELAY;
+    ///      the live value was verified 2026-06-16 and test_rebindDeadlineCapMatchesMock asserts
+    ///      equality against the mock so mock drift fails here too.
     uint256 internal constant MAX_DEADLINE_DELAY = 5 minutes;
 
     IIdentityRegistry internal registry = IIdentityRegistry(LIVE_REGISTRY);
@@ -74,7 +81,13 @@ contract IdentityRegistryForkTest is Test {
 
     function setUp() public {
         string memory url = vm.envOr("ARC_TESTNET_RPC_URL", string(""));
-        if (bytes(url).length == 0 || !_supportsPush0()) return; // every test self-skips via onlyFork
+        if (bytes(url).length == 0 || !_supportsPush0()) {
+            // Tripwire for the dedicated CI step: skipping is fine locally, but the step whose
+            // whole purpose is drift detection must never go green having run nothing. CI sets
+            // FORK_TESTS_REQUIRED=1; if either env line is later dropped, this fails loudly.
+            require(!vm.envOr("FORK_TESTS_REQUIRED", false), "fork tests required but would skip");
+            return; // every test self-skips via onlyFork
+        }
         vm.createSelectFork(url);
         forked = true;
         manager = vm.addr(managerPk);
@@ -148,6 +161,11 @@ contract IdentityRegistryForkTest is Test {
     ///         of these drift, this fails before the drift reaches production signing code.
     function test_liveDomainMatchesMockAssumptions() public onlyFork {
         assertEq(block.chainid, ARC_TESTNET_CHAIN_ID);
+        // MockIdentityRegistry.AGENT_WALLET_SET_TYPEHASH isn't reachable as a bare type-level
+        // member here (it inherits ERC721/EIP712, so solc requires an instance for the public
+        // constant's getter); a throwaway local instance still pins mock drift at this literal.
+        MockIdentityRegistry mockForConstants = new MockIdentityRegistry();
+        assertEq(AGENT_WALLET_SET_TYPEHASH, mockForConstants.AGENT_WALLET_SET_TYPEHASH());
 
         (bytes1 fields, string memory name, string memory version, uint256 chainId, address verifying,,) =
             IERC5267(LIVE_REGISTRY).eip712Domain();
@@ -170,8 +188,9 @@ contract IdentityRegistryForkTest is Test {
         view
         returns (bytes memory)
     {
-        (, string memory name, string memory version, uint256 chainId, address verifying,,) =
+        (bytes1 fields, string memory name, string memory version, uint256 chainId, address verifying,,) =
             IERC5267(LIVE_REGISTRY).eip712Domain();
+        require(fields == bytes1(0x0f), "unexpected EIP-712 domain shape");
         bytes32 domainSeparator = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -227,6 +246,11 @@ contract IdentityRegistryForkTest is Test {
         uint256 walletPk = 0xBEEF;
         address wallet = vm.addr(walletPk);
         uint256 cap = block.timestamp + MAX_DEADLINE_DELAY;
+
+        // Same reachability constraint as test_liveDomainMatchesMockAssumptions: pin via a
+        // throwaway instance rather than a bare type-level member.
+        MockIdentityRegistry mockForConstants = new MockIdentityRegistry();
+        assertEq(MAX_DEADLINE_DELAY, mockForConstants.MAX_DEADLINE_DELAY());
 
         bytes memory sigPastCap = _signWalletSet(walletPk, agentId, wallet, manager, cap + 1);
         vm.prank(manager);
