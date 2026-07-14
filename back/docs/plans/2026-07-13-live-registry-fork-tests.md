@@ -318,6 +318,8 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 Add inside `IdentityRegistryForkTest`, below the register-path tests:
 
+Note (execution finding): signatures must be precomputed into locals before each `vm.prank` — `_signWalletSet` performs a real `eip712Domain()` staticcall, which would otherwise consume a single-call prank and revert the bind with "Not authorized".
+
 ```solidity
     // ---------------------------------------------------------------- re-bind path
 
@@ -366,10 +368,12 @@ Add inside `IdentityRegistryForkTest`, below the register-path tests:
         (uint256 agentId,,) = _createEntity();
         uint256 deadline = block.timestamp + MAX_DEADLINE_DELAY;
 
+        bytes memory sig1 = _signWalletSet(0xBEEF, agentId, vm.addr(0xBEEF), manager, deadline);
         vm.prank(manager);
-        registry.setAgentWallet(agentId, vm.addr(0xBEEF), deadline, _signWalletSet(0xBEEF, agentId, vm.addr(0xBEEF), manager, deadline));
+        registry.setAgentWallet(agentId, vm.addr(0xBEEF), deadline, sig1);
+        bytes memory sig2 = _signWalletSet(0xCAFE, agentId, vm.addr(0xCAFE), manager, deadline);
         vm.prank(manager);
-        registry.setAgentWallet(agentId, vm.addr(0xCAFE), deadline, _signWalletSet(0xCAFE, agentId, vm.addr(0xCAFE), manager, deadline));
+        registry.setAgentWallet(agentId, vm.addr(0xCAFE), deadline, sig2);
 
         assertEq(registry.getAgentWallet(agentId), vm.addr(0xCAFE));
     }
