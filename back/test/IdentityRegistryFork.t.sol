@@ -160,4 +160,115 @@ contract IdentityRegistryForkTest is Test {
         // ERC-721 name is deliberately different from the EIP-712 domain name.
         assertEq(IERC721Metadata(LIVE_REGISTRY).name(), "AgentIdentity");
     }
+
+    // ---------------------------------------------------------------- re-bind path
+
+    /// @dev Signs AgentWalletSet over the registry's LIVE EIP-712 domain (read on-chain via
+    ///      eip712Domain(), not hardcoded) with the key of the wallet being bound.
+    function _signWalletSet(uint256 walletPk, uint256 agentId, address newWallet, address owner_, uint256 deadline)
+        internal
+        view
+        returns (bytes memory)
+    {
+        (, string memory name, string memory version, uint256 chainId, address verifying,,) =
+            IERC5267(LIVE_REGISTRY).eip712Domain();
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes(name)),
+                keccak256(bytes(version)),
+                chainId,
+                verifying
+            )
+        );
+        bytes32 structHash = keccak256(abi.encode(AGENT_WALLET_SET_TYPEHASH, agentId, newWallet, owner_, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(walletPk, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    /// @notice The canonical re-bind: the manager (NFT owner) binds a new wallet with that
+    ///         wallet's EIP-712 signature — the step the factory deliberately does NOT do
+    ///         on-chain (LegalManagerFactory.sol:17-20), here against the live verifier.
+    function test_managerRebindsWalletOnLiveRegistry() public onlyFork {
+        (uint256 agentId,,) = _createEntity();
+        uint256 walletPk = 0xBEEF;
+        address wallet = vm.addr(walletPk);
+        uint256 deadline = block.timestamp + MAX_DEADLINE_DELAY;
+
+        bytes memory sig = _signWalletSet(walletPk, agentId, wallet, manager, deadline);
+        vm.prank(manager);
+        registry.setAgentWallet(agentId, wallet, deadline, sig);
+
+        assertEq(registry.getAgentWallet(agentId), wallet);
+    }
+
+    /// @notice Binding is repeatable: a second re-bind to a different wallet overwrites the first.
+    function test_rebindSecondTimeOverwritesFirst() public onlyFork {
+        (uint256 agentId,,) = _createEntity();
+        uint256 deadline = block.timestamp + MAX_DEADLINE_DELAY;
+
+        bytes memory sig1 = _signWalletSet(0xBEEF, agentId, vm.addr(0xBEEF), manager, deadline);
+        vm.prank(manager);
+        registry.setAgentWallet(agentId, vm.addr(0xBEEF), deadline, sig1);
+        bytes memory sig2 = _signWalletSet(0xCAFE, agentId, vm.addr(0xCAFE), manager, deadline);
+        vm.prank(manager);
+        registry.setAgentWallet(agentId, vm.addr(0xCAFE), deadline, sig2);
+
+        assertEq(registry.getAgentWallet(agentId), vm.addr(0xCAFE));
+    }
+
+    /// @notice Pins the live 5-minute deadline cap the mock encodes (verified live 2026-06-16,
+    ///         MockIdentityRegistry.sol:20-22): one second past the cap reverts with the exact
+    ///         live string; exactly at the cap succeeds. The production signer relies on this
+    ///         bound (registry caps at 300s — see the coverage-audit TODO).
+    function test_rebindDeadlineCapMatchesMock() public onlyFork {
+        (uint256 agentId,,) = _createEntity();
+        uint256 walletPk = 0xBEEF;
+        address wallet = vm.addr(walletPk);
+        uint256 cap = block.timestamp + MAX_DEADLINE_DELAY;
+
+        bytes memory sigPastCap = _signWalletSet(walletPk, agentId, wallet, manager, cap + 1);
+        vm.prank(manager);
+        vm.expectRevert(bytes("deadline too far"));
+        registry.setAgentWallet(agentId, wallet, cap + 1, sigPastCap);
+
+        bytes memory sigAtCap = _signWalletSet(walletPk, agentId, wallet, manager, cap);
+        vm.prank(manager);
+        registry.setAgentWallet(agentId, wallet, cap, sigAtCap);
+        assertEq(registry.getAgentWallet(agentId), wallet);
+    }
+
+    /// @notice A caller who is not the NFT owner (nor approved) cannot re-bind, even with a
+    ///         valid wallet signature. Bare expectRevert: the exact live revert string for
+    ///         this case was never verified, and the property is the rejection itself.
+    function test_rebindRevertsForNonOwnerCaller() public onlyFork {
+        (uint256 agentId,,) = _createEntity();
+        uint256 walletPk = 0xBEEF;
+        address wallet = vm.addr(walletPk);
+        uint256 deadline = block.timestamp + MAX_DEADLINE_DELAY;
+        bytes memory sig = _signWalletSet(walletPk, agentId, wallet, manager, deadline);
+
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        registry.setAgentWallet(agentId, wallet, deadline, sig);
+        // Still unbound: live clears agentWallet on createEntity's NFT hand-off (see the
+        // drift finding at test_createEntityLeavesAgentWalletUnboundOnLive).
+        assertEq(registry.getAgentWallet(agentId), address(0));
+    }
+
+    /// @notice A signature from a key other than the wallet being bound is rejected (ECDSA
+    ///         recovers a different address; the EOA has no ERC-1271 fallback). Bare
+    ///         expectRevert for the same reason as above.
+    function test_rebindRevertsForWrongSigner() public onlyFork {
+        (uint256 agentId,,) = _createEntity();
+        address wallet = vm.addr(0xBEEF);
+        uint256 deadline = block.timestamp + MAX_DEADLINE_DELAY;
+        bytes memory sigFromWrongKey = _signWalletSet(0xD00D, agentId, wallet, manager, deadline);
+
+        vm.prank(manager);
+        vm.expectRevert();
+        registry.setAgentWallet(agentId, wallet, deadline, sigFromWrongKey);
+        assertEq(registry.getAgentWallet(agentId), address(0)); // still unbound, same as above
+    }
 }
