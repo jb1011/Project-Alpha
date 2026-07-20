@@ -136,9 +136,16 @@ export function BootstrapAgent() {
               You&apos;re about to create a <span className="text-ink">tenant-wide</span> connection with{" "}
               <span className="text-ink">{capability}</span> power, anchored to the guardian passkey you just
               created. Any agent that receives the one-time link code can act on your legal bodies at this level.
-              {capability === "spend" && (
+              {capability !== "read" && (
                 <div className="mt-2">
-                  &ldquo;spend&rdquo; also lets the agent fund treasuries and create new agent legal bodies.
+                  {capability === "provision" ? (
+                    <>
+                      &ldquo;provision&rdquo; also lets the agent fund treasuries from the platform and create new
+                      agent legal bodies.
+                    </>
+                  ) : (
+                    "This lets a connected agent act and pay on your behalf, within that capability's limits."
+                  )}
                 </div>
               )}
             </Callout>

@@ -27,7 +27,13 @@ Verify: `curl https://api.<domain>/healthz` → `{"ok":true}`; `curl https://api
 | Turnkey vars + `FACTORY_ADDRESS` | `onboard_agent`, `fund_treasury`, `fund_pocket` | operator signing + the factory contract |
 | `JOB_EVALUATOR_PRIVATE_KEY` (+ client/`PLATFORM_PRIVATE_KEY`) | `run_job` | platform stands in for client+evaluator |
 | `MAX_JOB_BUDGET_USDC` (def 5), `MAX_INFLIGHT_JOBS_PER_TENANT` (def 3) | `run_job` drain guard | tune if desired |
+| `MAX_TREASURY_FUND_USDC` (def 25), `MAX_TREASURY_FUNDED_PER_TENANT_USDC` (def 100) | `fund_treasury` drain guard | per-call cap + per-tenant lifetime quota on platform→treasury funding; tune if desired |
 | `SPEND_ALLOWLIST_THRESHOLD_USDC` (def 1), `FUNDING_FLOAT_USDC` | pay policy / float | have defaults |
+
+**Capability note (post-S1):** `onboard_agent` and `fund_treasury` now require the **`provision`** capability,
+not `spend` — `spend` only covers `pay`. Mint (or bootstrap) a `provision` key for any flow that provisions a
+new entity or platform-funds a treasury; existing effective-`spend` keys were promoted to `provision` once by
+a one-shot migration on deploy, so nothing already live breaks.
 
 `ARC_TESTNET_RPC_URL` is the only strictly-required-no-default; contract addresses + Gateway URL have testnet
 defaults. `chmod 600 .env`.
@@ -40,14 +46,17 @@ P3 bootstrap screen are still a future FE task (backend for both is live).
 
 ## 4. Fund + smoke-test each face
 1. **Health:** `/healthz` → ok; `/mcp` → 401.
-2. **Onboard** (frontend or `onboard_agent`): needs Turnkey + `FACTORY_ADDRESS`. Poll `get_entity` → `bound`.
-3. **fund_treasury** → **treasury_status** (`available` reflects it; re-funding now works repeatedly).
+2. **Onboard** (frontend or `onboard_agent`, needs a `provision` key): needs Turnkey + `FACTORY_ADDRESS`. Poll
+   `get_entity` → `bound`.
+3. **fund_treasury** (needs a `provision` key) → **treasury_status** (`available` reflects it; re-funding now
+   works repeatedly, up to the per-call/per-tenant caps above).
 4. **fund_pocket** → **treasury_status** (`float` reflects it). Costs ~2 Turnkey sigs.
 5. **run_job** → **get_job** (agent earns USDC + reputation; bounded by `MAX_JOB_BUDGET_USDC`).
 6. **pay** an x402 URL → settles from the pocket float (returns `insufficient-float` if the float is low →
    run `fund_pocket` first).
-7. **Agent-first:** `POST /bootstrap-connection` → paste key + linkCode into an agent → `claim_connection` →
-   `onboard_agent` (server owns `manager`, so the agent's spec doesn't need it) → operate.
+7. **Agent-first:** `POST /bootstrap-connection { "capability": "provision" }` → paste key + linkCode into an
+   agent → `claim_connection` → `onboard_agent` (server owns `manager`, so the agent's spec doesn't need it) →
+   operate.
 
 ## 5. Gotchas
 - **SIWE/passkey are domain-bound** — a domain mismatch fails silently; match FE + BE exactly.

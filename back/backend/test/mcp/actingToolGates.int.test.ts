@@ -8,6 +8,7 @@ import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 import { startMcpTestClient } from "./helpers";
 
 // TENANT is the authenticated tenant — onboard_agent forces roles.guardian = TENANT.
@@ -93,6 +94,7 @@ beforeEach(() => {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
   });
   app = buildApiApp({
     webOrigin: "*",
@@ -136,9 +138,11 @@ test("read key: fund_treasury and onboard_agent are both denied", async () => {
 test("entity-scoped key (different entity): fund_treasury and onboard_agent are both denied", async () => {
   const entityA1 = repoSeed(TENANT, "agent1");
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  // capability: "provision" isolates this test to the ENTITY-SCOPE gate (not the capability gate) —
+  // the key has the top capability rung but is scoped to a different entity, so it must still be denied.
   const { key } = apiKeys.mint(TENANT, {
     entityId: `${TENANT}:other`,
-    capability: "spend",
+    capability: "provision",
   });
   const { client, close } = await startMcpTestClient(app, key);
   try {
@@ -160,10 +164,34 @@ test("entity-scoped key (different entity): fund_treasury and onboard_agent are 
   }
 });
 
-test("tenant-wide spend key: fund_treasury and onboard_agent both still reach the runner (no regression)", async () => {
+test("tenant-wide spend key: fund_treasury and onboard_agent are both denied (S1: spend no longer provisions)", async () => {
   const entityA1 = repoSeed(TENANT, "agent1");
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
-  const { key } = apiKeys.mint(TENANT);
+  const { key } = apiKeys.mint(TENANT, { capability: "spend" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const fundRes = await client.callTool({
+      name: "fund_treasury",
+      arguments: { id: entityA1, amount: "1000000" },
+    });
+    expect(fundRes.isError).toBe(true);
+    expect((fundRes.content as { text: string }[])[0]!.text).toBe("not found");
+
+    const onboardRes = await client.callTool({
+      name: "onboard_agent",
+      arguments: { spec: VALID_SPEC, passkeyId: handle },
+    });
+    expect(onboardRes.isError).toBe(true);
+    expect((onboardRes.content as { text: string }[])[0]!.text).toBe("not authorized");
+  } finally {
+    await close();
+  }
+});
+
+test("tenant-wide provision key: fund_treasury and onboard_agent both succeed (the migrated-bootstrap-key equivalence)", async () => {
+  const entityA1 = repoSeed(TENANT, "agent1");
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     const fundRes = await client.callTool({
@@ -181,6 +209,83 @@ test("tenant-wide spend key: fund_treasury and onboard_agent both still reach th
     expect(onboardRes.isError).toBeFalsy();
     const onboardOut = JSON.parse((onboardRes.content as { text: string }[])[0]!.text);
     expect(onboardOut.status).toBe("pending");
+  } finally {
+    await close();
+  }
+});
+
+test("entity-scoped provision key: fund_treasury on its own entity passes the gate; onboard_agent is still rejected (tenant-wide gate)", async () => {
+  const entityA1 = repoSeed(TENANT, "agent1");
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { entityId: entityA1, capability: "provision" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const fundRes = await client.callTool({
+      name: "fund_treasury",
+      arguments: { id: entityA1, amount: "1000000" },
+    });
+    expect(fundRes.isError).toBeFalsy();
+    const fundOut = JSON.parse((fundRes.content as { text: string }[])[0]!.text);
+    expect(fundOut.id).toBe(entityA1);
+
+    // onboard_agent always requires a tenant-wide key (entityId === null) — even at the top
+    // capability rung, an entity-scoped key can never create a new entity.
+    const onboardRes = await client.callTool({
+      name: "onboard_agent",
+      arguments: { spec: VALID_SPEC, passkeyId: handle },
+    });
+    expect(onboardRes.isError).toBe(true);
+    expect((onboardRes.content as { text: string }[])[0]!.text).toBe("not authorized");
+  } finally {
+    await close();
+  }
+});
+
+test("fund_treasury rejects a malformed or negative amount before ever calling runner.fund", async () => {
+  const entityA1 = repoSeed(TENANT, "agent1");
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    const hexRes = await client.callTool({
+      name: "fund_treasury",
+      arguments: { id: entityA1, amount: "0x10" },
+    });
+    expect(hexRes.isError).toBe(true);
+    expect((hexRes.content as { text: string }[])[0]!.text).toBe("invalid amount");
+
+    const negRes = await client.callTool({
+      name: "fund_treasury",
+      arguments: { id: entityA1, amount: "-5" },
+    });
+    expect(negRes.isError).toBe(true);
+    expect((negRes.content as { text: string }[])[0]!.text).toBe("amount must be positive");
+
+    // The entity is still in its pre-fund state — neither malformed call reached runner.fund.
+    const rec = repo.findByIdempotencyKey(entityA1);
+    expect(rec?.status).toBe("bound");
+  } finally {
+    await close();
+  }
+});
+
+test("fund_treasury rejects an amount over the per-call cap (S1 ceiling)", async () => {
+  const entityA1 = repoSeed(TENANT, "agent1");
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const { client, close } = await startMcpTestClient(app, key);
+  try {
+    // TEST_FUND_CAPS.perCall is 25 USDC (25_000_000 atomic) — one unit over must be rejected.
+    const overCapRes = await client.callTool({
+      name: "fund_treasury",
+      arguments: { id: entityA1, amount: "25000001" },
+    });
+    expect(overCapRes.isError).toBe(true);
+    expect((overCapRes.content as { text: string }[])[0]!.text).toBe(
+      "amount exceeds the max treasury fund per call",
+    );
+
+    // The entity is still in its pre-fund state — the over-cap call never reached the saga.
+    const rec = repo.findByIdempotencyKey(entityA1);
+    expect(rec?.status).toBe("bound");
   } finally {
     await close();
   }

@@ -101,7 +101,11 @@ async function main() {
       signerForEntity,
     });
 
-  const runner = new OnboardingRunner({ repo, runSaga });
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
+  });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
 

@@ -7,12 +7,12 @@ import { ApiError } from "../errors";
 
 const BodySchema = z.object({
   entityId: z.string().min(1),
-  capability: z.enum(["read", "earn", "spend"]).default("spend"),
+  capability: z.enum(["read", "earn", "spend", "provision"]).default("spend"),
 });
 
 const BootstrapSchema = z.object({
   passkeyId: z.string().min(1),
-  capability: z.enum(["read", "earn", "spend"]).default("spend"),
+  capability: z.enum(["read", "earn", "spend", "provision"]).default("spend"),
 });
 
 const LINK_CODE_TTL_MS = 15 * 60_000;

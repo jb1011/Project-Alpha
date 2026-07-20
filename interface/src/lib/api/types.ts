@@ -131,7 +131,7 @@ export type ApiKeyView = {
   capability: Capability;
 };
 
-export type Capability = "read" | "earn" | "spend";
+export type Capability = "read" | "earn" | "spend" | "provision";
 
 export type ConnectionSnippets = {
   claudeCode: string;

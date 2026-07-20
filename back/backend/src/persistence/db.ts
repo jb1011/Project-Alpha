@@ -182,6 +182,13 @@ export function migrate(db: Database.Database): void {
       created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (idem_key, tenant_id, entity_key)
     );
+
+    -- Small key/value marker table for one-shot data migrations (guards below), distinct from the
+    -- additive schema (table/column) migrations, which are idempotent by construction.
+    CREATE TABLE IF NOT EXISTS meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 
   // Additive migration for pre-existing dev DBs (new tables/columns only).
@@ -202,6 +209,27 @@ export function migrate(db: Database.Database): void {
   if (!akCols.includes("entity_id")) db.exec("ALTER TABLE api_keys ADD COLUMN entity_id TEXT");
   if (!akCols.includes("capability")) db.exec("ALTER TABLE api_keys ADD COLUMN capability TEXT");
   if (!akCols.includes("expires_at")) db.exec("ALTER TABLE api_keys ADD COLUMN expires_at INTEGER");
+
+  // One-shot data migration (S1): promote every existing key whose effective capability is 'spend'
+  // (stored 'spend' or legacy NULL) to the new top rung 'provision'. Strictly behavior-preserving —
+  // these keys could already call fund_treasury/onboard_agent under the old single-rung "spend"
+  // gate, so after promotion they still can and nothing new is granted. Guarded by a `meta` marker
+  // so a re-run never re-promotes a key deliberately minted as 'spend' after this migration ran.
+  // See back/docs/design/2026-07-20-s1-fund-treasury-authorization.md.
+  const CAPABILITY_BACKFILL_KEY = "apikey_capability_provision_backfill";
+  const backfillDone = db
+    .prepare("SELECT value FROM meta WHERE key = ?")
+    .get(CAPABILITY_BACKFILL_KEY);
+  if (!backfillDone) {
+    db.transaction(() => {
+      db.exec(
+        "UPDATE api_keys SET capability = 'provision' WHERE capability IS NULL OR capability = 'spend'",
+      );
+      db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run(
+        CAPABILITY_BACKFILL_KEY,
+      );
+    })();
+  }
 
   const pkCols = (db.prepare("PRAGMA table_info(passkeys)").all() as { name: string }[]).map(
     (c) => c.name,

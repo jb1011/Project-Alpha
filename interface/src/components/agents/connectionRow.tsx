@@ -7,6 +7,7 @@ const CAP_STYLE: Record<Capability, string> = {
   read: "text-muted-2",
   earn: "text-accent",
   spend: "text-[#ff8a84]",
+  provision: "text-[#ff8a84]",
 };
 
 /** A read/earn/spend chip, tiered by privilege. */

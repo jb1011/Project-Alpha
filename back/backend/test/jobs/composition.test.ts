@@ -37,6 +37,8 @@ function makeConfig(): Config {
     spendAllowlistThreshold: 1_000_000n,
     maxJobBudget: 5_000_000n,
     maxInflightJobsPerTenant: 3,
+    maxTreasuryFund: 25_000_000n,
+    maxTreasuryFundedPerTenant: 100_000_000n,
     customerPrivateKey: PLATFORM_KEY,
     authJwtSecret: "dev-insecure-secret-change-me-please",
     authJwtTtlSec: 3600,
