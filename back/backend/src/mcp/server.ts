@@ -42,11 +42,14 @@ export interface McpToolDeps {
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
 export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
   // The ACTING tools (fund_treasury/onboard_agent) enforce capability + entity scope, on top of the
-  // tenant isolation shared by every tool below: fund_treasury requires "spend" capability and
-  // `entityInScope`; onboard_agent requires "spend" capability AND a tenant-wide key (entityId ===
-  // null), since it creates a new entity rather than acting on an existing one. The read tools
-  // (get_job/list_jobs) enforce entityInScope. The P2a prerequisite (gate the acting tools before the
-  // mint surface issues scoped keys) is resolved. See
+  // tenant isolation shared by every tool below: fund_treasury requires "provision" capability and
+  // `entityInScope`; onboard_agent requires "provision" capability AND a tenant-wide key (entityId ===
+  // null), since it creates a new entity rather than acting on an existing one. "provision" is the top
+  // rung of the capability ladder (read < earn < spend < provision) — these two tools move PLATFORM
+  // funds / provision platform resources, a strictly higher privilege than "spend" (which only moves an
+  // entity's own treasury funds). See back/docs/design/2026-07-20-s1-fund-treasury-authorization.md.
+  // The read tools (get_job/list_jobs) enforce entityInScope. The P2a prerequisite (gate the acting
+  // tools before the mint surface issues scoped keys) is resolved. See
   // back/docs/plans/2026-07-02-byoa-p2a-scope-and-reads.md.
   const tenantId = scope.tenantId;
   const { repo, runner } = deps;
@@ -329,16 +332,30 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "fund_treasury",
     {
       title: "Fund treasury",
-      description: "Fund a bound entity's treasury with atomic USDC (6 decimals).",
+      description:
+        "Fund a bound entity's treasury with atomic USDC (6 decimals), from the PLATFORM wallet. " +
+        "Requires the provision capability.",
       inputSchema: { id: z.string(), amount: z.string() },
     },
     async ({ id, amount }) => {
-      if (!hasCapability(scope, "spend"))
+      if (!hasCapability(scope, "provision"))
         return { content: [{ type: "text", text: "not found" }], isError: true };
       if (!entityInScope(scope, id))
         return { content: [{ type: "text", text: "not found" }], isError: true };
+      // Same decimal-integer + positive validation as `pay`/`fund_pocket` (atomic USDC, 6 decimals).
+      // Rejects hex ("0x10") and a negative amount before it ever reaches runner.fund.
+      if (!/^-?\d+$/.test(amount))
+        return { content: [{ type: "text", text: "invalid amount" }], isError: true };
+      let parsedAmount: bigint;
       try {
-        const { id: outId, status } = runner.fund({ id, tenantId, amount: BigInt(amount) });
+        parsedAmount = BigInt(amount);
+      } catch {
+        return { content: [{ type: "text", text: "invalid amount" }], isError: true };
+      }
+      if (parsedAmount <= 0n)
+        return { content: [{ type: "text", text: "amount must be positive" }], isError: true };
+      try {
+        const { id: outId, status } = runner.fund({ id, tenantId, amount: parsedAmount });
         return { content: [{ type: "text", text: JSON.stringify({ id: outId, status }) }] };
       } catch (e) {
         return { content: [{ type: "text", text: (e as Error).message }], isError: true };
@@ -355,7 +372,8 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         "automatically to your tenant and the manager is set automatically to the platform " +
         "manager account — you don't need to know or supply either. passkeyId references a " +
         "previously stored guardian passkey (POST /passkey). Returns immediately with status " +
-        "'pending' — poll get_entity until 'bound'.",
+        "'pending' — poll get_entity until 'bound'. Requires the provision capability and a " +
+        "tenant-wide key.",
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
@@ -363,7 +381,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       },
     },
     async ({ spec, passkeyId, idempotencyKey }) => {
-      if (!hasCapability(scope, "spend") || scope.entityId !== null)
+      if (!hasCapability(scope, "provision") || scope.entityId !== null)
         return { content: [{ type: "text", text: "not authorized" }], isError: true };
       const passkey = deps.passkeys.get(tenantId, passkeyId);
       if (!passkey)

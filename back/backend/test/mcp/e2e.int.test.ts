@@ -203,7 +203,8 @@ function repoSeed(tenantId: string, userKey: string) {
 
 test("end-to-end: mint key, store passkey, onboard_agent, poll get_entity to bound", async () => {
   const passkeyId = passkeys.store(TENANT, VALID_PASSKEY);
-  const { key } = apiKeys.mint(TENANT);
+  // onboard_agent requires the "provision" capability (S1).
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     const start = await client.callTool({

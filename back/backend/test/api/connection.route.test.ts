@@ -129,3 +129,55 @@ test("404 (uniform) when the entity is not owned by the caller", async () => {
   });
   expect(res.status).toBe(404);
 });
+
+test("mints an entity-scoped connection package with explicit capability:'provision'", async () => {
+  const { app } = makeApp();
+  const jwt = await login(app);
+  repo.upsert({
+    idempotencyKey: "ent-provision",
+    name: "ConnTestEntity2",
+    status: "bound",
+    manager: "0x000000000000000000000000000000000000000A",
+    guardian: account.address,
+    operator: null,
+    amendmentDelay: "86400",
+    ein: "00-0000000",
+    formationDate: Math.floor(Date.now() / 1000),
+    oaHash: null,
+    metadataURI: null,
+    docPath: null,
+    treasuryConfig: null,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: account.address,
+  } as EntityRecord);
+
+  const res = await app.request("/connection-package", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}`, "content-type": "application/json" },
+    body: JSON.stringify({ entityId: "ent-provision", capability: "provision" }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.capability).toBe("provision");
+  expect(apiKeys.verify(body.apiKey)).toMatchObject({
+    tenantId: account.address,
+    entityId: "ent-provision",
+    capability: "provision",
+  });
+});
+
+test("unknown capability → 400 (zod)", async () => {
+  const { app } = makeApp();
+  const jwt = await login(app);
+  const res = await app.request("/connection-package", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}`, "content-type": "application/json" },
+    body: JSON.stringify({ entityId: "ent-1", capability: "admin" }),
+  });
+  expect(res.status).toBe(400);
+});

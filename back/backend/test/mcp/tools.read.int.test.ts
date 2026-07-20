@@ -145,7 +145,8 @@ test("an entity-scoped key cannot get_entity a same-tenant sibling (uniform not 
 
 test("fund_treasury on a bound entity returns a status", async () => {
   repoSeed(TENANT, "agent1");
-  const { key } = apiKeys.mint(TENANT);
+  // fund_treasury requires the "provision" capability (S1).
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     const res = await client.callTool({

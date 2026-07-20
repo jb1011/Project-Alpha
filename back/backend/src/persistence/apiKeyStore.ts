@@ -10,7 +10,7 @@ export interface ApiKeyView {
   capability: Capability;
 }
 
-export type Capability = "read" | "earn" | "spend";
+export type Capability = "read" | "earn" | "spend" | "provision";
 export interface MintOpts {
   label?: string;
   entityId?: string;

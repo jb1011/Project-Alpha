@@ -149,6 +149,38 @@ test("404 (uniform) when the passkey is not owned by the caller, and no key is m
   expect(db.prepare("SELECT COUNT(*) AS n FROM api_keys").get()).toMatchObject({ n: 0 });
 });
 
+test("mints a tenant-wide bootstrap package with explicit capability:'provision'", async () => {
+  const { app } = makeApp();
+  const jwt = await login(app);
+  const passkeyId = passkeys.store(account.address, VALID_PASSKEY);
+
+  const res = await app.request("/bootstrap-connection", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}`, "content-type": "application/json" },
+    body: JSON.stringify({ passkeyId, capability: "provision" }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.capability).toBe("provision");
+  expect(apiKeys.verify(body.apiKey)).toMatchObject({
+    tenantId: account.address,
+    entityId: null,
+    capability: "provision",
+  });
+});
+
+test("unknown capability → 400 (zod)", async () => {
+  const { app } = makeApp();
+  const jwt = await login(app);
+  const passkeyId = passkeys.store(account.address, VALID_PASSKEY);
+  const res = await app.request("/bootstrap-connection", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}`, "content-type": "application/json" },
+    body: JSON.stringify({ passkeyId, capability: "admin" }),
+  });
+  expect(res.status).toBe(400);
+});
+
 test("401 without an Authorization header", async () => {
   const { app } = makeApp();
   const res = await app.request("/bootstrap-connection", {
