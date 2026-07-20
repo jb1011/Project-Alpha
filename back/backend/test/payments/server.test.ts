@@ -34,6 +34,7 @@ test("POST /authorize returns 200 + X-PAYMENT when policy allows", async () => {
       paused: false,
       allowlistEnabled: false,
       isAllowed: true,
+      legalActive: true,
     }),
     signX402: async () => ({ header: "X-PAYMENT-ok", ledgerRef: "r" }),
   });
@@ -51,6 +52,7 @@ test("POST /authorize returns 402 + reason when policy denies (over-cap)", async
       paused: false,
       allowlistEnabled: false,
       isAllowed: true,
+      legalActive: true,
     }),
     signX402: async () => ({ header: "X-PAYMENT-ok", ledgerRef: "r" }),
   });

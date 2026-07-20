@@ -368,6 +368,7 @@ export async function buildLiveAgentRunner(
       paused: await adapter.treasuryPaused(treasury),
       allowlistEnabled: await adapter.treasuryAllowlistEnabled(treasury),
       isAllowed: await adapter.treasuryIsAllowed(treasury, payee),
+      legalActive: (await adapter.legalStatus(entity.proxy!)) === 0,
     }),
     signX402: async (req: Parameters<typeof authorizePayment>[1]) =>
       signX402({

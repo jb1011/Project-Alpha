@@ -9,6 +9,7 @@ const base = {
   allowlistEnabled: true,
   isAllowed: true,
   runningPending: 0n,
+  legalActive: true,
 };
 
 test("allows a within-cap, allowlisted, unpaused payment", () => {
@@ -58,6 +59,7 @@ test("evaluatePolicy: rejects a single payment over the per-tx cap", () => {
     allowlistEnabled: false,
     isAllowed: true,
     runningPending: 0n,
+    legalActive: true,
   };
   expect(evaluatePolicy({ ...base, amount: 30_000n, perTxCap: 20_000n })).toEqual({
     ok: false,
@@ -75,6 +77,7 @@ test("hybrid: micro-payment (<= threshold) needs no allowlist", () => {
     allowlistEnabled: false,
     isAllowed: false,
     runningPending: 0n,
+    legalActive: true,
   };
   expect(evaluatePolicy({ ...base, amount: 50_000n, threshold: 100_000n })).toEqual({ ok: true });
 });
@@ -86,6 +89,7 @@ test("hybrid: above threshold requires an allowlisted payee", () => {
     allowlistEnabled: false,
     isAllowed: false,
     runningPending: 0n,
+    legalActive: true,
   };
   expect(
     evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n, isAllowed: false }),
@@ -102,6 +106,7 @@ test("hybrid: amount exactly at threshold is allowed (boundary, not >)", () => {
     allowlistEnabled: false,
     isAllowed: false,
     runningPending: 0n,
+    legalActive: true,
   };
   expect(evaluatePolicy({ ...base, amount: 100_000n, threshold: 100_000n })).toEqual({ ok: true });
 });
@@ -113,6 +118,7 @@ test("no threshold set → hybrid rule inactive (back-compat)", () => {
     allowlistEnabled: false,
     isAllowed: false,
     runningPending: 0n,
+    legalActive: true,
   };
   expect(evaluatePolicy({ ...base, amount: 999_999n })).toEqual({ ok: true });
 });
@@ -126,6 +132,7 @@ test("not-allowlisted rule precedes threshold rule: proves allowlist fires first
     allowlistEnabled: true,
     isAllowed: false,
     runningPending: 0n,
+    legalActive: true,
   };
   expect(evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n })).toEqual({
     ok: false,
@@ -142,8 +149,30 @@ test("over-threshold-needs-allowlist rule precedes over-tx-cap: proves threshold
     allowlistEnabled: false,
     isAllowed: false,
     runningPending: 0n,
+    legalActive: true,
   };
   expect(
     evaluatePolicy({ ...base, amount: 200_000n, threshold: 100_000n, perTxCap: 150_000n }),
   ).toEqual({ ok: false, reason: "over-threshold-needs-allowlist" });
+});
+
+test("denies when the legal body is not Active", () => {
+  expect(evaluatePolicy({ ...base, legalActive: false })).toEqual({
+    ok: false,
+    reason: "legal-not-active",
+  });
+});
+
+test("legal-not-active is checked before the allowlist (mirrors on-chain _requireSpendable order)", () => {
+  expect(evaluatePolicy({ ...base, legalActive: false, isAllowed: false })).toEqual({
+    ok: false,
+    reason: "legal-not-active",
+  });
+});
+
+test("paused still wins over legal-not-active (pause is checked first)", () => {
+  expect(evaluatePolicy({ ...base, paused: true, legalActive: false })).toEqual({
+    ok: false,
+    reason: "paused",
+  });
 });

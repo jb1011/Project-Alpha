@@ -23,6 +23,7 @@ export interface TreasuryReader {
   treasuryAllowlistEnabled(t: Address): Promise<boolean>;
   treasuryIsAllowed(t: Address, who: Address): Promise<boolean>;
   usdcBalanceOf(usdc: Address, owner: Address): Promise<bigint>;
+  legalStatus(proxy: Address): Promise<number>;
 }
 
 export interface TreasuryStatusView {
@@ -139,6 +140,7 @@ export function buildEntityPaymentService(
         paused: await deps.reader.treasuryPaused(treasury),
         allowlistEnabled: await deps.reader.treasuryAllowlistEnabled(treasury),
         isAllowed: await deps.reader.treasuryIsAllowed(treasury, payee),
+        legalActive: (await deps.reader.legalStatus(entity.proxy!)) === 0,
       }),
       signX402: async (req: AuthorizeRequest) =>
         signX402({

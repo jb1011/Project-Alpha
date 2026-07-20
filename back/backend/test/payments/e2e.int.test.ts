@@ -37,6 +37,7 @@ function makeStack(available: bigint) {
       paused: false,
       allowlistEnabled: false,
       isAllowed: true,
+      legalActive: true,
     }),
     signX402: async (req: {
       payee: `0x${string}`;

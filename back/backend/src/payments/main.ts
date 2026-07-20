@@ -59,6 +59,7 @@ async function main() {
       paused: await adapter.treasuryPaused(treasury),
       allowlistEnabled: await adapter.treasuryAllowlistEnabled(treasury),
       isAllowed: await adapter.treasuryIsAllowed(treasury, who),
+      legalActive: (await adapter.legalStatus(entity.proxy!)) === 0,
     }),
     signX402: async (req) =>
       signX402({

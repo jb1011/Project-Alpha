@@ -83,6 +83,7 @@ test("runLive: fund -> agent buys (settles) -> customer buys answer (settles) ->
       paused: false,
       allowlistEnabled: false,
       isAllowed: true,
+      legalActive: true,
     }),
     signX402: async (req: Parameters<typeof authorizePayment>[1]) =>
       signX402({

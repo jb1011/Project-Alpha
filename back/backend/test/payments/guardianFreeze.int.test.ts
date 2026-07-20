@@ -29,6 +29,7 @@ let anvil: AnvilHandle;
 let pub: PublicClient;
 let deps: AuthorityDeps;
 let treasury: `0x${string}`;
+let proxy: `0x${string}`;
 let guardianWallet: WalletClient;
 const manager = privateKeyToAccount(KEYS[0]);
 const guardian: PrivateKeyAccount = privateKeyToAccount(KEYS[1]);
@@ -80,11 +81,12 @@ beforeAll(async () => {
     },
   });
   treasury = res.treasury;
+  proxy = res.proxy;
 
   const db = new Database(":memory:");
   migrate(db);
   // The real readTreasury: compose the on-chain ArcAdapter reads into TreasuryState. This is what
-  // makes the off-chain Authority obey the on-chain guardian/cap/allowlist.
+  // makes the off-chain Authority obey the on-chain guardian/cap/allowlist/legal-status.
   deps = {
     ledger: new PaymentLedger(db),
     entityKey: "entityA",
@@ -93,6 +95,7 @@ beforeAll(async () => {
       paused: await adapter.treasuryPaused(treasury),
       allowlistEnabled: await adapter.treasuryAllowlistEnabled(treasury),
       isAllowed: await adapter.treasuryIsAllowed(treasury, who),
+      legalActive: (await adapter.legalStatus(proxy)) === 0,
     }),
     // signX402 is faked here (the real BatchEvmSigner adapter is Phase 2); this test proves the
     // GUARDIAN governs the off-chain rail, not the signing itself.

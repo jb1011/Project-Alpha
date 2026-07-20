@@ -8,6 +8,7 @@ export interface TreasuryState {
   paused: boolean;
   allowlistEnabled: boolean;
   isAllowed: boolean;
+  legalActive: boolean;
 }
 
 export interface AuthorizeRequest {
@@ -52,6 +53,7 @@ export async function authorizePayment(
     paused: t.paused,
     allowlistEnabled: t.allowlistEnabled,
     isAllowed: t.isAllowed,
+    legalActive: t.legalActive,
     runningPending: d.ledger.runningPending(d.entityKey),
     perTxCap: d.perTxCap,
     threshold: d.threshold,

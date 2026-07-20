@@ -128,6 +128,7 @@ function makeReader(
     allowlistEnabled: boolean;
     isAllowed: boolean;
     balance: bigint;
+    legalStatus: number;
   }> = {},
 ) {
   const isAllowedCalls: Address[] = [];
@@ -144,6 +145,7 @@ function makeReader(
       usdcBalanceOfCalls.push([usdc, owner]);
       return over.balance ?? 0n;
     },
+    legalStatus: async () => over.legalStatus ?? 0,
   };
   return { reader, isAllowedCalls, usdcBalanceOfCalls };
 }
@@ -207,6 +209,26 @@ test("policy denial (over-cap): surfaces the reason, no retry fetch, idempotency
   expect(fn).toHaveBeenCalledTimes(1); // only the 402 probe, no retry
   // released, not stuck: a subsequent begin() with the same key is "new" again
   expect(idempotency.begin("k-cap", "tenantA", entity.idempotencyKey)).toEqual({ status: "new" });
+});
+
+test("pay denies when the legal body is suspended, even with sufficient float", async () => {
+  const { reader } = makeReader({ legalStatus: 1 }); // non-zero = suspended
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+  });
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-legal",
+    tenantId: "tenantA",
+  });
+  expect(receipt).toMatchObject({ ok: false, reason: "legal-not-active" });
+  expect(fn).toHaveBeenCalledTimes(1); // only the 402 probe, no retry
 });
 
 test("hybrid: amount above threshold with a non-allowlisted payee is denied", async () => {

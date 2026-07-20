@@ -29,6 +29,7 @@ test("buildAuthorityService wires readTreasury + signX402 + ledger behind POST /
       paused: false,
       allowlistEnabled: false,
       isAllowed: true,
+      legalActive: true,
     }),
     signX402: async () => ({ header: "X-PAYMENT-real", ledgerRef: "nonce-1" }),
   });
