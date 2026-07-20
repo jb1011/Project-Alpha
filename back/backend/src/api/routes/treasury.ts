@@ -15,11 +15,16 @@ export function mountTreasuryRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
 
     const treasury = rec.treasury as Address;
     const usdc = rec.treasuryConfig.usdc;
-    const [usdcBalance, available, paused] = await Promise.all([
+    const [usdcBalance, available, paused, legalStatus, exposure] = await Promise.all([
       deps.arc.usdcBalanceOf(usdc, treasury),
       deps.arc.treasuryAvailable(treasury),
       deps.arc.treasuryPaused(treasury),
+      // entity.proxy is non-null whenever entity.treasury is non-null (both set together at
+      // onboarding step 4, guarded above) — same read as entityPayment.ts's readTreasury closure.
+      deps.arc.legalStatus(rec.proxy as Address),
+      deps.standingExposure ? deps.standingExposure.read(rec) : Promise.resolve(null),
     ]);
+    const zero = "0";
 
     return c.json({
       usdcBalance: usdcBalance.toString(),
@@ -27,6 +32,16 @@ export function mountTreasuryRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
       cap: rec.treasuryConfig.cap.toString(),
       period: rec.treasuryConfig.period.toString(),
       paused,
+      standing: exposure
+        ? {
+            operatorEoa: exposure.operatorEoa.toString(),
+            pocketEoa: exposure.pocketEoa.toString(),
+            gateway: exposure.gateway.toString(),
+            total: exposure.total.toString(),
+            ceiling: deps.standingExposure?.ceilingAtomic ?? zero,
+          }
+        : { operatorEoa: zero, pocketEoa: zero, gateway: zero, total: zero, ceiling: zero },
+      legalActive: legalStatus === 0,
     });
   });
 }

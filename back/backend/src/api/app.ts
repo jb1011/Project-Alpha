@@ -63,6 +63,17 @@ export interface ApiDeps {
   /** Optional flag-gated x402 demo seller (Leg 3 smoke target). Present only when
    *  ENABLE_X402_DEMO is set; absent -> route not mounted (404). */
   x402Demo?: import("./routes/x402Demo").X402DemoDeps;
+  /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
+   *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
+   *  `ceilingAtomic` is the configured MAX_POCKET_FLOAT_USDC, atomic USDC string. Optional for the
+   *  same reason as `payments`: absent when POCKET_MASTER_SEED isn't configured, in which case the
+   *  route reports zeroed standing. */
+  standingExposure?: {
+    read: (
+      entity: import("../types").EntityRecord,
+    ) => Promise<import("../payments/standingExposure").StandingExposure>;
+    ceilingAtomic: string;
+  };
 }
 
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */

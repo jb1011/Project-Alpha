@@ -13,7 +13,7 @@ import { buyWithX402 } from "./buyer";
 import type { PaymentLedger } from "./ledger";
 import { assertPublicHttpsUrl, safeFetch } from "./ssrfGuard";
 import type { StandingExposure } from "./standingExposure";
-import { readStandingExposure } from "./standingExposure";
+import { buildReadExposure } from "./standingExposure";
 
 /** The ArcAdapter surface this service needs — narrowed to the four treasury reads so tests can
  *  fake it without a chain. */
@@ -110,19 +110,9 @@ export function buildEntityPaymentService(
 
   // Real standing-exposure read (used unless a test injects deps.readExposure): derive this entity's
   // pocket key, build a throwaway PocketGateway, and sum operator EOA + pocket EOA + Gateway.
-  const readExposure =
-    deps.readExposure ??
-    ((entity: EntityRecord): Promise<StandingExposure> => {
-      const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
-      const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
-      return readStandingExposure({
-        usdcBalanceOf: (owner) =>
-          deps.reader.usdcBalanceOf(entity.treasuryConfig?.usdc ?? cfg.usdc, owner),
-        gatewayAvailable: () => gateway.getAvailable(),
-        operator: entity.operator as Address,
-        pocket: gateway.address,
-      });
-    });
+  // buildReadExposure is the shared wiring also used by GET /entities/:id/treasury.
+  const readExposure: (entity: EntityRecord) => Promise<StandingExposure> =
+    deps.readExposure ?? buildReadExposure(cfg, deps.reader);
 
   const buildAuthorize = (entity: EntityRecord, treasury: Address) => {
     const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);

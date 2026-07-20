@@ -85,21 +85,8 @@ export function AgentDashboard({
       : null;
   const displayName = entity?.name?.trim() || config?.name?.trim() || "Your agent";
   const periodHours = treasury ? Math.round(Number(treasury.period) / 3600) : null;
-  // T5 note: GET /entities/:id/treasury does not yet surface `standing`/`legalActive` — those
-  // fields live only on the MCP `treasury_status` tool output (entityPayment.status()), which the
-  // web dashboard does not call. Widen locally (no shared-type edit, no backend change — out of
-  // scope for this copy-only task) so the two new rows render honestly ("—") until a follow-up
-  // extends the REST route. See back/docs/design/2026-07-20-s2-interim-float-ceiling-design.md §D7.
-  const treasuryExt = treasury as
-    | (TreasuryView & {
-        standing?: { operatorEoa: string; pocketEoa: string; gateway: string; total: string; ceiling: string };
-        legalActive?: boolean;
-      })
-    | null;
-  const ceilingUsdc = treasuryExt?.standing?.ceiling
-    ? Number(treasuryExt.standing.ceiling) / 1e6
-    : null;
-  const legalActive = treasuryExt?.legalActive;
+  const ceilingUsdc = treasury?.standing?.ceiling ? Number(treasury.standing.ceiling) / 1e6 : null;
+  const legalActive = treasury?.legalActive;
 
   const onTogglePause = async () => {
     if (!treasuryAddr) return;

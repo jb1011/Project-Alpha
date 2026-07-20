@@ -33,6 +33,17 @@ export type TreasuryView = {
   cap: string;
   period: string;
   paused: boolean;
+  /** Honest total un-clawback-able standing exposure (operator EOA + pocket EOA + Gateway), atomic
+   *  USDC, plus the configured ceiling. See back/docs/design/2026-07-20-s2-interim-float-ceiling-design.md. */
+  standing: {
+    operatorEoa: string;
+    pocketEoa: string;
+    gateway: string;
+    total: string;
+    ceiling: string;
+  };
+  /** true when the entity's on-chain legal status is Active (LegalManager status() === 0). */
+  legalActive: boolean;
 };
 
 export type GuardianPasskey = {

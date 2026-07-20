@@ -19,17 +19,30 @@ const otherAccount = privateKeyToAccount(
 const DOMAIN = "wizard.local";
 const CHAIN = 5042002;
 
-// Fake adapter: the route only reads three values; canned numbers prove the response shape + scoping.
+// Fake adapter: the route reads four values off it; canned numbers prove the response shape + scoping.
 const FAKE_ARC = {
   usdcBalanceOf: async () => 1_500_000n, // 1.50 USDC actually held
   treasuryAvailable: async () => 800_000n, // 0.80 spendable this period
   treasuryPaused: async () => false,
+  legalStatus: async () => 0, // 0 = Active (LegalManager status())
 } as unknown as ArcAdapter;
+
+// Fake standing-exposure reader (the S2 float-ceiling wiring, api/app.ts#ApiDeps.standingExposure):
+// canned numbers distinct from FAKE_ARC's so the response shape is unambiguous in assertions.
+const FAKE_STANDING_EXPOSURE = {
+  read: async () => ({
+    operatorEoa: 100_000n,
+    pocketEoa: 50_000n,
+    gateway: 200_000n,
+    total: 350_000n,
+  }),
+  ceilingAtomic: "1000000",
+};
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 
-function makeApp() {
+function makeApp(opts?: { withStandingExposure?: boolean }) {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
@@ -46,6 +59,7 @@ function makeApp() {
     passkeyRpId: "wizard.local",
     apiKeys: new SqliteApiKeyStore(db),
     arc: FAKE_ARC,
+    standingExposure: opts?.withStandingExposure === false ? undefined : FAKE_STANDING_EXPOSURE,
   } as never);
 }
 
@@ -124,7 +138,62 @@ test("GET /entities/:id/treasury → 200 real on-chain shape", async () => {
     cap: "1000000",
     period: "86400",
     paused: false,
+    standing: {
+      operatorEoa: "100000",
+      pocketEoa: "50000",
+      gateway: "200000",
+      total: "350000",
+      ceiling: "1000000",
+    },
+    legalActive: true,
   });
+});
+
+test("GET /entities/:id/treasury → legalActive false when legalStatus() is non-zero (suspended)", async () => {
+  const app = buildApiApp({
+    webOrigin: "*",
+    nonceStore: new SqliteNonceStore(db),
+    siweDomain: DOMAIN,
+    chainId: CHAIN,
+    jwtSecret: "s",
+    jwtTtlSec: 3600,
+    repo,
+    runner: new OnboardingRunner({
+      repo,
+      runSaga: async (i: { idempotencyKey: string }) =>
+        repo.findByIdempotencyKey(i.idempotencyKey)!,
+    }),
+    passkeyRpId: "wizard.local",
+    apiKeys: new SqliteApiKeyStore(db),
+    arc: { ...FAKE_ARC, legalStatus: async () => 1 } as unknown as ArcAdapter,
+    standingExposure: FAKE_STANDING_EXPOSURE,
+  } as never);
+  const token = await login(app);
+  const id = seedBound(account.address, "a1");
+  const res = await app.request(`/entities/${encodeURIComponent(id)}/treasury`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(200);
+  expect((await res.json()).legalActive).toBe(false);
+});
+
+test("GET /entities/:id/treasury → zeroed standing when standingExposure isn't configured (no POCKET_MASTER_SEED)", async () => {
+  const app = makeApp({ withStandingExposure: false });
+  const token = await login(app);
+  const id = seedBound(account.address, "a1");
+  const res = await app.request(`/entities/${encodeURIComponent(id)}/treasury`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.standing).toEqual({
+    operatorEoa: "0",
+    pocketEoa: "0",
+    gateway: "0",
+    total: "0",
+    ceiling: "0",
+  });
+  expect(body.legalActive).toBe(true);
 });
 
 test("cross-tenant → 404", async () => {
