@@ -6,6 +6,7 @@ import { pocketSignerFromKey } from "../../src/adapters/x402/pocket";
 import { makeSignX402 } from "../../src/adapters/x402/signX402";
 import { runDemo } from "../../src/agent/demo";
 import {
+  fundToTarget,
   sellAnswer as realSell,
   requireVaultOperator,
   runLive,
@@ -16,7 +17,7 @@ import { authorizePayment } from "../../src/payments/authority";
 import { PaymentLedger } from "../../src/payments/ledger";
 import type { SettleFn } from "../../src/payments/settle";
 import { migrate } from "../../src/persistence/db";
-import type { EntityRecord } from "../../src/types";
+import type { EntityRecord, Hex } from "../../src/types";
 
 const CUSTOMER = `0x${"2".repeat(64)}` as const;
 const treasury = getAddress(`0x${"ab".repeat(20)}`);
@@ -213,4 +214,24 @@ test("fundPocket derives a per-agent pocket address from the entityKey", async (
   // The pocket address the funding path targets must equal the per-agent derived address:
   expect(privateKeyToAccount(derivePocketKey(seed, "entity-1")).address).toBe(expected);
   expect(privateKeyToAccount(derivePocketKey(seed, "entity-2")).address).not.toBe(expected);
+});
+
+test("fundToTarget no-ops when Gateway float already covers the target", async () => {
+  const fund = vi.fn(async () => ["0xa"] as Hex[]);
+  const hashes = await fundToTarget(500_000n, {
+    readGatewayAtomic: async () => 500_000n,
+    fund,
+  });
+  expect(hashes).toEqual([]);
+  expect(fund).not.toHaveBeenCalled();
+});
+
+test("fundToTarget funds only the shortfall when float is partially drained", async () => {
+  const fund = vi.fn(async () => ["0xa", "0xb", "0xc"] as Hex[]);
+  const hashes = await fundToTarget(500_000n, {
+    readGatewayAtomic: async () => 300_000n,
+    fund,
+  });
+  expect(fund).toHaveBeenCalledWith(200_000n);
+  expect(hashes).toEqual(["0xa", "0xb", "0xc"]);
 });

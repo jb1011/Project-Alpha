@@ -1,6 +1,7 @@
 // backend/src/payments/funding.ts
 import { formatUnits } from "viem";
 import type { Address, Hex } from "../types";
+import type { StandingExposure } from "./standingExposure";
 
 export interface FundingDeps {
   treasury: Address;
@@ -11,6 +12,8 @@ export interface FundingDeps {
   operatorUsdcBalance: () => Promise<bigint>; // operator EOA's USDC balance — confirms fundOperator propagated
   operatorTransferUsdc: (usdc: Address, to: Address, amount: bigint) => Promise<Hex>; // enclave-sent
   depositToGateway: (amountUsdc: string) => Promise<Hex>; // pocket-signed (free)
+  standingExposure: () => Promise<StandingExposure>; // total un-clawback-able exposure, atomic
+  ceiling: bigint; // MAX_POCKET_FLOAT_USDC, atomic
 }
 
 /** Tuning for the read-after-write balance poll between the fund and forward legs (overridable in tests). */
@@ -108,6 +111,22 @@ export async function topUpPocket(
   if (!opts.skipFundOperator) {
     const available = await d.available();
     if (amount > available) throw new Error(`top-up ${amount} exceeds available ${available}`);
+    const standing = await d.standingExposure();
+    if (standing.total + amount > d.ceiling) {
+      throw new Error(
+        JSON.stringify({
+          error: "float-ceiling-exceeded",
+          standing: standing.total.toString(),
+          breakdown: {
+            operatorEoa: standing.operatorEoa.toString(),
+            pocketEoa: standing.pocketEoa.toString(),
+            gateway: standing.gateway.toString(),
+          },
+          requested: amount.toString(),
+          ceiling: d.ceiling.toString(),
+        }),
+      );
+    }
     const fundHash = await d.fundOperator(d.treasury, amount);
     await awaitOperatorFunded(d.operatorUsdcBalance, amount, attempts, delayMs, sleep);
     bridge.push(fundHash);
