@@ -107,6 +107,8 @@ The marker is essential: without it, a re-run would promote keys deliberately mi
 
 **Decision: enforce BOTH, at the single choke point `OnboardingRunner.fund` (`src/workflow/runner.ts:77`),** so the MCP tool and the REST route are covered by one gate (unlike run_job's duplicated route/tool checks).
 
+**Deliberate carve-out: the operator CLI is not behind this choke point.** `src/cli/index.ts`'s `fund-treasury` command calls `arcAdapter.fundTreasury` directly, and `create-entity --fund` calls `runOnboarding` directly — neither goes through `OnboardingRunner.fund`, so neither the `provision` gate nor the per-call/per-tenant caps apply to them. This is intentional, not a residual gap: the CLI only runs where the operator already holds `PLATFORM_PRIVATE_KEY` on their own machine — i.e. it *is* the trusted operator, not the S1 threat model's remote/delegated MCP-key adversary — mirroring the existing `run-job` CLI command, which likewise bypasses the MCP tool's `maxJobBudget`/`maxInflightJobsPerTenant` guards for the same reason. S5's aggregate platform-wallet outflow meter must include these two CLI paths as outflow points (see Non-goals).
+
 **Config (`src/config/env.ts`)**, mirroring `MAX_JOB_BUDGET_USDC`:
 
 | Env var | Zod | Config field | Default |
@@ -192,7 +194,7 @@ Error propagation needs no new handling: the MCP tool's existing try/catch (`ser
 
 ## Non-goals
 
-- **S5** — the platform-wide **aggregate** outflow ceiling / rate-limit / alerting. Seam for S5: the platform wallet's outflow points are `runner.fund` → `arcAdapter.fundTreasury`, the gasSeeder, the job-escrow funding, and x402 gas — S5 wraps all of them behind one meter; S1's per-tenant quota is the per-actor bound underneath it.
+- **S5** — the platform-wide **aggregate** outflow ceiling / rate-limit / alerting. Seam for S5: the platform wallet's outflow points are `runner.fund` → `arcAdapter.fundTreasury`, the gasSeeder, the job-escrow funding, x402 gas, **and the operator CLI's `fund-treasury` / `create-entity --fund` commands (§3 — these bypass `OnboardingRunner.fund` by design and so are invisible to S1's per-tenant quota)** — S5 wraps all of them behind one meter; S1's per-tenant quota is the per-actor bound underneath it.
 - S2 (x402 path escaping on-chain policy), S3 (`POCKET_MASTER_SEED`), S4 (`PLATFORM_PRIVATE_KEY` overload) — separate audit items.
 - First-class tenant self-funding (deposit attribution / permit flow) — v2 smart-account migration; direct ERC-20 transfer to the treasury address works today.
 - Per-capability rate limiting, key rotation/expiry UX, MCP-side admin (key mgmt stays REST/session-only).

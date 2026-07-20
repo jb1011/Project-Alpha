@@ -225,7 +225,9 @@ export function migrate(db: Database.Database): void {
       db.exec(
         "UPDATE api_keys SET capability = 'provision' WHERE capability IS NULL OR capability = 'spend'",
       );
-      db.prepare("INSERT INTO meta (key, value) VALUES (?, '1')").run(CAPABILITY_BACKFILL_KEY);
+      db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run(
+        CAPABILITY_BACKFILL_KEY,
+      );
     })();
   }
 

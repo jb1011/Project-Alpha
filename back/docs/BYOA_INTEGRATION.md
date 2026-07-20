@@ -17,7 +17,7 @@ differs per agent; the server and tools are identical.
 
 1. Sign in to the dashboard (SIWE) and open the legal body you want to link.
 2. Request a **connection package** for it:
-   `POST /connection-package { "entityId": "<id>", "capability": "read" | "earn" | "spend" }`
+   `POST /connection-package { "entityId": "<id>", "capability": "read" | "earn" | "spend" | "provision" }`
    → `{ mcpUrl, apiKey, entityId, capability, snippets }`. The key is **scoped to that one entity** at the
    capability you chose.
 3. Paste the snippet for your agent (§3). Done — the agent can now operate that body.
@@ -29,10 +29,11 @@ For letting an agent onboard *and* operate from a prompt, with one browser step:
 1. Sign in (SIWE) and register a **guardian passkey** (`GET /passkey/challenge` → WebAuthn → `POST /passkey`
    → `passkeyId`). The passkey is the root of custody; only you hold it.
 2. Request an agent-first bootstrap:
-   `POST /bootstrap-connection { "passkeyId": "<id>" }`
-   → `{ mcpUrl, apiKey, passkeyId, capability: "spend", linkCode, snippets }`. This mints a **tenant-wide**
-   operating key and a one-time **link code**. The response is `no-store` / `no-referrer` and the key is
-   shown once.
+   `POST /bootstrap-connection { "passkeyId": "<id>", "capability": "provision" }`
+   → `{ mcpUrl, apiKey, passkeyId, capability: "provision", linkCode, snippets }`. This mints a **tenant-wide**
+   operating key and a one-time **link code**. `provision` is required here — the next step calls
+   `onboard_agent`, which creates a new legal body from the platform, not just spends from an existing one.
+   The response is `no-store` / `no-referrer` and the key is shown once.
 3. Paste the snippet into your agent, and give it the **link code**.
 4. The agent calls `claim_connection(linkCode)` to confirm it was intentionally linked to your account (a
    binding confirmation, never the key), then `onboard_agent(spec, passkeyId)` to create its legal body, and
@@ -45,13 +46,20 @@ codes are single-use, short-lived, and tenant-scoped.
 
 ## 2. The capability model
 
-Keys carry a **capability** on a ladder — `read < earn < spend` — and an optional **entity scope**:
+Keys carry a **capability** on a ladder — `read < earn < spend < provision` — and an optional **entity
+scope**:
 
-| Capability | Grants |
-|------------|--------|
-| `read`  | the read tools only |
-| `earn`  | read + `run_job` |
-| `spend` | read + earn + `pay` + provisioning (`fund_treasury`, `onboard_agent`) |
+| Capability   | Grants |
+|--------------|--------|
+| `read`       | the read tools only |
+| `earn`       | read + `run_job` |
+| `spend`      | read + earn + `pay` |
+| `provision`  | spend + platform-funded provisioning (`fund_treasury`, `onboard_agent`) |
+
+`provision` is a distinct, opt-in top rung: it moves **platform** USDC (into a treasury, or to create a new
+entity), not just funds already inside a treasury the key already controls. Treasury funding via
+`fund_treasury` is bounded by `MAX_TREASURY_FUND_USDC` (default 25 USDC per call) and
+`MAX_TREASURY_FUNDED_PER_TENANT_USDC` (default 100 USDC lifetime per tenant).
 
 A key scoped to a single `entityId` can operate **only that body**; a tenant-wide key can operate any of your
 bodies. Give an agent the least capability it needs.
@@ -101,7 +109,11 @@ a tool argument) and return a uniform "not found" on any ownership/scope miss.
 - `pay(id, to, amountUsdc, idempotencyKey)` — pay an **x402 resource URL** with USDC, within the treasury's
   leash. Flows through the Payment Authority (per-tx + per-period caps, hybrid allowlist) and is signed by the
   per-agent pocket; idempotent by `idempotencyKey`.
-- `fund_treasury(id, amount)` — move USDC into a bound body's treasury.
+
+**Provision** (`provision`):
+- `fund_treasury(id, amount)` — move USDC into a bound body's treasury, from the **platform** wallet. Bounded
+  by `MAX_TREASURY_FUND_USDC` (default 25 USDC/call) and `MAX_TREASURY_FUNDED_PER_TENANT_USDC` (default 100
+  USDC lifetime per tenant).
 - `onboard_agent(spec, passkeyId, idempotencyKey?)` — create a legal body (guardian = your tenant). `spec`
   must match the `schema://agent-spec` resource. Returns immediately with `pending`; poll `get_entity`.
 
