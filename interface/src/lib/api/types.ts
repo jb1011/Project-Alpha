@@ -34,16 +34,19 @@ export type TreasuryView = {
   period: string;
   paused: boolean;
   /** Honest total un-clawback-able standing exposure (operator EOA + pocket EOA + Gateway), atomic
-   *  USDC, plus the configured ceiling. See back/docs/design/2026-07-20-s2-interim-float-ceiling-design.md. */
+   *  USDC, plus the configured ceiling. See back/docs/design/2026-07-20-s2-interim-float-ceiling-design.md.
+   *  null when the Gateway/standing-exposure read failed (degraded, not zero — see T6 hardening);
+   *  the dashboard renders "—" for null, same as when standingExposure isn't configured at all. */
   standing: {
     operatorEoa: string;
     pocketEoa: string;
     gateway: string;
     total: string;
     ceiling: string;
-  };
-  /** true when the entity's on-chain legal status is Active (LegalManager status() === 0). */
-  legalActive: boolean;
+  } | null;
+  /** true when the entity's on-chain legal status is Active (LegalManager status() === 0); null
+   *  when the on-chain legal-status read failed (degraded, not a fake default — rendered as "—"). */
+  legalActive: boolean | null;
 };
 
 export type GuardianPasskey = {

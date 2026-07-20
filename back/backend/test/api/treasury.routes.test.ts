@@ -208,6 +208,52 @@ test("cross-tenant → 404", async () => {
   expect(res.status).toBe(404);
 });
 
+test("GET /entities/:id/treasury → degrades to standing:null + legalActive:null (not 500) when Gateway/legalStatus reads throw", async () => {
+  const app = buildApiApp({
+    webOrigin: "*",
+    nonceStore: new SqliteNonceStore(db),
+    siweDomain: DOMAIN,
+    chainId: CHAIN,
+    jwtSecret: "s",
+    jwtTtlSec: 3600,
+    repo,
+    runner: new OnboardingRunner({
+      repo,
+      runSaga: async (i: { idempotencyKey: string }) =>
+        repo.findByIdempotencyKey(i.idempotencyKey)!,
+    }),
+    passkeyRpId: "wizard.local",
+    apiKeys: new SqliteApiKeyStore(db),
+    arc: {
+      ...FAKE_ARC,
+      legalStatus: async () => {
+        throw new Error("legal-status RPC unavailable");
+      },
+    } as unknown as ArcAdapter,
+    standingExposure: {
+      read: async () => {
+        throw new Error("Gateway API unavailable");
+      },
+      ceilingAtomic: "1000000",
+    },
+  } as never);
+  const token = await login(app);
+  const id = seedBound(account.address, "a1");
+  const res = await app.request(`/entities/${encodeURIComponent(id)}/treasury`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({
+    usdcBalance: "1500000",
+    available: "800000",
+    cap: "1000000",
+    period: "86400",
+    paused: false,
+    standing: null,
+    legalActive: null,
+  });
+});
+
 test("no auth → 401", async () => {
   const app = makeApp();
   expect((await app.request("/entities/x/treasury")).status).toBe(401);

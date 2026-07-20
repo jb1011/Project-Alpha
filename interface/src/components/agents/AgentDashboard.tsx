@@ -265,7 +265,13 @@ export function AgentDashboard({
               <RuleRow k="Guardian pause" v={paused ? "On" : "Off"} />
               <RuleRow
                 k="Legal status"
-                v={legalActive === undefined ? "—" : legalActive ? "Active" : "Suspended"}
+                v={
+                  legalActive === undefined || legalActive === null
+                    ? "—"
+                    : legalActive
+                      ? "Active"
+                      : "Suspended"
+                }
               />
               <RuleRow
                 k="Allowlist (direct spend)"
@@ -299,8 +305,9 @@ export function AgentDashboard({
 
             <p className="mt-4 border-t hairline pt-3 text-[11px] leading-[1.5] text-muted-2">
               x402 payments enforce the same allowlist, per-tx and cap rules as direct on-chain
-              spends — in software, against live on-chain reads. The float ceiling caps how much
-              can sit beyond the guardian&apos;s reach at once.
+              spends — in software, against live on-chain reads. The float ceiling keeps how much
+              sits beyond the guardian&apos;s reach small in normal operation; the on-chain period
+              cap is the hard backstop.
             </p>
           </Card>
 
