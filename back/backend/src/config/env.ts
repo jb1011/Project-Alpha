@@ -46,6 +46,7 @@ const EnvSchema = z.object({
   TURNKEY_DELEGATED_API_PUBLIC_KEY: z.string().optional(),
   TURNKEY_DELEGATED_API_PRIVATE_KEY: z.string().optional(),
   FUNDING_FLOAT_USDC: z.string().default("0.50"),
+  MAX_POCKET_FLOAT_USDC: z.string().default("1.00"),
   SPEND_ALLOWLIST_THRESHOLD_USDC: z.string().default("1"),
   MAX_JOB_BUDGET_USDC: z.string().default("5"),
   MAX_INFLIGHT_JOBS_PER_TENANT: z.coerce.number().int().positive().default(3),
@@ -119,6 +120,7 @@ export interface Config {
   agentModel: string;
   gatewayFacilitatorUrl: string;
   fundingFloatUsdc: string;
+  maxPocketFloatUsdc: string;
   spendAllowlistThreshold: bigint;
   maxJobBudget: bigint;
   maxInflightJobsPerTenant: number;
@@ -187,6 +189,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     agentModel: e.AGENT_MODEL,
     gatewayFacilitatorUrl: e.GATEWAY_FACILITATOR_URL,
     fundingFloatUsdc: e.FUNDING_FLOAT_USDC,
+    maxPocketFloatUsdc: e.MAX_POCKET_FLOAT_USDC,
     spendAllowlistThreshold: usdToUnits(e.SPEND_ALLOWLIST_THRESHOLD_USDC),
     maxJobBudget: usdToUnits(e.MAX_JOB_BUDGET_USDC),
     maxInflightJobsPerTenant: e.MAX_INFLIGHT_JOBS_PER_TENANT,
@@ -234,6 +237,20 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   if (parseEther(cfg.gasSeedFloorUsdc) >= parseEther(cfg.gasSeedTargetUsdc)) {
     throw new Error("Invalid config: GAS_SEED_FLOOR_USDC must be less than GAS_SEED_TARGET_USDC");
+  }
+
+  const ceilingAtomic = usdToUnits(cfg.maxPocketFloatUsdc);
+  const floatAtomic = usdToUnits(cfg.fundingFloatUsdc);
+  // usdToUnits treats the native 18-dec seed string as its 6-dec-USDC decimal equivalent — the same
+  // interpretation the existing skip-guard uses (funding robustness doc; liveRunner.ts:213). On Arc,
+  // native gas IS USDC, so the numeric value is the correct 6-dec equivalent.
+  const seedTargetAtomic = usdToUnits(cfg.gasSeedTargetUsdc);
+  if (ceilingAtomic < floatAtomic + 2n * seedTargetAtomic) {
+    throw new Error(
+      "Invalid config: MAX_POCKET_FLOAT_USDC must be >= FUNDING_FLOAT_USDC + 2×GAS_SEED_TARGET_USDC " +
+        "(both EOAs are gas-seeded to the target and are counted in standing exposure, so the first " +
+        "legitimate float top-up would otherwise be rejected).",
+    );
   }
 
   return cfg;
