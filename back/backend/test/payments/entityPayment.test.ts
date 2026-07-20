@@ -38,6 +38,8 @@ function makeConfig(over: Partial<Config> = {}): Config {
     spendAllowlistThreshold: 500n,
     maxJobBudget: 5_000_000n,
     maxInflightJobsPerTenant: 3,
+    maxTreasuryFund: 25_000_000n,
+    maxTreasuryFundedPerTenant: 100_000_000n,
     customerPrivateKey: POCKET_MASTER_SEED,
     authJwtSecret: "dev-insecure-secret-change-me-please",
     authJwtTtlSec: 3600,

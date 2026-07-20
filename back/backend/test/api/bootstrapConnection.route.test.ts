@@ -12,6 +12,7 @@ import { SqliteLinkCodeStore } from "../../src/persistence/linkCodeStore";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import type { EntityRecord } from "../../src/types";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 
 const account = privateKeyToAccount(
   "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
@@ -44,7 +45,7 @@ function makeApp() {
     repo.upsert(bound);
     return bound;
   };
-  const runner = new OnboardingRunner({ repo, runSaga });
+  const runner = new OnboardingRunner({ repo, runSaga, fundCaps: TEST_FUND_CAPS });
   const app = buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),

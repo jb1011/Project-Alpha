@@ -11,6 +11,7 @@ import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteLinkCodeStore } from "../../src/persistence/linkCodeStore";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 import { startMcpTestClient } from "./helpers";
 
 /**
@@ -119,6 +120,7 @@ beforeEach(() => {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
   });
   app = buildApiApp({
     webOrigin: "*",

@@ -35,6 +35,8 @@ export interface EntityRepository {
   listInFlight(): EntityRecord[];
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
   transaction<T>(fn: () => T): T;
+  /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
+  sumFundedByTenant(tenantId: string): bigint;
 }
 
 interface Row {
@@ -279,5 +281,17 @@ export class SqliteEntityRepository implements EntityRepository {
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
   transaction<T>(fn: () => T): T {
     return this.db.transaction(fn)();
+  }
+
+  /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
+  sumFundedByTenant(tenantId: string): bigint {
+    const row = this.db
+      .prepare(`
+        SELECT COALESCE(SUM(CAST(json_extract(e.detail, '$.amount') AS INTEGER)), 0) AS total
+        FROM events e JOIN entities t ON t.idempotency_key = e.idempotency_key
+        WHERE e.step = 'fundTreasury' AND e.status = 'funded' AND t.owner_tenant_id = ?
+      `)
+      .get(tenantId) as { total: number | bigint };
+    return BigInt(row.total);
   }
 }

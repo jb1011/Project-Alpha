@@ -25,6 +25,7 @@ import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { runOnboarding } from "../../src/workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../../src/workflow/runner";
 import { type AnvilHandle, startAnvil } from "../helpers/anvil";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 import { deployStack } from "../helpers/stack";
 import { startMcpTestClient } from "./helpers";
 
@@ -147,7 +148,7 @@ beforeEach(() => {
       signerForEntity,
     });
 
-  runner = new OnboardingRunner({ repo, runSaga });
+  runner = new OnboardingRunner({ repo, runSaga, fundCaps: TEST_FUND_CAPS });
   app = buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),
