@@ -266,6 +266,21 @@ contract IdentityRegistryForkTest is Test {
         assertEq(registry.getAgentWallet(agentId), wallet);
     }
 
+    /// @notice The other side of the deadline bound: an already-expired deadline (one second
+    ///         in the past) is rejected. Bare expectRevert: the exact live revert string for
+    ///         the expired case was never verified, and the property is the rejection itself.
+    function test_rebindRevertsForExpiredDeadline() public onlyFork {
+        (uint256 agentId,,) = _createEntity();
+        uint256 walletPk = 0xBEEF;
+        address wallet = vm.addr(walletPk);
+        uint256 expired = block.timestamp - 1;
+
+        bytes memory sig = _signWalletSet(walletPk, agentId, wallet, manager, expired);
+        vm.prank(manager);
+        vm.expectRevert();
+        registry.setAgentWallet(agentId, wallet, expired, sig);
+    }
+
     /// @notice A caller who is not the NFT owner (nor approved) cannot re-bind, even with a
     ///         valid wallet signature. Bare expectRevert: the exact live revert string for
     ///         this case was never verified, and the property is the rejection itself.
