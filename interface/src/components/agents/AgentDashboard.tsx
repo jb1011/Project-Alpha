@@ -85,6 +85,8 @@ export function AgentDashboard({
       : null;
   const displayName = entity?.name?.trim() || config?.name?.trim() || "Your agent";
   const periodHours = treasury ? Math.round(Number(treasury.period) / 3600) : null;
+  const ceilingUsdc = treasury?.standing?.ceiling ? Number(treasury.standing.ceiling) / 1e6 : null;
+  const legalActive = treasury?.legalActive;
 
   const onTogglePause = async () => {
     if (!treasuryAddr) return;
@@ -253,15 +255,26 @@ export function AgentDashboard({
                 Edit →
               </Link>
             </div>
-            <dl className="mt-4 flex flex-col gap-3 text-[12.5px]">
-              <RuleRow
-                k="Per-tx cap"
-                v={perTxUsdc === null ? "Not set" : `${formatUsdc(perTxUsdc)} USDC`}
-              />
+
+            <div className="mt-4 text-[11px] uppercase tracking-[0.18em] text-muted-2">
+              On-chain (enforced by the treasury contract)
+            </div>
+            <dl className="mt-3 flex flex-col gap-3 text-[12.5px]">
               <RuleRow k="Period cap" v={`${formatUsdc(capUsdc)} USDC`} />
               <RuleRow k="Period" v={periodHours ? `${periodHours}h rolling` : "—"} />
+              <RuleRow k="Guardian pause" v={paused ? "On" : "Off"} />
               <RuleRow
-                k="Recipients"
+                k="Legal status"
+                v={
+                  legalActive === undefined || legalActive === null
+                    ? "—"
+                    : legalActive
+                      ? "Active"
+                      : "Suspended"
+                }
+              />
+              <RuleRow
+                k="Allowlist (direct spend)"
                 v={
                   config?.allowlist.length
                     ? `${config.allowlist.length} allowlisted`
@@ -269,6 +282,33 @@ export function AgentDashboard({
                 }
               />
             </dl>
+
+            <div className="mt-5 text-[11px] uppercase tracking-[0.18em] text-muted-2">
+              Software-enforced on x402 payments
+            </div>
+            <p className="mt-1.5 text-[11px] leading-[1.5] text-muted-2">
+              The backend checks each payment against fresh on-chain state — not guaranteed if the
+              backend is compromised.
+            </p>
+            <dl className="mt-3 flex flex-col gap-3 text-[12.5px]">
+              <RuleRow
+                k="Per-tx cap"
+                v={perTxUsdc === null ? "Not set" : `${formatUsdc(perTxUsdc)} USDC`}
+              />
+              <RuleRow k="Allowlist / threshold" v="Re-asserted before every payment" />
+              <RuleRow k="Pause + legal status" v="Re-checked before every payment" />
+              <RuleRow
+                k="Standing float ceiling"
+                v={ceilingUsdc === null ? "—" : `≤ ${formatUsdc(ceilingUsdc)} USDC`}
+              />
+            </dl>
+
+            <p className="mt-4 border-t hairline pt-3 text-[11px] leading-[1.5] text-muted-2">
+              x402 payments enforce the same allowlist, per-tx and cap rules as direct on-chain
+              spends — in software, against live on-chain reads. The float ceiling keeps how much
+              sits beyond the guardian&apos;s reach small in normal operation; the on-chain period
+              cap is the hard backstop.
+            </p>
           </Card>
 
           <Card className="p-5">

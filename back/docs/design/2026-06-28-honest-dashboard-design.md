@@ -24,7 +24,18 @@ truthful: real treasury balance + available-vs-cap, a **real on-chain guardian p
 of the fakes.
 
 **Already real — keep unchanged:** the on-chain identity card (agentId, treasury, operator,
-guardian, create/bind/fund tx links) and the active-rules card (from the user's config).
+guardian, create/bind/fund tx links).
+
+**Active-rules card — updated 2026-07-20** (see
+[S2 interim float-ceiling design](2026-07-20-s2-interim-float-ceiling-design.md) §D7): no longer a
+flat list that implies every rule is enforced identically everywhere. It is split into two labeled
+groups — **On-chain (enforced by the treasury contract):** period cap, guardian pause, legal
+status, allowlist for direct spend; and **Software-enforced on x402 payments** (the backend
+re-checks each payment against fresh on-chain state — not guaranteed if the backend is
+compromised): per-tx cap, allowlist/threshold, pause + legal status, and the standing-float
+ceiling. A one-line footnote makes clear x402 enforces the *same* allowlist/per-tx/cap rules as
+direct spends — just in software against live on-chain reads — not that those rules "don't apply"
+to x402.
 
 ## 2. Scope
 

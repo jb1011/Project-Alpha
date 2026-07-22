@@ -16,11 +16,13 @@ import { type Config, loadConfig } from "../config/env";
 import { authorizePayment } from "../payments/authority";
 import { shouldSkipFundOperator, topUpPocket } from "../payments/funding";
 import { ensureNativeGas } from "../payments/gasSeeder";
+import { withKeyedLock } from "../payments/keyedMutex";
 import { PaymentLedger } from "../payments/ledger";
 import { sweepPocketToTreasury } from "../payments/pocketFloat";
 import { buildPaywall } from "../payments/seller";
 import { makeSettle } from "../payments/settle";
 import type { SettleFn } from "../payments/settle";
+import { readStandingExposure } from "../payments/standingExposure";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import type { RunPaymentInput } from "../persistence/agentRunStore";
 import { migrate } from "../persistence/db";
@@ -161,6 +163,20 @@ function requireMasterSeed(cfg: Config): Hex {
   return cfg.pocketMasterSeed;
 }
 
+/** Fund the pocket UP TO `target` of spendable Gateway float; no-op if already covered. Used by the
+ *  liveRunner's leg-0 fund so repeated runs (Gateway float persists across runs — only the pocket EOA
+ *  is swept, not Gateway) don't re-pull a full float on top of what's already there and wedge against
+ *  the standing-exposure ceiling (D3). The MCP `fund_pocket` tool keeps the hard reject — only this
+ *  automatic leg-0 path funds to target. */
+export async function fundToTarget(
+  target: bigint,
+  d: { readGatewayAtomic: () => Promise<bigint>; fund: (shortfall: bigint) => Promise<Hex[]> },
+): Promise<Hex[]> {
+  const available = await d.readGatewayAtomic();
+  if (available >= target) return []; // already funded — no seed, no pull, no signatures
+  return d.fund(target - available);
+}
+
 /** Leg 0: governed top-up treasury -> operator(enclave) -> pocket -> Gateway. Returns the on-chain tx
  *  hashes. `operatorWallet` must sign as the treasury's authorized operator (its per-agent vault key).
  *  The pocket used is derived per-agent from the master seed + `entityKey` (no per-agent key storage). */
@@ -171,67 +187,77 @@ export async function fundPocket(
   operatorWallet: WalletClient,
   entityKey: string,
 ): Promise<Hex[]> {
-  const pocketKey = derivePocketKey(requireMasterSeed(cfg), entityKey);
-  const pub = createPublicClient({
-    chain: chainFor(cfg.chainId, cfg.rpcUrl),
-    transport: http(cfg.rpcUrl),
-  });
-  const adapter = new ArcAdapter({
-    publicClient: pub,
-    managerWallet: undefined as never, // not used by the operator-sent funding txs
-    operatorWallet,
-    chainId: cfg.chainId,
-    factory: (cfg.factoryAddress ?? "0x0") as Address,
-    identityRegistry: cfg.identityRegistry,
-  });
-  const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
-  const operatorAddress = operatorWallet.account?.address;
-  if (!operatorAddress) throw new Error("fundPocket: operator wallet has no account address");
+  return withKeyedLock(entityKey, async () => {
+    const pocketKey = derivePocketKey(requireMasterSeed(cfg), entityKey);
+    const pub = createPublicClient({
+      chain: chainFor(cfg.chainId, cfg.rpcUrl),
+      transport: http(cfg.rpcUrl),
+    });
+    const adapter = new ArcAdapter({
+      publicClient: pub,
+      managerWallet: undefined as never, // not used by the operator-sent funding txs
+      operatorWallet,
+      chainId: cfg.chainId,
+      factory: (cfg.factoryAddress ?? "0x0") as Address,
+      identityRegistry: cfg.identityRegistry,
+    });
+    const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
+    const operatorAddress = operatorWallet.account?.address;
+    if (!operatorAddress) throw new Error("fundPocket: operator wallet has no account address");
 
-  const managerWallet = managerWalletClient(cfg);
-  const seedTxs = await ensureNativeGas([operatorAddress, gateway.address], {
-    getBalance: (addr) => pub.getBalance({ address: addr }),
-    sendNative: (to, value) =>
-      managerWallet.sendTransaction({
-        to,
-        value,
-        account: managerWallet.account!,
-        chain: managerWallet.chain,
-      }),
-    // Await the seed mining before topUpPocket depends on it — sendNative only returns a mempool
-    // hash, and topUpPocket's operator-/pocket-signed txs would otherwise race an unmined seed and
-    // fail with "gas required exceeds allowance (0)".
-    confirm: (hash) => pub.waitForTransactionReceipt({ hash }).then(() => undefined),
-    floor: parseEther(cfg.gasSeedFloorUsdc),
-    target: parseEther(cfg.gasSeedTargetUsdc),
+    const managerWallet = managerWalletClient(cfg);
+    const seedTxs = await ensureNativeGas([operatorAddress, gateway.address], {
+      getBalance: (addr) => pub.getBalance({ address: addr }),
+      sendNative: (to, value) =>
+        managerWallet.sendTransaction({
+          to,
+          value,
+          account: managerWallet.account!,
+          chain: managerWallet.chain,
+        }),
+      // Await the seed mining before topUpPocket depends on it — sendNative only returns a mempool
+      // hash, and topUpPocket's operator-/pocket-signed txs would otherwise race an unmined seed and
+      // fail with "gas required exceeds allowance (0)".
+      confirm: (hash) => pub.waitForTransactionReceipt({ hash }).then(() => undefined),
+      floor: parseEther(cfg.gasSeedFloorUsdc),
+      target: parseEther(cfg.gasSeedTargetUsdc),
+    });
+
+    // Retry-safety (#32): if the operator already holds the fundOperator credit (a re-run completing a
+    // partial bridge), skip re-pulling from the treasury. The gas-seed lands the operator at
+    // gasSeedTarget; a landed credit pushes it to ~gasSeedTarget + amount (minus small gas), so the
+    // amount/2 margin cleanly distinguishes "seeded only" from "seeded + credit".
+    const seedTargetAtomic = usdToUnits(cfg.gasSeedTargetUsdc);
+    const operatorBalance = await adapter.usdcBalanceOf(cfg.usdc, operatorAddress);
+    const skipFundOperator = shouldSkipFundOperator(operatorBalance, seedTargetAtomic, floatAtomic);
+
+    const bridgeTxs = await topUpPocket(
+      {
+        treasury,
+        // NOTE: uses cfg.usdc (the platform-global token). treasury_status.balance in entityPayment.ts
+        // instead reads `entity.treasuryConfig?.usdc ?? cfg.usdc` — the two token sources coincide today
+        // (onboarding sets treasuryConfig.usdc = cfg.usdc) but should not silently drift.
+        usdc: cfg.usdc,
+        pocketAddress: gateway.address,
+        available: () => adapter.treasuryAvailable(treasury),
+        operatorUsdcBalance: () => adapter.usdcBalanceOf(cfg.usdc, operatorAddress),
+        fundOperator: (t, a) => adapter.fundOperator(t, a),
+        operatorTransferUsdc: (u, to, a) => adapter.operatorTransferUsdc(u, to, a),
+        depositToGateway: (amt) => gateway.deposit(amt),
+        standingExposure: () =>
+          readStandingExposure({
+            usdcBalanceOf: (owner) => adapter.usdcBalanceOf(cfg.usdc, owner),
+            gatewayAvailable: () => gateway.getAvailable(),
+            operator: operatorAddress,
+            pocket: gateway.address,
+          }),
+        ceiling: usdToUnits(cfg.maxPocketFloatUsdc),
+      },
+      floatAtomic,
+      { skipFundOperator },
+    );
+    return [...seedTxs, ...bridgeTxs];
   });
-
-  // Retry-safety (#32): if the operator already holds the fundOperator credit (a re-run completing a
-  // partial bridge), skip re-pulling from the treasury. The gas-seed lands the operator at
-  // gasSeedTarget; a landed credit pushes it to ~gasSeedTarget + amount (minus small gas), so the
-  // amount/2 margin cleanly distinguishes "seeded only" from "seeded + credit".
-  const seedTargetAtomic = usdToUnits(cfg.gasSeedTargetUsdc);
-  const operatorBalance = await adapter.usdcBalanceOf(cfg.usdc, operatorAddress);
-  const skipFundOperator = shouldSkipFundOperator(operatorBalance, seedTargetAtomic, floatAtomic);
-
-  const bridgeTxs = await topUpPocket(
-    {
-      treasury,
-      // NOTE: uses cfg.usdc (the platform-global token). treasury_status.balance in entityPayment.ts
-      // instead reads `entity.treasuryConfig?.usdc ?? cfg.usdc` — the two token sources coincide today
-      // (onboarding sets treasuryConfig.usdc = cfg.usdc) but should not silently drift.
-      usdc: cfg.usdc,
-      pocketAddress: gateway.address,
-      available: () => adapter.treasuryAvailable(treasury),
-      operatorUsdcBalance: () => adapter.usdcBalanceOf(cfg.usdc, operatorAddress),
-      fundOperator: (t, a) => adapter.fundOperator(t, a),
-      operatorTransferUsdc: (u, to, a) => adapter.operatorTransferUsdc(u, to, a),
-      depositToGateway: (amt) => gateway.deposit(amt),
-    },
-    floatAtomic,
-    { skipFundOperator },
-  );
-  return [...seedTxs, ...bridgeTxs];
 }
 
 /** Live composition root: wire real funding + agent + settled sell into a single runner. */
@@ -279,6 +305,8 @@ export async function buildLiveAgentRunner(
     network: arcBatchingConfig.network,
     verifyingContract: arcBatchingConfig.verifyingContract,
   });
+  // Read-only Gateway handle for leg-0's fund-to-target check (D5) — same pocket key, no signing.
+  const fundGateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
 
   // The pocket's own signer — used at the end of each run to sweep its residual USDC back to the
   // treasury (keeps the per-agent float ~zero; Gateway-held balance is not swept, only the EOA's).
@@ -340,6 +368,7 @@ export async function buildLiveAgentRunner(
       paused: await adapter.treasuryPaused(treasury),
       allowlistEnabled: await adapter.treasuryAllowlistEnabled(treasury),
       isAllowed: await adapter.treasuryIsAllowed(treasury, payee),
+      legalActive: (await adapter.legalStatus(entity.proxy!)) === 0,
     }),
     signX402: async (req: Parameters<typeof authorizePayment>[1]) =>
       signX402({
@@ -372,7 +401,15 @@ export async function buildLiveAgentRunner(
     paymentRecords.length = 0;
     const result = await runLive(
       {
-        fund: (amt) => fundPocket(cfg, treasury, amt, operatorWallet, entity.idempotencyKey),
+        // leg-0 funds only the shortfall (fund-to-target), so accumulated Gateway float across runs
+        // (only the pocket EOA is swept, not Gateway) can't wedge against the standing-float ceiling.
+        fund: (amt) =>
+          fundToTarget(amt, {
+            readGatewayAtomic: async () =>
+              BigInt(Math.floor((await fundGateway.getAvailable()) * 1e6)),
+            fund: (shortfall) =>
+              fundPocket(cfg, treasury, shortfall, operatorWallet, entity.idempotencyKey),
+          }),
         runDemo: (q) =>
           runDemo(
             {

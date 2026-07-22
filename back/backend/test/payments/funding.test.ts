@@ -6,6 +6,7 @@ import {
   shouldSkipFundOperator,
   topUpPocket,
 } from "../../src/payments/funding";
+import { withKeyedLock } from "../../src/payments/keyedMutex";
 
 const treasury = `0x${"aa".repeat(20)}` as const;
 const usdc = `0x${"bb".repeat(20)}` as const;
@@ -21,6 +22,13 @@ function deps(over: Partial<FundingDeps> = {}): FundingDeps {
     operatorUsdcBalance: vi.fn(async () => 1_000_000n), // operator already shows the float by default
     operatorTransferUsdc: vi.fn(async () => "0xxfer" as const),
     depositToGateway: vi.fn(async () => "0xdeposit" as const),
+    ceiling: 1_000_000_000n, // high default so existing tests are unaffected
+    standingExposure: async () => ({
+      operatorEoa: 0n,
+      pocketEoa: 0n,
+      gateway: 0n,
+      total: 0n,
+    }),
     ...over,
   };
 }
@@ -165,4 +173,84 @@ test("shouldSkipFundOperator: tiny-amount erosion false-negative (documented lim
   // amount=4 atomic is so small that gas erosion exceeds amount/2 (2 atomic), so a landed credit
   // can look identical to a fresh seed. This is the known, accepted false-negative (re-pulls) case.
   expect(shouldSkipFundOperator(200_000n, 200_000n, 4n)).toBe(false);
+});
+
+test("rejects a top-up that would push standing over the ceiling (fundOperator not called)", async () => {
+  const d = deps({
+    ceiling: 1_000_000n,
+    standingExposure: async () => ({
+      operatorEoa: 200_000n,
+      pocketEoa: 200_000n,
+      gateway: 300_000n,
+      total: 700_000n,
+    }),
+  });
+  await expect(topUpPocket(d, 400_000n, { sleep: noSleep })).rejects.toThrow(
+    /float-ceiling-exceeded/,
+  );
+  expect(d.fundOperator).not.toHaveBeenCalled();
+});
+
+test("allows a top-up when standing + amount exactly equals the ceiling (boundary)", async () => {
+  const d = deps({
+    ceiling: 1_000_000n,
+    standingExposure: async () => ({
+      operatorEoa: 200_000n,
+      pocketEoa: 200_000n,
+      gateway: 200_000n,
+      total: 600_000n,
+    }),
+  });
+  const hashes = await topUpPocket(d, 400_000n, { sleep: noSleep });
+  expect(d.fundOperator).toHaveBeenCalledWith(treasury, 400_000n);
+  expect(hashes).toEqual(["0xfund", "0xxfer", "0xdeposit"]);
+});
+
+test("does NOT consult the ceiling on the skipFundOperator retry path", async () => {
+  const standingExposure = vi.fn(async () => ({
+    operatorEoa: 0n,
+    pocketEoa: 0n,
+    gateway: 2_000_000n,
+    total: 2_000_000n, // already over the ceiling
+  }));
+  const d = deps({ ceiling: 1_000_000n, standingExposure });
+  const hashes = await topUpPocket(d, 400_000n, { sleep: noSleep, skipFundOperator: true });
+  expect(standingExposure).not.toHaveBeenCalled();
+  expect(d.fundOperator).not.toHaveBeenCalled();
+  expect(hashes).toEqual(["0xxfer", "0xdeposit"]);
+});
+
+test("mutex + ceiling: two concurrent same-agent top-ups serialize so the second sees the first's raised standing and rejects", async () => {
+  // Mirrors how fundPocket wraps topUpPocket in withKeyedLock(entityKey, ...) (D3+D4): `deposited`
+  // stands in for the Gateway balance rising once the first call's fundOperator lands.
+  const key = "agentA-mutex-test";
+  const ceiling = 1_000_000n;
+  const baseStanding = 600_000n;
+  let deposited = 0n;
+  const d = deps({
+    ceiling,
+    standingExposure: async () => ({
+      operatorEoa: 0n,
+      pocketEoa: 0n,
+      gateway: baseStanding + deposited,
+      total: baseStanding + deposited,
+    }),
+    fundOperator: vi.fn(async (_t, amount) => {
+      await noSleep(0); // yield, so a real race would interleave here if unserialized
+      deposited += amount;
+      return "0xfund" as const;
+    }),
+  });
+
+  const call = () => withKeyedLock(key, () => topUpPocket(d, 400_000n, { sleep: noSleep }));
+  const results = await Promise.allSettled([call(), call()]);
+
+  // first: baseStanding(600000) + amount(400000) == ceiling(1000000) -> allowed (boundary)
+  expect(results[0].status).toBe("fulfilled");
+  // second only starts once the first's fn has resolved (mutex), so it sees deposited=400000 ->
+  // standing 1000000 + amount 400000 > ceiling -> rejected, not an undetected race.
+  expect(results[1].status).toBe("rejected");
+  const reason = (results[1] as PromiseRejectedResult).reason as Error;
+  expect(reason.message).toMatch(/float-ceiling-exceeded/);
+  expect(d.fundOperator).toHaveBeenCalledTimes(1); // the second call never reached fundOperator
 });

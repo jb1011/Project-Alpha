@@ -5,12 +5,15 @@ import { makeSignX402 } from "../adapters/x402/signX402";
 import type { Config } from "../config/env";
 import type { PaymentReceipt } from "../persistence/paymentIdempotencyStore";
 import type { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
+import { usdToUnits } from "../policy/units";
 import type { Address, EntityRecord, Hex } from "../types";
 import type { AuthorityDeps, AuthorizeRequest } from "./authority";
 import { authorizePayment } from "./authority";
 import { buyWithX402 } from "./buyer";
 import type { PaymentLedger } from "./ledger";
 import { assertPublicHttpsUrl, safeFetch } from "./ssrfGuard";
+import type { StandingExposure } from "./standingExposure";
+import { buildReadExposure } from "./standingExposure";
 
 /** The ArcAdapter surface this service needs — narrowed to the four treasury reads so tests can
  *  fake it without a chain. */
@@ -20,6 +23,7 @@ export interface TreasuryReader {
   treasuryAllowlistEnabled(t: Address): Promise<boolean>;
   treasuryIsAllowed(t: Address, who: Address): Promise<boolean>;
   usdcBalanceOf(usdc: Address, owner: Address): Promise<bigint>;
+  legalStatus(proxy: Address): Promise<number>;
 }
 
 export interface TreasuryStatusView {
@@ -31,6 +35,15 @@ export interface TreasuryStatusView {
   float: string;
   /** Actual on-chain USDC balance of the treasury (atomic, 6 decimals) — distinct from the policy `available` leash. */
   balance: string;
+  /** Honest total un-clawback-able standing exposure (operator EOA + pocket EOA + Gateway), atomic USDC,
+   *  plus the configured ceiling. `float` above stays the spendable Gateway balance — this is additive. */
+  standing: {
+    operatorEoa: string;
+    pocketEoa: string;
+    gateway: string;
+    total: string;
+    ceiling: string;
+  };
 }
 
 export interface PayArgs {
@@ -54,6 +67,10 @@ export interface EntityPaymentDeps {
    *  real Circle Gateway read (derives the pocket key, builds a PocketGateway, converts the decimal
    *  `getAvailable()` to atomic units) — injectable so tests can fake it without a Gateway call. */
   readPocketFloat?: (entity: EntityRecord) => Promise<bigint>;
+  /** Reads the per-agent standing exposure (operator EOA + pocket EOA + Gateway). Defaults to a real
+   *  on-chain/Gateway read via readStandingExposure — injectable so tests can fake it without a live
+   *  Gateway call. */
+  readExposure?: (entity: EntityRecord) => Promise<StandingExposure>;
 }
 
 /** The pocket master seed is required to derive a per-agent pocket (mirrors liveRunner.ts). */
@@ -91,6 +108,12 @@ export function buildEntityPaymentService(
       return BigInt(Math.floor(available * 1e6));
     });
 
+  // Real standing-exposure read (used unless a test injects deps.readExposure): derive this entity's
+  // pocket key, build a throwaway PocketGateway, and sum operator EOA + pocket EOA + Gateway.
+  // buildReadExposure is the shared wiring also used by GET /entities/:id/treasury.
+  const readExposure: (entity: EntityRecord) => Promise<StandingExposure> =
+    deps.readExposure ?? buildReadExposure(cfg, deps.reader);
+
   const buildAuthorize = (entity: EntityRecord, treasury: Address) => {
     const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
     const signX402 = makeSignX402({
@@ -107,6 +130,7 @@ export function buildEntityPaymentService(
         paused: await deps.reader.treasuryPaused(treasury),
         allowlistEnabled: await deps.reader.treasuryAllowlistEnabled(treasury),
         isAllowed: await deps.reader.treasuryIsAllowed(treasury, payee),
+        legalActive: (await deps.reader.legalStatus(entity.proxy!)) === 0,
       }),
       signX402: async (req: AuthorizeRequest) =>
         signX402({
@@ -124,6 +148,7 @@ export function buildEntityPaymentService(
 
   return {
     async status(entity) {
+      const ceiling = usdToUnits(cfg.maxPocketFloatUsdc).toString();
       if (!entity.treasury) {
         return {
           available: "0",
@@ -132,15 +157,17 @@ export function buildEntityPaymentService(
           allowlistEnabled: false,
           float: "0",
           balance: "0",
+          standing: { operatorEoa: "0", pocketEoa: "0", gateway: "0", total: "0", ceiling },
         };
       }
       const treasury = entity.treasury;
-      const [available, paused, allowlistEnabled, float, balance] = await Promise.all([
+      const [available, paused, allowlistEnabled, float, balance, exposure] = await Promise.all([
         deps.reader.treasuryAvailable(treasury),
         deps.reader.treasuryPaused(treasury),
         deps.reader.treasuryAllowlistEnabled(treasury),
         readPocketFloat(entity),
         deps.reader.usdcBalanceOf(entity.treasuryConfig?.usdc ?? cfg.usdc, treasury),
+        readExposure(entity),
       ]);
       const cap = entity.treasuryConfig?.cap ?? 0n;
       return {
@@ -150,6 +177,13 @@ export function buildEntityPaymentService(
         allowlistEnabled,
         float: float.toString(),
         balance: balance.toString(),
+        standing: {
+          operatorEoa: exposure.operatorEoa.toString(),
+          pocketEoa: exposure.pocketEoa.toString(),
+          gateway: exposure.gateway.toString(),
+          total: exposure.total.toString(),
+          ceiling,
+        },
       };
     },
 

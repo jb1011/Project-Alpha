@@ -34,6 +34,7 @@ function makeConfig(): Config {
     agentModel: "claude-sonnet-4-6",
     gatewayFacilitatorUrl: "https://gateway-api-testnet.circle.com",
     fundingFloatUsdc: "0.50",
+    maxPocketFloatUsdc: "1.00",
     spendAllowlistThreshold: 1_000_000n,
     maxJobBudget: 5_000_000n,
     maxInflightJobsPerTenant: 3,

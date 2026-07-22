@@ -17,6 +17,7 @@ function deps(over: Partial<AuthorityDeps> = {}): AuthorityDeps {
       paused: false,
       allowlistEnabled: true,
       isAllowed: true,
+      legalActive: true,
     }),
     signX402: async () => ({ header: "X-PAYMENT-fake", ledgerRef: "ref" }),
     ...over,
@@ -66,6 +67,7 @@ test("denies an over-cap payment and writes nothing to the ledger", async () => 
       paused: false,
       allowlistEnabled: false,
       isAllowed: false,
+      legalActive: true,
     }),
   });
   const res = await authorizePayment(d, {
@@ -87,6 +89,7 @@ test("denies when guardian-paused", async () => {
       paused: true,
       allowlistEnabled: false,
       isAllowed: false,
+      legalActive: true,
     }),
   });
   const res = await authorizePayment(d, {
@@ -107,6 +110,7 @@ test("denies a non-allowlisted payee (allowlist on) and writes nothing to the le
       paused: false,
       allowlistEnabled: true,
       isAllowed: false,
+      legalActive: true,
     }),
   });
   const res = await authorizePayment(d, {
@@ -149,6 +153,7 @@ test("denies an over-threshold payment to a non-allowlisted payee and never call
       paused: false,
       allowlistEnabled: false,
       isAllowed: false,
+      legalActive: true,
     }),
     signX402,
     threshold: 100n,

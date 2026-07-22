@@ -30,6 +30,7 @@ test("full cycle: agent buys sentiment, answers, prices at margin, customer pays
       paused: false,
       allowlistEnabled: false,
       isAllowed: true,
+      legalActive: true,
     }),
     signX402: async (req: {
       payee: `0x${string}`;

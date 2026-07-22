@@ -35,6 +35,7 @@ function makeConfig(over: Partial<Config> = {}): Config {
     agentModel: "claude-sonnet-4-6",
     gatewayFacilitatorUrl: "https://gateway-api-testnet.circle.com",
     fundingFloatUsdc: "0.50",
+    maxPocketFloatUsdc: "1.00",
     spendAllowlistThreshold: 500n,
     maxJobBudget: 5_000_000n,
     maxInflightJobsPerTenant: 3,
@@ -127,6 +128,7 @@ function makeReader(
     allowlistEnabled: boolean;
     isAllowed: boolean;
     balance: bigint;
+    legalStatus: number;
   }> = {},
 ) {
   const isAllowedCalls: Address[] = [];
@@ -143,6 +145,7 @@ function makeReader(
       usdcBalanceOfCalls.push([usdc, owner]);
       return over.balance ?? 0n;
     },
+    legalStatus: async () => over.legalStatus ?? 0,
   };
   return { reader, isAllowedCalls, usdcBalanceOfCalls };
 }
@@ -206,6 +209,26 @@ test("policy denial (over-cap): surfaces the reason, no retry fetch, idempotency
   expect(fn).toHaveBeenCalledTimes(1); // only the 402 probe, no retry
   // released, not stuck: a subsequent begin() with the same key is "new" again
   expect(idempotency.begin("k-cap", "tenantA", entity.idempotencyKey)).toEqual({ status: "new" });
+});
+
+test("pay denies when the legal body is suspended, even with sufficient float", async () => {
+  const { reader } = makeReader({ legalStatus: 1 }); // non-zero = suspended
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+  });
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-legal",
+    tenantId: "tenantA",
+  });
+  expect(receipt).toMatchObject({ ok: false, reason: "legal-not-active" });
+  expect(fn).toHaveBeenCalledTimes(1); // only the 402 probe, no retry
 });
 
 test("hybrid: amount above threshold with a non-allowlisted payee is denied", async () => {
@@ -322,6 +345,7 @@ test("status: reads the four treasury fields plus the entity's configured cap", 
     ledger,
     idempotency,
     readPocketFloat: async () => 250_000n,
+    readExposure: async () => ({ operatorEoa: 0n, pocketEoa: 0n, gateway: 0n, total: 0n }),
   });
 
   const status = await svc.status(seedEntity());
@@ -333,6 +357,7 @@ test("status: reads the four treasury fields plus the entity's configured cap", 
     allowlistEnabled: true,
     float: "250000",
     balance: "123",
+    standing: { operatorEoa: "0", pocketEoa: "0", gateway: "0", total: "0", ceiling: "1000000" },
   });
 });
 
@@ -344,6 +369,7 @@ test("status: sources the balance read from the entity's own treasury USDC, not 
     ledger,
     idempotency,
     readPocketFloat: SUFFICIENT_FLOAT,
+    readExposure: async () => ({ operatorEoa: 0n, pocketEoa: 0n, gateway: 0n, total: 0n }),
   });
   const entity = seedEntity({
     treasuryConfig: {
@@ -520,6 +546,7 @@ test("status: an entity with no treasury reads as zeroed-out/not-paused", async 
     allowlistEnabled: false,
     float: "0",
     balance: "0",
+    standing: { operatorEoa: "0", pocketEoa: "0", gateway: "0", total: "0", ceiling: "1000000" },
   });
 });
 
@@ -645,4 +672,30 @@ test("audit fix E: pays on two different entities don't cross-count in runningPe
   expect(receiptB.ok).toBe(true);
   expect(ledger.runningPending(entityA.idempotencyKey)).toBe(1000n);
   expect(ledger.runningPending(entityB.idempotencyKey)).toBe(0n);
+});
+
+test("status surfaces the standing exposure breakdown + ceiling", async () => {
+  const { reader } = makeReader();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    readExposure: async () => ({
+      operatorEoa: 200_000n,
+      pocketEoa: 200_000n,
+      gateway: 500_000n,
+      total: 900_000n,
+    }),
+  });
+  const view = await svc.status(seedEntity());
+  expect(view.standing).toEqual({
+    operatorEoa: "200000",
+    pocketEoa: "200000",
+    gateway: "500000",
+    total: "900000",
+    ceiling: "1000000", // usdToUnits("1.00")
+  });
+  // float stays the spendable Gateway balance, NOT the standing total
+  expect(view.float).toBe(1_000_000_000n.toString());
 });

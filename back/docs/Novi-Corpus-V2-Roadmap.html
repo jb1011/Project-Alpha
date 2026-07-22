@@ -152,20 +152,24 @@
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">S2</div><div class="ic">
-      <div class="ititle">The x402 spend path escapes the on-chain allowlist, per-tx cap &amp; guardian clawback <span class="v crit">Critical</span></div>
-      <div class="why">Confirmed independently by two auditors. <code>fundOperator</code> is <b>allowlist-exempt</b>
-      and moves funds to the operator's hot EOA before payment, so: the on-chain allowlist governs only direct
-      <code>spend()</code> (which x402 never uses); there is <b>no on-chain per-tx cap</b> (only a period cap — the
-      "on-chain per-tx + period caps" claim is inaccurate); and the guardian's <code>emergencyWithdraw</code>/
-      <code>pause</code> <b>cannot reach in-flight funds</b> on the operator/pocket/Gateway. (Precise: <code>fundOperator</code>
-      <em>is</em> bounded by the period cap + pause + legal-status; the gaps are the allowlist, a per-tx cap, and
-      in-flight clawback.) <b>Fix — two-part plan (decided 2026-07-20):</b> the <b>full close is an explicit
-      acceptance criterion of the Tier 0 smart-account migration (#2)</b> — a policy module on the operator
-      smart-account enforcing allowlist + per-tx cap on its own payments, or treasury-direct signing (#6). It is
-      <b>not</b> a free side effect of swapping wallet types; a plain wallet-type swap leaves S2 open. <b>Interim
-      now (this item):</b> make the hot-wallet exposure a hard, monitored ceiling (bound operator+pocket+Gateway
-      float to ~one payment) and correct the docs/UI implying the allowlist/per-tx cap cover x402 payments — no new
-      contract, no unverified-Arc dependency.</div>
+      <div class="ititle">x402 payments enforce the same rules as direct spend, but in software — standing float sat beyond guardian clawback <span class="v crit">Critical</span></div>
+      <div class="why">Confirmed independently by two auditors, then corrected against the live code in the
+      2026-07-20 design review: x402 payments apply the <b>same</b> allowlist, per-tx-cap, threshold and pause rules
+      as direct <code>spend()</code> — enforced in software (<code>evaluatePolicy</code>, re-checked before every
+      payment against fresh on-chain reads), not contract-guaranteed the way <code>spend()</code> is. The genuine
+      gap: <code>fundOperator</code> is <b>allowlist-exempt on-chain</b> and has <b>no on-chain per-tx cap</b> (only
+      a period cap) before it moves funds to the operator's hot EOA/pocket/Gateway — so once funded, that standing
+      float sat beyond the guardian's <code>emergencyWithdraw</code>/<code>pause</code> reach until spent. Same
+      rules — contract-guaranteed for direct spends, software-enforced for x402; the on-chain-guaranteed x402 bounds
+      are <b>period cap + pause + legal status + the standing-float ceiling</b> (below). <b>Fix — two-part plan
+      (decided 2026-07-20):</b> the <b>full close is an explicit acceptance criterion of the Tier 0 smart-account
+      migration (#2)</b> — a policy module on the operator smart-account enforcing allowlist + per-tx cap on its own
+      payments, or treasury-direct signing (#6). It is <b>not</b> a free side effect of swapping wallet types; a
+      plain wallet-type swap leaves S2 open. <b>Interim shipped (this item, 2026-07-20):</b> a hard
+      <code>MAX_POCKET_FLOAT_USDC</code> ceiling (default 1.00 USDC) bounds operator+pocket+Gateway standing float
+      at the funding choke point, a per-agent lock closes the TOCTOU window, an on-chain legal-status re-check was
+      added to the off-chain gate, and the docs/UI now describe the real on-chain-vs-software split instead of
+      implying x402 is ungoverned — no new contract, no unverified-Arc dependency.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">S3</div><div class="ic">

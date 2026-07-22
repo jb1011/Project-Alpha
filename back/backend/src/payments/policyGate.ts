@@ -10,11 +10,13 @@ export interface PolicyInput {
   runningPending: bigint; // sum of ledger entries authorized-but-not-yet-settled this window
   perTxCap?: bigint; // optional per-transaction cap (off-chain; on-chain per-period cap is the hard guardrail)
   threshold?: bigint; // §14.1 hybrid: amount > threshold requires an allowlisted payee; undefined = rule off
+  legalActive: boolean; // LegalManager status() === 0 at check time; mirrors on-chain _requireSpendable
 }
 
 export type PolicyReason =
   | "zero-amount"
   | "paused"
+  | "legal-not-active"
   | "not-allowlisted"
   | "over-threshold-needs-allowlist"
   | "over-tx-cap"
@@ -25,6 +27,7 @@ export type PolicyDecision = { ok: true } | { ok: false; reason: PolicyReason };
 export function evaluatePolicy(i: PolicyInput): PolicyDecision {
   if (i.amount <= 0n) return { ok: false, reason: "zero-amount" };
   if (i.paused) return { ok: false, reason: "paused" };
+  if (!i.legalActive) return { ok: false, reason: "legal-not-active" };
   if (i.allowlistEnabled && !i.isAllowed) return { ok: false, reason: "not-allowlisted" };
   if (i.threshold !== undefined && i.amount > i.threshold && !i.isAllowed)
     return { ok: false, reason: "over-threshold-needs-allowlist" };
