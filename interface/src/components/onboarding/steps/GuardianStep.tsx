@@ -5,8 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { worldIdContext, worldIdMe, worldIdVerify } from "@/lib/api/client";
 import { ApiError, type WorldIdContext, type WorldIdMe } from "@/lib/api/types";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
+import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
 import { useAuth } from "../AuthProvider";
-import { Button, Callout, Card, CheckIcon, Spinner, StepHeader } from "../primitives";
+import { Button, Card, CheckIcon, Spinner, StepHeader } from "../primitives";
 
 /**
  * Proof of personhood for the account's guardian.
@@ -142,7 +143,7 @@ export function GuardianStep({
               </>
             )}
 
-            {error && <ErrorNote error={error} />}
+            {error && <WorldErrorNote error={error} />}
           </div>
         </div>
       </Card>
@@ -205,36 +206,3 @@ function Point({ children }: { children: React.ReactNode }) {
   );
 }
 
-function ErrorNote({ error }: { error: string }) {
-  const code = error.startsWith("world:") ? error.slice(6) : "";
-  if (code === "max_verifications_reached")
-    return (
-      <Callout tone="warn" title="World has already verified you for this action">
-        You are a real, unique human — World just won&apos;t issue a second proof for it.
-      </Callout>
-    );
-  if (code === "user_rejected" || code === "verification_rejected")
-    return (
-      <Callout tone="warn" title="Verification cancelled">
-        Nothing was recorded. Start again whenever you&apos;re ready.
-      </Callout>
-    );
-  if (code === "credential_unavailable")
-    return (
-      <Callout tone="warn" title="Orb credential required">
-        Guardianship needs an Orb or document-grade credential. A device-only World ID isn&apos;t
-        enough to be legally accountable for an agent.
-      </Callout>
-    );
-  if (error.toLowerCase().includes("already the guardian"))
-    return (
-      <Callout tone="warn" title="This human already backs another account">
-        One person cannot quietly hold two separate guardianships.
-      </Callout>
-    );
-  return (
-    <Callout tone="warn" title="Not verified">
-      {code || error}
-    </Callout>
-  );
-}

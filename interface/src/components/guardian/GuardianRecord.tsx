@@ -3,7 +3,8 @@
 import * as React from "react";
 import type { WorldIdMe } from "@/lib/api/types";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
-import { Button, Callout, cx } from "@/components/onboarding/primitives";
+import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
+import { Button, cx } from "@/components/onboarding/primitives";
 import { shortAddress } from "@/components/onboarding/types";
 
 /**
@@ -198,7 +199,7 @@ export function GuardianRecord({
 
       {error && (
         <div className="mt-4">
-          <ErrorNote error={error} />
+          <WorldErrorNote error={error} />
         </div>
       )}
     </div>
@@ -298,40 +299,3 @@ function formatDate(ms: number): string {
   });
 }
 
-/** Turns World/API failures into something a person can act on. */
-function ErrorNote({ error }: { error: string }) {
-  const code = error.startsWith("world:") ? error.slice(6) : "";
-  if (code === "max_verifications_reached")
-    return (
-      <Callout tone="warn" title="World has already verified you for this action">
-        You are a real, unique human — World simply won&apos;t issue a second proof, because this
-        action allows one verification per person.
-      </Callout>
-    );
-  if (code === "user_rejected" || code === "verification_rejected")
-    return (
-      <Callout tone="warn" title="Verification cancelled">
-        You dismissed the request in World App. Nothing was recorded — start again whenever
-        you&apos;re ready.
-      </Callout>
-    );
-  if (code === "credential_unavailable")
-    return (
-      <Callout tone="warn" title="Orb credential required">
-        Guardianship needs an Orb or document-grade credential. A device-only World ID isn&apos;t
-        enough to be legally accountable for an agent.
-      </Callout>
-    );
-  if (error.toLowerCase().includes("already the guardian"))
-    return (
-      <Callout tone="warn" title="This human already backs another account">
-        The uniqueness rule, working as intended: one person cannot quietly hold two separate
-        guardianships.
-      </Callout>
-    );
-  return (
-    <Callout tone="warn" title="Not verified">
-      {code || error}
-    </Callout>
-  );
-}
