@@ -5,6 +5,7 @@ import Link from "next/link";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
 import {
+  entityAgentBook,
   getEntity,
   getEntityRuns,
   getEntityTreasury,
@@ -36,6 +37,11 @@ export function AgentDashboard({
   const [runs, setRuns] = React.useState<AgentRun[]>([]);
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [pausing, setPausing] = React.useState(false);
+  const [agentBook, setAgentBook] = React.useState<{
+    registered: boolean;
+    humanId?: string;
+    register?: string;
+  } | null>(null);
   const [pauseError, setPauseError] = React.useState<string | null>(null);
 
   const ensureSessionRef = React.useRef(ensureSession);
@@ -72,6 +78,23 @@ export function AgentDashboard({
       clearInterval(h);
     };
   }, [refresh]);
+
+  // AgentBook standing — once, not on the poll (it's a World Chain read behind a cache).
+  React.useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const auth = await ensureSessionRef.current();
+        const ab = await entityAgentBook(auth.token, entityId);
+        if (live) setAgentBook(ab);
+      } catch {
+        /* 404 when AgentBook reads aren't configured — chip simply doesn't render */
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [entityId]);
 
   const paused = treasury?.paused ?? false;
   const balanceUsdc = treasury ? Number(treasury.usdcBalance) / 1e6 : null;
@@ -174,6 +197,31 @@ export function AgentDashboard({
             <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">
               On-chain identity
             </div>
+            <div className="flex flex-wrap items-center gap-2">
+            {agentBook && (
+              <span
+                title={
+                  agentBook.registered
+                    ? `AgentBook (World Chain): human ${agentBook.humanId?.slice(0, 14)}… answers for this agent's wallet`
+                    : agentBook.register
+                }
+                className={
+                  agentBook.registered
+                    ? "inline-flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1.5 text-[11.5px] text-emerald-300"
+                    : "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-muted-2"
+                }
+              >
+                <span
+                  aria-hidden
+                  className={
+                    agentBook.registered
+                      ? "h-1.5 w-1.5 rounded-full bg-emerald-300"
+                      : "h-1.5 w-1.5 rounded-full border border-muted-2"
+                  }
+                />
+                {agentBook.registered ? "AgentBook · human-backed" : "AgentBook · not registered"}
+              </span>
+            )}
             {ensName(entity) && (
               <a
                 href={`https://sepolia.app.ens.domains/${ensName(entity)}`}
@@ -187,6 +235,7 @@ export function AgentDashboard({
                 <span aria-hidden className="text-[10px] opacity-70">↗</span>
               </a>
             )}
+            </div>
           </div>
           <dl className="mt-4 grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
             {entity.agentId && <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />}

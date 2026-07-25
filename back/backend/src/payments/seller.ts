@@ -106,6 +106,10 @@ export interface PaywallConfig extends SellerConfig {
   /** Optional World AgentKit gate: authorize human-backed agents before requiring payment.
    *  Absent -> the paywall behaves exactly as before. */
   agentkit?: AgentkitSellerConfig;
+  /** Whom this seller trades with. "open" (default) = today's behavior. "accountable-only" =
+   *  agents no verified human answers for are REFUSED (403) — their payment is not wanted;
+   *  human-backed agents proceed to the normal payment path. Requires `agentkit`. */
+  trustPolicy?: "open" | "accountable-only";
 }
 
 /** A paywalled Hono sub-app: [agentkit authorization] -> 402 -> verify X-PAYMENT -> serve. */
@@ -123,12 +127,55 @@ export function buildPaywall(cfg: PaywallConfig) {
       ? { ...buildRequirements(cfg), extensions: mintAgentkitExtension(cfg.agentkit) }
       : buildRequirements(cfg);
 
+  const strict = cfg.trustPolicy === "accountable-only" && !!cfg.agentkit;
+
+  /** Strict refusal: a doorway, not a wall. 403 (never 402 — payment would not help), with the
+   *  remediation AND the standard challenge, so a capable agent can fix its situation from the
+   *  refusal alone. */
+  const refusal = (reason: string) => ({
+    error: "human_backing_required",
+    detail: "this seller trades only with agents a verified unique human answers for",
+    reason,
+    how: {
+      register: "npx @worldcoin/agentkit-cli register <your-agent-address>",
+      agentBook: cfg.agentkit?.agentBookAddress ?? "0xA23aB2712eA7BBa896930544C7d6636a96b944dA",
+      chain: "world-chain",
+    },
+    // biome-ignore lint/style/noNonNullAssertion: strict implies agentkit (see `strict` above).
+    extensions: mintAgentkitExtension(cfg.agentkit!),
+  });
+
   app.get(path, async (c) => {
-    // World gate FIRST: an agent proving it is backed by a verified unique human may be
-    // authorized to act within its per-human allowance. Beyond that (or on any failure) it
-    // falls through to the normal governed-payment path below — fail-closed by construction.
     const akHeader = c.req.header("agentkit");
-    if (akHeader && cfg.agentkit) {
+
+    // ── accountable-only: accountability is a PRECONDITION of commerce ──────────────────────
+    // No valid proof of a human backer -> refused outright; their money is not wanted (403,
+    // never 402). A valid proof unlocks the RIGHT TO BUY: flow continues into the normal x402
+    // path below — everyone pays. The per-human counter acts as a rate cap (429), not a free
+    // allowance: one human backing fifty agents still gets one budget.
+    if (strict) {
+      if (!akHeader) return c.json(refusal("no-proof-presented"), 403);
+      // biome-ignore lint/style/noNonNullAssertion: strict implies agentkit.
+      const outcome = await verifyAgentkitRequest(akHeader, cfg.agentkit!);
+      if (!outcome.authorized) {
+        if (outcome.reason === "allowance-exhausted") {
+          if (outcome.humanId) c.header("X-AGENTKIT-HUMAN", outcome.humanId);
+          return c.json(
+            { error: "rate-capped", detail: "per-human request budget exhausted for this window" },
+            429,
+          );
+        }
+        return c.json(refusal(outcome.reason ?? "unverified"), 403);
+      }
+      c.header("X-AGENTKIT-HUMAN", outcome.humanId);
+      c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
+      // fall through to payment — accountability grants no discount
+    }
+
+    // World gate FIRST (open mode): an agent proving it is backed by a verified unique human may
+    // be authorized to act within its per-human allowance. Beyond that (or on any failure) it
+    // falls through to the normal governed-payment path below — fail-closed by construction.
+    if (!strict && akHeader && cfg.agentkit) {
       const outcome = await verifyAgentkitRequest(akHeader, cfg.agentkit);
       if (outcome.authorized) {
         c.header("X-AGENTKIT-HUMAN", outcome.humanId);
@@ -170,7 +217,9 @@ export function buildPaywall(cfg: PaywallConfig) {
       if (!r.ok) return c.json({ ...challenge(), error: `settle-failed:${r.reason ?? ""}` }, 402);
       if (r.transferId) c.header("X-PAYMENT-RESPONSE", r.transferId);
     }
-    return c.json((await cfg.serve(c.req.raw)) as Record<string, unknown>, 200);
+    const served = (await cfg.serve(c.req.raw)) as Record<string, unknown>;
+    // In strict mode the buyer proved a human backer before paying — say so on the receipt.
+    return c.json(strict ? { ...served, humanBacked: true } : served, 200);
   });
   return app;
 }

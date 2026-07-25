@@ -269,6 +269,46 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     return c.json({ status: "attested", minAge: attested.minAge, credential: attested.credential });
   });
 
+  // ── AgentBook standing for an agent (W9.3) ─────────────────────────────────────────────────
+  // Answers "does a verified human publicly answer for this agent's wallet?" — a live World
+  // Chain read through the positive-only cache. Registration itself happens in World App (the
+  // human scans); we only ever read.
+  app.get("/entities/:id/agentbook", requireAuth(deps.jwtSecret), async (c) => {
+    const id = c.req.param("id");
+    const rec = deps.repo.findByIdempotencyKey(id);
+    if (!rec || rec.ownerTenantId !== c.get("tenantId"))
+      throw new ApiError("not_found", 404, "entity not found");
+    const ak = deps.x402Demo?.agentkit;
+    if (!ak) throw new ApiError("not_found", 404, "AgentBook reads are not configured");
+    const operator = rec.operator;
+    if (!operator) return c.json({ registered: false, reason: "no-operator-yet" });
+
+    let humanId = ak.store.getCachedHuman(operator, Date.now(), 10 * 60_000);
+    if (!humanId) {
+      try {
+        const { createAgentBookVerifier } = await import("@worldcoin/agentkit");
+        const verifier = createAgentBookVerifier({
+          ...(ak.worldChainRpc ? { rpcUrl: ak.worldChainRpc } : {}),
+          ...(ak.agentBookAddress ? { contractAddress: ak.agentBookAddress } : {}),
+          // biome-ignore lint/suspicious/noExplicitAny: options typing varies across SDK versions.
+        } as any);
+        const looked = await verifier.lookupHuman(operator);
+        if (looked && !/^0x0*$/.test(looked) && looked !== "0") {
+          humanId = looked;
+          ak.store.cacheHuman(operator, humanId, Date.now());
+        }
+      } catch {
+        // SDK swallows RPC errors into null; either way: unknown -> report unregistered,
+        // never throw — this is a status chip, not a gate.
+      }
+    }
+    return c.json(
+      humanId
+        ? { registered: true, humanId, operator }
+        : { registered: false, operator, register: "npx @worldcoin/agentkit-cli register " + operator },
+    );
+  });
+
   // Current guardian-verification state for the caller's tenant (drives UI + the onboarding gate).
   app.get("/world-id/me", requireAuth(deps.jwtSecret), (c) => {
     const tenantId = c.get("tenantId");

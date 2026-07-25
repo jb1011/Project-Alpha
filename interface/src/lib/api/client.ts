@@ -245,6 +245,14 @@ export function worldIdStatus(token: string, requestId: string): Promise<WorldId
   return request<WorldIdStatusView>(`/world-id/status/${requestId}`, { token });
 }
 
+/** AgentBook standing for an agent: does a verified human publicly answer for its wallet? */
+export function entityAgentBook(
+  token: string,
+  id: string,
+): Promise<{ registered: boolean; humanId?: string; operator?: string; register?: string }> {
+  return request(`/entities/${encodeURIComponent(id)}/agentbook`, { token });
+}
+
 /** Params for the identity step-up widget. 404 when the deployment has no attest action; 403
  *  until the caller is already a verified guardian — it is a step-up, not a way in. */
 export function worldIdAttestContext(token: string): Promise<WorldIdAttestContext> {

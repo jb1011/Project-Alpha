@@ -83,6 +83,14 @@ const EnvSchema = z.object({
     .optional()
     .transform((v) => v === "true" || v === "1"),
   X402_DEMO_PAYTO: addressSchema.optional(),
+  /** Seller trust policy. "open" = today's behavior (AgentKit authorizes within the allowance,
+   *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
+   *  outright (403); human-backed agents still pay. */
+  X402_TRUST_POLICY: z.enum(["open", "accountable-only"]).default("open"),
+  /** AgentBook-registered key for the /proof-run demo (signs AgentKit messages, holds no funds). */
+  X402_PROOF_AGENT_KEY: privKeySchema.optional(),
+  /** Window for the per-human rate cap. The raw counter is lifetime, which is not a rate. */
+  WORLD_RATE_WINDOW_HOURS: z.coerce.number().int().positive().default(24),
   X402_DEMO_PRICE_USDC: z
     .string()
     .default("0.01")
@@ -175,6 +183,10 @@ export interface Config {
   enableX402Demo: boolean;
   x402DemoPayTo: Address;
   x402DemoPriceUsdc: string;
+  /** Optional in the type (test fixtures build Config literals); loadConfig always sets them. */
+  x402TrustPolicy?: "open" | "accountable-only";
+  worldRateWindowHours?: number;
+  x402ProofAgentKey?: Hex;
   ens?: {
     signerKey: Hex;
     parentName: string;
@@ -282,6 +294,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     gasSeedFloorUsdc: e.GAS_SEED_FLOOR_USDC,
     gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,
+    x402TrustPolicy: e.X402_TRUST_POLICY,
+    worldRateWindowHours: e.WORLD_RATE_WINDOW_HOURS,
+    x402ProofAgentKey: e.X402_PROOF_AGENT_KEY,
     x402DemoPayTo:
       e.X402_DEMO_PAYTO ?? (privateKeyToAccount(e.PLATFORM_PRIVATE_KEY).address as Address),
     x402DemoPriceUsdc: e.X402_DEMO_PRICE_USDC,

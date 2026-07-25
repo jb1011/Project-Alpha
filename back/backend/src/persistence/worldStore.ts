@@ -68,12 +68,15 @@ export interface WorldStore {
   /** True iff the nonce was unused (marks it used). Replay guard for agentkit payloads. */
   consumeNonce(nonce: string, now: number): boolean;
   /** Increment usage for (human, resource) if under `limit`; returns the authorization decision. */
+  /** Windowed per-human counter. `windowMs` absent -> lifetime (legacy). A window that has
+   *  elapsed since the last update resets the count — so a "rate cap" is actually a rate. */
   tryIncrementUsage(
     humanId: string,
     resource: string,
     limit: number,
     now: number,
-  ): { allowed: boolean; used: number };
+    windowMs?: number,
+  ): { allowed: boolean; used: number; resetAt?: number };
   /** Cached AgentBook lookup (positive results only — misses must re-read, fail-closed). */
   getCachedHuman(agentAddress: string, now: number, ttlMs: number): string | undefined;
   cacheHuman(agentAddress: string, humanId: string, now: number): void;
@@ -256,20 +259,25 @@ export class SqliteWorldStore implements WorldStore {
     resource: string,
     limit: number,
     now: number,
-  ): { allowed: boolean; used: number } {
+    windowMs?: number,
+  ): { allowed: boolean; used: number; resetAt?: number } {
     return this.db.transaction(() => {
       const row = this.db
-        .prepare("SELECT used FROM world_usage WHERE human_id = ? AND resource = ?")
-        .get(humanId, resource) as { used: number } | undefined;
-      const used = row?.used ?? 0;
-      if (used >= limit) return { allowed: false, used };
+        .prepare("SELECT used, updated_at FROM world_usage WHERE human_id = ? AND resource = ?")
+        .get(humanId, resource) as { used: number; updated_at: number } | undefined;
+      // An elapsed window resets the count. Reset can only ever grant MORE than the old
+      // lifetime behavior, never less, so existing callers are safe.
+      const expired = row != null && windowMs != null && now - row.updated_at > windowMs;
+      const used = expired ? 0 : (row?.used ?? 0);
+      const resetAt = row && windowMs != null && !expired ? row.updated_at + windowMs : undefined;
+      if (used >= limit) return { allowed: false, used, resetAt };
       this.db
         .prepare(
           `INSERT INTO world_usage (human_id, resource, used, updated_at) VALUES (?,?,1,?)
-           ON CONFLICT(human_id, resource) DO UPDATE SET used = used + 1, updated_at = excluded.updated_at`,
+           ON CONFLICT(human_id, resource) DO UPDATE SET used = ?, updated_at = excluded.updated_at`,
         )
-        .run(humanId, resource, now);
-      return { allowed: true, used: used + 1 };
+        .run(humanId, resource, now, used + 1);
+      return { allowed: true, used: used + 1, resetAt };
     })();
   }
 

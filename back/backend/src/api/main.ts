@@ -126,7 +126,12 @@ async function main() {
       worldChainRpc: cfg.worldChain.rpcUrl,
       agentBookAddress: cfg.worldChain.agentBook,
       rpcUrls: { [x402Demo.network]: cfg.rpcUrl },
+      rateWindowMs: (cfg.worldRateWindowHours ?? 24) * 3_600_000,
     };
+    x402Demo.trustPolicy = cfg.x402TrustPolicy ?? "open";
+    x402Demo.proofAgentKey = cfg.x402ProofAgentKey;
+    if (x402Demo.trustPolicy === "accountable-only")
+      console.warn("⚠ x402 seller policy: ACCOUNTABLE-ONLY — anonymous agents are refused (403)");
   }
   if (x402Demo)
     console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);

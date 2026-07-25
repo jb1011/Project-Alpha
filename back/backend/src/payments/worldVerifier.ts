@@ -40,6 +40,8 @@ export interface AgentkitSellerConfig {
   rpcUrls?: Record<string, string>;
   /** Test seam: inject a verifier instead of hitting World Chain. */
   agentBook?: { lookupHuman(address: string): Promise<string | null> };
+  /** Window for the per-human counter; absent -> lifetime (legacy). */
+  rateWindowMs?: number;
   now?: () => number;
 }
 
@@ -129,6 +131,7 @@ export async function verifyAgentkitRequest(
       cfg.resourceUrl,
       cfg.allowancePerHuman,
       now(),
+      cfg.rateWindowMs,
     );
     if (!allowed)
       return {
