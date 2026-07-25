@@ -5,7 +5,7 @@ import type { WorldIdMe } from "@/lib/api/types";
 import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
-import { Button, cx } from "@/components/onboarding/primitives";
+import { Button, CheckIcon, cx } from "@/components/onboarding/primitives";
 import { shortAddress } from "@/components/onboarding/types";
 
 /**
@@ -20,6 +20,8 @@ export function GuardianRecord({
   struck,
   error,
   onVerify,
+  onAttest,
+  attestBusy = false,
 }: {
   me: WorldIdMe | null;
   address?: string;
@@ -28,8 +30,12 @@ export function GuardianRecord({
   struck: boolean;
   error: string | null;
   onVerify: () => void;
+  /** Absent = the step-up isn't wired on this surface. */
+  onAttest?: () => void;
+  attestBusy?: boolean;
 }) {
   const verified = me?.verified ?? false;
+  const formationReady = me?.formationReady ?? false;
   const seed = me?.nullifier ?? address ?? "novi-corpus";
 
   return (
@@ -94,8 +100,13 @@ export function GuardianRecord({
           </div>
         </div>
 
-        {/* Standing, at a glance */}
-        <div className="grid divide-y divide-line border-t hairline sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+        {/* Standing, at a glance. The fourth cell only exists once it's been earned. */}
+        <div
+          className={cx(
+            "grid divide-y divide-line border-t hairline sm:divide-x sm:divide-y-0",
+            formationReady ? "sm:grid-cols-2 lg:grid-cols-4" : "sm:grid-cols-3",
+          )}
+        >
           <LedgerCell label="Standing">
             <span
               className={cx(
@@ -139,7 +150,40 @@ export function GuardianRecord({
               {me?.maxEntities != null && <Pips used={me.entitiesUsed ?? 0} max={me.maxEntities} />}
             </div>
           </LedgerCell>
+
+          {formationReady && (
+            <LedgerCell label="Formation-ready" hint="adult, document-backed">
+              <span className="flex items-center gap-2 text-[14px] text-emerald-300">
+                <CheckIcon className="h-3.5 w-3.5" />
+                Age {me?.attestation?.minAge ?? 18}+ proven
+              </span>
+            </LedgerCell>
+          )}
         </div>
+
+        {/* The step-up. Only for a verified guardian who hasn't taken it, and only where the
+            deployment offers it — an unavailable capability shouldn't advertise itself. */}
+        {verified && !formationReady && me?.attestAvailable && onAttest && (
+          <div className="flex flex-col gap-4 border-t hairline p-6 sm:flex-row sm:items-center sm:justify-between sm:p-7">
+            <div className="flex max-w-[62ch] flex-col gap-1.5">
+              <h2 className="text-[10.5px] uppercase tracking-[0.24em] text-muted-2">
+                Formation-ready
+              </h2>
+              <p className="text-[13px] leading-[1.6] text-muted">
+                Your record proves a unique human. Filing a real Wyoming LLC also takes an adult.
+                Prove age with a document and we learn exactly one thing more about you — that
+                you&apos;re over 18.
+              </p>
+              <p className="text-[11px] leading-[1.5] text-muted-2">
+                Needs an NFC passport in World App, available in about a dozen countries. An Orb
+                alone can&apos;t do this.
+              </p>
+            </div>
+            <Button variant="ghost" onClick={onAttest} loading={attestBusy} className="shrink-0">
+              Prove age
+            </Button>
+          </div>
+        )}
 
         {/* What we hold, and what it binds */}
         <div className="grid divide-y divide-line border-t hairline md:grid-cols-2 md:divide-x md:divide-y-0">

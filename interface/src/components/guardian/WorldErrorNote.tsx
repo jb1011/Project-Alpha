@@ -30,11 +30,21 @@ export function WorldErrorNote({ error }: { error: string }) {
       </Callout>
     );
 
+  // Step-up specific: the requested attribute couldn't be satisfied by this person's credential.
+  if (code === "identity_attributes_not_matched")
+    return (
+      <Callout tone="warn" title="Your credential can't prove that">
+        The age check needs a document credential — an NFC passport added in World App. An Orb
+        verification alone doesn't carry it, and document support currently covers about a dozen
+        countries.
+      </Callout>
+    );
+
   if (code === "credential_unavailable")
     return (
-      <Callout tone="warn" title="Orb credential required">
-        Guardianship needs an Orb or document-grade credential. A device-only World ID isn&apos;t
-        enough to be legally accountable for an agent.
+      <Callout tone="warn" title="Stronger credential required">
+        This needs an Orb or document-grade credential. A device-only World ID isn&apos;t enough to
+        be legally accountable for an agent.
       </Callout>
     );
 

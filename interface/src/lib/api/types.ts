@@ -189,6 +189,21 @@ export type WorldIdMe = {
   nullifier?: string;
   entitiesUsed?: number;
   maxEntities?: number;
+  /** Whether this deployment offers the identity step-up at all. */
+  attestAvailable?: boolean;
+  /** True when a live document-backed attestation is on file. */
+  formationReady?: boolean;
+  attestation?: { minAge: number; credential?: string | null; verifiedAt: number };
+};
+
+/** Params for the identity-attestation widget (the step-up uses its own World action). */
+export type WorldIdAttestContext = {
+  appId: string;
+  action: string;
+  environment: "production" | "staging" | "sandbox";
+  signal: string;
+  rpContext: Record<string, unknown>;
+  minAge: number;
 };
 
 export type WorldIdContext = {
@@ -213,7 +228,13 @@ export type WorldIdStatusView = {
   nullifier?: string;
   entitiesUsed?: number;
   maxEntities?: number;
+  /** Whether this deployment offers the identity step-up at all. */
+  attestAvailable?: boolean;
+  /** True when a live document-backed attestation is on file. */
+  formationReady?: boolean;
+  attestation?: { minAge: number; credential?: string | null; verifiedAt: number };
 };
+
 
 export class ApiError extends Error {
   code: string;

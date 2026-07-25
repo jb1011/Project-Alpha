@@ -14,6 +14,7 @@ import type {
   PasskeyView,
   ReputationView,
   TreasuryView,
+  WorldIdAttestContext,
   WorldIdContext,
   WorldIdMe,
   WorldIdRequestView,
@@ -242,6 +243,17 @@ export function worldIdRequest(token: string): Promise<WorldIdRequestView> {
 /** Poll a verification request until it resolves. */
 export function worldIdStatus(token: string, requestId: string): Promise<WorldIdStatusView> {
   return request<WorldIdStatusView>(`/world-id/status/${requestId}`, { token });
+}
+
+/** Params for the identity step-up widget. 404 when the deployment has no attest action; 403
+ *  until the caller is already a verified guardian — it is a step-up, not a way in. */
+export function worldIdAttestContext(token: string): Promise<WorldIdAttestContext> {
+  return request<WorldIdAttestContext>("/world-id/attest/context", { token });
+}
+
+/** Submit an identity-attestation proof produced by the widget. */
+export function worldIdAttestVerify(token: string, proof: unknown): Promise<unknown> {
+  return request("/world-id/attest/verify", { token, body: { proof } });
 }
 
 /** Params for the browser IDKit widget, including the v4-mandatory signed request context. */
