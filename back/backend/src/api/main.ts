@@ -139,6 +139,7 @@ async function main() {
         identityRegistry: cfg.identityRegistry,
         chainId: cfg.chainId,
         resolverAddress: cfg.ens.resolverAddress,
+        labelAliases: cfg.ens.labelAliases,
       }
     : undefined;
   if (ens) console.warn(`⚠ ENS gateway ENABLED at /ensgateway (parent ${ens.parentName})`);

@@ -101,6 +101,9 @@ const EnvSchema = z.object({
   ENS_GATEWAY_SIGNER_KEY: privKeySchema.optional(),
   ENS_PARENT_NAME: z.string().default("novicorpus.eth"),
   ENS_RESOLVER_ADDRESS: addressSchema.optional(),
+  /** Vanity subnames, `label=publicId` comma-separated (e.g. "demo=b46fd15c-…"). Lets a memorable
+   *  name point at an existing agent without rewriting a publicId that is already on-chain. */
+  ENS_LABEL_ALIASES: z.string().optional(),
   // World ID / AgentKit (optional; absent -> routes not mounted, seller check skipped).
   WORLD_APP_ID: z.string().optional(),
   WORLD_RP_ID: z.string().optional(),
@@ -169,6 +172,8 @@ export interface Config {
     signerKey: Hex;
     parentName: string;
     resolverAddress?: Address;
+    /** Vanity subname label -> publicId. */
+    labelAliases?: Record<string, string>;
   };
   /** World ID + AgentKit. Present only when the portal credentials are configured. */
   world?: {
@@ -191,6 +196,17 @@ export interface Config {
 }
 
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
+/** "demo=abc,staging=def" -> { demo: "abc", staging: "def" }. Malformed pairs are ignored. */
+function parseLabelAliases(raw: string | undefined): Record<string, string> | undefined {
+  if (!raw?.trim()) return undefined;
+  const out: Record<string, string> = {};
+  for (const pair of raw.split(",")) {
+    const [label, publicId] = pair.split("=").map((s) => s.trim());
+    if (label && publicId) out[label.toLowerCase()] = publicId;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const parsed = EnvSchema.safeParse(env);
   if (!parsed.success) {
@@ -262,6 +278,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
           signerKey: e.ENS_GATEWAY_SIGNER_KEY,
           parentName: e.ENS_PARENT_NAME,
           resolverAddress: e.ENS_RESOLVER_ADDRESS,
+          labelAliases: parseLabelAliases(e.ENS_LABEL_ALIASES),
         }
       : undefined,
     // All three portal credentials are required together — a partial config would fail at

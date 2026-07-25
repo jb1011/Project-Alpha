@@ -198,6 +198,24 @@ describe("ENS gateway answer()", () => {
     expect(recovered.toLowerCase()).toBe(signer.address.toLowerCase());
   });
 
+  test("vanity label alias resolves to the aliased agent", async () => {
+    const deps = makeDeps();
+    deps.ens.labelAliases = { demo: "abc" };
+    // Unaliased, "demo" is not a publicId and resolves to nothing.
+    expect((await callText(makeDeps(), "demo.novicorpus.eth", "description")).value).toBe("");
+    expect((await callText(deps, "demo.novicorpus.eth", "description")).value).toBe(
+      "Agent A — Wyoming DAO LLC governed agent",
+    );
+  });
+
+  test("aliased label's metadata url points at the real publicId, not the alias", async () => {
+    const deps = makeDeps();
+    deps.ens.labelAliases = { demo: "abc" };
+    expect((await callText(deps, "demo.novicorpus.eth", "url")).value).toBe(
+      "https://x/backend/metadata/abc",
+    );
+  });
+
   test("bad calldata selector -> throws", async () => {
     await expect(answer(makeDeps(), RESOLVER, "0xdeadbeef")).rejects.toThrow();
   });

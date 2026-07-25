@@ -41,6 +41,16 @@ export interface EnsGatewayDeps {
   chainId: number;
   /** Deployed OffchainResolver address (informational; the URL `:sender` is authoritative). */
   resolverAddress?: Address;
+  /** Optional vanity labels -> publicId, e.g. { demo: "b46fd15c-…" }. Lets a memorable name point
+   *  at an existing agent without rewriting its publicId, which is baked into its on-chain
+   *  metadataURI and could not be changed without a registry write. */
+  labelAliases?: Record<string, string>;
+}
+
+/** Resolve a subname label to an entity, honouring vanity aliases. */
+function entityForLabel(deps: ApiDeps, label: string) {
+  const alias = deps.ens?.labelAliases?.[label];
+  return deps.repo.findByPublicId(alias ?? label);
 }
 
 /** ERC-7930 interoperable address for an EVM registry: version‖chainType(eip155)‖refLen‖chainRef‖addrLen‖addr. */
@@ -81,7 +91,7 @@ function classify(labels: string[], parentLabels: string[]): Target {
 function addrFor(deps: ApiDeps, target: Target): Address {
   if (target.kind === "apex") return getAddress(deps.platformManagerAddress) as Address;
   if (target.kind === "agent") {
-    const ent = deps.repo.findByPublicId(target.label);
+    const ent = entityForLabel(deps, target.label);
     return (ent?.treasury as Address | null) ?? zeroAddress;
   }
   return zeroAddress;
@@ -140,9 +150,10 @@ async function textFor(deps: ApiDeps, target: Target, key: string): Promise<stri
     return "";
   }
   if (target.kind !== "agent") return "";
-  const ent = deps.repo.findByPublicId(target.label);
+  const ent = entityForLabel(deps, target.label);
   if (!ent) return "";
-  const metaUrl = `${ens.metadataBaseUrl}/metadata/${target.label}`;
+  // Built from the entity's own publicId, not the label — an aliased label has no metadata route.
+  const metaUrl = `${ens.metadataBaseUrl}/metadata/${ent.publicId ?? target.label}`;
 
   // ENSIP-25: agent-registration[<erc7930 registry>][<agentId>] -> "1" iff it names THIS entity.
   const m = key.match(/^agent-registration\[(0x[0-9a-fA-F]+)\]\[([^[\]]+)\]$/);
