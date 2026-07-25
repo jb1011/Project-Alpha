@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import type { WorldIdMe } from "@/lib/api/types";
+import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
 import { Button, cx } from "@/components/onboarding/primitives";
@@ -61,6 +62,10 @@ export function GuardianRecord({
               Wyoming law requires a natural person behind every DAO LLC. World ID proves one
               unique human is here — and tells us nothing else about them.
             </p>
+
+            {!verified && !loading && (
+              <GetWorldIdHelp className="items-center sm:items-start" />
+            )}
 
             <div className="flex flex-col items-center gap-3 pt-1 sm:flex-row sm:gap-5">
               <Button

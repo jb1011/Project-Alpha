@@ -4,6 +4,7 @@ import { IDKitRequestWidget, proofOfHuman } from "@worldcoin/idkit";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { worldIdContext, worldIdMe, worldIdVerify } from "@/lib/api/client";
 import { ApiError, type WorldIdContext, type WorldIdMe } from "@/lib/api/types";
+import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
 import { useAuth } from "../AuthProvider";
@@ -135,11 +136,18 @@ export function GuardianStep({
                   <Point>We store a nullifier — never your name, document, or face.</Point>
                   <Point>Verify once; every agent on this account inherits it.</Point>
                 </ul>
-                {!required && (
+                {required ? (
+                  <p className="text-[11.5px] text-muted-2">
+                    Required — an agent can&apos;t be created without a human answering for it.
+                  </p>
+                ) : (
                   <p className="text-[11.5px] text-muted-2">
                     Optional for now — you can verify later from the guardian page.
                   </p>
                 )}
+                {/* Always present in the unverified state, not only after a failure: someone
+                    without World App has no other way forward now that this is enforced. */}
+                <GetWorldIdHelp />
               </>
             )}
 

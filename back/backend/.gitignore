@@ -14,3 +14,6 @@ tools/passkey-capture/capture.js
 
 # Coverage reports (vitest --coverage)
 coverage/
+
+# Real attestation response captured by the W7.2 probe — review before ever committing
+test/world/fixtures/attest-verify-response.json

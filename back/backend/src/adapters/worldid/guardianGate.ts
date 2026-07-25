@@ -33,11 +33,13 @@ export class WorldIdError extends Error {
   }
 }
 
-/** v4 requires a signed rp_context on every request. camelCase -> snake_case is intentional. */
-export function makeRpContext(cfg: WorldIdConfig) {
+/** v4 requires a signed rp_context on every request. camelCase -> snake_case is intentional.
+ *  The signature covers the ACTION, so a request for a different action (e.g. the attestation
+ *  step-up) must be signed for that action or World rejects it — hence the override. */
+export function makeRpContext(cfg: WorldIdConfig, action: string = cfg.action) {
   const { sig, nonce, createdAt, expiresAt } = signRequest({
     signingKeyHex: cfg.rpSigningKey,
-    action: cfg.action,
+    action,
     ttl: 300,
   });
   return { rp_id: cfg.rpId, nonce, created_at: createdAt, expires_at: expiresAt, signature: sig };

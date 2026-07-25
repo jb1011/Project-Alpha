@@ -121,6 +121,10 @@ const EnvSchema = z.object({
   WORLD_AGENTBOOK_ADDRESS: addressSchema.default("0xA23aB2712eA7BBa896930544C7d6636a96b944dA"),
   WORLD_ALLOWANCE_PER_HUMAN: z.coerce.number().int().nonnegative().default(3),
   WORLD_ENVIRONMENT: z.enum(["production", "staging", "sandbox"]).default("production"),
+  /** Identity-Check step-up. Absent -> the whole attestation surface stays unmounted, so merging
+   *  the feature is a no-op until this is deliberately set. */
+  WORLD_ATTEST_ACTION: z.string().optional(),
+  WORLD_ATTEST_MIN_AGE: z.coerce.number().int().positive().default(18),
 });
 
 export interface Config {
@@ -188,6 +192,10 @@ export interface Config {
     maxEntitiesPerHuman?: number;
     requireGuardian: boolean;
     environment: "production" | "staging" | "sandbox";
+    /** Identity-Check step-up action. Absent = attestation surface not mounted. */
+    attestAction?: string;
+    /** Age threshold proven by the attestation (never a birthdate). */
+    attestMinAge: number;
   };
   /** AgentBook read config — independent of `world` so the seller check can run standalone.
    *  Optional in the type (test fixtures build Config literals); loadConfig always populates it,
@@ -297,6 +305,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
             maxEntitiesPerHuman: e.WORLD_MAX_ENTITIES_PER_HUMAN,
             requireGuardian: e.WORLD_REQUIRE_GUARDIAN,
             environment: e.WORLD_ENVIRONMENT,
+            attestAction: e.WORLD_ATTEST_ACTION,
+            attestMinAge: e.WORLD_ATTEST_MIN_AGE,
           }
         : undefined,
     worldChain: {
