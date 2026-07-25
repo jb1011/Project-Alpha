@@ -119,12 +119,13 @@ export function GuardianStep({
                   <CheckIcon className="h-4 w-4" />
                   Verified human — {me?.credential ?? "proof of personhood"}
                 </div>
-                {me?.maxEntities != null && (
-                  <p className="text-[12.5px] leading-[1.6] text-muted">
-                    You hold {me.entitiesUsed ?? 0} of {me.maxEntities} legal entities. One person,
-                    a capped number of companies.
-                  </p>
-                )}
+                <p className="text-[12.5px] leading-[1.6] text-muted">
+                  {me?.maxEntities != null
+                    ? `You hold ${me.entitiesUsed ?? 0} of ${me.maxEntities} legal entities allowed on this account.`
+                    : `You hold ${me?.entitiesUsed ?? 0} legal ${
+                        (me?.entitiesUsed ?? 0) === 1 ? "entity" : "entities"
+                      }. There's no limit on how many a verified human may form.`}
+                </p>
               </>
             ) : (
               <>

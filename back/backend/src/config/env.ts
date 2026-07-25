@@ -109,7 +109,10 @@ const EnvSchema = z.object({
   WORLD_RP_ID: z.string().optional(),
   WORLD_RP_SIGNING_KEY: z.string().optional(),
   WORLD_ACTION: z.string().default("guardian-verification"),
-  WORLD_MAX_ENTITIES_PER_HUMAN: z.coerce.number().int().positive().default(3),
+  /** Optional anti-sybil ceiling on legal entities per verified human. No legal basis — Wyoming
+   *  does not cap how many LLCs a person may control — so it is UNSET (unlimited) by default and
+   *  exists only for deployments that want one. */
+  WORLD_MAX_ENTITIES_PER_HUMAN: z.coerce.number().int().positive().optional(),
   WORLD_REQUIRE_GUARDIAN: z
     .string()
     .optional()
@@ -181,7 +184,8 @@ export interface Config {
     rpId: string;
     rpSigningKey: string;
     action: string;
-    maxEntitiesPerHuman: number;
+    /** Absent = no ceiling. */
+    maxEntitiesPerHuman?: number;
     requireGuardian: boolean;
     environment: "production" | "staging" | "sandbox";
   };

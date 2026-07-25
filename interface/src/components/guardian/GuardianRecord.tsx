@@ -114,10 +114,21 @@ export function GuardianRecord({
             </span>
           </LedgerCell>
 
-          <LedgerCell label="Legal entities" hint="one human, a capped number of companies">
+          <LedgerCell
+            label="Legal entities"
+            hint={
+              me?.maxEntities != null
+                ? `this account is capped at ${me.maxEntities}`
+                : "no ceiling — one human may form as many as they like"
+            }
+          >
             <div className="flex items-center gap-3">
               <span className="tabular-nums text-[14px] text-ink">
-                {me?.maxEntities != null ? `${me.entitiesUsed ?? 0} / ${me.maxEntities}` : "—"}
+                {verified || me?.entitiesUsed != null
+                  ? me?.maxEntities != null
+                    ? `${me.entitiesUsed ?? 0} / ${me.maxEntities}`
+                    : `${me?.entitiesUsed ?? 0}`
+                  : "—"}
               </span>
               {me?.maxEntities != null && <Pips used={me.entitiesUsed ?? 0} max={me.maxEntities} />}
             </div>
@@ -232,9 +243,11 @@ function LedgerCell({
   );
 }
 
-/** The cap is a real limit, so it gets a shape and not only a number. */
+/** A configured cap is a real limit, so it gets a shape and not only a number. */
 function Pips({ used, max }: { used: number; max: number }) {
   if (max > 12) return null;
+  // Already past the ceiling (a cap lowered after the fact) — a row of pips would imply headroom.
+  if (used > max) return <span className="text-[11px] text-[#f3cd72]">over the cap</span>;
   return (
     <div aria-hidden className="flex gap-1">
       {Array.from({ length: max }, (_, i) => (

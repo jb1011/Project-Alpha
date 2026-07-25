@@ -15,7 +15,8 @@ import { ApiError } from "../errors";
 export interface WorldIdDeps {
   cfg: WorldIdConfig;
   store: WorldStore;
-  maxEntitiesPerHuman: number;
+  /** Absent = no ceiling on legal entities per human. */
+  maxEntitiesPerHuman?: number;
   requireGuardian: boolean;
 }
 
@@ -225,6 +226,9 @@ export function assertGuardianAllowed(world: WorldIdDeps | undefined, tenantId: 
       403,
       "guardian must complete World ID verification before creating a legal entity",
     );
+  // The ceiling is optional: unset means a verified human may form as many legal bodies as they
+  // like, which is what the law actually allows.
+  if (world.maxEntitiesPerHuman == null) return;
   const used = world.store.countEntitiesForNullifier(v.nullifier, world.cfg.action);
   if (used >= world.maxEntitiesPerHuman)
     throw new ApiError(
