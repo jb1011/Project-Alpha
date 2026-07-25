@@ -1,5 +1,6 @@
 "use client";
 
+import { AgentTabs } from "@/components/agents/AgentTabs";
 import * as React from "react";
 import { usePublicClient, useReadContract, useWriteContract } from "wagmi";
 import {
@@ -237,12 +238,15 @@ export function AgentSettings({ entityId }: { entityId: string }) {
 
   return (
     <div className="flex flex-col gap-6">
-      <div>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
         <h1 className="text-[28px] font-medium tracking-[-0.02em] text-ink">Governance settings</h1>
         <p className="mt-2 max-w-xl text-[13px] leading-relaxed text-muted">
           Change spending rules, manage the allowlist, and use guardian break-glass controls.
           Period-cap changes are timelocked; per-tx cap updates apply instantly.
         </p>
+        </div>
+        <AgentTabs entityId={entityId} active="settings" />
       </div>
 
       {pending && (

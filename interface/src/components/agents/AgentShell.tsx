@@ -9,12 +9,10 @@ import { cx } from "@/components/onboarding/primitives";
 export function AgentShell({
   title,
   subtitle,
-  entityId,
   children,
 }: {
   title?: string;
   subtitle?: string;
-  entityId?: string;
   children: ReactNode;
 }) {
   return (
@@ -39,14 +37,8 @@ export function AgentShell({
             <NavLink href="/agents/account">Account</NavLink>
             <NavLink href="/agents/connect">Connect an agent</NavLink>
             <GuardianBadge />
-            {entityId && (
-              <>
-                <NavLink href={`/agents/${encodeURIComponent(entityId)}`}>Dashboard</NavLink>
-                <NavLink href={`/agents/${encodeURIComponent(entityId)}/settings`}>
-                  Settings
-                </NavLink>
-              </>
-            )}
+            {/* Agent-scoped navigation (Dashboard/Settings) lives beside the agent's name on its
+                own pages — the shell nav stays account-level. */}
             <Link
               href="/onboarding?new=1"
               className="rounded-full bg-ink px-3.5 py-1.5 text-[12px] font-medium text-paper transition-colors hover:bg-ink-hover"

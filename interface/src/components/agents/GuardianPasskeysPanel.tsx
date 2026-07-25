@@ -6,7 +6,7 @@ import type { PasskeyView } from "@/lib/api/types";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { RevokeButton } from "@/components/agents/connectionRow";
 
-export function GuardianPasskeysPanel() {
+export function GuardianPasskeysPanel({ hideHeader = false }: { hideHeader?: boolean } = {}) {
   const { ensureSession } = useAuth();
   const [passkeys, setPasskeys] = React.useState<PasskeyView[]>([]);
   const [busy, setBusy] = React.useState(false);
@@ -45,7 +45,9 @@ export function GuardianPasskeysPanel() {
 
   return (
     <div>
-      <div className="text-[11px] uppercase tracking-[0.14em] text-muted-2">Guardian passkeys</div>
+      {!hideHeader && (
+        <div className="text-[11px] uppercase tracking-[0.14em] text-muted-2">Guardian passkeys</div>
+      )}
       {passkeys.length === 0 ? (
         <p className="mt-2 text-[12px] text-muted-2">No guardian passkeys yet.</p>
       ) : (

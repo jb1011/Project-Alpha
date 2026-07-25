@@ -97,6 +97,20 @@ export function GuardianRecord({
                 )}
               </dl>
             </div>
+
+            {/* Who performs the check — theirs, not ours, and worth saying plainly. */}
+            <a
+              href="https://world.org/world-id"
+              target="_blank"
+              rel="noreferrer"
+              className="group mt-1 flex items-center justify-center gap-2 self-center text-[11.5px] text-muted-2 transition-colors hover:text-ink sm:justify-start sm:self-start"
+            >
+              <WorldMark className="h-[15px] w-[15px] opacity-80 transition-opacity group-hover:opacity-100" />
+              <span>
+                Personhood verified by <span className="text-muted group-hover:text-ink">World ID</span>
+              </span>
+              <span aria-hidden className="text-[10px]">↗</span>
+            </a>
           </div>
         </div>
 
@@ -337,6 +351,16 @@ function CopyLine({ value }: { value: string }) {
     >
       {copied ? "Copied" : "Copy nullifier"}
     </button>
+  );
+}
+
+/** World's orb mark, reduced to strokes: a ring with the horizontal aperture. */
+function WorldMark({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
+      <circle cx="12" cy="12" r="9.5" stroke="currentColor" strokeWidth="1.6" />
+      <rect x="7.2" y="10.2" width="9.6" height="3.6" rx="1.8" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
   );
 }
 
