@@ -246,6 +246,17 @@ input[type="reset"]:disabled {
   animation: sealRise 0.5s ease-out both;
 }
 
+/* Guardian badge — lit while a verified human backs the account */
+@keyframes guardianGlow {
+  0%, 100% { filter: drop-shadow(0 0 2px rgba(110, 231, 183, 0.35)); }
+  50%      { filter: drop-shadow(0 0 7px rgba(110, 231, 183, 0.7)); }
+}
+
+.guardian-glow {
+  display: block;
+  animation: guardianGlow 3.4s ease-in-out infinite;
+}
+
 .text-balance {
   text-wrap: balance;
 }
@@ -271,5 +282,10 @@ input[type="reset"]:disabled {
   .seal-draw {
     animation: none;
     stroke-dashoffset: 0;
+  }
+  /* Keep the lit state, drop the pulse. */
+  .guardian-glow {
+    animation: none;
+    filter: drop-shadow(0 0 4px rgba(110, 231, 183, 0.55));
   }
 }

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { GuardianBadge } from "@/components/guardian/GuardianBadge";
 import { Wordmark } from "@/components/landing/Wordmark";
 import { cx } from "@/components/onboarding/primitives";
 
@@ -37,6 +38,7 @@ export function AgentShell({
             <NavLink href="/agents">My agents</NavLink>
             <NavLink href="/agents/account">Account</NavLink>
             <NavLink href="/agents/connect">Connect an agent</NavLink>
+            <GuardianBadge />
             {entityId && (
               <>
                 <NavLink href={`/agents/${encodeURIComponent(entityId)}`}>Dashboard</NavLink>
