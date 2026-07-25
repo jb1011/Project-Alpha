@@ -1,5 +1,6 @@
 export type Phase =
   | "welcome"
+  | "guardian"
   | "configure"
   | "agreement"
   | "deploy"
@@ -45,11 +46,12 @@ export const emptySession = (): OnboardingSession => ({
 
 export const PHASES: { id: Phase; n: string; label: string }[] = [
   { id: "welcome", n: "00", label: "Wallet & passkey" },
-  { id: "configure", n: "01", label: "Define agent" },
-  { id: "agreement", n: "02", label: "Operating agreement" },
-  { id: "deploy", n: "03", label: "Deploy on-chain" },
-  { id: "fund", n: "04", label: "Fund treasury" },
-  { id: "dashboard", n: "05", label: "Live" },
+  { id: "guardian", n: "01", label: "Accountable human" },
+  { id: "configure", n: "02", label: "Define agent" },
+  { id: "agreement", n: "03", label: "Operating agreement" },
+  { id: "deploy", n: "04", label: "Deploy on-chain" },
+  { id: "fund", n: "05", label: "Fund treasury" },
+  { id: "dashboard", n: "06", label: "Live" },
 ];
 
 export const emptyConfig = (): AgentConfig => ({
