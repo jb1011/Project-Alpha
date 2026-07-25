@@ -254,10 +254,11 @@ describe("windowed per-human rate cap", () => {
   test("counter resets after the window elapses", () => {
     const H = "human-1";
     const W = 60_000;
-    let t = 1_000_000;
-    expect(store.tryIncrementUsage(H, RESOURCE_URL, 2, t, W).allowed).toBe(true);
-    expect(store.tryIncrementUsage(H, RESOURCE_URL, 2, (t += 1000), W).allowed).toBe(true);
-    const over = store.tryIncrementUsage(H, RESOURCE_URL, 2, (t += 1000), W);
+    const t0 = 1_000_000;
+    expect(store.tryIncrementUsage(H, RESOURCE_URL, 2, t0, W).allowed).toBe(true);
+    expect(store.tryIncrementUsage(H, RESOURCE_URL, 2, t0 + 1000, W).allowed).toBe(true);
+    const t = t0 + 2000;
+    const over = store.tryIncrementUsage(H, RESOURCE_URL, 2, t, W);
     expect(over.allowed).toBe(false);
     expect(over.resetAt).toBeGreaterThan(t); // 429 can carry Retry-After
     // window elapses -> budget returns

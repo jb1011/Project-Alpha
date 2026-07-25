@@ -141,8 +141,8 @@ export function buildPaywall(cfg: PaywallConfig) {
       agentBook: cfg.agentkit?.agentBookAddress ?? "0xA23aB2712eA7BBa896930544C7d6636a96b944dA",
       chain: "world-chain",
     },
-    // biome-ignore lint/style/noNonNullAssertion: strict implies agentkit (see `strict` above).
-    extensions: mintAgentkitExtension(cfg.agentkit!),
+    // Safe: `strict` (checked by every caller) implies cfg.agentkit is present.
+    extensions: mintAgentkitExtension(cfg.agentkit as AgentkitSellerConfig),
   });
 
   app.get(path, async (c) => {
@@ -155,8 +155,7 @@ export function buildPaywall(cfg: PaywallConfig) {
     // allowance: one human backing fifty agents still gets one budget.
     if (strict) {
       if (!akHeader) return c.json(refusal("no-proof-presented"), 403);
-      // biome-ignore lint/style/noNonNullAssertion: strict implies agentkit.
-      const outcome = await verifyAgentkitRequest(akHeader, cfg.agentkit!);
+      const outcome = await verifyAgentkitRequest(akHeader, cfg.agentkit as AgentkitSellerConfig);
       if (!outcome.authorized) {
         if (outcome.reason === "allowance-exhausted") {
           if (outcome.humanId) c.header("X-AGENTKIT-HUMAN", outcome.humanId);

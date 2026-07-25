@@ -305,7 +305,11 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     return c.json(
       humanId
         ? { registered: true, humanId, operator }
-        : { registered: false, operator, register: "npx @worldcoin/agentkit-cli register " + operator },
+        : {
+            registered: false,
+            operator,
+            register: `npx @worldcoin/agentkit-cli register ${operator}`,
+          },
     );
   });
 
