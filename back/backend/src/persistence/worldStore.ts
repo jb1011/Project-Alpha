@@ -13,6 +13,20 @@ export interface GuardianVerification {
   expiresAtMin: number | null;
 }
 
+/** An optional document-backed attestation for a guardian: proof that they cleared a threshold
+ *  (currently age) at a point in time. No country — World's attributes are assertions, not
+ *  disclosures, so a value can be checked but never learned. */
+export interface GuardianAttestation {
+  nullifier: string;
+  action: string;
+  tenantId: string;
+  minAge: number;
+  credential: string | null;
+  issuerSchemaId: number | null;
+  verifiedAt: number;
+  expiresAtMin: number | null;
+}
+
 export interface WorldStore {
   // ── guardian verifications (proof-of-personhood) ──
   /** Insert a verification. Returns false if this nullifier already verified for this action
@@ -22,6 +36,11 @@ export interface WorldStore {
   findByNullifier(nullifier: string, action: string): GuardianVerification | undefined;
   /** How many entities this human's tenant already owns (for the N-per-human cap). */
   countEntitiesForNullifier(nullifier: string, action: string): number;
+
+  // ── identity attestations (optional step-up) ──
+  /** Same one-human-one-tenant rule as verifications: false if bound to a different tenant. */
+  recordAttestation(a: GuardianAttestation): boolean;
+  findAttestationByTenant(tenantId: string, action: string): GuardianAttestation | undefined;
 
   // ── in-flight proof requests ──
   createRequest(r: {
@@ -62,6 +81,55 @@ export interface WorldStore {
 
 export class SqliteWorldStore implements WorldStore {
   constructor(private readonly db: Database.Database) {}
+
+  recordAttestation(a: GuardianAttestation): boolean {
+    const existing = this.db
+      .prepare("SELECT * FROM guardian_attestations WHERE nullifier = ? AND action = ?")
+      .get(a.nullifier, a.action) as { tenant_id?: string } | undefined;
+    if (existing && existing.tenant_id !== a.tenantId) return false; // one human, one tenant
+    this.db
+      .prepare(
+        `INSERT INTO guardian_attestations
+           (nullifier, action, tenant_id, min_age, credential, issuer_schema_id, verified_at, expires_at_min)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(nullifier, action) DO UPDATE SET
+           min_age=excluded.min_age,
+           credential=excluded.credential,
+           issuer_schema_id=excluded.issuer_schema_id,
+           verified_at=excluded.verified_at,
+           expires_at_min=excluded.expires_at_min`,
+      )
+      .run(
+        a.nullifier,
+        a.action,
+        a.tenantId,
+        a.minAge,
+        a.credential,
+        a.issuerSchemaId,
+        a.verifiedAt,
+        a.expiresAtMin,
+      );
+    return true;
+  }
+
+  findAttestationByTenant(tenantId: string, action: string): GuardianAttestation | undefined {
+    const r = this.db
+      .prepare(
+        "SELECT * FROM guardian_attestations WHERE tenant_id = ? AND action = ? ORDER BY verified_at DESC LIMIT 1",
+      )
+      .get(tenantId, action) as Record<string, unknown> | undefined;
+    if (!r) return undefined;
+    return {
+      nullifier: r.nullifier as string,
+      action: r.action as string,
+      tenantId: r.tenant_id as string,
+      minAge: r.min_age as number,
+      credential: (r.credential as string) ?? null,
+      issuerSchemaId: (r.issuer_schema_id as number) ?? null,
+      verifiedAt: r.verified_at as number,
+      expiresAtMin: (r.expires_at_min as number) ?? null,
+    };
+  }
 
   recordVerification(v: GuardianVerification): boolean {
     const existing = this.findByNullifier(v.nullifier, v.action);

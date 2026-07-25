@@ -16,6 +16,7 @@ function deps(opts: {
   return {
     cfg: { action: ACTION } as WorldIdDeps["cfg"],
     requireGuardian: opts.requireGuardian,
+    attestMinAge: 18,
     maxEntitiesPerHuman: opts.maxEntitiesPerHuman,
     store: {
       findByTenant: () => (opts.verified ? { nullifier: NULLIFIER } : undefined),

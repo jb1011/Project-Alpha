@@ -67,7 +67,7 @@ let fetchPatchedForWasm = false;
  * every other request is delegated to the original fetch untouched. Installed once, lazily,
  * and only on the Node path.
  */
-function ensureNodeWasmFetch(): void {
+export function ensureNodeWasmFetch(): void {
   if (fetchPatchedForWasm || typeof globalThis.fetch !== "function") return;
   const original = globalThis.fetch.bind(globalThis);
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -116,6 +116,64 @@ export async function startGuardianVerification(
       timeout: 300_000,
       // biome-ignore lint/suspicious/noExplicitAny: poll options typing varies by SDK version.
     } as any) as Promise<{ success: boolean; result?: unknown; error?: unknown }>,
+  };
+}
+
+export interface VerifiedAttestation {
+  nullifier: string;
+  credential: string;
+  /** The threshold WE asked to be proven — World does not echo attribute values back. */
+  minAge: number;
+  issuerSchemaId: number | null;
+  expiresAtMin: number | null;
+  raw: unknown;
+}
+
+/**
+ * Identity Check step-up. Captured response shape (staging, 2026-07-25 — fixture at
+ * test/world/fixtures/attest-verify-response.json):
+ *
+ *   verify response: { success, action, nullifier, created_at, environment, results:[{identifier,
+ *                      success, nullifier}], message }      <- NO attribute echo, no identity_attested
+ *   idkit result:    { action, environment, identity_attested, nonce, protocol_version,
+ *                      responses:[{expires_at_min, identifier, issuer_schema_id, nullifier, ...}] }
+ *
+ * ⚠ TRUST LIMIT: `identity_attested` lives on the CLIENT payload, not on World's response, and the
+ * verify endpoint returns nothing about which attributes were asserted. A client that requested no
+ * attributes but set the flag is therefore indistinguishable from a genuine attestation at this
+ * layer — World's own demo prescribes exactly this check, so it appears to assume the RP controls
+ * the client, which is not true for a browser. We follow the prescribed rule and mark the
+ * attestation as claim-grade: good enough to unlock guidance, NOT to stand in for real KYC at
+ * filing time. Raised with the World team.
+ *
+ * What IS load-bearing: a mismatched assertion fails earlier, client-side — requesting an
+ * impossible attribute returns `identity_attributes_not_matched` and never reaches us.
+ */
+export async function verifyAttestation(
+  cfg: WorldIdConfig,
+  idkitResult: unknown,
+  minAge: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<VerifiedAttestation> {
+  const client = idkitResult as {
+    identity_attested?: boolean;
+    responses?: { issuer_schema_id?: number; expires_at_min?: number }[];
+  };
+  if (client?.identity_attested !== true)
+    throw new WorldIdError(
+      "not_attested",
+      "the proof carries no identity attestation (identity_attested is not true)",
+    );
+
+  const verified = await verifyProof(cfg, idkitResult, fetchImpl);
+  const item = (client.responses ?? [])[0];
+  return {
+    nullifier: verified.nullifier,
+    credential: verified.credential,
+    minAge,
+    issuerSchemaId: item?.issuer_schema_id ?? verified.issuerSchemaId,
+    expiresAtMin: item?.expires_at_min ?? verified.expiresAtMin,
+    raw: verified.raw,
   };
 }
 

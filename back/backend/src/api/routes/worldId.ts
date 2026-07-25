@@ -5,6 +5,7 @@ import {
   WorldIdError,
   makeRpContext,
   startGuardianVerification,
+  verifyAttestation,
   verifyProof,
 } from "../../adapters/worldid/guardianGate";
 import { type AuthVars, requireAuth } from "../../auth/middleware";
@@ -13,7 +14,9 @@ import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 
 export interface WorldIdDeps {
-  cfg: WorldIdConfig;
+  cfg: WorldIdConfig & { attestAction?: string };
+  /** Age threshold requested by the step-up. */
+  attestMinAge: number;
   store: WorldStore;
   /** Absent = no ceiling on legal entities per human. */
   maxEntitiesPerHuman?: number;
@@ -196,11 +199,82 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     });
   });
 
+  // ── Identity Check step-up ───────────────────────────────────────────────────────────────────
+  // Optional, and deliberately not a gate: World's document credentials cover ~12 countries, so
+  // requiring one would lock out most of Europe (including this project's own founder).
+
+  /** Guard shared by both step-up routes: unmounted without config, and never an entry point. */
+  const attestPreconditions = (tenantId: string) => {
+    const action = world.cfg.attestAction;
+    if (!action) throw new ApiError("not_found", 404, "identity attestation is not configured");
+    if (!world.store.findByTenant(tenantId, world.cfg.action))
+      throw new ApiError(
+        "guardian_not_verified",
+        403,
+        "verify as a guardian before adding an attestation",
+      );
+    return action;
+  };
+
+  app.get("/world-id/attest/context", requireAuth(deps.jwtSecret), (c) => {
+    const tenantId = c.get("tenantId");
+    const action = attestPreconditions(tenantId);
+    return c.json({
+      appId: world.cfg.appId,
+      action,
+      environment: world.cfg.environment,
+      signal: tenantId,
+      // The v4 request signature covers the ACTION, so this must be minted for the step-up action.
+      rpContext: makeRpContext(world.cfg, action),
+      minAge: world.attestMinAge,
+    });
+  });
+
+  app.post("/world-id/attest/verify", requireAuth(deps.jwtSecret), async (c) => {
+    const tenantId = c.get("tenantId");
+    const action = attestPreconditions(tenantId);
+    let body: { proof?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ApiError("validation_error", 400, "invalid JSON body");
+    }
+    if (!body.proof) throw new ApiError("validation_error", 400, "proof is required");
+
+    let attested: Awaited<ReturnType<typeof verifyAttestation>>;
+    try {
+      attested = await verifyAttestation({ ...world.cfg, action }, body.proof, world.attestMinAge);
+    } catch (e) {
+      const detail = e instanceof WorldIdError ? `${e.code}: ${e.message}` : String(e);
+      throw new ApiError("attestation_failed", 400, detail);
+    }
+
+    const stored = world.store.recordAttestation({
+      nullifier: attested.nullifier,
+      action,
+      tenantId,
+      minAge: attested.minAge,
+      credential: attested.credential,
+      issuerSchemaId: attested.issuerSchemaId,
+      verifiedAt: Date.now(),
+      expiresAtMin: attested.expiresAtMin,
+    });
+    if (!stored)
+      throw new ApiError(
+        "human_already_bound",
+        409,
+        "this human already holds an attestation on another account",
+      );
+
+    return c.json({ status: "attested", minAge: attested.minAge, credential: attested.credential });
+  });
+
   // Current guardian-verification state for the caller's tenant (drives UI + the onboarding gate).
   app.get("/world-id/me", requireAuth(deps.jwtSecret), (c) => {
     const tenantId = c.get("tenantId");
+    const attestAvailable = Boolean(world.cfg.attestAction);
     const v = world.store.findByTenant(tenantId, world.cfg.action);
-    if (!v) return c.json({ verified: false, required: world.requireGuardian });
+    if (!v) return c.json({ verified: false, required: world.requireGuardian, attestAvailable });
     return c.json({
       verified: true,
       required: world.requireGuardian,
@@ -211,8 +285,24 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
       nullifier: v.nullifier,
       entitiesUsed: world.store.countEntitiesForNullifier(v.nullifier, world.cfg.action),
       maxEntities: world.maxEntitiesPerHuman,
+      attestAvailable,
+      ...attestationView(tenantId),
     });
   });
+
+  /** Attestation slice of /me. Absent when unconfigured or unattested; expiry demotes it. */
+  const attestationView = (tenantId: string) => {
+    const action = world.cfg.attestAction;
+    if (!action) return { formationReady: false };
+    const a = world.store.findAttestationByTenant(tenantId, action);
+    // expires_at_min is a UNIX minute count, not milliseconds.
+    const live = a && (a.expiresAtMin == null || a.expiresAtMin * 60_000 > Date.now());
+    if (!a || !live) return { formationReady: false };
+    return {
+      formationReady: true,
+      attestation: { minAge: a.minAge, credential: a.credential, verifiedAt: a.verifiedAt },
+    };
+  };
 }
 
 /** Onboarding gate: throws unless the tenant's guardian is a verified unique human under the cap.

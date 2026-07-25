@@ -202,6 +202,23 @@ export function migrate(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_guardian_verifications_tenant
       ON guardian_verifications(tenant_id);
 
+    -- Identity Check step-up (optional). Separate action => separate nullifier from the guardian
+    -- verification above, by design. No issuing_country column: World's attributes are assertions,
+    -- not disclosures, so a country can be CHECKED but never LEARNED.
+    CREATE TABLE IF NOT EXISTS guardian_attestations (
+      nullifier        TEXT NOT NULL,
+      action           TEXT NOT NULL,
+      tenant_id        TEXT NOT NULL,
+      min_age          INTEGER NOT NULL,   -- threshold proven, never a birthdate
+      credential       TEXT,
+      issuer_schema_id INTEGER,
+      verified_at      INTEGER NOT NULL,
+      expires_at_min   INTEGER,
+      PRIMARY KEY (nullifier, action)
+    );
+    CREATE INDEX IF NOT EXISTS idx_guardian_attestations_tenant
+      ON guardian_attestations(tenant_id, action);
+
     -- In-flight World ID proof requests (server-driven idkit-core flow): created by
     -- POST /world-id/request, consumed by GET /world-id/status/:requestId.
     CREATE TABLE IF NOT EXISTS world_requests (

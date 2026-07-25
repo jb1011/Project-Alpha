@@ -153,15 +153,21 @@ async function main() {
           rpSigningKey: cfg.world.rpSigningKey,
           action: cfg.world.action,
           environment: cfg.world.environment,
+          attestAction: cfg.world.attestAction,
         },
         store: worldStore,
         maxEntitiesPerHuman: cfg.world.maxEntitiesPerHuman,
+        attestMinAge: cfg.world.attestMinAge,
         requireGuardian: cfg.world.requireGuardian,
       }
     : undefined;
   if (worldId)
     console.warn(
       `⚠ World ID guardian gate ENABLED (action ${worldId.cfg.action}, env ${worldId.cfg.environment}, enforce=${worldId.requireGuardian})`,
+    );
+  if (worldId?.cfg.attestAction)
+    console.warn(
+      `⚠ Identity attestation step-up ENABLED (action ${worldId.cfg.attestAction}, min age ${worldId.attestMinAge})`,
     );
 
   const app = buildApiApp({

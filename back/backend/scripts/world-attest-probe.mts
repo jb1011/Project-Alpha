@@ -19,8 +19,7 @@ import { IDKit, identityCheck } from "@worldcoin/idkit-core";
 // qrcode ships no bundled types (transitive dep, reused for the booth QR).
 // @ts-expect-error -- no types
 import QRCodeUntyped from "qrcode";
-import { makeRpContext } from "../src/adapters/worldid/guardianGate";
-import { loadConfig } from "../src/config/env";
+import { ensureNodeWasmFetch, makeRpContext } from "../src/adapters/worldid/guardianGate";
 
 const QRCode = QRCodeUntyped as unknown as {
   toString(text: string, opts: { type: string; small?: boolean }): Promise<string>;
@@ -29,25 +28,42 @@ const QRCode = QRCodeUntyped as unknown as {
 const OUT = "test/world/fixtures/attest-verify-response.json";
 const VERIFY_HOST = "https://developer.world.org";
 
-const cfg = loadConfig();
-const w = cfg.world;
-if (!w) throw new Error("World is not configured (WORLD_APP_ID/RP_ID/RP_SIGNING_KEY).");
-const action = w.attestAction;
+// Read the World slice straight from the environment rather than loadConfig(): a probe has no
+// business demanding unrelated secrets (PLATFORM_PRIVATE_KEY et al) that aren't in a dev .env.
+function need(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`${name} is required in .env for this probe`);
+  return v;
+}
+const w = {
+  appId: need("WORLD_APP_ID"),
+  rpId: need("WORLD_RP_ID"),
+  rpSigningKey: need("WORLD_RP_SIGNING_KEY"),
+  environment: (process.env.WORLD_ENVIRONMENT ?? "production") as
+    | "production"
+    | "staging"
+    | "sandbox",
+  attestMinAge: Number(process.env.WORLD_ATTEST_MIN_AGE ?? 18),
+};
+const action = process.env.WORLD_ATTEST_ACTION;
 if (!action) throw new Error("Set WORLD_ATTEST_ACTION (e.g. guardian-attest) in .env first.");
 
 const signal = process.env.SIGNAL ?? "0x0000000000000000000000000000000000000001";
+
+// idkit-core's WASM loader fetches a file:// URL, which Node's fetch rejects. Same shim the API
+// server uses; without it .preset() throws "Failed to initialize IDKit WASM".
+ensureNodeWasmFetch();
 
 console.log(`\n=== Identity Check probe — action "${action}" (${w.environment}) ===\n`);
 console.log(`Requesting: minimum_age >= ${w.attestMinAge}, issuing_country`);
 console.log(`Signal (tenant): ${signal}\n`);
 
-// Two shapes are plausible for "tell me the value" vs "assert this value". We ask for the age
-// threshold as a constraint and the country as a disclosed attribute; if World rejects the
-// request outright, the error itself is the finding — record it and try the alternative.
-const attributes = [
-  { type: "minimum_age", value: w.attestMinAge },
-  { type: "issuing_country", value: "" },
-];
+// FINDING (2026-07-25): IdentityAttribute is an ASSERTION, not a disclosure request. A first run
+// with `{type:"issuing_country", value:""}` came back `identity_attributes_not_matched` — it had
+// asserted "country equals empty string", which nothing satisfies. There is no "tell me the
+// value" form here (enumerate/all/any are CREDENTIAL combinators for .constraints(), not
+// attributes). So we can prove a threshold like age, but we cannot LEARN the issuing country.
+const attributes = [{ type: "minimum_age", value: w.attestMinAge }];
 
 const request = await IDKit.request({
   app_id: w.appId,
@@ -73,7 +89,9 @@ console.log(await QRCode.toString(request.connectorURI, { type: "terminal", smal
 console.log(`\nScan with World App, or open: ${request.connectorURI}\n`);
 console.log("Waiting for approval…\n");
 
-const outcome = await request.pollUntilCompletion({ timeout: 5 * 60_000 });
+const outcome = await request.pollUntilCompletion({
+  timeout: Number(process.env.TIMEOUT_MS ?? 8 * 60_000),
+});
 if (!outcome?.success) {
   console.error("Request did not complete:", JSON.stringify(outcome, null, 2));
   process.exit(1);
