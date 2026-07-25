@@ -4,6 +4,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   useSyncExternalStore,
@@ -65,6 +66,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     () => null,
   );
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+
+  // A session authenticates ONE address — the tenant every API call acts as. Switching accounts in
+  // the wallet must therefore invalidate it, or the app keeps acting as the previous account while
+  // displaying the new one. Only a genuine switch clears it: a disconnected wallet (extension
+  // locked, page reloaded before wagmi rehydrates) leaves `address` undefined and is not a switch.
+  useEffect(() => {
+    if (!address || !session) return;
+    if (session.address.toLowerCase() !== address.toLowerCase()) clearAuthSession();
+  }, [address, session]);
 
   const connectWallet = useCallback(async () => {
     const connector = connectors[0];
