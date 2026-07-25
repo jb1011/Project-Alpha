@@ -14,12 +14,15 @@ import type { WorldIdMe } from "@/lib/api/types";
  */
 export function TenantRecord({
   address,
+  ensName,
   me,
   entityCount,
   connections,
   passkeys,
 }: {
   address?: string;
+  /** ENS primary name for the wallet, when it has one. */
+  ensName?: string | null;
   me: WorldIdMe | null;
   entityCount: number | null;
   connections: React.ReactNode;
@@ -55,7 +58,7 @@ export function TenantRecord({
             </div>
 
             <h1 className="text-balance text-[26px] font-medium leading-[1.1] tracking-[-0.02em] text-ink sm:text-[30px]">
-              {address ? <AddressTitle address={address} /> : "Your account"}
+              {address ? <AddressTitle address={address} ensName={ensName} /> : "Your account"}
             </h1>
 
             <p className="max-w-[58ch] text-pretty text-[13px] leading-[1.65] text-muted">
@@ -124,19 +127,46 @@ export function TenantRecord({
   );
 }
 
-/** The wallet address as the title it deserves — full on wide screens, short on narrow, one-click copy. */
-function AddressTitle({ address }: { address: string }) {
+/** The account's name where ENS gives it one, the address where it doesn't. Either way the raw
+ *  address stays one click from the clipboard — a readable name must never hide the real value. */
+function AddressTitle({ address, ensName }: { address: string; ensName?: string | null }) {
   const [copied, setCopied] = React.useState(false);
+  const copy = () => {
+    void navigator.clipboard.writeText(address).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    });
+  };
+
+  if (ensName) {
+    return (
+      <span className="flex flex-col items-center gap-1 sm:items-start">
+        <span className="flex items-center gap-2.5">
+          <span className="truncate">{ensName}</span>
+          <span
+            title="Resolved from this wallet's ENS primary name"
+            className="shrink-0 rounded-full border border-accent/30 bg-accent/[0.07] px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.14em] text-accent-soft"
+          >
+            ens
+          </span>
+        </span>
+        <button
+          type="button"
+          onClick={copy}
+          className="group inline-flex items-center gap-2 font-mono text-[12px] font-normal tracking-normal text-muted-2 transition-colors hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+        >
+          <span>{shortAddress(address)}</span>
+          <span className="text-[11px]">{copied ? "copied" : "copy"}</span>
+        </button>
+      </span>
+    );
+  }
+
   return (
     <button
       type="button"
       title="Copy address"
-      onClick={() => {
-        void navigator.clipboard.writeText(address).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1600);
-        });
-      }}
+      onClick={copy}
       className="group inline-flex max-w-full items-baseline gap-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
     >
       <span className="hidden truncate font-mono text-[22px] tracking-tight lg:inline">{address}</span>
