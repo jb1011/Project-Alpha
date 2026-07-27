@@ -159,8 +159,8 @@ describe("verifyProof — the proof must be bound to THIS tenant and THIS action
   });
 
   test("accepts when World omits the action (older responses stay compatible)", async () => {
-    const noAction = { ...ok() };
-    delete (noAction as { action?: string }).action;
+    // JSON.stringify drops undefined keys, so the stubbed response has no `action` at all.
+    const noAction = { ...ok(), action: undefined };
     const v = await verifyProof(CFG, payloadFor(TENANT), TENANT, fetchStub(200, noAction));
     expect(v.credential).toBe("proof_of_human");
   });
