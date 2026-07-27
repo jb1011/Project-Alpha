@@ -1,3 +1,4 @@
+import { hashSignal } from "@worldcoin/idkit-core";
 import { describe, expect, test } from "vitest";
 import { type WorldIdConfig, verifyAttestation } from "../../src/adapters/worldid/guardianGate";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -30,7 +31,7 @@ const IDKIT_RESULT = {
       identifier: "passport",
       issuer_schema_id: 9303,
       nullifier: "0x09e0a16069aa15d8773ae5ca0323e29a9262cf761dbaf1a499717480a30ae932",
-      signal_hash: "0x0014",
+      signal_hash: hashSignal("0xtenant"),
     },
   ],
 };
@@ -60,7 +61,7 @@ function fetchReturning(body: unknown, status = 200): typeof fetch {
 
 describe("verifyAttestation", () => {
   test("accepts a real-shaped attestation and normalises the nullifier to decimal", async () => {
-    const a = await verifyAttestation(CFG, IDKIT_RESULT, 18, fetchReturning(VERIFY_OK));
+    const a = await verifyAttestation(CFG, IDKIT_RESULT, 18, "0xtenant", fetchReturning(VERIFY_OK));
     expect(a.credential).toBe("passport");
     expect(a.minAge).toBe(18);
     expect(a.issuerSchemaId).toBe(9303); // ICAO 9303 — the passport standard
@@ -70,29 +71,31 @@ describe("verifyAttestation", () => {
 
   test("rejects a proof that carries no attestation flag", async () => {
     const noFlag = { ...IDKIT_RESULT, identity_attested: false };
-    await expect(verifyAttestation(CFG, noFlag, 18, fetchReturning(VERIFY_OK))).rejects.toThrow(
-      /identity attestation/i,
-    );
+    await expect(
+      verifyAttestation(CFG, noFlag, 18, "0xtenant", fetchReturning(VERIFY_OK)),
+    ).rejects.toThrow(/identity attestation/i);
   });
 
   test("a plain proof-of-human payload is not an attestation", async () => {
     const { identity_attested, ...bare } = IDKIT_RESULT;
     void identity_attested;
-    await expect(verifyAttestation(CFG, bare, 18, fetchReturning(VERIFY_OK))).rejects.toThrow();
+    await expect(
+      verifyAttestation(CFG, bare, 18, "0xtenant", fetchReturning(VERIFY_OK)),
+    ).rejects.toThrow();
   });
 
   test("rejects when World says the proof failed", async () => {
     const bad = { success: false, code: "invalid_proof", detail: "nope" };
     await expect(
-      verifyAttestation(CFG, IDKIT_RESULT, 18, fetchReturning(bad, 400)),
+      verifyAttestation(CFG, IDKIT_RESULT, 18, "0xtenant", fetchReturning(bad, 400)),
     ).rejects.toThrow(/invalid_proof|nope/);
   });
 
   test("rejects a device-tier credential even when attested", async () => {
     const weak = { ...VERIFY_OK, results: [{ identifier: "device", success: true }] };
-    await expect(verifyAttestation(CFG, IDKIT_RESULT, 18, fetchReturning(weak))).rejects.toThrow(
-      /credential/i,
-    );
+    await expect(
+      verifyAttestation(CFG, IDKIT_RESULT, 18, "0xtenant", fetchReturning(weak)),
+    ).rejects.toThrow(/credential/i);
   });
 });
 

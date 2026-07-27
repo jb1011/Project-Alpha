@@ -1,3 +1,4 @@
+import { hashSignal } from "@worldcoin/idkit-core";
 import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { WorldIdError, verifyProof } from "../../src/adapters/worldid/guardianGate";
@@ -28,12 +29,18 @@ function fetchStub(status: number, body: unknown): typeof fetch {
 }
 
 describe("verifyProof — credential tier + nullifier normalization", () => {
-  const idkitResult = { responses: [{ issuer_schema_id: 1, expires_at_min: 999 }] };
+  const SIGNAL = "0xtenant";
+  // Every real payload carries the signal it was minted for; these fixtures must too, or they
+  // would be asserting behaviour that can no longer occur in production.
+  const idkitResult = {
+    responses: [{ issuer_schema_id: 1, expires_at_min: 999, signal_hash: hashSignal(SIGNAL) }],
+  };
 
   test("accepts proof_of_human and normalizes the nullifier to decimal", async () => {
     const v = await verifyProof(
       CFG,
       idkitResult,
+      SIGNAL,
       fetchStub(200, {
         success: true,
         environment: "staging",
@@ -49,6 +56,7 @@ describe("verifyProof — credential tier + nullifier normalization", () => {
     const v = await verifyProof(
       CFG,
       idkitResult,
+      SIGNAL,
       fetchStub(200, {
         success: true,
         results: [{ identifier: "orb", success: true, nullifier: "42" }],
@@ -63,6 +71,7 @@ describe("verifyProof — credential tier + nullifier normalization", () => {
       verifyProof(
         CFG,
         idkitResult,
+        SIGNAL,
         fetchStub(200, {
           success: true,
           results: [{ identifier: "device", success: true, nullifier: "7" }],
@@ -76,6 +85,7 @@ describe("verifyProof — credential tier + nullifier normalization", () => {
       verifyProof(
         CFG,
         idkitResult,
+        SIGNAL,
         fetchStub(200, {
           success: true,
           results: [{ identifier: "selfie", success: true, nullifier: "7" }],
@@ -89,6 +99,7 @@ describe("verifyProof — credential tier + nullifier normalization", () => {
       verifyProof(
         CFG,
         idkitResult,
+        SIGNAL,
         fetchStub(400, { success: false, code: "invalid_proof", detail: "bad" }),
       ),
     ).rejects.toThrow(/invalid_proof|bad/);
@@ -99,12 +110,59 @@ describe("verifyProof — credential tier + nullifier normalization", () => {
       verifyProof(
         CFG,
         idkitResult,
+        SIGNAL,
         fetchStub(200, {
           success: true,
           results: [{ identifier: "proof_of_human", success: false, code: "verification_error" }],
         }),
       ),
     ).rejects.toThrow(/credential/i);
+  });
+});
+
+describe("verifyProof — the proof must be bound to THIS tenant and THIS action", () => {
+  const TENANT = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const OTHER = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const ok = (nullifier = "0x1f") => ({
+    success: true,
+    action: CFG.action,
+    results: [{ identifier: "proof_of_human", success: true, nullifier }],
+  });
+  const payloadFor = (signal: string) => ({
+    responses: [{ issuer_schema_id: 1, expires_at_min: 999, signal_hash: hashSignal(signal) }],
+  });
+
+  test("accepts a proof whose signal is this tenant", async () => {
+    const v = await verifyProof(CFG, payloadFor(TENANT), TENANT, fetchStub(200, ok()));
+    expect(v.nullifier).toBe("31");
+  });
+
+  // The sybil bypass: a proof minted for someone else's tenant must not verify mine.
+  test("REFUSES a proof minted for a different tenant (replay)", async () => {
+    await expect(verifyProof(CFG, payloadFor(OTHER), TENANT, fetchStub(200, ok()))).rejects.toThrow(
+      /signal/i,
+    );
+  });
+
+  test("REFUSES a proof carrying no signal at all", async () => {
+    const bare = { responses: [{ issuer_schema_id: 1, expires_at_min: 999 }] };
+    await expect(verifyProof(CFG, bare, TENANT, fetchStub(200, ok()))).rejects.toThrow(/signal/i);
+  });
+
+  // Cross-action swap: a proof for another action yields a DIFFERENT nullifier for the same
+  // human, so accepting it would let one person hold two guardianships.
+  test("REFUSES a proof issued for a different action", async () => {
+    const other = { ...ok(), action: "guardian-attest" };
+    await expect(
+      verifyProof(CFG, payloadFor(TENANT), TENANT, fetchStub(200, other)),
+    ).rejects.toThrow(/action/i);
+  });
+
+  test("accepts when World omits the action (older responses stay compatible)", async () => {
+    const noAction = { ...ok() };
+    delete (noAction as { action?: string }).action;
+    const v = await verifyProof(CFG, payloadFor(TENANT), TENANT, fetchStub(200, noAction));
+    expect(v.credential).toBe("proof_of_human");
   });
 });
 

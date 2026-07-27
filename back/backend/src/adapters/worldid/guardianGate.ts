@@ -1,4 +1,4 @@
-import { IDKit, proofOfHuman } from "@worldcoin/idkit-core";
+import { IDKit, hashSignal, proofOfHuman } from "@worldcoin/idkit-core";
 import { signRequest } from "@worldcoin/idkit-core/signing";
 
 /** World ID config slice (mirrors Config["world"]). */
@@ -153,6 +153,7 @@ export async function verifyAttestation(
   cfg: WorldIdConfig,
   idkitResult: unknown,
   minAge: number,
+  expectedSignal: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<VerifiedAttestation> {
   const client = idkitResult as {
@@ -165,7 +166,7 @@ export async function verifyAttestation(
       "the proof carries no identity attestation (identity_attested is not true)",
     );
 
-  const verified = await verifyProof(cfg, idkitResult, fetchImpl);
+  const verified = await verifyProof(cfg, idkitResult, expectedSignal, fetchImpl);
   const item = (client.responses ?? [])[0];
   return {
     nullifier: verified.nullifier,
@@ -189,9 +190,15 @@ export interface VerifiedProof {
 
 /** Forward the IDKit result AS-IS to the Developer Portal and enforce the credential tier.
  *  Sending the payload byte-for-byte matters — remapping it is the #1 cause of invalid_proof. */
+/**
+ * @param expectedSignal the value the proof MUST be bound to — the caller's tenant. World cannot
+ *   check this for us: it never learns which signal we asked for, so a proof minted for one tenant
+ *   verifies perfectly well when replayed under another unless we compare it ourselves.
+ */
 export async function verifyProof(
   cfg: WorldIdConfig,
   idkitResult: unknown,
+  expectedSignal: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<VerifiedProof> {
   const res = await fetchImpl(`${VERIFY_HOST}/api/v4/verify/${cfg.rpId}`, {
@@ -205,6 +212,7 @@ export async function verifyProof(
     detail?: string;
     nullifier?: string;
     environment?: string;
+    action?: string;
     results?: {
       identifier?: string;
       success?: boolean;
@@ -217,6 +225,29 @@ export async function verifyProof(
     throw new WorldIdError(
       body.code ?? "verify_failed",
       body.detail ?? `verify HTTP ${res.status}`,
+    );
+
+  // ── Bind the proof to THIS caller and THIS action ────────────────────────────────────────
+  // World tells us the proof is genuine; it cannot tell us the proof was meant for us. Without
+  // the two checks below, a proof obtained for another tenant — or for another action of the
+  // same app, which yields a DIFFERENT nullifier for the same human — verifies here and defeats
+  // the one-human-one-account rule.
+  if (body.action != null && body.action !== cfg.action)
+    throw new WorldIdError(
+      "action_mismatch",
+      `proof was issued for action "${body.action}", not "${cfg.action}"`,
+    );
+
+  const expectedHash = hashSignal(expectedSignal).toLowerCase();
+  const signals = ((idkitResult as { responses?: { signal_hash?: string }[] })?.responses ?? [])
+    .map((r) => r.signal_hash?.toLowerCase())
+    .filter((h): h is string => Boolean(h));
+  if (signals.length === 0)
+    throw new WorldIdError("no_signal", "proof carries no signal_hash to bind it to this account");
+  if (signals.some((h) => h !== expectedHash))
+    throw new WorldIdError(
+      "signal_mismatch",
+      "proof was not issued for this account (signal mismatch)",
     );
 
   // 200 means at least one proof verified; pick the first successful result of an accepted tier.

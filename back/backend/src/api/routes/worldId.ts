@@ -99,7 +99,7 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     }
 
     try {
-      const proof = await verifyProof(world.cfg, outcome.result);
+      const proof = await verifyProof(world.cfg, outcome.result, tenantId);
       // Sybil gate: this human may already be bound to a DIFFERENT tenant.
       const stored = world.store.recordVerification({
         nullifier: proof.nullifier,
@@ -147,7 +147,8 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
       appId: world.cfg.appId,
       action: world.cfg.action,
       environment: world.cfg.environment,
-      // The guardian's wallet is bound into the proof, so it can't be replayed for another account.
+      // Bound into the proof as its signal and re-checked in verifyProof, so a proof minted for
+      // one account cannot be replayed to verify another.
       signal: tenantId,
       rpContext: makeRpContext(world.cfg),
     });
@@ -166,7 +167,7 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
 
     let proof: Awaited<ReturnType<typeof verifyProof>>;
     try {
-      proof = await verifyProof(world.cfg, body.proof);
+      proof = await verifyProof(world.cfg, body.proof, tenantId);
     } catch (e) {
       const detail = e instanceof WorldIdError ? `${e.code}: ${e.message}` : String(e);
       throw new ApiError("verification_failed", 400, detail);
@@ -243,7 +244,12 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
 
     let attested: Awaited<ReturnType<typeof verifyAttestation>>;
     try {
-      attested = await verifyAttestation({ ...world.cfg, action }, body.proof, world.attestMinAge);
+      attested = await verifyAttestation(
+        { ...world.cfg, action },
+        body.proof,
+        world.attestMinAge,
+        tenantId,
+      );
     } catch (e) {
       const detail = e instanceof WorldIdError ? `${e.code}: ${e.message}` : String(e);
       throw new ApiError("attestation_failed", 400, detail);

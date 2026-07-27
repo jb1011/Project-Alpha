@@ -139,7 +139,7 @@ async function main() {
   rule("3 · VERIFY (World Developer Portal)");
   let proof: Awaited<ReturnType<typeof verifyProof>>;
   try {
-    proof = await verifyProof(cfg, outcome.result);
+    proof = await verifyProof(cfg, outcome.result, tenant);
   } catch (e) {
     const err = e as WorldIdError;
     line(`  ${R}✗ rejected:${X} ${err.code ?? ""} ${err.message}`);
