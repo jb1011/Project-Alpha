@@ -42,7 +42,13 @@ export interface McpToolDeps {
   /** Arc adapter — live legal-status + ENSIP-25 reverse-binding reads for resolve_agent. Optional. */
   arc?: import("../adapters/arc/arcAdapter").ArcAdapter;
   /** ENS config for resolve_agent (parent name + registry for the ENSIP-25 verdict). Optional. */
-  ens?: { parentName: string; identityRegistry: string; chainId: number };
+  ens?: {
+    parentName: string;
+    identityRegistry: string;
+    chainId: number;
+    /** Vanity label -> publicId, same map the CCIP gateway uses. */
+    labelAliases?: Record<string, string>;
+  };
   /** World ID guardian gate (mirrors the REST /onboard gate). Optional. */
   worldId?: import("../api/routes/worldId").WorldIdDeps;
 }
@@ -155,7 +161,11 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const suffix = `.${deps.ens.parentName}`.toLowerCase();
       const lname = name.toLowerCase();
       const label = lname.endsWith(suffix) ? lname.slice(0, lname.length - suffix.length) : lname;
-      const rec = repo.findByPublicId(label);
+      // Resolve vanity aliases exactly as the CCIP gateway does, or the two disagree.
+      const aliases = deps.ens.labelAliases;
+      const publicId =
+        aliases && Object.hasOwn(aliases, label) ? (aliases[label] as string) : label;
+      const rec = repo.findByPublicId(publicId);
       if (!rec)
         return {
           content: [
@@ -178,7 +188,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           legalStatus = status === 0 && !paused ? "Active" : "Suspended";
           const meta = await deps.arc.getAgentMetadata(BigInt(rec.agentId), "ens");
           reverseName = meta === "0x" ? "" : hexToString(meta);
-          reverseVerified = reverseName.toLowerCase() === lname;
+          // Compare against the fully-qualified name: callers may pass a bare label, and the
+          // on-chain record always stores `<label>.<parent>`.
+          reverseVerified = reverseName.toLowerCase() === `${label}${suffix}`;
         } catch {
           // Degraded (Arc RPC issue): leave legalStatus "unknown" and reverse unverified.
         }

@@ -13,8 +13,10 @@ const CFG: WorldIdConfig = {
 };
 
 /**
- * Shapes below are transcribed from a REAL staging round-trip captured by
- * scripts/world-attest-probe.mts (2026-07-25), not invented. The two load-bearing facts:
+ * Shapes below mirror a REAL staging round-trip captured by
+ * scripts/world-attest-probe.mts (2026-07-25). The nullifier is SYNTHETIC — a nullifier is
+ * personal data, and these tests assert shape and decimal normalization only, so any
+ * well-formed 32-byte hex exercises them identically. The two load-bearing facts:
  *  - `identity_attested` is on the CLIENT payload; World's verify response never echoes it;
  *  - the verify response carries no attribute values at all, only results[].identifier.
  */
@@ -30,7 +32,7 @@ const IDKIT_RESULT = {
       expires_at_min: 1785005211,
       identifier: "passport",
       issuer_schema_id: 9303,
-      nullifier: "0x09e0a16069aa15d8773ae5ca0323e29a9262cf761dbaf1a499717480a30ae932",
+      nullifier: "0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9",
       signal_hash: hashSignal("0xtenant"),
     },
   ],
@@ -39,13 +41,13 @@ const IDKIT_RESULT = {
 const VERIFY_OK = {
   success: true,
   action: "guardian-attest",
-  nullifier: "0x09e0a16069aa15d8773ae5ca0323e29a9262cf761dbaf1a499717480a30ae932",
+  nullifier: "0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9",
   environment: "staging",
   results: [
     {
       identifier: "passport",
       success: true,
-      nullifier: "0x09e0a16069aa15d8773ae5ca0323e29a9262cf761dbaf1a499717480a30ae932",
+      nullifier: "0x0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9",
     },
   ],
   message: "Proof verified successfully",

@@ -378,6 +378,7 @@ export function redact(cfg: Config): Record<string, unknown> {
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
     jobClientPrivateKey: "REDACTED",
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
+    x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
     ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
     world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
     turnkey: cfg.turnkey
