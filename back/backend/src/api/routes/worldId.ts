@@ -25,6 +25,25 @@ export interface WorldIdDeps {
 
 const REQUEST_TTL_MS = 10 * 60_000;
 
+/** Why a World verification was refused. The backend logs nothing per-request, so when a scan
+ *  failed in the field we could not tell whether the proof had even reached us — only that the
+ *  user saw an error on their phone. Log the reason (never the nullifier; tenant truncated). */
+/**
+ * Is a World credential still valid?
+ *
+ * `expires_at_min` is UNIX **SECONDS** despite the name. Ground truth: the value in our own
+ * captured staging fixture, 1785005211, decodes as seconds to 2026-07-25 — the day it was
+ * captured. Read as minutes it lands in the year 5363, which is why expiry never fired.
+ * Absent expiry means non-expiring, not expired.
+ */
+function credentialLive(expiresAtSec: number | null | undefined, now = Date.now()): boolean {
+  return expiresAtSec == null || expiresAtSec * 1000 > now;
+}
+
+function logWorldRejection(kind: string, tenantId: string, detail: string): void {
+  console.warn(`world-id ${kind} refused for ${tenantId.slice(0, 10)}…: ${detail}`);
+}
+
 /**
  * Guardian proof-of-personhood gate. Server-driven idkit-core flow so it works for BOTH the web
  * wizard and MCP-first onboarding (the client only needs to display/scan `connectorURI`).
@@ -170,16 +189,19 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
       proof = await verifyProof(world.cfg, body.proof, tenantId);
     } catch (e) {
       const detail = e instanceof WorldIdError ? `${e.code}: ${e.message}` : String(e);
+      logWorldRejection("verify", tenantId, detail);
       throw new ApiError("verification_failed", 400, detail);
     }
 
     const existing = world.store.findByNullifier(proof.nullifier, world.cfg.action);
-    if (existing && existing.tenantId !== tenantId)
+    if (existing && existing.tenantId !== tenantId) {
+      logWorldRejection("verify", tenantId, "human already bound to another tenant");
       throw new ApiError(
         "human_already_bound",
         409,
         "this human is already the guardian of another account",
       );
+    }
 
     world.store.recordVerification({
       nullifier: proof.nullifier,
@@ -252,6 +274,7 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
       );
     } catch (e) {
       const detail = e instanceof WorldIdError ? `${e.code}: ${e.message}` : String(e);
+      logWorldRejection("attestation", tenantId, detail);
       throw new ApiError("attestation_failed", 400, detail);
     }
 
@@ -345,8 +368,7 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     const action = world.cfg.attestAction;
     if (!action) return { formationReady: false };
     const a = world.store.findAttestationByTenant(tenantId, action);
-    // expires_at_min is a UNIX minute count, not milliseconds.
-    const live = a && (a.expiresAtMin == null || a.expiresAtMin * 60_000 > Date.now());
+    const live = a && credentialLive(a.expiresAtMin);
     if (!a || !live) return { formationReady: false };
     return {
       formationReady: true,
@@ -365,6 +387,13 @@ export function assertGuardianAllowed(world: WorldIdDeps | undefined, tenantId: 
       "guardian_not_verified",
       403,
       "guardian must complete World ID verification before creating a legal entity",
+    );
+  // A credential that has lapsed is not a current statement about the guardian.
+  if (!credentialLive(v.expiresAtMin))
+    throw new ApiError(
+      "guardian_credential_expired",
+      403,
+      "the guardian's World ID credential has expired; verify again to continue",
     );
   // The ceiling is optional: unset means a verified human may form as many legal bodies as they
   // like, which is what the law actually allows.

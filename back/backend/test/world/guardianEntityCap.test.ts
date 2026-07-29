@@ -12,6 +12,8 @@ function deps(opts: {
   verified: boolean;
   used: number;
   maxEntitiesPerHuman?: number;
+  /** UNIX SECONDS, as World actually sends it. */
+  expiresAtMin?: number | null;
 }): WorldIdDeps {
   return {
     cfg: { action: ACTION } as WorldIdDeps["cfg"],
@@ -19,7 +21,10 @@ function deps(opts: {
     attestMinAge: 18,
     maxEntitiesPerHuman: opts.maxEntitiesPerHuman,
     store: {
-      findByTenant: () => (opts.verified ? { nullifier: NULLIFIER } : undefined),
+      findByTenant: () =>
+        opts.verified
+          ? { nullifier: NULLIFIER, expiresAtMin: opts.expiresAtMin ?? null }
+          : undefined,
       countEntitiesForNullifier: () => opts.used,
     } as unknown as WorldIdDeps["store"],
   };
@@ -62,6 +67,26 @@ describe("assertGuardianAllowed", () => {
   test("at a configured ceiling -> blocked", () => {
     const d = deps({ requireGuardian: true, verified: true, used: 3, maxEntitiesPerHuman: 3 });
     expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBe("guardian_entity_cap");
+  });
+
+  // `expires_at_min` is UNIX SECONDS despite the name — our own captured fixture value
+  // 1785005211 decodes to 2026-07-25, the day it was captured. Treating it as minutes puts
+  // every credential in the year 5363, i.e. expiry could never fire.
+  test("an EXPIRED credential no longer satisfies the gate", () => {
+    const expired = Math.floor(Date.now() / 1000) - 60; // one minute ago, in seconds
+    const d = deps({ requireGuardian: true, verified: true, used: 0, expiresAtMin: expired });
+    expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBe("guardian_credential_expired");
+  });
+
+  test("a live credential still satisfies the gate", () => {
+    const live = Math.floor(Date.now() / 1000) + 3600;
+    const d = deps({ requireGuardian: true, verified: true, used: 0, expiresAtMin: live });
+    expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBeNull();
+  });
+
+  test("a credential with no expiry is treated as live", () => {
+    const d = deps({ requireGuardian: true, verified: true, used: 0, expiresAtMin: null });
+    expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBeNull();
   });
 
   test("already past a ceiling lowered after the fact -> blocked", () => {
