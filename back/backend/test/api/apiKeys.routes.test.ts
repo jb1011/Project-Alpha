@@ -8,6 +8,7 @@ import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 
 const account = privateKeyToAccount(
   "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
@@ -24,6 +25,7 @@ function makeApp() {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
   });
   const app = buildApiApp({
     webOrigin: "*",
@@ -136,4 +138,49 @@ test("DELETE /api-keys/:id by a different tenant → 404 (cannot revoke another 
 test("no auth → 401", async () => {
   const app = makeApp();
   expect((await app.request("/api-keys")).status).toBe(401);
+});
+
+test("POST /api-keys with no capability given defaults to 'spend'", async () => {
+  const app = makeApp();
+  const token = await login(app);
+  const created = await app.request("/api-keys", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  expect(created.status).toBe(201);
+  const body = await created.json();
+  expect(body.capability).toBe("spend");
+
+  const listed = await app.request("/api-keys", { headers: { authorization: `Bearer ${token}` } });
+  const views = await listed.json();
+  expect(views[0]!.capability).toBe("spend");
+});
+
+test("POST /api-keys accepts an explicit 'provision' capability", async () => {
+  const app = makeApp();
+  const token = await login(app);
+  const created = await app.request("/api-keys", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ label: "provisioner", capability: "provision" }),
+  });
+  expect(created.status).toBe(201);
+  const body = await created.json();
+  expect(body.capability).toBe("provision");
+
+  const listed = await app.request("/api-keys", { headers: { authorization: `Bearer ${token}` } });
+  const views = await listed.json();
+  expect(views[0]!).toMatchObject({ label: "provisioner", capability: "provision" });
+});
+
+test("POST /api-keys with an unknown capability → 400", async () => {
+  const app = makeApp();
+  const token = await login(app);
+  const res = await app.request("/api-keys", {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ capability: "admin" }),
+  });
+  expect(res.status).toBe(400);
 });

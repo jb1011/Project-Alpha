@@ -18,6 +18,41 @@ test("loadConfig parses valid env with defaults", () => {
   expect(cfg.platformPrivateKey).toMatch(/^0x[0-9a-fA-F]{64}$/);
 });
 
+// --- S1: treasury funding caps ---
+
+test("loadConfig defaults MAX_TREASURY_FUND_USDC/MAX_TREASURY_FUNDED_PER_TENANT_USDC to 25/100", () => {
+  const cfg = loadConfig(base);
+  expect(cfg.maxTreasuryFund).toBe(25_000_000n);
+  expect(cfg.maxTreasuryFundedPerTenant).toBe(100_000_000n);
+});
+
+test("loadConfig rejects MAX_TREASURY_FUND_USDC > MAX_TREASURY_FUNDED_PER_TENANT_USDC", () => {
+  expect(() =>
+    loadConfig({
+      ...base,
+      MAX_TREASURY_FUND_USDC: "101",
+      MAX_TREASURY_FUNDED_PER_TENANT_USDC: "100",
+    }),
+  ).toThrow(/MAX_TREASURY_FUND_USDC must be <= MAX_TREASURY_FUNDED_PER_TENANT_USDC/);
+});
+
+test("loadConfig allows MAX_TREASURY_FUND_USDC == MAX_TREASURY_FUNDED_PER_TENANT_USDC", () => {
+  expect(() =>
+    loadConfig({
+      ...base,
+      MAX_TREASURY_FUND_USDC: "50",
+      MAX_TREASURY_FUNDED_PER_TENANT_USDC: "50",
+    }),
+  ).not.toThrow();
+});
+
+test("redact stringifies maxTreasuryFund and maxTreasuryFundedPerTenant (bigints)", () => {
+  const cfg = loadConfig(base);
+  const printed = redact(cfg) as Record<string, unknown>;
+  expect(printed.maxTreasuryFund).toBe("25000000");
+  expect(printed.maxTreasuryFundedPerTenant).toBe("100000000");
+});
+
 test("loadConfig rejects a malformed private key", () => {
   expect(() => loadConfig({ ...base, PLATFORM_PRIVATE_KEY: "nope" })).toThrow(
     /PLATFORM_PRIVATE_KEY/,

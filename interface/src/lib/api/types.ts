@@ -145,7 +145,7 @@ export type ApiKeyView = {
   capability: Capability;
 };
 
-export type Capability = "read" | "earn" | "spend";
+export type Capability = "read" | "earn" | "spend" | "provision";
 
 export type ConnectionSnippets = {
   claudeCode: string;
@@ -192,6 +192,63 @@ export type ApiErrorBody = {
     details?: { path: string; message: string }[];
   };
 };
+
+/** World ID guardian verification (proof-of-personhood for the legally required human). */
+export type WorldIdMe = {
+  verified: boolean;
+  required: boolean;
+  credential?: string;
+  verifiedAt?: number;
+  /** Per-app pseudonym — the only identity datum stored, and the seed for the guardian seal. */
+  nullifier?: string;
+  entitiesUsed?: number;
+  maxEntities?: number;
+  /** Whether this deployment offers the identity step-up at all. */
+  attestAvailable?: boolean;
+  /** True when a live document-backed attestation is on file. */
+  formationReady?: boolean;
+  attestation?: { minAge: number; credential?: string | null; verifiedAt: number };
+};
+
+/** Params for the identity-attestation widget (the step-up uses its own World action). */
+export type WorldIdAttestContext = {
+  appId: string;
+  action: string;
+  environment: "production" | "staging" | "sandbox";
+  signal: string;
+  rpContext: Record<string, unknown>;
+  minAge: number;
+};
+
+export type WorldIdContext = {
+  appId: string;
+  action: string;
+  environment: "production" | "staging" | "sandbox";
+  signal: string;
+  rpContext: Record<string, unknown>;
+};
+
+export type WorldIdRequestView = {
+  requestId: string;
+  connectorURI: string;
+  action: string;
+  environment: string;
+};
+
+export type WorldIdStatusView = {
+  status: "pending" | "verified" | "failed";
+  detail?: string;
+  credential?: string;
+  nullifier?: string;
+  entitiesUsed?: number;
+  maxEntities?: number;
+  /** Whether this deployment offers the identity step-up at all. */
+  attestAvailable?: boolean;
+  /** True when a live document-backed attestation is on file. */
+  formationReady?: boolean;
+  attestation?: { minAge: number; credential?: string | null; verifiedAt: number };
+};
+
 
 export class ApiError extends Error {
   code: string;

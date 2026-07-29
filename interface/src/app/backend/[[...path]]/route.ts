@@ -20,7 +20,9 @@ async function proxy(
 
   const headers = new Headers();
   // MCP Streamable HTTP requires accept/mcp-* headers end-to-end (the backend 406s without them);
-  // x402 requires x-payment end-to-end (the seller re-issues its 402 challenge without it).
+  // x402 requires x-payment end-to-end (the seller re-issues its 402 challenge without it);
+  // AgentKit sends its human-backing proof in a header named exactly `agentkit` — dropping it
+  // makes every external agent look anonymous to the seller, which refused them all.
   const forwarded = [
     "authorization",
     "content-type",
@@ -29,6 +31,7 @@ async function proxy(
     "mcp-protocol-version",
     "last-event-id",
     "x-payment",
+    "agentkit",
   ];
   for (const name of forwarded) {
     const value = req.headers.get(name);
@@ -50,6 +53,12 @@ async function proxy(
   // x402 settlement id is returned to the buyer in x-payment-response.
   const payResponse = res.headers.get("x-payment-response");
   if (payResponse) outHeaders["x-payment-response"] = payResponse;
+  // AgentKit outcome: who the seller judged to be backing the agent, and its remaining budget.
+  // Without these an authorized agent cannot read its own standing.
+  for (const h of ["x-agentkit-human", "x-agentkit-authorization"]) {
+    const v = res.headers.get(h);
+    if (v) outHeaders[h] = v;
+  }
   const joined = path?.join("/") ?? "";
   if (joined === "connection-package" || joined === "bootstrap-connection") {
     outHeaders["cache-control"] = "no-store";

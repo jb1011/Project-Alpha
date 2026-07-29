@@ -8,6 +8,7 @@ import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 import { startMcpTestClient } from "./helpers";
 
 // TENANT is the authenticated tenant — the tool forces roles.guardian = TENANT.
@@ -66,6 +67,7 @@ beforeEach(() => {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
   });
   app = buildApiApp({
     webOrigin: "*",
@@ -84,9 +86,12 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
+// onboard_agent requires the "provision" capability (S1) — these tests exercise the happy path and
+// its argument handling, not the capability gate itself (see actingToolGates.int.test.ts for that).
+
 test("onboard_agent with a stored passkey handle starts the saga and returns pending", async () => {
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
-  const { key } = apiKeys.mint(TENANT);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     const res = await client.callTool({
@@ -103,7 +108,7 @@ test("onboard_agent with a stored passkey handle starts the saga and returns pen
 
 test("onboard_agent overrides a caller-supplied wrong manager with the platform manager address", async () => {
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
-  const { key } = apiKeys.mint(TENANT);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     // VALID_SPEC.roles.manager is MANAGER — a wrong guess. The tool must override it with
@@ -124,7 +129,7 @@ test("onboard_agent overrides a caller-supplied wrong manager with the platform 
 
 test("onboard_agent with an omitted manager still resolves to the platform manager address", async () => {
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
-  const { key } = apiKeys.mint(TENANT);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     const { manager: _omit, ...rolesWithoutManager } = VALID_SPEC.roles;
@@ -143,7 +148,7 @@ test("onboard_agent with an omitted manager still resolves to the platform manag
 });
 
 test("onboard_agent with an unknown passkey handle returns isError", async () => {
-  const { key } = apiKeys.mint(TENANT);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     const res = await client.callTool({

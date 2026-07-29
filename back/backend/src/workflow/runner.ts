@@ -20,7 +20,13 @@ export class OnboardingRunner {
   private readonly inFlight = new Set<string>();
   private readonly pending: Promise<unknown>[] = [];
 
-  constructor(private readonly deps: { repo: EntityRepository; runSaga: RunSaga }) {}
+  constructor(
+    private readonly deps: {
+      repo: EntityRepository;
+      runSaga: RunSaga;
+      fundCaps: { perCall: bigint; perTenantTotal: bigint };
+    },
+  ) {}
 
   start(p: {
     spec: AgentSpec;
@@ -88,6 +94,12 @@ export class OnboardingRunner {
         `cannot fund in status "${rec.status}" (must be "bound" or "funded")`,
       );
     if (this.inFlight.has(p.id)) throw new ApiError("conflict", 409, "entity is busy");
+    if (p.amount <= 0n) throw new ApiError("validation_error", 400, "amount must be positive");
+    if (p.amount > this.deps.fundCaps.perCall)
+      throw new ApiError("limit_exceeded", 400, "amount exceeds the max treasury fund per call");
+    const funded = this.deps.repo.sumFundedByTenant(p.tenantId);
+    if (funded + p.amount > this.deps.fundCaps.perTenantTotal)
+      throw new ApiError("limit_exceeded", 400, "tenant treasury funding quota exhausted");
     const spec = JSON.parse(rec.specJson ?? "{}") as AgentSpec;
     this.run(p.id, () =>
       this.deps.runSaga({

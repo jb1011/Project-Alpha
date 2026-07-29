@@ -25,6 +25,7 @@ import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { runOnboarding } from "../../src/workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../../src/workflow/runner";
 import { type AnvilHandle, startAnvil } from "../helpers/anvil";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 import { deployStack } from "../helpers/stack";
 import { startMcpTestClient } from "./helpers";
 
@@ -147,7 +148,7 @@ beforeEach(() => {
       signerForEntity,
     });
 
-  runner = new OnboardingRunner({ repo, runSaga });
+  runner = new OnboardingRunner({ repo, runSaga, fundCaps: TEST_FUND_CAPS });
   app = buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),
@@ -203,7 +204,8 @@ function repoSeed(tenantId: string, userKey: string) {
 
 test("end-to-end: mint key, store passkey, onboard_agent, poll get_entity to bound", async () => {
   const passkeyId = passkeys.store(TENANT, VALID_PASSKEY);
-  const { key } = apiKeys.mint(TENANT);
+  // onboard_agent requires the "provision" capability (S1).
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(app, key);
   try {
     const start = await client.callTool({

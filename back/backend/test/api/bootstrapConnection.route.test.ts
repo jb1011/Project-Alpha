@@ -12,6 +12,7 @@ import { SqliteLinkCodeStore } from "../../src/persistence/linkCodeStore";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import type { EntityRecord } from "../../src/types";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 
 const account = privateKeyToAccount(
   "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
@@ -44,7 +45,7 @@ function makeApp() {
     repo.upsert(bound);
     return bound;
   };
-  const runner = new OnboardingRunner({ repo, runSaga });
+  const runner = new OnboardingRunner({ repo, runSaga, fundCaps: TEST_FUND_CAPS });
   const app = buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),
@@ -147,6 +148,38 @@ test("404 (uniform) when the passkey is not owned by the caller, and no key is m
   }
   // nothing was minted for the failed attempts
   expect(db.prepare("SELECT COUNT(*) AS n FROM api_keys").get()).toMatchObject({ n: 0 });
+});
+
+test("mints a tenant-wide bootstrap package with explicit capability:'provision'", async () => {
+  const { app } = makeApp();
+  const jwt = await login(app);
+  const passkeyId = passkeys.store(account.address, VALID_PASSKEY);
+
+  const res = await app.request("/bootstrap-connection", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}`, "content-type": "application/json" },
+    body: JSON.stringify({ passkeyId, capability: "provision" }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.capability).toBe("provision");
+  expect(apiKeys.verify(body.apiKey)).toMatchObject({
+    tenantId: account.address,
+    entityId: null,
+    capability: "provision",
+  });
+});
+
+test("unknown capability → 400 (zod)", async () => {
+  const { app } = makeApp();
+  const jwt = await login(app);
+  const passkeyId = passkeys.store(account.address, VALID_PASSKEY);
+  const res = await app.request("/bootstrap-connection", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}`, "content-type": "application/json" },
+    body: JSON.stringify({ passkeyId, capability: "admin" }),
+  });
+  expect(res.status).toBe(400);
 });
 
 test("401 without an Authorization header", async () => {

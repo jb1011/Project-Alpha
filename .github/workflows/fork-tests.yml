@@ -1,0 +1,61 @@
+name: Fork tests
+
+# The live-registry fork tests depend on a public RPC and fork the LATEST block, so an
+# RPC hiccup or registry change can red a run through no fault of the PR. They therefore
+# run on a nightly schedule (drift is caught within a day) instead of blocking every CI
+# run — reviewer call on PR #37. Exceptions: manual dispatch, and PRs that touch the fork
+# tests or this workflow itself (those need the signal on the PR).
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly, off the on-the-hour congestion window
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "back/test/IdentityRegistryFork.t.sol"
+      - ".github/workflows/fork-tests.yml"
+
+concurrency:
+  group: fork-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same pins as ci.yml (deps are gitignored, installed pinned; see back/README.md).
+  FORGE_STD_VERSION: v1.16.1
+  OZ_VERSION: v5.1.0
+
+jobs:
+  fork-tests:
+    name: Fork tests (live Arc registry)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: back
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Cache foundry deps
+        uses: actions/cache@v4
+        with:
+          path: back/lib
+          key: foundry-lib-${{ env.FORGE_STD_VERSION }}-${{ env.OZ_VERSION }}
+
+      - name: Install pinned deps (mirrors back/README.md; lib/ is gitignored)
+        run: |
+          [ -d lib/forge-std ] || forge install foundry-rs/forge-std@${{ env.FORGE_STD_VERSION }} --no-git
+          [ -d lib/openzeppelin-contracts ] || forge install OpenZeppelin/openzeppelin-contracts@${{ env.OZ_VERSION }} --no-git
+          [ -d lib/openzeppelin-contracts-upgradeable ] || forge install OpenZeppelin/openzeppelin-contracts-upgradeable@${{ env.OZ_VERSION }} --no-git
+
+      - name: Fork tests (live Arc registry)
+        run: forge test --match-contract IdentityRegistryForkTest -vv
+        env:
+          # The live registry's deployed bytecode uses PUSH0; the project pin stays paris
+          # (Arc deploy note), so the fork tests get their own shanghai run. The RPC URL is
+          # the public endpoint already in .env.example — plain env, not a secret; the
+          # tests self-skip anywhere it is absent.
+          FOUNDRY_EVM_VERSION: shanghai
+          ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.network
+          # Tripwire: fail this step instead of silently skipping if the env above is ever dropped.
+          FORK_TESTS_REQUIRED: "1"

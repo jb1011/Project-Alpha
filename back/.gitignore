@@ -21,6 +21,7 @@ broadcast/
 # Foundry
 forge-cache/
 lib/
+/lib
 
 # Local Claude settings
 .claude/settings.local.json

@@ -195,6 +195,32 @@ export class ArcAdapter {
     return txHash;
   }
 
+  /** Set an on-chain metadata key/value on the agent NFT (manager-gated: owner-or-approved).
+   *  ENSIP-25 uses key "ens" carrying the UTF-8 bytes of the agent's ENS name — the reverse half of
+   *  the bidirectional binding (the ENS name's agent-registration record is the forward half). */
+  async setAgentMetadata(agentId: bigint, key: string, value: Hex): Promise<Hex> {
+    const { request } = await this.d.publicClient.simulateContract({
+      address: this.d.identityRegistry,
+      abi: iIdentityRegistryAbi,
+      functionName: "setMetadata",
+      args: [agentId, key, value],
+      account: this.d.managerWallet.account!,
+    });
+    const txHash = await this.d.managerWallet.writeContract(request);
+    await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    return txHash;
+  }
+
+  /** Read an on-chain metadata value (ENSIP-25 verifier side): bytes for key on the agent NFT. */
+  getAgentMetadata(agentId: bigint, key: string): Promise<Hex> {
+    return this.d.publicClient.readContract({
+      address: this.d.identityRegistry,
+      abi: iIdentityRegistryAbi,
+      functionName: "getMetadata",
+      args: [agentId, key],
+    }) as Promise<Hex>;
+  }
+
   /** Schedule a treasury policy change (manager-gated, timelocked). Returns the on-chain tx hash. */
   async schedulePolicyUpdate(
     treasury: Address,

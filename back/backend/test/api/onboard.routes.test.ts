@@ -9,6 +9,7 @@ import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import type { EntityRecord } from "../../src/types";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 
 const account = privateKeyToAccount(
   "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
@@ -32,7 +33,7 @@ function makeApp(opts?: {
     repo.upsert(bound);
     return bound;
   };
-  const runner = new OnboardingRunner({ repo, runSaga });
+  const runner = new OnboardingRunner({ repo, runSaga, fundCaps: TEST_FUND_CAPS });
   const app = buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),
@@ -343,6 +344,30 @@ test("fund-pocket surfaces a thrown pocketFunding error as a 502", async () => {
   });
   expect(res.status).toBe(502);
   expect((await res.json()).error.message).toBe("insufficient treasury available");
+});
+
+test("POST /entities/:id/fund rejects an amount over the per-call cap (S1 ceiling, 400 limit_exceeded)", async () => {
+  const { app, runner } = makeApp();
+  const token = await login(app);
+  const { id } = await (
+    await app.request("/onboard", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ spec: validSpec, guardianPasskey: passkey }),
+    })
+  ).json();
+  await runner.settled(); // let onboarding reach "bound" so fund() passes the status check
+
+  // TEST_FUND_CAPS.perCall is 25 USDC (25_000_000 atomic) — one unit over must be rejected.
+  const res = await app.request(`/entities/${encodeURIComponent(id)}/fund`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ amount: "25000001" }),
+  });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.error.code).toBe("limit_exceeded");
+  expect(body.error.message).toBe("amount exceeds the max treasury fund per call");
 });
 
 test("GET /passkey/challenge requires auth and returns a challenge + rpId", async () => {

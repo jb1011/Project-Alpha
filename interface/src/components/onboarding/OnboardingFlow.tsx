@@ -27,6 +27,7 @@ import {
   type PersistedOnboarding,
 } from "@/lib/onboarding/storage";
 import { WelcomeStep } from "./steps/WelcomeStep";
+import { GuardianStep } from "./steps/GuardianStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
 import { DeployStep } from "./steps/DeployStep";
@@ -214,14 +215,20 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 onPasskey={(guardianPasskey) =>
                   setSession((s) => ({ ...s, guardianPasskey }))
                 }
-                onComplete={() => completePhase("welcome", "configure")}
+                onComplete={() => completePhase("welcome", "guardian")}
+              />
+            )}
+            {phase === "guardian" && (
+              <GuardianStep
+                onBack={() => goTo("welcome")}
+                onComplete={() => completePhase("guardian", "configure")}
               />
             )}
             {phase === "configure" && (
               <ConfigureStep
                 config={config}
                 onChange={setConfig}
-                onBack={() => goTo("welcome")}
+                onBack={() => goTo("guardian")}
                 onComplete={() => completePhase("configure", "agreement")}
               />
             )}

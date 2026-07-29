@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
+import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
@@ -22,6 +23,7 @@ import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
+import { SqliteWorldStore } from "../persistence/worldStore";
 import { usdToUnits } from "../policy/units";
 import type { Address } from "../types";
 import { runOnboarding } from "../workflow/onboarding";
@@ -105,6 +107,7 @@ async function main() {
       operatorSigner,
       usdc: cfg.usdc,
       metadataBaseUrl: cfg.metadataBaseUrl,
+      ensParentName: cfg.ens?.parentName,
       ownerTenantId: i.tenantId,
       specJson: i.specJson,
       fundAmount: i.fundAmount,
@@ -113,7 +116,11 @@ async function main() {
       signerForEntity,
     });
 
-  const runner = new OnboardingRunner({ repo, runSaga });
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
+  });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
 
@@ -122,8 +129,67 @@ async function main() {
   if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
 
   const x402Demo = buildX402DemoDeps(cfg);
+  // World gate on the demo seller: authorize human-backed agents (AgentBook on World Chain)
+  // before requiring payment. Settlement stays on Arc, untouched.
+  if (x402Demo && cfg.worldChain) {
+    const host = new URL(x402Demo.resourceUrl).hostname;
+    x402Demo.agentkit = {
+      domain: host,
+      resourceUrl: x402Demo.resourceUrl,
+      network: x402Demo.network,
+      store: new SqliteWorldStore(db),
+      allowancePerHuman: cfg.worldChain.allowancePerHuman,
+      worldChainRpc: cfg.worldChain.rpcUrl,
+      agentBookAddress: cfg.worldChain.agentBook,
+      rpcUrls: { [x402Demo.network]: cfg.rpcUrl },
+      rateWindowMs: (cfg.worldRateWindowHours ?? 24) * 3_600_000,
+    };
+    x402Demo.trustPolicy = cfg.x402TrustPolicy ?? "open";
+    x402Demo.proofAgentKey = cfg.x402ProofAgentKey;
+    if (x402Demo.trustPolicy === "accountable-only")
+      console.warn("⚠ x402 seller policy: ACCOUNTABLE-ONLY — anonymous agents are refused (403)");
+  }
   if (x402Demo)
     console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);
+
+  const ens = cfg.ens
+    ? {
+        signer: privateKeyToAccount(cfg.ens.signerKey),
+        parentName: cfg.ens.parentName,
+        metadataBaseUrl: cfg.metadataBaseUrl,
+        identityRegistry: cfg.identityRegistry,
+        chainId: cfg.chainId,
+        resolverAddress: cfg.ens.resolverAddress,
+        labelAliases: cfg.ens.labelAliases,
+      }
+    : undefined;
+  if (ens) console.warn(`⚠ ENS gateway ENABLED at /ensgateway (parent ${ens.parentName})`);
+
+  const worldStore = new SqliteWorldStore(db);
+  const worldId = cfg.world
+    ? {
+        cfg: {
+          appId: cfg.world.appId,
+          rpId: cfg.world.rpId,
+          rpSigningKey: cfg.world.rpSigningKey,
+          action: cfg.world.action,
+          environment: cfg.world.environment,
+          attestAction: cfg.world.attestAction,
+        },
+        store: worldStore,
+        maxEntitiesPerHuman: cfg.world.maxEntitiesPerHuman,
+        attestMinAge: cfg.world.attestMinAge,
+        requireGuardian: cfg.world.requireGuardian,
+      }
+    : undefined;
+  if (worldId)
+    console.warn(
+      `⚠ World ID guardian gate ENABLED (action ${worldId.cfg.action}, env ${worldId.cfg.environment}, enforce=${worldId.requireGuardian})`,
+    );
+  if (worldId?.cfg.attestAction)
+    console.warn(
+      `⚠ Identity attestation step-up ENABLED (action ${worldId.cfg.attestAction}, min age ${worldId.attestMinAge})`,
+    );
 
   const app = buildApiApp({
     webOrigin: cfg.webOrigin,
@@ -153,6 +219,8 @@ async function main() {
     payments,
     pocketFunding,
     x402Demo,
+    ens,
+    worldId,
     standingExposure,
   });
 

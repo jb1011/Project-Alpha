@@ -149,3 +149,39 @@ test("perTxCap defaults to null when not provided (backward compat)", () => {
   const got = repo.findByIdempotencyKey("key-1");
   expect(got?.perTxCap).toBeNull();
 });
+
+test("sumFundedByTenant sums only funded fundTreasury events for the target tenant", () => {
+  const TENANT_A = "0x000000000000000000000000000000000000aAaa";
+  const TENANT_B = "0x000000000000000000000000000000000000bBbb";
+
+  // Tenant A, entity 1: two successful funds.
+  repo.upsert(record({ idempotencyKey: "a-1", ownerTenantId: TENANT_A }));
+  repo.recordEvent("a-1", "fundTreasury", "funded", "0x1", JSON.stringify({ amount: "2000000" }));
+  repo.recordEvent("a-1", "fundTreasury", "funded", "0x2", JSON.stringify({ amount: "1000000" }));
+
+  // Tenant A, entity 2: one successful fund — same tenant, different entity, must be included.
+  repo.upsert(record({ idempotencyKey: "a-2", ownerTenantId: TENANT_A }));
+  repo.recordEvent("a-2", "fundTreasury", "funded", "0x3", JSON.stringify({ amount: "500000" }));
+
+  // Tenant B, entity 1: a successful fund that must NOT leak into tenant A's total.
+  repo.upsert(record({ idempotencyKey: "b-1", ownerTenantId: TENANT_B }));
+  repo.recordEvent("b-1", "fundTreasury", "funded", "0x4", JSON.stringify({ amount: "9000000" }));
+
+  expect(repo.sumFundedByTenant(TENANT_A)).toBe(3_500_000n);
+  expect(repo.sumFundedByTenant(TENANT_B)).toBe(9_000_000n);
+});
+
+test("sumFundedByTenant ignores non-funded status and non-fundTreasury steps", () => {
+  const TENANT_A = "0x000000000000000000000000000000000000aAaa";
+  repo.upsert(record({ idempotencyKey: "a-1", ownerTenantId: TENANT_A }));
+  // A failed fund attempt (no successful on-chain tx) must not count toward the quota.
+  repo.recordEvent("a-1", "fundTreasury", "failed", null, JSON.stringify({ amount: "2000000" }));
+  // A different step name, even if its detail also carries an "amount" key, must not count.
+  repo.recordEvent("a-1", "createEntity", "funded", "0x1", JSON.stringify({ amount: "7000000" }));
+
+  expect(repo.sumFundedByTenant(TENANT_A)).toBe(0n);
+});
+
+test("sumFundedByTenant returns 0 for a tenant with no entities/events", () => {
+  expect(repo.sumFundedByTenant("0x000000000000000000000000000000000000cCcc")).toBe(0n);
+});

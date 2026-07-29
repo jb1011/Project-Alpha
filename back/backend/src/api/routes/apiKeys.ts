@@ -1,18 +1,24 @@
 import type { Hono } from "hono";
+import { z } from "zod";
 import type { AuthVars } from "../../auth/middleware";
 import type { ApiDeps } from "../app";
 
+const BodySchema = z.object({
+  label: z.string().optional(),
+  capability: z.enum(["read", "earn", "spend", "provision"]).default("spend"),
+});
+
 export function mountApiKeyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   app.post("/api-keys", async (c) => {
-    let body: { label?: unknown } = {};
+    let raw: unknown = {};
     try {
-      body = await c.req.json();
+      raw = await c.req.json();
     } catch {
-      body = {};
+      raw = {};
     }
-    const label = typeof body.label === "string" ? body.label : undefined;
-    const { id, key } = deps.apiKeys.mint(c.get("tenantId"), { label });
-    return c.json({ id, key, label: label ?? null }, 201);
+    const { label, capability } = BodySchema.parse(raw);
+    const { id, key } = deps.apiKeys.mint(c.get("tenantId"), { label, capability });
+    return c.json({ id, key, label: label ?? null, capability }, 201);
   });
 
   app.get("/api-keys", (c) => c.json(deps.apiKeys.list(c.get("tenantId"))));

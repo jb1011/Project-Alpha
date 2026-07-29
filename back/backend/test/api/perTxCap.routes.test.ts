@@ -10,6 +10,7 @@ import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { OnboardingRunner } from "../../src/workflow/runner";
+import { TEST_FUND_CAPS } from "../helpers/fundCaps";
 
 const account = privateKeyToAccount(
   "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
@@ -27,6 +28,7 @@ function makeApp() {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
   });
   return buildApiApp({
     webOrigin: "*",

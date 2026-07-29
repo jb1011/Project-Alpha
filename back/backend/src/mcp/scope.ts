@@ -1,8 +1,8 @@
 import type { Capability } from "../persistence/apiKeyStore";
 
-const LEVEL: Record<Capability, number> = { read: 0, earn: 1, spend: 2 };
+const LEVEL: Record<Capability, number> = { read: 0, earn: 1, spend: 2, provision: 3 };
 
-/** A key's capability grants that action and all lower ones (read < earn < spend). */
+/** A key's capability grants that action and all lower ones (read < earn < spend < provision). */
 export function hasCapability(scope: { capability: Capability }, needed: Capability): boolean {
   return LEVEL[scope.capability] >= LEVEL[needed];
 }

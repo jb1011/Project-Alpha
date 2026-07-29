@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Address } from "viem";
+import { type Address, hexToString, toHex } from "viem";
 import type { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { buildWalletSetTypedData } from "../adapters/arc/walletSet";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
@@ -31,6 +31,10 @@ export interface OnboardingDeps {
    *  (default localhost) so the existing saga tests compile untouched; the REAL callers (main.ts
    *  runSaga + cli create-entity) always pass the prod-guarded cfg.metadataBaseUrl. */
   metadataBaseUrl?: string;
+  /** ENS parent name (e.g. "novicorpus.eth"). When set, the saga writes the ENSIP-25 reverse
+   *  binding (setMetadata(agentId,"ens","<publicId>.<parent>")) so the registry points back at the
+   *  agent's ENS name. Optional + non-fatal — absent leaves onboarding unchanged. */
+  ensParentName?: string;
   /** Owning tenant (controller wallet address); persisted on every record the saga writes. */
   ownerTenantId?: string;
   /** Validated AgentSpec JSON; persisted so the reconciler/fund can re-run the saga. */
@@ -310,6 +314,30 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         JSON.stringify({ amount: d.fundAmount?.toString() }),
       );
     });
+  }
+
+  // ── Step 8 (optional): ENSIP-25 reverse binding. Write the agent's ENS name onto the registry
+  //    (getMetadata(agentId,"ens")) so it points back at <publicId>.<parent> — the reverse half of
+  //    the bidirectional binding. Non-fatal and idempotent (skipped if already set); a failure here
+  //    never blocks onboarding. Runs on every pass once agentId + publicId exist (resume-safe).
+  if (d.ensParentName && rec.agentId && rec.publicId) {
+    const ensName = `${rec.publicId}.${d.ensParentName}`;
+    try {
+      const current = await d.arc.getAgentMetadata(BigInt(rec.agentId), "ens");
+      const already = current !== "0x" && hexToString(current) === ensName;
+      if (!already) {
+        const tx = await d.arc.setAgentMetadata(BigInt(rec.agentId), "ens", toHex(ensName));
+        d.repo.recordEvent(key, "setEnsMetadata", rec.status, tx, JSON.stringify({ ens: ensName }));
+      }
+    } catch (e) {
+      d.repo.recordEvent(
+        key,
+        "setEnsMetadata",
+        rec.status,
+        null,
+        `ens binding skipped: ${(e as Error).message}`,
+      );
+    }
   }
 
   return rec;

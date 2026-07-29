@@ -6,6 +6,7 @@ import { AgentSpecSchema } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 import { toEntityView } from "../views";
+import { assertGuardianAllowed } from "./worldId";
 
 export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   app.post("/onboard", async (c) => {
@@ -18,6 +19,11 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     }
     if (!body.guardianPasskey || typeof body.guardianPasskey !== "object")
       throw new ApiError("validation_error", 400, "guardianPasskey is required");
+
+    // Proof-of-personhood gate: the guardian is the legally accountable natural person, so when
+    // enforcement is on they must be a World-ID-verified unique human under the per-human cap.
+    // No-op when World isn't configured / WORLD_REQUIRE_GUARDIAN is false.
+    assertGuardianAllowed(deps.worldId, tenantId);
 
     // Server owns the guardian + manager: force guardian to the authenticated tenant and manager
     // to the platform manager address before validation (audit fix C — the caller can't discover

@@ -2,8 +2,10 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
 import {
+  entityAgentBook,
   getEntity,
   getEntityRuns,
   getEntityTreasury,
@@ -35,6 +37,11 @@ export function AgentDashboard({
   const [runs, setRuns] = React.useState<AgentRun[]>([]);
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [pausing, setPausing] = React.useState(false);
+  const [agentBook, setAgentBook] = React.useState<{
+    registered: boolean;
+    humanId?: string;
+    register?: string;
+  } | null>(null);
   const [pauseError, setPauseError] = React.useState<string | null>(null);
 
   const ensureSessionRef = React.useRef(ensureSession);
@@ -71,6 +78,23 @@ export function AgentDashboard({
       clearInterval(h);
     };
   }, [refresh]);
+
+  // AgentBook standing — once, not on the poll (it's a World Chain read behind a cache).
+  React.useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const auth = await ensureSessionRef.current();
+        const ab = await entityAgentBook(auth.token, entityId);
+        if (live) setAgentBook(ab);
+      } catch {
+        /* 404 when AgentBook reads aren't configured — chip simply doesn't render */
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [entityId]);
 
   const paused = treasury?.paused ?? false;
   const balanceUsdc = treasury ? Number(treasury.usdcBalance) / 1e6 : null;
@@ -156,19 +180,65 @@ export function AgentDashboard({
             .
           </p>
         </div>
-        {onRestart && (
-          <button
-            onClick={onRestart}
-            className="text-[12.5px] text-muted-2 underline-offset-2 hover:text-ink hover:underline"
-          >
-            Reset onboarding
-          </button>
-        )}
+        <div className="flex items-center gap-4">
+          <AgentTabs entityId={entityId} active="dashboard" />
+          {onRestart && (
+            <button
+              onClick={onRestart}
+              className="text-[12.5px] text-muted-2 underline-offset-2 hover:text-ink hover:underline"
+            >
+              Reset onboarding
+            </button>
+          )}
+        </div>
       </div>
 
       {entity && (
         <Card className="mt-6 p-5">
-          <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">On-chain identity</div>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">
+              On-chain identity
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+            {agentBook && (
+              <span
+                title={
+                  agentBook.registered
+                    ? `AgentBook (World Chain): human ${agentBook.humanId?.slice(0, 14)}… answers for this agent's wallet`
+                    : agentBook.register
+                }
+                className={
+                  agentBook.registered
+                    ? "inline-flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1.5 text-[11.5px] text-emerald-300"
+                    : "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-muted-2"
+                }
+              >
+                <span
+                  aria-hidden
+                  className={
+                    agentBook.registered
+                      ? "h-1.5 w-1.5 rounded-full bg-emerald-300"
+                      : "h-1.5 w-1.5 rounded-full border border-muted-2"
+                  }
+                />
+                {agentBook.registered ? "AgentBook · human-backed" : "AgentBook · not registered"}
+              </span>
+            )}
+            {ensName(entity) && (
+              <a
+                href={`https://sepolia.app.ens.domains/${ensName(entity)}`}
+                target="_blank"
+                rel="noreferrer"
+                title="Resolve this agent in any ENS client — addr, legal status, registration"
+                className="group inline-flex max-w-full items-center gap-2 rounded-full border border-accent/30 bg-accent/[0.07] px-3 py-1.5 font-mono text-[12px] text-accent-soft transition-colors hover:bg-accent/[0.14] hover:text-ink"
+              >
+                <EnsGlobe className="h-3.5 w-3.5 shrink-0 opacity-80" />
+                <span className="truncate">{ensName(entity)}</span>
+                <span aria-hidden className="text-[10px] opacity-70">↗</span>
+              </a>
+            )}
+            </div>
+          </div>
           <dl className="mt-4 grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
             {entity.agentId && <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />}
             {entity.treasury && (
@@ -415,6 +485,26 @@ function RunRow({ run }: { run: AgentRun }) {
 function shortenErr(msg: string): string {
   const first = msg.split("\n")[0]?.trim() ?? "Transaction failed.";
   return first.length > 140 ? `${first.slice(0, 140)}…` : first;
+}
+
+/** `<publicId>.novicorpus.eth` — the wildcard gateway resolves any entity by its publicId label.
+ *  The view doesn't carry publicId, but the public metadataURI ends with it. file:// legacy
+ *  agents predate the ENS integration and simply don't get a name shown. */
+function ensName(entity: { metadataURI: string | null }): string | null {
+  const uri = entity.metadataURI;
+  if (!uri || !/^https?:\/\//.test(uri)) return null;
+  const label = uri.split("/").filter(Boolean).pop();
+  return label ? `${label.toLowerCase()}.novicorpus.eth` : null;
+}
+
+function EnsGlobe({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.4" />
+      <ellipse cx="12" cy="12" rx="4.2" ry="9" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M3.6 9.5h16.8M3.6 14.5h16.8" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  );
 }
 
 function OnChainRow({ label, value, href }: { label: string; value: string; href?: string }) {

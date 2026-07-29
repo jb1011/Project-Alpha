@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { hexToString } from "viem";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
+import { assertGuardianAllowed } from "../api/routes/worldId";
 import { toEntityView } from "../api/views";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
@@ -37,16 +39,31 @@ export interface McpToolDeps {
   maxJobBudget: bigint;
   maxInflightJobsPerTenant: number;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
+  /** Arc adapter — live legal-status + ENSIP-25 reverse-binding reads for resolve_agent. Optional. */
+  arc?: import("../adapters/arc/arcAdapter").ArcAdapter;
+  /** ENS config for resolve_agent (parent name + registry for the ENSIP-25 verdict). Optional. */
+  ens?: {
+    parentName: string;
+    identityRegistry: string;
+    chainId: number;
+    /** Vanity label -> publicId, same map the CCIP gateway uses. */
+    labelAliases?: Record<string, string>;
+  };
+  /** World ID guardian gate (mirrors the REST /onboard gate). Optional. */
+  worldId?: import("../api/routes/worldId").WorldIdDeps;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
 export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
   // The ACTING tools (fund_treasury/onboard_agent) enforce capability + entity scope, on top of the
-  // tenant isolation shared by every tool below: fund_treasury requires "spend" capability and
-  // `entityInScope`; onboard_agent requires "spend" capability AND a tenant-wide key (entityId ===
-  // null), since it creates a new entity rather than acting on an existing one. The read tools
-  // (get_job/list_jobs) enforce entityInScope. The P2a prerequisite (gate the acting tools before the
-  // mint surface issues scoped keys) is resolved. See
+  // tenant isolation shared by every tool below: fund_treasury requires "provision" capability and
+  // `entityInScope`; onboard_agent requires "provision" capability AND a tenant-wide key (entityId ===
+  // null), since it creates a new entity rather than acting on an existing one. "provision" is the top
+  // rung of the capability ladder (read < earn < spend < provision) — these two tools move PLATFORM
+  // funds / provision platform resources, a strictly higher privilege than "spend" (which only moves an
+  // entity's own treasury funds). See back/docs/design/2026-07-20-s1-fund-treasury-authorization.md.
+  // The read tools (get_job/list_jobs) enforce entityInScope. The P2a prerequisite (gate the acting
+  // tools before the mint surface issues scoped keys) is resolved. See
   // back/docs/plans/2026-07-02-byoa-p2a-scope-and-reads.md.
   const tenantId = scope.tenantId;
   const { repo, runner } = deps;
@@ -127,6 +144,76 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
+    },
+  );
+
+  // Public verification: resolve any Novi Corpus agent by its ENS name and run the ENSIP-25
+  // bidirectional check. Returns public data only (same as the ENS gateway serves), so no
+  // capability/scope gate — a counterparty verifies an agent it does not own.
+  server.registerTool(
+    "resolve_agent",
+    {
+      title: "Resolve & verify an agent by ENS name",
+      description:
+        "Given a <publicId>.novicorpus.eth name, resolve the agent's public identity and run the ENSIP-25 bidirectional verification (ENS name <-> ERC-8004 registry on Arc): treasury, live legal status, and a verified verdict. Public data only; works for any Novi Corpus agent.",
+      inputSchema: { name: z.string() },
+    },
+    async ({ name }) => {
+      if (!deps.ens)
+        return { content: [{ type: "text", text: "ENS not configured" }], isError: true };
+      const suffix = `.${deps.ens.parentName}`.toLowerCase();
+      const lname = name.toLowerCase();
+      const label = lname.endsWith(suffix) ? lname.slice(0, lname.length - suffix.length) : lname;
+      // Resolve vanity aliases exactly as the CCIP gateway does, or the two disagree.
+      const aliases = deps.ens.labelAliases;
+      const publicId =
+        aliases && Object.hasOwn(aliases, label) ? (aliases[label] as string) : label;
+      const rec = repo.findByPublicId(publicId);
+      if (!rec)
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ name, resolved: false, reason: "unknown agent" }),
+            },
+          ],
+        };
+
+      let legalStatus = "unknown";
+      let reverseName = "";
+      let reverseVerified = false;
+      if (deps.arc && rec.agentId) {
+        try {
+          const [status, paused] = await Promise.all([
+            rec.proxy ? deps.arc.legalStatus(rec.proxy) : Promise.resolve(0),
+            rec.treasury ? deps.arc.treasuryPaused(rec.treasury) : Promise.resolve(false),
+          ]);
+          legalStatus = status === 0 && !paused ? "Active" : "Suspended";
+          const meta = await deps.arc.getAgentMetadata(BigInt(rec.agentId), "ens");
+          reverseName = meta === "0x" ? "" : hexToString(meta);
+          // Compare against the fully-qualified name: callers may pass a bare label, and the
+          // on-chain record always stores `<label>.<parent>`.
+          reverseVerified = reverseName.toLowerCase() === `${label}${suffix}`;
+        } catch {
+          // Degraded (Arc RPC issue): leave legalStatus "unknown" and reverse unverified.
+        }
+      }
+
+      const verdict = {
+        name,
+        resolved: true,
+        treasury: rec.treasury,
+        operator: rec.operator,
+        agentId: rec.agentId,
+        legalStatus,
+        registry: `eip155:${deps.ens.chainId}:${deps.ens.identityRegistry}`,
+        ensip25: { forward: rec.agentId ? "1" : "", reverseName, reverseVerified },
+        verified: Boolean(rec.treasury) && reverseVerified,
+        note: reverseVerified
+          ? "Bidirectional ENSIP-25 binding confirmed on-chain."
+          : "Reverse binding not yet written on-chain (setMetadata(agentId,'ens',...)).",
+      };
+      return { content: [{ type: "text", text: JSON.stringify(verdict) }] };
     },
   );
 
@@ -329,16 +416,30 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "fund_treasury",
     {
       title: "Fund treasury",
-      description: "Fund a bound entity's treasury with atomic USDC (6 decimals).",
+      description:
+        "Fund a bound entity's treasury with atomic USDC (6 decimals), from the PLATFORM wallet. " +
+        "Requires the provision capability.",
       inputSchema: { id: z.string(), amount: z.string() },
     },
     async ({ id, amount }) => {
-      if (!hasCapability(scope, "spend"))
+      if (!hasCapability(scope, "provision"))
         return { content: [{ type: "text", text: "not found" }], isError: true };
       if (!entityInScope(scope, id))
         return { content: [{ type: "text", text: "not found" }], isError: true };
+      // Same decimal-integer + positive validation as `pay`/`fund_pocket` (atomic USDC, 6 decimals).
+      // Rejects hex ("0x10") and a negative amount before it ever reaches runner.fund.
+      if (!/^-?\d+$/.test(amount))
+        return { content: [{ type: "text", text: "invalid amount" }], isError: true };
+      let parsedAmount: bigint;
       try {
-        const { id: outId, status } = runner.fund({ id, tenantId, amount: BigInt(amount) });
+        parsedAmount = BigInt(amount);
+      } catch {
+        return { content: [{ type: "text", text: "invalid amount" }], isError: true };
+      }
+      if (parsedAmount <= 0n)
+        return { content: [{ type: "text", text: "amount must be positive" }], isError: true };
+      try {
+        const { id: outId, status } = runner.fund({ id, tenantId, amount: parsedAmount });
         return { content: [{ type: "text", text: JSON.stringify({ id: outId, status }) }] };
       } catch (e) {
         return { content: [{ type: "text", text: (e as Error).message }], isError: true };
@@ -355,7 +456,8 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         "automatically to your tenant and the manager is set automatically to the platform " +
         "manager account — you don't need to know or supply either. passkeyId references a " +
         "previously stored guardian passkey (POST /passkey). Returns immediately with status " +
-        "'pending' — poll get_entity until 'bound'.",
+        "'pending' — poll get_entity until 'bound'. Requires the provision capability and a " +
+        "tenant-wide key.",
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
@@ -363,12 +465,15 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       },
     },
     async ({ spec, passkeyId, idempotencyKey }) => {
-      if (!hasCapability(scope, "spend") || scope.entityId !== null)
+      if (!hasCapability(scope, "provision") || scope.entityId !== null)
         return { content: [{ type: "text", text: "not authorized" }], isError: true };
       const passkey = deps.passkeys.get(tenantId, passkeyId);
       if (!passkey)
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
       try {
+        // Mirror of the REST gate: when World enforcement is on, the guardian must be a
+        // World-ID-verified unique human under the per-human entity cap.
+        assertGuardianAllowed(deps.worldId, tenantId);
         const raw = spec as Record<string, unknown>;
         const roles = {
           ...((raw.roles as object) ?? {}),
