@@ -1,0 +1,15 @@
+{
+  "name": "novi-corpus-arc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Novi Corpus subgraph — agent legal bodies + governed treasuries on Arc testnet",
+  "scripts": {
+    "codegen": "graph codegen",
+    "build": "graph build",
+    "deploy": "graph deploy novi-corpus-arc"
+  },
+  "dependencies": {
+    "@graphprotocol/graph-cli": "0.98.1",
+    "@graphprotocol/graph-ts": "0.38.2"
+  }
+}

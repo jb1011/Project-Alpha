@@ -101,7 +101,7 @@
     <div class="kicker">Novi Corpus · Agent Legal Body Platform</div>
     <h1>V2 Roadmap</h1>
     <div class="sub">Product &amp; Hardening Plan — audited against the live codebase</div>
-    <div class="meta">Version 2.1 &nbsp;·&nbsp; July 2026 &nbsp;·&nbsp; incorporates the 2026-07-05 four-track security audit</div>
+    <div class="meta">Version 2.2 &nbsp;·&nbsp; July 2026 &nbsp;·&nbsp; incorporates the 2026-07-05 four-track security audit; S2 full-fix folded into the Tier 0 smart-account migration (2026-07-20)</div>
 
     <p class="lede">Novi Corpus gives AI agents a real legal body: a Wyoming DAO LLC wrapped around a governed
     on-chain USDC treasury on Arc, with a human always holding the brake. V1 proved the full agent lifecycle
@@ -157,9 +157,15 @@
       and moves funds to the operator's hot EOA before payment, so: the on-chain allowlist governs only direct
       <code>spend()</code> (which x402 never uses); there is <b>no on-chain per-tx cap</b> (only a period cap — the
       "on-chain per-tx + period caps" claim is inaccurate); and the guardian's <code>emergencyWithdraw</code>/
-      <code>pause</code> <b>cannot reach in-flight funds</b> on the operator/pocket/Gateway. <b>Fix:</b> the real
-      closer is treasury-direct signing (Tier 0 #6) — see its risk note; interim, minimize float and tighten the
-      operator bound.</div>
+      <code>pause</code> <b>cannot reach in-flight funds</b> on the operator/pocket/Gateway. (Precise: <code>fundOperator</code>
+      <em>is</em> bounded by the period cap + pause + legal-status; the gaps are the allowlist, a per-tx cap, and
+      in-flight clawback.) <b>Fix — two-part plan (decided 2026-07-20):</b> the <b>full close is an explicit
+      acceptance criterion of the Tier 0 smart-account migration (#2)</b> — a policy module on the operator
+      smart-account enforcing allowlist + per-tx cap on its own payments, or treasury-direct signing (#6). It is
+      <b>not</b> a free side effect of swapping wallet types; a plain wallet-type swap leaves S2 open. <b>Interim
+      now (this item):</b> make the hot-wallet exposure a hard, monitored ceiling (bound operator+pocket+Gateway
+      float to ~one payment) and correct the docs/UI implying the allowlist/per-tx cap cover x402 payments — no new
+      contract, no unverified-Arc dependency.</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">S3</div><div class="ic">
@@ -222,7 +228,11 @@
       <div class="audit"><b>⚑ Audit:</b> genuine complexity win on the gas plumbing, but it is an
       <em>invariant-neutral signing swap</em> — a Circle-controlled SCA is the same "bounded hot wallet" trust as
       today and does <em>not</em> by itself close the allowlist/cap gap (S2). Gated on unverified Circle
-      SCA/Gas-Station/ERC-1271 support on Arc.</div>
+      SCA/Gas-Station/ERC-1271 support on Arc.
+      <br><b>⚑ Carries the S2 close (decided 2026-07-20):</b> this migration MUST enforce the allowlist + per-tx cap
+      on the new operator smart-account's own payments (a policy module), or adopt treasury-direct signing (#6) —
+      <b>closing S2 is an explicit acceptance criterion of this item, not an optional side effect.</b> Until it
+      ships, S2 runs a bounded-risk interim (see Tier S · S2).</div>
     </div><div class="pri">🔴</div></div>
 
     <div class="item"><div class="rank">3</div><div class="ic">
@@ -263,7 +273,9 @@
       settles at the token contract (not via <code>spend()</code>), and a <code>view</code> <code>isValidSignature</code>
       cannot update the rolling-cap state atomically. It needs a <em>stateful</em> settlement design (nonce-gated
       entrypoint or a debiting 4337 validator), plus a redeployed treasury (collides with the immutable-treasury
-      migration item). Treat as design work, not a drop-in.</div>
+      migration item). Treat as design work, not a drop-in.
+      <br><b>⚑ This is the mechanism that satisfies #2's S2 acceptance criterion</b> — the operator smart-account
+      can host it (ERC-1271) or run a policy-module equivalent; until it ships, S2 runs a bounded interim (Tier S · S2).</div>
     </div><div class="pri">🟠</div></div>
 
     <div class="item"><div class="rank">7</div><div class="ic">

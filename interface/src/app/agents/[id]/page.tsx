@@ -14,7 +14,7 @@ export default function AgentDetailPage({
 
   return (
     <RequireAuth>
-      <AgentShell entityId={id}>
+      <AgentShell>
         <AgentDashboard entityId={decodeURIComponent(id)} />
       </AgentShell>
     </RequireAuth>

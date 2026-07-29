@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { hexToString } from "viem";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
+import { assertGuardianAllowed } from "../api/routes/worldId";
 import { toEntityView } from "../api/views";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
@@ -37,6 +39,18 @@ export interface McpToolDeps {
   maxJobBudget: bigint;
   maxInflightJobsPerTenant: number;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
+  /** Arc adapter — live legal-status + ENSIP-25 reverse-binding reads for resolve_agent. Optional. */
+  arc?: import("../adapters/arc/arcAdapter").ArcAdapter;
+  /** ENS config for resolve_agent (parent name + registry for the ENSIP-25 verdict). Optional. */
+  ens?: {
+    parentName: string;
+    identityRegistry: string;
+    chainId: number;
+    /** Vanity label -> publicId, same map the CCIP gateway uses. */
+    labelAliases?: Record<string, string>;
+  };
+  /** World ID guardian gate (mirrors the REST /onboard gate). Optional. */
+  worldId?: import("../api/routes/worldId").WorldIdDeps;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -130,6 +144,76 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
+    },
+  );
+
+  // Public verification: resolve any Novi Corpus agent by its ENS name and run the ENSIP-25
+  // bidirectional check. Returns public data only (same as the ENS gateway serves), so no
+  // capability/scope gate — a counterparty verifies an agent it does not own.
+  server.registerTool(
+    "resolve_agent",
+    {
+      title: "Resolve & verify an agent by ENS name",
+      description:
+        "Given a <publicId>.novicorpus.eth name, resolve the agent's public identity and run the ENSIP-25 bidirectional verification (ENS name <-> ERC-8004 registry on Arc): treasury, live legal status, and a verified verdict. Public data only; works for any Novi Corpus agent.",
+      inputSchema: { name: z.string() },
+    },
+    async ({ name }) => {
+      if (!deps.ens)
+        return { content: [{ type: "text", text: "ENS not configured" }], isError: true };
+      const suffix = `.${deps.ens.parentName}`.toLowerCase();
+      const lname = name.toLowerCase();
+      const label = lname.endsWith(suffix) ? lname.slice(0, lname.length - suffix.length) : lname;
+      // Resolve vanity aliases exactly as the CCIP gateway does, or the two disagree.
+      const aliases = deps.ens.labelAliases;
+      const publicId =
+        aliases && Object.hasOwn(aliases, label) ? (aliases[label] as string) : label;
+      const rec = repo.findByPublicId(publicId);
+      if (!rec)
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ name, resolved: false, reason: "unknown agent" }),
+            },
+          ],
+        };
+
+      let legalStatus = "unknown";
+      let reverseName = "";
+      let reverseVerified = false;
+      if (deps.arc && rec.agentId) {
+        try {
+          const [status, paused] = await Promise.all([
+            rec.proxy ? deps.arc.legalStatus(rec.proxy) : Promise.resolve(0),
+            rec.treasury ? deps.arc.treasuryPaused(rec.treasury) : Promise.resolve(false),
+          ]);
+          legalStatus = status === 0 && !paused ? "Active" : "Suspended";
+          const meta = await deps.arc.getAgentMetadata(BigInt(rec.agentId), "ens");
+          reverseName = meta === "0x" ? "" : hexToString(meta);
+          // Compare against the fully-qualified name: callers may pass a bare label, and the
+          // on-chain record always stores `<label>.<parent>`.
+          reverseVerified = reverseName.toLowerCase() === `${label}${suffix}`;
+        } catch {
+          // Degraded (Arc RPC issue): leave legalStatus "unknown" and reverse unverified.
+        }
+      }
+
+      const verdict = {
+        name,
+        resolved: true,
+        treasury: rec.treasury,
+        operator: rec.operator,
+        agentId: rec.agentId,
+        legalStatus,
+        registry: `eip155:${deps.ens.chainId}:${deps.ens.identityRegistry}`,
+        ensip25: { forward: rec.agentId ? "1" : "", reverseName, reverseVerified },
+        verified: Boolean(rec.treasury) && reverseVerified,
+        note: reverseVerified
+          ? "Bidirectional ENSIP-25 binding confirmed on-chain."
+          : "Reverse binding not yet written on-chain (setMetadata(agentId,'ens',...)).",
+      };
+      return { content: [{ type: "text", text: JSON.stringify(verdict) }] };
     },
   );
 
@@ -387,6 +471,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!passkey)
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
       try {
+        // Mirror of the REST gate: when World enforcement is on, the guardian must be a
+        // World-ID-verified unique human under the per-human entity cap.
+        assertGuardianAllowed(deps.worldId, tenantId);
         const raw = spec as Record<string, unknown>;
         const roles = {
           ...((raw.roles as object) ?? {}),

@@ -205,9 +205,87 @@ input[type="reset"]:disabled {
   z-index: -1;
 }
 
+/* Guardian seal — the strike, and the slow bezel that follows it */
+@keyframes sealBezel {
+  to { transform: rotate(360deg); }
+}
+@keyframes sealDraw {
+  from { stroke-dashoffset: 1; }
+  to   { stroke-dashoffset: 0; }
+}
+@keyframes sealBloom {
+  from { transform: scale(0.88); opacity: 0.5; }
+  to   { transform: scale(1.32); opacity: 0; }
+}
+@keyframes sealSettle {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes sealRise {
+  from { opacity: 0; }
+}
+
+.seal-bezel {
+  transform-origin: 100px 100px;
+  animation: sealBezel 150s linear infinite;
+}
+.seal-draw {
+  stroke-dasharray: 1;
+  animation: sealDraw 1.15s cubic-bezier(0.22, 0.7, 0.2, 1) both;
+  animation-delay: 120ms;
+}
+.seal-bloom {
+  transform-origin: 100px 100px;
+  animation: sealBloom 1.5s cubic-bezier(0.2, 0.6, 0.2, 1) forwards;
+}
+.seal-settle {
+  transform-origin: center;
+  animation: sealSettle 0.6s cubic-bezier(0.22, 0.7, 0.2, 1) both;
+}
+.seal-rise {
+  animation: sealRise 0.5s ease-out both;
+}
+
+/* Guardian badge — lit while a verified human backs the account */
+@keyframes guardianGlow {
+  0%, 100% { filter: drop-shadow(0 0 2px rgba(110, 231, 183, 0.35)); }
+  50%      { filter: drop-shadow(0 0 7px rgba(110, 231, 183, 0.7)); }
+}
+
+.guardian-glow {
+  display: block;
+  animation: guardianGlow 3.4s ease-in-out infinite;
+}
+
 .text-balance {
   text-wrap: balance;
 }
 .text-pretty {
   text-wrap: pretty;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-mesh,
+  .anim-scroll-hint,
+  .anim-pulse-dot::after,
+  .seal-bezel,
+  .seal-bloom,
+  .seal-settle {
+    animation: none;
+  }
+  /* These start hidden, so they need their end state restored rather than just stopped. */
+  .anim-line,
+  .seal-rise {
+    animation: none;
+    opacity: 1;
+  }
+  .seal-draw {
+    animation: none;
+    stroke-dashoffset: 0;
+  }
+  /* Keep the lit state, drop the pulse. */
+  .guardian-glow {
+    animation: none;
+    filter: drop-shadow(0 0 4px rgba(110, 231, 183, 0.55));
+  }
 }

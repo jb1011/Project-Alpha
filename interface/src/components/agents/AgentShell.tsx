@@ -2,18 +2,17 @@
 
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { GuardianBadge } from "@/components/guardian/GuardianBadge";
 import { Wordmark } from "@/components/landing/Wordmark";
 import { cx } from "@/components/onboarding/primitives";
 
 export function AgentShell({
   title,
   subtitle,
-  entityId,
   children,
 }: {
   title?: string;
   subtitle?: string;
-  entityId?: string;
   children: ReactNode;
 }) {
   return (
@@ -21,7 +20,7 @@ export function AgentShell({
       <div aria-hidden className="pointer-events-none fixed inset-0 -z-10 hero-mesh-dark opacity-70" />
       <header className="sticky top-0 z-40 border-b hairline bg-paper/80 backdrop-blur-md">
         <div className="mx-auto flex h-16 max-w-[1180px] items-center justify-between gap-4 px-5 lg:px-8">
-          <div className="flex min-w-0 items-center gap-4">
+          <div className="flex shrink-0 items-center gap-4">
             <Wordmark />
             {title && (
               <div className="hidden min-w-0 sm:block">
@@ -32,18 +31,14 @@ export function AgentShell({
               </div>
             )}
           </div>
-          <nav className="flex shrink-0 items-center gap-2">
+          {/* Scrolls rather than forcing the page wider than the viewport on narrow screens. */}
+          <nav className="flex min-w-0 flex-1 items-center justify-end gap-2 overflow-x-auto [&>*]:shrink-0">
             <NavLink href="/agents">My agents</NavLink>
             <NavLink href="/agents/account">Account</NavLink>
             <NavLink href="/agents/connect">Connect an agent</NavLink>
-            {entityId && (
-              <>
-                <NavLink href={`/agents/${encodeURIComponent(entityId)}`}>Dashboard</NavLink>
-                <NavLink href={`/agents/${encodeURIComponent(entityId)}/settings`}>
-                  Settings
-                </NavLink>
-              </>
-            )}
+            <GuardianBadge />
+            {/* Agent-scoped navigation (Dashboard/Settings) lives beside the agent's name on its
+                own pages — the shell nav stays account-level. */}
             <Link
               href="/onboarding?new=1"
               className="rounded-full bg-ink px-3.5 py-1.5 text-[12px] font-medium text-paper transition-colors hover:bg-ink-hover"

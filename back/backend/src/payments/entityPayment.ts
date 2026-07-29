@@ -1,3 +1,4 @@
+import { agentkitSignerFromKey, wrapFetchWithAgentkit } from "../adapters/worldid/agentkitSigner";
 import { PocketGateway } from "../adapters/x402/gateway";
 import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
@@ -195,9 +196,23 @@ export function buildEntityPaymentService(
       //    fetchImpl defaults to a safeFetch-wrapped fetch so production is SSRF-safe even if the
       //    composition root doesn't wrap it itself; tests inject their own fake fetchImpl and so
       //    bypass safeFetch (unchanged).
-      const fetchImpl =
+      const baseFetch =
         deps.fetchImpl ??
         ((u: RequestInfo | URL, i?: RequestInit) => safeFetch(fetch, u as string, i));
+      // World layer: present a human-backing proof when the seller's 402 advertises AgentKit.
+      // Sits in FRONT of buyWithX402 and only reacts to agentkit-enabled 402s — every other
+      // response passes through, so sellers without the extension are unaffected. If the agent
+      // is authorized within its allowance the seller returns 200 and buyWithX402 treats it as a
+      // final response (no payment); otherwise the normal 402 -> policy -> sign -> settle path runs.
+      const fetchImpl = cfg.world
+        ? wrapFetchWithAgentkit(
+            baseFetch,
+            agentkitSignerFromKey(
+              derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey),
+              cfg.chainId,
+            ),
+          )
+        : baseFetch;
       // Tracks whether the payment was actually authorized/"signed" by buyWithX402's onAuthorized
       // callback. This is the load-bearing distinction for step 5 below: a failure BEFORE signing
       // (SSRF/treasury-null checks above, policy-denied, 402-no-requirements, buildAuthorize

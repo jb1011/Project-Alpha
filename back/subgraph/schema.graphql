@@ -1,0 +1,20 @@
+"""
+G1 walking skeleton: one entity per agent legal body, written from the factory's
+EntityCreated + TreasuryCreated events (both emitted in the same createEntity tx).
+G2 extends this with Treasury/SpendEvent/PolicyProposal/Incident + timeseries.
+"""
+type AgentEntity @entity(immutable: false) {
+  "ERC-8004 agentId (decimal string)"
+  id: ID!
+  "LegalManager beacon proxy (the legal body)"
+  proxy: Bytes
+  "Manager address (factory owner / platform manager)"
+  manager: Bytes
+  "AgentTreasury address (the governed vault)"
+  treasury: Bytes
+  "Operator EOA bound to this agent"
+  operator: Bytes
+  createdAt: BigInt!
+  createdAtBlock: BigInt!
+  createdTx: Bytes!
+}

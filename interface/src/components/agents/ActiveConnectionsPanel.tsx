@@ -8,7 +8,14 @@ import { CapabilityBadge, RevokeButton } from "@/components/agents/connectionRow
 
 type ConnectionFilter = { mode: "entity"; entityId: string } | { mode: "tenant" };
 
-export function ActiveConnectionsPanel({ filter }: { filter: ConnectionFilter }) {
+export function ActiveConnectionsPanel({
+  filter,
+  hideHeader = false,
+}: {
+  filter: ConnectionFilter;
+  /** The tenant record supplies its own section header. */
+  hideHeader?: boolean;
+}) {
   const { ensureSession } = useAuth();
   const [keys, setKeys] = React.useState<ApiKeyView[]>([]);
   const [busy, setBusy] = React.useState(false);
@@ -54,7 +61,9 @@ export function ActiveConnectionsPanel({ filter }: { filter: ConnectionFilter })
 
   return (
     <div>
-      <div className="text-[11px] uppercase tracking-[0.14em] text-muted-2">Active connections</div>
+      {!hideHeader && (
+        <div className="text-[11px] uppercase tracking-[0.14em] text-muted-2">Active connections</div>
+      )}
       {keys.length === 0 ? (
         <p className="mt-2 text-[12px] text-muted-2">No active connections yet.</p>
       ) : (

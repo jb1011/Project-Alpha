@@ -7,7 +7,7 @@ export function Wordmark({ className = "", tone = "ink" }: Props) {
   const ink = tone === "ink";
   return (
     <a
-      href="#top"
+      href="/"
       className={`group inline-flex items-center gap-2.5 ${className}`}
       aria-label="Novi Corpus home"
     >

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import type { ApiDeps } from "../app";
@@ -19,6 +20,53 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
       body = deps.docStore.get(`meta-${ent.idempotencyKey}.json`);
     } catch {
       throw new ApiError("not_found", 404, "metadata not found");
+    }
+    // Public attestations layered onto the stored JSON: the ENSIP-25 binding (ENS) and the
+    // guardian's proof-of-personhood (World). Both are additive and best-effort — a non-JSON
+    // stored body is served as-is rather than 500.
+    try {
+      const meta = JSON.parse(body);
+      let touched = false;
+
+      // ENSIP-25 off-chain half: advertise the ENS name + registry binding so a verifier can obtain
+      // the claimed name from the registry's metadata (on-chain half is setMetadata(id,"ens",...)).
+      if (deps.ens && ent.agentId) {
+        meta.ens = `${publicId}.${deps.ens.parentName}`;
+        meta.registrations = [
+          {
+            agentId: ent.agentId,
+            agentRegistry: `eip155:${deps.ens.chainId}:${deps.ens.identityRegistry}`,
+          },
+        ];
+        touched = true;
+      }
+
+      // World ID: attest that this agent's guardian — the legally required natural person — is a
+      // cryptographically verified unique human.
+      //
+      // PRIVACY: we publish sha256(nullifier), never the nullifier itself. The nullifier is
+      // disclosed to us alone (World's model is app-scoped, unlinkable across apps); republishing
+      // it would leak that datum to the world. The hash keeps the property that matters publicly —
+      // two agents backed by the same human carry the same humanRef — while disclosing nothing
+      // reusable elsewhere.
+      const gv =
+        deps.worldId && ent.ownerTenantId
+          ? deps.worldId.store.findByTenant(ent.ownerTenantId, deps.worldId.cfg.action)
+          : undefined;
+      if (gv) {
+        meta.worldId = {
+          humanVerified: true,
+          credential: gv.credential,
+          humanRef: createHash("sha256").update(gv.nullifier).digest("hex"),
+          verifiedAt: gv.verifiedAt,
+          environment: gv.environment,
+        };
+        touched = true;
+      }
+
+      if (touched) body = JSON.stringify(meta);
+    } catch {
+      // Non-JSON stored body: serve as-is rather than 500.
     }
     c.header("Content-Type", "application/json");
     c.header("Cache-Control", "public, max-age=300");

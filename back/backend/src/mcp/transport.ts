@@ -32,6 +32,18 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       maxJobBudget: deps.maxJobBudget,
       maxInflightJobsPerTenant: deps.maxInflightJobsPerTenant,
       linkCodes: deps.linkCodes,
+      arc: deps.arc,
+      worldId: deps.worldId,
+      ens: deps.ens
+        ? {
+            parentName: deps.ens.parentName,
+            identityRegistry: deps.ens.identityRegistry,
+            chainId: deps.ens.chainId,
+            // Without this, resolve_agent cannot resolve a vanity name the CCIP gateway serves
+            // happily — e.g. demo.novicorpus.eth resolved over ENS but was "unknown agent" here.
+            labelAliases: deps.ens.labelAliases,
+          }
+        : undefined,
     });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

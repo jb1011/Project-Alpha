@@ -27,6 +27,13 @@ const etherSchema = z.string().refine(
 
 const DEV_JWT_SECRET = "dev-insecure-secret-change-me-please";
 
+/** Fallbacks for `Config.worldChain` (optional in the type for test fixtures). */
+export const WORLD_CHAIN_DEFAULTS = {
+  rpcUrl: "https://worldchain-mainnet.g.alchemy.com/public",
+  agentBook: "0xA23aB2712eA7BBa896930544C7d6636a96b944dA" as Address,
+  allowancePerHuman: 3,
+} as const;
+
 const EnvSchema = z.object({
   ARC_TESTNET_RPC_URL: z.string().url(),
   ARC_CHAIN_ID: z.coerce.number().int().positive().default(5042002),
@@ -78,6 +85,14 @@ const EnvSchema = z.object({
     .optional()
     .transform((v) => v === "true" || v === "1"),
   X402_DEMO_PAYTO: addressSchema.optional(),
+  /** Seller trust policy. "open" = today's behavior (AgentKit authorizes within the allowance,
+   *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
+   *  outright (403); human-backed agents still pay. */
+  X402_TRUST_POLICY: z.enum(["open", "accountable-only"]).default("open"),
+  /** AgentBook-registered key for the /proof-run demo (signs AgentKit messages, holds no funds). */
+  X402_PROOF_AGENT_KEY: privKeySchema.optional(),
+  /** Window for the per-human rate cap. The raw counter is lifetime, which is not a rate. */
+  WORLD_RATE_WINDOW_HOURS: z.coerce.number().int().positive().default(24),
   X402_DEMO_PRICE_USDC: z
     .string()
     .default("0.01")
@@ -92,6 +107,34 @@ const EnvSchema = z.object({
       },
       { message: "must be > 0 and <= 1.0 USDC (max 6 decimals)" },
     ),
+  // ENS CCIP-Read gateway (optional; absent -> route not mounted). Signs record responses.
+  ENS_GATEWAY_SIGNER_KEY: privKeySchema.optional(),
+  ENS_PARENT_NAME: z.string().default("novicorpus.eth"),
+  ENS_RESOLVER_ADDRESS: addressSchema.optional(),
+  /** Vanity subnames, `label=publicId` comma-separated (e.g. "demo=b46fd15c-…"). Lets a memorable
+   *  name point at an existing agent without rewriting a publicId that is already on-chain. */
+  ENS_LABEL_ALIASES: z.string().optional(),
+  // World ID / AgentKit (optional; absent -> routes not mounted, seller check skipped).
+  WORLD_APP_ID: z.string().optional(),
+  WORLD_RP_ID: z.string().optional(),
+  WORLD_RP_SIGNING_KEY: z.string().optional(),
+  WORLD_ACTION: z.string().default("guardian-verification"),
+  /** Optional anti-sybil ceiling on legal entities per verified human. No legal basis — Wyoming
+   *  does not cap how many LLCs a person may control — so it is UNSET (unlimited) by default and
+   *  exists only for deployments that want one. */
+  WORLD_MAX_ENTITIES_PER_HUMAN: z.coerce.number().int().positive().optional(),
+  WORLD_REQUIRE_GUARDIAN: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
+  WORLD_CHAIN_RPC: z.string().url().default("https://worldchain-mainnet.g.alchemy.com/public"),
+  WORLD_AGENTBOOK_ADDRESS: addressSchema.default("0xA23aB2712eA7BBa896930544C7d6636a96b944dA"),
+  WORLD_ALLOWANCE_PER_HUMAN: z.coerce.number().int().nonnegative().default(3),
+  WORLD_ENVIRONMENT: z.enum(["production", "staging", "sandbox"]).default("production"),
+  /** Identity-Check step-up. Absent -> the whole attestation surface stays unmounted, so merging
+   *  the feature is a no-op until this is deliberately set. */
+  WORLD_ATTEST_ACTION: z.string().optional(),
+  WORLD_ATTEST_MIN_AGE: z.coerce.number().int().positive().default(18),
 });
 
 export interface Config {
@@ -144,9 +187,54 @@ export interface Config {
   enableX402Demo: boolean;
   x402DemoPayTo: Address;
   x402DemoPriceUsdc: string;
+  /** Optional in the type (test fixtures build Config literals); loadConfig always sets them. */
+  x402TrustPolicy?: "open" | "accountable-only";
+  worldRateWindowHours?: number;
+  x402ProofAgentKey?: Hex;
+  ens?: {
+    signerKey: Hex;
+    parentName: string;
+    resolverAddress?: Address;
+    /** Vanity subname label -> publicId. */
+    labelAliases?: Record<string, string>;
+  };
+  /** World ID + AgentKit. Present only when the portal credentials are configured. */
+  world?: {
+    appId: string;
+    rpId: string;
+    rpSigningKey: string;
+    action: string;
+    /** Absent = no ceiling. */
+    maxEntitiesPerHuman?: number;
+    requireGuardian: boolean;
+    environment: "production" | "staging" | "sandbox";
+    /** Identity-Check step-up action. Absent = attestation surface not mounted. */
+    attestAction?: string;
+    /** Age threshold proven by the attestation (never a birthdate). */
+    attestMinAge: number;
+  };
+  /** AgentBook read config — independent of `world` so the seller check can run standalone.
+   *  Optional in the type (test fixtures build Config literals); loadConfig always populates it,
+   *  and consumers should fall back to WORLD_CHAIN_DEFAULTS when absent. */
+  worldChain?: {
+    rpcUrl: string;
+    agentBook: Address;
+    allowancePerHuman: number;
+  };
 }
 
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
+/** "demo=abc,staging=def" -> { demo: "abc", staging: "def" }. Malformed pairs are ignored. */
+function parseLabelAliases(raw: string | undefined): Record<string, string> | undefined {
+  if (!raw?.trim()) return undefined;
+  const out: Record<string, string> = {};
+  for (const pair of raw.split(",")) {
+    const [label, publicId] = pair.split("=").map((s) => s.trim());
+    if (label && publicId) out[label.toLowerCase()] = publicId;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const parsed = EnvSchema.safeParse(env);
   if (!parsed.success) {
@@ -212,9 +300,41 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     gasSeedFloorUsdc: e.GAS_SEED_FLOOR_USDC,
     gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,
+    x402TrustPolicy: e.X402_TRUST_POLICY,
+    worldRateWindowHours: e.WORLD_RATE_WINDOW_HOURS,
+    x402ProofAgentKey: e.X402_PROOF_AGENT_KEY,
     x402DemoPayTo:
       e.X402_DEMO_PAYTO ?? (privateKeyToAccount(e.PLATFORM_PRIVATE_KEY).address as Address),
     x402DemoPriceUsdc: e.X402_DEMO_PRICE_USDC,
+    ens: e.ENS_GATEWAY_SIGNER_KEY
+      ? {
+          signerKey: e.ENS_GATEWAY_SIGNER_KEY,
+          parentName: e.ENS_PARENT_NAME,
+          resolverAddress: e.ENS_RESOLVER_ADDRESS,
+          labelAliases: parseLabelAliases(e.ENS_LABEL_ALIASES),
+        }
+      : undefined,
+    // All three portal credentials are required together — a partial config would fail at
+    // request-signing time with a confusing runtime error instead of a clear boot warning.
+    world:
+      e.WORLD_APP_ID && e.WORLD_RP_ID && e.WORLD_RP_SIGNING_KEY
+        ? {
+            appId: e.WORLD_APP_ID,
+            rpId: e.WORLD_RP_ID,
+            rpSigningKey: e.WORLD_RP_SIGNING_KEY,
+            action: e.WORLD_ACTION,
+            maxEntitiesPerHuman: e.WORLD_MAX_ENTITIES_PER_HUMAN,
+            requireGuardian: e.WORLD_REQUIRE_GUARDIAN,
+            environment: e.WORLD_ENVIRONMENT,
+            attestAction: e.WORLD_ATTEST_ACTION,
+            attestMinAge: e.WORLD_ATTEST_MIN_AGE,
+          }
+        : undefined,
+    worldChain: {
+      rpcUrl: e.WORLD_CHAIN_RPC,
+      agentBook: e.WORLD_AGENTBOOK_ADDRESS,
+      allowancePerHuman: e.WORLD_ALLOWANCE_PER_HUMAN,
+    },
   };
 
   // Fail-closed: never let production boot with the insecure dev defaults.
@@ -272,6 +392,9 @@ export function redact(cfg: Config): Record<string, unknown> {
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
     jobClientPrivateKey: "REDACTED",
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
+    x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
+    ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
+    world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
     turnkey: cfg.turnkey
       ? {
           ...cfg.turnkey,
