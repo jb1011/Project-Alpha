@@ -69,22 +69,18 @@ describe("assertGuardianAllowed", () => {
     expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBe("guardian_entity_cap");
   });
 
-  // `expires_at_min` is UNIX SECONDS despite the name — our own captured fixture value
-  // 1785005211 decodes to 2026-07-25, the day it was captured. Treating it as minutes puts
-  // every credential in the year 5363, i.e. expiry could never fire.
-  test("an EXPIRED credential no longer satisfies the gate", () => {
-    const expired = Math.floor(Date.now() / 1000) - 60; // one minute ago, in seconds
-    const d = deps({ requireGuardian: true, verified: true, used: 0, expiresAtMin: expired });
-    expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBe("guardian_credential_expired");
-  });
-
-  test("a live credential still satisfies the gate", () => {
-    const live = Math.floor(Date.now() / 1000) + 3600;
-    const d = deps({ requireGuardian: true, verified: true, used: 0, expiresAtMin: live });
+  // REGRESSION GUARD. `expires_at_min` looks like a credential expiry and is not one: measured
+  // on three real production verifications it lands 19-44s BEFORE the verification itself, so
+  // gating on it (as seconds) refuses every guardian on arrival. An earlier version of this fix
+  // did exactly that and would have taken entity creation down. Do not re-add gating until
+  // World tells us what the field means.
+  test("a past expires_at_min does NOT block the gate", () => {
+    const asSeenInProd = Math.floor(Date.now() / 1000) - 44;
+    const d = deps({ requireGuardian: true, verified: true, used: 0, expiresAtMin: asSeenInProd });
     expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBeNull();
   });
 
-  test("a credential with no expiry is treated as live", () => {
+  test("an absent expires_at_min does not block either", () => {
     const d = deps({ requireGuardian: true, verified: true, used: 0, expiresAtMin: null });
     expect(codeOf(() => assertGuardianAllowed(d, TENANT))).toBeNull();
   });

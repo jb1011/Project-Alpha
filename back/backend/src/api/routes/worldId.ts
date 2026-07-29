@@ -29,16 +29,23 @@ const REQUEST_TTL_MS = 10 * 60_000;
  *  failed in the field we could not tell whether the proof had even reached us — only that the
  *  user saw an error on their phone. Log the reason (never the nullifier; tenant truncated). */
 /**
- * Is a World credential still valid?
+ * ⚠ `expires_at_min` is NOT a credential expiry — do not gate on it.
  *
- * `expires_at_min` is UNIX **SECONDS** despite the name. Ground truth: the value in our own
- * captured staging fixture, 1785005211, decodes as seconds to 2026-07-25 — the day it was
- * captured. Read as minutes it lands in the year 5363, which is why expiry never fired.
- * Absent expiry means non-expiring, not expired.
+ * Measured against three real production verifications (2026-07-25/26/29), the value is
+ * consistently 19–44 seconds BEFORE the moment we record the verification:
+ *
+ *   verified_at 2026-07-29T09:36:09Z   expires_at_min*1000 2026-07-29T09:35:26Z   (+44s)
+ *   verified_at 2026-07-26T10:07:12Z   expires_at_min*1000 2026-07-26T10:06:53Z   (+19s)
+ *   verified_at 2026-07-25T16:10:30Z   expires_at_min*1000 2026-07-25T16:10:02Z   (+29s)
+ *
+ * So it tracks the proof's own short-lived validity window, not how long the human's credential
+ * remains good. Read as seconds, every credential is "expired" on arrival — gating on it would
+ * refuse 100% of guardians. Read as minutes (the original code) it is the year 5363, i.e. it
+ * never fires, which is why nobody noticed. Neither reading is a credential lifetime.
+ *
+ * We therefore store the raw value for forensics and gate on nothing until World clarifies the
+ * field's meaning. Raised with them alongside the other AgentKit findings.
  */
-function credentialLive(expiresAtSec: number | null | undefined, now = Date.now()): boolean {
-  return expiresAtSec == null || expiresAtSec * 1000 > now;
-}
 
 function logWorldRejection(kind: string, tenantId: string, detail: string): void {
   console.warn(`world-id ${kind} refused for ${tenantId.slice(0, 10)}…: ${detail}`);
@@ -368,7 +375,8 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     const action = world.cfg.attestAction;
     if (!action) return { formationReady: false };
     const a = world.store.findAttestationByTenant(tenantId, action);
-    const live = a && credentialLive(a.expiresAtMin);
+    // Deliberately not gated on expires_at_min — see the note above the imports.
+    const live = Boolean(a);
     if (!a || !live) return { formationReady: false };
     return {
       formationReady: true,
@@ -387,13 +395,6 @@ export function assertGuardianAllowed(world: WorldIdDeps | undefined, tenantId: 
       "guardian_not_verified",
       403,
       "guardian must complete World ID verification before creating a legal entity",
-    );
-  // A credential that has lapsed is not a current statement about the guardian.
-  if (!credentialLive(v.expiresAtMin))
-    throw new ApiError(
-      "guardian_credential_expired",
-      403,
-      "the guardian's World ID credential has expired; verify again to continue",
     );
   // The ceiling is optional: unset means a verified human may form as many legal bodies as they
   // like, which is what the law actually allows.
