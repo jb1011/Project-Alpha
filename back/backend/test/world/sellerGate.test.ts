@@ -274,3 +274,41 @@ describe("windowed per-human rate cap", () => {
     expect(store.tryIncrementUsage(H, RESOURCE_URL, 1, 32_000_000_000).allowed).toBe(false);
   });
 });
+
+describe("rate budgets are keyed independently", () => {
+  const H = "human-1";
+  const RESOURCE = "https://x/x402-demo/quote";
+
+  test("a separate rateKey does not spend the resource's budget", () => {
+    const db = new Database(":memory:");
+    migrate(db);
+    const store = new SqliteWorldStore(db);
+    const t = 1_000_000;
+
+    // The /proof demo runs on its own key…
+    expect(store.tryIncrementUsage(H, `${RESOURCE}#proof-run`, 2, t).allowed).toBe(true);
+    expect(store.tryIncrementUsage(H, `${RESOURCE}#proof-run`, 2, t).allowed).toBe(true);
+    expect(store.tryIncrementUsage(H, `${RESOURCE}#proof-run`, 2, t).allowed).toBe(false);
+
+    // …and the real seller's budget for the same human is untouched.
+    expect(store.tryIncrementUsage(H, RESOURCE, 2, t).allowed).toBe(true);
+  });
+
+  test("nonces older than the replay window are swept away", () => {
+    const db = new Database(":memory:");
+    migrate(db);
+    const store = new SqliteWorldStore(db);
+    const t0 = 1_000_000;
+
+    // Enough inserts to trip the amortised sweep, all stamped long ago.
+    for (let i = 0; i < 60; i++) expect(store.consumeNonce(`old-${i}`, t0)).toBe(true);
+    const before = db.prepare("SELECT COUNT(*) AS n FROM world_nonces").get() as { n: number };
+    expect(before.n).toBe(60);
+
+    // A much later insert triggers a sweep that drops the stale rows.
+    const later = t0 + 60 * 60_000;
+    for (let i = 0; i < 50; i++) expect(store.consumeNonce(`new-${i}`, later)).toBe(true);
+    const after = db.prepare("SELECT COUNT(*) AS n FROM world_nonces").get() as { n: number };
+    expect(after.n).toBeLessThan(60);
+  });
+});

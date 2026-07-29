@@ -90,7 +90,9 @@ export function mountX402DemoRoutes(
       network: deps.network,
       resource: "/x402-demo/quote",
       resourceUrl: deps.resourceUrl,
-      agentkit: deps.agentkit,
+      // Same proof semantics, separate budget: /proof runs on every page view, so charging the
+      // public seller's per-human allowance would let visitors exhaust what real buyers need.
+      agentkit: deps.agentkit && { ...deps.agentkit, rateKey: `${deps.resourceUrl}#proof-run` },
       serve: () => ({ quote: "demo" }),
     });
     const wallFetch = (init?: { headers?: Record<string, string> }) =>

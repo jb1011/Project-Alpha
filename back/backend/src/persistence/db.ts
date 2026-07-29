@@ -43,6 +43,9 @@ export function migrate(db: Database.Database): void {
       updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE INDEX IF NOT EXISTS idx_entities_agent_id ON entities(agent_id);
+    -- countEntitiesForNullifier + listEntities both filter on the owning tenant; without this
+    -- they scan the whole table, and /world-id/me runs on every authenticated page view.
+    CREATE INDEX IF NOT EXISTS idx_entities_owner_tenant ON entities(owner_tenant_id);
 
     -- Reserved for an optional DB-backed document index; v1 uses FileDocumentStore (filesystem).
     CREATE TABLE IF NOT EXISTS documents (

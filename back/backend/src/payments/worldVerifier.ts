@@ -42,6 +42,10 @@ export interface AgentkitSellerConfig {
   agentBook?: { lookupHuman(address: string): Promise<string | null> };
   /** Window for the per-human counter; absent -> lifetime (legacy). */
   rateWindowMs?: number;
+  /** Key the per-human budget is charged against; defaults to `resourceUrl`. The /proof demo
+   *  overrides it so replaying the demo cannot exhaust the allowance real buyers depend on —
+   *  the SIWE message still references `resourceUrl`, so proof semantics are unchanged. */
+  rateKey?: string;
   now?: () => number;
 }
 
@@ -128,7 +132,7 @@ export async function verifyAgentkitRequest(
 
     const { allowed, used } = cfg.store.tryIncrementUsage(
       humanId,
-      cfg.resourceUrl,
+      cfg.rateKey ?? cfg.resourceUrl,
       cfg.allowancePerHuman,
       now(),
       cfg.rateWindowMs,

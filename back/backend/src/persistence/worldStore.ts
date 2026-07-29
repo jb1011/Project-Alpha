@@ -82,6 +82,11 @@ export interface WorldStore {
   cacheHuman(agentAddress: string, humanId: string, now: number): void;
 }
 
+/** The SDK refuses messages older than 5 minutes, so anything past this is unreplayable. */
+const NONCE_RETENTION_MS = 15 * 60_000;
+/** Amortise the sweep so the hot path is one INSERT, not an INSERT plus a DELETE scan. */
+const NONCE_SWEEP_EVERY = 50;
+
 export class SqliteWorldStore implements WorldStore {
   constructor(private readonly db: Database.Database) {}
 
@@ -248,10 +253,26 @@ export class SqliteWorldStore implements WorldStore {
       this.db
         .prepare("INSERT INTO world_nonces (nonce, used_at, created_at) VALUES (?,?,?)")
         .run(nonce, now, now);
+      this.sweepNonces(now);
       return true;
     } catch {
       return false; // PK conflict => already used
     }
+  }
+
+  /**
+   * Drop nonces older than the replay window. Without this the table grows forever: rows are
+   * written by an unauthenticated route BEFORE signature verification, so a scripted caller can
+   * add them at will (~96 bytes each) until the disk fills.
+   *
+   * Safe because the AgentKit SDK rejects messages older than 5 minutes on freshness alone, so a
+   * nonce past NONCE_RETENTION_MS can no longer be replayed even if forgotten. Amortised: this
+   * runs on roughly 1 in SWEEP_EVERY inserts, so the hot path stays a single INSERT.
+   */
+  private sweepCounter = 0;
+  private sweepNonces(now: number): void {
+    if (++this.sweepCounter % NONCE_SWEEP_EVERY !== 0) return;
+    this.db.prepare("DELETE FROM world_nonces WHERE created_at < ?").run(now - NONCE_RETENTION_MS);
   }
 
   tryIncrementUsage(
