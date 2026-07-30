@@ -90,6 +90,9 @@ const EnvSchema = z.object({
    *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
    *  outright (403); human-backed agents still pay. */
   X402_TRUST_POLICY: z.enum(["open", "accountable-only"]).default("open"),
+  /** Buyer-side trust dial: "verified-sellers-only" refuses to pay any address AgentBook does not
+   *  vouch a human for. Default "open" = today's behavior. docs/design/2026-07-30-trust-policy-dials.md */
+  X402_BUYER_TRUST_POLICY: z.enum(["open", "verified-sellers-only"]).default("open"),
   /** AgentBook-registered key for the /proof-run demo (signs AgentKit messages, holds no funds). */
   X402_PROOF_AGENT_KEY: privKeySchema.optional(),
   /** Window for the per-human rate cap. The raw counter is lifetime, which is not a rate. */
@@ -191,6 +194,7 @@ export interface Config {
   x402DemoPriceUsdc: string;
   /** Optional in the type (test fixtures build Config literals); loadConfig always sets them. */
   x402TrustPolicy?: "open" | "accountable-only";
+  x402BuyerTrustPolicy: "open" | "verified-sellers-only";
   worldRateWindowHours?: number;
   x402ProofAgentKey?: Hex;
   ens?: {
@@ -304,6 +308,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,
     x402TrustPolicy: e.X402_TRUST_POLICY,
+    x402BuyerTrustPolicy: e.X402_BUYER_TRUST_POLICY,
     worldRateWindowHours: e.WORLD_RATE_WINDOW_HOURS,
     x402ProofAgentKey: e.X402_PROOF_AGENT_KEY,
     x402DemoPayTo:

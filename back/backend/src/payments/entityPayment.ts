@@ -8,10 +8,11 @@ import type { PaymentReceipt } from "../persistence/paymentIdempotencyStore";
 import type { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import { usdToUnits } from "../policy/units";
 import type { Address, EntityRecord, Hex } from "../types";
-import type { AuthorityDeps, AuthorizeRequest } from "./authority";
+import type { AuthorityDeps, AuthorizeRequest, AuthorizeResult } from "./authority";
 import { authorizePayment } from "./authority";
 import { buyWithX402 } from "./buyer";
 import type { PaymentLedger } from "./ledger";
+import type { SellerTrust } from "./sellerTrust";
 import { assertPublicHttpsUrl, safeFetch } from "./ssrfGuard";
 import type { StandingExposure } from "./standingExposure";
 import { buildReadExposure } from "./standingExposure";
@@ -72,6 +73,10 @@ export interface EntityPaymentDeps {
    *  on-chain/Gateway read via readStandingExposure — injectable so tests can fake it without a live
    *  Gateway call. */
   readExposure?: (entity: EntityRecord) => Promise<StandingExposure>;
+  /** Buyer trust dial (X402_BUYER_TRUST_POLICY): when `verified-sellers-only`, the payee must be
+   *  human-backed in AgentBook before we sign anything. Absent or `open` -> today's behavior,
+   *  byte-identical. See docs/design/2026-07-30-trust-policy-dials.md. */
+  sellerTrust?: SellerTrust;
 }
 
 /** The pocket master seed is required to derive a per-agent pocket (mirrors liveRunner.ts). */
@@ -144,7 +149,20 @@ export function buildEntityPaymentService(
       perTxCap: entity.perTxCap ?? undefined,
       threshold: cfg.spendAllowlistThreshold, // §14.1 — hybrid re-assert, forwarded to evaluatePolicy
     };
-    return (req: AuthorizeRequest) => authorizePayment(authorityDeps, req);
+    const authorize = (req: AuthorizeRequest) => authorizePayment(authorityDeps, req);
+    // Buyer trust dial. Runs at the authorize chokepoint — the payee is only known once the 402
+    // challenge arrives, so this is the earliest point that can see it. Still strictly PRE-SIGN:
+    // a denial here is a "failure before signing", the idempotency claim is released, and the same
+    // key retries cleanly once the seller registers (or the World Chain RPC recovers).
+    const trust = deps.sellerTrust;
+    if (!trust || trust.policy === "open") return authorize;
+    return async (req: AuthorizeRequest): Promise<AuthorizeResult> => {
+      const outcome = await trust.verify(req.payee);
+      if (outcome === "unregistered") return { ok: false, reason: "seller-not-human-backed" };
+      if (outcome === "unavailable")
+        return { ok: false, reason: "seller-verification-unavailable" };
+      return authorize(req);
+    };
   };
 
   return {

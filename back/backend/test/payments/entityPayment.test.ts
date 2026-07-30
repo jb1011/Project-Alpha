@@ -59,6 +59,7 @@ function makeConfig(over: Partial<Config> = {}): Config {
     enableX402Demo: false,
     x402DemoPayTo: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
     x402DemoPriceUsdc: "0.01",
+    x402BuyerTrustPolicy: "open",
     ...over,
   };
 }
@@ -700,4 +701,128 @@ test("status surfaces the standing exposure breakdown + ceiling", async () => {
   });
   // float stays the spendable Gateway balance, NOT the standing total
   expect(view.float).toBe(1_000_000_000n.toString());
+});
+
+// ── Buyer trust dial (X402_BUYER_TRUST_POLICY) — docs/design/2026-07-30-trust-policy-dials.md ──
+// The seller check runs at the authorize chokepoint: pre-sign, so a denial releases the
+// idempotency claim and nothing can have settled.
+
+function fakeTrust(outcome: "verified" | "unregistered" | "unavailable") {
+  let calls = 0;
+  return {
+    policy: "verified-sellers-only" as const,
+    verify: async () => {
+      calls++;
+      return outcome;
+    },
+    calls: () => calls,
+  };
+}
+
+test("strict buyer: unregistered seller is denied pre-sign — no retry fetch, claim released", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  const trust = fakeTrust("unregistered");
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: trust,
+  });
+  const entity = seedEntity();
+
+  const receipt = await svc.pay(entity, {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-strict-unreg",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "seller-not-human-backed" });
+  expect(trust.calls()).toBe(1); // the gate really consulted the seller check
+  expect(fn).toHaveBeenCalledTimes(1); // only the 402 probe — never signed, never retried
+  expect(idempotency.begin("k-strict-unreg", "tenantA", entity.idempotencyKey)).toEqual({
+    status: "new",
+  }); // released: the same key is retryable once the seller registers
+});
+
+test("strict buyer: World Chain outage denies fail-closed with its own reason (not 'unregistered')", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: fakeTrust("unavailable"),
+  });
+
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-strict-outage",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "seller-verification-unavailable" });
+  expect(fn).toHaveBeenCalledTimes(1);
+});
+
+test("strict buyer: a verified seller settles exactly like today", async () => {
+  const { reader } = makeReader();
+  const { fn, calls } = fakeFetch();
+  const trust = fakeTrust("verified");
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: trust,
+  });
+
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-strict-ok",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt.ok).toBe(true);
+  expect(trust.calls()).toBe(1);
+  const secondHeaders = calls[1]?.init?.headers as Record<string, string> | undefined;
+  expect(secondHeaders?.["X-PAYMENT"]).toBeTruthy(); // full normal settle path ran
+});
+
+test("open policy: the seller check is NEVER consulted (regression pin for the default)", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  let consulted = 0;
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: {
+      policy: "open",
+      verify: async () => {
+        consulted++;
+        return "unregistered";
+      },
+    },
+  });
+
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-open",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt.ok).toBe(true); // would have been denied if the strict path ran
+  expect(consulted).toBe(0);
 });

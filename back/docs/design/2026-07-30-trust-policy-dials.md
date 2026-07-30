@@ -28,8 +28,11 @@ as seller AND as buyer. Research grounding: `docs/research/2026-07-30-world-iden
 
 `X402_BUYER_TRUST_POLICY = open | verified-sellers-only` (env, default `open`).
 
-Enforcement point: the single pay choke point (`entityPayment.pay`), BEFORE settlement and BEFORE
-the idempotency claim, alongside the existing policy gate:
+Enforcement point (corrected at implementation): the authorize chokepoint inside
+`entityPayment.pay` — the payee is only known once the 402 challenge arrives, which is after the
+idempotency claim. The check is still strictly PRE-SIGN, and a denial is a failure-before-signing,
+so the claim is RELEASED and the same key retries cleanly — the spec's original intent (nothing
+settles, nothing burned) holds exactly:
 
 1. Resolve the payee address from the 402 challenge (`payTo`).
 2. `agentBookReader.lookupHuman(payTo)` (our 3-state reader from PR #63 — definitive

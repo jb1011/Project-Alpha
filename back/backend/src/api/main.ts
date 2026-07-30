@@ -8,11 +8,13 @@ import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
 import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { SqliteNonceStore } from "../auth/nonceStore";
-import { loadConfig } from "../config/env";
+import { WORLD_CHAIN_DEFAULTS, loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
+import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
 import { PaymentLedger } from "../payments/ledger";
 import { buildPocketFunding } from "../payments/pocketFunding";
+import { buildSellerTrust } from "../payments/sellerTrust";
 import { buildReadExposure } from "../payments/standingExposure";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
@@ -68,6 +70,18 @@ async function main() {
         reader: arc,
         ledger: new PaymentLedger(db),
         idempotency: new SqlitePaymentIdempotencyStore(db),
+        // Buyer trust dial (X402_BUYER_TRUST_POLICY, default "open" = no-op): when strict, the
+        // payee must be human-backed in AgentBook before anything is signed. Works without any
+        // WORLD_* portal creds — the reader only needs the World Chain RPC + AgentBook address,
+        // both of which have defaults. docs/design/2026-07-30-trust-policy-dials.md
+        sellerTrust: buildSellerTrust({
+          policy: cfg.x402BuyerTrustPolicy,
+          store: new SqliteWorldStore(db),
+          reader: createAgentBookReader({
+            rpcUrl: cfg.worldChain?.rpcUrl ?? WORLD_CHAIN_DEFAULTS.rpcUrl,
+            contractAddress: cfg.worldChain?.agentBook ?? WORLD_CHAIN_DEFAULTS.agentBook,
+          }),
+        }),
       })
     : undefined;
 
