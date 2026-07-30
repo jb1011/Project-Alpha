@@ -1,6 +1,11 @@
 import Database from "better-sqlite3";
 import { Hono } from "hono";
+import type { Hex } from "viem";
 import { beforeEach, describe, expect, test } from "vitest";
+import {
+  agentkitSignerFromKey,
+  wrapFetchWithAgentkit,
+} from "../../src/adapters/worldid/agentkitSigner";
 import { buildPaywall } from "../../src/payments/seller";
 import type { AgentkitSellerConfig } from "../../src/payments/worldVerifier";
 import { mintAgentkitExtension, verifyAgentkitRequest } from "../../src/payments/worldVerifier";
@@ -77,30 +82,221 @@ describe("mintAgentkitExtension", () => {
   });
 });
 
+const AGENT_KEY = `0x${"7".repeat(64)}` as Hex;
+
+/**
+ * Mint a REAL signed `agentkit` header by driving the SDK against a throwaway paywall and
+ * capturing what the agent sends on the retry.
+ *
+ * WHY THIS EXISTS: hand-written payloads (`{nope:1}`) are rejected by `parseAgentkitHeader` long
+ * before the gate ever consults AgentBook, so a test built on one cannot say anything about the
+ * lookup. Three tests below previously did exactly that — they passed for the wrong reason and
+ * would not have caught an AgentBook regression. Every test that claims to exercise the lookup now
+ * asserts `calls` as well as the verdict, so it can never silently decay back into a vacuous test.
+ *
+ * The captured header's nonce is consumed in the THROWAWAY store, so it is still fresh against the
+ * per-test store (`consumeNonce` is first-use-wins). One header is good for exactly one verify.
+ */
+async function realAgentkitHeader(): Promise<string> {
+  const throwawayDb = new Database(":memory:");
+  migrate(throwawayDb);
+  let captured = "";
+
+  const app = new Hono();
+  app.route(
+    "/",
+    buildPaywall({
+      price: 10_000n,
+      payTo: "0x0000000000000000000000000000000000000001" as Address,
+      asset: "0x3600000000000000000000000000000000000000" as Address,
+      network: "eip155:5042002",
+      resource: "/x402-demo/quote",
+      resourceUrl: RESOURCE_URL,
+      agentkit: {
+        domain: new URL(RESOURCE_URL).hostname,
+        resourceUrl: RESOURCE_URL,
+        network: "eip155:5042002",
+        store: new SqliteWorldStore(throwawayDb),
+        allowancePerHuman: 99,
+        agentBook: { lookupHuman: async () => HUMAN },
+      },
+      serve: () => ({ ok: true }),
+    }),
+  );
+
+  const capturingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers =
+      input instanceof Request ? new Headers(input.headers) : new Headers(init?.headers ?? {});
+    if (input instanceof Request)
+      new Headers(init?.headers ?? {}).forEach((v, k) => headers.set(k, v));
+    const h = headers.get("agentkit");
+    if (h) captured = h;
+    const url = input instanceof Request ? input.url : String(input);
+    return app.request(new URL(url).pathname, {
+      method: input instanceof Request ? (init?.method ?? input.method) : init?.method,
+      headers,
+    });
+  }) as typeof fetch;
+
+  await wrapFetchWithAgentkit(
+    capturingFetch,
+    agentkitSignerFromKey(AGENT_KEY, 5042002),
+  )(RESOURCE_URL);
+  if (!captured) throw new Error("failed to capture a signed agentkit header");
+  return captured;
+}
+
 describe("verifyAgentkitRequest — fail-closed", () => {
-  test("malformed header -> refused (falls through to payment)", async () => {
-    const r = await verifyAgentkitRequest("not-base64-json", cfg());
-    expect(r.authorized).toBe(false);
-  });
-
-  test("garbage base64 payload -> refused", async () => {
-    const bad = Buffer.from(JSON.stringify({ nope: 1 })).toString("base64");
-    const r = await verifyAgentkitRequest(bad, cfg());
-    expect(r.authorized).toBe(false);
-  });
-
-  test("AgentBook RPC failure is refused, never granted", async () => {
+  test("malformed header -> refused before any AgentBook lookup", async () => {
+    let calls = 0;
     const r = await verifyAgentkitRequest(
-      Buffer.from(JSON.stringify({ nope: 1 })).toString("base64"),
+      "not-base64-json",
       cfg({
         agentBook: {
           lookupHuman: async () => {
-            throw new Error("world chain down");
+            calls++;
+            return HUMAN;
           },
         },
       }),
     );
     expect(r.authorized).toBe(false);
+    expect(calls).toBe(0); // rejected at parse — no RPC spent on garbage
+  });
+
+  test("garbage base64 payload -> refused before any AgentBook lookup", async () => {
+    let calls = 0;
+    const bad = Buffer.from(JSON.stringify({ nope: 1 })).toString("base64");
+    const r = await verifyAgentkitRequest(
+      bad,
+      cfg({
+        agentBook: {
+          lookupHuman: async () => {
+            calls++;
+            return HUMAN;
+          },
+        },
+      }),
+    );
+    expect(r.authorized).toBe(false);
+    expect(calls).toBe(0);
+  });
+
+  test("AgentBook RPC failure is refused, never granted (lookup REALLY reached)", async () => {
+    const header = await realAgentkitHeader();
+    let calls = 0;
+    const r = await verifyAgentkitRequest(
+      header,
+      cfg({
+        agentBook: {
+          lookupHuman: async () => {
+            calls++;
+            throw new Error("world chain down");
+          },
+        },
+      }),
+    );
+    expect(calls).toBe(1); // the whole point: the throw happened INSIDE the gate
+    expect(r.authorized).toBe(false);
+  });
+
+  test("unregistered agent (null) is refused with not-human-backed", async () => {
+    const header = await realAgentkitHeader();
+    let calls = 0;
+    const r = await verifyAgentkitRequest(
+      header,
+      cfg({
+        agentBook: {
+          lookupHuman: async () => {
+            calls++;
+            return null;
+          },
+        },
+      }),
+    );
+    expect(calls).toBe(1);
+    expect(r.authorized).toBe(false);
+    expect((r as { reason: string }).reason).toBe("not-human-backed");
+  });
+
+  test("zero-address humanId is refused (a zero read is not a human)", async () => {
+    const header = await realAgentkitHeader();
+    const r = await verifyAgentkitRequest(
+      header,
+      cfg({ agentBook: { lookupHuman: async () => `0x${"0".repeat(64)}` } }),
+    );
+    expect(r.authorized).toBe(false);
+    expect((r as { reason: string }).reason).toBe("not-human-backed");
+  });
+
+  test("a DEFINITIVE unregistered answer is cached — the second call spends no RPC", async () => {
+    let calls = 0;
+    const book = {
+      lookupHuman: async () => {
+        calls++;
+        return null;
+      },
+    };
+    const a = await verifyAgentkitRequest(await realAgentkitHeader(), cfg({ agentBook: book }));
+    const b = await verifyAgentkitRequest(await realAgentkitHeader(), cfg({ agentBook: book }));
+    expect(a.authorized).toBe(false);
+    expect(b.authorized).toBe(false);
+    expect(calls).toBe(1); // the contract already told us nobody vouches — don't ask again
+  });
+
+  test("an AgentBook OUTAGE is NEVER cached — the next call retries the lookup", async () => {
+    // The dangerous case: caching an outage as "unregistered" would lock a legitimately
+    // registered agent out for the whole TTL, turning one bad minute of RPC into an hour of
+    // wrongly-refused commerce.
+    let calls = 0;
+    const book = {
+      lookupHuman: async () => {
+        calls++;
+        throw new Error("HTTP 429 Too Many Requests");
+      },
+    };
+    const a = await verifyAgentkitRequest(await realAgentkitHeader(), cfg({ agentBook: book }));
+    const b = await verifyAgentkitRequest(await realAgentkitHeader(), cfg({ agentBook: book }));
+    expect(a.authorized).toBe(false);
+    expect(b.authorized).toBe(false);
+    expect(calls).toBe(2); // we still don't know — ask again rather than cache a guess
+  });
+
+  test("an outage does not poison an existing cached positive", async () => {
+    let mode: "ok" | "down" = "ok";
+    const book = {
+      lookupHuman: async () => {
+        if (mode === "down") throw new Error("world chain down");
+        return HUMAN;
+      },
+    };
+    const first = await verifyAgentkitRequest(await realAgentkitHeader(), cfg({ agentBook: book }));
+    expect(first.authorized).toBe(true);
+    mode = "down";
+    const second = await verifyAgentkitRequest(
+      await realAgentkitHeader(),
+      cfg({ agentBook: book }),
+    );
+    expect(second.authorized).toBe(true); // served from the positive cache, never hits the RPC
+  });
+
+  test("a valid proof for a registered human IS authorized (positive control)", async () => {
+    const header = await realAgentkitHeader();
+    let calls = 0;
+    const r = await verifyAgentkitRequest(
+      header,
+      cfg({
+        agentBook: {
+          lookupHuman: async () => {
+            calls++;
+            return HUMAN;
+          },
+        },
+      }),
+    );
+    expect(calls).toBe(1);
+    expect(r.authorized).toBe(true);
+    expect((r as { humanId: string }).humanId).toBe(HUMAN);
   });
 });
 

@@ -1,12 +1,13 @@
 import { randomBytes } from "node:crypto";
 import {
-  createAgentBookVerifier,
   declareAgentkitExtension,
   parseAgentkitHeader,
   validateAgentkitMessage,
   verifyAgentkitSignature,
 } from "@worldcoin/agentkit";
 import type { WorldStore } from "../persistence/worldStore";
+import type { Address } from "../types";
+import { createAgentBookReader } from "./agentBookReader";
 
 /**
  * Seller-side "is this agent backed by a real, unique human?" check.
@@ -20,7 +21,22 @@ import type { WorldStore } from "../persistence/worldStore";
  * the paid route and settlement stay on Arc. The two never mix.
  */
 
-const CACHE_TTL_MS = 60 * 60_000; // 1h — positive lookups only
+/** Canonical World Chain deployment — same address our config defaults to. */
+const AGENT_BOOK_DEFAULT = "0xA23aB2712eA7BBa896930544C7d6636a96b944dA";
+
+const CACHE_TTL_MS = 60 * 60_000; // 1h — a registration is stable once made
+/** Deliberately much shorter than the positive TTL: "not registered" is a state the agent is
+ *  actively trying to leave, so a stale negative is a bad checkout experience. Long enough to
+ *  absorb a retry storm from one unregistered agent, short enough that registering feels instant. */
+const NEGATIVE_CACHE_TTL_MS = 60_000; // 1 min
+
+/** Our own AgentBook read, NOT the SDK's — see agentBookReader.ts for why the difference matters. */
+function defaultAgentBook(cfg: AgentkitSellerConfig) {
+  return createAgentBookReader({
+    ...(cfg.worldChainRpc ? { rpcUrl: cfg.worldChainRpc } : {}),
+    contractAddress: (cfg.agentBookAddress ?? AGENT_BOOK_DEFAULT) as Address,
+  });
+}
 
 export interface AgentkitSellerConfig {
   /** Hostname ONLY (no port): validateAgentkitMessage compares against URL.hostname. */
@@ -112,22 +128,30 @@ export async function verifyAgentkitRequest(
       return { authorized: false, reason: `invalid-signature:${sig.error ?? "unknown"}` };
     const agentAddress = sig.address;
 
-    // AgentBook lookup (World Chain), cached. The SDK swallows RPC errors into `null`, so a
-    // null is ambiguous (unregistered OR outage) — either way we refuse, i.e. fail closed.
-    let humanId = cfg.store.getCachedHuman(agentAddress, now(), CACHE_TTL_MS);
+    // AgentBook lookup (World Chain), cached. Our reader lets transport errors PROPAGATE, so a
+    // `null` here means the contract itself answered "nobody vouches for this address" — unlike
+    // the SDK's lookupHuman, which catches and returns null for an outage too. That distinction
+    // is what makes it safe to cache a negative at all: a cached outage would refuse a
+    // legitimately registered agent for the whole TTL. A throw is caught by the outer handler and
+    // refused WITHOUT being cached (fail-closed, but we ask again next time).
+    const cached = cfg.store.getCachedLookup(
+      agentAddress,
+      now(),
+      CACHE_TTL_MS,
+      NEGATIVE_CACHE_TTL_MS,
+    );
+    let humanId = cached?.humanId ?? undefined;
+    if (cached?.humanId === null)
+      return { authorized: false, reason: "not-human-backed", humanId: undefined };
     if (!humanId) {
-      const verifier =
-        cfg.agentBook ??
-        createAgentBookVerifier({
-          ...(cfg.worldChainRpc ? { rpcUrl: cfg.worldChainRpc } : {}),
-          ...(cfg.agentBookAddress ? { contractAddress: cfg.agentBookAddress } : {}),
-          // biome-ignore lint/suspicious/noExplicitAny: options typing varies across SDK versions.
-        } as any);
+      const verifier = cfg.agentBook ?? defaultAgentBook(cfg);
       const looked = await verifier.lookupHuman(agentAddress);
-      if (!looked || /^0x0*$/.test(looked) || looked === "0")
+      if (!looked || /^0x0*$/.test(looked) || looked === "0") {
+        cfg.store.cacheLookup(agentAddress, null, now()); // definitive: the contract said nobody
         return { authorized: false, reason: "not-human-backed", humanId: undefined };
+      }
       humanId = looked;
-      cfg.store.cacheHuman(agentAddress, humanId, now()); // positive results only
+      cfg.store.cacheLookup(agentAddress, humanId, now());
     }
 
     const { allowed, used } = cfg.store.tryIncrementUsage(

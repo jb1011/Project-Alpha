@@ -77,10 +77,31 @@ export interface WorldStore {
     now: number,
     windowMs?: number,
   ): { allowed: boolean; used: number; resetAt?: number };
-  /** Cached AgentBook lookup (positive results only — misses must re-read, fail-closed). */
+  /** Cached AgentBook lookup, positives only. Thin wrapper over `getCachedLookup`. */
   getCachedHuman(agentAddress: string, now: number, ttlMs: number): string | undefined;
   cacheHuman(agentAddress: string, humanId: string, now: number): void;
+  /**
+   * Cached AgentBook lookup including DEFINITIVE negatives.
+   *
+   * `{ humanId: null }` means the contract itself answered "nobody vouches for this address" —
+   * NOT that the lookup failed. A failed lookup must never reach this cache: caching an outage as
+   * a refusal would lock a legitimately registered agent out for the whole TTL. Negatives carry
+   * their own (much shorter) TTL because registration is something an agent actively fixes and
+   * should be picked up promptly.
+   */
+  getCachedLookup(
+    agentAddress: string,
+    now: number,
+    positiveTtlMs: number,
+    negativeTtlMs: number,
+  ): { humanId: string | null } | undefined;
+  cacheLookup(agentAddress: string, humanId: string | null, now: number): void;
 }
+
+/** Sentinel stored in `world_human_cache.human_id` for a DEFINITIVE "not registered" answer.
+ *  The column is NOT NULL and the table is a disposable cache, so a sentinel beats a migration.
+ *  Not a valid human id (those are 0x-prefixed hex), so it can never collide with a real one. */
+const UNREGISTERED = "";
 
 /** The SDK refuses messages older than 5 minutes, so anything past this is unreplayable. */
 const NONCE_RETENTION_MS = 15 * 60_000;
@@ -303,19 +324,36 @@ export class SqliteWorldStore implements WorldStore {
   }
 
   getCachedHuman(agentAddress: string, now: number, ttlMs: number): string | undefined {
+    const hit = this.getCachedLookup(agentAddress, now, ttlMs, 0);
+    return hit?.humanId ?? undefined;
+  }
+
+  cacheHuman(agentAddress: string, humanId: string, now: number): void {
+    this.cacheLookup(agentAddress, humanId, now);
+  }
+
+  getCachedLookup(
+    agentAddress: string,
+    now: number,
+    positiveTtlMs: number,
+    negativeTtlMs: number,
+  ): { humanId: string | null } | undefined {
     const r = this.db
       .prepare("SELECT human_id, cached_at FROM world_human_cache WHERE agent_address = ?")
       .get(agentAddress.toLowerCase()) as { human_id: string; cached_at: number } | undefined;
     if (!r) return undefined;
-    return now - r.cached_at <= ttlMs ? r.human_id : undefined;
+    const negative = r.human_id === UNREGISTERED;
+    const ttl = negative ? negativeTtlMs : positiveTtlMs;
+    if (now - r.cached_at > ttl) return undefined;
+    return { humanId: negative ? null : r.human_id };
   }
 
-  cacheHuman(agentAddress: string, humanId: string, now: number): void {
+  cacheLookup(agentAddress: string, humanId: string | null, now: number): void {
     this.db
       .prepare(
         `INSERT INTO world_human_cache (agent_address, human_id, cached_at) VALUES (?,?,?)
          ON CONFLICT(agent_address) DO UPDATE SET human_id=excluded.human_id, cached_at=excluded.cached_at`,
       )
-      .run(agentAddress.toLowerCase(), humanId, now);
+      .run(agentAddress.toLowerCase(), humanId ?? UNREGISTERED, now);
   }
 }
