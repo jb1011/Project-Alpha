@@ -49,11 +49,14 @@ a mini app where you control the client, but weaker for a website where the visi
 their browser. We implemented it exactly as documented and treat it internally as a claim rather
 than proof.
 
-Related question: what is `expires_at_min`? We assumed it was the credential expiry and nearly
-shipped a check against it. Turns out that across four real proofs it consistently lands 19 to 44
-seconds in the past, before the verification that produced it, so reading it as an expiry would
-have refused every one of our users. Is it the proof's own validity window? And if we want to
-know when someone's credential actually lapses, what should we be reading?
+Related, smaller one: `expires_at_min` nearly got us. We read it as the credential expiry and
+almost shipped a gate on it, which would have refused every one of our users since across real
+proofs it lands a few seconds in the past by the time we record it. We later found the v4 verify
+reference defines it as a minimum validity timestamp, which explains everything, but the name
+reads like an expiry at 2am. A one-line "this is a validity floor committed at proof time, do not
+gate on it as an expiry" in the verify docs would probably save the next team the same near-miss.
+And the question that remains for us: when a guardian's credential actually lapses (the NFC
+credential has no renewal), what should a relying party watch to notice?
 
 Happy to go deeper on number 2, we've already built the workaround and could share it properly.
 The Arc and World combination has been working really well for us.
@@ -87,15 +90,24 @@ round-trip (`test/world/fixtures/attest-verify-response.json`, staging, 2026-07-
 ⚠ One response, one environment, one request type. Hence "are we missing a field?" rather than
 "you don't return it."
 
-**#4 — `expires_at_min` is in the past. MEASUREMENT CONFIRMED (4 points), MEANING INFERRED.**
-Three production `guardian_verifications` rows plus the staging attestation fixture. Deltas
-(`verified_at − expires_at_min × 1000`): **+29s, +19s, +44s**, and the fixture value 1785005211
-decodes as seconds to its own capture date. Spread is consistent with proof-generation-to-record
-latency. Read as minutes it lands in the year 5363.
+**#4 — `expires_at_min` is in the past. MEASUREMENT CONFIRMED (4 points), MEANING NOW CONFIRMED
+BY THEIR DOCS (2026-07-30 update).** Three production `guardian_verifications` rows plus the
+staging attestation fixture. Deltas (`verified_at − expires_at_min × 1000`): **+29s, +19s, +44s**,
+and the fixture value 1785005211 decodes as seconds to its own capture date. The v4 verify API
+reference defines the field as *"the minimum timestamp until which the credential remains valid"*
+— a validity floor committed at proof time on the phone, which explains the consistent
+seconds-in-the-past skew exactly. So the item was REPHRASED from "what is this field?" (their docs
+answer that) to (a) a docs suggestion — name/annotate it so nobody gates on it as an expiry — and
+(b) the genuinely open question: what should a relying party watch to notice a credential lapsing,
+given the NFC credential has a real internal `expires_at` (max 10 years) and **no renewal**.
 
 We nearly shipped a gate on this field (PR #58's first attempt) which would have refused **every**
 guardian; the reversal and a regression test are in `worldId.ts` / `guardianEntityCap.test.ts`.
-That near-miss is why this is asked as a question, not asserted as a bug.
+
+**#3 addendum (2026-07-30):** the v4 verify OpenAPI schema confirms the audit finding — there is
+no `identity_attested` field in any server response object; it exists only in the client-side
+idkit result. Our "are we missing a field?" phrasing can stay (it is polite), but we now know the
+answer is no.
 
 ## If it needs to be shorter
 

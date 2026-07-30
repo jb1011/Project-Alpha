@@ -9,6 +9,7 @@ documents/
 .env
 .env.*
 !.env.example
+!.env.sandbox.example
 test/fixtures/*.local.json
 tools/passkey-capture/capture.js
 
