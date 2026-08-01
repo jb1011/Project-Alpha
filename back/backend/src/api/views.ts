@@ -19,6 +19,8 @@ export interface EntityView {
   error: string | null;
   /** Off-chain per-transaction cap in atomic USDC (6 decimals), or null if unset. */
   perTxCap: string | null;
+  /** Per-entity buyer trust dial; null = inherits the platform default. */
+  trustPolicy: "open" | "verified-sellers-only" | "verified-legal-bodies-only" | null;
 }
 
 export function toEntityView(r: EntityRecord): EntityView {
@@ -39,5 +41,6 @@ export function toEntityView(r: EntityRecord): EntityView {
     fundTxHash: r.fundTxHash,
     error: r.error ?? null,
     perTxCap: r.perTxCap?.toString() ?? null,
+    trustPolicy: r.trustPolicy ?? null,
   };
 }

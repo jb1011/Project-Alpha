@@ -52,6 +52,9 @@ export interface EntityRecord {
   specJson?: string | null;
   /** Off-chain per-transaction USDC cap in base units (6 decimals). null = no cap. */
   perTxCap?: bigint | null;
+  /** Per-entity buyer trust dial; null/undefined = inherit the global X402_BUYER_TRUST_POLICY.
+   *  Guardian-set only (session route) — never writable through an agent API key. */
+  trustPolicy?: "open" | "verified-sellers-only" | "verified-legal-bodies-only" | null;
   /** Opaque public slug; the on-chain metadataURI is METADATA_BASE_URL/metadata/<publicId>. */
   publicId?: string | null;
 }

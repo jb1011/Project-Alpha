@@ -707,10 +707,10 @@ test("status surfaces the standing exposure breakdown + ceiling", async () => {
 // The seller check runs at the authorize chokepoint: pre-sign, so a denial releases the
 // idempotency claim and nothing can have settled.
 
-function fakeTrust(outcome: "verified" | "unregistered" | "unavailable") {
+function fakeTrust(outcome: "verified" | "not-human-backed" | "unavailable") {
   let calls = 0;
   return {
-    policy: "verified-sellers-only" as const,
+    globalPolicy: "verified-sellers-only" as const,
     verify: async () => {
       calls++;
       return outcome;
@@ -722,7 +722,7 @@ function fakeTrust(outcome: "verified" | "unregistered" | "unavailable") {
 test("strict buyer: unregistered seller is denied pre-sign — no retry fetch, claim released", async () => {
   const { reader } = makeReader();
   const { fn } = fakeFetch();
-  const trust = fakeTrust("unregistered");
+  const trust = fakeTrust("not-human-backed");
   const svc = buildEntityPaymentService(makeConfig(), {
     reader,
     ledger,
@@ -808,10 +808,10 @@ test("open policy: the seller check is NEVER consulted (regression pin for the d
     fetchImpl: fn as unknown as typeof fetch,
     readPocketFloat: SUFFICIENT_FLOAT,
     sellerTrust: {
-      policy: "open",
+      globalPolicy: "open",
       verify: async () => {
         consulted++;
-        return "unregistered";
+        return "not-human-backed";
       },
     },
   });
@@ -825,4 +825,114 @@ test("open policy: the seller check is NEVER consulted (regression pin for the d
 
   expect(receipt.ok).toBe(true); // would have been denied if the strict path ran
   expect(consulted).toBe(0);
+});
+
+// ── Per-entity trust policy override (v2.5 batch 1, item 1) ─────────────────────────────────
+// entity.trustPolicy overrides the platform dial in BOTH directions; NULL/undefined inherits.
+
+test("per-entity override: strict entity is refused even when the platform dial is open", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  let consulted = 0;
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: {
+      globalPolicy: "open",
+      verify: async () => {
+        consulted++;
+        return "not-human-backed";
+      },
+    },
+  });
+
+  const receipt = await svc.pay(seedEntity({ trustPolicy: "verified-sellers-only" }), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-override-strict",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "seller-not-human-backed" });
+  expect(consulted).toBe(1);
+});
+
+test("per-entity override: open entity settles even when the platform dial is strict", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  let consulted = 0;
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: {
+      globalPolicy: "verified-sellers-only",
+      verify: async () => {
+        consulted++;
+        return "not-human-backed"; // would deny if consulted
+      },
+    },
+  });
+
+  const receipt = await svc.pay(seedEntity({ trustPolicy: "open" }), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-override-open",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt.ok).toBe(true);
+  expect(consulted).toBe(0); // the guardian said open — the check must not run
+});
+
+test("no per-entity value -> inherits the global dial (strict platform refuses)", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: { globalPolicy: "verified-sellers-only", verify: async () => "not-human-backed" },
+  });
+
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-inherit",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "seller-not-human-backed" });
+});
+
+test("legal-bodies denial surfaces its own reason (not the human-backed one)", async () => {
+  const { reader } = makeReader();
+  const { fn } = fakeFetch();
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fn as unknown as typeof fetch,
+    readPocketFloat: SUFFICIENT_FLOAT,
+    sellerTrust: {
+      globalPolicy: "verified-legal-bodies-only",
+      verify: async () => "not-legal-body",
+    },
+  });
+
+  const receipt = await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1000n,
+    idempotencyKey: "k-lb-reason",
+    tenantId: "tenantA",
+  });
+
+  expect(receipt).toMatchObject({ ok: false, reason: "seller-not-legal-body" });
 });

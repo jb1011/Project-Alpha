@@ -18,6 +18,7 @@ import { mountReputationRoutes } from "./routes/reputation";
 import { mountRunsRoutes } from "./routes/runs";
 import { mountSchemaRoutes } from "./routes/schema";
 import { mountTreasuryRoutes } from "./routes/treasury";
+import { mountTrustPolicyRoutes } from "./routes/trustPolicy";
 import { mountWorldIdRoutes } from "./routes/worldId";
 import { mountX402DemoRoutes } from "./routes/x402Demo";
 
@@ -120,6 +121,7 @@ export function buildApiApp(deps: ApiDeps) {
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);
   mountPerTxCapRoutes(app, deps);
+  mountTrustPolicyRoutes(app, deps);
   mountRunsRoutes(app, deps);
   mountJobRoutes(app, deps);
   mountReputationRoutes(app, deps);

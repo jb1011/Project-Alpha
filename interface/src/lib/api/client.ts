@@ -171,6 +171,18 @@ export async function executePolicyUpdate(
   });
 }
 
+export async function patchTrustPolicy(
+  token: string,
+  id: string,
+  trustPolicy: "open" | "verified-sellers-only" | "verified-legal-bodies-only" | null,
+): Promise<{ trustPolicy: string | null }> {
+  return request(`/entities/${encodeURIComponent(id)}/trust-policy`, {
+    method: "PATCH",
+    token,
+    body: { trustPolicy },
+  });
+}
+
 export async function patchPerTxCap(
   token: string,
   id: string,

@@ -24,6 +24,8 @@ export type EntityView = {
   fundTxHash: string | null;
   error: string | null;
   perTxCap: string | null;
+  /** Per-agent buyer trust dial; null = inherits the platform default. */
+  trustPolicy: "open" | "verified-sellers-only" | "verified-legal-bodies-only" | null;
 };
 
 /** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */

@@ -75,12 +75,21 @@ async function main() {
         // WORLD_* portal creds — the reader only needs the World Chain RPC + AgentBook address,
         // both of which have defaults. docs/design/2026-07-30-trust-policy-dials.md
         sellerTrust: buildSellerTrust({
-          policy: cfg.x402BuyerTrustPolicy,
+          globalPolicy: cfg.x402BuyerTrustPolicy,
           store: new SqliteWorldStore(db),
           reader: createAgentBookReader({
             rpcUrl: cfg.worldChain?.rpcUrl ?? WORLD_CHAIN_DEFAULTS.rpcUrl,
             contractAddress: cfg.worldChain?.agentBook ?? WORLD_CHAIN_DEFAULTS.agentBook,
           }),
+          // Legal-bodies tier: local registry lookup + the same Arc reads the dashboard trusts.
+          legalBodies: {
+            findByTreasury: (addr) => {
+              const rec = repo.findByTreasury(addr);
+              return rec ? { proxy: rec.proxy, treasury: rec.treasury } : undefined;
+            },
+            legalStatus: (proxy) => arc.legalStatus(proxy),
+            treasuryPaused: (treasury) => arc.treasuryPaused(treasury),
+          },
         }),
       })
     : undefined;

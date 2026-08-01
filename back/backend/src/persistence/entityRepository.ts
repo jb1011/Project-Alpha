@@ -65,6 +65,7 @@ interface Row {
   bind_tx_hash: string | null;
   fund_tx_hash: string | null;
   per_tx_cap: string | null;
+  trust_policy: string | null;
   public_id: string | null;
 }
 
@@ -115,6 +116,7 @@ function toRecord(r: Row): EntityRecord {
     error: r.error ?? null,
     specJson: r.spec_json ?? null,
     perTxCap: r.per_tx_cap ? BigInt(r.per_tx_cap) : null,
+    trustPolicy: (r.trust_policy as EntityRecord["trustPolicy"]) ?? null,
     publicId: r.public_id ?? null,
   };
 }
@@ -150,6 +152,7 @@ export class SqliteEntityRepository implements EntityRepository {
       bind_tx_hash: rec.bindTxHash,
       fund_tx_hash: rec.fundTxHash,
       per_tx_cap: rec.perTxCap?.toString() ?? null,
+      trust_policy: rec.trustPolicy ?? null,
       public_id: rec.publicId ?? null,
     };
   }
@@ -160,7 +163,7 @@ export class SqliteEntityRepository implements EntityRepository {
         owner_tenant_id, error, spec_json,
         amendment_delay,
         ein, formation_date, oa_hash, metadata_uri, doc_path, treasury_config,
-        agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, public_id, updated_at`;
+        agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, trust_policy, public_id, updated_at`;
 
   private static readonly INSERT_VALUES = `
         @idempotency_key, @name, @status, @manager, @guardian, @operator,
@@ -168,7 +171,7 @@ export class SqliteEntityRepository implements EntityRepository {
         @owner_tenant_id, @error, @spec_json,
         @amendment_delay,
         @ein, @formation_date, @oa_hash, @metadata_uri, @doc_path, @treasury_config,
-        @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @public_id, CURRENT_TIMESTAMP`;
+        @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @trust_policy, @public_id, CURRENT_TIMESTAMP`;
 
   upsert(rec: EntityRecord): void {
     this.db
@@ -188,7 +191,7 @@ export class SqliteEntityRepository implements EntityRepository {
           proxy=excluded.proxy, treasury=excluded.treasury,
           create_tx_hash=excluded.create_tx_hash, bind_tx_hash=excluded.bind_tx_hash,
           fund_tx_hash=excluded.fund_tx_hash, public_id=excluded.public_id,
-          per_tx_cap=excluded.per_tx_cap, updated_at=CURRENT_TIMESTAMP
+          per_tx_cap=excluded.per_tx_cap, trust_policy=excluded.trust_policy, updated_at=CURRENT_TIMESTAMP
       `)
       .run(SqliteEntityRepository.bindings(rec));
   }

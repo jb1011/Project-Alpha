@@ -7,6 +7,7 @@ import {
   executePolicyUpdate,
   getEntity,
   patchPerTxCap,
+  patchTrustPolicy,
   schedulePolicyUpdate,
 } from "@/lib/api/client";
 import type { EntityView } from "@/lib/api/types";
@@ -46,6 +47,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   const [pending, setPending] = React.useState<PendingPolicy | null>(null);
 
   const [perTxCap, setPerTxCap] = React.useState("");
+  const [trustPolicy, setTrustPolicy] = React.useState<string>("inherit");
   const [dailyCap, setDailyCap] = React.useState("");
   const [periodHours, setPeriodHours] = React.useState("24");
   const [allowlistOn, setAllowlistOn] = React.useState(false);
@@ -68,6 +70,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
     const e = await getEntity(auth.token, entityId);
     setEntity(e);
     if (e.perTxCap) setPerTxCap(String(Number(e.perTxCap) / 1e6));
+    setTrustPolicy(e.trustPolicy ?? "inherit");
   }, [ensureSession, entityId]);
 
   React.useEffect(() => {
@@ -121,6 +124,17 @@ export function AgentSettings({ entityId }: { entityId: string }) {
       const val = perTxCap.trim() === "" ? null : perTxCap.trim();
       await patchPerTxCap(auth.token, entityId, val);
     }, "Failed to update per-tx cap.");
+  }
+
+  async function onSaveTrustPolicy() {
+    await runTx(async () => {
+      const auth = await ensureSession();
+      await patchTrustPolicy(
+        auth.token,
+        entityId,
+        trustPolicy === "inherit" ? null : (trustPolicy as "open" | "verified-sellers-only" | "verified-legal-bodies-only"),
+      );
+    }, "Failed to update the trust policy.");
   }
 
   async function onSchedulePolicy() {
@@ -291,6 +305,31 @@ export function AgentSettings({ entityId }: { entityId: string }) {
             />
           </Field>
           <Button onClick={() => void onSavePerTxCap()} loading={busy}>
+            Save
+          </Button>
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <SectionTitle>Buyer trust policy</SectionTitle>
+        <p className="mt-1 text-[12px] text-muted-2">
+          Who this agent is willing to pay. Guardian-only — an agent can never loosen its own
+          strictness through an API key.
+        </p>
+        <div className="mt-4 flex flex-wrap items-end gap-3">
+          <Field label="Policy" className="min-w-[260px] flex-1">
+            <select
+              value={trustPolicy}
+              onChange={(e) => setTrustPolicy(e.target.value)}
+              className="w-full rounded-md border hairline bg-transparent px-3 py-2 text-[13px] text-ink"
+            >
+              <option value="inherit">Platform default</option>
+              <option value="open">Open — pay any seller the on-chain policy allows</option>
+              <option value="verified-sellers-only">Strict — only human-backed sellers (World AgentBook)</option>
+              <option value="verified-legal-bodies-only">Strictest — only active Novi Corpus legal bodies</option>
+            </select>
+          </Field>
+          <Button onClick={() => void onSaveTrustPolicy()} loading={busy}>
             Save
           </Button>
         </div>

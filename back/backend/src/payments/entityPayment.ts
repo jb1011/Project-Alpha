@@ -79,6 +79,14 @@ export interface EntityPaymentDeps {
   sellerTrust?: SellerTrust;
 }
 
+/** Deny reasons for each non-verified seller-trust outcome (docs/design/2026-08-01-v25-batch1.md). */
+const SELLER_DENY_REASONS = {
+  "not-human-backed": "seller-not-human-backed",
+  "not-legal-body": "seller-not-legal-body",
+  "legal-body-inactive": "seller-legal-body-inactive",
+  unavailable: "seller-verification-unavailable",
+} as const;
+
 /** The pocket master seed is required to derive a per-agent pocket (mirrors liveRunner.ts). */
 function requireMasterSeed(cfg: Config): Hex {
   if (!cfg.pocketMasterSeed) throw new Error("set POCKET_MASTER_SEED to run payments");
@@ -154,13 +162,14 @@ export function buildEntityPaymentService(
     // challenge arrives, so this is the earliest point that can see it. Still strictly PRE-SIGN:
     // a denial here is a "failure before signing", the idempotency claim is released, and the same
     // key retries cleanly once the seller registers (or the World Chain RPC recovers).
+    // The EFFECTIVE policy is the guardian's per-entity dial when set, else the platform default —
+    // an override wins in BOTH directions (stricter or looser than the platform).
     const trust = deps.sellerTrust;
-    if (!trust || trust.policy === "open") return authorize;
+    const effective = entity.trustPolicy ?? trust?.globalPolicy ?? "open";
+    if (!trust || effective === "open") return authorize;
     return async (req: AuthorizeRequest): Promise<AuthorizeResult> => {
-      const outcome = await trust.verify(req.payee);
-      if (outcome === "unregistered") return { ok: false, reason: "seller-not-human-backed" };
-      if (outcome === "unavailable")
-        return { ok: false, reason: "seller-verification-unavailable" };
+      const outcome = await trust.verify(req.payee, effective);
+      if (outcome !== "verified") return { ok: false, reason: SELLER_DENY_REASONS[outcome] };
       return authorize(req);
     };
   };

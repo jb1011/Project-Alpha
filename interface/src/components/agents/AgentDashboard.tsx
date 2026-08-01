@@ -371,6 +371,18 @@ export function AgentDashboard({
                 k="Standing float ceiling"
                 v={ceilingUsdc === null ? "—" : `≤ ${formatUsdc(ceilingUsdc)} USDC`}
               />
+              <RuleRow
+                k="Buyer trust policy"
+                v={
+                  entity?.trustPolicy
+                    ? entity.trustPolicy === "verified-legal-bodies-only"
+                      ? "Strictest — legal bodies only (own setting)"
+                      : entity.trustPolicy === "verified-sellers-only"
+                        ? "Strict — human-backed sellers (own setting)"
+                        : "Open (own setting)"
+                    : "Platform default"
+                }
+              />
             </dl>
 
             <p className="mt-4 border-t hairline pt-3 text-[11px] leading-[1.5] text-muted-2">
