@@ -21,6 +21,8 @@ export interface EntityView {
   perTxCap: string | null;
   /** Per-entity buyer trust dial; null = inherits the platform default. */
   trustPolicy: "open" | "verified-sellers-only" | "verified-legal-bodies-only" | null;
+  /** WebAuthn credentialId of the guardian passkey registered at onboarding. Owner-visible only. */
+  rootPasskeyId: string | null;
 }
 
 export function toEntityView(r: EntityRecord): EntityView {
@@ -42,5 +44,6 @@ export function toEntityView(r: EntityRecord): EntityView {
     error: r.error ?? null,
     perTxCap: r.perTxCap?.toString() ?? null,
     trustPolicy: r.trustPolicy ?? null,
+    rootPasskeyId: r.rootPasskeyId ?? null,
   };
 }
