@@ -1,10 +1,4 @@
 import { randomBytes } from "node:crypto";
-import {
-  declareAgentkitExtension,
-  parseAgentkitHeader,
-  validateAgentkitMessage,
-  verifyAgentkitSignature,
-} from "@worldcoin/agentkit";
 import type { WorldStore } from "../persistence/worldStore";
 import type { Address } from "../types";
 import { createAgentBookReader } from "./agentBookReader";
@@ -20,6 +14,16 @@ import { createAgentBookReader } from "./agentBookReader";
  * Chain separation: the AgentBook lookup always resolves on World Chain (SDK guarantee), while
  * the paid route and settlement stay on Arc. The two never mix.
  */
+
+/** Lazily load @worldcoin/agentkit so its import cost is paid on the FIRST World-layer request,
+ *  not at boot by every deployment. Measured on the api import chain under tsx: 209.1 -> 201.2 MB
+ *  RSS (~8 MB marginal — much of the SDK's dep tree is shared with viem; the audit's ~29.5 MB was
+ *  the full-boot estimate). Cached promise = loaded exactly once. */
+let agentkitMod: Promise<typeof import("@worldcoin/agentkit")> | undefined;
+const loadAgentkit = () => {
+  agentkitMod ??= import("@worldcoin/agentkit");
+  return agentkitMod;
+};
 
 /** Canonical World Chain deployment — same address our config defaults to. */
 const AGENT_BOOK_DEFAULT = "0xA23aB2712eA7BBa896930544C7d6636a96b944dA";
@@ -68,12 +72,13 @@ export interface AgentkitSellerConfig {
 /** The `extensions.agentkit` block for our 402 body. The SDK does NOT fill nonce/issuedAt/
  *  expirationTime (the hooks pipeline normally would), so we hand-mint them per response —
  *  without them the client's isAgentkitExtension check rejects the challenge. */
-export function mintAgentkitExtension(cfg: {
+export async function mintAgentkitExtension(cfg: {
   domain: string;
   resourceUrl: string;
   network: string;
   allowancePerHuman: number;
 }) {
+  const { declareAgentkitExtension } = await loadAgentkit();
   const ext = declareAgentkitExtension({
     domain: cfg.domain,
     resourceUri: cfg.resourceUrl,
@@ -109,6 +114,8 @@ export async function verifyAgentkitRequest(
 ): Promise<AgentkitOutcome> {
   const now = cfg.now ?? Date.now;
   try {
+    const { parseAgentkitHeader, validateAgentkitMessage, verifyAgentkitSignature } =
+      await loadAgentkit();
     const payload = parseAgentkitHeader(header);
 
     const validation = await validateAgentkitMessage(payload, cfg.resourceUrl, {

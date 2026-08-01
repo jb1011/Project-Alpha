@@ -122,9 +122,9 @@ export function buildPaywall(cfg: PaywallConfig) {
 
   /** 402 body, plus the hand-minted agentkit extension when the World gate is configured.
    *  `extensions` sits top-level next to `accepts`; the client only reads extensions.agentkit. */
-  const challenge = () =>
+  const challenge = async () =>
     cfg.agentkit
-      ? { ...buildRequirements(cfg), extensions: mintAgentkitExtension(cfg.agentkit) }
+      ? { ...buildRequirements(cfg), extensions: await mintAgentkitExtension(cfg.agentkit) }
       : buildRequirements(cfg);
 
   const strict = cfg.trustPolicy === "accountable-only" && !!cfg.agentkit;
@@ -132,7 +132,7 @@ export function buildPaywall(cfg: PaywallConfig) {
   /** Strict refusal: a doorway, not a wall. 403 (never 402 — payment would not help), with the
    *  remediation AND the standard challenge, so a capable agent can fix its situation from the
    *  refusal alone. */
-  const refusal = (reason: string) => ({
+  const refusal = async (reason: string) => ({
     error: "human_backing_required",
     detail: "this seller trades only with agents a verified unique human answers for",
     reason,
@@ -142,7 +142,7 @@ export function buildPaywall(cfg: PaywallConfig) {
       chain: "world-chain",
     },
     // Safe: `strict` (checked by every caller) implies cfg.agentkit is present.
-    extensions: mintAgentkitExtension(cfg.agentkit as AgentkitSellerConfig),
+    extensions: await mintAgentkitExtension(cfg.agentkit as AgentkitSellerConfig),
   });
 
   app.get(path, async (c) => {
@@ -154,7 +154,7 @@ export function buildPaywall(cfg: PaywallConfig) {
     // path below — everyone pays. The per-human counter acts as a rate cap (429), not a free
     // allowance: one human backing fifty agents still gets one budget.
     if (strict) {
-      if (!akHeader) return c.json(refusal("no-proof-presented"), 403);
+      if (!akHeader) return c.json(await refusal("no-proof-presented"), 403);
       const outcome = await verifyAgentkitRequest(akHeader, cfg.agentkit as AgentkitSellerConfig);
       if (!outcome.authorized) {
         if (outcome.reason === "allowance-exhausted") {
@@ -164,7 +164,7 @@ export function buildPaywall(cfg: PaywallConfig) {
             429,
           );
         }
-        return c.json(refusal(outcome.reason ?? "unverified"), 403);
+        return c.json(await refusal(outcome.reason ?? "unverified"), 403);
       }
       c.header("X-AGENTKIT-HUMAN", outcome.humanId);
       c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
@@ -193,10 +193,10 @@ export function buildPaywall(cfg: PaywallConfig) {
     }
 
     const header = c.req.header("X-PAYMENT");
-    if (!header) return c.json(challenge(), 402);
+    if (!header) return c.json(await challenge(), 402);
     const v = await verifyPayment(header, cfg);
-    if (!v.ok) return c.json({ ...challenge(), error: v.reason }, 402);
-    if (seen.has(v.nonce)) return c.json({ ...challenge(), error: "replay" }, 402);
+    if (!v.ok) return c.json({ ...(await challenge()), error: v.reason }, 402);
+    if (seen.has(v.nonce)) return c.json({ ...(await challenge()), error: "replay" }, 402);
     seen.add(v.nonce);
     if (cfg.settle) {
       const r = await cfg.settle(header, {
@@ -213,7 +213,8 @@ export function buildPaywall(cfg: PaywallConfig) {
         },
         resourceUrl: cfg.resourceUrl ?? cfg.resource ?? "/api/insight",
       });
-      if (!r.ok) return c.json({ ...challenge(), error: `settle-failed:${r.reason ?? ""}` }, 402);
+      if (!r.ok)
+        return c.json({ ...(await challenge()), error: `settle-failed:${r.reason ?? ""}` }, 402);
       if (r.transferId) c.header("X-PAYMENT-RESPONSE", r.transferId);
     }
     const served = (await cfg.serve(c.req.raw)) as Record<string, unknown>;

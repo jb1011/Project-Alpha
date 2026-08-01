@@ -1,4 +1,3 @@
-import { createAgentkitClient } from "@worldcoin/agentkit";
 import type { Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -41,14 +40,28 @@ export function wrapFetchWithAgentkit(
   baseFetch: typeof fetch,
   signer: AgentkitSigner,
 ): typeof fetch {
-  try {
-    const client = createAgentkitClient({
-      signer,
-      fetch: baseFetch,
-      // biome-ignore lint/suspicious/noExplicitAny: client options typing varies across SDK versions.
-    } as any) as { fetch: typeof fetch };
-    return client.fetch ?? baseFetch;
-  } catch {
-    return baseFetch;
-  }
+  // Lazy: the SDK (~8 MB marginal RSS measured; see worldVerifier.ts) loads on the FIRST
+  // wrapped call, not at composition time —
+  // buildEntityPaymentService wraps a fetch on every pay() even when the seller has no World
+  // gate. Cached promise = one load per wrapper. Failure semantics unchanged: if the client
+  // cannot be constructed the ORIGINAL fetch serves every call — the payment path never breaks
+  // because the World layer is unavailable.
+  let wrapped: Promise<typeof fetch> | undefined;
+  const init = async (): Promise<typeof fetch> => {
+    try {
+      const { createAgentkitClient } = await import("@worldcoin/agentkit");
+      const client = createAgentkitClient({
+        signer,
+        fetch: baseFetch,
+        // biome-ignore lint/suspicious/noExplicitAny: client options typing varies across SDK versions.
+      } as any) as { fetch: typeof fetch };
+      return client.fetch ?? baseFetch;
+    } catch {
+      return baseFetch;
+    }
+  };
+  return (async (input: RequestInfo | URL, initArg?: RequestInit) => {
+    wrapped ??= init();
+    return (await wrapped)(input, initArg);
+  }) as typeof fetch;
 }

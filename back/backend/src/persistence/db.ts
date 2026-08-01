@@ -7,6 +7,12 @@ export function openDatabase(path: string): Database.Database {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
+  // WAL + NORMAL is the documented safe pairing: fsync happens on WAL checkpoints instead of
+  // EVERY commit (the untuned default is FULL — ~2.5 ms of blocked event loop per write on the
+  // prod box). Power loss can roll back the last commit but can NOT corrupt the DB; every row we
+  // write is re-derivable or retryable (sagas resume, idempotency claims release, caches rebuild),
+  // so a lost final commit is acceptable. Do not raise to FULL without re-measuring the pay path.
+  db.pragma("synchronous = NORMAL");
   db.pragma("foreign_keys = ON");
   return db;
 }

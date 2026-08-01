@@ -36,13 +36,13 @@ function cfg(over: Partial<AgentkitSellerConfig> = {}): AgentkitSellerConfig {
 }
 
 describe("mintAgentkitExtension", () => {
-  test("hand-mints nonce/issuedAt/expirationTime (SDK omits them; client rejects without)", () => {
-    const ext = mintAgentkitExtension({
+  test("hand-mints nonce/issuedAt/expirationTime (SDK omits them; client rejects without)", async () => {
+    const ext = (await mintAgentkitExtension({
       domain: "example.com",
       resourceUrl: RESOURCE_URL,
       network: "eip155:5042002",
       allowancePerHuman: 3,
-    }) as { agentkit: { info: Record<string, unknown>; supportedChains: unknown[] } };
+    })) as { agentkit: { info: Record<string, unknown>; supportedChains: unknown[] } };
     expect(ext.agentkit.info.nonce).toBeTruthy();
     expect(ext.agentkit.info.issuedAt).toBeTruthy();
     expect(ext.agentkit.info.expirationTime).toBeTruthy();
@@ -50,34 +50,34 @@ describe("mintAgentkitExtension", () => {
     expect(ext.agentkit.supportedChains.length).toBeGreaterThan(0);
   });
 
-  test("REGRESSION: nonce is alphanumeric (SIWE rejects hyphens -> silent skip)", () => {
+  test("REGRESSION: nonce is alphanumeric (SIWE rejects hyphens -> silent skip)", async () => {
     // randomUUID() is the obvious choice and is what World's own example shows, but its hyphens
     // make the client's createHeader throw a SiweError, which it swallows as `agentkit_skipped`:
     // the agent is never authorized and nothing surfaces the reason. Keep this alphanumeric.
     for (let i = 0; i < 20; i++) {
-      const ext = mintAgentkitExtension({
+      const ext = (await mintAgentkitExtension({
         domain: "example.com",
         resourceUrl: RESOURCE_URL,
         network: "eip155:5042002",
         allowancePerHuman: 3,
-      }) as { agentkit: { info: { nonce: string } } };
+      })) as { agentkit: { info: { nonce: string } } };
       expect(ext.agentkit.info.nonce).toMatch(/^[a-zA-Z0-9]{8,}$/);
     }
   });
 
-  test("each mint carries a fresh nonce (no cross-response replay)", () => {
-    const a = mintAgentkitExtension({
+  test("each mint carries a fresh nonce (no cross-response replay)", async () => {
+    const a = (await mintAgentkitExtension({
       domain: "example.com",
       resourceUrl: RESOURCE_URL,
       network: "eip155:5042002",
       allowancePerHuman: 3,
-    }) as { agentkit: { info: { nonce: string } } };
-    const b = mintAgentkitExtension({
+    })) as { agentkit: { info: { nonce: string } } };
+    const b = (await mintAgentkitExtension({
       domain: "example.com",
       resourceUrl: RESOURCE_URL,
       network: "eip155:5042002",
       allowancePerHuman: 3,
-    }) as { agentkit: { info: { nonce: string } } };
+    })) as { agentkit: { info: { nonce: string } } };
     expect(a.agentkit.info.nonce).not.toBe(b.agentkit.info.nonce);
   });
 });

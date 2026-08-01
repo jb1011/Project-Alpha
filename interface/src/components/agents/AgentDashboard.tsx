@@ -68,14 +68,31 @@ export function AgentDashboard({
 
   React.useEffect(() => {
     let cancelled = false;
+    let h: ReturnType<typeof setInterval> | null = null;
     const tick = () => {
       if (!cancelled) void refresh();
     };
-    tick();
-    const h = setInterval(tick, 5000);
+    // Poll only while someone is actually looking: a hidden tab was ~36 backend RPC calls/min
+    // for nobody. Resume with an immediate tick so returning to the tab never shows stale data.
+    const start = () => {
+      if (h === null) {
+        tick();
+        h = setInterval(tick, 5000);
+      }
+    };
+    const stop = () => {
+      if (h !== null) {
+        clearInterval(h);
+        h = null;
+      }
+    };
+    const onVisibility = () => (document.visibilityState === "hidden" ? stop() : start());
+    document.addEventListener("visibilitychange", onVisibility);
+    onVisibility();
     return () => {
       cancelled = true;
-      clearInterval(h);
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [refresh]);
 
