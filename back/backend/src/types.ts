@@ -55,6 +55,9 @@ export interface EntityRecord {
   /** Per-entity buyer trust dial; null/undefined = inherit the global X402_BUYER_TRUST_POLICY.
    *  Guardian-set only (session route) — never writable through an agent API key. */
   trustPolicy?: "open" | "verified-sellers-only" | "verified-legal-bodies-only" | null;
+  /** WebAuthn credentialId of the guardian passkey registered at onboarding (v2.5 item 4) —
+   *  the bookkeeping future "same guardian?" re-verification stands on. Owner-visible only. */
+  rootPasskeyId?: string | null;
   /** Opaque public slug; the on-chain metadataURI is METADATA_BASE_URL/metadata/<publicId>. */
   publicId?: string | null;
 }

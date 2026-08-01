@@ -62,6 +62,10 @@ export class OnboardingRunner {
       ownerTenantId: p.tenantId,
       error: null,
       specJson,
+      // The durable WebAuthn credential id of the guardian passkey this agent was born with.
+      // Both call sites (REST body, MCP store lookup) carry the full passkey, so recording it
+      // here covers every path with no call-site changes. Defensive: REST input is caller-shaped.
+      rootPasskeyId: p.guardianPasskey?.attestation?.credentialId ?? null,
     };
     // Atomic claim: the INSERT-or-nothing is the single gate. Two concurrent starts (or processes
     // racing the same key) can never both win — the loser sees changes()==0 and gets a 409, before

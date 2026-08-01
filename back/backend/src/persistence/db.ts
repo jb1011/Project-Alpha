@@ -278,6 +278,8 @@ export function migrate(db: Database.Database): void {
   if (!cols.includes("spec_json")) db.exec("ALTER TABLE entities ADD COLUMN spec_json TEXT");
   if (!cols.includes("per_tx_cap")) db.exec("ALTER TABLE entities ADD COLUMN per_tx_cap TEXT");
   if (!cols.includes("trust_policy")) db.exec("ALTER TABLE entities ADD COLUMN trust_policy TEXT");
+  if (!cols.includes("root_passkey_id"))
+    db.exec("ALTER TABLE entities ADD COLUMN root_passkey_id TEXT");
   if (!cols.includes("public_id")) db.exec("ALTER TABLE entities ADD COLUMN public_id TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_public_id ON entities(public_id)");
 

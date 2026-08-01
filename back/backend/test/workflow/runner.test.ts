@@ -409,3 +409,27 @@ test("fund() a FAILED fund attempt does not consume the tenant's quota (no funde
   expect(repo.findByIdempotencyKey(bound.idempotencyKey)?.status).toBe("funded");
   expect(repo.sumFundedByTenant(QUOTA_TENANT)).toBe(usdToUnits("3"));
 });
+
+test("start() records the guardian passkey's credentialId as root_passkey_id (v2.5 item 4)", () => {
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: runSaga as never,
+    fundCaps: TEST_FUND_CAPS,
+  });
+  const withId = {
+    challenge: "c",
+    attestation: { credentialId: "cred-abc123", clientDataJson: "", attestationObject: "" },
+  } as never;
+  const { id } = runner.start({ spec, userKey: "pk1", tenantId: TENANT, guardianPasskey: withId });
+  expect(repo.findByIdempotencyKey(id)?.rootPasskeyId).toBe("cred-abc123");
+});
+
+test("start() with a passkey lacking credentialId stores null, not a crash", () => {
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: runSaga as never,
+    fundCaps: TEST_FUND_CAPS,
+  });
+  const { id } = runner.start({ spec, userKey: "pk2", tenantId: TENANT, guardianPasskey: passkey });
+  expect(repo.findByIdempotencyKey(id)?.rootPasskeyId ?? null).toBeNull();
+});
