@@ -57,3 +57,27 @@ Failing-first: window math (in/out of window, boundary), ceiling reject at exact
 gas-seed and CLI paths metered (call-counted fakes), boot invariant, log lines emitted on
 accept AND reject with secrets absent. Mutations: drop the window filter (lifetime sum),
 skip the gas-seed recording, log only rejections — each must fail a named test.
+
+## Audit corrections (2026-08-01, pre-implementation — spec audited against live code)
+
+1. **`runner.fund` claim holds, but split check/record.** The saga's direct `arc.fundTreasury`
+   (onboarding.ts:299) fires only with `fundAmount`, which only `runner.fund` passes (runner.ts:114)
+   — contained. The CHECK belongs in `runner.fund` (synchronous, before the saga spawns); the
+   RECORD belongs in the saga's fund step where the tx actually succeeds.
+2. **Unit normalization was missing.** Gas seeds are 18-dec native wei; treasury funds are 6-dec
+   atomic. Summing them raw is off by 1e12. ALL rows are normalized to 6-dec atomic at record
+   time (`wei / 1e12` for seeds — exact on Arc where native IS USDC).
+3. **Missed path: job funding.** `runJob` step 2 `approveAndFund(budget)` moves platform
+   client-wallet USDC (bounded per job by MAX_JOB_BUDGET, but in no aggregate). New path
+   `job_fund`: check before job creation, record on fund success.
+4. **CLI-through-runner.fund was the wrong shape.** `runner.fund` is async fire-and-forget; the
+   CLI is a synchronous operator tool. Corrected: the CLI keeps its direct signing (documented
+   trusted-operator status) but goes through the SAME meter — check before, record after — so no
+   path is silently unmetered. The original S1 fast-follow intent (no uncapped path) is met by
+   the meter, not by rerouting.
+5. **NEW SCOPE — Turnkey signature metering** (the plan became metered: 25 sigs/month + per-sig
+   charges, after this spec was written). `meterTurnkeyAccount(account, kind)` wraps the three
+   sign methods of every Turnkey-backed viem account (operatorWallet ×2 builders, TurnkeySigner
+   ×2 sites): each signature emits an opsLog line (kind + purpose label; journald is the durable
+   monthly record) and, where a db is registered from the composition root, a `turnkey_sigs` row
+   for an exact in-DB monthly count. Known costs for budgeting: fund_pocket=2, pay=0, denials=0.
