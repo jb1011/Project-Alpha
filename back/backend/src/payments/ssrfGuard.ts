@@ -121,9 +121,23 @@ export async function safeFetch(
  * carried (x402 discovery/retry is GET-shaped); extend deliberately if a POST resource ever
  * needs it.
  */
+/** Duck-typed: the AgentKit SDK constructs its Request from its OWN fetch implementation, so
+ *  `instanceof Request` is FALSE cross-realm even though the object walks and quacks like one
+ *  (proven live 2026-08-01: the instanceof-only fix deployed and the error persisted). URL
+ *  instances also have a string `href`, not `url`, so they fall through to the string branch. */
+function isRequestLike(x: RequestInfo | URL): x is Request {
+  return (
+    typeof x === "object" &&
+    x !== null &&
+    typeof (x as Request).url === "string" &&
+    typeof (x as Request).method === "string" &&
+    (x as Request).headers != null
+  );
+}
+
 export function requestAwareSafeFetch(fetchImpl: typeof fetch): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    if (input instanceof Request) {
+    if (isRequestLike(input)) {
       const headers = new Headers(input.headers);
       new Headers(init?.headers ?? {}).forEach((v, k) => headers.set(k, v));
       return safeFetch(fetchImpl, input.url, {

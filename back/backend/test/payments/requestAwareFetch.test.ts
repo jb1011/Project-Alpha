@@ -58,3 +58,24 @@ describe("requestAwareSafeFetch", () => {
     expect(impl).not.toHaveBeenCalled();
   });
 });
+
+test("a FOREIGN Request-like (not instanceof our Request) is still unwrapped — the prod bug", async () => {
+  // The SDK constructs its Request from its own fetch implementation, so `instanceof Request`
+  // is false in production even though the object walks and quacks like one. Proven live:
+  // the first fix deployed and the error persisted.
+  const calls: { url: string; init?: RequestInit }[] = [];
+  const impl = (async (u: RequestInfo | URL, i?: RequestInit) => {
+    calls.push({ url: String(u), init: i });
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+  const foreign = {
+    url: "https://8.8.8.8/resource",
+    method: "GET",
+    headers: new Headers({ agentkit: "signed" }),
+  }; // deliberately NOT a Request instance
+  const { requestAwareSafeFetch } = await import("../../src/payments/ssrfGuard");
+  const res = await requestAwareSafeFetch(impl)(foreign as unknown as Request);
+  expect(res.status).toBe(200);
+  expect(calls[0]?.url).toBe("https://8.8.8.8/resource");
+  expect(new Headers(calls[0]?.init?.headers).get("agentkit")).toBe("signed");
+});
