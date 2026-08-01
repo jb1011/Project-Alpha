@@ -13,6 +13,7 @@ import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
 import { PaymentLedger } from "../payments/ledger";
+import { buildOutflowMeter } from "../payments/outflowMeter";
 import { buildPocketFunding } from "../payments/pocketFunding";
 import { buildSellerTrust } from "../payments/sellerTrust";
 import { buildReadExposure } from "../payments/standingExposure";
@@ -58,6 +59,11 @@ async function main() {
     identityRegistry: cfg.identityRegistry,
   });
   const operatorSigner = await buildOperatorSigner(cfg);
+  // S5: the platform-wide outflow brake — one meter, shared by every path in this process.
+  const outflows = buildOutflowMeter(db, {
+    ceilingAtomic: cfg.platformOutflowCeiling,
+    windowMs: cfg.platformOutflowWindowMs,
+  });
   // Audit fix C: the platform manager address, force-set into `roles.manager` on onboarding so an
   // agent-first caller never needs to know or guess it (see managerAccount doc).
   const platformManagerAddress = managerAccount(cfg).address;
@@ -96,7 +102,8 @@ async function main() {
 
   // Explicit treasury->pocket top-up (fund_pocket tool/route). Same guard as `payments`: needs both
   // POCKET_MASTER_SEED (to derive the pocket) and Turnkey config (to sign as the operator).
-  const pocketFunding = cfg.pocketMasterSeed && cfg.turnkey ? buildPocketFunding(cfg) : undefined;
+  const pocketFunding =
+    cfg.pocketMasterSeed && cfg.turnkey ? buildPocketFunding(cfg, outflows) : undefined;
 
   // S2 standing-float-ceiling reads for the dashboard (GET /entities/:id/treasury). Same guard as
   // `payments`: undefined when POCKET_MASTER_SEED isn't configured, in which case the route
@@ -137,12 +144,14 @@ async function main() {
       guardianPasskey: i.guardianPasskey,
       provision,
       signerForEntity,
+      outflows,
     });
 
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
+    outflows,
   });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);

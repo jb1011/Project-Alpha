@@ -11,7 +11,10 @@ export type PocketFundingFn = (entity: EntityRecord, amountAtomic: bigint) => Pr
 /** Real composition: reuses the same funding leg as the standalone liveRunner (fundPocket +
  *  requireVaultOperator), just entered from a per-request entity record instead of the live demo's
  *  single resolved treasury. */
-export function buildPocketFunding(cfg: Config): PocketFundingFn {
+export function buildPocketFunding(
+  cfg: Config,
+  outflows?: { record(path: "gas_seed", amountAtomic: bigint, ref: string | null): void },
+): PocketFundingFn {
   return async (entity, amount) => {
     if (!entity.treasury) throw new Error("treasury not ready");
     const vault = requireVaultOperator(entity.treasury, entity);
@@ -22,6 +25,7 @@ export function buildPocketFunding(cfg: Config): PocketFundingFn {
       amount,
       operatorWallet,
       entity.idempotencyKey,
+      { outflows },
     );
   };
 }

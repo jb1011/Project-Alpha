@@ -186,6 +186,10 @@ export async function fundPocket(
   floatAtomic: bigint,
   operatorWallet: WalletClient,
   entityKey: string,
+
+  opts?: {
+    outflows?: { record(path: "gas_seed", amountAtomic: bigint, ref: string | null): void };
+  },
 ): Promise<Hex[]> {
   return withKeyedLock(entityKey, async () => {
     const pocketKey = derivePocketKey(requireMasterSeed(cfg), entityKey);
@@ -208,13 +212,19 @@ export async function fundPocket(
     const managerWallet = managerWalletClient(cfg);
     const seedTxs = await ensureNativeGas([operatorAddress, gateway.address], {
       getBalance: (addr) => pub.getBalance({ address: addr }),
-      sendNative: (to, value) =>
-        managerWallet.sendTransaction({
+      sendNative: async (to, value) => {
+        const hash = await managerWallet.sendTransaction({
           to,
           value,
           account: managerWallet.account!,
           chain: managerWallet.chain,
-        }),
+        });
+        // S5: gas seeds are platform outflows. RECORDED (they count toward the window) but not
+        // CHECKED — they are bounded (<= 2x GAS_SEED_TARGET per bridge) and a hard reject here
+        // would wedge an in-flight funding saga. Wei -> 6-dec atomic (exact: native IS USDC).
+        opts?.outflows?.record("gas_seed", value / 10n ** 12n, hash);
+        return hash;
+      },
       // Await the seed mining before topUpPocket depends on it — sendNative only returns a mempool
       // hash, and topUpPocket's operator-/pocket-signed txs would otherwise race an unmined seed and
       // fail with "gas required exceeds allowance (0)".

@@ -40,6 +40,8 @@ export interface OnboardingDeps {
   /** Validated AgentSpec JSON; persisted so the reconciler/fund can re-run the saga. */
   specJson?: string;
   fundAmount?: bigint; // optional: top up the treasury after binding (status -> funded)
+  /** S5: records the platform->treasury outflow on success (check happens in runner.fund). */
+  outflows?: { record(path: "fund_treasury", amountAtomic: bigint, ref: string | null): void };
   // ── Per-agent Turnkey vault (Step 0). When BOTH `provision` and `guardianPasskey` are present, the
   //    saga provisions a per-agent sub-org BEFORE minting and uses its operator/signer instead of the
   //    shared `operatorSigner`. Absent both -> legacy shared-key path (unchanged).
@@ -302,6 +304,7 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       treasury: rec.treasury! as Address,
       amount: d.fundAmount,
     });
+    d.outflows?.record("fund_treasury", d.fundAmount, txHash);
     const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash };
     rec = funded;
     d.repo.transaction(() => {

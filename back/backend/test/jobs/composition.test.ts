@@ -59,6 +59,8 @@ function makeConfig(): Config {
     x402DemoPayTo: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
     x402DemoPriceUsdc: "0.01",
     x402BuyerTrustPolicy: "open",
+    platformOutflowCeiling: 200_000_000n,
+    platformOutflowWindowMs: 86_400_000,
   };
 }
 

@@ -89,11 +89,16 @@ export function buildCli(
       const rec = ctx.repo.findByIdempotencyKey(key);
       if (!rec?.treasury || !rec.treasuryConfig)
         throw new Error(`entity ${key} has no treasury yet`);
+      // S5: the trusted operator keeps direct signing, but no path is unmetered — same
+      // rolling-window brake and record as every other platform outflow (audit correction 4).
+      const amount = usdToUnits(usd);
+      ctx.outflows.check(amount);
       const txHash = await ctx.arc.fundTreasury({
         usdc: rec.treasuryConfig.usdc,
         treasury: rec.treasury,
-        amount: usdToUnits(usd),
+        amount,
       });
+      ctx.outflows.record("cli_fund", amount, txHash);
       ctx.repo.upsert({ ...rec, status: "funded", fundTxHash: txHash });
       console.log(JSON.stringify({ key, funded: usd, txHash }, null, 2));
     });

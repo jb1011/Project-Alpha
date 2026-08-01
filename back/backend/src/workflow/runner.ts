@@ -25,6 +25,8 @@ export class OnboardingRunner {
       repo: EntityRepository;
       runSaga: RunSaga;
       fundCaps: { perCall: bigint; perTenantTotal: bigint };
+      /** S5 aggregate platform-outflow brake; absent in tests that predate it -> unmetered. */
+      outflows?: { check(amountAtomic: bigint): void };
     },
   ) {}
 
@@ -104,6 +106,13 @@ export class OnboardingRunner {
     const funded = this.deps.repo.sumFundedByTenant(p.tenantId);
     if (funded + p.amount > this.deps.fundCaps.perTenantTotal)
       throw new ApiError("limit_exceeded", 400, "tenant treasury funding quota exhausted");
+    // S5: the platform-wide rolling-window brake, after the per-tenant checks (most specific
+    // reason first). Synchronous, before the saga spawns — nothing to unwind on refusal.
+    try {
+      this.deps.outflows?.check(p.amount);
+    } catch {
+      throw new ApiError("limit_exceeded", 400, "platform outflow ceiling reached");
+    }
     const spec = JSON.parse(rec.specJson ?? "{}") as AgentSpec;
     this.run(p.id, () =>
       this.deps.runSaga({

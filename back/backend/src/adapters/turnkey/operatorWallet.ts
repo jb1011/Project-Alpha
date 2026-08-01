@@ -3,6 +3,7 @@ import { createAccount } from "@turnkey/viem";
 import { http, type WalletClient, createWalletClient, defineChain } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import type { Config } from "../../config/env";
+import { meterTurnkeyAccount } from "../../payments/outflowMeter";
 
 function arcChain(cfg: Config) {
   return defineChain({
@@ -33,7 +34,12 @@ export async function buildOperatorWalletClient(cfg: Config): Promise<WalletClie
       organizationId: cfg.turnkey.organizationId,
       signWith: cfg.turnkey.signWith,
     });
-    return createWalletClient({ account, chain, transport });
+    // S5: every enclave signature is billable (metered plan) — make each one visible.
+    return createWalletClient({
+      account: meterTurnkeyAccount(account, "root-operator"),
+      chain,
+      transport,
+    });
   }
   if (cfg.operatorPrivateKey) {
     return createWalletClient({
@@ -81,5 +87,10 @@ export async function buildOperatorWalletClientForEntity(
     organizationId: e.subOrgId,
     signWith: e.operator,
   });
-  return createWalletClient({ account, chain, transport });
+  // S5: every enclave signature is billable (metered plan) — make each one visible.
+  return createWalletClient({
+    account: meterTurnkeyAccount(account, "delegated-operator"),
+    chain,
+    transport,
+  });
 }

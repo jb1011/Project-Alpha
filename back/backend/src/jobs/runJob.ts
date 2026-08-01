@@ -33,6 +33,11 @@ export interface RunJobDeps {
   tenantId?: string;
   /** USDC amount to escrow (in USDC's smallest unit, 6 decimals). */
   budget: bigint;
+  /** S5: platform client-wallet outflow brake — check before job creation, record on fund. */
+  outflows?: {
+    check(amountAtomic: bigint): void;
+    record(path: "job_fund", amountAtomic: bigint, ref: string | null): void;
+  };
   /** Human-readable job description stored on-chain and in the DB. */
   description: string;
   /** USDC token contract address on the target chain. */
@@ -113,6 +118,7 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
     const nowSec = d.now ? d.now() : Math.floor(Date.now() / 1000);
     const expiredAt = BigInt(nowSec + (d.expiryWindowSec ?? 3600));
 
+    d.outflows?.check(d.budget); // S5: refuse before anything goes on-chain
     const { jobId, txHash: createTxHash } = await d.job.createJob({
       provider: entity.operator as Address,
       evaluator: d.job.evaluatorAddress(),
@@ -154,6 +160,7 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
 
     await d.job.setBudget(BigInt(rec.jobId!), d.budget, providerWallet);
     const fundTxHash = await d.job.approveAndFund(BigInt(rec.jobId!), d.usdc, d.budget);
+    d.outflows?.record("job_fund", d.budget, fundTxHash);
 
     const updated: JobRecord = {
       ...rec,

@@ -6,6 +6,7 @@ import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
 import { type Config, loadConfig } from "../config/env";
 import { type JobDeps, buildJobDeps } from "../jobs/composition";
+import { type OutflowMeter, buildOutflowMeter } from "../payments/outflowMeter";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
@@ -17,6 +18,7 @@ export interface CliContext {
   arc: ArcAdapter;
   operatorSigner: OperatorSigner;
   jobDeps: JobDeps;
+  outflows: OutflowMeter;
 }
 
 /** Build the live context from env (.env loaded). Throws if FACTORY_ADDRESS/operator signer missing. */
@@ -43,5 +45,9 @@ export async function buildContext(): Promise<CliContext> {
     arc,
     operatorSigner: await buildOperatorSigner(cfg), // Turnkey if configured, else OPERATOR_PRIVATE_KEY
     jobDeps: buildJobDeps(cfg, db, repo, docStore),
+    outflows: buildOutflowMeter(db, {
+      ceilingAtomic: cfg.platformOutflowCeiling,
+      windowMs: cfg.platformOutflowWindowMs,
+    }),
   };
 }

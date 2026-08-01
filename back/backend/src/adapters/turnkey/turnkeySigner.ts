@@ -2,6 +2,7 @@ import { Turnkey } from "@turnkey/sdk-server";
 import { createAccount } from "@turnkey/viem";
 import type { Address, Hex, TypedDataDefinition } from "viem";
 import type { Config } from "../../config/env";
+import { meterTurnkeyAccount } from "../../payments/outflowMeter";
 import type { OperatorSigner } from "./signer";
 
 export interface TurnkeyConfig {
@@ -42,7 +43,8 @@ export class TurnkeySigner implements OperatorSigner {
       organizationId: cfg.organizationId,
       signWith,
     });
-    return new TurnkeySigner(account);
+    // S5: every enclave signature is billable (metered plan) — make each one visible.
+    return new TurnkeySigner(meterTurnkeyAccount(account, "signer-key"));
   }
 
   /**
@@ -74,7 +76,8 @@ export class TurnkeySigner implements OperatorSigner {
       organizationId: e.subOrgId,
       signWith: e.operator,
     });
-    return new TurnkeySigner(account);
+    // S5: every enclave signature is billable (metered plan) — make each one visible.
+    return new TurnkeySigner(meterTurnkeyAccount(account, "signer-entity"));
   }
 
   signWalletSet(typedData: TypedDataDefinition): Promise<Hex> {

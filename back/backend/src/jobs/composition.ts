@@ -14,6 +14,7 @@ import { ReputationAdapter } from "../adapters/arc/reputationAdapter";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { chainFor } from "../chains";
 import type { Config } from "../config/env";
+import { buildOutflowMeter } from "../payments/outflowMeter";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import { type JobRepository, SqliteJobRepository } from "./jobRepository";
@@ -41,6 +42,11 @@ export function buildJobDeps(
   docStore: DocumentStore,
 ): JobDeps {
   const jobs = new SqliteJobRepository(db);
+  // S5: job budgets are platform client-wallet outflows — same rolling-window brake as funding.
+  const outflows = buildOutflowMeter(db, {
+    ceilingAtomic: cfg.platformOutflowCeiling,
+    windowMs: cfg.platformOutflowWindowMs,
+  });
 
   // Viem clients — no network calls at construction
   const publicClient = publicClientFor(cfg);
@@ -93,6 +99,7 @@ export function buildJobDeps(
       entityKey: input.entityKey,
       tenantId: input.tenantId,
       budget: input.budget,
+      outflows,
       description: input.description,
       usdc: cfg.usdc,
       jobs,

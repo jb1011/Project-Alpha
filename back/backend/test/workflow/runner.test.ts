@@ -433,3 +433,26 @@ test("start() with a passkey lacking credentialId stores null, not a crash", () 
   const { id } = runner.start({ spec, userKey: "pk2", tenantId: TENANT, guardianPasskey: passkey });
   expect(repo.findByIdempotencyKey(id)?.rootPasskeyId ?? null).toBeNull();
 });
+
+test("fund() refuses when the S5 platform outflow ceiling is reached (after per-tenant checks)", async () => {
+  let checked = 0n;
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: runSaga as never,
+    fundCaps: TEST_FUND_CAPS,
+    outflows: {
+      check(amount: bigint) {
+        checked = amount;
+        throw new Error("platform-outflow-ceiling");
+      },
+    },
+  });
+  const { id } = runner.start({ spec, userKey: "s5", tenantId: TENANT, guardianPasskey: passkey });
+  await runner.settled(); // let the start saga finish so the entity is no longer in-flight
+  const rec = repo.findByIdempotencyKey(id)!;
+  repo.upsert({ ...rec, status: "bound" });
+  expect(() => runner.fund({ id, tenantId: TENANT, amount: 1_000n })).toThrow(
+    /platform outflow ceiling/,
+  );
+  expect(checked).toBe(1_000n); // the meter really saw the amount
+});

@@ -11,6 +11,7 @@ import type { CliContext } from "../src/cli/context";
 import { buildCli } from "../src/cli/index";
 import { loadConfig } from "../src/config/env";
 import { buildJobDeps } from "../src/jobs/composition";
+import { buildOutflowMeter } from "../src/payments/outflowMeter";
 import { migrate, openDatabase } from "../src/persistence/db";
 import { FileDocumentStore } from "../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../src/persistence/entityRepository";
@@ -53,6 +54,10 @@ beforeAll(async () => {
     cfg: mergedCfg,
     repo,
     docStore,
+    outflows: buildOutflowMeter(db, {
+      ceilingAtomic: mergedCfg.platformOutflowCeiling,
+      windowMs: mergedCfg.platformOutflowWindowMs,
+    }),
     arc: new ArcAdapter({
       publicClient: pub,
       managerWallet: wallet,

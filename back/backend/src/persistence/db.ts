@@ -266,6 +266,24 @@ export function migrate(db: Database.Database): void {
       cached_at     INTEGER NOT NULL
     );
 
+    -- S5: every platform-wallet outflow, all paths, ONE table — the rolling-window SUM behind
+    -- the aggregate ceiling. Amounts are 6-dec atomic USDC (callers normalize; gas seeds /1e12).
+    CREATE TABLE IF NOT EXISTS platform_outflows (
+      id     INTEGER PRIMARY KEY AUTOINCREMENT,
+      at     INTEGER NOT NULL,
+      path   TEXT    NOT NULL,
+      amount INTEGER NOT NULL,
+      ref    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_platform_outflows_at ON platform_outflows(at);
+
+    -- S5: one row per billable Turnkey enclave signature (metered plan: 25/month, then per-sig).
+    CREATE TABLE IF NOT EXISTS turnkey_sigs (
+      id   INTEGER PRIMARY KEY AUTOINCREMENT,
+      at   INTEGER NOT NULL,
+      kind TEXT    NOT NULL
+    );
+
     -- Small key/value marker table for one-shot data migrations (guards below), distinct from the
     -- additive schema (table/column) migrations, which are idempotent by construction.
     CREATE TABLE IF NOT EXISTS meta (
