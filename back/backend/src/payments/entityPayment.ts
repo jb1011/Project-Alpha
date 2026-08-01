@@ -13,7 +13,7 @@ import { authorizePayment } from "./authority";
 import { buyWithX402 } from "./buyer";
 import type { PaymentLedger } from "./ledger";
 import type { SellerTrust } from "./sellerTrust";
-import { assertPublicHttpsUrl, safeFetch } from "./ssrfGuard";
+import { assertPublicHttpsUrl, requestAwareSafeFetch } from "./ssrfGuard";
 import type { StandingExposure } from "./standingExposure";
 import { buildReadExposure } from "./standingExposure";
 
@@ -257,9 +257,10 @@ export function buildEntityPaymentService(
       //    fetchImpl defaults to a safeFetch-wrapped fetch so production is SSRF-safe even if the
       //    composition root doesn't wrap it itself; tests inject their own fake fetchImpl and so
       //    bypass safeFetch (unchanged).
-      const baseFetch =
-        deps.fetchImpl ??
-        ((u: RequestInfo | URL, i?: RequestInit) => safeFetch(fetch, u as string, i));
+      // Request-aware: the AgentKit client retries with a Request OBJECT; the old `u as string`
+      // cast stringified it to "[object Request]" and broke every prod pay against an
+      // agentkit-enabled seller (see requestAwareSafeFetch).
+      const baseFetch = deps.fetchImpl ?? requestAwareSafeFetch(fetch);
       // World layer: present a human-backing proof when the seller's 402 advertises AgentKit.
       // Sits in FRONT of buyWithX402 and only reacts to agentkit-enabled 402s — every other
       // response passes through, so sellers without the extension are unaffected. If the agent

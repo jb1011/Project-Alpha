@@ -104,3 +104,34 @@ export async function safeFetch(
     clearTimeout(t);
   }
 }
+
+/**
+ * A `typeof fetch` that accepts what real callers actually send — string, URL, or a full
+ * `Request` object — and funnels ALL of them through `safeFetch`'s SSRF boundary.
+ *
+ * WHY: the AgentKit client retries an agentkit-enabled 402 with a `Request` OBJECT. The old
+ * default pay fetch did `u as string`, which stringifies a Request into the literal
+ * "[object Request]" and refuses it — breaking every production `pay` against an
+ * agentkit-enabled seller since the World wiring (caught live by the #65 checklist,
+ * 2026-08-01; the test harness handled Request itself, masking the prod seam).
+ *
+ * Header layering matches the Fetch spec's practical expectation: the Request's own headers
+ * are the base, an explicit `init.headers` overrides per key (so a retry's fresh X-PAYMENT
+ * beats a stale one, and the signed `agentkit` header survives the unwrap). Bodies are not
+ * carried (x402 discovery/retry is GET-shaped); extend deliberately if a POST resource ever
+ * needs it.
+ */
+export function requestAwareSafeFetch(fetchImpl: typeof fetch): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    if (input instanceof Request) {
+      const headers = new Headers(input.headers);
+      new Headers(init?.headers ?? {}).forEach((v, k) => headers.set(k, v));
+      return safeFetch(fetchImpl, input.url, {
+        ...init,
+        method: init?.method ?? input.method,
+        headers,
+      });
+    }
+    return safeFetch(fetchImpl, String(input), init);
+  }) as typeof fetch;
+}
