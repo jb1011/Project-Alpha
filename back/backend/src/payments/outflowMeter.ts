@@ -15,7 +15,14 @@ import { opsLog } from "../observability/opsLog";
  * signature is also metered: an opsLog line always (journald = the durable monthly trail), plus a
  * `turnkey_sigs` row for an exact in-DB count.
  */
-export type OutflowPath = "fund_treasury" | "gas_seed" | "job_fund" | "cli_fund";
+export type OutflowPath =
+  | "fund_treasury"
+  | "gas_seed"
+  | "job_fund"
+  | "cli_fund"
+  /** Tier-0: Gas Station sponsorship (billed cost+5%) — recorded from UserOp receipts so the
+   *  platform brake stays sighted when gas seeds disappear on the circle path. */
+  | "gas_sponsorship";
 
 export class OutflowCeilingError extends Error {
   constructor(msg: string) {

@@ -67,6 +67,13 @@ interface Row {
   per_tx_cap: string | null;
   trust_policy: string | null;
   root_passkey_id: string | null;
+  wallet_provider: string | null;
+  circle_wallet_set_id: string | null;
+  circle_operator_wallet_id: string | null;
+  circle_pocket_wallet_id: string | null;
+  pocket_address: string | null;
+  previous_operator: string | null;
+  operator_rotated_at: number | null;
   public_id: string | null;
 }
 
@@ -119,6 +126,13 @@ function toRecord(r: Row): EntityRecord {
     perTxCap: r.per_tx_cap ? BigInt(r.per_tx_cap) : null,
     trustPolicy: (r.trust_policy as EntityRecord["trustPolicy"]) ?? null,
     rootPasskeyId: r.root_passkey_id ?? null,
+    walletProvider: (r.wallet_provider as EntityRecord["walletProvider"]) ?? null,
+    circleWalletSetId: r.circle_wallet_set_id ?? null,
+    circleOperatorWalletId: r.circle_operator_wallet_id ?? null,
+    circlePocketWalletId: r.circle_pocket_wallet_id ?? null,
+    pocketAddress: r.pocket_address ?? null,
+    previousOperator: r.previous_operator ?? null,
+    operatorRotatedAt: r.operator_rotated_at ?? null,
     publicId: r.public_id ?? null,
   };
 }
@@ -156,6 +170,13 @@ export class SqliteEntityRepository implements EntityRepository {
       per_tx_cap: rec.perTxCap?.toString() ?? null,
       trust_policy: rec.trustPolicy ?? null,
       root_passkey_id: rec.rootPasskeyId ?? null,
+      wallet_provider: rec.walletProvider ?? null,
+      circle_wallet_set_id: rec.circleWalletSetId ?? null,
+      circle_operator_wallet_id: rec.circleOperatorWalletId ?? null,
+      circle_pocket_wallet_id: rec.circlePocketWalletId ?? null,
+      pocket_address: rec.pocketAddress ?? null,
+      previous_operator: rec.previousOperator ?? null,
+      operator_rotated_at: rec.operatorRotatedAt ?? null,
       public_id: rec.publicId ?? null,
     };
   }
@@ -166,7 +187,7 @@ export class SqliteEntityRepository implements EntityRepository {
         owner_tenant_id, error, spec_json,
         amendment_delay,
         ein, formation_date, oa_hash, metadata_uri, doc_path, treasury_config,
-        agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, trust_policy, root_passkey_id, public_id, updated_at`;
+        agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, trust_policy, root_passkey_id, wallet_provider, circle_wallet_set_id, circle_operator_wallet_id, circle_pocket_wallet_id, pocket_address, previous_operator, operator_rotated_at, public_id, updated_at`;
 
   private static readonly INSERT_VALUES = `
         @idempotency_key, @name, @status, @manager, @guardian, @operator,
@@ -174,7 +195,7 @@ export class SqliteEntityRepository implements EntityRepository {
         @owner_tenant_id, @error, @spec_json,
         @amendment_delay,
         @ein, @formation_date, @oa_hash, @metadata_uri, @doc_path, @treasury_config,
-        @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @trust_policy, @root_passkey_id, @public_id, CURRENT_TIMESTAMP`;
+        @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @trust_policy, @root_passkey_id, @wallet_provider, @circle_wallet_set_id, @circle_operator_wallet_id, @circle_pocket_wallet_id, @pocket_address, @previous_operator, @operator_rotated_at, @public_id, CURRENT_TIMESTAMP`;
 
   upsert(rec: EntityRecord): void {
     this.db
@@ -194,7 +215,7 @@ export class SqliteEntityRepository implements EntityRepository {
           proxy=excluded.proxy, treasury=excluded.treasury,
           create_tx_hash=excluded.create_tx_hash, bind_tx_hash=excluded.bind_tx_hash,
           fund_tx_hash=excluded.fund_tx_hash, public_id=excluded.public_id,
-          per_tx_cap=excluded.per_tx_cap, trust_policy=excluded.trust_policy, root_passkey_id=excluded.root_passkey_id, updated_at=CURRENT_TIMESTAMP
+          per_tx_cap=excluded.per_tx_cap, trust_policy=excluded.trust_policy, root_passkey_id=excluded.root_passkey_id, wallet_provider=excluded.wallet_provider, circle_wallet_set_id=excluded.circle_wallet_set_id, circle_operator_wallet_id=excluded.circle_operator_wallet_id, circle_pocket_wallet_id=excluded.circle_pocket_wallet_id, pocket_address=excluded.pocket_address, previous_operator=excluded.previous_operator, operator_rotated_at=excluded.operator_rotated_at, updated_at=CURRENT_TIMESTAMP
       `)
       .run(SqliteEntityRepository.bindings(rec));
   }

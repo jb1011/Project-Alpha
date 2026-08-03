@@ -65,6 +65,10 @@ const EnvSchema = z.object({
   PLATFORM_OUTFLOW_WINDOW_HOURS: z.coerce.number().int().positive().default(24),
   CUSTOMER_PRIVATE_KEY: privKeySchema.optional(),
   CIRCLE_API_KEY: z.string().optional(),
+  /** Circle DevC entity secret (Tier-0). UNRECOVERABLE-BY-DESIGN without the recovery file —
+   *  offline custody, >=2 locations, never on the VPS or in the repo. All-or-nothing with
+   *  CIRCLE_API_KEY. docs/design/2026-08-03-tier0-circle-wallet-migration.md (Secrets & recovery). */
+  CIRCLE_ENTITY_SECRET: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
   AGENT_MODEL: z.string().default("claude-sonnet-4-6"),
   GATEWAY_FACILITATOR_URL: z.string().url().default("https://gateway-api-testnet.circle.com"),
@@ -168,6 +172,8 @@ export interface Config {
     delegatedApiPrivateKey?: string;
   };
   circleApiKey?: string;
+  /** Tier-0 Circle DevC credentials; present only when BOTH env vars are set (all-or-nothing). */
+  circle?: { apiKey: string; entitySecret: string };
   anthropicApiKey?: string;
   agentModel: string;
   gatewayFacilitatorUrl: string;
@@ -287,6 +293,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     docStoreDir: `${e.DATA_DIR}/documents`,
     turnkey,
     circleApiKey: e.CIRCLE_API_KEY,
+    circle:
+      e.CIRCLE_API_KEY && e.CIRCLE_ENTITY_SECRET
+        ? { apiKey: e.CIRCLE_API_KEY, entitySecret: e.CIRCLE_ENTITY_SECRET }
+        : undefined,
     anthropicApiKey: e.ANTHROPIC_API_KEY,
     agentModel: e.AGENT_MODEL,
     gatewayFacilitatorUrl: e.GATEWAY_FACILITATOR_URL,
@@ -378,6 +388,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error("Invalid config: GAS_SEED_FLOOR_USDC must be less than GAS_SEED_TARGET_USDC");
   }
 
+  // Tier-0: a half-configured Circle block must fail at boot, not at first sign (audit item 1).
+  if (Boolean(e.CIRCLE_API_KEY) !== Boolean(e.CIRCLE_ENTITY_SECRET)) {
+    throw new Error(
+      e.CIRCLE_API_KEY
+        ? "Invalid config: CIRCLE_API_KEY is set but CIRCLE_ENTITY_SECRET is missing (all-or-nothing)"
+        : "Invalid config: CIRCLE_ENTITY_SECRET is set but CIRCLE_API_KEY is missing (all-or-nothing)",
+    );
+  }
+
   if (cfg.platformOutflowCeiling < cfg.maxTreasuryFund) {
     throw new Error(
       "Invalid config: PLATFORM_OUTFLOW_CEILING_USDC must be >= MAX_TREASURY_FUND_USDC (a single legal fund call must never be auto-blocked)",
@@ -426,6 +445,7 @@ export function redact(cfg: Config): Record<string, unknown> {
     operatorPrivateKey: cfg.operatorPrivateKey ? "REDACTED" : undefined,
     pocketMasterSeed: cfg.pocketMasterSeed ? "REDACTED" : undefined,
     circleApiKey: cfg.circleApiKey ? "REDACTED" : undefined,
+    circle: cfg.circle ? { apiKey: "REDACTED", entitySecret: "REDACTED" } : undefined,
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
     jobClientPrivateKey: "REDACTED",
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,

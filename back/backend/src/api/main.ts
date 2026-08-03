@@ -26,6 +26,7 @@ import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
+import { assertCircleCoverage, backfillPocketAddresses } from "../persistence/tier0";
 import { SqliteWorldStore } from "../persistence/worldStore";
 import { usdToUnits } from "../policy/units";
 import type { Address } from "../types";
@@ -44,6 +45,10 @@ async function main() {
 
   const db = openDatabase(cfg.dbPath);
   migrate(db);
+  // Tier-0: refuse to boot with unserviceable circle-path agents; store pocket addresses once
+  // so read paths can stop deriving from the master seed (spec audit items 1 + 7).
+  assertCircleCoverage(db, cfg.circle);
+  if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
   const repo = new SqliteEntityRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);

@@ -85,6 +85,22 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
     );
   }
 
+  // Tier-0 audit fix (spec 2026-08-03, finding 2): the on-chain job pins its provider at
+  // creation, but every later step signs with the LIVE entity operator. If the operator was
+  // rotated mid-job (migration), resuming would revert on-chain (msg.sender != job.provider) —
+  // or worse, `complete` would release earnings to the retired key after its drain. Refuse
+  // loudly; the migration runbook requires job quiescence before rotation.
+  const existing0 = d.jobs.findByKey(d.jobKey);
+  if (
+    existing0?.providerAddress &&
+    entity.operator &&
+    existing0.providerAddress.toLowerCase() !== entity.operator.toLowerCase()
+  ) {
+    throw new Error(
+      `job ${d.jobKey} was created under provider ${existing0.providerAddress} but the entity's operator was rotated to ${entity.operator} — refusing to resume (drain/complete jobs before rotating)`,
+    );
+  }
+
   // --- Step 0: upsert pending record if none exists ---
   let rec = d.jobs.findByKey(d.jobKey);
   if (!rec) {

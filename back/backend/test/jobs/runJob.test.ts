@@ -345,3 +345,41 @@ describe("runJob saga — steps 0–2", () => {
     expect(jobs.findByKey("t:k4")?.status).toBe("funded");
   });
 });
+
+test("TIER-0 AUDIT FIX: resuming a job after operator rotation is REFUSED, not mis-signed", async () => {
+  // The race (verified in the spec audit): the on-chain job pins its provider at creation, but
+  // steps rebuild the signing wallet from the LIVE entity row. After setOperator, resuming would
+  // sign as the wrong wallet (on-chain revert) or worse, complete pays the retired key after the
+  // drain. Refuse loudly instead.
+  const db = makeDb();
+  const jobs = new SqliteJobRepository(db);
+  const entities = new SqliteEntityRepository(db);
+  seedBoundEntity(entities, "t:rotated");
+
+  const deps = makeRunJobDeps({ db, jobs, entities, jobKey: "t:kr", entityKey: "t:rotated" });
+  // A job created under the OLD operator, mid-saga:
+  const rec = {
+    jobKey: "t:kr",
+    entityKey: "t:rotated",
+    tenantId: "t",
+    status: "created" as const,
+    jobId: "7",
+    budgetAmount: "500000",
+    description: "d",
+    providerAddress: "0x000000000000000000000000000000000000dEaD", // pinned at creation, != entity.operator
+    clientAddress: "0x0000000000000000000000000000000000000001",
+    evaluatorAddress: "0x0000000000000000000000000000000000000002",
+    deliverableHash: null,
+    resultSummary: null,
+    createTxHash: null,
+    fundTxHash: null,
+    submitTxHash: null,
+    completeTxHash: null,
+    sweepTxHash: null,
+    reputationTxHash: null,
+    error: null,
+  };
+  jobs.upsert(rec as never);
+
+  await expect(runJob(deps)).rejects.toThrow(/rotated|provider/i);
+});

@@ -10,8 +10,11 @@ import { privateKeyToAccount } from "viem/accounts";
  * payment fetch is safe for all existing sellers.
  *
  * We sign with the entity's POCKET key: it is already the agent's operational identity for x402,
- * and it's the address registered in AgentBook. Registration binds an address to a human — it
- * never grants spending power, so using the pocket key here adds no custody risk.
+ * and it is the address that WOULD be registered in AgentBook. (Audit-corrected 2026-08-03: no
+ * agent pocket is actually registered today — only the standalone /proof demo key is; a proof
+ * from an unregistered pocket simply fails the seller's lookup and falls through to payment.)
+ * Registration binds an address to a human — it never grants spending power, so using the
+ * pocket key here adds no custody risk.
  */
 export interface AgentkitSigner {
   address: string;

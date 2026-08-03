@@ -10,6 +10,7 @@ import { type OutflowMeter, buildOutflowMeter } from "../payments/outflowMeter";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
+import { assertCircleCoverage, backfillPocketAddresses } from "../persistence/tier0";
 
 export interface CliContext {
   cfg: Config;
@@ -29,6 +30,8 @@ export async function buildContext(): Promise<CliContext> {
 
   const db = openDatabase(cfg.dbPath);
   migrate(db);
+  assertCircleCoverage(db, cfg.circle);
+  if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
   const repo = new SqliteEntityRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const arc = new ArcAdapter({

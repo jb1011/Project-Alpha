@@ -58,6 +58,16 @@ export interface EntityRecord {
   /** WebAuthn credentialId of the guardian passkey registered at onboarding (v2.5 item 4) —
    *  the bookkeeping future "same guardian?" re-verification stands on. Owner-visible only. */
   rootPasskeyId?: string | null;
+  /** Custody provider for the hot layer; null/undefined = "turnkey" (every pre-Tier-0 agent). */
+  walletProvider?: "turnkey" | "circle" | null;
+  circleWalletSetId?: string | null;
+  circleOperatorWalletId?: string | null;
+  circlePocketWalletId?: string | null;
+  /** Stored (not derived) pocket address — lets read paths stop touching POCKET_MASTER_SEED. */
+  pocketAddress?: string | null;
+  /** Rotation forensics: where old money may still land after setOperator (audit item 7). */
+  previousOperator?: string | null;
+  operatorRotatedAt?: number | null;
   /** Opaque public slug; the on-chain metadataURI is METADATA_BASE_URL/metadata/<publicId>. */
   publicId?: string | null;
 }

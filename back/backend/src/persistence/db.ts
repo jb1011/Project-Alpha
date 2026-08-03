@@ -304,6 +304,22 @@ export function migrate(db: Database.Database): void {
   if (!cols.includes("trust_policy")) db.exec("ALTER TABLE entities ADD COLUMN trust_policy TEXT");
   if (!cols.includes("root_passkey_id"))
     db.exec("ALTER TABLE entities ADD COLUMN root_passkey_id TEXT");
+  // Tier-0 (audit item 7): custody provider + Circle wallet ids + stored pocket address (so read
+  // paths can stop deriving from the master seed) + rotation forensics.
+  if (!cols.includes("wallet_provider"))
+    db.exec("ALTER TABLE entities ADD COLUMN wallet_provider TEXT");
+  if (!cols.includes("circle_wallet_set_id"))
+    db.exec("ALTER TABLE entities ADD COLUMN circle_wallet_set_id TEXT");
+  if (!cols.includes("circle_operator_wallet_id"))
+    db.exec("ALTER TABLE entities ADD COLUMN circle_operator_wallet_id TEXT");
+  if (!cols.includes("circle_pocket_wallet_id"))
+    db.exec("ALTER TABLE entities ADD COLUMN circle_pocket_wallet_id TEXT");
+  if (!cols.includes("pocket_address"))
+    db.exec("ALTER TABLE entities ADD COLUMN pocket_address TEXT");
+  if (!cols.includes("previous_operator"))
+    db.exec("ALTER TABLE entities ADD COLUMN previous_operator TEXT");
+  if (!cols.includes("operator_rotated_at"))
+    db.exec("ALTER TABLE entities ADD COLUMN operator_rotated_at INTEGER");
   if (!cols.includes("public_id")) db.exec("ALTER TABLE entities ADD COLUMN public_id TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_public_id ON entities(public_id)");
 
