@@ -69,6 +69,8 @@ const EnvSchema = z.object({
    *  offline custody, >=2 locations, never on the VPS or in the repo. All-or-nothing with
    *  CIRCLE_API_KEY. docs/design/2026-08-03-tier0-circle-wallet-migration.md (Secrets & recovery). */
   CIRCLE_ENTITY_SECRET: z.string().optional(),
+  /** The platform wallet set ("novi-tier0"). Required only when provisioning circle-path agents. */
+  CIRCLE_WALLET_SET_ID: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
   AGENT_MODEL: z.string().default("claude-sonnet-4-6"),
   GATEWAY_FACILITATOR_URL: z.string().url().default("https://gateway-api-testnet.circle.com"),
@@ -173,7 +175,7 @@ export interface Config {
   };
   circleApiKey?: string;
   /** Tier-0 Circle DevC credentials; present only when BOTH env vars are set (all-or-nothing). */
-  circle?: { apiKey: string; entitySecret: string };
+  circle?: { apiKey: string; entitySecret: string; walletSetId?: string };
   anthropicApiKey?: string;
   agentModel: string;
   gatewayFacilitatorUrl: string;
@@ -295,7 +297,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     circleApiKey: e.CIRCLE_API_KEY,
     circle:
       e.CIRCLE_API_KEY && e.CIRCLE_ENTITY_SECRET
-        ? { apiKey: e.CIRCLE_API_KEY, entitySecret: e.CIRCLE_ENTITY_SECRET }
+        ? {
+            apiKey: e.CIRCLE_API_KEY,
+            entitySecret: e.CIRCLE_ENTITY_SECRET,
+            walletSetId: e.CIRCLE_WALLET_SET_ID,
+          }
         : undefined,
     anthropicApiKey: e.ANTHROPIC_API_KEY,
     agentModel: e.AGENT_MODEL,
@@ -445,7 +451,9 @@ export function redact(cfg: Config): Record<string, unknown> {
     operatorPrivateKey: cfg.operatorPrivateKey ? "REDACTED" : undefined,
     pocketMasterSeed: cfg.pocketMasterSeed ? "REDACTED" : undefined,
     circleApiKey: cfg.circleApiKey ? "REDACTED" : undefined,
-    circle: cfg.circle ? { apiKey: "REDACTED", entitySecret: "REDACTED" } : undefined,
+    circle: cfg.circle
+      ? { apiKey: "REDACTED", entitySecret: "REDACTED", walletSetId: cfg.circle.walletSetId }
+      : undefined,
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
     jobClientPrivateKey: "REDACTED",
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,

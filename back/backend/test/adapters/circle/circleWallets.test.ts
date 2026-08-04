@@ -1,0 +1,157 @@
+import { describe, expect, test, vi } from "vitest";
+import {
+  circleAgentkitSigner,
+  circleTypedDataSigner,
+  provisionCircleWallets,
+  withCircleOpsLog,
+} from "../../../src/adapters/circle/circleWallets";
+
+/** Narrow mock of the DevC SDK surface we use — call-recorded, anti-vacuous per house rule. */
+function mockApi() {
+  const calls: { createWallets: unknown[]; signTypedData: unknown[]; signMessage: unknown[] } = {
+    createWallets: [],
+    signTypedData: [],
+    signMessage: [],
+  };
+  let walletCounter = 0;
+  return {
+    calls,
+    api: {
+      createWallets: vi.fn(async (input: unknown) => {
+        calls.createWallets.push(input);
+        walletCounter++;
+        const i = input as { accountType: string };
+        return {
+          data: {
+            wallets: [
+              {
+                id: `w-${walletCounter}`,
+                address: `0x${String(walletCounter).padStart(40, "0")}`,
+                blockchain: "ARC-TESTNET",
+                accountType: i.accountType,
+                scaCore: i.accountType === "SCA" ? "circle_6900_singleowner_v2" : undefined,
+              },
+            ],
+          },
+        };
+      }),
+      signTypedData: vi.fn(async (input: unknown) => {
+        calls.signTypedData.push(input);
+        return { data: { signature: `0x${"ab".repeat(65)}` } };
+      }),
+      signMessage: vi.fn(async (input: unknown) => {
+        calls.signMessage.push(input);
+        return { data: { signature: `0x${"cd".repeat(65)}` } };
+      }),
+    },
+  };
+}
+
+describe("provisionCircleWallets — one SCA operator + one EOA pocket per agent", () => {
+  test("creates both on ARC-TESTNET in the platform wallet set, tagged with the entity key", async () => {
+    const { api, calls } = mockApi();
+    const out = await provisionCircleWallets(api as never, {
+      walletSetId: "ws-1",
+      blockchain: "ARC-TESTNET",
+      entityKey: "t:agent1",
+    });
+    expect(out.operator.address).toMatch(/^0x/);
+    expect(out.pocket.address).toMatch(/^0x/);
+    expect(out.operator.walletId).toBe("w-1");
+    expect(out.pocket.walletId).toBe("w-2");
+    expect(out.operator.scaCore).toBe("circle_6900_singleowner_v2");
+    const wallets = calls.createWallets as {
+      accountType: string;
+      blockchains: string[];
+      walletSetId: string;
+      metadata?: { name?: string; refId?: string }[];
+    }[];
+    const scaCall = wallets[0]!;
+    const eoaCall = wallets[1]!;
+    expect(scaCall.accountType).toBe("SCA");
+    expect(eoaCall.accountType).toBe("EOA");
+    for (const c of [scaCall, eoaCall]) {
+      expect(c.blockchains).toEqual(["ARC-TESTNET"]);
+      expect(c.walletSetId).toBe("ws-1");
+      expect(c.metadata?.[0]?.refId).toBe("t:agent1");
+    }
+  });
+
+  test("a response missing the wallet is a loud error, never a half-provisioned agent", async () => {
+    const { api } = mockApi();
+    (api.createWallets as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      data: { wallets: [] },
+    });
+    await expect(
+      provisionCircleWallets(api as never, {
+        walletSetId: "ws-1",
+        blockchain: "ARC-TESTNET",
+        entityKey: "t:x",
+      }),
+    ).rejects.toThrow(/wallet/i);
+  });
+});
+
+describe("circleTypedDataSigner — drops into the existing signX402/BatchEvmSigner seam", () => {
+  test("serializes the typed-data object to the SDK's JSON `data` string and returns the signature", async () => {
+    const { api, calls } = mockApi();
+    const signer = circleTypedDataSigner(api as never, { walletId: "w-9", address: "0xAbC" });
+    const typed = {
+      domain: { name: "GatewayWalletBatched", version: "1", chainId: 5042002 },
+      types: { TransferWithAuthorization: [{ name: "from", type: "address" }] },
+      primaryType: "TransferWithAuthorization",
+      message: { from: "0xAbC" },
+    };
+    const sig = await signer.signTypedData(typed as never);
+    expect(sig).toBe(`0x${"ab".repeat(65)}`);
+    expect(signer.address).toBe("0xAbC");
+    const sent = calls.signTypedData[0] as { walletId: string; data: string };
+    expect(sent.walletId).toBe("w-9");
+    const parsed = JSON.parse(sent.data);
+    expect(parsed.domain.name).toBe("GatewayWalletBatched");
+    expect(parsed.primaryType).toBe("TransferWithAuthorization");
+  });
+
+  test("a missing signature in the response throws rather than returning undefined", async () => {
+    const { api } = mockApi();
+    (api.signTypedData as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ data: {} });
+    const signer = circleTypedDataSigner(api as never, { walletId: "w-9", address: "0xAbC" });
+    await expect(signer.signTypedData({} as never)).rejects.toThrow(/signature/i);
+  });
+});
+
+describe("circleAgentkitSigner — the World human-backing proof seam", () => {
+  test("eip191 shape with Circle signMessage underneath", async () => {
+    const { api, calls } = mockApi();
+    const s = circleAgentkitSigner(api as never, { walletId: "w-3", address: "0xDeF" }, 5042002);
+    expect(s.type).toBe("eip191");
+    expect(s.chainId).toBe("eip155:5042002");
+    expect(await s.signMessage("hello world")).toBe(`0x${"cd".repeat(65)}`);
+    expect((calls.signMessage[0] as { message: string }).message).toBe("hello world");
+  });
+});
+
+describe("withCircleOpsLog — every mutating Circle call leaves a journald line (S5 parity)", () => {
+  test("wraps mutating methods with an opslog line carrying method + walletId", async () => {
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { api } = mockApi();
+    const wrapped = withCircleOpsLog(api as never);
+    await wrapped.signTypedData({ walletId: "w-7", data: "{}" } as never);
+    const line = spy.mock.calls.map((c) => String(c[0])).find((l) => l.includes("circle_call"));
+    expect(line).toBeTruthy();
+    expect(line).toContain("signTypedData");
+    expect(line).toContain("w-7");
+    spy.mockRestore();
+  });
+
+  test("logging failure never blocks the call (observe, don't gate)", async () => {
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {
+      throw new Error("logger down");
+    });
+    const { api } = mockApi();
+    const wrapped = withCircleOpsLog(api as never);
+    const res = await wrapped.signMessage({ walletId: "w", message: "m" } as never);
+    expect((res as { data?: { signature?: string } }).data?.signature).toBeTruthy();
+    spy.mockRestore();
+  });
+});
