@@ -15,7 +15,7 @@ import type { Hex } from "../types";
  * retry MUST bump the attempt — reusing the key would replay the original failed response forever.
  */
 export type BridgeLegName = "fund_operator" | "approve" | "deposit_for";
-export type BridgeLegState = "pending" | "submitted" | "confirmed" | "failed";
+export type BridgeLegState = "pending" | "submitted" | "confirmed" | "failed" | "abandoned";
 
 export const BRIDGE_LEG_ORDER: readonly BridgeLegName[] = [
   "fund_operator",
@@ -86,16 +86,29 @@ export class SqliteBridgeLegRepository {
     );
   }
 
-  /** The entity's in-flight bridge (any leg not yet confirmed), if one exists. At most one can be
-   *  incomplete because the bridge runner refuses to start a new bridge while one is open. */
+  /** The entity's in-flight bridge (any leg not yet confirmed nor abandoned), if one exists. At
+   *  most one can be incomplete because the bridge runner refuses to start a new bridge while one
+   *  is open; ORDER BY keeps the pick deterministic if that invariant ever slips. */
   findIncomplete(entityKey: string): BridgeLegRecord[] | undefined {
     const row = this.db
       .prepare(
         `SELECT DISTINCT bridge_key FROM bridge_legs
-         WHERE entity_key = ? AND state != 'confirmed' LIMIT 1`,
+         WHERE entity_key = ? AND state NOT IN ('confirmed','abandoned')
+         ORDER BY bridge_key LIMIT 1`,
       )
       .get(entityKey) as { bridge_key: string } | undefined;
     return row ? this.legsOf(row.bridge_key) : undefined;
+  }
+
+  /** Abandon a bridge whose FIRST leg never moved funds (caller-verified: pending or failed —
+   *  never submitted/confirmed). The rows stay for forensics; findIncomplete skips them. */
+  abandonBridge(bridgeKey: string): void {
+    this.db
+      .prepare(
+        `UPDATE bridge_legs SET state = 'abandoned', updated_at = CURRENT_TIMESTAMP
+         WHERE bridge_key = ?`,
+      )
+      .run(bridgeKey);
   }
 
   markSubmitted(bridgeKey: string, leg: BridgeLegName, circleTxId: string): void {

@@ -20,6 +20,7 @@ import { buildOutflowMeter } from "../payments/outflowMeter";
 import { providerOf, requireCircleWallets } from "../payments/provider";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
+import { SqliteJobOpAttempts } from "../persistence/jobOpAttempts";
 import type { EntityRecord } from "../types";
 import { circleJobOps } from "./circleJobOps";
 import { type JobRepository, SqliteJobRepository } from "./jobRepository";
@@ -48,6 +49,7 @@ export function buildJobDeps(
   circleApi?: CircleWalletsApi,
 ): JobDeps {
   const jobs = new SqliteJobRepository(db);
+  const jobOpAttempts = new SqliteJobOpAttempts(db);
   // S5: job budgets are platform client-wallet outflows — same rolling-window brake as funding.
   const outflows = buildOutflowMeter(db, {
     ceilingAtomic: cfg.platformOutflowCeiling,
@@ -105,6 +107,7 @@ export function buildJobDeps(
         operatorWalletId: requireCircleWallets(entity).operatorWalletId,
         jobContract: cfg.jobContract,
         jobKey,
+        attempts: jobOpAttempts,
         outflows,
       });
     }

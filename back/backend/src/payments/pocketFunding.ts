@@ -2,7 +2,7 @@ import { http, createPublicClient } from "viem";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import type { CircleWalletsApi } from "../adapters/circle/circleWallets";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
-import { readGatewayAvailable } from "../adapters/x402/gatewayRead";
+import { readGatewayAvailableByAddress } from "../adapters/x402/gatewayRead";
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { fundPocket, requireVaultOperator } from "../agent/liveRunner";
 import { chainFor } from "../chains";
@@ -75,15 +75,11 @@ export function buildPocketFunding(
             standingExposure: () =>
               readStandingExposure({
                 usdcBalanceOf: (owner) => adapter.usdcBalanceOf(usdc, owner),
-                gatewayAvailable: async () =>
-                  Number(
-                    await readGatewayAvailable({
-                      rpcUrl: cfg.rpcUrl,
-                      chainId: cfg.chainId,
-                      usdc,
-                      depositor: wallets.pocketAddress as Address,
-                    }),
-                  ) / 1e6,
+                gatewayAvailable: () =>
+                  readGatewayAvailableByAddress({
+                    rpcUrl: cfg.rpcUrl,
+                    depositor: wallets.pocketAddress,
+                  }),
                 operator: entity.operator as Address,
                 pocket: wallets.pocketAddress as Address,
               }),
@@ -95,6 +91,13 @@ export function buildPocketFunding(
       );
     }
 
+    // Review finding L2: name the config gap up front — without this, a turnkey agent on a
+    // circle-only deployment would die deep in wallet construction (or worse, risk a platform-key
+    // fallback signing for the wrong entity).
+    if (!cfg.pocketMasterSeed || !cfg.turnkey)
+      throw new Error(
+        `entity ${entity.idempotencyKey} is on the turnkey custody path but POCKET_MASTER_SEED/TURNKEY_* are not configured`,
+      );
     const vault = requireVaultOperator(entity.treasury, entity);
     const operatorWallet = await buildOperatorWalletClientForEntity(cfg, vault);
     return fundPocket(

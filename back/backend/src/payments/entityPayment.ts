@@ -6,7 +6,7 @@ import {
 import type { AgentkitSigner } from "../adapters/worldid/agentkitSigner";
 import { agentkitSignerFromKey, wrapFetchWithAgentkit } from "../adapters/worldid/agentkitSigner";
 import { PocketGateway } from "../adapters/x402/gateway";
-import { readGatewayAvailable } from "../adapters/x402/gatewayRead";
+import { readGatewayAvailableByAddress } from "../adapters/x402/gatewayRead";
 import { arcBatchingConfig, asBatchEvmSigner, pocketSignerFromKey } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { makeSignX402 } from "../adapters/x402/signX402";
@@ -155,19 +155,20 @@ export function buildEntityPaymentService(
 
   // Real Gateway read (used unless a test injects deps.readPocketFloat), atomic USDC.
   // Tier-0: a stored pocket address (backfilled fleet-wide in P1a) reads the Gateway balance BY
-  // ADDRESS — key-free, so it serves both custody paths and drops the seed dependency. Legacy
-  // rows without one fall back to deriving the key. Math.floor keeps the decimal conversion
+  // ADDRESS — key-free, so it serves both custody paths and drops the seed dependency — from the
+  // SAME facilitator-API source as the key-based read (gatewayRead.ts, review finding H2), so the
+  // preflight keeps seeing the balance that actually decides settlement. Legacy rows without a
+  // stored address fall back to deriving the key. Math.floor keeps the decimal conversion
   // conservative — never rounding UP into a float we don't have.
   const readPocketFloat =
     deps.readPocketFloat ??
     (async (entity: EntityRecord): Promise<bigint> => {
       if (entity.pocketAddress) {
-        return readGatewayAvailable({
+        const available = await readGatewayAvailableByAddress({
           rpcUrl: cfg.rpcUrl,
-          chainId: cfg.chainId,
-          usdc: entity.treasuryConfig?.usdc ?? cfg.usdc,
-          depositor: entity.pocketAddress as Address,
+          depositor: entity.pocketAddress,
         });
+        return BigInt(Math.floor(available * 1e6));
       }
       const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
       const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });

@@ -80,36 +80,50 @@ const DEFAULT_POLL_DELAY_MS = 2_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** Submit one contract execution and poll it to confirmation. Returns the Circle tx-id and the
- *  real on-chain hash. Throws CircleTxFailedError (terminal) or CircleTxTimeoutError (in flight —
- *  the deterministic idempotency key makes a later retry resume THIS tx, not fire a new one). */
-export async function submitAndConfirm(
-  api: Pick<CircleWalletsApi, "createContractExecutionTransaction" | "getTransaction">,
-  input: SubmitAndConfirmInput,
+/** Bound ONE HTTP call by a real wall-clock deadline (review finding M1): the poll loop's
+ *  deadline check only runs BETWEEN calls, so a hung Circle API call (dropped TCP, no RST) would
+ *  otherwise wedge the caller — which usually holds the per-entity keyed lock — forever. Uses a
+ *  real timer deliberately (not the injectable test sleep): an instantly-resolving fake sleep
+ *  must not fake-timeout instantly-resolving fake API calls. */
+function withCallDeadline<T>(work: Promise<T>, ms: number, err: () => Error): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(err()), Math.max(ms, 1));
+    (t as { unref?: () => void }).unref?.();
+    work.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Poll an ALREADY-SUBMITTED Circle tx to a terminal state (review finding M2: a resumed saga leg
+ *  that carries its circle_tx_id polls it directly instead of re-submitting — no reliance on
+ *  Circle's idempotency-replay retention for the no-double-send guarantee). */
+export async function confirmTransaction(
+  api: Pick<CircleWalletsApi, "getTransaction">,
+  circleTxId: string,
   opts: SubmitAndConfirmOptions = {},
 ): Promise<{ circleTxId: string; txHash: Hex }> {
   const pollDelayMs = opts.pollDelayMs ?? DEFAULT_POLL_DELAY_MS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const sleep = opts.sleep ?? defaultSleep;
   const now = opts.now ?? Date.now;
-
-  const res = await api.createContractExecutionTransaction({
-    walletId: input.walletId,
-    contractAddress: input.contractAddress,
-    callData: input.callData,
-    fee: { type: "level", config: { feeLevel: "MEDIUM" } },
-    idempotencyKey: deterministicIdempotencyKey(input.idempotencySeed),
-    refId: input.refId,
-  });
-  const circleTxId = res.data?.id;
-  if (!circleTxId)
-    throw new Error(
-      `circle createContractExecutionTransaction returned no tx id (contract ${input.contractAddress})`,
-    );
-
   const deadline = now() + timeoutMs;
   for (;;) {
-    const tx = (await api.getTransaction({ id: circleTxId })).data?.transaction;
+    const remaining = deadline - now();
+    const tx = (
+      await withCallDeadline(
+        api.getTransaction({ id: circleTxId }),
+        remaining,
+        () => new CircleTxTimeoutError(circleTxId, timeoutMs),
+      )
+    ).data?.transaction;
     const state = tx?.state ?? "UNKNOWN";
     if (SUCCESS_STATES.has(state)) {
       if (!tx?.txHash) throw new Error(`circle tx ${circleTxId} is ${state} but carries no txHash`);
@@ -129,4 +143,38 @@ export async function submitAndConfirm(
     if (now() >= deadline) throw new CircleTxTimeoutError(circleTxId, timeoutMs);
     await sleep(pollDelayMs);
   }
+}
+
+/** Submit one contract execution and poll it to confirmation. Returns the Circle tx-id and the
+ *  real on-chain hash. Throws CircleTxFailedError (terminal) or CircleTxTimeoutError (in flight —
+ *  the deterministic idempotency key makes a later retry resume THIS tx, not fire a new one). */
+export async function submitAndConfirm(
+  api: Pick<CircleWalletsApi, "createContractExecutionTransaction" | "getTransaction">,
+  input: SubmitAndConfirmInput,
+  opts: SubmitAndConfirmOptions = {},
+): Promise<{ circleTxId: string; txHash: Hex }> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+  const res = await withCallDeadline(
+    api.createContractExecutionTransaction({
+      walletId: input.walletId,
+      contractAddress: input.contractAddress,
+      callData: input.callData,
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+      idempotencyKey: deterministicIdempotencyKey(input.idempotencySeed),
+      refId: input.refId,
+    }),
+    timeoutMs,
+    () =>
+      new Error(
+        `circle createContractExecutionTransaction timed out after ${timeoutMs}ms — safe to retry (deterministic idempotency key replays)`,
+      ),
+  );
+  const circleTxId = res.data?.id;
+  if (!circleTxId)
+    throw new Error(
+      `circle createContractExecutionTransaction returned no tx id (contract ${input.contractAddress})`,
+    );
+
+  return confirmTransaction(api, circleTxId, opts);
 }

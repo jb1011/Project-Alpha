@@ -148,8 +148,9 @@ describe("runCircleBridge", () => {
       "submitted",
     ]);
 
-    // Second run (same amount): only the third leg is re-submitted — with the SAME deterministic
-    // key (attempt unchanged), so Circle replays the original tx rather than firing a new one.
+    // Second run (same amount): the third leg carries its persisted circle tx-id, so it is
+    // POLLED to a terminal state (review finding M2) — never re-submitted; the no-double-send
+    // guarantee rests on OUR rows, not Circle's idempotency-replay retention.
     const api2 = makeApi();
     const deps2 = makeDeps(api2, legs, {
       available: async () => {
@@ -160,11 +161,9 @@ describe("runCircleBridge", () => {
       },
     });
     const hashes = await runCircleBridge(deps2, 1_000_000n);
-    expect(api2.submits).toHaveLength(1);
-    expect(api2.submits[0]!.idempotencyKey).toBe(
-      deterministicIdempotencyKey("e:1:b1:deposit_for:0"),
-    );
-    expect(hashes).toHaveLength(3); // stored hashes for legs 1+2, fresh for leg 3
+    expect(api2.submits).toHaveLength(0);
+    expect(api2.polls).toEqual(["tx-3"]);
+    expect(hashes).toHaveLength(3); // stored hashes for legs 1+2, freshly-confirmed for leg 3
   });
 
   test("in-flight bridge with a DIFFERENT amount refuses with a structured error", async () => {
@@ -253,3 +252,70 @@ describe("runCircleBridge", () => {
     ]);
   });
 });
+
+describe("runCircleBridge — review hardening (M2/M3)", () => {
+  test("M2: a submitted leg with a stored circle tx-id is POLLED, never re-submitted", async () => {
+    const legs = makeLegs();
+    legs.createBridge("e:1:b1", "e:1", 1_000_000n);
+    legs.markConfirmed("e:1:b1", "fund_operator", "0xh1");
+    legs.markConfirmed("e:1:b1", "approve", "0xh2");
+    legs.markSubmitted("e:1:b1", "deposit_for", "tx-stored");
+
+    const api = makeApi();
+    const hashes = await runCircleBridge(
+      makeDeps(api, legs, {
+        available: async () => {
+          throw new Error("resume must not re-run the cap checks");
+        },
+        standingExposure: async () => {
+          throw new Error("resume must not re-run the ceiling checks");
+        },
+      }),
+      1_000_000n,
+    );
+    expect(api.submits).toHaveLength(0); // no createContractExecutionTransaction at all
+    expect(api.polls).toEqual(["tx-stored"]); // polled the PERSISTED tx-id
+    expect(hashes).toEqual(["0xh1", "0xh2", "0xhash-tx-stored"]);
+  });
+
+  test("M3: mismatched amount ABANDONS a bridge whose first leg never moved funds, then funds fresh", async () => {
+    const legs = makeLegs();
+    // First bridge fails terminally on leg 1 (e.g. treasury available dropped) — nothing moved.
+    const api1 = makeApi({ states: { "tx-1": ["FAILED"] } });
+    await expect(runCircleBridge(makeDeps(api1, legs), 1_000_000n)).rejects.toThrow(
+      /terminal state FAILED/,
+    );
+    // A DIFFERENT amount now abandons the wedged bridge and funds cleanly.
+    const api2 = makeApi();
+    const hashes = await runCircleBridge(
+      makeDeps(api2, legs, { newBridgeKey: () => "b2" }),
+      2_000_000n,
+    );
+    expect(hashes).toHaveLength(3);
+    expect(legs.legsOf("e:1:b1").map((r) => r.state)).toEqual([
+      "abandoned",
+      "abandoned",
+      "abandoned",
+    ]);
+    expect(legs.findIncomplete("e:1")).toBeUndefined(); // b2 confirmed, b1 abandoned
+  });
+
+  test("M3 guard: a bridge whose first leg is SUBMITTED (unresolved) still refuses a different amount", async () => {
+    const legs = makeLegs();
+    const api1 = makeApi({ states: { "tx-1": ["INITIATED"] } });
+    await expect(
+      runCircleBridge(
+        makeDeps(api1, legs, { confirm: { pollDelayMs: 0, timeoutMs: 0, sleep: async () => {} } }),
+        1_000_000n,
+      ),
+    ).rejects.toThrow(/not confirmed/);
+    // leg 1 is 'submitted' with tx-1 — could still land; abandoning would risk a double-pull.
+    await expect(runCircleBridge(makeApiDeps(legs), 2_000_000n)).rejects.toThrow(
+      BridgeInFlightError,
+    );
+  });
+});
+
+function makeApiDeps(legs: SqliteBridgeLegRepository) {
+  return makeDeps(makeApi(), legs);
+}

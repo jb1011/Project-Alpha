@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { encodeFunctionData } from "viem";
 import type { SubmitAndConfirmOptions } from "../adapters/circle/circleExec";
-import { submitAndConfirm } from "../adapters/circle/circleExec";
+import { confirmTransaction, submitAndConfirm } from "../adapters/circle/circleExec";
 import type { CircleWalletsApi } from "../adapters/circle/circleWallets";
 import type {
   BridgeLegName,
@@ -150,13 +150,26 @@ export class BridgeInFlightError extends Error {
 export async function runCircleBridge(d: CircleBridgeDeps, amount: bigint): Promise<Hex[]> {
   if (amount <= 0n) throw new Error("top-up amount must be positive");
 
-  let legs: BridgeLegRecord[];
+  let legs: BridgeLegRecord[] | undefined;
   const open = d.legs.findIncomplete(d.entityKey);
   if (open) {
-    const inFlight = open[0]!.amount;
-    if (inFlight !== amount) throw new BridgeInFlightError(d.entityKey, inFlight, amount);
-    legs = open; // crash-retry of the same funding call — resume, never re-check or re-pull
-  } else {
+    const first = open[0]!;
+    if (first.amount === amount) {
+      legs = open; // crash-retry of the same funding call — resume, never re-check or re-pull
+    } else if (first.state === "pending" || first.state === "failed") {
+      // Review finding M3 — the abandon path: a different amount is requested and the bridge's
+      // FIRST leg never moved funds ('pending' = never submitted; 'failed' = terminal on-chain
+      // failure, e.g. treasury available dropped below the amount after creation). Refusing
+      // forever would wedge the entity's funding on a bridge that can never succeed. Legs 2/3
+      // are necessarily pending here (the saga is strictly ordered), so abandoning is safe.
+      // A 'submitted' (unresolved — could still land) or 'confirmed' (treasury already pulled)
+      // first leg keeps the hard refusal: complete that bridge first.
+      d.legs.abandonBridge(first.bridgeKey);
+    } else {
+      throw new BridgeInFlightError(d.entityKey, first.amount, amount);
+    }
+  }
+  if (!legs) {
     // New bridge: the cap + ceiling gates run exactly once, before anything moves.
     const available = await d.available();
     if (amount > available) throw new Error(`top-up ${amount} exceeds available ${available}`);
@@ -194,21 +207,28 @@ export async function runCircleBridge(d: CircleBridgeDeps, amount: bigint): Prom
     if (leg.state === "failed") attempt = d.legs.bumpAttempt(leg.bridgeKey, leg.leg);
 
     const { contractAddress, callData } = legCall(d, leg.leg, leg.amount);
+    const confirmOpts = {
+      ...d.confirm,
+      onNetworkFee: (fee: bigint, txId: string) => d.outflows?.record("gas_sponsorship", fee, txId),
+    };
     try {
-      const { circleTxId, txHash } = await submitAndConfirm(
-        d.api,
-        {
-          walletId: d.operatorWalletId,
-          contractAddress,
-          callData,
-          idempotencySeed: `${leg.bridgeKey}:${leg.leg}:${attempt}`,
-          refId: `${d.entityKey}:${leg.leg}`,
-        },
-        {
-          ...d.confirm,
-          onNetworkFee: (fee, txId) => d.outflows?.record("gas_sponsorship", fee, txId),
-        },
-      );
+      // Review finding M2: a leg that already carries its circle tx-id polls THAT tx to a
+      // terminal state instead of re-submitting — the no-double-send guarantee then rests on our
+      // own persisted state, not on Circle's idempotency-replay retention window.
+      const { circleTxId, txHash } =
+        leg.state === "submitted" && leg.circleTxId
+          ? await confirmTransaction(d.api, leg.circleTxId, confirmOpts)
+          : await submitAndConfirm(
+              d.api,
+              {
+                walletId: d.operatorWalletId,
+                contractAddress,
+                callData,
+                idempotencySeed: `${leg.bridgeKey}:${leg.leg}:${attempt}`,
+                refId: `${d.entityKey}:${leg.leg}`,
+              },
+              confirmOpts,
+            );
       // markSubmitted before markConfirmed would need a poll-phase callback; the deterministic
       // idempotency key already makes the submit crash-safe, so record the terminal state only —
       // plus the circle tx-id for forensics either way.

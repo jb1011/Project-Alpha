@@ -1,5 +1,5 @@
 import { PocketGateway } from "../adapters/x402/gateway";
-import { readGatewayAvailable } from "../adapters/x402/gatewayRead";
+import { readGatewayAvailableByAddress } from "../adapters/x402/gatewayRead";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import type { Config } from "../config/env";
 import type { Address, EntityRecord, Hex } from "../types";
@@ -50,8 +50,10 @@ export interface ExposureBalanceReader {
  * Tier-0 dispatch (audit items 4+7): when the entity's pocket ADDRESS is stored (backfilled for
  * every agent in P1a; written at creation for new ones), the Gateway balance is read BY ADDRESS —
  * no key derivation, so read paths stop touching POCKET_MASTER_SEED, and circle-path pockets
- * (whose keys live in Circle MPC, underivable here) read identically. Legacy rows without a
- * stored address fall back to seed derivation (turnkey-only by construction).
+ * (whose keys live in Circle MPC, underivable here) read identically. SAME SOURCE as before
+ * (the Gateway facilitator API view — see gatewayRead.ts), so turnkey numbers are unchanged.
+ * Legacy rows without a stored address fall back to seed derivation (turnkey-only by
+ * construction).
  */
 export function buildReadExposure(
   cfg: Pick<Config, "pocketMasterSeed" | "rpcUrl" | "usdc" | "chainId">,
@@ -63,17 +65,8 @@ export function buildReadExposure(
     let gatewayAvailable: () => Promise<number>;
     if (entity.pocketAddress) {
       pocket = entity.pocketAddress as Address;
-      // Address-based read returns atomic units — feed readStandingExposure's decimal seam
-      // losslessly (it floors right back to the same atomic value).
-      gatewayAvailable = async () =>
-        Number(
-          await readGatewayAvailable({
-            rpcUrl: cfg.rpcUrl,
-            chainId: cfg.chainId,
-            usdc,
-            depositor: pocket,
-          }),
-        ) / 1e6;
+      gatewayAvailable = () =>
+        readGatewayAvailableByAddress({ rpcUrl: cfg.rpcUrl, depositor: pocket });
     } else {
       const pocketKey = derivePocketKey(requirePocketMasterSeed(cfg), entity.idempotencyKey);
       const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });

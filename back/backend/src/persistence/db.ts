@@ -298,13 +298,24 @@ export function migrate(db: Database.Database): void {
       attempt      INTEGER NOT NULL DEFAULT 0,
       circle_tx_id TEXT,
       tx_hash      TEXT,
-      state        TEXT NOT NULL CHECK (state IN ('pending','submitted','confirmed','failed')),
+      state        TEXT NOT NULL CHECK (state IN ('pending','submitted','confirmed','failed','abandoned')),
       error        TEXT,
       created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (bridge_key, leg)
     );
     CREATE INDEX IF NOT EXISTS idx_bridge_legs_entity ON bridge_legs(entity_key, state);
+
+    -- Tier-0: per-(jobKey, step) attempt counters for circle-path job ops. A FAILED Circle tx
+    -- burns its deterministic idempotency key (Circle replays the original failed response for a
+    -- reused key), so retries MUST derive a fresh key — same invariant the funding bridge keeps
+    -- in bridge_legs.attempt (review finding H1).
+    CREATE TABLE IF NOT EXISTS job_op_attempts (
+      job_key TEXT NOT NULL,
+      step    TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (job_key, step)
+    );
 
     -- Small key/value marker table for one-shot data migrations (guards below), distinct from the
     -- additive schema (table/column) migrations, which are idempotent by construction.
