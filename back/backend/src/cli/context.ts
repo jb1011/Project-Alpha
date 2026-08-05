@@ -2,6 +2,8 @@ import { config as loadDotenv } from "dotenv";
 import type { Address } from "viem";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
+import { buildCircleWalletsApi } from "../adapters/circle/circleWallets";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
 import { type Config, loadConfig } from "../config/env";
@@ -47,7 +49,13 @@ export async function buildContext(): Promise<CliContext> {
     docStore,
     arc,
     operatorSigner: await buildOperatorSigner(cfg), // Turnkey if configured, else OPERATOR_PRIVATE_KEY
-    jobDeps: buildJobDeps(cfg, db, repo, docStore),
+    jobDeps: buildJobDeps(
+      cfg,
+      db,
+      repo,
+      docStore,
+      cfg.circle ? withCircleRateLimit(buildCircleWalletsApi(cfg.circle)) : undefined,
+    ),
     outflows: buildOutflowMeter(db, {
       ceilingAtomic: cfg.platformOutflowCeiling,
       windowMs: cfg.platformOutflowWindowMs,

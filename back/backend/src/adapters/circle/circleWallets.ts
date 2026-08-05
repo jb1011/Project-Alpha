@@ -1,4 +1,4 @@
-// biome-ignore lint/style/noNamespaceImport: deliberate — see interop note below.
+// Namespace import is deliberate — see the CJS/ESM interop note in buildCircleWalletsApi.
 import * as dcwModule from "@circle-fin/developer-controlled-wallets";
 import { opsLog } from "../../observability/opsLog";
 import type { Hex } from "../../types";
@@ -47,6 +47,27 @@ export interface CircleWalletsApi {
     walletId: string;
     message: string;
   }): Promise<{ data?: { signature?: string } }>;
+  /** Async on-chain execution: returns a Circle tx-id immediately; poll getTransaction for the
+   *  hash. idempotencyKey MUST be a UUID; reuse replays the original response (crash-retry safe). */
+  createContractExecutionTransaction(input: {
+    walletId: string;
+    contractAddress: string;
+    callData: `0x${string}`;
+    fee: { type: "level"; config: { feeLevel: "LOW" | "MEDIUM" | "HIGH" } };
+    idempotencyKey: string;
+    refId?: string;
+  }): Promise<{ data?: { id?: string; state?: string } }>;
+  getTransaction(input: { id: string }): Promise<{
+    data?: {
+      transaction?: {
+        id?: string;
+        state?: string;
+        txHash?: string;
+        networkFee?: string;
+        errorReason?: string;
+      };
+    };
+  }>;
 }
 
 /** Real client, opsLog-wrapped. `cfg` mirrors Config.circle + the wallet-set id. */
@@ -73,7 +94,12 @@ export function buildCircleWalletsApi(cfg: {
   return withCircleOpsLog(client);
 }
 
-const MUTATING: (keyof CircleWalletsApi)[] = ["createWallets", "signTypedData", "signMessage"];
+const MUTATING: (keyof CircleWalletsApi)[] = [
+  "createWallets",
+  "signTypedData",
+  "signMessage",
+  "createContractExecutionTransaction",
+];
 
 /** S5 parity: one journald line per mutating Circle call. Logging failure never blocks the call. */
 export function withCircleOpsLog(api: CircleWalletsApi): CircleWalletsApi {
@@ -130,7 +156,10 @@ export async function provisionCircleWallets(
 }
 
 /** Feeds the EXISTING x402 seam (`asBatchEvmSigner`): {address, signTypedData}. The SDK wants
- *  the EIP-712 payload as a JSON string in `data`. */
+ *  the EIP-712 payload as a JSON string in `data` — and x402 typed data carries BigInt values
+ *  (amounts, deadlines), which plain JSON.stringify REJECTS ("Do not know how to serialize a
+ *  BigInt"; caught by the P1c pay-path test). uint256 fields serialize as decimal strings, the
+ *  representation EIP-712 JSON expects. */
 export function circleTypedDataSigner(
   api: CircleWalletsApi,
   wallet: { walletId: string; address: string },
@@ -140,7 +169,7 @@ export function circleTypedDataSigner(
     async signTypedData(typedData: unknown): Promise<Hex> {
       const res = await api.signTypedData({
         walletId: wallet.walletId,
-        data: JSON.stringify(typedData),
+        data: JSON.stringify(typedData, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
       });
       const sig = res.data?.signature;
       if (!sig)

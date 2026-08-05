@@ -14,14 +14,13 @@ function makeDb() {
 }
 
 describe("runJob saga — steps 0–2", () => {
-  test("create → fund advances to funded and setBudget uses provider wallet", async () => {
+  test("create → fund advances to funded and setBudget goes through providerOpsFor", async () => {
     const db = makeDb();
     const jobs = new SqliteJobRepository(db);
     const entities = new SqliteEntityRepository(db);
     seedBoundEntity(entities, "t:agent");
 
-    const capturedWallet = {} as unknown as import("viem").WalletClient; // sentinel
-    let setBudgetWallet: unknown;
+    const setBudget = vi.fn().mockResolvedValue(`0x${"bb".repeat(32)}` as `0x${string}`);
 
     const deps = makeRunJobDeps({
       db,
@@ -32,16 +31,14 @@ describe("runJob saga — steps 0–2", () => {
       budget: 500_000n,
     });
 
-    // Spy on providerWalletFor to capture the provider wallet
-    deps.providerWalletFor = vi.fn().mockResolvedValue(capturedWallet);
-
-    // Spy on setBudget to capture the wallet argument
-    deps.job.setBudget = vi
-      .fn()
-      .mockImplementation(async (_id: bigint, _amt: bigint, w: unknown) => {
-        setBudgetWallet = w;
-        return `0x${"bb".repeat(32)}` as `0x${string}`;
-      });
+    // Spy on the provider ops seam — the saga must route the provider-signed step through it
+    // (custody dispatch happens in composition, behind this seam).
+    const providerOpsFor = vi.fn((_entity, _jobKey) => ({
+      setBudget,
+      submit: vi.fn(),
+      sweepToTreasury: vi.fn(),
+    }));
+    deps.providerOpsFor = providerOpsFor;
 
     // Stub the worker so it throws after fund, stopping the saga before submit
     deps.worker.produceDeliverable = vi.fn().mockRejectedValueOnce(new Error("stop after fund"));
@@ -51,8 +48,12 @@ describe("runJob saga — steps 0–2", () => {
     // Steps 0–2 must have completed and the record must be persisted as "funded"
     expect(jobs.findByKey("t:k")?.status).toBe("funded");
 
-    // setBudget must be called with the provider wallet from providerWalletFor
-    expect(setBudgetWallet).toBe(capturedWallet);
+    // setBudget must have gone through the provider ops for THIS entity + job
+    expect(providerOpsFor).toHaveBeenCalledWith(
+      expect.objectContaining({ idempotencyKey: "t:agent" }),
+      "t:k",
+    );
+    expect(setBudget).toHaveBeenCalledWith(0n, 500_000n);
   });
 
   test("missing entity throws a clear error", async () => {
@@ -138,9 +139,9 @@ describe("runJob saga — steps 0–2", () => {
     const createJobSpy = vi.fn();
     deps.job.createJob = createJobSpy;
 
-    await expect(runJob(deps)).rejects.toThrow(
-      /fully-onboarded agent.*missing operator\/subOrg\/agentId/,
-    );
+    // Provider-agnostic guard message (Tier-0): operator/agentId are required on BOTH custody
+    // paths; the sub-org requirement moved into the provider-aware branch.
+    await expect(runJob(deps)).rejects.toThrow(/fully-onboarded agent.*missing operator\/agentId/);
     expect(createJobSpy).not.toHaveBeenCalled();
   });
 

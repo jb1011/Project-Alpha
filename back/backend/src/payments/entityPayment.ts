@@ -1,8 +1,16 @@
+import {
+  type CircleWalletsApi,
+  circleAgentkitSigner,
+  circleTypedDataSigner,
+} from "../adapters/circle/circleWallets";
+import type { AgentkitSigner } from "../adapters/worldid/agentkitSigner";
 import { agentkitSignerFromKey, wrapFetchWithAgentkit } from "../adapters/worldid/agentkitSigner";
 import { PocketGateway } from "../adapters/x402/gateway";
-import { arcBatchingConfig, pocketSignerFromKey } from "../adapters/x402/pocket";
+import { readGatewayAvailable } from "../adapters/x402/gatewayRead";
+import { arcBatchingConfig, asBatchEvmSigner, pocketSignerFromKey } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { makeSignX402 } from "../adapters/x402/signX402";
+import type { BatchEvmSigner } from "../adapters/x402/types";
 import type { Config } from "../config/env";
 import type { PaymentReceipt } from "../persistence/paymentIdempotencyStore";
 import type { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
@@ -12,6 +20,7 @@ import type { AuthorityDeps, AuthorizeRequest, AuthorizeResult } from "./authori
 import { authorizePayment } from "./authority";
 import { buyWithX402 } from "./buyer";
 import type { PaymentLedger } from "./ledger";
+import { providerOf, requireCircleWallets } from "./provider";
 import type { SellerTrust } from "./sellerTrust";
 import { assertPublicHttpsUrl, requestAwareSafeFetch } from "./ssrfGuard";
 import type { StandingExposure } from "./standingExposure";
@@ -77,6 +86,10 @@ export interface EntityPaymentDeps {
    *  human-backed in AgentBook before we sign anything. Absent or `open` -> today's behavior,
    *  byte-identical. See docs/design/2026-07-30-trust-policy-dials.md. */
   sellerTrust?: SellerTrust;
+  /** Tier-0: Circle DevC client for circle-custody agents — their pocket key lives in Circle MPC,
+   *  so x402 + AgentKit signing go through the API instead of a local key. Required only when
+   *  circle-path agents exist (assertCircleCoverage enforces the boot-level pairing). */
+  circleApi?: CircleWalletsApi;
 }
 
 /** Deny reasons for each non-verified seller-trust outcome (docs/design/2026-08-01-v25-batch1.md). */
@@ -110,12 +123,52 @@ export function buildEntityPaymentService(
   cfg: Config,
   deps: EntityPaymentDeps,
 ): EntityPaymentService {
-  // Real Gateway read (used unless a test injects deps.readPocketFloat): derive this entity's pocket
-  // key, build a throwaway PocketGateway, and convert its decimal available balance to atomic USDC.
-  // Math.floor keeps the conversion conservative — never rounding UP into a float we don't have.
+  // Tier-0 provider dispatch for the two pocket-signing surfaces (x402 typed-data + AgentKit
+  // EIP-191). `turnkey` derives the local hot key from the master seed (unchanged); `circle`
+  // signs through the Circle API against the MPC-held pocket EOA — same seams, different signer.
+  const pocketSigners = (
+    entity: EntityRecord,
+  ): { x402: BatchEvmSigner; agentkit: AgentkitSigner } => {
+    if (providerOf(entity) === "circle") {
+      const api = deps.circleApi;
+      if (!api)
+        throw new Error(
+          `entity ${entity.idempotencyKey} is on the circle custody path but no Circle client is configured (CIRCLE_API_KEY/CIRCLE_ENTITY_SECRET)`,
+        );
+      const wallets = requireCircleWallets(entity);
+      const ref = { walletId: wallets.pocketWalletId, address: wallets.pocketAddress as Address };
+      const typed = circleTypedDataSigner(api, ref);
+      return {
+        x402: asBatchEvmSigner({
+          address: ref.address,
+          signTypedData: (td) => typed.signTypedData(td),
+        }),
+        agentkit: circleAgentkitSigner(api, ref, cfg.chainId),
+      };
+    }
+    const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
+    return {
+      x402: pocketSignerFromKey(pocketKey),
+      agentkit: agentkitSignerFromKey(pocketKey, cfg.chainId),
+    };
+  };
+
+  // Real Gateway read (used unless a test injects deps.readPocketFloat), atomic USDC.
+  // Tier-0: a stored pocket address (backfilled fleet-wide in P1a) reads the Gateway balance BY
+  // ADDRESS — key-free, so it serves both custody paths and drops the seed dependency. Legacy
+  // rows without one fall back to deriving the key. Math.floor keeps the decimal conversion
+  // conservative — never rounding UP into a float we don't have.
   const readPocketFloat =
     deps.readPocketFloat ??
     (async (entity: EntityRecord): Promise<bigint> => {
+      if (entity.pocketAddress) {
+        return readGatewayAvailable({
+          rpcUrl: cfg.rpcUrl,
+          chainId: cfg.chainId,
+          usdc: entity.treasuryConfig?.usdc ?? cfg.usdc,
+          depositor: entity.pocketAddress as Address,
+        });
+      }
       const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
       const gateway = new PocketGateway({ pocketPrivateKey: pocketKey, rpcUrl: cfg.rpcUrl });
       const available = await gateway.getAvailable();
@@ -129,9 +182,8 @@ export function buildEntityPaymentService(
     deps.readExposure ?? buildReadExposure(cfg, deps.reader);
 
   const buildAuthorize = (entity: EntityRecord, treasury: Address) => {
-    const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
     const signX402 = makeSignX402({
-      signer: pocketSignerFromKey(pocketKey),
+      signer: pocketSigners(entity).x402,
       chainId: cfg.chainId,
       network: arcBatchingConfig.network,
       verifyingContract: arcBatchingConfig.verifyingContract,
@@ -266,15 +318,17 @@ export function buildEntityPaymentService(
       // response passes through, so sellers without the extension are unaffected. If the agent
       // is authorized within its allowance the seller returns 200 and buyWithX402 treats it as a
       // final response (no payment); otherwise the normal 402 -> policy -> sign -> settle path runs.
-      const fetchImpl = cfg.world
-        ? wrapFetchWithAgentkit(
-            baseFetch,
-            agentkitSignerFromKey(
-              derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey),
-              cfg.chainId,
-            ),
-          )
-        : baseFetch;
+      let fetchImpl: typeof baseFetch;
+      try {
+        fetchImpl = cfg.world
+          ? wrapFetchWithAgentkit(baseFetch, pocketSigners(entity).agentkit)
+          : baseFetch;
+      } catch (e) {
+        // Signer construction failed (missing circle wallet fields / client) — nothing signed,
+        // release the claim so the same key retries cleanly once the config is fixed.
+        deps.idempotency.release(args.idempotencyKey, args.tenantId, entityKey);
+        return { ok: false, txOrTransferId: null, reason: (e as Error).message };
+      }
       // Tracks whether the payment was actually authorized/"signed" by buyWithX402's onAuthorized
       // callback. This is the load-bearing distinction for step 5 below: a failure BEFORE signing
       // (SSRF/treasury-null checks above, policy-denied, 402-no-requirements, buildAuthorize

@@ -3,6 +3,8 @@ import { serve } from "@hono/node-server";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
+import { buildCircleWalletsApi } from "../adapters/circle/circleWallets";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
@@ -19,6 +21,7 @@ import { buildSellerTrust } from "../payments/sellerTrust";
 import { buildReadExposure } from "../payments/standingExposure";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
+import { SqliteBridgeLegRepository } from "../persistence/bridgeLegRepository";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
@@ -69,6 +72,12 @@ async function main() {
     ceilingAtomic: cfg.platformOutflowCeiling,
     windowMs: cfg.platformOutflowWindowMs,
   });
+  // Tier-0: one rate-limited Circle client for every circle-custody surface in this process
+  // (signing, funding bridge, job ops). Undefined on turnkey-only deployments — every consumer
+  // fails with a named error if a circle-path agent appears without it (assertCircleCoverage
+  // already refuses boot for that pairing).
+  const circleApi = cfg.circle ? withCircleRateLimit(buildCircleWalletsApi(cfg.circle)) : undefined;
+  const bridgeLegs = new SqliteBridgeLegRepository(db);
   // Audit fix C: the platform manager address, force-set into `roles.manager` on onboarding so an
   // agent-first caller never needs to know or guess it (see managerAccount doc).
   const platformManagerAddress = managerAccount(cfg).address;
@@ -102,13 +111,21 @@ async function main() {
             treasuryPaused: (treasury) => arc.treasuryPaused(treasury),
           },
         }),
+        circleApi,
       })
     : undefined;
 
-  // Explicit treasury->pocket top-up (fund_pocket tool/route). Same guard as `payments`: needs both
-  // POCKET_MASTER_SEED (to derive the pocket) and Turnkey config (to sign as the operator).
+  // Explicit treasury->pocket top-up (fund_pocket tool/route). Guard: the turnkey path needs
+  // POCKET_MASTER_SEED + Turnkey config; the circle path needs only the Circle client — either
+  // combination makes the tool available, and the per-entity dispatch names what's missing.
   const pocketFunding =
-    cfg.pocketMasterSeed && cfg.turnkey ? buildPocketFunding(cfg, outflows) : undefined;
+    (cfg.pocketMasterSeed && cfg.turnkey) || circleApi
+      ? buildPocketFunding(
+          cfg,
+          outflows,
+          circleApi ? { api: circleApi, legs: bridgeLegs } : undefined,
+        )
+      : undefined;
 
   // S2 standing-float-ceiling reads for the dashboard (GET /entities/:id/treasury). Same guard as
   // `payments`: undefined when POCKET_MASTER_SEED isn't configured, in which case the route
@@ -161,7 +178,7 @@ async function main() {
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
 
-  const jobDeps = buildJobDeps(cfg, db, repo, docStore);
+  const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
   const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
   if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
 

@@ -31,7 +31,12 @@ const DEFAULT_POLL_ATTEMPTS = 12;
 const DEFAULT_POLL_DELAY_MS = 1_500;
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** Retry-safety guard: true when the operator already holds the fundOperator credit (a re-run
+/** TURNKEY-ONLY retry-safety guard (Tier-0 spec, audit item 9): the balance heuristic assumes the
+ *  gas-seed baseline, which the circle path doesn't have — and job earnings on the operator SCA
+ *  would confound it. The circle bridge resumes from its persisted bridge_legs saga instead
+ *  (payments/circleBridge.ts), never by balance inference.
+ *
+ *  True when the operator already holds the fundOperator credit (a re-run
  *  completing a partial bridge), so the treasury must NOT be pulled again. `operatorBalance` and
  *  `seedTargetAtomic` are 6-dec atomic USDC; the seed lands the operator at exactly seedTargetAtomic,
  *  and a landed credit pushes it to ~seedTargetAtomic + amount (minus small gas). The amount/2 margin

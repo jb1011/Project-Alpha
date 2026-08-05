@@ -284,6 +284,28 @@ export function migrate(db: Database.Database): void {
       kind TEXT    NOT NULL
     );
 
+    -- Tier-0 (audit item 3): persisted saga rows for the circle-path funding bridge. Circle's API
+    -- is async (tx-id first, hash after confirmation) and its idempotency keys are per-request —
+    -- so resume MUST come from these rows + a Circle getTransaction query, never from balance
+    -- inference (the turnkey path's shouldSkipFundOperator heuristic does not transfer). One
+    -- bridge = three legs sharing a bridge_key; legs are created up-front in one transaction so
+    -- "incomplete bridge" is simply "any leg not yet confirmed". amount is atomic USDC (6 dec).
+    CREATE TABLE IF NOT EXISTS bridge_legs (
+      bridge_key   TEXT NOT NULL,
+      leg          TEXT NOT NULL CHECK (leg IN ('fund_operator','approve','deposit_for')),
+      entity_key   TEXT NOT NULL,
+      amount       TEXT NOT NULL,
+      attempt      INTEGER NOT NULL DEFAULT 0,
+      circle_tx_id TEXT,
+      tx_hash      TEXT,
+      state        TEXT NOT NULL CHECK (state IN ('pending','submitted','confirmed','failed')),
+      error        TEXT,
+      created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (bridge_key, leg)
+    );
+    CREATE INDEX IF NOT EXISTS idx_bridge_legs_entity ON bridge_legs(entity_key, state);
+
     -- Small key/value marker table for one-shot data migrations (guards below), distinct from the
     -- additive schema (table/column) migrations, which are idempotent by construction.
     CREATE TABLE IF NOT EXISTS meta (

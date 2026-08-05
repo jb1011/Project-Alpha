@@ -11,15 +11,20 @@ import { privateKeyToAccount } from "viem/accounts";
 import { publicClientFor } from "../adapters/arc/clients";
 import { JobAdapter } from "../adapters/arc/jobAdapter";
 import { ReputationAdapter } from "../adapters/arc/reputationAdapter";
+import type { CircleWalletsApi } from "../adapters/circle/circleWallets";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { chainFor } from "../chains";
 import type { Config } from "../config/env";
+import { withKeyedLock } from "../payments/keyedMutex";
 import { buildOutflowMeter } from "../payments/outflowMeter";
+import { providerOf, requireCircleWallets } from "../payments/provider";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
+import type { EntityRecord } from "../types";
+import { circleJobOps } from "./circleJobOps";
 import { type JobRepository, SqliteJobRepository } from "./jobRepository";
 import { JobRunner, type RunJobFn } from "./jobRunner";
-import { runJob as runJobSaga } from "./runJob";
+import { type ProviderJobOps, runJob as runJobSaga } from "./runJob";
 import { TrivialWorker } from "./worker";
 
 export interface JobDeps {
@@ -40,6 +45,7 @@ export function buildJobDeps(
   db: Database.Database,
   entities: EntityRepository,
   docStore: DocumentStore,
+  circleApi?: CircleWalletsApi,
 ): JobDeps {
   const jobs = new SqliteJobRepository(db);
   // S5: job budgets are platform client-wallet outflows — same rolling-window brake as funding.
@@ -84,33 +90,69 @@ export function buildJobDeps(
 
   const worker = new TrivialWorker();
 
-  // Lazy: only called inside the saga (Step 2 / setBudget), not at boot time.
-  const providerWalletFor = (e: { subOrgId: string; operator: string }) =>
-    buildOperatorWalletClientForEntity(cfg, e);
+  // Lazy provider dispatch (Tier-0 audit item 4): only called inside the saga (Steps 2/3/4.5),
+  // not at boot time. Turnkey wraps the enclave wallet (built once per ops instance, so a
+  // multi-step saga run costs one Turnkey API read); circle routes through contractExecution with
+  // per-(jobKey, step) deterministic idempotency.
+  const providerOpsFor = (entity: EntityRecord, jobKey: string): ProviderJobOps => {
+    if (providerOf(entity) === "circle") {
+      if (!circleApi)
+        throw new Error(
+          `entity ${entity.idempotencyKey} is on the circle custody path but no Circle client is configured (CIRCLE_API_KEY/CIRCLE_ENTITY_SECRET)`,
+        );
+      return circleJobOps({
+        api: circleApi,
+        operatorWalletId: requireCircleWallets(entity).operatorWalletId,
+        jobContract: cfg.jobContract,
+        jobKey,
+        outflows,
+      });
+    }
+    let walletPromise: ReturnType<typeof buildOperatorWalletClientForEntity> | undefined;
+    const wallet = () => {
+      walletPromise ??= buildOperatorWalletClientForEntity(cfg, {
+        subOrgId: entity.turnkeySubOrgId!,
+        operator: entity.operator!,
+      });
+      return walletPromise;
+    };
+    return {
+      setBudget: async (jobId, amount) => jobAdapter.setBudget(jobId, amount, await wallet()),
+      submit: async (jobId, deliverable) => jobAdapter.submit(jobId, deliverable, await wallet()),
+      sweepToTreasury: async (usdc, treasury, amount) =>
+        jobAdapter.transferUsdc(await wallet(), usdc, treasury, amount),
+    };
+  };
 
   const jobClientAddress: Address = clientWallet.account!.address;
   // Fallback: when no distinct evaluator key is set, jobEvaluatorAddress == jobClientAddress.
   // A real distinct evaluator key (JOB_EVALUATOR_PRIVATE_KEY) is required for live on-chain runs.
   const jobEvaluatorAddress: Address = evaluatorWallet?.account?.address ?? jobClientAddress;
 
+  // Per-entity serialization SPANNING funding and jobs (Tier-0 audit item 6): the saga sends as
+  // the operator (EOA or SCA — the SCA may only allow one in-flight tx), and the funding bridge
+  // uses the same key space, so a concurrent fund_pocket + run_job for one agent queue instead of
+  // racing nonces / the SCA queue.
   const runJob: RunJobFn = (input) =>
-    runJobSaga({
-      jobKey: input.jobKey,
-      entityKey: input.entityKey,
-      tenantId: input.tenantId,
-      budget: input.budget,
-      outflows,
-      description: input.description,
-      usdc: cfg.usdc,
-      jobs,
-      entities,
-      job: jobAdapter,
-      reputation: reputationAdapter,
-      worker,
-      docStore,
-      providerWalletFor,
-      sweepToTreasury: cfg.jobSweepToTreasury,
-    });
+    withKeyedLock(input.entityKey, () =>
+      runJobSaga({
+        jobKey: input.jobKey,
+        entityKey: input.entityKey,
+        tenantId: input.tenantId,
+        budget: input.budget,
+        outflows,
+        description: input.description,
+        usdc: cfg.usdc,
+        jobs,
+        entities,
+        job: jobAdapter,
+        reputation: reputationAdapter,
+        worker,
+        docStore,
+        providerOpsFor,
+        sweepToTreasury: cfg.jobSweepToTreasury,
+      }),
+    );
 
   const jobRunner = new JobRunner({ jobs, runJob });
 

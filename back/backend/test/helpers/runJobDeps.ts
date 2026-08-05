@@ -170,6 +170,8 @@ export interface MakeRunJobDepsOpts {
 }
 
 export function makeRunJobDeps(opts: MakeRunJobDepsOpts): RunJobDeps {
+  const job = opts.job ?? makeFakeJobAdapter();
+  const dummyWallet = makeDummyWallet();
   return {
     jobKey: opts.jobKey ?? "t:k",
     entityKey: opts.entityKey ?? "t:agent",
@@ -179,11 +181,19 @@ export function makeRunJobDeps(opts: MakeRunJobDepsOpts): RunJobDeps {
     usdc: opts.usdc ?? ("0x0000000000000000000000000000000000000002" as Address),
     jobs: opts.jobs,
     entities: opts.entities,
-    job: opts.job ?? makeFakeJobAdapter(),
+    job,
     reputation: opts.reputation ?? makeFakeReputationAdapter(),
     worker: opts.worker ?? new TrivialWorker(),
     docStore: makeFakeDocStore(),
-    providerWalletFor: async (_e) => makeDummyWallet(),
+    // Default ops mirror the turnkey composition: delegate to the (same, possibly test-mutated)
+    // fake JobAdapter instance with a dummy wallet — so tests that spy on `deps.job.setBudget`
+    // et al. keep observing the calls.
+    providerOpsFor: (_entity, _jobKey) => ({
+      setBudget: (jobId, amount) => job.setBudget(jobId, amount, dummyWallet),
+      submit: (jobId, deliverable) => job.submit(jobId, deliverable, dummyWallet),
+      sweepToTreasury: (usdc, treasury, amount) =>
+        job.transferUsdc(dummyWallet, usdc, treasury, amount),
+    }),
     sweepToTreasury: opts.sweepToTreasury ?? false,
     expiryWindowSec: opts.expiryWindowSec,
     now: opts.now,
@@ -193,7 +203,11 @@ export function makeRunJobDeps(opts: MakeRunJobDepsOpts): RunJobDeps {
 // ---------------------------------------------------------------------------
 // seedBoundEntity — insert a bound entity fixture carrying all fields the saga needs
 // ---------------------------------------------------------------------------
-export function seedBoundEntity(entities: EntityRepository, entityKey: string): EntityRecord {
+export function seedBoundEntity(
+  entities: EntityRepository,
+  entityKey: string,
+  overrides: Partial<EntityRecord> = {},
+): EntityRecord {
   const rec: EntityRecord = {
     idempotencyKey: entityKey,
     name: "Test Agent LLC",
@@ -219,6 +233,7 @@ export function seedBoundEntity(entities: EntityRepository, entityKey: string): 
     ownerTenantId: undefined,
     error: null,
     specJson: null,
+    ...overrides,
   };
   entities.upsert(rec);
   return rec;
