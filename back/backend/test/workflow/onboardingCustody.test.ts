@@ -205,3 +205,45 @@ test("legacy shared-key path (no custody, no provisioning) still works and store
   expect(rec.walletProvider ?? null).toBeNull(); // legacy rows stay null (reads as turnkey)
   expect(rec.pocketAddress).toBe("0xpocket-cust-A");
 });
+
+test("M1: a circle record can NEVER bind through the shared signer — missing circle signing refuses by name", async () => {
+  const arc = makeFakeArc();
+  const seams = makeCircleSeams();
+  // Crash after create (setAgentWallet fails once) so the record rests at 'created'.
+  (arc.setAgentWallet as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("boom"));
+  const deps = {
+    ...baseDeps(arc),
+    custody: "circle" as const,
+    provisionCircle: seams.provisionCircle,
+    circleSignerForEntity: seams.circleSignerForEntity,
+  };
+  await expect(runOnboarding(deps)).rejects.toThrow("boom");
+  expect(repo.findByIdempotencyKey("cust-A")?.status).toBe("created");
+
+  // Resume on a deployment whose Circle config was removed: must refuse, not fall through to
+  // the shared operatorSigner.
+  await expect(
+    runOnboarding({ ...baseDeps(arc), custody: "circle", provisionCircle: undefined }),
+  ).rejects.toThrow(/circle-custody entity.*cannot bind.*Circle signing is not configured/s);
+  expect(repo.findByIdempotencyKey("cust-A")?.status).toBe("created"); // untouched
+});
+
+test("M2: a legacy record (null provider) is NEVER converted by a circle custody input", async () => {
+  const arc = makeFakeArc();
+  // Legacy bound row: no walletProvider, no custody fields (pre-Tier-0 shape).
+  const legacy = await runOnboarding(baseDeps(arc));
+  expect(legacy.status).toBe("bound");
+  expect(legacy.walletProvider ?? null).toBeNull();
+
+  const seams = makeCircleSeams();
+  const rec = await runOnboarding({
+    ...baseDeps(arc),
+    custody: "circle",
+    provisionCircle: seams.provisionCircle,
+    circleSignerForEntity: seams.circleSignerForEntity,
+  });
+  // Null provider MEANS turnkey — the input must not re-provision or flip anything.
+  expect(seams.provisionCircle).not.toHaveBeenCalled();
+  expect(rec.walletProvider ?? null).toBeNull();
+  expect(rec.status).toBe("bound");
+});

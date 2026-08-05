@@ -73,7 +73,7 @@ export function ConfigureStep({ config, onChange, onBack, onComplete }: Props) {
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 01"
+        eyebrow="Screen 03"
         title="Define your agent"
         intro="Set the identity and the rules — spending caps, allowed recipients, and timelocks. The result is a policy your agent can never exceed on its own."
       />

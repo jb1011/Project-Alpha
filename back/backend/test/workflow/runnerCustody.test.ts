@@ -87,3 +87,33 @@ test("reconcile: pre-provision circle records resume; pre-provision turnkey reco
   expect(t.status).toBe("failed");
   expect(t.error).toMatch(/interrupted before provisioning/);
 });
+
+test("reconcile: a circle record that crashed POST-provisioning (created) also resumes", async () => {
+  const runSaga = vi.fn(async (i: { idempotencyKey: string }) => {
+    return repo.findByIdempotencyKey(i.idempotencyKey)!;
+  });
+  const runner = new OnboardingRunner({ repo, runSaga, fundCaps: CAPS });
+  runner.start({
+    spec,
+    userKey: "c2",
+    tenantId: "0xT",
+    guardianPasskey: passkey,
+    custody: "circle",
+  });
+  await runner.settled();
+  const r = repo.findByIdempotencyKey("0xT:c2")!;
+  repo.upsert({
+    ...r,
+    status: "created",
+    circleOperatorWalletId: "op-w",
+    circlePocketWalletId: "pk-w",
+    pocketAddress: "0xpocket",
+  });
+  const runSaga2 = vi.fn(async (i: { idempotencyKey: string }) => {
+    return repo.findByIdempotencyKey(i.idempotencyKey)!;
+  });
+  const runner2 = new OnboardingRunner({ repo, runSaga: runSaga2, fundCaps: CAPS });
+  expect(runner2.reconcileInFlight()).toBe(1);
+  await runner2.settled();
+  expect(runSaga2).toHaveBeenCalledTimes(1);
+});

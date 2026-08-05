@@ -67,7 +67,10 @@ export const emptyConfig = (): AgentConfig => ({
   name: "",
   purpose: "",
   configMode: "manual",
-  custody: "turnkey", // platform default until Tier-0 P4 flips it to "circle"
+  // Platform default until Tier-0 P4. NOTE (review N2): the wizard always SENDS an explicit
+  // custody value, so P4's backend WALLET_PROVIDER_DEFAULT flip does NOT reach wizard users —
+  // this default must be flipped alongside it.
+  custody: "turnkey",
   perTxCap: "",
   dailyCap: "",
   allowlist: [],

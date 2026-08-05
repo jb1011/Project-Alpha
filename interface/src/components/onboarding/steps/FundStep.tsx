@@ -75,7 +75,7 @@ export function FundStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 07"
+        eyebrow="Screen 06"
         title="Fund your agent's treasury"
         intro="The backend transfers USDC from the platform wallet into your agent's on-chain treasury. Enter the amount to fund."
       />

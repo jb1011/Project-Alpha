@@ -1,12 +1,14 @@
 // backend/src/onboarding/main.ts
 import "dotenv/config";
 import { serve } from "@hono/node-server";
+import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { managerWalletClient, publicClientFor } from "../adapters/arc/clients";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { provisionAgentVault } from "../adapters/turnkey/provisioner";
 import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
+import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { loadConfig } from "../config/env";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
@@ -74,6 +76,11 @@ async function main() {
       guardianPasskey,
       provision,
       signerForEntity,
+      // Audit item 7 (review L4): rows created here must also store their pocket address.
+      derivePocketAddress: cfg.pocketMasterSeed
+        ? (entityKey) =>
+            privateKeyToAccount(derivePocketKey(cfg.pocketMasterSeed!, entityKey)).address
+        : undefined,
     });
 
   const app = buildOnboardingApp({ runOnboarding });

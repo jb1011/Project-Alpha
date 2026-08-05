@@ -109,17 +109,22 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   const key = d.idempotencyKey;
   let rec = d.repo.findByIdempotencyKey(key);
 
-  // Tier-0 custody resolution: a resumed record's persisted provider ALWAYS wins (custody is
-  // immutable once claimed — a resume must never flip an agent's provider mid-saga); a fresh
-  // record takes the caller's choice, defaulting to turnkey (every pre-Tier-0 path).
-  const custody: "turnkey" | "circle" = rec?.walletProvider ?? d.custody ?? "turnkey";
+  // Tier-0 custody resolution: for ANY existing record the persisted provider wins — including
+  // legacy rows whose walletProvider is null, which MEAN turnkey (review M2: `rec?.wp ?? input`
+  // would let a caller's custody input CONVERT an existing pre-Tier-0 record). Only a genuinely
+  // fresh record takes the caller's choice; default turnkey (every pre-Tier-0 path).
+  const custody: "turnkey" | "circle" = rec
+    ? (rec.walletProvider ?? "turnkey")
+    : (d.custody ?? "turnkey");
 
   // ── Step 0a (circle custody): provision the per-agent Circle wallets (SCA operator + EOA
   //    pocket) BEFORE minting — the SCA address IS the on-chain operator. No Turnkey sub-org on
   //    this path; the guardian passkey is still recorded (rootPasskeyId, runner claim) as the
   //    guardian's identity anchor. On resume, a record already carrying circleOperatorWalletId is
   //    NOT re-provisioned.
-  if (custody === "circle" && !rec?.circleOperatorWalletId) {
+  // Status gate (review M2): provisioning may only run on a fresh or freshly-claimed record —
+  // never against one that already minted/bound (that would overwrite the on-chain operator).
+  if (custody === "circle" && !rec?.circleOperatorWalletId && (!rec || rec.status === "pending")) {
     if (!d.provisionCircle)
       throw new Error(
         `entity ${key} requested circle custody but this deployment has no Circle provisioning configured (CIRCLE_API_KEY/CIRCLE_ENTITY_SECRET/CIRCLE_WALLET_SET_ID)`,
@@ -304,6 +309,11 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       // Legacy shared-key path still gets a creation-time pocket address when the seed is around.
       pocketAddress: rec?.pocketAddress ?? d.derivePocketAddress?.(key) ?? null,
       rootPasskeyId: rec?.rootPasskeyId,
+      // Review M3: the rebuild must not silently NULL guardian-set / forensic fields — a resume
+      // after the guardian tightened the trust dial was resetting it to the looser default.
+      trustPolicy: rec?.trustPolicy ?? null,
+      previousOperator: rec?.previousOperator ?? null,
+      operatorRotatedAt: rec?.operatorRotatedAt ?? null,
       ownerTenantId: d.ownerTenantId ?? rec?.ownerTenantId,
       error: null,
       specJson: d.specJson ?? rec?.specJson ?? null,
@@ -381,6 +391,13 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       domainName: domain.name,
       domainVersion: domain.version,
     });
+    // Review M1: a circle record must NEVER fall through to the shared legacy signer — a resume
+    // on a deployment whose Circle config was removed would otherwise sign the bind with a key
+    // that has nothing to do with the SCA (opaque on-chain revert at best).
+    if (rec.walletProvider === "circle" && !d.circleSignerForEntity)
+      throw new Error(
+        `circle-custody entity ${key} cannot bind: Circle signing is not configured on this deployment (CIRCLE_API_KEY/CIRCLE_ENTITY_SECRET)`,
+      );
     // Provisioned path: build the per-entity signer — circle custody signs AgentWalletSet through
     // Circle as the operator SCA (ERC-1271; live-registry acceptance = the P2 known-unknown),
     // turnkey custody through the agent's own sub-org (the delegated Turnkey key signs only this

@@ -18,6 +18,7 @@ type Props = {
 const OPTIONS: {
   value: Custody;
   label: string;
+  tag?: string;
   tagline: string;
   points: string[];
   tradeoff: string;
@@ -25,6 +26,7 @@ const OPTIONS: {
   {
     value: "circle",
     label: "Novi-managed",
+    tag: "Early access",
     tagline: "Smart-account operator in Circle's MPC infrastructure, run by the platform.",
     points: [
       "Gasless — no gas top-ups, no per-signature costs",
@@ -32,7 +34,7 @@ const OPTIONS: {
       "Fastest funding path — fewer moving parts",
     ],
     tradeoff:
-      "The platform controls the operator's hot keys (in Circle MPC). Your guardian wallet still outranks the agent on-chain: pause, veto, clawback, and operator rotation always answer to you.",
+      "The platform controls the operator's hot keys (in Circle MPC). Your guardian wallet still outranks the agent on-chain: pause, veto, and clawback always answer to you. Early access: this path is in live validation, and some deployments don't offer it yet — if unavailable, submission will ask you to switch.",
   },
   {
     value: "turnkey",
@@ -78,6 +80,11 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
                   )}
                 />
                 <span className="text-[15px] font-medium text-ink">{o.label}</span>
+                {o.tag && (
+                  <span className="rounded-full border hairline-strong bg-paper-2/60 px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-muted-2">
+                    {o.tag}
+                  </span>
+                )}
               </div>
               <p className="mt-2 text-[12.5px] leading-[1.55] text-muted">{o.tagline}</p>
               <ul className="mt-3 flex flex-col gap-2">
@@ -99,8 +106,8 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
       <Callout tone="accent" className="mt-6" title="What this choice does NOT change">
         The agent&apos;s payment float (its spending pocket) is platform-managed on both options and
         capped at the standing-float ceiling. Your guardian wallet keeps every on-chain power —
-        pause, veto, clawback, key rotation — regardless of custody. You can migrate an agent
-        between custody options later via guardian-signed key rotation.
+        pause, veto, clawback — regardless of custody. Custody is fixed for the life of the agent
+        today; guardian-signed migration between options is on the roadmap.
       </Callout>
 
       <StepNav onBack={onBack}>

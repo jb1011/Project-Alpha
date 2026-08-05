@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Command } from "commander";
+import { privateKeyToAccount } from "viem/accounts";
+import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import type { DemoResult } from "../agent/demo";
 import { buildLiveAgentRunner } from "../agent/liveRunner";
 import { toJobView } from "../api/jobViews";
@@ -42,6 +44,12 @@ export function buildCli(
         usdc: ctx.cfg.usdc,
         metadataBaseUrl: ctx.cfg.metadataBaseUrl,
         fundAmount: opts.fund ? usdToUnits(opts.fund) : undefined,
+        // Audit item 7 (review L4): CLI-created rows must also store their pocket address at
+        // creation, or their read paths re-open the master-seed dependency.
+        derivePocketAddress: ctx.cfg.pocketMasterSeed
+          ? (entityKey) =>
+              privateKeyToAccount(derivePocketKey(ctx.cfg.pocketMasterSeed!, entityKey)).address
+          : undefined,
       });
       console.log(
         JSON.stringify(
