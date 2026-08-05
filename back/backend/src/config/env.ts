@@ -413,7 +413,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   // Tier-0 (review L2): a circle DEFAULT without circle provisioning would 400 every default
   // onboard at runtime — refuse at boot instead, like every other config mismatch.
-  if (cfg.walletProviderDefault === "circle" && !(cfg.circle && cfg.circle.walletSetId)) {
+  if (cfg.walletProviderDefault === "circle" && !cfg.circle?.walletSetId) {
     throw new Error(
       "Invalid config: WALLET_PROVIDER_DEFAULT=circle requires CIRCLE_API_KEY + CIRCLE_ENTITY_SECRET + CIRCLE_WALLET_SET_ID",
     );
