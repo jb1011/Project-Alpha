@@ -88,11 +88,12 @@ export async function onboardEntity(
   spec: AgentSpec,
   guardianPasskey: GuardianPasskey,
   idempotencyKey?: string,
+  custody?: "turnkey" | "circle",
 ): Promise<{ id: string; status: string }> {
   return request("/onboard", {
     method: "POST",
     token,
-    body: { spec, guardianPasskey, idempotencyKey },
+    body: { spec, guardianPasskey, idempotencyKey, custody },
   });
 }
 

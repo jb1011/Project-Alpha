@@ -66,7 +66,7 @@ export function AgreementStep({
           ? crypto.randomUUID()
           : `pa-${Date.now()}`);
       const spec = configToAgentSpec(config, address);
-      const { id } = await onboardEntity(auth.token, spec, guardianPasskey, key);
+      const { id } = await onboardEntity(auth.token, spec, guardianPasskey, key, config.custody);
       onSubmitted(id, key);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Onboarding submission failed.");
@@ -202,6 +202,16 @@ function keyClauses(config: AgentConfig) {
       title: `Guardian timelock — ${config.timelockHours || "1"}h`,
       body: "Sensitive actions are held, giving the guardian time to veto.",
     },
+    {
+      title:
+        config.custody === "circle"
+          ? "Novi-managed operator keys"
+          : "Passkey-rooted operator keys",
+      body:
+        config.custody === "circle"
+          ? "Operator keys are platform-managed (Circle MPC); the guardian keeps every on-chain override."
+          : "The guardian's passkey is the root authority over the agent's key vault.",
+    },
   ];
 }
 
@@ -247,9 +257,23 @@ ARTICLE VI — LAW-TO-CODE BINDING
 6.2  The backend computes the policy fingerprint at deploy time.
 6.3  Any divergence between this Agreement and the deployed policy is void.
 
-ARTICLE VII — NON-CUSTODY
-7.1  No platform, including Novi Corpus, holds the keys or assets of the
-     Company. Authority originates solely from the Guardian's passkey.
+ARTICLE VII — KEY CUSTODY
+${
+  config.custody === "circle"
+    ? `7.1  The Agent's operating keys are managed by the platform in secure MPC
+     infrastructure (Novi-managed custody). The Company's assets remain governed
+     by the on-chain policy; the platform cannot act outside it.
+7.2  The Guardian retains ultimate on-chain authority at all times: pause, veto,
+     asset clawback, and rotation of the operating keys.
+7.3  The Company's payment float is platform-managed and capped by the deployed
+     standing-float ceiling.`
+    : `7.1  The Agent's operating keys live in a key vault whose root authority is
+     the Guardian's passkey; the platform operates strictly under that root.
+7.2  The Guardian retains ultimate on-chain authority at all times: pause, veto,
+     asset clawback, and rotation of the operating keys.
+7.3  The Company's payment float is platform-managed and capped by the deployed
+     standing-float ceiling.`
+}
 
 IN WITNESS WHEREOF, the Guardian adopts this Agreement upon on-chain confirmation.`;
 }

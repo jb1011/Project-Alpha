@@ -54,6 +54,11 @@ export interface ApiDeps {
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
   agentRuns: import("../persistence/agentRunStore").AgentRunStore;
   mcpPublicUrl: string;
+  /** Tier-0 custody: the platform default for new agents ("turnkey" until P4) + whether circle
+   *  provisioning is configured on this deployment (credentials + wallet set). The /onboard
+   *  route and the MCP onboard_agent tool refuse a circle request when unavailable. */
+  walletProviderDefault: "turnkey" | "circle";
+  circleCustodyAvailable: boolean;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return

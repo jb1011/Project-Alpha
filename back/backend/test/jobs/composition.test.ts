@@ -60,6 +60,7 @@ function makeConfig(): Config {
     x402DemoPriceUsdc: "0.01",
     x402BuyerTrustPolicy: "open",
     platformOutflowCeiling: 200_000_000n,
+    walletProviderDefault: "turnkey" as const,
     platformOutflowWindowMs: 86_400_000,
   };
 }

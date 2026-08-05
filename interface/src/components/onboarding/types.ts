@@ -1,11 +1,16 @@
 export type Phase =
   | "welcome"
   | "guardian"
+  | "custody"
   | "configure"
   | "agreement"
   | "deploy"
   | "fund"
   | "dashboard";
+
+/** Tier-0 custody choice for the agent's OPERATOR keys (the payment float is platform-managed on
+ *  both options — the choice covers the operator layer only). */
+export type Custody = "turnkey" | "circle";
 
 export type ConfigMode = "manual" | "mcp";
 
@@ -21,6 +26,9 @@ export type AgentConfig = {
   name: string;
   purpose: string;
   configMode: ConfigMode;
+  /** Operator-key custody: "circle" = Novi-managed smart account (gasless), "turnkey" =
+   *  guardian-passkey-rooted key vault. Platform default stays turnkey until Tier-0 P4. */
+  custody: Custody;
   /** Per-transaction spend ceiling, in USDC. Kept as a string for input binding. */
   perTxCap: string;
   /** Rolling 24h spend ceiling, in USDC. */
@@ -47,17 +55,19 @@ export const emptySession = (): OnboardingSession => ({
 export const PHASES: { id: Phase; n: string; label: string }[] = [
   { id: "welcome", n: "00", label: "Wallet & passkey" },
   { id: "guardian", n: "01", label: "Accountable human" },
-  { id: "configure", n: "02", label: "Define agent" },
-  { id: "agreement", n: "03", label: "Operating agreement" },
-  { id: "deploy", n: "04", label: "Deploy on-chain" },
-  { id: "fund", n: "05", label: "Fund treasury" },
-  { id: "dashboard", n: "06", label: "Live" },
+  { id: "custody", n: "02", label: "Key custody" },
+  { id: "configure", n: "03", label: "Define agent" },
+  { id: "agreement", n: "04", label: "Operating agreement" },
+  { id: "deploy", n: "05", label: "Deploy on-chain" },
+  { id: "fund", n: "06", label: "Fund treasury" },
+  { id: "dashboard", n: "07", label: "Live" },
 ];
 
 export const emptyConfig = (): AgentConfig => ({
   name: "",
   purpose: "",
   configMode: "manual",
+  custody: "turnkey", // platform default until Tier-0 P4 flips it to "circle"
   perTxCap: "",
   dailyCap: "",
   allowlist: [],

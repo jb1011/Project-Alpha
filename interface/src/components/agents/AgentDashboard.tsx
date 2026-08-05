@@ -185,6 +185,17 @@ export function AgentDashboard({
               />
               {paused ? "Paused" : "Operational"}
             </span>
+            {/* Tier-0 custody badge: null walletProvider = legacy row, behaves as passkey-rooted */}
+            <span
+              className="inline-flex items-center rounded-full border hairline-strong bg-paper-2/60 px-3 py-1 text-[11.5px] font-normal tracking-normal text-muted"
+              title={
+                entity?.walletProvider === "circle"
+                  ? "Operator keys are Novi-managed (Circle MPC smart account). Your guardian wallet keeps every on-chain override."
+                  : "Operator keys live in a vault rooted under your guardian passkey."
+              }
+            >
+              {entity?.walletProvider === "circle" ? "Novi-managed" : "Passkey-rooted"}
+            </span>
           </h1>
           <p className="mt-2 text-[14px] text-muted">
             Monitor activity, treasury, and job track record. Edit rules in{" "}

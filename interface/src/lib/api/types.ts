@@ -28,6 +28,8 @@ export type EntityView = {
   trustPolicy: "open" | "verified-sellers-only" | "verified-legal-bodies-only" | null;
   /** WebAuthn credentialId of the guardian passkey registered at onboarding. */
   rootPasskeyId?: string | null;
+  /** Tier-0 custody provider; null/absent = legacy row (behaves as "turnkey"). */
+  walletProvider?: "turnkey" | "circle" | null;
 };
 
 /** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */

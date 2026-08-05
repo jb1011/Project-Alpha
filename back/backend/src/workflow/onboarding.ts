@@ -19,6 +19,15 @@ export interface ProvisionedVault {
   operator: string;
 }
 
+/** Result of provisioning the per-agent Circle wallets (Tier-0: SCA operator + EOA pocket). */
+export interface ProvisionedCircleWallets {
+  operator: string; // the SCA address — becomes the entity operator
+  operatorWalletId: string;
+  pocketWalletId: string;
+  pocketAddress: string;
+  walletSetId: string;
+}
+
 export interface OnboardingDeps {
   spec: AgentSpec;
   idempotencyKey: string;
@@ -55,6 +64,27 @@ export interface OnboardingDeps {
   }) => Promise<ProvisionedVault>;
   /** Build the per-entity operator signer. Real = (e) => TurnkeySigner.forEntity(cfg, e). */
   signerForEntity?: (e: { subOrgId: string; operator: string }) => Promise<OperatorSigner>;
+  // ── Tier-0 custody choice (docs/design/2026-08-03-tier0-circle-wallet-migration.md).
+  /** Custody provider for a NEW record. A resumed record's persisted walletProvider always wins —
+   *  custody is immutable after the claim. Absent -> "turnkey" (every pre-Tier-0 caller). */
+  custody?: "turnkey" | "circle";
+  /** Provision the per-agent Circle wallets (SCA operator + EOA pocket). Real = wraps
+   *  provisionCircleWallets(circleApi, { walletSetId, blockchain, entityKey }). NOTE: Circle
+   *  createWallets is not idempotent — a crash between provisioning and persisting re-provisions
+   *  on resume, orphaning one wallet pair (tagged by metadata.refId, unused, ~free under MAW
+   *  billing). Accepted; the alternative (failing the resume) strands the onboarding. */
+  provisionCircle?: (params: {
+    entityKey: string;
+    name: string;
+  }) => Promise<ProvisionedCircleWallets>;
+  /** Circle-path bind signer: the operator SCA signs AgentWalletSet via Circle (ERC-1271 — the
+   *  live-registry acceptance is the P2 known-unknown). Real = circleOperatorSigner(api, …). */
+  circleSignerForEntity?: (e: { operatorWalletId: string; operator: string }) => OperatorSigner;
+  /** Turnkey-path creation-time pocket address (audit item 7: derive ONCE at creation, store, so
+   *  read paths never touch the master seed again — the P1a backfill only covered existing rows).
+   *  Real = privateKeyToAccount(derivePocketKey(seed, entityKey)).address. Circle-path pockets
+   *  come from provisioning instead. */
+  derivePocketAddress?: (entityKey: string) => string;
 }
 
 /**
@@ -79,15 +109,87 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   const key = d.idempotencyKey;
   let rec = d.repo.findByIdempotencyKey(key);
 
-  // ── Step 0 (optional): provision the per-agent Turnkey vault BEFORE minting. Triggered only when a
-  //    `provision` seam + a `guardianPasskey` are supplied. Idempotent: on resume, a record that
-  //    already carries `turnkeySubOrgId` is NOT re-provisioned (no second sub-org) — its stored
-  //    sub-org id + operator are reused for createEntity/bind below. 'provisioned' precedes 'created'.
-  if (d.provision && d.guardianPasskey && !rec?.turnkeySubOrgId) {
+  // Tier-0 custody resolution: a resumed record's persisted provider ALWAYS wins (custody is
+  // immutable once claimed — a resume must never flip an agent's provider mid-saga); a fresh
+  // record takes the caller's choice, defaulting to turnkey (every pre-Tier-0 path).
+  const custody: "turnkey" | "circle" = rec?.walletProvider ?? d.custody ?? "turnkey";
+
+  // ── Step 0a (circle custody): provision the per-agent Circle wallets (SCA operator + EOA
+  //    pocket) BEFORE minting — the SCA address IS the on-chain operator. No Turnkey sub-org on
+  //    this path; the guardian passkey is still recorded (rootPasskeyId, runner claim) as the
+  //    guardian's identity anchor. On resume, a record already carrying circleOperatorWalletId is
+  //    NOT re-provisioned.
+  if (custody === "circle" && !rec?.circleOperatorWalletId) {
+    if (!d.provisionCircle)
+      throw new Error(
+        `entity ${key} requested circle custody but this deployment has no Circle provisioning configured (CIRCLE_API_KEY/CIRCLE_ENTITY_SECRET/CIRCLE_WALLET_SET_ID)`,
+      );
+    const wallets = await d.provisionCircle({ entityKey: key, name: d.spec.name });
+    const provisioned: EntityRecord = {
+      // Minimal pre-translate row (mirrors the Turnkey Step 0 below); translate re-derives the
+      // policy fields and keeps this operator.
+      idempotencyKey: key,
+      name: d.spec.name,
+      status: "provisioned",
+      manager: d.spec.roles.manager as Address,
+      guardian: d.spec.roles.guardian as Address,
+      amendmentDelay: "0",
+      ein: "",
+      formationDate: 0,
+      oaHash: null,
+      metadataURI: null,
+      docPath: null,
+      treasuryConfig: null,
+      agentId: null,
+      proxy: null,
+      treasury: null,
+      createTxHash: null,
+      bindTxHash: null,
+      fundTxHash: null,
+      ownerTenantId: d.ownerTenantId,
+      error: null,
+      specJson: d.specJson ?? null,
+      perTxCap: null,
+      ...rec, // a claimed 'pending' row keeps its identity fields (incl. rootPasskeyId)
+      operator: wallets.operator as Address,
+      walletProvider: "circle",
+      circleWalletSetId: wallets.walletSetId,
+      circleOperatorWalletId: wallets.operatorWalletId,
+      circlePocketWalletId: wallets.pocketWalletId,
+      pocketAddress: wallets.pocketAddress,
+    };
+    provisioned.status = "provisioned";
+    rec = provisioned;
+    d.repo.transaction(() => {
+      d.repo.upsert(provisioned);
+      d.repo.recordEvent(
+        key,
+        "provisionCircleWallets",
+        "provisioned",
+        null,
+        JSON.stringify({
+          operator: wallets.operator,
+          operatorWalletId: wallets.operatorWalletId,
+          pocketWalletId: wallets.pocketWalletId,
+          pocketAddress: wallets.pocketAddress,
+        }),
+      );
+    });
+  }
+
+  // ── Step 0 (optional, turnkey custody): provision the per-agent Turnkey vault BEFORE minting.
+  //    Triggered only when a `provision` seam + a `guardianPasskey` are supplied. Idempotent: on
+  //    resume, a record that already carries `turnkeySubOrgId` is NOT re-provisioned (no second
+  //    sub-org) — its stored sub-org id + operator are reused for createEntity/bind below.
+  //    'provisioned' precedes 'created'.
+  if (custody === "turnkey" && d.provision && d.guardianPasskey && !rec?.turnkeySubOrgId) {
     const vault = await d.provision({
       subOrgName: d.spec.name,
       guardianPasskey: d.guardianPasskey,
     });
+    // Creation-time pocket address (audit item 7): derive once, store — new turnkey agents must
+    // not re-open the master-seed dependency the P1a backfill closed for existing rows.
+    const pocketAddress = d.derivePocketAddress?.(key) ?? null;
     const provisioned: EntityRecord = rec
       ? {
           ...rec,
@@ -95,6 +197,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
           operator: vault.operator as Address,
           turnkeySubOrgId: vault.subOrgId,
           turnkeyWalletId: vault.walletId,
+          walletProvider: "turnkey",
+          pocketAddress: rec.pocketAddress ?? pocketAddress,
         }
       : {
           // Minimal pre-translate row: only the provision result + identity fields are known yet.
@@ -120,6 +224,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
           fundTxHash: null,
           turnkeySubOrgId: vault.subOrgId,
           turnkeyWalletId: vault.walletId,
+          walletProvider: "turnkey",
+          pocketAddress,
           ownerTenantId: d.ownerTenantId,
           error: null,
           specJson: d.specJson ?? null,
@@ -150,9 +256,10 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     rec.status === "translating"
   ) {
     const r = translate(d.spec, { usdc: d.usdc });
-    // Provisioned path: the operator is the per-agent Turnkey key persisted in Step 0. Legacy path:
-    // the shared operatorSigner's address. (rec.turnkeySubOrgId set => provisioned.)
-    const operator = rec?.turnkeySubOrgId ? rec.operator! : d.operatorSigner.address;
+    // Provisioned path (either custody): the operator persisted in Step 0 — the per-agent Turnkey
+    // key or the Circle SCA. Legacy path: the shared operatorSigner's address.
+    const provisioned0 = Boolean(rec?.turnkeySubOrgId || rec?.circleOperatorWalletId);
+    const operator = provisioned0 ? rec!.operator! : d.operatorSigner.address;
     assertOperatorDistinct(r, operator); // operator now known -> full distinctness check
     const resolved = { ...r, operator };
     const doc = renderOperatingAgreement(d.spec, resolved);
@@ -187,9 +294,16 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       createTxHash: rec?.createTxHash ?? null,
       bindTxHash: null,
       fundTxHash: null,
-      // Carry the Step-0 vault ids forward (undefined on the legacy path).
+      // Carry the Step-0 custody fields forward (undefined on the legacy shared-key path).
       turnkeySubOrgId: rec?.turnkeySubOrgId,
       turnkeyWalletId: rec?.turnkeyWalletId,
+      walletProvider: rec?.walletProvider ?? (custody === "circle" ? "circle" : null),
+      circleWalletSetId: rec?.circleWalletSetId,
+      circleOperatorWalletId: rec?.circleOperatorWalletId,
+      circlePocketWalletId: rec?.circlePocketWalletId,
+      // Legacy shared-key path still gets a creation-time pocket address when the seed is around.
+      pocketAddress: rec?.pocketAddress ?? d.derivePocketAddress?.(key) ?? null,
+      rootPasskeyId: rec?.rootPasskeyId,
       ownerTenantId: d.ownerTenantId ?? rec?.ownerTenantId,
       error: null,
       specJson: d.specJson ?? rec?.specJson ?? null,
@@ -267,12 +381,16 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       domainName: domain.name,
       domainVersion: domain.version,
     });
-    // Provisioned path: build the per-entity signer from the agent's own sub-org (the delegated
-    // Turnkey key signs only this agent's wallet). Legacy path: the shared operatorSigner.
+    // Provisioned path: build the per-entity signer — circle custody signs AgentWalletSet through
+    // Circle as the operator SCA (ERC-1271; live-registry acceptance = the P2 known-unknown),
+    // turnkey custody through the agent's own sub-org (the delegated Turnkey key signs only this
+    // agent's wallet). Legacy path: the shared operatorSigner.
     const signer: OperatorSigner =
-      rec.turnkeySubOrgId && d.signerForEntity
-        ? await d.signerForEntity({ subOrgId: rec.turnkeySubOrgId, operator })
-        : d.operatorSigner;
+      rec.walletProvider === "circle" && rec.circleOperatorWalletId && d.circleSignerForEntity
+        ? d.circleSignerForEntity({ operatorWalletId: rec.circleOperatorWalletId, operator })
+        : rec.turnkeySubOrgId && d.signerForEntity
+          ? await d.signerForEntity({ subOrgId: rec.turnkeySubOrgId, operator })
+          : d.operatorSigner;
     const signature = await signer.signWalletSet(td);
     const txHash = await d.arc.setAgentWallet({
       agentId,

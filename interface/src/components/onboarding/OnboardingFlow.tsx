@@ -28,6 +28,7 @@ import {
 } from "@/lib/onboarding/storage";
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { GuardianStep } from "./steps/GuardianStep";
+import { CustodyStep } from "./steps/CustodyStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
 import { DeployStep } from "./steps/DeployStep";
@@ -221,14 +222,22 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
             {phase === "guardian" && (
               <GuardianStep
                 onBack={() => goTo("welcome")}
-                onComplete={() => completePhase("guardian", "configure")}
+                onComplete={() => completePhase("guardian", "custody")}
+              />
+            )}
+            {phase === "custody" && (
+              <CustodyStep
+                config={config}
+                onChange={setConfig}
+                onBack={() => goTo("guardian")}
+                onComplete={() => completePhase("custody", "configure")}
               />
             )}
             {phase === "configure" && (
               <ConfigureStep
                 config={config}
                 onChange={setConfig}
-                onBack={() => goTo("guardian")}
+                onBack={() => goTo("custody")}
                 onComplete={() => completePhase("configure", "agreement")}
               />
             )}

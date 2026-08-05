@@ -179,6 +179,22 @@ export function circleTypedDataSigner(
   };
 }
 
+/** OperatorSigner for the onboarding saga's Step-5 bind: the operator SCA signs the ERC-8004
+ *  `AgentWalletSet` typed data through Circle. P2 CAVEAT (spec "known unknown"): an SCA cannot
+ *  produce plain ECDSA recovering to itself — the live registry must accept this signature via
+ *  ERC-1271 `isValidSignature` (Circle's SingleOwnerMSCA implements it on-chain). Proven only
+ *  against our mock until the P2 fork test runs against the live registry. */
+export function circleOperatorSigner(
+  api: CircleWalletsApi,
+  wallet: { walletId: string; address: string },
+): { address: `0x${string}`; signWalletSet(typedData: unknown): Promise<Hex> } {
+  const typed = circleTypedDataSigner(api, wallet);
+  return {
+    address: wallet.address as `0x${string}`,
+    signWalletSet: (typedData: unknown) => typed.signTypedData(typedData),
+  };
+}
+
 /** Satisfies the World AgentKit signer shape (EIP-191 personal_sign via Circle). */
 export function circleAgentkitSigner(
   api: CircleWalletsApi,

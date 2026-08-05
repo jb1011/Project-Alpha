@@ -4,11 +4,16 @@ import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
-import { buildCircleWalletsApi } from "../adapters/circle/circleWallets";
+import {
+  buildCircleWalletsApi,
+  circleOperatorSigner,
+  provisionCircleWallets,
+} from "../adapters/circle/circleWallets";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
 import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
+import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import { WORLD_CHAIN_DEFAULTS, loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
@@ -149,6 +154,38 @@ async function main() {
   const signerForEntity = (e: { subOrgId: string; operator: string }) =>
     TurnkeySigner.forEntity(cfg, e);
 
+  // Tier-0 custody wiring. `ARC-TESTNET` is the Circle blockchain enum for chain 5042002 (the
+  // only chain this deployment targets); mainnet lands with its own enum in P4.
+  const CIRCLE_BLOCKCHAIN = "ARC-TESTNET";
+  const circleWalletSetId = cfg.circle?.walletSetId;
+  const provisionCircle =
+    circleApi && circleWalletSetId
+      ? async ({ entityKey }: { entityKey: string; name: string }) => {
+          const { operator, pocket } = await provisionCircleWallets(circleApi, {
+            walletSetId: circleWalletSetId,
+            blockchain: CIRCLE_BLOCKCHAIN,
+            entityKey,
+          });
+          return {
+            operator: operator.address,
+            operatorWalletId: operator.walletId,
+            pocketWalletId: pocket.walletId,
+            pocketAddress: pocket.address,
+            walletSetId: circleWalletSetId,
+          };
+        }
+      : undefined;
+  const circleSignerForEntity = circleApi
+    ? (e: { operatorWalletId: string; operator: string }) =>
+        circleOperatorSigner(circleApi, { walletId: e.operatorWalletId, address: e.operator })
+    : undefined;
+  // Creation-time pocket address for turnkey/legacy agents (audit item 7 — new rows must not
+  // re-open the master-seed read dependency the P1a backfill closed).
+  const derivePocketAddress = cfg.pocketMasterSeed
+    ? (entityKey: string) =>
+        privateKeyToAccount(derivePocketKey(cfg.pocketMasterSeed!, entityKey)).address
+    : undefined;
+
   const runSaga: RunSaga = (i) =>
     runOnboarding({
       spec: i.spec,
@@ -167,6 +204,10 @@ async function main() {
       provision,
       signerForEntity,
       outflows,
+      custody: i.custody,
+      provisionCircle,
+      circleSignerForEntity,
+      derivePocketAddress,
     });
 
   const runner = new OnboardingRunner({
@@ -253,6 +294,8 @@ async function main() {
     jwtSecret: cfg.authJwtSecret,
     jwtTtlSec: cfg.authJwtTtlSec,
     platformManagerAddress,
+    walletProviderDefault: cfg.walletProviderDefault,
+    circleCustodyAvailable: Boolean(provisionCircle),
     repo,
     docStore,
     runner,

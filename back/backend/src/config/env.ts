@@ -71,6 +71,11 @@ const EnvSchema = z.object({
   CIRCLE_ENTITY_SECRET: z.string().optional(),
   /** The platform wallet set ("novi-tier0"). Required only when provisioning circle-path agents. */
   CIRCLE_WALLET_SET_ID: z.string().optional(),
+  /** Tier-0: platform default custody for NEW agents when the caller doesn't choose. Stays
+   *  `turnkey` through P1-P3 (the flag that keeps every step reversible); P4 flips it to `circle`
+   *  after the live experiment proves the path. Per-call override: `custody` on /onboard +
+   *  onboard_agent. docs/design/2026-08-03-tier0-circle-wallet-migration.md. */
+  WALLET_PROVIDER_DEFAULT: z.enum(["turnkey", "circle"]).default("turnkey"),
   ANTHROPIC_API_KEY: z.string().optional(),
   AGENT_MODEL: z.string().default("claude-sonnet-4-6"),
   GATEWAY_FACILITATOR_URL: z.string().url().default("https://gateway-api-testnet.circle.com"),
@@ -176,6 +181,8 @@ export interface Config {
   circleApiKey?: string;
   /** Tier-0 Circle DevC credentials; present only when BOTH env vars are set (all-or-nothing). */
   circle?: { apiKey: string; entitySecret: string; walletSetId?: string };
+  /** Tier-0: default custody for NEW agents (`turnkey` until P4 flips it). */
+  walletProviderDefault: "turnkey" | "circle";
   anthropicApiKey?: string;
   agentModel: string;
   gatewayFacilitatorUrl: string;
@@ -303,6 +310,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
             walletSetId: e.CIRCLE_WALLET_SET_ID,
           }
         : undefined,
+    walletProviderDefault: e.WALLET_PROVIDER_DEFAULT,
     anthropicApiKey: e.ANTHROPIC_API_KEY,
     agentModel: e.AGENT_MODEL,
     gatewayFacilitatorUrl: e.GATEWAY_FACILITATOR_URL,

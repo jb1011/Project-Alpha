@@ -11,6 +11,8 @@ export type RunSaga = (input: {
   guardianPasskey?: GuardianPasskey;
   specJson: string;
   fundAmount?: bigint;
+  /** Tier-0 custody choice for a NEW record (a resumed record's persisted provider wins). */
+  custody?: "turnkey" | "circle";
 }) => Promise<EntityRecord>;
 
 const TERMINAL: EntityStatus[] = ["bound", "funded", "failed"];
@@ -35,6 +37,9 @@ export class OnboardingRunner {
     userKey: string;
     tenantId: string;
     guardianPasskey: GuardianPasskey;
+    /** Tier-0 custody choice, resolved by the caller (route/tool applies the platform default).
+     *  Recorded on the claim so a restart resumes the RIGHT provider path. */
+    custody?: "turnkey" | "circle";
   }): {
     id: string;
     status: EntityStatus;
@@ -68,6 +73,8 @@ export class OnboardingRunner {
       // Both call sites (REST body, MCP store lookup) carry the full passkey, so recording it
       // here covers every path with no call-site changes. Defensive: REST input is caller-shaped.
       rootPasskeyId: p.guardianPasskey?.attestation?.credentialId ?? null,
+      // Tier-0: custody is claimed here, immutably — the saga and the reconciler both read it.
+      walletProvider: p.custody ?? null,
     };
     // Atomic claim: the INSERT-or-nothing is the single gate. Two concurrent starts (or processes
     // racing the same key) can never both win — the loser sees changes()==0 and gets a 409, before
@@ -81,6 +88,7 @@ export class OnboardingRunner {
         tenantId: p.tenantId,
         guardianPasskey: p.guardianPasskey,
         specJson,
+        custody: p.custody,
       }),
     );
     return { id, status: "pending" };
@@ -126,13 +134,18 @@ export class OnboardingRunner {
     return { id: p.id, status: rec.status };
   }
 
-  /** Resume non-terminal records after a restart. Records past provisioning resume; pre-provision pending ones fail. */
+  /** Resume non-terminal records after a restart. Provider-aware (Tier-0): turnkey records need
+   *  their sub-org (pre-provision ones fail — the passkey wasn't persisted); circle records can
+   *  resume even pre-provision (provisioning needs no passkey — a crash there re-provisions,
+   *  orphaning at most one tagged, unused wallet pair). */
   reconcileInFlight(): number {
     let resumed = 0;
     for (const rec of this.deps.repo.listInFlight()) {
       if (this.inFlight.has(rec.idempotencyKey)) continue;
-      if (!rec.turnkeySubOrgId) {
-        // Crashed before the vault existed: can't resume without the (unpersisted) passkey.
+      const circle = rec.walletProvider === "circle";
+      if (!circle && !rec.turnkeySubOrgId) {
+        // Turnkey path crashed before the vault existed: can't resume without the (unpersisted)
+        // passkey.
         this.deps.repo.upsert({
           ...rec,
           status: "failed",

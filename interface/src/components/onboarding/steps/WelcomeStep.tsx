@@ -119,8 +119,8 @@ export function WelcomeStep({
     <div>
       <StepHeader
         eyebrow="Screen 00"
-        title={<>Connect your wallet and secure the vault.</>}
-        intro="Sign in with your wallet — it becomes the agent's on-chain guardian. Then create a passkey as the root key for the agent's vault."
+        title={<>Connect your wallet and register as guardian.</>}
+        intro="Sign in with your wallet — it becomes the agent's on-chain guardian. Then create a passkey: it registers you as the guardian, the agent's durable human anchor."
       />
 
       <div className="grid grid-cols-1 gap-8 lg:grid-cols-[1fr_0.85fr] lg:gap-12">
@@ -190,13 +190,13 @@ export function WelcomeStep({
               />
               <MiniRow
                 icon={<KeyIcon className="h-4 w-4" />}
-                title="Vault created at deploy"
-                body="This step registers your passkey. The Turnkey sub-organization is provisioned on the backend when you confirm deployment."
+                title="Registers you as the guardian"
+                body="This step records your passkey as the guardian's identity anchor — the durable link between this agent and you, its accountable human."
               />
               <MiniRow
                 icon={<ShieldIcon className="h-4 w-4" />}
-                title="You hold the root"
-                body="Your passkey becomes the vault's root authority."
+                title="Root-capable"
+                body="If you pick passkey-rooted custody in a later step, this passkey also becomes the root authority over the agent's key vault."
               />
             </ol>
 
@@ -211,15 +211,16 @@ export function WelcomeStep({
                   loading={passkeyState === "pending"}
                   disabled={!walletDone || passkeyState === "pending"}
                 >
-                  Create vault with passkey
+                  Create guardian passkey
                 </Button>
               )}
             </div>
           </Card>
 
-          <Callout tone="accent" icon={<ShieldIcon className="h-4 w-4" />} title="Non-custodial">
-            Novi Corpus never holds your keys or funds. Your wallet is the guardian;
-            your passkey is the vault root.
+          <Callout tone="accent" icon={<ShieldIcon className="h-4 w-4" />} title="Guardian-controlled">
+            Your wallet is the on-chain guardian with full override powers — pause, veto,
+            clawback. Custody of the agent&apos;s operating keys is your choice in a later step:
+            Novi-managed, or rooted under this passkey.
           </Callout>
 
           {error && (
@@ -329,7 +330,7 @@ function PasskeyVisual({ state }: { state: PasskeyState }) {
           <div className="mt-5 text-center text-[13px] text-muted">
             {state === "idle" && "Complete wallet sign-in first"}
             {state === "pending" && "Confirm on your device…"}
-            {state === "registered" && "Passkey bound as vault root"}
+            {state === "registered" && "Guardian passkey registered"}
             {state === "error" && "Authentication cancelled"}
           </div>
         </div>
@@ -340,7 +341,7 @@ function PasskeyVisual({ state }: { state: PasskeyState }) {
           </div>
         ) : (
           <div className="grid grid-cols-3 gap-2 text-center">
-            {["Turnkey vault", "WebAuthn", "Root key"].map((t) => (
+            {["WebAuthn", "Guardian anchor", "Root-capable"].map((t) => (
               <div
                 key={t}
                 className="rounded-lg border hairline bg-paper/60 px-2 py-2 text-[10.5px] text-muted-2"

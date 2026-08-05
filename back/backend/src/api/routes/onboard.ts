@@ -11,7 +11,12 @@ import { assertGuardianAllowed } from "./worldId";
 export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   app.post("/onboard", async (c) => {
     const tenantId = c.get("tenantId");
-    let body: { spec?: unknown; guardianPasskey?: unknown; idempotencyKey?: unknown };
+    let body: {
+      spec?: unknown;
+      guardianPasskey?: unknown;
+      idempotencyKey?: unknown;
+      custody?: unknown;
+    };
     try {
       body = await c.req.json();
     } catch {
@@ -19,6 +24,19 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     }
     if (!body.guardianPasskey || typeof body.guardianPasskey !== "object")
       throw new ApiError("validation_error", 400, "guardianPasskey is required");
+
+    // Tier-0 custody choice: optional; absent -> the platform default (turnkey until P4). A
+    // circle request on a deployment without Circle provisioning is refused HERE, before any
+    // claim — the saga would only fail it asynchronously.
+    if (body.custody !== undefined && body.custody !== "turnkey" && body.custody !== "circle")
+      throw new ApiError("validation_error", 400, 'custody must be "turnkey" or "circle"');
+    const custody = (body.custody ?? deps.walletProviderDefault) as "turnkey" | "circle";
+    if (custody === "circle" && !deps.circleCustodyAvailable)
+      throw new ApiError(
+        "validation_error",
+        400,
+        "circle custody is not available on this deployment (Circle credentials/wallet set not configured)",
+      );
 
     // Proof-of-personhood gate: the guardian is the legally accountable natural person, so when
     // enforcement is on they must be a World-ID-verified unique human under the per-human cap.
@@ -45,6 +63,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       userKey,
       tenantId: getAddress(tenantId),
       guardianPasskey: body.guardianPasskey as GuardianPasskey,
+      custody,
     });
     return c.json({ id, status }, 202);
   });

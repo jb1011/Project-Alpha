@@ -22,6 +22,9 @@ export interface McpToolDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
+  /** Tier-0 custody: platform default + circle-provisioning availability (mirrors ApiDeps). */
+  walletProviderDefault: "turnkey" | "circle";
+  circleCustodyAvailable: boolean;
   /** Audit fix C: the platform/manager account address, force-set into `roles.manager` on
    *  onboard_agent so an agent-first caller never needs to know or guess it. */
   platformManagerAddress: string;
@@ -455,16 +458,19 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         "Create an agent legal body. spec must match schema://agent-spec; the guardian is set " +
         "automatically to your tenant and the manager is set automatically to the platform " +
         "manager account — you don't need to know or supply either. passkeyId references a " +
-        "previously stored guardian passkey (POST /passkey). Returns immediately with status " +
-        "'pending' — poll get_entity until 'bound'. Requires the provision capability and a " +
-        "tenant-wide key.",
+        "previously stored guardian passkey (POST /passkey). custody optionally picks the " +
+        "operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' " +
+        "(guardian-passkey-rooted key vault) — omitted uses the platform default. Returns " +
+        "immediately with status 'pending' — poll get_entity until 'bound'. Requires the " +
+        "provision capability and a tenant-wide key.",
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
         idempotencyKey: z.string().optional(),
+        custody: z.enum(["turnkey", "circle"]).optional(),
       },
     },
-    async ({ spec, passkeyId, idempotencyKey }) => {
+    async ({ spec, passkeyId, idempotencyKey, custody }) => {
       if (!hasCapability(scope, "provision") || scope.entityId !== null)
         return { content: [{ type: "text", text: "not authorized" }], isError: true };
       const passkey = deps.passkeys.get(tenantId, passkeyId);
@@ -481,12 +487,25 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           manager: deps.platformManagerAddress,
         };
         const parsed = AgentSpecSchema.parse({ ...raw, roles });
+        // Tier-0 custody: same resolution + availability gate as the REST /onboard route.
+        const resolvedCustody = custody ?? deps.walletProviderDefault;
+        if (resolvedCustody === "circle" && !deps.circleCustodyAvailable)
+          return {
+            content: [
+              {
+                type: "text",
+                text: "circle custody is not available on this deployment (Circle credentials/wallet set not configured)",
+              },
+            ],
+            isError: true,
+          };
         const userKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : parsed.name;
         const { id, status } = deps.runner.start({
           spec: parsed,
           userKey,
           tenantId,
           guardianPasskey: passkey,
+          custody: resolvedCustody,
         });
         return { content: [{ type: "text", text: JSON.stringify({ id, status }) }] };
       } catch (e) {
