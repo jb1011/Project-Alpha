@@ -104,26 +104,31 @@ const MUTATING: (keyof CircleWalletsApi)[] = [
   "createContractExecutionTransaction",
 ];
 
-/** S5 parity: one journald line per mutating Circle call. Logging failure never blocks the call. */
+/** S5 parity: one journald line per mutating Circle call. Logging failure never blocks the call.
+ *  PROXY, not `{...api}` (P3 leg-1 catch): the real SDK client is a CLASS INSTANCE whose methods
+ *  live on the prototype — an object spread silently DROPS every method it doesn't explicitly
+ *  rewrap (getTransaction died first, in the very first production-wrapped call). Plain-object
+ *  test fakes could never catch that; the prototype-based regression test now does. */
 export function withCircleOpsLog(api: CircleWalletsApi): CircleWalletsApi {
-  const wrapped = { ...api };
-  for (const method of MUTATING) {
-    const original = api[method];
-    if (typeof original !== "function") continue;
-    (wrapped as Record<string, unknown>)[method] = async (input: Record<string, unknown>) => {
-      try {
-        opsLog("circle_call", {
-          method,
-          walletId: input?.walletId,
-          accountType: input?.accountType,
-        });
-      } catch {
-        // observe, don't gate
-      }
-      return (original as (i: unknown) => Promise<unknown>).call(api, input);
-    };
-  }
-  return wrapped;
+  return new Proxy(api, {
+    get(target, prop, receiver) {
+      const original = Reflect.get(target, prop, receiver);
+      if (typeof original !== "function") return original;
+      if (!(MUTATING as string[]).includes(prop as string)) return original.bind(target);
+      return async (input: Record<string, unknown>) => {
+        try {
+          opsLog("circle_call", {
+            method: prop,
+            walletId: input?.walletId,
+            accountType: input?.accountType,
+          });
+        } catch {
+          // observe, don't gate
+        }
+        return (original as (i: unknown) => Promise<unknown>).call(target, input);
+      };
+    },
+  });
 }
 
 export interface CircleWalletRef {
@@ -150,8 +155,11 @@ const erc20ApproveAbi = [
  * approve(gatewayWallet, 0). P2 probe A proved Circle REFUSES to produce any signature from an
  * undeployed SCA ("initiate a transaction to deploy the wallet"), and the onboarding saga's very
  * next SCA touch is the bind SIGNATURE — so provisioning must leave the SCA deployed, not
- * counterfactual. Deterministic idempotency seed: a crash-retry replays this exact op instead of
- * firing a second one. Probe B measured the cost: ~0.009 USDC sponsored fee, ~3s to confirm.
+ * counterfactual. Deterministic idempotency seed keyed to the WALLET id, not the entity key
+ * (P3 leg-1 catch): re-provisioning mints a FRESH wallet under the SAME entity key, and an
+ * entity-keyed seed made Circle replay the previous pair's activation — "confirming" a deploy of
+ * the ORPHANED wallet while the new SCA stayed counterfactual. Same-wallet crash-retries still
+ * replay exactly. Probe B measured the cost: ~0.009 USDC sponsored fee, ~3s to confirm.
  */
 export async function activateCircleSca(
   api: Pick<CircleWalletsApi, "createContractExecutionTransaction" | "getTransaction">,
@@ -175,7 +183,7 @@ export async function activateCircleSca(
         functionName: "approve",
         args: [p.gatewayWallet as Address, 0n],
       }),
-      idempotencySeed: `activate:${p.entityKey}`,
+      idempotencySeed: `activate:${p.operatorWalletId}`,
       refId: `${p.entityKey}:activate`,
     },
     {

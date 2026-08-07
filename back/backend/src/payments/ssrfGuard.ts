@@ -95,7 +95,11 @@ export async function safeFetch(
   // validated here, e.g. via a custom undici Agent/dispatcher that skips fetch's own DNS resolution.
   // Fast-follow, not done now — see BYOA P2b Task 6 for where safeFetch's network path is exercised.
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 10_000);
+  // 20s (was 10s — P3 leg-3 catch): the circle custody path signs through Circle's API (~1-2s
+  // across the AgentKit + x402 signatures) on top of a seller that settles SYNCHRONOUSLY via the
+  // facilitator before answering, plus serverless cold starts. 10s aborted a real, otherwise
+  // healthy prod payment; the timeout exists to bound SSRF slow-loris, not to race settlement.
+  const t = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 20_000);
   try {
     const res = await fetchImpl(u.toString(), { ...init, redirect: "manual", signal: ctrl.signal });
     if (res.status >= 300 && res.status < 400) throw new SsrfError("redirects are not allowed");

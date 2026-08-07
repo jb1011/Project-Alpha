@@ -1,5 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import { deterministicIdempotencyKey } from "../../../src/adapters/circle/circleExec";
+import { withCircleRateLimit } from "../../../src/adapters/circle/circleRateLimit";
+import type { CircleWalletsApi } from "../../../src/adapters/circle/circleWallets";
 import {
   activateCircleSca,
   circleAgentkitSigner,
@@ -203,8 +205,9 @@ describe("activateCircleSca — P2 probe-A fix (deploy the SCA before any signat
     expect(api.submits[0]!.contractAddress).toBe(USDC);
     expect(api.submits[0]!.callData.startsWith("0x095ea7b3")).toBe(true); // approve selector
     expect(api.submits[0]!.callData.endsWith("0".repeat(64))).toBe(true); // amount 0
-    // Deterministic seed: a crash-retry replays THIS op instead of deploying twice.
-    expect(api.submits[0]!.idempotencyKey).toBe(deterministicIdempotencyKey("activate:t:agent-1"));
+    // Deterministic seed keyed to the WALLET (P3 catch): a crash-retry replays THIS op, while a
+    // re-provisioned FRESH wallet derives a fresh key instead of replaying the orphan's deploy.
+    expect(api.submits[0]!.idempotencyKey).toBe(deterministicIdempotencyKey("activate:op-1"));
     // S5 parity: the sponsored fee is observed (0.009188 USDC → 9188 atomic).
     expect(fees).toEqual([[9188n, "tx-1"]]);
   });
@@ -220,5 +223,55 @@ describe("activateCircleSca — P2 probe-A fix (deploy the SCA before any signat
         confirm: { pollDelayMs: 0, timeoutMs: 5_000, sleep: async () => {} },
       }),
     ).rejects.toThrow(/terminal state FAILED/);
+  });
+});
+
+describe("wrapper prototype-safety — P3 leg-1 regression", () => {
+  /** The REAL SDK client is a class instance: methods live on the PROTOTYPE. A `{...api}` spread
+   *  silently drops them — which is exactly how production lost getTransaction while every
+   *  plain-object test fake passed. This fake reproduces the real shape. */
+  class ProtoApi {
+    calls: string[] = [];
+    async createWallets(_i: unknown) {
+      this.calls.push("createWallets");
+      return { data: { wallets: [] } };
+    }
+    async signTypedData(_i: unknown) {
+      this.calls.push("signTypedData");
+      return { data: { signature: "0xsig" } };
+    }
+    async signMessage(_i: unknown) {
+      this.calls.push("signMessage");
+      return { data: { signature: "0xsig" } };
+    }
+    async createContractExecutionTransaction(_i: unknown) {
+      this.calls.push("exec");
+      return { data: { id: "tx-1" } };
+    }
+    async getTransaction(_i: unknown) {
+      this.calls.push("getTransaction");
+      return { data: { transaction: { id: "tx-1", state: "CONFIRMED", txHash: "0xh" } } };
+    }
+  }
+
+  test("withCircleOpsLog preserves prototype methods it does not wrap (getTransaction)", async () => {
+    const proto = new ProtoApi();
+    const api = withCircleOpsLog(proto as unknown as CircleWalletsApi);
+    expect(typeof api.getTransaction).toBe("function"); // the P3 crash was this being undefined
+    await api.getTransaction({ id: "tx-1" });
+    await api.createWallets({} as never);
+    expect(proto.calls).toEqual(["getTransaction", "createWallets"]);
+  });
+
+  test("withCircleRateLimit preserves prototype methods and still limits the listed ones", async () => {
+    const proto = new ProtoApi();
+    const api = withCircleRateLimit(proto as unknown as CircleWalletsApi, {
+      minIntervalMs: 0,
+      sleep: async () => {},
+    });
+    expect(typeof api.getTransaction).toBe("function");
+    await api.getTransaction({ id: "tx-1" });
+    await api.signMessage({ walletId: "w", message: "m" });
+    expect(proto.calls).toEqual(["getTransaction", "signMessage"]);
   });
 });

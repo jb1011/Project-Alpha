@@ -288,7 +288,7 @@ Scripts: `scripts/tier0-p2-experiment.mts` (probes A–E, re-runnable per leg) a
 
 | # | Question | Verdict |
 |---|---|---|
-| A | Counterfactual 1271 / signing from an undeployed SCA | **NO — Circle refuses to produce ANY signature from an undeployed SCA** ("initiate a transaction to deploy the wallet"). The bind signature therefore requires a prior deploy → **P1 fix shipped**: `activateCircleSca` (one sponsored `approve(gateway, 0)`, deterministic idempotency seed `activate:<entityKey>`) runs inside `provisionCircle` before the record persists. |
+| A | Counterfactual 1271 / signing from an undeployed SCA | **NO — Circle refuses to produce ANY signature from an undeployed SCA** ("initiate a transaction to deploy the wallet"). The bind signature therefore requires a prior deploy → **P1 fix shipped**: `activateCircleSca` (one sponsored `approve(gateway, 0)`, deterministic idempotency seed `activate:<operatorWalletId>` (wallet-keyed — an entity-keyed seed replayed the ORPHANED pair's activation on re-provision; caught live in P3 leg 1)) runs inside `provisionCircle` before the record persists. |
 | A′ | ERC-1271 on the DEPLOYED SCA | **VALID** — 65-byte MPC signature, `isValidSignature` returns the magic value. |
 | B | Gas Station sponsorship on Arc (USDC-native gas) | **FULLY SPONSORED** — SCA native balance 0 before AND after a confirmed contractExecution; fee 0.009188 USDC billed to the platform (cost+5%); confirmed in 2.8s. First op also deploys the SCA. |
 | C | The three-leg bridge on-chain | **PROVEN** — platform→SCA fund (0.6), exact `approve(gateway, 0.5)`, `GatewayWallet.depositFor(usdc, pocket, 0.5)`; pocket's on-chain `availableBalance` = 0.5. `depositFor`'s "anyone credits any depositor" now proven on-chain (fact-check residue closed). Circle faucet 403s under our restricted API key — platform-wallet funding used instead (mirrors the real leg 1). |
@@ -301,3 +301,29 @@ Scripts: `scripts/tier0-p2-experiment.mts` (probes A–E, re-runnable per leg) a
 before flipping the default (P4):** P3 — onboard one real circle test agent through
 the full stack (the activation + bind sequence end-to-end in production code paths),
 run the funding bridge + a live pay + a job, then the default flip.
+
+## P3 EXECUTED — first circle agent through the production stack (2026-08-07)
+
+Run locally against the live chain (prod carries no Circle creds; P3 on the prod DB is
+structurally forbidden — assertCircleCoverage would refuse the next boot). Driver:
+`scripts/tier0-p3-live.mts` (production builders only — the same composition api/main wires).
+Agent: `P3CircleAgent`, agentId **865083**, custody=circle.
+
+| Leg | Result |
+|---|---|
+| 1 onboard | **funded** — provision → activate → createEntity → **the FIRST non-fork ERC-1271 bind on the LIVE registry** (`0xdf7d03b6…`; `getAgentWallet` == the SCA) → fundTreasury |
+| 2 bridge | **all 3 legs confirmed** — fundOperator → exact approve → depositFor; pocket Gateway balance 0.25. A deliberate duplicate run then FAILED cleanly on-chain (`INSUFFICIENT_TOKEN`, saga-recorded) — the guards working. |
+| 3 pay | **SETTLED** — 0.01 USDC to the PROD demo seller through the Vercel proxy, Circle-MPC pocket signature, facilitator transfer id `8f9bce9f…`. Buyer-side prod parity. |
+| 4 job | **blocked on test funds only** — the platform test wallet is down to ~0.3 USDC and Arc's fee-reserve precheck (the PR-#33 estimateGas footgun, this time on the job client's contract writes) refuses before sending. Not circle-specific (client escrow is custody-agnostic, proven live in July); re-run after a faucet drip to the platform wallet. |
+
+**Three production bugs P3 caught (all fixed + test-pinned):**
+1. `withCircleOpsLog`/`withCircleRateLimit` used `{...api}` spreads — the real SDK client is a
+   class instance, so every prototype method not explicitly rewrapped was silently DROPPED
+   (`getTransaction` died on the first production-wrapped call; all prior probes used the raw
+   client). Both wrappers are now delegation Proxies; regression tests use a prototype-based fake.
+2. The activation idempotency seed was entity-keyed — a crash-retry that re-provisions mints a
+   FRESH wallet under the SAME entity key, so Circle replayed the ORPHANED pair's activation and
+   the new SCA stayed counterfactual (bind then failed "undeployed"). Seed is now wallet-keyed.
+3. The SSRF-guard fetch timeout (10s) aborted a healthy prod payment — circle signing latency +
+   synchronous facilitator settle + serverless cold start exceed it. Now 20s (the timeout bounds
+   slow-loris, not settlement).

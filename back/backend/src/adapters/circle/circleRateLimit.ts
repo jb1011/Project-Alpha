@@ -47,14 +47,18 @@ export function withCircleRateLimit(
     return granted;
   };
 
-  const wrapped = { ...api };
-  for (const method of ALL_METHODS) {
-    const original = api[method];
-    if (typeof original !== "function") continue;
-    (wrapped as Record<string, unknown>)[method] = async (input: unknown) => {
-      await acquire();
-      return (original as (i: unknown) => Promise<unknown>).call(api, input);
-    };
-  }
-  return wrapped;
+  // PROXY, not `{...api}` (P3 leg-1 catch, same class of bug as withCircleOpsLog): a spread of a
+  // class instance drops prototype methods. Listed methods get the limiter; anything else passes
+  // through bound — a future interface addition can never be silently dropped.
+  return new Proxy(api, {
+    get(target, prop, receiver) {
+      const original = Reflect.get(target, prop, receiver);
+      if (typeof original !== "function") return original;
+      if (!(ALL_METHODS as string[]).includes(prop as string)) return original.bind(target);
+      return async (input: unknown) => {
+        await acquire();
+        return (original as (i: unknown) => Promise<unknown>).call(target, input);
+      };
+    },
+  });
 }
