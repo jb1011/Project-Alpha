@@ -5,6 +5,7 @@ import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
 import {
+  activateCircleSca,
   buildCircleWalletsApi,
   circleOperatorSigner,
   provisionCircleWallets,
@@ -13,6 +14,7 @@ import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
 import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
+import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import { WORLD_CHAIN_DEFAULTS, loadConfig } from "../config/env";
@@ -165,6 +167,17 @@ async function main() {
             walletSetId: circleWalletSetId,
             blockchain: CIRCLE_BLOCKCHAIN,
             entityKey,
+          });
+          // P2 probe A: Circle refuses ANY signature from an undeployed SCA, and the saga's next
+          // SCA touch is the bind SIGNATURE — deploy it now with one sponsored no-op (~0.009
+          // USDC, ~3s; probe B). Runs BEFORE the record persists, so a crash re-provisions
+          // cleanly (documented orphan trade-off) rather than stranding an unactivated SCA.
+          await activateCircleSca(circleApi, {
+            operatorWalletId: operator.walletId,
+            entityKey,
+            usdc: cfg.usdc,
+            gatewayWallet: arcBatchingConfig.verifyingContract,
+            outflows,
           });
           return {
             operator: operator.address,

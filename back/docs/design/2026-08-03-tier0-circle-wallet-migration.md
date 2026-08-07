@@ -279,3 +279,25 @@ ADDITIONS — P1 is gated on them, in severity order:
 - Unverifiable-by-repo items held as assumptions with named owners: Vivienne's mainnet/policy
   statements (private correspondence), Turnkey plan terms (account), pocket non-registration
   (chain read, above).
+## P2 EXECUTED — live-experiment results (2026-08-06)
+
+All probes run against Arc testnet with the P1b wallet pair (SCA operator
+`0x3e4f9269…9fb2`, EOA pocket `0x2cd3a60a…fc64`), zero Turnkey signatures.
+Scripts: `scripts/tier0-p2-experiment.mts` (probes A–E, re-runnable per leg) and
+`scripts/tier0-p2-fork-bind.mts` (probe F). Verdicts:
+
+| # | Question | Verdict |
+|---|---|---|
+| A | Counterfactual 1271 / signing from an undeployed SCA | **NO — Circle refuses to produce ANY signature from an undeployed SCA** ("initiate a transaction to deploy the wallet"). The bind signature therefore requires a prior deploy → **P1 fix shipped**: `activateCircleSca` (one sponsored `approve(gateway, 0)`, deterministic idempotency seed `activate:<entityKey>`) runs inside `provisionCircle` before the record persists. |
+| A′ | ERC-1271 on the DEPLOYED SCA | **VALID** — 65-byte MPC signature, `isValidSignature` returns the magic value. |
+| B | Gas Station sponsorship on Arc (USDC-native gas) | **FULLY SPONSORED** — SCA native balance 0 before AND after a confirmed contractExecution; fee 0.009188 USDC billed to the platform (cost+5%); confirmed in 2.8s. First op also deploys the SCA. |
+| C | The three-leg bridge on-chain | **PROVEN** — platform→SCA fund (0.6), exact `approve(gateway, 0.5)`, `GatewayWallet.depositFor(usdc, pocket, 0.5)`; pocket's on-chain `availableBalance` = 0.5. `depositFor`'s "anyone credits any depositor" now proven on-chain (fact-check residue closed). Circle faucet 403s under our restricted API key — platform-wallet funding used instead (mirrors the real leg 1). |
+| D | Facilitator accepts the Circle-MPC pocket signature | **SETTLED** — full x402 flow through our own `buildPaywall` seller: 402 → `signX402` via `circleTypedDataSigner` (617ms) → facilitator verify+settle → 200. The migration's most load-bearing unknown, closed. |
+| E | SCA in-flight queue | **NO WEDGE** — two concurrent contractExecutions both accepted and confirmed, 9.1s total. The documented 1-in-flight queue either doesn't apply on Arc or Circle queues internally; our per-entity keyed lock serializes anyway. |
+| F | Live-registry `setAgentWallet` with the SCA's 1271 signature | **BIND ACCEPTED** — anvil fork of the LIVE registry code+state (chain-id 5042002), impersonated real owner of agentId 845775, REAL Circle MPC signature over the live EIP-712 domain: `setAgentWallet` succeeded and `getAgentWallet` returns the SCA. The "known unknown that gates NEW circle agents" is closed. Also learned: `register()` reverts for arbitrary EOAs on the live registry (agents mint through the platform flow only). |
+
+**Consequences applied to P1:** `activateCircleSca` in provisioning (above);
+`circleOperatorSigner`'s P2 caveat comment updated to the verdict. **Remaining
+before flipping the default (P4):** P3 — onboard one real circle test agent through
+the full stack (the activation + bind sequence end-to-end in production code paths),
+run the funding bridge + a live pay + a job, then the default flip.

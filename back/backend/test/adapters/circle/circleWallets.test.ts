@@ -1,5 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
+import { deterministicIdempotencyKey } from "../../../src/adapters/circle/circleExec";
 import {
+  activateCircleSca,
   circleAgentkitSigner,
   circleTypedDataSigner,
   provisionCircleWallets,
@@ -153,5 +155,71 @@ describe("withCircleOpsLog — every mutating Circle call leaves a journald line
     const res = await wrapped.signMessage({ walletId: "w", message: "m" } as never);
     expect((res as { data?: { signature?: string } }).data?.signature).toBeTruthy();
     spy.mockRestore();
+  });
+});
+
+
+describe("activateCircleSca — P2 probe-A fix (deploy the SCA before any signature)", () => {
+  const USDC = "0x3600000000000000000000000000000000000000";
+  const GATEWAY = "0x0077777d7EBA4688BDeF3E311b846F25870A19B9";
+
+  function makeExecApi(states: string[] = ["CONFIRMED"]) {
+    let call = 0;
+    const submits: { idempotencyKey: string; contractAddress: string; callData: string }[] = [];
+    return {
+      submits,
+      createContractExecutionTransaction: vi.fn(
+        async (input: { idempotencyKey: string; contractAddress: string; callData: string }) => {
+          submits.push(input);
+          return { data: { id: `tx-${submits.length}` } };
+        },
+      ),
+      getTransaction: vi.fn(async ({ id }: { id: string }) => ({
+        data: {
+          transaction: {
+            id,
+            state: states[Math.min(call++, states.length - 1)]!,
+            txHash: `0xhash-${id}`,
+            networkFee: "0.009188",
+          },
+        },
+      })),
+    };
+  }
+
+  test("submits ONE sponsored approve(gateway, 0) with a DETERMINISTIC per-entity key, records the fee", async () => {
+    const api = makeExecApi();
+    const fees: [bigint, string | null][] = [];
+    const { txHash } = await activateCircleSca(api, {
+      operatorWalletId: "op-1",
+      entityKey: "t:agent-1",
+      usdc: USDC,
+      gatewayWallet: GATEWAY,
+      confirm: { pollDelayMs: 0, timeoutMs: 5_000, sleep: async () => {} },
+      outflows: { record: (_p, amt, ref) => fees.push([amt, ref]) },
+    });
+    expect(txHash).toBe("0xhash-tx-1");
+    expect(api.submits).toHaveLength(1);
+    // approve(GATEWAY, 0) calldata against the USDC contract
+    expect(api.submits[0]!.contractAddress).toBe(USDC);
+    expect(api.submits[0]!.callData.startsWith("0x095ea7b3")).toBe(true); // approve selector
+    expect(api.submits[0]!.callData.endsWith("0".repeat(64))).toBe(true); // amount 0
+    // Deterministic seed: a crash-retry replays THIS op instead of deploying twice.
+    expect(api.submits[0]!.idempotencyKey).toBe(deterministicIdempotencyKey("activate:t:agent-1"));
+    // S5 parity: the sponsored fee is observed (0.009188 USDC → 9188 atomic).
+    expect(fees).toEqual([[9188n, "tx-1"]]);
+  });
+
+  test("a terminal FAILED activation propagates (provisioning must not persist a half-activated agent)", async () => {
+    const api = makeExecApi(["FAILED"]);
+    await expect(
+      activateCircleSca(api, {
+        operatorWalletId: "op-1",
+        entityKey: "t:agent-1",
+        usdc: USDC,
+        gatewayWallet: GATEWAY,
+        confirm: { pollDelayMs: 0, timeoutMs: 5_000, sleep: async () => {} },
+      }),
+    ).rejects.toThrow(/terminal state FAILED/);
   });
 });

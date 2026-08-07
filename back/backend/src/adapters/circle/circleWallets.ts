@@ -1,8 +1,11 @@
 // Namespace import is deliberate — see the CJS/ESM interop note in buildCircleWalletsApi.
 import * as dcwModule from "@circle-fin/developer-controlled-wallets";
+import { encodeFunctionData } from "viem";
 import { opsLog } from "../../observability/opsLog";
-import type { Hex } from "../../types";
+import type { Address, Hex } from "../../types";
 import type { AgentkitSigner } from "../worldid/agentkitSigner";
+import type { SubmitAndConfirmOptions } from "./circleExec";
+import { submitAndConfirm } from "./circleExec";
 
 /**
  * Tier-0 Circle DevC adapter (P1b) — docs/design/2026-08-03-tier0-circle-wallet-migration.md.
@@ -129,6 +132,60 @@ export interface CircleWalletRef {
   scaCore?: string;
 }
 
+const erc20ApproveAbi = [
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+
+/**
+ * Deploy ("activate") a freshly-provisioned operator SCA with one Gas-Station-sponsored no-op:
+ * approve(gatewayWallet, 0). P2 probe A proved Circle REFUSES to produce any signature from an
+ * undeployed SCA ("initiate a transaction to deploy the wallet"), and the onboarding saga's very
+ * next SCA touch is the bind SIGNATURE — so provisioning must leave the SCA deployed, not
+ * counterfactual. Deterministic idempotency seed: a crash-retry replays this exact op instead of
+ * firing a second one. Probe B measured the cost: ~0.009 USDC sponsored fee, ~3s to confirm.
+ */
+export async function activateCircleSca(
+  api: Pick<CircleWalletsApi, "createContractExecutionTransaction" | "getTransaction">,
+  p: {
+    operatorWalletId: string;
+    entityKey: string;
+    usdc: string;
+    gatewayWallet: string;
+    confirm?: SubmitAndConfirmOptions;
+    /** S5: Gas Station sponsorship observed from the confirmed-tx fee (recorded, never checked). */
+    outflows?: { record(path: "gas_sponsorship", amountAtomic: bigint, ref: string | null): void };
+  },
+): Promise<{ txHash: Hex }> {
+  const { txHash } = await submitAndConfirm(
+    api,
+    {
+      walletId: p.operatorWalletId,
+      contractAddress: p.usdc as Address,
+      callData: encodeFunctionData({
+        abi: erc20ApproveAbi,
+        functionName: "approve",
+        args: [p.gatewayWallet as Address, 0n],
+      }),
+      idempotencySeed: `activate:${p.entityKey}`,
+      refId: `${p.entityKey}:activate`,
+    },
+    {
+      ...p.confirm,
+      onNetworkFee: (fee, txId) => p.outflows?.record("gas_sponsorship", fee, txId),
+    },
+  );
+  return { txHash };
+}
+
 /** One SCA (operator) + one EOA (pocket) per agent, both tagged with the entity key. */
 export async function provisionCircleWallets(
   api: CircleWalletsApi,
@@ -180,10 +237,11 @@ export function circleTypedDataSigner(
 }
 
 /** OperatorSigner for the onboarding saga's Step-5 bind: the operator SCA signs the ERC-8004
- *  `AgentWalletSet` typed data through Circle. P2 CAVEAT (spec "known unknown"): an SCA cannot
- *  produce plain ECDSA recovering to itself — the live registry must accept this signature via
- *  ERC-1271 `isValidSignature` (Circle's SingleOwnerMSCA implements it on-chain). Proven only
- *  against our mock until the P2 fork test runs against the live registry. */
+ *  `AgentWalletSet` typed data through Circle. P2 VERDICT (2026-08-06, probe F): the LIVE Arc
+ *  registry accepts this ERC-1271 signature — proven on an anvil fork of real registry code+state
+ *  with a real MPC signature (agentId 845775 rebound to the SCA; getAgentWallet matched).
+ *  PRECONDITION (probe A): the SCA must be DEPLOYED first — Circle refuses to sign from an
+ *  undeployed wallet — hence `activateCircleSca` below runs during provisioning. */
 export function circleOperatorSigner(
   api: CircleWalletsApi,
   wallet: { walletId: string; address: string },
