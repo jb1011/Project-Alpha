@@ -88,7 +88,12 @@ async function main() {
     headers: { "content-type": "application/json" },
     body: JSON.stringify([
       { jsonrpc: "2.0", id: 1, method: "anvil_impersonateAccount", params: [realOwner] },
-      { jsonrpc: "2.0", id: 2, method: "anvil_setBalance", params: [realOwner, "0x8AC7230489E80000"] },
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "anvil_setBalance",
+        params: [realOwner, "0x8AC7230489E80000"],
+      },
     ]),
   });
   console.log(`agentId=${agentId} realOwner=${realOwner} (impersonated on fork)`);
@@ -129,7 +134,11 @@ async function main() {
       functionName: "setAgentWallet",
       args: [agentId, sca.address as Address, deadline, signature],
     });
-    const impersonated = createWalletClient({ account: realOwner, chain, transport: http(FORK_RPC) });
+    const impersonated = createWalletClient({
+      account: realOwner,
+      chain,
+      transport: http(FORK_RPC),
+    });
     const bindHash = await impersonated.writeContract({
       address: REGISTRY,
       abi: iIdentityRegistryAbi,
@@ -149,10 +158,9 @@ async function main() {
         `(${bound.toLowerCase() === sca.address.toLowerCase() ? "MATCHES the SCA — ERC-1271 path CONFIRMED against live registry code" : "UNEXPECTED MISMATCH"})`,
     );
   } catch (e) {
+    const revert = (e as Error).message.split("\n").slice(0, 4).join("\n");
     console.log(
-      `\nVERDICT: BIND REJECTED — the live registry does NOT accept the SCA signature.\n` +
-        `Revert: ${(e as Error).message.split("\n").slice(0, 4).join("\n")}\n` +
-        `Consequence: circle-path onboarding cannot 1271-bind; P1 must sidestep (e.g. EOA-assisted bind or registry-side change).`,
+      `\nVERDICT: BIND REJECTED — the live registry does NOT accept the SCA signature.\nRevert: ${revert}\nConsequence: circle-path onboarding cannot 1271-bind; P1 must sidestep (e.g. EOA-assisted bind or registry-side change).`,
     );
   }
 }

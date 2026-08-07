@@ -18,13 +18,7 @@
  */
 import "dotenv/config";
 import { createRequire } from "node:module";
-import {
-  http,
-  createPublicClient,
-  encodeFunctionData,
-  formatUnits,
-  hashTypedData,
-} from "viem";
+import { http, createPublicClient, encodeFunctionData, formatUnits, hashTypedData } from "viem";
 import { submitAndConfirm } from "../src/adapters/circle/circleExec";
 import type { CircleWalletsApi } from "../src/adapters/circle/circleWallets";
 import { circleTypedDataSigner } from "../src/adapters/circle/circleWallets";
@@ -329,7 +323,8 @@ async function main() {
     const PRICE = 10_000n; // 0.01 USDC
     const signer = asBatchEvmSigner({
       address: eoa.address as Address,
-      signTypedData: (td) => circleTypedDataSigner(api, { walletId: eoa.id, address: eoa.address }).signTypedData(td),
+      signTypedData: (td) =>
+        circleTypedDataSigner(api, { walletId: eoa.id, address: eoa.address }).signTypedData(td),
     });
     const signX402 = makeSignX402({
       signer,

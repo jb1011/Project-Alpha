@@ -158,7 +158,6 @@ describe("withCircleOpsLog — every mutating Circle call leaves a journald line
   });
 });
 
-
 describe("activateCircleSca — P2 probe-A fix (deploy the SCA before any signature)", () => {
   const USDC = "0x3600000000000000000000000000000000000000";
   const GATEWAY = "0x0077777d7EBA4688BDeF3E311b846F25870A19B9";
