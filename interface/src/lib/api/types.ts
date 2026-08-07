@@ -32,6 +32,13 @@ export type EntityView = {
   walletProvider?: "turnkey" | "circle" | null;
 };
 
+/** Public deployment capabilities (GET /config, unauthenticated) — lets the wizard preselect the
+ *  platform default and never offer a custody option this deployment can't serve. */
+export type PublicConfig = {
+  walletProviderDefault: "turnkey" | "circle";
+  circleCustodyAvailable: boolean;
+};
+
 /** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */
 export type TreasuryView = {
   usdcBalance: string;

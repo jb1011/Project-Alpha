@@ -144,3 +144,20 @@ test("custody omitted → the platform default is claimed", async () => {
   expect(res.status).toBe(202);
   expect(repo.listByTenant(account.address)[0]!.walletProvider).toBe("turnkey");
 });
+
+test("GET /config is public and reports this deployment's custody capabilities", async () => {
+  const available = makeApp({ circleAvailable: true, def: "circle" });
+  const res = await available.request("/config"); // no auth header — must be public
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({
+    walletProviderDefault: "circle",
+    circleCustodyAvailable: true,
+  });
+
+  // A credential-less deployment must advertise that, so the wizard never offers circle there.
+  const without = makeApp({ circleAvailable: false, def: "turnkey" });
+  expect(await (await without.request("/config")).json()).toEqual({
+    walletProviderDefault: "turnkey",
+    circleCustodyAvailable: false,
+  });
+});

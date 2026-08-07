@@ -71,10 +71,15 @@ const EnvSchema = z.object({
   CIRCLE_ENTITY_SECRET: z.string().optional(),
   /** The platform wallet set ("novi-tier0"). Required only when provisioning circle-path agents. */
   CIRCLE_WALLET_SET_ID: z.string().optional(),
-  /** Tier-0: platform default custody for NEW agents when the caller doesn't choose. Stays
-   *  `turnkey` through P1-P3 (the flag that keeps every step reversible); P4 flips it to `circle`
-   *  after the live experiment proves the path. Per-call override: `custody` on /onboard +
-   *  onboard_agent. docs/design/2026-08-03-tier0-circle-wallet-migration.md. */
+  /** Tier-0: platform default custody for NEW agents when the caller doesn't choose. Per-call
+   *  override: `custody` on /onboard + onboard_agent.
+   *
+   *  P4 (2026-08-07) flipped PROD to `circle` after P2+P3 proved the path live — but the SCHEMA
+   *  default stays `turnkey` on purpose: a `circle` schema default would make the boot invariant
+   *  below refuse to start every credential-less deployment (local dev, CI, contributors,
+   *  self-hosts). The platform default is therefore an explicit prod .env setting, and any
+   *  deployment without Circle credentials keeps working exactly as before.
+   *  docs/design/2026-08-03-tier0-circle-wallet-migration.md. */
   WALLET_PROVIDER_DEFAULT: z.enum(["turnkey", "circle"]).default("turnkey"),
   ANTHROPIC_API_KEY: z.string().optional(),
   AGENT_MODEL: z.string().default("claude-sonnet-4-6"),

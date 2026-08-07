@@ -67,10 +67,11 @@ export const emptyConfig = (): AgentConfig => ({
   name: "",
   purpose: "",
   configMode: "manual",
-  // Platform default until Tier-0 P4. NOTE (review N2): the wizard always SENDS an explicit
-  // custody value, so P4's backend WALLET_PROVIDER_DEFAULT flip does NOT reach wizard users —
-  // this default must be flipped alongside it.
-  custody: "turnkey",
+  // Tier-0 P4 (2026-08-07): flipped to `circle` alongside the backend's prod default, since the
+  // wizard always SENDS an explicit custody value (a backend-only flip would never reach wizard
+  // users). CustodyStep downgrades this to `turnkey` at runtime when GET /config reports the
+  // deployment can't serve circle, so credential-less deployments still onboard.
+  custody: "circle",
   perTxCap: "",
   dailyCap: "",
   allowlist: [],

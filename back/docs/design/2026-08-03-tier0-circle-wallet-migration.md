@@ -327,3 +327,33 @@ Agent: `P3CircleAgent`, agentId **865083**, custody=circle.
 3. The SSRF-guard fetch timeout (10s) aborted a healthy prod payment — circle signing latency +
    synchronous facilitator settle + serverless cold start exceed it. Now 20s (the timeout bounds
    slow-loris, not settlement).
+
+## P4 EXECUTED — circle is the platform default (2026-08-07)
+
+Prod carries the Circle credentials (`.env.bak-pre-circle` is the rollback), booted clean —
+the all-or-nothing config check and `assertCircleCoverage` both accept them.
+
+**Prod-machine validation before the flip:** a full circle onboarding run FROM the VPS, with
+prod credentials and prod env values, into an isolated `DATA_DIR` so the production entity list
+stayed clean: agentId **865421**, SCA operator `0xafa3fad8…`, ERC-1271 bind on the live registry
+`0x614e3da4…`, status `funded`. Prod can serve the path, not just the dev machine.
+
+**The flip, and the shape it took:**
+- Prod `.env`: `WALLET_PROVIDER_DEFAULT=circle`.
+- The **schema** default deliberately stays `turnkey`. A `circle` schema default would make the
+  P1d boot invariant (`WALLET_PROVIDER_DEFAULT=circle` requires full Circle config) refuse to
+  start every credential-less deployment — local dev, CI, contributors, self-hosts. The platform
+  default is therefore an explicit prod setting; everyone else keeps today's behavior.
+- Wizard default `custody: "circle"` + the **Recommended** tag (the wizard always sends an
+  explicit custody value, so a backend-only flip would never have reached wizard users).
+- New public `GET /config` (`walletProviderDefault`, `circleCustodyAvailable`) — booleans only.
+  The custody step probes it and **disables** the Novi-managed card on deployments that can't
+  serve it, instead of letting the user reach a 400 at submit. This also closes the P1d review's
+  deferred L1. Unknown/unreachable is treated as available: submission validates anyway, and a
+  transient blip shouldn't push someone off the recommended path.
+- "Early access" copy retired; the caveat it carried is now false.
+
+**Still open (owner: user, Circle console):** IP-allowlist the API key to the VPS. Note the
+trade-off — an allowlist pinned to the VPS alone also blocks the local probe scripts
+(`tier0-p2-*`, `tier0-p3-live`), so allowlist the dev machine too or accept running those from
+the VPS.

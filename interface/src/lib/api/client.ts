@@ -12,6 +12,7 @@ import type {
   GuardianPasskey,
   JobView,
   PasskeyView,
+  PublicConfig,
   ReputationView,
   TreasuryView,
   WorldIdAttestContext,
@@ -81,6 +82,12 @@ export async function getPasskeyChallenge(
   token: string,
 ): Promise<{ challenge: string; rpId: string }> {
   return request("/passkey/challenge", { token });
+}
+
+/** Public deployment capabilities — no auth. Used by the custody step so the wizard can't offer
+ *  an option this deployment would reject at submit. */
+export async function getPublicConfig(): Promise<PublicConfig> {
+  return request("/config");
 }
 
 export async function onboardEntity(

@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useState } from "react";
+import { getPublicConfig } from "@/lib/api/client";
 import { StepNav } from "../OnboardingFlow";
 import type { AgentConfig, Custody } from "../types";
 import { Button, Callout, CheckIcon, StepHeader, cx } from "../primitives";
@@ -26,7 +28,7 @@ const OPTIONS: {
   {
     value: "circle",
     label: "Novi-managed",
-    tag: "Early access",
+    tag: "Recommended",
     tagline: "Smart-account operator in Circle's MPC infrastructure, run by the platform.",
     points: [
       "Gasless — no gas top-ups, no per-signature costs",
@@ -34,7 +36,7 @@ const OPTIONS: {
       "Fastest funding path — fewer moving parts",
     ],
     tradeoff:
-      "The platform controls the operator's hot keys (in Circle MPC). Your guardian wallet still outranks the agent on-chain: pause, veto, and clawback always answer to you. Early access: this path is in live validation, and some deployments don't offer it yet — if unavailable, submission will ask you to switch.",
+      "The platform controls the operator's hot keys (in Circle MPC — never stored on our servers). Your guardian wallet still outranks the agent on-chain: pause, veto, and clawback always answer to you.",
   },
   {
     value: "turnkey",
@@ -51,6 +53,29 @@ const OPTIONS: {
 ];
 
 export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
+  // Ask the deployment what it can actually serve. Unknown (still loading, or the probe failed)
+  // is treated as available: submission validates anyway, and a transient blip shouldn't push
+  // someone off the recommended path.
+  const [circleAvailable, setCircleAvailable] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getPublicConfig()
+      .then((c) => {
+        if (!cancelled) setCircleAvailable(c.circleCustodyAvailable);
+      })
+      .catch(() => {
+        if (!cancelled) setCircleAvailable(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const circleUnavailable = circleAvailable === false;
+  // Derived, not stored: a deployment that can't serve circle shows turnkey as selected without
+  // an effect writing to parent state (which would cascade renders).
+  const selected = circleUnavailable ? "turnkey" : config.custody;
+
   return (
     <div>
       <StepHeader
@@ -61,28 +86,38 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {OPTIONS.map((o) => {
-          const selected = config.custody === o.value;
+          const isSelected = selected === o.value;
+          const disabled = o.value === "circle" && circleUnavailable;
           return (
             <button
               key={o.value}
               type="button"
+              disabled={disabled}
               onClick={() => onChange({ ...config, custody: o.value })}
               className={cx(
                 "rounded-2xl border p-5 text-left transition-colors",
-                selected ? "border-accent/40 bg-accent/[0.06]" : "hairline-strong hover:bg-paper-2",
+                isSelected
+                  ? "border-accent/40 bg-accent/[0.06]"
+                  : "hairline-strong hover:bg-paper-2",
+                disabled && "cursor-not-allowed opacity-50 hover:bg-transparent",
               )}
             >
               <div className="flex items-center gap-2.5">
                 <span
                   className={cx(
                     "h-4 w-4 rounded-full border",
-                    selected ? "border-accent bg-accent" : "border-line-strong",
+                    isSelected ? "border-accent bg-accent" : "border-line-strong",
                   )}
                 />
                 <span className="text-[15px] font-medium text-ink">{o.label}</span>
-                {o.tag && (
-                  <span className="rounded-full border hairline-strong bg-paper-2/60 px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-muted-2">
+                {o.tag && !disabled && (
+                  <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-accent-soft">
                     {o.tag}
+                  </span>
+                )}
+                {disabled && (
+                  <span className="rounded-full border hairline-strong bg-paper-2/60 px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-muted-2">
+                    Unavailable here
                   </span>
                 )}
               </div>
@@ -96,7 +131,9 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
                 ))}
               </ul>
               <p className="mt-3 border-t hairline pt-3 text-[11.5px] leading-[1.5] text-muted-2">
-                {o.tradeoff}
+                {disabled
+                  ? "This deployment isn't configured for Novi-managed custody, so it can't be selected here."
+                  : o.tradeoff}
               </p>
             </button>
           );
@@ -111,7 +148,14 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
       </Callout>
 
       <StepNav onBack={onBack}>
-        <Button onClick={onComplete}>
+        <Button
+          onClick={() => {
+            // Commit the derived selection in the event handler (not an effect) so a downgraded
+            // choice is what actually gets submitted.
+            if (selected !== config.custody) onChange({ ...config, custody: selected });
+            onComplete();
+          }}
+        >
           Continue
           <CheckIcon className="h-4 w-4" />
         </Button>

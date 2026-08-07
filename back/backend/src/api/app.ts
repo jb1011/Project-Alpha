@@ -105,6 +105,17 @@ export function buildApiApp(deps: ApiDeps) {
   );
   app.onError(apiOnError);
   app.get("/healthz", (c) => c.json({ ok: true }));
+  // Public deployment capabilities (Tier-0 P4). The wizard reads this BEFORE auth so it can
+  // preselect the platform's custody default and refuse to offer an option this deployment
+  // cannot serve — without it, a UI defaulting to `circle` would 400 at submit on every
+  // credential-less deployment (local dev, contributors, self-hosts). Booleans only: no
+  // secrets, no addresses, nothing a caller couldn't learn by attempting an onboard.
+  app.get("/config", (c) =>
+    c.json({
+      walletProviderDefault: deps.walletProviderDefault,
+      circleCustodyAvailable: deps.circleCustodyAvailable,
+    }),
+  );
   mountSchemaRoutes(app);
   mountMetadataRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
