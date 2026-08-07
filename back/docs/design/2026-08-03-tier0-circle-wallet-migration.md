@@ -302,7 +302,7 @@ before flipping the default (P4):** P3 — onboard one real circle test agent th
 the full stack (the activation + bind sequence end-to-end in production code paths),
 run the funding bridge + a live pay + a job, then the default flip.
 
-## P3 EXECUTED — first circle agent through the production stack (2026-08-07)
+## P3 EXECUTED — first circle agent through the production stack (2026-08-07) — ALL FOUR LEGS GREEN
 
 Run locally against the live chain (prod carries no Circle creds; P3 on the prod DB is
 structurally forbidden — assertCircleCoverage would refuse the next boot). Driver:
@@ -314,7 +314,7 @@ Agent: `P3CircleAgent`, agentId **865083**, custody=circle.
 | 1 onboard | **funded** — provision → activate → createEntity → **the FIRST non-fork ERC-1271 bind on the LIVE registry** (`0xdf7d03b6…`; `getAgentWallet` == the SCA) → fundTreasury |
 | 2 bridge | **all 3 legs confirmed** — fundOperator → exact approve → depositFor; pocket Gateway balance 0.25. A deliberate duplicate run then FAILED cleanly on-chain (`INSUFFICIENT_TOKEN`, saga-recorded) — the guards working. |
 | 3 pay | **SETTLED** — 0.01 USDC to the PROD demo seller through the Vercel proxy, Circle-MPC pocket signature, facilitator transfer id `8f9bce9f…`. Buyer-side prod parity. |
-| 4 job | **blocked on test funds only** — the platform test wallet is down to ~0.3 USDC and Arc's fee-reserve precheck (the PR-#33 estimateGas footgun, this time on the job client's contract writes) refuses before sending. Not circle-specific (client escrow is custody-agnostic, proven live in July); re-run after a faucet drip to the platform wallet. |
+| 4 job | **reputed** (after a 20-USDC faucet drip unblocked the dry test wallet — the initial refusal was Arc's fee-reserve precheck, the PR-#33 footgun class on the job client's writes, custody-agnostic). Two full jobs: jobId 171338 (29.2s, create→fund→SCA submit via sponsored execution→evaluate→reputation) and jobId 171339 with `JOB_SWEEP_TO_TREASURY=true` exercising the circle **sweep** op (`sweepToTreasury` via Circle contractExecution, `0x1beb2720…`). Every circleJobOps operation proven live. |
 
 **Three production bugs P3 caught (all fixed + test-pinned):**
 1. `withCircleOpsLog`/`withCircleRateLimit` used `{...api}` spreads — the real SDK client is a
