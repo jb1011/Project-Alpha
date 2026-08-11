@@ -1,20 +1,19 @@
 "use client";
 
-import * as React from "react";
+import { useEffect, useState } from "react";
 import { ActiveConnectionsPanel } from "@/components/agents/ActiveConnectionsPanel";
 import { AgentShell } from "@/components/agents/AgentShell";
 import { GuardianPasskeysPanel } from "@/components/agents/GuardianPasskeysPanel";
 import { RequireAuth } from "@/components/agents/RequireAuth";
 import { TenantRecord } from "@/components/agents/TenantRecord";
 import { useAuth } from "@/components/onboarding/AuthProvider";
-import { listEntities, worldIdMe } from "@/lib/api/client";
+import { useEntitiesQuery, useWorldIdMeQuery } from "@/lib/api/hooks";
 import { lookupEnsName } from "@/lib/ens";
-import type { WorldIdMe } from "@/lib/api/types";
 
 export default function AccountPage() {
   return (
     <RequireAuth>
-      <AgentShell title="Account" subtitle="The tenant behind your agents.">
+      <AgentShell>
         <AccountBody />
       </AgentShell>
     </RequireAuth>
@@ -23,28 +22,11 @@ export default function AccountPage() {
 
 function AccountBody() {
   const { session, address } = useAuth();
-  const [me, setMe] = React.useState<WorldIdMe | null>(null);
-  const [entityCount, setEntityCount] = React.useState<number | null>(null);
-  const [ensName, setEnsName] = React.useState<string | null>(null);
+  const { data: me = null } = useWorldIdMeQuery({ enabled: !!session?.token });
+  const { data: entities = [] } = useEntitiesQuery();
+  const [ensName, setEnsName] = useState<string | null>(null);
 
-  // Reads only — the stored session is enough, and rendering must never provoke a signature.
-  React.useEffect(() => {
-    const token = session?.token;
-    if (!token) return;
-    let live = true;
-    worldIdMe(token)
-      .then((v) => live && setMe(v))
-      .catch(() => {}); // deployments without World simply show no guardian standing
-    listEntities(token)
-      .then((es) => live && setEntityCount(es.length))
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, [session?.token]);
-
-  // ENS primary name for the wallet — decoration over the address, so failures stay silent.
-  React.useEffect(() => {
+  useEffect(() => {
     if (!address) return;
     let live = true;
     void lookupEnsName(address).then((n) => live && setEnsName(n));
@@ -58,8 +40,10 @@ function AccountBody() {
       address={address}
       ensName={ensName}
       me={me}
-      entityCount={entityCount}
-      connections={<ActiveConnectionsPanel filter={{ mode: "tenant" }} hideHeader />}
+      entityCount={entities.length}
+      connections={
+        <ActiveConnectionsPanel filter={{ mode: "tenant" }} hideHeader />
+      }
       passkeys={<GuardianPasskeysPanel hideHeader />}
     />
   );

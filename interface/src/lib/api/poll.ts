@@ -3,6 +3,8 @@ import { getEntity } from "./client";
 
 const TERMINAL: EntityStatus[] = ["bound", "funded", "failed"];
 
+export { TERMINAL };
+
 export async function pollEntity(
   token: string,
   id: string,

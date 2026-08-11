@@ -269,7 +269,13 @@ export function worldIdStatus(token: string, requestId: string): Promise<WorldId
 export function entityAgentBook(
   token: string,
   id: string,
-): Promise<{ registered: boolean; humanId?: string; operator?: string; register?: string }> {
+): Promise<{
+  registered: boolean;
+  reason?: "not registered" | "no-operator-yet";
+  humanId?: string;
+  operator?: string;
+  register?: string;
+}> {
   return request(`/entities/${encodeURIComponent(id)}/agentbook`, { token });
 }
 

@@ -1,9 +1,13 @@
 "use client";
 
-import { IDKitRequestWidget, proofOfHuman } from "@worldcoin/idkit";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { worldIdContext, worldIdMe, worldIdVerify } from "@/lib/api/client";
-import { ApiError, type WorldIdContext, type WorldIdMe } from "@/lib/api/types";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { IDKitRequestWidget, proofOfHuman, type RpContext } from "@worldcoin/idkit";
+import {
+  useWorldIdContextMutation,
+  useWorldIdMeQuery,
+  useWorldIdVerifyMutation,
+} from "@/lib/api/hooks";
+import { ApiError, type WorldIdContext } from "@/lib/api/types";
 import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
@@ -25,73 +29,62 @@ export function GuardianStep({
   onBack: () => void;
   onComplete: () => void;
 }) {
-  const { ensureSession, address } = useAuth();
-  const [me, setMe] = useState<WorldIdMe | null>(null);
+  const { address } = useAuth();
+  const { data: me = null, error: meError, refetch } = useWorldIdMeQuery();
+  const worldIdContextMutation = useWorldIdContextMutation();
+  const worldIdVerifyMutation = useWorldIdVerifyMutation();
   const [ctx, setCtx] = useState<WorldIdContext | null>(null);
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [struck, setStruck] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const skipped = useRef(false);
 
-  // The parent passes a fresh arrow every render; holding it in a ref keeps `refresh` stable so
-  // the mount effect doesn't re-fire on every render and poll the API forever.
   const onCompleteRef = useRef(onComplete);
   useEffect(() => {
     onCompleteRef.current = onComplete;
   });
 
-  const refresh = useCallback(async () => {
-    try {
-      const s = await ensureSession();
-      setMe(await worldIdMe(s.token));
-    } catch (e) {
-      // World isn't configured on this deployment — this step has nothing to ask for.
-      if (e instanceof ApiError && e.status === 404) {
-        if (!skipped.current) {
-          skipped.current = true;
-          onCompleteRef.current();
-        }
-        return;
-      }
-      setError((e as Error).message || "Could not check the guardian record.");
-    }
-  }, [ensureSession]);
-
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    if (meError instanceof ApiError && meError.status === 404 && !skipped.current) {
+      skipped.current = true;
+      onCompleteRef.current();
+    }
+  }, [meError]);
 
-  const begin = useCallback(async () => {
+  const queryError =
+    meError instanceof ApiError && meError.status === 404
+      ? null
+      : meError instanceof Error
+        ? meError.message
+        : meError
+          ? "Could not check the guardian record."
+          : null;
+  const displayError = error ?? queryError;
+
+  const busy = worldIdContextMutation.isPending;
+
+  async function begin() {
     setError(null);
-    setBusy(true);
     try {
-      const s = await ensureSession();
-      setCtx(await worldIdContext(s.token));
+      setCtx(await worldIdContextMutation.mutateAsync());
       setOpen(true);
     } catch (e) {
       setError((e as Error).message || "Could not start verification.");
-    } finally {
-      setBusy(false);
     }
-  }, [ensureSession]);
+  }
 
-  const handleVerify = useCallback(
-    async (proof: unknown) => {
-      const s = await ensureSession();
-      await worldIdVerify(s.token, proof);
-    },
-    [ensureSession],
-  );
+  async function handleVerify(proof: unknown) {
+    await worldIdVerifyMutation.mutateAsync(proof);
+  }
 
   const verified = me?.verified ?? false;
   const required = me?.required ?? false;
-  const loading = me === null && error === null;
+  const loading = me === null && displayError === null;
 
   return (
     <div>
       <StepHeader
-        eyebrow="01"
+        eyebrow="Screen 2"
         title={verified ? "A human is on record." : "Who is accountable for this agent?"}
         intro={
           verified
@@ -132,7 +125,7 @@ export function GuardianStep({
             ) : (
               <>
                 <ul className="flex flex-col gap-2 text-[12.5px] leading-[1.6] text-muted">
-                  <Point>Only a unique human can stand behind an agent's legal body.</Point>
+                  <Point>Only a unique human can stand behind an agent&apos;s legal body.</Point>
                   <Point>We store a nullifier — never your name, document, or face.</Point>
                   <Point>Verify once; every agent on this account inherits it.</Point>
                 </ul>
@@ -151,7 +144,7 @@ export function GuardianStep({
               </>
             )}
 
-            {error && <WorldErrorNote error={error} />}
+            {displayError && <WorldErrorNote error={displayError} />}
           </div>
         </div>
       </Card>
@@ -182,8 +175,7 @@ export function GuardianStep({
           onOpenChange={setOpen}
           app_id={ctx.appId as `app_${string}`}
           action={ctx.action}
-          // biome-ignore lint/suspicious/noExplicitAny: rp_context shape is defined by the API response.
-          rp_context={ctx.rpContext as any}
+          rp_context={ctx.rpContext as RpContext}
           allow_legacy_proofs
           environment={ctx.environment}
           preset={proofOfHuman({ signal: ctx.signal })}
@@ -192,7 +184,7 @@ export function GuardianStep({
             setOpen(false);
             setError(null);
             setStruck(true);
-            void refresh();
+            void refetch();
           }}
           onError={(e: unknown) => {
             const code = typeof e === "string" ? e : ((e as { code?: string })?.code ?? String(e));
@@ -205,7 +197,7 @@ export function GuardianStep({
   );
 }
 
-function Point({ children }: { children: React.ReactNode }) {
+function Point({ children }: { children: ReactNode }) {
   return (
     <li className="flex gap-2.5">
       <span aria-hidden className="mt-[7px] h-1 w-1 shrink-0 rounded-full bg-muted-2" />

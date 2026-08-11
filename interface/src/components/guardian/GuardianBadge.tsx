@@ -1,8 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import * as React from "react";
-import { worldIdMe } from "@/lib/api/client";
+import { useWorldIdMeQuery } from "@/lib/api/hooks";
 import { ApiError } from "@/lib/api/types";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { useAuth } from "@/components/onboarding/AuthProvider";
@@ -15,28 +14,11 @@ import { cx } from "@/components/onboarding/primitives";
  */
 export function GuardianBadge() {
   const { session, address } = useAuth();
-  const [me, setMe] = React.useState<Awaited<ReturnType<typeof worldIdMe>> | null>(null);
-  const [available, setAvailable] = React.useState(true);
+  const { data: me, error } = useWorldIdMeQuery({ enabled: !!session?.token });
 
-  React.useEffect(() => {
-    const token = session?.token;
-    if (!token) {
-      setMe(null);
-      return;
-    }
-    let live = true;
-    worldIdMe(token)
-      .then((v) => live && setMe(v))
-      .catch((e) => {
-        // 404 = World isn't configured on this deployment; say nothing rather than show a dead badge.
-        if (live && e instanceof ApiError && e.status === 404) setAvailable(false);
-      });
-    return () => {
-      live = false;
-    };
-  }, [session?.token]);
+  const unavailable = error instanceof ApiError && error.status === 404;
 
-  if (!available || !session?.token) return null;
+  if (unavailable || !session?.token) return null;
 
   return <GuardianBadgeView verified={me?.verified ?? false} seed={me?.nullifier ?? address ?? "novi-corpus"} />;
 }

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Archivo } from "next/font/google";
 import "./globals.css";
+import { type ReactNode } from "react";
 
 const archivo = Archivo({
   variable: "--font-archivo",
@@ -9,15 +10,18 @@ const archivo = Archivo({
   style: ["normal", "italic"],
 });
 
+const siteUrl =
+  process.env.NEXT_PUBLIC_SITE_URL ?? "https://novicorpus.xyz";
+
 export const metadata: Metadata = {
-  title: "Novi Corpus — A society for your agent",
+  title: "Novi Corpus — A company for your agent",
   description:
-    "Create a society for your agent: passkey-secured vault, on-chain spending policy, law-to-code operating agreement, and a USDC treasury on Arc.",
-  metadataBase: new URL("https://novicorpus.example"),
+    "Create a company for your agent: custody choice, World ID verification, on-chain spending policy, law-to-code operating agreement, and a USDC treasury on Arc.",
+  metadataBase: new URL(siteUrl),
   openGraph: {
-    title: "Novi Corpus — A society for your agent",
+    title: "Novi Corpus — A company for your agent",
     description:
-      "Passkey-secured agents with enforceable spending rules, Wyoming DAO LLC operating agreements, and guardian controls. Deploy and fund on Arc.",
+      "Agents with enforceable spending rules, Wyoming DAO LLC operating agreements, custody choice, and guardian controls. Deploy and fund on Arc.",
     type: "website",
   },
 };
@@ -25,7 +29,7 @@ export const metadata: Metadata = {
 export default function RootLayout({
   children,
 }: Readonly<{
-  children: React.ReactNode;
+  children: ReactNode;
 }>) {
   return (
     <html lang="en" className={`${archivo.variable} h-full antialiased`}>

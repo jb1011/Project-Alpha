@@ -7,7 +7,7 @@ import { RequireAuth } from "@/components/agents/RequireAuth";
 export default function ConnectPage() {
   return (
     <RequireAuth>
-      <AgentShell title="Connect an agent">
+      <AgentShell>
         <BootstrapAgent />
       </AgentShell>
     </RequireAuth>

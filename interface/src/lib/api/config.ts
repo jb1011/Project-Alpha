@@ -1,10 +1,14 @@
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/backend";
 
-export const SIWE_DOMAIN = process.env.NEXT_PUBLIC_SIWE_DOMAIN ?? "localhost";
+export const SIWE_DOMAIN =
+  process.env.NEXT_PUBLIC_SIWE_DOMAIN ??
+  (process.env.NODE_ENV === "production" ? "" : "localhost");
 
-export const MANAGER_ADDRESS =
-  process.env.NEXT_PUBLIC_MANAGER_ADDRESS ??
-  "0xbE497D6E00dedE6892Dcb99271af4DeA98c58a9e";
+export const ENS_PARENT_NAME =
+  process.env.NEXT_PUBLIC_ENS_PARENT_NAME ?? "novicorpus.eth";
+
+export const ENS_EXPLORER_URL =
+  process.env.NEXT_PUBLIC_ENS_EXPLORER_URL ?? "https://sepolia.app.ens.domains";
 
 const AUTH_STORAGE_KEY = "pa-auth-session";
 export const AUTH_SESSION_EVENT = "pa-auth-session-change";

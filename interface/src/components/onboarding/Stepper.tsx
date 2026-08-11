@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 import { Phase, PHASES } from "./types";
 import { CheckIcon, cx } from "./primitives";
 
@@ -47,7 +46,7 @@ export function Stepper({ current, done, onJump }: Props) {
                       "hairline-strong bg-paper text-muted-2",
                   )}
                 >
-                  {isDone ? <CheckIcon className="h-3.5 w-3.5" /> : p.n}
+                  {isDone ? <CheckIcon className="h-3.5 w-3.5" /> : i + 1}
                 </span>
                 <span className="flex flex-col">
                   <span
@@ -75,8 +74,9 @@ export function Stepper({ current, done, onJump }: Props) {
       </ol>
 
       <div className="mt-7 rounded-xl hairline bg-paper-2/40 px-3.5 py-3 text-[11.5px] leading-[1.5] text-muted-2">
-        <span className="text-muted">Non-custodial.</span> You sign only twice —
-        your passkey and your funding transfer. Everything else is automated.
+        <span className="text-muted">Guardian controlled.</span> SIWE sign-in,
+        passkey ceremony, and one guardian transaction per allowlist address.
+        Treasury funding needs no user signature.
       </div>
     </nav>
   );

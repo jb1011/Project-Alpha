@@ -1,16 +1,15 @@
 import { Wordmark } from "./Wordmark";
 
-// Informational anchors only — the app entry ("My agents") lives in the action cluster on the
-// right, because it is a door, not a chapter heading.
 const links = [
   { href: "#how", label: "How it works" },
   { href: "#features", label: "Features" },
   { href: "#mcp", label: "MCP" },
+  { href: "/personhood", label: "Personhood" },
 ];
 
 export function Nav() {
   return (
-    <header className="sticky top-0 z-50">
+    <header className="sticky top-0 z-50 anim-nav-drop">
       <div className="absolute inset-0 -z-10 backdrop-blur-md bg-paper/75 border-b hairline" />
       <nav className="mx-auto flex h-16 max-w-[1240px] items-center justify-between px-6 lg:px-10">
         <Wordmark />
@@ -36,10 +35,10 @@ export function Nav() {
             <span>My agents</span>
           </a>
           <a
-            href="#docs"
+            href="/agents/connect"
             className="hidden sm:inline-flex items-center gap-1.5 rounded-full border hairline-strong px-3.5 py-2 text-[13px] text-ink hover:bg-paper-2 transition-colors"
           >
-            <span>Docs</span>
+            <span>Connect agent</span>
           </a>
           <a
             href="/onboarding"

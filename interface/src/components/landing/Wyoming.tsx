@@ -1,3 +1,4 @@
+import { Reveal } from "./Reveal";
 import { SectionLabel } from "./SectionLabel";
 
 const facts = [
@@ -12,7 +13,7 @@ export function Wyoming() {
     <section id="wyoming" className="relative bg-paper-2">
       <div className="mx-auto max-w-[1240px] px-6 py-24 lg:px-10 lg:py-32">
         <div className="grid grid-cols-1 gap-12 lg:grid-cols-[1fr_1fr] lg:gap-20">
-          <div className="flex flex-col">
+          <Reveal variant="left" className="flex flex-col">
             <SectionLabel index="05" label="Jurisdiction" />
             <h2 className="mt-4 text-balance text-[34px] font-medium leading-[1.05] tracking-[-0.02em] sm:text-[42px] lg:text-[48px]">
               Why Wyoming.
@@ -25,25 +26,27 @@ export function Wyoming() {
             </p>
 
             <dl className="mt-10 grid grid-cols-2 gap-px overflow-hidden rounded-2xl border hairline-strong bg-line-strong">
-              {facts.map((f) => (
-                <div key={f.k} className="bg-paper px-5 py-5">
-                  <dt className="font-medium tabular-nums text-ink text-[22px] tracking-[-0.01em]">
-                    {f.k}
-                  </dt>
-                  <dd className="mt-1 text-[12.5px] leading-[1.45] text-muted">
-                    {f.v}
-                  </dd>
-                </div>
+              {facts.map((f, i) => (
+                <Reveal key={f.k} delay={i * 80} variant="pop" duration={560}>
+                  <div className="bg-paper px-5 py-5 transition-transform duration-300 hover:scale-[1.02]">
+                    <dt className="font-medium tabular-nums text-ink text-[22px] tracking-[-0.01em]">
+                      {f.k}
+                    </dt>
+                    <dd className="mt-1 text-[12.5px] leading-[1.45] text-muted">
+                      {f.v}
+                    </dd>
+                  </div>
+                </Reveal>
               ))}
             </dl>
-          </div>
+          </Reveal>
 
-          <figure className="relative flex flex-col justify-center">
+          <Reveal variant="right" delay={140} duration={760} className="relative flex flex-col justify-center">
             <div
               aria-hidden
               className="pointer-events-none absolute -inset-6 -z-10 rounded-[28px] bg-gradient-to-br from-accent/10 via-transparent to-highlight/15 blur-2xl"
             />
-            <div className="relative rounded-3xl border hairline-strong bg-paper p-8 lg:p-12">
+            <div className="relative rounded-3xl border hairline-strong bg-paper p-8 transition-transform duration-500 hover:scale-[1.01] lg:p-12">
               <svg
                 aria-hidden
                 viewBox="0 0 60 48"
@@ -61,19 +64,19 @@ export function Wyoming() {
 
               <figcaption className="mt-10 flex items-center gap-4 border-t hairline pt-6">
                 <div className="flex h-10 w-10 items-center justify-center rounded-full bg-ink text-paper">
-                  <span className="font-serif text-[15px]">N</span>
+                  <span className="font-serif text-[15px]">W</span>
                 </div>
                 <div>
                   <div className="text-[14px] font-medium text-ink">
-                    Lena Whitfield
+                    Wyoming DAO LLC Act
                   </div>
                   <div className="text-[12.5px] text-muted">
-                    Co-founder · Novi Corpus
+                    W.S. 17-31-101 et seq. · 2021
                   </div>
                 </div>
               </figcaption>
             </div>
-          </figure>
+          </Reveal>
         </div>
       </div>
     </section>

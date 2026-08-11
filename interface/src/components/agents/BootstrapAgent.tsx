@@ -1,11 +1,10 @@
 "use client";
 
-import * as React from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { bootstrapConnection, getPasskeyChallenge, storePasskey } from "@/lib/api/client";
+import { useBootstrapConnectionMutation, usePasskeyChallengeMutation, useStorePasskeyMutation } from "@/lib/api/hooks";
 import { createGuardianPasskey } from "@/lib/api/passkey";
 import type { BootstrapPackage, Capability } from "@/lib/api/types";
-import { useAuth } from "@/components/onboarding/AuthProvider";
 import { Button, Callout, Card, StepHeader } from "@/components/onboarding/primitives";
 import { CapabilitySelector } from "./CapabilitySelector";
 import { ConnectionSnippet } from "./ConnectionSnippet";
@@ -14,8 +13,8 @@ import { TENANT_CAPABILITIES, TENANT_DEFAULT_CAPABILITY } from "./capabilityCopy
 type Phase = "passkey" | "capability" | "confirm" | "generate";
 
 function LinkCodeBox({ code }: { code: string }) {
-  const [remaining, setRemaining] = React.useState(15 * 60);
-  React.useEffect(() => {
+  const [remaining, setRemaining] = useState(15 * 60);
+  useEffect(() => {
     const end = Date.now() + 15 * 60_000;
     const h = setInterval(() => setRemaining(Math.max(0, Math.round((end - Date.now()) / 1000))), 1000);
     return () => clearInterval(h);
@@ -34,13 +33,15 @@ function LinkCodeBox({ code }: { code: string }) {
 }
 
 export function BootstrapAgent() {
-  const { ensureSession } = useAuth();
-  const [phase, setPhase] = React.useState<Phase>("passkey");
-  const [passkeyId, setPasskeyId] = React.useState<string | null>(null);
-  const [capability, setCapability] = React.useState<Capability>(TENANT_DEFAULT_CAPABILITY);
-  const [pkg, setPkg] = React.useState<BootstrapPackage | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const passkeyChallenge = usePasskeyChallengeMutation();
+  const storePasskey = useStorePasskeyMutation();
+  const bootstrapConnection = useBootstrapConnectionMutation();
+  const [phase, setPhase] = useState<Phase>("passkey");
+  const [passkeyId, setPasskeyId] = useState<string | null>(null);
+  const [capability, setCapability] = useState<Capability>(TENANT_DEFAULT_CAPABILITY);
+  const [pkg, setPkg] = useState<BootstrapPackage | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const webauthnUnavailable =
     typeof window !== "undefined" && typeof window.PublicKeyCredential === "undefined";
@@ -49,10 +50,9 @@ export function BootstrapAgent() {
     setBusy(true);
     setError(null);
     try {
-      const auth = await ensureSession();
-      const { challenge, rpId } = await getPasskeyChallenge(auth.token);
+      const { challenge, rpId } = await passkeyChallenge.mutateAsync();
       const passkey = await createGuardianPasskey(challenge, rpId);
-      const { id } = await storePasskey(auth.token, passkey);
+      const { id } = await storePasskey.mutateAsync(passkey);
       setPasskeyId(id);
       setPhase("capability");
     } catch (e) {
@@ -69,8 +69,12 @@ export function BootstrapAgent() {
     setBusy(true);
     setError(null);
     try {
-      const auth = await ensureSession(); // re-check: guards a stale token across the multi-step flow
-      setPkg(await bootstrapConnection(auth.token, passkeyId, capability));
+      setPkg(
+        await bootstrapConnection.mutateAsync({
+          passkeyId,
+          capability,
+        }),
+      );
       setPhase("generate");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to generate connection.");

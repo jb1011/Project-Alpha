@@ -14,7 +14,7 @@ import {
   cx,
 } from "../primitives";
 import { useAuth } from "../AuthProvider";
-import { getPasskeyChallenge } from "@/lib/api/client";
+import { usePasskeyChallengeMutation } from "@/lib/api/hooks";
 import { createGuardianPasskey } from "@/lib/api/passkey";
 import type { GuardianPasskey } from "@/lib/api/types";
 import { shortAddress } from "../types";
@@ -40,6 +40,7 @@ export function WelcomeStep({
     session,
     ensureSession,
   } = useAuth();
+  const passkeyChallenge = usePasskeyChallengeMutation();
 
   const [walletOverride, setWalletOverride] = useState<"connecting" | "error" | null>(
     null,
@@ -96,8 +97,8 @@ export function WelcomeStep({
     setPasskeyOverride("pending");
     setError(null);
     try {
-      const auth = await ensureSession();
-      const { challenge } = await getPasskeyChallenge(auth.token);
+      await ensureSession();
+      const { challenge } = await passkeyChallenge.mutateAsync();
       const rpId = window.location.hostname;
       const passkey = await createGuardianPasskey(challenge, rpId);
       onPasskey(passkey);
@@ -118,7 +119,7 @@ export function WelcomeStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 00"
+        eyebrow="Screen 1"
         title={<>Connect your wallet and register as guardian.</>}
         intro="Sign in with your wallet — it becomes the agent's on-chain guardian. Then create a passkey: it registers you as the guardian, the agent's durable human anchor."
       />

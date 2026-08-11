@@ -1,45 +1,25 @@
 "use client";
 
-import * as React from "react";
-import { listPasskeys, revokePasskey } from "@/lib/api/client";
-import type { PasskeyView } from "@/lib/api/types";
-import { useAuth } from "@/components/onboarding/AuthProvider";
+import { useMemo, useState } from "react";
+import { usePasskeysQuery, useRevokePasskeyMutation } from "@/lib/api/hooks";
 import { RevokeButton } from "@/components/agents/connectionRow";
 
 export function GuardianPasskeysPanel({ hideHeader = false }: { hideHeader?: boolean } = {}) {
-  const { ensureSession } = useAuth();
-  const [passkeys, setPasskeys] = React.useState<PasskeyView[]>([]);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const [reloadKey, setReloadKey] = React.useState(0);
+  const { data: allPasskeys = [] } = usePasskeysQuery();
+  const revokePasskey = useRevokePasskeyMutation();
+  const [error, setError] = useState<string | null>(null);
 
-  React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const auth = await ensureSession();
-        const list = await listPasskeys(auth.token);
-        if (!cancelled) setPasskeys(list.filter((p) => !p.revokedAt));
-      } catch {
-        /* keep the prior list on a transient failure */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [ensureSession, reloadKey]);
+  const passkeys = useMemo(
+    () => allPasskeys.filter((p) => !p.revokedAt),
+    [allPasskeys],
+  );
 
   async function onRevoke(id: string) {
-    setBusy(true);
     setError(null);
     try {
-      const auth = await ensureSession();
-      await revokePasskey(auth.token, id);
-      setReloadKey((k) => k + 1); // re-trigger the load effect
+      await revokePasskey.mutateAsync(id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to revoke.");
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -62,7 +42,7 @@ export function GuardianPasskeysPanel({ hideHeader = false }: { hideHeader?: boo
                 <div className="font-mono text-[10.5px] text-muted-2">{p.id.slice(0, 8)}…</div>
               </div>
               <RevokeButton
-                disabled={busy}
+                disabled={revokePasskey.isPending}
                 confirmMessage="Revoking stops this passkey from creating new agents. Existing agents are unaffected. Continue?"
                 onRevoke={() => void onRevoke(p.id)}
               />

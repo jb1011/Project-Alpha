@@ -1,49 +1,13 @@
 "use client";
 
-import * as React from "react";
-import { getEntityReputation, listEntityJobs } from "@/lib/api/client";
-import type { JobView, ReputationView } from "@/lib/api/types";
+import { useJobsReputationQueries } from "@/lib/api/hooks";
+import type { JobView } from "@/lib/api/types";
 import { txUrl } from "@/lib/chain";
-import { useAuth } from "@/components/onboarding/AuthProvider";
 import { Card, cx, ExternalIcon } from "@/components/onboarding/primitives";
 import { formatUsdc } from "@/components/onboarding/types";
 
 export function JobsReputationCard({ entityId }: { entityId: string }) {
-  const { ensureSession } = useAuth();
-  const [reputation, setReputation] = React.useState<ReputationView | null>(null);
-  const [jobs, setJobs] = React.useState<JobView[]>([]);
-
-  const ensureSessionRef = React.useRef(ensureSession);
-  React.useEffect(() => {
-    ensureSessionRef.current = ensureSession;
-  }, [ensureSession]);
-
-  const refresh = React.useCallback(async () => {
-    try {
-      const auth = await ensureSessionRef.current();
-      const [rep, jobList] = await Promise.all([
-        getEntityReputation(auth.token, entityId),
-        listEntityJobs(auth.token, entityId),
-      ]);
-      setReputation(rep.reputation);
-      setJobs(jobList);
-    } catch {
-      /* keep last good value */
-    }
-  }, [entityId]);
-
-  React.useEffect(() => {
-    let cancelled = false;
-    const tick = () => {
-      if (!cancelled) void refresh();
-    };
-    tick();
-    const h = setInterval(tick, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(h);
-    };
-  }, [refresh]);
+  const { reputation, jobs } = useJobsReputationQueries(entityId);
 
   return (
     <Card className="overflow-hidden">
@@ -52,21 +16,21 @@ export function JobsReputationCard({ entityId }: { entityId: string }) {
         <span className="text-[11.5px] text-muted-2">ERC-8183 track record</span>
       </div>
 
-      {reputation && (
+      {reputation.data && (
         <div className="grid grid-cols-3 gap-px border-b hairline bg-line">
-          <RepStat label="Total jobs" value={String(reputation.totalJobs)} />
-          <RepStat label="Completed" value={String(reputation.completed)} />
-          <RepStat label="Reputed" value={String(reputation.reputed)} />
+          <RepStat label="Total jobs" value={String(reputation.data.totalJobs)} />
+          <RepStat label="Completed" value={String(reputation.data.completed)} />
+          <RepStat label="Reputed" value={String(reputation.data.reputed)} />
         </div>
       )}
 
-      {jobs.length === 0 ? (
+      {!jobs.data || jobs.data.length === 0 ? (
         <div className="px-5 py-10 text-center text-[12.5px] text-muted-2">
           No on-chain jobs yet — jobs are created outside the dashboard.
         </div>
       ) : (
         <ul>
-          {jobs.map((job) => (
+          {jobs.data.map((job) => (
             <JobRow key={job.jobKey} job={job} />
           ))}
         </ul>

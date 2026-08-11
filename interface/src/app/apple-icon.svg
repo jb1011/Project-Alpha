@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" fill="none" role="img" aria-label="Novi Corpus">
+  <rect x="4" y="4" width="172" height="172" rx="32" fill="#111111" stroke="rgba(255,255,255,0.14)" stroke-width="8"/>
+  <text
+    x="90"
+    y="122"
+    text-anchor="middle"
+    font-family="Georgia, 'Times New Roman', Times, serif"
+    font-size="108"
+    fill="#EDE8DE"
+  >N</text>
+</svg>

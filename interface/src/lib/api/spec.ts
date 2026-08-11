@@ -1,5 +1,4 @@
 import type { AgentConfig } from "@/components/onboarding/types";
-import { MANAGER_ADDRESS } from "./config";
 import type { AgentSpec } from "./types";
 
 function toUsdcAmount(value: string): string {
@@ -17,6 +16,11 @@ function toAmendmentDelay(hours: string): string {
   return `${h}h`;
 }
 
+function toSpendingPeriod(hours: string): string {
+  const h = Math.max(1, Number(hours) || 24);
+  return `${h}h`;
+}
+
 /** Map the wizard form into the backend AgentSpec shape. */
 export function configToAgentSpec(
   config: AgentConfig,
@@ -30,13 +34,14 @@ export function configToAgentSpec(
     name: config.name.trim(),
     jurisdiction: "Wyoming-DAO-LLC",
     roles: {
-      manager: MANAGER_ADDRESS,
+      // Backend force-overwrites manager/guardian at onboard time.
+      manager: guardianAddress,
       guardian: guardianAddress,
     },
     treasury: {
       payoutAddress: payout,
       spendingCapUsdc: toUsdcAmount(config.dailyCap || config.perTxCap),
-      spendingPeriod: "24h",
+      spendingPeriod: toSpendingPeriod(config.spendingPeriodHours),
       allowlistEnabled: config.allowlist.length > 0,
       perTxCapUsdc: toUsdcAmount(config.perTxCap),
     },

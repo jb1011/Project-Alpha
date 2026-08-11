@@ -1,9 +1,7 @@
 "use client";
 
-import * as React from "react";
-import { listApiKeys, revokeApiKey } from "@/lib/api/client";
-import type { ApiKeyView } from "@/lib/api/types";
-import { useAuth } from "@/components/onboarding/AuthProvider";
+import { useMemo, useState } from "react";
+import { useApiKeysQuery, useRevokeApiKeyMutation } from "@/lib/api/hooks";
 import { CapabilityBadge, RevokeButton } from "@/components/agents/connectionRow";
 
 type ConnectionFilter = { mode: "entity"; entityId: string } | { mode: "tenant" };
@@ -16,46 +14,27 @@ export function ActiveConnectionsPanel({
   /** The tenant record supplies its own section header. */
   hideHeader?: boolean;
 }) {
-  const { ensureSession } = useAuth();
-  const [keys, setKeys] = React.useState<ApiKeyView[]>([]);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const [reloadKey, setReloadKey] = React.useState(0);
+  const { data: allKeys = [] } = useApiKeysQuery();
+  const revokeKey = useRevokeApiKeyMutation();
+  const [error, setError] = useState<string | null>(null);
 
-  // Stabilize effect deps (filter is a fresh object each render).
   const mode = filter.mode;
   const entityId = filter.mode === "entity" ? filter.entityId : null;
 
-  React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const auth = await ensureSession();
-        const all = await listApiKeys(auth.token);
-        const visible = all.filter(
-          (k) => !k.revokedAt && (mode === "tenant" ? k.entityId === null : k.entityId === entityId),
-        );
-        if (!cancelled) setKeys(visible);
-      } catch {
-        /* keep the prior list on a transient failure */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [ensureSession, mode, entityId, reloadKey]);
+  const keys = useMemo(
+    () =>
+      allKeys.filter(
+        (k) => !k.revokedAt && (mode === "tenant" ? k.entityId === null : k.entityId === entityId),
+      ),
+    [allKeys, mode, entityId],
+  );
 
   async function onRevoke(id: string) {
-    setBusy(true);
     setError(null);
     try {
-      const auth = await ensureSession();
-      await revokeApiKey(auth.token, id);
-      setReloadKey((k) => k + 1);
+      await revokeKey.mutateAsync(id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to revoke.");
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -79,7 +58,7 @@ export function ActiveConnectionsPanel({
                 <span className="shrink-0 font-mono text-[10.5px] text-muted-2">{k.id.slice(0, 8)}…</span>
               </div>
               <RevokeButton
-                disabled={busy}
+                disabled={revokeKey.isPending}
                 confirmMessage="Revoking disconnects any agent using this connection. Continue?"
                 onRevoke={() => void onRevoke(k.id)}
               />
