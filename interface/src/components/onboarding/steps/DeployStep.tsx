@@ -190,7 +190,7 @@ export function DeployStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 05"
+        eyebrow="Screen 6"
         title="Deploying on-chain"
         intro="The backend is provisioning keys, registering identity, deploying contracts, and binding the agent wallet. This usually takes a few minutes."
       />

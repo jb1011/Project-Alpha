@@ -26,20 +26,13 @@ export function Wordmark({ className = "", tone = "ink" }: Props) {
           }`}
         />
       </span>
-      <span className="flex flex-col leading-none">
+      <span className="flex flex-col gap-1">
         <span
-          className={`text-[15px] font-medium tracking-tight ${
+          className={`text-[15px] font-medium leading-tight tracking-tight ${
             ink ? "text-ink" : "text-ink"
           }`}
         >
           Novi Corpus
-        </span>
-        <span
-          className={`text-[10px] uppercase tracking-[0.18em] ${
-            ink ? "text-muted-2" : "text-muted-dark-2"
-          }`}
-        >
-          autonomous entities
         </span>
       </span>
     </a>

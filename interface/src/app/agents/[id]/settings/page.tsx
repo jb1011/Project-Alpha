@@ -15,7 +15,7 @@ export default function AgentSettingsPage({
 
   return (
     <RequireAuth>
-      <AgentShell title="Settings">
+      <AgentShell>
         <AgentSettings entityId={entityId} />
       </AgentShell>
     </RequireAuth>

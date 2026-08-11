@@ -61,14 +61,14 @@ export function Wyoming() {
 
               <figcaption className="mt-10 flex items-center gap-4 border-t hairline pt-6">
                 <div className="flex h-10 w-10 items-center justify-center rounded-full bg-ink text-paper">
-                  <span className="font-serif text-[15px]">N</span>
+                  <span className="font-serif text-[15px]">W</span>
                 </div>
                 <div>
                   <div className="text-[14px] font-medium text-ink">
-                    Lena Whitfield
+                    Wyoming DAO LLC Act
                   </div>
                   <div className="text-[12.5px] text-muted">
-                    Co-founder · Novi Corpus
+                    W.S. 17-31-101 et seq. · 2021
                   </div>
                 </div>
               </figcaption>

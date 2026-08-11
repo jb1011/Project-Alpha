@@ -1,7 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { IDKitRequestWidget, identityCheck, proofOfHuman } from "@worldcoin/idkit";
+import {
+  IDKitRequestWidget,
+  identityCheck,
+  proofOfHuman,
+} from "@worldcoin/idkit";
 import {
   worldIdAttestContext,
   worldIdAttestVerify,
@@ -9,7 +13,11 @@ import {
   worldIdMe,
   worldIdVerify,
 } from "@/lib/api/client";
-import type { WorldIdAttestContext, WorldIdContext, WorldIdMe } from "@/lib/api/types";
+import type {
+  WorldIdAttestContext,
+  WorldIdContext,
+  WorldIdMe,
+} from "@/lib/api/types";
 import { AgentShell } from "@/components/agents/AgentShell";
 import { RequireAuth } from "@/components/agents/RequireAuth";
 import { GuardianRecord } from "@/components/guardian/GuardianRecord";
@@ -31,7 +39,9 @@ function GuardianVerification() {
   const [busy, setBusy] = React.useState(false);
   const [struck, setStruck] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const [attestCtx, setAttestCtx] = React.useState<WorldIdAttestContext | null>(null);
+  const [attestCtx, setAttestCtx] = React.useState<WorldIdAttestContext | null>(
+    null,
+  );
   const [attestOpen, setAttestOpen] = React.useState(false);
   const [attestBusy, setAttestBusy] = React.useState(false);
 
@@ -103,7 +113,7 @@ function GuardianVerification() {
   }, [struck]);
 
   return (
-    <AgentShell title="Guardian" subtitle="The legally accountable human behind your agents.">
+    <AgentShell>
       <GuardianRecord
         me={me}
         address={address}
@@ -136,7 +146,10 @@ function GuardianVerification() {
             void refresh();
           }}
           onError={(e: unknown) => {
-            const code = typeof e === "string" ? e : ((e as { code?: string })?.code ?? String(e));
+            const code =
+              typeof e === "string"
+                ? e
+                : ((e as { code?: string })?.code ?? String(e));
             setOpen(false);
             setError(`world:${code}`);
           }}
@@ -167,7 +180,10 @@ function GuardianVerification() {
             void refresh();
           }}
           onError={(e: unknown) => {
-            const code = typeof e === "string" ? e : ((e as { code?: string })?.code ?? String(e));
+            const code =
+              typeof e === "string"
+                ? e
+                : ((e as { code?: string })?.code ?? String(e));
             setAttestOpen(false);
             setError(`world:${code}`);
           }}

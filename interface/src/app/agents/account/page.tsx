@@ -14,7 +14,7 @@ import type { WorldIdMe } from "@/lib/api/types";
 export default function AccountPage() {
   return (
     <RequireAuth>
-      <AgentShell title="Account" subtitle="The tenant behind your agents.">
+      <AgentShell>
         <AccountBody />
       </AgentShell>
     </RequireAuth>
@@ -59,7 +59,9 @@ function AccountBody() {
       ensName={ensName}
       me={me}
       entityCount={entityCount}
-      connections={<ActiveConnectionsPanel filter={{ mode: "tenant" }} hideHeader />}
+      connections={
+        <ActiveConnectionsPanel filter={{ mode: "tenant" }} hideHeader />
+      }
       passkeys={<GuardianPasskeysPanel hideHeader />}
     />
   );

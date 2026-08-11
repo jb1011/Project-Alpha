@@ -1,23 +1,23 @@
-const stats = [
+const capabilities = [
   {
-    value: "842",
-    label: "Agents live",
-    sub: "On Arc testnet",
+    value: "7",
+    label: "Onboarding steps",
+    sub: "Passkey to live agent",
   },
   {
-    value: "$18.4M",
-    label: "Treasury volume",
-    sub: "USDC on Arc",
+    value: "2",
+    label: "Custody paths",
+    sub: "Novi-managed or passkey-rooted",
   },
   {
-    value: "12,400+",
-    label: "Policy actions",
-    sub: "Enforced on-chain",
+    value: "MCP",
+    label: "Agent connect",
+    sub: "Claude, Cursor, and more",
   },
   {
-    value: "~8 min",
-    label: "Avg setup",
-    sub: "Passkey to funded",
+    value: "World ID",
+    label: "Proof of personhood",
+    sub: "One human per account",
   },
 ];
 
@@ -26,7 +26,7 @@ export function Stats() {
     <section className="relative border-y hairline bg-paper-2">
       <div className="mx-auto max-w-[1240px] px-6 lg:px-10">
         <div className="grid grid-cols-2 divide-x divide-y hairline md:grid-cols-4 md:divide-y-0">
-          {stats.map((s, i) => (
+          {capabilities.map((s, i) => (
             <div
               key={s.label}
               className={`group relative px-6 py-8 md:px-8 md:py-10 ${

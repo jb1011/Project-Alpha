@@ -10,16 +10,22 @@ type Feature = {
 
 const features: Feature[] = [
   {
-    tag: "Security",
-    title: "Passkey vault",
-    body: "A Turnkey sub-organization holds your agent's keys. Your passkey is the vault root — it never leaves your device, and we can never move your keys or funds.",
+    tag: "Custody",
+    title: "Key custody, your choice",
+    body: "Novi-managed (Circle MPC smart account, gasless) is the recommended default. Or choose passkey-rooted keys in a Turnkey vault you control. Either way, your guardian wallet keeps every on-chain override.",
     icon: <IconPasskey />,
   },
   {
     tag: "Policy",
     title: "Spending rules",
-    body: "Per-transaction caps, rolling daily limits, recipient allowlists, and timelocks. Rules your agent can never exceed on its own — enforced on-chain, not in software.",
+    body: "Per-transaction caps, rolling period limits, recipient allowlists, and timelocks. The on-chain period cap is the hard backstop; software gates re-check fresh on-chain state before every x402 payment.",
     icon: <IconPolicy />,
+  },
+  {
+    tag: "Identity",
+    title: "World ID accountability",
+    body: "Wyoming DAO LLCs need a natural person. World ID proves one unique human per account without storing name, document, or face. AgentBook on World Chain powers human-backed payment trust.",
+    icon: <IconWorld />,
   },
   {
     tag: "Legal",
@@ -30,22 +36,44 @@ const features: Feature[] = [
   {
     tag: "Chain",
     title: "Arc deployment",
-    body: "Agent identity, treasury, and governance deploy on Arc in one resumable saga. USDC treasury, verifiable on-chain identity, guardian recorded at genesis.",
+    body: "Agent identity, treasury, and governance deploy on Arc in one resumable saga. ENS names, ERC-8183 jobs, and x402 payments are live on testnet today.",
     icon: <IconArc />,
   },
   {
     tag: "Guardian",
     title: "Human safety brake",
-    body: "Pause the agent, veto actions held in timelock, or recover the full treasury back to your wallet. You are the legally responsible guardian member.",
+    body: "Pause the agent, veto actions held in timelock, or emergency withdraw to the payout address. You are the legally responsible guardian member.",
     icon: <IconGuardian />,
   },
   {
     tag: "Agents",
-    title: "MCP self-config",
-    body: "Point your AI agent at our MCP server. It drafts its own policy in conversation — validated in real time — and you approve before anything goes on-chain.",
+    title: "MCP agent connect",
+    body: "Connect Claude Code, Cursor, or any of 11 MCP clients via /agents/connect. Bootstrap with a link code, claim_connection, and onboard_agent — scoped keys with a capability ladder from read to provision.",
     icon: <IconMcp />,
   },
 ];
+
+function FeatureCard({ feature }: { feature: Feature }) {
+  return (
+    <article className="group relative flex flex-col gap-6 bg-paper p-7 transition-colors hover:bg-paper-2 lg:p-8">
+      <div className="flex items-start justify-between">
+        <div className="inline-flex h-11 w-11 items-center justify-center rounded-lg border hairline-strong bg-paper-2 text-ink transition-all group-hover:bg-ink group-hover:text-paper group-hover:-translate-y-0.5 group-hover:border-transparent">
+          {feature.icon}
+        </div>
+        <span className="font-mono text-[10.5px] uppercase tracking-[0.18em] text-muted-2">
+          {feature.tag}
+        </span>
+      </div>
+
+      <div>
+        <h3 className="text-[19px] font-medium tracking-[-0.01em] text-ink">
+          {feature.title}
+        </h3>
+        <p className="mt-2 text-[14px] leading-[1.55] text-muted">{feature.body}</p>
+      </div>
+    </article>
+  );
+}
 
 export function Features() {
   return (
@@ -59,47 +87,39 @@ export function Features() {
             </h2>
           </div>
           <p className="max-w-md text-[14.5px] leading-[1.55] text-muted">
-            Passkey custody, spending policy, legal agreement, on-chain
-            deployment, and guardian controls — the full stack for an autonomous
-            agent that holds real money.
+            Custody choice, World ID verification, spending policy, legal agreement,
+            on-chain deployment, MCP connect, and guardian controls — the full stack
+            for an autonomous agent that holds real money.
           </p>
         </div>
 
-        <div className="mt-14 grid grid-cols-1 gap-px overflow-hidden rounded-2xl border hairline-strong bg-line-strong sm:grid-cols-2 lg:grid-cols-3">
-          {features.map((f) => (
-            <article
-              key={f.title}
-              className="group relative flex flex-col gap-6 bg-paper p-7 transition-colors hover:bg-paper-2 lg:p-8"
-            >
-              <div className="flex items-start justify-between">
-                <div className="inline-flex h-11 w-11 items-center justify-center rounded-lg border hairline-strong bg-paper-2 text-ink transition-all group-hover:bg-ink group-hover:text-paper group-hover:-translate-y-0.5 group-hover:border-transparent">
-                  {f.icon}
-                </div>
-                <span className="font-mono text-[10.5px] uppercase tracking-[0.18em] text-muted-2">
-                  {f.tag}
-                </span>
-              </div>
+        <div className="mt-14 overflow-hidden rounded-2xl border hairline-strong bg-line-strong">
+          <div className="grid grid-cols-1 gap-px sm:grid-cols-2 lg:grid-cols-3">
+            {features.slice(0, 6).map((f) => (
+              <FeatureCard key={f.title} feature={f} />
+            ))}
+          </div>
 
-              <div>
-                <h3 className="text-[19px] font-medium tracking-[-0.01em] text-ink">
-                  {f.title}
-                </h3>
-                <p className="mt-2 text-[14px] leading-[1.55] text-muted">
-                  {f.body}
-                </p>
+          <div className="grid grid-cols-1 gap-px border-t hairline-strong lg:grid-cols-[1fr_auto]">
+            <FeatureCard feature={features[6]!} />
+            <div className="flex flex-col justify-center bg-paper-2 px-7 py-8 lg:px-8 lg:py-10">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-muted-2">
+                Connect
               </div>
-
-              <div className="mt-auto flex items-center gap-1.5 text-[12.5px] text-ink/70 transition-colors group-hover:text-ink">
-                <span>Learn more</span>
-                <span
-                  aria-hidden
-                  className="transition-transform group-hover:translate-x-0.5"
-                >
-                  →
-                </span>
-              </div>
-            </article>
-          ))}
+              <p className="mt-2 max-w-xs text-[15px] font-medium leading-snug text-ink">
+                Hook up Claude, Cursor, or any MCP client.
+              </p>
+              <p className="mt-2 max-w-xs text-[13px] leading-[1.55] text-muted">
+                Bootstrap a link code and let your agent onboard itself.
+              </p>
+              <a
+                href="/agents/connect"
+                className="mt-5 inline-flex items-center gap-1.5 text-[13px] font-medium text-accent-soft transition-colors hover:text-ink"
+              >
+                Connect your agent <span aria-hidden>→</span>
+              </a>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -146,6 +166,19 @@ function IconPolicy() {
         stroke="currentColor"
         strokeWidth="1.4"
         strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function IconWorld() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth="1.4" />
+      <path
+        d="M4 12h16M12 4c2.5 3 2.5 13 0 16M12 4c-2.5 3-2.5 13 0 16"
+        stroke="currentColor"
+        strokeWidth="1.2"
       />
     </svg>
   );

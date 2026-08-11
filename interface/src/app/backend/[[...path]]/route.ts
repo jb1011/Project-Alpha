@@ -2,7 +2,13 @@ import { type NextRequest, NextResponse } from "next/server";
 
 function apiTarget(): string {
   const configured = process.env.API_PROXY_TARGET?.trim();
-  return configured || "http://159.223.137.183:8789";
+  if (configured) return configured;
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "API_PROXY_TARGET is required in production — set it to your backend HTTPS URL.",
+    );
+  }
+  return "http://localhost:8789";
 }
 
 function backendUrl(path: string[] | undefined, search: string): string {

@@ -118,7 +118,7 @@ export function WelcomeStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 00"
+        eyebrow="Screen 1"
         title={<>Connect your wallet and register as guardian.</>}
         intro="Sign in with your wallet — it becomes the agent's on-chain guardian. Then create a passkey: it registers you as the guardian, the agent's durable human anchor."
       />

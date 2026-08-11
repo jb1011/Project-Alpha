@@ -27,7 +27,7 @@ export type AgentConfig = {
   purpose: string;
   configMode: ConfigMode;
   /** Operator-key custody: "circle" = Novi-managed smart account (gasless), "turnkey" =
-   *  guardian-passkey-rooted key vault. Platform default stays turnkey until Tier-0 P4. */
+   *  guardian-passkey-rooted key vault. Platform default is circle since Tier-0 P4. */
   custody: Custody;
   /** Per-transaction spend ceiling, in USDC. Kept as a string for input binding. */
   perTxCap: string;
@@ -36,6 +36,8 @@ export type AgentConfig = {
   allowlist: AllowlistEntry[];
   /** Hours an above-cap or sensitive action is held before it can execute. */
   timelockHours: string;
+  /** Rolling spending period length in hours (maps to treasury spendingPeriod). */
+  spendingPeriodHours: string;
 };
 
 export type OnboardingSession = {
@@ -53,14 +55,14 @@ export const emptySession = (): OnboardingSession => ({
 });
 
 export const PHASES: { id: Phase; n: string; label: string }[] = [
-  { id: "welcome", n: "00", label: "Wallet & passkey" },
-  { id: "guardian", n: "01", label: "Accountable human" },
-  { id: "custody", n: "02", label: "Key custody" },
-  { id: "configure", n: "03", label: "Define agent" },
-  { id: "agreement", n: "04", label: "Operating agreement" },
-  { id: "deploy", n: "05", label: "Deploy on-chain" },
-  { id: "fund", n: "06", label: "Fund treasury" },
-  { id: "dashboard", n: "07", label: "Live" },
+  { id: "welcome", n: "1", label: "Wallet & passkey" },
+  { id: "guardian", n: "2", label: "Accountable human" },
+  { id: "custody", n: "3", label: "Key custody" },
+  { id: "configure", n: "4", label: "Define agent" },
+  { id: "agreement", n: "5", label: "Operating agreement" },
+  { id: "deploy", n: "6", label: "Deploy on-chain" },
+  { id: "fund", n: "7", label: "Fund treasury" },
+  { id: "dashboard", n: "8", label: "Live" },
 ];
 
 export const emptyConfig = (): AgentConfig => ({
@@ -76,6 +78,7 @@ export const emptyConfig = (): AgentConfig => ({
   dailyCap: "",
   allowlist: [],
   timelockHours: "24",
+  spendingPeriodHours: "24",
 });
 
 export type FieldErrors = Partial<Record<keyof AgentConfig | "allowlistRow", string>>;

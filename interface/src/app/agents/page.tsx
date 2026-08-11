@@ -43,7 +43,7 @@ function AgentsList() {
   }, [ensureSession]);
 
   return (
-    <AgentShell title="My agents" subtitle="All agents for your guardian wallet">
+    <AgentShell>
       {entities === null && !error ? (
         <LoadingState label="Loading agents…" />
       ) : error ? (
@@ -52,7 +52,8 @@ function AgentsList() {
         <Card className="p-10 text-center">
           <h2 className="text-[20px] font-medium text-ink">No agents yet</h2>
           <p className="mt-2 text-[13px] text-muted">
-            Create your first autonomous agent — passkey, policy, treasury, and governance in one flow.
+            Create your first autonomous agent — passkey, policy, treasury, and
+            governance in one flow.
           </p>
           <Link
             href="/onboarding"
@@ -78,10 +79,10 @@ function AgentsList() {
             </Link>
           </div>
           <ul className="flex flex-col gap-3">
-          {entities.map((e) => (
-            <AgentRow key={e.id} entity={e} />
-          ))}
-        </ul>
+            {entities.map((e) => (
+              <AgentRow key={e.id} entity={e} />
+            ))}
+          </ul>
         </>
       )}
     </AgentShell>
@@ -104,7 +105,9 @@ function AgentRow({ entity }: { entity: EntityView }) {
       >
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
-            <div className="text-[15px] font-medium text-ink">{entity.name}</div>
+            <div className="text-[15px] font-medium text-ink">
+              {entity.name}
+            </div>
             <div className="mt-1 font-mono text-[11.5px] text-muted-2">
               {entity.treasury ? (
                 <a

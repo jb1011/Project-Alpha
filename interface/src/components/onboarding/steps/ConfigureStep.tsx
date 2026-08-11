@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import {
   AgentConfig,
   AllowlistEntry,
@@ -24,6 +25,7 @@ import {
   Textarea,
   cx,
 } from "../primitives";
+import { fetchAgentSchema } from "@/lib/api/client";
 
 type Props = {
   config: AgentConfig;
@@ -32,18 +34,8 @@ type Props = {
   onComplete: () => void;
 };
 
-const SAMPLE_PROPOSAL: Partial<AgentConfig> = {
-  name: "Atlas Treasury Bot",
-  purpose:
-    "Pays recurring infra invoices and rebalances the operating float across approved vendors. Read-only on everything else.",
-  perTxCap: "500",
-  dailyCap: "2500",
-  timelockHours: "12",
-  allowlist: [
-    { id: "s1", label: "Infra · Render", address: "0x4f2a9c1b7e5d3a8f0c6b2d4e1a9f7c3b5d8e0a2c" },
-    { id: "s2", label: "Counsel · escrow", address: "0x9b1d7e3c5a2f8d4b6c0e1a3f9d7b5c2e4a6f8b0d" },
-  ],
-};
+const MCP_URL =
+  process.env.NEXT_PUBLIC_MCP_URL ?? "https://project-alpha-pi.vercel.app/mcp";
 
 let allowlistSeq = 0;
 function newAllowlistEntry(): AllowlistEntry {
@@ -67,13 +59,10 @@ export function ConfigureStep({ config, onChange, onBack, onComplete }: Props) {
     onChange({ ...config, [key]: value });
   }
 
-  // Mode B is "connected" once the agent has produced a proposal (has a name).
-  const mcpConnected = config.configMode === "mcp" && config.name.trim().length > 0;
-
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 03"
+        eyebrow="Screen 4"
         title="Define your agent"
         intro="Set the identity and the rules — spending caps, allowed recipients, and timelocks. The result is a policy your agent can never exceed on its own."
       />
@@ -90,14 +79,7 @@ export function ConfigureStep({ config, onChange, onBack, onComplete }: Props) {
               onChange={onChange}
             />
           ) : (
-            <McpReview
-              config={config}
-              connected={mcpConnected}
-              onPropose={() =>
-                onChange({ ...config, ...SAMPLE_PROPOSAL, configMode: "mcp" })
-              }
-              onEditManually={() => setMode("manual")}
-            />
+            <McpConnectPanel onEditManually={() => setMode("manual")} />
           )}
         </div>
 
@@ -222,7 +204,7 @@ function ManualForm({
           <Field
             label="Daily cap"
             htmlFor="daily"
-            hint="USDC / rolling 24h"
+            hint="USDC / rolling period"
             error={errors.dailyCap}
           >
             <UsdcInput
@@ -363,115 +345,89 @@ function UsdcInput({
 
 /* ------------------------------------------------------------------ */
 
-function McpReview({
-  config,
-  connected,
-  onPropose,
-  onEditManually,
-}: {
-  config: AgentConfig;
-  connected: boolean;
-  onPropose: () => void;
-  onEditManually: () => void;
-}) {
-  if (!connected) {
-    return (
-      <Card className="p-6">
-        <SectionTitle n="B" title="Connect your agent" />
-        <p className="mt-3 max-w-lg text-[13px] leading-[1.6] text-muted">
-          Point your AI agent at our MCP server. It will draft its own policy in
-          conversation — and our server validates every rule in real time, so an
-          invalid proposal is corrected on the spot.
-        </p>
-
-        <div className="mt-5 rounded-xl border hairline bg-paper px-4 py-3 font-mono text-[12px] text-muted">
-          <div className="flex items-center justify-between">
-            <span className="text-muted-2">MCP endpoint</span>
-            <span className="text-accent-soft">connected · live validation</span>
-          </div>
-          <div className="mt-1.5 text-ink">
-            https://mcp.novicorpus.xyz/agent-policy
-          </div>
-        </div>
-
-        <div className="mt-6 flex flex-wrap items-center gap-3">
-          <Button onClick={onPropose}>Simulate agent proposal</Button>
-          <button
-            onClick={onEditManually}
-            className="text-[12.5px] text-muted underline-offset-2 hover:text-ink hover:underline"
-          >
-            Or fill it manually
-          </button>
-        </div>
-
-        <Callout tone="warn" className="mt-6" title="The human still approves">
-          Even in self-config mode, you must approve the final policy before it
-          goes on-chain — you are the legally responsible guardian.
-        </Callout>
-      </Card>
-    );
-  }
-
+function McpConnectPanel({ onEditManually }: { onEditManually: () => void }) {
   return (
     <Card className="p-6">
-      <div className="flex items-center justify-between">
-        <SectionTitle n="B" title="Your agent's proposal" />
-        <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-2.5 py-1 text-[11px] text-accent-soft">
-          <CheckIcon className="h-3 w-3" /> Schema-valid
-        </span>
-      </div>
-
-      <p className="mt-3 text-[13px] leading-[1.6] text-muted">
-        Here are the rules your agent defined. Review them in plain language —
-        approve as-is, or switch to the form to adjust anything.
+      <SectionTitle n="B" title="Connect your agent via MCP" />
+      <p className="mt-3 max-w-lg text-[13px] leading-[1.6] text-muted">
+        Use the live bootstrap flow to connect your MCP agent. It can draft a
+        policy in conversation, validated against the server schema. Copy the
+        proposal into the manual form when ready, or onboard entirely via MCP.
       </p>
 
-      <div className="mt-5 flex flex-col gap-3">
-        <ProposalRow label="Name" value={config.name} />
-        <ProposalRow label="Purpose" value={config.purpose} />
-        <ProposalRow
-          label="Per-transaction cap"
-          value={`${formatUsdc(config.perTxCap)} USDC`}
-        />
-        <ProposalRow label="Daily cap" value={`${formatUsdc(config.dailyCap)} USDC`} />
-        <ProposalRow label="Timelock" value={`${config.timelockHours || "0"} hours`} />
-        <ProposalRow
-          label="Allowed recipients"
-          value={
-            config.allowlist.length
-              ? config.allowlist.map((a) => a.label || shortAddress(a.address)).join(", ")
-              : "Any (within caps)"
-          }
-        />
+      <div className="mt-5 rounded-xl border hairline bg-paper px-4 py-3 font-mono text-[12px] text-muted">
+        <div className="flex items-center justify-between">
+          <span className="text-muted-2">MCP endpoint</span>
+          <span className="text-accent-soft">from server</span>
+        </div>
+        <div className="mt-1.5 break-all text-ink">{MCP_URL}</div>
       </div>
+
+      <ol className="mt-5 flex list-decimal flex-col gap-2 pl-5 text-[12.5px] leading-[1.55] text-muted">
+        <li>
+          Open{" "}
+          <Link href="/agents/connect" className="text-accent underline-offset-2 hover:underline">
+            Agent connect
+          </Link>{" "}
+          and generate a link code.
+        </li>
+        <li>
+          Have your agent call <code className="text-ink">claim_connection</code> with the link
+          code.
+        </li>
+        <li>
+          Ask it to call <code className="text-ink">onboard_agent</code> with your passkey ID and
+          policy spec.
+        </li>
+        <li>
+          Poll <code className="text-ink">get_entity</code> until status is bound, or enter the
+          agent&apos;s proposal in the manual form below.
+        </li>
+      </ol>
 
       <div className="mt-6 flex flex-wrap items-center gap-3">
-        <Button variant="ghost" onClick={onEditManually}>
-          Edit in form
-        </Button>
+        <Link href="/agents/connect">
+          <Button>Open agent connect</Button>
+        </Link>
         <button
-          onClick={onPropose}
+          onClick={onEditManually}
           className="text-[12.5px] text-muted underline-offset-2 hover:text-ink hover:underline"
         >
-          Regenerate proposal
+          Enter proposal manually
         </button>
       </div>
-    </Card>
-  );
-}
 
-function ProposalRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="grid grid-cols-[130px_1fr] gap-3 border-b hairline pb-3 last:border-0 last:pb-0">
-      <span className="text-[12px] text-muted-2">{label}</span>
-      <span className="text-[13px] text-ink">{value || "—"}</span>
-    </div>
+      <Callout tone="warn" className="mt-6" title="The human still approves">
+        Even in self-config mode, you must approve the final policy before it
+        goes on-chain — you are the legally responsible guardian.
+      </Callout>
+    </Card>
   );
 }
 
 /* ------------------------------------------------------------------ */
 
 function PolicyPreview({ config, valid }: { config: AgentConfig; valid: boolean }) {
+  const [schemaOk, setSchemaOk] = React.useState<boolean | null>(null);
+
+  React.useEffect(() => {
+    if (!valid) {
+      setSchemaOk(null);
+      return;
+    }
+    let live = true;
+    void fetchAgentSchema()
+      .then(() => {
+        if (live) setSchemaOk(true);
+      })
+      .catch(() => {
+        if (live) setSchemaOk(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [valid, config]);
+
   const can: string[] = [];
   const cannot: string[] = [];
 
@@ -486,7 +442,7 @@ function PolicyPreview({ config, valid }: { config: AgentConfig; valid: boolean 
     can.push("Send to any recipient (within caps)");
   }
 
-  cannot.push(`Exceed ${daily} in a 24h window`);
+  cannot.push(`Exceed ${daily} in a rolling period`);
   cannot.push(
     `Run a sensitive action before a ${config.timelockHours || "0"}h timelock`,
   );
@@ -514,7 +470,12 @@ function PolicyPreview({ config, valid }: { config: AgentConfig; valid: boolean 
       <div className="border-t hairline px-5 py-3 text-[11.5px]">
         {valid ? (
           <span className="flex items-center gap-2 text-accent-soft">
-            <CheckIcon className="h-3.5 w-3.5" /> Ready — validated against the policy schema
+            <CheckIcon className="h-3.5 w-3.5" />{" "}
+            {schemaOk === true
+              ? "Ready — validated against agent-spec.json"
+              : schemaOk === false
+                ? "Rules complete — schema check unavailable"
+                : "Checking schema…"}
           </span>
         ) : (
           <span className="text-muted-2">Fill the required rules to validate.</span>

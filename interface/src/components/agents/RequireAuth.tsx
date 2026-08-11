@@ -1,11 +1,23 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Button, Card, Spinner } from "@/components/onboarding/primitives";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 
 export function RequireAuth({ children }: { children: ReactNode }) {
   const { session, isConnected, isLoggingIn, connectWallet, login } = useAuth();
+  const [ready, setReady] = useState(false);
+
+  // Session lives in sessionStorage; the server always sees "logged out". Wait for the
+  // client snapshot before branching, or React throws a hydration mismatch on /guardian,
+  // /agents, etc. when a session already exists.
+  useEffect(() => {
+    setReady(true);
+  }, []);
+
+  if (!ready) {
+    return <LoadingState />;
+  }
 
   if (session) return <>{children}</>;
 

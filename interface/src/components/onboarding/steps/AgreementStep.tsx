@@ -78,7 +78,7 @@ export function AgreementStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 04"
+        eyebrow="Screen 5"
         title="Review your operating agreement"
         intro="The backend will translate these rules into an LLC operating agreement and bind them to the on-chain policy when you confirm."
       />

@@ -91,7 +91,7 @@ export function GuardianStep({
   return (
     <div>
       <StepHeader
-        eyebrow="01"
+        eyebrow="Screen 2"
         title={verified ? "A human is on record." : "Who is accountable for this agent?"}
         intro={
           verified

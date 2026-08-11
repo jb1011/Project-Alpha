@@ -11,6 +11,7 @@ import {
   getEntityTreasury,
 } from "@/lib/api/client";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
+import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
@@ -39,6 +40,7 @@ export function AgentDashboard({
   const [pausing, setPausing] = React.useState(false);
   const [agentBook, setAgentBook] = React.useState<{
     registered: boolean;
+    reason?: "not registered" | "no-operator-yet";
     humanId?: string;
     register?: string;
   } | null>(null);
@@ -127,6 +129,8 @@ export function AgentDashboard({
   const displayName = entity?.name?.trim() || config?.name?.trim() || "Your agent";
   const periodHours = treasury ? Math.round(Number(treasury.period) / 3600) : null;
   const ceilingUsdc = treasury?.standing?.ceiling ? Number(treasury.standing.ceiling) / 1e6 : null;
+  const standingTotalUsdc =
+    treasury?.standing?.total != null ? Number(treasury.standing.total) / 1e6 : null;
   const legalActive = treasury?.legalActive;
 
   const onTogglePause = async () => {
@@ -237,7 +241,9 @@ export function AgentDashboard({
                 title={
                   agentBook.registered
                     ? `AgentBook (World Chain): human ${agentBook.humanId?.slice(0, 14)}… answers for this agent's wallet`
-                    : agentBook.register
+                    : agentBook.reason === "no-operator-yet"
+                      ? "Agent still provisioning — operator wallet not set yet"
+                      : agentBook.register ?? "Not registered in AgentBook"
                 }
                 className={
                   agentBook.registered
@@ -253,12 +259,16 @@ export function AgentDashboard({
                       : "h-1.5 w-1.5 rounded-full border border-muted-2"
                   }
                 />
-                {agentBook.registered ? "AgentBook · human-backed" : "AgentBook · not registered"}
+                {agentBook.registered
+                  ? "AgentBook · human-backed"
+                  : agentBook.reason === "no-operator-yet"
+                    ? "AgentBook · provisioning"
+                    : "AgentBook · not registered"}
               </span>
             )}
             {ensName(entity) && (
               <a
-                href={`https://sepolia.app.ens.domains/${ensName(entity)}`}
+                href={`${ENS_EXPLORER_URL}/${ensName(entity)}`}
                 target="_blank"
                 rel="noreferrer"
                 title="Resolve this agent in any ENS client — addr, legal status, registration"
@@ -400,6 +410,14 @@ export function AgentDashboard({
               <RuleRow k="Allowlist / threshold" v="Re-asserted before every payment" />
               <RuleRow k="Pause + legal status" v="Re-checked before every payment" />
               <RuleRow
+                k="Standing float total"
+                v={
+                  standingTotalUsdc === null
+                    ? "—"
+                    : `${formatUsdc(standingTotalUsdc)} USDC`
+                }
+              />
+              <RuleRow
                 k="Standing float ceiling"
                 v={ceilingUsdc === null ? "—" : `≤ ${formatUsdc(ceilingUsdc)} USDC`}
               />
@@ -538,7 +556,7 @@ function ensName(entity: { metadataURI: string | null }): string | null {
   const uri = entity.metadataURI;
   if (!uri || !/^https?:\/\//.test(uri)) return null;
   const label = uri.split("/").filter(Boolean).pop();
-  return label ? `${label.toLowerCase()}.novicorpus.eth` : null;
+  return label ? `${label.toLowerCase()}.${ENS_PARENT_NAME}` : null;
 }
 
 function EnsGlobe({ className }: { className?: string }) {

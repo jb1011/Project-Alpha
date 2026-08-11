@@ -6,6 +6,9 @@ import { WagmiProvider, createConfig, fallback, http } from "wagmi";
 import { injected } from "wagmi/connectors";
 import { arcTestnet } from "@/lib/chain";
 
+const arcFallbackRpc =
+  process.env.NEXT_PUBLIC_ARC_RPC_FALLBACK ?? "https://arc-testnet.drpc.org";
+
 const wagmiConfig = createConfig({
   chains: [arcTestnet],
   connectors: [injected()],
@@ -13,7 +16,7 @@ const wagmiConfig = createConfig({
     // Ranked fallback: guardian actions (pause, funding) must survive a single RPC having a bad
     // day — during a live recording the primary blipped and every wallet write on the page died
     // with "RPC Request failed". The chain's configured URL stays first; drpc is the understudy.
-    [arcTestnet.id]: fallback([http(), http("https://arc-testnet.drpc.org")]),
+    [arcTestnet.id]: fallback([http(), http(arcFallbackRpc)]),
   },
 });
 

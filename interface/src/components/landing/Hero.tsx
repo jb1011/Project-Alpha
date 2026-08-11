@@ -1,5 +1,3 @@
-import { Terminal } from "./Terminal";
-
 export function Hero() {
   return (
     <section id="top" className="relative isolate overflow-hidden bg-paper">
@@ -17,28 +15,18 @@ export function Hero() {
             </span>
             <span>Live on Arc</span>
             <span className="text-line-strong">/</span>
-            <span>Wyoming DAO LLC</span>
+            <span>Mainnet coming soon</span>
           </div>
 
           <h1 className="mt-7 text-balance text-[44px] font-medium leading-[1.02] tracking-[-0.025em] text-ink sm:text-[60px] lg:text-[78px]">
-            A society
-            <span className="relative inline-block">
-              <span
-                aria-hidden
-                className="absolute -bottom-1 left-0 h-[3px] w-full bg-accent/70"
-              />
-            </span>
-            {" "}
-            for your agent,
+            <span className="relative inline-block">A company</span>
             <br />
-            by design.
+            for your agent.
           </h1>
 
-          <p className="mt-7 max-w-xl text-pretty text-[17px] leading-[1.55] text-muted lg:text-[18.5px]">
-            Give your agent real infrastructure: identity, money, governance,
-            and enforceable rules. Your passkey controls the vault. You define
-            the spending policy. A law-to-code operating agreement binds it on
-            Arc — and you stay the guardian.
+          <p className="mt-7 max-w-lg text-pretty text-[17px] leading-[1.5] text-muted lg:text-[18px]">
+            A legal entity, a USDC treasury, and spending rules on Arc. You set
+            the limits and stay the guardian.
           </p>
 
           <div className="mt-9 flex flex-wrap items-center gap-3">
@@ -61,77 +49,11 @@ export function Hero() {
               See how it works
             </a>
           </div>
-
-          <div className="mt-10 flex flex-wrap items-center gap-x-7 gap-y-2 text-[12.5px] text-muted">
-            <span className="inline-flex items-center gap-2">
-              <CheckDot /> Passkey-secured vault
-            </span>
-            <span className="inline-flex items-center gap-2">
-              <CheckDot /> On-chain spending policy
-            </span>
-            <span className="inline-flex items-center gap-2">
-              <CheckDot /> You keep guardian control
-            </span>
-          </div>
         </div>
 
-        <div className="relative flex flex-col gap-4">
-          <div
-            aria-hidden
-            className="pointer-events-none absolute -inset-6 -z-10 rounded-[28px] bg-gradient-to-br from-accent/15 via-transparent to-highlight/20 blur-2xl"
-          />
-
-          <Terminal
-            title="Novi Corpus · onboarding"
-            lines={[
-              { kind: "out", text: "→ binding passkey as vault root…", tone: "muted" },
-              { kind: "out", text: "✓ Turnkey vault provisioned", tone: "ok" },
-              { kind: "blank" },
-              {
-                kind: "out",
-                text: "→ validating agent policy…",
-                tone: "muted",
-              },
-              {
-                kind: "out",
-                text: "✓ Caps $500 / tx · $2,500 / day · 12h timelock",
-                tone: "ok",
-              },
-              { kind: "blank" },
-              {
-                kind: "out",
-                text: "→ generating operating agreement…",
-                tone: "muted",
-              },
-              {
-                kind: "out",
-                text: "✓ Law-to-code fingerprint 0x7d3a…f8c2",
-                tone: "ok",
-              },
-              { kind: "blank" },
-              {
-                kind: "out",
-                text: "→ deploying identity + treasury on Arc…",
-                tone: "muted",
-              },
-              {
-                kind: "out",
-                text: "✓ Contracts live · guardian recorded",
-                tone: "ok",
-              },
-              { kind: "blank" },
-              {
-                kind: "out",
-                text: "✓ Treasury funded · 1,000.00 USDC",
-                tone: "info",
-              },
-            ]}
-          />
-
-          <div className="grid grid-cols-3 gap-3">
-            <MiniMetric label="Passkey" value="1 tap" />
-            <MiniMetric label="Policy" value="On-chain" />
-            <MiniMetric label="Treasury" value="USDC · Arc" />
+        <div className="flex items-center justify-center py-6 lg:justify-end lg:py-8">
+          <div className="w-full max-w-[400px] rotate-[2.5deg] transition-transform duration-300 hover:rotate-[1.5deg] lg:max-w-[420px]">
+            <AgentDeskPreview />
           </div>
         </div>
       </div>
@@ -141,6 +63,85 @@ export function Hero() {
         <span className="anim-scroll-hint inline-block h-6 w-px bg-muted/60" />
       </div>
     </section>
+  );
+}
+
+function AgentDeskPreview() {
+  return (
+    <div className="overflow-hidden rounded-2xl border hairline-strong bg-paper shadow-[0_12px_40px_-12px_rgba(0,0,0,0.3)]">
+      <div className="flex items-center justify-between border-b hairline bg-paper-2/80 px-4 py-2.5">
+        <div className="flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" />
+          <span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" />
+          <span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" />
+        </div>
+        <span className="text-[11px] tracking-wide text-muted-2">
+          Agent desk · Treasury
+        </span>
+        <span className="w-12" aria-hidden />
+      </div>
+
+      <div className="space-y-3 p-5">
+        <div className="rounded-xl border hairline bg-paper-2/50 px-4 py-3">
+          <div className="text-[10px] uppercase tracking-[0.18em] text-muted-2">
+            Policy
+          </div>
+          <p className="mt-1.5 text-[13px] leading-[1.5] text-ink">
+            Spend within your caps. Pause or veto anytime.
+          </p>
+        </div>
+
+        <div className="flex flex-col items-center py-1">
+          <div className="h-4 w-px bg-line-strong" />
+          <span className="my-1 rounded-full bg-ink px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.14em] text-paper">
+            Live
+          </span>
+          <div className="h-4 w-px bg-line-strong" />
+        </div>
+
+        <div className="overflow-hidden rounded-xl border-2 border-accent/40 bg-accent/[0.06]">
+          <div className="flex items-start gap-3 p-4">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-accent/30 to-highlight/25 text-[14px] font-medium text-ink">
+              AG
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-[15px] font-medium text-ink">
+                    Your agent
+                  </div>
+                  <div className="mt-0.5 text-[12px] text-muted">
+                    Wyoming LLC · Novi-managed · World ID
+                  </div>
+                </div>
+                <span className="shrink-0 rounded-full bg-ink px-2 py-0.5 text-[10px] font-medium text-paper">
+                  ✓
+                </span>
+              </div>
+              <ul className="mt-2.5 space-y-1 text-[12px] text-muted">
+                <li>· USDC treasury on Arc</li>
+                <li>· Rules you define</li>
+              </ul>
+            </div>
+          </div>
+          <div className="border-t border-accent/25 bg-accent/10 px-4 py-2 text-[11.5px] font-medium text-accent-soft">
+            Operational · guardian controls on
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3 rounded-xl border hairline bg-paper-2/40 px-3 py-2.5">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-paper-3 text-[10px] font-medium text-muted">
+            YOU
+          </div>
+          <div>
+            <div className="text-[13px] font-medium text-ink">You</div>
+            <div className="text-[11.5px] text-muted-2">
+              Guardian · pause & veto
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -160,18 +161,5 @@ function CheckDot() {
         <path d="M2.5 6.5l2.5 2.5 4.5-5" />
       </svg>
     </span>
-  );
-}
-
-function MiniMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl border hairline bg-paper/70 backdrop-blur px-3.5 py-3">
-      <div className="text-[10.5px] uppercase tracking-[0.18em] text-muted-2">
-        {label}
-      </div>
-      <div className="mt-1 font-mono text-[13.5px] text-ink tabular-nums">
-        {value}
-      </div>
-    </div>
   );
 }

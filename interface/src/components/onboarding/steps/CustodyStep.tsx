@@ -79,7 +79,7 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 02"
+        eyebrow="Screen 3"
         title="Choose who holds the agent's operating keys"
         intro="This sets the custody of the agent's operator key — the key that moves funds inside your rules. Your wallet remains the on-chain guardian with full override powers on both options."
       />

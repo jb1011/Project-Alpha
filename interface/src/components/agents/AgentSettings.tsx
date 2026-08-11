@@ -263,6 +263,19 @@ export function AgentSettings({ entityId }: { entityId: string }) {
         <AgentTabs entityId={entityId} active="settings" />
       </div>
 
+      {entity.rootPasskeyId && (
+        <Card className="p-5">
+          <SectionTitle>Guardian passkey</SectionTitle>
+          <p className="mt-1 text-[12px] text-muted-2">
+            WebAuthn credential ID recorded at onboarding — the human approval anchor for this
+            agent.
+          </p>
+          <code className="mt-3 block break-all rounded-lg bg-paper-2 px-3 py-2 font-mono text-[11px] text-ink">
+            {entity.rootPasskeyId}
+          </code>
+        </Card>
+      )}
+
       {pending && (
         <Callout tone="warn" title="Pending policy change">
           <p className="text-[12px] text-muted">

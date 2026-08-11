@@ -158,7 +158,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
             <Wordmark />
             <span className="hidden items-center gap-1.5 rounded-full border hairline-strong bg-paper-2/60 px-2.5 py-1 text-[10.5px] uppercase tracking-[0.16em] text-muted-2 sm:inline-flex">
               <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-              Arc testnet
+              Live on Arc · Mainnet coming soon
             </span>
           </div>
           <div className="flex items-center gap-2">
