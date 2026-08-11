@@ -1,23 +1,19 @@
 "use client";
 
-import * as React from "react";
+import { useEffect, useState } from "react";
 import {
   IDKitRequestWidget,
   identityCheck,
   proofOfHuman,
 } from "@worldcoin/idkit";
+import type { WorldIdAttestContext, WorldIdContext } from "@/lib/api/types";
 import {
-  worldIdAttestContext,
-  worldIdAttestVerify,
-  worldIdContext,
-  worldIdMe,
-  worldIdVerify,
-} from "@/lib/api/client";
-import type {
-  WorldIdAttestContext,
-  WorldIdContext,
-  WorldIdMe,
-} from "@/lib/api/types";
+  useWorldIdAttestContextMutation,
+  useWorldIdAttestVerifyMutation,
+  useWorldIdContextMutation,
+  useWorldIdMeQuery,
+  useWorldIdVerifyMutation,
+} from "@/lib/api/hooks";
 import { AgentShell } from "@/components/agents/AgentShell";
 import { RequireAuth } from "@/components/agents/RequireAuth";
 import { GuardianRecord } from "@/components/guardian/GuardianRecord";
@@ -32,81 +28,55 @@ export default function GuardianPage() {
 }
 
 function GuardianVerification() {
-  const { ensureSession, address } = useAuth();
-  const [me, setMe] = React.useState<WorldIdMe | null>(null);
-  const [ctx, setCtx] = React.useState<WorldIdContext | null>(null);
-  const [open, setOpen] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
-  const [struck, setStruck] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const [attestCtx, setAttestCtx] = React.useState<WorldIdAttestContext | null>(
-    null,
-  );
-  const [attestOpen, setAttestOpen] = React.useState(false);
-  const [attestBusy, setAttestBusy] = React.useState(false);
+  const { address } = useAuth();
+  const { data: me = null, error: meError, refetch } = useWorldIdMeQuery();
+  const worldIdContextMutation = useWorldIdContextMutation();
+  const worldIdVerifyMutation = useWorldIdVerifyMutation();
+  const worldIdAttestContextMutation = useWorldIdAttestContextMutation();
+  const worldIdAttestVerifyMutation = useWorldIdAttestVerifyMutation();
 
-  const refresh = React.useCallback(async () => {
-    try {
-      const s = await ensureSession();
-      setMe(await worldIdMe(s.token));
-    } catch (e) {
-      setError((e as Error).message || "Could not read your guardian record.");
-    }
-  }, [ensureSession]);
+  const [ctx, setCtx] = useState<WorldIdContext | null>(null);
+  const [open, setOpen] = useState(false);
+  const [struck, setStruck] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [attestCtx, setAttestCtx] = useState<WorldIdAttestContext | null>(null);
+  const [attestOpen, setAttestOpen] = useState(false);
 
-  React.useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const busy = worldIdContextMutation.isPending;
+  const attestBusy = worldIdAttestContextMutation.isPending;
+  const queryError =
+    meError instanceof Error ? meError.message : meError ? "Could not read your guardian record." : null;
+  const displayError = error ?? queryError;
 
-  // Fetch the signed request context, then open World's widget.
-  const begin = React.useCallback(async () => {
+  async function begin() {
     setError(null);
-    setBusy(true);
     try {
-      const s = await ensureSession();
-      setCtx(await worldIdContext(s.token));
+      setCtx(await worldIdContextMutation.mutateAsync());
       setOpen(true);
     } catch (e) {
       setError((e as Error).message || "Could not start verification.");
-    } finally {
-      setBusy(false);
     }
-  }, [ensureSession]);
+  }
 
-  // The widget hands us the proof; our backend verifies it and applies the sybil gate.
-  const handleVerify = React.useCallback(
-    async (proof: unknown) => {
-      const s = await ensureSession();
-      await worldIdVerify(s.token, proof); // throwing here makes the widget show the failure
-    },
-    [ensureSession],
-  );
+  async function handleVerify(proof: unknown) {
+    await worldIdVerifyMutation.mutateAsync(proof);
+  }
 
-  // Step-up: its own action, so its own signed context and its own widget instance.
-  const beginAttest = React.useCallback(async () => {
+  async function beginAttest() {
     setError(null);
-    setAttestBusy(true);
     try {
-      const s = await ensureSession();
-      setAttestCtx(await worldIdAttestContext(s.token));
+      setAttestCtx(await worldIdAttestContextMutation.mutateAsync());
       setAttestOpen(true);
     } catch (e) {
       setError((e as Error).message || "Could not start the attestation.");
-    } finally {
-      setAttestBusy(false);
     }
-  }, [ensureSession]);
+  }
 
-  const handleAttest = React.useCallback(
-    async (proof: unknown) => {
-      const s = await ensureSession();
-      await worldIdAttestVerify(s.token, proof);
-    },
-    [ensureSession],
-  );
+  async function handleAttest(proof: unknown) {
+    await worldIdAttestVerifyMutation.mutateAsync(proof);
+  }
 
-  // The strike plays once, when a verification lands — not on every render of a verified page.
-  React.useEffect(() => {
+  useEffect(() => {
     if (!struck) return;
     const t = setTimeout(() => setStruck(false), 2400);
     return () => clearTimeout(t);
@@ -118,15 +88,14 @@ function GuardianVerification() {
         me={me}
         address={address}
         busy={busy}
-        loading={me === null && error === null}
+        loading={me === null && displayError === null}
         struck={struck}
-        error={error}
+        error={displayError}
         onVerify={() => void begin()}
         onAttest={() => void beginAttest()}
         attestBusy={attestBusy}
       />
 
-      {/* World's own widget handles the QR, deep links and device handoff. */}
       {ctx ? (
         <IDKitRequestWidget
           open={open}
@@ -143,7 +112,7 @@ function GuardianVerification() {
             setOpen(false);
             setError(null);
             setStruck(true);
-            void refresh();
+            void refetch();
           }}
           onError={(e: unknown) => {
             const code =
@@ -156,8 +125,6 @@ function GuardianVerification() {
         />
       ) : null}
 
-      {/* Step-up widget. Age only: World's attributes are assertions, so a country could be
-          checked but never learned — see verifyAttestation for the full finding. */}
       {attestCtx ? (
         <IDKitRequestWidget
           open={attestOpen}
@@ -166,7 +133,6 @@ function GuardianVerification() {
           action={attestCtx.action}
           // biome-ignore lint/suspicious/noExplicitAny: rp_context shape is defined by the API response.
           rp_context={attestCtx.rpContext as any}
-          // Identity Check is v4-only; legacy proofs can't carry attributes.
           allow_legacy_proofs={false}
           environment={attestCtx.environment}
           preset={identityCheck({
@@ -177,7 +143,7 @@ function GuardianVerification() {
           onSuccess={() => {
             setAttestOpen(false);
             setError(null);
-            void refresh();
+            void refetch();
           }}
           onError={(e: unknown) => {
             const code =

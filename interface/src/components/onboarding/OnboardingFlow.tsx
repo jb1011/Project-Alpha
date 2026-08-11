@@ -354,7 +354,7 @@ export function StepNav({
 }: {
   onBack?: () => void;
   backLabel?: string;
-  children: React.ReactNode;
+  children: ReactNode;
   className?: string;
 }) {
   return (

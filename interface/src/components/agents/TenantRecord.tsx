@@ -1,7 +1,7 @@
 "use client";
 
+import { useState, type ReactNode } from "react";
 import Link from "next/link";
-import * as React from "react";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { cx } from "@/components/onboarding/primitives";
 import { shortAddress } from "@/components/onboarding/types";
@@ -25,8 +25,8 @@ export function TenantRecord({
   ensName?: string | null;
   me: WorldIdMe | null;
   entityCount: number | null;
-  connections: React.ReactNode;
-  passkeys: React.ReactNode;
+  connections: ReactNode;
+  passkeys: ReactNode;
 }) {
   const verified = me?.verified ?? false;
   const formationReady = me?.formationReady ?? false;
@@ -130,7 +130,7 @@ export function TenantRecord({
 /** The account's name where ENS gives it one, the address where it doesn't. Either way the raw
  *  address stays one click from the clipboard — a readable name must never hide the real value. */
 function AddressTitle({ address, ensName }: { address: string; ensName?: string | null }) {
-  const [copied, setCopied] = React.useState(false);
+  const [copied, setCopied] = useState(false);
   const copy = () => {
     void navigator.clipboard.writeText(address).then(() => {
       setCopied(true);
@@ -185,7 +185,7 @@ function Cell({
 }: {
   label: string;
   hint?: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-2 p-5 sm:p-6">
@@ -203,7 +203,7 @@ function Section({
 }: {
   label: string;
   intro: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <section className="flex flex-col gap-4 border-t hairline p-6 sm:p-7">

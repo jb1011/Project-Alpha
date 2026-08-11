@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { getPublicConfig } from "@/lib/api/client";
+import { usePublicConfigQuery } from "@/lib/api/hooks";
 import { StepNav } from "../OnboardingFlow";
 import type { AgentConfig, Custody } from "../types";
 import { Button, Callout, CheckIcon, StepHeader, cx } from "../primitives";
@@ -53,23 +52,8 @@ const OPTIONS: {
 ];
 
 export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
-  // Ask the deployment what it can actually serve. Unknown (still loading, or the probe failed)
-  // is treated as available: submission validates anyway, and a transient blip shouldn't push
-  // someone off the recommended path.
-  const [circleAvailable, setCircleAvailable] = useState<boolean | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    getPublicConfig()
-      .then((c) => {
-        if (!cancelled) setCircleAvailable(c.circleCustodyAvailable);
-      })
-      .catch(() => {
-        if (!cancelled) setCircleAvailable(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const { data: publicConfig, isError } = usePublicConfigQuery();
+  const circleAvailable = isError ? null : publicConfig?.circleCustodyAvailable ?? null;
 
   const circleUnavailable = circleAvailable === false;
   // Derived, not stored: a deployment that can't serve circle shows turnkey as selected without

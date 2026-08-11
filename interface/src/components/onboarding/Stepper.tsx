@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 import { Phase, PHASES } from "./types";
 import { CheckIcon, cx } from "./primitives";
 

@@ -1,3 +1,4 @@
+import { type CSSProperties } from "react";
 type Line =
   | { kind: "prompt"; user?: string; host?: string; cmd: string; delay?: number }
   | { kind: "out"; text: string; tone?: "muted" | "ok" | "info" | "warn"; delay?: number }
@@ -53,7 +54,7 @@ export function Terminal({
       <div className="relative px-5 py-5 font-mono text-[12.5px] leading-[1.65]">
         {lines.map((line, i) => {
           const delay = line.delay ?? i * 0.18;
-          const style = { animationDelay: `${delay}s` } as React.CSSProperties;
+          const style = { animationDelay: `${delay}s` } as CSSProperties;
 
           if (line.kind === "blank") {
             return <div key={i} className="h-3" />;

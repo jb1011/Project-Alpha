@@ -1,6 +1,6 @@
 "use client";
 
-import * as React from "react";
+import { useMemo } from "react";
 import { cx } from "@/components/onboarding/primitives";
 
 /**
@@ -25,7 +25,7 @@ export function PersonhoodSeal({
   compact?: boolean;
   className?: string;
 }) {
-  const figure = React.useMemo(() => buildFigure(seed), [seed]);
+  const figure = useMemo(() => buildFigure(seed), [seed]);
   const ink = verified ? "#6ee7b7" : "var(--muted-2)";
   const ticks = compact ? BEZEL.filter((t) => t.major) : BEZEL;
 

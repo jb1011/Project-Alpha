@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { usePublicClient, useWriteContract } from "wagmi";
 import { StepNav } from "../OnboardingFlow";
-import { useAuth } from "../AuthProvider";
-import { deployStepIndex, pollEntity } from "@/lib/api/poll";
+import { deployStepIndex, TERMINAL } from "@/lib/api/poll";
+import { useEntityPollQuery } from "@/lib/api/hooks";
 import type { EntityStatus, EntityView } from "@/lib/api/types";
 import { arcTestnet, txUrl } from "@/lib/chain";
 import { wireAllowlistEntries } from "@/lib/treasury/allowlist";
@@ -84,61 +84,33 @@ export function DeployStep({
   onEntity: (entity: EntityView) => void;
   onComplete: () => void;
 }) {
-  const { ensureSession } = useAuth();
   const publicClient = usePublicClient();
   const { writeContractAsync } = useWriteContract();
-  const [entity, setEntity] = useState<EntityView | null>(null);
-  const [polling, setPolling] = useState(false);
+  const entityQuery = useEntityPollQuery(entityId);
+  const entity = entityQuery.data ?? null;
   const [error, setError] = useState<string | null>(null);
   const [wiringAllowlist, setWiringAllowlist] = useState(false);
 
-  const onEntityRef = useRef(onEntity);
-  const ensureSessionRef = useRef(ensureSession);
+  useEffect(() => {
+    if (entityQuery.data) onEntity(entityQuery.data);
+  }, [entityQuery.data, onEntity]);
 
   useEffect(() => {
-    onEntityRef.current = onEntity;
-    ensureSessionRef.current = ensureSession;
-  }, [onEntity, ensureSession]);
+    if (entity?.status === "failed") {
+      setError(entity.error ?? "Onboarding failed.");
+    } else if (entityQuery.error) {
+      setError(
+        entityQuery.error instanceof Error
+          ? entityQuery.error.message
+          : "Failed to poll entity status.",
+      );
+    }
+  }, [entity, entityQuery.error]);
 
-  useEffect(() => {
-    if (!entityId) return;
-    let cancelled = false;
-
-    (async () => {
-      setPolling(true);
-      setError(null);
-      try {
-        const auth = await ensureSessionRef.current();
-        const result = await pollEntity(auth.token, entityId, {
-          onUpdate: (e) => {
-            if (!cancelled) {
-              setEntity(e);
-              onEntityRef.current(e);
-            }
-          },
-        });
-        if (!cancelled) {
-          setEntity(result);
-          onEntityRef.current(result);
-          if (result.status === "failed") {
-            setError(result.error ?? "Onboarding failed.");
-          }
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setError(
-            e instanceof Error ? e.message : "Failed to poll entity status.",
-          );
-        }
-      } finally {
-        if (!cancelled) setPolling(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [entityId]);
+  const polling =
+    !!entityId &&
+    entityQuery.isFetching &&
+    (!entity || !TERMINAL.includes(entity.status));
 
   const allDone = entity?.status === "bound" || entity?.status === "funded";
   const hasFailure = entity?.status === "failed";

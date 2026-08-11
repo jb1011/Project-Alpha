@@ -1,13 +1,11 @@
 "use client";
 
-import * as React from "react";
 import Link from "next/link";
-import { listEntities } from "@/lib/api/client";
+import { useEntitiesQuery } from "@/lib/api/hooks";
 import type { EntityView } from "@/lib/api/types";
 import { addressUrl } from "@/lib/chain";
 import { AgentShell } from "@/components/agents/AgentShell";
 import { LoadingState, RequireAuth } from "@/components/agents/RequireAuth";
-import { useAuth } from "@/components/onboarding/AuthProvider";
 import { Card, cx } from "@/components/onboarding/primitives";
 import { shortAddress } from "@/components/onboarding/types";
 
@@ -20,34 +18,15 @@ export default function AgentsPage() {
 }
 
 function AgentsList() {
-  const { ensureSession } = useAuth();
-  const [entities, setEntities] = React.useState<EntityView[] | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const auth = await ensureSession();
-        const list = await listEntities(auth.token);
-        if (!cancelled) setEntities(list);
-      } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : "Failed to load agents.");
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [ensureSession]);
+  const { data: entities, isPending, error } = useEntitiesQuery();
+  const errorMessage = error instanceof Error ? error.message : error ? "Failed to load agents." : null;
 
   return (
     <AgentShell>
-      {entities === null && !error ? (
+      {isPending && !errorMessage ? (
         <LoadingState label="Loading agents…" />
-      ) : error ? (
-        <p className="py-12 text-center text-[13px] text-[#ff8a84]">{error}</p>
+      ) : errorMessage ? (
+        <p className="py-12 text-center text-[13px] text-[#ff8a84]">{errorMessage}</p>
       ) : !entities || entities.length === 0 ? (
         <Card className="p-10 text-center">
           <h2 className="text-[20px] font-medium text-ink">No agents yet</h2>

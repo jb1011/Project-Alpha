@@ -1,4 +1,4 @@
-import * as React from "react";
+import { forwardRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type TextareaHTMLAttributes } from "react";
 
 export function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
@@ -8,7 +8,7 @@ export function cx(...parts: Array<string | false | null | undefined>): string {
 /* Buttons                                                             */
 /* ------------------------------------------------------------------ */
 
-type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
+type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: "primary" | "ghost" | "danger" | "subtle";
   size?: "md" | "lg";
   loading?: boolean;
@@ -77,7 +77,7 @@ export function Field({
   hint?: string;
   error?: string;
   htmlFor?: string;
-  children: React.ReactNode;
+  children: ReactNode;
   className?: string;
 }) {
   return (
@@ -106,9 +106,9 @@ export function Field({
 const inputBase =
   "w-full rounded-xl border bg-paper-2/80 px-3.5 py-2.5 text-[13.5px] text-ink placeholder:text-muted-2 transition-colors focus:outline-none focus:ring-2 focus:ring-accent/45";
 
-export const TextInput = React.forwardRef<
+export const TextInput = forwardRef<
   HTMLInputElement,
-  React.InputHTMLAttributes<HTMLInputElement> & { invalid?: boolean }
+  InputHTMLAttributes<HTMLInputElement> & { invalid?: boolean }
 >(function TextInput({ className, invalid, ...rest }, ref) {
   return (
     <input
@@ -123,9 +123,9 @@ export const TextInput = React.forwardRef<
   );
 });
 
-export const Textarea = React.forwardRef<
+export const Textarea = forwardRef<
   HTMLTextAreaElement,
-  React.TextareaHTMLAttributes<HTMLTextAreaElement> & { invalid?: boolean }
+  TextareaHTMLAttributes<HTMLTextAreaElement> & { invalid?: boolean }
 >(function Textarea({ className, invalid, ...rest }, ref) {
   return (
     <textarea
@@ -153,9 +153,9 @@ export function Callout({
   className,
 }: {
   tone?: "accent" | "info" | "warn";
-  icon?: React.ReactNode;
+  icon?: ReactNode;
   title?: string;
-  children?: React.ReactNode;
+  children?: ReactNode;
   className?: string;
 }) {
   const tones = {
@@ -192,8 +192,8 @@ export function StepHeader({
   intro,
 }: {
   eyebrow: string;
-  title: React.ReactNode;
-  intro?: React.ReactNode;
+  title: ReactNode;
+  intro?: ReactNode;
 }) {
   return (
     <header className="mb-8">
@@ -222,7 +222,7 @@ export function Card({
   children,
 }: {
   className?: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <div

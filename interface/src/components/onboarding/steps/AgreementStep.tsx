@@ -1,10 +1,10 @@
 "use client";
 
-import * as React from "react";
+import { useMemo, useState } from "react";
 import { AgentConfig, formatUsdc, shortAddress } from "../types";
 import { StepNav } from "../OnboardingFlow";
 import { useAuth } from "../AuthProvider";
-import { onboardEntity } from "@/lib/api/client";
+import { useOnboardEntityMutation } from "@/lib/api/hooks";
 import { configToAgentSpec } from "@/lib/api/spec";
 import type { GuardianPasskey } from "@/lib/api/types";
 import {
@@ -32,12 +32,13 @@ export function AgreementStep({
   onBack,
   onSubmitted,
 }: Props) {
-  const { ensureSession, address } = useAuth();
-  const [confirmed, setConfirmed] = React.useState(false);
-  const [submitting, setSubmitting] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const { address } = useAuth();
+  const onboardEntity = useOnboardEntityMutation();
+  const [confirmed, setConfirmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const submitting = onboardEntity.isPending;
 
-  const agreementText = React.useMemo(() => buildAgreement(config), [config]);
+  const agreementText = useMemo(() => buildAgreement(config), [config]);
 
   function download() {
     const blob = new Blob([agreementText], { type: "text/plain;charset=utf-8" });
@@ -56,22 +57,23 @@ export function AgreementStep({
       setError("Complete wallet sign-in and passkey setup first.");
       return;
     }
-    setSubmitting(true);
     setError(null);
     try {
-      const auth = await ensureSession();
       const key =
         idempotencyKey ??
         (typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : `pa-${Date.now()}`);
       const spec = configToAgentSpec(config, address);
-      const { id } = await onboardEntity(auth.token, spec, guardianPasskey, key, config.custody);
+      const { id } = await onboardEntity.mutateAsync({
+        spec,
+        guardianPasskey,
+        idempotencyKey: key,
+        custody: config.custody,
+      });
       onSubmitted(id, key);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Onboarding submission failed.");
-    } finally {
-      setSubmitting(false);
     }
   }
 

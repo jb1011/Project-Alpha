@@ -1,15 +1,12 @@
 "use client";
 
-import * as React from "react";
+import { useState, type ReactNode } from "react";
 import Link from "next/link";
+import { useQueryClient } from "@tanstack/react-query";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
-import {
-  entityAgentBook,
-  getEntity,
-  getEntityRuns,
-  getEntityTreasury,
-} from "@/lib/api/client";
+import { useAgentDashboardQueries } from "@/lib/api/hooks";
+import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
@@ -29,91 +26,43 @@ export function AgentDashboard({
   config?: AgentConfig;
   onRestart?: () => void;
 }) {
-  const { ensureSession } = useAuth();
+  const { session } = useAuth();
+  const queryClient = useQueryClient();
   const publicClient = usePublicClient();
   const { writeContractAsync } = useWriteContract();
 
-  const [entity, setEntity] = React.useState<EntityView | null>(null);
-  const [treasury, setTreasury] = React.useState<TreasuryView | null>(null);
-  const [runs, setRuns] = React.useState<AgentRun[]>([]);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
-  const [pausing, setPausing] = React.useState(false);
-  const [agentBook, setAgentBook] = React.useState<{
-    registered: boolean;
-    reason?: "not registered" | "no-operator-yet";
-    humanId?: string;
-    register?: string;
-  } | null>(null);
-  const [pauseError, setPauseError] = React.useState<string | null>(null);
+  const {
+    entity: entityQuery,
+    treasury: treasuryQuery,
+    runs: runsQuery,
+    agentBook: agentBookQuery,
+  } = useAgentDashboardQueries(entityId);
 
-  const ensureSessionRef = React.useRef(ensureSession);
-  React.useEffect(() => {
-    ensureSessionRef.current = ensureSession;
-  }, [ensureSession]);
+  const entity = entityQuery.data ?? null;
+  const treasury = treasuryQuery.data ?? null;
+  const runs = runsQuery.data ?? [];
+  const agentBook = agentBookQuery.data ?? null;
+  const loadError =
+    entityQuery.error instanceof Error
+      ? entityQuery.error.message
+      : entityQuery.error
+        ? "Failed to load agent."
+        : null;
+
+  const [pausing, setPausing] = useState(false);
+  const [pauseError, setPauseError] = useState<string | null>(null);
 
   const treasuryAddr = entity?.treasury ?? null;
 
-  const refresh = React.useCallback(async () => {
-    try {
-      const auth = await ensureSessionRef.current();
-      const e = await getEntity(auth.token, entityId);
-      setEntity(e);
-      setLoadError(null);
-      if (e.treasury) {
-        setTreasury(await getEntityTreasury(auth.token, entityId));
-        setRuns((await getEntityRuns(auth.token, entityId)).runs);
-      }
-    } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Failed to load agent.");
-    }
-  }, [entityId]);
-
-  React.useEffect(() => {
-    let cancelled = false;
-    let h: ReturnType<typeof setInterval> | null = null;
-    const tick = () => {
-      if (!cancelled) void refresh();
-    };
-    // Poll only while someone is actually looking: a hidden tab was ~36 backend RPC calls/min
-    // for nobody. Resume with an immediate tick so returning to the tab never shows stale data.
-    const start = () => {
-      if (h === null) {
-        tick();
-        h = setInterval(tick, 5000);
-      }
-    };
-    const stop = () => {
-      if (h !== null) {
-        clearInterval(h);
-        h = null;
-      }
-    };
-    const onVisibility = () => (document.visibilityState === "hidden" ? stop() : start());
-    document.addEventListener("visibilitychange", onVisibility);
-    onVisibility();
-    return () => {
-      cancelled = true;
-      stop();
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, [refresh]);
-
-  // AgentBook standing — once, not on the poll (it's a World Chain read behind a cache).
-  React.useEffect(() => {
-    let live = true;
-    void (async () => {
-      try {
-        const auth = await ensureSessionRef.current();
-        const ab = await entityAgentBook(auth.token, entityId);
-        if (live) setAgentBook(ab);
-      } catch {
-        /* 404 when AgentBook reads aren't configured — chip simply doesn't render */
-      }
-    })();
-    return () => {
-      live = false;
-    };
-  }, [entityId]);
+  async function refreshDashboard() {
+    const token = session?.token;
+    if (!token) return;
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: apiKeys.entity(token, entityId) }),
+      queryClient.invalidateQueries({ queryKey: apiKeys.entityTreasury(token, entityId) }),
+      queryClient.invalidateQueries({ queryKey: apiKeys.entityRuns(token, entityId) }),
+    ]);
+  }
 
   const paused = treasury?.paused ?? false;
   const balanceUsdc = treasury ? Number(treasury.usdcBalance) / 1e6 : null;
@@ -145,7 +94,7 @@ export function AgentDashboard({
         chainId: arcTestnet.id,
       });
       if (publicClient) await publicClient.waitForTransactionReceipt({ hash });
-      await refresh();
+      await refreshDashboard();
     } catch (e) {
       setPauseError(
         e instanceof Error
@@ -496,7 +445,7 @@ export function AgentDashboard({
 }
 
 function RunRow({ run }: { run: AgentRun }) {
-  const [open, setOpen] = React.useState(false);
+  const [open, setOpen] = useState(false);
   const profit = Number(run.pnl) >= 0;
   return (
     <li className="border-b hairline last:border-0">
@@ -611,7 +560,7 @@ function StatCard({
   value: string;
   unit?: string;
   emphasis?: boolean;
-  children?: React.ReactNode;
+  children?: ReactNode;
 }) {
   return (
     <Card className={cx("p-5", emphasis && "border-accent/20 bg-accent/[0.04]")}>

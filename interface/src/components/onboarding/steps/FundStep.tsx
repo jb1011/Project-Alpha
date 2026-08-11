@@ -1,11 +1,10 @@
 "use client";
 
-import * as React from "react";
+import { useEffect, useState } from "react";
 import { AgentConfig, formatUsdc, shortAddress } from "../types";
 import { StepNav } from "../OnboardingFlow";
 import { useAuth } from "../AuthProvider";
-import { fundEntity } from "@/lib/api/client";
-import { pollEntity } from "@/lib/api/poll";
+import { useEntityFundPollQuery, useFundEntityMutation } from "@/lib/api/hooks";
 import { usdcToAtomic } from "@/lib/api/spec";
 import type { EntityView } from "@/lib/api/types";
 import { txUrl } from "@/lib/chain";
@@ -35,17 +34,34 @@ export function FundStep({
   onEntity: (entity: EntityView) => void;
   onComplete: () => void;
 }) {
-  const { ensureSession, address, isConnected } = useAuth();
-  const [amount, setAmount] = React.useState("");
-  const [status, setStatus] = React.useState<FundStatus>(
+  const { address, isConnected } = useAuth();
+  const fundEntity = useFundEntityMutation();
+  const [amount, setAmount] = useState("");
+  const [status, setStatus] = useState<FundStatus>(
     entity?.status === "funded" ? "confirmed" : "idle",
   );
-  const [error, setError] = React.useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [pollFunding, setPollFunding] = useState(false);
+  const fundPoll = useEntityFundPollQuery(entityId, pollFunding);
+
+  useEffect(() => {
+    const polled = fundPoll.data;
+    if (!polled) return;
+    onEntity(polled);
+    if (polled.status === "funded") {
+      setStatus("confirmed");
+      setPollFunding(false);
+    } else if (polled.status === "failed") {
+      setStatus("error");
+      setError(polled.error ?? "Funding failed.");
+      setPollFunding(false);
+    }
+  }, [fundPoll.data, onEntity]);
 
   const treasury = entity?.treasury;
   const amountNum = Number(amount);
   const amountValid = amount !== "" && !Number.isNaN(amountNum) && amountNum > 0;
-  const busy = status === "pending";
+  const busy = status === "pending" || fundEntity.isPending || pollFunding;
   const confirmed = status === "confirmed" || entity?.status === "funded";
 
   async function fund() {
@@ -53,19 +69,11 @@ export function FundStep({
     setStatus("pending");
     setError(null);
     try {
-      const auth = await ensureSession();
-      await fundEntity(auth.token, entityId, usdcToAtomic(amount));
-      const result = await pollEntity(auth.token, entityId, {
-        until: ["funded", "failed"],
-        onUpdate: onEntity,
+      await fundEntity.mutateAsync({
+        entityId,
+        amountAtomic: usdcToAtomic(amount),
       });
-      onEntity(result);
-      if (result.status === "funded") {
-        setStatus("confirmed");
-      } else {
-        setStatus("error");
-        setError(result.error ?? "Funding failed.");
-      }
+      setPollFunding(true);
     } catch (e) {
       setStatus("error");
       setError(e instanceof Error ? e.message : "Funding request failed.");
@@ -154,7 +162,7 @@ export function FundStep({
               {!confirmed ? (
                 <Button
                   size="lg"
-                  onClick={fund}
+                  onClick={() => void fund()}
                   loading={busy}
                   disabled={!amountValid || busy || !entityId}
                 >

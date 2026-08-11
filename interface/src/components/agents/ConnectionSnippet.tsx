@@ -1,16 +1,16 @@
 "use client";
 
-import * as React from "react";
+import { useState } from "react";
 import type { ConnectionSnippets } from "@/lib/api/types";
 import { Button, cx } from "@/components/onboarding/primitives";
 import { CONNECT_TARGETS } from "./connectTargets";
 
 export function ConnectionSnippet({ snippets }: { snippets: ConnectionSnippets }) {
   const available = CONNECT_TARGETS.filter((t) => snippets[t.key]);
-  const [selected, setSelected] = React.useState<keyof ConnectionSnippets>(
+  const [selected, setSelected] = useState<keyof ConnectionSnippets>(
     available[0]?.key ?? "claudeCode",
   );
-  const [copied, setCopied] = React.useState(false);
+  const [copied, setCopied] = useState(false);
 
   const target = available.find((t) => t.key === selected) ?? available[0];
   const snippet = target ? snippets[target.key] ?? "" : "";

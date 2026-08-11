@@ -1,22 +1,21 @@
 "use client";
 
+import { useEffect, useState, type ReactNode } from "react";
 import { AgentTabs } from "@/components/agents/AgentTabs";
-import * as React from "react";
 import { usePublicClient, useReadContract, useWriteContract } from "wagmi";
 import {
-  executePolicyUpdate,
-  getEntity,
-  patchPerTxCap,
-  patchTrustPolicy,
-  schedulePolicyUpdate,
-} from "@/lib/api/client";
+  useEntityQuery,
+  useExecutePolicyUpdateMutation,
+  usePatchPerTxCapMutation,
+  usePatchTrustPolicyMutation,
+  useSchedulePolicyUpdateMutation,
+} from "@/lib/api/hooks";
 import type { EntityView } from "@/lib/api/types";
 import { arcTestnet } from "@/lib/chain";
 import { usdcToAtomic } from "@/lib/api/spec";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { computePolicyId } from "@/lib/treasury/policyId";
 import { wireAllowlistEntries } from "@/lib/treasury/allowlist";
-import { useAuth } from "@/components/onboarding/AuthProvider";
 import {
   Button,
   Callout,
@@ -37,23 +36,30 @@ type PendingPolicy = {
 };
 
 export function AgentSettings({ entityId }: { entityId: string }) {
-  const { ensureSession } = useAuth();
   const publicClient = usePublicClient();
   const { writeContractAsync } = useWriteContract();
+  const entityQuery = useEntityQuery(entityId);
+  const patchPerTxCap = usePatchPerTxCapMutation(entityId);
+  const patchTrustPolicy = usePatchTrustPolicyMutation(entityId);
+  const schedulePolicyUpdate = useSchedulePolicyUpdateMutation(entityId);
+  const executePolicyUpdate = useExecutePolicyUpdateMutation(entityId);
 
-  const [entity, setEntity] = React.useState<EntityView | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const [pending, setPending] = React.useState<PendingPolicy | null>(null);
+  const entity = entityQuery.data ?? null;
+  const [error, setError] = useState<string | null>(
+    entityQuery.error instanceof Error ? entityQuery.error.message : null,
+  );
+  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<PendingPolicy | null>(null);
+  const [formInitialized, setFormInitialized] = useState(false);
 
-  const [perTxCap, setPerTxCap] = React.useState("");
-  const [trustPolicy, setTrustPolicy] = React.useState<string>("inherit");
-  const [dailyCap, setDailyCap] = React.useState("");
-  const [periodHours, setPeriodHours] = React.useState("24");
-  const [allowlistOn, setAllowlistOn] = React.useState(false);
-  const [payout, setPayout] = React.useState("");
-  const [allowAddr, setAllowAddr] = React.useState("");
-  const [newOperator, setNewOperator] = React.useState("");
+  const [perTxCap, setPerTxCap] = useState("");
+  const [trustPolicy, setTrustPolicy] = useState<string>("inherit");
+  const [dailyCap, setDailyCap] = useState("");
+  const [periodHours, setPeriodHours] = useState("24");
+  const [allowlistOn, setAllowlistOn] = useState(false);
+  const [payout, setPayout] = useState("");
+  const [allowAddr, setAllowAddr] = useState("");
+  const [newOperator, setNewOperator] = useState("");
 
   const treasury = entity?.treasury as `0x${string}` | undefined;
 
@@ -65,21 +71,26 @@ export function AgentSettings({ entityId }: { entityId: string }) {
     query: { enabled: !!treasury },
   });
 
-  const refreshEntity = React.useCallback(async () => {
-    const auth = await ensureSession();
-    const e = await getEntity(auth.token, entityId);
-    setEntity(e);
-    if (e.perTxCap) setPerTxCap(String(Number(e.perTxCap) / 1e6));
-    setTrustPolicy(e.trustPolicy ?? "inherit");
-  }, [ensureSession, entityId]);
+  const refreshEntity = entityQuery.refetch;
 
-  React.useEffect(() => {
-    void refreshEntity().catch((e) =>
-      setError(e instanceof Error ? e.message : "Failed to load agent."),
-    );
-  }, [refreshEntity]);
+  useEffect(() => {
+    if (!entity || formInitialized) return;
+    if (entity.perTxCap) setPerTxCap(String(Number(entity.perTxCap) / 1e6));
+    setTrustPolicy(entity.trustPolicy ?? "inherit");
+    setFormInitialized(true);
+  }, [entity, formInitialized]);
 
-  React.useEffect(() => {
+  useEffect(() => {
+    if (entityQuery.error) {
+      setError(
+        entityQuery.error instanceof Error
+          ? entityQuery.error.message
+          : "Failed to load agent.",
+      );
+    }
+  }, [entityQuery.error]);
+
+  useEffect(() => {
     if (!pending?.policyId || !treasury || !publicClient) return;
     let cancelled = false;
     const poll = async () => {
@@ -120,26 +131,23 @@ export function AgentSettings({ entityId }: { entityId: string }) {
 
   async function onSavePerTxCap() {
     await runTx(async () => {
-      const auth = await ensureSession();
       const val = perTxCap.trim() === "" ? null : perTxCap.trim();
-      await patchPerTxCap(auth.token, entityId, val);
+      await patchPerTxCap.mutateAsync(val);
     }, "Failed to update per-tx cap.");
   }
 
   async function onSaveTrustPolicy() {
     await runTx(async () => {
-      const auth = await ensureSession();
-      await patchTrustPolicy(
-        auth.token,
-        entityId,
-        trustPolicy === "inherit" ? null : (trustPolicy as "open" | "verified-sellers-only" | "verified-legal-bodies-only"),
+      await patchTrustPolicy.mutateAsync(
+        trustPolicy === "inherit"
+          ? null
+          : (trustPolicy as "open" | "verified-sellers-only" | "verified-legal-bodies-only"),
       );
     }, "Failed to update the trust policy.");
   }
 
   async function onSchedulePolicy() {
     await runTx(async () => {
-      const auth = await ensureSession();
       const periodSeconds = Math.max(3600, Math.round(Number(periodHours) * 3600));
       const body = {
         capUsdc: dailyCap.trim(),
@@ -147,7 +155,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
         allowlistOn,
         payoutAddress: payout.trim(),
       };
-      await schedulePolicyUpdate(auth.token, entityId, body);
+      await schedulePolicyUpdate.mutateAsync(body);
       const policyId = computePolicyId({
         newCap: BigInt(usdcToAtomic(dailyCap.trim())),
         newPeriod: BigInt(periodSeconds),
@@ -178,8 +186,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   async function onExecutePolicy() {
     if (!pending) return;
     await runTx(async () => {
-      const auth = await ensureSession();
-      await executePolicyUpdate(auth.token, entityId, pending.policyId);
+      await executePolicyUpdate.mutateAsync(pending.policyId);
       setPending(null);
     }, "Failed to execute policy update.");
   }
@@ -441,7 +448,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   );
 }
 
-function SectionTitle({ children }: { children: React.ReactNode }) {
+function SectionTitle({ children }: { children: ReactNode }) {
   return (
     <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">{children}</div>
   );

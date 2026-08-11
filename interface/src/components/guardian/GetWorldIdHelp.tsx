@@ -1,6 +1,6 @@
 "use client";
 
-import * as React from "react";
+import { useState } from "react";
 import { cx } from "@/components/onboarding/primitives";
 
 /**
@@ -18,7 +18,7 @@ export function GetWorldIdHelp({
   className?: string;
   defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = React.useState(defaultOpen);
+  const [open, setOpen] = useState(defaultOpen);
 
   return (
     <div className={cx("flex flex-col gap-3", className)}>

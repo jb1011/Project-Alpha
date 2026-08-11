@@ -1,6 +1,6 @@
 "use client";
 
-import * as React from "react";
+import { useState, type ReactNode } from "react";
 import type { WorldIdMe } from "@/lib/api/types";
 import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
@@ -296,7 +296,7 @@ function LedgerCell({
 }: {
   label: string;
   hint?: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-2 p-5 sm:p-6">
@@ -327,7 +327,7 @@ function Pips({ used, max }: { used: number; max: number }) {
   );
 }
 
-function Clause({ term, children }: { term: string; children: React.ReactNode }) {
+function Clause({ term, children }: { term: string; children: ReactNode }) {
   return (
     <div className="flex flex-col gap-1 border-l hairline-strong pl-3.5">
       <dt className="text-[10.5px] uppercase tracking-[0.2em] text-muted-2">{term}</dt>
@@ -337,7 +337,7 @@ function Clause({ term, children }: { term: string; children: React.ReactNode })
 }
 
 function CopyLine({ value }: { value: string }) {
-  const [copied, setCopied] = React.useState(false);
+  const [copied, setCopied] = useState(false);
   return (
     <button
       type="button"

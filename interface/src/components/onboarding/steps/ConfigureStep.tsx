@@ -1,6 +1,6 @@
 "use client";
 
-import * as React from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
   AgentConfig,
@@ -25,7 +25,7 @@ import {
   Textarea,
   cx,
 } from "../primitives";
-import { fetchAgentSchema } from "@/lib/api/client";
+import { useAgentSchemaQuery } from "@/lib/api/hooks";
 
 type Props = {
   config: AgentConfig;
@@ -408,25 +408,8 @@ function McpConnectPanel({ onEditManually }: { onEditManually: () => void }) {
 /* ------------------------------------------------------------------ */
 
 function PolicyPreview({ config, valid }: { config: AgentConfig; valid: boolean }) {
-  const [schemaOk, setSchemaOk] = React.useState<boolean | null>(null);
-
-  React.useEffect(() => {
-    if (!valid) {
-      setSchemaOk(null);
-      return;
-    }
-    let live = true;
-    void fetchAgentSchema()
-      .then(() => {
-        if (live) setSchemaOk(true);
-      })
-      .catch(() => {
-        if (live) setSchemaOk(false);
-      });
-    return () => {
-      live = false;
-    };
-  }, [valid, config]);
+  const schemaQuery = useAgentSchemaQuery(valid);
+  const schemaOk = !valid ? null : schemaQuery.isSuccess ? true : schemaQuery.isError ? false : null;
 
   const can: string[] = [];
   const cannot: string[] = [];

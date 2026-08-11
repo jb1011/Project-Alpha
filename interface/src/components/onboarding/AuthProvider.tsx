@@ -28,7 +28,10 @@ import {
   saveAuthSession,
   SIWE_DOMAIN,
 } from "@/lib/api/config";
-import { getNonce, verifySiwe } from "@/lib/api/client";
+import {
+  useAuthNonceMutation,
+  useSiweLoginMutation,
+} from "@/lib/api/hooks";
 import type { AuthSession } from "@/lib/api/types";
 
 type AuthContextValue = {
@@ -65,6 +68,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     getAuthSessionSnapshot,
     () => null,
   );
+  const nonceMutation = useAuthNonceMutation();
+  const verifyMutation = useSiweLoginMutation();
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   // A session authenticates ONE address — the tenant every API call acts as. Switching accounts in
@@ -92,7 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (chainId !== arcTestnet.id) {
         await switchChainAsync({ chainId: arcTestnet.id });
       }
-      const { nonce } = await getNonce();
+      const { nonce } = await nonceMutation.mutateAsync();
       const message = createSiweMessage({
         address,
         chainId: arcTestnet.id,
@@ -102,12 +107,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         version: "1",
       });
       const signature = await signMessageAsync({ message });
-      const next = await verifySiwe(message, signature);
+      const next = await verifyMutation.mutateAsync({ message, signature });
       saveAuthSession(next);
     } finally {
       setIsLoggingIn(false);
     }
-  }, [address, chainId, signMessageAsync, switchChainAsync]);
+  }, [address, chainId, signMessageAsync, switchChainAsync, nonceMutation, verifyMutation]);
 
   const logout = useCallback(() => {
     clearAuthSession();

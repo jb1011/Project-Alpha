@@ -1,10 +1,9 @@
 "use client";
 
-import * as React from "react";
-import { createConnectionPackage } from "@/lib/api/client";
+import { useState } from "react";
+import { useCreateConnectionPackageMutation } from "@/lib/api/hooks";
 import type { Capability, ConnectionPackage, EntityView } from "@/lib/api/types";
 import { ApiError } from "@/lib/api/types";
-import { useAuth } from "@/components/onboarding/AuthProvider";
 import { Button, Callout, Card } from "@/components/onboarding/primitives";
 import { ActiveConnectionsPanel } from "./ActiveConnectionsPanel";
 import { CapabilitySelector } from "./CapabilitySelector";
@@ -12,21 +11,24 @@ import { ConnectionSnippet } from "./ConnectionSnippet";
 import { ENTITY_CAPABILITIES, ENTITY_DEFAULT_CAPABILITY } from "./capabilityCopy";
 
 export function ConnectAgentPanel({ entity }: { entity: EntityView }) {
-  const { ensureSession } = useAuth();
-  const [capability, setCapability] = React.useState<Capability>(ENTITY_DEFAULT_CAPABILITY);
-  const [pkg, setPkg] = React.useState<ConnectionPackage | null>(null);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const createConnection = useCreateConnectionPackageMutation();
+  const [capability, setCapability] = useState<Capability>(ENTITY_DEFAULT_CAPABILITY);
+  const [pkg, setPkg] = useState<ConnectionPackage | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const notReady = entity.status !== "bound" && entity.status !== "funded";
   const badMcpUrl = !!pkg && /localhost|127\.0\.0\.1/.test(pkg.mcpUrl);
+  const busy = createConnection.isPending;
 
   async function generate() {
-    setBusy(true);
     setError(null);
     try {
-      const auth = await ensureSession();
-      setPkg(await createConnectionPackage(auth.token, entity.id, capability));
+      setPkg(
+        await createConnection.mutateAsync({
+          entityId: entity.id,
+          capability,
+        }),
+      );
     } catch (e) {
       setError(
         e instanceof ApiError && e.status === 404
@@ -35,8 +37,6 @@ export function ConnectAgentPanel({ entity }: { entity: EntityView }) {
             ? e.message
             : "Failed to generate connection.",
       );
-    } finally {
-      setBusy(false);
     }
   }
 

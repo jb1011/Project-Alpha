@@ -1,5 +1,6 @@
 "use client";
 
+import { type ReactNode } from "react";
 import Link from "next/link";
 import { cx } from "@/components/onboarding/primitives";
 
@@ -35,7 +36,7 @@ function Tab({
 }: {
   href: string;
   current: boolean;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <Link
