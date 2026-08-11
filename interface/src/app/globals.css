@@ -194,6 +194,63 @@ input[type="reset"]:disabled {
   animation: scrollHint 2.2s ease-in-out infinite;
 }
 
+@keyframes navDrop {
+  from { opacity: 0; transform: translateY(-10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.anim-nav-drop {
+  animation: navDrop 0.55s cubic-bezier(0.22, 0.9, 0.3, 1.1) both;
+}
+
+@keyframes revealPop {
+  0%   { opacity: 0; transform: translateY(32px) scale(0.9); }
+  65%  { opacity: 1; transform: translateY(-6px) scale(1.025); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes revealUp {
+  0%   { opacity: 0; transform: translateY(28px); }
+  70%  { opacity: 1; transform: translateY(-3px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes revealLeft {
+  0%   { opacity: 0; transform: translateX(-28px) scale(0.96); }
+  70%  { opacity: 1; transform: translateX(4px) scale(1.01); }
+  100% { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+@keyframes revealRight {
+  0%   { opacity: 0; transform: translateX(28px) scale(0.96); }
+  70%  { opacity: 1; transform: translateX(-4px) scale(1.01); }
+  100% { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+@keyframes revealScale {
+  0%   { opacity: 0; transform: scale(0.88); }
+  70%  { opacity: 1; transform: scale(1.04); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+.reveal {
+  opacity: 0;
+  will-change: transform, opacity;
+}
+
+.reveal-visible {
+  animation-duration: var(--reveal-duration, 680ms);
+  animation-delay: var(--reveal-delay, 0ms);
+  animation-fill-mode: both;
+  animation-timing-function: cubic-bezier(0.22, 0.95, 0.32, 1.15);
+}
+
+.reveal-pop.reveal-visible    { animation-name: revealPop; }
+.reveal-up.reveal-visible     { animation-name: revealUp; }
+.reveal-left.reveal-visible   { animation-name: revealLeft; }
+.reveal-right.reveal-visible  { animation-name: revealRight; }
+.reveal-scale.reveal-visible  { animation-name: revealScale; }
+
 @keyframes pulseDot {
   0%, 100% { transform: scale(1); opacity: 1; }
   50%      { transform: scale(1.6); opacity: 0.4; }
@@ -271,11 +328,18 @@ input[type="reset"]:disabled {
 @media (prefers-reduced-motion: reduce) {
   .anim-mesh,
   .anim-scroll-hint,
+  .anim-nav-drop,
   .anim-pulse-dot::after,
   .seal-bezel,
   .seal-bloom,
-  .seal-settle {
+  .seal-settle,
+  .reveal-visible {
     animation: none;
+  }
+  .reveal,
+  .reveal-visible {
+    opacity: 1;
+    transform: none;
   }
   /* These start hidden, so they need their end state restored rather than just stopped. */
   .anim-line,

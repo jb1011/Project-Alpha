@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Reveal } from "./Reveal";
 import { SectionLabel } from "./SectionLabel";
 
 const steps = [
@@ -89,7 +90,7 @@ function StepCard({
   return (
     <div
       className={cx(
-        "group rounded-2xl border hairline-dark-strong bg-ink-2 p-8 transition-all duration-700 ease-out lg:p-10",
+        "group rounded-2xl border hairline-dark-strong bg-ink-2 p-8 transition-all duration-500 ease-[cubic-bezier(0.22,0.95,0.32,1.1)] lg:p-10",
         stacked
           ? active
             ? "relative z-10 translate-y-0 scale-100 opacity-100"
@@ -134,7 +135,7 @@ function DoneCard({ active, stacked = false }: { active: boolean; stacked?: bool
   return (
     <div
       className={cx(
-        "rounded-2xl border hairline-dark-strong bg-ink-2 p-8 transition-all duration-700 ease-out lg:p-10",
+        "rounded-2xl border hairline-dark-strong bg-ink-2 p-8 transition-all duration-500 ease-[cubic-bezier(0.22,0.95,0.32,1.1)] lg:p-10",
         stacked
           ? active
             ? "relative z-10 translate-y-0 scale-100 opacity-100"
@@ -309,15 +310,17 @@ export function HowItWorks() {
 
       <div className="relative mx-auto max-w-[1240px] px-6 py-24 lg:px-10 lg:py-32">
         <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
-          <div className="max-w-2xl">
-            <SectionLabel index="01" label="Onboarding" tone="paper" />
-            <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] text-ink sm:text-[46px] lg:text-[56px]">
-              Seven steps from passkey to live agent.
-            </h2>
-          </div>
-          <p className="max-w-sm text-[14.5px] leading-[1.55] text-muted-dark">
+        <Reveal variant="left" className="max-w-2xl">
+          <SectionLabel index="01" label="Onboarding" tone="paper" />
+          <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] text-ink sm:text-[46px] lg:text-[56px]">
+            Seven steps from passkey to live agent.
+          </h2>
+        </Reveal>
+        <Reveal variant="right" delay={120} className="max-w-sm">
+          <p className="text-[14.5px] leading-[1.55] text-muted-dark">
             Scroll through each step — the same flow you walk in onboarding.
           </p>
+        </Reveal>
         </div>
 
         <div className="mt-10 lg:hidden">

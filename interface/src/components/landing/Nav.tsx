@@ -9,7 +9,7 @@ const links = [
 
 export function Nav() {
   return (
-    <header className="sticky top-0 z-50">
+    <header className="sticky top-0 z-50 anim-nav-drop">
       <div className="absolute inset-0 -z-10 backdrop-blur-md bg-paper/75 border-b hairline" />
       <nav className="mx-auto flex h-16 max-w-[1240px] items-center justify-between px-6 lg:px-10">
         <Wordmark />

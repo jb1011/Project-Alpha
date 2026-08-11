@@ -1,3 +1,4 @@
+import { Reveal } from "./Reveal";
 import { SectionLabel } from "./SectionLabel";
 import { Terminal } from "./Terminal";
 
@@ -44,48 +45,51 @@ export function CLIShowcase() {
 
       <div className="relative mx-auto grid max-w-[1240px] grid-cols-1 gap-12 px-6 py-24 lg:grid-cols-[0.95fr_1.05fr] lg:gap-16 lg:px-10 lg:py-32">
         <div className="flex flex-col justify-center">
-          <SectionLabel index="03" label="MCP agent connect" tone="paper" />
-          <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] text-ink sm:text-[44px] lg:text-[52px]">
-            Connect your agent via MCP.
-          </h2>
-          <p className="mt-5 max-w-md text-[15px] leading-[1.6] text-muted-dark">
-            Bootstrap a tenant-wide connection at /agents/connect: generate a
-            link code, have your agent call claim_connection and onboard_agent,
-            then poll get_entity. Scoped keys with a capability ladder from read
-            to provision.
-          </p>
+          <Reveal variant="left">
+            <SectionLabel index="03" label="MCP agent connect" tone="paper" />
+            <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] text-ink sm:text-[44px] lg:text-[52px]">
+              Connect your agent via MCP.
+            </h2>
+            <p className="mt-5 max-w-md text-[15px] leading-[1.6] text-muted-dark">
+              Bootstrap a tenant-wide connection at /agents/connect: generate a
+              link code, have your agent call claim_connection and onboard_agent,
+              then poll get_entity. Scoped keys with a capability ladder from read
+              to provision.
+            </p>
+          </Reveal>
 
           <ul className="mt-8 space-y-px overflow-hidden rounded-xl border hairline-dark-strong bg-line-dark-strong">
-            {policyFields.map((r) => (
-              <li
-                key={r.name}
-                className="group flex items-center gap-4 bg-ink-2 px-5 py-3.5 transition-colors hover:bg-ink-3"
-              >
-                <span className="font-mono text-[12.5px] text-highlight w-36 shrink-0">
-                  {r.name}
-                </span>
-                <span className="text-[13.5px] text-muted-dark">{r.desc}</span>
-              </li>
+            {policyFields.map((r, i) => (
+              <Reveal key={r.name} as="li" delay={i * 70} variant="left" duration={560}>
+                <div className="group flex items-center gap-4 bg-ink-2 px-5 py-3.5 transition-colors hover:bg-ink-3">
+                  <span className="font-mono text-[12.5px] text-highlight w-36 shrink-0">
+                    {r.name}
+                  </span>
+                  <span className="text-[13.5px] text-muted-dark">{r.desc}</span>
+                </div>
+              </Reveal>
             ))}
           </ul>
 
-          <div className="mt-7 flex flex-wrap items-center gap-3">
-            <a
-              href="/agents/connect"
-              className="inline-flex items-center gap-1.5 rounded-full bg-paper px-4 py-2.5 text-[13px] font-medium text-ink hover:bg-paper-2 transition-colors"
-            >
-              Connect your agent <span aria-hidden>→</span>
-            </a>
-            <a
-              href="/onboarding"
-              className="inline-flex items-center gap-1.5 rounded-full border hairline-dark-strong px-4 py-2.5 text-[13px] text-ink/90 hover:bg-ink-3 transition-colors"
-            >
-              Manual onboarding
-            </a>
-          </div>
+          <Reveal delay={420} variant="pop">
+            <div className="mt-7 flex flex-wrap items-center gap-3">
+              <a
+                href="/agents/connect"
+                className="inline-flex items-center gap-1.5 rounded-full bg-paper px-4 py-2.5 text-[13px] font-medium text-ink transition-all duration-300 hover:bg-paper-2 hover:scale-[1.03] active:scale-[0.98]"
+              >
+                Connect your agent <span aria-hidden>→</span>
+              </a>
+              <a
+                href="/onboarding"
+                className="inline-flex items-center gap-1.5 rounded-full border hairline-dark-strong px-4 py-2.5 text-[13px] text-ink/90 transition-all duration-300 hover:bg-ink-3 hover:scale-[1.03] active:scale-[0.98]"
+              >
+                Manual onboarding
+              </a>
+            </div>
+          </Reveal>
         </div>
 
-        <div className="relative">
+        <Reveal variant="right" delay={160} duration={760} className="relative">
           <div
             aria-hidden
             className="pointer-events-none absolute -inset-6 -z-10 rounded-[28px] bg-gradient-to-br from-accent/20 via-transparent to-highlight/20 blur-2xl"
@@ -138,11 +142,17 @@ export function CLIShowcase() {
           />
 
           <div className="mt-4 grid grid-cols-3 gap-3">
-            <Pill label="Endpoint" value="MCP" />
-            <Pill label="Bootstrap" value="Live" />
-            <Pill label="Approval" value="Human" />
+            {[
+              { label: "Endpoint", value: "MCP" },
+              { label: "Bootstrap", value: "Live" },
+              { label: "Approval", value: "Human" },
+            ].map((pill, i) => (
+              <Reveal key={pill.label} delay={320 + i * 80} variant="scale" duration={520}>
+                <Pill label={pill.label} value={pill.value} />
+              </Reveal>
+            ))}
           </div>
-        </div>
+        </Reveal>
       </div>
     </section>
   );
@@ -150,7 +160,7 @@ export function CLIShowcase() {
 
 function Pill({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-xl border hairline-dark-strong bg-ink-2 px-3.5 py-3">
+    <div className="rounded-xl border hairline-dark-strong bg-ink-2 px-3.5 py-3 transition-transform duration-300 hover:scale-[1.04]">
       <div className="text-[10.5px] uppercase tracking-[0.18em] text-muted-dark-2">
         {label}
       </div>

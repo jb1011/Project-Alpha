@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Reveal } from "./Reveal";
 import { SectionLabel } from "./SectionLabel";
 
 type Feature = {
@@ -78,7 +79,7 @@ function FeatureCard({
   return (
     <article
       className={cx(
-        "group rounded-2xl border hairline-strong bg-paper p-8 transition-all duration-700 ease-out lg:p-10",
+        "group rounded-2xl border hairline-strong bg-paper p-8 transition-all duration-500 ease-[cubic-bezier(0.22,0.95,0.32,1.1)] lg:p-10",
         stacked
           ? active
             ? "relative z-10 translate-y-0 scale-100 opacity-100"
@@ -230,18 +231,20 @@ export function Features() {
 
   return (
     <section id="features" className="relative bg-paper-grain">
-      <div className="mx-auto max-w-[1240px] px-6 py-24 lg:px-10 lg:py-32">
+      <div className="relative mx-auto max-w-[1240px] px-6 py-24 lg:px-10 lg:py-32">
         <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
-          <div className="max-w-2xl">
-            <SectionLabel index="02" label="What you get" />
-            <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] sm:text-[46px] lg:text-[54px]">
-              Everything in the onboarding flow.
-            </h2>
-          </div>
-          <p className="max-w-md text-[14.5px] leading-[1.55] text-muted">
+        <Reveal variant="left" className="max-w-2xl">
+          <SectionLabel index="02" label="What you get" />
+          <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] sm:text-[46px] lg:text-[54px]">
+            Everything in the onboarding flow.
+          </h2>
+        </Reveal>
+        <Reveal variant="right" delay={120} className="max-w-md">
+          <p className="text-[14.5px] leading-[1.55] text-muted">
             Scroll through each capability — custody, policy, identity, legal,
             chain, guardian controls, and MCP connect.
           </p>
+        </Reveal>
         </div>
 
         <div className="mt-10 lg:hidden">
