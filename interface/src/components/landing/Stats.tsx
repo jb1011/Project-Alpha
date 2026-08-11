@@ -23,15 +23,13 @@ const capabilities = [
 
 export function Stats() {
   return (
-    <section className="relative border-y hairline bg-paper-2">
+    <section className="relative bg-paper-2">
       <div className="mx-auto max-w-[1240px] px-6 lg:px-10">
-        <div className="grid grid-cols-2 divide-x divide-y hairline md:grid-cols-4 md:divide-y-0">
+        <div className="grid grid-cols-2 md:grid-cols-4">
           {capabilities.map((s, i) => (
             <div
               key={s.label}
-              className={`group relative px-6 py-8 md:px-8 md:py-10 ${
-                i === 0 ? "border-l-0" : ""
-              }`}
+              className="group relative bg-paper-2 px-6 py-8 md:px-8 md:py-10"
             >
               <div className="text-[11px] uppercase tracking-[0.2em] text-muted-2">
                 {String(i + 1).padStart(2, "0")} · {s.label}
