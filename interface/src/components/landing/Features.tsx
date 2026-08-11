@@ -1,11 +1,14 @@
+"use client";
+
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { SectionLabel } from "./SectionLabel";
-import type { ReactNode } from "react";
 
 type Feature = {
   title: string;
   body: string;
   tag: string;
   icon: ReactNode;
+  cta?: { label: string; href: string };
 };
 
 const features: Feature[] = [
@@ -50,12 +53,41 @@ const features: Feature[] = [
     title: "MCP agent connect",
     body: "Connect Claude Code, Cursor, or any of 11 MCP clients via /agents/connect. Bootstrap with a link code, claim_connection, and onboard_agent — scoped keys with a capability ladder from read to provision.",
     icon: <IconMcp />,
+    cta: { label: "Connect your agent", href: "/agents/connect" },
   },
 ];
 
-function FeatureCard({ feature }: { feature: Feature }) {
+const PANEL_COUNT = features.length;
+const STEP_SCROLL_VH = 50;
+
+function cx(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
+}
+
+function FeatureCard({
+  feature,
+  index,
+  active,
+  stacked = false,
+}: {
+  feature: Feature;
+  index: number;
+  active: boolean;
+  stacked?: boolean;
+}) {
   return (
-    <article className="group relative flex flex-col gap-6 bg-paper p-7 transition-colors hover:bg-paper-2 lg:p-8">
+    <article
+      className={cx(
+        "group rounded-2xl border hairline-strong bg-paper p-8 transition-all duration-700 ease-out lg:p-10",
+        stacked
+          ? active
+            ? "relative z-10 translate-y-0 scale-100 opacity-100"
+            : "pointer-events-none absolute inset-x-0 top-0 z-0 translate-y-4 scale-[0.98] opacity-0"
+          : active
+            ? "relative translate-y-0 scale-100 opacity-100"
+            : "relative translate-y-6 scale-[0.98] opacity-40",
+      )}
+    >
       <div className="flex items-start justify-between">
         <div className="inline-flex h-11 w-11 items-center justify-center rounded-lg border hairline-strong bg-paper-2 text-ink transition-all group-hover:bg-ink group-hover:text-paper group-hover:-translate-y-0.5 group-hover:border-transparent">
           {feature.icon}
@@ -65,17 +97,137 @@ function FeatureCard({ feature }: { feature: Feature }) {
         </span>
       </div>
 
-      <div>
-        <h3 className="text-[19px] font-medium tracking-[-0.01em] text-ink">
-          {feature.title}
-        </h3>
-        <p className="mt-2 text-[14px] leading-[1.55] text-muted">{feature.body}</p>
+      <div className="mt-8 font-mono text-[12px] text-muted-2">
+        FEATURE {index + 1}
       </div>
+      <h3 className="mt-4 text-[28px] font-medium leading-none tracking-[-0.01em] text-ink">
+        {feature.title}
+      </h3>
+      <p className="mt-3 max-w-prose text-[14.5px] leading-[1.6] text-muted">
+        {feature.body}
+      </p>
+
+      {feature.cta && (
+        <a
+          href={feature.cta.href}
+          className="mt-6 inline-flex items-center gap-1.5 rounded-full bg-ink px-5 py-2.5 text-[13px] font-medium text-paper transition-colors hover:bg-ink-hover"
+        >
+          {feature.cta.label} <span aria-hidden>→</span>
+        </a>
+      )}
     </article>
   );
 }
 
+function FeatureRail({
+  activeIndex,
+  onSelect,
+}: {
+  activeIndex: number;
+  onSelect: (index: number) => void;
+}) {
+  return (
+    <ol className="space-y-1">
+      {features.map((feature, i) => {
+        const active = activeIndex === i;
+        const done = activeIndex > i;
+        return (
+          <li key={feature.title}>
+            <button
+              type="button"
+              onClick={() => onSelect(i)}
+              className={cx(
+                "group flex w-full items-start gap-3 rounded-lg px-2 py-2.5 text-left transition-colors",
+                active ? "bg-paper-2" : "hover:bg-paper-2/60",
+              )}
+            >
+              <span
+                className={cx(
+                  "mt-0.5 flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border text-[10px] font-mono transition-colors",
+                  active
+                    ? "border-accent bg-accent text-paper"
+                    : done
+                      ? "border-accent/40 bg-paper text-accent-soft"
+                      : "border-line-strong bg-paper text-muted-2",
+                )}
+              >
+                {i + 1}
+              </span>
+              <span className="min-w-0 pt-0.5">
+                <span
+                  className={cx(
+                    "block text-[13px] font-medium leading-snug transition-colors",
+                    active ? "text-ink" : done ? "text-ink/70" : "text-muted",
+                  )}
+                >
+                  {feature.title}
+                </span>
+              </span>
+            </button>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function MobileProgress({ activeIndex }: { activeIndex: number }) {
+  return (
+    <div className="lg:hidden">
+      <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.16em] text-muted-2">
+        <span>
+          Feature {activeIndex + 1} / {PANEL_COUNT}
+        </span>
+        <span>{features[activeIndex]?.title}</span>
+      </div>
+      <div className="mt-2 h-1 overflow-hidden rounded-full bg-line-strong">
+        <div
+          className="h-full rounded-full bg-accent transition-all duration-500 ease-out"
+          style={{ width: `${((activeIndex + 1) / PANEL_COUNT) * 100}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function Features() {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const sentinelRefs = useRef<Array<HTMLDivElement | null>>([]);
+
+  useEffect(() => {
+    function updateActiveStep() {
+      const center = window.innerHeight * 0.42;
+      let bestIndex = 0;
+      let bestDistance = Number.POSITIVE_INFINITY;
+
+      sentinelRefs.current.forEach((el, index) => {
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const midpoint = rect.top + rect.height / 2;
+        const distance = Math.abs(midpoint - center);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestIndex = index;
+        }
+      });
+
+      setActiveIndex(bestIndex);
+    }
+
+    window.addEventListener("scroll", updateActiveStep, { passive: true });
+    window.addEventListener("resize", updateActiveStep);
+    updateActiveStep();
+
+    return () => {
+      window.removeEventListener("scroll", updateActiveStep);
+      window.removeEventListener("resize", updateActiveStep);
+    };
+  }, []);
+
+  function scrollToFeature(index: number) {
+    sentinelRefs.current[index]?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
   return (
     <section id="features" className="relative bg-paper-grain">
       <div className="mx-auto max-w-[1240px] px-6 py-24 lg:px-10 lg:py-32">
@@ -87,39 +239,52 @@ export function Features() {
             </h2>
           </div>
           <p className="max-w-md text-[14.5px] leading-[1.55] text-muted">
-            Custody choice, World ID verification, spending policy, legal agreement,
-            on-chain deployment, MCP connect, and guardian controls — the full stack
-            for an autonomous agent that holds real money.
+            Scroll through each capability — custody, policy, identity, legal,
+            chain, guardian controls, and MCP connect.
           </p>
         </div>
 
-        <div className="mt-14 overflow-hidden rounded-2xl border hairline-strong bg-line-strong">
-          <div className="grid grid-cols-1 gap-px sm:grid-cols-2 lg:grid-cols-3">
-            {features.slice(0, 6).map((f) => (
-              <FeatureCard key={f.title} feature={f} />
-            ))}
-          </div>
+        <div className="mt-10 lg:hidden">
+          <MobileProgress activeIndex={activeIndex} />
+        </div>
 
-          <div className="grid grid-cols-1 gap-px border-t hairline-strong lg:grid-cols-[1fr_auto]">
-            <FeatureCard feature={features[6]!} />
-            <div className="flex flex-col justify-center bg-paper-2 px-7 py-8 lg:px-8 lg:py-10">
-              <div className="text-[10px] uppercase tracking-[0.2em] text-muted-2">
-                Connect
+        <div className="relative mt-8 lg:mt-14">
+          <div className="sticky top-20 z-10 lg:top-24">
+            <div className="flex min-h-[calc(100dvh-5.5rem)] items-center py-4 lg:min-h-[calc(100dvh-6.5rem)] lg:py-6">
+              <div className="grid w-full gap-10 lg:grid-cols-[minmax(220px,280px)_minmax(0,1fr)] lg:gap-14">
+                <aside className="hidden lg:block">
+                  <p className="mb-4 font-mono text-[11px] uppercase tracking-[0.18em] text-muted-2">
+                    Feature {activeIndex + 1} of {PANEL_COUNT}
+                  </p>
+                  <FeatureRail activeIndex={activeIndex} onSelect={scrollToFeature} />
+                </aside>
+
+                <div className="relative min-h-[380px] lg:min-h-[400px]">
+                  {features.map((feature, i) => (
+                    <FeatureCard
+                      key={feature.title}
+                      feature={feature}
+                      index={i}
+                      active={activeIndex === i}
+                      stacked
+                    />
+                  ))}
+                </div>
               </div>
-              <p className="mt-2 max-w-xs text-[15px] font-medium leading-snug text-ink">
-                Hook up Claude, Cursor, or any MCP client.
-              </p>
-              <p className="mt-2 max-w-xs text-[13px] leading-[1.55] text-muted">
-                Bootstrap a link code and let your agent onboard itself.
-              </p>
-              <a
-                href="/agents/connect"
-                className="mt-5 inline-flex items-center gap-1.5 text-[13px] font-medium text-accent-soft transition-colors hover:text-ink"
-              >
-                Connect your agent <span aria-hidden>→</span>
-              </a>
             </div>
           </div>
+
+          {Array.from({ length: PANEL_COUNT }, (_, i) => (
+            <div
+              key={i}
+              ref={(el) => {
+                sentinelRefs.current[i] = el;
+              }}
+              aria-hidden
+              className="pointer-events-none"
+              style={{ height: `${STEP_SCROLL_VH}vh` }}
+            />
+          ))}
         </div>
       </div>
     </section>

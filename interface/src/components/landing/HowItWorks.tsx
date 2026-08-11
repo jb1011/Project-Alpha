@@ -1,3 +1,6 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
 import { SectionLabel } from "./SectionLabel";
 
 const steps = [
@@ -62,43 +65,62 @@ const steps = [
     ],
     glyph: <FundGlyph />,
   },
-];
+] as const;
 
 type Step = (typeof steps)[number];
 
-function StepCard({ step, finale }: { step: Step; finale?: boolean }) {
+const PANEL_COUNT = steps.length + 1;
+/** Viewport heights per step — scroll runway below the sticky stage. */
+const STEP_SCROLL_VH = 50;
+
+function cx(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
+}
+
+function StepCard({
+  step,
+  active,
+  stacked = false,
+}: {
+  step: Step;
+  active: boolean;
+  stacked?: boolean;
+}) {
   return (
     <div
-      className={`group relative bg-ink-2 transition-colors hover:bg-ink-3 ${
-        finale ? "p-8 lg:p-10" : "p-8 lg:p-10"
-      }`}
+      className={cx(
+        "group rounded-2xl border hairline-dark-strong bg-ink-2 p-8 transition-all duration-700 ease-out lg:p-10",
+        stacked
+          ? active
+            ? "relative z-10 translate-y-0 scale-100 opacity-100"
+            : "pointer-events-none absolute inset-x-0 top-0 z-0 translate-y-4 scale-[0.98] opacity-0"
+          : active
+            ? "relative translate-y-0 scale-100 opacity-100"
+            : "relative translate-y-6 scale-[0.98] opacity-40",
+      )}
     >
       <div className="flex items-start justify-between">
         <div className="font-mono text-[12px] text-muted-dark-2">STEP {step.n}</div>
-        <div className="text-accent-soft/80 transition-transform group-hover:-translate-y-0.5">
+        <div
+          className={cx(
+            "text-accent-soft/80 transition-transform duration-500",
+            active && "group-hover:-translate-y-0.5",
+          )}
+        >
           {step.glyph}
         </div>
       </div>
 
-      <h3
-        className={`font-medium leading-none tracking-[-0.01em] text-ink ${
-          finale ? "mt-6 text-[24px] lg:mt-8 lg:text-[28px]" : "mt-10 text-[28px]"
-        }`}
-      >
+      <h3 className="mt-10 text-[28px] font-medium leading-none tracking-[-0.01em] text-ink">
         {step.title}
       </h3>
       <p className="mt-3 max-w-prose text-[14.5px] leading-[1.6] text-muted-dark">
         {step.body}
       </p>
 
-      <ul className={`space-y-2 ${finale ? "mt-5 flex flex-wrap gap-x-6 gap-y-2 lg:mt-6" : "mt-7"}`}>
+      <ul className="mt-7 space-y-2">
         {step.bullets.map((b) => (
-          <li
-            key={b}
-            className={`flex items-center gap-2.5 text-[13px] text-ink/85 ${
-              finale ? "shrink-0" : ""
-            }`}
-          >
+          <li key={b} className="flex items-center gap-2.5 text-[13px] text-ink/85">
             <span className="h-1 w-1 rounded-full bg-accent" />
             {b}
           </li>
@@ -108,24 +130,182 @@ function StepCard({ step, finale }: { step: Step; finale?: boolean }) {
   );
 }
 
-export function HowItWorks() {
+function DoneCard({ active, stacked = false }: { active: boolean; stacked?: boolean }) {
   return (
-    <section
-      id="how"
-      className="relative overflow-hidden bg-ink-grain text-ink"
+    <div
+      className={cx(
+        "rounded-2xl border hairline-dark-strong bg-ink-2 p-8 transition-all duration-700 ease-out lg:p-10",
+        stacked
+          ? active
+            ? "relative z-10 translate-y-0 scale-100 opacity-100"
+            : "pointer-events-none absolute inset-x-0 top-0 z-0 translate-y-4 scale-[0.98] opacity-0"
+          : active
+            ? "relative translate-y-0 scale-100 opacity-100"
+            : "relative translate-y-6 scale-[0.98] opacity-40",
+      )}
     >
-      <div
-        aria-hidden
-        className="absolute inset-0 ink-grid pointer-events-none"
-      />
-      <div
-        aria-hidden
-        className="pointer-events-none absolute -left-40 top-1/2 h-[480px] w-[480px] -translate-y-1/2 rounded-full bg-accent/15 blur-[120px]"
-      />
-      <div
-        aria-hidden
-        className="pointer-events-none absolute -right-40 top-0 h-[420px] w-[420px] rounded-full bg-highlight/10 blur-[120px]"
-      />
+      <div className="text-[10px] uppercase tracking-[0.2em] text-muted-dark-2">Done</div>
+      <p className="mt-4 text-[24px] font-medium leading-snug text-ink lg:text-[28px]">
+        Your agent is live on the dashboard.
+      </p>
+      <p className="mt-3 max-w-prose text-[14.5px] leading-[1.6] text-muted-dark">
+        Monitor treasury, pause spending, connect via MCP.
+      </p>
+      <a
+        href="/onboarding"
+        className="mt-6 inline-flex items-center gap-1.5 rounded-full bg-ink px-5 py-2.5 text-[13px] font-medium text-paper transition-colors hover:bg-ink-hover"
+      >
+        Start onboarding <span aria-hidden>→</span>
+      </a>
+    </div>
+  );
+}
+
+function StepRail({
+  activeIndex,
+  onSelect,
+}: {
+  activeIndex: number;
+  onSelect: (index: number) => void;
+}) {
+  return (
+    <ol className="space-y-1">
+      {steps.map((step, i) => {
+        const active = activeIndex === i;
+        const done = activeIndex > i;
+        return (
+          <li key={step.n}>
+            <button
+              type="button"
+              onClick={() => onSelect(i)}
+              className={cx(
+                "group flex w-full items-start gap-3 rounded-lg px-2 py-2.5 text-left transition-colors",
+                active ? "bg-ink-3/80" : "hover:bg-ink-3/40",
+              )}
+            >
+              <span
+                className={cx(
+                  "mt-0.5 flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border text-[10px] font-mono transition-colors",
+                  active
+                    ? "border-accent bg-accent text-paper"
+                    : done
+                      ? "border-accent/40 bg-ink-2 text-accent-soft"
+                      : "border-line-dark-strong bg-ink-2 text-muted-dark-2",
+                )}
+              >
+                {step.n}
+              </span>
+              <span className="min-w-0 pt-0.5">
+                <span
+                  className={cx(
+                    "block text-[13px] font-medium leading-snug transition-colors",
+                    active ? "text-ink" : done ? "text-ink/70" : "text-muted-dark",
+                  )}
+                >
+                  {step.title}
+                </span>
+              </span>
+            </button>
+          </li>
+        );
+      })}
+      <li>
+        <button
+          type="button"
+          onClick={() => onSelect(steps.length)}
+          className={cx(
+            "group flex w-full items-start gap-3 rounded-lg px-2 py-2.5 text-left transition-colors",
+            activeIndex === steps.length ? "bg-ink-3/80" : "hover:bg-ink-3/40",
+          )}
+        >
+          <span
+            className={cx(
+              "mt-0.5 flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-full border text-[9px] font-mono uppercase transition-colors",
+              activeIndex === steps.length
+                ? "border-accent bg-accent text-paper"
+                : "border-line-dark-strong bg-ink-2 text-muted-dark-2",
+            )}
+          >
+            ✓
+          </span>
+          <span
+            className={cx(
+              "pt-0.5 text-[13px] font-medium leading-snug transition-colors",
+              activeIndex === steps.length ? "text-ink" : "text-muted-dark",
+            )}
+          >
+            Live dashboard
+          </span>
+        </button>
+      </li>
+    </ol>
+  );
+}
+
+function MobileProgress({ activeIndex }: { activeIndex: number }) {
+  return (
+    <div className="lg:hidden">
+      <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.16em] text-muted-dark-2">
+        <span>
+          Step {Math.min(activeIndex + 1, PANEL_COUNT)} / {PANEL_COUNT}
+        </span>
+        <span>{activeIndex >= steps.length ? "Done" : steps[activeIndex]?.title}</span>
+      </div>
+      <div className="mt-2 h-1 overflow-hidden rounded-full bg-line-dark-strong">
+        <div
+          className="h-full rounded-full bg-accent transition-all duration-500 ease-out"
+          style={{ width: `${((activeIndex + 1) / PANEL_COUNT) * 100}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+export function HowItWorks() {
+  const [activeIndex, setActiveIndex] = useState(0);
+  const sentinelRefs = useRef<Array<HTMLDivElement | null>>([]);
+
+  useEffect(() => {
+    function updateActiveStep() {
+      const center = window.innerHeight * 0.42;
+      let bestIndex = 0;
+      let bestDistance = Number.POSITIVE_INFINITY;
+
+      sentinelRefs.current.forEach((el, index) => {
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const midpoint = rect.top + rect.height / 2;
+        const distance = Math.abs(midpoint - center);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestIndex = index;
+        }
+      });
+
+      setActiveIndex(bestIndex);
+    }
+
+    window.addEventListener("scroll", updateActiveStep, { passive: true });
+    window.addEventListener("resize", updateActiveStep);
+    updateActiveStep();
+
+    return () => {
+      window.removeEventListener("scroll", updateActiveStep);
+      window.removeEventListener("resize", updateActiveStep);
+    };
+  }, []);
+
+  function scrollToStep(index: number) {
+    sentinelRefs.current[index]?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  return (
+    <section id="how" className="relative bg-ink-grain text-ink">
+      <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div className="absolute inset-0 ink-grid" />
+        <div className="absolute -left-40 top-1/2 h-[480px] w-[480px] -translate-y-1/2 rounded-full bg-accent/15 blur-[120px]" />
+        <div className="absolute -right-40 top-0 h-[420px] w-[420px] rounded-full bg-highlight/10 blur-[120px]" />
+      </div>
 
       <div className="relative mx-auto max-w-[1240px] px-6 py-24 lg:px-10 lg:py-32">
         <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
@@ -136,39 +316,46 @@ export function HowItWorks() {
             </h2>
           </div>
           <p className="max-w-sm text-[14.5px] leading-[1.55] text-muted-dark">
-            The same flow you walk through in onboarding — World ID
-            verification, custody choice, spending policy, legal agreement,
-            on-chain deployment, funding, and your guardian dashboard.
+            Scroll through each step — the same flow you walk in onboarding.
           </p>
         </div>
 
-        <div className="mt-14 overflow-hidden rounded-2xl border hairline-dark-strong bg-line-dark-strong">
-          <div className="grid grid-cols-1 gap-px md:grid-cols-2 lg:grid-cols-3">
-            {steps.slice(0, 6).map((s) => (
-              <StepCard key={s.n} step={s} />
-            ))}
-          </div>
+        <div className="mt-10 lg:hidden">
+          <MobileProgress activeIndex={activeIndex} />
+        </div>
 
-          <div className="grid grid-cols-1 gap-px border-t hairline-dark-strong lg:grid-cols-[1fr_auto]">
-            <StepCard step={steps[6]!} finale />
-            <div className="bg-ink-2 px-8 py-8 lg:py-10 lg:pl-10 lg:pr-10">
-              <div className="text-[10px] uppercase tracking-[0.2em] text-muted-dark-2">
-                Done
+        <div className="relative mt-8 lg:mt-14">
+          <div className="sticky top-20 z-10 lg:top-24">
+            <div className="flex min-h-[calc(100dvh-5.5rem)] items-center py-4 lg:min-h-[calc(100dvh-6.5rem)] lg:py-6">
+              <div className="grid w-full gap-10 lg:grid-cols-[minmax(220px,280px)_minmax(0,1fr)] lg:gap-14">
+              <aside className="hidden lg:block">
+                <p className="mb-4 font-mono text-[11px] uppercase tracking-[0.18em] text-muted-dark-2">
+                  Step {Math.min(activeIndex + 1, PANEL_COUNT)} of {PANEL_COUNT}
+                </p>
+                <StepRail activeIndex={activeIndex} onSelect={scrollToStep} />
+              </aside>
+
+              <div className="relative min-h-[380px] lg:min-h-[400px]">
+                {steps.map((step, i) => (
+                  <StepCard key={step.n} step={step} active={activeIndex === i} stacked />
+                ))}
+                <DoneCard active={activeIndex === steps.length} stacked />
               </div>
-              <p className="mt-2 max-w-xs text-[15px] font-medium leading-snug text-ink">
-                Your agent is live on the dashboard.
-              </p>
-              <p className="mt-2 max-w-xs text-[13px] leading-[1.55] text-muted-dark">
-                Monitor treasury, pause spending, connect via MCP.
-              </p>
-              <a
-                href="/onboarding"
-                className="mt-5 inline-flex items-center gap-1.5 text-[13px] font-medium text-accent-soft transition-colors hover:text-ink"
-              >
-                Start onboarding <span aria-hidden>→</span>
-              </a>
+              </div>
             </div>
           </div>
+
+          {Array.from({ length: PANEL_COUNT }, (_, i) => (
+            <div
+              key={i}
+              ref={(el) => {
+                sentinelRefs.current[i] = el;
+              }}
+              aria-hidden
+              className="pointer-events-none"
+              style={{ height: `${STEP_SCROLL_VH}vh` }}
+            />
+          ))}
         </div>
       </div>
     </section>
