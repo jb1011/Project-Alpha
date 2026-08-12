@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import { loadConfig, redact } from "../src/config/env";
+import { TURNKEY_FULL_ENV } from "./helpers/prodEnv";
 
 const base = {
   ARC_TESTNET_RPC_URL: "https://rpc.testnet.arc.network",
@@ -90,12 +91,7 @@ test("production + real secret + explicit WEB_ORIGIN does not throw", () => {
       METADATA_BASE_URL: "https://app.example.com",
       // Prod also requires the default custody provider to be provisionable
       // (test/config/custodyDefault.test.ts) — satisfy it so this test stays about the guards above.
-      TURNKEY_API_PUBLIC_KEY: "pub",
-      TURNKEY_API_PRIVATE_KEY: "priv",
-      TURNKEY_ORGANIZATION_ID: "org",
-      TURNKEY_SIGN_WITH: "0xabc",
-      TURNKEY_DELEGATED_API_PUBLIC_KEY: "dpub",
-      TURNKEY_DELEGATED_API_PRIVATE_KEY: "dpriv",
+      ...TURNKEY_FULL_ENV,
     }),
   ).not.toThrow();
 });

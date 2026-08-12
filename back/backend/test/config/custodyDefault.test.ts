@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import { loadConfig } from "../../src/config/env";
+import { CIRCLE_FULL_ENV, TURNKEY_CORE_ENV, TURNKEY_FULL_ENV } from "../helpers/prodEnv";
 
 /** Production boot invariant for the DEFAULT custody provider (mirror of the existing circle-side
  *  check): a prod deployment whose default is `turnkey` but that cannot provision Turnkey vaults
@@ -17,41 +18,22 @@ const prodBase = {
   NODE_ENV: "production",
 };
 
-const TURNKEY_CORE = {
-  TURNKEY_API_PUBLIC_KEY: "pub",
-  TURNKEY_API_PRIVATE_KEY: "priv",
-  TURNKEY_ORGANIZATION_ID: "org",
-  TURNKEY_SIGN_WITH: "0xabc",
-};
-
-const TURNKEY_FULL = {
-  ...TURNKEY_CORE,
-  TURNKEY_DELEGATED_API_PUBLIC_KEY: "dpub",
-  TURNKEY_DELEGATED_API_PRIVATE_KEY: "dpriv",
-};
-
-const CIRCLE_FULL = {
-  CIRCLE_API_KEY: "ck_test",
-  CIRCLE_ENTITY_SECRET: "es_test",
-  CIRCLE_WALLET_SET_ID: "ws_test",
-};
-
 test("prod + implicit turnkey default + no turnkey config → refuses to boot", () => {
   expect(() => loadConfig(prodBase)).toThrow(/WALLET_PROVIDER_DEFAULT=turnkey/);
 });
 
 test("prod + turnkey default + core config but NO delegated keypair → refuses to boot (provisioning needs it)", () => {
-  expect(() => loadConfig({ ...prodBase, ...TURNKEY_CORE })).toThrow(
+  expect(() => loadConfig({ ...prodBase, ...TURNKEY_CORE_ENV })).toThrow(
     /WALLET_PROVIDER_DEFAULT=turnkey/,
   );
 });
 
 test("prod + turnkey default + full turnkey config → boots", () => {
-  expect(loadConfig({ ...prodBase, ...TURNKEY_FULL }).walletProviderDefault).toBe("turnkey");
+  expect(loadConfig({ ...prodBase, ...TURNKEY_FULL_ENV }).walletProviderDefault).toBe("turnkey");
 });
 
 test("prod circle-only (the mainnet shape): default=circle, no turnkey → boots", () => {
-  const cfg = loadConfig({ ...prodBase, ...CIRCLE_FULL, WALLET_PROVIDER_DEFAULT: "circle" });
+  const cfg = loadConfig({ ...prodBase, ...CIRCLE_FULL_ENV, WALLET_PROVIDER_DEFAULT: "circle" });
   expect(cfg.walletProviderDefault).toBe("circle");
   expect(cfg.turnkey).toBeUndefined();
 });

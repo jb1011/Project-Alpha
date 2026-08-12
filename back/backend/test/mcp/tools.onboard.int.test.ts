@@ -58,18 +58,15 @@ let apiKeys: SqliteApiKeyStore;
 let passkeys: SqlitePasskeyStore;
 let app: ReturnType<typeof buildApiApp>;
 
-beforeEach(() => {
-  db = openDatabase(":memory:");
-  migrate(db);
-  repo = new SqliteEntityRepository(db);
-  apiKeys = new SqliteApiKeyStore(db);
-  passkeys = new SqlitePasskeyStore(db);
+/** One app-construction site for every test in this file — pass deps overrides (e.g. custody
+ *  availability flags) instead of hand-copying the wiring; the `as never` cast lives only here. */
+function buildTestApp(overrides: Record<string, unknown> = {}) {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
   });
-  app = buildApiApp({
+  return buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),
     siweDomain: "wizard.local",
@@ -82,7 +79,17 @@ beforeEach(() => {
     apiKeys,
     passkeys,
     platformManagerAddress: PLATFORM_MANAGER,
+    ...overrides,
   } as never);
+}
+
+beforeEach(() => {
+  db = openDatabase(":memory:");
+  migrate(db);
+  repo = new SqliteEntityRepository(db);
+  apiKeys = new SqliteApiKeyStore(db);
+  passkeys = new SqlitePasskeyStore(db);
+  app = buildTestApp();
 });
 afterEach(() => db.close());
 
@@ -163,28 +170,11 @@ test("onboard_agent with an unknown passkey handle returns isError", async () =>
 
 test("onboard_agent custody=turnkey on a turnkey-less deployment (mainnet shape) → isError, nothing claimed", async () => {
   // The beforeEach app leaves availability flags undefined; build the circle-only shape explicitly.
-  const runner = new OnboardingRunner({
-    repo,
-    runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
-    fundCaps: TEST_FUND_CAPS,
-  });
-  const circleOnlyApp = buildApiApp({
-    webOrigin: "*",
-    nonceStore: new SqliteNonceStore(db),
-    siweDomain: "wizard.local",
-    chainId: 5042002,
-    jwtSecret: "s",
-    jwtTtlSec: 3600,
-    repo,
-    runner,
-    passkeyRpId: "wizard.local",
-    apiKeys,
-    passkeys,
-    platformManagerAddress: PLATFORM_MANAGER,
+  const circleOnlyApp = buildTestApp({
     walletProviderDefault: "circle",
     circleCustodyAvailable: true,
     turnkeyCustodyAvailable: false,
-  } as never);
+  });
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
   const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const { client, close } = await startMcpTestClient(circleOnlyApp, key);

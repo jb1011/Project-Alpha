@@ -37,6 +37,23 @@ export function backfillPocketAddresses(db: Database.Database, masterSeed: Hex):
   return rows.length;
 }
 
+/** Mirror of `assertCircleCoverage` for the turnkey side: a deployment with turnkey-custody agents
+ *  (including legacy rows, whose `wallet_provider` is NULL) but no Turnkey provisioning config must
+ *  refuse to BOOT — those agents' vaults are unserviceable. A circle-only deployment with an empty
+ *  or all-circle DB (the mainnet shape) passes. */
+export function assertTurnkeyCoverage(db: Database.Database, turnkeyServiceable: boolean): void {
+  if (turnkeyServiceable) return;
+  const r = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM entities WHERE wallet_provider = 'turnkey' OR wallet_provider IS NULL",
+    )
+    .get() as { n: number };
+  if (r.n > 0)
+    throw new Error(
+      `${r.n} agent(s) use the turnkey custody path but TURNKEY_* (incl. the delegated keypair) is not configured — refusing to boot (they would be unserviceable)`,
+    );
+}
+
 export function assertCircleCoverage(
   db: Database.Database,
   circle: { apiKey: string; entitySecret: string } | undefined,
