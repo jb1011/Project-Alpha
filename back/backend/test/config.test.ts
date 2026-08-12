@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import { loadConfig, redact } from "../src/config/env";
+import { TURNKEY_FULL_ENV } from "./helpers/prodEnv";
 
 const base = {
   ARC_TESTNET_RPC_URL: "https://rpc.testnet.arc.network",
@@ -88,6 +89,9 @@ test("production + real secret + explicit WEB_ORIGIN does not throw", () => {
       AUTH_JWT_SECRET: "a-real-secret-that-is-long-enough-for-prod",
       WEB_ORIGIN: "https://app.example.com",
       METADATA_BASE_URL: "https://app.example.com",
+      // Prod also requires the default custody provider to be provisionable
+      // (test/config/custodyDefault.test.ts) — satisfy it so this test stays about the guards above.
+      ...TURNKEY_FULL_ENV,
     }),
   ).not.toThrow();
 });

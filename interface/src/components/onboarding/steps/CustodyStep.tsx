@@ -23,6 +23,7 @@ const OPTIONS: {
   tagline: string;
   points: string[];
   tradeoff: string;
+  unavailableNote: string;
 }[] = [
   {
     value: "circle",
@@ -36,6 +37,8 @@ const OPTIONS: {
     ],
     tradeoff:
       "The platform controls the operator's hot keys (in Circle MPC — never stored on our servers). Your guardian wallet still outranks the agent on-chain: pause, veto, and clawback always answer to you.",
+    unavailableNote:
+      "This deployment isn't configured for Novi-managed custody, so it can't be selected here.",
   },
   {
     value: "turnkey",
@@ -48,17 +51,31 @@ const OPTIONS: {
     ],
     tradeoff:
       "Keeps the operational overhead the managed path removes: gas top-ups on funding, and metered signing costs on the key vault.",
+    unavailableNote:
+      "This deployment doesn't offer passkey-rooted custody, so it can't be selected here.",
   },
 ];
 
 export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
   const { data: publicConfig, isError } = usePublicConfigQuery();
-  const circleAvailable = isError ? null : publicConfig?.circleCustodyAvailable ?? null;
-
-  const circleUnavailable = circleAvailable === false;
-  // Derived, not stored: a deployment that can't serve circle shows turnkey as selected without
-  // an effect writing to parent state (which would cascade renders).
-  const selected = circleUnavailable ? "turnkey" : config.custody;
+  // Availability per option; null = unknown (loading/error → fail open, the backend gate is the
+  // backstop). An absent turnkey field = a backend predating per-provider gating, which always
+  // served turnkey.
+  const unavailable: Record<Custody, boolean> = {
+    circle: !isError && publicConfig?.circleCustodyAvailable === false,
+    turnkey: !isError && publicConfig?.turnkeyCustodyAvailable === false,
+  };
+  const loading = !publicConfig && !isError;
+  const noneAvailable = unavailable.circle && unavailable.turnkey;
+  // Derived, not stored: when the stored choice is unserveable, show the first AVAILABLE option
+  // as selected without an effect writing to parent state (which would cascade renders). When
+  // nothing is available (bare credential-less deployment) there is no selection — the step
+  // dead-ends below instead of submitting a value /config already said would be refused.
+  const selected: Custody | null = noneAvailable
+    ? null
+    : unavailable[config.custody]
+      ? (OPTIONS.find((o) => !unavailable[o.value])?.value ?? null)
+      : config.custody;
 
   return (
     <div>
@@ -71,7 +88,7 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {OPTIONS.map((o) => {
           const isSelected = selected === o.value;
-          const disabled = o.value === "circle" && circleUnavailable;
+          const disabled = unavailable[o.value];
           return (
             <button
               key={o.value}
@@ -115,25 +132,33 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
                 ))}
               </ul>
               <p className="mt-3 border-t hairline pt-3 text-[11.5px] leading-[1.5] text-muted-2">
-                {disabled
-                  ? "This deployment isn't configured for Novi-managed custody, so it can't be selected here."
-                  : o.tradeoff}
+                {disabled ? o.unavailableNote : o.tradeoff}
               </p>
             </button>
           );
         })}
       </div>
 
-      <Callout tone="accent" className="mt-6" title="What this choice does NOT change">
-        The agent&apos;s payment float (its spending pocket) is platform-managed on both options and
-        capped at the standing-float ceiling. Your guardian wallet keeps every on-chain power —
-        pause, veto, clawback — regardless of custody. Custody is fixed for the life of the agent
-        today; guardian-signed migration between options is on the roadmap.
-      </Callout>
+      {noneAvailable ? (
+        <Callout tone="accent" className="mt-6" title="No custody option is configured">
+          This deployment has neither Novi-managed nor passkey-rooted custody configured, so it
+          can&apos;t onboard new agents. If you run this deployment, configure Circle or Turnkey
+          credentials; otherwise contact the operator.
+        </Callout>
+      ) : (
+        <Callout tone="accent" className="mt-6" title="What this choice does NOT change">
+          The agent&apos;s payment float (its spending pocket) is platform-managed on both options
+          and capped at the standing-float ceiling. Your guardian wallet keeps every on-chain power
+          — pause, veto, clawback — regardless of custody. Custody is fixed for the life of the
+          agent today; guardian-signed migration between options is on the roadmap.
+        </Callout>
+      )}
 
       <StepNav onBack={onBack}>
         <Button
+          disabled={loading || selected === null}
           onClick={() => {
+            if (selected === null) return;
             // Commit the derived selection in the event handler (not an effect) so a downgraded
             // choice is what actually gets submitted.
             if (selected !== config.custody) onChange({ ...config, custody: selected });

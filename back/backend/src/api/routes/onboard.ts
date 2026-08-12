@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import { getAddress } from "viem";
 import type { GuardianPasskey } from "../../adapters/turnkey/provisioner";
 import type { AuthVars } from "../../auth/middleware";
+import { custodyUnavailableMessage } from "../../custody";
 import { AgentSpecSchema } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
@@ -32,11 +33,9 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       throw new ApiError("validation_error", 400, 'custody must be "turnkey" or "circle"');
     const custody = (body.custody ?? deps.walletProviderDefault) as "turnkey" | "circle";
     if (custody === "circle" && !deps.circleCustodyAvailable)
-      throw new ApiError(
-        "validation_error",
-        400,
-        "circle custody is not available on this deployment (Circle credentials/wallet set not configured)",
-      );
+      throw new ApiError("validation_error", 400, custodyUnavailableMessage("circle"));
+    if (custody === "turnkey" && !deps.turnkeyCustodyAvailable)
+      throw new ApiError("validation_error", 400, custodyUnavailableMessage("turnkey"));
 
     // Proof-of-personhood gate: the guardian is the legally accountable natural person, so when
     // enforcement is on they must be a World-ID-verified unique human under the per-human cap.

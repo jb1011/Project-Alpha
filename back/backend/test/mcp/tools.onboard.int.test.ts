@@ -58,18 +58,15 @@ let apiKeys: SqliteApiKeyStore;
 let passkeys: SqlitePasskeyStore;
 let app: ReturnType<typeof buildApiApp>;
 
-beforeEach(() => {
-  db = openDatabase(":memory:");
-  migrate(db);
-  repo = new SqliteEntityRepository(db);
-  apiKeys = new SqliteApiKeyStore(db);
-  passkeys = new SqlitePasskeyStore(db);
+/** One app-construction site for every test in this file — pass deps overrides (e.g. custody
+ *  availability flags) instead of hand-copying the wiring; the `as never` cast lives only here. */
+function buildTestApp(overrides: Record<string, unknown> = {}) {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
   });
-  app = buildApiApp({
+  return buildApiApp({
     webOrigin: "*",
     nonceStore: new SqliteNonceStore(db),
     siweDomain: "wizard.local",
@@ -82,7 +79,17 @@ beforeEach(() => {
     apiKeys,
     passkeys,
     platformManagerAddress: PLATFORM_MANAGER,
+    ...overrides,
   } as never);
+}
+
+beforeEach(() => {
+  db = openDatabase(":memory:");
+  migrate(db);
+  repo = new SqliteEntityRepository(db);
+  apiKeys = new SqliteApiKeyStore(db);
+  passkeys = new SqlitePasskeyStore(db);
+  app = buildTestApp();
 });
 afterEach(() => db.close());
 
@@ -156,6 +163,31 @@ test("onboard_agent with an unknown passkey handle returns isError", async () =>
       arguments: { spec: VALID_SPEC, passkeyId: "nope" },
     });
     expect(res.isError).toBe(true);
+  } finally {
+    await close();
+  }
+});
+
+test("onboard_agent custody=turnkey on a turnkey-less deployment (mainnet shape) → isError, nothing claimed", async () => {
+  // The beforeEach app leaves availability flags undefined; build the circle-only shape explicitly.
+  const circleOnlyApp = buildTestApp({
+    walletProviderDefault: "circle",
+    circleCustodyAvailable: true,
+    turnkeyCustodyAvailable: false,
+  });
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const { client, close } = await startMcpTestClient(circleOnlyApp, key);
+  try {
+    const res = await client.callTool({
+      name: "onboard_agent",
+      arguments: { spec: VALID_SPEC, passkeyId: handle, custody: "turnkey" },
+    });
+    expect(res.isError).toBe(true);
+    expect((res.content as { text: string }[])[0]!.text).toMatch(
+      /turnkey custody is not available/,
+    );
+    expect(repo.listByTenant(TENANT)).toHaveLength(0);
   } finally {
     await close();
   }

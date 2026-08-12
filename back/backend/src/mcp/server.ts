@@ -6,6 +6,7 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
 import { toEntityView } from "../api/views";
+import { custodyUnavailableMessage } from "../custody";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import type { EntityPaymentService } from "../payments/entityPayment";
@@ -22,9 +23,10 @@ export interface McpToolDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
-  /** Tier-0 custody: platform default + circle-provisioning availability (mirrors ApiDeps). */
+  /** Tier-0 custody: platform default + per-provider provisioning availability (mirrors ApiDeps). */
   walletProviderDefault: "turnkey" | "circle";
   circleCustodyAvailable: boolean;
+  turnkeyCustodyAvailable: boolean;
   /** Audit fix C: the platform/manager account address, force-set into `roles.manager` on
    *  onboard_agent so an agent-first caller never needs to know or guess it. */
   platformManagerAddress: string;
@@ -54,6 +56,21 @@ export interface McpToolDeps {
   };
   /** World ID guardian gate (mirrors the REST /onboard gate). Optional. */
   worldId?: import("../api/routes/worldId").WorldIdDeps;
+}
+
+/** Availability sentence for the onboard_agent description — agent-first callers have no GET
+ *  /config, so the tool description is their custody-capability discovery surface. */
+function custodyCapabilityNote(
+  deps: Pick<
+    McpToolDeps,
+    "walletProviderDefault" | "circleCustodyAvailable" | "turnkeyCustodyAvailable"
+  >,
+): string {
+  const available =
+    [deps.circleCustodyAvailable && "'circle'", deps.turnkeyCustodyAvailable && "'turnkey'"]
+      .filter(Boolean)
+      .join(", ") || "none";
+  return `('${deps.walletProviderDefault}'). Available on this deployment: ${available}.`;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -454,15 +471,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "onboard_agent",
     {
       title: "Onboard agent",
-      description:
-        "Create an agent legal body. spec must match schema://agent-spec; the guardian is set " +
-        "automatically to your tenant and the manager is set automatically to the platform " +
-        "manager account — you don't need to know or supply either. passkeyId references a " +
-        "previously stored guardian passkey (POST /passkey). custody optionally picks the " +
-        "operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' " +
-        "(guardian-passkey-rooted key vault) — omitted uses the platform default. Returns " +
-        "immediately with status 'pending' — poll get_entity until 'bound'. Requires the " +
-        "provision capability and a tenant-wide key.",
+      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
@@ -477,6 +486,20 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!passkey)
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
       try {
+        // Tier-0 custody: same resolution, availability gates, and ORDER as the REST /onboard
+        // route — gate before the World check and spec parse, circle first, so a request that is
+        // both invalid-spec and unavailable-custody gets the same primary error on both surfaces.
+        const resolvedCustody = custody ?? deps.walletProviderDefault;
+        if (resolvedCustody === "circle" && !deps.circleCustodyAvailable)
+          return {
+            content: [{ type: "text", text: custodyUnavailableMessage("circle") }],
+            isError: true,
+          };
+        if (resolvedCustody === "turnkey" && !deps.turnkeyCustodyAvailable)
+          return {
+            content: [{ type: "text", text: custodyUnavailableMessage("turnkey") }],
+            isError: true,
+          };
         // Mirror of the REST gate: when World enforcement is on, the guardian must be a
         // World-ID-verified unique human under the per-human entity cap.
         assertGuardianAllowed(deps.worldId, tenantId);
@@ -487,18 +510,6 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           manager: deps.platformManagerAddress,
         };
         const parsed = AgentSpecSchema.parse({ ...raw, roles });
-        // Tier-0 custody: same resolution + availability gate as the REST /onboard route.
-        const resolvedCustody = custody ?? deps.walletProviderDefault;
-        if (resolvedCustody === "circle" && !deps.circleCustodyAvailable)
-          return {
-            content: [
-              {
-                type: "text",
-                text: "circle custody is not available on this deployment (Circle credentials/wallet set not configured)",
-              },
-            ],
-            isError: true,
-          };
         const userKey = idempotencyKey && idempotencyKey.length > 0 ? idempotencyKey : parsed.name;
         const { id, status } = deps.runner.start({
           spec: parsed,

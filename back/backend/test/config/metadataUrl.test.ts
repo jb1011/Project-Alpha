@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import { loadConfig } from "../../src/config/env";
+import { TURNKEY_FULL_ENV } from "../helpers/prodEnv";
 
 // Minimal env that passes loadConfig + the existing prod guards (JWT/WEB_ORIGIN), so we isolate the
 // METADATA_BASE_URL check.
@@ -45,6 +46,9 @@ test("prod accepts a real https METADATA_BASE_URL", () => {
     ...baseEnv,
     NODE_ENV: "production",
     METADATA_BASE_URL: "https://project-alpha-pi.vercel.app/backend",
+    // Prod also requires the default custody provider to be provisionable
+    // (test/config/custodyDefault.test.ts) — satisfy it so this test stays about the URL check.
+    ...TURNKEY_FULL_ENV,
   });
   expect(cfg.metadataBaseUrl).toBe("https://project-alpha-pi.vercel.app/backend");
 });

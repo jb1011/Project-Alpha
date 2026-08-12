@@ -267,6 +267,15 @@ function parseLabelAliases(raw: string | undefined): Record<string, string> | un
   return Object.keys(out).length ? out : undefined;
 }
 
+/** The one definition of "this deployment can provision Turnkey vaults": core turnkey config plus
+ *  the delegated keypair (buildTurnkeyProvisionDeps throws without it). Used by the prod boot
+ *  invariant below and by api/main.ts to derive `turnkeyCustodyAvailable` — one predicate, so the
+ *  boot gate and the advertised availability can never drift apart. Note core-without-delegated is
+ *  a legitimate shape (legacy shared-operator signing works; per-agent vault provisioning doesn't). */
+export function canProvisionTurnkey(cfg: Pick<Config, "turnkey">): boolean {
+  return Boolean(cfg.turnkey?.delegatedApiPublicKey && cfg.turnkey?.delegatedApiPrivateKey);
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const parsed = EnvSchema.safeParse(env);
   if (!parsed.success) {
@@ -382,8 +391,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     },
   };
 
+  const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
+
   // Fail-closed: never let production boot with the insecure dev defaults.
-  if ((env.NODE_ENV ?? process.env.NODE_ENV) === "production") {
+  if (isProd) {
     if (cfg.authJwtSecret === DEV_JWT_SECRET)
       throw new Error("Invalid config: AUTH_JWT_SECRET must be set to a real secret in production");
     if (cfg.webOrigin === "*")
@@ -421,6 +432,16 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (cfg.walletProviderDefault === "circle" && !cfg.circle?.walletSetId) {
     throw new Error(
       "Invalid config: WALLET_PROVIDER_DEFAULT=circle requires CIRCLE_API_KEY + CIRCLE_ENTITY_SECRET + CIRCLE_WALLET_SET_ID",
+    );
+  }
+
+  // Symmetric turnkey-side check, production-only: `turnkey` is the SCHEMA default so bare
+  // dev/CI deployments must keep booting credential-less — but a production deployment whose
+  // default custody it cannot provision (vault provisioning needs the delegated keypair too)
+  // would fail every default onboard in front of a user instead of at boot.
+  if (isProd && cfg.walletProviderDefault === "turnkey" && !canProvisionTurnkey(cfg)) {
+    throw new Error(
+      "Invalid config: WALLET_PROVIDER_DEFAULT=turnkey in production requires TURNKEY_API_* + TURNKEY_ORGANIZATION_ID + TURNKEY_SIGN_WITH + TURNKEY_DELEGATED_API_* (set WALLET_PROVIDER_DEFAULT=circle for a circle-only deployment)",
     );
   }
 

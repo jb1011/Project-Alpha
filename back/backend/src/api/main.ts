@@ -17,7 +17,7 @@ import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
-import { WORLD_CHAIN_DEFAULTS, loadConfig } from "../config/env";
+import { WORLD_CHAIN_DEFAULTS, canProvisionTurnkey, loadConfig } from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -36,7 +36,11 @@ import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
-import { assertCircleCoverage, backfillPocketAddresses } from "../persistence/tier0";
+import {
+  assertCircleCoverage,
+  assertTurnkeyCoverage,
+  backfillPocketAddresses,
+} from "../persistence/tier0";
 import { SqliteWorldStore } from "../persistence/worldStore";
 import { usdToUnits } from "../policy/units";
 import type { Address } from "../types";
@@ -48,9 +52,13 @@ import { buildX402DemoDeps } from "./routes/x402Demo";
 async function main() {
   const cfg = loadConfig();
   if (!cfg.factoryAddress) throw new Error("FACTORY_ADDRESS is required to run the API server");
-  if (!cfg.turnkey?.delegatedApiPublicKey || !cfg.turnkey?.delegatedApiPrivateKey)
-    throw new Error(
-      "TURNKEY_DELEGATED_API_{PUBLIC,PRIVATE}_KEY are required to run the API server",
+  // Turnkey is now per-deployment (mirror of circle): a deployment shipping no TURNKEY_* is
+  // turnkey-less by construction — the circle-only mainnet shape. The DB-coverage assert below
+  // still refuses to boot if turnkey-custody agents exist that this deployment can't serve.
+  const turnkeyServiceable = canProvisionTurnkey(cfg);
+  if (cfg.turnkey && !turnkeyServiceable)
+    console.warn(
+      "[boot] TURNKEY_* core config is set but the delegated keypair is missing — per-agent vault provisioning is DISABLED (turnkeyCustodyAvailable=false). If this deployment should serve turnkey custody, set TURNKEY_DELEGATED_API_{PUBLIC,PRIVATE}_KEY.",
     );
 
   const db = openDatabase(cfg.dbPath);
@@ -58,6 +66,7 @@ async function main() {
   // Tier-0: refuse to boot with unserviceable circle-path agents; store pocket addresses once
   // so read paths can stop deriving from the master seed (spec audit items 1 + 7).
   assertCircleCoverage(db, cfg.circle);
+  assertTurnkeyCoverage(db, turnkeyServiceable);
   if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
   const repo = new SqliteEntityRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
@@ -144,17 +153,19 @@ async function main() {
       }
     : undefined;
 
-  const provision = (p: {
-    subOrgName: string;
-    guardianPasskey: GuardianPasskey;
-    guardianEmail?: string;
-  }) =>
-    provisionAgentVault(buildTurnkeyProvisionDeps(cfg), {
-      ...p,
-      delegatedApiPublicKey: cfg.turnkey!.delegatedApiPublicKey!,
-    });
-  const signerForEntity = (e: { subOrgId: string; operator: string }) =>
-    TurnkeySigner.forEntity(cfg, e);
+  // Both seams are optional in the saga; on a turnkey-less deployment they stay undefined and the
+  // onboard gates (REST + MCP) refuse `custody: "turnkey"` before any claim, while
+  // assertTurnkeyCoverage above guarantees no existing row can need them.
+  const provision = turnkeyServiceable
+    ? (p: { subOrgName: string; guardianPasskey: GuardianPasskey; guardianEmail?: string }) =>
+        provisionAgentVault(buildTurnkeyProvisionDeps(cfg), {
+          ...p,
+          delegatedApiPublicKey: cfg.turnkey!.delegatedApiPublicKey!,
+        })
+    : undefined;
+  const signerForEntity = turnkeyServiceable
+    ? (e: { subOrgId: string; operator: string }) => TurnkeySigner.forEntity(cfg, e)
+    : undefined;
 
   // Tier-0 custody wiring. `ARC-TESTNET` is the Circle blockchain enum for chain 5042002 (the
   // only chain this deployment targets); mainnet lands with its own enum in P4.
@@ -309,6 +320,10 @@ async function main() {
     platformManagerAddress,
     walletProviderDefault: cfg.walletProviderDefault,
     circleCustodyAvailable: Boolean(provisionCircle),
+    // One predicate shared with the env.ts boot invariant (canProvisionTurnkey) — the advertised
+    // availability and what provisioning actually needs can never drift apart. A deployment that
+    // ships no TURNKEY_* is turnkey-less by construction — the mainnet circle-only shape.
+    turnkeyCustodyAvailable: turnkeyServiceable,
     repo,
     docStore,
     runner,

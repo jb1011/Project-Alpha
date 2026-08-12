@@ -59,6 +59,8 @@ export interface ApiDeps {
    *  route and the MCP onboard_agent tool refuse a circle request when unavailable. */
   walletProviderDefault: "turnkey" | "circle";
   circleCustodyAvailable: boolean;
+  /** Mirror flag for turnkey: false on deployments (e.g. mainnet) that ship no Turnkey config. */
+  turnkeyCustodyAvailable: boolean;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
@@ -114,6 +116,7 @@ export function buildApiApp(deps: ApiDeps) {
     c.json({
       walletProviderDefault: deps.walletProviderDefault,
       circleCustodyAvailable: deps.circleCustodyAvailable,
+      turnkeyCustodyAvailable: deps.turnkeyCustodyAvailable,
     }),
   );
   mountSchemaRoutes(app);
