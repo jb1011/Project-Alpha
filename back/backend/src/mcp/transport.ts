@@ -24,6 +24,7 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       passkeys: deps.passkeys,
       walletProviderDefault: deps.walletProviderDefault,
       circleCustodyAvailable: deps.circleCustodyAvailable,
+      turnkeyCustodyAvailable: deps.turnkeyCustodyAvailable,
       platformManagerAddress: deps.platformManagerAddress,
       jobs: deps.jobs,
       payments: deps.payments,

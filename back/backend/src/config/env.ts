@@ -424,6 +424,20 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     );
   }
 
+  // Symmetric turnkey-side check, production-only: `turnkey` is the SCHEMA default so bare
+  // dev/CI deployments must keep booting credential-less — but a production deployment whose
+  // default custody it cannot provision (vault provisioning needs the delegated keypair too)
+  // would fail every default onboard in front of a user instead of at boot.
+  if (
+    (env.NODE_ENV ?? process.env.NODE_ENV) === "production" &&
+    cfg.walletProviderDefault === "turnkey" &&
+    !(cfg.turnkey?.delegatedApiPublicKey && cfg.turnkey?.delegatedApiPrivateKey)
+  ) {
+    throw new Error(
+      "Invalid config: WALLET_PROVIDER_DEFAULT=turnkey in production requires TURNKEY_API_* + TURNKEY_ORGANIZATION_ID + TURNKEY_SIGN_WITH + TURNKEY_DELEGATED_API_* (set WALLET_PROVIDER_DEFAULT=circle for a circle-only deployment)",
+    );
+  }
+
   if (cfg.platformOutflowCeiling < cfg.maxTreasuryFund) {
     throw new Error(
       "Invalid config: PLATFORM_OUTFLOW_CEILING_USDC must be >= MAX_TREASURY_FUND_USDC (a single legal fund call must never be auto-blocked)",

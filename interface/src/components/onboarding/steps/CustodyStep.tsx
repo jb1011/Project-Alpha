@@ -54,11 +54,15 @@ const OPTIONS: {
 export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
   const { data: publicConfig, isError } = usePublicConfigQuery();
   const circleAvailable = isError ? null : publicConfig?.circleCustodyAvailable ?? null;
+  // Absent field = a backend that predates per-provider gating, which always served turnkey.
+  const turnkeyAvailable = isError ? null : publicConfig?.turnkeyCustodyAvailable ?? null;
 
   const circleUnavailable = circleAvailable === false;
-  // Derived, not stored: a deployment that can't serve circle shows turnkey as selected without
-  // an effect writing to parent state (which would cascade renders).
-  const selected = circleUnavailable ? "turnkey" : config.custody;
+  const turnkeyUnavailable = turnkeyAvailable === false;
+  // Derived, not stored: a deployment that can't serve an option shows the other as selected
+  // without an effect writing to parent state (which would cascade renders). Circle-only is the
+  // mainnet shape; turnkey-only is the credential-less dev shape.
+  const selected = circleUnavailable ? "turnkey" : turnkeyUnavailable ? "circle" : config.custody;
 
   return (
     <div>
@@ -71,7 +75,9 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {OPTIONS.map((o) => {
           const isSelected = selected === o.value;
-          const disabled = o.value === "circle" && circleUnavailable;
+          const disabled =
+            (o.value === "circle" && circleUnavailable) ||
+            (o.value === "turnkey" && turnkeyUnavailable);
           return (
             <button
               key={o.value}
@@ -116,7 +122,9 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
               </ul>
               <p className="mt-3 border-t hairline pt-3 text-[11.5px] leading-[1.5] text-muted-2">
                 {disabled
-                  ? "This deployment isn't configured for Novi-managed custody, so it can't be selected here."
+                  ? o.value === "circle"
+                    ? "This deployment isn't configured for Novi-managed custody, so it can't be selected here."
+                    : "This deployment doesn't offer passkey-rooted custody, so it can't be selected here."
                   : o.tradeoff}
               </p>
             </button>

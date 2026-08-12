@@ -160,3 +160,45 @@ test("onboard_agent with an unknown passkey handle returns isError", async () =>
     await close();
   }
 });
+
+test("onboard_agent custody=turnkey on a turnkey-less deployment (mainnet shape) → isError, nothing claimed", async () => {
+  // The beforeEach app leaves availability flags undefined; build the circle-only shape explicitly.
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
+  });
+  const circleOnlyApp = buildApiApp({
+    webOrigin: "*",
+    nonceStore: new SqliteNonceStore(db),
+    siweDomain: "wizard.local",
+    chainId: 5042002,
+    jwtSecret: "s",
+    jwtTtlSec: 3600,
+    repo,
+    runner,
+    passkeyRpId: "wizard.local",
+    apiKeys,
+    passkeys,
+    platformManagerAddress: PLATFORM_MANAGER,
+    walletProviderDefault: "circle",
+    circleCustodyAvailable: true,
+    turnkeyCustodyAvailable: false,
+  } as never);
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const { client, close } = await startMcpTestClient(circleOnlyApp, key);
+  try {
+    const res = await client.callTool({
+      name: "onboard_agent",
+      arguments: { spec: VALID_SPEC, passkeyId: handle, custody: "turnkey" },
+    });
+    expect(res.isError).toBe(true);
+    expect((res.content as { text: string }[])[0]!.text).toMatch(
+      /turnkey custody is not available/,
+    );
+    expect(repo.listByTenant(TENANT)).toHaveLength(0);
+  } finally {
+    await close();
+  }
+});

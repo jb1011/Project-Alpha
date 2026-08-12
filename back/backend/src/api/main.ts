@@ -309,6 +309,12 @@ async function main() {
     platformManagerAddress,
     walletProviderDefault: cfg.walletProviderDefault,
     circleCustodyAvailable: Boolean(provisionCircle),
+    // Availability = what vault provisioning actually needs (buildTurnkeyProvisionDeps throws
+    // without the delegated keypair). A deployment that ships no TURNKEY_* is turnkey-less by
+    // construction — that IS the mainnet circle-only shape, no feature flag involved.
+    turnkeyCustodyAvailable: Boolean(
+      cfg.turnkey?.delegatedApiPublicKey && cfg.turnkey?.delegatedApiPrivateKey,
+    ),
     repo,
     docStore,
     runner,

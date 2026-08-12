@@ -37,6 +37,12 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
         400,
         "circle custody is not available on this deployment (Circle credentials/wallet set not configured)",
       );
+    if (custody === "turnkey" && !deps.turnkeyCustodyAvailable)
+      throw new ApiError(
+        "validation_error",
+        400,
+        "turnkey custody is not available on this deployment (Turnkey credentials not configured)",
+      );
 
     // Proof-of-personhood gate: the guardian is the legally accountable natural person, so when
     // enforcement is on they must be a World-ID-verified unique human under the per-human cap.

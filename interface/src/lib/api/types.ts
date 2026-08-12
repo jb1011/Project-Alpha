@@ -37,6 +37,9 @@ export type EntityView = {
 export type PublicConfig = {
   walletProviderDefault: "turnkey" | "circle";
   circleCustodyAvailable: boolean;
+  /** Optional for deploy-order safety: a backend that predates this field means "available"
+   *  (every legacy deployment served turnkey). Mainnet ships false — circle-only. */
+  turnkeyCustodyAvailable?: boolean;
 };
 
 /** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */

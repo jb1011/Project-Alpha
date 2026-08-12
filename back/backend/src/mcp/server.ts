@@ -22,9 +22,10 @@ export interface McpToolDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
-  /** Tier-0 custody: platform default + circle-provisioning availability (mirrors ApiDeps). */
+  /** Tier-0 custody: platform default + per-provider provisioning availability (mirrors ApiDeps). */
   walletProviderDefault: "turnkey" | "circle";
   circleCustodyAvailable: boolean;
+  turnkeyCustodyAvailable: boolean;
   /** Audit fix C: the platform/manager account address, force-set into `roles.manager` on
    *  onboard_agent so an agent-first caller never needs to know or guess it. */
   platformManagerAddress: string;
@@ -489,6 +490,16 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         const parsed = AgentSpecSchema.parse({ ...raw, roles });
         // Tier-0 custody: same resolution + availability gate as the REST /onboard route.
         const resolvedCustody = custody ?? deps.walletProviderDefault;
+        if (resolvedCustody === "turnkey" && !deps.turnkeyCustodyAvailable)
+          return {
+            content: [
+              {
+                type: "text",
+                text: "turnkey custody is not available on this deployment (Turnkey credentials not configured)",
+              },
+            ],
+            isError: true,
+          };
         if (resolvedCustody === "circle" && !deps.circleCustodyAvailable)
           return {
             content: [

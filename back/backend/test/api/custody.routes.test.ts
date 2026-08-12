@@ -46,7 +46,11 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-function makeApp(opts: { circleAvailable: boolean; def?: "turnkey" | "circle" }) {
+function makeApp(opts: {
+  circleAvailable: boolean;
+  turnkeyAvailable?: boolean;
+  def?: "turnkey" | "circle";
+}) {
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
@@ -62,6 +66,7 @@ function makeApp(opts: { circleAvailable: boolean; def?: "turnkey" | "circle" })
     platformManagerAddress: "0x000000000000000000000000000000000000000A",
     walletProviderDefault: opts.def ?? "turnkey",
     circleCustodyAvailable: opts.circleAvailable,
+    turnkeyCustodyAvailable: opts.turnkeyAvailable ?? true,
     repo,
     runner,
     passkeyRpId: "wizard.local",
@@ -145,6 +150,26 @@ test("custody omitted → the platform default is claimed", async () => {
   expect(repo.listByTenant(account.address)[0]!.walletProvider).toBe("turnkey");
 });
 
+// ── Turnkey availability gate (mirror of the circle gate; mainnet ships circle-only by simply
+// not configuring Turnkey, so the deployment must be able to REFUSE turnkey, not crash mid-saga).
+
+test("custody=turnkey on a deployment without turnkey provisioning → named 400, nothing claimed", async () => {
+  const app = makeApp({ circleAvailable: true, turnkeyAvailable: false, def: "circle" });
+  const token = await login(app);
+  const res = await postOnboard(app, token, { custody: "turnkey" });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error.message).toMatch(/turnkey custody is not available/);
+  expect(repo.listByTenant(account.address)).toHaveLength(0);
+});
+
+test("circle-only deployment (the mainnet shape): omitted custody claims circle", async () => {
+  const app = makeApp({ circleAvailable: true, turnkeyAvailable: false, def: "circle" });
+  const token = await login(app);
+  const res = await postOnboard(app, token, {});
+  expect(res.status).toBe(202);
+  expect(repo.listByTenant(account.address)[0]!.walletProvider).toBe("circle");
+});
+
 test("GET /config is public and reports this deployment's custody capabilities", async () => {
   const available = makeApp({ circleAvailable: true, def: "circle" });
   const res = await available.request("/config"); // no auth header — must be public
@@ -152,6 +177,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
   expect(await res.json()).toEqual({
     walletProviderDefault: "circle",
     circleCustodyAvailable: true,
+    turnkeyCustodyAvailable: true,
   });
 
   // A credential-less deployment must advertise that, so the wizard never offers circle there.
@@ -159,5 +185,15 @@ test("GET /config is public and reports this deployment's custody capabilities",
   expect(await (await without.request("/config")).json()).toEqual({
     walletProviderDefault: "turnkey",
     circleCustodyAvailable: false,
+    turnkeyCustodyAvailable: true,
+  });
+
+  // The mainnet shape: circle-only, so the wizard hides the turnkey card instead of offering
+  // an option this deployment would 400.
+  const circleOnly = makeApp({ circleAvailable: true, turnkeyAvailable: false, def: "circle" });
+  expect(await (await circleOnly.request("/config")).json()).toEqual({
+    walletProviderDefault: "circle",
+    circleCustodyAvailable: true,
+    turnkeyCustodyAvailable: false,
   });
 });

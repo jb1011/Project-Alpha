@@ -45,6 +45,14 @@ test("prod accepts a real https METADATA_BASE_URL", () => {
     ...baseEnv,
     NODE_ENV: "production",
     METADATA_BASE_URL: "https://project-alpha-pi.vercel.app/backend",
+    // Prod also requires the default custody provider to be provisionable
+    // (test/config/custodyDefault.test.ts) — satisfy it so this test stays about the URL check.
+    TURNKEY_API_PUBLIC_KEY: "pub",
+    TURNKEY_API_PRIVATE_KEY: "priv",
+    TURNKEY_ORGANIZATION_ID: "org",
+    TURNKEY_SIGN_WITH: "0xabc",
+    TURNKEY_DELEGATED_API_PUBLIC_KEY: "dpub",
+    TURNKEY_DELEGATED_API_PRIVATE_KEY: "dpriv",
   });
   expect(cfg.metadataBaseUrl).toBe("https://project-alpha-pi.vercel.app/backend");
 });

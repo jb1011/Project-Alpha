@@ -88,6 +88,14 @@ test("production + real secret + explicit WEB_ORIGIN does not throw", () => {
       AUTH_JWT_SECRET: "a-real-secret-that-is-long-enough-for-prod",
       WEB_ORIGIN: "https://app.example.com",
       METADATA_BASE_URL: "https://app.example.com",
+      // Prod also requires the default custody provider to be provisionable
+      // (test/config/custodyDefault.test.ts) — satisfy it so this test stays about the guards above.
+      TURNKEY_API_PUBLIC_KEY: "pub",
+      TURNKEY_API_PRIVATE_KEY: "priv",
+      TURNKEY_ORGANIZATION_ID: "org",
+      TURNKEY_SIGN_WITH: "0xabc",
+      TURNKEY_DELEGATED_API_PUBLIC_KEY: "dpub",
+      TURNKEY_DELEGATED_API_PRIVATE_KEY: "dpriv",
     }),
   ).not.toThrow();
 });
