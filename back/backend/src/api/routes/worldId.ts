@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import {
   type WorldIdConfig,
@@ -225,6 +225,59 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
       credential: proof.credential,
       nullifier: proof.nullifier,
       entitiesUsed: world.store.countEntitiesForNullifier(proof.nullifier, world.cfg.action),
+      maxEntities: world.maxEntitiesPerHuman,
+    });
+  });
+
+  // ── Guardian waiver ──────────────────────────────────────────────────────────────────────────
+  // The escape hatch for humans with NO World ID path: no Orb in their country AND a passport
+  // outside World's ~12-country credential list (France is the canonical case — Orb operations
+  // ended there in 2023). Codes are admin-issued via the CLI, single-use, and recorded as
+  // credential "waiver" so nothing downstream can mistake access for verification: the metadata
+  // block publishes humanVerified: false for waived guardians.
+  app.post("/world-id/waiver", requireAuth(deps.jwtSecret), async (c) => {
+    const tenantId = c.get("tenantId");
+    let body: { code?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ApiError("validation_error", 400, "invalid JSON body");
+    }
+    if (typeof body.code !== "string" || !body.code.trim())
+      throw new ApiError("validation_error", 400, "code is required");
+
+    // A real verification outranks a waiver; never overwrite one (recordVerification would
+    // upsert this tenant's row only if the nullifier matched, but refusing early keeps /me
+    // reporting the stronger credential and makes the mistake visible to the caller).
+    if (world.store.findByTenant(tenantId, world.cfg.action))
+      throw new ApiError("already_verified", 409, "this account already has a guardian on record");
+
+    const codeHash = createHash("sha256").update(body.code.trim()).digest("hex");
+    const redeemed = world.store.redeemWaiver(codeHash, tenantId, Date.now());
+    if (!redeemed) {
+      // Unknown, used, expired, and revoked are deliberately one answer: a waiver code is a
+      // bearer secret, and distinguishing states would let anyone probe issued codes.
+      logWorldRejection("waiver", tenantId, "code not redeemable");
+      throw new ApiError("waiver_invalid", 404, "this waiver code cannot be redeemed");
+    }
+
+    const nullifier = `waiver:${codeHash}`;
+    world.store.recordVerification({
+      nullifier,
+      action: world.cfg.action,
+      tenantId,
+      issuerSchemaId: null,
+      credential: "waiver",
+      environment: null,
+      verifiedAt: Date.now(),
+      expiresAtMin: null,
+    });
+    console.warn(`world-id waiver redeemed by ${tenantId.slice(0, 10)}… (${redeemed.note})`);
+    return c.json({
+      status: "verified",
+      credential: "waiver",
+      nullifier,
+      entitiesUsed: world.store.countEntitiesForNullifier(nullifier, world.cfg.action),
       maxEntities: world.maxEntitiesPerHuman,
     });
   });

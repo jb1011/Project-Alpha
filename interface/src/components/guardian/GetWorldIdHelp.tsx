@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useWorldIdWaiverMutation } from "@/lib/api/hooks";
 import { cx } from "@/components/onboarding/primitives";
 
 /**
@@ -57,8 +58,62 @@ export function GetWorldIdHelp({
             Come back to this page once World App shows your World ID and tap Verify — we keep
             your place.
           </p>
+
+          {/* Neither route exists everywhere (no Orb in France; ~12 countries of passports).
+              The waiver is the honest fallback: admin-issued, single-use, and recorded as a
+              waiver — never presented as proof of personhood. */}
+          <WaiverRedeem />
         </div>
       )}
+    </div>
+  );
+}
+
+function WaiverRedeem() {
+  const waiverMutation = useWorldIdWaiverMutation();
+  const [code, setCode] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  async function redeem() {
+    setError(null);
+    try {
+      await waiverMutation.mutateAsync(code.trim());
+    } catch (e) {
+      setError((e as Error).message || "This code cannot be redeemed.");
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5 border-l hairline-strong pl-3">
+      <span className="text-[12.5px] text-ink">Neither works where you live?</span>
+      <span>
+        Ask the team for a one-time waiver code. Your agents will show a waiver on record instead
+        of a verified human until you can verify for real.
+      </span>
+      <form
+        className="flex items-center gap-2 pt-1"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void redeem();
+        }}
+      >
+        <input
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          placeholder="nvw_…"
+          spellCheck={false}
+          autoComplete="off"
+          className="w-44 rounded-lg border hairline bg-transparent px-2.5 py-1.5 text-[12px] text-ink placeholder:text-muted-2 focus:outline-none focus:ring-2 focus:ring-accent/50"
+        />
+        <button
+          type="submit"
+          disabled={!code.trim() || waiverMutation.isPending}
+          className="rounded-lg border hairline-strong px-2.5 py-1.5 text-[12px] text-ink transition-opacity disabled:opacity-40"
+        >
+          {waiverMutation.isPending ? "Redeeming…" : "Redeem"}
+        </button>
+      </form>
+      {error && <span className="text-[11.5px] text-red-400">{error}</span>}
     </div>
   );
 }
