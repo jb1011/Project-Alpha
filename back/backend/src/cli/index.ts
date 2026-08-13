@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { privateKeyToAccount } from "viem/accounts";
@@ -182,6 +182,69 @@ export function buildCli(
             console.log(`sold=${lr.sold} customer=${lr.customer} vendorPayout=${lr.vendorPayout}`);
         }),
     );
+
+  // ── Guardian waivers ─────────────────────────────────────────────────────────────────────────
+  // DB-only on purpose: waiver admin must work on a box (or against a snapshot) without chain
+  // config, so this path never goes through buildContext / FACTORY_ADDRESS.
+  const openWorldStore = async () => {
+    const { config: loadDotenv } = await import("dotenv");
+    const { openDatabase, migrate } = await import("../persistence/db");
+    const { SqliteWorldStore } = await import("../persistence/worldStore");
+    loadDotenv();
+    // Resolve the DB path without loadConfig(): full config validation demands chain keys this
+    // command never touches (and local .envs post-P3 deliberately no longer carry them).
+    const dbPath = process.env.DB_PATH ?? `${process.env.DATA_DIR ?? "./data"}/legalbody.db`;
+    const db = openDatabase(dbPath);
+    migrate(db);
+    return new SqliteWorldStore(db);
+  };
+
+  const waiver = program
+    .command("waiver")
+    .description("Guardian waiver codes — the escape hatch for humans with no World ID path");
+
+  waiver
+    .command("create")
+    .requiredOption(
+      "-n, --note <who/why>",
+      "audit note, e.g. 'FR colleague — no Orb/passport path'",
+    )
+    .option("-d, --days <n>", "expiry in days (default 14)", "14")
+    .description("Issue a single-use waiver code (plaintext shown ONCE, only the hash is stored)")
+    .action(async (opts) => {
+      const store = await openWorldStore();
+      const code = `nvw_${randomUUID().replaceAll("-", "")}`;
+      store.createWaiver({
+        codeHash: createHash("sha256").update(code).digest("hex"),
+        note: opts.note,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + Number(opts.days) * 86_400_000,
+      });
+      console.log(code);
+      console.error(`(expires in ${opts.days} days; redeem with POST /world-id/waiver)`);
+    });
+
+  waiver
+    .command("list")
+    .description("List issued waivers (hashes only) and their redemption state")
+    .action(async () => {
+      const store = await openWorldStore();
+      console.log(JSON.stringify(store.listWaivers(), null, 2));
+    });
+
+  waiver
+    .command("revoke")
+    .argument("<code-or-hash>", "the plaintext code or its sha256 hash")
+    .description("Revoke an unredeemed waiver")
+    .action(async (arg: string) => {
+      const store = await openWorldStore();
+      const hash = /^[0-9a-f]{64}$/.test(arg)
+        ? arg
+        : createHash("sha256").update(arg).digest("hex");
+      const revoked = store.revokeWaiver(hash);
+      console.log(revoked ? "revoked" : "not revoked (unknown or already redeemed)");
+      if (!revoked) process.exitCode = 1;
+    });
 
   return program;
 }
