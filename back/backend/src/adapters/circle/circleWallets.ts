@@ -199,13 +199,20 @@ export async function provisionCircleWallets(
   api: CircleWalletsApi,
   p: { walletSetId: string; blockchain: string; entityKey: string },
 ): Promise<{ operator: CircleWalletRef; pocket: CircleWalletRef }> {
+  // Circle rejects long metadata NAMES with a bare "API parameter invalid" (hit by the first
+  // real wizard onboarding, whose entityKey is `<tenant-address>:<uuid>` ≈ 83 chars — every
+  // earlier probe used short script keys). refId carries the full key (accepted at that length
+  // and the authoritative reference); the name is display-only, so bound it: role + enough key
+  // tail to eyeball in the Circle console.
+  const label = (role: string) =>
+    p.entityKey.length <= 40 ? `${role}:${p.entityKey}` : `${role}:${p.entityKey.slice(-12)}`;
   const create = async (accountType: "SCA" | "EOA", role: string): Promise<CircleWalletRef> => {
     const res = await api.createWallets({
       accountType,
       blockchains: [p.blockchain],
       count: 1,
       walletSetId: p.walletSetId,
-      metadata: [{ name: `${role}:${p.entityKey}`, refId: p.entityKey }],
+      metadata: [{ name: label(role), refId: p.entityKey }],
     });
     const w = res.data?.wallets?.[0];
     if (!w?.id || !w?.address)

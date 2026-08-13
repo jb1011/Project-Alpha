@@ -81,6 +81,27 @@ describe("provisionCircleWallets — one SCA operator + one EOA pocket per agent
     }
   });
 
+  test("wizard-length entity keys: refId carries the full key, the display name stays within Circle's limit", async () => {
+    // The REST-wizard entityKey is `<tenant-address>:<uuid>` (~83 chars). Circle accepts that as
+    // refId but rejects a `role:<entityKey>` NAME (~92 chars) with "API parameter invalid" —
+    // found by the first real wizard onboarding (2026-08-13); every earlier probe used short
+    // script keys. The name is display-only, so it must be bounded; refId stays authoritative.
+    const { api, calls } = mockApi();
+    const KEY = "0x172B7952b0F711b8B372410E81d51Dcba7D4BB02:f251041a-4128-4674-9eab-eb6fb2503bd9";
+    await provisionCircleWallets(api as never, {
+      walletSetId: "ws-1",
+      blockchain: "ARC-TESTNET",
+      entityKey: KEY,
+    });
+    const wallets = calls.createWallets as { metadata?: { name?: string; refId?: string }[] }[];
+    expect(wallets).toHaveLength(2);
+    for (const c of wallets) {
+      expect(c.metadata?.[0]?.refId).toBe(KEY);
+      expect(c.metadata?.[0]?.name?.length ?? 999).toBeLessThanOrEqual(50);
+      expect(c.metadata?.[0]?.name).toMatch(/^(operator|pocket):/);
+    }
+  });
+
   test("a response missing the wallet is a loud error, never a half-provisioned agent", async () => {
     const { api } = mockApi();
     (api.createWallets as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
