@@ -1,4 +1,4 @@
-import { IDKit, hashSignal, proofOfHuman } from "@worldcoin/idkit-core";
+import { CredentialRequest, IDKit, any as anyOf, hashSignal } from "@worldcoin/idkit-core";
 import { signRequest } from "@worldcoin/idkit-core/signing";
 
 /** World ID config slice (mirrors Config["world"]). */
@@ -20,9 +20,20 @@ const ACCEPTED_CREDENTIALS = new Set([
   "proof_of_human",
   "orb",
   "passport",
+  "mnc",
   "secure_document",
   "document",
 ]);
+
+/** The tiers the guardian request OFFERS in World App. Must stay a subset of
+ *  ACCEPTED_CREDENTIALS: offering a tier the verifier refuses would let a human scan
+ *  successfully on their phone and then be rejected here. */
+const guardianConstraints = (signal: string) =>
+  anyOf(
+    CredentialRequest("proof_of_human", { signal }),
+    CredentialRequest("passport", { signal }),
+    CredentialRequest("mnc", { signal }),
+  );
 
 export class WorldIdError extends Error {
   constructor(
@@ -106,7 +117,7 @@ export async function startGuardianVerification(
     allow_legacy_proofs: true,
     environment: cfg.environment,
     // biome-ignore lint/suspicious/noExplicitAny: SDK request config typing is loose across versions.
-  } as any).preset(proofOfHuman({ signal: tenantWallet }));
+  } as any).constraints(guardianConstraints(tenantWallet));
 
   return {
     requestId: request.requestId,

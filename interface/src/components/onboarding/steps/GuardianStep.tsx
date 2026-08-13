@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { IDKitRequestWidget, proofOfHuman, type RpContext } from "@worldcoin/idkit";
+import { IDKitRequestWidget, type RpContext } from "@worldcoin/idkit";
+import { guardianConstraints } from "@/lib/worldid";
 import {
   useWorldIdContextMutation,
   useWorldIdMeQuery,
@@ -178,7 +179,7 @@ export function GuardianStep({
           rp_context={ctx.rpContext as RpContext}
           allow_legacy_proofs
           environment={ctx.environment}
-          preset={proofOfHuman({ signal: ctx.signal })}
+          constraints={guardianConstraints(ctx.signal)}
           handleVerify={handleVerify}
           onSuccess={() => {
             setOpen(false);
