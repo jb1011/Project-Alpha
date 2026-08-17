@@ -1,7 +1,11 @@
-import { hashSignal } from "@worldcoin/idkit-core";
+import { IDKit, hashSignal } from "@worldcoin/idkit-core";
 import Database from "better-sqlite3";
-import { describe, expect, test } from "vitest";
-import { WorldIdError, verifyProof } from "../../src/adapters/worldid/guardianGate";
+import { describe, expect, test, vi } from "vitest";
+import {
+  WorldIdError,
+  startGuardianVerification,
+  verifyProof,
+} from "../../src/adapters/worldid/guardianGate";
 import { migrate } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
 
@@ -66,6 +70,32 @@ describe("verifyProof — credential tier + nullifier normalization", () => {
     expect(v.nullifier).toBe("42");
   });
 
+  test("accepts passport (document tier is guardianship-grade by policy)", async () => {
+    const v = await verifyProof(
+      CFG,
+      idkitResult,
+      SIGNAL,
+      fetchStub(200, {
+        success: true,
+        results: [{ identifier: "passport", success: true, nullifier: "43" }],
+      }),
+    );
+    expect(v.credential).toBe("passport");
+  });
+
+  test("accepts mnc (Japan My Number Card — same document tier as passport)", async () => {
+    const v = await verifyProof(
+      CFG,
+      idkitResult,
+      SIGNAL,
+      fetchStub(200, {
+        success: true,
+        results: [{ identifier: "mnc", success: true, nullifier: "44" }],
+      }),
+    );
+    expect(v.credential).toBe("mnc");
+  });
+
   test("REJECTS device tier (insufficient for guardianship)", async () => {
     await expect(
       verifyProof(
@@ -117,6 +147,36 @@ describe("verifyProof — credential tier + nullifier normalization", () => {
         }),
       ),
     ).rejects.toThrow(/credential/i);
+  });
+});
+
+describe("startGuardianVerification — which credential tiers the request asks for", () => {
+  // The verify side has accepted document-tier credentials since day one, but the REQUEST only
+  // ever asked World App for proof_of_human (Orb) — so passport-verified humans were told they
+  // needed an Orb. The request must offer every tier the verifier accepts.
+  test("requests proof_of_human OR passport OR mnc, each bound to the tenant", async () => {
+    const fakeRequest = {
+      requestId: "req_1",
+      connectorURI: "https://world.test/qr",
+      pollUntilCompletion: vi.fn().mockResolvedValue({ success: false }),
+    };
+    const constraints = vi.fn().mockResolvedValue(fakeRequest);
+    const preset = vi.fn().mockResolvedValue(fakeRequest);
+    const spy = vi.spyOn(IDKit, "request").mockReturnValue({ constraints, preset } as never);
+    try {
+      const started = await startGuardianVerification(CFG, "0xTENANT");
+      expect(started.connectorURI).toBe("https://world.test/qr");
+      expect(preset).not.toHaveBeenCalled(); // preset(proofOfHuman) is the Orb-only shape
+      expect(constraints).toHaveBeenCalledWith({
+        any: [
+          { type: "proof_of_human", signal: "0xTENANT" },
+          { type: "passport", signal: "0xTENANT" },
+          { type: "mnc", signal: "0xTENANT" },
+        ],
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

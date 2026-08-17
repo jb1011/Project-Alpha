@@ -1,11 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import {
-  IDKitRequestWidget,
-  identityCheck,
-  proofOfHuman,
-} from "@worldcoin/idkit";
+import { IDKitRequestWidget, identityCheck } from "@worldcoin/idkit";
+import { guardianConstraints } from "@/lib/worldid";
 import type { WorldIdAttestContext, WorldIdContext } from "@/lib/api/types";
 import {
   useWorldIdAttestContextMutation,
@@ -106,7 +103,7 @@ function GuardianVerification() {
           rp_context={ctx.rpContext as any}
           allow_legacy_proofs
           environment={ctx.environment}
-          preset={proofOfHuman({ signal: ctx.signal })}
+          constraints={guardianConstraints(ctx.signal)}
           handleVerify={handleVerify}
           onSuccess={() => {
             setOpen(false);
