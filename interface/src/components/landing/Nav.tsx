@@ -5,6 +5,7 @@ const links = [
   { href: "#features", label: "Features" },
   { href: "#mcp", label: "MCP" },
   { href: "/personhood", label: "Personhood" },
+  { href: "/transparency", label: "Transparency" },
 ];
 
 export function Nav() {

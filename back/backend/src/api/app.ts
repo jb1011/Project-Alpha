@@ -17,6 +17,7 @@ import { mountPolicyRoutes } from "./routes/policy";
 import { mountReputationRoutes } from "./routes/reputation";
 import { mountRunsRoutes } from "./routes/runs";
 import { mountSchemaRoutes } from "./routes/schema";
+import { mountTransparencyRoutes } from "./routes/transparency";
 import { mountTreasuryRoutes } from "./routes/treasury";
 import { mountTrustPolicyRoutes } from "./routes/trustPolicy";
 import { mountWorldIdRoutes } from "./routes/worldId";
@@ -99,7 +100,9 @@ export function buildApiApp(deps: ApiDeps) {
     "*",
     cors({
       origin: (_origin, c) =>
-        c.req.path.startsWith("/metadata/") || c.req.path.startsWith("/ensgateway")
+        c.req.path.startsWith("/metadata/") ||
+        c.req.path.startsWith("/ensgateway") ||
+        c.req.path === "/transparency"
           ? "*"
           : deps.webOrigin,
       allowHeaders: ["authorization", "content-type"],
@@ -121,6 +124,7 @@ export function buildApiApp(deps: ApiDeps) {
   );
   mountSchemaRoutes(app);
   mountMetadataRoutes(app, deps);
+  mountTransparencyRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
   if (deps.x402Demo) mountX402DemoRoutes(app, deps.x402Demo);
   mountAuthRoutes(app, deps);

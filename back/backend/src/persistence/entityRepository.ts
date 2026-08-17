@@ -37,6 +37,24 @@ export interface EntityRepository {
   transaction<T>(fn: () => T): T;
   /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
   sumFundedByTenant(tenantId: string): bigint;
+  /** Entities with an on-chain ERC-8004 identity that finished the on-chain leg of onboarding
+   *  (created/bound/funded) — the rows the public transparency surface may enumerate. Selected
+   *  directly (not via EntityRecord) because the surface needs created_at, which toRecord does
+   *  not map. idempotencyKey/ownerTenantId are for server-side joins only — never serve them. */
+  listPublicOnChain(): PublicEntityRow[];
+}
+
+export interface PublicEntityRow {
+  idempotencyKey: string;
+  publicId: string | null;
+  name: string;
+  status: EntityRecord["status"];
+  agentId: string;
+  proxy: string | null;
+  treasury: string | null;
+  walletProvider: EntityRecord["walletProvider"];
+  ownerTenantId: string | null;
+  createdAt: string | null;
 }
 
 interface Row {
@@ -320,5 +338,19 @@ export class SqliteEntityRepository implements EntityRepository {
       `)
       .get(tenantId) as { total: number | bigint };
     return BigInt(row.total);
+  }
+
+  listPublicOnChain(): PublicEntityRow[] {
+    // Newest first: the transparency page leads with the latest entities.
+    return this.db
+      .prepare(`
+        SELECT idempotency_key AS idempotencyKey, public_id AS publicId, name, status,
+               agent_id AS agentId, proxy, treasury, wallet_provider AS walletProvider,
+               owner_tenant_id AS ownerTenantId, created_at AS createdAt
+        FROM entities
+        WHERE agent_id IS NOT NULL AND status IN ('created','bound','funded')
+        ORDER BY rowid DESC
+      `)
+      .all() as PublicEntityRow[];
   }
 }
