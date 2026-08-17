@@ -54,6 +54,7 @@ function makeDeps(arc?: Partial<ArcMock>) {
       ...arc,
     },
     platformManagerAddress: TREASURY,
+    ensApexAddress: TREASURY,
     mcpPublicUrl: "https://x/mcp",
     webOrigin: "https://x",
     // biome-ignore lint/suspicious/noExplicitAny: partial mock of ApiDeps for isolated gateway test.
@@ -184,6 +185,25 @@ describe("ENS gateway answer()", () => {
     expect((await callText(makeDeps(), "novicorpus.eth", "description")).value).toBe(
       "Novi Corpus — legal bodies for AI agents",
     );
+  });
+
+  // NoviController design §5: the apex target is an EXPLICIT, REQUIRED dep — resolution is
+  // decided ONCE in main.ts (ENS_APEX_RESOLVES_TO ?? signing key). The route has NO fallback: a
+  // second default here disagreed with main.ts's in controller mode (it would have resolved the
+  // apex to the controller contract — the exact accident the design forbids).
+  test("apex addr -> the deps' ensApexAddress, always (no route-level fallback)", async () => {
+    expect((await callAddr(makeDeps(), "novicorpus.eth")).toLowerCase()).toBe(
+      TREASURY.toLowerCase(),
+    );
+  });
+
+  test("apex addr -> ensApexAddress when configured (never the controller by accident)", async () => {
+    const APEX = "0x00000000000000000000000000000000000000A1";
+    const deps = makeDeps();
+    deps.ensApexAddress = APEX;
+    expect((await callAddr(deps, "novicorpus.eth")).toLowerCase()).toBe(APEX.toLowerCase());
+    // Agent subnames are untouched — they still resolve to their own treasury.
+    expect((await callAddr(deps, "abc.novicorpus.eth")).toLowerCase()).toBe(TREASURY.toLowerCase());
   });
 
   test("response signature recovers to the gateway signer", async () => {

@@ -13,6 +13,9 @@ on:
     branches: [main]
     paths:
       - "back/test/IdentityRegistryFork.t.sol"
+      - "back/test/NoviControllerFork.t.sol"
+      - "back/src/NoviController.sol"
+      - "back/src/LegalManagerFactory.sol"
       - ".github/workflows/fork-tests.yml"
 
 concurrency:
@@ -49,7 +52,7 @@ jobs:
           [ -d lib/openzeppelin-contracts-upgradeable ] || forge install OpenZeppelin/openzeppelin-contracts-upgradeable@${{ env.OZ_VERSION }} --no-git
 
       - name: Fork tests (live Arc registry)
-        run: forge test --match-contract IdentityRegistryForkTest -vv
+        run: forge test --match-contract "Fork" -vv
         env:
           # The live registry's deployed bytecode uses PUSH0; the project pin stays paris
           # (Arc deploy note), so the fork tests get their own shanghai run. The RPC URL is
@@ -57,5 +60,8 @@ jobs:
           # tests self-skip anywhere it is absent.
           FOUNDRY_EVM_VERSION: shanghai
           ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.network
-          # Tripwire: fail this step instead of silently skipping if the env above is ever dropped.
-          FORK_TESTS_REQUIRED: "1"
+          # Tripwire: fail this step instead of silently skipping if the env above is ever dropped
+          # (a missing RPC URL, or an EVM version without PUSH0). The suites read it with Foundry's
+          # `vm.envOr("FORK_TESTS_REQUIRED", false)`, which parses a Solidity bool — so the value
+          # must be the literal "true", not a truthy-looking "1".
+          FORK_TESTS_REQUIRED: "true"

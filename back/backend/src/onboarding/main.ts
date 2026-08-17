@@ -3,7 +3,11 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import {
+  managerWalletClient,
+  platformManagerAddress,
+  publicClientFor,
+} from "../adapters/arc/clients";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { provisionAgentVault } from "../adapters/turnkey/provisioner";
@@ -42,6 +46,7 @@ async function main() {
     chainId: cfg.chainId,
     factory: cfg.factoryAddress as Address,
     identityRegistry: cfg.identityRegistry,
+    controller: cfg.controllerAddress,
   });
 
   const operatorSigner = await buildOperatorSigner(cfg);
@@ -83,7 +88,11 @@ async function main() {
         : undefined,
     });
 
-  const app = buildOnboardingApp({ runOnboarding });
+  const app = buildOnboardingApp({
+    runOnboarding,
+    // Controller mode: the controller contract; otherwise the signing key's address, as before.
+    platformManagerAddress: platformManagerAddress(cfg),
+  });
 
   const port = Number(process.env.PORT ?? 8788);
   serve({ fetch: app.fetch, port });

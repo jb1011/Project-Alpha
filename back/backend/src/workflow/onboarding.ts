@@ -346,7 +346,9 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       rec = { ...rec, createTxHash };
       d.repo.upsert(rec);
     }
-    const res = await d.arc.confirmCreateEntity(createTxHash);
+    // rec.manager is the manager this record was MINTED with. Passing it keeps the controller
+    // assertion honest for a record broadcast before the controller cutover and resumed after it.
+    const res = await d.arc.confirmCreateEntity(createTxHash, rec.manager as Address);
     const created: EntityRecord = {
       ...rec,
       status: "created",
@@ -414,6 +416,9 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       newWallet: operator,
       deadline,
       signature,
+      // The registry gates on the NFT's owner = this agent's manager. Relay only when that IS the
+      // controller; a legacy agent's NFT is still owned by the old EOA and must be bound directly.
+      agentManager: rec.manager as Address,
     });
     const bound: EntityRecord = { ...rec, status: "bound", bindTxHash: txHash };
     rec = bound;
@@ -464,7 +469,12 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       const current = await d.arc.getAgentMetadata(BigInt(rec.agentId), "ens");
       const already = current !== "0x" && hexToString(current) === ensName;
       if (!already) {
-        const tx = await d.arc.setAgentMetadata(BigInt(rec.agentId), "ens", toHex(ensName));
+        const tx = await d.arc.setAgentMetadata(
+          BigInt(rec.agentId),
+          "ens",
+          toHex(ensName),
+          rec.manager as Address,
+        );
         d.repo.recordEvent(key, "setEnsMetadata", rec.status, tx, JSON.stringify({ ens: ensName }));
       }
     } catch (e) {

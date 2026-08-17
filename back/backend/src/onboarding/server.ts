@@ -23,6 +23,17 @@ export interface OnboardingAppDeps {
     guardianPasskey: GuardianPasskey,
     idempotencyKey: string,
   ) => Promise<EntityRecord>;
+  /**
+   * The platform manager identity, force-set into `roles.manager` — exactly as the REST door
+   * (api/routes/onboard.ts) and the MCP door (mcp/server.ts) do. The server owns this address; a
+   * caller can neither discover nor choose it.
+   *
+   * Load-bearing under NoviController (design §3/§5): in controller mode this is the CONTROLLER,
+   * and the factory REQUIRES `manager == owner()` (M4). A caller-supplied spec would therefore
+   * revert `ManagerMustBeOwner` at createEntity — this door used to pass the spec through verbatim,
+   * which made it the one entrance that broke at cutover.
+   */
+  platformManagerAddress: string;
 }
 
 /**
@@ -52,7 +63,14 @@ export function buildOnboardingApp(deps: OnboardingAppDeps) {
       return c.json({ error: "missing or invalid field: guardianPasskey" }, 400);
     }
 
-    const spec = body.spec as AgentSpec;
+    // Server owns the manager: force `roles.manager` to the platform manager identity before the
+    // spec goes anywhere, same as the REST and MCP doors. In controller mode that is the
+    // controller contract, which the factory's M4 check requires.
+    const rawSpec = body.spec as Record<string, unknown>;
+    const spec = {
+      ...rawSpec,
+      roles: { ...((rawSpec.roles as object) ?? {}), manager: deps.platformManagerAddress },
+    } as AgentSpec;
     const passkey = body.guardianPasskey as GuardianPasskey;
     const hasPasskey = true; // guardianPasskey was present in request (validated above)
 

@@ -1,8 +1,20 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
+import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import {
+  CONTROLLER_GRANTED_SELECTORS,
+  CONTROLLER_PINNED_SELECTORS,
+  assertControllerWiring,
+  assertLegacyFactoryOwner,
+} from "../adapters/arc/bootVerify";
+import {
+  managerAccount,
+  managerWalletClient,
+  platformManagerAddress as platformManagerAddressOf,
+  publicClientFor,
+} from "../adapters/arc/clients";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
 import {
   activateCircleSca,
@@ -75,12 +87,39 @@ async function main() {
   const passkeys = new SqlitePasskeyStore(db);
   const challenges = new SqliteChallengeStore(db);
   const agentRuns = new SqliteAgentRunStore(db);
+  // One account object for the whole boot: the executor/signing identity, used by the on-chain
+  // verification below and by the ENS apex fallback further down.
+  const executor = managerAccount(cfg);
+  const publicClient = publicClientFor(cfg);
+  const factoryAddress = cfg.factoryAddress as Address;
+
+  // Boot-time on-chain verification (design §5). loadConfig can only check the env against itself;
+  // these are the relational facts that live on the chain, and every one of them otherwise fails at
+  // the first onboarding instead of at boot. See adapters/arc/bootVerify.ts.
+  if (cfg.controllerAddress) {
+    await assertControllerWiring(publicClient, {
+      controller: cfg.controllerAddress,
+      factory: factoryAddress,
+      identityRegistry: cfg.identityRegistry,
+      executor: executor.address,
+    });
+    console.log(
+      `[boot] controller wiring verified on-chain: factory owner, ${CONTROLLER_GRANTED_SELECTORS.length} executor grants, ${CONTROLLER_PINNED_SELECTORS.length} registry pins`,
+    );
+  } else {
+    await assertLegacyFactoryOwner(publicClient, {
+      factory: factoryAddress,
+      signer: executor.address,
+    });
+  }
+
   const arc = new ArcAdapter({
-    publicClient: publicClientFor(cfg),
+    publicClient,
     managerWallet: managerWalletClient(cfg),
     chainId: cfg.chainId,
-    factory: cfg.factoryAddress as Address,
+    factory: factoryAddress,
     identityRegistry: cfg.identityRegistry,
+    controller: cfg.controllerAddress,
   });
   const operatorSigner = await buildOperatorSigner(cfg);
   // S5: the platform-wide outflow brake — one meter, shared by every path in this process.
@@ -96,7 +135,13 @@ async function main() {
   const bridgeLegs = new SqliteBridgeLegRepository(db);
   // Audit fix C: the platform manager address, force-set into `roles.manager` on onboarding so an
   // agent-first caller never needs to know or guess it (see managerAccount doc).
-  const platformManagerAddress = managerAccount(cfg).address;
+  // NoviController (design §5): in controller mode this is the CONTROLLER contract — the signing
+  // key above stays the executor/tx sender only. Unset => the signing key's address, as before.
+  const platformManagerAddress = platformManagerAddressOf(cfg);
+  if (cfg.controllerAddress)
+    console.warn(
+      `⚠ NoviController mode: manager identity = ${platformManagerAddress}, executor (signing key) = ${executor.address}, factory = ${factoryAddress}`,
+    );
 
   // Per-entity payment service (treasury_status/pay tools) needs a pocket-derivation seed; leave
   // it undefined on deployments that haven't set POCKET_MASTER_SEED so they keep working (the
@@ -318,6 +363,11 @@ async function main() {
     jwtSecret: cfg.authJwtSecret,
     jwtTtlSec: cfg.authJwtTtlSec,
     platformManagerAddress,
+    // Explicit apex target (design §5): unset keeps today's address — the platform signing key —
+    // so controller mode never silently repoints the apex at a contract that cannot be paid.
+    // Checksum-normalized ONCE here rather than on every gateway request (loadConfig already
+    // validated the shape; this pins the canonical casing at the seam).
+    ensApexAddress: getAddress(cfg.ensApexResolvesTo ?? executor.address),
     walletProviderDefault: cfg.walletProviderDefault,
     circleCustodyAvailable: Boolean(provisionCircle),
     // One predicate shared with the env.ts boot invariant (canProvisionTurnkey) — the advertised

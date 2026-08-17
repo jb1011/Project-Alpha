@@ -35,6 +35,12 @@ export interface ApiDeps {
    *  see `managerAccount`). Force-set into `roles.manager` on onboarding so an agent-first caller
    *  never needs to know or guess it — a wrong guess would burn the entity name on bind failure. */
   platformManagerAddress: string;
+  /** Address the ENS apex resolves to, ALREADY checksum-normalized. REQUIRED so the resolution is
+   *  decided in exactly one place (main.ts: ENS_APEX_RESOLVES_TO ?? the signing key) — a second
+   *  fallback here defaulted to `platformManagerAddress`, which in controller mode is the
+   *  CONTROLLER CONTRACT: the exact address the NoviController design (§5) says the apex must never
+   *  inherit by accident. Normalizing here (once) keeps it off the gateway's per-request path. */
+  ensApexAddress: string;
   /** Injectable clock (ms) for tests; defaults to Date.now. */
   now?: () => number;
   repo: import("../persistence/entityRepository").EntityRepository;

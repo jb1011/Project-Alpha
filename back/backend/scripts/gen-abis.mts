@@ -16,6 +16,10 @@ const TARGETS: Record<string, string> = {
   legalManagerAbi: "LegalManager.sol/LegalManager.json",
   agentTreasuryAbi: "AgentTreasury.sol/AgentTreasury.json",
   iIdentityRegistryAbi: "IIdentityRegistry.sol/IIdentityRegistry.json",
+  // NoviController: needed for the boot-time wiring verification (hasRole/boundTarget reads) AND
+  // so relayed failures can decode the controller's OWN errors — NotAuthorized/TargetNotBound and
+  // friends arrive as raw bytes from an eth_call/estimateGas that has no ABI attached.
+  noviControllerAbi: "NoviController.sol/NoviController.json",
   // Test-only doubles (used by anvil integration tests):
   mockIdentityRegistryAbi: "MockIdentityRegistry.sol/MockIdentityRegistry.json",
   mockUsdcAbi: "MockUSDC.sol/MockUSDC.json",

@@ -6,6 +6,11 @@
  * Runs standalone with just the MANAGER key (the agent-NFT owner) — no DB, no full backend.
  * Dry-runs (simulate + read-back check) unless SEND=1.
  *
+ * SCOPE (NoviController, design §5): this writes DIRECTLY as the signing key, so it serves LEGACY
+ * agents only — those whose NFT is still owned by the platform EOA. For a controller-managed agent
+ * the ownerOf check below stops it cold (the owner is the controller contract, not this key); use
+ * the backend path instead, which relays through the controller with the agent's persisted manager.
+ *
  * Env (put non-secrets in .env; pass the manager key explicitly):
  *   ENS_MANAGER_KEY | PLATFORM_PRIVATE_KEY   manager EOA private key (owns the agent NFTs)
  *   AGENT_ID                                  e.g. 845775
