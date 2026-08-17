@@ -14,6 +14,7 @@ import type {
   PasskeyView,
   PublicConfig,
   ReputationView,
+  TransparencyView,
   TreasuryView,
   WorldIdAttestContext,
   WorldIdContext,
@@ -88,6 +89,11 @@ export async function getPasskeyChallenge(
  *  an option this deployment would reject at submit. */
 export async function getPublicConfig(): Promise<PublicConfig> {
   return request("/config");
+}
+
+/** Public transparency surface — no auth. Platform stats + the on-chain entity registry. */
+export async function getTransparency(): Promise<TransparencyView> {
+  return request("/transparency");
 }
 
 export async function onboardEntity(

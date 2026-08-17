@@ -42,6 +42,30 @@ export type PublicConfig = {
   turnkeyCustodyAvailable?: boolean;
 };
 
+/** One row of the public transparency registry (GET /transparency, unauthenticated).
+ *  USDC fields are atomic strings (6 decimals). */
+export type TransparencyEntity = {
+  publicId: string | null;
+  name: string;
+  agentId: string;
+  status: string;
+  legalManager: string | null;
+  treasury: string | null;
+  walletProvider: "turnkey" | "circle";
+  humanVerified: boolean;
+  /** World ID credential tier backing the guardian (e.g. "orb"), null when unverified. */
+  credential: string | null;
+  createdAt: string | null;
+  jobsSettled: number;
+  usdcSettledAtomic: string;
+};
+
+/** Public transparency surface: platform stats + the on-chain entity registry. */
+export type TransparencyView = {
+  stats: { entities: number; jobsSettled: number; usdcSettledAtomic: string };
+  entities: TransparencyEntity[];
+};
+
 /** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */
 export type TreasuryView = {
   usdcBalance: string;
