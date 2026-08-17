@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
+import {ControllerSelectors} from "../src/libraries/ControllerSelectors.sol";
 import {NoviController} from "../src/NoviController.sol";
 import {BreakGlassOneShot} from "../src/BreakGlassOneShot.sol";
 import {LegalManager} from "../src/LegalManager.sol";
@@ -93,17 +94,9 @@ contract DeployController is Script {
         console2.log("THEN: backend env -> FACTORY_ADDRESS + CONTROLLER_ADDRESS, restart, probe agent, wizard test.");
     }
 
-    /// @dev design §3's standing grant list, computed from the ABIs rather than hardcoded hex, so
-    ///      a signature change in our own contracts moves the deploy script with it.
-    function _grantedSelectors() internal pure returns (bytes4[] memory s) {
-        s = new bytes4[](7);
-        s[0] = AgentTreasury.schedulePolicyUpdate.selector;
-        s[1] = AgentTreasury.executePolicyUpdate.selector;
-        s[2] = LegalManager.scheduleOperatingAgreementUpdate.selector;
-        s[3] = LegalManager.executeOperatingAgreementUpdate.selector;
-        s[4] = LegalManagerFactory.createEntity.selector;
-        s[5] = IIdentityRegistry.setAgentWallet.selector;
-        s[6] = IIdentityRegistry.setMetadata.selector;
+    /// @dev The ONE grant-set definition — src/libraries/ControllerSelectors.sol.
+    function _grantedSelectors() internal pure returns (bytes4[] memory) {
+        return ControllerSelectors.granted();
     }
 
     function _logSelector(string memory name, bytes4 selector) internal pure {

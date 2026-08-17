@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {ControllerSelectors} from "../src/libraries/ControllerSelectors.sol";
 import {NoviController} from "../src/NoviController.sol";
 import {BreakGlassOneShot} from "../src/BreakGlassOneShot.sol";
 import {LegalManager} from "../src/LegalManager.sol";
@@ -78,15 +79,9 @@ contract NoviControllerForkTest is Test {
         ok = probe != address(0);
     }
 
-    function _grantedSelectors() internal pure returns (bytes4[] memory s) {
-        s = new bytes4[](7);
-        s[0] = AgentTreasury.schedulePolicyUpdate.selector;
-        s[1] = AgentTreasury.executePolicyUpdate.selector;
-        s[2] = LegalManager.scheduleOperatingAgreementUpdate.selector;
-        s[3] = LegalManager.executeOperatingAgreementUpdate.selector;
-        s[4] = LegalManagerFactory.createEntity.selector;
-        s[5] = IIdentityRegistry.setAgentWallet.selector;
-        s[6] = IIdentityRegistry.setMetadata.selector;
+    /// @dev The ONE grant-set definition — src/libraries/ControllerSelectors.sol.
+    function _grantedSelectors() internal pure returns (bytes4[] memory) {
+        return ControllerSelectors.granted();
     }
 
     function setUp() public {

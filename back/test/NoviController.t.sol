@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ControllerSelectors} from "../src/libraries/ControllerSelectors.sol";
 import {NoviController} from "../src/NoviController.sol";
 import {BreakGlassOneShot} from "../src/BreakGlassOneShot.sol";
 import {AgentTreasury} from "../src/AgentTreasury.sol";
@@ -125,16 +126,9 @@ abstract contract ControllerTestBase is Test {
 
     // ── selector sets ────────────────────────────────────────────────────
 
-    /// @dev design §3: the selectors the backend executor holds at deploy.
-    function _grantedSelectors() internal pure returns (bytes4[] memory s) {
-        s = new bytes4[](7);
-        s[0] = AgentTreasury.schedulePolicyUpdate.selector;
-        s[1] = AgentTreasury.executePolicyUpdate.selector;
-        s[2] = LegalManager.scheduleOperatingAgreementUpdate.selector;
-        s[3] = LegalManager.executeOperatingAgreementUpdate.selector;
-        s[4] = LegalManagerFactory.createEntity.selector;
-        s[5] = IIdentityRegistry.setAgentWallet.selector;
-        s[6] = IIdentityRegistry.setMetadata.selector;
+    /// @dev The ONE grant-set definition — src/libraries/ControllerSelectors.sol.
+    function _grantedSelectors() internal pure returns (bytes4[] memory) {
+        return ControllerSelectors.granted();
     }
 
     /// @dev design §3: deliberately UNgranted — admin break-glass only. Still part of the
@@ -191,6 +185,36 @@ abstract contract ControllerTestBase is Test {
     function _grant(bytes4 selector, address account) internal {
         vm.prank(admin);
         controller.grantRole(bytes32(selector), account);
+    }
+
+    /// @dev Pinned to `forge inspect NoviController methods` (22 entries, verified 2026-08-17).
+    ///      Derived from signature strings, not hardcoded hex. If the controller's ABI grows,
+    ///      update this list — test_everyRelayedSelectorRoutesToFallback is the behavioral
+    ///      backstop that fails on a REAL collision even if this list goes stale.
+    function _localSelectors() internal pure returns (bytes4[] memory s) {
+        s = new bytes4[](22);
+        s[0] = bytes4(keccak256("DEFAULT_ADMIN_ROLE()"));
+        s[1] = bytes4(keccak256("WILDCARD_ROLE()"));
+        s[2] = bytes4(keccak256("acceptDefaultAdminTransfer()"));
+        s[3] = bytes4(keccak256("beginDefaultAdminTransfer(address)"));
+        s[4] = bytes4(keccak256("boundTarget(bytes4)"));
+        s[5] = bytes4(keccak256("cancelDefaultAdminTransfer()"));
+        s[6] = bytes4(keccak256("changeDefaultAdminDelay(uint48)"));
+        s[7] = bytes4(keccak256("defaultAdmin()"));
+        s[8] = bytes4(keccak256("defaultAdminDelay()"));
+        s[9] = bytes4(keccak256("defaultAdminDelayIncreaseWait()"));
+        s[10] = bytes4(keccak256("getRoleAdmin(bytes32)"));
+        s[11] = bytes4(keccak256("grantRole(bytes32,address)"));
+        s[12] = bytes4(keccak256("hasRole(bytes32,address)"));
+        s[13] = bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"));
+        s[14] = bytes4(keccak256("owner()"));
+        s[15] = bytes4(keccak256("pendingDefaultAdmin()"));
+        s[16] = bytes4(keccak256("pendingDefaultAdminDelay()"));
+        s[17] = bytes4(keccak256("renounceRole(bytes32,address)"));
+        s[18] = bytes4(keccak256("revokeRole(bytes32,address)"));
+        s[19] = bytes4(keccak256("rollbackDefaultAdminDelay()"));
+        s[20] = bytes4(keccak256("setBoundTarget(bytes4,address)"));
+        s[21] = bytes4(keccak256("supportsInterface(bytes4)"));
     }
 }
 
@@ -759,36 +783,6 @@ contract NoviControllerAdminLifecycleTest is ControllerTestBase {
 // ─────────────────────────────────────────────────────────────────────────
 
 contract NoviControllerDisjointnessTest is ControllerTestBase {
-    /// @dev Pinned to `forge inspect NoviController methods` (22 entries, verified 2026-08-17).
-    ///      Derived from signature strings, not hardcoded hex. If the controller's ABI grows,
-    ///      update this list — test_everyRelayedSelectorRoutesToFallback is the behavioral
-    ///      backstop that fails on a REAL collision even if this list goes stale.
-    function _localSelectors() internal pure returns (bytes4[] memory s) {
-        s = new bytes4[](22);
-        s[0] = bytes4(keccak256("DEFAULT_ADMIN_ROLE()"));
-        s[1] = bytes4(keccak256("WILDCARD_ROLE()"));
-        s[2] = bytes4(keccak256("acceptDefaultAdminTransfer()"));
-        s[3] = bytes4(keccak256("beginDefaultAdminTransfer(address)"));
-        s[4] = bytes4(keccak256("boundTarget(bytes4)"));
-        s[5] = bytes4(keccak256("cancelDefaultAdminTransfer()"));
-        s[6] = bytes4(keccak256("changeDefaultAdminDelay(uint48)"));
-        s[7] = bytes4(keccak256("defaultAdmin()"));
-        s[8] = bytes4(keccak256("defaultAdminDelay()"));
-        s[9] = bytes4(keccak256("defaultAdminDelayIncreaseWait()"));
-        s[10] = bytes4(keccak256("getRoleAdmin(bytes32)"));
-        s[11] = bytes4(keccak256("grantRole(bytes32,address)"));
-        s[12] = bytes4(keccak256("hasRole(bytes32,address)"));
-        s[13] = bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"));
-        s[14] = bytes4(keccak256("owner()"));
-        s[15] = bytes4(keccak256("pendingDefaultAdmin()"));
-        s[16] = bytes4(keccak256("pendingDefaultAdminDelay()"));
-        s[17] = bytes4(keccak256("renounceRole(bytes32,address)"));
-        s[18] = bytes4(keccak256("revokeRole(bytes32,address)"));
-        s[19] = bytes4(keccak256("rollbackDefaultAdminDelay()"));
-        s[20] = bytes4(keccak256("setBoundTarget(bytes4,address)"));
-        s[21] = bytes4(keccak256("supportsInterface(bytes4)"));
-    }
-
     function _relayedSelectors() internal pure returns (bytes4[] memory s) {
         bytes4[] memory granted = _grantedSelectors();
         bytes4[] memory bg = _breakGlassSelectors();
@@ -855,25 +849,13 @@ contract NoviControllerDisjointnessTest is ControllerTestBase {
 
 contract NoviControllerFuzzTest is ControllerTestBase {
     function _isLocal(bytes4 sel) internal pure returns (bool) {
-        return sel == bytes4(keccak256("DEFAULT_ADMIN_ROLE()")) || sel == bytes4(keccak256("WILDCARD_ROLE()"))
-            || sel == bytes4(keccak256("acceptDefaultAdminTransfer()"))
-            || sel == bytes4(keccak256("beginDefaultAdminTransfer(address)"))
-            || sel == bytes4(keccak256("boundTarget(bytes4)"))
-            || sel == bytes4(keccak256("cancelDefaultAdminTransfer()"))
-            || sel == bytes4(keccak256("changeDefaultAdminDelay(uint48)")) || sel == bytes4(keccak256("defaultAdmin()"))
-            || sel == bytes4(keccak256("defaultAdminDelay()"))
-            || sel == bytes4(keccak256("defaultAdminDelayIncreaseWait()"))
-            || sel == bytes4(keccak256("getRoleAdmin(bytes32)"))
-            || sel == bytes4(keccak256("grantRole(bytes32,address)"))
-            || sel == bytes4(keccak256("hasRole(bytes32,address)"))
-            || sel == bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))
-            || sel == bytes4(keccak256("owner()")) || sel == bytes4(keccak256("pendingDefaultAdmin()"))
-            || sel == bytes4(keccak256("pendingDefaultAdminDelay()"))
-            || sel == bytes4(keccak256("renounceRole(bytes32,address)"))
-            || sel == bytes4(keccak256("revokeRole(bytes32,address)"))
-            || sel == bytes4(keccak256("rollbackDefaultAdminDelay()"))
-            || sel == bytes4(keccak256("setBoundTarget(bytes4,address)"))
-            || sel == bytes4(keccak256("supportsInterface(bytes4)"));
+        // Membership derived from _localSelectors() — ONE list to re-pin when the ABI
+        // grows, instead of a second hand-maintained || chain that can silently drift.
+        bytes4[] memory local = _localSelectors();
+        for (uint256 i = 0; i < local.length; i++) {
+            if (local[i] == sel) return true;
+        }
+        return false;
     }
 
     /// @notice Random calldata from an unauthorized caller ALWAYS reverts and NEVER writes storage.

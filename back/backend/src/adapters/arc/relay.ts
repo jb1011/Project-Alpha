@@ -1,4 +1,12 @@
-import { type Abi, BaseError, decodeErrorResult, isAddress, isHex, size } from "viem";
+import {
+  type Abi,
+  BaseError,
+  RawContractError,
+  decodeErrorResult,
+  isAddress,
+  isHex,
+  size,
+} from "viem";
 import type { Address, Hex } from "../../types";
 
 /**
@@ -18,16 +26,10 @@ import type { Address, Hex } from "../../types";
  * well-formed relay is a bare 4-byte selector + the 20-byte target.
  */
 
-/** Bytes of address suffix the controller strips off the end of `msg.data`. */
-export const RELAY_TARGET_BYTES = 20;
-
-/** Controller floor: 4-byte selector + 20-byte target. Anything shorter reverts `MsgDataInvalid`. */
-export const RELAY_MIN_BYTES = 4 + RELAY_TARGET_BYTES;
-
 /**
- * `D ++ T`. Deliberately strict about its inputs: a malformed prefix or target would produce a
- * transaction that relays to a *different* contract than intended, which is exactly the class of
- * mistake the encoding is otherwise silent about.
+ * `D ++ T` (T = 20 raw address bytes). Deliberately strict about its inputs: a malformed prefix or
+ * target would produce a transaction that relays to a *different* contract than intended, which is
+ * exactly the class of mistake the encoding is otherwise silent about.
  */
 export function appendRelayTarget(data: Hex, target: Address): Hex {
   if (!isHex(data)) throw new Error(`relay: calldata must be a 0x hex string, got ${String(data)}`);
@@ -38,12 +40,6 @@ export function appendRelayTarget(data: Hex, target: Address): Hex {
   if (!isAddress(target, { strict: false }))
     throw new Error(`relay: target must be a 0x address, got ${String(target)}`);
   return `${data}${target.slice(2).toLowerCase()}` as Hex;
-}
-
-/** The relay endpoint for this deployment: the controller when configured, else undefined
- *  (legacy direct-call mode — the signing key IS the manager and calls targets directly). */
-export function relayAddress(cfg: { controllerAddress?: Address }): Address | undefined {
-  return cfg.controllerAddress;
 }
 
 /**
@@ -79,17 +75,13 @@ function decodeRevert(err: unknown, abi: Abi): string | undefined {
   }
 }
 
-/** viem nests the raw revert bytes under `.data` (RawContractError) somewhere in the cause chain. */
+/** viem carries the raw revert bytes in a RawContractError inside the cause chain; `walk` is
+ *  viem's supported API for retrieving it (a hand-rolled traversal would silently break on a
+ *  viem-internal nesting change and degrade every relay failure to an undecoded blob). */
 function revertData(err: unknown): Hex | undefined {
-  let cur: unknown = err;
-  for (let depth = 0; cur && depth < 10; depth++) {
-    const d = (cur as { data?: unknown }).data;
-    if (typeof d === "string" && isHex(d) && size(d as Hex) >= 4) return d as Hex;
-    if (typeof d === "object" && d !== null) {
-      const inner = (d as { data?: unknown }).data;
-      if (typeof inner === "string" && isHex(inner) && size(inner as Hex) >= 4) return inner as Hex;
-    }
-    cur = (cur as { cause?: unknown }).cause;
-  }
-  return undefined;
+  if (!(err instanceof BaseError)) return undefined;
+  const raw = err.walk((e) => e instanceof RawContractError) as RawContractError | null;
+  const d = raw?.data;
+  const data = typeof d === "object" && d !== null ? (d as { data?: unknown }).data : d;
+  return typeof data === "string" && isHex(data) && size(data) >= 4 ? data : undefined;
 }

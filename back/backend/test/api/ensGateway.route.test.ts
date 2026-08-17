@@ -54,6 +54,7 @@ function makeDeps(arc?: Partial<ArcMock>) {
       ...arc,
     },
     platformManagerAddress: TREASURY,
+    ensApexAddress: TREASURY,
     mcpPublicUrl: "https://x/mcp",
     webOrigin: "https://x",
     // biome-ignore lint/suspicious/noExplicitAny: partial mock of ApiDeps for isolated gateway test.
@@ -186,10 +187,11 @@ describe("ENS gateway answer()", () => {
     );
   });
 
-  // NoviController design §5: the apex target is now an EXPLICIT choice (ENS_APEX_RESOLVES_TO).
-  // Controller mode turns platformManagerAddress into a contract that cannot be paid, so the apex
-  // must never inherit it silently — but with nothing configured, behavior is unchanged.
-  test("apex addr -> platformManagerAddress when no explicit apex target is configured", async () => {
+  // NoviController design §5: the apex target is an EXPLICIT, REQUIRED dep — resolution is
+  // decided ONCE in main.ts (ENS_APEX_RESOLVES_TO ?? signing key). The route has NO fallback: a
+  // second default here disagreed with main.ts's in controller mode (it would have resolved the
+  // apex to the controller contract — the exact accident the design forbids).
+  test("apex addr -> the deps' ensApexAddress, always (no route-level fallback)", async () => {
     expect((await callAddr(makeDeps(), "novicorpus.eth")).toLowerCase()).toBe(
       TREASURY.toLowerCase(),
     );

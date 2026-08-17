@@ -11,8 +11,10 @@
  */
 import {
   type Address,
+  BaseError,
   type Hex,
   type PublicClient,
+  RawContractError,
   type WalletClient,
   encodeErrorResult,
   encodeFunctionData,
@@ -222,8 +224,10 @@ test("a bubbled vault custom error is DECODED against the target ABI (debuggable
   // The controller bubbles AgentTreasury.TooEarly() verbatim; eth_call has no ABI attached, so the
   // adapter must decode it itself or the operator sees only "0x085de625".
   const reverted = encodeErrorResult({ abi: agentTreasuryAbi, errorName: "TooEarly" });
+  // A REAL viem error chain (BaseError -> RawContractError), which is what production throws and
+  // what revertData()'s BaseError.walk() consumes — not a synthetic plain object.
   call.mockRejectedValueOnce(
-    Object.assign(new Error("execution reverted"), { cause: { data: reverted } }),
+    new BaseError("execution reverted", { cause: new RawContractError({ data: reverted }) }),
   );
   await expect(adapter.executePolicyUpdate(TREASURY, POLICY_ID)).rejects.toThrow(/TooEarly/);
 });

@@ -92,10 +92,6 @@ export class ArcAdapter {
   get identityRegistry(): Address {
     return this.d.identityRegistry;
   }
-  /** The NoviController this deployment relays through, if any (design §5). */
-  get controller(): Address | undefined {
-    return this.d.controller;
-  }
 
   /**
    * The ONE seam every manager-signed, role-gated write goes through, and the only place that knows

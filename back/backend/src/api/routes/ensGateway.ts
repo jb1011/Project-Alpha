@@ -92,8 +92,7 @@ function addrFor(deps: ApiDeps, target: Target): Address {
   // Apex: an EXPLICIT choice (ENS_APEX_RESOLVES_TO), falling back to the platform manager address =
   // today's behavior. NoviController design §5: in controller mode the platform manager becomes a
   // contract that can neither be paid nor spend, so the apex must not inherit it by accident.
-  if (target.kind === "apex")
-    return getAddress(deps.ensApexAddress ?? deps.platformManagerAddress) as Address;
+  if (target.kind === "apex") return getAddress(deps.ensApexAddress) as Address;
   if (target.kind === "agent") {
     const ent = entityForLabel(deps, target.label);
     return (ent?.treasury as Address | null) ?? zeroAddress;

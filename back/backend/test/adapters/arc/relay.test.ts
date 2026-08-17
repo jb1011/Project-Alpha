@@ -8,7 +8,7 @@
  */
 import { type Address, type Hex, encodeFunctionData, size, slice } from "viem";
 import { expect, test } from "vitest";
-import { appendRelayTarget, relayAddress } from "../../../src/adapters/arc/relay";
+import { appendRelayTarget } from "../../../src/adapters/arc/relay";
 
 const TARGET = "0x8004A818BFB912233c491871b3d84c89A494BD9e" as Address;
 const CONTROLLER = "0x4819000000000000000000000000000000000000" as Address;
@@ -79,10 +79,4 @@ test("rejects malformed calldata rather than relaying to a garbage target", () =
   expect(() => appendRelayTarget("0x123456789" as Hex, TARGET)).toThrow(/whole bytes|hex/i);
   expect(() => appendRelayTarget("1234567890" as Hex, TARGET)).toThrow(/hex/i);
   expect(() => appendRelayTarget("0x12345678", "0xnope" as Address)).toThrow(/target/i);
-});
-
-test("relayAddress: the controller when configured, undefined otherwise (legacy direct mode)", () => {
-  expect(relayAddress({ controllerAddress: CONTROLLER })).toBe(CONTROLLER);
-  expect(relayAddress({})).toBeUndefined();
-  expect(relayAddress({ controllerAddress: undefined })).toBeUndefined();
 });
