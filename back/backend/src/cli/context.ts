@@ -42,6 +42,7 @@ export async function buildContext(): Promise<CliContext> {
     chainId: cfg.chainId,
     factory: cfg.factoryAddress as Address,
     identityRegistry: cfg.identityRegistry,
+    controller: cfg.controllerAddress,
   });
   return {
     cfg,

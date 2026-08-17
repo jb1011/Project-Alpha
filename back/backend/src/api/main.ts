@@ -2,7 +2,12 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { managerAccount, managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import {
+  managerAccount,
+  managerWalletClient,
+  platformManagerAddress as platformManagerAddressOf,
+  publicClientFor,
+} from "../adapters/arc/clients";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
 import {
   activateCircleSca,
@@ -81,6 +86,7 @@ async function main() {
     chainId: cfg.chainId,
     factory: cfg.factoryAddress as Address,
     identityRegistry: cfg.identityRegistry,
+    controller: cfg.controllerAddress,
   });
   const operatorSigner = await buildOperatorSigner(cfg);
   // S5: the platform-wide outflow brake — one meter, shared by every path in this process.
@@ -96,7 +102,13 @@ async function main() {
   const bridgeLegs = new SqliteBridgeLegRepository(db);
   // Audit fix C: the platform manager address, force-set into `roles.manager` on onboarding so an
   // agent-first caller never needs to know or guess it (see managerAccount doc).
-  const platformManagerAddress = managerAccount(cfg).address;
+  // NoviController (design §5): in controller mode this is the CONTROLLER contract — the signing
+  // key above stays the executor/tx sender only. Unset => the signing key's address, as before.
+  const platformManagerAddress = platformManagerAddressOf(cfg);
+  if (cfg.controllerAddress)
+    console.warn(
+      `⚠ NoviController mode: manager identity = ${platformManagerAddress}, executor (signing key) = ${managerAccount(cfg).address}, factory = ${cfg.factoryAddress}`,
+    );
 
   // Per-entity payment service (treasury_status/pay tools) needs a pocket-derivation seed; leave
   // it undefined on deployments that haven't set POCKET_MASTER_SEED so they keep working (the
@@ -318,6 +330,9 @@ async function main() {
     jwtSecret: cfg.authJwtSecret,
     jwtTtlSec: cfg.authJwtTtlSec,
     platformManagerAddress,
+    // Explicit apex target (design §5): unset keeps today's address — the platform signing key —
+    // so controller mode never silently repoints the apex at a contract that cannot be paid.
+    ensApexAddress: cfg.ensApexResolvesTo ?? managerAccount(cfg).address,
     walletProviderDefault: cfg.walletProviderDefault,
     circleCustodyAvailable: Boolean(provisionCircle),
     // One predicate shared with the env.ts boot invariant (canProvisionTurnkey) — the advertised

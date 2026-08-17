@@ -186,6 +186,24 @@ describe("ENS gateway answer()", () => {
     );
   });
 
+  // NoviController design §5: the apex target is now an EXPLICIT choice (ENS_APEX_RESOLVES_TO).
+  // Controller mode turns platformManagerAddress into a contract that cannot be paid, so the apex
+  // must never inherit it silently — but with nothing configured, behavior is unchanged.
+  test("apex addr -> platformManagerAddress when no explicit apex target is configured", async () => {
+    expect((await callAddr(makeDeps(), "novicorpus.eth")).toLowerCase()).toBe(
+      TREASURY.toLowerCase(),
+    );
+  });
+
+  test("apex addr -> ensApexAddress when configured (never the controller by accident)", async () => {
+    const APEX = "0x00000000000000000000000000000000000000A1";
+    const deps = makeDeps();
+    deps.ensApexAddress = APEX;
+    expect((await callAddr(deps, "novicorpus.eth")).toLowerCase()).toBe(APEX.toLowerCase());
+    // Agent subnames are untouched — they still resolve to their own treasury.
+    expect((await callAddr(deps, "abc.novicorpus.eth")).toLowerCase()).toBe(TREASURY.toLowerCase());
+  });
+
   test("response signature recovers to the gateway signer", async () => {
     const { result, expires, sig, outer } = await callText(makeDeps(), "abc.novicorpus.eth", "url");
     const digest = keccak256(

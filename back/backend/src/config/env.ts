@@ -41,6 +41,16 @@ const EnvSchema = z.object({
   IDENTITY_REGISTRY: addressSchema.default("0x8004A818BFB912233c491871b3d84c89A494BD9e"),
   USDC_ADDRESS: addressSchema.default("0x3600000000000000000000000000000000000000"),
   FACTORY_ADDRESS: addressSchema.optional(),
+  /** NoviController (docs/design/2026-08-13-novi-controller-design.md). When set, the platform
+   *  manager IDENTITY is this contract — it is the immutable `manager` of every new agent's vaults,
+   *  the factory/beacon owner and the holder of each agent's identity NFT — and PLATFORM_PRIVATE_KEY
+   *  becomes the EXECUTOR (tx sender) only. Every role-gated manager call is then relayed through it.
+   *  Unset = legacy: the signing key IS the manager and calls targets directly. */
+  CONTROLLER_ADDRESS: addressSchema.optional(),
+  /** Address the ENS apex (`ENS_PARENT_NAME`) resolves to. Explicit BY DESIGN: in controller mode
+   *  the platform manager address becomes a contract that can neither hold nor be paid, so the apex
+   *  must never inherit it by accident. Unset = today's behavior (the platform signing key). */
+  ENS_APEX_RESOLVES_TO: addressSchema.optional(),
   GUARDIAN_ADDRESS: addressSchema.optional(),
   OPERATOR_PRIVATE_KEY: privKeySchema.optional(),
   POCKET_MASTER_SEED: privKeySchema.optional(),
@@ -168,6 +178,11 @@ export interface Config {
   identityRegistry: Address;
   usdc: Address;
   factoryAddress?: Address;
+  /** NoviController address; present => controller mode (see CONTROLLER_ADDRESS). The platform
+   *  manager identity is this contract and every role-gated manager call is relayed through it. */
+  controllerAddress?: Address;
+  /** Explicit ENS apex target; absent => the platform signing key (today's behavior). */
+  ensApexResolvesTo?: Address;
   guardianAddress?: Address;
   operatorPrivateKey?: Hex;
   pocketMasterSeed?: Hex;
@@ -308,6 +323,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     identityRegistry: e.IDENTITY_REGISTRY,
     usdc: e.USDC_ADDRESS,
     factoryAddress: e.FACTORY_ADDRESS,
+    controllerAddress: e.CONTROLLER_ADDRESS,
+    ensApexResolvesTo: e.ENS_APEX_RESOLVES_TO,
     guardianAddress: e.GUARDIAN_ADDRESS,
     operatorPrivateKey: e.OPERATOR_PRIVATE_KEY,
     pocketMasterSeed: e.POCKET_MASTER_SEED,
@@ -442,6 +459,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (isProd && cfg.walletProviderDefault === "turnkey" && !canProvisionTurnkey(cfg)) {
     throw new Error(
       "Invalid config: WALLET_PROVIDER_DEFAULT=turnkey in production requires TURNKEY_API_* + TURNKEY_ORGANIZATION_ID + TURNKEY_SIGN_WITH + TURNKEY_DELEGATED_API_* (set WALLET_PROVIDER_DEFAULT=circle for a circle-only deployment)",
+    );
+  }
+
+  // NoviController (design §5). Controller mode only makes sense against the NEW factory whose
+  // OWNER is the controller: the old factory is owned by the platform EOA, so relayed createEntity
+  // calls would revert OwnableUnauthorizedAccount at the first onboarding. We cannot verify
+  // `factory.owner() == controller` at boot (no chain I/O in loadConfig), so the enforceable form
+  // is: naming a controller obliges you to name its factory EXPLICITLY. FACTORY_ADDRESS has no
+  // schema default, so "explicitly set" is simply "present" — there is no inherited value to
+  // mistake for a deliberate one.
+  if (cfg.controllerAddress && !cfg.factoryAddress) {
+    throw new Error(
+      "Invalid config: CONTROLLER_ADDRESS is set but FACTORY_ADDRESS is missing — controller mode requires the factory whose owner is the controller to be named explicitly",
     );
   }
 

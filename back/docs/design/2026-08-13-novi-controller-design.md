@@ -163,9 +163,11 @@ mitigation is smallness + audit + the fact that admin can always re-key every RO
 ## 4. Factory + wiring changes
 
 `LegalManagerFactory` (new deployment, constructor unchanged in shape):
-- `createEntity(manager=CONTROLLER, …)` — backend passes the controller as manager for every agent.
-  Add require: `manager == owner()`? NO — keep the factory generic; the backend supplies the
-  controller address (platform-gated `onlyOwner` already prevents forgery).
+- `createEntity(manager=CONTROLLER, …)` — backend passes the controller as manager for every agent,
+  and the factory ENFORCES `manager == owner()` (M4 — supersedes this section's earlier "keep it
+  generic" stance; the audit showed a stolen executor could otherwise mint a rogue-managed body in
+  Novi's registry namespace). Side effect, deliberate: the identity NFT's destination in step 5 is
+  thereby pinned to the owner (the controller).
 - Step 5 hands the identity NFT to `manager` = controller (unchanged code path, new destination).
 - **Factory owner** = controller (deploy with deployer key, `transferOwnership(controller)`,
   `acceptOwnership` relayed via admin-granted selector, one ceremony).

@@ -34,6 +34,10 @@ export interface ApiDeps {
    *  see `managerAccount`). Force-set into `roles.manager` on onboarding so an agent-first caller
    *  never needs to know or guess it — a wrong guess would burn the entity name on bind failure. */
   platformManagerAddress: string;
+  /** Address the ENS apex resolves to (ENS_APEX_RESOLVES_TO). Absent => `platformManagerAddress`,
+   *  i.e. today's behavior. Explicit by design (NoviController §5): in controller mode the platform
+   *  manager address is a contract, and the apex must not silently start pointing at it. */
+  ensApexAddress?: string;
   /** Injectable clock (ms) for tests; defaults to Date.now. */
   now?: () => number;
   repo: import("../persistence/entityRepository").EntityRepository;

@@ -52,6 +52,9 @@ contract LegalManagerFactory is IERC721Receiver, Ownable2Step {
     ///      new legal body again). Disabled deliberately; use `transferOwnership` (two-step) instead.
     error OwnershipRenounceDisabled();
 
+    /// @dev The created body's `manager` must be the factory owner itself (the NoviController).
+    error ManagerMustBeOwner();
+
     /// @param implementation     the LegalManager logic contract the beacon points at
     /// @param identityRegistry_  the live ERC-8004 IdentityRegistry
     /// @param beaconOwner        the address allowed to upgrade every LegalManager at once
@@ -81,6 +84,13 @@ contract LegalManagerFactory is IERC721Receiver, Ownable2Step {
         bytes32 operatingAgreementHash,
         TreasuryConfig calldata tcfg
     ) external onlyOwner returns (uint256 agentId, address proxy, address treasury) {
+        // 0. M4 (adversarial audit 2026-08-13): the manager must BE the owner — the NoviController.
+        //    Without this, a stolen owner key could mint a legal body in Novi's registry namespace
+        //    with `manager = attacker`, holding the identity NFT and the vault's manager powers
+        //    outside the controller's role system. Zero flexibility cost for a bespoke platform
+        //    factory; note it also pins the identity NFT's destination (step 5) to the owner.
+        if (manager != owner()) revert ManagerMustBeOwner();
+
         // 1. Register the agent's on-chain identity (ERC-8004). _safeMints the NFT to this
         //    factory (hence IERC721Receiver) and returns the agentId.
         agentId = identityRegistry.register(metadataURI);

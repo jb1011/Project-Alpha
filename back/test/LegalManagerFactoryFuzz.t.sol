@@ -65,7 +65,15 @@ contract LegalManagerFactoryFuzzTest is Test {
             allowlistEnabled: allowlist
         });
 
+        // M4 (NoviController design §3): the created body's manager must be the factory owner.
+        // The fuzz keeps a random manager address by handing the factory to it first — the
+        // production shape, where owner == manager == the NoviController.
+        factory.transferOwnership(manager);
+        vm.prank(manager);
+        factory.acceptOwnership();
+
         uint256 countBefore = factory.entitiesCount();
+        vm.prank(manager);
         (uint256 agentId, address proxy, address treasury) = factory.createEntity(
             manager, guardian, operator, delay, "ipfs://meta", "EIN-1", formationDate, oaHash, cfg
         );
@@ -111,10 +119,10 @@ contract LegalManagerFactoryFuzzTest is Test {
             period: 1 days,
             allowlistEnabled: false
         });
+        // owner() read BEFORE expectRevert: an argument-position external call would consume it.
+        address mgr = factory.owner();
         vm.expectRevert(LegalManager.DelayTooShort.selector);
-        factory.createEntity(
-            makeAddr("m"), makeAddr("g"), makeAddr("o"), delay, "ipfs://x", "EIN", 1, keccak256("x"), cfg
-        );
+        factory.createEntity(mgr, makeAddr("g"), makeAddr("o"), delay, "ipfs://x", "EIN", 1, keccak256("x"), cfg);
     }
 
     /// Only the owner may create entities, for ANY caller that isn't the owner.
@@ -127,10 +135,12 @@ contract LegalManagerFactoryFuzzTest is Test {
             period: 1 days,
             allowlistEnabled: false
         });
+        // manager == owner so the ONLY reason this can revert is the caller check (M4 passes).
+        address mgr = factory.owner();
         vm.prank(caller);
         vm.expectRevert(); // OZ Ownable: OwnableUnauthorizedAccount
         factory.createEntity(
-            makeAddr("m"), makeAddr("g"), makeAddr("o"), 2 days, "ipfs://x", "EIN", 1, keccak256("x"), cfg
+            mgr, makeAddr("g"), makeAddr("o"), 2 days, "ipfs://x", "EIN", 1, keccak256("x"), cfg
         );
     }
 }

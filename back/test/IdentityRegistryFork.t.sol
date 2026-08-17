@@ -93,6 +93,11 @@ contract IdentityRegistryForkTest is Test {
         manager = vm.addr(managerPk);
         LegalManager impl = new LegalManager();
         factory = new LegalManagerFactory(address(impl), LIVE_REGISTRY, makeAddr("beaconOwner"));
+        // M4 (NoviController design §3): createEntity pins the body's manager to the factory
+        // owner, so the fixture hands the factory to `manager` and creates entities as it.
+        factory.transferOwnership(manager);
+        vm.prank(manager);
+        factory.acceptOwnership();
     }
 
     function _defaultTreasuryCfg() internal returns (LegalManagerFactory.TreasuryConfig memory) {
@@ -109,9 +114,11 @@ contract IdentityRegistryForkTest is Test {
     }
 
     function _createEntity() internal returns (uint256 agentId, address proxy, address treasury) {
-        (agentId, proxy, treasury) = factory.createEntity(
-            manager, guardian, operator, 2 days, "ipfs://fork-test", "EIN-FORK", 1, keccak256("oa"), _defaultTreasuryCfg()
-        );
+        // cfg first: _defaultTreasuryCfg deploys a mock, and a CREATE would consume the prank.
+        LegalManagerFactory.TreasuryConfig memory cfg = _defaultTreasuryCfg();
+        vm.prank(manager);
+        (agentId, proxy, treasury) =
+            factory.createEntity(manager, guardian, operator, 2 days, "ipfs://fork-test", "EIN-FORK", 1, keccak256("oa"), cfg);
     }
 
     // ---------------------------------------------------------------- register path

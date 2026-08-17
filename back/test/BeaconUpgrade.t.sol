@@ -31,9 +31,11 @@ contract BeaconUpgradeTest is Test {
     }
 
     function test_upgradingBeaconUpgradesAllProxies() public {
-        // address(1)=manager, address(2)=guardian; operator must differ from both
-        (, address proxyA,) = factory.createEntity(address(1), address(2), address(3), 1 days, "a", "E1", 1, bytes32(0), _defaultTreasuryCfg());
-        (, address proxyB,) = factory.createEntity(address(4), address(5), address(6), 1 days, "b", "E2", 2, bytes32(0), _defaultTreasuryCfg());
+        // M4 (NoviController design §3): the body's manager must be the factory owner, so both
+        // agents share this test contract as manager; guardian/operator still differ from it.
+        address mgr = factory.owner();
+        (, address proxyA,) = factory.createEntity(mgr, address(2), address(3), 1 days, "a", "E1", 1, bytes32(0), _defaultTreasuryCfg());
+        (, address proxyB,) = factory.createEntity(mgr, address(5), address(6), 1 days, "b", "E2", 2, bytes32(0), _defaultTreasuryCfg());
 
         LegalManagerV2 v2 = new LegalManagerV2();
         UpgradeableBeacon beacon = factory.beacon();
@@ -42,7 +44,7 @@ contract BeaconUpgradeTest is Test {
         // Both existing proxies now expose the new V2 behavior, with state intact.
         assertEq(LegalManagerV2(payable(proxyA)).version(), "v2");
         assertEq(LegalManagerV2(payable(proxyB)).version(), "v2");
-        assertEq(LegalManager(payable(proxyA)).manager(), address(1));
+        assertEq(LegalManager(payable(proxyA)).manager(), mgr);
     }
 
     function test_onlyBeaconOwnerCanUpgrade() public {

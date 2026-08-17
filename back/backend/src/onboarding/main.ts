@@ -42,6 +42,7 @@ async function main() {
     chainId: cfg.chainId,
     factory: cfg.factoryAddress as Address,
     identityRegistry: cfg.identityRegistry,
+    controller: cfg.controllerAddress,
   });
 
   const operatorSigner = await buildOperatorSigner(cfg);

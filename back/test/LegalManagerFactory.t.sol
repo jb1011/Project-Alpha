@@ -13,7 +13,12 @@ import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Recei
 contract LegalManagerFactoryTest is Test {
     LegalManagerFactory internal factory;
     MockIdentityRegistry internal registry;
-    address internal manager = address(0xA11CE);
+    /// @dev M4 (NoviController design §3): `createEntity` pins the created body's manager to the
+    ///      factory owner, so the fixture's manager IS the owner — the production shape, where
+    ///      owner == manager == the NoviController. This contract keeps the ownership tests
+    ///      below meaningful by leaving the deployer as owner rather than handing the factory
+    ///      away in setUp.
+    address internal manager = address(this);
     address internal guardian = address(0x60A12D);
     address internal operator = address(0x0EEEA7);
     address internal beaconOwner = address(0xB1A);
@@ -167,6 +172,20 @@ contract WalletBindingTest is Test {
         registry = new MockIdentityRegistry();
         LegalManager impl = new LegalManager();
         factory = new LegalManagerFactory(address(impl), address(registry), address(0xB1A));
+        // M4: the created body's manager must be the factory owner, so the factory is handed to
+        // the manager (two-step) and entities are created as the manager below.
+        factory.transferOwnership(manager);
+        vm.prank(manager);
+        factory.acceptOwnership();
+    }
+
+    function _createAsManager() internal returns (uint256 agentId) {
+        // cfg first: _defaultTreasuryCfg deploys a mock, and a CREATE would consume the prank.
+        LegalManagerFactory.TreasuryConfig memory cfg = _defaultTreasuryCfg();
+        vm.prank(manager);
+        (agentId,,) = factory.createEntity(
+            manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), cfg
+        );
     }
 
     function _defaultTreasuryCfg() internal returns (LegalManagerFactory.TreasuryConfig memory) {
@@ -181,9 +200,7 @@ contract WalletBindingTest is Test {
     }
 
     function test_managerBindsWalletWithEip712Signature() public {
-        (uint256 agentId, ,) = factory.createEntity(
-            manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), _defaultTreasuryCfg()
-        );
+        uint256 agentId = _createAsManager();
         assertEq(registry.ownerOf(agentId), manager);
 
         address walletToBind = vm.addr(managerPk); // manager binds its own wallet
@@ -198,9 +215,7 @@ contract WalletBindingTest is Test {
     }
 
     function test_bindingRejectsWrongSigner() public {
-        (uint256 agentId, ,) = factory.createEntity(
-            manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), _defaultTreasuryCfg()
-        );
+        uint256 agentId = _createAsManager();
         address walletToBind = vm.addr(managerPk);
         uint256 deadline = block.timestamp + 5 minutes;
         bytes32 digest = registry.walletSetDigest(agentId, walletToBind, manager, deadline);
@@ -213,9 +228,7 @@ contract WalletBindingTest is Test {
     }
 
     function test_bindingRejectsDeadlineBeyondMaxWindow() public {
-        (uint256 agentId,,) = factory.createEntity(
-            manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), _defaultTreasuryCfg()
-        );
+        uint256 agentId = _createAsManager();
         address walletToBind = vm.addr(managerPk);
         // One second past the registry's MAX_DEADLINE_DELAY (mirrors the live Arc 300s cap). The
         // signature is otherwise valid, so the deadline guard is the only reason this reverts.
@@ -245,6 +258,10 @@ contract FactoryTreasuryWiringTest is Test {
         usdc = new MockUSDC();
         LegalManager impl = new LegalManager();
         factory = new LegalManagerFactory(address(impl), address(registry), beaconOwner);
+        // M4: manager == factory owner.
+        factory.transferOwnership(manager);
+        vm.prank(manager);
+        factory.acceptOwnership();
     }
 
     function test_createEntityDeploysWiredTreasury() public {
@@ -255,6 +272,7 @@ contract FactoryTreasuryWiringTest is Test {
             period: 1 days,
             allowlistEnabled: false
         });
+        vm.prank(manager);
         (uint256 agentId, address proxy, address treasury) =
             factory.createEntity(manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1748476800, keccak256("oa"), cfg);
 
@@ -278,6 +296,7 @@ contract FactoryTreasuryWiringTest is Test {
             allowlistEnabled: false
         });
         vm.recordLogs();
+        vm.prank(manager);
         (uint256 agentId, , address treasury) =
             factory.createEntity(manager, guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1748476800, keccak256("oa"), cfg);
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -351,8 +370,15 @@ contract FactoryTransferCallbackTest is Test {
     /// if that callback ever does fire.
     function test_identityTransferFiresNoManagerCallback() public {
         CallbackTrackingManager mgr = new CallbackTrackingManager();
+        // M4: the contract manager must also be the factory owner (production: the controller).
+        factory.transferOwnership(address(mgr));
+        vm.prank(address(mgr));
+        factory.acceptOwnership();
+
+        LegalManagerFactory.TreasuryConfig memory cfg = _cfg();
+        vm.prank(address(mgr));
         (uint256 agentId,,) = factory.createEntity(
-            address(mgr), guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), _cfg()
+            address(mgr), guardian, operator, 2 days, "ipfs://meta", "EIN-1", 1, keccak256("oa"), cfg
         );
 
         // The identity NFT reached the contract manager...
@@ -379,12 +405,13 @@ contract FactoryAgentIdCollisionTest is Test {
     }
 
     function test_duplicateAgentIdFromRegistryReverts() public {
-        factory.createEntity(makeAddr("m1"), makeAddr("g1"), makeAddr("o1"), 2 days, "a", "E1", 1, keccak256("a"), _cfg());
+        // M4: manager == factory owner == this test contract for both creations.
+        factory.createEntity(address(this), makeAddr("g1"), makeAddr("o1"), 2 days, "a", "E1", 1, keccak256("a"), _cfg());
         assertEq(factory.entityByAgentId(0), factory.entities(0)); // entity #0 recorded under id 0
 
         // Pre-compute args so vm.expectRevert binds to createEntity itself (not the _cfg() deploy).
         LegalManagerFactory.TreasuryConfig memory cfg = _cfg();
-        address m2 = makeAddr("m2");
+        address m2 = address(this);
         address g2 = makeAddr("g2");
         address o2 = makeAddr("o2");
         // The registry hands back id 0 again; the guard must reject rather than orphan entity #1.
