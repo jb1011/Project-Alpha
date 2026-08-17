@@ -5,6 +5,7 @@ import {
   type PublicClient,
   type WalletClient,
   encodeFunctionData,
+  isAddressEqual,
   parseEventLogs,
 } from "viem";
 import {
@@ -94,19 +95,38 @@ export class ArcAdapter {
   }
 
   /**
+   * PER-AGENT relay routing. The controller is the manager of agents created THROUGH it; every
+   * agent minted before the cutover still has the old EOA as its immutable `manager`, and a vault
+   * only ever obeys its own manager. So "controller mode" is not a global switch — it is a
+   * property of the AGENT, read from the manager this deployment persisted when it was created.
+   *
+   * Relay when a controller is configured AND (no agent manager was supplied — deployment-level
+   * calls like createEntity, where the doors force the controller — OR the agent's manager IS the
+   * controller). Otherwise go direct, EVEN IN CONTROLLER MODE: that is the legacy agent's only
+   * working path, and relaying its policy update would revert `NotManager` on the vault.
+   */
+  private relayTargetFor(agentManager?: Address): Address | undefined {
+    const controller = this.d.controller;
+    if (!controller) return undefined;
+    if (agentManager && !isAddressEqual(agentManager, controller)) return undefined;
+    return controller;
+  }
+
+  /**
    * The ONE seam every manager-signed, role-gated write goes through, and the only place that knows
    * about the controller. Returns the broadcast tx hash WITHOUT awaiting a receipt (callers that
    * need confirmation await it themselves, exactly as they did before).
    *
-   * Direct mode (no controller): unchanged — simulateContract against the target, then write the
-   * simulated request.
+   * Direct path (no controller, or a legacy agent — see {relayTargetFor}): unchanged —
+   * simulateContract against the target, then write the simulated request.
    *
-   * Controller mode: the same calldata is encoded, the 20-byte target is appended (Euler relay
+   * Relayed path: the same calldata is encoded, the 20-byte target is appended (Euler relay
    * encoding — see relay.ts) and the whole thing is sent as a RAW transaction to the controller,
    * which checks `hasRole(selector, executor)` and forwards. simulateContract cannot express that
-   * (the trailing target is not part of any ABI), so we eth_call the exact bytes we are about to
-   * send: the controller bubbles the target's revert verbatim, and we decode it against the
-   * target's ABI so a relay mistake names itself instead of arriving as a hex blob.
+   * (the trailing target is not part of any ABI), so the preflight is an `eth_estimateGas` on the
+   * exact bytes we are about to send: it reverts with the target's bubbled error before we spend
+   * gas, AND its result is the gas limit we send with — one node round-trip doing both jobs, where
+   * an `eth_call` preflight had viem execute the transaction a second time to estimate.
    *
    * NOT for signer-direct calls: fundTreasury (a plain USDC transfer) and the liveRunner gas seeds
    * are not role-gated and must keep coming straight from the signing key.
@@ -116,9 +136,19 @@ export class ArcAdapter {
     abi: Abi;
     functionName: string;
     args: readonly unknown[];
+    /** The agent's PERSISTED on-chain manager. Omit for calls that belong to no single agent. */
+    agentManager?: Address;
   }): Promise<Hex> {
-    const account = this.d.managerWallet.account ?? undefined;
-    const controller = this.d.controller;
+    // Every path below signs/simulates AS this account. viem silently substitutes the zero address
+    // for an absent account, which turns an onlyManager write into a confusing revert (or, worse,
+    // a simulation that passes against a mock) — so refuse loudly instead.
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send/simulate as the zero address",
+      );
+
+    const controller = this.relayTargetFor(p.agentManager);
     if (!controller) {
       const { request } = await this.d.publicClient.simulateContract({
         address: p.target,
@@ -134,17 +164,34 @@ export class ArcAdapter {
       encodeFunctionData({ abi: p.abi, functionName: p.functionName, args: p.args }),
       p.target,
     );
+    let gas: bigint;
     try {
-      await this.d.publicClient.call({ to: controller, data, account });
+      gas = await this.d.publicClient.estimateGas({ account, to: controller, data });
     } catch (err) {
+      // Only a REVERT is re-dressed with the decoded reason; a transport failure is rethrown
+      // untouched so an RPC outage never reads as "reverted in simulation" (see relay.ts).
       throw relayRevertError(err, { ...p, controller });
     }
     return this.d.managerWallet.sendTransaction({
       to: controller,
       data,
-      account: account!,
+      gas,
+      account,
       chain: this.d.managerWallet.chain,
     });
+  }
+
+  /** {sendManagerCall} + await the receipt — the tail four of the five relayed sites repeat. */
+  private async sendManagerCallConfirmed(p: {
+    target: Address;
+    abi: Abi;
+    functionName: string;
+    args: readonly unknown[];
+    agentManager?: Address;
+  }): Promise<Hex> {
+    const hash = await this.sendManagerCall(p);
+    await this.d.publicClient.waitForTransactionReceipt({ hash });
+    return hash;
   }
 
   /**
@@ -160,7 +207,7 @@ export class ArcAdapter {
    */
   async createEntity(p: CreateEntityParams): Promise<CreateEntityResult> {
     const txHash = await this.broadcastCreateEntity(p);
-    return this.confirmCreateEntity(txHash);
+    return this.confirmCreateEntity(txHash, p.manager);
   }
 
   /**
@@ -192,6 +239,10 @@ export class ArcAdapter {
       abi: legalManagerFactoryAbi as Abi,
       functionName: "createEntity",
       args,
+      // The manager being minted IS the routing key: in controller mode both onboard doors force
+      // it to the controller, so this relays. Anything else takes the direct path and fails loudly
+      // at the factory (M4: `ManagerMustBeOwner`) instead of quietly minting a rogue-managed body.
+      agentManager: p.manager,
     });
   }
 
@@ -200,7 +251,7 @@ export class ArcAdapter {
    * mined tx yields the same agentId, which is exactly what the saga relies on to adopt an in-flight
    * mint on resume rather than broadcasting a second one.
    */
-  async confirmCreateEntity(txHash: Hex): Promise<CreateEntityResult> {
+  async confirmCreateEntity(txHash: Hex, agentManager?: Address): Promise<CreateEntityResult> {
     const receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
 
     // Controller mode puts other contracts' logs in this receipt (the controller's own `Relayed`,
@@ -209,28 +260,31 @@ export class ArcAdapter {
     const factoryLogs = receipt.logs.filter(
       (l) => l.address.toLowerCase() === this.d.factory.toLowerCase(),
     );
-    // Narrow to a single event name each so viem types `.args` precisely (no casts needed).
-    const [created] = parseEventLogs({
+    // One pass over the logs for both events; viem still types each `.args` precisely because the
+    // event names are a literal union, so the result is discriminated on `eventName`.
+    const events = parseEventLogs({
       abi: legalManagerFactoryAbi,
-      eventName: "EntityCreated",
+      eventName: ["EntityCreated", "TreasuryCreated"],
       logs: factoryLogs,
     });
-    const [treasuryEvt] = parseEventLogs({
-      abi: legalManagerFactoryAbi,
-      eventName: "TreasuryCreated",
-      logs: factoryLogs,
-    });
+    const created = events.find((e) => e.eventName === "EntityCreated");
+    const treasuryEvt = events.find((e) => e.eventName === "TreasuryCreated");
     if (!created || !treasuryEvt)
       throw new Error("createEntity: EntityCreated/TreasuryCreated not emitted");
 
-    // In controller mode the manager topic MUST be the controller — that is the whole point of the
-    // design (the controller is the immutable manager + NFT owner of every new agent). A mismatch
-    // means this deployment minted through the OLD factory (or against the wrong controller), and
-    // every later step — bind, metadata, policy — would fail obscurely against a vault whose
-    // manager is an address we no longer sign as. Fail here, where the cause is still visible.
-    if (this.d.controller && created.args.manager.toLowerCase() !== this.d.controller.toLowerCase())
+    // When the create was RELAYED, the manager topic MUST be the controller — that is the whole
+    // point of the design (the controller is the immutable manager + NFT owner of every new
+    // agent). A mismatch means this deployment minted through the OLD factory (or against the
+    // wrong controller), and every later step — bind, metadata, policy — would fail obscurely
+    // against a vault whose manager is an address we no longer sign as. Fail here, visibly.
+    //
+    // Gated on the SAME predicate the send used (not merely "a controller is configured"), so a
+    // record broadcast before the cutover and resumed after it confirms against the manager it was
+    // actually minted with, instead of throwing forever on a mismatch it can never resolve.
+    const relayed = this.relayTargetFor(agentManager);
+    if (relayed && !isAddressEqual(created.args.manager, relayed))
       throw new Error(
-        `createEntity: EntityCreated manager ${created.args.manager} is not the configured controller ${this.d.controller} — check FACTORY_ADDRESS/CONTROLLER_ADDRESS (is this the controller-owned factory?)`,
+        `createEntity: EntityCreated manager ${created.args.manager} is not the configured controller ${relayed} — check FACTORY_ADDRESS/CONTROLLER_ADDRESS (is this the controller-owned factory?)`,
       );
 
     return {
@@ -264,29 +318,36 @@ export class ArcAdapter {
     newWallet: Address;
     deadline: bigint;
     signature: Hex;
+    /** The agent's persisted manager = the NFT owner the registry gates on. */
+    agentManager?: Address;
   }): Promise<Hex> {
-    const txHash = await this.sendManagerCall({
+    return this.sendManagerCallConfirmed({
       target: this.d.identityRegistry,
       abi: iIdentityRegistryAbi as Abi,
       functionName: "setAgentWallet",
       args: [p.agentId, p.newWallet, p.deadline, p.signature],
+      agentManager: p.agentManager,
     });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
-    return txHash;
   }
 
   /** Set an on-chain metadata key/value on the agent NFT (manager-gated: owner-or-approved).
    *  ENSIP-25 uses key "ens" carrying the UTF-8 bytes of the agent's ENS name — the reverse half of
-   *  the bidirectional binding (the ENS name's agent-registration record is the forward half). */
-  async setAgentMetadata(agentId: bigint, key: string, value: Hex): Promise<Hex> {
-    const txHash = await this.sendManagerCall({
+   *  the bidirectional binding (the ENS name's agent-registration record is the forward half).
+   *  `agentManager` is the agent's persisted manager: a legacy agent's NFT is still owned by the
+   *  old EOA, so its metadata write must NOT be relayed. */
+  async setAgentMetadata(
+    agentId: bigint,
+    key: string,
+    value: Hex,
+    agentManager?: Address,
+  ): Promise<Hex> {
+    return this.sendManagerCallConfirmed({
       target: this.d.identityRegistry,
       abi: iIdentityRegistryAbi as Abi,
       functionName: "setMetadata",
       args: [agentId, key, value],
+      agentManager,
     });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
-    return txHash;
   }
 
   /** Read an on-chain metadata value (ENSIP-25 verifier side): bytes for key on the agent NFT. */
@@ -299,31 +360,36 @@ export class ArcAdapter {
     }) as Promise<Hex>;
   }
 
-  /** Schedule a treasury policy change (manager-gated, timelocked). Returns the on-chain tx hash. */
+  /** Schedule a treasury policy change (manager-gated, timelocked). Returns the on-chain tx hash.
+   *  `agentManager` is the vault's IMMUTABLE manager as persisted at creation — the vault obeys
+   *  nobody else, so it decides whether this call relays or goes direct. */
   async schedulePolicyUpdate(
     treasury: Address,
     p: { newCap: bigint; newPeriod: bigint; allowlistOn: boolean; newPayout: Address },
+    agentManager?: Address,
   ): Promise<Hex> {
-    const hash = await this.sendManagerCall({
+    return this.sendManagerCallConfirmed({
       target: treasury,
       abi: agentTreasuryAbi as Abi,
       functionName: "schedulePolicyUpdate",
       args: [p.newCap, p.newPeriod, p.allowlistOn, p.newPayout],
+      agentManager,
     });
-    await this.d.publicClient.waitForTransactionReceipt({ hash });
-    return hash;
   }
 
   /** Execute a previously-scheduled policy change once its timelock has elapsed (manager-gated). */
-  async executePolicyUpdate(treasury: Address, policyId: Hex): Promise<Hex> {
-    const hash = await this.sendManagerCall({
+  async executePolicyUpdate(
+    treasury: Address,
+    policyId: Hex,
+    agentManager?: Address,
+  ): Promise<Hex> {
+    return this.sendManagerCallConfirmed({
       target: treasury,
       abi: agentTreasuryAbi as Abi,
       functionName: "executePolicyUpdate",
       args: [policyId],
+      agentManager,
     });
-    await this.d.publicClient.waitForTransactionReceipt({ hash });
-    return hash;
   }
 
   /** Optional v1 step: top up the treasury vault with ERC-20 USDC from the manager wallet. */

@@ -203,6 +203,58 @@ mitigation is smallness + audit + the fact that admin can always re-key every RO
 - Registry event parsing: `EntityCreated`'s `manager` topic now = controller (indexers/tests that
   asserted the EOA update accordingly).
 
+### Implementation adjustments (review round, 2026-08-17)
+
+Five corrections from the 8-angle review of the built branch. All are implemented; they change
+§5's shape, not its intent.
+
+1. **Relay routing is PER AGENT, keyed on the entity's PERSISTED `manager` — not a per-deployment
+   flag.** The draft above reads as "controller set ⇒ relay everything", which would have broken
+   all 11 legacy prod agents the moment `CONTROLLER_ADDRESS` was set: `AgentTreasury.manager` is
+   immutable and the identity NFT has one owner, so an agent minted before the cutover obeys the
+   old EOA forever and a relayed call reaches it as `msg.sender == controller` → `NotManager`.
+   `sendManagerCall` therefore takes `agentManager` and relays only when a controller is configured
+   AND (no agent is implied — deployment-level calls like `createEntity`, where the doors force the
+   controller — OR the agent's manager IS the controller). Every call site threads the manager it
+   persisted: `rec.manager` in the saga, the entity's `manager` column in the policy routes.
+   `confirmCreateEntity`'s "manager must be the controller" assertion is gated on the SAME
+   predicate, so a create broadcast before the flip and resumed after it confirms against the
+   manager it was actually minted with instead of throwing forever.
+2. **Boot-time ON-CHAIN verification** (`adapters/arc/bootVerify.ts`, called from `api/main.ts`;
+   `loadConfig` stays pure). Controller mode reads `factory.owner()`, `hasRole` for each of the
+   seven granted selectors (derived from the generated ABIs with `toFunctionSelector`, never
+   hardcoded), and `boundTarget` for the two registry pins; any mismatch refuses the boot, naming
+   the failing check and the env vars involved. Legacy mode with a factory configured asserts
+   `factory.owner() == the signing key`, which catches "flipped the factory, forgot
+   `CONTROLLER_ADDRESS`" and the pending-`acceptOwnership` window. A read failure is reported as
+   "could not verify", never as a misconfiguration.
+3. **Break-glass is spend-and-revoke EVEN ON FAILURE.** `BreakGlassOneShot.execute` used to bubble
+   the target's revert — which rolled back `used` AND both `renounceRole`s, leaving the dangerous
+   grant standing on the controller after a ceremony the admin believed was over. It now captures
+   `(ok, data)`, renounces both roles unconditionally, emits
+   `BreakGlassExecuted(target, selector, ok, data)` and returns `(ok, data)`. **The admin must read
+   `ok`** — a failed action needs a fresh grant and a fresh helper. The `hasRole` pre-checks and
+   `RoleNotGranted` are gone: the controller's fallback is the canonical authority, and OZ's
+   `renounceRole` is a no-op for a role the account does not hold.
+4. **M5 pins are CONSTRUCTOR arguments** (`pinSelectors`/`pinTargets`), not a post-deploy ceremony.
+   The pins exist from block 0, closing the window in which a registry selector was relayable at
+   any target, and removing a ceremony step that could be forgotten. `setBoundTarget` remains for
+   later changes (a registry migration, an unpin). §7's "MANUAL STEP (b)" is therefore deleted;
+   `acceptOwnership` remains the one ceremony.
+5. **ENS apex must be named in controller mode.** `CONTROLLER_ADDRESS` + `ENS_GATEWAY_SIGNER_KEY`
+   now require `ENS_APEX_RESOLVES_TO` (boot invariant, in `loadConfig` — pure env logic). Without
+   it the apex resolves to the platform signing key, which is exactly the address this design makes
+   ROTATABLE: rotating the executor would silently repoint `novicorpus.eth` at the new key.
+
+Also folded in: the relay preflight is `eth_estimateGas` (one round-trip that both proves the call
+and produces the gas limit, instead of an `eth_call` followed by viem estimating — a double
+execution); only a genuine revert is re-dressed with a decoded reason, so an RPC timeout is
+rethrown untouched rather than reading as "reverted in simulation"; and the decode covers the
+controller's own errors (`NotAuthorized`, `TargetNotBound`, …) so relay-level failures name
+themselves. The standalone onboarding server (`src/onboarding/server.ts`) — the third door — now
+forces `roles.manager` like the REST and MCP doors; it was passing caller-supplied specs verbatim,
+which M4 rejects in controller mode.
+
 ## 6. Test plan
 
 **New Foundry suite `test/NoviController.t.sol`:**

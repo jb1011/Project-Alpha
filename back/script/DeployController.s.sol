@@ -12,8 +12,9 @@ import {IIdentityRegistry} from "../src/interfaces/IIdentityRegistry.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /// @notice Steps 1-2 of the NoviController migration (design §7): deploy the controller with the
-///         executor's standing selector grants, deploy a factory whose beacon owner is the
-///         controller, and hand the factory's ownership to the controller (two-step, pending).
+///         executor's standing selector grants AND the M5 registry pins, deploy a factory whose
+///         beacon owner is the controller, and hand the factory's ownership to the controller
+///         (two-step, pending).
 /// @dev    Env:
 ///           PRIVATE_KEY              deployer key (broadcast)
 ///           IDENTITY_REGISTRY        live ERC-8004 registry
@@ -23,11 +24,14 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 ///           LEGAL_MANAGER_IMPL       optional; reuse an existing implementation instead of
 ///                                    deploying a fresh one (the beacon points at it)
 ///
-///         Deliberately NOT broadcast here, because both require the ADMIN key (which is not the
-///         deployer) and the design wants them as human-visible ceremonies:
+///         The M5 pins (`setAgentWallet`/`setMetadata` -> the registry) are CONSTRUCTOR arguments,
+///         so they hold from block 0 — there is no window in which a registry selector is
+///         relayable at an arbitrary target, and no ceremony step that can be forgotten.
+///
+///         Deliberately NOT broadcast here, because it requires the ADMIN key (which is not the
+///         deployer) and the design wants it as a human-visible ceremony:
 ///           a) `acceptOwnership` on the factory, via a BreakGlassOneShot (grant + act + revoke)
-///           b) `setBoundTarget` for the two registry selectors (M5)
-///         Both are printed below with the exact arguments.
+///         It is printed below with the exact arguments.
 contract DeployController is Script {
     function run() external {
         uint256 pk = vm.envUint("PRIVATE_KEY");
@@ -39,8 +43,17 @@ contract DeployController is Script {
 
         bytes4[] memory selectors = _grantedSelectors();
 
+        // M5 (design §3): the ERC-8004 registry is a third-party UPGRADEABLE proxy, so the two
+        // selectors we relay at it are pinned to its address from block 0.
+        bytes4[] memory pinSelectors = new bytes4[](2);
+        pinSelectors[0] = IIdentityRegistry.setAgentWallet.selector;
+        pinSelectors[1] = IIdentityRegistry.setMetadata.selector;
+        address[] memory pinTargets = new address[](2);
+        pinTargets[0] = identityRegistry;
+        pinTargets[1] = identityRegistry;
+
         vm.startBroadcast(pk);
-        NoviController controller = new NoviController(adminDelay, admin, executor, selectors);
+        NoviController controller = new NoviController(adminDelay, admin, executor, selectors, pinSelectors, pinTargets);
 
         address impl = existingImpl;
         if (impl == address(0)) impl = address(new LegalManager());
@@ -63,14 +76,29 @@ contract DeployController is Script {
         console2.log("  pendingOwner:        ", factory.pendingOwner());
 
         console2.log("");
+        // Each line names the function AND derives its selector from the same ABI the constructor
+        // used. Never index into `selectors` positionally: this log is the human verification
+        // artifact of a mainnet ceremony, and a reordered library would silently relabel it.
         console2.log("Executor selector grants made at deploy:");
-        _logSelector("AgentTreasury.schedulePolicyUpdate", selectors[0]);
-        _logSelector("AgentTreasury.executePolicyUpdate", selectors[1]);
-        _logSelector("LegalManager.scheduleOperatingAgreementUpdate", selectors[2]);
-        _logSelector("LegalManager.executeOperatingAgreementUpdate", selectors[3]);
-        _logSelector("LegalManagerFactory.createEntity", selectors[4]);
-        _logSelector("IdentityRegistry.setAgentWallet", selectors[5]);
-        _logSelector("IdentityRegistry.setMetadata", selectors[6]);
+        _logSelector("AgentTreasury.schedulePolicyUpdate", AgentTreasury.schedulePolicyUpdate.selector);
+        _logSelector("AgentTreasury.executePolicyUpdate", AgentTreasury.executePolicyUpdate.selector);
+        _logSelector(
+            "LegalManager.scheduleOperatingAgreementUpdate", LegalManager.scheduleOperatingAgreementUpdate.selector
+        );
+        _logSelector(
+            "LegalManager.executeOperatingAgreementUpdate", LegalManager.executeOperatingAgreementUpdate.selector
+        );
+        _logSelector("LegalManagerFactory.createEntity", LegalManagerFactory.createEntity.selector);
+        _logSelector("IdentityRegistry.setAgentWallet", IIdentityRegistry.setAgentWallet.selector);
+        _logSelector("IdentityRegistry.setMetadata", IIdentityRegistry.setMetadata.selector);
+        console2.log("  (count logged vs granted):", selectors.length);
+
+        console2.log("");
+        console2.log("M5 target pins set in the CONSTRUCTOR (no ceremony needed):");
+        console2.log("  registry =", identityRegistry);
+        _logSelector("  pinned: IdentityRegistry.setAgentWallet", IIdentityRegistry.setAgentWallet.selector);
+        _logSelector("  pinned: IdentityRegistry.setMetadata", IIdentityRegistry.setMetadata.selector);
+        console2.log("  verify: controller.boundTarget(<selector>) == registry, for both");
 
         console2.log("");
         console2.log("MANUAL STEP (a) - factory acceptOwnership via one-shot break-glass:");
@@ -82,13 +110,10 @@ contract DeployController is Script {
         _logSelector("     selector/role = Ownable2Step.acceptOwnership", Ownable2Step.acceptOwnership.selector);
         console2.log("  2. ADMIN sends: controller.grantRole(bytes32(selector), <helper>)");
         console2.log("  3. HELPER DEPLOYER sends: helper.execute()   (relays + self-revokes in one tx)");
-        console2.log("  4. verify: factory.owner() == controller, and the old deployer's createEntity reverts");
-
-        console2.log("");
-        console2.log("MANUAL STEP (b) - ADMIN pins the registry selectors to the registry (M5):");
-        console2.log("  controller.setBoundTarget(<setAgentWallet selector>, registry)");
-        console2.log("  controller.setBoundTarget(<setMetadata selector>,    registry)");
-        console2.log("     registry =", identityRegistry);
+        console2.log("  4. CHECK THE RETURNED `ok` / BreakGlassExecuted event: execute() spends the");
+        console2.log("     helper and revokes the grant EVEN IF the relayed call failed. ok=false");
+        console2.log("     means nothing happened - deploy a FRESH helper and re-grant.");
+        console2.log("  5. verify: factory.owner() == controller, and the old deployer's createEntity reverts");
 
         console2.log("");
         console2.log("THEN: backend env -> FACTORY_ADDRESS + CONTROLLER_ADDRESS, restart, probe agent, wizard test.");

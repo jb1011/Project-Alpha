@@ -89,7 +89,9 @@ contract LegalManagerFactory is IERC721Receiver, Ownable2Step {
         //    with `manager = attacker`, holding the identity NFT and the vault's manager powers
         //    outside the controller's role system. Zero flexibility cost for a bespoke platform
         //    factory; note it also pins the identity NFT's destination (step 5) to the owner.
-        if (manager != owner()) revert ManagerMustBeOwner();
+        //    `onlyOwner` above already established msg.sender == owner(), so comparing against
+        //    msg.sender is the same check without the second SLOAD.
+        if (manager != msg.sender) revert ManagerMustBeOwner();
 
         // 1. Register the agent's on-chain identity (ERC-8004). _safeMints the NFT to this
         //    factory (hence IERC721Receiver) and returns the agentId.

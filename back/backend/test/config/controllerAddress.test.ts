@@ -62,6 +62,52 @@ test("ENS_APEX_RESOLVES_TO is an explicit, optional address (never inferred from
   expect(loadConfig(base).ensApexResolvesTo).toBeUndefined();
 });
 
+// ── the apex invariant: controller mode + ENS gateway => the apex must be named ──
+//
+// With no explicit apex the gateway resolves it to the platform SIGNING KEY. That is precisely the
+// address the controller design makes ROTATABLE (the key stops being the manager identity and
+// becomes a replaceable executor), so leaving the apex to follow it means an executor rotation
+// silently repoints novicorpus.eth at whatever key was rotated in.
+
+const ENS_ON = { ENS_GATEWAY_SIGNER_KEY: `0x${"2".repeat(64)}` };
+const APEX = "0x00000000000000000000000000000000000000A1";
+
+test("controller + ENS gateway without ENS_APEX_RESOLVES_TO refuses to boot", () => {
+  expect(() =>
+    loadConfig({ ...base, ...ENS_ON, CONTROLLER_ADDRESS: CONTROLLER, FACTORY_ADDRESS: FACTORY }),
+  ).toThrow(/ENS_APEX_RESOLVES_TO/);
+});
+
+test("...and the message explains WHY (the key is rotatable, the apex must not follow it)", () => {
+  const err = (() => {
+    try {
+      loadConfig({ ...base, ...ENS_ON, CONTROLLER_ADDRESS: CONTROLLER, FACTORY_ADDRESS: FACTORY });
+    } catch (e) {
+      return e as Error;
+    }
+  })();
+  expect(err?.message).toMatch(/rotatable executor/i);
+  expect(err?.message).toMatch(/must not follow it silently/i);
+});
+
+test("naming the apex satisfies the invariant", () => {
+  const cfg = loadConfig({
+    ...base,
+    ...ENS_ON,
+    CONTROLLER_ADDRESS: CONTROLLER,
+    FACTORY_ADDRESS: FACTORY,
+    ENS_APEX_RESOLVES_TO: APEX,
+  });
+  expect(cfg.ensApexResolvesTo).toBe(APEX);
+});
+
+test("the invariant is scoped: ENS without a controller boots, controller without ENS boots", () => {
+  expect(loadConfig({ ...base, ...ENS_ON }).ens).toBeDefined(); // legacy ENS deployment: unchanged
+  expect(
+    loadConfig({ ...base, CONTROLLER_ADDRESS: CONTROLLER, FACTORY_ADDRESS: FACTORY }).ens,
+  ).toBeUndefined(); // controller, no gateway: no apex to get wrong
+});
+
 test("redact() leaves the controller address visible — it is an address, not a secret", () => {
   const cfg = loadConfig({ ...base, CONTROLLER_ADDRESS: CONTROLLER, FACTORY_ADDRESS: FACTORY });
   const safe = redact(cfg);

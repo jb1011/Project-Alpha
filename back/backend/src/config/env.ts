@@ -475,6 +475,18 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     );
   }
 
+  // NoviController (design §5), the ENS half. With no explicit apex the gateway resolves the apex
+  // to the platform SIGNING KEY — which, in controller mode, is exactly the address the design
+  // makes rotatable: the key stops being the manager identity and becomes a replaceable executor.
+  // Leaving the apex to follow it means rotating the executor silently repoints
+  // `novicorpus.eth` at whatever key was rotated in. So once a controller AND an ENS gateway are
+  // both configured, the apex must be a deliberate, named address.
+  if (cfg.controllerAddress && cfg.ens && !cfg.ensApexResolvesTo) {
+    throw new Error(
+      "Invalid config: CONTROLLER_ADDRESS + ENS_GATEWAY_SIGNER_KEY are set but ENS_APEX_RESOLVES_TO is missing — in controller mode the platform signing key is a ROTATABLE executor, and the apex must not follow it silently; name the apex address explicitly (a treasury/receiving address, NOT the controller, which can neither hold nor be paid)",
+    );
+  }
+
   if (cfg.platformOutflowCeiling < cfg.maxTreasuryFund) {
     throw new Error(
       "Invalid config: PLATFORM_OUTFLOW_CEILING_USDC must be >= MAX_TREASURY_FUND_USDC (a single legal fund call must never be auto-blocked)",

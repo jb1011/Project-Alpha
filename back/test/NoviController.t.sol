@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
-import {ControllerSelectors} from "../src/libraries/ControllerSelectors.sol";
+import {ControllerRelayHarness} from "./helpers/ControllerRelayHarness.sol";
 import {NoviController} from "../src/NoviController.sol";
 import {BreakGlassOneShot} from "../src/BreakGlassOneShot.sol";
 import {AgentTreasury} from "../src/AgentTreasury.sol";
@@ -58,8 +58,9 @@ contract Echo {
 
 /// @dev Shared fixture: a controller whose executor holds exactly the design §3 granted
 ///      selector set, plus real vaults so relayed reverts are genuine vault custom errors.
-abstract contract ControllerTestBase is Test {
-    NoviController internal controller;
+///      The relay mechanics themselves (wrapping, relaying, break-glass) come from
+///      {ControllerRelayHarness}, which the live-state fork suite inherits too.
+abstract contract ControllerTestBase is ControllerRelayHarness {
     Echo internal echo;
     MockUSDC internal usdc;
     MockLegalManagerStatus internal legal;
@@ -70,8 +71,6 @@ abstract contract ControllerTestBase is Test {
     ///      travel back through the relay. `spend` is never granted in production.
     AgentTreasury internal opVault;
 
-    address internal admin = makeAddr("noviAdmin");
-    address internal executor = makeAddr("noviExecutor");
     address internal stranger = makeAddr("stranger");
     address internal guardian = makeAddr("guardian");
     address internal operator = makeAddr("operator");
@@ -89,7 +88,11 @@ abstract contract ControllerTestBase is Test {
     uint256 internal constant POLICY_DELAY = 2 days;
 
     function setUp() public virtual {
-        controller = new NoviController(ADMIN_DELAY, admin, executor, _grantedSelectors());
+        // No constructor pins in the base fixture: every relay target here is one of OUR audited
+        // contracts, where coarse-across-targets is the intended semantics (design §3). The M5
+        // pins are exercised in NoviControllerBoundTargetTest + the integration suite.
+        (bytes4[] memory pinSelectors, address[] memory pinTargets) = _noPins();
+        controller = new NoviController(ADMIN_DELAY, admin, executor, _grantedSelectors(), pinSelectors, pinTargets);
         WILDCARD = controller.WILDCARD_ROLE();
         ADMIN_ROLE = controller.DEFAULT_ADMIN_ROLE();
         echo = new Echo();
@@ -126,11 +129,6 @@ abstract contract ControllerTestBase is Test {
 
     // ── selector sets ────────────────────────────────────────────────────
 
-    /// @dev The ONE grant-set definition — src/libraries/ControllerSelectors.sol.
-    function _grantedSelectors() internal pure returns (bytes4[] memory) {
-        return ControllerSelectors.granted();
-    }
-
     /// @dev design §3: deliberately UNgranted — admin break-glass only. Still part of the
     ///      RELAYED set for disjointness purposes (they must route to the fallback).
     function _breakGlassSelectors() internal pure returns (bytes4[] memory s) {
@@ -153,68 +151,23 @@ abstract contract ControllerTestBase is Test {
         s[13] = Ownable2Step.acceptOwnership.selector;
     }
 
-    // ── relay helpers ────────────────────────────────────────────────────
+    // ── the controller's own ABI, read from the compiled artifact ────────
 
-    /// @dev Euler encoding: target-function calldata with the target appended as 20 trailing bytes.
-    function _wrap(bytes memory inner, address target) internal pure returns (bytes memory) {
-        return abi.encodePacked(inner, target);
-    }
-
-    function _relay(address caller, address target, bytes memory inner) internal returns (bool ok, bytes memory ret) {
-        vm.prank(caller);
-        (ok, ret) = address(controller).call(_wrap(inner, target));
-    }
-
-    function _relayOk(address caller, address target, bytes memory inner) internal returns (bytes memory) {
-        (bool ok, bytes memory ret) = _relay(caller, target, inner);
-        assertTrue(ok, "relay reverted unexpectedly");
-        return ret;
-    }
-
-    function _relayRaw(address caller, bytes memory raw) internal returns (bool ok, bytes memory ret) {
-        vm.prank(caller);
-        (ok, ret) = address(controller).call(raw);
-    }
-
-    function _sel(bytes memory data) internal pure returns (bytes4 s) {
-        assembly {
-            s := mload(add(data, 0x20))
+    /// @dev The controller's LOCAL selector surface, loaded from the build artifact
+    ///      (`methodIdentifiers` = the exact signature -> selector map solc emitted for THIS
+    ///      compilation) instead of a hand-pinned list. A hand-pinned list can only ever be as
+    ///      fresh as the last time someone re-ran `forge inspect`; this one cannot go stale, and
+    ///      a function added to the controller shows up in the disjointness check immediately.
+    ///      `test_everyRelayedSelectorRoutesToFallback` remains the behavioral backstop.
+    function _localSelectors() internal view returns (bytes4[] memory s) {
+        string memory artifact = vm.readFile("out/NoviController.sol/NoviController.json");
+        string[] memory sigs = vm.parseJsonKeys(artifact, ".methodIdentifiers");
+        s = new bytes4[](sigs.length);
+        for (uint256 i = 0; i < sigs.length; i++) {
+            // The keys ARE canonical signatures, so the selector is their keccak prefix — the
+            // same derivation solc used, not a re-transcribed hex value.
+            s[i] = bytes4(keccak256(bytes(sigs[i])));
         }
-    }
-
-    function _grant(bytes4 selector, address account) internal {
-        vm.prank(admin);
-        controller.grantRole(bytes32(selector), account);
-    }
-
-    /// @dev Pinned to `forge inspect NoviController methods` (22 entries, verified 2026-08-17).
-    ///      Derived from signature strings, not hardcoded hex. If the controller's ABI grows,
-    ///      update this list — test_everyRelayedSelectorRoutesToFallback is the behavioral
-    ///      backstop that fails on a REAL collision even if this list goes stale.
-    function _localSelectors() internal pure returns (bytes4[] memory s) {
-        s = new bytes4[](22);
-        s[0] = bytes4(keccak256("DEFAULT_ADMIN_ROLE()"));
-        s[1] = bytes4(keccak256("WILDCARD_ROLE()"));
-        s[2] = bytes4(keccak256("acceptDefaultAdminTransfer()"));
-        s[3] = bytes4(keccak256("beginDefaultAdminTransfer(address)"));
-        s[4] = bytes4(keccak256("boundTarget(bytes4)"));
-        s[5] = bytes4(keccak256("cancelDefaultAdminTransfer()"));
-        s[6] = bytes4(keccak256("changeDefaultAdminDelay(uint48)"));
-        s[7] = bytes4(keccak256("defaultAdmin()"));
-        s[8] = bytes4(keccak256("defaultAdminDelay()"));
-        s[9] = bytes4(keccak256("defaultAdminDelayIncreaseWait()"));
-        s[10] = bytes4(keccak256("getRoleAdmin(bytes32)"));
-        s[11] = bytes4(keccak256("grantRole(bytes32,address)"));
-        s[12] = bytes4(keccak256("hasRole(bytes32,address)"));
-        s[13] = bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"));
-        s[14] = bytes4(keccak256("owner()"));
-        s[15] = bytes4(keccak256("pendingDefaultAdmin()"));
-        s[16] = bytes4(keccak256("pendingDefaultAdminDelay()"));
-        s[17] = bytes4(keccak256("renounceRole(bytes32,address)"));
-        s[18] = bytes4(keccak256("revokeRole(bytes32,address)"));
-        s[19] = bytes4(keccak256("rollbackDefaultAdminDelay()"));
-        s[20] = bytes4(keccak256("setBoundTarget(bytes4,address)"));
-        s[21] = bytes4(keccak256("supportsInterface(bytes4)"));
     }
 }
 
@@ -797,11 +750,13 @@ contract NoviControllerDisjointnessTest is ControllerTestBase {
 
     /// @notice design §6 (audit M3): local ∩ RELAYED = ∅. Full-ABI disjointness is FALSE
     ///         (owner()/supportsInterface exist on both sides) and is deliberately NOT asserted.
-    function test_localSelectorsDisjointFromRelayedSet() public pure {
+    function test_localSelectorsDisjointFromRelayedSet() public view {
         bytes4[] memory local = _localSelectors();
         bytes4[] memory relayed = _relayedSelectors();
-        assertEq(local.length, 22, "local ABI drifted: re-pin from forge inspect");
-        assertEq(relayed.length, 21);
+        // Counts are derived, never pinned: the local set is whatever the artifact says the
+        // controller's ABI is, and the relayed set is the two design §3 lists concatenated.
+        assertGt(local.length, 0, "controller artifact carried no methodIdentifiers");
+        assertEq(relayed.length, _grantedSelectors().length + _breakGlassSelectors().length);
         for (uint256 i = 0; i < local.length; i++) {
             for (uint256 j = 0; j < relayed.length; j++) {
                 assertTrue(local[i] != relayed[j], "local/relayed selector collision");
@@ -848,9 +803,9 @@ contract NoviControllerDisjointnessTest is ControllerTestBase {
 // ─────────────────────────────────────────────────────────────────────────
 
 contract NoviControllerFuzzTest is ControllerTestBase {
-    function _isLocal(bytes4 sel) internal pure returns (bool) {
-        // Membership derived from _localSelectors() — ONE list to re-pin when the ABI
-        // grows, instead of a second hand-maintained || chain that can silently drift.
+    function _isLocal(bytes4 sel) internal view returns (bool) {
+        // Membership derived from _localSelectors() — the compiled artifact's own ABI, so a new
+        // controller function is excluded from the fuzz domain the moment it is added.
         bytes4[] memory local = _localSelectors();
         for (uint256 i = 0; i < local.length; i++) {
             if (local[i] == sel) return true;
@@ -1023,7 +978,8 @@ contract BreakGlassOneShotTest is ControllerTestBase {
         controller.grantRole(bytes32(Echo.ping.selector), address(helper));
         assertTrue(controller.hasRole(bytes32(Echo.ping.selector), address(helper)));
 
-        bytes memory ret = helper.execute();
+        (bool ok, bytes memory ret) = helper.execute();
+        assertTrue(ok);
         assertEq(abi.decode(ret, (uint256)), 22);
         assertEq(echo.lastCaller(), address(controller));
         // grant + act + revoke: the dangerous grant never outlives the ceremony tx
@@ -1053,26 +1009,62 @@ contract BreakGlassOneShotTest is ControllerTestBase {
         helper.execute();
     }
 
-    function test_executeRevertsWithoutGrant() public {
+    /// @notice An ungranted helper is not a special case: the controller's fallback is the
+    ///         authority, so the ceremony simply comes back `ok == false` carrying NotAuthorized —
+    ///         and is spent, because a helper that could retry after a missing grant is a helper
+    ///         that outlives its ceremony.
+    function test_executeWithoutGrantReportsNotAuthorizedAndIsSpent() public {
         BreakGlassOneShot helper = new BreakGlassOneShot(controller, address(echo), abi.encodeCall(Echo.ping, (1)));
-        vm.expectRevert(BreakGlassOneShot.RoleNotGranted.selector);
-        helper.execute();
+        (bool ok, bytes memory ret) = helper.execute();
+        assertFalse(ok);
+        assertEq(
+            ret, abi.encodeWithSelector(NoviController.NotAuthorized.selector, Echo.ping.selector, address(helper))
+        );
+        assertTrue(helper.used());
+        assertEq(echo.lastX(), 0);
     }
 
     function test_executeWorksViaWildcardAndRevokesIt() public {
         BreakGlassOneShot helper = new BreakGlassOneShot(controller, address(echo), abi.encodeCall(Echo.ping, (3)));
         vm.prank(admin);
         controller.grantRole(WILDCARD, address(helper));
-        helper.execute();
+        (bool ok,) = helper.execute();
+        assertTrue(ok);
         assertEq(echo.lastX(), 3);
         assertFalse(controller.hasRole(WILDCARD, address(helper)));
+        // The selector role it never held is renounced too — a no-op, which is why the helper
+        // needs no `hasRole` pre-check to decide what to give back.
+        assertFalse(controller.hasRole(bytes32(Echo.ping.selector), address(helper)));
     }
 
-    function test_executeBubblesTargetRevertAndStaysUsed() public {
+    /// @notice THE property this contract exists for: a ceremony whose ACTION fails still SPENDS
+    ///         the helper and REVOKES the grant, in the same transaction. The old shape reverted
+    ///         on a failed target, which rolled `used` and both renounces back — leaving a live
+    ///         dangerous grant on the controller after an admin believed the ceremony was over.
+    function test_failedActionStillSpendsTheHelperAndRevokesBothRoles() public {
         BreakGlassOneShot helper = new BreakGlassOneShot(controller, address(echo), abi.encodeCall(Echo.boom, (5)));
+        bytes32 role = bytes32(Echo.boom.selector);
+        vm.startPrank(admin);
+        controller.grantRole(role, address(helper));
+        controller.grantRole(WILDCARD, address(helper));
+        vm.stopPrank();
+
+        bytes memory revertData = abi.encodeWithSelector(Echo.Boom.selector, uint256(5), address(controller));
+        // The receipt names the failure: ok == false, plus the target's revert data verbatim.
+        vm.expectEmit(true, true, false, true, address(helper));
+        emit BreakGlassOneShot.BreakGlassExecuted(address(echo), Echo.boom.selector, false, revertData);
+        (bool ok, bytes memory ret) = helper.execute();
+
+        assertFalse(ok, "execute must report failure, not revert");
+        assertEq(ret, revertData);
+        assertTrue(helper.used(), "a failed ceremony still spends the helper");
+        assertFalse(controller.hasRole(role, address(helper)), "selector grant outlived a FAILED ceremony");
+        assertFalse(controller.hasRole(WILDCARD, address(helper)), "WILDCARD outlived a FAILED ceremony");
+
+        // ...and it can never fire again: a failed action needs a fresh grant + a fresh helper.
         vm.prank(admin);
-        controller.grantRole(bytes32(Echo.boom.selector), address(helper));
-        vm.expectRevert(abi.encodeWithSelector(Echo.Boom.selector, uint256(5), address(controller)));
+        controller.grantRole(role, address(helper));
+        vm.expectRevert(BreakGlassOneShot.AlreadyUsed.selector);
         helper.execute();
     }
 
@@ -1122,17 +1114,6 @@ contract NoviControllerIntegrationTest is ControllerTestBase {
         return LegalManagerFactory.TreasuryConfig({
             usdc: address(usdc), payoutAddress: agentPayout, cap: CAP, period: PERIOD, allowlistEnabled: false
         });
-    }
-
-    /// @dev The design's break-glass ceremony: deploy a one-shot, admin grants it the selector,
-    ///      one call performs act + self-revoke atomically.
-    function _breakGlass(address target_, bytes memory data) internal returns (bytes memory) {
-        BreakGlassOneShot helper = new BreakGlassOneShot(controller, target_, data);
-        vm.prank(admin);
-        controller.grantRole(bytes32(_sel(data)), address(helper));
-        bytes memory ret = helper.execute();
-        assertFalse(controller.hasRole(bytes32(_sel(data)), address(helper)), "grant outlived the ceremony");
-        return ret;
     }
 
     function _acceptFactoryOwnership() internal {

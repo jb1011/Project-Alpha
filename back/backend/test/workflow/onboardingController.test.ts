@@ -57,7 +57,7 @@ function makeFakeArc() {
       minted.manager = p.manager;
       return "0xcreate" as `0x${string}`;
     }),
-    confirmCreateEntity: vi.fn(async (txHash: string) => ({
+    confirmCreateEntity: vi.fn(async (txHash: string, _agentManager?: string) => ({
       agentId: 876734n,
       proxy: "0x0000000000000000000000000000000000000abc" as const,
       treasury: "0x0000000000000000000000000000000000000def" as const,
@@ -141,4 +141,78 @@ test("legacy mode: owner is still the signing key's address (unchanged behavior)
     metadataBaseUrl: "https://api.example/backend",
   });
   expect(captured[0]!.message.owner).toBe(managerAccount(cfg).address);
+});
+
+/**
+ * Resume ACROSS the controller cutover (design §5).
+ *
+ * A create broadcast before the flip is already on chain, minted with the OLD manager EOA. The
+ * saga resumes from the PERSISTED spec (runner.reconcileInFlight rehydrates rec.specJson), so the
+ * manager it confirms against must be the one the mint actually used — not the controller this
+ * deployment now runs with. Confirming with the wrong one throws "is not the configured
+ * controller" on every retry and strands the record at `translating` forever.
+ */
+test("a create broadcast pre-flip confirms against the manager it was MINTED with", async () => {
+  const cfg = loadConfig(env); // pre-flip: no controller
+  const mintedManager = managerAccount(cfg).address;
+  const spec = specWithManager(mintedManager);
+  const common = {
+    idempotencyKey: "resume-across-flip",
+    repo,
+    docStore,
+    usdc: "0x3600000000000000000000000000000000000000",
+    ownerTenantId: "t1",
+    metadataBaseUrl: "https://api.example/backend",
+  } as const;
+
+  // Pass 1: broadcast lands, the receipt never arrives — the crash the split exists to survive.
+  const first = makeFakeArc();
+  first.arc.confirmCreateEntity.mockRejectedValueOnce(new Error("receipt timeout"));
+  await expect(
+    runOnboarding({ ...common, spec, arc: first.arc, operatorSigner: first.signer }),
+  ).rejects.toThrow(/receipt timeout/);
+  const stranded = repo.findByIdempotencyKey(common.idempotencyKey);
+  expect(stranded?.status).toBe("translating");
+  expect(stranded?.createTxHash).toBe("0xcreate"); // the hash is persisted, ready to be adopted
+  expect(stranded?.manager).toBe(mintedManager);
+
+  // Pass 2: the deployment has since flipped to controller mode. The saga replays the PERSISTED
+  // spec, so the manager of record is still the old EOA.
+  const second = makeFakeArc();
+  const rec = await runOnboarding({
+    ...common,
+    spec,
+    arc: second.arc,
+    operatorSigner: second.signer,
+  });
+
+  expect(second.arc.broadcastCreateEntity).not.toHaveBeenCalled(); // adopted, not re-minted
+  expect(second.arc.confirmCreateEntity).toHaveBeenCalledWith("0xcreate", mintedManager);
+  expect(rec.status).toBe("bound");
+  // The bind of a legacy agent is likewise attributed to its own manager, so the adapter sends it
+  // direct instead of relaying it into a NotManager revert.
+  expect(second.arc.setAgentWallet).toHaveBeenCalledWith(
+    expect.objectContaining({ agentManager: mintedManager }),
+  );
+});
+
+test("a controller-managed agent threads the CONTROLLER as its manager everywhere", async () => {
+  const cfg = loadConfig({ ...env, CONTROLLER_ADDRESS: CONTROLLER });
+  const manager = platformManagerAddress(cfg);
+  const { arc, signer } = makeFakeArc();
+  await runOnboarding({
+    spec: specWithManager(manager),
+    idempotencyKey: "ctrl-thread",
+    repo,
+    docStore,
+    arc,
+    operatorSigner: signer,
+    usdc: "0x3600000000000000000000000000000000000000",
+    ownerTenantId: "t1",
+    metadataBaseUrl: "https://api.example/backend",
+  });
+  expect(arc.confirmCreateEntity).toHaveBeenCalledWith("0xcreate", CONTROLLER);
+  expect(arc.setAgentWallet).toHaveBeenCalledWith(
+    expect.objectContaining({ agentManager: CONTROLLER }),
+  );
 });

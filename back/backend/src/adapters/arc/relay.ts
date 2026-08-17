@@ -2,11 +2,13 @@ import {
   type Abi,
   BaseError,
   RawContractError,
+  concatHex,
   decodeErrorResult,
   isAddress,
   isHex,
   size,
 } from "viem";
+import { noviControllerAbi } from "../../abis/generated";
 import type { Address, Hex } from "../../types";
 
 /**
@@ -39,39 +41,55 @@ export function appendRelayTarget(data: Hex, target: Address): Hex {
     throw new Error(`relay: calldata must carry at least a 4-byte selector (got ${size(data)})`);
   if (!isAddress(target, { strict: false }))
     throw new Error(`relay: target must be a 0x address, got ${String(target)}`);
-  return `${data}${target.slice(2).toLowerCase()}` as Hex;
+  // The validation above is the point of this function; `concatHex` is just the join, and using
+  // viem's keeps the 0x-prefix handling out of our hands. Lowercased so the bytes we send are
+  // deterministic regardless of how the caller checksummed the address.
+  return concatHex([data, target.toLowerCase() as Hex]);
 }
 
 /**
- * Decorate a failed relay simulation so the operator sees WHAT reverted, not a raw hex blob.
+ * Decorate a REVERTED relay preflight so the operator sees WHAT reverted, not a raw hex blob.
  *
- * The controller bubbles the target's revert verbatim, but `eth_call` against the controller has no
- * ABI attached, so viem cannot name a custom error the way `simulateContract` does. We walk the
- * error chain for the revert bytes and decode them against the target's ABI — recovering
- * `CapExceeded(...)`-style names — and fall back to the original message when the data is a
- * controller-level error we don't have an ABI for (e.g. `NotAuthorized(selector, sender)`).
+ * The controller bubbles the target's revert verbatim, but the preflight (`eth_estimateGas`
+ * against the controller) has no ABI attached, so viem cannot name a custom error the way
+ * `simulateContract` does. We walk the error chain for the revert bytes and decode them against
+ * the target's ABI CONCATENATED WITH THE CONTROLLER'S — so a `CapExceeded()` from the vault and a
+ * `NotAuthorized(selector, caller)` from the relay itself both name themselves. (`decodeErrorResult`
+ * also covers `Error(string)` and `Panic(uint256)`, which viem appends internally; viem's
+ * `getContractError` was considered and left alone — it is built around a function call on a known
+ * ABI, and the relay is deliberately a raw send whose target ABI is not the one being called.)
+ *
+ * IMPORTANT: when the error carries NO revert data it is NOT a revert — it is transport (RPC
+ * timeout, connection reset, rate limit). Those are returned UNTOUCHED, because dressing a network
+ * blip up as "reverted in simulation" sends the operator hunting a contract bug that never happened.
  */
 export function relayRevertError(
   err: unknown,
   ctx: { abi: Abi; functionName: string; target: Address; controller: Address },
 ): Error {
-  const decoded = decodeRevert(err, ctx.abi);
+  const data = revertData(err);
+  // No revert bytes anywhere in the chain => not a revert. Hand the original back verbatim.
+  if (!data) return err instanceof Error ? err : new Error(String(err));
+
   const where = `relay ${ctx.functionName} -> ${ctx.target} via controller ${ctx.controller}`;
-  const detail = decoded ?? (err instanceof BaseError ? err.shortMessage : (err as Error)?.message);
+  const detail =
+    decodeRevert(data, ctx.abi) ??
+    (err instanceof BaseError ? err.shortMessage : (err as Error)?.message);
   return new Error(`${where} reverted in simulation: ${detail ?? "unknown reason"}`, {
     cause: err,
   });
 }
 
-/** Best-effort `Name(arg, arg)` from the revert bytes buried in a viem call error. */
-function decodeRevert(err: unknown, abi: Abi): string | undefined {
-  const data = revertData(err);
-  if (!data) return undefined;
+/** Best-effort `Name(arg, arg)` from revert bytes, against the target's ABI + the controller's. */
+function decodeRevert(data: Hex, abi: Abi): string | undefined {
   try {
-    const { errorName, args } = decodeErrorResult({ abi, data });
+    const { errorName, args } = decodeErrorResult({
+      abi: [...abi, ...(noviControllerAbi as unknown as Abi)],
+      data,
+    });
     return `${errorName}(${(args ?? []).map((a) => String(a)).join(", ")})`;
   } catch {
-    return `revert data ${data}`; // not in the target's ABI (controller-level error) — show it raw
+    return `revert data ${data}`; // in neither ABI (a third-party target) — show it raw
   }
 }
 

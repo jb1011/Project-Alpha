@@ -89,10 +89,11 @@ function classify(labels: string[], parentLabels: string[]): Target {
 
 /** The entity's canonical "pay me" address = its governed treasury (zero if none/unknown/apex). */
 function addrFor(deps: ApiDeps, target: Target): Address {
-  // Apex: an EXPLICIT choice (ENS_APEX_RESOLVES_TO), falling back to the platform manager address =
+  // Apex: an EXPLICIT choice (ENS_APEX_RESOLVES_TO), falling back to the platform SIGNING KEY =
   // today's behavior. NoviController design §5: in controller mode the platform manager becomes a
   // contract that can neither be paid nor spend, so the apex must not inherit it by accident.
-  if (target.kind === "apex") return getAddress(deps.ensApexAddress) as Address;
+  // Already checksum-normalized once at deps construction (api/main.ts) — no per-request work.
+  if (target.kind === "apex") return deps.ensApexAddress as Address;
   if (target.kind === "agent") {
     const ent = entityForLabel(deps, target.label);
     return (ent?.treasury as Address | null) ?? zeroAddress;

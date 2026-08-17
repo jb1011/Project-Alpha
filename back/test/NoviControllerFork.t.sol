@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
-import {ControllerSelectors} from "../src/libraries/ControllerSelectors.sol";
+import {ControllerRelayHarness} from "./helpers/ControllerRelayHarness.sol";
 import {NoviController} from "../src/NoviController.sol";
-import {BreakGlassOneShot} from "../src/BreakGlassOneShot.sol";
 import {LegalManager} from "../src/LegalManager.sol";
 import {LegalManagerFactory} from "../src/LegalManagerFactory.sol";
 import {AgentTreasury} from "../src/AgentTreasury.sol";
@@ -43,7 +41,7 @@ interface IERC5267Fork {
 ///         registry's deployed bytecode uses it; the project pins evm_version = paris for Arc
 ///         deploys). Same self-skip + FORK_TESTS_REQUIRED tripwire as IdentityRegistryFork.t.sol.
 ///         Pure local simulation — nothing is broadcast, nothing is spent.
-contract NoviControllerForkTest is Test {
+contract NoviControllerForkTest is ControllerRelayHarness {
     address internal constant LIVE_REGISTRY = 0x8004A818BFB912233c491871b3d84c89A494BD9e;
     uint256 internal constant ARC_TESTNET_CHAIN_ID = 5042002;
     /// @dev Literal duplicate of MockIdentityRegistry.AGENT_WALLET_SET_TYPEHASH for the same
@@ -54,12 +52,9 @@ contract NoviControllerForkTest is Test {
     uint48 internal constant ADMIN_DELAY = 24 hours;
 
     IIdentityRegistry internal registry = IIdentityRegistry(LIVE_REGISTRY);
-    NoviController internal controller;
     LegalManagerFactory internal factory;
     bool internal forked;
 
-    address internal admin = makeAddr("noviAdmin");
-    address internal executor = makeAddr("noviExecutor");
     address internal guardian = makeAddr("agentGuardian");
     address internal operator = makeAddr("agentOperator");
     address internal payout = makeAddr("agentPayout");
@@ -79,11 +74,6 @@ contract NoviControllerForkTest is Test {
         ok = probe != address(0);
     }
 
-    /// @dev The ONE grant-set definition — src/libraries/ControllerSelectors.sol.
-    function _grantedSelectors() internal pure returns (bytes4[] memory) {
-        return ControllerSelectors.granted();
-    }
-
     function setUp() public {
         string memory url = vm.envOr("ARC_TESTNET_RPC_URL", string(""));
         if (bytes(url).length == 0 || !_supportsPush0()) {
@@ -93,49 +83,20 @@ contract NoviControllerForkTest is Test {
         vm.createSelectFork(url);
         forked = true;
 
-        // Deploy sequence of script/DeployController.s.sol, rehearsed against live state.
-        controller = new NoviController(ADMIN_DELAY, admin, executor, _grantedSelectors());
+        // Deploy sequence of script/DeployController.s.sol, rehearsed against live state — M5 pins
+        // included, because the script sets them in the CONSTRUCTOR (no post-deploy ceremony).
+        (bytes4[] memory pinSelectors, address[] memory pinTargets) = _registryPins(LIVE_REGISTRY);
+        controller = new NoviController(ADMIN_DELAY, admin, executor, _grantedSelectors(), pinSelectors, pinTargets);
         LegalManager impl = new LegalManager();
         factory = new LegalManagerFactory(address(impl), LIVE_REGISTRY, address(controller));
         factory.transferOwnership(address(controller));
         _breakGlass(address(factory), abi.encodeCall(Ownable2Step.acceptOwnership, ()));
-
-        // M5: pin the two registry selectors to the live registry address.
-        vm.startPrank(admin);
-        controller.setBoundTarget(IIdentityRegistry.setAgentWallet.selector, LIVE_REGISTRY);
-        controller.setBoundTarget(IIdentityRegistry.setMetadata.selector, LIVE_REGISTRY);
-        vm.stopPrank();
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
-
-    function _sel(bytes memory data) internal pure returns (bytes4 s) {
-        assembly {
-            s := mload(add(data, 0x20))
-        }
-    }
-
-    /// @dev The design's ceremony: grant to a single-use helper, which acts and self-revokes.
-    function _breakGlass(address target, bytes memory data) internal returns (bytes memory) {
-        BreakGlassOneShot helper = new BreakGlassOneShot(controller, target, data);
-        bytes32 role = bytes32(_sel(data));
-        vm.prank(admin);
-        controller.grantRole(role, address(helper));
-        bytes memory ret = helper.execute();
-        assertFalse(controller.hasRole(role, address(helper)), "grant outlived the ceremony");
-        return ret;
-    }
-
-    function _relay(address caller, address target, bytes memory inner) internal returns (bool ok, bytes memory ret) {
-        vm.prank(caller);
-        (ok, ret) = address(controller).call(abi.encodePacked(inner, target));
-    }
-
-    function _relayOk(address caller, address target, bytes memory inner) internal returns (bytes memory) {
-        (bool ok, bytes memory ret) = _relay(caller, target, inner);
-        assertTrue(ok, "relay reverted against live state");
-        return ret;
-    }
+    // (relay wrapping, _relay/_relayOk, _sel and the break-glass ceremony come from
+    //  ControllerRelayHarness — ONE copy, shared with the local suite, so this deploy gate
+    //  exercises exactly the encoding production and the local tests use.)
 
     function _createAgentThroughRelay() internal returns (uint256 agentId, address proxy, address treasury) {
         MockUSDC usdc = new MockUSDC(); // the treasury's token is incidental to the registry paths
@@ -191,6 +152,9 @@ contract NoviControllerForkTest is Test {
         assertEq(factory.owner(), address(controller));
         assertEq(factory.beacon().owner(), address(controller));
         assertTrue(LIVE_REGISTRY.code.length > 0);
+        // M5 pins came from the constructor: they hold before anyone could relay anything.
+        assertEq(controller.boundTarget(IIdentityRegistry.setAgentWallet.selector), LIVE_REGISTRY);
+        assertEq(controller.boundTarget(IIdentityRegistry.setMetadata.selector), LIVE_REGISTRY);
     }
 
     /// @notice DEPLOY GATE 0: an agent is registered on the LIVE ERC-8004 registry by a factory

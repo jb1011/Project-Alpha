@@ -60,6 +60,9 @@ contract NoviController is AccessControlDefaultAdminRules, IERC721Receiver {
     /// @dev Granting selectors to the zero address would emit a governance event that authorizes
     ///      no one; almost certainly a mis-scripted deployment.
     error ZeroExecutor();
+    /// @dev The constructor's M5 pins are two parallel arrays; a length mismatch means the deploy
+    ///      script would silently pin a selector to the wrong target (or drop a pin entirely).
+    error PinLengthMismatch();
 
     /// @notice Emitted for every relayed call. Monitoring keys off the TARGET's own events
     ///         (design §8); this is the audit trail of who asked.
@@ -73,25 +76,46 @@ contract NoviController is AccessControlDefaultAdminRules, IERC721Receiver {
     ///                          24h delay gates HANDOVER only, never an admin compromise).
     /// @param executor_         the hot backend key receiving the standing selector grants.
     /// @param executorSelectors the exact selectors the executor may relay at deploy.
-    constructor(uint48 initialDelay, address admin_, address executor_, bytes4[] memory executorSelectors)
-        AccessControlDefaultAdminRules(initialDelay, admin_)
-    {
+    /// @param pinSelectors      M5 target pins applied at construction (parallel to `pinTargets`).
+    /// @param pinTargets        the sole target each `pinSelectors` entry may be relayed to.
+    /// @dev    The pins exist from block 0 rather than from a follow-up admin ceremony: an
+    ///         unpinned registry selector between deploy and ceremony is exactly the window M5
+    ///         exists to close, and a ceremony step that can be forgotten is not a control.
+    ///         {setBoundTarget} remains for LATER changes (a registry migration, an unpin).
+    constructor(
+        uint48 initialDelay,
+        address admin_,
+        address executor_,
+        bytes4[] memory executorSelectors,
+        bytes4[] memory pinSelectors,
+        address[] memory pinTargets
+    ) AccessControlDefaultAdminRules(initialDelay, admin_) {
         uint256 len = executorSelectors.length;
         if (len != 0 && executor_ == address(0)) revert ZeroExecutor();
         for (uint256 i = 0; i < len; i++) {
             bytes4 selector = executorSelectors[i];
             // Same partition guard the relay enforces, applied at grant time so a mis-scripted
             // deploy cannot even record a role in the admin/wildcard namespace.
-            if (selector == bytes4(0) || bytes32(selector) == WILDCARD_ROLE) revert InvalidSelector();
+            _requireRelayableSelector(selector);
             _grantRole(bytes32(selector), executor_);
+        }
+
+        uint256 pins = pinSelectors.length;
+        if (pins != pinTargets.length) revert PinLengthMismatch();
+        for (uint256 i = 0; i < pins; i++) {
+            bytes4 selector = pinSelectors[i];
+            _requireRelayableSelector(selector);
+            boundTarget[selector] = pinTargets[i];
+            emit BoundTargetSet(selector, pinTargets[i]);
         }
     }
 
     /// @notice Pin (or unpin, with `address(0)`) the only target a selector may be relayed to.
     /// @dev    Admin-only and instant: it is a tightening control, and the delay that matters for
-    ///         governance is on the admin role itself.
+    ///         governance is on the admin role itself. The launch pins are set in the constructor;
+    ///         this is the path for changing them afterwards.
     function setBoundTarget(bytes4 selector, address target) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (selector == bytes4(0) || bytes32(selector) == WILDCARD_ROLE) revert InvalidSelector();
+        _requireRelayableSelector(selector);
         boundTarget[selector] = target;
         emit BoundTargetSet(selector, target);
     }
@@ -106,10 +130,7 @@ contract NoviController is AccessControlDefaultAdminRules, IERC721Receiver {
         if (msg.data.length < 24) revert MsgDataInvalid();
 
         bytes4 selector = bytes4(msg.data[0:4]);
-        // M1. The zero check is load-bearing (bytes32(bytes4(0)) == DEFAULT_ADMIN_ROLE); the
-        // WILDCARD check is unreachable for a left-aligned selector and is kept as an assertion
-        // of the partition, so the invariant survives any future change to WILDCARD_ROLE.
-        if (selector == bytes4(0) || bytes32(selector) == WILDCARD_ROLE) revert InvalidSelector();
+        _requireRelayableSelector(selector);
 
         address target = address(bytes20(msg.data[msg.data.length - 20:]));
 
@@ -142,6 +163,16 @@ contract NoviController is AccessControlDefaultAdminRules, IERC721Receiver {
     ///         `_safeMint`/`safeTransferFrom` flows (e.g. registering directly) from bricking.
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
         return IERC721Receiver.onERC721Received.selector;
+    }
+
+    /// @dev M1. The one partition guard, enforced everywhere a selector enters the system (deploy
+    ///      grants, deploy/admin pins, and the relay itself) so the three can never drift apart.
+    ///      The zero check is load-bearing — `bytes32(bytes4(0)) == DEFAULT_ADMIN_ROLE`, so a
+    ///      zero-selector relay would satisfy `hasRole` for the admin with no grant at all. The
+    ///      WILDCARD check is unreachable for a left-aligned selector and is kept as an assertion
+    ///      of the partition, so the invariant survives any future change to WILDCARD_ROLE.
+    function _requireRelayableSelector(bytes4 selector) internal pure {
+        if (selector == bytes4(0) || bytes32(selector) == WILDCARD_ROLE) revert InvalidSelector();
     }
 
     /// @dev M2. Blocks every path to a self-held role (constructor, `grantRole`, and any future

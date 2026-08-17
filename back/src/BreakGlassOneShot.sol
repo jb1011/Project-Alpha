@@ -5,8 +5,9 @@ import {NoviController} from "./NoviController.sol";
 
 /// @title BreakGlassOneShot
 /// @notice Single-use ceremony contract that makes a break-glass relay atomic under a
-///         single-EOA controller admin: act + self-revoke happen in ONE transaction, so the
-///         dangerous grant never lives across blocks.
+///         single-EOA controller admin: the grant is SPENT AND REVOKED in ONE transaction —
+///         whether or not the action itself succeeded — so a dangerous grant never lives across
+///         blocks.
 /// @dev    Design §3. The full ceremony is exactly two admin transactions:
 ///           1. `controller.grantRole(bytes32(helper.selector()), helper)`  (or WILDCARD_ROLE)
 ///           2. `helper.execute()`                                          (relay + renounce)
@@ -33,10 +34,13 @@ contract BreakGlassOneShot {
 
     error NotAdmin();
     error AlreadyUsed();
-    error RoleNotGranted();
     error CallDataTooShort();
 
-    event BreakGlassExecuted(address indexed target, bytes4 indexed selector, bool viaWildcard);
+    /// @notice The ceremony's receipt. `ok` is the ONLY success signal — `execute` itself does not
+    ///         revert when the action fails, because reverting would roll the revocation back.
+    /// @param data the target's return data when `ok`, otherwise its revert data verbatim
+    ///        (the controller bubbles it through, so a failed ceremony still names its cause).
+    event BreakGlassExecuted(address indexed target, bytes4 indexed selector, bool ok, bytes data);
 
     constructor(NoviController controller_, address target_, bytes memory callData_) {
         if (callData_.length < 4) revert CallDataTooShort();
@@ -52,35 +56,35 @@ contract BreakGlassOneShot {
         callData = callData_;
     }
 
-    /// @notice Relay {callData} to {target} through the controller, then renounce whichever role
-    ///         made it possible. Reverts (leaving the helper spent) if the target reverts, so a
-    ///         failed ceremony is never mistaken for a completed one.
-    /// @return The target's return data, verbatim.
-    function execute() external returns (bytes memory) {
+    /// @notice Relay {callData} to {target} through the controller and give the roles back —
+    ///         SUCCEED OR FAIL. The helper is spent (`used`) and both possible roles are renounced
+    ///         on the controller in the SAME transaction, whatever the target did.
+    /// @dev    Why this does not bubble the target's revert: reverting would roll back `used` AND
+    ///         the renounces, leaving the dangerous grant standing on the controller after a
+    ///         ceremony the admin believes is over — the failure mode is strictly worse than a
+    ///         quiet one. So the failure is REPORTED, not thrown: the admin reads `ok` (or the
+    ///         {BreakGlassExecuted} event, which carries the revert data). A failed action needs a
+    ///         FRESH grant and a FRESH helper; this one can never fire again.
+    ///
+    ///         The renounces are unconditional and need no `hasRole` pre-check: OZ's
+    ///         `renounceRole` -> `_revokeRole` is a no-op for a role the account does not hold,
+    ///         and the controller's fallback is the canonical authority on whether the relay was
+    ///         permitted (an ungranted helper simply gets `NotAuthorized` back in `data`).
+    /// @return ok   whether the relayed call succeeded — the ONLY success signal.
+    /// @return data the target's return data, or its revert data when `ok` is false.
+    function execute() external returns (bool ok, bytes memory data) {
         if (msg.sender != admin) revert NotAdmin();
         if (used) revert AlreadyUsed();
         used = true;
 
-        bytes32 role = bytes32(selector);
-        bytes32 wildcard = controller.WILDCARD_ROLE();
-        bool viaSelector = controller.hasRole(role, address(this));
-        bool viaWildcard = controller.hasRole(wildcard, address(this));
-        if (!viaSelector && !viaWildcard) revert RoleNotGranted();
-
         // Euler encoding: payload with the target appended as the trailing 20 bytes.
-        (bool ok, bytes memory ret) = address(controller).call(abi.encodePacked(callData, target));
-        if (!ok) {
-            assembly {
-                revert(add(ret, 0x20), mload(ret))
-            }
-        }
+        (ok, data) = address(controller).call(abi.encodePacked(callData, target));
 
-        // Self-revoke last: the roles are needed for the call above. `renounceRole` requires the
-        // caller to be the account, which is exactly this contract.
-        if (viaSelector) controller.renounceRole(role, address(this));
-        if (viaWildcard) controller.renounceRole(wildcard, address(this));
+        // Give both roles back regardless of the outcome. `renounceRole` requires the caller to be
+        // the account, which is exactly this contract.
+        controller.renounceRole(bytes32(selector), address(this));
+        controller.renounceRole(controller.WILDCARD_ROLE(), address(this));
 
-        emit BreakGlassExecuted(target, selector, viaWildcard);
-        return ret;
+        emit BreakGlassExecuted(target, selector, ok, data);
     }
 }

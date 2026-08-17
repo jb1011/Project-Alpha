@@ -15,6 +15,11 @@ remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
 ]
+# Read-only access to the build artifacts. NoviController.t.sol derives the controller's LOCAL
+# selector surface from out/NoviController.sol/NoviController.json (`methodIdentifiers`) instead of
+# a hand-pinned list, so the selector-disjointness test can never be checked against a stale copy
+# of the ABI. Read-only and scoped to the output directory.
+fs_permissions = [{ access = "read", path = "./out" }]
 
 [rpc_endpoints]
 arc_testnet = "${ARC_TESTNET_RPC_URL}"
