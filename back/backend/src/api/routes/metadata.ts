@@ -55,7 +55,9 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
           : undefined;
       if (gv) {
         meta.worldId = {
-          humanVerified: true,
+          // A waiver is admin-granted ACCESS, not proof of personhood — claiming otherwise
+          // here would be exactly the fabricated-trust problem the frontend audit flagged.
+          humanVerified: gv.credential !== "waiver",
           credential: gv.credential,
           humanRef: createHash("sha256").update(gv.nullifier).digest("hex"),
           verifiedAt: gv.verifiedAt,

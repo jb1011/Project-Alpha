@@ -35,6 +35,7 @@ export function GuardianRecord({
   attestBusy?: boolean;
 }) {
   const verified = me?.verified ?? false;
+  const waived = me?.credential === "waiver";
   const formationReady = me?.formationReady ?? false;
   const seed = me?.nullifier ?? address ?? "novi-corpus";
 
@@ -122,20 +123,21 @@ export function GuardianRecord({
           )}
         >
           <LedgerCell label="Standing">
+            {/* A waiver grants access, not personhood — it must never wear the verified green. */}
             <span
               className={cx(
                 "flex items-center gap-2 text-[14px]",
-                verified ? "text-emerald-300" : "text-muted",
+                verified ? (waived ? "text-amber-300" : "text-emerald-300") : "text-muted",
               )}
             >
               <span
                 aria-hidden
                 className={cx(
                   "h-1.5 w-1.5 rounded-full",
-                  verified ? "bg-emerald-300" : "bg-muted-2",
+                  verified ? (waived ? "bg-amber-300" : "bg-emerald-300") : "bg-muted-2",
                 )}
               />
-              {verified ? "Accountable human" : "Not on record"}
+              {verified ? (waived ? "Waiver on record" : "Accountable human") : "Not on record"}
             </span>
           </LedgerCell>
 

@@ -39,6 +39,7 @@ import {
   worldIdContext,
   worldIdMe,
   worldIdVerify,
+  worldIdWaiver,
 } from "./client";
 import { apiKeys } from "./keys";
 import { TERMINAL } from "./poll";
@@ -501,6 +502,22 @@ export function useWorldIdVerifyMutation() {
     mutationFn: async (proof: unknown) => {
       const token = await ensureToken();
       return worldIdVerify(token, proof);
+    },
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.worldIdMe(token) });
+    },
+  });
+}
+
+export function useWorldIdWaiverMutation() {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+
+  return useMutation({
+    mutationFn: async (code: string) => {
+      const token = await ensureToken();
+      return worldIdWaiver(token, code);
     },
     onSuccess: async () => {
       const token = await ensureToken();

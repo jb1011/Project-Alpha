@@ -42,6 +42,22 @@ export interface WorldStore {
   recordAttestation(a: GuardianAttestation): boolean;
   findAttestationByTenant(tenantId: string, action: string): GuardianAttestation | undefined;
 
+  // ── guardian waivers (admin-issued escape hatch, see guardian_waivers DDL) ──
+  createWaiver(w: { codeHash: string; note: string; createdAt: number; expiresAt?: number }): void;
+  /** Atomically redeem an open, unexpired waiver for `tenantId`. Returns its note, or undefined
+   *  if the code is unknown, already redeemed, or expired — deliberately indistinguishable. */
+  redeemWaiver(codeHash: string, tenantId: string, now: number): { note: string } | undefined;
+  /** Delete an UNREDEEMED waiver. False if it never existed, was revoked, or was already used. */
+  revokeWaiver(codeHash: string): boolean;
+  listWaivers(): {
+    codeHash: string;
+    note: string;
+    createdAt: number;
+    expiresAt: number | null;
+    redeemedBy: string | null;
+    redeemedAt: number | null;
+  }[];
+
   // ── in-flight proof requests ──
   createRequest(r: {
     requestId: string;
@@ -229,6 +245,54 @@ export class SqliteWorldStore implements WorldStore {
       )
       .get(nullifier, action) as { n: number };
     return row.n;
+  }
+
+  createWaiver(w: { codeHash: string; note: string; createdAt: number; expiresAt?: number }): void {
+    this.db
+      .prepare(
+        "INSERT INTO guardian_waivers (code_hash, note, created_at, expires_at) VALUES (?,?,?,?)",
+      )
+      .run(w.codeHash, w.note, w.createdAt, w.expiresAt ?? null);
+  }
+
+  redeemWaiver(codeHash: string, tenantId: string, now: number): { note: string } | undefined {
+    return this.db.transaction(() => {
+      // The UPDATE carries every validity condition, so redemption is a single atomic
+      // compare-and-set: two concurrent redeemers cannot both see changes === 1.
+      const res = this.db
+        .prepare(
+          `UPDATE guardian_waivers SET redeemed_by = ?, redeemed_at = ?
+           WHERE code_hash = ? AND redeemed_by IS NULL
+             AND (expires_at IS NULL OR expires_at > ?)`,
+        )
+        .run(tenantId, now, codeHash, now);
+      if (res.changes !== 1) return undefined;
+      const row = this.db
+        .prepare("SELECT note FROM guardian_waivers WHERE code_hash = ?")
+        .get(codeHash) as { note: string };
+      return { note: row.note };
+    })();
+  }
+
+  revokeWaiver(codeHash: string): boolean {
+    const res = this.db
+      .prepare("DELETE FROM guardian_waivers WHERE code_hash = ? AND redeemed_by IS NULL")
+      .run(codeHash);
+    return res.changes === 1;
+  }
+
+  listWaivers() {
+    const rows = this.db
+      .prepare("SELECT * FROM guardian_waivers ORDER BY created_at DESC")
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => ({
+      codeHash: r.code_hash as string,
+      note: r.note as string,
+      createdAt: r.created_at as number,
+      expiresAt: (r.expires_at as number | null) ?? null,
+      redeemedBy: (r.redeemed_by as string | null) ?? null,
+      redeemedAt: (r.redeemed_at as number | null) ?? null,
+    }));
   }
 
   createRequest(r: {

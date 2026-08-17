@@ -13,7 +13,7 @@ import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
 import { useAuth } from "../AuthProvider";
-import { Button, Card, CheckIcon, Spinner, StepHeader } from "../primitives";
+import { Button, Card, CheckIcon, Spinner, StepHeader, cx } from "../primitives";
 
 /**
  * Proof of personhood for the account's guardian.
@@ -111,9 +111,16 @@ export function GuardianStep({
               </div>
             ) : verified ? (
               <>
-                <div className="flex items-center gap-2 text-[13px] text-emerald-300">
+                <div
+                  className={cx(
+                    "flex items-center gap-2 text-[13px]",
+                    me?.credential === "waiver" ? "text-amber-300" : "text-emerald-300",
+                  )}
+                >
                   <CheckIcon className="h-4 w-4" />
-                  Verified human — {me?.credential ?? "proof of personhood"}
+                  {me?.credential === "waiver"
+                    ? "Guardian waiver on record — not a verified human"
+                    : `Verified human — ${me?.credential ?? "proof of personhood"}`}
                 </div>
                 <p className="text-[12.5px] leading-[1.6] text-muted">
                   {me?.maxEntities != null

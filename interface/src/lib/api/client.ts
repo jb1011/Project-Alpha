@@ -299,3 +299,9 @@ export function worldIdContext(token: string): Promise<WorldIdContext> {
 export function worldIdVerify(token: string, proof: unknown): Promise<WorldIdStatusView> {
   return request<WorldIdStatusView>("/world-id/verify", { token, body: { proof } });
 }
+
+/** Redeem an admin-issued guardian waiver code — the escape hatch for humans with no World ID
+ *  path (no Orb in their country, passport outside World's credential list). */
+export function worldIdWaiver(token: string, code: string): Promise<WorldIdStatusView> {
+  return request<WorldIdStatusView>("/world-id/waiver", { token, body: { code } });
+}

@@ -228,6 +228,18 @@ export function migrate(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_guardian_attestations_tenant
       ON guardian_attestations(tenant_id, action);
 
+    -- Admin-issued guardian waivers: the escape hatch for humans with NO World ID path (no Orb
+    -- in their country, passport not in World's credential list). Single-use, revocable by
+    -- deletion. Only the sha256 of the code is stored — the plaintext exists once, at issuance.
+    CREATE TABLE IF NOT EXISTS guardian_waivers (
+      code_hash   TEXT PRIMARY KEY,
+      note        TEXT NOT NULL,          -- who/why, for the audit trail
+      created_at  INTEGER NOT NULL,
+      expires_at  INTEGER,                -- NULL = no expiry
+      redeemed_by TEXT,                   -- tenant that used it (NULL = still open)
+      redeemed_at INTEGER
+    );
+
     -- In-flight World ID proof requests (server-driven idkit-core flow): created by
     -- POST /world-id/request, consumed by GET /world-id/status/:requestId.
     CREATE TABLE IF NOT EXISTS world_requests (
