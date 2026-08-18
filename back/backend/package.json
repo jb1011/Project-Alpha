@@ -21,6 +21,7 @@
     "onboarding": "tsx src/onboarding/main.ts",
     "passkey:capture": "esbuild tools/passkey-capture/capture.entry.ts --bundle --format=esm --platform=browser --outfile=tools/passkey-capture/capture.js && tsx tools/passkey-capture/main.ts",
     "api": "tsx src/api/main.ts",
+    "monitor": "tsx src/monitor/main.ts",
     "cli:sweep": "tsx scripts/sweep-standing-float.mts",
     "api:sandbox": "DOTENV_CONFIG_PATH=.env.sandbox tsx src/api/main.ts"
   },

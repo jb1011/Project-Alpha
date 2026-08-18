@@ -169,6 +169,22 @@ const EnvSchema = z.object({
    *  the feature is a no-op until this is deliberately set. */
   WORLD_ATTEST_ACTION: z.string().optional(),
   WORLD_ATTEST_MIN_AGE: z.coerce.number().int().positive().default(18),
+
+  // --- NoviController monitoring (design §8; src/monitor). Every var below is OPTIONAL and read
+  // only by the `monitor` process: adding them changes nothing for an existing API/MCP boot. ---
+  /** Ops webhook for WARN/CRITICAL monitor alerts (Discord/Slack incoming-webhook compatible).
+   *  TREAT AS A SECRET — a Discord/Slack webhook URL is a bearer credential (redacted below). */
+  ALERT_WEBHOOK_URL: z.string().url().optional(),
+  MONITOR_POLL_SEC: z.coerce.number().int().positive().default(30),
+  /** How long a break-glass grant may stand before the monitor pages. The ceremony is one tx. */
+  MONITOR_GRANT_TTL_MIN: z.coerce.number().int().positive().default(15),
+  /** First-run cold start: scan back this many blocks. NEVER genesis (Arc has sub-second blocks). */
+  MONITOR_LOOKBACK_BLOCKS: z.coerce.number().int().positive().default(5000),
+  /** Extra beacons/factories to watch, comma-separated. The configured FACTORY_ADDRESS and the
+   *  beacon it reports are watched anyway; these are for the LEGACY pair, which still owns the
+   *  logic of every pre-cutover agent and is therefore just as fleet-critical. */
+  MONITOR_WATCH_BEACONS: z.string().optional(),
+  MONITOR_WATCH_FACTORIES: z.string().optional(),
 });
 
 export interface Config {
@@ -268,6 +284,21 @@ export interface Config {
     agentBook: Address;
     allowancePerHuman: number;
   };
+  /** Ops webhook for monitor alerts. SECRET (bearer credential in the URL) — see redact(). */
+  alertWebhookUrl?: string;
+  /** Controller monitoring (design §8). Optional in the TYPE only, for the same reason as
+   *  `worldChain`: test fixtures build Config literals and must not have to know about a process
+   *  they never start. loadConfig always populates it. */
+  monitor?: {
+    pollSec: number;
+    grantTtlMin: number;
+    lookbackBlocks: number;
+    /** The monitor's OWN database. Deliberately not legalbody.db: the monitor must never hold a
+     *  write handle on the money-path DB, and its schema must never enter those migrations. */
+    dbPath: string;
+    watchBeacons: Address[];
+    watchFactories: Address[];
+  };
 }
 
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
@@ -280,6 +311,21 @@ function parseLabelAliases(raw: string | undefined): Record<string, string> | un
     if (label && publicId) out[label.toLowerCase()] = publicId;
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * "0xaaa…,0xbbb…" -> checksummed addresses. THROWS on a malformed entry rather than skipping it:
+ * these lists are a security WATCH set, and a typo that silently drops the legacy beacon would
+ * leave a fleet-upgrade blind spot that looks exactly like "no alerts".
+ */
+function parseAddressList(raw: string | undefined, varName: string): Address[] {
+  if (!raw?.trim()) return [];
+  return raw.split(",").map((entry) => {
+    const s = entry.trim();
+    if (!isAddress(s, { strict: false }))
+      throw new Error(`Invalid config: ${varName} contains "${s}" — must be a 0x address`);
+    return getAddress(s) as Address;
+  });
 }
 
 /** The one definition of "this deployment can provision Turnkey vaults": core turnkey config plus
@@ -405,6 +451,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       rpcUrl: e.WORLD_CHAIN_RPC,
       agentBook: e.WORLD_AGENTBOOK_ADDRESS,
       allowancePerHuman: e.WORLD_ALLOWANCE_PER_HUMAN,
+    },
+    alertWebhookUrl: e.ALERT_WEBHOOK_URL,
+    monitor: {
+      pollSec: e.MONITOR_POLL_SEC,
+      grantTtlMin: e.MONITOR_GRANT_TTL_MIN,
+      lookbackBlocks: e.MONITOR_LOOKBACK_BLOCKS,
+      dbPath: `${e.DATA_DIR}/monitor.db`,
+      watchBeacons: parseAddressList(e.MONITOR_WATCH_BEACONS, "MONITOR_WATCH_BEACONS"),
+      watchFactories: parseAddressList(e.MONITOR_WATCH_FACTORIES, "MONITOR_WATCH_FACTORIES"),
     },
   };
 
@@ -539,6 +594,8 @@ export function redact(cfg: Config): Record<string, unknown> {
       ? { apiKey: "REDACTED", entitySecret: "REDACTED", walletSetId: cfg.circle.walletSetId }
       : undefined,
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
+    // A Discord/Slack webhook URL embeds its own token — posting to it needs no other credential.
+    alertWebhookUrl: cfg.alertWebhookUrl ? "REDACTED" : undefined,
     jobClientPrivateKey: "REDACTED",
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
     x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
