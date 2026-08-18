@@ -1,0 +1,51 @@
+# NoviController monitoring watcher (docs/design/2026-08-13-novi-controller-design.md §8).
+#
+# INSTALL: copy to /etc/systemd/system/legalbody-monitor.service on the box, adjust the three
+# paths below to match the API unit (`systemctl cat legalbody-api` shows the live values), then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now legalbody-monitor
+#   journalctl -u legalbody-monitor -f
+#
+# It shares the API's .env deliberately: the monitor must watch the SAME controller, factory and
+# registry the API transacts against, and a second copy of that config is a second thing to drift.
+# It opens legalbody.db READ-ONLY and writes only ${DATA_DIR}/monitor.db, so it can run alongside
+# the API on one box without touching the money path.
+#
+# See docs/runbooks/controller-monitoring.md for the rules, the alert meanings and the responses.
+
+[Unit]
+Description=Novi Corpus controller monitor
+Documentation=file:///root/Project-Alpha/back/docs/runbooks/controller-monitoring.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=novi
+Group=novi
+WorkingDirectory=/root/Project-Alpha/back/backend
+EnvironmentFile=/root/Project-Alpha/back/backend/.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/npm run monitor
+
+# Restart=always, not on-failure: a monitor that exited cleanly is still a monitor that is not
+# watching. RestartSec keeps a crash-loop from hammering the RPC.
+Restart=always
+RestartSec=10
+
+# One JSON line per alert on stdout; journald is the durable trail.
+#   journalctl -u legalbody-monitor | grep monitor_alert
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=legalbody-monitor
+
+# The monitor holds no keys and sends no transactions — give it as little as it needs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# ReadWritePaths must cover DATA_DIR (monitor.db lives there). Adjust if DATA_DIR moves.
+ReadWritePaths=/root/Project-Alpha/back/backend/data
+
+[Install]
+WantedBy=multi-user.target
