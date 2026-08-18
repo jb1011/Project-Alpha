@@ -10,6 +10,10 @@ documents/
 .env.*
 !.env.example
 !.env.sandbox.example
+# Circle entity-secret recovery files. The DevC SDK writes recovery_file_<uuid>.dat into the
+# working directory on registerEntitySecretCiphertext — it is the ONLY way to recover the
+# entity secret, so keep it offline and never in the repo.
+recovery_file_*.dat
 test/fixtures/*.local.json
 tools/passkey-capture/capture.js
 
