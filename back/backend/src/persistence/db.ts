@@ -329,6 +329,73 @@ export function migrate(db: Database.Database): void {
       PRIMARY KEY (job_key, step)
     );
 
+    -- ── doola formation (design 2026-08-19 §3) ────────────────────────────────────────────
+    -- NO new EntityStatus values: formation state layers BESIDE the status machine (ENS +
+    -- guardian precedents), so the CHECK on entities.status above stays untouched.
+
+    -- Provider-side formation milestones only; on-chain anchor cycles live in oa_anchors.
+    CREATE TABLE IF NOT EXISTS formation_requests (
+      entity_key   TEXT NOT NULL,
+      step         TEXT NOT NULL CHECK (step IN
+                   ('create_provider','await_filing','fetch_documents','await_ein')),
+      state        TEXT NOT NULL CHECK (state IN
+                   ('pending','submitted','confirmed','failed','abandoned')),
+      attempt      INTEGER NOT NULL DEFAULT 0,
+      provider_ref TEXT,
+      detail       TEXT,          -- JSON: filingNumber, ein, doc ids…
+      error        TEXT,
+      created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (entity_key, step)
+    );
+    CREATE INDEX IF NOT EXISTS idx_formation_state ON formation_requests(state, step);
+    CREATE INDEX IF NOT EXISTS idx_formation_provider ON formation_requests(provider_ref);
+
+    -- Anchor cycles: one row PER MANIFEST VERSION. Deliberately NOT keyed like bridge_legs
+    -- (entity, step) — a bridge has exactly one of each leg, whereas an entity accumulates
+    -- v1, v2, v3… and two cycles must be able to coexist (audit H1).
+    CREATE TABLE IF NOT EXISTS oa_anchors (
+      entity_key    TEXT NOT NULL,
+      version       INTEGER NOT NULL,
+      manifest_hash TEXT NOT NULL,
+      state         TEXT NOT NULL CHECK (state IN
+                    ('pending','scheduled','executed','vetoed','superseded','failed')),
+      schedule_tx   TEXT, execute_tx TEXT,
+      executable_at INTEGER,
+      attempt       INTEGER NOT NULL DEFAULT 0,
+      error         TEXT,
+      created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (entity_key, version)
+    );
+
+    -- Webhook dedupe + audit. A webhook is a WAKE-UP SIGNAL, never a source of facts: the
+    -- payload is persisted for forensics, and processors always re-fetch authoritative state
+    -- from doola over TLS. processed_at NULL = still owed to the sweeper.
+    CREATE TABLE IF NOT EXISTS doola_webhook_events (
+      event_id TEXT PRIMARY KEY, event_name TEXT NOT NULL,
+      provider_ref TEXT, payload TEXT NOT NULL,
+      received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, processed_at TEXT
+    );
+    -- PARTIAL index: the sweeper's only query is "what is unprocessed?", and the table is
+    -- swept after 30d, so indexing the processed majority would be pure write cost.
+    CREATE INDEX IF NOT EXISTS idx_doola_events_pending ON doola_webhook_events(processed_at)
+      WHERE processed_at IS NULL;
+
+    -- Controller PII — its OWN table, never spec_json / views / transparency / metadata / logs.
+    -- region is nullable because most countries have no state/province (US region = 2-letter
+    -- state); deleted_at is the erasure marker for parties that never reached a filing.
+    CREATE TABLE IF NOT EXISTS formation_parties (
+      entity_key TEXT PRIMARY KEY,
+      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
+      email TEXT NOT NULL, phone TEXT,
+      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
+      region TEXT,
+      postal_code TEXT NOT NULL, country TEXT NOT NULL,   -- ISO-3
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      deleted_at TEXT
+    );
+
     -- Small key/value marker table for one-shot data migrations (guards below), distinct from the
     -- additive schema (table/column) migrations, which are idempotent by construction.
     CREATE TABLE IF NOT EXISTS meta (
@@ -367,6 +434,44 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN operator_rotated_at INTEGER");
   if (!cols.includes("public_id")) db.exec("ALTER TABLE entities ADD COLUMN public_id TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_public_id ON entities(public_id)");
+
+  // doola formation (design §3). Purely additive: NULL formation_provider = legacy/stub forever
+  // (the 13 testnet + existing prod agents are never backfilled). The three hash/version columns
+  // exist because the monitor and the guardian veto UI read `entities` through a fixed projection
+  // — version NUMBERS alone cannot feed the compromise rule or the veto card (audit H3/14).
+  if (!cols.includes("formation_provider"))
+    db.exec("ALTER TABLE entities ADD COLUMN formation_provider TEXT");
+  if (!cols.includes("formation_environment"))
+    db.exec("ALTER TABLE entities ADD COLUMN formation_environment TEXT");
+  // The REAL EIN, once the IRS issues one. `ein` above stays the on-chain-frozen value.
+  if (!cols.includes("ein_real")) db.exec("ALTER TABLE entities ADD COLUMN ein_real TEXT");
+  if (!cols.includes("formation_filed_at"))
+    db.exec("ALTER TABLE entities ADD COLUMN formation_filed_at INTEGER");
+  if (!cols.includes("formation_filing_number"))
+    db.exec("ALTER TABLE entities ADD COLUMN formation_filing_number TEXT");
+  if (!cols.includes("oa_manifest_version"))
+    db.exec("ALTER TABLE entities ADD COLUMN oa_manifest_version INTEGER");
+  if (!cols.includes("oa_manifest_anchored_hash"))
+    db.exec("ALTER TABLE entities ADD COLUMN oa_manifest_anchored_hash TEXT");
+  if (!cols.includes("oa_manifest_pending_hash"))
+    db.exec("ALTER TABLE entities ADD COLUMN oa_manifest_pending_hash TEXT");
+  if (!cols.includes("oa_amendment_executable_at"))
+    db.exec("ALTER TABLE entities ADD COLUMN oa_amendment_executable_at INTEGER");
+
+  // The `documents` table (declared-unused since v1) becomes the index for real legal PDFs.
+  // The existing `path NOT NULL` is satisfied by DocumentStore.putBytes. System of record for
+  // the BYTES is doola (re-fetchable via provider_doc_id); this is our hash-pinned index.
+  const docCols = (db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!docCols.includes("entity_key")) db.exec("ALTER TABLE documents ADD COLUMN entity_key TEXT");
+  if (!docCols.includes("doc_type")) db.exec("ALTER TABLE documents ADD COLUMN doc_type TEXT");
+  if (!docCols.includes("sha256")) db.exec("ALTER TABLE documents ADD COLUMN sha256 TEXT");
+  if (!docCols.includes("content_type"))
+    db.exec("ALTER TABLE documents ADD COLUMN content_type TEXT");
+  if (!docCols.includes("size")) db.exec("ALTER TABLE documents ADD COLUMN size INTEGER");
+  if (!docCols.includes("provider_doc_id"))
+    db.exec("ALTER TABLE documents ADD COLUMN provider_doc_id TEXT");
 
   const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
     (c) => c.name,

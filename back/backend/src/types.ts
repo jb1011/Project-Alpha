@@ -70,4 +70,23 @@ export interface EntityRecord {
   operatorRotatedAt?: number | null;
   /** Opaque public slug; the on-chain metadataURI is METADATA_BASE_URL/metadata/<publicId>. */
   publicId?: string | null;
+  // ── doola formation (design 2026-08-19 §3). Every field is additive and nullable; null
+  //    `formationProvider` means legacy/stub and is never backfilled.
+  /** "doola" | null. Persisted at CLAIM from config (custody-twin rule) and immutable after. */
+  formationProvider?: string | null;
+  /** The provider environment this entity is PINNED to. A mainnet flip can never route an
+   *  in-flight sandbox company at the production host. */
+  formationEnvironment?: "sandbox" | "production" | null;
+  /** The real EIN once the IRS issues one. `ein` stays the value frozen on-chain at mint. */
+  einReal?: string | null;
+  /** Unix seconds the entity was actually filed (distinct from the on-chain `formationDate`). */
+  formationFiledAt?: number | null;
+  formationFilingNumber?: string | null;
+  /** Manifest version currently ANCHORED on-chain. null = legacy doc-hash scheme (§4). */
+  oaManifestVersion?: number | null;
+  oaManifestAnchoredHash?: Hex | null;
+  /** The single in-flight version's hash (single-pending rule). Cleared when it anchors. */
+  oaManifestPendingHash?: Hex | null;
+  /** Unix seconds the pending amendment becomes executable (feeds the guardian veto countdown). */
+  oaAmendmentExecutableAt?: number | null;
 }
