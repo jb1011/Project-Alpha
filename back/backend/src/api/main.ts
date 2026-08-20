@@ -260,6 +260,13 @@ async function main() {
         privateKeyToAccount(derivePocketKey(cfg.pocketMasterSeed!, entityKey)).address
     : undefined;
 
+  // doola formation (design §2). One value, derived once from config, handed to BOTH the claim
+  // (runner) and the saga — so the pinned environment on a row and the client that would file it
+  // can never come from different places. Undefined on a credential-less deployment = stub mode.
+  const formation = cfg.doola
+    ? { provider: "doola" as const, environment: cfg.doola.environment }
+    : undefined;
+
   const runSaga: RunSaga = (i) =>
     runOnboarding({
       spec: i.spec,
@@ -282,6 +289,7 @@ async function main() {
       provisionCircle,
       circleSignerForEntity,
       derivePocketAddress,
+      formation,
     });
 
   const runner = new OnboardingRunner({
@@ -289,6 +297,7 @@ async function main() {
     runSaga,
     fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
     outflows,
+    formation,
   });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);

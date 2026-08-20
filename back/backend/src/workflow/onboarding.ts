@@ -5,12 +5,20 @@ import { buildWalletSetTypedData } from "../adapters/arc/walletSet";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
 import { computeOaHash, renderMetadata, renderOperatingAgreement } from "../oa/generator";
+import {
+  OA_MANIFEST_VERSION_V1,
+  buildManifestV1,
+  manifestDocName,
+  manifestHash,
+  serializeManifest,
+  termsDocName,
+} from "../oa/manifest";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import { assertOperatorDistinct, translate } from "../policy/translator";
 import { usdToUnits } from "../policy/units";
-import type { EntityRecord } from "../types";
+import type { EntityRecord, Hex } from "../types";
 
 /** Result of provisioning a per-agent Turnkey vault (the saga only needs these three fields). */
 export interface ProvisionedVault {
@@ -85,6 +93,37 @@ export interface OnboardingDeps {
    *  Real = privateKeyToAccount(derivePocketKey(seed, entityKey)).address. Circle-path pockets
    *  come from provisioning instead. */
   derivePocketAddress?: (entityKey: string) => string;
+  // ── doola formation (design 2026-08-19 §2/§5). PR 1 only PINS the provider on the record; the
+  //    filing itself is PR 2.
+  /** Formation provider + environment for a NEW record, from config. A resumed record's
+   *  persisted pair always wins — the custody-resolution twin: the environment an in-flight
+   *  entity was pinned to can never be re-pointed by a config flip (audit M5). Absent (no doola
+   *  credentials) = stub mode: `formation_provider` stays null, forever, and NOTHING else in the
+   *  saga changes. */
+  formation?: { provider: string; environment: "sandbox" | "production" };
+}
+
+/**
+ * Which OA anchoring scheme this record derives its `oa_hash` under (design §4, completeness 1).
+ *
+ * The manifest scheme applies to NEW entities. The one record that must NOT be upgraded is one
+ * caught mid-onboarding by the deploy: it has already BROADCAST `createEntity` with the legacy
+ * doc hash as an argument, so re-deriving the anchor on resume would silently diverge the DB
+ * from the chain — a permanently unverifiable entity, and exactly the failure the split
+ * broadcast/confirm window exists to prevent.
+ *
+ * The commitment is therefore sticky in BOTH directions: a record that already wrote a manifest
+ * hash keeps the manifest scheme even after its own create tx is broadcast (otherwise the
+ * translating-resume would flip it back to legacy and diverge in the other direction), and a
+ * record that broadcast without one keeps the legacy derivation forever.
+ */
+export function usesManifestScheme(
+  rec:
+    | Pick<EntityRecord, "createTxHash" | "oaManifestVersion" | "oaManifestPendingHash">
+    | undefined,
+): boolean {
+  if (rec?.oaManifestVersion != null || rec?.oaManifestPendingHash != null) return true;
+  return rec?.createTxHash == null;
 }
 
 /**
@@ -116,6 +155,15 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   const custody: "turnkey" | "circle" = rec
     ? (rec.walletProvider ?? "turnkey")
     : (d.custody ?? "turnkey");
+
+  // Formation pinning, the custody twin (design §2, audit M5): for ANY existing record the
+  // PERSISTED provider/environment win — including legacy rows whose pair is null, which mean
+  // "stub forever". Only a genuinely fresh record takes this deployment's configuration, so a
+  // mainnet flip can never re-route an in-flight sandbox company at the production host.
+  const formationProvider = rec ? (rec.formationProvider ?? null) : (d.formation?.provider ?? null);
+  const formationEnvironment = rec
+    ? (rec.formationEnvironment ?? null)
+    : (d.formation?.environment ?? null);
 
   // ── Step 0a (circle custody): provision the per-agent Circle wallets (SCA operator + EOA
   //    pocket) BEFORE minting — the SCA address IS the on-chain operator. No Turnkey sub-org on
@@ -155,6 +203,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       error: null,
       specJson: d.specJson ?? null,
       perTxCap: null,
+      formationProvider,
+      formationEnvironment,
       ...rec, // a claimed 'pending' row keeps its identity fields (incl. rootPasskeyId)
       operator: wallets.operator as Address,
       walletProvider: "circle",
@@ -235,6 +285,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
           error: null,
           specJson: d.specJson ?? null,
           perTxCap: null,
+          formationProvider,
+          formationEnvironment,
         };
     rec = provisioned;
     d.repo.transaction(() => {
@@ -267,13 +319,44 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     const operator = provisioned0 ? rec!.operator! : d.operatorSigner.address;
     assertOperatorDistinct(r, operator); // operator now known -> full distinctness check
     const resolved = { ...r, operator };
-    const doc = renderOperatingAgreement(d.spec, resolved);
-    const oaHash = computeOaHash(doc);
-    const meta = renderMetadata(d.spec, resolved, oaHash);
-    const docPut = d.docStore.put(`oa-${key}.md`, doc);
-    d.docStore.put(`meta-${key}.json`, JSON.stringify(meta, null, 2)); // written for the public route to serve
     const publicId = rec?.publicId ?? randomUUID(); // minted once; preserved across a translating-resume
     const metadataBaseUrl = d.metadataBaseUrl ?? "http://localhost:8789"; // real callers pass the guarded cfg value
+
+    // ── The anchor (design §4). Under the MANIFEST scheme the on-chain `oa_hash` commits to the
+    //    bundle manifest — terms doc + chain identity + (from v2) the legal facts — instead of to
+    //    the terms doc alone. The terms doc is still written, versioned, and its keccak is what
+    //    `terms.hash` inside the manifest points at, so nothing is lost: the anchor simply covers
+    //    strictly more. A record already carrying a broadcast create tx keeps the LEGACY
+    //    derivation (see usesManifestScheme) — its hash is already an argument of an in-flight tx.
+    const manifestScheme = usesManifestScheme(rec);
+    const doc = renderOperatingAgreement(d.spec, resolved, {
+      scheme: manifestScheme ? "manifest" : "legacy",
+    });
+    let oaHash: Hex;
+    let docPut: { path: string };
+    let manifestPendingHash: Hex | null = rec?.oaManifestPendingHash ?? null;
+    if (manifestScheme) {
+      const manifest = buildManifestV1(d.spec, resolved, publicId, {
+        chainId: d.arc.chainId,
+        entityKey: key,
+      });
+      oaHash = manifestHash(manifest);
+      docPut = d.docStore.put(termsDocName(key, OA_MANIFEST_VERSION_V1), doc);
+      // Bytes, not a string: the manifest is HASHED, so it goes through the atomic writer — a
+      // torn file whose hash is anchored is permanently unverifiable (audit M7).
+      d.docStore.putBytes(
+        manifestDocName(key, OA_MANIFEST_VERSION_V1),
+        Buffer.from(serializeManifest(manifest), "utf8"),
+      );
+      // v1 is PENDING until createEntity confirms; the create-confirm below promotes it to
+      // anchored. This is also the sticky marker that keeps a resumed record on this scheme.
+      manifestPendingHash = oaHash;
+    } else {
+      oaHash = computeOaHash(doc);
+      docPut = d.docStore.put(`oa-${key}.md`, doc);
+    }
+    const meta = renderMetadata(d.spec, resolved, oaHash);
+    d.docStore.put(`meta-${key}.json`, JSON.stringify(meta, null, 2)); // written for the public route to serve
 
     rec = {
       idempotencyKey: key,
@@ -319,6 +402,18 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       specJson: d.specJson ?? rec?.specJson ?? null,
       perTxCap:
         d.spec.treasury.perTxCapUsdc != null ? usdToUnits(d.spec.treasury.perTxCapUsdc) : null,
+      // Formation: pinned here (custody twin) and never re-derived from config afterwards.
+      // Null on a credential-less deployment = stub, which is what every legacy row stays.
+      formationProvider,
+      formationEnvironment,
+      // The rebuild must not NULL facts a later sub-saga earned (same rule as trustPolicy above).
+      einReal: rec?.einReal ?? null,
+      formationFiledAt: rec?.formationFiledAt ?? null,
+      formationFilingNumber: rec?.formationFilingNumber ?? null,
+      oaManifestVersion: rec?.oaManifestVersion ?? null,
+      oaManifestAnchoredHash: rec?.oaManifestAnchoredHash ?? null,
+      oaManifestPendingHash: manifestPendingHash,
+      oaAmendmentExecutableAt: rec?.oaAmendmentExecutableAt ?? null,
     };
     d.repo.upsert(rec);
   }
@@ -356,6 +451,16 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       proxy: res.proxy,
       treasury: res.treasury,
       createTxHash: res.txHash,
+      // The manifest v1 hash is now ON CHAIN (createEntity args[7]): pending becomes anchored, in
+      // the same transaction as the entity row, so the DB can never claim an anchor the chain
+      // does not hold. Legacy-scheme records carry no pending hash and are untouched here.
+      ...(rec.oaManifestPendingHash
+        ? {
+            oaManifestVersion: OA_MANIFEST_VERSION_V1,
+            oaManifestAnchoredHash: rec.oaManifestPendingHash,
+            oaManifestPendingHash: null,
+          }
+        : {}),
     };
     rec = created;
     // Atomic: the entity row and its audit event commit together (or roll back together).
