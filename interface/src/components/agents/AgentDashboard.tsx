@@ -246,7 +246,19 @@ export function AgentDashboard({
               <OnChainRow label="Guardian" value={shortAddress(entity.guardian)} />
             )}
             {entity.oaHash && (
-              <OnChainRow label="OA hash" value={`${entity.oaHash.slice(0, 14)}…`} />
+              // Two different things share one field. With a manifest version the anchor commits
+              // to the whole OA BUNDLE — terms doc, legal documents, chain identity — so it is an
+              // "anchor" and the version is part of its name. Without one (every legacy row) it
+              // still commits to the operating-agreement document alone, and calling that an
+              // anchor would overstate what is on chain.
+              <OnChainRow
+                label={
+                  entity.oaManifestVersion != null
+                    ? `OA anchor (v${entity.oaManifestVersion})`
+                    : "OA hash"
+                }
+                value={`${entity.oaHash.slice(0, 14)}…`}
+              />
             )}
           </dl>
           <div className="mt-4 flex flex-wrap gap-3">

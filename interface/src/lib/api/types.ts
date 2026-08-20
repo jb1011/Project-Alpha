@@ -30,6 +30,19 @@ export type EntityView = {
   rootPasskeyId?: string | null;
   /** Tier-0 custody provider; null/absent = legacy row (behaves as "turnkey"). */
   walletProvider?: "turnkey" | "circle" | null;
+  /** Anchored OA bundle-manifest version. null/absent = a LEGACY row whose `oaHash` commits to
+   *  the operating-agreement document alone, not to the manifest — which is why the two are
+   *  labelled differently. Optional for deploy-order safety: a backend that predates this field
+   *  means "legacy". */
+  oaManifestVersion?: number | null;
+  /** Formation (doola). null/absent = stub, forever. `environment` is always present when the
+   *  block is: a sandbox filing must render amber ("Demo formation"), never green. PR 1 ships
+   *  the skeleton, so `status` is always "none". Never carries PII. */
+  formation?: {
+    provider: string;
+    environment: "sandbox" | "production";
+    status: "none";
+  } | null;
 };
 
 /** Public deployment capabilities (GET /config, unauthenticated) — lets the wizard preselect the
@@ -40,6 +53,12 @@ export type PublicConfig = {
   /** Optional for deploy-order safety: a backend that predates this field means "available"
    *  (every legacy deployment served turnkey). Mainnet ships false — circle-only. */
   turnkeyCustodyAvailable?: boolean;
+  /** doola formation. All three are optional for deploy-order safety: a backend that predates
+   *  them forms nothing, which is exactly what absent should mean. `formationEnvironment` is
+   *  non-null whenever formation is available — the honesty invariant. */
+  formationAvailable?: boolean;
+  formationRequired?: boolean;
+  formationEnvironment?: "sandbox" | "production" | null;
 };
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).
