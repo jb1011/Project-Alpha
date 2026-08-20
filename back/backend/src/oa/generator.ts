@@ -4,15 +4,36 @@ import type { TranslateResult } from "../policy/translator";
 import { formatUnitsUsd } from "../policy/units";
 
 /**
+ * Which anchoring scheme this document is rendered for.
+ *
+ * "legacy"   — the pre-manifest scheme: the whole document IS the anchor (its keccak256 goes on
+ *              chain), so its bytes may NEVER change for an existing record. Default, so every
+ *              pre-existing caller renders byte-identically.
+ * "manifest" — the OA bundle manifest is the anchor (design §4) and this document is the TERMS
+ *              doc it commits to. Legal FACTS (the EIN, the filing) live in the manifest's
+ *              `legal` block instead, so the terms doc changes only when a TERM changes — which
+ *              is what lets v2/v3 move exactly one hash.
+ */
+export type OaScheme = "legacy" | "manifest";
+
+/**
  * Render a canonical operating-agreement document. MUST be deterministic: explicit field order,
  * no timestamps / random data, so computeOaHash is stable for identical inputs.
  */
-export function renderOperatingAgreement(spec: AgentSpec, r: TranslateResult): string {
+export function renderOperatingAgreement(
+  spec: AgentSpec,
+  r: TranslateResult,
+  opts: { scheme?: OaScheme } = {},
+): string {
+  const manifestScheme = opts.scheme === "manifest";
   const lines = [
     `# Operating Agreement — ${spec.name}`,
     "",
     `Jurisdiction: ${spec.jurisdiction}`,
-    `EIN: ${r.legal.ein}`,
+    // The EIN is a legal FACT, not a term. Under the manifest scheme it is carried by the
+    // manifest's `legal` block (and is the only carrier), so putting it here too would make an
+    // EIN issuance re-hash the terms doc for no change in what the parties agreed.
+    ...(manifestScheme ? [] : [`EIN: ${r.legal.ein}`]),
     `Formation date (unix): ${r.legal.formationDate}`,
     "",
     "## Roles",

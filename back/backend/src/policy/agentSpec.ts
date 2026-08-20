@@ -71,6 +71,8 @@ export const AgentSpecSchema = z
     }),
     legal: z
       .object({
+        /** REJECTED when supplied — see the superRefine below. Kept in the shape so the refusal
+         *  is a named, readable error instead of a silently-stripped unknown key. */
         ein: z.string().optional(),
         formationDate: z.string().date().optional(), // ISO YYYY-MM-DD; stubbed if absent
       })
@@ -88,6 +90,18 @@ export const AgentSpecSchema = z
   // (RolesMustDiffer + payout != operator). Addresses are already EIP-55-normalized above, so
   // string equality is a sound comparison.
   .superRefine((spec, ctx) => {
+    // doola formation (design §4): the OA bundle manifest is the ONE carrier of the EIN. A
+    // caller-supplied EIN would put an unverified legal fact into the terms doc and therefore
+    // into the on-chain anchor, which is exactly the fabrication class this design forbids —
+    // the real EIN arrives from the IRS, through the provider, and lands in the manifest.
+    if (spec.legal.ein !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["legal", "ein"],
+        message:
+          "legal.ein is not accepted: the EIN is issued by the IRS and carried by the OA bundle manifest, never supplied by the caller",
+      });
+    }
     const { manager, guardian, operator } = spec.roles;
     if (manager === guardian) {
       ctx.addIssue({
