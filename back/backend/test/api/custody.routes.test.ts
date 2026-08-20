@@ -37,6 +37,14 @@ const SPEC = {
 };
 const PASSKEY = { attestation: { credentialId: "cred-1" } };
 
+/** What a deployment with no doola block advertises (design §2): formation off, environment null.
+ *  Every credential-less deployment — dev, CI, self-hosts — serves exactly this. */
+const FORMATION_OFF = {
+  formationAvailable: false,
+  formationRequired: false,
+  formationEnvironment: null,
+};
+
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 beforeEach(() => {
@@ -50,6 +58,9 @@ function makeApp(opts: {
   circleAvailable: boolean;
   turnkeyAvailable?: boolean;
   def?: "turnkey" | "circle";
+  formationAvailable?: boolean;
+  formationRequired?: boolean;
+  formationEnvironment?: "sandbox" | "production" | null;
 }) {
   const runner = new OnboardingRunner({
     repo,
@@ -67,6 +78,9 @@ function makeApp(opts: {
     walletProviderDefault: opts.def ?? "turnkey",
     circleCustodyAvailable: opts.circleAvailable,
     turnkeyCustodyAvailable: opts.turnkeyAvailable ?? true,
+    formationAvailable: opts.formationAvailable,
+    formationRequired: opts.formationRequired,
+    formationEnvironment: opts.formationEnvironment,
     repo,
     runner,
     passkeyRpId: "wizard.local",
@@ -178,6 +192,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "circle",
     circleCustodyAvailable: true,
     turnkeyCustodyAvailable: true,
+    ...FORMATION_OFF,
   });
 
   // A turnkey-only deployment (the pre-Tier-0 shape: Turnkey creds, no Circle creds) must
@@ -187,6 +202,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "turnkey",
     circleCustodyAvailable: false,
     turnkeyCustodyAvailable: true,
+    ...FORMATION_OFF,
   });
 
   // A genuinely bare deployment (no creds at all — the dev/CI shape that still boots) advertises
@@ -197,6 +213,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "turnkey",
     circleCustodyAvailable: false,
     turnkeyCustodyAvailable: false,
+    ...FORMATION_OFF,
   });
 
   // The mainnet shape: circle-only, so the wizard hides the turnkey card instead of offering
@@ -206,5 +223,48 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "circle",
     circleCustodyAvailable: true,
     turnkeyCustodyAvailable: false,
+    ...FORMATION_OFF,
   });
+});
+
+test("GET /config reports formation availability, requirement and ENVIRONMENT (honesty invariant)", async () => {
+  // A sandbox formation deployment: available + required, and the environment is named so the
+  // wizard can render "Demo formation (sandbox)" amber instead of a green real-formation badge.
+  const sandbox = makeApp({
+    circleAvailable: true,
+    def: "circle",
+    formationAvailable: true,
+    formationRequired: true,
+    formationEnvironment: "sandbox",
+  });
+  expect(await (await sandbox.request("/config")).json()).toEqual({
+    walletProviderDefault: "circle",
+    circleCustodyAvailable: true,
+    turnkeyCustodyAvailable: true,
+    formationAvailable: true,
+    formationRequired: true,
+    formationEnvironment: "sandbox",
+  });
+
+  // Production formation is a DIFFERENT advertised value, never a missing one: the environment is
+  // required-when-available, so no surface can render a real filing and a demo filing the same.
+  const prod = makeApp({
+    circleAvailable: true,
+    def: "circle",
+    formationAvailable: true,
+    formationRequired: true,
+    formationEnvironment: "production",
+  });
+  expect((await (await prod.request("/config")).json()).formationEnvironment).toBe("production");
+
+  // Provider configured but formation optional (FORMATION_REQUIRED=false).
+  const optional = makeApp({
+    circleAvailable: true,
+    def: "circle",
+    formationAvailable: true,
+    formationRequired: false,
+    formationEnvironment: "sandbox",
+  });
+  const body = await (await optional.request("/config")).json();
+  expect([body.formationAvailable, body.formationRequired]).toEqual([true, false]);
 });

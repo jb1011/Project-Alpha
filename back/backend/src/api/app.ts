@@ -68,6 +68,13 @@ export interface ApiDeps {
   circleCustodyAvailable: boolean;
   /** Mirror flag for turnkey: false on deployments (e.g. mainnet) that ship no Turnkey config. */
   turnkeyCustodyAvailable: boolean;
+  /** doola formation (design §2). All three are OPTIONAL so every existing caller — and every
+   *  credential-less deployment — builds unchanged; absent reads as "no formation on this box".
+   *  `formationEnvironment` is REQUIRED-when-available by the honesty invariant: a sandbox
+   *  formation must never be renderable as a real one. */
+  formationAvailable?: boolean;
+  formationRequired?: boolean;
+  formationEnvironment?: "sandbox" | "production" | null;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
@@ -126,6 +133,12 @@ export function buildApiApp(deps: ApiDeps) {
       walletProviderDefault: deps.walletProviderDefault,
       circleCustodyAvailable: deps.circleCustodyAvailable,
       turnkeyCustodyAvailable: deps.turnkeyCustodyAvailable,
+      // Formation (design §2). Booleans + an enum, same discipline as the custody flags. The
+      // environment is served so the wizard can label a sandbox filing amber ("Demo formation")
+      // instead of green — the honesty invariant, enforced at the surface that renders it.
+      formationAvailable: Boolean(deps.formationAvailable),
+      formationRequired: Boolean(deps.formationRequired),
+      formationEnvironment: deps.formationEnvironment ?? null,
     }),
   );
   mountSchemaRoutes(app);

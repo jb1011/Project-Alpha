@@ -185,7 +185,47 @@ const EnvSchema = z.object({
    *  logic of every pre-cutover agent and is therefore just as fleet-critical. */
   MONITOR_WATCH_BEACONS: z.string().optional(),
   MONITOR_WATCH_FACTORIES: z.string().optional(),
+
+  // --- doola formation provider (docs/design/2026-08-19-doola-formation-provider-design.md §2).
+  // The API key and the webhook secret are ALL-OR-NOTHING (`cfg.doola`, mirroring the Circle
+  // block): a half-configured provider would fail at the first filing instead of at boot. ---
+  /** dk_test_… | dk_live_…  Sent RAW in `Authorization` (no Bearer prefix — doola's contract). */
+  DOOLA_API_KEY: z.string().optional(),
+  /** HMAC-SHA256 key for inbound webhooks. Issued/rotated BY DOOLA over email, not self-served. */
+  DOOLA_WEBHOOK_SECRET: z.string().optional(),
+  /** Optional second secret verified alongside the current one -> zero-downtime rotation. */
+  DOOLA_WEBHOOK_SECRET_PREVIOUS: z.string().optional(),
+  DOOLA_ENVIRONMENT: z.enum(["sandbox", "production"]).default("sandbox"),
+  /** Optional override; default derives from DOOLA_ENVIRONMENT (see DOOLA_BASE_URLS). */
+  DOOLA_BASE_URL: z.string().url().optional(),
+  /** Arc network identity. Added NOW (default testnet) so the mainnet⇒doola-production invariant
+   *  is ENFORCED rather than deferred. Deliberately NOT derived from NODE_ENV: the testnet box
+   *  runs NODE_ENV=production against doola sandbox by design. */
+  ARC_NETWORK: z.enum(["testnet", "mainnet"]).default("testnet"),
+  /** Tri-state on purpose: unset = TRUE when doola is configured, FALSE otherwise, so enabling
+   *  the provider makes formation mandatory without a second switch. "true"/"1" forces it on. */
+  FORMATION_REQUIRED: z.string().optional(),
+  FORMATION_SWEEP_MS: z.coerce.number().int().positive().default(60_000),
+  /** Lifetime formation quota per tenant (formation is real money in production: $100–150 each). */
+  FORMATION_MAX_PER_TENANT: z.coerce.number().int().positive().default(3),
+  /** Rolling-24h formation count across the whole deployment (platform_outflows twin). */
+  FORMATION_DAILY_CEILING: z.coerce.number().int().positive().default(10),
+  /** Tri-state, same shape as FORMATION_REQUIRED: unset = TRUE in sandbox. Real names/addresses
+   *  are then neither collected nor sent to doola's development environment (§3 PII). */
+  FORMATION_SANDBOX_SYNTHETIC_PII: z.string().optional(),
 });
+
+/** doola API hosts per environment. `DOOLA_BASE_URL` overrides both (staging/mock/replay). */
+export const DOOLA_BASE_URLS = {
+  sandbox: "https://api.test.doola.com",
+  production: "https://api.doola.com",
+} as const;
+
+/** "true"/"1" -> true, "false"/"0"/anything else -> false, ABSENT -> `whenUnset` (tri-state). */
+function boolWithDerivedDefault(raw: string | undefined, whenUnset: boolean): boolean {
+  if (raw === undefined || raw.trim() === "") return whenUnset;
+  return raw === "true" || raw === "1";
+}
 
 export interface Config {
   rpcUrl: string;
@@ -299,6 +339,30 @@ export interface Config {
     watchBeacons: Address[];
     watchFactories: Address[];
   };
+  /** doola formation provider credentials; present only when the API key AND the webhook secret
+   *  are both set (all-or-nothing). Absent = this deployment forms nothing and every entity keeps
+   *  the stub (`formation_provider = null`) — the credential-less shape stays fully supported. */
+  doola?: {
+    apiKey: string;
+    webhookSecret: string;
+    webhookSecretPrevious?: string;
+    environment: "sandbox" | "production";
+    /** Resolved host: DOOLA_BASE_URL when set, else DOOLA_BASE_URLS[environment]. */
+    baseUrl: string;
+  };
+  /** Arc network identity ("testnet" | "mainnet"). Optional in the TYPE only — same reason as
+   *  `monitor`/`worldChain`: test fixtures build Config literals. loadConfig always sets it. */
+  arcNetwork?: "testnet" | "mainnet";
+  /** Formation policy knobs (§2). Optional in the TYPE only; loadConfig always populates it. */
+  formation?: {
+    /** Mandatory formation: a deployment with doola configured defaults to TRUE. */
+    required: boolean;
+    sweepMs: number;
+    maxPerTenant: number;
+    dailyCeiling: number;
+    /** Sandbox files with a labeled synthetic identity instead of a real natural person. */
+    sandboxSyntheticPii: boolean;
+  };
 }
 
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
@@ -337,6 +401,14 @@ export function canProvisionTurnkey(cfg: Pick<Config, "turnkey">): boolean {
   return Boolean(cfg.turnkey?.delegatedApiPublicKey && cfg.turnkey?.delegatedApiPrivateKey);
 }
 
+/** The one definition of "this deployment can file real legal entities": the all-or-nothing doola
+ *  block is present. Twin of `canProvisionTurnkey` — used by the prod boot invariants below, by the
+ *  public `GET /config` (`formationAvailable`) and by every formation door, so the boot gate and the
+ *  advertised availability can never drift apart. Credential-less deployments keep the stub. */
+export function canFormEntities(cfg: Pick<Config, "doola">): boolean {
+  return Boolean(cfg.doola);
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const parsed = EnvSchema.safeParse(env);
   if (!parsed.success) {
@@ -359,6 +431,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
           signWith: e.TURNKEY_SIGN_WITH,
           delegatedApiPublicKey: e.TURNKEY_DELEGATED_API_PUBLIC_KEY,
           delegatedApiPrivateKey: e.TURNKEY_DELEGATED_API_PRIVATE_KEY,
+        }
+      : undefined;
+
+  // doola formation provider (design §2). All-or-nothing over the API key + webhook secret; the
+  // PREVIOUS secret is optional by construction (it only exists during a rotation window).
+  const doola =
+    e.DOOLA_API_KEY && e.DOOLA_WEBHOOK_SECRET
+      ? {
+          apiKey: e.DOOLA_API_KEY,
+          webhookSecret: e.DOOLA_WEBHOOK_SECRET,
+          webhookSecretPrevious: e.DOOLA_WEBHOOK_SECRET_PREVIOUS,
+          environment: e.DOOLA_ENVIRONMENT,
+          baseUrl: e.DOOLA_BASE_URL ?? DOOLA_BASE_URLS[e.DOOLA_ENVIRONMENT],
         }
       : undefined;
 
@@ -461,6 +546,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       watchBeacons: parseAddressList(e.MONITOR_WATCH_BEACONS, "MONITOR_WATCH_BEACONS"),
       watchFactories: parseAddressList(e.MONITOR_WATCH_FACTORIES, "MONITOR_WATCH_FACTORIES"),
     },
+    doola,
+    arcNetwork: e.ARC_NETWORK,
+    formation: {
+      // Turning the provider on makes formation mandatory unless the operator says otherwise.
+      required: boolWithDerivedDefault(e.FORMATION_REQUIRED, Boolean(doola)),
+      sweepMs: e.FORMATION_SWEEP_MS,
+      maxPerTenant: e.FORMATION_MAX_PER_TENANT,
+      dailyCeiling: e.FORMATION_DAILY_CEILING,
+      sandboxSyntheticPii: boolWithDerivedDefault(
+        e.FORMATION_SANDBOX_SYNTHETIC_PII,
+        e.DOOLA_ENVIRONMENT === "sandbox",
+      ),
+    },
   };
 
   const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
@@ -484,6 +582,27 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       throw new Error(
         "Invalid config: METADATA_BASE_URL must be an https, non-loopback URL in production (it is baked permanently on-chain)",
       );
+
+    // Formation (design §2). Mandatory formation with no provider configured would refuse every
+    // onboard at the door — a deployment-wide outage that must surface at boot, not per request.
+    if (cfg.formation.required && !canFormEntities(cfg))
+      throw new Error(
+        "Invalid config: FORMATION_REQUIRED is set but the doola block is missing — mandatory formation needs DOOLA_API_KEY + DOOLA_WEBHOOK_SECRET (unset FORMATION_REQUIRED for a stub-only deployment)",
+      );
+  }
+
+  // Mainnet invariants (design §2). Keyed on ARC_NETWORK and NOT on NODE_ENV, deliberately: the
+  // testnet box runs NODE_ENV=production against doola SANDBOX by design, so NODE_ENV cannot be
+  // the signal. ARC_NETWORK=mainnet is always a deliberate act, so these refuse everywhere.
+  if (cfg.arcNetwork === "mainnet") {
+    if (!canFormEntities(cfg))
+      throw new Error(
+        "Invalid config: ARC_NETWORK=mainnet requires the doola block (DOOLA_API_KEY + DOOLA_WEBHOOK_SECRET) — formation is mandatory on mainnet",
+      );
+    if (cfg.doola?.environment === "sandbox")
+      throw new Error(
+        "Invalid config: ARC_NETWORK=mainnet with DOOLA_ENVIRONMENT=sandbox — a mainnet deployment must not file DEMO-watermarked sandbox entities (set DOOLA_ENVIRONMENT=production)",
+      );
   }
 
   if (parseEther(cfg.gasSeedFloorUsdc) >= parseEther(cfg.gasSeedTargetUsdc)) {
@@ -496,6 +615,16 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       e.CIRCLE_API_KEY
         ? "Invalid config: CIRCLE_API_KEY is set but CIRCLE_ENTITY_SECRET is missing (all-or-nothing)"
         : "Invalid config: CIRCLE_ENTITY_SECRET is set but CIRCLE_API_KEY is missing (all-or-nothing)",
+    );
+  }
+
+  // Formation (design §2), Circle twin: a half-configured doola block must fail at boot, not at
+  // the first filing — a real Wyoming LLC and a real fee are on the other side of that call.
+  if (Boolean(e.DOOLA_API_KEY) !== Boolean(e.DOOLA_WEBHOOK_SECRET)) {
+    throw new Error(
+      e.DOOLA_API_KEY
+        ? "Invalid config: DOOLA_API_KEY is set but DOOLA_WEBHOOK_SECRET is missing (all-or-nothing)"
+        : "Invalid config: DOOLA_WEBHOOK_SECRET is set but DOOLA_API_KEY is missing (all-or-nothing)",
     );
   }
 
@@ -599,6 +728,16 @@ export function redact(cfg: Config): Record<string, unknown> {
     jobClientPrivateKey: "REDACTED",
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
     x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
+    // The API key files real companies and the webhook secret authenticates inbound state changes:
+    // both are bearer credentials, and neither may ever reach a log line.
+    doola: cfg.doola
+      ? {
+          ...cfg.doola,
+          apiKey: "REDACTED",
+          webhookSecret: "REDACTED",
+          webhookSecretPrevious: cfg.doola.webhookSecretPrevious ? "REDACTED" : undefined,
+        }
+      : undefined,
     ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
     world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
     turnkey: cfg.turnkey

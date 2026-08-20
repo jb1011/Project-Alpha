@@ -29,7 +29,12 @@ import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
-import { WORLD_CHAIN_DEFAULTS, canProvisionTurnkey, loadConfig } from "../config/env";
+import {
+  WORLD_CHAIN_DEFAULTS,
+  canFormEntities,
+  canProvisionTurnkey,
+  loadConfig,
+} from "../config/env";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -374,6 +379,11 @@ async function main() {
     // availability and what provisioning actually needs can never drift apart. A deployment that
     // ships no TURNKEY_* is turnkey-less by construction — the mainnet circle-only shape.
     turnkeyCustodyAvailable: turnkeyServiceable,
+    // Formation (design §2). One predicate shared with the env.ts boot invariants
+    // (canFormEntities) so the boot gate and the advertised availability cannot drift apart.
+    formationAvailable: canFormEntities(cfg),
+    formationRequired: Boolean(cfg.formation?.required),
+    formationEnvironment: cfg.doola?.environment ?? null,
     repo,
     docStore,
     runner,
