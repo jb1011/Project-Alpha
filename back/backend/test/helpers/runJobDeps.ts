@@ -126,6 +126,7 @@ function makeFakeReputationAdapter(): ReputationAdapter {
 // ---------------------------------------------------------------------------
 function makeFakeDocStore(): DocumentStore {
   const store = new Map<string, string>();
+  const bytes = new Map<string, Buffer>();
   return {
     put(name: string, contents: string) {
       store.set(name, contents);
@@ -133,6 +134,15 @@ function makeFakeDocStore(): DocumentStore {
     },
     get(id: string): string {
       const v = store.get(id);
+      if (v === undefined) throw new Error(`docStore: not found: ${id}`);
+      return v;
+    },
+    putBytes(name: string, buf: Buffer) {
+      bytes.set(name, Buffer.from(buf));
+      return { id: name, path: `/tmp/fake-docs/${name}`, uri: `file:///tmp/fake-docs/${name}` };
+    },
+    getBytes(id: string): Buffer {
+      const v = bytes.get(id);
       if (v === undefined) throw new Error(`docStore: not found: ${id}`);
       return v;
     },

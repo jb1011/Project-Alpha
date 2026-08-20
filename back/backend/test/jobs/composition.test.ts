@@ -79,6 +79,12 @@ const fakeDocStore: DocumentStore = {
     uri: `file:///tmp/test-docs/${name}`,
   }),
   get: (_id: string) => "",
+  putBytes: (name: string, _bytes: Buffer) => ({
+    id: name,
+    path: `/tmp/test-docs/${name}`,
+    uri: `file:///tmp/test-docs/${name}`,
+  }),
+  getBytes: (_id: string) => Buffer.alloc(0),
 };
 
 test("buildJobDeps returns the expected interface without network calls", () => {

@@ -1,4 +1,14 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -11,6 +21,9 @@ export interface PutResult {
 export interface DocumentStore {
   put(name: string, contents: string): PutResult;
   get(id: string): string;
+  /** Binary write (legal PDFs, canonical manifest bytes). ATOMIC — see the impl note. */
+  putBytes(name: string, bytes: Buffer): PutResult;
+  getBytes(id: string): Buffer;
 }
 
 /** Local-filesystem doc store. Interface allows S3 / Vercel Blob later (deferred). */
@@ -39,4 +52,62 @@ export class FileDocumentStore implements DocumentStore {
   get(id: string): string {
     return readFileSync(this.safePath(id), "utf8");
   }
+
+  /**
+   * ATOMIC binary write: temp file in the SAME directory -> write -> fsync -> rename.
+   *
+   * Why the ceremony (audit M7): these bytes get HASHED, and the hash gets anchored on-chain
+   * forever. A torn or truncated file whose hash is already anchored is a permanently
+   * unverifiable anchor — there is no amendment path that can fix what the chain already
+   * committed to. So:
+   *  - same directory, because rename() is only atomic within one filesystem;
+   *  - `wx` on the temp, so a colliding leftover is an ERROR rather than a silent overwrite of
+   *    another writer's in-flight bytes;
+   *  - fsync BEFORE rename, so a power loss can lose the whole file but never publish a
+   *    half-written one under the real name (the DB runs synchronous=NORMAL for the same
+   *    "re-derivable, never corrupt" reason);
+   *  - rename, which replaces the target atomically on POSIX.
+   */
+  putBytes(name: string, bytes: Buffer): PutResult {
+    const path = this.safePath(name);
+    // The temp name is derived from the target's own safe path, so it cannot escape the root
+    // either, and it carries pid + a counter so two writers never pick the same one.
+    const tmp = `${path}.tmp-${process.pid}-${nextTempSeq()}`;
+    let fd: number | undefined;
+    try {
+      fd = openSync(tmp, "wx", 0o600);
+      writeSync(fd, bytes);
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      renameSync(tmp, path);
+    } catch (e) {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          // already closed / never opened — the unlink below is what matters
+        }
+      }
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // best-effort cleanup: a leftover temp is inert (it is never read, and `wx` gives the
+        // next writer a fresh name), so it must not mask the real failure below.
+      }
+      throw e;
+    }
+    return { id: name, path, uri: pathToFileURL(path).href };
+  }
+
+  getBytes(id: string): Buffer {
+    return readFileSync(this.safePath(id));
+  }
+}
+
+/** Monotonic per-process counter for temp-file names (two writes in the same millisecond). */
+let tempSeq = 0;
+function nextTempSeq(): number {
+  tempSeq = (tempSeq + 1) % Number.MAX_SAFE_INTEGER;
+  return tempSeq;
 }
