@@ -97,6 +97,62 @@ test("formation_parties.region and deleted_at are NULLABLE (most countries have 
     expect(cols.find((c) => c.name === required)?.notnull).toBe(1);
 });
 
+test("formation_parties is keyed by party_id, with a NULLABLE UNIQUE entity_key + a tenant", () => {
+  // The intake handle exists BEFORE the entity does (design §5): PII is collected, a partyId is
+  // returned, and onboard binds it. A table keyed by entity_key cannot express that.
+  const cols = db.prepare("PRAGMA table_info(formation_parties)").all() as {
+    name: string;
+    notnull: number;
+    pk: number;
+  }[];
+  expect(cols.find((c) => c.name === "party_id")?.pk).toBe(1);
+  expect(cols.find((c) => c.name === "entity_key")?.pk).toBe(0);
+  expect(cols.find((c) => c.name === "entity_key")?.notnull).toBe(0);
+  expect(cols.find((c) => c.name === "tenant_id")?.notnull).toBe(1);
+
+  const insert = db.prepare(
+    `INSERT INTO formation_parties (party_id, entity_key, tenant_id, legal_first_name,
+       legal_last_name, email, line1, city, postal_code, country)
+     VALUES (?,?,?,'A','L','a@b.c','1 Way','Cheyenne','82001','USA')`,
+  );
+  insert.run("p1", "ent-1", "0xA");
+  // One party per entity: a second party binding the same entity is refused by the schema, not
+  // by a code path that could be forgotten.
+  expect(() => insert.run("p2", "ent-1", "0xA")).toThrow(/UNIQUE/);
+  // …and two UNBOUND parties coexist (NULLs do not collide in a SQLite UNIQUE index).
+  insert.run("p3", null, "0xA");
+  insert.run("p4", null, "0xA");
+  expect(
+    (
+      db.prepare("SELECT COUNT(*) c FROM formation_parties WHERE entity_key IS NULL").get() as {
+        c: number;
+      }
+    ).c,
+  ).toBe(2);
+});
+
+test("a PR-1-shaped formation_parties table is REBUILT in place (it never held a row)", () => {
+  // The prod-box upgrade: PR 1 created the table keyed by entity_key and shipped no writer for
+  // it, so the migration drops and recreates rather than attempting a 12-step ALTER.
+  const old = new Database(":memory:");
+  old.exec(`
+    CREATE TABLE formation_parties (
+      entity_key TEXT PRIMARY KEY,
+      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
+      email TEXT NOT NULL, phone TEXT,
+      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
+      region TEXT, postal_code TEXT NOT NULL, country TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deleted_at TEXT
+    );
+  `);
+  migrate(old);
+  migrate(old);
+  expect(columnsOf(old, "formation_parties")).toEqual(
+    expect.arrayContaining(["party_id", "entity_key", "tenant_id", "synthetic"]),
+  );
+  old.close();
+});
+
 test("the CHECKs refuse an unknown step/state (typos become errors, not silent rows)", () => {
   expect(() =>
     db

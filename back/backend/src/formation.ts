@@ -1,4 +1,5 @@
 import { type Config, canFormEntities } from "./config/env";
+import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
 
 /**
@@ -24,4 +25,197 @@ export function resolveFormationDeployment(
   // canFormEntities is exactly "cfg.doola is present", so the non-null assertion holds by the
   // guard above; the predicate is shared so the two can never drift.
   return { provider: "doola", environment: cfg.doola!.environment };
+}
+
+// ── Door gate (design §2/§5) ─────────────────────────────────────────────────────────────────
+//
+// Every message a formation door can refuse with lives in THIS file, for the reason
+// `custodyUnavailableMessage` does: REST /onboard and MCP onboard_agent must stay behaviorally
+// identical, tests regex-match these strings, and two copies of a refusal is two ways for the
+// surfaces to drift. The gate itself is one function returning `string | null` — REST maps a
+// non-null to a 400, MCP to an `isError` text — so the ORDER of the checks cannot differ
+// between the surfaces either, which is the property `server.ts:489-491` asks for.
+
+/** Formation is mandatory here and the caller sent no party handle. */
+export function formationPartyRequiredMessage(): string {
+  return "formation is required on this deployment: create a formation party (POST /formation-party, or the create_formation_party tool) and pass its partyId to onboard";
+}
+
+/**
+ * ONE message for unknown / not-yours / already-bound, deliberately.
+ *
+ * Distinguishing them would turn the endpoint into an existence oracle over other tenants'
+ * party ids, which is the same reason `GET /entities/:id` answers 404 rather than 403 for a
+ * foreign entity. The message names all three conditions so an honest caller can still tell what
+ * to fix.
+ */
+export function formationPartyUnavailableMessage(): string {
+  return "partyId is unknown, not yours, or already bound to another entity — create a new formation party";
+}
+
+/** A partyId arrived at a deployment that forms nothing. Refused rather than ignored: silently
+ *  dropping a legal identity a caller believed they were filing with is the worse failure. */
+export function formationUnavailableMessage(): string {
+  return "formation is not available on this deployment (doola credentials not configured) — omit partyId";
+}
+
+export function formationQuotaExhaustedMessage(maxPerTenant: number): string {
+  return `formation quota exhausted: this tenant has already reached the limit of ${maxPerTenant} formation(s)`;
+}
+
+export function formationCeilingReachedMessage(dailyCeiling: number): string {
+  return `platform formation ceiling reached: ${dailyCeiling} formation(s) in the last 24h — try again later`;
+}
+
+/** Sandbox: real personal data is refused outright, never merely replaced. */
+export function syntheticPiiRequiredMessage(): string {
+  return "this deployment files with SYNTHETIC sandbox identities (FORMATION_SANDBOX_SYNTHETIC_PII): pass { synthetic: true } — real personal data is refused here and is never sent to doola's development environment";
+}
+
+/** Production: the synthetic shortcut would file a real Wyoming LLC for a person who does not
+ *  exist. Refused for the honesty invariant, not merely for data quality. */
+export function syntheticPiiRefusedMessage(): string {
+  return "synthetic formation parties are refused on this deployment (FORMATION_SANDBOX_SYNTHETIC_PII is off): a real filing needs a real legal identity";
+}
+
+/**
+ * The labeled sandbox identity (§3, audit H7).
+ *
+ * doola's own registered-agent address in Sheridan, WY — the address a formed company already
+ * gets — and an address of ours in the email, so nothing here can be mistaken for, or traced to,
+ * a real natural person. The name is deliberately not a plausible one.
+ */
+export function syntheticFormationParty(partyId: string): {
+  legalFirstName: string;
+  legalLastName: string;
+  email: string;
+  phone: string;
+  line1: string;
+  line2: string;
+  city: string;
+  region: string;
+  postalCode: string;
+  country: string;
+} {
+  return {
+    legalFirstName: "Novi Sandbox",
+    legalLastName: "Guardian",
+    email: `sandbox+${partyId}@novicorpus.com`,
+    // doola REQUIRES a phone on a natural person's address (live sandbox, 2026-08-21).
+    phone: "+13075550142",
+    line1: "30 N Gould St",
+    line2: "STE R",
+    city: "Sheridan",
+    region: "WY",
+    postalCode: "82801",
+    country: "USA",
+  };
+}
+
+/** Counting surface behind the two spend controls. Implemented by the formation repository. */
+export interface FormationQuotaReader {
+  /** Lifetime formations opened by one tenant. */
+  createRequestsByTenant(tenantId: string): number;
+  /** Formations opened across the whole deployment since a UTC "YYYY-MM-DD HH:MM:SS" instant. */
+  createRequestsSince(sinceUtc: string): number;
+}
+
+/** Everything the door needs. Absent `formation` = this deployment forms nothing. */
+export interface FormationDoorDeps {
+  formation?: {
+    required: boolean;
+    maxPerTenant: number;
+    dailyCeiling: number;
+    parties: import("./persistence/formationPartyRepository").FormationPartyRepository;
+    quota: FormationQuotaReader;
+  };
+  now?: () => number;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** A `CURRENT_TIMESTAMP`-shaped UTC instant, so the comparison is lexicographic against the
+ *  TEXT timestamps SQLite writes (and stays injectable-clock friendly, which `datetime('now')`
+ *  would not be). */
+export function sqliteUtcTimestamp(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+}
+
+/**
+ * The formation door gate, in the ONE order both surfaces run it (design §2/§5).
+ *
+ * Returns the refusal message, or null when the request may proceed. Everything here happens
+ * BEFORE the entity is claimed: formation is real money in production ($100–150 each), and the
+ * user-facing answer to an exhausted quota or pack is a door that refuses, never an entity left
+ * live with a mandatory formation that can never happen.
+ */
+export function formationDoorRefusal(
+  deps: FormationDoorDeps,
+  input: { tenantId: string; partyId?: string },
+): string | null {
+  const f = deps.formation;
+  const now = deps.now ?? Date.now;
+
+  // 1. A deployment that forms nothing. A partyId here is a caller who believes their legal
+  //    identity is being filed with; say so instead of dropping it.
+  if (!f) return input.partyId ? formationUnavailableMessage() : null;
+
+  // 2. Mandatory formation with no party handle.
+  if (f.required && !input.partyId) return formationPartyRequiredMessage();
+
+  // 3. Ownership + single-use. Uniform message (see formationPartyUnavailableMessage).
+  if (input.partyId) {
+    const party = f.parties.findOwned(input.tenantId, input.partyId);
+    if (!party || party.entityKey) return formationPartyUnavailableMessage();
+  }
+
+  // 4. Spend controls, only when a filing will ACTUALLY be initiated for this entity — which is
+  //    exactly when formation is required (`resolveFormationDeployment` pins nothing otherwise,
+  //    so an opt-in party on a non-required deployment costs no money and burns no quota).
+  if (!f.required) return null;
+
+  const used = f.quota.createRequestsByTenant(input.tenantId);
+  if (used >= f.maxPerTenant) {
+    opsLog("formation_quota_rejected", {
+      reason: "tenant-formation-quota",
+      tenantId: truncateTenant(input.tenantId),
+      used,
+      limit: f.maxPerTenant,
+    });
+    return formationQuotaExhaustedMessage(f.maxPerTenant);
+  }
+
+  const inWindow = f.quota.createRequestsSince(sqliteUtcTimestamp(now() - DAY_MS));
+  if (inWindow >= f.dailyCeiling) {
+    opsLog("formation_ceiling_rejected", {
+      reason: "platform-formation-ceiling",
+      windowCount: inWindow,
+      limit: f.dailyCeiling,
+    });
+    return formationCeilingReachedMessage(f.dailyCeiling);
+  }
+
+  // Within 20% of either limit AFTER this formation: the operator hears about it while there is
+  // still headroom, not when the door starts refusing.
+  warnIfNearLimit("formation_quota_warning", used + 1, f.maxPerTenant, {
+    tenantId: truncateTenant(input.tenantId),
+  });
+  warnIfNearLimit("formation_ceiling_warning", inWindow + 1, f.dailyCeiling, {});
+  return null;
+}
+
+/** Tenant ids are wallet addresses — pseudonymous, but still tenant identity. opsLog carries the
+ *  same truncated form the World gate's rejection log uses. */
+export function truncateTenant(tenantId: string): string {
+  return `${tenantId.slice(0, 10)}…`;
+}
+
+function warnIfNearLimit(
+  event: string,
+  used: number,
+  limit: number,
+  fields: Record<string, unknown>,
+): void {
+  if (limit - used > limit * 0.2) return;
+  opsLog(event, { level: "warn", used, limit, remaining: limit - used, ...fields });
 }

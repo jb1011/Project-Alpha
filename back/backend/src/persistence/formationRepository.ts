@@ -75,7 +75,7 @@ export class SqliteFormationRepository {
    */
   private readonly stmts;
 
-  constructor(db: Database.Database) {
+  constructor(private readonly db: Database.Database) {
     this.stmts = {
       claimStep: db.prepare(
         `INSERT INTO formation_requests (entity_key, step, state)
@@ -99,6 +99,23 @@ export class SqliteFormationRepository {
       // One statement, not an UPDATE followed by a SELECT: the read-back could otherwise return
       // a DIFFERENT driver's attempt number (this repo exists because two drivers meet on these
       // rows), and a retry would then derive an idempotency key for an attempt it does not own.
+      // ── Spend controls (design §2, audit H6). Both count `create_provider` rows, which is one
+      //    row per entity a filing was ever OPENED for — including failed ones, deliberately: a
+      //    create that failed after doola committed has already cost a real company and a real
+      //    fee, and a quota that only counted successes would let a retry loop spend without
+      //    bound. The join is how a per-TENANT quota reaches rows keyed only by entity.
+      countByTenant: db.prepare(
+        `SELECT COUNT(*) AS n
+           FROM formation_requests f
+           JOIN entities e ON e.idempotency_key = f.entity_key
+          WHERE f.step = 'create_provider' AND e.owner_tenant_id = ?`,
+      ),
+      // Lexicographic on the TEXT CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC) the schema
+      // writes — the caller supplies the cutoff so the window is testable with an injected clock,
+      // which `datetime('now','-24 hours')` would not be.
+      countSince: db.prepare(
+        "SELECT COUNT(*) AS n FROM formation_requests WHERE step = 'create_provider' AND created_at > ?",
+      ),
       bumpAttempt: db.prepare(
         `UPDATE formation_requests
             SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP
@@ -176,6 +193,30 @@ export class SqliteFormationRepository {
       | { attempt: number }
       | undefined;
     return row?.attempt;
+  }
+
+  /** Lifetime formations opened by one tenant (FORMATION_MAX_PER_TENANT). */
+  createRequestsByTenant(tenantId: string): number {
+    return (this.stmts.countByTenant.get(tenantId) as { n: number }).n;
+  }
+
+  /** Formations opened across the deployment since a UTC "YYYY-MM-DD HH:MM:SS" instant
+   *  (FORMATION_DAILY_CEILING, the platform_outflows twin). */
+  createRequestsSince(sinceUtc: string): number {
+    return (this.stmts.countSince.get(sinceUtc) as { n: number }).n;
+  }
+
+  /** Claim all four steps of a new entity's formation in ONE transaction (the bridge-legs
+   *  pattern): "is a formation in flight for this entity?" is then a single query over rows that
+   *  provably all exist, instead of a guess about which of them a crash created. Returns whether
+   *  this caller opened the saga (i.e. `create_provider` did not already exist). */
+  claimAllSteps(entityKey: string): boolean {
+    return this.db.transaction(() => {
+      let opened = false;
+      for (const step of FORMATION_STEP_ORDER)
+        if (this.claimStep(entityKey, step) && step === "create_provider") opened = true;
+      return opened;
+    })();
   }
 
   /** The deterministic per-attempt idempotency key doola's two create endpoints honor. */

@@ -17,6 +17,41 @@ export function openDatabase(path: string): Database.Database {
   return db;
 }
 
+/**
+ * The PII table (design §3/§5), extracted as a constant because the migration below REBUILDS it.
+ *
+ * PR 1 keyed it by `entity_key` — but PII is collected BEFORE an entity exists: the wizard (and
+ * an MCP caller) posts a legal identity, gets a `partyId` back, and passes that to onboard, where
+ * the party is bound to the entity the claim mints. So the key is the partyId, the entity_key is
+ * nullable-and-unique (one party per entity, bound exactly once), and the row carries the tenant
+ * that owns it — ownership has to be answerable before there is an entity to answer it from.
+ *
+ * `region` is nullable because most countries have no state/province (US region = 2-letter
+ * state); `deleted_at` is the erasure marker for parties that never reached a filing (H7).
+ */
+const FORMATION_PARTIES_DDL = `
+    CREATE TABLE IF NOT EXISTS formation_parties (
+      party_id   TEXT PRIMARY KEY,
+      entity_key TEXT UNIQUE,      -- NULL until the party is bound to an entity at onboard
+      tenant_id  TEXT NOT NULL,
+      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
+      email TEXT NOT NULL, phone TEXT,
+      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
+      region TEXT,
+      postal_code TEXT NOT NULL, country TEXT NOT NULL,   -- ISO-3
+      -- A clearly-labeled sandbox fixture rather than a real natural person (§3, audit H7).
+      synthetic INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      deleted_at TEXT
+    );
+`;
+
+/** Created SEPARATELY, after the rebuild guard below: on a pre-existing database the table still
+ *  has PR 1's shape when the CREATE-TABLE block runs, and indexing a `tenant_id` that does not
+ *  exist yet fails the whole migration. */
+const FORMATION_PARTIES_INDEX_DDL =
+  "CREATE INDEX IF NOT EXISTS idx_formation_parties_tenant ON formation_parties(tenant_id);";
+
 /** Create tables if absent. Idempotent. */
 export function migrate(db: Database.Database): void {
   db.exec(`
@@ -383,18 +418,7 @@ export function migrate(db: Database.Database): void {
       WHERE processed_at IS NULL;
 
     -- Controller PII — its OWN table, never spec_json / views / transparency / metadata / logs.
-    -- region is nullable because most countries have no state/province (US region = 2-letter
-    -- state); deleted_at is the erasure marker for parties that never reached a filing.
-    CREATE TABLE IF NOT EXISTS formation_parties (
-      entity_key TEXT PRIMARY KEY,
-      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
-      email TEXT NOT NULL, phone TEXT,
-      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
-      region TEXT,
-      postal_code TEXT NOT NULL, country TEXT NOT NULL,   -- ISO-3
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      deleted_at TEXT
-    );
+    ${FORMATION_PARTIES_DDL}
 
     -- Small key/value marker table for one-shot data migrations (guards below), distinct from the
     -- additive schema (table/column) migrations, which are idempotent by construction.
@@ -472,6 +496,20 @@ export function migrate(db: Database.Database): void {
   if (!docCols.includes("size")) db.exec("ALTER TABLE documents ADD COLUMN size INTEGER");
   if (!docCols.includes("provider_doc_id"))
     db.exec("ALTER TABLE documents ADD COLUMN provider_doc_id TEXT");
+
+  // formation_parties: PR 1's shape was keyed by entity_key with no tenant column, which cannot
+  // express a party that exists BEFORE its entity does (the intake handle, design §5). Rebuild
+  // rather than ALTER: PR 1 shipped no writer for this table — the endpoint that produces rows
+  // arrives in this PR — so there is provably nothing to preserve, and a drop+create leaves the
+  // documented key structure (PRIMARY KEY, UNIQUE) that a 12-step ALTER dance cannot add anyway.
+  // Guarded on the column so it runs exactly once and never on a table that already has it.
+  const partyCols = (
+    db.prepare("PRAGMA table_info(formation_parties)").all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!partyCols.includes("party_id")) {
+    db.exec(`DROP TABLE formation_parties;${FORMATION_PARTIES_DDL}`);
+  }
+  db.exec(FORMATION_PARTIES_INDEX_DDL);
 
   const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
     (c) => c.name,
