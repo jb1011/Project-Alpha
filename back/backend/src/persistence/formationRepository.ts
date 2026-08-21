@@ -64,34 +64,65 @@ function toRecord(r: Row): FormationRequestRecord {
 }
 
 export class SqliteFormationRepository {
-  constructor(private readonly db: Database.Database) {}
+  /**
+   * Statements are prepared ONCE, in the constructor.
+   *
+   * The sweeper runs these on a timer, for every in-flight entity, forever — re-preparing on
+   * every call means re-parsing and re-planning the same six statements on every tick, for the
+   * whole life of the process. better-sqlite3 caches nothing on our behalf; this is the
+   * caching. (It also means the table must exist when the repo is constructed, which is already
+   * true everywhere: `migrate(db)` runs first at every composition root.)
+   */
+  private readonly stmts;
+
+  constructor(db: Database.Database) {
+    this.stmts = {
+      claimStep: db.prepare(
+        `INSERT INTO formation_requests (entity_key, step, state)
+         VALUES (?, ?, 'pending')
+         ON CONFLICT(entity_key, step) DO NOTHING`,
+      ),
+      find: db.prepare("SELECT * FROM formation_requests WHERE entity_key = ? AND step = ?"),
+      stepsOf: db.prepare("SELECT * FROM formation_requests WHERE entity_key = ?"),
+      listByState: db.prepare(
+        "SELECT * FROM formation_requests WHERE state = ? ORDER BY entity_key, step",
+      ),
+      transition: db.prepare(
+        `UPDATE formation_requests
+            SET state = ?,
+                provider_ref = COALESCE(?, provider_ref),
+                detail       = COALESCE(?, detail),
+                error        = ?,
+                updated_at   = CURRENT_TIMESTAMP
+          WHERE entity_key = ? AND step = ? AND state = ?`,
+      ),
+      // One statement, not an UPDATE followed by a SELECT: the read-back could otherwise return
+      // a DIFFERENT driver's attempt number (this repo exists because two drivers meet on these
+      // rows), and a retry would then derive an idempotency key for an attempt it does not own.
+      bumpAttempt: db.prepare(
+        `UPDATE formation_requests
+            SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP
+          WHERE entity_key = ? AND step = ? AND state = ?
+      RETURNING attempt`,
+      ),
+    };
+  }
 
   /** Create a step row in `pending` if it does not exist. Returns true when this caller created
    *  it — the claim primitive (INSERT … DO NOTHING, `claimKey`'s shape), so two drivers racing a
    *  fresh entity cannot both believe they own the step. */
   claimStep(entityKey: string, step: FormationStep): boolean {
-    const info = this.db
-      .prepare(
-        `INSERT INTO formation_requests (entity_key, step, state)
-         VALUES (?, ?, 'pending')
-         ON CONFLICT(entity_key, step) DO NOTHING`,
-      )
-      .run(entityKey, step);
-    return info.changes === 1;
+    return this.stmts.claimStep.run(entityKey, step).changes === 1;
   }
 
   find(entityKey: string, step: FormationStep): FormationRequestRecord | undefined {
-    const r = this.db
-      .prepare("SELECT * FROM formation_requests WHERE entity_key = ? AND step = ?")
-      .get(entityKey, step) as Row | undefined;
+    const r = this.stmts.find.get(entityKey, step) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 
   /** Every step of one entity, in saga order (missing steps are simply absent). */
   stepsOf(entityKey: string): FormationRequestRecord[] {
-    const rows = this.db
-      .prepare("SELECT * FROM formation_requests WHERE entity_key = ?")
-      .all(entityKey) as Row[];
+    const rows = this.stmts.stepsOf.all(entityKey) as Row[];
     const byStep = new Map(rows.map((r) => [r.step, toRecord(r)]));
     return FORMATION_STEP_ORDER.map((s) => byStep.get(s)).filter(
       (r): r is FormationRequestRecord => r !== undefined,
@@ -100,11 +131,7 @@ export class SqliteFormationRepository {
 
   /** Rows the sweeper owes work on: everything in `state` for any entity. */
   listByState(state: FormationState): FormationRequestRecord[] {
-    return (
-      this.db
-        .prepare("SELECT * FROM formation_requests WHERE state = ? ORDER BY entity_key, step")
-        .all(state) as Row[]
-    ).map(toRecord);
+    return (this.stmts.listByState.all(state) as Row[]).map(toRecord);
   }
 
   /**
@@ -120,27 +147,17 @@ export class SqliteFormationRepository {
     to: FormationState,
     fields: { providerRef?: string; detail?: string; error?: string | null } = {},
   ): boolean {
-    const info = this.db
-      .prepare(
-        `UPDATE formation_requests
-            SET state = ?,
-                provider_ref = COALESCE(?, provider_ref),
-                detail       = COALESCE(?, detail),
-                error        = ?,
-                updated_at   = CURRENT_TIMESTAMP
-          WHERE entity_key = ? AND step = ? AND state = ?`,
-      )
-      .run(
-        to,
-        fields.providerRef ?? null,
-        fields.detail ?? null,
-        // `error` is the one field a transition MUST be able to clear: a row that succeeds after
-        // a failure has no error, and leaving a stale one would misreport a healthy step.
-        fields.error ?? null,
-        entityKey,
-        step,
-        from,
-      );
+    const info = this.stmts.transition.run(
+      to,
+      fields.providerRef ?? null,
+      fields.detail ?? null,
+      // `error` is the one field a transition MUST be able to clear: a row that succeeds after
+      // a failure has no error, and leaving a stale one would misreport a healthy step.
+      fields.error ?? null,
+      entityKey,
+      step,
+      from,
+    );
     return info.changes === 1;
   }
 
@@ -151,18 +168,14 @@ export class SqliteFormationRepository {
    * number, or undefined when this caller lost the race.
    */
   bumpAttempt(entityKey: string, step: FormationStep, from: FormationState): number | undefined {
-    const info = this.db
-      .prepare(
-        `UPDATE formation_requests
-            SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP
-          WHERE entity_key = ? AND step = ? AND state = ?`,
-      )
-      .run(entityKey, step, from);
-    if (info.changes !== 1) return undefined;
-    const row = this.db
-      .prepare("SELECT attempt FROM formation_requests WHERE entity_key = ? AND step = ?")
-      .get(entityKey, step) as { attempt: number };
-    return row.attempt;
+    // UPDATE … RETURNING: the bump and the read-back are ONE statement, so the number returned
+    // is the one THIS update wrote. The previous UPDATE-then-SELECT could read a value another
+    // driver had bumped in between and hand back an attempt number this caller does not own —
+    // and the attempt number IS the idempotency key doola's create endpoints honor.
+    const row = this.stmts.bumpAttempt.get(entityKey, step, from) as
+      | { attempt: number }
+      | undefined;
+    return row?.attempt;
   }
 
   /** The deterministic per-attempt idempotency key doola's two create endpoints honor. */

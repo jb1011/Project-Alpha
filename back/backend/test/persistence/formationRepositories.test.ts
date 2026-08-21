@@ -152,3 +152,58 @@ test("anchor bumpAttempt is CAS-guarded like its formation twin", () => {
   expect(anchors.find("ent", 1)?.attempt).toBe(1);
   expect(anchors.listByState("pending").map((r) => r.version)).toEqual([1]);
 });
+
+// ── H: one statement per bump, statements prepared once ─────────────────────────────────────
+
+test("H1: bumpAttempt returns the number THIS update wrote, not a later read-back", () => {
+  // The old UPDATE-then-SELECT could read a value another driver bumped in between and hand the
+  // caller an attempt number it does not own — and that number IS the idempotency key doola's
+  // create endpoints honor, so the two drivers would collide on one key with different bodies.
+  // Simulated here by interleaving a second bump between the first caller's update and any
+  // read-back it might have done: with UPDATE … RETURNING there is no gap to interleave into.
+  formation.claimStep("ent", "await_ein");
+  formation.transition("ent", "await_ein", "pending", "failed", { error: "irs" });
+  const first = formation.bumpAttempt("ent", "await_ein", "failed");
+  expect(first).toBe(1);
+  // A concurrent driver now bumps again from the state THIS one left behind.
+  formation.transition("ent", "await_ein", "pending", "failed", { error: "irs again" });
+  const second = formation.bumpAttempt("ent", "await_ein", "failed");
+  expect(second).toBe(2);
+  // Each caller kept its own number; neither observed the other's.
+  expect(first).not.toBe(second);
+  expect(SqliteFormationRepository.idempotencyKey("ent", "await_ein", first!)).not.toBe(
+    SqliteFormationRepository.idempotencyKey("ent", "await_ein", second!),
+  );
+});
+
+test("H1: the anchor twin returns its own attempt number the same way", () => {
+  anchors.claimVersion("ent", 7, "0x07");
+  anchors.transition("ent", 7, "pending", "failed", { error: "rpc" });
+  expect(anchors.bumpAttempt("ent", 7, "failed")).toBe(1);
+  anchors.transition("ent", 7, "pending", "failed", { error: "rpc" });
+  expect(anchors.bumpAttempt("ent", 7, "failed")).toBe(2);
+  expect(anchors.find("ent", 7)?.attempt).toBe(2);
+  // A lost race still returns undefined — the CAS is unchanged by the single-statement rewrite.
+  expect(anchors.bumpAttempt("ent", 7, "failed")).toBeUndefined();
+});
+
+test("H2: statements are prepared once — a repo built on a fresh db serves every method", () => {
+  // Constructor-time preparation means the tables must exist when the repo is built (they do:
+  // `migrate(db)` runs first at every composition root). Pin that a freshly-built pair works
+  // end to end, so a future statement added to the constructor cannot silently break boot.
+  const f = new SqliteFormationRepository(db);
+  const a = new SqliteOaAnchorRepository(db);
+  expect(f.claimStep("fresh", "create_provider")).toBe(true);
+  expect(f.find("fresh", "create_provider")?.state).toBe("pending");
+  expect(f.stepsOf("fresh").map((r) => r.step)).toEqual(["create_provider"]);
+  expect(f.listByState("pending").some((r) => r.entityKey === "fresh")).toBe(true);
+  expect(f.transition("fresh", "create_provider", "pending", "failed", { error: "x" })).toBe(true);
+  expect(f.bumpAttempt("fresh", "create_provider", "failed")).toBe(1);
+  expect(a.claimVersion("fresh", 1, "0xaa")).toBe(true);
+  expect(a.find("fresh", 1)?.manifestHash).toBe("0xaa");
+  expect(a.versionsOf("fresh").map((r) => r.version)).toEqual([1]);
+  expect(a.findPending("fresh")?.version).toBe(1);
+  expect(a.listByState("pending").some((r) => r.entityKey === "fresh")).toBe(true);
+  expect(a.transition("fresh", 1, "pending", "failed", { error: "y" })).toBe(true);
+  expect(a.bumpAttempt("fresh", 1, "failed")).toBe(1);
+});

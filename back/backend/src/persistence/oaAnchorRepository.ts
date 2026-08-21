@@ -81,57 +81,75 @@ export interface OaAnchorRepository {
 }
 
 export class SqliteOaAnchorRepository implements OaAnchorRepository {
-  constructor(private readonly db: Database.Database) {}
+  /** Prepared ONCE — same reason as the formation repo: the anchor sweeper runs these on a timer
+   *  for the life of the process, and better-sqlite3 caches nothing on our behalf. The tables
+   *  exist by construction time (`migrate(db)` runs first at every composition root). */
+  private readonly stmts;
+
+  constructor(db: Database.Database) {
+    this.stmts = {
+      claimVersion: db.prepare(
+        `INSERT INTO oa_anchors (entity_key, version, manifest_hash, state)
+         VALUES (?, ?, ?, 'pending')
+         ON CONFLICT(entity_key, version) DO NOTHING`,
+      ),
+      find: db.prepare("SELECT * FROM oa_anchors WHERE entity_key = ? AND version = ?"),
+      versionsOf: db.prepare("SELECT * FROM oa_anchors WHERE entity_key = ? ORDER BY version"),
+      findPending: db.prepare(
+        `SELECT * FROM oa_anchors
+          WHERE entity_key = ? AND state IN ('pending','scheduled')
+          ORDER BY version DESC LIMIT 1`,
+      ),
+      listByState: db.prepare(
+        "SELECT * FROM oa_anchors WHERE state = ? ORDER BY entity_key, version",
+      ),
+      transition: db.prepare(
+        `UPDATE oa_anchors
+            SET state         = ?,
+                schedule_tx   = COALESCE(?, schedule_tx),
+                execute_tx    = COALESCE(?, execute_tx),
+                executable_at = COALESCE(?, executable_at),
+                error         = ?,
+                updated_at    = CURRENT_TIMESTAMP
+          WHERE entity_key = ? AND version = ? AND state = ?`,
+      ),
+      // ONE statement (see the formation repo's twin): an UPDATE followed by a SELECT could read
+      // back a number another driver bumped in between.
+      bumpAttempt: db.prepare(
+        `UPDATE oa_anchors
+            SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP
+          WHERE entity_key = ? AND version = ? AND state = ?
+      RETURNING attempt`,
+      ),
+    };
+  }
 
   /** Open a new anchor cycle in `pending`. Returns false when this version already exists —
    *  the claim primitive: re-deriving v2 after a crash must adopt the existing row, never
    *  restart the cycle with a different hash. */
   claimVersion(entityKey: string, version: number, manifestHash: Hex): boolean {
-    const info = this.db
-      .prepare(
-        `INSERT INTO oa_anchors (entity_key, version, manifest_hash, state)
-         VALUES (?, ?, ?, 'pending')
-         ON CONFLICT(entity_key, version) DO NOTHING`,
-      )
-      .run(entityKey, version, manifestHash);
-    return info.changes === 1;
+    return this.stmts.claimVersion.run(entityKey, version, manifestHash).changes === 1;
   }
 
   find(entityKey: string, version: number): OaAnchorRecord | undefined {
-    const r = this.db
-      .prepare("SELECT * FROM oa_anchors WHERE entity_key = ? AND version = ?")
-      .get(entityKey, version) as Row | undefined;
+    const r = this.stmts.find.get(entityKey, version) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 
   /** Every cycle of one entity, oldest version first. */
   versionsOf(entityKey: string): OaAnchorRecord[] {
-    return (
-      this.db
-        .prepare("SELECT * FROM oa_anchors WHERE entity_key = ? ORDER BY version")
-        .all(entityKey) as Row[]
-    ).map(toRecord);
+    return (this.stmts.versionsOf.all(entityKey) as Row[]).map(toRecord);
   }
 
   /** The entity's single in-flight cycle (single-pending rule), if one is open. */
   findPending(entityKey: string): OaAnchorRecord | undefined {
-    const r = this.db
-      .prepare(
-        `SELECT * FROM oa_anchors
-          WHERE entity_key = ? AND state IN ('pending','scheduled')
-          ORDER BY version DESC LIMIT 1`,
-      )
-      .get(entityKey) as Row | undefined;
+    const r = this.stmts.findPending.get(entityKey) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 
   /** Rows in one state across the deployment — the sweeper's due-work query. */
   listByState(state: OaAnchorState): OaAnchorRecord[] {
-    return (
-      this.db
-        .prepare("SELECT * FROM oa_anchors WHERE state = ? ORDER BY entity_key, version")
-        .all(state) as Row[]
-    ).map(toRecord);
+    return (this.stmts.listByState.all(state) as Row[]).map(toRecord);
   }
 
   /**
@@ -152,44 +170,25 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
       error?: string | null;
     } = {},
   ): boolean {
-    const info = this.db
-      .prepare(
-        `UPDATE oa_anchors
-            SET state         = ?,
-                schedule_tx   = COALESCE(?, schedule_tx),
-                execute_tx    = COALESCE(?, execute_tx),
-                executable_at = COALESCE(?, executable_at),
-                error         = ?,
-                updated_at    = CURRENT_TIMESTAMP
-          WHERE entity_key = ? AND version = ? AND state = ?`,
-      )
-      .run(
-        to,
-        fields.scheduleTx ?? null,
-        fields.executeTx ?? null,
-        fields.executableAt ?? null,
-        fields.error ?? null,
-        entityKey,
-        version,
-        from,
-      );
+    const info = this.stmts.transition.run(
+      to,
+      fields.scheduleTx ?? null,
+      fields.executeTx ?? null,
+      fields.executableAt ?? null,
+      fields.error ?? null,
+      entityKey,
+      version,
+      from,
+    );
     return info.changes === 1;
   }
 
   /** Retry bookkeeping for a transient failure: bump the attempt and return to `pending`.
    *  CAS-guarded like every other move; undefined = this caller lost the race. */
   bumpAttempt(entityKey: string, version: number, from: OaAnchorState): number | undefined {
-    const info = this.db
-      .prepare(
-        `UPDATE oa_anchors
-            SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP
-          WHERE entity_key = ? AND version = ? AND state = ?`,
-      )
-      .run(entityKey, version, from);
-    if (info.changes !== 1) return undefined;
-    const row = this.db
-      .prepare("SELECT attempt FROM oa_anchors WHERE entity_key = ? AND version = ?")
-      .get(entityKey, version) as { attempt: number };
-    return row.attempt;
+    const row = this.stmts.bumpAttempt.get(entityKey, version, from) as
+      | { attempt: number }
+      | undefined;
+    return row?.attempt;
   }
 }
