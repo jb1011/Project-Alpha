@@ -1,11 +1,19 @@
 /**
- * doola client contract (design §2/§5). Four properties are load-bearing enough to pin here:
+ * doola client contract (design §2/§5). Six properties are load-bearing enough to pin here:
  *  1. the API key rides RAW in Authorization — a "Bearer " prefix 401s every call;
  *  2. Idempotency-Key goes on the two CREATE endpoints and NOWHERE else (doola honors it nowhere
  *     else — sending it elsewhere would imply crash safety that does not exist);
  *  3. their error envelope maps to a typed error carrying code + requestId, with validation
  *     distinguishable from internal WITHOUT string-sniffing;
- *  4. the base URL comes from the environment, and the playground calls refuse production.
+ *  4. the base URL comes from the environment, and the playground calls refuse production;
+ *  5. the deadline covers the BODY READ and aborts the request (review A1);
+ *  6. bodies are size-capped, and a 2xx that is not a `{payload}` envelope is an ERROR, never a
+ *     silently-resolved `undefined` (review A2/A3).
+ *
+ * The fakes below build NATIVE `Response` objects (the sibling fetch fakes' convention, e.g.
+ * test/payments/buyer.test.ts): a cast object cannot exercise `res.body`, `res.headers` or the
+ * streaming read the client actually performs, so a hand-rolled stub would pin a client that
+ * does not exist.
  */
 import { expect, test, vi } from "vitest";
 import { DoolaApiError, buildDoolaApi } from "../../../src/adapters/doola/doolaClient";
@@ -18,8 +26,15 @@ interface Recorded {
   body?: string;
 }
 
-/** A fetch fake that records every call and replies with a queued response. */
-function fakeFetch(responses: { status: number; body?: unknown; text?: string }[]): {
+interface FakeResponse {
+  status: number;
+  body?: unknown;
+  text?: string;
+  headers?: Record<string, string>;
+}
+
+/** A fetch fake that records every call and replies with a queued NATIVE Response. */
+function fakeFetch(responses: FakeResponse[]): {
   fetchImpl: typeof fetch;
   calls: Recorded[];
 } {
@@ -34,11 +49,7 @@ function fakeFetch(responses: { status: number; body?: unknown; text?: string }[
     });
     const r = responses[Math.min(i++, responses.length - 1)] ?? { status: 200 };
     const text = r.text ?? (r.body === undefined ? "" : JSON.stringify(r.body));
-    return {
-      ok: r.status >= 200 && r.status < 300,
-      status: r.status,
-      text: async () => text,
-    } as Response;
+    return new Response(text, { status: r.status, headers: r.headers });
   });
   return { fetchImpl: fetchImpl as unknown as typeof fetch, calls };
 }
@@ -231,10 +242,10 @@ test("playground calls are SANDBOX-ONLY and refuse a production-pinned client", 
   expect(calls).toHaveLength(0); // refused BEFORE any network call
 });
 
-test("list reads unwrap doola's payload envelope and tolerate an empty body", async () => {
+test("list reads unwrap doola's payload envelope; a null payload is an empty list", async () => {
   const { fetchImpl } = fakeFetch([
     { status: 200, body: { payload: [{ id: "doc_1", type: "OperatingAgreement" }] } },
-    { status: 200, text: "" },
+    { status: 200, body: { payload: null } },
   ]);
   const api = buildDoolaApi({
     apiKey: "dk",
@@ -243,6 +254,8 @@ test("list reads unwrap doola's payload envelope and tolerate an empty body", as
     fetchImpl,
   });
   expect(await api.listDocuments("cmp_1")).toEqual([{ id: "doc_1", type: "OperatingAgreement" }]);
+  // `payload: null` is doola saying "nothing yet" — an ENVELOPE with no content, which is a
+  // different thing from a body with no envelope (that one throws, below).
   expect(await api.listRequiredActions("cmp_1")).toEqual([]);
 });
 
@@ -256,4 +269,161 @@ test("every call is deadline-bounded — a hung socket cannot wedge the entity l
     fetchImpl: hang,
   });
   await expect(api.getCompany("cmp_1")).rejects.toThrow(/did not respond within 20ms/);
+});
+
+// ── A1: the deadline covers the BODY READ, and it aborts ────────────────────────────────────
+
+test("A1: a response whose BODY never resolves still times out, and the signal is ABORTED", async () => {
+  // The realistic hang: headers arrive fast, the body stalls forever. A deadline wrapped around
+  // `fetch` alone has already resolved by then and would wait on the read with no bound at all —
+  // while the caller holds the per-entity lock.
+  let seen: AbortSignal | undefined;
+  const stalledBody = new ReadableStream<Uint8Array>({
+    start() {
+      /* never enqueues, never closes */
+    },
+  });
+  const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    seen = init?.signal ?? undefined;
+    return new Response(stalledBody, { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    timeoutMs: 20,
+    fetchImpl,
+  });
+  await expect(api.getCompany("cmp_1")).rejects.toThrow(/did not respond within 20ms/);
+  // The rejection is what the caller sees; the abort is what frees the socket.
+  expect(seen?.aborted).toBe(true);
+});
+
+// ── A2: the response size cap, both enforcement paths ───────────────────────────────────────
+
+test("A2: a declared Content-Length over 4 MiB is refused before a byte is buffered", async () => {
+  const { fetchImpl } = fakeFetch([
+    {
+      status: 200,
+      body: { payload: { id: "cmp_1" } },
+      headers: { "content-length": String(4 * 1024 * 1024 + 1) },
+    },
+  ]);
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+  const err = (await api.getCompany("cmp_1").catch((e) => e)) as DoolaApiError;
+  expect(err).toBeInstanceOf(DoolaApiError);
+  expect(err.code).toBe("E_RESPONSE_TOO_LARGE");
+});
+
+test("A2: a CHUNKED body that lies about its length is cut off by the running byte counter", async () => {
+  // No content-length at all (or a small one) is the normal chunked case — the header check is
+  // simply absent, so the stream counter is the only thing standing between this process and an
+  // unbounded allocation.
+  // 256 KiB per chunk; the stream would happily emit 400 of them (100 MiB) if nothing stopped it.
+  const chunk = new Uint8Array(256 * 1024);
+  let sent = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent >= 400) return controller.close();
+      sent += 1;
+      controller.enqueue(chunk);
+    },
+  });
+  const fetchImpl = vi.fn(
+    async () => new Response(stream, { status: 200, headers: { "content-length": "12" } }),
+  ) as unknown as typeof fetch;
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+  const err = (await api.getCompany("cmp_1").catch((e) => e)) as DoolaApiError;
+  expect(err).toBeInstanceOf(DoolaApiError);
+  expect(err.code).toBe("E_RESPONSE_TOO_LARGE");
+  // ~17 chunks reach the cap; the point is that it stopped there instead of draining 100 MiB.
+  expect(sent).toBeLessThan(100);
+});
+
+test("A2: a normal-sized body is unaffected by the cap", async () => {
+  const { fetchImpl } = fakeFetch([{ status: 200, body: { payload: { id: "cmp_1" } } }]);
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+  expect(await api.getCompany("cmp_1")).toEqual({ id: "cmp_1" });
+});
+
+// ── A3: a 2xx that is not an envelope is an ERROR, never `undefined` ────────────────────────
+
+test("A3: a 2xx with an empty / non-JSON / envelope-less body throws E_BAD_RESPONSE", async () => {
+  const cases: { name: string; res: FakeResponse }[] = [
+    { name: "empty", res: { status: 200, text: "" } },
+    { name: "html from a proxy", res: { status: 200, text: "<html>ok</html>" } },
+    { name: "no payload key", res: { status: 200, body: { id: "cmp_1" } } },
+  ];
+  for (const c of cases) {
+    const { fetchImpl } = fakeFetch([c.res]);
+    const api = buildDoolaApi({
+      apiKey: "dk",
+      baseUrl: "https://doola.test",
+      environment: "sandbox",
+      fetchImpl,
+    });
+    const err = (await api.getCompany("cmp_1").catch((e) => e)) as DoolaApiError;
+    expect(err, c.name).toBeInstanceOf(DoolaApiError);
+    expect(err.code, c.name).toBe("E_BAD_RESPONSE");
+    expect(err.status, c.name).toBe(200);
+  }
+});
+
+test("A3: E_BAD_RESPONSE carries the requestId when the response has one", async () => {
+  const { fetchImpl } = fakeFetch([
+    { status: 200, text: "<html>stripped by a CDN</html>", headers: { "x-request-id": "req_cdn" } },
+  ]);
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+  const err = (await api.getCompany("cmp_1").catch((e) => e)) as DoolaApiError;
+  expect(err.requestId).toBe("req_cdn"); // the first thing doola support asks for
+});
+
+test("A3: no read EVER resolves undefined — the whole point of the envelope check", async () => {
+  const { fetchImpl } = fakeFetch([{ status: 200, text: "" }]);
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+  // A stripped 200 must never read as "there is no such company" — that is how a live formation
+  // silently becomes a hole in the DB.
+  await expect(api.getCompany("cmp_1")).rejects.toThrow(DoolaApiError);
+  await expect(api.listDocuments("cmp_1")).rejects.toThrow(DoolaApiError);
+  await expect(api.getDocumentDownloadUrl("cmp_1", "doc_1")).rejects.toThrow(DoolaApiError);
+});
+
+test("A3: the VOID playground calls still accept an empty 2xx body", async () => {
+  // They return nothing by contract, so there is no payload to demand.
+  const { fetchImpl, calls } = fakeFetch([{ status: 200, text: "" }]);
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+  await expect(api.playgroundCompleteFormation("cmp_1")).resolves.toBeUndefined();
+  await expect(api.playgroundCompleteEin("cmp_1")).resolves.toBeUndefined();
+  expect(calls).toHaveLength(2);
 });
