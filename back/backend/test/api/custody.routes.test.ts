@@ -37,6 +37,13 @@ const SPEC = {
 };
 const PASSKEY = { attestation: { credentialId: "cred-1" } };
 
+/** What a deployment with no doola block advertises (design §2): formation off, environment null.
+ *  Every credential-less deployment — dev, CI, self-hosts — serves exactly this. */
+const FORMATION_OFF = {
+  formationAvailable: false,
+  formationEnvironment: null,
+};
+
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 beforeEach(() => {
@@ -50,6 +57,7 @@ function makeApp(opts: {
   circleAvailable: boolean;
   turnkeyAvailable?: boolean;
   def?: "turnkey" | "circle";
+  formation?: { environment: "sandbox" | "production" };
 }) {
   const runner = new OnboardingRunner({
     repo,
@@ -67,6 +75,7 @@ function makeApp(opts: {
     walletProviderDefault: opts.def ?? "turnkey",
     circleCustodyAvailable: opts.circleAvailable,
     turnkeyCustodyAvailable: opts.turnkeyAvailable ?? true,
+    formation: opts.formation,
     repo,
     runner,
     passkeyRpId: "wizard.local",
@@ -178,6 +187,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "circle",
     circleCustodyAvailable: true,
     turnkeyCustodyAvailable: true,
+    ...FORMATION_OFF,
   });
 
   // A turnkey-only deployment (the pre-Tier-0 shape: Turnkey creds, no Circle creds) must
@@ -187,6 +197,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "turnkey",
     circleCustodyAvailable: false,
     turnkeyCustodyAvailable: true,
+    ...FORMATION_OFF,
   });
 
   // A genuinely bare deployment (no creds at all — the dev/CI shape that still boots) advertises
@@ -197,6 +208,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "turnkey",
     circleCustodyAvailable: false,
     turnkeyCustodyAvailable: false,
+    ...FORMATION_OFF,
   });
 
   // The mainnet shape: circle-only, so the wizard hides the turnkey card instead of offering
@@ -206,5 +218,54 @@ test("GET /config is public and reports this deployment's custody capabilities",
     walletProviderDefault: "circle",
     circleCustodyAvailable: true,
     turnkeyCustodyAvailable: false,
+    ...FORMATION_OFF,
   });
+});
+
+test("GET /config reports formation availability and its ENVIRONMENT (honesty invariant)", async () => {
+  // A sandbox formation deployment: available, and the environment is named so the wizard can
+  // render "Demo formation (sandbox)" amber instead of a green real-formation badge.
+  const sandbox = makeApp({
+    circleAvailable: true,
+    def: "circle",
+    formation: { environment: "sandbox" },
+  });
+  expect(await (await sandbox.request("/config")).json()).toEqual({
+    walletProviderDefault: "circle",
+    circleCustodyAvailable: true,
+    turnkeyCustodyAvailable: true,
+    formationAvailable: true,
+    formationEnvironment: "sandbox",
+  });
+
+  // Production formation is a DIFFERENT advertised value, never a missing one: the environment is
+  // required-when-available, so no surface can render a real filing and a demo filing the same.
+  const prod = makeApp({
+    circleAvailable: true,
+    def: "circle",
+    formation: { environment: "production" },
+  });
+  expect((await (await prod.request("/config")).json()).formationEnvironment).toBe("production");
+});
+
+test("availability and environment are ONE dep — they can never be advertised in disagreement", async () => {
+  // The two fields are projections of a single optional object, so "available with a null
+  // environment" (a sandbox filing renderable without its demo qualifier) is unrepresentable.
+  const off = await (
+    await makeApp({ circleAvailable: true, def: "circle" }).request("/config")
+  ).json();
+  expect([off.formationAvailable, off.formationEnvironment]).toEqual([false, null]);
+
+  const on = await (
+    await makeApp({
+      circleAvailable: true,
+      def: "circle",
+      formation: { environment: "sandbox" },
+    }).request("/config")
+  ).json();
+  expect([on.formationAvailable, on.formationEnvironment]).toEqual([true, "sandbox"]);
+
+  // PR 1 deliberately does not advertise FORMATION_REQUIRED: the door gate that enforces it
+  // lands in PR 2, and a requirement nothing enforces is a claim the deployment cannot keep.
+  expect(on).not.toHaveProperty("formationRequired");
 });

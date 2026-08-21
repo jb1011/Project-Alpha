@@ -93,6 +93,15 @@ interface Row {
   previous_operator: string | null;
   operator_rotated_at: number | null;
   public_id: string | null;
+  formation_provider: string | null;
+  formation_environment: string | null;
+  ein_real: string | null;
+  formation_filed_at: number | null;
+  formation_filing_number: string | null;
+  oa_manifest_version: number | null;
+  oa_manifest_anchored_hash: string | null;
+  oa_manifest_pending_hash: string | null;
+  oa_amendment_executable_at: number | null;
 }
 
 function serializeTreasury(tc: TreasuryConfig | null): string | null {
@@ -152,6 +161,15 @@ function toRecord(r: Row): EntityRecord {
     previousOperator: r.previous_operator ?? null,
     operatorRotatedAt: r.operator_rotated_at ?? null,
     publicId: r.public_id ?? null,
+    formationProvider: r.formation_provider ?? null,
+    formationEnvironment: (r.formation_environment as EntityRecord["formationEnvironment"]) ?? null,
+    einReal: r.ein_real ?? null,
+    formationFiledAt: r.formation_filed_at ?? null,
+    formationFilingNumber: r.formation_filing_number ?? null,
+    oaManifestVersion: r.oa_manifest_version ?? null,
+    oaManifestAnchoredHash: (r.oa_manifest_anchored_hash as Hex) ?? null,
+    oaManifestPendingHash: (r.oa_manifest_pending_hash as Hex) ?? null,
+    oaAmendmentExecutableAt: r.oa_amendment_executable_at ?? null,
   };
 }
 
@@ -196,6 +214,15 @@ export class SqliteEntityRepository implements EntityRepository {
       previous_operator: rec.previousOperator ?? null,
       operator_rotated_at: rec.operatorRotatedAt ?? null,
       public_id: rec.publicId ?? null,
+      formation_provider: rec.formationProvider ?? null,
+      formation_environment: rec.formationEnvironment ?? null,
+      ein_real: rec.einReal ?? null,
+      formation_filed_at: rec.formationFiledAt ?? null,
+      formation_filing_number: rec.formationFilingNumber ?? null,
+      oa_manifest_version: rec.oaManifestVersion ?? null,
+      oa_manifest_anchored_hash: rec.oaManifestAnchoredHash ?? null,
+      oa_manifest_pending_hash: rec.oaManifestPendingHash ?? null,
+      oa_amendment_executable_at: rec.oaAmendmentExecutableAt ?? null,
     };
   }
 
@@ -205,7 +232,10 @@ export class SqliteEntityRepository implements EntityRepository {
         owner_tenant_id, error, spec_json,
         amendment_delay,
         ein, formation_date, oa_hash, metadata_uri, doc_path, treasury_config,
-        agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, trust_policy, root_passkey_id, wallet_provider, circle_wallet_set_id, circle_operator_wallet_id, circle_pocket_wallet_id, pocket_address, previous_operator, operator_rotated_at, public_id, updated_at`;
+        agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, trust_policy, root_passkey_id, wallet_provider, circle_wallet_set_id, circle_operator_wallet_id, circle_pocket_wallet_id, pocket_address, previous_operator, operator_rotated_at, public_id,
+        formation_provider, formation_environment, ein_real, formation_filed_at, formation_filing_number,
+        oa_manifest_version, oa_manifest_anchored_hash, oa_manifest_pending_hash, oa_amendment_executable_at,
+        updated_at`;
 
   private static readonly INSERT_VALUES = `
         @idempotency_key, @name, @status, @manager, @guardian, @operator,
@@ -213,7 +243,10 @@ export class SqliteEntityRepository implements EntityRepository {
         @owner_tenant_id, @error, @spec_json,
         @amendment_delay,
         @ein, @formation_date, @oa_hash, @metadata_uri, @doc_path, @treasury_config,
-        @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @trust_policy, @root_passkey_id, @wallet_provider, @circle_wallet_set_id, @circle_operator_wallet_id, @circle_pocket_wallet_id, @pocket_address, @previous_operator, @operator_rotated_at, @public_id, CURRENT_TIMESTAMP`;
+        @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @trust_policy, @root_passkey_id, @wallet_provider, @circle_wallet_set_id, @circle_operator_wallet_id, @circle_pocket_wallet_id, @pocket_address, @previous_operator, @operator_rotated_at, @public_id,
+        @formation_provider, @formation_environment, @ein_real, @formation_filed_at, @formation_filing_number,
+        @oa_manifest_version, @oa_manifest_anchored_hash, @oa_manifest_pending_hash, @oa_amendment_executable_at,
+        CURRENT_TIMESTAMP`;
 
   upsert(rec: EntityRecord): void {
     this.db
@@ -233,7 +266,15 @@ export class SqliteEntityRepository implements EntityRepository {
           proxy=excluded.proxy, treasury=excluded.treasury,
           create_tx_hash=excluded.create_tx_hash, bind_tx_hash=excluded.bind_tx_hash,
           fund_tx_hash=excluded.fund_tx_hash, public_id=excluded.public_id,
-          per_tx_cap=excluded.per_tx_cap, trust_policy=excluded.trust_policy, root_passkey_id=excluded.root_passkey_id, wallet_provider=excluded.wallet_provider, circle_wallet_set_id=excluded.circle_wallet_set_id, circle_operator_wallet_id=excluded.circle_operator_wallet_id, circle_pocket_wallet_id=excluded.circle_pocket_wallet_id, pocket_address=excluded.pocket_address, previous_operator=excluded.previous_operator, operator_rotated_at=excluded.operator_rotated_at, updated_at=CURRENT_TIMESTAMP
+          per_tx_cap=excluded.per_tx_cap, trust_policy=excluded.trust_policy, root_passkey_id=excluded.root_passkey_id, wallet_provider=excluded.wallet_provider, circle_wallet_set_id=excluded.circle_wallet_set_id, circle_operator_wallet_id=excluded.circle_operator_wallet_id, circle_pocket_wallet_id=excluded.circle_pocket_wallet_id, pocket_address=excluded.pocket_address, previous_operator=excluded.previous_operator, operator_rotated_at=excluded.operator_rotated_at,
+          formation_provider=excluded.formation_provider, formation_environment=excluded.formation_environment,
+          ein_real=excluded.ein_real, formation_filed_at=excluded.formation_filed_at,
+          formation_filing_number=excluded.formation_filing_number,
+          oa_manifest_version=excluded.oa_manifest_version,
+          oa_manifest_anchored_hash=excluded.oa_manifest_anchored_hash,
+          oa_manifest_pending_hash=excluded.oa_manifest_pending_hash,
+          oa_amendment_executable_at=excluded.oa_amendment_executable_at,
+          updated_at=CURRENT_TIMESTAMP
       `)
       .run(SqliteEntityRepository.bindings(rec));
   }

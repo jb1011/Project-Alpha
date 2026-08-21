@@ -29,7 +29,13 @@ import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
-import { WORLD_CHAIN_DEFAULTS, canProvisionTurnkey, loadConfig } from "../config/env";
+import {
+  WORLD_CHAIN_DEFAULTS,
+  canFormEntities,
+  canProvisionTurnkey,
+  loadConfig,
+} from "../config/env";
+import { resolveFormationDeployment } from "../formation";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -46,6 +52,7 @@ import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
+import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import {
@@ -81,6 +88,10 @@ async function main() {
   assertTurnkeyCoverage(db, turnkeyServiceable);
   if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
   const repo = new SqliteEntityRepository(db);
+  // Same db handle as `repo`, deliberately: the v1 anchor row is written INSIDE the entity row's
+  // transaction at create-confirm, so the entity store and the anchor history can never disagree
+  // about what the chain holds.
+  const anchors = new SqliteOaAnchorRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
@@ -255,6 +266,13 @@ async function main() {
         privateKeyToAccount(derivePocketKey(cfg.pocketMasterSeed!, entityKey)).address
     : undefined;
 
+  // doola formation (design §2). ONE value, resolved once by the shared resolver every
+  // composition root uses (api, cli, legacy onboarding server), and handed to BOTH the claim
+  // (runner) and the saga — so the pin on a row and the client that would file for it can never
+  // come from different places, and no door can pin differently from another. Null on a
+  // credential-less deployment, and on one that has FORMATION_REQUIRED off = stub mode.
+  const formationDeployment = resolveFormationDeployment(cfg);
+
   const runSaga: RunSaga = (i) =>
     runOnboarding({
       spec: i.spec,
@@ -277,6 +295,8 @@ async function main() {
       provisionCircle,
       circleSignerForEntity,
       derivePocketAddress,
+      formation: formationDeployment,
+      anchors,
     });
 
   const runner = new OnboardingRunner({
@@ -284,6 +304,7 @@ async function main() {
     runSaga,
     fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
     outflows,
+    formation: formationDeployment,
   });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
@@ -374,6 +395,12 @@ async function main() {
     // availability and what provisioning actually needs can never drift apart. A deployment that
     // ships no TURNKEY_* is turnkey-less by construction — the mainnet circle-only shape.
     turnkeyCustodyAvailable: turnkeyServiceable,
+    // Formation (design §2). ONE object: `canFormEntities` — the same predicate the env.ts boot
+    // invariants use, so the boot gate and the advertised availability cannot drift apart — and
+    // the environment it is available IN, which the honesty invariant makes inseparable from it.
+    // Availability is NOT the pin: a box with credentials but FORMATION_REQUIRED off still
+    // advertises the capability while pinning nothing.
+    formation: canFormEntities(cfg) ? { environment: cfg.doola!.environment } : undefined,
     repo,
     docStore,
     runner,

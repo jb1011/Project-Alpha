@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Hex } from "../../types";
+import { withDeadline } from "../../util/deadline";
 import type { CircleWalletsApi } from "./circleWallets";
 
 /**
@@ -80,28 +81,6 @@ const DEFAULT_POLL_DELAY_MS = 2_000;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** Bound ONE HTTP call by a real wall-clock deadline (review finding M1): the poll loop's
- *  deadline check only runs BETWEEN calls, so a hung Circle API call (dropped TCP, no RST) would
- *  otherwise wedge the caller — which usually holds the per-entity keyed lock — forever. Uses a
- *  real timer deliberately (not the injectable test sleep): an instantly-resolving fake sleep
- *  must not fake-timeout instantly-resolving fake API calls. */
-function withCallDeadline<T>(work: Promise<T>, ms: number, err: () => Error): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(err()), Math.max(ms, 1));
-    (t as { unref?: () => void }).unref?.();
-    work.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      },
-    );
-  });
-}
-
 /** Poll an ALREADY-SUBMITTED Circle tx to a terminal state (review finding M2: a resumed saga leg
  *  that carries its circle_tx_id polls it directly instead of re-submitting — no reliance on
  *  Circle's idempotency-replay retention for the no-double-send guarantee). */
@@ -117,10 +96,13 @@ export async function confirmTransaction(
   const deadline = now() + timeoutMs;
   for (;;) {
     const remaining = deadline - now();
+    // The Circle SDK takes no AbortSignal, so the signal is unused here — the deadline still
+    // bounds the caller, which is the property the keyed lock depends on (review finding M1:
+    // the poll loop's own deadline check only runs BETWEEN calls).
     const tx = (
-      await withCallDeadline(
-        api.getTransaction({ id: circleTxId }),
+      await withDeadline(
         remaining,
+        () => api.getTransaction({ id: circleTxId }),
         () => new CircleTxTimeoutError(circleTxId, timeoutMs),
       )
     ).data?.transaction;
@@ -155,16 +137,17 @@ export async function submitAndConfirm(
 ): Promise<{ circleTxId: string; txHash: Hex }> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-  const res = await withCallDeadline(
-    api.createContractExecutionTransaction({
-      walletId: input.walletId,
-      contractAddress: input.contractAddress,
-      callData: input.callData,
-      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
-      idempotencyKey: deterministicIdempotencyKey(input.idempotencySeed),
-      refId: input.refId,
-    }),
+  const res = await withDeadline(
     timeoutMs,
+    () =>
+      api.createContractExecutionTransaction({
+        walletId: input.walletId,
+        contractAddress: input.contractAddress,
+        callData: input.callData,
+        fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+        idempotencyKey: deterministicIdempotencyKey(input.idempotencySeed),
+        refId: input.refId,
+      }),
     () =>
       new Error(
         `circle createContractExecutionTransaction timed out after ${timeoutMs}ms — safe to retry (deterministic idempotency key replays)`,

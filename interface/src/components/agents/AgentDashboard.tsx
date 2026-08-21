@@ -246,7 +246,12 @@ export function AgentDashboard({
               <OnChainRow label="Guardian" value={shortAddress(entity.guardian)} />
             )}
             {entity.oaHash && (
-              <OnChainRow label="OA hash" value={`${entity.oaHash.slice(0, 14)}…`} />
+              // Two different things share one field, and the backend says which: with the
+              // manifest scheme the anchor commits to the whole OA BUNDLE — terms doc, legal
+              // documents, chain identity — so it is an "anchor" and its version is part of its
+              // name. For a legacy row it commits to the operating-agreement document alone, and
+              // calling that an anchor would overstate what is on chain.
+              <OnChainRow label={oaAnchorLabel(entity)} value={`${entity.oaHash.slice(0, 14)}…`} />
             )}
           </dl>
           <div className="mt-4 flex flex-wrap gap-3">
@@ -506,6 +511,20 @@ function ensName(entity: { metadataURI: string | null }): string | null {
   if (!uri || !/^https?:\/\//.test(uri)) return null;
   const label = uri.split("/").filter(Boolean).pop();
   return label ? `${label.toLowerCase()}.${ENS_PARENT_NAME}` : null;
+}
+
+/**
+ * How to NAME the on-chain OA hash row.
+ *
+ * The scheme comes from the backend (`oaAnchor.scheme`), never from guessing at a version
+ * number: a manifest entity whose v1 has not confirmed yet has a null version, and calling that
+ * "OA hash" would describe a bundle anchor as a plain document hash. An absent `oaAnchor` means
+ * a backend that predates the field, which is the legacy shape by definition.
+ */
+function oaAnchorLabel(entity: Pick<EntityView, "oaAnchor">): string {
+  const anchor = entity.oaAnchor;
+  if (!anchor || anchor.scheme === "legacy") return "OA hash";
+  return anchor.version != null ? `OA anchor (v${anchor.version})` : "OA anchor (pending)";
 }
 
 function EnsGlobe({ className }: { className?: string }) {

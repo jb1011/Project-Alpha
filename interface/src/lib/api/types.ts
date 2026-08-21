@@ -30,6 +30,28 @@ export type EntityView = {
   rootPasskeyId?: string | null;
   /** Tier-0 custody provider; null/absent = legacy row (behaves as "turnkey"). */
   walletProvider?: "turnkey" | "circle" | null;
+  /** What `oaHash` COMMITS to. "legacy" = the operating-agreement document alone; "manifest" =
+   *  the OA bundle manifest (terms doc + legal documents + chain identity), which is why the two
+   *  are labelled differently. The backend decides the scheme with the same predicate it anchors
+   *  with, so the UI never re-derives it from a version number. Optional for deploy-order safety:
+   *  a backend that predates this field means "legacy". */
+  oaAnchor?:
+    | { scheme: "legacy"; hash: string | null }
+    | {
+        scheme: "manifest";
+        hash: string | null;
+        /** Anchored version; null while v1 is still in flight. */
+        version: number | null;
+        pendingHash: string | null;
+      };
+  /** Formation (doola). null/absent = stub, forever. `environment` is always present when the
+   *  block is: a sandbox filing must render amber ("Demo formation"), never green. PR 1 ships
+   *  the skeleton, so `status` is always "none". Never carries PII. */
+  formation?: {
+    provider: string;
+    environment: "sandbox" | "production";
+    status: "none";
+  } | null;
 };
 
 /** Public deployment capabilities (GET /config, unauthenticated) — lets the wizard preselect the
@@ -40,6 +62,13 @@ export type PublicConfig = {
   /** Optional for deploy-order safety: a backend that predates this field means "available"
    *  (every legacy deployment served turnkey). Mainnet ships false — circle-only. */
   turnkeyCustodyAvailable?: boolean;
+  /** doola formation. Both are optional for deploy-order safety: a backend that predates them
+   *  forms nothing, which is exactly what absent should mean. `formationEnvironment` is non-null
+   *  whenever formation is available — the honesty invariant, and the reason the two are served
+   *  as projections of one value rather than as independent flags. (Whether formation is
+   *  REQUIRED is not advertised until the door gate that enforces it ships.) */
+  formationAvailable?: boolean;
+  formationEnvironment?: "sandbox" | "production" | null;
 };
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).

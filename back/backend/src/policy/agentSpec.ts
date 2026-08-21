@@ -69,11 +69,17 @@ export const AgentSpecSchema = z
         "must be a duration >= 1h",
       ).default("24h"),
     }),
+    // `.strict()`: an unknown key here is REFUSED, not silently stripped. `ein` is the reason —
+    // the EIN is issued by the IRS and carried by the OA bundle manifest (design §4), never
+    // supplied by the caller, and it is absent from this shape so the generated JSON Schema
+    // (GET /schema/agent-spec.json, the MCP schema resource) stops ADVERTISING a field the
+    // system will not honor. Strictness turns "quietly ignored" into zod's named
+    // "Unrecognized key(s) in object: 'ein'", which is what a caller needs to hear.
     legal: z
       .object({
-        ein: z.string().optional(),
         formationDate: z.string().date().optional(), // ISO YYYY-MM-DD; stubbed if absent
       })
+      .strict()
       .default({}),
     metadata: z
       .object({

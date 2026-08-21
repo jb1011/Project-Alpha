@@ -2,7 +2,7 @@ import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import { ApiError } from "../api/errors";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { AgentSpec } from "../policy/agentSpec";
-import type { Address, EntityRecord, EntityStatus } from "../types";
+import type { Address, EntityRecord, EntityStatus, FormationPin } from "../types";
 
 export type RunSaga = (input: {
   spec: AgentSpec;
@@ -29,6 +29,11 @@ export class OnboardingRunner {
       fundCaps: { perCall: bigint; perTenantTotal: bigint };
       /** S5 aggregate platform-outflow brake; absent in tests that predate it -> unmetered. */
       outflows?: { check(amountAtomic: bigint): void };
+      /** doola formation (design §2): a DEPLOYMENT constant, so it is a runner dep rather than a
+       *  per-call argument — no door has to learn about it. Stamped on the CLAIM so the
+       *  environment an entity is pinned to is fixed before anything can be filed for it (audit
+       *  M5). Absent (no doola credentials) = stub mode, `formation_provider` stays null. */
+      formation?: FormationPin | null;
     },
   ) {}
 
@@ -75,6 +80,9 @@ export class OnboardingRunner {
       rootPasskeyId: p.guardianPasskey?.attestation?.credentialId ?? null,
       // Tier-0: custody is claimed here, immutably — the saga and the reconciler both read it.
       walletProvider: p.custody ?? null,
+      // Formation, the custody twin: pinned at the claim and never re-derived from config.
+      formationProvider: this.deps.formation?.provider ?? null,
+      formationEnvironment: this.deps.formation?.environment ?? null,
     };
     // Atomic claim: the INSERT-or-nothing is the single gate. Two concurrent starts (or processes
     // racing the same key) can never both win — the loser sees changes()==0 and gets a 409, before

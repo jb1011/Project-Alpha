@@ -14,6 +14,7 @@ import { provisionAgentVault } from "../adapters/turnkey/provisioner";
 import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { loadConfig } from "../config/env";
+import { resolveFormationDeployment } from "../formation";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
@@ -86,6 +87,10 @@ async function main() {
         ? (entityKey) =>
             privateKeyToAccount(derivePocketKey(cfg.pocketMasterSeed!, entityKey)).address
         : undefined,
+      // Formation (design §2/§5): the SAME resolver the API and the CLI use. This server is a
+      // legacy door (retire-vs-gate is a PR-2 decision), but while it can still mint entities it
+      // must not mint ones that disagree with the rest of the deployment about their provider.
+      formation: resolveFormationDeployment(cfg),
     });
 
   const app = buildOnboardingApp({
