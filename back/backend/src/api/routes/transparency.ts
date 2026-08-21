@@ -45,7 +45,10 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
         treasury: e.treasury,
         // null = legacy pre-Tier-0 row, same "behaves as turnkey" convention as EntityView.
         walletProvider: e.walletProvider ?? "turnkey",
-        humanVerified: Boolean(gv),
+        // A waiver grants access, not personhood: it is on record (credential "waiver") but
+        // never human-verified — the same rule GET /metadata/:publicId applies, so the two
+        // public surfaces cannot disagree about the same guardian.
+        humanVerified: Boolean(gv) && gv?.credential !== "waiver",
         credential: gv?.credential ?? null,
         createdAt: e.createdAt,
         jobsSettled: agg?.jobs ?? 0,

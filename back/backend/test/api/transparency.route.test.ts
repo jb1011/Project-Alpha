@@ -148,6 +148,27 @@ test("marks the entity human-verified when the guardian holds a World verificati
   expect(JSON.stringify(body)).not.toContain("0xsecret");
 });
 
+test("a guardian waiver is access, not personhood: never human-verified on the public registry", async () => {
+  repo.upsert(base);
+  const worldId = {
+    cfg: { action: "guardian" },
+    store: {
+      findByTenant: (tenantId: string, action: string) =>
+        tenantId === "tenant-a" && action === "guardian"
+          ? {
+              credential: "waiver",
+              nullifier: "waiver:abc",
+              verifiedAt: 1,
+              environment: "production",
+            }
+          : undefined,
+    },
+  };
+  const body = await (await app(worldId).request("/transparency")).json();
+  // Same invariant as GET /metadata/:publicId — the two public surfaces must never disagree.
+  expect(body.entities[0]).toMatchObject({ humanVerified: false, credential: "waiver" });
+});
+
 test("cross-origin OPTIONS preflight gets ACAO: *", async () => {
   const res = await app().request("/transparency", {
     method: "OPTIONS",
