@@ -212,18 +212,22 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     failStep(d, row, noFormationPartyError());
     return;
   }
-  if (!party.phone) {
-    failStep(d, row, partyPhoneRequiredError());
-    return;
-  }
-
   let detail = parseDetail(row.detail);
 
   // ── ADOPT (crash-window rule). A persisted provider_ref means the company create ALREADY
   //    returned — whatever happened next. Filing again would be a second real LLC and a second
-  //    real fee, so this path only ever reads.
+  //    real fee, so this path only ever reads. Checked BEFORE the body preconditions below: a
+  //    company that exists must be adopted whatever the party's data looks like now.
   if (row.providerRef) {
     await adopt(d, row, row.providerRef, { ...detail, adopted: true });
+    return;
+  }
+
+  // Everything from here builds a request body, and doola REQUIRES a phone on a natural person's
+  // address (live sandbox, 2026-08-21). Refused HERE, with a named reason, rather than by a body
+  // we already know will come back 400.
+  if (!party.phone) {
+    failStep(d, row, partyPhoneRequiredError());
     return;
   }
 
@@ -285,8 +289,9 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     persistDetail(d, detail);
   }
 
-  // ── 2. Pre-create lookup fallback (completeness 9). ONLY on a resume, and it may only ever
-  //       ADOPT: `GET /companies` is eventually consistent with the creates (verified live), so
+  // ── 2. Pre-create lookup fallback (completeness 9). Only when a previous attempt already had
+  //       a customer, and it may only ever ADOPT: `GET /companies` is eventually consistent with
+  //       the creates (verified live — see the runbook), so
   //       an empty result is NOT evidence that nothing was filed and can never authorize a
   //       fresh create. The Idempotency-Key is what makes that safe; this is belt-and-braces.
   if (hadCustomer) {

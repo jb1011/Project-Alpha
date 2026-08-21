@@ -494,3 +494,21 @@ test("RETRY after a failure: the row re-enters `submitted`, so the company id is
   // The customer survived the failure, so the retry reuses it and looks first.
   expect(fixed.calls.map((c) => c.method)).toEqual(["listCompanies", "createCompany"]);
 });
+
+test("ADOPT wins over the body preconditions: a filed company is adopted even if the party degrades", async () => {
+  bindParty();
+  const arc = makeFakeArc();
+  const first = makeFakeDoola();
+  await runOnboarding(baseDeps(arc, first.api));
+  db.prepare(
+    "UPDATE formation_requests SET state = 'submitted' WHERE entity_key = ? AND step = 'create_provider'",
+  ).run(KEY);
+  // The phone disappears (an erasure, a correction, a bad edit). The company still exists in
+  // Wyoming's queue and its id is ours: adopting it is the only safe answer.
+  db.prepare("UPDATE formation_parties SET phone = NULL WHERE entity_key = ?").run(KEY);
+
+  const second = makeFakeDoola();
+  await runOnboarding(baseDeps(arc, second.api));
+  expect(second.calls.map((c) => c.method)).toEqual(["getCompany"]);
+  expect(requests.find(KEY, "create_provider")!.state).toBe("confirmed");
+});
