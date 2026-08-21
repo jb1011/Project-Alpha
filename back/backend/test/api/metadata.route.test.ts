@@ -85,3 +85,35 @@ test("cross-origin OPTIONS preflight to /metadata gets ACAO: *", async () => {
   });
   expect(res.headers.get("access-control-allow-origin")).toBe("*");
 });
+
+test("the served metadata NEVER carries the EIN or anything about the natural person (§8)", async () => {
+  // The record holds the real EIN and the filing facts, and a party row holds real PII…
+  repo.upsert({
+    ...rec,
+    formationProvider: "doola",
+    formationEnvironment: "sandbox",
+    einReal: "98-7654321",
+    formationFilingNumber: "2026-123456",
+  });
+  db.prepare(
+    `INSERT INTO formation_parties (party_id, entity_key, tenant_id, legal_first_name,
+       legal_last_name, email, line1, city, postal_code, country)
+     VALUES ('p1', ?, '0xAAA', 'Ada', 'Lovelace', 'ada@example.com', '1 Analytical Way',
+             'Cheyenne', '82001', 'USA')`,
+  ).run(KEY);
+  docStore.put(`meta-${KEY}.json`, JSON.stringify({ name: "A", type: "agent" }));
+
+  // …and this route is UNAUTHENTICATED, so none of it may appear.
+  const body = await (await app().request(`/metadata/${PUBLIC_ID}`)).text();
+  for (const forbidden of [
+    "98-7654321",
+    "2026-123456",
+    "Ada",
+    "Lovelace",
+    "ada@example.com",
+    "Analytical",
+    "82001",
+    "p1",
+  ])
+    expect(body).not.toContain(forbidden);
+});

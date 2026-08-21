@@ -437,9 +437,12 @@ async function main() {
           maxPerTenant: cfg.formation?.maxPerTenant ?? 3,
           dailyCeiling: cfg.formation?.dailyCeiling ?? 10,
           parties: formationParties,
-          quota: formationRequests,
+          requests: formationRequests,
         }
       : undefined,
+    // Always wired, credentials or not: the rows are plain SQL, and an entity already filed must
+    // stay describable even on a box that has since lost its doola block.
+    formationSteps: (entityKey: string) => formationRequests.stepsOf(entityKey),
     repo,
     docStore,
     runner,

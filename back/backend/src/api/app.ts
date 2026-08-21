@@ -87,8 +87,18 @@ export interface ApiDeps {
     maxPerTenant: number;
     dailyCeiling: number;
     parties: import("../persistence/formationPartyRepository").FormationPartyRepository;
-    quota: import("../formation").FormationQuotaReader;
+    requests: import("../persistence/formationRepository").FormationRepository;
   };
+  /**
+   * How every view learns a record's formation progress (design §5/§8).
+   *
+   * A TOP-LEVEL dep, not part of `formation`, and deliberately so: `formation` is the
+   * CAPABILITY — it exists only where doola is configured — whereas the sub-saga rows are plain
+   * SQL over the same database and exist on any box that ever formed anything. A deployment
+   * that lost its doola credentials must still be able to describe the entities it already
+   * filed, rather than report them as unformed.
+   */
+  formationSteps?: import("./views").FormationStepsLookup;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return

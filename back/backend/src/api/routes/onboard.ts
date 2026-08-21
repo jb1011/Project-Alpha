@@ -127,13 +127,17 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     return c.json({ partyId: result.partyId }, 201);
   });
 
-  app.get("/entities", (c) => c.json(deps.repo.listByTenant(c.get("tenantId")).map(toEntityView)));
+  app.get("/entities", (c) =>
+    c.json(
+      deps.repo.listByTenant(c.get("tenantId")).map((r) => toEntityView(r, deps.formationSteps)),
+    ),
+  );
 
   app.get("/entities/:id", (c) => {
     const rec = deps.repo.findByIdempotencyKey(c.req.param("id"));
     if (!rec || rec.ownerTenantId !== c.get("tenantId"))
       throw new ApiError("not_found", 404, "entity not found");
-    return c.json(toEntityView(rec));
+    return c.json(toEntityView(rec, deps.formationSteps));
   });
 
   app.post("/entities/:id/fund", async (c) => {

@@ -86,7 +86,7 @@ function makeApp(opts: {
           maxPerTenant: 3,
           dailyCeiling: 10,
           parties: new SqliteFormationPartyRepository(db),
-          quota: new SqliteFormationRepository(db),
+          requests: new SqliteFormationRepository(db),
         }
       : undefined,
     repo,

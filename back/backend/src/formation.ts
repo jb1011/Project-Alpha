@@ -128,7 +128,9 @@ export interface FormationDoorDeps {
     maxPerTenant: number;
     dailyCeiling: number;
     parties: import("./persistence/formationPartyRepository").FormationPartyRepository;
-    quota: FormationQuotaReader;
+    /** The sub-saga rows. Typed as the narrow COUNTING surface here — the door needs nothing
+     *  else from them, and the full repository satisfies it structurally. */
+    requests: FormationQuotaReader;
   };
   now?: () => number;
 }
@@ -175,7 +177,7 @@ export function formationDoorRefusal(
   //    so an opt-in party on a non-required deployment costs no money and burns no quota).
   if (!f.required) return null;
 
-  const used = f.quota.createRequestsByTenant(input.tenantId);
+  const used = f.requests.createRequestsByTenant(input.tenantId);
   if (used >= f.maxPerTenant) {
     opsLog("formation_quota_rejected", {
       reason: "tenant-formation-quota",
@@ -186,7 +188,7 @@ export function formationDoorRefusal(
     return formationQuotaExhaustedMessage(f.maxPerTenant);
   }
 
-  const inWindow = f.quota.createRequestsSince(sqliteUtcTimestamp(now() - DAY_MS));
+  const inWindow = f.requests.createRequestsSince(sqliteUtcTimestamp(now() - DAY_MS));
   if (inWindow >= f.dailyCeiling) {
     opsLog("formation_ceiling_rejected", {
       reason: "platform-formation-ceiling",

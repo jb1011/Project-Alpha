@@ -6,6 +6,7 @@
  */
 import { expect, test } from "vitest";
 import { toEntityView } from "../../src/api/views";
+import type { FormationRequestRecord } from "../../src/persistence/formationRepository";
 import type { EntityRecord } from "../../src/types";
 
 const BASE: EntityRecord = {
@@ -38,7 +39,7 @@ test("a LEGACY row serves formation: null and the LEGACY anchor scheme (the stub
   expect(v.oaHash).toBe("0xabc");
 });
 
-test("a formed row serves provider + environment + the PR-1 status skeleton", () => {
+test("a formed row serves provider + environment + the derived status", () => {
   const v = toEntityView({
     ...BASE,
     formationProvider: "doola",
@@ -46,7 +47,16 @@ test("a formed row serves provider + environment + the PR-1 status skeleton", ()
     oaManifestVersion: 1,
     oaManifestAnchoredHash: "0xabc",
   });
-  expect(v.formation).toEqual({ provider: "doola", environment: "sandbox", status: "none" });
+  // No sub-saga rows to read: the entity is pinned but nothing has been opened for it.
+  expect(v.formation).toEqual({
+    provider: "doola",
+    environment: "sandbox",
+    status: "none",
+    providerRef: null,
+    filedAt: null,
+    filingNumber: null,
+    ein: null,
+  });
   expect(v.oaAnchor).toEqual({
     scheme: "manifest",
     hash: "0xabc",
@@ -98,6 +108,91 @@ test("HONESTY INVARIANT: the environment can never be omitted from a formation b
   // environment would let a sandbox filing be shown without its "demo" qualifier.
   expect(toEntityView({ ...BASE, formationProvider: "doola" }).formation).toBeNull();
   expect(toEntityView({ ...BASE, formationEnvironment: "sandbox" }).formation).toBeNull();
+});
+
+// ── the derived status (design §5/§8) ──────────────────────────────────────────────────────
+
+const step = (
+  step: FormationRequestRecord["step"],
+  state: FormationRequestRecord["state"],
+  providerRef: string | null = null,
+): FormationRequestRecord => ({
+  entityKey: BASE.idempotencyKey,
+  step,
+  state,
+  attempt: 0,
+  providerRef,
+  detail: null,
+  error: null,
+});
+
+const formed = (steps: FormationRequestRecord[]) =>
+  toEntityView(
+    { ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" },
+    () => steps,
+  );
+
+test("status is DERIVED from the sub-saga rows, never stored", () => {
+  expect(formed([]).formation!.status).toBe("none");
+
+  // Opened, nothing legally true yet: doola has the request, Wyoming has nothing.
+  expect(
+    formed([step("create_provider", "confirmed"), step("await_filing", "pending")]).formation!
+      .status,
+  ).toBe("in_progress");
+  expect(formed([step("create_provider", "submitted")]).formation!.status).toBe("in_progress");
+
+  // The STATE has filed it — the company legally exists.
+  expect(
+    formed([step("create_provider", "confirmed"), step("await_filing", "confirmed")]).formation!
+      .status,
+  ).toBe("filed");
+
+  // The IRS has issued the EIN: fully formed.
+  expect(
+    formed([step("await_filing", "confirmed"), step("await_ein", "confirmed")]).formation!.status,
+  ).toBe("complete");
+
+  // Nothing confirmed and the filing step is in error.
+  expect(formed([step("create_provider", "failed")]).formation!.status).toBe("failed");
+  expect(formed([step("create_provider", "abandoned")]).formation!.status).toBe("failed");
+});
+
+test("a FILED company whose later step failed still reads `filed` — the legal fact stands", () => {
+  // Reporting this as "failed" would deny a company that exists in Wyoming's records. The
+  // ordering of the checks is what makes that impossible.
+  const v = formed([
+    step("create_provider", "confirmed"),
+    step("await_filing", "confirmed"),
+    step("fetch_documents", "failed"),
+  ]);
+  expect(v.formation!.status).toBe("filed");
+});
+
+test("providerRef comes from the create_provider row; the legal facts come from the record", () => {
+  const v = toEntityView(
+    {
+      ...BASE,
+      formationProvider: "doola",
+      formationEnvironment: "sandbox",
+      einReal: "12-3456789",
+      formationFiledAt: 1_755_600_000,
+      formationFilingNumber: "2026-123456",
+    },
+    () => [step("create_provider", "confirmed", "cmp_1"), step("await_ein", "confirmed")],
+  );
+  expect(v.formation).toEqual({
+    provider: "doola",
+    environment: "sandbox",
+    status: "complete",
+    providerRef: "cmp_1",
+    filedAt: 1_755_600_000,
+    filingNumber: "2026-123456",
+    // The AUTHENTICATED view — and only this one — carries the EIN.
+    ein: "12-3456789",
+  });
+  // `ein` on the record is the placeholder frozen on-chain at mint; it is never served as a fact.
+  expect(v.formation!.ein).not.toBe(BASE.ein);
 });
 
 test("no PII reaches the view, whatever the record carries", () => {

@@ -1,6 +1,7 @@
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import type { ApiDeps } from "../app";
+import { deriveFormationStatus } from "../views";
 
 /** A job is "settled" once escrowed USDC has paid out on-chain. `reputed` is a settled job that
  *  also earned reputation — same canonical definition as routes/reputation.ts. */
@@ -10,7 +11,12 @@ const SETTLED = new Set(["completed", "reputed"]);
  *  Everything served here is either already public on Arc (addresses, agent ids, settled jobs) or
  *  already published per-entity via GET /metadata/:publicId (name, humanVerified, credential).
  *  Deliberately NOT included: idempotency keys and tenant ids (they encode tenant identity),
- *  operator/guardian wallets, and anything about in-flight or failed onboardings. */
+ *  operator/guardian wallets, anything about in-flight or failed onboardings — and, since
+ *  formation landed, EVERYTHING about the natural person behind an entity (name, email, address,
+ *  the partyId that would let one be looked up) together with the EIN and the filing number. The
+ *  EIN is the entity owner's tax identifier and is served only to an authenticated owner; the
+ *  formation block below carries a derived status and the environment, which are exactly the two
+ *  facts the honesty invariant requires a stranger to be able to see. */
 export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   app.get("/transparency", (c) => {
     const entities = deps.repo.listPublicOnChain();
@@ -48,6 +54,16 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
         humanVerified: Boolean(gv),
         credential: gv?.credential ?? null,
         createdAt: e.createdAt,
+        // Formation (design §8). Present only for an entity actually pinned to a provider;
+        // null for every legacy/stub row, forever. `environment` is inseparable from the
+        // status: a sandbox filing must read as a demo here too, not as a Wyoming company.
+        formation:
+          e.formationProvider && e.formationEnvironment
+            ? {
+                status: deriveFormationStatus(deps.formationSteps?.(e.idempotencyKey) ?? []),
+                environment: e.formationEnvironment,
+              }
+            : null,
         jobsSettled: agg?.jobs ?? 0,
         usdcSettledAtomic: (agg?.usdcAtomic ?? 0n).toString(),
       };

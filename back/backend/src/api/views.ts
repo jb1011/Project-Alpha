@@ -1,6 +1,42 @@
 import type { DoolaEnvironment } from "../adapters/doola/types";
+import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
 import { usesManifestScheme } from "../workflow/onboarding";
+
+/** The formation sub-saga rows of one entity. A function rather than the repository so the view
+ *  stays a pure projection and the caller decides where the rows come from. */
+export type FormationStepsLookup = (entityKey: string) => FormationRequestRecord[];
+
+/**
+ * What a tenant is told about their entity's formation (design §5/§8) — DERIVED from the sub-saga
+ * rows, never stored, so it cannot drift from the rows the sweeper actually drives.
+ *
+ *   none         nothing has been opened (a legacy/stub entity, or a filing not yet started)
+ *   in_progress  opened, nothing legally true yet — doola has the request
+ *   filed        the STATE has filed it: the company legally exists
+ *   complete     the EIN has been issued: the entity is fully formed
+ *   failed       nothing was filed and the step that would have filed it is in error
+ */
+export type FormationStatus = "none" | "in_progress" | "filed" | "complete" | "failed";
+
+/**
+ * The projection, in the ONE order that keeps it honest.
+ *
+ * `filed` and `complete` are checked BEFORE `failed`, deliberately: an entity whose company was
+ * filed but whose document fetch failed IS a filed company, and reporting it as "failed" would
+ * deny a legal fact that already exists in Wyoming's records. Conversely an entity whose
+ * `create_provider` failed has nothing confirmed at all, so it falls through to `failed` —
+ * which is the honest answer, and the one the ops trail agrees with.
+ */
+export function deriveFormationStatus(steps: FormationRequestRecord[]): FormationStatus {
+  if (steps.length === 0) return "none";
+  const state = (step: FormationRequestRecord["step"]) => steps.find((s) => s.step === step)?.state;
+  if (state("await_ein") === "confirmed") return "complete";
+  if (state("await_filing") === "confirmed" || state("fetch_documents") === "confirmed")
+    return "filed";
+  if (steps.some((s) => s.state === "failed" || s.state === "abandoned")) return "failed";
+  return "in_progress";
+}
 
 /** Secret-free projection of an EntityRecord for API responses. */
 export interface EntityView {
@@ -47,19 +83,38 @@ export interface EntityView {
         /** The single in-flight version's hash, or null when nothing is pending. */
         pendingHash: string | null;
       };
-  /** Formation (design §2). NULL = stub, forever — the shape every legacy row keeps and the
+  /** Formation (design §2/§8). NULL = stub, forever — the shape every legacy row keeps and the
    *  shape every credential-less deployment serves. `environment` is REQUIRED whenever this is
    *  present (honesty invariant): a sandbox filing can never render as a real one by omission.
-   *  PR 1 ships the skeleton only, so `status` is always "none"; PR 2 fills it from the
-   *  formation sub-saga. NO PII is ever served here. */
+   *  NO PII is ever served here — not a name, not an address, not an email. */
   formation: {
     provider: string;
     environment: DoolaEnvironment;
-    status: "none";
+    status: FormationStatus;
+    /** doola's company id. An opaque provider reference — not PII, and the id an operator needs
+     *  to find this entity in doola's portal. */
+    providerRef: string | null;
+    /** Unix seconds the STATE filed the company. Null until it has. */
+    filedAt: number | null;
+    filingNumber: string | null;
+    /**
+     * ⚠ AUTHENTICATED VIEWS ONLY. The EIN is a tax identifier: it belongs to the entity's owner
+     * and to nobody else. It reaches this projection — which serves GET /entities and the MCP
+     * read tools, both tenant-scoped — and it must NEVER reach `/transparency` or `/metadata`,
+     * which are unauthenticated. Both of those build their own row shapes, and a test asserts
+     * neither can grow this field.
+     */
+    ein: string | null;
   } | null;
 }
 
-export function toEntityView(r: EntityRecord): EntityView {
+/**
+ * The single choke point for everything a tenant is told about an entity.
+ *
+ * `formationSteps` is optional so every pre-formation caller compiles unchanged; absent, a
+ * record simply reports the status its own columns can prove, which is `none`.
+ */
+export function toEntityView(r: EntityRecord, formationSteps?: FormationStepsLookup): EntityView {
   return {
     id: r.idempotencyKey,
     name: r.name,
@@ -99,7 +154,15 @@ export function toEntityView(r: EntityRecord): EntityView {
         ? {
             provider: r.formationProvider,
             environment: r.formationEnvironment,
-            status: "none",
+            status: deriveFormationStatus(formationSteps?.(r.idempotencyKey) ?? []),
+            providerRef:
+              formationSteps?.(r.idempotencyKey)?.find((s) => s.step === "create_provider")
+                ?.providerRef ?? null,
+            filedAt: r.formationFiledAt ?? null,
+            filingNumber: r.formationFilingNumber ?? null,
+            // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain
+            // at mint and is never served as a legal fact.
+            ein: r.einReal ?? null,
           }
         : null,
   };

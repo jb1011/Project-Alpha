@@ -216,10 +216,14 @@ export default function TransparencyPage() {
             </h2>
             <p className="mt-4 max-w-2xl text-[15px] leading-[1.65] text-muted">
               These are testnet figures from a guarded beta, not vanity
-              metrics. Legal formation is simulated until Arc mainnet; the
-              on-chain governance, identity, and USDC settlement around each
-              entity are real and independently checkable. This page will carry
-              the same role on mainnet: if we claim it, you can verify it.
+              metrics. Legal formation runs through our filing provider&rsquo;s
+              sandbox until Arc mainnet: the paperwork is really generated from
+              our data, but it comes back watermarked as a demo, so no Wyoming
+              company exists behind a testnet entity. On mainnet the same path
+              files for real. The on-chain governance, identity, and USDC
+              settlement around each entity are real and independently
+              checkable today. This page will carry the same role on mainnet:
+              if we claim it, you can verify it.
             </p>
           </div>
         </section>

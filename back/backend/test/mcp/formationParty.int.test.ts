@@ -115,7 +115,7 @@ function buildTestApp(
           maxPerTenant: formation.maxPerTenant ?? 3,
           dailyCeiling: 10,
           parties,
-          quota: new SqliteFormationRepository(db),
+          requests: new SqliteFormationRepository(db),
         }
       : undefined,
   } as never);

@@ -67,6 +67,9 @@ export interface McpToolDeps {
    *  requirement, the PII intake policy, the spend limits and the two repositories. Absent =
    *  this deployment forms nothing, and neither the tool nor the gate exists. */
   formation?: import("../api/app").ApiDeps["formation"];
+  /** Formation progress for the read tools' views — the same top-level dep ApiDeps carries, and
+   *  present independently of `formation` for the same reason. */
+  formationSteps?: import("../api/views").FormationStepsLookup;
 }
 
 /**
@@ -134,7 +137,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       // attempt fails uniformly and never burns the owner's code).
       if (!deps.linkCodes.consume(scope.tenantId, linkCode, Date.now()))
         return { content: [{ type: "text", text: "invalid or expired link code" }], isError: true };
-      const entities = repo.listByTenant(scope.tenantId).map(toEntityView);
+      const entities = repo
+        .listByTenant(scope.tenantId)
+        .map((r) => toEntityView(r, deps.formationSteps));
       return {
         content: [
           {
@@ -172,7 +177,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const views = repo
         .listByTenant(tenantId)
         .filter((e) => entityInScope(scope, e.idempotencyKey)) // an entity-scoped key lists only its entity
-        .map(toEntityView);
+        .map((r) => toEntityView(r, deps.formationSteps));
       return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );
@@ -188,7 +193,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const rec = repo.findByIdempotencyKey(id);
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
-      return { content: [{ type: "text", text: JSON.stringify(toEntityView(rec)) }] };
+      return {
+        content: [{ type: "text", text: JSON.stringify(toEntityView(rec, deps.formationSteps)) }],
+      };
     },
   );
 

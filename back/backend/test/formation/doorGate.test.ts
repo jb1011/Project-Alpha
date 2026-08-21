@@ -60,7 +60,7 @@ function deps(over: { required?: boolean; maxPerTenant?: number; dailyCeiling?: 
       maxPerTenant: over.maxPerTenant ?? 3,
       dailyCeiling: over.dailyCeiling ?? 10,
       parties,
-      quota,
+      requests: quota,
     },
     now: () => NOW,
   };
