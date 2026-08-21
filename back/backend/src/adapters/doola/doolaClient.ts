@@ -4,11 +4,13 @@ import type {
   CreateCompanyInput,
   CreateCustomerInput,
   DoolaCompany,
+  DoolaCompanyPage,
   DoolaComplianceEvent,
   DoolaCustomer,
   DoolaDocument,
   DoolaDocumentDownload,
   DoolaErrorEnvelope,
+  DoolaPlaygroundResult,
   DoolaRequiredAction,
 } from "./types";
 
@@ -98,15 +100,20 @@ export interface DoolaApi {
   /** Idempotency-Key honored. */
   createCompany(input: CreateCompanyInput, idempotencyKey: string): Promise<DoolaCompany>;
   getCompany(companyId: string): Promise<DoolaCompany>;
+  /** Pre-create lookup fallback (completeness 9): "did a create we lost the answer to actually
+   *  land?". Scoped to OUR customer id, which we mint one-per-entity, so anything it returns
+   *  belongs to the entity that is asking. */
+  listCompanies(customerId: string): Promise<DoolaCompany[]>;
   listDocuments(companyId: string): Promise<DoolaDocument[]>;
   getDocumentDownloadUrl(companyId: string, documentId: string): Promise<DoolaDocumentDownload>;
   listRequiredActions(companyId: string): Promise<DoolaRequiredAction[]>;
   getComplianceCalendar(companyId: string): Promise<DoolaComplianceEvent[]>;
-  /** SANDBOX ONLY: force the formation to complete. Refused against production by construction. */
-  playgroundCompleteFormation(companyId: string): Promise<void>;
+  /** SANDBOX ONLY: force the formation to complete. Refused against production by construction.
+   *  Resolves with the webhook events the call actually fired (`triggeredEvents`). */
+  playgroundCompleteFormation(companyId: string): Promise<DoolaPlaygroundResult | undefined>;
   /** SANDBOX ONLY: force EIN issuance. NOTE: `company_ein_issued` fires on FIRST issuance only —
    *  a repeat re-fires the document-letter event, not the EIN event. */
-  playgroundCompleteEin(companyId: string): Promise<void>;
+  playgroundCompleteEin(companyId: string): Promise<DoolaPlaygroundResult | undefined>;
 }
 
 export interface DoolaClientConfig {
@@ -121,6 +128,18 @@ export interface DoolaClientConfig {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Every partner endpoint lives under this prefix — verified against doola's published OpenAPI
+ * document and the live sandbox (`GET https://api.test.doola.com/companies` answers
+ * `NoHandlerFoundException`, i.e. a 404, not an empty list).
+ *
+ * It belongs to the CLIENT, not to `DOOLA_BASE_URLS`, because it is part of the API's shape
+ * rather than part of where the API is hosted: an operator pointing `DOOLA_BASE_URL` at a mock
+ * or a replay proxy is redirecting the HOST, and should not have to know — or be able to get
+ * wrong — the route prefix underneath it.
+ */
+const API_PREFIX = "/v1/partner";
 
 /**
  * Hard ceiling on ONE response body. doola's largest legitimate JSON payload is a document list;
@@ -295,53 +314,75 @@ export function buildDoolaApi(cfg: DoolaClientConfig): DoolaApi {
 
   return {
     async createCustomer(input, idempotencyKey) {
-      return await callPayload<DoolaCustomer>("POST", "/customers", {
+      return await callPayload<DoolaCustomer>("POST", `${API_PREFIX}/customers`, {
         body: input,
         idempotencyKey,
       });
     },
     async createCompany(input, idempotencyKey) {
-      return await callPayload<DoolaCompany>("POST", "/companies", { body: input, idempotencyKey });
+      return await callPayload<DoolaCompany>("POST", `${API_PREFIX}/companies`, {
+        body: input,
+        idempotencyKey,
+      });
     },
     async getCompany(companyId) {
-      return await callPayload<DoolaCompany>("GET", `/companies/${companyId}`);
+      return await callPayload<DoolaCompany>("GET", `${API_PREFIX}/companies/${companyId}`);
+    },
+    async listCompanies(customerId) {
+      // A PAGED envelope, not a bare array: `payload.content`. We ask for the maximum page size
+      // and read the first page only — one entity mints one customer, so "more than 100
+      // companies under this customer" is not a state this integration can produce.
+      const page = await callPayload<DoolaCompanyPage | null>(
+        "GET",
+        `${API_PREFIX}/companies?customerId=${encodeURIComponent(customerId)}&size=100`,
+      );
+      return page?.content ?? [];
     },
     async listDocuments(companyId) {
       // `payload: null` is a legitimate empty list; a MISSING envelope already threw above.
       return (
-        (await callPayload<DoolaDocument[] | null>("GET", `/companies/${companyId}/documents`)) ??
-        []
+        (await callPayload<DoolaDocument[] | null>(
+          "GET",
+          `${API_PREFIX}/companies/${companyId}/documents`,
+        )) ?? []
       );
     },
     async getDocumentDownloadUrl(companyId, documentId) {
       return await callPayload<DoolaDocumentDownload>(
         "GET",
-        `/companies/${companyId}/documents/${documentId}/download`,
+        `${API_PREFIX}/companies/${companyId}/documents/${documentId}`,
       );
     },
     async listRequiredActions(companyId) {
       return (
         (await callPayload<DoolaRequiredAction[] | null>(
           "GET",
-          `/companies/${companyId}/required-actions`,
+          `${API_PREFIX}/companies/${companyId}/required-actions`,
         )) ?? []
       );
     },
     async getComplianceCalendar(companyId) {
-      return (
-        (await callPayload<DoolaComplianceEvent[] | null>(
-          "GET",
-          `/companies/${companyId}/compliance-calendar`,
-        )) ?? []
+      const cal = await callPayload<{ events?: DoolaComplianceEvent[] | null } | null>(
+        "GET",
+        `${API_PREFIX}/companies/${companyId}/compliance/calendar`,
       );
+      return cal?.events ?? [];
     },
     async playgroundCompleteFormation(companyId) {
       assertSandbox("playgroundCompleteFormation");
-      await call("POST", `/playground/companies/${companyId}/complete-formation`);
+      const { parsed } = await call(
+        "POST",
+        `${API_PREFIX}/playground/companies/${companyId}/formation/complete`,
+      );
+      return (parsed as { payload?: DoolaPlaygroundResult } | undefined)?.payload;
     },
     async playgroundCompleteEin(companyId) {
       assertSandbox("playgroundCompleteEin");
-      await call("POST", `/playground/companies/${companyId}/complete-ein`);
+      const { parsed } = await call(
+        "POST",
+        `${API_PREFIX}/playground/companies/${companyId}/eincreation/complete`,
+      );
+      return (parsed as { payload?: DoolaPlaygroundResult } | undefined)?.payload;
     },
   };
 }

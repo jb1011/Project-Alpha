@@ -58,13 +58,45 @@ const CUSTOMER = {
   firstName: "Ada",
   lastName: "Lovelace",
   email: "ada@example.com",
-  address: {
-    line1: "1 Analytical Way",
-    city: "Cheyenne",
-    region: "WY",
-    postalCode: "82001",
-    country: "USA",
+  countryOfResidence: "USA",
+};
+
+const ADDRESS = {
+  line1: "1 Analytical Way",
+  city: "Cheyenne",
+  state: "WY",
+  postalCode: "82001",
+  country: "USA",
+};
+
+/** A minimal-but-COMPLETE company create: the API requires addresses, description,
+ *  doolaCustomerId, nameOptions, responsibleParty and state, and members for an LLC. */
+const COMPANY = {
+  doolaCustomerId: "cus_1",
+  entityType: "LLC" as const,
+  state: "WY",
+  nameOptions: [{ name: "Novi Agent", entityTypeEnding: "LLC", position: 1 }],
+  industry: "Software development",
+  description: "An autonomous agent legal body.",
+  responsibleParty: {
+    legalFirstName: "Ada",
+    legalLastName: "Lovelace",
+    email: "ada@example.com",
+    address: ADDRESS,
   },
+  addresses: [
+    { provider: "registeredAgent" as const, type: "mailing" as const },
+    { provider: "registeredAgent" as const, type: "business" as const },
+  ],
+  members: [
+    {
+      legalFirstName: "Ada",
+      legalLastName: "Lovelace",
+      isNaturalPerson: true,
+      address: ADDRESS,
+      ownershipPercent: 100,
+    },
+  ],
 };
 
 test("the API key is sent RAW in Authorization — never with a Bearer prefix", async () => {
@@ -90,11 +122,9 @@ test("Idempotency-Key is set on the two CREATE endpoints and on NOTHING else", a
   });
 
   await api.createCustomer(CUSTOMER, "key-customer");
-  await api.createCompany(
-    { customerId: "cus_1", nameOptions: ["Novi Agent LLC"], entityType: "LLC", state: "WY" },
-    "key-company",
-  );
+  await api.createCompany(COMPANY, "key-company");
   await api.getCompany("cmp_1");
+  await api.listCompanies("cus_1");
   await api.listDocuments("cmp_1");
   await api.getDocumentDownloadUrl("cmp_1", "doc_1");
   await api.listRequiredActions("cmp_1");
@@ -104,11 +134,11 @@ test("Idempotency-Key is set on the two CREATE endpoints and on NOTHING else", a
 
   const withKey = calls.filter((c) => c.headers["Idempotency-Key"] !== undefined);
   expect(withKey.map((c) => c.url)).toEqual([
-    "https://doola.test/customers",
-    "https://doola.test/companies",
+    "https://doola.test/v1/partner/customers",
+    "https://doola.test/v1/partner/companies",
   ]);
   expect(withKey.map((c) => c.headers["Idempotency-Key"])).toEqual(["key-customer", "key-company"]);
-  expect(calls).toHaveLength(9);
+  expect(calls).toHaveLength(10);
 });
 
 test("request shape: creates POST JSON, reads GET, ISO-3 country and 2-letter state survive", async () => {
@@ -120,16 +150,21 @@ test("request shape: creates POST JSON, reads GET, ISO-3 country and 2-letter st
     fetchImpl,
   });
   await api.createCustomer(CUSTOMER, "k");
-  const sent = JSON.parse(calls[0]!.body!);
+  const sentCustomer = JSON.parse(calls[0]!.body!);
   expect(calls[0]!.method).toBe("POST");
   expect(calls[0]!.headers["Content-Type"]).toBe("application/json");
-  expect(sent.address.country).toBe("USA"); // alpha-3, not "US"
-  expect(sent.address.region).toBe("WY"); // 2-letter state
+  expect(sentCustomer.countryOfResidence).toBe("USA"); // alpha-3, not "US"
+
+  await api.createCompany(COMPANY, "k2");
+  const sentCompany = JSON.parse(calls[1]!.body!);
+  expect(sentCompany.state).toBe("WY"); // 2-letter formation state
+  expect(sentCompany.responsibleParty.address.country).toBe("USA"); // alpha-3, not "US"
+  expect(sentCompany.responsibleParty.address.state).toBe("WY"); // 2-letter state
 
   await api.getCompany("cmp_1");
-  expect(calls[1]!.method).toBe("GET");
-  expect(calls[1]!.body).toBeUndefined();
-  expect(calls[1]!.headers["Content-Type"]).toBeUndefined();
+  expect(calls[2]!.method).toBe("GET");
+  expect(calls[2]!.body).toBeUndefined();
+  expect(calls[2]!.headers["Content-Type"]).toBeUndefined();
 });
 
 test("errors map to DoolaApiError carrying code + requestId; validation != internal", async () => {
@@ -154,7 +189,7 @@ test("errors map to DoolaApiError carrying code + requestId; validation != inter
     fetchImpl: validation.fetchImpl,
   });
   const err = (await api
-    .createCompany({ customerId: "c", nameOptions: [], entityType: "LLC", state: "WY" }, "k")
+    .createCompany({ ...COMPANY, nameOptions: [] }, "k")
     .catch((e) => e)) as DoolaApiError;
   expect(err).toBeInstanceOf(DoolaApiError);
   expect(err.code).toBe("E_VALIDATION_FAILED");
@@ -215,7 +250,7 @@ test("the base URL comes from the environment, and an explicit override wins", a
     const { fetchImpl, calls } = fakeFetch([{ status: 200, body: { payload: {} } }]);
     const api = buildDoolaApi({ apiKey: "dk", baseUrl: host, environment, fetchImpl });
     await api.getCompany("cmp_1");
-    expect(calls[0]!.url).toBe(`${host}/companies/cmp_1`);
+    expect(calls[0]!.url).toBe(`${host}/v1/partner/companies/cmp_1`);
   }
   // A trailing slash on the configured host must not produce a double slash in the path.
   const { fetchImpl, calls } = fakeFetch([{ status: 200, body: { payload: {} } }]);
@@ -226,7 +261,7 @@ test("the base URL comes from the environment, and an explicit override wins", a
     fetchImpl,
   });
   await api.getCompany("cmp_1");
-  expect(calls[0]!.url).toBe("https://doola.test/companies/cmp_1");
+  expect(calls[0]!.url).toBe("https://doola.test/v1/partner/companies/cmp_1");
 });
 
 test("playground calls are SANDBOX-ONLY and refuse a production-pinned client", async () => {
@@ -244,7 +279,7 @@ test("playground calls are SANDBOX-ONLY and refuse a production-pinned client", 
 
 test("list reads unwrap doola's payload envelope; a null payload is an empty list", async () => {
   const { fetchImpl } = fakeFetch([
-    { status: 200, body: { payload: [{ id: "doc_1", type: "OperatingAgreement" }] } },
+    { status: 200, body: { payload: [{ id: "doc_1", documentType: "OperatingAgreement" }] } },
     { status: 200, body: { payload: null } },
   ]);
   const api = buildDoolaApi({
@@ -253,10 +288,45 @@ test("list reads unwrap doola's payload envelope; a null payload is an empty lis
     environment: "sandbox",
     fetchImpl,
   });
-  expect(await api.listDocuments("cmp_1")).toEqual([{ id: "doc_1", type: "OperatingAgreement" }]);
+  expect(await api.listDocuments("cmp_1")).toEqual([
+    { id: "doc_1", documentType: "OperatingAgreement" },
+  ]);
   // `payload: null` is doola saying "nothing yet" — an ENVELOPE with no content, which is a
   // different thing from a body with no envelope (that one throws, below).
   expect(await api.listRequiredActions("cmp_1")).toEqual([]);
+});
+
+test("listCompanies unwraps the PAGED envelope and scopes the query to our customer", async () => {
+  const { fetchImpl, calls } = fakeFetch([
+    {
+      status: 200,
+      body: {
+        payload: { content: [{ doolaCompanyId: "cmp_1", name: "Novi Agent LLC" }], total: 1 },
+      },
+    },
+    { status: 200, body: { payload: { content: null, total: 0 } } },
+    { status: 200, body: { payload: null } },
+  ]);
+  const api = buildDoolaApi({
+    apiKey: "dk",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+
+  // The pre-create lookup fallback (completeness 9) rests on this: companies come back under
+  // `payload.content`, NOT as a bare array — reading it as an array would silently find nothing
+  // and re-file a company doola had already created.
+  expect(await api.listCompanies("cus_1")).toEqual([
+    { doolaCompanyId: "cmp_1", name: "Novi Agent LLC" },
+  ]);
+  expect(calls[0]!.url).toBe("https://doola.test/v1/partner/companies?customerId=cus_1&size=100");
+  expect(calls[0]!.headers["Idempotency-Key"]).toBeUndefined();
+
+  // An empty page and a null payload both mean "doola created nothing for this customer" — the
+  // ONLY answer that may lead the saga to file.
+  expect(await api.listCompanies("cus_1")).toEqual([]);
+  expect(await api.listCompanies("cus_1")).toEqual([]);
 });
 
 test("every call is deadline-bounded — a hung socket cannot wedge the entity lock", async () => {
