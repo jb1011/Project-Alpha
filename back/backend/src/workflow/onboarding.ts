@@ -4,13 +4,14 @@ import type { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { buildWalletSetTypedData } from "../adapters/arc/walletSet";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
+import type { MetadataAnchor } from "../oa/generator";
 import { computeOaHash, renderMetadata, renderOperatingAgreement } from "../oa/generator";
 import {
   OA_MANIFEST_VERSION_V1,
   buildManifestV1,
   manifestDocName,
   manifestHash,
-  serializeManifest,
+  serializeManifestBytes,
   termsDocName,
 } from "../oa/manifest";
 import type { DocumentStore } from "../persistence/documentStore";
@@ -107,23 +108,31 @@ export interface OnboardingDeps {
  * Which OA anchoring scheme this record derives its `oa_hash` under (design §4, completeness 1).
  *
  * The manifest scheme applies to NEW entities. The one record that must NOT be upgraded is one
- * caught mid-onboarding by the deploy: it has already BROADCAST `createEntity` with the legacy
- * doc hash as an argument, so re-deriving the anchor on resume would silently diverge the DB
- * from the chain — a permanently unverifiable entity, and exactly the failure the split
- * broadcast/confirm window exists to prevent.
+ * caught mid-onboarding by the deploy: it may already have derived a legacy doc hash — and, in
+ * the worst case, BROADCAST `createEntity` with it as an argument — so re-deriving the anchor on
+ * resume would silently diverge the DB from the chain: a permanently unverifiable entity, and
+ * exactly the failure the split broadcast/confirm window exists to prevent.
  *
- * The commitment is therefore sticky in BOTH directions: a record that already wrote a manifest
- * hash keeps the manifest scheme even after its own create tx is broadcast (otherwise the
- * translating-resume would flip it back to legacy and diverge in the other direction), and a
- * record that broadcast without one keeps the legacy derivation forever.
+ * The decision is therefore:
+ *   1. a MANIFEST MARKER (an anchored version or a pending hash) -> manifest, always. This is
+ *      what keeps a manifest record on the manifest scheme after its own create tx is broadcast;
+ *      without it the translating-resume would flip back to legacy and diverge the other way.
+ *   2. otherwise, manifest iff the record has NO `oa_hash` yet — i.e. it is genuinely new
+ *      (absent, or claimed/provisioned, both of which carry a null hash).
+ *
+ * Rule 2 is keyed on `oa_hash`, NOT on `createTxHash`, because the two are written at different
+ * moments. A pre-upgrade record could sit at status 'translating' with a legacy `oa_hash`
+ * persisted and its create tx broadcast-but-not-yet-persisted (the saga persists the hash after
+ * the broadcast returns). Keyed on `createTxHash`, that record read as "new" on resume, adopted
+ * the manifest scheme, and re-derived a different anchor — while the chain already held the
+ * legacy one. `oa_hash` closes that window because it is written FIRST: a record that has one
+ * has already committed to a derivation, whatever stage its tx is at.
  */
 export function usesManifestScheme(
-  rec:
-    | Pick<EntityRecord, "createTxHash" | "oaManifestVersion" | "oaManifestPendingHash">
-    | undefined,
+  rec: Pick<EntityRecord, "oaHash" | "oaManifestVersion" | "oaManifestPendingHash"> | undefined,
 ): boolean {
   if (rec?.oaManifestVersion != null || rec?.oaManifestPendingHash != null) return true;
-  return rec?.createTxHash == null;
+  return rec?.oaHash == null;
 }
 
 /**
@@ -334,20 +343,38 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     });
     let oaHash: Hex;
     let docPut: { path: string };
+    let anchor: MetadataAnchor = { scheme: "document" };
     let manifestPendingHash: Hex | null = rec?.oaManifestPendingHash ?? null;
     if (manifestScheme) {
-      const manifest = buildManifestV1(d.spec, resolved, publicId, {
-        chainId: d.arc.chainId,
-        entityKey: key,
-      });
-      oaHash = manifestHash(manifest);
-      docPut = d.docStore.put(termsDocName(key, OA_MANIFEST_VERSION_V1), doc);
-      // Bytes, not a string: the manifest is HASHED, so it goes through the atomic writer — a
-      // torn file whose hash is anchored is permanently unverifiable (audit M7).
-      d.docStore.putBytes(
-        manifestDocName(key, OA_MANIFEST_VERSION_V1),
-        Buffer.from(serializeManifest(manifest), "utf8"),
+      // STORE THE BYTES THAT ARE HASHED. `computeOaHash` hashes the NFC-normalized form (the
+      // canonical form its doc-comment fixes), so storing the raw render would leave a terms doc
+      // on disk whose keccak is NOT the `terms.hash` inside the manifest whenever the spec name
+      // arrives decomposed — a verifier re-hashing the published document would get a mismatch
+      // and be right. Normalizing here makes the stored bytes and the hashed bytes the same
+      // bytes, which is the only version of "verifiable" that means anything.
+      const termsDoc = doc.normalize("NFC");
+      const manifest = buildManifestV1(
+        d.spec,
+        resolved,
+        publicId,
+        { chainId: d.arc.chainId, entityKey: key },
+        termsDoc,
       );
+      // ONE serialization: the same buffer is hashed and written, so the file on disk cannot
+      // fail to re-hash to the anchor. Bytes, not a string, so it takes the atomic writer — a
+      // torn file whose hash is anchored is permanently unverifiable (audit M7).
+      const manifestBytes = serializeManifestBytes(manifest);
+      oaHash = manifestHash(manifestBytes);
+      docPut = d.docStore.put(termsDocName(key, OA_MANIFEST_VERSION_V1), termsDoc);
+      d.docStore.putBytes(manifestDocName(key, OA_MANIFEST_VERSION_V1), manifestBytes);
+      // Published so a verifier holding only the chain can tell WHAT the anchor commits to and
+      // where both artifacts live (design §4, M16).
+      anchor = {
+        scheme: "manifest",
+        version: OA_MANIFEST_VERSION_V1,
+        manifestUri: `novi:doc:${manifestDocName(key, OA_MANIFEST_VERSION_V1)}`,
+        termsUri: `novi:doc:${termsDocName(key, OA_MANIFEST_VERSION_V1)}`,
+      };
       // v1 is PENDING until createEntity confirms; the create-confirm below promotes it to
       // anchored. This is also the sticky marker that keeps a resumed record on this scheme.
       manifestPendingHash = oaHash;
@@ -355,7 +382,7 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       oaHash = computeOaHash(doc);
       docPut = d.docStore.put(`oa-${key}.md`, doc);
     }
-    const meta = renderMetadata(d.spec, resolved, oaHash);
+    const meta = renderMetadata(d.spec, resolved, oaHash, anchor);
     d.docStore.put(`meta-${key}.json`, JSON.stringify(meta, null, 2)); // written for the public route to serve
 
     rec = {
@@ -425,14 +452,20 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   if (rec.status === "translating") {
     let createTxHash = rec.createTxHash;
     if (!createTxHash) {
+      // Under the MANIFEST scheme the on-chain `meta.ein` / `meta.formationDate` are explicit
+      // EMPTY placeholders (design §4). They are frozen at initialize, read by nothing on-chain,
+      // and superseded by the manifest's `legal` block — so writing a plausible-looking
+      // "STUB-NOT-FILED" and a fabricated 0-date as if they were facts would put unverified
+      // legal claims on a permanent record. Legacy rows keep exactly what they always wrote.
+      const manifestAnchored = usesManifestScheme(rec);
       createTxHash = await d.arc.broadcastCreateEntity({
         manager: rec.manager,
         guardian: rec.guardian,
         operator: rec.operator!,
         amendmentDelay: BigInt(rec.amendmentDelay),
         metadataURI: rec.metadataURI!,
-        ein: rec.ein,
-        formationDate: rec.formationDate,
+        ein: manifestAnchored ? "" : rec.ein,
+        formationDate: manifestAnchored ? 0 : rec.formationDate,
         operatingAgreementHash: rec.oaHash!,
         treasury: rec.treasuryConfig!,
       });

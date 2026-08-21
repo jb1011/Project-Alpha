@@ -1,8 +1,8 @@
-import { type Hex, keccak256, toHex } from "viem";
+import { type Hex, keccak256 } from "viem";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { TranslateResult } from "../policy/translator";
-import { computeOaHash, renderOperatingAgreement } from "./generator";
+import { computeOaHash } from "./generator";
 
 /**
  * The OA bundle manifest (design 2026-08-19 §4) — the B+ core.
@@ -91,9 +91,25 @@ export function serializeManifest(manifest: Canonicalizable): string {
   return `${canonicalizeJcs(manifest as JsonValue)}\n`;
 }
 
-/** The on-chain anchor: keccak256 over the canonical UTF-8 bytes (trailing newline included). */
-export function manifestHash(manifest: Canonicalizable): Hex {
-  return keccak256(toHex(serializeManifest(manifest)));
+/** The canonical bytes, as UTF-8 — what gets written to disk AND what gets hashed. */
+export function serializeManifestBytes(manifest: Canonicalizable): Buffer {
+  return Buffer.from(serializeManifest(manifest), "utf8");
+}
+
+/**
+ * The on-chain anchor: keccak256 over the canonical UTF-8 BYTES.
+ *
+ * It takes bytes, not a manifest, on purpose. The caller has to write those exact bytes to disk
+ * anyway, and a signature that took the object invited serializing twice — once to hash, once to
+ * store — with nothing but discipline keeping the two results identical. One serialization, one
+ * buffer, hashed and stored: "the file on disk re-hashes to the anchor" stops being a property
+ * that has to be tested and becomes one that cannot be violated.
+ *
+ * (Hashing the bytes directly also drops a UTF-8 -> hex -> bytes round trip that existed only to
+ * satisfy the old signature.)
+ */
+export function manifestHash(bytes: Uint8Array): Hex {
+  return keccak256(bytes);
 }
 
 // ── The v1 schema ───────────────────────────────────────────────────────────────────────────
@@ -162,8 +178,12 @@ export function buildManifestV1(
   r: TranslateResult,
   publicId: string,
   chain: ManifestChainMeta,
+  /** The terms doc the caller ALREADY rendered and is about to store. Passed in rather than
+   *  re-rendered here: a second render is a second chance for the stored document and the
+   *  document this manifest commits to to differ (a scheme flag, a spec mutation, a future
+   *  render option), and the whole value of `terms.hash` is that they cannot. */
+  termsDoc: string,
 ): OaBundleManifest {
-  const termsDoc = renderOperatingAgreement(spec, r, { scheme: "manifest" });
   return {
     schema: OA_MANIFEST_SCHEMA_V1,
     chain: { chainId: chain.chainId, legalManager: null, agentId: null },

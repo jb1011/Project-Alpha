@@ -30,11 +30,15 @@ export function renderOperatingAgreement(
     `# Operating Agreement — ${spec.name}`,
     "",
     `Jurisdiction: ${spec.jurisdiction}`,
-    // The EIN is a legal FACT, not a term. Under the manifest scheme it is carried by the
-    // manifest's `legal` block (and is the only carrier), so putting it here too would make an
-    // EIN issuance re-hash the terms doc for no change in what the parties agreed.
-    ...(manifestScheme ? [] : [`EIN: ${r.legal.ein}`]),
-    `Formation date (unix): ${r.legal.formationDate}`,
+    // The EIN and the formation date are legal FACTS, not terms. Under the manifest scheme both
+    // are carried by the manifest's `legal` block (its only carrier), so leaving either here
+    // would re-hash the terms doc when a filing completes — a version bump on a document whose
+    // terms nobody changed, which is precisely what the terms/facts split exists to avoid.
+    // (Under this scheme the on-chain `formationDate` is a 0 placeholder anyway: nothing is
+    // filed at mint, and the real date lands in the manifest, not on the frozen struct.)
+    ...(manifestScheme
+      ? []
+      : [`EIN: ${r.legal.ein}`, `Formation date (unix): ${r.legal.formationDate}`]),
     "",
     "## Roles",
     `- Manager (platform controller): ${r.manager}`,
@@ -72,6 +76,19 @@ export function computeOaHash(doc: string): Hex {
   return keccak256(toHex(doc.normalize("NFC")));
 }
 
+/**
+ * What `legalBody.oaHash` on the served metadata actually COMMITS to (design §4, M16).
+ *
+ * A verifier holding only the chain sees one 32-byte value and cannot tell whether it is the
+ * keccak of an operating-agreement document (every legacy row) or of an OA bundle manifest that
+ * in turn commits to the terms doc, the legal documents and the chain identity. Publishing the
+ * scheme — and, for the manifest scheme, WHERE the two artifacts live — is what makes the anchor
+ * checkable by someone who was not there when it was written.
+ */
+export type MetadataAnchor =
+  | { scheme: "document" }
+  | { scheme: "manifest"; version: number; manifestUri: string; termsUri: string };
+
 export interface AgentMetadata {
   name: string;
   description: string;
@@ -83,6 +100,8 @@ export interface AgentMetadata {
     formationDate: number;
     oaHash: Hex;
   };
+  /** How to interpret `legalBody.oaHash`. Legacy rows: `{ scheme: "document" }`. */
+  anchor: MetadataAnchor;
 }
 
 /**
@@ -92,7 +111,13 @@ export interface AgentMetadata {
  * not hashed — the operating-agreement document is the canonical artifact; oaHash is embedded here
  * only as a convenience pointer.
  */
-export function renderMetadata(spec: AgentSpec, r: TranslateResult, oaHash: Hex): AgentMetadata {
+export function renderMetadata(
+  spec: AgentSpec,
+  r: TranslateResult,
+  oaHash: Hex,
+  /** Defaults to the LEGACY meaning, which is what every pre-manifest caller intends. */
+  anchor: MetadataAnchor = { scheme: "document" },
+): AgentMetadata {
   return {
     name: spec.name,
     description: spec.metadata.description,
@@ -104,5 +129,6 @@ export function renderMetadata(spec: AgentSpec, r: TranslateResult, oaHash: Hex)
       formationDate: r.legal.formationDate,
       oaHash,
     },
+    anchor,
   };
 }

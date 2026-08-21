@@ -16,9 +16,12 @@ import {
   manifestDocName,
   manifestHash,
   serializeManifest,
+  serializeManifestBytes,
   termsDocName,
 } from "../../src/oa/manifest";
+import type { AgentSpec } from "../../src/policy/agentSpec";
 import { parseAgentSpec } from "../../src/policy/agentSpec";
+import type { TranslateResult } from "../../src/policy/translator";
 import { translate } from "../../src/policy/translator";
 
 const USDC = "0x3600000000000000000000000000000000000000" as const;
@@ -59,9 +62,14 @@ test("GOLDEN: a v1 manifest serializes to exactly these bytes and this anchor", 
   expect(Buffer.byteLength(GOLDEN_BYTES, "utf8")).toBe(373);
   // The anchor, pinned as a literal — if this value ever moves, every entity anchored under the
   // old one becomes unverifiable, so the change has to be a deliberate schema version bump.
-  expect(manifestHash(GOLDEN_MANIFEST)).toBe(GOLDEN_HASH);
+  // `manifestHash` takes the BYTES the caller is about to store, so the value under test is
+  // literally the file's keccak (review E4) — not a re-serialization that might differ.
+  expect(manifestHash(serializeManifestBytes(GOLDEN_MANIFEST))).toBe(GOLDEN_HASH);
   // …and the hash is genuinely keccak256 of THOSE bytes, not of whatever our serializer emitted.
   expect(keccak256(toHex(GOLDEN_BYTES))).toBe(GOLDEN_HASH);
+  expect(
+    Buffer.compare(serializeManifestBytes(GOLDEN_MANIFEST), Buffer.from(GOLDEN_BYTES, "utf8")),
+  ).toBe(0);
 });
 
 test("GOLDEN: input key order does not matter — the canonical form is one fixed byte string", () => {
@@ -79,7 +87,7 @@ test("GOLDEN: input key order does not matter — the canonical form is one fixe
     schema: "novi/oa-bundle/1",
   };
   expect(serializeManifest(shuffled)).toBe(GOLDEN_BYTES);
-  expect(manifestHash(shuffled)).toBe(GOLDEN_HASH);
+  expect(manifestHash(serializeManifestBytes(shuffled))).toBe(GOLDEN_HASH);
 });
 
 test("exactly ONE trailing newline, and it is inside the hashed bytes", () => {
@@ -87,7 +95,7 @@ test("exactly ONE trailing newline, and it is inside the hashed bytes", () => {
   expect(bytes.endsWith("}\n")).toBe(true);
   expect(bytes.endsWith("}\n\n")).toBe(false);
   expect(canonicalizeJcs(GOLDEN_MANIFEST)).not.toContain("\n"); // the raw JCS carries none
-  expect(manifestHash(GOLDEN_MANIFEST)).not.toBe(
+  expect(manifestHash(serializeManifestBytes(GOLDEN_MANIFEST))).not.toBe(
     keccak256(toHex(canonicalizeJcs(GOLDEN_MANIFEST))),
   );
 });
@@ -177,9 +185,26 @@ const SPEC_INPUT = {
 };
 const SPEC = parseAgentSpec(SPEC_INPUT);
 
+/** The terms doc every buildManifestV1 call below commits to — rendered ONCE by the caller, as
+ *  the saga does (review E4: a second render inside the builder is a second chance to diverge). */
+function termsFor(spec: AgentSpec, r: TranslateResult): string {
+  return renderOperatingAgreement(spec, r, { scheme: "manifest" }).normalize("NFC");
+}
+
+/** The anchor of a manifest, via the bytes that would be stored — the only path that exists. */
+function anchorOf(m: Parameters<typeof serializeManifestBytes>[0]) {
+  return manifestHash(serializeManifestBytes(m));
+}
+
 test("v1 carries the schema, a REAL chainId, and explicit nulls for what does not exist yet", () => {
   const r = translate(SPEC, { usdc: USDC });
-  const m = buildManifestV1(SPEC, r, "pub-1", { chainId: 5042002, entityKey: "ent-1" });
+  const m = buildManifestV1(
+    SPEC,
+    r,
+    "pub-1",
+    { chainId: 5042002, entityKey: "ent-1" },
+    termsFor(SPEC, r),
+  );
   expect(m.schema).toBe("novi/oa-bundle/1");
   expect(m.version).toBe(1);
   expect(m.chain.chainId).toBe(5042002); // domain separation: no cross-network replay (M9)
@@ -198,24 +223,56 @@ test("v1 carries the schema, a REAL chainId, and explicit nulls for what does no
   expect(m.terms.uri).toBe("novi:doc:oa-ent-1-v1.md");
 });
 
-test("terms.hash is the keccak of the terms doc the saga stores — one function, no drift", () => {
+test("terms.hash is the keccak of the terms doc the CALLER passed in — one document, no drift", () => {
   const r = translate(SPEC, { usdc: USDC });
-  const m = buildManifestV1(SPEC, r, "pub-1", { chainId: 5042002, entityKey: "ent-1" });
-  const doc = renderOperatingAgreement(SPEC, r, { scheme: "manifest" });
+  const doc = termsFor(SPEC, r);
+  const m = buildManifestV1(SPEC, r, "pub-1", { chainId: 5042002, entityKey: "ent-1" }, doc);
   expect(m.terms.hash).toBe(computeOaHash(doc));
-  // The LEGACY doc hashes differently (it carries the EIN line), which is exactly why an entity
-  // must never switch schemes mid-flight.
+  // The LEGACY doc hashes differently (it carries the EIN and formation-date lines), which is
+  // exactly why an entity must never switch schemes mid-flight.
   expect(m.terms.hash).not.toBe(computeOaHash(renderOperatingAgreement(SPEC, r)));
+});
+
+test("E2: the manifest terms doc carries NEITHER the EIN nor the formation date", () => {
+  const r = translate(SPEC, { usdc: USDC });
+  const doc = renderOperatingAgreement(SPEC, r, { scheme: "manifest" });
+  expect(doc).not.toContain("EIN:");
+  expect(doc).not.toContain("Formation date (unix):");
+  // Both are legal FACTS: they live in the manifest's `legal` block, so a completed filing moves
+  // exactly one hash (the manifest) and leaves `terms.uri` pointing at v1.
+  const legacy = renderOperatingAgreement(SPEC, r);
+  expect(legacy).toContain("EIN:");
+  expect(legacy).toContain("Formation date (unix):");
+  // Everything that IS a term is still there, in the same order.
+  for (const line of ["## Roles", "## Treasury policy", "## Governance"])
+    expect(doc).toContain(line);
+});
+
+test("E4: the anchor is keccak over the STORED bytes, with no hex round-trip", () => {
+  const r = translate(SPEC, { usdc: USDC });
+  const m = buildManifestV1(
+    SPEC,
+    r,
+    "pub-1",
+    { chainId: 5042002, entityKey: "ent-1" },
+    termsFor(SPEC, r),
+  );
+  const bytes = serializeManifestBytes(m);
+  expect(bytes.toString("utf8")).toBe(serializeManifest(m));
+  expect(manifestHash(bytes)).toBe(keccak256(bytes));
+  // Same value the old UTF-8 -> hex -> bytes path produced; the round trip was noise, not meaning.
+  expect(manifestHash(bytes)).toBe(keccak256(toHex(serializeManifest(m))));
 });
 
 test("the same inputs always produce the same anchor (no clock, no randomness)", () => {
   const r = translate(SPEC, { usdc: USDC });
-  const a = buildManifestV1(SPEC, r, "pub-1", { chainId: 5042002, entityKey: "ent-1" });
-  const b = buildManifestV1(SPEC, r, "pub-1", { chainId: 5042002, entityKey: "ent-1" });
-  expect(manifestHash(a)).toBe(manifestHash(b));
+  const doc = termsFor(SPEC, r);
+  const a = buildManifestV1(SPEC, r, "pub-1", { chainId: 5042002, entityKey: "ent-1" }, doc);
+  const b = buildManifestV1(SPEC, r, "pub-1", { chainId: 5042002, entityKey: "ent-1" }, doc);
+  expect(anchorOf(a)).toBe(anchorOf(b));
   // …and a DIFFERENT chain is a different anchor (M9 again, from the other side).
-  const other = buildManifestV1(SPEC, r, "pub-1", { chainId: 1, entityKey: "ent-1" });
-  expect(manifestHash(other)).not.toBe(manifestHash(a));
+  const other = buildManifestV1(SPEC, r, "pub-1", { chainId: 1, entityKey: "ent-1" }, doc);
+  expect(anchorOf(other)).not.toBe(anchorOf(a));
 });
 
 test("user-supplied text is NFC-normalized before it reaches the hash", () => {
@@ -223,16 +280,24 @@ test("user-supplied text is NFC-normalized before it reaches the hash", () => {
   // different bytes — and therefore a different keccak unless we normalize first.
   const decomposed = parseAgentSpec({ ...SPEC_INPUT, name: "Cafe\u0301 Agent" });
   const composed = parseAgentSpec({ ...SPEC_INPUT, name: "Caf\u00e9 Agent" });
-  const a = buildManifestV1(decomposed, translate(decomposed, { usdc: USDC }), "p", {
-    chainId: 1,
-    entityKey: "k",
-  });
-  const b = buildManifestV1(composed, translate(composed, { usdc: USDC }), "p", {
-    chainId: 1,
-    entityKey: "k",
-  });
+  const rd = translate(decomposed, { usdc: USDC });
+  const rc = translate(composed, { usdc: USDC });
+  const a = buildManifestV1(
+    decomposed,
+    rd,
+    "p",
+    { chainId: 1, entityKey: "k" },
+    termsFor(decomposed, rd),
+  );
+  const b = buildManifestV1(
+    composed,
+    rc,
+    "p",
+    { chainId: 1, entityKey: "k" },
+    termsFor(composed, rc),
+  );
   expect(a.entity.name).toBe("Caf\u00e9 Agent");
-  expect(manifestHash(a)).toBe(manifestHash(b));
+  expect(anchorOf(a)).toBe(anchorOf(b));
 });
 
 test("document names are versioned and stable", () => {
@@ -241,13 +306,19 @@ test("document names are versioned and stable", () => {
   expect(manifestDocName("ent-1", 3)).toBe("manifest-ent-1-v3.json");
 });
 
-test("the spec REFUSES a caller-supplied EIN — the manifest is the only carrier", () => {
+test("E5: the spec REFUSES a caller-supplied EIN — the manifest is the only carrier", () => {
+  // `legal` is `.strict()` and no longer HAS an `ein` field, so this is zod's own unrecognized-key
+  // refusal rather than a custom rule layered over a field we still advertise.
   expect(() => parseAgentSpec({ ...SPEC_INPUT, legal: { ein: "12-3456789" } })).toThrow(
-    /legal\.ein is not accepted/,
+    /Unrecognized key/,
   );
+  expect(() => parseAgentSpec({ ...SPEC_INPUT, legal: { ein: "12-3456789" } })).toThrow(/ein/);
   // A spec with no legal block, or with only a formation date, is still fine.
   expect(() => parseAgentSpec({ ...SPEC_INPUT, legal: {} })).not.toThrow();
   expect(() =>
     parseAgentSpec({ ...SPEC_INPUT, legal: { formationDate: "2026-08-19" } }),
   ).not.toThrow();
+  // And the EIN never reaches the terms doc from the caller's side, whatever they send.
+  const r = translate(SPEC, { usdc: USDC });
+  expect(r.legal.ein).toBe("STUB-NOT-FILED");
 });

@@ -18,7 +18,12 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ArcAdapter } from "../../src/adapters/arc/arcAdapter";
 import type { OperatorSigner } from "../../src/adapters/turnkey/signer";
 import { computeOaHash, renderOperatingAgreement } from "../../src/oa/generator";
-import { buildManifestV1, manifestHash, serializeManifest } from "../../src/oa/manifest";
+import {
+  buildManifestV1,
+  manifestHash,
+  serializeManifest,
+  serializeManifestBytes,
+} from "../../src/oa/manifest";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -120,7 +125,15 @@ test("a FRESH entity anchors the MANIFEST hash, not the doc hash", async () => {
   const r = translate(spec, { usdc: USDC });
   const resolved = { ...r, operator: fakeSigner.address as `0x${string}` };
   const expected = manifestHash(
-    buildManifestV1(spec, resolved, rec.publicId!, { chainId: CHAIN_ID, entityKey: "anchor-A" }),
+    serializeManifestBytes(
+      buildManifestV1(
+        spec,
+        resolved,
+        rec.publicId!,
+        { chainId: CHAIN_ID, entityKey: "anchor-A" },
+        renderOperatingAgreement(spec, resolved, { scheme: "manifest" }).normalize("NFC"),
+      ),
+    ),
   );
   expect(rec.oaHash).toBe(expected);
   // …and it is NOT the legacy derivation, which is the whole point of the change.
@@ -233,38 +246,83 @@ test("STICKY the other way: a manifest record that crashed after broadcast stays
   expect(arc.broadcastCreateEntity).toHaveBeenCalledTimes(1); // adopted, never re-minted
 });
 
-test("usesManifestScheme: the predicate itself, at each of its three decision points", () => {
+test("usesManifestScheme: the predicate itself, at each of its decision points", () => {
   expect(usesManifestScheme(undefined)).toBe(true); // brand-new record
+  // A claimed / provisioned row: no hash derived yet, so it is genuinely new.
   expect(
-    usesManifestScheme({
-      createTxHash: null,
-      oaManifestVersion: null,
-      oaManifestPendingHash: null,
-    }),
+    usesManifestScheme({ oaHash: null, oaManifestVersion: null, oaManifestPendingHash: null }),
   ).toBe(true);
-  // Broadcast without a manifest marker = a pre-upgrade record: legacy, forever.
+  // A hash already derived, with no manifest marker = a pre-upgrade record: legacy, forever.
   expect(
-    usesManifestScheme({
-      createTxHash: "0xabc",
-      oaManifestVersion: null,
-      oaManifestPendingHash: null,
-    }),
+    usesManifestScheme({ oaHash: "0xdoc", oaManifestVersion: null, oaManifestPendingHash: null }),
   ).toBe(false);
-  // Broadcast WITH a marker (either one) = a manifest record mid-window: still manifest.
+  // A marker (either one) = a manifest record mid-window: still manifest.
   expect(
     usesManifestScheme({
-      createTxHash: "0xabc",
+      oaHash: "0xman",
       oaManifestVersion: null,
       oaManifestPendingHash: "0xdead",
     }),
   ).toBe(true);
   expect(
+    usesManifestScheme({ oaHash: "0xman", oaManifestVersion: 1, oaManifestPendingHash: null }),
+  ).toBe(true);
+});
+
+test("F1: a LEGACY record mid-translate is legacy even with NO create tx persisted", () => {
+  // The window the old `createTxHash`-keyed rule missed. The saga persists the broadcast hash
+  // AFTER the broadcast call returns, so a pre-upgrade record can sit at 'translating' with a
+  // legacy oa_hash and a create tx that is already ON THE WIRE but not yet in the DB. Keyed on
+  // createTxHash, resume read that record as "new", adopted the manifest scheme and re-derived a
+  // different anchor — while the chain was about to record the legacy one.
+  expect(
     usesManifestScheme({
-      createTxHash: "0xabc",
-      oaManifestVersion: 1,
+      oaHash: "0xlegacy",
+      oaManifestVersion: null,
       oaManifestPendingHash: null,
     }),
-  ).toBe(true);
+  ).toBe(false);
+});
+
+test("F1 KEYSTONE: a legacy 'translating' row with NO create tx keeps the legacy hash on resume", async () => {
+  const r = translate(spec, { usdc: USDC });
+  const resolved = { ...r, operator: fakeSigner.address as `0x${string}` };
+  const legacyDoc = renderOperatingAgreement(spec, resolved);
+  const legacyHash = computeOaHash(legacyDoc);
+  const midTranslate: EntityRecord = {
+    idempotencyKey: "anchor-A",
+    name: spec.name,
+    status: "translating",
+    manager: r.manager,
+    guardian: r.guardian,
+    operator: resolved.operator,
+    amendmentDelay: r.amendmentDelay.toString(),
+    ein: r.legal.ein,
+    formationDate: r.legal.formationDate,
+    oaHash: legacyHash,
+    metadataURI: "https://host.example/backend/metadata/legacy-public-id",
+    publicId: "legacy-public-id",
+    docPath: docStore.put("oa-anchor-A.md", legacyDoc).path,
+    treasuryConfig: r.treasury,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null, // <- the broadcast is in flight; nothing persisted yet
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: "t1",
+    error: null,
+    specJson: JSON.stringify(spec),
+    perTxCap: null,
+  };
+  repo.upsert(midTranslate);
+
+  const rec = await runOnboarding(deps(makeFakeArc()));
+
+  expect(rec.oaHash).toBe(legacyHash); // the value the in-flight tx carries
+  expect(rec.oaManifestVersion).toBeNull();
+  expect(rec.oaManifestPendingHash).toBeNull();
+  expect(readdirSync(dir).sort()).toEqual(["meta-anchor-A.json", "oa-anchor-A.md"]);
 });
 
 // ── Formation pinning (custody twin) ────────────────────────────────────────────────────────
@@ -296,4 +354,128 @@ test("a PERSISTED environment wins over config — a flip cannot re-point an in-
   );
   expect(rec.formationEnvironment).toBe("sandbox");
   expect(repo.findByIdempotencyKey("anchor-A")?.formationEnvironment).toBe("sandbox");
+});
+
+// ── E1/E3/E6: what is stored, what is broadcast, what is served ─────────────────────────────
+
+test("E1: the STORED terms doc is the NFC-normalized form — its bytes re-hash to terms.hash", async () => {
+  // A decomposed spec name ("Cafe" + U+0301) is what a real wizard submission can contain.
+  // `computeOaHash` hashes the NFC form, so storing the raw render would leave a document on
+  // disk whose keccak does NOT match the `terms.hash` published inside the manifest — and a
+  // verifier who re-hashed the file we served them would be right to call it a mismatch.
+  // Written as an explicit escape so no editor or formatter can silently re-normalize it.
+  const decomposedSpec = { ...spec, name: "Cafe\u0301 Agent" } as AgentSpec;
+  await runOnboarding(deps(makeFakeArc(), { spec: decomposedSpec }));
+
+  const storedTerms = readFileSync(join(dir, "oa-anchor-A-v1.md"), "utf8");
+  const manifest = JSON.parse(readFileSync(join(dir, "manifest-anchor-A-v1.json"), "utf8"));
+  expect(storedTerms).toContain("Caf\u00e9 Agent"); // precomposed on disk
+  expect(storedTerms).not.toContain("Cafe\u0301 Agent"); // the decomposed form did NOT survive
+  expect(storedTerms.normalize("NFC")).toBe(storedTerms); // already canonical
+  // The load-bearing assertion: hash the file exactly as read, with no normalization step —
+  // which is all a third-party verifier will do.
+  expect(keccak256(toHex(storedTerms))).toBe(manifest.terms.hash);
+  // …and the raw render would NOT have matched, which is exactly why this matters.
+  const raw = renderOperatingAgreement(
+    decomposedSpec,
+    { ...translate(decomposedSpec, { usdc: USDC }), operator: fakeSigner.address as `0x${string}` },
+    { scheme: "manifest" },
+  );
+  expect(keccak256(toHex(raw))).not.toBe(manifest.terms.hash);
+});
+
+test("E3: a manifest-scheme createEntity broadcasts an EMPTY ein and formationDate 0", async () => {
+  const arc = makeFakeArc();
+  await runOnboarding(deps(arc));
+  // Both fields are frozen at initialize and read by nothing on-chain: under the manifest scheme
+  // they are superseded by `legal` (design §4), so writing a plausible "STUB-NOT-FILED" and a
+  // fabricated date would put unverified legal claims on a permanent record.
+  expect(arc.broadcastCreateEntity).toHaveBeenCalledWith(
+    expect.objectContaining({ ein: "", formationDate: 0 }),
+  );
+});
+
+test("E3: a LEGACY record still broadcasts exactly what it always did", async () => {
+  const r = translate(spec, { usdc: USDC });
+  const resolved = { ...r, operator: fakeSigner.address as `0x${string}` };
+  const legacyDoc = renderOperatingAgreement(spec, resolved);
+  repo.upsert({
+    idempotencyKey: "anchor-A",
+    name: spec.name,
+    status: "translating",
+    manager: r.manager,
+    guardian: r.guardian,
+    operator: resolved.operator,
+    amendmentDelay: r.amendmentDelay.toString(),
+    ein: r.legal.ein,
+    formationDate: r.legal.formationDate,
+    oaHash: computeOaHash(legacyDoc),
+    metadataURI: "https://host.example/backend/metadata/legacy-public-id",
+    publicId: "legacy-public-id",
+    docPath: docStore.put("oa-anchor-A.md", legacyDoc).path,
+    treasuryConfig: r.treasury,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: "t1",
+    error: null,
+    specJson: JSON.stringify(spec),
+    perTxCap: null,
+  });
+  const arc = makeFakeArc();
+  await runOnboarding(deps(arc));
+  expect(arc.broadcastCreateEntity).toHaveBeenCalledWith(
+    expect.objectContaining({ ein: "STUB-NOT-FILED", formationDate: r.legal.formationDate }),
+  );
+});
+
+test("E6: served metadata publishes the anchor SCHEME and both artifact URIs", async () => {
+  await runOnboarding(deps(makeFakeArc()));
+  const meta = JSON.parse(readFileSync(join(dir, "meta-anchor-A.json"), "utf8"));
+  // A verifier holding only the chain sees one 32-byte value; this is what tells them whether it
+  // commits to a document or to a bundle manifest, and where to find both halves.
+  expect(meta.anchor).toEqual({
+    scheme: "manifest",
+    version: 1,
+    manifestUri: "novi:doc:manifest-anchor-A-v1.json",
+    termsUri: "novi:doc:oa-anchor-A-v1.md",
+  });
+});
+
+test("E6: a LEGACY row serves the document scheme — the same field, honestly", async () => {
+  const r = translate(spec, { usdc: USDC });
+  const resolved = { ...r, operator: fakeSigner.address as `0x${string}` };
+  const legacyDoc = renderOperatingAgreement(spec, resolved);
+  repo.upsert({
+    idempotencyKey: "anchor-A",
+    name: spec.name,
+    status: "translating",
+    manager: r.manager,
+    guardian: r.guardian,
+    operator: resolved.operator,
+    amendmentDelay: r.amendmentDelay.toString(),
+    ein: r.legal.ein,
+    formationDate: r.legal.formationDate,
+    oaHash: computeOaHash(legacyDoc),
+    metadataURI: "https://host.example/backend/metadata/legacy-public-id",
+    publicId: "legacy-public-id",
+    docPath: docStore.put("oa-anchor-A.md", legacyDoc).path,
+    treasuryConfig: r.treasury,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: "t1",
+    error: null,
+    specJson: JSON.stringify(spec),
+    perTxCap: null,
+  });
+  await runOnboarding(deps(makeFakeArc()));
+  const meta = JSON.parse(readFileSync(join(dir, "meta-anchor-A.json"), "utf8"));
+  expect(meta.anchor).toEqual({ scheme: "document" });
 });

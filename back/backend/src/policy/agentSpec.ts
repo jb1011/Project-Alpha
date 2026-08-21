@@ -69,13 +69,17 @@ export const AgentSpecSchema = z
         "must be a duration >= 1h",
       ).default("24h"),
     }),
+    // `.strict()`: an unknown key here is REFUSED, not silently stripped. `ein` is the reason —
+    // the EIN is issued by the IRS and carried by the OA bundle manifest (design §4), never
+    // supplied by the caller, and it is absent from this shape so the generated JSON Schema
+    // (GET /schema/agent-spec.json, the MCP schema resource) stops ADVERTISING a field the
+    // system will not honor. Strictness turns "quietly ignored" into zod's named
+    // "Unrecognized key(s) in object: 'ein'", which is what a caller needs to hear.
     legal: z
       .object({
-        /** REJECTED when supplied — see the superRefine below. Kept in the shape so the refusal
-         *  is a named, readable error instead of a silently-stripped unknown key. */
-        ein: z.string().optional(),
         formationDate: z.string().date().optional(), // ISO YYYY-MM-DD; stubbed if absent
       })
+      .strict()
       .default({}),
     metadata: z
       .object({
@@ -90,18 +94,6 @@ export const AgentSpecSchema = z
   // (RolesMustDiffer + payout != operator). Addresses are already EIP-55-normalized above, so
   // string equality is a sound comparison.
   .superRefine((spec, ctx) => {
-    // doola formation (design §4): the OA bundle manifest is the ONE carrier of the EIN. A
-    // caller-supplied EIN would put an unverified legal fact into the terms doc and therefore
-    // into the on-chain anchor, which is exactly the fabrication class this design forbids —
-    // the real EIN arrives from the IRS, through the provider, and lands in the manifest.
-    if (spec.legal.ein !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["legal", "ein"],
-        message:
-          "legal.ein is not accepted: the EIN is issued by the IRS and carried by the OA bundle manifest, never supplied by the caller",
-      });
-    }
     const { manager, guardian, operator } = spec.roles;
     if (manager === guardian) {
       ctx.addIssue({

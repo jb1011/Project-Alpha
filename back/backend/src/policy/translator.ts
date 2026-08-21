@@ -70,7 +70,10 @@ export function translate(spec: AgentSpec, defaults: { usdc: Address }): Transla
     }
   }
 
-  const ein = spec.legal.ein ?? "STUB-NOT-FILED";
+  // No caller-supplied EIN exists any more: the spec schema refuses the key, because the EIN is
+  // issued by the IRS and carried by the OA bundle manifest's `legal` block (design §4). The
+  // on-chain `meta.ein` is a placeholder that nothing on-chain reads, superseded by the manifest.
+  const ein = "STUB-NOT-FILED";
   const formationDate = spec.legal.formationDate ? isoToUnix(spec.legal.formationDate) : 0;
 
   return {
