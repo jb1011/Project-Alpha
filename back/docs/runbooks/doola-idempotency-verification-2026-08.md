@@ -97,6 +97,22 @@ bump is what keeps a retry with a *changed* body out of case 2's 409.
 }
 ```
 
+### 5. The key namespace is PER-ENDPOINT
+
+The design's key scheme is `formation:<entityKey>:<step>:<attempt>` — the SAME key on both
+creates of one attempt. That is only safe if doola scopes keys per endpoint, so it was checked
+directly: one key, `POST /customers` (customer body), then `POST /companies` (a completely
+different body) with that same key.
+
+```
+key=probe-crossendpoint-1787315573
+POST /v1/partner/customers  -> 200  doolaCustomerId 3IE2nRPNrOlz0kYHpRsGlWct5Uh
+POST /v1/partner/companies  -> 200  doolaCompanyId  3IE2naznv1cXxFISjtV8uJWSKsD
+```
+
+No `E_IDEMPOTENCY_KEY_REUSED`. Keys are namespaced per endpoint, so one attempt's two creates
+may share a key — as the design specifies.
+
 ## ⚠ Finding: `GET /companies` is EVENTUALLY consistent with the creates
 
 The same query, run immediately after the creates, answered:

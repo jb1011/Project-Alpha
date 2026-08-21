@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { type Address, hexToString, toHex } from "viem";
 import type { ArcAdapter } from "../adapters/arc/arcAdapter";
 import { buildWalletSetTypedData } from "../adapters/arc/walletSet";
+import type { DoolaApi } from "../adapters/doola/doolaClient";
+import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
 import type { MetadataAnchor } from "../oa/generator";
@@ -16,11 +18,14 @@ import {
 } from "../oa/manifest";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
+import type { FormationPartyRepository } from "../persistence/formationPartyRepository";
+import type { FormationRepository } from "../persistence/formationRepository";
 import type { OaAnchorRepository } from "../persistence/oaAnchorRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import { assertOperatorDistinct, translate } from "../policy/translator";
 import { usdToUnits } from "../policy/units";
 import type { EntityRecord, FormationPin, Hex } from "../types";
+import { runFormationCreateProvider } from "./formationProvider";
 
 /** Result of provisioning a per-agent Turnkey vault (the saga only needs these three fields). */
 export interface ProvisionedVault {
@@ -108,6 +113,20 @@ export interface OnboardingDeps {
    *  the SAME db handle as `repo`, which is what lets the v1 row commit inside the entity row's
    *  transaction rather than beside it. */
   anchors?: OaAnchorRepository;
+  // ── The filing itself (Step 9, design §5). All four are optional and all four must be present
+  //    for anything to happen: a deployment without doola credentials, and every existing test,
+  //    builds unchanged and files nothing.
+  /** The doola client. Absent = no filing, whatever the record is pinned to. */
+  doola?: DoolaApi;
+  /** The formation sub-saga rows (`formation_requests`). */
+  formationRequests?: FormationRepository;
+  /** The PII table. The saga reads the party bound to THIS entity, and nothing else. */
+  formationParties?: FormationPartyRepository;
+  /** The environment this DEPLOYMENT is configured for — deliberately separate from
+   *  `formation`, which is the per-claim pin: the pinning refusal (audit M5) compares the two,
+   *  and a deployment that has switched FORMATION_REQUIRED off still owes its in-flight rows a
+   *  correctly-routed call. */
+  doolaEnvironment?: DoolaEnvironment;
 }
 
 /**
@@ -649,6 +668,43 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         rec.status,
         null,
         `ens binding skipped: ${(e as Error).message}`,
+      );
+    }
+  }
+
+  // ── Step 9 (optional, NON-FATAL): file the legal entity with the formation provider
+  //    (design §5, audit H5). LAST, after every funding and binding step, and wrapped in the
+  //    ENS step's non-fatal shape: a doola outage records a `failed` row and an ops alert, and
+  //    never blocks funding, ENS, or the 202 the caller already holds. The sweeper retries it.
+  //
+  //    `runFormationCreateProvider` is non-throwing by construction; the catch is the last line
+  //    of defense, and it is here because "formation never fails an onboarding" is a property
+  //    worth being unable to break by accident.
+  if (
+    rec.formationProvider === "doola" &&
+    d.doola &&
+    d.formationRequests &&
+    d.formationParties &&
+    d.doolaEnvironment
+  ) {
+    try {
+      await runFormationCreateProvider({
+        entityKey: key,
+        rec,
+        spec: d.spec,
+        repo: d.repo,
+        requests: d.formationRequests,
+        parties: d.formationParties,
+        doola: d.doola,
+        environment: d.doolaEnvironment,
+      });
+    } catch (e) {
+      d.repo.recordEvent(
+        key,
+        "formationCreate",
+        rec.status,
+        null,
+        `formation create skipped: ${(e as Error).message}`,
       );
     }
   }

@@ -22,6 +22,7 @@ import {
   circleOperatorSigner,
   provisionCircleWallets,
 } from "../adapters/circle/circleWallets";
+import { buildDoolaApi } from "../adapters/doola/doolaClient";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
@@ -278,6 +279,19 @@ async function main() {
   // come from different places, and no door can pin differently from another. Null on a
   // credential-less deployment, and on one that has FORMATION_REQUIRED off = stub mode.
   const formationDeployment = resolveFormationDeployment(cfg);
+  // Built from the SAME config block `canFormEntities` gates on, so the availability the door
+  // advertises and the client that would actually file can never disagree.
+  const doolaApi = cfg.doola
+    ? buildDoolaApi({
+        apiKey: cfg.doola.apiKey,
+        baseUrl: cfg.doola.baseUrl,
+        environment: cfg.doola.environment,
+      })
+    : undefined;
+  if (doolaApi)
+    console.warn(
+      `⚠ doola formation ENABLED (${cfg.doola!.environment}, required=${cfg.formation?.required})`,
+    );
 
   const runSaga: RunSaga = (i) =>
     runOnboarding({
@@ -303,6 +317,14 @@ async function main() {
       derivePocketAddress,
       formation: formationDeployment,
       anchors,
+      // The filing (Step 9). All four travel together: the client, the two repositories, and the
+      // DEPLOYMENT's environment — which is deliberately not `formationDeployment.environment`,
+      // because that one is null whenever FORMATION_REQUIRED is off, while an entity pinned
+      // earlier still owes its filing a correctly-routed call.
+      doola: doolaApi,
+      formationRequests,
+      formationParties,
+      doolaEnvironment: cfg.doola?.environment,
     });
 
   const runner = new OnboardingRunner({

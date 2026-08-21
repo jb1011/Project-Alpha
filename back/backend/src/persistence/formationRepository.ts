@@ -63,7 +63,30 @@ function toRecord(r: Row): FormationRequestRecord {
   };
 }
 
-export class SqliteFormationRepository {
+/**
+ * The narrow surface the saga, the doors and (in part B) the sweeper use. Injectable for the
+ * same reason `DoolaApi` is: a step that files a real company must be testable against a repo
+ * that can be poisoned at any transition.
+ */
+export interface FormationRepository {
+  claimStep(entityKey: string, step: FormationStep): boolean;
+  claimAllSteps(entityKey: string): boolean;
+  find(entityKey: string, step: FormationStep): FormationRequestRecord | undefined;
+  stepsOf(entityKey: string): FormationRequestRecord[];
+  listByState(state: FormationState): FormationRequestRecord[];
+  transition(
+    entityKey: string,
+    step: FormationStep,
+    from: FormationState,
+    to: FormationState,
+    fields?: { providerRef?: string; detail?: string; error?: string | null },
+  ): boolean;
+  bumpAttempt(entityKey: string, step: FormationStep, from: FormationState): number | undefined;
+  createRequestsByTenant(tenantId: string): number;
+  createRequestsSince(sinceUtc: string): number;
+}
+
+export class SqliteFormationRepository implements FormationRepository {
   /**
    * Statements are prepared ONCE, in the constructor.
    *
