@@ -30,11 +30,11 @@ const BASE: EntityRecord = {
   fundTxHash: null,
 };
 
-test("a LEGACY row serves formation: null and oaManifestVersion: null (the stub shape, forever)", () => {
+test("a LEGACY row serves formation: null and the LEGACY anchor scheme (the stub shape, forever)", () => {
   const v = toEntityView(BASE);
   expect(v.formation).toBeNull();
-  expect(v.oaManifestVersion).toBeNull();
-  // The hash is still served — it is simply a DOC hash, which is what the null version means.
+  // A row with an oaHash and no manifest marker is legacy: the hash commits to the document.
+  expect(v.oaAnchor).toEqual({ scheme: "legacy", hash: "0xabc" });
   expect(v.oaHash).toBe("0xabc");
 });
 
@@ -44,9 +44,45 @@ test("a formed row serves provider + environment + the PR-1 status skeleton", ()
     formationProvider: "doola",
     formationEnvironment: "sandbox",
     oaManifestVersion: 1,
+    oaManifestAnchoredHash: "0xabc",
   });
   expect(v.formation).toEqual({ provider: "doola", environment: "sandbox", status: "none" });
-  expect(v.oaManifestVersion).toBe(1);
+  expect(v.oaAnchor).toEqual({
+    scheme: "manifest",
+    hash: "0xabc",
+    version: 1,
+    pendingHash: null,
+  });
+});
+
+test("G2: the anchor scheme comes from the SAME predicate the saga anchors with", () => {
+  // A manifest entity whose v1 has not confirmed yet has a NULL version — the exact case a
+  // "version == null means legacy" renderer got wrong, describing a bundle anchor as a doc hash.
+  const pending = toEntityView({
+    ...BASE,
+    status: "translating",
+    oaHash: "0xman",
+    oaManifestPendingHash: "0xman",
+  });
+  expect(pending.oaAnchor).toEqual({
+    scheme: "manifest",
+    hash: "0xman",
+    version: null,
+    pendingHash: "0xman",
+  });
+
+  // A brand-new row (nothing derived yet) is a manifest entity too — that is what the saga will
+  // give it — and it has no hash to show.
+  const fresh = toEntityView({ ...BASE, status: "pending", oaHash: null });
+  expect(fresh.oaAnchor).toEqual({
+    scheme: "manifest",
+    hash: null,
+    version: null,
+    pendingHash: null,
+  });
+
+  // …and a legacy row stays legacy whatever its tx state is.
+  expect(toEntityView({ ...BASE, createTxHash: null }).oaAnchor.scheme).toBe("legacy");
 });
 
 test("HONESTY INVARIANT: the environment can never be omitted from a formation block", () => {

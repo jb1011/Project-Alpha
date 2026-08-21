@@ -61,7 +61,26 @@ function toRecord(r: Row): OaAnchorRecord {
   };
 }
 
-export class SqliteOaAnchorRepository {
+/** The slice of the anchor store its callers use. An interface so the onboarding saga can take
+ *  it as a seam (tests fake it; production passes the sqlite one over the SAME db handle, which
+ *  is what lets the anchor row commit inside the entity row's transaction). */
+export interface OaAnchorRepository {
+  claimVersion(entityKey: string, version: number, manifestHash: Hex): boolean;
+  find(entityKey: string, version: number): OaAnchorRecord | undefined;
+  versionsOf(entityKey: string): OaAnchorRecord[];
+  findPending(entityKey: string): OaAnchorRecord | undefined;
+  listByState(state: OaAnchorState): OaAnchorRecord[];
+  transition(
+    entityKey: string,
+    version: number,
+    from: OaAnchorState,
+    to: OaAnchorState,
+    fields?: { scheduleTx?: Hex; executeTx?: Hex; executableAt?: number; error?: string | null },
+  ): boolean;
+  bumpAttempt(entityKey: string, version: number, from: OaAnchorState): number | undefined;
+}
+
+export class SqliteOaAnchorRepository implements OaAnchorRepository {
   constructor(private readonly db: Database.Database) {}
 
   /** Open a new anchor cycle in `pending`. Returns false when this version already exists —

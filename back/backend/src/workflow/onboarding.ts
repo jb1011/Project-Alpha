@@ -16,6 +16,7 @@ import {
 } from "../oa/manifest";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
+import type { OaAnchorRepository } from "../persistence/oaAnchorRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import { assertOperatorDistinct, translate } from "../policy/translator";
 import { usdToUnits } from "../policy/units";
@@ -102,6 +103,11 @@ export interface OnboardingDeps {
    *  credentials) = stub mode: `formation_provider` stays null, forever, and NOTHING else in the
    *  saga changes. */
   formation?: FormationPin | null;
+  /** Anchor-cycle history (design §3/§7). OPTIONAL so every existing caller — and every test —
+   *  builds unchanged; absent simply records no history. Production passes the sqlite repo over
+   *  the SAME db handle as `repo`, which is what lets the v1 row commit inside the entity row's
+   *  transaction rather than beside it. */
+  anchors?: OaAnchorRepository;
 }
 
 /**
@@ -477,6 +483,9 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     // rec.manager is the manager this record was MINTED with. Passing it keeps the controller
     // assertion honest for a record broadcast before the controller cutover and resumed after it.
     const res = await d.arc.confirmCreateEntity(createTxHash, rec.manager as Address);
+    // Read BEFORE the promotion below clears it: this is the v1 hash that just landed on chain,
+    // and null on a legacy-scheme record (which has no pending hash and no anchor cycle).
+    const anchoredV1 = rec.oaManifestPendingHash ?? null;
     const created: EntityRecord = {
       ...rec,
       status: "created",
@@ -496,7 +505,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         : {}),
     };
     rec = created;
-    // Atomic: the entity row and its audit event commit together (or roll back together).
+    // Atomic: the entity row, its audit event and the v1 anchor row commit together (or roll
+    // back together).
     d.repo.transaction(() => {
       d.repo.upsert(created);
       d.repo.recordEvent(
@@ -510,6 +520,23 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
           treasury: created.treasury,
         }),
       );
+      // v1 is an ANCHOR CYCLE like every later version, and it must appear in the history as
+      // one: PR 3's monotonic rules ("schedule/execute only when version > the anchored one")
+      // and the monitor's "any execute of a non-current version is CRITICAL" both read
+      // `oa_anchors`, and an entity whose v1 is missing there has a hole exactly where its
+      // baseline should be — v2 would be the FIRST row, with nothing to be newer than.
+      //
+      // It is `executed` immediately and with no `executable_at`: v1 has no timelock to wait
+      // out, because it went on chain as an argument of `createEntity` itself (there was no
+      // prior agreement to amend), and `execute_tx` is that very tx. Writing it in the SAME
+      // transaction as the row that promotes pending -> anchored is what stops the two stores
+      // from ever disagreeing about what the chain holds.
+      if (anchoredV1 && d.anchors) {
+        d.anchors.claimVersion(key, OA_MANIFEST_VERSION_V1, anchoredV1);
+        d.anchors.transition(key, OA_MANIFEST_VERSION_V1, "pending", "executed", {
+          executeTx: res.txHash,
+        });
+      }
     });
   }
 

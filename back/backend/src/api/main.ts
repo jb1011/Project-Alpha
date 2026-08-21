@@ -52,6 +52,7 @@ import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
+import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import {
@@ -87,6 +88,10 @@ async function main() {
   assertTurnkeyCoverage(db, turnkeyServiceable);
   if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
   const repo = new SqliteEntityRepository(db);
+  // Same db handle as `repo`, deliberately: the v1 anchor row is written INSIDE the entity row's
+  // transaction at create-confirm, so the entity store and the anchor history can never disagree
+  // about what the chain holds.
+  const anchors = new SqliteOaAnchorRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
@@ -291,6 +296,7 @@ async function main() {
       circleSignerForEntity,
       derivePocketAddress,
       formation: formationDeployment,
+      anchors,
     });
 
   const runner = new OnboardingRunner({

@@ -30,11 +30,20 @@ export type EntityView = {
   rootPasskeyId?: string | null;
   /** Tier-0 custody provider; null/absent = legacy row (behaves as "turnkey"). */
   walletProvider?: "turnkey" | "circle" | null;
-  /** Anchored OA bundle-manifest version. null/absent = a LEGACY row whose `oaHash` commits to
-   *  the operating-agreement document alone, not to the manifest — which is why the two are
-   *  labelled differently. Optional for deploy-order safety: a backend that predates this field
-   *  means "legacy". */
-  oaManifestVersion?: number | null;
+  /** What `oaHash` COMMITS to. "legacy" = the operating-agreement document alone; "manifest" =
+   *  the OA bundle manifest (terms doc + legal documents + chain identity), which is why the two
+   *  are labelled differently. The backend decides the scheme with the same predicate it anchors
+   *  with, so the UI never re-derives it from a version number. Optional for deploy-order safety:
+   *  a backend that predates this field means "legacy". */
+  oaAnchor?:
+    | { scheme: "legacy"; hash: string | null }
+    | {
+        scheme: "manifest";
+        hash: string | null;
+        /** Anchored version; null while v1 is still in flight. */
+        version: number | null;
+        pendingHash: string | null;
+      };
   /** Formation (doola). null/absent = stub, forever. `environment` is always present when the
    *  block is: a sandbox filing must render amber ("Demo formation"), never green. PR 1 ships
    *  the skeleton, so `status` is always "none". Never carries PII. */

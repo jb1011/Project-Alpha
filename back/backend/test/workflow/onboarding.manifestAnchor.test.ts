@@ -27,6 +27,7 @@ import {
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
+import { SqliteOaAnchorRepository } from "../../src/persistence/oaAnchorRepository";
 import type { AgentSpec } from "../../src/policy/agentSpec";
 import { translate } from "../../src/policy/translator";
 import type { EntityRecord } from "../../src/types";
@@ -478,4 +479,97 @@ test("E6: a LEGACY row serves the document scheme — the same field, honestly",
   await runOnboarding(deps(makeFakeArc()));
   const meta = JSON.parse(readFileSync(join(dir, "meta-anchor-A.json"), "utf8"));
   expect(meta.anchor).toEqual({ scheme: "document" });
+});
+
+// ── G1: the v1 anchor cycle enters the history ──────────────────────────────────────────────
+
+test("G1: create-confirm records v1 as an EXECUTED anchor cycle, in the entity's transaction", async () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  const rec = await runOnboarding(deps(makeFakeArc(), { anchors }));
+
+  const v1 = anchors.find("anchor-A", 1)!;
+  expect(v1.state).toBe("executed");
+  expect(v1.manifestHash).toBe(rec.oaHash); // the value the chain holds
+  expect(v1.executeTx).toBe(rec.createTxHash); // createEntity IS the anchoring tx
+  // v1 has no timelock to wait out: there was no prior agreement to amend.
+  expect(v1.executableAt).toBeNull();
+  expect(v1.scheduleTx).toBeNull();
+  // It is the entity's baseline, so v2 has something to be newer than (PR 3's monotonic rules).
+  expect(anchors.versionsOf("anchor-A").map((a) => a.version)).toEqual([1]);
+  expect(anchors.findPending("anchor-A")).toBeUndefined();
+});
+
+test("G1: a LEGACY record opens no anchor cycle — it has no manifest to anchor", async () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  const r = translate(spec, { usdc: USDC });
+  const resolved = { ...r, operator: fakeSigner.address as `0x${string}` };
+  const legacyDoc = renderOperatingAgreement(spec, resolved);
+  repo.upsert({
+    idempotencyKey: "anchor-A",
+    name: spec.name,
+    status: "translating",
+    manager: r.manager,
+    guardian: r.guardian,
+    operator: resolved.operator,
+    amendmentDelay: r.amendmentDelay.toString(),
+    ein: r.legal.ein,
+    formationDate: r.legal.formationDate,
+    oaHash: computeOaHash(legacyDoc),
+    metadataURI: "https://host.example/backend/metadata/legacy-public-id",
+    publicId: "legacy-public-id",
+    docPath: docStore.put("oa-anchor-A.md", legacyDoc).path,
+    treasuryConfig: r.treasury,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: "0xcreate0",
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: "t1",
+    error: null,
+    specJson: JSON.stringify(spec),
+    perTxCap: null,
+  });
+  await runOnboarding(deps(makeFakeArc(), { anchors }));
+  expect(anchors.versionsOf("anchor-A")).toEqual([]);
+});
+
+test("G1: a resumed create-confirm adopts the existing v1 row instead of restarting the cycle", async () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  const arc = makeFakeArc({ confirmFails: true });
+  await expect(runOnboarding(deps(arc, { anchors }))).rejects.toThrow(/simulated confirm crash/);
+  // The crash happened before the transaction, so nothing was written…
+  expect(anchors.versionsOf("anchor-A")).toEqual([]);
+  const rec = await runOnboarding(deps(arc, { anchors }));
+  // …and the resume writes exactly one executed cycle, carrying the hash already on chain.
+  expect(anchors.versionsOf("anchor-A").map((a) => [a.version, a.state])).toEqual([
+    [1, "executed"],
+  ]);
+  expect(anchors.find("anchor-A", 1)?.manifestHash).toBe(rec.oaHash);
+});
+
+test("G1: the anchor row and the entity row commit together — a failed event rolls both back", async () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  const boom = {
+    ...repo,
+    upsert: repo.upsert.bind(repo),
+    findByIdempotencyKey: repo.findByIdempotencyKey.bind(repo),
+    transaction: repo.transaction.bind(repo),
+    recordEvent: (k: string, step: string, ...rest: unknown[]) => {
+      if (step === "createEntity") throw new Error("event write failed");
+      return (repo.recordEvent as (...a: unknown[]) => void)(k, step, ...rest);
+    },
+  } as unknown as SqliteEntityRepository;
+  await expect(runOnboarding(deps(makeFakeArc(), { repo: boom, anchors }))).rejects.toThrow(
+    /event write failed/,
+  );
+  // No half-written history: the DB must never hold an anchor the chain's record was rolled back
+  // out from under.
+  expect(anchors.versionsOf("anchor-A")).toEqual([]);
+  // The row exists (translate wrote it) but the create-confirm transaction rolled back whole:
+  // status is still 'translating' and the pending hash is still pending.
+  const persisted = repo.findByIdempotencyKey("anchor-A")!;
+  expect(persisted.status).toBe("translating");
+  expect(persisted.oaManifestVersion).toBeNull();
+  expect(persisted.oaManifestPendingHash).toBe(persisted.oaHash);
 });
