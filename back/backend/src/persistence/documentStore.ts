@@ -6,7 +6,6 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
@@ -19,6 +18,7 @@ export interface PutResult {
 }
 
 export interface DocumentStore {
+  /** Text write. ATOMIC: a thin UTF-8 wrapper over `putBytes`, same tmp+fsync+rename ceremony. */
   put(name: string, contents: string): PutResult;
   get(id: string): string;
   /** Binary write (legal PDFs, canonical manifest bytes). ATOMIC — see the impl note. */
@@ -43,14 +43,22 @@ export class FileDocumentStore implements DocumentStore {
     return p;
   }
 
+  /**
+   * Text write — a UTF-8 wrapper over the ATOMIC byte path, deliberately.
+   *
+   * The old in-place `writeFileSync` was the torn-write hazard `putBytes` exists to avoid, and
+   * "which artifacts get the ceremony" is not a distinction the store should be making: the
+   * TERMS doc is hashed into the manifest, the manifest is hashed onto the chain, and the served
+   * metadata is what a verifier reads. Every one of them is a document whose truncated form is
+   * indistinguishable from its whole form until someone recomputes a hash and finds it wrong.
+   * One code path, always atomic, so no future caller can pick the unsafe one by accident.
+   */
   put(name: string, contents: string): PutResult {
-    const path = this.safePath(name);
-    writeFileSync(path, contents, "utf8");
-    return { id: name, path, uri: pathToFileURL(path).href };
+    return this.putBytes(name, Buffer.from(contents, "utf8"));
   }
 
   get(id: string): string {
-    return readFileSync(this.safePath(id), "utf8");
+    return this.getBytes(id).toString("utf8");
   }
 
   /**
@@ -66,7 +74,12 @@ export class FileDocumentStore implements DocumentStore {
    *  - fsync BEFORE rename, so a power loss can lose the whole file but never publish a
    *    half-written one under the real name (the DB runs synchronous=NORMAL for the same
    *    "re-derivable, never corrupt" reason);
-   *  - rename, which replaces the target atomically on POSIX.
+   *  - rename, which replaces the target atomically on POSIX;
+   *  - and the write itself LOOPS. `writeSync` is allowed to write fewer bytes than it was
+   *    given (a large buffer, a signal, a full-ish pipe or disk), and its return value is the
+   *    only thing that says so. A single unchecked call therefore fsync'd and published a
+   *    SHORT file under the anchored name — the exact outcome the rest of this ceremony exists
+   *    to prevent, reached through the front door.
    */
   putBytes(name: string, bytes: Buffer): PutResult {
     const path = this.safePath(name);
@@ -76,7 +89,16 @@ export class FileDocumentStore implements DocumentStore {
     let fd: number | undefined;
     try {
       fd = openSync(tmp, "wx", 0o600);
-      writeSync(fd, bytes);
+      // Write to completion: writeSync returns how many bytes it actually took.
+      let written = 0;
+      while (written < bytes.length) {
+        const n = writeSync(fd, bytes, written, bytes.length - written);
+        if (n <= 0)
+          throw new Error(
+            `document write stalled after ${written}/${bytes.length} bytes for ${name}`,
+          );
+        written += n;
+      }
       fsyncSync(fd);
       closeSync(fd);
       fd = undefined;

@@ -9,6 +9,7 @@ import { buildJobDeps } from "../../src/jobs/composition";
 import { migrate } from "../../src/persistence/db";
 import type { DocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
+import { makeFakeDocStore } from "../helpers/runJobDeps";
 
 // Two distinct valid secp256k1 private keys (these are Anvil test keys — safe for tests)
 const PLATFORM_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as const;
@@ -72,20 +73,9 @@ function makeDb() {
   return db;
 }
 
-const fakeDocStore: DocumentStore = {
-  put: (name: string, contents: string) => ({
-    id: name,
-    path: `/tmp/test-docs/${name}`,
-    uri: `file:///tmp/test-docs/${name}`,
-  }),
-  get: (_id: string) => "",
-  putBytes: (name: string, _bytes: Buffer) => ({
-    id: name,
-    path: `/tmp/test-docs/${name}`,
-    uri: `file:///tmp/test-docs/${name}`,
-  }),
-  getBytes: (_id: string) => Buffer.alloc(0),
-};
+// The ONE fake doc store (test/helpers/runJobDeps.ts). The inline copy that used to live here
+// silently dropped `putBytes`/`getBytes` when the interface grew.
+const fakeDocStore: DocumentStore = makeFakeDocStore();
 
 test("buildJobDeps returns the expected interface without network calls", () => {
   const cfg = makeConfig();

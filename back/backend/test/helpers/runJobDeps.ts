@@ -124,7 +124,10 @@ function makeFakeReputationAdapter(): ReputationAdapter {
 // ---------------------------------------------------------------------------
 // Tiny in-memory DocumentStore
 // ---------------------------------------------------------------------------
-function makeFakeDocStore(): DocumentStore {
+/** Shared by every test that needs a DocumentStore it does not care about. Exported because two
+ *  copies of a four-method fake is two places to forget a method when the interface grows —
+ *  which is exactly what happened when `putBytes`/`getBytes` were added. */
+export function makeFakeDocStore(): DocumentStore {
   const store = new Map<string, string>();
   const bytes = new Map<string, Buffer>();
   return {

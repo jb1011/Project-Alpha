@@ -83,3 +83,32 @@ test("getBytes/putBytes keep the traversal guard (an id may never escape the roo
   expect(() => store.putBytes("/etc/passwd", Buffer.from("x"))).toThrow(/ENOENT/);
   expect(() => store.getBytes("/etc/passwd")).toThrow(/ENOENT/);
 });
+
+test("D1: put() is the ATOMIC path too — text never lands in place", () => {
+  const store = new FileDocumentStore(dir);
+  store.put("oa-key-v1.md", "original terms");
+  const target = join(dir, "oa-key-v1.md");
+  // Freeze the real file. An in-place writer (open 'w' + write) truncates it here and leaves a
+  // zero-length terms doc whose keccak is NOT the one committed inside the manifest.
+  chmodSync(target, 0o444);
+  try {
+    store.put("oa-key-v1.md", "replacement terms");
+  } finally {
+    chmodSync(target, 0o644);
+  }
+  const after = store.get("oa-key-v1.md");
+  expect(["original terms", "replacement terms"]).toContain(after);
+  expect(after).not.toBe("");
+  // …and no temp file is left behind by the text path either.
+  expect(readdirSync(dir).filter((f) => f.includes(".tmp-"))).toEqual([]);
+});
+
+test("D1: put/get round-trip multi-byte UTF-8 through the byte path unchanged", () => {
+  const store = new FileDocumentStore(dir);
+  // The terms doc carries NFC-normalized user text; a naive Buffer round-trip that guessed the
+  // encoding would mangle exactly this.
+  const doc = "# Operating Agreement — Café Agent \u{1F600}\nJurisdiction: Wyoming-DAO-LLC\n";
+  store.put("oa-unicode.md", doc);
+  expect(store.get("oa-unicode.md")).toBe(doc);
+  expect(store.getBytes("oa-unicode.md").toString("utf8")).toBe(doc);
+});
