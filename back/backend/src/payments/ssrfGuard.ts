@@ -73,6 +73,25 @@ export function assertPublicHttpsUrl(raw: string): URL {
 
 /** Fetch with SSRF hardening: validate the URL, resolve the host and reject blocked IPs, forbid redirects
  *  (redirect:"manual" — an x402 resource must answer directly), and enforce a timeout. */
+/**
+ * Reject a hostname that resolves to any blocked address.
+ *
+ * Factored out of `safeFetch` so the doola document downloader — which needs the SAME boundary but
+ * a DIFFERENT redirect policy (presigned S3 URLs redirect; an x402 resource must not) — enforces
+ * it with this code rather than a second copy of it. A drifted copy of an SSRF check is a silently
+ * missing SSRF check.
+ *
+ * ALL addresses (A + AAAA) are resolved and any blocked one refuses the whole host: a hostname that
+ * round-robins between a public and a blocked IP must not sneak the blocked one through just
+ * because the first record looked fine.
+ */
+export async function assertPublicHost(u: URL): Promise<void> {
+  if (net.isIP(u.hostname.replace(/^\[|\]$/g, ""))) return; // a literal was already classified
+  const addrs = await lookup(u.hostname, { all: true });
+  const blocked = addrs.find((a) => isBlockedIp(a.address));
+  if (blocked) throw new SsrfError(`host ${u.hostname} resolves to blocked ${blocked.address}`);
+}
+
 export async function safeFetch(
   fetchImpl: typeof fetch,
   raw: string,
@@ -80,14 +99,7 @@ export async function safeFetch(
   opts: { timeoutMs?: number } = {},
 ): Promise<Response> {
   const u = assertPublicHttpsUrl(raw);
-  if (!net.isIP(u.hostname.replace(/^\[|\]$/g, ""))) {
-    // Resolve ALL addresses the hostname maps to (A + AAAA) and reject if ANY is blocked — a hostname
-    // that round-robins or rotates between a public and a blocked IP (DNS rebinding) must not sneak a
-    // blocked address through just because the first resolved record looked public.
-    const addrs = await lookup(u.hostname, { all: true });
-    const blocked = addrs.find((a) => isBlockedIp(a.address));
-    if (blocked) throw new SsrfError(`host ${u.hostname} resolves to blocked ${blocked.address}`);
-  }
+  await assertPublicHost(u);
   // Residual TOCTOU (v1 limitation, documented — not fixed here): fetchImpl() below re-resolves the
   // hostname itself at connect time, after the check above. A DNS answer that changes between our
   // lookup() and the underlying fetch's own resolution (classic DNS rebinding) can still slip a
