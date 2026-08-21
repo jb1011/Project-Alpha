@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import { SsrfError, assertPublicHost, assertPublicHttpsUrl } from "../payments/ssrfGuard";
+import {
+  type HostLookup,
+  SsrfError,
+  assertPublicHost,
+  assertPublicHttpsUrl,
+} from "../payments/ssrfGuard";
 import { withDeadline } from "../util/deadline";
 
 /**
@@ -125,6 +130,9 @@ export interface DownloadOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   maxBytes?: number;
+  /** Injected in tests so the suite never touches DNS. Production omits it and gets the real
+   *  resolver; there is no option that turns the blocked-range classification OFF. */
+  lookupImpl?: HostLookup;
 }
 
 /**
@@ -146,7 +154,7 @@ export async function downloadDocument(
     for (let hop = 0; ; hop++) {
       // Re-checked on EVERY hop, not just the first: a redirect target is exactly as untrusted as
       // the original URL, and more so — it was chosen after we committed to the request.
-      await assertPublicHost(current);
+      await assertPublicHost(current, opts.lookupImpl);
       const res = await fetchImpl(current.toString(), { redirect: "manual", signal });
 
       if (res.status >= 300 && res.status < 400) {

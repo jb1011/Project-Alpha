@@ -19,6 +19,7 @@ import {
 } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { EntityRecord } from "../types";
+import { failFormationStep, logFormationStep } from "./formationStep";
 
 /**
  * The `create_provider` step of the formation sub-saga (design §5, audit H5 / M5, completeness 9).
@@ -154,7 +155,7 @@ function logStep(
   attempt: number,
   extra: Record<string, unknown> = {},
 ): void {
-  opsLog("formation_step", { entityKey, step: "create_provider", state, attempt, ...extra });
+  logFormationStep(entityKey, "create_provider", state, attempt, extra);
 }
 
 /** doola's machine code + correlation id, for the ops line and the persisted error. */
@@ -493,14 +494,13 @@ function failStep(
   error: string,
   cause?: unknown,
 ): void {
-  const { entityKey, requests } = d;
-  const from = requests.find(entityKey, "create_provider")?.state ?? row.state;
-  d.repo.transaction(() => {
-    const bumped = requests.bumpAttempt(entityKey, "create_provider", from);
-    if (bumped !== undefined)
-      requests.transition(entityKey, "create_provider", "pending", "failed", { error });
-    else requests.transition(entityKey, "create_provider", from, "failed", { error });
-  });
+  const { entityKey } = d;
+  const described: { code?: string; requestId?: string } = cause ? describe(cause) : {};
+  // The bump-then-park sequence itself lives in `formationStep.ts`: the webhook processor and the
+  // sweeper park rows too, and three copies of that contract would be three chances to burn an
+  // attempt without parking the row (or the reverse). What stays HERE is what is specific to the
+  // create: the entity audit event, and doola's own error code on the ops line.
+  failFormationStep(d, entityKey, "create_provider", error, { code: described.code });
   d.repo.recordEvent(
     entityKey,
     "formationCreate",
@@ -508,12 +508,10 @@ function failStep(
     null,
     `formation create failed: ${error}`,
   );
-  const described: { code?: string; requestId?: string } = cause ? describe(cause) : {};
   opsLog("formation_create_failed", {
     entityKey,
     level: "warn",
     code: described.code,
     requestId: described.requestId,
   });
-  logStep(entityKey, "failed", row.attempt + 1, { code: described.code });
 }

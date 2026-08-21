@@ -18,6 +18,10 @@ import {
 const PDF = Buffer.from("%PDF-1.7\nfake\n");
 const SIGNED = "https://api.test.doola.com/signed/doc-1";
 
+/** The suite never touches DNS: the RESOLVER is substituted, the blocked-range classification is
+ *  not — 93.184.216.34 is ordinary globally-routable unicast, so it passes the real check. */
+const lookupImpl = async () => [{ address: "93.184.216.34" }];
+
 /** A fetch fake driven by a URL -> response script. Records what it was asked for. */
 function scriptedFetch(script: Record<string, () => Response>) {
   const calls: string[] = [];
@@ -45,7 +49,7 @@ function redirect(to: string, status = 302) {
 
 test("the happy path: bytes, size and the sha256 of exactly those bytes", async () => {
   const { impl } = scriptedFetch({ [SIGNED]: () => pdfResponse() });
-  const got = await downloadDocument(SIGNED, { fetchImpl: impl });
+  const got = await downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl });
   expect(got.bytes.equals(PDF)).toBe(true);
   expect(got.size).toBe(PDF.length);
   expect(got.contentType).toBe("application/pdf");
@@ -58,7 +62,7 @@ test("application/octet-stream is accepted; anything else is refused before the 
   const { impl } = scriptedFetch({
     [SIGNED]: () => pdfResponse(PDF, { "content-type": "application/octet-stream" }),
   });
-  await expect(downloadDocument(SIGNED, { fetchImpl: impl })).resolves.toMatchObject({
+  await expect(downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl })).resolves.toMatchObject({
     contentType: "application/octet-stream",
   });
 
@@ -71,16 +75,16 @@ test("application/octet-stream is accepted; anything else is refused before the 
         }),
     });
     // An HTML login page is not worth 16 MiB of patience, and is certainly not a legal document.
-    await expect(downloadDocument(SIGNED, { fetchImpl: s.impl })).rejects.toBeInstanceOf(
-      DocumentDownloadError,
-    );
+    await expect(
+      downloadDocument(SIGNED, { fetchImpl: s.impl, lookupImpl }),
+    ).rejects.toBeInstanceOf(DocumentDownloadError);
   }
 });
 
 test("HTTPS only — a plain-http URL never leaves the process", async () => {
   const { impl, calls } = scriptedFetch({});
   await expect(
-    downloadDocument("http://api.test.doola.com/signed/doc-1", { fetchImpl: impl }),
+    downloadDocument("http://api.test.doola.com/signed/doc-1", { fetchImpl: impl, lookupImpl }),
   ).rejects.toBeInstanceOf(SsrfError);
   expect(calls).toHaveLength(0);
 });
@@ -89,7 +93,7 @@ test("a blocked IP literal is refused, including the cloud metadata address", as
   const { impl, calls } = scriptedFetch({});
   for (const host of ["169.254.169.254", "127.0.0.1", "10.0.0.5", "[::1]"])
     await expect(
-      downloadDocument(`https://${host}/doc`, { fetchImpl: impl }),
+      downloadDocument(`https://${host}/doc`, { fetchImpl: impl, lookupImpl }),
     ).rejects.toBeInstanceOf(SsrfError);
   expect(calls).toHaveLength(0);
 });
@@ -100,7 +104,7 @@ test("a presigned S3 redirect is FOLLOWED — that is why this is not safeFetch"
     [SIGNED]: () => redirect(s3),
     [s3]: () => pdfResponse(),
   });
-  const got = await downloadDocument(SIGNED, { fetchImpl: impl });
+  const got = await downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl });
   expect(got.size).toBe(PDF.length);
   expect(calls).toEqual([SIGNED, s3]);
 });
@@ -108,12 +112,14 @@ test("a presigned S3 redirect is FOLLOWED — that is why this is not safeFetch"
 test("a redirect BACK to the original host is allowed; one to anywhere else is not", async () => {
   const same = "https://api.test.doola.com/signed/doc-1/final";
   const ok = scriptedFetch({ [SIGNED]: () => redirect(same), [same]: () => pdfResponse() });
-  await expect(downloadDocument(SIGNED, { fetchImpl: ok.impl })).resolves.toBeDefined();
+  await expect(downloadDocument(SIGNED, { fetchImpl: ok.impl, lookupImpl })).resolves.toBeDefined();
 
   // An open redirect at doola must not be able to walk us to an arbitrary origin.
   const evil = "https://attacker.example.com/doc.pdf";
   const bad = scriptedFetch({ [SIGNED]: () => redirect(evil), [evil]: () => pdfResponse() });
-  await expect(downloadDocument(SIGNED, { fetchImpl: bad.impl })).rejects.toBeInstanceOf(SsrfError);
+  await expect(
+    downloadDocument(SIGNED, { fetchImpl: bad.impl, lookupImpl }),
+  ).rejects.toBeInstanceOf(SsrfError);
   // Refused BEFORE the request: the allowlist is a pre-flight check, not a post-mortem.
   expect(bad.calls).toEqual([SIGNED]);
 });
@@ -121,7 +127,9 @@ test("a redirect BACK to the original host is allowed; one to anywhere else is n
 test("a redirect that downgrades to http is refused like any other non-https URL", async () => {
   const plain = "http://doola-docs.s3.amazonaws.com/aoo.pdf";
   const { impl } = scriptedFetch({ [SIGNED]: () => redirect(plain) });
-  await expect(downloadDocument(SIGNED, { fetchImpl: impl })).rejects.toBeInstanceOf(SsrfError);
+  await expect(downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl })).rejects.toBeInstanceOf(
+    SsrfError,
+  );
 });
 
 test("the redirect chain is bounded", async () => {
@@ -129,7 +137,7 @@ test("the redirect chain is bounded", async () => {
   const script: Record<string, () => Response> = { [SIGNED]: () => redirect(hop(1)) };
   for (let i = 1; i <= 6; i++) script[hop(i)] = () => redirect(hop(i + 1));
   const { impl, calls } = scriptedFetch(script);
-  await expect(downloadDocument(SIGNED, { fetchImpl: impl })).rejects.toThrow(
+  await expect(downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl })).rejects.toThrow(
     /exceeded 2 redirects/,
   );
   // The original request plus MAX_DOCUMENT_REDIRECTS follow-ups, and no more.
@@ -140,7 +148,9 @@ test("a redirect with no Location is an error, not an infinite loop", async () =
   const { impl } = scriptedFetch({
     [SIGNED]: () => new Response(null, { status: 302 }),
   });
-  await expect(downloadDocument(SIGNED, { fetchImpl: impl })).rejects.toThrow(/no Location/);
+  await expect(downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl })).rejects.toThrow(
+    /no Location/,
+  );
 });
 
 test("a relative Location is resolved against the current URL and re-validated", async () => {
@@ -149,7 +159,7 @@ test("a relative Location is resolved against the current URL and re-validated",
     [SIGNED]: () => redirect("/signed/final.pdf"),
     [resolved]: () => pdfResponse(),
   });
-  await expect(downloadDocument(SIGNED, { fetchImpl: impl })).resolves.toBeDefined();
+  await expect(downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl })).resolves.toBeDefined();
   expect(calls).toEqual([SIGNED, resolved]);
 });
 
@@ -159,7 +169,9 @@ test("an honest oversized Content-Length is refused before a byte is buffered", 
   const { impl } = scriptedFetch({
     [SIGNED]: () => pdfResponse(PDF, { "content-length": String(64 * 1024 * 1024) }),
   });
-  await expect(downloadDocument(SIGNED, { fetchImpl: impl })).rejects.toThrow(/over the .* cap/);
+  await expect(downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl })).rejects.toThrow(
+    /over the .* cap/,
+  );
 });
 
 test("a CHUNKED body that lies about its size is stopped by the running counter", async () => {
@@ -179,7 +191,7 @@ test("a CHUNKED body that lies about its size is stopped by the running counter"
   });
   await expect(
     // A 1 MiB cap for the test; the production value is 16 MiB.
-    downloadDocument(SIGNED, { fetchImpl: impl, maxBytes: 1024 * 1024 }),
+    downloadDocument(SIGNED, { fetchImpl: impl, lookupImpl, maxBytes: 1024 * 1024 }),
   ).rejects.toThrow(/while streaming/);
   // The stream was CANCELLED rather than drained: we stopped well short of what it would produce.
   expect(produced).toBeLessThan(8 * 1024 * 1024);
@@ -187,10 +199,14 @@ test("a CHUNKED body that lies about its size is stopped by the running counter"
 
 test("a non-2xx and an empty body are both refused", async () => {
   const err = scriptedFetch({ [SIGNED]: () => new Response("nope", { status: 403 }) });
-  await expect(downloadDocument(SIGNED, { fetchImpl: err.impl })).rejects.toThrow(/HTTP 403/);
+  await expect(downloadDocument(SIGNED, { fetchImpl: err.impl, lookupImpl })).rejects.toThrow(
+    /HTTP 403/,
+  );
 
   const empty = scriptedFetch({ [SIGNED]: () => pdfResponse(Buffer.alloc(0)) });
-  await expect(downloadDocument(SIGNED, { fetchImpl: empty.impl })).rejects.toThrow(/0 bytes/);
+  await expect(downloadDocument(SIGNED, { fetchImpl: empty.impl, lookupImpl })).rejects.toThrow(
+    /0 bytes/,
+  );
 });
 
 // ── the pure helpers ───────────────────────────────────────────────────────────────────────

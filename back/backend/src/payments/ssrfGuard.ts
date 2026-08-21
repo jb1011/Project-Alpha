@@ -85,9 +85,19 @@ export function assertPublicHttpsUrl(raw: string): URL {
  * round-robins between a public and a blocked IP must not sneak the blocked one through just
  * because the first record looked fine.
  */
-export async function assertPublicHost(u: URL): Promise<void> {
+export type HostLookup = (hostname: string) => Promise<{ address: string }[]>;
+
+/** The real resolver. Separated only so a test can substitute one and stay off the network. */
+export const dnsHostLookup: HostLookup = (hostname) => lookup(hostname, { all: true });
+
+export async function assertPublicHost(
+  u: URL,
+  // The injection point is the RESOLVER, never the check: a caller can decide where names are
+  // looked up, and can never decide whether the classification runs.
+  lookupImpl: HostLookup = dnsHostLookup,
+): Promise<void> {
   if (net.isIP(u.hostname.replace(/^\[|\]$/g, ""))) return; // a literal was already classified
-  const addrs = await lookup(u.hostname, { all: true });
+  const addrs = await lookupImpl(u.hostname);
   const blocked = addrs.find((a) => isBlockedIp(a.address));
   if (blocked) throw new SsrfError(`host ${u.hostname} resolves to blocked ${blocked.address}`);
 }
