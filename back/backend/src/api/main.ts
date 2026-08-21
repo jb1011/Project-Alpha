@@ -51,6 +51,8 @@ import { SqliteChallengeStore } from "../persistence/challengeStore";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
+import { SqliteFormationPartyRepository } from "../persistence/formationPartyRepository";
+import { SqliteFormationRepository } from "../persistence/formationRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
@@ -92,6 +94,10 @@ async function main() {
   // transaction at create-confirm, so the entity store and the anchor history can never disagree
   // about what the chain holds.
   const anchors = new SqliteOaAnchorRepository(db);
+  // Same db handle again: the four formation step rows are claimed inside one transaction, the
+  // spend-control counts JOIN `entities`, and the party bind commits with the entity claim.
+  const formationRequests = new SqliteFormationRepository(db);
+  const formationParties = new SqliteFormationPartyRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
@@ -305,6 +311,7 @@ async function main() {
     fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
     outflows,
     formation: formationDeployment,
+    parties: formationParties,
   });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
@@ -400,7 +407,17 @@ async function main() {
     // the environment it is available IN, which the honesty invariant makes inseparable from it.
     // Availability is NOT the pin: a box with credentials but FORMATION_REQUIRED off still
     // advertises the capability while pinning nothing.
-    formation: canFormEntities(cfg) ? { environment: cfg.doola!.environment } : undefined,
+    formation: canFormEntities(cfg)
+      ? {
+          environment: cfg.doola!.environment,
+          required: Boolean(cfg.formation?.required),
+          sandboxSyntheticPii: Boolean(cfg.formation?.sandboxSyntheticPii),
+          maxPerTenant: cfg.formation?.maxPerTenant ?? 3,
+          dailyCeiling: cfg.formation?.dailyCeiling ?? 10,
+          parties: formationParties,
+          quota: formationRequests,
+        }
+      : undefined,
     repo,
     docStore,
     runner,

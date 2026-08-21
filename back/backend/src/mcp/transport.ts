@@ -37,6 +37,7 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       linkCodes: deps.linkCodes,
       arc: deps.arc,
       worldId: deps.worldId,
+      formation: deps.formation,
       ens: deps.ens
         ? {
             parentName: deps.ens.parentName,

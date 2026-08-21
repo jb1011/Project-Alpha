@@ -7,14 +7,21 @@ import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
 import { toEntityView } from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
+import {
+  createFormationParty,
+  formationDoorRefusal,
+  formationUnavailableMessage,
+  truncateTenant,
+} from "../formation";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
+import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
 import type { PocketFundingFn } from "../payments/pocketFunding";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
-import { AgentSpecSchema } from "../policy/agentSpec";
+import { AgentSpecSchema, FormationPartySchema } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import type { OnboardingRunner } from "../workflow/runner";
 import { entityInScope, hasCapability } from "./scope";
@@ -56,10 +63,19 @@ export interface McpToolDeps {
   };
   /** World ID guardian gate (mirrors the REST /onboard gate). Optional. */
   worldId?: import("../api/routes/worldId").WorldIdDeps;
+  /** doola formation (design §2/§5), the SAME object ApiDeps carries — availability, the
+   *  requirement, the PII intake policy, the spend limits and the two repositories. Absent =
+   *  this deployment forms nothing, and neither the tool nor the gate exists. */
+  formation?: import("../api/app").ApiDeps["formation"];
 }
 
-/** Availability sentence for the onboard_agent description — agent-first callers have no GET
- *  /config, so the tool description is their custody-capability discovery surface. */
+/**
+ * Availability sentence for the onboard_agent description — agent-first callers have no GET
+ * /config, so the tool description is their capability discovery surface. The formation note
+ * follows the same pattern for the same reason: an agent that cannot read /config must still be
+ * able to learn that this deployment will refuse an onboard without a partyId, and in WHICH
+ * environment it files (the honesty invariant reaches the agent surface too).
+ */
 function custodyCapabilityNote(
   deps: Pick<
     McpToolDeps,
@@ -71,6 +87,15 @@ function custodyCapabilityNote(
       .filter(Boolean)
       .join(", ") || "none";
   return `('${deps.walletProviderDefault}'). Available on this deployment: ${available}.`;
+}
+
+/** Formation availability sentence for the onboard_agent / create_formation_party descriptions. */
+function formationCapabilityNote(deps: Pick<McpToolDeps, "formation">): string {
+  if (!deps.formation) return "Formation is not available on this deployment.";
+  const identity = deps.formation.sandboxSyntheticPii
+    ? "This deployment files with a labeled SYNTHETIC sandbox identity: pass synthetic:true and no personal data — real personal data is refused."
+    : "This deployment files real legal entities: real personal data is required and synthetic:true is refused.";
+  return `Formation is ${deps.formation.required ? "REQUIRED" : "available"} on this deployment (doola, ${deps.formation.environment}). ${identity}`;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -467,19 +492,77 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     },
   );
 
+  /**
+   * PII intake, the MCP twin of POST /formation-party (design §5).
+   *
+   * Registered ONLY when the deployment forms entities: a tool that exists but always refuses
+   * teaches an agent-first caller nothing, and a deployment with no formation has no business
+   * exposing a PII surface at all.
+   *
+   * The identity travels in its OWN tool call, never inside `spec` — spec_json is persisted and
+   * rendered — and the response is the handle alone: echoing the stored identity back would put
+   * PII in a tool result, a transcript, and any client that logs them.
+   */
+  if (deps.formation)
+    server.registerTool(
+      "create_formation_party",
+      {
+        title: "Create formation party",
+        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to onboard_agent. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in onboard_agent's spec. The response contains the handle and nothing else.`,
+        inputSchema: {
+          /** The sandbox shortcut: no personal data at all. */
+          synthetic: z.boolean().optional(),
+          legalFirstName: z.string().optional(),
+          legalLastName: z.string().optional(),
+          email: z.string().optional(),
+          phone: z.string().optional(),
+          address: z.record(z.unknown()).optional(),
+        },
+      },
+      async (args) => {
+        // "provision" — the same rung onboard_agent sits on, and for the same reason: this call
+        // is a step of provisioning a legal body, and it commits the tenant to a real filing.
+        if (!hasCapability(scope, "provision") || scope.entityId !== null)
+          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        try {
+          const { synthetic, ...body } = args as Record<string, unknown>;
+          // The synthetic shortcut carries no PII, so it is never parsed as a party body.
+          const parsed = synthetic === true ? undefined : FormationPartySchema.parse(body);
+          const result = createFormationParty(
+            {
+              parties: deps.formation!.parties,
+              sandboxSyntheticPii: deps.formation!.sandboxSyntheticPii,
+            },
+            tenantId,
+            { synthetic, parsed },
+          );
+          if ("error" in result)
+            return { content: [{ type: "text", text: result.error }], isError: true };
+          opsLog("formation_party_created", {
+            tenantId: truncateTenant(tenantId),
+            partyId: result.partyId,
+          });
+          return { content: [{ type: "text", text: JSON.stringify({ partyId: result.partyId }) }] };
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+        }
+      },
+    );
+
   server.registerTool(
     "onboard_agent",
     {
       title: "Onboard agent",
-      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
+      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} partyId is the handle returned by create_formation_party — the legal identity the entity is filed under; never put personal data in spec. ${formationCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
         idempotencyKey: z.string().optional(),
         custody: z.enum(["turnkey", "circle"]).optional(),
+        partyId: z.string().optional(),
       },
     },
-    async ({ spec, passkeyId, idempotencyKey, custody }) => {
+    async ({ spec, passkeyId, idempotencyKey, custody, partyId }) => {
       if (!hasCapability(scope, "provision") || scope.entityId !== null)
         return { content: [{ type: "text", text: "not authorized" }], isError: true };
       const passkey = deps.passkeys.get(tenantId, passkeyId);
@@ -500,6 +583,12 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             content: [{ type: "text", text: custodyUnavailableMessage("turnkey") }],
             isError: true,
           };
+        // Formation gate: AFTER custody, BEFORE the World check — the SAME order as the REST
+        // /onboard route, running the SAME function (src/formation.ts), so a request that is
+        // both party-less and quota-exhausted gets the identical primary error on both surfaces.
+        const formationRefusal = formationDoorRefusal(deps, { tenantId, partyId });
+        if (formationRefusal)
+          return { content: [{ type: "text", text: formationRefusal }], isError: true };
         // Mirror of the REST gate: when World enforcement is on, the guardian must be a
         // World-ID-verified unique human under the per-human entity cap.
         assertGuardianAllowed(deps.worldId, tenantId);
@@ -517,6 +606,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           tenantId,
           guardianPasskey: passkey,
           custody: resolvedCustody,
+          partyId,
         });
         return { content: [{ type: "text", text: JSON.stringify({ id, status }) }] };
       } catch (e) {

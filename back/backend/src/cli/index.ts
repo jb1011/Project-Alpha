@@ -7,7 +7,11 @@ import type { DemoResult } from "../agent/demo";
 import { buildLiveAgentRunner } from "../agent/liveRunner";
 import { toJobView } from "../api/jobViews";
 import { loadConfig } from "../config/env";
-import { resolveFormationDeployment } from "../formation";
+import {
+  legacyDoorRefusalMessage,
+  legacyDoorRefused,
+  resolveFormationDeployment,
+} from "../formation";
 import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import { runOnboarding } from "../workflow/onboarding";
@@ -33,6 +37,11 @@ export function buildCli(
     .option("-f, --fund <usd>", "optional: fund the treasury with this many USDC")
     .action(async (opts) => {
       const ctx = await makeContext();
+      // Door 4 (design §5): the CLI is a separate process on the same DB with no `partyId` and
+      // no PII intake, so on a deployment where formation is MANDATORY it refuses at COMMAND
+      // time rather than minting an entity that owes a filing it can never make.
+      if (legacyDoorRefused(ctx.cfg))
+        throw new Error(legacyDoorRefusalMessage("cli create-entity"));
       const spec = parseAgentSpec(JSON.parse(readFileSync(opts.config, "utf8")));
       const idempotencyKey = opts.id ?? spec.name;
       const rec = await runOnboarding({

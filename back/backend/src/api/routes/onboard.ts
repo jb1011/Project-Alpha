@@ -3,7 +3,14 @@ import { getAddress } from "viem";
 import type { GuardianPasskey } from "../../adapters/turnkey/provisioner";
 import type { AuthVars } from "../../auth/middleware";
 import { custodyUnavailableMessage } from "../../custody";
-import { AgentSpecSchema } from "../../policy/agentSpec";
+import {
+  createFormationParty,
+  formationDoorRefusal,
+  formationUnavailableMessage,
+  truncateTenant,
+} from "../../formation";
+import { opsLog } from "../../observability/opsLog";
+import { AgentSpecSchema, FormationPartySchema } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 import { toEntityView } from "../views";
@@ -17,6 +24,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       guardianPasskey?: unknown;
       idempotencyKey?: unknown;
       custody?: unknown;
+      partyId?: unknown;
     };
     try {
       body = await c.req.json();
@@ -36,6 +44,17 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       throw new ApiError("validation_error", 400, custodyUnavailableMessage("circle"));
     if (custody === "turnkey" && !deps.turnkeyCustodyAvailable)
       throw new ApiError("validation_error", 400, custodyUnavailableMessage("turnkey"));
+
+    // Formation gate (design §2/§5): AFTER custody, BEFORE the World gate. The order is mirrored
+    // exactly by the MCP onboard_agent tool, and the checks themselves live in ONE function so
+    // the two surfaces cannot drift — see src/formation.ts. Everything it refuses is refused
+    // BEFORE the claim: formation is real money in production, and an entity must never be left
+    // live with a mandatory formation that can never happen.
+    if (body.partyId !== undefined && typeof body.partyId !== "string")
+      throw new ApiError("validation_error", 400, "partyId must be a string");
+    const partyId = body.partyId as string | undefined;
+    const formationRefusal = formationDoorRefusal(deps, { tenantId, partyId });
+    if (formationRefusal) throw new ApiError("validation_error", 400, formationRefusal);
 
     // Proof-of-personhood gate: the guardian is the legally accountable natural person, so when
     // enforcement is on they must be a World-ID-verified unique human under the per-human cap.
@@ -63,8 +82,49 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       tenantId: getAddress(tenantId),
       guardianPasskey: body.guardianPasskey as GuardianPasskey,
       custody,
+      partyId,
     });
     return c.json({ id, status }, 202);
+  });
+
+  /**
+   * PII intake (design §3/§5). The ONE place a legal identity enters the system.
+   *
+   * It is a separate call, not a field on /onboard, because PII must never ride in `spec`
+   * (spec_json is persisted and rendered) and must never travel as an MCP tool argument in the
+   * same shape as the agent's public configuration. The caller gets back an opaque handle and
+   * passes THAT to onboard.
+   *
+   * The response carries the partyId and nothing else — echoing the stored identity back would
+   * put PII in a response body, a log, and any client that persists API responses.
+   */
+  app.post("/formation-party", async (c) => {
+    const tenantId = c.get("tenantId");
+    if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
+
+    let body: { synthetic?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ApiError("validation_error", 400, "invalid JSON body");
+    }
+
+    // The synthetic shortcut carries no PII at all, so it is never parsed as a party body.
+    const parsed = body.synthetic === true ? undefined : FormationPartySchema.parse(body); // ZodError -> 400
+    const result = createFormationParty(
+      { parties: deps.formation.parties, sandboxSyntheticPii: deps.formation.sandboxSyntheticPii },
+      tenantId,
+      { synthetic: body.synthetic, parsed },
+    );
+    if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+
+    // The ONLY trail this leaves: which tenant created which handle. No name, no address, no
+    // email — not here, not in any view, not in the manifest.
+    opsLog("formation_party_created", {
+      tenantId: truncateTenant(tenantId),
+      partyId: result.partyId,
+    });
+    return c.json({ partyId: result.partyId }, 201);
   });
 
   app.get("/entities", (c) => c.json(deps.repo.listByTenant(c.get("tenantId")).map(toEntityView)));

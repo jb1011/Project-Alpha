@@ -42,8 +42,19 @@ export interface FormationPartyRecord {
   deletedAt: string | null;
 }
 
-/** What the intake surfaces hand in. `partyId` is minted here, never supplied by a caller. */
-export type NewFormationParty = Omit<FormationPartyRecord, "partyId" | "entityKey" | "deletedAt">;
+/**
+ * What the intake surfaces hand in.
+ *
+ * `partyId` is optional and is NOT a caller-facing field: the sandbox fixture's email embeds the
+ * id (`sandbox+<partyId>@novicorpus.com`), so that one path mints the uuid before building the
+ * row. Every other path leaves it out and gets one from here.
+ */
+export type NewFormationParty = Omit<
+  FormationPartyRecord,
+  "partyId" | "entityKey" | "deletedAt"
+> & {
+  partyId?: string;
+};
 
 interface Row {
   party_id: string;
@@ -123,7 +134,7 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
   }
 
   create(input: NewFormationParty): string {
-    const partyId = randomUUID();
+    const partyId = input.partyId ?? randomUUID();
     this.stmts.insert.run({
       party_id: partyId,
       tenant_id: input.tenantId,

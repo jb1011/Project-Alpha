@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { type Config, canFormEntities } from "./config/env";
 import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
@@ -218,4 +219,90 @@ function warnIfNearLimit(
 ): void {
   if (limit - used > limit * 0.2) return;
   opsLog(event, { level: "warn", used, limit, remaining: limit - used, ...fields });
+}
+
+// ── PII intake (design §3/§5) ────────────────────────────────────────────────────────────────
+
+export interface FormationPartyIntakeDeps {
+  parties: import("./persistence/formationPartyRepository").FormationPartyRepository;
+  /** True = this deployment refuses real PII and files with the labeled sandbox fixture. */
+  sandboxSyntheticPii: boolean;
+}
+
+/** Either the handle, or the single-sourced refusal both surfaces render. */
+export type FormationPartyIntakeResult = { partyId: string } | { error: string };
+
+/**
+ * Create a formation party from a validated body, or from the sandbox shortcut.
+ *
+ * Shared by `POST /formation-party` and the `create_formation_party` MCP tool so the two intake
+ * surfaces cannot accept different things — the same reason the door gate is one function.
+ *
+ * The synthetic rule is a REFUSAL in both directions, never a substitution (§3, audit H7):
+ *  - on a sandbox deployment, real names and addresses are refused outright and never reach
+ *    doola's development environment. Quietly swapping in a fixture would leave the caller
+ *    believing their data had been filed, and would still have accepted (and stored) it;
+ *  - on a production deployment, the synthetic shortcut is refused because it would file a real
+ *    Wyoming LLC naming a person who does not exist.
+ */
+export function createFormationParty(
+  deps: FormationPartyIntakeDeps,
+  tenantId: string,
+  body: { synthetic?: unknown; parsed?: import("./policy/agentSpec").FormationPartyInput },
+): FormationPartyIntakeResult {
+  if (body.synthetic === true) {
+    if (!deps.sandboxSyntheticPii) return { error: syntheticPiiRefusedMessage() };
+    // The id is minted HERE rather than by the repository because the fixture's email embeds it
+    // (`sandbox+<partyId>@novicorpus.com`) — which is what keeps each sandbox filing
+    // distinguishable in doola's portal, and unmistakably ours.
+    const partyId = randomUUID();
+    deps.parties.create({
+      tenantId,
+      ...syntheticFormationParty(partyId),
+      synthetic: true,
+      partyId,
+    });
+    return { partyId };
+  }
+  if (deps.sandboxSyntheticPii) return { error: syntheticPiiRequiredMessage() };
+  if (!body.parsed) return { error: "a formation party body is required" };
+  const p = body.parsed;
+  return {
+    partyId: deps.parties.create({
+      tenantId,
+      legalFirstName: p.legalFirstName,
+      legalLastName: p.legalLastName,
+      email: p.email,
+      phone: p.phone ?? null,
+      line1: p.address.line1,
+      line2: p.address.line2 ?? null,
+      city: p.address.city,
+      region: p.address.region ?? null,
+      postalCode: p.address.postalCode,
+      country: p.address.country,
+      synthetic: false,
+    }),
+  };
+}
+
+/**
+ * The legacy doors' refusal (design §5, door matrix).
+ *
+ * `src/onboarding/server.ts` and `cli create-entity` bypass the claim, the World gate and the
+ * custody gate entirely — and they have no way to carry a `partyId`. On a deployment where
+ * formation is MANDATORY they would therefore mint entities that are pinned to a provider, owe
+ * a filing, and have no legal identity to file with: a permanently stuck entity, created by a
+ * door that never learned formation exists.
+ *
+ * So they refuse, loudly, at request/command time. The design records the recommendation to
+ * retire the legacy server outright and leaves the decision to this PR's review; the refusal is
+ * what makes either outcome safe in the meantime.
+ */
+export function legacyDoorRefusalMessage(door: "onboarding-server" | "cli create-entity"): string {
+  return `${door} cannot onboard on a deployment where formation is required: it carries no formation party (POST /formation-party) and would mint an entity that can never be filed. Use the wizard API (POST /onboard) or the MCP onboard_agent tool.`;
+}
+
+/** True when the legacy doors must refuse: formation is configured AND mandatory. */
+export function legacyDoorRefused(cfg: Pick<Config, "doola" | "formation">): boolean {
+  return canFormEntities(cfg) && Boolean(cfg.formation?.required);
 }

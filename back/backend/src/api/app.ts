@@ -75,10 +75,20 @@ export interface ApiDeps {
    *  Optional so every existing caller — and every credential-less deployment — builds unchanged;
    *  absent reads as "no formation on this box".
    *
-   *  Note there is deliberately no `required` here in PR 1: FORMATION_REQUIRED is enforced by the
-   *  door gate, which PR 2 adds. Advertising a requirement nothing enforces yet would be a claim
-   *  the deployment cannot keep. */
-  formation?: { environment: DoolaEnvironment };
+   *  `required` joins it in PR 2, together with the door gate that enforces it: advertising a
+   *  requirement nothing enforces would be a claim the deployment cannot keep. The repositories
+   *  travel in here too, so a deployment that forms nothing has no PII surface at all — the
+   *  route and the tool are gated on this one object's presence. */
+  formation?: {
+    environment: DoolaEnvironment;
+    required: boolean;
+    /** Refuse real PII and file with the labeled sandbox fixture instead (§3, audit H7). */
+    sandboxSyntheticPii: boolean;
+    maxPerTenant: number;
+    dailyCeiling: number;
+    parties: import("../persistence/formationPartyRepository").FormationPartyRepository;
+    quota: import("../formation").FormationQuotaReader;
+  };
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
@@ -142,6 +152,10 @@ export function buildApiApp(deps: ApiDeps) {
       // this route can produce. The wizard labels a sandbox filing amber off this value.
       formationAvailable: Boolean(deps.formation),
       formationEnvironment: deps.formation?.environment ?? null,
+      // Whether onboard will REFUSE without a partyId. The wizard needs it to know whether the
+      // legal-identity phase is a step or an option, and it is only advertised now because the
+      // door gate below actually enforces it.
+      formationRequired: Boolean(deps.formation?.required),
     }),
   );
   mountSchemaRoutes(app);
@@ -152,6 +166,7 @@ export function buildApiApp(deps: ApiDeps) {
   mountAuthRoutes(app, deps);
   mountPasskeyRoutes(app, deps);
   app.use("/onboard", requireAuth(deps.jwtSecret));
+  app.use("/formation-party", requireAuth(deps.jwtSecret));
   app.use("/entities", requireAuth(deps.jwtSecret));
   app.use("/entities/*", requireAuth(deps.jwtSecret));
   app.use("/jobs/*", requireAuth(deps.jwtSecret));
