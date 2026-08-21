@@ -100,6 +100,12 @@ export interface ApiDeps {
    * filed, rather than report them as unformed.
    */
   formationSteps?: import("./views").FormationStepsLookup;
+  /** How a view learns which legal documents an entity has. Wired on the same terms as
+   *  `formationSteps` — plain SQL, no credentials needed — so a box that has lost its doola block
+   *  can still list and serve the PDFs it already fetched. */
+  formationDocuments?: import("./views").FormationDocumentsLookup;
+  /** The document index itself, for the download route's ownership re-assertion. */
+  documents?: import("../persistence/documentIndexRepository").DocumentIndexRepository;
   /**
    * The inbound doola webhook receiver (design §6). Present only where the doola block is
    * configured — a credential-less deployment has NO such route, which is the honest answer for a

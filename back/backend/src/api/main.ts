@@ -50,7 +50,9 @@ import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteBridgeLegRepository } from "../persistence/bridgeLegRepository";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
 import { migrate, openDatabase } from "../persistence/db";
+import { SqliteDocumentIndexRepository } from "../persistence/documentIndexRepository";
 import { FileDocumentStore } from "../persistence/documentStore";
+import { SqliteDoolaEventRepository } from "../persistence/doolaEventRepository";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../persistence/formationPartyRepository";
 import { SqliteFormationRepository } from "../persistence/formationRepository";
@@ -66,10 +68,14 @@ import {
 import { SqliteWorldStore } from "../persistence/worldStore";
 import { usdToUnits } from "../policy/units";
 import type { Address } from "../types";
+import { TaskTracker } from "../util/taskTracker";
+import { processDoolaEvent } from "../workflow/formationProcessor";
+import { FormationSweeper, formationReconcile } from "../workflow/formationSweeper";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
 import { buildX402DemoDeps } from "./routes/x402Demo";
+import { installShutdownHandlers, shouldInstallSignalHandlers } from "./shutdown";
 
 async function main() {
   const cfg = loadConfig();
@@ -99,6 +105,10 @@ async function main() {
   // spend-control counts JOIN `entities`, and the party bind commits with the entity claim.
   const formationRequests = new SqliteFormationRepository(db);
   const formationParties = new SqliteFormationPartyRepository(db);
+  // Same db handle again: a stored document's index row and the step it confirms have to commit
+  // against the same database, and the webhook ledger is the sweeper's work queue.
+  const formationDocuments = new SqliteDocumentIndexRepository(db);
+  const doolaEvents = new SqliteDoolaEventRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
@@ -338,6 +348,37 @@ async function main() {
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
 
+  // ── The formation loop (design §5/§6/§7) ─────────────────────────────────────────────────
+  //
+  // All three parts share ONE dependency object, deliberately: the webhook processor and the
+  // sweeper's poll are the same fetch-and-advance, and giving them separate wiring would be the
+  // first step toward them disagreeing about what "filed" means.
+  //
+  // Every piece is gated on `doolaApi`, so a credential-less deployment mounts no receiver,
+  // starts no timer, and reconciles nothing — the stub shape stays exactly as it was.
+  const doolaTasks = new TaskTracker("doola_webhook_task");
+  const formationDeps = doolaApi && {
+    repo,
+    requests: formationRequests,
+    parties: formationParties,
+    documents: formationDocuments,
+    docStore,
+    events: doolaEvents,
+    doola: doolaApi,
+    // The DEPLOYMENT's environment, which is what every entity's pin is compared against.
+    environment: cfg.doola!.environment,
+    intervalMs: cfg.formation?.sweepMs ?? 60_000,
+  };
+  const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
+  if (formationSweeper) {
+    // Beside the two reconcilers above, and for the same reason — except that formation entities
+    // are `bound`/`funded` and therefore invisible to `listInFlight()`, so nothing else would
+    // ever pick up what a restart interrupted.
+    await formationReconcile(formationSweeper);
+    formationSweeper.start();
+    console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
+  }
+
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
   const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
   if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
@@ -441,8 +482,25 @@ async function main() {
         }
       : undefined,
     // Always wired, credentials or not: the rows are plain SQL, and an entity already filed must
-    // stay describable even on a box that has since lost its doola block.
+    // stay describable even on a box that has since lost its doola block. The document index is
+    // wired on the same terms and for the same reason — a filed entity's PDFs stay downloadable.
     formationSteps: (entityKey: string) => formationRequests.stepsOf(entityKey),
+    formationDocuments: (entityKey: string) => formationDocuments.listByEntity(entityKey),
+    documents: formationDocuments,
+    // The inbound receiver (design §6). Present only with credentials: a box that cannot verify a
+    // signature has no business owning the URL.
+    doola:
+      doolaApi && formationDeps
+        ? {
+            environment: cfg.doola!.environment,
+            webhookSecret: cfg.doola!.webhookSecret,
+            webhookSecretPrevious: cfg.doola!.webhookSecretPrevious,
+            events: doolaEvents,
+            tasks: doolaTasks,
+            // The receiver hands over ids; this is where they become a re-fetch (audit H2).
+            process: (wake) => processDoolaEvent(formationDeps, wake),
+          }
+        : undefined,
     repo,
     docStore,
     runner,
@@ -469,8 +527,15 @@ async function main() {
   });
 
   const port = Number(process.env.PORT ?? 8789);
-  serve({ fetch: app.fetch, port });
+  const server = serve({ fetch: app.fetch, port });
   console.log(`Wizard API listening on :${port}`);
+
+  // The API process's FIRST signal handlers (design §7). Until part B every unit of work was a
+  // request, so a restart only dropped HTTP a client would retry; now the process also holds
+  // acked webhook work and an unattended timer. Guarded so importing this module under a test
+  // runner never installs a handler that would exit the runner.
+  if (shouldInstallSignalHandlers())
+    installShutdownHandlers({ sweeper: formationSweeper, tasks: doolaTasks, server });
 }
 
 main().catch((e) => {

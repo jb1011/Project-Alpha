@@ -1,4 +1,5 @@
 import type { DoolaEnvironment } from "../adapters/doola/types";
+import type { DocumentIndexRecord } from "../persistence/documentIndexRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
 import { usesManifestScheme } from "../workflow/onboarding";
@@ -6,6 +7,9 @@ import { usesManifestScheme } from "../workflow/onboarding";
 /** The formation sub-saga rows of one entity. A function rather than the repository so the view
  *  stays a pure projection and the caller decides where the rows come from. */
 export type FormationStepsLookup = (entityKey: string) => FormationRequestRecord[];
+
+/** The legal documents of one entity, for the same reason and on the same terms. */
+export type FormationDocumentsLookup = (entityKey: string) => DocumentIndexRecord[];
 
 /**
  * What a tenant is told about their entity's formation (design §5/§8) — DERIVED from the sub-saga

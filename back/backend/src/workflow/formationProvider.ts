@@ -448,7 +448,17 @@ function confirm(
   detail: CreateProviderDetail,
 ): void {
   const { entityKey, requests } = d;
-  requests.transition(entityKey, "create_provider", "submitted", "confirmed", {
+  // CAS on the state the row is ACTUALLY in, re-read here rather than assumed to be `submitted`.
+  //
+  // The create path does arrive at `submitted`, but the ADOPT path does not: adoption happens
+  // BEFORE the body preconditions (a company that exists must be adopted whatever the party data
+  // looks like now), so a row the sweeper is retrying arrives here still parked in `failed`. A
+  // hardcoded `from` made that transition a silent no-op — the company existed, was read, and the
+  // row stayed `failed` until it burned through eight attempts and was abandoned. Found by part
+  // B's sweeper test; the retry path had no coverage before it.
+  const from = requests.find(entityKey, "create_provider")?.state ?? row.state;
+  if (from === "confirmed" || from === "abandoned") return;
+  requests.transition(entityKey, "create_provider", from, "confirmed", {
     providerRef: companyId,
     detail: JSON.stringify(detail),
     error: null,
