@@ -8,6 +8,7 @@ import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
 import { mountConnectionRoutes } from "./routes/connection";
+import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountMetadataRoutes } from "./routes/metadata";
@@ -99,6 +100,17 @@ export interface ApiDeps {
    * filed, rather than report them as unformed.
    */
   formationSteps?: import("./views").FormationStepsLookup;
+  /**
+   * The inbound doola webhook receiver (design §6). Present only where the doola block is
+   * configured — a credential-less deployment has NO such route, which is the honest answer for a
+   * box that could not verify a signature if one arrived.
+   *
+   * Separate from `formation` above on purpose: `formation` is the DOOR capability (quotas, PII
+   * intake, the required-flag), while this is the inbound channel and its secrets. A box could in
+   * principle receive events for entities it no longer files for, and conflating the two would
+   * make that unrepresentable.
+   */
+  doola?: DoolaWebhookDeps;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
@@ -169,6 +181,10 @@ export function buildApiApp(deps: ApiDeps) {
     }),
   );
   mountSchemaRoutes(app);
+  // PUBLIC, and necessarily so: doola authenticates with an HMAC over the body, not with our JWT.
+  // Mounted BEFORE the /entities auth middleware for the same reason every other public route is,
+  // and gated on the credentials that make verification possible at all.
+  if (deps.doola) mountDoolaWebhookRoutes(app, { ...deps, doola: deps.doola });
   mountMetadataRoutes(app, deps);
   mountTransparencyRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
