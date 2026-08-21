@@ -56,6 +56,8 @@ test("a formed row serves provider + environment + the derived status", () => {
     filedAt: null,
     filingNumber: null,
     ein: null,
+    requiredActions: [],
+    documents: [],
   });
   expect(v.oaAnchor).toEqual({
     scheme: "manifest",
@@ -192,6 +194,8 @@ test("providerRef comes from the create_provider row; the legal facts come from 
     filingNumber: "2026-123456",
     // The AUTHENTICATED view — and only this one — carries the EIN.
     ein: "12-3456789",
+    requiredActions: [],
+    documents: [],
   });
   // `ein` on the record is the placeholder frozen on-chain at mint; it is never served as a fact.
   expect(v.formation!.ein).not.toBe(BASE.ein);
@@ -202,4 +206,77 @@ test("no PII reaches the view, whatever the record carries", () => {
   const printed = JSON.stringify(v);
   for (const forbidden of ["legalFirstName", "email", "ssn", "postalCode", "line1"])
     expect(printed).not.toContain(forbidden);
+});
+
+// ── required actions + documents (design §8, part B) ───────────────────────────────────────
+
+test("requiredActions serves CODES only — never the id, never doola's free-text reason", () => {
+  const withActions = step("await_filing", "pending");
+  withActions.detail = JSON.stringify({
+    submissionStatus: "SUBMITTED",
+    requiredActions: [
+      {
+        id: "ra-1",
+        code: "FORMATION_NAME_OPTIONS_EXHAUSTED",
+        status: "OPEN",
+      },
+    ],
+  });
+  const v = formed([step("create_provider", "confirmed", "cmp-1"), withActions]);
+  expect(v.formation?.requiredActions).toEqual(["FORMATION_NAME_OPTIONS_EXHAUSTED"]);
+  // The internal handle is not a thing a tenant surface has any use for.
+  expect(JSON.stringify(v.formation)).not.toContain("ra-1");
+});
+
+test("a missing, malformed or empty detail blob yields no required actions", () => {
+  for (const detail of [null, "not json", "{}", JSON.stringify({ requiredActions: [] })]) {
+    const row = step("await_filing", "pending");
+    row.detail = detail;
+    // A UI that cannot read the detail must neither claim there is nothing to do NOR invent
+    // something to do.
+    expect(formed([row]).formation?.requiredActions, String(detail)).toEqual([]);
+  }
+  // A malformed ENTRY inside a good blob is skipped rather than serving `undefined`.
+  const partial = step("await_filing", "pending");
+  partial.detail = JSON.stringify({ requiredActions: [{ id: "ra-1" }, { code: "GOOD" }] });
+  expect(formed([partial]).formation?.requiredActions).toEqual(["GOOD"]);
+});
+
+test("documents are projected as metadata with a DERIVED name, and never the storage path", () => {
+  const v = toEntityView(
+    { ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" },
+    () => [step("create_provider", "confirmed", "cmp-1")],
+    () => [
+      {
+        id: "abc123",
+        entityKey: BASE.idempotencyKey,
+        docType: "ArticlesOfOrganization",
+        sha256: "f".repeat(64),
+        contentType: "application/pdf",
+        size: 4096,
+        providerDocId: "doola-doc-1",
+        path: "/data/documents/doc-t-agent-1-ArticlesOfOrganization-doola-doc-1.pdf",
+        createdAt: "2026-08-21 12:00:00",
+      },
+    ],
+  );
+  expect(v.formation?.documents).toEqual([
+    {
+      id: "abc123",
+      type: "ArticlesOfOrganization",
+      name: "ArticlesOfOrganization.pdf",
+      size: 4096,
+      sha256: "f".repeat(64),
+    },
+  ]);
+  // Neither the on-disk path nor doola's own document id belongs on a tenant surface.
+  const json = JSON.stringify(v.formation);
+  expect(json).not.toContain("/data/documents");
+  expect(json).not.toContain("doola-doc-1");
+});
+
+test("no documents lookup wired reads as no documents, not as an error", () => {
+  const v = formed([step("create_provider", "confirmed", "cmp-1")]);
+  expect(v.formation?.documents).toEqual([]);
+  expect(v.formation?.requiredActions).toEqual([]);
 });

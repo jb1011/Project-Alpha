@@ -311,3 +311,47 @@ export function worldIdVerify(token: string, proof: unknown): Promise<WorldIdSta
 export function worldIdWaiver(token: string, code: string): Promise<WorldIdStatusView> {
   return request<WorldIdStatusView>("/world-id/waiver", { token, body: { code } });
 }
+
+/**
+ * Download one legal document as a Blob.
+ *
+ * The only bytes-returning call in this client, and it has to exist: an `<a href>` cannot carry a
+ * Bearer token, so the browser path is fetch -> blob -> objectURL rather than a plain link. The
+ * shared `request` helper is json-only by construction (it calls `res.json()`), so this goes
+ * around it — and therefore repeats the auth header and the error envelope by hand.
+ *
+ * The response is deliberately NOT trusted to be a PDF just because it was asked for: a proxy
+ * error page or an expired-session redirect would otherwise be handed to the caller as a
+ * "document" and saved to disk under a .pdf name.
+ */
+export async function downloadDocument(
+  token: string,
+  id: string,
+  docId: string,
+): Promise<Blob> {
+  const res = await fetch(
+    `${API_URL}/entities/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`,
+    { headers: { authorization: `Bearer ${token}` } },
+  );
+
+  if (!res.ok) {
+    const json = (await res.json().catch(() => null)) as ApiErrorBody | null;
+    throw new ApiError(
+      res.status,
+      json?.error ?? {
+        code: "http_error",
+        message: res.statusText || `Request failed (HTTP ${res.status})`,
+      },
+    );
+  }
+
+  const blob = await res.blob();
+  const contentType = (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  if (contentType !== "application/pdf") {
+    throw new ApiError(res.status, {
+      code: "unexpected_content_type",
+      message: `expected a PDF, got "${contentType || "(none)"}"`,
+    });
+  }
+  return blob;
+}

@@ -1,5 +1,5 @@
 import type { DoolaEnvironment } from "../adapters/doola/types";
-import type { DocumentIndexRecord } from "../persistence/documentIndexRepository";
+import { type DocumentIndexRecord, documentFileName } from "../persistence/documentIndexRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
 import { usesManifestScheme } from "../workflow/onboarding";
@@ -109,7 +109,47 @@ export interface EntityView {
      * neither can grow this field.
      */
     ein: string | null;
+    /**
+     * Open required-action CODES only, e.g. `FORMATION_NAME_OPTIONS_EXHAUSTED`.
+     *
+     * Never the id (an internal handle) and never doola's `reason` prose, which is free text
+     * their operators write and can name the responsible party. A code is a thing the UI can
+     * translate into an instruction; the prose is a PII risk with no upside.
+     */
+    requiredActions: string[];
+    /** The legal documents fetched so far. Metadata only — the bytes come from the download
+     *  route, which re-asserts ownership of its own. */
+    documents: {
+      id: string;
+      type: string;
+      name: string;
+      size: number;
+      /** What a verifier re-computes from the downloaded bytes. */
+      sha256: string;
+    }[];
   } | null;
+}
+
+/**
+ * Open required-action codes out of `await_filing.detail`.
+ *
+ * Parsed structurally rather than by importing the processor's `AwaitFilingDetail`: this module
+ * is a pure projection, and reaching into `workflow/` from here would create an import cycle
+ * (views → processor → receiver → app → views) as well as a layering one. A malformed or absent
+ * blob yields no actions, which is the honest answer — a UI that cannot read the detail must not
+ * claim there is nothing to do OR invent something to do.
+ */
+export function requiredActionCodesOf(steps: FormationRequestRecord[]): string[] {
+  const raw = steps.find((s) => s.step === "await_filing")?.detail;
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as { requiredActions?: { code?: unknown }[] };
+    return (parsed.requiredActions ?? [])
+      .map((a) => a?.code)
+      .filter((c): c is string => typeof c === "string" && c.length > 0);
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -118,7 +158,15 @@ export interface EntityView {
  * `formationSteps` is optional so every pre-formation caller compiles unchanged; absent, a
  * record simply reports the status its own columns can prove, which is `none`.
  */
-export function toEntityView(r: EntityRecord, formationSteps?: FormationStepsLookup): EntityView {
+export function toEntityView(
+  r: EntityRecord,
+  formationSteps?: FormationStepsLookup,
+  formationDocuments?: FormationDocumentsLookup,
+): EntityView {
+  // Read ONCE. The projection asks three questions of the same rows (status, provider ref,
+  // required actions), and calling the lookup per question meant three queries per entity on
+  // every list response.
+  const steps = formationSteps?.(r.idempotencyKey) ?? [];
   return {
     id: r.idempotencyKey,
     name: r.name,
@@ -158,15 +206,21 @@ export function toEntityView(r: EntityRecord, formationSteps?: FormationStepsLoo
         ? {
             provider: r.formationProvider,
             environment: r.formationEnvironment,
-            status: deriveFormationStatus(formationSteps?.(r.idempotencyKey) ?? []),
-            providerRef:
-              formationSteps?.(r.idempotencyKey)?.find((s) => s.step === "create_provider")
-                ?.providerRef ?? null,
+            status: deriveFormationStatus(steps),
+            providerRef: steps.find((s) => s.step === "create_provider")?.providerRef ?? null,
             filedAt: r.formationFiledAt ?? null,
             filingNumber: r.formationFilingNumber ?? null,
             // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain
             // at mint and is never served as a legal fact.
             ein: r.einReal ?? null,
+            requiredActions: requiredActionCodesOf(steps),
+            documents: (formationDocuments?.(r.idempotencyKey) ?? []).map((d) => ({
+              id: d.id,
+              type: d.docType,
+              name: documentFileName(d.docType),
+              size: d.size,
+              sha256: d.sha256,
+            })),
           }
         : null,
   };

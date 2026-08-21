@@ -70,6 +70,9 @@ export interface McpToolDeps {
   /** Formation progress for the read tools' views — the same top-level dep ApiDeps carries, and
    *  present independently of `formation` for the same reason. */
   formationSteps?: import("../api/views").FormationStepsLookup;
+  /** The legal documents behind the same views. An agent reading its own entity sees the hashes
+   *  and can fetch the bytes over REST; the MCP surface never carries them inline. */
+  formationDocuments?: import("../api/views").FormationDocumentsLookup;
 }
 
 /**
@@ -139,7 +142,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         return { content: [{ type: "text", text: "invalid or expired link code" }], isError: true };
       const entities = repo
         .listByTenant(scope.tenantId)
-        .map((r) => toEntityView(r, deps.formationSteps));
+        .map((r) => toEntityView(r, deps.formationSteps, deps.formationDocuments));
       return {
         content: [
           {
@@ -177,7 +180,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const views = repo
         .listByTenant(tenantId)
         .filter((e) => entityInScope(scope, e.idempotencyKey)) // an entity-scoped key lists only its entity
-        .map((r) => toEntityView(r, deps.formationSteps));
+        .map((r) => toEntityView(r, deps.formationSteps, deps.formationDocuments));
       return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );
@@ -194,7 +197,12 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "entity not found" }], isError: true };
       return {
-        content: [{ type: "text", text: JSON.stringify(toEntityView(rec, deps.formationSteps)) }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(toEntityView(rec, deps.formationSteps, deps.formationDocuments)),
+          },
+        ],
       };
     },
   );

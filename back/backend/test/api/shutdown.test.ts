@@ -146,7 +146,12 @@ test("a second signal during a drain is ignored, not a second shutdown", async (
 test("shutdown works with nothing wired at all (a credential-less deployment)", async () => {
   const p = fakeProc();
   let exited = false;
-  const shutdown = installShutdownHandlers({ proc: p.proc, exit: () => (exited = true) });
+  const shutdown = installShutdownHandlers({
+    proc: p.proc,
+    exit: () => {
+      exited = true;
+    },
+  });
   await shutdown("SIGINT");
   expect(exited).toBe(true);
 });

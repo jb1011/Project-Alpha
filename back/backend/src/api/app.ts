@@ -8,6 +8,7 @@ import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
 import { mountConnectionRoutes } from "./routes/connection";
+import { mountDocumentRoutes } from "./routes/documents";
 import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
 import { mountJobRoutes } from "./routes/jobs";
@@ -210,6 +211,8 @@ export function buildApiApp(deps: ApiDeps) {
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);
+  // After the `/entities/*` requireAuth line above, so both document routes inherit auth.
+  mountDocumentRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);
   mountPerTxCapRoutes(app, deps);

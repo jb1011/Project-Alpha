@@ -61,7 +61,26 @@ export type EntityView = {
     /** Owner-visible only: this field exists on the authenticated entity view and on no public
      *  surface. Never render it outside a signed-in owner's own dashboard. */
     ein?: string | null;
+    /** Open required-action CODES (e.g. `FORMATION_NAME_OPTIONS_EXHAUSTED`) — never doola's
+     *  free-text reason, which their operators write and can name the responsible party.
+     *  Optional for deploy-order safety: a backend that predates this field has no actions. */
+    requiredActions?: string[];
+    /** Legal documents fetched from doola so far. Metadata only — the bytes come from
+     *  `downloadDocument`, which re-asserts ownership server-side. */
+    documents?: FormationDocument[];
   } | null;
+};
+
+/** One stored legal document. `sha256` is what a verifier recomputes from the downloaded bytes
+ *  (and, from PR 3, what the on-chain OA bundle manifest commits to). */
+export type FormationDocument = {
+  id: string;
+  /** doola's document type, e.g. "ArticlesOfOrganization" | "OperatingAgreement". */
+  type: string;
+  /** A safe, derived filename — never a provider-supplied string. */
+  name: string;
+  size: number;
+  sha256: string;
 };
 
 /** Public deployment capabilities (GET /config, unauthenticated) — lets the wizard preselect the
