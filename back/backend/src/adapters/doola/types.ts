@@ -41,10 +41,16 @@ export interface DoolaAddress {
   line1: string;
   line2?: string;
   city: string;
-  /** US: the 2-letter state code. Omitted for countries that have no state/province. */
+  /** US: the 2-letter state code. The OpenAPI document marks this REQUIRED on every address,
+   *  which sits awkwardly with the countries that have no state/province — a §9 item to settle
+   *  against the live API before the first non-US production filing. */
   state?: string;
   postalCode: string;
   country: Iso3Country;
+  /** E.164. **REQUIRED on a natural person's address** (responsible party, member, executive
+   *  member) — live sandbox 2026-08-21 answers `E_REQUEST_BODY_INVALID: Address Phone number
+   *  cannot be null or empty` without it. Optional on a company mailing/business address. */
+  phone?: string;
 }
 
 /** `CreateCustomerRequestDto`. The customer carries NO address — the postal addresses of the
@@ -218,7 +224,9 @@ export interface DoolaErrorEnvelope {
   error?: {
     code?: string;
     message?: string;
-    fields?: Record<string, string | string[]>;
+    /** Field-level detail. Live shape is `{field: {code, message}}` — NOT the flat
+     *  `{field: "reason"}` PR 1 assumed — so it is carried opaquely and only ever logged. */
+    fields?: Record<string, unknown>;
     requestId?: string;
   };
   payload?: unknown;

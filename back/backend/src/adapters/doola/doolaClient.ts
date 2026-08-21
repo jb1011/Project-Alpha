@@ -60,8 +60,9 @@ export class DoolaApiError extends Error {
     message: string,
     /** doola's correlation id — the FIRST thing their support asks for. */
     readonly requestId?: string,
-    /** Field-level detail on a validation failure. */
-    readonly fields?: Record<string, string | string[]>,
+    /** Field-level detail on a validation failure. Opaque: doola nests `{code, message}` per
+     *  field, and a narrower type would be a claim about a partner surface we do not control. */
+    readonly fields?: Record<string, unknown>,
   ) {
     super(message);
     this.name = "DoolaApiError";
