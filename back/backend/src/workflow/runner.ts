@@ -2,7 +2,7 @@ import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import { ApiError } from "../api/errors";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { AgentSpec } from "../policy/agentSpec";
-import type { Address, EntityRecord, EntityStatus } from "../types";
+import type { Address, EntityRecord, EntityStatus, FormationPin } from "../types";
 
 export type RunSaga = (input: {
   spec: AgentSpec;
@@ -33,7 +33,7 @@ export class OnboardingRunner {
        *  per-call argument — no door has to learn about it. Stamped on the CLAIM so the
        *  environment an entity is pinned to is fixed before anything can be filed for it (audit
        *  M5). Absent (no doola credentials) = stub mode, `formation_provider` stays null. */
-      formation?: { provider: string; environment: "sandbox" | "production" };
+      formation?: FormationPin | null;
     },
   ) {}
 

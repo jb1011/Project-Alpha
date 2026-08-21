@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { AuthVars } from "../auth/middleware";
 import { requireAuth } from "../auth/middleware";
 import { mountMcpRoute } from "../mcp/transport";
@@ -68,13 +69,16 @@ export interface ApiDeps {
   circleCustodyAvailable: boolean;
   /** Mirror flag for turnkey: false on deployments (e.g. mainnet) that ship no Turnkey config. */
   turnkeyCustodyAvailable: boolean;
-  /** doola formation (design §2). All three are OPTIONAL so every existing caller — and every
-   *  credential-less deployment — builds unchanged; absent reads as "no formation on this box".
-   *  `formationEnvironment` is REQUIRED-when-available by the honesty invariant: a sandbox
-   *  formation must never be renderable as a real one. */
-  formationAvailable?: boolean;
-  formationRequired?: boolean;
-  formationEnvironment?: "sandbox" | "production" | null;
+  /** doola formation (design §2). ONE optional object, not a bag of parallel flags: an
+   *  "available" boolean and an environment that could disagree is exactly the drift the honesty
+   *  invariant forbids, so availability is DERIVED from the object's presence at the route.
+   *  Optional so every existing caller — and every credential-less deployment — builds unchanged;
+   *  absent reads as "no formation on this box".
+   *
+   *  Note there is deliberately no `required` here in PR 1: FORMATION_REQUIRED is enforced by the
+   *  door gate, which PR 2 adds. Advertising a requirement nothing enforces yet would be a claim
+   *  the deployment cannot keep. */
+  formation?: { environment: DoolaEnvironment };
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
@@ -133,12 +137,11 @@ export function buildApiApp(deps: ApiDeps) {
       walletProviderDefault: deps.walletProviderDefault,
       circleCustodyAvailable: deps.circleCustodyAvailable,
       turnkeyCustodyAvailable: deps.turnkeyCustodyAvailable,
-      // Formation (design §2). Booleans + an enum, same discipline as the custody flags. The
-      // environment is served so the wizard can label a sandbox filing amber ("Demo formation")
-      // instead of green — the honesty invariant, enforced at the surface that renders it.
-      formationAvailable: Boolean(deps.formationAvailable),
-      formationRequired: Boolean(deps.formationRequired),
-      formationEnvironment: deps.formationEnvironment ?? null,
+      // Formation (design §2). Both fields are projections of ONE dep, so "available with no
+      // environment" — a sandbox filing renderable without its "demo" qualifier — is not a state
+      // this route can produce. The wizard labels a sandbox filing amber off this value.
+      formationAvailable: Boolean(deps.formation),
+      formationEnvironment: deps.formation?.environment ?? null,
     }),
   );
   mountSchemaRoutes(app);

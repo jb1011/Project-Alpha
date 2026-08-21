@@ -53,11 +53,12 @@ export type PublicConfig = {
   /** Optional for deploy-order safety: a backend that predates this field means "available"
    *  (every legacy deployment served turnkey). Mainnet ships false — circle-only. */
   turnkeyCustodyAvailable?: boolean;
-  /** doola formation. All three are optional for deploy-order safety: a backend that predates
-   *  them forms nothing, which is exactly what absent should mean. `formationEnvironment` is
-   *  non-null whenever formation is available — the honesty invariant. */
+  /** doola formation. Both are optional for deploy-order safety: a backend that predates them
+   *  forms nothing, which is exactly what absent should mean. `formationEnvironment` is non-null
+   *  whenever formation is available — the honesty invariant, and the reason the two are served
+   *  as projections of one value rather than as independent flags. (Whether formation is
+   *  REQUIRED is not advertised until the door gate that enforces it ships.) */
   formationAvailable?: boolean;
-  formationRequired?: boolean;
   formationEnvironment?: "sandbox" | "production" | null;
 };
 

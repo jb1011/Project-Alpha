@@ -1,3 +1,4 @@
+import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { EntityRecord } from "../types";
 
 /** Secret-free projection of an EntityRecord for API responses. */
@@ -36,7 +37,7 @@ export interface EntityView {
    *  formation sub-saga. NO PII is ever served here. */
   formation: {
     provider: string;
-    environment: "sandbox" | "production";
+    environment: DoolaEnvironment;
     status: "none";
   } | null;
 }

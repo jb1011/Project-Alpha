@@ -18,7 +18,7 @@ import type { EntityRepository } from "../persistence/entityRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import { assertOperatorDistinct, translate } from "../policy/translator";
 import { usdToUnits } from "../policy/units";
-import type { EntityRecord, Hex } from "../types";
+import type { EntityRecord, FormationPin, Hex } from "../types";
 
 /** Result of provisioning a per-agent Turnkey vault (the saga only needs these three fields). */
 export interface ProvisionedVault {
@@ -100,7 +100,7 @@ export interface OnboardingDeps {
    *  entity was pinned to can never be re-pointed by a config flip (audit M5). Absent (no doola
    *  credentials) = stub mode: `formation_provider` stays null, forever, and NOTHING else in the
    *  saga changes. */
-  formation?: { provider: string; environment: "sandbox" | "production" };
+  formation?: FormationPin | null;
 }
 
 /**

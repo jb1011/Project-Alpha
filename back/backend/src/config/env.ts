@@ -1,6 +1,7 @@
 import { getAddress, isAddress, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
+import type { DoolaEnvironment } from "../adapters/doola/types";
 import { usdToUnits } from "../policy/units";
 import type { Address, Hex } from "../types";
 
@@ -27,6 +28,12 @@ const etherSchema = z.string().refine(
 
 const DEV_JWT_SECRET = "dev-insecure-secret-change-me-please";
 
+/** Arc TESTNET's chain id — the schema default, and the value `ARC_NETWORK` is cross-checked
+ *  against. Named rather than repeated: `ARC_NETWORK` and `ARC_CHAIN_ID` are two knobs describing
+ *  ONE network, and a deployment that names mainnet while still pointing at the testnet chain id
+ *  would sign real filings against test state (or the reverse) with nothing to catch it. */
+export const ARC_TESTNET_CHAIN_ID = 5042002;
+
 /** Fallbacks for `Config.worldChain` (optional in the type for test fixtures). */
 export const WORLD_CHAIN_DEFAULTS = {
   rpcUrl: "https://worldchain-mainnet.g.alchemy.com/public",
@@ -36,7 +43,7 @@ export const WORLD_CHAIN_DEFAULTS = {
 
 const EnvSchema = z.object({
   ARC_TESTNET_RPC_URL: z.string().url(),
-  ARC_CHAIN_ID: z.coerce.number().int().positive().default(5042002),
+  ARC_CHAIN_ID: z.coerce.number().int().positive().default(ARC_TESTNET_CHAIN_ID),
   PLATFORM_PRIVATE_KEY: privKeySchema,
   IDENTITY_REGISTRY: addressSchema.default("0x8004A818BFB912233c491871b3d84c89A494BD9e"),
   USDC_ADDRESS: addressSchema.default("0x3600000000000000000000000000000000000000"),
@@ -221,10 +228,25 @@ export const DOOLA_BASE_URLS = {
   production: "https://api.doola.com",
 } as const;
 
-/** "true"/"1" -> true, "false"/"0"/anything else -> false, ABSENT -> `whenUnset` (tri-state). */
-function boolWithDerivedDefault(raw: string | undefined, whenUnset: boolean): boolean {
+/**
+ * Tri-state boolean env var: absent/blank -> `whenUnset`, otherwise an EXPLICIT true or false.
+ *
+ * Case-insensitive `true|1|yes` / `false|0|no`, and ANYTHING else THROWS. The old "anything that
+ * is not true is false" rule silently turned `FORMATION_REQUIRED=True`, `=yes` and `=ture` into
+ * `false` — i.e. an operator deliberately enabling mandatory formation could get a deployment
+ * that quietly forms nothing, which is exactly the failure the boot invariants exist to prevent.
+ * A typo in a boolean is a config error and reads as one.
+ */
+function boolWithDerivedDefault(
+  raw: string | undefined,
+  whenUnset: boolean,
+  varName: string,
+): boolean {
   if (raw === undefined || raw.trim() === "") return whenUnset;
-  return raw === "true" || raw === "1";
+  const v = raw.trim().toLowerCase();
+  if (v === "true" || v === "1" || v === "yes") return true;
+  if (v === "false" || v === "0" || v === "no") return false;
+  throw new Error(`Invalid config: ${varName} must be true|false (got "${raw}")`);
 }
 
 export interface Config {
@@ -346,7 +368,7 @@ export interface Config {
     apiKey: string;
     webhookSecret: string;
     webhookSecretPrevious?: string;
-    environment: "sandbox" | "production";
+    environment: DoolaEnvironment;
     /** Resolved host: DOOLA_BASE_URL when set, else DOOLA_BASE_URLS[environment]. */
     baseUrl: string;
   };
@@ -550,16 +572,32 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     arcNetwork: e.ARC_NETWORK,
     formation: {
       // Turning the provider on makes formation mandatory unless the operator says otherwise.
-      required: boolWithDerivedDefault(e.FORMATION_REQUIRED, Boolean(doola)),
+      required: boolWithDerivedDefault(e.FORMATION_REQUIRED, Boolean(doola), "FORMATION_REQUIRED"),
       sweepMs: e.FORMATION_SWEEP_MS,
       maxPerTenant: e.FORMATION_MAX_PER_TENANT,
       dailyCeiling: e.FORMATION_DAILY_CEILING,
       sandboxSyntheticPii: boolWithDerivedDefault(
         e.FORMATION_SANDBOX_SYNTHETIC_PII,
         e.DOOLA_ENVIRONMENT === "sandbox",
+        "FORMATION_SANDBOX_SYNTHETIC_PII",
       ),
     },
   };
+
+  // Formation (design §2), Circle twin: a half-configured doola block must fail at boot, not at
+  // the first filing — a real Wyoming LLC and a real fee are on the other side of that call.
+  //
+  // FIRST, deliberately: every invariant below reads `canFormEntities(cfg)`, which is false for a
+  // HALF-configured block just as it is for an absent one. Checking them first would answer
+  // "DOOLA_API_KEY is missing" to an operator who set DOOLA_API_KEY and forgot the webhook secret.
+  // The all-or-nothing message is the one that names the missing half.
+  if (Boolean(e.DOOLA_API_KEY) !== Boolean(e.DOOLA_WEBHOOK_SECRET)) {
+    throw new Error(
+      e.DOOLA_API_KEY
+        ? "Invalid config: DOOLA_API_KEY is set but DOOLA_WEBHOOK_SECRET is missing (all-or-nothing)"
+        : "Invalid config: DOOLA_WEBHOOK_SECRET is set but DOOLA_API_KEY is missing (all-or-nothing)",
+    );
+  }
 
   const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
 
@@ -599,11 +637,34 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       throw new Error(
         "Invalid config: ARC_NETWORK=mainnet requires the doola block (DOOLA_API_KEY + DOOLA_WEBHOOK_SECRET) — formation is mandatory on mainnet",
       );
+    // Having the credentials is not the same as USING them: FORMATION_REQUIRED=false with the
+    // block present would mint mainnet entities whose legal body is a stub, which is precisely
+    // the shape "formation is mandatory on mainnet" forbids. It defaults to true, so this only
+    // ever fires on a deliberate opt-out — and that opt-out has to be refused, not honored.
+    if (!cfg.formation.required)
+      throw new Error(
+        "Invalid config: ARC_NETWORK=mainnet with FORMATION_REQUIRED=false — formation is mandatory on mainnet, so mainnet entities can never be stub-only (unset FORMATION_REQUIRED or set it to true)",
+      );
     if (cfg.doola?.environment === "sandbox")
       throw new Error(
         "Invalid config: ARC_NETWORK=mainnet with DOOLA_ENVIRONMENT=sandbox — a mainnet deployment must not file DEMO-watermarked sandbox entities (set DOOLA_ENVIRONMENT=production)",
       );
   }
+
+  // ARC_NETWORK vs ARC_CHAIN_ID (design §2). Two knobs describe ONE network, and nothing else
+  // reconciles them: a box that says "mainnet" while still pointing at the testnet chain id would
+  // file REAL Wyoming LLCs and anchor them against test state — and the reverse ("testnet" on a
+  // foreign chain id) silently domain-separates every manifest away from the chain we verify on
+  // (manifest §4 binds chainId). Both directions refuse, and the checks sit AFTER the mainnet
+  // invariants above so a mainnet box with no provider still hears about the provider first.
+  if (cfg.arcNetwork === "testnet" && cfg.chainId !== ARC_TESTNET_CHAIN_ID)
+    throw new Error(
+      `Invalid config: ARC_NETWORK=testnet with ARC_CHAIN_ID=${cfg.chainId} — Arc testnet is chain ${ARC_TESTNET_CHAIN_ID} (name the network the chain id actually belongs to)`,
+    );
+  if (cfg.arcNetwork === "mainnet" && cfg.chainId === ARC_TESTNET_CHAIN_ID)
+    throw new Error(
+      `Invalid config: ARC_NETWORK=mainnet with ARC_CHAIN_ID=${ARC_TESTNET_CHAIN_ID} — that is the Arc TESTNET chain id (set ARC_CHAIN_ID to the mainnet chain)`,
+    );
 
   if (parseEther(cfg.gasSeedFloorUsdc) >= parseEther(cfg.gasSeedTargetUsdc)) {
     throw new Error("Invalid config: GAS_SEED_FLOOR_USDC must be less than GAS_SEED_TARGET_USDC");
@@ -615,16 +676,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       e.CIRCLE_API_KEY
         ? "Invalid config: CIRCLE_API_KEY is set but CIRCLE_ENTITY_SECRET is missing (all-or-nothing)"
         : "Invalid config: CIRCLE_ENTITY_SECRET is set but CIRCLE_API_KEY is missing (all-or-nothing)",
-    );
-  }
-
-  // Formation (design §2), Circle twin: a half-configured doola block must fail at boot, not at
-  // the first filing — a real Wyoming LLC and a real fee are on the other side of that call.
-  if (Boolean(e.DOOLA_API_KEY) !== Boolean(e.DOOLA_WEBHOOK_SECRET)) {
-    throw new Error(
-      e.DOOLA_API_KEY
-        ? "Invalid config: DOOLA_API_KEY is set but DOOLA_WEBHOOK_SECRET is missing (all-or-nothing)"
-        : "Invalid config: DOOLA_WEBHOOK_SECRET is set but DOOLA_API_KEY is missing (all-or-nothing)",
     );
   }
 

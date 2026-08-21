@@ -1,6 +1,17 @@
 import type { Address, Hex } from "viem";
+import type { DoolaEnvironment } from "./adapters/doola/types";
 
 export type { Address, Hex };
+export type { DoolaEnvironment };
+
+/**
+ * What a deployment pins a NEW entity to at claim time (design §2, audit M5).
+ *
+ * Provider AND environment travel together, always: an entity pinned to a provider with no
+ * environment could be rendered without its "demo" qualifier, and an environment with no
+ * provider names a filer nobody can call. One type, so no door can carry half of it.
+ */
+export type FormationPin = { provider: "doola"; environment: DoolaEnvironment };
 
 /** Mirror of LegalManagerFactory.TreasuryConfig (encoded into createEntity). */
 export interface TreasuryConfig {
@@ -76,7 +87,7 @@ export interface EntityRecord {
   formationProvider?: string | null;
   /** The provider environment this entity is PINNED to. A mainnet flip can never route an
    *  in-flight sandbox company at the production host. */
-  formationEnvironment?: "sandbox" | "production" | null;
+  formationEnvironment?: DoolaEnvironment | null;
   /** The real EIN once the IRS issues one. `ein` stays the value frozen on-chain at mint. */
   einReal?: string | null;
   /** Unix seconds the entity was actually filed (distinct from the on-chain `formationDate`). */

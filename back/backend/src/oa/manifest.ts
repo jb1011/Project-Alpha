@@ -1,4 +1,5 @@
 import { type Hex, keccak256, toHex } from "viem";
+import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { TranslateResult } from "../policy/translator";
 import { computeOaHash, renderOperatingAgreement } from "./generator";
@@ -104,7 +105,7 @@ export const OA_MANIFEST_VERSION_V1 = 1;
  *  invariant is mechanical: a sandbox filing cannot be rendered as a real one by omission. */
 export interface ManifestLegal {
   provider: string;
-  environment: "sandbox" | "production";
+  environment: DoolaEnvironment;
   providerCompanyId: string;
   entityType: string;
   state: string;

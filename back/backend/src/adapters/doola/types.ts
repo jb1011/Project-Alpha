@@ -11,6 +11,15 @@
  *  - the US state is a 2-letter code on input ("WY").
  */
 
+/**
+ * Which doola environment a client, a deployment or a single ENTITY is pinned to.
+ *
+ * Exported from here and imported EVERYWHERE (config, manifest, views, the API surface) rather
+ * than re-typed inline: the honesty invariant (§2) says a sandbox filing must never render as a
+ * real one, and an inline copy is how one surface quietly grows a third value — or drops one.
+ */
+export type DoolaEnvironment = "sandbox" | "production";
+
 /** ISO-3166-1 alpha-3 country code, e.g. "USA". Aliased for readability at the call sites. */
 export type Iso3Country = string;
 
