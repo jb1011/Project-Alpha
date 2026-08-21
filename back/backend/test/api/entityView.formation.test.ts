@@ -124,6 +124,8 @@ const step = (
   providerRef,
   detail: null,
   error: null,
+  createdAt: "2026-08-21 12:00:00",
+  updatedAt: "2026-08-21 12:00:00",
 });
 
 const formed = (steps: FormationRequestRecord[]) =>

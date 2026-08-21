@@ -36,6 +36,8 @@ export interface FormationPartyRecord {
   postalCode: string;
   /** ISO-3166-1 alpha-3, e.g. "USA". */
   country: string;
+  /** When this row was created (SQLite UTC TEXT). Survives erasure — see `erase`. */
+  createdAt: string;
   /** True = a labeled sandbox fixture, not a real natural person (§3, audit H7). */
   synthetic: boolean;
   /** Erasure marker for a party that never reached a filing. */
@@ -51,7 +53,7 @@ export interface FormationPartyRecord {
  */
 export type NewFormationParty = Omit<
   FormationPartyRecord,
-  "partyId" | "entityKey" | "deletedAt"
+  "partyId" | "entityKey" | "deletedAt" | "createdAt"
 > & {
   partyId?: string;
 };
@@ -71,6 +73,7 @@ interface Row {
   postal_code: string;
   country: string;
   synthetic: number;
+  created_at: string;
   deleted_at: string | null;
 }
 
@@ -90,6 +93,7 @@ function toRecord(r: Row): FormationPartyRecord {
     postalCode: r.postal_code,
     country: r.country,
     synthetic: r.synthetic === 1,
+    createdAt: r.created_at,
     deletedAt: r.deleted_at,
   };
 }
@@ -104,6 +108,26 @@ export interface FormationPartyRepository {
   bind(partyId: string, entityKey: string, tenantId: string): boolean;
   /** The bound party for an entity — what `create_provider` files with. */
   findByEntityKey(entityKey: string): FormationPartyRecord | undefined;
+  /**
+   * Erasure candidates (design §3, audit H7). Two disjoint reasons, one query each:
+   *
+   *  - a party bound to an entity whose `create_provider` was **abandoned** — the filing will
+   *    never happen, so no retention duty ever attached to it;
+   *  - an **unbound** party older than the cutoff — a form that was filled in and never used.
+   *
+   * A party bound to a filing that DID happen is never in this list: once a responsible party is
+   * on a state filing, the retention duty is real and erasing our copy would not unfile it.
+   */
+  listErasable(unboundCutoffUtc: string): { partyId: string; reason: "abandoned" | "unbound" }[];
+  /**
+   * ERASE: NULL every column that is personal data and stamp `deleted_at`. `party_id`,
+   * `tenant_id` and the timestamps survive so the erasure itself remains auditable — "this handle
+   * existed and its contents were destroyed on this date" is the record we owe, and a deleted row
+   * could not carry it.
+   *
+   * Returns false when the row was already erased (idempotent under a re-run of the sweep).
+   */
+  erase(partyId: string): boolean;
 }
 
 export class SqliteFormationPartyRepository implements FormationPartyRepository {
@@ -129,6 +153,27 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
       ),
       findByEntity: db.prepare(
         "SELECT * FROM formation_parties WHERE entity_key = ? AND deleted_at IS NULL",
+      ),
+      listAbandoned: db.prepare(
+        `SELECT p.party_id AS party_id
+           FROM formation_parties p
+           JOIN formation_requests f
+             ON f.entity_key = p.entity_key AND f.step = 'create_provider'
+          WHERE p.deleted_at IS NULL AND f.state = 'abandoned'`,
+      ),
+      listStaleUnbound: db.prepare(
+        `SELECT party_id FROM formation_parties
+          WHERE deleted_at IS NULL AND entity_key IS NULL AND created_at < ?`,
+      ),
+      // Every PII column to NULL in ONE statement — a loop, or a second pass, is a window in
+      // which half a person's data is erased and half is not.
+      erase: db.prepare(
+        `UPDATE formation_parties
+            SET legal_first_name = NULL, legal_last_name = NULL, email = NULL, phone = NULL,
+                line1 = NULL, line2 = NULL, city = NULL, region = NULL,
+                postal_code = NULL, country = NULL,
+                deleted_at = CURRENT_TIMESTAMP
+          WHERE party_id = ? AND deleted_at IS NULL`,
       ),
     };
   }
@@ -168,5 +213,22 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
   findByEntityKey(entityKey: string): FormationPartyRecord | undefined {
     const r = this.stmts.findByEntity.get(entityKey) as Row | undefined;
     return r ? toRecord(r) : undefined;
+  }
+
+  listErasable(unboundCutoffUtc: string): { partyId: string; reason: "abandoned" | "unbound" }[] {
+    const abandoned = (this.stmts.listAbandoned.all() as { party_id: string }[]).map((r) => ({
+      partyId: r.party_id,
+      reason: "abandoned" as const,
+    }));
+    const unbound = (
+      this.stmts.listStaleUnbound.all(unboundCutoffUtc) as { party_id: string }[]
+    ).map((r) => ({ partyId: r.party_id, reason: "unbound" as const }));
+    // The two sets are disjoint by construction (one requires a bound entity_key, the other
+    // requires it to be NULL), so no de-duplication is needed or wanted.
+    return [...abandoned, ...unbound];
+  }
+
+  erase(partyId: string): boolean {
+    return this.stmts.erase.run(partyId).changes === 1;
   }
 }

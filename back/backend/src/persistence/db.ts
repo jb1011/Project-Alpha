@@ -34,11 +34,16 @@ const FORMATION_PARTIES_DDL = `
       party_id   TEXT PRIMARY KEY,
       entity_key TEXT UNIQUE,      -- NULL until the party is bound to an entity at onboard
       tenant_id  TEXT NOT NULL,
-      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
-      email TEXT NOT NULL, phone TEXT,
-      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
+      -- The PII columns are NULLABLE, and that is the point: ERASURE (§3, audit H7) sets every
+      -- one of them to NULL and stamps deleted_at, keeping only the handle, the owner and the
+      -- dates so the erasure itself stays auditable. A NOT NULL here would force the sweeper to
+      -- overwrite personal data with a sentinel string instead of removing it — "erased" has to
+      -- mean the column holds nothing, not that it holds something else.
+      legal_first_name TEXT, legal_last_name TEXT,
+      email TEXT, phone TEXT,
+      line1 TEXT, line2 TEXT, city TEXT,
       region TEXT,
-      postal_code TEXT NOT NULL, country TEXT NOT NULL,   -- ISO-3
+      postal_code TEXT, country TEXT,   -- ISO-3
       -- A clearly-labeled sandbox fixture rather than a real natural person (§3, audit H7).
       synthetic INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -510,6 +515,42 @@ export function migrate(db: Database.Database): void {
     db.exec(`DROP TABLE formation_parties;${FORMATION_PARTIES_DDL}`);
   }
   db.exec(FORMATION_PARTIES_INDEX_DDL);
+
+  // One-shot: drop NOT NULL from the PII columns so erasure can actually NULL them (§3, H7).
+  // SQLite cannot ALTER a constraint away, so this is the documented 4-step dance — create the
+  // new shape, copy, drop, rename — inside one transaction, preserving every existing row. The
+  // guard is the column's own nullability rather than a `meta` marker: it reads the fact it is
+  // fixing, so a database restored from a pre-PR-2 backup is repaired too, and a database that
+  // is already correct is untouched no matter how many times migrate() runs.
+  const partyInfo = db.prepare("PRAGMA table_info(formation_parties)").all() as {
+    name: string;
+    notnull: number;
+  }[];
+  if (partyInfo.some((c) => c.name === "legal_first_name" && c.notnull === 1)) {
+    db.transaction(() => {
+      db.exec(FORMATION_PARTIES_DDL.replace("formation_parties", "formation_parties_new"));
+      db.exec(`
+        INSERT INTO formation_parties_new
+          (party_id, entity_key, tenant_id, legal_first_name, legal_last_name, email, phone,
+           line1, line2, city, region, postal_code, country, synthetic, created_at, deleted_at)
+        SELECT party_id, entity_key, tenant_id, legal_first_name, legal_last_name, email, phone,
+               line1, line2, city, region, postal_code, country, synthetic, created_at, deleted_at
+          FROM formation_parties;
+        DROP TABLE formation_parties;
+        ALTER TABLE formation_parties_new RENAME TO formation_parties;
+      `);
+      db.exec(FORMATION_PARTIES_INDEX_DDL);
+    })();
+  }
+
+  // The documents index is keyed by OUR derived id (documentIndexRepository.documentIndexId), but
+  // the fact that makes a re-fetch idempotent is (entity, doola document id) — so that pair is
+  // the constraint, and a second insert for a document we already stored is a no-op rather than a
+  // duplicate row pointing at a second copy of the same bytes.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_entity_provider ON documents(entity_key, provider_doc_id)",
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents(entity_key)");
 
   const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
     (c) => c.name,

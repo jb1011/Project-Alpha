@@ -85,16 +85,33 @@ test("the webhook-events index is PARTIAL on processed_at IS NULL (the sweeper's
   expect(idx).toContain("WHERE processed_at IS NULL");
 });
 
-test("formation_parties.region and deleted_at are NULLABLE (most countries have no region; H7)", () => {
+test("every PII column in formation_parties is NULLABLE — that is what ERASURE needs (H7)", () => {
   const cols = db.prepare("PRAGMA table_info(formation_parties)").all() as {
     name: string;
     notnull: number;
   }[];
   expect(cols.find((c) => c.name === "region")?.notnull).toBe(0);
   expect(cols.find((c) => c.name === "deleted_at")?.notnull).toBe(0);
-  // …while the fields a filing legally requires stay NOT NULL.
-  for (const required of ["legal_first_name", "legal_last_name", "email", "line1", "city"])
-    expect(cols.find((c) => c.name === required)?.notnull).toBe(1);
+  // PR 2 part A declared the legally-required fields NOT NULL. Part B has to erase them: the
+  // sweeper NULLs every PII column for a party whose filing provably never happened, and a NOT
+  // NULL constraint would force it to overwrite personal data with a sentinel string instead of
+  // removing it. "Erased" has to mean the column holds nothing. What a FILING requires is still
+  // required — enforced where it belongs, at the intake schema (POST /formation-party), which is
+  // the only writer.
+  for (const pii of [
+    "legal_first_name",
+    "legal_last_name",
+    "email",
+    "phone",
+    "line1",
+    "line2",
+    "city",
+    "postal_code",
+    "country",
+  ])
+    expect(cols.find((c) => c.name === pii)?.notnull, pii).toBe(0);
+  // The columns that must survive an erasure keep their constraints.
+  expect(cols.find((c) => c.name === "tenant_id")?.notnull).toBe(1);
 });
 
 test("formation_parties is keyed by party_id, with a NULLABLE UNIQUE entity_key + a tenant", () => {

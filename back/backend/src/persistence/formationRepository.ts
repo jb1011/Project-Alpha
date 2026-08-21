@@ -39,6 +39,11 @@ export interface FormationRequestRecord {
   /** JSON blob: filingNumber, ein, document ids. NEVER PII (that lives in formation_parties). */
   detail: string | null;
   error: string | null;
+  /** SQLite TEXT "YYYY-MM-DD HH:MM:SS", UTC. The sweeper's backoff clock reads these, so they
+   *  are part of the record rather than a second query: "how long has this row been failed?" and
+   *  "how long has this entity been in flight?" are the two questions every tick asks. */
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface Row {
@@ -49,6 +54,8 @@ interface Row {
   provider_ref: string | null;
   detail: string | null;
   error: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 function toRecord(r: Row): FormationRequestRecord {
@@ -60,6 +67,8 @@ function toRecord(r: Row): FormationRequestRecord {
     providerRef: r.provider_ref,
     detail: r.detail,
     error: r.error,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
   };
 }
 
@@ -74,6 +83,14 @@ export interface FormationRepository {
   find(entityKey: string, step: FormationStep): FormationRequestRecord | undefined;
   stepsOf(entityKey: string): FormationRequestRecord[];
   listByState(state: FormationState): FormationRequestRecord[];
+  /** The entity a doola company id belongs to (`idx_formation_provider`). This is the ONLY
+   *  mapping from a webhook's `doolaCompanyId` to anything of ours — and until it exists, an
+   *  arriving event is unmappable and waits in `doola_webhook_events` for a tick that can place
+   *  it (design §5/§6). */
+  findByProviderRef(providerRef: string): FormationRequestRecord | undefined;
+  /** Entity keys with at least one step not yet in a terminal state — the sweeper's poll
+   *  candidate set, narrowed further by the derived formation status at the call site. */
+  listOpenEntityKeys(): string[];
   transition(
     entityKey: string,
     step: FormationStep,
@@ -109,6 +126,15 @@ export class SqliteFormationRepository implements FormationRepository {
       stepsOf: db.prepare("SELECT * FROM formation_requests WHERE entity_key = ?"),
       listByState: db.prepare(
         "SELECT * FROM formation_requests WHERE state = ? ORDER BY entity_key, step",
+      ),
+      // Scoped to `create_provider`, which is the ONLY step that owns a company id. Without the
+      // step filter a later step that mirrored the ref would make this ambiguous.
+      findByProviderRef: db.prepare(
+        "SELECT * FROM formation_requests WHERE provider_ref = ? AND step = 'create_provider'",
+      ),
+      listOpenEntityKeys: db.prepare(
+        `SELECT DISTINCT entity_key AS k FROM formation_requests
+          WHERE state NOT IN ('confirmed','abandoned') ORDER BY entity_key`,
       ),
       transition: db.prepare(
         `UPDATE formation_requests
@@ -172,6 +198,15 @@ export class SqliteFormationRepository implements FormationRepository {
   /** Rows the sweeper owes work on: everything in `state` for any entity. */
   listByState(state: FormationState): FormationRequestRecord[] {
     return (this.stmts.listByState.all(state) as Row[]).map(toRecord);
+  }
+
+  findByProviderRef(providerRef: string): FormationRequestRecord | undefined {
+    const r = this.stmts.findByProviderRef.get(providerRef) as Row | undefined;
+    return r ? toRecord(r) : undefined;
+  }
+
+  listOpenEntityKeys(): string[] {
+    return (this.stmts.listOpenEntityKeys.all() as { k: string }[]).map((r) => r.k);
   }
 
   /**
