@@ -1,5 +1,7 @@
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { loadConfig } from "../../src/config/env";
+import { resolveFormationDeployment } from "../../src/formation";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import type { AgentSpec } from "../../src/policy/agentSpec";
@@ -14,6 +16,12 @@ const spec = {
   roles: { manager: "0x00000000000000000000000000000000000000Ma", guardian: TENANT },
 } as unknown as AgentSpec;
 const passkey = { challenge: "c", attestation: {} } as never;
+
+/** The minimum loadConfig needs; the formation tests below add the doola half on top. */
+const CFG_BASE = {
+  ARC_TESTNET_RPC_URL: "https://rpc.example",
+  PLATFORM_PRIVATE_KEY: `0x${"a".repeat(64)}`,
+};
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
@@ -455,4 +463,69 @@ test("fund() refuses when the S5 platform outflow ceiling is reached (after per-
     /platform outflow ceiling/,
   );
   expect(checked).toBe(1_000n); // the meter really saw the amount
+});
+
+// ── Formation pinning at the claim (design §2, review C1) ───────────────────────────────────
+
+test("C1: the claim pins EXACTLY the deployment's resolved formation value", () => {
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: resolveFormationDeployment(
+      loadConfig({ ...CFG_BASE, DOOLA_API_KEY: "dk", DOOLA_WEBHOOK_SECRET: "whsec" }),
+    ),
+  });
+  const { id } = runner.start({
+    spec,
+    userKey: "pin-1",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+  });
+  const rec = repo.findByIdempotencyKey(id)!;
+  expect(rec.formationProvider).toBe("doola");
+  expect(rec.formationEnvironment).toBe("sandbox");
+});
+
+test("C1: FORMATION_REQUIRED=false pins NOTHING, even with the credentials present", () => {
+  // Credentials configured but formation switched off: those entities are stub entities forever,
+  // and a pinned provider that will never file for them would be a claim the row cannot keep.
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: resolveFormationDeployment(
+      loadConfig({
+        ...CFG_BASE,
+        DOOLA_API_KEY: "dk",
+        DOOLA_WEBHOOK_SECRET: "whsec",
+        FORMATION_REQUIRED: "false",
+      }),
+    ),
+  });
+  const { id } = runner.start({
+    spec,
+    userKey: "pin-2",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+  });
+  const rec = repo.findByIdempotencyKey(id)!;
+  expect(rec.formationProvider).toBeNull();
+  expect(rec.formationEnvironment).toBeNull();
+});
+
+test("C1: a credential-less deployment pins nothing — the stub shape, unchanged", () => {
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: resolveFormationDeployment(loadConfig(CFG_BASE)),
+  });
+  const { id } = runner.start({
+    spec,
+    userKey: "pin-3",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+  });
+  expect(repo.findByIdempotencyKey(id)?.formationProvider).toBeNull();
 });

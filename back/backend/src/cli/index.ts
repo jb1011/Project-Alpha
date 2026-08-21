@@ -7,6 +7,7 @@ import type { DemoResult } from "../agent/demo";
 import { buildLiveAgentRunner } from "../agent/liveRunner";
 import { toJobView } from "../api/jobViews";
 import { loadConfig } from "../config/env";
+import { resolveFormationDeployment } from "../formation";
 import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import { runOnboarding } from "../workflow/onboarding";
@@ -50,6 +51,10 @@ export function buildCli(
           ? (entityKey) =>
               privateKeyToAccount(derivePocketKey(ctx.cfg.pocketMasterSeed!, entityKey)).address
           : undefined,
+        // Formation (design §2/§5): the SAME resolver every other door uses. An operator-created
+        // entity that pinned differently from an API-created one would be a permanent split in
+        // what an entity is on this deployment — the pin is stamped once and never re-derived.
+        formation: resolveFormationDeployment(ctx.cfg),
       });
       console.log(
         JSON.stringify(

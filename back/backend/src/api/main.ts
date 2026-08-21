@@ -35,6 +35,7 @@ import {
   canProvisionTurnkey,
   loadConfig,
 } from "../config/env";
+import { resolveFormationDeployment } from "../formation";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -260,12 +261,12 @@ async function main() {
         privateKeyToAccount(derivePocketKey(cfg.pocketMasterSeed!, entityKey)).address
     : undefined;
 
-  // doola formation (design §2). One value, derived once from config, handed to BOTH the claim
-  // (runner) and the saga — so the pinned environment on a row and the client that would file it
-  // can never come from different places. Undefined on a credential-less deployment = stub mode.
-  const formation = cfg.doola
-    ? { provider: "doola" as const, environment: cfg.doola.environment }
-    : undefined;
+  // doola formation (design §2). ONE value, resolved once by the shared resolver every
+  // composition root uses (api, cli, legacy onboarding server), and handed to BOTH the claim
+  // (runner) and the saga — so the pin on a row and the client that would file for it can never
+  // come from different places, and no door can pin differently from another. Null on a
+  // credential-less deployment, and on one that has FORMATION_REQUIRED off = stub mode.
+  const formationDeployment = resolveFormationDeployment(cfg);
 
   const runSaga: RunSaga = (i) =>
     runOnboarding({
@@ -289,7 +290,7 @@ async function main() {
       provisionCircle,
       circleSignerForEntity,
       derivePocketAddress,
-      formation,
+      formation: formationDeployment,
     });
 
   const runner = new OnboardingRunner({
@@ -297,7 +298,7 @@ async function main() {
     runSaga,
     fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
     outflows,
-    formation,
+    formation: formationDeployment,
   });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
@@ -388,11 +389,12 @@ async function main() {
     // availability and what provisioning actually needs can never drift apart. A deployment that
     // ships no TURNKEY_* is turnkey-less by construction — the mainnet circle-only shape.
     turnkeyCustodyAvailable: turnkeyServiceable,
-    // Formation (design §2). One predicate shared with the env.ts boot invariants
-    // (canFormEntities) so the boot gate and the advertised availability cannot drift apart.
-    formationAvailable: canFormEntities(cfg),
-    formationRequired: Boolean(cfg.formation?.required),
-    formationEnvironment: cfg.doola?.environment ?? null,
+    // Formation (design §2). ONE object: `canFormEntities` — the same predicate the env.ts boot
+    // invariants use, so the boot gate and the advertised availability cannot drift apart — and
+    // the environment it is available IN, which the honesty invariant makes inseparable from it.
+    // Availability is NOT the pin: a box with credentials but FORMATION_REQUIRED off still
+    // advertises the capability while pinning nothing.
+    formation: canFormEntities(cfg) ? { environment: cfg.doola!.environment } : undefined,
     repo,
     docStore,
     runner,
