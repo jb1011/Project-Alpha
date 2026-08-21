@@ -462,3 +462,35 @@ test("the lookup is skipped on a FIRST attempt — there is nothing to have lost
   await runOnboarding(baseDeps(makeFakeArc(), api));
   expect(calls.map((c) => c.method)).toEqual(["createCustomer", "createCompany"]);
 });
+
+test("RETRY after a failure: the row re-enters `submitted`, so the company id is still persisted", async () => {
+  bindParty();
+  const arc = makeFakeArc();
+
+  // First pass: the company create fails, the row parks in `failed`, the attempt is burned.
+  const broken = makeFakeDoola({
+    createCompany: vi.fn(async () => {
+      throw new DoolaApiError("E_INTERNAL", 500, "doola is down");
+    }) as never,
+  });
+  await runOnboarding(baseDeps(arc, broken.api));
+  expect(requests.find(KEY, "create_provider")).toMatchObject({ state: "failed", attempt: 1 });
+
+  // Second pass (what the sweeper will do): doola is back. The row must move OUT of `failed`
+  // before the create, or every persist below it CASes on `submitted`, writes nothing, and the
+  // company id is lost — the exact crash-window hole this step exists to close.
+  const fixed = makeFakeDoola();
+  await runOnboarding(baseDeps(arc, fixed.api));
+
+  const row = requests.find(KEY, "create_provider")!;
+  expect(row.state).toBe("confirmed");
+  expect(row.providerRef).toBe(COMPANY);
+  expect(row.error).toBeNull();
+  // A FRESH idempotency key: doola released the failed one, and reusing it with a different
+  // body returns 409 E_IDEMPOTENCY_KEY_REUSED (verified live).
+  expect(fixed.calls.find((c) => c.method === "createCompany")!.idempotencyKey).toBe(
+    `formation:${KEY}:create_provider:1`,
+  );
+  // The customer survived the failure, so the retry reuses it and looks first.
+  expect(fixed.calls.map((c) => c.method)).toEqual(["listCompanies", "createCompany"]);
+});

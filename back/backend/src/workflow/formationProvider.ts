@@ -227,10 +227,11 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     return;
   }
 
-  // Was this row already mid-flight when we arrived? That is what makes the pre-create lookup
-  // meaningful: a `submitted` row with a customer id and no company id is an attempt that got
-  // past the customer create and lost the answer to the company create.
-  const resumed = row.state === "submitted";
+  // Did a PREVIOUS attempt already get past the customer create? That — not the row's state — is
+  // what makes the pre-create lookup meaningful: a customer id with no company id is an attempt
+  // that asked doola to file and lost the answer. It is the same shape whether the row was left
+  // `submitted` by a crash or `failed` by an error the sweeper is now retrying.
+  const hadCustomer = Boolean(detail.customerId);
 
   const nameOptions = companyNameOptions(d.spec.name);
   const expedited = isNonUsResponsibleParty(party);
@@ -241,14 +242,19 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   };
 
   // `submitted` means "we are about to talk to doola". Written BEFORE the first call so a crash
-  // during it is distinguishable from one before it.
-  if (row.state === "pending") {
+  // during it is distinguishable from one before it — and written from WHATEVER state we found,
+  // because a RETRY arrives at `failed`, not `pending`. Every persist below CASes on
+  // `submitted`: leaving the row parked elsewhere would make each of them a silent no-op, and
+  // the company id — the one thing that must survive — would never be written. The CAS on the
+  // observed state is also what stops two drivers from racing one entity's create.
+  if (row.state !== "submitted") {
     if (
-      !requests.transition(entityKey, "create_provider", "pending", "submitted", {
+      !requests.transition(entityKey, "create_provider", row.state, "submitted", {
         detail: JSON.stringify(detail),
+        error: null,
       })
     )
-      return; // another driver owns this row; two creates must not race one entity
+      return;
     logStep(entityKey, "submitted", row.attempt);
   }
 
@@ -283,7 +289,7 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   //       ADOPT: `GET /companies` is eventually consistent with the creates (verified live), so
   //       an empty result is NOT evidence that nothing was filed and can never authorize a
   //       fresh create. The Idempotency-Key is what makes that safe; this is belt-and-braces.
-  if (resumed) {
+  if (hadCustomer) {
     const found = await lookupExistingCompany(d, customerId, nameOptions[0]!.name);
     if (found) {
       await adopt(d, row, found.doolaCompanyId, { ...detail, adopted: true }, found);
