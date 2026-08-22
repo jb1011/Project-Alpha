@@ -505,43 +505,28 @@ export function migrate(db: Database.Database): void {
   // formation_parties: PR 1's shape was keyed by entity_key with no tenant column, which cannot
   // express a party that exists BEFORE its entity does (the intake handle, design §5). Rebuild
   // rather than ALTER: PR 1 shipped no writer for this table — the endpoint that produces rows
-  // arrives in this PR — so there is provably nothing to preserve, and a drop+create leaves the
-  // documented key structure (PRIMARY KEY, UNIQUE) that a 12-step ALTER dance cannot add anyway.
-  // Guarded on the column so it runs exactly once and never on a table that already has it.
+  // arrives in PR 2 — so on every database that has ever existed there is provably nothing to
+  // preserve, and a drop+create leaves the documented key structure (PRIMARY KEY, UNIQUE) that a
+  // 12-step ALTER dance cannot add anyway.
+  //
+  // "Provably nothing to preserve" is an argument about the code that shipped, and the code that
+  // shipped is not the only thing that can put rows in a table. So the drop ASKS: a legacy-shaped
+  // table with any rows in it refuses the boot, by name, rather than silently destroying personal
+  // data nobody can get back. There is no automatic migration path for those rows — the columns
+  // the new shape needs (`party_id`, `tenant_id`) do not exist to derive them from — so the
+  // honest answer is an operator decision, not a guess.
   const partyCols = (
     db.prepare("PRAGMA table_info(formation_parties)").all() as { name: string }[]
   ).map((c) => c.name);
-  if (!partyCols.includes("party_id")) {
+  if (partyCols.length > 0 && !partyCols.includes("party_id")) {
+    const { n } = db.prepare("SELECT COUNT(*) AS n FROM formation_parties").get() as { n: number };
+    if (n > 0)
+      throw new Error(
+        `refusing to migrate: formation_parties still has PR 1's shape (no party_id column) and holds ${n} row(s). That table is the only one in the system carrying personal data, the rebuild this migration performs is a DROP, and the new shape's keys (party_id, tenant_id) cannot be derived from the old one. Back the rows up and remove them, or rename the table aside, then restart.`,
+      );
     db.exec(`DROP TABLE formation_parties;${FORMATION_PARTIES_DDL}`);
   }
   db.exec(FORMATION_PARTIES_INDEX_DDL);
-
-  // One-shot: drop NOT NULL from the PII columns so erasure can actually NULL them (§3, H7).
-  // SQLite cannot ALTER a constraint away, so this is the documented 4-step dance — create the
-  // new shape, copy, drop, rename — inside one transaction, preserving every existing row. The
-  // guard is the column's own nullability rather than a `meta` marker: it reads the fact it is
-  // fixing, so a database restored from a pre-PR-2 backup is repaired too, and a database that
-  // is already correct is untouched no matter how many times migrate() runs.
-  const partyInfo = db.prepare("PRAGMA table_info(formation_parties)").all() as {
-    name: string;
-    notnull: number;
-  }[];
-  if (partyInfo.some((c) => c.name === "legal_first_name" && c.notnull === 1)) {
-    db.transaction(() => {
-      db.exec(FORMATION_PARTIES_DDL.replace("formation_parties", "formation_parties_new"));
-      db.exec(`
-        INSERT INTO formation_parties_new
-          (party_id, entity_key, tenant_id, legal_first_name, legal_last_name, email, phone,
-           line1, line2, city, region, postal_code, country, synthetic, created_at, deleted_at)
-        SELECT party_id, entity_key, tenant_id, legal_first_name, legal_last_name, email, phone,
-               line1, line2, city, region, postal_code, country, synthetic, created_at, deleted_at
-          FROM formation_parties;
-        DROP TABLE formation_parties;
-        ALTER TABLE formation_parties_new RENAME TO formation_parties;
-      `);
-      db.exec(FORMATION_PARTIES_INDEX_DDL);
-    })();
-  }
 
   // The documents index is keyed by OUR derived id (documentIndexRepository.documentIndexId), but
   // the fact that makes a re-fetch idempotent is (entity, doola document id) — so that pair is

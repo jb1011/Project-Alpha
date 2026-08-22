@@ -273,7 +273,7 @@ export function createFormationParty(
       legalFirstName: p.legalFirstName,
       legalLastName: p.legalLastName,
       email: p.email,
-      phone: p.phone ?? null,
+      phone: p.phone,
       line1: p.address.line1,
       line2: p.address.line2 ?? null,
       city: p.address.city,

@@ -523,13 +523,16 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       "create_formation_party",
       {
         title: "Create formation party",
-        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to onboard_agent. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in onboard_agent's spec. The response contains the handle and nothing else.`,
+        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to onboard_agent. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in onboard_agent's spec. A real party requires legalFirstName, legalLastName, email, PHONE and address (doola will not file a responsible party without a phone number). The response contains the handle and nothing else.`,
         inputSchema: {
           /** The sandbox shortcut: no personal data at all. */
           synthetic: z.boolean().optional(),
           legalFirstName: z.string().optional(),
           legalLastName: z.string().optional(),
           email: z.string().optional(),
+          /** Optional HERE only because the synthetic shortcut passes no fields at all; a real
+           *  party without one is refused by `FormationPartySchema` (C6) — doola will not file
+           *  a responsible party with no phone. */
           phone: z.string().optional(),
           address: z.record(z.unknown()).optional(),
         },

@@ -164,6 +164,32 @@ test("real PII in, an opaque handle out — and NOTHING else in the response", a
   expect(parties.findOwned(account.address, body.partyId)!.legalFirstName).toBe("Ada");
 });
 
+test("C6: a real party with NO PHONE is refused at intake (400), not at the filing", async () => {
+  // doola refuses a company create whose responsible party has no phone. Left to the create step,
+  // that refusal arrives AFTER the entity is minted, bound and funded — the caller's legal
+  // identity is unusable and they find out from a `failed` formation row. Refused here it costs
+  // one 400.
+  const app = makeApp({});
+  const token = await login(app);
+  const { phone: _dropped, ...noPhone } = REAL_PARTY;
+  const res = await post(app, "/formation-party", token, noPhone);
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.error.code).toBe("validation_error");
+  expect(JSON.stringify(body.error.details)).toContain("phone");
+  // Nothing was stored: a refused intake must not leave a half-usable identity behind.
+  expect(db.prepare("SELECT COUNT(*) AS n FROM formation_parties").get()).toEqual({ n: 0 });
+});
+
+test("C6: the SYNTHETIC fixture still passes — it supplies a phone of its own", async () => {
+  const app = makeApp({ syntheticPii: true });
+  const token = await login(app);
+  const res = await post(app, "/formation-party", token, { synthetic: true });
+  expect(res.status).toBe(201);
+  const { partyId } = await res.json();
+  expect(parties.findOwned(account.address, partyId)!.phone).toBe("+13075550142");
+});
+
 test("it requires auth, and the party belongs to the AUTHENTICATED tenant only", async () => {
   const app = makeApp({});
   expect(

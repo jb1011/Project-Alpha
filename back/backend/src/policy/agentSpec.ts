@@ -158,10 +158,21 @@ export const FormationPartySchema = z
     legalFirstName: z.string().min(1),
     legalLastName: z.string().min(1),
     email: z.string().email(),
-    /** doola REQUIRES a phone on a natural person's address (live sandbox, 2026-08-21), so a
-     *  party without one cannot be filed — see `formationProvider.ts`. Kept optional here
-     *  because the design specifies it so; the wizard must collect it before production. */
-    phone: z.string().min(1).optional(),
+    /**
+     * REQUIRED (C6). doola refuses a company create whose responsible party has no phone (live
+     * sandbox, 2026-08-21), so a party without one is a legal identity that can never be filed.
+     *
+     * The design left it optional and the create step refuses it later, which meant a caller
+     * could post an identity, receive a handle, onboard with it, and discover at the FILING —
+     * after the entity is minted, bound and funded — that their party was unusable. Refusing at
+     * INTAKE costs the caller one 400 and costs the platform nothing. The create step's own check
+     * stays as belt-and-braces: it guards the parties already in the table, and it is the layer
+     * that must hold if doola's requirements change again.
+     *
+     * The labeled sandbox fixture supplies one (`syntheticFormationParty`), so the synthetic path
+     * is unaffected.
+     */
+    phone: z.string().min(1),
     address: z
       .object({
         line1: z.string().min(1),

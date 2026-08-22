@@ -173,6 +173,20 @@ test("real PII in, an opaque handle out — and the tenant is the KEY's, never a
   expect(parties.findOwned(OTHER, partyId)).toBeUndefined();
 });
 
+test("C6: create_formation_party refuses a real party with no phone, exactly as REST does", async () => {
+  // Both intake surfaces run the SAME `FormationPartySchema`, so a phone-less identity cannot
+  // enter the table through the agent-first door either.
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const { phone: _dropped, ...noPhone } = REAL_PARTY;
+  const res = await withClient(app, key, async (c) =>
+    c.callTool({ name: "create_formation_party", arguments: noPhone }),
+  );
+  expect((res as { isError?: boolean }).isError).toBe(true);
+  expect(textOf(res)).toMatch(/phone/i);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM formation_parties").get()).toEqual({ n: 0 });
+});
+
 test("it needs the provision capability and a tenant-wide key (onboard_agent's rung)", async () => {
   const app = buildTestApp({ required: true });
   const { key: readKey } = apiKeys.mint(TENANT, { capability: "read" });
