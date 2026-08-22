@@ -155,3 +155,104 @@ test("cross-origin OPTIONS preflight gets ACAO: *", async () => {
   });
   expect(res.headers.get("access-control-allow-origin")).toBe("*");
 });
+
+// ── formation (design §8) ───────────────────────────────────────────────────────────────────
+
+test("a legacy/stub row serves formation: null — forever, with no backfill", async () => {
+  repo.upsert(base);
+  const body = await (await app().request("/transparency")).json();
+  expect(body.entities[0].formation).toBeNull();
+});
+
+test("a formed row serves the DERIVED status and its environment, and nothing else", async () => {
+  repo.upsert({ ...base, formationProvider: "doola", formationEnvironment: "sandbox" });
+  const steps = () => [
+    {
+      entityKey: base.idempotencyKey,
+      step: "await_filing" as const,
+      state: "confirmed" as const,
+      attempt: 0,
+      providerRef: "cmp_1",
+      detail: null,
+      error: null,
+    },
+  ];
+  const built = buildApiApp({
+    webOrigin: "https://app.example.com",
+    repo,
+    jobs,
+    formationSteps: steps,
+  } as never);
+  const body = await (await built.request("/transparency")).json();
+  // The honesty invariant on the PUBLIC surface: a sandbox filing is labeled as one here too.
+  expect(body.entities[0].formation).toEqual({ status: "filed", environment: "sandbox" });
+});
+
+test("the public surface NEVER carries the EIN, the filing number, or anything about a person", async () => {
+  // The record holds every fact an authenticated owner may see…
+  repo.upsert({
+    ...base,
+    formationProvider: "doola",
+    formationEnvironment: "sandbox",
+    einReal: "98-7654321",
+    formationFilingNumber: "2026-123456",
+    formationFiledAt: 1_755_600_000,
+  });
+  // …and a party row exists for it, with real PII in the database.
+  db.prepare(
+    `INSERT INTO formation_parties (party_id, entity_key, tenant_id, legal_first_name,
+       legal_last_name, email, line1, city, postal_code, country)
+     VALUES ('p1', ?, 'tenant-a', 'Ada', 'Lovelace', 'ada@example.com', '1 Analytical Way',
+             'Cheyenne', '82001', 'USA')`,
+  ).run(base.idempotencyKey);
+
+  const text = JSON.stringify(await (await app().request("/transparency")).json());
+  // The EIN is the entity owner's tax identifier: authenticated views only.
+  for (const forbidden of [
+    "98-7654321",
+    "2026-123456",
+    "Ada",
+    "Lovelace",
+    "ada@example.com",
+    "Analytical",
+    "82001",
+    "p1",
+  ])
+    expect(text).not.toContain(forbidden);
+});
+
+// ── M5: the short in-process cache ─────────────────────────────────────────────────────────
+
+test("M5: /transparency is cached for a few seconds, and refreshes after the TTL", async () => {
+  // The one surface whose request volume is not bounded by how many tenants exist. It reads every
+  // public entity, every job and every formation, so a link doing the rounds used to cost one
+  // full pass per request. Ten seconds is shorter than anything a human notices.
+  repo.upsert(base);
+  let now = 1_000_000;
+  const app = buildApiApp({
+    webOrigin: "*",
+    repo,
+    jobs,
+    now: () => now,
+  } as never);
+
+  const first = await (await app.request("/transparency")).json();
+  expect(first.stats.entities).toBe(1);
+
+  // A second entity appears; within the TTL the cached body is served unchanged.
+  repo.upsert({
+    ...base,
+    idempotencyKey: "tenant-b:agent",
+    publicId: "33333333-3333-3333-3333-333333333333",
+  });
+  now += 5_000;
+  expect((await (await app.request("/transparency")).json()).stats.entities).toBe(1);
+
+  // Past it, the pass runs again.
+  now += 6_000;
+  const fresh = await (await app.request("/transparency")).json();
+  expect(fresh.stats.entities).toBe(2);
+  // The freshness contract advertised to intermediaries is unchanged either way.
+  const res = await app.request("/transparency");
+  expect(res.headers.get("cache-control")).toBe("public, max-age=300");
+});

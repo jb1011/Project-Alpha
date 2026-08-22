@@ -149,6 +149,9 @@ export function makeFakeDocStore(): DocumentStore {
       if (v === undefined) throw new Error(`docStore: not found: ${id}`);
       return v;
     },
+    async getBytesAsync(id: string): Promise<Buffer> {
+      return this.getBytes(id);
+    },
   };
 }
 

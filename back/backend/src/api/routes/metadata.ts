@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
+import { formationSummary } from "../../formation/status";
+import { usesManifestScheme } from "../../workflow/onboarding";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 
@@ -63,6 +65,36 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
           verifiedAt: gv.verifiedAt,
           environment: gv.environment,
         };
+        touched = true;
+      }
+
+      // ── Formation + the CURRENT anchor, layered at SERVE time (design §8, audit M10).
+      //
+      // The stored JSON is written once, during translate. Everything below changes afterwards:
+      // a formation completes, an EIN issues, and (from PR 3) a new manifest version is anchored
+      // through the timelock. Serving the stored values forever would publish, on a public
+      // unauthenticated surface, an anchor that the chain has already moved past and a formation
+      // status that stopped being true weeks ago — the fabrication class the frontend audit
+      // flagged and this design forbids. So these three read the DB on every request.
+      // ONE derivation, shared with `/transparency` and the authenticated view — a public
+      // surface and a private one must never disagree about what an entity's formation IS.
+      const formation = formationSummary(ent, deps.formationSteps?.(ent.idempotencyKey) ?? []);
+      if (formation) {
+        // The environment is REQUIRED whenever this block exists: a sandbox filing must never be
+        // publishable as a real one by omission (the honesty invariant, §2).
+        meta.formation = { environment: formation.environment, status: formation.status };
+        // What is NOT here, and must never be: the EIN (a tax identifier, authenticated views
+        // only), the filing number, doola's company id, and anything at all from
+        // `formation_parties`. This route has no authentication of any kind.
+        touched = true;
+      }
+
+      if (usesManifestScheme(ent) && meta.legalBody && typeof meta.legalBody === "object") {
+        // A verifier holding only the chain compares `legalBody.oaHash` against
+        // `LegalManager.meta.operatingAgreementHash`. Those must agree, so the served value has
+        // to track the column the anchor sub-saga writes — not the one translate rendered.
+        meta.legalBody.oaHash = ent.oaHash;
+        meta.legalBody.manifestVersion = ent.oaManifestVersion ?? null;
         touched = true;
       }
 

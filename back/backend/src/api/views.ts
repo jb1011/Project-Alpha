@@ -1,6 +1,53 @@
-import type { DoolaEnvironment } from "../adapters/doola/types";
+import { type FormationStatus, type FormationSummary, formationSummary } from "../formation/status";
+import {
+  type DocumentIndexRecord,
+  type DocumentIndexRepository,
+  documentFileName,
+} from "../persistence/documentIndexRepository";
+import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
 import { usesManifestScheme } from "../workflow/onboarding";
+
+/** The formation sub-saga rows of one entity. A function rather than the repository so the view
+ *  stays a pure projection and the caller decides where the rows come from. */
+export type FormationStepsLookup = (entityKey: string) => FormationRequestRecord[];
+
+/**
+ * Everything a view needs beyond the entity row itself (C8).
+ *
+ * ONE object, built once in the composition root and handed to BOTH surfaces. It used to be two
+ * independent optional fields plus a third for the download route, and the MCP transport passed
+ * one of them and forgot the other — so `get_entity` over MCP reported an entity with no legal
+ * documents while `GET /entities/:id` over REST reported the same entity with two. Nothing failed;
+ * the agent surface was simply, silently, less true than the browser one.
+ *
+ * As one object it cannot happen: there is no partial to pass.
+ */
+export interface EntityViewDeps {
+  /** How a view learns a record's formation progress (design §5/§8). A function rather than the
+   *  repository so the view stays a pure projection and the caller decides where the rows come
+   *  from. */
+  formationSteps?: FormationStepsLookup;
+  /**
+   * The BATCHED twin, for the list routes (M5). Optional: absent, a list falls back to one
+   * lookup per row, which is what every caller did before.
+   */
+  formationStepsMany?: (entityKeys: string[]) => Map<string, FormationRequestRecord[]>;
+  /**
+   * The document index. A repository rather than a lookup, because the download route needs
+   * `findOwned` from the SAME object — and a deployment that has one and not the other is the
+   * split this type exists to prevent. Narrowed to the two READS a view can make, so a batched
+   * stand-in satisfies it; `ApiDeps` re-declares it as the full repository.
+   */
+  documents?: Pick<DocumentIndexRepository, "listByEntity" | "listByEntities">;
+}
+
+/**
+ * The formation projection itself lives in `src/formation/status.ts` — the sweeper needs it too,
+ * and a timer importing from `api/` is a layering inversion a test now forbids. Re-exported here
+ * so the view module still names the type it renders.
+ */
+export type { FormationStatus };
 
 /** Secret-free projection of an EntityRecord for API responses. */
 export interface EntityView {
@@ -47,19 +94,69 @@ export interface EntityView {
         /** The single in-flight version's hash, or null when nothing is pending. */
         pendingHash: string | null;
       };
-  /** Formation (design §2). NULL = stub, forever — the shape every legacy row keeps and the
-   *  shape every credential-less deployment serves. `environment` is REQUIRED whenever this is
-   *  present (honesty invariant): a sandbox filing can never render as a real one by omission.
-   *  PR 1 ships the skeleton only, so `status` is always "none"; PR 2 fills it from the
-   *  formation sub-saga. NO PII is ever served here. */
-  formation: {
-    provider: string;
-    environment: DoolaEnvironment;
-    status: "none";
-  } | null;
+  /**
+   * Formation (design §2/§8). NULL = stub, forever — the shape every legacy row keeps and the
+   * shape every credential-less deployment serves. The shared `FormationSummary` is everything
+   * that is safe on ANY surface; the two fields below it are the OWNER-ONLY additions, and they
+   * are spelled out here rather than in the summary so an unauthenticated surface cannot grow
+   * them by spreading it. NO PII is ever served here — not a name, not an address, not an email.
+   */
+  formation:
+    | (FormationSummary & {
+        /**
+         * ⚠ AUTHENTICATED VIEWS ONLY. The EIN is a tax identifier: it belongs to the entity's
+         * owner and to nobody else. It reaches this projection — which serves GET /entities and
+         * the MCP read tools, both tenant-scoped — and it must NEVER reach `/transparency` or
+         * `/metadata`, which are unauthenticated. Both of those build their own row shapes from
+         * `formationSummary`, and a test asserts neither can grow this field.
+         */
+        ein: string | null;
+        /** The legal documents fetched so far. Metadata only — the bytes come from the download
+         *  route, which re-asserts ownership of its own. */
+        documents: DocumentView[];
+      })
+    | null;
 }
 
-export function toEntityView(r: EntityRecord): EntityView {
+/** The document metadata a tenant sees, in the ONE shape both surfaces render (M4). The bytes
+ *  come from the download route, which re-asserts ownership of its own. */
+export interface DocumentView {
+  id: string;
+  type: string;
+  name: string;
+  size: number;
+  /** What a verifier re-computes from the downloaded bytes. */
+  sha256: string;
+}
+
+/** One projection for `GET /entities/:id/documents`, the entity view, and the MCP read tools —
+ *  three renderers of the same row is three chances for them to describe it differently. */
+export function toDocumentView(d: DocumentIndexRecord): DocumentView {
+  return {
+    id: d.id,
+    type: d.docType,
+    // DERIVED from the doc type, never echoed from doola's `name` field.
+    name: documentFileName(d.docType),
+    size: d.size,
+    sha256: d.sha256,
+  };
+}
+
+/**
+ * The single choke point for everything a tenant is told about an entity.
+ *
+ * `deps` is optional so every pre-formation caller compiles unchanged; absent, a record simply
+ * reports the status its own columns can prove, which is `none`.
+ */
+export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): EntityView {
+  // Read ONCE, and only for a row that is actually pinned. The projection asks three questions
+  // of the same rows (status, provider ref, required actions), and calling the lookup per
+  // question meant three queries per entity on every list response — while an UNPINNED row (every
+  // legacy entity, every stub deployment) needs none of them at all, and the list routes are
+  // mostly unpinned rows.
+  const pinned = Boolean(r.formationProvider && r.formationEnvironment);
+  const steps = pinned ? (deps.formationSteps?.(r.idempotencyKey) ?? []) : [];
+  const summary = pinned ? formationSummary(r, steps) : null;
   return {
     id: r.idempotencyKey,
     name: r.name,
@@ -94,13 +191,48 @@ export function toEntityView(r: EntityRecord): EntityView {
     // Both halves or neither: an entity pinned to a provider is always pinned to an environment
     // too (they are written together at the claim), so a half-populated formation block would be
     // a bug — and rendering one without the other is exactly the deception §2 forbids.
-    formation:
-      r.formationProvider && r.formationEnvironment
-        ? {
-            provider: r.formationProvider,
-            environment: r.formationEnvironment,
-            status: "none",
-          }
-        : null,
+    formation: summary
+      ? {
+          ...summary,
+          // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
+          // mint and is never served as a legal fact.
+          ein: r.einReal ?? null,
+          documents: (deps.documents?.listByEntity(r.idempotencyKey) ?? []).map(toDocumentView),
+        }
+      : null,
   };
+}
+
+/**
+ * The LIST projection (M5).
+ *
+ * `GET /entities`, the MCP `list_entities`/`claim_connection` tools and `/transparency` all render
+ * every entity a caller can see, and each row used to ask for its own formation steps and its own
+ * documents — two queries per entity, per page view, on the hottest read paths in the API and on
+ * an unauthenticated public surface. Here the two reads happen ONCE for the whole page.
+ *
+ * Only PINNED rows are looked up at all: an unpinned entity has no formation to describe, and on
+ * most deployments most rows are unpinned.
+ *
+ * Falls back to the per-row path when the batched lookups are not wired, so every existing caller
+ * keeps working with whatever it already passes.
+ */
+export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): EntityView[] {
+  const keys = rows
+    .filter((r) => r.formationProvider && r.formationEnvironment)
+    .map((r) => r.idempotencyKey);
+  if (keys.length === 0) return rows.map((r) => toEntityView(r, deps));
+
+  const steps = deps.formationStepsMany?.(keys);
+  const docs = deps.documents?.listByEntities?.(keys);
+  if (!steps && !docs) return rows.map((r) => toEntityView(r, deps));
+
+  const batched: EntityViewDeps = {
+    ...deps,
+    formationSteps: steps ? (k) => steps.get(k) ?? [] : deps.formationSteps,
+    documents: docs
+      ? { listByEntity: (k) => docs.get(k) ?? [], listByEntities: () => docs }
+      : deps.documents,
+  };
+  return rows.map((r) => toEntityView(r, batched));
 }

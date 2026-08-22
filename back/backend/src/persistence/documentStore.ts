@@ -8,6 +8,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -24,6 +25,15 @@ export interface DocumentStore {
   /** Binary write (legal PDFs, canonical manifest bytes). ATOMIC — see the impl note. */
   putBytes(name: string, bytes: Buffer): PutResult;
   getBytes(id: string): Buffer;
+  /**
+   * The same read, off the event loop.
+   *
+   * The saga's reads are small and synchronous by design (a manifest blob, an OA), but the
+   * document DOWNLOAD route serves multi-hundred-kilobyte PDFs to arbitrary tenants, and a
+   * synchronous `readFileSync` there blocks every other request in the process for the duration
+   * of the disk read. Same containment guard, same bytes.
+   */
+  getBytesAsync(id: string): Promise<Buffer>;
 }
 
 /** Local-filesystem doc store. Interface allows S3 / Vercel Blob later (deferred). */
@@ -124,6 +134,12 @@ export class FileDocumentStore implements DocumentStore {
 
   getBytes(id: string): Buffer {
     return readFileSync(this.safePath(id));
+  }
+
+  async getBytesAsync(id: string): Promise<Buffer> {
+    // `safePath` FIRST, and synchronously: the traversal guard must run before anything touches
+    // the filesystem, exactly as it does on the sync path.
+    return await readFile(this.safePath(id));
   }
 }
 

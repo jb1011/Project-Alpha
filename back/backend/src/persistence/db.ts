@@ -17,6 +17,46 @@ export function openDatabase(path: string): Database.Database {
   return db;
 }
 
+/**
+ * The PII table (design §3/§5), extracted as a constant because the migration below REBUILDS it.
+ *
+ * PR 1 keyed it by `entity_key` — but PII is collected BEFORE an entity exists: the wizard (and
+ * an MCP caller) posts a legal identity, gets a `partyId` back, and passes that to onboard, where
+ * the party is bound to the entity the claim mints. So the key is the partyId, the entity_key is
+ * nullable-and-unique (one party per entity, bound exactly once), and the row carries the tenant
+ * that owns it — ownership has to be answerable before there is an entity to answer it from.
+ *
+ * `region` is nullable because most countries have no state/province (US region = 2-letter
+ * state); `deleted_at` is the erasure marker for parties that never reached a filing (H7).
+ */
+const FORMATION_PARTIES_DDL = `
+    CREATE TABLE IF NOT EXISTS formation_parties (
+      party_id   TEXT PRIMARY KEY,
+      entity_key TEXT UNIQUE,      -- NULL until the party is bound to an entity at onboard
+      tenant_id  TEXT NOT NULL,
+      -- The PII columns are NULLABLE, and that is the point: ERASURE (§3, audit H7) sets every
+      -- one of them to NULL and stamps deleted_at, keeping only the handle, the owner and the
+      -- dates so the erasure itself stays auditable. A NOT NULL here would force the sweeper to
+      -- overwrite personal data with a sentinel string instead of removing it — "erased" has to
+      -- mean the column holds nothing, not that it holds something else.
+      legal_first_name TEXT, legal_last_name TEXT,
+      email TEXT, phone TEXT,
+      line1 TEXT, line2 TEXT, city TEXT,
+      region TEXT,
+      postal_code TEXT, country TEXT,   -- ISO-3
+      -- A clearly-labeled sandbox fixture rather than a real natural person (§3, audit H7).
+      synthetic INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      deleted_at TEXT
+    );
+`;
+
+/** Created SEPARATELY, after the rebuild guard below: on a pre-existing database the table still
+ *  has PR 1's shape when the CREATE-TABLE block runs, and indexing a `tenant_id` that does not
+ *  exist yet fails the whole migration. */
+const FORMATION_PARTIES_INDEX_DDL =
+  "CREATE INDEX IF NOT EXISTS idx_formation_parties_tenant ON formation_parties(tenant_id);";
+
 /** Create tables if absent. Idempotent. */
 export function migrate(db: Database.Database): void {
   db.exec(`
@@ -344,6 +384,11 @@ export function migrate(db: Database.Database): void {
       provider_ref TEXT,
       detail       TEXT,          -- JSON: filingNumber, ein, doc ids…
       error        TEXT,
+      -- Epoch ms the sweeper may next POLL this step. A MIRROR of detail.nextPollAt, and it is a
+      -- column for exactly one reason: "which rows are due?" has to be a question the database
+      -- answers. Reading every open entity's detail blob to find out means the poll cost grows
+      -- with the number of formations ever opened rather than with the number actually due.
+      next_poll_at INTEGER,
       created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (entity_key, step)
@@ -383,18 +428,7 @@ export function migrate(db: Database.Database): void {
       WHERE processed_at IS NULL;
 
     -- Controller PII — its OWN table, never spec_json / views / transparency / metadata / logs.
-    -- region is nullable because most countries have no state/province (US region = 2-letter
-    -- state); deleted_at is the erasure marker for parties that never reached a filing.
-    CREATE TABLE IF NOT EXISTS formation_parties (
-      entity_key TEXT PRIMARY KEY,
-      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
-      email TEXT NOT NULL, phone TEXT,
-      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
-      region TEXT,
-      postal_code TEXT NOT NULL, country TEXT NOT NULL,   -- ISO-3
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      deleted_at TEXT
-    );
+    ${FORMATION_PARTIES_DDL}
 
     -- Small key/value marker table for one-shot data migrations (guards below), distinct from the
     -- additive schema (table/column) migrations, which are idempotent by construction.
@@ -472,6 +506,55 @@ export function migrate(db: Database.Database): void {
   if (!docCols.includes("size")) db.exec("ALTER TABLE documents ADD COLUMN size INTEGER");
   if (!docCols.includes("provider_doc_id"))
     db.exec("ALTER TABLE documents ADD COLUMN provider_doc_id TEXT");
+
+  // formation_parties: PR 1's shape was keyed by entity_key with no tenant column, which cannot
+  // express a party that exists BEFORE its entity does (the intake handle, design §5). Rebuild
+  // rather than ALTER: PR 1 shipped no writer for this table — the endpoint that produces rows
+  // arrives in PR 2 — so on every database that has ever existed there is provably nothing to
+  // preserve, and a drop+create leaves the documented key structure (PRIMARY KEY, UNIQUE) that a
+  // 12-step ALTER dance cannot add anyway.
+  //
+  // "Provably nothing to preserve" is an argument about the code that shipped, and the code that
+  // shipped is not the only thing that can put rows in a table. So the drop ASKS: a legacy-shaped
+  // table with any rows in it refuses the boot, by name, rather than silently destroying personal
+  // data nobody can get back. There is no automatic migration path for those rows — the columns
+  // the new shape needs (`party_id`, `tenant_id`) do not exist to derive them from — so the
+  // honest answer is an operator decision, not a guess.
+  const partyCols = (
+    db.prepare("PRAGMA table_info(formation_parties)").all() as { name: string }[]
+  ).map((c) => c.name);
+  if (partyCols.length > 0 && !partyCols.includes("party_id")) {
+    const { n } = db.prepare("SELECT COUNT(*) AS n FROM formation_parties").get() as { n: number };
+    if (n > 0)
+      throw new Error(
+        `refusing to migrate: formation_parties still has PR 1's shape (no party_id column) and holds ${n} row(s). That table is the only one in the system carrying personal data, the rebuild this migration performs is a DROP, and the new shape's keys (party_id, tenant_id) cannot be derived from the old one. Back the rows up and remove them, or rename the table aside, then restart.`,
+      );
+    db.exec(`DROP TABLE formation_parties;${FORMATION_PARTIES_DDL}`);
+  }
+  db.exec(FORMATION_PARTIES_INDEX_DDL);
+
+  // formation_requests.next_poll_at: ALTER-if-missing, the house idiom. A database created by
+  // PR 2's first migration has the column; one created by an earlier build of PR 2 does not, and
+  // a NULL there reads as "never polled", which is exactly right for every existing row.
+  const reqCols = (
+    db.prepare("PRAGMA table_info(formation_requests)").all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!reqCols.includes("next_poll_at"))
+    db.exec("ALTER TABLE formation_requests ADD COLUMN next_poll_at INTEGER");
+  // The sweeper's poll-due query orders by this and filters on it, for every open entity, on
+  // every tick.
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_formation_poll_due ON formation_requests(next_poll_at, entity_key)",
+  );
+
+  // The documents index is keyed by OUR derived id (documentIndexRepository.documentIndexId), but
+  // the fact that makes a re-fetch idempotent is (entity, doola document id) — so that pair is
+  // the constraint, and a second insert for a document we already stored is a no-op rather than a
+  // duplicate row pointing at a second copy of the same bytes.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_entity_provider ON documents(entity_key, provider_doc_id)",
+  );
+  db.exec("CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents(entity_key)");
 
   const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
     (c) => c.name,

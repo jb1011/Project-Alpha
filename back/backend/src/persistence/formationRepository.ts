@@ -39,6 +39,15 @@ export interface FormationRequestRecord {
   /** JSON blob: filingNumber, ein, document ids. NEVER PII (that lives in formation_parties). */
   detail: string | null;
   error: string | null;
+  /** SQLite TEXT "YYYY-MM-DD HH:MM:SS", UTC. The sweeper's backoff clock reads these, so they
+   *  are part of the record rather than a second query: "how long has this row been failed?" and
+   *  "how long has this entity been in flight?" are the two questions every tick asks. */
+  createdAt: string;
+  updatedAt: string;
+  /** Epoch ms the sweeper may next poll this step, or null when it has never been polled. A
+   *  MIRROR of `detail.nextPollAt` — the column exists so the due-set is a query rather than a
+   *  full scan of every open entity's detail blob (M5). */
+  nextPollAt: number | null;
 }
 
 interface Row {
@@ -49,6 +58,9 @@ interface Row {
   provider_ref: string | null;
   detail: string | null;
   error: string | null;
+  next_poll_at: number | null;
+  created_at: string;
+  updated_at: string;
 }
 
 function toRecord(r: Row): FormationRequestRecord {
@@ -60,10 +72,102 @@ function toRecord(r: Row): FormationRequestRecord {
     providerRef: r.provider_ref,
     detail: r.detail,
     error: r.error,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    nextPollAt: r.next_poll_at ?? null,
   };
 }
 
-export class SqliteFormationRepository {
+/**
+ * The narrow surface the saga, the doors and (in part B) the sweeper use. Injectable for the
+ * same reason `DoolaApi` is: a step that files a real company must be testable against a repo
+ * that can be poisoned at any transition.
+ */
+export interface FormationRepository {
+  claimStep(entityKey: string, step: FormationStep): boolean;
+  claimAllSteps(entityKey: string): boolean;
+  find(entityKey: string, step: FormationStep): FormationRequestRecord | undefined;
+  stepsOf(entityKey: string): FormationRequestRecord[];
+  /**
+   * The same rows for MANY entities, in ONE statement (M5).
+   *
+   * The list routes render every entity a tenant owns, and each one asked for its own steps: N+1
+   * queries per page view, on the two hottest read paths in the API and on the unauthenticated
+   * `/transparency`. Returns a map so the caller can build a per-key lookup without re-grouping.
+   */
+  stepsOfMany(entityKeys: string[]): Map<string, FormationRequestRecord[]>;
+  listByState(state: FormationState): FormationRequestRecord[];
+  /** The entity a doola company id belongs to (`idx_formation_provider`). This is the ONLY
+   *  mapping from a webhook's `doolaCompanyId` to anything of ours — and until it exists, an
+   *  arriving event is unmappable and waits in `doola_webhook_events` for a tick that can place
+   *  it (design §5/§6). */
+  findByProviderRef(providerRef: string): FormationRequestRecord | undefined;
+  /** Entity keys with at least one step not yet in a terminal state — the sweeper's poll
+   *  candidate set, narrowed further by the derived formation status at the call site. */
+  listOpenEntityKeys(): string[];
+  /**
+   * The poll-due candidate set, filtered and ordered IN SQL (M5).
+   *
+   * A superset by construction, and deliberately so: it asks "does this entity have any
+   * non-terminal polled step that is due?", while the caller decides which step the entity is
+   * actually waiting on. The superset is cheap (an index scan on `next_poll_at`) and the exact
+   * answer needs the step ordering, which the caller already has in memory.
+   *
+   * A row that has never been polled has a NULL `next_poll_at`; its clock is its own
+   * `updated_at`, which is why the caller passes the age cutoff as well as the instant. Ordered
+   * oldest-due first so a `limit` throttles a backlog instead of starving the tail of it.
+   */
+  listPollDueEntityKeys(nowMs: number, neverPolledCutoffUtc: string, limit: number): string[];
+  /**
+   * Entities PINNED to doola, with a party bound, for which no formation row exists at all (C2).
+   *
+   * The crash window between the claim (which writes the pin and binds the party, in one
+   * transaction) and `claimAllSteps` at the top of the create step. Nothing else can see these:
+   * they are `bound`/`funded`, so the onboarding reconciler skips them, and they have no rows, so
+   * every other sweeper query skips them too. They would sit, pinned and unfiled, forever.
+   */
+  listUnopenedFormations(limit: number): string[];
+  transition(
+    entityKey: string,
+    step: FormationStep,
+    from: FormationState,
+    to: FormationState,
+    fields?: {
+      providerRef?: string;
+      detail?: string;
+      error?: string | null;
+      /** Mirror of `detail.nextPollAt`. Written together with the detail it mirrors, never
+       *  alone — the column is an INDEX over the blob, not a second source of truth. */
+      nextPollAt?: number;
+    },
+  ): boolean;
+  bumpAttempt(entityKey: string, step: FormationStep, from: FormationState): number | undefined;
+  createRequestsByTenant(tenantId: string): number;
+  createRequestsSince(sinceUtc: string): number;
+}
+
+/**
+ * The ONE reader for a `formation_requests.detail` blob (M4).
+ *
+ * It belongs to the repository because `detail` is the repository's column, and because there
+ * were three parsers of it — the create step's private copy, the processor's exported one, and
+ * the view's ad-hoc `JSON.parse` — which is three chances to disagree about what an unreadable
+ * blob means.
+ *
+ * A corrupt blob yields an EMPTY object rather than throwing. Every fact `detail` can hold is
+ * either re-fetchable from doola or duplicated in a column (`provider_ref` above all), so an
+ * unreadable blob must never be the reason an entity is stranded.
+ */
+export function parseDetail<T>(raw: string | null): T {
+  if (!raw) return {} as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
+export class SqliteFormationRepository implements FormationRepository {
   /**
    * Statements are prepared ONCE, in the constructor.
    *
@@ -75,7 +179,7 @@ export class SqliteFormationRepository {
    */
   private readonly stmts;
 
-  constructor(db: Database.Database) {
+  constructor(private readonly db: Database.Database) {
     this.stmts = {
       claimStep: db.prepare(
         `INSERT INTO formation_requests (entity_key, step, state)
@@ -87,18 +191,70 @@ export class SqliteFormationRepository {
       listByState: db.prepare(
         "SELECT * FROM formation_requests WHERE state = ? ORDER BY entity_key, step",
       ),
+      // Scoped to `create_provider`, which is the ONLY step that owns a company id. Without the
+      // step filter a later step that mirrored the ref would make this ambiguous.
+      findByProviderRef: db.prepare(
+        "SELECT * FROM formation_requests WHERE provider_ref = ? AND step = 'create_provider'",
+      ),
+      listOpenEntityKeys: db.prepare(
+        `SELECT DISTINCT entity_key AS k FROM formation_requests
+          WHERE state NOT IN ('confirmed','abandoned') ORDER BY entity_key`,
+      ),
       transition: db.prepare(
         `UPDATE formation_requests
             SET state = ?,
                 provider_ref = COALESCE(?, provider_ref),
                 detail       = COALESCE(?, detail),
                 error        = ?,
+                next_poll_at = COALESCE(?, next_poll_at),
                 updated_at   = CURRENT_TIMESTAMP
           WHERE entity_key = ? AND step = ? AND state = ?`,
+      ),
+      // Superset by design — see `listPollDueEntityKeys`. GROUP BY + MIN so the ordering is by
+      // the EARLIEST due step of each entity, which is what makes `limit` a throttle rather than
+      // a starvation hazard.
+      listPollDue: db.prepare(
+        `SELECT entity_key AS k, MIN(COALESCE(next_poll_at, 0)) AS due
+           FROM formation_requests
+          WHERE state NOT IN ('confirmed','abandoned')
+            AND step IN ('await_filing','fetch_documents','await_ein')
+            AND ((next_poll_at IS NOT NULL AND next_poll_at <= @now)
+                 OR (next_poll_at IS NULL AND updated_at <= @cutoff))
+          GROUP BY entity_key
+          ORDER BY due, entity_key
+          LIMIT @limit`,
+      ),
+      listUnopened: db.prepare(
+        `SELECT e.idempotency_key AS k
+           FROM entities e
+           JOIN formation_parties p
+             ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
+          WHERE e.formation_provider = 'doola'
+            AND NOT EXISTS (
+                  SELECT 1 FROM formation_requests f WHERE f.entity_key = e.idempotency_key)
+          ORDER BY e.idempotency_key
+          LIMIT ?`,
       ),
       // One statement, not an UPDATE followed by a SELECT: the read-back could otherwise return
       // a DIFFERENT driver's attempt number (this repo exists because two drivers meet on these
       // rows), and a retry would then derive an idempotency key for an attempt it does not own.
+      // ── Spend controls (design §2, audit H6). Both count `create_provider` rows, which is one
+      //    row per entity a filing was ever OPENED for — including failed ones, deliberately: a
+      //    create that failed after doola committed has already cost a real company and a real
+      //    fee, and a quota that only counted successes would let a retry loop spend without
+      //    bound. The join is how a per-TENANT quota reaches rows keyed only by entity.
+      countByTenant: db.prepare(
+        `SELECT COUNT(*) AS n
+           FROM formation_requests f
+           JOIN entities e ON e.idempotency_key = f.entity_key
+          WHERE f.step = 'create_provider' AND e.owner_tenant_id = ?`,
+      ),
+      // Lexicographic on the TEXT CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC) the schema
+      // writes — the caller supplies the cutoff so the window is testable with an injected clock,
+      // which `datetime('now','-24 hours')` would not be.
+      countSince: db.prepare(
+        "SELECT COUNT(*) AS n FROM formation_requests WHERE step = 'create_provider' AND created_at > ?",
+      ),
       bumpAttempt: db.prepare(
         `UPDATE formation_requests
             SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP
@@ -120,6 +276,35 @@ export class SqliteFormationRepository {
     return r ? toRecord(r) : undefined;
   }
 
+  stepsOfMany(entityKeys: string[]): Map<string, FormationRequestRecord[]> {
+    const out = new Map<string, FormationRequestRecord[]>();
+    if (entityKeys.length === 0) return out;
+    // `IN (?,?,…)` built per call rather than prepared once: the arity varies, and SQLite has no
+    // array binding. Chunked at 400 to stay clear of SQLITE_MAX_VARIABLE_NUMBER (999 by default).
+    for (let i = 0; i < entityKeys.length; i += 400) {
+      const chunk = entityKeys.slice(i, i + 400);
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM formation_requests WHERE entity_key IN (${chunk.map(() => "?").join(",")})`,
+        )
+        .all(...chunk) as Row[];
+      for (const r of rows) {
+        const list = out.get(r.entity_key);
+        if (list) list.push(toRecord(r));
+        else out.set(r.entity_key, [toRecord(r)]);
+      }
+    }
+    // Saga order per entity, the same order `stepsOf` returns.
+    for (const [k, list] of out)
+      out.set(
+        k,
+        FORMATION_STEP_ORDER.map((step) => list.find((r) => r.step === step)).filter(
+          (r): r is FormationRequestRecord => r !== undefined,
+        ),
+      );
+    return out;
+  }
+
   /** Every step of one entity, in saga order (missing steps are simply absent). */
   stepsOf(entityKey: string): FormationRequestRecord[] {
     const rows = this.stmts.stepsOf.all(entityKey) as Row[];
@@ -134,6 +319,29 @@ export class SqliteFormationRepository {
     return (this.stmts.listByState.all(state) as Row[]).map(toRecord);
   }
 
+  findByProviderRef(providerRef: string): FormationRequestRecord | undefined {
+    const r = this.stmts.findByProviderRef.get(providerRef) as Row | undefined;
+    return r ? toRecord(r) : undefined;
+  }
+
+  listOpenEntityKeys(): string[] {
+    return (this.stmts.listOpenEntityKeys.all() as { k: string }[]).map((r) => r.k);
+  }
+
+  listPollDueEntityKeys(nowMs: number, neverPolledCutoffUtc: string, limit: number): string[] {
+    return (
+      this.stmts.listPollDue.all({
+        now: nowMs,
+        cutoff: neverPolledCutoffUtc,
+        limit,
+      }) as { k: string }[]
+    ).map((r) => r.k);
+  }
+
+  listUnopenedFormations(limit: number): string[] {
+    return (this.stmts.listUnopened.all(limit) as { k: string }[]).map((r) => r.k);
+  }
+
   /**
    * COMPARE-AND-SET the state: moves `step` from `from` to `to` and returns whether THIS caller
    * made the move. A second concurrent driver observing the same `from` gets `false` and must not
@@ -145,7 +353,12 @@ export class SqliteFormationRepository {
     step: FormationStep,
     from: FormationState,
     to: FormationState,
-    fields: { providerRef?: string; detail?: string; error?: string | null } = {},
+    fields: {
+      providerRef?: string;
+      detail?: string;
+      error?: string | null;
+      nextPollAt?: number;
+    } = {},
   ): boolean {
     const info = this.stmts.transition.run(
       to,
@@ -154,6 +367,7 @@ export class SqliteFormationRepository {
       // `error` is the one field a transition MUST be able to clear: a row that succeeds after
       // a failure has no error, and leaving a stale one would misreport a healthy step.
       fields.error ?? null,
+      fields.nextPollAt ?? null,
       entityKey,
       step,
       from,
@@ -178,8 +392,45 @@ export class SqliteFormationRepository {
     return row?.attempt;
   }
 
-  /** The deterministic per-attempt idempotency key doola's two create endpoints honor. */
-  static idempotencyKey(entityKey: string, step: FormationStep, attempt: number): string {
-    return `formation:${entityKey}:${step}:${attempt}`;
+  /** Lifetime formations opened by one tenant (FORMATION_MAX_PER_TENANT). */
+  createRequestsByTenant(tenantId: string): number {
+    return (this.stmts.countByTenant.get(tenantId) as { n: number }).n;
+  }
+
+  /** Formations opened across the deployment since a UTC "YYYY-MM-DD HH:MM:SS" instant
+   *  (FORMATION_DAILY_CEILING, the platform_outflows twin). */
+  createRequestsSince(sinceUtc: string): number {
+    return (this.stmts.countSince.get(sinceUtc) as { n: number }).n;
+  }
+
+  /** Claim all four steps of a new entity's formation in ONE transaction (the bridge-legs
+   *  pattern): "is a formation in flight for this entity?" is then a single query over rows that
+   *  provably all exist, instead of a guess about which of them a crash created. Returns whether
+   *  this caller opened the saga (i.e. `create_provider` did not already exist). */
+  claimAllSteps(entityKey: string): boolean {
+    return this.db.transaction(() => {
+      let opened = false;
+      for (const step of FORMATION_STEP_ORDER)
+        if (this.claimStep(entityKey, step) && step === "create_provider") opened = true;
+      return opened;
+    })();
+  }
+
+  /**
+   * The deterministic per-attempt idempotency key doola's two create endpoints honor.
+   *
+   * `endpoint` is a hardening suffix (C1): the customer create and the company create are two
+   * different requests with two different bodies, and giving them one key made "same key,
+   * different body" — doola's `E_IDEMPOTENCY_KEY_REUSED` — a shape our own traffic could produce.
+   * Omitted, the bare per-attempt key is returned, which is what the pre-suffix rows carry.
+   */
+  static idempotencyKey(
+    entityKey: string,
+    step: FormationStep,
+    attempt: number,
+    endpoint?: "customer" | "company",
+  ): string {
+    const base = `formation:${entityKey}:${step}:${attempt}`;
+    return endpoint ? `${base}:${endpoint}` : base;
   }
 }

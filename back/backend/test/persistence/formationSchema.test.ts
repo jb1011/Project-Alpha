@@ -3,6 +3,8 @@
  * columns, and the ALTER-if-missing idiom holding on a PRE-EXISTING database — the shape the
  * prod box actually upgrades through.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
@@ -85,16 +87,134 @@ test("the webhook-events index is PARTIAL on processed_at IS NULL (the sweeper's
   expect(idx).toContain("WHERE processed_at IS NULL");
 });
 
-test("formation_parties.region and deleted_at are NULLABLE (most countries have no region; H7)", () => {
+test("every PII column in formation_parties is NULLABLE — that is what ERASURE needs (H7)", () => {
   const cols = db.prepare("PRAGMA table_info(formation_parties)").all() as {
     name: string;
     notnull: number;
   }[];
   expect(cols.find((c) => c.name === "region")?.notnull).toBe(0);
   expect(cols.find((c) => c.name === "deleted_at")?.notnull).toBe(0);
-  // …while the fields a filing legally requires stay NOT NULL.
-  for (const required of ["legal_first_name", "legal_last_name", "email", "line1", "city"])
-    expect(cols.find((c) => c.name === required)?.notnull).toBe(1);
+  // PR 2 part A declared the legally-required fields NOT NULL. Part B has to erase them: the
+  // sweeper NULLs every PII column for a party whose filing provably never happened, and a NOT
+  // NULL constraint would force it to overwrite personal data with a sentinel string instead of
+  // removing it. "Erased" has to mean the column holds nothing. What a FILING requires is still
+  // required — enforced where it belongs, at the intake schema (POST /formation-party), which is
+  // the only writer.
+  for (const pii of [
+    "legal_first_name",
+    "legal_last_name",
+    "email",
+    "phone",
+    "line1",
+    "line2",
+    "city",
+    "postal_code",
+    "country",
+  ])
+    expect(cols.find((c) => c.name === pii)?.notnull, pii).toBe(0);
+  // The columns that must survive an erasure keep their constraints.
+  expect(cols.find((c) => c.name === "tenant_id")?.notnull).toBe(1);
+});
+
+test("formation_parties is keyed by party_id, with a NULLABLE UNIQUE entity_key + a tenant", () => {
+  // The intake handle exists BEFORE the entity does (design §5): PII is collected, a partyId is
+  // returned, and onboard binds it. A table keyed by entity_key cannot express that.
+  const cols = db.prepare("PRAGMA table_info(formation_parties)").all() as {
+    name: string;
+    notnull: number;
+    pk: number;
+  }[];
+  expect(cols.find((c) => c.name === "party_id")?.pk).toBe(1);
+  expect(cols.find((c) => c.name === "entity_key")?.pk).toBe(0);
+  expect(cols.find((c) => c.name === "entity_key")?.notnull).toBe(0);
+  expect(cols.find((c) => c.name === "tenant_id")?.notnull).toBe(1);
+
+  const insert = db.prepare(
+    `INSERT INTO formation_parties (party_id, entity_key, tenant_id, legal_first_name,
+       legal_last_name, email, line1, city, postal_code, country)
+     VALUES (?,?,?,'A','L','a@b.c','1 Way','Cheyenne','82001','USA')`,
+  );
+  insert.run("p1", "ent-1", "0xA");
+  // One party per entity: a second party binding the same entity is refused by the schema, not
+  // by a code path that could be forgotten.
+  expect(() => insert.run("p2", "ent-1", "0xA")).toThrow(/UNIQUE/);
+  // …and two UNBOUND parties coexist (NULLs do not collide in a SQLite UNIQUE index).
+  insert.run("p3", null, "0xA");
+  insert.run("p4", null, "0xA");
+  expect(
+    (
+      db.prepare("SELECT COUNT(*) c FROM formation_parties WHERE entity_key IS NULL").get() as {
+        c: number;
+      }
+    ).c,
+  ).toBe(2);
+});
+
+test("a PR-1-shaped formation_parties table is REBUILT in place (it never held a row)", () => {
+  // The prod-box upgrade: PR 1 created the table keyed by entity_key and shipped no writer for
+  // it, so the migration drops and recreates rather than attempting a 12-step ALTER.
+  const old = new Database(":memory:");
+  old.exec(`
+    CREATE TABLE formation_parties (
+      entity_key TEXT PRIMARY KEY,
+      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
+      email TEXT NOT NULL, phone TEXT,
+      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
+      region TEXT, postal_code TEXT NOT NULL, country TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deleted_at TEXT
+    );
+  `);
+  migrate(old);
+  migrate(old);
+  expect(columnsOf(old, "formation_parties")).toEqual(
+    expect.arrayContaining(["party_id", "entity_key", "tenant_id", "synthetic"]),
+  );
+  old.close();
+});
+
+test("C10: a PR-1-shaped formation_parties table with ROWS in it refuses the migration", () => {
+  // The rebuild above is a DROP, and this is the only table in the system holding personal data.
+  // "PR 1 shipped no writer" is an argument about the code that shipped — it is not a proof that
+  // nothing ever wrote a row (a fixture, a hand-run INSERT, a restored backup from a fork). So a
+  // legacy-shaped table with any rows in it stops the boot by name instead of destroying data
+  // that cannot be reconstructed: the new shape's keys do not exist in the old one to derive.
+  const old = new Database(":memory:");
+  old.exec(`
+    CREATE TABLE formation_parties (
+      entity_key TEXT PRIMARY KEY,
+      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
+      email TEXT NOT NULL, phone TEXT,
+      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
+      region TEXT, postal_code TEXT NOT NULL, country TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deleted_at TEXT
+    );
+    INSERT INTO formation_parties
+      (entity_key, legal_first_name, legal_last_name, email, line1, city, postal_code, country)
+    VALUES ('t:agent-1', 'Ada', 'Lovelace', 'ada@example.com', '1 Analytical Way', 'Cheyenne', '82001', 'USA');
+  `);
+  expect(() => migrate(old)).toThrow(/refusing to migrate: formation_parties/);
+  // And the row is STILL THERE: a refusal that had already dropped the table would be worse than
+  // no refusal at all.
+  expect(
+    (old.prepare("SELECT COUNT(*) AS n FROM formation_parties").get() as { n: number }).n,
+  ).toBe(1);
+  expect(columnsOf(old, "formation_parties")).not.toContain("party_id");
+  old.close();
+});
+
+test("C10: the unreachable second formation_parties rebuild is gone", () => {
+  // The migration had a SECOND block that rebuilt the table to drop NOT NULL from the PII
+  // columns. It could never run: the guard above recreates the table from the current DDL, in
+  // which those columns are already nullable, and no shipped shape has ever had both `party_id`
+  // and a NOT NULL `legal_first_name`. Dead migration code that performs a DROP is the worst kind
+  // to keep, because the day it becomes reachable is the day it deletes something.
+  const source = readFileSync(
+    join(import.meta.dirname, "..", "..", "src", "persistence", "db.ts"),
+    "utf8",
+  );
+  expect(source).not.toContain("formation_parties_new");
+  // Exactly one DROP of this table, and it is the guarded one.
+  expect(source.match(/DROP TABLE formation_parties/g)?.length ?? 0).toBe(1);
 });
 
 test("the CHECKs refuse an unknown step/state (typos become errors, not silent rows)", () => {

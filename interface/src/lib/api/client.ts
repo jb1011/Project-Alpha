@@ -30,6 +30,33 @@ type RequestOpts = {
   body?: unknown;
 };
 
+/**
+ * The ONE error path for every response this client reads (M4).
+ *
+ * Both callers — the JSON `request` helper and the bytes-returning `downloadDocument` — need the
+ * identical treatment of a failure: prefer the backend's own `{error:{code,message}}` envelope,
+ * fall back to a synthesized one, and NEVER surface a blank message (statusText is routinely
+ * empty on HTTP/2 and on bare 500s). Two copies of that is two chances for a download to fail
+ * with an empty string where a request would have failed with a reason.
+ *
+ * Returns the parsed body on success so `request` does not have to read the stream twice; the
+ * download path ignores it and reads the bytes itself.
+ */
+async function throwIfNotOk(res: Response): Promise<unknown> {
+  if (res.ok) return undefined;
+  const json = (await res.json().catch(() => null)) as ApiErrorBody | null;
+  throw new ApiError(
+    res.status,
+    json && typeof json === "object" && "error" in json
+      ? json.error
+      : {
+          code: "http_error",
+          // statusText is often empty (HTTP/2, bare 500s) — never surface a blank error.
+          message: res.statusText || `Request failed (HTTP ${res.status})`,
+        },
+  );
+}
+
 async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
   const headers: Record<string, string> = {};
   if (opts.body !== undefined) headers["content-type"] = "application/json";
@@ -41,24 +68,8 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
 
-  const json = (await res.json().catch(() => null)) as
-    | T
-    | ApiErrorBody
-    | null;
-
-  if (!res.ok) {
-    const err =
-      json && typeof json === "object" && "error" in json
-        ? (json as ApiErrorBody).error
-        : {
-            code: "http_error",
-            // statusText is often empty (HTTP/2, bare 500s) — never surface a blank error.
-            message: res.statusText || `Request failed (HTTP ${res.status})`,
-          };
-    throw new ApiError(res.status, err);
-  }
-
-  return json as T;
+  await throwIfNotOk(res);
+  return (await res.json().catch(() => null)) as T;
 }
 
 export async function healthCheck(): Promise<{ ok: boolean }> {
@@ -310,4 +321,39 @@ export function worldIdVerify(token: string, proof: unknown): Promise<WorldIdSta
  *  path (no Orb in their country, passport outside World's credential list). */
 export function worldIdWaiver(token: string, code: string): Promise<WorldIdStatusView> {
   return request<WorldIdStatusView>("/world-id/waiver", { token, body: { code } });
+}
+
+/**
+ * Download one legal document as a Blob.
+ *
+ * The only bytes-returning call in this client, and it has to exist: an `<a href>` cannot carry a
+ * Bearer token, so the browser path is fetch -> blob -> objectURL rather than a plain link. The
+ * shared `request` helper is json-only by construction (it calls `res.json()`), so this goes
+ * around it — and therefore repeats the auth header and the error envelope by hand.
+ *
+ * The response is deliberately NOT trusted to be a PDF just because it was asked for: a proxy
+ * error page or an expired-session redirect would otherwise be handed to the caller as a
+ * "document" and saved to disk under a .pdf name.
+ */
+export async function downloadDocument(
+  token: string,
+  id: string,
+  docId: string,
+): Promise<Blob> {
+  const res = await fetch(
+    `${API_URL}/entities/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`,
+    { headers: { authorization: `Bearer ${token}` } },
+  );
+
+  await throwIfNotOk(res);
+
+  const blob = await res.blob();
+  const contentType = (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  if (contentType !== "application/pdf") {
+    throw new ApiError(res.status, {
+      code: "unexpected_content_type",
+      message: `expected a PDF, got "${contentType || "(none)"}"`,
+    });
+  }
+  return blob;
 }

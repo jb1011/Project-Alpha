@@ -8,6 +8,8 @@ import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
+import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
+import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { OnboardingRunner } from "../../src/workflow/runner";
 import { TEST_FUND_CAPS } from "../helpers/fundCaps";
@@ -42,6 +44,7 @@ const PASSKEY = { attestation: { credentialId: "cred-1" } };
 const FORMATION_OFF = {
   formationAvailable: false,
   formationEnvironment: null,
+  formationRequired: false,
 };
 
 let db: Database.Database;
@@ -57,7 +60,7 @@ function makeApp(opts: {
   circleAvailable: boolean;
   turnkeyAvailable?: boolean;
   def?: "turnkey" | "circle";
-  formation?: { environment: "sandbox" | "production" };
+  formation?: { environment: "sandbox" | "production"; required?: boolean };
 }) {
   const runner = new OnboardingRunner({
     repo,
@@ -75,7 +78,17 @@ function makeApp(opts: {
     walletProviderDefault: opts.def ?? "turnkey",
     circleCustodyAvailable: opts.circleAvailable,
     turnkeyCustodyAvailable: opts.turnkeyAvailable ?? true,
-    formation: opts.formation,
+    formation: opts.formation
+      ? {
+          environment: opts.formation.environment,
+          required: opts.formation.required ?? false,
+          sandboxSyntheticPii: opts.formation.environment === "sandbox",
+          maxPerTenant: 3,
+          dailyCeiling: 10,
+          parties: new SqliteFormationPartyRepository(db),
+          requests: new SqliteFormationRepository(db),
+        }
+      : undefined,
     repo,
     runner,
     passkeyRpId: "wizard.local",
@@ -236,6 +249,7 @@ test("GET /config reports formation availability and its ENVIRONMENT (honesty in
     turnkeyCustodyAvailable: true,
     formationAvailable: true,
     formationEnvironment: "sandbox",
+    formationRequired: false,
   });
 
   // Production formation is a DIFFERENT advertised value, never a missing one: the environment is
@@ -265,7 +279,15 @@ test("availability and environment are ONE dep — they can never be advertised 
   ).json();
   expect([on.formationAvailable, on.formationEnvironment]).toEqual([true, "sandbox"]);
 
-  // PR 1 deliberately does not advertise FORMATION_REQUIRED: the door gate that enforces it
-  // lands in PR 2, and a requirement nothing enforces is a claim the deployment cannot keep.
-  expect(on).not.toHaveProperty("formationRequired");
+  // PR 2 advertises FORMATION_REQUIRED — and only now, because the door gate that enforces it
+  // ships with it. A requirement nothing enforces is a claim the deployment cannot keep.
+  expect(on.formationRequired).toBe(false);
+  const mandatory = await (
+    await makeApp({
+      circleAvailable: true,
+      def: "circle",
+      formation: { environment: "sandbox", required: true },
+    }).request("/config")
+  ).json();
+  expect([mandatory.formationAvailable, mandatory.formationRequired]).toEqual([true, true]);
 });

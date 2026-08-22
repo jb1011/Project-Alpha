@@ -1,4 +1,9 @@
 import { type NextRequest, NextResponse } from "next/server";
+import {
+  FORWARDED_REQUEST_HEADERS,
+  forwardedResponseHeaders,
+  isNoStorePath,
+} from "../../../lib/proxyHeaders";
 
 function apiTarget(): string {
   const configured = process.env.API_PROXY_TARGET?.trim();
@@ -24,22 +29,11 @@ async function proxy(
   const { path } = await ctx.params;
   const url = backendUrl(path, req.nextUrl.search);
 
+  // Both allowlists live in ../../../lib/proxyHeaders: "which headers cross the boundary" is a
+  // security decision, and a Next.js route file cannot export it for review or for the backend's
+  // drift guard.
   const headers = new Headers();
-  // MCP Streamable HTTP requires accept/mcp-* headers end-to-end (the backend 406s without them);
-  // x402 requires x-payment end-to-end (the seller re-issues its 402 challenge without it);
-  // AgentKit sends its human-backing proof in a header named exactly `agentkit` — dropping it
-  // makes every external agent look anonymous to the seller, which refused them all.
-  const forwarded = [
-    "authorization",
-    "content-type",
-    "accept",
-    "mcp-session-id",
-    "mcp-protocol-version",
-    "last-event-id",
-    "x-payment",
-    "agentkit",
-  ];
-  for (const name of forwarded) {
+  for (const name of FORWARDED_REQUEST_HEADERS) {
     const value = req.headers.get(name);
     if (value) headers.set(name, value);
   }
@@ -51,22 +45,21 @@ async function proxy(
 
   const res = await fetch(url, init);
 
-  const outHeaders: Record<string, string> = {};
-  const ct = res.headers.get("content-type");
-  if (ct) outHeaders["content-type"] = ct;
-  const sessionId = res.headers.get("mcp-session-id");
-  if (sessionId) outHeaders["mcp-session-id"] = sessionId;
-  // x402 settlement id is returned to the buyer in x-payment-response.
-  const payResponse = res.headers.get("x-payment-response");
-  if (payResponse) outHeaders["x-payment-response"] = payResponse;
-  // AgentKit outcome: who the seller judged to be backing the agent, and its remaining budget.
-  // Without these an authorized agent cannot read its own standing.
-  for (const h of ["x-agentkit-human", "x-agentkit-authorization"]) {
-    const v = res.headers.get(h);
-    if (v) outHeaders[h] = v;
-  }
+  // Which headers may cross depends on the ROUTE and on what the backend actually answered (C9):
+  // the four download headers are forwarded only for the document bytes route, and
+  // `content-length` is dropped whenever the response is encoded, because the backend's byte
+  // count would then be a lie about the bytes on the wire — and a lying Content-Length truncates
+  // the download rather than merely annoying the browser.
   const joined = path?.join("/") ?? "";
-  if (joined === "connection-package" || joined === "bootstrap-connection") {
+  const outHeaders: Record<string, string> = {};
+  for (const name of forwardedResponseHeaders(joined, res.headers)) {
+    const v = res.headers.get(name);
+    if (v) outHeaders[name] = v;
+  }
+  // The second lock. The backend already sets `private, no-store` on these responses; this is the
+  // proxy refusing to let an intermediary decide otherwise, and it OVERRIDES whatever the
+  // forwarding loop above copied.
+  if (isNoStorePath(joined)) {
     outHeaders["cache-control"] = "no-store";
   }
 

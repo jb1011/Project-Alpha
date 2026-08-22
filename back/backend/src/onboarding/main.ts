@@ -14,7 +14,7 @@ import { provisionAgentVault } from "../adapters/turnkey/provisioner";
 import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { loadConfig } from "../config/env";
-import { resolveFormationDeployment } from "../formation";
+import { legacyDoorRefusalMessage, legacyDoorRefused } from "../formation";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
@@ -87,14 +87,20 @@ async function main() {
         ? (entityKey) =>
             privateKeyToAccount(derivePocketKey(cfg.pocketMasterSeed!, entityKey)).address
         : undefined,
-      // Formation (design §2/§5): the SAME resolver the API and the CLI use. This server is a
-      // legacy door (retire-vs-gate is a PR-2 decision), but while it can still mint entities it
-      // must not mint ones that disagree with the rest of the deployment about their provider.
-      formation: resolveFormationDeployment(cfg),
+      // Formation (design §2/§5, C5): NOT wired. An entity is pinned iff a formation party is
+      // bound to it, and this legacy door carries no partyId — so what it mints is a stub, on
+      // every deployment. `legacyDoorRefused` below is what stops it minting anything at all
+      // where formation is mandatory.
     });
 
+  const refused = legacyDoorRefused(cfg);
+  if (refused)
+    console.warn(
+      "⚠ formation is REQUIRED on this deployment — this legacy onboarding door refuses every request",
+    );
   const app = buildOnboardingApp({
     runOnboarding,
+    formationRefusal: refused ? legacyDoorRefusalMessage("onboarding-server") : undefined,
     // Controller mode: the controller contract; otherwise the signing key's address, as before.
     platformManagerAddress: platformManagerAddress(cfg),
   });

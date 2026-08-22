@@ -22,6 +22,7 @@ import {
   circleOperatorSigner,
   provisionCircleWallets,
 } from "../adapters/circle/circleWallets";
+import { buildDoolaApi } from "../adapters/doola/doolaClient";
 import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
@@ -49,8 +50,12 @@ import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteBridgeLegRepository } from "../persistence/bridgeLegRepository";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
 import { migrate, openDatabase } from "../persistence/db";
+import { SqliteDocumentIndexRepository } from "../persistence/documentIndexRepository";
 import { FileDocumentStore } from "../persistence/documentStore";
+import { SqliteDoolaEventRepository } from "../persistence/doolaEventRepository";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
+import { SqliteFormationPartyRepository } from "../persistence/formationPartyRepository";
+import { SqliteFormationRepository } from "../persistence/formationRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
@@ -63,10 +68,14 @@ import {
 import { SqliteWorldStore } from "../persistence/worldStore";
 import { usdToUnits } from "../policy/units";
 import type { Address } from "../types";
+import { TaskTracker } from "../util/taskTracker";
+import { processDoolaEvent } from "../workflow/formationProcessor";
+import { FormationSweeper } from "../workflow/formationSweeper";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
 import { buildX402DemoDeps } from "./routes/x402Demo";
+import { installShutdownHandlers, shouldInstallSignalHandlers } from "./shutdown";
 
 async function main() {
   const cfg = loadConfig();
@@ -92,6 +101,14 @@ async function main() {
   // transaction at create-confirm, so the entity store and the anchor history can never disagree
   // about what the chain holds.
   const anchors = new SqliteOaAnchorRepository(db);
+  // Same db handle again: the four formation step rows are claimed inside one transaction, the
+  // spend-control counts JOIN `entities`, and the party bind commits with the entity claim.
+  const formationRequests = new SqliteFormationRepository(db);
+  const formationParties = new SqliteFormationPartyRepository(db);
+  // Same db handle again: a stored document's index row and the step it confirms have to commit
+  // against the same database, and the webhook ledger is the sweeper's work queue.
+  const formationDocuments = new SqliteDocumentIndexRepository(db);
+  const doolaEvents = new SqliteDoolaEventRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const nonceStore = new SqliteNonceStore(db);
   const apiKeys = new SqliteApiKeyStore(db);
@@ -272,6 +289,29 @@ async function main() {
   // come from different places, and no door can pin differently from another. Null on a
   // credential-less deployment, and on one that has FORMATION_REQUIRED off = stub mode.
   const formationDeployment = resolveFormationDeployment(cfg);
+  // Built from the SAME config block `canFormEntities` gates on, so the availability the door
+  // advertises and the client that would actually file can never disagree.
+  const doolaApi = cfg.doola
+    ? buildDoolaApi({
+        apiKey: cfg.doola.apiKey,
+        baseUrl: cfg.doola.baseUrl,
+        environment: cfg.doola.environment,
+      })
+    : undefined;
+  if (doolaApi)
+    console.warn(
+      `⚠ doola formation ENABLED (${cfg.doola!.environment}, required=${cfg.formation?.required})`,
+    );
+  // C5. The opt-in shape, said out loud at boot. It is the shape the testnet box runs until the
+  // PR-4 wizard collects a legal identity, and it is easy to mistake for "formation is off": the
+  // credentials are loaded, the door advertises the capability, the receiver is mounted — and yet
+  // an onboard that carries no partyId files nothing at all, forever. An operator who expected
+  // every new entity to become a Wyoming LLC should learn that here, not from an empty
+  // `formation_requests` table a week later.
+  if (doolaApi && !cfg.formation?.required)
+    console.warn(
+      "⚠ FORMATION_REQUIRED=false — formation is AVAILABLE, not mandatory: an onboard is only pinned and filed when it carries a partyId, and the wizard does not send one yet (docs/runbooks/doola-deploy.md)",
+    );
 
   const runSaga: RunSaga = (i) =>
     runOnboarding({
@@ -295,8 +335,21 @@ async function main() {
       provisionCircle,
       circleSignerForEntity,
       derivePocketAddress,
-      formation: formationDeployment,
       anchors,
+      // Formation (Step 9) — the pin and the filer as ONE object (M3), so this root cannot hand
+      // the saga a provider to pin without also handing it the client and the repositories that
+      // would file for it. `environment` is the DEPLOYMENT's, deliberately separate from
+      // `pin.environment`: an entity pinned earlier still owes its filing a correctly-routed
+      // call, whatever the config has since become.
+      formation: doolaApi
+        ? {
+            pin: formationDeployment,
+            doola: doolaApi,
+            requests: formationRequests,
+            parties: formationParties,
+            environment: cfg.doola!.environment,
+          }
+        : undefined,
     });
 
   const runner = new OnboardingRunner({
@@ -305,9 +358,50 @@ async function main() {
     fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
     outflows,
     formation: formationDeployment,
+    parties: formationParties,
   });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
+
+  // ── The formation loop (design §5/§6/§7) ─────────────────────────────────────────────────
+  //
+  // All three parts share ONE dependency object, deliberately: the webhook processor and the
+  // sweeper's poll are the same fetch-and-advance, and giving them separate wiring would be the
+  // first step toward them disagreeing about what "filed" means.
+  //
+  // Every piece is gated on `doolaApi`, so a credential-less deployment mounts no receiver,
+  // starts no timer, and reconciles nothing — the stub shape stays exactly as it was.
+  // ── The view dependencies (C8) ───────────────────────────────────────────────────────────
+  //
+  // Built ONCE and spread into `buildApiApp`, which hands the same object to the MCP server. The
+  // two surfaces used to be wired separately and the MCP one was missing the document index, so
+  // `get_entity` over MCP described an entity with no legal documents while `GET /entities/:id`
+  // described the same entity with two. Nothing errored; the agent surface was quietly less true.
+  //
+  // Always wired, credentials or not: these are plain SQL over the same database, not part of the
+  // doola capability, and an entity already filed must stay describable — and its PDFs
+  // downloadable — on a box that has since lost its doola block.
+  const entityViewDeps = {
+    formationSteps: (entityKey: string) => formationRequests.stepsOf(entityKey),
+    // The batched twin the list routes use: one read per page instead of two per entity (M5).
+    formationStepsMany: (entityKeys: string[]) => formationRequests.stepsOfMany(entityKeys),
+    documents: formationDocuments,
+  };
+
+  const doolaTasks = new TaskTracker("doola_webhook_task");
+  const formationDeps = doolaApi && {
+    repo,
+    requests: formationRequests,
+    parties: formationParties,
+    documents: formationDocuments,
+    docStore,
+    events: doolaEvents,
+    doola: doolaApi,
+    // The DEPLOYMENT's environment, which is what every entity's pin is compared against.
+    environment: cfg.doola!.environment,
+    intervalMs: cfg.formation?.sweepMs ?? 60_000,
+  };
+  const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
 
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
   const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
@@ -400,7 +494,33 @@ async function main() {
     // the environment it is available IN, which the honesty invariant makes inseparable from it.
     // Availability is NOT the pin: a box with credentials but FORMATION_REQUIRED off still
     // advertises the capability while pinning nothing.
-    formation: canFormEntities(cfg) ? { environment: cfg.doola!.environment } : undefined,
+    formation: canFormEntities(cfg)
+      ? {
+          environment: cfg.doola!.environment,
+          required: Boolean(cfg.formation?.required),
+          sandboxSyntheticPii: Boolean(cfg.formation?.sandboxSyntheticPii),
+          maxPerTenant: cfg.formation?.maxPerTenant ?? 3,
+          dailyCeiling: cfg.formation?.dailyCeiling ?? 10,
+          parties: formationParties,
+          requests: formationRequests,
+        }
+      : undefined,
+    // The view dependencies, as ONE object shared with the MCP surface below (C8).
+    ...entityViewDeps,
+    // The inbound receiver (design §6). Present only with credentials: a box that cannot verify a
+    // signature has no business owning the URL.
+    doola:
+      doolaApi && formationDeps
+        ? {
+            environment: cfg.doola!.environment,
+            webhookSecret: cfg.doola!.webhookSecret,
+            webhookSecretPrevious: cfg.doola!.webhookSecretPrevious,
+            events: doolaEvents,
+            tasks: doolaTasks,
+            // The receiver hands over ids; this is where they become a re-fetch (audit H2).
+            process: (wake) => processDoolaEvent(formationDeps, wake),
+          }
+        : undefined,
     repo,
     docStore,
     runner,
@@ -427,8 +547,33 @@ async function main() {
   });
 
   const port = Number(process.env.PORT ?? 8789);
-  serve({ fetch: app.fetch, port });
+  const server = serve({ fetch: app.fetch, port });
   console.log(`Wizard API listening on :${port}`);
+
+  // ── C4. The formation reconcile happens AFTER the socket is listening, never before it.
+  //
+  //    It used to be `await formationReconcile(sweeper)` up beside the other two reconcilers, and
+  //    that put doola on the boot path: the reconcile fetch-and-advances every in-flight entity,
+  //    each one a network round trip to a third party, before `serve()` was ever called. A doola
+  //    outage or a slow morning therefore delayed the port opening — so /healthz did not answer,
+  //    the load balancer marked the box down, and the deploy failed for a reason that has nothing
+  //    to do with whether this process can serve requests. A formation provider must never be
+  //    able to keep the API from starting.
+  //
+  //    `start()` runs its first loop iteration immediately, and that iteration IS the reconcile —
+  //    which is why there is no separate tick here any more: the duplicate would have doubled
+  //    every boot's doola traffic for nothing.
+  if (formationSweeper) {
+    formationSweeper.start();
+    console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
+  }
+
+  // The API process's FIRST signal handlers (design §7). Until part B every unit of work was a
+  // request, so a restart only dropped HTTP a client would retry; now the process also holds
+  // acked webhook work and an unattended timer. Guarded so importing this module under a test
+  // runner never installs a handler that would exit the runner.
+  if (shouldInstallSignalHandlers())
+    installShutdownHandlers({ sweeper: formationSweeper, tasks: doolaTasks, server });
 }
 
 main().catch((e) => {

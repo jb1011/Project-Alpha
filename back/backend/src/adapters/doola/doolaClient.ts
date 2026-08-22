@@ -1,14 +1,17 @@
 import { opsLog } from "../../observability/opsLog";
 import { withDeadline } from "../../util/deadline";
+import { readCappedText } from "../../util/readStreamCapped";
 import type {
   CreateCompanyInput,
   CreateCustomerInput,
   DoolaCompany,
+  DoolaCompanyPage,
   DoolaComplianceEvent,
   DoolaCustomer,
   DoolaDocument,
   DoolaDocumentDownload,
   DoolaErrorEnvelope,
+  DoolaPlaygroundResult,
   DoolaRequiredAction,
 } from "./types";
 
@@ -58,8 +61,9 @@ export class DoolaApiError extends Error {
     message: string,
     /** doola's correlation id — the FIRST thing their support asks for. */
     readonly requestId?: string,
-    /** Field-level detail on a validation failure. */
-    readonly fields?: Record<string, string | string[]>,
+    /** Field-level detail on a validation failure. Opaque: doola nests `{code, message}` per
+     *  field, and a narrower type would be a claim about a partner surface we do not control. */
+    readonly fields?: Record<string, unknown>,
   ) {
     super(message);
     this.name = "DoolaApiError";
@@ -91,6 +95,65 @@ export class DoolaTimeoutError extends Error {
   }
 }
 
+/**
+ * ONE description of a doola failure, for every error string and every ops line (M4).
+ *
+ * Three drivers — the create step, the fetch-and-advance, the sweeper — each had their own
+ * rendering, and two of them dropped doola's machine code and correlation id entirely. Those two
+ * fields are the whole reason `DoolaApiError` carries them: `code` is what the retry logic
+ * branches on (a validation failure must never be retried blind), and `requestId` is the first
+ * thing doola's support asks for.
+ *
+ * A timeout gets a code of its own (`E_TIMEOUT`) rather than none: "we never heard back" is the
+ * single most important distinction the create step makes, because it is the one case where the
+ * request may have COMMITTED at doola and the answer was lost.
+ */
+export function describeDoolaError(e: unknown): {
+  message: string;
+  code?: string;
+  requestId?: string;
+} {
+  if (e instanceof DoolaApiError)
+    return { message: `${e.code}: ${e.message}`, code: e.code, requestId: e.requestId };
+  if (e instanceof DoolaTimeoutError) return { message: e.message, code: "E_TIMEOUT" };
+  return { message: (e as Error)?.message ?? String(e) };
+}
+
+/**
+ * What a failed doola call actually tells us about doola's state (C1).
+ *
+ * This is the most consequential three-way branch in the formation loop, because the answer
+ * decides whether the `Idempotency-Key` may be ROTATED — and rotating it is a claim that the last
+ * request definitely did not commit. Behind `POST /companies` is a real Wyoming LLC and a real
+ * fee, so a wrong "rejected" verdict files a second one.
+ *
+ *   lost        no verdict reached us. A timeout, a torn socket, a 5xx, a 429, or a 2xx whose
+ *               body we could not read: doola may hold a committed create. The SAME key must be
+ *               re-sent — doola replays the committed response — and the attempt must not move.
+ *   rejected    doola looked at the request and refused it (a 4xx that is not a key conflict).
+ *               Nothing committed, the key is released, and a retry with a corrected body needs
+ *               a fresh one — so this is the ONLY kind that burns an attempt.
+ *   key_reused  409 `E_IDEMPOTENCY_KEY_REUSED`: doola has this key against a DIFFERENT body. It
+ *               is ambiguous by construction — something exists, and it is not what we just
+ *               asked for. Never re-keyed blind: the caller adopts via the persisted ids or the
+ *               pre-create lookup, and otherwise parks for a human.
+ *
+ * 408 and 429 sit with `lost` deliberately. Neither is a verdict about the request, and treating
+ * "come back later" as a refusal would rotate a key over a rate limit.
+ */
+export type DoolaFailureKind = "lost" | "rejected" | "key_reused";
+
+export function classifyDoolaFailure(e: unknown): DoolaFailureKind {
+  if (!(e instanceof DoolaApiError)) return "lost"; // timeout, transport, DNS, an unexpected throw
+  if (e.code === DOOLA_ERROR_CODES.idempotencyKeyReused) return "key_reused";
+  // OUR codes: the call may well have succeeded and we simply could not read the answer.
+  if (e.code === DOOLA_ERROR_CODES.badResponse || e.code === DOOLA_ERROR_CODES.responseTooLarge)
+    return "lost";
+  if (e.status >= 500 || e.status === 408 || e.status === 429) return "lost";
+  if (e.status >= 400) return "rejected";
+  return "lost";
+}
+
 /** The slice of doola we consume. Tests fake this; production builds it from config. */
 export interface DoolaApi {
   /** Idempotency-Key honored. */
@@ -98,15 +161,20 @@ export interface DoolaApi {
   /** Idempotency-Key honored. */
   createCompany(input: CreateCompanyInput, idempotencyKey: string): Promise<DoolaCompany>;
   getCompany(companyId: string): Promise<DoolaCompany>;
+  /** Pre-create lookup fallback (completeness 9): "did a create we lost the answer to actually
+   *  land?". Scoped to OUR customer id, which we mint one-per-entity, so anything it returns
+   *  belongs to the entity that is asking. */
+  listCompanies(customerId: string): Promise<DoolaCompany[]>;
   listDocuments(companyId: string): Promise<DoolaDocument[]>;
   getDocumentDownloadUrl(companyId: string, documentId: string): Promise<DoolaDocumentDownload>;
   listRequiredActions(companyId: string): Promise<DoolaRequiredAction[]>;
   getComplianceCalendar(companyId: string): Promise<DoolaComplianceEvent[]>;
-  /** SANDBOX ONLY: force the formation to complete. Refused against production by construction. */
-  playgroundCompleteFormation(companyId: string): Promise<void>;
+  /** SANDBOX ONLY: force the formation to complete. Refused against production by construction.
+   *  Resolves with the webhook events the call actually fired (`triggeredEvents`). */
+  playgroundCompleteFormation(companyId: string): Promise<DoolaPlaygroundResult | undefined>;
   /** SANDBOX ONLY: force EIN issuance. NOTE: `company_ein_issued` fires on FIRST issuance only —
    *  a repeat re-fires the document-letter event, not the EIN event. */
-  playgroundCompleteEin(companyId: string): Promise<void>;
+  playgroundCompleteEin(companyId: string): Promise<DoolaPlaygroundResult | undefined>;
 }
 
 export interface DoolaClientConfig {
@@ -120,7 +188,23 @@ export interface DoolaClientConfig {
   fetchImpl?: typeof fetch;
 }
 
-const DEFAULT_TIMEOUT_MS = 30_000;
+/** The per-call deadline. EXPORTED because the sweeper needs it: "how long may a row sit in
+ *  `submitted` before the process that wrote it is presumed dead?" is this number plus slack, and
+ *  hard-coding a second copy of it would let the two drift (C2). */
+export const DOOLA_DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = DOOLA_DEFAULT_TIMEOUT_MS;
+
+/**
+ * Every partner endpoint lives under this prefix — verified against doola's published OpenAPI
+ * document and the live sandbox (`GET https://api.test.doola.com/companies` answers
+ * `NoHandlerFoundException`, i.e. a 404, not an empty list).
+ *
+ * It belongs to the CLIENT, not to `DOOLA_BASE_URLS`, because it is part of the API's shape
+ * rather than part of where the API is hosted: an operator pointing `DOOLA_BASE_URL` at a mock
+ * or a replay proxy is redirecting the HOST, and should not have to know — or be able to get
+ * wrong — the route prefix underneath it.
+ */
+const API_PREFIX = "/v1/partner";
 
 /**
  * Hard ceiling on ONE response body. doola's largest legitimate JSON payload is a document list;
@@ -140,41 +224,25 @@ function tooLargeError(status: number, path: string, bytes: number): DoolaApiErr
 }
 
 /**
- * Read a response body under the size cap.
+ * Read a response body under the size cap, using the shared capped reader (M4).
  *
- * BOTH halves are needed. `Content-Length` catches the honest large response before a single
- * chunk is buffered — but a chunked (`Transfer-Encoding: chunked`) response declares no length at
- * all, and a lying one declares a small one, so the running counter over the body stream is what
- * actually enforces the bound. Passing the cap cancels the stream, which tears the socket down
- * instead of politely draining megabytes we have already decided to reject.
+ * The MECHANISM is shared (declared length first, running counter second, cancel on overflow);
+ * the ERROR is ours, because "a doola response was too large" is a distinct operational event
+ * from "a legal document was too large" and the two have different runbooks.
  */
 async function readCappedBody(res: Response, path: string): Promise<string> {
-  const declared = Number(res.headers?.get?.("content-length") ?? Number.NaN);
-  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES)
-    throw tooLargeError(res.status, path, declared);
-
-  const body = res.body as ReadableStream<Uint8Array> | null | undefined;
-  // A 204/empty response has no body stream at all; so do the hand-rolled fakes some callers
-  // pass in. Fall back to text() — there is nothing to meter.
-  if (!body || typeof body.getReader !== "function") return await res.text();
-
-  const reader = body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    total += value.byteLength;
-    if (total > MAX_RESPONSE_BYTES) {
-      await reader.cancel().catch(() => {
-        // the throw below is the real signal; a failed cancel must not mask it
-      });
-      throw tooLargeError(res.status, path, total);
-    }
-    chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks).toString("utf8");
+  return await readCappedText(
+    {
+      body: res.body as ReadableStream<Uint8Array> | null | undefined,
+      contentLength: res.headers?.get?.("content-length"),
+      readAll: async () => Buffer.from(await res.text(), "utf8"),
+    },
+    MAX_RESPONSE_BYTES,
+    {
+      declared: (n) => tooLargeError(res.status, path, n),
+      streamed: (n) => tooLargeError(res.status, path, n),
+    },
+  );
 }
 
 /** doola's correlation id — the FIRST thing their support asks for — wherever it rides. */
@@ -295,53 +363,75 @@ export function buildDoolaApi(cfg: DoolaClientConfig): DoolaApi {
 
   return {
     async createCustomer(input, idempotencyKey) {
-      return await callPayload<DoolaCustomer>("POST", "/customers", {
+      return await callPayload<DoolaCustomer>("POST", `${API_PREFIX}/customers`, {
         body: input,
         idempotencyKey,
       });
     },
     async createCompany(input, idempotencyKey) {
-      return await callPayload<DoolaCompany>("POST", "/companies", { body: input, idempotencyKey });
+      return await callPayload<DoolaCompany>("POST", `${API_PREFIX}/companies`, {
+        body: input,
+        idempotencyKey,
+      });
     },
     async getCompany(companyId) {
-      return await callPayload<DoolaCompany>("GET", `/companies/${companyId}`);
+      return await callPayload<DoolaCompany>("GET", `${API_PREFIX}/companies/${companyId}`);
+    },
+    async listCompanies(customerId) {
+      // A PAGED envelope, not a bare array: `payload.content`. We ask for the maximum page size
+      // and read the first page only — one entity mints one customer, so "more than 100
+      // companies under this customer" is not a state this integration can produce.
+      const page = await callPayload<DoolaCompanyPage | null>(
+        "GET",
+        `${API_PREFIX}/companies?customerId=${encodeURIComponent(customerId)}&size=100`,
+      );
+      return page?.content ?? [];
     },
     async listDocuments(companyId) {
       // `payload: null` is a legitimate empty list; a MISSING envelope already threw above.
       return (
-        (await callPayload<DoolaDocument[] | null>("GET", `/companies/${companyId}/documents`)) ??
-        []
+        (await callPayload<DoolaDocument[] | null>(
+          "GET",
+          `${API_PREFIX}/companies/${companyId}/documents`,
+        )) ?? []
       );
     },
     async getDocumentDownloadUrl(companyId, documentId) {
       return await callPayload<DoolaDocumentDownload>(
         "GET",
-        `/companies/${companyId}/documents/${documentId}/download`,
+        `${API_PREFIX}/companies/${companyId}/documents/${documentId}`,
       );
     },
     async listRequiredActions(companyId) {
       return (
         (await callPayload<DoolaRequiredAction[] | null>(
           "GET",
-          `/companies/${companyId}/required-actions`,
+          `${API_PREFIX}/companies/${companyId}/required-actions`,
         )) ?? []
       );
     },
     async getComplianceCalendar(companyId) {
-      return (
-        (await callPayload<DoolaComplianceEvent[] | null>(
-          "GET",
-          `/companies/${companyId}/compliance-calendar`,
-        )) ?? []
+      const cal = await callPayload<{ events?: DoolaComplianceEvent[] | null } | null>(
+        "GET",
+        `${API_PREFIX}/companies/${companyId}/compliance/calendar`,
       );
+      return cal?.events ?? [];
     },
     async playgroundCompleteFormation(companyId) {
       assertSandbox("playgroundCompleteFormation");
-      await call("POST", `/playground/companies/${companyId}/complete-formation`);
+      const { parsed } = await call(
+        "POST",
+        `${API_PREFIX}/playground/companies/${companyId}/formation/complete`,
+      );
+      return (parsed as { payload?: DoolaPlaygroundResult } | undefined)?.payload;
     },
     async playgroundCompleteEin(companyId) {
       assertSandbox("playgroundCompleteEin");
-      await call("POST", `/playground/companies/${companyId}/complete-ein`);
+      const { parsed } = await call(
+        "POST",
+        `${API_PREFIX}/playground/companies/${companyId}/eincreation/complete`,
+      );
+      return (parsed as { payload?: DoolaPlaygroundResult } | undefined)?.payload;
     },
   };
 }

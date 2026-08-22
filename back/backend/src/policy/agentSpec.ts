@@ -140,3 +140,58 @@ export function parseAgentSpec(input: unknown): AgentSpec {
   }
   return parsed.data;
 }
+
+/**
+ * The formation party — the legal identity of the natural person a filing names (design §3/§5).
+ *
+ * **Deliberately BESIDE `AgentSpecSchema`, never inside it.** The spec is persisted verbatim in
+ * `entities.spec_json` and rendered back out of it; PII that entered the spec would land in a
+ * column every read path touches, in the OA terms doc, and in any future spec echo. The two
+ * schemas sit next to each other so the separation is visible to whoever adds the next field:
+ * anything identifying a human belongs here, and this shape never travels as `spec`.
+ *
+ * `.strict()` for the same reason the spec is: an unknown key is a caller's misunderstanding of
+ * where their data is going, and it must be named rather than silently dropped.
+ */
+export const FormationPartySchema = z
+  .object({
+    legalFirstName: z.string().min(1),
+    legalLastName: z.string().min(1),
+    email: z.string().email(),
+    /**
+     * REQUIRED (C6). doola refuses a company create whose responsible party has no phone (live
+     * sandbox, 2026-08-21), so a party without one is a legal identity that can never be filed.
+     *
+     * The design left it optional and the create step refuses it later, which meant a caller
+     * could post an identity, receive a handle, onboard with it, and discover at the FILING —
+     * after the entity is minted, bound and funded — that their party was unusable. Refusing at
+     * INTAKE costs the caller one 400 and costs the platform nothing. The create step's own check
+     * stays as belt-and-braces: it guards the parties already in the table, and it is the layer
+     * that must hold if doola's requirements change again.
+     *
+     * The labeled sandbox fixture supplies one (`syntheticFormationParty`), so the synthetic path
+     * is unaffected.
+     */
+    phone: z.string().min(1),
+    address: z
+      .object({
+        line1: z.string().min(1),
+        line2: z.string().min(1).optional(),
+        city: z.string().min(1),
+        /** US: the 2-letter state. Absent for the countries that have no state/province (L3). */
+        region: z.string().min(1).optional(),
+        postalCode: z.string().min(1),
+        /** ISO-3166-1 **alpha-3** ("USA", "FRA") — doola's convention, not alpha-2. Normalized
+         *  to upper case so "usa" and "USA" cannot become two different countries downstream. */
+        country: z
+          .string()
+          .transform((s) => s.toUpperCase())
+          .refine((s) => /^[A-Z]{3}$/.test(s), {
+            message: "must be an ISO-3166-1 alpha-3 country code, e.g. USA",
+          }),
+      })
+      .strict(),
+  })
+  .strict();
+
+export type FormationPartyInput = z.infer<typeof FormationPartySchema>;

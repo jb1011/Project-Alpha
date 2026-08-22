@@ -8,6 +8,8 @@ import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
 import { mountConnectionRoutes } from "./routes/connection";
+import { mountDocumentRoutes } from "./routes/documents";
+import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountMetadataRoutes } from "./routes/metadata";
@@ -23,9 +25,22 @@ import { mountTreasuryRoutes } from "./routes/treasury";
 import { mountTrustPolicyRoutes } from "./routes/trustPolicy";
 import { mountWorldIdRoutes } from "./routes/worldId";
 import { mountX402DemoRoutes } from "./routes/x402Demo";
+import type { EntityViewDeps } from "./views";
 
-/** Dependencies for the REST API. Extended by later tasks (auth/onboard routes). */
-export interface ApiDeps {
+/**
+ * Dependencies for the REST API.
+ *
+ * It EXTENDS `EntityViewDeps` (C8) rather than restating its fields: the same object is handed to
+ * `buildMcpServer`, so a view dependency cannot exist on one surface and not the other. Both of
+ * those fields are wired on any box that ever formed anything — they are plain SQL over the same
+ * database, not part of the `formation` CAPABILITY — because a deployment that has lost its doola
+ * credentials must still be able to describe and serve the entities it already filed, rather than
+ * report them as unformed.
+ */
+export interface ApiDeps extends EntityViewDeps {
+  /** The FULL document index: the view reads two methods off it, the download route also needs
+   *  `findOwned` to re-assert which entity a document belongs to. */
+  documents?: import("../persistence/documentIndexRepository").DocumentIndexRepository;
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
@@ -75,10 +90,32 @@ export interface ApiDeps {
    *  Optional so every existing caller — and every credential-less deployment — builds unchanged;
    *  absent reads as "no formation on this box".
    *
-   *  Note there is deliberately no `required` here in PR 1: FORMATION_REQUIRED is enforced by the
-   *  door gate, which PR 2 adds. Advertising a requirement nothing enforces yet would be a claim
-   *  the deployment cannot keep. */
-  formation?: { environment: DoolaEnvironment };
+   *  `required` joins it in PR 2, together with the door gate that enforces it: advertising a
+   *  requirement nothing enforces would be a claim the deployment cannot keep. The repositories
+   *  travel in here too, so a deployment that forms nothing has no PII surface at all — the
+   *  route and the tool are gated on this one object's presence. */
+  formation?: {
+    environment: DoolaEnvironment;
+    required: boolean;
+    /** Refuse real PII and file with the labeled sandbox fixture instead (§3, audit H7). */
+    sandboxSyntheticPii: boolean;
+    maxPerTenant: number;
+    dailyCeiling: number;
+    parties: import("../persistence/formationPartyRepository").FormationPartyRepository;
+    requests: import("../persistence/formationRepository").FormationRepository;
+  };
+
+  /**
+   * The inbound doola webhook receiver (design §6). Present only where the doola block is
+   * configured — a credential-less deployment has NO such route, which is the honest answer for a
+   * box that could not verify a signature if one arrived.
+   *
+   * Separate from `formation` above on purpose: `formation` is the DOOR capability (quotas, PII
+   * intake, the required-flag), while this is the inbound channel and its secrets. A box could in
+   * principle receive events for entities it no longer files for, and conflating the two would
+   * make that unrepresentable.
+   */
+  doola?: DoolaWebhookDeps;
   linkCodes: import("../persistence/linkCodeStore").LinkCodeStore;
   /** Per-entity payment service (status/pay), used by the MCP treasury_status/pay tools. Optional
    *  so deployments without POCKET_MASTER_SEED configured still build; the tools then return
@@ -142,9 +179,17 @@ export function buildApiApp(deps: ApiDeps) {
       // this route can produce. The wizard labels a sandbox filing amber off this value.
       formationAvailable: Boolean(deps.formation),
       formationEnvironment: deps.formation?.environment ?? null,
+      // Whether onboard will REFUSE without a partyId. The wizard needs it to know whether the
+      // legal-identity phase is a step or an option, and it is only advertised now because the
+      // door gate below actually enforces it.
+      formationRequired: Boolean(deps.formation?.required),
     }),
   );
   mountSchemaRoutes(app);
+  // PUBLIC, and necessarily so: doola authenticates with an HMAC over the body, not with our JWT.
+  // Mounted BEFORE the /entities auth middleware for the same reason every other public route is,
+  // and gated on the credentials that make verification possible at all.
+  if (deps.doola) mountDoolaWebhookRoutes(app, { ...deps, doola: deps.doola });
   mountMetadataRoutes(app, deps);
   mountTransparencyRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
@@ -152,6 +197,7 @@ export function buildApiApp(deps: ApiDeps) {
   mountAuthRoutes(app, deps);
   mountPasskeyRoutes(app, deps);
   app.use("/onboard", requireAuth(deps.jwtSecret));
+  app.use("/formation-party", requireAuth(deps.jwtSecret));
   app.use("/entities", requireAuth(deps.jwtSecret));
   app.use("/entities/*", requireAuth(deps.jwtSecret));
   app.use("/jobs/*", requireAuth(deps.jwtSecret));
@@ -163,6 +209,8 @@ export function buildApiApp(deps: ApiDeps) {
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);
+  // After the `/entities/*` requireAuth line above, so both document routes inherit auth.
+  mountDocumentRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);
   mountPerTxCapRoutes(app, deps);

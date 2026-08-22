@@ -34,6 +34,17 @@ export interface OnboardingAppDeps {
    * which made it the one entrance that broke at cutover.
    */
   platformManagerAddress: string;
+  /**
+   * Formation (design §5, door matrix). Set when this deployment makes formation MANDATORY, in
+   * which case every request here is refused: this door carries no `partyId`, so anything it
+   * minted would be pinned to a provider, owe a filing, and have no legal identity to file with.
+   *
+   * A REQUEST-time refusal rather than a boot-time one, deliberately: the operator gets a
+   * readable answer at the door instead of a service that will not start, and the composition
+   * root stays a wiring file. (Retire-vs-gate is recorded as a PR-2 review decision; the refusal
+   * is what makes either outcome safe.)
+   */
+  formationRefusal?: string;
 }
 
 /**
@@ -49,6 +60,8 @@ export function buildOnboardingApp(deps: OnboardingAppDeps) {
   const app = new Hono();
 
   app.post("/onboard", async (c) => {
+    // BEFORE the body is even read: nothing this door can be told changes the answer.
+    if (deps.formationRefusal) return c.json({ error: deps.formationRefusal }, 400);
     let body: { spec?: unknown; guardianPasskey?: unknown; idempotencyKey?: unknown };
     try {
       body = await c.req.json();

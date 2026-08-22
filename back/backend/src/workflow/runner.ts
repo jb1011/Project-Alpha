@@ -1,5 +1,6 @@
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
-import { ApiError } from "../api/errors";
+import { ApiError } from "../errors";
+import { formationPartyUnavailableMessage } from "../formation";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { Address, EntityRecord, EntityStatus, FormationPin } from "../types";
@@ -29,11 +30,21 @@ export class OnboardingRunner {
       fundCaps: { perCall: bigint; perTenantTotal: bigint };
       /** S5 aggregate platform-outflow brake; absent in tests that predate it -> unmetered. */
       outflows?: { check(amountAtomic: bigint): void };
-      /** doola formation (design §2): a DEPLOYMENT constant, so it is a runner dep rather than a
-       *  per-call argument — no door has to learn about it. Stamped on the CLAIM so the
-       *  environment an entity is pinned to is fixed before anything can be filed for it (audit
-       *  M5). Absent (no doola credentials) = stub mode, `formation_provider` stays null. */
+      /**
+       * doola formation (design §2): a DEPLOYMENT constant, so it is a runner dep rather than a
+       * per-call argument — no door has to learn about it. Absent (no doola credentials) = stub
+       * mode, `formation_provider` stays null.
+       *
+       * It is what an entity WOULD be pinned to, not what every entity IS pinned to (C5): the pin
+       * is written only for a claim that also binds a party, in the same transaction, because a
+       * bound party is exactly what makes a filing happen. Stamping it here means the environment
+       * an entity is pinned to is fixed before anything can be filed for it (audit M5).
+       */
       formation?: FormationPin | null;
+      /** PII intake (design §5). Present only on a deployment that forms entities; the runner
+       *  binds a party to the entity key it mints, because the key is derived HERE and nowhere
+       *  else — a door that recomputed it would be a second definition of what an entity is. */
+      parties?: import("../persistence/formationPartyRepository").FormationPartyRepository;
     },
   ) {}
 
@@ -45,6 +56,9 @@ export class OnboardingRunner {
     /** Tier-0 custody choice, resolved by the caller (route/tool applies the platform default).
      *  Recorded on the claim so a restart resumes the RIGHT provider path. */
     custody?: "turnkey" | "circle";
+    /** Formation party handle, already validated by the door (owned + unbound). Bound to the
+     *  entity in the SAME transaction as the claim. */
+    partyId?: string;
   }): {
     id: string;
     status: EntityStatus;
@@ -81,14 +95,33 @@ export class OnboardingRunner {
       // Tier-0: custody is claimed here, immutably — the saga and the reconciler both read it.
       walletProvider: p.custody ?? null,
       // Formation, the custody twin: pinned at the claim and never re-derived from config.
-      formationProvider: this.deps.formation?.provider ?? null,
-      formationEnvironment: this.deps.formation?.environment ?? null,
+      //
+      // Pinned IFF a party is bound (C5). The two are written by the same transaction below, so
+      // "pinned" and "has a legal identity to file with" are one fact rather than two that can
+      // disagree. An entity pinned with no party could never be filed and would burn eight
+      // attempts on its way to `abandoned`; a party bound to an unpinned entity would be a legal
+      // identity a caller handed over and nothing ever used.
+      formationProvider: p.partyId ? (this.deps.formation?.provider ?? null) : null,
+      formationEnvironment: p.partyId ? (this.deps.formation?.environment ?? null) : null,
     };
     // Atomic claim: the INSERT-or-nothing is the single gate. Two concurrent starts (or processes
     // racing the same key) can never both win — the loser sees changes()==0 and gets a 409, before
     // any on-chain side effect. Replaces the old non-atomic inFlight/find pre-check.
-    if (!this.deps.repo.claimKey(initial))
-      throw new ApiError("conflict", 409, `onboarding already exists for "${p.userKey}"`);
+    const claim = () => {
+      if (!this.deps.repo.claimKey(initial))
+        throw new ApiError("conflict", 409, `onboarding already exists for "${p.userKey}"`);
+      // Binding the party is part of the claim, not a follow-up: a crash between the two would
+      // leave an entity whose mandatory formation has no legal identity to file with, and a
+      // party the door still considers free. The bind is itself a CAS, so if another onboard won
+      // the party in between, THIS claim rolls back with it.
+      if (p.partyId && !this.deps.parties?.bind(p.partyId, id, p.tenantId))
+        throw new ApiError("validation_error", 400, formationPartyUnavailableMessage());
+    };
+    // Only formation takes the transaction: without a party there is exactly one write, and
+    // every pre-formation caller (including the tests that hand in a repo stub) keeps its
+    // existing single-statement path.
+    if (p.partyId) this.deps.repo.transaction(claim);
+    else claim();
     this.run(id, () =>
       this.deps.runSaga({
         spec: p.spec,

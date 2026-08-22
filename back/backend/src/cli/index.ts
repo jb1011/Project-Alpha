@@ -7,7 +7,7 @@ import type { DemoResult } from "../agent/demo";
 import { buildLiveAgentRunner } from "../agent/liveRunner";
 import { toJobView } from "../api/jobViews";
 import { loadConfig } from "../config/env";
-import { resolveFormationDeployment } from "../formation";
+import { legacyDoorRefusalMessage, legacyDoorRefused } from "../formation";
 import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import { runOnboarding } from "../workflow/onboarding";
@@ -33,6 +33,11 @@ export function buildCli(
     .option("-f, --fund <usd>", "optional: fund the treasury with this many USDC")
     .action(async (opts) => {
       const ctx = await makeContext();
+      // Door 4 (design §5): the CLI is a separate process on the same DB with no `partyId` and
+      // no PII intake, so on a deployment where formation is MANDATORY it refuses at COMMAND
+      // time rather than minting an entity that owes a filing it can never make.
+      if (legacyDoorRefused(ctx.cfg))
+        throw new Error(legacyDoorRefusalMessage("cli create-entity"));
       const spec = parseAgentSpec(JSON.parse(readFileSync(opts.config, "utf8")));
       const idempotencyKey = opts.id ?? spec.name;
       const rec = await runOnboarding({
@@ -51,10 +56,10 @@ export function buildCli(
           ? (entityKey) =>
               privateKeyToAccount(derivePocketKey(ctx.cfg.pocketMasterSeed!, entityKey)).address
           : undefined,
-        // Formation (design §2/§5): the SAME resolver every other door uses. An operator-created
-        // entity that pinned differently from an API-created one would be a permanent split in
-        // what an entity is on this deployment — the pin is stamped once and never re-derived.
-        formation: resolveFormationDeployment(ctx.cfg),
+        // Formation (design §2/§5, C5): NOT wired, and that is now a statement rather than an
+        // omission. An entity is pinned iff a formation party is bound to it, and this door has
+        // no way to carry a partyId — so an entity it mints is a stub, on every deployment.
+        // `legacyDoorRefused` is what stops it minting one at all where formation is mandatory.
       });
       console.log(
         JSON.stringify(

@@ -55,6 +55,11 @@ export interface PublicEntityRow {
   walletProvider: EntityRecord["walletProvider"];
   ownerTenantId: string | null;
   createdAt: string | null;
+  /** Formation pin (design §8). The PROVIDER and its ENVIRONMENT only — the honesty invariant
+   *  reaches the public surface, so a sandbox filing is labeled as one there too. No EIN, no
+   *  filing number, and never anything from `formation_parties`. */
+  formationProvider: string | null;
+  formationEnvironment: EntityRecord["formationEnvironment"];
 }
 
 interface Row {
@@ -387,7 +392,9 @@ export class SqliteEntityRepository implements EntityRepository {
       .prepare(`
         SELECT idempotency_key AS idempotencyKey, public_id AS publicId, name, status,
                agent_id AS agentId, proxy, treasury, wallet_provider AS walletProvider,
-               owner_tenant_id AS ownerTenantId, created_at AS createdAt
+               owner_tenant_id AS ownerTenantId, created_at AS createdAt,
+               formation_provider AS formationProvider,
+               formation_environment AS formationEnvironment
         FROM entities
         WHERE agent_id IS NOT NULL AND status IN ('created','bound','funded')
         ORDER BY rowid DESC

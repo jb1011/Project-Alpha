@@ -45,13 +45,42 @@ export type EntityView = {
         pendingHash: string | null;
       };
   /** Formation (doola). null/absent = stub, forever. `environment` is always present when the
-   *  block is: a sandbox filing must render amber ("Demo formation"), never green. PR 1 ships
-   *  the skeleton, so `status` is always "none". Never carries PII. */
+   *  block is: a sandbox filing must render amber ("Demo formation"), never green. Never
+   *  carries PII — no name, no address, no email. */
   formation?: {
     provider: string;
     environment: "sandbox" | "production";
-    status: "none";
+    /** Derived from the formation sub-saga: nothing opened / opened but nothing legally true
+     *  yet / the state has FILED it / the EIN has issued / the filing step is in error. */
+    status: "none" | "in_progress" | "filed" | "complete" | "failed";
+    /** doola's company id — an opaque provider reference, not personal data. */
+    providerRef?: string | null;
+    /** Unix seconds the state filed the company. */
+    filedAt?: number | null;
+    filingNumber?: string | null;
+    /** Owner-visible only: this field exists on the authenticated entity view and on no public
+     *  surface. Never render it outside a signed-in owner's own dashboard. */
+    ein?: string | null;
+    /** Open required-action CODES (e.g. `FORMATION_NAME_OPTIONS_EXHAUSTED`) — never doola's
+     *  free-text reason, which their operators write and can name the responsible party.
+     *  Optional for deploy-order safety: a backend that predates this field has no actions. */
+    requiredActions?: string[];
+    /** Legal documents fetched from doola so far. Metadata only — the bytes come from
+     *  `downloadDocument`, which re-asserts ownership server-side. */
+    documents?: FormationDocument[];
   } | null;
+};
+
+/** One stored legal document. `sha256` is what a verifier recomputes from the downloaded bytes
+ *  (and, from PR 3, what the on-chain OA bundle manifest commits to). */
+export type FormationDocument = {
+  id: string;
+  /** doola's document type, e.g. "ArticlesOfOrganization" | "OperatingAgreement". */
+  type: string;
+  /** A safe, derived filename — never a provider-supplied string. */
+  name: string;
+  size: number;
+  sha256: string;
 };
 
 /** Public deployment capabilities (GET /config, unauthenticated) — lets the wizard preselect the
@@ -69,6 +98,10 @@ export type PublicConfig = {
    *  REQUIRED is not advertised until the door gate that enforces it ships.) */
   formationAvailable?: boolean;
   formationEnvironment?: "sandbox" | "production" | null;
+  /** Whether onboarding REFUSES without a partyId — i.e. whether the legal-identity step is
+   *  mandatory or optional. Optional for deploy-order safety: a backend that predates it
+   *  enforces nothing, which is exactly what absent should mean. */
+  formationRequired?: boolean;
 };
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).
@@ -87,6 +120,13 @@ export type TransparencyEntity = {
   createdAt: string | null;
   jobsSettled: number;
   usdcSettledAtomic: string;
+  /** Formation status + the environment it was filed in. null = a stub entity (every legacy
+   *  row). Deliberately carries no EIN, no filing number and nothing about the natural person
+   *  behind the entity — this surface is unauthenticated. */
+  formation?: {
+    status: "none" | "in_progress" | "filed" | "complete" | "failed";
+    environment: "sandbox" | "production";
+  } | null;
 };
 
 /** Public transparency surface: platform stats + the on-chain entity registry. */
