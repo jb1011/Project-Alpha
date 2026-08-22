@@ -263,9 +263,16 @@ export async function advanceFormation(
   let documents: DoolaDocument[];
   let requiredActions: DoolaRequiredAction[] | undefined;
   try {
-    company = await d.doola.getCompany(providerRef);
-    documents = await d.doola.listDocuments(providerRef);
-    if (opts.requiredActions) requiredActions = await d.doola.listRequiredActions(providerRef);
+    // Three INDEPENDENT reads of the same company (M5). Sequential, they were three round trips
+    // deep — and this runs while holding the entity's lock, once per wake-up, for every in-flight
+    // entity on every sweep. None of them feeds another, so the only thing the sequence bought
+    // was latency. `Promise.all` rejects on the first failure, which is the same behaviour the
+    // `await` chain had.
+    [company, documents, requiredActions] = await Promise.all([
+      d.doola.getCompany(providerRef),
+      d.doola.listDocuments(providerRef),
+      opts.requiredActions ? d.doola.listRequiredActions(providerRef) : Promise.resolve(undefined),
+    ]);
   } catch (e) {
     // ── C3. The read failed, so nothing is known and nothing is written — and, crucially,
     //    NOTHING WAS ATTEMPTED. A GET that 502s is not a formation going badly; it is a bad
@@ -427,6 +434,59 @@ function advanceFiling(
   return won;
 }
 
+/** How many documents may be fetched at once for ONE entity (M5). */
+export const DOCUMENT_FETCH_CONCURRENCY = 3;
+
+/** Fetch, store and index ONE document. Never throws: returns whether it stored anything. */
+async function storeOneDocument(
+  d: FormationAdvanceDeps,
+  entityKey: string,
+  providerRef: string,
+  doc: DoolaDocument,
+): Promise<boolean> {
+  const docType = doc.documentType?.trim() || "Unknown";
+  try {
+    const dl = await d.doola.getDocumentDownloadUrl(providerRef, doc.id!);
+    const got = await downloadDocument(dl.downloadUrl, {
+      fetchImpl: d.fetchImpl,
+      lookupImpl: d.lookupImpl,
+    });
+    const path = documentStoreName(entityKey, docType, doc.id!);
+    // Bytes to disk FIRST (atomically), index second: an index row that points at a file which
+    // is not there would be a hash nobody can check, and PR 3 anchors these hashes on-chain.
+    d.docStore.putBytes(path, got.bytes);
+    d.documents.insert({
+      id: documentIndexId(entityKey, doc.id!),
+      entityKey,
+      docType,
+      sha256: got.sha256,
+      contentType: got.contentType,
+      size: got.size,
+      providerDocId: doc.id!,
+      path,
+    });
+    opsLog("formation_document_stored", {
+      entityKey,
+      providerRef,
+      docType,
+      providerDocId: doc.id,
+      sha256: got.sha256,
+      size: got.size,
+    });
+    return true;
+  } catch (e) {
+    opsLog("formation_document_failed", {
+      level: "warn",
+      entityKey,
+      providerRef,
+      docType,
+      providerDocId: doc.id,
+      ...describeDoolaError(e),
+    });
+    return false;
+  }
+}
+
 /**
  * `fetch_documents`: store every document doola has that we do not, then confirm once the two
  * required types are in.
@@ -443,51 +503,31 @@ async function advanceDocuments(
   const row = d.requests.find(entityKey, "fetch_documents");
   if (!row || row.state === "abandoned") return false;
 
+  // Only what we do not already hold. A document already indexed is never re-fetched: doola
+  // re-issues a document under a NEW id, so an id we know is bytes we know.
+  const wanted = documents.filter(
+    (doc) => doc.id && !d.documents.findByProviderDocId(entityKey, doc.id),
+  );
+
+  // BOUNDED concurrency (M5). Each document is a presigned-URL call plus a download of up to
+  // 16 MiB, and a formed company can carry half a dozen. Sequentially that is six round trips
+  // deep while holding the entity's lock; unbounded it is six simultaneous 16 MiB buffers in a
+  // process that also serves HTTP. Three is the compromise, and it is a constant rather than a
+  // setting because there is nothing here an operator could tune with better information.
   let stored = false;
-  for (const doc of documents) {
-    if (!doc.id) continue;
-    if (d.documents.findByProviderDocId(entityKey, doc.id)) continue;
-    const docType = doc.documentType?.trim() || "Unknown";
-    try {
-      const dl = await d.doola.getDocumentDownloadUrl(providerRef, doc.id);
-      const got = await downloadDocument(dl.downloadUrl, {
-        fetchImpl: d.fetchImpl,
-        lookupImpl: d.lookupImpl,
-      });
-      const path = documentStoreName(entityKey, docType, doc.id);
-      // Bytes to disk FIRST (atomically), index second: an index row that points at a file which
-      // is not there would be a hash nobody can check, and PR 3 anchors these hashes on-chain.
-      d.docStore.putBytes(path, got.bytes);
-      d.documents.insert({
-        id: documentIndexId(entityKey, doc.id),
-        entityKey,
-        docType,
-        sha256: got.sha256,
-        contentType: got.contentType,
-        size: got.size,
-        providerDocId: doc.id,
-        path,
-      });
-      stored = true;
-      opsLog("formation_document_stored", {
-        entityKey,
-        providerRef,
-        docType,
-        providerDocId: doc.id,
-        sha256: got.sha256,
-        size: got.size,
-      });
-    } catch (e) {
-      opsLog("formation_document_failed", {
-        level: "warn",
-        entityKey,
-        providerRef,
-        docType,
-        providerDocId: doc.id,
-        ...describeDoolaError(e),
-      });
+  const queue = [...wanted];
+  const worker = async () => {
+    for (;;) {
+      const doc = queue.shift();
+      if (!doc?.id) return;
+      // One bad document never blocks the others — a single unreadable PDF must not stop the
+      // Articles of Organization from being stored.
+      if (await storeOneDocument(d, entityKey, providerRef, doc)) stored = true;
     }
-  }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(DOCUMENT_FETCH_CONCURRENCY, queue.length) }, worker),
+  );
 
   const have = new Set(d.documents.storedTypes(entityKey));
   const missing = REQUIRED_DOCUMENT_TYPES.filter((t) => !have.has(t));

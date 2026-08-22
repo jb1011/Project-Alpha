@@ -21,6 +21,8 @@ import { opsLog } from "../observability/opsLog";
  */
 export class TaskTracker {
   private readonly inflight = new Set<Promise<unknown>>();
+  /** Per-key coalescing state — see `trackCoalesced`. */
+  private readonly coalescing = new Map<string, unknown[]>();
 
   constructor(private readonly label = "task") {}
 
@@ -80,5 +82,53 @@ export class TaskTracker {
         return false;
     }
     return true;
+  }
+
+  /**
+   * Start `run` for `key`, COALESCING everything that arrives while it is in flight (M5).
+   *
+   * doola's retry ladder plus a busy formation deliver several events for one company in quick
+   * succession, and every one of them used to become its own task: the same three reads of the
+   * same company, five times over, each holding the entity's lock in turn. A wake-up carries no
+   * facts — every event for a company is the same request, "look again" — so one read answers all
+   * of them.
+   *
+   * The shape is a trailing-edge coalescer, and the trailing edge is the point: an item that
+   * arrives DURING a run is not dropped, because that run may have read doola before the change
+   * the item is telling us about. It is batched into exactly one further run afterwards, and
+   * anything else arriving in the meantime joins the same batch. So a burst of five costs two
+   * reads instead of five, and never misses the last one.
+   *
+   * `run` receives every item in its batch, so a caller can retire all of them on one read.
+   */
+  trackCoalesced<T>(key: string, item: T, run: (items: T[]) => Promise<unknown>): void {
+    const queued = this.coalescing.get(key);
+    if (queued) {
+      // A run is already in flight for this key: join the batch it will start when it finishes.
+      queued.push(item);
+      return;
+    }
+    // The empty array IS the in-flight marker: its presence says "a run owns this key".
+    this.coalescing.set(key, []);
+    this.track(async () => {
+      let batch: T[] = [item];
+      for (;;) {
+        try {
+          await run(batch);
+        } catch (e) {
+          // Logged, never rethrown: the same contract `track` gives every task, applied per
+          // batch so one bad run cannot strand the items queued behind it.
+          opsLog(`${this.label}_failed`, { level: "warn", message: (e as Error)?.message });
+        }
+        const next = (this.coalescing.get(key) ?? []) as T[];
+        if (next.length === 0) {
+          // Cleared only once nothing is waiting, so the marker and the queue are one fact.
+          this.coalescing.delete(key);
+          return;
+        }
+        this.coalescing.set(key, []);
+        batch = next;
+      }
+    });
   }
 }

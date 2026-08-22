@@ -43,6 +43,7 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       // described an entity with no legal documents while REST described the same entity with
       // two. `EntityViewDeps` is now inherited by both dep types, so the pick cannot be partial.
       formationSteps: deps.formationSteps,
+      formationStepsMany: deps.formationStepsMany,
       documents: deps.documents,
       ens: deps.ens
         ? {

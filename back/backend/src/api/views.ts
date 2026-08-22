@@ -29,11 +29,17 @@ export interface EntityViewDeps {
    *  from. */
   formationSteps?: FormationStepsLookup;
   /**
+   * The BATCHED twin, for the list routes (M5). Optional: absent, a list falls back to one
+   * lookup per row, which is what every caller did before.
+   */
+  formationStepsMany?: (entityKeys: string[]) => Map<string, FormationRequestRecord[]>;
+  /**
    * The document index. A repository rather than a lookup, because the download route needs
    * `findOwned` from the SAME object — and a deployment that has one and not the other is the
-   * split this type exists to prevent.
+   * split this type exists to prevent. Narrowed to the two READS a view can make, so a batched
+   * stand-in satisfies it; `ApiDeps` re-declares it as the full repository.
    */
-  documents?: DocumentIndexRepository;
+  documents?: Pick<DocumentIndexRepository, "listByEntity" | "listByEntities">;
 }
 
 /**
@@ -195,4 +201,38 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
         }
       : null,
   };
+}
+
+/**
+ * The LIST projection (M5).
+ *
+ * `GET /entities`, the MCP `list_entities`/`claim_connection` tools and `/transparency` all render
+ * every entity a caller can see, and each row used to ask for its own formation steps and its own
+ * documents — two queries per entity, per page view, on the hottest read paths in the API and on
+ * an unauthenticated public surface. Here the two reads happen ONCE for the whole page.
+ *
+ * Only PINNED rows are looked up at all: an unpinned entity has no formation to describe, and on
+ * most deployments most rows are unpinned.
+ *
+ * Falls back to the per-row path when the batched lookups are not wired, so every existing caller
+ * keeps working with whatever it already passes.
+ */
+export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): EntityView[] {
+  const keys = rows
+    .filter((r) => r.formationProvider && r.formationEnvironment)
+    .map((r) => r.idempotencyKey);
+  if (keys.length === 0) return rows.map((r) => toEntityView(r, deps));
+
+  const steps = deps.formationStepsMany?.(keys);
+  const docs = deps.documents?.listByEntities?.(keys);
+  if (!steps && !docs) return rows.map((r) => toEntityView(r, deps));
+
+  const batched: EntityViewDeps = {
+    ...deps,
+    formationSteps: steps ? (k) => steps.get(k) ?? [] : deps.formationSteps,
+    documents: docs
+      ? { listByEntity: (k) => docs.get(k) ?? [], listByEntities: () => docs }
+      : deps.documents,
+  };
+  return rows.map((r) => toEntityView(r, batched));
 }

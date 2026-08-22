@@ -109,6 +109,8 @@ export interface DocumentIndexRepository {
   /** Index a stored document. Returns false when the row already existed (idempotent re-fetch). */
   insert(rec: Omit<DocumentIndexRecord, "createdAt">): boolean;
   listByEntity(entityKey: string): DocumentIndexRecord[];
+  /** The same rows for MANY entities, in ONE statement — the list routes' N+1 (M5). */
+  listByEntities(entityKeys: string[]): Map<string, DocumentIndexRecord[]>;
   /** Ownership is enforced by the caller against `entities`; the entity key is re-asserted here
    *  so a document id from one entity can never be read through another entity's route. */
   findOwned(entityKey: string, id: string): DocumentIndexRecord | undefined;
@@ -120,7 +122,7 @@ export interface DocumentIndexRepository {
 export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
   private readonly stmts;
 
-  constructor(db: Database.Database) {
+  constructor(private readonly db: Database.Database) {
     this.stmts = {
       insert: db.prepare(
         `INSERT OR IGNORE INTO documents
@@ -157,6 +159,27 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
 
   listByEntity(entityKey: string): DocumentIndexRecord[] {
     return (this.stmts.listByEntity.all(entityKey) as Row[]).map(toRecord);
+  }
+
+  listByEntities(entityKeys: string[]): Map<string, DocumentIndexRecord[]> {
+    const out = new Map<string, DocumentIndexRecord[]>();
+    if (entityKeys.length === 0) return out;
+    for (let i = 0; i < entityKeys.length; i += 400) {
+      const chunk = entityKeys.slice(i, i + 400);
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM documents WHERE entity_key IN (${chunk.map(() => "?").join(",")})
+            ORDER BY created_at, doc_type, id`,
+        )
+        .all(...chunk) as Row[];
+      for (const r of rows) {
+        const key = r.entity_key ?? "";
+        const list = out.get(key);
+        if (list) list.push(toRecord(r));
+        else out.set(key, [toRecord(r)]);
+      }
+    }
+    return out;
   }
 
   findOwned(entityKey: string, id: string): DocumentIndexRecord | undefined {

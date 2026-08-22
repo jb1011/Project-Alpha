@@ -383,6 +383,8 @@ async function main() {
   // downloadable — on a box that has since lost its doola block.
   const entityViewDeps = {
     formationSteps: (entityKey: string) => formationRequests.stepsOf(entityKey),
+    // The batched twin the list routes use: one read per page instead of two per entity (M5).
+    formationStepsMany: (entityKeys: string[]) => formationRequests.stepsOfMany(entityKeys),
     documents: formationDocuments,
   };
 

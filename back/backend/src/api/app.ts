@@ -38,6 +38,9 @@ import type { EntityViewDeps } from "./views";
  * report them as unformed.
  */
 export interface ApiDeps extends EntityViewDeps {
+  /** The FULL document index: the view reads two methods off it, the download route also needs
+   *  `findOwned` to re-assert which entity a document belongs to. */
+  documents?: import("../persistence/documentIndexRepository").DocumentIndexRepository;
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;

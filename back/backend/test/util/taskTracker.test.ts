@@ -65,3 +65,67 @@ test("settled(timeoutMs) gives up rather than hanging a deploy on a wedged task"
 test("settled() on an empty tracker resolves immediately", async () => {
   expect(await new TaskTracker().settled(0)).toBe(true);
 });
+
+// ── M5: coalescing a burst of wake-ups for one company ────────────────────────────────────
+
+test("M5: items arriving during a run are batched into exactly ONE further run", async () => {
+  // doola's retry ladder plus a busy formation deliver several events for one company in
+  // seconds. A wake-up carries no facts — every one of them is the same request, "look again" —
+  // so one read answers all of them. The trailing edge is the point: an item that arrives DURING
+  // a run is not dropped, because that run may have read doola before the change it is about.
+  const tracker = new TaskTracker("t");
+  const batches: string[][] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+
+  tracker.trackCoalesced("cmp-1", "a", async (items) => {
+    batches.push([...items]);
+    await gate; // hold the first run open so the rest pile up behind it
+  });
+  tracker.trackCoalesced("cmp-1", "b", async (items) => {
+    batches.push([...items]);
+  });
+  tracker.trackCoalesced("cmp-1", "c", async (items) => {
+    batches.push([...items]);
+  });
+
+  release();
+  await tracker.settled(1000);
+  // Two runs, not three: the first, then ONE batch carrying everything that arrived during it.
+  expect(batches).toEqual([["a"], ["b", "c"]]);
+});
+
+test("M5: different keys never coalesce with each other", async () => {
+  const tracker = new TaskTracker("t");
+  const seen: string[] = [];
+  tracker.trackCoalesced("cmp-1", "a", async (items) => {
+    seen.push(`1:${items.join(",")}`);
+  });
+  tracker.trackCoalesced("cmp-2", "b", async (items) => {
+    seen.push(`2:${items.join(",")}`);
+  });
+  await tracker.settled(1000);
+  expect(seen.sort()).toEqual(["1:a", "2:b"]);
+});
+
+test("M5: a throwing run is logged and never strands the batch queued behind it", async () => {
+  const tracker = new TaskTracker("t");
+  const batches: string[][] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  tracker.trackCoalesced("cmp-1", "a", async (items) => {
+    batches.push([...items]);
+    await gate;
+    throw new Error("doola is down");
+  });
+  tracker.trackCoalesced("cmp-1", "b", async (items) => {
+    batches.push([...items]);
+  });
+  release();
+  expect(await tracker.settled(1000)).toBe(true);
+  expect(batches).toEqual([["a"], ["b"]]);
+});

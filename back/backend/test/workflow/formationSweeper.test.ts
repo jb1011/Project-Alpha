@@ -6,6 +6,8 @@
  * can race, and `await_ein` waits four to six weeks for the IRS. Every test here is one of those
  * scenarios.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { sqliteUtcTimestamp } from "../../src/formation";
@@ -657,4 +659,90 @@ test("a sweeper tick and a concurrent driver advance one entity EXACTLY once", a
 test("parseSqliteUtc reads the schema's own timestamp format, and survives nonsense", () => {
   expect(parseSqliteUtc("2026-08-21 12:00:00")).toBe(Date.parse("2026-08-21T12:00:00Z"));
   for (const bad of [null, undefined, "", "not a date"]) expect(parseSqliteUtc(bad)).toBe(0);
+});
+
+// ── M2 / M5: one dispatcher, one read per company ──────────────────────────────────────────
+
+test("M2: the re-drive goes through the ONE dispatcher — a companyless disable event is retired", () => {
+  // `partner_webhook_disabled` carries no company id and cannot be advanced; the dispatcher is
+  // what knows to log it CRITICAL and retire it. The sweeper used to re-implement that branch
+  // itself, which is how the two copies drifted (its version never logged an unknown name and
+  // marked events processed on a different condition).
+  const src = readFileSync(
+    join(import.meta.dirname, "..", "..", "src", "workflow", "formationSweeper.ts"),
+    "utf8",
+  );
+  expect(src).toContain('source: "sweeper"');
+  expect(src).toContain("acceptUnknownNames: true");
+  // No second dispatch: the sweeper never inspects an event NAME for itself any more.
+  expect(src).not.toContain("DOOLA_EVENT_NAMES");
+});
+
+test("M2: every step has a retry DRIVER in the table, not an `if` on create_provider", () => {
+  const src = readFileSync(
+    join(import.meta.dirname, "..", "..", "src", "workflow", "formationSweeper.ts"),
+    "utf8",
+  );
+  const table = src.slice(
+    src.indexOf("private readonly drivers"),
+    src.indexOf("private async retry("),
+  );
+  for (const step of ["create_provider", "await_filing", "fetch_documents", "await_ein"])
+    expect(table, step).toContain(`${step}:`);
+  // The dispatch itself is a lookup, so a fifth step without a driver is a type error rather
+  // than a row that silently never retries.
+  const retry = src.slice(src.indexOf("private async retry("));
+  expect(retry.slice(0, 200)).toContain("this.drivers[row.step]");
+  expect(retry.slice(0, 200)).not.toContain('row.step === "create_provider"');
+});
+
+test("M5: a burst of events for ONE company costs one read, and retires all of them", async () => {
+  seedFormation();
+  doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
+  for (const id of ["evt-1", "evt-2", "evt-3"])
+    events.record({
+      eventId: id,
+      eventName: "company_formation_completed",
+      providerRef: COMPANY_ID,
+      payload: "{}",
+    });
+
+  await sweeper().tick();
+
+  // ONE fetch-and-advance, not three: every event for a company is the same request, "look
+  // again", and one read answers all of them.
+  expect(doola.calls.filter((c) => c.startsWith("getCompany"))).toHaveLength(1);
+  for (const id of ["evt-1", "evt-2", "evt-3"])
+    expect(events.find(id)?.processedAt, id).not.toBeNull();
+});
+
+test("M5: the poll due-set is filtered in SQL — an entity that is not due is never loaded", () => {
+  seedFormation();
+  // Fresh rows: nothing is due, and the query says so without the sweeper reading a single blob.
+  expect(requests.listPollDueEntityKeys(now, sqliteUtcTimestamp(now - POLL_BASE_MS), 100)).toEqual(
+    [],
+  );
+
+  // Past the never-polled window (the row's own age is the clock).
+  const later = now + POLL_BASE_MS + 1000;
+  expect(
+    requests.listPollDueEntityKeys(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
+  ).toEqual([ENTITY_KEY]);
+
+  // A persisted schedule lives in a COLUMN, so "which rows are due?" stays a query rather than a
+  // scan of every open entity's detail blob. Move every row's age out of the way first — the
+  // query is deliberately a SUPERSET (it does not know which step an entity is waiting on), so
+  // any non-terminal polled row that is due by age keeps the entity in the candidate set.
+  stampRows(later);
+  expect(
+    requests.listPollDueEntityKeys(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
+  ).toEqual([]);
+
+  requests.transition(ENTITY_KEY, "await_filing", "pending", "pending", {
+    nextPollAt: later - 1,
+    detail: JSON.stringify({ nextPollAt: later - 1 }),
+  });
+  expect(
+    requests.listPollDueEntityKeys(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
+  ).toEqual([ENTITY_KEY]);
 });

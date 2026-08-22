@@ -220,3 +220,39 @@ test("the public surface NEVER carries the EIN, the filing number, or anything a
   ])
     expect(text).not.toContain(forbidden);
 });
+
+// ── M5: the short in-process cache ─────────────────────────────────────────────────────────
+
+test("M5: /transparency is cached for a few seconds, and refreshes after the TTL", async () => {
+  // The one surface whose request volume is not bounded by how many tenants exist. It reads every
+  // public entity, every job and every formation, so a link doing the rounds used to cost one
+  // full pass per request. Ten seconds is shorter than anything a human notices.
+  repo.upsert(base);
+  let now = 1_000_000;
+  const app = buildApiApp({
+    webOrigin: "*",
+    repo,
+    jobs,
+    now: () => now,
+  } as never);
+
+  const first = await (await app.request("/transparency")).json();
+  expect(first.stats.entities).toBe(1);
+
+  // A second entity appears; within the TTL the cached body is served unchanged.
+  repo.upsert({
+    ...base,
+    idempotencyKey: "tenant-b:agent",
+    publicId: "33333333-3333-3333-3333-333333333333",
+  });
+  now += 5_000;
+  expect((await (await app.request("/transparency")).json()).stats.entities).toBe(1);
+
+  // Past it, the pass runs again.
+  now += 6_000;
+  const fresh = await (await app.request("/transparency")).json();
+  expect(fresh.stats.entities).toBe(2);
+  // The freshness contract advertised to intermediaries is unchanged either way.
+  const res = await app.request("/transparency");
+  expect(res.headers.get("cache-control")).toBe("public, max-age=300");
+});

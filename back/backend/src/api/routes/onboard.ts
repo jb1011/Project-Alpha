@@ -13,7 +13,7 @@ import { opsLog } from "../../observability/opsLog";
 import { AgentSpecSchema, FormationPartySchema } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
-import { toEntityView } from "../views";
+import { toEntityView, toEntityViews } from "../views";
 import { assertGuardianAllowed } from "./worldId";
 
 export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
@@ -127,8 +127,10 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     return c.json({ partyId: result.partyId }, 201);
   });
 
+  // The batched projection: one formation-steps read and one documents read for the whole page,
+  // instead of two per entity (M5).
   app.get("/entities", (c) =>
-    c.json(deps.repo.listByTenant(c.get("tenantId")).map((r) => toEntityView(r, deps))),
+    c.json(toEntityViews(deps.repo.listByTenant(c.get("tenantId")), deps)),
   );
 
   app.get("/entities/:id", (c) => {

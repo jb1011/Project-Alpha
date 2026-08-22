@@ -18,7 +18,26 @@ const SETTLED = new Set(["completed", "reputed"]);
  *  formation block below carries a derived status and the environment, which are exactly the two
  *  facts the honesty invariant requires a stranger to be able to see. */
 export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
+  /**
+   * A very short in-process cache (M5).
+   *
+   * This route reads every public entity, every job, and now every formation, and it is
+   * UNAUTHENTICATED — it is the one surface where request volume is not bounded by how many
+   * tenants exist. Ten seconds is chosen to be shorter than anything a human would notice and
+   * long enough that a burst (a link doing the rounds, a crawler, a status page polling) costs
+   * one pass rather than one per request. The response already advertises `max-age=300` to
+   * intermediaries, so the freshness contract is unchanged; this only stops the process doing the
+   * work again for a browser that ignored it.
+   */
+  const CACHE_TTL_MS = 10_000;
+  let cached: { at: number; body: unknown } | undefined;
+
   app.get("/transparency", (c) => {
+    const now = (deps.now ?? Date.now)();
+    if (cached && now - cached.at < CACHE_TTL_MS) {
+      c.header("Cache-Control", "public, max-age=300");
+      return c.json(cached.body as Record<string, unknown>);
+    }
     const entities = deps.repo.listPublicOnChain();
     const jobs = deps.jobs.list();
 
@@ -36,6 +55,16 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
       settledByEntity.set(j.entityKey, agg);
     }
 
+    // ONE formation read for the whole page (M5) — this route used to run a `stepsOf` query per
+    // entity, on a public endpoint.
+    const stepsByEntity = deps.formationStepsMany?.(
+      entities
+        .filter((e) => e.formationProvider && e.formationEnvironment)
+        .map((e) => e.idempotencyKey),
+    );
+    const stepsOf = (key: string) =>
+      stepsByEntity ? (stepsByEntity.get(key) ?? []) : (deps.formationSteps?.(key) ?? []);
+
     const rows = entities.map((e) => {
       const gv =
         deps.worldId && e.ownerTenantId
@@ -43,7 +72,7 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
           : undefined;
       const agg = settledByEntity.get(e.idempotencyKey);
       // The SAME derivation the authenticated view uses, minus everything it may not serve.
-      const formation = formationSummary(e, deps.formationSteps?.(e.idempotencyKey) ?? []);
+      const formation = formationSummary(e, stepsOf(e.idempotencyKey));
       return {
         publicId: e.publicId,
         name: e.name,
@@ -67,14 +96,16 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
       };
     });
 
-    c.header("Cache-Control", "public, max-age=300");
-    return c.json({
+    const body = {
       stats: {
         entities: rows.length,
         jobsSettled,
         usdcSettledAtomic: usdcSettledAtomic.toString(),
       },
       entities: rows,
-    });
+    };
+    cached = { at: now, body };
+    c.header("Cache-Control", "public, max-age=300");
+    return c.json(body);
   });
 }

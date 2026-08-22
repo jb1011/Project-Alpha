@@ -77,7 +77,8 @@ export interface DoolaWebhookDeps {
   /** Set during a rotation window; both are verified so rotation is zero-downtime. */
   webhookSecretPrevious?: string;
   events: import("../../persistence/doolaEventRepository").DoolaEventRepository;
-  /** Where the acked-then-deferred work is remembered (SIGTERM drain + test join point). */
+  /** Where the acked-then-deferred work is remembered (SIGTERM drain + test join point), and
+   *  where a burst of events for one company is coalesced into one read (M5). */
   tasks: import("../../util/taskTracker").TaskTracker;
   /** The wake-up handler. Given ids only — never the payload (audit H2). Its result is the
    *  processor's, and the receiver ignores it: the ack has already gone out. */
@@ -290,12 +291,24 @@ export function mountDoolaWebhookRoutes(
 
     // ── 5. Ack now, work after. The task is TRACKED so SIGTERM can drain it and tests can join
     //       on it; a failure leaves `processed_at` NULL and the sweeper re-drives it.
-    d.tasks.track(() =>
-      d.process({
-        eventId: env.eventId,
-        eventName: env.eventName,
-        providerRef: env.providerRef,
-      }),
+    //
+    //       COALESCED per company (M5). doola's retry ladder plus a busy formation deliver
+    //       several events for one company in seconds, and a wake-up carries no facts — every one
+    //       of them is the same request, "look again". One fetch-and-advance answers the whole
+    //       batch, and the events it did not name are retired on the same read rather than
+    //       waiting for a sweeper tick. Keyed by the company id, or by the event id when there is
+    //       none, so a companyless event still gets its own task.
+    d.tasks.trackCoalesced<DoolaWakeUp>(
+      env.providerRef ?? `event:${env.eventId}`,
+      { eventId: env.eventId, eventName: env.eventName, providerRef: env.providerRef },
+      async (batch) => {
+        // The NEWEST wake-up leads: it is the one whose change a stale read could have missed.
+        const lead = batch[batch.length - 1]!;
+        const result = (await d.process(lead)) as { fetched?: boolean } | undefined;
+        // Only a real read may retire an event — the same rule the processor applies to its own.
+        if (result?.fetched)
+          for (const w of batch) if (w.eventId !== lead.eventId) d.events.markProcessed(w.eventId);
+      },
     );
     return c.json(OK_BODY, 200);
   });

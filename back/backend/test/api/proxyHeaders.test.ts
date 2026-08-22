@@ -73,7 +73,12 @@ test("C9: the document headers are their OWN list, scoped to the download", () =
     s.indexOf("export const FORWARDED_RESPONSE_HEADERS"),
     s.indexOf("export const DOCUMENT_RESPONSE_HEADERS"),
   );
-  for (const h of ["content-disposition", "cache-control", "content-length", "x-content-type-options"])
+  for (const h of [
+    "content-disposition",
+    "cache-control",
+    "content-length",
+    "x-content-type-options",
+  ])
     expect(global, h).not.toContain(`"${h}"`);
 
   // The ones that were already global and must not be lost in the split.

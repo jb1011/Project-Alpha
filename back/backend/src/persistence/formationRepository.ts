@@ -88,6 +88,14 @@ export interface FormationRepository {
   claimAllSteps(entityKey: string): boolean;
   find(entityKey: string, step: FormationStep): FormationRequestRecord | undefined;
   stepsOf(entityKey: string): FormationRequestRecord[];
+  /**
+   * The same rows for MANY entities, in ONE statement (M5).
+   *
+   * The list routes render every entity a tenant owns, and each one asked for its own steps: N+1
+   * queries per page view, on the two hottest read paths in the API and on the unauthenticated
+   * `/transparency`. Returns a map so the caller can build a per-key lookup without re-grouping.
+   */
+  stepsOfMany(entityKeys: string[]): Map<string, FormationRequestRecord[]>;
   listByState(state: FormationState): FormationRequestRecord[];
   /** The entity a doola company id belongs to (`idx_formation_provider`). This is the ONLY
    *  mapping from a webhook's `doolaCompanyId` to anything of ours — and until it exists, an
@@ -266,6 +274,35 @@ export class SqliteFormationRepository implements FormationRepository {
   find(entityKey: string, step: FormationStep): FormationRequestRecord | undefined {
     const r = this.stmts.find.get(entityKey, step) as Row | undefined;
     return r ? toRecord(r) : undefined;
+  }
+
+  stepsOfMany(entityKeys: string[]): Map<string, FormationRequestRecord[]> {
+    const out = new Map<string, FormationRequestRecord[]>();
+    if (entityKeys.length === 0) return out;
+    // `IN (?,?,…)` built per call rather than prepared once: the arity varies, and SQLite has no
+    // array binding. Chunked at 400 to stay clear of SQLITE_MAX_VARIABLE_NUMBER (999 by default).
+    for (let i = 0; i < entityKeys.length; i += 400) {
+      const chunk = entityKeys.slice(i, i + 400);
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM formation_requests WHERE entity_key IN (${chunk.map(() => "?").join(",")})`,
+        )
+        .all(...chunk) as Row[];
+      for (const r of rows) {
+        const list = out.get(r.entity_key);
+        if (list) list.push(toRecord(r));
+        else out.set(r.entity_key, [toRecord(r)]);
+      }
+    }
+    // Saga order per entity, the same order `stepsOf` returns.
+    for (const [k, list] of out)
+      out.set(
+        k,
+        FORMATION_STEP_ORDER.map((step) => list.find((r) => r.step === step)).filter(
+          (r): r is FormationRequestRecord => r !== undefined,
+        ),
+      );
+    return out;
   }
 
   /** Every step of one entity, in saga order (missing steps are simply absent). */

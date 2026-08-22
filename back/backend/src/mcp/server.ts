@@ -5,7 +5,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
-import { type EntityViewDeps, toEntityView } from "../api/views";
+import { type EntityViewDeps, toEntityView, toEntityViews } from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
 import {
   createFormationParty,
@@ -143,7 +143,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       // attempt fails uniformly and never burns the owner's code).
       if (!deps.linkCodes.consume(scope.tenantId, linkCode, Date.now()))
         return { content: [{ type: "text", text: "invalid or expired link code" }], isError: true };
-      const entities = repo.listByTenant(scope.tenantId).map((r) => toEntityView(r, deps));
+      const entities = toEntityViews(repo.listByTenant(scope.tenantId), deps);
       return {
         content: [
           {
@@ -178,10 +178,12 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "list_entities",
     { title: "List entities", description: "List the caller's agent legal bodies." },
     async () => {
-      const views = repo
-        .listByTenant(tenantId)
-        .filter((e) => entityInScope(scope, e.idempotencyKey)) // an entity-scoped key lists only its entity
-        .map((r) => toEntityView(r, deps));
+      const views = toEntityViews(
+        repo
+          .listByTenant(tenantId)
+          .filter((e) => entityInScope(scope, e.idempotencyKey)), // an entity-scoped key lists only its entity
+        deps,
+      );
       return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );

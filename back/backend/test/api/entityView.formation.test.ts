@@ -5,7 +5,7 @@
  * be renderable as a real one by omission.
  */
 import { expect, test } from "vitest";
-import { toEntityView } from "../../src/api/views";
+import { toEntityView, toEntityViews } from "../../src/api/views";
 import type { FormationRequestRecord } from "../../src/persistence/formationRepository";
 import type { EntityRecord } from "../../src/types";
 
@@ -289,4 +289,60 @@ test("no documents lookup wired reads as no documents, not as an error", () => {
   const v = formed([step("create_provider", "confirmed", "cmp-1")]);
   expect(v.formation?.documents).toEqual([]);
   expect(v.formation?.requiredActions).toEqual([]);
+});
+
+// ── M5: the LIST projection reads once for the page, not twice per entity ──────────────────
+
+test("M5: toEntityViews batches the formation and document reads across the whole page", () => {
+  const rows: EntityRecord[] = Array.from({ length: 5 }, (_, i) => ({
+    ...BASE,
+    idempotencyKey: `t:agent-${i}`,
+    formationProvider: "doola",
+    formationEnvironment: "sandbox" as const,
+  }));
+  // …plus an unpinned row, which must not be looked up at all.
+  rows.push({ ...BASE, idempotencyKey: "t:stub" });
+
+  const askedSteps: string[][] = [];
+  const askedDocs: string[][] = [];
+  const views = toEntityViews(rows, {
+    formationSteps: () => {
+      throw new Error("the per-row lookup must not be used when a batched one is wired");
+    },
+    formationStepsMany: (keys) => {
+      askedSteps.push([...keys]);
+      return new Map(keys.map((k) => [k, [step("create_provider", "confirmed", `cmp-${k}`)]]));
+    },
+    documents: {
+      listByEntity: () => {
+        throw new Error("the per-row lookup must not be used when a batched one is wired");
+      },
+      listByEntities: (keys) => {
+        askedDocs.push([...keys]);
+        return new Map();
+      },
+    },
+  });
+
+  // ONE call each, for the PINNED rows only — an unpinned entity has no formation to describe,
+  // and on most deployments most rows are unpinned.
+  expect(askedSteps).toHaveLength(1);
+  expect(askedDocs).toHaveLength(1);
+  expect(askedSteps[0]).toEqual(rows.slice(0, 5).map((r) => r.idempotencyKey));
+  expect(views).toHaveLength(6);
+  expect(views[0]!.formation!.providerRef).toBe("cmp-t:agent-0");
+  expect(views[5]!.formation).toBeNull();
+});
+
+test("M5: with no batched lookups wired, the list falls back to the per-row path", () => {
+  let calls = 0;
+  const rows = [{ ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" as const }];
+  const views = toEntityViews(rows, {
+    formationSteps: () => {
+      calls++;
+      return [step("create_provider", "confirmed", "cmp-1")];
+    },
+  });
+  expect(calls).toBe(1);
+  expect(views[0]!.formation!.providerRef).toBe("cmp-1");
 });
