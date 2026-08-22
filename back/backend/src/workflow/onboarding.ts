@@ -227,10 +227,18 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   //    verdict that erases personal data. It is a composition or door bug, and the honest place
   //    to say so is here, at entry, before anything is provisioned or minted.
   //
-  //    Scoped to a record that has not started yet. A record further along may legitimately have
-  //    lost its party — an abandoned formation's party IS erased — and a later `fund` call
-  //    re-enters this saga; failing that would turn one abandoned filing into a broken entity.
-  if (formationProvider === "doola" && !boundParty && (!rec || rec.status === "pending"))
+  //    Scoped twice over. To a record that has not STARTED yet: a record further along may
+  //    legitimately have lost its party — an abandoned formation's party IS erased — and a later
+  //    `fund` call re-enters this saga, so failing that would turn one abandoned filing into a
+  //    broken entity. And to a caller that actually wired formation: without the repositories
+  //    there is no way to know whether a party exists, and refusing on a question we cannot ask
+  //    would be a guess (the legacy doors, which file nothing, are exactly that case).
+  if (
+    d.formation &&
+    formationProvider === "doola" &&
+    !boundParty &&
+    (!rec || rec.status === "pending")
+  )
     throw new Error(
       `entity ${key} is pinned to formation provider "doola" but no formation party is bound to it — it could never be filed (bind a party at the claim, or do not pin)`,
     );
