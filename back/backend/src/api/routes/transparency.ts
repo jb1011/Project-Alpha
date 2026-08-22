@@ -1,7 +1,7 @@
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
+import { formationSummary } from "../../formation/status";
 import type { ApiDeps } from "../app";
-import { deriveFormationStatus } from "../views";
 
 /** A job is "settled" once escrowed USDC has paid out on-chain. `reputed` is a settled job that
  *  also earned reputation — same canonical definition as routes/reputation.ts. */
@@ -42,6 +42,8 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
           ? deps.worldId.store.findByTenant(e.ownerTenantId, deps.worldId.cfg.action)
           : undefined;
       const agg = settledByEntity.get(e.idempotencyKey);
+      // The SAME derivation the authenticated view uses, minus everything it may not serve.
+      const formation = formationSummary(e, deps.formationSteps?.(e.idempotencyKey) ?? []);
       return {
         publicId: e.publicId,
         name: e.name,
@@ -57,13 +59,9 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
         // Formation (design §8). Present only for an entity actually pinned to a provider;
         // null for every legacy/stub row, forever. `environment` is inseparable from the
         // status: a sandbox filing must read as a demo here too, not as a Wyoming company.
-        formation:
-          e.formationProvider && e.formationEnvironment
-            ? {
-                status: deriveFormationStatus(deps.formationSteps?.(e.idempotencyKey) ?? []),
-                environment: e.formationEnvironment,
-              }
-            : null,
+        formation: formation
+          ? { status: formation.status, environment: formation.environment }
+          : null,
         jobsSettled: agg?.jobs ?? 0,
         usdcSettledAtomic: (agg?.usdcAtomic ?? 0n).toString(),
       };

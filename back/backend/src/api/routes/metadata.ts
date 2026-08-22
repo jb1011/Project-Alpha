@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
+import { formationSummary } from "../../formation/status";
 import { usesManifestScheme } from "../../workflow/onboarding";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
-import { deriveFormationStatus } from "../views";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -76,13 +76,13 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
       // unauthenticated surface, an anchor that the chain has already moved past and a formation
       // status that stopped being true weeks ago — the fabrication class the frontend audit
       // flagged and this design forbids. So these three read the DB on every request.
-      if (ent.formationProvider && ent.formationEnvironment) {
+      // ONE derivation, shared with `/transparency` and the authenticated view — a public
+      // surface and a private one must never disagree about what an entity's formation IS.
+      const formation = formationSummary(ent, deps.formationSteps?.(ent.idempotencyKey) ?? []);
+      if (formation) {
         // The environment is REQUIRED whenever this block exists: a sandbox filing must never be
         // publishable as a real one by omission (the honesty invariant, §2).
-        meta.formation = {
-          environment: ent.formationEnvironment,
-          status: deriveFormationStatus(deps.formationSteps?.(ent.idempotencyKey) ?? []),
-        };
+        meta.formation = { environment: formation.environment, status: formation.status };
         // What is NOT here, and must never be: the EIN (a tax identifier, authenticated views
         // only), the filing number, doola's company id, and anything at all from
         // `formation_parties`. This route has no authentication of any kind.

@@ -6,6 +6,7 @@ import {
   assertPublicHttpsUrl,
 } from "../payments/ssrfGuard";
 import { withDeadline } from "../util/deadline";
+import { readCappedStream } from "../util/readStreamCapped";
 
 /**
  * Fetching a legal PDF from doola's signed download URL (design §10 "doola compromise / poisoned
@@ -83,47 +84,29 @@ export function normalizeContentType(raw: string | null | undefined): string {
 }
 
 /**
- * Read a response body under a running cap. Returns the buffer, or throws once the cap is passed.
- * Mirrors the doola client's `readCappedBody` — same reasoning, different limit and different
- * error type, because a document that is too large is a different operational event from an API
- * response that is.
+ * Read a response body under a running cap, on the shared capped reader (M4) — same mechanism as
+ * the doola client's, different limit and different error type, because a document that is too
+ * large is a different operational event from an API response that is.
  */
 async function readCapped(res: Response, max: number): Promise<Buffer> {
-  const declared = Number(res.headers?.get?.("content-length") ?? Number.NaN);
-  // The honest large response, caught before a single byte is buffered.
-  if (Number.isFinite(declared) && declared > max)
-    throw new DocumentDownloadError(
-      `document declares ${declared} bytes, over the ${max}-byte cap`,
-    );
-
-  const body = res.body as ReadableStream<Uint8Array> | null | undefined;
-  if (!body || typeof body.getReader !== "function") {
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > max)
-      throw new DocumentDownloadError(`document is ${buf.length} bytes, over the ${max}-byte cap`);
-    return buf;
-  }
-
-  const reader = body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    total += value.byteLength;
-    // The bound that actually holds: Content-Length is spoofable on a chunked response.
-    if (total > max) {
-      await reader.cancel().catch(() => {
-        // the throw below is the signal; a failed cancel must not mask it
-      });
-      throw new DocumentDownloadError(
-        `document exceeded the ${max}-byte cap while streaming (at least ${total} bytes)`,
-      );
-    }
-    chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks);
+  return await readCappedStream(
+    {
+      body: res.body as ReadableStream<Uint8Array> | null | undefined,
+      contentLength: res.headers?.get?.("content-length"),
+      readAll: async () => Buffer.from(await res.arrayBuffer()),
+    },
+    max,
+    {
+      // The honest large response, caught before a single byte is buffered.
+      declared: (n) =>
+        new DocumentDownloadError(`document declares ${n} bytes, over the ${max}-byte cap`),
+      // The bound that actually holds: Content-Length is spoofable on a chunked response.
+      streamed: (n) =>
+        new DocumentDownloadError(
+          `document exceeded the ${max}-byte cap while streaming (at least ${n} bytes)`,
+        ),
+    },
+  );
 }
 
 export interface DownloadOptions {

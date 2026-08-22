@@ -1,11 +1,10 @@
-import type { DoolaApi } from "../adapters/doola/doolaClient";
+import { type DoolaApi, describeDoolaError } from "../adapters/doola/doolaClient";
 import type {
   DoolaCompany,
   DoolaDocument,
   DoolaEnvironment,
   DoolaRequiredAction,
 } from "../adapters/doola/types";
-import type { DoolaWakeUp } from "../api/routes/doolaWebhook";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
 import {
@@ -16,10 +15,11 @@ import {
 import type { DocumentStore } from "../persistence/documentStore";
 import type { DoolaEventRepository } from "../persistence/doolaEventRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
-import type {
-  FormationRepository,
-  FormationRequestRecord,
-  FormationStep,
+import {
+  type FormationRepository,
+  type FormationRequestRecord,
+  type FormationStep,
+  parseDetail,
 } from "../persistence/formationRepository";
 import { downloadDocument } from "./documentDownloader";
 import { environmentPinMismatchError } from "./formationProvider";
@@ -43,6 +43,21 @@ import { failFormationStep, logFormationStep } from "./formationStep";
  * a sweeper tick meeting on one entity advance it exactly once. `withKeyedLock` is layered on top
  * as an optimization — it is single-process by its own doc, and correctness may not rest on it.
  */
+
+/**
+ * What a verified webhook hands this module. Four fields, and deliberately not five: the payload
+ * is NOT here, because a webhook is a wake-up signal and never a source of facts (audit H2).
+ *
+ * Defined here rather than in the receiver because the CONSUMER owns the contract — and because
+ * `src/workflow` must not import from `src/api` (a layering test enforces it); the receiver
+ * re-exports this type for its own callers.
+ */
+export interface DoolaWakeUp {
+  eventId: string;
+  eventName: string;
+  /** doola's company id, when the envelope carried one. NULL = unmappable, for now. */
+  providerRef: string | null;
+}
 
 // ── event names (design §5, fact-checked) ───────────────────────────────────────────────────
 
@@ -128,16 +143,9 @@ export const POLLED_STEPS: readonly FormationStep[] = [
   "await_ein",
 ] as const;
 
-export function parseDetail<T>(raw: string | null): T {
-  if (!raw) return {} as T;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    // A corrupt blob must not strand an entity: every fact it could hold is re-fetchable from
-    // doola, and the columns that matter legally live on the entity row.
-    return {} as T;
-  }
-}
+/** The `detail` reader lives with the column it reads (`persistence/formationRepository`, M4);
+ *  re-exported here because this module is where the `detail` SHAPES are declared. */
+export { parseDetail };
 
 // ── reading doola's company, honestly ───────────────────────────────────────────────────────
 
@@ -265,9 +273,12 @@ export async function advanceFormation(
   } catch (e) {
     // The read failed, so nothing is known and nothing is written. Park the step the entity is
     // waiting on so the sweeper's backoff owns the retry.
+    const described = describeDoolaError(e);
     if (waitingOn)
-      failFormationStep(d, entityKey, waitingOn, `doola read failed: ${(e as Error).message}`, {
+      failFormationStep(d, entityKey, waitingOn, `doola read failed: ${described.message}`, {
         providerRef,
+        code: described.code,
+        requestId: described.requestId,
       });
     return { fetched: false, advanced: false };
   }
@@ -423,7 +434,7 @@ async function advanceDocuments(
         providerRef,
         docType,
         providerDocId: doc.id,
-        message: (e as Error).message,
+        ...describeDoolaError(e),
       });
     }
   }

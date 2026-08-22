@@ -175,4 +175,7 @@ export class MemoryDocumentStore implements DocumentStore {
     if (!b) throw new Error(`no such document: ${id}`);
     return b;
   }
+  async getBytesAsync(id: string): Promise<Buffer> {
+    return this.getBytes(id);
+  }
 }

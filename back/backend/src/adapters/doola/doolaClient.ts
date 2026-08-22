@@ -1,5 +1,6 @@
 import { opsLog } from "../../observability/opsLog";
 import { withDeadline } from "../../util/deadline";
+import { readCappedText } from "../../util/readStreamCapped";
 import type {
   CreateCompanyInput,
   CreateCustomerInput,
@@ -94,6 +95,30 @@ export class DoolaTimeoutError extends Error {
   }
 }
 
+/**
+ * ONE description of a doola failure, for every error string and every ops line (M4).
+ *
+ * Three drivers — the create step, the fetch-and-advance, the sweeper — each had their own
+ * rendering, and two of them dropped doola's machine code and correlation id entirely. Those two
+ * fields are the whole reason `DoolaApiError` carries them: `code` is what the retry logic
+ * branches on (a validation failure must never be retried blind), and `requestId` is the first
+ * thing doola's support asks for.
+ *
+ * A timeout gets a code of its own (`E_TIMEOUT`) rather than none: "we never heard back" is the
+ * single most important distinction the create step makes, because it is the one case where the
+ * request may have COMMITTED at doola and the answer was lost.
+ */
+export function describeDoolaError(e: unknown): {
+  message: string;
+  code?: string;
+  requestId?: string;
+} {
+  if (e instanceof DoolaApiError)
+    return { message: `${e.code}: ${e.message}`, code: e.code, requestId: e.requestId };
+  if (e instanceof DoolaTimeoutError) return { message: e.message, code: "E_TIMEOUT" };
+  return { message: (e as Error)?.message ?? String(e) };
+}
+
 /** The slice of doola we consume. Tests fake this; production builds it from config. */
 export interface DoolaApi {
   /** Idempotency-Key honored. */
@@ -160,41 +185,25 @@ function tooLargeError(status: number, path: string, bytes: number): DoolaApiErr
 }
 
 /**
- * Read a response body under the size cap.
+ * Read a response body under the size cap, using the shared capped reader (M4).
  *
- * BOTH halves are needed. `Content-Length` catches the honest large response before a single
- * chunk is buffered — but a chunked (`Transfer-Encoding: chunked`) response declares no length at
- * all, and a lying one declares a small one, so the running counter over the body stream is what
- * actually enforces the bound. Passing the cap cancels the stream, which tears the socket down
- * instead of politely draining megabytes we have already decided to reject.
+ * The MECHANISM is shared (declared length first, running counter second, cancel on overflow);
+ * the ERROR is ours, because "a doola response was too large" is a distinct operational event
+ * from "a legal document was too large" and the two have different runbooks.
  */
 async function readCappedBody(res: Response, path: string): Promise<string> {
-  const declared = Number(res.headers?.get?.("content-length") ?? Number.NaN);
-  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES)
-    throw tooLargeError(res.status, path, declared);
-
-  const body = res.body as ReadableStream<Uint8Array> | null | undefined;
-  // A 204/empty response has no body stream at all; so do the hand-rolled fakes some callers
-  // pass in. Fall back to text() — there is nothing to meter.
-  if (!body || typeof body.getReader !== "function") return await res.text();
-
-  const reader = body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    total += value.byteLength;
-    if (total > MAX_RESPONSE_BYTES) {
-      await reader.cancel().catch(() => {
-        // the throw below is the real signal; a failed cancel must not mask it
-      });
-      throw tooLargeError(res.status, path, total);
-    }
-    chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks).toString("utf8");
+  return await readCappedText(
+    {
+      body: res.body as ReadableStream<Uint8Array> | null | undefined,
+      contentLength: res.headers?.get?.("content-length"),
+      readAll: async () => Buffer.from(await res.text(), "utf8"),
+    },
+    MAX_RESPONSE_BYTES,
+    {
+      declared: (n) => tooLargeError(res.status, path, n),
+      streamed: (n) => tooLargeError(res.status, path, n),
+    },
+  );
 }
 
 /** doola's correlation id — the FIRST thing their support asks for — wherever it rides. */

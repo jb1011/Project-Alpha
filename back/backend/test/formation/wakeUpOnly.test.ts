@@ -89,7 +89,9 @@ test("inside the receiver, `eventPayload` is only ever read by the two extractor
 });
 
 test("the wake-up handed to the processor carries ids ONLY — the type says so", () => {
-  const text = codeOnly(readFileSync(join(SRC, "api", "routes", "doolaWebhook.ts"), "utf8"));
+  // Declared by the PROCESSOR since M1: it is the consumer, and `src/workflow` may not import
+  // from `src/api`. The receiver re-exports it for its own callers.
+  const text = codeOnly(readFileSync(join(SRC, "workflow", "formationProcessor.ts"), "utf8"));
   const iface = text.slice(text.indexOf("export interface DoolaWakeUp"));
   const body = iface.slice(0, iface.indexOf("}"));
   // Three fields, and none of them is a fact about a legal entity.

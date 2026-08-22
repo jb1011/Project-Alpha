@@ -1,4 +1,4 @@
-import type { DoolaEnvironment } from "../adapters/doola/types";
+import { type FormationStatus, type FormationSummary, formationSummary } from "../formation/status";
 import { type DocumentIndexRecord, documentFileName } from "../persistence/documentIndexRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
@@ -12,35 +12,11 @@ export type FormationStepsLookup = (entityKey: string) => FormationRequestRecord
 export type FormationDocumentsLookup = (entityKey: string) => DocumentIndexRecord[];
 
 /**
- * What a tenant is told about their entity's formation (design §5/§8) — DERIVED from the sub-saga
- * rows, never stored, so it cannot drift from the rows the sweeper actually drives.
- *
- *   none         nothing has been opened (a legacy/stub entity, or a filing not yet started)
- *   in_progress  opened, nothing legally true yet — doola has the request
- *   filed        the STATE has filed it: the company legally exists
- *   complete     the EIN has been issued: the entity is fully formed
- *   failed       nothing was filed and the step that would have filed it is in error
+ * The formation projection itself lives in `src/formation/status.ts` — the sweeper needs it too,
+ * and a timer importing from `api/` is a layering inversion a test now forbids. Re-exported here
+ * so the view module still names the type it renders.
  */
-export type FormationStatus = "none" | "in_progress" | "filed" | "complete" | "failed";
-
-/**
- * The projection, in the ONE order that keeps it honest.
- *
- * `filed` and `complete` are checked BEFORE `failed`, deliberately: an entity whose company was
- * filed but whose document fetch failed IS a filed company, and reporting it as "failed" would
- * deny a legal fact that already exists in Wyoming's records. Conversely an entity whose
- * `create_provider` failed has nothing confirmed at all, so it falls through to `failed` —
- * which is the honest answer, and the one the ops trail agrees with.
- */
-export function deriveFormationStatus(steps: FormationRequestRecord[]): FormationStatus {
-  if (steps.length === 0) return "none";
-  const state = (step: FormationRequestRecord["step"]) => steps.find((s) => s.step === step)?.state;
-  if (state("await_ein") === "confirmed") return "complete";
-  if (state("await_filing") === "confirmed" || state("fetch_documents") === "confirmed")
-    return "filed";
-  if (steps.some((s) => s.state === "failed" || s.state === "abandoned")) return "failed";
-  return "in_progress";
-}
+export type { FormationStatus };
 
 /** Secret-free projection of an EntityRecord for API responses. */
 export interface EntityView {
@@ -87,69 +63,52 @@ export interface EntityView {
         /** The single in-flight version's hash, or null when nothing is pending. */
         pendingHash: string | null;
       };
-  /** Formation (design §2/§8). NULL = stub, forever — the shape every legacy row keeps and the
-   *  shape every credential-less deployment serves. `environment` is REQUIRED whenever this is
-   *  present (honesty invariant): a sandbox filing can never render as a real one by omission.
-   *  NO PII is ever served here — not a name, not an address, not an email. */
-  formation: {
-    provider: string;
-    environment: DoolaEnvironment;
-    status: FormationStatus;
-    /** doola's company id. An opaque provider reference — not PII, and the id an operator needs
-     *  to find this entity in doola's portal. */
-    providerRef: string | null;
-    /** Unix seconds the STATE filed the company. Null until it has. */
-    filedAt: number | null;
-    filingNumber: string | null;
-    /**
-     * ⚠ AUTHENTICATED VIEWS ONLY. The EIN is a tax identifier: it belongs to the entity's owner
-     * and to nobody else. It reaches this projection — which serves GET /entities and the MCP
-     * read tools, both tenant-scoped — and it must NEVER reach `/transparency` or `/metadata`,
-     * which are unauthenticated. Both of those build their own row shapes, and a test asserts
-     * neither can grow this field.
-     */
-    ein: string | null;
-    /**
-     * Open required-action CODES only, e.g. `FORMATION_NAME_OPTIONS_EXHAUSTED`.
-     *
-     * Never the id (an internal handle) and never doola's `reason` prose, which is free text
-     * their operators write and can name the responsible party. A code is a thing the UI can
-     * translate into an instruction; the prose is a PII risk with no upside.
-     */
-    requiredActions: string[];
-    /** The legal documents fetched so far. Metadata only — the bytes come from the download
-     *  route, which re-asserts ownership of its own. */
-    documents: {
-      id: string;
-      type: string;
-      name: string;
-      size: number;
-      /** What a verifier re-computes from the downloaded bytes. */
-      sha256: string;
-    }[];
-  } | null;
+  /**
+   * Formation (design §2/§8). NULL = stub, forever — the shape every legacy row keeps and the
+   * shape every credential-less deployment serves. The shared `FormationSummary` is everything
+   * that is safe on ANY surface; the two fields below it are the OWNER-ONLY additions, and they
+   * are spelled out here rather than in the summary so an unauthenticated surface cannot grow
+   * them by spreading it. NO PII is ever served here — not a name, not an address, not an email.
+   */
+  formation:
+    | (FormationSummary & {
+        /**
+         * ⚠ AUTHENTICATED VIEWS ONLY. The EIN is a tax identifier: it belongs to the entity's
+         * owner and to nobody else. It reaches this projection — which serves GET /entities and
+         * the MCP read tools, both tenant-scoped — and it must NEVER reach `/transparency` or
+         * `/metadata`, which are unauthenticated. Both of those build their own row shapes from
+         * `formationSummary`, and a test asserts neither can grow this field.
+         */
+        ein: string | null;
+        /** The legal documents fetched so far. Metadata only — the bytes come from the download
+         *  route, which re-asserts ownership of its own. */
+        documents: DocumentView[];
+      })
+    | null;
 }
 
-/**
- * Open required-action codes out of `await_filing.detail`.
- *
- * Parsed structurally rather than by importing the processor's `AwaitFilingDetail`: this module
- * is a pure projection, and reaching into `workflow/` from here would create an import cycle
- * (views → processor → receiver → app → views) as well as a layering one. A malformed or absent
- * blob yields no actions, which is the honest answer — a UI that cannot read the detail must not
- * claim there is nothing to do OR invent something to do.
- */
-export function requiredActionCodesOf(steps: FormationRequestRecord[]): string[] {
-  const raw = steps.find((s) => s.step === "await_filing")?.detail;
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw) as { requiredActions?: { code?: unknown }[] };
-    return (parsed.requiredActions ?? [])
-      .map((a) => a?.code)
-      .filter((c): c is string => typeof c === "string" && c.length > 0);
-  } catch {
-    return [];
-  }
+/** The document metadata a tenant sees, in the ONE shape both surfaces render (M4). The bytes
+ *  come from the download route, which re-asserts ownership of its own. */
+export interface DocumentView {
+  id: string;
+  type: string;
+  name: string;
+  size: number;
+  /** What a verifier re-computes from the downloaded bytes. */
+  sha256: string;
+}
+
+/** One projection for `GET /entities/:id/documents`, the entity view, and the MCP read tools —
+ *  three renderers of the same row is three chances for them to describe it differently. */
+export function toDocumentView(d: DocumentIndexRecord): DocumentView {
+  return {
+    id: d.id,
+    type: d.docType,
+    // DERIVED from the doc type, never echoed from doola's `name` field.
+    name: documentFileName(d.docType),
+    size: d.size,
+    sha256: d.sha256,
+  };
 }
 
 /**
@@ -163,10 +122,14 @@ export function toEntityView(
   formationSteps?: FormationStepsLookup,
   formationDocuments?: FormationDocumentsLookup,
 ): EntityView {
-  // Read ONCE. The projection asks three questions of the same rows (status, provider ref,
-  // required actions), and calling the lookup per question meant three queries per entity on
-  // every list response.
-  const steps = formationSteps?.(r.idempotencyKey) ?? [];
+  // Read ONCE, and only for a row that is actually pinned. The projection asks three questions
+  // of the same rows (status, provider ref, required actions), and calling the lookup per
+  // question meant three queries per entity on every list response — while an UNPINNED row (every
+  // legacy entity, every stub deployment) needs none of them at all, and the list routes are
+  // mostly unpinned rows.
+  const pinned = Boolean(r.formationProvider && r.formationEnvironment);
+  const steps = pinned ? (formationSteps?.(r.idempotencyKey) ?? []) : [];
+  const summary = pinned ? formationSummary(r, steps) : null;
   return {
     id: r.idempotencyKey,
     name: r.name,
@@ -201,27 +164,14 @@ export function toEntityView(
     // Both halves or neither: an entity pinned to a provider is always pinned to an environment
     // too (they are written together at the claim), so a half-populated formation block would be
     // a bug — and rendering one without the other is exactly the deception §2 forbids.
-    formation:
-      r.formationProvider && r.formationEnvironment
-        ? {
-            provider: r.formationProvider,
-            environment: r.formationEnvironment,
-            status: deriveFormationStatus(steps),
-            providerRef: steps.find((s) => s.step === "create_provider")?.providerRef ?? null,
-            filedAt: r.formationFiledAt ?? null,
-            filingNumber: r.formationFilingNumber ?? null,
-            // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain
-            // at mint and is never served as a legal fact.
-            ein: r.einReal ?? null,
-            requiredActions: requiredActionCodesOf(steps),
-            documents: (formationDocuments?.(r.idempotencyKey) ?? []).map((d) => ({
-              id: d.id,
-              type: d.docType,
-              name: documentFileName(d.docType),
-              size: d.size,
-              sha256: d.sha256,
-            })),
-          }
-        : null,
+    formation: summary
+      ? {
+          ...summary,
+          // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
+          // mint and is never served as a legal fact.
+          ein: r.einReal ?? null,
+          documents: (formationDocuments?.(r.idempotencyKey) ?? []).map(toDocumentView),
+        }
+      : null,
   };
 }

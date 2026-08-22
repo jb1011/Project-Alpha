@@ -103,6 +103,27 @@ export interface FormationRepository {
   createRequestsSince(sinceUtc: string): number;
 }
 
+/**
+ * The ONE reader for a `formation_requests.detail` blob (M4).
+ *
+ * It belongs to the repository because `detail` is the repository's column, and because there
+ * were three parsers of it — the create step's private copy, the processor's exported one, and
+ * the view's ad-hoc `JSON.parse` — which is three chances to disagree about what an unreadable
+ * blob means.
+ *
+ * A corrupt blob yields an EMPTY object rather than throwing. Every fact `detail` can hold is
+ * either re-fetchable from doola or duplicated in a column (`provider_ref` above all), so an
+ * unreadable blob must never be the reason an entity is stranded.
+ */
+export function parseDetail<T>(raw: string | null): T {
+  if (!raw) return {} as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
 export class SqliteFormationRepository implements FormationRepository {
   /**
    * Statements are prepared ONCE, in the constructor.

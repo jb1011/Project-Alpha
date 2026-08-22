@@ -1,5 +1,5 @@
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
-import { ApiError } from "../api/errors";
+import { ApiError } from "../errors";
 import { formationPartyUnavailableMessage } from "../formation";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { AgentSpec } from "../policy/agentSpec";

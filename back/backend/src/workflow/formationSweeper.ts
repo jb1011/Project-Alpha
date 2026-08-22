@@ -1,5 +1,6 @@
-import { deriveFormationStatus } from "../api/views";
+import { describeDoolaError } from "../adapters/doola/doolaClient";
 import { sqliteUtcTimestamp } from "../formation";
+import { deriveFormationStatus } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
 import type {
@@ -9,6 +10,7 @@ import type {
 import type { FormationPartyRepository } from "../persistence/formationPartyRepository";
 import type { FormationRequestRecord, FormationStep } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
+import { parseSqliteUtc } from "../util/sqliteTime";
 import {
   DOOLA_EVENT_NAMES,
   type FormationAdvanceDeps,
@@ -85,12 +87,10 @@ export function retryDelayMs(attempt: number): number {
   return Math.min(RETRY_BASE_MS * 2 ** Math.max(attempt, 0), RETRY_CAP_MS);
 }
 
-/** SQLite's TEXT `CURRENT_TIMESTAMP` ("YYYY-MM-DD HH:MM:SS", UTC) as epoch ms. */
-export function parseSqliteUtc(ts: string | null | undefined): number {
-  if (!ts) return 0;
-  const ms = Date.parse(`${ts.replace(" ", "T")}Z`);
-  return Number.isFinite(ms) ? ms : 0;
-}
+/** SQLite's TEXT `CURRENT_TIMESTAMP` ("YYYY-MM-DD HH:MM:SS", UTC) as epoch ms. Defined beside
+ *  its formatter in `util/sqliteTime` (M4); re-exported here because the sweeper's schedules are
+ *  what the tests read it through. */
+export { parseSqliteUtc };
 
 // ── deps ────────────────────────────────────────────────────────────────────────────────────
 
@@ -129,7 +129,7 @@ export class FormationSweeper {
       try {
         await this.tick();
       } catch (err) {
-        opsLog("formation_sweep_failed", { level: "warn", message: (err as Error).message });
+        opsLog("formation_sweep_failed", { level: "warn", ...describeDoolaError(err) });
       }
       if (!this.stopped) {
         this.timer = setTimeout(loop, this.d.intervalMs);
@@ -176,7 +176,7 @@ export class FormationSweeper {
         opsLog("doola_event_redrive_failed", {
           level: "warn",
           eventId: e.eventId,
-          message: (err as Error).message,
+          ...describeDoolaError(err),
         });
       }
     }
@@ -225,7 +225,7 @@ export class FormationSweeper {
           level: "warn",
           entityKey: row.entityKey,
           step: row.step,
-          message: (err as Error).message,
+          ...describeDoolaError(err),
         });
       }
     }
@@ -321,7 +321,7 @@ export class FormationSweeper {
         opsLog("formation_poll_failed", {
           level: "warn",
           entityKey,
-          message: (err as Error).message,
+          ...describeDoolaError(err),
         });
         continue;
       }

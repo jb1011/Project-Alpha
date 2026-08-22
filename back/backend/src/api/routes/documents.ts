@@ -2,7 +2,8 @@ import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { documentFileName } from "../../persistence/documentIndexRepository";
 import type { ApiDeps } from "../app";
-import { ApiError } from "../errors";
+import { ApiError, requireOwnedEntity } from "../errors";
+import { toDocumentView } from "../views";
 
 /**
  * The tenant's legal documents (design §8).
@@ -24,35 +25,21 @@ import { ApiError } from "../errors";
  * fetches to a blob (`downloadDocument` in the api client) and creates an object URL.
  */
 export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
-  /** Entity-or-404, the two-line ownership idiom. */
-  const owned = (c: { req: { param(k: string): string }; get(k: "tenantId"): string }) => {
-    const rec = deps.repo.findByIdempotencyKey(c.req.param("id"));
-    if (!rec || rec.ownerTenantId !== c.get("tenantId"))
-      throw new ApiError("not_found", 404, "entity not found");
-    return rec;
-  };
-
   app.get("/entities/:id/documents", (c) => {
-    const rec = owned(c);
+    const rec = requireOwnedEntity(deps, c);
     // No lookup wired (a deployment that has never formed anything) reads as "no documents",
     // which is the truth, rather than as an error.
     const docs = deps.formationDocuments?.(rec.idempotencyKey) ?? [];
     return c.json({
-      documents: docs.map((d) => ({
-        id: d.id,
-        type: d.docType,
-        name: documentFileName(d.docType),
-        size: d.size,
-        // The hash a verifier re-computes from the bytes below — and, from PR 3, the one the OA
-        // bundle manifest commits to on-chain.
-        sha256: d.sha256,
-        createdAt: d.createdAt,
-      })),
+      // The SAME projection the entity view renders (M4) — `sha256` is the hash a verifier
+      // re-computes from the bytes below, and from PR 3 the one the OA bundle manifest commits
+      // to on-chain — plus the one field only this index carries.
+      documents: docs.map((d) => ({ ...toDocumentView(d), createdAt: d.createdAt })),
     });
   });
 
-  app.get("/entities/:id/documents/:docId", (c) => {
-    const rec = owned(c);
+  app.get("/entities/:id/documents/:docId", async (c) => {
+    const rec = requireOwnedEntity(deps, c);
     // `findOwned` re-asserts the entity key, so a document id belonging to another entity is a
     // 404 here even though it is a perfectly valid id somewhere else.
     const doc = deps.documents?.findOwned(rec.idempotencyKey, c.req.param("docId"));
@@ -60,7 +47,9 @@ export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
 
     let bytes: Buffer;
     try {
-      bytes = deps.docStore.getBytes(doc.path);
+      // Off the event loop: a legal PDF is hundreds of kilobytes and `readFileSync` here would
+      // stall every other request in the process for the length of the disk read.
+      bytes = await deps.docStore.getBytesAsync(doc.path);
     } catch {
       // Indexed but not on disk: a restore that missed `data/documents/`, or a hand-deleted file.
       // The bytes are re-fetchable from doola (that is what `provider_doc_id` is for), so this is
@@ -76,6 +65,11 @@ export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
     c.header("X-Content-Type-Options", "nosniff");
     // A legal document belonging to one tenant must not sit in a shared cache.
     c.header("Cache-Control", "private, no-store");
-    return c.body(new Uint8Array(bytes));
+    // From the INDEX row, not from the buffer: it is the size the tenant was told the document
+    // has, and a mismatch between the two is a fact worth surfacing rather than papering over.
+    c.header("Content-Length", String(doc.size));
+    // A VIEW over the same memory, not `new Uint8Array(bytes)` — that constructor COPIES the
+    // whole PDF for nothing.
+    return c.body(new Uint8Array(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength));
   });
 }

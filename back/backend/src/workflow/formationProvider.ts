@@ -1,4 +1,4 @@
-import { type DoolaApi, DoolaApiError } from "../adapters/doola/doolaClient";
+import { type DoolaApi, describeDoolaError } from "../adapters/doola/doolaClient";
 import type {
   CreateCompanyInput,
   DoolaAddress,
@@ -16,6 +16,7 @@ import {
   type FormationRequestRecord,
   type FormationState,
   SqliteFormationRepository,
+  parseDetail,
 } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { EntityRecord } from "../types";
@@ -138,17 +139,6 @@ function toDoolaAddress(p: FormationPartyRecord): DoolaAddress {
   };
 }
 
-function parseDetail(raw: string | null): CreateProviderDetail {
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw) as CreateProviderDetail;
-  } catch {
-    // A corrupt detail blob must not strand the entity: the authoritative facts are the
-    // provider_ref column and doola itself, both of which survive an unreadable blob.
-    return {};
-  }
-}
-
 function logStep(
   entityKey: string,
   state: FormationState,
@@ -156,13 +146,6 @@ function logStep(
   extra: Record<string, unknown> = {},
 ): void {
   logFormationStep(entityKey, "create_provider", state, attempt, extra);
-}
-
-/** doola's machine code + correlation id, for the ops line and the persisted error. */
-function describe(e: unknown): { message: string; code?: string; requestId?: string } {
-  if (e instanceof DoolaApiError)
-    return { message: `${e.code}: ${e.message}`, code: e.code, requestId: e.requestId };
-  return { message: (e as Error).message };
 }
 
 /**
@@ -192,7 +175,7 @@ export async function runFormationCreateProvider(d: FormationCreateDeps): Promis
     opsLog("formation_create_failed", {
       entityKey,
       code: "E_UNEXPECTED",
-      message: describe(e).message,
+      message: describeDoolaError(e).message,
     });
   }
 }
@@ -213,7 +196,7 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     failStep(d, row, noFormationPartyError());
     return;
   }
-  let detail = parseDetail(row.detail);
+  let detail = parseDetail<CreateProviderDetail>(row.detail);
 
   // ── ADOPT (crash-window rule). A persisted provider_ref means the company create ALREADY
   //    returned — whatever happened next. Filing again would be a second real LLC and a second
@@ -283,7 +266,7 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
         )
       ).doolaCustomerId;
     } catch (e) {
-      failStep(d, row, describe(e).message, e);
+      failStep(d, row, describeDoolaError(e).message, e);
       return;
     }
     detail = { ...detail, customerId };
@@ -311,7 +294,7 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
       key,
     );
   } catch (e) {
-    failStep(d, row, describe(e).message, e);
+    failStep(d, row, describeDoolaError(e).message, e);
     return;
   }
 
@@ -400,7 +383,7 @@ async function lookupExistingCompany(
     opsLog("formation_lookup_failed", {
       entityKey: d.entityKey,
       level: "warn",
-      ...describe(e),
+      ...describeDoolaError(e),
     });
     return undefined;
   }
@@ -421,7 +404,7 @@ async function adopt(
     } catch (e) {
       // The company exists (we hold its id); we simply could not read it right now. Fail the row
       // so the sweeper retries — it will land in this same branch and read again.
-      failStep(d, row, describe(e).message, e);
+      failStep(d, row, describeDoolaError(e).message, e);
       return;
     }
   }
@@ -505,7 +488,7 @@ function failStep(
   cause?: unknown,
 ): void {
   const { entityKey } = d;
-  const described: { code?: string; requestId?: string } = cause ? describe(cause) : {};
+  const described: { code?: string; requestId?: string } = cause ? describeDoolaError(cause) : {};
   // The bump-then-park sequence itself lives in `formationStep.ts`: the webhook processor and the
   // sweeper park rows too, and three copies of that contract would be three chances to burn an
   // attempt without parking the row (or the reverse). What stays HERE is what is specific to the

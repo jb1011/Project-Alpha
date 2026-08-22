@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { type Config, canFormEntities } from "./config/env";
 import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
+import { sqliteUtcTimestamp } from "./util/sqliteTime";
 
 /**
  * The ONE resolution of "what does this deployment pin a NEW entity to?" (design §2/§5).
@@ -137,12 +138,9 @@ export interface FormationDoorDeps {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** A `CURRENT_TIMESTAMP`-shaped UTC instant, so the comparison is lexicographic against the
- *  TEXT timestamps SQLite writes (and stays injectable-clock friendly, which `datetime('now')`
- *  would not be). */
-export function sqliteUtcTimestamp(ms: number): string {
-  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
-}
+/** The SQLite TEXT-timestamp formatter, defined beside its parser in `util/sqliteTime` (M4) and
+ *  re-exported here for the door's own callers. */
+export { sqliteUtcTimestamp };
 
 /**
  * The formation door gate, in the ONE order both surfaces run it (design §2/§5).

@@ -2,6 +2,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Context, Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { opsLog } from "../../observability/opsLog";
+import { readCappedText } from "../../util/readStreamCapped";
+import type { DoolaWakeUp } from "../../workflow/formationProcessor";
 import type { ApiDeps } from "../app";
 
 /**
@@ -43,6 +45,11 @@ import type { ApiDeps } from "../app";
  * `docs/runbooks/doola-webhooks.md`. If doola's live header turns out to carry a `sha256=`
  * prefix or base64, this constant and `decodeSignature` are the two places that change.
  */
+/** What the receiver hands the processor — defined by the PROCESSOR (it is the consumer,
+ *  and `src/workflow` may not import from `src/api`) and re-exported here for the receiver's own
+ *  callers. Note what is NOT in it: the payload. */
+export type { DoolaWakeUp };
+
 export const DOOLA_SIGNATURE_HEADER = "x-doola-signature";
 export const DOOLA_SIGNATURE_ENCODING = "hex" as const;
 
@@ -63,14 +70,6 @@ const UNAUTHORIZED_BODY = { error: { code: "unauthorized", message: "invalid sig
 const NOT_FOUND_BODY = { error: { code: "not_found", message: "not found" } };
 const TOO_LARGE_BODY = { error: { code: "payload_too_large", message: "payload too large" } };
 const OK_BODY = { ok: true };
-
-/** What the receiver hands the processor. Note what is NOT here: the payload. */
-export interface DoolaWakeUp {
-  eventId: string;
-  eventName: string;
-  /** doola's company id, when the envelope carried one. NULL = unmappable, for now. */
-  providerRef: string | null;
-}
 
 export interface DoolaWebhookDeps {
   environment: "sandbox" | "production";
@@ -175,46 +174,33 @@ export function parseEnvelope(rawBody: string): DoolaEnvelope | null {
   return { eventId, eventName, timestamp: ts, providerRef: providerRefOf(e.eventPayload) };
 }
 
+/** The receiver's own overflow signal. Never leaves this module: the route turns it into a 413. */
+class WebhookTooLargeError extends Error {}
+
 /**
- * Read the body under a running byte cap.
- *
- * Both halves matter, for the same reason they do in the doola client: `Content-Length` catches
- * the honest oversized request before a byte is buffered, but a chunked request declares no
- * length and a lying one declares a small one — so the counter over the stream is what actually
- * enforces the bound. Returns `undefined` when the cap is exceeded.
+ * Read the body under a running byte cap, on the shared capped reader (M4).
  *
  * Read as TEXT, before any JSON parse: the signature covers the RAW bytes, so re-serializing a
- * parsed object would verify a different string than the one doola signed.
+ * parsed object would verify a different string than the one doola signed. Returns `undefined`
+ * when the cap is exceeded — a size refusal is a 413 here, not a signature verdict.
  */
 async function readCappedBody(c: Context, max: number): Promise<string | undefined> {
-  const declared = Number(c.req.header("content-length") ?? Number.NaN);
-  if (Number.isFinite(declared) && declared > max) return undefined;
-
-  const body = c.req.raw.body as ReadableStream<Uint8Array> | null | undefined;
-  if (!body || typeof body.getReader !== "function") {
-    // No stream (an empty body, or a hand-rolled Request in a test): there is nothing to meter,
-    // so read it and check the result.
-    const text = await c.req.text();
-    return Buffer.byteLength(text, "utf8") > max ? undefined : text;
+  try {
+    return await readCappedText(
+      {
+        body: c.req.raw.body as ReadableStream<Uint8Array> | null | undefined,
+        contentLength: c.req.header("content-length"),
+        // No stream (an empty body, or a hand-rolled Request in a test): there is nothing to
+        // meter, so read it and let the shared reader check the result.
+        readAll: async () => Buffer.from(await c.req.text(), "utf8"),
+      },
+      max,
+      { declared: () => new WebhookTooLargeError(), streamed: () => new WebhookTooLargeError() },
+    );
+  } catch (e) {
+    if (e instanceof WebhookTooLargeError) return undefined;
+    throw e;
   }
-
-  const reader = body.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    total += value.byteLength;
-    if (total > max) {
-      await reader.cancel().catch(() => {
-        // tearing the socket down is best-effort; the refusal below is the real answer
-      });
-      return undefined;
-    }
-    chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks).toString("utf8");
 }
 
 /**
