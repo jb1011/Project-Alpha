@@ -109,14 +109,26 @@ export interface FormationPartyRepository {
   /** The bound party for an entity — what `create_provider` files with. */
   findByEntityKey(entityKey: string): FormationPartyRecord | undefined;
   /**
-   * Erasure candidates (design §3, audit H7). Two disjoint reasons, one query each:
+   * Erasure candidates (design §3, audit H7, C7). Two disjoint reasons, one query each:
    *
-   *  - a party bound to an entity whose `create_provider` was **abandoned** — the filing will
-   *    never happen, so no retention duty ever attached to it;
-   *  - an **unbound** party older than the cutoff — a form that was filled in and never used.
+   *  - a party bound to an entity whose formation is TERMINAL (`create_provider` abandoned) and
+   *    which was PROVABLY NEVER FILED;
+   *  - an **unbound** party older than the cutoff — a form that was filled in and never used, and
+   *    with no entity there is nothing it could have been filed for.
    *
-   * A party bound to a filing that DID happen is never in this list: once a responsible party is
-   * on a state filing, the retention duty is real and erasing our copy would not unfile it.
+   * "Provably never filed" is the whole of C7, and it is deliberately conservative, because the
+   * two errors are not symmetric: erasing too late is a retention-policy miss, while erasing too
+   * early destroys the identity of the responsible party on a REAL Wyoming filing — data we are
+   * required to hold and cannot reconstruct. So it takes BOTH:
+   *
+   *  - `create_provider` has **no `provider_ref`**. A ref means `POST /companies` returned: a
+   *    company exists, or very likely exists, at doola. `abandoned` says our SAGA gave up, which
+   *    is a statement about our retries and not about Wyoming's records;
+   *  - `await_filing` is **not confirmed**. That row is the one that says the STATE filed it, and
+   *    it is written from doola's own answer.
+   *
+   * A party bound to a filing that DID happen is therefore never in this list, whatever the saga
+   * subsequently did — erasing our copy would not unfile it.
    */
   listErasable(unboundCutoffUtc: string): { partyId: string; reason: "abandoned" | "unbound" }[];
   /**
@@ -159,7 +171,17 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
            FROM formation_parties p
            JOIN formation_requests f
              ON f.entity_key = p.entity_key AND f.step = 'create_provider'
-          WHERE p.deleted_at IS NULL AND f.state = 'abandoned'`,
+          WHERE p.deleted_at IS NULL
+            AND f.state = 'abandoned'
+            -- A company id means the create RETURNED. Whatever the saga decided afterwards, a
+            -- real filing may exist under this person's name.
+            AND f.provider_ref IS NULL
+            -- And doola's own answer never said the state filed it.
+            AND NOT EXISTS (
+                  SELECT 1 FROM formation_requests g
+                   WHERE g.entity_key = p.entity_key
+                     AND g.step = 'await_filing'
+                     AND g.state = 'confirmed')`,
       ),
       listStaleUnbound: db.prepare(
         `SELECT party_id FROM formation_parties

@@ -16,6 +16,10 @@ import { SqliteFormationRepository } from "../../src/persistence/formationReposi
 
 const TENANT = "0x000000000000000000000000000000000000000A";
 
+/** A cutoff far enough ahead that the UNBOUND half of the query can never be the reason a party
+ *  appears in these results — every assertion below is about the abandoned half. */
+const FUTURE = "2999-01-01 00:00:00";
+
 let db: DatabaseType.Database;
 let parties: SqliteFormationPartyRepository;
 let requests: SqliteFormationRepository;
@@ -168,4 +172,60 @@ test("C10: the migration performs exactly ONE formation_parties rebuild, and it 
   for (const col of ["legal_first_name", "legal_last_name", "email", "line1", "city", "country"])
     expect(info.find((c) => c.name === col)?.notnull, col).toBe(0);
   fresh.close();
+});
+
+// ── C7: "never filed" is a fact about doola, not about our retries ─────────────────────────
+
+/** A party bound to `entityKey`, plus the four formation rows for it. */
+function bound(entityKey: string): string {
+  const partyId = parties.create({
+    tenantId: TENANT,
+    legalFirstName: "Ada",
+    legalLastName: "Lovelace",
+    email: "ada@example.com",
+    phone: "+12125550100",
+    line1: "1 Analytical Way",
+    line2: null,
+    city: "Cheyenne",
+    region: "WY",
+    postalCode: "82001",
+    country: "USA",
+    synthetic: false,
+  });
+  parties.bind(partyId, entityKey, TENANT);
+  requests.claimAllSteps(entityKey);
+  return partyId;
+}
+
+test("C7: an abandoned formation whose create_provider holds a PROVIDER REF is never erased", () => {
+  // The dangerous case. `abandoned` says our saga gave up after eight attempts; the company id
+  // says `POST /companies` returned. A real Wyoming LLC may exist under this person's name, the
+  // retention duty is real, and erasing our copy would not unfile it.
+  const partyId = bound("t:filed");
+  requests.transition("t:filed", "create_provider", "pending", "abandoned", {
+    providerRef: "cmp-live-1",
+  });
+  expect(parties.listErasable(FUTURE).map((e) => e.partyId)).not.toContain(partyId);
+});
+
+test("C7: an abandoned formation whose await_filing CONFIRMED is never erased either", () => {
+  // Even with no ref on the create row: `await_filing` confirmed is doola's own answer that the
+  // STATE filed the company. A later step failing eight times does not unmake that.
+  const partyId = bound("t:state-filed");
+  requests.transition("t:state-filed", "create_provider", "pending", "abandoned");
+  requests.transition("t:state-filed", "await_filing", "pending", "confirmed");
+  expect(parties.listErasable(FUTURE).map((e) => e.partyId)).not.toContain(partyId);
+});
+
+test("C7: an abandoned formation that PROVABLY never filed IS erased", () => {
+  // No company id and no confirmed filing: nothing was ever created at doola, so no retention
+  // duty ever attached and the personal data has to go.
+  const partyId = bound("t:never");
+  requests.transition("t:never", "create_provider", "pending", "abandoned");
+  expect(parties.listErasable(FUTURE)).toContainEqual({ partyId, reason: "abandoned" });
+});
+
+test("C7: a formation still IN FLIGHT is never erased, ref or no ref", () => {
+  const partyId = bound("t:inflight");
+  expect(parties.listErasable(FUTURE).map((e) => e.partyId)).not.toContain(partyId);
 });

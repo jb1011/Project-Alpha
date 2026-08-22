@@ -29,13 +29,7 @@ export const FORWARDED_REQUEST_HEADERS = [
 ] as const;
 
 /**
- * Response headers the backend may send BACK through the proxy.
- *
- * The last four arrive with the legal-document download (design §8, audit M14/15). Without
- * `content-disposition` the browser has no filename; without `content-type` it has no type;
- * without `x-content-type-options` it is free to sniff one; and without `cache-control` a PDF
- * belonging to one tenant can be cached by an intermediary. `content-length` is what lets a
- * download show progress instead of a spinner.
+ * Response headers the backend may send BACK through the proxy, on EVERY route.
  *
  * NOTE: `x-doola-signature` is deliberately absent from the REQUEST list above. doola's webhooks
  * must be pointed at the backend origin directly — a portal pointed here would 401 on every
@@ -50,11 +44,55 @@ export const FORWARDED_RESPONSE_HEADERS = [
   // Without these an authorized agent cannot read its own standing.
   "x-agentkit-human",
   "x-agentkit-authorization",
+] as const;
+
+/**
+ * Response headers forwarded ONLY on the legal-document download (design §8, audit M14/15, C9).
+ *
+ * All four exist for that one route: without `content-disposition` the browser has no filename,
+ * without `x-content-type-options` it is free to sniff a type of its own, without `cache-control`
+ * a PDF belonging to one tenant can be cached by an intermediary, and without `content-length` a
+ * download shows a spinner instead of progress.
+ *
+ * They are scoped rather than global because three of them are not inert elsewhere. A
+ * `content-disposition` leaking onto a JSON response turns an API call into a file save; a
+ * backend `cache-control` echoed onto every route silently overrides the caching policy the
+ * proxy would otherwise apply; and `content-length` is the dangerous one — see below.
+ */
+export const DOCUMENT_RESPONSE_HEADERS = [
   "content-disposition",
   "cache-control",
   "content-length",
   "x-content-type-options",
 ] as const;
+
+/**
+ * Which response headers this path may carry, given what the backend actually answered.
+ *
+ * `content-length` is dropped whenever the response is ENCODED. The header the backend sent
+ * counts the bytes it produced; if anything between here and the browser compresses the body, the
+ * number is a lie about the bytes on the wire — and a lying `Content-Length` is not a cosmetic
+ * problem, it truncates the download at whatever byte the wrong number names. `undici` also
+ * refuses to re-send it beside a `content-encoding` it did not produce. The browser is perfectly
+ * happy with a chunked response and no length; it is not happy with a wrong one.
+ */
+export function forwardedResponseHeaders(
+  joinedPath: string,
+  headers: { get(name: string): string | null },
+): readonly string[] {
+  if (!isDocumentDownloadPath(joinedPath)) return FORWARDED_RESPONSE_HEADERS;
+  const encoded = Boolean(headers.get("content-encoding"));
+  return [
+    ...FORWARDED_RESPONSE_HEADERS,
+    ...DOCUMENT_RESPONSE_HEADERS.filter((h) => !(encoded && h === "content-length")),
+  ];
+}
+
+/** `entities/<id>/documents/<docId>` — the bytes route, and only it. The INDEX route above it
+ *  returns JSON and needs none of the four. */
+export function isDocumentDownloadPath(joinedPath: string): boolean {
+  return /^entities\/[^/]+\/documents\/[^/]+$/.test(joinedPath);
+}
 
 /**
  * Paths whose responses must never be cached by anything between the backend and the browser.

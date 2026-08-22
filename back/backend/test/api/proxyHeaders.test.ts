@@ -48,9 +48,12 @@ test("the interface's proxy-header module is where this guard expects it", () =>
   expect(existsSync(PROXY_ROUTE), PROXY_ROUTE).toBe(true);
 });
 
-test("the response allowlist carries everything a document download needs", () => {
+test("C9: the document headers are their OWN list, scoped to the download", () => {
   const s = source();
-  const list = s.slice(s.indexOf("FORWARDED_RESPONSE_HEADERS"), s.indexOf("isNoStorePath"));
+  const docs = s.slice(
+    s.indexOf("export const DOCUMENT_RESPONSE_HEADERS"),
+    s.indexOf("export function forwardedResponseHeaders"),
+  );
   for (const h of [
     // Without it the browser has no filename.
     "content-disposition",
@@ -60,14 +63,48 @@ test("the response allowlist carries everything a document download needs", () =
     "content-length",
     // Without it the browser is free to sniff a type of its own.
     "x-content-type-options",
-    // The ones that were already there and must not be lost in the refactor.
+  ])
+    expect(docs, h).toContain(`"${h}"`);
+
+  // …and NOT on the global list, where three of them are not inert: a `content-disposition` on a
+  // JSON response turns an API call into a file save, and a backend `cache-control` echoed onto
+  // every route silently overrides the policy the proxy would otherwise apply.
+  const global = s.slice(
+    s.indexOf("export const FORWARDED_RESPONSE_HEADERS"),
+    s.indexOf("export const DOCUMENT_RESPONSE_HEADERS"),
+  );
+  for (const h of ["content-disposition", "cache-control", "content-length", "x-content-type-options"])
+    expect(global, h).not.toContain(`"${h}"`);
+
+  // The ones that were already global and must not be lost in the split.
+  for (const h of [
     "content-type",
     "mcp-session-id",
     "x-payment-response",
     "x-agentkit-human",
     "x-agentkit-authorization",
   ])
-    expect(list, h).toContain(`"${h}"`);
+    expect(global, h).toContain(`"${h}"`);
+});
+
+test("C9: content-length is never forwarded beside a content-encoding", () => {
+  // The backend's byte count describes the bytes IT produced. If anything between the proxy and
+  // the browser compresses the body, that number is a lie about the bytes on the wire — and a
+  // lying Content-Length truncates the download at whatever byte the wrong number names.
+  const fn = source().slice(source().indexOf("export function forwardedResponseHeaders"));
+  expect(fn).toContain("content-encoding");
+  expect(fn).toContain("content-length");
+  // The gate is on the DOWNLOAD path, so every other route keeps the previous out-header set.
+  expect(fn).toContain("isDocumentDownloadPath");
+  expect(fn).toContain("return FORWARDED_RESPONSE_HEADERS");
+});
+
+test("C9: only the BYTES route is a document-download path, not the JSON index above it", () => {
+  const s = source();
+  const fn = s.slice(s.indexOf("export function isDocumentDownloadPath"));
+  // Two path segments after `documents`, not one: the index route returns JSON and needs none of
+  // the four headers.
+  expect(fn).toContain("documents\\/[^/]+$");
 });
 
 test("the request allowlist still carries what the non-browser protocols need", () => {
@@ -107,7 +144,10 @@ test("the document paths are in the no-store branch", () => {
 test("the route file uses the allowlists rather than a second copy of them", () => {
   const route = readFileSync(PROXY_ROUTE, "utf8");
   expect(route).toContain("FORWARDED_REQUEST_HEADERS");
-  expect(route).toContain("FORWARDED_RESPONSE_HEADERS");
+  // The RESOLVER, not the raw list: which headers cross now depends on the route and on what the
+  // backend answered, and a route that read the constant directly would forward the four
+  // download headers everywhere again.
+  expect(route).toContain("forwardedResponseHeaders(joined, res.headers)");
   expect(route).toContain("isNoStorePath");
   // A route that re-declared its own array would drift the moment one of them was edited.
   expect(route).not.toMatch(/const\s+forwarded\s*=\s*\[/);
@@ -128,7 +168,7 @@ test("an unlisted header is dropped in both directions", () => {
     return [...body.matchAll(/"([a-z0-9-]+)"/g)].map((m) => m[1]);
   };
   const req = parse("FORWARDED_REQUEST_HEADERS");
-  const res = parse("FORWARDED_RESPONSE_HEADERS");
+  const res = [...parse("FORWARDED_RESPONSE_HEADERS"), ...parse("DOCUMENT_RESPONSE_HEADERS")];
   expect(req.length).toBeGreaterThan(0);
   expect(res.length).toBeGreaterThan(0);
 

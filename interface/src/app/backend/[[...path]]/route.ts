@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server";
 import {
   FORWARDED_REQUEST_HEADERS,
-  FORWARDED_RESPONSE_HEADERS,
+  forwardedResponseHeaders,
   isNoStorePath,
 } from "../../../lib/proxyHeaders";
 
@@ -45,15 +45,20 @@ async function proxy(
 
   const res = await fetch(url, init);
 
+  // Which headers may cross depends on the ROUTE and on what the backend actually answered (C9):
+  // the four download headers are forwarded only for the document bytes route, and
+  // `content-length` is dropped whenever the response is encoded, because the backend's byte
+  // count would then be a lie about the bytes on the wire — and a lying Content-Length truncates
+  // the download rather than merely annoying the browser.
+  const joined = path?.join("/") ?? "";
   const outHeaders: Record<string, string> = {};
-  for (const name of FORWARDED_RESPONSE_HEADERS) {
+  for (const name of forwardedResponseHeaders(joined, res.headers)) {
     const v = res.headers.get(name);
     if (v) outHeaders[name] = v;
   }
   // The second lock. The backend already sets `private, no-store` on these responses; this is the
   // proxy refusing to let an intermediary decide otherwise, and it OVERRIDES whatever the
   // forwarding loop above copied.
-  const joined = path?.join("/") ?? "";
   if (isNoStorePath(joined)) {
     outHeaders["cache-control"] = "no-store";
   }
