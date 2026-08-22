@@ -4,6 +4,7 @@ import { loadConfig } from "../../src/config/env";
 import { resolveFormationDeployment } from "../../src/formation";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
+import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
 import type { AgentSpec } from "../../src/policy/agentSpec";
 import { usdToUnits } from "../../src/policy/units";
 import type { EntityRecord } from "../../src/types";
@@ -467,41 +468,62 @@ test("fund() refuses when the S5 platform outflow ceiling is reached (after per-
 
 // ── Formation pinning at the claim (design §2, review C1) ───────────────────────────────────
 
-test("C1: the claim pins EXACTLY the deployment's resolved formation value", () => {
+/** A parties repository over the test db, plus one unbound party belonging to TENANT. */
+function partyFixture() {
+  const parties = new SqliteFormationPartyRepository(db);
+  const partyId = parties.create({
+    tenantId: TENANT,
+    legalFirstName: "Ada",
+    legalLastName: "Lovelace",
+    email: "ada@example.com",
+    phone: "+12125550100",
+    line1: "1 Analytical Way",
+    line2: null,
+    city: "Cheyenne",
+    region: "WY",
+    postalCode: "82001",
+    country: "USA",
+    synthetic: false,
+  });
+  return { parties, partyId };
+}
+
+const doolaCfg = (over: Record<string, string> = {}) =>
+  loadConfig({ ...CFG_BASE, DOOLA_API_KEY: "dk", DOOLA_WEBHOOK_SECRET: "whsec", ...over });
+
+test("C5: the claim pins the deployment's resolved value — WITH the party, in one transaction", () => {
+  const { parties, partyId } = partyFixture();
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
-    formation: resolveFormationDeployment(
-      loadConfig({ ...CFG_BASE, DOOLA_API_KEY: "dk", DOOLA_WEBHOOK_SECRET: "whsec" }),
-    ),
+    formation: resolveFormationDeployment(doolaCfg()),
+    parties,
   });
   const { id } = runner.start({
     spec,
     userKey: "pin-1",
     tenantId: TENANT,
     guardianPasskey: passkey,
+    partyId,
   });
   const rec = repo.findByIdempotencyKey(id)!;
   expect(rec.formationProvider).toBe("doola");
   expect(rec.formationEnvironment).toBe("sandbox");
+  // Pin and bind are ONE fact: an entity that owes a filing always has an identity to file with.
+  expect(parties.findByEntityKey(id)?.partyId).toBe(partyId);
 });
 
-test("C1: FORMATION_REQUIRED=false pins NOTHING, even with the credentials present", () => {
-  // Credentials configured but formation switched off: those entities are stub entities forever,
-  // and a pinned provider that will never file for them would be a claim the row cannot keep.
+test("C5: no partyId pins NOTHING, even with the credentials present and formation REQUIRED", () => {
+  // The wizard's shape today. The door is what refuses a party-less onboard where formation is
+  // mandatory; the CLAIM's job is only to never pin an entity it cannot file for.
+  const { parties } = partyFixture();
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
-    formation: resolveFormationDeployment(
-      loadConfig({
-        ...CFG_BASE,
-        DOOLA_API_KEY: "dk",
-        DOOLA_WEBHOOK_SECRET: "whsec",
-        FORMATION_REQUIRED: "false",
-      }),
-    ),
+    formation: resolveFormationDeployment(doolaCfg()),
+    parties,
   });
   const { id } = runner.start({
     spec,
@@ -514,18 +536,48 @@ test("C1: FORMATION_REQUIRED=false pins NOTHING, even with the credentials prese
   expect(rec.formationEnvironment).toBeNull();
 });
 
+test("C5: FORMATION_REQUIRED=false still pins and files an onboard that CARRIES a party", () => {
+  // ⚠ Supersedes PR 2 decision #2. `required` decides whether the door refuses a party-less
+  // onboard — it does NOT decide whether a supplied party is honoured. Dropping one silently was
+  // the bug: a caller posted a real legal identity, handed over its handle, and got a stub.
+  const { parties, partyId } = partyFixture();
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: resolveFormationDeployment(doolaCfg({ FORMATION_REQUIRED: "false" })),
+    parties,
+  });
+  const { id } = runner.start({
+    spec,
+    userKey: "pin-4",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    partyId,
+  });
+  const rec = repo.findByIdempotencyKey(id)!;
+  expect(rec.formationProvider).toBe("doola");
+  expect(rec.formationEnvironment).toBe("sandbox");
+});
+
 test("C1: a credential-less deployment pins nothing — the stub shape, unchanged", () => {
+  const { parties, partyId } = partyFixture();
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
     formation: resolveFormationDeployment(loadConfig(CFG_BASE)),
+    parties,
   });
   const { id } = runner.start({
     spec,
     userKey: "pin-3",
     tenantId: TENANT,
     guardianPasskey: passkey,
+    partyId,
   });
+  // Even with a party: there is no provider to pin to, so the row is a stub and the party stays
+  // bound to an entity nothing will ever file. The door refuses this combination up front
+  // (`formationUnavailableMessage`); this is what the claim does if it ever gets past it.
   expect(repo.findByIdempotencyKey(id)?.formationProvider).toBeNull();
 });

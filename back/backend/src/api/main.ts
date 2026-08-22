@@ -70,7 +70,7 @@ import { usdToUnits } from "../policy/units";
 import type { Address } from "../types";
 import { TaskTracker } from "../util/taskTracker";
 import { processDoolaEvent } from "../workflow/formationProcessor";
-import { FormationSweeper, formationReconcile } from "../workflow/formationSweeper";
+import { FormationSweeper } from "../workflow/formationSweeper";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
@@ -302,6 +302,16 @@ async function main() {
     console.warn(
       `⚠ doola formation ENABLED (${cfg.doola!.environment}, required=${cfg.formation?.required})`,
     );
+  // C5. The opt-in shape, said out loud at boot. It is the shape the testnet box runs until the
+  // PR-4 wizard collects a legal identity, and it is easy to mistake for "formation is off": the
+  // credentials are loaded, the door advertises the capability, the receiver is mounted — and yet
+  // an onboard that carries no partyId files nothing at all, forever. An operator who expected
+  // every new entity to become a Wyoming LLC should learn that here, not from an empty
+  // `formation_requests` table a week later.
+  if (doolaApi && !cfg.formation?.required)
+    console.warn(
+      "⚠ FORMATION_REQUIRED=false — formation is AVAILABLE, not mandatory: an onboard is only pinned and filed when it carries a partyId, and the wizard does not send one yet (docs/runbooks/doola-deploy.md)",
+    );
 
   const runSaga: RunSaga = (i) =>
     runOnboarding({
@@ -325,16 +335,21 @@ async function main() {
       provisionCircle,
       circleSignerForEntity,
       derivePocketAddress,
-      formation: formationDeployment,
       anchors,
-      // The filing (Step 9). All four travel together: the client, the two repositories, and the
-      // DEPLOYMENT's environment — which is deliberately not `formationDeployment.environment`,
-      // because that one is null whenever FORMATION_REQUIRED is off, while an entity pinned
-      // earlier still owes its filing a correctly-routed call.
-      doola: doolaApi,
-      formationRequests,
-      formationParties,
-      doolaEnvironment: cfg.doola?.environment,
+      // Formation (Step 9) — the pin and the filer as ONE object (M3), so this root cannot hand
+      // the saga a provider to pin without also handing it the client and the repositories that
+      // would file for it. `environment` is the DEPLOYMENT's, deliberately separate from
+      // `pin.environment`: an entity pinned earlier still owes its filing a correctly-routed
+      // call, whatever the config has since become.
+      formation: doolaApi
+        ? {
+            pin: formationDeployment,
+            doola: doolaApi,
+            requests: formationRequests,
+            parties: formationParties,
+            environment: cfg.doola!.environment,
+          }
+        : undefined,
     });
 
   const runner = new OnboardingRunner({
@@ -356,6 +371,21 @@ async function main() {
   //
   // Every piece is gated on `doolaApi`, so a credential-less deployment mounts no receiver,
   // starts no timer, and reconciles nothing — the stub shape stays exactly as it was.
+  // ── The view dependencies (C8) ───────────────────────────────────────────────────────────
+  //
+  // Built ONCE and spread into `buildApiApp`, which hands the same object to the MCP server. The
+  // two surfaces used to be wired separately and the MCP one was missing the document index, so
+  // `get_entity` over MCP described an entity with no legal documents while `GET /entities/:id`
+  // described the same entity with two. Nothing errored; the agent surface was quietly less true.
+  //
+  // Always wired, credentials or not: these are plain SQL over the same database, not part of the
+  // doola capability, and an entity already filed must stay describable — and its PDFs
+  // downloadable — on a box that has since lost its doola block.
+  const entityViewDeps = {
+    formationSteps: (entityKey: string) => formationRequests.stepsOf(entityKey),
+    documents: formationDocuments,
+  };
+
   const doolaTasks = new TaskTracker("doola_webhook_task");
   const formationDeps = doolaApi && {
     repo,
@@ -370,14 +400,6 @@ async function main() {
     intervalMs: cfg.formation?.sweepMs ?? 60_000,
   };
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
-  if (formationSweeper) {
-    // Beside the two reconcilers above, and for the same reason — except that formation entities
-    // are `bound`/`funded` and therefore invisible to `listInFlight()`, so nothing else would
-    // ever pick up what a restart interrupted.
-    await formationReconcile(formationSweeper);
-    formationSweeper.start();
-    console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
-  }
 
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
   const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
@@ -481,12 +503,8 @@ async function main() {
           requests: formationRequests,
         }
       : undefined,
-    // Always wired, credentials or not: the rows are plain SQL, and an entity already filed must
-    // stay describable even on a box that has since lost its doola block. The document index is
-    // wired on the same terms and for the same reason — a filed entity's PDFs stay downloadable.
-    formationSteps: (entityKey: string) => formationRequests.stepsOf(entityKey),
-    formationDocuments: (entityKey: string) => formationDocuments.listByEntity(entityKey),
-    documents: formationDocuments,
+    // The view dependencies, as ONE object shared with the MCP surface below (C8).
+    ...entityViewDeps,
     // The inbound receiver (design §6). Present only with credentials: a box that cannot verify a
     // signature has no business owning the URL.
     doola:
@@ -529,6 +547,24 @@ async function main() {
   const port = Number(process.env.PORT ?? 8789);
   const server = serve({ fetch: app.fetch, port });
   console.log(`Wizard API listening on :${port}`);
+
+  // ── C4. The formation reconcile happens AFTER the socket is listening, never before it.
+  //
+  //    It used to be `await formationReconcile(sweeper)` up beside the other two reconcilers, and
+  //    that put doola on the boot path: the reconcile fetch-and-advances every in-flight entity,
+  //    each one a network round trip to a third party, before `serve()` was ever called. A doola
+  //    outage or a slow morning therefore delayed the port opening — so /healthz did not answer,
+  //    the load balancer marked the box down, and the deploy failed for a reason that has nothing
+  //    to do with whether this process can serve requests. A formation provider must never be
+  //    able to keep the API from starting.
+  //
+  //    `start()` runs its first loop iteration immediately, and that iteration IS the reconcile —
+  //    which is why there is no separate tick here any more: the duplicate would have doubled
+  //    every boot's doola traffic for nothing.
+  if (formationSweeper) {
+    formationSweeper.start();
+    console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
+  }
 
   // The API process's FIRST signal handlers (design §7). Until part B every unit of work was a
   // request, so a restart only dropped HTTP a client would retry; now the process also holds

@@ -186,7 +186,10 @@ test("ORDER: the party gate runs BEFORE the spend controls (most specific reason
   );
 });
 
-test("spend controls do NOT run when formation is not required (nothing will be filed)", () => {
+test("C5: spend controls key on the PARTY, not on `required` — an opt-in filing costs the same", () => {
+  // Supersedes PR 2 decision #2. A bound party is always pinned and always filed, so an opt-in
+  // formation on a `required=false` box spends the same $100–150 as a mandatory one and must
+  // count against the same limits. Keyed on `required`, that money was unmetered.
   pastFormation("k1", TENANT);
   pastFormation("k2", TENANT);
   pastFormation("k3", TENANT);
@@ -194,6 +197,18 @@ test("spend controls do NOT run when formation is not required (nothing will be 
     formationDoorRefusal(deps({ required: false, maxPerTenant: 1, dailyCeiling: 1 }), {
       tenantId: TENANT,
       partyId: newParty(),
+    }),
+  ).toMatch(/formation quota exhausted/);
+});
+
+test("C5: no party means no filing, so the controls do not run at all", () => {
+  // The wizard's shape today: no partyId, nothing pinned, nothing filed, nothing spent — and
+  // therefore nothing to refuse, however exhausted the quota is.
+  pastFormation("k1", TENANT);
+  pastFormation("k2", TENANT);
+  expect(
+    formationDoorRefusal(deps({ required: false, maxPerTenant: 1, dailyCeiling: 1 }), {
+      tenantId: TENANT,
     }),
   ).toBeNull();
 });

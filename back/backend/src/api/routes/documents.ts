@@ -29,7 +29,7 @@ export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
     const rec = requireOwnedEntity(deps, c);
     // No lookup wired (a deployment that has never formed anything) reads as "no documents",
     // which is the truth, rather than as an error.
-    const docs = deps.formationDocuments?.(rec.idempotencyKey) ?? [];
+    const docs = deps.documents?.listByEntity(rec.idempotencyKey) ?? [];
     return c.json({
       // The SAME projection the entity view renders (M4) — `sha256` is the hash a verifier
       // re-computes from the bytes below, and from PR 3 the one the OA bundle manifest commits

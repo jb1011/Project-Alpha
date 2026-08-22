@@ -25,9 +25,19 @@ import { mountTreasuryRoutes } from "./routes/treasury";
 import { mountTrustPolicyRoutes } from "./routes/trustPolicy";
 import { mountWorldIdRoutes } from "./routes/worldId";
 import { mountX402DemoRoutes } from "./routes/x402Demo";
+import type { EntityViewDeps } from "./views";
 
-/** Dependencies for the REST API. Extended by later tasks (auth/onboard routes). */
-export interface ApiDeps {
+/**
+ * Dependencies for the REST API.
+ *
+ * It EXTENDS `EntityViewDeps` (C8) rather than restating its fields: the same object is handed to
+ * `buildMcpServer`, so a view dependency cannot exist on one surface and not the other. Both of
+ * those fields are wired on any box that ever formed anything — they are plain SQL over the same
+ * database, not part of the `formation` CAPABILITY — because a deployment that has lost its doola
+ * credentials must still be able to describe and serve the entities it already filed, rather than
+ * report them as unformed.
+ */
+export interface ApiDeps extends EntityViewDeps {
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
@@ -91,22 +101,7 @@ export interface ApiDeps {
     parties: import("../persistence/formationPartyRepository").FormationPartyRepository;
     requests: import("../persistence/formationRepository").FormationRepository;
   };
-  /**
-   * How every view learns a record's formation progress (design §5/§8).
-   *
-   * A TOP-LEVEL dep, not part of `formation`, and deliberately so: `formation` is the
-   * CAPABILITY — it exists only where doola is configured — whereas the sub-saga rows are plain
-   * SQL over the same database and exist on any box that ever formed anything. A deployment
-   * that lost its doola credentials must still be able to describe the entities it already
-   * filed, rather than report them as unformed.
-   */
-  formationSteps?: import("./views").FormationStepsLookup;
-  /** How a view learns which legal documents an entity has. Wired on the same terms as
-   *  `formationSteps` — plain SQL, no credentials needed — so a box that has lost its doola block
-   *  can still list and serve the PDFs it already fetched. */
-  formationDocuments?: import("./views").FormationDocumentsLookup;
-  /** The document index itself, for the download route's ownership re-assertion. */
-  documents?: import("../persistence/documentIndexRepository").DocumentIndexRepository;
+
   /**
    * The inbound doola webhook receiver (design §6). Present only where the doola block is
    * configured — a credential-less deployment has NO such route, which is the honest answer for a

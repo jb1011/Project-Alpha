@@ -5,7 +5,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
-import { toEntityView } from "../api/views";
+import { type EntityViewDeps, toEntityView } from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
 import {
   createFormationParty,
@@ -26,7 +26,16 @@ import { usdToUnits } from "../policy/units";
 import type { OnboardingRunner } from "../workflow/runner";
 import { entityInScope, hasCapability } from "./scope";
 
-export interface McpToolDeps {
+/**
+ * What the MCP tools need.
+ *
+ * The view dependencies are INHERITED from `EntityViewDeps` (C8), the same object `ApiDeps`
+ * extends and the composition root builds once. They used to be two optional fields restated
+ * here, and the transport passed one and forgot the other — so `get_entity` over MCP reported an
+ * entity with no legal documents while REST reported the same entity with two. Inheriting the
+ * object is what makes "wired on one surface only" unrepresentable rather than merely unlikely.
+ */
+export interface McpToolDeps extends EntityViewDeps {
   repo: EntityRepository;
   runner: OnboardingRunner;
   passkeys: PasskeyStore;
@@ -67,12 +76,6 @@ export interface McpToolDeps {
    *  requirement, the PII intake policy, the spend limits and the two repositories. Absent =
    *  this deployment forms nothing, and neither the tool nor the gate exists. */
   formation?: import("../api/app").ApiDeps["formation"];
-  /** Formation progress for the read tools' views — the same top-level dep ApiDeps carries, and
-   *  present independently of `formation` for the same reason. */
-  formationSteps?: import("../api/views").FormationStepsLookup;
-  /** The legal documents behind the same views. An agent reading its own entity sees the hashes
-   *  and can fetch the bytes over REST; the MCP surface never carries them inline. */
-  formationDocuments?: import("../api/views").FormationDocumentsLookup;
 }
 
 /**
@@ -140,9 +143,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       // attempt fails uniformly and never burns the owner's code).
       if (!deps.linkCodes.consume(scope.tenantId, linkCode, Date.now()))
         return { content: [{ type: "text", text: "invalid or expired link code" }], isError: true };
-      const entities = repo
-        .listByTenant(scope.tenantId)
-        .map((r) => toEntityView(r, deps.formationSteps, deps.formationDocuments));
+      const entities = repo.listByTenant(scope.tenantId).map((r) => toEntityView(r, deps));
       return {
         content: [
           {
@@ -180,7 +181,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       const views = repo
         .listByTenant(tenantId)
         .filter((e) => entityInScope(scope, e.idempotencyKey)) // an entity-scoped key lists only its entity
-        .map((r) => toEntityView(r, deps.formationSteps, deps.formationDocuments));
+        .map((r) => toEntityView(r, deps));
       return { content: [{ type: "text", text: JSON.stringify(views) }] };
     },
   );
@@ -200,7 +201,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         content: [
           {
             type: "text",
-            text: JSON.stringify(toEntityView(rec, deps.formationSteps, deps.formationDocuments)),
+            text: JSON.stringify(toEntityView(rec, deps)),
           },
         ],
       };

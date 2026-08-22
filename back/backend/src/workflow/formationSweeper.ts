@@ -166,7 +166,8 @@ export class FormationSweeper {
     this.timer = undefined;
   }
 
-  /** One pass. Safe to call directly — that is what `formationReconcile` does at boot. */
+  /** One pass. Safe to call directly — `start()` calls it immediately, and that first call is
+   *  the boot reconcile (C4). */
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
@@ -560,16 +561,19 @@ export class FormationSweeper {
 }
 
 /**
- * One synchronous pass at boot, beside the two existing reconcilers in `api/main.ts`.
+ * The boot reconcile is `start()` itself (C4).
  *
- * Formation entities are `bound`/`funded` and therefore invisible to `listInFlight()` — the
- * onboarding reconciler will never look at them. Without this, everything a restart interrupted
- * would wait a full sweep interval, and everything a crash interrupted would wait until someone
- * noticed.
+ * There used to be a `formationReconcile(sweeper)` helper, awaited in `api/main.ts` BEFORE
+ * `serve()`. That put a third party on the boot path: the reconcile fetch-and-advances every
+ * in-flight entity, so a doola outage delayed the port opening, /healthz did not answer, and the
+ * deploy failed for a reason unrelated to whether the process could serve requests.
+ *
+ * `start()` runs its first loop iteration immediately, and that iteration IS the reconcile — the
+ * helper was a duplicate of it, and awaiting it doubled every boot's doola traffic. Formation
+ * entities are `bound`/`funded` and therefore invisible to `listInFlight()`, so this remains the
+ * only thing that picks up what a restart interrupted; it simply does so a few milliseconds after
+ * the socket is listening rather than before.
  */
-export async function formationReconcile(sweeper: FormationSweeper): Promise<void> {
-  await sweeper.tick();
-}
 
 /** Steps the sweeper retries. Exported for the tests that enumerate them. */
 export const RETRYABLE_STEPS: readonly FormationStep[] = [

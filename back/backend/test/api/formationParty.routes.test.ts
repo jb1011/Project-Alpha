@@ -85,6 +85,9 @@ function makeApp(
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
     parties,
+    // What this deployment WOULD pin to. Whether an entity takes it is decided by the claim,
+    // which pins iff a party is bound (C5) — never by `required`.
+    formation: formation ? { provider: "doola" as const, environment: "sandbox" as const } : null,
   });
   return buildApiApp({
     webOrigin: "*",
@@ -314,6 +317,33 @@ test("NOT required: onboard without a partyId succeeds (formation is opt-in ther
   const token = await login(app);
   const res = await post(app, "/onboard", token, { spec: SPEC, guardianPasskey: PASSKEY });
   expect(res.status).toBe(202);
+});
+
+test("C5: NOT required + a party — the entity is PINNED and the party is bound (opt-in filing)", async () => {
+  // ⚠ Supersedes PR 2 decision #2. A bound party is always pinned and always filed; `required`
+  // only decides whether the door refuses an onboard that carries no party. An MCP or REST
+  // caller can therefore opt in to formation on a box where the wizard does not.
+  const app = makeApp({ required: false });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const res = await post(app, "/onboard", token, { spec: SPEC, guardianPasskey: PASSKEY, partyId });
+  expect(res.status).toBe(202);
+  const { id } = await res.json();
+  const rec = repo.findByIdempotencyKey(id)!;
+  expect([rec.formationProvider, rec.formationEnvironment]).toEqual(["doola", "sandbox"]);
+  expect(parties.findByEntityKey(id)!.partyId).toBe(partyId);
+});
+
+test("C5: NOT required + the WIZARD's shape (no partyId) — 202, and nothing is pinned or filed", async () => {
+  // The testnet box's shape until the PR-4 wizard collects an identity. It must keep working
+  // exactly as it did before formation existed.
+  const app = makeApp({ required: false });
+  const token = await login(app);
+  const res = await post(app, "/onboard", token, { spec: SPEC, guardianPasskey: PASSKEY });
+  expect(res.status).toBe(202);
+  const { id } = await res.json();
+  const rec = repo.findByIdempotencyKey(id)!;
+  expect([rec.formationProvider, rec.formationEnvironment]).toEqual([null, null]);
 });
 
 test("ABSENT: a partyId sent to a deployment that forms nothing is refused, never ignored", async () => {

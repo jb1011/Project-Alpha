@@ -134,7 +134,7 @@ const step = (
 const formed = (steps: FormationRequestRecord[]) =>
   toEntityView(
     { ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" },
-    () => steps,
+    { formationSteps: () => steps },
   );
 
 test("status is DERIVED from the sub-saga rows, never stored", () => {
@@ -184,7 +184,12 @@ test("providerRef comes from the create_provider row; the legal facts come from 
       formationFiledAt: 1_755_600_000,
       formationFilingNumber: "2026-123456",
     },
-    () => [step("create_provider", "confirmed", "cmp_1"), step("await_ein", "confirmed")],
+    {
+      formationSteps: () => [
+        step("create_provider", "confirmed", "cmp_1"),
+        step("await_ein", "confirmed"),
+      ],
+    },
   );
   expect(v.formation).toEqual({
     provider: "doola",
@@ -246,20 +251,24 @@ test("a missing, malformed or empty detail blob yields no required actions", () 
 test("documents are projected as metadata with a DERIVED name, and never the storage path", () => {
   const v = toEntityView(
     { ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" },
-    () => [step("create_provider", "confirmed", "cmp-1")],
-    () => [
-      {
-        id: "abc123",
-        entityKey: BASE.idempotencyKey,
-        docType: "ArticlesOfOrganization",
-        sha256: "f".repeat(64),
-        contentType: "application/pdf",
-        size: 4096,
-        providerDocId: "doola-doc-1",
-        path: "/data/documents/doc-t-agent-1-ArticlesOfOrganization-doola-doc-1.pdf",
-        createdAt: "2026-08-21 12:00:00",
-      },
-    ],
+    {
+      formationSteps: () => [step("create_provider", "confirmed", "cmp-1")],
+      documents: {
+        listByEntity: () => [
+          {
+            id: "abc123",
+            entityKey: BASE.idempotencyKey,
+            docType: "ArticlesOfOrganization",
+            sha256: "f".repeat(64),
+            contentType: "application/pdf",
+            size: 4096,
+            providerDocId: "doola-doc-1",
+            path: "/data/documents/doc-t-agent-1-ArticlesOfOrganization-doola-doc-1.pdf",
+            createdAt: "2026-08-21 12:00:00",
+          },
+        ],
+      } as never,
+    },
   );
   expect(v.formation?.documents).toEqual([
     {

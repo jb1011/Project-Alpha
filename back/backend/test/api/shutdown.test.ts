@@ -5,6 +5,8 @@
  * test runner down. That is also the reason `shouldInstallSignalHandlers` exists at all: a
  * handler that called `process.exit` under vitest would turn a Ctrl-C into a confusing half-exit.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { expect, test } from "vitest";
 import {
   SHUTDOWN_DRAIN_MS,
@@ -154,4 +156,31 @@ test("shutdown works with nothing wired at all (a credential-less deployment)", 
   });
   await shutdown("SIGINT");
   expect(exited).toBe(true);
+});
+
+/**
+ * C4: the boot ORDER, read off the composition root.
+ *
+ * `api/main.ts` has no injectable seam for its own startup sequence, and giving it one to test a
+ * three-line ordering would be a worse trade than reading the file. What is being protected is
+ * concrete: the formation reconcile used to be `await`ed BEFORE `serve()`, which put a third
+ * party on the boot path — the reconcile fetch-and-advances every in-flight entity, so a doola
+ * outage delayed the port opening, /healthz did not answer, and the deploy failed for a reason
+ * that has nothing to do with whether this process can serve requests.
+ */
+test("C4: the sweeper starts AFTER serve(), and nothing awaits a reconcile before it", () => {
+  const main = readFileSync(join(import.meta.dirname, "..", "..", "src", "api", "main.ts"), "utf8");
+  const serveAt = main.indexOf("serve({ fetch: app.fetch");
+  const startAt = main.indexOf("formationSweeper.start()");
+  expect(serveAt, "serve() call not found — this guard has stopped guarding").toBeGreaterThan(0);
+  expect(startAt, "sweeper start not found").toBeGreaterThan(0);
+  expect(startAt).toBeGreaterThan(serveAt);
+
+  // The helper that used to be awaited at boot is gone entirely: `start()` runs its first loop
+  // iteration immediately, and THAT iteration is the reconcile. Keeping both doubled every
+  // boot's doola traffic for nothing. (Its name survives only in the comment explaining why.)
+  expect(main).not.toMatch(/^\s*await formationReconcile/m);
+  expect(main).not.toMatch(/import .*formationReconcile/);
+  // And nothing else may await the sweeper on the way up.
+  expect(main).not.toMatch(/await\s+formationSweeper/);
 });

@@ -38,7 +38,12 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       arc: deps.arc,
       worldId: deps.worldId,
       formation: deps.formation,
+      // The view dependencies, taken from the SAME object the REST routes read (C8). This line
+      // used to name them one by one and forgot the document index, so `get_entity` over MCP
+      // described an entity with no legal documents while REST described the same entity with
+      // two. `EntityViewDeps` is now inherited by both dep types, so the pick cannot be partial.
       formationSteps: deps.formationSteps,
+      documents: deps.documents,
       ens: deps.ens
         ? {
             parentName: deps.ens.parentName,

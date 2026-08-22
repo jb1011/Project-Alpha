@@ -7,7 +7,7 @@
  * scenarios.
  */
 import type Database from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { sqliteUtcTimestamp } from "../../src/formation";
 import { deriveFormationStatus } from "../../src/formation/status";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -24,7 +24,6 @@ import {
   POLL_BASE_MS,
   POLL_CAP_MS,
   SUBMITTED_STALL_MS,
-  formationReconcile,
   parseSqliteUtc,
   retryDelayMs,
 } from "../../src/workflow/formationSweeper";
@@ -613,9 +612,13 @@ test("a throwing tick never stops the loop from being scheduled again", async ()
   expect(true).toBe(true);
 });
 
-test("formationReconcile is one synchronous pass — what a restart owes at boot", async () => {
+test("C4: start() reconciles on its FIRST iteration, and returns before it finishes", async () => {
   // Formation entities are `bound`/`funded`, so `listInFlight()` will never look at them: without
-  // this, everything a restart interrupted would wait a whole sweep interval.
+  // this pass, everything a restart interrupted would wait a whole sweep interval.
+  //
+  // It is also why `start()` must not be awaited at boot: the reconcile talks to doola for every
+  // in-flight entity, and a provider outage must never be able to delay the API's port from
+  // opening. `start()` is synchronous by construction — it schedules, it does not block.
   seedFormation();
   doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
   doola.state.documents = [
@@ -629,10 +632,16 @@ test("formationReconcile is one synchronous pass — what a restart owes at boot
     payload: "{}",
   });
 
-  await formationReconcile(sweeper());
-  expect(stateOf("await_filing")).toBe("confirmed");
+  const s = sweeper();
+  // Nothing is awaited here — this is exactly what the composition root does after `serve()`.
+  s.start();
+  expect(stateOf("await_filing")).toBe("pending"); // still going: start() did not block
+
+  // …and the work happens on its own.
+  await vi.waitFor(() => expect(stateOf("await_filing")).toBe("confirmed"));
   expect(stateOf("fetch_documents")).toBe("confirmed");
   expect(events.find("evt-1")?.processedAt).not.toBeNull();
+  s.stop();
 });
 
 test("a sweeper tick and a concurrent driver advance one entity EXACTLY once", async () => {

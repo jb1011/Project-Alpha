@@ -100,33 +100,45 @@ export interface OnboardingDeps {
    *  Real = privateKeyToAccount(derivePocketKey(seed, entityKey)).address. Circle-path pockets
    *  come from provisioning instead. */
   derivePocketAddress?: (entityKey: string) => string;
-  // ── doola formation (design 2026-08-19 §2/§5). PR 1 only PINS the provider on the record; the
-  //    filing itself is PR 2.
-  /** Formation provider + environment for a NEW record, from config. A resumed record's
-   *  persisted pair always wins — the custody-resolution twin: the environment an in-flight
-   *  entity was pinned to can never be re-pointed by a config flip (audit M5). Absent (no doola
-   *  credentials) = stub mode: `formation_provider` stays null, forever, and NOTHING else in the
-   *  saga changes. */
-  formation?: FormationPin | null;
+  /**
+   * doola formation (design §2/§5) — the pin AND the filer, as ONE object (M3).
+   *
+   * They used to be five independent optional fields (`formation`, `doola`, `formationRequests`,
+   * `formationParties`, `doolaEnvironment`), and a composition root could supply any subset. The
+   * dangerous subset is a PIN with no filer: the record claims a provider, the saga's Step 9
+   * silently does nothing because one of the other four is missing, and the entity is left
+   * pinned, owing a filing, with nothing in the process able to make it. One object makes that
+   * unrepresentable — you cannot pass a pin without also passing the client and the two
+   * repositories that act on it.
+   *
+   * Absent (no doola credentials) = stub mode: `formation_provider` stays null, forever, and
+   * NOTHING else in the saga changes.
+   */
+  formation?: {
+    /**
+     * What a NEW record is pinned to — WHEN a party is bound to it (C5). A resumed record's
+     * persisted pair always wins: the custody-resolution twin, so the environment an in-flight
+     * entity was pinned to can never be re-pointed by a config flip (audit M5).
+     */
+    pin: FormationPin | null;
+    /** The doola client. */
+    doola: DoolaApi;
+    /** The formation sub-saga rows (`formation_requests`). */
+    requests: FormationRepository;
+    /** The PII table. The saga reads the party bound to THIS entity, and nothing else. */
+    parties: FormationPartyRepository;
+    /**
+     * The environment this DEPLOYMENT is configured for — deliberately separate from `pin`, which
+     * is the per-claim value: the pinning refusal (audit M5) compares the two, and a deployment
+     * whose config has moved on still owes its in-flight rows a correctly-routed call.
+     */
+    environment: DoolaEnvironment;
+  };
   /** Anchor-cycle history (design §3/§7). OPTIONAL so every existing caller — and every test —
    *  builds unchanged; absent simply records no history. Production passes the sqlite repo over
    *  the SAME db handle as `repo`, which is what lets the v1 row commit inside the entity row's
    *  transaction rather than beside it. */
   anchors?: OaAnchorRepository;
-  // ── The filing itself (Step 9, design §5). All four are optional and all four must be present
-  //    for anything to happen: a deployment without doola credentials, and every existing test,
-  //    builds unchanged and files nothing.
-  /** The doola client. Absent = no filing, whatever the record is pinned to. */
-  doola?: DoolaApi;
-  /** The formation sub-saga rows (`formation_requests`). */
-  formationRequests?: FormationRepository;
-  /** The PII table. The saga reads the party bound to THIS entity, and nothing else. */
-  formationParties?: FormationPartyRepository;
-  /** The environment this DEPLOYMENT is configured for — deliberately separate from
-   *  `formation`, which is the per-claim pin: the pinning refusal (audit M5) compares the two,
-   *  and a deployment that has switched FORMATION_REQUIRED off still owes its in-flight rows a
-   *  correctly-routed call. */
-  doolaEnvironment?: DoolaEnvironment;
 }
 
 /**
@@ -194,10 +206,34 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   // PERSISTED provider/environment win — including legacy rows whose pair is null, which mean
   // "stub forever". Only a genuinely fresh record takes this deployment's configuration, so a
   // mainnet flip can never re-route an in-flight sandbox company at the production host.
-  const formationProvider = rec ? (rec.formationProvider ?? null) : (d.formation?.provider ?? null);
+  //
+  // A fresh record is pinned IFF a party is bound to its key (C5) — the same rule the runner's
+  // claim applies, restated here because the CLI and the legacy onboarding server reach this
+  // function without going through the runner at all.
+  const boundParty = d.formation?.parties.findByEntityKey(key);
+  const formationProvider = rec
+    ? (rec.formationProvider ?? null)
+    : boundParty
+      ? (d.formation?.pin?.provider ?? null)
+      : null;
   const formationEnvironment = rec
     ? (rec.formationEnvironment ?? null)
-    : (d.formation?.environment ?? null);
+    : boundParty
+      ? (d.formation?.pin?.environment ?? null)
+      : null;
+
+  // ── M3. A record that is PINNED but has no party bound can never be filed: Step 9 would burn
+  //    eight attempts on `no formation party is bound` and end in `abandoned`, which is the
+  //    verdict that erases personal data. It is a composition or door bug, and the honest place
+  //    to say so is here, at entry, before anything is provisioned or minted.
+  //
+  //    Scoped to a record that has not started yet. A record further along may legitimately have
+  //    lost its party — an abandoned formation's party IS erased — and a later `fund` call
+  //    re-enters this saga; failing that would turn one abandoned filing into a broken entity.
+  if (formationProvider === "doola" && !boundParty && (!rec || rec.status === "pending"))
+    throw new Error(
+      `entity ${key} is pinned to formation provider "doola" but no formation party is bound to it — it could never be filed (bind a party at the claim, or do not pin)`,
+    );
 
   // ── Step 0a (circle custody): provision the per-agent Circle wallets (SCA operator + EOA
   //    pocket) BEFORE minting — the SCA address IS the on-chain operator. No Turnkey sub-org on
@@ -680,23 +716,17 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   //    `runFormationCreateProvider` is non-throwing by construction; the catch is the last line
   //    of defense, and it is here because "formation never fails an onboarding" is a property
   //    worth being unable to break by accident.
-  if (
-    rec.formationProvider === "doola" &&
-    d.doola &&
-    d.formationRequests &&
-    d.formationParties &&
-    d.doolaEnvironment
-  ) {
+  if (rec.formationProvider === "doola" && d.formation) {
     try {
       await runFormationCreateProvider({
         entityKey: key,
         rec,
         spec: d.spec,
         repo: d.repo,
-        requests: d.formationRequests,
-        parties: d.formationParties,
-        doola: d.doola,
-        environment: d.doolaEnvironment,
+        requests: d.formation.requests,
+        parties: d.formation.parties,
+        doola: d.formation.doola,
+        environment: d.formation.environment,
       });
     } catch (e) {
       d.repo.recordEvent(

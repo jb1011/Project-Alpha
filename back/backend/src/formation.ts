@@ -5,15 +5,24 @@ import type { FormationPin } from "./types";
 import { sqliteUtcTimestamp } from "./util/sqliteTime";
 
 /**
- * The ONE resolution of "what does this deployment pin a NEW entity to?" (design §2/§5).
+ * The ONE resolution of "what CAN this deployment pin a new entity to?" (design §2/§5).
  *
- * Two conditions, both necessary:
- *  - the doola block is configured (`canFormEntities`) — nothing can be filed without it;
- *  - `FORMATION_REQUIRED` is on. A deployment that carries the credentials but has formation
- *    switched OFF must keep minting stub entities exactly as before, so the pin is null and
- *    `formation_provider` stays null forever on those rows. Pinning them anyway would leave the
- *    row claiming a provider that will never file for it — a lie the guardian surface would
- *    faithfully render.
+ * ONE condition: the doola block is configured (`canFormEntities`). Nothing can be filed without
+ * it, and with it, anything CAN be.
+ *
+ * ⚠ This supersedes PR 2's decision #2, which also required `FORMATION_REQUIRED`. The two flags
+ * were doing one job between them and the seam leaked: a deployment with the credentials and
+ * `required=false` resolved a null pin, so an entity onboarded WITH a partyId — a caller who had
+ * posted a real legal identity and handed over its handle — was minted unpinned and never filed,
+ * while their party sat bound to it. The identity was silently dropped, which is the failure the
+ * door's `formationUnavailableMessage` exists to prevent on the OTHER kind of deployment.
+ *
+ * The semantic that replaces it is one sentence: **a bound party is always pinned and always
+ * filed; `FORMATION_REQUIRED` decides only whether the door REFUSES an onboard that carries no
+ * party.** So the pin is per-CLAIM (`OnboardingRunner.start` writes it with the bind, in the same
+ * transaction) rather than per-deployment, and this function answers the narrower question of
+ * what that pin would be. A wizard that sends no partyId keeps working and files nothing, on
+ * every deployment; an MCP or REST caller can opt in by passing one.
  *
  * It lives OUTSIDE any composition root on purpose: the API, the CLI and the legacy onboarding
  * server all mint entities, and three copies of this rule is three ways for the doors to
@@ -23,7 +32,7 @@ import { sqliteUtcTimestamp } from "./util/sqliteTime";
 export function resolveFormationDeployment(
   cfg: Pick<Config, "doola" | "formation">,
 ): FormationPin | null {
-  if (!canFormEntities(cfg) || !cfg.formation?.required) return null;
+  if (!canFormEntities(cfg)) return null;
   // canFormEntities is exactly "cfg.doola is present", so the non-null assertion holds by the
   // guard above; the predicate is shared so the two can never drift.
   return { provider: "doola", environment: cfg.doola!.environment };
@@ -171,9 +180,11 @@ export function formationDoorRefusal(
   }
 
   // 4. Spend controls, only when a filing will ACTUALLY be initiated for this entity — which is
-  //    exactly when formation is required (`resolveFormationDeployment` pins nothing otherwise,
-  //    so an opt-in party on a non-required deployment costs no money and burns no quota).
-  if (!f.required) return null;
+  //    exactly when a party is bound to it, on EVERY deployment (the opt-in semantic: a bound
+  //    party is always pinned and always filed). Keyed on the partyId rather than on `required`,
+  //    because an opt-in filing on a `required=false` box costs the same $100–150 as a mandatory
+  //    one and must count against the same limits.
+  if (!input.partyId) return null;
 
   const used = f.requests.createRequestsByTenant(input.tenantId);
   if (used >= f.maxPerTenant) {

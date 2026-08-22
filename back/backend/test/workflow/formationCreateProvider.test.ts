@@ -25,7 +25,11 @@ import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import type { AgentSpec } from "../../src/policy/agentSpec";
-import type { CreateProviderDetail } from "../../src/workflow/formationProvider";
+import {
+  type CreateProviderDetail,
+  noFormationPartyError,
+  runFormationCreateProvider,
+} from "../../src/workflow/formationProvider";
 import { runOnboarding } from "../../src/workflow/onboarding";
 
 const TENANT = "0x000000000000000000000000000000000000000A";
@@ -165,11 +169,15 @@ function baseDeps(
     ownerTenantId: TENANT,
     specJson: JSON.stringify(spec),
     metadataBaseUrl: "https://host.example/backend",
-    formation: { provider: "doola" as const, environment: "sandbox" as const },
-    doola,
-    formationRequests: requests,
-    formationParties: parties,
-    doolaEnvironment: environment,
+    // The pin and the filer as ONE object (M3): a root cannot hand the saga a provider to pin
+    // without also handing it the client and the repositories that would file for it.
+    formation: {
+      pin: { provider: "doola" as const, environment: "sandbox" as const },
+      doola,
+      requests,
+      parties,
+      environment,
+    },
   };
 }
 
@@ -355,10 +363,81 @@ test("ENVIRONMENT PINNING (M5): a sandbox-pinned entity is never routed at produ
   expect(calls).toHaveLength(0); // not one call — the refusal is BEFORE the network
 });
 
-test("no bound party: refused with a named error, and doola is never called", async () => {
+test("C5: no bound party means the record is never PINNED, so nothing is opened or called", async () => {
   const { api, calls } = makeFakeDoola(); // no bindParty()
-  await runOnboarding(baseDeps(makeFakeArc(), api));
-  expect(requests.find(KEY, "create_provider")!.error).toMatch(/no formation party is bound/);
+  const rec = await runOnboarding(baseDeps(makeFakeArc(), api));
+  // A wizard-shaped onboard: no legal identity, so no pin, no rows, no filing — on a deployment
+  // that is fully wired for doola. That is the opt-in semantic (C5).
+  expect([rec.formationProvider, rec.formationEnvironment]).toEqual([null, null]);
+  expect(requests.stepsOf(KEY)).toHaveLength(0);
+  expect(calls).toHaveLength(0);
+});
+
+test("M3: a PINNED record with no party is refused at entry, before anything is provisioned", async () => {
+  // The composition/door bug the pin-with-the-bind rule exists to prevent. Reached here by
+  // writing the pin without a party, which is what a root that got it wrong would do.
+  repo.claimKey({
+    idempotencyKey: KEY,
+    name: spec.name,
+    status: "pending",
+    manager: spec.roles.manager as `0x${string}`,
+    guardian: spec.roles.guardian as `0x${string}`,
+    operator: null,
+    amendmentDelay: "0",
+    ein: "",
+    formationDate: 0,
+    oaHash: null,
+    metadataURI: null,
+    docPath: null,
+    treasuryConfig: null,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: TENANT,
+    error: null,
+    specJson: JSON.stringify(spec),
+    formationProvider: "doola",
+    formationEnvironment: "sandbox",
+  });
+  const { api, calls } = makeFakeDoola();
+  await expect(runOnboarding(baseDeps(makeFakeArc(), api))).rejects.toThrow(
+    /pinned to formation provider "doola" but no formation party is bound/,
+  );
+  // Nothing was provisioned, nothing was minted, and doola was never told about any of it.
+  expect(calls).toHaveLength(0);
+  expect(requests.stepsOf(KEY)).toHaveLength(0);
+});
+
+test("the create step itself still refuses a partyless row — belt and braces for the sweeper", async () => {
+  // The SWEEPER can reach a pinned row whose party was erased (an abandoned filing erases it), so
+  // the step keeps its own named refusal even though the saga can no longer arrive here.
+  bindParty();
+  const first = makeFakeDoola();
+  await runOnboarding(baseDeps(makeFakeArc(), first.api));
+  // Erase the party and re-open the step, which is the shape the sweeper would retry.
+  db.prepare(
+    "UPDATE formation_parties SET deleted_at = CURRENT_TIMESTAMP WHERE entity_key = ?",
+  ).run(KEY);
+  db.prepare(
+    "UPDATE formation_requests SET state='pending', provider_ref=NULL, detail=NULL WHERE entity_key=? AND step='create_provider'",
+  ).run(KEY);
+
+  const { api, calls } = makeFakeDoola();
+  const rec = repo.findByIdempotencyKey(KEY)!;
+  await runFormationCreateProvider({
+    entityKey: KEY,
+    rec,
+    spec,
+    repo,
+    requests,
+    parties,
+    doola: api,
+    environment: "sandbox",
+  });
+  expect(requests.find(KEY, "create_provider")!.error).toMatch(noFormationPartyError());
   expect(calls).toHaveLength(0);
 });
 
@@ -373,9 +452,9 @@ test("a party with no phone is refused HERE, not by a body doola would 400", asy
 test("a legacy/stub entity files nothing at all", async () => {
   bindParty();
   const { api, calls } = makeFakeDoola();
-  // No `formation` pin: the row is a stub, forever, and the step does not run.
+  // No `formation` wiring at all: the row is a stub, forever, and the step does not run.
   const deps = baseDeps(makeFakeArc(), api);
-  await runOnboarding({ ...deps, formation: null });
+  await runOnboarding({ ...deps, formation: undefined });
   expect(calls).toHaveLength(0);
   expect(requests.stepsOf(KEY)).toHaveLength(0);
 });
@@ -383,7 +462,8 @@ test("a legacy/stub entity files nothing at all", async () => {
 test("a deployment with no doola client files nothing, whatever the pin says", async () => {
   bindParty();
   const arc = makeFakeArc();
-  await runOnboarding({ ...baseDeps(arc, makeFakeDoola().api), doola: undefined });
+  const base = baseDeps(arc, makeFakeDoola().api);
+  await runOnboarding({ ...base, formation: { ...base.formation, pin: null } });
   expect(requests.stepsOf(KEY)).toHaveLength(0);
 });
 

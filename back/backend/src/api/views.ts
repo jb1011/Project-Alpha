@@ -1,5 +1,9 @@
 import { type FormationStatus, type FormationSummary, formationSummary } from "../formation/status";
-import { type DocumentIndexRecord, documentFileName } from "../persistence/documentIndexRepository";
+import {
+  type DocumentIndexRecord,
+  type DocumentIndexRepository,
+  documentFileName,
+} from "../persistence/documentIndexRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
 import { usesManifestScheme } from "../workflow/onboarding";
@@ -8,8 +12,29 @@ import { usesManifestScheme } from "../workflow/onboarding";
  *  stays a pure projection and the caller decides where the rows come from. */
 export type FormationStepsLookup = (entityKey: string) => FormationRequestRecord[];
 
-/** The legal documents of one entity, for the same reason and on the same terms. */
-export type FormationDocumentsLookup = (entityKey: string) => DocumentIndexRecord[];
+/**
+ * Everything a view needs beyond the entity row itself (C8).
+ *
+ * ONE object, built once in the composition root and handed to BOTH surfaces. It used to be two
+ * independent optional fields plus a third for the download route, and the MCP transport passed
+ * one of them and forgot the other — so `get_entity` over MCP reported an entity with no legal
+ * documents while `GET /entities/:id` over REST reported the same entity with two. Nothing failed;
+ * the agent surface was simply, silently, less true than the browser one.
+ *
+ * As one object it cannot happen: there is no partial to pass.
+ */
+export interface EntityViewDeps {
+  /** How a view learns a record's formation progress (design §5/§8). A function rather than the
+   *  repository so the view stays a pure projection and the caller decides where the rows come
+   *  from. */
+  formationSteps?: FormationStepsLookup;
+  /**
+   * The document index. A repository rather than a lookup, because the download route needs
+   * `findOwned` from the SAME object — and a deployment that has one and not the other is the
+   * split this type exists to prevent.
+   */
+  documents?: DocumentIndexRepository;
+}
 
 /**
  * The formation projection itself lives in `src/formation/status.ts` — the sweeper needs it too,
@@ -114,21 +139,17 @@ export function toDocumentView(d: DocumentIndexRecord): DocumentView {
 /**
  * The single choke point for everything a tenant is told about an entity.
  *
- * `formationSteps` is optional so every pre-formation caller compiles unchanged; absent, a
- * record simply reports the status its own columns can prove, which is `none`.
+ * `deps` is optional so every pre-formation caller compiles unchanged; absent, a record simply
+ * reports the status its own columns can prove, which is `none`.
  */
-export function toEntityView(
-  r: EntityRecord,
-  formationSteps?: FormationStepsLookup,
-  formationDocuments?: FormationDocumentsLookup,
-): EntityView {
+export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): EntityView {
   // Read ONCE, and only for a row that is actually pinned. The projection asks three questions
   // of the same rows (status, provider ref, required actions), and calling the lookup per
   // question meant three queries per entity on every list response — while an UNPINNED row (every
   // legacy entity, every stub deployment) needs none of them at all, and the list routes are
   // mostly unpinned rows.
   const pinned = Boolean(r.formationProvider && r.formationEnvironment);
-  const steps = pinned ? (formationSteps?.(r.idempotencyKey) ?? []) : [];
+  const steps = pinned ? (deps.formationSteps?.(r.idempotencyKey) ?? []) : [];
   const summary = pinned ? formationSummary(r, steps) : null;
   return {
     id: r.idempotencyKey,
@@ -170,7 +191,7 @@ export function toEntityView(
           // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
           // mint and is never served as a legal fact.
           ein: r.einReal ?? null,
-          documents: (formationDocuments?.(r.idempotencyKey) ?? []).map(toDocumentView),
+          documents: (deps.documents?.listByEntity(r.idempotencyKey) ?? []).map(toDocumentView),
         }
       : null,
   };

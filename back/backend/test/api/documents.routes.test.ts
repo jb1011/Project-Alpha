@@ -47,7 +47,6 @@ function app() {
     docStore,
     documents,
     formationSteps: (k: string) => requests.stepsOf(k),
-    formationDocuments: (k: string) => documents.listByEntity(k),
   } as never);
 }
 
