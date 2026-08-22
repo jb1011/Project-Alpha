@@ -13,7 +13,11 @@
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ArcAdapter } from "../../src/adapters/arc/arcAdapter";
-import { type DoolaApi, DoolaApiError } from "../../src/adapters/doola/doolaClient";
+import {
+  type DoolaApi,
+  DoolaApiError,
+  DoolaTimeoutError,
+} from "../../src/adapters/doola/doolaClient";
 import type { OperatorSigner } from "../../src/adapters/turnkey/signer";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
@@ -207,10 +211,12 @@ test("files the company, claims all four steps, and confirms create_provider", a
     stored.formationFilingNumber ?? null,
   ]).toEqual([null, null, null]);
 
-  // Idempotency-Key on the two CREATES and nothing else, one key per attempt.
+  // Idempotency-Key on the two CREATES and nothing else — one key per attempt, and one per
+  // ENDPOINT (C1): two different bodies under one key is the shape that produces doola's own
+  // `E_IDEMPOTENCY_KEY_REUSED`, and it costs nothing to make it unrepresentable.
   expect(calls.map((c) => [c.method, c.idempotencyKey])).toEqual([
-    ["createCustomer", `formation:${KEY}:create_provider:0`],
-    ["createCompany", `formation:${KEY}:create_provider:0`],
+    ["createCustomer", `formation:${KEY}:create_provider:0:customer`],
+    ["createCompany", `formation:${KEY}:create_provider:0:company`],
   ]);
 });
 
@@ -311,9 +317,11 @@ test("NON-FATAL: doola throwing leaves funding and ENS untouched and the saga re
   const row = requests.find(KEY, "create_provider")!;
   expect(row.state).toBe("failed");
   expect(row.error).toMatch(/E_INTERNAL/);
-  // The attempt is BURNED: doola released the key, so a retry must derive a fresh one — reusing
-  // it with a corrected body returns 409 E_IDEMPOTENCY_KEY_REUSED (verified live).
-  expect(row.attempt).toBe(1);
+  // C1: the attempt is NOT burned. A 500 is not a verdict — doola may hold a committed company
+  // and the answer was simply lost. Bumping would rotate the idempotency key, and the retry
+  // would file a SECOND real Wyoming LLC.
+  expect(row.attempt).toBe(0);
+  expect(row.error).toMatch(/may have COMMITTED/);
   expect(repo.listEvents(KEY).some((e) => e.step === "formationCreate")).toBe(true);
 });
 
@@ -463,14 +471,15 @@ test("the lookup is skipped on a FIRST attempt — there is nothing to have lost
   expect(calls.map((c) => c.method)).toEqual(["createCustomer", "createCompany"]);
 });
 
-test("RETRY after a failure: the row re-enters `submitted`, so the company id is still persisted", async () => {
+test("RETRY after a REFUSAL: the row re-enters `submitted`, so the company id is still persisted", async () => {
   bindParty();
   const arc = makeFakeArc();
 
-  // First pass: the company create fails, the row parks in `failed`, the attempt is burned.
+  // First pass: doola REFUSES the body (a 4xx validation failure). That is a verdict — nothing
+  // committed and the key is released — so it is the one kind of failure that burns an attempt.
   const broken = makeFakeDoola({
     createCompany: vi.fn(async () => {
-      throw new DoolaApiError("E_INTERNAL", 500, "doola is down");
+      throw new DoolaApiError("E_VALIDATION_FAILED", 400, "one or more fields are invalid");
     }) as never,
   });
   await runOnboarding(baseDeps(arc, broken.api));
@@ -486,10 +495,10 @@ test("RETRY after a failure: the row re-enters `submitted`, so the company id is
   expect(row.state).toBe("confirmed");
   expect(row.providerRef).toBe(COMPANY);
   expect(row.error).toBeNull();
-  // A FRESH idempotency key: doola released the failed one, and reusing it with a different
+  // A FRESH idempotency key: doola released the refused one, and reusing it with a corrected
   // body returns 409 E_IDEMPOTENCY_KEY_REUSED (verified live).
   expect(fixed.calls.find((c) => c.method === "createCompany")!.idempotencyKey).toBe(
-    `formation:${KEY}:create_provider:1`,
+    `formation:${KEY}:create_provider:1:company`,
   );
   // The customer survived the failure, so the retry reuses it and looks first.
   expect(fixed.calls.map((c) => c.method)).toEqual(["listCompanies", "createCompany"]);
@@ -511,4 +520,167 @@ test("ADOPT wins over the body preconditions: a filed company is adopted even if
   await runOnboarding(baseDeps(arc, second.api));
   expect(second.calls.map((c) => c.method)).toEqual(["getCompany"]);
   expect(requests.find(KEY, "create_provider")!.state).toBe("confirmed");
+});
+
+// ── C1: a LOST answer must never become a second company ────────────────────────────────────
+//
+// The most expensive failure this integration can have. Behind `POST /companies` is a real
+// Wyoming LLC and a real fee, and the `Idempotency-Key` is the only thing standing between a
+// retry and a second one. Rotating that key is a CLAIM — "the last request definitely did not
+// commit" — and a timeout, a 5xx or a torn socket cannot make it.
+
+test("C1: a TIMEOUT on the company create parks the row WITHOUT burning the attempt", async () => {
+  bindParty();
+  const { api } = makeFakeDoola({
+    createCompany: vi.fn(async () => {
+      throw new DoolaTimeoutError("/v1/partner/companies", 30_000);
+    }) as never,
+  });
+  await runOnboarding(baseDeps(makeFakeArc(), api));
+
+  const row = requests.find(KEY, "create_provider")!;
+  expect(row.state).toBe("failed");
+  expect(row.attempt).toBe(0); // the key is NOT rotated
+  expect(row.error).toMatch(/no usable answer/);
+  // The marker that makes the next pass safe: a create went out under attempt 0.
+  expect(detailOf().companySentAttempt).toBe(0);
+  // Parked rows carry their own schedule, because `attempt` can no longer express one.
+  const backoff = JSON.parse(row.detail ?? "{}") as { nextRetryAt?: number };
+  expect(backoff.nextRetryAt).toBeGreaterThan(0);
+});
+
+test("C1: timeout then retry — the SAME key is re-sent and doola's replay is adopted, once", async () => {
+  bindParty();
+  const arc = makeFakeArc();
+
+  // Pass 1: doola COMMITTED the company and the answer was lost on the way back.
+  const filed = { doolaCompanyId: COMPANY, formationSubmissionStatus: "PENDING" };
+  const committed: (typeof filed)[] = [];
+  const lost = makeFakeDoola({
+    createCompany: vi.fn(async () => {
+      committed.push(filed); // this is the real Wyoming LLC
+      throw new DoolaTimeoutError("/v1/partner/companies", 30_000);
+    }) as never,
+  });
+  await runOnboarding(baseDeps(arc, lost.api));
+  expect(committed).toHaveLength(1);
+
+  // Pass 2 (the sweeper's retry): doola is healthy and REPLAYS the committed response for the
+  // same key — which is exactly what an idempotency key is for. Its list is still eventually
+  // consistent, so the pre-create lookup finds nothing and must not be read as "nothing filed".
+  const replayKeys: string[] = [];
+  const replay = makeFakeDoola({
+    listCompanies: vi.fn(async () => []) as never,
+    createCompany: vi.fn(async (_body: unknown, key: string) => {
+      replayKeys.push(key);
+      return filed; // the replay: the SAME company, not a new one
+    }) as never,
+  });
+  await runOnboarding(baseDeps(arc, replay.api));
+
+  // THE assertion: the same key, so doola replays instead of filing.
+  expect(replayKeys).toEqual([`formation:${KEY}:create_provider:0:company`]);
+  expect(committed).toHaveLength(1); // no second company, no second fee
+  const row = requests.find(KEY, "create_provider")!;
+  expect([row.state, row.providerRef, row.attempt]).toEqual(["confirmed", COMPANY, 0]);
+});
+
+test("C1: timeout then retry — a lookup that DOES find the company adopts it, with no create", async () => {
+  bindParty();
+  const arc = makeFakeArc();
+  const lost = makeFakeDoola({
+    createCompany: vi.fn(async () => {
+      throw new DoolaTimeoutError("/v1/partner/companies", 30_000);
+    }) as never,
+  });
+  await runOnboarding(baseDeps(arc, lost.api));
+
+  const second = makeFakeDoola({
+    listCompanies: vi.fn(async () => [
+      {
+        doolaCompanyId: COMPANY,
+        name: "Formation Agent LLC",
+        formationSubmissionStatus: "SUBMITTED",
+      },
+    ]) as never,
+  });
+  await runOnboarding(baseDeps(arc, second.api));
+  // Adopt-only: the lookup answered, so nothing is created at all.
+  expect(second.calls.map((c) => c.method)).toEqual([]);
+  expect(requests.find(KEY, "create_provider")).toMatchObject({
+    state: "confirmed",
+    providerRef: COMPANY,
+    attempt: 0,
+  });
+  expect(detailOf().adopted).toBe(true);
+});
+
+test("C1: a lost CUSTOMER create keeps its key too — the retry replays rather than duplicating", async () => {
+  bindParty();
+  const arc = makeFakeArc();
+  const lost = makeFakeDoola({
+    createCustomer: vi.fn(async () => {
+      throw new DoolaApiError("E_INTERNAL", 503, "upstream unavailable");
+    }) as never,
+  });
+  await runOnboarding(baseDeps(arc, lost.api));
+  expect(requests.find(KEY, "create_provider")).toMatchObject({ state: "failed", attempt: 0 });
+
+  const fixed = makeFakeDoola();
+  await runOnboarding(baseDeps(arc, fixed.api));
+  expect(fixed.calls.map((c) => [c.method, c.idempotencyKey])).toEqual([
+    ["createCustomer", `formation:${KEY}:create_provider:0:customer`],
+    ["createCompany", `formation:${KEY}:create_provider:0:company`],
+  ]);
+});
+
+test("C1: E_IDEMPOTENCY_KEY_REUSED never re-keys — it adopts, and otherwise asks for a human", async () => {
+  bindParty();
+  const arc = makeFakeArc();
+
+  // A 409 says SOMETHING exists under this key and it is not what we just asked for. Blindly
+  // re-keying would file a second company beside it.
+  const conflicted = makeFakeDoola({
+    createCompany: vi.fn(async () => {
+      throw new DoolaApiError("E_IDEMPOTENCY_KEY_REUSED", 409, "key already used");
+    }) as never,
+  });
+  await runOnboarding(baseDeps(arc, conflicted.api));
+  const parked = requests.find(KEY, "create_provider")!;
+  expect(parked.state).toBe("failed");
+  expect(parked.attempt).toBe(0); // NOT re-keyed
+  expect(parked.error).toMatch(/NOT re-keying/);
+  // It looked before it parked: the lookup is the adopt path a conflict is supposed to resolve.
+  expect(conflicted.calls.map((c) => c.method)).toContain("listCompanies");
+
+  // Once doola's list catches up, the conflict resolves itself by adoption.
+  const resolved = makeFakeDoola({
+    listCompanies: vi.fn(async () => [
+      {
+        doolaCompanyId: COMPANY,
+        name: "Formation Agent LLC",
+        formationSubmissionStatus: "SUBMITTED",
+      },
+    ]) as never,
+  });
+  await runOnboarding(baseDeps(arc, resolved.api));
+  expect(requests.find(KEY, "create_provider")).toMatchObject({
+    state: "confirmed",
+    providerRef: COMPANY,
+    attempt: 0,
+  });
+});
+
+test("C1: an environment-pin mismatch does NOT count toward abandonment (C7)", async () => {
+  bindParty();
+  const { api, calls } = makeFakeDoola();
+  // Eight passes with the deployment pointed at the wrong environment.
+  for (let i = 0; i < 8; i++) await runOnboarding(baseDeps(makeFakeArc(), api, "production"));
+  const row = requests.find(KEY, "create_provider")!;
+  expect(calls).toHaveLength(0);
+  // A config error is not a formation going badly: the attempt never moves, so the sweeper's
+  // max-attempt verdict — which is what erases the party's data — can never be reached by it.
+  expect(row.attempt).toBe(0);
+  expect(row.state).toBe("failed");
+  expect(row.error).toMatch(/environment pin mismatch/);
 });

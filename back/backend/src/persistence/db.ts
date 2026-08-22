@@ -384,6 +384,11 @@ export function migrate(db: Database.Database): void {
       provider_ref TEXT,
       detail       TEXT,          -- JSON: filingNumber, ein, doc ids…
       error        TEXT,
+      -- Epoch ms the sweeper may next POLL this step. A MIRROR of detail.nextPollAt, and it is a
+      -- column for exactly one reason: "which rows are due?" has to be a question the database
+      -- answers. Reading every open entity's detail blob to find out means the poll cost grows
+      -- with the number of formations ever opened rather than with the number actually due.
+      next_poll_at INTEGER,
       created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (entity_key, step)
@@ -527,6 +532,20 @@ export function migrate(db: Database.Database): void {
     db.exec(`DROP TABLE formation_parties;${FORMATION_PARTIES_DDL}`);
   }
   db.exec(FORMATION_PARTIES_INDEX_DDL);
+
+  // formation_requests.next_poll_at: ALTER-if-missing, the house idiom. A database created by
+  // PR 2's first migration has the column; one created by an earlier build of PR 2 does not, and
+  // a NULL there reads as "never polled", which is exactly right for every existing row.
+  const reqCols = (
+    db.prepare("PRAGMA table_info(formation_requests)").all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!reqCols.includes("next_poll_at"))
+    db.exec("ALTER TABLE formation_requests ADD COLUMN next_poll_at INTEGER");
+  // The sweeper's poll-due query orders by this and filters on it, for every open entity, on
+  // every tick.
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_formation_poll_due ON formation_requests(next_poll_at, entity_key)",
+  );
 
   // The documents index is keyed by OUR derived id (documentIndexRepository.documentIndexId), but
   // the fact that makes a re-fetch idempotent is (entity, doola document id) — so that pair is

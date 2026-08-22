@@ -1,4 +1,9 @@
-import { type DoolaApi, describeDoolaError } from "../adapters/doola/doolaClient";
+import {
+  type DoolaApi,
+  type DoolaFailureKind,
+  classifyDoolaFailure,
+  describeDoolaError,
+} from "../adapters/doola/doolaClient";
 import type {
   CreateCompanyInput,
   DoolaAddress,
@@ -20,7 +25,7 @@ import {
 } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { EntityRecord } from "../types";
-import { failFormationStep, logFormationStep } from "./formationStep";
+import { failFormationStep, logFormationStep, parkFormationStep } from "./formationStep";
 
 /**
  * The `create_provider` step of the formation sub-saga (design §5, audit H5 / M5, completeness 9).
@@ -61,6 +66,18 @@ export interface CreateProviderDetail {
   /** True when the company was ADOPTED — a crash-window resume or the pre-create lookup — rather
    *  than created by this attempt. The one field that says "we did not file this one twice". */
   adopted?: boolean;
+  /**
+   * The `attempt` under which `POST /companies` was last SENT — written BEFORE the call, so it
+   * survives a crash inside it (C1).
+   *
+   * It is what makes "did a create ever go out with the key we are about to use again?"
+   * answerable. When it equals the row's current attempt, doola may be holding a committed
+   * company for that key, an empty pre-create lookup proves NOTHING (their list is eventually
+   * consistent with their creates), and the only safe move is to re-send the SAME key and let
+   * doola replay. It is compared against `attempt` rather than stored as a boolean precisely so
+   * that a legitimate re-key — after doola REJECTED the body — starts clean.
+   */
+  companySentAttempt?: number;
 }
 
 export interface FormationCreateDeps {
@@ -125,6 +142,33 @@ export function companyNameOptions(specName: string): { name: string; entityType
   return [{ name: base, entityTypeEnding: ENTITY_TYPE_ENDING }];
 }
 
+/**
+ * The two idempotency keys of one attempt — one per ENDPOINT (C1 hardening).
+ *
+ * The customer create and the company create are different requests with different bodies, and a
+ * single shared key made "same key, different body" — doola's `E_IDEMPOTENCY_KEY_REUSED` — a
+ * shape our own traffic could produce. Suffixing costs nothing and removes the ambiguity.
+ */
+export function createProviderKeys(
+  entityKey: string,
+  attempt: number,
+): { customer: string; company: string } {
+  return {
+    customer: SqliteFormationRepository.idempotencyKey(
+      entityKey,
+      "create_provider",
+      attempt,
+      "customer",
+    ),
+    company: SqliteFormationRepository.idempotencyKey(
+      entityKey,
+      "create_provider",
+      attempt,
+      "company",
+    ),
+  };
+}
+
 function toDoolaAddress(p: FormationPartyRecord): DoolaAddress {
   return {
     line1: p.line1,
@@ -186,8 +230,26 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   // ── Environment pinning (audit M5). BEFORE anything else, and never a doola call: an entity
   //    pinned to sandbox must not be routed at api.doola.com by a config flip, and one pinned to
   //    production must not be quietly re-filed in a playground.
+  //
+  //    PARKED, not failed (C7): no request was made, so there is nothing to be idempotent about,
+  //    and this is a configuration error rather than a formation that is going badly. Burning
+  //    attempts on it would `abandon` the formation after eight ticks of a wrong env var — and
+  //    `abandoned` is what makes the sweeper erase the responsible party's personal data.
   if (rec.formationEnvironment !== d.environment) {
-    failStep(d, row, environmentPinMismatchError(rec.formationEnvironment ?? null, d.environment));
+    parkFormationStep(
+      d,
+      entityKey,
+      "create_provider",
+      environmentPinMismatchError(rec.formationEnvironment ?? null, d.environment),
+      { reason: "environment_pin" },
+    );
+    d.repo.recordEvent(
+      entityKey,
+      "formationCreate",
+      d.rec.status,
+      null,
+      "formation create skipped: environment pin mismatch",
+    );
     return;
   }
 
@@ -209,7 +271,8 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
 
   // Everything from here builds a request body, and doola REQUIRES a phone on a natural person's
   // address (live sandbox, 2026-08-21). Refused HERE, with a named reason, rather than by a body
-  // we already know will come back 400.
+  // we already know will come back 400. (The intake refuses it too, since C6 — this guards the
+  // parties that were already in the table.)
   if (!party.phone) {
     failStep(d, row, partyPhoneRequiredError());
     return;
@@ -246,10 +309,13 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     logStep(entityKey, "submitted", row.attempt);
   }
 
-  const key = SqliteFormationRepository.idempotencyKey(entityKey, "create_provider", row.attempt);
+  // ONE key per endpoint, both derived from THIS attempt. Nothing below rotates them: an attempt
+  // moves only when doola has told us, in as many words, that it refused the request.
+  const keys = createProviderKeys(entityKey, row.attempt);
 
   // ── 1. The customer. Persisted immediately: it is what the pre-create lookup searches by, and
-  //       what part B re-fetches with.
+  //       what part B re-fetches with. A lost answer here leaves no id and does NOT bump, so the
+  //       retry re-sends the same key and doola replays the customer it already made.
   let customerId = detail.customerId;
   if (!customerId) {
     try {
@@ -262,22 +328,22 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
             countryOfResidence: party.country,
             phoneNumber: party.phone ?? undefined,
           },
-          key,
+          keys.customer,
         )
       ).doolaCustomerId;
     } catch (e) {
-      failStep(d, row, describeDoolaError(e).message, e);
+      onCallFailure(d, row, e, "createCustomer");
       return;
     }
     detail = { ...detail, customerId };
     persistDetail(d, detail);
   }
 
-  // ── 2. Pre-create lookup fallback (completeness 9). Only when a previous attempt already had
-  //       a customer, and it may only ever ADOPT: `GET /companies` is eventually consistent with
-  //       the creates (verified live — see the runbook), so
-  //       an empty result is NOT evidence that nothing was filed and can never authorize a
-  //       fresh create. The Idempotency-Key is what makes that safe; this is belt-and-braces.
+  // ── 2. Pre-create lookup fallback (completeness 9). ADOPT-ONLY, always: `GET /companies` is
+  //       eventually consistent with the creates (verified live — see the runbook), so an empty
+  //       result is NOT evidence that nothing was filed and can never authorize a fresh create.
+  //       It runs whenever a previous attempt already had a customer, because that is exactly the
+  //       shape of "we asked doola to file and lost the answer".
   if (hadCustomer) {
     const found = await lookupExistingCompany(d, customerId, nameOptions[0]!.name);
     if (found) {
@@ -286,19 +352,40 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     }
   }
 
-  // ── 3. The company. THE call that costs money.
+  // ── 3. Record that a company create is going out under THIS key, BEFORE it goes out.
+  //
+  //       This is the marker that survives a crash inside the call. On the next pass it says: a
+  //       create with this exact key may be committed at doola, so an empty lookup proves
+  //       nothing and the only safe move is to re-send the SAME key. Which is precisely what the
+  //       code below does — the key is a pure function of an attempt that indeterminate failures
+  //       never move.
+  if (detail.companySentAttempt !== row.attempt) {
+    detail = { ...detail, companySentAttempt: row.attempt };
+    persistDetail(d, detail);
+  }
+
+  // ── 4. The company. THE call that costs money.
   let company: DoolaCompany;
   try {
     company = await d.doola.createCompany(
       buildCompanyInput(d, party, customerId, nameOptions, expedited),
-      key,
+      keys.company,
     );
   } catch (e) {
-    failStep(d, row, describeDoolaError(e).message, e);
+    // A key conflict means SOMETHING exists under this key. Look before parking — the lookup is
+    // adopt-only, so the worst case is that we learn nothing and a human is told.
+    if (classifyDoolaFailure(e) === "key_reused") {
+      const found = await lookupExistingCompany(d, customerId, nameOptions[0]!.name);
+      if (found) {
+        await adopt(d, row, found.doolaCompanyId, { ...detail, adopted: true }, found);
+        return;
+      }
+    }
+    onCallFailure(d, row, e, "createCompany");
     return;
   }
 
-  // ── 4. Persist the id BEFORE treating the create as done. A crash between here and the
+  // ── 5. Persist the id BEFORE treating the create as done. A crash between here and the
   //       confirm below resumes into the ADOPT branch above, never into a second create.
   detail = { ...detail, companyId: company.doolaCompanyId };
   requests.transition(entityKey, "create_provider", "submitted", "submitted", {
@@ -310,6 +397,56 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   confirm(d, row, company.doolaCompanyId, {
     ...detail,
     submissionStatus: company.formationSubmissionStatus,
+  });
+}
+
+/**
+ * The ONE place a failed doola CALL decides whether the attempt moves (C1).
+ *
+ * Only `rejected` — doola looked at the request and refused it — burns an attempt and therefore
+ * rotates the key. `lost` and `key_reused` park the row without bumping, so the retry re-sends
+ * the same key and doola replays whatever it committed. Getting this backwards is the
+ * double-filing bug: an entity whose create timed out would come back with a fresh key and file a
+ * second real Wyoming LLC, with a second real fee, under a second real name.
+ */
+function onCallFailure(
+  d: FormationCreateDeps,
+  row: FormationRequestRecord,
+  e: unknown,
+  endpoint: "createCustomer" | "createCompany",
+): void {
+  const kind: DoolaFailureKind = classifyDoolaFailure(e);
+  const described = describeDoolaError(e);
+  if (kind === "rejected") {
+    failStep(d, row, described.message, e);
+    return;
+  }
+  const reason =
+    kind === "key_reused"
+      ? `doola reports this idempotency key was already used with a different body (${endpoint}) — NOT re-keying: something exists under it and re-filing could be a second company. ${described.message}`
+      : `doola ${endpoint} gave no usable answer (${described.message}) — the request may have COMMITTED, so the attempt is NOT burned and the same idempotency key will be re-sent`;
+  parkFormationStep(d, d.entityKey, "create_provider", reason, {
+    providerRef: row.providerRef ?? undefined,
+    endpoint,
+    kind,
+    code: described.code,
+  });
+  d.repo.recordEvent(
+    d.entityKey,
+    "formationCreate",
+    d.rec.status,
+    null,
+    `formation create parked (${kind}): ${reason}`,
+  );
+  opsLog("formation_create_parked", {
+    entityKey: d.entityKey,
+    // A key conflict is a real bug and needs a human; a lost answer is ordinary weather.
+    level: kind === "key_reused" ? "error" : "warn",
+    ...(kind === "key_reused" ? { severity: "CRITICAL" as const } : {}),
+    kind,
+    endpoint,
+    code: described.code,
+    requestId: described.requestId,
   });
 }
 
@@ -402,9 +539,18 @@ async function adopt(
     try {
       company = await d.doola.getCompany(companyId);
     } catch (e) {
-      // The company exists (we hold its id); we simply could not read it right now. Fail the row
-      // so the sweeper retries — it will land in this same branch and read again.
-      failStep(d, row, describeDoolaError(e).message, e);
+      // The company EXISTS — we hold its id — and we simply could not read it right now. Parked
+      // without burning the attempt (C1/C3): this is a read, it attempted nothing and committed
+      // nothing, and eight transient read failures must not `abandon` a company Wyoming has
+      // already filed (which is also what would erase the responsible party's data).
+      const described = describeDoolaError(e);
+      parkFormationStep(
+        d,
+        d.entityKey,
+        "create_provider",
+        `could not read the company we already filed (${companyId}): ${described.message}`,
+        { providerRef: companyId, code: described.code },
+      );
       return;
     }
   }

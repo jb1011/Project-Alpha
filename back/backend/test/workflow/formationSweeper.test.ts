@@ -9,6 +9,7 @@
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { sqliteUtcTimestamp } from "../../src/formation";
+import { deriveFormationStatus } from "../../src/formation/status";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
 import { SqliteDoolaEventRepository } from "../../src/persistence/doolaEventRepository";
@@ -22,6 +23,7 @@ import {
   MAX_FORMATION_ATTEMPTS,
   POLL_BASE_MS,
   POLL_CAP_MS,
+  SUBMITTED_STALL_MS,
   formationReconcile,
   parseSqliteUtc,
   retryDelayMs,
@@ -202,6 +204,136 @@ test("create_provider is retried too — through the saga step, which ADOPTS rat
   expect(doola.calls.some((c) => c.startsWith("getCompany"))).toBe(true);
 });
 
+// ── C2: the two crash windows ──────────────────────────────────────────────────────────────
+//
+// Between the claim (which writes the pin and binds the party) and `claimAllSteps` at the top of
+// the create step lie provisioning, minting, binding and funding — a long stretch of real
+// network work. An entity that dies in it is pinned, owes a real filing, and is invisible to
+// EVERY other pass: `bound`/`funded` so the onboarding reconciler skips it, and with no formation
+// rows at all so every row query skips it too.
+
+test("C2: an entity pinned with a party but NO formation rows is opened and filed", async () => {
+  // The crash: the claim committed (pin + party bind), nothing else did.
+  repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
+  newParty({ entityKey: ENTITY_KEY });
+  expect(requests.stepsOf(ENTITY_KEY)).toHaveLength(0);
+
+  const created = { doolaCompanyId: COMPANY_ID, formationSubmissionStatus: "PENDING" };
+  const calls: string[] = [];
+  doola = fakeDoola();
+  (doola.api as unknown as Record<string, unknown>).createCustomer = async () => {
+    calls.push("createCustomer");
+    return { doolaCustomerId: "cus-1" };
+  };
+  (doola.api as unknown as Record<string, unknown>).createCompany = async () => {
+    calls.push("createCompany");
+    return created;
+  };
+  (doola.api as unknown as Record<string, unknown>).listCompanies = async () => [];
+
+  await sweeper().tick();
+
+  // All four rows exist now, and the filing actually went out.
+  expect(requests.stepsOf(ENTITY_KEY).map((r) => r.step)).toEqual([
+    "create_provider",
+    "await_filing",
+    "fetch_documents",
+    "await_ein",
+  ]);
+  expect(calls).toEqual(["createCustomer", "createCompany"]);
+  expect(rowOf("create_provider")).toMatchObject({ state: "confirmed", providerRef: COMPANY_ID });
+});
+
+test("C2: an entity with no party bound is NOT opened — there is nothing to file with", async () => {
+  repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
+  await sweeper().tick();
+  expect(requests.stepsOf(ENTITY_KEY)).toHaveLength(0);
+  expect(doola.calls).toHaveLength(0);
+});
+
+test("C2: a create_provider row stuck in `submitted` past the deadline is re-run, and ADOPTS", async () => {
+  // The other window: the process died INSIDE the company create, after the id was persisted.
+  // `submitted` is not `failed`, so the retry pass never looked at it — the row sat there forever.
+  repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
+  newParty({ entityKey: ENTITY_KEY });
+  requests.claimAllSteps(ENTITY_KEY);
+  db.prepare(
+    `UPDATE formation_requests SET state='submitted', provider_ref=?, detail=?, updated_at=?
+      WHERE entity_key=? AND step='create_provider'`,
+  ).run(
+    COMPANY_ID,
+    JSON.stringify({ customerId: "cus-1", companyId: COMPANY_ID, companySentAttempt: 0 }),
+    sqliteUtcTimestamp(now - SUBMITTED_STALL_MS - 1000),
+    ENTITY_KEY,
+  );
+
+  await sweeper().tick();
+
+  // Adopted through the persisted id: `getCompany`, never a second `createCompany` (the fake
+  // throws if the create is called at all).
+  expect(doola.calls.some((c) => c.startsWith("getCompany"))).toBe(true);
+  expect(stateOf("create_provider")).toBe("confirmed");
+});
+
+test("C2: a create_provider row that is merely SLOW is left alone", async () => {
+  repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
+  newParty({ entityKey: ENTITY_KEY });
+  requests.claimAllSteps(ENTITY_KEY);
+  db.prepare(
+    `UPDATE formation_requests SET state='submitted', updated_at=?
+      WHERE entity_key=? AND step='create_provider'`,
+  ).run(sqliteUtcTimestamp(now - 1000), ENTITY_KEY);
+
+  await sweeper().tick();
+  // Inside the client's own deadline: the call may still be in flight in another frame.
+  expect(doola.calls).toHaveLength(0);
+  expect(stateOf("create_provider")).toBe("submitted");
+});
+
+// ── C3: a transient read failure is not a formation failure ────────────────────────────────
+
+test("C3: one 502 then a healthy read — the status never shows `failed`", async () => {
+  seedFormation();
+  now += POLL_BASE_MS + 1000;
+  doola.state.failNext = { getCompany: true };
+  await sweeper().tick();
+
+  const parked = rowOf("await_filing")!;
+  expect(parked.state).toBe("pending"); // NOT failed
+  expect(parked.attempt).toBe(0); // NOT burned
+  expect(deriveFormationStatus(requests.stepsOf(ENTITY_KEY))).toBe("in_progress");
+
+  // The next poll is scheduled rather than immediate, and the healthy read clears the error.
+  expect(parked.nextPollAt).toBeGreaterThan(now);
+  now = parked.nextPollAt! + 1000;
+  doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
+  await sweeper().tick();
+  expect(stateOf("await_filing")).toBe("confirmed");
+});
+
+test("C3: an await_ein row's poll cadence GROWS instead of asking every tick for six weeks", async () => {
+  seedFormation();
+  // Filed and documented; only the IRS is left, which takes four to six weeks.
+  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
+  doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
+  stampRows(now);
+
+  const intervals: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    now += POLL_CAP_MS + 1000; // always due, so only the backoff can throttle it
+    await sweeper().tick();
+    const d = parseDetail<{ pollIntervalMs?: number }>(rowOf("await_ein")?.detail ?? null);
+    intervals.push(d.pollIntervalMs ?? 0);
+  }
+  // Strictly growing until the cap, and never faster than daily.
+  expect(intervals[0]).toBe(2 * POLL_BASE_MS);
+  expect(intervals[1]).toBe(4 * POLL_BASE_MS);
+  expect(intervals[3]).toBe(POLL_CAP_MS);
+  // And the column mirrors the blob, which is what the SQL due-filter reads.
+  expect(rowOf("await_ein")?.nextPollAt).toBe(now + POLL_CAP_MS);
+});
+
 // ── (a) re-driving events that arrived too early ───────────────────────────────────────────
 
 test("an unmappable event is re-driven once create_provider lands the company id", async () => {
@@ -319,11 +451,31 @@ test("a COMPLETE entity is never polled again", async () => {
 
 test("a FAILED entity belongs to the retry path, not the poll path", async () => {
   seedFormation();
-  fail("await_filing", 1, 0); // failed, and its backoff has NOT elapsed
-  now += 30 * DAY - retryDelayMs(1); // long past the poll window, short of nothing else
+  // Aged well past the POLL window, so the poll pass would happily claim it on age alone…
+  fail("await_filing", 1, 30 * DAY);
+  // …and parked with a retry schedule that has NOT elapsed. This is the no-bump backoff a lost
+  // answer or a transient read failure leaves (C1/C3): the attempt does not move, so the
+  // interval on the row is the only thing that knows how long to wait.
+  requests.transition(ENTITY_KEY, "await_filing", "failed", "failed", {
+    detail: JSON.stringify({ nextRetryAt: now + DAY, retryIntervalMs: DAY }),
+  });
+  db.prepare(
+    "UPDATE formation_requests SET updated_at=? WHERE entity_key=? AND step='await_filing'",
+  ).run(sqliteUtcTimestamp(now - 30 * DAY), ENTITY_KEY);
+
   await sweeper().tick();
-  // If the poll path had claimed it, doola would have been called despite the backoff.
+  // NEITHER pass touched it: the poll skips a `failed` entity by derived status, and the retry
+  // honours the schedule the parking wrote.
+  expect(doola.calls).toHaveLength(0);
   expect(stateOf("await_filing")).toBe("failed");
+
+  // Once the retry schedule elapses it is the RETRY driver that picks it up, and the successful
+  // read un-parks the row (C3) without having burned an attempt.
+  now += DAY + 1000;
+  await sweeper().tick();
+  expect(doola.calls.filter((c) => c.startsWith("getCompany"))).toHaveLength(1);
+  expect(stateOf("await_filing")).toBe("pending");
+  expect(rowOf("await_filing")?.attempt).toBe(1);
 });
 
 // ── (d) PII erasure ────────────────────────────────────────────────────────────────────────

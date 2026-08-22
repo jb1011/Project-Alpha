@@ -12,6 +12,7 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { DOOLA_SIGNATURE_HEADER, type DoolaWakeUp } from "../../src/api/routes/doolaWebhook";
+import { deriveFormationStatus } from "../../src/formation/status";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
 import { SqliteDoolaEventRepository } from "../../src/persistence/doolaEventRepository";
@@ -313,16 +314,45 @@ test("FAILED never overrules a step that already confirmed", async () => {
   expect(stateOf("await_ein")).toBe("failed");
 });
 
-test("a doola read failure parks the step the entity is WAITING on, and nothing else", async () => {
+test("C3: a doola read failure records itself and backs off — it does NOT burn an attempt", async () => {
+  // A GET that 502s is not a formation going badly. Nothing was attempted, nothing committed,
+  // and nothing about the entity changed. Parking it `failed` (and burning an attempt) meant
+  // eight bad minutes at doola could `abandon` a company Wyoming had already filed — and
+  // `abandoned` is what erases the responsible party's personal data.
   seedFormation();
+  const before = requests.find(ENTITY_KEY, "await_filing")!;
   doola.state.failNext = { getCompany: true };
   const out = await advanceFormation(deps(), ENTITY_KEY);
   expect(out).toMatchObject({ fetched: false, advanced: false });
-  expect(stateOf("await_filing")).toBe("failed");
-  expect(requests.find(ENTITY_KEY, "await_filing")?.error).toMatch(/doola read failed/);
-  // The steps behind it are untouched — one outage is one failure, not three.
+
+  const after = requests.find(ENTITY_KEY, "await_filing")!;
+  // The state is unchanged, so no tenant surface renders this as a failed formation…
+  expect(after.state).toBe(before.state);
+  expect(after.attempt).toBe(before.attempt);
+  // …but the reason is on the row, and the next read is scheduled rather than immediate.
+  expect(after.error).toMatch(/doola read failed/);
+  expect(after.nextPollAt).toBeGreaterThan(0);
+  // The steps behind it are untouched — one outage is one event, not three.
   expect(stateOf("fetch_documents")).toBe("pending");
   expect(stateOf("await_ein")).toBe("pending");
+});
+
+test("C3: one 502 then a healthy read — the status never shows `failed`, and the row un-parks", async () => {
+  seedFormation();
+  // Whatever put the row in `failed` (an older build, a doola-reported failure since resolved),
+  // a successful read proves the reason no longer holds.
+  requests.transition(ENTITY_KEY, "await_filing", "pending", "failed", { error: "boom" });
+
+  doola.state.failNext = { getCompany: true };
+  await advanceFormation(deps(), ENTITY_KEY);
+  // The transient failure did not burn an attempt on the way through.
+  expect(requests.find(ENTITY_KEY, "await_filing")?.attempt).toBe(0);
+
+  await advanceFormation(deps(), ENTITY_KEY);
+  const row = requests.find(ENTITY_KEY, "await_filing")!;
+  expect(row.state).toBe("pending");
+  expect(row.error).toBeNull();
+  expect(deriveFormationStatus(requests.stepsOf(ENTITY_KEY))).toBe("in_progress");
 });
 
 // ── the guards ─────────────────────────────────────────────────────────────────────────────

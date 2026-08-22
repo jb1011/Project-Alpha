@@ -6,6 +6,8 @@
  * `create_provider`, and a handle nobody ever used — and the erasure has to actually remove the
  * data rather than overwrite it with a sentinel, which is why the columns are nullable.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -138,52 +140,32 @@ test("an already-erased party never re-appears in the candidate list", () => {
   expect(parties.listErasable("2026-08-14 00:00:00")).toHaveLength(0);
 });
 
-test("MIGRATION: a database carrying the old NOT NULL shape is rebuilt without losing rows", () => {
-  const legacy = openDatabase(":memory:");
-  // PR 2 part A's shape, verbatim in the part that matters: NOT NULL on the PII columns.
-  legacy.exec(`
-    CREATE TABLE formation_parties (
-      party_id   TEXT PRIMARY KEY,
-      entity_key TEXT UNIQUE,
-      tenant_id  TEXT NOT NULL,
-      legal_first_name TEXT NOT NULL, legal_last_name TEXT NOT NULL,
-      email TEXT NOT NULL, phone TEXT,
-      line1 TEXT NOT NULL, line2 TEXT, city TEXT NOT NULL,
-      region TEXT,
-      postal_code TEXT NOT NULL, country TEXT NOT NULL,
-      synthetic INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      deleted_at TEXT
-    );
-    INSERT INTO formation_parties
-      (party_id, entity_key, tenant_id, legal_first_name, legal_last_name, email, phone,
-       line1, city, postal_code, country, created_at)
-    VALUES ('p1','t:agent-1','${TENANT}','Ada','Lovelace','ada@example.com','+12125550100',
-            '1 Analytical Way','Cheyenne','82001','USA','2026-08-20 09:00:00');
-  `);
-  migrate(legacy);
+test("C10: the migration performs exactly ONE formation_parties rebuild, and it is guarded", () => {
+  // There used to be a second one: a 4-step "drop NOT NULL from the PII columns" dance guarded on
+  // the columns' own nullability. It could never run. The guarded rebuild above it recreates the
+  // table from the CURRENT DDL, in which those columns are already nullable, and no shipped shape
+  // has ever had both `party_id` and a NOT NULL `legal_first_name` — only a database created by a
+  // mid-branch build of this PR could, and none exists outside a developer's laptop.
+  //
+  // Dead migration code that performs a DROP is the worst kind to keep, because the day it
+  // becomes reachable is the day it deletes something. This test is what stops it coming back.
+  const source = readFileSync(
+    join(import.meta.dirname, "..", "..", "src", "persistence", "db.ts"),
+    "utf8",
+  );
+  expect(source.match(/DROP TABLE formation_parties/g)?.length ?? 0).toBe(1);
+  expect(source).not.toContain("formation_parties_new");
 
-  const info = legacy.prepare("PRAGMA table_info(formation_parties)").all() as {
+  // What the deleted block existed to guarantee still holds, from the DDL itself: a freshly
+  // migrated table has NULLABLE PII columns, which is what makes erasure `NULL` rather than a
+  // sentinel string.
+  const fresh = openDatabase(":memory:");
+  migrate(fresh);
+  const info = fresh.prepare("PRAGMA table_info(formation_parties)").all() as {
     name: string;
     notnull: number;
   }[];
-  expect(info.find((c) => c.name === "legal_first_name")?.notnull).toBe(0);
-  const row = legacy
-    .prepare("SELECT * FROM formation_parties WHERE party_id = 'p1'")
-    .get() as Record<string, unknown>;
-  // Every column carried across, including the timestamp and the binding.
-  expect(row).toMatchObject({
-    entity_key: "t:agent-1",
-    tenant_id: TENANT,
-    legal_first_name: "Ada",
-    email: "ada@example.com",
-    created_at: "2026-08-20 09:00:00",
-  });
-  // The unique index the door gate relies on survived the rebuild.
-  const idx = legacy.prepare("PRAGMA index_list(formation_parties)").all() as { name: string }[];
-  expect(idx.map((i) => i.name)).toContain("idx_formation_parties_tenant");
-  // Idempotent: running migrate again is a no-op, not a second rebuild.
-  migrate(legacy);
-  expect(legacy.prepare("SELECT COUNT(*) AS n FROM formation_parties").get()).toEqual({ n: 1 });
-  legacy.close();
+  for (const col of ["legal_first_name", "legal_last_name", "email", "line1", "city", "country"])
+    expect(info.find((c) => c.name === col)?.notnull, col).toBe(0);
+  fresh.close();
 });

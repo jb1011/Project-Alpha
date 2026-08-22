@@ -119,6 +119,41 @@ export function describeDoolaError(e: unknown): {
   return { message: (e as Error)?.message ?? String(e) };
 }
 
+/**
+ * What a failed doola call actually tells us about doola's state (C1).
+ *
+ * This is the most consequential three-way branch in the formation loop, because the answer
+ * decides whether the `Idempotency-Key` may be ROTATED — and rotating it is a claim that the last
+ * request definitely did not commit. Behind `POST /companies` is a real Wyoming LLC and a real
+ * fee, so a wrong "rejected" verdict files a second one.
+ *
+ *   lost        no verdict reached us. A timeout, a torn socket, a 5xx, a 429, or a 2xx whose
+ *               body we could not read: doola may hold a committed create. The SAME key must be
+ *               re-sent — doola replays the committed response — and the attempt must not move.
+ *   rejected    doola looked at the request and refused it (a 4xx that is not a key conflict).
+ *               Nothing committed, the key is released, and a retry with a corrected body needs
+ *               a fresh one — so this is the ONLY kind that burns an attempt.
+ *   key_reused  409 `E_IDEMPOTENCY_KEY_REUSED`: doola has this key against a DIFFERENT body. It
+ *               is ambiguous by construction — something exists, and it is not what we just
+ *               asked for. Never re-keyed blind: the caller adopts via the persisted ids or the
+ *               pre-create lookup, and otherwise parks for a human.
+ *
+ * 408 and 429 sit with `lost` deliberately. Neither is a verdict about the request, and treating
+ * "come back later" as a refusal would rotate a key over a rate limit.
+ */
+export type DoolaFailureKind = "lost" | "rejected" | "key_reused";
+
+export function classifyDoolaFailure(e: unknown): DoolaFailureKind {
+  if (!(e instanceof DoolaApiError)) return "lost"; // timeout, transport, DNS, an unexpected throw
+  if (e.code === DOOLA_ERROR_CODES.idempotencyKeyReused) return "key_reused";
+  // OUR codes: the call may well have succeeded and we simply could not read the answer.
+  if (e.code === DOOLA_ERROR_CODES.badResponse || e.code === DOOLA_ERROR_CODES.responseTooLarge)
+    return "lost";
+  if (e.status >= 500 || e.status === 408 || e.status === 429) return "lost";
+  if (e.status >= 400) return "rejected";
+  return "lost";
+}
+
 /** The slice of doola we consume. Tests fake this; production builds it from config. */
 export interface DoolaApi {
   /** Idempotency-Key honored. */
@@ -153,7 +188,11 @@ export interface DoolaClientConfig {
   fetchImpl?: typeof fetch;
 }
 
-const DEFAULT_TIMEOUT_MS = 30_000;
+/** The per-call deadline. EXPORTED because the sweeper needs it: "how long may a row sit in
+ *  `submitted` before the process that wrote it is presumed dead?" is this number plus slack, and
+ *  hard-coding a second copy of it would let the two drift (C2). */
+export const DOOLA_DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = DOOLA_DEFAULT_TIMEOUT_MS;
 
 /**
  * Every partner endpoint lives under this prefix — verified against doola's published OpenAPI

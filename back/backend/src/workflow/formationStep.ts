@@ -1,9 +1,18 @@
+import {
+  POLL_BASE_MS,
+  POLL_CAP_MS,
+  RETRY_BASE_MS,
+  RETRY_CAP_MS,
+  type StepBackoff,
+  nextInterval,
+} from "../formation/schedule";
 import { opsLog } from "../observability/opsLog";
 import type { EntityRepository } from "../persistence/entityRepository";
-import type {
-  FormationRepository,
-  FormationState,
-  FormationStep,
+import {
+  type FormationRepository,
+  type FormationState,
+  type FormationStep,
+  parseDetail,
 } from "../persistence/formationRepository";
 
 /**
@@ -65,4 +74,73 @@ export function failFormationStep(
     else d.requests.transition(entityKey, step, from, "failed", { error });
   });
   logFormationStep(entityKey, step, "failed", row.attempt + 1, logExtra);
+}
+
+/**
+ * Park a step in `failed` WITHOUT burning the attempt — the other half of the contract (C1/C3/C7).
+ *
+ * An attempt is a claim about doola's state, not a counter of how often something went wrong. It
+ * feeds the `Idempotency-Key`, and rotating that key is a statement: "the last request definitely
+ * did not commit, so a fresh one is safe". Three failures cannot honestly say that:
+ *
+ *  - a TIMEOUT or a transport error on a create: doola may hold a real Wyoming LLC and a real
+ *    fee, and the answer was simply lost. A new key would file a SECOND one (C1);
+ *  - a transient READ failure on a polled step: nothing was written, nothing was attempted, and
+ *    burning eight of those would `abandon` a formation the state has already filed (C3);
+ *  - an environment-pin mismatch: no call was made at all. It is a configuration error, and
+ *    counting it toward abandonment would erase a party over a wrong env var (C7).
+ *
+ * Because `attempt` does not move, `retryDelayMs(attempt)` cannot express "this has now failed
+ * six times in a row" — so the backoff itself is the memory: a doubling `nextRetryAt`, persisted
+ * on the row, capped, and reset by the first success (which clears the whole detail-carried
+ * schedule when it writes its own).
+ *
+ * `confirmed` and `abandoned` rows are never touched, exactly as in `failFormationStep`.
+ */
+export function parkFormationStep(
+  d: { repo: EntityRepository; requests: FormationRepository; now?: () => number },
+  entityKey: string,
+  step: FormationStep,
+  error: string,
+  logExtra: Record<string, unknown> = {},
+): void {
+  const row = d.requests.find(entityKey, step);
+  if (!row || row.state === "confirmed" || row.state === "abandoned") return;
+  const detail = parseDetail<StepBackoff>(row.detail);
+  const retryIntervalMs = nextInterval(detail.retryIntervalMs, RETRY_BASE_MS, RETRY_CAP_MS);
+  const nextRetryAt = (d.now ?? Date.now)() + retryIntervalMs;
+  d.requests.transition(entityKey, step, row.state, "failed", {
+    error,
+    detail: JSON.stringify({ ...detail, retryIntervalMs, nextRetryAt }),
+  });
+  logFormationStep(entityKey, step, "failed", row.attempt, {
+    ...logExtra,
+    // The one field an operator needs to tell these two apart in journald.
+    attemptBurned: false,
+    retryInMs: retryIntervalMs,
+  });
+}
+
+/**
+ * Persist a poll schedule on a step WITHOUT moving it (a CAS from its own state onto itself).
+ *
+ * `advance` resets the cadence to the base interval — something happened, so ask again soon —
+ * while an empty or failed read doubles it, capped. The column and the blob are written together;
+ * the column is an index over the blob, never a second source of truth.
+ */
+export function persistPollBackoff(
+  d: { requests: FormationRepository; now?: () => number },
+  row: { entityKey: string; step: FormationStep; state: FormationState; detail: string | null },
+  opts: { advanced: boolean },
+): number {
+  const detail = parseDetail<StepBackoff>(row.detail);
+  const pollIntervalMs = opts.advanced
+    ? POLL_BASE_MS
+    : nextInterval(detail.pollIntervalMs, POLL_BASE_MS, POLL_CAP_MS);
+  const nextPollAt = (d.now ?? Date.now)() + pollIntervalMs;
+  d.requests.transition(row.entityKey, row.step, row.state, row.state, {
+    detail: JSON.stringify({ ...detail, pollIntervalMs, nextPollAt }),
+    nextPollAt,
+  });
+  return nextPollAt;
 }

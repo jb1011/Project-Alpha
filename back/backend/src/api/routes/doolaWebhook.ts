@@ -79,8 +79,9 @@ export interface DoolaWebhookDeps {
   events: import("../../persistence/doolaEventRepository").DoolaEventRepository;
   /** Where the acked-then-deferred work is remembered (SIGTERM drain + test join point). */
   tasks: import("../../util/taskTracker").TaskTracker;
-  /** The wake-up handler. Given ids only — never the payload (audit H2). */
-  process: (wake: DoolaWakeUp) => Promise<void>;
+  /** The wake-up handler. Given ids only — never the payload (audit H2). Its result is the
+   *  processor's, and the receiver ignores it: the ack has already gone out. */
+  process: (wake: DoolaWakeUp) => Promise<unknown>;
 }
 
 /**

@@ -44,6 +44,10 @@ export interface FormationRequestRecord {
    *  "how long has this entity been in flight?" are the two questions every tick asks. */
   createdAt: string;
   updatedAt: string;
+  /** Epoch ms the sweeper may next poll this step, or null when it has never been polled. A
+   *  MIRROR of `detail.nextPollAt` — the column exists so the due-set is a query rather than a
+   *  full scan of every open entity's detail blob (M5). */
+  nextPollAt: number | null;
 }
 
 interface Row {
@@ -54,6 +58,7 @@ interface Row {
   provider_ref: string | null;
   detail: string | null;
   error: string | null;
+  next_poll_at: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -69,6 +74,7 @@ function toRecord(r: Row): FormationRequestRecord {
     error: r.error,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    nextPollAt: r.next_poll_at ?? null,
   };
 }
 
@@ -91,12 +97,41 @@ export interface FormationRepository {
   /** Entity keys with at least one step not yet in a terminal state — the sweeper's poll
    *  candidate set, narrowed further by the derived formation status at the call site. */
   listOpenEntityKeys(): string[];
+  /**
+   * The poll-due candidate set, filtered and ordered IN SQL (M5).
+   *
+   * A superset by construction, and deliberately so: it asks "does this entity have any
+   * non-terminal polled step that is due?", while the caller decides which step the entity is
+   * actually waiting on. The superset is cheap (an index scan on `next_poll_at`) and the exact
+   * answer needs the step ordering, which the caller already has in memory.
+   *
+   * A row that has never been polled has a NULL `next_poll_at`; its clock is its own
+   * `updated_at`, which is why the caller passes the age cutoff as well as the instant. Ordered
+   * oldest-due first so a `limit` throttles a backlog instead of starving the tail of it.
+   */
+  listPollDueEntityKeys(nowMs: number, neverPolledCutoffUtc: string, limit: number): string[];
+  /**
+   * Entities PINNED to doola, with a party bound, for which no formation row exists at all (C2).
+   *
+   * The crash window between the claim (which writes the pin and binds the party, in one
+   * transaction) and `claimAllSteps` at the top of the create step. Nothing else can see these:
+   * they are `bound`/`funded`, so the onboarding reconciler skips them, and they have no rows, so
+   * every other sweeper query skips them too. They would sit, pinned and unfiled, forever.
+   */
+  listUnopenedFormations(limit: number): string[];
   transition(
     entityKey: string,
     step: FormationStep,
     from: FormationState,
     to: FormationState,
-    fields?: { providerRef?: string; detail?: string; error?: string | null },
+    fields?: {
+      providerRef?: string;
+      detail?: string;
+      error?: string | null;
+      /** Mirror of `detail.nextPollAt`. Written together with the detail it mirrors, never
+       *  alone — the column is an INDEX over the blob, not a second source of truth. */
+      nextPollAt?: number;
+    },
   ): boolean;
   bumpAttempt(entityKey: string, step: FormationStep, from: FormationState): number | undefined;
   createRequestsByTenant(tenantId: string): number;
@@ -163,8 +198,34 @@ export class SqliteFormationRepository implements FormationRepository {
                 provider_ref = COALESCE(?, provider_ref),
                 detail       = COALESCE(?, detail),
                 error        = ?,
+                next_poll_at = COALESCE(?, next_poll_at),
                 updated_at   = CURRENT_TIMESTAMP
           WHERE entity_key = ? AND step = ? AND state = ?`,
+      ),
+      // Superset by design — see `listPollDueEntityKeys`. GROUP BY + MIN so the ordering is by
+      // the EARLIEST due step of each entity, which is what makes `limit` a throttle rather than
+      // a starvation hazard.
+      listPollDue: db.prepare(
+        `SELECT entity_key AS k, MIN(COALESCE(next_poll_at, 0)) AS due
+           FROM formation_requests
+          WHERE state NOT IN ('confirmed','abandoned')
+            AND step IN ('await_filing','fetch_documents','await_ein')
+            AND ((next_poll_at IS NOT NULL AND next_poll_at <= @now)
+                 OR (next_poll_at IS NULL AND updated_at <= @cutoff))
+          GROUP BY entity_key
+          ORDER BY due, entity_key
+          LIMIT @limit`,
+      ),
+      listUnopened: db.prepare(
+        `SELECT e.idempotency_key AS k
+           FROM entities e
+           JOIN formation_parties p
+             ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
+          WHERE e.formation_provider = 'doola'
+            AND NOT EXISTS (
+                  SELECT 1 FROM formation_requests f WHERE f.entity_key = e.idempotency_key)
+          ORDER BY e.idempotency_key
+          LIMIT ?`,
       ),
       // One statement, not an UPDATE followed by a SELECT: the read-back could otherwise return
       // a DIFFERENT driver's attempt number (this repo exists because two drivers meet on these
@@ -230,6 +291,20 @@ export class SqliteFormationRepository implements FormationRepository {
     return (this.stmts.listOpenEntityKeys.all() as { k: string }[]).map((r) => r.k);
   }
 
+  listPollDueEntityKeys(nowMs: number, neverPolledCutoffUtc: string, limit: number): string[] {
+    return (
+      this.stmts.listPollDue.all({
+        now: nowMs,
+        cutoff: neverPolledCutoffUtc,
+        limit,
+      }) as { k: string }[]
+    ).map((r) => r.k);
+  }
+
+  listUnopenedFormations(limit: number): string[] {
+    return (this.stmts.listUnopened.all(limit) as { k: string }[]).map((r) => r.k);
+  }
+
   /**
    * COMPARE-AND-SET the state: moves `step` from `from` to `to` and returns whether THIS caller
    * made the move. A second concurrent driver observing the same `from` gets `false` and must not
@@ -241,7 +316,12 @@ export class SqliteFormationRepository implements FormationRepository {
     step: FormationStep,
     from: FormationState,
     to: FormationState,
-    fields: { providerRef?: string; detail?: string; error?: string | null } = {},
+    fields: {
+      providerRef?: string;
+      detail?: string;
+      error?: string | null;
+      nextPollAt?: number;
+    } = {},
   ): boolean {
     const info = this.stmts.transition.run(
       to,
@@ -250,6 +330,7 @@ export class SqliteFormationRepository implements FormationRepository {
       // `error` is the one field a transition MUST be able to clear: a row that succeeds after
       // a failure has no error, and leaving a stale one would misreport a healthy step.
       fields.error ?? null,
+      fields.nextPollAt ?? null,
       entityKey,
       step,
       from,
@@ -298,8 +379,21 @@ export class SqliteFormationRepository implements FormationRepository {
     })();
   }
 
-  /** The deterministic per-attempt idempotency key doola's two create endpoints honor. */
-  static idempotencyKey(entityKey: string, step: FormationStep, attempt: number): string {
-    return `formation:${entityKey}:${step}:${attempt}`;
+  /**
+   * The deterministic per-attempt idempotency key doola's two create endpoints honor.
+   *
+   * `endpoint` is a hardening suffix (C1): the customer create and the company create are two
+   * different requests with two different bodies, and giving them one key made "same key,
+   * different body" — doola's `E_IDEMPOTENCY_KEY_REUSED` — a shape our own traffic could produce.
+   * Omitted, the bare per-attempt key is returned, which is what the pre-suffix rows carry.
+   */
+  static idempotencyKey(
+    entityKey: string,
+    step: FormationStep,
+    attempt: number,
+    endpoint?: "customer" | "company",
+  ): string {
+    const base = `formation:${entityKey}:${step}:${attempt}`;
+    return endpoint ? `${base}:${endpoint}` : base;
   }
 }

@@ -1,5 +1,18 @@
-import { describeDoolaError } from "../adapters/doola/doolaClient";
+import { DOOLA_DEFAULT_TIMEOUT_MS, describeDoolaError } from "../adapters/doola/doolaClient";
 import { sqliteUtcTimestamp } from "../formation";
+import {
+  EVENT_RETENTION_MS,
+  FORMATION_STALE_MS,
+  MAX_FORMATION_ATTEMPTS,
+  POLL_BASE_MS,
+  POLL_CAP_MS,
+  RETRY_BASE_MS,
+  RETRY_CAP_MS,
+  SUBMITTED_STALL_SLACK_MS,
+  type StepBackoff,
+  UNBOUND_PARTY_MAX_AGE_MS,
+  retryDelayMs,
+} from "../formation/schedule";
 import { deriveFormationStatus } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
@@ -8,19 +21,21 @@ import type {
   DoolaWebhookEventRecord,
 } from "../persistence/doolaEventRepository";
 import type { FormationPartyRepository } from "../persistence/formationPartyRepository";
-import type { FormationRequestRecord, FormationStep } from "../persistence/formationRepository";
+import {
+  type FormationRequestRecord,
+  type FormationStep,
+  parseDetail,
+} from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import { parseSqliteUtc } from "../util/sqliteTime";
 import {
-  DOOLA_EVENT_NAMES,
   type FormationAdvanceDeps,
-  type PollBackoff,
   advanceFormation,
   currentPolledStep,
-  parseDetail,
   processDoolaEvent,
 } from "./formationProcessor";
 import { runFormationCreateProvider } from "./formationProvider";
+import { persistPollBackoff } from "./formationStep";
 
 /**
  * The formation sweeper (design §7 "Reconcile & sweeper") — the first recurring timer in the API
@@ -33,45 +48,49 @@ import { runFormationCreateProvider } from "./formationProvider";
  * to six weeks for the IRS, during which no event may arrive at all. So the timer, not the
  * webhook, is what makes progress guaranteed. The webhook only makes it FAST.
  *
- * A tick does six things, in this order and for these reasons:
+ * A tick does seven things, in this order and for these reasons:
  *
  *   (a) re-drive events nothing could place when they arrived — once `create_provider` lands the
  *       company id, they become processable;
- *   (b) retry `failed` rows with exponential backoff, and give up at a bounded attempt count
- *       rather than retrying a hopeless row forever;
- *   (c) poll doola for anything still in flight, with its own much slower backoff;
- *   (d) erase PII whose filing provably never happened;
- *   (e) warn about formations that have been in flight far too long;
- *   (f) drop webhook rows past their retention window.
+ *   (b) OPEN what a crash never opened, and re-run what a crash left mid-call (C2). These are the
+ *       two windows in which an entity is pinned, owes a filing, and is invisible to every other
+ *       pass: with no rows at all it matches no row query, and stuck in `submitted` it is not
+ *       `failed` so the retry pass skips it. Both used to strand the formation forever;
+ *   (c) retry `failed` rows with backoff, and give up at a bounded attempt count rather than
+ *       retrying a hopeless row forever;
+ *   (d) poll doola for anything still in flight, with its own much slower backoff;
+ *   (e) erase PII whose filing provably never happened;
+ *   (f) warn about formations that have been in flight far too long;
+ *   (g) drop webhook rows past their retention window.
  *
  * Loop shape is the monitor's (`monitor/monitor.ts:302-314`): a guarded self-rescheduling
  * `setTimeout`, so one throwing tick can never stop the next one from being scheduled.
  */
 
-// ── the schedules, all in one place ─────────────────────────────────────────────────────────
+// ── the schedules ───────────────────────────────────────────────────────────────────────────
+//
+// Defined in `src/formation/schedule.ts` and re-exported here. They had to move: the step helpers
+// write backoff now (a row parked without an attempt bump still has to back off — C1/C3), the
+// helpers are imported BY the sweeper, and constants the sweeper owned would have made that a
+// cycle. "The sweeper's schedules" is still how the tests and the runbook name these numbers, so
+// this is where they are still reachable from.
 
-/** Retry backoff for a `failed` row: 1m · 2^attempt, capped. `attempt` is already ≥1 when a row
- *  reaches `failed`, so the first retry waits two minutes. */
-export const RETRY_BASE_MS = 60_000;
-export const RETRY_CAP_MS = 6 * 60 * 60 * 1000;
+/** The SQLite timestamp parser is defined beside its formatter in `util/sqliteTime` (M4) and
+ *  re-exported here with the schedules: the sweeper's clock is what the tests read it through. */
+export { parseSqliteUtc };
 
-/** After this many burned attempts a row is `abandoned` — the sweeper's terminal verdict. */
-export const MAX_FORMATION_ATTEMPTS = 8;
-
-/** Poll cadence for an in-flight entity: daily, doubling on every EMPTY poll, capped at a week.
- *  An `await_ein` row legitimately sits 4–6 weeks; polling it 42 times to learn nothing is 42
- *  round trips and 42 chances to trip a rate limit. */
-export const POLL_BASE_MS = 24 * 60 * 60 * 1000;
-export const POLL_CAP_MS = 7 * 24 * 60 * 60 * 1000;
-
-/** An unbound formation party is a form somebody filled in and never used. */
-export const UNBOUND_PARTY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-
-/** How long a step may be in flight before an operator hears about it. */
-export const FORMATION_STALE_MS = 14 * 24 * 60 * 60 * 1000;
-
-/** Webhook forensics retention. */
-export const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+export {
+  RETRY_BASE_MS,
+  RETRY_CAP_MS,
+  MAX_FORMATION_ATTEMPTS,
+  POLL_BASE_MS,
+  POLL_CAP_MS,
+  UNBOUND_PARTY_MAX_AGE_MS,
+  FORMATION_STALE_MS,
+  EVENT_RETENTION_MS,
+  SUBMITTED_STALL_SLACK_MS,
+  retryDelayMs,
+};
 
 /**
  * The retention sweep and the stale warning run every Nth tick rather than every tick.
@@ -82,15 +101,16 @@ export const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export const AMORTISED_EVERY_N_TICKS = 60;
 
-/** `1m · 2^attempt`, capped. */
-export function retryDelayMs(attempt: number): number {
-  return Math.min(RETRY_BASE_MS * 2 ** Math.max(attempt, 0), RETRY_CAP_MS);
-}
+/** How many entities one tick may poll, and how many stranded rows it may re-open. A tick is a
+ *  timer, not a batch job: a backlog is worked down over several of them rather than in one pass
+ *  that holds the process for minutes. */
+export const POLL_BATCH = 200;
+export const STRANDED_BATCH = 50;
 
-/** SQLite's TEXT `CURRENT_TIMESTAMP` ("YYYY-MM-DD HH:MM:SS", UTC) as epoch ms. Defined beside
- *  its formatter in `util/sqliteTime` (M4); re-exported here because the sweeper's schedules are
- *  what the tests read it through. */
-export { parseSqliteUtc };
+/** How long a `submitted` `create_provider` row may sit before a tick presumes the process that
+ *  wrote it is gone (C2). The client's own deadline plus slack — imported, never re-typed, so the
+ *  two cannot drift. */
+export const SUBMITTED_STALL_MS = DOOLA_DEFAULT_TIMEOUT_MS + SUBMITTED_STALL_SLACK_MS;
 
 // ── deps ────────────────────────────────────────────────────────────────────────────────────
 
@@ -153,12 +173,15 @@ export class FormationSweeper {
     const amortised = this.ticks % AMORTISED_EVERY_N_TICKS === 0;
     try {
       await this.redriveEvents();
+      await this.openStrandedFormations();
+      await this.resumeStalledCreates();
       await this.retryFailedSteps();
       await this.pollInFlight();
       this.erasePii();
       if (amortised) {
         this.warnStale();
         this.sweepEvents();
+        this.pruneWarned();
       }
     } finally {
       this.ticks++;
@@ -169,45 +192,128 @@ export class FormationSweeper {
   // ── (a) events nothing could place when they arrived ──────────────────────────────────────
 
   private async redriveEvents(): Promise<void> {
-    for (const e of this.d.events.listUnprocessed()) {
+    const pending = this.d.events.listUnprocessed();
+
+    // Coalesce by company id (M5). doola's retry ladder plus a busy formation can leave five or
+    // six unprocessed events for ONE company, and each of them used to be its own
+    // fetch-and-advance: the same three reads, five times, for a state that can only be read
+    // once. One advance answers all of them, because a wake-up carries no facts — every event
+    // for a company is the same request, "look again".
+    const byRef = new Map<string, DoolaWebhookEventRecord[]>();
+    const companyless: DoolaWebhookEventRecord[] = [];
+    for (const e of pending) {
+      if (!e.providerRef) {
+        companyless.push(e);
+        continue;
+      }
+      const group = byRef.get(e.providerRef);
+      if (group) group.push(e);
+      else byRef.set(e.providerRef, [e]);
+    }
+
+    for (const e of companyless) await this.redriveOne(e, [e]);
+    for (const group of byRef.values()) await this.redriveOne(group[0]!, group);
+  }
+
+  /**
+   * Re-drive ONE group of events through the SAME dispatcher the receiver uses (M2).
+   *
+   * The sweeper used to re-implement the dispatch — skipping the name check, forcing the
+   * required-actions read, and marking the event itself. Two dispatchers is two answers to "what
+   * does an event mean", and the copy had already drifted. The differences are options now,
+   * because that is what they always were: by the time the SWEEPER sees a row, an unknown name
+   * has had its chance at an operator's attention, and a periodic pass has no name to infer
+   * required-actions from.
+   */
+  private async redriveOne(
+    lead: DoolaWebhookEventRecord,
+    group: DoolaWebhookEventRecord[],
+  ): Promise<void> {
+    try {
+      const result = await processDoolaEvent(
+        this.d,
+        { eventId: lead.eventId, eventName: lead.eventName, providerRef: lead.providerRef },
+        { source: "sweeper", acceptUnknownNames: true, requiredActions: true },
+      );
+      // Only a real read may retire an event — and it retires the whole group, because one read
+      // is exactly what all of them were asking for.
+      if (result.fetched)
+        for (const e of group)
+          if (e.eventId !== lead.eventId) this.d.events.markProcessed(e.eventId);
+    } catch (err) {
+      opsLog("doola_event_redrive_failed", {
+        level: "warn",
+        eventId: lead.eventId,
+        coalesced: group.length,
+        ...describeDoolaError(err),
+      });
+    }
+  }
+
+  // ── (b) the two crash windows (C2) ────────────────────────────────────────────────────────
+
+  /**
+   * Entities that are PINNED to doola, have a party bound, and have no formation rows at all.
+   *
+   * The claim writes the pin and binds the party in one transaction; `claimAllSteps` runs later,
+   * at the top of the create step, after provisioning, minting, binding and funding. A crash
+   * anywhere in that stretch leaves an entity that owes a real filing and has NOTHING to find it
+   * by: it is `bound`/`funded` so `listInFlight()` skips it, and it has no rows so every query in
+   * this file skipped it too. It would sit there, pinned and unfiled, until a human noticed.
+   */
+  private async openStrandedFormations(): Promise<void> {
+    for (const entityKey of this.d.requests.listUnopenedFormations(STRANDED_BATCH)) {
+      opsLog("formation_stranded_opened", { entityKey, environment: this.d.environment });
       try {
-        await this.redrive(e);
+        // `runFormationCreateProvider` claims all four steps in one transaction before it does
+        // anything else, so this both opens the saga and runs its first step.
+        await withKeyedLock(entityKey, () => this.retryCreateProvider(entityKey));
       } catch (err) {
-        opsLog("doola_event_redrive_failed", {
+        opsLog("formation_stranded_failed", {
           level: "warn",
-          eventId: e.eventId,
+          entityKey,
           ...describeDoolaError(err),
         });
       }
     }
   }
 
-  private async redrive(e: DoolaWebhookEventRecord): Promise<void> {
-    // Companyless and account-level: the receiver's own handler logs it CRITICAL and retires it.
-    if (e.eventName === DOOLA_EVENT_NAMES.webhookDisabled) {
-      await processDoolaEvent(this.d, {
-        eventId: e.eventId,
-        eventName: e.eventName,
-        providerRef: e.providerRef,
+  /**
+   * `create_provider` rows left in `submitted` by a process that died mid-call.
+   *
+   * `submitted` means "we are inside a doola call right now", and the client's own deadline
+   * bounds that. A row still `submitted` well past it belongs to nobody — and it is invisible to
+   * the retry pass, which only looks at `failed`. The re-run is safe by construction: a persisted
+   * `provider_ref` is ADOPTED, a persisted customer id makes the pre-create lookup meaningful,
+   * and the idempotency key is derived from an attempt that nothing here moves, so a company
+   * create that did commit is replayed rather than re-filed.
+   */
+  private async resumeStalledCreates(): Promise<void> {
+    const now = this.now();
+    for (const row of this.d.requests.listByState("submitted")) {
+      if (row.step !== "create_provider") continue;
+      if (now - parseSqliteUtc(row.updatedAt) < SUBMITTED_STALL_MS) continue;
+      opsLog("formation_create_resumed", {
+        level: "warn",
+        entityKey: row.entityKey,
+        stalledMs: now - parseSqliteUtc(row.updatedAt),
+        providerRef: row.providerRef,
+        environment: this.d.environment,
       });
-      return;
+      try {
+        await withKeyedLock(row.entityKey, () => this.retryCreateProvider(row.entityKey));
+      } catch (err) {
+        opsLog("formation_retry_failed", {
+          level: "warn",
+          entityKey: row.entityKey,
+          step: row.step,
+          ...describeDoolaError(err),
+        });
+      }
     }
-    if (!e.providerRef) return; // nothing to map it to, ever; the retention sweep will drop it
-    const owner = this.d.requests.findByProviderRef(e.providerRef);
-    if (!owner) return; // still unmappable — keep waiting for `create_provider`
-
-    // Note this does NOT go back through `processDoolaEvent`: that function refuses an event name
-    // it has no route for, on purpose, so a name we do not understand gets an operator's
-    // attention before we act on it. By the time the SWEEPER sees the row, that attention has had
-    // its chance, and the correct action for any wake-up is the same one — re-read doola. Asking
-    // for required-actions too, because a periodic pass has no name to infer them from.
-    const outcome = await withKeyedLock(owner.entityKey, () =>
-      advanceFormation(this.d, owner.entityKey, { requiredActions: true }),
-    );
-    if (outcome.fetched) this.d.events.markProcessed(e.eventId);
   }
 
-  // ── (b) retry, then give up ───────────────────────────────────────────────────────────────
+  // ── (c) retry, then give up ───────────────────────────────────────────────────────────────
 
   private async retryFailedSteps(): Promise<void> {
     const now = this.now();
@@ -217,7 +323,7 @@ export class FormationSweeper {
         this.abandon(row);
         continue;
       }
-      if (now - parseSqliteUtc(row.updatedAt) < retryDelayMs(row.attempt)) continue;
+      if (now < this.retryDueAt(row)) continue;
       try {
         await this.retry(row);
       } catch (err) {
@@ -231,13 +337,46 @@ export class FormationSweeper {
     }
   }
 
+  /**
+   * When a parked row may be tried again.
+   *
+   * TWO schedules, because there are two kinds of parking (C1/C3). A row whose attempt was BURNED
+   * carries the count in `attempt`, and `retryDelayMs` reads it. A row parked WITHOUT a bump — a
+   * lost doola answer, a transient read failure, a config mismatch — has an `attempt` that
+   * deliberately does not move, so the interval itself is its only memory of how many times this
+   * has happened; it is persisted as `nextRetryAt` and it wins when present.
+   */
+  private retryDueAt(row: FormationRequestRecord): number {
+    const backoff = parseDetail<StepBackoff>(row.detail);
+    return backoff.nextRetryAt ?? parseSqliteUtc(row.updatedAt) + retryDelayMs(row.attempt);
+  }
+
+  /**
+   * Which driver owns each step's retry — a TABLE, not an `if` (M2).
+   *
+   * The distinction is real and it is per-step: `create_provider` is driven by the filing step
+   * (it is the only one that can create a company, and it carries the whole crash-window
+   * discipline), while every polled step is driven by fetch-and-advance. A fifth step added to
+   * `FORMATION_STEP_ORDER` without a driver is now a type error rather than a row that silently
+   * never retries.
+   */
+  private readonly drivers: Record<FormationStep, (entityKey: string) => Promise<unknown>> = {
+    create_provider: (entityKey) =>
+      withKeyedLock(entityKey, () => this.retryCreateProvider(entityKey)),
+    await_filing: (entityKey) => this.advance(entityKey),
+    fetch_documents: (entityKey) => this.advance(entityKey),
+    await_ein: (entityKey) => this.advance(entityKey),
+  };
+
   private async retry(row: FormationRequestRecord): Promise<void> {
-    if (row.step === "create_provider") {
-      await withKeyedLock(row.entityKey, () => this.retryCreateProvider(row.entityKey));
-      return;
-    }
-    await withKeyedLock(row.entityKey, () =>
-      advanceFormation(this.d, row.entityKey, { requiredActions: true }),
+    await this.drivers[row.step](row.entityKey);
+  }
+
+  /** Fetch-and-advance under the entity lock, asking for required-actions: a periodic pass has no
+   *  event name to infer them from. */
+  private advance(entityKey: string): Promise<{ fetched: boolean; advanced: boolean }> {
+    return withKeyedLock(entityKey, () =>
+      advanceFormation(this.d, entityKey, { requiredActions: true }),
     );
   }
 
@@ -292,11 +431,23 @@ export class FormationSweeper {
     });
   }
 
-  // ── (c) the slow poll ─────────────────────────────────────────────────────────────────────
+  // ── (d) the slow poll ─────────────────────────────────────────────────────────────────────
 
   private async pollInFlight(): Promise<void> {
     const now = this.now();
-    for (const entityKey of this.d.requests.listOpenEntityKeys()) {
+    // The due-set comes from SQL (M5). It used to be "every entity with an open row", whose cost
+    // grows with the number of formations ever opened rather than with the number actually due —
+    // and for each of them a `stepsOf` plus a JSON parse, once a minute, forever. `next_poll_at`
+    // is a column precisely so this is an indexed range scan; the result is a SUPERSET (it does
+    // not know which step an entity is waiting on) and the loop below still decides.
+    const candidates = this.d.requests.listPollDueEntityKeys(
+      now,
+      // A row that has never been polled has a NULL column; its clock is its own `updated_at`,
+      // which is the ">24h since it last moved" rule the design specifies.
+      sqliteUtcTimestamp(now - POLL_BASE_MS),
+      POLL_BATCH,
+    );
+    for (const entityKey of candidates) {
       const steps = this.d.requests.stepsOf(entityKey);
       const status = deriveFormationStatus(steps);
       // `failed` entities belong to the retry path above, not here; `complete`/`none` are done or
@@ -307,16 +458,14 @@ export class FormationSweeper {
       const row = steps.find((s) => s.step === step);
       if (!row) continue;
 
-      const backoff = parseDetail<PollBackoff>(row.detail);
+      const backoff = parseDetail<StepBackoff>(row.detail);
       // Never polled: the row's own age is the clock, which is the ">24h since updated_at" rule.
       const due = backoff.nextPollAt ?? parseSqliteUtc(row.updatedAt) + POLL_BASE_MS;
       if (now < due) continue;
 
       let outcome: Awaited<ReturnType<typeof advanceFormation>>;
       try {
-        outcome = await withKeyedLock(entityKey, () =>
-          advanceFormation(this.d, entityKey, { requiredActions: true }),
-        );
+        outcome = await this.advance(entityKey);
       } catch (err) {
         opsLog("formation_poll_failed", {
           level: "warn",
@@ -329,27 +478,30 @@ export class FormationSweeper {
       // the next one down — the failure path already has its own backoff.
       if (!outcome.fetched) continue;
 
-      const interval = outcome.advanced
-        ? POLL_BASE_MS
-        : Math.min((backoff.pollIntervalMs ?? POLL_BASE_MS) * 2, POLL_CAP_MS);
-      this.persistBackoff(entityKey, { nextPollAt: now + interval, pollIntervalMs: interval });
+      this.persistBackoff(entityKey, outcome.advanced);
     }
   }
 
   /** Write the poll schedule onto whichever step the entity is waiting on NOW — which may not be
    *  the one it was waiting on before the poll, because the poll may have advanced it. */
-  private persistBackoff(entityKey: string, backoff: PollBackoff): void {
+  private persistBackoff(entityKey: string, advanced: boolean): void {
     const steps = this.d.requests.stepsOf(entityKey);
     const step = currentPolledStep(steps);
     if (!step) return; // fully formed: there is nothing left to schedule
     const row = steps.find((s) => s.step === step);
     if (!row) return;
-    this.d.requests.transition(entityKey, step, row.state, row.state, {
-      detail: JSON.stringify({ ...parseDetail<PollBackoff>(row.detail), ...backoff }),
-    });
+    // The processor may already have scheduled this row on the way past — `advanceEin` does,
+    // because it is the step that spends six weeks doing nothing and it is the one handler with
+    // no state change to hang an `updated_at` on. Doubling an interval twice for one poll would
+    // make the cadence grow at the square of the intended rate, so a schedule that is already in
+    // the future is left alone. An ADVANCE still resets it: something happened, ask again soon.
+    if (!advanced && row.nextPollAt !== null && row.nextPollAt > this.now()) return;
+    // The same helper the processor uses, so the blob and the `next_poll_at` column are written
+    // together by ONE piece of code — the column is an index over the blob, never a second truth.
+    persistPollBackoff(this.d, row, { advanced });
   }
 
-  // ── (d) PII erasure (design §3, audit H7) ─────────────────────────────────────────────────
+  // ── (e) PII erasure (design §3, audit H7) ─────────────────────────────────────────────────
 
   private erasePii(): void {
     const cutoff = sqliteUtcTimestamp(this.now() - UNBOUND_PARTY_MAX_AGE_MS);
@@ -361,7 +513,7 @@ export class FormationSweeper {
     }
   }
 
-  // ── (e) formations that have been in flight far too long ──────────────────────────────────
+  // ── (f) formations that have been in flight far too long ──────────────────────────────────
 
   private warnStale(): void {
     const now = this.now();
@@ -384,7 +536,20 @@ export class FormationSweeper {
     }
   }
 
-  // ── (f) retention ─────────────────────────────────────────────────────────────────────────
+  /**
+   * Drop stale-warning keys from days that are over (M5).
+   *
+   * The set is keyed `entityKey:step:YYYY-MM-DD` and it is what stops one stuck formation
+   * producing a warning every hour. It only ever GREW, though, and the API process is meant to
+   * run for months: one entry per stuck step per day, forever. Yesterday's keys can never match
+   * again, so they are simply dropped.
+   */
+  private pruneWarned(): void {
+    const today = new Date(this.now()).toISOString().slice(0, 10);
+    for (const key of this.warned) if (!key.endsWith(`:${today}`)) this.warned.delete(key);
+  }
+
+  // ── (g) retention ─────────────────────────────────────────────────────────────────────────
 
   private sweepEvents(): void {
     const deleted = this.d.events.deleteOlderThan(
