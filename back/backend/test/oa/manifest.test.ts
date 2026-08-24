@@ -360,23 +360,30 @@ const GOLDEN_CHAIN = {
   agentId: "881938",
 };
 
+/** Hand-written canonical form, byte for byte, exactly like the v1 vector: literal hashes rather
+ *  than expressions, because a golden vector an outsider cannot read off the page is not one. */
 const GOLDEN_V2_BYTES =
   '{"chain":{"agentId":"881938","chainId":5042002,' +
   '"legalManager":"0x00000000000000000000000000000000000000aa"},' +
   '"entity":{"jurisdiction":"Wyoming-DAO-LLC","name":"Golden Agent",' +
   '"publicId":"11111111-2222-3333-4444-555555555555"},' +
-  `"legal":{"documents":[{"name":"Articles of Organization.pdf","sha256":"${"a".repeat(64)}",` +
-  `"type":"ArticlesOfOrganization"},{"name":"Operating Agreement.pdf","sha256":"${"b".repeat(64)}",` +
+  '"legal":{"documents":[{"name":"Articles of Organization.pdf",' +
+  '"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",' +
+  '"type":"ArticlesOfOrganization"},{"name":"Operating Agreement.pdf",' +
+  '"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",' +
   '"type":"OperatingAgreement"}],"ein":null,"entityType":"LLC","environment":"sandbox",' +
   '"filingNumber":"2026-001234567","formationDate":1755600000,"provider":"doola",' +
   '"providerCompanyId":"cmp_123","state":"WY"},' +
-  `"previous":"${GOLDEN_HASH}","schema":"novi/oa-bundle/1",` +
+  '"previous":"0x1aedd87173d59c10abcfeb02713e8bdbdf8b00b83e7bcdf1c971bea0eb3e6b6c",' +
+  '"schema":"novi/oa-bundle/1",' +
   '"terms":{"hash":"0x1111111111111111111111111111111111111111111111111111111111111111",' +
   '"uri":"novi:doc:oa-golden-key-v1.md"},"version":2}\n';
 
 const GOLDEN_V2_HASH = "0xe76d8b7d1bb5173945a81b884867972a9842076d5b0543f08cf9afab1b024394";
 
 test("GOLDEN: a v2 manifest serializes to exactly these bytes and this anchor", () => {
+  // The literal `previous` above IS v1's anchor — asserted, not eyeballed.
+  expect(GOLDEN_V2_BYTES).toContain(`"previous":"${GOLDEN_HASH}"`);
   const v2 = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
   expect(serializeManifest(v2)).toBe(GOLDEN_V2_BYTES);
   expect(manifestHash(serializeManifestBytes(v2))).toBe(GOLDEN_V2_HASH);
