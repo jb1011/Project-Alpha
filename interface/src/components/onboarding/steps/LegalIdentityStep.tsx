@@ -8,7 +8,16 @@ import {
   validateParty,
   type FormationParty,
 } from "../types";
-import { useCreateFormationPartyMutation, usePublicConfigQuery } from "@/lib/api/hooks";
+import {
+  useCreateFormationPartyMutation,
+  useFormationEnvironment,
+  usePublicConfigQuery,
+  useRetryPublicConfig,
+} from "@/lib/api/hooks";
+import {
+  isKnownEnvironment,
+  type FormationEnvironment,
+} from "@/lib/api/formationEnvironment";
 import {
   AmberPill,
   Button,
@@ -65,21 +74,20 @@ export function LegalIdentityStep({
   onComplete,
   onClear,
 }: Props) {
-  const { data: publicConfig, isError: configError } = usePublicConfigQuery();
+  const { data: publicConfig } = usePublicConfigQuery();
+  const environment = useFormationEnvironment();
+  const { retry, retrying } = useRetryPublicConfig();
   const createParty = useCreateFormationPartyMutation();
   const [error, setError] = useState<string | null>(null);
   const [showErrors, setShowErrors] = useState(false);
-  const [otherCountry, setOtherCountry] = useState(
-    () => party.country !== "" && !COUNTRIES.some((c) => c.code === party.country),
-  );
 
-  const environment = publicConfig?.formationEnvironment ?? null;
+  // Which of the two modes this screen is IS the honesty question, so it renders NEITHER until it
+  // has the answer. The old shape had two ways of getting this wrong and took both: a `/config`
+  // still in flight showed the demo panel for a beat, and a `/config` that had FAILED showed it
+  // permanently — telling a real founder on a production box that nothing they type is real, and
+  // offering them a synthetic-identity button and a skip on a deployment that allows neither.
+  const resolved = isKnownEnvironment(environment);
   const required = publicConfig?.formationRequired === true;
-  const sandbox = environment !== "production";
-  // Which of the two modes this screen is IS the honesty question, so it waits for the answer.
-  // Rendering the demo panel for a beat on a production deployment would tell a real founder that
-  // nothing they type is real — the one thing this screen must never say wrongly.
-  const loading = !publicConfig && !configError;
   const busy = createParty.isPending;
   const errors = validateParty(party);
 
@@ -108,26 +116,24 @@ export function LegalIdentityStep({
       <StepHeader
         eyebrow={eyebrow}
         title={
-          loading
+          !resolved
             ? "Legal identity"
-            : sandbox
+            : environment === "sandbox"
               ? "Legal identity (demo filing)"
               : "Who is filing this company?"
         }
         intro={
-          loading
+          !resolved
             ? "Checking what this deployment can file."
-            : sandbox
+            : environment === "sandbox"
               ? "This deployment files in doola's sandbox, so no real identity is collected or sent. The filing uses a labeled demo identity and produces a demo company — nothing legally exists at the end of it."
               : "A Wyoming LLC is filed in the name of a real, responsible person. doola files it on your behalf, so this identity goes to doola as the filing agent and is never written into your agent's public record, its on-chain metadata, or its operating agreement."
         }
       />
 
-      {loading ? (
-        <Card className="flex items-center gap-2.5 p-6 text-[12.5px] text-muted">
-          <Spinner className="h-3.5 w-3.5" /> Checking this deployment&apos;s filing environment…
-        </Card>
-      ) : partyId ? (
+      {/* A recorded handle FIRST: it is a fact the backend already gave us, and hiding it behind a
+          `/config` blip would strand somebody who has already done this step. */}
+      {partyId ? (
         <RecordedPanel
           partyId={partyId}
           synthetic={synthetic}
@@ -136,23 +142,12 @@ export function LegalIdentityStep({
             onClear();
           }}
         />
-      ) : sandbox ? (
-        <SandboxPanel
-          environment={environment}
-          busy={busy}
-          onCreate={() => void create({ synthetic: true })}
-        />
+      ) : !resolved ? (
+        <UnresolvedPanel environment={environment} retrying={retrying} onRetry={retry} />
+      ) : environment === "sandbox" ? (
+        <SandboxPanel />
       ) : (
-        <RealForm
-          party={party}
-          errors={showErrors ? errors : {}}
-          set={set}
-          otherCountry={otherCountry}
-          onOtherCountry={(on) => {
-            setOtherCountry(on);
-            set("country", "");
-          }}
-        />
+        <RealForm party={party} errors={showErrors ? errors : {}} set={set} />
       )}
 
       {error && (
@@ -161,7 +156,7 @@ export function LegalIdentityStep({
         </Callout>
       )}
 
-      {!loading && !partyId && !sandbox && (
+      {environment === "production" && !partyId && (
         <Callout tone="info" className="mt-6" title="Where this goes">
           Straight to doola, the filing agent, and into one table on this deployment that no view,
           no log, no metadata document and no on-chain record ever reads from. Your agent&apos;s
@@ -170,9 +165,10 @@ export function LegalIdentityStep({
       )}
 
       <StepNav onBack={onBack}>
-        {/* No skip offered until we know whether this deployment allows one — an affordance that
-            appears and then vanishes is worse than one that arrives a beat late. */}
-        {!loading && !required && !partyId && (
+        {/* No skip until we know whether this deployment allows one. An affordance that appears and
+            then vanishes is worse than one that arrives a beat late — and a skip offered on a
+            deployment that REQUIRES a filing walks the user into a refused submit two steps on. */}
+        {resolved && !required && !partyId && (
           <Button variant="subtle" disabled={busy} onClick={onComplete}>
             Skip — no legal filing
           </Button>
@@ -182,18 +178,19 @@ export function LegalIdentityStep({
             Continue
             <CheckIcon className="h-4 w-4" />
           </Button>
-        ) : sandbox ? (
-          <Button
-            disabled={loading}
-            loading={busy}
-            onClick={() => void create({ synthetic: true })}
-          >
+        ) : environment === "sandbox" ? (
+          <Button loading={busy} onClick={() => void create({ synthetic: true })}>
             Use the demo identity
           </Button>
-        ) : (
-          <Button disabled={loading} loading={busy} onClick={() => void submitReal()}>
+        ) : environment === "production" ? (
+          <Button loading={busy} onClick={() => void submitReal()}>
             Record identity
             {!busy && <CheckIcon className="h-4 w-4" />}
+          </Button>
+        ) : (
+          // Neutral: no synthetic POST, no real submit, no skip — just the way to ask again.
+          <Button variant="ghost" loading={retrying} onClick={retry}>
+            {environment === "loading" ? "Checking…" : "Retry"}
           </Button>
         )}
       </StepNav>
@@ -203,24 +200,56 @@ export function LegalIdentityStep({
 
 /* ------------------------------------------------------------------ */
 
-/** AMBER, never green (the honesty invariant, §2 — the guardian-waiver precedent). A sandbox
- *  filing is a demo, and every surface that shows it says so in the same colour. */
-function SandboxPanel({
+/**
+ * The environment is not known yet — so this panel claims NOTHING about it.
+ *
+ * No demo wording, no real-filing wording, no identity form and no synthetic-identity button: the
+ * two panels below are both assertions about what this deployment does, and neither can be made
+ * from here. What it does offer is the way out — asking `/config` again, without losing the
+ * wizard state a page reload would throw away.
+ */
+function UnresolvedPanel({
   environment,
-  busy,
-  onCreate,
+  retrying,
+  onRetry,
 }: {
-  environment: "sandbox" | "production" | null;
-  busy: boolean;
-  onCreate: () => void;
+  environment: FormationEnvironment;
+  retrying: boolean;
+  onRetry: () => void;
 }) {
+  const checking = environment === "loading";
+  return (
+    <Card className="p-6">
+      <div className="flex items-center gap-2.5 text-[13px] text-muted">
+        {(checking || retrying) && <Spinner className="h-3.5 w-3.5" />}
+        {checking
+          ? "Checking this deployment's filing environment…"
+          : "Can't verify this deployment's filing environment"}
+      </div>
+      <p className="mt-3 text-[12.5px] leading-[1.6] text-muted-2">
+        Whether a filing here is real or a labeled demo decides what this screen collects and what
+        it tells you afterwards, so it says neither until the deployment answers. Nothing has been
+        recorded and nothing has been sent.
+      </p>
+      {!checking && (
+        <Button className="mt-5" variant="ghost" loading={retrying} onClick={onRetry}>
+          Retry
+        </Button>
+      )}
+    </Card>
+  );
+}
+
+/** AMBER, never green (the honesty invariant, §2 — the guardian-waiver precedent). A sandbox
+ *  filing is a demo, and every surface that shows it says so in the same colour.
+ *
+ *  Rendered only for a CONFIRMED sandbox — an unreported environment gets `UnresolvedPanel`, not
+ *  this one, which is why there is no "environment not reported" caveat left inside it. */
+function SandboxPanel() {
   return (
     <Card className="border-[#febc2e]/30 bg-[#febc2e]/[0.05] p-6">
       <div className="flex flex-wrap items-center gap-2.5">
         <AmberPill size="label">Demo formation (sandbox)</AmberPill>
-        {environment === null && (
-          <span className="text-[11.5px] text-muted-2">environment not reported by this deployment</span>
-        )}
       </div>
       <p className="mt-4 text-[13px] leading-[1.65] text-muted">
         Nothing is filed with the State of Wyoming and no company legally exists at the end of
@@ -241,9 +270,6 @@ function SandboxPanel({
           screen naming doola as the processor.
         </Point>
       </ul>
-      <Button className="mt-6" variant="ghost" loading={busy} onClick={onCreate}>
-        Use the demo identity
-      </Button>
     </Card>
   );
 }
@@ -293,15 +319,22 @@ function RealForm({
   party,
   errors,
   set,
-  otherCountry,
-  onOtherCountry,
 }: {
   party: FormationParty;
   errors: ReturnType<typeof validateParty>;
   set: <K extends keyof FormationParty>(key: K, value: FormationParty[K]) => void;
-  otherCountry: boolean;
-  onOtherCountry: (on: boolean) => void;
 }) {
+  // Local to the form, because that is the only thing that can see it: "is the country one of the
+  // listed ones or typed in by hand" is a fact about this `<select>`, not about the wizard. It was
+  // hoisted to the step so a prop pair could carry it back down, and the step then had to reset it
+  // in a callback beside the field's own value — two places to keep in step for one dropdown.
+  const [otherCountry, setOtherCountry] = useState(
+    () => party.country !== "" && !COUNTRIES.some((c) => c.code === party.country),
+  );
+  const onOtherCountry = (on: boolean) => {
+    setOtherCountry(on);
+    set("country", "");
+  };
   const isUs = party.country.trim().toUpperCase() === "USA";
   return (
     <div className="flex flex-col gap-6">

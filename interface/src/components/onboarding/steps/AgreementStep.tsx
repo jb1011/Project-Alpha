@@ -4,7 +4,15 @@ import { useState } from "react";
 import { AgentConfig, formatUsdc } from "../types";
 import { StepNav } from "../OnboardingFlow";
 import { useAuth } from "../AuthProvider";
-import { useOnboardEntityMutation, usePublicConfigQuery } from "@/lib/api/hooks";
+import {
+  useFormationEnvironment,
+  useOnboardEntityMutation,
+  useRetryPublicConfig,
+} from "@/lib/api/hooks";
+import {
+  isKnownEnvironment,
+  type FormationEnvironment,
+} from "@/lib/api/formationEnvironment";
 import { configToAgentSpec } from "@/lib/api/spec";
 import type { GuardianPasskey } from "@/lib/api/types";
 import {
@@ -43,7 +51,8 @@ export function AgreementStep({
   onSubmitted,
 }: Props) {
   const { address } = useAuth();
-  const { data: publicConfig } = usePublicConfigQuery();
+  const deploymentEnvironment = useFormationEnvironment();
+  const { retry, retrying } = useRetryPublicConfig();
   const onboardEntity = useOnboardEntityMutation();
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -52,9 +61,17 @@ export function AgreementStep({
   // "Formation applies to THIS agent" is the handle, not the deployment: a deployment that can
   // form entities still onboards agents that asked for no filing.
   const forming = partyId !== null;
-  const sandbox = partySynthetic || publicConfig?.formationEnvironment !== "production";
+  // A SYNTHETIC handle is the labeled sandbox fixture — a fact about the handle the backend
+  // already told us, true whatever `/config` says or fails to say. Everything else defers to the
+  // deployment's answer, INCLUDING its two ways of not having one.
+  const environment: FormationEnvironment = partySynthetic ? "sandbox" : deploymentEnvironment;
+  // The gate. Confirming here starts a filing, and a filing whose environment we cannot name is
+  // one this screen cannot describe honestly — so it does not let the user start it. This is the
+  // exact case that used to render "Demo — nothing is filed" over a real Wyoming filing.
+  const blockedOnEnvironment = forming && !isKnownEnvironment(environment);
 
   async function submit() {
+    if (blockedOnEnvironment) return;
     if (!guardianPasskey || !address) {
       setError("Complete wallet sign-in and passkey setup first.");
       return;
@@ -93,7 +110,12 @@ export function AgreementStep({
       <div className="grid grid-cols-1 gap-8 lg:grid-cols-[1fr_320px] lg:gap-10">
         <div className="flex min-w-0 flex-col gap-5">
           <AnchorExplainer config={config} forming={forming} />
-          <FormationNote forming={forming} sandbox={sandbox} />
+          <FormationNote
+            forming={forming}
+            environment={environment}
+            onRetry={retry}
+            retrying={retrying}
+          />
         </div>
 
         <div className="flex flex-col gap-5 lg:sticky lg:top-24 lg:self-start">
@@ -158,9 +180,14 @@ export function AgreementStep({
       )}
 
       <StepNav onBack={onBack}>
+        {blockedOnEnvironment && (
+          <span className="text-[11.5px] text-muted-2">
+            Waiting on this deployment&apos;s filing environment.
+          </span>
+        )}
         <Button
           onClick={submit}
-          disabled={!confirmed || submitting}
+          disabled={!confirmed || submitting || blockedOnEnvironment}
           loading={submitting}
         >
           {submitting ? "Submitting…" : "Confirm & deploy"}
@@ -299,9 +326,22 @@ function Committed({ title, body }: { title: string; body: string }) {
  * Where the REAL Operating Agreement comes from — and, in sandbox, that it is a demo.
  *
  * Amber for sandbox, never green: a demo filing must read as a demo on every surface that shows
- * it (the guardian-waiver precedent).
+ * it (the guardian-waiver precedent). And NEITHER claim when the environment is not known: this
+ * paragraph is the one a founder reads before ticking the box, and the version of it that said
+ * "nothing is filed with the State of Wyoming" over a real filing is the reason the environment
+ * has four states now.
  */
-function FormationNote({ forming, sandbox }: { forming: boolean; sandbox: boolean }) {
+function FormationNote({
+  forming,
+  environment,
+  onRetry,
+  retrying,
+}: {
+  forming: boolean;
+  environment: FormationEnvironment;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
   if (!forming) {
     return (
       <Callout tone="info" title="No legal filing for this agent">
@@ -310,12 +350,39 @@ function FormationNote({ forming, sandbox }: { forming: boolean; sandbox: boolea
       </Callout>
     );
   }
+
+  if (!isKnownEnvironment(environment)) {
+    return (
+      <Callout tone="muted" title="Can&apos;t verify this deployment&apos;s filing environment">
+        <p>
+          A legal identity is attached to this agent, so a filing will be opened for it. This
+          deployment has not told us whether it files for real or in the provider&apos;s sandbox,
+          and until it does, nothing on this screen will claim either. Confirming is disabled in
+          the meantime — being told a filing is a demo when it is not is the one mistake this
+          screen must never make.
+        </p>
+        <Button
+          variant="ghost"
+          className="mt-3"
+          loading={retrying}
+          onClick={onRetry}
+        >
+          {environment === "loading" ? "Checking…" : "Retry"}
+        </Button>
+      </Callout>
+    );
+  }
+
   return (
     <Callout
-      tone={sandbox ? "warn" : "accent"}
-      title={sandbox ? "Demo formation (sandbox)" : "The real Operating Agreement arrives after filing"}
+      tone={environment === "sandbox" ? "warn" : "accent"}
+      title={
+        environment === "sandbox"
+          ? "Demo formation (sandbox)"
+          : "The real Operating Agreement arrives after filing"
+      }
     >
-      {sandbox ? (
+      {environment === "sandbox" ? (
         <>
           Nothing is filed with the State of Wyoming and no company legally exists. doola&apos;s
           sandbox returns DEMO documents — including a demo Operating Agreement — after the demo

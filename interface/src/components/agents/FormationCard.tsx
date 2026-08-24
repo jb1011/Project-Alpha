@@ -2,6 +2,10 @@
 
 import { useState } from "react";
 import { downloadDocument } from "@/lib/api/client";
+import {
+  formationEnvironmentOf,
+  type FormationEnvironment,
+} from "@/lib/api/formationEnvironment";
 import type { EntityView, FormationDocument } from "@/lib/api/types";
 import { formatDate } from "@/lib/format";
 import { useAuth } from "@/components/onboarding/AuthProvider";
@@ -18,6 +22,13 @@ type Formation = NonNullable<EntityView["formation"]>;
  * an EIN. The guardian-waiver card set the precedent: an honest-but-unverified state gets its own
  * colour rather than borrowing the confirmed one.
  *
+ * The confirmed colour therefore requires an explicit "production" and nothing else. A row whose
+ * `environment` this build cannot read — a value from a newer backend, an absent field — is
+ * `unknown`, and unknown is amber too: green is a claim that a real company exists in a real
+ * register, and the one thing worse than calling a real filing a demo is calling an unverifiable
+ * one real. Note the environment comes from the ENTITY's own record, not from `GET /config`: an
+ * agent filed in sandbox stays a sandbox filing on a box that later flips to production.
+ *
  * Rendered only for entities that HAVE a formation block — a legacy or stub row has none, forever,
  * and inventing a "not formed" card for it would describe an absence as a stage.
  */
@@ -32,7 +43,10 @@ export function FormationCard({
   const [busyDocId, setBusyDocId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const sandbox = formation.environment === "sandbox";
+  const environment = formationEnvironmentOf(formation.environment);
+  const confirmedReal = environment === "production";
+  // Amber covers "sandbox" AND "unknown" — everything that is not a confirmed real filing.
+  const sandbox = environment === "sandbox";
   const documents = formation.documents ?? [];
   const requiredActions = formation.requiredActions ?? [];
 
@@ -65,28 +79,30 @@ export function FormationCard({
   }
 
   return (
-    <Card className={cx("p-5", sandbox && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
+    <Card className={cx("p-5", !confirmedReal && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <SectionTitle>Legal formation</SectionTitle>
-        {sandbox ? (
-          <AmberPill>Demo formation (sandbox)</AmberPill>
-        ) : (
+        {confirmedReal ? (
           <span className="inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1 text-[11.5px] text-muted-2">
             Production filing
           </span>
+        ) : (
+          <AmberPill>
+            {sandbox ? "Demo formation (sandbox)" : "Filing environment not reported"}
+          </AmberPill>
         )}
       </div>
 
       <div
         className={cx(
           "mt-3 text-[13px] leading-[1.5]",
-          statusTone(formation.status, sandbox),
+          statusTone(formation.status, environment),
         )}
       >
-        {statusHeadline(formation.status, sandbox)}
+        {statusHeadline(formation.status, environment)}
       </div>
       <p className="mt-1 text-[11.5px] leading-[1.5] text-muted-2">
-        {statusDetail(formation.status, sandbox)}
+        {statusDetail(formation.status, environment)}
       </p>
 
       <dl className="mt-4 flex flex-col gap-3 text-[12.5px]">
@@ -168,32 +184,48 @@ function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   );
 }
 
-/** Amber for every sandbox state — never the confirmed colour, whatever the sub-status says. */
-function statusTone(status: Formation["status"], sandbox: boolean): string {
+/** Amber for everything that is not a CONFIRMED real filing — never the confirmed colour,
+ *  whatever the sub-status says, and never for an environment we could not read. */
+function statusTone(status: Formation["status"], environment: FormationEnvironment): string {
   if (status === "failed") return "text-[#ff8a84]";
-  if (sandbox) return "text-[#f3cd72]";
+  if (environment !== "production") return "text-[#f3cd72]";
   if (status === "filed" || status === "complete") return "text-emerald-300";
   return "text-muted";
 }
 
-function statusHeadline(status: Formation["status"], sandbox: boolean): string {
+function statusHeadline(status: Formation["status"], environment: FormationEnvironment): string {
+  const demo = environment === "sandbox";
+  const real = environment === "production";
   switch (status) {
     case "none":
       return "Not started";
     case "in_progress":
-      return sandbox ? "Demo filing in progress" : "Filing in progress";
+      return demo ? "Demo filing in progress" : "Filing in progress";
+    // "the company legally exists" is a CLAIM, and it needs a confirmed production environment
+    // behind it. Unknown gets the bare fact the sub-saga reported and nothing added to it.
     case "filed":
-      return sandbox ? "Demo filed — nothing legally exists" : "Filed — the company legally exists";
+      return demo
+        ? "Demo filed — nothing legally exists"
+        : real
+          ? "Filed — the company legally exists"
+          : "Filed";
     case "complete":
-      return sandbox ? "Demo complete — sandbox EIN issued" : "Complete — EIN issued";
+      return demo
+        ? "Demo complete — sandbox EIN issued"
+        : real
+          ? "Complete — EIN issued"
+          : "Complete";
     case "failed":
       return "Filing failed";
   }
 }
 
-function statusDetail(status: Formation["status"], sandbox: boolean): string {
-  if (sandbox) {
+function statusDetail(status: Formation["status"], environment: FormationEnvironment): string {
+  if (environment === "sandbox") {
     return "This deployment files in the provider's sandbox. No state register was touched, the documents are demo documents, and the EIN is not a tax identifier.";
+  }
+  if (environment !== "production") {
+    return "This record does not say which environment it was filed in, so nothing here claims the company does or does not legally exist. Treat the documents and any EIN below as unverified and contact the operator.";
   }
   switch (status) {
     case "none":
