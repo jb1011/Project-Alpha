@@ -64,6 +64,32 @@ test("a formed row serves provider + environment + the derived status", () => {
     hash: "0xabc",
     version: 1,
     pendingHash: null,
+    pendingVersion: null,
+    amendmentExecutableAt: null,
+  });
+});
+
+test("PR4: a PENDING amendment serves its version and its executable-at, in SECONDS", () => {
+  // What the guardian veto card renders beside the on-chain hash it read for itself: the version
+  // number is a label, and `amendmentExecutableAt` is the countdown. Seconds, like the column and
+  // like the chain — a millisecond value here would put the countdown 55,000 years out and the
+  // "veto now" window would never open.
+  const v = toEntityView({
+    ...BASE,
+    oaManifestVersion: 2,
+    oaManifestAnchoredHash: "0xv2",
+    oaHash: "0xv2",
+    oaManifestPendingHash: "0xv3",
+    oaManifestPendingVersion: 3,
+    oaAmendmentExecutableAt: 1_755_600_000,
+  });
+  expect(v.oaAnchor).toEqual({
+    scheme: "manifest",
+    hash: "0xv2",
+    version: 2,
+    pendingHash: "0xv3",
+    pendingVersion: 3,
+    amendmentExecutableAt: 1_755_600_000,
   });
 });
 
@@ -81,6 +107,8 @@ test("G2: the anchor scheme comes from the SAME predicate the saga anchors with"
     hash: "0xman",
     version: null,
     pendingHash: "0xman",
+    pendingVersion: null,
+    amendmentExecutableAt: null,
   });
 
   // A brand-new row (nothing derived yet) is a manifest entity too — that is what the saga will
@@ -91,6 +119,8 @@ test("G2: the anchor scheme comes from the SAME predicate the saga anchors with"
     hash: null,
     version: null,
     pendingHash: null,
+    pendingVersion: null,
+    amendmentExecutableAt: null,
   });
 
   // …and a legacy row stays legacy whatever its tx state is.

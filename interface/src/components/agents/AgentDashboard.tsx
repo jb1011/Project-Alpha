@@ -10,11 +10,14 @@ import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
+import { shortenErr } from "@/lib/errors";
+import { oaAnchorLabel, pendingAnchorLabel } from "@/lib/oaAnchor";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { JobsReputationCard } from "@/components/agents/JobsReputationCard";
 import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
-import { Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
+import { FormationCard } from "@/components/agents/FormationCard";
+import { AmberPill, Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
 
 export function AgentDashboard({
@@ -251,7 +254,11 @@ export function AgentDashboard({
               // documents, chain identity — so it is an "anchor" and its version is part of its
               // name. For a legacy row it commits to the operating-agreement document alone, and
               // calling that an anchor would overstate what is on chain.
-              <OnChainRow label={oaAnchorLabel(entity)} value={`${entity.oaHash.slice(0, 14)}…`} />
+              <OnChainRow
+                label={oaAnchorLabel(entity)}
+                value={`${entity.oaHash.slice(0, 14)}…`}
+                chip={pendingAnchorChip(entity)}
+              />
             )}
           </dl>
           <div className="mt-4 flex flex-wrap gap-3">
@@ -311,6 +318,12 @@ export function AgentDashboard({
         </div>
 
         <div className="flex flex-col gap-6">
+          {/* Only for entities that HAVE a formation block: a legacy or stub row has none,
+              forever, and a "not formed" card would describe an absence as a stage. */}
+          {entity?.formation && (
+            <FormationCard entityId={entityId} formation={entity.formation} />
+          )}
+
           <Card className="p-5">
             <div className="flex items-center justify-between">
               <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">Active rules</div>
@@ -498,11 +511,6 @@ function RunRow({ run }: { run: AgentRun }) {
   );
 }
 
-function shortenErr(msg: string): string {
-  const first = msg.split("\n")[0]?.trim() ?? "Transaction failed.";
-  return first.length > 140 ? `${first.slice(0, 140)}…` : first;
-}
-
 /** `<publicId>.novicorpus.eth` — the wildcard gateway resolves any entity by its publicId label.
  *  The view doesn't carry publicId, but the public metadataURI ends with it. file:// legacy
  *  agents predate the ENS integration and simply don't get a name shown. */
@@ -513,18 +521,20 @@ function ensName(entity: { metadataURI: string | null }): string | null {
   return label ? `${label.toLowerCase()}.${ENS_PARENT_NAME}` : null;
 }
 
-/**
- * How to NAME the on-chain OA hash row.
- *
- * The scheme comes from the backend (`oaAnchor.scheme`), never from guessing at a version
- * number: a manifest entity whose v1 has not confirmed yet has a null version, and calling that
- * "OA hash" would describe a bundle anchor as a plain document hash. An absent `oaAnchor` means
- * a backend that predates the field, which is the legacy shape by definition.
- */
-function oaAnchorLabel(entity: Pick<EntityView, "oaAnchor">): string {
-  const anchor = entity.oaAnchor;
-  if (!anchor || anchor.scheme === "legacy") return "OA hash";
-  return anchor.version != null ? `OA anchor (v${anchor.version})` : "OA anchor (pending)";
+/** The chip beside the anchored hash. Its TEXT — including whether a version number can honestly
+ *  be named at all — is decided in `lib/oaAnchor.ts`, where it is tested. */
+function pendingAnchorChip(entity: Pick<EntityView, "oaAnchor">): ReactNode {
+  const label = pendingAnchorLabel(entity);
+  if (!label) return null;
+  return (
+    <AmberPill
+      size="sm"
+      className="font-normal"
+      title="A new version of this entity's anchor is scheduled behind the guardian timelock. Review or veto it in Settings."
+    >
+      {label}
+    </AmberPill>
+  );
 }
 
 function EnsGlobe({ className }: { className?: string }) {
@@ -537,11 +547,21 @@ function EnsGlobe({ className }: { className?: string }) {
   );
 }
 
-function OnChainRow({ label, value, href }: { label: string; value: string; href?: string }) {
+function OnChainRow({
+  label,
+  value,
+  href,
+  chip,
+}: {
+  label: string;
+  value: string;
+  href?: string;
+  chip?: ReactNode;
+}) {
   return (
     <div>
       <dt className="text-muted-2">{label}</dt>
-      <dd className="mt-0.5 font-mono text-ink">
+      <dd className="mt-0.5 flex flex-wrap items-center gap-2 font-mono text-ink">
         {href ? (
           <a href={href} target="_blank" rel="noreferrer" className="hover:text-accent-soft">
             {value}
@@ -549,6 +569,7 @@ function OnChainRow({ label, value, href }: { label: string; value: string; href
         ) : (
           value
         )}
+        {chip}
       </dd>
     </div>
   );

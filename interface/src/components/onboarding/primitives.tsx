@@ -152,7 +152,7 @@ export function Callout({
   children,
   className,
 }: {
-  tone?: "accent" | "info" | "warn";
+  tone?: "accent" | "info" | "warn" | "alarm" | "muted";
   icon?: ReactNode;
   title?: string;
   children?: ReactNode;
@@ -161,7 +161,15 @@ export function Callout({
   const tones = {
     accent: "border-accent/25 bg-accent/[0.07] text-accent-soft",
     info: "border-line-strong bg-paper-2/70 text-muted",
+    // `muted` is `info` under the vocabulary the chain-reading cards speak (alarm / warn / muted),
+    // where "info" would read as a fourth severity rather than the absence of one. Same pixels,
+    // and deliberately so: one visual language, two names for the quiet end of it.
+    muted: "border-line-strong bg-paper-2/70 text-muted",
     warn: "border-[#febc2e]/30 bg-[#febc2e]/[0.07] text-[#f3cd72]",
+    // Louder than `warn` on purpose, and reserved for the one thing that earns it: the platform's
+    // record disagreeing with the chain. Spending it on anything routine is how a guardian learns
+    // to ignore it.
+    alarm: "border-[#ff5f57]/45 bg-[#ff5f57]/[0.09] text-[#ff8a84]",
   } as const;
   return (
     <div
@@ -178,6 +186,104 @@ export function Callout({
         )}
         <div className={cx(title && "mt-0.5")}>{children}</div>
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* The amber pill — the honesty invariant, as one component            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * AMBER, never green.
+ *
+ * A demo formation, a sandbox document set and a pending amendment are all states that are honest
+ * but not confirmed, and the guardian-waiver card set the rule they follow: an unconfirmed state
+ * gets its OWN colour rather than borrowing the confirmed one. Four surfaces render that pill
+ * (the formation card's badge, the wizard's sandbox panel, the dashboard's "update pending" chip
+ * and the veto card), and four hand-rolled copies of a colour rule is three copies too many —
+ * the one that drifts to `emerald` is the one that lies.
+ *
+ * `size` is the only axis, because the pill sits in three different type contexts: beside a card
+ * heading, inside an `h1`, and as a standalone label.
+ */
+export function AmberPill({
+  size = "md",
+  dot = true,
+  title,
+  className,
+  children,
+}: {
+  size?: "sm" | "md" | "label";
+  /** The leading dot. Off where the pill already sits next to one. */
+  dot?: boolean;
+  title?: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  const sizes = {
+    sm: "px-2 py-0.5 text-[10.5px]",
+    md: "px-3 py-1 text-[11.5px]",
+    label: "px-3 py-1 text-[11px] uppercase tracking-[0.14em]",
+  } as const;
+  return (
+    <span
+      title={title}
+      className={cx(
+        "inline-flex items-center gap-1.5 rounded-full border border-[#febc2e]/40 bg-[#febc2e]/10 text-[#f3cd72]",
+        sizes[size],
+        className,
+      )}
+    >
+      {dot && (
+        <span
+          aria-hidden
+          className={cx(
+            "shrink-0 rounded-full bg-[#febc2e]",
+            size === "sm" ? "h-1 w-1" : "h-1.5 w-1.5",
+          )}
+        />
+      )}
+      {children}
+    </span>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Section title — one component, both variants                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The small heading above a block, in its two shapes: the plain tracked caps used on every card,
+ * and the lettered variant the wizard's long forms use to say "part A", "part B".
+ *
+ * One component rather than the four private copies this replaces — three of them identical to
+ * the character, which is exactly the sort of thing that ends up with four different letter
+ * spacings after a year.
+ */
+export function SectionTitle({
+  n,
+  className,
+  children,
+}: {
+  /** The letter badge. Present → the lettered form-section variant; absent → the plain caps one. */
+  n?: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  if (n) {
+    return (
+      <div className={cx("flex items-center gap-2.5", className)}>
+        <span className="flex h-5 w-5 items-center justify-center rounded-md border hairline-strong bg-paper text-[10.5px] text-muted">
+          {n}
+        </span>
+        <h3 className="text-[14px] font-medium text-ink">{children}</h3>
+      </div>
+    );
+  }
+  return (
+    <div className={cx("text-[11px] uppercase tracking-[0.18em] text-muted-2", className)}>
+      {children}
     </div>
   );
 }

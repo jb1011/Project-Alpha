@@ -1,10 +1,18 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { AgentConfig, formatUsdc, shortAddress } from "../types";
+import { useState } from "react";
+import { AgentConfig, formatUsdc } from "../types";
 import { StepNav } from "../OnboardingFlow";
 import { useAuth } from "../AuthProvider";
-import { useOnboardEntityMutation } from "@/lib/api/hooks";
+import {
+  useFormationEnvironment,
+  useOnboardEntityMutation,
+  useRetryPublicConfig,
+} from "@/lib/api/hooks";
+import {
+  isKnownEnvironment,
+  type FormationEnvironment,
+} from "@/lib/api/formationEnvironment";
 import { configToAgentSpec } from "@/lib/api/spec";
 import type { GuardianPasskey } from "@/lib/api/types";
 import {
@@ -18,41 +26,52 @@ import {
 } from "../primitives";
 
 type Props = {
+  /** "Screen N" — counted over the phases THIS deployment shows. */
+  eyebrow: string;
   config: AgentConfig;
   guardianPasskey: GuardianPasskey | null;
   idempotencyKey: string | null;
+  /** The opaque formation-party handle, when the legal-identity step produced one. Never the
+   *  identity — that is gone from this browser by the time the wizard reaches here. */
+  partyId: string | null;
+  /** Whether that handle is the labeled sandbox fixture. Amber, never green. */
+  partySynthetic: boolean;
   onBack: () => void;
   onSubmitted: (entityId: string, idempotencyKey: string) => void;
 };
 
 export function AgreementStep({
+  eyebrow,
   config,
   guardianPasskey,
   idempotencyKey,
+  partyId,
+  partySynthetic,
   onBack,
   onSubmitted,
 }: Props) {
   const { address } = useAuth();
+  const deploymentEnvironment = useFormationEnvironment();
+  const { retry, retrying } = useRetryPublicConfig();
   const onboardEntity = useOnboardEntityMutation();
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const submitting = onboardEntity.isPending;
 
-  const agreementText = useMemo(() => buildAgreement(config), [config]);
-
-  function download() {
-    const blob = new Blob([agreementText], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${(config.name || "agent").toLowerCase().replace(/\s+/g, "-")}-operating-agreement.txt`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
+  // "Formation applies to THIS agent" is the handle, not the deployment: a deployment that can
+  // form entities still onboards agents that asked for no filing.
+  const forming = partyId !== null;
+  // A SYNTHETIC handle is the labeled sandbox fixture — a fact about the handle the backend
+  // already told us, true whatever `/config` says or fails to say. Everything else defers to the
+  // deployment's answer, INCLUDING its two ways of not having one.
+  const environment: FormationEnvironment = partySynthetic ? "sandbox" : deploymentEnvironment;
+  // The gate. Confirming here starts a filing, and a filing whose environment we cannot name is
+  // one this screen cannot describe honestly — so it does not let the user start it. This is the
+  // exact case that used to render "Demo — nothing is filed" over a real Wyoming filing.
+  const blockedOnEnvironment = forming && !isKnownEnvironment(environment);
 
   async function submit() {
+    if (blockedOnEnvironment) return;
     if (!guardianPasskey || !address) {
       setError("Complete wallet sign-in and passkey setup first.");
       return;
@@ -70,6 +89,9 @@ export function AgreementStep({
         guardianPasskey,
         idempotencyKey: key,
         custody: config.custody,
+        // The HANDLE, never the identity: `spec` is persisted verbatim by the backend, and PII
+        // that entered it would land in a column every read path touches.
+        partyId: partyId ?? undefined,
       });
       onSubmitted(id, key);
     } catch (e) {
@@ -80,34 +102,30 @@ export function AgreementStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 5"
-        title="Review your operating agreement"
-        intro="The backend will translate these rules into an LLC operating agreement and bind them to the on-chain policy when you confirm."
+        eyebrow={eyebrow}
+        title="Review what gets anchored"
+        intro="Confirming publishes one hash on Arc. This is what that hash commits to, and what it does not."
       />
 
       <div className="grid grid-cols-1 gap-8 lg:grid-cols-[1fr_320px] lg:gap-10">
-        <Card className="overflow-hidden">
-          <div className="flex items-center justify-between border-b hairline px-5 py-3">
-            <span className="text-[12px] text-muted-2">
-              Operating Agreement — {config.name || "Agent"} DAO LLC
-            </span>
-            <button
-              onClick={download}
-              className="text-[12px] text-muted underline-offset-2 hover:text-ink hover:underline"
-            >
-              Download
-            </button>
-          </div>
-          <div className="max-h-[420px] overflow-y-auto px-6 py-5 text-[12.5px] leading-[1.7] text-muted whitespace-pre-wrap">
-            {agreementText}
-          </div>
-        </Card>
+        <div className="flex min-w-0 flex-col gap-5">
+          <AnchorExplainer config={config} forming={forming} />
+          <FormationNote
+            forming={forming}
+            environment={environment}
+            onRetry={retry}
+            retrying={retrying}
+          />
+        </div>
 
         <div className="flex flex-col gap-5 lg:sticky lg:top-24 lg:self-start">
           <Card className="p-5">
             <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">
-              Key clauses
+              Machine terms
             </div>
+            <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
+              The rules the contracts actually enforce. These are hashed into the anchor.
+            </p>
             <ul className="mt-4 flex flex-col gap-3">
               {keyClauses(config).map((c) => (
                 <li key={c.title} className="flex gap-2.5">
@@ -126,16 +144,18 @@ export function AgreementStep({
               On submit
             </div>
             <p className="mt-3 text-[12px] leading-[1.5] text-muted">
-              The backend generates the legal document, registers identity on Arc,
-              deploys contracts, and binds the agent wallet. This takes a few minutes.
+              The backend writes the terms document, registers identity on Arc, deploys the
+              contracts, binds the agent wallet, and anchors version 1 of the manifest. This takes
+              a few minutes.
+              {forming && " The filing runs after that, on its own clock."}
             </p>
           </Card>
         </div>
       </div>
 
       <Callout tone="warn" className="mt-7" title="Human decision point">
-        This is a binding policy for a real legal entity. Read it, then confirm
-        you agree to these rules.
+        These rules bind a real on-chain treasury and, once anchored, are what the entity&apos;s
+        record commits to. Read them, then confirm.
       </Callout>
 
       <label className="mt-5 flex cursor-pointer items-start gap-3 text-[13px] text-ink">
@@ -148,8 +168,8 @@ export function AgreementStep({
           )}
         />
         <span className="text-muted">
-          I&apos;ve reviewed the operating agreement and I confirm these rules
-          for {config.name || "my agent"}.
+          I&apos;ve reviewed what will be anchored and I confirm these rules for{" "}
+          {config.name || "my agent"}.
         </span>
       </label>
 
@@ -160,9 +180,14 @@ export function AgreementStep({
       )}
 
       <StepNav onBack={onBack}>
+        {blockedOnEnvironment && (
+          <span className="text-[11.5px] text-muted-2">
+            Waiting on this deployment&apos;s filing environment.
+          </span>
+        )}
         <Button
           onClick={submit}
-          disabled={!confirmed || submitting}
+          disabled={!confirmed || submitting || blockedOnEnvironment}
           loading={submitting}
         >
           {submitting ? "Submitting…" : "Confirm & deploy"}
@@ -217,65 +242,161 @@ function keyClauses(config: AgentConfig) {
   ];
 }
 
-function buildAgreement(config: AgentConfig): string {
-  const name = config.name || "The Agent";
-  const lines = config.allowlist.length
-    ? config.allowlist
-        .map((a, i) => `        (${i + 1}) ${a.label || "Recipient"} — ${shortAddress(a.address)}`)
-        .join("\n")
-    : "        (none — open recipients within the spending caps)";
+/* ------------------------------------------------------------------ */
 
-  return `OPERATING AGREEMENT
-OF ${name.toUpperCase()} DAO LLC
-(A Wyoming Decentralized Autonomous Organization Limited Liability Company)
+/**
+ * What the on-chain anchor actually commits to.
+ *
+ * This screen used to render a long-form "OPERATING AGREEMENT OF … DAO LLC" assembled in the
+ * browser, with articles and a witness clause, downloadable as a .txt. Nothing signed it, nothing
+ * filed it, no lawyer wrote it, and the hash that went on-chain did not commit to it. It looked
+ * like the legal document while being the one thing on the page that was not real — the exact
+ * fabrication class the frontend audit found on the landing page.
+ *
+ * What replaces it is smaller and true: the scheme, the contents, and where the REAL document
+ * comes from.
+ */
+function AnchorExplainer({ config, forming }: { config: AgentConfig; forming: boolean }) {
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between border-b hairline px-5 py-3">
+        <span className="text-[12px] text-muted-2">
+          OA bundle anchor — {config.name || "Agent"} DAO LLC
+        </span>
+        <span className="text-[11px] uppercase tracking-[0.14em] text-muted-2">version 1</span>
+      </div>
+      <div className="px-6 py-5 text-[12.5px] leading-[1.7] text-muted">
+        <p>
+          The backend assembles a JSON <strong className="font-medium text-ink">manifest</strong>,
+          canonicalises it (RFC 8785) and hashes it with keccak256. That single hash — and nothing
+          else — is written to your entity&apos;s LegalManager contract on Arc. Anyone holding only
+          the chain can fetch the published manifest and recompute it.
+        </p>
 
-ARTICLE I — FORMATION
-1.1  This Agreement governs ${name} DAO LLC (the "Company"), formed under the
-     Wyoming DAO LLC Act. The Company is algorithmically managed within the
-     bounds defined herein and mirrored by smart contract.
+        <div className="mt-5 text-[11px] uppercase tracking-[0.18em] text-muted-2">
+          The manifest commits to
+        </div>
+        <ul className="mt-3 flex flex-col gap-2.5">
+          <Committed
+            title="The machine terms"
+            body="The caps, period, allowlist, timelock and custody in the panel beside this one, as a terms document with its own hash."
+          />
+          <Committed
+            title="This chain and this agent"
+            body="Chain id, the LegalManager address and the agent id — so an anchor from another deployment can never be mistaken for yours."
+          />
+          <Committed
+            title="The entity"
+            body="Name, jurisdiction and public id."
+          />
+          <Committed
+            title={forming ? "The legal filing, once it exists" : "The legal filing — not applicable"}
+            body={
+              forming
+                ? "Provider, environment, entity type, state, formation date, filing number, EIN, and the sha256 of every document the filing produces. Each new fact is a new manifest version."
+                : "No filing was requested for this agent, so the manifest's legal block stays empty and the anchor commits to the terms alone."
+            }
+          />
+        </ul>
 
-ARTICLE II — PURPOSE
-2.1  ${config.purpose || "The Company operates an autonomous agent acting within the mandate set herein."}
-
-ARTICLE III — MANAGEMENT & GUARDIANSHIP
-3.1  The Company is managed by an autonomous agent (the "Agent") operating under
-     a delegated key with strictly limited authority.
-3.2  The natural person who created the Company (the "Guardian") retains
-     ultimate authority and may pause, veto, or recover Company assets at any
-     time.
-
-ARTICLE IV — SPENDING MANDATE
-4.1  Per-transaction limit: ${formatUsdc(config.perTxCap)} USDC.
-4.2  Rolling 24-hour limit: ${formatUsdc(config.dailyCap)} USDC.
-4.3  Timelock: sensitive or above-threshold actions are delayed
-     ${config.timelockHours || "1"} hour(s) before execution.
-
-ARTICLE V — AUTHORIZED RECIPIENTS
-5.1  Transfers may be made to:
-${lines}
-
-ARTICLE VI — LAW-TO-CODE BINDING
-6.1  This Agreement is cryptographically bound to the deployed on-chain policy.
-6.2  The backend computes the policy fingerprint at deploy time.
-6.3  Any divergence between this Agreement and the deployed policy is void.
-
-ARTICLE VII — KEY CUSTODY
-${
-  config.custody === "circle"
-    ? `7.1  The Agent's operating keys are managed by the platform in secure MPC
-     infrastructure (Novi-managed custody). The Company's assets remain governed
-     by the on-chain policy; the platform cannot act outside it.
-7.2  The Guardian retains ultimate on-chain authority at all times: pause, veto,
-     asset clawback, and rotation of the operating keys.
-7.3  The Company's payment float is platform-managed and capped by the deployed
-     standing-float ceiling.`
-    : `7.1  The Agent's operating keys live in a key vault whose root authority is
-     the Guardian's passkey; the platform operates strictly under that root.
-7.2  The Guardian retains ultimate on-chain authority at all times: pause, veto,
-     asset clawback, and rotation of the operating keys.
-7.3  The Company's payment float is platform-managed and capped by the deployed
-     standing-float ceiling.`
+        <p className="mt-5 border-t hairline pt-4 text-[12px] leading-[1.6] text-muted-2">
+          Every later version is <strong className="font-medium text-muted">scheduled</strong>{" "}
+          through your guardian timelock before it can replace this one, and you can veto it from
+          the agent&apos;s Settings page while it waits. The platform cannot change what your
+          entity commits to without giving you that window.
+        </p>
+      </div>
+    </Card>
+  );
 }
 
-IN WITNESS WHEREOF, the Guardian adopts this Agreement upon on-chain confirmation.`;
+function Committed({ title, body }: { title: string; body: string }) {
+  return (
+    <li className="flex gap-2.5">
+      <CheckIcon className="mt-1 h-3.5 w-3.5 shrink-0 text-accent-soft" />
+      <div>
+        <div className="text-[12.5px] font-medium text-ink">{title}</div>
+        <div className="text-[11.5px] leading-[1.5] text-muted-2">{body}</div>
+      </div>
+    </li>
+  );
+}
+
+/**
+ * Where the REAL Operating Agreement comes from — and, in sandbox, that it is a demo.
+ *
+ * Amber for sandbox, never green: a demo filing must read as a demo on every surface that shows
+ * it (the guardian-waiver precedent). And NEITHER claim when the environment is not known: this
+ * paragraph is the one a founder reads before ticking the box, and the version of it that said
+ * "nothing is filed with the State of Wyoming" over a real filing is the reason the environment
+ * has four states now.
+ */
+function FormationNote({
+  forming,
+  environment,
+  onRetry,
+  retrying,
+}: {
+  forming: boolean;
+  environment: FormationEnvironment;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
+  if (!forming) {
+    return (
+      <Callout tone="info" title="No legal filing for this agent">
+        Nothing is filed with any state and no Operating Agreement document is produced. The agent
+        gets its contracts, its treasury and its anchor; the legal body is not part of it.
+      </Callout>
+    );
+  }
+
+  if (!isKnownEnvironment(environment)) {
+    return (
+      <Callout tone="muted" title="Can&apos;t verify this deployment&apos;s filing environment">
+        <p>
+          A legal identity is attached to this agent, so a filing will be opened for it. This
+          deployment has not told us whether it files for real or in the provider&apos;s sandbox,
+          and until it does, nothing on this screen will claim either. Confirming is disabled in
+          the meantime — being told a filing is a demo when it is not is the one mistake this
+          screen must never make.
+        </p>
+        <Button
+          variant="ghost"
+          className="mt-3"
+          loading={retrying}
+          onClick={onRetry}
+        >
+          {environment === "loading" ? "Checking…" : "Retry"}
+        </Button>
+      </Callout>
+    );
+  }
+
+  return (
+    <Callout
+      tone={environment === "sandbox" ? "warn" : "accent"}
+      title={
+        environment === "sandbox"
+          ? "Demo formation (sandbox)"
+          : "The real Operating Agreement arrives after filing"
+      }
+    >
+      {environment === "sandbox" ? (
+        <>
+          Nothing is filed with the State of Wyoming and no company legally exists. doola&apos;s
+          sandbox returns DEMO documents — including a demo Operating Agreement — after the demo
+          filing. They appear in your dashboard under Legal documents, labeled sandbox, and their
+          hashes go into the next manifest version exactly as real ones would.
+        </>
+      ) : (
+        <>
+          doola files the company and generates the Operating Agreement itself. It arrives after
+          the filing, appears in your dashboard under Legal documents for you to download, and its
+          sha256 is folded into the next manifest version — which is scheduled through your
+          guardian timelock like any other change.
+        </>
+      )}
+    </Callout>
+  );
 }

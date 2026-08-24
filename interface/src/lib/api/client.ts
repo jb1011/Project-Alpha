@@ -9,6 +9,7 @@ import type {
   Capability,
   ConnectionPackage,
   EntityView,
+  FormationPartyInput,
   GuardianPasskey,
   JobView,
   PasskeyView,
@@ -113,12 +114,34 @@ export async function onboardEntity(
   guardianPasskey: GuardianPasskey,
   idempotencyKey?: string,
   custody?: "turnkey" | "circle",
+  /** The OPAQUE handle from `createFormationParty` — never the identity itself. On a deployment
+   *  where formation is required, onboarding refuses without it. */
+  partyId?: string,
 ): Promise<{ id: string; status: string }> {
   return request("/onboard", {
     method: "POST",
     token,
-    body: { spec, guardianPasskey, idempotencyKey, custody },
+    body: { spec, guardianPasskey, idempotencyKey, custody, partyId },
   });
+}
+
+/**
+ * Record the legal identity of the responsible natural person, and get back a handle.
+ *
+ * The ONE call in this client that carries personal data, and the reason the flow is two calls
+ * instead of a field on `/onboard`: the identity must never ride inside `spec` (which is
+ * persisted verbatim and rendered back out) and must never be held anywhere the wizard could
+ * later serialize. The response deliberately carries the handle and NOTHING else — echoing the
+ * stored identity back would put it in a response body and in every client that caches one.
+ *
+ * `{ synthetic: true }` is the sandbox path: no identity is collected or sent at all, and the
+ * backend files with its own labeled demo fixture.
+ */
+export async function createFormationParty(
+  token: string,
+  body: { synthetic: true } | FormationPartyInput,
+): Promise<{ partyId: string }> {
+  return request("/formation-party", { method: "POST", token, body });
 }
 
 export async function getEntity(
@@ -339,7 +362,7 @@ export async function downloadDocument(
   token: string,
   id: string,
   docId: string,
-): Promise<Blob> {
+): Promise<{ blob: Blob; filename: string | null }> {
   const res = await fetch(
     `${API_URL}/entities/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`,
     { headers: { authorization: `Bearer ${token}` } },
@@ -355,5 +378,29 @@ export async function downloadDocument(
       message: `expected a PDF, got "${contentType || "(none)"}"`,
     });
   }
-  return blob;
+  return {
+    blob,
+    filename: parseAttachmentFilename(res.headers.get("content-disposition")),
+  };
+}
+
+/**
+ * The download's filename, from `Content-Disposition`, or null.
+ *
+ * The backend derives this name from the document TYPE and never echoes a provider-supplied
+ * string, so it arrives safe. It is re-sanitized here anyway because it has crossed a proxy by
+ * the time we read it, and it is about to become the `download` attribute of an anchor: anything
+ * with a path separator, a control character or a non-PDF extension is discarded in favour of the
+ * caller's own name rather than trusted.
+ */
+function parseAttachmentFilename(header: string | null): string | null {
+  if (!header) return null;
+  const match = /filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;]+)/i.exec(header);
+  const raw = (match?.[1] ?? match?.[2] ?? "").trim();
+  if (!raw) return null;
+  // Basename only — a "directory/../name.pdf" never becomes a path.
+  const base = raw.split(/[/\\]/).pop() ?? "";
+  if (!/^[A-Za-z0-9._-]{1,128}\.pdf$/.test(base)) return null;
+  if (base.includes("..")) return null;
+  return base;
 }

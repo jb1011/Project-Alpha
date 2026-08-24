@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { AgentTabs } from "@/components/agents/AgentTabs";
+import { AmendmentVetoCard } from "@/components/agents/AmendmentVetoCard";
 import { usePublicClient, useReadContract, useWriteContract } from "wagmi";
 import {
   useEntityQuery,
@@ -16,11 +17,14 @@ import { usdcToAtomic } from "@/lib/api/spec";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { computePolicyId } from "@/lib/treasury/policyId";
 import { wireAllowlistEntries } from "@/lib/treasury/allowlist";
+import { shortenErr } from "@/lib/errors";
+import { formatDateTime } from "@/lib/format";
 import {
   Button,
   Callout,
   Card,
   Field,
+  SectionTitle,
   TextInput,
   cx,
 } from "@/components/onboarding/primitives";
@@ -293,7 +297,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
           <p className="mt-1 text-[12px] text-muted-2">
             {canExecute
               ? "Timelock elapsed — you can execute the change."
-              : `Executable ${new Date(executableAt).toLocaleString()}`}
+              : `Executable ${formatDateTime(executableAt)}`}
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <Button
@@ -310,6 +314,11 @@ export function AgentSettings({ entityId }: { entityId: string }) {
           </div>
         </Callout>
       )}
+
+      {/* Beside the treasury's pending-policy card, and deliberately a different kind of thing:
+          that one is scheduled through this platform and executed through it, while this one is
+          read straight off the chain and vetoed straight on it. */}
+      <AmendmentVetoCard entity={entity} />
 
       <Card className="p-5">
         <SectionTitle>Per-transaction cap (instant)</SectionTitle>
@@ -448,13 +457,3 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   );
 }
 
-function SectionTitle({ children }: { children: ReactNode }) {
-  return (
-    <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">{children}</div>
-  );
-}
-
-function shortenErr(msg: string): string {
-  const first = msg.split("\n")[0]?.trim() ?? "Transaction failed.";
-  return first.length > 140 ? `${first.slice(0, 140)}…` : first;
-}

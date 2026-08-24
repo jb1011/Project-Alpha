@@ -1,4 +1,9 @@
-/** AgentTreasury ABI fragment for guardian + read calls from the dashboard. */
+/** AgentTreasury ABI fragment for guardian + read calls from the dashboard.
+ *
+ * TODO(follow-up): generate this the way `legalManagerAbi.ts` now is — same forge artifacts, same
+ * name allowlist in `back/backend/src/abis/interfaceFragment.ts`, same freshness test. Left
+ * hand-written in this PR deliberately: it is the second-largest fragment in the package and
+ * churning it here would bury the surfaces this change is actually about. */
 export const treasuryAbi = [
   { type: "function", name: "pause", stateMutability: "nonpayable", inputs: [], outputs: [] },
   { type: "function", name: "unpause", stateMutability: "nonpayable", inputs: [], outputs: [] },

@@ -1,3 +1,31 @@
+/**
+ * The formation lifecycle, as the backend derives it — ONE definition for this package.
+ *
+ * The literal union was written out twice here (the entity view and the transparency row) and
+ * switched on with no default in the formation card. That is three places to update when the
+ * backend's `src/formation/status.ts` grows a state, and the one that gets missed is the switch:
+ * TypeScript is perfectly happy with an exhaustive switch over a union that is no longer the
+ * backend's, and the card just renders nothing where a status line should be. A backend drift test
+ * (`test/api/formationStatusUnion.test.ts`) asserts these members match the backend's, and the
+ * card's switches carry a default for the window between a backend deploy and an interface one.
+ *
+ * Exported as a runtime array as well as a type, because "is this a status this build knows?" is a
+ * question the card has to ask at runtime — of a value that arrived over the wire.
+ */
+export const FORMATION_STATUSES = [
+  "none",
+  "in_progress",
+  "filed",
+  "complete",
+  "failed",
+] as const;
+
+export type FormationStatus = (typeof FORMATION_STATUSES)[number];
+
+export function isKnownFormationStatus(value: string): value is FormationStatus {
+  return (FORMATION_STATUSES as readonly string[]).includes(value);
+}
+
 export type EntityStatus =
   | "pending"
   | "provisioned"
@@ -43,6 +71,13 @@ export type EntityView = {
         /** Anchored version; null while v1 is still in flight. */
         version: number | null;
         pendingHash: string | null;
+        /** The in-flight version's number — a LABEL beside the pending hash, nothing more. The
+         *  hash a guardian actually vetoes is read off the chain by the veto card itself. */
+        pendingVersion?: number | null;
+        /** Unix **SECONDS** the pending amendment becomes executable on-chain; null until the
+         *  schedule tx confirmed. Optional for deploy-order safety: a backend that predates it
+         *  has no countdown to show. */
+        amendmentExecutableAt?: number | null;
       };
   /** Formation (doola). null/absent = stub, forever. `environment` is always present when the
    *  block is: a sandbox filing must render amber ("Demo formation"), never green. Never
@@ -52,7 +87,7 @@ export type EntityView = {
     environment: "sandbox" | "production";
     /** Derived from the formation sub-saga: nothing opened / opened but nothing legally true
      *  yet / the state has FILED it / the EIN has issued / the filing step is in error. */
-    status: "none" | "in_progress" | "filed" | "complete" | "failed";
+    status: FormationStatus;
     /** doola's company id — an opaque provider reference, not personal data. */
     providerRef?: string | null;
     /** Unix seconds the state filed the company. */
@@ -81,6 +116,36 @@ export type FormationDocument = {
   name: string;
   size: number;
   sha256: string;
+};
+
+/**
+ * The legal identity of the natural person a filing names — the ONE personal-data shape in this
+ * package, mirroring the backend's `FormationPartySchema` field for field.
+ *
+ * It exists only to travel: typed here, held in the wizard's non-persisted PII slice, POSTed to
+ * `/formation-party`, and forgotten. It must never be written to localStorage, never enter a
+ * React Query key, and never enter `AgentSpec` — the caller keeps the opaque `partyId` the
+ * endpoint hands back and passes THAT to onboard.
+ *
+ * `phone` is REQUIRED (backend C6): doola refuses a company create whose responsible party has
+ * no phone, so a party without one is an identity that can never be filed.
+ */
+export type FormationPartyInput = {
+  legalFirstName: string;
+  legalLastName: string;
+  email: string;
+  phone: string;
+  address: {
+    line1: string;
+    /** Omitted entirely when blank — the backend schema is `.strict()` and rejects an empty one. */
+    line2?: string;
+    city: string;
+    /** US: the 2-letter state. Absent for the countries that have no state/province. */
+    region?: string;
+    postalCode: string;
+    /** ISO-3166-1 **alpha-3** ("USA", "FRA") — doola's convention, not alpha-2. */
+    country: string;
+  };
 };
 
 /** Public deployment capabilities (GET /config, unauthenticated) — lets the wizard preselect the
@@ -124,7 +189,7 @@ export type TransparencyEntity = {
    *  row). Deliberately carries no EIN, no filing number and nothing about the natural person
    *  behind the entity — this surface is unauthenticated. */
   formation?: {
-    status: "none" | "in_progress" | "filed" | "complete" | "failed";
+    status: FormationStatus;
     environment: "sandbox" | "production";
   } | null;
 };

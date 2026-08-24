@@ -22,12 +22,15 @@ import {
 type FundStatus = "idle" | "pending" | "confirmed" | "error";
 
 export function FundStep({
+  eyebrow,
   config,
   entityId,
   entity,
   onEntity,
   onComplete,
 }: {
+  /** "Screen N" — counted over the phases THIS deployment shows. */
+  eyebrow: string;
   config: AgentConfig;
   entityId: string | null;
   entity: EntityView | null;
@@ -83,7 +86,7 @@ export function FundStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 7"
+        eyebrow={eyebrow}
         title="Fund your agent's treasury"
         intro="The backend transfers USDC from the platform wallet into your agent's on-chain treasury. Enter the amount to fund."
       />
