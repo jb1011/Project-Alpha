@@ -2,6 +2,7 @@ import { pad, toFunctionSelector, zeroAddress } from "viem";
 import { describe, expect, test } from "vitest";
 import {
   agentTreasuryAbi,
+  legalManagerAbi,
   legalManagerFactoryAbi,
   noviControllerAbi,
 } from "../../src/abis/generated";
@@ -518,5 +519,166 @@ describe("roleLabel", () => {
     expect(roleLabel(WILDCARD_ROLE)).toBe("WILDCARD_ROLE");
     expect(roleLabel(STANDING_ROLE)).toBe(CONTROLLER_GRANTED_SELECTORS[0]?.name);
     expect(roleLabel(UNKNOWN_ROLE)).toBe("UNKNOWN_SELECTOR_ROLE");
+  });
+});
+
+// ── the OA amendment path (doola design §8) ─────────────────────────────────────────────────
+
+describe("legal manager — the OA amendment path", () => {
+  const PROXY = "0x8888888888888888888888888888888888888888";
+  const PENDING = `0x${"22".repeat(32)}` as const;
+  const STRANGER = `0x${"99".repeat(32)}` as const;
+  const EXECUTABLE_AT = 1_700_086_400n;
+
+  const scheduledLog = (newHash: string) =>
+    makeLog({
+      abi: legalManagerAbi,
+      eventName: "AmendmentScheduled",
+      args: { newHash, executableAt: EXECUTABLE_AT },
+      address: PROXY,
+    });
+
+  const pendingCtx = (over: Parameters<typeof entity>[0] = {}) =>
+    ruleContext({
+      entities: indexEntities([
+        entity({ oaManifestPendingHash: PENDING, oaManifestPendingVersion: 2, ...over }),
+      ]),
+    });
+
+  test("A-monitor-1: a scheduled amendment ALWAYS notifies the guardian, at WARN minimum", async () => {
+    const out = await evaluateLog(scheduledLog(PENDING), pendingCtx(), ruleDeps());
+    // Two alerts, exactly like the treasury twin: the event, and the notification the guardian is
+    // supposed to act on. INFO would never leave the box, so WARN is the floor even when the
+    // amendment is entirely expected (audit H3).
+    expect(out.alerts).toHaveLength(2);
+    const [scheduled, notification] = out.alerts;
+    expect(scheduled?.rule).toBe("legal_amendment_scheduled");
+    expect(scheduled?.severity).toBe("WARN");
+    expect(scheduled?.subject).toBe(PROXY);
+    expect(notification?.rule).toBe("legal_amendment_guardian_notification");
+    expect(notification?.severity).toBe("WARN");
+    // Subject-keyed on the ENTITY, and it names the exact call plus the deadline.
+    expect(notification?.subject).toBe("pub-1");
+    expect(notification?.detail.guardian).toBe(ADDR.guardian);
+    expect(notification?.detail.action).toMatch(
+      new RegExp(`cancelOperatingAgreementUpdate\\(${PENDING}\\) on ${PROXY}`),
+    );
+    expect(notification?.detail.vetoDeadline).toBe(new Date(1_700_086_400_000).toISOString());
+    expect(scheduled?.detail.matchesPending).toBe(true);
+  });
+
+  test("A-monitor-2: a hash we do not have pending is CRITICAL — on BOTH alerts", async () => {
+    const out = await evaluateLog(scheduledLog(STRANGER), pendingCtx(), ruleDeps());
+    expect(out.alerts.map((a) => a.severity)).toEqual(["CRITICAL", "CRITICAL"]);
+    expect(out.alerts[0]?.detail.matchesPending).toBe(false);
+    expect(out.alerts[0]?.detail.expectedPendingHash).toBe(PENDING);
+    expect(String(out.alerts[0]?.detail.note)).toMatch(/possible backend compromise/);
+  });
+
+  test("A-monitor-3: the DB comparison only ESCALATES — an absent record never suppresses", async () => {
+    // Nothing recorded as pending (a stub entity, a lagging write, a wiped row): the chain says an
+    // amendment was scheduled, and that is what the guardian must react to.
+    const out = await evaluateLog(
+      scheduledLog(STRANGER),
+      ruleContext({
+        entities: indexEntities([
+          entity({ oaManifestPendingHash: null, oaManifestPendingVersion: null }),
+        ]),
+      }),
+      ruleDeps(),
+    );
+    expect(out.alerts.map((a) => a.severity)).toEqual(["CRITICAL", "CRITICAL"]);
+    // …and a MATCH still never drops below WARN.
+    const matched = await evaluateLog(scheduledLog(PENDING), pendingCtx(), ruleDeps());
+    expect(matched.alerts.every((a) => a.severity === "WARN")).toBe(true);
+  });
+
+  test("A-monitor-4: a veto is WARN and says what it means for anchoring", async () => {
+    const out = await evaluateLog(
+      makeLog({
+        abi: legalManagerAbi,
+        eventName: "AmendmentVetoed",
+        args: { newHash: PENDING },
+        address: PROXY,
+      }),
+      pendingCtx(),
+      ruleDeps(),
+    );
+    expect(out.alerts).toHaveLength(1);
+    expect(out.alerts[0]?.rule).toBe("legal_amendment_vetoed");
+    expect(out.alerts[0]?.severity).toBe("WARN");
+    expect(String(out.alerts[0]?.detail.meaning)).toMatch(/blacklisted on chain until liftVeto/);
+  });
+
+  test("A-monitor-5: a lifted veto is recorded, not paged — only the guardian can do it", async () => {
+    const out = await evaluateLog(
+      makeLog({
+        abi: legalManagerAbi,
+        eventName: "VetoLifted",
+        args: { newHash: PENDING },
+        address: PROXY,
+      }),
+      pendingCtx(),
+      ruleDeps(),
+    );
+    expect(out.alerts[0]?.rule).toBe("legal_veto_lifted");
+    expect(out.alerts[0]?.severity).toBe("INFO");
+  });
+
+  test("A-monitor-6: an execute of the pending hash is INFO; anything else is CRITICAL", async () => {
+    const executed = (newHash: string, over: Parameters<typeof entity>[0] = {}) =>
+      evaluateLog(
+        makeLog({
+          abi: legalManagerAbi,
+          eventName: "OperatingAgreementUpdated",
+          args: { newHash },
+          address: PROXY,
+        }),
+        pendingCtx(over),
+        ruleDeps(),
+      );
+
+    const ok = await executed(PENDING);
+    expect(ok.alerts[0]?.rule).toBe("legal_amendment_executed");
+    expect(ok.alerts[0]?.severity).toBe("INFO");
+
+    // The failure the monotonic rules exist to prevent, seen from the outside: a superseded
+    // amendment stayed executable forever (contract property 4) and someone executed it.
+    const stale = await executed(STRANGER);
+    expect(stale.alerts[0]?.severity).toBe("CRITICAL");
+    expect(String(stale.alerts[0]?.detail.meaning)).toMatch(/did not have pending/);
+  });
+
+  test("A-monitor-7: an anchor that goes BACKWARDS is flagged as a regression", async () => {
+    const anchored = `0x${"11".repeat(32)}`;
+    const out = await evaluateLog(
+      makeLog({
+        abi: legalManagerAbi,
+        eventName: "OperatingAgreementUpdated",
+        args: { newHash: anchored },
+        address: PROXY,
+      }),
+      pendingCtx({ oaManifestAnchoredHash: anchored }),
+      ruleDeps(),
+    );
+    // The chain re-anchored the version we already had while a NEWER one is pending.
+    expect(out.alerts[0]?.severity).toBe("CRITICAL");
+    expect(out.alerts[0]?.detail.regression).toBe(true);
+    expect(out.alerts[0]?.detail.pendingVersion).toBe(2);
+    expect(out.alerts[0]?.detail.anchoredVersion).toBe(1);
+  });
+
+  test("A-monitor-8: another operator's LegalManager on the same chain is ignored", async () => {
+    const out = await evaluateLog(
+      makeLog({
+        abi: legalManagerAbi,
+        eventName: "AmendmentScheduled",
+        args: { newHash: PENDING, executableAt: EXECUTABLE_AT },
+        address: "0x1111111111111111111111111111111111111111",
+      }),
+      pendingCtx(),
+      ruleDeps(),
+    );
+    expect(out.alerts).toHaveLength(0);
   });
 });

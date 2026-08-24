@@ -11,10 +11,14 @@ import { expect, test } from "vitest";
 import { computeOaHash, renderOperatingAgreement } from "../../src/oa/generator";
 import {
   JcsError,
+  ManifestError,
+  type ManifestLegal,
+  buildManifestNext,
   buildManifestV1,
   canonicalizeJcs,
   manifestDocName,
   manifestHash,
+  parseManifest,
   serializeManifest,
   serializeManifestBytes,
   termsDocName,
@@ -321,4 +325,186 @@ test("E5: the spec REFUSES a caller-supplied EIN — the manifest is the only ca
   // And the EIN never reaches the terms doc from the caller's side, whatever they send.
   const r = translate(SPEC, { usdc: USDC });
   expect(r.legal.ein).toBe("STUB-NOT-FILED");
+});
+
+// ── Golden vector 3: a v2 manifest (the legal facts folded in) ──────────────────────────────
+//
+// Hand-written, byte for byte, exactly like the v1 vector above and for the same reason: a v2
+// anchor commits to a real Wyoming filing, and an outsider holding only the chain and the
+// published manifest must be able to recompute it.
+
+const GOLDEN_LEGAL: ManifestLegal = {
+  provider: "doola",
+  environment: "sandbox",
+  providerCompanyId: "cmp_123",
+  entityType: "LLC",
+  state: "WY",
+  formationDate: 1755600000,
+  filingNumber: "2026-001234567",
+  ein: null,
+  documents: [
+    // Deliberately in the WRONG order and with UPPER-CASE hex — the builder sorts and lowercases,
+    // because a SQL row order is not a fact about the entity and hex case is not information.
+    { type: "OperatingAgreement", sha256: "B".repeat(64), name: "Operating Agreement.pdf" },
+    {
+      type: "ArticlesOfOrganization",
+      sha256: "A".repeat(64),
+      name: "Articles of Organization.pdf",
+    },
+  ],
+};
+
+const GOLDEN_CHAIN = {
+  chainId: 5042002,
+  legalManager: "0x00000000000000000000000000000000000000aa",
+  agentId: "881938",
+};
+
+/** Hand-written canonical form, byte for byte, exactly like the v1 vector: literal hashes rather
+ *  than expressions, because a golden vector an outsider cannot read off the page is not one. */
+const GOLDEN_V2_BYTES =
+  '{"chain":{"agentId":"881938","chainId":5042002,' +
+  '"legalManager":"0x00000000000000000000000000000000000000aa"},' +
+  '"entity":{"jurisdiction":"Wyoming-DAO-LLC","name":"Golden Agent",' +
+  '"publicId":"11111111-2222-3333-4444-555555555555"},' +
+  '"legal":{"documents":[{"name":"Articles of Organization.pdf",' +
+  '"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",' +
+  '"type":"ArticlesOfOrganization"},{"name":"Operating Agreement.pdf",' +
+  '"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",' +
+  '"type":"OperatingAgreement"}],"ein":null,"entityType":"LLC","environment":"sandbox",' +
+  '"filingNumber":"2026-001234567","formationDate":1755600000,"provider":"doola",' +
+  '"providerCompanyId":"cmp_123","state":"WY"},' +
+  '"previous":"0x1aedd87173d59c10abcfeb02713e8bdbdf8b00b83e7bcdf1c971bea0eb3e6b6c",' +
+  '"schema":"novi/oa-bundle/1",' +
+  '"terms":{"hash":"0x1111111111111111111111111111111111111111111111111111111111111111",' +
+  '"uri":"novi:doc:oa-golden-key-v1.md"},"version":2}\n';
+
+const GOLDEN_V2_HASH = "0xe76d8b7d1bb5173945a81b884867972a9842076d5b0543f08cf9afab1b024394";
+
+test("GOLDEN: a v2 manifest serializes to exactly these bytes and this anchor", () => {
+  // The literal `previous` above IS v1's anchor — asserted, not eyeballed.
+  expect(GOLDEN_V2_BYTES).toContain(`"previous":"${GOLDEN_HASH}"`);
+  const v2 = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  expect(serializeManifest(v2)).toBe(GOLDEN_V2_BYTES);
+  expect(manifestHash(serializeManifestBytes(v2))).toBe(GOLDEN_V2_HASH);
+  expect(keccak256(toHex(GOLDEN_V2_BYTES))).toBe(GOLDEN_V2_HASH);
+});
+
+test("A-manifest-1: `previous` is the keccak of the PREVIOUS document's own bytes", () => {
+  const v2 = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  // Not a caller-supplied hash: computed here from the anchored document, so the chain of
+  // manifests cannot point at something that never went on chain (design §4, M9).
+  expect(v2.previous).toBe(GOLDEN_HASH);
+  expect(v2.previous).toBe(manifestHash(serializeManifestBytes(GOLDEN_MANIFEST)));
+});
+
+test("A-manifest-2: chain.legalManager/agentId are REQUIRED from v2 (v1 left them null)", () => {
+  expect(GOLDEN_MANIFEST.chain.legalManager).toBeNull();
+  expect(GOLDEN_MANIFEST.chain.agentId).toBeNull();
+  const v2 = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  expect(v2.chain).toEqual(GOLDEN_CHAIN);
+  for (const bad of [
+    { ...GOLDEN_CHAIN, legalManager: "" },
+    { ...GOLDEN_CHAIN, agentId: "" },
+  ])
+    expect(() => buildManifestNext(GOLDEN_MANIFEST, 2, bad, GOLDEN_LEGAL)).toThrow(ManifestError);
+  // Domain separation from the other side: v2 cannot silently move the entity to another chain.
+  expect(() =>
+    buildManifestNext(GOLDEN_MANIFEST, 2, { ...GOLDEN_CHAIN, chainId: 1 }, GOLDEN_LEGAL),
+  ).toThrow(/does not move between chains/);
+});
+
+test("A-manifest-3: entity and terms carry forward VERBATIM — v2 moves exactly one hash", () => {
+  const v2 = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  expect(v2.entity).toEqual(GOLDEN_MANIFEST.entity);
+  // The terms-doc versioning rule (§4): the EIN and the filing facts live in `legal`, so a v2/v3
+  // that folds them in leaves `terms.uri` pointing at v1.
+  expect(v2.terms).toEqual(GOLDEN_MANIFEST.terms);
+  expect(v2.terms.uri).toBe("novi:doc:oa-golden-key-v1.md");
+});
+
+test("A-manifest-4: versions are strictly monotonic — v2 cannot re-anchor v1 or skip backwards", () => {
+  for (const v of [1, 0, -1, 2.5]) {
+    expect(() => buildManifestNext(GOLDEN_MANIFEST, v, GOLDEN_CHAIN, GOLDEN_LEGAL)).toThrow(
+      ManifestError,
+    );
+  }
+  const v2 = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  expect(() => buildManifestNext(v2, 2, GOLDEN_CHAIN, GOLDEN_LEGAL)).toThrow(/does not advance/);
+  expect(
+    buildManifestNext(v2, 3, GOLDEN_CHAIN, { ...GOLDEN_LEGAL, ein: "88-1234567" }).version,
+  ).toBe(3);
+});
+
+test("A-manifest-5: identical FACTS in a different row order produce identical BYTES", () => {
+  const a = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  const b = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, {
+    ...GOLDEN_LEGAL,
+    documents: [...GOLDEN_LEGAL.documents].reverse(),
+  });
+  expect(serializeManifest(a)).toBe(serializeManifest(b));
+  // …and a genuinely different document IS a different anchor.
+  const c = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, {
+    ...GOLDEN_LEGAL,
+    documents: [{ ...GOLDEN_LEGAL.documents[0]!, sha256: "c".repeat(64) }],
+  });
+  expect(anchorOf(c)).not.toBe(anchorOf(a));
+});
+
+test("A-manifest-6: the honesty invariant is MECHANICAL — no environment, no manifest", () => {
+  expect(() =>
+    buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, {
+      ...GOLDEN_LEGAL,
+      environment: "" as never,
+    }),
+  ).toThrow(/environment is required/);
+  // A sandbox v2 and a production v2 with otherwise identical facts are different anchors.
+  const sandbox = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  const production = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, {
+    ...GOLDEN_LEGAL,
+    environment: "production",
+  });
+  expect(anchorOf(production)).not.toBe(anchorOf(sandbox));
+});
+
+test("A-manifest-7: a v2 with no documents, no company id or a broken date is REFUSED", () => {
+  const bad: [Partial<ManifestLegal>, RegExp][] = [
+    [{ documents: [] }, /documents is empty/],
+    [{ providerCompanyId: "" }, /providerCompanyId is required/],
+    [{ provider: "" }, /provider is required/],
+    [{ formationDate: 1.5 }, /formationDate must be a non-negative integer/],
+    [{ formationDate: -1 }, /formationDate must be a non-negative integer/],
+    [{ documents: [{ type: "ArticlesOfOrganization", sha256: "", name: "x.pdf" }] }, /no sha256/],
+    [{ documents: [{ type: "", sha256: "a".repeat(64), name: "x.pdf" }] }, /no type/],
+  ];
+  for (const [over, msg] of bad)
+    expect(() =>
+      buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, { ...GOLDEN_LEGAL, ...over }),
+    ).toThrow(msg);
+});
+
+// ── parseManifest: the bytes we build the next version on ───────────────────────────────────
+
+test("A-manifest-8: parseManifest round-trips canonical bytes and REFUSES anything else", () => {
+  const bytes = serializeManifestBytes(GOLDEN_MANIFEST);
+  expect(parseManifest(bytes)).toEqual(GOLDEN_MANIFEST);
+  // Re-indented by a well-meaning human: same JSON, different bytes, therefore a DIFFERENT hash —
+  // and `previous` would then point at nothing on the chain.
+  const pretty = Buffer.from(`${JSON.stringify(GOLDEN_MANIFEST, null, 2)}\n`, "utf8");
+  expect(() => parseManifest(pretty)).toThrow(/not in canonical/);
+  expect(() => parseManifest(Buffer.from("not json", "utf8"))).toThrow(/not JSON/);
+  expect(() => parseManifest(Buffer.from('{"a":1}\n', "utf8"))).toThrow(/OA bundle shape/);
+  const wrongSchema = { ...GOLDEN_MANIFEST, schema: "novi/oa-bundle/2" };
+  expect(() => parseManifest(serializeManifestBytes(wrongSchema))).toThrow(/cannot extend/);
+});
+
+test("A-manifest-9: a v3 chains onto the ANCHORED v2, folding the EIN in", () => {
+  const v2 = buildManifestNext(GOLDEN_MANIFEST, 2, GOLDEN_CHAIN, GOLDEN_LEGAL);
+  const v3 = buildManifestNext(v2, 3, GOLDEN_CHAIN, { ...GOLDEN_LEGAL, ein: "88-1234567" });
+  expect(v3.previous).toBe(anchorOf(v2));
+  expect(v3.legal?.ein).toBe("88-1234567");
+  expect(v3.legal?.documents).toEqual(v2.legal?.documents);
+  // The EIN is the ONLY difference, so the two anchors differ and nothing else moved.
+  expect(anchorOf(v3)).not.toBe(anchorOf(v2));
+  expect({ ...v3, version: 2, previous: v2.previous, legal: v2.legal }).toEqual(v2);
 });

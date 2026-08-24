@@ -72,24 +72,67 @@ export function relayRevertError(
   if (!data) return err instanceof Error ? err : new Error(String(err));
 
   const where = `relay ${ctx.functionName} -> ${ctx.target} via controller ${ctx.controller}`;
+  const decoded = decodeRevert(data, ctx.abi);
   const detail =
-    decodeRevert(data, ctx.abi) ??
-    (err instanceof BaseError ? err.shortMessage : (err as Error)?.message);
-  return new Error(`${where} reverted in simulation: ${detail ?? "unknown reason"}`, {
-    cause: err,
-  });
+    decoded?.detail ?? (err instanceof BaseError ? err.shortMessage : (err as Error)?.message);
+  return new ContractRevertError(
+    `${where} reverted in simulation: ${detail ?? "unknown reason"}`,
+    decoded?.errorName,
+    { cause: err },
+  );
+}
+
+/**
+ * A DETERMINISTIC contract revert, told apart from a bad minute at an RPC.
+ *
+ * The distinction is the whole point of the class (review F5). A relayed manager call that comes
+ * back `NotManager()` will come back `NotManager()` on every retry until a human changes
+ * something, whereas a timed-out `eth_estimateGas` says nothing at all about the call. Drivers
+ * that retry both forever either give up on a healthy amendment or hide a broken deployment; the
+ * anchor loop burns an attempt for the first and never for the second, and this type is how it
+ * tells them apart WITHOUT string-matching an error message.
+ *
+ * `errorName` is present whenever the bytes decoded against the target's ABI or the controller's.
+ * A revert that decoded against neither is still deterministic — it is still revert DATA — so the
+ * name is optional and the class, not the name, is the signal.
+ */
+export class ContractRevertError extends Error {
+  constructor(
+    message: string,
+    readonly errorName: string | undefined,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "ContractRevertError";
+  }
+}
+
+/**
+ * Did this error carry revert bytes? Walks the cause chain, because a caller may have wrapped it.
+ *
+ * Returns the decoded error NAME when there is one, `""` for an undecodable revert, and undefined
+ * when this was not a revert at all — so `!== undefined` is the deterministic-failure test.
+ */
+export function decodedRevertName(err: unknown): string | undefined {
+  for (let e: unknown = err, hops = 0; e instanceof Error && hops < 8; hops++) {
+    if (e instanceof ContractRevertError) return e.errorName ?? "";
+    e = (e as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 /** Best-effort `Name(arg, arg)` from revert bytes, against the target's ABI + the controller's. */
-function decodeRevert(data: Hex, abi: Abi): string | undefined {
+function decodeRevert(data: Hex, abi: Abi): { errorName: string; detail: string } | undefined {
   try {
     const { errorName, args } = decodeErrorResult({
       abi: [...abi, ...(noviControllerAbi as unknown as Abi)],
       data,
     });
-    return `${errorName}(${(args ?? []).map((a) => String(a)).join(", ")})`;
+    return { errorName, detail: `${errorName}(${(args ?? []).map((a) => String(a)).join(", ")})` };
   } catch {
-    return `revert data ${data}`; // in neither ABI (a third-party target) — show it raw
+    // In neither ABI (a third-party target). Still a revert — show the bytes raw and leave the
+    // name empty rather than inventing one.
+    return { errorName: "", detail: `revert data ${data}` };
   }
 }
 

@@ -12,11 +12,16 @@ import { type OutflowMeter, buildOutflowMeter } from "../payments/outflowMeter";
 import { migrate, openDatabase } from "../persistence/db";
 import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
+import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
 import { assertCircleCoverage, backfillPocketAddresses } from "../persistence/tier0";
 
 export interface CliContext {
   cfg: Config;
   repo: SqliteEntityRepository;
+  /** Anchor-cycle history. The CLI mints entities too (door 4), and an entity whose v1 cycle is
+   *  missing from `oa_anchors` has a hole exactly where its baseline should be — v2 would be the
+   *  FIRST row, with nothing to be newer than, and the monotonic rules read that table. */
+  anchors: SqliteOaAnchorRepository;
   docStore: FileDocumentStore;
   arc: ArcAdapter;
   operatorSigner: OperatorSigner;
@@ -35,6 +40,9 @@ export async function buildContext(): Promise<CliContext> {
   assertCircleCoverage(db, cfg.circle);
   if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
   const repo = new SqliteEntityRepository(db);
+  // Same db handle as `repo`, deliberately: the v1 anchor row commits INSIDE the entity row's
+  // transaction at create-confirm.
+  const anchors = new SqliteOaAnchorRepository(db);
   const docStore = new FileDocumentStore(cfg.docStoreDir);
   const arc = new ArcAdapter({
     publicClient: publicClientFor(cfg),
@@ -47,6 +55,7 @@ export async function buildContext(): Promise<CliContext> {
   return {
     cfg,
     repo,
+    anchors,
     docStore,
     arc,
     operatorSigner: await buildOperatorSigner(cfg), // Turnkey if configured, else OPERATOR_PRIVATE_KEY

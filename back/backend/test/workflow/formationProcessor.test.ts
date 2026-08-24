@@ -12,7 +12,13 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { DOOLA_SIGNATURE_HEADER, type DoolaWakeUp } from "../../src/api/routes/doolaWebhook";
-import { deriveFormationStatus } from "../../src/formation/status";
+import {
+  companyFiled,
+  deriveFormationStatus,
+  documentsFetched,
+  einIssued,
+  providerRefOf,
+} from "../../src/formation/status";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
 import { SqliteDoolaEventRepository } from "../../src/persistence/doolaEventRepository";
@@ -572,4 +578,65 @@ test("currentPolledStep names the step an entity is actually waiting on", () => 
   expect(currentPolledStep(requests.stepsOf(ENTITY_KEY))).toBe("await_ein");
   requests.transition(ENTITY_KEY, "await_ein", "pending", "confirmed");
   expect(currentPolledStep(requests.stepsOf(ENTITY_KEY))).toBeUndefined();
+});
+
+// ── F11 / F12: the shared fact predicates, and the filing-number heal ──────────────────────
+
+test("F11: the fact predicates are the ones every surface shares", () => {
+  seedFormation();
+  const steps = () => requests.stepsOf(ENTITY_KEY);
+  expect(providerRefOf(steps())).toBe(COMPANY_ID);
+  expect(companyFiled(steps())).toBe(false);
+  expect(documentsFetched(steps())).toBe(false);
+  expect(einIssued(steps())).toBe(false);
+
+  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
+  expect(companyFiled(steps())).toBe(true);
+  // …and the DERIVED status is built out of the same three, so a surface and the anchor trigger
+  // can never disagree about what "filed" means.
+  expect(deriveFormationStatus(steps())).toBe("filed");
+
+  requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
+  expect(documentsFetched(steps())).toBe(true);
+  requests.transition(ENTITY_KEY, "await_ein", "pending", "confirmed");
+  expect(einIssued(steps())).toBe(true);
+  expect(deriveFormationStatus(steps())).toBe("complete");
+});
+
+test("F12: a filing confirmed WITHOUT a number gains it on a later poll", async () => {
+  seedFormation();
+  // doola reports the formation service completed, but the state has not assigned a number yet.
+  // The step confirms on that signal alone — and the entity facts are written only inside the
+  // CAS that confirms it, so the number used to have no way in, ever.
+  doola.state.company = {
+    doolaCompanyId: COMPANY_ID,
+    services: [{ name: "Formation", status: "Completed" }],
+  };
+  expect(await advanceFormation(deps(), ENTITY_KEY)).toMatchObject({ advanced: true });
+  expect(stateOf("await_filing")).toBe("confirmed");
+  expect(entity()?.formationFilingNumber).toBeNull();
+  expect(entity()?.formationFiledAt).toBeNull();
+
+  // The state assigns one. The next poll takes the confirmed→confirmed branch, which used to
+  // refresh the `detail` blob and touch nothing else.
+  doola.state.company = {
+    doolaCompanyId: COMPANY_ID,
+    services: [{ name: "Formation", status: "Completed" }],
+    formationFilingDate: "2026-08-19",
+    formationFilingNumber: "2026-001234567",
+  };
+  const healed = await advanceFormation(deps(), ENTITY_KEY);
+  expect(entity()?.formationFilingNumber).toBe("2026-001234567");
+  expect(entity()?.formationFiledAt).toBe(Math.floor(Date.parse("2026-08-19T00:00:00Z") / 1000));
+  // It is an ADVANCE: it is precisely the fact the anchor sub-saga is blocked on, so it must
+  // reset the poll cadence and wake the fast path rather than wait for the next tick.
+  expect(healed.advanced).toBe(true);
+
+  // And it never downgrades: a poll that happens not to return the number leaves it alone.
+  doola.state.company = {
+    doolaCompanyId: COMPANY_ID,
+    services: [{ name: "Formation", status: "Completed" }],
+  };
+  await advanceFormation(deps(), ENTITY_KEY);
+  expect(entity()?.formationFilingNumber).toBe("2026-001234567");
 });

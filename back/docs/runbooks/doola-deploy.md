@@ -23,7 +23,22 @@ file. The identity was silently dropped — which is exactly the failure
 |---|---|---|
 | unset | (must be unset) | No formation anywhere. A `partyId` on an onboard is **refused**, never ignored. No webhook route, no sweeper. |
 | set | `false` | Formation is **available, not mandatory**. An onboard with no `partyId` succeeds and files nothing. An onboard WITH a `partyId` is pinned and filed, and counts against the spend controls. |
-| set | `true` (the default when the block is present) | An onboard **without** a `partyId` is refused at the door (REST 400 / MCP `isError`). The legacy onboarding server and `cli create-entity` refuse every request, because neither can carry a party. |
+| set | `true` (the default when the block is present) | An onboard **without** a `partyId` is refused at the door (REST 400 / MCP `isError`). `cli create-entity` refuses every request, because it cannot carry a party. |
+
+### The doors, as of PR 3
+
+There are **three**, and only the first two can onboard:
+
+| Door | Carries a `partyId`? | With `FORMATION_REQUIRED=true` |
+|---|---|---|
+| REST `POST /onboard` (the wizard API) | yes | pins and files; refuses an onboard without one |
+| MCP `onboard_agent` | yes | pins and files; refuses an onboard without one |
+| `cli create-entity` | no — a separate process with no PII intake | **refuses at command time** (`legacyDoorRefusalMessage`) |
+
+The standalone onboarding server (`src/onboarding/{server,main}.ts`) was **RETIRED in PR 3** and is
+no longer a door: it had no auth, no World gate and no custody gate, and it bypassed `claimKey`,
+the cross-process mutex that stops two runners minting the same entity. Nothing shipped depended
+on it. If you are reading an older copy of this table that lists it, this row supersedes it.
 
 `ARC_NETWORK=mainnet` forces the block present and `FORMATION_REQUIRED=true`; a mainnet
 deployment cannot mint stub entities, and it cannot point at doola sandbox.

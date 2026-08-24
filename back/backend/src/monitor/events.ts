@@ -1,12 +1,15 @@
 import {
+  type Abi,
   type AbiEvent,
   type Hex,
+  getAbiItem,
   keccak256,
   pad,
   parseAbiItem,
   toEventSelector,
   toHex,
 } from "viem";
+import { legalManagerAbi } from "../abis/generated";
 import { CONTROLLER_GRANTED_SELECTORS, selectorRole } from "../adapters/arc/bootVerify";
 
 /**
@@ -53,6 +56,27 @@ export const registryTransferEvent = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
 ) as AbiEvent;
 
+/**
+ * One event fragment out of the GENERATED LegalManager ABI, by name.
+ *
+ * Derived rather than written as a signature string, deliberately: a `bytes32` that quietly
+ * became a `bytes32[]` would move topic0 and leave a hand-written signature watching a topic
+ * nothing emits — a silent blind spot on the one governance path the guardian is expected to
+ * police. This way `forge build` + `gen:abis` moves the monitor with the contract, and an event
+ * that is renamed or removed fails HERE, at import time, instead of at 3am.
+ */
+export function legalManagerEvent(name: string): AbiEvent {
+  // viem's own ABI accessor rather than a hand-rolled `.find`: it already knows that a name can be
+  // overloaded and that `type` has to be matched too, and it is the thing that stays right when
+  // the ABI shape changes under us. Widened to `Abi` on purpose — against the generated const-ABI
+  // viem narrows `name` to the union of every member, and taking a name it cannot know at compile
+  // time is this helper's entire job.
+  const found = getAbiItem({ abi: legalManagerAbi as Abi, name });
+  if (!found || found.type !== "event")
+    throw new Error(`monitor: LegalManager ABI has no event ${name}`);
+  return found as AbiEvent;
+}
+
 /** The reserved metadata key the registry uses for the bound agent wallet. */
 export const AGENT_WALLET_KEY = "agentWallet";
 /** topic[2] of a wallet-bind `MetadataSet` — the indexed string is stored as its keccak256. */
@@ -80,6 +104,12 @@ export const TOPIC = {
   // Registry
   metadataSet: toEventSelector(registryMetadataSetEvent),
   transfer: toEventSelector(registryTransferEvent),
+  // LegalManager — the OA amendment path (design 2026-08-19 §8). Topic0 comes from the generated
+  // ABI, never from a hand-written signature: see `legalManagerEvent`.
+  amendmentScheduled: toEventSelector(legalManagerEvent("AmendmentScheduled")),
+  amendmentVetoed: toEventSelector(legalManagerEvent("AmendmentVetoed")),
+  vetoLifted: toEventSelector(legalManagerEvent("VetoLifted")),
+  operatingAgreementUpdated: toEventSelector(legalManagerEvent("OperatingAgreementUpdated")),
 } as const;
 
 function sel(signature: string): Hex {

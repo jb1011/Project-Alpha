@@ -98,6 +98,9 @@ export interface EntityRecord {
   oaManifestAnchoredHash?: Hex | null;
   /** The single in-flight version's hash (single-pending rule). Cleared when it anchors. */
   oaManifestPendingHash?: Hex | null;
+  /** …and its VERSION. The hash alone cannot answer "does this observed amendment REGRESS the
+   *  anchored version?", which is the monitor's CRITICAL case and the guardian card's headline. */
+  oaManifestPendingVersion?: number | null;
   /** Unix seconds the pending amendment becomes executable (feeds the guardian veto countdown). */
   oaAmendmentExecutableAt?: number | null;
 }

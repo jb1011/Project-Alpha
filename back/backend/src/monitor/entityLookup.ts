@@ -28,6 +28,16 @@ export interface MonitoredEntity {
   operator: string | null;
   treasury: string | null;
   proxy: string | null;
+  // ── The OA anchor projection (design §8, audit H3/14). Version NUMBERS alone cannot feed the
+  //    compromise rule: it has to compare the hash the CHAIN scheduled against the hash this
+  //    deployment says is pending, and a number cannot do that. Read here so the rules stay pure
+  //    functions of (log, context).
+  /** The manifest version currently ANCHORED on chain, per our records. */
+  oaManifestVersion: number | null;
+  oaManifestAnchoredHash: string | null;
+  /** The single in-flight version (single-pending rule), or null when nothing is pending. */
+  oaManifestPendingHash: string | null;
+  oaManifestPendingVersion: number | null;
 }
 
 export interface EntityLookup {
@@ -47,13 +57,63 @@ interface Row {
   operator: string | null;
   treasury: string | null;
   proxy: string | null;
+  oa_manifest_version: number | null;
+  oa_manifest_anchored_hash: string | null;
+  oa_manifest_pending_hash: string | null;
+  oa_manifest_pending_version: number | null;
 }
 
 const SELECT_ALL = `
-  SELECT idempotency_key, public_id, name, status, agent_id, manager, guardian, operator, treasury, proxy
+  SELECT idempotency_key, public_id, name, status, agent_id, manager, guardian, operator, treasury, proxy,
+         oa_manifest_version, oa_manifest_anchored_hash,
+         oa_manifest_pending_hash, oa_manifest_pending_version
   FROM entities
   WHERE treasury IS NOT NULL OR agent_id IS NOT NULL
   ORDER BY rowid`;
+
+/**
+ * Is this SQLite failure the SCHEMA, rather than the moment?
+ *
+ * The two deserve opposite treatment and the difference is not visible from the message alone
+ * unless you look for it, so it is looked for in exactly one place. A locked database is a bad
+ * second; a missing column is a monitor pointed at a database the API has not migrated yet, and no
+ * amount of retrying will produce the column.
+ */
+function isSchemaMismatch(err: unknown): boolean {
+  return /no such (column|table)/i.test((err as Error)?.message ?? "");
+}
+
+/**
+ * The STARTUP probe (review F4). Throws — loudly, and naming the deploy order — when the main
+ * database does not have the columns this monitor's rules read.
+ *
+ * The monitor is deliberately forgiving mid-run: a lookup failure degrades the entity-derived
+ * rules for one tick and the last known set is reused, because a watcher's whole job is to still
+ * be running when the interesting block arrives. That tolerance is exactly wrong at boot. Deploy
+ * the monitor before the API on a release that adds a column and every tick logs
+ * `monitor_entity_lookup_failed` and carries on with an EMPTY entity set — a monitor that is
+ * running, scanning, and silently blind to every treasury and every LegalManager proxy it exists
+ * to watch. Silence that looks like health is the one failure mode this process must not have.
+ *
+ * Called from the composition root, whose `.catch` exits non-zero: systemd restarts it, and it
+ * keeps failing until the API has migrated, which is the visible outcome.
+ */
+export function assertLookupSchema(lookup: EntityLookup): void {
+  try {
+    lookup.all();
+  } catch (err) {
+    if (err instanceof EntityLookupError && err.schemaMismatch)
+      throw new EntityLookupError(
+        [
+          `monitor: the main database is missing columns this monitor reads (${err.message}).`,
+          "DEPLOY ORDER: restart the API (which migrates the schema on boot) BEFORE the monitor.",
+          "Refusing to start blind — a running monitor with an empty entity set watches no treasury and no LegalManager proxy.",
+        ].join(" "),
+        { cause: err, schemaMismatch: true },
+      );
+    throw err;
+  }
+}
 
 export class SqliteEntityLookup implements EntityLookup {
   private db?: Database.Database;
@@ -94,7 +154,7 @@ export class SqliteEntityLookup implements EntityLookup {
       this.close();
       throw new EntityLookupError(
         `monitor: entity lookup failed against ${this.path}: ${(err as Error).message}`,
-        { cause: err },
+        { cause: err, schemaMismatch: isSchemaMismatch(err) },
       );
     }
     return rows.map((r) => ({
@@ -108,6 +168,10 @@ export class SqliteEntityLookup implements EntityLookup {
       operator: r.operator,
       treasury: r.treasury,
       proxy: r.proxy,
+      oaManifestVersion: r.oa_manifest_version,
+      oaManifestAnchoredHash: r.oa_manifest_anchored_hash,
+      oaManifestPendingHash: r.oa_manifest_pending_hash,
+      oaManifestPendingVersion: r.oa_manifest_pending_version,
     }));
   }
 
@@ -127,14 +191,18 @@ export interface EntityIndex {
   byTreasury: Map<string, MonitoredEntity>;
   /** agentId (decimal string) -> entity */
   byAgentId: Map<string, MonitoredEntity>;
+  /** lowercased LegalManager proxy address -> entity. The OA amendment rules key off this. */
+  byProxy: Map<string, MonitoredEntity>;
 }
 
 export function indexEntities(entities: readonly MonitoredEntity[]): EntityIndex {
   const byTreasury = new Map<string, MonitoredEntity>();
   const byAgentId = new Map<string, MonitoredEntity>();
+  const byProxy = new Map<string, MonitoredEntity>();
   for (const e of entities) {
     if (e.treasury) byTreasury.set(e.treasury.toLowerCase(), e);
     if (e.agentId) byAgentId.set(e.agentId, e);
+    if (e.proxy) byProxy.set(e.proxy.toLowerCase(), e);
   }
-  return { byTreasury, byAgentId };
+  return { byTreasury, byAgentId, byProxy };
 }

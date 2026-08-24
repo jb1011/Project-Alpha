@@ -18,7 +18,6 @@
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit",
     "authority": "tsx src/payments/main.ts",
-    "onboarding": "tsx src/onboarding/main.ts",
     "passkey:capture": "esbuild tools/passkey-capture/capture.entry.ts --bundle --format=esm --platform=browser --outfile=tools/passkey-capture/capture.js && tsx tools/passkey-capture/main.ts",
     "api": "tsx src/api/main.ts",
     "monitor": "tsx src/monitor/main.ts",

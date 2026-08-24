@@ -36,8 +36,7 @@ export function buildCli(
       // Door 4 (design §5): the CLI is a separate process on the same DB with no `partyId` and
       // no PII intake, so on a deployment where formation is MANDATORY it refuses at COMMAND
       // time rather than minting an entity that owes a filing it can never make.
-      if (legacyDoorRefused(ctx.cfg))
-        throw new Error(legacyDoorRefusalMessage("cli create-entity"));
+      if (legacyDoorRefused(ctx.cfg)) throw new Error(legacyDoorRefusalMessage());
       const spec = parseAgentSpec(JSON.parse(readFileSync(opts.config, "utf8")));
       const idempotencyKey = opts.id ?? spec.name;
       const rec = await runOnboarding({
@@ -50,6 +49,11 @@ export function buildCli(
         usdc: ctx.cfg.usdc,
         metadataBaseUrl: ctx.cfg.metadataBaseUrl,
         fundAmount: opts.fund ? usdToUnits(opts.fund) : undefined,
+        // Carried from PR 1: a CLI-created entity records its v1 anchor cycle like every other
+        // one. Without it `oa_anchors` has no baseline for this entity, and the monotonic rules
+        // ("schedule/execute only when version > the anchored one") plus the monitor's
+        // "any execute of a non-current version is CRITICAL" both read that table.
+        anchors: ctx.anchors,
         // Audit item 7 (review L4): CLI-created rows must also store their pocket address at
         // creation, or their read paths re-open the master-seed dependency.
         derivePocketAddress: ctx.cfg.pocketMasterSeed
@@ -97,6 +101,58 @@ export function buildCli(
       .map((r) => ({ key: r.idempotencyKey, name: r.name, status: r.status, agentId: r.agentId }));
     console.log(JSON.stringify(rows, null, 2));
   });
+
+  /**
+   * The operator's exit from an anchor HOLD (design §7, audit H4 — review F10).
+   *
+   * Two cycle states park an entity's WHOLE anchor pipeline until a human acts: `vetoed` (the
+   * guardian stopped this manifest) and `failed` (its bytes no longer re-hash to the scheduled
+   * anchor, or its manager call reverted deterministically until the attempts ran out). A veto can
+   * also end on chain via `liftVeto`, which the loop observes by itself. This is the OTHER exit,
+   * and until now it existed only as a repository method with no way to call it: an operator
+   * looking at `anchor_held` in journald had to open sqlite and hand-write the UPDATE.
+   *
+   * It is deliberately per-version rather than per-entity: acknowledging a hold is a statement
+   * about ONE manifest version ("that one is dead, move on"), and a blanket per-entity ack would
+   * quietly clear a second hold nobody had looked at.
+   */
+  program
+    .command("anchor-ack")
+    .description("acknowledge a held OA anchor cycle so the entity's pipeline can resume")
+    .argument("<entityKey>", "idempotency key")
+    .argument("<version>", "manifest version of the held cycle")
+    .action(async (entityKey: string, version: string) => {
+      const ctx = await makeContext();
+      const v = Number(version);
+      const before = ctx.anchors.find(entityKey, v);
+      if (!before) {
+        console.error(`no anchor cycle ${entityKey} v${v}`);
+        process.exitCode = 1;
+        return;
+      }
+      const acknowledged = ctx.anchors.acknowledgeHold(entityKey, v);
+      if (!acknowledged) process.exitCode = 1;
+      console.log(
+        JSON.stringify(
+          {
+            entityKey,
+            version: v,
+            acknowledged,
+            was: before.state,
+            now: ctx.anchors.find(entityKey, v)?.state,
+            manifestHash: before.manifestHash,
+            // The honest caveat, printed where the operator is looking: an acknowledgement is a
+            // statement about OUR records. A scheduled amendment stays executable on chain
+            // forever, and only the guardian can stop it.
+            note: acknowledged
+              ? "this version will never be anchored by us; if it is still scheduled on chain only the guardian can stop it"
+              : "not a held cycle (only `vetoed` or `failed` can be acknowledged)",
+          },
+          null,
+          2,
+        ),
+      );
+    });
 
   program
     .command("fund-treasury")

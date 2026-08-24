@@ -5,6 +5,7 @@
  * so a test can make the PROVIDER say one thing while the webhook payload says another, which is
  * how the wake-up-only rule (audit H2) is actually proven rather than asserted.
  */
+import { ContractRevertError } from "../../src/adapters/arc/relay";
 import type { DoolaApi } from "../../src/adapters/doola/doolaClient";
 import type {
   DoolaCompany,
@@ -178,4 +179,159 @@ export class MemoryDocumentStore implements DocumentStore {
   async getBytesAsync(id: string): Promise<Buffer> {
     return this.getBytes(id);
   }
+}
+
+// ── the chain seam the anchor sub-saga drives (design §7) ───────────────────────────────────
+
+/**
+ * An in-memory LegalManager that reproduces the FOUR contract properties the anchor loop is
+ * written against, because a fake that "works nicely" would let every one of them regress:
+ *
+ *  1. re-scheduling a hash RESETS its clock (no AlreadyScheduled guard);
+ *  2. executing DELETES `scheduledAt[hash]`, making 0 ambiguous;
+ *  3. a guardian veto deletes the schedule AND blacklists the hash permanently, and there is no
+ *     manager-side cancel;
+ *  4. a scheduled hash stays executable forever once its delay has elapsed.
+ *
+ * `mode` is how a test asks for the failure shapes that matter: a tx that reverts, and a tx that
+ * is broadcast and never lands (where the receipt wait throws, exactly as viem's does).
+ */
+export type FakeTxMode = "ok" | "revert" | "lost";
+
+export interface FakeChainState {
+  /** LegalManager.Status: 0 Active, 1 WindingDown, 2 Dissolved. */
+  status: number;
+  /** `meta().operatingAgreementHash`. */
+  current: string;
+  scheduledAt: Map<string, bigint>;
+  vetoed: Set<string>;
+  amendmentDelay: bigint;
+  /** Block time, unix SECONDS. */
+  nowSeconds: number;
+  scheduleMode: FakeTxMode;
+  executeMode: FakeTxMode;
+  /** Set to make the next READ of the named kind throw (a transport failure, not a revert). */
+  failNextRead?: "legalStatus" | "oaCurrentHash" | "oaScheduledAt" | "oaVetoed" | "amendmentDelay";
+  /**
+   * Make the next BROADCAST revert deterministically with this custom error, the way the adapter
+   * surfaces one: a `ContractRevertError` carrying the decoded name.
+   *
+   * The distinction from `failNextRead` (and from `mode: "revert"`, which is a tx that MINES and
+   * then reverts) is the whole of review F5. A preflight that comes back `NotManager()` is a
+   * verdict and burns an attempt; an RPC that times out is a bad minute and must not. Sticky —
+   * it keeps reverting until a test clears it, because that is what a deterministic revert does.
+   */
+  revertBroadcast?: string;
+}
+
+export interface FakeAnchorChain {
+  chain: import("../../src/workflow/anchorLoop").AnchorChain;
+  state: FakeChainState;
+  calls: string[];
+  /** The guardian's two on-chain moves, so a test can act as the guardian rather than mutate
+   *  state by hand — the veto path has to go through the same delete-and-blacklist the contract
+   *  performs, or the "park until liftVeto" rule is being tested against a fiction. */
+  veto(hash: string): void;
+  liftVeto(hash: string): void;
+}
+
+/** What the ADAPTER hands back for a decoded contract revert — the seam the loop classifies on
+ *  (`decodedRevertName`), so a test drives the real branch rather than a message-shaped guess. */
+function fakeRevert(name: string): Error {
+  return new ContractRevertError(
+    `relay -> proxy via controller reverted in simulation: ${name}()`,
+    name,
+  );
+}
+
+export function fakeAnchorChain(over: Partial<FakeChainState> = {}): FakeAnchorChain {
+  const calls: string[] = [];
+  const reverted = new Set<string>();
+  let seq = 0;
+  const state: FakeChainState = {
+    status: 0,
+    current: `0x${"00".repeat(32)}`,
+    scheduledAt: new Map(),
+    vetoed: new Set(),
+    amendmentDelay: 86_400n,
+    nowSeconds: Math.floor(Date.parse("2026-08-21T12:00:00Z") / 1000),
+    scheduleMode: "ok",
+    executeMode: "ok",
+    ...over,
+  };
+
+  const read = <T>(name: NonNullable<FakeChainState["failNextRead"]>, value: T): T => {
+    calls.push(name);
+    if (state.failNextRead === name) {
+      state.failNextRead = undefined;
+      throw new Error(`rpc: ${name} timed out`);
+    }
+    return value;
+  };
+
+  const chain = {
+    async legalStatus() {
+      return read("legalStatus", state.status);
+    },
+    async oaCurrentHash() {
+      return read("oaCurrentHash", state.current) as `0x${string}`;
+    },
+    async oaScheduledAt(_proxy: string, hash: string) {
+      return read("oaScheduledAt", state.scheduledAt.get(hash) ?? 0n);
+    },
+    async oaVetoed(_proxy: string, hash: string) {
+      return read("oaVetoed", state.vetoed.has(hash));
+    },
+    async oaAmendmentDelay() {
+      return read("amendmentDelay", state.amendmentDelay);
+    },
+    async scheduleOperatingAgreementUpdate(_proxy: string, hash: string) {
+      calls.push(`schedule:${hash}`);
+      if (state.revertBroadcast) throw fakeRevert(state.revertBroadcast);
+      const tx = `0x${(++seq).toString(16).padStart(64, "s")}`;
+      if (state.scheduleMode === "ok") {
+        if (state.vetoed.has(hash)) throw fakeRevert("Vetoed");
+        if (state.status !== 0) throw fakeRevert("NotActive");
+        // Property 1: no AlreadyScheduled guard — this OVERWRITES, resetting the clock.
+        state.scheduledAt.set(hash, BigInt(state.nowSeconds) + state.amendmentDelay);
+      } else if (state.scheduleMode === "revert") reverted.add(tx);
+      return tx as `0x${string}`;
+    },
+    async executeOperatingAgreementUpdate(_proxy: string, hash: string) {
+      calls.push(`execute:${hash}`);
+      if (state.revertBroadcast) throw fakeRevert(state.revertBroadcast);
+      const tx = `0x${(++seq).toString(16).padStart(64, "e")}`;
+      if (state.executeMode === "ok") {
+        const at = state.scheduledAt.get(hash);
+        if (at === undefined) throw fakeRevert("NotScheduled");
+        if (BigInt(state.nowSeconds) < at) throw fakeRevert("TooEarly");
+        if (state.status !== 0) throw fakeRevert("NotActive");
+        // Property 2: the schedule is DELETED, so `== 0` no longer means "never scheduled".
+        state.scheduledAt.delete(hash);
+        state.current = hash;
+      } else if (state.executeMode === "revert") reverted.add(tx);
+      return tx as `0x${string}`;
+    },
+    async waitForManagerReceipt(txHash: string) {
+      calls.push(`receipt:${txHash.slice(0, 6)}`);
+      const mode = txHash.includes("s") ? state.scheduleMode : state.executeMode;
+      // A tx that never lands: viem's receipt wait times out rather than resolving.
+      if (mode === "lost") throw new Error(`receipt for ${txHash} timed out`);
+      return { status: reverted.has(txHash) ? ("reverted" as const) : ("success" as const) };
+    },
+  } as import("../../src/workflow/anchorLoop").AnchorChain;
+
+  return {
+    chain,
+    state,
+    calls,
+    veto(hash: string) {
+      // Exactly what `cancelOperatingAgreementUpdate` does: delete the schedule, blacklist forever.
+      state.scheduledAt.delete(hash);
+      state.vetoed.add(hash);
+    },
+    liftVeto(hash: string) {
+      state.vetoed.delete(hash);
+    },
+  };
 }

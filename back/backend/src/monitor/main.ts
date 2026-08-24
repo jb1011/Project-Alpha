@@ -5,7 +5,7 @@ import { managerAccount, publicClientFor } from "../adapters/arc/clients";
 import { loadConfig } from "../config/env";
 import { opsLog } from "../observability/opsLog";
 import { buildAlertSink } from "./alerts";
-import { SqliteEntityLookup } from "./entityLookup";
+import { SqliteEntityLookup, assertLookupSchema } from "./entityLookup";
 import { MonitorConfigError } from "./errors";
 import { Monitor } from "./monitor";
 import { fromPublicClient } from "./rpc";
@@ -48,6 +48,10 @@ async function main() {
 
   const store = SqliteMonitorStore.open(monitorCfg.dbPath);
   const entities = new SqliteEntityLookup(cfg.dbPath);
+  // Before the loop, and deliberately fatal: a monitor whose entity query cannot run is a monitor
+  // that scans, logs `monitor_scanned`, and sees no treasury and no LegalManager proxy at all.
+  // The `.catch` at the bottom of this file turns the throw into a non-zero exit (F4).
+  assertLookupSchema(entities);
   const sink = buildAlertSink({ store, webhookUrl: cfg.alertWebhookUrl });
 
   const monitor = new Monitor({

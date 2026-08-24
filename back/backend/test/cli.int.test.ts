@@ -15,6 +15,7 @@ import { buildOutflowMeter } from "../src/payments/outflowMeter";
 import { migrate, openDatabase } from "../src/persistence/db";
 import { FileDocumentStore } from "../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../src/persistence/entityRepository";
+import { SqliteOaAnchorRepository } from "../src/persistence/oaAnchorRepository";
 import { type AnvilHandle, startAnvil } from "./helpers/anvil";
 import { deployStack } from "./helpers/stack";
 
@@ -55,6 +56,7 @@ beforeAll(async () => {
   ctx = {
     cfg: mergedCfg,
     repo,
+    anchors: new SqliteOaAnchorRepository(db),
     docStore,
     outflows: buildOutflowMeter(db, {
       ceilingAtomic: mergedCfg.platformOutflowCeiling,

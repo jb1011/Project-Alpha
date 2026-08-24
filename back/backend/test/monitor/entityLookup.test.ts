@@ -2,7 +2,11 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { SqliteEntityLookup, indexEntities } from "../../src/monitor/entityLookup";
+import {
+  SqliteEntityLookup,
+  assertLookupSchema,
+  indexEntities,
+} from "../../src/monitor/entityLookup";
 import { EntityLookupError } from "../../src/monitor/errors";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -95,6 +99,34 @@ describe("SqliteEntityLookup", () => {
     lookup.close();
   });
 
+  test("F4: a PR-2-shaped database FAILS THE STARTUP PROBE, naming the deploy order", () => {
+    // The monitor deployed ahead of the API on a release that adds a column. Mid-run this is
+    // tolerated (the last entity set is reused); at STARTUP it must stop the process, because the
+    // alternative is a watcher that scans, logs `monitor_scanned` and is silently blind to every
+    // treasury and every LegalManager proxy it exists to watch.
+    const path = seedMainDb([record()]);
+    const writer = openDatabase(path);
+    writer.exec("ALTER TABLE entities DROP COLUMN oa_manifest_pending_version");
+    writer.close();
+
+    const lookup = new SqliteEntityLookup(path);
+    expect(() => assertLookupSchema(lookup)).toThrow(EntityLookupError);
+    expect(() => assertLookupSchema(lookup)).toThrow(/restart the API/i);
+    expect(() => assertLookupSchema(lookup)).toThrow(/DEPLOY ORDER/);
+    try {
+      assertLookupSchema(lookup);
+    } catch (err) {
+      expect((err as EntityLookupError).schemaMismatch).toBe(true);
+    }
+    lookup.close();
+  });
+
+  test("F4: a healthy database passes the startup probe", () => {
+    const lookup = new SqliteEntityLookup(seedMainDb([record()]));
+    expect(() => assertLookupSchema(lookup)).not.toThrow();
+    lookup.close();
+  });
+
   test("reads while the API holds the DB open (WAL: readers never block on a writer)", () => {
     const path = seedMainDb([record()]);
     const writer = openDatabase(path); // simulates the running API
@@ -121,5 +153,53 @@ describe("indexEntities", () => {
     const index = indexEntities([noTreasury, noAgent]);
     expect([...index.byTreasury.keys()]).toEqual([ADDR.treasury.toLowerCase()]);
     expect([...index.byAgentId.keys()]).toEqual(["1"]);
+  });
+
+  test("A-monitor-9: byProxy indexes the LegalManager, lowercased, and skips rows without one", () => {
+    const index = indexEntities([
+      entity({ proxy: "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }),
+      entity({ idempotencyKey: "k2", proxy: null }),
+    ]);
+    expect(index.byProxy.get("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?.name).toBe(
+      "Acme Agent LLC",
+    );
+    expect(index.byProxy.size).toBe(1);
+  });
+});
+
+describe("the OA anchor projection (design §8, audit H3/14)", () => {
+  test("A-monitor-10: the four anchor columns reach the monitor — version numbers are not enough", () => {
+    // The compromise rule compares the hash the CHAIN scheduled against the hash this deployment
+    // says is pending. A version number cannot answer that, which is why these are columns on
+    // `entities` and why the read-only projection has to carry them.
+    const pending = `0x${"22".repeat(32)}`;
+    const anchored = `0x${"11".repeat(32)}`;
+    const path = seedMainDb([
+      record({
+        oaManifestVersion: 2,
+        oaManifestAnchoredHash: anchored as `0x${string}`,
+        oaManifestPendingHash: pending as `0x${string}`,
+        oaManifestPendingVersion: 3,
+      }),
+    ]);
+    const lookup = new SqliteEntityLookup(path);
+    expect(lookup.all()[0]).toMatchObject({
+      oaManifestVersion: 2,
+      oaManifestAnchoredHash: anchored,
+      oaManifestPendingHash: pending,
+      oaManifestPendingVersion: 3,
+    });
+    lookup.close();
+  });
+
+  test("A-monitor-11: a legacy row reads as nulls, not as a missing column", () => {
+    const path = seedMainDb([record()]);
+    const lookup = new SqliteEntityLookup(path);
+    expect(lookup.all()[0]).toMatchObject({
+      oaManifestVersion: null,
+      oaManifestPendingHash: null,
+      oaManifestPendingVersion: null,
+    });
+    lookup.close();
   });
 });

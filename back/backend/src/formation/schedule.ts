@@ -20,6 +20,30 @@ export const RETRY_CAP_MS = 6 * 60 * 60 * 1000;
 /** After this many burned attempts a row is `abandoned` — the sweeper's terminal verdict. */
 export const MAX_FORMATION_ATTEMPTS = 8;
 
+/**
+ * After this many DETERMINISTICALLY REVERTED manager calls an anchor cycle is held for a human.
+ *
+ * Lower than `MAX_FORMATION_ATTEMPTS`, and for a different kind of evidence. A doola attempt is
+ * burned for a request that may have half-succeeded, so the count is generous. A decoded contract
+ * revert is a verdict — `NotManager` will be `NotManager` at the eighth try too — and the only
+ * thing more attempts buy is a longer silence before anybody is told. Five leaves room for the one
+ * case that does self-heal (a body mid-dissolution that is un-dissolved) without turning a broken
+ * deployment into a background hum.
+ */
+export const MAX_ANCHOR_REVERT_ATTEMPTS = 5;
+
+/**
+ * How often a VETOED anchor cycle re-reads `vetoed(hash)` to see whether the guardian lifted it.
+ *
+ * Scheduled rather than read every tick (F6): a held entity is a permanent member of the anchor
+ * sweeper's due set, and `liftVeto` is a deliberate human action, not something that happens
+ * between two 60-second ticks. It doubles from `RETRY_BASE_MS` like every other backoff here but
+ * caps FIFTEEN MINUTES rather than at `RETRY_CAP_MS` — the six-hour cap is right for a machine
+ * failure that nobody is waiting on, and wrong for this, where a human has just acted and is
+ * watching for the pipeline to move again.
+ */
+export const VETO_RECHECK_CAP_MS = 15 * 60 * 1000;
+
 /** Poll cadence for an in-flight entity: daily, doubling on every EMPTY poll, capped at a week.
  *  An `await_ein` row legitimately sits 4–6 weeks; polling it 42 times to learn nothing is 42
  *  round trips and 42 chances to trip a rate limit. */

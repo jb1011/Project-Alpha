@@ -104,8 +104,17 @@ export class Monitor {
     }
   }
 
-  /** Entities drive three rules. A lookup failure degrades those rules for one tick — the last
-   *  known set is reused rather than dropped, so a locked DB does not blind the treasury watch. */
+  /**
+   * Entities drive three rules. A lookup failure degrades those rules for one tick — the last
+   * known set is reused rather than dropped, so a locked DB does not blind the treasury watch.
+   *
+   * EVERY mid-run failure is treated this way, a schema error included (review F4). A column that
+   * vanishes under a running monitor means the file was replaced (a restore, a litestream
+   * recovery) and the next tick reconnects; dropping the entity set because of it would blind the
+   * watch at exactly the moment the box is being operated on. The deploy-order case — starting
+   * against a database the API has not migrated — is caught before the loop starts, by
+   * `assertLookupSchema` in the composition root, where it is fatal.
+   */
   private refreshEntities(): MonitoredEntity[] {
     try {
       this.lastEntities = this.deps.entities.all();
@@ -162,6 +171,10 @@ export class Monitor {
       ...cfg.beacons,
       ...this.resolvedBeacons,
       ...[...index.byTreasury.values()].map((e) => e.treasury as Address),
+      // The LegalManager proxies (design §8). Until PR 3 they were unwatched, which meant the OA
+      // amendment path — the one governance action with a timelock and a guardian veto — emitted
+      // its events into a monitor that was not looking.
+      ...[...index.byProxy.values()].map((e) => e.proxy as Address),
     ];
     const agentIds = [...index.byAgentId.keys()];
 

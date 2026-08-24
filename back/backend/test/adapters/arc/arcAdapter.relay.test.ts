@@ -30,10 +30,11 @@ import { expect, test, vi } from "vitest";
 import {
   agentTreasuryAbi,
   iIdentityRegistryAbi,
+  legalManagerAbi,
   legalManagerFactoryAbi,
   noviControllerAbi,
 } from "../../../src/abis/generated";
-import { ArcAdapter } from "../../../src/adapters/arc/arcAdapter";
+import { ArcAdapter, MANAGER_RECEIPT_TIMEOUT_MS } from "../../../src/adapters/arc/arcAdapter";
 
 const CONTROLLER = "0x4819000000000000000000000000000000000000" as Address;
 /** The manager of the agents that already exist on prod: the platform EOA, not the controller. */
@@ -45,6 +46,9 @@ const USDC = "0x3600000000000000000000000000000000000000" as Address;
 const PAYOUT = "0x000000000000000000000000000000000000000A" as Address;
 const EXECUTOR = "0x000000000000000000000000000000000000000B" as Address;
 const POLICY_ID = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" as Hex;
+/** The entity's LegalManager proxy — the target of the two OA amendment calls. */
+const PROXY = "0x00000000000000000000000000000000000000fa" as Address;
+const OA_HASH = "0xabcdef00000000000000000000000000000000000000000000000000000000ff" as Hex;
 const FAKE_HASH = "0xdeadbeef00000000000000000000000000000000000000000000000000000003" as Hex;
 const GAS = 123_456n;
 
@@ -75,7 +79,15 @@ function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
     identityRegistry: REGISTRY,
     controller: opts.controller,
   });
-  return { adapter, simulateContract, call, estimateGas, writeContract, sendTransaction };
+  return {
+    adapter,
+    simulateContract,
+    call,
+    estimateGas,
+    writeContract,
+    sendTransaction,
+    waitForTransactionReceipt,
+  };
 }
 
 const createParams = {
@@ -208,7 +220,85 @@ test("executePolicyUpdate relays with the per-agent TREASURY appended", async ()
   assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: TREASURY });
 });
 
-test("relayed writes still await the receipt (except broadcastCreateEntity, which never did)", async () => {
+// ── the OA amendment pair (design §7): relayed like the treasury pair, BROADCAST-ONLY ──
+
+test("scheduleOperatingAgreementUpdate relays with the per-agent PROXY appended", async () => {
+  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const hash = await adapter.scheduleOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
+  expect(hash).toBe(FAKE_HASH);
+  const expected = encodeFunctionData({
+    abi: legalManagerAbi,
+    functionName: "scheduleOperatingAgreementUpdate",
+    args: [OA_HASH],
+  });
+  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: PROXY });
+});
+
+test("executeOperatingAgreementUpdate relays with the per-agent PROXY appended", async () => {
+  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  await adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
+  const expected = encodeFunctionData({
+    abi: legalManagerAbi,
+    functionName: "executeOperatingAgreementUpdate",
+    args: [OA_HASH],
+  });
+  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: PROXY });
+});
+
+test("A-adapter-1: the OA pair BROADCASTS and returns — it never awaits its own receipt", async () => {
+  // The split is load-bearing (design §7): the anchor loop persists the tx hash on the oa_anchors
+  // row BEFORE the receipt, so a crash in that gap resumes by ADOPTING it. Re-broadcasting a
+  // schedule is not harmless — LegalManager has no AlreadyScheduled guard, so a re-schedule
+  // silently RESETS the timelock and shortens the veto window the guardian was notified about.
+  const { adapter, waitForTransactionReceipt } = makeAdapter({ controller: CONTROLLER });
+  await adapter.scheduleOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
+  await adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
+  expect(waitForTransactionReceipt).not.toHaveBeenCalled();
+  // …and the confirm half is exposed for the caller to await once the hash is durable — BOUNDED
+  // (review F7), because this is awaited from an unattended sweeper tick that holds the entity's
+  // keyed lock: viem's default is to wait forever, and one dropped tx would pin a worker with it.
+  await adapter.waitForManagerReceipt(FAKE_HASH);
+  expect(waitForTransactionReceipt).toHaveBeenCalledTimes(1);
+  expect(waitForTransactionReceipt.mock.calls[0]![0]).toEqual({
+    hash: FAKE_HASH,
+    timeout: MANAGER_RECEIPT_TIMEOUT_MS,
+  });
+});
+
+test("A-adapter-2: a LEGACY agent's amendment goes DIRECT, even in controller mode", async () => {
+  // The proxy's manager is immutable. Relaying a pre-cutover agent's amendment would arrive as
+  // msg.sender == controller and revert NotManager — permanently.
+  const { adapter, simulateContract, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  await adapter.scheduleOperatingAgreementUpdate(PROXY, OA_HASH, LEGACY_MANAGER);
+  await adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, LEGACY_MANAGER);
+  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(simulateContract.mock.calls.map((c) => [c[0].address, c[0].functionName])).toEqual([
+    [PROXY, "scheduleOperatingAgreementUpdate"],
+    [PROXY, "executeOperatingAgreementUpdate"],
+  ]);
+});
+
+test("A-adapter-3: Vetoed()/TooEarly()/NotActive() decode by NAME, not as a hex blob", async () => {
+  // These three are the entire vocabulary of an amendment that will not go through, and an
+  // operator reading `0x...` in journald cannot tell "the guardian stopped this" from "the
+  // timelock has not elapsed" from "the body is dissolving".
+  for (const errorName of ["Vetoed", "TooEarly", "NotActive"] as const) {
+    const { adapter, estimateGas, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+    estimateGas.mockRejectedValueOnce(
+      new BaseError("execution reverted", {
+        cause: new RawContractError({
+          data: encodeErrorResult({ abi: legalManagerAbi, errorName }),
+        }),
+      }),
+    );
+    await expect(
+      adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER),
+    ).rejects.toThrow(new RegExp(errorName));
+    expect(sendTransaction).not.toHaveBeenCalled();
+  }
+});
+
+test("relayed writes still await the receipt (except the three broadcast-only ones)", async () => {
   const a1 = makeAdapter({ controller: CONTROLLER });
   const a2 = makeAdapter({ controller: CONTROLLER });
   await a1.adapter.setAgentMetadata(1n, "ens", "0x00", CONTROLLER);
