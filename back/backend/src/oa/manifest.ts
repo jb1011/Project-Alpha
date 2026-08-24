@@ -205,6 +205,187 @@ export function buildManifestV1(
   };
 }
 
+// ── v2+ : folding the legal facts in ────────────────────────────────────────────────────────
+
+/** A manifest that cannot be built (or a stored one that cannot be trusted). Distinct from
+ *  `JcsError`, which is about SERIALIZATION: this one is about the schema's own rules. */
+export class ManifestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ManifestError";
+  }
+}
+
+/**
+ * The on-chain identity, REQUIRED from v2 onward.
+ *
+ * v1 left all three null and documented why: the proxy and the agentId are minted by the very
+ * `createEntity` call v1's hash is an argument to, so at v1 they do not exist yet. Every later
+ * version is built AFTER that receipt, so there is no honest reason for them to be absent — and
+ * they are what give the manifest its domain separation (audit M9): a manifest naming this chain,
+ * this LegalManager and this agentId cannot be replayed as another entity's amendment.
+ */
+export interface ManifestChainRef {
+  chainId: number;
+  /** The entity's LegalManager proxy — the contract that holds the anchor. */
+  legalManager: string;
+  /** The ERC-8004 agentId, as a decimal string (it is a uint256; JSON numbers cannot hold it). */
+  agentId: string;
+}
+
+/**
+ * Build v(n) for n ≥ 2 from the last ANCHORED manifest.
+ *
+ * The previous manifest is passed as a whole DOCUMENT rather than as a hash, and that is the
+ * point of the signature: `previous` is computed HERE, from the bytes of the document that is
+ * actually on the chain, so the chain of manifests cannot be forged by a caller passing a hash
+ * that belongs to nothing. Pass the anchored one — never a `vetoed` or `superseded` version
+ * (design §4, M9): those never entered the chain, and a `previous` pointing at one would make the
+ * published history unverifiable at exactly the point a guardian intervened.
+ *
+ * What carries forward verbatim, and why:
+ *  - `entity` — already NFC-normalized at v1; re-normalizing a value that is already canonical is
+ *    a second chance to produce different bytes for the same entity;
+ *  - `terms` — the terms-doc versioning rule (§4). A v2/v3 that only folds in legal facts changes
+ *    exactly ONE hash, the manifest's own; `terms.uri` keeps pointing at v1 until a TERM changes.
+ *
+ * The `legal` block is normalized (below) rather than trusted verbatim, because its document list
+ * is assembled from a database query whose row order is not part of the schema's meaning — and
+ * JCS preserves array order, so an unsorted list would hash differently for identical facts.
+ */
+export function buildManifestNext(
+  prevAnchoredManifest: OaBundleManifest,
+  version: number,
+  chain: ManifestChainRef,
+  legal: ManifestLegal,
+): OaBundleManifest {
+  if (!Number.isInteger(version) || version < 2)
+    throw new ManifestError(`manifest version must be an integer ≥ 2 (got ${version})`);
+  if (version <= prevAnchoredManifest.version)
+    throw new ManifestError(
+      `manifest v${version} does not advance the anchored v${prevAnchoredManifest.version} — anchoring is strictly monotonic (design §7)`,
+    );
+  if (chain.chainId !== prevAnchoredManifest.chain.chainId)
+    throw new ManifestError(
+      `manifest chainId ${chain.chainId} differs from the anchored manifest's ${prevAnchoredManifest.chain.chainId} — an entity does not move between chains`,
+    );
+  if (!chain.legalManager || !chain.agentId)
+    throw new ManifestError(
+      "manifest v2+ requires chain.legalManager and chain.agentId — they are null only at v1, before createEntity has minted them",
+    );
+
+  return {
+    schema: OA_MANIFEST_SCHEMA_V1,
+    chain: { chainId: chain.chainId, legalManager: chain.legalManager, agentId: chain.agentId },
+    entity: { ...prevAnchoredManifest.entity },
+    version,
+    // Computed from the previous document's own canonical bytes — see the doc comment.
+    previous: manifestHash(serializeManifestBytes(prevAnchoredManifest)),
+    terms: { ...prevAnchoredManifest.terms },
+    legal: normalizeLegal(legal),
+  };
+}
+
+/**
+ * Canonicalize the legal block so identical FACTS always produce identical BYTES.
+ *
+ * Two things are load-bearing:
+ *  - the document list is SORTED (type, then sha256, then name). It arrives from a SQL query, and
+ *    "ORDER BY created_at" is not a fact about the entity — but JCS preserves array order, so two
+ *    runs that fetched the same documents in a different order would anchor different hashes and
+ *    the second would look like a material change;
+ *  - `environment` is asserted present. The honesty invariant (§2) is meant to be mechanical, and
+ *    a manifest is the one artifact a verifier holds forever: a sandbox filing that lost its label
+ *    on the way to the anchor is indistinguishable from a real one.
+ */
+function normalizeLegal(l: ManifestLegal): ManifestLegal {
+  if (!l.environment)
+    throw new ManifestError(
+      "manifest legal.environment is required — a sandbox filing must never be able to render as a real one by omission (design §2)",
+    );
+  if (!l.provider) throw new ManifestError("manifest legal.provider is required");
+  if (!l.providerCompanyId)
+    throw new ManifestError("manifest legal.providerCompanyId is required from v2");
+  if (!Number.isInteger(l.formationDate) || l.formationDate < 0)
+    throw new ManifestError(
+      `manifest legal.formationDate must be a non-negative integer of unix SECONDS (got ${l.formationDate})`,
+    );
+  if (l.documents.length === 0)
+    throw new ManifestError(
+      "manifest legal.documents is empty — the whole point of v2 is that it commits to the filed documents",
+    );
+  for (const d of l.documents)
+    if (!d.type || !d.sha256)
+      throw new ManifestError(
+        `manifest legal.documents carries an entry with no ${d.type ? "sha256" : "type"} — a hash nobody can check is worse than no hash`,
+      );
+
+  return {
+    provider: l.provider,
+    environment: l.environment,
+    providerCompanyId: l.providerCompanyId,
+    entityType: l.entityType,
+    state: l.state,
+    formationDate: l.formationDate,
+    filingNumber: l.filingNumber,
+    ein: l.ein,
+    documents: l.documents
+      .map((d) => ({
+        type: d.type,
+        // sha256 is hex: case is not information, and doola has been seen to report both.
+        sha256: d.sha256.toLowerCase(),
+        // Provider-supplied free text — the same NFC discipline the entity name gets.
+        name: d.name.normalize("NFC"),
+      }))
+      .sort(
+        (a, b) =>
+          a.type.localeCompare(b.type, "en") ||
+          a.sha256.localeCompare(b.sha256, "en") ||
+          a.name.localeCompare(b.name, "en"),
+      ),
+  };
+}
+
+/**
+ * Read a manifest back from the bytes we stored, and REFUSE anything that is not canonical.
+ *
+ * The round-trip check is the whole value of this function. A manifest read off disk is about to
+ * become the `previous` link of the next version — its hash is computed from ITS canonical bytes,
+ * so a file that has been reformatted, re-indented, or hand-edited would silently produce a
+ * `previous` that points at nothing on the chain. Failing loudly here turns a permanently
+ * unverifiable chain of manifests into a parked anchor cycle and an ops line.
+ */
+export function parseManifest(bytes: Uint8Array): OaBundleManifest {
+  const text = Buffer.from(bytes).toString("utf8");
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch (e) {
+    throw new ManifestError(`stored manifest is not JSON: ${(e as Error).message}`);
+  }
+  const m = value as Partial<OaBundleManifest>;
+  if (
+    !m ||
+    typeof m !== "object" ||
+    typeof m.schema !== "string" ||
+    typeof m.version !== "number" ||
+    typeof m.chain !== "object" ||
+    typeof m.entity !== "object" ||
+    typeof m.terms !== "object"
+  )
+    throw new ManifestError("stored manifest does not have the OA bundle shape");
+  if (m.schema !== OA_MANIFEST_SCHEMA_V1)
+    throw new ManifestError(
+      `stored manifest declares schema "${m.schema}", which this build cannot extend (expected "${OA_MANIFEST_SCHEMA_V1}")`,
+    );
+  const manifest = value as OaBundleManifest;
+  if (Buffer.compare(serializeManifestBytes(manifest), Buffer.from(bytes)) !== 0)
+    throw new ManifestError(
+      "stored manifest is not in canonical (JCS) form — refusing to build on bytes whose keccak is not the anchor",
+    );
+  return manifest;
+}
+
 /** Terms-doc file name for a manifest-scheme entity. */
 export function termsDocName(entityKey: string, version: number): string {
   return `oa-${entityKey}-v${version}.md`;
