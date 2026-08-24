@@ -18,6 +18,14 @@ import type { TreasuryConfig } from "../../types";
 import { USDC_TRANSFER_GAS } from "./gas";
 import { appendRelayTarget, relayRevertError } from "./relay";
 
+/**
+ * How long a manager-call receipt is waited for before the caller is told to come back later.
+ *
+ * See `waitForManagerReceipt`. Exported so the anchor loop's tests and the runbook name the same
+ * number the adapter uses.
+ */
+export const MANAGER_RECEIPT_TIMEOUT_MS = 30_000;
+
 /** Minimal ERC-20 transfer fragment for funding the treasury vault with USDC. */
 const erc20TransferAbi = [
   {
@@ -441,9 +449,22 @@ export class ArcAdapter {
     });
   }
 
-  /** Await a manager-call receipt. The confirm half of the broadcast/persist/confirm split. */
+  /**
+   * Await a manager-call receipt. The confirm half of the broadcast/persist/confirm split.
+   *
+   * BOUNDED (review F7). viem's default is to wait indefinitely, and this is called from an
+   * unattended sweeper tick that holds the entity's keyed lock while it waits: one dropped
+   * transaction would pin a worker, and the tick, forever. A timeout is not a failure here — it is
+   * the DESIGNED path. The tx hash is already persisted on the `oa_anchors` row, so the next pass
+   * adopts the broadcast rather than sending a second one, and the park's doubling backoff is what
+   * keeps asking. Arc's finality is sub-second; 30s is a wide margin for a mempool, not a guess at
+   * one.
+   */
   async waitForManagerReceipt(txHash: Hex): Promise<{ status: "success" | "reverted" }> {
-    const receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    const receipt = await this.d.publicClient.waitForTransactionReceipt({
+      hash: txHash,
+      timeout: MANAGER_RECEIPT_TIMEOUT_MS,
+    });
     return { status: receipt.status };
   }
 

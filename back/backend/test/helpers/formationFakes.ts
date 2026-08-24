@@ -5,6 +5,7 @@
  * so a test can make the PROVIDER say one thing while the webhook payload says another, which is
  * how the wake-up-only rule (audit H2) is actually proven rather than asserted.
  */
+import { ContractRevertError } from "../../src/adapters/arc/relay";
 import type { DoolaApi } from "../../src/adapters/doola/doolaClient";
 import type {
   DoolaCompany,
@@ -211,6 +212,16 @@ export interface FakeChainState {
   executeMode: FakeTxMode;
   /** Set to make the next READ of the named kind throw (a transport failure, not a revert). */
   failNextRead?: "legalStatus" | "oaCurrentHash" | "oaScheduledAt" | "oaVetoed" | "amendmentDelay";
+  /**
+   * Make the next BROADCAST revert deterministically with this custom error, the way the adapter
+   * surfaces one: a `ContractRevertError` carrying the decoded name.
+   *
+   * The distinction from `failNextRead` (and from `mode: "revert"`, which is a tx that MINES and
+   * then reverts) is the whole of review F5. A preflight that comes back `NotManager()` is a
+   * verdict and burns an attempt; an RPC that times out is a bad minute and must not. Sticky —
+   * it keeps reverting until a test clears it, because that is what a deterministic revert does.
+   */
+  revertBroadcast?: string;
 }
 
 export interface FakeAnchorChain {
@@ -222,6 +233,15 @@ export interface FakeAnchorChain {
    *  performs, or the "park until liftVeto" rule is being tested against a fiction. */
   veto(hash: string): void;
   liftVeto(hash: string): void;
+}
+
+/** What the ADAPTER hands back for a decoded contract revert — the seam the loop classifies on
+ *  (`decodedRevertName`), so a test drives the real branch rather than a message-shaped guess. */
+function fakeRevert(name: string): Error {
+  return new ContractRevertError(
+    `relay -> proxy via controller reverted in simulation: ${name}()`,
+    name,
+  );
 }
 
 export function fakeAnchorChain(over: Partial<FakeChainState> = {}): FakeAnchorChain {
@@ -267,10 +287,11 @@ export function fakeAnchorChain(over: Partial<FakeChainState> = {}): FakeAnchorC
     },
     async scheduleOperatingAgreementUpdate(_proxy: string, hash: string) {
       calls.push(`schedule:${hash}`);
+      if (state.revertBroadcast) throw fakeRevert(state.revertBroadcast);
       const tx = `0x${(++seq).toString(16).padStart(64, "s")}`;
       if (state.scheduleMode === "ok") {
-        if (state.vetoed.has(hash)) throw new Error("Vetoed()");
-        if (state.status !== 0) throw new Error("NotActive()");
+        if (state.vetoed.has(hash)) throw fakeRevert("Vetoed");
+        if (state.status !== 0) throw fakeRevert("NotActive");
         // Property 1: no AlreadyScheduled guard — this OVERWRITES, resetting the clock.
         state.scheduledAt.set(hash, BigInt(state.nowSeconds) + state.amendmentDelay);
       } else if (state.scheduleMode === "revert") reverted.add(tx);
@@ -278,12 +299,13 @@ export function fakeAnchorChain(over: Partial<FakeChainState> = {}): FakeAnchorC
     },
     async executeOperatingAgreementUpdate(_proxy: string, hash: string) {
       calls.push(`execute:${hash}`);
+      if (state.revertBroadcast) throw fakeRevert(state.revertBroadcast);
       const tx = `0x${(++seq).toString(16).padStart(64, "e")}`;
       if (state.executeMode === "ok") {
         const at = state.scheduledAt.get(hash);
-        if (at === undefined) throw new Error("NotScheduled()");
-        if (BigInt(state.nowSeconds) < at) throw new Error("TooEarly()");
-        if (state.status !== 0) throw new Error("NotActive()");
+        if (at === undefined) throw fakeRevert("NotScheduled");
+        if (BigInt(state.nowSeconds) < at) throw fakeRevert("TooEarly");
+        if (state.status !== 0) throw fakeRevert("NotActive");
         // Property 2: the schedule is DELETED, so `== 0` no longer means "never scheduled".
         state.scheduledAt.delete(hash);
         state.current = hash;

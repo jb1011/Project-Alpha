@@ -34,7 +34,7 @@ import {
   legalManagerFactoryAbi,
   noviControllerAbi,
 } from "../../../src/abis/generated";
-import { ArcAdapter } from "../../../src/adapters/arc/arcAdapter";
+import { ArcAdapter, MANAGER_RECEIPT_TIMEOUT_MS } from "../../../src/adapters/arc/arcAdapter";
 
 const CONTROLLER = "0x4819000000000000000000000000000000000000" as Address;
 /** The manager of the agents that already exist on prod: the platform EOA, not the controller. */
@@ -254,10 +254,15 @@ test("A-adapter-1: the OA pair BROADCASTS and returns — it never awaits its ow
   await adapter.scheduleOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
   await adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
   expect(waitForTransactionReceipt).not.toHaveBeenCalled();
-  // …and the confirm half is exposed for the caller to await once the hash is durable.
+  // …and the confirm half is exposed for the caller to await once the hash is durable — BOUNDED
+  // (review F7), because this is awaited from an unattended sweeper tick that holds the entity's
+  // keyed lock: viem's default is to wait forever, and one dropped tx would pin a worker with it.
   await adapter.waitForManagerReceipt(FAKE_HASH);
   expect(waitForTransactionReceipt).toHaveBeenCalledTimes(1);
-  expect(waitForTransactionReceipt.mock.calls[0]![0]).toEqual({ hash: FAKE_HASH });
+  expect(waitForTransactionReceipt.mock.calls[0]![0]).toEqual({
+    hash: FAKE_HASH,
+    timeout: MANAGER_RECEIPT_TIMEOUT_MS,
+  });
 });
 
 test("A-adapter-2: a LEGACY agent's amendment goes DIRECT, even in controller mode", async () => {

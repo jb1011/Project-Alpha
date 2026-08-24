@@ -500,10 +500,11 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN oa_manifest_pending_hash TEXT");
   if (!cols.includes("oa_amendment_executable_at"))
     db.exec("ALTER TABLE entities ADD COLUMN oa_amendment_executable_at INTEGER");
-  // PR 3: the pending VERSION beside the pending hash. The design listed only the hash, but the
-  // monitor's compromise rule and the guardian veto card both have to answer "which version is
-  // this?" — a hash alone cannot say whether an observed amendment REGRESSES the anchored
-  // version, which is the CRITICAL case (§8). Same fixed projection, one more column.
+  // PR 3: the pending VERSION beside the pending hash. The design listed only the hash, and the
+  // hash is what DECIDES every rule — the monitor compares hashes, and its regression case is a
+  // hash comparison too. The version is the fixed PROJECTION the monitor's alerts and the tenant's
+  // guardian card render (audit H3): "amendment v3 is pending" is the sentence an operator can
+  // act on, where a bare keccak is not. Same projection, one more column.
   if (!cols.includes("oa_manifest_pending_version"))
     db.exec("ALTER TABLE entities ADD COLUMN oa_manifest_pending_version INTEGER");
 
