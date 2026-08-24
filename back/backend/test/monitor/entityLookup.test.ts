@@ -2,7 +2,11 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { SqliteEntityLookup, indexEntities } from "../../src/monitor/entityLookup";
+import {
+  SqliteEntityLookup,
+  assertLookupSchema,
+  indexEntities,
+} from "../../src/monitor/entityLookup";
 import { EntityLookupError } from "../../src/monitor/errors";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -92,6 +96,34 @@ describe("SqliteEntityLookup", () => {
     openDatabase(path).close(); // exists, but has no `entities` table
     const lookup = new SqliteEntityLookup(path);
     expect(() => lookup.all()).toThrow(EntityLookupError);
+    lookup.close();
+  });
+
+  test("F4: a PR-2-shaped database FAILS THE STARTUP PROBE, naming the deploy order", () => {
+    // The monitor deployed ahead of the API on a release that adds a column. Mid-run this is
+    // tolerated (the last entity set is reused); at STARTUP it must stop the process, because the
+    // alternative is a watcher that scans, logs `monitor_scanned` and is silently blind to every
+    // treasury and every LegalManager proxy it exists to watch.
+    const path = seedMainDb([record()]);
+    const writer = openDatabase(path);
+    writer.exec("ALTER TABLE entities DROP COLUMN oa_manifest_pending_version");
+    writer.close();
+
+    const lookup = new SqliteEntityLookup(path);
+    expect(() => assertLookupSchema(lookup)).toThrow(EntityLookupError);
+    expect(() => assertLookupSchema(lookup)).toThrow(/restart the API/i);
+    expect(() => assertLookupSchema(lookup)).toThrow(/DEPLOY ORDER/);
+    try {
+      assertLookupSchema(lookup);
+    } catch (err) {
+      expect((err as EntityLookupError).schemaMismatch).toBe(true);
+    }
+    lookup.close();
+  });
+
+  test("F4: a healthy database passes the startup probe", () => {
+    const lookup = new SqliteEntityLookup(seedMainDb([record()]));
+    expect(() => assertLookupSchema(lookup)).not.toThrow();
     lookup.close();
   });
 

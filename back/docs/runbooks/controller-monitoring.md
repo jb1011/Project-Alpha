@@ -42,6 +42,29 @@ Healthy start looks like:
 {"opslog":"monitor_scanned","from":"…","to":"…","watched":16,"agents":14}
 ```
 
+### ⚠ DEPLOY ORDER: the API first, then the monitor
+
+**On any release that adds a column to `entities`, restart `legalbody-api` BEFORE
+`legalbody-monitor`.** The API migrates the schema at boot; the monitor only reads it.
+
+The monitor refuses to start against a database missing the columns its rules read, and says so:
+
+```
+EntityLookupError: monitor: the main database is missing columns this monitor reads
+  (no such column: oa_manifest_pending_version). DEPLOY ORDER: restart the API (which migrates
+  the schema on boot) BEFORE the monitor. Refusing to start blind — …
+```
+
+That refusal is the desired outcome: systemd restarts the unit, and it keeps refusing until the
+API has run. The alternative — which is what it used to do — is a process that starts, scans, logs
+`monitor_scanned` every tick and watches **no treasury and no LegalManager proxy at all**, because
+the entity query fails and the entity set is empty. Silence that looks like health is the one
+failure mode this process must not have.
+
+Mid-run the opposite rule applies and the monitor is deliberately forgiving: a lookup failure of
+any kind (a locked DB, a file replaced by a restore or a litestream recovery) logs
+`monitor_entity_lookup_failed` and **reuses the last known entity set** for that tick.
+
 ### Discord / Slack webhook
 
 Discord: server → **Edit Channel → Integrations → Webhooks → New Webhook → Copy URL**.
@@ -236,7 +259,38 @@ match never downgrades below WARN, and a missing record never silences the alert
 3. A veto is permanent for that hash until `liftVeto`, and the backend parks the entity's WHOLE
    anchor pipeline on it — that is the design (a veto is a stop sign, not a per-hash speed bump a
    re-versioning backend routes around). Anchoring for that entity resumes only after the guardian
-   lifts it or an operator acknowledges the cycle.
+   lifts it or an operator acknowledges the cycle (below).
+
+### Ending an anchor HOLD — `anchor-ack`
+
+Two cycle states park an entity's whole anchor pipeline until a human acts, and both page as
+`anchor_held` (WARN, **once per entity per day** — the condition does not change on its own, so it
+is not repeated every tick):
+
+| `oa_anchors.state` | What happened | Ends by |
+|---|---|---|
+| `vetoed` | The guardian cancelled this manifest hash | `liftVeto` on chain (the loop notices within `VETO_RECHECK_CAP_MS`, 15 min), **or** an ack |
+| `failed` | The stored manifest stopped re-hashing to the scheduled anchor (`anchor_rehash_mismatch`), or a manager call reverted deterministically until its attempts ran out (`anchor_revert_exhausted`) | an ack only |
+
+```bash
+# what is held, and why
+sqlite3 -header data/legalbody.db \
+  "SELECT entity_key, version, state, attempt, substr(error,1,80) FROM oa_anchors
+    WHERE state IN ('vetoed','failed');"
+
+# the ack: this version will never be anchored, move the pipeline on
+cd back/backend && npm run cli -- anchor-ack <entityKey> <version>
+```
+
+**Read the caveat the command prints.** An ack is a statement about OUR records. If the amendment
+is still scheduled on chain it stays executable there forever, and only the guardian can stop it —
+so on a `failed` cycle whose hash must never land, the guardian must veto it as well.
+
+`anchor_revert_exhausted` is worth reading before acking: a deterministic revert names itself
+(`NotManager`, `NotActive`, a custom error) and the ack does not fix whatever it named. A legacy
+agent whose `LegalManager` obeys an old EOA reverts `NotManager` forever, and its cycle should be
+acked; a transient RPC problem never lands here at all (it parks with a backoff and burns no
+attempt, by design).
 
 ⚠ **There is no manager-side cancel.** Once scheduled, a hash stays executable FOREVER after its
 delay elapses, and only the guardian can stop it. That is why this alert exists and why the

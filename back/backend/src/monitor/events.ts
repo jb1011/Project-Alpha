@@ -1,6 +1,8 @@
 import {
+  type Abi,
   type AbiEvent,
   type Hex,
+  getAbiItem,
   keccak256,
   pad,
   parseAbiItem,
@@ -64,8 +66,14 @@ export const registryTransferEvent = parseAbiItem(
  * that is renamed or removed fails HERE, at import time, instead of at 3am.
  */
 export function legalManagerEvent(name: string): AbiEvent {
-  const found = legalManagerAbi.find((e) => e.type === "event" && e.name === name);
-  if (!found) throw new Error(`monitor: LegalManager ABI has no event ${name}`);
+  // viem's own ABI accessor rather than a hand-rolled `.find`: it already knows that a name can be
+  // overloaded and that `type` has to be matched too, and it is the thing that stays right when
+  // the ABI shape changes under us. Widened to `Abi` on purpose — against the generated const-ABI
+  // viem narrows `name` to the union of every member, and taking a name it cannot know at compile
+  // time is this helper's entire job.
+  const found = getAbiItem({ abi: legalManagerAbi as Abi, name });
+  if (!found || found.type !== "event")
+    throw new Error(`monitor: LegalManager ABI has no event ${name}`);
   return found as AbiEvent;
 }
 

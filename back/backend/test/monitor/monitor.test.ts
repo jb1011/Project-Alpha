@@ -344,6 +344,48 @@ describe("entity lookup resilience", () => {
     }).tick();
     expect(alerts.map((a) => a.rule)).toContain("controller_role_granted");
   });
+
+  test("F4: a MID-RUN schema error keeps the last entity set — it does not blind the watch", async () => {
+    // The startup case is fatal (`assertLookupSchema`, review F4): a monitor booted against a
+    // database the API has not migrated must stop rather than scan blind. Mid-run is the opposite
+    // situation and gets the opposite answer — a column that vanishes under a RUNNING monitor
+    // means the file was replaced (a restore, a litestream recovery), the next tick reconnects,
+    // and dropping every treasury and proxy in the meantime is exactly the blindness to avoid.
+    let calls = 0;
+    const entities: EntityLookup = {
+      all: () => {
+        if (calls++ === 0) return [entity()];
+        throw new EntityLookupError("no such column: oa_manifest_pending_version", {
+          schemaMismatch: true,
+        });
+      },
+      close: () => {},
+    };
+    const store = SqliteMonitorStore.open(":memory:");
+    store.setCursor(999n);
+    const rpc = rpcStub({ head: 1000n });
+    const monitor = new Monitor({
+      rpc,
+      store,
+      entities,
+      sink: collectingSink().sink,
+      cfg: BASE_CFG,
+      log: () => {},
+    });
+
+    await monitor.tick(); // the good read
+    const afterFirst = rpc.queries.length;
+    store.setCursor(999n); // give the second tick blocks to scan, so it really issues queries
+    await monitor.tick(); // the schema error
+    expect(calls).toBe(2);
+    expect(rpc.queries.length).toBeGreaterThan(afterFirst);
+    // The treasury the first tick learned is still being watched: it is in the address filter of
+    // the SECOND tick's getLogs queries, which an empty entity set would have dropped.
+    const own = rpc.queries
+      .slice(afterFirst)
+      .flatMap((q) => (Array.isArray(q.address) ? q.address : q.address ? [q.address] : []));
+    expect(own.map((a) => a.toLowerCase())).toContain(ADDR.treasury.toLowerCase());
+  });
 });
 
 describe("grant tracking and the TTL sweep", () => {

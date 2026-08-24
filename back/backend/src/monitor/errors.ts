@@ -14,11 +14,15 @@ export class MonitorConfigError extends Error {
 }
 
 /** The main legalbody.db could not be read (missing, locked beyond the busy timeout, un-migrated).
- *  Recoverable: the entity-derived rules degrade for a tick, the controller rules do not. */
+ *  Recoverable MID-RUN: the entity-derived rules degrade for a tick, the controller rules do not.
+ *  `schemaMismatch` is the exception — a missing column never fixes itself, and at STARTUP it is a
+ *  deploy-order mistake that must stop the process rather than produce a blind watcher (F4). */
 export class EntityLookupError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
+  readonly schemaMismatch: boolean;
+  constructor(message: string, options?: { cause?: unknown; schemaMismatch?: boolean }) {
     super(message, options);
     this.name = "EntityLookupError";
+    this.schemaMismatch = options?.schemaMismatch ?? false;
   }
 }
 
