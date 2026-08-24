@@ -113,6 +113,10 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    */
   const phase: Phase =
     formationRequired &&
+    // A box that reports `required` always reports `available` too (they are projections of one
+    // dep). If one ever did not, this guard is what stops the correction from sending the wizard
+    // to a phase that is not in the list and rendering nothing at all.
+    formationAvailable &&
     !session.partyId &&
     !session.entityId &&
     storedPhase !== "dashboard" &&

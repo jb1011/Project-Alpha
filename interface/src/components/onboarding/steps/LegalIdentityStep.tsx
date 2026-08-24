@@ -15,6 +15,7 @@ import {
   Card,
   CheckIcon,
   Field,
+  Spinner,
   StepHeader,
   TextInput,
   cx,
@@ -62,7 +63,7 @@ export function LegalIdentityStep({
   onComplete,
   onClear,
 }: Props) {
-  const { data: publicConfig } = usePublicConfigQuery();
+  const { data: publicConfig, isError: configError } = usePublicConfigQuery();
   const createParty = useCreateFormationPartyMutation();
   const [error, setError] = useState<string | null>(null);
   const [showErrors, setShowErrors] = useState(false);
@@ -73,6 +74,10 @@ export function LegalIdentityStep({
   const environment = publicConfig?.formationEnvironment ?? null;
   const required = publicConfig?.formationRequired === true;
   const sandbox = environment !== "production";
+  // Which of the two modes this screen is IS the honesty question, so it waits for the answer.
+  // Rendering the demo panel for a beat on a production deployment would tell a real founder that
+  // nothing they type is real — the one thing this screen must never say wrongly.
+  const loading = !publicConfig && !configError;
   const busy = createParty.isPending;
   const errors = validateParty(party);
 
@@ -100,15 +105,27 @@ export function LegalIdentityStep({
     <div>
       <StepHeader
         eyebrow={eyebrow}
-        title={sandbox ? "Legal identity (demo filing)" : "Who is filing this company?"}
+        title={
+          loading
+            ? "Legal identity"
+            : sandbox
+              ? "Legal identity (demo filing)"
+              : "Who is filing this company?"
+        }
         intro={
-          sandbox
-            ? "This deployment files in doola's sandbox, so no real identity is collected or sent. The filing uses a labeled demo identity and produces a demo company — nothing legally exists at the end of it."
-            : "A Wyoming LLC is filed in the name of a real, responsible person. doola files it on your behalf, so this identity goes to doola as the filing agent and is never written into your agent's public record, its on-chain metadata, or its operating agreement."
+          loading
+            ? "Checking what this deployment can file."
+            : sandbox
+              ? "This deployment files in doola's sandbox, so no real identity is collected or sent. The filing uses a labeled demo identity and produces a demo company — nothing legally exists at the end of it."
+              : "A Wyoming LLC is filed in the name of a real, responsible person. doola files it on your behalf, so this identity goes to doola as the filing agent and is never written into your agent's public record, its on-chain metadata, or its operating agreement."
         }
       />
 
-      {partyId ? (
+      {loading ? (
+        <Card className="flex items-center gap-2.5 p-6 text-[12.5px] text-muted">
+          <Spinner className="h-3.5 w-3.5" /> Checking this deployment&apos;s filing environment…
+        </Card>
+      ) : partyId ? (
         <RecordedPanel
           partyId={partyId}
           synthetic={synthetic}
@@ -142,7 +159,7 @@ export function LegalIdentityStep({
         </Callout>
       )}
 
-      {!partyId && !sandbox && (
+      {!loading && !partyId && !sandbox && (
         <Callout tone="info" className="mt-6" title="Where this goes">
           Straight to doola, the filing agent, and into one table on this deployment that no view,
           no log, no metadata document and no on-chain record ever reads from. Your agent&apos;s
@@ -151,7 +168,9 @@ export function LegalIdentityStep({
       )}
 
       <StepNav onBack={onBack}>
-        {!required && !partyId && (
+        {/* No skip offered until we know whether this deployment allows one — an affordance that
+            appears and then vanishes is worse than one that arrives a beat late. */}
+        {!loading && !required && !partyId && (
           <Button variant="subtle" disabled={busy} onClick={onComplete}>
             Skip — no legal filing
           </Button>
@@ -162,11 +181,15 @@ export function LegalIdentityStep({
             <CheckIcon className="h-4 w-4" />
           </Button>
         ) : sandbox ? (
-          <Button loading={busy} onClick={() => void create({ synthetic: true })}>
+          <Button
+            disabled={loading}
+            loading={busy}
+            onClick={() => void create({ synthetic: true })}
+          >
             Use the demo identity
           </Button>
         ) : (
-          <Button loading={busy} onClick={() => void submitReal()}>
+          <Button disabled={loading} loading={busy} onClick={() => void submitReal()}>
             Record identity
             {!busy && <CheckIcon className="h-4 w-4" />}
           </Button>
