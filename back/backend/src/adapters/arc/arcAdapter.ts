@@ -392,6 +392,107 @@ export class ArcAdapter {
     });
   }
 
+  // ── Operating-agreement amendments (design §7, the anchor sub-saga) ─────────────────────────
+  //
+  // The treasury pair above is the template with ONE deliberate difference: these two BROADCAST
+  // and return, instead of broadcasting and awaiting. The anchor loop has to persist the tx hash
+  // on the `oa_anchors` row BEFORE the receipt arrives, because a crash in that gap must resume
+  // by ADOPTING the persisted tx — and re-broadcasting a schedule is not harmless here the way a
+  // second policy schedule is: `scheduleOperatingAgreementUpdate` has no `AlreadyScheduled` guard,
+  // so a re-schedule silently RESETS the timelock and hands the guardian a shorter veto window
+  // than the one they were notified about.
+  //
+  // `waitForManagerReceipt` is the other half, exposed so the caller can do
+  // broadcast -> persist -> confirm without reaching for the public client itself.
+
+  /**
+   * Schedule a new operating-agreement hash on the entity's LegalManager (manager-gated,
+   * timelocked, guardian-vetoable). BROADCAST ONLY — see the note above.
+   *
+   * `agentManager` is the proxy's IMMUTABLE manager as persisted at creation: a legacy agent's
+   * LegalManager still obeys the old EOA, so relaying its amendment would revert `NotManager`.
+   */
+  async scheduleOperatingAgreementUpdate(
+    proxy: Address,
+    newHash: Hex,
+    agentManager?: Address,
+  ): Promise<Hex> {
+    return this.sendManagerCall({
+      target: proxy,
+      abi: legalManagerAbi as Abi,
+      functionName: "scheduleOperatingAgreementUpdate",
+      args: [newHash],
+      agentManager,
+    });
+  }
+
+  /** Execute a previously-scheduled amendment once its timelock has elapsed. BROADCAST ONLY. */
+  async executeOperatingAgreementUpdate(
+    proxy: Address,
+    newHash: Hex,
+    agentManager?: Address,
+  ): Promise<Hex> {
+    return this.sendManagerCall({
+      target: proxy,
+      abi: legalManagerAbi as Abi,
+      functionName: "executeOperatingAgreementUpdate",
+      args: [newHash],
+      agentManager,
+    });
+  }
+
+  /** Await a manager-call receipt. The confirm half of the broadcast/persist/confirm split. */
+  async waitForManagerReceipt(txHash: Hex): Promise<{ status: "success" | "reverted" }> {
+    const receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    return { status: receipt.status };
+  }
+
+  /**
+   * Earliest time this hash may be executed, or 0.
+   *
+   * ZERO IS AMBIGUOUS, and every caller must treat it so: `executeOperatingAgreementUpdate`
+   * DELETES the entry, so 0 means "never scheduled" OR "already executed". `oaCurrentHash` is what
+   * disambiguates them, and the anchor loop reads it first (design §7, audit C1).
+   */
+  oaScheduledAt(proxy: Address, newHash: Hex): Promise<bigint> {
+    return this.d.publicClient.readContract({
+      address: proxy,
+      abi: legalManagerAbi,
+      functionName: "scheduledAt",
+      args: [newHash],
+    }) as Promise<bigint>;
+  }
+
+  /** Guardian hard-veto state for one hash. Permanent until `liftVeto` — never a speed bump. */
+  oaVetoed(proxy: Address, newHash: Hex): Promise<boolean> {
+    return this.d.publicClient.readContract({
+      address: proxy,
+      abi: legalManagerAbi,
+      functionName: "vetoed",
+      args: [newHash],
+    }) as Promise<boolean>;
+  }
+
+  /** The entity's timelock, read PER AGENT: it is set at initialize and immutable, and the factory
+   *  reuses the same value as the treasury's policy delay by construction. */
+  oaAmendmentDelay(proxy: Address): Promise<bigint> {
+    return this.d.publicClient.readContract({
+      address: proxy,
+      abi: legalManagerAbi,
+      functionName: "amendmentDelay",
+    }) as Promise<bigint>;
+  }
+
+  /** The anchor the chain currently holds — `meta().operatingAgreementHash`. */
+  async oaCurrentHash(proxy: Address): Promise<Hex> {
+    const meta = (await this.d.publicClient.readContract({
+      address: proxy,
+      abi: legalManagerAbi,
+      functionName: "meta",
+    })) as readonly [string, bigint, Hex, bigint];
+    return meta[2];
+  }
+
   /** Optional v1 step: top up the treasury vault with ERC-20 USDC from the manager wallet. */
   async fundTreasury(p: { usdc: Address; treasury: Address; amount: bigint }): Promise<Hex> {
     const { request } = await this.d.publicClient.simulateContract({
