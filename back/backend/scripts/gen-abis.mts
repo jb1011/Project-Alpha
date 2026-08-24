@@ -1,14 +1,32 @@
 /**
  * Generate type-safe `as const` ABIs from Foundry artifacts in ../out.
  * Run: npm run gen:abis  (re-run after any contract change + `forge build`).
+ *
+ * Emits TWO files, from the same artifacts:
+ *   - `src/abis/generated.ts` — every ABI this backend calls.
+ *   - `interface/src/lib/legalManagerAbi.ts` — the small allowlisted fragment the guardian veto
+ *     card reads the chain with. It used to be hand-written and defended by a drift test; the
+ *     source of truth is right here, so it is derived instead. `test/api/legalManagerAbiFragment.test.ts`
+ *     regenerates and diffs, so a stale fragment fails CI.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { renderLegalManagerFragment } from "../src/abis/interfaceFragment";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = resolve(HERE, "..", "..", "out");
 const DEST = resolve(HERE, "..", "src", "abis", "generated.ts");
+const INTERFACE_FRAGMENT = resolve(
+  HERE,
+  "..",
+  "..",
+  "..",
+  "interface",
+  "src",
+  "lib",
+  "legalManagerAbi.ts",
+);
 
 // exportName -> artifact path under out/<Sol>/<Json>
 const TARGETS: Record<string, string> = {
@@ -45,3 +63,9 @@ for (const [name, rel] of Object.entries(TARGETS)) {
 mkdirSync(dirname(DEST), { recursive: true });
 writeFileSync(DEST, body);
 console.log(`wrote ${DEST} (${Object.keys(TARGETS).length} ABIs)`);
+
+const fragment = renderLegalManagerFragment(
+  loadAbi(TARGETS.legalManagerAbi as string) as unknown[],
+);
+writeFileSync(INTERFACE_FRAGMENT, fragment);
+console.log(`wrote ${INTERFACE_FRAGMENT} (guardian veto-card fragment)`);
