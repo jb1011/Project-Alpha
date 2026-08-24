@@ -1,5 +1,9 @@
 import type { DoolaEnvironment } from "../adapters/doola/types";
-import { type FormationRequestRecord, parseDetail } from "../persistence/formationRepository";
+import {
+  type FormationRequestRecord,
+  type FormationStep,
+  parseDetail,
+} from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
 
 /**
@@ -30,6 +34,47 @@ import type { EntityRecord } from "../types";
 export type FormationStatus = "none" | "in_progress" | "filed" | "complete" | "failed";
 
 /**
+ * ── THE FACT PREDICATES ─────────────────────────────────────────────────────────────────────
+ *
+ * "Has the state filed it?", "has the IRS issued?", "what is doola's company id?" — three
+ * questions four modules ask, and each of them used to answer with its own inline
+ * `steps.find(s => s.step === "await_ein")?.state === "confirmed"`. Written out that way the step
+ * name is a STRING LITERAL in five places, so renaming a step (or adding a fifth) leaves the
+ * copies compiling and quietly wrong: the sweeper would keep polling an entity the anchor loop
+ * considered finished. Centralised here and typed on `FormationStep`, a rename fails to compile.
+ *
+ * They are pure functions of the rows, like everything else in this module, and none of them
+ * reads PII or the EIN itself.
+ */
+export function stepStateOf(
+  steps: FormationRequestRecord[],
+  step: FormationStep,
+): FormationRequestRecord["state"] | undefined {
+  return steps.find((s) => s.step === step)?.state;
+}
+
+/** The STATE has filed the company: it legally exists. */
+export function companyFiled(steps: FormationRequestRecord[]): boolean {
+  return stepStateOf(steps, "await_filing") === "confirmed";
+}
+
+/** Every required document has been fetched, hashed and indexed. */
+export function documentsFetched(steps: FormationRequestRecord[]): boolean {
+  return stepStateOf(steps, "fetch_documents") === "confirmed";
+}
+
+/** The IRS has issued the EIN: the entity is fully formed, and no further legal fact follows. */
+export function einIssued(steps: FormationRequestRecord[]): boolean {
+  return stepStateOf(steps, "await_ein") === "confirmed";
+}
+
+/** doola's company id. Scoped to `create_provider`, the ONLY step that owns one — a later step
+ *  that mirrored the ref would make this ambiguous. An opaque provider reference, not PII. */
+export function providerRefOf(steps: FormationRequestRecord[]): string | null {
+  return steps.find((s) => s.step === "create_provider")?.providerRef ?? null;
+}
+
+/**
  * The projection, in the ONE order that keeps it honest.
  *
  * `filed` and `complete` are checked BEFORE `failed`, deliberately: an entity whose company was
@@ -40,10 +85,8 @@ export type FormationStatus = "none" | "in_progress" | "filed" | "complete" | "f
  */
 export function deriveFormationStatus(steps: FormationRequestRecord[]): FormationStatus {
   if (steps.length === 0) return "none";
-  const state = (step: FormationRequestRecord["step"]) => steps.find((s) => s.step === step)?.state;
-  if (state("await_ein") === "confirmed") return "complete";
-  if (state("await_filing") === "confirmed" || state("fetch_documents") === "confirmed")
-    return "filed";
+  if (einIssued(steps)) return "complete";
+  if (companyFiled(steps) || documentsFetched(steps)) return "filed";
   if (steps.some((s) => s.state === "failed" || s.state === "abandoned")) return "failed";
   return "in_progress";
 }
@@ -107,7 +150,7 @@ export function formationSummary(
     provider: rec.formationProvider,
     environment: rec.formationEnvironment,
     status: deriveFormationStatus(steps),
-    providerRef: steps.find((s) => s.step === "create_provider")?.providerRef ?? null,
+    providerRef: providerRefOf(steps),
     filedAt: rec.formationFiledAt ?? null,
     filingNumber: rec.formationFilingNumber ?? null,
     requiredActions: requiredActionCodesOf(steps),
