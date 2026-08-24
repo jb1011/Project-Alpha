@@ -11,6 +11,7 @@ import { useAuth } from "@/components/onboarding/AuthProvider";
 import {
   bootstrapConnection,
   createConnectionPackage,
+  createFormationParty,
   entityAgentBook,
   executePolicyUpdate,
   fetchAgentSchema,
@@ -50,6 +51,7 @@ import type {
   ConnectionPackage,
   EntityStatus,
   EntityView,
+  FormationPartyInput,
   GuardianPasskey,
   JobView,
   ReputationView,
@@ -263,18 +265,41 @@ export function useOnboardEntityMutation() {
       guardianPasskey,
       idempotencyKey,
       custody,
+      partyId,
     }: {
       spec: AgentSpec;
       guardianPasskey: GuardianPasskey;
       idempotencyKey?: string;
       custody?: "turnkey" | "circle";
+      /** The opaque formation-party handle. Never the identity — that never reaches this layer. */
+      partyId?: string;
     }) => {
       const token = await ensureToken();
-      return onboardEntity(token, spec, guardianPasskey, idempotencyKey, custody);
+      return onboardEntity(token, spec, guardianPasskey, idempotencyKey, custody, partyId);
     },
     onSuccess: async () => {
       const token = await ensureToken();
       await queryClient.invalidateQueries({ queryKey: apiKeys.entities(token) });
+    },
+  });
+}
+
+/**
+ * Record the responsible natural person and get back a handle (design §3/§5).
+ *
+ * A MUTATION and never a query, for a reason beyond the HTTP verb: React Query keys are held in
+ * memory for the life of the page and are the first thing a devtools panel prints. Personal data
+ * must never become one — so this hook takes the identity as an argument, hands it to the client,
+ * and keeps nothing. Nothing is invalidated on success either: the response is one opaque handle,
+ * and no cached view of the account changed.
+ */
+export function useCreateFormationPartyMutation() {
+  const ensureToken = useEnsureAuthToken();
+
+  return useMutation({
+    mutationFn: async (body: { synthetic: true } | FormationPartyInput) => {
+      const token = await ensureToken();
+      return createFormationParty(token, body);
     },
   });
 }

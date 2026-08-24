@@ -43,6 +43,13 @@ export type EntityView = {
         /** Anchored version; null while v1 is still in flight. */
         version: number | null;
         pendingHash: string | null;
+        /** The in-flight version's number — a LABEL beside the pending hash, nothing more. The
+         *  hash a guardian actually vetoes is read off the chain by the veto card itself. */
+        pendingVersion?: number | null;
+        /** Unix **SECONDS** the pending amendment becomes executable on-chain; null until the
+         *  schedule tx confirmed. Optional for deploy-order safety: a backend that predates it
+         *  has no countdown to show. */
+        amendmentExecutableAt?: number | null;
       };
   /** Formation (doola). null/absent = stub, forever. `environment` is always present when the
    *  block is: a sandbox filing must render amber ("Demo formation"), never green. Never
@@ -81,6 +88,36 @@ export type FormationDocument = {
   name: string;
   size: number;
   sha256: string;
+};
+
+/**
+ * The legal identity of the natural person a filing names — the ONE personal-data shape in this
+ * package, mirroring the backend's `FormationPartySchema` field for field.
+ *
+ * It exists only to travel: typed here, held in the wizard's non-persisted PII slice, POSTed to
+ * `/formation-party`, and forgotten. It must never be written to localStorage, never enter a
+ * React Query key, and never enter `AgentSpec` — the caller keeps the opaque `partyId` the
+ * endpoint hands back and passes THAT to onboard.
+ *
+ * `phone` is REQUIRED (backend C6): doola refuses a company create whose responsible party has
+ * no phone, so a party without one is an identity that can never be filed.
+ */
+export type FormationPartyInput = {
+  legalFirstName: string;
+  legalLastName: string;
+  email: string;
+  phone: string;
+  address: {
+    line1: string;
+    /** Omitted entirely when blank — the backend schema is `.strict()` and rejects an empty one. */
+    line2?: string;
+    city: string;
+    /** US: the 2-letter state. Absent for the countries that have no state/province. */
+    region?: string;
+    postalCode: string;
+    /** ISO-3166-1 **alpha-3** ("USA", "FRA") — doola's convention, not alpha-2. */
+    country: string;
+  };
 };
 
 /** Public deployment capabilities (GET /config, unauthenticated) — lets the wizard preselect the
