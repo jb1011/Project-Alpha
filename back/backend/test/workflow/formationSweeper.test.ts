@@ -18,8 +18,10 @@ import { SqliteDoolaEventRepository } from "../../src/persistence/doolaEventRepo
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
+import { SqliteOaAnchorRepository } from "../../src/persistence/oaAnchorRepository";
 import { advanceFormation, parseDetail } from "../../src/workflow/formationProcessor";
 import {
+  ANCHOR_CONCURRENCY,
   FormationSweeper,
   type FormationSweeperDeps,
   MAX_FORMATION_ATTEMPTS,
@@ -36,6 +38,7 @@ import {
   MemoryDocumentStore,
   TENANT,
   doolaDoc,
+  fakeAnchorChain,
   fakeDoola,
   formedEntity,
 } from "../helpers/formationFakes";
@@ -318,6 +321,13 @@ test("C3: an await_ein row's poll cadence GROWS instead of asking every tick for
   requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
   requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
   doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
+  // The ENTITY facts too, exactly as `advanceFiling`'s confirming CAS writes them. Without them
+  // the first poll would HEAL the filing date onto the record (F12) — a real advance, which
+  // legitimately resets the cadence and would make this test about something else.
+  repo.upsert({
+    ...repo.findByIdempotencyKey(ENTITY_KEY)!,
+    formationFiledAt: Math.floor(Date.parse("2026-08-19T00:00:00Z") / 1000),
+  });
   stampRows(now);
 
   const intervals: number[] = [];
@@ -745,4 +755,90 @@ test("M5: the poll due-set is filtered in SQL — an entity that is not due is n
   expect(
     requests.listPollDueEntityKeys(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
   ).toEqual([ENTITY_KEY]);
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// The merge-gate review fixes for the sweeper's anchor phase.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/** N entities that all pass the anchor loop's gates and are all HELD by a guardian veto — which
+ *  is the one shape whose first action is a chain read, and therefore the one that can be watched
+ *  for concurrency. */
+function seedHeldEntities(count: number, anchors: SqliteOaAnchorRepository): string[] {
+  const keys: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const key = `${TENANT}:held-${i}`;
+    keys.push(key);
+    repo.upsert(
+      formedEntity({
+        idempotencyKey: key,
+        publicId: `pub-${i}`,
+        oaHash: `0x${"a".repeat(63)}${i}`,
+        oaManifestAnchoredHash: `0x${"a".repeat(63)}${i}`,
+      }),
+    );
+    anchors.claimVersion(key, 2, `0x${"b".repeat(63)}${i}`);
+    anchors.transition(key, 2, "pending", "vetoed", { error: "guardian veto" });
+  }
+  return keys;
+}
+
+test("F6: the anchor due-set is INCREMENTAL — a settled entity is not a candidate forever", () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  seedFormation();
+  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
+
+  // A confirmed step with no anchor write behind it: the entity owes a version.
+  expect(anchors.listDueEntityKeys(50)).toContain(ENTITY_KEY);
+
+  // Once a cycle has been written AFTER the facts, it is settled and drops out — this is the
+  // whole fix: the old set was "every entity with a confirmed step", which only ever grows.
+  db.prepare(
+    "UPDATE formation_requests SET updated_at = datetime('now','-1 day') WHERE entity_key = ?",
+  ).run(ENTITY_KEY);
+  anchors.claimVersion(ENTITY_KEY, 2, `0x${"c".repeat(64)}`);
+  anchors.transition(ENTITY_KEY, 2, "pending", "executed");
+  expect(anchors.listDueEntityKeys(50)).not.toContain(ENTITY_KEY);
+
+  // …and it comes straight back when a step moves again (the EIN), or when a cycle is open.
+  requests.transition(ENTITY_KEY, "await_ein", "pending", "confirmed");
+  expect(anchors.listDueEntityKeys(50)).toContain(ENTITY_KEY);
+});
+
+test("F6: an OPEN or HELD cycle is always due, whatever its steps say", () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  const [held] = seedHeldEntities(1, anchors);
+  expect(anchors.listDueEntityKeys(50)).toContain(held);
+  // The ack retires the hold, and with it the candidacy.
+  anchors.acknowledgeHold(held!, 2);
+  expect(anchors.listDueEntityKeys(50)).not.toContain(held);
+});
+
+test("F7: the anchor phase drives every due entity, at most ANCHOR_CONCURRENCY at a time", async () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  const keys = seedHeldEntities(ANCHOR_CONCURRENCY * 3, anchors);
+
+  let inFlight = 0;
+  let peak = 0;
+  const seen: string[] = [];
+  const chain = fakeAnchorChain();
+  const arc = {
+    ...chain.chain,
+    oaVetoed: async (proxy: string, hash: string) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      seen.push(hash);
+      // A real chain read is a round trip; without a yield here nothing could ever overlap and
+      // the assertion below would be about the test rather than about the pool.
+      await new Promise((r) => setImmediate(r));
+      inFlight--;
+      return true;
+    },
+  } as unknown as typeof chain.chain;
+
+  await sweeper({ anchor: { anchors, arc, chainId: 5042002 } }).tick();
+
+  expect(seen).toHaveLength(keys.length); // the queue is drained, not truncated
+  expect(peak).toBeGreaterThan(1); // …in parallel
+  expect(peak).toBeLessThanOrEqual(ANCHOR_CONCURRENCY); // …and bounded
 });

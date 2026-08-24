@@ -112,6 +112,18 @@ export const AMORTISED_EVERY_N_TICKS = 60;
 export const POLL_BATCH = 200;
 export const STRANDED_BATCH = 50;
 
+/**
+ * How many entities one tick may drive through the ANCHOR sub-saga, and how many at once.
+ *
+ * Smaller than `POLL_BATCH` because the work is heavier: an anchor pass is several sequential
+ * chain reads and, on the broadcast path, a bounded receipt wait. Four in flight hides the RPC
+ * latency without letting one sweep saturate the endpoint or the event loop of a process that is
+ * also serving HTTP (the document fetcher's `DOCUMENT_FETCH_CONCURRENCY` reasoning, applied to a
+ * per-entity unit of work).
+ */
+export const ANCHOR_BATCH = 50;
+export const ANCHOR_CONCURRENCY = 4;
+
 /** How long a `submitted` `create_provider` row may sit before a tick presumes the process that
  *  wrote it is gone (C2). The client's own deadline plus slack — imported, never re-typed, so the
  *  two cannot drift. */
@@ -513,36 +525,51 @@ export class FormationSweeper {
   /**
    * Drive every entity whose anchor pipeline could possibly move.
    *
-   * TWO candidate sets, and the second is the one that is easy to forget. Open cycles are
-   * obvious: something is pending or scheduled and the chain may have moved. But an entity whose
-   * facts have just confirmed has NO cycle yet — the version that should exist has never been
-   * opened — and if the webhook that confirmed it arrived while this process was restarting,
-   * nothing else in the system would ever open it. Those entities are found by their confirmed
-   * formation steps, which is exactly the trigger `deriveLegalBlock` reads.
+   * THE CANDIDATE SET IS INCREMENTAL (review F6). It used to be "every open cycle, plus every
+   * entity with a confirmed formation step" — and the second half is every entity that has ever
+   * been formed, a set that only grows and never shrinks. Each member cost a manifest read, a
+   * keccak and a canonical re-serialization, once a minute, forever, to conclude that nothing had
+   * changed. `listDueEntityKeys` asks the database the question instead: an open cycle, a held
+   * one, or a confirmed step written since the entity's last anchor write. The entities it still
+   * over-includes (SQLite timestamps have one-second resolution, so the fast path's
+   * confirm-and-open pair can look simultaneous) are dismissed by the cheap gates at the top of
+   * `advanceAnchor` without a single file being opened.
    *
-   * The keyed lock is taken HERE rather than inside the loop, because `advanceAnchor` is
-   * deliberately lock-free so fetch-and-advance can call it while already holding the lock.
+   * BOUNDED CONCURRENCY (review F7). Each entity is several sequential RPC round trips and, on the
+   * broadcast path, a receipt wait — sequentially, a backlog of fifty is a tick that runs for
+   * minutes and blocks the poll behind it. Four at a time is the same compromise the document
+   * fetcher makes: enough to hide the latency, few enough that a sweep cannot saturate the RPC
+   * (or the event loop of a process that is also serving HTTP). `allSettled`, because one
+   * entity's rejection must never cancel its neighbours' work.
+   *
+   * The keyed lock is taken per entity HERE rather than inside the loop, because `advanceAnchor`
+   * is deliberately lock-free so fetch-and-advance can call it while already holding the lock.
    */
   private async advanceAnchors(): Promise<void> {
     const anchor = this.d.anchor;
     if (!anchor) return; // no anchor wiring: the v1-row-only shape, unchanged
     const deps = { ...this.d, ...anchor };
-    const keys = new Set<string>();
-    for (const row of anchor.anchors.listOpen()) keys.add(row.entityKey);
-    for (const row of this.d.requests.listByState("confirmed")) keys.add(row.entityKey);
-    for (const entityKey of keys) {
-      try {
-        await withKeyedLock(entityKey, () => advanceAnchor(deps, entityKey));
-      } catch (err) {
-        // advanceAnchor has its own catch-all, so reaching this is a bug rather than a bad
-        // minute — but one entity's bug must still not stop the sweep.
-        opsLog("anchor_sweep_failed", {
-          level: "warn",
-          entityKey,
-          message: (err as Error).message,
-        });
+    const queue = anchor.anchors.listDueEntityKeys(ANCHOR_BATCH);
+    const worker = async () => {
+      for (;;) {
+        const entityKey = queue.shift();
+        if (entityKey === undefined) return;
+        try {
+          await withKeyedLock(entityKey, () => advanceAnchor(deps, entityKey));
+        } catch (err) {
+          // advanceAnchor has its own catch-all, so reaching this is a bug rather than a bad
+          // minute — but one entity's bug must still not stop the sweep.
+          opsLog("anchor_sweep_failed", {
+            level: "warn",
+            entityKey,
+            message: (err as Error).message,
+          });
+        }
       }
-    }
+    };
+    await Promise.allSettled(
+      Array.from({ length: Math.min(ANCHOR_CONCURRENCY, queue.length) }, worker),
+    );
   }
 
   // ── (f) PII erasure (design §3, audit H7) ─────────────────────────────────────────────────
