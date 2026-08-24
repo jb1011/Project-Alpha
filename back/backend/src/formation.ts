@@ -297,23 +297,32 @@ export function createFormationParty(
 }
 
 /**
- * The legacy doors' refusal (design §5, door matrix).
+ * The legacy door's refusal (design §5, door matrix).
  *
- * `src/onboarding/server.ts` and `cli create-entity` bypass the claim, the World gate and the
- * custody gate entirely — and they have no way to carry a `partyId`. On a deployment where
- * formation is MANDATORY they would therefore mint entities that are pinned to a provider, owe
- * a filing, and have no legal identity to file with: a permanently stuck entity, created by a
- * door that never learned formation exists.
+ * `cli create-entity` bypasses the claim, the World gate and the custody gate entirely — and it
+ * has no way to carry a `partyId`. On a deployment where formation is MANDATORY it would
+ * therefore mint entities that are pinned to a provider, owe a filing, and have no legal identity
+ * to file with: a permanently stuck entity, created by a door that never learned formation exists.
  *
- * So they refuse, loudly, at request/command time. The design records the recommendation to
- * retire the legacy server outright and leaves the decision to this PR's review; the refusal is
- * what makes either outcome safe in the meantime.
+ * So it refuses, loudly, at command time.
+ *
+ * There used to be TWO such doors. The standalone onboarding server
+ * (`src/onboarding/{server,main}.ts`) was RETIRED in PR 3 — the design recorded the
+ * recommendation and left the decision to review, and the decision was to retire it. It had no
+ * auth, no World gate and no custody gate, and it bypassed `claimKey`, which is the cross-process
+ * mutex that stops two runners minting the same entity. Nothing shipped depended on it: the
+ * wizard API (`POST /onboard`) and the MCP `onboard_agent` tool are the doors, and both carry the
+ * full gate order. Keeping a fifth entry point alive purely so it could refuse was more surface,
+ * not less.
+ *
+ * The CLI stays. It is a separate process on the same database, it is how an operator mints on a
+ * box with no browser, and its hard refusal is intact.
  */
-export function legacyDoorRefusalMessage(door: "onboarding-server" | "cli create-entity"): string {
+export function legacyDoorRefusalMessage(door: "cli create-entity"): string {
   return `${door} cannot onboard on a deployment where formation is required: it carries no formation party (POST /formation-party) and would mint an entity that can never be filed. Use the wizard API (POST /onboard) or the MCP onboard_agent tool.`;
 }
 
-/** True when the legacy doors must refuse: formation is configured AND mandatory. */
+/** True when the legacy door must refuse: formation is configured AND mandatory. */
 export function legacyDoorRefused(cfg: Pick<Config, "doola" | "formation">): boolean {
   return canFormEntities(cfg) && Boolean(cfg.formation?.required);
 }
