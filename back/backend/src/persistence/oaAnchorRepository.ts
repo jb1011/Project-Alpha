@@ -101,16 +101,20 @@ export interface OaAnchorRepository {
   ): boolean;
   bumpAttempt(entityKey: string, version: number, from: OaAnchorState): number | undefined;
   /**
-   * The OPERATOR ACK on a veto (design §7, audit H4).
+   * The OPERATOR ACK that ends a HOLD (design §7, audit H4).
    *
-   * A guardian veto parks the entity's WHOLE anchor pipeline — it is a stop sign, not a per-hash
-   * speed bump a re-versioning backend routes around. Two things can end that park: the guardian
-   * lifting the veto on chain (which the loop observes and resumes from), or a human deciding
-   * this version is dead and the pipeline should move on. This is the second one, and it is
-   * deliberately a state move rather than a flag column: `superseded` already MEANS "this cycle
-   * will never be anchored", and the acknowledgement is exactly that statement.
+   * Two cycle states park the entity's WHOLE anchor pipeline rather than just themselves: a
+   * guardian `vetoed` (a stop sign, not a per-hash speed bump a re-versioning backend routes
+   * around) and a `failed` one, which today means the scheduled manifest no longer re-hashes to
+   * its anchor — a fact a human has to look at, because the amendment is still live on chain and
+   * only the guardian can stop it.
+   *
+   * A veto can also end on chain, via `liftVeto`, which the loop observes. This is the other exit:
+   * a human deciding the version is dead and the pipeline should move on. Deliberately a state
+   * move rather than a flag column — `superseded` already MEANS "this cycle will never be
+   * anchored", and the acknowledgement is exactly that statement.
    */
-  acknowledgeVeto(entityKey: string, version: number): boolean;
+  acknowledgeHold(entityKey: string, version: number): boolean;
 }
 
 export class SqliteOaAnchorRepository implements OaAnchorRepository {
@@ -242,10 +246,12 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
     return (this.stmts.listOpen.all() as Row[]).map(toRecord);
   }
 
-  /** CAS `vetoed` -> `superseded`. See the interface note: the state IS the acknowledgement. */
-  acknowledgeVeto(entityKey: string, version: number): boolean {
-    return this.transition(entityKey, version, "vetoed", "superseded", {
-      error: "veto acknowledged by an operator — this version will never be anchored",
-    });
+  /** CAS `vetoed`|`failed` -> `superseded`. See the interface note: the state IS the ack. */
+  acknowledgeHold(entityKey: string, version: number): boolean {
+    const error = "hold acknowledged by an operator — this version will never be anchored";
+    return (
+      this.transition(entityKey, version, "vetoed", "superseded", { error }) ||
+      this.transition(entityKey, version, "failed", "superseded", { error })
+    );
   }
 }

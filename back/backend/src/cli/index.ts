@@ -50,6 +50,11 @@ export function buildCli(
         usdc: ctx.cfg.usdc,
         metadataBaseUrl: ctx.cfg.metadataBaseUrl,
         fundAmount: opts.fund ? usdToUnits(opts.fund) : undefined,
+        // Carried from PR 1: a CLI-created entity records its v1 anchor cycle like every other
+        // one. Without it `oa_anchors` has no baseline for this entity, and the monotonic rules
+        // ("schedule/execute only when version > the anchored one") plus the monitor's
+        // "any execute of a non-current version is CRITICAL" both read that table.
+        anchors: ctx.anchors,
         // Audit item 7 (review L4): CLI-created rows must also store their pocket address at
         // creation, or their read paths re-open the master-seed dependency.
         derivePocketAddress: ctx.cfg.pocketMasterSeed

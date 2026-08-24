@@ -28,6 +28,7 @@ import {
 } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import { parseSqliteUtc } from "../util/sqliteTime";
+import { advanceAnchor } from "./anchorLoop";
 import {
   type FormationAdvanceDeps,
   advanceFormation,
@@ -59,9 +60,13 @@ import { persistPollBackoff } from "./formationStep";
  *   (c) retry `failed` rows with backoff, and give up at a bounded attempt count rather than
  *       retrying a hopeless row forever;
  *   (d) poll doola for anything still in flight, with its own much slower backoff;
- *   (e) erase PII whose filing provably never happened;
- *   (f) warn about formations that have been in flight far too long;
- *   (g) drop webhook rows past their retention window.
+ *   (e) drive the ON-CHAIN anchor sub-saga — open the cycle a confirmed fact justifies, adopt a
+ *       broadcast a crash orphaned, and execute what the timelock has released. This is the leg
+ *       that makes anchoring GUARANTEED rather than merely fast: the webhook path opens a version
+ *       within the second, but only a timer can be there when a 24h timelock elapses;
+ *   (f) erase PII whose filing provably never happened;
+ *   (g) warn about formations that have been in flight far too long;
+ *   (h) drop webhook rows past their retention window.
  *
  * Loop shape is the monitor's (`monitor/monitor.ts:302-314`): a guarded self-rescheduling
  * `setTimeout`, so one throwing tick can never stop the next one from being scheduled.
@@ -178,6 +183,7 @@ export class FormationSweeper {
       await this.resumeStalledCreates();
       await this.retryFailedSteps();
       await this.pollInFlight();
+      await this.advanceAnchors();
       this.erasePii();
       if (amortised) {
         this.warnStale();
@@ -502,7 +508,44 @@ export class FormationSweeper {
     persistPollBackoff(this.d, row, { advanced });
   }
 
-  // ── (e) PII erasure (design §3, audit H7) ─────────────────────────────────────────────────
+  // ── (e) the on-chain anchor sub-saga (design §7) ──────────────────────────────────────────
+
+  /**
+   * Drive every entity whose anchor pipeline could possibly move.
+   *
+   * TWO candidate sets, and the second is the one that is easy to forget. Open cycles are
+   * obvious: something is pending or scheduled and the chain may have moved. But an entity whose
+   * facts have just confirmed has NO cycle yet — the version that should exist has never been
+   * opened — and if the webhook that confirmed it arrived while this process was restarting,
+   * nothing else in the system would ever open it. Those entities are found by their confirmed
+   * formation steps, which is exactly the trigger `deriveLegalBlock` reads.
+   *
+   * The keyed lock is taken HERE rather than inside the loop, because `advanceAnchor` is
+   * deliberately lock-free so fetch-and-advance can call it while already holding the lock.
+   */
+  private async advanceAnchors(): Promise<void> {
+    const anchor = this.d.anchor;
+    if (!anchor) return; // no anchor wiring: the v1-row-only shape, unchanged
+    const deps = { ...this.d, ...anchor };
+    const keys = new Set<string>();
+    for (const row of anchor.anchors.listOpen()) keys.add(row.entityKey);
+    for (const row of this.d.requests.listByState("confirmed")) keys.add(row.entityKey);
+    for (const entityKey of keys) {
+      try {
+        await withKeyedLock(entityKey, () => advanceAnchor(deps, entityKey));
+      } catch (err) {
+        // advanceAnchor has its own catch-all, so reaching this is a bug rather than a bad
+        // minute — but one entity's bug must still not stop the sweep.
+        opsLog("anchor_sweep_failed", {
+          level: "warn",
+          entityKey,
+          message: (err as Error).message,
+        });
+      }
+    }
+  }
+
+  // ── (f) PII erasure (design §3, audit H7) ─────────────────────────────────────────────────
 
   private erasePii(): void {
     const cutoff = sqliteUtcTimestamp(this.now() - UNBOUND_PARTY_MAX_AGE_MS);
@@ -514,7 +557,7 @@ export class FormationSweeper {
     }
   }
 
-  // ── (f) formations that have been in flight far too long ──────────────────────────────────
+  // ── (g) formations that have been in flight far too long ──────────────────────────────────
 
   private warnStale(): void {
     const now = this.now();
@@ -550,7 +593,7 @@ export class FormationSweeper {
     for (const key of this.warned) if (!key.endsWith(`:${today}`)) this.warned.delete(key);
   }
 
-  // ── (g) retention ─────────────────────────────────────────────────────────────────────────
+  // ── (h) retention ─────────────────────────────────────────────────────────────────────────
 
   private sweepEvents(): void {
     const deleted = this.d.events.deleteOlderThan(

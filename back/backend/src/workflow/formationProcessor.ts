@@ -22,6 +22,7 @@ import {
   type FormationStep,
   parseDetail,
 } from "../persistence/formationRepository";
+import { type AnchorWiring, advanceAnchor } from "./anchorLoop";
 import { downloadDocument } from "./documentDownloader";
 import { environmentPinMismatchError } from "./formationProvider";
 import { failFormationStep, logFormationStep, persistPollBackoff } from "./formationStep";
@@ -203,6 +204,15 @@ export interface FormationAdvanceDeps {
   fetchImpl?: typeof fetch;
   /** Injected in tests; the document downloader's DNS resolver (the SSRF check always runs). */
   lookupImpl?: import("../payments/ssrfGuard").HostLookup;
+  /**
+   * The anchor sub-saga's extra wiring (design §7). Absent = nothing beyond the v1 row written at
+   * create-confirm — which is the shape a credential-less deployment and every legacy entity keep.
+   *
+   * It is a nested block rather than three more top-level fields for the reason `formation` on
+   * `OnboardingDeps` is: the three arrive together or not at all, and a composition root that
+   * could supply the repository without the chain adapter would produce cycles nothing can drive.
+   */
+  anchor?: AnchorWiring;
   now?: () => number;
 }
 
@@ -323,6 +333,13 @@ export async function advanceFormation(
   advanced = advanceFiling(d, entityKey, company, requiredActions, providerRef) || advanced;
   advanced = (await advanceDocuments(d, entityKey, providerRef, documents)) || advanced;
   advanced = advanceEin(d, entityKey, company, providerRef) || advanced;
+
+  // ── The anchor sub-saga's FAST path (design §7). A webhook that confirms the filing opens v2
+  //    within the second; the sweeper's own anchor phase is what makes progress guaranteed.
+  //    Gated on `advanced` deliberately: a poll that learned nothing has nothing new to anchor,
+  //    and the sweeper already re-drives every open cycle every tick. Called WITHOUT taking the
+  //    entity lock, because both callers of this function are already holding it.
+  if (advanced && d.anchor) await advanceAnchor({ ...d, ...d.anchor }, entityKey);
   return { fetched: true, advanced };
 }
 

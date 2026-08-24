@@ -246,16 +246,22 @@ test("A-repo-2: the backoff scalars are written together and CLEARED by the next
   expect(row.scheduleTx).toBe("0xs");
 });
 
-test("A-repo-3: acknowledgeVeto is a CAS from `vetoed` and nothing else", () => {
+test("A-repo-3: acknowledgeHold is a CAS from the two HOLD states and nothing else", () => {
   anchors.claimVersion("ent", 3, "0x03");
   anchors.transition("ent", 3, "pending", "scheduled", { scheduleTx: "0xs" });
-  // A scheduled cycle is not something an operator may wave through — only a vetoed one.
-  expect(anchors.acknowledgeVeto("ent", 3)).toBe(false);
+  // A scheduled cycle is not something an operator may wave through — only a held one.
+  expect(anchors.acknowledgeHold("ent", 3)).toBe(false);
   anchors.transition("ent", 3, "scheduled", "vetoed");
-  expect(anchors.acknowledgeVeto("ent", 3)).toBe(true);
+  expect(anchors.acknowledgeHold("ent", 3)).toBe(true);
   const row = anchors.find("ent", 3)!;
   expect(row.state).toBe("superseded");
-  expect(row.error).toMatch(/veto acknowledged by an operator/);
+  expect(row.error).toMatch(/hold acknowledged by an operator/);
   // Idempotent by construction: the second ack has nothing to move.
-  expect(anchors.acknowledgeVeto("ent", 3)).toBe(false);
+  expect(anchors.acknowledgeHold("ent", 3)).toBe(false);
+
+  // The other hold: a cycle whose scheduled manifest no longer re-hashes to its anchor.
+  anchors.claimVersion("ent", 4, "0x04");
+  anchors.transition("ent", 4, "pending", "failed", { error: "rehash mismatch" });
+  expect(anchors.acknowledgeHold("ent", 4)).toBe(true);
+  expect(anchors.find("ent", 4)?.state).toBe("superseded");
 });

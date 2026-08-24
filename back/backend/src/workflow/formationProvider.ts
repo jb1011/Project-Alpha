@@ -92,11 +92,19 @@ export interface FormationCreateDeps {
   environment: DoolaEnvironment;
 }
 
-/** We form Wyoming LLCs. Both are constants rather than spec fields on purpose: the jurisdiction
- *  is a product decision, and a caller-chosen state would file into a legal regime the OA, the
- *  treasury contracts and the compliance calendar were not written for. */
-const FORMATION_STATE = "WY";
-const ENTITY_TYPE_ENDING = "LLC";
+/**
+ * We form Wyoming LLCs. Both are constants rather than spec fields on purpose: the jurisdiction
+ * is a product decision, and a caller-chosen state would file into a legal regime the OA, the
+ * treasury contracts and the compliance calendar were not written for.
+ *
+ * EXPORTED for the anchor loop (design §7): the manifest's `legal.entityType`/`legal.state` must
+ * be the values we FILED with, and re-typing them there would be a second source of truth for a
+ * fact that gets hashed onto the chain. Reading them back off a doola response instead would put
+ * a provider-controlled string inside the anchor.
+ */
+export const FORMATION_STATE = "WY";
+export const FORMATION_ENTITY_TYPE = "LLC";
+const ENTITY_TYPE_ENDING = FORMATION_ENTITY_TYPE;
 
 /** A NAICS `industry` label from `GET /v1/partner/references/naics-codes` (verified live
  *  2026-08-21; maps to 541511). `industry` or `naicsCode` is REQUIRED by the create. */
@@ -460,7 +468,7 @@ function buildCompanyInput(
   const address = toDoolaAddress(party);
   return {
     doolaCustomerId: customerId,
-    entityType: "LLC",
+    entityType: FORMATION_ENTITY_TYPE,
     state: FORMATION_STATE,
     nameOptions: nameOptions.map((n, i) => ({ ...n, position: i + 1 })),
     industry: DEFAULT_INDUSTRY,

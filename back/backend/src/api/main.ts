@@ -400,6 +400,10 @@ async function main() {
     // The DEPLOYMENT's environment, which is what every entity's pin is compared against.
     environment: cfg.doola!.environment,
     intervalMs: cfg.formation?.sweepMs ?? 60_000,
+    // The anchor sub-saga (design §7). The SAME `anchors` repo the saga writes the v1 row with
+    // and the SAME `arc` adapter the saga mints through — a second adapter would be a second
+    // manager identity, and a second repo would be a second opinion about what the chain holds.
+    anchor: { anchors, arc, chainId: cfg.chainId },
   };
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
 
