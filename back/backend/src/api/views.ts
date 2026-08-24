@@ -93,6 +93,19 @@ export interface EntityView {
         version: number | null;
         /** The single in-flight version's hash, or null when nothing is pending. */
         pendingHash: string | null;
+        /**
+         * The in-flight version's NUMBER — for DISPLAY beside the pending hash ("update pending
+         * (v3)"), and for nothing else. A guardian deciding whether to veto reads the hash off
+         * the chain, never off this projection (audit H4): a compromised backend that could
+         * choose which hash the veto card shows could steer the veto itself.
+         */
+        pendingVersion: number | null;
+        /**
+         * Unix **SECONDS** the pending amendment becomes executable on-chain; null until the
+         * schedule tx has confirmed. Seconds, like the column and like the chain — the veto card
+         * multiplies by 1000 exactly once, at the edge.
+         */
+        amendmentExecutableAt: number | null;
       };
   /**
    * Formation (design §2/§8). NULL = stub, forever — the shape every legacy row keeps and the
@@ -186,6 +199,8 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
           hash: r.oaHash ?? null,
           version: r.oaManifestVersion ?? null,
           pendingHash: r.oaManifestPendingHash ?? null,
+          pendingVersion: r.oaManifestPendingVersion ?? null,
+          amendmentExecutableAt: r.oaAmendmentExecutableAt ?? null,
         }
       : { scheme: "legacy" as const, hash: r.oaHash ?? null },
     // Both halves or neither: an entity pinned to a provider is always pinned to an environment
