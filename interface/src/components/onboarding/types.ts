@@ -104,6 +104,66 @@ export function indexIn(phases: PhaseMeta[], phase: Phase): number {
   return phases.findIndex((p) => p.id === phase);
 }
 
+/**
+ * The phase to actually RENDER, given the phases this deployment shows.
+ *
+ * **The invariant: the rendered phase is always a member of the visible list.** Break it and
+ * `indexIn` returns -1, which is not an error anywhere — it is "Step 0 of 7" in the header, no
+ * highlighted row in the rail, and a `<Stepper current=…>` pointing at a step that is not on it.
+ * The wizard keeps working, and every position it reports is wrong by one screen.
+ *
+ * It breaks for reasons that are ordinary rather than exotic: a session restored from storage on
+ * the `legal-identity` step while `GET /config` is still in flight (formation unknown → the step
+ * is hidden), the same session after `/config` failed, or a deployment that turned formation off
+ * between two visits. All three are "the stored phase is no longer on the list", and all three
+ * used to render the phantom step.
+ *
+ * Where it snaps to:
+ *   - `legal-identity` → `custody`, the phase the flow itself sends users to when the step is
+ *     skipped or absent. Snapping BACKWARDS here would re-run the accountable-human step for
+ *     somebody who already completed it.
+ *   - anything else → the nearest surviving phase BEFORE it, so a snap can never carry someone
+ *     past a step they have not done.
+ *   - a phase that is not in `PHASES` at all (corrupt storage) → the first visible phase.
+ *
+ * Pure, and derived during render rather than corrected by an effect: an effect would paint the
+ * phantom step for one frame and then cascade a second render to fix it.
+ */
+export function snapToVisiblePhase(phases: PhaseMeta[], phase: Phase): Phase {
+  if (indexIn(phases, phase) >= 0) return phase;
+  if (phase === "legal-identity" && indexIn(phases, "custody") >= 0) return "custody";
+
+  const canonical = PHASES.findIndex((p) => p.id === phase);
+  for (let i = canonical - 1; i >= 0; i--) {
+    const candidate = PHASES[i];
+    if (candidate && indexIn(phases, candidate.id) >= 0) return candidate.id;
+  }
+  return phases[0]?.id ?? "welcome";
+}
+
+/**
+ * The neighbours of a phase IN THE VISIBLE LIST — the only list that knows.
+ *
+ * These replace hand-rolled ternaries at the two seams where the optional legal-identity step
+ * sits (`guardian → ?` forwards, `custody → ?` backwards). Each ternary re-derived the same fact
+ * `visiblePhases` already holds, from a different input (`formationAvailable` rather than the list
+ * itself), which is two answers to one question — and the day a second optional phase appears,
+ * the ternaries are wrong and nothing says so.
+ *
+ * Clamped at both ends: there is no phase before `welcome` and none after `dashboard`.
+ */
+export function nextPhase(phases: PhaseMeta[], phase: Phase): Phase {
+  const i = indexIn(phases, phase);
+  if (i < 0) return phase;
+  return phases[i + 1]?.id ?? phase;
+}
+
+export function prevPhase(phases: PhaseMeta[], phase: Phase): Phase {
+  const i = indexIn(phases, phase);
+  if (i <= 0) return phase;
+  return phases[i - 1]?.id ?? phase;
+}
+
 /** The "Screen N" eyebrow, counted over the phases this deployment actually shows. */
 export function screenLabel(phases: PhaseMeta[], phase: Phase): string {
   const i = indexIn(phases, phase);

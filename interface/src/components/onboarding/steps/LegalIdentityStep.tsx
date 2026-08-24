@@ -10,11 +10,13 @@ import {
 } from "../types";
 import { useCreateFormationPartyMutation, usePublicConfigQuery } from "@/lib/api/hooks";
 import {
+  AmberPill,
   Button,
   Callout,
   Card,
   CheckIcon,
   Field,
+  SectionTitle,
   Spinner,
   StepHeader,
   TextInput,
@@ -215,10 +217,7 @@ function SandboxPanel({
   return (
     <Card className="border-[#febc2e]/30 bg-[#febc2e]/[0.05] p-6">
       <div className="flex flex-wrap items-center gap-2.5">
-        <span className="inline-flex items-center gap-1.5 rounded-full border border-[#febc2e]/40 bg-[#febc2e]/10 px-3 py-1 text-[11px] uppercase tracking-[0.14em] text-[#f3cd72]">
-          <span className="h-1.5 w-1.5 rounded-full bg-[#febc2e]" />
-          Demo formation (sandbox)
-        </span>
+        <AmberPill size="label">Demo formation (sandbox)</AmberPill>
         {environment === null && (
           <span className="text-[11.5px] text-muted-2">environment not reported by this deployment</span>
         )}
@@ -307,7 +306,7 @@ function RealForm({
   return (
     <div className="flex flex-col gap-6">
       <Card className="p-6">
-        <SectionTitle n="A" title="Responsible person" />
+        <SectionTitle n="A">Responsible person</SectionTitle>
         <div className="mt-5 grid grid-cols-1 gap-5 sm:grid-cols-2">
           <Field label="Legal first name" htmlFor="party-first" error={errors.legalFirstName}>
             <TextInput
@@ -357,7 +356,7 @@ function RealForm({
       </Card>
 
       <Card className="p-6">
-        <SectionTitle n="B" title="Address" />
+        <SectionTitle n="B">Address</SectionTitle>
         <div className="mt-5 grid grid-cols-1 gap-5 sm:grid-cols-2">
           <Field
             label="Street address"
@@ -462,17 +461,6 @@ function RealForm({
           )}
         </div>
       </Card>
-    </div>
-  );
-}
-
-function SectionTitle({ n, title }: { n: string; title: string }) {
-  return (
-    <div className="flex items-center gap-2.5">
-      <span className="flex h-5 w-5 items-center justify-center rounded-md border hairline-strong bg-paper text-[10.5px] text-muted">
-        {n}
-      </span>
-      <h3 className="text-[14px] font-medium text-ink">{title}</h3>
     </div>
   );
 }

@@ -10,12 +10,13 @@ import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
+import { shortenErr } from "@/lib/errors";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { JobsReputationCard } from "@/components/agents/JobsReputationCard";
 import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
 import { FormationCard } from "@/components/agents/FormationCard";
-import { Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
+import { AmberPill, Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
 
 export function AgentDashboard({
@@ -509,11 +510,6 @@ function RunRow({ run }: { run: AgentRun }) {
   );
 }
 
-function shortenErr(msg: string): string {
-  const first = msg.split("\n")[0]?.trim() ?? "Transaction failed.";
-  return first.length > 140 ? `${first.slice(0, 140)}…` : first;
-}
-
 /** `<publicId>.novicorpus.eth` — the wildcard gateway resolves any entity by its publicId label.
  *  The view doesn't carry publicId, but the public metadataURI ends with it. file:// legacy
  *  agents predate the ENS integration and simply don't get a name shown. */
@@ -552,13 +548,13 @@ function pendingAnchorChip(entity: Pick<EntityView, "oaAnchor">): ReactNode {
   if (!anchor.pendingHash || anchor.version == null) return null;
   const version = anchor.pendingVersion ?? anchor.version + 1;
   return (
-    <span
+    <AmberPill
+      size="sm"
+      className="font-normal"
       title="A new version of this entity's anchor is scheduled behind the guardian timelock. Review or veto it in Settings."
-      className="inline-flex items-center gap-1.5 rounded-full border border-[#febc2e]/40 bg-[#febc2e]/10 px-2 py-0.5 text-[10.5px] font-normal text-[#f3cd72]"
     >
-      <span aria-hidden className="h-1 w-1 rounded-full bg-[#febc2e]" />
       update pending (v{version})
-    </span>
+    </AmberPill>
   );
 }
 

@@ -5,6 +5,7 @@ import type { WorldIdMe } from "@/lib/api/types";
 import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
+import { formatDate } from "@/lib/format";
 import { Button, CheckIcon, cx } from "@/components/onboarding/primitives";
 import { shortAddress } from "@/components/onboarding/types";
 
@@ -366,11 +367,4 @@ function WorldMark({ className }: { className?: string }) {
   );
 }
 
-function formatDate(ms: number): string {
-  return new Date(ms).toLocaleDateString(undefined, {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
-}
 

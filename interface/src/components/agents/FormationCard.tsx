@@ -3,8 +3,9 @@
 import { useState } from "react";
 import { downloadDocument } from "@/lib/api/client";
 import type { EntityView, FormationDocument } from "@/lib/api/types";
+import { formatDate } from "@/lib/format";
 import { useAuth } from "@/components/onboarding/AuthProvider";
-import { Card, Spinner, cx } from "@/components/onboarding/primitives";
+import { AmberPill, Card, SectionTitle, Spinner, cx } from "@/components/onboarding/primitives";
 
 type Formation = NonNullable<EntityView["formation"]>;
 
@@ -66,12 +67,9 @@ export function FormationCard({
   return (
     <Card className={cx("p-5", sandbox && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">Legal formation</div>
+        <SectionTitle>Legal formation</SectionTitle>
         {sandbox ? (
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-[#febc2e]/40 bg-[#febc2e]/10 px-3 py-1 text-[11.5px] text-[#f3cd72]">
-            <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-[#febc2e]" />
-            Demo formation (sandbox)
-          </span>
+          <AmberPill>Demo formation (sandbox)</AmberPill>
         ) : (
           <span className="inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1 text-[11.5px] text-muted-2">
             Production filing
@@ -94,7 +92,9 @@ export function FormationCard({
       <dl className="mt-4 flex flex-col gap-3 text-[12.5px]">
         <Row k="Filing agent" v={formation.provider} />
         {formation.providerRef && <Row k="Provider reference" v={formation.providerRef} mono />}
-        <Row k="Filed" v={formation.filedAt ? formatDate(formation.filedAt) : "—"} />
+        {/* The view carries unix SECONDS; the shared formatter takes milliseconds and the
+            conversion is written here, where the unit is visible. */}
+        <Row k="Filed" v={formation.filedAt ? formatDate(formation.filedAt * 1000) : "—"} />
         <Row k="Filing number" v={formation.filingNumber ?? "—"} mono={!!formation.filingNumber} />
         {/* Owner-visible only: the authenticated entity view is the ONLY surface that carries it,
             and this dashboard is the only place it is rendered. */}
@@ -116,9 +116,7 @@ export function FormationCard({
       )}
 
       <div className="mt-5 border-t hairline pt-4">
-        <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">
-          Legal documents{sandbox && " (demo)"}
-        </div>
+        <SectionTitle>Legal documents{sandbox && " (demo)"}</SectionTitle>
         {documents.length === 0 ? (
           <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
             None yet. The filing agent produces the Articles of Organization and the Operating
@@ -235,14 +233,6 @@ function humanDocType(type: string): string {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim();
-}
-
-function formatDate(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
 }
 
 function formatBytes(size: number): string {

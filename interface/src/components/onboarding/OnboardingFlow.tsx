@@ -18,9 +18,11 @@ import {
   emptySession,
   FormationParty,
   indexIn,
+  nextPhase,
   OnboardingSession,
   Phase,
   PHASES,
+  prevPhase,
   screenLabel,
   visiblePhases,
 } from "./types";
@@ -277,8 +279,9 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 onBack={() => goTo("welcome")}
                 onComplete={() =>
                   // The step AFTER guardian is deployment-dependent: legal-identity where the box
-                  // can form entities, custody where it can't.
-                  completePhase("guardian", formationAvailable ? "legal-identity" : "custody")
+                  // can form entities, custody where it can't. Asked of the VISIBLE list rather
+                  // than re-derived from `formationAvailable`, so there is one answer to it.
+                  completePhase("guardian", nextPhase(phases, "guardian"))
                 }
               />
             )}
@@ -307,7 +310,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 eyebrow={screenLabel(phases, "custody")}
                 config={config}
                 onChange={setConfig}
-                onBack={() => goTo(formationAvailable ? "legal-identity" : "guardian")}
+                onBack={() => goTo(prevPhase(phases, "custody"))}
                 onComplete={() => completePhase("custody", "configure")}
               />
             )}
