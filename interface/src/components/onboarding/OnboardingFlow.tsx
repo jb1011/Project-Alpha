@@ -323,6 +323,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 guardianPasskey={session.guardianPasskey}
                 idempotencyKey={session.idempotencyKey}
                 partyId={session.partyId}
+                partySynthetic={session.partySynthetic}
                 onBack={() => goTo("configure")}
                 onSubmitted={(entityId, idempotencyKey) => {
                   setSession((s) => ({
