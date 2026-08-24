@@ -207,3 +207,55 @@ test("H2: statements are prepared once — a repo built on a fresh db serves eve
   expect(a.transition("fresh", 1, "pending", "failed", { error: "y" })).toBe(true);
   expect(a.bumpAttempt("fresh", 1, "failed")).toBe(1);
 });
+
+// ── PR 3: the anchor cycle's backoff, its open-work query and the veto acknowledgement ──────
+
+test("A-repo-1: listOpen returns every in-flight cycle in ONE statement, ordered", () => {
+  anchors.claimVersion("a", 1, "0x01");
+  anchors.transition("a", 1, "pending", "executed", { executeTx: "0xe" });
+  anchors.claimVersion("a", 2, "0x02");
+  anchors.transition("a", 2, "pending", "scheduled", { scheduleTx: "0xs" });
+  anchors.claimVersion("b", 4, "0x04");
+  anchors.claimVersion("c", 9, "0x09");
+  anchors.transition("c", 9, "pending", "vetoed");
+  // Executed and vetoed cycles are not open work; the two states that ARE come back together,
+  // so a cycle moving from pending to scheduled mid-tick cannot be seen twice or missed.
+  expect(anchors.listOpen().map((r) => `${r.entityKey}v${r.version}`)).toEqual(["av2", "bv4"]);
+});
+
+test("A-repo-2: the backoff scalars are written together and CLEARED by the next pass", () => {
+  anchors.claimVersion("ent", 2, "0x02");
+  // Parked WITHOUT burning an attempt — a transport failure says nothing about whether the
+  // amendment is going through, so it must never count toward abandonment.
+  anchors.transition("ent", 2, "pending", "pending", {
+    error: "rpc timeout",
+    nextRetryAt: 1_800_000_000_000,
+    retryIntervalMs: 120_000,
+  });
+  let row = anchors.find("ent", 2)!;
+  expect(row.attempt).toBe(0);
+  expect(row.nextRetryAt).toBe(1_800_000_000_000);
+  expect(row.retryIntervalMs).toBe(120_000);
+  // The success that follows must be able to clear it: an un-clearable schedule would keep a
+  // healthy cycle parked forever. (Deliberately NOT coalesced, unlike the tx hashes.)
+  anchors.transition("ent", 2, "pending", "scheduled", { scheduleTx: "0xs", error: null });
+  row = anchors.find("ent", 2)!;
+  expect(row.nextRetryAt).toBeNull();
+  expect(row.retryIntervalMs).toBeNull();
+  expect(row.error).toBeNull();
+  expect(row.scheduleTx).toBe("0xs");
+});
+
+test("A-repo-3: acknowledgeVeto is a CAS from `vetoed` and nothing else", () => {
+  anchors.claimVersion("ent", 3, "0x03");
+  anchors.transition("ent", 3, "pending", "scheduled", { scheduleTx: "0xs" });
+  // A scheduled cycle is not something an operator may wave through — only a vetoed one.
+  expect(anchors.acknowledgeVeto("ent", 3)).toBe(false);
+  anchors.transition("ent", 3, "scheduled", "vetoed");
+  expect(anchors.acknowledgeVeto("ent", 3)).toBe(true);
+  const row = anchors.find("ent", 3)!;
+  expect(row.state).toBe("superseded");
+  expect(row.error).toMatch(/veto acknowledged by an operator/);
+  // Idempotent by construction: the second ack has nothing to move.
+  expect(anchors.acknowledgeVeto("ent", 3)).toBe(false);
+});

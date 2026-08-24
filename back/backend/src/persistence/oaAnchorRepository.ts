@@ -33,6 +33,13 @@ export interface OaAnchorRecord {
   executableAt: number | null;
   attempt: number;
   error: string | null;
+  /** Epoch ms before which a parked cycle is not retried, and the interval that produced it.
+   *  Written when a cycle is parked WITHOUT burning an attempt — a transport failure on a
+   *  broadcast or a receipt read says nothing about whether the amendment is going through, so it
+   *  must never count toward abandonment, and the interval is then the row's only memory of how
+   *  many times this has happened (the `parkFormationStep` rule, applied to anchors). */
+  nextRetryAt: number | null;
+  retryIntervalMs: number | null;
 }
 
 interface Row {
@@ -45,6 +52,8 @@ interface Row {
   executable_at: number | null;
   attempt: number;
   error: string | null;
+  next_retry_at: number | null;
+  retry_interval_ms: number | null;
 }
 
 function toRecord(r: Row): OaAnchorRecord {
@@ -58,6 +67,8 @@ function toRecord(r: Row): OaAnchorRecord {
     executableAt: r.executable_at,
     attempt: r.attempt,
     error: r.error,
+    nextRetryAt: r.next_retry_at,
+    retryIntervalMs: r.retry_interval_ms,
   };
 }
 
@@ -70,14 +81,36 @@ export interface OaAnchorRepository {
   versionsOf(entityKey: string): OaAnchorRecord[];
   findPending(entityKey: string): OaAnchorRecord | undefined;
   listByState(state: OaAnchorState): OaAnchorRecord[];
+  /** Every cycle still in flight anywhere in the deployment — the sweeper's due-work query. ONE
+   *  statement rather than two `listByState` calls, so a cycle that moves between the two states
+   *  mid-tick cannot be seen twice or missed entirely. */
+  listOpen(): OaAnchorRecord[];
   transition(
     entityKey: string,
     version: number,
     from: OaAnchorState,
     to: OaAnchorState,
-    fields?: { scheduleTx?: Hex; executeTx?: Hex; executableAt?: number; error?: string | null },
+    fields?: {
+      scheduleTx?: Hex;
+      executeTx?: Hex;
+      executableAt?: number;
+      error?: string | null;
+      nextRetryAt?: number;
+      retryIntervalMs?: number;
+    },
   ): boolean;
   bumpAttempt(entityKey: string, version: number, from: OaAnchorState): number | undefined;
+  /**
+   * The OPERATOR ACK on a veto (design §7, audit H4).
+   *
+   * A guardian veto parks the entity's WHOLE anchor pipeline — it is a stop sign, not a per-hash
+   * speed bump a re-versioning backend routes around. Two things can end that park: the guardian
+   * lifting the veto on chain (which the loop observes and resumes from), or a human deciding
+   * this version is dead and the pipeline should move on. This is the second one, and it is
+   * deliberately a state move rather than a flag column: `superseded` already MEANS "this cycle
+   * will never be anchored", and the acknowledgement is exactly that statement.
+   */
+  acknowledgeVeto(entityKey: string, version: number): boolean;
 }
 
 export class SqliteOaAnchorRepository implements OaAnchorRepository {
@@ -103,12 +136,20 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
       listByState: db.prepare(
         "SELECT * FROM oa_anchors WHERE state = ? ORDER BY entity_key, version",
       ),
+      listOpen: db.prepare(
+        `SELECT * FROM oa_anchors WHERE state IN ('pending','scheduled')
+          ORDER BY entity_key, version`,
+      ),
       transition: db.prepare(
         `UPDATE oa_anchors
             SET state         = ?,
                 schedule_tx   = COALESCE(?, schedule_tx),
                 execute_tx    = COALESCE(?, execute_tx),
                 executable_at = COALESCE(?, executable_at),
+                -- NOT coalesced: a successful pass must be able to CLEAR a stale backoff, and
+                -- "no schedule" is a value the column has to be able to hold again.
+                next_retry_at     = ?,
+                retry_interval_ms = ?,
                 error         = ?,
                 updated_at    = CURRENT_TIMESTAMP
           WHERE entity_key = ? AND version = ? AND state = ?`,
@@ -168,6 +209,8 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
       executeTx?: Hex;
       executableAt?: number;
       error?: string | null;
+      nextRetryAt?: number;
+      retryIntervalMs?: number;
     } = {},
   ): boolean {
     const info = this.stmts.transition.run(
@@ -175,6 +218,8 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
       fields.scheduleTx ?? null,
       fields.executeTx ?? null,
       fields.executableAt ?? null,
+      fields.nextRetryAt ?? null,
+      fields.retryIntervalMs ?? null,
       fields.error ?? null,
       entityKey,
       version,
@@ -190,5 +235,17 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
       | { attempt: number }
       | undefined;
     return row?.attempt;
+  }
+
+  /** Every cycle still in flight, across the deployment. */
+  listOpen(): OaAnchorRecord[] {
+    return (this.stmts.listOpen.all() as Row[]).map(toRecord);
+  }
+
+  /** CAS `vetoed` -> `superseded`. See the interface note: the state IS the acknowledgement. */
+  acknowledgeVeto(entityKey: string, version: number): boolean {
+    return this.transition(entityKey, version, "vetoed", "superseded", {
+      error: "veto acknowledged by an operator — this version will never be anchored",
+    });
   }
 }

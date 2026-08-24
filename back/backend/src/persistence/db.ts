@@ -409,10 +409,19 @@ export function migrate(db: Database.Database): void {
       executable_at INTEGER,
       attempt       INTEGER NOT NULL DEFAULT 0,
       error         TEXT,
+      -- Backoff for a cycle parked WITHOUT burning an attempt (PR 3, the parkFormationStep rule).
+      -- A transport failure on a broadcast or a receipt read tells us nothing about whether the
+      -- amendment is going through, so it must never count toward abandonment; the interval
+      -- itself is then the row's only memory of how many times this has happened. Two scalars
+      -- rather than formation_requests' detail blob: there are exactly two numbers, and a JSON
+      -- parse per row per tick buys nothing.
+      retry_interval_ms INTEGER,
+      next_retry_at     INTEGER,
       created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (entity_key, version)
     );
+    CREATE INDEX IF NOT EXISTS idx_oa_anchors_state ON oa_anchors(state, entity_key, version);
 
     -- Webhook dedupe + audit. A webhook is a WAKE-UP SIGNAL, never a source of facts: the
     -- payload is persisted for forensics, and processors always re-fetch authoritative state
@@ -491,6 +500,22 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN oa_manifest_pending_hash TEXT");
   if (!cols.includes("oa_amendment_executable_at"))
     db.exec("ALTER TABLE entities ADD COLUMN oa_amendment_executable_at INTEGER");
+  // PR 3: the pending VERSION beside the pending hash. The design listed only the hash, but the
+  // monitor's compromise rule and the guardian veto card both have to answer "which version is
+  // this?" — a hash alone cannot say whether an observed amendment REGRESSES the anchored
+  // version, which is the CRITICAL case (§8). Same fixed projection, one more column.
+  if (!cols.includes("oa_manifest_pending_version"))
+    db.exec("ALTER TABLE entities ADD COLUMN oa_manifest_pending_version INTEGER");
+
+  // oa_anchors gained its two backoff columns in PR 3 (see the DDL above); a database created by
+  // PR 1 has the table without them.
+  const anchorCols = (db.prepare("PRAGMA table_info(oa_anchors)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!anchorCols.includes("retry_interval_ms"))
+    db.exec("ALTER TABLE oa_anchors ADD COLUMN retry_interval_ms INTEGER");
+  if (!anchorCols.includes("next_retry_at"))
+    db.exec("ALTER TABLE oa_anchors ADD COLUMN next_retry_at INTEGER");
 
   // The `documents` table (declared-unused since v1) becomes the index for real legal PDFs.
   // The existing `path NOT NULL` is satisfied by DocumentStore.putBytes. System of record for

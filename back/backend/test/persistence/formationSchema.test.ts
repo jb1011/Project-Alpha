@@ -42,7 +42,7 @@ test("no new EntityStatus value: the entities CHECK is byte-identical to the pre
   expect(check).toBe("'pending','provisioned','translating','created','bound','funded','failed'");
 });
 
-test("entities gains exactly the nine additive formation columns, all nullable", () => {
+test("entities gains exactly the ten additive formation columns, all nullable", () => {
   const cols = columnsOf(db, "entities");
   for (const c of [
     "formation_provider",
@@ -53,6 +53,7 @@ test("entities gains exactly the nine additive formation columns, all nullable",
     "oa_manifest_version",
     "oa_manifest_anchored_hash",
     "oa_manifest_pending_hash",
+    "oa_manifest_pending_version",
     "oa_amendment_executable_at",
   ])
     expect(cols).toContain(c);
@@ -296,6 +297,7 @@ test("ALTER-if-missing: a PRE-FORMATION database migrates in place, twice, witho
   migrate(old);
 
   expect(columnsOf(old, "entities")).toContain("oa_manifest_anchored_hash");
+  expect(columnsOf(old, "entities")).toContain("oa_manifest_pending_version");
   expect(columnsOf(old, "documents")).toContain("provider_doc_id");
   const legacy = old.prepare("SELECT * FROM entities WHERE idempotency_key = 'legacy-1'").get() as
     | Record<string, unknown>
@@ -309,5 +311,49 @@ test("ALTER-if-missing: a PRE-FORMATION database migrates in place, twice, witho
     (old.prepare("SELECT * FROM documents WHERE id = 'oa-legacy-1.md'").get() as { path: string })
       .path,
   ).toBe("/data/documents/oa-legacy-1.md");
+  old.close();
+});
+
+// ── PR 3 additions ──────────────────────────────────────────────────────────────────────────
+
+test("oa_anchors carries the two backoff scalars, and a PR-1-shaped table gains them in place", () => {
+  expect(columnsOf(db, "oa_anchors")).toEqual(
+    expect.arrayContaining(["retry_interval_ms", "next_retry_at"]),
+  );
+
+  // The upgrade the prod box performs: a database whose oa_anchors was created by PR 1, with a
+  // cycle already in it. A cycle recorded before this migration must survive it — v1 rows are
+  // written at create-confirm and they are the baseline every later version is "newer than".
+  const old = new Database(":memory:");
+  old.exec(`
+    CREATE TABLE oa_anchors (
+      entity_key    TEXT NOT NULL,
+      version       INTEGER NOT NULL,
+      manifest_hash TEXT NOT NULL,
+      state         TEXT NOT NULL CHECK (state IN
+                    ('pending','scheduled','executed','vetoed','superseded','failed')),
+      schedule_tx   TEXT, execute_tx TEXT,
+      executable_at INTEGER,
+      attempt       INTEGER NOT NULL DEFAULT 0,
+      error         TEXT,
+      created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (entity_key, version)
+    );
+    INSERT INTO oa_anchors (entity_key, version, manifest_hash, state, execute_tx)
+      VALUES ('ent-1', 1, '0xaa', 'executed', '0xtx');
+  `);
+  migrate(old);
+  migrate(old);
+  expect(columnsOf(old, "oa_anchors")).toEqual(
+    expect.arrayContaining(["retry_interval_ms", "next_retry_at"]),
+  );
+  const v1 = old.prepare("SELECT * FROM oa_anchors WHERE entity_key = 'ent-1'").get() as Record<
+    string,
+    unknown
+  >;
+  expect(v1.state).toBe("executed");
+  expect(v1.execute_tx).toBe("0xtx");
+  expect(v1.next_retry_at).toBeNull();
   old.close();
 });

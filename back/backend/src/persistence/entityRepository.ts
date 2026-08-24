@@ -106,6 +106,7 @@ interface Row {
   oa_manifest_version: number | null;
   oa_manifest_anchored_hash: string | null;
   oa_manifest_pending_hash: string | null;
+  oa_manifest_pending_version: number | null;
   oa_amendment_executable_at: number | null;
 }
 
@@ -174,6 +175,7 @@ function toRecord(r: Row): EntityRecord {
     oaManifestVersion: r.oa_manifest_version ?? null,
     oaManifestAnchoredHash: (r.oa_manifest_anchored_hash as Hex) ?? null,
     oaManifestPendingHash: (r.oa_manifest_pending_hash as Hex) ?? null,
+    oaManifestPendingVersion: r.oa_manifest_pending_version ?? null,
     oaAmendmentExecutableAt: r.oa_amendment_executable_at ?? null,
   };
 }
@@ -227,6 +229,7 @@ export class SqliteEntityRepository implements EntityRepository {
       oa_manifest_version: rec.oaManifestVersion ?? null,
       oa_manifest_anchored_hash: rec.oaManifestAnchoredHash ?? null,
       oa_manifest_pending_hash: rec.oaManifestPendingHash ?? null,
+      oa_manifest_pending_version: rec.oaManifestPendingVersion ?? null,
       oa_amendment_executable_at: rec.oaAmendmentExecutableAt ?? null,
     };
   }
@@ -239,7 +242,8 @@ export class SqliteEntityRepository implements EntityRepository {
         ein, formation_date, oa_hash, metadata_uri, doc_path, treasury_config,
         agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, trust_policy, root_passkey_id, wallet_provider, circle_wallet_set_id, circle_operator_wallet_id, circle_pocket_wallet_id, pocket_address, previous_operator, operator_rotated_at, public_id,
         formation_provider, formation_environment, ein_real, formation_filed_at, formation_filing_number,
-        oa_manifest_version, oa_manifest_anchored_hash, oa_manifest_pending_hash, oa_amendment_executable_at,
+        oa_manifest_version, oa_manifest_anchored_hash, oa_manifest_pending_hash,
+        oa_manifest_pending_version, oa_amendment_executable_at,
         updated_at`;
 
   private static readonly INSERT_VALUES = `
@@ -250,7 +254,8 @@ export class SqliteEntityRepository implements EntityRepository {
         @ein, @formation_date, @oa_hash, @metadata_uri, @doc_path, @treasury_config,
         @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @trust_policy, @root_passkey_id, @wallet_provider, @circle_wallet_set_id, @circle_operator_wallet_id, @circle_pocket_wallet_id, @pocket_address, @previous_operator, @operator_rotated_at, @public_id,
         @formation_provider, @formation_environment, @ein_real, @formation_filed_at, @formation_filing_number,
-        @oa_manifest_version, @oa_manifest_anchored_hash, @oa_manifest_pending_hash, @oa_amendment_executable_at,
+        @oa_manifest_version, @oa_manifest_anchored_hash, @oa_manifest_pending_hash,
+        @oa_manifest_pending_version, @oa_amendment_executable_at,
         CURRENT_TIMESTAMP`;
 
   upsert(rec: EntityRecord): void {
@@ -278,6 +283,7 @@ export class SqliteEntityRepository implements EntityRepository {
           oa_manifest_version=excluded.oa_manifest_version,
           oa_manifest_anchored_hash=excluded.oa_manifest_anchored_hash,
           oa_manifest_pending_hash=excluded.oa_manifest_pending_hash,
+          oa_manifest_pending_version=excluded.oa_manifest_pending_version,
           oa_amendment_executable_at=excluded.oa_amendment_executable_at,
           updated_at=CURRENT_TIMESTAMP
       `)
