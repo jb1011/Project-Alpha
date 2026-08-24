@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { AgentTabs } from "@/components/agents/AgentTabs";
+import { AmendmentVetoCard } from "@/components/agents/AmendmentVetoCard";
 import { usePublicClient, useReadContract, useWriteContract } from "wagmi";
 import {
   useEntityQuery,
@@ -310,6 +311,11 @@ export function AgentSettings({ entityId }: { entityId: string }) {
           </div>
         </Callout>
       )}
+
+      {/* Beside the treasury's pending-policy card, and deliberately a different kind of thing:
+          that one is scheduled through this platform and executed through it, while this one is
+          read straight off the chain and vetoed straight on it. */}
+      <AmendmentVetoCard entity={entity} />
 
       <Card className="p-5">
         <SectionTitle>Per-transaction cap (instant)</SectionTitle>
