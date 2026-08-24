@@ -24,6 +24,7 @@ import {
   PHASES,
   prevPhase,
   screenLabel,
+  snapToVisiblePhase,
   visiblePhases,
 } from "./types";
 import type { EntityView } from "@/lib/api/types";
@@ -113,7 +114,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * NEVER once the entity exists: by `deploy` the handle has already been consumed by /onboard,
    * and sending the user back to collect another one would be nonsense.
    */
-  const phase: Phase =
+  const requestedPhase: Phase =
     formationRequired &&
     // A box that reports `required` always reports `available` too (they are projections of one
     // dep). If one ever did not, this guard is what stops the correction from sending the wizard
@@ -125,6 +126,24 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     indexIn(phases, storedPhase) > indexIn(phases, "legal-identity")
       ? "legal-identity"
       : storedPhase;
+
+  /**
+   * THE INVARIANT: the phase we render is always a member of `phases`.
+   *
+   * `phases` is the list the header counter and the Stepper rail index into, and `storedPhase`
+   * comes from localStorage — written on a visit when the list may have been longer. Restore a
+   * session parked on `legal-identity` while `GET /config` is still in flight (formation unknown →
+   * the step is hidden), or after `/config` failed, or on a deployment that turned formation off
+   * between visits, and `indexIn` returns -1. Nothing throws: the header says "Step 0 of 7", the
+   * rail highlights nothing, and the wizard reports a position that is wrong by one screen while
+   * looking entirely healthy.
+   *
+   * Snapping is DERIVED here rather than corrected by an effect, for the same reason the bounce
+   * above is: an effect would paint the phantom step for a frame first. And it composes with that
+   * bounce rather than replacing it — if the environment resolves and `legal-identity` becomes
+   * visible and required again, `storedPhase` is untouched and the user lands back on it.
+   */
+  const phase = snapToVisiblePhase(phases, requestedPhase);
 
   const goTo = useCallback((next: Phase) => {
     setPhase(next);
