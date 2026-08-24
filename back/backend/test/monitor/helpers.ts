@@ -80,6 +80,12 @@ export function entity(over: Partial<MonitoredEntity> = {}): MonitoredEntity {
     operator: ADDR.operator,
     treasury: ADDR.treasury,
     proxy: "0x8888888888888888888888888888888888888888",
+    // The OA anchor projection. Defaults describe an entity anchored at v1 with nothing pending,
+    // which is what every entity looks like before its first amendment.
+    oaManifestVersion: 1,
+    oaManifestAnchoredHash: `0x${"11".repeat(32)}`,
+    oaManifestPendingHash: null,
+    oaManifestPendingVersion: null,
     ...over,
   };
 }

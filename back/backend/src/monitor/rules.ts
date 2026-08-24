@@ -7,7 +7,12 @@ import {
   isAddressEqual,
   zeroAddress,
 } from "viem";
-import { agentTreasuryAbi, legalManagerFactoryAbi, noviControllerAbi } from "../abis/generated";
+import {
+  agentTreasuryAbi,
+  legalManagerAbi,
+  legalManagerFactoryAbi,
+  noviControllerAbi,
+} from "../abis/generated";
 import { CONTROLLER_GRANTED_SELECTORS, selectorRole } from "../adapters/arc/bootVerify";
 import type { Alert, Severity } from "./alerts";
 import type { EntityIndex, MonitoredEntity } from "./entityLookup";
@@ -125,6 +130,8 @@ export async function evaluateLog(
   if (address === ctx.registry.toLowerCase()) return registryRule(log, topic0, ctx, deps);
   const treasuryOwner = ctx.entities.byTreasury.get(address);
   if (treasuryOwner) return treasuryRule(log, topic0, treasuryOwner, deps);
+  const proxyOwner = ctx.entities.byProxy.get(address);
+  if (proxyOwner) return legalManagerRule(log, topic0, proxyOwner, deps);
   return EMPTY;
 }
 
@@ -610,6 +617,169 @@ async function treasuryRule(
         { ...base, cap: s(cap), period: s(period), allowlistOn, payoutAddress },
         ts,
         logKey("treasury_policy_updated", log),
+      ),
+    );
+  }
+
+  return EMPTY;
+}
+
+// --- The OA amendment path (doola design §8) ---------------------------------------------------
+
+/**
+ * The four LegalManager events that move an entity's operating-agreement anchor.
+ *
+ * The premise is the treasury twin's, restated for a different asset: the timelock and the
+ * guardian veto are REACTION WINDOWS, and they only work if the guardian notices. So an
+ * `AmendmentScheduled` fires the notification UNCONDITIONALLY at WARN minimum — INFO never leaves
+ * the box (`alerts.ts:103`), which would make a "notification" nobody receives (audit H3).
+ *
+ * The DB comparison ONLY EVER ESCALATES. If the scheduled hash is not the one this deployment
+ * says is pending, that is the shape a backend compromise takes — a hash we did not choose,
+ * inside our own timelock — and it goes CRITICAL. But a MATCH never downgrades the alert below
+ * WARN, and an entity with nothing recorded as pending escalates rather than falls silent. The
+ * monitor's independence is the whole point: it reads the chain, and the database is a second
+ * opinion that can only make it louder.
+ */
+function legalManagerRule(
+  log: RawLog,
+  topic0: string,
+  entity: MonitoredEntity,
+  deps: RuleDeps,
+): RuleOutcome {
+  const ts = deps.now();
+  const proxy = log.address;
+  const base = {
+    tx: log.transactionHash,
+    block: s(log.blockNumber),
+    entity: entity.name,
+    proxy,
+    anchoredVersion: entity.oaManifestVersion,
+    anchoredHash: entity.oaManifestAnchoredHash,
+    pendingVersion: entity.oaManifestPendingVersion,
+    expectedPendingHash: entity.oaManifestPendingHash,
+  };
+
+  if (topic0 === TOPIC.amendmentScheduled.toLowerCase()) {
+    const { newHash, executableAt } = decode(log, legalManagerAbi) as {
+      newHash: Hex;
+      executableAt: bigint;
+    };
+    const expected = entity.oaManifestPendingHash;
+    const matchesPending = expected !== null && expected.toLowerCase() === newHash.toLowerCase();
+    const severity: Severity = matchesPending ? "WARN" : "CRITICAL";
+    const vetoDeadline = isoFromSeconds(executableAt);
+    const shared = {
+      ...base,
+      newHash,
+      matchesPending,
+      vetoDeadline,
+      // Said out loud in the alert, because it is the fact that decides whether the guardian has
+      // to act: nothing on chain enforces ordering between two scheduled amendments, and a
+      // scheduled hash stays executable forever once its delay elapses.
+      note: matchesPending
+        ? "this is the amendment this deployment has pending"
+        : "this hash is NOT the one this deployment records as pending — treat as a possible backend compromise",
+    };
+    return {
+      alerts: [
+        alert(
+          severity,
+          "legal_amendment_scheduled",
+          proxy,
+          shared,
+          ts,
+          logKey("legal_amendment_scheduled", log),
+        ),
+        // The treasury twin's shape: its own record, subject-keyed on the ENTITY, carrying the
+        // guardian's address, the exact call they make, and the deadline they have to make it by.
+        alert(
+          severity,
+          "legal_amendment_guardian_notification",
+          entitySubject(entity),
+          {
+            ...shared,
+            guardian: entity.guardian,
+            action: `guardian may call cancelOperatingAgreementUpdate(${newHash}) on ${proxy} before ${vetoDeadline}`,
+          },
+          ts,
+          logKey("legal_amendment_guardian_notification", log),
+        ),
+      ],
+      grants: [],
+    };
+  }
+
+  if (topic0 === TOPIC.amendmentVetoed.toLowerCase()) {
+    const { newHash } = decode(log, legalManagerAbi) as { newHash: Hex };
+    // WARN, not INFO: a veto is the guardian stopping a change the platform proposed, and the
+    // platform's own operators need to know that happened — the backend parks the entity's whole
+    // anchor pipeline on it, so anchoring for that entity has stopped until a human acts.
+    return single(
+      alert(
+        "WARN",
+        "legal_amendment_vetoed",
+        proxy,
+        {
+          ...base,
+          newHash,
+          meaning:
+            "the guardian vetoed this operating-agreement hash — it is blacklisted on chain until liftVeto, and the backend parks this entity's anchoring until then",
+        },
+        ts,
+        logKey("legal_amendment_vetoed", log),
+      ),
+    );
+  }
+
+  if (topic0 === TOPIC.vetoLifted.toLowerCase()) {
+    const { newHash } = decode(log, legalManagerAbi) as { newHash: Hex };
+    // The guardian re-allowing what they blocked. Recorded, not paged: only the guardian can do
+    // it, and it restores normal operation rather than removing a control.
+    return single(
+      alert(
+        "INFO",
+        "legal_veto_lifted",
+        proxy,
+        { ...base, newHash },
+        ts,
+        logKey("legal_veto_lifted", log),
+      ),
+    );
+  }
+
+  if (topic0 === TOPIC.operatingAgreementUpdated.toLowerCase()) {
+    const { newHash } = decode(log, legalManagerAbi) as { newHash: Hex };
+    const expected = entity.oaManifestPendingHash;
+    const matchesPending = expected !== null && expected.toLowerCase() === newHash.toLowerCase();
+    // An execute of a hash we do not have pending is the failure mode the monotonic rules exist to
+    // prevent, observed from the outside: a superseded version that stayed executable forever, or
+    // a hash the platform never chose at all.
+    const regression =
+      entity.oaManifestAnchoredHash !== null &&
+      entity.oaManifestAnchoredHash.toLowerCase() === newHash.toLowerCase() &&
+      expected !== null;
+    return single(
+      alert(
+        matchesPending ? "INFO" : "CRITICAL",
+        "legal_amendment_executed",
+        proxy,
+        {
+          ...base,
+          newHash,
+          matchesPending,
+          // True when the chain just re-anchored the version we already had while a NEWER one is
+          // pending — an anchor that went BACKWARDS.
+          regression,
+          ...(matchesPending
+            ? {}
+            : {
+                meaning:
+                  "an operating-agreement hash landed that this deployment did not have pending — a superseded amendment that stayed executable, or one nobody here proposed",
+              }),
+        },
+        ts,
+        logKey("legal_amendment_executed", log),
       ),
     );
   }

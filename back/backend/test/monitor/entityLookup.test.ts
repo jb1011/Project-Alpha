@@ -122,4 +122,52 @@ describe("indexEntities", () => {
     expect([...index.byTreasury.keys()]).toEqual([ADDR.treasury.toLowerCase()]);
     expect([...index.byAgentId.keys()]).toEqual(["1"]);
   });
+
+  test("A-monitor-9: byProxy indexes the LegalManager, lowercased, and skips rows without one", () => {
+    const index = indexEntities([
+      entity({ proxy: "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }),
+      entity({ idempotencyKey: "k2", proxy: null }),
+    ]);
+    expect(index.byProxy.get("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")?.name).toBe(
+      "Acme Agent LLC",
+    );
+    expect(index.byProxy.size).toBe(1);
+  });
+});
+
+describe("the OA anchor projection (design §8, audit H3/14)", () => {
+  test("A-monitor-10: the four anchor columns reach the monitor — version numbers are not enough", () => {
+    // The compromise rule compares the hash the CHAIN scheduled against the hash this deployment
+    // says is pending. A version number cannot answer that, which is why these are columns on
+    // `entities` and why the read-only projection has to carry them.
+    const pending = `0x${"22".repeat(32)}`;
+    const anchored = `0x${"11".repeat(32)}`;
+    const path = seedMainDb([
+      record({
+        oaManifestVersion: 2,
+        oaManifestAnchoredHash: anchored as `0x${string}`,
+        oaManifestPendingHash: pending as `0x${string}`,
+        oaManifestPendingVersion: 3,
+      }),
+    ]);
+    const lookup = new SqliteEntityLookup(path);
+    expect(lookup.all()[0]).toMatchObject({
+      oaManifestVersion: 2,
+      oaManifestAnchoredHash: anchored,
+      oaManifestPendingHash: pending,
+      oaManifestPendingVersion: 3,
+    });
+    lookup.close();
+  });
+
+  test("A-monitor-11: a legacy row reads as nulls, not as a missing column", () => {
+    const path = seedMainDb([record()]);
+    const lookup = new SqliteEntityLookup(path);
+    expect(lookup.all()[0]).toMatchObject({
+      oaManifestVersion: null,
+      oaManifestPendingHash: null,
+      oaManifestPendingVersion: null,
+    });
+    lookup.close();
+  });
 });

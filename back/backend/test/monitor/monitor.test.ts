@@ -298,6 +298,9 @@ describe("watch targets", () => {
     expect(own).toContain(ADDR.controller);
     expect(own).toContain(ADDR.factory);
     expect(own).toContain(ADDR.treasury);
+    // PR 3: the LegalManager proxies. Until they were watched, the one governance path with a
+    // timelock AND a guardian veto emitted its events into a monitor that was not looking.
+    expect(own).toContain("0x8888888888888888888888888888888888888888");
   });
 
   test("a failed beacon read is RETRIED next tick rather than silently disabling rule 6", async () => {

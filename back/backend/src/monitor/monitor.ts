@@ -162,6 +162,10 @@ export class Monitor {
       ...cfg.beacons,
       ...this.resolvedBeacons,
       ...[...index.byTreasury.values()].map((e) => e.treasury as Address),
+      // The LegalManager proxies (design §8). Until PR 3 they were unwatched, which meant the OA
+      // amendment path — the one governance action with a timelock and a guardian veto — emitted
+      // its events into a monitor that was not looking.
+      ...[...index.byProxy.values()].map((e) => e.proxy as Address),
     ];
     const agentIds = [...index.byAgentId.keys()];
 

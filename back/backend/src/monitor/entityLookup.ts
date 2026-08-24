@@ -28,6 +28,16 @@ export interface MonitoredEntity {
   operator: string | null;
   treasury: string | null;
   proxy: string | null;
+  // ── The OA anchor projection (design §8, audit H3/14). Version NUMBERS alone cannot feed the
+  //    compromise rule: it has to compare the hash the CHAIN scheduled against the hash this
+  //    deployment says is pending, and a number cannot do that. Read here so the rules stay pure
+  //    functions of (log, context).
+  /** The manifest version currently ANCHORED on chain, per our records. */
+  oaManifestVersion: number | null;
+  oaManifestAnchoredHash: string | null;
+  /** The single in-flight version (single-pending rule), or null when nothing is pending. */
+  oaManifestPendingHash: string | null;
+  oaManifestPendingVersion: number | null;
 }
 
 export interface EntityLookup {
@@ -47,10 +57,16 @@ interface Row {
   operator: string | null;
   treasury: string | null;
   proxy: string | null;
+  oa_manifest_version: number | null;
+  oa_manifest_anchored_hash: string | null;
+  oa_manifest_pending_hash: string | null;
+  oa_manifest_pending_version: number | null;
 }
 
 const SELECT_ALL = `
-  SELECT idempotency_key, public_id, name, status, agent_id, manager, guardian, operator, treasury, proxy
+  SELECT idempotency_key, public_id, name, status, agent_id, manager, guardian, operator, treasury, proxy,
+         oa_manifest_version, oa_manifest_anchored_hash,
+         oa_manifest_pending_hash, oa_manifest_pending_version
   FROM entities
   WHERE treasury IS NOT NULL OR agent_id IS NOT NULL
   ORDER BY rowid`;
@@ -108,6 +124,10 @@ export class SqliteEntityLookup implements EntityLookup {
       operator: r.operator,
       treasury: r.treasury,
       proxy: r.proxy,
+      oaManifestVersion: r.oa_manifest_version,
+      oaManifestAnchoredHash: r.oa_manifest_anchored_hash,
+      oaManifestPendingHash: r.oa_manifest_pending_hash,
+      oaManifestPendingVersion: r.oa_manifest_pending_version,
     }));
   }
 
@@ -127,14 +147,18 @@ export interface EntityIndex {
   byTreasury: Map<string, MonitoredEntity>;
   /** agentId (decimal string) -> entity */
   byAgentId: Map<string, MonitoredEntity>;
+  /** lowercased LegalManager proxy address -> entity. The OA amendment rules key off this. */
+  byProxy: Map<string, MonitoredEntity>;
 }
 
 export function indexEntities(entities: readonly MonitoredEntity[]): EntityIndex {
   const byTreasury = new Map<string, MonitoredEntity>();
   const byAgentId = new Map<string, MonitoredEntity>();
+  const byProxy = new Map<string, MonitoredEntity>();
   for (const e of entities) {
     if (e.treasury) byTreasury.set(e.treasury.toLowerCase(), e);
     if (e.agentId) byAgentId.set(e.agentId, e);
+    if (e.proxy) byProxy.set(e.proxy.toLowerCase(), e);
   }
-  return { byTreasury, byAgentId };
+  return { byTreasury, byAgentId, byProxy };
 }

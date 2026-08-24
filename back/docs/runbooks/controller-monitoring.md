@@ -92,6 +92,11 @@ Severity: **INFO** = recorded, never paged · **WARN** = look today · **CRITICA
 | `treasury_policy_update_scheduled` | WARN, **CRITICAL** if the payout address changes | `PolicyUpdateScheduled` on any of our treasuries |
 | `treasury_guardian_notification` | same as above | the guardian-facing copy — subject is the ENTITY |
 | `treasury_policy_update_vetoed` / `treasury_policy_updated` | INFO | veto / settle |
+| `legal_amendment_scheduled` | **WARN always**, **CRITICAL** if the hash is not the one we have pending | `AmendmentScheduled` on any of our `LegalManager` proxies |
+| `legal_amendment_guardian_notification` | same as above | the guardian-facing copy — subject is the ENTITY |
+| `legal_amendment_vetoed` | WARN | `AmendmentVetoed` — the guardian stopped an amendment |
+| `legal_veto_lifted` | INFO | `VetoLifted` — the guardian re-allowed a hash they had blocked |
+| `legal_amendment_executed` | INFO on match, **CRITICAL** if the executed hash is not the pending one | `OperatingAgreementUpdated` |
 
 ---
 
@@ -206,7 +211,51 @@ elsewhere, wait out the timelock, drain. The guardian row carries `guardian` and
 `currentPayoutAddress: "unreadable"` means the on-chain read failed — the alert stayed WARN, but
 **it is not evidence the payout is unchanged**. Read `payoutAddress()` manually.
 
-### `controller_relayed`, `treasury_policy_updated`, `treasury_policy_update_vetoed` (INFO)
+### `legal_amendment_scheduled` + `legal_amendment_guardian_notification`
+
+**Meaning.** A new operating-agreement hash is scheduled on one of our `LegalManager` proxies —
+the entity's legal terms are being amended, through the same timelock the treasury policy uses.
+
+The notification fires **unconditionally at WARN**, even when everything is expected. INFO never
+leaves the box, and a notification nobody receives is not a notification. Normal operation
+produces one of these per anchored manifest version (v2 when the state files the company, v3 when
+the IRS issues the EIN), so a WARN here is routine — the thing to read is `matchesPending`.
+
+**CRITICAL means `detail.matchesPending` is false**: the hash on chain is not the one this
+deployment records as pending (`entities.oa_manifest_pending_hash`). That is the shape a backend
+compromise takes — a hash we did not choose, inside our own timelock. It is also what an empty
+`expectedPendingHash` produces, deliberately: **the database comparison only ever ESCALATES**. A
+match never downgrades below WARN, and a missing record never silences the alert.
+
+**Do.**
+1. Did we schedule it? `journalctl -u legalbody-api | grep anchor_step` — a legitimate amendment
+   has `code:"opened"` then `code:"schedule_broadcast"` with the same `manifestHash`, and the
+   manifest itself is at `${DATA_DIR}/documents/manifest-<entityKey>-v<n>.json`.
+2. **Notify the guardian** — `detail.action` is the literal call:
+   `cancelOperatingAgreementUpdate(<hash>)` on the proxy, before `detail.vetoDeadline`.
+3. A veto is permanent for that hash until `liftVeto`, and the backend parks the entity's WHOLE
+   anchor pipeline on it — that is the design (a veto is a stop sign, not a per-hash speed bump a
+   re-versioning backend routes around). Anchoring for that entity resumes only after the guardian
+   lifts it or an operator acknowledges the cycle.
+
+⚠ **There is no manager-side cancel.** Once scheduled, a hash stays executable FOREVER after its
+delay elapses, and only the guardian can stop it. That is why this alert exists and why the
+backend never schedules a hash twice (a re-schedule would silently reset the clock and shorten
+the window this alert just promised the guardian).
+
+### `legal_amendment_executed` (CRITICAL)
+
+**Meaning.** An operating-agreement hash landed that we did not have pending. Two shapes:
+a superseded amendment that stayed executable and was then executed by someone, or a hash nobody
+here proposed. `detail.regression: true` narrows it further — the chain re-anchored the version we
+already had while a NEWER one was pending, i.e. the anchor went BACKWARDS.
+
+**Do.** Compare `meta().operatingAgreementHash` on the proxy against `oa_manifest_anchored_hash`
+and the `oa_anchors` rows for that entity. If the landed hash matches a `superseded` cycle, the
+manifest for it is still on disk and the change is knowable; if it matches nothing, treat the
+platform key as suspect.
+
+### `controller_relayed`, `treasury_policy_updated`, `treasury_policy_update_vetoed`, `legal_veto_lifted` (INFO)
 
 Never paged. These are the trail you read to answer "was this us?" during any of the above.
 
@@ -261,7 +310,10 @@ sqlite3 data/monitor.db "SELECT last_scanned_block FROM cursor;"
 - No dead-man's switch: nothing pages when the MONITOR itself stops. Until one exists, treat the
   absence of `monitor_scanned` as an alert and check the unit after any box restart.
 - No alerting on `AgentTreasury` `Paused`/`OperatorRotated`/`EmergencyWithdrawn`, or on
-  `LegalManager` dissolution events. Add if the §8 set proves too narrow in practice.
+  `LegalManager` **dissolution** events (`DissolutionInitiated`, `DissolutionVetoed`, `Dissolved`,
+  `AssetsSwept`, `NativeSwept`). The operating-agreement AMENDMENT gap named here is closed as of
+  PR 3 of the doola formation work (`legal_amendment_*`); the dissolution gap is NOT, and stays
+  listed. Add if the §8 set proves too narrow in practice.
 - The wallet-bind rule keys off the registry's `MetadataSet(agentId, "agentWallet", …)` event —
   the live ERC-8004 registry has **no** `AgentWalletSet` event (verified 2026-08-18 against the
   verified implementation `0x7274e874ca62410a93bd8bf61c69d8045e399c02`). If the registry proxy is

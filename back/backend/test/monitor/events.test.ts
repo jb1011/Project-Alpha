@@ -7,6 +7,7 @@ import {
   DEFAULT_ADMIN_ROLE,
   TOPIC,
   WILDCARD_ROLE,
+  legalManagerEvent,
   standingRoles,
 } from "../../src/monitor/events";
 
@@ -34,6 +35,25 @@ describe("topic pins against live Arc-testnet logs", () => {
     test(`${name}`, () => {
       expect(TOPIC[name as keyof typeof TOPIC]).toBe(expected);
     });
+
+  test("A-monitor-12: the LegalManager topics come from the GENERATED ABI, not a signature string", () => {
+    // Same pins as the live ones above, computed the way the monitor computes them — but the
+    // point of the ABI derivation is the OTHER direction: a `bytes32` that quietly became a
+    // `bytes32[]` moves topic0, and a hand-written signature would keep watching a topic nothing
+    // emits. This asserts the values AND that each event still exists to derive them from.
+    expect(TOPIC.amendmentScheduled).toBe(keccak256(toHex("AmendmentScheduled(bytes32,uint256)")));
+    expect(TOPIC.amendmentVetoed).toBe(keccak256(toHex("AmendmentVetoed(bytes32)")));
+    expect(TOPIC.vetoLifted).toBe(keccak256(toHex("VetoLifted(bytes32)")));
+    expect(TOPIC.operatingAgreementUpdated).toBe(
+      keccak256(toHex("OperatingAgreementUpdated(bytes32)")),
+    );
+    // An event that is renamed or removed fails HERE rather than becoming a silent blind spot.
+    expect(() => legalManagerEvent("NoSuchEvent")).toThrow(/has no event NoSuchEvent/);
+    expect(legalManagerEvent("AmendmentScheduled").inputs.map((i) => i.type)).toEqual([
+      "bytes32",
+      "uint256",
+    ]);
+  });
 
   test("the wallet-bind key hash matches the live indexed topic", () => {
     // The live registry has NO AgentWalletSet event: binds arrive as
