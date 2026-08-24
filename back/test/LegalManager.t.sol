@@ -583,3 +583,106 @@ contract LegalManagerDissolveTest is LegalManagerTestBase {
         lm.cancelDissolution();
     }
 }
+
+/// @notice The three on-chain properties the BACKEND's anchor rules exist to survive
+///         (docs/design/2026-08-19-doola-formation-provider-design.md §7/§11).
+///
+///         None of these is a bug: `LegalManager` is a timelock with a guardian veto, and it
+///         deliberately does not know what a "manifest version" is. But each one means an
+///         ordering guarantee the backend claims is NOT enforced here, so each is pinned as a
+///         test — the day one of these assertions flips, an anchor-loop rule became redundant or
+///         a contract change made one of them load-bearing in a new way.
+contract LegalManagerAmendmentOrderingTest is LegalManagerTestBase {
+    LegalManager internal lm;
+    address internal manager = address(0xA11CE);
+    address internal guardian = address(0x60A12D);
+    uint256 internal constant DELAY = 2 days;
+
+    function setUp() public {
+        lm = _deploy(manager, guardian, DELAY, 1, "EIN", 1, keccak256("oa-v1"));
+    }
+
+    /// @notice ORDER IS NOT ENFORCED. Two amendments can be scheduled at once and executed in
+    ///         either order, so "v3 supersedes v2" is a statement about our database and nothing
+    ///         else. This is why the backend's single-pending rule and its
+    ///         `version > entities.oa_manifest_version` gate are load-bearing rather than
+    ///         belt-and-braces.
+    function test_sequentialAmendmentsAreExecutableInEitherOrder() public {
+        bytes32 v2 = keccak256("manifest-v2");
+        bytes32 v3 = keccak256("manifest-v3");
+
+        vm.startPrank(manager);
+        lm.scheduleOperatingAgreementUpdate(v2);
+        // v3 is scheduled while v2 is still pending: the contract holds BOTH, independently keyed.
+        lm.scheduleOperatingAgreementUpdate(v3);
+        vm.stopPrank();
+
+        assertEq(lm.scheduledAt(v2), block.timestamp + DELAY);
+        assertEq(lm.scheduledAt(v3), block.timestamp + DELAY);
+
+        vm.warp(block.timestamp + DELAY);
+
+        // Newest first…
+        vm.prank(manager);
+        lm.executeOperatingAgreementUpdate(v3);
+        (,, bytes32 afterV3,) = lm.meta();
+        assertEq(afterV3, v3);
+
+        // …and the OLDER one is still perfectly executable afterwards, silently moving the anchor
+        // BACKWARDS to a superseded agreement. Nothing on chain refuses it.
+        vm.prank(manager);
+        lm.executeOperatingAgreementUpdate(v2);
+        (,, bytes32 afterV2,) = lm.meta();
+        assertEq(afterV2, v2);
+    }
+
+    /// @notice A scheduled hash the backend has SUPERSEDED stays executable forever. There is no
+    ///         manager-side cancel — only the guardian's veto — so "left to expire unexecuted" is
+    ///         a promise the backend keeps by never calling execute, not one the chain enforces.
+    function test_supersededScheduledHashStaysExecutableForever() public {
+        bytes32 superseded = keccak256("manifest-v2-superseded");
+        vm.prank(manager);
+        lm.scheduleOperatingAgreementUpdate(superseded);
+
+        // A year later, long after the backend marked it `superseded` and anchored v3.
+        vm.warp(block.timestamp + 365 days);
+        assertEq(lm.scheduledAt(superseded), block.timestamp - 365 days + DELAY);
+
+        vm.prank(manager);
+        lm.executeOperatingAgreementUpdate(superseded);
+        (,, bytes32 oaHash,) = lm.meta();
+        assertEq(oaHash, superseded);
+    }
+
+    /// @notice RE-SCHEDULING RESETS THE CLOCK. There is no `AlreadyScheduled` guard (unlike
+    ///         `AgentTreasury`), so a retry that "just schedules again" hands the guardian a
+    ///         shorter veto window than the one they were notified about. The backend therefore
+    ///         schedules only when `scheduledAt(hash) == 0`. Documented in the design, untested
+    ///         until now.
+    function test_reschedulingResetsTheClock() public {
+        bytes32 h = keccak256("manifest-v2");
+        vm.prank(manager);
+        lm.scheduleOperatingAgreementUpdate(h);
+        uint256 firstDeadline = lm.scheduledAt(h);
+        assertEq(firstDeadline, block.timestamp + DELAY);
+
+        // Most of the guardian's window has elapsed.
+        vm.warp(block.timestamp + DELAY - 1 hours);
+
+        vm.prank(manager);
+        vm.expectEmit(true, false, false, true, address(lm));
+        emit LegalManager.AmendmentScheduled(h, block.timestamp + DELAY);
+        lm.scheduleOperatingAgreementUpdate(h);
+
+        // The deadline moved FORWARD by nearly the whole delay: the guardian's remaining hour
+        // silently became two more days.
+        assertEq(lm.scheduledAt(h), block.timestamp + DELAY);
+        assertGt(lm.scheduledAt(h), firstDeadline);
+
+        // And the amendment is genuinely not executable at the ORIGINAL deadline any more.
+        vm.warp(firstDeadline);
+        vm.prank(manager);
+        vm.expectRevert(LegalManager.TooEarly.selector);
+        lm.executeOperatingAgreementUpdate(h);
+    }
+}
