@@ -1,6 +1,14 @@
 import type { Address, Hex } from "viem";
+import { decodedRevertName } from "../adapters/arc/relay";
 import type { DoolaEnvironment } from "../adapters/doola/types";
-import { RETRY_BASE_MS, RETRY_CAP_MS, nextInterval } from "../formation/schedule";
+import {
+  MAX_ANCHOR_REVERT_ATTEMPTS,
+  RETRY_BASE_MS,
+  RETRY_CAP_MS,
+  VETO_RECHECK_CAP_MS,
+  nextInterval,
+} from "../formation/schedule";
+import { companyFiled, documentsFetched, einIssued, providerRefOf } from "../formation/status";
 import {
   type JsonValue,
   ManifestError,
@@ -20,13 +28,19 @@ import {
 } from "../persistence/documentIndexRepository";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
-import type { FormationRepository } from "../persistence/formationRepository";
 import type {
-  OaAnchorRecord,
-  OaAnchorRepository,
-  OaAnchorState,
+  FormationRepository,
+  FormationRequestRecord,
+} from "../persistence/formationRepository";
+import {
+  HOLD_STATES,
+  OPEN_STATES,
+  type OaAnchorRecord,
+  type OaAnchorRepository,
+  type OaAnchorState,
 } from "../persistence/oaAnchorRepository";
 import type { EntityRecord } from "../types";
+import { parseSqliteUtc } from "../util/sqliteTime";
 import { FORMATION_ENTITY_TYPE, FORMATION_STATE } from "./formationProvider";
 import { usesManifestScheme } from "./onboarding";
 
@@ -53,7 +67,8 @@ import { usesManifestScheme } from "./onboarding";
  *     between "never scheduled" and "already executed", and a crash between the execute
  *     broadcast and its receipt would otherwise re-schedule an executed version — letting a
  *     stale manifest land AFTER a newer one. `meta().operatingAgreementHash` is what
- *     disambiguates, and it is read FIRST.
+ *     disambiguates, and it is read FIRST — before the manifest is even re-hashed, because a
+ *     version the chain already holds is a version there is nothing left to verify about (F3).
  *  3. **There is no manager-side cancel.** Once a hash is scheduled we cannot take it back; the
  *     guardian's veto is the only stop, and it permanently blacklists that hash. Which is why a
  *     superseded-but-scheduled version is left to expire rather than "cancelled", and why the
@@ -69,6 +84,14 @@ import { usesManifestScheme } from "./onboarding";
  * columns are written inside the transaction that WON it. `withKeyedLock` is layered on by the
  * callers as an optimization — this module is deliberately lock-free so it can be called from
  * inside a lock the caller already holds (the processor does exactly that).
+ *
+ * ── The projection ─────────────────────────────────────────────────────────────────────────
+ *
+ * Nothing here writes `entities.oa_manifest_*` directly. Those five columns are a projection of
+ * `oa_anchors`, recomputed from the rows by `transitionAndProject` inside the transaction that
+ * won the CAS (review F2). Six call sites each deciding for themselves what "pending" meant is
+ * how a supersede with no successor left an entity advertising an amendment that had ceased to
+ * exist.
  *
  * ── What never enters an anchor ────────────────────────────────────────────────────────────
  *
@@ -106,6 +129,7 @@ export interface AnchorChain {
     newHash: Hex,
     agentManager?: Address,
   ): Promise<Hex>;
+  /** BOUNDED — a receipt that never arrives times out and parks the cycle (F7). */
   waitForManagerReceipt(txHash: Hex): Promise<{ status: "success" | "reverted" }>;
 }
 
@@ -136,6 +160,7 @@ export type AnchorSkip =
   | "environment_pin"
   | "hold_park"
   | "no_new_facts"
+  | "fully_anchored"
   | "not_due"
   | "not_active";
 
@@ -159,6 +184,43 @@ function logAnchor(
   opsLog("anchor_step", { entityKey, version, state, ...extra });
 }
 
+// ── warning de-duplication (review F9) ──────────────────────────────────────────────────────
+
+/**
+ * Standing conditions warn ONCE PER ENTITY PER DAY, keyed `code:entityKey:YYYY-MM-DD`.
+ *
+ * Three of this module's WARN lines describe a state that does not change on its own: a held
+ * pipeline, an entity pinned to the other environment, a filing confirmed without a number. The
+ * sweeper visits each of them every tick, so at the 60s default they produced 1,440 identical
+ * lines a day per entity — which does not make the condition more visible, it makes journald less
+ * readable and buries the lines that fire once.
+ *
+ * In memory, and deliberately so (the sweeper's `warned` rule): this de-duplicates an ops LINE,
+ * not state anything depends on. A restart re-warns, which is the failure direction to prefer.
+ */
+const warned = new Set<string>();
+
+function warnOnce(
+  code: string,
+  entityKey: string,
+  now: number,
+  fields: Record<string, unknown>,
+): void {
+  const day = new Date(now).toISOString().slice(0, 10);
+  const key = `${code}:${entityKey}:${day}`;
+  if (warned.has(key)) return;
+  // Yesterday's keys can never match again. Pruned here rather than on a timer, because this is
+  // the only place the set grows and the API process is meant to run for months.
+  for (const old of warned) if (!old.endsWith(`:${day}`)) warned.delete(old);
+  warned.add(key);
+  opsLog(code, { level: "warn", entityKey, ...fields });
+}
+
+/** Tests only: the de-dup set is process-wide, so a test asserting a warn must start clean. */
+export function resetAnchorWarnings(): void {
+  warned.clear();
+}
+
 // ── the entry point ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -171,11 +233,21 @@ function logAnchor(
  * Never throws for an ordinary failure. A transport error parks the cycle with a doubling
  * backoff and NO attempt bump, for the same reason a failed doola read does not burn one: a lost
  * receipt is not evidence about whether the amendment is going through, and the only thing an
- * attempt counter can do here is abandon a legitimate one.
+ * attempt counter can do here is abandon a legitimate one. A DECODED CONTRACT REVERT is the
+ * opposite and does burn one — see `classifyChainFailure`.
+ *
+ * ── The gate order (review F6) ──────────────────────────────────────────────────────────────
+ *
+ * Everything that can be answered from the database is answered before anything is read off the
+ * disk. `loadAnchoredManifest` reads a file, hashes it and parses it, and `reconcileTarget` then
+ * serializes and hashes a candidate — per entity, per tick, forever. A parked cycle, an entity
+ * whose amendment is still inside its timelock and an entity that will never anchor again are all
+ * dismissed above that line.
  */
 export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promise<AnchorOutcome> {
   const rec = d.repo.findByIdempotencyKey(entityKey);
   if (!rec) return { advanced: false, skipped: "no_entity" };
+  const now = (d.now ?? Date.now)();
 
   // ── Gates. A legacy row, a stub deployment or a legacy-scheme record must never reach the
   //    chain from here: `formation_provider = null` is stub forever, and a record anchored under
@@ -191,9 +263,7 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
   // Environment pinning (audit M5), before any chain read — the same refusal fetch-and-advance
   // makes, for the same reason: a config flip must never act on an entity pinned elsewhere.
   if (rec.formationEnvironment !== d.environment) {
-    opsLog("anchor_environment_mismatch", {
-      level: "warn",
-      entityKey,
+    warnOnce("anchor_environment_mismatch", entityKey, now, {
       pinned: rec.formationEnvironment,
       deployment: d.environment,
     });
@@ -201,15 +271,53 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
   }
 
   try {
+    // ONE read of this entity's cycle history per pass (review F8). It answers the hold check,
+    // the open-cycle lookup and the highest-version reduce; it is re-read only when this pass has
+    // itself moved rows (a lifted veto) or after a lost CAS — the two moments it is provably
+    // stale.
+    //
     // A veto parks the WHOLE pipeline (design §7, audit H4) — it is a stop sign, not a per-hash
     // speed bump a re-versioning backend routes around. Checked before anything else.
-    if (await parkedByHold(d, rec)) return { advanced: false, skipped: "hold_park" };
+    const hold = await parkedByHold(d, rec, d.anchors.versionsOf(entityKey), now);
+    if (hold.held) return { advanced: false, skipped: "hold_park" };
+    const all = hold.all;
 
-    const prev = loadAnchoredManifest(d, rec);
-    if (!prev) return NOTHING; // corrupt/unreadable baseline — already parked and logged
-    const open = await reconcileTarget(d, rec, prev);
-    if (!open) return { advanced: false, skipped: "no_new_facts" };
-    return await driveCycle(d, rec, open);
+    const open = newestOpen(all);
+    const steps = d.requests.stepsOf(entityKey);
+
+    // A parked cycle waits out its backoff. `next_retry_at` is epoch MILLISECONDS (the sweeper's
+    // clock); `executable_at` below is unix SECONDS (chain time). They are different units
+    // because they answer to different clocks, and both are labeled everywhere they appear.
+    if (open && open.nextRetryAt !== null && now < open.nextRetryAt)
+      return { advanced: false, version: open.version, state: open.state, skipped: "not_due" };
+
+    // An amendment inside its timelock, with no formation step touched since the cycle was last
+    // written: there is provably nothing to re-derive. EVERY fact `deriveLegalBlock` reads is
+    // written in the same transaction as a `formation_requests` row (the filing facts and the EIN
+    // inside their confirming CAS, the documents alongside the `fetch_documents` detail), so a
+    // step's `updated_at` is a sound upper bound on when the facts last moved.
+    if (open && awaitingTimelock(open, now) && !factsMovedSince(steps, open))
+      return { advanced: false, version: open.version, state: open.state, skipped: "not_due" };
+
+    // Fully and finally anchored: the IRS has issued, the anchored cycle was written after that
+    // landed, and no cycle is open or held. The EIN is the LAST fact this entity can ever
+    // produce, so the anchored manifest already carries it and no version will ever follow.
+    if (!open && fullyAnchored(all, steps)) return { advanced: false, skipped: "fully_anchored" };
+
+    const legal = deriveLegalBlock(d, rec, steps);
+    // Nothing new to say and nothing in flight: the quiet entity, answered without a file read.
+    if (!legal && !open) return { advanced: false, skipped: "no_new_facts" };
+
+    let target = open;
+    if (legal) {
+      // Only NOW is the anchored manifest worth reading: it is the document the candidate chains
+      // onto, and without a candidate there is nothing to chain.
+      const prev = loadAnchoredManifest(d, rec);
+      if (!prev) return NOTHING; // corrupt/unreadable baseline — already parked and logged
+      target = await reconcileTarget(d, rec, prev, legal, all, open);
+    }
+    if (!target) return { advanced: false, skipped: "no_new_facts" };
+    return await driveCycle(d, rec, target);
   } catch (err) {
     // The catch-all exists so one entity's bad minute cannot stop a sweep. Anything that reaches
     // here without having parked a row is a bug, so it is logged loudly rather than swallowed.
@@ -222,6 +330,45 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
   }
 }
 
+// ── the cheap gates ─────────────────────────────────────────────────────────────────────────
+
+/** The entity's single in-flight cycle (single-pending rule), out of the one snapshot. */
+function newestOpen(all: readonly OaAnchorRecord[]): OaAnchorRecord | undefined {
+  return all.filter((r) => (OPEN_STATES as readonly string[]).includes(r.state)).at(-1);
+}
+
+/** A scheduled amendment whose timelock has not elapsed. Unix SECONDS — chain time. */
+function awaitingTimelock(row: OaAnchorRecord, nowMs: number): boolean {
+  return (
+    row.state === "scheduled" &&
+    (row.executableAt === null || Math.floor(nowMs / 1000) < row.executableAt)
+  );
+}
+
+/** Has any formation step been written since this cycle was? `>=` because both timestamps have
+ *  one-SECOND resolution and the fast path confirms a step and opens its version inside the same
+ *  second: the safe direction is to re-derive one time too many, never one too few. */
+function factsMovedSince(steps: FormationRequestRecord[], row: OaAnchorRecord): boolean {
+  const at = parseSqliteUtc(row.updatedAt);
+  return steps.some((s) => parseSqliteUtc(s.updatedAt) >= at);
+}
+
+/**
+ * Is this entity done for good (review F6)?
+ *
+ * The check is deliberately made of facts already in memory: `await_ein` confirmed means no
+ * further legal fact can arrive, and an anchored cycle written after every step means the manifest
+ * the chain holds already folded them all in. Proving the same thing by reading the anchored
+ * manifest and comparing its `legal.ein` would cost a file read and two hashes to reach a
+ * conclusion that cannot change.
+ */
+function fullyAnchored(all: readonly OaAnchorRecord[], steps: FormationRequestRecord[]): boolean {
+  if (!einIssued(steps)) return false;
+  if (all.some((r) => (HOLD_STATES as readonly string[]).includes(r.state))) return false;
+  const anchored = all.filter((r) => r.state === "executed").at(-1);
+  return anchored !== undefined && !factsMovedSince(steps, anchored);
+}
+
 // ── the veto park ───────────────────────────────────────────────────────────────────────────
 
 /**
@@ -232,34 +379,54 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
  *  - `vetoed`. A veto blacklists ONE hash, so a backend that simply re-versioned around it would
  *    defeat the guardian entirely (audit H4). It ends on chain via `liftVeto`, which this
  *    observes, or via `acknowledgeHold` — an operator saying "that version is dead, move on".
- *  - `failed`. Today that means a scheduled manifest stopped re-hashing to its anchor, and the
- *    amendment is STILL LIVE on chain with only the guardian able to stop it. Building a
- *    successor while that is true would be the platform quietly moving on from a problem the
- *    operator has to see. Ends only by acknowledgement.
+ *  - `failed`. Today that means either a scheduled manifest stopped re-hashing to its anchor, or a
+ *    manager call reverted deterministically until its attempts ran out. Both leave an amendment
+ *    LIVE on chain with only the guardian able to stop it. Building a successor while that is true
+ *    would be the platform quietly moving on from a problem the operator has to see. Ends only by
+ *    acknowledgement.
+ *
+ * The lift check is SCHEDULED like every other chain read (review F6): a held entity is a
+ * candidate on every single tick, `liftVeto` is a human action measured in hours, and an RPC per
+ * tick per vetoed entity buys nothing. A transport failure here parks with the same backoff every
+ * other read gets — it must never reach the catch-all and read as `anchor_failed`.
  *
  * When a lift IS observed, only the NEWEST vetoed version resumes; older ones are superseded, so
  * the single-pending rule survives a guardian who vetoed twice and lifted both.
  */
-async function parkedByHold(d: AnchorLoopDeps, rec: EntityRecord): Promise<boolean> {
-  const all = d.anchors.versionsOf(rec.idempotencyKey);
+type HoldOutcome =
+  | { held: true }
+  /** Not held — carrying the snapshot, refreshed iff this call moved any row. */
+  | { held: false; all: readonly OaAnchorRecord[] };
+
+async function parkedByHold(
+  d: AnchorLoopDeps,
+  rec: EntityRecord,
+  all: readonly OaAnchorRecord[],
+  now: number,
+): Promise<HoldOutcome> {
+  const key = rec.idempotencyKey;
   const failed = all.filter((r) => r.state === "failed");
   if (failed.length > 0) {
-    opsLog("anchor_held", {
-      level: "warn",
-      entityKey: rec.idempotencyKey,
+    warnOnce("anchor_held", key, now, {
       versions: failed.map((r) => r.version),
       reason:
         "a cycle is in `failed` and needs an operator acknowledgement before anchoring resumes",
     });
-    return true;
+    return { held: true };
   }
   const vetoed = all.filter((r) => r.state === "vetoed");
-  if (vetoed.length === 0) return false;
+  if (vetoed.length === 0) return { held: false, all };
 
   const proxy = rec.proxy as Address;
   const lifted: OaAnchorRecord[] = [];
   for (const row of vetoed) {
-    if (await d.arc.oaVetoed(proxy, row.manifestHash)) return true; // the park stands
+    if (row.nextRetryAt !== null && now < row.nextRetryAt) return heldWarn(key, vetoed, now);
+    const still = await tryChain(d, row, () => d.arc.oaVetoed(proxy, row.manifestHash));
+    if (still.stop) return { held: true }; // transient RPC: parked with backoff, the park stands
+    if (still.value) {
+      scheduleVetoRecheck(d, row, now);
+      return heldWarn(key, vetoed, now);
+    }
     lifted.push(row);
   }
 
@@ -267,10 +434,48 @@ async function parkedByHold(d: AnchorLoopDeps, rec: EntityRecord): Promise<boole
   const newest = lifted[lifted.length - 1]!;
   for (const row of lifted) {
     const to: OaAnchorState = row.version === newest.version ? "pending" : "superseded";
-    if (d.anchors.transition(rec.idempotencyKey, row.version, "vetoed", to, { error: null }))
-      logAnchor(rec.idempotencyKey, row.version, to, { code: "veto_lifted" });
+    if (
+      d.anchors.transitionAndProject(key, row.version, "vetoed", to, {
+        error: null,
+        // ── The wedge (review F1). The veto DELETED this hash's schedule, so the persisted
+        //    `schedule_tx` now describes something the chain does not have. Left in place, the
+        //    schedule leg read `scheduledAt == 0`, found the mined tx, and parked "refusing to
+        //    re-broadcast blindly" — forever, on every pass, for a cycle whose only problem was
+        //    that it had been stopped and un-stopped. Re-scheduling resets no clock here: there
+        //    is no clock.
+        clearScheduleTx: true,
+        clearExecuteTx: true,
+      })
+    )
+      logAnchor(key, row.version, to, { code: "veto_lifted" });
   }
-  return false;
+  // Rows moved, so the caller's snapshot is stale by our own hand: the resumed cycle reads
+  // `vetoed` in it, which would leave the pass with no open cycle and mint a successor around the
+  // very version the guardian just released.
+  return { held: false, all: d.anchors.versionsOf(key) };
+}
+
+function heldWarn(key: string, vetoed: OaAnchorRecord[], now: number): HoldOutcome {
+  warnOnce("anchor_held", key, now, {
+    versions: vetoed.map((r) => r.version),
+    reason: "the guardian's veto is still in place — anchoring resumes on liftVeto or an ack",
+  });
+  return { held: true };
+}
+
+/** Space out the next `vetoed(hash)` read, preserving the row's error (it is still the veto).
+ *  Its own cap: a guardian who lifts a veto must not wait hours for the pipeline to notice. */
+function scheduleVetoRecheck(d: AnchorLoopDeps, row: OaAnchorRecord, now: number): void {
+  const retryIntervalMs = nextInterval(
+    row.retryIntervalMs ?? undefined,
+    RETRY_BASE_MS,
+    VETO_RECHECK_CAP_MS,
+  );
+  d.anchors.transition(row.entityKey, row.version, "vetoed", "vetoed", {
+    error: row.error,
+    nextRetryAt: now + retryIntervalMs,
+    retryIntervalMs,
+  });
 }
 
 // ── the baseline: the manifest the chain currently holds ────────────────────────────────────
@@ -288,38 +493,18 @@ interface AnchoredManifest {
  * recorded as anchored, and the document's own `version` is the version we think is anchored. A
  * failure here parks the pipeline rather than guessing, because every later `previous` link would
  * inherit the mistake.
+ *
+ * The hash check is `verifyStoredManifest`'s — ONE hash-verify path and one event name for the
+ * whole module (review F11), because "the file on disk is not the anchor it claims to be" is one
+ * fact whichever side of the pipeline notices it.
  */
 function loadAnchoredManifest(d: AnchorLoopDeps, rec: EntityRecord): AnchoredManifest | undefined {
   const key = rec.idempotencyKey;
   const version = rec.oaManifestVersion!;
-  const name = manifestDocName(key, version);
-  try {
-    const bytes = d.docStore.getBytes(name);
-    const hash = manifestHash(bytes);
-    if (hash !== rec.oaManifestAnchoredHash)
-      throw new ManifestError(
-        `stored ${name} hashes to ${hash} but the anchored hash is ${rec.oaManifestAnchoredHash}`,
-      );
-    const manifest = parseManifest(bytes);
-    if (manifest.version !== version)
-      throw new ManifestError(
-        `stored ${name} declares version ${manifest.version}, not the anchored ${version}`,
-      );
-    return { manifest, hash };
-  } catch (err) {
-    // CRITICAL: the anchored document cannot be reproduced from disk, so nothing can honestly
-    // chain onto it. Anchoring stops here until a human restores the file (doola remains the
-    // system of record for the PDFs; the manifest is ours and lives in the backup runbook).
-    opsLog("anchor_baseline_unreadable", {
-      severity: "CRITICAL",
-      level: "error",
-      entityKey: key,
-      version,
-      document: name,
-      message: (err as Error).message,
-    });
-    return undefined;
-  }
+  const hash = rec.oaManifestAnchoredHash as Hex;
+  const bytes = verifyStoredManifest(d, key, version, hash, { declaredVersion: version });
+  if (!bytes) return undefined;
+  return { manifest: parseManifest(bytes), hash };
 }
 
 // ── the target: which version, and what does it say ─────────────────────────────────────────
@@ -330,29 +515,28 @@ function loadAnchoredManifest(d: AnchorLoopDeps, rec: EntityRecord): AnchoredMan
  * The trigger, stated as data rather than as a sequence of `if`s (design §7): v2 becomes possible
  * when `await_filing` AND `fetch_documents` are both confirmed, because that is the moment both
  * halves exist — a filing date and filing number on the record, and the two required documents'
- * sha256s in the index. v3 follows when `await_ein` confirms. Everything is read from the ENTITY
- * RECORD and the `documents` table, never from a webhook payload (audit H2) and never from a live
- * provider response, so re-deriving a version after a restart produces the same bytes.
+ * sha256s in the index. v3 follows when `await_ein` confirms. The step predicates are the shared
+ * ones in `formation/status` (review F11), so a renamed step fails to compile rather than
+ * silently stalling every entity. Everything is read from the ENTITY RECORD and the `documents`
+ * table, never from a webhook payload (audit H2) and never from a live provider response, so
+ * re-deriving a version after a restart produces the same bytes.
  */
-export function deriveLegalBlock(d: AnchorLoopDeps, rec: EntityRecord): ManifestLegal | null {
+export function deriveLegalBlock(
+  d: AnchorLoopDeps,
+  rec: EntityRecord,
+  steps: FormationRequestRecord[] = d.requests.stepsOf(rec.idempotencyKey),
+): ManifestLegal | null {
   const key = rec.idempotencyKey;
-  const steps = d.requests.stepsOf(key);
-  const stateOf = (step: string) => steps.find((s) => s.step === step)?.state;
-  const providerRef = steps.find((s) => s.step === "create_provider")?.providerRef;
+  const providerRef = providerRefOf(steps);
   if (!providerRef) return null;
-  if (stateOf("await_filing") !== "confirmed" || stateOf("fetch_documents") !== "confirmed")
-    return null;
+  if (!companyFiled(steps) || !documentsFetched(steps)) return null;
   if (rec.formationFiledAt == null) return null;
   if (!rec.formationFilingNumber) {
-    // ⚠ FLAGGED. The filing number is part of the v2 trigger, and `advanceFiling` writes it onto
-    // the entity only inside the CAS that CONFIRMS the step — so a company doola confirmed as
-    // filed without one yet will never anchor v2 on its own. That is a real (pre-existing) gap in
-    // the fetch-and-advance path rather than something to paper over here: anchoring a manifest
-    // that claims a filing with no filing number would be the dishonest fix. Say so, once per
-    // pass, where an operator will see it.
-    opsLog("anchor_awaiting_filing_number", {
-      level: "warn",
-      entityKey: key,
+    // The filing number is part of the v2 trigger, and anchoring a manifest that claims a filing
+    // with no filing number would be the dishonest fix. `advanceFiling` now HEALS the number onto
+    // the entity on any later poll that reports one (review F12), so this is a wait, not a
+    // deadlock — but it is a wait an operator should be able to see, once a day.
+    warnOnce("anchor_awaiting_filing_number", key, (d.now ?? Date.now)(), {
       providerRef,
       message:
         "formation is confirmed filed but the record carries no filing number — v2 cannot be anchored until it does",
@@ -375,7 +559,7 @@ export function deriveLegalBlock(d: AnchorLoopDeps, rec: EntityRecord): Manifest
     filingNumber: rec.formationFilingNumber,
     // v2 anchors WITHOUT an EIN and says so: the IRS takes four to six weeks, and pretending
     // otherwise is the deception §2 forbids. v3 lands when the IRS does.
-    ein: stateOf("await_ein") === "confirmed" ? (rec.einReal ?? null) : null,
+    ein: einIssued(steps) ? (rec.einReal ?? null) : null,
     documents: docs.map((r) => ({
       type: r.docType,
       sha256: r.sha256,
@@ -420,13 +604,11 @@ async function reconcileTarget(
   d: AnchorLoopDeps,
   rec: EntityRecord,
   prev: AnchoredManifest,
+  legal: ManifestLegal,
+  all: readonly OaAnchorRecord[],
+  open: OaAnchorRecord | undefined,
 ): Promise<OaAnchorRecord | undefined> {
   const key = rec.idempotencyKey;
-  const legal = deriveLegalBlock(d, rec);
-  const open = d.anchors.findPending(key);
-
-  // Nothing new to say: an open cycle keeps being driven, and a quiet entity stays quiet.
-  if (!legal) return open;
 
   const chain = {
     chainId: d.chainId,
@@ -465,7 +647,7 @@ async function reconcileTarget(
     // row carrying a `schedule_tx` may well be on chain (the broadcast landed and the receipt was
     // lost), so it gets the same honest wording as a `scheduled` one: it is left to expire.
     const onChain = open.state === "scheduled" || open.scheduleTx !== null;
-    const superseded = d.anchors.transition(key, open.version, open.state, "superseded", {
+    const superseded = d.anchors.transitionAndProject(key, open.version, open.state, "superseded", {
       error: onChain
         ? "superseded by newer facts after its schedule was broadcast — left to expire unexecuted (there is no manager-side cancel)"
         : "superseded by newer facts before it was broadcast",
@@ -480,7 +662,7 @@ async function reconcileTarget(
 
   // The next version: strictly ahead of BOTH the anchored one and every cycle ever opened, so a
   // superseded v3 can never be re-claimed as a v3 with different bytes.
-  const highest = d.anchors.versionsOf(key).reduce((m, r) => Math.max(m, r.version), 0);
+  const highest = all.reduce((m, r) => Math.max(m, r.version), 0);
   const version = Math.max(rec.oaManifestVersion ?? 1, highest) + 1;
 
   let built: ReturnType<typeof build>;
@@ -506,14 +688,14 @@ async function reconcileTarget(
   // ── HASH-FINAL DISCIPLINE, first of two (audit M7). Write atomically, then read the file BACK
   //    and re-hash it. A torn or truncated manifest whose hash is already scheduled is a
   //    permanently unverifiable anchor, and there is no manager-side cancel to undo it.
-  const name = manifestDocName(key, version);
-  d.docStore.putBytes(name, built.bytes);
-  const verified = verifyStoredManifest(d, key, version, built.hash);
-  if (!verified) return undefined;
+  d.docStore.putBytes(manifestDocName(key, version), built.bytes);
+  if (!verifyStoredManifest(d, key, version, built.hash)) return undefined;
 
   // Claim the cycle. `claimVersion` adopts rather than restarts: a crash between the write and
   // this claim re-derives the SAME bytes and the same hash, so the second pass finds its own row.
-  if (!d.anchors.claimVersion(key, version, built.hash)) {
+  // The projection — the pending pair the monitor and the guardian card read (audit H3/14) — is
+  // recomputed inside the same transaction as the claim it describes.
+  if (!d.anchors.claimVersionAndProject(key, version, built.hash)) {
     const existing = d.anchors.find(key, version);
     if (existing && existing.manifestHash !== built.hash) {
       opsLog("anchor_hash_conflict", {
@@ -531,38 +713,43 @@ async function reconcileTarget(
     return existing;
   }
 
-  // The pending pair on the entity: the fixed projection the monitor and the guardian card read
-  // (audit H3/14). Written in the same transaction as the claim it describes.
-  d.repo.transaction(() => {
-    const fresh = d.repo.findByIdempotencyKey(key);
-    if (fresh)
-      d.repo.upsert({
-        ...fresh,
-        oaManifestPendingHash: built.hash,
-        oaManifestPendingVersion: version,
-        oaAmendmentExecutableAt: null,
-      });
-  });
   logAnchor(key, version, "pending", { code: "opened", manifestHash: built.hash });
   return d.anchors.find(key, version);
 }
 
-/** Re-read the manifest we just wrote and re-hash it. The one check that makes "the file on disk
- *  IS the anchor" a fact rather than an intention. */
+/**
+ * Re-read a manifest from the store and re-hash it — the ONE check that makes "the file on disk
+ * IS the anchor" a fact rather than an intention, used by both the write path (immediately after
+ * `putBytes`) and the read path (the anchored baseline, and again before every execute).
+ *
+ * Returns the VERIFIED bytes, so a caller that needs the document does not read it twice.
+ */
 function verifyStoredManifest(
   d: AnchorLoopDeps,
   entityKey: string,
   version: number,
   expected: Hex,
-): boolean {
+  opts: { declaredVersion?: number } = {},
+): Buffer | undefined {
   const name = manifestDocName(entityKey, version);
   try {
     const back = d.docStore.getBytes(name);
     const hash = manifestHash(back);
     if (hash !== expected)
       throw new ManifestError(`re-read ${name} hashes to ${hash}, not ${expected}`);
-    return true;
+    if (opts.declaredVersion !== undefined) {
+      const manifest = parseManifest(back);
+      if (manifest.version !== opts.declaredVersion)
+        throw new ManifestError(
+          `stored ${name} declares version ${manifest.version}, not the anchored ${opts.declaredVersion}`,
+        );
+    }
+    return back;
   } catch (err) {
+    // CRITICAL either way: on the write path a torn manifest must never be scheduled, and on the
+    // read path the anchored document cannot be reproduced from disk, so nothing can honestly
+    // chain onto it. Anchoring stops until a human restores the file (doola remains the system of
+    // record for the PDFs; the manifest is ours and lives in the backup runbook).
     opsLog("anchor_manifest_unverifiable", {
       severity: "CRITICAL",
       level: "error",
@@ -571,7 +758,7 @@ function verifyStoredManifest(
       document: name,
       message: (err as Error).message,
     });
-    return false;
+    return undefined;
   }
 }
 
@@ -583,9 +770,8 @@ async function driveCycle(
   row: OaAnchorRecord,
 ): Promise<AnchorOutcome> {
   const now = (d.now ?? Date.now)();
-  // A parked cycle waits out its backoff. `next_retry_at` is epoch MILLISECONDS (the sweeper's
-  // clock); `executable_at` below is unix SECONDS (chain time). They are different units because
-  // they answer to different clocks, and both are labeled everywhere they appear.
+  // The backoff gate is hoisted into `advanceAnchor`; it is repeated here because a re-read row
+  // (the CAS-lost path) may carry a schedule the caller's snapshot did not.
   if (row.nextRetryAt !== null && now < row.nextRetryAt)
     return { advanced: false, version: row.version, state: row.state, skipped: "not_due" };
 
@@ -597,7 +783,7 @@ async function driveCycle(
   const vetoed = await tryChain(d, row, () =>
     d.arc.oaVetoed(rec.proxy as Address, row.manifestHash),
   );
-  if (vetoed.parked) return NOTHING;
+  if (vetoed.stop) return vetoed.stop;
   if (vetoed.value) return recordVeto(d, rec, row);
 
   if (row.state === "pending") return schedulePhase(d, rec, row);
@@ -605,7 +791,14 @@ async function driveCycle(
   return NOTHING;
 }
 
-/** The guardian stopped this amendment. The row parks, and with it the whole pipeline. */
+/**
+ * The guardian stopped this amendment. The row parks, and with it the whole pipeline.
+ *
+ * Deliberately NOT a projecting transition: the amendment is still SCHEDULED on chain (a veto
+ * blacklists the hash, it does not un-schedule the entity's pending state as far as any observer
+ * is concerned), and the pending pair is exactly what the guardian card and the monitor's
+ * compromise rule need to keep showing while a human decides what to do.
+ */
 function recordVeto(d: AnchorLoopDeps, rec: EntityRecord, row: OaAnchorRecord): AnchorOutcome {
   const key = rec.idempotencyKey;
   if (d.anchors.transition(key, row.version, row.state, "vetoed", { error: "guardian veto" }))
@@ -655,7 +848,7 @@ async function commonPrechecks(
   const anchored = freshAnchoredVersion(d, key, rec);
   if (row.version <= anchored) {
     if (
-      d.anchors.transition(key, row.version, row.state, "superseded", {
+      d.anchors.transitionAndProject(key, row.version, row.state, "superseded", {
         error: `v${row.version} does not advance the anchored v${anchored} — refusing to act on it`,
       })
     )
@@ -671,6 +864,60 @@ function freshAnchoredVersion(d: AnchorLoopDeps, key: string, fallback: EntityRe
   return d.repo.findByIdempotencyKey(key)?.oaManifestVersion ?? fallback.oaManifestVersion ?? 1;
 }
 
+// ── the broadcast/persist/confirm shape, once ───────────────────────────────────────────────
+
+/**
+ * The half of each leg that is identical: adopt a persisted broadcast, or send a new one and
+ * persist it BETWEEN the two awaits.
+ *
+ * That persist is the entire point of the split — a crash after the broadcast resumes by adopting
+ * the tx rather than sending a second one, which for the schedule leg is not merely wasteful but
+ * silently RESETS the guardian's veto window (contract property 1). It was written out twice, and
+ * the two copies had already drifted in what they logged.
+ *
+ * `adopt` decides what a mined prior tx means for THIS leg and returns the outcome to stop with,
+ * or undefined to say "that tx did not achieve it — send another".
+ */
+interface BroadcastLeg {
+  priorTx: Hex | null;
+  leg: "schedule" | "execute";
+  adopt: () => Promise<AnchorOutcome | undefined>;
+  send: () => Promise<Hex>;
+  persistTx: (txHash: Hex) => void;
+}
+
+async function driveBroadcast(
+  d: AnchorLoopDeps,
+  row: OaAnchorRecord,
+  o: BroadcastLeg,
+): Promise<{ txHash?: Hex; stop?: AnchorOutcome }> {
+  const { entityKey: key, version } = row;
+  if (o.priorTx) {
+    const receipt = await tryChain(d, row, () => d.arc.waitForManagerReceipt(o.priorTx!));
+    if (receipt.stop) return { stop: receipt.stop };
+    if (receipt.value!.status === "success") {
+      const adopted = await o.adopt();
+      if (adopted) return { stop: adopted };
+    } else {
+      logAnchor(key, version, row.state, { code: `${o.leg}_reverted`, txHash: o.priorTx });
+    }
+  }
+
+  const sent = await tryChain(d, row, o.send);
+  if (sent.stop) return { stop: sent.stop };
+  const txHash = sent.value!;
+  o.persistTx(txHash);
+  logAnchor(key, version, row.state, { code: `${o.leg}_broadcast`, txHash });
+
+  const receipt = await tryChain(d, row, () => d.arc.waitForManagerReceipt(txHash));
+  if (receipt.stop) return { stop: receipt.stop };
+  if (receipt.value!.status !== "success") {
+    park(d, row, `${o.leg} tx ${txHash} reverted`);
+    return { stop: NOTHING };
+  }
+  return { txHash };
+}
+
 /** pending -> scheduled: broadcast, persist, confirm. */
 async function schedulePhase(
   d: AnchorLoopDeps,
@@ -680,12 +927,12 @@ async function schedulePhase(
   const key = rec.idempotencyKey;
   const proxy = rec.proxy as Address;
 
-  const stop = await tryChain(d, row, () => commonPrechecks(d, rec, row));
-  if (stop.parked) return NOTHING;
-  if (stop.value) return stop.value;
+  const pre = await tryChain(d, row, () => commonPrechecks(d, rec, row));
+  if (pre.stop) return pre.stop;
+  if (pre.value) return pre.value;
 
   const scheduled = await tryChain(d, row, () => d.arc.oaScheduledAt(proxy, row.manifestHash));
-  if (scheduled.parked) return NOTHING;
+  if (scheduled.stop) return scheduled.stop;
 
   // Already on chain: ADOPT it. This is the crash-between-broadcast-and-persist window — the
   // chain has the schedule, our row does not know its tx. Re-broadcasting here would reset the
@@ -693,61 +940,81 @@ async function schedulePhase(
   if (scheduled.value! > 0n)
     return confirmScheduled(d, rec, row, Number(scheduled.value!), row.scheduleTx ?? null);
 
-  // A persisted broadcast that the chain does not reflect: either it is still unmined (the
-  // receipt wait blocks, and a timeout parks us) or it reverted, in which case re-broadcasting is
-  // exactly right — `scheduledAt == 0` proves there is no clock to reset.
-  if (row.scheduleTx) {
-    const receipt = await tryChain(d, row, () => d.arc.waitForManagerReceipt(row.scheduleTx!));
-    if (receipt.parked) return NOTHING;
-    if (receipt.value!.status === "success") {
+  // A persisted broadcast the chain does not reflect: either it reverted (re-broadcasting is
+  // exactly right — `scheduledAt == 0` proves there is no clock to reset) or it succeeded and
+  // something removed the schedule afterwards, which `scheduleGone` adjudicates.
+  const drive = await driveBroadcast(d, row, {
+    priorTx: row.scheduleTx,
+    leg: "schedule",
+    adopt: async () => {
       // Mined successfully and yet nothing is scheduled: re-read once before believing it.
       const again = await tryChain(d, row, () => d.arc.oaScheduledAt(proxy, row.manifestHash));
-      if (again.parked) return NOTHING;
+      if (again.stop) return again.stop;
       if (again.value! > 0n)
         return confirmScheduled(d, rec, row, Number(again.value!), row.scheduleTx);
-      park(
-        d,
-        row,
-        `schedule tx ${row.scheduleTx} succeeded but scheduledAt is still 0 — refusing to re-broadcast blindly`,
-      );
-      return NOTHING;
-    }
-    logAnchor(key, row.version, "pending", { code: "schedule_reverted", txHash: row.scheduleTx });
-  }
-
-  // ── BROADCAST -> PERSIST -> CONFIRM. The persist happens between the two awaits, and that is
-  //    the entire point: a crash after the broadcast resumes by adopting this hash.
-  const sent = await tryChain(d, row, () =>
-    d.arc.scheduleOperatingAgreementUpdate(proxy, row.manifestHash, rec.manager as Address),
-  );
-  if (sent.parked) return NOTHING;
-  const txHash = sent.value!;
-  d.anchors.transition(key, row.version, "pending", "pending", {
-    scheduleTx: txHash,
-    error: null,
+      return scheduleGone(d, rec, row);
+    },
+    send: () =>
+      d.arc.scheduleOperatingAgreementUpdate(proxy, row.manifestHash, rec.manager as Address),
+    persistTx: (txHash) => {
+      d.anchors.transition(key, row.version, "pending", "pending", { scheduleTx: txHash });
+    },
   });
-  logAnchor(key, row.version, "pending", { code: "schedule_broadcast", txHash });
-
-  const receipt = await tryChain(d, row, () => d.arc.waitForManagerReceipt(txHash));
-  if (receipt.parked) return NOTHING;
-  if (receipt.value!.status !== "success") {
-    park(d, row, `schedule tx ${txHash} reverted`);
-    return NOTHING;
-  }
+  if (drive.stop) return drive.stop;
 
   // Prefer the CHAIN's own executableAt over `now + amendmentDelay()`: the guardian's countdown
   // is a promise about when we may act, and block time is the only clock that decides it.
   const onChain = await tryChain(d, row, () => d.arc.oaScheduledAt(proxy, row.manifestHash));
-  let executableAt = onChain.parked ? 0 : Number(onChain.value!);
+  let executableAt = onChain.stop ? 0 : Number(onChain.value!);
   if (executableAt === 0) {
     const delay = await tryChain(d, row, () => d.arc.oaAmendmentDelay(proxy));
-    if (delay.parked) return NOTHING;
+    if (delay.stop) return delay.stop;
     executableAt = Math.floor((d.now ?? Date.now)() / 1000) + Number(delay.value!);
   }
-  return confirmScheduled(d, rec, row, executableAt, txHash);
+  return confirmScheduled(d, rec, row, executableAt, drive.txHash!);
 }
 
-/** Record `scheduled` + the guardian's countdown, in one transaction with the entity column. */
+/**
+ * Our schedule tx MINED, and the chain has no schedule for the hash. What now (review F1)?
+ *
+ * There is exactly one benign shape, and it is the guardian's: `cancelOperatingAgreementUpdate`
+ * DELETES `scheduledAt[hash]` and blacklists the hash, and `liftVeto` then un-blacklists it —
+ * leaving a hash that was scheduled, is not scheduled, is not vetoed and is not the current
+ * anchor. Re-broadcasting there resets nothing, because there is no clock left to reset; refusing
+ * to (which is what this used to do, forever, on every pass) is how a lifted veto became a
+ * permanent wedge.
+ *
+ * The other two readings are checked first and are not benign: still vetoed, or already executed.
+ * Returns undefined to say "re-broadcast".
+ */
+async function scheduleGone(
+  d: AnchorLoopDeps,
+  rec: EntityRecord,
+  row: OaAnchorRecord,
+): Promise<AnchorOutcome | undefined> {
+  const proxy = rec.proxy as Address;
+  const vetoed = await tryChain(d, row, () => d.arc.oaVetoed(proxy, row.manifestHash));
+  if (vetoed.stop) return vetoed.stop;
+  if (vetoed.value) return recordVeto(d, rec, row);
+
+  const current = await tryChain(d, row, () => d.arc.oaCurrentHash(proxy));
+  if (current.stop) return current.stop;
+  if (current.value === row.manifestHash) {
+    markExecuted(d, rec, row, row.executeTx ?? null, "recovered");
+    return { advanced: true, version: row.version, state: "executed" };
+  }
+
+  logAnchor(rec.idempotencyKey, row.version, row.state, {
+    code: "schedule_cancelled",
+    txHash: row.scheduleTx ?? undefined,
+    reason:
+      "the schedule this tx created is gone and the hash is neither vetoed nor anchored — re-scheduling resets no clock",
+  });
+  return undefined;
+}
+
+/** Record `scheduled` + the guardian's countdown. The projection moves with it, in the repo's
+ *  own transaction, so the DB can never advertise a countdown the row does not have. */
 function confirmScheduled(
   d: AnchorLoopDeps,
   rec: EntityRecord,
@@ -756,23 +1023,10 @@ function confirmScheduled(
   txHash: Hex | null,
 ): AnchorOutcome {
   const key = rec.idempotencyKey;
-  let won = false;
-  d.repo.transaction(() => {
-    won = d.anchors.transition(key, row.version, row.state, "scheduled", {
-      ...(txHash ? { scheduleTx: txHash } : {}),
-      executableAt,
-      error: null,
-    });
-    if (!won) return;
-    const fresh = d.repo.findByIdempotencyKey(key);
-    if (fresh)
-      d.repo.upsert({
-        ...fresh,
-        oaManifestPendingHash: row.manifestHash,
-        oaManifestPendingVersion: row.version,
-        // Unix SECONDS — chain time, which is what the veto countdown must be measured in.
-        oaAmendmentExecutableAt: executableAt,
-      });
+  const won = d.anchors.transitionAndProject(key, row.version, row.state, "scheduled", {
+    ...(txHash ? { scheduleTx: txHash } : {}),
+    // Unix SECONDS — chain time, which is what the veto countdown must be measured in.
+    executableAt,
   });
   if (won)
     logAnchor(key, row.version, "scheduled", {
@@ -794,6 +1048,17 @@ async function executePhase(
   const nowSeconds = Math.floor((d.now ?? Date.now)() / 1000);
   if (row.executableAt === null || nowSeconds < row.executableAt)
     return { advanced: false, version: row.version, state: "scheduled", skipped: "not_due" };
+
+  // ── ORDER MATTERS (review F3). The prechecks run FIRST because the first thing they read is
+  //    `meta().operatingAgreementHash`, and a version the chain ALREADY HOLDS is a version there
+  //    is nothing left to decide about: recovering it is the only honest outcome whatever state
+  //    the file is in. Rehashing first meant a crash between the execute broadcast and its
+  //    receipt, combined with a lost manifest, recorded the cycle as `failed` and held the
+  //    pipeline over an amendment that had in fact LANDED — and the next version would then have
+  //    chained onto a hash the chain no longer held.
+  const pre = await tryChain(d, row, () => commonPrechecks(d, rec, row));
+  if (pre.stop) return pre.stop;
+  if (pre.value) return pre.value;
 
   // ── HASH-FINAL DISCIPLINE, second of two (audit M7). The file can rot between the two
   //    transactions, and there is NO manager-side cancel: executing a hash whose document we can
@@ -819,60 +1084,53 @@ async function executePhase(
     return { advanced: true, version: row.version, state: "failed" };
   }
 
-  const stop = await tryChain(d, row, () => commonPrechecks(d, rec, row));
-  if (stop.parked) return NOTHING;
-  if (stop.value) return stop.value;
-
   const scheduled = await tryChain(d, row, () => d.arc.oaScheduledAt(proxy, row.manifestHash));
-  if (scheduled.parked) return NOTHING;
+  if (scheduled.stop) return scheduled.stop;
   if (scheduled.value! === 0n) {
     // Not vetoed (checked), not executed (checked): our row believes something the chain does not.
     // Back to `pending`, where the schedule leg can re-derive it — safely, because it schedules
-    // only when `scheduledAt == 0`, which is exactly what we just read.
+    // only when `scheduledAt == 0`, which is exactly what we just read. The persisted txs go with
+    // it (review F1): they describe a schedule the chain does not have, and left in place they
+    // would send the schedule leg straight back into "refusing to re-broadcast blindly".
     if (
-      d.anchors.transition(key, row.version, "scheduled", "pending", {
+      d.anchors.transitionAndProject(key, row.version, "scheduled", "pending", {
         error: "the chain has no schedule for this hash — re-deriving from the schedule leg",
+        clearScheduleTx: true,
+        clearExecuteTx: true,
       })
     )
       logAnchor(key, row.version, "pending", { code: "schedule_missing" });
     return { advanced: true, version: row.version, state: "pending" };
   }
 
-  // A persisted execute broadcast: adopt it rather than sending a second one.
-  if (row.executeTx) {
-    const receipt = await tryChain(d, row, () => d.arc.waitForManagerReceipt(row.executeTx!));
-    if (receipt.parked) return NOTHING;
-    if (receipt.value!.status === "success") {
+  const drive = await driveBroadcast(d, row, {
+    priorTx: row.executeTx,
+    leg: "execute",
+    adopt: async () => {
       const current = await tryChain(d, row, () => d.arc.oaCurrentHash(proxy));
-      if (current.parked) return NOTHING;
+      if (current.stop) return current.stop;
       if (current.value === row.manifestHash) {
         markExecuted(d, rec, row, row.executeTx, "adopted");
         return { advanced: true, version: row.version, state: "executed" };
       }
-    }
-    logAnchor(key, row.version, "scheduled", { code: "execute_reverted", txHash: row.executeTx });
-  }
-
-  const sent = await tryChain(d, row, () =>
-    d.arc.executeOperatingAgreementUpdate(proxy, row.manifestHash, rec.manager as Address),
-  );
-  if (sent.parked) return NOTHING;
-  const txHash = sent.value!;
-  d.anchors.transition(key, row.version, "scheduled", "scheduled", {
-    executeTx: txHash,
-    error: null,
+      logAnchor(key, row.version, row.state, {
+        code: "execute_reverted",
+        txHash: row.executeTx ?? undefined,
+      });
+      return undefined;
+    },
+    send: () =>
+      d.arc.executeOperatingAgreementUpdate(proxy, row.manifestHash, rec.manager as Address),
+    persistTx: (txHash) => {
+      d.anchors.transition(key, row.version, "scheduled", "scheduled", { executeTx: txHash });
+    },
   });
-  logAnchor(key, row.version, "scheduled", { code: "execute_broadcast", txHash });
+  if (drive.stop) return drive.stop;
+  const txHash = drive.txHash!;
 
-  const receipt = await tryChain(d, row, () => d.arc.waitForManagerReceipt(txHash));
-  if (receipt.parked) return NOTHING;
-  if (receipt.value!.status !== "success") {
-    park(d, row, `execute tx ${txHash} reverted`);
-    return NOTHING;
-  }
   // Confirm against the CHAIN, not against the receipt: the anchor is what `meta()` says it is.
   const current = await tryChain(d, row, () => d.arc.oaCurrentHash(proxy));
-  if (current.parked) return NOTHING;
+  if (current.stop) return current.stop;
   if (current.value !== row.manifestHash) {
     park(
       d,
@@ -886,10 +1144,14 @@ async function executePhase(
 }
 
 /**
- * The promotion, in ONE transaction: the cycle becomes `executed` and the entity's four anchor
- * columns move with it. Split across two transactions, a crash in between would leave the DB
- * claiming an anchor the chain does not hold — or, worse, still advertising a pending amendment
- * that has already landed.
+ * The promotion, in ONE transaction: the cycle becomes `executed`, the entity's projection is
+ * recomputed from the rows, and the audit event is written. Split across two transactions, a
+ * crash in between would leave the DB claiming an anchor the chain does not hold — or, worse,
+ * still advertising a pending amendment that has already landed.
+ *
+ * The `stillOurs` guard this used to carry is gone with the hand-written projection (review F2):
+ * "which version is pending now?" is a question the ROWS answer, and a newer cycle opened while
+ * this one was in flight is simply the newest open row.
  */
 function markExecuted(
   d: AnchorLoopDeps,
@@ -901,30 +1163,12 @@ function markExecuted(
   const key = rec.idempotencyKey;
   let won = false;
   d.repo.transaction(() => {
-    won = d.anchors.transition(key, row.version, row.state, "executed", {
+    won = d.anchors.transitionAndProject(key, row.version, row.state, "executed", {
       ...(executeTx ? { executeTx } : {}),
-      error: null,
     });
     if (!won) return;
     const fresh = d.repo.findByIdempotencyKey(key);
     if (!fresh) return;
-    // Clear the pending pair ONLY if it still describes THIS version. A newer cycle may have been
-    // opened while this one was in flight, and wiping its hash would blind the monitor's
-    // compromise rule to the amendment that is actually pending.
-    const stillOurs = (fresh.oaManifestPendingVersion ?? row.version) === row.version;
-    d.repo.upsert({
-      ...fresh,
-      oaHash: row.manifestHash,
-      oaManifestVersion: row.version,
-      oaManifestAnchoredHash: row.manifestHash,
-      ...(stillOurs
-        ? {
-            oaManifestPendingHash: null,
-            oaManifestPendingVersion: null,
-            oaAmendmentExecutableAt: null,
-          }
-        : {}),
-    });
     d.repo.recordEvent(
       key,
       "oaAnchored",
@@ -970,16 +1214,108 @@ function park(d: AnchorLoopDeps, row: OaAnchorRecord, error: string): void {
   });
 }
 
-/** Run one chain interaction; a transport failure parks the row instead of propagating. */
+/** Run one chain interaction. A failure never propagates: it is classified and turned into the
+ *  outcome the caller must stop with. */
+interface ChainAttempt<T> {
+  value?: T;
+  /** Present iff the interaction failed — the outcome the caller must return. */
+  stop?: AnchorOutcome;
+}
+
 async function tryChain<T>(
   d: AnchorLoopDeps,
   row: OaAnchorRecord,
   fn: () => Promise<T>,
-): Promise<{ value?: T; parked: boolean }> {
+): Promise<ChainAttempt<T>> {
   try {
-    return { value: await fn(), parked: false };
+    return { value: await fn() };
   } catch (err) {
-    park(d, row, (err as Error).message);
-    return { parked: true };
+    return { stop: classifyChainFailure(d, row, err) };
   }
+}
+
+/**
+ * Two kinds of failure, and treating them alike is how a driver either abandons a healthy
+ * amendment or hides a broken deployment (review F5).
+ *
+ *  - **Transport.** An RPC timeout, a connection reset, a lost receipt. It says NOTHING about
+ *    whether the amendment is going through — the schedule may well be on chain — so it parks
+ *    with a doubling backoff and burns no attempt. Retried forever, deliberately.
+ *  - **A decoded contract revert.** `NotManager`, `NotActive`, `Vetoed`, a custom error: a
+ *    VERDICT, and the same verdict every time until a human changes something. It burns an
+ *    attempt, and a bounded number of them escalates the cycle to the `failed` hold, which pages.
+ *    A legacy agent's LegalManager that still obeys the old EOA is exactly this shape, and left
+ *    to retry it would have retried silently forever.
+ *  - **`TooEarly`** is neither. It is the timelock itself, observed from the chain's clock rather
+ *    than ours, and the only correct response is to come back later.
+ */
+function classifyChainFailure(d: AnchorLoopDeps, row: OaAnchorRecord, err: unknown): AnchorOutcome {
+  const message = (err as Error).message;
+  const revert = decodedRevertName(err);
+  if (revert === undefined) {
+    park(d, row, message);
+    return NOTHING;
+  }
+  if (revert === "TooEarly") {
+    logAnchor(row.entityKey, row.version, row.state, {
+      code: "too_early",
+      reason: "the chain's clock has not reached this amendment's executableAt yet",
+    });
+    return { advanced: false, version: row.version, state: row.state, skipped: "not_due" };
+  }
+  return burnRevert(d, row, revert, message);
+}
+
+/** Burn one attempt for a deterministic revert, and escalate to the hold when they run out. */
+function burnRevert(
+  d: AnchorLoopDeps,
+  row: OaAnchorRecord,
+  revert: string,
+  message: string,
+): AnchorOutcome {
+  const now = (d.now ?? Date.now)();
+  const retryIntervalMs = nextInterval(
+    row.retryIntervalMs ?? undefined,
+    RETRY_BASE_MS,
+    RETRY_CAP_MS,
+  );
+  const error = `${revert ? `${revert}: ` : ""}${message}`;
+  const attempt = d.anchors.parkWithAttempt(row.entityKey, row.version, row.state, {
+    error,
+    nextRetryAt: now + retryIntervalMs,
+    retryIntervalMs,
+  });
+  if (attempt === undefined) return NOTHING; // lost the CAS; the winner owns this cycle
+  logAnchor(row.entityKey, row.version, row.state, {
+    code: "parked",
+    attemptBurned: true,
+    attempt,
+    revert: revert || undefined,
+    retryInMs: retryIntervalMs,
+    reason: error,
+  });
+  if (attempt < MAX_ANCHOR_REVERT_ATTEMPTS) return NOTHING;
+
+  // Out of attempts. NOT a projecting transition, for `recordVeto`'s reason: whatever is on chain
+  // is still on chain, and the pending pair is what the guardian and the monitor read.
+  const held = d.anchors.transition(row.entityKey, row.version, row.state, "failed", {
+    error: `${error} — abandoned after ${attempt} reverted attempts`,
+  });
+  if (!held) return NOTHING;
+  logAnchor(row.entityKey, row.version, "failed", { code: "revert_exhausted", attempt, revert });
+  opsLog("anchor_revert_exhausted", {
+    severity: "CRITICAL",
+    level: "error",
+    entityKey: row.entityKey,
+    version: row.version,
+    attempt,
+    revert: revert || undefined,
+    message:
+      "a manager call for this amendment reverted deterministically until its attempts ran out — the entity's whole anchor pipeline is now HELD until an operator acknowledges it (cli anchor-ack)",
+  });
+  warnOnce("anchor_held", row.entityKey, now, {
+    versions: [row.version],
+    reason: "a cycle is in `failed` and needs an operator acknowledgement before anchoring resumes",
+  });
+  return { advanced: true, version: row.version, state: "failed" };
 }

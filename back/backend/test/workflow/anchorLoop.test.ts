@@ -15,7 +15,8 @@
  */
 import type Database from "better-sqlite3";
 import type { Hex } from "viem";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { MAX_ANCHOR_REVERT_ATTEMPTS } from "../../src/formation/schedule";
 import {
   buildManifestV1,
   manifestDocName,
@@ -38,6 +39,7 @@ import {
   type AnchorLoopDeps,
   advanceAnchor,
   deriveLegalBlock,
+  resetAnchorWarnings,
 } from "../../src/workflow/anchorLoop";
 import {
   COMPANY_ID,
@@ -746,4 +748,437 @@ test("A-24: a filing confirmed with NO filing number does not anchor (and says s
   // the honest one is to wait and warn. (Flagged: fetch-and-advance only writes the number inside
   // the CAS that confirms the step, so a late-arriving number needs the poll to re-confirm.)
   expect(deriveLegalBlock(deps(), entity())).toBeNull();
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// The merge-gate review fixes. Each is named for the finding it protects.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/** The projection columns are a function of the ROWS. Asserted as one invariant, so a test that
+ *  drives the pipeline anywhere can check it without restating the rule (review F2). */
+function expectProjectionMatchesRows(): void {
+  const e = entity();
+  const open = cycles()
+    .filter((c) => c.state === "pending" || c.state === "scheduled")
+    .at(-1);
+  expect(e.oaManifestPendingHash).toBe(open?.manifestHash ?? null);
+  expect(e.oaManifestPendingVersion).toBe(open?.version ?? null);
+  expect(e.oaAmendmentExecutableAt).toBe(
+    open?.state === "scheduled" ? (open.executableAt ?? null) : null,
+  );
+  const anchored = cycles()
+    .filter((c) => c.state === "executed")
+    .at(-1);
+  if (anchored) {
+    expect(e.oaManifestVersion).toBe(anchored.version);
+    expect(e.oaManifestAnchoredHash).toBe(anchored.manifestHash);
+    expect(e.oaHash).toBe(anchored.manifestHash);
+  }
+}
+
+// ── F1: the veto-lift wedge ────────────────────────────────────────────────────────────────
+
+test("F1: a lifted veto RE-SCHEDULES the same version — the stale schedule tx is not a wedge", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const v2Hash = cycle(2)!.manifestHash;
+  expect(cycle(2)!.scheduleTx).toBeTruthy();
+
+  // The guardian cancels: the contract DELETES the schedule and blacklists the hash.
+  chain.veto(v2Hash);
+  await advanceAnchor(deps(), ENTITY_KEY);
+  expect(cycle(2)!.state).toBe("vetoed");
+
+  // …and then lifts it, with NO new facts. There is nothing to supersede v2 with, so v2 itself
+  // has to go back on chain — and it can, because the veto deleted the clock a re-schedule would
+  // otherwise reset.
+  chain.liftVeto(v2Hash);
+  const before = chain.calls.length;
+  const resumed = await advanceAnchor(deps(), ENTITY_KEY);
+  expect(resumed).toMatchObject({ version: 2, state: "scheduled" });
+  expect(chain.state.scheduledAt.get(v2Hash)).toBeDefined();
+  expect(chain.calls.filter((c) => c === `schedule:${v2Hash}`)).toHaveLength(2);
+  expectProjectionMatchesRows();
+
+  // The wedge itself: the resumed pass must not go looking for the OLD schedule's receipt first.
+  // With the stale `schedule_tx` still on the row it did, found it mined, read `scheduledAt == 0`
+  // and parked "refusing to re-broadcast blindly" — forever, on every pass.
+  const after = chain.calls.slice(before);
+  expect(after.indexOf(`schedule:${v2Hash}`)).toBeLessThan(
+    after.findIndex((c) => c.startsWith("receipt:")),
+  );
+});
+
+test("F1: a scheduled cycle the chain has no schedule for is demoted AND loses its stale txs", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const v2Hash = cycle(2)!.manifestHash;
+
+  // The schedule is gone and the hash is neither vetoed nor anchored — a guardian cancel plus a
+  // lift that both happened between two passes, so the loop never saw the veto at all.
+  chain.state.scheduledAt.delete(v2Hash);
+  warpPastDelay();
+
+  const demoted = await advanceAnchor(deps(), ENTITY_KEY);
+  expect(demoted).toMatchObject({ version: 2, state: "pending" });
+  expect(cycle(2)!.scheduleTx).toBeNull();
+  expect(cycle(2)!.executeTx).toBeNull();
+  // The countdown stops being advertised too: there is nothing left to count down to.
+  expect(entity().oaAmendmentExecutableAt).toBeNull();
+  expectProjectionMatchesRows();
+
+  const rescheduled = await advanceAnchor(deps(), ENTITY_KEY);
+  expect(rescheduled).toMatchObject({ version: 2, state: "scheduled" });
+  expect(chain.calls.filter((c) => c === `schedule:${v2Hash}`)).toHaveLength(2);
+});
+
+test("F1: a MINED schedule whose clock is gone is re-broadcast, not parked forever", async () => {
+  seedV1();
+  confirmFiling();
+  // The broadcast lands but the receipt is lost, so the tx hash is persisted and nothing else is.
+  chain.state.scheduleMode = "lost";
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const row = cycle(2)!;
+  expect(row.state).toBe("pending");
+  expect(row.scheduleTx).toBeTruthy();
+  expect(chain.state.scheduledAt.get(row.manifestHash)).toBeUndefined();
+
+  // The tx DID mine; the guardian then cancelled it and lifted the veto. Not vetoed, not the
+  // current anchor, no schedule: the one shape in which re-broadcasting resets nothing.
+  chain.state.scheduleMode = "ok";
+  clock = row.nextRetryAt!;
+  const out = await advanceAnchor(deps(), ENTITY_KEY);
+  expect(out).toMatchObject({ version: 2, state: "scheduled" });
+  expect(cycle(2)!.error).toBeNull();
+  expect(chain.calls.filter((c) => c.startsWith("schedule:"))).toHaveLength(2);
+});
+
+// ── F2: one projection writer ──────────────────────────────────────────────────────────────
+
+test("F2: a supersede with no successor CLEARS the pending pair — no phantom amendment", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const row = cycle(2)!;
+  expect(entity().oaManifestPendingHash).toBe(row.manifestHash);
+
+  // v2 was anchored by something that is not this row, so the cycle is retired and NOTHING
+  // replaces it. The entity used to go on advertising a pending amendment that had ceased to
+  // exist — which the monitor reads as "the hash on chain is not the one we have pending".
+  repo.upsert({
+    ...entity(),
+    oaManifestVersion: 2,
+    oaManifestAnchoredHash: row.manifestHash,
+    oaHash: row.manifestHash,
+  });
+  warpPastDelay();
+  await advanceAnchor(deps(), ENTITY_KEY);
+
+  expect(cycle(2)!.state).toBe("superseded");
+  expect(entity().oaManifestPendingHash).toBeNull();
+  expect(entity().oaManifestPendingVersion).toBeNull();
+  expect(entity().oaAmendmentExecutableAt).toBeNull();
+  // …and the anchored trio is untouched. An entity never un-anchors.
+  expect(entity().oaManifestVersion).toBe(2);
+  expect(entity().oaManifestAnchoredHash).toBe(row.manifestHash);
+});
+
+test("F2: the monotonic gate's supersede clears it too, with no facts left to re-derive", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const row = cycle(2)!;
+
+  db.exec("DELETE FROM documents"); // the reconcile now has nothing to compare
+  repo.upsert({
+    ...entity(),
+    oaManifestVersion: 2,
+    oaManifestAnchoredHash: row.manifestHash,
+    oaHash: row.manifestHash,
+  });
+  warpPastDelay();
+
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ state: "superseded" });
+  expect(entity().oaManifestPendingHash).toBeNull();
+  expect(entity().oaManifestPendingVersion).toBeNull();
+  expect(entity().oaAmendmentExecutableAt).toBeNull();
+});
+
+test("F2: the projection tracks the ROWS at every step of a two-version lifecycle", async () => {
+  seedV1();
+  confirmFiling();
+  expectProjectionMatchesRows();
+  await advanceAnchor(deps(), ENTITY_KEY); // v2 opened + scheduled
+  expectProjectionMatchesRows();
+  warpPastDelay();
+  await advanceAnchor(deps(), ENTITY_KEY); // v2 executed
+  expectProjectionMatchesRows();
+  confirmEin();
+  await advanceAnchor(deps(), ENTITY_KEY); // v3 opened + scheduled
+  expectProjectionMatchesRows();
+  expect(entity().oaManifestPendingVersion).toBe(3);
+  expect(entity().oaManifestVersion).toBe(2);
+  warpPastDelay();
+  await advanceAnchor(deps(), ENTITY_KEY); // v3 executed
+  expectProjectionMatchesRows();
+  expect(entity().oaManifestPendingVersion).toBeNull();
+});
+
+// ── F3: recovery before rehash ─────────────────────────────────────────────────────────────
+
+test("F3: a crash AFTER the execute is recovered even when the manifest is gone", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const v2Hash = cycle(2)!.manifestHash;
+  const v2Bytes = docStore.getBytes(manifestDocName(ENTITY_KEY, 2));
+
+  // The execute landed, the process died before the receipt, and the manifest file was then lost
+  // (a restore that missed it, a half-synced volume). The chain holds v2.
+  chain.state.scheduledAt.delete(v2Hash);
+  chain.state.current = v2Hash;
+  docStore.files.delete(manifestDocName(ENTITY_KEY, 2));
+  warpPastDelay();
+
+  // Recovered, NOT `failed`: re-hashing a version the chain ALREADY HOLDS decides nothing, and
+  // the refusal used to hold the whole pipeline over an amendment that had in fact landed.
+  const out = await advanceAnchor(deps(), ENTITY_KEY);
+  expect(out).toMatchObject({ version: 2, state: "executed" });
+  expect(cycle(2)!.state).toBe("executed");
+  expect(entity().oaManifestVersion).toBe(2);
+  expect(entity().oaManifestAnchoredHash).toBe(v2Hash);
+  expect(entity().oaHash).toBe(v2Hash);
+  expect(entity().oaManifestPendingHash).toBeNull();
+
+  // …and once a human restores the file, the NEXT version chains onto the hash the chain
+  // actually holds — where a `failed` v2 plus an ack would have chained v3 onto v1.
+  docStore.putBytes(manifestDocName(ENTITY_KEY, 2), v2Bytes);
+  confirmEin();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 3, state: "scheduled" });
+  expect(parseManifest(docStore.getBytes(manifestDocName(ENTITY_KEY, 3))).previous).toBe(v2Hash);
+});
+
+// ── F5: deterministic reverts vs transport ─────────────────────────────────────────────────
+
+test("F5: a deterministic revert BURNS attempts and ends in the `failed` hold", async () => {
+  seedV1();
+  confirmFiling();
+  // The shape a legacy agent produces: its LegalManager obeys an EOA the controller is not, so
+  // every relayed amendment comes back `NotManager()` — the same answer, forever.
+  chain.state.revertBroadcast = "NotManager";
+  for (let i = 1; i <= MAX_ANCHOR_REVERT_ATTEMPTS; i++) {
+    await advanceAnchor(deps(), ENTITY_KEY);
+    const row = cycle(2)!;
+    expect(row.attempt).toBe(i);
+    expect(row.error).toMatch(/NotManager/);
+    clock = row.nextRetryAt ?? clock;
+  }
+  expect(cycle(2)!.state).toBe("failed");
+
+  // The hold is the ENTITY's: nothing new is built while a human has not looked at this.
+  confirmEin();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ skipped: "hold_park" });
+  expect(cycles().map((c) => c.version)).toEqual([2]);
+
+  // The operator's ack is the exit, and it clears the phantom pending with it.
+  expect(anchors.acknowledgeHold(ENTITY_KEY, 2)).toBe(true);
+  expect(entity().oaManifestPendingHash).toBeNull();
+  chain.state.revertBroadcast = undefined;
+  expect((await advanceAnchor(deps(), ENTITY_KEY)).version).toBe(3);
+});
+
+test("F5: a TRANSPORT failure never burns an attempt, however often it happens", async () => {
+  seedV1();
+  confirmFiling();
+  for (let i = 0; i < MAX_ANCHOR_REVERT_ATTEMPTS + 2; i++) {
+    chain.state.failNextRead = "legalStatus";
+    await advanceAnchor(deps(), ENTITY_KEY);
+    const row = cycle(2)!;
+    // A lost read is not evidence that anything failed — the schedule may well be on chain.
+    expect(row.attempt).toBe(0);
+    expect(row.state).toBe("pending");
+    clock = row.nextRetryAt!;
+  }
+  chain.state.failNextRead = undefined;
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ state: "scheduled" });
+});
+
+test("F5: `TooEarly` is the timelock, not a failure — no park, no burned attempt", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  // OUR clock says the amendment is due; the CHAIN's block time does not agree yet.
+  clock += 25 * 60 * 60 * 1000;
+
+  const out = await advanceAnchor(deps(), ENTITY_KEY);
+  expect(out).toMatchObject({ version: 2, state: "scheduled", skipped: "not_due" });
+  const row = cycle(2)!;
+  expect(row.attempt).toBe(0);
+  expect(row.nextRetryAt).toBeNull();
+  expect(row.state).toBe("scheduled");
+
+  // …and the moment block time catches up, the same cycle executes.
+  chain.state.nowSeconds = Math.floor(clock / 1000);
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "executed" });
+});
+
+// ── F6/F8/F9: the cheap gates, one history read, one warning ───────────────────────────────
+
+/** Put the formation steps a day in the past, where a real entity's are by the time an anchor
+ *  cycle has been through a timelock. SQLite stamps CURRENT_TIMESTAMP at one-second resolution,
+ *  and the fast path confirms a step and opens its version inside the same second — which the
+ *  gates deliberately read as "the facts may have moved". */
+function stampStepsYesterday(): void {
+  db.prepare(
+    "UPDATE formation_requests SET updated_at = datetime('now','-1 day') WHERE entity_key = ?",
+  ).run(ENTITY_KEY);
+}
+
+/** Count manifest reads. The gates' whole purpose is that a quiet entity causes none. */
+function countingDocStore(): () => number {
+  const original = docStore.getBytes.bind(docStore);
+  let reads = 0;
+  docStore.getBytes = ((name: string) => {
+    reads++;
+    return original(name);
+  }) as typeof docStore.getBytes;
+  return () => reads;
+}
+
+test("F6: a fully anchored entity is dismissed without reading a single manifest", async () => {
+  seedV1();
+  confirmFiling();
+  confirmEin();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  warpPastDelay();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  expect(cycle(2)!.state).toBe("executed");
+  // In production the facts land well before the anchor write that folds them in; SQLite's
+  // one-second stamps make them look simultaneous inside a test, so the steps are stamped where
+  // they would really be.
+  stampStepsYesterday();
+
+  const reads = countingDocStore();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ skipped: "fully_anchored" });
+  expect(reads()).toBe(0);
+});
+
+test("F6: a cycle inside its timelock with no new facts costs no file I/O either", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  stampStepsYesterday();
+
+  const reads = countingDocStore();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({
+    version: 2,
+    state: "scheduled",
+    skipped: "not_due",
+  });
+  expect(reads()).toBe(0);
+  // …but a step that MOVES is re-derived, timelock or not: the scheduled version has to be
+  // superseded the moment the facts it describes stop being the newest ones.
+  confirmEin();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 3, state: "scheduled" });
+  expect(cycle(2)!.state).toBe("superseded");
+});
+
+test("F8: the cycle history is read ONCE per pass, not once per question", async () => {
+  seedV1();
+  confirmFiling();
+  const original = anchors.versionsOf.bind(anchors);
+  let calls = 0;
+  anchors.versionsOf = ((k: string) => {
+    calls++;
+    return original(k);
+  }) as typeof anchors.versionsOf;
+
+  await advanceAnchor(deps(), ENTITY_KEY);
+  expect(calls).toBe(1);
+});
+
+test("F9: a standing hold warns ONCE per entity per day, not once per tick", async () => {
+  resetAnchorWarnings();
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  chain.veto(cycle(2)!.manifestHash);
+  await advanceAnchor(deps(), ENTITY_KEY);
+
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+  try {
+    for (let i = 0; i < 5; i++) {
+      clock = cycle(2)!.nextRetryAt ?? clock;
+      await advanceAnchor(deps(), ENTITY_KEY);
+    }
+  } finally {
+    spy.mockRestore();
+  }
+  expect(lines.filter((l) => l.includes("anchor_held"))).toHaveLength(1);
+
+  // A new day says it again — the condition is still true and nobody has acted on it.
+  clock += 24 * 60 * 60 * 1000;
+  const nextDay: string[] = [];
+  const spy2 = vi.spyOn(console, "log").mockImplementation((m) => nextDay.push(String(m)));
+  try {
+    await advanceAnchor(deps(), ENTITY_KEY);
+  } finally {
+    spy2.mockRestore();
+  }
+  expect(nextDay.filter((l) => l.includes("anchor_held"))).toHaveLength(1);
+});
+
+// ── F11 / F12: one hash-verify path, one warning, and the healed filing number ─────────────
+
+test("F11: both sides of the hash-verify report under ONE event name", async () => {
+  seedV1();
+  confirmFiling();
+  // The READ side: the anchored baseline no longer re-hashes to what we recorded.
+  docStore.files.set(manifestDocName(ENTITY_KEY, 1), Buffer.from("{}\n", "utf8"));
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+  try {
+    await advanceAnchor(deps(), ENTITY_KEY);
+  } finally {
+    spy.mockRestore();
+  }
+  // "The file on disk is not the anchor it claims to be" is ONE fact, whichever side notices it,
+  // and it used to be two event names an operator had to know to grep for.
+  const unverifiable = lines
+    .map((l) => JSON.parse(l))
+    .filter((l) => l.opslog?.startsWith("anchor_"));
+  expect(unverifiable.map((l) => l.opslog)).toEqual(["anchor_manifest_unverifiable"]);
+  expect(unverifiable[0]).toMatchObject({ severity: "CRITICAL", version: 1 });
+  expect(cycles()).toHaveLength(0);
+});
+
+test("F12: a filing number that arrives late unblocks v2 — the refusal is a wait, not a deadlock", async () => {
+  resetAnchorWarnings();
+  seedV1();
+  confirmFiling({ filingNumber: null });
+  // Anchoring a manifest that claims a filing with no filing number would be the dishonest fix.
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ skipped: "no_new_facts" });
+  expect(cycles()).toHaveLength(0);
+
+  // The warning is deduped like every other standing condition (F9) — this used to be one WARN
+  // per entity per tick, forever.
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+  try {
+    for (let i = 0; i < 3; i++) await advanceAnchor(deps(), ENTITY_KEY);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(lines.filter((l) => l.includes("anchor_awaiting_filing_number"))).toHaveLength(0);
+
+  // `advanceFiling` heals the number onto the record on a later poll (F12); the anchor loop then
+  // has both halves and opens v2 on the very next pass.
+  repo.upsert({ ...entity(), formationFilingNumber: "2026-001234567" });
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "scheduled" });
+  expect(parseManifest(docStore.getBytes(manifestDocName(ENTITY_KEY, 2))).legal?.filingNumber).toBe(
+    "2026-001234567",
+  );
 });

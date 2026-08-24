@@ -559,15 +559,20 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       // The manifest v1 hash is now ON CHAIN (createEntity args[7]): pending becomes anchored, in
       // the same transaction as the entity row, so the DB can never claim an anchor the chain
       // does not hold. Legacy-scheme records carry no pending hash and are untouched here.
-      ...(rec.oaManifestPendingHash
+      //
+      // WHERE that promotion is written depends on whether an anchor store is wired. With one —
+      // every real composition root — it is `transitionAndProject` below, the single writer of the
+      // five projection columns (review F2): they are a projection of `oa_anchors`, and a second
+      // hand writing them here is how the two stores learn to disagree. Without one there are no
+      // rows to project from, so this record IS the only statement of the anchor.
+      ...(anchoredV1 && !d.anchors
         ? {
             oaManifestVersion: OA_MANIFEST_VERSION_V1,
-            oaManifestAnchoredHash: rec.oaManifestPendingHash,
+            oaManifestAnchoredHash: anchoredV1,
             oaManifestPendingHash: null,
           }
         : {}),
     };
-    rec = created;
     // Atomic: the entity row, its audit event and the v1 anchor row commit together (or roll
     // back together).
     d.repo.transaction(() => {
@@ -596,11 +601,16 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       // from ever disagreeing about what the chain holds.
       if (anchoredV1 && d.anchors) {
         d.anchors.claimVersion(key, OA_MANIFEST_VERSION_V1, anchoredV1);
-        d.anchors.transition(key, OA_MANIFEST_VERSION_V1, "pending", "executed", {
+        // …and the projection moves with it: `oa_manifest_version`, `oa_manifest_anchored_hash`
+        // and the cleared pending hash are recomputed from the row that was just written.
+        d.anchors.transitionAndProject(key, OA_MANIFEST_VERSION_V1, "pending", "executed", {
           executeTx: res.txHash,
         });
       }
     });
+    // Re-read: the projection was written by the repo, inside the transaction, and the rest of
+    // the saga carries this record forward.
+    rec = d.repo.findByIdempotencyKey(key) ?? created;
   }
 
   // ── Step 5: bind wallet (operator signs, manager sends). Skip if already bound/funded.

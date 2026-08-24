@@ -329,6 +329,13 @@ test("A-int-2: a real guardian veto parks the pipeline; liftVeto resumes it", as
   });
   await pub.waitForTransactionReceipt({ hash: liftTx });
 
+  // The lift is observed on the vetoed row's next SCHEDULED re-check, not on the very next pass
+  // (review F6): a held entity is a permanent member of the sweeper's due set, and one
+  // `vetoed(hash)` eth_call per entity per tick buys nothing against a human action. The wait is
+  // capped at VETO_RECHECK_CAP_MS precisely so a guardian who has just acted sees movement.
+  expect(await advanceAnchor(deps(), key)).toMatchObject({ skipped: "hold_park" });
+  clock = anchors.find(key, 2)!.nextRetryAt!;
+
   const resumed = await advanceAnchor(deps(), key);
   expect(resumed).toMatchObject({ version: 3, state: "scheduled" });
   expect(anchors.find(key, 2)!.state).toBe("superseded");
