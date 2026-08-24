@@ -14,6 +14,7 @@ import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { JobsReputationCard } from "@/components/agents/JobsReputationCard";
 import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
+import { FormationCard } from "@/components/agents/FormationCard";
 import { Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
 
@@ -251,7 +252,11 @@ export function AgentDashboard({
               // documents, chain identity — so it is an "anchor" and its version is part of its
               // name. For a legacy row it commits to the operating-agreement document alone, and
               // calling that an anchor would overstate what is on chain.
-              <OnChainRow label={oaAnchorLabel(entity)} value={`${entity.oaHash.slice(0, 14)}…`} />
+              <OnChainRow
+                label={oaAnchorLabel(entity)}
+                value={`${entity.oaHash.slice(0, 14)}…`}
+                chip={pendingAnchorChip(entity)}
+              />
             )}
           </dl>
           <div className="mt-4 flex flex-wrap gap-3">
@@ -311,6 +316,12 @@ export function AgentDashboard({
         </div>
 
         <div className="flex flex-col gap-6">
+          {/* Only for entities that HAVE a formation block: a legacy or stub row has none,
+              forever, and a "not formed" card would describe an absence as a stage. */}
+          {entity?.formation && (
+            <FormationCard entityId={entityId} formation={entity.formation} />
+          )}
+
           <Card className="p-5">
             <div className="flex items-center justify-between">
               <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">Active rules</div>
@@ -527,6 +538,30 @@ function oaAnchorLabel(entity: Pick<EntityView, "oaAnchor">): string {
   return anchor.version != null ? `OA anchor (v${anchor.version})` : "OA anchor (pending)";
 }
 
+/**
+ * "update pending (vN)" beside the anchored hash.
+ *
+ * A pending amendment is a change to what the entity commits to, waiting out a timelock the
+ * guardian can veto — so the dashboard says so where the anchor is shown, rather than leaving it
+ * to whoever opens Settings. Deliberately NOT rendered for a v1 that has simply not confirmed yet
+ * (`version == null`): that is the first anchor arriving, not an update to an existing one.
+ */
+function pendingAnchorChip(entity: Pick<EntityView, "oaAnchor">): ReactNode {
+  const anchor = entity.oaAnchor;
+  if (!anchor || anchor.scheme !== "manifest") return null;
+  if (!anchor.pendingHash || anchor.version == null) return null;
+  const version = anchor.pendingVersion ?? anchor.version + 1;
+  return (
+    <span
+      title="A new version of this entity's anchor is scheduled behind the guardian timelock. Review or veto it in Settings."
+      className="inline-flex items-center gap-1.5 rounded-full border border-[#febc2e]/40 bg-[#febc2e]/10 px-2 py-0.5 text-[10.5px] font-normal text-[#f3cd72]"
+    >
+      <span aria-hidden className="h-1 w-1 rounded-full bg-[#febc2e]" />
+      update pending (v{version})
+    </span>
+  );
+}
+
 function EnsGlobe({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 24 24" fill="none" className={className} aria-hidden>
@@ -537,11 +572,21 @@ function EnsGlobe({ className }: { className?: string }) {
   );
 }
 
-function OnChainRow({ label, value, href }: { label: string; value: string; href?: string }) {
+function OnChainRow({
+  label,
+  value,
+  href,
+  chip,
+}: {
+  label: string;
+  value: string;
+  href?: string;
+  chip?: ReactNode;
+}) {
   return (
     <div>
       <dt className="text-muted-2">{label}</dt>
-      <dd className="mt-0.5 font-mono text-ink">
+      <dd className="mt-0.5 flex flex-wrap items-center gap-2 font-mono text-ink">
         {href ? (
           <a href={href} target="_blank" rel="noreferrer" className="hover:text-accent-soft">
             {value}
@@ -549,6 +594,7 @@ function OnChainRow({ label, value, href }: { label: string; value: string; href
         ) : (
           value
         )}
+        {chip}
       </dd>
     </div>
   );

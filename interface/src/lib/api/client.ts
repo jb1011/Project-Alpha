@@ -362,7 +362,7 @@ export async function downloadDocument(
   token: string,
   id: string,
   docId: string,
-): Promise<Blob> {
+): Promise<{ blob: Blob; filename: string | null }> {
   const res = await fetch(
     `${API_URL}/entities/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`,
     { headers: { authorization: `Bearer ${token}` } },
@@ -378,5 +378,29 @@ export async function downloadDocument(
       message: `expected a PDF, got "${contentType || "(none)"}"`,
     });
   }
-  return blob;
+  return {
+    blob,
+    filename: parseAttachmentFilename(res.headers.get("content-disposition")),
+  };
+}
+
+/**
+ * The download's filename, from `Content-Disposition`, or null.
+ *
+ * The backend derives this name from the document TYPE and never echoes a provider-supplied
+ * string, so it arrives safe. It is re-sanitized here anyway because it has crossed a proxy by
+ * the time we read it, and it is about to become the `download` attribute of an anchor: anything
+ * with a path separator, a control character or a non-PDF extension is discarded in favour of the
+ * caller's own name rather than trusted.
+ */
+function parseAttachmentFilename(header: string | null): string | null {
+  if (!header) return null;
+  const match = /filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;]+)/i.exec(header);
+  const raw = (match?.[1] ?? match?.[2] ?? "").trim();
+  if (!raw) return null;
+  // Basename only — a "directory/../name.pdf" never becomes a path.
+  const base = raw.split(/[/\\]/).pop() ?? "";
+  if (!/^[A-Za-z0-9._-]{1,128}\.pdf$/.test(base)) return null;
+  if (base.includes("..")) return null;
+  return base;
 }
