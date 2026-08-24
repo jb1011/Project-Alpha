@@ -11,6 +11,7 @@ import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
 import { shortenErr } from "@/lib/errors";
+import { oaAnchorLabel, pendingAnchorLabel } from "@/lib/oaAnchor";
 import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { JobsReputationCard } from "@/components/agents/JobsReputationCard";
@@ -520,40 +521,18 @@ function ensName(entity: { metadataURI: string | null }): string | null {
   return label ? `${label.toLowerCase()}.${ENS_PARENT_NAME}` : null;
 }
 
-/**
- * How to NAME the on-chain OA hash row.
- *
- * The scheme comes from the backend (`oaAnchor.scheme`), never from guessing at a version
- * number: a manifest entity whose v1 has not confirmed yet has a null version, and calling that
- * "OA hash" would describe a bundle anchor as a plain document hash. An absent `oaAnchor` means
- * a backend that predates the field, which is the legacy shape by definition.
- */
-function oaAnchorLabel(entity: Pick<EntityView, "oaAnchor">): string {
-  const anchor = entity.oaAnchor;
-  if (!anchor || anchor.scheme === "legacy") return "OA hash";
-  return anchor.version != null ? `OA anchor (v${anchor.version})` : "OA anchor (pending)";
-}
-
-/**
- * "update pending (vN)" beside the anchored hash.
- *
- * A pending amendment is a change to what the entity commits to, waiting out a timelock the
- * guardian can veto — so the dashboard says so where the anchor is shown, rather than leaving it
- * to whoever opens Settings. Deliberately NOT rendered for a v1 that has simply not confirmed yet
- * (`version == null`): that is the first anchor arriving, not an update to an existing one.
- */
+/** The chip beside the anchored hash. Its TEXT — including whether a version number can honestly
+ *  be named at all — is decided in `lib/oaAnchor.ts`, where it is tested. */
 function pendingAnchorChip(entity: Pick<EntityView, "oaAnchor">): ReactNode {
-  const anchor = entity.oaAnchor;
-  if (!anchor || anchor.scheme !== "manifest") return null;
-  if (!anchor.pendingHash || anchor.version == null) return null;
-  const version = anchor.pendingVersion ?? anchor.version + 1;
+  const label = pendingAnchorLabel(entity);
+  if (!label) return null;
   return (
     <AmberPill
       size="sm"
       className="font-normal"
       title="A new version of this entity's anchor is scheduled behind the guardian timelock. Review or veto it in Settings."
     >
-      update pending (v{version})
+      {label}
     </AmberPill>
   );
 }

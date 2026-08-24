@@ -6,7 +6,12 @@ import {
   formationEnvironmentOf,
   type FormationEnvironment,
 } from "@/lib/api/formationEnvironment";
-import type { EntityView, FormationDocument } from "@/lib/api/types";
+import {
+  isKnownFormationStatus,
+  type EntityView,
+  type FormationDocument,
+  type FormationStatus,
+} from "@/lib/api/types";
 import { formatDate } from "@/lib/format";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { AmberPill, Card, SectionTitle, Spinner, cx } from "@/components/onboarding/primitives";
@@ -185,15 +190,26 @@ function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
 }
 
 /** Amber for everything that is not a CONFIRMED real filing — never the confirmed colour,
- *  whatever the sub-status says, and never for an environment we could not read. */
-function statusTone(status: Formation["status"], environment: FormationEnvironment): string {
+ *  whatever the sub-status says, never for an environment we could not read, and never for a
+ *  status this build has never heard of. */
+function statusTone(status: FormationStatus, environment: FormationEnvironment): string {
   if (status === "failed") return "text-[#ff8a84]";
-  if (environment !== "production") return "text-[#f3cd72]";
+  if (environment !== "production" || !isKnownFormationStatus(status)) return "text-[#f3cd72]";
   if (status === "filed" || status === "complete") return "text-emerald-300";
   return "text-muted";
 }
 
-function statusHeadline(status: Formation["status"], environment: FormationEnvironment): string {
+/**
+ * The status line, with a DEFAULT branch.
+ *
+ * The switches below are exhaustive over the union this build compiled against, which is not the
+ * same thing as exhaustive over what the backend sends: the backend derives this status in
+ * `src/formation/status.ts`, deploys independently of the interface, and there is a window after
+ * every backend release where a new state arrives that this bundle has never heard of. Without a
+ * default the function returned `undefined` and the card rendered a blank line where the legal
+ * status of a company should be — silence being the worst possible answer to "is this filed?".
+ */
+function statusHeadline(status: FormationStatus, environment: FormationEnvironment): string {
   const demo = environment === "sandbox";
   const real = environment === "production";
   switch (status) {
@@ -217,10 +233,12 @@ function statusHeadline(status: Formation["status"], environment: FormationEnvir
           : "Complete";
     case "failed":
       return "Filing failed";
+    default:
+      return "Unknown state — contact the operator";
   }
 }
 
-function statusDetail(status: Formation["status"], environment: FormationEnvironment): string {
+function statusDetail(status: FormationStatus, environment: FormationEnvironment): string {
   if (environment === "sandbox") {
     return "This deployment files in the provider's sandbox. No state register was touched, the documents are demo documents, and the EIN is not a tax identifier.";
   }
@@ -238,6 +256,8 @@ function statusDetail(status: Formation["status"], environment: FormationEnviron
       return "The company is filed and the IRS has issued its EIN. No further legal fact follows.";
     case "failed":
       return "Nothing was filed and the step that would have filed it is in error. Contact the operator.";
+    default:
+      return "This deployment reported a formation state this page does not recognise, so nothing here describes what it means. The operator can say what it is.";
   }
 }
 
