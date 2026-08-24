@@ -1,6 +1,9 @@
 export type Phase =
   | "welcome"
   | "guardian"
+  /** The responsible natural person a real filing names (design §3/§8). Present only where the
+   *  deployment can actually form entities — see `visiblePhases`. */
+  | "legal-identity"
   | "custody"
   | "configure"
   | "agreement"
@@ -20,7 +23,7 @@ export type AllowlistEntry = {
   address: string;
 };
 
-import type { EntityView, GuardianPasskey } from "@/lib/api/types";
+import type { EntityView, FormationPartyInput, GuardianPasskey } from "@/lib/api/types";
 
 export type AgentConfig = {
   name: string;
@@ -45,6 +48,13 @@ export type OnboardingSession = {
   idempotencyKey: string | null;
   entity: EntityView | null;
   guardianPasskey: GuardianPasskey | null;
+  /** The OPAQUE handle `POST /formation-party` returned — never the identity behind it. This is
+   *  the only thing the legal-identity phase leaves in wizard state, and the only formation datum
+   *  the persistence allowlist carries. */
+  partyId: string | null;
+  /** Whether that handle is the labeled sandbox fixture rather than a real person. Kept so the
+   *  wizard can keep saying "demo" after a reload instead of quietly promoting it. */
+  partySynthetic: boolean;
 };
 
 export const emptySession = (): OnboardingSession => ({
@@ -52,18 +62,53 @@ export const emptySession = (): OnboardingSession => ({
   idempotencyKey: null,
   entity: null,
   guardianPasskey: null,
+  partyId: null,
+  partySynthetic: false,
 });
 
-export const PHASES: { id: Phase; n: string; label: string }[] = [
-  { id: "welcome", n: "1", label: "Wallet & passkey" },
-  { id: "guardian", n: "2", label: "Accountable human" },
-  { id: "custody", n: "3", label: "Key custody" },
-  { id: "configure", n: "4", label: "Define agent" },
-  { id: "agreement", n: "5", label: "Operating agreement" },
-  { id: "deploy", n: "6", label: "Deploy on-chain" },
-  { id: "fund", n: "7", label: "Fund treasury" },
-  { id: "dashboard", n: "8", label: "Live" },
+export type PhaseMeta = { id: Phase; label: string };
+
+/**
+ * Every phase the wizard can show, in order.
+ *
+ * The step NUMBER is deliberately not stored here: `legal-identity` is present on some
+ * deployments and absent on others, so a hardcoded "3" on the custody step would be wrong on
+ * exactly half of them. Numbers are derived from the VISIBLE list at render time
+ * (`screenLabel`), which is the only list that knows.
+ */
+export const PHASES: PhaseMeta[] = [
+  { id: "welcome", label: "Wallet & passkey" },
+  { id: "guardian", label: "Accountable human" },
+  { id: "legal-identity", label: "Legal identity" },
+  { id: "custody", label: "Key custody" },
+  { id: "configure", label: "Define agent" },
+  { id: "agreement", label: "Operating agreement" },
+  { id: "deploy", label: "Deploy on-chain" },
+  { id: "fund", label: "Fund treasury" },
+  { id: "dashboard", label: "Live" },
 ];
+
+/**
+ * The phases THIS deployment has.
+ *
+ * `formationAvailable` comes from `GET /config`, and anything other than an explicit `true`
+ * hides the phase — a backend that predates the field forms nothing, which is exactly what
+ * absent should mean, and a deployment we cannot ask must not be shown a step whose only
+ * endpoint would answer 503.
+ */
+export function visiblePhases(formationAvailable: boolean): PhaseMeta[] {
+  return formationAvailable ? PHASES : PHASES.filter((p) => p.id !== "legal-identity");
+}
+
+export function indexIn(phases: PhaseMeta[], phase: Phase): number {
+  return phases.findIndex((p) => p.id === phase);
+}
+
+/** The "Screen N" eyebrow, counted over the phases this deployment actually shows. */
+export function screenLabel(phases: PhaseMeta[], phase: Phase): string {
+  const i = indexIn(phases, phase);
+  return `Screen ${i < 0 ? 1 : i + 1}`;
+}
 
 export const emptyConfig = (): AgentConfig => ({
   name: "",
@@ -135,6 +180,119 @@ export function validateConfig(config: AgentConfig): FieldErrors {
 
 export function isConfigValid(config: AgentConfig): boolean {
   return Object.keys(validateConfig(config)).length === 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* The PII slice — separate from AgentConfig, and separate on purpose  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The responsible natural person's legal identity, as the form holds it (design §3, audit 16/L8).
+ *
+ * **This is NOT part of `AgentConfig`, and that is the whole point.** `AgentConfig` is persisted
+ * to localStorage and translated into the `AgentSpec` the backend stores verbatim; anything that
+ * lived on it would follow it into both. This type lives in its own slice, held only in wizard
+ * memory, cleared the moment the backend hands back a handle, and named nowhere in the
+ * persistence allowlist (`lib/onboarding/storage.ts`).
+ *
+ * Flat rather than nested because a form binds to flat fields; `toFormationPartyInput` builds the
+ * nested wire shape the backend's `.strict()` schema expects.
+ */
+export type FormationParty = {
+  legalFirstName: string;
+  legalLastName: string;
+  email: string;
+  /** REQUIRED. doola refuses a company create whose responsible party has no phone, so a party
+   *  without one is an identity that can never be filed — the backend refuses it at intake. */
+  phone: string;
+  line1: string;
+  line2: string;
+  city: string;
+  /** US: the 2-letter state. Blank for the countries that have no state/province. */
+  region: string;
+  postalCode: string;
+  /** ISO-3166-1 **alpha-3** ("USA", "FRA") — doola's convention, not alpha-2. */
+  country: string;
+};
+
+export const emptyParty = (): FormationParty => ({
+  legalFirstName: "",
+  legalLastName: "",
+  email: "",
+  phone: "",
+  line1: "",
+  line2: "",
+  city: "",
+  region: "",
+  postalCode: "",
+  country: "",
+});
+
+export type PartyFieldErrors = Partial<Record<keyof FormationParty, string>>;
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const ISO3_RE = /^[A-Za-z]{3}$/;
+const US_STATE_RE = /^[A-Za-z]{2}$/;
+
+/**
+ * The PII slice's OWN validator, mirroring the backend's `FormationPartySchema` field for field.
+ *
+ * Separate from `validateConfig` for the same reason the types are separate: one function
+ * validating both would have to be handed both, and the PII would be one refactor away from the
+ * object that gets persisted. Client-side validation is a courtesy either way — the backend
+ * schema is the authority, and it is `.strict()`.
+ */
+export function validateParty(party: FormationParty): PartyFieldErrors {
+  const errors: PartyFieldErrors = {};
+
+  if (!party.legalFirstName.trim()) errors.legalFirstName = "Enter the legal first name.";
+  if (!party.legalLastName.trim()) errors.legalLastName = "Enter the legal last name.";
+  if (!EMAIL_RE.test(party.email.trim())) errors.email = "Enter a valid email address.";
+  // Not "optional but recommended": a filing without it is refused, so the wizard refuses first.
+  if (!party.phone.trim()) errors.phone = "A phone number is required — a filing without one is refused.";
+  if (!party.line1.trim()) errors.line1 = "Enter the street address.";
+  if (!party.city.trim()) errors.city = "Enter the city.";
+  if (!party.postalCode.trim()) errors.postalCode = "Enter the postal code.";
+
+  const country = party.country.trim().toUpperCase();
+  if (!ISO3_RE.test(country)) {
+    errors.country = "Choose a country (ISO-3166-1 alpha-3, e.g. USA).";
+  } else if (country === "USA" && !US_STATE_RE.test(party.region.trim())) {
+    // Only the US: most countries have no state/province at all, and demanding one there would
+    // invent a field the filing does not have.
+    errors.region = "A US filing needs the 2-letter state, e.g. WY.";
+  }
+
+  return errors;
+}
+
+export function isPartyValid(party: FormationParty): boolean {
+  return Object.keys(validateParty(party)).length === 0;
+}
+
+/**
+ * The wire shape, built once at the edge.
+ *
+ * Blank optionals are OMITTED rather than sent empty: the backend address schema is `.strict()`
+ * with `min(1)` on `line2`/`region`, so an empty string is a 400 while an absent key is correct.
+ */
+export function toFormationPartyInput(party: FormationParty): FormationPartyInput {
+  const line2 = party.line2.trim();
+  const region = party.region.trim();
+  return {
+    legalFirstName: party.legalFirstName.trim(),
+    legalLastName: party.legalLastName.trim(),
+    email: party.email.trim(),
+    phone: party.phone.trim(),
+    address: {
+      line1: party.line1.trim(),
+      ...(line2 ? { line2 } : {}),
+      city: party.city.trim(),
+      ...(region ? { region } : {}),
+      postalCode: party.postalCode.trim(),
+      country: party.country.trim().toUpperCase(),
+    },
+  };
 }
 
 export function formatUsdc(value: string | number): string {

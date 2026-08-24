@@ -4,6 +4,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
   useState,
   useSyncExternalStore,
   type ReactNode,
@@ -13,13 +14,20 @@ import { useRouter, useSearchParams } from "next/navigation";
 import {
   AgentConfig,
   emptyConfig,
+  emptyParty,
   emptySession,
+  FormationParty,
+  indexIn,
   OnboardingSession,
   Phase,
   PHASES,
+  screenLabel,
+  visiblePhases,
 } from "./types";
 import type { EntityView } from "@/lib/api/types";
+import { usePublicConfigQuery } from "@/lib/api/hooks";
 import {
+  buildPersistedOnboarding,
   clearOnboardingStorage,
   isOnboardingComplete,
   ONBOARDING_STORAGE_KEY,
@@ -28,6 +36,7 @@ import {
 } from "@/lib/onboarding/storage";
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { GuardianStep } from "./steps/GuardianStep";
+import { LegalIdentityStep } from "./steps/LegalIdentityStep";
 import { CustodyStep } from "./steps/CustodyStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
@@ -49,7 +58,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const wantsNewAgent = searchParams.get("new") === "1";
-  const [phase, setPhase] = useState<Phase>(() => {
+  const [storedPhase, setPhase] = useState<Phase>(() => {
     if (wantsNewAgent) return "welcome";
     return initial?.phase && phaseIndex(initial.phase) > 0 ? initial.phase : "welcome";
   });
@@ -69,6 +78,47 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const [resumed, setResumed] = useState(
     () => !wantsNewAgent && !!(initial?.phase && phaseIndex(initial.phase) > 0),
   );
+  /**
+   * The PII slice (design §3, audit 16/L8).
+   *
+   * Deliberately its own piece of state, beside `config` rather than inside it: `config` is what
+   * gets persisted and what becomes the AgentSpec, and a legal name that lived on it would follow
+   * it into both. Nothing here is ever written to storage — the persistence allowlist does not
+   * name a single field of it — and the flow clears it the moment the backend returns a handle.
+   */
+  const [party, setParty] = useState<FormationParty>(emptyParty);
+
+  // Which phases this deployment HAS. Anything other than an explicit `true` hides the
+  // legal-identity step: a backend that predates the field forms nothing, and a deployment we
+  // could not ask must not be shown a step whose only endpoint would answer 503.
+  const { data: publicConfig } = usePublicConfigQuery();
+  const formationAvailable = publicConfig?.formationAvailable === true;
+  const formationRequired = publicConfig?.formationRequired === true;
+  const phases = useMemo(() => visiblePhases(formationAvailable), [formationAvailable]);
+
+  /**
+   * Past the legal-identity step with no party handle, on a deployment that REQUIRES one → the
+   * wizard shows that step again.
+   *
+   * The passkey precedent: a restored session that lost the credential a step produces re-does
+   * that step, explicitly, rather than carrying the user to a submit that will be refused. It
+   * corrects a race too (a fast click while `GET /config` is still in flight), which is strictly
+   * safer than a restore-only check.
+   *
+   * DERIVED during render rather than corrected by an effect — an effect that called `goTo` would
+   * paint the wrong screen first and cascade a second render to fix it.
+   *
+   * NEVER once the entity exists: by `deploy` the handle has already been consumed by /onboard,
+   * and sending the user back to collect another one would be nonsense.
+   */
+  const phase: Phase =
+    formationRequired &&
+    !session.partyId &&
+    !session.entityId &&
+    storedPhase !== "dashboard" &&
+    indexIn(phases, storedPhase) > indexIn(phases, "legal-identity")
+      ? "legal-identity"
+      : storedPhase;
 
   const goTo = useCallback((next: Phase) => {
     setPhase(next);
@@ -82,6 +132,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     clearOnboardingStorage();
     setConfig(emptyConfig());
     setSession(emptySession());
+    setParty(emptyParty());
     setDone({});
     setResumed(false);
     goTo("welcome");
@@ -114,12 +165,9 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   }, [phase, session.entityId, session.entity?.id, router]);
 
   useEffect(() => {
-    const data: Persisted = {
-      phase,
-      config,
-      done,
-      session: { ...session, guardianPasskey: null },
-    };
+    // An ALLOWLIST, not a spread with one field nulled (audit 16/L8): the wizard now holds
+    // personal data, and a denylist fails open on the next field somebody forgets.
+    const data: Persisted = buildPersistedOnboarding({ phase, config, done, session });
     try {
       window.localStorage.setItem(ONBOARDING_STORAGE_KEY, JSON.stringify(data));
     } catch {
@@ -135,7 +183,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     [goTo],
   );
 
-  const idx = phaseIndex(phase);
+  const idx = indexIn(phases, phase);
 
   const finishOnboarding = useCallback(() => {
     const id = session.entityId ?? session.entity?.id;
@@ -163,7 +211,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
           </div>
           <div className="flex items-center gap-2">
             <span className="hidden text-[12px] text-muted-2 sm:inline">
-              Step {idx + 1} of {PHASES.length - 1}
+              Step {idx + 1} of {phases.length - 1}
             </span>
             <Link
               href="/"
@@ -187,11 +235,12 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
       <main className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
         <div className="lg:sticky lg:top-24 lg:self-start">
           <Stepper
+            phases={phases}
             current={phase}
             done={done}
             onJump={(p) => {
               if (p === "dashboard") return;
-              if (done[p] || phaseIndex(p) < idx) goTo(p);
+              if (done[p] || indexIn(phases, p) < idx) goTo(p);
             }}
           />
         </div>
@@ -222,19 +271,45 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
             {phase === "guardian" && (
               <GuardianStep
                 onBack={() => goTo("welcome")}
-                onComplete={() => completePhase("guardian", "custody")}
+                onComplete={() =>
+                  // The step AFTER guardian is deployment-dependent: legal-identity where the box
+                  // can form entities, custody where it can't.
+                  completePhase("guardian", formationAvailable ? "legal-identity" : "custody")
+                }
+              />
+            )}
+            {phase === "legal-identity" && (
+              <LegalIdentityStep
+                eyebrow={screenLabel(phases, "legal-identity")}
+                party={party}
+                onParty={setParty}
+                partyId={session.partyId}
+                synthetic={session.partySynthetic}
+                onCreated={(partyId, synthetic) => {
+                  setSession((s) => ({ ...s, partyId, partySynthetic: synthetic }));
+                  // Belt and braces on top of the allowlist: once the backend holds the identity
+                  // and has issued a handle, there is no reason for this browser to keep a copy
+                  // of it in memory either.
+                  setParty(emptyParty());
+                  completePhase("legal-identity", "custody");
+                }}
+                onClear={() => setSession((s) => ({ ...s, partyId: null, partySynthetic: false }))}
+                onBack={() => goTo("guardian")}
+                onComplete={() => completePhase("legal-identity", "custody")}
               />
             )}
             {phase === "custody" && (
               <CustodyStep
+                eyebrow={screenLabel(phases, "custody")}
                 config={config}
                 onChange={setConfig}
-                onBack={() => goTo("guardian")}
+                onBack={() => goTo(formationAvailable ? "legal-identity" : "guardian")}
                 onComplete={() => completePhase("custody", "configure")}
               />
             )}
             {phase === "configure" && (
               <ConfigureStep
+                eyebrow={screenLabel(phases, "configure")}
                 config={config}
                 onChange={setConfig}
                 onBack={() => goTo("custody")}
@@ -243,9 +318,11 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
             )}
             {phase === "agreement" && (
               <AgreementStep
+                eyebrow={screenLabel(phases, "agreement")}
                 config={config}
                 guardianPasskey={session.guardianPasskey}
                 idempotencyKey={session.idempotencyKey}
+                partyId={session.partyId}
                 onBack={() => goTo("configure")}
                 onSubmitted={(entityId, idempotencyKey) => {
                   setSession((s) => ({
@@ -259,6 +336,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
             )}
             {phase === "deploy" && (
               <DeployStep
+                eyebrow={screenLabel(phases, "deploy")}
                 entityId={session.entityId}
                 config={config}
                 onEntity={handleEntityUpdate}
@@ -267,6 +345,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
             )}
             {phase === "fund" && (
               <FundStep
+                eyebrow={screenLabel(phases, "fund")}
                 config={config}
                 entityId={session.entityId}
                 entity={session.entity}

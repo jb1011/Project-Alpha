@@ -28,6 +28,8 @@ import {
 import { useAgentSchemaQuery } from "@/lib/api/hooks";
 
 type Props = {
+  /** "Screen N" — counted over the phases THIS deployment shows. */
+  eyebrow: string;
   config: AgentConfig;
   onChange: (next: AgentConfig) => void;
   onBack: () => void;
@@ -47,7 +49,7 @@ function newAllowlistEntry(): AllowlistEntry {
   return { id, label: "", address: "" };
 }
 
-export function ConfigureStep({ config, onChange, onBack, onComplete }: Props) {
+export function ConfigureStep({ eyebrow, config, onChange, onBack, onComplete }: Props) {
   const errors = validateConfig(config);
   const valid = isConfigValid(config);
 
@@ -62,7 +64,7 @@ export function ConfigureStep({ config, onChange, onBack, onComplete }: Props) {
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 4"
+        eyebrow={eyebrow}
         title="Define your agent"
         intro="Set the identity and the rules — spending caps, allowed recipients, and timelocks. The result is a policy your agent can never exceed on its own."
       />

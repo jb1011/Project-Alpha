@@ -18,17 +18,24 @@ import {
 } from "../primitives";
 
 type Props = {
+  /** "Screen N" — counted over the phases THIS deployment shows. */
+  eyebrow: string;
   config: AgentConfig;
   guardianPasskey: GuardianPasskey | null;
   idempotencyKey: string | null;
+  /** The opaque formation-party handle, when the legal-identity step produced one. Never the
+   *  identity — that is gone from this browser by the time the wizard reaches here. */
+  partyId: string | null;
   onBack: () => void;
   onSubmitted: (entityId: string, idempotencyKey: string) => void;
 };
 
 export function AgreementStep({
+  eyebrow,
   config,
   guardianPasskey,
   idempotencyKey,
+  partyId,
   onBack,
   onSubmitted,
 }: Props) {
@@ -70,6 +77,9 @@ export function AgreementStep({
         guardianPasskey,
         idempotencyKey: key,
         custody: config.custody,
+        // The HANDLE, never the identity: `spec` is persisted verbatim by the backend, and PII
+        // that entered it would land in a column every read path touches.
+        partyId: partyId ?? undefined,
       });
       onSubmitted(id, key);
     } catch (e) {
@@ -80,7 +90,7 @@ export function AgreementStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 5"
+        eyebrow={eyebrow}
         title="Review your operating agreement"
         intro="The backend will translate these rules into an LLC operating agreement and bind them to the on-chain policy when you confirm."
       />

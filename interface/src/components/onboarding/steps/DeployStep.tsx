@@ -74,11 +74,14 @@ function stepUiStatus(stepIdx: number, entity: EntityView | null): UiStatus {
 }
 
 export function DeployStep({
+  eyebrow,
   entityId,
   config,
   onEntity,
   onComplete,
 }: {
+  /** "Screen N" — counted over the phases THIS deployment shows. */
+  eyebrow: string;
   entityId: string | null;
   config: AgentConfig;
   onEntity: (entity: EntityView) => void;
@@ -162,7 +165,7 @@ export function DeployStep({
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 6"
+        eyebrow={eyebrow}
         title="Deploying on-chain"
         intro="The backend is provisioning keys, registering identity, deploying contracts, and binding the agent wallet. This usually takes a few minutes."
       />

@@ -6,6 +6,9 @@ import type { AgentConfig, Custody } from "../types";
 import { Button, Callout, CheckIcon, StepHeader, cx } from "../primitives";
 
 type Props = {
+  /** "Screen N" — counted over the phases THIS deployment shows, so it stays right whether or
+   *  not the legal-identity step exists here. */
+  eyebrow: string;
   config: AgentConfig;
   onChange: (config: AgentConfig) => void;
   onBack: () => void;
@@ -56,7 +59,7 @@ const OPTIONS: {
   },
 ];
 
-export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
+export function CustodyStep({ eyebrow, config, onChange, onBack, onComplete }: Props) {
   const { data: publicConfig, isError } = usePublicConfigQuery();
   // Availability per option; null = unknown (loading/error → fail open, the backend gate is the
   // backstop). An absent turnkey field = a backend predating per-provider gating, which always
@@ -80,7 +83,7 @@ export function CustodyStep({ config, onChange, onBack, onComplete }: Props) {
   return (
     <div>
       <StepHeader
-        eyebrow="Screen 3"
+        eyebrow={eyebrow}
         title="Choose who holds the agent's operating keys"
         intro="This sets the custody of the agent's operator key — the key that moves funds inside your rules. Your wallet remains the on-chain guardian with full override powers on both options."
       />

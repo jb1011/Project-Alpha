@@ -1,16 +1,19 @@
 "use client";
 
-import { Phase, PHASES } from "./types";
+import { Phase, PhaseMeta } from "./types";
 import { CheckIcon, cx } from "./primitives";
 
 type Props = {
+  /** The phases THIS deployment shows — not the full list. A deployment that forms no entities
+   *  has no legal-identity step, and a rail advertising one would be describing another box. */
+  phases: PhaseMeta[];
   current: Phase;
   done: Record<string, boolean>;
   onJump: (phase: Phase) => void;
 };
 
-export function Stepper({ current, done, onJump }: Props) {
-  const currentIndex = PHASES.findIndex((p) => p.id === current);
+export function Stepper({ phases, current, done, onJump }: Props) {
+  const currentIndex = phases.findIndex((p) => p.id === current);
 
   return (
     <nav aria-label="Onboarding progress">
@@ -18,7 +21,7 @@ export function Stepper({ current, done, onJump }: Props) {
         Create your agent
       </div>
       <ol className="flex flex-col gap-1">
-        {PHASES.map((p, i) => {
+        {phases.map((p, i) => {
           const isCurrent = p.id === current;
           const isDone = !!done[p.id];
           const isReachable = isDone || i < currentIndex;
