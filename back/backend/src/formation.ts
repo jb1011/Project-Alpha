@@ -316,10 +316,11 @@ export function createFormationParty(
  * not less.
  *
  * The CLI stays. It is a separate process on the same database, it is how an operator mints on a
- * box with no browser, and its hard refusal is intact.
+ * box with no browser, and its hard refusal is intact — and, being the only one left, this message
+ * names it rather than taking it as a parameter.
  */
-export function legacyDoorRefusalMessage(door: "cli create-entity"): string {
-  return `${door} cannot onboard on a deployment where formation is required: it carries no formation party (POST /formation-party) and would mint an entity that can never be filed. Use the wizard API (POST /onboard) or the MCP onboard_agent tool.`;
+export function legacyDoorRefusalMessage(): string {
+  return "cli create-entity cannot onboard on a deployment where formation is required: it carries no formation party (POST /formation-party) and would mint an entity that can never be filed. Use the wizard API (POST /onboard) or the MCP onboard_agent tool.";
 }
 
 /** True when the legacy door must refuse: formation is configured AND mandatory. */

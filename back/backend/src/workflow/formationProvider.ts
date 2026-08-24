@@ -104,7 +104,6 @@ export interface FormationCreateDeps {
  */
 export const FORMATION_STATE = "WY";
 export const FORMATION_ENTITY_TYPE = "LLC";
-const ENTITY_TYPE_ENDING = FORMATION_ENTITY_TYPE;
 
 /** A NAICS `industry` label from `GET /v1/partner/references/naics-codes` (verified live
  *  2026-08-21; maps to 541511). `industry` or `naicsCode` is REQUIRED by the create. */
@@ -147,7 +146,7 @@ export function isNonUsResponsibleParty(p: { ssn?: string | null; country: strin
  *  A trailing "LLC" in the agent's name would otherwise be filed as "Acme LLC LLC". */
 export function companyNameOptions(specName: string): { name: string; entityTypeEnding: string }[] {
   const base = specName.replace(/[\s,]+(l\.?l\.?c\.?)$/i, "").trim() || specName.trim();
-  return [{ name: base, entityTypeEnding: ENTITY_TYPE_ENDING }];
+  return [{ name: base, entityTypeEnding: FORMATION_ENTITY_TYPE }];
 }
 
 /**

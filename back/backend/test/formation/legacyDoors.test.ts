@@ -71,7 +71,7 @@ test("the CLI is UNCHANGED on a deployment where formation is not mandatory", as
 });
 
 test("the refusal names the door and points at the two real ones", () => {
-  const msg = legacyDoorRefusalMessage("cli create-entity");
+  const msg = legacyDoorRefusalMessage();
   expect(msg).toMatch(/^cli create-entity cannot onboard/);
   expect(msg).toMatch(/POST \/onboard/);
   expect(msg).toMatch(/onboard_agent/);

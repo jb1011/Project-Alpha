@@ -6,6 +6,7 @@ import type {
   DoolaRequiredAction,
 } from "../adapters/doola/types";
 import { POLL_BASE_MS, POLL_CAP_MS, type StepBackoff, nextInterval } from "../formation/schedule";
+import { providerRefOf } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
 import {
@@ -263,7 +264,8 @@ export async function advanceFormation(
   }
 
   const steps = d.requests.stepsOf(entityKey);
-  const providerRef = steps.find((s) => s.step === "create_provider")?.providerRef;
+  // The ONE extraction, shared with the projection and the anchor trigger (review F11).
+  const providerRef = providerRefOf(steps);
   // Nothing has been filed yet: `create_provider` is the sweeper's job, not this one's.
   if (!providerRef) return { fetched: false, advanced: false, skipped: "no_provider_ref" };
 
@@ -400,12 +402,17 @@ function advanceFiling(
       : {}),
   };
 
-  // Already filed: refresh the detail (required-actions in particular) without touching state.
+  // Already filed: refresh the detail (required-actions in particular) without touching state —
+  // and HEAL the two legal facts if doola has learned them since (review F12).
   if (row.state === "confirmed") {
-    d.requests.transition(entityKey, "await_filing", "confirmed", "confirmed", {
-      detail: JSON.stringify(next),
+    let healed = false;
+    d.repo.transaction(() => {
+      d.requests.transition(entityKey, "await_filing", "confirmed", "confirmed", {
+        detail: JSON.stringify(next),
+      });
+      healed = healFilingFacts(d, entityKey, company);
     });
-    return false;
+    return healed;
   }
 
   if (!isFormationFiled(company)) {
@@ -449,6 +456,56 @@ function advanceFiling(
   });
   if (won) logFormationStep(entityKey, "await_filing", "confirmed", row.attempt, { providerRef });
   return won;
+}
+
+/**
+ * Write the filing number and filing date onto the ENTITY whenever doola reports them — including
+ * long after the step confirmed (review F12).
+ *
+ * The gap this closes: `await_filing` confirms on either of two signals (the formation service
+ * reports completed, OR a filing date exists), and the entity facts were written only inside the
+ * CAS that CONFIRMS it. A company doola reported as completed before the state had assigned a
+ * filing number therefore confirmed with `formation_filing_number` NULL — and nothing ever wrote
+ * it afterwards, because every later poll took the confirmed→confirmed branch, which refreshed
+ * the `detail` blob and touched nothing else. The anchor loop then refused v2 forever (correctly:
+ * a manifest claiming a filing with no filing number would be the dishonest fix), and the entity
+ * sat in that state permanently.
+ *
+ * So the facts are healed here, from the same authenticated re-fetch every other fact comes from,
+ * and never downgraded: a value we hold is never overwritten with a null doola happens not to have
+ * returned this time.
+ *
+ * Returns whether anything changed — an ADVANCE, because it is exactly the fact the anchor
+ * sub-saga is waiting on.
+ */
+function healFilingFacts(
+  d: FormationAdvanceDeps,
+  entityKey: string,
+  company: DoolaCompany,
+): boolean {
+  const number = company.formationFilingNumber?.trim() || null;
+  const filedAt = filingDateToUnix(company.formationFilingDate);
+  if (number === null && filedAt === null) return false;
+  const fresh = d.repo.findByIdempotencyKey(entityKey);
+  if (!fresh) return false;
+  const gainsNumber = number !== null && fresh.formationFilingNumber !== number;
+  const gainsDate = filedAt !== null && fresh.formationFiledAt !== filedAt;
+  if (!gainsNumber && !gainsDate) return false;
+  d.repo.upsert({
+    ...fresh,
+    ...(gainsNumber ? { formationFilingNumber: number } : {}),
+    ...(gainsDate ? { formationFiledAt: filedAt } : {}),
+  });
+  opsLog("formation_filing_healed", {
+    entityKey,
+    environment: d.environment,
+    // The number itself is a public state-registry identifier, not PII — it is already in the
+    // manifest and on chain by keccak. The date likewise.
+    filingNumber: gainsNumber ? number : undefined,
+    filedAt: gainsDate ? filedAt : undefined,
+    message: "a confirmed filing gained facts doola had not reported when the step confirmed",
+  });
+  return true;
 }
 
 /** How many documents may be fetched at once for ONE entity (M5). */
