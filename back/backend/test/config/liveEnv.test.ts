@@ -15,9 +15,13 @@ test("fundingFloatUsdc defaults to 0.50 and is overridable", () => {
   ).toBe("1.25");
 });
 
-test("customerPrivateKey defaults to the platform key and is overridable + redacted", () => {
+test("customerPrivateKey is undefined when unset, never the platform key, and is redacted", () => {
+  // No fallback: the simulated customer must never sign with the platform governance key, so an
+  // unset CUSTOMER_PRIVATE_KEY has to stay undefined and be refused at the point of use.
   const cfg = loadConfig(base);
-  expect(cfg.customerPrivateKey).toBe(base.PLATFORM_PRIVATE_KEY);
+  expect(cfg.customerPrivateKey).toBeUndefined();
+  expect(cfg.customerPrivateKey).not.toBe(base.PLATFORM_PRIVATE_KEY);
+  expect(redact(cfg).customerPrivateKey).toBeUndefined();
   const over = loadConfig({ ...base, CUSTOMER_PRIVATE_KEY: `0x${"2".repeat(64)}` });
   expect(over.customerPrivateKey).toBe(`0x${"2".repeat(64)}`);
   expect(redact(over).customerPrivateKey).toBe("REDACTED");

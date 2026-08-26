@@ -53,7 +53,7 @@ export interface SellParams {
   answer: string;
   price: bigint;
   sellerPayTo: Address; // the treasury payout — revenue lands governed
-  customerPrivateKey: Hex; // the simulated customer's signer (defaults to the platform key upstream)
+  customerPrivateKey: Hex; // the simulated customer's signer (CUSTOMER_PRIVATE_KEY, never the platform key)
   settle: SettleFn;
   resourceUrl?: string;
 }
@@ -275,6 +275,11 @@ export async function buildLiveAgentRunner(
   cfg: Config = loadConfig(),
 ): Promise<(query: string) => Promise<LiveRunResult>> {
   if (!cfg.anthropicApiKey) throw new Error("set ANTHROPIC_API_KEY to run the agent");
+  // Leg 2's customer signs for itself. The config no longer falls back to the platform key, so a
+  // missing var must stop the run here rather than silently sign customer payments as governance.
+  if (!cfg.customerPrivateKey)
+    throw new Error("set CUSTOMER_PRIVATE_KEY to run the agent: leg 2 needs a customer signer");
+  const customerPrivateKey = cfg.customerPrivateKey;
   requireMasterSeed(cfg);
   const { treasury, vendorPayout, agentPayout } = resolveLiveAddresses({
     treasury: process.env.TREASURY_ADDRESS,
@@ -348,7 +353,7 @@ export async function buildLiveAgentRunner(
       },
     });
 
-  const customer = pocketSignerFromKey(cfg.customerPrivateKey).address;
+  const customer = pocketSignerFromKey(customerPrivateKey).address;
 
   // recording settle shared by both legs
   const settleTransferIds: string[] = [];
@@ -440,7 +445,7 @@ export async function buildLiveAgentRunner(
             answer,
             price,
             sellerPayTo: agentPayout,
-            customerPrivateKey: cfg.customerPrivateKey,
+            customerPrivateKey,
             settle,
           }),
         floatAtomic,
