@@ -193,9 +193,10 @@ export function AgentDashboard({
                 title={
                   agentBook.registered
                     ? `AgentBook (World Chain): human ${agentBook.humanId?.slice(0, 14)}… answers for this agent's wallet`
-                    : agentBook.reason === "no-operator-yet"
-                      ? "Agent still provisioning — operator wallet not set yet"
-                      : agentBook.register ?? "Not registered in AgentBook"
+                    : agentBook.reason === "no-pocket-yet" ||
+                        agentBook.reason === "no-operator-yet"
+                      ? "Agent still provisioning — payment wallet not set yet"
+                      : "Not registered in AgentBook"
                 }
                 className={
                   agentBook.registered

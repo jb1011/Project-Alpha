@@ -311,10 +311,13 @@ export function entityAgentBook(
   id: string,
 ): Promise<{
   registered: boolean;
-  reason?: "not registered" | "no-operator-yet";
+  /** `no-operator-yet` is kept only so a browser running an older build still parses a response
+   *  from a backend that predates the pocket-address fix; the API no longer emits it. */
+  reason?: "not registered" | "no-operator-yet" | "no-pocket-yet";
   humanId?: string;
-  operator?: string;
-  register?: string;
+  /** The address AgentBook was queried for: the agent's pocket EOA, which is what signs AgentKit
+   *  challenges and therefore what a seller looks up. */
+  address?: string;
 }> {
   return request(`/entities/${encodeURIComponent(id)}/agentbook`, { token });
 }
