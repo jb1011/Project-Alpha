@@ -2,9 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { getAbiItem, type Address, type Hex, type PublicClient } from "viem";
+import { type Address, type Hex } from "viem";
 import { useAccount, usePublicClient, useWriteContract } from "wagmi";
-import { collectAmendmentHashes, sameHash } from "@/lib/amendments";
+import {
+  classifyAmendments,
+  readAmendments,
+  sameHash,
+  type AmendmentChainClient,
+} from "@/lib/amendments";
 import { apiKeys } from "@/lib/api/keys";
 import type { EntityView } from "@/lib/api/types";
 import { shortenErr } from "@/lib/errors";
@@ -21,41 +26,6 @@ import {
   cx,
 } from "@/components/onboarding/primitives";
 import { shortAddress } from "@/components/onboarding/types";
-
-/** One amendment hash, joined with what the chain says about it NOW. */
-type Amendment = {
-  hash: Hex;
-  /** From `scheduledAt(hash)` — unix seconds, 0 when nothing is live for this hash. This is the
-   *  authority, not the log's `executableAt`: a reschedule resets the clock and the mapping is
-   *  what the contract will actually check. */
-  scheduledAt: bigint;
-  /** Sticky. Set by `cancelOperatingAgreementUpdate`, cleared only by `liftVeto`. */
-  vetoed: boolean;
-};
-
-type ChainState = {
-  amendments: Amendment[];
-  /** The hash the contract currently carries — read here, not taken from the API. */
-  anchored: Hex;
-  /** True when the RPC refused a full-history log query and only a recent window was scanned. */
-  partial: boolean;
-};
-
-// `0n` literals need an ES2020 target; this package compiles to ES2017, like the rest of it.
-const ZERO = BigInt(0);
-
-const SCHEDULED_EVENT = getAbiItem({ abi: legalManagerAbi, name: "AmendmentScheduled" });
-
-/**
- * How far back to scan when an RPC refuses `fromBlock: 0`.
- *
- * A bounded window and NOT a safe one: an amendment timelock can be set as high as 365 days, and
- * no fixed block count covers that on a chain that finalises sub-second. This window discovers
- * recent hashes; it is not evidence that an older schedule does not exist, and the card says so
- * rather than presenting a truncated scan as a clean bill of health. The hash the platform reports
- * is read directly regardless of any window (see `collectAmendmentHashes`).
- */
-const FALLBACK_LOOKBACK = BigInt(200_000);
 
 /** Chain reads are cheap but not free, and a schedule cannot appear without a transaction. */
 const CHAIN_STALE_TIME = 3 * 60_000;
@@ -81,6 +51,17 @@ const CHAIN_STALE_TIME = 3 * 60_000;
  * stops driving it, but the schedule it already broadcast stays executable on-chain forever. To
  * the chain that is simply a live amendment the platform is not talking about, which is precisely
  * the thing a guardian should be told to veto proactively.
+ *
+ * Those two jobs — DISCOVERING hashes from logs and CHECKING a hash against the mappings — have
+ * very different requirements from an RPC, and the card no longer pretends otherwise. Discovery
+ * needs a block range and is the first thing a pruned or rate-limited node refuses; checking is a
+ * point read that works everywhere. Tying them together meant the public Arc RPC (which prunes,
+ * and caps log ranges at ~10k blocks) produced "Could not read the amendment state from the chain"
+ * over a live amendment that was one `eth_call` away — the card failing closed on the single
+ * screen where failing closed means a guardian cannot veto. Discovery is now best-effort and its
+ * verdict (`full` / `partial` / `unavailable`) is stated on the card; the point reads always run.
+ * What has NOT changed is the security posture: a hash is still only ever shown as live because a
+ * point read on-chain said so, never because the platform claimed it.
  */
 export function AmendmentVetoCard({ entity }: { entity: EntityView }) {
   const publicClient = usePublicClient();
@@ -122,7 +103,8 @@ export function AmendmentVetoCard({ entity }: { entity: EntityView }) {
 
   const chainQuery = useQuery({
     queryKey,
-    queryFn: () => readAmendments(publicClient as PublicClient, proxy as Address, apiPendingHash),
+    queryFn: () =>
+      readAmendments(publicClient as AmendmentChainClient, proxy as Address, apiPendingHash),
     enabled: !!publicClient && !!proxy && !legacy,
     staleTime: CHAIN_STALE_TIME,
     retry: false,
@@ -147,8 +129,20 @@ export function AmendmentVetoCard({ entity }: { entity: EntityView }) {
         : null;
 
   const amendments = useMemo(() => chain?.amendments ?? [], [chain]);
-  const live = amendments.filter((a) => a.scheduledAt !== ZERO);
-  const parked = amendments.filter((a) => a.scheduledAt === ZERO && a.vetoed);
+  const discovery = chain?.discovery ?? null;
+  /**
+   * What the contract said, sorted into the rows this card renders.
+   *
+   * `apiClaimsPendingButChainDoesNot` is the load-bearing one: the hash the platform reports is
+   * ALWAYS a direct `scheduledAt`/`vetoed` point read (`collectAmendmentHashes` puts it in the
+   * batch whether or not a log turned it up, and those reads now run even when NO log query
+   * succeeded), so "nothing is scheduled for it" is something the contract said rather than
+   * something a truncated or refused log scan failed to mention.
+   */
+  const { live, parked, apiClaimsPendingButChainDoesNot } = useMemo(
+    () => classifyAmendments(amendments, apiPendingHash),
+    [amendments, apiPendingHash],
+  );
 
   /**
    * The platform's anchored hash against the contract's — confirmed before it becomes an alarm.
@@ -182,19 +176,6 @@ export function AmendmentVetoCard({ entity }: { entity: EntityView }) {
 
   const syncingAnchor = disagreementKey != null && confirmedDisagreement !== disagreementKey;
   const anchoredAlarm = disagreementKey != null && confirmedDisagreement === disagreementKey;
-
-  /**
-   * The hash the platform reports pending, as the CONTRACT sees it.
-   *
-   * Always a direct `scheduledAt`/`vetoed` point read (`collectAmendmentHashes` puts it in the
-   * batch whether or not a log turned it up), so "nothing is scheduled for it" is something the
-   * contract said rather than something a truncated log scan failed to mention.
-   */
-  const pendingRead = apiPendingHash
-    ? amendments.find((a) => sameHash(a.hash, apiPendingHash))
-    : undefined;
-  const apiClaimsPendingButChainDoesNot =
-    pendingRead != null && pendingRead.scheduledAt === ZERO && !pendingRead.vetoed;
 
   // The last deadline on the card. Past it every badge is settled, so the clock stops rather than
   // re-rendering this card once a second for the life of the page.
@@ -272,13 +253,31 @@ export function AmendmentVetoCard({ entity }: { entity: EntityView }) {
         </Callout>
       )}
 
-      {chain?.partial && (
+      {discovery?.status === "partial" && (
         <Callout tone="muted" className="mt-4" title="Partial history">
-          Your RPC refused a full-history log query, so only the last {String(FALLBACK_LOOKBACK)}{" "}
-          blocks were scanned for scheduled amendments. An amendment scheduled before that window
-          would not be listed here — and a timelock can run to a year, so &ldquo;older&rdquo; does
-          not mean &ldquo;expired&rdquo;. A different RPC will show more. The hash this platform
-          reports as pending is read from the contract directly and is unaffected by this window.
+          Your RPC refused a full-history log query, so only the last{" "}
+          {discovery.window.toLocaleString("en-US")} blocks were scanned for scheduled amendments. An
+          amendment scheduled before that window would not be listed here — and a timelock can run
+          to a year, so &ldquo;older&rdquo; does not mean &ldquo;expired&rdquo;. A different RPC will
+          show more. The hash this platform reports as pending is read from the contract directly
+          and is unaffected by this window.
+        </Callout>
+      )}
+
+      {/* No history at ALL, but the point reads went through. Emphatically not the error state:
+          the one hash the platform named HAS been checked against the contract, so a guardian can
+          still see and veto it. What is missing is discovery of anything the platform did not
+          mention — which is the half of this card's job that needs logs. */}
+      {discovery?.status === "unavailable" && (
+        <Callout tone="warn" className="mt-4" title="This RPC would not return any amendment history">
+          No log query was accepted at any range
+          {discovery.reason && <> — it answered &ldquo;{shortenErr(discovery.reason)}&rdquo;</>}, so
+          no amendment could be <em>discovered</em> here.{" "}
+          {apiPendingHash
+            ? "The hash this platform reports as pending was still checked against your contract directly — that read needs no history — so it is shown below if the contract says it is live."
+            : "This platform also reports no pending hash, so there was nothing left to check directly and this card can tell you nothing about this contract right now."}{" "}
+          An amendment this platform is not talking about would not appear either way. Point a
+          different RPC at this page before concluding nothing is scheduled.
         </Callout>
       )}
 
@@ -301,13 +300,21 @@ export function AmendmentVetoCard({ entity }: { entity: EntityView }) {
         </Callout>
       )}
 
-      {chain && live.length === 0 && (
-        <p className="mt-4 text-[12.5px] text-muted">
-          {chain.partial
-            ? "No amendment is scheduled on-chain within the range this RPC allowed."
-            : "No amendment is scheduled on-chain right now."}
-        </p>
-      )}
+      {/* Suppressed in the one case where it would be meaningless: no history AND no hash to point
+          read, where "nothing is scheduled" would be a claim about a contract we never reached. The
+          banner above already says so. */}
+      {chain &&
+        discovery &&
+        live.length === 0 &&
+        (discovery.status !== "unavailable" || amendments.length > 0) && (
+          <p className="mt-4 text-[12.5px] text-muted">
+            {discovery.status === "full"
+              ? "No amendment is scheduled on-chain right now."
+              : discovery.status === "partial"
+                ? "No amendment is scheduled on-chain within the range this RPC allowed."
+                : "Nothing is scheduled for the hashes this RPC allowed us to check."}
+          </p>
+        )}
 
       {apiClaimsPendingButChainDoesNot && (
         <Callout
@@ -427,114 +434,6 @@ export function AmendmentVetoCard({ entity }: { entity: EntityView }) {
 }
 
 /* ------------------------------------------------------------------ */
-
-/**
- * Everything the card needs from the chain, in as few round trips as the RPC allows.
- *
- * The block height and the anchored hash do not depend on each other, so they go together. The log
- * scan DISCOVERS hashes — `fromBlock: 0` first, because a live amendment older than any fixed
- * window is exactly the one worth catching, with a bounded retry for public RPCs that cap ranges.
- * The per-hash `scheduledAt`/`vetoed` pairs are then one multicall rather than 2N eth_calls, and
- * the hash the platform reports is in that batch whether or not the scan found it.
- */
-async function readAmendments(
-  client: PublicClient,
-  proxy: Address,
-  apiPendingHash: string | null,
-): Promise<ChainState> {
-  const [latest, meta] = await Promise.all([
-    client.getBlockNumber(),
-    client.readContract({ address: proxy, abi: legalManagerAbi, functionName: "meta" }),
-  ]);
-
-  let partial = false;
-  let logs: Awaited<ReturnType<typeof client.getLogs>>;
-  try {
-    logs = await client.getLogs({
-      address: proxy,
-      event: SCHEDULED_EVENT,
-      fromBlock: ZERO,
-      toBlock: latest,
-    });
-  } catch {
-    partial = true;
-    logs = await client.getLogs({
-      address: proxy,
-      event: SCHEDULED_EVENT,
-      fromBlock: latest > FALLBACK_LOOKBACK ? latest - FALLBACK_LOOKBACK : ZERO,
-      toBlock: latest,
-    });
-  }
-
-  const fromLogs: Hex[] = [];
-  for (const log of logs) {
-    const hash = (log as { args?: { newHash?: Hex } }).args?.newHash;
-    if (hash) fromLogs.push(hash);
-  }
-
-  const amendments = await readAmendmentStates(
-    client,
-    proxy,
-    collectAmendmentHashes(fromLogs, apiPendingHash),
-  );
-
-  return { amendments, anchored: meta[2], partial };
-}
-
-/**
- * `scheduledAt` + `vetoed` for every hash — batched where the chain offers a batcher.
- *
- * Multicall3 is not deployed on every chain this UI can be pointed at, and a card that threw
- * "chain does not support contract multicall3" would be a card that tells the guardian nothing at
- * all. So the batch is an optimisation with a plain fallback under it, never a requirement.
- */
-async function readAmendmentStates(
-  client: PublicClient,
-  proxy: Address,
-  hashes: Hex[],
-): Promise<Amendment[]> {
-  if (hashes.length === 0) return [];
-
-  if (client.chain?.contracts?.multicall3) {
-    try {
-      const contracts = hashes.flatMap((hash) => [
-        { address: proxy, abi: legalManagerAbi, functionName: "scheduledAt", args: [hash] } as const,
-        { address: proxy, abi: legalManagerAbi, functionName: "vetoed", args: [hash] } as const,
-      ]);
-      const results = (await client.multicall({
-        contracts,
-        allowFailure: false,
-      })) as unknown as (bigint | boolean)[];
-      return hashes.map((hash, i) => ({
-        hash,
-        scheduledAt: results[i * 2] as bigint,
-        vetoed: results[i * 2 + 1] as boolean,
-      }));
-    } catch {
-      /* fall through to individual reads */
-    }
-  }
-
-  return Promise.all(
-    hashes.map(async (hash): Promise<Amendment> => {
-      const [scheduledAt, vetoed] = await Promise.all([
-        client.readContract({
-          address: proxy,
-          abi: legalManagerAbi,
-          functionName: "scheduledAt",
-          args: [hash],
-        }),
-        client.readContract({
-          address: proxy,
-          abi: legalManagerAbi,
-          functionName: "vetoed",
-          args: [hash],
-        }),
-      ]);
-      return { hash, scheduledAt, vetoed };
-    }),
-  );
-}
 
 /**
  * A wall clock that ticks only while something is counting down.
