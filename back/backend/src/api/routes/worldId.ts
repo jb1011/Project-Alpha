@@ -369,10 +369,17 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
       throw new ApiError("not_found", 404, "entity not found");
     const ak = deps.x402Demo?.agentkit;
     if (!ak) throw new ApiError("not_found", 404, "AgentBook reads are not configured");
-    const operator = rec.operator;
-    if (!operator) return c.json({ registered: false, reason: "no-operator-yet" });
+    // AgentBook is keyed by the address that SIGNS AgentKit challenges — the entity's POCKET EOA
+    // (adapters/worldid/agentkitSigner.ts), which is also what a seller looks up after verifying a
+    // challenge signature. The operator SCA never signs one, so reading it here could only ever
+    // answer "unregistered"; worse, the `npx … register <operator>` hint this route used to print
+    // would have written a PERMANENT binding to an address no seller will ever query — AgentBook
+    // has no deregistration. Pocket only, and no registration instructions until the real flow
+    // ships (docs/design/2026-08-25-agentbook-registration-design.md).
+    const address = rec.pocketAddress;
+    if (!address) return c.json({ registered: false, reason: "no-pocket-yet" });
 
-    let humanId = ak.store.getCachedHuman(operator, Date.now(), 10 * 60_000);
+    let humanId = ak.store.getCachedHuman(address, Date.now(), 10 * 60_000);
     if (!humanId) {
       try {
         const { createAgentBookVerifier } = await import("@worldcoin/agentkit");
@@ -381,10 +388,10 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
           ...(ak.agentBookAddress ? { contractAddress: ak.agentBookAddress } : {}),
           // biome-ignore lint/suspicious/noExplicitAny: options typing varies across SDK versions.
         } as any);
-        const looked = await verifier.lookupHuman(operator);
+        const looked = await verifier.lookupHuman(address);
         if (looked && !/^0x0*$/.test(looked) && looked !== "0") {
           humanId = looked;
-          ak.store.cacheHuman(operator, humanId, Date.now());
+          ak.store.cacheHuman(address, humanId, Date.now());
         }
       } catch {
         // SDK swallows RPC errors into null; either way: unknown -> report unregistered,
@@ -392,13 +399,7 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
       }
     }
     return c.json(
-      humanId
-        ? { registered: true, humanId, operator }
-        : {
-            registered: false,
-            operator,
-            register: `npx @worldcoin/agentkit-cli register ${operator}`,
-          },
+      humanId ? { registered: true, humanId, address } : { registered: false, address },
     );
   });
 
