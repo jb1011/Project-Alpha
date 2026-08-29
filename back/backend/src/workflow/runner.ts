@@ -6,6 +6,7 @@ import {
   companyUnavailableMessage,
 } from "../formation";
 import { deriveFormationStatus } from "../formation/status";
+import { opsLog } from "../observability/opsLog";
 import type { CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationRepository } from "../persistence/formationRepository";
@@ -180,6 +181,10 @@ export class OnboardingRunner {
       // every caller's memory.
       if (companyId && !this.deps.repo.attachCompany(id, companyId))
         throw new ApiError("validation_error", 400, companyUnavailableMessage());
+      // The ops trail for sharing (§7). Ids only — a company id is an opaque handle, and nothing
+      // about the party behind it belongs in a log line. `shim` says whether this attach created
+      // the company it is attaching to, which is what tells A3 when the shim can be removed.
+      if (companyId) opsLog("company_attach", { companyId, entityKey: id, shim: !p.companyId });
     };
     // Only formation takes the transaction: without a company or a party there is exactly one
     // write, and every pre-formation caller (including the tests that hand in a repo stub) keeps

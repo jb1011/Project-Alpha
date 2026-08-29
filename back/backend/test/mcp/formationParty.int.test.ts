@@ -402,3 +402,76 @@ test("the quota refuses onboard_agent before the entity is minted", async () => 
   });
   expect(repo.listByTenant(TENANT)).toHaveLength(1);
 });
+
+// ── COMPANIES over MCP (design 2026-08-26 §7) ───────────────────────────────────────────────
+
+test("create_company + list_companies exist only where formation does, and never take an ssn", async () => {
+  const on = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const tools = await withClient(on, key, async (c) => (await c.listTools()).tools);
+  const create = tools.find((t) => t.name === "create_company")!;
+  expect(create).toBeDefined();
+  expect(tools.map((t) => t.name)).toContain("list_companies");
+  // ⚠ PERMANENT: an SSN in a tool argument would sit in an LLM client's context window and in
+  // its logs. The web form is the only place one is ever collected (§4.1).
+  expect(Object.keys(create.inputSchema.properties ?? {})).toEqual([
+    "partyId",
+    "name",
+    "synthetic",
+  ]);
+
+  const off = buildTestApp(undefined);
+  const { key: key2 } = apiKeys.mint(TENANT, { capability: "provision" });
+  const offNames = await withClient(off, key2, async (c) =>
+    (await c.listTools()).tools.map((t) => t.name),
+  );
+  expect(offNames).not.toContain("create_company");
+  expect(offNames).not.toContain("list_companies");
+});
+
+test("MCP and REST mint the SAME company — one domain function, one set of refusals", async () => {
+  const app = buildTestApp({ required: true });
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+
+  await withClient(app, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    const { companyId } = JSON.parse(
+      textOf(
+        await c.callTool({ name: "create_company", arguments: { partyId, name: "Acme LLC" } }),
+      ),
+    );
+    expect(companyId).toBeTruthy();
+
+    // The single-use rule reaches this door too: one identity, one company.
+    const reused = await c.callTool({
+      name: "create_company",
+      arguments: { partyId, name: "Second" },
+    });
+    expect(textOf(reused)).toMatch(/unknown, not yours, or already bound/);
+
+    // list_companies renders the same projection REST does, newest first.
+    const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
+    expect(listed.companies).toHaveLength(1);
+    expect(listed.companies[0]).toMatchObject({
+      companyId,
+      status: "ready",
+      formationStatus: "none",
+      paying: false,
+      agents: 0,
+    });
+
+    // …and onboard_agent attaches to it, free.
+    const out = JSON.parse(
+      textOf(
+        await c.callTool({
+          name: "onboard_agent",
+          arguments: { spec: VALID_SPEC, passkeyId: handle, companyId },
+        }),
+      ),
+    );
+    expect(repo.findByIdempotencyKey(out.id)?.companyId).toBe(companyId);
+  });
+});
