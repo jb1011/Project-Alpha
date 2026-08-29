@@ -65,7 +65,7 @@ beforeAll(async () => {
   });
   treasury = res.treasury;
   // mint USDC to the manager so it can fund
-  await wallet.writeContract({
+  const mintHash = await wallet.writeContract({
     address: stack.usdc,
     abi: mockUsdcAbi,
     functionName: "mint",
@@ -73,6 +73,9 @@ beforeAll(async () => {
     account: manager,
     chain: anvilChain,
   });
+  // A hash is not a balance: fundTreasury estimates gas against mined state, and a newer
+  // anvil no longer guarantees the mint is in a block by the time writeContract returns.
+  await pub.waitForTransactionReceipt({ hash: mintHash });
 }, 40_000);
 afterAll(() => anvil?.stop());
 
