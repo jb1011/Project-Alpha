@@ -1,0 +1,232 @@
+@import url("https://fonts.googleapis.com/css2?family=Archivo:ital,wght@0,100..900;1,100..900&display=swap");
+
+:root {
+  --paper: #090909;
+  --paper-2: #111111;
+  --paper-3: #1a1a1a;
+  --ink: #f2f0ea;
+  --ink-hover: #e0ddd6;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --muted: #9c9a92;
+  --muted-2: #7a7872;
+  --accent: #4d8ef7;
+  --accent-2: #2563eb;
+  --accent-soft: #93c5fd;
+  --highlight: #6366f1;
+  --font: "Archivo", ui-sans-serif, system-ui, sans-serif;
+  --font-code: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+html,
+body,
+.book,
+.book-body,
+.book-body .body-inner,
+.page-wrapper,
+.page-inner {
+  background: var(--paper) !important;
+  color: var(--ink) !important;
+  font-family: var(--font) !important;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-size: 15px !important;
+  letter-spacing: -0.01em !important;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--paper);
+}
+
+.book-header {
+  background: var(--paper) !important;
+  color: var(--muted) !important;
+  font-family: var(--font) !important;
+}
+
+.book-header .btn {
+  color: var(--muted) !important;
+  text-transform: none !important;
+  font-family: var(--font) !important;
+}
+
+.book-header .btn:hover {
+  color: var(--ink) !important;
+  background: var(--paper-2) !important;
+}
+
+.book-header h1 {
+  color: var(--muted) !important;
+  font-weight: 500 !important;
+  letter-spacing: -0.02em !important;
+}
+
+.book-summary {
+  background: var(--paper-2) !important;
+  color: var(--ink) !important;
+  border-right: 1px solid var(--line) !important;
+  font-family: var(--font) !important;
+}
+
+.book-summary ul.summary li.header {
+  color: var(--muted-2) !important;
+  font-family: var(--font) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.18em !important;
+}
+
+.book-summary ul.summary li.divider {
+  background: var(--line) !important;
+}
+
+.book-summary ul.summary li a,
+.book-summary ul.summary li span {
+  color: var(--muted) !important;
+  font-family: var(--font) !important;
+}
+
+.book-summary ul.summary li a:hover {
+  color: var(--ink) !important;
+  text-decoration: none !important;
+  background: var(--paper-3) !important;
+}
+
+.book-summary ul.summary li.active > a {
+  color: var(--accent-soft) !important;
+  background: rgba(77, 142, 247, 0.08) !important;
+}
+
+#book-search-input {
+  background: var(--paper) !important;
+  border-color: var(--line) !important;
+}
+
+#book-search-input input {
+  color: var(--ink) !important;
+  font-family: var(--font) !important;
+}
+
+#book-search-input input::placeholder {
+  color: var(--muted-2);
+}
+
+.markdown-section {
+  color: var(--ink) !important;
+  font-family: var(--font) !important;
+  line-height: 1.65 !important;
+}
+
+.markdown-section h1,
+.markdown-section h2,
+.markdown-section h3,
+.markdown-section h4,
+.markdown-section h5,
+.markdown-section h6 {
+  color: var(--ink) !important;
+  font-family: var(--font) !important;
+  font-weight: 500 !important;
+  letter-spacing: -0.02em !important;
+}
+
+.markdown-section h6 {
+  color: var(--muted) !important;
+}
+
+.markdown-section p,
+.markdown-section li,
+.markdown-section td,
+.markdown-section th {
+  color: var(--ink);
+}
+
+.markdown-section a {
+  color: var(--accent) !important;
+}
+
+.markdown-section a:hover {
+  color: var(--accent-soft) !important;
+  text-decoration: none !important;
+}
+
+.markdown-section hr {
+  background: var(--line) !important;
+  height: 1px !important;
+}
+
+.markdown-section blockquote {
+  color: var(--muted) !important;
+  border-left-color: var(--accent) !important;
+}
+
+.markdown-section code {
+  background: var(--paper-3) !important;
+  color: var(--ink) !important;
+  font-family: var(--font-code) !important;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.markdown-section pre {
+  background: var(--paper-2) !important;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.markdown-section pre > code {
+  background: transparent !important;
+  border: none !important;
+  color: var(--ink) !important;
+  font-family: var(--font-code) !important;
+}
+
+.markdown-section table td,
+.markdown-section table th {
+  border-color: var(--line-strong) !important;
+}
+
+.markdown-section table tr {
+  background: var(--paper) !important;
+}
+
+.markdown-section table tr:nth-child(2n) {
+  background: var(--paper-2) !important;
+}
+
+.markdown-section table th {
+  background: var(--paper-3) !important;
+  font-weight: 500 !important;
+}
+
+.navigation {
+  color: var(--muted-2) !important;
+}
+
+.navigation:hover {
+  color: var(--accent) !important;
+}
+
+.dropdown-menu {
+  background: var(--paper-2) !important;
+  border-color: var(--line-strong) !important;
+}
+
+.dropdown-menu .buttons .button {
+  color: var(--muted) !important;
+}
+
+.dropdown-menu .buttons .button:hover {
+  color: var(--ink) !important;
+}
+
+#book-search-results .search-results .has-results .search-results-item {
+  color: var(--ink) !important;
+}
+
+#book-search-results .search-results .has-results .search-results-item a {
+  color: var(--accent) !important;
+}
