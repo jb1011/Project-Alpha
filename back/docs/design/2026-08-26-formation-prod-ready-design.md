@@ -1,11 +1,12 @@
 # Formation, production-ready — companies as first-class, real intake, USDC payments
 
 > **Status:** DESIGN, ADVERSARIALLY AUDITED 2026-08-26 (3 passes: fact-check — 45 claims, 33
-> confirmed, 10 corrected below; security — 14 findings incl. 1 critical; completeness — 18
-> findings). All findings folded into this revision. Combined verdict after amendments: sound to
-> build. Successor to `2026-08-19-doola-formation-provider-design.md` (four PRs + fix merged;
-> E2E proven on testnet 2026-08-26 — capture of that run as a runbook artifact is an A1
-> prerequisite, §10).
+> confirmed, 10 corrected, 2 carried as doola questions since settled from their docs, §10; security —
+> 14 findings incl. 1 critical; completeness — 18 findings) **and re-gated 2026-08-29 (8-angle gate:
+> 7 finders + 4 adversarial verifiers against the merged code — 20 confirmed findings, none refuted
+> outright, all folded; traceability in §12).** Combined verdict after amendments: sound to build.
+> Successor to `2026-08-19-doola-formation-provider-design.md` (four PRs + fix merged; E2E proven on
+> testnet 2026-08-26 — capture of that run as a runbook artifact is an A1 prerequisite, §10).
 > **Decisions locked (Martin, 2026-08-26):** (1) company:agents = user's choice (1:1, N:1, many),
 > reuse suggested default, sharing labeled plainly; N:1 document coherence → counsel
 > (non-blocking). (2) SSN: collect (US persons), forward, delete adopt-safely. (3) Payments FREE
@@ -48,64 +49,124 @@ As in the audited table of the predecessor design, with corrections from this au
 - `getComplianceCalendar` exists on the client but has never been called (first consumption is §7).
 - `SecretStore` has zero production consumers; keys land in `config/env.ts` (so does
   `FORMATION_PII_KEY`).
-- Erasure rules (C7): party erasable only when `create_provider` has no `provider_ref` AND
-  `await_filing` never confirmed AND (formation abandoned OR party unbound > 7 days).
-- `assertGuardianAllowed` is a no-op unless `WORLD_REQUIRE_GUARDIAN`; `maxEntitiesPerHuman`
-  optional.
+- Erasure rules (C7) are TWO DISJOINT arms, not one conjunction: `listAbandoned` = `create_provider`
+  state `abandoned` AND `provider_ref IS NULL` AND no confirmed `await_filing` (no time component);
+  `listStaleUnbound` = `entity_key IS NULL` AND `created_at` older than 7 days (no provider
+  conditions). `erase` NULLs ten PII columns in ONE statement. `abandoned` has exactly one writer —
+  the sweeper at max attempts; `key_reused`/`lost` parks never bump the attempt, so a human-parked
+  row is never abandoned by the system and there is no operator abandon action today.
+- `assertGuardianAllowed` silently returns when `cfg.world` is undefined (any of `WORLD_APP_ID` /
+  `WORLD_RP_ID` / `WORLD_RP_SIGNING_KEY` missing) or `requireGuardian` is off; it is wired on
+  exactly two doors (REST onboard, MCP onboard); its ceiling counts AGENTS
+  (`countEntitiesForNullifier`).
+- `FormationStatus` = `none | in_progress | filed | complete | failed`, pinned by a CI drift test
+  against the interface union. There is no `forming`.
+- `oa_anchors.listDue` is `ORDER BY k LIMIT 50` with no cursor; `factsMovedSince` and `listDue`'s
+  UNION arm read `formation_requests.updated_at`, which `persistPollBackoff` bumps on EVERY poll.
+- Documents are entity-keyed end to end: `documentIndexId`/`documentStoreName` embed the entity key,
+  dedupe is `UNIQUE(entity_key, provider_doc_id)`, and five readers are `WHERE entity_key = ?`.
+- Interface proxy: `isDocumentDownloadPath`/`isNoStorePath` hardcode `/entities/…/documents`
+  regexes; the drift test asserts fragments that survive a rename.
+- `seller.ts verifyPayment` performs the four EIP-3009 checks, but on an x402 header envelope, with an
+  amount FLOOR, against the Gateway domain. No `authorizationState`/`cancelAuthorization` code exists.
+  The S5 `OutflowMeter` is the platform hot-wallet brake (default ceiling 200 USDC / 24h).
 
 ## 2. Data model + THE MIGRATION (specified to the query)
 
 `companies` as previously drafted, with amendments:
-- `industry_label TEXT NOT NULL` replaces `naics_code` (store doola's label; keep an optional
-  `naics_code` informational column, nullable).
-- `status` is restricted to the dimension only the company owns: `'draft' | 'paying' | 'ready' |
-  'abandoned'`. Filing progress (`forming/filed/complete/failed`) stays DERIVED from the step
-  rows via `deriveFormationStatus` — never stored (the anti-drift rule the status module states).
+- `industry_label TEXT NOT NULL` replaces `naics_code`. No code column: nothing would write or read it.
+- `status` is restricted to the dimension only the company owns: `'draft' | 'ready' | 'abandoned'`.
+  **"Paying" is DERIVED**, never stored: `hasLivePayment(companyId)` =
+  `EXISTS (formation_payments WHERE company_id = ? AND status IN ('quoted','settling'))`, exported
+  beside `deriveFormationStatus`. Filing progress stays derived via `deriveFormationStatus`, whose
+  union is `none | in_progress | filed | complete | failed`. Nothing about payments is ever written
+  to `companies`, so a refund or an expired quote needs no second write and cannot drift.
+- `intake_synthesized INTEGER NOT NULL DEFAULT 0` — the row-level marker for migrated/shimmed
+  intake (never a key inside `name_options`, which keeps ONE shape).
+- `name_options` stored shape is canonical: `[{name, entityTypeEnding, position}]`, produced by the
+  existing `companyNameOptions` (strips a trailing `LLC`/`L.L.C.`). The migration, the shim and the
+  live intake ALL call it. The §5 matcher compares `name + " " + entityTypeEnding` against doola's
+  reported name.
 - `legal_name_filed TEXT NULL` — set ONLY by matching doola's reported name against OUR stored
   `name_options` (§5); never doola free text.
-- Unique partial index `idx_companies_one_payment` on `formation_payments(company_id) WHERE
-  status IN ('quoted','settling','settled','released')`.
-- `formation_requests` PK becomes `(company_id, step)`; `formation_parties` gains `company_id`
-  (+ `ssn_ciphertext BLOB NULL`, `ssn_iv BLOB NULL`, `ssn_key_id TEXT NULL`,
-  `ssn_deleted_at TEXT NULL`); `documents` gains `company_id`; `entities` gains
-  `company_id` (WRITE-ONCE — anchored manifests carry `legal.providerCompanyId`, so re-attach
-  would make a permanent on-chain claim false; detach/dissolution is out of scope and on the
-  counsel list).
-- **Idempotency keys:** existing keys are DERIVED (`formation:<entityKey>:<step>:<attempt>[:endpoint]`).
-  The migration MUST NOT rotate a live key: it stores the derived pre-migration key prefix on
-  each migrated `create_provider` row (`legacy_key_prefix`), and key derivation uses the stored
-  prefix when present. New companies use `company:<companyId>:…`.
+- `formation_payments`: status union enumerated ONCE, normatively:
+  `quoted | settling | settled | expired | failed | refunded` (there is no `released`);
+  `product` as §6.8; `raw_tx BLOB NULL` and `tx_hash` persisted BEFORE broadcast (§6.4); `attempt`.
+  Unique partial index `idx_formation_payments_one_live ON formation_payments(company_id, product)
+  WHERE status IN ('quoted','settling')` — LIVE rows only, per product, so a later
+  `maintenance_year` quote and a re-quote after `expired`/`failed` are both insertable.
+- `formation_requests` PK becomes `(company_id, step)` and gains `facts_updated_at TEXT NOT NULL`,
+  written ONLY by transitions that change state, `provider_ref` or fact detail — never by
+  `persistPollBackoff` (§3 reads it).
+- `formation_parties` gains `company_id TEXT NULL UNIQUE` — one party row is single-use PER COMPANY,
+  bound by a CAS inside the `POST /companies` transaction (§7) — plus `ssn_ciphertext BLOB NULL`,
+  `ssn_iv BLOB NULL`, `ssn_key_id TEXT NULL`, `ssn_deleted_at TEXT NULL`. `entities` gains
+  `company_id` (WRITE-ONCE — anchored manifests carry `legal.providerCompanyId`, so re-attach would
+  make a permanent on-chain claim false; detach/dissolution is out of scope and on the counsel list).
+- **Documents re-key to the company:** `documentIndexId(companyId, providerDocId)`,
+  `documentStoreName(companyId, …)`, dedupe `UNIQUE(company_id, provider_doc_id)` (replaces
+  `idx_documents_entity_provider`; `idx_documents_entity` stays for legacy rows). Existing rows keep
+  their entity-derived id and path as opaque locators; lookups read the `company_id` COLUMN and never
+  re-derive an id. Readers that change: `listByEntity → listByCompany` (anchorLoop, formationProcessor,
+  documents route, views), `findOwned(companyId, id)`, `findByProviderDocId` and `storedTypes`
+  (company-scoped); `listByEntities` stays entity-shaped at the view boundary through a join on
+  `entities.company_id`. A company can be filed and have its documents fetched before any agent
+  attaches (§7 sequencing) — that is why the entity key cannot be the document key.
+- Indexes added in the same migration: `entities(company_id) WHERE company_id IS NOT NULL`,
+  `companies(tenant_id, status)`, `oa_anchors(entity_key, updated_at)`.
+- **Idempotency keys:** existing keys are DERIVED (`formation:<entityKey>:<step>:<attempt>[:endpoint]`)
+  and are only ever re-sent while a `create_provider` row is `pending`/`submitted` — exactly the rows
+  step 1 refuses. No surviving row can re-send a key, so nothing needs preserving: ALL keys become
+  `company:<companyId>:…` after the migration. No `legacy_key_prefix` column, no branch in
+  `idempotencyKey` (fixture: no migrated row is in a key-re-deriving state).
 
 **Migration steps (one guarded transaction, meta-marker, refuses loudly rather than guessing):**
 1. **Refusal predicate:** any `create_provider` row non-terminal (`pending`/`submitted`/`failed`
-   with no `provider_ref`) → REFUSE with a message naming the entity ("finish or abandon in-flight
-   formations before upgrading") — re-keying a live create can file a second real LLC.
-2. Per formed entity: synthesize a `companies` row copying `created_at`/`updated_at` **verbatim**
-   (never re-default — a fresh timestamp makes `factsMovedSince` true for every formed entity and
-   opens a fleet-wide amendment storm on the first sweep tick); status `ready`; NOT-NULL intake
-   columns synthesized by the SAME rule the A1 shim uses (§10): `name_options` =
-   `[{name: <agent name>, position: 1}]` marked `synthesized: true`, `business_purpose` = the
-   forwarded description or the default, `industry_label` = "Software development".
+   with no `provider_ref`) → REFUSE with a message naming the entity — re-keying a live create can
+   file a second real LLC. **Operator escape (ships with A1):** CLI `formation:abandon <entityKey>`
+   transitions `create_provider → abandoned` with an ops-logged reason and REFUSES when
+   `provider_ref IS NOT NULL` (a create that reached doola is adopted, never abandoned by hand); the
+   refusal message names the command. Without it a `key_reused`-parked row, which never burns
+   attempts, blocks the upgrade forever.
+2. **The synthesis rule (§10 references it by this name):** for EVERY entity with
+   `formation_provider IS NOT NULL` OR a bound `formation_parties` row — NOT only formed ones:
+   unopened entities, live filings past `create_provider`, and abandoned-with-`provider_ref` rows all
+   exist and all hold PII that must stay attached — synthesize a `companies` row: status `ready` (so
+   the sub-saga and attach stay unblocked), `intake_synthesized = 1`, `name_options =
+   companyNameOptions(agentName)` at position 1, `business_purpose` = the forwarded description or
+   the default, `industry_label` = "Software development", `created_at`/`updated_at` copied from
+   the entity.
 3. Re-key `formation_requests` (table REBUILD — SQLite cannot alter a PK; the house precedent for
-   populated-table rebuilds is refuse-unless-clean, which step 1 guarantees), `documents.company_id`
-   backfill (index ids and file paths are NOT re-derived — paths stay entity-keyed as opaque
-   locators; manifests commit to `{type, sha256, name}`, so bytes and hashes are untouched),
-   `formation_parties.company_id` backfill.
+   populated-table rebuilds is refuse-unless-clean, which step 1 guarantees). **The INSERT enumerates
+   columns and copies `created_at`, `updated_at`, `attempt`, `provider_ref`, `detail`, `error`,
+   `next_poll_at` VERBATIM — never re-defaulted:** `updated_at` is what `factsMovedSince`, the
+   `listDue` UNION arm, the retry clock, the stall detector and `listPollDue` read; a re-stamp makes
+   every formed entity due forever and starves the 50-row anchor batch. `facts_updated_at` is
+   initialised to `updated_at`. `documents.company_id` and `formation_parties.company_id` backfills
+   are ALTER-only (index ids and file paths are NOT re-derived; manifests commit to
+   `{type, sha256, name}`, so bytes and hashes are untouched).
 4. **Re-keyed queries, each named because each silently breaks otherwise:** `listStaleUnbound`
-   (`entity_key IS NULL` → `company_id IS NULL` — otherwise EVERY party looks unbound and the
-   7-day sweep NULLs the responsible party of every real filing), `listAbandoned` (join on
-   `company_id`, restating both C7 conditions at company scope), `countByTenant` (counts
-   `companies` rows), `oa_anchors.listDue`'s UNION arm, `listUnopened` (companies-keyed — this is
-   the crash-recovery query that starts a stuck filing).
-5. Fixture tests: a PR-4-era DB with formed entities migrates losslessly; a party bound to a
-   filed company is NOT erasable after 8 days; a migrated entity's next anchor pass computes an
-   UNCHANGED manifest hash (no storm); the in-flight fixture refuses.
+   (`entity_key IS NULL` → `company_id IS NULL AND entity_key IS NULL` — both null preserves "never
+   used" even if a backfill misses a row; a wider predicate NULLs the responsible party of every real
+   filing), `listAbandoned` (join on `company_id`, restating its THREE conditions at company scope),
+   `countByTenant`, `oa_anchors.listDue`'s UNION arm, `listUnopened` (companies-keyed — the
+   crash-recovery query that starts a stuck filing). **Post-migration assertion inside the
+   transaction:** zero rows where `deleted_at IS NULL AND entity_key IS NOT NULL AND company_id IS
+   NULL`, else REFUSE and roll back.
+5. Fixture tests: a PR-4-era DB with formed entities migrates losslessly; a party bound to a filed
+   company is NOT erasable after 8 days; a migrated entity's next anchor pass computes an UNCHANGED
+   manifest hash (no storm); the in-flight fixture refuses and its message names `formation:abandon`;
+   `listDueEntityKeys` returns the same set pre- and post-migration; an unopened entity's synthesized
+   company is `ready` and fileable; an abandoned-with-`provider_ref` party survives.
 
-**Manifest `companyName` gating:** additive field, but `deriveLegalBlock` is a pure function of
-facts and `sameLegal` compares canonicalized blocks — so the field is emitted ONLY when the
-entity's last anchored manifest already carries it OR no anchor cycle exists yet (schema-presence
-check on the loaded baseline). Existing anchors stay byte-stable; entities gain the field
-naturally on their next REAL fact change.
+**Manifest `companyName`:** emitted by `normalizeLegal` ONLY when `legal_name_filed` is a non-empty
+string — a conditional key; absent ≡ null for this one field (a deliberate, documented departure from
+the explicit-nulls convention in `manifest.ts`). NO baseline gate: `deriveLegalBlock` stays a pure
+function of facts, called before `loadAnchoredManifest` exactly as today (a baseline-gated builder
+could never bootstrap the field for an already-anchored entity, and would force a manifest read per
+tick). No storm: every migrated company has `legal_name_filed` NULL ⇒ byte-identical block ⇒
+`sameLegal` short-circuits; the hash moves exactly once, when a real filed name lands — the intended
+amendment. A schema-id bump is NOT an option: `parseManifest` refuses any schema ≠ v1.
 
 ## 3. Company sub-saga, attach, and the anchor interface
 
@@ -122,15 +183,30 @@ maps to a company (one advance per company replaces N — the processor never re
 **Attach (reuse):** door check AND a CAS inside the claim transaction (re-read company tenant/
 environment/status in the same transaction; `UPDATE entities SET company_id = ? WHERE
 idempotency_key = ? AND company_id IS NULL`). Pin fields are copied FROM THE COMPANY ROW, never
-from config. Attach is allowed for status `ready` + derived filing status any of
-forming/filed/complete; refused for `draft`, `paying`, `abandoned`, or derived `failed`.
+from config. Attach is allowed for status `ready` AND derived filing status any of
+`none | in_progress | filed | complete` (a `ready` company whose `create_provider` row is not yet
+open derives `none` — the shim's and the hybrid flow's happy path); refused for `draft`,
+`abandoned`, `hasLivePayment`, or derived `failed`.
 **Caps:** `FORMATION_MAX_AGENTS_PER_COMPANY` (default 10) — each attached agent is an anchor
-sequence per late fact, sponsored on-chain writes through timelocks; and because the formation
-quota now bounds companies, a per-human entity ceiling remains via `maxEntitiesPerHuman`
-(REQUIRED set in production — see §6 identity floor).
+sequence per late fact, sponsored on-chain writes through timelocks; a per-human ceiling on
+COMPANIES (`maxCompaniesPerHuman`, §6.7) bounds filings, and the per-human ENTITY ceiling
+(`maxEntitiesPerHuman`) stays as the separate agent bound.
 
-Late facts (e.g. EIN) fire one amendment cycle per attached entity through its own timelock —
-accepted, bounded by the agents-per-company cap.
+**Anchor scheduling under N:1 (three changes, all in A1):**
+- `listDue` gains a keyset cursor — `WHERE k > @after ORDER BY k LIMIT ?`, the sweeper persists the
+  last key and wraps (the anti-starvation shape `listPollDue` already has) — and opsLogs
+  `anchor_batch_full` when a batch comes back full. Its UNION arm is deduped at company granularity
+  (`SELECT DISTINCT company_id`, expanded to entities AFTER the limit), so one busy company cannot
+  fill the 50-slot batch with its ten agents.
+- `factsMovedSince` and the UNION arm compare `facts_updated_at`, not `updated_at`: a poll must not
+  invalidate the anchor gate (today one `await_ein` poll makes an entity re-read its manifest every
+  tick for the whole 4–6-week EIN wait).
+- Late facts (e.g. EIN) fire one amendment cycle per attached entity through its own timelock. The
+  bound is stated: `agents × late facts × 2 sponsored writes` (worst case 10 × 3 × 2 = 60 ≈ $0.54 at
+  the measured $0.009/op) plus one guardian notification per entity per fact. One cheap gate: a new
+  cycle is not OPENED while the company's `facts_updated_at` is younger than one sweep interval, so
+  facts landing together fold into one cycle per entity. Company-level batching is a named follow-up,
+  not A1.
 
 ## 4. SSN lifecycle (amended)
 
@@ -154,10 +230,17 @@ accepted, bounded by the agents-per-company cap.
 5. **`expedited` is frozen into `create_provider.detail` at first send** and read from there
    forever — it is a function of the SSN, and PII erasure must never mutate a body under a live
    key.
-6. **TTL (replaces the flat 30 days):** erase when `doola_company_id IS NOT NULL` (doola holds
-   what it needs) OR the company is terminal; if a TTL of 7 days (aligned with the row's other
-   PII) fires on a company with NO provider_ref, the formation is ABANDONED in the same
-   transaction — never left retrying a body it can no longer rebuild.
+6. **Two clocks, stated separately (replaces the flat 30 days).** (a) **SSN erasure:** NULL
+   `ssn_ciphertext`/`ssn_iv`/`ssn_key_id` and stamp `ssn_deleted_at` when the company is terminal
+   (`abandoned`, or `create_provider` terminal) OR the SSN is older than 7 days AND `create_provider`
+   has never reached `submitted`. The `doola_company_id` case is §4.4's in-transaction delete; the
+   sweeper's clause for it is an idempotent backstop, not a TTL. (b) **Party erasure** stays EXACTLY
+   C7's two disjoint arms (§1). The system NEVER manufactures `abandoned` from a clock: a company with
+   no `provider_ref` at day 7 raises a `formation_stale` guardian notification + ops alert and KEEPS
+   its intake; only the max-attempt path or the operator CLI sets `abandoned`. Why: a NULL
+   `provider_ref` is not proof no company exists at doola (the adopt path exists for exactly that),
+   and an erased party makes adoption unrecoverable. `erase` is extended to the four `ssn_*` columns
+   so ONE statement still erases everything.
 7. Intake immutability: name options, purpose, party fields and SSN are frozen once the first
    create is sent; the edit-and-retry UX is offered ONLY when the last failure was `rejected`
    (the one case where doola releases the key — verified). Values are canonicalized (trim/NFC)
@@ -166,61 +249,95 @@ accepted, bounded by the agents-per-company cap.
 
 ## 5. Intake details
 
-- Names ×3, validated (length, charset, WY restricted words as data + test, no duplicates).
-  Adopt lookup matches ANY of the three stored candidates, not just the first.
+- Names ×3, validated (length, charset, WY restricted words as data + test, no duplicates), stored in
+  the canonical `{name, entityTypeEnding, position}` shape via `companyNameOptions`. Adopt lookup
+  matches ANY of the three stored candidates, not just the first.
 - **Filed name:** doola's full-company response carries `nameOptions` with no winner flag; the
-  LIST item carries `name`. The processor matches the reported name against OUR stored candidates
-  — on match, `legal_name_filed` = OUR candidate string (never doola free text — the anchor
-  imports from the filer, it never hashes partner-controlled text); on no match → required-action
-  to the owner, `legal_name_filed` stays NULL, `manifest.legal.companyName` stays null (honest)
-  until resolved. **A1 merge gate: a live sandbox probe pinning where the filed name is actually
-  readable** (list item vs `getCustomer.companies[]` vs AOO), recorded in the runbook.
-- Business purpose: own required field; agent description no longer doola-visible. Industry:
-  picker fed by a NEW `listNaicsCodes` client method (cached); stored as label.
+  LIST item carries `name` (verified 2026-08-27: it is our submitted first option WITHOUT its ending).
+  The processor matches doola's reported name against `name + " " + entityTypeEnding` of OUR stored
+  candidates — on match, `legal_name_filed` = OUR candidate string (never doola free text — the
+  anchor imports from the filer, it never hashes partner-controlled text); on no match →
+  required-action to the owner, `legal_name_filed` stays NULL, `manifest.legal.companyName` is absent
+  (honest) until resolved. **A1 merge gate: a live sandbox probe pinning where the filed name is
+  actually readable** (list item vs `getCustomer.companies[]` vs AOO), recorded in the runbook; the
+  question is also open with doola (§10).
+- Business purpose: own required field; agent description no longer doola-visible. Industry: the
+  label list is a static federal reference table, shipped as a BUILD-TIME constant refreshed by a
+  script (`scripts/refresh-naics.mts` against `references/naics-codes`; the `listNaicsCodes` client
+  method exists for the script only) — no partner API call at the top of the funnel, no cache to
+  specify.
 
 ## 6. Payments (rebuilt from the real primitive; built now, OFF for beta)
 
 **Primitive: genuine EIP-3009 on the USDC token contract** (`transferWithAuthorization` — native
-USDC feature). NOT the Gateway batching scheme (wrong domain, requires an on-chain Gateway
-deposit, library-generated nonce, server-side signer). No facilitator, no Circle service in the
-path, no new external dependency.
+USDC feature; Arc's USDC predeploy is Circle's FiatTokenV2_2, which also exposes
+`authorizationState` and `cancelAuthorization`). NOT the Gateway batching scheme (wrong domain,
+requires an on-chain Gateway deposit, library-generated nonce, server-side signer). No facilitator,
+no Circle service in the path, no new external dependency.
 
 Flow:
-1. `POST /companies` (payment ON) → company `paying` + quote `{amountUsdc, payTo:
-   FORMATION_REVENUE_ADDRESS, nonce, validUntil}`. `nonce` = random 32 bytes, stored on the
-   `formation_payments` row (uniqueness from the row, NOT derived from companyId — a derived
-   nonce is one-shot and bricks the company after any failed attempt). `validBefore` in the
-   authorization = `validUntil`.
+1. `POST /companies` (payment ON) → company stays `draft`; a `formation_payments` row `quoted`
+   makes it derived-paying; quote `{amountUsdc, payTo: FORMATION_REVENUE_ADDRESS, nonce, validUntil}`.
+   `nonce` = random 32 bytes, stored on the row (uniqueness from the row, NOT derived from companyId
+   — a derived nonce is one-shot and bricks the company after any failed attempt). The client signs
+   `validAfter = 0` and `validBefore = validUntil`.
 2. Guardian signs with wagmi `useSignTypedData` against the **USDC domain** — NEW frontend work,
    budgeted as such (no typed-data signing exists in the interface; SIWE is personal_sign).
-3. Backend verifies LOCALLY before touching the chain: recipient == revenue address, value ==
-   the STORED quote amount (never live config — a fee change between quote and settle must not
-   re-price a signature), validBefore in the future, signature recovers the guardian.
-4. **Crash-window discipline (same class as the doola create):** persist `settling` + the
-   broadcast intent BEFORE submitting; executor submits `transferWithAuthorization` (gas is
-   USDC cents on Arc — the platform pays it, stated); persist the tx hash; confirm receipt →
-   `settled` → company `ready` in one transaction. On resume with `settling`: check
-   `authorizationState(from, nonce)` on USDC + the persisted tx before any re-quote. Re-quoting
-   (expired/failed) issues a NEW row with a NEW nonce; the unique partial index prevents two
-   live payments per company.
-5. `create_provider` refuses while `paying` (CAS-guarded). With payment OFF the states are
-   skipped entirely and beta copy says formation is included.
-6. **Refunds:** manual CLI, but METERED — `formation_refund` joins the `OutflowPath` enum under
-   the S5 meter and ceiling (the CLI-outside-the-meter hole is exactly what S5 closed once
-   already). **Revenue custody DECIDED (2026-08-27):** `FORMATION_REVENUE_ADDRESS` is a Ledger
-   hardware-wallet account — receive-only, NO key on the box, listed in the S4 key inventory.
-   Refunds are signed MANUALLY from the Ledger by runbook, so B1 ships NO fund-moving refund
-   path and NO hot float: the CLI only RECORDS a refund (`settled → refunded` with the Ledger
-   tx hash, opsLogged) and moves nothing. A capped, S5-metered hot float for automated refunds
-   is a later phase, built only if refund volume justifies it. Boot invariants: revenue
-   address ≠ executor and ≠ every operational key; payment cannot be required in sandbox.
+3. Backend verifies LOCALLY before touching the chain through ONE shared helper,
+   `verifyTransferAuthorization({ authorization, signature, domain, payTo, value, mode })`, extracted
+   from the recovery core of `seller.ts` and called by both rails (x402: Gateway domain, `floor`;
+   formation: USDC domain, `exact`): recipient == revenue address, value == the STORED quote amount
+   (never live config — a fee change between quote and settle must not re-price a signature),
+   `validAfter <= now`, `validBefore` in the future, signature recovers the guardian.
+4. **Crash-window discipline (same class as the doola create, same primitives as the bridge legs):**
+   persist `settling` + the signed RAW tx + its hash BEFORE broadcast (`markSubmitted`-before-network,
+   as `bridgeLegRepository`); the executor — the platform EOA, `writeContract` with EXPLICIT gas via a
+   new `TRANSFER_WITH_AUTHORIZATION_GAS` beside `USDC_TRANSFER_GAS` (ecrecover + an
+   `authorizationState` SSTORE; do not reuse the 100k plain-transfer figure; the Arc estimate footgun
+   does not bite here because the guardian, not the executor, is the token sender) — submits; gas is
+   USDC cents on Arc, the platform pays it, stated; confirm receipt → `settled` → company `ready` in
+   one transaction. **Resume is owned by a NEW eighth sweeper leg, `resumeStalledSettles()`**,
+   modelled on `resumeStalledCreates` (`SUBMITTED_STALL_MS`, `attempt`/`bumpAttempt`, `retryDelayMs`
+   from `formation/schedule.ts`), with three rules: (1) `settling` with an unknown outcome NEVER
+   re-quotes — it re-broadcasts the persisted raw tx; (2) it moves to `expired` only when `now >
+   validBefore` AND `authorizationState(from, nonce) === false`; if that reads true, it resolves
+   `settled` from the receipt; (3) the fast path is an explicit guardian action — a second
+   `useSignTypedData` over `CancelAuthorization`, submitted by the executor (the platform cannot cancel
+   unilaterally), after which the row may go `expired` at once. The same leg moves `quoted` rows past
+   `validBefore` to `expired`. Re-quote is therefore two-step: `quoted → expired` or `settling →
+   expired/failed` THEN a new row with a new nonce (the live-rows index admits it). Why: a signed
+   authorization is public and self-authorizing until `validBefore`; `authorizationState == false`
+   means "not yet used", not "dead", so re-quoting on it can charge the guardian twice — and B1 ships
+   no fund-moving refund.
+5. `create_provider` refuses while `hasLivePayment` (CAS-guarded). With payment OFF the payment
+   states never exist and beta copy says formation is included.
+6. **Refunds and revenue custody DECIDED (2026-08-27):** `FORMATION_REVENUE_ADDRESS` is a Ledger
+   hardware-wallet account — receive-only, NO key on the box, listed in the S4 key inventory. Refunds
+   are signed MANUALLY from the Ledger by runbook, so B1 ships NO fund-moving refund path and NO hot
+   float: the CLI only RECORDS a refund (`settled → refunded` with the Ledger tx hash +
+   `opsLog(formation_payment_refunded)`) and moves nothing. **A refund is NOT a platform-wallet
+   outflow and never enters `platform_outflows`**: a 399 USDC record would exceed the 200 USDC S5
+   ceiling and block every agent's treasury funding, gas seeds and job funding for 24 hours. The
+   later hot-float phase (built only if refund volume justifies it) adds `formation_refund` to
+   `OutflowPath` TOGETHER WITH an env invariant `PLATFORM_OUTFLOW_CEILING_USDC >= FORMATION_FEE_USDC`
+   beside the existing `maxTreasuryFund` guard. Boot invariants: revenue address ≠ executor and ≠
+   every platform key (a fixed set plus an indexed `EXISTS` over operator addresses, not a fleet scan);
+   payment cannot be required in sandbox.
 7. **Identity floor (the anonymous-USDC-buys-real-LLCs finding):** production formation
-   (`DOOLA_ENVIRONMENT=production` OR payment required) boot-requires `WORLD_REQUIRE_GUARDIAN=on`
-   AND `maxEntitiesPerHuman` set. The per-tenant formation quota is KEPT when paying (raised via
-   config, never removed — payment is a price, not a brake); the platform daily ceiling stays;
-   doola's KYB/KYC is the named contractual identity control on the filing itself; formation
-   velocity per tenant/human is opsLogged and alertable. `payer_address` recorded on every
-   payment.
+   (`DOOLA_ENVIRONMENT=production` OR payment required) boot-FAILS unless `cfg.world` is CONSTRUCTED
+   (all three `WORLD_*` present) AND `world.requireGuardian` AND `world.maxCompaniesPerHuman != null`
+   — the invariant asserts the WIRED dependency, never env strings, because `assertGuardianAllowed`
+   silently no-ops when `cfg.world` is undefined. `assertGuardianAllowed` is called on `POST
+   /companies` and MCP `create_company` — the doors that spend the money — in addition to onboard.
+   NEW `countCompaniesForNullifier` (join `companies.tenant_id` ↔ `guardian_verifications`) backs
+   `maxCompaniesPerHuman`; `maxEntitiesPerHuman`/`countEntitiesForNullifier` stay as the separate
+   per-human AGENT ceiling. The per-tenant formation quota is KEPT when paying (raised via config,
+   never removed — payment is a price, not a brake) and counts companies that have spent or committed
+   (`status = 'ready'` OR `hasLivePayment`), never drafts; the platform DAILY ceiling stays on
+   `create_provider` rows (`createRequestsSince`) — where the fee is actually incurred, since with
+   payment ON a company can sit in draft for days before its create fires. doola's KYB/KYC is the named
+   contractual identity control on the filing itself; formation velocity per tenant/human is opsLogged
+   and alertable. `payer_address` recorded on every payment.
 8. `/config` gains `formationPaymentRequired` + `formationFeeUsdc` (deliberate departure from
    the booleans-only rule — public pricing; the revenue address stays OFF it, the quote carries
    `payTo` on an authenticated route). Fee (provisional, 2026-08-27): `FORMATION_FEE_USDC=399`
@@ -236,26 +353,39 @@ Flow:
 
 ## 7. Surfaces and doors
 
-- **Doors (three: REST, MCP, CLI):** onboard carries `companyId` ONLY — **"inline creation" is
-  wizard SEQUENCING (`POST /companies` then `POST /onboard`), never a company payload on the
-  onboard door** (PII, now including SSN potential, stays off it). MCP gains `create_company`
-  (no ssn) + `list_companies`; `create_formation_party` folds into `create_company` (party args
-  remain a separate dedicated call shape, consistent with the existing rule: PII never in `spec`
-  or spec-shaped args). CLI keeps its hard refusal. Message constants renamed and re-worded:
-  `formationPartyRequiredMessage` → company-based; `formationPartyUnavailableMessage`'s
-  single-use arm ("already bound") is REPLACED by ownership+environment+status checks;
-  `legacyDoorRefusalMessage` reworded. **Spend controls MOVE to `POST /companies`** (quota +
-  ceiling count `companies` rows — onboard is where filings *don't* happen under N:1).
+- **Doors (three: REST, MCP, CLI) and ONE domain function:** every company creation goes through
+  `createCompany(deps, tenantId, intake)`, which REST `POST /companies`, MCP `create_company` and the
+  A1 shim all call — tenant quota, daily ceiling, `assertGuardianAllowed`, the synthetic-PII
+  refusals, intake validation/synthesis and the party bind CAS
+  (`UPDATE formation_parties SET company_id = ? WHERE party_id = ? AND tenant_id = ? AND company_id
+  IS NULL AND deleted_at IS NULL` inside the transaction that inserts the company; false ⇒ roll back),
+  all refusing BEFORE any row is minted (the `formationDoorRefusal` "cannot drift" precedent). The
+  spend controls therefore land in A1 with the function, never in a later phase. Onboard carries
+  `companyId` ONLY — **"inline creation" is wizard SEQUENCING (`POST /companies` then
+  `POST /onboard`), never a company payload on the onboard door** (PII, now including SSN potential,
+  stays off it). MCP gains `create_company` (no ssn) + `list_companies`; `create_formation_party`
+  folds into `create_company` (party args remain a separate dedicated call shape, consistent with the
+  existing rule: PII never in `spec` or spec-shaped args). CLI keeps its hard refusal. Message
+  constants: `formationPartyRequiredMessage` → company-based; `formationPartyUnavailableMessage`'s
+  single-use arm is KEPT at company scope (`party.companyId` set ⇒ unavailable) — reusing an identity
+  for a second company is a NEW party row (fresh intake, fresh SSN capture, its own clocks), and the
+  brake on how many companies one human forms is `maxCompaniesPerHuman`, not party reuse;
+  `syntheticPiiRequiredMessage`/`syntheticPiiRefusedMessage` carried UNCHANGED, keyed on the
+  deployment's `sandboxSyntheticPii`, which writes `companies.environment`/`synthetic` (never caller
+  input), with a boot invariant `sandboxSyntheticPii ⇒ DOOLA_ENVIRONMENT ≠ production`;
+  `legacyDoorRefusalMessage` reworded.
 - **Wizard:** legal-body phase branches (picker default = last-used, an API-level ordering
   contract shared by `list_companies`; create form; payment step when ON). localStorage
   allowlist: `companyId` added; `partyId`/`partySynthetic` retired; the sandbox label signal
   moves to the company's `environment`/`synthetic` (AgreementStep no longer keys on
   `partySynthetic`). SSN joins the never-persisted PII slice. Resume gate keys on
   `session.companyId`.
-- **Companies section:** list + detail with explicit states (empty, draft, paying, forming,
-  filed, complete, failed, abandoned, all-agents-detached); documents; compliance calendar
-  (FIRST consumption of `getComplianceCalendar`: A3 adds fetch + 24h cache + storage); attached
-  agents; annual-report row with "handled by: (ask doola)" placeholder.
+- **Companies section:** list + detail with explicit states (empty, draft, paying, in_progress,
+  filed, complete, failed, abandoned, all-agents-detached); documents; compliance calendar (FIRST
+  consumption of `getComplianceCalendar`): lazy-on-view, in-process `Map<companyId, {at, events}>`
+  with a 24h TTL, restart re-fetches — the `worldVerifier`/`transparency` TTL-map precedent; never
+  sweeper-warmed, NO table (re-derivable partner data does not belong in the replicated store);
+  attached agents; annual-report row with "handled by: (ask doola)" placeholder.
 - **Sharing labels — the exact surfaces:** authenticated only: `EntityView.formation` gains
   `sharedWith: <count>`, rendered by `FormationCard` and mirrored by the three MCP entity tools.
   The PUBLIC surfaces (`/transparency`, `/metadata`) do NOT carry the count. **Honest privacy
@@ -263,49 +393,69 @@ Flow:
   sharing a company are publicly linkable via their anchored manifests — the reuse picker says
   this before the user confirms.
 - Document routes move to `/companies/:id/documents/:docId`; the entity alias is dropped
-  immediately (the index route has zero client consumers; `downloadDocument` is updated in the
-  same PR).
+  immediately. Client changes in the SAME PR: `downloadDocument`, AND the proxy predicates
+  `isDocumentDownloadPath` → `/^companies\/[^/]+\/documents\/[^/]+$/` and `isNoStorePath` →
+  `/^companies\/[^/]+\/documents(\/|$)/` (they gate `content-disposition`, `cache-control:
+  private, no-store`, `content-length`, `x-content-type-options` on legal PDFs). The drift test
+  becomes a PATH guard: it extracts each regex literal from the source, asserts it matches
+  `companies/abc/documents/def`, and asserts the negative on `entities/abc/documents/def`, so a
+  half-done rename fails CI.
 - opsLog events (new): `company_created`, `company_reused`, `company_attach`, `company_draft_expired`,
-  `formation_payment_{quoted,settling,settled,released,refund}`, `formation_ssn_erased`,
-  `formation_velocity_warn`.
-- Runbooks updated in the same PRs: `doola-deploy.md` (door table AGAIN), `doola-webhooks.md`
-  (provider_ref → company), `.env.example`/`.env.sandbox.example`, S4 key inventory (revenue
-  address = Ledger, no refund float), manual-refund runbook.
+  `formation_payment_{quoted,settling,settled,expired,failed,refunded}`, `formation_stale`,
+  `anchor_batch_full`, `formation_ssn_erased`, `formation_velocity_warn`.
+- Runbooks updated in the same PRs: `doola-deploy.md` (door table AGAIN, `formation:abandon`),
+  `doola-webhooks.md` (provider_ref → company), `.env.example`/`.env.sandbox.example`, S4 key
+  inventory (revenue address = Ledger, no refund float), manual-refund runbook.
 
 ## 8. Threat model (delta, amended)
 
-SSN as §4 (adopt-safe, encrypted, AAD-bound, TTL-abandon rule). Payment: signature binds
-amount+recipient+validBefore+nonce; local verification against the stored quote; nonce uniqueness
-from the row; settle crash-window persisted; unique live-payment index; velocity alerts.
-Reuse: door + claim-transaction CAS; pin from company row; write-once company_id. Revenue
-custody: receive-only Ledger, no key on the box; refunds signed manually, recorded not executed.
-Identity: World personhood boot-invariant + per-human entity ceiling + kept quotas + doola KYB
-named. Migration: refusal predicates, verbatim timestamps, key-prefix preservation, PII-query
-re-keys with fixture proofs. Public linkability of shared companies disclosed, not hidden.
+SSN as §4 (adopt-safe, encrypted, AAD-bound, two erasure clocks, never clock-abandoned). Payment:
+signature binds amount+recipient+validAfter+validBefore+nonce; local verification against the stored
+quote through the shared helper; nonce uniqueness from the row; raw tx persisted before broadcast;
+expiry only after `validBefore` + `authorizationState`; guardian-signed cancel fast path; unique
+live-payment index per product; refunds outside the S5 meter; velocity alerts. Reuse: one domain
+function on every door; door + claim-transaction CAS; party single-use per company; pin from company
+row; write-once `company_id`. Revenue custody: receive-only Ledger, no key on the box; refunds signed
+manually, recorded not executed. Identity: wired-dependency boot invariant + `assertGuardianAllowed`
+on the paying doors + per-human company ceiling + per-human agent ceiling + kept quotas + doola KYB
+named. Migration: refusal predicate + operator abandon, verbatim `formation_requests` timestamps,
+universal company synthesis + post-migration assertion, PII-query re-keys with fixture proofs.
+Public linkability of shared companies disclosed, not hidden.
 
 ## 9. Test plan (amended)
 
-Everything previously listed, PLUS: nonce-after-indeterminate-settle (crash mid `settling`,
-resume must read `authorizationState` and never re-sign the same nonce); MCP↔REST parity across
-ALL new company fields on all three entity tools; migrated-entity manifest hash UNCHANGED on the
-next anchor pass; PII-sweeper fixture (bound party not erasable at day 8); the reordered-JSON
-idempotency probe; attach-CAS race (abandon between door and claim loses); companyName gating
-(anchored baseline without the field ⇒ candidate block omits it).
+Everything previously listed, PLUS: settle resume never re-signs or re-quotes on an unknown outcome
+(crash mid `settling`; resume re-broadcasts the persisted raw tx; `expired` only after `validBefore`
+AND `authorizationState === false`); the two-step re-quote; `maintenance_year` row insertable beside
+a `settled` formation row; MCP↔REST parity across ALL new company fields on all three entity tools;
+migrated-entity manifest hash UNCHANGED on the next anchor pass; `legal_name_filed` NULL ⇒ legal
+block bytes unchanged, setting it ⇒ exactly one new version; PII fixtures (bound party not erasable
+at day 8; a company parked on a required action for 8 days is NOT abandoned and its party NOT
+erasable; abandoned-with-`provider_ref` party survives migration; `erase` NULLs the `ssn_*` columns);
+the reordered-JSON idempotency probe; attach-CAS race (abandon between door and claim loses); attach
+allowed at derived `none`; party bind CAS refuses a second company; sandbox refuses real intake incl.
+SSN and production refuses `synthetic: true` through `createCompany`; boot fails with
+`WORLD_REQUIRE_GUARDIAN` on but `cfg.world` unwired; `POST /companies` calls `assertGuardianAllowed`;
+`listDue` cursor wraps and no key starves under a 10-agent company; a poll does not move
+`facts_updated_at`; proxy path guard (positive on `companies/…`, negative on `entities/…`); a
+recorded refund leaves `platform_outflows` untouched.
 
 ## 10. Rollout
 
-- **A1** — schema + migration (as §2, with its refusal predicates and fixtures) + company-keyed
-  sub-saga + company CRUD + **shim**: a party-only onboard auto-creates a 1:1 company that lands
-  in `ready` (never draft/paying), consumes the tenant quota, synthesizes the NOT-NULL intake
-  columns by the §2.2 rule, and is removed in A3. A1 merge gates: filed-name live probe;
-  reordered-JSON probe; FormationE2E_1 run captured as a runbook artifact (it is the migration's
-  golden fixture).
-- **A2** — production intake (names/purpose/industry/SSN) + REST/MCP surfaces + messages +
-  spend-control move.
-- **A3** — wizard branch + Companies section + labels + document-route move + shim removal +
-  compliance-calendar consumption.
-- **B1** — payments (flag off) + Ledger revenue address + refund-recording CLI + manual-refund
-  runbook + live settle probe.
+- **A1** — schema + migration (as §2, with its refusal predicate, `formation:abandon` CLI, the
+  synthesis rule and fixtures) + company-keyed sub-saga + company-keyed documents + the anchor
+  scheduling changes (§3) + `createCompany` domain function WITH spend controls and the identity
+  gate + company CRUD + **shim**: a party-only onboard calls `createCompany` for a 1:1 company that
+  lands in `ready` (never draft/paying) with `intake_synthesized = 1` via the §2 synthesis rule, and
+  is removed in A3. A1 merge gates: filed-name live probe; reordered-JSON probe; FormationE2E_1 run
+  captured as a runbook artifact (it is the migration's golden fixture).
+- **A2** — production intake (names/purpose/industry/SSN) + REST/MCP surfaces + messages.
+- **A3** — wizard branch + Companies section + labels + document-route move (with the proxy
+  predicates) + shim removal + compliance-calendar consumption.
+- **B1** — payments (flag off): `verifyTransferAuthorization` extraction, `resumeStalledSettles`
+  leg, `TRANSFER_WITH_AUTHORIZATION_GAS`, guardian cancel fast path, Ledger revenue address,
+  refund-recording CLI + manual-refund runbook + live settle probe. B1 touches no doola and may run
+  in parallel with A2/A3 once A1 has landed.
 - Deployment to the box is a separate, deliberate decision (Sept-15 demo runs on today's state).
 - **Externals:** counsel (N:1 document coherence, terms-doc/doola-OA duality, Series LLC, DAO
   supplement); Haliny (asked 2026-08-27: who files the annual report and at what cost, registered-
@@ -319,3 +469,28 @@ idempotency probe; attach-CAS race (abandon between door and claim loses); compa
 
 Multi-member companies (single member = guardian); company detach/deletion and dissolution
 paperwork (counsel list; `company_id` is write-once meanwhile); automatic refunds; Stripe/fiat.
+
+## 12. 2026-08-29 gate — findings and where each is resolved
+
+| # | Finding (verified against code) | Resolved in |
+|---|---|---|
+| 1 | `paying` stored though derivable; payment union never enumerated; `released` undefined | §2 status, §6.1/6.5 |
+| 2 | `legacy_key_prefix` dead by step 1's own refusal predicate | §2 keys |
+| 3 | Migration synthesized companies only for FORMED entities → unopened/live/abandoned-with-ref parties erased | §2 step 2 + step 4 assertion |
+| 4 | Verbatim-timestamp rule on the wrong table; `formation_requests` rebuild would re-stamp `updated_at` | §2 step 3 |
+| 5 | `forming` is not a status; attach predicate missed `none` | §2, §3 attach |
+| 6 | `naics_code` dead; synthesized marker in JSON; circular "§2.2 rule"; no operator abandon; three `name_options` shapes | §2 |
+| 7 | `companyName` baseline gate can never bootstrap; inverts derive-before-load | §2 manifest |
+| 8 | Refund recorded into the S5 meter exceeds the 200 USDC ceiling and blocks all funding | §6.6 |
+| 9 | No actor resumes `settling`; no backoff; primitives unnamed | §6.4 |
+| 10 | Superseded authorization never cancelled → double charge; `validAfter` unspecified | §6.1/6.3/6.4 |
+| 11 | One-payment index covered terminal statuses → forbids `maintenance_year` and re-quote | §2 index |
+| 12 | Party single-use rule deleted with no company-scope replacement | §2, §7 |
+| 13 | Synthetic-PII refusals lost their enforcer | §7 |
+| 14 | Identity floor asserted env strings; gate not on the paying doors; ceiling counted agents | §6.7 |
+| 15 | Spend controls in A2 left `POST /companies` uncontrolled in A1; quota counted drafts | §6.7, §7, §10 |
+| 16 | SSN TTL clause unreachable; clock-manufactured `abandoned` erased adoptable parties; `erase` skipped `ssn_*` | §1, §4.6 |
+| 17 | Documents entity-keyed while company-scoped fetch can precede any entity | §2 documents |
+| 18 | Proxy path predicates silently miss the new document route | §7 |
+| 19 | `listDue` batch starvation under N:1; polls invalidate the anchor gate | §3 |
+| 20 | Compliance-calendar table and unspecified NAICS cache | §5, §7 |
