@@ -33,6 +33,16 @@ function StatTile({ label, value }: { label: string; value: string }) {
 }
 
 function HumanChip({ entity }: { entity: TransparencyEntity }) {
+  // A waiver grants access, not personhood — the backend already reports it as humanVerified:false,
+  // and it must never wear the verified green here either. Amber, named for what it is.
+  if (entity.credential === "waiver") {
+    return (
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-300/35 bg-amber-300/[0.08] px-2.5 py-1 text-[12px] text-amber-300">
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-300" />
+        Waiver on record · not verified
+      </span>
+    );
+  }
   if (entity.humanVerified) {
     return (
       <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/35 bg-accent/[0.08] px-2.5 py-1 text-[12px] text-accent-soft">
