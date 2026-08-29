@@ -265,3 +265,88 @@ test("A-repo-3: acknowledgeHold is a CAS from the two HOLD states and nothing el
   expect(anchors.acknowledgeHold("ent", 4)).toBe(true);
   expect(anchors.find("ent", 4)?.state).toBe("superseded");
 });
+
+// ── 2026-08-26 §3: the anchor scheduler under N:1 ──────────────────────────────────────────
+
+/** An entity attached to `companyId`, with a company row to attach to. */
+function attach(entityKey: string, companyId: string): void {
+  if (!db.prepare("SELECT 1 FROM companies WHERE company_id = ?").get(companyId))
+    db.prepare(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
+                              name_options, business_purpose, industry_label)
+       VALUES (?, 't', 'ready', 'doola', 'sandbox', '[]', 'p', 'i')`,
+    ).run(companyId);
+  db.prepare(
+    `INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay,
+                           ein, formation_date, company_id)
+     VALUES (?, ?, 'bound', '0x1', '0x2', '86400', 'STUB', 0, ?)`,
+  ).run(entityKey, entityKey, companyId);
+}
+
+test("a POLL does not move facts_updated_at — and so does not invalidate the anchor gate", () => {
+  formation.claimStep("c1", "await_ein");
+  const before = formation.find("c1", "await_ein")!;
+  // What `persistPollBackoff` writes on EVERY pass over a waiting row: a schedule, in `detail`.
+  formation.transition("c1", "await_ein", "pending", "pending", {
+    detail: JSON.stringify({ nextPollAt: 1 }),
+    nextPollAt: 1,
+    touchFacts: false,
+  });
+  const polled = formation.find("c1", "await_ein")!;
+  expect(polled.detail).toContain("nextPollAt");
+  // The FACT clock did not move. An `await_ein` row waits four to six weeks for the IRS, and
+  // bumping this on every poll made its entity re-read and re-hash its manifest on every tick.
+  expect(polled.factsUpdatedAt).toBe(before.factsUpdatedAt);
+
+  // …while a real transition does move it.
+  formation.transition("c1", "await_ein", "pending", "confirmed");
+  expect(formation.find("c1", "await_ein")!.state).toBe("confirmed");
+});
+
+test("the anchor due-set DEDUPES the facts arm per COMPANY, then expands after the limit", () => {
+  // Ten agents on ONE company, and one agent on another. A page of one must not be all ten.
+  for (let i = 0; i < 10; i++) attach(`busy-${i}`, "company-busy");
+  attach("quiet-1", "company-quiet");
+  for (const c of ["company-busy", "company-quiet"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+
+  // ONE row of the pre-expansion page = ONE company, expanded to its ten agents afterwards.
+  const first = anchors.listDue(1);
+  expect(first.entityKeys).toHaveLength(10);
+  expect(new Set(first.entityKeys.map((k) => k.split("-")[0]))).toEqual(new Set(["busy"]));
+  // …and the cursor is what lets the OTHER company be reached at all.
+  expect(first.nextCursor).toBe("company-busy");
+  const second = anchors.listDue(1, first.nextCursor!);
+  expect(second.entityKeys).toEqual(["quiet-1"]);
+});
+
+test("the cursor WRAPS: a short page reports null, and the next sweep starts over", () => {
+  attach("a-1", "company-a");
+  attach("b-1", "company-b");
+  for (const c of ["company-a", "company-b"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+  const page = anchors.listDue(50);
+  expect(page.entityKeys.sort()).toEqual(["a-1", "b-1"]);
+  // Fewer rows than the limit means the end of the set — the caller wraps rather than paging on.
+  expect(page.nextCursor).toBeNull();
+});
+
+test("no key starves: a permanently HELD cycle does not occupy a slot forever", () => {
+  // The starvation shape: a held cycle sorts first and would be re-read on every tick.
+  attach("aaa-held", "company-held");
+  anchors.claimVersion("aaa-held", 2, "0x02");
+  anchors.transition("aaa-held", 2, "pending", "vetoed");
+  attach("zzz-due", "company-due");
+  formation.claimStep("company-due", "await_filing");
+  formation.transition("company-due", "await_filing", "pending", "confirmed");
+
+  const first = anchors.listDue(1);
+  expect(first.entityKeys).toEqual(["aaa-held"]);
+  // The cursor is what makes the second tick see the OTHER one rather than the same held cycle.
+  const second = anchors.listDue(1, first.nextCursor!);
+  expect(second.entityKeys).toEqual(["zzz-due"]);
+});

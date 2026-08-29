@@ -1210,3 +1210,67 @@ test("F12: a filing number that arrives late unblocks v2 — the refusal is a wa
     "2026-001234567",
   );
 });
+
+// ── 2026-08-26 §3: the settling gate, and §2's conditional companyName ─────────────────────
+
+test("a new cycle is NOT opened while the company's facts are still moving", async () => {
+  seedV1();
+  confirmFiling();
+  touchFacts();
+  // The instant the facts landed — which is exactly the state the webhook fast path arrives in,
+  // since it is called from inside the pass that wrote them.
+  clock = Date.now();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ skipped: "facts_settling" });
+  expect(cycles()).toHaveLength(0);
+
+  // One sweep interval later the facts have settled and the cycle opens — ONE cycle folding
+  // everything that landed inside the window, rather than one amendment per fact per agent.
+  clock = Date.now() + 61_000;
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "scheduled" });
+});
+
+test("the settling gate never holds a cycle that is already OPEN", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  expect(cycle(2)!.state).toBe("scheduled");
+  // Facts move again while v2 is in flight. The gate is about OPENING; an open cycle is driven on
+  // every pass, because that is what makes progress guaranteed.
+  confirmEin();
+  touchFacts();
+  clock = Date.now();
+  expect((await advanceAnchor(deps(), ENTITY_KEY)).skipped).not.toBe("facts_settling");
+});
+
+test("legal.companyName is a CONDITIONAL key — absent until a filed name is matched", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const bytes = docStore.getBytes(manifestDocName(ENTITY_KEY, 2));
+  // ABSENT, not null. Every company that predates the field has no filed name, so emitting the
+  // key for all of them would change every legal block's bytes and re-anchor the whole fleet.
+  expect(parseManifest(bytes).legal).not.toHaveProperty("companyName");
+  expect(bytes.toString("utf8")).not.toContain("companyName");
+});
+
+test("a matched filed name moves the hash exactly ONCE — the intended amendment", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const v2Hash = cycle(2)!.manifestHash;
+
+  // The state accepted one of OUR candidates. What is stored is our own string — never doola's
+  // free text, which is what this manifest would otherwise hash onto a public chain.
+  companies.recordFilingFacts(COMPANY_KEY, { legalNameFiled: "Formation Agent" });
+  touchFacts();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 3, state: "scheduled" });
+  expect(cycle(3)!.manifestHash).not.toBe(v2Hash);
+  expect(parseManifest(docStore.getBytes(manifestDocName(ENTITY_KEY, 3))).legal?.companyName).toBe(
+    "Formation Agent",
+  );
+
+  // …and it does not keep moving: the same fact, re-read, is not a new amendment.
+  touchFacts();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  expect(cycles().map((c) => c.version)).toEqual([2, 3]);
+});

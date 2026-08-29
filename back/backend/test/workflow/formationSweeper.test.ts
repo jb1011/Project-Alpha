@@ -22,6 +22,7 @@ import { SqliteFormationRepository } from "../../src/persistence/formationReposi
 import { SqliteOaAnchorRepository } from "../../src/persistence/oaAnchorRepository";
 import { advanceFormation, parseDetail } from "../../src/workflow/formationProcessor";
 import {
+  ANCHOR_BATCH,
   ANCHOR_CONCURRENCY,
   FormationSweeper,
   type FormationSweeperDeps,
@@ -856,4 +857,52 @@ test("F7: the anchor phase drives every due entity, at most ANCHOR_CONCURRENCY a
   expect(seen).toHaveLength(keys.length); // the queue is drained, not truncated
   expect(peak).toBeGreaterThan(1); // …in parallel
   expect(peak).toBeLessThanOrEqual(ANCHOR_CONCURRENCY); // …and bounded
+});
+
+// ── 2026-08-26 §3: the anchor batch carries a CURSOR across ticks ──────────────────────────
+
+test("the anchor cursor advances across ticks and WRAPS — no entity starves behind a held one", async () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  // More due entities than one batch can hold. Without a cursor the first ANCHOR_BATCH keys are
+  // re-read on every tick forever and the tail is never reached at all.
+  const keys = seedHeldEntities(ANCHOR_BATCH + 3, anchors);
+  const seen: string[] = [];
+  const chain = fakeAnchorChain();
+  const arc = {
+    ...chain.chain,
+    oaVetoed: async (_proxy: string, hash: string) => {
+      seen.push(hash);
+      return true;
+    },
+  } as unknown as typeof chain.chain;
+
+  const s = sweeper({ anchor: { anchors, arc, chainId: 5042002 } });
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (l: string) => lines.push(l);
+  try {
+    await s.tick();
+    const first = seen.length;
+    expect(first).toBe(ANCHOR_BATCH);
+    // A full batch is an ops line, not an error: the cursor is what makes leaving work behind
+    // safe, but a batch full on every tick is a deployment that has outgrown ANCHOR_BATCH.
+    expect(lines.map((l) => JSON.parse(l)).some((l) => l.opslog === "anchor_batch_full")).toBe(
+      true,
+    );
+
+    // The SECOND tick resumes where the first stopped rather than re-reading its head.
+    await s.tick();
+    expect(seen.length).toBe(keys.length);
+    expect(new Set(seen).size).toBe(keys.length);
+
+    // …and then wraps: the short page reset the cursor, so a third tick starts over at the head.
+    // (Past the veto re-check backoff, or the held cycles are simply not due yet — a re-check is
+    // a deliberate human-scale interval, not something that happens between two ticks.)
+    now += 60 * 60 * 1000;
+    await s.tick();
+    expect(seen.length).toBeGreaterThan(keys.length);
+    expect(seen.slice(keys.length)).toEqual(seen.slice(0, seen.length - keys.length));
+  } finally {
+    console.log = orig;
+  }
 });

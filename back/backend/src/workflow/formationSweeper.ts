@@ -154,6 +154,15 @@ export class FormationSweeper {
    */
   private readonly warned = new Set<string>();
 
+  /**
+   * Where the last anchor batch stopped (2026-08-26 §3).
+   *
+   * In memory, like the warning set and for the same reason: it is a FAIRNESS aid, not state
+   * anything depends on. A restart re-starts the sweep from the beginning of the set, which costs
+   * one pass over cheap gates and cannot lose work — every candidate is re-derived from rows.
+   */
+  private anchorCursor: string | undefined;
+
   constructor(private readonly d: FormationSweeperDeps) {}
 
   private now(): number {
@@ -558,7 +567,23 @@ export class FormationSweeper {
     const anchor = this.d.anchor;
     if (!anchor) return; // no anchor wiring: the v1-row-only shape, unchanged
     const deps = { ...this.d, ...anchor };
-    const queue = anchor.anchors.listDueEntityKeys(ANCHOR_BATCH);
+    // THE KEYSET CURSOR (2026-08-26 §3). A held cycle whose key sorts early used to occupy a slot
+    // on every tick forever, so under N:1 — where one company can contribute ten entities to the
+    // same page — the tail of the due set was never reached at all. The cursor is carried across
+    // ticks and WRAPS: a short batch means the end of the set, and the next tick starts over.
+    const { entityKeys, nextCursor } = anchor.anchors.listDue(ANCHOR_BATCH, this.anchorCursor);
+    this.anchorCursor = nextCursor ?? undefined;
+    if (nextCursor !== null)
+      // A full batch means work was left behind. It is not an error — the cursor is exactly what
+      // makes that safe — but a batch that is full on EVERY tick is a deployment that has
+      // outgrown ANCHOR_BATCH, and only an ops line makes that visible.
+      opsLog("anchor_batch_full", {
+        level: "warn",
+        batch: ANCHOR_BATCH,
+        entities: entityKeys.length,
+        environment: this.d.environment,
+      });
+    const queue = entityKeys;
     const worker = async () => {
       for (;;) {
         const entityKey = queue.shift();

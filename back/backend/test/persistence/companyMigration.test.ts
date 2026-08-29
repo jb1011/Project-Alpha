@@ -1,7 +1,10 @@
 import type Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_DESCRIPTION, DEFAULT_INDUSTRY } from "../../src/formation/intake";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
+import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
+import { SqliteOaAnchorRepository } from "../../src/persistence/oaAnchorRepository";
 import {
   legacyDocument,
   legacyEntity,
@@ -334,5 +337,127 @@ describe("the entity → company re-key", () => {
         }
       ).n,
     ).toBe(1);
+  });
+
+  // ── The three fixtures that are about what happens AFTER the boot (§2 step 5) ─────────────
+
+  test("a party bound to a FILED company is not erasable, eight days later", () => {
+    const db = openLegacyDb();
+    const key = legacyEntity(db, { filedAt: 1_756_000_000, filingNumber: "2026-1" });
+    legacyParty(db, { partyId: "p1", entityKey: key, createdAt: "2026-08-01 00:00:00" });
+    legacyStep(db, {
+      entityKey: key,
+      step: "create_provider",
+      state: "confirmed",
+      providerRef: "cmp-1",
+    });
+    legacyStep(db, { entityKey: key, step: "await_filing", state: "confirmed" });
+
+    migrate(db);
+
+    // Day 8 for an UNBOUND handle is the erasure cutoff. This one is bound to a real Wyoming
+    // filing: erasing it would destroy the identity of a responsible party we are required to
+    // hold and could not reconstruct. `listStaleUnbound` requires BOTH keys to be null, which is
+    // what the backfill makes true — and the abandoned arm requires an abandoned create.
+    const parties = new SqliteFormationPartyRepository(db);
+    expect(parties.listErasable("2026-08-09 00:00:00")).toEqual([]);
+    expect(parties.findOwned("tenant-a", "p1")?.legalFirstName).toBe("Ada");
+  });
+
+  test("a migrated entity's legal block is byte-identical — no fleet-wide re-anchor", () => {
+    const db = openLegacyDb();
+    const key = legacyEntity(db, {
+      filedAt: 1_756_000_000,
+      filingNumber: "2026-123456",
+      einReal: "88-1234567",
+    });
+    legacyParty(db, { partyId: "p1", entityKey: key });
+    for (const step of ["create_provider", "await_filing", "fetch_documents", "await_ein"])
+      legacyStep(db, { entityKey: key, step, state: "confirmed", providerRef: "cmp-1" });
+    legacyDocument(db, {
+      id: "doc-a",
+      entityKey: key,
+      docType: "ArticlesOfOrganization",
+      providerDocId: "d1",
+    });
+
+    migrate(db);
+
+    const companies = new SqliteCompanyRepository(db);
+    const company = companies.find(
+      (
+        db.prepare("SELECT company_id AS c FROM entities WHERE idempotency_key = ?").get(key) as {
+          c: string;
+        }
+      ).c,
+    )!;
+    // The facts MOVED, unchanged: the block the anchor loop builds next carries exactly what the
+    // entity columns held, so `sameLegal` short-circuits and no new version is opened.
+    const entity = db.prepare("SELECT * FROM entities WHERE idempotency_key = ?").get(key) as {
+      formation_filed_at: number;
+      formation_filing_number: string;
+      ein_real: string;
+    };
+    expect(company.filedAt).toBe(entity.formation_filed_at);
+    expect(company.filingNumber).toBe(entity.formation_filing_number);
+    expect(company.ein).toBe(entity.ein_real);
+    // …and the ONE field that could have changed the bytes is absent. `normalizeLegal` emits
+    // `companyName` only for a non-empty filed name, and no migrated company has one.
+    expect(company.legalNameFiled).toBeNull();
+    // The document keeps its index id and its path: the manifest commits to those bytes.
+    const doc = db.prepare("SELECT * FROM documents WHERE id = 'doc-a'").get() as {
+      path: string;
+      sha256: string;
+    };
+    expect(doc.path).toBe("doc-doc-a.pdf");
+    expect(doc.sha256).toBe("sha-d1");
+  });
+
+  test("the anchor due-set is the SAME set before and after the migration", () => {
+    const db = openLegacyDb();
+    // One entity whose facts moved since its last anchor write (due), and one that is settled.
+    const due = legacyEntity(db, { key: "tenant-a:due" });
+    const settled = legacyEntity(db, { key: "tenant-a:settled" });
+    for (const k of [due, settled]) {
+      legacyParty(db, { partyId: `p-${k}`, entityKey: k });
+      legacyStep(db, { entityKey: k, step: "create_provider", state: "confirmed", providerRef: k });
+      legacyStep(db, {
+        entityKey: k,
+        step: "await_filing",
+        state: "confirmed",
+        updatedAt: "2026-08-02 11:22:33",
+      });
+    }
+    // The settled one already anchored AFTER its facts moved.
+    db.prepare(
+      `INSERT INTO oa_anchors (entity_key, version, manifest_hash, state, updated_at)
+       VALUES (?, 2, '0xaa', 'executed', '2026-08-03 00:00:00')`,
+    ).run(settled);
+
+    // The PRE-migration query, written out against the legacy schema — the only honest way to
+    // compare a set across a schema change is to ask the old shape the old question.
+    const before = (
+      db
+        .prepare(
+          `SELECT k FROM (
+             SELECT DISTINCT entity_key AS k FROM oa_anchors
+              WHERE state IN ('pending','scheduled','vetoed','failed')
+             UNION
+             SELECT f.entity_key AS k
+               FROM formation_requests f
+               LEFT JOIN (SELECT entity_key, MAX(updated_at) AS last
+                            FROM oa_anchors GROUP BY entity_key) a
+                 ON a.entity_key = f.entity_key
+              WHERE f.state = 'confirmed'
+                AND (a.last IS NULL OR f.updated_at >= a.last)
+           ) ORDER BY k LIMIT 50`,
+        )
+        .all() as { k: string }[]
+    ).map((r) => r.k);
+    expect(before).toEqual([due]);
+
+    migrate(db);
+
+    expect(new SqliteOaAnchorRepository(db).listDueEntityKeys(50)).toEqual(before);
   });
 });

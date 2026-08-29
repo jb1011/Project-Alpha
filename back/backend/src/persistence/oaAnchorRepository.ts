@@ -174,7 +174,14 @@ export interface OaAnchorRepository {
    * limit, so one busy company cannot fill the whole batch with its ten agents while every other
    * company waits. The expansion means the returned list can exceed `limit`; that is deliberate,
    * and the caller's concurrency bound is what keeps a tick bounded.
+   *
+   * And it takes a KEYSET CURSOR — `WHERE k > @after ORDER BY k LIMIT ?`, the anti-starvation
+   * shape `listPollDue` already has. Without one, a permanently-held cycle whose key sorts early
+   * occupies a slot on every tick forever, and the tail of the set is never reached at all. The
+   * caller persists `nextCursor` and wraps when a short batch says the end has been reached.
    */
+  listDue(limit: number, after?: string): { entityKeys: string[]; nextCursor: string | null };
+  /** The cursor-less form, for callers that want the whole head of the set. */
   listDueEntityKeys(limit: number): string[];
   transition(
     entityKey: string,
@@ -388,9 +395,18 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
     return (this.stmts.listByState.all(state) as Row[]).map(toRecord);
   }
 
+  listDue(limit: number, after = ""): { entityKeys: string[]; nextCursor: string | null } {
+    const rows = this.stmts.listDue.all({ after, limit }) as { k: string; kind: string }[];
+    return {
+      entityKeys: this.expandDue(rows),
+      // The cursor is the last key of the PRE-EXPANSION page, so the next call resumes exactly
+      // where the LIMIT cut. A short page means the end: null tells the caller to wrap.
+      nextCursor: rows.length === limit ? (rows[rows.length - 1]?.k ?? null) : null,
+    };
+  }
+
   listDueEntityKeys(limit: number): string[] {
-    const rows = this.stmts.listDue.all({ after: "", limit }) as { k: string; kind: string }[];
-    return this.expandDue(rows);
+    return this.listDue(limit).entityKeys;
   }
 
   /** Company ids become entity keys HERE, after the limit has already been applied — which is
