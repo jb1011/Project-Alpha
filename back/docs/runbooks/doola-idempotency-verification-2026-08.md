@@ -147,3 +147,17 @@ that nothing was filed, so it can never be what authorizes a fresh `POST /compan
 Before the mainnet flip, re-run against **production** with a `dk_live_` key — the probe refuses
 that by design (it creates companies), so a production verification is a *one-company, manual*
 exercise against the first real filing, not this script.
+
+## Addendum 2026-08-29 — re-ordered JSON under the same key (A1 merge gate 2)
+
+Script: `back/backend/scripts/doola-idempotency-reorder-probe.mts`. Run `1788011954`, customer
+`3IaoHv9zXhHSGwwBPBCRBGejR9L`. The first `POST /companies` created `3IaoHvjnRyDJCEXhwP6nvKpFxNu`
+(988 bytes). The replay used the SAME `Idempotency-Key` and the SAME values with every JSON object's
+keys re-ordered (also 988 bytes): **2xx, same company id returned**.
+
+**Verdict: SEMANTIC.** doola compares the parsed body, not the bytes, so field order is free. Our
+same-key retry still rebuilds the body from the persisted company row (canonical, stable order) —
+not because doola needs it, but because a value change under the same key is what returns
+`409 E_IDEMPOTENCY_KEY_REUSED` (verified 2026-08-19), and the persisted row is the only thing that
+guarantees the values are identical. The list read immediately after the replay returned 0
+companies (eventual consistency, ~15s); minutes later it returned the one expected row.
