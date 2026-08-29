@@ -33,6 +33,7 @@ Status legend: ✅ current · 📓 historical record (the work it plans/designs 
 | [plans/2026-06-08-agent-treasury-vault.md](./plans/2026-06-08-agent-treasury-vault.md) | 📓 | `AgentTreasury` vault plan — **completed**. |
 | [plans/2026-06-10-backend-onboarding-brain-implementation.md](./plans/2026-06-10-backend-onboarding-brain-implementation.md) | ✅ | Phase-2 backend plan — being executed; the brain is built (translator, OA gen, Arc adapter, Turnkey, saga, CLI), live Arc E2E pending. |
 | [plans/2026-06-18-nanopayments-x402-phase3-implementation.md](./plans/2026-06-18-nanopayments-x402-phase3-implementation.md) | 📓 | Phase-3 implementation plan — **completed** (seller/settle 3A, in-process vendor 3B, tools/pricing 3C, Claude insight-agent loop 3D, demo CLI + live spike 3E). All 145 tests pass; live agent gated on `ANTHROPIC_API_KEY`. |
+| [plans/2026-06-29-frontend-surfacing-roadmap.md](./plans/2026-06-29-frontend-surfacing-roadmap.md) | 📓 | Frontend surfacing roadmap (kept here so the public GitBook does not publish it). |
 
 ## Research (co-founder owned — legal + technical)
 | Doc | Status | What it is |
@@ -52,6 +53,7 @@ Status legend: ✅ current · 📓 historical record (the work it plans/designs 
 | Doc | Status | What it is |
 |---|---|---|
 | [audit/2026-06-09-internal-security-audit.md](./audit/2026-06-09-internal-security-audit.md) | 📓 | Internal security audit of the Phase-1 contracts (no Critical/High). |
+| [audit/2026-08-07-frontend-audit.md](./audit/2026-08-07-frontend-audit.md) | 📓 | Frontend truthfulness audit (kept here so the public GitBook does not publish it). |
 
 ## The legal model, in one line
 A fully human-less ("Bayern / zero-member") entity is **legally foreclosed**; a named, KYC'd

@@ -1,0 +1,8 @@
+{
+  "title": "Novi Corpus",
+  "language": "en",
+  "plugins": ["-sharing", "-fontsettings"],
+  "styles": {
+    "website": "styles/website.css"
+  }
+}

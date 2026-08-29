@@ -166,6 +166,7 @@ back/          Smart contracts (Foundry) + TypeScript backend ("the brain")
   subgraph/    The Graph subgraph (Arc testnet)
   docs/        Specs, designs, and research — start at back/docs/README.md
                ETHGlobal specs: back/docs/ethglobal-lisbon-2026/
+docs/          Public GitBook (docs.novicorpus.com)
 ```
 
 ## Quick start
@@ -208,8 +209,11 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ## Documentation
 
+Public product docs (GitBook, intended host `docs.novicorpus.com`) live in [`docs/`](./docs/).
+
+- [docs/README.md](./docs/README.md). Public GitBook homepage.
 - [back/README.md](./back/README.md) — architecture, deployed contracts, getting started
-- [back/docs/README.md](./back/docs/README.md) — full doc index (specs, designs, runbooks)
+- [back/docs/README.md](./back/docs/README.md) — full internal doc index (specs, designs, runbooks)
 - [back/docs/ethglobal-lisbon-2026/](./back/docs/ethglobal-lisbon-2026/) — hackathon specs (ENS T1–T7, World W0–W9, Graph G1–G7) and build references
 - [back/docs/POSITIONING.md](./back/docs/POSITIONING.md) — what makes this different from "just another governed wallet"
 
