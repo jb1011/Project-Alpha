@@ -143,8 +143,10 @@ accepted, bounded by the agents-per-company cap.
    trial-decrypted. `FORMATION_PII_KEY` lives in `config/env.ts` with a boot invariant (required
    when doola is production). Stated honestly: the key shares the box `.env` — encryption-at-rest
    defends the Litestream→R2 replica, not a compromised box.
-3. Forwarded ONLY in `createCompany` (`responsibleParty.ssn`; `createCustomer` takes no SSN —
-   whether `members[0].ssn` should also carry it is a one-line doola question, default: no).
+3. Forwarded ONLY in `createCompany`, ONCE, as `responsibleParty.ssn` (`createCustomer` takes no
+   SSN; `members[].ssn` is never sent). Settled from doola's docs 2026-08-27: US-vs-non-US is
+   derived from ANY one person's `ssn`, and the responsible party is the IRS-relevant person, so
+   sending it once is sufficient and minimises PII exposure.
 4. Deleted (`ssn_ciphertext = NULL`, `ssn_deleted_at = now`) in the SAME transaction that
    persists `doola_company_id` — both the create-persist and the adopt path; idempotent. Not
    earlier (same-key retry must rebuild a byte-identical body or doola 409s; consequence is a
@@ -205,9 +207,12 @@ Flow:
    skipped entirely and beta copy says formation is included.
 6. **Refunds:** manual CLI, but METERED — `formation_refund` joins the `OutflowPath` enum under
    the S5 meter and ceiling (the CLI-outside-the-meter hole is exactly what S5 closed once
-   already). **Revenue custody named:** `FORMATION_REVENUE_ADDRESS` is receive-only with NO key
-   on the box (Circle DevC wallet under a SEPARATE entity secret, or hardware); refunds are paid
-   from a small capped hot float wallet listed in the S4 key inventory. Boot invariants: revenue
+   already). **Revenue custody DECIDED (2026-08-27):** `FORMATION_REVENUE_ADDRESS` is a Ledger
+   hardware-wallet account — receive-only, NO key on the box, listed in the S4 key inventory.
+   Refunds are signed MANUALLY from the Ledger by runbook, so B1 ships NO fund-moving refund
+   path and NO hot float: the CLI only RECORDS a refund (`settled → refunded` with the Ledger
+   tx hash, opsLogged) and moves nothing. A capped, S5-metered hot float for automated refunds
+   is a later phase, built only if refund volume justifies it. Boot invariants: revenue
    address ≠ executor and ≠ every operational key; payment cannot be required in sandbox.
 7. **Identity floor (the anonymous-USDC-buys-real-LLCs finding):** production formation
    (`DOOLA_ENVIRONMENT=production` OR payment required) boot-requires `WORLD_REQUIRE_GUARDIAN=on`
@@ -218,7 +223,13 @@ Flow:
    payment.
 8. `/config` gains `formationPaymentRequired` + `formationFeeUsdc` (deliberate departure from
    the booleans-only rule — public pricing; the revenue address stays OFF it, the quote carries
-   `payTo` on an authenticated route).
+   `payTo` on an authenticated route). Fee (provisional, 2026-08-27): `FORMATION_FEE_USDC=399`
+   all-in; the Wyoming filing fee ($100, OUTSIDE doola's pack per doola's FAQ and state-fees
+   endpoint) is shown as a breakdown line in copy, never added at checkout. Beta copy:
+   "included during the beta, normally $399". `formation_payments.product TEXT NOT NULL DEFAULT
+   'formation'` with `CHECK (product IN ('formation','maintenance_year'))` so a yearly
+   maintenance quote (registered-agent renewal + annual report) is additive later; B1 quotes
+   `formation` only. Billing is per COMPANY: attaching an agent to an existing company is free.
 9. **B1 merge gate: a live probe settling a real signed authorization to a test revenue address
    on Arc testnet** (the house six-probes precedent; B1 touches no doola so it needs its own
    live gate).
@@ -258,8 +269,8 @@ Flow:
   `formation_payment_{quoted,settling,settled,released,refund}`, `formation_ssn_erased`,
   `formation_velocity_warn`.
 - Runbooks updated in the same PRs: `doola-deploy.md` (door table AGAIN), `doola-webhooks.md`
-  (provider_ref → company), `.env.example`/`.env.sandbox.example`, S4 key inventory (revenue +
-  refund float), S5 outflow paths (`formation_refund`).
+  (provider_ref → company), `.env.example`/`.env.sandbox.example`, S4 key inventory (revenue
+  address = Ledger, no refund float), manual-refund runbook.
 
 ## 8. Threat model (delta, amended)
 
@@ -267,7 +278,7 @@ SSN as §4 (adopt-safe, encrypted, AAD-bound, TTL-abandon rule). Payment: signat
 amount+recipient+validBefore+nonce; local verification against the stored quote; nonce uniqueness
 from the row; settle crash-window persisted; unique live-payment index; velocity alerts.
 Reuse: door + claim-transaction CAS; pin from company row; write-once company_id. Revenue
-custody: receive-only, no key on the box; refund float capped + metered (S5) + inventoried (S4).
+custody: receive-only Ledger, no key on the box; refunds signed manually, recorded not executed.
 Identity: World personhood boot-invariant + per-human entity ceiling + kept quotas + doola KYB
 named. Migration: refusal predicates, verbatim timestamps, key-prefix preservation, PII-query
 re-keys with fixture proofs. Public linkability of shared companies disclosed, not hidden.
@@ -293,12 +304,16 @@ idempotency probe; attach-CAS race (abandon between door and claim loses); compa
   spend-control move.
 - **A3** — wizard branch + Companies section + labels + document-route move + shim removal +
   compliance-calendar consumption.
-- **B1** — payments (flag off) + revenue/refund custody + metered refund CLI + live settle probe.
+- **B1** — payments (flag off) + Ledger revenue address + refund-recording CLI + manual-refund
+  runbook + live settle probe.
 - Deployment to the box is a separate, deliberate decision (Sept-15 demo runs on today's state).
 - **Externals:** counsel (N:1 document coherence, terms-doc/doola-OA duality, Series LLC, DAO
-  supplement); Halyna (annual-report/BOI ownership under packs; FinCEN BOI status — likely
-  domestic-exempt since 2025, verify; where the filed name is authoritatively readable; whether
-  `members[0].ssn` should carry the SSN too); pricing (fee amount, state-fee pass-through).
+  supplement); Haliny (asked 2026-08-27: who files the annual report and at what cost, registered-
+  agent renewal price from year two and how reminders arrive — no renewal webhook event exists;
+  expedited-EIN per-use price; where the state-accepted name is readable when a lower-ranked
+  option is filed — the company object has no filed-name field). Settled without asking: state
+  fee outside the pack (WY $100), pack includes EIN + RA year one + OA, SSN once on the
+  responsible party, BOI moot (domestic entities exempt since March 2025).
 
 ## 11. Out of scope (explicit)
 
