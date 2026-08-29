@@ -1,5 +1,18 @@
 # Runbook — doola webhooks
 
+> ⚠ **A1 (2026-08-26):** a webhook's `doolaCompanyId` now maps to a **company**, not to an entity.
+> `formation_requests.provider_ref` is unchanged on the wire and in the table — what changed is the
+> row it sits on, which is keyed `(company_id, step)`. One wake-up therefore advances ONE company,
+> where it used to advance one entity, and every agent attached to that company sees the result.
+> Ops lines that used to carry `entityKey` carry `companyId`; a journald filter written against
+> the old field name will come back empty rather than wrong. To find the agents behind a company:
+>
+> ```bash
+> sqlite3 "$DATA_DIR/legalbody.db" \
+>   "SELECT idempotency_key FROM entities WHERE company_id =
+>      (SELECT company_id FROM formation_requests WHERE provider_ref = '<doolaCompanyId>');"
+> ```
+
 > Covers the inbound receiver shipped in PR 2 part B.
 > Design: `back/docs/design/2026-08-19-doola-formation-provider-design.md` §6 (receiver), §5
 > (event handling), §7 (sweeper), §10 (threat model).
