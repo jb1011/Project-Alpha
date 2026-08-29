@@ -1,0 +1,14 @@
+{
+  "name": "novi-corpus-docs",
+  "private": true,
+  "scripts": {
+    "build": "honkit build .",
+    "serve": "honkit serve ."
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "honkit": "6.2.2"
+  }
+}
