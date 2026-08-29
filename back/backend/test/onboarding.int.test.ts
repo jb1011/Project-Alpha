@@ -155,7 +155,7 @@ test("resume from 'created': a bind failure stays 'created'; re-run binds withou
 test("optional fundAmount runs the fund step: status 'funded' and treasury holds the USDC", async () => {
   const key = "agent-C";
   // The manager needs USDC to fund the new entity's treasury.
-  await wallet.writeContract({
+  const mintHash = await wallet.writeContract({
     address: stack.usdc,
     abi: mockUsdcAbi,
     functionName: "mint",
@@ -163,6 +163,7 @@ test("optional fundAmount runs the fund step: status 'funded' and treasury holds
     account: manager,
     chain: anvilChain,
   });
+  await pub.waitForTransactionReceipt({ hash: mintHash }); // a hash is not a balance
 
   const rec = await runOnboarding({
     spec: spec(),
@@ -193,7 +194,7 @@ test("optional fundAmount runs the fund step: status 'funded' and treasury holds
 test("re-funding an already-funded entity moves more USDC (audit fix B-safe: re-fundable treasury)", async () => {
   const key = "agent-D";
   // The manager needs USDC for two separate fund rounds.
-  await wallet.writeContract({
+  const mintHash = await wallet.writeContract({
     address: stack.usdc,
     abi: mockUsdcAbi,
     functionName: "mint",
@@ -201,6 +202,7 @@ test("re-funding an already-funded entity moves more USDC (audit fix B-safe: re-
     account: manager,
     chain: anvilChain,
   });
+  await pub.waitForTransactionReceipt({ hash: mintHash }); // a hash is not a balance
 
   const first = await runOnboarding({
     spec: spec(),

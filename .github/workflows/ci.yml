@@ -1,5 +1,9 @@
 name: CI
 
+permissions:
+  contents: read
+  pull-requests: read # dorny/paths-filter reads the PR file list
+
 on:
   pull_request:
     branches: [main]
@@ -29,6 +33,8 @@ jobs:
           fetch-depth: 0 # full history so path filtering works on push events too
 
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1 # pinned: unpinned = nightly, which exposed the mint race in fund.int.test.ts
 
       - name: Detect contract changes
         id: changes
@@ -71,6 +77,8 @@ jobs:
       # Backend *.int.test.ts deploy mocks to a local anvil and read forge artifacts,
       # so this job needs Foundry and a forge build too, not just Node.
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.5.1 # pinned: unpinned = nightly, which exposed the mint race in fund.int.test.ts
 
       - name: Cache foundry deps
         uses: actions/cache@v4
