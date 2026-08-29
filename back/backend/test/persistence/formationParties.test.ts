@@ -60,42 +60,42 @@ test("tenant isolation: another tenant cannot read a party by its id", () => {
   expect(parties.findOwned(TENANT_A, id)).toBeDefined();
 });
 
-test("bind is a CAS: it moves once, for the owner only, and never twice", () => {
+test("the company bind is a CAS: it moves once, for the owner only, and never twice", () => {
   const id = parties.create(party(TENANT_A));
 
   // A foreign tenant cannot bind it, even knowing the id.
-  expect(parties.bind(id, "0xB:agent", TENANT_B)).toBe(false);
+  expect(parties.bindToCompany(id, "company-b", TENANT_B)).toBe(false);
 
-  expect(parties.bind(id, "0xA:agent", TENANT_A)).toBe(true);
-  expect(parties.findOwned(TENANT_A, id)!.entityKey).toBe("0xA:agent");
+  expect(parties.bindToCompany(id, "company-a", TENANT_A)).toBe(true);
+  expect(parties.findOwned(TENANT_A, id)!.companyId).toBe("company-a");
 
-  // Second bind — the "two entities on one consent" case — loses.
-  expect(parties.bind(id, "0xA:other", TENANT_A)).toBe(false);
-  expect(parties.findOwned(TENANT_A, id)!.entityKey).toBe("0xA:agent");
+  // Second bind — the SINGLE-USE rule, "two companies on one consent" — loses.
+  expect(parties.bindToCompany(id, "company-other", TENANT_A)).toBe(false);
+  expect(parties.findOwned(TENANT_A, id)!.companyId).toBe("company-a");
 });
 
-test("one party per entity: the UNIQUE entity_key refuses a second binding to the same entity", () => {
+test("one party per company: the UNIQUE company_id refuses a second binding to the same company", () => {
   const first = parties.create(party(TENANT_A));
   const second = parties.create(party(TENANT_A));
-  expect(parties.bind(first, "0xA:agent", TENANT_A)).toBe(true);
-  expect(() => parties.bind(second, "0xA:agent", TENANT_A)).toThrow(/UNIQUE/);
+  expect(parties.bindToCompany(first, "company-a", TENANT_A)).toBe(true);
+  expect(() => parties.bindToCompany(second, "company-a", TENANT_A)).toThrow(/UNIQUE/);
 });
 
-test("findByEntityKey is what create_provider files with", () => {
+test("findByCompanyId is what create_provider files with", () => {
   const id = parties.create(party(TENANT_A, { legalFirstName: "Grace" }));
-  expect(parties.findByEntityKey("0xA:agent")).toBeUndefined();
-  parties.bind(id, "0xA:agent", TENANT_A);
-  expect(parties.findByEntityKey("0xA:agent")!.legalFirstName).toBe("Grace");
+  expect(parties.findByCompanyId("company-a")).toBeUndefined();
+  parties.bindToCompany(id, "company-a", TENANT_A);
+  expect(parties.findByCompanyId("company-a")!.legalFirstName).toBe("Grace");
 });
 
 test("an ERASED party is invisible to every read (the H7 retention marker)", () => {
   const id = parties.create(party(TENANT_A));
-  parties.bind(id, "0xA:agent", TENANT_A);
+  parties.bindToCompany(id, "company-a", TENANT_A);
   db.prepare("UPDATE formation_parties SET deleted_at = CURRENT_TIMESTAMP WHERE party_id = ?").run(
     id,
   );
   expect(parties.findOwned(TENANT_A, id)).toBeUndefined();
-  expect(parties.findByEntityKey("0xA:agent")).toBeUndefined();
+  expect(parties.findByCompanyId("company-a")).toBeUndefined();
 });
 
 test("a synthetic party is stored as such — the flag is not a rendering decision", () => {

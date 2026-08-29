@@ -12,6 +12,7 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { sqliteUtcTimestamp } from "../../src/formation";
 import { deriveFormationStatus } from "../../src/formation/status";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
 import { SqliteDoolaEventRepository } from "../../src/persistence/doolaEventRepository";
@@ -33,6 +34,7 @@ import {
 } from "../../src/workflow/formationSweeper";
 import {
   COMPANY_ID,
+  COMPANY_KEY,
   ENTITY_KEY,
   type FakeDoola,
   MemoryDocumentStore,
@@ -41,6 +43,7 @@ import {
   fakeAnchorChain,
   fakeDoola,
   formedEntity,
+  seedCompany,
 } from "../helpers/formationFakes";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -48,6 +51,7 @@ let now = Date.parse("2026-08-21T12:00:00Z");
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
+let companies: SqliteCompanyRepository;
 let requests: SqliteFormationRepository;
 let documents: SqliteDocumentIndexRepository;
 let events: SqliteDoolaEventRepository;
@@ -58,6 +62,7 @@ let doola: FakeDoola;
 function deps(over: Partial<FormationSweeperDeps> = {}): FormationSweeperDeps {
   return {
     repo,
+    companies,
     requests,
     documents,
     parties,
@@ -76,9 +81,10 @@ function deps(over: Partial<FormationSweeperDeps> = {}): FormationSweeperDeps {
 const sweeper = (over: Partial<FormationSweeperDeps> = {}) => new FormationSweeper(deps(over));
 
 function seedFormation(over: Parameters<typeof formedEntity>[0] = {}) {
+  seedCompany(companies);
   repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }), ...over }));
-  requests.claimAllSteps(ENTITY_KEY);
-  requests.transition(ENTITY_KEY, "create_provider", "pending", "confirmed", {
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
     providerRef: COMPANY_ID,
   });
   // Pin the rows to the INJECTED clock. SQLite stamps CURRENT_TIMESTAMP from the real wall clock,
@@ -89,12 +95,12 @@ function seedFormation(over: Parameters<typeof formedEntity>[0] = {}) {
 
 function stampRows(at: number) {
   db.prepare(
-    "UPDATE formation_requests SET created_at = ?, updated_at = ? WHERE entity_key = ?",
-  ).run(sqliteUtcTimestamp(at), sqliteUtcTimestamp(at), ENTITY_KEY);
+    "UPDATE formation_requests SET created_at = ?, updated_at = ?, facts_updated_at = ? WHERE company_id = ?",
+  ).run(sqliteUtcTimestamp(at), sqliteUtcTimestamp(at), sqliteUtcTimestamp(at), COMPANY_KEY);
 }
 
 /** A formation party, optionally bound. Every real filing has one — the door gate requires it. */
-function newParty(over: { entityKey?: string } = {}): string {
+function newParty(over: { companyId?: string } = {}): string {
   const id = parties.create({
     tenantId: TENANT,
     legalFirstName: "Ada",
@@ -109,18 +115,18 @@ function newParty(over: { entityKey?: string } = {}): string {
     country: "USA",
     synthetic: false,
   });
-  if (over.entityKey) parties.bind(id, over.entityKey, TENANT);
+  if (over.companyId) parties.bindToCompany(id, over.companyId, TENANT);
   return id;
 }
 
-const rowOf = (step: string) => requests.stepsOf(ENTITY_KEY).find((s) => s.step === step);
+const rowOf = (step: string) => requests.stepsOf(COMPANY_KEY).find((s) => s.step === step);
 const stateOf = (step: string) => rowOf(step)?.state ?? "(missing)";
 
 /** Put a row into `failed` at a chosen attempt count and age, the way a real failure leaves it. */
 function fail(step: string, attempt: number, updatedMsAgo = 0) {
   db.prepare(
-    "UPDATE formation_requests SET state='failed', attempt=?, updated_at=? WHERE entity_key=? AND step=?",
-  ).run(attempt, sqliteUtcTimestamp(now - updatedMsAgo), ENTITY_KEY, step);
+    "UPDATE formation_requests SET state='failed', attempt=?, updated_at=? WHERE company_id=? AND step=?",
+  ).run(attempt, sqliteUtcTimestamp(now - updatedMsAgo), COMPANY_KEY, step);
 }
 
 beforeEach(() => {
@@ -128,6 +134,7 @@ beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
+  companies = new SqliteCompanyRepository(db);
   requests = new SqliteFormationRepository(db);
   documents = new SqliteDocumentIndexRepository(db);
   events = new SqliteDoolaEventRepository(db);
@@ -195,12 +202,13 @@ test("an abandoned row is terminal — the next tick does not resurrect it", asy
 test("create_provider is retried too — through the saga step, which ADOPTS rather than re-files", async () => {
   // The company id is already persisted, which is the crash-window case: a retry must never file
   // a second real Wyoming LLC.
+  seedCompany(companies);
   repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
-  requests.claimAllSteps(ENTITY_KEY);
-  newParty({ entityKey: ENTITY_KEY });
+  requests.claimAllSteps(COMPANY_KEY);
+  newParty({ companyId: COMPANY_KEY });
   db.prepare(
-    "UPDATE formation_requests SET state='failed', attempt=1, provider_ref=?, updated_at=? WHERE entity_key=? AND step='create_provider'",
-  ).run(COMPANY_ID, sqliteUtcTimestamp(now - DAY), ENTITY_KEY);
+    "UPDATE formation_requests SET state='failed', attempt=1, provider_ref=?, updated_at=? WHERE company_id=? AND step='create_provider'",
+  ).run(COMPANY_ID, sqliteUtcTimestamp(now - DAY), COMPANY_KEY);
 
   await sweeper().tick();
   expect(stateOf("create_provider")).toBe("confirmed");
@@ -216,11 +224,12 @@ test("create_provider is retried too — through the saga step, which ADOPTS rat
 // EVERY other pass: `bound`/`funded` so the onboarding reconciler skips it, and with no formation
 // rows at all so every row query skips it too.
 
-test("C2: an entity pinned with a party but NO formation rows is opened and filed", async () => {
+test("C2: a READY company with a party but NO formation rows is opened and filed", async () => {
   // The crash: the claim committed (pin + party bind), nothing else did.
+  seedCompany(companies);
   repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
-  newParty({ entityKey: ENTITY_KEY });
-  expect(requests.stepsOf(ENTITY_KEY)).toHaveLength(0);
+  newParty({ companyId: COMPANY_KEY });
+  expect(requests.stepsOf(COMPANY_KEY)).toHaveLength(0);
 
   const created = { doolaCompanyId: COMPANY_ID, formationSubmissionStatus: "PENDING" };
   const calls: string[] = [];
@@ -238,7 +247,7 @@ test("C2: an entity pinned with a party but NO formation rows is opened and file
   await sweeper().tick();
 
   // All four rows exist now, and the filing actually went out.
-  expect(requests.stepsOf(ENTITY_KEY).map((r) => r.step)).toEqual([
+  expect(requests.stepsOf(COMPANY_KEY).map((r) => r.step)).toEqual([
     "create_provider",
     "await_filing",
     "fetch_documents",
@@ -248,27 +257,29 @@ test("C2: an entity pinned with a party but NO formation rows is opened and file
   expect(rowOf("create_provider")).toMatchObject({ state: "confirmed", providerRef: COMPANY_ID });
 });
 
-test("C2: an entity with no party bound is NOT opened — there is nothing to file with", async () => {
+test("C2: a company with no party bound is NOT opened — there is nothing to file with", async () => {
+  seedCompany(companies);
   repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
   await sweeper().tick();
-  expect(requests.stepsOf(ENTITY_KEY)).toHaveLength(0);
+  expect(requests.stepsOf(COMPANY_KEY)).toHaveLength(0);
   expect(doola.calls).toHaveLength(0);
 });
 
 test("C2: a create_provider row stuck in `submitted` past the deadline is re-run, and ADOPTS", async () => {
   // The other window: the process died INSIDE the company create, after the id was persisted.
   // `submitted` is not `failed`, so the retry pass never looked at it — the row sat there forever.
+  seedCompany(companies);
   repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
-  newParty({ entityKey: ENTITY_KEY });
-  requests.claimAllSteps(ENTITY_KEY);
+  newParty({ companyId: COMPANY_KEY });
+  requests.claimAllSteps(COMPANY_KEY);
   db.prepare(
     `UPDATE formation_requests SET state='submitted', provider_ref=?, detail=?, updated_at=?
-      WHERE entity_key=? AND step='create_provider'`,
+      WHERE company_id=? AND step='create_provider'`,
   ).run(
     COMPANY_ID,
     JSON.stringify({ customerId: "cus-1", companyId: COMPANY_ID, companySentAttempt: 0 }),
     sqliteUtcTimestamp(now - SUBMITTED_STALL_MS - 1000),
-    ENTITY_KEY,
+    COMPANY_KEY,
   );
 
   await sweeper().tick();
@@ -280,13 +291,14 @@ test("C2: a create_provider row stuck in `submitted` past the deadline is re-run
 });
 
 test("C2: a create_provider row that is merely SLOW is left alone", async () => {
+  seedCompany(companies);
   repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));
-  newParty({ entityKey: ENTITY_KEY });
-  requests.claimAllSteps(ENTITY_KEY);
+  newParty({ companyId: COMPANY_KEY });
+  requests.claimAllSteps(COMPANY_KEY);
   db.prepare(
     `UPDATE formation_requests SET state='submitted', updated_at=?
-      WHERE entity_key=? AND step='create_provider'`,
-  ).run(sqliteUtcTimestamp(now - 1000), ENTITY_KEY);
+      WHERE company_id=? AND step='create_provider'`,
+  ).run(sqliteUtcTimestamp(now - 1000), COMPANY_KEY);
 
   await sweeper().tick();
   // Inside the client's own deadline: the call may still be in flight in another frame.
@@ -305,7 +317,7 @@ test("C3: one 502 then a healthy read — the status never shows `failed`", asyn
   const parked = rowOf("await_filing")!;
   expect(parked.state).toBe("pending"); // NOT failed
   expect(parked.attempt).toBe(0); // NOT burned
-  expect(deriveFormationStatus(requests.stepsOf(ENTITY_KEY))).toBe("in_progress");
+  expect(deriveFormationStatus(requests.stepsOf(COMPANY_KEY))).toBe("in_progress");
 
   // The next poll is scheduled rather than immediate, and the healthy read clears the error.
   expect(parked.nextPollAt).toBeGreaterThan(now);
@@ -318,15 +330,14 @@ test("C3: one 502 then a healthy read — the status never shows `failed`", asyn
 test("C3: an await_ein row's poll cadence GROWS instead of asking every tick for six weeks", async () => {
   seedFormation();
   // Filed and documented; only the IRS is left, which takes four to six weeks.
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
-  requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "fetch_documents", "pending", "confirmed");
   doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
-  // The ENTITY facts too, exactly as `advanceFiling`'s confirming CAS writes them. Without them
-  // the first poll would HEAL the filing date onto the record (F12) — a real advance, which
+  // The COMPANY facts too, exactly as `advanceFiling`'s confirming CAS writes them. Without them
+  // the first poll would HEAL the filing date onto the row (F12) — a real advance, which
   // legitimately resets the cadence and would make this test about something else.
-  repo.upsert({
-    ...repo.findByIdempotencyKey(ENTITY_KEY)!,
-    formationFiledAt: Math.floor(Date.parse("2026-08-19T00:00:00Z") / 1000),
+  companies.recordFilingFacts(COMPANY_KEY, {
+    filedAt: Math.floor(Date.parse("2026-08-19T00:00:00Z") / 1000),
   });
   stampRows(now);
 
@@ -419,8 +430,8 @@ test("an in-flight entity is polled only once a day, and the interval DOUBLES on
 
 test("the poll interval is capped at a week — await_ein legitimately sits for six", async () => {
   seedFormation();
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
-  requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "fetch_documents", "pending", "confirmed");
   doola.state.company = { doolaCompanyId: COMPANY_ID }; // no EIN, for weeks
 
   for (let i = 0; i < 12; i++) {
@@ -454,7 +465,7 @@ test("a poll that ADVANCES something resets the interval to daily", async () => 
 test("a COMPLETE entity is never polled again", async () => {
   seedFormation();
   for (const step of ["await_filing", "fetch_documents", "await_ein"])
-    requests.transition(ENTITY_KEY, step as "await_filing", "pending", "confirmed");
+    requests.transition(COMPANY_KEY, step as "await_filing", "pending", "confirmed");
   now += 30 * DAY;
   await sweeper().tick();
   expect(doola.calls).toHaveLength(0);
@@ -467,12 +478,12 @@ test("a FAILED entity belongs to the retry path, not the poll path", async () =>
   // …and parked with a retry schedule that has NOT elapsed. This is the no-bump backoff a lost
   // answer or a transient read failure leaves (C1/C3): the attempt does not move, so the
   // interval on the row is the only thing that knows how long to wait.
-  requests.transition(ENTITY_KEY, "await_filing", "failed", "failed", {
+  requests.transition(COMPANY_KEY, "await_filing", "failed", "failed", {
     detail: JSON.stringify({ nextRetryAt: now + DAY, retryIntervalMs: DAY }),
   });
   db.prepare(
-    "UPDATE formation_requests SET updated_at=? WHERE entity_key=? AND step='await_filing'",
-  ).run(sqliteUtcTimestamp(now - 30 * DAY), ENTITY_KEY);
+    "UPDATE formation_requests SET updated_at=? WHERE company_id=? AND step='await_filing'",
+  ).run(sqliteUtcTimestamp(now - 30 * DAY), COMPANY_KEY);
 
   await sweeper().tick();
   // NEITHER pass touched it: the poll skips a `failed` entity by derived status, and the retry
@@ -493,11 +504,12 @@ test("a FAILED entity belongs to the retry path, not the poll path", async () =>
 
 test("erasure: an abandoned filing and a stale unbound handle; never a live one", async () => {
   seedFormation();
-  const live = newParty({ entityKey: ENTITY_KEY });
+  const live = newParty({ companyId: COMPANY_KEY });
 
-  requests.claimAllSteps("t:dead");
-  requests.transition("t:dead", "create_provider", "pending", "abandoned");
-  const dead = newParty({ entityKey: "t:dead" });
+  seedCompany(companies, { companyId: "company-dead" });
+  requests.claimAllSteps("company-dead");
+  requests.transition("company-dead", "create_provider", "pending", "abandoned");
+  const dead = newParty({ companyId: "company-dead" });
 
   const stale = newParty();
   db.prepare("UPDATE formation_parties SET created_at = ? WHERE party_id = ?").run(
@@ -527,9 +539,9 @@ test("erasure: an abandoned filing and a stale unbound handle; never a live one"
 
 test("a step in flight for more than 14 days warns — once per row per day, not once per tick", async () => {
   seedFormation();
-  db.prepare("UPDATE formation_requests SET created_at = ? WHERE entity_key = ?").run(
+  db.prepare("UPDATE formation_requests SET created_at = ? WHERE company_id = ?").run(
     sqliteUtcTimestamp(now - 20 * DAY),
-    ENTITY_KEY,
+    COMPANY_KEY,
   );
 
   const capture = async (s: FormationSweeper) => {
@@ -547,7 +559,7 @@ test("a step in flight for more than 14 days warns — once per row per day, not
   const s = sweeper();
   const first = await capture(s);
   expect(first.length).toBeGreaterThan(0);
-  expect(first[0]).toMatchObject({ entityKey: ENTITY_KEY, ageDays: 20, level: "warn" });
+  expect(first[0]).toMatchObject({ companyId: COMPANY_KEY, ageDays: 20, level: "warn" });
 
   // At the 60s default a per-tick warning would be 1440 lines a day for one stuck formation.
   now += 60_000;
@@ -660,7 +672,7 @@ test("a sweeper tick and a concurrent driver advance one entity EXACTLY once", a
   seedFormation();
   doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
   now += POLL_BASE_MS + 1000;
-  await Promise.all([sweeper().tick(), advanceFormation(deps(), ENTITY_KEY)]);
+  await Promise.all([sweeper().tick(), advanceFormation(deps(), COMPANY_KEY)]);
   expect(stateOf("await_filing")).toBe("confirmed");
   // The CAS is what proves it: only the winner ran the write inside its transaction.
   expect(repo.listEvents(ENTITY_KEY).filter((e) => e.step === "formationFiled")).toHaveLength(1);
@@ -729,15 +741,15 @@ test("M5: a burst of events for ONE company costs one read, and retires all of t
 test("M5: the poll due-set is filtered in SQL — an entity that is not due is never loaded", () => {
   seedFormation();
   // Fresh rows: nothing is due, and the query says so without the sweeper reading a single blob.
-  expect(requests.listPollDueEntityKeys(now, sqliteUtcTimestamp(now - POLL_BASE_MS), 100)).toEqual(
+  expect(requests.listPollDueCompanyIds(now, sqliteUtcTimestamp(now - POLL_BASE_MS), 100)).toEqual(
     [],
   );
 
   // Past the never-polled window (the row's own age is the clock).
   const later = now + POLL_BASE_MS + 1000;
   expect(
-    requests.listPollDueEntityKeys(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
-  ).toEqual([ENTITY_KEY]);
+    requests.listPollDueCompanyIds(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
+  ).toEqual([COMPANY_KEY]);
 
   // A persisted schedule lives in a COLUMN, so "which rows are due?" stays a query rather than a
   // scan of every open entity's detail blob. Move every row's age out of the way first — the
@@ -745,16 +757,16 @@ test("M5: the poll due-set is filtered in SQL — an entity that is not due is n
   // any non-terminal polled row that is due by age keeps the entity in the candidate set.
   stampRows(later);
   expect(
-    requests.listPollDueEntityKeys(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
+    requests.listPollDueCompanyIds(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
   ).toEqual([]);
 
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "pending", {
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "pending", {
     nextPollAt: later - 1,
     detail: JSON.stringify({ nextPollAt: later - 1 }),
   });
   expect(
-    requests.listPollDueEntityKeys(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
-  ).toEqual([ENTITY_KEY]);
+    requests.listPollDueCompanyIds(later, sqliteUtcTimestamp(later - POLL_BASE_MS), 100),
+  ).toEqual([COMPANY_KEY]);
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -765,6 +777,9 @@ test("M5: the poll due-set is filtered in SQL — an entity that is not due is n
  *  is the one shape whose first action is a chain read, and therefore the one that can be watched
  *  for concurrency. */
 function seedHeldEntities(count: number, anchors: SqliteOaAnchorRepository): string[] {
+  // All of them attached to ONE company — the N:1 shape the re-key exists for, and the one the
+  // anchor fan-out has to bound.
+  seedCompany(companies);
   const keys: string[] = [];
   for (let i = 0; i < count; i++) {
     const key = `${TENANT}:held-${i}`;
@@ -786,7 +801,7 @@ function seedHeldEntities(count: number, anchors: SqliteOaAnchorRepository): str
 test("F6: the anchor due-set is INCREMENTAL — a settled entity is not a candidate forever", () => {
   const anchors = new SqliteOaAnchorRepository(db);
   seedFormation();
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
 
   // A confirmed step with no anchor write behind it: the entity owes a version.
   expect(anchors.listDueEntityKeys(50)).toContain(ENTITY_KEY);
@@ -794,14 +809,14 @@ test("F6: the anchor due-set is INCREMENTAL — a settled entity is not a candid
   // Once a cycle has been written AFTER the facts, it is settled and drops out — this is the
   // whole fix: the old set was "every entity with a confirmed step", which only ever grows.
   db.prepare(
-    "UPDATE formation_requests SET updated_at = datetime('now','-1 day') WHERE entity_key = ?",
-  ).run(ENTITY_KEY);
+    "UPDATE formation_requests SET updated_at = datetime('now','-1 day'), facts_updated_at = datetime('now','-1 day') WHERE company_id = ?",
+  ).run(COMPANY_KEY);
   anchors.claimVersion(ENTITY_KEY, 2, `0x${"c".repeat(64)}`);
   anchors.transition(ENTITY_KEY, 2, "pending", "executed");
   expect(anchors.listDueEntityKeys(50)).not.toContain(ENTITY_KEY);
 
   // …and it comes straight back when a step moves again (the EIN), or when a cycle is open.
-  requests.transition(ENTITY_KEY, "await_ein", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "await_ein", "pending", "confirmed");
   expect(anchors.listDueEntityKeys(50)).toContain(ENTITY_KEY);
 });
 

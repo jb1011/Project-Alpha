@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
+import { DEFAULT_DESCRIPTION, DEFAULT_INDUSTRY, companyNameOptions } from "../formation/intake";
 
 /** Open (and create dirs for) a SQLite db. Use ":memory:" in tests. */
 export function openDatabase(path: string): Database.Database {
@@ -46,6 +48,16 @@ const FORMATION_PARTIES_DDL = `
       postal_code TEXT, country TEXT,   -- ISO-3
       -- A clearly-labeled sandbox fixture rather than a real natural person (§3, audit H7).
       synthetic INTEGER NOT NULL DEFAULT 0,
+      -- The COMPANY this identity was spent on (2026-08-26 §2). A party row is SINGLE-USE: once
+      -- bound it is never reusable, and a second company needs a second row with its own intake,
+      -- its own SSN capture and its own erasure clocks. UNIQUE lives in an index rather than
+      -- inline, because ALTER TABLE ADD COLUMN cannot add a UNIQUE constraint and both the fresh
+      -- and the upgraded database must end up with the same keys.
+      company_id TEXT,
+      -- SSN (2026-08-26 §4): AES-256-GCM ciphertext, its 12-byte IV, and the key id so a
+      -- PREVIOUS key is SELECTED rather than trial-decrypted. Written by A2; the columns exist
+      -- now so the erasure statement below is complete from the day the first one is written.
+      ssn_ciphertext BLOB, ssn_iv BLOB, ssn_key_id TEXT, ssn_deleted_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       deleted_at TEXT
     );
@@ -54,8 +66,137 @@ const FORMATION_PARTIES_DDL = `
 /** Created SEPARATELY, after the rebuild guard below: on a pre-existing database the table still
  *  has PR 1's shape when the CREATE-TABLE block runs, and indexing a `tenant_id` that does not
  *  exist yet fails the whole migration. */
-const FORMATION_PARTIES_INDEX_DDL =
-  "CREATE INDEX IF NOT EXISTS idx_formation_parties_tenant ON formation_parties(tenant_id);";
+const FORMATION_PARTIES_INDEX_DDL = `
+  CREATE INDEX IF NOT EXISTS idx_formation_parties_tenant ON formation_parties(tenant_id);
+  -- Single-use, enforced by the database. SQLite treats NULLs as distinct in a UNIQUE index, so
+  -- every unbound party still coexists happily.
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_formation_parties_company
+    ON formation_parties(company_id);
+`;
+
+/**
+ * The sub-saga rows, extracted as a constant because the 2026-08-26 migration REBUILDS the table
+ * (SQLite cannot alter a primary key).
+ *
+ * `facts_updated_at` is the column the anchor gate reads, and it is separate from `updated_at`
+ * for one measured reason: `persistPollBackoff` bumps `updated_at` on EVERY poll, so an
+ * `await_ein` row waiting four to six weeks for the IRS made its entity re-read and re-hash its
+ * manifest on every single tick of those six weeks. Only a transition that changes state, the
+ * provider ref or the fact detail moves this one.
+ */
+const FORMATION_REQUESTS_DDL = `
+    CREATE TABLE IF NOT EXISTS formation_requests (
+      company_id   TEXT NOT NULL,
+      step         TEXT NOT NULL CHECK (step IN
+                   ('create_provider','await_filing','fetch_documents','await_ein')),
+      state        TEXT NOT NULL CHECK (state IN
+                   ('pending','submitted','confirmed','failed','abandoned')),
+      attempt      INTEGER NOT NULL DEFAULT 0,
+      provider_ref TEXT,
+      detail       TEXT,          -- JSON: filingNumber, ein, doc ids…
+      error        TEXT,
+      -- Epoch ms the sweeper may next POLL this step. A MIRROR of detail.nextPollAt, and it is a
+      -- column for exactly one reason: "which rows are due?" has to be a question the database
+      -- answers. Reading every open company's detail blob to find out means the poll cost grows
+      -- with the number of formations ever opened rather than with the number actually due.
+      next_poll_at INTEGER,
+      created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      facts_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (company_id, step)
+    );
+`;
+
+/**
+ * COMPANIES — the home of everything doola-related (design 2026-08-26 §2).
+ *
+ * Entities attach to a company MANY-TO-ONE, which is why the filing's facts live here and not on
+ * `entities`: a company can be filed, and have its documents fetched, before any agent attaches
+ * to it, and ten agents can share one filing afterwards.
+ *
+ * `status` carries ONLY the dimension the company itself owns. "Paying" is derived from
+ * `formation_payments` (`hasLivePayment`) and filing progress is derived from
+ * `formation_requests` (`deriveFormationStatus`), so a refund, an expired quote or a late filing
+ * needs no second write here and nothing can drift.
+ */
+const COMPANIES_DDL = `
+    CREATE TABLE IF NOT EXISTS companies (
+      company_id  TEXT PRIMARY KEY,
+      tenant_id   TEXT NOT NULL,
+      status      TEXT NOT NULL CHECK (status IN ('draft','ready','abandoned')),
+      -- The pin, exactly as an entity carried it: a mainnet flip must never route an in-flight
+      -- sandbox company at the production host, and an attached entity copies BOTH halves from
+      -- this row rather than from config.
+      provider    TEXT NOT NULL,
+      environment TEXT NOT NULL CHECK (environment IN ('sandbox','production')),
+      -- A labeled sandbox fixture rather than a real natural person. Written from the
+      -- DEPLOYMENT's own setting, never from caller input.
+      synthetic   INTEGER NOT NULL DEFAULT 0,
+      -- JSON, ONE canonical shape: [{name, entityTypeEnding, position}] (formation/intake.ts).
+      name_options    TEXT NOT NULL,
+      business_purpose TEXT NOT NULL,
+      -- The doola INDUSTRY LABEL. There is no code column because doola deprecated naicsCode and
+      -- nothing would ever write or read one.
+      industry_label  TEXT NOT NULL,
+      -- Row-level marker for intake that was DERIVED (the migration, the A1 shim) rather than
+      -- typed by a human. Deliberately not a key inside name_options, which keeps ONE shape.
+      intake_synthesized INTEGER NOT NULL DEFAULT 0,
+      -- The name the STATE accepted, and only ever OUR candidate string that doola's reported
+      -- name matched (§5) — never doola free text, which the manifest would then hash on-chain.
+      legal_name_filed TEXT,
+      -- The legal facts, moved here from the entity: unix SECONDS, the state's filing number,
+      -- and the real EIN once the IRS issues one.
+      filed_at       INTEGER,
+      filing_number  TEXT,
+      ein            TEXT,
+      created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_companies_tenant ON companies(tenant_id, status);
+`;
+
+/**
+ * FORMATION PAYMENTS (design 2026-08-26 §2/§6) — shipped in A1, WRITTEN by B1.
+ *
+ * The table lands with the schema rather than with the feature so the derived-paying predicate
+ * (`hasLivePayment`) has something to read from day one and answers `false` honestly, and so the
+ * one index that carries a real invariant — at most one LIVE quote per (company, product) — is
+ * in place before anything can violate it.
+ */
+const FORMATION_PAYMENTS_DDL = `
+    CREATE TABLE IF NOT EXISTS formation_payments (
+      payment_id  TEXT PRIMARY KEY,
+      company_id  TEXT NOT NULL,
+      -- Additive by construction: a yearly maintenance quote is a second product, not a second
+      -- table, and the live-rows index below is per product so both can be live at once.
+      product     TEXT NOT NULL DEFAULT 'formation'
+                  CHECK (product IN ('formation','maintenance_year')),
+      status      TEXT NOT NULL CHECK (status IN
+                  ('quoted','settling','settled','expired','failed','refunded')),
+      -- The STORED quote. Verification compares the signature against THIS, never live config:
+      -- a fee change between quote and settle must not re-price a signature already given.
+      amount_usdc TEXT NOT NULL,
+      -- 32 random bytes, hex. Uniqueness comes from the ROW, never derived from the company id —
+      -- a derived nonce is one-shot and would brick the company after any failed attempt.
+      nonce       TEXT NOT NULL,
+      valid_before INTEGER NOT NULL,
+      payer_address TEXT,
+      -- Persisted BEFORE broadcast (the bridge-legs rule): a crash mid-settle re-broadcasts the
+      -- SAME signed transaction rather than re-quoting, which is how a double charge is avoided.
+      raw_tx      BLOB,
+      tx_hash     TEXT,
+      attempt     INTEGER NOT NULL DEFAULT 0,
+      refund_tx_hash TEXT,
+      created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    -- LIVE rows only. A terminal row (settled/expired/failed/refunded) must not forbid the
+    -- re-quote that follows it, and a maintenance_year quote must not forbid the formation one.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_formation_payments_one_live
+      ON formation_payments(company_id, product) WHERE status IN ('quoted','settling');
+    CREATE INDEX IF NOT EXISTS idx_formation_payments_company
+      ON formation_payments(company_id, status);
+`;
 
 /** Create tables if absent. Idempotent. */
 export function migrate(db: Database.Database): void {
@@ -374,27 +515,14 @@ export function migrate(db: Database.Database): void {
     -- guardian precedents), so the CHECK on entities.status above stays untouched.
 
     -- Provider-side formation milestones only; on-chain anchor cycles live in oa_anchors.
-    CREATE TABLE IF NOT EXISTS formation_requests (
-      entity_key   TEXT NOT NULL,
-      step         TEXT NOT NULL CHECK (step IN
-                   ('create_provider','await_filing','fetch_documents','await_ein')),
-      state        TEXT NOT NULL CHECK (state IN
-                   ('pending','submitted','confirmed','failed','abandoned')),
-      attempt      INTEGER NOT NULL DEFAULT 0,
-      provider_ref TEXT,
-      detail       TEXT,          -- JSON: filingNumber, ein, doc ids…
-      error        TEXT,
-      -- Epoch ms the sweeper may next POLL this step. A MIRROR of detail.nextPollAt, and it is a
-      -- column for exactly one reason: "which rows are due?" has to be a question the database
-      -- answers. Reading every open entity's detail blob to find out means the poll cost grows
-      -- with the number of formations ever opened rather than with the number actually due.
-      next_poll_at INTEGER,
-      created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (entity_key, step)
-    );
+    -- Keyed by COMPANY since 2026-08-26: the sub-saga runs once per company, not once per agent,
+    -- and ten agents sharing a filing must not mean ten filings.
+    ${FORMATION_REQUESTS_DDL}
     CREATE INDEX IF NOT EXISTS idx_formation_state ON formation_requests(state, step);
     CREATE INDEX IF NOT EXISTS idx_formation_provider ON formation_requests(provider_ref);
+
+    ${COMPANIES_DDL}
+    ${FORMATION_PAYMENTS_DDL}
 
     -- Anchor cycles: one row PER MANIFEST VERSION. Deliberately NOT keyed like bridge_legs
     -- (entity, step) — a bridge has exactly one of each leg, whereas an entity accumulates
@@ -557,6 +685,21 @@ export function migrate(db: Database.Database): void {
       );
     db.exec(`DROP TABLE formation_parties;${FORMATION_PARTIES_DDL}`);
   }
+  // The 2026-08-26 columns, ALTER-if-missing (the house idiom) and BEFORE the index block below,
+  // which now indexes `company_id`: indexing a column that does not exist yet fails the boot.
+  const partyColsNow = (
+    db.prepare("PRAGMA table_info(formation_parties)").all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!partyColsNow.includes("company_id"))
+    db.exec("ALTER TABLE formation_parties ADD COLUMN company_id TEXT");
+  for (const [col, type] of [
+    ["ssn_ciphertext", "BLOB"],
+    ["ssn_iv", "BLOB"],
+    ["ssn_key_id", "TEXT"],
+    ["ssn_deleted_at", "TEXT"],
+  ] as const)
+    if (!partyColsNow.includes(col))
+      db.exec(`ALTER TABLE formation_parties ADD COLUMN ${col} ${type}`);
   db.exec(FORMATION_PARTIES_INDEX_DDL);
 
   // formation_requests.next_poll_at: ALTER-if-missing, the house idiom. A database created by
@@ -567,20 +710,26 @@ export function migrate(db: Database.Database): void {
   ).map((c) => c.name);
   if (!reqCols.includes("next_poll_at"))
     db.exec("ALTER TABLE formation_requests ADD COLUMN next_poll_at INTEGER");
-  // The sweeper's poll-due query orders by this and filters on it, for every open entity, on
-  // every tick.
-  db.exec(
-    "CREATE INDEX IF NOT EXISTS idx_formation_poll_due ON formation_requests(next_poll_at, entity_key)",
-  );
+
+  // ── The 2026-08-26 re-key: companies become the home of a filing (design §2). Everything it
+  //    touches — the new columns, the synthesis, the table rebuild and the assertion — is in one
+  //    place because the ORDER is the whole safety argument. It is a no-op on a database that has
+  //    already been through it, and on a brand-new one.
+  migrateFormationToCompanies(db);
 
   // The documents index is keyed by OUR derived id (documentIndexRepository.documentIndexId), but
-  // the fact that makes a re-fetch idempotent is (entity, doola document id) — so that pair is
+  // the fact that makes a re-fetch idempotent is (company, doola document id) — so that pair is
   // the constraint, and a second insert for a document we already stored is a no-op rather than a
-  // duplicate row pointing at a second copy of the same bytes.
+  // duplicate row pointing at a second copy of the same bytes. The entity-keyed pair it replaces
+  // is dropped: a document can be fetched before any agent attaches, so the entity key is not a
+  // key at all any more. `idx_documents_entity` stays for the legacy rows, which keep their
+  // entity-derived index id and file path as opaque locators.
+  db.exec("DROP INDEX IF EXISTS idx_documents_entity_provider");
   db.exec(
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_entity_provider ON documents(entity_key, provider_doc_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_company_provider ON documents(company_id, provider_doc_id)",
   );
   db.exec("CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents(entity_key)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_documents_company ON documents(company_id)");
 
   const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
     (c) => c.name,
@@ -623,4 +772,268 @@ export function migrate(db: Database.Database): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_payments_ledger_entity ON payments_ledger(entity_key, status)",
   );
+}
+
+/** Marker for the one-shot 2026-08-26 re-key (design §2 steps 1-5). */
+const COMPANY_REKEY_MARKER = "formation_company_rekey_2026_08_26";
+
+/** The message the refusal predicate throws. Exported so the test asserts the sentence an
+ *  operator actually reads, and so the CLI escape hatch is named in exactly one place. */
+export function companyRekeyRefusalMessage(entityKeys: string[]): string {
+  return `refusing to migrate: the formation sub-saga is being re-keyed from entities to COMPANIES, and ${entityKeys.length} create_provider row(s) are still in flight (${entityKeys.slice(0, 5).join(", ")}${entityKeys.length > 5 ? ", …" : ""}). Re-keying a live create rotates its idempotency key, and doola would file a SECOND real Wyoming LLC under a second real fee. Wait for each one to reach a terminal state, or — for a row parked forever on a human decision — abandon it deliberately with: npm run cli -- formation:abandon <entityKey>`;
+}
+
+/**
+ * THE MIGRATION (design 2026-08-26 §2, steps 1-5).
+ *
+ * It is written out step by step, and specified to the query, because two adversarial passes
+ * showed that the naive version files duplicate LLCs, erases live PII and re-anchors the fleet.
+ * Every step below exists because of one of those.
+ *
+ * ONE transaction, a `meta` marker, and a REFUSAL rather than a guess. Additive column work is
+ * outside the transaction (it is idempotent by construction and safe to repeat); the data move is
+ * inside it, and its final act is an assertion that rolls the whole thing back if a single
+ * responsible party would have been left unattached.
+ */
+function migrateFormationToCompanies(db: Database.Database): void {
+  // ── Additive columns first. They are needed whether or not the data move runs (a fresh
+  //    database gets `companies` from the DDL block but still needs `entities.company_id`).
+  const entityCols = (db.prepare("PRAGMA table_info(entities)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  // WRITE-ONCE. An anchored manifest carries `legal.providerCompanyId`, so re-attaching an entity
+  // to a different company would make a permanent on-chain claim false. `upsert` deliberately
+  // omits this column from its DO UPDATE list; the only writer is the attach CAS.
+  if (!entityCols.includes("company_id"))
+    db.exec("ALTER TABLE entities ADD COLUMN company_id TEXT");
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_entities_company ON entities(company_id) WHERE company_id IS NOT NULL",
+  );
+
+  const documentCols = (db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!documentCols.includes("company_id"))
+    db.exec("ALTER TABLE documents ADD COLUMN company_id TEXT");
+
+  // The anchor scheduler's UNION arm reduces `MAX(updated_at)` per entity on every tick.
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_oa_anchors_entity_updated ON oa_anchors(entity_key, updated_at)",
+  );
+
+  const shapeCols = (
+    db.prepare("PRAGMA table_info(formation_requests)").all() as { name: string }[]
+  ).map((c) => c.name);
+  const legacyShape = shapeCols.includes("entity_key");
+  const alreadyDone = db.prepare("SELECT value FROM meta WHERE key = ?").get(COMPANY_REKEY_MARKER);
+
+  if (!legacyShape) {
+    // Either a fresh database or one that has been through this already. Only the indexes that
+    // name the new columns still need asserting.
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_formation_poll_due ON formation_requests(next_poll_at, company_id)",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_formation_facts ON formation_requests(facts_updated_at)",
+    );
+    if (!alreadyDone)
+      db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run(
+        COMPANY_REKEY_MARKER,
+      );
+    return;
+  }
+
+  // ── Step 1: THE REFUSAL PREDICATE. A `create_provider` row that is not terminal may be holding
+  //    a committed company at doola under a key we are about to change. `failed` WITH a
+  //    provider_ref is terminal enough (the adopt path owns it); `failed` WITHOUT one is not —
+  //    that is exactly the shape of a lost answer, which re-sends the SAME key on its next pass.
+  const inFlight = (
+    db
+      .prepare(
+        `SELECT entity_key AS k FROM formation_requests
+          WHERE step = 'create_provider'
+            AND (state IN ('pending','submitted')
+                 OR (state = 'failed' AND provider_ref IS NULL))
+          ORDER BY entity_key`,
+      )
+      .all() as { k: string }[]
+  ).map((r) => r.k);
+  if (inFlight.length > 0) throw new Error(companyRekeyRefusalMessage(inFlight));
+
+  db.transaction(() => {
+    // ── Step 2: THE SYNTHESIS RULE. A company for EVERY entity that holds formation state of any
+    //    kind — not only the formed ones. Unopened entities, live filings past `create_provider`
+    //    and abandoned-with-a-provider_ref rows all exist, and all of them hold personal data
+    //    that must stay ATTACHED: the erasure queries are re-keyed to the company, and a party
+    //    left with no company reads as "never used" and is erased on day 7.
+    //
+    //    The two arms the design names are `formation_provider IS NOT NULL` and "a bound party".
+    //    Two more are added here — a formation row, or a document — because both are provably
+    //    formation state, and the widened predicate can only ever synthesize MORE rows. A missed
+    //    entity would drop its sub-saga rows in step 3.
+    const candidates = db
+      .prepare(
+        `SELECT e.idempotency_key AS key, e.name AS name, e.spec_json AS spec_json,
+                e.owner_tenant_id AS owner_tenant_id, e.guardian AS guardian,
+                e.formation_provider AS provider, e.formation_environment AS environment,
+                e.ein_real AS ein, e.formation_filed_at AS filed_at,
+                e.formation_filing_number AS filing_number,
+                e.created_at AS created_at, e.updated_at AS updated_at,
+                p.tenant_id AS party_tenant, p.synthetic AS party_synthetic
+           FROM entities e
+           LEFT JOIN formation_parties p
+             ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
+          WHERE e.company_id IS NULL
+            AND (e.formation_provider IS NOT NULL
+                 OR p.party_id IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM formation_requests f
+                             WHERE f.entity_key = e.idempotency_key)
+                 OR EXISTS (SELECT 1 FROM documents d WHERE d.entity_key = e.idempotency_key))
+          ORDER BY e.idempotency_key`,
+      )
+      .all() as SynthesisCandidate[];
+
+    const insertCompany = db.prepare(
+      `INSERT INTO companies
+         (company_id, tenant_id, status, provider, environment, synthetic,
+          name_options, business_purpose, industry_label, intake_synthesized,
+          legal_name_filed, filed_at, filing_number, ein, created_at, updated_at)
+       VALUES (@company_id, @tenant_id, 'ready', @provider, @environment, @synthetic,
+               @name_options, @business_purpose, @industry_label, 1,
+               NULL, @filed_at, @filing_number, @ein, @created_at, @updated_at)`,
+    );
+    const attachEntity = db.prepare(
+      "UPDATE entities SET company_id = ? WHERE idempotency_key = ? AND company_id IS NULL",
+    );
+    // Every party of this entity, ERASED ONES INCLUDED: the link is what keeps the audit trail
+    // readable, and an erased row has nothing left to protect.
+    const attachParty = db.prepare(
+      "UPDATE formation_parties SET company_id = ? WHERE entity_key = ? AND company_id IS NULL",
+    );
+    // Index ids and file paths are NOT re-derived: manifests commit to {type, sha256, name}, so
+    // the bytes and their hashes must not move. The column is the lookup key from here on.
+    const attachDocs = db.prepare(
+      "UPDATE documents SET company_id = ? WHERE entity_key = ? AND company_id IS NULL",
+    );
+
+    for (const c of candidates) {
+      const companyId = randomUUID();
+      insertCompany.run({
+        company_id: companyId,
+        // Every company has an owner. A legacy row with no tenant falls back to its party's
+        // tenant and then to the guardian address, which is the tenant id by construction.
+        tenant_id: c.owner_tenant_id ?? c.party_tenant ?? c.guardian,
+        provider: c.provider ?? "doola",
+        // An entity with a bound party but no pin could never be filed anyway; pinning its
+        // synthesized company to `sandbox` makes the environment check REFUSE rather than route
+        // it somewhere, which is the safe direction.
+        environment: c.environment ?? "sandbox",
+        synthetic: c.party_synthetic ?? 0,
+        name_options: JSON.stringify(companyNameOptions(c.name)),
+        business_purpose: purposeOf(c.spec_json),
+        industry_label: DEFAULT_INDUSTRY,
+        // The legal facts move to the company row. The entity columns stay populated (nothing
+        // reads them after this migration) so the move is reversible by inspection.
+        filed_at: c.filed_at,
+        filing_number: c.filing_number,
+        ein: c.ein,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+      });
+      attachEntity.run(companyId, c.key);
+      attachParty.run(companyId, c.key);
+      attachDocs.run(companyId, c.key);
+    }
+
+    // ── Step 3: REBUILD `formation_requests` on the new key. SQLite cannot alter a primary key,
+    //    and the house precedent for a populated-table rebuild is refuse-unless-clean — which
+    //    step 1 has just guaranteed for the only rows that could be harmed.
+    //
+    //    The INSERT enumerates columns and copies the timestamps VERBATIM. `updated_at` is what
+    //    `factsMovedSince`, the anchor scheduler's UNION arm, the retry clock, the stall detector
+    //    and `listPollDue` all read: re-stamping it would make every formed entity due forever
+    //    and starve the 50-row anchor batch on the first tick after the upgrade.
+    const legacyCount = (
+      db.prepare("SELECT COUNT(*) AS n FROM formation_requests").get() as { n: number }
+    ).n;
+    db.exec("ALTER TABLE formation_requests RENAME TO formation_requests_legacy");
+    db.exec(FORMATION_REQUESTS_DDL);
+    db.exec(
+      `INSERT INTO formation_requests
+         (company_id, step, state, attempt, provider_ref, detail, error, next_poll_at,
+          created_at, updated_at, facts_updated_at)
+       SELECT e.company_id, l.step, l.state, l.attempt, l.provider_ref, l.detail, l.error,
+              l.next_poll_at, l.created_at, l.updated_at, l.updated_at
+         FROM formation_requests_legacy l
+         JOIN entities e ON e.idempotency_key = l.entity_key
+        WHERE e.company_id IS NOT NULL`,
+    );
+    const movedCount = (
+      db.prepare("SELECT COUNT(*) AS n FROM formation_requests").get() as { n: number }
+    ).n;
+    if (movedCount !== legacyCount)
+      throw new Error(
+        `refusing to migrate: ${legacyCount} formation_requests row(s) went in and ${movedCount} came out — some belong to an entity the company synthesis did not cover, and dropping a sub-saga row would strand a real filing. Nothing has been changed.`,
+      );
+    db.exec("DROP TABLE formation_requests_legacy");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_formation_state ON formation_requests(state, step)");
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_formation_provider ON formation_requests(provider_ref)",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_formation_poll_due ON formation_requests(next_poll_at, company_id)",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_formation_facts ON formation_requests(facts_updated_at)",
+    );
+
+    // ── Step 4: THE POST-MIGRATION ASSERTION, inside the transaction. A live party bound to an
+    //    entity and attached to no company is the exact shape `listStaleUnbound` would erase, and
+    //    what it would erase is the responsible party of a real Wyoming filing.
+    const orphans = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM formation_parties
+            WHERE deleted_at IS NULL AND entity_key IS NOT NULL AND company_id IS NULL`,
+        )
+        .get() as { n: number }
+    ).n;
+    if (orphans > 0)
+      throw new Error(
+        `refusing to migrate: ${orphans} bound formation part${orphans === 1 ? "y" : "ies"} would be left with no company, and the erasure sweep reads an unattached party as "never used". Nothing has been changed.`,
+      );
+
+    db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run(COMPANY_REKEY_MARKER);
+  })();
+}
+
+interface SynthesisCandidate {
+  key: string;
+  name: string;
+  spec_json: string | null;
+  owner_tenant_id: string | null;
+  guardian: string;
+  provider: string | null;
+  environment: string | null;
+  ein: string | null;
+  filed_at: number | null;
+  filing_number: string | null;
+  created_at: string;
+  updated_at: string;
+  party_tenant: string | null;
+  party_synthetic: number | null;
+}
+
+/** The business purpose a migrated company inherits: the description the entity was forwarding to
+ *  doola, or the default. A corrupt spec blob yields the default rather than throwing — this is a
+ *  migration, and an unreadable blob must never be the reason a box cannot boot. */
+function purposeOf(specJson: string | null): string {
+  if (!specJson) return DEFAULT_DESCRIPTION;
+  try {
+    const spec = JSON.parse(specJson) as { metadata?: { description?: unknown } };
+    const d = spec.metadata?.description;
+    return typeof d === "string" && d.trim() ? d.trim() : DEFAULT_DESCRIPTION;
+  } catch {
+    return DEFAULT_DESCRIPTION;
+  }
 }

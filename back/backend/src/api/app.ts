@@ -39,8 +39,12 @@ import type { EntityViewDeps } from "./views";
  */
 export interface ApiDeps extends EntityViewDeps {
   /** The FULL document index: the view reads two methods off it, the download route also needs
-   *  `findOwned` to re-assert which entity a document belongs to. */
+   *  `findOwned` to re-assert which COMPANY a document belongs to. */
   documents?: import("../persistence/documentIndexRepository").DocumentIndexRepository;
+  /** The company store. Wired on any box with a database — like `documents` and `formationSteps`
+   *  it is plain SQL, not part of the doola CAPABILITY, because a box that has lost its
+   *  credentials must still describe the filings it already made. */
+  companies?: import("../persistence/companyRepository").CompanyRepository;
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
@@ -101,8 +105,16 @@ export interface ApiDeps extends EntityViewDeps {
     sandboxSyntheticPii: boolean;
     maxPerTenant: number;
     dailyCeiling: number;
+    /** FORMATION_MAX_AGENTS_PER_COMPANY. Each attached agent is an anchor sequence per late fact,
+     *  sponsored on-chain through its own timelock, so the fan-out has to be bounded. */
+    maxAgentsPerCompany: number;
     parties: import("../persistence/formationPartyRepository").FormationPartyRepository;
     requests: import("../persistence/formationRepository").FormationRepository;
+    /** The company store again, non-optional here: a deployment that FORMS must be able to mint
+     *  and read companies, where a deployment that merely describes old ones need not. */
+    companies: import("../persistence/companyRepository").CompanyRepository;
+    /** The deployment's pin, copied onto every company this box mints. */
+    pin: { provider: string; environment: DoolaEnvironment };
   };
 
   /**
@@ -198,6 +210,7 @@ export function buildApiApp(deps: ApiDeps) {
   mountPasskeyRoutes(app, deps);
   app.use("/onboard", requireAuth(deps.jwtSecret));
   app.use("/formation-party", requireAuth(deps.jwtSecret));
+  app.use("/companies", requireAuth(deps.jwtSecret));
   app.use("/entities", requireAuth(deps.jwtSecret));
   app.use("/entities/*", requireAuth(deps.jwtSecret));
   app.use("/jobs/*", requireAuth(deps.jwtSecret));

@@ -32,6 +32,18 @@ export interface EntityRepository {
   ): void;
   listEvents(key: string): EventRow[];
   listByTenant(tenantId: string): EntityRecord[];
+  /** Every agent attached to one company (2026-08-26 §3). The fan-out set for a late fact, and
+   *  the count behind FORMATION_MAX_AGENTS_PER_COMPANY. */
+  listByCompany(companyId: string): EntityRecord[];
+  /**
+   * ATTACH an entity to a company, WRITE-ONCE.
+   *
+   * A compare-and-set on `company_id IS NULL`, and the only writer of that column: an anchored
+   * manifest carries `legal.providerCompanyId`, so re-attaching would make a permanent on-chain
+   * claim false. `upsert` deliberately leaves the column out of its DO UPDATE list, so no
+   * ordinary record write can move it either.
+   */
+  attachCompany(entityKey: string, companyId: string): boolean;
   listInFlight(): EntityRecord[];
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
   transaction<T>(fn: () => T): T;
@@ -55,6 +67,10 @@ export interface PublicEntityRow {
   walletProvider: EntityRecord["walletProvider"];
   ownerTenantId: string | null;
   createdAt: string | null;
+  /** The company this agent is attached to — a server-side join key for the formation projection,
+   *  exactly like `idempotencyKey`. NEVER served: it is `legal.providerCompanyId`'s sibling and
+   *  the public surface carries only a status and an environment. */
+  companyId: string | null;
   /** Formation pin (design §8). The PROVIDER and its ENVIRONMENT only — the honesty invariant
    *  reaches the public surface, so a sandbox filing is labeled as one there too. No EIN, no
    *  filing number, and never anything from `formation_parties`. */
@@ -98,6 +114,7 @@ interface Row {
   previous_operator: string | null;
   operator_rotated_at: number | null;
   public_id: string | null;
+  company_id: string | null;
   formation_provider: string | null;
   formation_environment: string | null;
   ein_real: string | null;
@@ -167,6 +184,7 @@ function toRecord(r: Row): EntityRecord {
     previousOperator: r.previous_operator ?? null,
     operatorRotatedAt: r.operator_rotated_at ?? null,
     publicId: r.public_id ?? null,
+    companyId: r.company_id ?? null,
     formationProvider: r.formation_provider ?? null,
     formationEnvironment: (r.formation_environment as EntityRecord["formationEnvironment"]) ?? null,
     einReal: r.ein_real ?? null,
@@ -221,6 +239,7 @@ export class SqliteEntityRepository implements EntityRepository {
       previous_operator: rec.previousOperator ?? null,
       operator_rotated_at: rec.operatorRotatedAt ?? null,
       public_id: rec.publicId ?? null,
+      company_id: rec.companyId ?? null,
       formation_provider: rec.formationProvider ?? null,
       formation_environment: rec.formationEnvironment ?? null,
       ein_real: rec.einReal ?? null,
@@ -241,6 +260,7 @@ export class SqliteEntityRepository implements EntityRepository {
         amendment_delay,
         ein, formation_date, oa_hash, metadata_uri, doc_path, treasury_config,
         agent_id, proxy, treasury, create_tx_hash, bind_tx_hash, fund_tx_hash, per_tx_cap, trust_policy, root_passkey_id, wallet_provider, circle_wallet_set_id, circle_operator_wallet_id, circle_pocket_wallet_id, pocket_address, previous_operator, operator_rotated_at, public_id,
+        company_id,
         formation_provider, formation_environment, ein_real, formation_filed_at, formation_filing_number,
         oa_manifest_version, oa_manifest_anchored_hash, oa_manifest_pending_hash,
         oa_manifest_pending_version, oa_amendment_executable_at,
@@ -253,6 +273,7 @@ export class SqliteEntityRepository implements EntityRepository {
         @amendment_delay,
         @ein, @formation_date, @oa_hash, @metadata_uri, @doc_path, @treasury_config,
         @agent_id, @proxy, @treasury, @create_tx_hash, @bind_tx_hash, @fund_tx_hash, @per_tx_cap, @trust_policy, @root_passkey_id, @wallet_provider, @circle_wallet_set_id, @circle_operator_wallet_id, @circle_pocket_wallet_id, @pocket_address, @previous_operator, @operator_rotated_at, @public_id,
+        @company_id,
         @formation_provider, @formation_environment, @ein_real, @formation_filed_at, @formation_filing_number,
         @oa_manifest_version, @oa_manifest_anchored_hash, @oa_manifest_pending_hash,
         @oa_manifest_pending_version, @oa_amendment_executable_at,
@@ -365,6 +386,25 @@ export class SqliteEntityRepository implements EntityRepository {
     ).map(toRecord);
   }
 
+  listByCompany(companyId: string): EntityRecord[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM entities WHERE company_id = ? ORDER BY idempotency_key")
+        .all(companyId) as Row[]
+    ).map(toRecord);
+  }
+
+  attachCompany(entityKey: string, companyId: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE entities SET company_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE idempotency_key = ? AND company_id IS NULL`,
+        )
+        .run(companyId, entityKey).changes === 1
+    );
+  }
+
   listInFlight(): EntityRecord[] {
     return (
       this.db
@@ -399,6 +439,7 @@ export class SqliteEntityRepository implements EntityRepository {
         SELECT idempotency_key AS idempotencyKey, public_id AS publicId, name, status,
                agent_id AS agentId, proxy, treasury, wallet_provider AS walletProvider,
                owner_tenant_id AS ownerTenantId, created_at AS createdAt,
+               company_id AS companyId,
                formation_provider AS formationProvider,
                formation_environment AS formationEnvironment
         FROM entities

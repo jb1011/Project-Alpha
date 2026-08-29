@@ -154,15 +154,26 @@ export interface OaAnchorRepository {
    * Three things are due, and nothing else is:
    *  - an OPEN cycle (something is pending or scheduled and the chain may have moved);
    *  - a HELD cycle (a veto may have been lifted, or a hold acknowledged);
-   *  - an entity whose facts moved since its last anchor write — a confirmed formation step
-   *    whose `updated_at` is at or after the newest `oa_anchors` write for that entity, or an
+   *  - an entity whose facts moved since its last anchor write — a confirmed formation step whose
+   *    `facts_updated_at` is at or after the newest `oa_anchors` write for that entity, or an
    *    entity with no anchor rows at all.
+   *
+   * `facts_updated_at`, NOT `updated_at` (2026-08-26 §3): a poll must not invalidate the anchor
+   * gate. One `await_ein` poll used to make an entity re-read and re-hash its manifest every tick
+   * for the whole four-to-six-week EIN wait.
    *
    * `>=` rather than `>` deliberately: both columns are `CURRENT_TIMESTAMP`, i.e. one-SECOND
    * resolution, and the fast path confirms a step and opens its version inside the same second.
    * Strict `>` would drop exactly that entity from the set forever. The cost of `>=` is that a
    * same-second entity stays a candidate — which the cheap gates in `advanceAnchor` then dismiss
    * without touching a file.
+   *
+   * ── Under N:1 (2026-08-26 §3) ──────────────────────────────────────────────────────────────
+   *
+   * The facts arm is DEDUPED AT COMPANY GRANULARITY and expanded to entities only AFTER the
+   * limit, so one busy company cannot fill the whole batch with its ten agents while every other
+   * company waits. The expansion means the returned list can exceed `limit`; that is deliberate,
+   * and the caller's concurrency bound is what keeps a tick bounded.
    */
   listDueEntityKeys(limit: number): string[];
   transition(
@@ -249,21 +260,28 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
         `SELECT * FROM oa_anchors WHERE state IN (${sqlStates(OPEN_STATES)})
           ORDER BY entity_key, version`,
       ),
-      // See `listDueEntityKeys`. One statement, so an entity that moves between the two halves
-      // mid-tick cannot be seen twice or missed entirely.
+      // See `listDueEntityKeys`. One statement, so a row that moves between the two halves
+      // mid-tick cannot be seen twice or missed entirely. `kind` says which namespace the key is
+      // in: the cycle arm yields ENTITY keys, the facts arm yields COMPANY ids that the reader
+      // expands after the limit.
       listDue: db.prepare(
-        `SELECT k FROM (
-           SELECT DISTINCT entity_key AS k FROM oa_anchors
+        `SELECT k, kind FROM (
+           SELECT DISTINCT entity_key AS k, 'entity' AS kind FROM oa_anchors
             WHERE state IN (${sqlStates([...OPEN_STATES, ...HOLD_STATES])})
            UNION
-           SELECT f.entity_key AS k
+           SELECT DISTINCT e.company_id AS k, 'company' AS kind
              FROM formation_requests f
+             JOIN entities e ON e.company_id = f.company_id
              LEFT JOIN (SELECT entity_key, MAX(updated_at) AS last
                           FROM oa_anchors GROUP BY entity_key) a
-               ON a.entity_key = f.entity_key
+               ON a.entity_key = e.idempotency_key
             WHERE f.state = 'confirmed'
-              AND (a.last IS NULL OR f.updated_at >= a.last)
-         ) ORDER BY k LIMIT ?`,
+              AND (a.last IS NULL OR f.facts_updated_at >= a.last)
+         ) WHERE k IS NOT NULL AND k > @after ORDER BY k LIMIT @limit`,
+      ),
+      /** Expand one company id to the entities attached to it (the post-limit half). */
+      entitiesOfCompany: db.prepare(
+        "SELECT idempotency_key AS k FROM entities WHERE company_id = ? ORDER BY idempotency_key",
       ),
       transition: db.prepare(
         `UPDATE oa_anchors
@@ -371,7 +389,28 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
   }
 
   listDueEntityKeys(limit: number): string[] {
-    return (this.stmts.listDue.all(limit) as { k: string }[]).map((r) => r.k);
+    const rows = this.stmts.listDue.all({ after: "", limit }) as { k: string; kind: string }[];
+    return this.expandDue(rows);
+  }
+
+  /** Company ids become entity keys HERE, after the limit has already been applied — which is
+   *  what stops one ten-agent company from filling a fifty-row batch on its own. Order is
+   *  preserved and duplicates are dropped: an entity can be in both arms at once. */
+  protected expandDue(rows: { k: string; kind: string }[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const r of rows) {
+      const keys =
+        r.kind === "company"
+          ? (this.stmts.entitiesOfCompany.all(r.k) as { k: string }[]).map((e) => e.k)
+          : [r.k];
+      for (const k of keys)
+        if (!seen.has(k)) {
+          seen.add(k);
+          out.push(k);
+        }
+    }
+    return out;
   }
 
   /**

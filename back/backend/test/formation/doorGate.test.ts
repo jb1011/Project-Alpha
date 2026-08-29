@@ -17,6 +17,8 @@ import {
   formationUnavailableMessage,
   sqliteUtcTimestamp,
 } from "../../src/formation";
+import { companyNameOptions } from "../../src/formation/intake";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
@@ -28,11 +30,13 @@ const NOW = Date.parse("2026-08-21T12:00:00Z");
 let db: DatabaseType.Database;
 let parties: SqliteFormationPartyRepository;
 let quota: SqliteFormationRepository;
+let companies: SqliteCompanyRepository;
 beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   parties = new SqliteFormationPartyRepository(db);
   quota = new SqliteFormationRepository(db);
+  companies = new SqliteCompanyRepository(db);
 });
 afterEach(() => db.close());
 
@@ -53,29 +57,54 @@ function newParty(tenantId = TENANT): string {
   });
 }
 
-function deps(over: { required?: boolean; maxPerTenant?: number; dailyCeiling?: number } = {}) {
+function deps(
+  over: {
+    required?: boolean;
+    maxPerTenant?: number;
+    dailyCeiling?: number;
+    maxAgentsPerCompany?: number;
+  } = {},
+) {
   return {
     formation: {
       required: over.required ?? true,
       maxPerTenant: over.maxPerTenant ?? 3,
       dailyCeiling: over.dailyCeiling ?? 10,
+      maxAgentsPerCompany: over.maxAgentsPerCompany ?? 10,
       parties,
       requests: quota,
+      companies,
     },
     now: () => NOW,
   };
 }
 
+/** A company the tenant owns, in whatever state the case under test needs. */
+function newCompany(
+  over: { tenantId?: string; status?: "draft" | "ready" | "abandoned"; companyId?: string } = {},
+): string {
+  return companies.create({
+    companyId: over.companyId,
+    tenantId: over.tenantId ?? TENANT,
+    status: over.status ?? "ready",
+    provider: "doola",
+    environment: "sandbox",
+    synthetic: false,
+    nameOptions: companyNameOptions("Acme"),
+    businessPurpose: "purpose",
+    industryLabel: "Software development",
+    intakeSynthesized: true,
+  });
+}
+
 /** A past formation for `tenantId`: an entity row plus its create_provider row (what the quota
  *  actually counts — the join is how a per-tenant limit reaches rows keyed only by entity). */
 function pastFormation(key: string, tenantId: string, atUtc = sqliteUtcTimestamp(NOW - 60_000)) {
+  // The quota counts `create_provider` rows, which are keyed by COMPANY since the re-key — so a
+  // past formation is a company with an opened filing, and the tenant join goes through it.
+  newCompany({ tenantId, companyId: key });
   db.prepare(
-    `INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay,
-       ein, formation_date, owner_tenant_id)
-     VALUES (?, ?, 'bound', '0x1', '0x2', '86400', 'STUB-NOT-FILED', 0, ?)`,
-  ).run(key, key, tenantId);
-  db.prepare(
-    "INSERT INTO formation_requests (entity_key, step, state, created_at) VALUES (?,?,?,?)",
+    "INSERT INTO formation_requests (company_id, step, state, created_at) VALUES (?,?,?,?)",
   ).run(key, "create_provider", "confirmed", atUtc);
 }
 
@@ -117,7 +146,7 @@ test("NOT required + a valid party → allowed, and still ownership-checked", ()
 test("unknown, FOREIGN and already-BOUND parties are refused with the SAME message", () => {
   const foreign = newParty(OTHER);
   const bound = newParty();
-  parties.bind(bound, `${TENANT}:agent-1`, TENANT);
+  parties.bindToCompany(bound, newCompany(), TENANT);
 
   // One message for all three: distinguishing them turns the door into an existence oracle over
   // another tenant's party ids.
@@ -148,12 +177,8 @@ test("the per-tenant LIFETIME quota refuses before the entity is minted", () => 
 });
 
 test("the quota counts FAILED formations too — a failed create can already have cost a company", () => {
-  db.prepare(
-    `INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay,
-       ein, formation_date, owner_tenant_id)
-     VALUES ('kf','kf','failed','0x1','0x2','86400','STUB-NOT-FILED',0,?)`,
-  ).run(TENANT);
-  db.prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES ('kf',?,?)").run(
+  newCompany({ companyId: "kf" });
+  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES ('kf',?,?)").run(
     "create_provider",
     "failed",
   );

@@ -6,6 +6,7 @@
  */
 import { expect, test } from "vitest";
 import { toEntityView, toEntityViews } from "../../src/api/views";
+import type { CompanyRecord } from "../../src/persistence/companyRepository";
 import type { FormationRequestRecord } from "../../src/persistence/formationRepository";
 import type { EntityRecord } from "../../src/types";
 
@@ -31,6 +32,43 @@ const BASE: EntityRecord = {
   fundTxHash: null,
 };
 
+/**
+ * The COMPANY a pinned entity is attached to (2026-08-26 §3). The view reads the provider, the
+ * environment and the legal facts from HERE — one filing, however many agents share it — so a
+ * projection with no company lookup wired renders `formation: null`, which is the honest answer
+ * for a surface that cannot read the row the facts are in.
+ */
+const COMPANY: CompanyRecord = {
+  companyId: "company-1",
+  tenantId: "0x000000000000000000000000000000000000000A",
+  status: "ready",
+  provider: "doola",
+  environment: "sandbox",
+  synthetic: false,
+  nameOptions: [{ name: "Agent", entityTypeEnding: "LLC", position: 1 }],
+  businessPurpose: "purpose",
+  industryLabel: "Software development",
+  intakeSynthesized: true,
+  legalNameFiled: null,
+  filedAt: null,
+  filingNumber: null,
+  ein: null,
+  createdAt: "2026-08-21 12:00:00",
+  updatedAt: "2026-08-21 12:00:00",
+};
+
+/** A pinned entity: attached to COMPANY, with the pin copied off it as the claim writes it. */
+const PINNED: EntityRecord = {
+  ...BASE,
+  companyId: COMPANY.companyId,
+  formationProvider: "doola",
+  formationEnvironment: "sandbox",
+};
+
+const companyDeps = (over: Partial<CompanyRecord> = {}) => ({
+  company: () => ({ ...COMPANY, ...over }),
+});
+
 test("a LEGACY row serves formation: null and the LEGACY anchor scheme (the stub shape, forever)", () => {
   const v = toEntityView(BASE);
   expect(v.formation).toBeNull();
@@ -40,13 +78,10 @@ test("a LEGACY row serves formation: null and the LEGACY anchor scheme (the stub
 });
 
 test("a formed row serves provider + environment + the derived status", () => {
-  const v = toEntityView({
-    ...BASE,
-    formationProvider: "doola",
-    formationEnvironment: "sandbox",
-    oaManifestVersion: 1,
-    oaManifestAnchoredHash: "0xabc",
-  });
+  const v = toEntityView(
+    { ...PINNED, oaManifestVersion: 1, oaManifestAnchoredHash: "0xabc" },
+    companyDeps(),
+  );
   // No sub-saga rows to read: the entity is pinned but nothing has been opened for it.
   expect(v.formation).toEqual({
     provider: "doola",
@@ -129,17 +164,14 @@ test("G2: the anchor scheme comes from the SAME predicate the saga anchors with"
 
 test("HONESTY INVARIANT: the environment can never be omitted from a formation block", () => {
   for (const environment of ["sandbox", "production"] as const) {
-    const v = toEntityView({
-      ...BASE,
-      formationProvider: "doola",
-      formationEnvironment: environment,
-    });
+    const v = toEntityView(PINNED, companyDeps({ environment }));
     expect(v.formation?.environment).toBe(environment);
   }
-  // A half-written pair is a bug, and the view refuses to render half of it: a provider with no
+  // An entity that is not attached to a company has no formation to describe, and a lookup that
+  // cannot find the company renders nothing rather than half a block: a provider with no
   // environment would let a sandbox filing be shown without its "demo" qualifier.
-  expect(toEntityView({ ...BASE, formationProvider: "doola" }).formation).toBeNull();
-  expect(toEntityView({ ...BASE, formationEnvironment: "sandbox" }).formation).toBeNull();
+  expect(toEntityView({ ...BASE, formationProvider: "doola" }, companyDeps()).formation).toBeNull();
+  expect(toEntityView(PINNED, { company: () => undefined }).formation).toBeNull();
 });
 
 // ── the derived status (design §5/§8) ──────────────────────────────────────────────────────
@@ -149,7 +181,7 @@ const step = (
   state: FormationRequestRecord["state"],
   providerRef: string | null = null,
 ): FormationRequestRecord => ({
-  entityKey: BASE.idempotencyKey,
+  companyId: COMPANY.companyId,
   step,
   state,
   attempt: 0,
@@ -159,13 +191,11 @@ const step = (
   nextPollAt: null,
   createdAt: "2026-08-21 12:00:00",
   updatedAt: "2026-08-21 12:00:00",
+  factsUpdatedAt: "2026-08-21 12:00:00",
 });
 
-const formed = (steps: FormationRequestRecord[]) =>
-  toEntityView(
-    { ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" },
-    { formationSteps: () => steps },
-  );
+const formed = (steps: FormationRequestRecord[], company: Partial<CompanyRecord> = {}) =>
+  toEntityView(PINNED, { ...companyDeps(company), formationSteps: () => steps });
 
 test("status is DERIVED from the sub-saga rows, never stored", () => {
   expect(formed([]).formation!.status).toBe("none");
@@ -204,23 +234,18 @@ test("a FILED company whose later step failed still reads `filed` — the legal 
   expect(v.formation!.status).toBe("filed");
 });
 
-test("providerRef comes from the create_provider row; the legal facts come from the record", () => {
-  const v = toEntityView(
-    {
-      ...BASE,
-      formationProvider: "doola",
-      formationEnvironment: "sandbox",
-      einReal: "12-3456789",
-      formationFiledAt: 1_755_600_000,
-      formationFilingNumber: "2026-123456",
-    },
-    {
-      formationSteps: () => [
-        step("create_provider", "confirmed", "cmp_1"),
-        step("await_ein", "confirmed"),
-      ],
-    },
-  );
+test("providerRef comes from the create_provider row; the legal facts come from the COMPANY", () => {
+  const v = toEntityView(PINNED, {
+    ...companyDeps({
+      ein: "12-3456789",
+      filedAt: 1_755_600_000,
+      filingNumber: "2026-123456",
+    }),
+    formationSteps: () => [
+      step("create_provider", "confirmed", "cmp_1"),
+      step("await_ein", "confirmed"),
+    ],
+  });
   expect(v.formation).toEqual({
     provider: "doola",
     environment: "sandbox",
@@ -238,7 +263,7 @@ test("providerRef comes from the create_provider row; the legal facts come from 
 });
 
 test("no PII reaches the view, whatever the record carries", () => {
-  const v = toEntityView({ ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" });
+  const v = toEntityView(PINNED, companyDeps());
   const printed = JSON.stringify(v);
   for (const forbidden of ["legalFirstName", "email", "ssn", "postalCode", "line1"])
     expect(printed).not.toContain(forbidden);
@@ -279,27 +304,26 @@ test("a missing, malformed or empty detail blob yields no required actions", () 
 });
 
 test("documents are projected as metadata with a DERIVED name, and never the storage path", () => {
-  const v = toEntityView(
-    { ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" },
-    {
-      formationSteps: () => [step("create_provider", "confirmed", "cmp-1")],
-      documents: {
-        listByEntity: () => [
-          {
-            id: "abc123",
-            entityKey: BASE.idempotencyKey,
-            docType: "ArticlesOfOrganization",
-            sha256: "f".repeat(64),
-            contentType: "application/pdf",
-            size: 4096,
-            providerDocId: "doola-doc-1",
-            path: "/data/documents/doc-t-agent-1-ArticlesOfOrganization-doola-doc-1.pdf",
-            createdAt: "2026-08-21 12:00:00",
-          },
-        ],
-      } as never,
-    },
-  );
+  const v = toEntityView(PINNED, {
+    ...companyDeps(),
+    formationSteps: () => [step("create_provider", "confirmed", "cmp-1")],
+    documents: {
+      listByCompany: () => [
+        {
+          id: "abc123",
+          companyId: COMPANY.companyId,
+          entityKey: null,
+          docType: "ArticlesOfOrganization",
+          sha256: "f".repeat(64),
+          contentType: "application/pdf",
+          size: 4096,
+          providerDocId: "doola-doc-1",
+          path: "/data/documents/doc-company-1-ArticlesOfOrganization-doola-doc-1.pdf",
+          createdAt: "2026-08-21 12:00:00",
+        },
+      ],
+    } as never,
+  });
   expect(v.formation?.documents).toEqual([
     {
       id: "abc123",
@@ -324,27 +348,36 @@ test("no documents lookup wired reads as no documents, not as an error", () => {
 // ── M5: the LIST projection reads once for the page, not twice per entity ──────────────────
 
 test("M5: toEntityViews batches the formation and document reads across the whole page", () => {
+  // Five agents on THREE companies — the N:1 shape. The batch must ask for each company ONCE,
+  // whatever number of agents render it, which is the whole point of the de-duplication.
   const rows: EntityRecord[] = Array.from({ length: 5 }, (_, i) => ({
-    ...BASE,
+    ...PINNED,
     idempotencyKey: `t:agent-${i}`,
-    formationProvider: "doola",
-    formationEnvironment: "sandbox" as const,
+    companyId: `company-${i % 3}`,
   }));
-  // …plus an unpinned row, which must not be looked up at all.
+  // …plus an unattached row, which must not be looked up at all.
   rows.push({ ...BASE, idempotencyKey: "t:stub" });
 
   const askedSteps: string[][] = [];
+  const askedCompanies: string[][] = [];
   const askedDocs: string[][] = [];
   const views = toEntityViews(rows, {
     formationSteps: () => {
       throw new Error("the per-row lookup must not be used when a batched one is wired");
     },
-    formationStepsMany: (keys) => {
-      askedSteps.push([...keys]);
-      return new Map(keys.map((k) => [k, [step("create_provider", "confirmed", `cmp-${k}`)]]));
+    formationStepsMany: (ids) => {
+      askedSteps.push([...ids]);
+      return new Map(ids.map((k) => [k, [step("create_provider", "confirmed", `cmp-${k}`)]]));
+    },
+    company: () => {
+      throw new Error("the per-row lookup must not be used when a batched one is wired");
+    },
+    companyMany: (ids) => {
+      askedCompanies.push([...ids]);
+      return new Map(ids.map((k) => [k, { ...COMPANY, companyId: k }]));
     },
     documents: {
-      listByEntity: () => {
+      listByCompany: () => {
         throw new Error("the per-row lookup must not be used when a batched one is wired");
       },
       listByEntities: (keys) => {
@@ -354,20 +387,24 @@ test("M5: toEntityViews batches the formation and document reads across the whol
     },
   });
 
-  // ONE call each, for the PINNED rows only — an unpinned entity has no formation to describe,
-  // and on most deployments most rows are unpinned.
+  // ONE call each, for the ATTACHED rows only, de-duplicated by company.
   expect(askedSteps).toHaveLength(1);
   expect(askedDocs).toHaveLength(1);
-  expect(askedSteps[0]).toEqual(rows.slice(0, 5).map((r) => r.idempotencyKey));
+  expect(askedSteps[0]).toEqual(["company-0", "company-1", "company-2"]);
+  expect(askedCompanies[0]).toEqual(["company-0", "company-1", "company-2"]);
+  // The documents batch stays ENTITY-shaped at this boundary: the repository joins through
+  // `entities.company_id`, so a shared filing renders for every agent on it.
+  expect(askedDocs[0]).toEqual(rows.slice(0, 5).map((r) => r.idempotencyKey));
   expect(views).toHaveLength(6);
-  expect(views[0]!.formation!.providerRef).toBe("cmp-t:agent-0");
+  expect(views[0]!.formation!.providerRef).toBe("cmp-company-0");
   expect(views[5]!.formation).toBeNull();
 });
 
 test("M5: with no batched lookups wired, the list falls back to the per-row path", () => {
   let calls = 0;
-  const rows = [{ ...BASE, formationProvider: "doola", formationEnvironment: "sandbox" as const }];
+  const rows = [PINNED];
   const views = toEntityViews(rows, {
+    ...companyDeps(),
     formationSteps: () => {
       calls++;
       return [step("create_provider", "confirmed", "cmp-1")];

@@ -57,13 +57,19 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
 
     // ONE formation read for the whole page (M5) — this route used to run a `stepsOf` query per
     // entity, on a public endpoint.
-    const stepsByEntity = deps.formationStepsMany?.(
-      entities
-        .filter((e) => e.formationProvider && e.formationEnvironment)
-        .map((e) => e.idempotencyKey),
-    );
-    const stepsOf = (key: string) =>
-      stepsByEntity ? (stepsByEntity.get(key) ?? []) : (deps.formationSteps?.(key) ?? []);
+    // De-duplicated by COMPANY: under N:1 a page of agents may share one filing, and asking for
+    // its steps once per agent is the N+1 this batch exists to remove.
+    const companyIds = [
+      ...new Set(entities.map((e) => e.companyId).filter((c): c is string => !!c)),
+    ];
+    const stepsByCompany = deps.formationStepsMany?.(companyIds);
+    const companiesById = deps.companyMany?.(companyIds);
+    const stepsOf = (companyId: string) =>
+      stepsByCompany
+        ? (stepsByCompany.get(companyId) ?? [])
+        : (deps.formationSteps?.(companyId) ?? []);
+    const companyOf = (companyId: string) =>
+      companiesById ? companiesById.get(companyId) : deps.company?.(companyId);
 
     const rows = entities.map((e) => {
       const gv =
@@ -72,7 +78,9 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
           : undefined;
       const agg = settledByEntity.get(e.idempotencyKey);
       // The SAME derivation the authenticated view uses, minus everything it may not serve.
-      const formation = formationSummary(e, stepsOf(e.idempotencyKey));
+      const formation = e.companyId
+        ? formationSummary(companyOf(e.companyId), stepsOf(e.companyId))
+        : null;
       return {
         publicId: e.publicId,
         name: e.name,

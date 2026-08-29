@@ -23,6 +23,25 @@ const DOOLA = {
   DOOLA_WEBHOOK_SECRET: "whsec_test",
 };
 
+/**
+ * THE IDENTITY FLOOR (2026-08-26 §6.7): production formation refuses to boot without a WIRED
+ * World ID block. It is spelled out as a fixture rather than folded into DOOLA because the tests
+ * below prove BOTH halves — that a production box with it boots, and that one without it does not.
+ *
+ * The invariant asserts the wired dependency, never the env strings, because that is exactly
+ * where the hole was: `assertGuardianAllowed` silently returns when `cfg.world` is undefined.
+ */
+const WORLD = {
+  WORLD_APP_ID: "app_staging_1",
+  WORLD_RP_ID: "app.example",
+  WORLD_RP_SIGNING_KEY: "0xsigning",
+  WORLD_REQUIRE_GUARDIAN: "true",
+  WORLD_MAX_COMPANIES_PER_HUMAN: "3",
+};
+
+/** A production doola environment, with the identity floor satisfied. */
+const DOOLA_PROD = { ...DOOLA, ...WORLD, DOOLA_ENVIRONMENT: "production" };
+
 /** Arc mainnet's chain id is not published yet; any non-testnet id exercises the invariant. */
 const MAINNET_CHAIN_ID = "8004";
 
@@ -32,6 +51,7 @@ const MAINNET = {
   ARC_NETWORK: "mainnet",
   ARC_CHAIN_ID: MAINNET_CHAIN_ID,
   DOOLA_ENVIRONMENT: "production",
+  ...WORLD,
 };
 
 // A production-NODE_ENV env that already satisfies the pre-existing prod invariants, so a throw
@@ -76,9 +96,7 @@ test("canFormEntities is exactly 'the doola block is present' (drift guard)", ()
 
 test("base URL derives from the environment; DOOLA_BASE_URL overrides it", () => {
   expect(loadConfig({ ...BASE, ...DOOLA }).doola?.baseUrl).toBe("https://api.test.doola.com");
-  expect(loadConfig({ ...BASE, ...DOOLA, DOOLA_ENVIRONMENT: "production" }).doola?.baseUrl).toBe(
-    "https://api.doola.com",
-  );
+  expect(loadConfig({ ...BASE, ...DOOLA_PROD }).doola?.baseUrl).toBe("https://api.doola.com");
   expect(
     loadConfig({ ...BASE, ...DOOLA, DOOLA_BASE_URL: "https://replay.local/doola" }).doola?.baseUrl,
   ).toBe("https://replay.local/doola");
@@ -146,10 +164,7 @@ test("the formation knobs carry their documented defaults and honor overrides", 
 
 test("synthetic sandbox PII defaults TRUE in sandbox, FALSE in production, overridable", () => {
   expect(loadConfig({ ...BASE, ...DOOLA }).formation?.sandboxSyntheticPii).toBe(true);
-  expect(
-    loadConfig({ ...BASE, ...DOOLA, DOOLA_ENVIRONMENT: "production" }).formation
-      ?.sandboxSyntheticPii,
-  ).toBe(false);
+  expect(loadConfig({ ...BASE, ...DOOLA_PROD }).formation?.sandboxSyntheticPii).toBe(false);
   expect(
     loadConfig({ ...BASE, ...DOOLA, FORMATION_SANDBOX_SYNTHETIC_PII: "false" }).formation
       ?.sandboxSyntheticPii,
@@ -221,9 +236,9 @@ test("B3: ARC_NETWORK and ARC_CHAIN_ID must describe the SAME network, both dire
     }),
   ).toThrow(/that is the Arc TESTNET chain id/);
   // …and the default (no ARC_CHAIN_ID at all) is the testnet id, so it is refused too.
-  expect(() =>
-    loadConfig({ ...PROD_BASE, ...DOOLA, ARC_NETWORK: "mainnet", DOOLA_ENVIRONMENT: "production" }),
-  ).toThrow(/that is the Arc TESTNET chain id/);
+  expect(() => loadConfig({ ...PROD_BASE, ...DOOLA_PROD, ARC_NETWORK: "mainnet" })).toThrow(
+    /that is the Arc TESTNET chain id/,
+  );
 });
 
 test("the mainnet invariants are keyed on ARC_NETWORK, NOT on NODE_ENV", () => {
@@ -252,4 +267,60 @@ test("neither doola secret EVER survives redact() — env.ts's own header rule",
   expect(printed).not.toContain("whsec_OLD_SECRET");
   // The non-secret half stays visible — redaction must not blind the boot log.
   expect(printed).toContain("api.test.doola.com");
+});
+
+// ── THE IDENTITY FLOOR (2026-08-26 §6.7) ────────────────────────────────────────────────────
+//
+// Production formation without proof-of-personhood is anonymous USDC buying real Wyoming LLCs.
+// Every case below is the SAME deployment minus one piece of the wiring, because the failure this
+// guards against is precisely a partial one: `assertGuardianAllowed` SILENTLY RETURNS when
+// `cfg.world` is undefined, so a box could set WORLD_REQUIRE_GUARDIAN=true, pass every string
+// check an operator would think to make, and gate nothing at all.
+
+test("identity floor: production formation boots with the World block WIRED", () => {
+  const cfg = loadConfig({ ...BASE, ...DOOLA_PROD });
+  expect(cfg.world?.requireGuardian).toBe(true);
+  expect(cfg.world?.maxCompaniesPerHuman).toBe(3);
+});
+
+test("identity floor: production formation REFUSES when any WORLD_* credential is missing", () => {
+  for (const missing of ["WORLD_APP_ID", "WORLD_RP_ID", "WORLD_RP_SIGNING_KEY"] as const) {
+    const env: Record<string, string | undefined> = { ...BASE, ...DOOLA_PROD };
+    env[missing] = undefined;
+    // The wired dependency, not the env string: two of the three present is still a no-op gate.
+    expect(() => loadConfig(env), missing).toThrow(/requires the World ID block/);
+  }
+});
+
+test("identity floor: production formation REFUSES with the gate configured but OFF", () => {
+  expect(() => loadConfig({ ...BASE, ...DOOLA_PROD, WORLD_REQUIRE_GUARDIAN: "false" })).toThrow(
+    /the guardian must be a verified unique human/,
+  );
+});
+
+test("identity floor: production formation REFUSES an unbounded per-human company count", () => {
+  const env: Record<string, string | undefined> = { ...BASE, ...DOOLA_PROD };
+  env.WORLD_MAX_COMPANIES_PER_HUMAN = undefined;
+  expect(() => loadConfig(env)).toThrow(/requires WORLD_MAX_COMPANIES_PER_HUMAN/);
+});
+
+test("identity floor: a SANDBOX deployment is unaffected — the floor is about real filings", () => {
+  expect(() => loadConfig({ ...BASE, ...DOOLA })).not.toThrow();
+  expect(loadConfig({ ...BASE, ...DOOLA }).world).toBeUndefined();
+});
+
+test("a synthetic sandbox identity can never file a REAL company", () => {
+  // The shortcut exists so real personal data never reaches a playground. Used the other way
+  // round it would file a real Wyoming LLC naming a person who does not exist (§7).
+  expect(() =>
+    loadConfig({ ...BASE, ...DOOLA_PROD, FORMATION_SANDBOX_SYNTHETIC_PII: "true" }),
+  ).toThrow(/would file a REAL Wyoming LLC for a person who does not exist/);
+});
+
+test("FORMATION_MAX_AGENTS_PER_COMPANY defaults to 10 and is overridable", () => {
+  expect(loadConfig({ ...BASE, ...DOOLA }).formation?.maxAgentsPerCompany).toBe(10);
+  expect(
+    loadConfig({ ...BASE, ...DOOLA, FORMATION_MAX_AGENTS_PER_COMPANY: "2" }).formation
+      ?.maxAgentsPerCompany,
+  ).toBe(2);
 });

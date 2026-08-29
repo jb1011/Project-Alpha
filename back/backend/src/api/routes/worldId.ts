@@ -20,6 +20,15 @@ export interface WorldIdDeps {
   store: WorldStore;
   /** Absent = no ceiling on legal entities per human. */
   maxEntitiesPerHuman?: number;
+  /**
+   * Absent = no ceiling on COMPANIES per human (2026-08-26 §6.7).
+   *
+   * A separate bound from `maxEntitiesPerHuman`, because they brake different things: companies
+   * are FILINGS (real money, a real Wyoming record), agents are software. Production formation
+   * boot-FAILS unless this one is set, and the invariant asserts the wired dependency rather than
+   * an env string — `assertGuardianAllowed` silently no-ops when `cfg.world` is undefined.
+   */
+  maxCompaniesPerHuman?: number;
   requireGuardian: boolean;
 }
 
@@ -439,9 +448,20 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
   };
 }
 
-/** Onboarding gate: throws unless the tenant's guardian is a verified unique human under the cap.
- *  No-op when World isn't configured or enforcement is off — existing deployments are unaffected. */
-export function assertGuardianAllowed(world: WorldIdDeps | undefined, tenantId: string): void {
+/**
+ * The personhood gate: throws unless the tenant's guardian is a verified unique human under the
+ * relevant cap. No-op when World isn't configured or enforcement is off — existing deployments
+ * are unaffected, and production formation has a BOOT invariant precisely because of that no-op.
+ *
+ * TWO scopes, because there are two different things to bound (2026-08-26 §6.7). The `entity`
+ * scope (the default, and what onboard uses) counts AGENTS; the `company` scope counts FILINGS
+ * and backs `POST /companies` and MCP `create_company` — the doors that spend the money.
+ */
+export function assertGuardianAllowed(
+  world: WorldIdDeps | undefined,
+  tenantId: string,
+  opts: { scope?: "entity" | "company" } = {},
+): void {
   if (!world || !world.requireGuardian) return;
   const v = world.store.findByTenant(tenantId, world.cfg.action);
   if (!v)
@@ -450,8 +470,19 @@ export function assertGuardianAllowed(world: WorldIdDeps | undefined, tenantId: 
       403,
       "guardian must complete World ID verification before creating a legal entity",
     );
-  // The ceiling is optional: unset means a verified human may form as many legal bodies as they
-  // like, which is what the law actually allows.
+  // Both ceilings are optional: unset means a verified human may form as many legal bodies as
+  // they like, which is what the law actually allows.
+  if (opts.scope === "company") {
+    if (world.maxCompaniesPerHuman == null) return;
+    const used = world.store.countCompaniesForNullifier(v.nullifier, world.cfg.action);
+    if (used >= world.maxCompaniesPerHuman)
+      throw new ApiError(
+        "guardian_company_cap",
+        403,
+        `this human already controls ${used} companies (max ${world.maxCompaniesPerHuman})`,
+      );
+    return;
+  }
   if (world.maxEntitiesPerHuman == null) return;
   const used = world.store.countEntitiesForNullifier(v.nullifier, world.cfg.action);
   if (used >= world.maxEntitiesPerHuman)

@@ -221,12 +221,12 @@ test("C10: the unreachable second formation_parties rebuild is gone", () => {
 test("the CHECKs refuse an unknown step/state (typos become errors, not silent rows)", () => {
   expect(() =>
     db
-      .prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)")
+      .prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)")
       .run("k", "not_a_step", "pending"),
   ).toThrow(/CHECK/);
   expect(() =>
     db
-      .prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)")
+      .prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)")
       .run("k", "await_ein", "not_a_state"),
   ).toThrow(/CHECK/);
   expect(() =>
@@ -256,14 +256,17 @@ test("oa_anchors is keyed per VERSION: two cycles for one entity coexist (audit 
 });
 
 test("timestamps default to CURRENT_TIMESTAMP as TEXT (bridge_legs consistency)", () => {
-  db.prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)").run(
+  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
     "k",
     "create_provider",
     "pending",
   );
-  const row = db.prepare("SELECT created_at, updated_at FROM formation_requests").get() as {
+  const row = db
+    .prepare("SELECT created_at, updated_at, facts_updated_at FROM formation_requests")
+    .get() as {
     created_at: string;
     updated_at: string;
+    facts_updated_at: string;
   };
   expect(typeof row.created_at).toBe("string");
   expect(row.created_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);

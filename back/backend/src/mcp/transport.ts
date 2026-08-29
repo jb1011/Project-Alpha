@@ -44,6 +44,12 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       // two. `EntityViewDeps` is now inherited by both dep types, so the pick cannot be partial.
       formationSteps: deps.formationSteps,
       formationStepsMany: deps.formationStepsMany,
+      // The company lookups joined the set with the 2026-08-26 re-key: the formation block is
+      // read off the COMPANY row now, so an MCP surface without them would describe every formed
+      // entity as unformed — the exact class of quiet divergence the C8 note above is about.
+      company: deps.company,
+      companyMany: deps.companyMany,
+      companies: deps.companies,
       documents: deps.documents,
       ens: deps.ens
         ? {

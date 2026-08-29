@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -16,6 +17,8 @@ let db: Database.Database;
 let repo: SqliteEntityRepository;
 let docStore: FileDocumentStore;
 let requests: SqliteFormationRepository;
+let companies: SqliteCompanyRepository;
+const COMPANY_KEY = "company-meta";
 
 const rec: EntityRecord = {
   idempotencyKey: KEY,
@@ -45,8 +48,32 @@ function app() {
     webOrigin: "https://app.example.com",
     repo,
     docStore,
-    formationSteps: (k: string) => requests.stepsOf(k),
+    formationSteps: (companyId: string) => requests.stepsOf(companyId),
+    company: (companyId: string) => companies.find(companyId),
   } as never);
+}
+
+/**
+ * The company the entity is attached to — where the pin and the filing facts live (§3).
+ *
+ * The attach is `repo.attachCompany`, not an `upsert`: `company_id` is WRITE-ONCE and deliberately
+ * absent from upsert's DO UPDATE list, so an ordinary record write cannot move it.
+ */
+function attachCompany(over: { environment?: "sandbox" | "production" } = {}): void {
+  if (!companies.find(COMPANY_KEY))
+    companies.create({
+      companyId: COMPANY_KEY,
+      tenantId: "t1",
+      status: "ready",
+      provider: "doola",
+      environment: over.environment ?? "sandbox",
+      synthetic: false,
+      nameOptions: [{ name: "Meta", entityTypeEnding: "LLC", position: 1 }],
+      businessPurpose: "purpose",
+      industryLabel: "Software development",
+      intakeSynthesized: true,
+    });
+  repo.attachCompany(KEY, COMPANY_KEY);
 }
 
 beforeEach(() => {
@@ -54,6 +81,7 @@ beforeEach(() => {
   migrate(db);
   repo = new SqliteEntityRepository(db);
   requests = new SqliteFormationRepository(db);
+  companies = new SqliteCompanyRepository(db);
   docStore = new FileDocumentStore(mkdtempSync(join(tmpdir(), "meta-")));
   repo.upsert(rec);
   docStore.put(
@@ -96,13 +124,16 @@ test("cross-origin OPTIONS preflight to /metadata gets ACAO: *", async () => {
 
 test("the served metadata NEVER carries the EIN or anything about the natural person (§8)", async () => {
   // The record holds the real EIN and the filing facts, and a party row holds real PII…
+  attachCompany();
   repo.upsert({
     ...rec,
+    companyId: COMPANY_KEY,
     formationProvider: "doola",
     formationEnvironment: "sandbox",
-    einReal: "98-7654321",
-    formationFilingNumber: "2026-123456",
   });
+  // The EIN and the filing number live on the COMPANY now — and neither may reach this surface.
+  companies.recordEin(COMPANY_KEY, "98-7654321");
+  companies.recordFilingFacts(COMPANY_KEY, { filingNumber: "2026-123456" });
   db.prepare(
     `INSERT INTO formation_parties (party_id, entity_key, tenant_id, legal_first_name,
        legal_last_name, email, line1, city, postal_code, country)
@@ -129,7 +160,13 @@ test("the served metadata NEVER carries the EIN or anything about the natural pe
 // ── serve-time layering (design §8, audit M10) ─────────────────────────────────────────────
 
 test("formation status is layered from the DB at SERVE time, not frozen at translate", async () => {
-  repo.upsert({ ...rec, formationProvider: "doola", formationEnvironment: "sandbox" });
+  attachCompany();
+  repo.upsert({
+    ...rec,
+    companyId: COMPANY_KEY,
+    formationProvider: "doola",
+    formationEnvironment: "sandbox",
+  });
   // The stored JSON was written during translate and knows nothing about any of this.
   docStore.put(
     `meta-${KEY}.json`,
@@ -140,24 +177,29 @@ test("formation status is layered from the DB at SERVE time, not frozen at trans
   expect(before.formation).toEqual({ environment: "sandbox", status: "none" });
 
   // Time passes; the state files the company.
-  requests.claimAllSteps(KEY);
-  requests.transition(KEY, "create_provider", "pending", "confirmed", { providerRef: "cmp-1" });
-  requests.transition(KEY, "await_filing", "pending", "confirmed");
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
+    providerRef: "cmp-1",
+  });
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
 
   const after = await (await app().request(`/metadata/${PUBLIC_ID}`)).json();
   expect(after.formation).toEqual({ environment: "sandbox", status: "filed" });
 });
 
 test("the formation block carries the environment and NOTHING that could identify anyone", async () => {
+  attachCompany();
   repo.upsert({
     ...rec,
+    companyId: COMPANY_KEY,
     formationProvider: "doola",
     formationEnvironment: "sandbox",
-    einReal: "98-7654321",
-    formationFilingNumber: "2026-123456",
   });
-  requests.claimAllSteps(KEY);
-  requests.transition(KEY, "create_provider", "pending", "confirmed", {
+  // The EIN and the filing number live on the COMPANY now — and neither may reach this surface.
+  companies.recordEin(COMPANY_KEY, "98-7654321");
+  companies.recordFilingFacts(COMPANY_KEY, { filingNumber: "2026-123456" });
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
     providerRef: "cmp-secret",
   });
 

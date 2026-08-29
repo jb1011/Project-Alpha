@@ -29,7 +29,9 @@ export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
     const rec = requireOwnedEntity(deps, c);
     // No lookup wired (a deployment that has never formed anything) reads as "no documents",
     // which is the truth, rather than as an error.
-    const docs = deps.documents?.listByEntity(rec.idempotencyKey) ?? [];
+    // Company-scoped since the re-key: the documents belong to the FILING, and every agent
+    // attached to it may read them. Ownership was already asserted on the entity above.
+    const docs = rec.companyId ? (deps.documents?.listByCompany(rec.companyId) ?? []) : [];
     return c.json({
       // The SAME projection the entity view renders (M4) — `sha256` is the hash a verifier
       // re-computes from the bytes below, and from PR 3 the one the OA bundle manifest commits
@@ -40,9 +42,11 @@ export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
 
   app.get("/entities/:id/documents/:docId", async (c) => {
     const rec = requireOwnedEntity(deps, c);
-    // `findOwned` re-asserts the entity key, so a document id belonging to another entity is a
+    // `findOwned` re-asserts the COMPANY id, so a document id belonging to another company is a
     // 404 here even though it is a perfectly valid id somewhere else.
-    const doc = deps.documents?.findOwned(rec.idempotencyKey, c.req.param("docId"));
+    const doc = rec.companyId
+      ? deps.documents?.findOwned(rec.companyId, c.req.param("docId"))
+      : undefined;
     if (!doc) throw new ApiError("not_found", 404, "document not found");
 
     let bytes: Buffer;

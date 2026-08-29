@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type Config, canFormEntities } from "./config/env";
+import { deriveFormationStatus } from "./formation/status";
 import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
 import { sqliteUtcTimestamp } from "./util/sqliteTime";
@@ -47,9 +48,46 @@ export function resolveFormationDeployment(
 // non-null to a 400, MCP to an `isError` text — so the ORDER of the checks cannot differ
 // between the surfaces either, which is the property `server.ts:489-491` asks for.
 
-/** Formation is mandatory here and the caller sent no party handle. */
+/** Formation is mandatory here and the caller sent neither a company nor a party handle. */
 export function formationPartyRequiredMessage(): string {
-  return "formation is required on this deployment: create a formation party (POST /formation-party, or the create_formation_party tool) and pass its partyId to onboard";
+  return "formation is required on this deployment: create or reuse a company (POST /companies, or the create_company tool) and pass its companyId to onboard — or pass a partyId and one will be created for you";
+}
+
+/** The company handle is unknown, not yours, or not in a state an agent may attach to. ONE
+ *  message for all of them, for the reason `formationPartyUnavailableMessage` gives. */
+export function companyUnavailableMessage(): string {
+  return "companyId is unknown, not yours, or not available for attachment (a draft, an abandoned or a failed company cannot take new agents)";
+}
+
+/** The per-company agent bound (design §3). Each attached agent is an anchor sequence per late
+ *  fact, sponsored on-chain through its own timelock, so the fan-out has to be bounded. */
+export function companyAgentCapMessage(max: number): string {
+  return `this company already has ${max} agent(s) attached (FORMATION_MAX_AGENTS_PER_COMPANY) — create another company for further agents`;
+}
+
+/**
+ * May an agent attach to this company (design §3)?
+ *
+ * `status` must be `ready` — a `draft` still owes its payment step and an `abandoned` one is
+ * over — and the DERIVED filing status must be one of `none | in_progress | filed | complete`.
+ * `none` is in the list deliberately: a `ready` company whose `create_provider` row is not yet
+ * open derives `none`, and that is the happy path for both the shim and the hybrid flow. A
+ * derived `failed` is refused because the agent would be attaching to a filing that will not
+ * happen, and a live payment is refused because the company is not paid for yet.
+ */
+export function companyAcceptsAgents(
+  company: { status: "draft" | "ready" | "abandoned" },
+  derivedStatus: import("./formation/status").FormationStatus,
+  hasLivePayment: boolean,
+): boolean {
+  if (company.status !== "ready") return false;
+  if (hasLivePayment) return false;
+  return (
+    derivedStatus === "none" ||
+    derivedStatus === "in_progress" ||
+    derivedStatus === "filed" ||
+    derivedStatus === "complete"
+  );
 }
 
 /**
@@ -61,7 +99,7 @@ export function formationPartyRequiredMessage(): string {
  * to fix.
  */
 export function formationPartyUnavailableMessage(): string {
-  return "partyId is unknown, not yours, or already bound to another entity — create a new formation party";
+  return "partyId is unknown, not yours, or already bound to another company — create a new formation party";
 }
 
 /** A partyId arrived at a deployment that forms nothing. Refused rather than ignored: silently
@@ -129,6 +167,8 @@ export interface FormationQuotaReader {
   createRequestsByTenant(tenantId: string): number;
   /** Formations opened across the whole deployment since a UTC "YYYY-MM-DD HH:MM:SS" instant. */
   createRequestsSince(sinceUtc: string): number;
+  /** The attach predicate's steps read. Optional so the pre-company fakes still satisfy it. */
+  stepsOf?(companyId: string): import("./persistence/formationRepository").FormationRequestRecord[];
 }
 
 /** Everything the door needs. Absent `formation` = this deployment forms nothing. */
@@ -137,10 +177,15 @@ export interface FormationDoorDeps {
     required: boolean;
     maxPerTenant: number;
     dailyCeiling: number;
+    maxAgentsPerCompany: number;
     parties: import("./persistence/formationPartyRepository").FormationPartyRepository;
     /** The sub-saga rows. Typed as the narrow COUNTING surface here — the door needs nothing
      *  else from them, and the full repository satisfies it structurally. */
     requests: FormationQuotaReader;
+    /** Companies: what an ATTACH resolves against. The door's check is advisory — the binding
+     *  answer is the CAS inside the claim transaction (§3) — but refusing here means an
+     *  unattachable company never costs a claim. */
+    companies: import("./persistence/companyRepository").CompanyRepository;
   };
   now?: () => number;
 }
@@ -161,29 +206,52 @@ export { sqliteUtcTimestamp };
  */
 export function formationDoorRefusal(
   deps: FormationDoorDeps,
-  input: { tenantId: string; partyId?: string },
+  input: { tenantId: string; partyId?: string; companyId?: string },
 ): string | null {
   const f = deps.formation;
   const now = deps.now ?? Date.now;
 
-  // 1. A deployment that forms nothing. A partyId here is a caller who believes their legal
-  //    identity is being filed with; say so instead of dropping it.
-  if (!f) return input.partyId ? formationUnavailableMessage() : null;
+  // 1. A deployment that forms nothing. A party or company handle here is a caller who believes
+  //    a legal body is being filed; say so instead of dropping it.
+  if (!f) return input.partyId || input.companyId ? formationUnavailableMessage() : null;
 
-  // 2. Mandatory formation with no party handle.
-  if (f.required && !input.partyId) return formationPartyRequiredMessage();
+  // 2. Mandatory formation with no handle of either kind.
+  if (f.required && !input.partyId && !input.companyId) return formationPartyRequiredMessage();
 
-  // 3. Ownership + single-use. Uniform message (see formationPartyUnavailableMessage).
-  if (input.partyId) {
-    const party = f.parties.findOwned(input.tenantId, input.partyId);
-    if (!party || party.entityKey) return formationPartyUnavailableMessage();
+  // 3. ATTACH (§3). An existing company costs nothing new — the filing is already paid for and
+  //    already open — so it short-circuits the spend controls below entirely. Billing is per
+  //    COMPANY: attaching an agent to one is free. The binding check is the CAS inside the claim
+  //    transaction; this one exists so an unattachable company never costs a claim.
+  if (input.companyId) {
+    // Both at once would be ambiguous about which identity the filing is under.
+    if (input.partyId)
+      return "pass either companyId (attach to an existing company) or partyId (create one), not both";
+    const company = f.companies.findOwned(input.tenantId, input.companyId);
+    if (!company) return companyUnavailableMessage();
+    if (
+      !companyAcceptsAgents(
+        company,
+        deriveFormationStatus(f.requests.stepsOf?.(input.companyId) ?? []),
+        f.companies.livePaymentCount(input.companyId) > 0,
+      )
+    )
+      return companyUnavailableMessage();
+    if (f.companies.countAgents(input.companyId) >= f.maxAgentsPerCompany)
+      return companyAgentCapMessage(f.maxAgentsPerCompany);
+    return null;
   }
 
-  // 4. Spend controls, only when a filing will ACTUALLY be initiated for this entity — which is
-  //    exactly when a party is bound to it, on EVERY deployment (the opt-in semantic: a bound
-  //    party is always pinned and always filed). Keyed on the partyId rather than on `required`,
-  //    because an opt-in filing on a `required=false` box costs the same $100–150 as a mandatory
-  //    one and must count against the same limits.
+  // 4. Ownership + single-use. Uniform message (see formationPartyUnavailableMessage).
+  if (input.partyId) {
+    const party = f.parties.findOwned(input.tenantId, input.partyId);
+    if (!party || party.companyId) return formationPartyUnavailableMessage();
+  }
+
+  // 5. Spend controls, only when a filing will ACTUALLY be initiated — which is exactly when a
+  //    party handle is passed and a NEW company will be minted for it, on EVERY deployment (the
+  //    opt-in semantic). Keyed on the partyId rather than on `required`, because an opt-in filing
+  //    on a `required=false` box costs the same $100–150 as a mandatory one and must count
+  //    against the same limits. `createCompany` re-checks all of it inside the claim.
   if (!input.partyId) return null;
 
   const used = f.requests.createRequestsByTenant(input.tenantId);
@@ -320,7 +388,7 @@ export function createFormationParty(
  * names it rather than taking it as a parameter.
  */
 export function legacyDoorRefusalMessage(): string {
-  return "cli create-entity cannot onboard on a deployment where formation is required: it carries no formation party (POST /formation-party) and would mint an entity that can never be filed. Use the wizard API (POST /onboard) or the MCP onboard_agent tool.";
+  return "cli create-entity cannot onboard on a deployment where formation is required: it carries no company handle (POST /companies) and would mint an entity that can never be filed. Use the wizard API (POST /onboard) or the MCP onboard_agent tool.";
 }
 
 /** True when the legacy door must refuse: formation is configured AND mandatory. */

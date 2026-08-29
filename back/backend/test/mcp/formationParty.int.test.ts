@@ -11,8 +11,10 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import type { GuardianPasskey } from "../../src/adapters/turnkey/provisioner";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { createCompany } from "../../src/formation/company";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
@@ -84,11 +86,39 @@ function buildTestApp(
   formation?: { required?: boolean; syntheticPii?: boolean; maxPerTenant?: number },
   custody: { circle?: boolean; turnkey?: boolean } = {},
 ) {
+  const companies = new SqliteCompanyRepository(db);
+  const requests = new SqliteFormationRepository(db);
+  const pin = { provider: "doola" as const, environment: "sandbox" as const };
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
-    parties,
+    // The A1 shim: a party-only onboard mints its 1:1 company inside the claim (design §10).
+    formation: formation
+      ? {
+          companies,
+          requests,
+          maxAgentsPerCompany: 10,
+          createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
+            const result = createCompany(
+              {
+                companies,
+                parties,
+                requests,
+                pin,
+                sandboxSyntheticPii: formation.syntheticPii ?? false,
+                maxPerTenant: formation.maxPerTenant ?? 3,
+                dailyCeiling: 10,
+                transaction: (fn) => fn(),
+              },
+              tenantId,
+              { ...intake, synthetic: formation.syntheticPii ? true : undefined },
+            );
+            if ("error" in result) throw new Error(result.error);
+            return result.companyId;
+          },
+        }
+      : undefined,
   });
   return buildApiApp({
     webOrigin: "*",
@@ -114,10 +144,14 @@ function buildTestApp(
           sandboxSyntheticPii: formation.syntheticPii ?? false,
           maxPerTenant: formation.maxPerTenant ?? 3,
           dailyCeiling: 10,
+          maxAgentsPerCompany: 10,
           parties,
-          requests: new SqliteFormationRepository(db),
+          requests,
+          companies,
+          pin,
         }
       : undefined,
+    companies,
   } as never);
 }
 
@@ -250,7 +284,9 @@ test("REQUIRED: a valid party onboards and is bound; a second use is refused", a
       ),
     );
     expect(out.status).toBe("pending");
-    expect(parties.findByEntityKey(out.id)!.partyId).toBe(partyId);
+    expect(parties.findByCompanyId(repo.findByIdempotencyKey(out.id)!.companyId!)!.partyId).toBe(
+      partyId,
+    );
 
     const second = await c.callTool({
       name: "onboard_agent",
@@ -345,8 +381,9 @@ test("the quota refuses onboard_agent before the entity is minted", async () => 
         }),
       ),
     );
-    db.prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)").run(
-      out.id,
+    // The COMPANY's create_provider row is what burns the door's quota since the re-key.
+    db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
+      repo.findByIdempotencyKey(out.id)!.companyId!,
       "create_provider",
       "pending",
     );

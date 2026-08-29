@@ -1,4 +1,5 @@
 import { type FormationStatus, type FormationSummary, formationSummary } from "../formation/status";
+import type { CompanyRecord } from "../persistence/companyRepository";
 import {
   type DocumentIndexRecord,
   type DocumentIndexRepository,
@@ -8,9 +9,12 @@ import type { FormationRequestRecord } from "../persistence/formationRepository"
 import type { EntityRecord } from "../types";
 import { usesManifestScheme } from "../workflow/onboarding";
 
-/** The formation sub-saga rows of one entity. A function rather than the repository so the view
+/** The formation sub-saga rows of one COMPANY. A function rather than the repository so the view
  *  stays a pure projection and the caller decides where the rows come from. */
-export type FormationStepsLookup = (entityKey: string) => FormationRequestRecord[];
+export type FormationStepsLookup = (companyId: string) => FormationRequestRecord[];
+
+/** How a view learns the company an entity is attached to. Same shape, same reason. */
+export type CompanyLookup = (companyId: string) => CompanyRecord | undefined;
 
 /**
  * Everything a view needs beyond the entity row itself (C8).
@@ -32,14 +36,21 @@ export interface EntityViewDeps {
    * The BATCHED twin, for the list routes (M5). Optional: absent, a list falls back to one
    * lookup per row, which is what every caller did before.
    */
-  formationStepsMany?: (entityKeys: string[]) => Map<string, FormationRequestRecord[]>;
+  formationStepsMany?: (companyIds: string[]) => Map<string, FormationRequestRecord[]>;
+  /**
+   * The COMPANY an entity is attached to (2026-08-26 §3) — where the pin and the filing facts
+   * now live. Absent, a pinned entity renders `formation: null`: the honest answer for a
+   * projection that cannot read the row the facts are in, and never a half-populated block.
+   */
+  company?: CompanyLookup;
+  companyMany?: (companyIds: string[]) => Map<string, CompanyRecord>;
   /**
    * The document index. A repository rather than a lookup, because the download route needs
    * `findOwned` from the SAME object — and a deployment that has one and not the other is the
    * split this type exists to prevent. Narrowed to the two READS a view can make, so a batched
    * stand-in satisfies it; `ApiDeps` re-declares it as the full repository.
    */
-  documents?: Pick<DocumentIndexRepository, "listByEntity" | "listByEntities">;
+  documents?: Pick<DocumentIndexRepository, "listByCompany" | "listByEntities">;
 }
 
 /**
@@ -167,9 +178,9 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
   // question meant three queries per entity on every list response — while an UNPINNED row (every
   // legacy entity, every stub deployment) needs none of them at all, and the list routes are
   // mostly unpinned rows.
-  const pinned = Boolean(r.formationProvider && r.formationEnvironment);
-  const steps = pinned ? (deps.formationSteps?.(r.idempotencyKey) ?? []) : [];
-  const summary = pinned ? formationSummary(r, steps) : null;
+  const companyId = r.companyId ?? null;
+  const steps = companyId ? (deps.formationSteps?.(companyId) ?? []) : [];
+  const summary = companyId ? formationSummary(deps.company?.(companyId), steps) : null;
   return {
     id: r.idempotencyKey,
     name: r.name,
@@ -211,8 +222,11 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
           ...summary,
           // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
           // mint and is never served as a legal fact.
-          ein: r.einReal ?? null,
-          documents: (deps.documents?.listByEntity(r.idempotencyKey) ?? []).map(toDocumentView),
+          // The EIN now lives on the COMPANY: one filing, one EIN, however many agents share it.
+          ein: (companyId ? deps.company?.(companyId)?.ein : null) ?? null,
+          documents: (companyId ? (deps.documents?.listByCompany(companyId) ?? []) : []).map(
+            toDocumentView,
+          ),
         }
       : null,
   };
@@ -233,20 +247,35 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
  * keeps working with whatever it already passes.
  */
 export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): EntityView[] {
-  const keys = rows
-    .filter((r) => r.formationProvider && r.formationEnvironment)
-    .map((r) => r.idempotencyKey);
-  if (keys.length === 0) return rows.map((r) => toEntityView(r, deps));
+  const entityKeys = rows.filter((r) => r.companyId).map((r) => r.idempotencyKey);
+  // De-duplicated: under N:1 a page of ten agents may be one company, and asking for its steps
+  // ten times is the N+1 this function exists to remove.
+  const companyIds = [...new Set(rows.map((r) => r.companyId).filter((c): c is string => !!c))];
+  if (companyIds.length === 0) return rows.map((r) => toEntityView(r, deps));
 
-  const steps = deps.formationStepsMany?.(keys);
-  const docs = deps.documents?.listByEntities?.(keys);
-  if (!steps && !docs) return rows.map((r) => toEntityView(r, deps));
+  const steps = deps.formationStepsMany?.(companyIds);
+  const companies = deps.companyMany?.(companyIds);
+  // Still ENTITY-shaped at this boundary: the repository joins through `entities.company_id`, so
+  // two agents sharing a filing each render the same documents.
+  const docs = deps.documents?.listByEntities?.(entityKeys);
+  if (!steps && !docs && !companies) return rows.map((r) => toEntityView(r, deps));
+
+  // Re-grouped by company for the per-row read below. Every entity attached to one company sees
+  // the SAME rows (the join is on `company_id`), so the first non-empty answer is the answer.
+  const docsByCompany = new Map<string, DocumentIndexRecord[]>();
+  if (docs)
+    for (const r of rows) {
+      const c = r.companyId;
+      if (!c || docsByCompany.get(c)?.length) continue;
+      docsByCompany.set(c, docs.get(r.idempotencyKey) ?? []);
+    }
 
   const batched: EntityViewDeps = {
     ...deps,
     formationSteps: steps ? (k) => steps.get(k) ?? [] : deps.formationSteps,
+    company: companies ? (k) => companies.get(k) : deps.company,
     documents: docs
-      ? { listByEntity: (k) => docs.get(k) ?? [], listByEntities: () => docs }
+      ? { listByCompany: (c) => docsByCompany.get(c) ?? [], listByEntities: () => docs }
       : deps.documents,
   };
   return rows.map((r) => toEntityView(r, batched));

@@ -24,6 +24,7 @@ import {
   parseManifest,
   serializeManifestBytes,
 } from "../../src/oa/manifest";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import {
   SqliteDocumentIndexRepository,
@@ -43,11 +44,13 @@ import {
 } from "../../src/workflow/anchorLoop";
 import {
   COMPANY_ID,
+  COMPANY_KEY,
   ENTITY_KEY,
   type FakeAnchorChain,
   MemoryDocumentStore,
   fakeAnchorChain,
   formedEntity,
+  seedCompany,
 } from "../helpers/formationFakes";
 
 const USDC = "0x3600000000000000000000000000000000000000" as const;
@@ -75,6 +78,7 @@ const SPEC = parseAgentSpec({
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
+let companies: SqliteCompanyRepository;
 let requests: SqliteFormationRepository;
 let documents: SqliteDocumentIndexRepository;
 let anchors: SqliteOaAnchorRepository;
@@ -85,6 +89,7 @@ let clock: number;
 function deps(over: Partial<AnchorLoopDeps> = {}): AnchorLoopDeps {
   return {
     repo,
+    companies,
     requests,
     documents,
     docStore,
@@ -115,6 +120,7 @@ function seedV1(over: Partial<EntityRecord> = {}): Hex {
   const bytes = serializeManifestBytes(manifest);
   const hash = manifestHash(bytes);
   docStore.putBytes(manifestDocName(ENTITY_KEY, 1), bytes);
+  seedCompany(companies);
   repo.upsert(
     formedEntity({
       oaHash: hash,
@@ -123,8 +129,8 @@ function seedV1(over: Partial<EntityRecord> = {}): Hex {
       ...over,
     }),
   );
-  requests.claimAllSteps(ENTITY_KEY);
-  requests.transition(ENTITY_KEY, "create_provider", "pending", "confirmed", {
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
     providerRef: COMPANY_ID,
   });
   chain.state.current = hash;
@@ -133,21 +139,20 @@ function seedV1(over: Partial<EntityRecord> = {}): Hex {
 
 /** The v2 trigger: the state filed the company AND both required documents are indexed. */
 function confirmFiling(over: { filingNumber?: string | null } = {}): void {
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
-  requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
-  const rec = repo.findByIdempotencyKey(ENTITY_KEY)!;
-  repo.upsert({
-    ...rec,
-    formationFiledAt: FILED_AT,
-    formationFilingNumber: over.filingNumber === undefined ? "2026-001234567" : over.filingNumber,
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "fetch_documents", "pending", "confirmed");
+  // The legal facts live on the COMPANY since 2026-08-26 §3.
+  companies.recordFilingFacts(COMPANY_KEY, {
+    filedAt: FILED_AT,
+    filingNumber: over.filingNumber === undefined ? "2026-001234567" : over.filingNumber,
   });
   for (const [type, sha] of [
     ["ArticlesOfOrganization", "a".repeat(64)],
     ["OperatingAgreement", "b".repeat(64)],
   ] as const)
     documents.insert({
-      id: documentIndexId(ENTITY_KEY, type),
-      entityKey: ENTITY_KEY,
+      id: documentIndexId(COMPANY_KEY, type),
+      companyId: COMPANY_KEY,
       docType: type,
       sha256: sha,
       contentType: "application/pdf",
@@ -157,11 +162,23 @@ function confirmFiling(over: { filingNumber?: string | null } = {}): void {
     });
 }
 
+/**
+ * Re-stamp the company's facts as of NOW.
+ *
+ * A SCHEDULED cycle inside its timelock is deliberately skipped when no fact has moved since it
+ * was written (F6) — that is the optimization that stopped every formed entity re-reading and
+ * re-hashing its manifest on every tick. SQLite timestamps have ONE-SECOND resolution, so whether
+ * a fixture's steps and its cycle land in the same second is a race with the machine's load. The
+ * tests below are about the veto, not about that race, so they say what they mean.
+ */
+function touchFacts(): void {
+  db.prepare("UPDATE formation_requests SET facts_updated_at = CURRENT_TIMESTAMP").run();
+}
+
 /** The v3 trigger: the IRS issued. */
 function confirmEin(ein = "88-1234567"): void {
-  requests.transition(ENTITY_KEY, "await_ein", "pending", "confirmed");
-  const rec = repo.findByIdempotencyKey(ENTITY_KEY)!;
-  repo.upsert({ ...rec, einReal: ein });
+  requests.transition(COMPANY_KEY, "await_ein", "pending", "confirmed");
+  companies.recordEin(COMPANY_KEY, ein);
 }
 
 const entity = () => repo.findByIdempotencyKey(ENTITY_KEY)!;
@@ -177,6 +194,7 @@ beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
+  companies = new SqliteCompanyRepository(db);
   requests = new SqliteFormationRepository(db);
   documents = new SqliteDocumentIndexRepository(db);
   anchors = new SqliteOaAnchorRepository(db);
@@ -516,6 +534,7 @@ test("A-13: liftVeto resumes the pipeline, and the newest facts are what get anc
   await advanceAnchor(deps(), ENTITY_KEY);
   const v2Hash = cycle(2)!.manifestHash;
   chain.veto(v2Hash);
+  touchFacts();
   await advanceAnchor(deps(), ENTITY_KEY);
   confirmEin();
 
@@ -535,6 +554,7 @@ test("A-14: an operator ACK also ends the park, without the guardian lifting any
   confirmFiling();
   await advanceAnchor(deps(), ENTITY_KEY);
   chain.veto(cycle(2)!.manifestHash);
+  touchFacts();
   await advanceAnchor(deps(), ENTITY_KEY);
 
   expect(anchors.acknowledgeHold(ENTITY_KEY, 2)).toBe(true);
@@ -682,6 +702,8 @@ test("A-21: legacy, stub and legacy-scheme entities never reach the chain from h
     // No doola pin: the 13 testnet + existing prod agents, stub forever.
     [{ formationProvider: null, formationEnvironment: null }, "not_pinned"],
     // Pinned elsewhere: a mainnet flip must never act on an in-flight sandbox entity (audit M5).
+    // The entity's pin is a COPY of its company's, so the entity-side value is what this gate
+    // reads; the company-side refusal is `formationProcessor`'s.
     [{ formationEnvironment: "production" }, "environment_pin"],
     // The create tx has not confirmed: no proxy to amend, no v1 to chain onto.
     [
@@ -690,7 +712,9 @@ test("A-21: legacy, stub and legacy-scheme entities never reach the chain from h
     ],
   ];
   for (const [over, skipped] of cases) {
-    db.exec("DELETE FROM entities; DELETE FROM formation_requests; DELETE FROM documents");
+    db.exec(
+      "DELETE FROM entities; DELETE FROM formation_requests; DELETE FROM documents; DELETE FROM companies",
+    );
     seedV1(over);
     confirmFiling();
     expect((await advanceAnchor(deps(), ENTITY_KEY)).skipped, skipped).toBe(skipped);
@@ -708,8 +732,8 @@ test("A-22: a LEGACY-SCHEME record (doc-hash anchor, no manifest version) is lef
       oaManifestPendingHash: null,
     }),
   );
-  requests.claimAllSteps(ENTITY_KEY);
-  requests.transition(ENTITY_KEY, "create_provider", "pending", "confirmed", {
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
     providerRef: COMPANY_ID,
   });
   confirmFiling();
@@ -725,7 +749,7 @@ test("A-23: the legal block comes from the entity record and the document index,
   expect(deriveLegalBlock(d, entity())).toBeNull();
 
   // Filing confirmed but documents not: v2 needs BOTH halves.
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
   repo.upsert({ ...entity(), formationFiledAt: FILED_AT, formationFilingNumber: "F-1" });
   expect(deriveLegalBlock(d, entity())).toBeNull();
 
@@ -787,6 +811,7 @@ test("F1: a lifted veto RE-SCHEDULES the same version — the stale schedule tx 
 
   // The guardian cancels: the contract DELETES the schedule and blacklists the hash.
   chain.veto(v2Hash);
+  touchFacts();
   await advanceAnchor(deps(), ENTITY_KEY);
   expect(cycle(2)!.state).toBe("vetoed");
 
@@ -1032,8 +1057,10 @@ test("F5: `TooEarly` is the timelock, not a failure — no park, no burned attem
  *  gates deliberately read as "the facts may have moved". */
 function stampStepsYesterday(): void {
   db.prepare(
-    "UPDATE formation_requests SET updated_at = datetime('now','-1 day') WHERE entity_key = ?",
-  ).run(ENTITY_KEY);
+    `UPDATE formation_requests
+        SET updated_at = datetime('now','-1 day'), facts_updated_at = datetime('now','-1 day')
+      WHERE company_id = ?`,
+  ).run(COMPANY_KEY);
 }
 
 /** Count manifest reads. The gates' whole purpose is that a quiet entity causes none. */
@@ -1105,6 +1132,7 @@ test("F9: a standing hold warns ONCE per entity per day, not once per tick", asy
   confirmFiling();
   await advanceAnchor(deps(), ENTITY_KEY);
   chain.veto(cycle(2)!.manifestHash);
+  touchFacts();
   await advanceAnchor(deps(), ENTITY_KEY);
 
   const lines: string[] = [];
@@ -1176,7 +1204,7 @@ test("F12: a filing number that arrives late unblocks v2 — the refusal is a wa
 
   // `advanceFiling` heals the number onto the record on a later poll (F12); the anchor loop then
   // has both halves and opens v2 on the very next pass.
-  repo.upsert({ ...entity(), formationFilingNumber: "2026-001234567" });
+  companies.recordFilingFacts(COMPANY_KEY, { filingNumber: "2026-001234567" });
   expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "scheduled" });
   expect(parseManifest(docStore.getBytes(manifestDocName(ENTITY_KEY, 2))).legal?.filingNumber).toBe(
     "2026-001234567",

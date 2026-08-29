@@ -37,6 +37,7 @@ import {
   loadConfig,
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
+import { createCompany } from "../formation/company";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -49,6 +50,7 @@ import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteBridgeLegRepository } from "../persistence/bridgeLegRepository";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
+import { SqliteCompanyRepository } from "../persistence/companyRepository";
 import { migrate, openDatabase } from "../persistence/db";
 import { SqliteDocumentIndexRepository } from "../persistence/documentIndexRepository";
 import { FileDocumentStore } from "../persistence/documentStore";
@@ -74,6 +76,7 @@ import { FormationSweeper } from "../workflow/formationSweeper";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
+import { ApiError } from "./errors";
 import { buildX402DemoDeps } from "./routes/x402Demo";
 import { installShutdownHandlers, shouldInstallSignalHandlers } from "./shutdown";
 
@@ -105,6 +108,10 @@ async function main() {
   // spend-control counts JOIN `entities`, and the party bind commits with the entity claim.
   const formationRequests = new SqliteFormationRepository(db);
   const formationParties = new SqliteFormationPartyRepository(db);
+  // Always constructed, credentials or not: `companies` is plain SQL over the same database, and
+  // a box that has lost its doola block must still describe (and serve documents for) the filings
+  // it already made.
+  const companies = new SqliteCompanyRepository(db);
   // Same db handle again: a stored document's index row and the step it confirms have to commit
   // against the same database, and the webhook ledger is the sweeper's work queue.
   const formationDocuments = new SqliteDocumentIndexRepository(db);
@@ -343,10 +350,10 @@ async function main() {
       // call, whatever the config has since become.
       formation: doolaApi
         ? {
-            pin: formationDeployment,
             doola: doolaApi,
             requests: formationRequests,
             parties: formationParties,
+            companies,
             environment: cfg.doola!.environment,
           }
         : undefined,
@@ -357,8 +364,43 @@ async function main() {
     runSaga,
     fundCaps: { perCall: cfg.maxTreasuryFund, perTenantTotal: cfg.maxTreasuryFundedPerTenant },
     outflows,
-    formation: formationDeployment,
-    parties: formationParties,
+    // Formation, re-keyed to companies (2026-08-26 §3). Present only where a company could be
+    // minted or attached: the pin is copied from the company ROW inside the claim, so this block
+    // carries the stores rather than a deployment pin.
+    formation: formationDeployment
+      ? {
+          companies,
+          requests: formationRequests,
+          maxAgentsPerCompany: cfg.formation?.maxAgentsPerCompany ?? 10,
+          // The A1 SHIM: a party-only onboard — every client that exists today — mints its own
+          // 1:1 company inside the claim transaction. Removed in A3.
+          createCompanyForParty: (tenantId, intake) => {
+            const result = createCompany(
+              {
+                companies,
+                parties: formationParties,
+                requests: formationRequests,
+                pin: formationDeployment,
+                sandboxSyntheticPii: Boolean(cfg.formation?.sandboxSyntheticPii),
+                maxPerTenant: cfg.formation?.maxPerTenant ?? 3,
+                dailyCeiling: cfg.formation?.dailyCeiling ?? 10,
+                transaction: (fn) => fn(),
+                world: worldId,
+              },
+              tenantId,
+              {
+                partyId: intake.partyId,
+                name: intake.name,
+                // The shim never invents a claim: it mirrors the deployment, which is what the
+                // party it is binding was already created against.
+                synthetic: cfg.formation?.sandboxSyntheticPii ? true : undefined,
+              },
+            );
+            if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+            return result.companyId;
+          },
+        }
+      : undefined,
   });
   const resumed = runner.reconcileInFlight();
   if (resumed) console.log(`Resumed ${resumed} in-flight onboarding(s)`);
@@ -382,9 +424,13 @@ async function main() {
   // doola capability, and an entity already filed must stay describable — and its PDFs
   // downloadable — on a box that has since lost its doola block.
   const entityViewDeps = {
-    formationSteps: (entityKey: string) => formationRequests.stepsOf(entityKey),
+    // Company-keyed since the re-key: one filing, one set of steps, however many agents share it.
+    formationSteps: (companyId: string) => formationRequests.stepsOf(companyId),
     // The batched twin the list routes use: one read per page instead of two per entity (M5).
-    formationStepsMany: (entityKeys: string[]) => formationRequests.stepsOfMany(entityKeys),
+    formationStepsMany: (companyIds: string[]) => formationRequests.stepsOfMany(companyIds),
+    company: (companyId: string) => companies.find(companyId),
+    companyMany: (companyIds: string[]) => companies.findMany(companyIds),
+    companies,
     documents: formationDocuments,
   };
 
@@ -393,6 +439,7 @@ async function main() {
     repo,
     requests: formationRequests,
     parties: formationParties,
+    companies,
     documents: formationDocuments,
     docStore,
     events: doolaEvents,
@@ -404,6 +451,9 @@ async function main() {
     // and the SAME `arc` adapter the saga mints through — a second adapter would be a second
     // manager identity, and a second repo would be a second opinion about what the chain holds.
     anchor: { anchors, arc, chainId: cfg.chainId },
+    // The settling window the anchor gate folds late facts over (§3). The sweep interval IS the
+    // window: facts that land inside one tick become one amendment cycle per attached agent.
+    sweepIntervalMs: cfg.formation?.sweepMs ?? 60_000,
   };
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
 
@@ -505,8 +555,11 @@ async function main() {
           sandboxSyntheticPii: Boolean(cfg.formation?.sandboxSyntheticPii),
           maxPerTenant: cfg.formation?.maxPerTenant ?? 3,
           dailyCeiling: cfg.formation?.dailyCeiling ?? 10,
+          maxAgentsPerCompany: cfg.formation?.maxAgentsPerCompany ?? 10,
           parties: formationParties,
           requests: formationRequests,
+          companies,
+          pin: { provider: "doola", environment: cfg.doola!.environment },
         }
       : undefined,
     // The view dependencies, as ONE object shared with the MCP surface below (C8).

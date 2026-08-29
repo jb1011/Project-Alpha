@@ -1,10 +1,10 @@
 import type { DoolaEnvironment } from "../adapters/doola/types";
+import type { CompanyRecord } from "../persistence/companyRepository";
 import {
   type FormationRequestRecord,
   type FormationStep,
   parseDetail,
 } from "../persistence/formationRepository";
-import type { EntityRecord } from "../types";
 
 /**
  * The formation DOMAIN projection (design §5/§8) — what an entity's sub-saga rows mean.
@@ -109,7 +109,7 @@ export function requiredActionCodesOf(steps: FormationRequestRecord[]): string[]
 }
 
 /**
- * Everything about one entity's formation that is safe on ANY surface.
+ * Everything about one company's formation that is safe on ANY surface.
  *
  * No EIN (a tax identifier — authenticated views only), no filing party, nothing at all out of
  * `formation_parties`. `/metadata` and `/transparency` pick two fields out of this; the
@@ -136,23 +136,45 @@ export interface FormationSummary {
 }
 
 export function formationSummary(
-  rec: Pick<
-    EntityRecord,
-    "formationProvider" | "formationEnvironment" | "formationFiledAt" | "formationFilingNumber"
-  >,
+  company:
+    | Pick<CompanyRecord, "provider" | "environment" | "filedAt" | "filingNumber">
+    | undefined
+    | null,
   steps: FormationRequestRecord[],
 ): FormationSummary | null {
-  // Both halves or neither: an entity pinned to a provider is always pinned to an environment too
-  // (they are written together at the claim), so a half-populated block would be a bug — and
+  // The COMPANY is the source since 2026-08-26 §3: it owns the filing, and ten agents sharing one
+  // must describe it identically. Both halves or neither — a company row always carries provider
+  // AND environment (they are NOT NULL together), so a half-populated block would be a bug, and
   // rendering one without the other is exactly the deception §2 forbids.
-  if (!rec.formationProvider || !rec.formationEnvironment) return null;
+  if (!company?.provider || !company.environment) return null;
   return {
-    provider: rec.formationProvider,
-    environment: rec.formationEnvironment,
+    provider: company.provider,
+    environment: company.environment,
     status: deriveFormationStatus(steps),
     providerRef: providerRefOf(steps),
-    filedAt: rec.formationFiledAt ?? null,
-    filingNumber: rec.formationFilingNumber ?? null,
+    filedAt: company.filedAt ?? null,
+    filingNumber: company.filingNumber ?? null,
     requiredActions: requiredActionCodesOf(steps),
   };
+}
+
+/**
+ * Is a payment LIVE for this company (design 2026-08-26 §2)?
+ *
+ * "Paying" is DERIVED and never stored: a refund or an expired quote needs no second write, and a
+ * `companies.paying` column could drift from the payment rows the moment either happened. It sits
+ * beside `deriveFormationStatus` because the two together are everything a caller is told about a
+ * company's progress, and both are pure functions of rows somebody else owns.
+ *
+ * Returns FALSE on every deployment until B1 writes the first `formation_payments` row.
+ */
+export interface LivePaymentReader {
+  livePaymentCount(companyId: string): number;
+}
+
+export function hasLivePayment(
+  payments: LivePaymentReader | undefined,
+  companyId: string,
+): boolean {
+  return (payments?.livePaymentCount(companyId) ?? 0) > 0;
 }

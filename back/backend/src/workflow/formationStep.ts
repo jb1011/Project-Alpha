@@ -28,13 +28,13 @@ import {
 
 /** The ops line for every transition. IDs, steps and states only — never PII, never a payload. */
 export function logFormationStep(
-  entityKey: string,
+  companyId: string,
   step: FormationStep,
   state: FormationState,
   attempt: number,
   extra: Record<string, unknown> = {},
 ): void {
-  opsLog("formation_step", { entityKey, step, state, attempt, ...extra });
+  opsLog("formation_step", { companyId, step, state, attempt, ...extra });
 }
 
 /**
@@ -55,25 +55,25 @@ export function logFormationStep(
  */
 export function failFormationStep(
   d: { repo: EntityRepository; requests: FormationRepository },
-  entityKey: string,
+  companyId: string,
   step: FormationStep,
   error: string,
   logExtra: Record<string, unknown> = {},
 ): void {
   // Re-read rather than trusting a caller's snapshot: between the read that produced it and this
   // call there may have been a whole doola round trip.
-  const row = d.requests.find(entityKey, step);
+  const row = d.requests.find(companyId, step);
   if (!row || row.state === "confirmed" || row.state === "abandoned") return;
   const from = row.state;
   d.repo.transaction(() => {
-    const bumped = d.requests.bumpAttempt(entityKey, step, from);
+    const bumped = d.requests.bumpAttempt(companyId, step, from);
     if (bumped !== undefined)
-      d.requests.transition(entityKey, step, "pending", "failed", { error });
+      d.requests.transition(companyId, step, "pending", "failed", { error });
     // Lost the bump race: another driver moved the row. Park it from wherever it now is, which
     // the CAS will simply refuse if that driver already parked it.
-    else d.requests.transition(entityKey, step, from, "failed", { error });
+    else d.requests.transition(companyId, step, from, "failed", { error });
   });
-  logFormationStep(entityKey, step, "failed", row.attempt + 1, logExtra);
+  logFormationStep(companyId, step, "failed", row.attempt + 1, logExtra);
 }
 
 /**
@@ -99,21 +99,21 @@ export function failFormationStep(
  */
 export function parkFormationStep(
   d: { repo: EntityRepository; requests: FormationRepository; now?: () => number },
-  entityKey: string,
+  companyId: string,
   step: FormationStep,
   error: string,
   logExtra: Record<string, unknown> = {},
 ): void {
-  const row = d.requests.find(entityKey, step);
+  const row = d.requests.find(companyId, step);
   if (!row || row.state === "confirmed" || row.state === "abandoned") return;
   const detail = parseDetail<StepBackoff>(row.detail);
   const retryIntervalMs = nextInterval(detail.retryIntervalMs, RETRY_BASE_MS, RETRY_CAP_MS);
   const nextRetryAt = (d.now ?? Date.now)() + retryIntervalMs;
-  d.requests.transition(entityKey, step, row.state, "failed", {
+  d.requests.transition(companyId, step, row.state, "failed", {
     error,
     detail: JSON.stringify({ ...detail, retryIntervalMs, nextRetryAt }),
   });
-  logFormationStep(entityKey, step, "failed", row.attempt, {
+  logFormationStep(companyId, step, "failed", row.attempt, {
     ...logExtra,
     // The one field an operator needs to tell these two apart in journald.
     attemptBurned: false,
@@ -127,10 +127,15 @@ export function parkFormationStep(
  * `advance` resets the cadence to the base interval — something happened, so ask again soon —
  * while an empty or failed read doubles it, capped. The column and the blob are written together;
  * the column is an index over the blob, never a second source of truth.
+ *
+ * `touchFacts: false` is load-bearing (2026-08-26 §3). A POLL IS NOT A FACT: this write happens on
+ * every pass over a waiting row, and letting it move `facts_updated_at` is what made an
+ * `await_ein` row re-derive and re-hash its entity's manifest on every tick for the whole
+ * four-to-six-week IRS wait.
  */
 export function persistPollBackoff(
   d: { requests: FormationRepository; now?: () => number },
-  row: { entityKey: string; step: FormationStep; state: FormationState; detail: string | null },
+  row: { companyId: string; step: FormationStep; state: FormationState; detail: string | null },
   opts: { advanced: boolean },
 ): number {
   const detail = parseDetail<StepBackoff>(row.detail);
@@ -138,9 +143,10 @@ export function persistPollBackoff(
     ? POLL_BASE_MS
     : nextInterval(detail.pollIntervalMs, POLL_BASE_MS, POLL_CAP_MS);
   const nextPollAt = (d.now ?? Date.now)() + pollIntervalMs;
-  d.requests.transition(row.entityKey, row.step, row.state, row.state, {
+  d.requests.transition(row.companyId, row.step, row.state, row.state, {
     detail: JSON.stringify({ ...detail, pollIntervalMs, nextPollAt }),
     nextPollAt,
+    touchFacts: false,
   });
   return nextPollAt;
 }

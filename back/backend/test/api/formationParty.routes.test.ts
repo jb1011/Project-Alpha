@@ -15,9 +15,12 @@ import { privateKeyToAccount } from "viem/accounts";
 import { createSiweMessage } from "viem/siwe";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
+import { ApiError } from "../../src/api/errors";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { createCompany } from "../../src/formation/company";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
@@ -80,14 +83,43 @@ function makeApp(
   formation?: { required?: boolean; syntheticPii?: boolean; maxPerTenant?: number },
   custody: { circle?: boolean } = {},
 ) {
+  const companies = new SqliteCompanyRepository(db);
+  const requests = new SqliteFormationRepository(db);
+  const pin = { provider: "doola" as const, environment: "sandbox" as const };
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
-    parties,
-    // What this deployment WOULD pin to. Whether an entity takes it is decided by the claim,
-    // which pins iff a party is bound (C5) — never by `required`.
-    formation: formation ? { provider: "doola" as const, environment: "sandbox" as const } : null,
+    // The claim attaches a company and copies the pin off ITS row (2026-08-26 §3); the A1 shim
+    // is what turns a party-only onboard into one.
+    formation: formation
+      ? {
+          companies,
+          requests,
+          maxAgentsPerCompany: 10,
+          createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
+            const result = createCompany(
+              {
+                companies,
+                parties,
+                requests,
+                pin,
+                sandboxSyntheticPii: formation.syntheticPii ?? false,
+                maxPerTenant: formation.maxPerTenant ?? 3,
+                dailyCeiling: 10,
+                transaction: (fn) => fn(),
+              },
+              tenantId,
+              {
+                ...intake,
+                synthetic: formation.syntheticPii ? true : undefined,
+              },
+            );
+            if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+            return result.companyId;
+          },
+        }
+      : undefined,
   });
   return buildApiApp({
     webOrigin: "*",
@@ -107,10 +139,14 @@ function makeApp(
           sandboxSyntheticPii: formation.syntheticPii ?? false,
           maxPerTenant: formation.maxPerTenant ?? 3,
           dailyCeiling: 10,
+          maxAgentsPerCompany: 10,
           parties,
-          requests: new SqliteFormationRepository(db),
+          requests,
+          companies,
+          pin,
         }
       : undefined,
+    companies,
     repo,
     runner,
     passkeyRpId: DOMAIN,
@@ -300,7 +336,7 @@ test("REQUIRED: a valid party onboards and is BOUND to the entity the claim mint
   });
   expect(res.status).toBe(202);
   const { id } = await res.json();
-  expect(parties.findByEntityKey(id)!.partyId).toBe(partyId);
+  expect(parties.findByCompanyId(repo.findByIdempotencyKey(id)!.companyId!)!.partyId).toBe(partyId);
 
   // Single use: the same handle cannot file a second company.
   const second = await post(app, "/onboard", token, {
@@ -331,7 +367,7 @@ test("C5: NOT required + a party — the entity is PINNED and the party is bound
   const { id } = await res.json();
   const rec = repo.findByIdempotencyKey(id)!;
   expect([rec.formationProvider, rec.formationEnvironment]).toEqual(["doola", "sandbox"]);
-  expect(parties.findByEntityKey(id)!.partyId).toBe(partyId);
+  expect(parties.findByCompanyId(rec.companyId!)!.partyId).toBe(partyId);
 });
 
 test("C5: NOT required + the WIZARD's shape (no partyId) — 202, and nothing is pinned or filed", async () => {
@@ -370,9 +406,10 @@ test("the tenant QUOTA refuses the onboard before the entity is minted", async (
       partyId: first.partyId,
     })
   ).json();
-  // The first entity's create_provider row is what burns the quota.
-  db.prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)").run(
-    id,
+  // The first COMPANY's create_provider row is what burns the door's quota (the company row it
+  // was minted with already burns `createCompany`'s).
+  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
+    repo.findByIdempotencyKey(id)!.companyId!,
     "create_provider",
     "pending",
   );

@@ -5,10 +5,12 @@ import type {
   DoolaEnvironment,
   DoolaRequiredAction,
 } from "../adapters/doola/types";
+import { normalizeCompanyName } from "../formation/intake";
 import { POLL_BASE_MS, POLL_CAP_MS, type StepBackoff, nextInterval } from "../formation/schedule";
 import { providerRefOf } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
+import type { CompanyRepository } from "../persistence/companyRepository";
 import {
   type DocumentIndexRepository,
   documentIndexId,
@@ -195,11 +197,15 @@ export function filingDateToUnix(raw: string | null | undefined): number | null 
 
 export interface FormationAdvanceDeps {
   repo: EntityRepository;
+  /** The row the legal facts are written to since the re-key. `filed_at`, `filing_number`, `ein`
+   *  and `legal_name_filed` all live on the COMPANY now — one write for a filing that ten agents
+   *  may share, instead of N writes that could disagree. */
+  companies: CompanyRepository;
   requests: FormationRepository;
   documents: DocumentIndexRepository;
   docStore: DocumentStore;
   doola: DoolaApi;
-  /** The environment THIS DEPLOYMENT runs. Compared against every entity's pin (audit M5). */
+  /** The environment THIS DEPLOYMENT runs. Compared against every company's pin (audit M5). */
   environment: DoolaEnvironment;
   /** Injected in tests; the document downloader's transport. */
   fetchImpl?: typeof fetch;
@@ -223,7 +229,7 @@ export interface AdvanceOutcome {
   /** Did anything change? This is what resets the poll backoff. */
   advanced: boolean;
   /** Why nothing happened, when nothing happened. */
-  skipped?: "no_entity" | "environment_pin" | "no_provider_ref";
+  skipped?: "no_company" | "environment_pin" | "no_provider_ref";
 }
 
 /** The step an entity is currently waiting on — where poll backoff is persisted. */
@@ -243,27 +249,27 @@ export function currentPolledStep(steps: FormationRequestRecord[]): FormationSte
  */
 export async function advanceFormation(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   opts: { requiredActions?: boolean } = {},
 ): Promise<AdvanceOutcome> {
-  const rec = d.repo.findByIdempotencyKey(entityKey);
-  if (!rec) return { fetched: false, advanced: false, skipped: "no_entity" };
+  const company = d.companies.find(companyId);
+  if (!company) return { fetched: false, advanced: false, skipped: "no_company" };
 
-  // ── Environment pinning (audit M5), BEFORE any provider call. An entity pinned to sandbox must
+  // ── Environment pinning (audit M5), BEFORE any provider call. A company pinned to sandbox must
   //    never be routed at api.doola.com by a config flip, and one pinned to production must never
   //    be re-read out of a playground.
-  if (rec.formationEnvironment !== d.environment) {
+  if (company.environment !== d.environment) {
     opsLog("formation_environment_mismatch", {
       level: "warn",
-      entityKey,
-      pinned: rec.formationEnvironment ?? null,
+      companyId,
+      pinned: company.environment,
       deployment: d.environment,
-      message: environmentPinMismatchError(rec.formationEnvironment ?? null, d.environment),
+      message: environmentPinMismatchError(company.environment, d.environment),
     });
     return { fetched: false, advanced: false, skipped: "environment_pin" };
   }
 
-  const steps = d.requests.stepsOf(entityKey);
+  const steps = d.requests.stepsOf(companyId);
   // The ONE extraction, shared with the projection and the anchor trigger (review F11).
   const providerRef = providerRefOf(steps);
   // Nothing has been filed yet: `create_provider` is the sweeper's job, not this one's.
@@ -271,7 +277,7 @@ export async function advanceFormation(
 
   const waitingOn = currentPolledStep(steps);
 
-  let company: DoolaCompany;
+  let doolaCompany: DoolaCompany;
   let documents: DoolaDocument[];
   let requiredActions: DoolaRequiredAction[] | undefined;
   try {
@@ -280,7 +286,7 @@ export async function advanceFormation(
     // entity on every sweep. None of them feeds another, so the only thing the sequence bought
     // was latency. `Promise.all` rejects on the first failure, which is the same behaviour the
     // `await` chain had.
-    [company, documents, requiredActions] = await Promise.all([
+    [doolaCompany, documents, requiredActions] = await Promise.all([
       d.doola.getCompany(providerRef),
       d.doola.listDocuments(providerRef),
       opts.requiredActions ? d.doola.listRequiredActions(providerRef) : Promise.resolve(undefined),
@@ -297,20 +303,23 @@ export async function advanceFormation(
     //    failure, which is the only thing a tenant should ever see rendered as one.
     const described = describeDoolaError(e);
     if (waitingOn) {
-      const row = d.requests.find(entityKey, waitingOn);
+      const row = d.requests.find(companyId, waitingOn);
       if (row) {
         const detail = parseDetail<StepBackoff>(row.detail);
         const pollIntervalMs = nextInterval(detail.pollIntervalMs, POLL_BASE_MS, POLL_CAP_MS);
         const nextPollAt = (d.now ?? Date.now)() + pollIntervalMs;
-        d.requests.transition(entityKey, waitingOn, row.state, row.state, {
+        d.requests.transition(companyId, waitingOn, row.state, row.state, {
           error: `doola read failed: ${described.message}`,
           detail: JSON.stringify({ ...detail, pollIntervalMs, nextPollAt }),
           nextPollAt,
+          // A failed READ is not a fact either — this is the same every-poll write
+          // `persistPollBackoff` makes, with a reason attached.
+          touchFacts: false,
         });
       }
       opsLog("formation_read_failed", {
         level: "warn",
-        entityKey,
+        companyId,
         step: waitingOn,
         providerRef,
         // The distinction the whole change is about, said out loud in journald.
@@ -321,27 +330,32 @@ export async function advanceFormation(
     return { fetched: false, advanced: false };
   }
 
-  if (isFormationFailed(company)) {
-    return { fetched: true, advanced: failRemainingSteps(d, entityKey, steps, providerRef) };
+  if (isFormationFailed(doolaCompany)) {
+    return { fetched: true, advanced: failRemainingSteps(d, companyId, steps, providerRef) };
   }
 
   // The read SUCCEEDED. Anything parked by a previous read failure is provably parked for a
   // reason that no longer holds, so it goes back to `pending` before the advance runs — otherwise
   // a tenant keeps seeing `failed` for a formation that is simply waiting, and the sweeper keeps
   // treating a healthy row as a retry candidate.
-  unparkAfterSuccessfulRead(d, entityKey, steps);
+  unparkAfterSuccessfulRead(d, companyId, steps);
 
   let advanced = false;
-  advanced = advanceFiling(d, entityKey, company, requiredActions, providerRef) || advanced;
-  advanced = (await advanceDocuments(d, entityKey, providerRef, documents)) || advanced;
-  advanced = advanceEin(d, entityKey, company, providerRef) || advanced;
+  advanced = advanceFiling(d, companyId, doolaCompany, requiredActions, providerRef) || advanced;
+  advanced = (await advanceDocuments(d, companyId, providerRef, documents)) || advanced;
+  advanced = advanceEin(d, companyId, doolaCompany, providerRef) || advanced;
 
   // ── The anchor sub-saga's FAST path (design §7). A webhook that confirms the filing opens v2
   //    within the second; the sweeper's own anchor phase is what makes progress guaranteed.
   //    Gated on `advanced` deliberately: a poll that learned nothing has nothing new to anchor,
-  //    and the sweeper already re-drives every open cycle every tick. Called WITHOUT taking the
-  //    entity lock, because both callers of this function are already holding it.
-  if (advanced && d.anchor) await advanceAnchor({ ...d, ...d.anchor }, entityKey);
+  //    and the sweeper already re-drives every open cycle every tick.
+  //
+  //    FANNED OUT under N:1 (2026-08-26 §3): one late fact is one amendment cycle PER ATTACHED
+  //    AGENT, each through its own timelock. Called without taking the per-entity lock, because
+  //    both callers of this function hold the COMPANY's lock, not any entity's.
+  if (advanced && d.anchor)
+    for (const e of d.repo.listByCompany(companyId))
+      await advanceAnchor({ ...d, ...d.anchor }, e.idempotencyKey);
   return { fetched: true, advanced };
 }
 
@@ -359,26 +373,26 @@ export async function advanceFormation(
  */
 function unparkAfterSuccessfulRead(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   steps: FormationRequestRecord[],
 ): void {
   for (const step of POLLED_STEPS) {
     const row = steps.find((s) => s.step === step);
     if (!row || row.state !== "failed") continue;
-    if (d.requests.transition(entityKey, step, "failed", "pending", { error: null }))
-      logFormationStep(entityKey, step, "pending", row.attempt, { unparked: true });
+    if (d.requests.transition(companyId, step, "failed", "pending", { error: null }))
+      logFormationStep(companyId, step, "pending", row.attempt, { unparked: true });
   }
 }
 
-/** `await_filing`: the STATE has filed the company. Writes the two legal facts onto the entity. */
+/** `await_filing`: the STATE has filed the company. Writes the legal facts onto the COMPANY. */
 function advanceFiling(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   company: DoolaCompany,
   requiredActions: DoolaRequiredAction[] | undefined,
   providerRef: string,
 ): boolean {
-  const row = d.requests.find(entityKey, "await_filing");
+  const row = d.requests.find(companyId, "await_filing");
   if (!row || row.state === "abandoned") return false;
 
   const detail = parseDetail<AwaitFilingDetail>(row.detail);
@@ -407,16 +421,16 @@ function advanceFiling(
   if (row.state === "confirmed") {
     let healed = false;
     d.repo.transaction(() => {
-      d.requests.transition(entityKey, "await_filing", "confirmed", "confirmed", {
+      d.requests.transition(companyId, "await_filing", "confirmed", "confirmed", {
         detail: JSON.stringify(next),
       });
-      healed = healFilingFacts(d, entityKey, company);
+      healed = healFilingFacts(d, companyId, company);
     });
     return healed;
   }
 
   if (!isFormationFiled(company)) {
-    d.requests.transition(entityKey, "await_filing", row.state, row.state, {
+    d.requests.transition(companyId, "await_filing", row.state, row.state, {
       detail: JSON.stringify(next),
     });
     return false;
@@ -428,24 +442,20 @@ function advanceFiling(
     // The CAS decides; the facts are written inside the transaction it won. A second driver
     // observing the same `from` gets false here and writes nothing — which is what makes
     // "advance exactly once" true without depending on the in-process lock.
-    won = d.requests.transition(entityKey, "await_filing", row.state, "confirmed", {
+    won = d.requests.transition(companyId, "await_filing", row.state, "confirmed", {
       detail: JSON.stringify(next),
       error: null,
     });
     if (!won) return;
-    // Re-read inside the transaction: a doola round trip happened since the caller's snapshot.
-    const fresh = d.repo.findByIdempotencyKey(entityKey);
-    if (fresh)
-      d.repo.upsert({
-        ...fresh,
-        formationFiledAt: filedAt,
-        formationFilingNumber: company.formationFilingNumber ?? null,
-      });
-    d.repo.recordEvent(
-      entityKey,
+    d.companies.recordFilingFacts(companyId, {
+      filedAt,
+      filingNumber: company.formationFilingNumber ?? null,
+      legalNameFiled: matchFiledName(d, companyId, company),
+    });
+    recordCompanyEvent(
+      d,
+      companyId,
       "formationFiled",
-      fresh?.status ?? "bound",
-      null,
       JSON.stringify({
         providerRef,
         filingNumber: company.formationFilingNumber ?? null,
@@ -454,8 +464,54 @@ function advanceFiling(
       }),
     );
   });
-  if (won) logFormationStep(entityKey, "await_filing", "confirmed", row.attempt, { providerRef });
+  if (won) logFormationStep(companyId, "await_filing", "confirmed", row.attempt, { providerRef });
   return won;
+}
+
+/**
+ * The entity audit trail, fanned out over every agent attached to the company (2026-08-26 §3).
+ *
+ * Zero attached agents is a legitimate shape — a company can be filed before anyone onboards — and
+ * it records nothing, which is honest: there is no entity whose history the event would belong to.
+ */
+function recordCompanyEvent(
+  d: FormationAdvanceDeps,
+  companyId: string,
+  step: string,
+  detail: string,
+): void {
+  for (const e of d.repo.listByCompany(companyId))
+    d.repo.recordEvent(e.idempotencyKey, step, e.status, null, detail);
+}
+
+/**
+ * Which of OUR name candidates the state actually accepted (design §5).
+ *
+ * doola reports the accepted name as free text, and free text is exactly what must never reach
+ * `legal_name_filed`: the manifest hashes that field onto a public chain, so what is stored is
+ * ALWAYS our own candidate string — the one whose normalized form matches. No match means no
+ * name: `legal.companyName` stays absent, which is honest, and the owner gets a required action.
+ */
+function matchFiledName(
+  d: FormationAdvanceDeps,
+  companyId: string,
+  company: DoolaCompany,
+): string | null {
+  const reported = company.name?.trim();
+  if (!reported) return null;
+  const wanted = normalizeCompanyName(reported);
+  const stored = d.companies.find(companyId)?.nameOptions ?? [];
+  const hit = stored.find((o) => normalizeCompanyName(o.name) === wanted);
+  if (hit) return hit.name;
+  opsLog("formation_filed_name_unmatched", {
+    level: "warn",
+    companyId,
+    // The candidates are ours and the reported name is a public registry fact; neither is PII.
+    candidates: stored.length,
+    message:
+      "doola reports a company name that matches none of our stored candidates — legal_name_filed stays NULL and the manifest omits companyName until a human resolves it",
+  });
+  return null;
 }
 
 /**
@@ -480,29 +536,31 @@ function advanceFiling(
  */
 function healFilingFacts(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   company: DoolaCompany,
 ): boolean {
   const number = company.formationFilingNumber?.trim() || null;
   const filedAt = filingDateToUnix(company.formationFilingDate);
-  if (number === null && filedAt === null) return false;
-  const fresh = d.repo.findByIdempotencyKey(entityKey);
-  if (!fresh) return false;
-  const gainsNumber = number !== null && fresh.formationFilingNumber !== number;
-  const gainsDate = filedAt !== null && fresh.formationFiledAt !== filedAt;
-  if (!gainsNumber && !gainsDate) return false;
-  d.repo.upsert({
-    ...fresh,
-    ...(gainsNumber ? { formationFilingNumber: number } : {}),
-    ...(gainsDate ? { formationFiledAt: filedAt } : {}),
+  // The FILED NAME heals too, and for the same reason: doola may report a name only after the
+  // state assigns one, and `legal.companyName` cannot bootstrap itself from a manifest.
+  const name = matchFiledName(d, companyId, company);
+  if (number === null && filedAt === null && name === null) return false;
+  // The repository refuses to downgrade and reports whether anything actually moved, so "did we
+  // learn something?" is one statement rather than a read, three comparisons and a write.
+  const healed = d.companies.recordFilingFacts(companyId, {
+    filedAt,
+    filingNumber: number,
+    legalNameFiled: name,
   });
+  if (!healed) return false;
   opsLog("formation_filing_healed", {
-    entityKey,
+    companyId,
     environment: d.environment,
     // The number itself is a public state-registry identifier, not PII — it is already in the
-    // manifest and on chain by keccak. The date likewise.
-    filingNumber: gainsNumber ? number : undefined,
-    filedAt: gainsDate ? filedAt : undefined,
+    // manifest and on chain by keccak. The date and the filed name likewise.
+    filingNumber: number ?? undefined,
+    filedAt: filedAt ?? undefined,
+    legalNameFiled: name ?? undefined,
     message: "a confirmed filing gained facts doola had not reported when the step confirmed",
   });
   return true;
@@ -514,7 +572,7 @@ export const DOCUMENT_FETCH_CONCURRENCY = 3;
 /** Fetch, store and index ONE document. Never throws: returns whether it stored anything. */
 async function storeOneDocument(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   providerRef: string,
   doc: DoolaDocument,
 ): Promise<boolean> {
@@ -525,13 +583,13 @@ async function storeOneDocument(
       fetchImpl: d.fetchImpl,
       lookupImpl: d.lookupImpl,
     });
-    const path = documentStoreName(entityKey, docType, doc.id!);
+    const path = documentStoreName(companyId, docType, doc.id!);
     // Bytes to disk FIRST (atomically), index second: an index row that points at a file which
     // is not there would be a hash nobody can check, and PR 3 anchors these hashes on-chain.
     d.docStore.putBytes(path, got.bytes);
     d.documents.insert({
-      id: documentIndexId(entityKey, doc.id!),
-      entityKey,
+      id: documentIndexId(companyId, doc.id!),
+      companyId,
       docType,
       sha256: got.sha256,
       contentType: got.contentType,
@@ -540,7 +598,7 @@ async function storeOneDocument(
       path,
     });
     opsLog("formation_document_stored", {
-      entityKey,
+      companyId,
       providerRef,
       docType,
       providerDocId: doc.id,
@@ -551,7 +609,7 @@ async function storeOneDocument(
   } catch (e) {
     opsLog("formation_document_failed", {
       level: "warn",
-      entityKey,
+      companyId,
       providerRef,
       docType,
       providerDocId: doc.id,
@@ -570,17 +628,17 @@ async function storeOneDocument(
  */
 async function advanceDocuments(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   providerRef: string,
   documents: DoolaDocument[],
 ): Promise<boolean> {
-  const row = d.requests.find(entityKey, "fetch_documents");
+  const row = d.requests.find(companyId, "fetch_documents");
   if (!row || row.state === "abandoned") return false;
 
   // Only what we do not already hold. A document already indexed is never re-fetched: doola
   // re-issues a document under a NEW id, so an id we know is bytes we know.
   const wanted = documents.filter(
-    (doc) => doc.id && !d.documents.findByProviderDocId(entityKey, doc.id),
+    (doc) => doc.id && !d.documents.findByProviderDocId(companyId, doc.id),
   );
 
   // BOUNDED concurrency (M5). Each document is a presigned-URL call plus a download of up to
@@ -596,56 +654,56 @@ async function advanceDocuments(
       if (!doc?.id) return;
       // One bad document never blocks the others — a single unreadable PDF must not stop the
       // Articles of Organization from being stored.
-      if (await storeOneDocument(d, entityKey, providerRef, doc)) stored = true;
+      if (await storeOneDocument(d, companyId, providerRef, doc)) stored = true;
     }
   };
   await Promise.all(
     Array.from({ length: Math.min(DOCUMENT_FETCH_CONCURRENCY, queue.length) }, worker),
   );
 
-  const have = new Set(d.documents.storedTypes(entityKey));
+  const have = new Set(d.documents.storedTypes(companyId));
   const missing = REQUIRED_DOCUMENT_TYPES.filter((t) => !have.has(t));
   const detail: FetchDocumentsDetail = {
     ...parseDetail<FetchDocumentsDetail>(row.detail),
     stored: d.documents
-      .listByEntity(entityKey)
+      .listByCompany(companyId)
       .map((r) => ({ docId: r.providerDocId, type: r.docType, sha256: r.sha256 })),
     missing,
   };
 
   if (row.state === "confirmed") {
-    d.requests.transition(entityKey, "fetch_documents", "confirmed", "confirmed", {
+    d.requests.transition(companyId, "fetch_documents", "confirmed", "confirmed", {
       detail: JSON.stringify(detail),
     });
     return stored;
   }
   if (missing.length > 0) {
-    d.requests.transition(entityKey, "fetch_documents", row.state, row.state, {
+    d.requests.transition(companyId, "fetch_documents", row.state, row.state, {
       detail: JSON.stringify(detail),
     });
     return stored;
   }
 
-  const won = d.requests.transition(entityKey, "fetch_documents", row.state, "confirmed", {
+  const won = d.requests.transition(companyId, "fetch_documents", row.state, "confirmed", {
     detail: JSON.stringify(detail),
     error: null,
   });
   if (won)
-    logFormationStep(entityKey, "fetch_documents", "confirmed", row.attempt, {
+    logFormationStep(companyId, "fetch_documents", "confirmed", row.attempt, {
       providerRef,
       documents: detail.stored?.length ?? 0,
     });
   return stored || won;
 }
 
-/** `await_ein`: the IRS has issued. Writes `ein_real` onto the entity inside the winning CAS. */
+/** `await_ein`: the IRS has issued. Writes the EIN onto the COMPANY inside the winning CAS. */
 function advanceEin(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   company: DoolaCompany,
   providerRef: string,
 ): boolean {
-  const row = d.requests.find(entityKey, "await_ein");
+  const row = d.requests.find(companyId, "await_ein");
   if (!row || row.state === "confirmed" || row.state === "abandoned") return false;
   const ein = company.ein?.trim();
   if (!ein) {
@@ -665,33 +723,31 @@ function advanceEin(
   };
   let won = false;
   d.repo.transaction(() => {
-    won = d.requests.transition(entityKey, "await_ein", row.state, "confirmed", {
+    won = d.requests.transition(companyId, "await_ein", row.state, "confirmed", {
       detail: JSON.stringify(detail),
       error: null,
     });
     if (!won) return;
-    const fresh = d.repo.findByIdempotencyKey(entityKey);
-    // `ein_real`, never `ein`: the latter is the placeholder frozen on-chain at mint, and
-    // overwriting it would make the record disagree with the chain.
-    if (fresh) d.repo.upsert({ ...fresh, einReal: ein });
+    // On the COMPANY, never on `entities.ein`: the latter is the placeholder frozen on-chain at
+    // mint, and overwriting it would make the record disagree with the chain.
+    d.companies.recordEin(companyId, ein);
     // The EIN itself never reaches the audit trail — it is a tax identifier, and the event only
     // needs to record THAT one was issued.
-    d.repo.recordEvent(
-      entityKey,
+    recordCompanyEvent(
+      d,
+      companyId,
       "formationEin",
-      fresh?.status ?? "bound",
-      null,
       JSON.stringify({ providerRef, environment: d.environment }),
     );
   });
-  if (won) logFormationStep(entityKey, "await_ein", "confirmed", row.attempt, { providerRef });
+  if (won) logFormationStep(companyId, "await_ein", "confirmed", row.attempt, { providerRef });
   return won;
 }
 
 /** doola says the formation failed: park every step that has not already succeeded. */
 function failRemainingSteps(
   d: FormationAdvanceDeps,
-  entityKey: string,
+  companyId: string,
   steps: FormationRequestRecord[],
   providerRef: string,
 ): boolean {
@@ -700,13 +756,13 @@ function failRemainingSteps(
   for (const step of POLLED_STEPS) {
     const row = steps.find((s) => s.step === step);
     if (!row || row.state === "confirmed" || row.state === "abandoned") continue;
-    failFormationStep(d, entityKey, step, error, { providerRef });
+    failFormationStep(d, companyId, step, error, { providerRef });
     touched = true;
   }
   if (touched)
     opsLog("formation_failed", {
       level: "warn",
-      entityKey,
+      companyId,
       providerRef,
       environment: d.environment,
     });
@@ -748,8 +804,9 @@ export interface ProcessEventOptions {
 export interface ProcessEventResult {
   fetched: boolean;
   advanced: boolean;
-  /** The entity the event mapped to, when it mapped to one. */
-  entityKey?: string;
+  /** The COMPANY the event mapped to, when it mapped to one. One advance per company now
+   *  replaces the N per entity the entity-keyed version performed. */
+  companyId?: string;
   /** Why nothing was done, when nothing was done. */
   skipped?: "webhook_disabled" | "no_provider_ref" | "unmapped" | "unknown_name";
 }
@@ -811,7 +868,7 @@ export async function processDoolaEvent(
       eventId: wake.eventId,
       eventName: wake.eventName,
       providerRef: wake.providerRef,
-      reason: "no entity owns this company id yet",
+      reason: "no company owns this doola company id yet",
     });
     return { fetched: false, advanced: false, skipped: "unmapped" };
   }
@@ -823,7 +880,7 @@ export async function processDoolaEvent(
       source,
       eventId: wake.eventId,
       eventName: wake.eventName,
-      entityKey: owner.entityKey,
+      companyId: owner.companyId,
       accepted: Boolean(opts.acceptUnknownNames),
     });
     // Left unprocessed so the sweeper's re-drive picks it up — and the re-drive is the caller
@@ -832,18 +889,18 @@ export async function processDoolaEvent(
       return {
         fetched: false,
         advanced: false,
-        entityKey: owner.entityKey,
+        companyId: owner.companyId,
         skipped: "unknown_name",
       };
   }
 
-  const outcome = await withKeyedLock(owner.entityKey, () =>
-    advanceFormation(d, owner.entityKey, {
+  const outcome = await withKeyedLock(owner.companyId, () =>
+    advanceFormation(d, owner.companyId, {
       // A periodic pass has no name to infer from, so it always asks.
       requiredActions: opts.requiredActions || eventSuggestsRequiredActions(wake.eventName),
     }),
   );
   // Only a real read may retire the event. A skipped or failed pass leaves it for the sweeper.
   if (outcome.fetched) d.events.markProcessed(wake.eventId);
-  return { fetched: outcome.fetched, advanced: outcome.advanced, entityKey: owner.entityKey };
+  return { fetched: outcome.fetched, advanced: outcome.advanced, companyId: owner.companyId };
 }

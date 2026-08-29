@@ -79,7 +79,7 @@ test("bumpAttempt is CAS-guarded and drives a FRESH idempotency key per attempt"
   // Keys must differ per attempt: doola RELEASES a failed create's key, and reuse-with-a-
   // different-body comes back 409 E_IDEMPOTENCY_KEY_REUSED.
   expect(SqliteFormationRepository.idempotencyKey("ent", "create_provider", 0)).toBe(
-    "formation:ent:create_provider:0",
+    "company:ent:create_provider:0",
   );
   expect(SqliteFormationRepository.idempotencyKey("ent", "create_provider", 1)).not.toBe(
     SqliteFormationRepository.idempotencyKey("ent", "create_provider", 0),
@@ -96,7 +96,7 @@ test("stepsOf returns saga order; listByState is the sweeper's due-work query", 
   ]);
   formation.claimStep("other", "create_provider");
   formation.transition("other", "create_provider", "pending", "failed", { error: "x" });
-  expect(formation.listByState("failed").map((r) => r.entityKey)).toEqual(["other"]);
+  expect(formation.listByState("failed").map((r) => r.companyId)).toEqual(["other"]);
 });
 
 // ── oa_anchors ────────────────────────────────────────────────────────────────────────────
@@ -196,7 +196,7 @@ test("H2: statements are prepared once — a repo built on a fresh db serves eve
   expect(f.claimStep("fresh", "create_provider")).toBe(true);
   expect(f.find("fresh", "create_provider")?.state).toBe("pending");
   expect(f.stepsOf("fresh").map((r) => r.step)).toEqual(["create_provider"]);
-  expect(f.listByState("pending").some((r) => r.entityKey === "fresh")).toBe(true);
+  expect(f.listByState("pending").some((r) => r.companyId === "fresh")).toBe(true);
   expect(f.transition("fresh", "create_provider", "pending", "failed", { error: "x" })).toBe(true);
   expect(f.bumpAttempt("fresh", "create_provider", "failed")).toBe(1);
   expect(a.claimVersion("fresh", 1, "0xaa")).toBe(true);
