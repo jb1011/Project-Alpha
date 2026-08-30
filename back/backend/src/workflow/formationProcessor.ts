@@ -427,11 +427,18 @@ function advanceFiling(
 
   // Already filed: refresh the detail (required-actions in particular) without touching state —
   // and HEAL the two legal facts if doola has learned them since (review F12).
+  //
+  // `touchFacts: false` — a POLL IS NOT A FACT (2026-08-26 §3). This runs on every pass over a
+  // confirmed row, and the anchor gate reads `facts_updated_at`: letting a required-actions
+  // refresh move it makes the entity re-derive and re-hash its manifest on every tick, forever.
+  // The legal facts that DID move are written by `healFilingFacts` onto the COMPANY row, and the
+  // caller's `advanced` is what opens a cycle for them.
   if (row.state === "confirmed") {
     let healed = false;
     d.repo.transaction(() => {
       d.requests.transition(companyId, "await_filing", "confirmed", "confirmed", {
         detail: JSON.stringify(next),
+        touchFacts: false,
       });
       healed = healFilingFacts(d, companyId, company);
     });
@@ -680,15 +687,21 @@ async function advanceDocuments(
     missing,
   };
 
+  // Both of these are POLLS, not facts (2026-08-26 §3): a re-listing that stored nothing new, and
+  // a row still waiting for a document doola has not produced. Neither changes what a manifest
+  // would say, and both run on every pass — so neither may move `facts_updated_at`. A document
+  // that IS newly stored moves the facts through the confirming CAS below.
   if (row.state === "confirmed") {
     d.requests.transition(companyId, "fetch_documents", "confirmed", "confirmed", {
       detail: JSON.stringify(detail),
+      touchFacts: false,
     });
     return stored;
   }
   if (missing.length > 0) {
     d.requests.transition(companyId, "fetch_documents", row.state, row.state, {
       detail: JSON.stringify(detail),
+      touchFacts: false,
     });
     return stored;
   }

@@ -112,6 +112,11 @@ export function parkFormationStep(
   d.requests.transition(companyId, step, row.state, "failed", {
     error,
     detail: JSON.stringify({ ...detail, retryIntervalMs, nextRetryAt }),
+    // A PARK IS NOT A FACT (2026-08-26 §3). Nothing was learned — a lost answer, a transient read
+    // failure, a config mismatch — and the only thing written is the retry schedule. Moving
+    // `facts_updated_at` here would make a row that fails every tick re-derive and re-hash its
+    // entity's manifest every tick, which is the exact cost the column exists to avoid.
+    touchFacts: false,
   });
   logFormationStep(companyId, step, "failed", row.attempt, {
     ...logExtra,

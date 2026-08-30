@@ -117,6 +117,46 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
+// ── §3: the FACTS clock moves only on a fact ───────────────────────────────────────────────
+
+test("a filing CONFIRMATION moves facts_updated_at; the next poll of that row does not", async () => {
+  seedFormation();
+  doola.state.company = {
+    doolaCompanyId: COMPANY_ID,
+    formationFilingDate: "2026-08-19",
+    formationFilingNumber: "WY-1",
+  };
+  const OLD = "2026-01-01 00:00:00";
+  const factsOf = (step: string) =>
+    requests.stepsOf(COMPANY_KEY).find((s) => s.step === step)!.factsUpdatedAt;
+  // Both timestamps are CURRENT_TIMESTAMP at one-second resolution, so "unchanged" is only a
+  // real assertion against a value the clock cannot reproduce.
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+
+  // The filing lands: a real fact, and the anchor gate must see it.
+  await advanceFormation(deps(), COMPANY_KEY);
+  expect(stateOf("await_filing")).toBe("confirmed");
+  const afterConfirm = factsOf("await_filing");
+  expect(afterConfirm).not.toBe(OLD);
+
+  // The next pass over the SAME confirmed row refreshes its required-actions detail and nothing
+  // else. It runs on every tick; moving the fact clock here is what made a formed entity
+  // re-derive and re-hash its manifest for the whole four-to-six-week EIN wait.
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+  doola.state.requiredActions = [
+    { requiredActionId: "ra-1", actionCode: "NAME_UNAVAILABLE", status: "open" },
+  ];
+  await advanceFormation(deps(), COMPANY_KEY, { requiredActions: true });
+  expect(detailOf("await_filing").requiredActions).toHaveLength(1);
+  expect(factsOf("await_filing")).toBe(OLD);
+});
+
 // ── the wake-up-only rule, proven end to end ───────────────────────────────────────────────
 
 test("the payload LIES and every fact still comes from the API (audit H2)", async () => {

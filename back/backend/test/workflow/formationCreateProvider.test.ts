@@ -471,6 +471,33 @@ test("the create step itself still refuses a partyless row — belt and braces f
   expect(calls).toHaveLength(0);
 });
 
+test("a PARK is not a fact: parking a step does not move facts_updated_at", async () => {
+  bindParty();
+  requests.claimAllSteps(COMPANY_KEY);
+  const OLD = "2026-01-01 00:00:00";
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+  const { api, calls } = makeFakeDoola();
+  // The environment pin: parks, burns no attempt, and learns nothing about the world.
+  await runFormationCreateProvider({
+    company: companies.find(COMPANY_KEY)!,
+    companies,
+    repo,
+    requests,
+    parties,
+    doola: api,
+    environment: "production",
+  });
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
+  expect(row.state).toBe("failed");
+  expect(calls).toHaveLength(0);
+  // Nothing landed, so nothing is owed an amendment cycle. Bumping this on every park is how a
+  // permanently parked row keeps its entity re-hashing a manifest every tick, forever.
+  expect(row.factsUpdatedAt).toBe(OLD);
+});
+
 test("an unreadable name_options blob PARKS the filing and sends nothing at all", async () => {
   bindParty();
   // What a corrupt/truncated blob looks like to the repository: `parseNameOptions` maps anything

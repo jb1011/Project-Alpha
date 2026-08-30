@@ -301,10 +301,13 @@ export class SqliteFormationRepository implements FormationRepository {
       countSince: db.prepare(
         "SELECT COUNT(*) AS n FROM formation_requests WHERE step = 'create_provider' AND created_at > ?",
       ),
+      // `facts_updated_at` is deliberately NOT touched (2026-08-26 §3): an attempt bump is a
+      // statement about an idempotency key, not about the world. A step that fails on every pass
+      // would otherwise keep its entity permanently inside the anchor due-set, re-deriving and
+      // re-hashing a manifest whose facts have not moved at all.
       bumpAttempt: db.prepare(
         `UPDATE formation_requests
-            SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP,
-                facts_updated_at = CURRENT_TIMESTAMP
+            SET attempt = attempt + 1, state = 'pending', updated_at = CURRENT_TIMESTAMP
           WHERE company_id = ? AND step = ? AND state = ?
       RETURNING attempt`,
       ),

@@ -303,6 +303,29 @@ test("a POLL does not move facts_updated_at — and so does not invalidate the a
   expect(formation.find("c1", "await_ein")!.state).toBe("confirmed");
 });
 
+test("an ATTEMPT BUMP is not a fact — it must not hold the entity in the anchor due-set", () => {
+  formation.claimStep("c1", "create_provider");
+  // Stamped in the past explicitly: both columns are CURRENT_TIMESTAMP at one-SECOND resolution,
+  // so "unchanged" is only a real assertion against a value the clock cannot reproduce.
+  const OLD = "2026-01-01 00:00:00";
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = 'c1'").run(OLD);
+
+  formation.transition("c1", "create_provider", "pending", "failed", {
+    error: "doola 503",
+    touchFacts: false,
+  });
+  expect(formation.find("c1", "create_provider")!.factsUpdatedAt).toBe(OLD);
+
+  // The bump rotates an IDEMPOTENCY KEY. It says nothing about the world, and a step that fails
+  // every tick would otherwise keep re-deriving and re-hashing a manifest that has not changed.
+  expect(formation.bumpAttempt("c1", "create_provider", "failed")).toBe(1);
+  expect(formation.find("c1", "create_provider")!.factsUpdatedAt).toBe(OLD);
+
+  // …and a real state change still moves it.
+  formation.transition("c1", "create_provider", "pending", "confirmed");
+  expect(formation.find("c1", "create_provider")!.factsUpdatedAt).not.toBe(OLD);
+});
+
 test("the anchor due-set DEDUPES the facts arm per COMPANY, then expands after the limit", () => {
   // Ten agents on ONE company, and one agent on another. A page of one must not be all ten.
   for (let i = 0; i < 10; i++) attach(`busy-${i}`, "company-busy");
