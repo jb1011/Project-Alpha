@@ -10,7 +10,7 @@ import {
   truncateTenant,
 } from "../../formation";
 import { createCompany } from "../../formation/company";
-import { deriveFormationStatus } from "../../formation/status";
+import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
 import { AgentSpecSchema, FormationPartySchema } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
@@ -174,7 +174,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
           industryLabel: company.industryLabel,
           // DERIVED, both of them — see `deriveFormationStatus` and `hasLivePayment`.
           formationStatus: deriveFormationStatus(steps),
-          paying: (deps.companies?.livePaymentCount(company.companyId) ?? 0) > 0,
+          paying: hasLivePayment(deps.companies, company.companyId),
           filedAt: company.filedAt,
           filingNumber: company.filingNumber,
           // How many agents SHARE this filing. Authenticated surface only: the public ones do

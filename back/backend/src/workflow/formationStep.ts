@@ -26,6 +26,27 @@ import {
  * failing step retry forever without ever reaching the max-attempt verdict.
  */
 
+/**
+ * The ENTITY audit trail of a COMPANY-level event, fanned out (2026-08-26 §3).
+ *
+ * One company may have zero agents attached (it can be filed before anyone onboards) or ten. The
+ * event is the same for every one of them, and a company with none records nothing — which is
+ * honest: there is no entity whose history it would belong to.
+ *
+ * ONE copy, here, because there were three: the filer's, the processor's and (before the re-key)
+ * the saga's. Three copies of "which entities does this event belong to?" is three chances for a
+ * company's agents to end up with different histories of the same filing.
+ */
+export function recordCompanyEvent(
+  repo: EntityRepository,
+  companyId: string,
+  step: string,
+  detail: string,
+): void {
+  for (const e of repo.listByCompany(companyId))
+    repo.recordEvent(e.idempotencyKey, step, e.status, null, detail);
+}
+
 /** The ops line for every transition. IDs, steps and states only — never PII, never a payload. */
 export function logFormationStep(
   companyId: string,

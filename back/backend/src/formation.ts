@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type Config, canFormEntities } from "./config/env";
-import { deriveFormationStatus } from "./formation/status";
+import { deriveFormationStatus, hasLivePayment } from "./formation/status";
 import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
 import { sqliteUtcTimestamp } from "./util/sqliteTime";
@@ -232,7 +232,7 @@ export function formationDoorRefusal(
       !companyAcceptsAgents(
         company,
         deriveFormationStatus(f.requests.stepsOf?.(input.companyId) ?? []),
-        f.companies.livePaymentCount(input.companyId) > 0,
+        hasLivePayment(f.companies, input.companyId),
       )
     )
       return companyUnavailableMessage();
@@ -290,7 +290,15 @@ export function truncateTenant(tenantId: string): string {
   return `${tenantId.slice(0, 10)}…`;
 }
 
-function warnIfNearLimit(
+/**
+ * Within 20% of a limit AFTER this request: the operator hears about it while there is still
+ * headroom, not when the door starts refusing.
+ *
+ * EXPORTED, because `createCompany` had a second copy with its own signature and its own
+ * hardcoded event name — two definitions of "near" is how one door starts warning at 80% and the
+ * other at 90% without anyone noticing.
+ */
+export function warnIfNearLimit(
   event: string,
   used: number,
   limit: number,

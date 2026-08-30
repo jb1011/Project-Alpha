@@ -7,6 +7,7 @@ import {
   syntheticPiiRefusedMessage,
   syntheticPiiRequiredMessage,
   truncateTenant,
+  warnIfNearLimit,
 } from "../formation";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRepository, CompanyStatus } from "../persistence/companyRepository";
@@ -196,19 +197,10 @@ export function createCompany(
     synthetic: deps.sandboxSyntheticPii,
     intakeSynthesized: built.synthesized,
   });
-  warnIfNearLimit(used + 1, deps.maxPerTenant, truncateTenant(tenantId));
-  return { companyId };
-}
-
-/** Within 20% of the quota AFTER this company: the operator hears about it while there is still
- *  headroom, not when the door starts refusing. The door gate's own rule, at company scope. */
-function warnIfNearLimit(used: number, limit: number, tenantId: string): void {
-  if (limit - used > limit * 0.2) return;
-  opsLog("formation_quota_warning", {
-    level: "warn",
-    used,
-    limit,
-    remaining: limit - used,
-    tenantId,
+  // The door gate's own rule, at company scope — the SAME function, so "near" cannot mean two
+  // different things on two doors that spend the same money.
+  warnIfNearLimit("formation_quota_warning", used + 1, deps.maxPerTenant, {
+    tenantId: truncateTenant(tenantId),
   });
+  return { companyId };
 }

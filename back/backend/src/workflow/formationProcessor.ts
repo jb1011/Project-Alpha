@@ -28,7 +28,12 @@ import {
 import { type AnchorWiring, advanceAnchor } from "./anchorLoop";
 import { downloadDocument } from "./documentDownloader";
 import { environmentPinMismatchError } from "./formationProvider";
-import { failFormationStep, logFormationStep, persistPollBackoff } from "./formationStep";
+import {
+  failFormationStep,
+  logFormationStep,
+  persistPollBackoff,
+  recordCompanyEvent,
+} from "./formationStep";
 
 /**
  * FETCH-AND-ADVANCE: the only code that turns doola's state into ours (design §5, audit H2).
@@ -469,7 +474,7 @@ function advanceFiling(
       legalNameFiled: matchFiledName(d, companyId, company),
     });
     recordCompanyEvent(
-      d,
+      d.repo,
       companyId,
       "formationFiled",
       JSON.stringify({
@@ -482,22 +487,6 @@ function advanceFiling(
   });
   if (won) logFormationStep(companyId, "await_filing", "confirmed", row.attempt, { providerRef });
   return won;
-}
-
-/**
- * The entity audit trail, fanned out over every agent attached to the company (2026-08-26 §3).
- *
- * Zero attached agents is a legitimate shape — a company can be filed before anyone onboards — and
- * it records nothing, which is honest: there is no entity whose history the event would belong to.
- */
-function recordCompanyEvent(
-  d: FormationAdvanceDeps,
-  companyId: string,
-  step: string,
-  detail: string,
-): void {
-  for (const e of d.repo.listByCompany(companyId))
-    d.repo.recordEvent(e.idempotencyKey, step, e.status, null, detail);
 }
 
 /**
@@ -756,7 +745,7 @@ function advanceEin(
     // The EIN itself never reaches the audit trail — it is a tax identifier, and the event only
     // needs to record THAT one was issued.
     recordCompanyEvent(
-      d,
+      d.repo,
       companyId,
       "formationEin",
       JSON.stringify({ providerRef, environment: d.environment }),

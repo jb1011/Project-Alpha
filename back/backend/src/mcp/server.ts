@@ -14,7 +14,7 @@ import {
   truncateTenant,
 } from "../formation";
 import { createCompany } from "../formation/company";
-import { deriveFormationStatus } from "../formation/status";
+import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { opsLog } from "../observability/opsLog";
@@ -661,7 +661,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
                   formationStatus: deriveFormationStatus(
                     deps.formationSteps?.(company.companyId) ?? [],
                   ),
-                  paying: (deps.companies?.livePaymentCount(company.companyId) ?? 0) > 0,
+                  paying: hasLivePayment(deps.companies, company.companyId),
                   agents: deps.companies?.countAgents(company.companyId) ?? 0,
                   createdAt: company.createdAt,
                 })),

@@ -32,7 +32,12 @@ import {
   SqliteFormationRepository,
   parseDetail,
 } from "../persistence/formationRepository";
-import { failFormationStep, logFormationStep, parkFormationStep } from "./formationStep";
+import {
+  failFormationStep,
+  logFormationStep,
+  parkFormationStep,
+  recordCompanyEvent,
+} from "./formationStep";
 
 /**
  * The `create_provider` step of the formation sub-saga (design §5, audit H5 / M5, completeness 9).
@@ -198,18 +203,6 @@ function logStep(
 }
 
 /**
- * The entity audit trail, fanned out (2026-08-26 §3).
- *
- * One company may have zero agents attached (it can be filed before any onboards) or ten. The
- * event is the same for every one of them, and a company with none simply records nothing —
- * which is honest: there is no entity whose history it would belong to.
- */
-function recordCompanyEvent(d: FormationCreateDeps, step: string, detail: string): void {
-  for (const e of d.repo.listByCompany(d.company.companyId))
-    d.repo.recordEvent(e.idempotencyKey, step, e.status, null, detail);
-}
-
-/**
  * Run the create_provider step. **Never throws** — every exit is a recorded state.
  *
  * Returns nothing: the caller is the saga, and the saga's only correct reaction to any outcome
@@ -262,7 +255,12 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
       environmentPinMismatchError(d.company.environment, d.environment),
       { reason: "environment_pin" },
     );
-    recordCompanyEvent(d, "formationCreate", "formation create skipped: environment pin mismatch");
+    recordCompanyEvent(
+      d.repo,
+      d.company.companyId,
+      "formationCreate",
+      "formation create skipped: environment pin mismatch",
+    );
     return;
   }
 
@@ -313,7 +311,12 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     parkFormationStep(d, companyId, "create_provider", noNameOptionsError(), {
       reason: "intake_unreadable",
     });
-    recordCompanyEvent(d, "formationCreate", "formation create parked: intake unreadable");
+    recordCompanyEvent(
+      d.repo,
+      d.company.companyId,
+      "formationCreate",
+      "formation create parked: intake unreadable",
+    );
     opsLog("formation_intake_unreadable", {
       level: "error",
       severity: "CRITICAL",
@@ -468,7 +471,12 @@ function onCallFailure(
     kind,
     code: described.code,
   });
-  recordCompanyEvent(d, "formationCreate", `formation create parked (${kind}): ${reason}`);
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
+    "formationCreate",
+    `formation create parked (${kind}): ${reason}`,
+  );
   opsLog("formation_create_parked", {
     companyId: d.company.companyId,
     // A key conflict is a real bug and needs a human; a lost answer is ordinary weather.
@@ -633,7 +641,8 @@ function confirm(
     error: null,
   });
   recordCompanyEvent(
-    d,
+    d.repo,
+    d.company.companyId,
     "formationCreate",
     JSON.stringify({
       providerRef: doolaCompanyId,
@@ -678,7 +687,12 @@ function failStep(
   // attempt without parking the row (or the reverse). What stays HERE is what is specific to the
   // create: the entity audit event, and doola's own error code on the ops line.
   failFormationStep(d, companyId, "create_provider", error, { code: described.code });
-  recordCompanyEvent(d, "formationCreate", `formation create failed: ${error}`);
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
+    "formationCreate",
+    `formation create failed: ${error}`,
+  );
   opsLog("formation_create_failed", {
     companyId,
     level: "warn",

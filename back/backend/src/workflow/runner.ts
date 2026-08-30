@@ -5,7 +5,7 @@ import {
   companyAgentCapMessage,
   companyUnavailableMessage,
 } from "../formation";
-import { deriveFormationStatus } from "../formation/status";
+import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
@@ -153,7 +153,7 @@ export class OnboardingRunner {
           !companyAcceptsAgents(
             fresh,
             deriveFormationStatus(f.requests.stepsOf(companyId)),
-            f.companies.livePaymentCount(companyId) > 0,
+            hasLivePayment(f.companies, companyId),
           )
         )
           throw new ApiError("validation_error", 400, companyUnavailableMessage());
