@@ -258,6 +258,27 @@ test("C2: a READY company with a party but NO formation rows is opened and filed
   expect(rowOf("create_provider")).toMatchObject({ state: "confirmed", providerRef: COMPANY_ID });
 });
 
+test("C2: a company pinned to the OTHER environment is not opened, and mints no row at all", async () => {
+  // The pin is part of the due-set query, not a check the create step makes afterwards. Opening
+  // a company mints a `create_provider` row, and that row is what `createRequestsSince` (the
+  // platform DAILY ceiling) and `createRequestsByTenant` (the tenant quota) count — so a company
+  // this deployment can never file used to burn a ceiling slot on every single tick.
+  seedCompany(companies, { environment: "production" });
+  repo.upsert(
+    formedEntity({
+      specJson: JSON.stringify({ name: "Formation Agent" }),
+      formationEnvironment: "production",
+    }),
+  );
+  newParty({ companyId: COMPANY_KEY });
+
+  await sweeper().tick(); // this deployment is "sandbox"
+
+  expect(requests.stepsOf(COMPANY_KEY)).toHaveLength(0);
+  expect(requests.createRequestsSince("1970-01-01 00:00:00")).toBe(0);
+  expect(doola.calls).toHaveLength(0);
+});
+
 test("C2: a company with no party bound is NOT opened — there is nothing to file with", async () => {
   seedCompany(companies);
   repo.upsert(formedEntity({ specJson: JSON.stringify({ name: "Formation Agent" }) }));

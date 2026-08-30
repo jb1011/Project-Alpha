@@ -292,7 +292,13 @@ export class FormationSweeper {
    * that opens its filing.
    */
   private async openStrandedFormations(): Promise<void> {
-    for (const companyId of this.d.requests.listUnopenedFormations(STRANDED_BATCH)) {
+    // The DEPLOYMENT's environment is part of the query, not a check made after the fact: opening
+    // a company mints a `create_provider` row, and that row counts against the daily ceiling and
+    // the tenant quota. A company pinned elsewhere must never consume a slot it can never use.
+    for (const companyId of this.d.requests.listUnopenedFormations(
+      this.d.environment,
+      STRANDED_BATCH,
+    )) {
       opsLog("formation_stranded_opened", { companyId, environment: this.d.environment });
       try {
         // `runFormationCreateProvider` claims all four steps in one transaction before it does

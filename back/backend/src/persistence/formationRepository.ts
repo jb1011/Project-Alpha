@@ -142,8 +142,16 @@ export interface FormationRepository {
    * pinned and unfiled, forever. The second is new and deliberate: a company created through
    * `POST /companies` with no agent attached yet is fileable on its own, and this is what opens
    * it — which is why the predicate is about the COMPANY and not about any entity.
+   *
+   * THE PIN IS PART OF THE PREDICATE, not a check the caller makes afterwards. Opening a company
+   * MINTS a `create_provider` row, and that row is what the platform daily ceiling
+   * (`createRequestsSince`) and the per-tenant quota (`createRequestsByTenant`) count. A company
+   * pinned to the other environment is refused by the create step — but only AFTER the row
+   * exists, so every tick of a mixed-pin deployment used to burn a ceiling slot on a company it
+   * was never going to file, and could exhaust the day's ceiling against filings that can
+   * actually happen. Asked here, nothing is minted at all.
    */
-  listUnopenedFormations(limit: number): string[];
+  listUnopenedFormations(environment: string, limit: number): string[];
   transition(
     companyId: string,
     step: FormationStep,
@@ -264,10 +272,14 @@ export class SqliteFormationRepository implements FormationRepository {
            JOIN formation_parties p
              ON p.company_id = c.company_id AND p.deleted_at IS NULL
           WHERE c.status = 'ready'
+            AND c.environment = @environment
+            -- doola is the only filer that exists. Stated rather than assumed, so a second
+            -- provider added later cannot be opened by this deployment's doola client by default.
+            AND c.provider = 'doola'
             AND NOT EXISTS (
                   SELECT 1 FROM formation_requests f WHERE f.company_id = c.company_id)
           ORDER BY c.company_id
-          LIMIT ?`,
+          LIMIT @limit`,
       ),
       // One statement, not an UPDATE followed by a SELECT: the read-back could otherwise return
       // a DIFFERENT driver's attempt number (this repo exists because two drivers meet on these
@@ -373,8 +385,8 @@ export class SqliteFormationRepository implements FormationRepository {
     ).map((r) => r.k);
   }
 
-  listUnopenedFormations(limit: number): string[] {
-    return (this.stmts.listUnopened.all(limit) as { k: string }[]).map((r) => r.k);
+  listUnopenedFormations(environment: string, limit: number): string[] {
+    return (this.stmts.listUnopened.all({ environment, limit }) as { k: string }[]).map((r) => r.k);
   }
 
   /**
