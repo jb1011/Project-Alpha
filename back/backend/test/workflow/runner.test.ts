@@ -629,6 +629,12 @@ test("ATTACH records what the agent JOINED — an agent attached after the filin
     companyId,
   });
 
+  // The SHIM path records nothing: the first agent did not JOIN a filing, it created the 1:1
+  // company it is attached to, and there is no prior history for an event to describe. A
+  // `formationAttached` there would be a spurious `status: "none"` row on every party-only
+  // onboard — which is every client that exists today.
+  expect(repo.listEvents(first.id).filter((e) => e.step === "formationAttached")).toHaveLength(0);
+
   const events = repo.listEvents(second.id).filter((e) => e.step === "formationAttached");
   expect(events).toHaveLength(1);
   const detail = JSON.parse(events[0]!.detail!);

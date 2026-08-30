@@ -157,6 +157,46 @@ test("a filing CONFIRMATION moves facts_updated_at; the next poll of that row do
   expect(factsOf("await_filing")).toBe(OLD);
 });
 
+test("a HEAL on a confirmed row DOES move the fact clock — the amendment survives a crash", async () => {
+  // `healFilingFacts` writes real legal facts onto the COMPANY row on a pass over an ALREADY
+  // confirmed step, and those facts are what the next manifest version commits to. It used to
+  // rely entirely on the in-process anchor fan-out to notice: a crash between the heal write and
+  // the fan-out left the amendment unopened, and nothing would ever open it, because the anchor
+  // gate reads `facts_updated_at` and the heal had not moved it.
+  seedFormation();
+  doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
+  const OLD = "2026-01-01 00:00:00";
+  const factsOf = () =>
+    requests.stepsOf(COMPANY_KEY).find((s) => s.step === "await_filing")!.factsUpdatedAt;
+
+  // Confirm the filing WITHOUT a filing number — the shape the heal exists for.
+  await advanceFormation(deps(), COMPANY_KEY);
+  expect(stateOf("await_filing")).toBe("confirmed");
+  expect(company()?.filingNumber).toBeNull();
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+
+  // doola learns the number. The step does not move; the FACTS do.
+  doola.state.company = {
+    doolaCompanyId: COMPANY_ID,
+    formationFilingDate: "2026-08-19",
+    formationFilingNumber: "WY-HEALED-1",
+  };
+  expect(await advanceFormation(deps(), COMPANY_KEY)).toMatchObject({ advanced: true });
+  expect(company()?.filingNumber).toBe("WY-HEALED-1");
+  expect(factsOf()).not.toBe(OLD);
+
+  // …and the very next pass, which heals nothing, leaves the clock exactly where it is.
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+  expect(await advanceFormation(deps(), COMPANY_KEY)).toMatchObject({ advanced: false });
+  expect(factsOf()).toBe(OLD);
+});
+
 // ── the wake-up-only rule, proven end to end ───────────────────────────────────────────────
 
 test("the payload LIES and every fact still comes from the API (audit H2)", async () => {

@@ -203,7 +203,13 @@ export class OnboardingRunner {
       // N:1 — was attached to a real, filed Wyoming LLC and had a completely empty formation
       // history, because every event that describes that filing had already been written. This
       // is the row that says what it joined.
-      if (companyId && attachedSummary)
+      //
+      // Gated on `p.companyId`, the SAME signal the `shim:` field above reads — not on the local
+      // `companyId`, which the A1 shim also fills in. A shim onboard did not JOIN anything: it
+      // created the 1:1 company it is attached to, milliseconds ago, and there is no prior
+      // history for this event to describe. Recording one there wrote a spurious
+      // `status: "none"` row on every party-only onboard, which is every client that exists.
+      if (p.companyId && attachedSummary)
         this.deps.repo.recordEvent(id, "formationAttached", "pending", null, attachedSummary);
     };
     // Only formation takes the transaction: without a company or a party there is exactly one

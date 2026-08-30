@@ -433,19 +433,26 @@ function advanceFiling(
   // Already filed: refresh the detail (required-actions in particular) without touching state —
   // and HEAL the two legal facts if doola has learned them since (review F12).
   //
-  // `touchFacts: false` — a POLL IS NOT A FACT (2026-08-26 §3). This runs on every pass over a
-  // confirmed row, and the anchor gate reads `facts_updated_at`: letting a required-actions
-  // refresh move it makes the entity re-derive and re-hash its manifest on every tick, forever.
-  // The legal facts that DID move are written by `healFilingFacts` onto the COMPANY row, and the
-  // caller's `advanced` is what opens a cycle for them.
+  // `touchFacts` IS THE HEAL'S OWN VERDICT (2026-08-26 §3), and the heal therefore runs FIRST,
+  // inside the same transaction, so the refresh can report it honestly.
+  //
+  // Neither constant is right here. `true` would move the clock on every pass over a confirmed
+  // row — the required-actions refresh runs on all of them — and that is what made an entity
+  // re-derive and re-hash its manifest every tick for the whole EIN wait. But `false` was wrong
+  // in the other direction: a heal writes REAL LEGAL FACTS onto the company row, and those are
+  // what the next manifest version commits to. With the clock unmoved, the only thing that
+  // opened the amendment was the in-process anchor fan-out — so a crash between the heal write
+  // and the fan-out left it unopened, and nothing would ever open it, because the anchor gate
+  // reads exactly the column the heal had declined to move. Stamping it on a real heal is what
+  // makes the next sweep tick recover.
   if (row.state === "confirmed") {
     let healed = false;
     d.repo.transaction(() => {
+      healed = healFilingFacts(d, companyId, company);
       d.requests.transition(companyId, "await_filing", "confirmed", "confirmed", {
         detail: JSON.stringify(next),
-        touchFacts: false,
+        touchFacts: healed,
       });
-      healed = healFilingFacts(d, companyId, company);
     });
     return healed;
   }
