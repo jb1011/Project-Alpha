@@ -897,6 +897,32 @@ test("F6: an OPEN or HELD cycle is always due, whatever its steps say", () => {
   expect(anchors.listDueEntityKeys(50)).not.toContain(held);
 });
 
+test("the anchor cursor SURVIVES A RESTART — a redeploy does not reset paging to the head", async () => {
+  // In memory the cursor died with the process, and a deployment that restarts more often than
+  // it takes to page through the due set (a deploy, a crash loop, an OOM) never reached its tail
+  // at all — which IS the starvation the cursor exists to prevent.
+  const anchors = new SqliteOaAnchorRepository(db);
+  const keys = seedHeldEntities(ANCHOR_BATCH + 3, anchors);
+  const seen: string[] = [];
+  const chain = fakeAnchorChain();
+  const arc = {
+    ...chain.chain,
+    oaVetoed: async (_proxy: string, hash: string) => {
+      seen.push(hash);
+      return true;
+    },
+  } as unknown as typeof chain.chain;
+  const wiring = { anchor: { anchors, arc, chainId: 5042002 } };
+
+  await sweeper(wiring).tick();
+  expect(seen.length).toBe(ANCHOR_BATCH);
+
+  // A NEW FormationSweeper is a new process: it reads the cursor off `meta`, not off a field.
+  await sweeper(wiring).tick();
+  expect(seen.length).toBe(keys.length);
+  expect(new Set(seen).size).toBe(keys.length);
+});
+
 test("F7: the anchor phase drives every due entity, at most ANCHOR_CONCURRENCY at a time", async () => {
   const anchors = new SqliteOaAnchorRepository(db);
   const keys = seedHeldEntities(ANCHOR_CONCURRENCY * 3, anchors);
@@ -953,9 +979,15 @@ test("the anchor cursor advances across ticks and WRAPS — no entity starves be
     expect(first).toBe(ANCHOR_BATCH);
     // A full batch is an ops line, not an error: the cursor is what makes leaving work behind
     // safe, but a batch full on every tick is a deployment that has outgrown ANCHOR_BATCH.
-    expect(lines.map((l) => JSON.parse(l)).some((l) => l.opslog === "anchor_batch_full")).toBe(
-      true,
-    );
+    const full = lines.map((l) => JSON.parse(l)).find((l) => l.opslog === "anchor_batch_full");
+    expect(full).toBeDefined();
+    // INFO, not warn: this is the steady state of any deployment with more due keys than one
+    // tick's budget, and a warn here trains an operator to ignore the channel.
+    expect(full.level).toBe("info");
+    // Both counts, because they answer different questions: what the tick drove, and how much of
+    // the due SET one page covered.
+    expect(full.entities).toBe(ANCHOR_BATCH);
+    expect(full.companies).toBe(0); // held CYCLES are the entity arm; no company was expanded
 
     // The SECOND tick resumes where the first stopped rather than re-reading its head.
     await s.tick();

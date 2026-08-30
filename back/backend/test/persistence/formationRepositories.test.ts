@@ -268,8 +268,15 @@ test("A-repo-3: acknowledgeHold is a CAS from the two HOLD states and nothing el
 
 // ── 2026-08-26 §3: the anchor scheduler under N:1 ──────────────────────────────────────────
 
-/** An entity attached to `companyId`, with a company row to attach to. */
-function attach(entityKey: string, companyId: string): void {
+/**
+ * An entity attached to `companyId`, with a company row to attach to.
+ *
+ * ANCHORED by default (`oa_manifest_version = 1`), because that is the only state in which an
+ * entity can owe an amendment at all: the facts arm's watermark is taken over a company's
+ * anchored entities, and `advanceAnchor` dismisses an un-anchored one as `not_anchored` before
+ * it reads anything. `anchored: false` is the sibling the watermark must ignore.
+ */
+function attach(entityKey: string, companyId: string, opts: { anchored?: boolean } = {}): void {
   if (!db.prepare("SELECT 1 FROM companies WHERE company_id = ?").get(companyId))
     db.prepare(
       `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
@@ -278,9 +285,16 @@ function attach(entityKey: string, companyId: string): void {
     ).run(companyId);
   db.prepare(
     `INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay,
-                           ein, formation_date, company_id)
-     VALUES (?, ?, 'bound', '0x1', '0x2', '86400', 'STUB', 0, ?)`,
-  ).run(entityKey, entityKey, companyId);
+                           ein, formation_date, company_id, oa_manifest_version,
+                           oa_manifest_anchored_hash)
+     VALUES (?, ?, 'bound', '0x1', '0x2', '86400', 'STUB', 0, ?, ?, ?)`,
+  ).run(
+    entityKey,
+    entityKey,
+    companyId,
+    opts.anchored === false ? null : 1,
+    opts.anchored === false ? null : `0x${"11".repeat(32)}`,
+  );
 }
 
 test("a POLL does not move facts_updated_at — and so does not invalidate the anchor gate", () => {
@@ -343,6 +357,81 @@ test("the anchor due-set DEDUPES the facts arm per COMPANY, then expands after t
   expect(first.nextCursor).toBe("company-busy");
   const second = anchors.listDue(1, first.nextCursor!);
   expect(second.entityKeys).toEqual(["quiet-1"]);
+});
+
+test("the EXPANDED page never exceeds the limit, and the cursor names the last company that fit", () => {
+  // Three companies of four agents each and a budget of ten. Expanding AFTER the SQL LIMIT, a
+  // "batch of 10" handed back twelve keys — and with the real ANCHOR_BATCH of 50 and ten agents
+  // a company, five hundred. `limit` is the caller's concurrency budget for one tick; a bound
+  // that its own reader can multiply is not a bound.
+  for (const c of ["company-a", "company-b", "company-c"])
+    for (let i = 0; i < 4; i++) attach(`${c}-agent-${i}`, c);
+  for (const c of ["company-a", "company-b", "company-c"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+
+  const page = anchors.listDue(10);
+  expect(page.entityKeys.length).toBeLessThanOrEqual(10);
+  // Two whole companies fit; the third would have made twelve, so it waits for the next tick.
+  expect(page.entityKeys).toHaveLength(8);
+  expect(page.companies).toBe(2);
+  // The cursor is the last company whose expansion fit ENTIRELY — so the next page starts at the
+  // one that did not, and no agent is skipped by the cut.
+  expect(page.nextCursor).toBe("company-b");
+  const next = anchors.listDue(10, page.nextCursor!);
+  expect(next.entityKeys.every((k) => k.startsWith("company-c"))).toBe(true);
+  expect(next.entityKeys).toHaveLength(4);
+});
+
+test("the facts watermark is per COMPANY: an un-anchored sibling does not make it due forever", () => {
+  // The trap: a company whose filing settled long ago, plus ONE agent that has never anchored —
+  // a fresh onboard whose v1 has not confirmed, which `advanceAnchor` dismisses on sight. Per
+  // ENTITY that agent has no anchor write, so `a.last IS NULL` made the whole company due on
+  // every single tick, forever, dragging every sibling's manifest through a re-hash with it.
+  attach("settled-1", "company-x");
+  attach("fresh-2", "company-x", { anchored: false });
+  formation.claimStep("company-x", "await_filing");
+  formation.transition("company-x", "await_filing", "pending", "confirmed");
+  db.prepare(
+    "UPDATE formation_requests SET facts_updated_at = '2026-08-01 00:00:00' WHERE company_id = 'company-x'",
+  ).run();
+  // The anchored sibling wrote its cycle AFTER the facts landed: nothing is owed.
+  anchors.claimVersion("settled-1", 2, "0x02");
+  anchors.transition("settled-1", 2, "pending", "executed");
+  db.prepare(
+    "UPDATE oa_anchors SET updated_at = '2026-08-02 00:00:00' WHERE entity_key = 'settled-1'",
+  ).run();
+
+  expect(anchors.listDueEntityKeys(50)).toEqual([]);
+
+  // …and a fact that really does move still brings the company back.
+  db.prepare(
+    "UPDATE formation_requests SET facts_updated_at = '2026-08-03 00:00:00' WHERE company_id = 'company-x'",
+  ).run();
+  expect(anchors.listDueEntityKeys(50).sort()).toEqual(["fresh-2", "settled-1"]);
+});
+
+test("the due cursor is PERSISTED in meta, so a restart resumes instead of re-reading the head", () => {
+  attach("a-1", "company-a");
+  attach("b-1", "company-b");
+  for (const c of ["company-a", "company-b"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+  expect(anchors.readDueCursor()).toBeUndefined();
+
+  const first = anchors.listDue(1);
+  anchors.writeDueCursor(first.nextCursor);
+  // A fresh repository is a fresh PROCESS: in memory the cursor died with the old one, and a
+  // deployment that restarts faster than it can page through the due set never reached its tail.
+  expect(new SqliteOaAnchorRepository(db).readDueCursor()).toBe("company-a");
+
+  // …and a short page clears it, which is what makes the next sweep start over at the head.
+  const second = anchors.listDue(50, "company-a");
+  expect(second.nextCursor).toBeNull();
+  anchors.writeDueCursor(second.nextCursor);
+  expect(anchors.readDueCursor()).toBeUndefined();
 });
 
 test("the cursor WRAPS: a short page reports null, and the next sweep starts over", () => {

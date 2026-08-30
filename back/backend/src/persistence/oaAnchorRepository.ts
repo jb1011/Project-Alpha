@@ -170,17 +170,39 @@ export interface OaAnchorRepository {
    *
    * ── Under N:1 (2026-08-26 §3) ──────────────────────────────────────────────────────────────
    *
-   * The facts arm is DEDUPED AT COMPANY GRANULARITY and expanded to entities only AFTER the
-   * limit, so one busy company cannot fill the whole batch with its ten agents while every other
-   * company waits. The expansion means the returned list can exceed `limit`; that is deliberate,
-   * and the caller's concurrency bound is what keeps a tick bounded.
+   * The facts arm is DEDUPED AT COMPANY GRANULARITY, so one busy company cannot fill the whole
+   * page with its ten agents while every other company waits. Its watermark is per COMPANY too:
+   * `facts_updated_at` is compared against the OLDEST anchor write across the company's ANCHORED
+   * entities. Per entity it was a trap — one sibling that has never anchored (a fresh agent whose
+   * v1 has not confirmed, and which `advanceAnchor` dismisses on sight) has no anchor write at
+   * all, and made its whole company due on every tick forever.
    *
-   * And it takes a KEYSET CURSOR — `WHERE k > @after ORDER BY k LIMIT ?`, the anti-starvation
-   * shape `listPollDue` already has. Without one, a permanently-held cycle whose key sorts early
+   * The expansion to entity keys happens BEFORE `limit` is applied, and the page is cut so the
+   * returned list never exceeds it: `limit` is the caller's concurrency budget for a tick, and a
+   * "limit" that could return ten times its own value was not a bound at all. The cursor is the
+   * last key whose expansion fit ENTIRELY, so no entity is skipped by the cut.
+   *
+   * And it takes a KEYSET CURSOR — `WHERE k > @after ORDER BY k`, the anti-starvation shape
+   * `listPollDue` already has. Without one, a permanently-held cycle whose key sorts early
    * occupies a slot on every tick forever, and the tail of the set is never reached at all. The
-   * caller persists `nextCursor` and wraps when a short batch says the end has been reached.
+   * caller PERSISTS `nextCursor` (see `writeDueCursor`) and wraps when a short page says the end
+   * has been reached.
    */
-  listDue(limit: number, after?: string): { entityKeys: string[]; nextCursor: string | null };
+  listDue(
+    limit: number,
+    after?: string,
+  ): { entityKeys: string[]; nextCursor: string | null; companies: number };
+  /**
+   * The persisted due-set cursor (`meta.anchor_cursor`).
+   *
+   * In memory it was a fairness aid that a restart threw away — and on a deployment that restarts
+   * more often than it takes to page through the due set (a deploy, a crash loop, an OOM), the
+   * tail of that set is never reached at all, which is the exact starvation the cursor exists to
+   * prevent. One row in `meta`, written after every page.
+   */
+  readDueCursor(): string | undefined;
+  /** Persist the cursor. `null` DELETES it — a short page means "start over at the head". */
+  writeDueCursor(cursor: string | null): void;
   /** The cursor-less form, for callers that want the whole head of the set. */
   listDueEntityKeys(limit: number): string[];
   transition(
@@ -271,21 +293,41 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
       // mid-tick cannot be seen twice or missed entirely. `kind` says which namespace the key is
       // in: the cycle arm yields ENTITY keys, the facts arm yields COMPANY ids that the reader
       // expands after the limit.
+      // The facts arm's watermark is the OLDEST anchor write across the company's ANCHORED
+      // entities (`oa_manifest_version IS NOT NULL`). Per entity, one never-anchored sibling —
+      // which has no anchor write and which `advanceAnchor` dismisses as `not_anchored` — made
+      // its whole company due on every tick, forever. `COALESCE` keeps the safe direction for an
+      // anchored entity that somehow has no rows: it reads as the earliest possible watermark,
+      // so the company IS due.
+      //
+      // `LIMIT` is on the PRE-EXPANSION page and is the same number the caller asked for: every
+      // row expands to at least one entity, so `limit` rows can always cover a batch of `limit`
+      // keys, and the reader cuts the expansion (see `expandDue`).
       listDue: db.prepare(
         `SELECT k, kind FROM (
            SELECT DISTINCT entity_key AS k, 'entity' AS kind FROM oa_anchors
             WHERE state IN (${sqlStates([...OPEN_STATES, ...HOLD_STATES])})
            UNION
-           SELECT DISTINCT e.company_id AS k, 'company' AS kind
-             FROM formation_requests f
-             JOIN entities e ON e.company_id = f.company_id
-             LEFT JOIN (SELECT entity_key, MAX(updated_at) AS last
-                          FROM oa_anchors GROUP BY entity_key) a
-               ON a.entity_key = e.idempotency_key
-            WHERE f.state = 'confirmed'
-              AND (a.last IS NULL OR f.facts_updated_at >= a.last)
+           SELECT company_id AS k, 'company' AS kind FROM (
+             SELECT e.company_id AS company_id,
+                    MAX(f.facts_updated_at) AS facts,
+                    MIN(COALESCE(a.last, '0000-00-00 00:00:00')) AS anchored
+               FROM formation_requests f
+               JOIN entities e
+                 ON e.company_id = f.company_id AND e.oa_manifest_version IS NOT NULL
+               LEFT JOIN (SELECT entity_key, MAX(updated_at) AS last
+                            FROM oa_anchors GROUP BY entity_key) a
+                 ON a.entity_key = e.idempotency_key
+              WHERE f.state = 'confirmed'
+              GROUP BY e.company_id
+           ) WHERE facts >= anchored
          ) WHERE k IS NOT NULL AND k > @after ORDER BY k LIMIT @limit`,
       ),
+      readCursor: db.prepare("SELECT value FROM meta WHERE key = 'anchor_cursor'"),
+      writeCursor: db.prepare(
+        "INSERT INTO meta (key, value) VALUES ('anchor_cursor', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ),
+      clearCursor: db.prepare("DELETE FROM meta WHERE key = 'anchor_cursor'"),
       /** Expand one company id to the entities attached to it (the post-limit half). */
       entitiesOfCompany: db.prepare(
         "SELECT idempotency_key AS k FROM entities WHERE company_id = ? ORDER BY idempotency_key",
@@ -395,13 +437,21 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
     return (this.stmts.listByState.all(state) as Row[]).map(toRecord);
   }
 
-  listDue(limit: number, after = ""): { entityKeys: string[]; nextCursor: string | null } {
+  listDue(
+    limit: number,
+    after = "",
+  ): { entityKeys: string[]; nextCursor: string | null; companies: number } {
     const rows = this.stmts.listDue.all({ after, limit }) as { k: string; kind: string }[];
+    const page = this.expandDue(rows, limit);
+    // More work is left behind either because the SQL page was full, or because the expansion
+    // cut it short. Either way the cursor is the last key that fit ENTIRELY, so the next call
+    // resumes at the first key this one did not drive. A short, fully-consumed page means the
+    // end of the set: null tells the caller to wrap.
+    const more = page.cut || rows.length === limit;
     return {
-      entityKeys: this.expandDue(rows),
-      // The cursor is the last key of the PRE-EXPANSION page, so the next call resumes exactly
-      // where the LIMIT cut. A short page means the end: null tells the caller to wrap.
-      nextCursor: rows.length === limit ? (rows[rows.length - 1]?.k ?? null) : null,
+      entityKeys: page.entityKeys,
+      nextCursor: more ? page.lastFit : null,
+      companies: page.companies,
     };
   }
 
@@ -409,24 +459,52 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
     return this.listDue(limit).entityKeys;
   }
 
-  /** Company ids become entity keys HERE, after the limit has already been applied — which is
-   *  what stops one ten-agent company from filling a fifty-row batch on its own. Order is
-   *  preserved and duplicates are dropped: an entity can be in both arms at once. */
-  protected expandDue(rows: { k: string; kind: string }[]): string[] {
+  readDueCursor(): string | undefined {
+    return (this.stmts.readCursor.get() as { value: string } | undefined)?.value;
+  }
+
+  writeDueCursor(cursor: string | null): void {
+    if (cursor === null) this.stmts.clearCursor.run();
+    else this.stmts.writeCursor.run(cursor);
+  }
+
+  /**
+   * Company ids become entity keys HERE, and the batch is cut AFTER that — which is the only
+   * place it can honestly be cut. `limit` is the caller's concurrency budget for one tick, and
+   * expanding after the SQL LIMIT meant a "batch of 50" could hand back five hundred keys.
+   *
+   * A company is taken whole or not at all, so the cut never splits one filing's fan-out across
+   * two ticks in a way the cursor cannot express. The one exception is a first company that
+   * alone exceeds the budget: it is taken anyway, because returning nothing would re-read the
+   * same head on every tick forever and that company would never advance.
+   *
+   * Order is preserved and duplicates are dropped: an entity can be in both arms at once.
+   */
+  protected expandDue(
+    rows: { k: string; kind: string }[],
+    limit: number,
+  ): { entityKeys: string[]; lastFit: string | null; cut: boolean; companies: number } {
     const out: string[] = [];
     const seen = new Set<string>();
+    let lastFit: string | null = null;
+    let companies = 0;
     for (const r of rows) {
       const keys =
         r.kind === "company"
           ? (this.stmts.entitiesOfCompany.all(r.k) as { k: string }[]).map((e) => e.k)
           : [r.k];
-      for (const k of keys)
-        if (!seen.has(k)) {
-          seen.add(k);
-          out.push(k);
-        }
+      const fresh = keys.filter((k) => !seen.has(k));
+      // Over budget, and something already fits: stop here and let the cursor point at it.
+      if (out.length + fresh.length > limit && out.length > 0)
+        return { entityKeys: out, lastFit, cut: true, companies };
+      for (const k of fresh) {
+        seen.add(k);
+        out.push(k);
+      }
+      if (r.kind === "company") companies++;
+      lastFit = r.k;
     }
-    return out;
+    return { entityKeys: out, lastFit, cut: false, companies };
   }
 
   /**

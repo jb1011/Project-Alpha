@@ -155,13 +155,18 @@ export class FormationSweeper {
   private readonly warned = new Set<string>();
 
   /**
-   * Where the last anchor batch stopped (2026-08-26 §3).
+   * Where the last anchor batch stopped (2026-08-26 §3) — PERSISTED in `meta.anchor_cursor`.
    *
-   * In memory, like the warning set and for the same reason: it is a FAIRNESS aid, not state
-   * anything depends on. A restart re-starts the sweep from the beginning of the set, which costs
-   * one pass over cheap gates and cannot lose work — every candidate is re-derived from rows.
+   * It used to live only in memory, on the argument that it is a fairness aid rather than state
+   * anything depends on. That argument is wrong in exactly the case the cursor exists for: a
+   * deployment that restarts more often than it takes to page through the due set (a deploy, a
+   * crash loop, an OOM) resets to the head every time, and the tail is never reached at all —
+   * which IS the starvation. The field is the in-process mirror; the row is the truth.
    */
   private anchorCursor: string | undefined;
+  /** Whether the persisted cursor has been read yet. One read per process, at the first tick that
+   *  has anchor wiring — the composition root builds this object before the DB is interesting. */
+  private anchorCursorLoaded = false;
 
   constructor(private readonly d: FormationSweeperDeps) {}
 
@@ -581,15 +586,28 @@ export class FormationSweeper {
     // on every tick forever, so under N:1 — where one company can contribute ten entities to the
     // same page — the tail of the due set was never reached at all. The cursor is carried across
     // ticks and WRAPS: a short batch means the end of the set, and the next tick starts over.
-    const { entityKeys, nextCursor } = anchor.anchors.listDue(ANCHOR_BATCH, this.anchorCursor);
+    if (!this.anchorCursorLoaded) {
+      this.anchorCursor = anchor.anchors.readDueCursor();
+      this.anchorCursorLoaded = true;
+    }
+    const { entityKeys, nextCursor, companies } = anchor.anchors.listDue(
+      ANCHOR_BATCH,
+      this.anchorCursor,
+    );
     this.anchorCursor = nextCursor ?? undefined;
+    // Written on EVERY page, including the null that wraps: a restart must resume where the last
+    // completed page stopped, not at the head.
+    anchor.anchors.writeDueCursor(nextCursor);
     if (nextCursor !== null)
-      // A full batch means work was left behind. It is not an error — the cursor is exactly what
-      // makes that safe — but a batch that is full on EVERY tick is a deployment that has
-      // outgrown ANCHOR_BATCH, and only an ops line makes that visible.
+      // A full batch means work was left behind. That is ordinary and it is what the cursor makes
+      // safe — INFO, not warn: it is the steady state of any deployment with more due keys than
+      // one tick's budget, and a warn here trains an operator to ignore the channel. Both counts
+      // are reported because they answer different questions: `entities` is what the tick
+      // actually drove, `companies` is how much of the due SET one page covered.
       opsLog("anchor_batch_full", {
-        level: "warn",
+        level: "info",
         batch: ANCHOR_BATCH,
+        companies,
         entities: entityKeys.length,
         environment: this.d.environment,
       });

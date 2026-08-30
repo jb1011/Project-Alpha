@@ -470,6 +470,14 @@ describe("the entity → company re-key", () => {
         updatedAt: "2026-08-02 11:22:33",
       });
     }
+    // Both are ANCHORED under the manifest scheme — the only state in which an entity can owe an
+    // amendment at all (`advanceAnchor` dismisses an un-anchored one as `not_anchored` before it
+    // reads anything), and what every formed entity on the box actually looks like.
+    for (const k of [due, settled])
+      db.prepare(
+        `UPDATE entities SET oa_manifest_version = 1, oa_manifest_anchored_hash = ?
+          WHERE idempotency_key = ?`,
+      ).run(`0x${"11".repeat(32)}`, k);
     // The settled one already anchored AFTER its facts moved.
     db.prepare(
       `INSERT INTO oa_anchors (entity_key, version, manifest_hash, state, updated_at)
