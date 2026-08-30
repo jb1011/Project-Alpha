@@ -121,6 +121,14 @@ export function noFormationPartyError(): string {
   return "no formation party is bound to this company — nothing can be filed without a legal identity";
 }
 
+/** The refusal when the company's stored intake carries NO name candidates — an empty or
+ *  unreadable `name_options` blob. Its own sentence, like the pin mismatch, because nothing was
+ *  called and nothing is wrong with doola: the ROW is unreadable, and a filing must never invent
+ *  the name it asks the state for. */
+export function noNameOptionsError(): string {
+  return "the company's stored name candidates are empty or unreadable — refusing to file, because a filing must never invent the name it asks the state for";
+}
+
 /** doola REQUIRES a phone on a natural person's address (live sandbox, 2026-08-21). Refused
  *  HERE, with a named reason, rather than sending a body we know will come back 400. */
 export function partyPhoneRequiredError(): string {
@@ -292,10 +300,28 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   // The candidates we STORED at intake — never re-derived here. The migration, the shim and the
   // real form all wrote the same canonical shape, and the matcher that decides `legal_name_filed`
   // compares against exactly these rows.
-  const nameOptions: CompanyNameOption[] =
-    d.company.nameOptions.length > 0
-      ? d.company.nameOptions
-      : companyNameOptions(d.company.businessPurpose);
+  //
+  // An EMPTY list is a corrupt or unparseable `name_options` blob (`parseNameOptions` maps one to
+  // `[]`), and there is exactly one safe answer: file NOTHING. Deriving a substitute would ask
+  // Wyoming for a name nobody chose, under a real fee, and store it as the company's own
+  // candidate — the matcher that decides `legal_name_filed` compares against these rows, so the
+  // invented name would go on to be published in an anchored manifest. It PARKS rather than
+  // burning an attempt, for the environment pin's reason: nothing was sent, a human has to fix
+  // the row, and eight ticks of `failed` would `abandon` the formation and erase the party.
+  const nameOptions: CompanyNameOption[] = d.company.nameOptions;
+  if (nameOptions.length === 0) {
+    parkFormationStep(d, companyId, "create_provider", noNameOptionsError(), {
+      reason: "intake_unreadable",
+    });
+    recordCompanyEvent(d, "formationCreate", "formation create parked: intake unreadable");
+    opsLog("formation_intake_unreadable", {
+      level: "error",
+      severity: "CRITICAL",
+      companyId,
+      environment: d.environment,
+    });
+    return;
+  }
   const expedited = isNonUsResponsibleParty(party);
   detail = {
     ...detail,
@@ -467,8 +493,13 @@ function buildCompanyInput(
     doolaCustomerId: customerId,
     entityType: FORMATION_ENTITY_TYPE,
     state: FORMATION_STATE,
-    // Position is stored, not recomputed: the ranking IS the intake.
-    nameOptions: nameOptions.map((n, i) => ({ ...n, position: n.position ?? i + 1 })),
+    // Position is stored, not recomputed: the ranking IS the intake, and `position` is a required
+    // column of the canonical shape — a fallback here would be a second opinion about the order.
+    nameOptions: nameOptions.map((n) => ({
+      name: n.name,
+      entityTypeEnding: n.entityTypeEnding,
+      position: n.position,
+    })),
     // The company's OWN intake, not the agent's description: the purpose describes the legal
     // body, and from A2 it is a required field on the create form.
     industry: d.company.industryLabel || DEFAULT_INDUSTRY,

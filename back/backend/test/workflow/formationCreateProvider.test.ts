@@ -471,6 +471,37 @@ test("the create step itself still refuses a partyless row — belt and braces f
   expect(calls).toHaveLength(0);
 });
 
+test("an unreadable name_options blob PARKS the filing and sends nothing at all", async () => {
+  bindParty();
+  // What a corrupt/truncated blob looks like to the repository: `parseNameOptions` maps anything
+  // unparseable to `[]`, which is the exact shape the deleted fallback used to paper over by
+  // deriving a name from the business purpose — and filing a real LLC under it.
+  db.prepare("UPDATE companies SET name_options = ? WHERE company_id = ?").run(
+    "{not json",
+    COMPANY_KEY,
+  );
+  const { api, calls } = makeFakeDoola();
+  await runFormationCreateProvider({
+    company: companies.find(COMPANY_KEY)!,
+    companies,
+    repo,
+    requests,
+    parties,
+    doola: api,
+    environment: "sandbox",
+  });
+
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
+  expect(row.state).toBe("failed");
+  expect(row.error).toMatch(/name candidates are empty or unreadable/);
+  // PARKED, not failed-with-a-bump: eight ticks of a burned attempt would `abandon` the formation,
+  // and `abandoned` is what erases the responsible party's personal data.
+  expect(row.attempt).toBe(0);
+  expect(row.providerRef).toBeNull();
+  // The whole point: nothing reached doola. No customer, no company, no fee.
+  expect(calls).toHaveLength(0);
+});
+
 test("a party with no phone is refused HERE, not by a body doola would 400", async () => {
   bindParty({ phone: null });
   const { api, calls } = makeFakeDoola();
