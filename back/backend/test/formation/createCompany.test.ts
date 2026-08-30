@@ -111,6 +111,23 @@ test("A1 mints a READY company with the SYNTHESIZED intake, in the canonical sha
   expect(parties.findOwned(TENANT, partyId)!.companyId).toBe(company.companyId);
 });
 
+test("a LOST bind CAS rolls the company INSERT back — against a real transaction", () => {
+  // The race step 3 cannot close: another request takes this party between the ownership check
+  // and the CAS. Simulated at the ONE seam that produces it — a `bindToCompany` that loses —
+  // with the real `companies` repository and the real better-sqlite3 transaction, because the
+  // bug was precisely that better-sqlite3 commits a callback which merely RETURNS false.
+  const partyId = newParty();
+  // The real repository with ONE method overridden — prototype-delegating, so every other read
+  // (the ownership check in step 3 above all) still goes to the real rows.
+  const losingParties: SqliteFormationPartyRepository = Object.create(parties);
+  losingParties.bindToCompany = () => false;
+  const result = createCompany(deps({ parties: losingParties }), TENANT, intake(partyId));
+  expect(result).toEqual({ error: formationPartyUnavailableMessage() });
+  // Zero rows. An orphan here would count against the tenant's quota forever, be attachable, and
+  // sit inside `listUnopened`'s reach with no party to file with.
+  expect((db.prepare("SELECT COUNT(*) AS n FROM companies").get() as { n: number }).n).toBe(0);
+});
+
 test("the party bind is a CAS: a second company cannot reuse one person's consent", () => {
   const partyId = newParty();
   expect("companyId" in createCompany(deps(), TENANT, intake(partyId))).toBe(true);

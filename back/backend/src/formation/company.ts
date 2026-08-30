@@ -77,6 +77,15 @@ export type CreateCompanyResult = { companyId: string } | { error: string };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * The party-bind CAS lost, expressed as an exception because that is the only thing better-sqlite3
+ * treats as a rollback.
+ *
+ * Private to this module and never surfaced: the caller sees `formationPartyUnavailableMessage()`,
+ * the same sentence every other arm of the single-use rule returns.
+ */
+class PartyBindLost extends Error {}
+
 export function createCompany(
   deps: CreateCompanyDeps,
   tenantId: string,
@@ -152,25 +161,33 @@ export function createCompany(
   //    payment step that does not exist yet and would never be filed. B1 is what makes `draft`
   //    reachable, together with the quote that leaves it.
   const status: CompanyStatus = "ready";
-  let companyId: string | undefined;
-  const bound = deps.transaction(() => {
-    const id = deps.companies.create({
-      tenantId,
-      status,
-      provider: deps.pin.provider,
-      environment: deps.pin.environment,
-      // From the DEPLOYMENT, never from caller input — the caller only gets to be WRONG about it.
-      synthetic: deps.sandboxSyntheticPii,
-      nameOptions: built.nameOptions,
-      businessPurpose: built.businessPurpose,
-      industryLabel: built.industryLabel,
-      intakeSynthesized: built.synthesized,
+  let companyId: string;
+  try {
+    companyId = deps.transaction(() => {
+      const id = deps.companies.create({
+        tenantId,
+        status,
+        provider: deps.pin.provider,
+        environment: deps.pin.environment,
+        // From the DEPLOYMENT, never from caller input — the caller only gets to be WRONG about it.
+        synthetic: deps.sandboxSyntheticPii,
+        nameOptions: built.nameOptions,
+        businessPurpose: built.businessPurpose,
+        industryLabel: built.industryLabel,
+        intakeSynthesized: built.synthesized,
+      });
+      // THROWN, not returned. better-sqlite3 rolls a transaction back on an EXCEPTION and on
+      // nothing else: a callback that returns `false` COMMITS, and the company row it just
+      // inserted survives — orphaned, with no party, counting against the tenant's quota and
+      // sitting in `listUnopened`'s reach forever. The sentinel is caught immediately below and
+      // converted back into the door's one refusal message.
+      if (!deps.parties.bindToCompany(intake.partyId, id, tenantId)) throw new PartyBindLost();
+      return id;
     });
-    if (!deps.parties.bindToCompany(intake.partyId, id, tenantId)) return false;
-    companyId = id;
-    return true;
-  });
-  if (!bound || !companyId) return { error: formationPartyUnavailableMessage() };
+  } catch (e) {
+    if (e instanceof PartyBindLost) return { error: formationPartyUnavailableMessage() };
+    throw e;
+  }
 
   opsLog("company_created", {
     companyId,
