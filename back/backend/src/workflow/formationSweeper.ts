@@ -566,8 +566,12 @@ export class FormationSweeper {
    * (or the event loop of a process that is also serving HTTP). `allSettled`, because one
    * entity's rejection must never cancel its neighbours' work.
    *
-   * The keyed lock is taken per entity HERE rather than inside the loop, because `advanceAnchor`
-   * is deliberately lock-free so fetch-and-advance can call it while already holding the lock.
+   * The keyed lock is taken per entity HERE, because `advanceAnchor` is deliberately lock-free —
+   * and it is REQUIRED, not an optimization: fetch-and-advance drives the same entities from
+   * under the COMPANY's lock, and without an entity lock on both sides the two could each read
+   * `oaScheduledAt == 0` and each broadcast a schedule, the second resetting the guardian's veto
+   * window. Fetch-and-advance takes the entity lock inside the company lock, so the ordering is
+   * company → entity on one side and entity alone on the other: no cycle.
    */
   private async advanceAnchors(): Promise<void> {
     const anchor = this.d.anchor;

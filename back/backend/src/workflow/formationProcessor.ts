@@ -351,11 +351,20 @@ export async function advanceFormation(
   //    and the sweeper already re-drives every open cycle every tick.
   //
   //    FANNED OUT under N:1 (2026-08-26 §3): one late fact is one amendment cycle PER ATTACHED
-  //    AGENT, each through its own timelock. Called without taking the per-entity lock, because
-  //    both callers of this function hold the COMPANY's lock, not any entity's.
+  //    AGENT, each through its own timelock.
+  //
+  //    ⚠ THE ENTITY LOCK IS TAKEN HERE. Both callers of this function hold the COMPANY's lock,
+  //    and the sweeper's anchor phase holds the ENTITY's — two different keys, so before this
+  //    the two could drive one entity's cycle at the same time. Both would read
+  //    `oaScheduledAt == 0` and both would broadcast a schedule; the contract has no
+  //    AlreadyScheduled guard, so the second one OVERWRITES the first and RESETS the guardian's
+  //    veto window (anchorLoop's "property 1"). Taking it here, INSIDE the company lock, fixes
+  //    the ordering at company → entity and never the reverse, so the two paths cannot deadlock.
   if (advanced && d.anchor)
     for (const e of d.repo.listByCompany(companyId))
-      await advanceAnchor({ ...d, ...d.anchor }, e.idempotencyKey);
+      await withKeyedLock(e.idempotencyKey, () =>
+        advanceAnchor({ ...d, ...d.anchor! }, e.idempotencyKey),
+      );
   return { fetched: true, advanced };
 }
 

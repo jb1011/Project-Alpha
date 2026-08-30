@@ -12,6 +12,7 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { sqliteUtcTimestamp } from "../../src/formation";
 import { deriveFormationStatus } from "../../src/formation/status";
+import { withKeyedLock } from "../../src/payments/keyedMutex";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
@@ -698,6 +699,51 @@ test("a sweeper tick and a concurrent driver advance one entity EXACTLY once", a
   expect(stateOf("await_filing")).toBe("confirmed");
   // The CAS is what proves it: only the winner ran the write inside its transaction.
   expect(repo.listEvents(ENTITY_KEY).filter((e) => e.step === "formationFiled")).toHaveLength(1);
+});
+
+test("§3: the webhook fan-out takes the ENTITY lock, so two drivers of one entity serialize", async () => {
+  // The receiver locks `owner.companyId`; the sweeper's anchor phase locks the ENTITY key. Two
+  // different keys is no mutual exclusion at all — and `advanceAnchor` has a read-then-broadcast
+  // window (`oaScheduledAt == 0` → `scheduleOperatingAgreementUpdate`) that the CAS cannot close.
+  // The contract has no AlreadyScheduled guard, so a second broadcast OVERWRITES the schedule and
+  // RESETS the guardian's veto window.
+  const anchors = new SqliteOaAnchorRepository(db);
+  seedFormation();
+  doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
+
+  // The first thing `advanceAnchor` touches past its database gates.
+  const order: string[] = [];
+  const spyAnchors: SqliteOaAnchorRepository = Object.create(anchors);
+  spyAnchors.versionsOf = (k: string) => {
+    order.push("anchor");
+    return anchors.versionsOf(k);
+  };
+
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  // The sweeper's anchor phase, mid-pass, holding the entity's lock.
+  const holder = withKeyedLock(ENTITY_KEY, async () => {
+    order.push("holder-in");
+    await gate;
+    order.push("holder-out");
+  });
+  const chain = fakeAnchorChain();
+  const fanOut = advanceFormation(
+    deps({ anchor: { anchors: spyAnchors, arc: chain.chain, chainId: 5042002 } }),
+    COMPANY_KEY,
+  );
+
+  // Long enough for the whole fetch-and-advance to reach its fan-out. It gets there and WAITS.
+  await new Promise((r) => setTimeout(r, 20));
+  expect(order).toEqual(["holder-in"]);
+
+  release();
+  await Promise.all([holder, fanOut]);
+  expect(order).toEqual(["holder-in", "holder-out", "anchor"]);
+  // One driver, one schedule broadcast — never two, which is what resets the veto window.
+  expect(chain.calls.filter((c) => c.startsWith("schedule:"))).toHaveLength(0);
 });
 
 test("parseSqliteUtc reads the schema's own timestamp format, and survives nonsense", () => {

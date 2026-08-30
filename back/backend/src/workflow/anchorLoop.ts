@@ -82,9 +82,13 @@ import { usesManifestScheme } from "./onboarding";
  * ── Concurrency ────────────────────────────────────────────────────────────────────────────
  *
  * DB-level, not mutex-level (audit M13/20): every state move is a compare-and-set, and the entity
- * columns are written inside the transaction that WON it. `withKeyedLock` is layered on by the
- * callers as an optimization — this module is deliberately lock-free so it can be called from
- * inside a lock the caller already holds (the processor does exactly that).
+ * columns are written inside the transaction that WON it. This module is deliberately lock-free;
+ * EVERY caller wraps it in `withKeyedLock(entityKey, …)`, and that is not merely an optimization
+ * (2026-08-26 §3): the CAS cannot stop two drivers that both read `oaScheduledAt == 0` from both
+ * broadcasting a schedule, and the second broadcast OVERWRITES the first and resets the
+ * guardian's veto window (property 1 above). The processor's fan-out takes the entity lock INSIDE
+ * the company lock it already holds — company → entity, never the reverse, so the two paths
+ * cannot deadlock.
  *
  * ── The projection ─────────────────────────────────────────────────────────────────────────
  *
@@ -236,9 +240,11 @@ export function resetAnchorWarnings(): void {
 /**
  * Advance ONE entity's anchor pipeline as far as it can go right now.
  *
- * Called from two places, both of which already hold the entity's keyed lock: the sweeper's
- * anchor phase (which is what makes progress guaranteed) and fetch-and-advance (which is what
- * makes it fast — a webhook that confirms the filing opens v2 within the second).
+ * Called from two places, and BOTH must hold the entity's keyed lock: the sweeper's anchor phase
+ * (which is what makes progress guaranteed) and fetch-and-advance's fan-out (which is what makes
+ * it fast — a webhook that confirms the filing opens v2 within the second). The lock is the
+ * caller's job because this function is called from inside a company lock in one of the two
+ * cases; see the concurrency note at the top of the module for why it is not optional.
  *
  * Never throws for an ordinary failure. A transport error parks the cycle with a doubling
  * backoff and NO attempt bump, for the same reason a failed doola read does not burn one: a lost
