@@ -321,6 +321,48 @@ async function main() {
       "⚠ FORMATION_REQUIRED=false — formation is AVAILABLE, not mandatory: an onboard is only pinned and filed when it carries a partyId, and the wizard does not send one yet (docs/runbooks/doola-deploy.md)",
     );
 
+  const worldStore = new SqliteWorldStore(db);
+  // ONE builder (§6.7). Spelled out inline here, this object silently dropped
+  // `maxCompaniesPerHuman` — so the company ceiling the boot invariant demands for production
+  // formation had no production caller at all.
+  const worldId = cfg.world ? buildWorldIdDeps(cfg.world, worldStore) : undefined;
+  if (worldId)
+    console.warn(
+      `⚠ World ID guardian gate ENABLED (action ${worldId.cfg.action}, env ${worldId.cfg.environment}, enforce=${worldId.requireGuardian})`,
+    );
+  if (worldId?.cfg.attestAction)
+    console.warn(
+      `⚠ Identity attestation step-up ENABLED (action ${worldId.cfg.attestAction}, min age ${worldId.attestMinAge})`,
+    );
+
+  // `loadConfig` always populates this block — zod supplies every default — and the type is
+  // optional only so a test fixture can build a Config literal without it. Named once so no call
+  // site below re-invents a default the config already owns.
+  const formationCfg = cfg.formation!;
+
+  /**
+   * The `createCompany` dependency set, built ONCE (design §7).
+   *
+   * THREE doors call `createCompany` — REST `POST /companies`, MCP `create_company` and the A1
+   * onboard shim — and each of them used to spell this object out for itself, complete with its
+   * own `?? 3` / `?? 10` fallbacks for limits zod has already defaulted. Three literals is three
+   * ways for the surfaces to disagree about what a company costs, which is the exact drift the
+   * one domain function exists to prevent. Only `transaction` differs per call site: the shim
+   * already runs inside the claim's transaction, the two doors open their own.
+   */
+  const companyDeps = formationDeployment
+    ? {
+        companies,
+        parties: formationParties,
+        requests: formationRequests,
+        pin: formationDeployment,
+        sandboxSyntheticPii: formationCfg.sandboxSyntheticPii,
+        maxPerTenant: formationCfg.maxPerTenant,
+        dailyCeiling: formationCfg.dailyCeiling,
+        world: worldId,
+      }
+    : undefined;
+
   const runSaga: RunSaga = (i) =>
     runOnboarding({
       spec: i.spec,
@@ -372,29 +414,21 @@ async function main() {
       ? {
           companies,
           requests: formationRequests,
-          maxAgentsPerCompany: cfg.formation?.maxAgentsPerCompany ?? 10,
+          maxAgentsPerCompany: formationCfg.maxAgentsPerCompany,
           // The A1 SHIM: a party-only onboard — every client that exists today — mints its own
           // 1:1 company inside the claim transaction. Removed in A3.
           createCompanyForParty: (tenantId, intake) => {
             const result = createCompany(
-              {
-                companies,
-                parties: formationParties,
-                requests: formationRequests,
-                pin: formationDeployment,
-                sandboxSyntheticPii: Boolean(cfg.formation?.sandboxSyntheticPii),
-                maxPerTenant: cfg.formation?.maxPerTenant ?? 3,
-                dailyCeiling: cfg.formation?.dailyCeiling ?? 10,
-                transaction: (fn) => fn(),
-                world: worldId,
-              },
+              // Already inside the claim's transaction: `fn()` runs in it rather than opening a
+              // nested one, so a 409 below rolls the company back with everything else.
+              { ...companyDeps!, transaction: (fn) => fn() },
               tenantId,
               {
                 partyId: intake.partyId,
                 name: intake.name,
                 // The shim never invents a claim: it mirrors the deployment, which is what the
                 // party it is binding was already created against.
-                synthetic: cfg.formation?.sandboxSyntheticPii ? true : undefined,
+                synthetic: formationCfg.sandboxSyntheticPii ? true : undefined,
               },
             );
             if ("error" in result) throw new ApiError("validation_error", 400, result.error);
@@ -499,20 +533,6 @@ async function main() {
     : undefined;
   if (ens) console.warn(`⚠ ENS gateway ENABLED at /ensgateway (parent ${ens.parentName})`);
 
-  const worldStore = new SqliteWorldStore(db);
-  // ONE builder (§6.7). Spelled out inline here, this object silently dropped
-  // `maxCompaniesPerHuman` — so the company ceiling the boot invariant demands for production
-  // formation had no production caller at all.
-  const worldId = cfg.world ? buildWorldIdDeps(cfg.world, worldStore) : undefined;
-  if (worldId)
-    console.warn(
-      `⚠ World ID guardian gate ENABLED (action ${worldId.cfg.action}, env ${worldId.cfg.environment}, enforce=${worldId.requireGuardian})`,
-    );
-  if (worldId?.cfg.attestAction)
-    console.warn(
-      `⚠ Identity attestation step-up ENABLED (action ${worldId.cfg.attestAction}, min age ${worldId.attestMinAge})`,
-    );
-
   const app = buildApiApp({
     webOrigin: cfg.webOrigin,
     nonceStore,
@@ -537,20 +557,23 @@ async function main() {
     // the environment it is available IN, which the honesty invariant makes inseparable from it.
     // Availability is NOT the pin: a box with credentials but FORMATION_REQUIRED off still
     // advertises the capability while pinning nothing.
-    formation: canFormEntities(cfg)
-      ? {
-          environment: cfg.doola!.environment,
-          required: Boolean(cfg.formation?.required),
-          sandboxSyntheticPii: Boolean(cfg.formation?.sandboxSyntheticPii),
-          maxPerTenant: cfg.formation?.maxPerTenant ?? 3,
-          dailyCeiling: cfg.formation?.dailyCeiling ?? 10,
-          maxAgentsPerCompany: cfg.formation?.maxAgentsPerCompany ?? 10,
-          parties: formationParties,
-          requests: formationRequests,
-          companies,
-          pin: { provider: "doola", environment: cfg.doola!.environment },
-        }
-      : undefined,
+    formation:
+      canFormEntities(cfg) && companyDeps
+        ? {
+            environment: cfg.doola!.environment,
+            required: formationCfg.required,
+            sandboxSyntheticPii: formationCfg.sandboxSyntheticPii,
+            maxPerTenant: formationCfg.maxPerTenant,
+            dailyCeiling: formationCfg.dailyCeiling,
+            maxAgentsPerCompany: formationCfg.maxAgentsPerCompany,
+            parties: formationParties,
+            requests: formationRequests,
+            companies,
+            pin: { provider: "doola", environment: cfg.doola!.environment },
+            // The same object the shim uses; the doors add only their own transaction.
+            companyDeps,
+          }
+        : undefined,
     // The view dependencies, as ONE object shared with the MCP surface below (C8).
     ...entityViewDeps,
     // The inbound receiver (design §6). Present only with credentials: a box that cannot verify a

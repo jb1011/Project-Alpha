@@ -123,18 +123,8 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       throw new ApiError("validation_error", 400, "name is required");
 
     const result = createCompany(
-      {
-        companies: deps.formation.companies,
-        parties: deps.formation.parties,
-        requests: deps.formation.requests,
-        pin: deps.formation.pin,
-        sandboxSyntheticPii: deps.formation.sandboxSyntheticPii,
-        maxPerTenant: deps.formation.maxPerTenant,
-        dailyCeiling: deps.formation.dailyCeiling,
-        transaction: (fn) => deps.repo.transaction(fn),
-        world: deps.worldId,
-        now: deps.now,
-      },
+      // The composition root's ONE dependency set; this door supplies only its transaction.
+      { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
       tenantId,
       {
         partyId: body.partyId,

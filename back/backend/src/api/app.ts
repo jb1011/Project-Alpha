@@ -115,6 +115,15 @@ export interface ApiDeps extends EntityViewDeps {
     companies: import("../persistence/companyRepository").CompanyRepository;
     /** The deployment's pin, copied onto every company this box mints. */
     pin: { provider: string; environment: DoolaEnvironment };
+    /**
+     * The `createCompany` dependency set, built ONCE by the composition root (§7).
+     *
+     * REST `POST /companies`, MCP `create_company` and the A1 onboard shim all call the same
+     * domain function, and each of them used to assemble this object for itself — complete with
+     * its own fallbacks for limits the config already defaults. Only `transaction` is supplied
+     * per call site, because that is the only thing that legitimately differs.
+     */
+    companyDeps: Omit<import("../formation/company").CreateCompanyDeps, "transaction">;
   };
 
   /**

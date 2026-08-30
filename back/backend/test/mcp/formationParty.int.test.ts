@@ -89,6 +89,17 @@ function buildTestApp(
   const companies = new SqliteCompanyRepository(db);
   const requests = new SqliteFormationRepository(db);
   const pin = { provider: "doola" as const, environment: "sandbox" as const };
+  // ONE dependency set for all three doors, exactly as the composition root builds it — only the
+  // transaction differs per call site.
+  const companyDeps = {
+    companies,
+    parties,
+    requests,
+    pin,
+    sandboxSyntheticPii: formation?.syntheticPii ?? false,
+    maxPerTenant: formation?.maxPerTenant ?? 3,
+    dailyCeiling: 10,
+  };
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
@@ -100,20 +111,10 @@ function buildTestApp(
           requests,
           maxAgentsPerCompany: 10,
           createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
-            const result = createCompany(
-              {
-                companies,
-                parties,
-                requests,
-                pin,
-                sandboxSyntheticPii: formation.syntheticPii ?? false,
-                maxPerTenant: formation.maxPerTenant ?? 3,
-                dailyCeiling: 10,
-                transaction: (fn) => fn(),
-              },
-              tenantId,
-              { ...intake, synthetic: formation.syntheticPii ? true : undefined },
-            );
+            const result = createCompany({ ...companyDeps, transaction: (fn) => fn() }, tenantId, {
+              ...intake,
+              synthetic: formation.syntheticPii ? true : undefined,
+            });
             if ("error" in result) throw new Error(result.error);
             return result.companyId;
           },
@@ -149,6 +150,7 @@ function buildTestApp(
           requests,
           companies,
           pin,
+          companyDeps,
         }
       : undefined,
     companies,

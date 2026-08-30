@@ -608,17 +608,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           return { content: [{ type: "text", text: "not authorized" }], isError: true };
         try {
           const result = createCompany(
+            // The composition root's ONE dependency set; this door supplies only its transaction.
             {
-              companies: deps.formation!.companies,
-              parties: deps.formation!.parties,
-              requests: deps.formation!.requests,
-              pin: deps.formation!.pin,
-              sandboxSyntheticPii: deps.formation!.sandboxSyntheticPii,
-              maxPerTenant: deps.formation!.maxPerTenant,
-              dailyCeiling: deps.formation!.dailyCeiling,
+              ...deps.formation!.companyDeps,
               transaction: (fn) => deps.repo.transaction(fn),
-              world: deps.worldId,
-              now: deps.now,
             },
             tenantId,
             { partyId, name, synthetic: synthetic === true ? true : undefined },
