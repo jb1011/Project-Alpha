@@ -123,6 +123,16 @@ export interface ManifestLegal {
   provider: string;
   environment: DoolaEnvironment;
   providerCompanyId: string;
+  /**
+   * The legal name the STATE accepted (2026-08-26 §2) — always OUR candidate string, never
+   * doola free text, because this is hashed onto a public chain.
+   *
+   * A CONDITIONAL key, and the one documented departure from the explicit-nulls convention this
+   * module otherwise keeps: absent ≡ "not known yet". It has to be, because every company that
+   * predates the field has no filed name, and emitting `"companyName": null` for all of them
+   * would change every legal block's bytes and re-anchor the entire fleet at once.
+   */
+  companyName?: string;
   entityType: string;
   state: string;
   formationDate: number;
@@ -324,6 +334,13 @@ function normalizeLegal(l: ManifestLegal): ManifestLegal {
     provider: l.provider,
     environment: l.environment,
     providerCompanyId: l.providerCompanyId,
+    // Emitted ONLY when it is a non-empty string. An absent key and a `null` are different bytes,
+    // and every pre-2026-08-26 company has no filed name — so emitting the key unconditionally
+    // would move every anchored entity's hash at once. NFC for the same reason `entity.name` is:
+    // a decomposed form would hash differently for a visually identical company.
+    ...(typeof l.companyName === "string" && l.companyName.trim()
+      ? { companyName: l.companyName.normalize("NFC") }
+      : {}),
     entityType: l.entityType,
     state: l.state,
     formationDate: l.formationDate,

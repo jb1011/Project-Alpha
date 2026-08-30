@@ -164,6 +164,15 @@ const EnvSchema = z.object({
    *  does not cap how many LLCs a person may control — so it is UNSET (unlimited) by default and
    *  exists only for deployments that want one. */
   WORLD_MAX_ENTITIES_PER_HUMAN: z.coerce.number().int().positive().optional(),
+  /**
+   * Anti-sybil ceiling on COMPANIES (filings) per verified human (2026-08-26 §6.7).
+   *
+   * A different bound from the entity ceiling above and for a different reason: a company is a
+   * real Wyoming record with a real fee behind it, where an agent is software. Optional here —
+   * but production formation BOOT-FAILS without it, because an anonymous wallet must not be able
+   * to buy real LLCs.
+   */
+  WORLD_MAX_COMPANIES_PER_HUMAN: z.coerce.number().int().positive().optional(),
   WORLD_REQUIRE_GUARDIAN: z
     .string()
     .optional()
@@ -217,6 +226,14 @@ const EnvSchema = z.object({
   FORMATION_MAX_PER_TENANT: z.coerce.number().int().positive().default(3),
   /** Rolling-24h formation count across the whole deployment (platform_outflows twin). */
   FORMATION_DAILY_CEILING: z.coerce.number().int().positive().default(10),
+  /**
+   * How many agents may attach to ONE company (2026-08-26 §3).
+   *
+   * Every attached agent is its own anchor sequence per late fact — sponsored on-chain writes
+   * through its own timelock, plus a guardian notification each — so the fan-out of a single EIN
+   * arriving is `agents × facts × 2` transactions. Ten is the stated bound behind that arithmetic.
+   */
+  FORMATION_MAX_AGENTS_PER_COMPANY: z.coerce.number().int().positive().default(10),
   /** Tri-state, same shape as FORMATION_REQUIRED: unset = TRUE in sandbox. Real names/addresses
    *  are then neither collected nor sent to doola's development environment (§3 PII). */
   FORMATION_SANDBOX_SYNTHETIC_PII: z.string().optional(),
@@ -331,6 +348,8 @@ export interface Config {
     action: string;
     /** Absent = no ceiling. */
     maxEntitiesPerHuman?: number;
+    /** Absent = no ceiling on FILINGS per human. Required for production formation (§6.7). */
+    maxCompaniesPerHuman?: number;
     requireGuardian: boolean;
     environment: "production" | "staging" | "sandbox";
     /** Identity-Check step-up action. Absent = attestation surface not mounted. */
@@ -382,6 +401,8 @@ export interface Config {
     sweepMs: number;
     maxPerTenant: number;
     dailyCeiling: number;
+    /** How many agents may share ONE company's filing (§3). */
+    maxAgentsPerCompany: number;
     /** Sandbox files with a labeled synthetic identity instead of a real natural person. */
     sandboxSyntheticPii: boolean;
   };
@@ -548,6 +569,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
             rpSigningKey: e.WORLD_RP_SIGNING_KEY,
             action: e.WORLD_ACTION,
             maxEntitiesPerHuman: e.WORLD_MAX_ENTITIES_PER_HUMAN,
+            maxCompaniesPerHuman: e.WORLD_MAX_COMPANIES_PER_HUMAN,
             requireGuardian: e.WORLD_REQUIRE_GUARDIAN,
             environment: e.WORLD_ENVIRONMENT,
             attestAction: e.WORLD_ATTEST_ACTION,
@@ -576,6 +598,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       sweepMs: e.FORMATION_SWEEP_MS,
       maxPerTenant: e.FORMATION_MAX_PER_TENANT,
       dailyCeiling: e.FORMATION_DAILY_CEILING,
+      maxAgentsPerCompany: e.FORMATION_MAX_AGENTS_PER_COMPANY,
       sandboxSyntheticPii: boolWithDerivedDefault(
         e.FORMATION_SANDBOX_SYNTHETIC_PII,
         e.DOOLA_ENVIRONMENT === "sandbox",
@@ -628,6 +651,39 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         "Invalid config: FORMATION_REQUIRED is set but the doola block is missing — mandatory formation needs DOOLA_API_KEY + DOOLA_WEBHOOK_SECRET (unset FORMATION_REQUIRED for a stub-only deployment)",
       );
   }
+
+  // ── THE IDENTITY FLOOR (2026-08-26 §6.7) ───────────────────────────────────────────────────
+  //
+  // Production formation without proof-of-personhood is anonymous USDC buying real Wyoming LLCs.
+  // The invariant asserts the WIRED DEPENDENCY, never env strings, because that is exactly where
+  // the hole is: `assertGuardianAllowed` SILENTLY RETURNS when `cfg.world` is undefined — any one
+  // of WORLD_APP_ID / WORLD_RP_ID / WORLD_RP_SIGNING_KEY missing — so a box could have
+  // WORLD_REQUIRE_GUARDIAN=true set, pass every string check, and gate nothing at all.
+  //
+  // Not gated on NODE_ENV: the testnet box runs NODE_ENV=production against doola SANDBOX by
+  // design, and a production doola environment is always a deliberate act.
+  if (cfg.doola?.environment === "production") {
+    if (!cfg.world)
+      throw new Error(
+        "Invalid config: DOOLA_ENVIRONMENT=production requires the World ID block (WORLD_APP_ID + WORLD_RP_ID + WORLD_RP_SIGNING_KEY) — production formation files real Wyoming LLCs, and without all three the guardian gate silently passes everyone",
+      );
+    if (!cfg.world.requireGuardian)
+      throw new Error(
+        "Invalid config: DOOLA_ENVIRONMENT=production with WORLD_REQUIRE_GUARDIAN off — production formation spends real money on a real legal record and the guardian must be a verified unique human",
+      );
+    if (cfg.world.maxCompaniesPerHuman == null)
+      throw new Error(
+        "Invalid config: DOOLA_ENVIRONMENT=production requires WORLD_MAX_COMPANIES_PER_HUMAN — an unbounded per-human filing count is how one verified human buys a hundred LLCs",
+      );
+  }
+
+  // Sandbox synthetic identities must never reach a production filing: the shortcut exists to
+  // avoid sending real personal data to a playground, and using it the other way round would file
+  // a real Wyoming LLC naming a person who does not exist (§7).
+  if (cfg.formation.sandboxSyntheticPii && cfg.doola?.environment === "production")
+    throw new Error(
+      "Invalid config: FORMATION_SANDBOX_SYNTHETIC_PII is on with DOOLA_ENVIRONMENT=production — a synthetic identity would file a REAL Wyoming LLC for a person who does not exist",
+    );
 
   // Mainnet invariants (design §2). Keyed on ARC_NETWORK and NOT on NODE_ENV, deliberately: the
   // testnet box runs NODE_ENV=production against doola SANDBOX by design, so NODE_ENV cannot be

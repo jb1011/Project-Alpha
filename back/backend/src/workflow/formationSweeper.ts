@@ -16,6 +16,7 @@ import {
 import { deriveFormationStatus } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
+import type { CompanyRepository } from "../persistence/companyRepository";
 import type {
   DoolaEventRepository,
   DoolaWebhookEventRecord,
@@ -26,9 +27,8 @@ import {
   type FormationStep,
   parseDetail,
 } from "../persistence/formationRepository";
-import type { AgentSpec } from "../policy/agentSpec";
 import { parseSqliteUtc } from "../util/sqliteTime";
-import { advanceAnchor } from "./anchorLoop";
+import { advanceAnchor, newAnchorReadCache } from "./anchorLoop";
 import {
   type FormationAdvanceDeps,
   advanceFormation,
@@ -36,7 +36,7 @@ import {
   processDoolaEvent,
 } from "./formationProcessor";
 import { runFormationCreateProvider } from "./formationProvider";
-import { persistPollBackoff } from "./formationStep";
+import { abandonFormation, persistPollBackoff } from "./formationStep";
 
 /**
  * The formation sweeper (design §7 "Reconcile & sweeper") — the first recurring timer in the API
@@ -134,6 +134,7 @@ export const SUBMITTED_STALL_MS = DOOLA_DEFAULT_TIMEOUT_MS + SUBMITTED_STALL_SLA
 export interface FormationSweeperDeps extends FormationAdvanceDeps {
   events: DoolaEventRepository;
   parties: FormationPartyRepository;
+  companies: CompanyRepository;
   /** `FORMATION_SWEEP_MS`. */
   intervalMs: number;
 }
@@ -145,13 +146,27 @@ export class FormationSweeper {
   private ticking = false;
   private ticks = 0;
   /**
-   * Stale warnings already emitted, keyed `entityKey:step:YYYY-MM-DD`.
+   * Stale warnings already emitted, keyed `companyId:step:YYYY-MM-DD`.
    *
    * In memory, and deliberately so: this is de-duplication of an ops LINE, not state anything
    * depends on. A restart re-warns, which is the failure direction to prefer — the alternative is
    * a persisted marker that could suppress a warning about a formation nobody is watching.
    */
   private readonly warned = new Set<string>();
+
+  /**
+   * Where the last anchor batch stopped (2026-08-26 §3) — PERSISTED in `meta.anchor_cursor`.
+   *
+   * It used to live only in memory, on the argument that it is a fairness aid rather than state
+   * anything depends on. That argument is wrong in exactly the case the cursor exists for: a
+   * deployment that restarts more often than it takes to page through the due set (a deploy, a
+   * crash loop, an OOM) resets to the head every time, and the tail is never reached at all —
+   * which IS the starvation. The field is the in-process mirror; the row is the truth.
+   */
+  private anchorCursor: string | undefined;
+  /** Whether the persisted cursor has been read yet. One read per process, at the first tick that
+   *  has anchor wiring — the composition root builds this object before the DB is interesting. */
+  private anchorCursorLoaded = false;
 
   constructor(private readonly d: FormationSweeperDeps) {}
 
@@ -272,25 +287,32 @@ export class FormationSweeper {
   // ── (b) the two crash windows (C2) ────────────────────────────────────────────────────────
 
   /**
-   * Entities that are PINNED to doola, have a party bound, and have no formation rows at all.
+   * READY companies with a party bound and no formation rows at all.
    *
-   * The claim writes the pin and binds the party in one transaction; `claimAllSteps` runs later,
-   * at the top of the create step, after provisioning, minting, binding and funding. A crash
-   * anywhere in that stretch leaves an entity that owes a real filing and has NOTHING to find it
-   * by: it is `bound`/`funded` so `listInFlight()` skips it, and it has no rows so every query in
-   * this file skipped it too. It would sit there, pinned and unfiled, until a human noticed.
+   * Two shapes come through here since the re-key. The original is the crash window: the claim
+   * writes the pin and binds the party in one transaction, `claimAllSteps` runs later at the top
+   * of the create step, and a crash anywhere in that stretch left an entity that owed a real
+   * filing and had NOTHING to find it by. The second is ordinary operation — a company created
+   * through `POST /companies` is fileable before any agent attaches to it, and this is the leg
+   * that opens its filing.
    */
   private async openStrandedFormations(): Promise<void> {
-    for (const entityKey of this.d.requests.listUnopenedFormations(STRANDED_BATCH)) {
-      opsLog("formation_stranded_opened", { entityKey, environment: this.d.environment });
+    // The DEPLOYMENT's environment is part of the query, not a check made after the fact: opening
+    // a company mints a `create_provider` row, and that row counts against the daily ceiling and
+    // the tenant quota. A company pinned elsewhere must never consume a slot it can never use.
+    for (const companyId of this.d.requests.listUnopenedFormations(
+      this.d.environment,
+      STRANDED_BATCH,
+    )) {
+      opsLog("formation_stranded_opened", { companyId, environment: this.d.environment });
       try {
         // `runFormationCreateProvider` claims all four steps in one transaction before it does
         // anything else, so this both opens the saga and runs its first step.
-        await withKeyedLock(entityKey, () => this.retryCreateProvider(entityKey));
+        await withKeyedLock(companyId, () => this.retryCreateProvider(companyId));
       } catch (err) {
         opsLog("formation_stranded_failed", {
           level: "warn",
-          entityKey,
+          companyId,
           ...describeDoolaError(err),
         });
       }
@@ -314,17 +336,17 @@ export class FormationSweeper {
       if (now - parseSqliteUtc(row.updatedAt) < SUBMITTED_STALL_MS) continue;
       opsLog("formation_create_resumed", {
         level: "warn",
-        entityKey: row.entityKey,
+        companyId: row.companyId,
         stalledMs: now - parseSqliteUtc(row.updatedAt),
         providerRef: row.providerRef,
         environment: this.d.environment,
       });
       try {
-        await withKeyedLock(row.entityKey, () => this.retryCreateProvider(row.entityKey));
+        await withKeyedLock(row.companyId, () => this.retryCreateProvider(row.companyId));
       } catch (err) {
         opsLog("formation_retry_failed", {
           level: "warn",
-          entityKey: row.entityKey,
+          companyId: row.companyId,
           step: row.step,
           ...describeDoolaError(err),
         });
@@ -348,7 +370,7 @@ export class FormationSweeper {
       } catch (err) {
         opsLog("formation_retry_failed", {
           level: "warn",
-          entityKey: row.entityKey,
+          companyId: row.companyId,
           step: row.step,
           ...describeDoolaError(err),
         });
@@ -379,23 +401,23 @@ export class FormationSweeper {
    * `FORMATION_STEP_ORDER` without a driver is now a type error rather than a row that silently
    * never retries.
    */
-  private readonly drivers: Record<FormationStep, (entityKey: string) => Promise<unknown>> = {
-    create_provider: (entityKey) =>
-      withKeyedLock(entityKey, () => this.retryCreateProvider(entityKey)),
-    await_filing: (entityKey) => this.advance(entityKey),
-    fetch_documents: (entityKey) => this.advance(entityKey),
-    await_ein: (entityKey) => this.advance(entityKey),
+  private readonly drivers: Record<FormationStep, (companyId: string) => Promise<unknown>> = {
+    create_provider: (companyId) =>
+      withKeyedLock(companyId, () => this.retryCreateProvider(companyId)),
+    await_filing: (companyId) => this.advance(companyId),
+    fetch_documents: (companyId) => this.advance(companyId),
+    await_ein: (companyId) => this.advance(companyId),
   };
 
   private async retry(row: FormationRequestRecord): Promise<void> {
-    await this.drivers[row.step](row.entityKey);
+    await this.drivers[row.step](row.companyId);
   }
 
-  /** Fetch-and-advance under the entity lock, asking for required-actions: a periodic pass has no
-   *  event name to infer them from. */
-  private advance(entityKey: string): Promise<{ fetched: boolean; advanced: boolean }> {
-    return withKeyedLock(entityKey, () =>
-      advanceFormation(this.d, entityKey, { requiredActions: true }),
+  /** Fetch-and-advance under the COMPANY lock, asking for required-actions: a periodic pass has
+   *  no event name to infer them from. */
+  private advance(companyId: string): Promise<{ fetched: boolean; advanced: boolean }> {
+    return withKeyedLock(companyId, () =>
+      advanceFormation(this.d, companyId, { requiredActions: true }),
     );
   }
 
@@ -407,24 +429,23 @@ export class FormationSweeper {
    * is the entire reason the saga step was written as a standalone module rather than as another
    * branch inside onboarding: the retry driver is not the saga.
    */
-  private async retryCreateProvider(entityKey: string): Promise<void> {
-    const rec = this.d.repo.findByIdempotencyKey(entityKey);
-    if (!rec) return;
-    // The spec is persisted precisely so a resume can re-derive what to file.
-    const spec = JSON.parse(rec.specJson ?? "{}") as AgentSpec;
-    if (!spec.name) {
+  private async retryCreateProvider(companyId: string): Promise<void> {
+    // The company row IS the persisted intake — names, purpose, industry — so a resume re-derives
+    // nothing and re-reads everything. (It used to parse the agent's spec_json, which is why an
+    // entity with no persisted spec could not be retried at all.)
+    const company = this.d.companies.find(companyId);
+    if (!company) {
       opsLog("formation_retry_skipped", {
         level: "warn",
-        entityKey,
+        companyId,
         step: "create_provider",
-        reason: "no persisted spec to file with",
+        reason: "no company row to file with",
       });
       return;
     }
     await runFormationCreateProvider({
-      entityKey,
-      rec,
-      spec,
+      company,
+      companies: this.d.companies,
       repo: this.d.repo,
       requests: this.d.requests,
       parties: this.d.parties,
@@ -436,14 +457,21 @@ export class FormationSweeper {
   /** The terminal verdict. CRITICAL: a mandatory formation has permanently failed, and the
    *  entity is live without one. */
   private abandon(row: FormationRequestRecord): void {
-    const moved = this.d.requests.transition(row.entityKey, row.step, "failed", "abandoned", {
-      error: row.error ?? `abandoned after ${row.attempt} attempts`,
-    });
+    // The step transition and the COMPANY's status move in ONE transaction (2026-08-26 §4.6):
+    // company-level `abandoned` has exactly three writers, and all three go through the SAME
+    // function so the company and its step can never disagree about whether the filing is over.
+    const moved = abandonFormation(
+      this.d.requests,
+      this.d.companies,
+      row.companyId,
+      row.error ?? `abandoned after ${row.attempt} attempts`,
+      { transaction: (fn) => this.d.repo.transaction(fn), step: row.step, from: "failed" },
+    );
     if (!moved) return;
     opsLog("formation_abandoned", {
       severity: "CRITICAL",
       level: "error",
-      entityKey: row.entityKey,
+      companyId: row.companyId,
       step: row.step,
       attempt: row.attempt,
       environment: this.d.environment,
@@ -459,17 +487,17 @@ export class FormationSweeper {
     // and for each of them a `stepsOf` plus a JSON parse, once a minute, forever. `next_poll_at`
     // is a column precisely so this is an indexed range scan; the result is a SUPERSET (it does
     // not know which step an entity is waiting on) and the loop below still decides.
-    const candidates = this.d.requests.listPollDueEntityKeys(
+    const candidates = this.d.requests.listPollDueCompanyIds(
       now,
       // A row that has never been polled has a NULL column; its clock is its own `updated_at`,
       // which is the ">24h since it last moved" rule the design specifies.
       sqliteUtcTimestamp(now - POLL_BASE_MS),
       POLL_BATCH,
     );
-    for (const entityKey of candidates) {
-      const steps = this.d.requests.stepsOf(entityKey);
+    for (const companyId of candidates) {
+      const steps = this.d.requests.stepsOf(companyId);
       const status = deriveFormationStatus(steps);
-      // `failed` entities belong to the retry path above, not here; `complete`/`none` are done or
+      // `failed` companies belong to the retry path above, not here; `complete`/`none` are done or
       // have not started. What is left is genuinely in flight.
       if (status === "complete" || status === "failed" || status === "none") continue;
       const step = currentPolledStep(steps);
@@ -484,11 +512,11 @@ export class FormationSweeper {
 
       let outcome: Awaited<ReturnType<typeof advanceFormation>>;
       try {
-        outcome = await this.advance(entityKey);
+        outcome = await this.advance(companyId);
       } catch (err) {
         opsLog("formation_poll_failed", {
           level: "warn",
-          entityKey,
+          companyId,
           ...describeDoolaError(err),
         });
         continue;
@@ -497,14 +525,14 @@ export class FormationSweeper {
       // the next one down — the failure path already has its own backoff.
       if (!outcome.fetched) continue;
 
-      this.persistBackoff(entityKey, outcome.advanced);
+      this.persistBackoff(companyId, outcome.advanced);
     }
   }
 
-  /** Write the poll schedule onto whichever step the entity is waiting on NOW — which may not be
+  /** Write the poll schedule onto whichever step the company is waiting on NOW — which may not be
    *  the one it was waiting on before the poll, because the poll may have advanced it. */
-  private persistBackoff(entityKey: string, advanced: boolean): void {
-    const steps = this.d.requests.stepsOf(entityKey);
+  private persistBackoff(companyId: string, advanced: boolean): void {
+    const steps = this.d.requests.stepsOf(companyId);
     const step = currentPolledStep(steps);
     if (!step) return; // fully formed: there is nothing left to schedule
     const row = steps.find((s) => s.step === step);
@@ -542,20 +570,59 @@ export class FormationSweeper {
    * (or the event loop of a process that is also serving HTTP). `allSettled`, because one
    * entity's rejection must never cancel its neighbours' work.
    *
-   * The keyed lock is taken per entity HERE rather than inside the loop, because `advanceAnchor`
-   * is deliberately lock-free so fetch-and-advance can call it while already holding the lock.
+   * The keyed lock is taken per entity HERE, because `advanceAnchor` is deliberately lock-free —
+   * and it is REQUIRED, not an optimization: fetch-and-advance drives the same entities from
+   * under the COMPANY's lock, and without an entity lock on both sides the two could each read
+   * `oaScheduledAt == 0` and each broadcast a schedule, the second resetting the guardian's veto
+   * window. Fetch-and-advance takes the entity lock inside the company lock, so the ordering is
+   * company → entity on one side and entity alone on the other: no cycle.
    */
   private async advanceAnchors(): Promise<void> {
     const anchor = this.d.anchor;
     if (!anchor) return; // no anchor wiring: the v1-row-only shape, unchanged
     const deps = { ...this.d, ...anchor };
-    const queue = anchor.anchors.listDueEntityKeys(ANCHOR_BATCH);
+    // THE KEYSET CURSOR (2026-08-26 §3). A held cycle whose key sorts early used to occupy a slot
+    // on every tick forever, so under N:1 — where one company can contribute ten entities to the
+    // same page — the tail of the due set was never reached at all. The cursor is carried across
+    // ticks and WRAPS: a short batch means the end of the set, and the next tick starts over.
+    if (!this.anchorCursorLoaded) {
+      this.anchorCursor = anchor.anchors.readDueCursor();
+      this.anchorCursorLoaded = true;
+    }
+    const { entityKeys, nextCursor, companies } = anchor.anchors.listDue(
+      ANCHOR_BATCH,
+      this.anchorCursor,
+    );
+    this.anchorCursor = nextCursor ?? undefined;
+    // Written on EVERY page, including the null that wraps: a restart must resume where the last
+    // completed page stopped, not at the head.
+    anchor.anchors.writeDueCursor(nextCursor);
+    if (nextCursor !== null)
+      // A full batch means work was left behind. That is ordinary and it is what the cursor makes
+      // safe — INFO, not warn: it is the steady state of any deployment with more due keys than
+      // one tick's budget, and a warn here trains an operator to ignore the channel. Both counts
+      // are reported because they answer different questions: `entities` is what the tick
+      // actually drove, `companies` is how much of the due SET one page covered.
+      opsLog("anchor_batch_full", {
+        level: "info",
+        batch: ANCHOR_BATCH,
+        companies,
+        entities: entityKeys.length,
+        environment: this.d.environment,
+      });
+    const queue = entityKeys;
+    // ONE cache for the whole pass. A batch under N:1 is mostly SIBLINGS — ten agents on one
+    // filing used to cost ten `companies.find`, ten `stepsOf` and ten `listByCompany` for three
+    // answers that are identical by construction. Per TICK and no longer: these rows move, and a
+    // cache that outlived its pass would be a staler source of truth for the facts an amendment
+    // is derived from.
+    const cache = newAnchorReadCache();
     const worker = async () => {
       for (;;) {
         const entityKey = queue.shift();
         if (entityKey === undefined) return;
         try {
-          await withKeyedLock(entityKey, () => advanceAnchor(deps, entityKey));
+          await withKeyedLock(entityKey, () => advanceAnchor(deps, entityKey, cache));
         } catch (err) {
           // advanceAnchor has its own catch-all, so reaching this is a bug rather than a bad
           // minute — but one entity's bug must still not stop the sweep.
@@ -593,12 +660,12 @@ export class FormationSweeper {
       for (const row of this.d.requests.listByState(state)) {
         const ageMs = now - parseSqliteUtc(row.createdAt);
         if (ageMs < FORMATION_STALE_MS) continue;
-        const key = `${row.entityKey}:${row.step}:${day}`;
+        const key = `${row.companyId}:${row.step}:${day}`;
         if (this.warned.has(key)) continue;
         this.warned.add(key);
         opsLog("formation_stale", {
           level: "warn",
-          entityKey: row.entityKey,
+          companyId: row.companyId,
           step: row.step,
           ageDays: Math.floor(ageMs / (24 * 60 * 60 * 1000)),
           environment: this.d.environment,
@@ -610,7 +677,7 @@ export class FormationSweeper {
   /**
    * Drop stale-warning keys from days that are over (M5).
    *
-   * The set is keyed `entityKey:step:YYYY-MM-DD` and it is what stops one stuck formation
+   * The set is keyed `companyId:step:YYYY-MM-DD` and it is what stops one stuck formation
    * producing a warning every hour. It only ever GREW, though, and the API process is meant to
    * run for months: one entry per stuck step per day, forever. Yesterday's keys can never match
    * again, so they are simply dropped.

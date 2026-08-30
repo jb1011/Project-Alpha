@@ -1,5 +1,18 @@
 # Runbook — doola webhooks
 
+> ⚠ **A1 (2026-08-26):** a webhook's `doolaCompanyId` now maps to a **company**, not to an entity.
+> `formation_requests.provider_ref` is unchanged on the wire and in the table — what changed is the
+> row it sits on, which is keyed `(company_id, step)`. One wake-up therefore advances ONE company,
+> where it used to advance one entity, and every agent attached to that company sees the result.
+> Ops lines that used to carry `entityKey` carry `companyId`; a journald filter written against
+> the old field name will come back empty rather than wrong. To find the agents behind a company:
+>
+> ```bash
+> sqlite3 "$DATA_DIR/legalbody.db" \
+>   "SELECT idempotency_key FROM entities WHERE company_id =
+>      (SELECT company_id FROM formation_requests WHERE provider_ref = '<doolaCompanyId>');"
+> ```
+
 > Covers the inbound receiver shipped in PR 2 part B.
 > Design: `back/docs/design/2026-08-19-doola-formation-provider-design.md` §6 (receiver), §5
 > (event handling), §7 (sweeper), §10 (threat model).
@@ -196,6 +209,8 @@ Every line is one JSON object on stdout → journald.
 | `formation_abandoned` | **CRITICAL** — a step burned all 8 attempts |
 | `formation_stale` | A step has been in flight > 14 days (once per row per day) |
 | `formation_party_erased` | PII destroyed for a filing that never happened |
+| `formation_intake_unreadable` | **CRITICAL** — the company's stored `name_options` blob is empty or unreadable. The filing is PARKED and nothing was sent; it never files under an invented name. Fix the row, then let the sweeper retry |
+| `anchor_batch_full` | INFO. One anchor page hit `ANCHOR_BATCH`; the cursor carries the rest to the next tick. Reports `companies` (how much of the due set the page covered) and `entities` (what the tick actually drove). Full on EVERY tick ⇒ the deployment has outgrown `ANCHOR_BATCH` |
 
 Useful queries:
 
@@ -206,10 +221,17 @@ journalctl -u legalbody-api --since today | grep doola_webhook_received | wc -l
 # Anything CRITICAL, ever
 journalctl -u legalbody-api | grep '"severity":"CRITICAL"'
 
-# What is stuck?
+# What is stuck? (A1: the sub-saga is keyed by COMPANY — there is no entity_key column any more)
 sqlite3 /var/lib/legalbody/legalbody.db \
-  "SELECT entity_key, step, state, attempt, updated_at FROM formation_requests
+  "SELECT company_id, step, state, attempt, updated_at FROM formation_requests
     WHERE state IN ('failed','abandoned') ORDER BY updated_at DESC;"
+
+# …and which agents (if any) share each of those filings
+sqlite3 /var/lib/legalbody/legalbody.db \
+  "SELECT f.company_id, f.step, f.state, group_concat(e.idempotency_key)
+     FROM formation_requests f
+     LEFT JOIN entities e ON e.company_id = f.company_id
+    WHERE f.state IN ('failed','abandoned') GROUP BY f.company_id, f.step;"
 
 # Events the sweeper still owes work on
 sqlite3 /var/lib/legalbody/legalbody.db \

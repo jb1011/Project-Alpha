@@ -78,7 +78,12 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
       // flagged and this design forbids. So these three read the DB on every request.
       // ONE derivation, shared with `/transparency` and the authenticated view — a public
       // surface and a private one must never disagree about what an entity's formation IS.
-      const formation = formationSummary(ent, deps.formationSteps?.(ent.idempotencyKey) ?? []);
+      const formation = ent.companyId
+        ? formationSummary(
+            deps.company?.(ent.companyId),
+            deps.formationSteps?.(ent.companyId) ?? [],
+          )
+        : null;
       if (formation) {
         // The environment is REQUIRED whenever this block exists: a sandbox filing must never be
         // publishable as a real one by omission (the honesty invariant, §2).

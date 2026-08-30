@@ -20,7 +20,61 @@ export interface WorldIdDeps {
   store: WorldStore;
   /** Absent = no ceiling on legal entities per human. */
   maxEntitiesPerHuman?: number;
+  /**
+   * Absent = no ceiling on COMPANIES per human (2026-08-26 §6.7).
+   *
+   * A separate bound from `maxEntitiesPerHuman`, because they brake different things: companies
+   * are FILINGS (real money, a real Wyoming record), agents are software. Production formation
+   * boot-FAILS unless this one is set, and the invariant asserts the wired dependency rather than
+   * an env string — `assertGuardianAllowed` silently no-ops when `cfg.world` is undefined.
+   */
+  maxCompaniesPerHuman?: number;
   requireGuardian: boolean;
+}
+
+/**
+ * The composition seam, as ONE function (2026-08-26 §6.7).
+ *
+ * `api/main.ts` used to spell this object out inline, and it silently dropped
+ * `maxCompaniesPerHuman`: the config parsed `WORLD_MAX_COMPANIES_PER_HUMAN`, the boot invariant
+ * REQUIRED it for production formation, `assertGuardianAllowed`'s company scope read it — and
+ * nothing ever put it in the object, so the company ceiling had zero production callers and every
+ * verified human could buy unlimited Wyoming LLCs on a box that believed it was bounded.
+ *
+ * A hand-written literal is exactly how that happens. This is the only builder, and it is
+ * testable without booting a server.
+ */
+export function buildWorldIdDeps(
+  world: {
+    appId: string;
+    rpId: string;
+    rpSigningKey: string;
+    action: string;
+    environment: WorldIdConfig["environment"];
+    attestAction?: string;
+    attestMinAge: number;
+    maxEntitiesPerHuman?: number;
+    maxCompaniesPerHuman?: number;
+    requireGuardian: boolean;
+  },
+  store: WorldStore,
+): WorldIdDeps {
+  return {
+    cfg: {
+      appId: world.appId,
+      rpId: world.rpId,
+      rpSigningKey: world.rpSigningKey,
+      action: world.action,
+      environment: world.environment,
+      attestAction: world.attestAction,
+    },
+    store,
+    maxEntitiesPerHuman: world.maxEntitiesPerHuman,
+    // The FILING ceiling (§6.7). Its own bound, and the one the money hangs off.
+    maxCompaniesPerHuman: world.maxCompaniesPerHuman,
+    attestMinAge: world.attestMinAge,
+    requireGuardian: world.requireGuardian,
+  };
 }
 
 const REQUEST_TTL_MS = 10 * 60_000;
@@ -439,9 +493,20 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
   };
 }
 
-/** Onboarding gate: throws unless the tenant's guardian is a verified unique human under the cap.
- *  No-op when World isn't configured or enforcement is off — existing deployments are unaffected. */
-export function assertGuardianAllowed(world: WorldIdDeps | undefined, tenantId: string): void {
+/**
+ * The personhood gate: throws unless the tenant's guardian is a verified unique human under the
+ * relevant cap. No-op when World isn't configured or enforcement is off — existing deployments
+ * are unaffected, and production formation has a BOOT invariant precisely because of that no-op.
+ *
+ * TWO scopes, because there are two different things to bound (2026-08-26 §6.7). The `entity`
+ * scope (the default, and what onboard uses) counts AGENTS; the `company` scope counts FILINGS
+ * and backs `POST /companies` and MCP `create_company` — the doors that spend the money.
+ */
+export function assertGuardianAllowed(
+  world: WorldIdDeps | undefined,
+  tenantId: string,
+  opts: { scope?: "entity" | "company" } = {},
+): void {
   if (!world || !world.requireGuardian) return;
   const v = world.store.findByTenant(tenantId, world.cfg.action);
   if (!v)
@@ -450,8 +515,19 @@ export function assertGuardianAllowed(world: WorldIdDeps | undefined, tenantId: 
       403,
       "guardian must complete World ID verification before creating a legal entity",
     );
-  // The ceiling is optional: unset means a verified human may form as many legal bodies as they
-  // like, which is what the law actually allows.
+  // Both ceilings are optional: unset means a verified human may form as many legal bodies as
+  // they like, which is what the law actually allows.
+  if (opts.scope === "company") {
+    if (world.maxCompaniesPerHuman == null) return;
+    const used = world.store.countCompaniesForNullifier(v.nullifier, world.cfg.action);
+    if (used >= world.maxCompaniesPerHuman)
+      throw new ApiError(
+        "guardian_company_cap",
+        403,
+        `this human already controls ${used} companies (max ${world.maxCompaniesPerHuman})`,
+      );
+    return;
+  }
   if (world.maxEntitiesPerHuman == null) return;
   const used = world.store.countEntitiesForNullifier(v.nullifier, world.cfg.action);
   if (used >= world.maxEntitiesPerHuman)

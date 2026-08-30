@@ -19,6 +19,8 @@ import {
   DoolaTimeoutError,
 } from "../../src/adapters/doola/doolaClient";
 import type { OperatorSigner } from "../../src/adapters/turnkey/signer";
+import { companyNameOptions } from "../../src/formation/intake";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -34,6 +36,8 @@ import { runOnboarding } from "../../src/workflow/onboarding";
 
 const TENANT = "0x000000000000000000000000000000000000000A";
 const KEY = "form-A";
+/** OUR company id — the sub-saga's key since 2026-08-26. Distinct from doola's `COMPANY`. */
+const COMPANY_KEY = "company-A";
 const COMPANY = "cmp_live_1";
 const CUSTOMER = "cus_live_1";
 
@@ -123,6 +127,7 @@ let repo: SqliteEntityRepository;
 let docStore: FileDocumentStore;
 let requests: SqliteFormationRepository;
 let parties: SqliteFormationPartyRepository;
+let companies: SqliteCompanyRepository;
 
 beforeEach(() => {
   db = openDatabase(":memory:");
@@ -130,11 +135,30 @@ beforeEach(() => {
   repo = new SqliteEntityRepository(db);
   requests = new SqliteFormationRepository(db);
   parties = new SqliteFormationPartyRepository(db);
+  companies = new SqliteCompanyRepository(db);
   docStore = new FileDocumentStore(`/tmp/legalbody-formation-${Math.floor(performance.now())}`);
 });
 afterEach(() => db.close());
 
+/**
+ * The state the door leaves behind since the re-key: a READY company carrying the intake, a party
+ * bound to IT (not to the entity), and an entity claimed with `company_id` set and its pin copied
+ * from the company row. That is exactly what `OnboardingRunner.start` writes in one transaction.
+ */
 function bindParty(over: { country?: string; phone?: string | null } = {}): string {
+  companies.create({
+    companyId: COMPANY_KEY,
+    tenantId: TENANT,
+    status: "ready",
+    provider: "doola",
+    environment: "sandbox",
+    synthetic: false,
+    nameOptions: companyNameOptions(spec.name),
+    businessPurpose: "A test agent.",
+    industryLabel: "Software development",
+    intakeSynthesized: true,
+  });
+  claimEntity({ companyId: COMPANY_KEY, provider: "doola", environment: "sandbox" });
   const id = parties.create({
     tenantId: TENANT,
     legalFirstName: "Ada",
@@ -149,8 +173,41 @@ function bindParty(over: { country?: string; phone?: string | null } = {}): stri
     country: over.country ?? "USA",
     synthetic: false,
   });
-  parties.bind(id, KEY, TENANT);
+  parties.bindToCompany(id, COMPANY_KEY, TENANT);
   return id;
+}
+
+/** The entity row as the claim transaction writes it (the runner's job, not the saga's). */
+function claimEntity(
+  over: { companyId?: string; provider?: string; environment?: "sandbox" | "production" } = {},
+): void {
+  repo.claimKey({
+    idempotencyKey: KEY,
+    name: spec.name,
+    status: "pending",
+    manager: spec.roles.manager as `0x${string}`,
+    guardian: spec.roles.guardian as `0x${string}`,
+    operator: null,
+    amendmentDelay: "0",
+    ein: "",
+    formationDate: 0,
+    oaHash: null,
+    metadataURI: null,
+    docPath: null,
+    treasuryConfig: null,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: TENANT,
+    error: null,
+    specJson: JSON.stringify(spec),
+    companyId: over.companyId ?? null,
+    formationProvider: over.provider ?? null,
+    formationEnvironment: over.environment ?? null,
+  });
 }
 
 function baseDeps(
@@ -172,17 +229,17 @@ function baseDeps(
     // The pin and the filer as ONE object (M3): a root cannot hand the saga a provider to pin
     // without also handing it the client and the repositories that would file for it.
     formation: {
-      pin: { provider: "doola" as const, environment: "sandbox" as const },
       doola,
       requests,
       parties,
+      companies,
       environment,
     },
   };
 }
 
 const detailOf = (): CreateProviderDetail =>
-  JSON.parse(requests.find(KEY, "create_provider")!.detail ?? "{}");
+  JSON.parse(requests.find(COMPANY_KEY, "create_provider")!.detail ?? "{}");
 
 // ── happy path ──────────────────────────────────────────────────────────────────────────────
 
@@ -194,14 +251,14 @@ test("files the company, claims all four steps, and confirms create_provider", a
   expect(rec.status).toBe("bound");
   // The bridge-legs pattern: all four rows exist up front, so "is a formation in flight?" is a
   // query over rows that provably exist rather than a guess about which a crash created.
-  expect(requests.stepsOf(KEY).map((r) => [r.step, r.state])).toEqual([
+  expect(requests.stepsOf(COMPANY_KEY).map((r) => [r.step, r.state])).toEqual([
     ["create_provider", "confirmed"],
     ["await_filing", "pending"],
     ["fetch_documents", "pending"],
     ["await_ein", "pending"],
   ]);
 
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(row.providerRef).toBe(COMPANY);
   expect(detailOf()).toMatchObject({
     customerId: CUSTOMER,
@@ -223,8 +280,8 @@ test("files the company, claims all four steps, and confirms create_provider", a
   // ENDPOINT (C1): two different bodies under one key is the shape that produces doola's own
   // `E_IDEMPOTENCY_KEY_REUSED`, and it costs nothing to make it unrepresentable.
   expect(calls.map((c) => [c.method, c.idempotencyKey])).toEqual([
-    ["createCustomer", `formation:${KEY}:create_provider:0:customer`],
-    ["createCompany", `formation:${KEY}:create_provider:0:company`],
+    ["createCustomer", `company:${COMPANY_KEY}:create_provider:0:customer`],
+    ["createCompany", `company:${COMPANY_KEY}:create_provider:0:company`],
   ]);
 });
 
@@ -322,7 +379,7 @@ test("NON-FATAL: doola throwing leaves funding and ENS untouched and the saga re
   expect(arc.setAgentMetadata).toHaveBeenCalledTimes(1);
 
   // …and the failure is recorded rather than swallowed.
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(row.state).toBe("failed");
   expect(row.error).toMatch(/E_INTERNAL/);
   // C1: the attempt is NOT burned. A 500 is not a verdict — doola may hold a committed company
@@ -341,7 +398,7 @@ test("a validation failure is recorded with doola's code, and the customer id is
     }) as never,
   });
   await runOnboarding(baseDeps(makeFakeArc(), api));
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(row.state).toBe("failed");
   expect(row.error).toMatch(/E_VALIDATION_FAILED/);
   // The customer survives the failure — it is what the retry and the pre-create lookup reuse.
@@ -356,59 +413,34 @@ test("ENVIRONMENT PINNING (M5): a sandbox-pinned entity is never routed at produ
   // The deployment has flipped to production while this entity is pinned to sandbox.
   await runOnboarding(baseDeps(makeFakeArc(), api, "production"));
 
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(row.state).toBe("failed");
   expect(row.error).toMatch(/environment pin mismatch/);
   expect(row.error).toMatch(/refusing to call doola/);
   expect(calls).toHaveLength(0); // not one call — the refusal is BEFORE the network
 });
 
-test("C5: no bound party means the record is never PINNED, so nothing is opened or called", async () => {
-  const { api, calls } = makeFakeDoola(); // no bindParty()
+test("C5: no company attached means the record is never PINNED, so nothing is opened or called", async () => {
+  const { api, calls } = makeFakeDoola(); // no bindParty(), so no company
   const rec = await runOnboarding(baseDeps(makeFakeArc(), api));
-  // A wizard-shaped onboard: no legal identity, so no pin, no rows, no filing — on a deployment
-  // that is fully wired for doola. That is the opt-in semantic (C5).
+  // A wizard-shaped onboard: no legal body, so no pin, no rows, no filing — on a deployment
+  // that is fully wired for doola. That is the opt-in semantic (C5), re-keyed to companies.
   expect([rec.formationProvider, rec.formationEnvironment]).toEqual([null, null]);
-  expect(requests.stepsOf(KEY)).toHaveLength(0);
+  expect(requests.stepsOf(COMPANY_KEY)).toHaveLength(0);
   expect(calls).toHaveLength(0);
 });
 
-test("M3: a PINNED record with no party is refused at entry, before anything is provisioned", async () => {
-  // The composition/door bug the pin-with-the-bind rule exists to prevent. Reached here by
-  // writing the pin without a party, which is what a root that got it wrong would do.
-  repo.claimKey({
-    idempotencyKey: KEY,
-    name: spec.name,
-    status: "pending",
-    manager: spec.roles.manager as `0x${string}`,
-    guardian: spec.roles.guardian as `0x${string}`,
-    operator: null,
-    amendmentDelay: "0",
-    ein: "",
-    formationDate: 0,
-    oaHash: null,
-    metadataURI: null,
-    docPath: null,
-    treasuryConfig: null,
-    agentId: null,
-    proxy: null,
-    treasury: null,
-    createTxHash: null,
-    bindTxHash: null,
-    fundTxHash: null,
-    ownerTenantId: TENANT,
-    error: null,
-    specJson: JSON.stringify(spec),
-    formationProvider: "doola",
-    formationEnvironment: "sandbox",
-  });
+test("M3: a PINNED record attached to no company is refused at entry, before anything is provisioned", async () => {
+  // The composition/door bug the pin-with-the-attach rule exists to prevent. Reached here by
+  // writing the pin with no company_id, which is what a root that got it wrong would do.
+  claimEntity({ provider: "doola", environment: "sandbox" });
   const { api, calls } = makeFakeDoola();
   await expect(runOnboarding(baseDeps(makeFakeArc(), api))).rejects.toThrow(
-    /pinned to formation provider "doola" but no formation party is bound/,
+    /pinned to formation provider "doola" but is attached to no company/,
   );
   // Nothing was provisioned, nothing was minted, and doola was never told about any of it.
   expect(calls).toHaveLength(0);
-  expect(requests.stepsOf(KEY)).toHaveLength(0);
+  expect(requests.stepsOf(COMPANY_KEY)).toHaveLength(0);
 });
 
 test("the create step itself still refuses a partyless row — belt and braces for the sweeper", async () => {
@@ -419,25 +451,109 @@ test("the create step itself still refuses a partyless row — belt and braces f
   await runOnboarding(baseDeps(makeFakeArc(), first.api));
   // Erase the party and re-open the step, which is the shape the sweeper would retry.
   db.prepare(
-    "UPDATE formation_parties SET deleted_at = CURRENT_TIMESTAMP WHERE entity_key = ?",
-  ).run(KEY);
+    "UPDATE formation_parties SET deleted_at = CURRENT_TIMESTAMP WHERE company_id = ?",
+  ).run(COMPANY_KEY);
   db.prepare(
-    "UPDATE formation_requests SET state='pending', provider_ref=NULL, detail=NULL WHERE entity_key=? AND step='create_provider'",
-  ).run(KEY);
+    "UPDATE formation_requests SET state='pending', provider_ref=NULL, detail=NULL WHERE company_id=? AND step='create_provider'",
+  ).run(COMPANY_KEY);
 
   const { api, calls } = makeFakeDoola();
-  const rec = repo.findByIdempotencyKey(KEY)!;
   await runFormationCreateProvider({
-    entityKey: KEY,
-    rec,
-    spec,
+    company: companies.find(COMPANY_KEY)!,
+    companies,
     repo,
     requests,
     parties,
     doola: api,
     environment: "sandbox",
   });
-  expect(requests.find(KEY, "create_provider")!.error).toMatch(noFormationPartyError());
+  expect(requests.find(COMPANY_KEY, "create_provider")!.error).toMatch(noFormationPartyError());
+  expect(calls).toHaveLength(0);
+});
+
+test("a PARK is not a fact: parking a step does not move facts_updated_at", async () => {
+  bindParty();
+  requests.claimAllSteps(COMPANY_KEY);
+  const OLD = "2026-01-01 00:00:00";
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+  const { api, calls } = makeFakeDoola();
+  // The environment pin: parks, burns no attempt, and learns nothing about the world.
+  await runFormationCreateProvider({
+    company: companies.find(COMPANY_KEY)!,
+    companies,
+    repo,
+    requests,
+    parties,
+    doola: api,
+    environment: "production",
+  });
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
+  expect(row.state).toBe("failed");
+  expect(calls).toHaveLength(0);
+  // Nothing landed, so nothing is owed an amendment cycle. Bumping this on every park is how a
+  // permanently parked row keeps its entity re-hashing a manifest every tick, forever.
+  expect(row.factsUpdatedAt).toBe(OLD);
+});
+
+test("an unreadable name_options blob PARKS the filing and sends nothing at all", async () => {
+  bindParty();
+  // What a corrupt/truncated blob looks like to the repository: `parseNameOptions` maps anything
+  // unparseable to `[]`, which is the exact shape the deleted fallback used to paper over by
+  // deriving a name from the business purpose — and filing a real LLC under it.
+  db.prepare("UPDATE companies SET name_options = ? WHERE company_id = ?").run(
+    "{not json",
+    COMPANY_KEY,
+  );
+  const { api, calls } = makeFakeDoola();
+  await runFormationCreateProvider({
+    company: companies.find(COMPANY_KEY)!,
+    companies,
+    repo,
+    requests,
+    parties,
+    doola: api,
+    environment: "sandbox",
+  });
+
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
+  expect(row.state).toBe("failed");
+  expect(row.error).toMatch(/name candidates are empty or unreadable/);
+  // PARKED, not failed-with-a-bump: eight ticks of a burned attempt would `abandon` the formation,
+  // and `abandoned` is what erases the responsible party's personal data.
+  expect(row.attempt).toBe(0);
+  expect(row.providerRef).toBeNull();
+  // The whole point: nothing reached doola. No customer, no company, no fee.
+  expect(calls).toHaveLength(0);
+});
+
+test("a BLANK stored candidate parks the filing too — not just an empty list", async () => {
+  bindParty();
+  // An agent literally named "LLC". `stripEntityEnding` correctly strips it to nothing, so the
+  // canonical shape is `[{ name: "", entityTypeEnding: "LLC", position: 1 }]` — a non-empty LIST
+  // whose only candidate is blank. The door refuses this intake, but the migration and the shim
+  // write through other paths, and the filer must not send a nameless company to Wyoming.
+  db.prepare("UPDATE companies SET name_options = ? WHERE company_id = ?").run(
+    JSON.stringify([{ name: "", entityTypeEnding: "LLC", position: 1 }]),
+    COMPANY_KEY,
+  );
+  const { api, calls } = makeFakeDoola();
+  await runFormationCreateProvider({
+    company: companies.find(COMPANY_KEY)!,
+    companies,
+    repo,
+    requests,
+    parties,
+    doola: api,
+    environment: "sandbox",
+  });
+
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
+  expect(row.state).toBe("failed");
+  expect(row.error).toMatch(/name candidates are empty or unreadable/);
+  expect(row.attempt).toBe(0); // parked, never burned — the same reason as the empty-list guard
   expect(calls).toHaveLength(0);
 });
 
@@ -445,7 +561,7 @@ test("a party with no phone is refused HERE, not by a body doola would 400", asy
   bindParty({ phone: null });
   const { api, calls } = makeFakeDoola();
   await runOnboarding(baseDeps(makeFakeArc(), api));
-  expect(requests.find(KEY, "create_provider")!.error).toMatch(/has no phone number/);
+  expect(requests.find(COMPANY_KEY, "create_provider")!.error).toMatch(/has no phone number/);
   expect(calls).toHaveLength(0);
 });
 
@@ -456,15 +572,18 @@ test("a legacy/stub entity files nothing at all", async () => {
   const deps = baseDeps(makeFakeArc(), api);
   await runOnboarding({ ...deps, formation: undefined });
   expect(calls).toHaveLength(0);
-  expect(requests.stepsOf(KEY)).toHaveLength(0);
+  expect(requests.stepsOf(COMPANY_KEY)).toHaveLength(0);
 });
 
-test("a deployment with no doola client files nothing, whatever the pin says", async () => {
+test("a pinned record whose company row is GONE files nothing rather than guessing an intake", async () => {
+  // The company row IS the intake — names, purpose, industry. Without it there is nothing to
+  // file, and inventing a body from the agent's spec is exactly the guess the re-key removes.
   bindParty();
-  const arc = makeFakeArc();
-  const base = baseDeps(arc, makeFakeDoola().api);
-  await runOnboarding({ ...base, formation: { ...base.formation, pin: null } });
-  expect(requests.stepsOf(KEY)).toHaveLength(0);
+  db.prepare("DELETE FROM companies WHERE company_id = ?").run(COMPANY_KEY);
+  const { api, calls } = makeFakeDoola();
+  await runOnboarding(baseDeps(makeFakeArc(), api));
+  expect(calls).toHaveLength(0);
+  expect(requests.stepsOf(COMPANY_KEY)).toHaveLength(0);
 });
 
 // ── the crash window ────────────────────────────────────────────────────────────────────────
@@ -479,15 +598,15 @@ test("ADOPT ON RESUME: a persisted provider_ref is never re-created", async () =
   const first = makeFakeDoola();
   await runOnboarding(baseDeps(arc, first.api));
   db.prepare(
-    "UPDATE formation_requests SET state = 'submitted' WHERE entity_key = ? AND step = 'create_provider'",
-  ).run(KEY);
+    "UPDATE formation_requests SET state = 'submitted' WHERE company_id = ? AND step = 'create_provider'",
+  ).run(COMPANY_KEY);
 
   const second = makeFakeDoola();
   await runOnboarding(baseDeps(arc, second.api));
 
   // Not one create. A second create is a second real Wyoming LLC and a second real fee.
   expect(second.calls.map((c) => c.method)).toEqual(["getCompany"]);
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(row.state).toBe("confirmed");
   expect(row.providerRef).toBe(COMPANY);
   expect(detailOf()).toMatchObject({ adopted: true, submissionStatus: "SUBMITTED" });
@@ -506,11 +625,11 @@ test("PRE-CREATE LOOKUP: a resumed row with a customer but no company adopts wha
   bindParty();
   // The state a crash between the customer create and the company create leaves: `submitted`,
   // a customer id in `detail`, no provider_ref.
-  requests.claimAllSteps(KEY);
+  requests.claimAllSteps(COMPANY_KEY);
   db.prepare(
     `UPDATE formation_requests SET state = 'submitted', detail = ?
-      WHERE entity_key = ? AND step = 'create_provider'`,
-  ).run(JSON.stringify({ customerId: CUSTOMER }), KEY);
+      WHERE company_id = ? AND step = 'create_provider'`,
+  ).run(JSON.stringify({ customerId: CUSTOMER }), COMPANY_KEY);
 
   const listCompanies = vi.fn(async () => [
     {
@@ -525,23 +644,23 @@ test("PRE-CREATE LOOKUP: a resumed row with a customer but no company adopts wha
   // The lookup adopted it: no createCustomer (we had one), and no createCompany at all.
   expect(listCompanies).toHaveBeenCalledWith(CUSTOMER);
   expect(calls.map((c) => c.method)).toEqual([]);
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect([row.state, row.providerRef]).toEqual(["confirmed", COMPANY]);
   expect(detailOf().adopted).toBe(true);
 });
 
 test("PRE-CREATE LOOKUP: an EMPTY result never blocks the create (the list is eventually consistent)", async () => {
   bindParty();
-  requests.claimAllSteps(KEY);
+  requests.claimAllSteps(COMPANY_KEY);
   db.prepare(
     `UPDATE formation_requests SET state = 'submitted', detail = ?
-      WHERE entity_key = ? AND step = 'create_provider'`,
-  ).run(JSON.stringify({ customerId: CUSTOMER }), KEY);
+      WHERE company_id = ? AND step = 'create_provider'`,
+  ).run(JSON.stringify({ customerId: CUSTOMER }), COMPANY_KEY);
 
   const { api, calls } = makeFakeDoola(); // listCompanies -> []
   await runOnboarding(baseDeps(makeFakeArc(), api));
   expect(calls.map((c) => c.method)).toEqual(["listCompanies", "createCompany"]);
-  expect(requests.find(KEY, "create_provider")!.providerRef).toBe(COMPANY);
+  expect(requests.find(COMPANY_KEY, "create_provider")!.providerRef).toBe(COMPANY);
 });
 
 test("the lookup is skipped on a FIRST attempt — there is nothing to have lost yet", async () => {
@@ -563,7 +682,10 @@ test("RETRY after a REFUSAL: the row re-enters `submitted`, so the company id is
     }) as never,
   });
   await runOnboarding(baseDeps(arc, broken.api));
-  expect(requests.find(KEY, "create_provider")).toMatchObject({ state: "failed", attempt: 1 });
+  expect(requests.find(COMPANY_KEY, "create_provider")).toMatchObject({
+    state: "failed",
+    attempt: 1,
+  });
 
   // Second pass (what the sweeper will do): doola is back. The row must move OUT of `failed`
   // before the create, or every persist below it CASes on `submitted`, writes nothing, and the
@@ -571,14 +693,14 @@ test("RETRY after a REFUSAL: the row re-enters `submitted`, so the company id is
   const fixed = makeFakeDoola();
   await runOnboarding(baseDeps(arc, fixed.api));
 
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(row.state).toBe("confirmed");
   expect(row.providerRef).toBe(COMPANY);
   expect(row.error).toBeNull();
   // A FRESH idempotency key: doola released the refused one, and reusing it with a corrected
   // body returns 409 E_IDEMPOTENCY_KEY_REUSED (verified live).
   expect(fixed.calls.find((c) => c.method === "createCompany")!.idempotencyKey).toBe(
-    `formation:${KEY}:create_provider:1:company`,
+    `company:${COMPANY_KEY}:create_provider:1:company`,
   );
   // The customer survived the failure, so the retry reuses it and looks first.
   expect(fixed.calls.map((c) => c.method)).toEqual(["listCompanies", "createCompany"]);
@@ -590,16 +712,16 @@ test("ADOPT wins over the body preconditions: a filed company is adopted even if
   const first = makeFakeDoola();
   await runOnboarding(baseDeps(arc, first.api));
   db.prepare(
-    "UPDATE formation_requests SET state = 'submitted' WHERE entity_key = ? AND step = 'create_provider'",
-  ).run(KEY);
+    "UPDATE formation_requests SET state = 'submitted' WHERE company_id = ? AND step = 'create_provider'",
+  ).run(COMPANY_KEY);
   // The phone disappears (an erasure, a correction, a bad edit). The company still exists in
   // Wyoming's queue and its id is ours: adopting it is the only safe answer.
-  db.prepare("UPDATE formation_parties SET phone = NULL WHERE entity_key = ?").run(KEY);
+  db.prepare("UPDATE formation_parties SET phone = NULL WHERE company_id = ?").run(COMPANY_KEY);
 
   const second = makeFakeDoola();
   await runOnboarding(baseDeps(arc, second.api));
   expect(second.calls.map((c) => c.method)).toEqual(["getCompany"]);
-  expect(requests.find(KEY, "create_provider")!.state).toBe("confirmed");
+  expect(requests.find(COMPANY_KEY, "create_provider")!.state).toBe("confirmed");
 });
 
 // ── C1: a LOST answer must never become a second company ────────────────────────────────────
@@ -618,7 +740,7 @@ test("C1: a TIMEOUT on the company create parks the row WITHOUT burning the atte
   });
   await runOnboarding(baseDeps(makeFakeArc(), api));
 
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(row.state).toBe("failed");
   expect(row.attempt).toBe(0); // the key is NOT rotated
   expect(row.error).toMatch(/no usable answer/);
@@ -659,9 +781,9 @@ test("C1: timeout then retry — the SAME key is re-sent and doola's replay is a
   await runOnboarding(baseDeps(arc, replay.api));
 
   // THE assertion: the same key, so doola replays instead of filing.
-  expect(replayKeys).toEqual([`formation:${KEY}:create_provider:0:company`]);
+  expect(replayKeys).toEqual([`company:${COMPANY_KEY}:create_provider:0:company`]);
   expect(committed).toHaveLength(1); // no second company, no second fee
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect([row.state, row.providerRef, row.attempt]).toEqual(["confirmed", COMPANY, 0]);
 });
 
@@ -687,7 +809,7 @@ test("C1: timeout then retry — a lookup that DOES find the company adopts it, 
   await runOnboarding(baseDeps(arc, second.api));
   // Adopt-only: the lookup answered, so nothing is created at all.
   expect(second.calls.map((c) => c.method)).toEqual([]);
-  expect(requests.find(KEY, "create_provider")).toMatchObject({
+  expect(requests.find(COMPANY_KEY, "create_provider")).toMatchObject({
     state: "confirmed",
     providerRef: COMPANY,
     attempt: 0,
@@ -704,13 +826,16 @@ test("C1: a lost CUSTOMER create keeps its key too — the retry replays rather 
     }) as never,
   });
   await runOnboarding(baseDeps(arc, lost.api));
-  expect(requests.find(KEY, "create_provider")).toMatchObject({ state: "failed", attempt: 0 });
+  expect(requests.find(COMPANY_KEY, "create_provider")).toMatchObject({
+    state: "failed",
+    attempt: 0,
+  });
 
   const fixed = makeFakeDoola();
   await runOnboarding(baseDeps(arc, fixed.api));
   expect(fixed.calls.map((c) => [c.method, c.idempotencyKey])).toEqual([
-    ["createCustomer", `formation:${KEY}:create_provider:0:customer`],
-    ["createCompany", `formation:${KEY}:create_provider:0:company`],
+    ["createCustomer", `company:${COMPANY_KEY}:create_provider:0:customer`],
+    ["createCompany", `company:${COMPANY_KEY}:create_provider:0:company`],
   ]);
 });
 
@@ -726,7 +851,7 @@ test("C1: E_IDEMPOTENCY_KEY_REUSED never re-keys — it adopts, and otherwise as
     }) as never,
   });
   await runOnboarding(baseDeps(arc, conflicted.api));
-  const parked = requests.find(KEY, "create_provider")!;
+  const parked = requests.find(COMPANY_KEY, "create_provider")!;
   expect(parked.state).toBe("failed");
   expect(parked.attempt).toBe(0); // NOT re-keyed
   expect(parked.error).toMatch(/NOT re-keying/);
@@ -744,7 +869,7 @@ test("C1: E_IDEMPOTENCY_KEY_REUSED never re-keys — it adopts, and otherwise as
     ]) as never,
   });
   await runOnboarding(baseDeps(arc, resolved.api));
-  expect(requests.find(KEY, "create_provider")).toMatchObject({
+  expect(requests.find(COMPANY_KEY, "create_provider")).toMatchObject({
     state: "confirmed",
     providerRef: COMPANY,
     attempt: 0,
@@ -756,7 +881,7 @@ test("C1: an environment-pin mismatch does NOT count toward abandonment (C7)", a
   const { api, calls } = makeFakeDoola();
   // Eight passes with the deployment pointed at the wrong environment.
   for (let i = 0; i < 8; i++) await runOnboarding(baseDeps(makeFakeArc(), api, "production"));
-  const row = requests.find(KEY, "create_provider")!;
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
   expect(calls).toHaveLength(0);
   // A config error is not a formation going badly: the attempt never moves, so the sweeper's
   // max-attempt verdict — which is what erases the party's data — can never be reached by it.

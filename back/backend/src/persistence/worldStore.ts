@@ -36,6 +36,9 @@ export interface WorldStore {
   findByNullifier(nullifier: string, action: string): GuardianVerification | undefined;
   /** How many entities this human's tenant already owns (for the N-per-human cap). */
   countEntitiesForNullifier(nullifier: string, action: string): number;
+  /** How many COMPANIES this human's tenant already owns (2026-08-26 §6.7). A separate bound
+   *  from the entity ceiling: a company is a filing with a fee and a state record behind it. */
+  countCompaniesForNullifier(nullifier: string, action: string): number;
 
   // ── identity attestations (optional step-up) ──
   /** Same one-human-one-tenant rule as verifications: false if bound to a different tenant. */
@@ -240,6 +243,20 @@ export class SqliteWorldStore implements WorldStore {
       .prepare(
         `SELECT COUNT(*) AS n FROM entities
          WHERE owner_tenant_id IN (
+           SELECT tenant_id FROM guardian_verifications WHERE nullifier = ? AND action = ?
+         )`,
+      )
+      .get(nullifier, action) as { n: number };
+    return row.n;
+  }
+
+  countCompaniesForNullifier(nullifier: string, action: string): number {
+    // Every company, whatever its status: a draft that was abandoned still consumed a slot's
+    // worth of a human's attention, and the point of this ceiling is anti-sybil, not billing.
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM companies
+         WHERE tenant_id IN (
            SELECT tenant_id FROM guardian_verifications WHERE nullifier = ? AND action = ?
          )`,
       )

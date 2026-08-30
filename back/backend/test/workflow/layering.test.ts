@@ -60,3 +60,39 @@ test("M1: the formation status projection is the domain module's, and everyone r
     expect(source, rel.join("/")).not.toContain("export function deriveFormationStatus");
   }
 });
+
+// ── 2026-08-26 §2/§7: one definition per rule ──────────────────────────────────────────────
+
+/** Every `.ts` under `src/`, recursively — the whole surface a second copy could hide in. */
+function allSources(dir = join(import.meta.dirname, "..", "..", "src")): { rel: string }[] {
+  const out: { rel: string }[] = [];
+  const walk = (d: string, prefix: string) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(join(d, e.name), `${prefix}${e.name}/`);
+      else if (e.name.endsWith(".ts")) out.push({ rel: `${prefix}${e.name}` });
+    }
+  };
+  walk(dir, "");
+  return out;
+}
+
+const sourceText = (rel: string) =>
+  readFileSync(join(import.meta.dirname, "..", "..", "src", rel), "utf8");
+
+test("the derived paying predicate has ONE reader: nobody re-writes `livePaymentCount() > 0`", () => {
+  // `hasLivePayment` is exported beside `deriveFormationStatus` precisely because four surfaces
+  // asked the same question, and four inline copies of a predicate is four places for the
+  // definition of "paying" to drift when B1 adds a state to the union.
+  const offenders = allSources()
+    .filter((f) => f.rel !== "formation/status.ts" && f.rel !== "persistence/companyRepository.ts")
+    .filter((f) => /livePaymentCount\([^)]*\)\s*(\?\?[^)]*\)?\s*)?>\s*0/.test(sourceText(f.rel)));
+  expect(offenders.map((f) => f.rel)).toEqual([]);
+});
+
+test("`warnIfNearLimit` and `recordCompanyEvent` are each defined exactly once", () => {
+  const defs = (needle: RegExp) => allSources().filter((f) => needle.test(sourceText(f.rel)));
+  expect(defs(/function warnIfNearLimit\(/).map((f) => f.rel)).toEqual(["formation.ts"]);
+  expect(defs(/function recordCompanyEvent\(/).map((f) => f.rel)).toEqual([
+    "workflow/formationStep.ts",
+  ]);
+});

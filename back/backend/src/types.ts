@@ -83,7 +83,14 @@ export interface EntityRecord {
   publicId?: string | null;
   // ── doola formation (design 2026-08-19 §3). Every field is additive and nullable; null
   //    `formationProvider` means legacy/stub and is never backfilled.
-  /** "doola" | null. Persisted at CLAIM from config (custody-twin rule) and immutable after. */
+  /**
+   * The COMPANY this agent is attached to (2026-08-26 §2/§3). WRITE-ONCE: an anchored manifest
+   * carries `legal.providerCompanyId`, so re-attaching would make a permanent on-chain claim
+   * false. Written only by `attachCompany`, never by `upsert`.
+   */
+  companyId?: string | null;
+  /** "doola" | null. Copied at CLAIM from the COMPANY ROW (never from config) and immutable
+   *  after. Kept beside `companyId` because every read path that renders a pin reads it. */
   formationProvider?: string | null;
   /** The provider environment this entity is PINNED to. A mainnet flip can never route an
    *  in-flight sandbox company at the production host. */

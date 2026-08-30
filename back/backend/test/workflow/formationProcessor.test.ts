@@ -19,6 +19,7 @@ import {
   einIssued,
   providerRefOf,
 } from "../../src/formation/status";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
 import { SqliteDoolaEventRepository } from "../../src/persistence/doolaEventRepository";
@@ -38,12 +39,14 @@ import {
 } from "../../src/workflow/formationProcessor";
 import {
   COMPANY_ID,
+  COMPANY_KEY,
   ENTITY_KEY,
   type FakeDoola,
   MemoryDocumentStore,
   doolaDoc,
   fakeDoola,
   formedEntity,
+  seedCompany,
 } from "../helpers/formationFakes";
 
 const SECRET = "whsec_current";
@@ -51,6 +54,7 @@ const NOW = Date.parse("2026-08-21T12:00:00Z");
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
+let companies: SqliteCompanyRepository;
 let requests: SqliteFormationRepository;
 let documents: SqliteDocumentIndexRepository;
 let events: SqliteDoolaEventRepository;
@@ -60,6 +64,7 @@ let doola: FakeDoola;
 function deps(over: Partial<FormationEventDeps> = {}): FormationEventDeps {
   return {
     repo,
+    companies,
     requests,
     documents,
     docStore,
@@ -75,19 +80,22 @@ function deps(over: Partial<FormationEventDeps> = {}): FormationEventDeps {
 
 /** Seed a pinned entity whose `create_provider` has confirmed — part A's handoff state. */
 function seedFormation(over: Parameters<typeof formedEntity>[0] = {}) {
+  seedCompany(companies);
   repo.upsert(formedEntity(over));
-  requests.claimAllSteps(ENTITY_KEY);
-  requests.transition(ENTITY_KEY, "create_provider", "pending", "confirmed", {
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
     providerRef: COMPANY_ID,
     detail: JSON.stringify({ companyId: COMPANY_ID }),
   });
 }
 
 const stateOf = (step: string) =>
-  requests.stepsOf(ENTITY_KEY).find((s) => s.step === step)?.state ?? "(missing)";
+  requests.stepsOf(COMPANY_KEY).find((s) => s.step === step)?.state ?? "(missing)";
 const entity = () => repo.findByIdempotencyKey(ENTITY_KEY);
+/** The legal facts live on the COMPANY since 2026-08-26 §3 — one filing, however many agents. */
+const company = () => companies.find(COMPANY_KEY);
 const detailOf = (step: string) =>
-  JSON.parse(requests.stepsOf(ENTITY_KEY).find((s) => s.step === step)?.detail ?? "{}");
+  JSON.parse(requests.stepsOf(COMPANY_KEY).find((s) => s.step === step)?.detail ?? "{}");
 
 const wake = (over: Partial<DoolaWakeUp> = {}): DoolaWakeUp => ({
   eventId: "evt-1",
@@ -100,6 +108,7 @@ beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
+  companies = new SqliteCompanyRepository(db);
   requests = new SqliteFormationRepository(db);
   documents = new SqliteDocumentIndexRepository(db);
   events = new SqliteDoolaEventRepository(db);
@@ -107,6 +116,86 @@ beforeEach(() => {
   doola = fakeDoola();
 });
 afterEach(() => db.close());
+
+// ── §3: the FACTS clock moves only on a fact ───────────────────────────────────────────────
+
+test("a filing CONFIRMATION moves facts_updated_at; the next poll of that row does not", async () => {
+  seedFormation();
+  doola.state.company = {
+    doolaCompanyId: COMPANY_ID,
+    formationFilingDate: "2026-08-19",
+    formationFilingNumber: "WY-1",
+  };
+  const OLD = "2026-01-01 00:00:00";
+  const factsOf = (step: string) =>
+    requests.stepsOf(COMPANY_KEY).find((s) => s.step === step)!.factsUpdatedAt;
+  // Both timestamps are CURRENT_TIMESTAMP at one-second resolution, so "unchanged" is only a
+  // real assertion against a value the clock cannot reproduce.
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+
+  // The filing lands: a real fact, and the anchor gate must see it.
+  await advanceFormation(deps(), COMPANY_KEY);
+  expect(stateOf("await_filing")).toBe("confirmed");
+  const afterConfirm = factsOf("await_filing");
+  expect(afterConfirm).not.toBe(OLD);
+
+  // The next pass over the SAME confirmed row refreshes its required-actions detail and nothing
+  // else. It runs on every tick; moving the fact clock here is what made a formed entity
+  // re-derive and re-hash its manifest for the whole four-to-six-week EIN wait.
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+  doola.state.requiredActions = [
+    { requiredActionId: "ra-1", actionCode: "NAME_UNAVAILABLE", status: "open" },
+  ];
+  await advanceFormation(deps(), COMPANY_KEY, { requiredActions: true });
+  expect(detailOf("await_filing").requiredActions).toHaveLength(1);
+  expect(factsOf("await_filing")).toBe(OLD);
+});
+
+test("a HEAL on a confirmed row DOES move the fact clock — the amendment survives a crash", async () => {
+  // `healFilingFacts` writes real legal facts onto the COMPANY row on a pass over an ALREADY
+  // confirmed step, and those facts are what the next manifest version commits to. It used to
+  // rely entirely on the in-process anchor fan-out to notice: a crash between the heal write and
+  // the fan-out left the amendment unopened, and nothing would ever open it, because the anchor
+  // gate reads `facts_updated_at` and the heal had not moved it.
+  seedFormation();
+  doola.state.company = { doolaCompanyId: COMPANY_ID, formationFilingDate: "2026-08-19" };
+  const OLD = "2026-01-01 00:00:00";
+  const factsOf = () =>
+    requests.stepsOf(COMPANY_KEY).find((s) => s.step === "await_filing")!.factsUpdatedAt;
+
+  // Confirm the filing WITHOUT a filing number — the shape the heal exists for.
+  await advanceFormation(deps(), COMPANY_KEY);
+  expect(stateOf("await_filing")).toBe("confirmed");
+  expect(company()?.filingNumber).toBeNull();
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+
+  // doola learns the number. The step does not move; the FACTS do.
+  doola.state.company = {
+    doolaCompanyId: COMPANY_ID,
+    formationFilingDate: "2026-08-19",
+    formationFilingNumber: "WY-HEALED-1",
+  };
+  expect(await advanceFormation(deps(), COMPANY_KEY)).toMatchObject({ advanced: true });
+  expect(company()?.filingNumber).toBe("WY-HEALED-1");
+  expect(factsOf()).not.toBe(OLD);
+
+  // …and the very next pass, which heals nothing, leaves the clock exactly where it is.
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    COMPANY_KEY,
+  );
+  expect(await advanceFormation(deps(), COMPANY_KEY)).toMatchObject({ advanced: false });
+  expect(factsOf()).toBe(OLD);
+});
 
 // ── the wake-up-only rule, proven end to end ───────────────────────────────────────────────
 
@@ -161,10 +250,10 @@ test("the payload LIES and every fact still comes from the API (audit H2)", asyn
   expect(res.status).toBe(200);
   await tasks.settled();
 
-  const e = entity();
-  expect(e?.formationFilingNumber).toBe("WY-REAL-0001");
-  expect(e?.einReal).toBe("88-1111111");
-  expect(e?.formationFiledAt).toBe(filingDateToUnix("2026-08-19"));
+  const e = company();
+  expect(e?.filingNumber).toBe("WY-REAL-0001");
+  expect(e?.ein).toBe("88-1111111");
+  expect(e?.filedAt).toBe(filingDateToUnix("2026-08-19"));
   // Not one of the forged values reached the database.
   expect(JSON.stringify(e)).not.toContain("99-9999999");
   expect(JSON.stringify(e)).not.toContain("WY-FORGED-6666");
@@ -174,19 +263,19 @@ test("the payload LIES and every fact still comes from the API (audit H2)", asyn
 
 // ── advancing each step ────────────────────────────────────────────────────────────────────
 
-test("await_filing confirms on the filing date and writes the two legal facts onto the entity", async () => {
+test("await_filing confirms on the filing date and writes the two legal facts onto the company", async () => {
   seedFormation();
   doola.state.company = {
     doolaCompanyId: COMPANY_ID,
     formationFilingDate: "2026-08-19",
     formationFilingNumber: "WY-2026-1234",
   };
-  const out = await advanceFormation(deps(), ENTITY_KEY);
+  const out = await advanceFormation(deps(), COMPANY_KEY);
   expect(out).toMatchObject({ fetched: true, advanced: true });
   expect(stateOf("await_filing")).toBe("confirmed");
-  expect(entity()).toMatchObject({
-    formationFiledAt: Date.parse("2026-08-19T00:00:00Z") / 1000,
-    formationFilingNumber: "WY-2026-1234",
+  expect(company()).toMatchObject({
+    filedAt: Date.parse("2026-08-19T00:00:00Z") / 1000,
+    filingNumber: "WY-2026-1234",
   });
   // The on-chain-frozen placeholder is untouched: overwriting it would make the row disagree
   // with the chain.
@@ -201,19 +290,19 @@ test("a Completed formation SERVICE also confirms the filing", async () => {
     doolaCompanyId: COMPANY_ID,
     services: [{ name: "Formation", status: "Completed" }],
   };
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   expect(stateOf("await_filing")).toBe("confirmed");
   // No filing date to parse — the fact we do not have is not invented.
-  expect(entity()?.formationFiledAt).toBeNull();
+  expect(company()?.filedAt).toBeNull();
 });
 
-test("nothing filed yet: the step stays where it is and no entity fact is written", async () => {
+test("nothing filed yet: the step stays where it is and no legal fact is written", async () => {
   seedFormation();
   doola.state.company = { doolaCompanyId: COMPANY_ID, formationSubmissionStatus: "PENDING" };
-  const out = await advanceFormation(deps(), ENTITY_KEY);
+  const out = await advanceFormation(deps(), COMPANY_KEY);
   expect(out).toMatchObject({ fetched: true, advanced: false });
   expect(stateOf("await_filing")).toBe("pending");
-  expect(entity()?.formationFiledAt).toBeFalsy();
+  expect(company()?.filedAt).toBeFalsy();
   // The intake status is still recorded, so an operator can see what doola thinks.
   expect(detailOf("await_filing").submissionStatus).toBe("PENDING");
 });
@@ -221,14 +310,14 @@ test("nothing filed yet: the step stays where it is and no entity fact is writte
 test("documents are stored, hashed, and fetch_documents confirms only when BOTH required types are in", async () => {
   seedFormation();
   doola.state.documents = [doolaDoc("d-aoo", "ArticlesOfOrganization")];
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
 
   // One of two: stored, but the step cannot confirm.
-  expect(documents.listByEntity(ENTITY_KEY)).toHaveLength(1);
+  expect(documents.listByCompany(COMPANY_KEY)).toHaveLength(1);
   expect(stateOf("fetch_documents")).toBe("pending");
   expect(detailOf("fetch_documents").missing).toEqual(["OperatingAgreement"]);
 
-  const stored = documents.listByEntity(ENTITY_KEY)[0]!;
+  const stored = documents.listByCompany(COMPANY_KEY)[0]!;
   const bytes = docStore.getBytes(stored.path);
   const { createHash } = await import("node:crypto");
   // The indexed hash is the hash of the bytes on disk — the property PR 3 anchors on-chain.
@@ -237,9 +326,9 @@ test("documents are stored, hashed, and fetch_documents confirms only when BOTH 
   expect(stored.contentType).toBe("application/pdf");
 
   doola.state.documents.push(doolaDoc("d-oa", "OperatingAgreement"));
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   expect(stateOf("fetch_documents")).toBe("confirmed");
-  expect(documents.storedTypes(ENTITY_KEY).sort()).toEqual([
+  expect(documents.storedTypes(COMPANY_KEY).sort()).toEqual([
     "ArticlesOfOrganization",
     "OperatingAgreement",
   ]);
@@ -248,11 +337,11 @@ test("documents are stored, hashed, and fetch_documents confirms only when BOTH 
 test("an already-stored document is never re-downloaded", async () => {
   seedFormation();
   doola.state.documents = [doolaDoc("d-aoo", "ArticlesOfOrganization")];
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   const first = doola.calls.filter((c) => c.startsWith("getDocumentDownloadUrl")).length;
   expect(first).toBe(1);
 
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   expect(doola.calls.filter((c) => c.startsWith("getDocumentDownloadUrl"))).toHaveLength(first);
 });
 
@@ -263,19 +352,19 @@ test("one unreadable document does not stop the others from being stored", async
     doolaDoc("d-aoo", "ArticlesOfOrganization"),
   ];
   doola.state.failNext = { getDocumentDownloadUrl: true };
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   // The Articles of Organization are far too important to be blocked by a bad EIN letter.
-  expect(documents.storedTypes(ENTITY_KEY)).toEqual(["ArticlesOfOrganization"]);
+  expect(documents.storedTypes(COMPANY_KEY)).toEqual(["ArticlesOfOrganization"]);
   // The step is not failed — a document that did not arrive is a reason to poll again.
   expect(stateOf("fetch_documents")).toBe("pending");
 });
 
-test("await_ein confirms on the EIN and writes ein_real, never `ein`", async () => {
+test("await_ein confirms on the EIN and writes it on the COMPANY, never on entities.ein", async () => {
   seedFormation();
   doola.state.company = { doolaCompanyId: COMPANY_ID, ein: "12-3456789" };
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   expect(stateOf("await_ein")).toBe("confirmed");
-  expect(entity()?.einReal).toBe("12-3456789");
+  expect(company()?.ein).toBe("12-3456789");
   expect(entity()?.ein).toBe("STUB-NOT-FILED");
   // The EIN is a tax identifier: the audit event records THAT one was issued, not what it is.
   const ev = repo.listEvents(ENTITY_KEY).find((e) => e.step === "formationEin");
@@ -290,14 +379,14 @@ test("a FAILED formation parks every step that has not already succeeded", async
     doolaCompanyId: COMPANY_ID,
     services: [{ name: "Formation", status: "Failed" }],
   };
-  const out = await advanceFormation(deps(), ENTITY_KEY);
+  const out = await advanceFormation(deps(), COMPANY_KEY);
   expect(out).toMatchObject({ fetched: true, advanced: true });
   for (const step of ["await_filing", "fetch_documents", "await_ein"])
     expect(stateOf(step), step).toBe("failed");
   // `create_provider` succeeded — a company WAS created — and a later failure does not unmake it.
   expect(stateOf("create_provider")).toBe("confirmed");
   // Attempts were burned, which is what walks the sweeper toward the abandon verdict.
-  expect(requests.find(ENTITY_KEY, "await_filing")?.attempt).toBe(1);
+  expect(requests.find(COMPANY_KEY, "await_filing")?.attempt).toBe(1);
 });
 
 test("FAILED never overrules a step that already confirmed", async () => {
@@ -307,14 +396,14 @@ test("FAILED never overrules a step that already confirmed", async () => {
     formationFilingDate: "2026-08-19",
     formationFilingNumber: "WY-1",
   };
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   expect(stateOf("await_filing")).toBe("confirmed");
 
   doola.state.company = {
     doolaCompanyId: COMPANY_ID,
     formationSubmissionStatus: "FAILED",
   };
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   // Wyoming filed it. Nothing doola says later un-files it.
   expect(stateOf("await_filing")).toBe("confirmed");
   expect(stateOf("await_ein")).toBe("failed");
@@ -326,12 +415,12 @@ test("C3: a doola read failure records itself and backs off — it does NOT burn
   // eight bad minutes at doola could `abandon` a company Wyoming had already filed — and
   // `abandoned` is what erases the responsible party's personal data.
   seedFormation();
-  const before = requests.find(ENTITY_KEY, "await_filing")!;
+  const before = requests.find(COMPANY_KEY, "await_filing")!;
   doola.state.failNext = { getCompany: true };
-  const out = await advanceFormation(deps(), ENTITY_KEY);
+  const out = await advanceFormation(deps(), COMPANY_KEY);
   expect(out).toMatchObject({ fetched: false, advanced: false });
 
-  const after = requests.find(ENTITY_KEY, "await_filing")!;
+  const after = requests.find(COMPANY_KEY, "await_filing")!;
   // The state is unchanged, so no tenant surface renders this as a failed formation…
   expect(after.state).toBe(before.state);
   expect(after.attempt).toBe(before.attempt);
@@ -347,36 +436,42 @@ test("C3: one 502 then a healthy read — the status never shows `failed`, and t
   seedFormation();
   // Whatever put the row in `failed` (an older build, a doola-reported failure since resolved),
   // a successful read proves the reason no longer holds.
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "failed", { error: "boom" });
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "failed", { error: "boom" });
 
   doola.state.failNext = { getCompany: true };
-  await advanceFormation(deps(), ENTITY_KEY);
+  await advanceFormation(deps(), COMPANY_KEY);
   // The transient failure did not burn an attempt on the way through.
-  expect(requests.find(ENTITY_KEY, "await_filing")?.attempt).toBe(0);
+  expect(requests.find(COMPANY_KEY, "await_filing")?.attempt).toBe(0);
 
-  await advanceFormation(deps(), ENTITY_KEY);
-  const row = requests.find(ENTITY_KEY, "await_filing")!;
+  await advanceFormation(deps(), COMPANY_KEY);
+  const row = requests.find(COMPANY_KEY, "await_filing")!;
   expect(row.state).toBe("pending");
   expect(row.error).toBeNull();
-  expect(deriveFormationStatus(requests.stepsOf(ENTITY_KEY))).toBe("in_progress");
+  expect(deriveFormationStatus(requests.stepsOf(COMPANY_KEY))).toBe("in_progress");
 });
 
 // ── the guards ─────────────────────────────────────────────────────────────────────────────
 
-test("an entity pinned to another environment is refused WITHOUT a provider call (audit M5)", async () => {
-  seedFormation({ formationEnvironment: "production" });
-  const out = await advanceFormation(deps(), ENTITY_KEY);
+test("a COMPANY pinned to another environment is refused WITHOUT a provider call (audit M5)", async () => {
+  seedFormation();
+  // The pin that decides is the COMPANY's since the re-key: it owns the filing, and no entity
+  // need exist at all when the first poll runs.
+  db.prepare("UPDATE companies SET environment = 'production' WHERE company_id = ?").run(
+    COMPANY_KEY,
+  );
+  const out = await advanceFormation(deps(), COMPANY_KEY);
   expect(out).toMatchObject({ fetched: false, skipped: "environment_pin" });
-  // Nothing was called. A config flip cannot route a pinned entity at the other host.
+  // Nothing was called. A config flip cannot route a pinned company at the other host.
   expect(doola.calls).toHaveLength(0);
   // And nothing was failed: this is our misconfiguration, not the entity's problem.
   expect(stateOf("await_filing")).toBe("pending");
 });
 
-test("an entity with no company id yet is skipped — create_provider is the sweeper's job", async () => {
+test("a company with no doola id yet is skipped — create_provider is the sweeper's job", async () => {
+  seedCompany(companies);
   repo.upsert(formedEntity());
-  requests.claimAllSteps(ENTITY_KEY);
-  const out = await advanceFormation(deps(), ENTITY_KEY);
+  requests.claimAllSteps(COMPANY_KEY);
+  const out = await advanceFormation(deps(), COMPANY_KEY);
   expect(out).toMatchObject({ fetched: false, skipped: "no_provider_ref" });
   expect(doola.calls).toHaveLength(0);
 });
@@ -399,13 +494,13 @@ test("re-processing an already-processed event changes nothing (every transition
   });
 
   await processDoolaEvent(deps(), wake());
-  const after = entity();
+  const after = company();
   const filedEvents = () => repo.listEvents(ENTITY_KEY).filter((e) => e.step === "formationFiled");
   expect(filedEvents()).toHaveLength(1);
 
   await processDoolaEvent(deps(), wake());
   await processDoolaEvent(deps(), wake());
-  expect(entity()).toEqual(after);
+  expect(company()).toEqual(after);
   // The audit trail did not grow: the CAS lost, so the write inside it never ran.
   expect(filedEvents()).toHaveLength(1);
 });
@@ -421,7 +516,7 @@ test("a webhook task and a sweeper tick racing one entity advance it EXACTLY onc
   // DB-level (audit M13/20), and this is the assertion that says so.
   const [a, b] = await Promise.all([
     processDoolaEvent(deps(), wake()).then(() => "event"),
-    advanceFormation(deps(), ENTITY_KEY).then((o) => o.advanced),
+    advanceFormation(deps(), COMPANY_KEY).then((o) => o.advanced),
   ]);
   expect(a).toBe("event");
   expect(typeof b).toBe("boolean");
@@ -514,7 +609,7 @@ test("a required-actions-shaped event also reads required-actions, and stores co
   });
   // Unknown NAME, so the webhook path leaves it — the sweeper drives it. Drive the advance
   // directly with the flag the sweeper sets.
-  await advanceFormation(deps(), ENTITY_KEY, { requiredActions: true });
+  await advanceFormation(deps(), COMPANY_KEY, { requiredActions: true });
   expect(detailOf("await_filing").requiredActions).toEqual([
     { id: "ra-1", code: "FORMATION_NAME_OPTIONS_EXHAUSTED", status: "OPEN" },
   ]);
@@ -571,34 +666,34 @@ test("reading doola's company state", () => {
 
 test("currentPolledStep names the step an entity is actually waiting on", () => {
   seedFormation();
-  expect(currentPolledStep(requests.stepsOf(ENTITY_KEY))).toBe("await_filing");
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
-  expect(currentPolledStep(requests.stepsOf(ENTITY_KEY))).toBe("fetch_documents");
-  requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
-  expect(currentPolledStep(requests.stepsOf(ENTITY_KEY))).toBe("await_ein");
-  requests.transition(ENTITY_KEY, "await_ein", "pending", "confirmed");
-  expect(currentPolledStep(requests.stepsOf(ENTITY_KEY))).toBeUndefined();
+  expect(currentPolledStep(requests.stepsOf(COMPANY_KEY))).toBe("await_filing");
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
+  expect(currentPolledStep(requests.stepsOf(COMPANY_KEY))).toBe("fetch_documents");
+  requests.transition(COMPANY_KEY, "fetch_documents", "pending", "confirmed");
+  expect(currentPolledStep(requests.stepsOf(COMPANY_KEY))).toBe("await_ein");
+  requests.transition(COMPANY_KEY, "await_ein", "pending", "confirmed");
+  expect(currentPolledStep(requests.stepsOf(COMPANY_KEY))).toBeUndefined();
 });
 
 // ── F11 / F12: the shared fact predicates, and the filing-number heal ──────────────────────
 
 test("F11: the fact predicates are the ones every surface shares", () => {
   seedFormation();
-  const steps = () => requests.stepsOf(ENTITY_KEY);
+  const steps = () => requests.stepsOf(COMPANY_KEY);
   expect(providerRefOf(steps())).toBe(COMPANY_ID);
   expect(companyFiled(steps())).toBe(false);
   expect(documentsFetched(steps())).toBe(false);
   expect(einIssued(steps())).toBe(false);
 
-  requests.transition(ENTITY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
   expect(companyFiled(steps())).toBe(true);
   // …and the DERIVED status is built out of the same three, so a surface and the anchor trigger
   // can never disagree about what "filed" means.
   expect(deriveFormationStatus(steps())).toBe("filed");
 
-  requests.transition(ENTITY_KEY, "fetch_documents", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "fetch_documents", "pending", "confirmed");
   expect(documentsFetched(steps())).toBe(true);
-  requests.transition(ENTITY_KEY, "await_ein", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "await_ein", "pending", "confirmed");
   expect(einIssued(steps())).toBe(true);
   expect(deriveFormationStatus(steps())).toBe("complete");
 });
@@ -606,16 +701,16 @@ test("F11: the fact predicates are the ones every surface shares", () => {
 test("F12: a filing confirmed WITHOUT a number gains it on a later poll", async () => {
   seedFormation();
   // doola reports the formation service completed, but the state has not assigned a number yet.
-  // The step confirms on that signal alone — and the entity facts are written only inside the
+  // The step confirms on that signal alone — and the legal facts are written only inside the
   // CAS that confirms it, so the number used to have no way in, ever.
   doola.state.company = {
     doolaCompanyId: COMPANY_ID,
     services: [{ name: "Formation", status: "Completed" }],
   };
-  expect(await advanceFormation(deps(), ENTITY_KEY)).toMatchObject({ advanced: true });
+  expect(await advanceFormation(deps(), COMPANY_KEY)).toMatchObject({ advanced: true });
   expect(stateOf("await_filing")).toBe("confirmed");
-  expect(entity()?.formationFilingNumber).toBeNull();
-  expect(entity()?.formationFiledAt).toBeNull();
+  expect(company()?.filingNumber).toBeNull();
+  expect(company()?.filedAt).toBeNull();
 
   // The state assigns one. The next poll takes the confirmed→confirmed branch, which used to
   // refresh the `detail` blob and touch nothing else.
@@ -625,9 +720,9 @@ test("F12: a filing confirmed WITHOUT a number gains it on a later poll", async 
     formationFilingDate: "2026-08-19",
     formationFilingNumber: "2026-001234567",
   };
-  const healed = await advanceFormation(deps(), ENTITY_KEY);
-  expect(entity()?.formationFilingNumber).toBe("2026-001234567");
-  expect(entity()?.formationFiledAt).toBe(Math.floor(Date.parse("2026-08-19T00:00:00Z") / 1000));
+  const healed = await advanceFormation(deps(), COMPANY_KEY);
+  expect(company()?.filingNumber).toBe("2026-001234567");
+  expect(company()?.filedAt).toBe(Math.floor(Date.parse("2026-08-19T00:00:00Z") / 1000));
   // It is an ADVANCE: it is precisely the fact the anchor sub-saga is blocked on, so it must
   // reset the poll cadence and wake the fast path rather than wait for the next tick.
   expect(healed.advanced).toBe(true);
@@ -637,6 +732,6 @@ test("F12: a filing confirmed WITHOUT a number gains it on a later poll", async 
     doolaCompanyId: COMPANY_ID,
     services: [{ name: "Formation", status: "Completed" }],
   };
-  await advanceFormation(deps(), ENTITY_KEY);
-  expect(entity()?.formationFilingNumber).toBe("2026-001234567");
+  await advanceFormation(deps(), COMPANY_KEY);
+  expect(company()?.filingNumber).toBe("2026-001234567");
 });

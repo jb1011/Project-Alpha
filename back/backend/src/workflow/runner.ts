@@ -1,9 +1,17 @@
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import { ApiError } from "../errors";
-import { formationPartyUnavailableMessage } from "../formation";
+import {
+  companyAcceptsAgents,
+  companyAgentCapMessage,
+  companyUnavailableMessage,
+} from "../formation";
+import { deriveFormationStatus, formationSummary, hasLivePayment } from "../formation/status";
+import { opsLog } from "../observability/opsLog";
+import type { CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
+import type { FormationRepository } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
-import type { Address, EntityRecord, EntityStatus, FormationPin } from "../types";
+import type { Address, EntityRecord, EntityStatus } from "../types";
 
 export type RunSaga = (input: {
   spec: AgentSpec;
@@ -31,20 +39,35 @@ export class OnboardingRunner {
       /** S5 aggregate platform-outflow brake; absent in tests that predate it -> unmetered. */
       outflows?: { check(amountAtomic: bigint): void };
       /**
-       * doola formation (design §2): a DEPLOYMENT constant, so it is a runner dep rather than a
-       * per-call argument — no door has to learn about it. Absent (no doola credentials) = stub
-       * mode, `formation_provider` stays null.
+       * doola formation, re-keyed to COMPANIES (2026-08-26 §3).
        *
-       * It is what an entity WOULD be pinned to, not what every entity IS pinned to (C5): the pin
-       * is written only for a claim that also binds a party, in the same transaction, because a
-       * bound party is exactly what makes a filing happen. Stamping it here means the environment
-       * an entity is pinned to is fixed before anything can be filed for it (audit M5).
+       * The pin is no longer a deployment constant the runner stamps: it is COPIED FROM THE
+       * COMPANY ROW inside the claim transaction, so a company minted in sandbox can never become
+       * a production filing because a flag moved between its creation and an attach.
+       *
+       * Absent (no doola credentials) = stub mode: `company_id` and `formation_provider` stay
+       * null and nothing in the saga changes.
        */
-      formation?: FormationPin | null;
-      /** PII intake (design §5). Present only on a deployment that forms entities; the runner
-       *  binds a party to the entity key it mints, because the key is derived HERE and nowhere
-       *  else — a door that recomputed it would be a second definition of what an entity is. */
-      parties?: import("../persistence/formationPartyRepository").FormationPartyRepository;
+      formation?: {
+        companies: CompanyRepository;
+        requests: FormationRepository;
+        /** FORMATION_MAX_AGENTS_PER_COMPANY, re-checked inside the transaction. */
+        maxAgentsPerCompany: number;
+        /**
+         * The A1 SHIM (design §10): a party-only onboard — every caller that exists today —
+         * mints a 1:1 company for that party and attaches the new agent to it, so no client
+         * changes and nothing is left unfiled. Removed in A3, when the wizard learns to create
+         * a company of its own.
+         *
+         * It runs INSIDE the claim transaction: a 409 on the entity key must roll the company
+         * back with it, or a duplicate onboard would leave an orphan company holding a spent
+         * identity.
+         */
+        createCompanyForParty?: (
+          tenantId: string,
+          intake: { partyId: string; name: string },
+        ) => string;
+      };
     },
   ) {}
 
@@ -56,9 +79,12 @@ export class OnboardingRunner {
     /** Tier-0 custody choice, resolved by the caller (route/tool applies the platform default).
      *  Recorded on the claim so a restart resumes the RIGHT provider path. */
     custody?: "turnkey" | "circle";
-    /** Formation party handle, already validated by the door (owned + unbound). Bound to the
-     *  entity in the SAME transaction as the claim. */
+    /** Formation party handle, already validated by the door (owned + unbound). The A1 shim
+     *  turns it into a company inside the claim transaction. */
     partyId?: string;
+    /** ATTACH: an existing company this agent joins (design §3). Validated at the door and
+     *  re-validated by a CAS inside the claim transaction. */
+    companyId?: string;
   }): {
     id: string;
     status: EntityStatus;
@@ -94,33 +120,102 @@ export class OnboardingRunner {
       rootPasskeyId: p.guardianPasskey?.attestation?.credentialId ?? null,
       // Tier-0: custody is claimed here, immutably — the saga and the reconciler both read it.
       walletProvider: p.custody ?? null,
-      // Formation, the custody twin: pinned at the claim and never re-derived from config.
-      //
-      // Pinned IFF a party is bound (C5). The two are written by the same transaction below, so
-      // "pinned" and "has a legal identity to file with" are one fact rather than two that can
-      // disagree. An entity pinned with no party could never be filed and would burn eight
-      // attempts on its way to `abandoned`; a party bound to an unpinned entity would be a legal
-      // identity a caller handed over and nothing ever used.
-      formationProvider: p.partyId ? (this.deps.formation?.provider ?? null) : null,
-      formationEnvironment: p.partyId ? (this.deps.formation?.environment ?? null) : null,
+      // Formation, the custody twin: pinned at the claim and never re-derived from config. The
+      // pin and `company_id` are written together, below, from the COMPANY ROW — so "pinned" and
+      // "attached to a filing" are one fact rather than two that can disagree.
+      companyId: null,
+      formationProvider: null,
+      formationEnvironment: null,
     };
     // Atomic claim: the INSERT-or-nothing is the single gate. Two concurrent starts (or processes
     // racing the same key) can never both win — the loser sees changes()==0 and gets a 409, before
     // any on-chain side effect. Replaces the old non-atomic inFlight/find pre-check.
+    const f = this.deps.formation;
     const claim = () => {
-      if (!this.deps.repo.claimKey(initial))
+      // The A1 shim: a party-only onboard mints its own 1:1 company first, INSIDE this
+      // transaction, so a 409 below rolls it back rather than orphaning a spent identity.
+      const companyId =
+        p.companyId ??
+        (p.partyId && f?.createCompanyForParty
+          ? f.createCompanyForParty(p.tenantId, { partyId: p.partyId, name: p.spec.name })
+          : undefined);
+
+      // ── The ATTACH CAS (design §3). Re-read the company HERE, in the transaction, because the
+      //    door's check happened before it: a company abandoned, paid-for or filled to its agent
+      //    cap in between must lose, and losing means the whole claim rolls back.
+      let company:
+        | { provider: string; environment: EntityRecord["formationEnvironment"] }
+        | undefined;
+      /** What the filing looked like AT THE MOMENT OF ATTACH — the joining agent's history. */
+      let attachedSummary: string | undefined;
+      if (companyId && f) {
+        const fresh = f.companies.findOwned(p.tenantId, companyId);
+        const steps = f.requests.stepsOf(companyId);
+        if (
+          !fresh ||
+          !companyAcceptsAgents(
+            fresh,
+            deriveFormationStatus(steps),
+            hasLivePayment(f.companies, companyId),
+          )
+        )
+          throw new ApiError("validation_error", 400, companyUnavailableMessage());
+        if (f.companies.countAgents(companyId) >= f.maxAgentsPerCompany)
+          throw new ApiError("limit_exceeded", 400, companyAgentCapMessage(f.maxAgentsPerCompany));
+        // Pin fields FROM THE COMPANY ROW, never from config.
+        company = { provider: fresh.provider, environment: fresh.environment };
+        attachedSummary = JSON.stringify({
+          companyId,
+          ...formationSummary(fresh, steps),
+          // PRESENCE only, never the number: an EIN is a tax identifier, and the audit trail is
+          // the one place the processor deliberately keeps it out of (`formationEin` does the
+          // same). "Has one" is the fact an owner reading the history needs.
+          ein: Boolean(fresh.ein),
+        });
+      }
+
+      if (
+        !this.deps.repo.claimKey(
+          company
+            ? {
+                ...initial,
+                formationProvider: company.provider,
+                formationEnvironment: company.environment,
+              }
+            : initial,
+        )
+      )
         throw new ApiError("conflict", 409, `onboarding already exists for "${p.userKey}"`);
-      // Binding the party is part of the claim, not a follow-up: a crash between the two would
-      // leave an entity whose mandatory formation has no legal identity to file with, and a
-      // party the door still considers free. The bind is itself a CAS, so if another onboard won
-      // the party in between, THIS claim rolls back with it.
-      if (p.partyId && !this.deps.parties?.bind(p.partyId, id, p.tenantId))
-        throw new ApiError("validation_error", 400, formationPartyUnavailableMessage());
+
+      // WRITE-ONCE, and a separate statement on purpose: `attachCompany` is the only writer of
+      // `entities.company_id` anywhere, so the write-once rule lives in one CAS rather than in
+      // every caller's memory.
+      if (companyId && !this.deps.repo.attachCompany(id, companyId))
+        throw new ApiError("validation_error", 400, companyUnavailableMessage());
+      // The ops trail for sharing (§7). Ids only — a company id is an opaque handle, and nothing
+      // about the party behind it belongs in a log line. `shim` says whether this attach created
+      // the company it is attaching to, which is what tells A3 when the shim can be removed.
+      if (companyId) opsLog("company_attach", { companyId, entityKey: id, shim: !p.companyId });
+      // ONE event on the JOINING entity, carrying the filing as it stands right now (§3).
+      //
+      // The sub-saga's own events are fanned out at the moment each fact lands, over whichever
+      // agents are attached THEN. An agent that joins a company afterwards — the whole point of
+      // N:1 — was attached to a real, filed Wyoming LLC and had a completely empty formation
+      // history, because every event that describes that filing had already been written. This
+      // is the row that says what it joined.
+      //
+      // Gated on `p.companyId`, the SAME signal the `shim:` field above reads — not on the local
+      // `companyId`, which the A1 shim also fills in. A shim onboard did not JOIN anything: it
+      // created the 1:1 company it is attached to, milliseconds ago, and there is no prior
+      // history for this event to describe. Recording one there wrote a spurious
+      // `status: "none"` row on every party-only onboard, which is every client that exists.
+      if (p.companyId && attachedSummary)
+        this.deps.repo.recordEvent(id, "formationAttached", "pending", null, attachedSummary);
     };
-    // Only formation takes the transaction: without a party there is exactly one write, and
-    // every pre-formation caller (including the tests that hand in a repo stub) keeps its
-    // existing single-statement path.
-    if (p.partyId) this.deps.repo.transaction(claim);
+    // Only formation takes the transaction: without a company or a party there is exactly one
+    // write, and every pre-formation caller (including the tests that hand in a repo stub) keeps
+    // its existing single-statement path.
+    if (p.partyId || p.companyId) this.deps.repo.transaction(claim);
     else claim();
     this.run(id, () =>
       this.deps.runSaga({

@@ -15,9 +15,12 @@ import { privateKeyToAccount } from "viem/accounts";
 import { createSiweMessage } from "viem/siwe";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
+import { ApiError } from "../../src/api/errors";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { createCompany } from "../../src/formation/company";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
@@ -80,14 +83,41 @@ function makeApp(
   formation?: { required?: boolean; syntheticPii?: boolean; maxPerTenant?: number },
   custody: { circle?: boolean } = {},
 ) {
+  const companies = new SqliteCompanyRepository(db);
+  const requests = new SqliteFormationRepository(db);
+  const pin = { provider: "doola" as const, environment: "sandbox" as const };
+  // ONE dependency set for all three doors, exactly as the composition root builds it — only the
+  // transaction differs per call site.
+  const companyDeps = {
+    companies,
+    parties,
+    requests,
+    pin,
+    sandboxSyntheticPii: formation?.syntheticPii ?? false,
+    maxPerTenant: formation?.maxPerTenant ?? 3,
+    dailyCeiling: 10,
+  };
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
-    parties,
-    // What this deployment WOULD pin to. Whether an entity takes it is decided by the claim,
-    // which pins iff a party is bound (C5) — never by `required`.
-    formation: formation ? { provider: "doola" as const, environment: "sandbox" as const } : null,
+    // The claim attaches a company and copies the pin off ITS row (2026-08-26 §3); the A1 shim
+    // is what turns a party-only onboard into one.
+    formation: formation
+      ? {
+          companies,
+          requests,
+          maxAgentsPerCompany: 10,
+          createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
+            const result = createCompany({ ...companyDeps, transaction: (fn) => fn() }, tenantId, {
+              ...intake,
+              synthetic: formation.syntheticPii ? true : undefined,
+            });
+            if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+            return result.companyId;
+          },
+        }
+      : undefined,
   });
   return buildApiApp({
     webOrigin: "*",
@@ -107,10 +137,15 @@ function makeApp(
           sandboxSyntheticPii: formation.syntheticPii ?? false,
           maxPerTenant: formation.maxPerTenant ?? 3,
           dailyCeiling: 10,
+          maxAgentsPerCompany: 10,
           parties,
-          requests: new SqliteFormationRepository(db),
+          requests,
+          companies,
+          pin,
+          companyDeps,
         }
       : undefined,
+    companies,
     repo,
     runner,
     passkeyRpId: DOMAIN,
@@ -300,7 +335,7 @@ test("REQUIRED: a valid party onboards and is BOUND to the entity the claim mint
   });
   expect(res.status).toBe(202);
   const { id } = await res.json();
-  expect(parties.findByEntityKey(id)!.partyId).toBe(partyId);
+  expect(parties.findByCompanyId(repo.findByIdempotencyKey(id)!.companyId!)!.partyId).toBe(partyId);
 
   // Single use: the same handle cannot file a second company.
   const second = await post(app, "/onboard", token, {
@@ -331,7 +366,7 @@ test("C5: NOT required + a party — the entity is PINNED and the party is bound
   const { id } = await res.json();
   const rec = repo.findByIdempotencyKey(id)!;
   expect([rec.formationProvider, rec.formationEnvironment]).toEqual(["doola", "sandbox"]);
-  expect(parties.findByEntityKey(id)!.partyId).toBe(partyId);
+  expect(parties.findByCompanyId(rec.companyId!)!.partyId).toBe(partyId);
 });
 
 test("C5: NOT required + the WIZARD's shape (no partyId) — 202, and nothing is pinned or filed", async () => {
@@ -370,9 +405,10 @@ test("the tenant QUOTA refuses the onboard before the entity is minted", async (
       partyId: first.partyId,
     })
   ).json();
-  // The first entity's create_provider row is what burns the quota.
-  db.prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)").run(
-    id,
+  // The first COMPANY's create_provider row is what burns the door's quota (the company row it
+  // was minted with already burns `createCompany`'s).
+  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
+    repo.findByIdempotencyKey(id)!.companyId!,
     "create_provider",
     "pending",
   );
@@ -427,4 +463,150 @@ test("no PII reaches the entity record or its spec_json", async () => {
   const printed = JSON.stringify(rec);
   for (const forbidden of ["Ada", "Lovelace", "ada@example.com", "Analytical", "82001", partyId])
     expect(printed).not.toContain(forbidden);
+});
+
+// ── COMPANIES (design 2026-08-26 §7) ────────────────────────────────────────────────────────
+
+test("POST /companies mints a company through the ONE domain function, and lists it back", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+
+  const res = await post(app, "/companies", token, { partyId, name: "Acme Robotics LLC" });
+  expect(res.status).toBe(201);
+  const { companyId } = await res.json();
+  expect(companyId).toBeTruthy();
+
+  const list = await (
+    await app.request("/companies", { headers: { authorization: `Bearer ${token}` } })
+  ).json();
+  expect(list.companies).toHaveLength(1);
+  // The projection's key set, asserted IDENTICALLY on the MCP door (see
+  // test/mcp/formationParty.int.test.ts): one API-level contract, two surfaces, and a field added
+  // to one and not the other fails whichever was forgotten.
+  expect(Object.keys(list.companies[0]).sort()).toEqual([
+    "agents",
+    "businessPurpose",
+    "companyId",
+    "createdAt",
+    "environment",
+    "filedAt",
+    "filingNumber",
+    "formationStatus",
+    "industryLabel",
+    "legalNameFiled",
+    "nameOptions",
+    "paying",
+    "status",
+    "synthetic",
+  ]);
+  expect(list.companies[0]).toMatchObject({
+    companyId,
+    status: "ready",
+    environment: "sandbox",
+    // DERIVED, both of them: nothing about progress or payment is stored on the company row.
+    formationStatus: "none",
+    paying: false,
+    agents: 0,
+    nameOptions: [{ name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 }],
+  });
+  // NO PII on the list, ever — not the responsible party's name, not their email.
+  const printed = JSON.stringify(list);
+  for (const forbidden of ["Ada", "Lovelace", "ada@example.com", "82001"])
+    expect(printed).not.toContain(forbidden);
+});
+
+test("POST /companies requires a partyId and a name, and needs a session", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  expect((await post(app, "/companies", token, { name: "Acme" })).status).toBe(400);
+  expect((await post(app, "/companies", token, { partyId: "p" })).status).toBe(400);
+  const anon = await app.request("/companies", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ partyId: "p", name: "Acme" }),
+  });
+  expect(anon.status).toBe(401);
+});
+
+test("a deployment that forms nothing answers 503 on POST and an empty list on GET", async () => {
+  const app = makeApp(undefined);
+  const token = await login(app);
+  const res = await post(app, "/companies", token, { partyId: "p", name: "Acme" });
+  expect(res.status).toBe(503);
+  const list = await (
+    await app.request("/companies", { headers: { authorization: `Bearer ${token}` } })
+  ).json();
+  expect(list).toEqual({ companies: [] });
+});
+
+test("ATTACH: onboard takes a companyId, and a second agent joins the SAME filing", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, name: "Acme Robotics LLC" })
+  ).json();
+
+  for (const name of ["Agent One", "Agent Two"]) {
+    const res = await post(app, "/onboard", token, {
+      spec: { ...SPEC, name },
+      guardianPasskey: PASSKEY,
+      companyId,
+    });
+    expect(res.status).toBe(202);
+    const { id } = await res.json();
+    // The pin is copied FROM THE COMPANY ROW, never from config.
+    expect(repo.findByIdempotencyKey(id)).toMatchObject({
+      companyId,
+      formationProvider: "doola",
+      formationEnvironment: "sandbox",
+    });
+  }
+  // Billing is per COMPANY: the second agent is free, and there is still ONE party bound.
+  expect(repo.listByTenant(account.address)).toHaveLength(2);
+});
+
+test("onboard refuses BOTH handles at once — which identity would the filing be under?", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, name: "Acme Robotics LLC" })
+  ).json();
+  const second = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const res = await post(app, "/onboard", token, {
+    spec: SPEC,
+    guardianPasskey: PASSKEY,
+    companyId,
+    partyId: second.partyId,
+  });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error.message).toMatch(/not both/);
+});
+
+test("a FOREIGN company id is refused with the same message as an unknown one", async () => {
+  const app = makeApp({ required: true });
+  const mine = await login(app);
+  const theirs = await login(app, other);
+  const { partyId } = await (await post(app, "/formation-party", theirs, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", theirs, { partyId, name: "Theirs LLC" })
+  ).json();
+
+  const foreign = await post(app, "/onboard", mine, {
+    spec: SPEC,
+    guardianPasskey: PASSKEY,
+    companyId,
+  });
+  const unknown = await post(app, "/onboard", mine, {
+    spec: SPEC,
+    guardianPasskey: PASSKEY,
+    companyId: "00000000-0000-4000-8000-000000000000",
+  });
+  expect([foreign.status, unknown.status]).toEqual([400, 400]);
+  // Identical: the door is not an existence oracle over another tenant's company ids.
+  expect((await foreign.json()).error.message).toBe((await unknown.json()).error.message);
+  // …and the OTHER tenant's company is untouched.
+  expect(repo.listByTenant(account.address)).toHaveLength(0);
 });

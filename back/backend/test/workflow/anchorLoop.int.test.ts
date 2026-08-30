@@ -32,6 +32,7 @@ import {
   parseManifest,
   serializeManifestBytes,
 } from "../../src/oa/manifest";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import {
   SqliteDocumentIndexRepository,
@@ -91,6 +92,7 @@ let guardianWallet: WalletClient;
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 let requests: SqliteFormationRepository;
+let companies: SqliteCompanyRepository;
 let documents: SqliteDocumentIndexRepository;
 let anchors: SqliteOaAnchorRepository;
 let docStore: MemoryDocumentStore;
@@ -100,6 +102,7 @@ let seq = 0;
 function deps(): AnchorLoopDeps {
   return {
     repo,
+    companies,
     requests,
     documents,
     docStore,
@@ -169,8 +172,23 @@ async function mintAnchoredEntity(): Promise<{ key: string; v1Hash: Hex; rec: En
     },
   });
 
+  // The company id is the entity key here, deliberately: this suite drives ONE agent per filing
+  // through real chain calls, and keeping the two ids equal keeps every assertion readable.
+  companies.create({
+    companyId: key,
+    tenantId: "tenant-a",
+    status: "ready",
+    provider: "doola",
+    environment: "sandbox",
+    synthetic: false,
+    nameOptions: [{ name: `Anchor ${seq}`, entityTypeEnding: "LLC", position: 1 }],
+    businessPurpose: "purpose",
+    industryLabel: "Software development",
+    intakeSynthesized: true,
+  });
   const rec = formedEntity({
     idempotencyKey: key,
+    companyId: key,
     publicId: `pub-${seq}`,
     manager: manager.address,
     guardian: guardianAcct.address,
@@ -191,19 +209,32 @@ async function mintAnchoredEntity(): Promise<{ key: string; v1Hash: Hex; rec: En
   return { key, v1Hash, rec };
 }
 
+/**
+ * Age the company's facts past the settling window (2026-08-26 §3).
+ *
+ * A cycle is not OPENED while the facts are younger than one sweep interval, so that facts
+ * landing together fold into ONE amendment per agent. A real filing's facts are minutes old by
+ * the time an anchor pass sees them; the fixture says so explicitly rather than racing the gate.
+ */
+function settleFacts(key: string): void {
+  db.prepare(
+    "UPDATE formation_requests SET facts_updated_at = datetime('now','-1 hour') WHERE company_id = ?",
+  ).run(key);
+}
+
 /** The v2 trigger: the state filed the company and both required documents are indexed. */
 function confirmFiling(key: string): void {
   requests.transition(key, "await_filing", "pending", "confirmed");
   requests.transition(key, "fetch_documents", "pending", "confirmed");
-  const rec = repo.findByIdempotencyKey(key)!;
-  repo.upsert({ ...rec, formationFiledAt: 1_755_600_000, formationFilingNumber: "2026-0001" });
+  companies.recordFilingFacts(key, { filedAt: 1_755_600_000, filingNumber: "2026-0001" });
+  settleFacts(key);
   for (const [type, sha] of [
     ["ArticlesOfOrganization", "a".repeat(64)],
     ["OperatingAgreement", "b".repeat(64)],
   ] as const)
     documents.insert({
       id: documentIndexId(key, type),
-      entityKey: key,
+      companyId: key,
       docType: type,
       sha256: sha,
       contentType: "application/pdf",
@@ -234,6 +265,7 @@ beforeEach(async () => {
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
+  companies = new SqliteCompanyRepository(db);
   requests = new SqliteFormationRepository(db);
   documents = new SqliteDocumentIndexRepository(db);
   anchors = new SqliteOaAnchorRepository(db);
@@ -314,7 +346,8 @@ test("A-int-2: a real guardian veto parks the pipeline; liftVeto resumes it", as
 
   // The whole pipeline is parked: new facts do NOT get routed around the guardian.
   requests.transition(key, "await_ein", "pending", "confirmed");
-  repo.upsert({ ...repo.findByIdempotencyKey(key)!, einReal: "88-1234567" });
+  companies.recordEin(key, "88-1234567");
+  settleFacts(key);
   expect(await advanceAnchor(deps(), key)).toMatchObject({ skipped: "hold_park" });
   expect(anchors.versionsOf(key).map((c) => c.version)).toEqual([2]);
 

@@ -16,6 +16,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { signSession } from "../../src/auth/session";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import {
   SqliteDocumentIndexRepository,
@@ -24,7 +25,13 @@ import {
 } from "../../src/persistence/documentIndexRepository";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
-import { ENTITY_KEY, MemoryDocumentStore, formedEntity } from "../helpers/formationFakes";
+import {
+  COMPANY_KEY,
+  ENTITY_KEY,
+  MemoryDocumentStore,
+  formedEntity,
+  seedCompany,
+} from "../helpers/formationFakes";
 import { startMcpTestClient } from "./helpers";
 
 const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
@@ -33,6 +40,7 @@ const PDF = Buffer.from("%PDF-1.7\nArticles\n");
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
+let companies: SqliteCompanyRepository;
 let documents: SqliteDocumentIndexRepository;
 let requests: SqliteFormationRepository;
 let apiKeys: SqliteApiKeyStore;
@@ -42,6 +50,8 @@ beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
+  companies = new SqliteCompanyRepository(db);
+  seedCompany(companies);
   documents = new SqliteDocumentIndexRepository(db);
   requests = new SqliteFormationRepository(db);
   apiKeys = new SqliteApiKeyStore(db);
@@ -53,7 +63,9 @@ function app() {
   // The composition root builds these ONCE and hands the same object to both surfaces; this is
   // the same object, spread the same way.
   const entityViewDeps = {
-    formationSteps: (k: string) => requests.stepsOf(k),
+    formationSteps: (companyId: string) => requests.stepsOf(companyId),
+    company: (companyId: string) => companies.find(companyId),
+    companies,
     documents,
   };
   return buildApiApp({
@@ -67,11 +79,11 @@ function app() {
 }
 
 function storeDoc(docId: string, docType: string) {
-  const path = documentStoreName(ENTITY_KEY, docType, docId);
+  const path = documentStoreName(COMPANY_KEY, docType, docId);
   docStore.putBytes(path, PDF);
   documents.insert({
-    id: documentIndexId(ENTITY_KEY, docId),
-    entityKey: ENTITY_KEY,
+    id: documentIndexId(COMPANY_KEY, docId),
+    companyId: COMPANY_KEY,
     docType,
     sha256: "a".repeat(64),
     contentType: "application/pdf",
@@ -83,8 +95,8 @@ function storeDoc(docId: string, docType: string) {
 
 test("C8: MCP get_entity lists the SAME documents as REST", async () => {
   repo.upsert(formedEntity({ ownerTenantId: OWNER }));
-  requests.claimAllSteps(ENTITY_KEY);
-  requests.transition(ENTITY_KEY, "create_provider", "pending", "confirmed", {
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
     providerRef: "cmp-1",
   });
   storeDoc("d-aoo", "ArticlesOfOrganization");

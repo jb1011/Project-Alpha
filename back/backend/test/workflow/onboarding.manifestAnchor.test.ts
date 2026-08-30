@@ -24,6 +24,7 @@ import {
   serializeManifest,
   serializeManifestBytes,
 } from "../../src/oa/manifest";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -330,11 +331,30 @@ test("F1 KEYSTONE: a legacy 'translating' row with NO create tx keeps the legacy
 
 // ── Formation pinning (custody twin) ────────────────────────────────────────────────────────
 
-/** The M3 formation object: the pin AND the filer, so a root cannot supply one without the other.
- *  A party bound to the key is what makes a FRESH record take the pin at all (C5). */
-function formationDeps(environment: "sandbox" | "production", bind = true) {
+/**
+ * The M3 formation object: the client AND the repositories, so a root cannot supply one without
+ * the others.
+ *
+ * `attach` is what makes a record pinned at all since the re-key (2026-08-26 §3): the pin is
+ * COPIED FROM THE COMPANY ROW inside the claim transaction, so an entity attached to nothing is a
+ * stub whatever the deployment is configured for.
+ */
+function formationDeps(environment: "sandbox" | "production", attach = true) {
   const parties = new SqliteFormationPartyRepository(db);
-  if (bind) {
+  const companies = new SqliteCompanyRepository(db);
+  if (attach && !companies.find("company-A")) {
+    companies.create({
+      companyId: "company-A",
+      tenantId: "t1",
+      status: "ready",
+      provider: "doola",
+      environment,
+      synthetic: false,
+      nameOptions: [{ name: "Anchor", entityTypeEnding: "LLC", position: 1 }],
+      businessPurpose: "purpose",
+      industryLabel: "Software development",
+      intakeSynthesized: true,
+    });
     const partyId = parties.create({
       tenantId: "t1",
       legalFirstName: "Ada",
@@ -349,30 +369,64 @@ function formationDeps(environment: "sandbox" | "production", bind = true) {
       country: "USA",
       synthetic: false,
     });
-    parties.bind(partyId, "anchor-A", "t1");
+    parties.bindToCompany(partyId, "company-A", "t1");
   }
   return {
     formation: {
-      pin: { provider: "doola" as const, environment },
       // The saga only reaches the filing step through these; the anchor tests never get there.
       doola: {} as never,
       requests: new SqliteFormationRepository(db),
       parties,
+      companies,
       environment,
     },
   };
 }
 
-test("formation provider + environment are pinned from config on a FRESH record", async () => {
+/** The claim's job — attach the company and copy its pin — which these tests reach
+ *  `runOnboarding` without going through. */
+function claimAttached(environment: "sandbox" | "production"): void {
+  formationDeps(environment);
+  repo.claimKey({
+    idempotencyKey: "anchor-A",
+    name: spec.name,
+    status: "pending",
+    manager: spec.roles.manager as `0x${string}`,
+    guardian: spec.roles.guardian as `0x${string}`,
+    operator: null,
+    amendmentDelay: "0",
+    ein: "",
+    formationDate: 0,
+    oaHash: null,
+    metadataURI: null,
+    docPath: null,
+    treasuryConfig: null,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: "t1",
+    specJson: JSON.stringify(spec),
+    companyId: "company-A",
+    formationProvider: "doola",
+    formationEnvironment: environment,
+  });
+}
+
+test("an entity ATTACHED to a company carries that company's pin through the saga", async () => {
+  claimAttached("sandbox");
   const rec = await runOnboarding(deps(makeFakeArc(), formationDeps("sandbox")));
+  expect(rec.companyId).toBe("company-A");
   expect(rec.formationProvider).toBe("doola");
   expect(rec.formationEnvironment).toBe("sandbox");
   expect(repo.findByIdempotencyKey("anchor-A")?.formationEnvironment).toBe("sandbox");
 });
 
-test("C5: no party bound means no pin, even with the provider fully wired", async () => {
-  // The opt-in semantic: an entity is pinned iff a formation party is bound to it. A wizard
-  // submission that carries no partyId is a stub, on every deployment, and it files nothing.
+test("C5: no company attached means no pin, even with the provider fully wired", async () => {
+  // The opt-in semantic, re-keyed: an entity is pinned iff it is attached to a company. A wizard
+  // submission that carries no handle is a stub, on every deployment, and it files nothing.
   const rec = await runOnboarding(deps(makeFakeArc(), formationDeps("sandbox", false)));
   expect(rec.formationProvider).toBeNull();
   expect(rec.formationEnvironment).toBeNull();
@@ -388,6 +442,7 @@ test("a credential-less deployment leaves the pair NULL — stub mode, nothing e
 
 test("a PERSISTED environment wins over config — a flip cannot re-point an in-flight entity", async () => {
   // Claim the row pinned to sandbox…
+  claimAttached("sandbox");
   await runOnboarding(deps(makeFakeArc(), formationDeps("sandbox")));
   // …then resume the SAME key on a deployment that now says production (the mainnet flip).
   const rec = await runOnboarding(deps(makeFakeArc(), formationDeps("production", false)));

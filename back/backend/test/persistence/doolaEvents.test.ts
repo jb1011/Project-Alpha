@@ -71,48 +71,48 @@ test("retention: rows older than the cutoff are deleted, newer ones are kept", (
 // ── the document index ─────────────────────────────────────────────────────────────────────
 
 test("the document id is DERIVED, so re-indexing the same doola document is a no-op", () => {
-  const entityKey = "t:agent-1";
-  const id = documentIndexId(entityKey, "doc-aoo");
+  const companyId = "company-1";
+  const id = documentIndexId(companyId, "doc-aoo");
   expect(id).toMatch(/^[0-9a-f]{32}$/);
-  // Deterministic across calls, and scoped to the entity.
-  expect(documentIndexId(entityKey, "doc-aoo")).toBe(id);
-  expect(documentIndexId("t:agent-2", "doc-aoo")).not.toBe(id);
+  // Deterministic across calls, and scoped to the COMPANY.
+  expect(documentIndexId(companyId, "doc-aoo")).toBe(id);
+  expect(documentIndexId("company-2", "doc-aoo")).not.toBe(id);
 
   const rec = {
     id,
-    entityKey,
+    companyId,
     docType: "ArticlesOfOrganization",
     sha256: "a".repeat(64),
     contentType: "application/pdf",
     size: 1234,
     providerDocId: "doc-aoo",
-    path: documentStoreName(entityKey, "ArticlesOfOrganization", "doc-aoo"),
+    path: documentStoreName(companyId, "ArticlesOfOrganization", "doc-aoo"),
   };
   expect(docs.insert(rec)).toBe(true);
   expect(docs.insert(rec)).toBe(false);
-  expect(docs.listByEntity(entityKey)).toHaveLength(1);
-  expect(docs.storedTypes(entityKey)).toEqual(["ArticlesOfOrganization"]);
-  expect(docs.findByProviderDocId(entityKey, "doc-aoo")?.id).toBe(id);
+  expect(docs.listByCompany(companyId)).toHaveLength(1);
+  expect(docs.storedTypes(companyId)).toEqual(["ArticlesOfOrganization"]);
+  expect(docs.findByProviderDocId(companyId, "doc-aoo")?.id).toBe(id);
 });
 
-test("findOwned re-asserts the entity, so one entity's document id cannot read another's", () => {
-  const mine = { entityKey: "t:mine", providerDocId: "d1" };
-  const theirs = { entityKey: "t:theirs", providerDocId: "d2" };
+test("findOwned re-asserts the company, so one company's document id cannot read another's", () => {
+  const mine = { companyId: "company-mine", providerDocId: "d1" };
+  const theirs = { companyId: "company-theirs", providerDocId: "d2" };
   for (const e of [mine, theirs])
     docs.insert({
-      id: documentIndexId(e.entityKey, e.providerDocId),
-      entityKey: e.entityKey,
+      id: documentIndexId(e.companyId, e.providerDocId),
+      companyId: e.companyId,
       docType: "OperatingAgreement",
       sha256: "b".repeat(64),
       contentType: "application/pdf",
       size: 10,
       providerDocId: e.providerDocId,
-      path: documentStoreName(e.entityKey, "OperatingAgreement", e.providerDocId),
+      path: documentStoreName(e.companyId, "OperatingAgreement", e.providerDocId),
     });
 
-  const theirId = documentIndexId(theirs.entityKey, theirs.providerDocId);
-  expect(docs.findOwned(theirs.entityKey, theirId)).toBeDefined();
-  expect(docs.findOwned(mine.entityKey, theirId)).toBeUndefined();
+  const theirId = documentIndexId(theirs.companyId, theirs.providerDocId);
+  expect(docs.findOwned(theirs.companyId, theirId)).toBeDefined();
+  expect(docs.findOwned(mine.companyId, theirId)).toBeUndefined();
 });
 
 test("a provider-controlled documentType can never become a path", () => {

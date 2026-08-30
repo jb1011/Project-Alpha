@@ -10,7 +10,16 @@ import type {
   DoolaCompany,
   DoolaEnvironment,
 } from "../adapters/doola/types";
+import {
+  type CompanyNameOption,
+  DEFAULT_DESCRIPTION,
+  DEFAULT_INDUSTRY,
+  FORMATION_ENTITY_TYPE,
+  FORMATION_STATE,
+  companyNameOptions,
+} from "../formation/intake";
 import { opsLog } from "../observability/opsLog";
+import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type {
   FormationPartyRecord,
@@ -23,9 +32,12 @@ import {
   SqliteFormationRepository,
   parseDetail,
 } from "../persistence/formationRepository";
-import type { AgentSpec } from "../policy/agentSpec";
-import type { EntityRecord } from "../types";
-import { failFormationStep, logFormationStep, parkFormationStep } from "./formationStep";
+import {
+  failFormationStep,
+  logFormationStep,
+  parkFormationStep,
+  recordCompanyEvent,
+} from "./formationStep";
 
 /**
  * The `create_provider` step of the formation sub-saga (design §5, audit H5 / M5, completeness 9).
@@ -81,47 +93,45 @@ export interface CreateProviderDetail {
 }
 
 export interface FormationCreateDeps {
-  entityKey: string;
-  rec: EntityRecord;
-  spec: AgentSpec;
+  /** The COMPANY being filed. The saga runs once per company, whatever number of agents (zero
+   *  included) happen to be attached to it. */
+  company: CompanyRecord;
+  companies: CompanyRepository;
+  /** Still here for the ENTITY AUDIT TRAIL and for the transaction primitive. Every attached
+   *  agent gets the same event; a company with no agents attached simply gets none. */
   repo: EntityRepository;
   requests: FormationRepository;
   parties: FormationPartyRepository;
   doola: DoolaApi;
-  /** The environment THIS DEPLOYMENT is configured for. Compared against the entity's pin. */
+  /** The environment THIS DEPLOYMENT is configured for. Compared against the company's pin. */
   environment: DoolaEnvironment;
 }
 
 /**
- * We form Wyoming LLCs. Both are constants rather than spec fields on purpose: the jurisdiction
- * is a product decision, and a caller-chosen state would file into a legal regime the OA, the
- * treasury contracts and the compliance calendar were not written for.
- *
- * EXPORTED for the anchor loop (design §7): the manifest's `legal.entityType`/`legal.state` must
- * be the values we FILED with, and re-typing them there would be a second source of truth for a
- * fact that gets hashed onto the chain. Reading them back off a doola response instead would put
- * a provider-controlled string inside the anchor.
+ * The jurisdiction constants and the intake defaults now live in `formation/intake.ts`, because
+ * the DATABASE MIGRATION synthesizes a company with the same values and a persistence module must
+ * not reach up into the workflow layer for them. Re-exported here so the anchor loop — which must
+ * import `legal.entityType`/`legal.state` from the FILER rather than re-typing them, or reading
+ * them back off a provider response — keeps its existing import.
  */
-export const FORMATION_STATE = "WY";
-export const FORMATION_ENTITY_TYPE = "LLC";
+export { FORMATION_STATE, FORMATION_ENTITY_TYPE, companyNameOptions, DEFAULT_INDUSTRY };
 
-/** A NAICS `industry` label from `GET /v1/partner/references/naics-codes` (verified live
- *  2026-08-21; maps to 541511). `industry` or `naicsCode` is REQUIRED by the create. */
-const DEFAULT_INDUSTRY = "Software development";
-
-/** `description` is REQUIRED by the create. The spec's own description wins when the caller
- *  wrote one; this is the fallback, and it is deliberately a true statement about the entity. */
-const DEFAULT_DESCRIPTION =
-  "An autonomous software agent operating under an on-chain governed operating agreement.";
-
-/** The refusal when the entity's pinned environment is not this deployment's (audit M5). It is
+/** The refusal when the company's pinned environment is not this deployment's (audit M5). It is
  *  its own distinct sentence because it must never read as a doola failure: nothing was called. */
 export function environmentPinMismatchError(pinned: string | null, deployment: string): string {
   return `formation environment pin mismatch: this entity is pinned to "${pinned ?? "none"}" and this deployment runs "${deployment}" — refusing to call doola`;
 }
 
 export function noFormationPartyError(): string {
-  return "no formation party is bound to this entity — nothing can be filed without a legal identity";
+  return "no formation party is bound to this company — nothing can be filed without a legal identity";
+}
+
+/** The refusal when the company's stored intake carries NO name candidates — an empty or
+ *  unreadable `name_options` blob. Its own sentence, like the pin mismatch, because nothing was
+ *  called and nothing is wrong with doola: the ROW is unreadable, and a filing must never invent
+ *  the name it asks the state for. */
+export function noNameOptionsError(): string {
+  return "the company's stored name candidates are empty or unreadable — refusing to file, because a filing must never invent the name it asks the state for";
 }
 
 /** doola REQUIRES a phone on a natural person's address (live sandbox, 2026-08-21). Refused
@@ -142,13 +152,6 @@ export function isNonUsResponsibleParty(p: { ssn?: string | null; country: strin
   return !p.ssn && p.country.toUpperCase() !== "USA";
 }
 
-/** The company name doola files, WITHOUT its entity ending (`entityTypeEnding` carries that).
- *  A trailing "LLC" in the agent's name would otherwise be filed as "Acme LLC LLC". */
-export function companyNameOptions(specName: string): { name: string; entityTypeEnding: string }[] {
-  const base = specName.replace(/[\s,]+(l\.?l\.?c\.?)$/i, "").trim() || specName.trim();
-  return [{ name: base, entityTypeEnding: FORMATION_ENTITY_TYPE }];
-}
-
 /**
  * The two idempotency keys of one attempt — one per ENDPOINT (C1 hardening).
  *
@@ -157,18 +160,18 @@ export function companyNameOptions(specName: string): { name: string; entityType
  * shape our own traffic could produce. Suffixing costs nothing and removes the ambiguity.
  */
 export function createProviderKeys(
-  entityKey: string,
+  companyId: string,
   attempt: number,
 ): { customer: string; company: string } {
   return {
     customer: SqliteFormationRepository.idempotencyKey(
-      entityKey,
+      companyId,
       "create_provider",
       attempt,
       "customer",
     ),
     company: SqliteFormationRepository.idempotencyKey(
-      entityKey,
+      companyId,
       "create_provider",
       attempt,
       "company",
@@ -191,12 +194,12 @@ function toDoolaAddress(p: FormationPartyRecord): DoolaAddress {
 }
 
 function logStep(
-  entityKey: string,
+  companyId: string,
   state: FormationState,
   attempt: number,
   extra: Record<string, unknown> = {},
 ): void {
-  logFormationStep(entityKey, "create_provider", state, attempt, extra);
+  logFormationStep(companyId, "create_provider", state, attempt, extra);
 }
 
 /**
@@ -206,14 +209,15 @@ function logStep(
  * here is to carry on.
  */
 export async function runFormationCreateProvider(d: FormationCreateDeps): Promise<void> {
-  const { entityKey, requests } = d;
+  const { requests } = d;
+  const companyId = d.company.companyId;
   try {
     // All four steps, in one transaction (the bridge-legs pattern): "is a formation in flight for
     // this entity?" then reads rows that provably all exist, instead of guessing which of them a
     // crash created. Idempotent — a resume claims nothing and finds everything.
-    requests.claimAllSteps(entityKey);
+    requests.claimAllSteps(companyId);
 
-    const row = requests.find(entityKey, "create_provider");
+    const row = requests.find(companyId, "create_provider");
     if (!row) return; // unreachable after claimAllSteps; a missing row is never a reason to file
     if (row.state === "confirmed") return;
     // `abandoned` is the sweeper's terminal verdict (part B). The saga does not overrule it.
@@ -224,7 +228,7 @@ export async function runFormationCreateProvider(d: FormationCreateDeps): Promis
     // The last line of defense. Everything below already handles its own failures, so reaching
     // here means the BOOKKEEPING itself failed — and even that must not fail an onboarding.
     opsLog("formation_create_failed", {
-      entityKey,
+      companyId,
       code: "E_UNEXPECTED",
       message: describeDoolaError(e).message,
     });
@@ -232,7 +236,8 @@ export async function runFormationCreateProvider(d: FormationCreateDeps): Promis
 }
 
 async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Promise<void> {
-  const { entityKey, rec, requests, parties } = d;
+  const { requests, parties } = d;
+  const companyId = d.company.companyId;
 
   // ── Environment pinning (audit M5). BEFORE anything else, and never a doola call: an entity
   //    pinned to sandbox must not be routed at api.doola.com by a config flip, and one pinned to
@@ -242,25 +247,24 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   //    and this is a configuration error rather than a formation that is going badly. Burning
   //    attempts on it would `abandon` the formation after eight ticks of a wrong env var — and
   //    `abandoned` is what makes the sweeper erase the responsible party's personal data.
-  if (rec.formationEnvironment !== d.environment) {
+  if (d.company.environment !== d.environment) {
     parkFormationStep(
       d,
-      entityKey,
+      companyId,
       "create_provider",
-      environmentPinMismatchError(rec.formationEnvironment ?? null, d.environment),
+      environmentPinMismatchError(d.company.environment, d.environment),
       { reason: "environment_pin" },
     );
-    d.repo.recordEvent(
-      entityKey,
+    recordCompanyEvent(
+      d.repo,
+      d.company.companyId,
       "formationCreate",
-      d.rec.status,
-      null,
       "formation create skipped: environment pin mismatch",
     );
     return;
   }
 
-  const party = parties.findByEntityKey(entityKey);
+  const party = parties.findByCompanyId(companyId);
   if (!party) {
     failStep(d, row, noFormationPartyError());
     return;
@@ -291,7 +295,42 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   // `submitted` by a crash or `failed` by an error the sweeper is now retrying.
   const hadCustomer = Boolean(detail.customerId);
 
-  const nameOptions = companyNameOptions(d.spec.name);
+  // The candidates we STORED at intake — never re-derived here. The migration, the shim and the
+  // real form all wrote the same canonical shape, and the matcher that decides `legal_name_filed`
+  // compares against exactly these rows.
+  //
+  // An EMPTY list is a corrupt or unparseable `name_options` blob (`parseNameOptions` maps one to
+  // `[]`), and there is exactly one safe answer: file NOTHING. Deriving a substitute would ask
+  // Wyoming for a name nobody chose, under a real fee, and store it as the company's own
+  // candidate — the matcher that decides `legal_name_filed` compares against these rows, so the
+  // invented name would go on to be published in an anchored manifest. It PARKS rather than
+  // burning an attempt, for the environment pin's reason: nothing was sent, a human has to fix
+  // the row, and eight ticks of `failed` would `abandon` the formation and erase the party.
+  //
+  // A BLANK candidate is the same fact wearing a different shape, and the list being non-empty
+  // is no comfort: an agent named "LLC" strips to nothing, so the canonical row is
+  // `[{ name: "", entityTypeEnding: "LLC", position: 1 }]`. `createCompany` refuses that intake
+  // at the door, but the migration and the shim write `name_options` through other paths, and
+  // the filer is the last thing standing between a nameless company and a real filing.
+  const nameOptions: CompanyNameOption[] = d.company.nameOptions;
+  if (nameOptions.length === 0 || nameOptions.some((n) => !n.name.trim())) {
+    parkFormationStep(d, companyId, "create_provider", noNameOptionsError(), {
+      reason: "intake_unreadable",
+    });
+    recordCompanyEvent(
+      d.repo,
+      d.company.companyId,
+      "formationCreate",
+      "formation create parked: intake unreadable",
+    );
+    opsLog("formation_intake_unreadable", {
+      level: "error",
+      severity: "CRITICAL",
+      companyId,
+      environment: d.environment,
+    });
+    return;
+  }
   const expedited = isNonUsResponsibleParty(party);
   detail = {
     ...detail,
@@ -307,18 +346,18 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   // observed state is also what stops two drivers from racing one entity's create.
   if (row.state !== "submitted") {
     if (
-      !requests.transition(entityKey, "create_provider", row.state, "submitted", {
+      !requests.transition(companyId, "create_provider", row.state, "submitted", {
         detail: JSON.stringify(detail),
         error: null,
       })
     )
       return;
-    logStep(entityKey, "submitted", row.attempt);
+    logStep(companyId, "submitted", row.attempt);
   }
 
   // ONE key per endpoint, both derived from THIS attempt. Nothing below rotates them: an attempt
   // moves only when doola has told us, in as many words, that it refused the request.
-  const keys = createProviderKeys(entityKey, row.attempt);
+  const keys = createProviderKeys(companyId, row.attempt);
 
   // ── 1. The customer. Persisted immediately: it is what the pre-create lookup searches by, and
   //       what part B re-fetches with. A lost answer here leaves no id and does NOT bump, so the
@@ -395,11 +434,11 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   // ── 5. Persist the id BEFORE treating the create as done. A crash between here and the
   //       confirm below resumes into the ADOPT branch above, never into a second create.
   detail = { ...detail, companyId: company.doolaCompanyId };
-  requests.transition(entityKey, "create_provider", "submitted", "submitted", {
+  requests.transition(companyId, "create_provider", "submitted", "submitted", {
     providerRef: company.doolaCompanyId,
     detail: JSON.stringify(detail),
   });
-  logStep(entityKey, "submitted", row.attempt, { providerRef: company.doolaCompanyId });
+  logStep(companyId, "submitted", row.attempt, { providerRef: company.doolaCompanyId });
 
   confirm(d, row, company.doolaCompanyId, {
     ...detail,
@@ -432,21 +471,20 @@ function onCallFailure(
     kind === "key_reused"
       ? `doola reports this idempotency key was already used with a different body (${endpoint}) — NOT re-keying: something exists under it and re-filing could be a second company. ${described.message}`
       : `doola ${endpoint} gave no usable answer (${described.message}) — the request may have COMMITTED, so the attempt is NOT burned and the same idempotency key will be re-sent`;
-  parkFormationStep(d, d.entityKey, "create_provider", reason, {
+  parkFormationStep(d, d.company.companyId, "create_provider", reason, {
     providerRef: row.providerRef ?? undefined,
     endpoint,
     kind,
     code: described.code,
   });
-  d.repo.recordEvent(
-    d.entityKey,
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
     "formationCreate",
-    d.rec.status,
-    null,
     `formation create parked (${kind}): ${reason}`,
   );
   opsLog("formation_create_parked", {
-    entityKey: d.entityKey,
+    companyId: d.company.companyId,
     // A key conflict is a real bug and needs a human; a lost answer is ordinary weather.
     level: kind === "key_reused" ? "error" : "warn",
     ...(kind === "key_reused" ? { severity: "CRITICAL" as const } : {}),
@@ -461,7 +499,7 @@ function buildCompanyInput(
   d: FormationCreateDeps,
   party: FormationPartyRecord,
   customerId: string,
-  nameOptions: { name: string; entityTypeEnding: string }[],
+  nameOptions: CompanyNameOption[],
   expedited: boolean,
 ): CreateCompanyInput {
   const address = toDoolaAddress(party);
@@ -469,9 +507,17 @@ function buildCompanyInput(
     doolaCustomerId: customerId,
     entityType: FORMATION_ENTITY_TYPE,
     state: FORMATION_STATE,
-    nameOptions: nameOptions.map((n, i) => ({ ...n, position: i + 1 })),
-    industry: DEFAULT_INDUSTRY,
-    description: d.spec.metadata?.description || DEFAULT_DESCRIPTION,
+    // Position is stored, not recomputed: the ranking IS the intake, and `position` is a required
+    // column of the canonical shape — a fallback here would be a second opinion about the order.
+    nameOptions: nameOptions.map((n) => ({
+      name: n.name,
+      entityTypeEnding: n.entityTypeEnding,
+      position: n.position,
+    })),
+    // The company's OWN intake, not the agent's description: the purpose describes the legal
+    // body, and from A2 it is a required field on the create form.
+    industry: d.company.industryLabel || DEFAULT_INDUSTRY,
+    description: d.company.businessPurpose || DEFAULT_DESCRIPTION,
     responsibleParty: {
       legalFirstName: party.legalFirstName,
       legalLastName: party.legalLastName,
@@ -518,14 +564,14 @@ async function lookupExistingCompany(
     if (byName) return byName;
     if (companies.length === 1) return companies[0];
     opsLog("formation_lookup_ambiguous", {
-      entityKey: d.entityKey,
+      companyId: d.company.companyId,
       level: "warn",
       count: companies.length,
     });
     return undefined;
   } catch (e) {
     opsLog("formation_lookup_failed", {
-      entityKey: d.entityKey,
+      companyId: d.company.companyId,
       level: "warn",
       ...describeDoolaError(e),
     });
@@ -537,14 +583,14 @@ async function lookupExistingCompany(
 async function adopt(
   d: FormationCreateDeps,
   row: FormationRequestRecord,
-  companyId: string,
+  doolaCompanyId: string,
   detail: CreateProviderDetail,
   known?: DoolaCompany,
 ): Promise<void> {
   let company = known;
   if (!company) {
     try {
-      company = await d.doola.getCompany(companyId);
+      company = await d.doola.getCompany(doolaCompanyId);
     } catch (e) {
       // The company EXISTS — we hold its id — and we simply could not read it right now. Parked
       // without burning the attempt (C1/C3): this is a read, it attempted nothing and committed
@@ -553,17 +599,17 @@ async function adopt(
       const described = describeDoolaError(e);
       parkFormationStep(
         d,
-        d.entityKey,
+        d.company.companyId,
         "create_provider",
-        `could not read the company we already filed (${companyId}): ${described.message}`,
-        { providerRef: companyId, code: described.code },
+        `could not read the company we already filed (${doolaCompanyId}): ${described.message}`,
+        { providerRef: doolaCompanyId, code: described.code },
       );
       return;
     }
   }
-  confirm(d, row, companyId, {
+  confirm(d, row, doolaCompanyId, {
     ...detail,
-    companyId,
+    companyId: doolaCompanyId,
     submissionStatus: company.formationSubmissionStatus,
   });
 }
@@ -580,10 +626,11 @@ async function adopt(
 function confirm(
   d: FormationCreateDeps,
   row: FormationRequestRecord,
-  companyId: string,
+  doolaCompanyId: string,
   detail: CreateProviderDetail,
 ): void {
-  const { entityKey, requests } = d;
+  const { requests } = d;
+  const companyId = d.company.companyId;
   // CAS on the state the row is ACTUALLY in, re-read here rather than assumed to be `submitted`.
   //
   // The create path does arrive at `submitted`, but the ADOPT path does not: adoption happens
@@ -592,34 +639,33 @@ function confirm(
   // hardcoded `from` made that transition a silent no-op — the company existed, was read, and the
   // row stayed `failed` until it burned through eight attempts and was abandoned. Found by part
   // B's sweeper test; the retry path had no coverage before it.
-  const from = requests.find(entityKey, "create_provider")?.state ?? row.state;
+  const from = requests.find(companyId, "create_provider")?.state ?? row.state;
   if (from === "confirmed" || from === "abandoned") return;
-  requests.transition(entityKey, "create_provider", from, "confirmed", {
-    providerRef: companyId,
+  requests.transition(companyId, "create_provider", from, "confirmed", {
+    providerRef: doolaCompanyId,
     detail: JSON.stringify(detail),
     error: null,
   });
-  d.repo.recordEvent(
-    entityKey,
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
     "formationCreate",
-    d.rec.status,
-    null,
     JSON.stringify({
-      providerRef: companyId,
+      providerRef: doolaCompanyId,
       submissionStatus: detail.submissionStatus ?? null,
       adopted: Boolean(detail.adopted),
       environment: d.environment,
     }),
   );
-  logStep(entityKey, "confirmed", row.attempt, {
-    providerRef: companyId,
+  logStep(companyId, "confirmed", row.attempt, {
+    providerRef: doolaCompanyId,
     adopted: Boolean(detail.adopted),
   });
 }
 
 /** Write the current detail back without moving the row (a CAS on `submitted` -> `submitted`). */
 function persistDetail(d: FormationCreateDeps, detail: CreateProviderDetail): void {
-  d.requests.transition(d.entityKey, "create_provider", "submitted", "submitted", {
+  d.requests.transition(d.company.companyId, "create_provider", "submitted", "submitted", {
     detail: JSON.stringify(detail),
   });
 }
@@ -640,22 +686,21 @@ function failStep(
   error: string,
   cause?: unknown,
 ): void {
-  const { entityKey } = d;
+  const companyId = d.company.companyId;
   const described: { code?: string; requestId?: string } = cause ? describeDoolaError(cause) : {};
   // The bump-then-park sequence itself lives in `formationStep.ts`: the webhook processor and the
   // sweeper park rows too, and three copies of that contract would be three chances to burn an
   // attempt without parking the row (or the reverse). What stays HERE is what is specific to the
   // create: the entity audit event, and doola's own error code on the ops line.
-  failFormationStep(d, entityKey, "create_provider", error, { code: described.code });
-  d.repo.recordEvent(
-    entityKey,
+  failFormationStep(d, companyId, "create_provider", error, { code: described.code });
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
     "formationCreate",
-    d.rec.status,
-    null,
     `formation create failed: ${error}`,
   );
   opsLog("formation_create_failed", {
-    entityKey,
+    companyId,
     level: "warn",
     code: described.code,
     requestId: described.requestId,

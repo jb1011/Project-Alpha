@@ -12,13 +12,18 @@ import type {
   DoolaDocument,
   DoolaRequiredAction,
 } from "../../src/adapters/doola/types";
+import { companyNameOptions } from "../../src/formation/intake";
 import type { HostLookup } from "../../src/payments/ssrfGuard";
+import type { CompanyRepository } from "../../src/persistence/companyRepository";
 import type { DocumentStore, PutResult } from "../../src/persistence/documentStore";
 import type { EntityRecord } from "../../src/types";
 
 export const ENTITY_KEY = "tenant-a:agent-1";
 export const TENANT = "tenant-a";
+/** doola's company id — the `provider_ref` a webhook carries. */
 export const COMPANY_ID = "cmp-1";
+/** OUR company id: the sub-saga's key, and what an entity is attached to (2026-08-26 §2). */
+export const COMPANY_KEY = "company-1";
 
 /** A pinned, doola-formed entity that has finished its on-chain onboarding. */
 export function formedEntity(over: Partial<EntityRecord> = {}): EntityRecord {
@@ -45,12 +50,33 @@ export function formedEntity(over: Partial<EntityRecord> = {}): EntityRecord {
     bindTxHash: "0xbind",
     fundTxHash: "0xfund",
     ownerTenantId: TENANT,
+    companyId: COMPANY_KEY,
     formationProvider: "doola",
     formationEnvironment: "sandbox",
     oaManifestVersion: 1,
     oaManifestAnchoredHash: "0xaaaa",
     ...over,
   };
+}
+
+/** The company row a formed entity is attached to — `ready`, with the intake the filer reads. */
+export function seedCompany(
+  companies: CompanyRepository,
+  over: Partial<Parameters<CompanyRepository["create"]>[0]> = {},
+): string {
+  return companies.create({
+    companyId: COMPANY_KEY,
+    tenantId: TENANT,
+    status: "ready",
+    provider: "doola",
+    environment: "sandbox",
+    synthetic: false,
+    nameOptions: companyNameOptions("Formation Agent"),
+    businessPurpose: "An autonomous software agent.",
+    industryLabel: "Software development",
+    intakeSynthesized: true,
+    ...over,
+  });
 }
 
 export interface FakeDoolaState {

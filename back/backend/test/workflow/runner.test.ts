@@ -2,9 +2,12 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { loadConfig } from "../../src/config/env";
 import { resolveFormationDeployment } from "../../src/formation";
+import { createCompany } from "../../src/formation/company";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
+import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import type { AgentSpec } from "../../src/policy/agentSpec";
 import { usdToUnits } from "../../src/policy/units";
 import type { EntityRecord } from "../../src/types";
@@ -471,6 +474,8 @@ test("fund() refuses when the S5 platform outflow ceiling is reached (after per-
 /** A parties repository over the test db, plus one unbound party belonging to TENANT. */
 function partyFixture() {
   const parties = new SqliteFormationPartyRepository(db);
+  const companies = new SqliteCompanyRepository(db);
+  const requests = new SqliteFormationRepository(db);
   const partyId = parties.create({
     tenantId: TENANT,
     legalFirstName: "Ada",
@@ -485,45 +490,239 @@ function partyFixture() {
     country: "USA",
     synthetic: false,
   });
-  return { parties, partyId };
+  return { parties, partyId, companies, requests };
+}
+
+/**
+ * The runner's formation wiring, with the A1 SHIM (design §10).
+ *
+ * A party-only onboard — every client that exists today — mints its own 1:1 company inside the
+ * claim transaction and attaches the new agent to it. The shim calls the ONE domain function, so
+ * this fixture is the composition root in miniature.
+ */
+function formationDeps(
+  fx: ReturnType<typeof partyFixture>,
+  pin: { provider: string; environment: "sandbox" | "production" } | null,
+) {
+  if (!pin) return undefined;
+  return {
+    companies: fx.companies,
+    requests: fx.requests,
+    maxAgentsPerCompany: 10,
+    createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
+      const result = createCompany(
+        {
+          companies: fx.companies,
+          parties: fx.parties,
+          requests: fx.requests,
+          pin,
+          sandboxSyntheticPii: false,
+          maxPerTenant: 3,
+          dailyCeiling: 10,
+          transaction: (fn) => fn(),
+        },
+        tenantId,
+        intake,
+      );
+      if ("error" in result) throw new Error(result.error);
+      return result.companyId;
+    },
+  };
 }
 
 const doolaCfg = (over: Record<string, string> = {}) =>
   loadConfig({ ...CFG_BASE, DOOLA_API_KEY: "dk", DOOLA_WEBHOOK_SECRET: "whsec", ...over });
 
-test("C5: the claim pins the deployment's resolved value — WITH the party, in one transaction", () => {
-  const { parties, partyId } = partyFixture();
+test("C5/A1 shim: a party-only claim mints a company, attaches it, and pins FROM ITS ROW", () => {
+  const fx = partyFixture();
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
-    formation: resolveFormationDeployment(doolaCfg()),
-    parties,
+    formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
   });
   const { id } = runner.start({
     spec,
     userKey: "pin-1",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId,
+    partyId: fx.partyId,
   });
   const rec = repo.findByIdempotencyKey(id)!;
+  expect(rec.companyId).toBeTruthy();
   expect(rec.formationProvider).toBe("doola");
   expect(rec.formationEnvironment).toBe("sandbox");
-  // Pin and bind are ONE fact: an entity that owes a filing always has an identity to file with.
-  expect(parties.findByEntityKey(id)?.partyId).toBe(partyId);
+  // Attach and bind are ONE fact: an entity that owes a filing always has an identity behind it.
+  expect(fx.parties.findByCompanyId(rec.companyId!)?.partyId).toBe(fx.partyId);
+  // The company landed `ready` with the SYNTHESIZED intake — never `draft`, which would owe a
+  // payment step that does not exist in A1.
+  const company = fx.companies.find(rec.companyId!)!;
+  expect(company.status).toBe("ready");
+  expect(company.intakeSynthesized).toBe(true);
 });
 
-test("C5: no partyId pins NOTHING, even with the credentials present and formation REQUIRED", () => {
-  // The wizard's shape today. The door is what refuses a party-less onboard where formation is
-  // mandatory; the CLAIM's job is only to never pin an entity it cannot file for.
-  const { parties } = partyFixture();
+test("ATTACH: a second agent joins an existing company, and the party is NOT reused", () => {
+  const fx = partyFixture();
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
-    formation: resolveFormationDeployment(doolaCfg()),
-    parties,
+    formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
+  });
+  const first = runner.start({
+    spec,
+    userKey: "attach-1",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    partyId: fx.partyId,
+  });
+  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
+
+  const second = runner.start({
+    spec,
+    userKey: "attach-2",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    companyId,
+  });
+  const rec = repo.findByIdempotencyKey(second.id)!;
+  expect(rec.companyId).toBe(companyId);
+  // Billing is per COMPANY: attaching is free, so no second party and no second filing.
+  expect(fx.companies.countAgents(companyId)).toBe(2);
+  expect(fx.requests.stepsOf(companyId)).toHaveLength(0);
+});
+
+test("ATTACH records what the agent JOINED — an agent attached after the filing has a history", () => {
+  // The sub-saga fans its events out over whichever agents are attached AT THE MOMENT a fact
+  // lands. An agent that joins afterwards — which is the entire point of N:1 — was attached to a
+  // real, filed Wyoming LLC and had a completely empty formation history, because every event
+  // describing that filing had already been written.
+  const fx = partyFixture();
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
+  });
+  const first = runner.start({
+    spec,
+    userKey: "hist-1",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    partyId: fx.partyId,
+  });
+  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
+  // The filing happens BEFORE the second agent exists.
+  fx.requests.claimAllSteps(companyId);
+  fx.requests.transition(companyId, "create_provider", "pending", "confirmed", {
+    providerRef: "cmp-live-1",
+  });
+  fx.requests.transition(companyId, "await_filing", "pending", "confirmed");
+  fx.companies.recordFilingFacts(companyId, { filedAt: 1_756_000_000, filingNumber: "WY-2026-1" });
+  fx.companies.recordEin(companyId, "88-1234567");
+
+  const second = runner.start({
+    spec,
+    userKey: "hist-2",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    companyId,
+  });
+
+  // The SHIM path records nothing: the first agent did not JOIN a filing, it created the 1:1
+  // company it is attached to, and there is no prior history for an event to describe. A
+  // `formationAttached` there would be a spurious `status: "none"` row on every party-only
+  // onboard — which is every client that exists today.
+  expect(repo.listEvents(first.id).filter((e) => e.step === "formationAttached")).toHaveLength(0);
+
+  const events = repo.listEvents(second.id).filter((e) => e.step === "formationAttached");
+  expect(events).toHaveLength(1);
+  const detail = JSON.parse(events[0]!.detail!);
+  expect(detail).toMatchObject({
+    companyId,
+    provider: "doola",
+    environment: "sandbox",
+    status: "filed",
+    providerRef: "cmp-live-1",
+    filedAt: 1_756_000_000,
+    filingNumber: "WY-2026-1",
+    // PRESENCE only. An EIN is a tax identifier and the audit trail is the one place the
+    // processor deliberately keeps it out of.
+    ein: true,
+  });
+  expect(JSON.stringify(detail)).not.toContain("88-1234567");
+});
+
+test("ATTACH is bounded: FORMATION_MAX_AGENTS_PER_COMPANY refuses inside the claim", () => {
+  const fx = partyFixture();
+  const deps = formationDeps(fx, resolveFormationDeployment(doolaCfg()))!;
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: { ...deps, maxAgentsPerCompany: 1 },
+  });
+  const first = runner.start({
+    spec,
+    userKey: "cap-1",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    partyId: fx.partyId,
+  });
+  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
+  expect(() =>
+    runner.start({
+      spec,
+      userKey: "cap-2",
+      tenantId: TENANT,
+      guardianPasskey: passkey,
+      companyId,
+    }),
+  ).toThrow(/agent\(s\) attached/);
+  // The whole claim rolled back: no entity, and the count is unchanged.
+  expect(repo.findByIdempotencyKey(`${TENANT}:cap-2`)).toBeUndefined();
+  expect(fx.companies.countAgents(companyId)).toBe(1);
+});
+
+test("ATTACH refuses an ABANDONED company — the CAS re-reads it inside the transaction", () => {
+  const fx = partyFixture();
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
+  });
+  const first = runner.start({
+    spec,
+    userKey: "cas-1",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    partyId: fx.partyId,
+  });
+  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
+  // The race the door check cannot close: the company is abandoned between the door and here.
+  fx.companies.setStatus(companyId, "ready", "abandoned");
+  expect(() =>
+    runner.start({
+      spec,
+      userKey: "cas-2",
+      tenantId: TENANT,
+      guardianPasskey: passkey,
+      companyId,
+    }),
+  ).toThrow(/not available for attachment/);
+  expect(repo.findByIdempotencyKey(`${TENANT}:cas-2`)).toBeUndefined();
+});
+
+test("C5: no party and no company pins NOTHING, even with the credentials present", () => {
+  // The wizard's shape today. The door is what refuses a handle-less onboard where formation is
+  // mandatory; the CLAIM's job is only to never pin an entity it cannot file for.
+  const fx = partyFixture();
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
   });
   const { id } = runner.start({
     spec,
@@ -537,23 +736,25 @@ test("C5: no partyId pins NOTHING, even with the credentials present and formati
 });
 
 test("C5: FORMATION_REQUIRED=false still pins and files an onboard that CARRIES a party", () => {
-  // ⚠ Supersedes PR 2 decision #2. `required` decides whether the door refuses a party-less
+  // ⚠ Supersedes PR 2 decision #2. `required` decides whether the door refuses a handle-less
   // onboard — it does NOT decide whether a supplied party is honoured. Dropping one silently was
   // the bug: a caller posted a real legal identity, handed over its handle, and got a stub.
-  const { parties, partyId } = partyFixture();
+  const fx = partyFixture();
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
-    formation: resolveFormationDeployment(doolaCfg({ FORMATION_REQUIRED: "false" })),
-    parties,
+    formation: formationDeps(
+      fx,
+      resolveFormationDeployment(doolaCfg({ FORMATION_REQUIRED: "false" })),
+    ),
   });
   const { id } = runner.start({
     spec,
     userKey: "pin-4",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId,
+    partyId: fx.partyId,
   });
   const rec = repo.findByIdempotencyKey(id)!;
   expect(rec.formationProvider).toBe("doola");
@@ -561,23 +762,24 @@ test("C5: FORMATION_REQUIRED=false still pins and files an onboard that CARRIES 
 });
 
 test("C1: a credential-less deployment pins nothing — the stub shape, unchanged", () => {
-  const { parties, partyId } = partyFixture();
+  const fx = partyFixture();
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
-    formation: resolveFormationDeployment(loadConfig(CFG_BASE)),
-    parties,
+    formation: formationDeps(fx, resolveFormationDeployment(loadConfig(CFG_BASE))),
   });
   const { id } = runner.start({
     spec,
     userKey: "pin-3",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId,
+    partyId: fx.partyId,
   });
-  // Even with a party: there is no provider to pin to, so the row is a stub and the party stays
-  // bound to an entity nothing will ever file. The door refuses this combination up front
-  // (`formationUnavailableMessage`); this is what the claim does if it ever gets past it.
+  // Even with a party: there is no provider to pin to, so no company is minted, the row is a stub
+  // and the party stays UNBOUND — free for a real filing later. The door refuses this combination
+  // up front (`formationUnavailableMessage`); this is what the claim does if it gets past it.
+  expect(repo.findByIdempotencyKey(id)?.companyId).toBeNull();
   expect(repo.findByIdempotencyKey(id)?.formationProvider).toBeNull();
+  expect(fx.parties.findOwned(TENANT, fx.partyId)?.companyId).toBeNull();
 });

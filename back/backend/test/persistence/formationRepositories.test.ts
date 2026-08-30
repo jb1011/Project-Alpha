@@ -6,9 +6,11 @@
  */
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import { SqliteOaAnchorRepository } from "../../src/persistence/oaAnchorRepository";
+import { abandonFormation } from "../../src/workflow/formationStep";
 
 let db: Database.Database;
 let formation: SqliteFormationRepository;
@@ -79,7 +81,7 @@ test("bumpAttempt is CAS-guarded and drives a FRESH idempotency key per attempt"
   // Keys must differ per attempt: doola RELEASES a failed create's key, and reuse-with-a-
   // different-body comes back 409 E_IDEMPOTENCY_KEY_REUSED.
   expect(SqliteFormationRepository.idempotencyKey("ent", "create_provider", 0)).toBe(
-    "formation:ent:create_provider:0",
+    "company:ent:create_provider:0",
   );
   expect(SqliteFormationRepository.idempotencyKey("ent", "create_provider", 1)).not.toBe(
     SqliteFormationRepository.idempotencyKey("ent", "create_provider", 0),
@@ -96,7 +98,7 @@ test("stepsOf returns saga order; listByState is the sweeper's due-work query", 
   ]);
   formation.claimStep("other", "create_provider");
   formation.transition("other", "create_provider", "pending", "failed", { error: "x" });
-  expect(formation.listByState("failed").map((r) => r.entityKey)).toEqual(["other"]);
+  expect(formation.listByState("failed").map((r) => r.companyId)).toEqual(["other"]);
 });
 
 // ── oa_anchors ────────────────────────────────────────────────────────────────────────────
@@ -196,7 +198,7 @@ test("H2: statements are prepared once — a repo built on a fresh db serves eve
   expect(f.claimStep("fresh", "create_provider")).toBe(true);
   expect(f.find("fresh", "create_provider")?.state).toBe("pending");
   expect(f.stepsOf("fresh").map((r) => r.step)).toEqual(["create_provider"]);
-  expect(f.listByState("pending").some((r) => r.entityKey === "fresh")).toBe(true);
+  expect(f.listByState("pending").some((r) => r.companyId === "fresh")).toBe(true);
   expect(f.transition("fresh", "create_provider", "pending", "failed", { error: "x" })).toBe(true);
   expect(f.bumpAttempt("fresh", "create_provider", "failed")).toBe(1);
   expect(a.claimVersion("fresh", 1, "0xaa")).toBe(true);
@@ -264,4 +266,258 @@ test("A-repo-3: acknowledgeHold is a CAS from the two HOLD states and nothing el
   anchors.transition("ent", 4, "pending", "failed", { error: "rehash mismatch" });
   expect(anchors.acknowledgeHold("ent", 4)).toBe(true);
   expect(anchors.find("ent", 4)?.state).toBe("superseded");
+});
+
+// ── 2026-08-26 §3: the anchor scheduler under N:1 ──────────────────────────────────────────
+
+/**
+ * An entity attached to `companyId`, with a company row to attach to.
+ *
+ * ANCHORED by default (`oa_manifest_version = 1`), because that is the only state in which an
+ * entity can owe an amendment at all: the facts arm's watermark is taken over a company's
+ * anchored entities, and `advanceAnchor` dismisses an un-anchored one as `not_anchored` before
+ * it reads anything. `anchored: false` is the sibling the watermark must ignore.
+ */
+function attach(entityKey: string, companyId: string, opts: { anchored?: boolean } = {}): void {
+  if (!db.prepare("SELECT 1 FROM companies WHERE company_id = ?").get(companyId))
+    db.prepare(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
+                              name_options, business_purpose, industry_label)
+       VALUES (?, 't', 'ready', 'doola', 'sandbox', '[]', 'p', 'i')`,
+    ).run(companyId);
+  db.prepare(
+    `INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay,
+                           ein, formation_date, company_id, oa_manifest_version,
+                           oa_manifest_anchored_hash)
+     VALUES (?, ?, 'bound', '0x1', '0x2', '86400', 'STUB', 0, ?, ?, ?)`,
+  ).run(
+    entityKey,
+    entityKey,
+    companyId,
+    opts.anchored === false ? null : 1,
+    opts.anchored === false ? null : `0x${"11".repeat(32)}`,
+  );
+}
+
+test("a POLL does not move facts_updated_at — and so does not invalidate the anchor gate", () => {
+  formation.claimStep("c1", "await_ein");
+  const before = formation.find("c1", "await_ein")!;
+  // What `persistPollBackoff` writes on EVERY pass over a waiting row: a schedule, in `detail`.
+  formation.transition("c1", "await_ein", "pending", "pending", {
+    detail: JSON.stringify({ nextPollAt: 1 }),
+    nextPollAt: 1,
+    touchFacts: false,
+  });
+  const polled = formation.find("c1", "await_ein")!;
+  expect(polled.detail).toContain("nextPollAt");
+  // The FACT clock did not move. An `await_ein` row waits four to six weeks for the IRS, and
+  // bumping this on every poll made its entity re-read and re-hash its manifest on every tick.
+  expect(polled.factsUpdatedAt).toBe(before.factsUpdatedAt);
+
+  // …while a real transition does move it.
+  formation.transition("c1", "await_ein", "pending", "confirmed");
+  expect(formation.find("c1", "await_ein")!.state).toBe("confirmed");
+});
+
+test("abandonFormation is ONE transaction: the step and the company move together or neither", () => {
+  // `abandoned` has three writers (§4.6) and every one of them must move both rows. The CLI used
+  // to run two raw UPDATEs outside any transaction, so a crash between them left a company still
+  // `ready` — attachable, quota-chargeable, and inside `listUnopened`'s reach — over a create
+  // that had been abandoned by hand.
+  const companies = new SqliteCompanyRepository(db);
+  const companyId = companies.create({
+    tenantId: "t",
+    status: "ready",
+    provider: "doola",
+    environment: "sandbox",
+    synthetic: false,
+    nameOptions: [],
+    businessPurpose: "p",
+    industryLabel: "i",
+    intakeSynthesized: true,
+  });
+  formation.claimStep(companyId, "create_provider");
+  formation.transition(companyId, "create_provider", "pending", "failed", { error: "doola 503" });
+  const OLD = "2026-01-01 00:00:00";
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    companyId,
+  );
+
+  // NEITHER: the company write throws, so the step's transition must roll back with it.
+  const exploding: Pick<SqliteCompanyRepository, "setStatus"> = {
+    setStatus: () => {
+      throw new Error("disk full");
+    },
+  };
+  expect(() =>
+    abandonFormation(formation, exploding, companyId, "operator abandon", {
+      transaction: (fn) => db.transaction(fn)(),
+    }),
+  ).toThrow(/disk full/);
+  expect(formation.find(companyId, "create_provider")!.state).toBe("failed");
+  expect(companies.find(companyId)!.status).toBe("ready");
+
+  // BOTH — and the verdict IS a fact, so the anchor gate sees it.
+  expect(
+    abandonFormation(formation, companies, companyId, "operator abandon", {
+      transaction: (fn) => db.transaction(fn)(),
+    }),
+  ).toBe(true);
+  expect(formation.find(companyId, "create_provider")!.state).toBe("abandoned");
+  expect(companies.find(companyId)!.status).toBe("abandoned");
+  expect(formation.find(companyId, "create_provider")!.factsUpdatedAt).not.toBe(OLD);
+
+  // A caller that LOSES the CAS reports false rather than logging a verdict somebody else reached.
+  expect(
+    abandonFormation(formation, companies, companyId, "again", {
+      transaction: (fn) => db.transaction(fn)(),
+    }),
+  ).toBe(false);
+});
+
+test("an ATTEMPT BUMP is not a fact — it must not hold the entity in the anchor due-set", () => {
+  formation.claimStep("c1", "create_provider");
+  // Stamped in the past explicitly: both columns are CURRENT_TIMESTAMP at one-SECOND resolution,
+  // so "unchanged" is only a real assertion against a value the clock cannot reproduce.
+  const OLD = "2026-01-01 00:00:00";
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = 'c1'").run(OLD);
+
+  formation.transition("c1", "create_provider", "pending", "failed", {
+    error: "doola 503",
+    touchFacts: false,
+  });
+  expect(formation.find("c1", "create_provider")!.factsUpdatedAt).toBe(OLD);
+
+  // The bump rotates an IDEMPOTENCY KEY. It says nothing about the world, and a step that fails
+  // every tick would otherwise keep re-deriving and re-hashing a manifest that has not changed.
+  expect(formation.bumpAttempt("c1", "create_provider", "failed")).toBe(1);
+  expect(formation.find("c1", "create_provider")!.factsUpdatedAt).toBe(OLD);
+
+  // …and a real state change still moves it.
+  formation.transition("c1", "create_provider", "pending", "confirmed");
+  expect(formation.find("c1", "create_provider")!.factsUpdatedAt).not.toBe(OLD);
+});
+
+test("the anchor due-set DEDUPES the facts arm per COMPANY, then expands after the limit", () => {
+  // Ten agents on ONE company, and one agent on another. A page of one must not be all ten.
+  for (let i = 0; i < 10; i++) attach(`busy-${i}`, "company-busy");
+  attach("quiet-1", "company-quiet");
+  for (const c of ["company-busy", "company-quiet"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+
+  // ONE row of the pre-expansion page = ONE company, expanded to its ten agents afterwards.
+  const first = anchors.listDue(1);
+  expect(first.entityKeys).toHaveLength(10);
+  expect(new Set(first.entityKeys.map((k) => k.split("-")[0]))).toEqual(new Set(["busy"]));
+  // …and the cursor is what lets the OTHER company be reached at all.
+  expect(first.nextCursor).toBe("company-busy");
+  const second = anchors.listDue(1, first.nextCursor!);
+  expect(second.entityKeys).toEqual(["quiet-1"]);
+});
+
+test("the EXPANDED page never exceeds the limit, and the cursor names the last company that fit", () => {
+  // Three companies of four agents each and a budget of ten. Expanding AFTER the SQL LIMIT, a
+  // "batch of 10" handed back twelve keys — and with the real ANCHOR_BATCH of 50 and ten agents
+  // a company, five hundred. `limit` is the caller's concurrency budget for one tick; a bound
+  // that its own reader can multiply is not a bound.
+  for (const c of ["company-a", "company-b", "company-c"])
+    for (let i = 0; i < 4; i++) attach(`${c}-agent-${i}`, c);
+  for (const c of ["company-a", "company-b", "company-c"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+
+  const page = anchors.listDue(10);
+  expect(page.entityKeys.length).toBeLessThanOrEqual(10);
+  // Two whole companies fit; the third would have made twelve, so it waits for the next tick.
+  expect(page.entityKeys).toHaveLength(8);
+  expect(page.companies).toBe(2);
+  // The cursor is the last company whose expansion fit ENTIRELY — so the next page starts at the
+  // one that did not, and no agent is skipped by the cut.
+  expect(page.nextCursor).toBe("company-b");
+  const next = anchors.listDue(10, page.nextCursor!);
+  expect(next.entityKeys.every((k) => k.startsWith("company-c"))).toBe(true);
+  expect(next.entityKeys).toHaveLength(4);
+});
+
+test("the facts watermark is per COMPANY: an un-anchored sibling does not make it due forever", () => {
+  // The trap: a company whose filing settled long ago, plus ONE agent that has never anchored —
+  // a fresh onboard whose v1 has not confirmed, which `advanceAnchor` dismisses on sight. Per
+  // ENTITY that agent has no anchor write, so `a.last IS NULL` made the whole company due on
+  // every single tick, forever, dragging every sibling's manifest through a re-hash with it.
+  attach("settled-1", "company-x");
+  attach("fresh-2", "company-x", { anchored: false });
+  formation.claimStep("company-x", "await_filing");
+  formation.transition("company-x", "await_filing", "pending", "confirmed");
+  db.prepare(
+    "UPDATE formation_requests SET facts_updated_at = '2026-08-01 00:00:00' WHERE company_id = 'company-x'",
+  ).run();
+  // The anchored sibling wrote its cycle AFTER the facts landed: nothing is owed.
+  anchors.claimVersion("settled-1", 2, "0x02");
+  anchors.transition("settled-1", 2, "pending", "executed");
+  db.prepare(
+    "UPDATE oa_anchors SET updated_at = '2026-08-02 00:00:00' WHERE entity_key = 'settled-1'",
+  ).run();
+
+  expect(anchors.listDueEntityKeys(50)).toEqual([]);
+
+  // …and a fact that really does move still brings the company back.
+  db.prepare(
+    "UPDATE formation_requests SET facts_updated_at = '2026-08-03 00:00:00' WHERE company_id = 'company-x'",
+  ).run();
+  expect(anchors.listDueEntityKeys(50).sort()).toEqual(["fresh-2", "settled-1"]);
+});
+
+test("the due cursor is PERSISTED in meta, so a restart resumes instead of re-reading the head", () => {
+  attach("a-1", "company-a");
+  attach("b-1", "company-b");
+  for (const c of ["company-a", "company-b"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+  expect(anchors.readDueCursor()).toBeUndefined();
+
+  const first = anchors.listDue(1);
+  anchors.writeDueCursor(first.nextCursor);
+  // A fresh repository is a fresh PROCESS: in memory the cursor died with the old one, and a
+  // deployment that restarts faster than it can page through the due set never reached its tail.
+  expect(new SqliteOaAnchorRepository(db).readDueCursor()).toBe("company-a");
+
+  // …and a short page clears it, which is what makes the next sweep start over at the head.
+  const second = anchors.listDue(50, "company-a");
+  expect(second.nextCursor).toBeNull();
+  anchors.writeDueCursor(second.nextCursor);
+  expect(anchors.readDueCursor()).toBeUndefined();
+});
+
+test("the cursor WRAPS: a short page reports null, and the next sweep starts over", () => {
+  attach("a-1", "company-a");
+  attach("b-1", "company-b");
+  for (const c of ["company-a", "company-b"]) {
+    formation.claimStep(c, "await_filing");
+    formation.transition(c, "await_filing", "pending", "confirmed");
+  }
+  const page = anchors.listDue(50);
+  expect(page.entityKeys.sort()).toEqual(["a-1", "b-1"]);
+  // Fewer rows than the limit means the end of the set — the caller wraps rather than paging on.
+  expect(page.nextCursor).toBeNull();
+});
+
+test("no key starves: a permanently HELD cycle does not occupy a slot forever", () => {
+  // The starvation shape: a held cycle sorts first and would be re-read on every tick.
+  attach("aaa-held", "company-held");
+  anchors.claimVersion("aaa-held", 2, "0x02");
+  anchors.transition("aaa-held", 2, "pending", "vetoed");
+  attach("zzz-due", "company-due");
+  formation.claimStep("company-due", "await_filing");
+  formation.transition("company-due", "await_filing", "pending", "confirmed");
+
+  const first = anchors.listDue(1);
+  expect(first.entityKeys).toEqual(["aaa-held"]);
+  // The cursor is what makes the second tick see the OTHER one rather than the same held cycle.
+  const second = anchors.listDue(1, first.nextCursor!);
+  expect(second.entityKeys).toEqual(["zzz-due"]);
 });

@@ -221,12 +221,12 @@ test("C10: the unreachable second formation_parties rebuild is gone", () => {
 test("the CHECKs refuse an unknown step/state (typos become errors, not silent rows)", () => {
   expect(() =>
     db
-      .prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)")
+      .prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)")
       .run("k", "not_a_step", "pending"),
   ).toThrow(/CHECK/);
   expect(() =>
     db
-      .prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)")
+      .prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)")
       .run("k", "await_ein", "not_a_state"),
   ).toThrow(/CHECK/);
   expect(() =>
@@ -256,14 +256,17 @@ test("oa_anchors is keyed per VERSION: two cycles for one entity coexist (audit 
 });
 
 test("timestamps default to CURRENT_TIMESTAMP as TEXT (bridge_legs consistency)", () => {
-  db.prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)").run(
+  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
     "k",
     "create_provider",
     "pending",
   );
-  const row = db.prepare("SELECT created_at, updated_at FROM formation_requests").get() as {
+  const row = db
+    .prepare("SELECT created_at, updated_at, facts_updated_at FROM formation_requests")
+    .get() as {
     created_at: string;
     updated_at: string;
+    facts_updated_at: string;
   };
   expect(typeof row.created_at).toBe("string");
   expect(row.created_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
@@ -356,4 +359,90 @@ test("oa_anchors carries the two backoff scalars, and a PR-1-shaped table gains 
   expect(v1.execute_tx).toBe("0xtx");
   expect(v1.next_retry_at).toBeNull();
   old.close();
+});
+
+// ── 2026-08-26 §3: the indexes the new queries actually read ───────────────────────────────
+
+/** SQLite's own verdict, so "this index serves that query" is measured rather than asserted. */
+const planOf = (sql: string, ...params: unknown[]) =>
+  (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[])
+    .map((r) => r.detail)
+    .join(" | ");
+
+test("the DAILY CEILING count is an index seek, not a scan of every formation ever opened", () => {
+  // `createRequestsSince` runs on the money path — every company creation asks it.
+  const plan = planOf(
+    "SELECT COUNT(*) AS n FROM formation_requests WHERE step = 'create_provider' AND created_at > ?",
+    "2026-01-01 00:00:00",
+  );
+  expect(plan).toContain("idx_formation_created");
+  expect(plan).not.toContain("SCAN formation_requests");
+});
+
+test("listByTenant's ordering contract is served by the index, not by a sort of the whole page", () => {
+  const plan = planOf(
+    "SELECT * FROM companies WHERE tenant_id = ? ORDER BY created_at DESC, company_id",
+    "0xabc",
+  );
+  expect(plan).toContain("idx_companies_tenant_created");
+  expect(plan).not.toContain("SCAN companies");
+});
+
+test("the retired indexes are gone — including from a database that already had them", () => {
+  const names = () =>
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]
+    ).map((i) => i.name);
+  // `idx_formation_facts` served the anchor UNION arm's per-row comparison. Since that arm became
+  // a per-COMPANY aggregate, no query has a predicate or an ordering on the column alone — the
+  // index is pure write amplification on the formation loop's hottest write path.
+  expect(names()).not.toContain("idx_formation_facts");
+  expect(names()).not.toContain("idx_companies_tenant");
+
+  // The upgrade path: a box that already carries them must actually lose them, which
+  // `CREATE INDEX IF NOT EXISTS` alone can never do.
+  db.exec("CREATE INDEX idx_formation_facts ON formation_requests(facts_updated_at)");
+  db.exec("CREATE INDEX idx_companies_tenant ON companies(tenant_id, status)");
+  migrate(db);
+  expect(names()).not.toContain("idx_formation_facts");
+  expect(names()).not.toContain("idx_companies_tenant");
+});
+
+test("entities.company_id is WRITE-ONCE at the SCHEMA level, not by convention", () => {
+  // An anchored manifest publishes `legal.providerCompanyId` on a public chain, so re-attaching
+  // an entity makes a permanent on-chain claim false — there is no repair, only prevention. The
+  // rule used to be three comments and one careful CAS in `attachCompany`; a trigger is the
+  // version a future `upsert`, a migration or an operator at a sqlite3 prompt cannot get wrong.
+  for (const id of ["c-1", "c-2"])
+    db.prepare(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
+                              name_options, business_purpose, industry_label)
+       VALUES (?, 't', 'ready', 'doola', 'sandbox', '[]', 'p', 'i')`,
+    ).run(id);
+  db.prepare(
+    `INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay,
+                           ein, formation_date)
+     VALUES ('e-1', 'e-1', 'bound', '0x1', '0x2', '86400', 'STUB', 0)`,
+  ).run();
+
+  // The FIRST attach is allowed: NULL -> a company is what the CAS does.
+  db.prepare("UPDATE entities SET company_id = 'c-1' WHERE idempotency_key = 'e-1'").run();
+  expect(
+    (
+      db.prepare("SELECT company_id AS c FROM entities WHERE idempotency_key = 'e-1'").get() as {
+        c: string;
+      }
+    ).c,
+  ).toBe("c-1");
+
+  // Re-attaching is refused by the DATABASE, whatever the statement looks like.
+  expect(() =>
+    db.prepare("UPDATE entities SET company_id = 'c-2' WHERE idempotency_key = 'e-1'").run(),
+  ).toThrow(/WRITE-ONCE/);
+  // …and so is clearing it: `IS NOT` is null-safe, so NULL is a different value, not an escape.
+  expect(() =>
+    db.prepare("UPDATE entities SET company_id = NULL WHERE idempotency_key = 'e-1'").run(),
+  ).toThrow(/WRITE-ONCE/);
+  // A no-op write of the SAME id is not a re-attach and stays allowed.
+  db.prepare("UPDATE entities SET company_id = 'c-1' WHERE idempotency_key = 'e-1'").run();
 });

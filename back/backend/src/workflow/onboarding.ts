@@ -16,6 +16,7 @@ import {
   serializeManifestBytes,
   termsDocName,
 } from "../oa/manifest";
+import type { CompanyRepository } from "../persistence/companyRepository";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationPartyRepository } from "../persistence/formationPartyRepository";
@@ -115,18 +116,14 @@ export interface OnboardingDeps {
    * NOTHING else in the saga changes.
    */
   formation?: {
-    /**
-     * What a NEW record is pinned to — WHEN a party is bound to it (C5). A resumed record's
-     * persisted pair always wins: the custody-resolution twin, so the environment an in-flight
-     * entity was pinned to can never be re-pointed by a config flip (audit M5).
-     */
-    pin: FormationPin | null;
     /** The doola client. */
     doola: DoolaApi;
-    /** The formation sub-saga rows (`formation_requests`). */
+    /** The formation sub-saga rows (`formation_requests`), keyed by COMPANY. */
     requests: FormationRepository;
-    /** The PII table. The saga reads the party bound to THIS entity, and nothing else. */
+    /** The PII table. The saga reads the party bound to THIS COMPANY, and nothing else. */
     parties: FormationPartyRepository;
+    /** The company store: the row that carries the intake, the pin and the filing facts. */
+    companies: CompanyRepository;
     /**
      * The environment this DEPLOYMENT is configured for — deliberately separate from `pin`, which
      * is the per-claim value: the pinning refusal (audit M5) compares the two, and a deployment
@@ -202,25 +199,18 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     ? (rec.walletProvider ?? "turnkey")
     : (d.custody ?? "turnkey");
 
-  // Formation pinning, the custody twin (design §2, audit M5): for ANY existing record the
-  // PERSISTED provider/environment win — including legacy rows whose pair is null, which mean
-  // "stub forever". Only a genuinely fresh record takes this deployment's configuration, so a
-  // mainnet flip can never re-route an in-flight sandbox company at the production host.
+  // Formation pinning, the custody twin (design §2, audit M5): the PERSISTED
+  // provider/environment win, always — including for legacy rows whose pair is null, which mean
+  // "stub forever". Nothing here derives a pin from configuration, so a mainnet flip can never
+  // re-route an in-flight sandbox company at the production host.
   //
-  // A fresh record is pinned IFF a party is bound to its key (C5) — the same rule the runner's
-  // claim applies, restated here because the CLI and the legacy onboarding server reach this
-  // function without going through the runner at all.
-  const boundParty = d.formation?.parties.findByEntityKey(key);
-  const formationProvider = rec
-    ? (rec.formationProvider ?? null)
-    : boundParty
-      ? (d.formation?.pin?.provider ?? null)
-      : null;
-  const formationEnvironment = rec
-    ? (rec.formationEnvironment ?? null)
-    : boundParty
-      ? (d.formation?.pin?.environment ?? null)
-      : null;
+  // A record that does not exist yet is UNPINNED, by construction: the pin is copied from the
+  // COMPANY ROW inside the runner's claim, in the same transaction that writes `company_id`
+  // (2026-08-26 §3), so there is no window in which a fresh record has a company and no pin.
+  // This function only ever reads back what that claim wrote — an earlier version looked the
+  // company up here for the fresh case, which could not happen and never did.
+  const formationProvider = rec?.formationProvider ?? null;
+  const formationEnvironment = rec?.formationEnvironment ?? null;
 
   // ── M3. A record that is PINNED but has no party bound can never be filed: Step 9 would burn
   //    eight attempts on `no formation party is bound` and end in `abandoned`, which is the
@@ -236,11 +226,11 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   if (
     d.formation &&
     formationProvider === "doola" &&
-    !boundParty &&
+    !rec?.companyId &&
     (!rec || rec.status === "pending")
   )
     throw new Error(
-      `entity ${key} is pinned to formation provider "doola" but no formation party is bound to it — it could never be filed (bind a party at the claim, or do not pin)`,
+      `entity ${key} is pinned to formation provider "doola" but is attached to no company — it could never be filed (attach a company at the claim, or do not pin)`,
     );
 
   // ── Step 0a (circle custody): provision the per-agent Circle wallets (SCA operator + EOA
@@ -734,12 +724,18 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   //    `runFormationCreateProvider` is non-throwing by construction; the catch is the last line
   //    of defense, and it is here because "formation never fails an onboarding" is a property
   //    worth being unable to break by accident.
-  if (rec.formationProvider === "doola" && d.formation) {
+  //
+  //    Keyed by the COMPANY since 2026-08-26: the filing belongs to the company, so a SECOND
+  //    agent attaching to a company that is already filed opens nothing (`claimAllSteps` is a
+  //    no-op and the create step returns on the confirmed row) — which is the whole point of
+  //    reuse. The sweeper's `listUnopenedFormations` is the other driver, and it needs no entity
+  //    at all.
+  const filingCompany = rec.companyId ? d.formation?.companies.find(rec.companyId) : undefined;
+  if (rec.formationProvider === "doola" && d.formation && filingCompany) {
     try {
       await runFormationCreateProvider({
-        entityKey: key,
-        rec,
-        spec: d.spec,
+        company: filingCompany,
+        companies: d.formation.companies,
         repo: d.repo,
         requests: d.formation.requests,
         parties: d.formation.parties,

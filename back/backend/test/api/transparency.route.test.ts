@@ -179,6 +179,28 @@ test("cross-origin OPTIONS preflight gets ACAO: *", async () => {
 
 // ── formation (design §8) ───────────────────────────────────────────────────────────────────
 
+/** The company a formed row is attached to. The public surface reads its ENVIRONMENT and the
+ *  derived status off it, and nothing else — no EIN, no filing number, no provider reference. */
+const COMPANY_KEY = "company-public";
+const PUBLIC_COMPANY = {
+  companyId: COMPANY_KEY,
+  tenantId: "tenant-a",
+  status: "ready" as const,
+  provider: "doola",
+  environment: "sandbox" as const,
+  synthetic: false,
+  nameOptions: [],
+  businessPurpose: "purpose",
+  industryLabel: "Software development",
+  intakeSynthesized: true,
+  legalNameFiled: null,
+  filedAt: 1_755_600_000,
+  filingNumber: "2026-123456",
+  ein: "98-7654321",
+  createdAt: "2026-08-21 12:00:00",
+  updatedAt: "2026-08-21 12:00:00",
+};
+
 test("a legacy/stub row serves formation: null — forever, with no backfill", async () => {
   repo.upsert(base);
   const body = await (await app().request("/transparency")).json();
@@ -187,9 +209,10 @@ test("a legacy/stub row serves formation: null — forever, with no backfill", a
 
 test("a formed row serves the DERIVED status and its environment, and nothing else", async () => {
   repo.upsert({ ...base, formationProvider: "doola", formationEnvironment: "sandbox" });
+  repo.attachCompany(base.idempotencyKey, COMPANY_KEY);
   const steps = () => [
     {
-      entityKey: base.idempotencyKey,
+      companyId: COMPANY_KEY,
       step: "await_filing" as const,
       state: "confirmed" as const,
       attempt: 0,
@@ -203,6 +226,7 @@ test("a formed row serves the DERIVED status and its environment, and nothing el
     repo,
     jobs,
     formationSteps: steps,
+    company: () => PUBLIC_COMPANY,
   } as never);
   const body = await (await built.request("/transparency")).json();
   // The honesty invariant on the PUBLIC surface: a sandbox filing is labeled as one here too.
@@ -210,15 +234,9 @@ test("a formed row serves the DERIVED status and its environment, and nothing el
 });
 
 test("the public surface NEVER carries the EIN, the filing number, or anything about a person", async () => {
-  // The record holds every fact an authenticated owner may see…
-  repo.upsert({
-    ...base,
-    formationProvider: "doola",
-    formationEnvironment: "sandbox",
-    einReal: "98-7654321",
-    formationFilingNumber: "2026-123456",
-    formationFiledAt: 1_755_600_000,
-  });
+  // The COMPANY holds every fact an authenticated owner may see…
+  repo.upsert({ ...base, formationProvider: "doola", formationEnvironment: "sandbox" });
+  repo.attachCompany(base.idempotencyKey, COMPANY_KEY);
   // …and a party row exists for it, with real PII in the database.
   db.prepare(
     `INSERT INTO formation_parties (party_id, entity_key, tenant_id, legal_first_name,

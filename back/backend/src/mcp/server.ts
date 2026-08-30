@@ -5,7 +5,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
-import { type EntityViewDeps, toEntityView, toEntityViews } from "../api/views";
+import { type EntityViewDeps, listCompanyViews, toEntityView, toEntityViews } from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
 import {
   createFormationParty,
@@ -13,6 +13,8 @@ import {
   formationUnavailableMessage,
   truncateTenant,
 } from "../formation";
+import { createCompany } from "../formation/company";
+import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { opsLog } from "../observability/opsLog";
@@ -73,9 +75,15 @@ export interface McpToolDeps extends EntityViewDeps {
   /** World ID guardian gate (mirrors the REST /onboard gate). Optional. */
   worldId?: import("../api/routes/worldId").WorldIdDeps;
   /** doola formation (design §2/§5), the SAME object ApiDeps carries — availability, the
-   *  requirement, the PII intake policy, the spend limits and the two repositories. Absent =
-   *  this deployment forms nothing, and neither the tool nor the gate exists. */
+   *  requirement, the PII intake policy, the spend limits and the repositories. Absent =
+   *  this deployment forms nothing, and neither the tools nor the gate exist. */
   formation?: import("../api/app").ApiDeps["formation"];
+  /** The company store and the steps lookup, for `list_companies` and the entity projection —
+   *  the SAME objects ApiDeps carries, so MCP and REST cannot describe a company differently. */
+  companies?: import("../api/app").ApiDeps["companies"];
+  formationSteps?: import("../api/app").ApiDeps["formationSteps"];
+  /** Injectable clock (ms) for tests; defaults to Date.now. */
+  now?: () => number;
 }
 
 /**
@@ -570,20 +578,110 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       },
     );
 
+  /**
+   * COMPANIES over MCP (design §7). The same domain function the REST door calls.
+   *
+   * `create_formation_party` STAYS its own call: the bind CAS needs a party row that already
+   * exists, and personal data must never ride in a spec-shaped tool argument. This tool takes the
+   * partyId that one returns.
+   *
+   * ⚠ It takes NO `ssn`, deliberately and permanently (§4.1). An SSN in an MCP tool argument
+   * would sit in an LLM client's context window and in its logs; the web form is the only place
+   * one is ever collected.
+   */
+  if (deps.formation) {
+    server.registerTool(
+      "create_company",
+      {
+        title: "Create company",
+        description: `Create the legal body (a Wyoming LLC) your agents will be filed under, and get back a companyId to pass to onboard_agent. ${formationCapabilityNote(deps)} partyId is the handle from create_formation_party — the natural person legally answerable for the filing. This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling. It never takes an SSN — if one is needed, use the web form. Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.`,
+        inputSchema: {
+          partyId: z.string(),
+          /** The company name. A2 replaces this with three ranked candidates. */
+          name: z.string(),
+          /** The sandbox deployment's marker, checked against this box's own setting. */
+          synthetic: z.boolean().optional(),
+        },
+      },
+      async ({ partyId, name, synthetic }) => {
+        if (!hasCapability(scope, "provision") || scope.entityId !== null)
+          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        try {
+          const result = createCompany(
+            // The composition root's ONE dependency set; this door supplies only its transaction.
+            {
+              ...deps.formation!.companyDeps,
+              transaction: (fn) => deps.repo.transaction(fn),
+            },
+            tenantId,
+            { partyId, name, synthetic: synthetic === true ? true : undefined },
+          );
+          if ("error" in result)
+            return { content: [{ type: "text", text: result.error }], isError: true };
+          return {
+            content: [{ type: "text", text: JSON.stringify({ companyId: result.companyId }) }],
+          };
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+        }
+      },
+    );
+  }
+
+  /**
+   * `list_companies` is registered wherever a COMPANY STORE is, exactly like REST
+   * `GET /companies` — and deliberately not under `deps.formation` as it was.
+   *
+   * Reading the legal bodies you already own is not a formation capability: a box whose doola
+   * credentials have been pulled still holds real Wyoming LLCs, and an agent surface that cannot
+   * name them while the browser can is the silent asymmetry `EntityViewDeps` was made one object
+   * to prevent. `create_company` stays gated on `deps.formation`, because that one spends money.
+   */
+  if (deps.companies) {
+    server.registerTool(
+      "list_companies",
+      {
+        title: "List companies",
+        description:
+          "List the legal bodies you own, NEWEST FIRST — the same ordering the web picker defaults to. Each row carries its filing status, how many agents share it, and the name candidates it was filed under. Attaching a new agent to one of these is free; pass its companyId to onboard_agent.",
+        inputSchema: {},
+      },
+      async () => {
+        if (!hasCapability(scope, "read"))
+          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        return {
+          content: [
+            {
+              type: "text",
+              // The SAME projection REST `GET /companies` renders — literally the same function,
+              // because the two are one API-level contract (the picker's ordering and its
+              // labels) and two literals is how the agent surface quietly ended up dropping the
+              // business purpose, the industry and both filing facts.
+              text: JSON.stringify({
+                companies: listCompanyViews({ ...deps, companies: deps.companies! }, tenantId),
+              }),
+            },
+          ],
+        };
+      },
+    );
+  }
+
   server.registerTool(
     "onboard_agent",
     {
       title: "Onboard agent",
-      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} partyId is the handle returned by create_formation_party — the legal identity the entity is filed under; never put personal data in spec. ${formationCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
+      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} companyId attaches this agent to a company you already own (free, and the fastest path — see list_companies); partyId instead creates a fresh 1:1 company for a new legal identity. Never put personal data in spec. ${formationCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
         idempotencyKey: z.string().optional(),
         custody: z.enum(["turnkey", "circle"]).optional(),
         partyId: z.string().optional(),
+        companyId: z.string().optional(),
       },
     },
-    async ({ spec, passkeyId, idempotencyKey, custody, partyId }) => {
+    async ({ spec, passkeyId, idempotencyKey, custody, partyId, companyId }) => {
       if (!hasCapability(scope, "provision") || scope.entityId !== null)
         return { content: [{ type: "text", text: "not authorized" }], isError: true };
       const passkey = deps.passkeys.get(tenantId, passkeyId);
@@ -607,7 +705,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         // Formation gate: AFTER custody, BEFORE the World check — the SAME order as the REST
         // /onboard route, running the SAME function (src/formation.ts), so a request that is
         // both party-less and quota-exhausted gets the identical primary error on both surfaces.
-        const formationRefusal = formationDoorRefusal(deps, { tenantId, partyId });
+        const formationRefusal = formationDoorRefusal(deps, { tenantId, partyId, companyId });
         if (formationRefusal)
           return { content: [{ type: "text", text: formationRefusal }], isError: true };
         // Mirror of the REST gate: when World enforcement is on, the guardian must be a
@@ -628,6 +726,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           guardianPasskey: passkey,
           custody: resolvedCustody,
           partyId,
+          companyId,
         });
         return { content: [{ type: "text", text: JSON.stringify({ id, status }) }] };
       } catch (e) {

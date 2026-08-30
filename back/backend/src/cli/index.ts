@@ -312,6 +312,112 @@ export function buildCli(
       if (!revoked) process.exitCode = 1;
     });
 
+  // ── formation:abandon — the OPERATOR ESCAPE (design 2026-08-26 §2 step 1) ──────────────────
+  //
+  // The entity→company migration REFUSES to run while any `create_provider` row is non-terminal,
+  // because re-keying a live create rotates its idempotency key and doola would file a SECOND
+  // real Wyoming LLC. Most such rows clear themselves: the sweeper retries them and abandons them
+  // at the attempt bound. One shape never does — a row parked on `key_reused` or on a lost answer
+  // never burns an attempt, by design (C1), so a human-parked row would block the upgrade forever.
+  // This is the deliberate, ops-logged act that clears it.
+  //
+  // It REFUSES when `provider_ref IS NOT NULL`: a create that reached doola is ADOPTED, never
+  // abandoned by hand, and abandoning it is what would erase the responsible party's data for a
+  // company that may really exist in Wyoming's records.
+  //
+  // DB-only, like the waiver commands, and deliberately WITHOUT `migrate()`: this command exists
+  // to be run on a box whose migration is refusing, so running that migration first would be a
+  // catch-22. It therefore speaks whichever schema it finds.
+  program
+    .command("formation:abandon")
+    .argument("<entityKey>", "the entity whose create_provider row is parked (or its companyId)")
+    .option("-r, --reason <text>", "why, for the ops trail", "operator abandon (pre-migration)")
+    .description("Abandon a parked create_provider row so the company re-key can proceed")
+    .action(async (key: string, opts: { reason: string }) => {
+      const { config: loadDotenv } = await import("dotenv");
+      const { loadConfig } = await import("../config/env");
+      const { openDatabase } = await import("../persistence/db");
+      const { SqliteCompanyRepository } = await import("../persistence/companyRepository");
+      const { SqliteFormationRepository } = await import("../persistence/formationRepository");
+      const { opsLog } = await import("../observability/opsLog");
+      const { abandonFormation } = await import("../workflow/formationStep");
+      loadDotenv();
+      // `loadConfig().dbPath`, never `process.env.DB_PATH`: there is no DB_PATH knob. The config
+      // derives the path from DATA_DIR, so an operator who moved the data directory would have
+      // had this command open a DIFFERENT, empty database and report "no create_provider row"
+      // about a formation that is sitting right there.
+      const db = openDatabase(loadConfig().dbPath);
+
+      // Whichever shape is on disk. Pre-migration the rows are keyed by entity; post-migration by
+      // company, and the argument is resolved through `entities.company_id`.
+      const cols = (
+        db.prepare("PRAGMA table_info(formation_requests)").all() as { name: string }[]
+      ).map((c) => c.name);
+      const legacy = cols.includes("entity_key");
+      const target = legacy
+        ? key
+        : ((
+            db.prepare("SELECT company_id AS c FROM entities WHERE idempotency_key = ?").get(key) as
+              | { c: string | null }
+              | undefined
+          )?.c ?? key);
+      const column = legacy ? "entity_key" : "company_id";
+
+      const row = db
+        .prepare(
+          `SELECT state, provider_ref AS providerRef FROM formation_requests
+            WHERE ${column} = ? AND step = 'create_provider'`,
+        )
+        .get(target) as { state: string; providerRef: string | null } | undefined;
+      if (!row) throw new Error(`no create_provider row for "${key}"`);
+      if (row.providerRef)
+        throw new Error(
+          `refusing: create_provider for "${key}" holds doola company id ${row.providerRef}. A create that REACHED doola is adopted, never abandoned by hand — abandoning it would erase the responsible party's data for a company that may exist in Wyoming's records. Let the saga adopt it.`,
+        );
+      if (row.state === "abandoned") {
+        console.log("already abandoned");
+        return;
+      }
+      const reason = `operator abandon: ${opts.reason}`;
+      // POST-migration this is the SAME domain function the sweeper's own terminal verdict uses:
+      // one transaction, the step and the company together, `facts_updated_at` stamped. The two
+      // raw UPDATEs it replaces ran outside any transaction and stamped nothing, so a crash
+      // between them left a company `ready` — attachable and quota-chargeable — over an
+      // abandoned create.
+      //
+      // The LEGACY branch stays a raw statement because it must: on a pre-migration box there is
+      // no `companies` table and `formation_requests` has no `company_id`, so neither repository
+      // can even be constructed, and this command exists precisely to be run there.
+      const changed = legacy
+        ? db
+            .prepare(
+              `UPDATE formation_requests
+                  SET state = 'abandoned', error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE entity_key = ? AND step = 'create_provider' AND state = ?`,
+            )
+            .run(reason, target, row.state).changes === 1
+        : abandonFormation(
+            new SqliteFormationRepository(db),
+            new SqliteCompanyRepository(db),
+            target,
+            reason,
+            {
+              transaction: (fn) => db.transaction(fn)(),
+              from: row.state as "pending" | "submitted" | "failed",
+            },
+          );
+      if (!changed) throw new Error("lost the race: the row moved, re-run to see its state");
+      opsLog("formation_abandoned", {
+        severity: "CRITICAL",
+        level: "error",
+        [legacy ? "entityKey" : "companyId"]: target,
+        step: "create_provider",
+        by: "operator",
+        reason: opts.reason,
+      });
+      console.log(`abandoned create_provider for ${key}`);
+    });
+
   return program;
 }
 

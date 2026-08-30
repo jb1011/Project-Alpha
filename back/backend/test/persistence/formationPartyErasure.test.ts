@@ -92,7 +92,7 @@ test("erase() NULLs every PII column, keeps the handle, the owner and the dates,
 
   // An erased party is gone for every purpose: no reader may resurrect it.
   expect(parties.findOwned(TENANT, partyId)).toBeUndefined();
-  expect(parties.bind(partyId, "t:agent-1", TENANT)).toBe(false);
+  expect(parties.bindToCompany(partyId, "t:agent-1", TENANT)).toBe(false);
   // Idempotent: a second sweep finds nothing to do.
   expect(parties.erase(partyId)).toBe(false);
 });
@@ -100,13 +100,13 @@ test("erase() NULLs every PII column, keeps the handle, the owner and the dates,
 test("erasable = an ABANDONED filing, or an UNBOUND handle older than the cutoff", () => {
   // 1. bound to an abandoned formation -> the filing will never happen
   const abandoned = newParty();
-  parties.bind(abandoned, "t:abandoned", TENANT);
+  parties.bindToCompany(abandoned, "t:abandoned", TENANT);
   requests.claimAllSteps("t:abandoned");
   requests.transition("t:abandoned", "create_provider", "pending", "abandoned");
 
   // 2. bound to a formation that is still going -> NOT erasable
   const live = newParty();
-  parties.bind(live, "t:live", TENANT);
+  parties.bindToCompany(live, "t:live", TENANT);
   requests.claimAllSteps("t:live");
   requests.transition("t:live", "create_provider", "pending", "confirmed");
 
@@ -192,7 +192,7 @@ function bound(entityKey: string): string {
     country: "USA",
     synthetic: false,
   });
-  parties.bind(partyId, entityKey, TENANT);
+  parties.bindToCompany(partyId, entityKey, TENANT);
   requests.claimAllSteps(entityKey);
   return partyId;
 }

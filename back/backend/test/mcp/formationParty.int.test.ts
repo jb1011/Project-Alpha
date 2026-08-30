@@ -11,8 +11,10 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import type { GuardianPasskey } from "../../src/adapters/turnkey/provisioner";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { createCompany } from "../../src/formation/company";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
@@ -84,11 +86,40 @@ function buildTestApp(
   formation?: { required?: boolean; syntheticPii?: boolean; maxPerTenant?: number },
   custody: { circle?: boolean; turnkey?: boolean } = {},
 ) {
+  const companies = new SqliteCompanyRepository(db);
+  const requests = new SqliteFormationRepository(db);
+  const pin = { provider: "doola" as const, environment: "sandbox" as const };
+  // ONE dependency set for all three doors, exactly as the composition root builds it — only the
+  // transaction differs per call site.
+  const companyDeps = {
+    companies,
+    parties,
+    requests,
+    pin,
+    sandboxSyntheticPii: formation?.syntheticPii ?? false,
+    maxPerTenant: formation?.maxPerTenant ?? 3,
+    dailyCeiling: 10,
+  };
   const runner = new OnboardingRunner({
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
-    parties,
+    // The A1 shim: a party-only onboard mints its 1:1 company inside the claim (design §10).
+    formation: formation
+      ? {
+          companies,
+          requests,
+          maxAgentsPerCompany: 10,
+          createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
+            const result = createCompany({ ...companyDeps, transaction: (fn) => fn() }, tenantId, {
+              ...intake,
+              synthetic: formation.syntheticPii ? true : undefined,
+            });
+            if ("error" in result) throw new Error(result.error);
+            return result.companyId;
+          },
+        }
+      : undefined,
   });
   return buildApiApp({
     webOrigin: "*",
@@ -114,10 +145,15 @@ function buildTestApp(
           sandboxSyntheticPii: formation.syntheticPii ?? false,
           maxPerTenant: formation.maxPerTenant ?? 3,
           dailyCeiling: 10,
+          maxAgentsPerCompany: 10,
           parties,
-          requests: new SqliteFormationRepository(db),
+          requests,
+          companies,
+          pin,
+          companyDeps,
         }
       : undefined,
+    companies,
   } as never);
 }
 
@@ -250,7 +286,9 @@ test("REQUIRED: a valid party onboards and is bound; a second use is refused", a
       ),
     );
     expect(out.status).toBe("pending");
-    expect(parties.findByEntityKey(out.id)!.partyId).toBe(partyId);
+    expect(parties.findByCompanyId(repo.findByIdempotencyKey(out.id)!.companyId!)!.partyId).toBe(
+      partyId,
+    );
 
     const second = await c.callTool({
       name: "onboard_agent",
@@ -345,8 +383,9 @@ test("the quota refuses onboard_agent before the entity is minted", async () => 
         }),
       ),
     );
-    db.prepare("INSERT INTO formation_requests (entity_key, step, state) VALUES (?,?,?)").run(
-      out.id,
+    // The COMPANY's create_provider row is what burns the door's quota since the re-key.
+    db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
+      repo.findByIdempotencyKey(out.id)!.companyId!,
       "create_provider",
       "pending",
     );
@@ -364,4 +403,110 @@ test("the quota refuses onboard_agent before the entity is minted", async () => 
     expect(textOf(res)).toMatch(/formation quota exhausted/);
   });
   expect(repo.listByTenant(TENANT)).toHaveLength(1);
+});
+
+// ── COMPANIES over MCP (design 2026-08-26 §7) ───────────────────────────────────────────────
+
+/** The company projection's key set, asserted IDENTICALLY on both surfaces (§7). Its twin lives
+ *  in test/api/formationParty.routes.test.ts; a field added to one door and not the other fails
+ *  whichever of the two was forgotten. */
+const COMPANY_VIEW_KEYS = [
+  "agents",
+  "businessPurpose",
+  "companyId",
+  "createdAt",
+  "environment",
+  "filedAt",
+  "filingNumber",
+  "formationStatus",
+  "industryLabel",
+  "legalNameFiled",
+  "nameOptions",
+  "paying",
+  "status",
+  "synthetic",
+];
+
+test("create_company is gated on FORMATION; list_companies on the company store, like REST", async () => {
+  const on = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const tools = await withClient(on, key, async (c) => (await c.listTools()).tools);
+  const create = tools.find((t) => t.name === "create_company")!;
+  expect(create).toBeDefined();
+  expect(tools.map((t) => t.name)).toContain("list_companies");
+  // ⚠ PERMANENT: an SSN in a tool argument would sit in an LLM client's context window and in
+  // its logs. The web form is the only place one is ever collected (§4.1).
+  expect(Object.keys(create.inputSchema.properties ?? {})).toEqual([
+    "partyId",
+    "name",
+    "synthetic",
+  ]);
+
+  const off = buildTestApp(undefined);
+  const { key: key2 } = apiKeys.mint(TENANT, { capability: "provision" });
+  const offNames = await withClient(off, key2, async (c) =>
+    (await c.listTools()).tools.map((t) => t.name),
+  );
+  // Creating a company SPENDS, so it needs the filer. READING the ones you already own does not:
+  // a box whose doola credentials were pulled still holds real Wyoming LLCs, and REST
+  // `GET /companies` answers for them whenever a company store is wired. The agent surface must
+  // not be quietly less capable than the browser one.
+  expect(offNames).not.toContain("create_company");
+  expect(offNames).toContain("list_companies");
+});
+
+test("MCP and REST mint the SAME company — one domain function, one set of refusals", async () => {
+  const app = buildTestApp({ required: true });
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+
+  await withClient(app, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    const { companyId } = JSON.parse(
+      textOf(
+        await c.callTool({ name: "create_company", arguments: { partyId, name: "Acme LLC" } }),
+      ),
+    );
+    expect(companyId).toBeTruthy();
+
+    // The single-use rule reaches this door too: one identity, one company.
+    const reused = await c.callTool({
+      name: "create_company",
+      arguments: { partyId, name: "Second" },
+    });
+    expect(textOf(reused)).toMatch(/unknown, not yours, or already bound/);
+
+    // list_companies renders the same projection REST does, newest first — FIELD FOR FIELD.
+    // The two are one API-level contract (the picker's ordering and its labels), and MCP was
+    // silently dropping businessPurpose, industryLabel, filedAt and filingNumber: an agent
+    // surface less true than the browser one, for no reason anybody chose. The counterpart
+    // assertion is in test/api/formationParty.routes.test.ts — the two lists must stay identical.
+    const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
+    expect(listed.companies).toHaveLength(1);
+    expect(Object.keys(listed.companies[0]).sort()).toEqual(COMPANY_VIEW_KEYS);
+    expect(listed.companies[0]).toMatchObject({
+      companyId,
+      status: "ready",
+      formationStatus: "none",
+      paying: false,
+      agents: 0,
+      businessPurpose: expect.any(String),
+      industryLabel: expect.any(String),
+      filedAt: null,
+      filingNumber: null,
+    });
+
+    // …and onboard_agent attaches to it, free.
+    const out = JSON.parse(
+      textOf(
+        await c.callTool({
+          name: "onboard_agent",
+          arguments: { spec: VALID_SPEC, passkeyId: handle, companyId },
+        }),
+      ),
+    );
+    expect(repo.findByIdempotencyKey(out.id)?.companyId).toBe(companyId);
+  });
 });

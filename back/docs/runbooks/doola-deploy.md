@@ -1,10 +1,70 @@
 # Runbook — deploying the doola formation provider
 
 > Design: `back/docs/design/2026-08-19-doola-formation-provider-design.md` §2 (the pin), §5 (the
-> doors), §7 (the sweeper).
+> doors), §7 (the sweeper), **superseded for the KEY by
+> `back/docs/design/2026-08-26-formation-prod-ready-design.md` §2/§3/§7 (companies)**.
 > Webhook receiver: `docs/runbooks/doola-webhooks.md`.
-> Code: `back/backend/src/formation.ts`, `back/backend/src/workflow/runner.ts`,
-> `back/backend/src/api/main.ts`.
+> Code: `back/backend/src/formation.ts`, `back/backend/src/formation/company.ts`,
+> `back/backend/src/workflow/runner.ts`, `back/backend/src/api/main.ts`.
+
+## ⚠ A1 (2026-08-26): the filing belongs to a COMPANY, not to an agent
+
+Everything below still holds, with one substitution: a filing is keyed by a **company**, and
+entities attach to it many-to-one. `formation_requests` is `(company_id, step)`, documents are
+company-scoped, and the legal facts (`filed_at`, `filing_number`, `ein`, `legal_name_filed`) live
+on the `companies` row rather than on `entities`.
+
+What that changes for an operator:
+
+- **the upgrade REFUSES to run while a create is in flight.** The boot throws, names the entity,
+  and names the command below. That is not a bug: re-keying a live create rotates its idempotency
+  key, and doola would file a SECOND real Wyoming LLC under a second real fee;
+- **`npm run cli -- formation:abandon <entityKey>`** is the escape. It moves a parked
+  `create_provider` row to `abandoned` (ops-logged, CRITICAL) so the migration can proceed, and it
+  **refuses when the row holds a doola company id** — a create that reached doola is adopted, never
+  abandoned by hand, because abandoning it is what erases the responsible party's data for a
+  company that may really exist in Wyoming's records. Run it, then restart;
+- **every existing client keeps working.** A party-only onboard (which is every client today) mints
+  a 1:1 company inside the claim transaction — the A1 shim — so nothing about the wizard changes;
+- **new doors:** `POST /companies` + `GET /companies`, and MCP `create_company` + `list_companies`.
+  `POST /onboard` and `onboard_agent` now also take `companyId` to ATTACH an agent to a company
+  that already exists. Attaching is free; only creating a company costs a filing.
+
+Before the upgrade, on the box:
+
+```bash
+# Run these against the PRE-migration shape (formation_requests is still entity-keyed here).
+# Any row from either query blocks the migration. Empty from both = the upgrade will run clean.
+
+# 1. A create still in flight. Re-keying it would file a SECOND real Wyoming LLC.
+sqlite3 "$DATA_DIR/legalbody.db" \
+  "SELECT entity_key, state, provider_ref FROM formation_requests
+    WHERE step='create_provider'
+      AND (state IN ('pending','submitted') OR (state='failed' AND provider_ref IS NULL));"
+
+# 2. An entity that holds formation state but carries NO pin. `companies.environment` is what
+#    routes a filing at sandbox or at production, and the migration will not invent one. Expected
+#    to be empty: the claim writes the pin, the company and the party bind in one transaction.
+#    A row here needs a human to set formation_provider/formation_environment deliberately (or to
+#    erase the party bound to it) before the upgrade can run.
+sqlite3 "$DATA_DIR/legalbody.db" \
+  "SELECT e.idempotency_key, e.formation_provider, e.formation_environment
+     FROM entities e
+     LEFT JOIN formation_parties p
+       ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
+    WHERE (e.formation_provider IS NULL OR e.formation_environment IS NULL)
+      AND (p.party_id IS NOT NULL
+           OR EXISTS (SELECT 1 FROM formation_requests f WHERE f.entity_key = e.idempotency_key)
+           OR EXISTS (SELECT 1 FROM documents d WHERE d.entity_key = e.idempotency_key))
+    GROUP BY e.idempotency_key;"
+```
+
+After the upgrade, a synthesized company mirrors its legacy `create_provider` verdict: an
+`abandoned` create yields an `abandoned` company (not attachable, not re-opened by the sweeper),
+and everything else yields `ready`.
+
+`formation:abandon` resolves its database through the same config the API does (`DATA_DIR`);
+there is no `DB_PATH` override.
 
 ## The one sentence
 
@@ -86,12 +146,52 @@ whatever it was pinned to, forever.
 
 ## Spend controls
 
-`FORMATION_MAX_PER_TENANT` (default 3) and `FORMATION_DAILY_CEILING` (default 10) are checked at
-the door, before the entity is claimed, **whenever the onboard carries a party** — on every
-deployment, `required` or not. An opt-in filing costs the same $100–150 as a mandatory one.
+`FORMATION_MAX_PER_TENANT` (default 3) and `FORMATION_DAILY_CEILING` (default 10) are checked
+before any row is minted, **whenever a company would be created** — on every deployment,
+`required` or not. An opt-in filing costs the same $100–150 as a mandatory one.
 
-Both counts include FAILED `create_provider` rows, deliberately: a create that failed after doola
-committed has already cost a real company and a real fee.
+Since A1 the two count different things, on purpose:
+
+- the **per-tenant quota** counts CHARGEABLE COMPANIES (`status='ready'`, or carrying a live
+  payment). Drafts do not count: with payment on, a company can sit in draft for days, and an
+  abandoned form must not exhaust a real quota;
+- the **daily ceiling** counts `create_provider` ROWS — where the fee is actually incurred —
+  including FAILED ones, deliberately: a create that failed after doola committed has already cost
+  a real company and a real fee.
+
+`FORMATION_MAX_AGENTS_PER_COMPANY` (default 10) bounds how many agents may share one filing. Each
+attached agent is its own anchor sequence per late fact — two sponsored on-chain writes through
+its own timelock, plus a guardian notification — so an EIN arriving on a ten-agent company is
+about 60 transactions (~$0.54 at the measured $0.009/op).
+
+`WORLD_MAX_COMPANIES_PER_HUMAN` bounds FILINGS per verified human, separately from
+`WORLD_MAX_ENTITIES_PER_HUMAN`, which bounds agents. **Production formation (`DOOLA_ENVIRONMENT=
+production`) BOOT-FAILS** without all three `WORLD_*` credentials, without
+`WORLD_REQUIRE_GUARDIAN`, and without `WORLD_MAX_COMPANIES_PER_HUMAN`: the guardian gate silently
+passes everyone when the World block is only half-configured, so the invariant asserts the wired
+dependency rather than the env strings.
+
+## A1 merge gates — the three things a human still has to run
+
+None of these can be a test: two of them cost real sandbox companies and need a live key, and no
+test in this repo makes a live doola call.
+
+1. **`npx tsx scripts/doola-filed-name-probe.mts`** — files a sandbox company with THREE distinct
+   name candidates, completes it through the playground, and prints which surface actually
+   carries the accepted name (list item `.name` / full `.nameOptions` / the AOO document). Until
+   this is recorded, the §5 matcher is pointed at the list item on the strength of one 2026-08-27
+   observation, and `legal_name_filed` stays NULL whenever it does not match — which is honest,
+   but it means `manifest.legal.companyName` never appears.
+2. **`npx tsx scripts/doola-idempotency-reorder-probe.mts`** — one request settles whether
+   doola's idempotency comparison is byte-wise or semantic: same key, same values, keys
+   reordered. A `409` means the stored body must be replayed VERBATIM, which is what makes
+   intake immutability and the frozen `expedited` flag load-bearing rather than tidy.
+3. **The FormationE2E_1 run, captured as a runbook artifact.** It is the migration's golden
+   fixture: the fixtures in `test/persistence/companyMigration.test.ts` are built from a frozen
+   copy of the PR-4 schema, and the capture is what proves that copy matches the box.
+
+Both probes are sandbox-only by construction (they refuse a key that is not `dk_test_…`) and read
+`DOOLA_API_KEY` from the environment, writing it to no file.
 
 ## Boot ordering (C4)
 

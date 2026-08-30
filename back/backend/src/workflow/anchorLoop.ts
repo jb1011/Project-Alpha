@@ -22,7 +22,9 @@ import {
   serializeManifestBytes,
 } from "../oa/manifest";
 import { opsLog } from "../observability/opsLog";
+import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import {
+  type DocumentIndexRecord,
   type DocumentIndexRepository,
   documentFileName,
 } from "../persistence/documentIndexRepository";
@@ -81,9 +83,13 @@ import { usesManifestScheme } from "./onboarding";
  * ── Concurrency ────────────────────────────────────────────────────────────────────────────
  *
  * DB-level, not mutex-level (audit M13/20): every state move is a compare-and-set, and the entity
- * columns are written inside the transaction that WON it. `withKeyedLock` is layered on by the
- * callers as an optimization — this module is deliberately lock-free so it can be called from
- * inside a lock the caller already holds (the processor does exactly that).
+ * columns are written inside the transaction that WON it. This module is deliberately lock-free;
+ * EVERY caller wraps it in `withKeyedLock(entityKey, …)`, and that is not merely an optimization
+ * (2026-08-26 §3): the CAS cannot stop two drivers that both read `oaScheduledAt == 0` from both
+ * broadcasting a schedule, and the second broadcast OVERWRITES the first and resets the
+ * guardian's veto window (property 1 above). The processor's fan-out takes the entity lock INSIDE
+ * the company lock it already holds — company → entity, never the reverse, so the two paths
+ * cannot deadlock.
  *
  * ── The projection ─────────────────────────────────────────────────────────────────────────
  *
@@ -143,13 +149,79 @@ export interface AnchorWiring {
 
 export type AnchorLoopDeps = AnchorWiring & {
   repo: EntityRepository;
+  /** The legal facts live on the COMPANY since 2026-08-26 §3: `filed_at`, `filing_number`, `ein`
+   *  and `legal_name_filed` are read from here, and from nowhere else. */
+  companies: CompanyRepository;
   requests: FormationRepository;
   documents: DocumentIndexRepository;
   docStore: DocumentStore;
-  /** The environment THIS DEPLOYMENT runs, compared against every entity's pin (audit M5). */
+  /** The environment THIS DEPLOYMENT runs, compared against every company's pin (audit M5). */
   environment: DoolaEnvironment;
+  /** `FORMATION_SWEEP_MS`. The window the settling gate below folds facts over; absent falls back
+   *  to `DEFAULT_SWEEP_INTERVAL_MS`, and the gate is only ever a DELAY. */
+  sweepIntervalMs?: number;
   now?: () => number;
 };
+
+/**
+ * The three per-COMPANY reads one sweep makes over and over (2026-08-26 §3).
+ *
+ * Under N:1 a batch is mostly SIBLINGS: ten agents on one filing meant ten `companies.find`, ten
+ * `requests.stepsOf` and ten `documents.listByCompany` for three answers that are identical by
+ * construction — every agent attached to a company reads the same company row, the same sub-saga
+ * rows and the same documents. The sweeper creates one of these per tick and hands it to every
+ * `advanceAnchor` call, so each company is read once.
+ *
+ * Deliberately per TICK and never longer-lived: these rows move, and a cache that outlived the
+ * pass that made it would be a second, staler source of truth for the facts an amendment is
+ * derived from. `undefined` is a cached ANSWER (the company does not exist), not a cache miss.
+ */
+export interface AnchorReadCache {
+  companies: Map<string, CompanyRecord | undefined>;
+  steps: Map<string, FormationRequestRecord[]>;
+  documents: Map<string, DocumentIndexRecord[]>;
+}
+
+/** One cache per sweep. */
+export function newAnchorReadCache(): AnchorReadCache {
+  return { companies: new Map(), steps: new Map(), documents: new Map() };
+}
+
+function cachedCompany(
+  d: AnchorLoopDeps,
+  cache: AnchorReadCache | undefined,
+  companyId: string,
+): CompanyRecord | undefined {
+  if (!cache) return d.companies.find(companyId);
+  if (!cache.companies.has(companyId)) cache.companies.set(companyId, d.companies.find(companyId));
+  return cache.companies.get(companyId);
+}
+
+function cachedSteps(
+  d: AnchorLoopDeps,
+  cache: AnchorReadCache | undefined,
+  companyId: string,
+): FormationRequestRecord[] {
+  if (!cache) return d.requests.stepsOf(companyId);
+  const hit = cache.steps.get(companyId);
+  if (hit) return hit;
+  const rows = d.requests.stepsOf(companyId);
+  cache.steps.set(companyId, rows);
+  return rows;
+}
+
+function cachedDocuments(
+  d: AnchorLoopDeps,
+  cache: AnchorReadCache | undefined,
+  companyId: string,
+): DocumentIndexRecord[] {
+  if (!cache) return d.documents.listByCompany(companyId);
+  const hit = cache.documents.get(companyId);
+  if (hit) return hit;
+  const rows = d.documents.listByCompany(companyId);
+  cache.documents.set(companyId, rows);
+  return rows;
+}
 
 /** Why a pass did nothing. Every one of these is a normal, expected outcome. */
 export type AnchorSkip =
@@ -162,6 +234,9 @@ export type AnchorSkip =
   | "no_new_facts"
   | "fully_anchored"
   | "not_due"
+  /** The company's facts moved less than one sweep interval ago (2026-08-26 §3): facts that land
+   *  together fold into ONE amendment cycle per attached agent instead of one cycle each. */
+  | "facts_settling"
   | "not_active";
 
 export interface AnchorOutcome {
@@ -226,9 +301,11 @@ export function resetAnchorWarnings(): void {
 /**
  * Advance ONE entity's anchor pipeline as far as it can go right now.
  *
- * Called from two places, both of which already hold the entity's keyed lock: the sweeper's
- * anchor phase (which is what makes progress guaranteed) and fetch-and-advance (which is what
- * makes it fast — a webhook that confirms the filing opens v2 within the second).
+ * Called from two places, and BOTH must hold the entity's keyed lock: the sweeper's anchor phase
+ * (which is what makes progress guaranteed) and fetch-and-advance's fan-out (which is what makes
+ * it fast — a webhook that confirms the filing opens v2 within the second). The lock is the
+ * caller's job because this function is called from inside a company lock in one of the two
+ * cases; see the concurrency note at the top of the module for why it is not optional.
  *
  * Never throws for an ordinary failure. A transport error parks the cycle with a doubling
  * backoff and NO attempt bump, for the same reason a failed doola read does not burn one: a lost
@@ -244,7 +321,11 @@ export function resetAnchorWarnings(): void {
  * whose amendment is still inside its timelock and an entity that will never anchor again are all
  * dismissed above that line.
  */
-export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promise<AnchorOutcome> {
+export async function advanceAnchor(
+  d: AnchorLoopDeps,
+  entityKey: string,
+  cache?: AnchorReadCache,
+): Promise<AnchorOutcome> {
   const rec = d.repo.findByIdempotencyKey(entityKey);
   if (!rec) return { advanced: false, skipped: "no_entity" };
   const now = (d.now ?? Date.now)();
@@ -253,8 +334,10 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
   //    chain from here: `formation_provider = null` is stub forever, and a record anchored under
   //    the document scheme has an `oa_hash` that commits to a terms doc, not to a manifest.
   if (!usesManifestScheme(rec)) return { advanced: false, skipped: "not_manifest_scheme" };
-  if (!rec.formationProvider || !rec.formationEnvironment)
+  if (!rec.formationProvider || !rec.formationEnvironment || !rec.companyId)
     return { advanced: false, skipped: "not_pinned" };
+  const company = cachedCompany(d, cache, rec.companyId);
+  if (!company) return { advanced: false, skipped: "not_pinned" };
   if (!rec.proxy || !rec.agentId || rec.oaManifestVersion == null || !rec.oaManifestAnchoredHash)
     // Nothing is anchored yet: the create tx has not confirmed, so there is no proxy to amend and
     // no v1 to chain onto. The onboarding saga owns this window.
@@ -283,7 +366,7 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
     const all = hold.all;
 
     const open = newestOpen(all);
-    const steps = d.requests.stepsOf(entityKey);
+    const steps = cachedSteps(d, cache, company.companyId);
 
     // A parked cycle waits out its backoff. `next_retry_at` is epoch MILLISECONDS (the sweeper's
     // clock); `executable_at` below is unix SECONDS (chain time). They are different units
@@ -304,7 +387,18 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
     // produce, so the anchored manifest already carries it and no version will ever follow.
     if (!open && fullyAnchored(all, steps)) return { advanced: false, skipped: "fully_anchored" };
 
-    const legal = deriveLegalBlock(d, rec, steps);
+    // ── The SETTLING gate (2026-08-26 §3). A late fact fans out into one amendment cycle per
+    //    attached agent, each one two sponsored on-chain writes through its own timelock — so a
+    //    filing number and an EIN landing minutes apart would cost two full rounds for every
+    //    agent on the company. Opening is therefore held until the company's facts have been
+    //    still for one sweep interval, and facts that land together fold into ONE cycle. Only
+    //    OPENING waits: a cycle already in flight is driven on every pass, as before.
+    if (!open && factsAreSettling(steps, now, d.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS))
+      return { advanced: false, skipped: "facts_settling" };
+
+    const legal = deriveLegalBlock(d, rec, steps, company, () =>
+      cachedDocuments(d, cache, company.companyId),
+    );
     // Nothing new to say and nothing in flight: the quiet entity, answered without a file read.
     if (!legal && !open) return { advanced: false, skipped: "no_new_facts" };
 
@@ -345,12 +439,37 @@ function awaitingTimelock(row: OaAnchorRecord, nowMs: number): boolean {
   );
 }
 
-/** Has any formation step been written since this cycle was? `>=` because both timestamps have
+/** Has any formation FACT been written since this cycle was? `>=` because both timestamps have
  *  one-SECOND resolution and the fast path confirms a step and opens its version inside the same
- *  second: the safe direction is to re-derive one time too many, never one too few. */
+ *  second: the safe direction is to re-derive one time too many, never one too few.
+ *
+ *  `factsUpdatedAt`, not `updatedAt` (2026-08-26 §3): a poll is not a fact, and reading the wrong
+ *  column made one `await_ein` poll invalidate this gate every tick for four to six weeks. */
 function factsMovedSince(steps: FormationRequestRecord[], row: OaAnchorRecord): boolean {
   const at = parseSqliteUtc(row.updatedAt);
-  return steps.some((s) => parseSqliteUtc(s.updatedAt) >= at);
+  return steps.some((s) => parseSqliteUtc(s.factsUpdatedAt) >= at);
+}
+
+/** The sweep interval a deployment that did not say. Only ever a DELAY, never a skip. */
+export const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * Are the company's facts still moving? See the gate at the call site.
+ *
+ * A NEGATIVE age — a fact stamped after our own clock reads — is deliberately NOT settling. That
+ * is a clock disagreement, not evidence that anything is still landing, and treating it as
+ * settling would stall the amendment for as long as the disagreement lasted. The gate exists to
+ * save money, so its failure direction is "open one cycle too many", never "open none".
+ */
+function factsAreSettling(
+  steps: FormationRequestRecord[],
+  nowMs: number,
+  intervalMs: number,
+): boolean {
+  return steps.some((s) => {
+    const age = nowMs - parseSqliteUtc(s.factsUpdatedAt);
+    return age >= 0 && age < intervalMs;
+  });
 }
 
 /**
@@ -524,14 +643,25 @@ function loadAnchoredManifest(d: AnchorLoopDeps, rec: EntityRecord): AnchoredMan
 export function deriveLegalBlock(
   d: AnchorLoopDeps,
   rec: EntityRecord,
-  steps: FormationRequestRecord[] = d.requests.stepsOf(rec.idempotencyKey),
+  steps: FormationRequestRecord[] = rec.companyId ? d.requests.stepsOf(rec.companyId) : [],
+  company: CompanyRecord | undefined = rec.companyId ? d.companies.find(rec.companyId) : undefined,
+  /**
+   * The company's documents, hoisted by the sweeper so N siblings cost ONE read.
+   *
+   * A THUNK, not an array: every gate above returns before this line for the quiet entity, and
+   * the whole point of the gate order (review F6) is that a settled entity costs no reads at all.
+   * Passing the rows eagerly would add one query per company per tick to exactly the case the
+   * gates exist to make free.
+   */
+  documents?: () => DocumentIndexRecord[],
 ): ManifestLegal | null {
   const key = rec.idempotencyKey;
+  if (!company) return null;
   const providerRef = providerRefOf(steps);
   if (!providerRef) return null;
   if (!companyFiled(steps) || !documentsFetched(steps)) return null;
-  if (rec.formationFiledAt == null) return null;
-  if (!rec.formationFilingNumber) {
+  if (company.filedAt == null) return null;
+  if (!company.filingNumber) {
     // The filing number is part of the v2 trigger, and anchoring a manifest that claims a filing
     // with no filing number would be the dishonest fix. `advanceFiling` now HEALS the number onto
     // the entity on any later poll that reports one (review F12), so this is a wait, not a
@@ -544,22 +674,27 @@ export function deriveLegalBlock(
     return null;
   }
 
-  const docs = d.documents.listByEntity(key);
+  const docs = documents ? documents() : d.documents.listByCompany(company.companyId);
   if (docs.length === 0) return null;
 
   return {
     provider: rec.formationProvider!,
     environment: rec.formationEnvironment!,
     providerCompanyId: providerRef,
+    // A CONDITIONAL key (2026-08-26 §2), the one documented departure from the explicit-nulls
+    // convention: absent ≡ "we do not know the filed name". Every migrated company has it NULL,
+    // so its legal block is byte-identical and `sameLegal` short-circuits — no re-anchor storm.
+    // The hash moves exactly once, when a real filed name lands, which is the intended amendment.
+    ...(company.legalNameFiled ? { companyName: company.legalNameFiled } : {}),
     // The values we FILED with, imported from the filer (see their doc comment) — not read back
     // off a provider response, which would put a partner-controlled string inside the anchor.
     entityType: FORMATION_ENTITY_TYPE,
     state: FORMATION_STATE,
-    formationDate: rec.formationFiledAt,
-    filingNumber: rec.formationFilingNumber,
+    formationDate: company.filedAt,
+    filingNumber: company.filingNumber,
     // v2 anchors WITHOUT an EIN and says so: the IRS takes four to six weeks, and pretending
     // otherwise is the deception §2 forbids. v3 lands when the IRS does.
-    ein: einIssued(steps) ? (rec.einReal ?? null) : null,
+    ein: einIssued(steps) ? (company.ein ?? null) : null,
     documents: docs.map((r) => ({
       type: r.docType,
       sha256: r.sha256,

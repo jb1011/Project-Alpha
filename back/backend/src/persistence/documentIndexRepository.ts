@@ -6,9 +6,15 @@ import type Database from "better-sqlite3";
  *
  * The BYTES live in the `DocumentStore` (and, as system of record, at doola — every row keeps its
  * `provider_doc_id` so the file is re-fetchable). What lives here is the thing the bytes alone
- * cannot prove: which entity a document belongs to, what kind of document it is, and the sha256
- * that the OA bundle manifest will commit to in PR 3. A row is written only after the bytes are
- * durably on disk, so an index entry never points at a file that is not there.
+ * cannot prove: which COMPANY a document belongs to, what kind of document it is, and the sha256
+ * that the OA bundle manifest commits to. A row is written only after the bytes are durably on
+ * disk, so an index entry never points at a file that is not there.
+ *
+ * Keyed by the COMPANY since 2026-08-26 §2: a company can be filed and have its documents fetched
+ * BEFORE any agent attaches to it, so the entity key was never a key at all. Rows written before
+ * the re-key keep their entity-derived index id and file path as OPAQUE LOCATORS — the manifest
+ * commits to those bytes and their hashes, so nothing may be re-derived — and are found through
+ * the backfilled `company_id` COLUMN, never by recomputing an id.
  *
  * Documents are IMMUTABLE once indexed: doola may re-issue a document, and when it does it gets a
  * new provider document id, which is a new row. Nothing here updates.
@@ -16,7 +22,9 @@ import type Database from "better-sqlite3";
 export interface DocumentIndexRecord {
   /** Our stable, URL-safe id — see `documentIndexId`. This is what the download route takes. */
   id: string;
-  entityKey: string;
+  companyId: string;
+  /** Legacy locator on a pre-2026-08-26 row (the id and path embed it). Never written any more. */
+  entityKey: string | null;
   /** doola's `documentType`, e.g. "ArticlesOfOrganization" | "OperatingAgreement" | "EinLetter". */
   docType: string;
   sha256: string;
@@ -31,6 +39,7 @@ export interface DocumentIndexRecord {
 
 interface Row {
   id: string;
+  company_id: string | null;
   entity_key: string | null;
   doc_type: string | null;
   sha256: string | null;
@@ -44,7 +53,8 @@ interface Row {
 function toRecord(r: Row): DocumentIndexRecord {
   return {
     id: r.id,
-    entityKey: r.entity_key ?? "",
+    companyId: r.company_id ?? "",
+    entityKey: r.entity_key,
     docType: r.doc_type ?? "",
     sha256: r.sha256 ?? "",
     contentType: r.content_type ?? "",
@@ -56,17 +66,20 @@ function toRecord(r: Row): DocumentIndexRecord {
 }
 
 /**
- * The document's public id: `sha256(entityKey \0 providerDocId)`, truncated to 32 hex chars.
+ * The document's public id: `sha256(companyId \0 providerDocId)`, truncated to 32 hex chars.
  *
  * DETERMINISTIC on purpose. A random uuid would make "have we already stored this document?" a
  * question only a lookup could answer, and the answer would change if the lookup ever raced
  * itself — two rows for one doola document, two copies of the bytes, and a manifest that has to
- * choose. Derived from both halves so one entity's document id can never collide with another's,
- * whatever doola's id space does. URL-safe by construction, which is what the download route
- * needs (the entity key contains a `:`).
+ * choose. Derived from both halves so one company's document id can never collide with another's,
+ * whatever doola's id space does. URL-safe by construction.
+ *
+ * ⚠ Existing rows keep the id this function USED to produce (it hashed the entity key). They are
+ * never re-derived — the manifest commits to `{type, sha256, name}` and the download route
+ * resolves an id by lookup, not by recomputation.
  */
-export function documentIndexId(entityKey: string, providerDocId: string): string {
-  return createHash("sha256").update(`${entityKey}\0${providerDocId}`).digest("hex").slice(0, 32);
+export function documentIndexId(companyId: string, providerDocId: string): string {
+  return createHash("sha256").update(`${companyId}\0${providerDocId}`).digest("hex").slice(0, 32);
 }
 
 /**
@@ -77,7 +90,7 @@ export function documentIndexId(entityKey: string, providerDocId: string): strin
  * a partner-controlled string, and the first place to stop it is before it is a path at all.
  */
 export function documentStoreName(
-  entityKey: string,
+  companyId: string,
   docType: string,
   providerDocId: string,
 ): string {
@@ -89,7 +102,7 @@ export function documentStoreName(
       .replace(/[^A-Za-z0-9._-]+/g, "-")
       .replace(/\.{2,}/g, ".")
       .slice(0, 64) || "unknown";
-  return `doc-${safe(entityKey)}-${safe(docType)}-${safe(providerDocId)}.pdf`;
+  return `doc-${safe(companyId)}-${safe(docType)}-${safe(providerDocId)}.pdf`;
 }
 
 /**
@@ -107,16 +120,24 @@ export function documentFileName(docType: string): string {
 
 export interface DocumentIndexRepository {
   /** Index a stored document. Returns false when the row already existed (idempotent re-fetch). */
-  insert(rec: Omit<DocumentIndexRecord, "createdAt">): boolean;
-  listByEntity(entityKey: string): DocumentIndexRecord[];
-  /** The same rows for MANY entities, in ONE statement — the list routes' N+1 (M5). */
-  listByEntities(entityKeys: string[]): Map<string, DocumentIndexRecord[]>;
-  /** Ownership is enforced by the caller against `entities`; the entity key is re-asserted here
-   *  so a document id from one entity can never be read through another entity's route. */
-  findOwned(entityKey: string, id: string): DocumentIndexRecord | undefined;
-  findByProviderDocId(entityKey: string, providerDocId: string): DocumentIndexRecord | undefined;
-  /** The doc types already stored for an entity — what "are the required documents in?" reads. */
-  storedTypes(entityKey: string): string[];
+  insert(rec: Omit<DocumentIndexRecord, "createdAt" | "entityKey"> & { entityKey?: null }): boolean;
+  listByCompany(companyId: string): DocumentIndexRecord[];
+  /**
+   * The same rows for MANY COMPANIES, in ONE statement — the list routes' N+1 (M5).
+   *
+   * COMPANY-keyed, and deliberately no join. The entity-shaped version went
+   * entity → `entities.company_id` → documents and back, which cost a join per page and, worse,
+   * could not answer for a company with no agent attached to it — a shape the re-key made
+   * ordinary, since a company can be filed and have its documents fetched before anyone onboards.
+   * The caller already knows each row's company; asking by that is both cheaper and total.
+   */
+  listByCompanies(companyIds: string[]): Map<string, DocumentIndexRecord[]>;
+  /** Ownership is enforced by the caller against `companies`; the company id is re-asserted here
+   *  so a document id from one company can never be read through another company's route. */
+  findOwned(companyId: string, id: string): DocumentIndexRecord | undefined;
+  findByProviderDocId(companyId: string, providerDocId: string): DocumentIndexRecord | undefined;
+  /** The doc types already stored for a company — what "are the required documents in?" reads. */
+  storedTypes(companyId: string): string[];
 }
 
 export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
@@ -124,29 +145,31 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
 
   constructor(private readonly db: Database.Database) {
     this.stmts = {
+      // `entity_key` is deliberately not written: a new document may belong to a company that no
+      // agent has attached to yet, and inventing an entity for it would be a fact we do not have.
       insert: db.prepare(
         `INSERT OR IGNORE INTO documents
-           (id, entity_key, doc_type, sha256, content_type, size, provider_doc_id, path)
-         VALUES (@id, @entity_key, @doc_type, @sha256, @content_type, @size, @provider_doc_id, @path)`,
+           (id, company_id, doc_type, sha256, content_type, size, provider_doc_id, path)
+         VALUES (@id, @company_id, @doc_type, @sha256, @content_type, @size, @provider_doc_id, @path)`,
       ),
-      listByEntity: db.prepare(
-        "SELECT * FROM documents WHERE entity_key = ? ORDER BY created_at, doc_type, id",
+      listByCompany: db.prepare(
+        "SELECT * FROM documents WHERE company_id = ? ORDER BY created_at, doc_type, id",
       ),
-      findOwned: db.prepare("SELECT * FROM documents WHERE entity_key = ? AND id = ?"),
+      findOwned: db.prepare("SELECT * FROM documents WHERE company_id = ? AND id = ?"),
       findByProvider: db.prepare(
-        "SELECT * FROM documents WHERE entity_key = ? AND provider_doc_id = ?",
+        "SELECT * FROM documents WHERE company_id = ? AND provider_doc_id = ?",
       ),
       storedTypes: db.prepare(
-        "SELECT DISTINCT doc_type AS t FROM documents WHERE entity_key = ? AND doc_type IS NOT NULL",
+        "SELECT DISTINCT doc_type AS t FROM documents WHERE company_id = ? AND doc_type IS NOT NULL",
       ),
     };
   }
 
-  insert(rec: Omit<DocumentIndexRecord, "createdAt">): boolean {
+  insert(rec: Omit<DocumentIndexRecord, "createdAt" | "entityKey">): boolean {
     return (
       this.stmts.insert.run({
         id: rec.id,
-        entity_key: rec.entityKey,
+        company_id: rec.companyId,
         doc_type: rec.docType,
         sha256: rec.sha256,
         content_type: rec.contentType,
@@ -157,23 +180,26 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
     );
   }
 
-  listByEntity(entityKey: string): DocumentIndexRecord[] {
-    return (this.stmts.listByEntity.all(entityKey) as Row[]).map(toRecord);
+  listByCompany(companyId: string): DocumentIndexRecord[] {
+    return (this.stmts.listByCompany.all(companyId) as Row[]).map(toRecord);
   }
 
-  listByEntities(entityKeys: string[]): Map<string, DocumentIndexRecord[]> {
+  listByCompanies(companyIds: string[]): Map<string, DocumentIndexRecord[]> {
     const out = new Map<string, DocumentIndexRecord[]>();
-    if (entityKeys.length === 0) return out;
-    for (let i = 0; i < entityKeys.length; i += 400) {
-      const chunk = entityKeys.slice(i, i + 400);
+    if (companyIds.length === 0) return out;
+    // Chunked at 400, clear of SQLITE_MAX_VARIABLE_NUMBER — the `stepsOfMany` idiom.
+    for (let i = 0; i < companyIds.length; i += 400) {
+      const chunk = companyIds.slice(i, i + 400);
       const rows = this.db
         .prepare(
-          `SELECT * FROM documents WHERE entity_key IN (${chunk.map(() => "?").join(",")})
+          `SELECT * FROM documents
+            WHERE company_id IN (${chunk.map(() => "?").join(",")})
             ORDER BY created_at, doc_type, id`,
         )
         .all(...chunk) as Row[];
       for (const r of rows) {
-        const key = r.entity_key ?? "";
+        const key = r.company_id;
+        if (!key) continue; // a legacy row the backfill could not place has no company to key on
         const list = out.get(key);
         if (list) list.push(toRecord(r));
         else out.set(key, [toRecord(r)]);
@@ -182,17 +208,17 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
     return out;
   }
 
-  findOwned(entityKey: string, id: string): DocumentIndexRecord | undefined {
-    const r = this.stmts.findOwned.get(entityKey, id) as Row | undefined;
+  findOwned(companyId: string, id: string): DocumentIndexRecord | undefined {
+    const r = this.stmts.findOwned.get(companyId, id) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 
-  findByProviderDocId(entityKey: string, providerDocId: string): DocumentIndexRecord | undefined {
-    const r = this.stmts.findByProvider.get(entityKey, providerDocId) as Row | undefined;
+  findByProviderDocId(companyId: string, providerDocId: string): DocumentIndexRecord | undefined {
+    const r = this.stmts.findByProvider.get(companyId, providerDocId) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 
-  storedTypes(entityKey: string): string[] {
-    return (this.stmts.storedTypes.all(entityKey) as { t: string }[]).map((r) => r.t);
+  storedTypes(companyId: string): string[] {
+    return (this.stmts.storedTypes.all(companyId) as { t: string }[]).map((r) => r.t);
   }
 }
