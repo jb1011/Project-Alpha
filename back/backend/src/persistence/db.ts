@@ -809,7 +809,8 @@ export function companyRekeyRefusalMessage(entityKeys: string[]): string {
  * than defaulted.
  */
 export function companyRekeyUnpinnedRefusalMessage(entityKeys: string[]): string {
-  return `refusing to migrate: ${entityKeys.length} entit${entityKeys.length === 1 ? "y holds" : "ies hold"} formation state (a bound responsible party, a sub-saga row or a document) but carry NO formation pin (${entityKeys.slice(0, 5).join(", ")}${entityKeys.length > 5 ? ", …" : ""}). companies.environment is NOT NULL and it is what routes a filing at sandbox or at production, and this migration will not invent one: pinning such a row to "sandbox" would silently decide, on a sandbox box, that a real person's identity is filed there. Under the current claim rules the pin, the company and the party bind are written in one transaction, so this shape cannot be produced any more — set formation_provider/formation_environment on each entity above deliberately, or erase the party that is bound to it, and re-run.`;
+  const one = entityKeys.length === 1;
+  return `refusing to migrate: ${entityKeys.length} entit${one ? "y holds" : "ies hold"} formation state (a formation provider, a bound responsible party, a sub-saga row or a document) but ${one ? "carries" : "carry"} an INCOMPLETE formation pin — provider or environment is NULL (${entityKeys.slice(0, 5).join(", ")}${entityKeys.length > 5 ? ", …" : ""}). companies.provider and companies.environment are both NOT NULL, and the environment is what routes a filing at sandbox or at production; this migration will not invent either. Pinning such a row to "sandbox" would silently decide, on a sandbox box, that a real person's identity is filed there. Under the current claim rules the pin, the company and the party bind are written in one transaction, so this shape cannot be produced any more — set formation_provider AND formation_environment on each entity above deliberately, or erase the party bound to it, and re-run.`;
 }
 
 /**
@@ -902,9 +903,18 @@ function migrateFormationToCompanies(db: Database.Database): void {
   if (inFlight.length > 0) throw new Error(companyRekeyRefusalMessage(inFlight));
 
   // ── Step 1b: THE UNPINNED-BUT-STATEFUL REFUSAL. Every entity the synthesis rule below will
-  //    mint a company for has to supply that company's `environment`, which is NOT NULL and is
-  //    what decides whether the filing is routed at sandbox or at production. An entity with no
-  //    pin has no such value, and there is no safe default — see the message.
+  //    mint a company for has to supply that company's `provider` and `environment`, both NOT
+  //    NULL, and `environment` is what decides whether the filing is routed at sandbox or at
+  //    production. An entity with either half missing has no such value, and there is no safe
+  //    default — see the message.
+  //
+  //    ⚠ The arms below MIRROR the synthesis predicate in step 2 EXACTLY, `formation_provider IS
+  //    NOT NULL` included. That arm selects candidates all by itself, so an entity with a
+  //    provider and a NULL environment — no party, no step, no document — is a candidate that
+  //    matched none of the other three: it sailed past this refusal and died inside the
+  //    transaction on the NOT NULL constraint. A rollback, so nothing was corrupted, but a
+  //    cryptic one that names no entity and tells the operator nothing they can act on. Any
+  //    future widening of the synthesis rule has to be made here too.
   const unpinned = (
     db
       .prepare(
@@ -914,7 +924,8 @@ function migrateFormationToCompanies(db: Database.Database): void {
              ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
           WHERE e.company_id IS NULL
             AND (e.formation_provider IS NULL OR e.formation_environment IS NULL)
-            AND (p.party_id IS NOT NULL
+            AND (e.formation_provider IS NOT NULL
+                 OR p.party_id IS NOT NULL
                  OR EXISTS (SELECT 1 FROM formation_requests f
                              WHERE f.entity_key = e.idempotency_key)
                  OR EXISTS (SELECT 1 FROM documents d WHERE d.entity_key = e.idempotency_key))

@@ -241,9 +241,24 @@ describe("the entity → company re-key", () => {
     // `companies.environment` routes a filing. There is no honest value to invent for a row that
     // never carried one — `'sandbox'` refuses nothing on a sandbox box, and it silently decides
     // where a real person's identity is sent.
-    expect(() => migrate(db)).toThrow(/carry NO formation pin/);
+    expect(() => migrate(db)).toThrow(/INCOMPLETE formation pin/);
     expect(() => migrate(db)).toThrow(new RegExp(key));
     // Nothing was written: the refusal is BEFORE the transaction.
+    expect((db.prepare("SELECT COUNT(*) AS n FROM companies").get() as { n: number }).n).toBe(0);
+  });
+
+  test("HALF a pin refuses too: provider set, environment NULL, and no other formation state", () => {
+    // The arm the first version of this refusal missed. `formation_provider IS NOT NULL` is a
+    // synthesis arm all by itself, so this entity IS a candidate — and with no party, no step and
+    // no document it matched none of the arms the refusal was checking. It sailed past step 1 and
+    // died inside the transaction on the `companies.environment` NOT NULL constraint: a rollback,
+    // which is safe, but a cryptic one that names no entity and offers the operator nothing.
+    const db = openLegacyDb();
+    const key = legacyEntity(db, { key: "tenant-a:half", environment: null });
+    expect(() => migrate(db)).toThrow(/INCOMPLETE formation pin/);
+    expect(() => migrate(db)).toThrow(new RegExp(key));
+    // Never SQLite's own constraint failure — the operator must be told which entity and why.
+    expect(() => migrate(db)).not.toThrow(/NOT NULL constraint failed/);
     expect((db.prepare("SELECT COUNT(*) AS n FROM companies").get() as { n: number }).n).toBe(0);
   });
 
@@ -256,7 +271,7 @@ describe("the entity → company re-key", () => {
       state: "confirmed",
       providerRef: "cmp-1",
     });
-    expect(() => migrate(db)).toThrow(/carry NO formation pin/);
+    expect(() => migrate(db)).toThrow(/INCOMPLETE formation pin/);
   });
 
   test("a synthesized company inherits the legacy create_provider verdict: abandoned stays abandoned", () => {

@@ -529,6 +529,34 @@ test("an unreadable name_options blob PARKS the filing and sends nothing at all"
   expect(calls).toHaveLength(0);
 });
 
+test("a BLANK stored candidate parks the filing too — not just an empty list", async () => {
+  bindParty();
+  // An agent literally named "LLC". `stripEntityEnding` correctly strips it to nothing, so the
+  // canonical shape is `[{ name: "", entityTypeEnding: "LLC", position: 1 }]` — a non-empty LIST
+  // whose only candidate is blank. The door refuses this intake, but the migration and the shim
+  // write through other paths, and the filer must not send a nameless company to Wyoming.
+  db.prepare("UPDATE companies SET name_options = ? WHERE company_id = ?").run(
+    JSON.stringify([{ name: "", entityTypeEnding: "LLC", position: 1 }]),
+    COMPANY_KEY,
+  );
+  const { api, calls } = makeFakeDoola();
+  await runFormationCreateProvider({
+    company: companies.find(COMPANY_KEY)!,
+    companies,
+    repo,
+    requests,
+    parties,
+    doola: api,
+    environment: "sandbox",
+  });
+
+  const row = requests.find(COMPANY_KEY, "create_provider")!;
+  expect(row.state).toBe("failed");
+  expect(row.error).toMatch(/name candidates are empty or unreadable/);
+  expect(row.attempt).toBe(0); // parked, never burned — the same reason as the empty-list guard
+  expect(calls).toHaveLength(0);
+});
+
 test("a party with no phone is refused HERE, not by a body doola would 400", async () => {
   bindParty({ phone: null });
   const { api, calls } = makeFakeDoola();

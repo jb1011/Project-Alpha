@@ -306,8 +306,14 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   // invented name would go on to be published in an anchored manifest. It PARKS rather than
   // burning an attempt, for the environment pin's reason: nothing was sent, a human has to fix
   // the row, and eight ticks of `failed` would `abandon` the formation and erase the party.
+  //
+  // A BLANK candidate is the same fact wearing a different shape, and the list being non-empty
+  // is no comfort: an agent named "LLC" strips to nothing, so the canonical row is
+  // `[{ name: "", entityTypeEnding: "LLC", position: 1 }]`. `createCompany` refuses that intake
+  // at the door, but the migration and the shim write `name_options` through other paths, and
+  // the filer is the last thing standing between a nameless company and a real filing.
   const nameOptions: CompanyNameOption[] = d.company.nameOptions;
-  if (nameOptions.length === 0) {
+  if (nameOptions.length === 0 || nameOptions.some((n) => !n.name.trim())) {
     parkFormationStep(d, companyId, "create_provider", noNameOptionsError(), {
       reason: "intake_unreadable",
     });
