@@ -180,7 +180,12 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
   // mostly unpinned rows.
   const companyId = r.companyId ?? null;
   const steps = companyId ? (deps.formationSteps?.(companyId) ?? []) : [];
-  const summary = companyId ? formationSummary(deps.company?.(companyId), steps) : null;
+  // ONE snapshot of the company row, used by BOTH the summary and the EIN below. Two lookups
+  // meant two queries per pinned entity on every list response — and, worse, two answers: the
+  // row can move between them, so a page could render a filing's status from one version of the
+  // row and its EIN from another.
+  const company = companyId ? deps.company?.(companyId) : undefined;
+  const summary = companyId ? formationSummary(company, steps) : null;
   return {
     id: r.idempotencyKey,
     name: r.name,
@@ -223,7 +228,7 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
           // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
           // mint and is never served as a legal fact.
           // The EIN now lives on the COMPANY: one filing, one EIN, however many agents share it.
-          ein: (companyId ? deps.company?.(companyId)?.ein : null) ?? null,
+          ein: company?.ein ?? null,
           documents: (companyId ? (deps.documents?.listByCompany(companyId) ?? []) : []).map(
             toDocumentView,
           ),

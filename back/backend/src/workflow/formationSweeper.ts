@@ -28,7 +28,7 @@ import {
   parseDetail,
 } from "../persistence/formationRepository";
 import { parseSqliteUtc } from "../util/sqliteTime";
-import { advanceAnchor } from "./anchorLoop";
+import { advanceAnchor, newAnchorReadCache } from "./anchorLoop";
 import {
   type FormationAdvanceDeps,
   advanceFormation,
@@ -612,12 +612,18 @@ export class FormationSweeper {
         environment: this.d.environment,
       });
     const queue = entityKeys;
+    // ONE cache for the whole pass. A batch under N:1 is mostly SIBLINGS — ten agents on one
+    // filing used to cost ten `companies.find`, ten `stepsOf` and ten `listByCompany` for three
+    // answers that are identical by construction. Per TICK and no longer: these rows move, and a
+    // cache that outlived its pass would be a staler source of truth for the facts an amendment
+    // is derived from.
+    const cache = newAnchorReadCache();
     const worker = async () => {
       for (;;) {
         const entityKey = queue.shift();
         if (entityKey === undefined) return;
         try {
-          await withKeyedLock(entityKey, () => advanceAnchor(deps, entityKey));
+          await withKeyedLock(entityKey, () => advanceAnchor(deps, entityKey, cache));
         } catch (err) {
           // advanceAnchor has its own catch-all, so reaching this is a bug rather than a bad
           // minute — but one entity's bug must still not stop the sweep.

@@ -897,6 +897,111 @@ test("F6: an OPEN or HELD cycle is always due, whatever its steps say", () => {
   expect(anchors.listDueEntityKeys(50)).not.toContain(held);
 });
 
+test("the anchor pass reads each COMPANY once, however many siblings the batch holds", async () => {
+  // N:1 is the whole point of the re-key, and a batch is therefore mostly SIBLINGS: ten agents
+  // on one filing cost ten `companies.find`, ten `stepsOf` and ten `listByCompany` for three
+  // answers that are identical by construction.
+  const anchors = new SqliteOaAnchorRepository(db);
+  seedCompany(companies);
+  const SIBLINGS = 5;
+  for (let i = 0; i < SIBLINGS; i++) {
+    const key = `${TENANT}:sib-${i}`;
+    repo.upsert(
+      formedEntity({
+        idempotencyKey: key,
+        publicId: `pub-sib-${i}`,
+        oaHash: `0x${"c".repeat(63)}${i}`,
+        oaManifestAnchoredHash: `0x${"c".repeat(63)}${i}`,
+      }),
+    );
+    // An OPEN cycle: past the hold check, so the pass reaches all three reads.
+    anchors.claimVersion(key, 2, `0x${"d".repeat(63)}${i}`);
+  }
+
+  const counts = { find: 0, steps: 0, docs: 0 };
+  const spyCompanies: SqliteCompanyRepository = Object.create(companies);
+  spyCompanies.find = (id: string) => {
+    counts.find++;
+    return companies.find(id);
+  };
+  const spyRequests: SqliteFormationRepository = Object.create(requests);
+  spyRequests.stepsOf = (id: string) => {
+    counts.steps++;
+    return requests.stepsOf(id);
+  };
+  const spyDocuments: SqliteDocumentIndexRepository = Object.create(documents);
+  spyDocuments.listByCompany = (id: string) => {
+    counts.docs++;
+    return documents.listByCompany(id);
+  };
+
+  const chain = fakeAnchorChain();
+  await sweeper({
+    companies: spyCompanies,
+    requests: spyRequests,
+    documents: spyDocuments,
+    anchor: { anchors, arc: chain.chain, chainId: 5042002 },
+  }).tick();
+
+  // ONE read per company for the whole pass, not one per agent.
+  expect(counts.find).toBe(1);
+  expect(counts.steps).toBe(1);
+  // …and the DOCUMENT read is still behind the cheap gates: an entity with nothing to anchor
+  // must cost no reads at all (the F6 gate-order rule), which is why it is passed as a thunk.
+  expect(counts.docs).toBe(0);
+});
+
+test("a FILED company's documents are read once for the whole sibling batch", async () => {
+  const anchors = new SqliteOaAnchorRepository(db);
+  seedCompany(companies);
+  // Everything `deriveLegalBlock` needs, so the pass reaches the document read at all.
+  requests.claimAllSteps(COMPANY_KEY);
+  requests.transition(COMPANY_KEY, "create_provider", "pending", "confirmed", {
+    providerRef: COMPANY_ID,
+  });
+  requests.transition(COMPANY_KEY, "await_filing", "pending", "confirmed");
+  requests.transition(COMPANY_KEY, "fetch_documents", "pending", "confirmed");
+  companies.recordFilingFacts(COMPANY_KEY, { filedAt: 1_756_000_000, filingNumber: "WY-1" });
+  documents.insert({
+    id: "doc-1",
+    companyId: COMPANY_KEY,
+    docType: "ArticlesOfOrganization",
+    sha256: "a".repeat(64),
+    contentType: "application/pdf",
+    size: 10,
+    providerDocId: "d1",
+    path: "doc-1.pdf",
+  });
+  // Fresh rows, so the POLL path does not run and every read counted below is the anchor's.
+  stampRows(now);
+  for (let i = 0; i < 3; i++) {
+    const key = `${TENANT}:filed-${i}`;
+    repo.upsert(
+      formedEntity({
+        idempotencyKey: key,
+        publicId: `pub-filed-${i}`,
+        oaHash: `0x${"e".repeat(63)}${i}`,
+        oaManifestAnchoredHash: `0x${"e".repeat(63)}${i}`,
+      }),
+    );
+    anchors.claimVersion(key, 2, `0x${"f".repeat(63)}${i}`);
+  }
+
+  let docReads = 0;
+  const spyDocuments: SqliteDocumentIndexRepository = Object.create(documents);
+  spyDocuments.listByCompany = (id: string) => {
+    docReads++;
+    return documents.listByCompany(id);
+  };
+  const chain = fakeAnchorChain();
+  await sweeper({
+    documents: spyDocuments,
+    anchor: { anchors, arc: chain.chain, chainId: 5042002 },
+  }).tick();
+
+  expect(docReads).toBe(1);
+});
+
 test("the anchor cursor SURVIVES A RESTART — a redeploy does not reset paging to the head", async () => {
   // In memory the cursor died with the process, and a deployment that restarts more often than
   // it takes to page through the due set (a deploy, a crash loop, an OOM) never reached its tail

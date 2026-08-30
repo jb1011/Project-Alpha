@@ -24,6 +24,7 @@ import {
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import {
+  type DocumentIndexRecord,
   type DocumentIndexRepository,
   documentFileName,
 } from "../persistence/documentIndexRepository";
@@ -162,6 +163,66 @@ export type AnchorLoopDeps = AnchorWiring & {
   now?: () => number;
 };
 
+/**
+ * The three per-COMPANY reads one sweep makes over and over (2026-08-26 §3).
+ *
+ * Under N:1 a batch is mostly SIBLINGS: ten agents on one filing meant ten `companies.find`, ten
+ * `requests.stepsOf` and ten `documents.listByCompany` for three answers that are identical by
+ * construction — every agent attached to a company reads the same company row, the same sub-saga
+ * rows and the same documents. The sweeper creates one of these per tick and hands it to every
+ * `advanceAnchor` call, so each company is read once.
+ *
+ * Deliberately per TICK and never longer-lived: these rows move, and a cache that outlived the
+ * pass that made it would be a second, staler source of truth for the facts an amendment is
+ * derived from. `undefined` is a cached ANSWER (the company does not exist), not a cache miss.
+ */
+export interface AnchorReadCache {
+  companies: Map<string, CompanyRecord | undefined>;
+  steps: Map<string, FormationRequestRecord[]>;
+  documents: Map<string, DocumentIndexRecord[]>;
+}
+
+/** One cache per sweep. */
+export function newAnchorReadCache(): AnchorReadCache {
+  return { companies: new Map(), steps: new Map(), documents: new Map() };
+}
+
+function cachedCompany(
+  d: AnchorLoopDeps,
+  cache: AnchorReadCache | undefined,
+  companyId: string,
+): CompanyRecord | undefined {
+  if (!cache) return d.companies.find(companyId);
+  if (!cache.companies.has(companyId)) cache.companies.set(companyId, d.companies.find(companyId));
+  return cache.companies.get(companyId);
+}
+
+function cachedSteps(
+  d: AnchorLoopDeps,
+  cache: AnchorReadCache | undefined,
+  companyId: string,
+): FormationRequestRecord[] {
+  if (!cache) return d.requests.stepsOf(companyId);
+  const hit = cache.steps.get(companyId);
+  if (hit) return hit;
+  const rows = d.requests.stepsOf(companyId);
+  cache.steps.set(companyId, rows);
+  return rows;
+}
+
+function cachedDocuments(
+  d: AnchorLoopDeps,
+  cache: AnchorReadCache | undefined,
+  companyId: string,
+): DocumentIndexRecord[] {
+  if (!cache) return d.documents.listByCompany(companyId);
+  const hit = cache.documents.get(companyId);
+  if (hit) return hit;
+  const rows = d.documents.listByCompany(companyId);
+  cache.documents.set(companyId, rows);
+  return rows;
+}
+
 /** Why a pass did nothing. Every one of these is a normal, expected outcome. */
 export type AnchorSkip =
   | "no_entity"
@@ -260,7 +321,11 @@ export function resetAnchorWarnings(): void {
  * whose amendment is still inside its timelock and an entity that will never anchor again are all
  * dismissed above that line.
  */
-export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promise<AnchorOutcome> {
+export async function advanceAnchor(
+  d: AnchorLoopDeps,
+  entityKey: string,
+  cache?: AnchorReadCache,
+): Promise<AnchorOutcome> {
   const rec = d.repo.findByIdempotencyKey(entityKey);
   if (!rec) return { advanced: false, skipped: "no_entity" };
   const now = (d.now ?? Date.now)();
@@ -271,7 +336,7 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
   if (!usesManifestScheme(rec)) return { advanced: false, skipped: "not_manifest_scheme" };
   if (!rec.formationProvider || !rec.formationEnvironment || !rec.companyId)
     return { advanced: false, skipped: "not_pinned" };
-  const company = d.companies.find(rec.companyId);
+  const company = cachedCompany(d, cache, rec.companyId);
   if (!company) return { advanced: false, skipped: "not_pinned" };
   if (!rec.proxy || !rec.agentId || rec.oaManifestVersion == null || !rec.oaManifestAnchoredHash)
     // Nothing is anchored yet: the create tx has not confirmed, so there is no proxy to amend and
@@ -301,7 +366,7 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
     const all = hold.all;
 
     const open = newestOpen(all);
-    const steps = d.requests.stepsOf(company.companyId);
+    const steps = cachedSteps(d, cache, company.companyId);
 
     // A parked cycle waits out its backoff. `next_retry_at` is epoch MILLISECONDS (the sweeper's
     // clock); `executable_at` below is unix SECONDS (chain time). They are different units
@@ -331,7 +396,9 @@ export async function advanceAnchor(d: AnchorLoopDeps, entityKey: string): Promi
     if (!open && factsAreSettling(steps, now, d.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS))
       return { advanced: false, skipped: "facts_settling" };
 
-    const legal = deriveLegalBlock(d, rec, steps, company);
+    const legal = deriveLegalBlock(d, rec, steps, company, () =>
+      cachedDocuments(d, cache, company.companyId),
+    );
     // Nothing new to say and nothing in flight: the quiet entity, answered without a file read.
     if (!legal && !open) return { advanced: false, skipped: "no_new_facts" };
 
@@ -578,6 +645,15 @@ export function deriveLegalBlock(
   rec: EntityRecord,
   steps: FormationRequestRecord[] = rec.companyId ? d.requests.stepsOf(rec.companyId) : [],
   company: CompanyRecord | undefined = rec.companyId ? d.companies.find(rec.companyId) : undefined,
+  /**
+   * The company's documents, hoisted by the sweeper so N siblings cost ONE read.
+   *
+   * A THUNK, not an array: every gate above returns before this line for the quiet entity, and
+   * the whole point of the gate order (review F6) is that a settled entity costs no reads at all.
+   * Passing the rows eagerly would add one query per company per tick to exactly the case the
+   * gates exist to make free.
+   */
+  documents?: () => DocumentIndexRecord[],
 ): ManifestLegal | null {
   const key = rec.idempotencyKey;
   if (!company) return null;
@@ -598,7 +674,7 @@ export function deriveLegalBlock(
     return null;
   }
 
-  const docs = d.documents.listByCompany(company.companyId);
+  const docs = documents ? documents() : d.documents.listByCompany(company.companyId);
   if (docs.length === 0) return null;
 
   return {
