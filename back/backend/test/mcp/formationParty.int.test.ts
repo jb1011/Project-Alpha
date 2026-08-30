@@ -407,7 +407,27 @@ test("the quota refuses onboard_agent before the entity is minted", async () => 
 
 // ── COMPANIES over MCP (design 2026-08-26 §7) ───────────────────────────────────────────────
 
-test("create_company + list_companies exist only where formation does, and never take an ssn", async () => {
+/** The company projection's key set, asserted IDENTICALLY on both surfaces (§7). Its twin lives
+ *  in test/api/formationParty.routes.test.ts; a field added to one door and not the other fails
+ *  whichever of the two was forgotten. */
+const COMPANY_VIEW_KEYS = [
+  "agents",
+  "businessPurpose",
+  "companyId",
+  "createdAt",
+  "environment",
+  "filedAt",
+  "filingNumber",
+  "formationStatus",
+  "industryLabel",
+  "legalNameFiled",
+  "nameOptions",
+  "paying",
+  "status",
+  "synthetic",
+];
+
+test("create_company is gated on FORMATION; list_companies on the company store, like REST", async () => {
   const on = buildTestApp({ required: true });
   const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const tools = await withClient(on, key, async (c) => (await c.listTools()).tools);
@@ -427,8 +447,12 @@ test("create_company + list_companies exist only where formation does, and never
   const offNames = await withClient(off, key2, async (c) =>
     (await c.listTools()).tools.map((t) => t.name),
   );
+  // Creating a company SPENDS, so it needs the filer. READING the ones you already own does not:
+  // a box whose doola credentials were pulled still holds real Wyoming LLCs, and REST
+  // `GET /companies` answers for them whenever a company store is wired. The agent surface must
+  // not be quietly less capable than the browser one.
   expect(offNames).not.toContain("create_company");
-  expect(offNames).not.toContain("list_companies");
+  expect(offNames).toContain("list_companies");
 });
 
 test("MCP and REST mint the SAME company — one domain function, one set of refusals", async () => {
@@ -454,15 +478,24 @@ test("MCP and REST mint the SAME company — one domain function, one set of ref
     });
     expect(textOf(reused)).toMatch(/unknown, not yours, or already bound/);
 
-    // list_companies renders the same projection REST does, newest first.
+    // list_companies renders the same projection REST does, newest first — FIELD FOR FIELD.
+    // The two are one API-level contract (the picker's ordering and its labels), and MCP was
+    // silently dropping businessPurpose, industryLabel, filedAt and filingNumber: an agent
+    // surface less true than the browser one, for no reason anybody chose. The counterpart
+    // assertion is in test/api/formationParty.routes.test.ts — the two lists must stay identical.
     const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
     expect(listed.companies).toHaveLength(1);
+    expect(Object.keys(listed.companies[0]).sort()).toEqual(COMPANY_VIEW_KEYS);
     expect(listed.companies[0]).toMatchObject({
       companyId,
       status: "ready",
       formationStatus: "none",
       paying: false,
       agents: 0,
+      businessPurpose: expect.any(String),
+      industryLabel: expect.any(String),
+      filedAt: null,
+      filingNumber: null,
     });
 
     // …and onboard_agent attaches to it, free.

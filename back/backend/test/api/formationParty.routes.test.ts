@@ -481,6 +481,25 @@ test("POST /companies mints a company through the ONE domain function, and lists
     await app.request("/companies", { headers: { authorization: `Bearer ${token}` } })
   ).json();
   expect(list.companies).toHaveLength(1);
+  // The projection's key set, asserted IDENTICALLY on the MCP door (see
+  // test/mcp/formationParty.int.test.ts): one API-level contract, two surfaces, and a field added
+  // to one and not the other fails whichever was forgotten.
+  expect(Object.keys(list.companies[0]).sort()).toEqual([
+    "agents",
+    "businessPurpose",
+    "companyId",
+    "createdAt",
+    "environment",
+    "filedAt",
+    "filingNumber",
+    "formationStatus",
+    "industryLabel",
+    "legalNameFiled",
+    "nameOptions",
+    "paying",
+    "status",
+    "synthetic",
+  ]);
   expect(list.companies[0]).toMatchObject({
     companyId,
     status: "ready",

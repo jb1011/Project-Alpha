@@ -626,7 +626,18 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         }
       },
     );
+  }
 
+  /**
+   * `list_companies` is registered wherever a COMPANY STORE is, exactly like REST
+   * `GET /companies` — and deliberately not under `deps.formation` as it was.
+   *
+   * Reading the legal bodies you already own is not a formation capability: a box whose doola
+   * credentials have been pulled still holds real Wyoming LLCs, and an agent surface that cannot
+   * name them while the browser can is the silent asymmetry `EntityViewDeps` was made one object
+   * to prevent. `create_company` stays gated on `deps.formation`, because that one spends money.
+   */
+  if (deps.companies) {
     server.registerTool(
       "list_companies",
       {
@@ -643,6 +654,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           content: [
             {
               type: "text",
+              // The SAME projection REST `GET /companies` renders — field for field. The two are
+              // one API-level contract (the picker's ordering and its labels), and an agent
+              // surface that quietly dropped the business purpose, the industry and the filing
+              // facts was less true than the browser one for no reason anybody chose.
               text: JSON.stringify({
                 companies: rows.map((company) => ({
                   companyId: company.companyId,
@@ -651,10 +666,14 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
                   synthetic: company.synthetic,
                   nameOptions: company.nameOptions,
                   legalNameFiled: company.legalNameFiled,
+                  businessPurpose: company.businessPurpose,
+                  industryLabel: company.industryLabel,
                   formationStatus: deriveFormationStatus(
                     deps.formationSteps?.(company.companyId) ?? [],
                   ),
                   paying: hasLivePayment(deps.companies, company.companyId),
+                  filedAt: company.filedAt,
+                  filingNumber: company.filingNumber,
                   agents: deps.companies?.countAgents(company.companyId) ?? 0,
                   createdAt: company.createdAt,
                 })),
