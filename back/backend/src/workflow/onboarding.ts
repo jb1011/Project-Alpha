@@ -199,20 +199,18 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     ? (rec.walletProvider ?? "turnkey")
     : (d.custody ?? "turnkey");
 
-  // Formation pinning, the custody twin (design §2, audit M5): for ANY existing record the
-  // PERSISTED provider/environment win — including legacy rows whose pair is null, which mean
-  // "stub forever". Only a genuinely fresh record takes this deployment's configuration, so a
-  // mainnet flip can never re-route an in-flight sandbox company at the production host.
+  // Formation pinning, the custody twin (design §2, audit M5): the PERSISTED
+  // provider/environment win, always — including for legacy rows whose pair is null, which mean
+  // "stub forever". Nothing here derives a pin from configuration, so a mainnet flip can never
+  // re-route an in-flight sandbox company at the production host.
   //
-  // A fresh record is pinned IFF it is ATTACHED TO A COMPANY (2026-08-26 §3) — the same rule the
-  // runner's claim applies, restated here because the CLI reaches this function without going
-  // through the runner at all. The pin is copied FROM THE COMPANY ROW, never from config: a
-  // company minted in sandbox must not become a production filing because a flag moved.
-  const attached = rec?.companyId ? d.formation?.companies.find(rec.companyId) : undefined;
-  const formationProvider = rec ? (rec.formationProvider ?? null) : (attached?.provider ?? null);
-  const formationEnvironment = rec
-    ? (rec.formationEnvironment ?? null)
-    : (attached?.environment ?? null);
+  // A record that does not exist yet is UNPINNED, by construction: the pin is copied from the
+  // COMPANY ROW inside the runner's claim, in the same transaction that writes `company_id`
+  // (2026-08-26 §3), so there is no window in which a fresh record has a company and no pin.
+  // This function only ever reads back what that claim wrote — an earlier version looked the
+  // company up here for the fresh case, which could not happen and never did.
+  const formationProvider = rec?.formationProvider ?? null;
+  const formationEnvironment = rec?.formationEnvironment ?? null;
 
   // ── M3. A record that is PINNED but has no party bound can never be filed: Step 9 would burn
   //    eight attempts on `no formation party is bound` and end in `abandoned`, which is the

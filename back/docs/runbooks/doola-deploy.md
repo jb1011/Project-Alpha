@@ -33,12 +33,38 @@ What that changes for an operator:
 Before the upgrade, on the box:
 
 ```bash
-# Any row here blocks the migration. Empty = the upgrade will run clean.
+# Run these against the PRE-migration shape (formation_requests is still entity-keyed here).
+# Any row from either query blocks the migration. Empty from both = the upgrade will run clean.
+
+# 1. A create still in flight. Re-keying it would file a SECOND real Wyoming LLC.
 sqlite3 "$DATA_DIR/legalbody.db" \
   "SELECT entity_key, state, provider_ref FROM formation_requests
     WHERE step='create_provider'
       AND (state IN ('pending','submitted') OR (state='failed' AND provider_ref IS NULL));"
+
+# 2. An entity that holds formation state but carries NO pin. `companies.environment` is what
+#    routes a filing at sandbox or at production, and the migration will not invent one. Expected
+#    to be empty: the claim writes the pin, the company and the party bind in one transaction.
+#    A row here needs a human to set formation_provider/formation_environment deliberately (or to
+#    erase the party bound to it) before the upgrade can run.
+sqlite3 "$DATA_DIR/legalbody.db" \
+  "SELECT e.idempotency_key, e.formation_provider, e.formation_environment
+     FROM entities e
+     LEFT JOIN formation_parties p
+       ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
+    WHERE (e.formation_provider IS NULL OR e.formation_environment IS NULL)
+      AND (p.party_id IS NOT NULL
+           OR EXISTS (SELECT 1 FROM formation_requests f WHERE f.entity_key = e.idempotency_key)
+           OR EXISTS (SELECT 1 FROM documents d WHERE d.entity_key = e.idempotency_key))
+    GROUP BY e.idempotency_key;"
 ```
+
+After the upgrade, a synthesized company mirrors its legacy `create_provider` verdict: an
+`abandoned` create yields an `abandoned` company (not attachable, not re-opened by the sweeper),
+and everything else yields `ready`.
+
+`formation:abandon` resolves its database through the same config the API does (`DATA_DIR`);
+there is no `DB_PATH` override.
 
 ## The one sentence
 
