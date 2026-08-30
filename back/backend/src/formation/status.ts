@@ -170,6 +170,8 @@ export function formationSummary(
  */
 export interface LivePaymentReader {
   livePaymentCount(companyId: string): number;
+  /** The batched twin, for a whole page. Optional so a stub reader still satisfies this type. */
+  livePaymentCountMany?(companyIds: string[]): Map<string, number>;
 }
 
 export function hasLivePayment(
@@ -177,4 +179,21 @@ export function hasLivePayment(
   companyId: string,
 ): boolean {
   return (payments?.livePaymentCount(companyId) ?? 0) > 0;
+}
+
+/**
+ * The same predicate for a whole page, in ONE query (M5).
+ *
+ * Returns a lookup rather than a map so the definition of "paying" stays in this file: a caller
+ * holding a map of counts would have to re-write `> 0` for itself, which is exactly the drift
+ * `hasLivePayment` exists to stop. Falls back to the per-row reader when the batched one is not
+ * wired, so every existing caller keeps working.
+ */
+export function livePaymentLookup(
+  payments: LivePaymentReader | undefined,
+  companyIds: string[],
+): (companyId: string) => boolean {
+  const counts = payments?.livePaymentCountMany?.(companyIds);
+  if (!counts) return (companyId) => hasLivePayment(payments, companyId);
+  return (companyId) => (counts.get(companyId) ?? 0) > 0;
 }

@@ -5,7 +5,7 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
-import { type EntityViewDeps, toEntityView, toEntityViews } from "../api/views";
+import { type EntityViewDeps, listCompanyViews, toEntityView, toEntityViews } from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
 import {
   createFormationParty,
@@ -649,34 +649,16 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       async () => {
         if (!hasCapability(scope, "read"))
           return { content: [{ type: "text", text: "not authorized" }], isError: true };
-        const rows = deps.companies?.listByTenant(tenantId) ?? [];
         return {
           content: [
             {
               type: "text",
-              // The SAME projection REST `GET /companies` renders — field for field. The two are
-              // one API-level contract (the picker's ordering and its labels), and an agent
-              // surface that quietly dropped the business purpose, the industry and the filing
-              // facts was less true than the browser one for no reason anybody chose.
+              // The SAME projection REST `GET /companies` renders — literally the same function,
+              // because the two are one API-level contract (the picker's ordering and its
+              // labels) and two literals is how the agent surface quietly ended up dropping the
+              // business purpose, the industry and both filing facts.
               text: JSON.stringify({
-                companies: rows.map((company) => ({
-                  companyId: company.companyId,
-                  status: company.status,
-                  environment: company.environment,
-                  synthetic: company.synthetic,
-                  nameOptions: company.nameOptions,
-                  legalNameFiled: company.legalNameFiled,
-                  businessPurpose: company.businessPurpose,
-                  industryLabel: company.industryLabel,
-                  formationStatus: deriveFormationStatus(
-                    deps.formationSteps?.(company.companyId) ?? [],
-                  ),
-                  paying: hasLivePayment(deps.companies, company.companyId),
-                  filedAt: company.filedAt,
-                  filingNumber: company.filingNumber,
-                  agents: deps.companies?.countAgents(company.companyId) ?? 0,
-                  createdAt: company.createdAt,
-                })),
+                companies: listCompanyViews({ ...deps, companies: deps.companies! }, tenantId),
               }),
             },
           ],

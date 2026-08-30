@@ -15,7 +15,7 @@ import { opsLog } from "../../observability/opsLog";
 import { AgentSpecSchema, FormationPartySchema } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
-import { toEntityView, toEntityViews } from "../views";
+import { listCompanyViews, toEntityView, toEntityViews } from "../views";
 import { assertGuardianAllowed } from "./worldId";
 
 export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
@@ -149,30 +149,9 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
   app.get("/companies", (c) => {
     const tenantId = c.get("tenantId");
     if (!deps.companies) return c.json({ companies: [] });
-    const rows = deps.companies.listByTenant(tenantId);
+    // ONE projection, shared with MCP `list_companies`, in four queries however long the page is.
     return c.json({
-      companies: rows.map((company) => {
-        const steps = deps.formationSteps?.(company.companyId) ?? [];
-        return {
-          companyId: company.companyId,
-          status: company.status,
-          environment: company.environment,
-          synthetic: company.synthetic,
-          nameOptions: company.nameOptions,
-          legalNameFiled: company.legalNameFiled,
-          businessPurpose: company.businessPurpose,
-          industryLabel: company.industryLabel,
-          // DERIVED, both of them — see `deriveFormationStatus` and `hasLivePayment`.
-          formationStatus: deriveFormationStatus(steps),
-          paying: hasLivePayment(deps.companies, company.companyId),
-          filedAt: company.filedAt,
-          filingNumber: company.filingNumber,
-          // How many agents SHARE this filing. Authenticated surface only: the public ones do
-          // not carry it (§7 sharing labels).
-          agents: deps.companies?.countAgents(company.companyId) ?? 0,
-          createdAt: company.createdAt,
-        };
-      }),
+      companies: listCompanyViews({ ...deps, companies: deps.companies }, tenantId),
     });
   });
 

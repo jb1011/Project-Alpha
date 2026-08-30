@@ -132,6 +132,18 @@ export interface CompanyRepository {
   livePaymentCount(companyId: string): number;
   /** Entities attached to one company — the FORMATION_MAX_AGENTS_PER_COMPANY reader. */
   countAgents(companyId: string): number;
+  /**
+   * The two counts above for a WHOLE PAGE, one `GROUP BY` each (M5's rule, applied to the company
+   * list).
+   *
+   * `GET /companies` and MCP `list_companies` rendered every row with its own `stepsOf`, its own
+   * `livePaymentCount` and its own `countAgents`: 3N+1 queries for a page, on two authenticated
+   * surfaces, for three answers a single grouped scan gives. Companies absent from the map have
+   * a count of zero — a map, not a default, so the caller cannot mistake "no rows" for "not
+   * asked".
+   */
+  countAgentsMany(companyIds: string[]): Map<string, number>;
+  livePaymentCountMany(companyIds: string[]): Map<string, number>;
   /** CAS the status. Returns whether THIS caller made the move. */
   setStatus(companyId: string, from: CompanyStatus, to: CompanyStatus): boolean;
   /**
@@ -265,6 +277,40 @@ export class SqliteCompanyRepository implements CompanyRepository {
 
   countAgents(companyId: string): number {
     return (this.stmts.countAgents.get(companyId) as { n: number }).n;
+  }
+
+  countAgentsMany(companyIds: string[]): Map<string, number> {
+    return this.groupCount(
+      companyIds,
+      (list) =>
+        `SELECT company_id AS k, COUNT(*) AS n FROM entities
+          WHERE company_id IN (${list}) GROUP BY company_id`,
+    );
+  }
+
+  livePaymentCountMany(companyIds: string[]): Map<string, number> {
+    return this.groupCount(
+      companyIds,
+      (list) =>
+        `SELECT company_id AS k, COUNT(*) AS n FROM formation_payments
+          WHERE company_id IN (${list}) AND status IN ('quoted','settling')
+          GROUP BY company_id`,
+    );
+  }
+
+  /** Chunked at 400, clear of SQLITE_MAX_VARIABLE_NUMBER — the `findMany` idiom, for counts. */
+  private groupCount(companyIds: string[], sql: (list: string) => string): Map<string, number> {
+    const out = new Map<string, number>();
+    if (companyIds.length === 0) return out;
+    for (let i = 0; i < companyIds.length; i += 400) {
+      const chunk = companyIds.slice(i, i + 400);
+      const rows = this.db.prepare(sql(chunk.map(() => "?").join(","))).all(...chunk) as {
+        k: string;
+        n: number;
+      }[];
+      for (const r of rows) out.set(r.k, r.n);
+    }
+    return out;
   }
 
   setStatus(companyId: string, from: CompanyStatus, to: CompanyStatus): boolean {

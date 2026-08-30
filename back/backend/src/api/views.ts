@@ -1,4 +1,10 @@
-import { type FormationStatus, type FormationSummary, formationSummary } from "../formation/status";
+import {
+  type FormationStatus,
+  type FormationSummary,
+  deriveFormationStatus,
+  formationSummary,
+  livePaymentLookup,
+} from "../formation/status";
 import type { CompanyRecord } from "../persistence/companyRepository";
 import {
   type DocumentIndexRecord,
@@ -51,6 +57,79 @@ export interface EntityViewDeps {
    * stand-in satisfies it; `ApiDeps` re-declares it as the full repository.
    */
   documents?: Pick<DocumentIndexRepository, "listByCompany" | "listByEntities">;
+}
+
+/**
+ * ONE row of the company list (design §7).
+ *
+ * `GET /companies` and MCP `list_companies` are one API-level contract — the reuse picker's
+ * ordering and its labels — so they render through one function rather than two literals. The
+ * agent surface had already drifted: it dropped the business purpose, the industry and both
+ * filing facts.
+ *
+ * NO PII, exactly as everywhere else: the responsible party is not projected here and neither is
+ * the filed party's name. A company's own name candidates are not personal data.
+ */
+export interface CompanyView {
+  companyId: string;
+  status: CompanyRecord["status"];
+  environment: CompanyRecord["environment"];
+  synthetic: boolean;
+  nameOptions: CompanyRecord["nameOptions"];
+  legalNameFiled: string | null;
+  businessPurpose: string;
+  industryLabel: string;
+  /** DERIVED from the sub-saga rows; nothing about progress is stored on the company. */
+  formationStatus: FormationStatus;
+  /** DERIVED from `formation_payments`; nothing about payment is stored on the company either. */
+  paying: boolean;
+  filedAt: number | null;
+  filingNumber: string | null;
+  /** How many agents SHARE this filing. Authenticated surfaces only (§7 sharing labels). */
+  agents: number;
+  createdAt: string;
+}
+
+/** What a company list needs beyond the rows themselves. */
+export interface CompanyListDeps {
+  companies: import("../persistence/companyRepository").CompanyRepository;
+  /** The batched steps lookup. Absent, each row falls back to its own read. */
+  formationStepsMany?: (companyIds: string[]) => Map<string, FormationRequestRecord[]>;
+  formationSteps?: FormationStepsLookup;
+}
+
+/**
+ * A tenant's companies, NEWEST FIRST, in FOUR queries however long the page is (M5).
+ *
+ * Every row used to ask for its own steps, its own live-payment count and its own agent count:
+ * 3N+1 queries per page view, on two authenticated surfaces. The ordering is the repository's,
+ * because it is an API-level contract shared with the wizard's picker — two renderers sorting for
+ * themselves is how a picker ends up disagreeing with the list behind it.
+ */
+export function listCompanyViews(deps: CompanyListDeps, tenantId: string): CompanyView[] {
+  const rows = deps.companies.listByTenant(tenantId);
+  const ids = rows.map((r) => r.companyId);
+  const steps = deps.formationStepsMany?.(ids);
+  const agents = deps.companies.countAgentsMany(ids);
+  const paying = livePaymentLookup(deps.companies, ids);
+  return rows.map((company) => ({
+    companyId: company.companyId,
+    status: company.status,
+    environment: company.environment,
+    synthetic: company.synthetic,
+    nameOptions: company.nameOptions,
+    legalNameFiled: company.legalNameFiled,
+    businessPurpose: company.businessPurpose,
+    industryLabel: company.industryLabel,
+    formationStatus: deriveFormationStatus(
+      steps?.get(company.companyId) ?? deps.formationSteps?.(company.companyId) ?? [],
+    ),
+    paying: paying(company.companyId),
+    filedAt: company.filedAt,
+    filingNumber: company.filingNumber,
+    agents: agents.get(company.companyId) ?? 0,
+    createdAt: company.createdAt,
+  }));
 }
 
 /**
