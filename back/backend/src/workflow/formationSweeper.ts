@@ -36,7 +36,7 @@ import {
   processDoolaEvent,
 } from "./formationProcessor";
 import { runFormationCreateProvider } from "./formationProvider";
-import { persistPollBackoff } from "./formationStep";
+import { abandonFormation, persistPollBackoff } from "./formationStep";
 
 /**
  * The formation sweeper (design §7 "Reconcile & sweeper") — the first recurring timer in the API
@@ -458,16 +458,15 @@ export class FormationSweeper {
    *  entity is live without one. */
   private abandon(row: FormationRequestRecord): void {
     // The step transition and the COMPANY's status move in ONE transaction (2026-08-26 §4.6):
-    // company-level `abandoned` has exactly three writers, and all three set the two together so
-    // the company and its step can never disagree about whether the filing is over.
-    let moved = false;
-    this.d.repo.transaction(() => {
-      moved = this.d.requests.transition(row.companyId, row.step, "failed", "abandoned", {
-        error: row.error ?? `abandoned after ${row.attempt} attempts`,
-      });
-      if (moved && row.step === "create_provider")
-        this.d.companies.setStatus(row.companyId, "ready", "abandoned");
-    });
+    // company-level `abandoned` has exactly three writers, and all three go through the SAME
+    // function so the company and its step can never disagree about whether the filing is over.
+    const moved = abandonFormation(
+      this.d.requests,
+      this.d.companies,
+      row.companyId,
+      row.error ?? `abandoned after ${row.attempt} attempts`,
+      { transaction: (fn) => this.d.repo.transaction(fn), step: row.step, from: "failed" },
+    );
     if (!moved) return;
     opsLog("formation_abandoned", {
       severity: "CRITICAL",

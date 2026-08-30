@@ -7,6 +7,7 @@ import {
   nextInterval,
 } from "../formation/schedule";
 import { opsLog } from "../observability/opsLog";
+import type { CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
 import {
   type FormationRepository,
@@ -56,6 +57,48 @@ export function logFormationStep(
   extra: Record<string, unknown> = {},
 ): void {
   opsLog("formation_step", { companyId, step, state, attempt, ...extra });
+}
+
+/**
+ * ABANDON a formation step, moving the COMPANY's status with it, in ONE transaction.
+ *
+ * `abandoned` is the terminal verdict, and §4.6 says it has exactly three writers — the sweeper
+ * at the attempt bound, the operator escape (`npm run cli -- formation:abandon`), and a future
+ * payment expiry — each of which must move the step and the company TOGETHER. The CLI used to
+ * run two raw UPDATEs outside any transaction, so a crash between them left a company still
+ * `ready` (attachable, quota-chargeable, and inside `listUnopened`'s reach) over an abandoned
+ * create — and it never stamped `facts_updated_at` at all, which the anchor gate reads.
+ *
+ * Returns whether THIS caller made the move: the step transition is a CAS, and a caller that
+ * loses it must not log a CRITICAL about a verdict somebody else reached.
+ *
+ * The company's status moves only for `create_provider`, because that is the step whose failure
+ * means the FILING is over; a later step can be abandoned while the company legitimately exists.
+ */
+export function abandonFormation(
+  requests: FormationRepository,
+  companies: Pick<CompanyRepository, "setStatus">,
+  companyId: string,
+  reason: string,
+  opts: {
+    transaction: <T>(fn: () => T) => T;
+    /** Which step. Defaults to the one whose abandonment ends the filing. */
+    step?: FormationStep;
+    /** The state to CAS from. Defaults to the sweeper's own `failed`. */
+    from?: FormationState;
+  },
+): boolean {
+  const step = opts.step ?? "create_provider";
+  let moved = false;
+  opts.transaction(() => {
+    moved = requests.transition(companyId, step, opts.from ?? "failed", "abandoned", {
+      error: reason,
+    });
+    // A verdict IS a fact: the row's state changed, so `transition` stamps `facts_updated_at`
+    // by default and the anchor gate sees it.
+    if (moved && step === "create_provider") companies.setStatus(companyId, "ready", "abandoned");
+  });
+  return moved;
 }
 
 /**

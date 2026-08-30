@@ -335,11 +335,18 @@ export function buildCli(
     .description("Abandon a parked create_provider row so the company re-key can proceed")
     .action(async (key: string, opts: { reason: string }) => {
       const { config: loadDotenv } = await import("dotenv");
+      const { loadConfig } = await import("../config/env");
       const { openDatabase } = await import("../persistence/db");
+      const { SqliteCompanyRepository } = await import("../persistence/companyRepository");
+      const { SqliteFormationRepository } = await import("../persistence/formationRepository");
       const { opsLog } = await import("../observability/opsLog");
+      const { abandonFormation } = await import("../workflow/formationStep");
       loadDotenv();
-      const dbPath = process.env.DB_PATH ?? `${process.env.DATA_DIR ?? "./data"}/legalbody.db`;
-      const db = openDatabase(dbPath);
+      // `loadConfig().dbPath`, never `process.env.DB_PATH`: there is no DB_PATH knob. The config
+      // derives the path from DATA_DIR, so an operator who moved the data directory would have
+      // had this command open a DIFFERENT, empty database and report "no create_provider row"
+      // about a formation that is sitting right there.
+      const db = openDatabase(loadConfig().dbPath);
 
       // Whichever shape is on disk. Pre-migration the rows are keyed by entity; post-migration by
       // company, and the argument is resolved through `entities.company_id`.
@@ -371,20 +378,35 @@ export function buildCli(
         console.log("already abandoned");
         return;
       }
-      const changed = db
-        .prepare(
-          `UPDATE formation_requests
-              SET state = 'abandoned', error = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE ${column} = ? AND step = 'create_provider' AND state = ?`,
-        )
-        .run(`operator abandon: ${opts.reason}`, target, row.state).changes;
-      if (changed !== 1) throw new Error("lost the race: the row moved, re-run to see its state");
-      // The company's own status moves with it where the column exists, so the two can never
-      // disagree about whether the filing is over (§4.6: three writers, all paired).
-      if (!legacy)
-        db.prepare(
-          "UPDATE companies SET status = 'abandoned', updated_at = CURRENT_TIMESTAMP WHERE company_id = ? AND status = 'ready'",
-        ).run(target);
+      const reason = `operator abandon: ${opts.reason}`;
+      // POST-migration this is the SAME domain function the sweeper's own terminal verdict uses:
+      // one transaction, the step and the company together, `facts_updated_at` stamped. The two
+      // raw UPDATEs it replaces ran outside any transaction and stamped nothing, so a crash
+      // between them left a company `ready` — attachable and quota-chargeable — over an
+      // abandoned create.
+      //
+      // The LEGACY branch stays a raw statement because it must: on a pre-migration box there is
+      // no `companies` table and `formation_requests` has no `company_id`, so neither repository
+      // can even be constructed, and this command exists precisely to be run there.
+      const changed = legacy
+        ? db
+            .prepare(
+              `UPDATE formation_requests
+                  SET state = 'abandoned', error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE entity_key = ? AND step = 'create_provider' AND state = ?`,
+            )
+            .run(reason, target, row.state).changes === 1
+        : abandonFormation(
+            new SqliteFormationRepository(db),
+            new SqliteCompanyRepository(db),
+            target,
+            reason,
+            {
+              transaction: (fn) => db.transaction(fn)(),
+              from: row.state as "pending" | "submitted" | "failed",
+            },
+          );
+      if (!changed) throw new Error("lost the race: the row moved, re-run to see its state");
       opsLog("formation_abandoned", {
         severity: "CRITICAL",
         level: "error",

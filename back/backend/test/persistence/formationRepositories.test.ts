@@ -6,9 +6,11 @@
  */
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import { SqliteOaAnchorRepository } from "../../src/persistence/oaAnchorRepository";
+import { abandonFormation } from "../../src/workflow/formationStep";
 
 let db: Database.Database;
 let formation: SqliteFormationRepository;
@@ -315,6 +317,63 @@ test("a POLL does not move facts_updated_at — and so does not invalidate the a
   // …while a real transition does move it.
   formation.transition("c1", "await_ein", "pending", "confirmed");
   expect(formation.find("c1", "await_ein")!.state).toBe("confirmed");
+});
+
+test("abandonFormation is ONE transaction: the step and the company move together or neither", () => {
+  // `abandoned` has three writers (§4.6) and every one of them must move both rows. The CLI used
+  // to run two raw UPDATEs outside any transaction, so a crash between them left a company still
+  // `ready` — attachable, quota-chargeable, and inside `listUnopened`'s reach — over a create
+  // that had been abandoned by hand.
+  const companies = new SqliteCompanyRepository(db);
+  const companyId = companies.create({
+    tenantId: "t",
+    status: "ready",
+    provider: "doola",
+    environment: "sandbox",
+    synthetic: false,
+    nameOptions: [],
+    businessPurpose: "p",
+    industryLabel: "i",
+    intakeSynthesized: true,
+  });
+  formation.claimStep(companyId, "create_provider");
+  formation.transition(companyId, "create_provider", "pending", "failed", { error: "doola 503" });
+  const OLD = "2026-01-01 00:00:00";
+  db.prepare("UPDATE formation_requests SET facts_updated_at = ? WHERE company_id = ?").run(
+    OLD,
+    companyId,
+  );
+
+  // NEITHER: the company write throws, so the step's transition must roll back with it.
+  const exploding: Pick<SqliteCompanyRepository, "setStatus"> = {
+    setStatus: () => {
+      throw new Error("disk full");
+    },
+  };
+  expect(() =>
+    abandonFormation(formation, exploding, companyId, "operator abandon", {
+      transaction: (fn) => db.transaction(fn)(),
+    }),
+  ).toThrow(/disk full/);
+  expect(formation.find(companyId, "create_provider")!.state).toBe("failed");
+  expect(companies.find(companyId)!.status).toBe("ready");
+
+  // BOTH — and the verdict IS a fact, so the anchor gate sees it.
+  expect(
+    abandonFormation(formation, companies, companyId, "operator abandon", {
+      transaction: (fn) => db.transaction(fn)(),
+    }),
+  ).toBe(true);
+  expect(formation.find(companyId, "create_provider")!.state).toBe("abandoned");
+  expect(companies.find(companyId)!.status).toBe("abandoned");
+  expect(formation.find(companyId, "create_provider")!.factsUpdatedAt).not.toBe(OLD);
+
+  // A caller that LOSES the CAS reports false rather than logging a verdict somebody else reached.
+  expect(
+    abandonFormation(formation, companies, companyId, "again", {
+      transaction: (fn) => db.transaction(fn)(),
+    }),
+  ).toBe(false);
 });
 
 test("an ATTEMPT BUMP is not a fact — it must not hold the entity in the anchor due-set", () => {

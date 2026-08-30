@@ -25,7 +25,13 @@ const savedEnv = { ...process.env };
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "abandon-"));
   dbPath = join(dir, "legalbody.db");
-  process.env.DB_PATH = dbPath;
+  // DATA_DIR, not DB_PATH: the command resolves its database through `loadConfig().dbPath`, and
+  // there is no DB_PATH knob — an operator who moved the data directory and set DB_PATH would
+  // otherwise have had this command open a different, empty database and report "no
+  // create_provider row" about a formation sitting right there.
+  process.env.DATA_DIR = dir;
+  process.env.ARC_TESTNET_RPC_URL = "https://rpc.example";
+  process.env.PLATFORM_PRIVATE_KEY = `0x${"a".repeat(64)}`;
 });
 afterEach(() => {
   process.env = { ...savedEnv };
