@@ -248,13 +248,30 @@ test("a party whose synthetic flag disagrees with the deployment is refused", ()
 
 // ── intake validation ──────────────────────────────────────────────────────────────────────
 
-test("a blank or ending-only name is refused", () => {
+test("a blank name and an over-long one are refused", () => {
   expect(createCompany(deps(), TENANT, intake(newParty(), { name: "   " }))).toEqual({
     error: "a company name is required",
   });
   expect(createCompany(deps(), TENANT, intake(newParty(), { name: "x".repeat(200) }))).toEqual({
     error: "a company name may be at most 120 characters",
   });
+});
+
+test("a name that is NOTHING BUT an entity ending is refused — the guard actually fires", () => {
+  // `stripEntityEnding` used to anchor on `[\s,]+`, so a bare "LLC" never matched, and its
+  // `|| raw.trim()` fallback handed the ending straight back as the name. The guard below was
+  // therefore unreachable and Wyoming would have been asked to file "LLC LLC".
+  for (const name of ["LLC", " L.L.C. ", "llc", ",llc"])
+    expect(createCompany(deps(), TENANT, intake(newParty(), { name })), name).toEqual({
+      error: "a company name must contain something other than an entity ending",
+    });
+  // …and a real name that merely ENDS in one still keeps its name.
+  const ok = createCompany(deps(), TENANT, intake(newParty(), { name: "Acme Robotics L.L.C." }));
+  expect(companies.find((ok as { companyId: string }).companyId)!.nameOptions).toEqual([
+    { name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 },
+  ]);
+  // Nothing was minted for any of the refused ones.
+  expect(companies.listByTenant(TENANT)).toHaveLength(1);
 });
 
 // ── the identity floor (§6.7) ──────────────────────────────────────────────────────────────

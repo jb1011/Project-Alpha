@@ -52,9 +52,17 @@ export function companyNameOptions(...names: string[]): CompanyNameOption[] {
   }));
 }
 
-/** Strip a trailing `LLC` / `L.L.C.` — the ending is a separate field on the wire. */
+/**
+ * Strip a trailing `LLC` / `L.L.C.` — the ending is a separate field on the wire.
+ *
+ * A name that is NOTHING BUT an ending strips to the EMPTY STRING, deliberately. The old version
+ * anchored on `[\s,]+`, so a bare `"LLC"` never matched, and its `|| raw.trim()` fallback then
+ * handed the ending back as the name — which made the ending-only guard in `createCompany`
+ * unreachable and would have filed a Wyoming LLC called "LLC LLC". Returning empty is what lets
+ * that guard fire.
+ */
 export function stripEntityEnding(raw: string): string {
-  return raw.replace(/[\s,]+(l\.?l\.?c\.?)$/i, "").trim() || raw.trim();
+  return raw.replace(/(^|[\s,]+)(l\.?l\.?c\.?)$/i, "").trim();
 }
 
 /**
