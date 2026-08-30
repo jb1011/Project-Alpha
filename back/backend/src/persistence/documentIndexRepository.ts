@@ -123,13 +123,15 @@ export interface DocumentIndexRepository {
   insert(rec: Omit<DocumentIndexRecord, "createdAt" | "entityKey"> & { entityKey?: null }): boolean;
   listByCompany(companyId: string): DocumentIndexRecord[];
   /**
-   * The same rows for MANY ENTITIES, in ONE statement — the list routes' N+1 (M5).
+   * The same rows for MANY COMPANIES, in ONE statement — the list routes' N+1 (M5).
    *
-   * Entity-shaped at the view boundary and company-keyed underneath: the join goes through
-   * `entities.company_id`, so two agents sharing a filing each render the same documents without
-   * either surface learning that the key moved.
+   * COMPANY-keyed, and deliberately no join. The entity-shaped version went
+   * entity → `entities.company_id` → documents and back, which cost a join per page and, worse,
+   * could not answer for a company with no agent attached to it — a shape the re-key made
+   * ordinary, since a company can be filed and have its documents fetched before anyone onboards.
+   * The caller already knows each row's company; asking by that is both cheaper and total.
    */
-  listByEntities(entityKeys: string[]): Map<string, DocumentIndexRecord[]>;
+  listByCompanies(companyIds: string[]): Map<string, DocumentIndexRecord[]>;
   /** Ownership is enforced by the caller against `companies`; the company id is re-asserted here
    *  so a document id from one company can never be read through another company's route. */
   findOwned(companyId: string, id: string): DocumentIndexRecord | undefined;
@@ -182,26 +184,25 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
     return (this.stmts.listByCompany.all(companyId) as Row[]).map(toRecord);
   }
 
-  listByEntities(entityKeys: string[]): Map<string, DocumentIndexRecord[]> {
+  listByCompanies(companyIds: string[]): Map<string, DocumentIndexRecord[]> {
     const out = new Map<string, DocumentIndexRecord[]>();
-    if (entityKeys.length === 0) return out;
-    for (let i = 0; i < entityKeys.length; i += 400) {
-      const chunk = entityKeys.slice(i, i + 400);
-      // The join is what makes this entity-shaped: the row lives under a company, and the
-      // entity's own `company_id` is the only thing that connects the two.
+    if (companyIds.length === 0) return out;
+    // Chunked at 400, clear of SQLITE_MAX_VARIABLE_NUMBER — the `stepsOfMany` idiom.
+    for (let i = 0; i < companyIds.length; i += 400) {
+      const chunk = companyIds.slice(i, i + 400);
       const rows = this.db
         .prepare(
-          `SELECT d.*, e.idempotency_key AS for_entity
-             FROM documents d
-             JOIN entities e ON e.company_id = d.company_id
-            WHERE e.idempotency_key IN (${chunk.map(() => "?").join(",")})
-            ORDER BY d.created_at, d.doc_type, d.id`,
+          `SELECT * FROM documents
+            WHERE company_id IN (${chunk.map(() => "?").join(",")})
+            ORDER BY created_at, doc_type, id`,
         )
-        .all(...chunk) as (Row & { for_entity: string })[];
+        .all(...chunk) as Row[];
       for (const r of rows) {
-        const list = out.get(r.for_entity);
+        const key = r.company_id;
+        if (!key) continue; // a legacy row the backfill could not place has no company to key on
+        const list = out.get(key);
         if (list) list.push(toRecord(r));
-        else out.set(r.for_entity, [toRecord(r)]);
+        else out.set(key, [toRecord(r)]);
       }
     }
     return out;

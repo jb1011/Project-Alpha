@@ -380,8 +380,8 @@ test("M5: toEntityViews batches the formation and document reads across the whol
       listByCompany: () => {
         throw new Error("the per-row lookup must not be used when a batched one is wired");
       },
-      listByEntities: (keys) => {
-        askedDocs.push([...keys]);
+      listByCompanies: (ids: string[]) => {
+        askedDocs.push([...ids]);
         return new Map();
       },
     },
@@ -392,9 +392,10 @@ test("M5: toEntityViews batches the formation and document reads across the whol
   expect(askedDocs).toHaveLength(1);
   expect(askedSteps[0]).toEqual(["company-0", "company-1", "company-2"]);
   expect(askedCompanies[0]).toEqual(["company-0", "company-1", "company-2"]);
-  // The documents batch stays ENTITY-shaped at this boundary: the repository joins through
-  // `entities.company_id`, so a shared filing renders for every agent on it.
-  expect(askedDocs[0]).toEqual(rows.slice(0, 5).map((r) => r.idempotencyKey));
+  // The documents batch is COMPANY-keyed like everything else here: no join back to the entity
+  // for a key the caller was already holding, and a company with no agent attached still has its
+  // documents — which the re-key made an ordinary shape.
+  expect(askedDocs[0]).toEqual(["company-0", "company-1", "company-2"]);
   expect(views).toHaveLength(6);
   expect(views[0]!.formation!.providerRef).toBe("cmp-company-0");
   expect(views[5]!.formation).toBeNull();

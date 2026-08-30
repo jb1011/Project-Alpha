@@ -215,3 +215,26 @@ test("the filename is DERIVED, so a provider-controlled type cannot inject a hea
   expect(name.endsWith(".pdf")).toBe(true);
   expect(documentFileName("")).toBe("document.pdf");
 });
+
+test("listByCompanies answers for a company with NO agent attached — no join to lose it through", () => {
+  // The batched read used to go entity → `entities.company_id` → documents and back through a
+  // join. That is a round trip to recover a key the caller already holds, and it cannot answer
+  // at all for a company nobody has attached to yet — which the re-key made an ordinary shape:
+  // a company is filed and its documents are fetched before any agent onboards.
+  db.prepare(
+    `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
+                            name_options, business_purpose, industry_label)
+     VALUES ('lonely-co', ?, 'ready', 'doola', 'sandbox', '[]', 'p', 'i')`,
+  ).run(OWNER);
+  storeDoc("lonely-co", "d-lonely", "OperatingAgreement");
+  storeDoc(COMPANY_KEY, "d-aoo", "ArticlesOfOrganization");
+  expect(
+    db.prepare("SELECT COUNT(*) AS n FROM entities WHERE company_id = 'lonely-co'").get(),
+  ).toEqual({ n: 0 });
+
+  const batched = documents.listByCompanies(["lonely-co", COMPANY_KEY]);
+  expect(batched.get("lonely-co")?.map((d) => d.providerDocId)).toEqual(["d-lonely"]);
+  expect(batched.get(COMPANY_KEY)?.map((d) => d.providerDocId)).toEqual(["d-aoo"]);
+  // …and it agrees with the per-row read, which is the whole contract.
+  expect(batched.get(COMPANY_KEY)).toEqual(documents.listByCompany(COMPANY_KEY));
+});

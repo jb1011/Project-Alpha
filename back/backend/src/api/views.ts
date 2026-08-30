@@ -56,7 +56,8 @@ export interface EntityViewDeps {
    * split this type exists to prevent. Narrowed to the two READS a view can make, so a batched
    * stand-in satisfies it; `ApiDeps` re-declares it as the full repository.
    */
-  documents?: Pick<DocumentIndexRepository, "listByCompany" | "listByEntities">;
+  documents?: Pick<DocumentIndexRepository, "listByCompany"> &
+    Partial<Pick<DocumentIndexRepository, "listByCompanies">>;
 }
 
 /**
@@ -331,7 +332,6 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
  * keeps working with whatever it already passes.
  */
 export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): EntityView[] {
-  const entityKeys = rows.filter((r) => r.companyId).map((r) => r.idempotencyKey);
   // De-duplicated: under N:1 a page of ten agents may be one company, and asking for its steps
   // ten times is the N+1 this function exists to remove.
   const companyIds = [...new Set(rows.map((r) => r.companyId).filter((c): c is string => !!c))];
@@ -339,28 +339,20 @@ export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): 
 
   const steps = deps.formationStepsMany?.(companyIds);
   const companies = deps.companyMany?.(companyIds);
-  // Still ENTITY-shaped at this boundary: the repository joins through `entities.company_id`, so
-  // two agents sharing a filing each render the same documents.
-  const docs = deps.documents?.listByEntities?.(entityKeys);
+  // COMPANY-keyed, like everything else on this path. It used to go entity → `entities.company_id`
+  // → documents and back through a join, which is a round trip to recover a key the caller was
+  // already holding — and one that cannot answer for a company with no agent attached.
+  const docs = deps.documents?.listByCompanies?.(companyIds);
   if (!steps && !docs && !companies) return rows.map((r) => toEntityView(r, deps));
-
-  // Re-grouped by company for the per-row read below. Every entity attached to one company sees
-  // the SAME rows (the join is on `company_id`), so the first non-empty answer is the answer.
-  const docsByCompany = new Map<string, DocumentIndexRecord[]>();
-  if (docs)
-    for (const r of rows) {
-      const c = r.companyId;
-      if (!c || docsByCompany.get(c)?.length) continue;
-      docsByCompany.set(c, docs.get(r.idempotencyKey) ?? []);
-    }
 
   const batched: EntityViewDeps = {
     ...deps,
     formationSteps: steps ? (k) => steps.get(k) ?? [] : deps.formationSteps,
     company: companies ? (k) => companies.get(k) : deps.company,
-    documents: docs
-      ? { listByCompany: (c) => docsByCompany.get(c) ?? [], listByEntities: () => docs }
-      : deps.documents,
+    // Only `listByCompany` — the one read `toEntityView` makes. The old shape also carried a
+    // `listByEntities: () => docs` stub that ignored its argument entirely, which is a lie in the
+    // type system's own terms and would have answered any caller with the whole page's rows.
+    documents: docs ? { listByCompany: (c) => docs.get(c) ?? [] } : deps.documents,
   };
   return rows.map((r) => toEntityView(r, batched));
 }
