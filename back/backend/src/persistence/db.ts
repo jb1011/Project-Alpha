@@ -784,6 +784,25 @@ export function companyRekeyRefusalMessage(entityKeys: string[]): string {
 }
 
 /**
+ * The SECOND step-1 refusal: an entity holding formation state with NO pin of its own.
+ *
+ * `companies.environment` is NOT NULL and it decides where a filing is ROUTED — the create step
+ * compares it against the deployment's own environment and refuses on a mismatch. There is no
+ * honest value to synthesize for an entity that never carried one, and the migration used to
+ * write `'sandbox'` on the grounds that it would make the check refuse. That is a guess dressed
+ * as a safety property: on a sandbox box it refuses nothing, and it silently decides for a real
+ * responsible party's filing which host their identity is sent to.
+ *
+ * The cohort is impossible under the rules on `main` — the pin, the company and the party bind
+ * are written in ONE claim transaction — so a row in it means hand-edited data or a shape that
+ * predates that rule, and either way a human has to say what the pin is. Named, loudly, rather
+ * than defaulted.
+ */
+export function companyRekeyUnpinnedRefusalMessage(entityKeys: string[]): string {
+  return `refusing to migrate: ${entityKeys.length} entit${entityKeys.length === 1 ? "y holds" : "ies hold"} formation state (a bound responsible party, a sub-saga row or a document) but carry NO formation pin (${entityKeys.slice(0, 5).join(", ")}${entityKeys.length > 5 ? ", …" : ""}). companies.environment is NOT NULL and it is what routes a filing at sandbox or at production, and this migration will not invent one: pinning such a row to "sandbox" would silently decide, on a sandbox box, that a real person's identity is filed there. Under the current claim rules the pin, the company and the party bind are written in one transaction, so this shape cannot be produced any more — set formation_provider/formation_environment on each entity above deliberately, or erase the party that is bound to it, and re-run.`;
+}
+
+/**
  * THE MIGRATION (design 2026-08-26 §2, steps 1-5).
  *
  * It is written out step by step, and specified to the query, because two adversarial passes
@@ -860,6 +879,30 @@ function migrateFormationToCompanies(db: Database.Database): void {
   ).map((r) => r.k);
   if (inFlight.length > 0) throw new Error(companyRekeyRefusalMessage(inFlight));
 
+  // ── Step 1b: THE UNPINNED-BUT-STATEFUL REFUSAL. Every entity the synthesis rule below will
+  //    mint a company for has to supply that company's `environment`, which is NOT NULL and is
+  //    what decides whether the filing is routed at sandbox or at production. An entity with no
+  //    pin has no such value, and there is no safe default — see the message.
+  const unpinned = (
+    db
+      .prepare(
+        `SELECT e.idempotency_key AS k
+           FROM entities e
+           LEFT JOIN formation_parties p
+             ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
+          WHERE e.company_id IS NULL
+            AND (e.formation_provider IS NULL OR e.formation_environment IS NULL)
+            AND (p.party_id IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM formation_requests f
+                             WHERE f.entity_key = e.idempotency_key)
+                 OR EXISTS (SELECT 1 FROM documents d WHERE d.entity_key = e.idempotency_key))
+          GROUP BY e.idempotency_key
+          ORDER BY e.idempotency_key`,
+      )
+      .all() as { k: string }[]
+  ).map((r) => r.k);
+  if (unpinned.length > 0) throw new Error(companyRekeyUnpinnedRefusalMessage(unpinned));
+
   db.transaction(() => {
     // ── Step 2: THE SYNTHESIS RULE. A company for EVERY entity that holds formation state of any
     //    kind — not only the formed ones. Unopened entities, live filings past `create_provider`
@@ -879,7 +922,10 @@ function migrateFormationToCompanies(db: Database.Database): void {
                 e.ein_real AS ein, e.formation_filed_at AS filed_at,
                 e.formation_filing_number AS filing_number,
                 e.created_at AS created_at, e.updated_at AS updated_at,
-                p.tenant_id AS party_tenant, p.synthetic AS party_synthetic
+                p.tenant_id AS party_tenant, p.synthetic AS party_synthetic,
+                (SELECT f.state FROM formation_requests f
+                  WHERE f.entity_key = e.idempotency_key
+                    AND f.step = 'create_provider') AS create_state
            FROM entities e
            LEFT JOIN formation_parties p
              ON p.entity_key = e.idempotency_key AND p.deleted_at IS NULL
@@ -898,7 +944,7 @@ function migrateFormationToCompanies(db: Database.Database): void {
          (company_id, tenant_id, status, provider, environment, synthetic,
           name_options, business_purpose, industry_label, intake_synthesized,
           legal_name_filed, filed_at, filing_number, ein, created_at, updated_at)
-       VALUES (@company_id, @tenant_id, 'ready', @provider, @environment, @synthetic,
+       VALUES (@company_id, @tenant_id, @status, @provider, @environment, @synthetic,
                @name_options, @business_purpose, @industry_label, 1,
                NULL, @filed_at, @filing_number, @ein, @created_at, @updated_at)`,
     );
@@ -923,11 +969,16 @@ function migrateFormationToCompanies(db: Database.Database): void {
         // Every company has an owner. A legacy row with no tenant falls back to its party's
         // tenant and then to the guardian address, which is the tenant id by construction.
         tenant_id: c.owner_tenant_id ?? c.party_tenant ?? c.guardian,
+        // The COMPANY-level twin of the legacy step's verdict (§4.6: `abandoned` has three
+        // writers and all three move the step and the company together). A synthesized `ready`
+        // over an abandoned create said the filing was still open, which put the company back in
+        // `listUnopened`'s reach — an abandoned formation re-opened by the first sweep after the
+        // upgrade — and made it attachable and quota-chargeable again.
+        status: c.create_state === "abandoned" ? "abandoned" : "ready",
         provider: c.provider ?? "doola",
-        // An entity with a bound party but no pin could never be filed anyway; pinning its
-        // synthesized company to `sandbox` makes the environment check REFUSE rather than route
-        // it somewhere, which is the safe direction.
-        environment: c.environment ?? "sandbox",
+        // Straight from the entity's own pin. Step 1b has already refused every row that has
+        // none, because there is no honest value to invent for a column that routes a filing.
+        environment: c.environment,
         synthetic: c.party_synthetic ?? 0,
         name_options: JSON.stringify(companyNameOptions(c.name)),
         business_purpose: purposeOf(c.spec_json),
@@ -1022,6 +1073,8 @@ interface SynthesisCandidate {
   updated_at: string;
   party_tenant: string | null;
   party_synthetic: number | null;
+  /** The legacy `create_provider` state, which the synthesized company's status mirrors. */
+  create_state: string | null;
 }
 
 /** The business purpose a migrated company inherits: the description the entity was forwarding to

@@ -234,15 +234,57 @@ describe("the entity → company re-key", () => {
     expect(party?.company_id).toBe(companyOf(db, key)?.company_id);
   });
 
-  test("an entity with a bound party but NO pin still gets a company (the PII must stay attached)", () => {
+  test("an entity with a bound party but NO pin REFUSES the migration, naming the entity", () => {
     const db = openLegacyDb();
     const key = legacyEntity(db, { provider: null, environment: null });
     legacyParty(db, { partyId: "p1", entityKey: key });
+    // `companies.environment` routes a filing. There is no honest value to invent for a row that
+    // never carried one — `'sandbox'` refuses nothing on a sandbox box, and it silently decides
+    // where a real person's identity is sent.
+    expect(() => migrate(db)).toThrow(/carry NO formation pin/);
+    expect(() => migrate(db)).toThrow(new RegExp(key));
+    // Nothing was written: the refusal is BEFORE the transaction.
+    expect((db.prepare("SELECT COUNT(*) AS n FROM companies").get() as { n: number }).n).toBe(0);
+  });
+
+  test("an entity with a formation row but NO pin refuses too — the same missing value", () => {
+    const db = openLegacyDb();
+    const key = legacyEntity(db, { provider: null, environment: null });
+    legacyStep(db, {
+      entityKey: key,
+      step: "create_provider",
+      state: "confirmed",
+      providerRef: "cmp-1",
+    });
+    expect(() => migrate(db)).toThrow(/carry NO formation pin/);
+  });
+
+  test("a synthesized company inherits the legacy create_provider verdict: abandoned stays abandoned", () => {
+    const db = openLegacyDb();
+    const done = legacyEntity(db, { key: "tenant-a:done" });
+    legacyParty(db, { partyId: "p-done", entityKey: done });
+    legacyStep(db, {
+      entityKey: done,
+      step: "create_provider",
+      state: "abandoned",
+      providerRef: "cmp-abandoned",
+    });
+    const live = legacyEntity(db, { key: "tenant-a:live" });
+    legacyParty(db, { partyId: "p-live", entityKey: live });
+    legacyStep(db, {
+      entityKey: live,
+      step: "create_provider",
+      state: "confirmed",
+      providerRef: "cmp-live",
+    });
+
     migrate(db);
-    const company = companyOf(db, key);
-    expect(company).toBeDefined();
-    // Pinned to sandbox so the environment check REFUSES rather than routing it somewhere.
-    expect(company?.environment).toBe("sandbox");
+
+    // `ready` over an abandoned create would have said the filing was still open: the company
+    // would be attachable, quota-chargeable, and back inside `listUnopened`'s reach — an
+    // abandoned formation re-opened by the first sweep after the upgrade.
+    expect(companyOf(db, done)?.status).toBe("abandoned");
+    expect(companyOf(db, live)?.status).toBe("ready");
   });
 
   test("an UNBOUND party keeps company_id NULL — it is still `never used`", () => {
