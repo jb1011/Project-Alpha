@@ -838,6 +838,20 @@ function migrateFormationToCompanies(db: Database.Database): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_entities_company ON entities(company_id) WHERE company_id IS NOT NULL",
   );
+  // WRITE-ONCE, made STRUCTURAL. The rule was three comments and one careful CAS in
+  // `attachCompany`; a trigger is the only version of it that a future `upsert`, a migration or
+  // an operator at a sqlite3 prompt cannot get wrong. An anchored manifest publishes
+  // `legal.providerCompanyId` on a public chain, so moving an entity to a different company
+  // makes a permanent on-chain claim false — there is no repair for that, only prevention.
+  // `IS NOT` is SQLite's null-safe inequality, so clearing the column is refused too.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_entities_company_write_once
+    BEFORE UPDATE OF company_id ON entities
+    FOR EACH ROW WHEN OLD.company_id IS NOT NULL AND NEW.company_id IS NOT OLD.company_id
+    BEGIN
+      SELECT RAISE(ABORT, 'entities.company_id is WRITE-ONCE: this entity is already attached to a company, and its anchored manifest publishes that company id on chain');
+    END;
+  `);
 
   const documentCols = (db.prepare("PRAGMA table_info(documents)").all() as { name: string }[]).map(
     (c) => c.name,

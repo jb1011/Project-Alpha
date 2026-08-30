@@ -407,3 +407,42 @@ test("the retired indexes are gone — including from a database that already ha
   expect(names()).not.toContain("idx_formation_facts");
   expect(names()).not.toContain("idx_companies_tenant");
 });
+
+test("entities.company_id is WRITE-ONCE at the SCHEMA level, not by convention", () => {
+  // An anchored manifest publishes `legal.providerCompanyId` on a public chain, so re-attaching
+  // an entity makes a permanent on-chain claim false — there is no repair, only prevention. The
+  // rule used to be three comments and one careful CAS in `attachCompany`; a trigger is the
+  // version a future `upsert`, a migration or an operator at a sqlite3 prompt cannot get wrong.
+  for (const id of ["c-1", "c-2"])
+    db.prepare(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
+                              name_options, business_purpose, industry_label)
+       VALUES (?, 't', 'ready', 'doola', 'sandbox', '[]', 'p', 'i')`,
+    ).run(id);
+  db.prepare(
+    `INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay,
+                           ein, formation_date)
+     VALUES ('e-1', 'e-1', 'bound', '0x1', '0x2', '86400', 'STUB', 0)`,
+  ).run();
+
+  // The FIRST attach is allowed: NULL -> a company is what the CAS does.
+  db.prepare("UPDATE entities SET company_id = 'c-1' WHERE idempotency_key = 'e-1'").run();
+  expect(
+    (
+      db.prepare("SELECT company_id AS c FROM entities WHERE idempotency_key = 'e-1'").get() as {
+        c: string;
+      }
+    ).c,
+  ).toBe("c-1");
+
+  // Re-attaching is refused by the DATABASE, whatever the statement looks like.
+  expect(() =>
+    db.prepare("UPDATE entities SET company_id = 'c-2' WHERE idempotency_key = 'e-1'").run(),
+  ).toThrow(/WRITE-ONCE/);
+  // …and so is clearing it: `IS NOT` is null-safe, so NULL is a different value, not an escape.
+  expect(() =>
+    db.prepare("UPDATE entities SET company_id = NULL WHERE idempotency_key = 'e-1'").run(),
+  ).toThrow(/WRITE-ONCE/);
+  // A no-op write of the SAME id is not a re-attach and stays allowed.
+  db.prepare("UPDATE entities SET company_id = 'c-1' WHERE idempotency_key = 'e-1'").run();
+});
