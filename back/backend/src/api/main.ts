@@ -77,6 +77,7 @@ import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
 import { ApiError } from "./errors";
+import { buildWorldIdDeps } from "./routes/worldId";
 import { buildX402DemoDeps } from "./routes/x402Demo";
 import { installShutdownHandlers, shouldInstallSignalHandlers } from "./shutdown";
 
@@ -499,22 +500,10 @@ async function main() {
   if (ens) console.warn(`⚠ ENS gateway ENABLED at /ensgateway (parent ${ens.parentName})`);
 
   const worldStore = new SqliteWorldStore(db);
-  const worldId = cfg.world
-    ? {
-        cfg: {
-          appId: cfg.world.appId,
-          rpId: cfg.world.rpId,
-          rpSigningKey: cfg.world.rpSigningKey,
-          action: cfg.world.action,
-          environment: cfg.world.environment,
-          attestAction: cfg.world.attestAction,
-        },
-        store: worldStore,
-        maxEntitiesPerHuman: cfg.world.maxEntitiesPerHuman,
-        attestMinAge: cfg.world.attestMinAge,
-        requireGuardian: cfg.world.requireGuardian,
-      }
-    : undefined;
+  // ONE builder (§6.7). Spelled out inline here, this object silently dropped
+  // `maxCompaniesPerHuman` — so the company ceiling the boot invariant demands for production
+  // formation had no production caller at all.
+  const worldId = cfg.world ? buildWorldIdDeps(cfg.world, worldStore) : undefined;
   if (worldId)
     console.warn(
       `⚠ World ID guardian gate ENABLED (action ${worldId.cfg.action}, env ${worldId.cfg.environment}, enforce=${worldId.requireGuardian})`,

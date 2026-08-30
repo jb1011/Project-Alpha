@@ -32,6 +32,51 @@ export interface WorldIdDeps {
   requireGuardian: boolean;
 }
 
+/**
+ * The composition seam, as ONE function (2026-08-26 §6.7).
+ *
+ * `api/main.ts` used to spell this object out inline, and it silently dropped
+ * `maxCompaniesPerHuman`: the config parsed `WORLD_MAX_COMPANIES_PER_HUMAN`, the boot invariant
+ * REQUIRED it for production formation, `assertGuardianAllowed`'s company scope read it — and
+ * nothing ever put it in the object, so the company ceiling had zero production callers and every
+ * verified human could buy unlimited Wyoming LLCs on a box that believed it was bounded.
+ *
+ * A hand-written literal is exactly how that happens. This is the only builder, and it is
+ * testable without booting a server.
+ */
+export function buildWorldIdDeps(
+  world: {
+    appId: string;
+    rpId: string;
+    rpSigningKey: string;
+    action: string;
+    environment: WorldIdConfig["environment"];
+    attestAction?: string;
+    attestMinAge: number;
+    maxEntitiesPerHuman?: number;
+    maxCompaniesPerHuman?: number;
+    requireGuardian: boolean;
+  },
+  store: WorldStore,
+): WorldIdDeps {
+  return {
+    cfg: {
+      appId: world.appId,
+      rpId: world.rpId,
+      rpSigningKey: world.rpSigningKey,
+      action: world.action,
+      environment: world.environment,
+      attestAction: world.attestAction,
+    },
+    store,
+    maxEntitiesPerHuman: world.maxEntitiesPerHuman,
+    // The FILING ceiling (§6.7). Its own bound, and the one the money hangs off.
+    maxCompaniesPerHuman: world.maxCompaniesPerHuman,
+    attestMinAge: world.attestMinAge,
+    requireGuardian: world.requireGuardian,
+  };
+}
+
 const REQUEST_TTL_MS = 10 * 60_000;
 
 /** Why a World verification was refused. The backend logs nothing per-request, so when a scan

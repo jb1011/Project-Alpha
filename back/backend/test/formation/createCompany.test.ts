@@ -12,7 +12,8 @@
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { ApiError } from "../../src/api/errors";
-import type { WorldIdDeps } from "../../src/api/routes/worldId";
+import { type WorldIdDeps, buildWorldIdDeps } from "../../src/api/routes/worldId";
+import { loadConfig } from "../../src/config/env";
 import {
   formationCeilingReachedMessage,
   formationPartyUnavailableMessage,
@@ -294,6 +295,49 @@ test("the per-human ceiling counts COMPANIES, not agents — filings are the thi
   expect(() => createCompany(deps({ world }), TENANT, intake(newParty()))).toThrow(
     /already controls 1 companies/,
   );
+});
+
+test("the COMPOSITION SEAM wires the company ceiling: config → deps → the door actually counts", () => {
+  // The regression this exists for: `WORLD_MAX_COMPANIES_PER_HUMAN` parsed, the boot invariant
+  // demanded it for production formation, `assertGuardianAllowed`'s company scope read it — and
+  // `api/main.ts` built its `WorldIdDeps` literal WITHOUT it. Zero production callers, so a box
+  // that believed it was bounded let one verified human buy unlimited Wyoming LLCs. Asserted
+  // from `loadConfig` through the real builder, because a hand-written deps object in a test
+  // proves only that the test wired it.
+  const cfg = loadConfig({
+    ARC_TESTNET_RPC_URL: "https://rpc.example",
+    PLATFORM_PRIVATE_KEY: `0x${"a".repeat(64)}`,
+    WORLD_APP_ID: "app_staging_1",
+    WORLD_RP_ID: "app.example",
+    WORLD_RP_SIGNING_KEY: "0xsigning",
+    WORLD_REQUIRE_GUARDIAN: "true",
+    WORLD_MAX_COMPANIES_PER_HUMAN: "2",
+  });
+  expect(cfg.world?.maxCompaniesPerHuman).toBe(2);
+
+  const store = new SqliteWorldStore(db);
+  store.recordVerification({
+    nullifier: "null-seam",
+    action: cfg.world!.action,
+    tenantId: TENANT,
+    credential: "orb",
+    verifiedAt: NOW,
+    issuerSchemaId: null,
+    environment: "staging",
+    expiresAtMin: null,
+  });
+  let counted = 0;
+  const spy: SqliteWorldStore = Object.create(store);
+  spy.countCompaniesForNullifier = (n: string, a: string) => {
+    counted++;
+    return store.countCompaniesForNullifier(n, a);
+  };
+
+  const world = buildWorldIdDeps(cfg.world!, spy);
+  expect(world.maxCompaniesPerHuman).toBe(2);
+  expect("companyId" in createCompany(deps({ world }), TENANT, intake(newParty()))).toBe(true);
+  // The ceiling was READ. Without it the company scope returns early and this stays 0.
+  expect(counted).toBe(1);
 });
 
 test("an UNWIRED World block gates nothing — which is why production formation boot-fails", () => {
