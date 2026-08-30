@@ -360,3 +360,50 @@ test("oa_anchors carries the two backoff scalars, and a PR-1-shaped table gains 
   expect(v1.next_retry_at).toBeNull();
   old.close();
 });
+
+// ── 2026-08-26 §3: the indexes the new queries actually read ───────────────────────────────
+
+/** SQLite's own verdict, so "this index serves that query" is measured rather than asserted. */
+const planOf = (sql: string, ...params: unknown[]) =>
+  (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[])
+    .map((r) => r.detail)
+    .join(" | ");
+
+test("the DAILY CEILING count is an index seek, not a scan of every formation ever opened", () => {
+  // `createRequestsSince` runs on the money path — every company creation asks it.
+  const plan = planOf(
+    "SELECT COUNT(*) AS n FROM formation_requests WHERE step = 'create_provider' AND created_at > ?",
+    "2026-01-01 00:00:00",
+  );
+  expect(plan).toContain("idx_formation_created");
+  expect(plan).not.toContain("SCAN formation_requests");
+});
+
+test("listByTenant's ordering contract is served by the index, not by a sort of the whole page", () => {
+  const plan = planOf(
+    "SELECT * FROM companies WHERE tenant_id = ? ORDER BY created_at DESC, company_id",
+    "0xabc",
+  );
+  expect(plan).toContain("idx_companies_tenant_created");
+  expect(plan).not.toContain("SCAN companies");
+});
+
+test("the retired indexes are gone — including from a database that already had them", () => {
+  const names = () =>
+    (
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]
+    ).map((i) => i.name);
+  // `idx_formation_facts` served the anchor UNION arm's per-row comparison. Since that arm became
+  // a per-COMPANY aggregate, no query has a predicate or an ordering on the column alone — the
+  // index is pure write amplification on the formation loop's hottest write path.
+  expect(names()).not.toContain("idx_formation_facts");
+  expect(names()).not.toContain("idx_companies_tenant");
+
+  // The upgrade path: a box that already carries them must actually lose them, which
+  // `CREATE INDEX IF NOT EXISTS` alone can never do.
+  db.exec("CREATE INDEX idx_formation_facts ON formation_requests(facts_updated_at)");
+  db.exec("CREATE INDEX idx_companies_tenant ON companies(tenant_id, status)");
+  migrate(db);
+  expect(names()).not.toContain("idx_formation_facts");
+  expect(names()).not.toContain("idx_companies_tenant");
+});

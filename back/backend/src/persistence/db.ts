@@ -152,7 +152,14 @@ const COMPANIES_DDL = `
       created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-    CREATE INDEX IF NOT EXISTS idx_companies_tenant ON companies(tenant_id, status);
+    -- (tenant_id, created_at DESC) because listByTenant -- the reuse picker's ordering contract,
+    -- shared by GET /companies and MCP list_companies -- reads exactly that, and the old
+    -- (tenant_id, status) left it sorting every page in memory. countChargeableByTenant still
+    -- narrows on the leading column. RENAMED rather than redefined, because
+    -- CREATE INDEX IF NOT EXISTS will not redefine an index that already exists under the same
+    -- name; the old name is dropped by dropRetiredIndexes below.
+    CREATE INDEX IF NOT EXISTS idx_companies_tenant_created
+      ON companies(tenant_id, created_at DESC);
 `;
 
 /**
@@ -520,6 +527,9 @@ export function migrate(db: Database.Database): void {
     ${FORMATION_REQUESTS_DDL}
     CREATE INDEX IF NOT EXISTS idx_formation_state ON formation_requests(state, step);
     CREATE INDEX IF NOT EXISTS idx_formation_provider ON formation_requests(provider_ref);
+    -- createRequestsSince -- the platform DAILY CEILING, asked on every company creation, i.e. on
+    -- the money path. Without it the count is a full scan of every formation ever opened.
+    CREATE INDEX IF NOT EXISTS idx_formation_created ON formation_requests(step, created_at);
 
     ${COMPANIES_DDL}
     ${FORMATION_PAYMENTS_DDL}
@@ -852,9 +862,7 @@ function migrateFormationToCompanies(db: Database.Database): void {
     db.exec(
       "CREATE INDEX IF NOT EXISTS idx_formation_poll_due ON formation_requests(next_poll_at, company_id)",
     );
-    db.exec(
-      "CREATE INDEX IF NOT EXISTS idx_formation_facts ON formation_requests(facts_updated_at)",
-    );
+    dropRetiredIndexes(db);
     if (!alreadyDone)
       db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run(
         COMPANY_REKEY_MARKER,
@@ -1035,7 +1043,7 @@ function migrateFormationToCompanies(db: Database.Database): void {
       "CREATE INDEX IF NOT EXISTS idx_formation_poll_due ON formation_requests(next_poll_at, company_id)",
     );
     db.exec(
-      "CREATE INDEX IF NOT EXISTS idx_formation_facts ON formation_requests(facts_updated_at)",
+      "CREATE INDEX IF NOT EXISTS idx_formation_created ON formation_requests(step, created_at)",
     );
 
     // ── Step 4: THE POST-MIGRATION ASSERTION, inside the transaction. A live party bound to an
@@ -1056,6 +1064,29 @@ function migrateFormationToCompanies(db: Database.Database): void {
 
     db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '1')").run(COMPANY_REKEY_MARKER);
   })();
+
+  dropRetiredIndexes(db);
+}
+
+/**
+ * Indexes this schema used to carry and no longer earns.
+ *
+ * `idx_formation_facts` was built for the anchor scheduler's UNION arm, which compared
+ * `facts_updated_at` per row. Since the arm became a per-COMPANY aggregate (2026-08-26 §3) NO
+ * query has a predicate or an ordering on that column alone — it is only ever read as `MAX(...)`
+ * inside a group — so the index is pure write amplification on the hottest write path in the
+ * formation loop.
+ *
+ * `idx_companies_tenant` was `(tenant_id, status)`; `listByTenant` orders by
+ * `created_at DESC`, and `idx_companies_tenant_created` is what actually serves it.
+ *
+ * Idempotent, and run on every boot: `CREATE INDEX IF NOT EXISTS` will not redefine an index that
+ * already exists under the same name, so dropping by name is the only way an upgraded box gets
+ * the new shape.
+ */
+function dropRetiredIndexes(db: Database.Database): void {
+  db.exec("DROP INDEX IF EXISTS idx_formation_facts");
+  db.exec("DROP INDEX IF EXISTS idx_companies_tenant");
 }
 
 interface SynthesisCandidate {
