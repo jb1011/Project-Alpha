@@ -592,6 +592,61 @@ test("ATTACH: a second agent joins an existing company, and the party is NOT reu
   expect(fx.requests.stepsOf(companyId)).toHaveLength(0);
 });
 
+test("ATTACH records what the agent JOINED — an agent attached after the filing has a history", () => {
+  // The sub-saga fans its events out over whichever agents are attached AT THE MOMENT a fact
+  // lands. An agent that joins afterwards — which is the entire point of N:1 — was attached to a
+  // real, filed Wyoming LLC and had a completely empty formation history, because every event
+  // describing that filing had already been written.
+  const fx = partyFixture();
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
+  });
+  const first = runner.start({
+    spec,
+    userKey: "hist-1",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    partyId: fx.partyId,
+  });
+  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
+  // The filing happens BEFORE the second agent exists.
+  fx.requests.claimAllSteps(companyId);
+  fx.requests.transition(companyId, "create_provider", "pending", "confirmed", {
+    providerRef: "cmp-live-1",
+  });
+  fx.requests.transition(companyId, "await_filing", "pending", "confirmed");
+  fx.companies.recordFilingFacts(companyId, { filedAt: 1_756_000_000, filingNumber: "WY-2026-1" });
+  fx.companies.recordEin(companyId, "88-1234567");
+
+  const second = runner.start({
+    spec,
+    userKey: "hist-2",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    companyId,
+  });
+
+  const events = repo.listEvents(second.id).filter((e) => e.step === "formationAttached");
+  expect(events).toHaveLength(1);
+  const detail = JSON.parse(events[0]!.detail!);
+  expect(detail).toMatchObject({
+    companyId,
+    provider: "doola",
+    environment: "sandbox",
+    status: "filed",
+    providerRef: "cmp-live-1",
+    filedAt: 1_756_000_000,
+    filingNumber: "WY-2026-1",
+    // PRESENCE only. An EIN is a tax identifier and the audit trail is the one place the
+    // processor deliberately keeps it out of.
+    ein: true,
+  });
+  expect(JSON.stringify(detail)).not.toContain("88-1234567");
+});
+
 test("ATTACH is bounded: FORMATION_MAX_AGENTS_PER_COMPANY refuses inside the claim", () => {
   const fx = partyFixture();
   const deps = formationDeps(fx, resolveFormationDeployment(doolaCfg()))!;

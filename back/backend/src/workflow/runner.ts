@@ -5,7 +5,7 @@ import {
   companyAgentCapMessage,
   companyUnavailableMessage,
 } from "../formation";
-import { deriveFormationStatus, hasLivePayment } from "../formation/status";
+import { deriveFormationStatus, formationSummary, hasLivePayment } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
@@ -146,13 +146,16 @@ export class OnboardingRunner {
       let company:
         | { provider: string; environment: EntityRecord["formationEnvironment"] }
         | undefined;
+      /** What the filing looked like AT THE MOMENT OF ATTACH — the joining agent's history. */
+      let attachedSummary: string | undefined;
       if (companyId && f) {
         const fresh = f.companies.findOwned(p.tenantId, companyId);
+        const steps = f.requests.stepsOf(companyId);
         if (
           !fresh ||
           !companyAcceptsAgents(
             fresh,
-            deriveFormationStatus(f.requests.stepsOf(companyId)),
+            deriveFormationStatus(steps),
             hasLivePayment(f.companies, companyId),
           )
         )
@@ -161,6 +164,14 @@ export class OnboardingRunner {
           throw new ApiError("limit_exceeded", 400, companyAgentCapMessage(f.maxAgentsPerCompany));
         // Pin fields FROM THE COMPANY ROW, never from config.
         company = { provider: fresh.provider, environment: fresh.environment };
+        attachedSummary = JSON.stringify({
+          companyId,
+          ...formationSummary(fresh, steps),
+          // PRESENCE only, never the number: an EIN is a tax identifier, and the audit trail is
+          // the one place the processor deliberately keeps it out of (`formationEin` does the
+          // same). "Has one" is the fact an owner reading the history needs.
+          ein: Boolean(fresh.ein),
+        });
       }
 
       if (
@@ -185,6 +196,15 @@ export class OnboardingRunner {
       // about the party behind it belongs in a log line. `shim` says whether this attach created
       // the company it is attaching to, which is what tells A3 when the shim can be removed.
       if (companyId) opsLog("company_attach", { companyId, entityKey: id, shim: !p.companyId });
+      // ONE event on the JOINING entity, carrying the filing as it stands right now (§3).
+      //
+      // The sub-saga's own events are fanned out at the moment each fact lands, over whichever
+      // agents are attached THEN. An agent that joins a company afterwards — the whole point of
+      // N:1 — was attached to a real, filed Wyoming LLC and had a completely empty formation
+      // history, because every event that describes that filing had already been written. This
+      // is the row that says what it joined.
+      if (companyId && attachedSummary)
+        this.deps.repo.recordEvent(id, "formationAttached", "pending", null, attachedSummary);
     };
     // Only formation takes the transaction: without a company or a party there is exactly one
     // write, and every pre-formation caller (including the tests that hand in a repo stub) keeps
