@@ -9,6 +9,7 @@ import {
   POLL_CAP_MS,
   RETRY_BASE_MS,
   RETRY_CAP_MS,
+  SSN_MAX_AGE_MS,
   SUBMITTED_STALL_SLACK_MS,
   type StepBackoff,
   UNBOUND_PARTY_MAX_AGE_MS,
@@ -37,7 +38,7 @@ import {
   processDoolaEvent,
 } from "./formationProcessor";
 import { runFormationCreateProvider } from "./formationProvider";
-import { abandonFormation, persistPollBackoff } from "./formationStep";
+import { abandonFormation, persistPollBackoff, recordCompanyEvent } from "./formationStep";
 
 /**
  * The formation sweeper (design §7 "Reconcile & sweeper") — the first recurring timer in the API
@@ -65,6 +66,8 @@ import { abandonFormation, persistPollBackoff } from "./formationStep";
  *       broadcast a crash orphaned, and execute what the timelock has released. This is the leg
  *       that makes anchoring GUARANTEED rather than merely fast: the webhook path opens a version
  *       within the second, but only a timer can be there when a 24h timelock elapses;
+ *   (f0) erase an SSN that is no longer needed or has waited out its 7-day clock (§4.6a) — a
+ *        SHORTER clock than (f), over a different fact, and it never manufactures `abandoned`;
  *   (f) erase PII whose filing provably never happened;
  *   (g) warn about formations that have been in flight far too long;
  *   (h) drop webhook rows past their retention window.
@@ -92,6 +95,7 @@ export {
   POLL_BASE_MS,
   POLL_CAP_MS,
   UNBOUND_PARTY_MAX_AGE_MS,
+  SSN_MAX_AGE_MS,
   FORMATION_STALE_MS,
   EVENT_RETENTION_MS,
   SUBMITTED_STALL_SLACK_MS,
@@ -215,6 +219,7 @@ export class FormationSweeper {
       await this.retryFailedSteps();
       await this.pollInFlight();
       await this.advanceAnchors();
+      this.eraseExpiredSsns();
       this.erasePii();
       if (amortised) {
         this.warnStale();
@@ -645,6 +650,81 @@ export class FormationSweeper {
     await Promise.allSettled(
       Array.from({ length: Math.min(ANCHOR_CONCURRENCY, queue.length) }, worker),
     );
+  }
+
+  // ── (f0) SSN retention — THE SHORT CLOCK (design 2026-08-26 §4.6a) ────────────────────────
+
+  /**
+   * Erase an SSN that is either no longer needed or has waited too long.
+   *
+   * TWO clauses, and they are deliberately not one:
+   *
+   *  - **terminal** — the company is `abandoned`, or `create_provider` is `confirmed`/
+   *    `abandoned`. The `confirmed` arm is an idempotent BACKSTOP, not a TTL: §4.4 already erased
+   *    in the transaction that persisted `provider_ref`, and this catches a row that somehow
+   *    missed it;
+   *  - **TTL** — the SSN is older than 7 days AND the filing was never in flight. Seven days is
+   *    a retention promise we make in the intake copy, and "never in flight" is what makes the
+   *    erasure safe: nothing is holding a body under an idempotency key, so nothing can be
+   *    wedged by the value disappearing (§4.5).
+   *
+   * **Nothing here manufactures `abandoned` from a clock.** A company with no `provider_ref` at
+   * day 7 raises `formation_stale` — an ops alert and a guardian-visible entity event — and
+   * KEEPS its intake. A NULL `provider_ref` is not proof no company exists at doola (the adopt
+   * path exists for exactly that case), and an erased party makes adoption unrecoverable. Only
+   * the max-attempt path and the operator CLI set `abandoned`.
+   *
+   * Party erasure (below) is UNCHANGED: it is a different clock over a different fact.
+   */
+  private eraseExpiredSsns(): void {
+    const now = this.now();
+    const day = new Date(now).toISOString().slice(0, 10);
+    for (const row of this.d.parties.listSsnRetention()) {
+      const ageMs = now - parseSqliteUtc(row.capturedAt);
+      const terminal =
+        row.companyStatus === "abandoned" ||
+        row.createState === "confirmed" ||
+        row.createState === "abandoned";
+      const expired = ageMs >= SSN_MAX_AGE_MS && !row.everSubmitted;
+
+      if (terminal || expired) {
+        if (this.d.parties.eraseSsn(row.companyId))
+          // The company, the reason, and nothing else — an erasure line that named the person
+          // would be the one place their data outlived the erasure.
+          opsLog("formation_ssn_erased", {
+            companyId: row.companyId,
+            reason: terminal ? "terminal" : "ttl",
+            environment: this.d.environment,
+          });
+        continue;
+      }
+
+      // Day 7 with a filing that DID reach doola and still has no company id back. The intake is
+      // kept — that is the whole point — and a human is told, once a day.
+      if (ageMs >= SSN_MAX_AGE_MS && !row.providerRef) {
+        const key = `ssn:${row.companyId}:${day}`;
+        if (this.warned.has(key)) continue;
+        this.warned.add(key);
+        opsLog("formation_stale", {
+          level: "error",
+          severity: "CRITICAL",
+          companyId: row.companyId,
+          reason: "ssn_ttl_no_provider_ref",
+          ageDays: Math.floor(ageMs / (24 * 60 * 60 * 1000)),
+          environment: this.d.environment,
+        });
+        // The guardian-visible half. There is no notification module yet (A1 deviation 8), and
+        // the entity event trail is the primitive that exists and that the UI already renders —
+        // so the required action is recorded where an owner will actually see it, fanned out
+        // over every agent attached to the company.
+        recordCompanyEvent(
+          this.d.repo,
+          row.companyId,
+          "formationStale",
+          "action required: this filing has been in flight for 7 days with no company id from the provider, and the responsible party's SSN is still held. Contact support before it is erased.",
+        );
+      }
+    }
   }
 
   // ── (f) PII erasure (design §3, audit H7) ─────────────────────────────────────────────────

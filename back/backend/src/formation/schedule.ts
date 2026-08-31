@@ -53,6 +53,17 @@ export const POLL_CAP_MS = 7 * 24 * 60 * 60 * 1000;
 /** An unbound formation party is a form somebody filled in and never used. */
 export const UNBOUND_PARTY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * THE SHORT CLOCK (2026-08-26 §4.6a): how long an SSN may be held when the filing never started.
+ *
+ * Deliberately its own constant even though it currently equals `UNBOUND_PARTY_MAX_AGE_MS`. They
+ * are two different promises about two different facts — "a form nobody used" and "a Social
+ * Security Number we are still holding" — and the intake copy quotes THIS one to the person who
+ * typed it. Collapsing them into one number is how a retention promise gets changed by accident
+ * while somebody edits an unrelated sweep.
+ */
+export const SSN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** How long a step may be in flight before an operator hears about it. */
 export const FORMATION_STALE_MS = 14 * 24 * 60 * 60 * 1000;
 
