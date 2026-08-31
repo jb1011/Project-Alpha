@@ -115,9 +115,27 @@ export function describeDoolaError(e: unknown): {
   requestId?: string;
 } {
   if (e instanceof DoolaApiError)
-    return { message: `${e.code}: ${e.message}`, code: e.code, requestId: e.requestId };
-  if (e instanceof DoolaTimeoutError) return { message: e.message, code: "E_TIMEOUT" };
-  return { message: (e as Error)?.message ?? String(e) };
+    return { message: redactPii(`${e.code}: ${e.message}`), code: e.code, requestId: e.requestId };
+  if (e instanceof DoolaTimeoutError) return { message: redactPii(e.message), code: "E_TIMEOUT" };
+  return { message: redactPii((e as Error)?.message ?? String(e)) };
+}
+
+/**
+ * Strip anything SSN-shaped out of an error message before it is logged or persisted (§4).
+ *
+ * The message here is a THIRD PARTY's text, and a validation error that quotes the offending
+ * field is an ordinary thing for an API to return — doola's error envelope carries a `fields`
+ * map, and our own `E_REQUEST_BODY_INVALID` handling has always passed the message straight into
+ * `formation_requests.error`, the entity event trail and the ops line. That is three places a
+ * responsible party's Social Security Number could come to rest because somebody else echoed it.
+ *
+ * So: any `XXX-XX-XXXX` or bare nine-digit run becomes `[redacted]`. It is a blunt rule and it
+ * will occasionally redact an EIN (also nine digits) out of an error message. That is an
+ * acceptable trade: an EIN we hold in a column of its own, and an operator who needs it can read
+ * it there, while an SSN that has reached a log line cannot be un-logged.
+ */
+export function redactPii(message: string): string {
+  return message.replace(/\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b/g, "[redacted]");
 }
 
 /**

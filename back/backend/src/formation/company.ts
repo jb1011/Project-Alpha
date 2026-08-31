@@ -206,6 +206,9 @@ export function createCompany(
   //    Number in a partner's DEVELOPMENT environment. The environment is the deployment's PIN,
   //    not caller input.
   const ssn = intake.ssn;
+  // Narrowed HERE and carried as a pair, so the mint below cannot reach an SSN without the key
+  // that seals it — a non-null assertion at the write would be the same claim, unchecked.
+  let sealed: { ssn: string; pii: PiiKeyring } | undefined;
   if (ssn !== undefined) {
     if (deps.sandboxSyntheticPii || deps.pin.environment !== "production")
       return { error: ssnRefusedHereMessage() };
@@ -213,6 +216,7 @@ export function createCompany(
     // Unreachable on a correctly-booted production box — `FORMATION_PII_KEY` is a boot invariant
     // (§4.2). It exists so that a misconfiguration is a REFUSAL rather than a plaintext write.
     if (!deps.pii) return { error: ssnUnavailableMessage() };
+    sealed = { ssn, pii: deps.pii };
   }
 
   // 7. Intake validation, in whichever of the two shapes this caller sent (§5).
@@ -253,10 +257,9 @@ export function createCompany(
       // did not exist a line ago. A failed write is a thrown sentinel for the same reason the
       // bind is: an accepted SSN that silently did not persist would leave the caller believing
       // the fast EIN route was in play and the filer sending a body without it.
-      if (ssn !== undefined) {
+      if (sealed) {
         const bind = { partyId: intake.partyId, companyId: id };
-        // biome-ignore lint/style/noNonNullAssertion: step 6 refuses an ssn with no keyring.
-        if (!deps.parties.storeSsn(intake.partyId, id, encryptSsn(deps.pii!, ssn, bind)))
+        if (!deps.parties.storeSsn(intake.partyId, id, encryptSsn(sealed.pii, sealed.ssn, bind)))
           throw new PartyBindLost();
       }
       return id;

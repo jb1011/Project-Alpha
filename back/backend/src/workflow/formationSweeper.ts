@@ -1,5 +1,6 @@
 import { DOOLA_DEFAULT_TIMEOUT_MS, describeDoolaError } from "../adapters/doola/doolaClient";
 import { sqliteUtcTimestamp } from "../formation";
+import type { PiiKeyring } from "../formation/pii";
 import {
   EVENT_RETENTION_MS,
   FORMATION_STALE_MS,
@@ -135,6 +136,9 @@ export interface FormationSweeperDeps extends FormationAdvanceDeps {
   events: DoolaEventRepository;
   parties: FormationPartyRepository;
   companies: CompanyRepository;
+  /** The SSN keyring (§4.2), handed on to the filing step so a resumed create can rebuild the
+   *  body it originally sent. Absent on every deployment that never collected one. */
+  pii?: PiiKeyring;
   /** `FORMATION_SWEEP_MS`. */
   intervalMs: number;
 }
@@ -451,6 +455,10 @@ export class FormationSweeper {
       parties: this.d.parties,
       doola: this.d.doola,
       environment: this.d.environment,
+      // Without it, a resumed create that originally carried an SSN would park rather than
+      // rebuild the body it sent (§4.5) — which is safe, but only correct on a box that really
+      // has no key.
+      pii: this.d.pii,
     });
   }
 

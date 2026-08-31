@@ -401,6 +401,9 @@ async function main() {
             parties: formationParties,
             companies,
             environment: cfg.doola!.environment,
+            // The SSN keyring (§4.2): the create forwards it ONCE and deletes it in the
+            // transaction that records the company id.
+            pii: formationCfg.pii,
           }
         : undefined,
     });
@@ -481,6 +484,9 @@ async function main() {
     doola: doolaApi,
     // The DEPLOYMENT's environment, which is what every entity's pin is compared against.
     environment: cfg.doola!.environment,
+    // The SSN keyring (§4.2). The sweeper hands it to the filing step, which needs it to rebuild
+    // a body it already sent, and to the TTL leg, which needs only to erase.
+    pii: formationCfg.pii,
     intervalMs: cfg.formation?.sweepMs ?? 60_000,
     // The anchor sub-saga (design §7). The SAME `anchors` repo the saga writes the v1 row with
     // and the SAME `arc` adapter the saga mints through — a second adapter would be a second

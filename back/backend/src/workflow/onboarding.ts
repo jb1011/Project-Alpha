@@ -130,6 +130,16 @@ export interface OnboardingDeps {
      * whose config has moved on still owes its in-flight rows a correctly-routed call.
      */
     environment: DoolaEnvironment;
+    /**
+     * The SSN keyring (2026-08-26 §4.2), so the create can forward the responsible party's SSN
+     * once and delete it in the transaction that records the company id.
+     *
+     * Absent on every deployment that never collected one. It is in the SAME block as the client
+     * and the repositories for the reason the block exists at all: a root that could hand the
+     * saga a filer without the key would produce a create that parks on every SSN-bearing
+     * company it touches.
+     */
+    pii?: import("../formation/pii").PiiKeyring;
   };
   /** Anchor-cycle history (design §3/§7). OPTIONAL so every existing caller — and every test —
    *  builds unchanged; absent simply records no history. Production passes the sqlite repo over
@@ -741,6 +751,7 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         parties: d.formation.parties,
         doola: d.formation.doola,
         environment: d.formation.environment,
+        pii: d.formation.pii,
       });
     } catch (e) {
       d.repo.recordEvent(
