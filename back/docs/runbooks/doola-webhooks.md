@@ -207,8 +207,11 @@ Every line is one JSON object on stdout → journald.
 | `formation_document_stored` | A legal PDF was fetched, hashed and indexed |
 | `formation_failed` | doola's fetched state says the formation failed |
 | `formation_abandoned` | **CRITICAL** — a step burned all 8 attempts |
-| `formation_stale` | A step has been in flight > 14 days (once per row per day) |
+| `formation_stale` | A step has been in flight > 14 days, OR (A2 §4.6a, `reason: ssn_ttl_no_provider_ref`, **CRITICAL**) an SSN has been held 7 days on a filing that reached doola and never got a company id back. Once per row per day. The A2 arm erases NOTHING and abandons nothing — a NULL `provider_ref` is not proof no company exists at doola |
 | `formation_party_erased` | PII destroyed for a filing that never happened |
+| `formation_ssn_erased` | The SSN was destroyed. `reason`: `provider_persisted` (the transaction that recorded the company id — the normal path), `terminal`, `ttl`, or `intake_reopened` (an edit-and-retry re-capture). Never carries the value or the person |
+| `formation_ssn_unreadable` | **CRITICAL** — a create body frozen WITH an SSN can no longer be rebuilt (the key is gone, or the row was erased out from under a live idempotency key). The filing is PARKED without burning the attempt: sending the body without the SSN is a different body under a live key, and re-keying would file a SECOND real Wyoming LLC. See `doola-deploy.md`, "If the key is LOST" |
+| `company_intake_updated` | An intake was re-opened after a rejected filing (§4.7) |
 | `formation_intake_unreadable` | **CRITICAL** — the company's stored `name_options` blob is empty or unreadable. The filing is PARKED and nothing was sent; it never files under an invented name. Fix the row, then let the sweeper retry |
 | `anchor_batch_full` | INFO. One anchor page hit `ANCHOR_BATCH`; the cursor carries the rest to the next tick. Reports `companies` (how much of the due set the page covered) and `entities` (what the tick actually drove). Full on EVERY tick ⇒ the deployment has outgrown `ANCHOR_BATCH` |
 
@@ -248,6 +251,18 @@ sqlite3 /var/lib/legalbody/legalbody.db \
 - Formation-party PII is erased automatically for filings that provably never happened (an
   abandoned `create_provider`, or an unbound handle older than 7 days) — see
   `formation_party_erased`.
+- **The SSN is a SHORTER clock over a different fact** (A2 §4.6a) and is erased separately, most
+  often within seconds: the transaction that records the doola company id destroys it. It is
+  stored AES-256-GCM encrypted, bound by its AAD to its `(party_id, company_id)` pair, and never
+  appears in a log line, an ops field, a `detail` blob or an error — a provider error that echoes
+  it back is redacted before it is stored. See `doola-deploy.md` for the key and its rotation.
+
+```bash
+# How many SSNs are we holding right now, and under which key?
+sqlite3 /var/lib/legalbody/legalbody.db \
+  "SELECT ssn_key_id, COUNT(*) FROM formation_parties
+    WHERE ssn_ciphertext IS NOT NULL GROUP BY ssn_key_id;"
+```
 
 ## Related
 
