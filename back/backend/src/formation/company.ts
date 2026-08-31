@@ -2,6 +2,7 @@ import { assertGuardianAllowed } from "../api/routes/worldId";
 import {
   businessPurposeRequiredMessage,
   businessPurposeTooLongMessage,
+  companyIntakeFrozenMessage,
   companyNameBlankMessage,
   companyNameCharsetMessage,
   companyNameDuplicateMessage,
@@ -9,6 +10,7 @@ import {
   companyNameRestrictedMessage,
   companyNameTooLongMessage,
   companyNamesRequiredMessage,
+  companyUnavailableMessage,
   formationCeilingReachedMessage,
   formationPartyUnavailableMessage,
   formationQuotaExhaustedMessage,
@@ -284,6 +286,91 @@ export function createCompany(
   // different things on two doors that spend the same money.
   warnIfNearLimit("formation_quota_warning", used + 1, deps.maxPerTenant, {
     tenantId: truncateTenant(tenantId),
+  });
+  return { companyId };
+}
+
+/**
+ * EDIT-AND-RETRY (design 2026-08-26 §4.7) — re-open a frozen intake, with a fresh SSN capture.
+ *
+ * The rule is one sentence: intake is FROZEN once the first create has been sent, and re-openable
+ * only in the case where the provider REJECTED it. That is not a UX preference, it is the
+ * idempotency contract: a `rejected` create is the one failure that releases doola's key (and the
+ * only one that burns our attempt — C1), so it is the only one after which a NEW body may be sent
+ * at all. Everything else parks with the SAME key, and a changed body under a live key is a 409.
+ *
+ * The predicate itself lives in `companies.updateIntake`'s WHERE clause, NOT here: three surfaces
+ * can reach a company, and a route-level check is a check one more door can forget. This function
+ * owns what a repository cannot — ownership, validation, and the SSN re-capture — and reads the
+ * repository's answer for the freeze.
+ *
+ * The whole thing is ONE transaction: a re-opened intake with the old SSN still attached, or a
+ * new SSN attached to un-rewritten names, are both worse than either half failing.
+ */
+export function updateCompanyIntake(
+  deps: CreateCompanyDeps,
+  tenantId: string,
+  companyId: string,
+  intake: Omit<CompanyIntakeInput, "partyId" | "synthesizedName">,
+): { companyId: string } | { error: string } {
+  // Ownership first, and the same not-an-oracle rule the rest of the door follows: an unknown id
+  // and somebody else's id get one answer.
+  const company = deps.companies.findOwned(tenantId, companyId);
+  if (!company) return { error: companyUnavailableMessage() };
+
+  const party = deps.parties.findByCompanyId(companyId);
+  if (!party) return { error: formationPartyUnavailableMessage() };
+
+  // The SSN gate, IDENTICAL to the create's — the same three refusals in the same order, because
+  // this door captures an SSN under exactly the same terms.
+  const ssn = intake.ssn;
+  let sealed: { ssn: string; pii: PiiKeyring } | undefined;
+  if (ssn !== undefined) {
+    if (deps.sandboxSyntheticPii || company.environment !== "production")
+      return { error: ssnRefusedHereMessage() };
+    if (!isWellFormedSsn(ssn)) return { error: ssnFormatMessage() };
+    if (!deps.pii) return { error: ssnUnavailableMessage() };
+    sealed = { ssn, pii: deps.pii };
+  }
+
+  const validated = validateIntake(intake);
+  if ("error" in validated) return validated;
+  const built = validated.intake;
+  // A re-opened intake is typed by a human, so the synthesized path has no business here: it
+  // would silently discard the three candidates the caller just supplied.
+  if (built.synthesized) return { error: companyNamesRequiredMessage() };
+
+  let frozen = false;
+  deps.transaction(() => {
+    if (!deps.companies.updateIntake(companyId, built)) {
+      frozen = true;
+      return;
+    }
+    if (sealed) {
+      // Erase-then-store, in this order and in this transaction. The old SSN belonged to the body
+      // doola rejected; the new one belongs to the body we are about to send. `storeSsn` is
+      // write-once while a ciphertext exists, so the erase is what makes room for it — and it
+      // clears `ssn_deleted_at`, so the row never holds a live ciphertext under a deletion stamp.
+      if (deps.parties.eraseSsn(companyId))
+        opsLog("formation_ssn_erased", {
+          companyId,
+          reason: "intake_reopened",
+          environment: company.environment,
+        });
+      const bind = { partyId: party.partyId, companyId };
+      if (
+        !deps.parties.storeSsn(party.partyId, companyId, encryptSsn(sealed.pii, sealed.ssn, bind))
+      )
+        throw new PartyBindLost();
+    }
+  });
+  if (frozen) return { error: companyIntakeFrozenMessage() };
+
+  opsLog("company_intake_updated", {
+    companyId,
+    tenantId: truncateTenant(tenantId),
+    environment: company.environment,
+    ssnCaptured: ssn !== undefined,
   });
   return { companyId };
 }

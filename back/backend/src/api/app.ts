@@ -220,6 +220,11 @@ export function buildApiApp(deps: ApiDeps) {
   app.use("/onboard", requireAuth(deps.jwtSecret));
   app.use("/formation-party", requireAuth(deps.jwtSecret));
   app.use("/companies", requireAuth(deps.jwtSecret));
+  // The SUBPATH too, exactly as `/entities` has both: Hono's `use` on a bare path matches that
+  // path only, so `PATCH /companies/:companyId` (A2's edit-and-retry, which carries an SSN) would
+  // otherwise be UNAUTHENTICATED with no tenant to scope it by. A3's document routes move under
+  // here as well.
+  app.use("/companies/*", requireAuth(deps.jwtSecret));
   app.use("/entities", requireAuth(deps.jwtSecret));
   app.use("/entities/*", requireAuth(deps.jwtSecret));
   app.use("/jobs/*", requireAuth(deps.jwtSecret));

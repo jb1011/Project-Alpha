@@ -10,7 +10,7 @@ import {
   formationUnavailableMessage,
   truncateTenant,
 } from "../../formation";
-import { createCompany } from "../../formation/company";
+import { createCompany, updateCompanyIntake } from "../../formation/company";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
 import { AgentSpecSchema, FormationPartySchema } from "../../policy/agentSpec";
@@ -162,6 +162,57 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     // The companyId and nothing else. Echoing the intake back would put the SSN in a response
     // body, in any client that persists responses, and in any proxy log along the way.
     return c.json({ companyId: result.companyId }, 201);
+  });
+
+  /**
+   * EDIT-AND-RETRY (design §4.7) — re-open a frozen intake, with a fresh SSN capture.
+   *
+   * REST only, and for the same reason `POST /companies` is: this is the door that may carry an
+   * SSN, and an SSN never travels as an MCP tool argument. There is no MCP twin, deliberately.
+   *
+   * The freeze itself is a property of the ROW (`companies.updateIntake`'s WHERE clause), not of
+   * this handler: three surfaces can reach a company, and a route-level check is a check one more
+   * door can forget. This handler decides only what is a well-formed HTTP body.
+   */
+  app.patch("/companies/:companyId", async (c) => {
+    const tenantId = c.get("tenantId");
+    if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
+
+    let body: {
+      names?: unknown;
+      businessPurpose?: unknown;
+      industryLabel?: unknown;
+      ssn?: unknown;
+    };
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new ApiError("validation_error", 400, "invalid JSON body");
+    }
+    if (body.names !== undefined && !Array.isArray(body.names))
+      throw new ApiError("validation_error", 400, companyNamesRequiredMessage());
+    for (const [field, value] of [
+      ["businessPurpose", body.businessPurpose],
+      ["industryLabel", body.industryLabel],
+      ["ssn", body.ssn],
+    ] as const)
+      if (value !== undefined && typeof value !== "string")
+        throw new ApiError("validation_error", 400, `${field} must be a string`);
+
+    const result = updateCompanyIntake(
+      { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
+      tenantId,
+      c.req.param("companyId"),
+      {
+        names: body.names as string[] | undefined,
+        businessPurpose: body.businessPurpose as string | undefined,
+        industryLabel: body.industryLabel as string | undefined,
+        ssn: body.ssn as string | undefined,
+      },
+    );
+    if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+    // The id and nothing else — the same rule the create follows, for the same reason.
+    return c.json({ companyId: result.companyId });
   });
 
   /**

@@ -582,6 +582,53 @@ test("a SANDBOX deployment refuses an ssn outright, and nothing is minted", asyn
   expect(list.companies).toHaveLength(0);
 });
 
+test("PATCH /companies/:id re-opens a rejected intake, and REQUIRES a session", async () => {
+  // §4.7. The freeze itself is a property of the row (tested at the repository and the domain
+  // function); what this pins is that the ROUTE exists, is authenticated, and refuses a frozen
+  // company with the message a caller can act on.
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
+  ).json();
+
+  const patch = (body: unknown, auth = token) =>
+    app.request(`/companies/${companyId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", authorization: `Bearer ${auth}` },
+      body: JSON.stringify(body),
+    });
+
+  // ⚠ The subpath needs its OWN requireAuth: Hono's `use` on a bare "/companies" matches that
+  // path only, so without it this door — the one that carries an SSN — would be wide open.
+  const anon = await app.request(`/companies/${companyId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(COMPANY_INTAKE),
+  });
+  expect(anon.status).toBe(401);
+
+  // Nothing sent yet: the intake is editable.
+  const ok = await patch({ ...COMPANY_INTAKE, businessPurpose: "Corrected." });
+  expect(ok.status).toBe(200);
+  const list = await (
+    await app.request("/companies", { headers: { authorization: `Bearer ${token}` } })
+  ).json();
+  expect(list.companies[0].businessPurpose).toBe("Corrected.");
+
+  // …and once a create has gone out under the live key, it is not. (Same database handle as the
+  // app's — the repository is a thin statement holder, not a session.)
+  const steps = new SqliteFormationRepository(db);
+  steps.claimAllSteps(companyId);
+  steps.transition(companyId, "create_provider", "pending", "submitted", {
+    detail: JSON.stringify({ companySentAttempt: 0 }),
+  });
+  const frozen = await patch(COMPANY_INTAKE);
+  expect(frozen.status).toBe(400);
+  expect((await frozen.json()).error.message).toMatch(/can no longer be changed/);
+});
+
 test("a deployment that forms nothing answers 503 on POST and an empty list on GET", async () => {
   const app = makeApp(undefined);
   const token = await login(app);
