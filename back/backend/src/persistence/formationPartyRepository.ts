@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import type { EncryptedSsn } from "../formation/pii";
+import type { CompanyStatus } from "./companyRepository";
+import type { FormationState } from "./formationRepository";
 
 /**
  * The formation party — the natural person legally answerable for a filed entity (design §3/§5).
@@ -106,6 +109,44 @@ function toRecord(r: Row): FormationPartyRecord {
   };
 }
 
+/**
+ * One SSN-holding row, with everything the TTL sweeper needs to decide (design §4.6a).
+ *
+ * It is a JOIN rather than four reads because the decision is a conjunction over three tables,
+ * and it is answered in TypeScript rather than in SQL because the set is tiny by construction —
+ * only rows that still hold an SSN, which is the handful of companies between an intake and a
+ * `provider_ref`. A predicate this consequential is worth reading as prose.
+ */
+export interface SsnRetentionRow {
+  partyId: string;
+  companyId: string;
+  /**
+   * When the SSN was captured, as a SQLite UTC TEXT.
+   *
+   * The COMPANY's `created_at`, deliberately, and it is exact rather than an approximation: the
+   * SSN rides the same request that mints the company (§4.1), so the two happen in one
+   * transaction. The party's own `created_at` would be wrong — it predates the company by
+   * however long the caller took to fill in the second form — and a fifth `ssn_*` column would
+   * be a second source of truth for a fact the company row already states.
+   */
+  capturedAt: string;
+  companyStatus: CompanyStatus;
+  /** `create_provider`'s state, or null when the step was never opened at all. */
+  createState: FormationState | null;
+  providerRef: string | null;
+  /**
+   * Has this company's filing EVER been in flight at doola?
+   *
+   * Deliberately broader than "the row is currently `submitted`", because a row that was
+   * submitted and then failed is back at `failed` and its state no longer remembers. It is true
+   * for a live/terminal state, for a persisted `provider_ref`, and for a `detail` carrying a
+   * customer id or a `companySentAttempt` — any one of which means we have talked to doola about
+   * this company. The failure direction is deliberate: keeping an SSN a week too long is a
+   * retention miss, while erasing one mid-flight wedges a same-key retry (§4.4).
+   */
+  everSubmitted: boolean;
+}
+
 /** The narrow surface the doors and the saga use. Injectable so tests fake it honestly. */
 export interface FormationPartyRepository {
   create(input: NewFormationParty): string;
@@ -150,6 +191,42 @@ export interface FormationPartyRepository {
    * Returns false when the row was already erased (idempotent under a re-run of the sweep).
    */
   erase(partyId: string): boolean;
+
+  // ── THE SSN (design 2026-08-26 §4) ────────────────────────────────────────────────────────
+  //
+  // Three operations and one query, and every one of them is keyed by the COMPANY as well as the
+  // party. That is not redundancy: the AAD the ciphertext is sealed under is `party_id ||
+  // company_id`, so a read that did not know the company could not decrypt anyway, and a write
+  // that did not check it could seal a row under a binding nothing will ever satisfy.
+
+  /**
+   * Store an encrypted SSN against a bound party. Returns whether it was written.
+   *
+   * CAS on the (party, company) pair AND on there being no live ciphertext, so an SSN is
+   * WRITE-ONCE for as long as one exists. `ssn_deleted_at` is cleared, because the one path that
+   * writes over an erased row is the §4.7 edit-and-retry re-capture, and a row holding a live
+   * ciphertext under an "erased on" stamp would be a lie in the audit trail.
+   */
+  storeSsn(partyId: string, companyId: string, rec: EncryptedSsn): boolean;
+
+  /**
+   * The stored SSN for a company, with the party id the AAD needs. Undefined when there is none —
+   * which is the ordinary state of every company past its `provider_ref`.
+   */
+  findSsnByCompanyId(companyId: string): (EncryptedSsn & { partyId: string }) | undefined;
+
+  /**
+   * ERASE the SSN and stamp `ssn_deleted_at`, leaving the rest of the party intact.
+   *
+   * Its own operation, distinct from `erase`: the SSN dies at the moment the filing no longer
+   * needs it (§4.4 — the transaction that persists `provider_ref`), which is typically YEARS
+   * before the party row itself is erasable, if ever. Idempotent: false means there was nothing
+   * to erase, which is what every backstop pass sees.
+   */
+  eraseSsn(companyId: string): boolean;
+
+  /** Every party still holding an SSN, with what the TTL clock needs to judge it (§4.6a). */
+  listSsnRetention(): SsnRetentionRow[];
 }
 
 export class SqliteFormationPartyRepository implements FormationPartyRepository {
@@ -216,6 +293,47 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
                 deleted_at = CURRENT_TIMESTAMP
           WHERE party_id = ? AND deleted_at IS NULL`,
       ),
+      // ── the SSN (§4) ──────────────────────────────────────────────────────────────────────
+      // Keyed on the (party, company) PAIR, which is the pair the ciphertext's AAD is sealed
+      // under: a write against the wrong company would produce a row nothing can ever open.
+      storeSsn: db.prepare(
+        `UPDATE formation_parties
+            SET ssn_ciphertext = @ciphertext, ssn_iv = @iv, ssn_key_id = @key_id,
+                -- Cleared, not kept: the one path that writes over an erased row is the §4.7
+                -- re-capture, and a live ciphertext under an "erased on" stamp is a lie.
+                ssn_deleted_at = NULL
+          WHERE party_id = @party_id AND company_id = @company_id
+            AND deleted_at IS NULL
+            -- WRITE-ONCE while one exists. A second SSN for a live filing would change the body
+            -- under an idempotency key doola is already holding (§4.4/§4.5).
+            AND ssn_ciphertext IS NULL`,
+      ),
+      findSsn: db.prepare(
+        `SELECT party_id, ssn_ciphertext, ssn_iv, ssn_key_id FROM formation_parties
+          WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
+      ),
+      eraseSsn: db.prepare(
+        `UPDATE formation_parties
+            SET ssn_ciphertext = NULL, ssn_iv = NULL, ssn_key_id = NULL,
+                ssn_deleted_at = CURRENT_TIMESTAMP
+          WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
+      ),
+      // Only rows that still HOLD an SSN — a handful at any moment, being exactly the companies
+      // between an intake and a `provider_ref`.
+      ssnRetention: db.prepare(
+        `SELECT p.party_id      AS party_id,
+                p.company_id    AS company_id,
+                c.created_at    AS captured_at,
+                c.status        AS company_status,
+                f.state         AS create_state,
+                f.provider_ref  AS provider_ref,
+                f.detail        AS detail
+           FROM formation_parties p
+           JOIN companies c ON c.company_id = p.company_id
+           LEFT JOIN formation_requests f
+             ON f.company_id = p.company_id AND f.step = 'create_provider'
+          WHERE p.deleted_at IS NULL AND p.ssn_ciphertext IS NOT NULL`,
+      ),
     };
   }
 
@@ -271,5 +389,88 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
 
   erase(partyId: string): boolean {
     return this.stmts.erase.run(partyId).changes === 1;
+  }
+
+  storeSsn(partyId: string, companyId: string, rec: EncryptedSsn): boolean {
+    return (
+      this.stmts.storeSsn.run({
+        party_id: partyId,
+        company_id: companyId,
+        ciphertext: rec.ciphertext,
+        iv: rec.iv,
+        key_id: rec.keyId,
+      }).changes === 1
+    );
+  }
+
+  findSsnByCompanyId(companyId: string): (EncryptedSsn & { partyId: string }) | undefined {
+    const r = this.stmts.findSsn.get(companyId) as
+      | {
+          party_id: string;
+          ssn_ciphertext: Buffer;
+          ssn_iv: Buffer;
+          ssn_key_id: string;
+        }
+      | undefined;
+    return r
+      ? {
+          partyId: r.party_id,
+          ciphertext: r.ssn_ciphertext,
+          iv: r.ssn_iv,
+          keyId: r.ssn_key_id,
+        }
+      : undefined;
+  }
+
+  eraseSsn(companyId: string): boolean {
+    return this.stmts.eraseSsn.run(companyId).changes === 1;
+  }
+
+  listSsnRetention(): SsnRetentionRow[] {
+    const rows = this.stmts.ssnRetention.all() as {
+      party_id: string;
+      company_id: string;
+      captured_at: string;
+      company_status: CompanyStatus;
+      create_state: FormationState | null;
+      provider_ref: string | null;
+      detail: string | null;
+    }[];
+    return rows.map((r) => ({
+      partyId: r.party_id,
+      companyId: r.company_id,
+      capturedAt: r.captured_at,
+      companyStatus: r.company_status,
+      createState: r.create_state,
+      providerRef: r.provider_ref,
+      everSubmitted: everSubmitted(r.create_state, r.provider_ref, r.detail),
+    }));
+  }
+}
+
+/**
+ * "Has this company's filing ever been in flight at doola?" — read from three independent
+ * witnesses, ANY of which is enough (§4.6a).
+ *
+ * The state alone is not enough and that is the whole point: a row that was `submitted` and then
+ * failed is back at `failed`, and its state has forgotten. `provider_ref` and the two ids in
+ * `detail` remember. Erring toward "yes" keeps an SSN a week longer than the policy; erring
+ * toward "no" erases one out from under a live idempotency key, which is a wedge (§4.4).
+ */
+function everSubmitted(
+  state: FormationState | null,
+  providerRef: string | null,
+  detail: string | null,
+): boolean {
+  if (state === "submitted" || state === "confirmed") return true;
+  if (providerRef) return true;
+  if (!detail) return false;
+  try {
+    const d = JSON.parse(detail) as { customerId?: unknown; companySentAttempt?: unknown };
+    return d.customerId !== undefined || d.companySentAttempt !== undefined;
+  } catch {
+    // An unreadable blob is not evidence that nothing happened. The conservative answer is the
+    // one that KEEPS the data.
+    return true;
   }
 }
