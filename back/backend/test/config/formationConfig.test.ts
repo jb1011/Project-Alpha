@@ -39,8 +39,15 @@ const WORLD = {
   WORLD_MAX_COMPANIES_PER_HUMAN: "3",
 };
 
-/** A production doola environment, with the identity floor satisfied. */
-const DOOLA_PROD = { ...DOOLA, ...WORLD, DOOLA_ENVIRONMENT: "production" };
+/**
+ * THE PII FLOOR (2026-08-26 §4.2): production formation is the only deployment that collects an
+ * SSN, and it refuses to boot without a key to encrypt one with. Its own fixture, beside WORLD,
+ * for the same reason: the tests below prove both halves.
+ */
+const PII = { FORMATION_PII_KEY: Buffer.alloc(32, 7).toString("base64") };
+
+/** A production doola environment, with the identity and PII floors satisfied. */
+const DOOLA_PROD = { ...DOOLA, ...WORLD, ...PII, DOOLA_ENVIRONMENT: "production" };
 
 /** Arc mainnet's chain id is not published yet; any non-testnet id exercises the invariant. */
 const MAINNET_CHAIN_ID = "8004";
@@ -52,6 +59,7 @@ const MAINNET = {
   ARC_CHAIN_ID: MAINNET_CHAIN_ID,
   DOOLA_ENVIRONMENT: "production",
   ...WORLD,
+  ...PII,
 };
 
 // A production-NODE_ENV env that already satisfies the pre-existing prod invariants, so a throw
@@ -315,6 +323,97 @@ test("a synthetic sandbox identity can never file a REAL company", () => {
   expect(() =>
     loadConfig({ ...BASE, ...DOOLA_PROD, FORMATION_SANDBOX_SYNTHETIC_PII: "true" }),
   ).toThrow(/would file a REAL Wyoming LLC for a person who does not exist/);
+});
+
+// ── THE PII FLOOR (2026-08-26 §4.2) ─────────────────────────────────────────────────────────
+//
+// Production formation collects the responsible party's SSN on the same request that mints the
+// company. Without a key the door could only refuse every such create or store one in plaintext,
+// and both are worse than refusing to boot.
+
+test("PII floor: production formation boots with a key, and PARSES it into a keyring", () => {
+  const cfg = loadConfig({ ...BASE, ...DOOLA_PROD });
+  expect(cfg.formation?.pii?.current.id).toMatch(/^fpk1:[0-9a-f]{16}$/);
+  expect(cfg.formation?.pii?.previous).toBeUndefined();
+  // PARSED at boot, so a malformed key names its variable here rather than throwing at the first
+  // filing — which is the only moment the key is otherwise used.
+  expect(cfg.formation?.pii?.current.key).toHaveLength(32);
+});
+
+test("PII floor: production formation REFUSES with no FORMATION_PII_KEY", () => {
+  const env: Record<string, string | undefined> = { ...BASE, ...DOOLA_PROD };
+  env.FORMATION_PII_KEY = undefined;
+  expect(() => loadConfig(env)).toThrow(/requires FORMATION_PII_KEY/);
+});
+
+test("a malformed key fails at BOOT with the variable named, never at the first filing", () => {
+  for (const bad of ["", "   ", Buffer.alloc(31).toString("base64"), "nope"])
+    expect(() => loadConfig({ ...BASE, ...DOOLA_PROD, FORMATION_PII_KEY: bad }), bad).toThrow(
+      /FORMATION_PII_KEY/,
+    );
+  // Hex is accepted too — an operator reaching for `openssl rand` gets one of the two forms.
+  expect(() =>
+    loadConfig({ ...BASE, ...DOOLA_PROD, FORMATION_PII_KEY: Buffer.alloc(32, 3).toString("hex") }),
+  ).not.toThrow();
+});
+
+test("_PREVIOUS alone is refused, and so is a 'rotation' to the same key", () => {
+  // Both shapes are SILENT otherwise: the first leaves every row keyed to a key this box does not
+  // have, the second is a rotation somebody believes they have done.
+  expect(() =>
+    loadConfig({
+      ...BASE,
+      ...DOOLA,
+      FORMATION_PII_KEY_PREVIOUS: Buffer.alloc(32).toString("base64"),
+    }),
+  ).toThrow(/FORMATION_PII_KEY_PREVIOUS is set but FORMATION_PII_KEY is missing/);
+  expect(() =>
+    loadConfig({
+      ...BASE,
+      ...DOOLA_PROD,
+      FORMATION_PII_KEY_PREVIOUS: DOOLA_PROD.FORMATION_PII_KEY,
+    }),
+  ).toThrow(/are the SAME key — that is not a rotation/);
+  // A real rotation boots, with two distinct ids.
+  const rotated = loadConfig({
+    ...BASE,
+    ...DOOLA_PROD,
+    FORMATION_PII_KEY_PREVIOUS: Buffer.alloc(32, 9).toString("base64"),
+  });
+  expect(rotated.formation?.pii?.previous?.id).not.toBe(rotated.formation?.pii?.current.id);
+});
+
+test("a SANDBOX deployment must not carry a PII key — it has nothing to encrypt", () => {
+  // §4.1: the door refuses the SSN field outright on a sandbox box. A key there is at best dead
+  // weight and at worst a production key pasted into a sandbox `.env`.
+  expect(() =>
+    loadConfig({ ...BASE, ...DOOLA, FORMATION_PII_KEY: Buffer.alloc(32, 5).toString("base64") }),
+  ).toThrow(/FORMATION_PII_KEY is set with DOOLA_ENVIRONMENT=sandbox/);
+  // …and a box with NO doola block at all is unaffected: it forms nothing either way.
+  expect(() =>
+    loadConfig({ ...BASE, FORMATION_PII_KEY: Buffer.alloc(32, 5).toString("base64") }),
+  ).not.toThrow();
+});
+
+test("the PII key NEVER survives redact() — a Buffer stringifies to its bytes", () => {
+  // The boot log prints the config. `JSON.stringify(Buffer)` is `{"type":"Buffer","data":[...]}`,
+  // so an un-redacted keyring puts the key material in journald verbatim.
+  const key = Buffer.alloc(32, 0x2a);
+  const cfg = loadConfig({
+    ...BASE,
+    ...DOOLA_PROD,
+    FORMATION_PII_KEY: key.toString("base64"),
+    FORMATION_PII_KEY_PREVIOUS: Buffer.alloc(32, 0x2b).toString("base64"),
+  });
+  const printed = JSON.stringify(redact(cfg));
+  expect(printed).not.toContain(key.toString("base64"));
+  expect(printed).not.toContain(key.toString("hex"));
+  // The byte-array spelling, which is what an un-redacted Buffer actually prints as.
+  expect(printed).not.toContain('"type":"Buffer"');
+  expect(printed).not.toContain(JSON.stringify([...key]).slice(1, -1));
+  // The IDS survive: two of them is how an operator sees a rotation actually in progress.
+  expect(printed).toContain(cfg.formation!.pii!.current.id);
+  expect(printed).toContain(cfg.formation!.pii!.previous!.id);
 });
 
 test("FORMATION_MAX_AGENTS_PER_COMPANY defaults to 10 and is overridable", () => {

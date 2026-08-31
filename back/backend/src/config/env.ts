@@ -2,6 +2,7 @@ import { getAddress, isAddress, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 import type { DoolaEnvironment } from "../adapters/doola/types";
+import { parsePiiKey } from "../formation/pii";
 import { usdToUnits } from "../policy/units";
 import type { Address, Hex } from "../types";
 
@@ -237,6 +238,17 @@ const EnvSchema = z.object({
   /** Tri-state, same shape as FORMATION_REQUIRED: unset = TRUE in sandbox. Real names/addresses
    *  are then neither collected nor sent to doola's development environment (§3 PII). */
   FORMATION_SANDBOX_SYNTHETIC_PII: z.string().optional(),
+  /**
+   * AES-256 key for the responsible party's SSN (2026-08-26 §4.2). 32 bytes, base64 or hex.
+   *
+   * REQUIRED when `DOOLA_ENVIRONMENT=production` — that is the only deployment that collects one.
+   * Generate with `openssl rand -base64 32`. See `docs/runbooks/doola-deploy.md` for rotation and
+   * for what is lost if the key is lost.
+   */
+  FORMATION_PII_KEY: z.string().optional(),
+  /** The PREVIOUS key, during a rotation window only. Rows name the key they were written with,
+   *  so this one is SELECTED for the rows that need it, never trial-decrypted. */
+  FORMATION_PII_KEY_PREVIOUS: z.string().optional(),
 });
 
 /** doola API hosts per environment. `DOOLA_BASE_URL` overrides both (staging/mock/replay). */
@@ -405,6 +417,15 @@ export interface Config {
     maxAgentsPerCompany: number;
     /** Sandbox files with a labeled synthetic identity instead of a real natural person. */
     sandboxSyntheticPii: boolean;
+    /**
+     * The SSN encryption keyring (§4.2), absent when no key is configured.
+     *
+     * It lives here, beside the policy knobs, because the design says so in as many words: "keys
+     * land in `config/env.ts` (so does `FORMATION_PII_KEY`)". It is the PARSED keyring rather
+     * than the raw strings, so a malformed key is a boot failure with the variable named instead
+     * of a throw at the first filing — and so nothing downstream ever holds the env string.
+     */
+    pii?: import("../formation/pii").PiiKeyring;
   };
 }
 
@@ -604,6 +625,17 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         e.DOOLA_ENVIRONMENT === "sandbox",
         "FORMATION_SANDBOX_SYNTHETIC_PII",
       ),
+      // PARSED here (§4.2), so a malformed key names its variable at boot rather than throwing
+      // at the first filing. `_PREVIOUS` alone is refused below: it would be a rotation with
+      // nothing to rotate to.
+      pii: e.FORMATION_PII_KEY
+        ? {
+            current: parsePiiKey(e.FORMATION_PII_KEY, "FORMATION_PII_KEY"),
+            previous: e.FORMATION_PII_KEY_PREVIOUS
+              ? parsePiiKey(e.FORMATION_PII_KEY_PREVIOUS, "FORMATION_PII_KEY_PREVIOUS")
+              : undefined,
+          }
+        : undefined,
     },
   };
 
@@ -675,8 +707,30 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       throw new Error(
         "Invalid config: DOOLA_ENVIRONMENT=production requires WORLD_MAX_COMPANIES_PER_HUMAN — an unbounded per-human filing count is how one verified human buys a hundred LLCs",
       );
+    // ── THE PII KEY (2026-08-26 §4.2) ────────────────────────────────────────────────────────
+    //
+    // Production formation is the ONLY deployment that collects an SSN, and it collects one on
+    // the same request that mints the company. Without a key there are exactly two things the
+    // door could do — refuse every create-company that carries an SSN, or store one in
+    // plaintext — and both are worse than refusing to boot.
+    if (!cfg.formation.pii)
+      throw new Error(
+        "Invalid config: DOOLA_ENVIRONMENT=production requires FORMATION_PII_KEY — production formation collects the responsible party's SSN and it is stored encrypted (generate one with: openssl rand -base64 32)",
+      );
   }
 
+  // A rotation with nothing to rotate FROM is a typo, and the shape it produces is silent: every
+  // row keyed to the missing current key would fail to decrypt at send time.
+  if (e.FORMATION_PII_KEY_PREVIOUS && !e.FORMATION_PII_KEY)
+    throw new Error(
+      "Invalid config: FORMATION_PII_KEY_PREVIOUS is set but FORMATION_PII_KEY is missing — the previous key exists only to READ rows written before a rotation, and there is nothing to rotate to",
+    );
+  // The same key in both slots is not a rotation; it is a rotation somebody believes they have
+  // done. Refused, because the belief is the dangerous part.
+  if (cfg.formation.pii?.previous && cfg.formation.pii.previous.id === cfg.formation.pii.current.id)
+    throw new Error(
+      "Invalid config: FORMATION_PII_KEY and FORMATION_PII_KEY_PREVIOUS are the SAME key — that is not a rotation. Set _PREVIOUS to the key being retired, or unset it",
+    );
   // Sandbox synthetic identities must never reach a production filing: the shortcut exists to
   // avoid sending real personal data to a playground, and using it the other way round would file
   // a real Wyoming LLC naming a person who does not exist (§7).
@@ -706,6 +760,18 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         "Invalid config: ARC_NETWORK=mainnet with DOOLA_ENVIRONMENT=sandbox — a mainnet deployment must not file DEMO-watermarked sandbox entities (set DOOLA_ENVIRONMENT=production)",
       );
   }
+
+  // A sandbox deployment never sees a real SSN (§4.1 — the door refuses the field outright), so a
+  // key here is at best dead weight and at worst a production key pasted into a sandbox box's
+  // `.env`. Refused with the reason, not warned about.
+  //
+  // AFTER the mainnet block, deliberately: a mainnet box pointed at doola sandbox is a much more
+  // fundamental misconfiguration than a stray key, and an operator must hear about THAT first —
+  // the same ordering rule the chain-id checks below follow.
+  if (cfg.formation.pii && cfg.doola && cfg.doola.environment !== "production")
+    throw new Error(
+      "Invalid config: FORMATION_PII_KEY is set with DOOLA_ENVIRONMENT=sandbox — a sandbox deployment refuses the SSN field outright and has nothing to encrypt (unset it, or set DOOLA_ENVIRONMENT=production if this box really files for real people)",
+    );
 
   // ARC_NETWORK vs ARC_CHAIN_ID (design §2). Two knobs describe ONE network, and nothing else
   // reconciles them: a box that says "mainnet" while still pointing at the testnet chain id would
@@ -845,6 +911,21 @@ export function redact(cfg: Config): Record<string, unknown> {
           webhookSecretPrevious: cfg.doola.webhookSecretPrevious ? "REDACTED" : undefined,
         }
       : undefined,
+    // The SSN key. The boot log prints the config, and a `Buffer` stringifies to its BYTES —
+    // `{"type":"Buffer","data":[...]}` — so an un-redacted keyring would put the key material in
+    // journald verbatim. The key IDS survive, and are the point: two ids is how an operator sees
+    // a rotation actually in progress.
+    formation: {
+      ...cfg.formation,
+      pii: cfg.formation?.pii
+        ? {
+            current: { id: cfg.formation.pii.current.id, key: "REDACTED" },
+            previous: cfg.formation.pii.previous
+              ? { id: cfg.formation.pii.previous.id, key: "REDACTED" }
+              : undefined,
+          }
+        : undefined,
+    },
     ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
     world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
     turnkey: cfg.turnkey
