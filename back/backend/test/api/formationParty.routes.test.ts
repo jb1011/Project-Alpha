@@ -17,7 +17,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { ApiError } from "../../src/api/errors";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
-import { createCompany } from "../../src/formation/company";
+import { createCompany, shimCompanyIntake } from "../../src/formation/company";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -68,6 +68,13 @@ const REAL_PARTY = {
   },
 };
 
+/** The PRODUCTION intake (A2 §5) — what `POST /companies` takes now that it is real. */
+const COMPANY_INTAKE = {
+  names: ["Acme Robotics LLC", "Acme Automata", "Acme Mechanicals"],
+  businessPurpose: "Operating autonomous software agents.",
+  industryLabel: "Software development",
+};
+
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 let parties: SqliteFormationPartyRepository;
@@ -109,10 +116,13 @@ function makeApp(
           requests,
           maxAgentsPerCompany: 10,
           createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
-            const result = createCompany({ ...companyDeps, transaction: (fn) => fn() }, tenantId, {
-              ...intake,
-              synthetic: formation.syntheticPii ? true : undefined,
-            });
+            const result = createCompany(
+              { ...companyDeps, transaction: (fn) => fn() },
+              tenantId,
+              // The SHARED mapping (A2), not a literal: four copies of "what the shim sends" is
+              // four chances for it to mean something different on one surface.
+              shimCompanyIntake(intake, formation.syntheticPii ?? false),
+            );
             if ("error" in result) throw new ApiError("validation_error", 400, result.error);
             return result.companyId;
           },
@@ -472,7 +482,7 @@ test("POST /companies mints a company through the ONE domain function, and lists
   const token = await login(app);
   const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
 
-  const res = await post(app, "/companies", token, { partyId, name: "Acme Robotics LLC" });
+  const res = await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE });
   expect(res.status).toBe(201);
   const { companyId } = await res.json();
   expect(companyId).toBeTruthy();
@@ -508,7 +518,14 @@ test("POST /companies mints a company through the ONE domain function, and lists
     formationStatus: "none",
     paying: false,
     agents: 0,
-    nameOptions: [{ name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 }],
+    // All THREE candidates, canonical, ending split off — the shape the filer sends verbatim.
+    nameOptions: [
+      { name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 },
+      { name: "Acme Automata", entityTypeEnding: "LLC", position: 2 },
+      { name: "Acme Mechanicals", entityTypeEnding: "LLC", position: 3 },
+    ],
+    businessPurpose: "Operating autonomous software agents.",
+    industryLabel: "Software development",
   });
   // NO PII on the list, ever — not the responsible party's name, not their email.
   const printed = JSON.stringify(list);
@@ -516,23 +533,59 @@ test("POST /companies mints a company through the ONE domain function, and lists
     expect(printed).not.toContain(forbidden);
 });
 
-test("POST /companies requires a partyId and a name, and needs a session", async () => {
+test("POST /companies requires a session and the FULL intake, naming what is missing", async () => {
   const app = makeApp({ required: true });
   const token = await login(app);
-  expect((await post(app, "/companies", token, { name: "Acme" })).status).toBe(400);
-  expect((await post(app, "/companies", token, { partyId: "p" })).status).toBe(400);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+
+  const message = async (body: Record<string, unknown>) => {
+    const res = await post(app, "/companies", token, body);
+    expect(res.status).toBe(400);
+    return (await res.json()).error.message as string;
+  };
+  expect(await message({ ...COMPANY_INTAKE })).toMatch(/partyId is required/);
+  // Each refusal names its own field — the whole point of A2's messages.
+  expect(await message({ partyId, ...COMPANY_INTAKE, names: undefined })).toMatch(/^names must be/);
+  expect(await message({ partyId, ...COMPANY_INTAKE, businessPurpose: undefined })).toMatch(
+    /^businessPurpose is required/,
+  );
+  expect(await message({ partyId, ...COMPANY_INTAKE, industryLabel: "Nope" })).toMatch(
+    /^industryLabel "Nope" is not one of/,
+  );
+  // A TYPE error is caught by the route; the CONTENT rules all live in `createCompany`.
+  expect(await message({ partyId, ...COMPANY_INTAKE, names: "Acme" })).toMatch(/^names must be/);
+  expect(await message({ partyId, ...COMPANY_INTAKE, ssn: 123 })).toBe("ssn must be a string");
+
   const anon = await app.request("/companies", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ partyId: "p", name: "Acme" }),
+    body: JSON.stringify({ partyId: "p", ...COMPANY_INTAKE }),
   });
   expect(anon.status).toBe(401);
+});
+
+test("a SANDBOX deployment refuses an ssn outright, and nothing is minted", async () => {
+  // §4.1. The test app is a sandbox deployment, which is the shape every deployment but one has.
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const res = await post(app, "/companies", token, {
+    partyId,
+    ...COMPANY_INTAKE,
+    ssn: "123-45-6789",
+  });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error.message).toMatch(/never sent to doola's development environment/);
+  const list = await (
+    await app.request("/companies", { headers: { authorization: `Bearer ${token}` } })
+  ).json();
+  expect(list.companies).toHaveLength(0);
 });
 
 test("a deployment that forms nothing answers 503 on POST and an empty list on GET", async () => {
   const app = makeApp(undefined);
   const token = await login(app);
-  const res = await post(app, "/companies", token, { partyId: "p", name: "Acme" });
+  const res = await post(app, "/companies", token, { partyId: "p", ...COMPANY_INTAKE });
   expect(res.status).toBe(503);
   const list = await (
     await app.request("/companies", { headers: { authorization: `Bearer ${token}` } })
@@ -545,7 +598,7 @@ test("ATTACH: onboard takes a companyId, and a second agent joins the SAME filin
   const token = await login(app);
   const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
   const { companyId } = await (
-    await post(app, "/companies", token, { partyId, name: "Acme Robotics LLC" })
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
   ).json();
 
   for (const name of ["Agent One", "Agent Two"]) {
@@ -572,7 +625,7 @@ test("onboard refuses BOTH handles at once — which identity would the filing b
   const token = await login(app);
   const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
   const { companyId } = await (
-    await post(app, "/companies", token, { partyId, name: "Acme Robotics LLC" })
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
   ).json();
   const second = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
   const res = await post(app, "/onboard", token, {
@@ -591,7 +644,11 @@ test("a FOREIGN company id is refused with the same message as an unknown one", 
   const theirs = await login(app, other);
   const { partyId } = await (await post(app, "/formation-party", theirs, REAL_PARTY)).json();
   const { companyId } = await (
-    await post(app, "/companies", theirs, { partyId, name: "Theirs LLC" })
+    await post(app, "/companies", theirs, {
+      partyId,
+      ...COMPANY_INTAKE,
+      names: ["Theirs One", "Theirs Two", "Theirs Three"],
+    })
   ).json();
 
   const foreign = await post(app, "/onboard", mine, {

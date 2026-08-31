@@ -37,7 +37,7 @@ import {
   loadConfig,
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
-import { createCompany } from "../formation/company";
+import { createCompany, shimCompanyIntake } from "../formation/company";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -359,6 +359,9 @@ async function main() {
         sandboxSyntheticPii: formationCfg.sandboxSyntheticPii,
         maxPerTenant: formationCfg.maxPerTenant,
         dailyCeiling: formationCfg.dailyCeiling,
+        // The SSN keyring (§4.2). Absent everywhere except production doola, where it is a boot
+        // invariant — and its absence makes the door REFUSE the field, never store it in clear.
+        pii: formationCfg.pii,
         world: worldId,
       }
     : undefined;
@@ -423,13 +426,10 @@ async function main() {
               // nested one, so a 409 below rolls the company back with everything else.
               { ...companyDeps!, transaction: (fn) => fn() },
               tenantId,
-              {
-                partyId: intake.partyId,
-                name: intake.name,
-                // The shim never invents a claim: it mirrors the deployment, which is what the
-                // party it is binding was already created against.
-                synthetic: formationCfg.sandboxSyntheticPii ? true : undefined,
-              },
+              // ONE mapping, shared with every test wiring of this shim — see
+              // `shimCompanyIntake`. It reaches `synthesizedName`, the field spelled for what it
+              // is, so no production door can fall into the derived-name path by accident.
+              shimCompanyIntake(intake, formationCfg.sandboxSyntheticPii),
             );
             if ("error" in result) throw new ApiError("validation_error", 400, result.error);
             return result.companyId;

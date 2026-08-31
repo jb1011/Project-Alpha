@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { loadConfig } from "../../src/config/env";
 import { resolveFormationDeployment } from "../../src/formation";
-import { createCompany } from "../../src/formation/company";
+import { createCompany, shimCompanyIntake } from "../../src/formation/company";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -522,7 +522,9 @@ function formationDeps(
           transaction: (fn) => fn(),
         },
         tenantId,
-        intake,
+        // The SHARED mapping (A2): four copies of "what the shim sends" is four chances for it
+        // to mean something different on one surface.
+        shimCompanyIntake(intake, false),
       );
       if ("error" in result) throw new Error(result.error);
       return result.companyId;

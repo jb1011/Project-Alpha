@@ -127,6 +127,128 @@ export function syntheticPiiRefusedMessage(): string {
   return "synthetic formation parties are refused on this deployment (FORMATION_SANDBOX_SYNTHETIC_PII is off): a real filing needs a real legal identity";
 }
 
+// ── INTAKE VALIDATION (design 2026-08-26 §5) ────────────────────────────────────────────────
+//
+// Every one of these names the FIELD and, where there is one, the offending value. That is the
+// whole design of them: the alternative is a caller who cannot proceed and cannot tell why, on a
+// form whose next step spends real money. They live here with the door's other refusals for the
+// reason the file header gives — REST and MCP must refuse the same things in the same words, and
+// A3's UI renders these strings rather than inventing its own.
+
+/** Exactly three, always. The alternates are not a nicety: Wyoming refuses a name that is
+ *  already taken, and a second attempt is a second filing. */
+export function companyNamesRequiredMessage(): string {
+  return "names must be exactly three company name candidates, in order of preference — Wyoming refuses a name that is already taken, and the two alternates are what let the filing proceed without a second fee";
+}
+
+export function companyNameBlankMessage(position: number): string {
+  return `names[${position - 1}] is blank — all three candidates are required`;
+}
+
+export function companyNameTooLongMessage(position: number, max: number): string {
+  return `names[${position - 1}] is longer than ${max} characters`;
+}
+
+/**
+ * The charset refusal. It names the character, because "invalid characters" on a form is not
+ * something a caller can act on.
+ */
+export function companyNameCharsetMessage(position: number, char: string): string {
+  return `names[${position - 1}] contains ${JSON.stringify(char)}, which Wyoming does not accept in an entity name (letters, digits, spaces and & ' - , . ( ) + only)`;
+}
+
+/** "LLC" is the ENTITY ENDING, carried in its own field. A name that is nothing else has no
+ *  name in it at all, and would be filed as "LLC LLC". */
+export function companyNameEndingOnlyMessage(position: number): string {
+  return `names[${position - 1}] must contain something other than an entity ending`;
+}
+
+/** Wyoming reserves this word to licensed or chartered entities (see wyRestrictedWords.ts). */
+export function companyNameRestrictedMessage(position: number, word: string): string {
+  return `names[${position - 1}] contains the restricted word "${word}" — Wyoming will not file it without a licence or charter we cannot supply on your behalf, so it would come back rejected after the fee was paid`;
+}
+
+/** Three candidates that are really one candidate leave the filing with no fallback at all. */
+export function companyNameDuplicateMessage(position: number): string {
+  return `names[${position - 1}] repeats an earlier candidate — three identical options give the filing no alternative if the first is taken`;
+}
+
+export function businessPurposeRequiredMessage(): string {
+  return "businessPurpose is required: a short description of what the company does, which is filed with it";
+}
+
+export function businessPurposeTooLongMessage(max: number): string {
+  return `businessPurpose is longer than ${max} characters`;
+}
+
+export function industryLabelRequiredMessage(): string {
+  return "industryLabel is required";
+}
+
+/** An unlisted label reaches doola and comes back rejected on a real fee, so it is refused
+ *  here — and the message points at where the list lives. */
+export function industryLabelUnknownMessage(label: string): string {
+  return `industryLabel ${JSON.stringify(label)} is not one of the industries we can file under — pick one of the listed labels (GET /config exposes them from A3; the list is doola's NAICS reference table)`;
+}
+
+// ── THE SSN (design §4.1) ───────────────────────────────────────────────────────────────────
+
+/** doola's documented format. Validated at the door so a typo is a specific 400 rather than a
+ *  blob nobody can inspect and a rejected filing. */
+export function ssnFormatMessage(): string {
+  return "ssn must be formatted XXX-XX-XXXX";
+}
+
+/**
+ * A sandbox or synthetic deployment refuses the field OUTRIGHT — never merely ignores it.
+ *
+ * The same reasoning as `syntheticPiiRefusedMessage`, one field down: quietly dropping an SSN
+ * would leave a caller believing they had supplied one, and quietly accepting it would put a real
+ * person's Social Security Number in a partner's DEVELOPMENT environment.
+ */
+export function ssnRefusedHereMessage(): string {
+  return "ssn is refused on this deployment: an SSN is collected only for a real production filing, and never sent to doola's development environment";
+}
+
+/** The door cannot encrypt, so it must not accept. Unreachable on a correctly-booted production
+ *  box (`FORMATION_PII_KEY` is a boot invariant) — it exists so the failure is a refusal rather
+ *  than a plaintext write. */
+export function ssnUnavailableMessage(): string {
+  return "ssn cannot be accepted: this deployment has no FORMATION_PII_KEY configured, and an SSN is never stored unencrypted";
+}
+
+/** MCP does not take one, permanently (§4.1). */
+export function ssnNotOnThisDoorMessage(): string {
+  return "ssn is not accepted over MCP — an SSN in a tool argument would sit in an LLM client's context window and its logs. Use the web form (POST /companies)";
+}
+
+/**
+ * The §4.1 optional-but-recommended copy, as a CONSTANT so A3's form and this door say the same
+ * thing. It is the whole of what a caller is told before they decide.
+ *
+ * Optional because the filing genuinely proceeds without one: doola derives US-vs-non-US
+ * applicant status from its presence, and a non-US applicant is expected not to have one.
+ * Recommended because supplying it is what gets the EIN issued in days rather than weeks — the
+ * alternative is the SS-4 signature route.
+ */
+export const SSN_COPY = {
+  label: "Social Security Number or ITIN (optional)",
+  help: "US persons: supplying this lets the IRS issue your EIN in days instead of weeks. It is encrypted immediately, sent once to our filing partner, and deleted from our records the moment the company is filed. Leave it blank if you are not a US person — we will file the SS-4 signature route instead.",
+  /** What the surface may say about retention, and it is literally true (§4.4/§4.6a). */
+  retention:
+    "Deleted in the same transaction that records your company id, and in any case within 7 days if the filing never starts.",
+} as const;
+
+/**
+ * The §4.7 freeze, refused in the caller's terms.
+ *
+ * It names the one case that IS editable, because that is the actionable half: a filing doola
+ * refused releases its idempotency key, and only then can a new body be sent under it.
+ */
+export function companyIntakeFrozenMessage(): string {
+  return "this company's intake can no longer be changed: a filing has already been sent for it. Intake is re-openable only after the provider REJECTED the filing, which is the one case that releases the request — otherwise create a new company";
+}
+
 /**
  * The labeled sandbox identity (§3, audit H7).
  *

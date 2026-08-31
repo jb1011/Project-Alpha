@@ -4,6 +4,7 @@ import type { GuardianPasskey } from "../../adapters/turnkey/provisioner";
 import type { AuthVars } from "../../auth/middleware";
 import { custodyUnavailableMessage } from "../../custody";
 import {
+  companyNamesRequiredMessage,
   createFormationParty,
   formationDoorRefusal,
   formationUnavailableMessage,
@@ -103,15 +104,28 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    * and the A1 onboard shim call too — one function, so the three doors cannot disagree about
    * what a company costs.
    *
-   * A1 accepts the SYNTHESIZED intake (a name, and the defaults); A2 replaces it with the real
-   * three-candidate form, the business purpose, the industry and the SSN. The stored shape is
-   * already canonical, so that is a change to this handler and not to the row.
+   * It takes the PRODUCTION intake (§5): three ranked name candidates, the company's own
+   * business purpose, an industry from the shipped reference list — and, on a production
+   * deployment only, the responsible party's SSN. Everything is validated inside
+   * `createCompany`, so the two doors refuse the same things in the same words; this handler
+   * only decides what is a well-formed HTTP body.
+   *
+   * **This is the ONLY door that takes an SSN** (§4.1), and it takes it on THIS request because
+   * the AAD it is encrypted under is `party_id || company_id` — the company id does not exist
+   * until the create mints it. Never echoed back, never logged, never in a view.
    */
   app.post("/companies", async (c) => {
     const tenantId = c.get("tenantId");
     if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
 
-    let body: { partyId?: unknown; name?: unknown; synthetic?: unknown };
+    let body: {
+      partyId?: unknown;
+      names?: unknown;
+      businessPurpose?: unknown;
+      industryLabel?: unknown;
+      ssn?: unknown;
+      synthetic?: unknown;
+    };
     try {
       body = await c.req.json();
     } catch {
@@ -119,8 +133,17 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     }
     if (typeof body.partyId !== "string" || !body.partyId)
       throw new ApiError("validation_error", 400, "partyId is required");
-    if (typeof body.name !== "string" || !body.name.trim())
-      throw new ApiError("validation_error", 400, "name is required");
+    // TYPE checks only — the CONTENT rules (length, charset, restricted words, duplicates, the
+    // industry list, the SSN format) all live in `createCompany`, where MCP meets them too.
+    if (body.names !== undefined && !Array.isArray(body.names))
+      throw new ApiError("validation_error", 400, companyNamesRequiredMessage());
+    for (const [field, value] of [
+      ["businessPurpose", body.businessPurpose],
+      ["industryLabel", body.industryLabel],
+      ["ssn", body.ssn],
+    ] as const)
+      if (value !== undefined && typeof value !== "string")
+        throw new ApiError("validation_error", 400, `${field} must be a string`);
 
     const result = createCompany(
       // The composition root's ONE dependency set; this door supplies only its transaction.
@@ -128,11 +151,16 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       tenantId,
       {
         partyId: body.partyId,
-        name: body.name,
+        names: body.names as string[] | undefined,
+        businessPurpose: body.businessPurpose as string | undefined,
+        industryLabel: body.industryLabel as string | undefined,
+        ssn: body.ssn as string | undefined,
         synthetic: body.synthetic === true ? true : undefined,
       },
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+    // The companyId and nothing else. Echoing the intake back would put the SSN in a response
+    // body, in any client that persists responses, and in any proxy log along the way.
     return c.json({ companyId: result.companyId }, 201);
   });
 

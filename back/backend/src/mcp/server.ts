@@ -14,6 +14,7 @@ import {
   truncateTenant,
 } from "../formation";
 import { createCompany } from "../formation/company";
+import { NAICS_LABELS } from "../formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
@@ -594,16 +595,21 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       "create_company",
       {
         title: "Create company",
-        description: `Create the legal body (a Wyoming LLC) your agents will be filed under, and get back a companyId to pass to onboard_agent. ${formationCapabilityNote(deps)} partyId is the handle from create_formation_party — the natural person legally answerable for the filing. This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling. It never takes an SSN — if one is needed, use the web form. Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.`,
+        description: `Create the legal body (a Wyoming LLC) your agents will be filed under, and get back a companyId to pass to onboard_agent. ${formationCapabilityNote(deps)} partyId is the handle from create_formation_party — the natural person legally answerable for the filing. names is THREE candidates in order of preference: Wyoming refuses a name that is already taken, and the alternates are what let the filing proceed without a second fee. businessPurpose is a short description of what the COMPANY does, filed with it. industryLabel must be one of the industries we can file under (${NAICS_LABELS.join(", ")}). This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling. ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs. If the responsible party is a US person and wants the fast EIN route, create the company through the web form (POST /companies) instead. Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.`,
         inputSchema: {
           partyId: z.string(),
-          /** The company name. A2 replaces this with three ranked candidates. */
-          name: z.string(),
+          /** THREE ranked candidates (§5). */
+          names: z.array(z.string()).length(3),
+          /** The COMPANY's own purpose — the agent's description is no longer doola-visible. */
+          businessPurpose: z.string(),
+          /** One of the shipped NAICS labels. */
+          industryLabel: z.string(),
           /** The sandbox deployment's marker, checked against this box's own setting. */
           synthetic: z.boolean().optional(),
+          // ⚠ NO `ssn`, deliberately and permanently (§4.1). See the description above.
         },
       },
-      async ({ partyId, name, synthetic }) => {
+      async ({ partyId, names, businessPurpose, industryLabel, synthetic }) => {
         if (!hasCapability(scope, "provision") || scope.entityId !== null)
           return { content: [{ type: "text", text: "not authorized" }], isError: true };
         try {
@@ -614,7 +620,13 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
               transaction: (fn) => deps.repo.transaction(fn),
             },
             tenantId,
-            { partyId, name, synthetic: synthetic === true ? true : undefined },
+            {
+              partyId,
+              names,
+              businessPurpose,
+              industryLabel,
+              synthetic: synthetic === true ? true : undefined,
+            },
           );
           if ("error" in result)
             return { content: [{ type: "text", text: result.error }], isError: true };
