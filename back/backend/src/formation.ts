@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type Config, canFormEntities } from "./config/env";
+import { NAICS_LABELS } from "./formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "./formation/status";
 import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
@@ -185,10 +186,19 @@ export function industryLabelRequiredMessage(): string {
   return "industryLabel is required";
 }
 
-/** An unlisted label reaches doola and comes back rejected on a real fee, so it is refused
- *  here — and the message points at where the list lives. */
+/**
+ * An unlisted label reaches doola and comes back rejected on a real fee, so it is refused here.
+ *
+ * The message NAMES the acceptable labels, because an enumerated field whose values a caller
+ * cannot discover is a field they cannot fill in — and REST has no discovery surface for this one
+ * yet (MCP's tool description carries them). Capped, so a refreshed list of hundreds does not
+ * produce an error nobody can read.
+ */
 export function industryLabelUnknownMessage(label: string): string {
-  return `industryLabel ${JSON.stringify(label)} is not one of the industries we can file under — pick one of the listed labels (GET /config exposes them from A3; the list is doola's NAICS reference table)`;
+  const shown = NAICS_LABELS.slice(0, 8);
+  const rest = NAICS_LABELS.length - shown.length;
+  const list = shown.join(", ") + (rest > 0 ? `, …and ${rest} more` : "");
+  return `industryLabel ${JSON.stringify(label)} is not one of the industries we can file under — pick one of: ${list}`;
 }
 
 // ── THE SSN (design §4.1) ───────────────────────────────────────────────────────────────────
