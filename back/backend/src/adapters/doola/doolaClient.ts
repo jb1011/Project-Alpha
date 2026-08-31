@@ -11,6 +11,7 @@ import type {
   DoolaDocument,
   DoolaDocumentDownload,
   DoolaErrorEnvelope,
+  DoolaNaicsCode,
   DoolaPlaygroundResult,
   DoolaRequiredAction,
 } from "./types";
@@ -169,6 +170,15 @@ export interface DoolaApi {
   getDocumentDownloadUrl(companyId: string, documentId: string): Promise<DoolaDocumentDownload>;
   listRequiredActions(companyId: string): Promise<DoolaRequiredAction[]>;
   getComplianceCalendar(companyId: string): Promise<DoolaComplianceEvent[]>;
+  /**
+   * The NAICS reference table. **SCRIPT-ONLY** (design §5).
+   *
+   * It exists for `scripts/refresh-naics.mts`, which regenerates
+   * `src/formation/naicsLabels.ts` — a BUILD-TIME constant. Nothing in the request path may call
+   * it: the industry picker sits at the very top of the funnel, and putting a partner round trip
+   * there would make a form that cannot render when doola is slow, plus a cache nobody specified.
+   */
+  listNaicsCodes(): Promise<DoolaNaicsCode[]>;
   /** SANDBOX ONLY: force the formation to complete. Refused against production by construction.
    *  Resolves with the webhook events the call actually fired (`triggeredEvents`). */
   playgroundCompleteFormation(companyId: string): Promise<DoolaPlaygroundResult | undefined>;
@@ -416,6 +426,15 @@ export function buildDoolaApi(cfg: DoolaClientConfig): DoolaApi {
         `${API_PREFIX}/companies/${companyId}/compliance/calendar`,
       );
       return cal?.events ?? [];
+    },
+    async listNaicsCodes() {
+      // A bare array in the envelope, and `payload: null` is a legitimate empty list.
+      return (
+        (await callPayload<DoolaNaicsCode[] | null>(
+          "GET",
+          `${API_PREFIX}/references/naics-codes`,
+        )) ?? []
+      );
     },
     async playgroundCompleteFormation(companyId) {
       assertSandbox("playgroundCompleteFormation");

@@ -202,6 +202,20 @@ export interface DoolaRequiredAction {
   updatedAt?: string;
 }
 
+/**
+ * `NaicsCode` — one row of `GET /v1/partner/references/naics-codes`.
+ *
+ * `industry` is the LABEL the create-company endpoint wants (`naicsCode` is deprecated there),
+ * and it is the only field we keep: `src/formation/naicsLabels.ts` is a build-time list of
+ * labels, refreshed by `scripts/refresh-naics.mts`, so no request ever sits at the top of the
+ * funnel waiting on doola to tell a caller what industries exist.
+ */
+export interface DoolaNaicsCode {
+  naicsCodeId?: string;
+  naicsCode?: string;
+  industry?: string;
+}
+
 /** `PartnerComplianceEventDto`. */
 export interface DoolaComplianceEvent {
   type?: string;

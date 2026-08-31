@@ -129,6 +129,7 @@ test("Idempotency-Key is set on the two CREATE endpoints and on NOTHING else", a
   await api.getDocumentDownloadUrl("cmp_1", "doc_1");
   await api.listRequiredActions("cmp_1");
   await api.getComplianceCalendar("cmp_1");
+  await api.listNaicsCodes();
   await api.playgroundCompleteFormation("cmp_1");
   await api.playgroundCompleteEin("cmp_1");
 
@@ -138,7 +139,34 @@ test("Idempotency-Key is set on the two CREATE endpoints and on NOTHING else", a
     "https://doola.test/v1/partner/companies",
   ]);
   expect(withKey.map((c) => c.headers["Idempotency-Key"])).toEqual(["key-customer", "key-company"]);
-  expect(calls).toHaveLength(10);
+  expect(calls).toHaveLength(11);
+});
+
+test("listNaicsCodes reads the reference table, and a null payload is an empty list", async () => {
+  // SCRIPT-ONLY (§5): it backs `scripts/refresh-naics.mts`, which regenerates the build-time
+  // label constant. Nothing in the request path may call it — an industry picker that waits on
+  // doola is a form that cannot render when doola is slow.
+  const { fetchImpl, calls } = fakeFetch([
+    {
+      status: 200,
+      body: {
+        payload: [{ naicsCodeId: "n1", naicsCode: "541511", industry: "Software development" }],
+      },
+    },
+    { status: 200, body: { payload: null } },
+  ]);
+  const api = buildDoolaApi({
+    apiKey: "dk_test",
+    baseUrl: "https://doola.test",
+    environment: "sandbox",
+    fetchImpl,
+  });
+  expect(await api.listNaicsCodes()).toEqual([
+    { naicsCodeId: "n1", naicsCode: "541511", industry: "Software development" },
+  ]);
+  expect(calls[0]!.url).toBe("https://doola.test/v1/partner/references/naics-codes");
+  expect(calls[0]!.method).toBe("GET");
+  expect(await api.listNaicsCodes()).toEqual([]);
 });
 
 test("request shape: creates POST JSON, reads GET, ISO-3 country and 2-letter state survive", async () => {
