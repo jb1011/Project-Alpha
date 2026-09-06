@@ -36,7 +36,7 @@ record. We form a Wyoming LLC for the agent through doola's API. The agent gets 
 contract on Arc that enforces the operating agreement: spending caps, approved counterparties, and
 the human's power to pause or claw back. Then the agent works, earning and paying in USDC.
 
-Fifteen agent entities are live, every one backed by a verified human, and none of them hold gas.
+Fifteen agent entities are live, every one backed by a verified human, and not one of them needs to hold gas.
 Every entity is listed publicly, every contract source-verified on Arcscan. You don't have to take
 my word for any of it.
 
@@ -60,7 +60,6 @@ accountability has to be impeccable about its own. An independent audit of the c
 agent holds real customer money. A minimal, focused version of Novi Corpus with Nanopayments, which
 we are designing right now. And pitching AI and crypto VCs for the funding that pays for all of it.
 
-Nine weeks to turn a working testnet product into a business that can hold real customer money.
 And what we want most from this programme is the people: building alongside teams at Circle and Arc
 who have done this before, an introduction to US corporate counsel, and design partners running real
 agents.
