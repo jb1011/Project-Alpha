@@ -303,7 +303,22 @@
   <section class="slide"><div class="mesh"></div><div class="grain"></div>
     <div class="eyebrow"><span class="no">03</span> Where the idea comes from</div>
     <h1>The law got there first.</h1>
-    <div class="origin">
+    <svg class="diagram" viewBox="0 0 1560 120" fill="none" aria-hidden="true" style="margin-top:3vh">
+      <defs><marker id="ln" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0L10 5L0 10z" fill="rgba(255,255,255,.45)"/></marker></defs>
+      <line x1="600" y1="60" x2="742" y2="60" stroke="rgba(255,255,255,.25)" stroke-width="1.25" marker-end="url(#ln)"/>
+      <line x1="1150" y1="60" x2="1272" y2="60" stroke="rgba(255,255,255,.25)" stroke-width="1.25" marker-end="url(#ln)"/>
+      <circle cx="150" cy="60" r="10" fill="none" stroke="#d9b96a" stroke-width="2"/>
+      <text x="190" y="52" fill="#77756e" font-size="19" letter-spacing="4">THE MECHANISM</text>
+      <text x="190" y="84" fill="#f4f2ec" font-size="27" font-weight="600">Shawn Bayern</text>
+      <circle cx="780" cy="60" r="10" fill="none" stroke="#d9b96a" stroke-width="2"/>
+      <text x="820" y="52" fill="#77756e" font-size="19" letter-spacing="4">THE STATUTE · 2021</text>
+      <text x="820" y="84" fill="#f4f2ec" font-size="27" font-weight="600">Wyoming DAO LLC</text>
+      <circle cx="1310" cy="60" r="10" fill="none" stroke="#4d8ef7" stroke-width="2"/>
+      <text x="1350" y="52" fill="#77756e" font-size="19" letter-spacing="4">THE CALL · MAY 2026</text>
+      <text x="1350" y="84" fill="#f4f2ec" font-size="27" font-weight="600">Jeremy Allaire</text>
+    </svg>
+    <div class="origin" style="margin-top:3.4vh">
       <div class="post">
         <div class="who">
           <div class="av">JA</div>
@@ -313,19 +328,16 @@
         <div class="qt">
           <div class="qk">Quoting · Aaron Wright</div>
           <div class="qn">The algorithmically managed LLC</div>
-          <div class="qd">Shawn Bayern's mechanism: US LLC law already lets a company be run by software, with the operating agreement as the control layer.</div>
         </div>
-        <div class="dt">16 May 2026 · x.com/jerallaire</div>
       </div>
       <div class="ledger allows">
         <div class="lh">What a Wyoming DAO LLC allows</div>
-        <div class="lrow"><span>A legal person<small>it can own assets and sign contracts</small></span><span class="dot au"></span></div>
-        <div class="lrow"><span>Limited liability<small>for the human standing behind it</small></span><span class="dot au"></span></div>
-        <div class="lrow"><span>Management by an algorithm<small>declared openly, since 2021</small></span><span class="dot au"></span></div>
-        <div class="lrow"><span>The smart contract in the filing<small>the code is named in the articles</small></span><span class="dot au"></span></div>
+        <div class="lrow"><span>A legal person</span><span class="dot au"></span></div>
+        <div class="lrow"><span>Limited liability</span><span class="dot au"></span></div>
+        <div class="lrow"><span>Run by an algorithm</span><span class="dot au"></span></div>
+        <div class="lrow"><span>The smart contract in the filing</span><span class="dot au"></span></div>
       </div>
     </div>
-    <p class="note">Bayern showed the mechanism. Wyoming made it something you can declare. Nobody had turned it into a product.</p>
     <div class="foot"><span>A human controller of record is required by law, and by us</span><span class="pg">03 / 07</span></div>
   </section>
 
@@ -370,26 +382,26 @@
     <div class="eyebrow"><span class="no">05</span> What we built · live on Arc testnet</div>
     <h1>One flow: <span class="dim">agent to company.</span></h1>
     <div class="flow">
-      <div class="fbox ok"><small>Verify</small><b>World ID human</b><br/>the controller of record</div>
+      <div class="fbox ok"><small>Verify</small><b>World ID human</b><br/>controller of record</div>
       <div class="farrow">→</div>
-      <div class="fbox au"><small>Form</small><b>Wyoming LLC</b><br/>filed through doola's API</div>
+      <div class="fbox au"><small>Form</small><b>Wyoming LLC</b><br/>via doola's API</div>
       <div class="farrow">→</div>
-      <div class="fbox hi"><small>Govern</small><b>Treasury on Arc</b><br/>the operating agreement, enforced</div>
+      <div class="fbox hi"><small>Govern</small><b>Treasury on Arc</b><br/>rules enforced on chain</div>
       <div class="farrow">→</div>
-      <div class="fbox ok"><small>Work</small><b>Earn and pay in USDC</b><br/>jobs and x402, within caps</div>
+      <div class="fbox ok"><small>Work</small><b>Earn and pay in USDC</b><br/>jobs and x402</div>
     </div>
     <div class="proof">
       <div class="card au">
         <div class="k">Formation</div>
-        <div class="v">A real operating agreement, <b>generated from our data and anchored on chain</b>, end to end against doola's sandbox.</div>
+        <div class="v"><b>Real operating agreement, anchored on chain</b></div>
       </div>
       <div class="card hi">
         <div class="k">Governance</div>
-        <div class="v"><b>One contract holds all platform authority</b>, administered from a hardware wallet.</div>
+        <div class="v"><b>One root, hardware wallet</b></div>
       </div>
       <div class="card ok">
         <div class="k">Monitoring</div>
-        <div class="v">Every treasury and registry <b>watched on chain around the clock</b>, alerts on anything unexpected.</div>
+        <div class="v"><b>Every treasury, around the clock</b></div>
       </div>
     </div>
     <div class="foot"><span>15 agent entities live on Arc testnet · every contract source-verified</span><span class="pg">05 / 07</span></div>
