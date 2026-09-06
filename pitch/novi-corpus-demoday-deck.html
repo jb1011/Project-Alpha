@@ -226,6 +226,28 @@
   .dot.au{background:var(--gold);box-shadow:0 0 10px rgba(217,185,106,.5)}
   /* --- built slide: proof row --- */
   .proof{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1.2vw;margin-top:4.6vh}
+
+  /* --- built slide: the four steps as the core --- */
+  .flowbig{display:grid;grid-template-columns:1fr auto 1fr auto 1fr auto 1fr;align-items:stretch;gap:1vw;margin-top:5.5vh}
+  .fb{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:18px;padding:3.2vh 1.6vw 3vh;
+    min-height:34vh;display:flex;flex-direction:column;justify-content:flex-end;
+    background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.012))}
+  .fb::before{content:"";position:absolute;top:0;left:12%;right:12%;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(255,255,255,.16),transparent)}
+  .fb .num{position:absolute;top:1.8vh;right:1.3vw;font-family:Georgia,"Times New Roman",serif;
+    font-size:clamp(44px,4.8vw,80px);line-height:1;color:rgba(255,255,255,.07)}
+  .fb .k{display:flex;align-items:center;gap:.8em;font-size:clamp(10px,.9vw,12.5px);letter-spacing:.24em;
+    text-transform:uppercase;color:var(--muted-2)}
+  .fb .k::before{content:"";width:6px;height:6px;border-radius:50%;flex:none;background:var(--muted-2)}
+  .fb .t{margin-top:1.4vh;font-size:clamp(21px,2.1vw,34px);font-weight:600;letter-spacing:-.02em;line-height:1.12;color:var(--ink)}
+  .fb .d{margin-top:1vh;font-size:clamp(13px,1.2vw,18px);line-height:1.45;color:var(--muted)}
+  .fb.ok::before{background:linear-gradient(90deg,transparent,rgba(99,220,174,.4),transparent)}
+  .fb.ok .k::before{background:var(--emerald);box-shadow:0 0 12px rgba(99,220,174,.6)}
+  .fb.au::before{background:linear-gradient(90deg,transparent,rgba(217,185,106,.4),transparent)}
+  .fb.au .k::before{background:var(--gold);box-shadow:0 0 12px rgba(217,185,106,.6)}
+  .fb.hi::before{background:linear-gradient(90deg,transparent,rgba(77,142,247,.45),transparent)}
+  .fb.hi .k::before{background:var(--blue);box-shadow:0 0 12px rgba(77,142,247,.65)}
+  .fa{align-self:center;color:var(--muted-2);font-size:clamp(22px,2.3vw,38px);line-height:1}
   /* PDF export: every slide, one landscape page each */
   @media print{
     @page{ size:1920px 1080px; margin:0 }
@@ -381,28 +403,14 @@
   <section class="slide"><div class="mesh"></div><div class="grain"></div>
     <div class="eyebrow"><span class="no">05</span> What we built · live on Arc testnet</div>
     <h1>One flow: <span class="dim">agent to company.</span></h1>
-    <div class="flow">
-      <div class="fbox ok"><small>Verify</small><b>World ID human</b><br/>controller of record</div>
-      <div class="farrow">→</div>
-      <div class="fbox au"><small>Form</small><b>Wyoming LLC</b><br/>via doola's API</div>
-      <div class="farrow">→</div>
-      <div class="fbox hi"><small>Govern</small><b>Treasury on Arc</b><br/>rules enforced on chain</div>
-      <div class="farrow">→</div>
-      <div class="fbox ok"><small>Work</small><b>Earn and pay in USDC</b><br/>jobs and x402</div>
-    </div>
-    <div class="proof">
-      <div class="card au">
-        <div class="k">Formation</div>
-        <div class="v"><b>Real operating agreement, anchored on chain</b></div>
-      </div>
-      <div class="card hi">
-        <div class="k">Governance</div>
-        <div class="v"><b>One root, hardware wallet</b></div>
-      </div>
-      <div class="card ok">
-        <div class="k">Monitoring</div>
-        <div class="v"><b>Every treasury, around the clock</b></div>
-      </div>
+    <div class="flowbig">
+      <div class="fb ok"><span class="num">01</span><div class="k">Verify</div><div class="t">World ID human</div><div class="d">the controller of record</div></div>
+      <div class="fa">→</div>
+      <div class="fb au"><span class="num">02</span><div class="k">Form</div><div class="t">Wyoming LLC</div><div class="d">via doola's API</div></div>
+      <div class="fa">→</div>
+      <div class="fb hi"><span class="num">03</span><div class="k">Govern</div><div class="t">Treasury on Arc</div><div class="d">rules enforced on chain</div></div>
+      <div class="fa">→</div>
+      <div class="fb ok"><span class="num">04</span><div class="k">Work</div><div class="t">Earn and pay</div><div class="d">USDC, jobs and x402</div></div>
     </div>
     <div class="foot"><span>15 agent entities live on Arc testnet · every contract source-verified</span><span class="pg">05 / 07</span></div>
   </section>
