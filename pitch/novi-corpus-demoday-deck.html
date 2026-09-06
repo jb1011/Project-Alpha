@@ -200,6 +200,32 @@
   .helpstrip .lead{font-size:clamp(10px,.9vw,13px);letter-spacing:.2em;text-transform:uppercase;color:var(--muted-2)}
   .helpstrip .it{font-size:clamp(13.5px,1.2vw,19px);color:var(--muted)}
   .helpstrip .it b{color:var(--ink);font-weight:600}
+
+  /* --- origin slide: the post card --- */
+  .origin{display:grid;grid-template-columns:1.05fr 1fr;gap:2.8vw;margin-top:4.4vh;align-items:start}
+  .post{border:1px solid var(--line-strong);border-radius:18px;padding:2.6vh 1.7vw;
+    background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.014))}
+  .post .who{display:flex;align-items:center;gap:.9vw}
+  .post .av{width:clamp(40px,3.2vw,54px);height:clamp(40px,3.2vw,54px);border-radius:50%;flex:none;
+    border:1px solid rgba(77,142,247,.5);background:rgba(77,142,247,.12);display:flex;align-items:center;
+    justify-content:center;font-family:Georgia,"Times New Roman",serif;font-size:clamp(15px,1.3vw,22px);color:var(--blue-soft)}
+  .post .nm{font-size:clamp(15px,1.35vw,21px);font-weight:600;line-height:1.15}
+  .post .hd{font-size:clamp(11px,1vw,15px);color:var(--muted-2);margin-top:.3vh}
+  .post .txt{margin-top:2vh;font-size:clamp(17px,1.7vw,27px);line-height:1.4;color:var(--ink);letter-spacing:-.01em}
+  .post .txt b{color:var(--blue-soft);font-weight:500}
+  .post .qt{margin-top:2vh;border:1px solid var(--line);border-radius:12px;padding:1.8vh 1.3vw;
+    background:rgba(255,255,255,.02)}
+  .post .qt .qk{font-size:clamp(10px,.9vw,12.5px);letter-spacing:.2em;text-transform:uppercase;color:var(--muted-2)}
+  .post .qt .qn{margin-top:.8vh;font-size:clamp(14px,1.25vw,19px);font-weight:600;color:var(--ink)}
+  .post .qt .qd{margin-top:.5vh;font-size:clamp(12.5px,1.1vw,17px);color:var(--muted);line-height:1.45}
+  .post .dt{margin-top:1.8vh;font-size:clamp(11px,.95vw,14px);letter-spacing:.14em;text-transform:uppercase;color:var(--muted-2)}
+  .allows{border-color:rgba(217,185,106,.32)}
+  .allows .lh{color:var(--gold)}
+  .allows .lrow{font-weight:500}
+  .allows .lrow small{display:block;font-size:.72em;font-weight:400;color:var(--muted-2);margin-top:.25em}
+  .dot.au{background:var(--gold);box-shadow:0 0 10px rgba(217,185,106,.5)}
+  /* --- built slide: proof row --- */
+  .proof{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1.2vw;margin-top:4.6vh}
   /* PDF export: every slide, one landscape page each */
   @media print{
     @page{ size:1920px 1080px; margin:0 }
@@ -242,7 +268,7 @@
         <line x1="42" y1="100" x2="34" y2="100"/><line x1="158" y1="100" x2="166" y2="100"/>
       </g>
     </svg>
-    <div class="foot"><span>www.novicorpus.com</span><span class="pg">01 / 06</span></div>
+    <div class="foot"><span>www.novicorpus.com</span><span class="pg">01 / 07</span></div>
   </section>
 
   <!-- 2 · PROBLEM -->
@@ -269,13 +295,43 @@
       </div>
     </div>
     <p class="note" style="text-align:center;max-width:none">No business hires a counterparty nobody answers for. That is where agentic commerce stalls.</p>
-    <div class="foot"><span>Novi Corpus closes this gap</span><span class="pg">02 / 06</span></div>
+    <div class="foot"><span>Novi Corpus closes this gap</span><span class="pg">02 / 07</span></div>
   </section>
 
 
-  <!-- 3 · TEAM -->
+  <!-- 3 · ORIGIN -->
   <section class="slide"><div class="mesh"></div><div class="grain"></div>
-    <div class="eyebrow"><span class="no">03</span> Who is building it</div>
+    <div class="eyebrow"><span class="no">03</span> Where the idea comes from</div>
+    <h1>The law got there first.</h1>
+    <div class="origin">
+      <div class="post">
+        <div class="who">
+          <div class="av">JA</div>
+          <div><div class="nm">Jeremy Allaire</div><div class="hd">@jerallaire · CEO, Circle</div></div>
+        </div>
+        <div class="txt">Calling <b>@Arc</b> Architects — I would love to back a team building this with Circle Agent Stack and Arc.</div>
+        <div class="qt">
+          <div class="qk">Quoting · Aaron Wright</div>
+          <div class="qn">The algorithmically managed LLC</div>
+          <div class="qd">Shawn Bayern's mechanism: US LLC law already lets a company be run by software, with the operating agreement as the control layer.</div>
+        </div>
+        <div class="dt">16 May 2026 · x.com/jerallaire</div>
+      </div>
+      <div class="ledger allows">
+        <div class="lh">What a Wyoming DAO LLC allows</div>
+        <div class="lrow"><span>A legal person<small>it can own assets and sign contracts</small></span><span class="dot au"></span></div>
+        <div class="lrow"><span>Limited liability<small>for the human standing behind it</small></span><span class="dot au"></span></div>
+        <div class="lrow"><span>Management by an algorithm<small>declared openly, since 2021</small></span><span class="dot au"></span></div>
+        <div class="lrow"><span>The smart contract in the filing<small>the code is named in the articles</small></span><span class="dot au"></span></div>
+      </div>
+    </div>
+    <p class="note">Bayern showed the mechanism. Wyoming made it something you can declare. Nobody had turned it into a product.</p>
+    <div class="foot"><span>A human controller of record is required by law, and by us</span><span class="pg">03 / 07</span></div>
+  </section>
+
+  <!-- 4 · TEAM -->
+  <section class="slide"><div class="mesh"></div><div class="grain"></div>
+    <div class="eyebrow"><span class="no">04</span> Who is building it</div>
     <h1>Three builders, <span class="dim">three angles.</span></h1>
     <div class="team">
       <div class="member">
@@ -306,12 +362,12 @@
         </div>
       </div>
     </div>
-    <div class="foot"><span>France and the US · all three building on Arc before this programme</span><span class="pg">03 / 06</span></div>
+    <div class="foot"><span>France and the US · all three building on Arc before this programme</span><span class="pg">04 / 07</span></div>
   </section>
 
-  <!-- 4 · WHAT WE BUILT -->
+  <!-- 5 · WHAT WE BUILT -->
   <section class="slide"><div class="mesh"></div><div class="grain"></div>
-    <div class="eyebrow"><span class="no">04</span> What we built · live on Arc testnet</div>
+    <div class="eyebrow"><span class="no">05</span> What we built · live on Arc testnet</div>
     <h1>One flow: <span class="dim">agent to company.</span></h1>
     <div class="flow">
       <div class="fbox ok"><small>Verify</small><b>World ID human</b><br/>the controller of record</div>
@@ -322,18 +378,26 @@
       <div class="farrow">→</div>
       <div class="fbox ok"><small>Work</small><b>Earn and pay in USDC</b><br/>jobs and x402, within caps</div>
     </div>
-    <div class="bigstats">
-      <div class="bigstat em"><div class="n">15</div><div class="l">agent entities on Arc</div></div>
-      <div class="bigstat em"><div class="n">100%</div><div class="l">backed by a verified human</div></div>
-      <div class="bigstat bl"><div class="n">0</div><div class="l">gas an agent needs to hold</div></div>
+    <div class="proof">
+      <div class="card au">
+        <div class="k">Formation</div>
+        <div class="v">A real operating agreement, <b>generated from our data and anchored on chain</b>, end to end against doola's sandbox.</div>
+      </div>
+      <div class="card hi">
+        <div class="k">Governance</div>
+        <div class="v"><b>One contract holds all platform authority</b>, administered from a hardware wallet.</div>
+      </div>
+      <div class="card ok">
+        <div class="k">Monitoring</div>
+        <div class="v">Every treasury and registry <b>watched on chain around the clock</b>, alerts on anything unexpected.</div>
+      </div>
     </div>
-    <p class="note">Every entity is public at <span class="ink">novicorpus.com/transparency</span>, every contract source-verified on Arcscan.</p>
-    <div class="foot"><span>Formation loop proven end to end against doola sandbox</span><span class="pg">04 / 06</span></div>
+    <div class="foot"><span>15 agent entities live on Arc testnet · every contract source-verified</span><span class="pg">05 / 07</span></div>
   </section>
 
-  <!-- 5 · CIRCLE STACK -->
+  <!-- 6 · CIRCLE STACK -->
   <section class="slide"><div class="mesh"></div><div class="grain"></div>
-    <div class="eyebrow"><span class="no">05</span> Built on Arc, not ported to it</div>
+    <div class="eyebrow"><span class="no">06</span> Built on Arc, not ported to it</div>
     <h1>Circle-native <span class="dim">end to end.</span></h1>
     <div class="rail">
       <span class="railchip2">USDC on Arc</span>
@@ -346,12 +410,12 @@
     <p class="bigline">Every treasury, every job, every fee settles in USDC.
       Agents never hold gas, because <b>Gas Station sponsors every transaction</b>.</p>
     <p class="note">On mainnet our configuration is Circle-wallets-only by construction. Platform authority sits behind one governance contract, administered from a hardware wallet, with 24/7 on-chain monitoring.</p>
-    <div class="foot"><span>Six Circle products, all load-bearing</span><span class="pg">05 / 06</span></div>
+    <div class="foot"><span>Six Circle products, all load-bearing</span><span class="pg">06 / 07</span></div>
   </section>
 
-  <!-- 6 · THE ROAD TO PRODUCTION -->
+  <!-- 7 · THE ROAD TO PRODUCTION -->
   <section class="slide"><div class="mesh"></div><div class="grain"></div>
-    <div class="eyebrow"><span class="no">06</span> The road to production</div>
+    <div class="eyebrow"><span class="no">07</span> The road to production</div>
     <h1>We would rather be right <span class="dim">than first.</span></h1>
     <svg class="diagram" viewBox="0 0 1560 360" fill="none" aria-hidden="true" style="margin-top:2.6vh">
       <defs><marker id="rd" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
@@ -392,7 +456,7 @@
       <span class="it"><b>Counsel:</b> intro to US corporate lawyers</span>
       <span class="it"><b>Customers:</b> design partners running agents</span>
     </div>
-    <div class="foot"><span>www.novicorpus.com · novicorpus.com/transparency</span><span class="pg">06 / 06</span></div>
+    <div class="foot"><span>www.novicorpus.com · novicorpus.com/transparency</span><span class="pg">07 / 07</span></div>
   </section>
 
 </div>
