@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { everSubmitted } from "../formation/freeze";
 import type { EncryptedSsn } from "../formation/pii";
 import type { CompanyStatus } from "./companyRepository";
 import type { FormationState } from "./formationRepository";
@@ -448,29 +449,6 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
   }
 }
 
-/**
- * "Has this company's filing ever been in flight at doola?" — read from three independent
- * witnesses, ANY of which is enough (§4.6a).
- *
- * The state alone is not enough and that is the whole point: a row that was `submitted` and then
- * failed is back at `failed`, and its state has forgotten. `provider_ref` and the two ids in
- * `detail` remember. Erring toward "yes" keeps an SSN a week longer than the policy; erring
- * toward "no" erases one out from under a live idempotency key, which is a wedge (§4.4).
- */
-function everSubmitted(
-  state: FormationState | null,
-  providerRef: string | null,
-  detail: string | null,
-): boolean {
-  if (state === "submitted" || state === "confirmed") return true;
-  if (providerRef) return true;
-  if (!detail) return false;
-  try {
-    const d = JSON.parse(detail) as { customerId?: unknown; companySentAttempt?: unknown };
-    return d.customerId !== undefined || d.companySentAttempt !== undefined;
-  } catch {
-    // An unreadable blob is not evidence that nothing happened. The conservative answer is the
-    // one that KEEPS the data.
-    return true;
-  }
-}
+// `everSubmitted` used to live here. It is now in `formation/freeze.ts`, beside the freeze
+// predicate: both are read off the same `create_provider` row, both treat an unreadable `detail`
+// as the cautious answer, and keeping them apart is how the two definitions of "in flight" drift.

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { DoolaEnvironment } from "../adapters/doola/types";
+import { INTAKE_FROZEN_SQL } from "../formation/freeze";
 import type { CompanyNameOption } from "../formation/intake";
 
 /**
@@ -170,19 +171,9 @@ export interface CompanyRepository {
    * one predicate may decide whether it is still editable. So the whole rule is the WHERE clause
    * of one UPDATE, and a caller learns the answer from whether it changed anything.
    *
-   * The predicate, in words: nothing is editable once the `create_provider` row holds a
-   * `provider_ref` (a company exists at doola), is `submitted`/`confirmed`/`abandoned`, or has
-   * ALREADY SENT a company create under its CURRENT attempt. That last clause is the precise
-   * one, and it is the same fact the filer's `detail.companySentAttempt` already carries: an
-   * idempotency key is a pure function of the attempt, so "a create went out under this attempt"
-   * is exactly "doola is holding a body under the key we would use next". A new body under that
-   * key is a 409 `E_IDEMPOTENCY_KEY_REUSED`.
-   *
-   * And its converse is why the design says edit-and-retry is offered only after a `rejected`:
-   * `rejected` is the ONLY failure that burns the attempt (`lost` and `key_reused` deliberately
-   * do not — C1), so it is the only one that leaves `companySentAttempt < attempt`. The rule the
-   * design states in doola's vocabulary and the rule this clause states in ours are the same
-   * rule, and this one cannot be got wrong by a door.
+   * The predicate is `INTAKE_FROZEN_SQL`, imported from `formation/freeze.ts` — which is also
+   * where the prose explaining each of its four clauses lives, and where the TypeScript twin the
+   * filer uses sits beside it under a test that asserts the two agree.
    *
    * `intake_synthesized` is cleared: a human typed these values.
    */
@@ -251,9 +242,13 @@ export class SqliteCompanyRepository implements CompanyRepository {
         `UPDATE companies SET ein = ?, updated_at = CURRENT_TIMESTAMP
           WHERE company_id = ? AND (ein IS NULL OR ein <> ?)`,
       ),
-      // The §4.7 freeze, as the WHERE clause of the one UPDATE that can re-open an intake. See
-      // the interface comment for why each disjunct is there; the short version is that all four
-      // are ways of saying "doola is, or may be, holding a body under the key we would use next".
+      // The §4.7 freeze, as the WHERE clause of the one UPDATE that can re-open an intake — and
+      // the predicate itself is IMPORTED, not written here: the filer asks the same question of
+      // the same row (`resolveSsn`), and two spellings of the idempotency contract is one
+      // spelling too many. See `formation/freeze.ts` for why each disjunct is there.
+      //
+      // The company-level arm stays local, because it is a predicate over the row being updated
+      // rather than over the sub-saga: an `abandoned` company is over, whatever its step says.
       updateIntake: db.prepare(
         `UPDATE companies
             SET name_options = @name_options,
@@ -264,14 +259,7 @@ export class SqliteCompanyRepository implements CompanyRepository {
                 updated_at = CURRENT_TIMESTAMP
           WHERE company_id = @company_id
             AND status <> 'abandoned'
-            AND NOT EXISTS (
-                  SELECT 1 FROM formation_requests f
-                   WHERE f.company_id = companies.company_id
-                     AND f.step = 'create_provider'
-                     AND (   f.provider_ref IS NOT NULL
-                          OR f.state IN ('submitted','confirmed','abandoned')
-                          OR COALESCE(json_extract(f.detail, '$.companySentAttempt'), -1)
-                             = f.attempt))`,
+            AND NOT ${INTAKE_FROZEN_SQL}`,
       ),
     };
   }

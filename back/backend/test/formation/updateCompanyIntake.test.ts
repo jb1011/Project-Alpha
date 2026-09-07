@@ -170,6 +170,26 @@ test("a LIVE key freezes the intake, and the refusal names the one case that is 
   expect(decryptSsn(RING, stored, { partyId: stored.partyId, companyId }).reveal()).toBe(SSN);
 });
 
+test("a CORRUPT detail blob answers 'frozen' — it does not throw a 500 out of the door", () => {
+  // `json_extract` on a blob that is not JSON is a SQLite ERROR, and the freeze predicate lives in
+  // the WHERE clause of the UPDATE — so an unreadable `detail` used to take an ordinary PATCH out
+  // as a 500 with no answer at all. `json_valid`-guarded it is FROZEN, which is the safe
+  // direction: clause 3 cannot be evaluated, and an editable answer would send a new body under a
+  // key that may still be live.
+  const companyId = mint();
+  requests.claimAllSteps(companyId);
+  db.prepare(
+    "UPDATE formation_requests SET detail = ? WHERE company_id = ? AND step = 'create_provider'",
+  ).run("{not json", companyId);
+
+  let answer: unknown;
+  expect(() => {
+    answer = updateCompanyIntake(deps(), TENANT, companyId, { ...EDIT, ssn: SSN_2 });
+  }).not.toThrow();
+  expect(answer).toEqual({ error: companyIntakeFrozenMessage() });
+  expect(companies.find(companyId)!.businessPurpose).toBe("Original purpose.");
+});
+
 test("the whole update is ONE transaction: a frozen row leaves the SSN untouched", () => {
   // The half-applied states are both worse than either half failing: a re-opened intake with the
   // old SSN attached, or a new SSN attached to un-rewritten names.

@@ -10,6 +10,7 @@ import type {
   DoolaCompany,
   DoolaEnvironment,
 } from "../adapters/doola/types";
+import { isIntakeFrozen } from "../formation/freeze";
 import {
   type CompanyNameOption,
   DEFAULT_DESCRIPTION,
@@ -524,9 +525,10 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
  * The SSN is part of that body, and §4.4 deletes it in the very transaction that persists
  * `provider_ref`. Those two facts have to be reconciled, and this is the reconciliation:
  *
- *  - `frozen` is `detail.companySentAttempt === row.attempt` — "a company create has ALREADY gone
- *    out under the key we would use next". That is exactly the condition under which the body may
- *    not change;
+ *  - `frozen` is the shared freeze predicate (`formation/freeze.ts`), whose load-bearing clause
+ *    here is `detail.companySentAttempt === row.attempt` — "a company create has ALREADY gone out
+ *    under the key we would use next". That is exactly the condition under which the body may not
+ *    change;
  *  - when frozen, `ssnIncluded` and `expedited` are READ FROM `detail`, never recomputed. The row
  *    may have been erased since; the body must not notice;
  *  - when not frozen (a first send, or a retry after a `rejected` that burned the attempt and so
@@ -552,7 +554,9 @@ function resolveSsn(
 ): { ssn?: Secret; ssnIncluded: boolean; expedited: boolean } | { park: string; reason: string } {
   const companyId = d.company.companyId;
   const stored = d.parties.findSsnByCompanyId(companyId);
-  const frozen = detail.companySentAttempt === row.attempt;
+  // The SHARED predicate, not a local re-spelling of it: the PATCH door asks the same question of
+  // the same row in SQL, and two spellings of the idempotency contract is one spelling too many.
+  const frozen = isIntakeFrozen(row);
   const ssnIncluded = frozen ? Boolean(detail.ssnIncluded) : Boolean(stored);
   // A function of the SSN, so it is frozen by the same rule (§4.5).
   const expedited = frozen
