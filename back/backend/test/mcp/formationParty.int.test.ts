@@ -13,6 +13,7 @@ import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
 import { ssnNotOnThisDoorMessage } from "../../src/formation";
 import { createCompany, shimCompanyIntake } from "../../src/formation/company";
+import { describeIndustryLabels } from "../../src/formation/naicsLabels";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -462,7 +463,10 @@ test("create_company is gated on FORMATION; list_companies on the company store,
   expect(create.description).toMatch(/NEVER takes an SSN/);
   expect(create.description).toMatch(/web form/);
   // The industries are NAMED in the description: an agent-first caller has no GET /config, so
-  // the description is its only discovery surface for the one enumerated field.
+  // the description is its only discovery surface for the one enumerated field — rendered by the
+  // SAME capped function the REST refusal uses, so a refreshed list of hundreds cannot turn this
+  // description into something that crowds out every other tool in the client's context window.
+  expect(create.description).toContain(`(${describeIndustryLabels()})`);
   expect(create.description).toContain("Software development");
 
   const off = buildTestApp(undefined);

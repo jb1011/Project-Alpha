@@ -48,3 +48,20 @@ const LABEL_SET = new Set(NAICS_LABELS);
 export function isKnownIndustryLabel(label: string): boolean {
   return LABEL_SET.has(label.normalize("NFC").trim());
 }
+
+/**
+ * The labels as a human-readable list, CAPPED.
+ *
+ * Two surfaces name them — the REST refusal (which is REST's only discovery surface for the one
+ * enumerated field) and the MCP tool description (which is an agent's) — and both have the same
+ * problem the day the refresher runs: this list is a federal reference table, and a few hundred
+ * labels is an error message nobody reads and a tool description that crowds out the rest of the
+ * tool. Eight and a count, in one place, so the two surfaces cannot cap differently.
+ */
+export const LABEL_LIST_CAP = 8;
+
+export function describeIndustryLabels(labels: readonly string[] = NAICS_LABELS): string {
+  const shown = labels.slice(0, LABEL_LIST_CAP);
+  const rest = labels.length - shown.length;
+  return shown.join(", ") + (rest > 0 ? `, …and ${rest} more` : "");
+}

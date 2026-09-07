@@ -15,7 +15,7 @@ import {
   truncateTenant,
 } from "../formation";
 import { createCompany } from "../formation/company";
-import { NAICS_LABELS } from "../formation/naicsLabels";
+import { describeIndustryLabels } from "../formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
@@ -106,6 +106,37 @@ function custodyCapabilityNote(
       .filter(Boolean)
       .join(", ") || "none";
   return `('${deps.walletProviderDefault}'). Available on this deployment: ${available}.`;
+}
+
+/**
+ * `create_company`'s description, as ONE constant plus the deployment's own sentence.
+ *
+ * It was a 900-character template literal inline in the registration, which is where a tool's
+ * description is least readable and most likely to drift from the schema three lines below it.
+ *
+ * The industry list is CAPPED exactly as the REST refusal caps it (`describeIndustryLabels`),
+ * and that shared cap is the point: this description is an agent's ONLY discovery surface for
+ * the one enumerated field, and the day `refresh-naics.mts` is run against a real sandbox key it
+ * becomes a few hundred federal labels. Uncapped, that is a tool description that crowds out
+ * every other tool in the client's context window — paid for on every single request.
+ */
+const CREATE_COMPANY_DESCRIPTION =
+  "Create the legal body (a Wyoming LLC) your agents will be filed under, and get back a companyId to pass to onboard_agent." +
+  " %CAPABILITY%" +
+  " partyId is the handle from create_formation_party — the natural person legally answerable for the filing." +
+  " names is THREE candidates in order of preference: Wyoming refuses a name that is already taken, and the alternates are what let the filing proceed without a second fee." +
+  " businessPurpose is a short description of what the COMPANY does, filed with it." +
+  " industryLabel must be one of the industries we can file under (%INDUSTRIES%)." +
+  " This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling." +
+  " ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs; the field is declared only so that passing one is REFUSED rather than silently dropped." +
+  " If the responsible party is a US person and wants the fast EIN route, create the company through the web form (POST /companies) instead." +
+  " Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.";
+
+function createCompanyDescription(deps: Pick<McpToolDeps, "formation">): string {
+  return CREATE_COMPANY_DESCRIPTION.replace("%CAPABILITY%", formationCapabilityNote(deps)).replace(
+    "%INDUSTRIES%",
+    describeIndustryLabels(),
+  );
 }
 
 /** Formation availability sentence for the onboard_agent / create_formation_party descriptions. */
@@ -596,7 +627,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       "create_company",
       {
         title: "Create company",
-        description: `Create the legal body (a Wyoming LLC) your agents will be filed under, and get back a companyId to pass to onboard_agent. ${formationCapabilityNote(deps)} partyId is the handle from create_formation_party — the natural person legally answerable for the filing. names is THREE candidates in order of preference: Wyoming refuses a name that is already taken, and the alternates are what let the filing proceed without a second fee. businessPurpose is a short description of what the COMPANY does, filed with it. industryLabel must be one of the industries we can file under (${NAICS_LABELS.join(", ")}). This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling. ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs; the field is declared only so that passing one is REFUSED rather than silently dropped. If the responsible party is a US person and wants the fast EIN route, create the company through the web form (POST /companies) instead. Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.`,
+        description: createCompanyDescription(deps),
         inputSchema: {
           partyId: z.string(),
           /** THREE ranked candidates (§5). */

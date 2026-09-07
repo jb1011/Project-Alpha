@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type Config, canFormEntities } from "./config/env";
-import { NAICS_LABELS } from "./formation/naicsLabels";
+import { describeIndustryLabels } from "./formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "./formation/status";
 import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
@@ -219,10 +219,7 @@ export function industryLabelRequiredMessage(): string {
  * produce an error nobody can read.
  */
 export function industryLabelUnknownMessage(label: string): string {
-  const shown = NAICS_LABELS.slice(0, 8);
-  const rest = NAICS_LABELS.length - shown.length;
-  const list = shown.join(", ") + (rest > 0 ? `, …and ${rest} more` : "");
-  return `industryLabel ${JSON.stringify(label)} is not one of the industries we can file under — pick one of: ${list}`;
+  return `industryLabel ${JSON.stringify(label)} is not one of the industries we can file under — pick one of: ${describeIndustryLabels()}`;
 }
 
 // ── THE SSN (design §4.1) ───────────────────────────────────────────────────────────────────
