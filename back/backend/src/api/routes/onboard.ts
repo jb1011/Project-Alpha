@@ -21,8 +21,8 @@ import {
   firstIssueMessage,
 } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
-import { ApiError } from "../errors";
-import { listCompanyViews, toEntityView, toEntityViews } from "../views";
+import { ApiError, requireOwnedCompany } from "../errors";
+import { listCompanyViews, toCompanyDetailView, toEntityView, toEntityViews } from "../views";
 import { assertGuardianAllowed } from "./worldId";
 
 export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
@@ -206,6 +206,24 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     return c.json({
       companies: listCompanyViews({ ...deps, companies: deps.companies }, tenantId),
     });
+  });
+
+  /**
+   * ONE COMPANY, in full (design §7) — what the Companies section's detail page reads.
+   *
+   * Registered wherever a company STORE is, exactly like `GET /companies` and for the same
+   * reason: a box whose doola credentials have been pulled still holds real Wyoming LLCs, and a
+   * tenant must be able to read the filings they already have. It is `deps.companies`, not
+   * `deps.formation`, that gates it.
+   *
+   * `requireOwnedCompany` answers the same uniform 404 for unknown and not-yours that every other
+   * ownership check in this file does.
+   */
+  app.get("/companies/:companyId", (c) => {
+    const company = requireOwnedCompany(deps, c);
+    // The SHARED deps object, narrowed only where the route already proved the store exists:
+    // `requireOwnedCompany` answered a 404 without it.
+    return c.json(toCompanyDetailView({ ...deps, companies: deps.companies! }, company));
   });
 
   /**

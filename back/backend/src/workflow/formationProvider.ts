@@ -10,7 +10,7 @@ import type {
   DoolaCompany,
   DoolaEnvironment,
 } from "../adapters/doola/types";
-import { isIntakeFrozen } from "../formation/freeze";
+import { awaitsSsnDecision, isIntakeFrozen } from "../formation/freeze";
 import {
   type CompanyNameOption,
   DEFAULT_DESCRIPTION,
@@ -648,7 +648,11 @@ function resolveSsn(
   if (!ssnIncluded) {
     // NOT frozen, no stored SSN — and the clock is why. See the block comment above: filing now
     // would quietly send a body the caller did not choose.
-    if (!frozen && party.ssnErasedReason === "ttl")
+    //
+    // ONE predicate, shared with the company detail view (A3): a surface that re-derived this
+    // would be a second opinion about a filing's state, and the one that gets it wrong tells the
+    // owner to wait for something that is waiting for them.
+    if (awaitsSsnDecision(row, { ssnErasedReason: party.ssnErasedReason, hasSsn: Boolean(stored) }))
       return {
         park: ssnErasedBeforeSendError(),
         reason: "ssn_erased_before_send",

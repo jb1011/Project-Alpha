@@ -11,6 +11,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import type { GuardianPasskey } from "../../src/adapters/turnkey/provisioner";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { signSession } from "../../src/auth/session";
 import { ssnNotOnThisDoorMessage } from "../../src/formation";
 import { createCompany } from "../../src/formation/company";
 import { describeIndustryLabels } from "../../src/formation/naicsLabels";
@@ -435,6 +436,7 @@ const COMPANY_VIEW_KEYS = [
   "legalNameFiled",
   "nameOptions",
   "paying",
+  "state",
   "status",
   "synthetic",
 ];
@@ -593,5 +595,78 @@ test("MCP and REST mint the SAME company — one domain function, one set of ref
       ),
     );
     expect(repo.findByIdempotencyKey(out.id)?.companyId).toBe(companyId);
+  });
+});
+
+test("PARITY: get_company and GET /companies/:companyId answer with the SAME body", async () => {
+  // The `EntityViewDeps` lesson, applied to the company detail. `list_companies` had already
+  // drifted from `GET /companies` once — silently dropping the business purpose, the industry
+  // and both filing facts — and nothing failed: the agent surface was simply less true than the
+  // browser one. Both doors now render through ONE function over ONE dependency object, and this
+  // asserts the result rather than the wiring, on the same app and the same row.
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const { token } = await signSession(TENANT, "s", 3600, Math.floor(Date.now() / 1000));
+
+  await withClient(app, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    const { companyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_company", arguments: { partyId, ...MCP_INTAKE } })),
+    );
+
+    const overMcp = JSON.parse(
+      textOf(await c.callTool({ name: "get_company", arguments: { companyId } })),
+    );
+    const overRest = await (
+      await app.request(`/companies/${companyId}`, {
+        headers: { authorization: `Bearer ${token}` },
+      })
+    ).json();
+    expect(overMcp).toEqual(overRest);
+    // …and it really is the detail shape, not the list row: the four fields a list has no room
+    // for, plus the park state that is the whole reason the page exists.
+    expect(Object.keys(overMcp).sort()).toEqual(
+      [
+        ...COMPANY_VIEW_KEYS,
+        "attachedAgents",
+        "documents",
+        "ein",
+        "intakeSynthesized",
+        "park",
+        "providerRef",
+        "requiredActions",
+      ].sort(),
+    );
+    expect(overMcp.park).toEqual({
+      awaitingIntakeEdit: false,
+      awaitingPartyEdit: false,
+      awaitingSsnDecision: false,
+    });
+  });
+});
+
+test("PARITY: get_company is tenant-scoped, and unknown reads exactly like not-yours", async () => {
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const otherApp = buildTestApp({ required: true });
+  const { key: otherKey } = apiKeys.mint(OTHER, { capability: "provision" });
+
+  const companyId = await withClient(app, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    return JSON.parse(
+      textOf(await c.callTool({ name: "create_company", arguments: { partyId, ...MCP_INTAKE } })),
+    ).companyId as string;
+  });
+
+  await withClient(otherApp, otherKey, async (c) => {
+    const theirs = await c.callTool({ name: "get_company", arguments: { companyId } });
+    const missing = await c.callTool({ name: "get_company", arguments: { companyId: "nope" } });
+    expect((theirs as { isError?: boolean }).isError).toBe(true);
+    // One answer for both, or the tool is an existence oracle over other tenants' company ids.
+    expect(textOf(theirs)).toBe(textOf(missing));
   });
 });

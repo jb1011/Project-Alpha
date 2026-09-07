@@ -75,6 +75,38 @@ export function isIntakeFrozen(row: FreezableStep | undefined): boolean {
 }
 
 /**
+ * IS THIS FILING WAITING ON THE OWNER'S SSN DECISION? (design §4.6a.)
+ *
+ * The third park, and the only one that is not a flag in `detail`. A company reaches its first
+ * send with no SSN for two indistinguishable reasons — nobody supplied one, or the seven-day
+ * retention clock destroyed the one they did — and the difference is the whole decision, because
+ * the second files a US person under the slow EIN route they explicitly opted out of. So the
+ * filer PARKS, and the two exits are both `PATCH /companies/:companyId`: re-supply a number, or
+ * say `proceedWithoutSsn`.
+ *
+ * It lives here, beside `isIntakeFrozen`, because it is read off the same `create_provider` row
+ * by the same rule, and because TWO callers now need it: the FILER (`resolveSsn`, deciding
+ * whether to send) and the company detail VIEW (explaining to the owner why nothing is happening
+ * and what they can do about it). A view that re-derived it would be a second opinion about a
+ * filing's state, and the one that gets it wrong tells an owner to wait for something that is
+ * waiting for them.
+ *
+ * Deliberately NOT a PII read: `erasedReason` is an enum and `hasSsn` is a boolean, which is the
+ * whole of what the question needs.
+ */
+export function awaitsSsnDecision(
+  step: FreezableStep | undefined,
+  party: { ssnErasedReason: string | null; hasSsn: boolean } | undefined,
+): boolean {
+  if (!party) return false;
+  // A frozen body's SSN question was settled at the first send and is read back from `detail`;
+  // this park is only ever about a body that has NOT gone out yet.
+  if (isIntakeFrozen(step)) return false;
+  if (party.hasSsn) return false;
+  return party.ssnErasedReason === "ttl";
+}
+
+/**
  * "Has this company's filing ever been in flight at doola?" — read from three independent
  * witnesses, ANY of which is enough (§4.6a).
  *

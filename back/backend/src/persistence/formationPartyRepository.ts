@@ -256,6 +256,20 @@ export interface FormationPartyRepository {
 
   /** Every party still holding an SSN, with what the TTL clock needs to judge it (§4.6a). */
   listSsnRetention(): SsnRetentionRow[];
+
+  /**
+   * The §4.6a DECISION STATE of a company's responsible party — an enum and a boolean, and
+   * deliberately nothing else (A3).
+   *
+   * `awaitsSsnDecision` (formation/freeze.ts) is the predicate; this is the half of its input
+   * that lives in the PII table. It exists as its own method rather than as a `findByCompanyId`
+   * at the call site because the company detail VIEW asks it, and a view holding a whole party
+   * record is a legal name one careless spread away from a response body. Undefined = no party
+   * (or an erased one), which is not a state that can be waiting for a decision.
+   */
+  ssnState(
+    companyId: string,
+  ): { ssnErasedReason: SsnErasedReason | null; hasSsn: boolean } | undefined;
 }
 
 export class SqliteFormationPartyRepository implements FormationPartyRepository {
@@ -371,6 +385,13 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
         `UPDATE formation_parties SET ssn_erased_reason = 'none'
           WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NULL`,
       ),
+      // The §4.6a decision state, with NO personal column in the SELECT list at all: an enum and
+      // a NULL-check, which is the whole of what `awaitsSsnDecision` reads.
+      ssnState: db.prepare(
+        `SELECT ssn_erased_reason AS reason, ssn_ciphertext IS NOT NULL AS has_ssn
+           FROM formation_parties
+          WHERE company_id = ? AND deleted_at IS NULL`,
+      ),
       // Only rows that still HOLD an SSN — a handful at any moment, being exactly the companies
       // between an intake and a `provider_ref`.
       ssnRetention: db.prepare(
@@ -483,6 +504,17 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
 
   proceedWithoutSsn(companyId: string): boolean {
     return this.stmts.proceedWithoutSsn.run(companyId).changes === 1;
+  }
+
+  ssnState(
+    companyId: string,
+  ): { ssnErasedReason: SsnErasedReason | null; hasSsn: boolean } | undefined {
+    const r = this.stmts.ssnState.get(companyId) as
+      | { reason: string | null; has_ssn: number }
+      | undefined;
+    return r
+      ? { ssnErasedReason: (r.reason as SsnErasedReason | null) ?? null, hasSsn: r.has_ssn === 1 }
+      : undefined;
   }
 
   listSsnRetention(): SsnRetentionRow[] {

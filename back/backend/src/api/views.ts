@@ -1,9 +1,15 @@
+import { awaitsSsnDecision } from "../formation/freeze";
 import {
+  type CompanyState,
   type FormationStatus,
   type FormationSummary,
+  companyState,
   deriveFormationStatus,
   formationSummary,
+  hasLivePayment,
   livePaymentLookup,
+  providerRefOf,
+  requiredActionCodesOf,
 } from "../formation/status";
 import type { CompanyRecord } from "../persistence/companyRepository";
 import {
@@ -11,6 +17,7 @@ import {
   type DocumentIndexRepository,
   documentFileName,
 } from "../persistence/documentIndexRepository";
+import { parseDetail } from "../persistence/formationRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
 import { usesManifestScheme } from "../workflow/onboarding";
@@ -84,6 +91,14 @@ export interface CompanyView {
   formationStatus: FormationStatus;
   /** DERIVED from `formation_payments`; nothing about payment is stored on the company either. */
   paying: boolean;
+  /**
+   * The three facts above, combined into the ONE word §7's Companies section renders.
+   *
+   * Kept BESIDE its inputs rather than replacing them: a picker filtering for "attachable" wants
+   * the raw `status`, and the honesty invariant is asserted against `environment`. The
+   * combination is what three renderers would otherwise each do for themselves.
+   */
+  state: CompanyState;
   filedAt: number | null;
   filingNumber: string | null;
   /** How many agents SHARE this filing. Authenticated surfaces only (§7 sharing labels). */
@@ -113,24 +128,31 @@ export function listCompanyViews(deps: CompanyListDeps, tenantId: string): Compa
   const steps = deps.formationStepsMany?.(ids);
   const agents = deps.companies.countAgentsMany(ids);
   const paying = livePaymentLookup(deps.companies, ids);
-  return rows.map((company) => ({
-    companyId: company.companyId,
-    status: company.status,
-    environment: company.environment,
-    synthetic: company.synthetic,
-    nameOptions: company.nameOptions,
-    legalNameFiled: company.legalNameFiled,
-    businessPurpose: company.businessPurpose,
-    industryLabel: company.industryLabel,
-    formationStatus: deriveFormationStatus(
-      steps?.get(company.companyId) ?? deps.formationSteps?.(company.companyId) ?? [],
-    ),
-    paying: paying(company.companyId),
-    filedAt: company.filedAt,
-    filingNumber: company.filingNumber,
-    agents: agents.get(company.companyId) ?? 0,
-    createdAt: company.createdAt,
-  }));
+  return rows.map((company) => {
+    // ONE steps read and ONE payment read per row, named once each: `formationStatus` and
+    // `state` are two projections of the same rows, and asking twice is two queries AND two
+    // possibly-different answers.
+    const rowSteps =
+      steps?.get(company.companyId) ?? deps.formationSteps?.(company.companyId) ?? [];
+    const rowPaying = paying(company.companyId);
+    return {
+      companyId: company.companyId,
+      status: company.status,
+      environment: company.environment,
+      synthetic: company.synthetic,
+      nameOptions: company.nameOptions,
+      legalNameFiled: company.legalNameFiled,
+      businessPurpose: company.businessPurpose,
+      industryLabel: company.industryLabel,
+      formationStatus: deriveFormationStatus(rowSteps),
+      paying: rowPaying,
+      state: companyState(company, rowSteps, rowPaying),
+      filedAt: company.filedAt,
+      filingNumber: company.filingNumber,
+      agents: agents.get(company.companyId) ?? 0,
+      createdAt: company.createdAt,
+    };
+  });
 }
 
 /**
@@ -368,4 +390,129 @@ export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): 
     documents: docs ? { listByCompany: (c) => docs.get(c) ?? [] } : deps.documents,
   };
   return rows.map((r) => toEntityView(r, batched));
+}
+
+/**
+ * ONE COMPANY, in full (design §7) — what the Companies section's detail page renders, and what
+ * MCP `get_company` answers with.
+ *
+ * It EXTENDS the list row rather than restating it, so the two cannot describe the same company
+ * differently, and adds the four things a list has no room for: the documents, the agents sharing
+ * the filing, the open required actions, and — the reason this view exists at all — the PARK
+ * STATE.
+ *
+ * **The park state is the product decision here.** A2 gave a filing three ways to stop and wait
+ * for a human, all of them correct and none of them visible: a rejected intake
+ * (`awaitingIntakeEdit`), a rejected responsible party (`awaitingPartyEdit`), and an SSN the
+ * seven-day clock erased before the first send (§4.6a). To the owner all three looked identical —
+ * a company that had simply stopped — and two of the three have an exit they alone can take. So
+ * the view says which one it is, and the section renders the sentence and the form that clears it.
+ *
+ * NO PII, exactly as everywhere else. `awaitingPartyEdit` says a party field was refused; it does
+ * not say WHICH, because doola's rejection prose is free text their operators write and can name
+ * the responsible party. The SSN park is read through `parties.ssnState`, which selects an enum
+ * and a NULL-check and no personal column at all.
+ */
+export interface CompanyDetailView extends CompanyView {
+  /** True = the intake was DERIVED by the migration, not typed by a human. The section says so:
+   *  a company nobody described is one whose names are worth checking before it files. */
+  intakeSynthesized: boolean;
+  /** doola's company id, once the create has returned one. An opaque provider reference. */
+  providerRef: string | null;
+  /** The real EIN, once the IRS issues one. ⚠ Owner-scoped surfaces only, like `EntityView`'s. */
+  ein: string | null;
+  /** Open required-action CODES only — never doola's free-text reason (see `FormationSummary`). */
+  requiredActions: string[];
+  /** The legal documents fetched so far. Metadata only; the bytes come from the download route,
+   *  which re-asserts ownership of its own. */
+  documents: DocumentView[];
+  /** The agents attached to this filing. `agents` (inherited) is this array's length. */
+  attachedAgents: { id: string; name: string; status: EntityRecord["status"] }[];
+  /** What stopped this filing and who can restart it. All three are false on a healthy company. */
+  park: {
+    /** A doola-rejected INTAKE. Exit: `PATCH /companies/:companyId` with new names/purpose/
+     *  industry — one edit buys one retry. */
+    awaitingIntakeEdit: boolean;
+    /** A doola-rejected responsible PARTY. Exit: `PATCH /formation-party/:partyId`. */
+    awaitingPartyEdit: boolean;
+    /** The §4.6a clock erased an SSN before the filing was ever sent. Exit:
+     *  `PATCH /companies/:companyId` with a fresh `ssn`, or `proceedWithoutSsn: true`. */
+    awaitingSsnDecision: boolean;
+  };
+}
+
+/**
+ * What a company detail needs beyond the company row — shaped so that the SHARED dependency
+ * object both doors already hold satisfies it structurally.
+ *
+ * That is the parity mechanism, and it is the `EntityViewDeps` lesson applied one view along:
+ * REST `GET /companies/:companyId` and MCP `get_company` are handed the same object, so a field
+ * cannot be wired on one surface and forgotten on the other. `parties` sits under `formation`
+ * because that is where the composition root puts it, and it is optional because a box that
+ * merely DESCRIBES old filings has no PII surface at all — such a company simply reports no SSN
+ * park, which is the truth.
+ */
+export interface CompanyDetailDeps {
+  companies: import("../persistence/companyRepository").CompanyRepository;
+  formationSteps?: FormationStepsLookup;
+  documents?: Pick<DocumentIndexRepository, "listByCompany">;
+  repo: Pick<import("../persistence/entityRepository").EntityRepository, "listByCompany">;
+  formation?: {
+    parties: Pick<
+      import("../persistence/formationPartyRepository").FormationPartyRepository,
+      "ssnState"
+    >;
+  };
+}
+
+export function toCompanyDetailView(
+  deps: CompanyDetailDeps,
+  company: CompanyRecord,
+): CompanyDetailView {
+  const steps = deps.formationSteps?.(company.companyId) ?? [];
+  const attachedAgents = deps.repo.listByCompany(company.companyId).map((e) => ({
+    id: e.idempotencyKey,
+    name: e.name,
+    status: e.status,
+  }));
+  const create = steps.find((s) => s.step === "create_provider");
+  const detail = parseDetail<{ awaitingIntakeEdit?: boolean; awaitingPartyEdit?: boolean }>(
+    create?.detail ?? null,
+  );
+  const paying = hasLivePayment(deps.companies, company.companyId);
+  return {
+    companyId: company.companyId,
+    status: company.status,
+    environment: company.environment,
+    synthetic: company.synthetic,
+    nameOptions: company.nameOptions,
+    legalNameFiled: company.legalNameFiled,
+    businessPurpose: company.businessPurpose,
+    industryLabel: company.industryLabel,
+    formationStatus: deriveFormationStatus(steps),
+    paying,
+    state: companyState(company, steps, paying),
+    filedAt: company.filedAt,
+    filingNumber: company.filingNumber,
+    // The list's own field, and this page's `attachedAgents.length` — one number, counted from
+    // the rows it names rather than from a second query that could disagree with them.
+    agents: attachedAgents.length,
+    createdAt: company.createdAt,
+    intakeSynthesized: company.intakeSynthesized,
+    providerRef: providerRefOf(steps),
+    ein: company.ein,
+    requiredActions: requiredActionCodesOf(steps),
+    documents: (deps.documents?.listByCompany(company.companyId) ?? []).map(toDocumentView),
+    attachedAgents,
+    park: {
+      awaitingIntakeEdit: detail.awaitingIntakeEdit === true,
+      awaitingPartyEdit: detail.awaitingPartyEdit === true,
+      // The SHARED predicate — the filer asks the same question of the same row, and two
+      // spellings of "is this waiting for the owner?" is one spelling too many.
+      awaitingSsnDecision: awaitsSsnDecision(
+        create,
+        deps.formation?.parties.ssnState(company.companyId),
+      ),
+    },
+  };
 }

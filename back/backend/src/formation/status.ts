@@ -159,6 +159,52 @@ export function formationSummary(
 }
 
 /**
+ * THE COMPANY STATE (design §7) — the ONE vocabulary the Companies section renders.
+ *
+ * Three independent facts describe a company: the row's own `status` (`draft | ready |
+ * abandoned`), whether a payment is live, and the DERIVED filing status of its sub-saga. Every
+ * surface that wants to say "where is this company?" has to combine them, and three renderers
+ * combining three facts for themselves is how a picker, a list and a detail page end up
+ * disagreeing about the same row.
+ *
+ * So the combination happens once, here, and the answer is one of eight words. (§7 names a ninth,
+ * `empty`, which is the state of a LIST with no rows — not of a company, and not this function's
+ * to return.)
+ *
+ * The ORDER is the honesty rule, and it is the same shape `deriveFormationStatus` uses:
+ *
+ *  1. `abandoned` first. It is terminal and it is the company's own column; whatever a stale
+ *     sub-saga row says, this company is over.
+ *  2. `paying` next, because a live quote means the company has not been paid for and cannot be
+ *     filed — an unpaid `draft` and an unpaid `ready` are the same fact to the owner.
+ *  3. `draft` — intake taken, nothing owed yet, nothing opened.
+ *  4. otherwise the filing status, with `none` rendered as `ready`: a `ready` company whose
+ *     `create_provider` row has not been opened yet is exactly "fileable, not yet filing", and
+ *     showing the raw `none` there would read as "nothing will ever happen".
+ */
+export type CompanyState =
+  | "draft"
+  | "paying"
+  | "ready"
+  | "in_progress"
+  | "filed"
+  | "complete"
+  | "failed"
+  | "abandoned";
+
+export function companyState(
+  company: Pick<CompanyRecord, "status">,
+  steps: FormationRequestRecord[],
+  paying: boolean,
+): CompanyState {
+  if (company.status === "abandoned") return "abandoned";
+  if (paying) return "paying";
+  if (company.status === "draft") return "draft";
+  const filing = deriveFormationStatus(steps);
+  return filing === "none" ? "ready" : filing;
+}
+
+/**
  * Is a payment LIVE for this company (design 2026-08-26 §2)?
  *
  * "Paying" is DERIVED and never stored: a refund or an expired quote needs no second write, and a

@@ -512,6 +512,7 @@ test("POST /companies mints a company through the ONE domain function, and lists
     "legalNameFiled",
     "nameOptions",
     "paying",
+    "state",
     "status",
     "synthetic",
   ]);

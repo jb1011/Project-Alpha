@@ -5,7 +5,13 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
-import { type EntityViewDeps, listCompanyViews, toEntityView, toEntityViews } from "../api/views";
+import {
+  type EntityViewDeps,
+  listCompanyViews,
+  toCompanyDetailView,
+  toEntityView,
+  toEntityViews,
+} from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
 import {
   createFormationParty,
@@ -722,6 +728,49 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
               text: JSON.stringify({
                 companies: listCompanyViews({ ...deps, companies: deps.companies! }, tenantId),
               }),
+            },
+          ],
+        };
+      },
+    );
+  }
+
+  /**
+   * `get_company` — the MCP twin of REST `GET /companies/:companyId`, rendered by the SAME
+   * function over the SAME dependency object (§7).
+   *
+   * Registered beside `list_companies` and gated the same way, on the company STORE rather than
+   * on `deps.formation`: reading the legal bodies you already own is not a formation capability.
+   *
+   * A parity test asserts the two doors answer with an identical key set. That is not ceremony —
+   * `list_companies` had already silently drifted from `GET /companies` once, dropping the
+   * business purpose, the industry and both filing facts, and nothing failed: the agent surface
+   * was simply less true than the browser one.
+   */
+  if (deps.companies) {
+    server.registerTool(
+      "get_company",
+      {
+        title: "Get company",
+        description:
+          "Fetch one of your legal bodies in full: its filing state, the documents filed for it, the agents attached to it, and — if the filing has STOPPED — which of the three human decisions it is waiting on. A parked company does nothing until its owner acts: awaitingIntakeEdit is fixed by re-submitting names/purpose/industry, awaitingPartyEdit by correcting the responsible party, awaitingSsnDecision by re-supplying an SSN or confirming the slower EIN route. The last two go through the web form and the party-edit call respectively; an SSN is never an argument here.",
+        inputSchema: { companyId: z.string() },
+      },
+      async ({ companyId }) => {
+        if (!hasCapability(scope, "read"))
+          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        // Tenant-scoped, and the SAME uniform answer REST gives: unknown and not-yours are one
+        // reply, or the tool becomes an existence oracle over other tenants' company ids.
+        const company = deps.companies!.findOwned(tenantId, companyId);
+        if (!company)
+          return { content: [{ type: "text", text: "company not found" }], isError: true };
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                toCompanyDetailView({ ...deps, companies: deps.companies! }, company),
+              ),
             },
           ],
         };

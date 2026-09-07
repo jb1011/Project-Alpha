@@ -86,6 +86,10 @@ test("a formed row serves provider + environment + the derived status", () => {
   expect(v.formation).toEqual({
     provider: "doola",
     environment: "sandbox",
+    // OUR company id (A3): the document routes, the compliance calendar and the Companies
+    // section are all addressed by it, so a dashboard holding this view can reach them.
+    // Owner-scoped, like `ein` and `documents` below.
+    companyId: COMPANY.companyId,
     status: "none",
     providerRef: null,
     filedAt: null,
@@ -249,6 +253,7 @@ test("providerRef comes from the create_provider row; the legal facts come from 
   expect(v.formation).toEqual({
     provider: "doola",
     environment: "sandbox",
+    companyId: COMPANY.companyId,
     status: "complete",
     providerRef: "cmp_1",
     filedAt: 1_755_600_000,
