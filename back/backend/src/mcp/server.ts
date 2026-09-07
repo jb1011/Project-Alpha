@@ -11,6 +11,7 @@ import {
   createFormationParty,
   formationDoorRefusal,
   formationUnavailableMessage,
+  ssnNotOnThisDoorMessage,
   truncateTenant,
 } from "../formation";
 import { createCompany } from "../formation/company";
@@ -595,7 +596,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       "create_company",
       {
         title: "Create company",
-        description: `Create the legal body (a Wyoming LLC) your agents will be filed under, and get back a companyId to pass to onboard_agent. ${formationCapabilityNote(deps)} partyId is the handle from create_formation_party — the natural person legally answerable for the filing. names is THREE candidates in order of preference: Wyoming refuses a name that is already taken, and the alternates are what let the filing proceed without a second fee. businessPurpose is a short description of what the COMPANY does, filed with it. industryLabel must be one of the industries we can file under (${NAICS_LABELS.join(", ")}). This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling. ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs. If the responsible party is a US person and wants the fast EIN route, create the company through the web form (POST /companies) instead. Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.`,
+        description: `Create the legal body (a Wyoming LLC) your agents will be filed under, and get back a companyId to pass to onboard_agent. ${formationCapabilityNote(deps)} partyId is the handle from create_formation_party — the natural person legally answerable for the filing. names is THREE candidates in order of preference: Wyoming refuses a name that is already taken, and the alternates are what let the filing proceed without a second fee. businessPurpose is a short description of what the COMPANY does, filed with it. industryLabel must be one of the industries we can file under (${NAICS_LABELS.join(", ")}). This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling. ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs; the field is declared only so that passing one is REFUSED rather than silently dropped. If the responsible party is a US person and wants the fast EIN route, create the company through the web form (POST /companies) instead. Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.`,
         inputSchema: {
           partyId: z.string(),
           /** THREE ranked candidates (§5). */
@@ -606,12 +607,30 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           industryLabel: z.string(),
           /** The sandbox deployment's marker, checked against this box's own setting. */
           synthetic: z.boolean().optional(),
-          // ⚠ NO `ssn`, deliberately and permanently (§4.1). See the description above.
+          /**
+           * ⚠ DECLARED IN ORDER TO BE REFUSED (§4.1), and for no other reason.
+           *
+           * This door never takes an SSN. But an UNDECLARED field is not rejected by the SDK — it
+           * is SILENTLY STRIPPED before the handler ever sees it, because the tool's zod schema
+           * parses the arguments and discards what it does not know. So a model that reads "US
+           * persons should supply an SSN" on the web form and helpfully passes one here would
+           * have got back a companyId, filed under the slow EIN route, with no indication that
+           * the field had been thrown away — and with the number still sitting in the client's
+           * context window and its logs, which is the entire harm §4.1 exists to prevent.
+           *
+           * Declaring it is what turns a silent strip into a loud refusal that says where the
+           * field DOES belong.
+           */
+          ssn: z.string().optional(),
         },
       },
-      async ({ partyId, names, businessPurpose, industryLabel, synthetic }) => {
+      async ({ partyId, names, businessPurpose, industryLabel, synthetic, ssn }) => {
         if (!hasCapability(scope, "provision") || scope.entityId !== null)
           return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        // BEFORE anything is created, and before any other validation: the refusal must be the
+        // whole answer, so that nothing exists afterwards for the caller to have to clean up.
+        if (ssn !== undefined)
+          return { content: [{ type: "text", text: ssnNotOnThisDoorMessage() }], isError: true };
         try {
           const result = createCompany(
             // The composition root's ONE dependency set; this door supplies only its transaction.

@@ -11,6 +11,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import type { GuardianPasskey } from "../../src/adapters/turnkey/provisioner";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { ssnNotOnThisDoorMessage } from "../../src/formation";
 import { createCompany, shimCompanyIntake } from "../../src/formation/company";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
@@ -444,15 +445,19 @@ test("create_company is gated on FORMATION; list_companies on the company store,
   const create = tools.find((t) => t.name === "create_company")!;
   expect(create).toBeDefined();
   expect(tools.map((t) => t.name)).toContain("list_companies");
-  // The PRODUCTION intake (A2 §5), and — ⚠ PERMANENTLY — no `ssn`: an SSN in a tool argument
-  // would sit in an LLM client's context window and in its logs. The web form is the only place
-  // one is ever collected (§4.1), and the description says so.
+  // The PRODUCTION intake (A2 §5). `ssn` IS declared — and declared in order to be REFUSED: an
+  // undeclared field is not rejected by the SDK, it is silently STRIPPED by the tool's zod schema
+  // before the handler ever sees it, so a model that helpfully passed one would have got back a
+  // companyId with no indication the number had been thrown away and the slow EIN route taken —
+  // while the number sat in the client's context window and its logs, which is the entire harm
+  // §4.1 exists to prevent. The web form is the only place one is ever collected.
   expect(Object.keys(create.inputSchema.properties ?? {})).toEqual([
     "partyId",
     "names",
     "businessPurpose",
     "industryLabel",
     "synthetic",
+    "ssn",
   ]);
   expect(create.description).toMatch(/NEVER takes an SSN/);
   expect(create.description).toMatch(/web form/);
@@ -471,6 +476,44 @@ test("create_company is gated on FORMATION; list_companies on the company store,
   // not be quietly less capable than the browser one.
   expect(offNames).not.toContain("create_company");
   expect(offNames).toContain("list_companies");
+});
+
+test("an `ssn` argument is REFUSED, loudly, and NOTHING is created", async () => {
+  // The bug this pins: `ssn` was not declared on the tool, and an undeclared field is not
+  // rejected by the SDK — it is silently STRIPPED by the tool's zod schema before the handler
+  // sees it. A model that had read "US persons should supply an SSN" on the web form and helpfully
+  // passed one here would have got back a companyId, filed under the slow EIN route, with no
+  // indication the field had been thrown away — and with the number still sitting in the client's
+  // context window and its logs, which is the entire harm §4.1 exists to prevent.
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+
+  await withClient(app, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    const refused = await c.callTool({
+      name: "create_company",
+      arguments: { partyId, ...MCP_INTAKE, ssn: "123-45-6789" },
+    });
+    expect(refused.isError).toBe(true);
+    // It says where the field DOES belong — a refusal a caller cannot act on is a dead end.
+    expect(textOf(refused)).toBe(ssnNotOnThisDoorMessage());
+    // The refusal is the WHOLE answer: nothing exists afterwards to clean up, and the quota was
+    // not spent. The check therefore runs before any other validation.
+    expect(
+      JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} }))).companies,
+    ).toHaveLength(0);
+    // …and no digits of it are anywhere in the answer.
+    expect(textOf(refused)).not.toMatch(/\d{3}-\d{2}-\d{4}/);
+
+    // The very same call WITHOUT the field is accepted, so the refusal is about the ssn alone.
+    const ok = await c.callTool({
+      name: "create_company",
+      arguments: { partyId, ...MCP_INTAKE },
+    });
+    expect(JSON.parse(textOf(ok)).companyId).toBeTruthy();
+  });
 });
 
 test("MCP and REST mint the SAME company — one domain function, one set of refusals", async () => {
