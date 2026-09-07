@@ -5,6 +5,7 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
+import { inspect } from "node:util";
 
 /**
  * SSN ENCRYPTION (design 2026-08-26 §4.2) — the only place a Social Security Number is ever in
@@ -71,6 +72,55 @@ export interface EncryptedSsn {
   keyId: string;
 }
 
+// ── the plaintext, wrapped ──────────────────────────────────────────────────────────────────
+
+const SECRET = Symbol("novi.secret");
+
+/**
+ * A decrypted SSN, wrapped so that the ONLY way to get the digits is to ask for them.
+ *
+ * The threat this closes is not malice, it is reflex. A plain `string` reaches a log line through
+ * a dozen ordinary gestures nobody thinks of as logging: `JSON.stringify(body)` in a debug print,
+ * `${ssn}` in an error message, `console.log(obj)` on a frame that happens to hold it, a snapshot
+ * assertion in a test, an APM breadcrumb. Every one of those goes through `toString`, `toJSON` or
+ * `util.inspect`, and all three of them answer `"[redacted]"` here.
+ *
+ * `reveal()` is the single deliberate exit, and it has exactly ONE caller: `buildCompanyInput`,
+ * at the wire boundary, where the value is placed into the body doola is about to receive. A
+ * second caller is a review question, which is the point — `grep -rn "\.reveal()"` is the whole
+ * audit.
+ */
+export interface Secret {
+  readonly [SECRET]: true;
+  /** The plaintext. The ONE deliberate exit — see the interface comment. */
+  reveal(): string;
+  toString(): string;
+  toJSON(): string;
+}
+
+/** The redacted stand-in every accidental stringification produces. */
+const REDACTED = "[redacted]";
+
+/**
+ * Wrap a plaintext value.
+ *
+ * The digits live in the closure, not on the object, so there is no property for a spread, a
+ * structured clone or a snapshot serializer to find: `{...secret}` is `{}` and
+ * `JSON.stringify({ssn: secret})` is `{"ssn":"[redacted]"}`.
+ */
+export function toSecret(value: string): Secret {
+  const self: Secret = {
+    [SECRET]: true,
+    reveal: () => value,
+    toString: () => REDACTED,
+    toJSON: () => REDACTED,
+  };
+  // `util.inspect` is what `console.log(obj)` and vitest's diff both go through, and it ignores
+  // `toString`. Defined non-enumerably so it does not itself show up in a serialization.
+  Object.defineProperty(self, inspect.custom, { value: () => REDACTED, enumerable: false });
+  return self;
+}
+
 /**
  * Parse one env value into a key.
  *
@@ -119,10 +169,16 @@ function aad(partyId: string, companyId: string): Buffer {
 }
 
 /**
- * Encrypt an SSN for one (party, company).
+ * ENCRYPT an SSN for one (party, company).
  *
  * Always with `keyring.current`: `previous` exists to READ rows written before a rotation, and
  * writing with it would extend the window it exists to close.
+ *
+ * It takes a PLAIN string, not a `Secret`, and the asymmetry with `decryptSsn` is deliberate:
+ * this is the direction where the value has just arrived from a door and has not been anywhere
+ * yet, so wrapping it here would be ceremony over a value that is about to stop existing. The
+ * wrapper exists for the OTHER direction, where a decrypted value is handed to code that will
+ * carry it through a call stack.
  */
 export function encryptSsn(
   keyring: PiiKeyring,
@@ -149,12 +205,15 @@ export function encryptSsn(
  * THROWS on any failure, and the message never contains plaintext, ciphertext or key material.
  * The caller's only correct reaction is to refuse to send a body — never to send one WITHOUT the
  * SSN, which under a live idempotency key is a different body (see formationProvider).
+ *
+ * Returns a `Secret`, not a string: from here the value travels through a call stack, and every
+ * accidental stringification on the way answers `"[redacted]"`.
  */
 export function decryptSsn(
   keyring: PiiKeyring,
   stored: EncryptedSsn,
   bind: { partyId: string; companyId: string },
-): string {
+): Secret {
   const key = selectKey(keyring, stored.keyId);
   if (!key)
     throw new Error(
@@ -169,7 +228,7 @@ export function decryptSsn(
   decipher.setAuthTag(tag);
   // `final()` is what verifies the tag; a wrong key, a moved row or a tampered blob all throw
   // here rather than returning bytes.
-  return Buffer.concat([decipher.update(body), decipher.final()]).toString("utf8");
+  return toSecret(Buffer.concat([decipher.update(body), decipher.final()]).toString("utf8"));
 }
 
 /** Exact-id lookup, in constant time over the two candidates. */

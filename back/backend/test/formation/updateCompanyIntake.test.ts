@@ -131,7 +131,7 @@ test("after a REJECTED create, the intake is re-openable and the SSN re-captured
   // The NEW SSN is what the next body will carry, sealed under the same (party, company).
   const after = parties.findSsnByCompanyId(companyId)!;
   expect(after.partyId).toBe(before.partyId);
-  expect(decryptSsn(RING, after, { partyId: after.partyId, companyId })).toBe(SSN_2);
+  expect(decryptSsn(RING, after, { partyId: after.partyId, companyId }).reveal()).toBe(SSN_2);
   // …and the row does not hold a live ciphertext under an "erased on" stamp.
   const row = db
     .prepare("SELECT ssn_deleted_at FROM formation_parties WHERE company_id = ?")
@@ -146,7 +146,7 @@ test("the intake can be re-opened WITHOUT a new SSN — the old one is kept, not
   rejected(companyId);
   expect(updateCompanyIntake(deps(), TENANT, companyId, EDIT)).toEqual({ companyId });
   const stored = parties.findSsnByCompanyId(companyId)!;
-  expect(decryptSsn(RING, stored, { partyId: stored.partyId, companyId })).toBe(SSN);
+  expect(decryptSsn(RING, stored, { partyId: stored.partyId, companyId }).reveal()).toBe(SSN);
 });
 
 // ── the freeze ─────────────────────────────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ test("a LIVE key freezes the intake, and the refusal names the one case that is 
   // NOTHING moved — not the names, and not the SSN the frozen body carries.
   expect(companies.find(companyId)!.businessPurpose).toBe("Original purpose.");
   const stored = parties.findSsnByCompanyId(companyId)!;
-  expect(decryptSsn(RING, stored, { partyId: stored.partyId, companyId })).toBe(SSN);
+  expect(decryptSsn(RING, stored, { partyId: stored.partyId, companyId }).reveal()).toBe(SSN);
 });
 
 test("the whole update is ONE transaction: a frozen row leaves the SSN untouched", () => {

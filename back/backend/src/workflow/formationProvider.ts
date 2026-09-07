@@ -18,7 +18,7 @@ import {
   FORMATION_STATE,
   companyNameOptions,
 } from "../formation/intake";
-import { type PiiKeyring, decryptSsn } from "../formation/pii";
+import { type PiiKeyring, type Secret, decryptSsn } from "../formation/pii";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
@@ -552,7 +552,7 @@ function resolveSsn(
   row: FormationRequestRecord,
   detail: CreateProviderDetail,
   party: FormationPartyRecord,
-): { ssn?: string; ssnIncluded: boolean; expedited: boolean } | { park: string; reason: string } {
+): { ssn?: Secret; ssnIncluded: boolean; expedited: boolean } | { park: string; reason: string } {
   const companyId = d.company.companyId;
   const stored = d.parties.findSsnByCompanyId(companyId);
   const frozen = detail.companySentAttempt === row.attempt;
@@ -568,7 +568,9 @@ function resolveSsn(
     return { park: ssnUnreadableError(), reason: stored ? "ssn_no_key" : "ssn_erased" };
   try {
     return {
-      // Decrypted HERE, at send time, and held for the length of the call and no longer.
+      // Decrypted HERE, at send time, and held for the length of the call and no longer. A
+      // `Secret`, so the only way it reaches the wire is the explicit `reveal()` in
+      // `buildCompanyInput` — every accidental stringification on the way is "[redacted]".
       ssn: decryptSsn(d.pii, stored, { partyId: stored.partyId, companyId }),
       ssnIncluded: true,
       expedited,
@@ -667,7 +669,7 @@ function buildCompanyInput(
   customerId: string,
   nameOptions: CompanyNameOption[],
   expedited: boolean,
-  ssn: string | undefined,
+  ssn: Secret | undefined,
 ): CreateCompanyInput {
   const address = toDoolaAddress(party);
   return {
@@ -698,7 +700,11 @@ function buildCompanyInput(
       // Spread conditionally so an absent SSN produces a body with NO `ssn` key at all: an
       // explicit `ssn: undefined` serializes away in JSON, but the shape of the object is what a
       // reader of this file has to trust, and "the key is not there" is the honest one.
-      ...(ssn !== undefined ? { ssn } : {}),
+      //
+      // ⚠ THE ONLY `.reveal()` IN THE SYSTEM. Everywhere else the decrypted value is a `Secret`
+      // that stringifies to "[redacted]"; this line is the wire boundary, and a second caller of
+      // `reveal()` is a review question by construction (`grep -rn "\.reveal()" src`).
+      ...(ssn !== undefined ? { ssn: ssn.reveal() } : {}),
     },
     // doola's own registered agent provides both addresses. This is not a convenience: an AGENT
     // has no premises, and a mailing address it does not control is the difference between a

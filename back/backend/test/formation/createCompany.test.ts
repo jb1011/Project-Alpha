@@ -460,7 +460,7 @@ test("a production REST create takes an SSN, encrypts it, and stores it in the S
   expect(stored.keyId).toBe(RING.current.id);
   // Sealed under the (party, company) AAD — which is why it had to ride THIS request: the
   // company id did not exist a moment earlier.
-  expect(decryptSsn(RING, stored, { partyId, companyId })).toBe(SSN);
+  expect(decryptSsn(RING, stored, { partyId, companyId }).reveal()).toBe(SSN);
   // Not in the row in clear, anywhere.
   const raw = JSON.stringify(
     db.prepare("SELECT * FROM formation_parties WHERE party_id = ?").get(partyId),

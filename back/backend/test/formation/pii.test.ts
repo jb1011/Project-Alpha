@@ -13,6 +13,7 @@
  *  4. tampering throws.
  */
 import { randomBytes } from "node:crypto";
+import { inspect } from "node:util";
 import { expect, test } from "vitest";
 import {
   type PiiKeyring,
@@ -20,6 +21,7 @@ import {
   encryptSsn,
   isWellFormedSsn,
   parsePiiKey,
+  toSecret,
 } from "../../src/formation/pii";
 
 const SSN = "123-45-6789";
@@ -39,8 +41,8 @@ test("round trips, and every record gets its own IV", () => {
   const k = ring(KEY_A);
   const one = encryptSsn(k, SSN, BIND);
   const two = encryptSsn(k, SSN, BIND);
-  expect(decryptSsn(k, one, BIND)).toBe(SSN);
-  expect(decryptSsn(k, two, BIND)).toBe(SSN);
+  expect(decryptSsn(k, one, BIND).reveal()).toBe(SSN);
+  expect(decryptSsn(k, two, BIND).reveal()).toBe(SSN);
   expect(one.iv).toHaveLength(12);
   // Same plaintext, same key, DIFFERENT bytes — an IV reuse under GCM is catastrophic, and this
   // is the cheapest possible assertion that it is not happening.
@@ -63,7 +65,7 @@ test("the key is SELECTED by the stored id — a PREVIOUS key opens an old row, 
 
   // The rotation: yesterday's key moves to _PREVIOUS, a new one becomes current.
   const rotated = ring(KEY_B, KEY_A);
-  expect(decryptSsn(rotated, written, BIND)).toBe(SSN);
+  expect(decryptSsn(rotated, written, BIND).reveal()).toBe(SSN);
   // New writes use CURRENT, never previous — that is what closes the rotation window.
   expect(encryptSsn(rotated, SSN, BIND).keyId).toBe(rotated.current.id);
   expect(rotated.current.id).not.toBe(rotated.previous!.id);
@@ -163,4 +165,40 @@ test("the SSN format is doola's documented XXX-XX-XXXX, and nothing is auto-refo
     "",
   ])
     expect(isWellFormedSsn(bad), bad).toBe(false);
+});
+
+// ── the Secret wrapper ─────────────────────────────────────────────────────────────────────
+
+test("a decrypted SSN cannot be stringified by ACCIDENT — only by asking", () => {
+  const k = ring(KEY_A);
+  const secret = decryptSsn(k, encryptSsn(k, SSN, BIND), BIND);
+
+  // The three gestures that reach a log line without anybody meaning to.
+  expect(`${secret}`).toBe("[redacted]");
+  expect(String(secret)).toBe("[redacted]");
+  expect(JSON.stringify(secret)).toBe('"[redacted]"');
+  expect(inspect(secret)).toBe("[redacted]");
+
+  // …including when it is a FIELD of something bigger, which is how it actually travels: a
+  // request body, a log object, a test snapshot. NO DIGITS, at all, anywhere in the output.
+  for (const carrier of [
+    { responsibleParty: { ssn: secret } },
+    [secret],
+    { nested: { deep: { ssn: secret } } },
+  ]) {
+    const printed = JSON.stringify(carrier);
+    expect(printed).not.toContain(SSN);
+    expect(printed, printed).not.toMatch(/\d/);
+  }
+  // A SPREAD cannot free them either: the digits live in a closure rather than in a property,
+  // and the copy carries the same redacting `toJSON`.
+  expect(JSON.stringify({ ...secret })).toBe('"[redacted]"');
+
+  // And the one deliberate exit still works — that is what the wire boundary calls.
+  expect(secret.reveal()).toBe(SSN);
+});
+
+test("toSecret wraps any value the same way", () => {
+  expect(`${toSecret("123-45-6789")}`).toBe("[redacted]");
+  expect(toSecret("x").reveal()).toBe("x");
 });
