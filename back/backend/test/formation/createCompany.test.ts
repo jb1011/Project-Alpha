@@ -15,15 +15,38 @@ import { ApiError } from "../../src/api/errors";
 import { type WorldIdDeps, buildWorldIdDeps } from "../../src/api/routes/worldId";
 import { loadConfig } from "../../src/config/env";
 import {
+  businessPurposeRequiredMessage,
+  businessPurposeTooLongMessage,
+  companyNameBlankMessage,
+  companyNameCharsetMessage,
+  companyNameDuplicateMessage,
+  companyNameEndingOnlyMessage,
+  companyNameRestrictedMessage,
+  companyNameTooLongMessage,
+  companyNamesRequiredMessage,
   formationCeilingReachedMessage,
   formationPartyUnavailableMessage,
   formationQuotaExhaustedMessage,
+  industryLabelRequiredMessage,
+  industryLabelUnknownMessage,
+  shimAgentNameBlankMessage,
+  shimAgentNameEndingOnlyMessage,
+  shimAgentNameTooLongMessage,
   sqliteUtcTimestamp,
+  ssnFormatMessage,
+  ssnRefusedHereMessage,
+  ssnUnavailableMessage,
   syntheticPiiRefusedMessage,
   syntheticPiiRequiredMessage,
 } from "../../src/formation";
 import { type CreateCompanyDeps, createCompany } from "../../src/formation/company";
-import { DEFAULT_DESCRIPTION, DEFAULT_INDUSTRY } from "../../src/formation/intake";
+import {
+  DEFAULT_DESCRIPTION,
+  DEFAULT_INDUSTRY,
+  NAME_MAX_LENGTH,
+  PURPOSE_MAX_LENGTH,
+} from "../../src/formation/intake";
+import { decryptSsn, parsePiiKey } from "../../src/formation/pii";
 import { hasLivePayment } from "../../src/formation/status";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -64,6 +87,18 @@ function deps(over: Partial<CreateCompanyDeps> = {}): CreateCompanyDeps {
   };
 }
 
+const SSN = "123-45-6789";
+const RING = { current: parsePiiKey(Buffer.alloc(32, 4).toString("base64"), "FORMATION_PII_KEY") };
+
+/**
+ * A PRODUCTION deployment: the only one that may be handed an SSN (§4.1), and therefore the only
+ * one carrying a keyring. `deps()` above stays sandbox, so every test that does not say
+ * "production" is exercising the deployment that must REFUSE the field.
+ */
+function prodDeps(over: Partial<CreateCompanyDeps> = {}): CreateCompanyDeps {
+  return deps({ pin: { provider: "doola", environment: "production" }, pii: RING, ...over });
+}
+
 function newParty(over: { tenantId?: string; synthetic?: boolean } = {}): string {
   return parties.create({
     tenantId: over.tenantId ?? TENANT,
@@ -81,35 +116,108 @@ function newParty(over: { tenantId?: string; synthetic?: boolean } = {}): string
   });
 }
 
+/**
+ * The PRODUCTION intake (A2 §5) — what REST and MCP send. Three ranked candidates, the company's
+ * own purpose, a listed industry.
+ */
 const intake = (partyId: string, over: Record<string, unknown> = {}) => ({
   partyId,
-  name: "Acme Robotics LLC",
+  names: ["Acme Robotics LLC", "Acme Automata", "Acme Mechanicals"],
+  businessPurpose: "Operating autonomous software agents.",
+  industryLabel: DEFAULT_INDUSTRY,
+  ...over,
+});
+
+/** A second, distinct set of candidates, for the tests that mint twice. */
+const SECOND_NAMES = ["Beta Works", "Beta Systems", "Beta Foundry"];
+
+/** The A1 SHIM's intake, which is the ONLY caller that may derive a name (§10). */
+const shimIntake = (partyId: string, over: Record<string, unknown> = {}) => ({
+  partyId,
+  synthesizedName: "Acme Robotics LLC",
   ...over,
 });
 
 // ── the happy path ─────────────────────────────────────────────────────────────────────────
 
-test("A1 mints a READY company with the SYNTHESIZED intake, in the canonical shape", () => {
+test("A2 mints a READY company from the REAL intake, in the canonical shape", () => {
   const partyId = newParty();
   const result = createCompany(deps(), TENANT, intake(partyId));
   expect("companyId" in result).toBe(true);
   const company = companies.find((result as { companyId: string }).companyId)!;
 
-  // `ready`, never `draft`: payment is off in A1, so a draft would owe a step that does not exist
-  // and would never be filed.
+  // `ready`, never `draft`: payment is off in A1/A2, so a draft would owe a step that does not
+  // exist and would never be filed.
   expect(company.status).toBe("ready");
-  expect(company.intakeSynthesized).toBe(true);
-  // ONE canonical shape, with the entity ending split off — "Acme Robotics LLC" must not be
-  // filed as "Acme Robotics LLC LLC".
+  // A HUMAN typed this one.
+  expect(company.intakeSynthesized).toBe(false);
+  // ONE canonical shape, three positions, with the entity ending split off — "Acme Robotics LLC"
+  // must not be filed as "Acme Robotics LLC LLC".
   expect(company.nameOptions).toEqual([
     { name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 },
+    { name: "Acme Automata", entityTypeEnding: "LLC", position: 2 },
+    { name: "Acme Mechanicals", entityTypeEnding: "LLC", position: 3 },
   ]);
-  expect(company.businessPurpose).toBe(DEFAULT_DESCRIPTION);
+  // The company's OWN purpose, not the agent's description and not the default.
+  expect(company.businessPurpose).toBe("Operating autonomous software agents.");
   expect(company.industryLabel).toBe(DEFAULT_INDUSTRY);
   // The pin comes from the DEPLOYMENT and is copied onto every agent that attaches later.
   expect([company.provider, company.environment]).toEqual(["doola", "sandbox"]);
   // …and the party is SPENT: bound to this company, inside the same transaction.
   expect(parties.findOwned(TENANT, partyId)!.companyId).toBe(company.companyId);
+});
+
+test("the A1 SHIM still mints its 1:1 synthesized company — every existing client keeps working", () => {
+  // §10: the synthesized path survives A2 for the shim ALONE, and is removed in A3. It is spelled
+  // `synthesizedName` rather than `name` precisely so a production door cannot reach it.
+  const result = createCompany(deps(), TENANT, shimIntake(newParty()));
+  const company = companies.find((result as { companyId: string }).companyId)!;
+  expect(company.intakeSynthesized).toBe(true);
+  expect(company.nameOptions).toEqual([
+    { name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 },
+  ]);
+  expect(company.businessPurpose).toBe(DEFAULT_DESCRIPTION);
+  expect(company.industryLabel).toBe(DEFAULT_INDUSTRY);
+});
+
+test("the SHIM refuses in its OWN words — it never names a field its caller cannot send", () => {
+  // The bug: a party-only `POST /onboard` sends an AGENT NAME. There is no `names` array anywhere
+  // in that request, so "names[0] is blank — all three candidates are required" told the caller
+  // to fix a field they had never heard of. Same rules, same order, a sentence they can act on.
+  for (const [label, name, expected] of [
+    ["blank", "   ", shimAgentNameBlankMessage()],
+    ["ending only", "LLC", shimAgentNameEndingOnlyMessage()],
+    ["too long", "A".repeat(NAME_MAX_LENGTH + 1), shimAgentNameTooLongMessage(NAME_MAX_LENGTH)],
+  ] as const) {
+    const result = createCompany(deps(), TENANT, shimIntake(newParty(), { synthesizedName: name }));
+    expect(result, label).toEqual({ error: expected });
+    // …and no `names[` anywhere in it, which is the property rather than the wording.
+    expect((result as { error: string }).error, label).not.toContain("names[");
+  }
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
+});
+
+test("the PRODUCTION door still names the position — three candidates, three places to be wrong", () => {
+  // The other half: the shim's softer wording must not have leaked onto the door that really does
+  // take three candidates, where "names[1]" is exactly what a caller needs to hear.
+  expect(
+    createCompany(deps(), TENANT, intake(newParty(), { names: ["Acme One", "  ", "Acme Three"] })),
+  ).toEqual({ error: companyNameBlankMessage(2) });
+});
+
+test("the production doors REQUIRE the full shape — no defaults, no single name", () => {
+  // A door that could fall back to a derived name is a door that files a company nobody
+  // described, under a purpose nobody wrote.
+  expect(createCompany(deps(), TENANT, intake(newParty(), { names: undefined }))).toEqual({
+    error: companyNamesRequiredMessage(),
+  });
+  expect(createCompany(deps(), TENANT, intake(newParty(), { businessPurpose: undefined }))).toEqual(
+    { error: businessPurposeRequiredMessage() },
+  );
+  expect(createCompany(deps(), TENANT, intake(newParty(), { industryLabel: undefined }))).toEqual({
+    error: industryLabelRequiredMessage(),
+  });
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
 });
 
 test("a LOST bind CAS rolls the company INSERT back — against a real transaction", () => {
@@ -132,7 +240,7 @@ test("a LOST bind CAS rolls the company INSERT back — against a real transacti
 test("the party bind is a CAS: a second company cannot reuse one person's consent", () => {
   const partyId = newParty();
   expect("companyId" in createCompany(deps(), TENANT, intake(partyId))).toBe(true);
-  const second = createCompany(deps(), TENANT, intake(partyId, { name: "Second" }));
+  const second = createCompany(deps(), TENANT, intake(partyId, { names: SECOND_NAMES }));
   expect(second).toEqual({ error: formationPartyUnavailableMessage() });
   // And the rollback is complete: the refused create left NO company behind.
   expect(companies.listByTenant(TENANT)).toHaveLength(1);
@@ -246,32 +354,205 @@ test("a party whose synthetic flag disagrees with the deployment is refused", ()
   ).toEqual({ error: syntheticPiiRequiredMessage() });
 });
 
-// ── intake validation ──────────────────────────────────────────────────────────────────────
+// ── intake validation (A2 §5) ──────────────────────────────────────────────────────────────
+//
+// Every refusal NAMES the field and, where there is one, the offending value. That is the design
+// of them: the alternative is a caller who cannot proceed and cannot tell why, on a form whose
+// next step spends real money.
 
-test("a blank name and an over-long one are refused", () => {
-  expect(createCompany(deps(), TENANT, intake(newParty(), { name: "   " }))).toEqual({
-    error: "a company name is required",
-  });
-  expect(createCompany(deps(), TENANT, intake(newParty(), { name: "x".repeat(200) }))).toEqual({
-    error: "a company name may be at most 120 characters",
-  });
+test("names must be EXACTLY three — not one, not two, not four", () => {
+  // Wyoming refuses a name that is already taken, and a second attempt is a second fee. The
+  // alternates are what let one filing succeed.
+  for (const names of [[], ["One"], ["One", "Two"], ["One", "Two", "Three", "Four"]])
+    expect(createCompany(deps(), TENANT, intake(newParty(), { names })), String(names)).toEqual({
+      error: companyNamesRequiredMessage(),
+    });
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
 });
 
-test("a name that is NOTHING BUT an entity ending is refused — the guard actually fires", () => {
-  // `stripEntityEnding` used to anchor on `[\s,]+`, so a bare "LLC" never matched, and its
-  // `|| raw.trim()` fallback handed the ending straight back as the name. The guard below was
-  // therefore unreachable and Wyoming would have been asked to file "LLC LLC".
-  for (const name of ["LLC", " L.L.C. ", "llc", ",llc"])
-    expect(createCompany(deps(), TENANT, intake(newParty(), { name })), name).toEqual({
-      error: "a company name must contain something other than an entity ending",
+test("each candidate is checked in POSITION order, and the message names the position", () => {
+  const at = (i: number, value: unknown) => {
+    const names = ["Alpha Works", "Beta Works", "Gamma Works"];
+    names[i] = value as string;
+    return intake(newParty(), { names });
+  };
+  expect(createCompany(deps(), TENANT, at(1, "   "))).toEqual({
+    error: companyNameBlankMessage(2),
+  });
+  expect(createCompany(deps(), TENANT, at(2, "x".repeat(200)))).toEqual({
+    error: companyNameTooLongMessage(3, NAME_MAX_LENGTH),
+  });
+  // The ending is a separate field on the wire; a candidate that is nothing else has no name.
+  for (const ending of ["LLC", " L.L.C. ", "llc", ",llc"])
+    expect(createCompany(deps(), TENANT, at(0, ending)), ending).toEqual({
+      error: companyNameEndingOnlyMessage(1),
     });
-  // …and a real name that merely ENDS in one still keeps its name.
-  const ok = createCompany(deps(), TENANT, intake(newParty(), { name: "Acme Robotics L.L.C." }));
-  expect(companies.find((ok as { companyId: string }).companyId)!.nameOptions).toEqual([
-    { name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 },
-  ]);
-  // Nothing was minted for any of the refused ones.
-  expect(companies.listByTenant(TENANT)).toHaveLength(1);
+});
+
+test("the charset refusal NAMES the character, so the caller can act on it", () => {
+  // "invalid characters" on a form is not something anyone can act on.
+  const withChar = (ch: string) =>
+    intake(newParty(), { names: [`Acme${ch}Works`, "Beta Works", "Gamma Works"] });
+  expect(createCompany(deps(), TENANT, withChar("™"))).toEqual({
+    error: companyNameCharsetMessage(1, "™"),
+  });
+  // Accented letters are out too: the Secretary of State's standard is English letters, and a
+  // canonicalized "Café" would be FILED as typed.
+  expect(createCompany(deps(), TENANT, withChar("é"))).toEqual({
+    error: companyNameCharsetMessage(1, "é"),
+  });
+  // …while the punctuation Wyoming does accept passes.
+  const ok = createCompany(
+    deps(),
+    TENANT,
+    intake(newParty(), { names: ["Acme & Co.", "Beta-Works, Inc", "Gamma (Works) +1"] }),
+  );
+  expect("companyId" in ok).toBe(true);
+});
+
+test("a Wyoming RESTRICTED word is refused at the door, before the fee", () => {
+  // It would come back `rejected` after the filing fee was paid, and park the company.
+  expect(
+    createCompany(
+      deps(),
+      TENANT,
+      intake(newParty(), { names: ["Acme Bank", "Beta Works", "Gamma Works"] }),
+    ),
+  ).toEqual({ error: companyNameRestrictedMessage(1, "bank") });
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
+});
+
+test("DUPLICATE candidates are refused, in the form Wyoming would compare them", () => {
+  // Three candidates that are really one leave the filing with no fallback at all — which is the
+  // entire reason three are demanded.
+  for (const names of [
+    ["Acme Works", "Acme Works", "Gamma Works"],
+    ["Acme Works", "acme  works", "Gamma Works"], // case + whitespace
+    ["Acme Works", "Acme Works LLC", "Gamma Works"], // …and the entity ending
+  ])
+    expect(createCompany(deps(), TENANT, intake(newParty(), { names })), String(names)).toEqual({
+      error: companyNameDuplicateMessage(2),
+    });
+});
+
+test("purpose and industry are required, bounded, and the industry must be a LISTED label", () => {
+  expect(createCompany(deps(), TENANT, intake(newParty(), { businessPurpose: "  " }))).toEqual({
+    error: businessPurposeRequiredMessage(),
+  });
+  expect(
+    createCompany(deps(), TENANT, intake(newParty(), { businessPurpose: "x".repeat(600) })),
+  ).toEqual({ error: businessPurposeTooLongMessage(PURPOSE_MAX_LENGTH) });
+  // An unlisted label reaches doola and comes back rejected on a real fee.
+  expect(
+    createCompany(deps(), TENANT, intake(newParty(), { industryLabel: "Interpretive Dance" })),
+  ).toEqual({ error: industryLabelUnknownMessage("Interpretive Dance") });
+});
+
+test("values are CANONICALIZED (NFC + trim) at intake and stored canonical", () => {
+  // Two spellings of one string must not become two candidates, and the stored value is the value
+  // SENT — the filer forwards `name_options` verbatim and the §5 matcher compares against them.
+  const decomposed = "AcmeÅ"; // "AcmeÅ" as A + combining ring
+  const result = createCompany(
+    deps(),
+    TENANT,
+    intake(newParty(), {
+      names: ["  Acme Works  ", "Beta Works", "Gamma Works"],
+      businessPurpose: "  Building agents.  ",
+      industryLabel: `  ${DEFAULT_INDUSTRY}  `,
+    }),
+  );
+  const company = companies.find((result as { companyId: string }).companyId)!;
+  expect(company.nameOptions[0]!.name).toBe("Acme Works");
+  expect(company.businessPurpose).toBe("Building agents.");
+  expect(company.industryLabel).toBe(DEFAULT_INDUSTRY);
+  // NFC composes the decomposed form — and the composed result then fails the ASCII charset,
+  // which is the deliberate narrow rule, not an accident of ordering.
+  expect(
+    createCompany(
+      deps(),
+      TENANT,
+      intake(newParty(), { names: [decomposed, "B Works", "C Works"] }),
+    ),
+  ).toEqual({ error: companyNameCharsetMessage(1, "Å") });
+});
+
+// ── THE SSN (§4.1/§4.2) ────────────────────────────────────────────────────────────────────
+
+test("a production REST create takes an SSN, encrypts it, and stores it in the SAME transaction", () => {
+  const partyId = newParty();
+  const result = createCompany(prodDeps(), TENANT, intake(partyId, { ssn: SSN }));
+  const companyId = (result as { companyId: string }).companyId;
+
+  const stored = parties.findSsnByCompanyId(companyId)!;
+  expect(stored.partyId).toBe(partyId);
+  expect(stored.keyId).toBe(RING.current.id);
+  // Sealed under the (party, company) AAD — which is why it had to ride THIS request: the
+  // company id did not exist a moment earlier.
+  expect(decryptSsn(RING, stored, { partyId, companyId }).reveal()).toBe(SSN);
+  // Not in the row in clear, anywhere.
+  const raw = JSON.stringify(
+    db.prepare("SELECT * FROM formation_parties WHERE party_id = ?").get(partyId),
+  );
+  expect(raw).not.toContain(SSN);
+  expect(raw).not.toContain("123456789");
+});
+
+test("the SSN is OPTIONAL — a non-US applicant files without one", () => {
+  const result = createCompany(prodDeps(), TENANT, intake(newParty()));
+  expect("companyId" in result).toBe(true);
+  expect(parties.findSsnByCompanyId((result as { companyId: string }).companyId)).toBeUndefined();
+});
+
+test("a SANDBOX or SYNTHETIC deployment REFUSES the field outright — never ignores it", () => {
+  // Quietly dropping it leaves a caller believing they supplied one; quietly accepting it puts a
+  // real person's SSN in a partner's DEVELOPMENT environment.
+  expect(createCompany(deps(), TENANT, intake(newParty(), { ssn: SSN }))).toEqual({
+    error: ssnRefusedHereMessage(),
+  });
+  expect(
+    createCompany(
+      prodDeps({ sandboxSyntheticPii: true }),
+      TENANT,
+      intake(newParty({ synthetic: true }), { ssn: SSN, synthetic: true }),
+    ),
+  ).toEqual({ error: ssnRefusedHereMessage() });
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
+});
+
+test("a malformed SSN is a SPECIFIC refusal, and nothing is minted", () => {
+  for (const bad of ["123456789", "123-45-678", "abc-de-fghi", ""])
+    expect(createCompany(prodDeps(), TENANT, intake(newParty(), { ssn: bad })), bad).toEqual({
+      error: ssnFormatMessage(),
+    });
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
+});
+
+test("no keyring means REFUSE, never a plaintext write", () => {
+  // Unreachable on a correctly-booted production box (FORMATION_PII_KEY is a boot invariant); it
+  // exists so a misconfiguration is a refusal rather than an SSN in the clear.
+  expect(
+    createCompany(prodDeps({ pii: undefined }), TENANT, intake(newParty(), { ssn: SSN })),
+  ).toEqual({ error: ssnUnavailableMessage() });
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
+});
+
+test("a LOST bind CAS takes the SSN down with the company — one transaction", () => {
+  const partyId = newParty();
+  const losingParties: SqliteFormationPartyRepository = Object.create(parties);
+  losingParties.bindToCompany = () => false;
+  expect(
+    createCompany(prodDeps({ parties: losingParties }), TENANT, intake(partyId, { ssn: SSN })),
+  ).toEqual({ error: formationPartyUnavailableMessage() });
+  expect((db.prepare("SELECT COUNT(*) AS n FROM companies").get() as { n: number }).n).toBe(0);
+  // An SSN that outlived the company row it was sealed against could never be decrypted again —
+  // and would sit in the database with no filing to justify it.
+  expect(
+    (
+      db
+        .prepare("SELECT COUNT(*) AS n FROM formation_parties WHERE ssn_ciphertext IS NOT NULL")
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
 });
 
 // ── the identity floor (§6.7) ──────────────────────────────────────────────────────────────

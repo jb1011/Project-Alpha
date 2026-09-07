@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { redactPii } from "../formation/pii";
 import type { Address, EntityRecord, Hex, TreasuryConfig } from "../types";
 
 export interface EventRow {
@@ -367,7 +368,13 @@ export class SqliteEntityRepository implements EntityRepository {
       .prepare(
         "INSERT INTO events (idempotency_key, step, status, tx_hash, detail) VALUES (?,?,?,?,?)",
       )
-      .run(key, step, status, txHash, detail);
+      // `detail` is free text that the UI renders and an operator reads, and the formation steps
+      // write a PROVIDER's error message into it — which is where an echoed-back SSN would come
+      // to rest (design §4). Redacted at the write, so no producer has to remember. It is
+      // deliberately blind to what it is redacting: `redactPii` will not touch a hash or a long
+      // digit run, and everything else nine digits long is worth losing to keep an SSN out of a
+      // permanent record.
+      .run(key, step, status, txHash, detail === null ? null : redactPii(detail));
   }
 
   listEvents(key: string): EventRow[] {

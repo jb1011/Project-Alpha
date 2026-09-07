@@ -10,6 +10,7 @@ import type {
   DoolaCompany,
   DoolaEnvironment,
 } from "../adapters/doola/types";
+import { isIntakeFrozen } from "../formation/freeze";
 import {
   type CompanyNameOption,
   DEFAULT_DESCRIPTION,
@@ -18,6 +19,8 @@ import {
   FORMATION_STATE,
   companyNameOptions,
 } from "../formation/intake";
+import { type PiiKeyring, type Secret, decryptSsn } from "../formation/pii";
+import { eraseSsnLogged } from "../formation/ssnErasure";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
@@ -73,11 +76,59 @@ export interface CreateProviderDetail {
   submissionStatus?: string;
   /** The name preferences we filed, in order. */
   nameOptions?: string[];
-  /** True when the §9 expedited-EIN service was requested (non-US applicant only). */
+  /**
+   * True when the §9 expedited-EIN service was requested (non-US applicant only).
+   *
+   * FROZEN at first send and read from there forever (§4.5). It is a function of the SSN, and the
+   * SSN is deleted in the transaction that persists `provider_ref` — so recomputing it on a
+   * same-key retry could produce a DIFFERENT body under a key doola is already holding.
+   */
   expedited?: boolean;
+  /**
+   * Whether the create body we SENT carried `responsibleParty.ssn` — frozen at first send, for
+   * exactly the reason `expedited` is (§4.5), and reasoned through against doola's 409 in the
+   * `resolveSsn` comment below.
+   *
+   * The VALUE is never here. This is a boolean about the shape of a request, and the design's
+   * "never in `detail`" rule is about the number itself.
+   */
+  ssnIncluded?: boolean;
   /** True when the company was ADOPTED — a crash-window resume or the pre-create lookup — rather
    *  than created by this attempt. The one field that says "we did not file this one twice". */
   adopted?: boolean;
+  /**
+   * PARKED FOR A HUMAN: doola REJECTED this intake, and the same body must never go out again.
+   *
+   * A `rejected` is doola looking at the request and refusing it — a name it will not file, a
+   * malformed field, a person it cannot accept. Re-sending it changes nothing, and the sweeper's
+   * doubling backoff used to send it seven more times over about eight hours and then
+   * `abandonFormation` it: which erases the responsible party's data, sets the company terminal,
+   * and forecloses the edit-and-retry §4.7 exists to offer. So the row waits instead, and the
+   * ONLY thing that clears the flag is a successful `PATCH /companies/:id` — the edit IS the
+   * evidence that the next body will be different.
+   *
+   * It is the COMPANY's intake specifically, which is why its twin below exists.
+   */
+  awaitingIntakeEdit?: boolean;
+  /**
+   * PARKED FOR A HUMAN, on the PARTY's data rather than the company's (§4.7, review 5b).
+   *
+   * `create_provider` makes TWO doola calls — `createCustomer` with the responsible party, then
+   * `createCompany` with the intake — and both can come back `rejected`. The same park serves
+   * both (an unchanged body is as doomed either way, and burning eight attempts to prove it ends
+   * in `abandonFormation`, which erases the party's data overnight), but they are NOT the same
+   * flag, because they do not have the same exit.
+   *
+   * `PATCH /companies/:companyId` edits names, purpose, industry and the SSN. None of those is
+   * what `createCustomer` refused: a rejected party is a name, an email, a phone or an address
+   * doola will not accept. Clearing this flag from that door would re-arm a retry of a customer
+   * body that had not changed at all — the exact loop the park exists to stop.
+   *
+   * So there is deliberately NO self-service exit today; the party-edit route is A3's, and
+   * `rearmAfterPartyEdit` is exported and waiting for it. Until then the operator trail says so,
+   * in as many words, on both surfaces.
+   */
+  awaitingPartyEdit?: boolean;
   /**
    * The `attempt` under which `POST /companies` was last SENT — written BEFORE the call, so it
    * survives a crash inside it (C1).
@@ -105,6 +156,14 @@ export interface FormationCreateDeps {
   doola: DoolaApi;
   /** The environment THIS DEPLOYMENT is configured for. Compared against the company's pin. */
   environment: DoolaEnvironment;
+  /**
+   * The SSN keyring (§4.2). Absent on every deployment that never collected one — which is every
+   * deployment but production doola.
+   *
+   * Absent WITH a stored ciphertext is a box that has lost its key, and the step parks rather
+   * than sending a body without the SSN: see `resolveSsn`.
+   */
+  pii?: PiiKeyring;
 }
 
 /**
@@ -144,12 +203,48 @@ export function partyPhoneRequiredError(): string {
  * §9: the expedited EIN is offered ONLY to a non-US applicant.
  *
  * As a deployment default it would break every US-founder formation, so the signal is the
- * applicant's own: no SSN AND a country of residence outside the US. `ssn` is not collected by
- * the intake today, which makes the first conjunct vacuously true — it is written out anyway so
- * that the day an SSN is collected, this rule already reads correctly.
+ * applicant's own: no SSN AND a country of residence outside the US.
+ *
+ * It takes `hasSsn` rather than the value, deliberately: the SSN is a secret that lives in
+ * plaintext for the length of one function call, and a predicate that ACCEPTED one would be one
+ * more place it could end up in a stack trace or a snapshot. Nothing here needs the number.
  */
-export function isNonUsResponsibleParty(p: { ssn?: string | null; country: string }): boolean {
-  return !p.ssn && p.country.toUpperCase() !== "USA";
+export function isNonUsResponsibleParty(p: { hasSsn: boolean; country: string }): boolean {
+  return !p.hasSsn && p.country.toUpperCase() !== "USA";
+}
+
+/** The refusal when a create body cannot be rebuilt as it was SENT (§4.5). Its own sentence,
+ *  like the pin mismatch, because nothing is wrong with doola and nothing was called: the SSN
+ *  the frozen body carried can no longer be read, and sending the body WITHOUT it would be a
+ *  different body under an idempotency key doola is already holding. */
+export function ssnUnreadableError(): string {
+  return "this company's create body carried an SSN that can no longer be read, and re-sending the same idempotency key with a different body would be refused by the provider — a human must resolve it (restore FORMATION_PII_KEY_PREVIOUS, or abandon and re-file)";
+}
+
+/**
+ * A filing that has STOPPED and needs a human, with the ops event an operator greps for.
+ *
+ * The event is part of the answer rather than derived from the reason at the log line, because
+ * the two parks want different people: `formation_ssn_unreadable` is a lost key or a bug and
+ * wants an engineer, `formation_ssn_erased_before_send` is the retention promise working exactly
+ * as written and wants the company's OWNER.
+ */
+interface ParkedSsn {
+  park: string;
+  reason: string;
+  event: "formation_ssn_unreadable" | "formation_ssn_erased_before_send";
+}
+
+/**
+ * The refusal when the seven-day clock erased an SSN BEFORE the filing ever went out (§4.6a).
+ *
+ * Not an error, and nothing is wrong with doola: the retention promise did exactly what it says.
+ * But the two ways to proceed are a product decision the owner has to make — supply the number
+ * again, or accept the slower SS-4 route — and filing without one is neither. It parks without
+ * burning an attempt, because nothing was sent.
+ */
+export function ssnErasedBeforeSendError(): string {
+  return "this filing was given an SSN, and the 7-day retention clock erased it before the filing was ever sent — sending now would file under the slow EIN route the applicant did not choose. Re-supply the SSN, or confirm you want to proceed without one, through PATCH /companies/:companyId";
 }
 
 /**
@@ -331,11 +426,41 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     });
     return;
   }
-  const expedited = isNonUsResponsibleParty(party);
+  // ── THE FROZEN BODY (§4.5). Everything that shapes the create request is decided ONCE, at the
+  //    first send under the current attempt, and read back from `detail` on every pass after it.
+  const resolved = resolveSsn(d, row, detail, party);
+  if ("park" in resolved) {
+    parkFormationStep(d, companyId, "create_provider", resolved.park, { reason: resolved.reason });
+    recordCompanyEvent(
+      d.repo,
+      d.company.companyId,
+      "formationCreate",
+      `formation create parked: ${resolved.reason}`,
+    );
+    // The event NAME distinguishes the two parks, because an operator greps by name and the two
+    // have different answers: `unreadable` is a key or a bug and needs an engineer, while
+    // `erased_before_send` is the retention promise working as designed and needs the OWNER to
+    // choose between re-supplying the number and the slower route.
+    opsLog(resolved.event, {
+      level: "error",
+      severity: "CRITICAL",
+      companyId,
+      reason: resolved.reason,
+      environment: d.environment,
+    });
+    return;
+  }
+  const { ssn, expedited } = resolved;
   detail = {
     ...detail,
     nameOptions: nameOptions.map((n) => `${n.name} ${n.entityTypeEnding}`),
     expedited,
+    // DERIVED HERE, at the one place the frozen body is written down, from the one value that
+    // decides it: `resolveSsn` returns the SSN this body will carry, or nothing, and every one of
+    // its exits agrees with that (a frozen body that claims an SSN it cannot produce PARKS rather
+    // than returning). Two computations of "did we send one?" is how the boolean in `detail` and
+    // the body on the wire come to disagree — which is a 409 on the next retry.
+    ssnIncluded: ssn !== undefined,
   };
 
   // `submitted` means "we are about to talk to doola". Written BEFORE the first call so a crash
@@ -405,6 +530,10 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   //       nothing and the only safe move is to re-send the SAME key. Which is precisely what the
   //       code below does — the key is a pure function of an attempt that indeterminate failures
   //       never move.
+  //
+  //       It is also the write that FREEZES the body's shape: `companySentAttempt` goes down
+  //       beside the `ssnIncluded` and `expedited` already written above, so a resume knows both
+  //       that a create went out under this key AND what it looked like.
   if (detail.companySentAttempt !== row.attempt) {
     detail = { ...detail, companySentAttempt: row.attempt };
     persistDetail(d, detail);
@@ -414,7 +543,7 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   let company: DoolaCompany;
   try {
     company = await d.doola.createCompany(
-      buildCompanyInput(d, party, customerId, nameOptions, expedited),
+      buildCompanyInput(d, party, customerId, nameOptions, expedited, ssn),
       keys.company,
     );
   } catch (e) {
@@ -433,17 +562,149 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
 
   // ── 5. Persist the id BEFORE treating the create as done. A crash between here and the
   //       confirm below resumes into the ADOPT branch above, never into a second create.
+  //
+  //       And this is the transaction §4.4 names: the SSN dies with the write that records the
+  //       company id. It has been forwarded, once; nothing downstream ever needs it again.
   detail = { ...detail, companyId: company.doolaCompanyId };
-  requests.transition(companyId, "create_provider", "submitted", "submitted", {
-    providerRef: company.doolaCompanyId,
-    detail: JSON.stringify(detail),
-  });
+  persistRefAndEraseSsn(d, () =>
+    requests.transition(companyId, "create_provider", "submitted", "submitted", {
+      providerRef: company.doolaCompanyId,
+      detail: JSON.stringify(detail),
+    }),
+  );
   logStep(companyId, "submitted", row.attempt, { providerRef: company.doolaCompanyId });
 
   confirm(d, row, company.doolaCompanyId, {
     ...detail,
     submissionStatus: company.formationSubmissionStatus,
   });
+}
+
+/**
+ * What the create body says about the SSN, on THIS pass (§4.4/§4.5).
+ *
+ * ── THE RULE, and why it is shaped like this ───────────────────────────────────────────────
+ *
+ * An `Idempotency-Key` is a pure function of the attempt, and doola answers a REPEAT of a key
+ * with the committed response — but only for the SAME body. A different body under a live key is
+ * a 409 `E_IDEMPOTENCY_KEY_REUSED`, which this module deliberately never re-keys past: it looks
+ * for an existing company and otherwise parks for a human. So on any pass where doola may already
+ * hold a body under the key we are about to use, the body has to be rebuilt BYTE-IDENTICALLY.
+ *
+ * The SSN is part of that body, and §4.4 deletes it in the very transaction that persists
+ * `provider_ref`. Those two facts have to be reconciled, and this is the reconciliation.
+ *
+ * It returns the SSN THIS BODY WILL CARRY, or nothing — never a separate boolean saying whether it
+ * did. `detail.ssnIncluded` is then derived at the single site that writes the frozen body down,
+ * because two computations of "did we send one?" is how the flag in `detail` and the bytes on the
+ * wire come to disagree, which is a 409 on the next retry:
+ *
+ *  - `frozen` is the shared freeze predicate (`formation/freeze.ts`), whose load-bearing clause
+ *    here is `detail.companySentAttempt === row.attempt` — "a company create has ALREADY gone out
+ *    under the key we would use next". That is exactly the condition under which the body may not
+ *    change;
+ *  - when frozen, the SSN's presence and `expedited` are READ FROM `detail`, never recomputed.
+ *    The row may have been erased since; the body must not notice. A frozen body that carried NO
+ *    SSN short-circuits before the repository read: there is nothing to fetch and nothing to
+ *    decide, and that is the common case on every retry of every filing that never had one;
+ *  - when not frozen (a first send, or a retry after a `rejected` that burned the attempt and so
+ *    released the key), both are computed from the row as it is NOW. A `rejected` create is the
+ *    one case doola releases the key, which is also the one case §4.7 re-opens the intake — the
+ *    two rules are the same rule seen from two sides;
+ *  - if the body was frozen WITH an SSN and the SSN can no longer be read, there is no safe
+ *    move: sending without it is a different body under a live key, and re-keying is a second
+ *    real Wyoming LLC. It PARKS, CRITICAL, for a human.
+ *
+ * Is the last case reachable? Only by an operator or a bug: the erase and the `provider_ref`
+ * write commit together, so "erased but no ref" cannot happen through the normal path — a pass
+ * that finds a ref takes the ADOPT branch and never rebuilds a body at all. The §4.6a TTL clause
+ * cannot cause it either: it erases only when the company is terminal or when nothing was ever
+ * submitted. It is written out anyway, because the alternative to a park here is a silent 409 or
+ * a duplicate filing.
+ */
+function resolveSsn(
+  d: FormationCreateDeps,
+  row: FormationRequestRecord,
+  detail: CreateProviderDetail,
+  party: FormationPartyRecord,
+): { ssn?: Secret; expedited: boolean } | ParkedSsn {
+  const companyId = d.company.companyId;
+  // The SHARED predicate, not a local re-spelling of it: the PATCH door asks the same question of
+  // the same row in SQL, and two spellings of the idempotency contract is one spelling too many.
+  const frozen = isIntakeFrozen(row);
+
+  // The frozen-WITHOUT-an-SSN body: nothing to read, nothing to decide, and no reason to touch
+  // the PII table at all. Checked before the repository read because this is the common case on
+  // every retry of every filing that never had one.
+  if (frozen && detail.ssnIncluded === false) return { expedited: Boolean(detail.expedited) };
+
+  const stored = d.parties.findSsnByCompanyId(companyId);
+  const ssnIncluded = frozen ? Boolean(detail.ssnIncluded) : Boolean(stored);
+  // A function of the SSN, so it is frozen by the same rule (§4.5).
+  const expedited = frozen
+    ? Boolean(detail.expedited)
+    : isNonUsResponsibleParty({ hasSsn: ssnIncluded, country: party.country });
+
+  if (!ssnIncluded) {
+    // NOT frozen, no stored SSN — and the clock is why. See the block comment above: filing now
+    // would quietly send a body the caller did not choose.
+    if (!frozen && party.ssnErasedReason === "ttl")
+      return {
+        park: ssnErasedBeforeSendError(),
+        reason: "ssn_erased_before_send",
+        event: "formation_ssn_erased_before_send",
+      };
+    return { expedited };
+  }
+  // Frozen WITH an SSN, and the row no longer has one (or this box has lost the key).
+  if (!stored || !d.pii)
+    return {
+      park: ssnUnreadableError(),
+      reason: stored ? "ssn_no_key" : "ssn_erased",
+      event: "formation_ssn_unreadable",
+    };
+  try {
+    return {
+      // Decrypted HERE, at send time, and held for the length of the call and no longer. A
+      // `Secret`, so the only way it reaches the wire is the explicit `reveal()` in
+      // `buildCompanyInput` — every accidental stringification on the way is "[redacted]".
+      ssn: decryptSsn(d.pii, stored, { partyId: stored.partyId, companyId }),
+      expedited,
+    };
+  } catch {
+    // The message is deliberately NOT propagated: it names a key id, which is fine, but the catch
+    // is broad and this is the one path where a stack could carry ciphertext.
+    return {
+      park: ssnUnreadableError(),
+      reason: "ssn_undecryptable",
+      event: "formation_ssn_unreadable",
+    };
+  }
+}
+
+/**
+ * Persist a `provider_ref` and ERASE the SSN, in ONE transaction (§4.4).
+ *
+ * The atomicity is the whole point, in both directions. If the ref committed without the erase, a
+ * filed company would keep an SSN it no longer needs — a retention breach with no clock to catch
+ * it but the §4.6a backstop. If the erase committed without the ref, the next pass would rebuild
+ * a frozen body it can no longer complete and park for a human (see `resolveSsn`).
+ *
+ * The erase is NOT conditional on the CAS winning. A lost CAS means another driver persisted the
+ * same ref in the same instant, so the design's condition — "the transaction that persists
+ * `doola_company_id`" — holds either way, and `eraseSsn` is idempotent.
+ *
+ * The reason is not a parameter. Both call sites are this one fact — a `provider_ref` reached the
+ * row — and a single-literal argument is a knob nobody may turn.
+ */
+function persistRefAndEraseSsn(d: FormationCreateDeps, write: () => boolean): boolean {
+  let moved = false;
+  d.repo.transaction(() => {
+    moved = write();
+    // ONE helper, so an erase and its audit line cannot be separated (see `ssnErasure.ts`).
+    eraseSsnLogged(d.parties, d.company.companyId, "provider_persisted", d.environment);
+  });
+  return moved;
 }
 
 /**
@@ -464,7 +725,16 @@ function onCallFailure(
   const kind: DoolaFailureKind = classifyDoolaFailure(e);
   const described = describeDoolaError(e);
   if (kind === "rejected") {
-    failStep(d, row, described.message, e);
+    // WHICH body was refused decides which flag, because the flags do not have the same exit
+    // (review 5b). Both park identically — the attempt is burned once and never again, nothing
+    // is re-sent unchanged — but only the company's has a door that can clear it today.
+    if (endpoint === "createCustomer") {
+      failStep(d, row, described.message, e, { awaitingPartyEdit: true });
+      parkedForPartyEdit(d, described.message);
+      return;
+    }
+    failStep(d, row, described.message, e, { awaitingIntakeEdit: true });
+    parkedForIntakeEdit(d, described.message);
     return;
   }
   const reason =
@@ -501,6 +771,7 @@ function buildCompanyInput(
   customerId: string,
   nameOptions: CompanyNameOption[],
   expedited: boolean,
+  ssn: Secret | undefined,
 ): CreateCompanyInput {
   const address = toDoolaAddress(party);
   return {
@@ -523,6 +794,19 @@ function buildCompanyInput(
       legalLastName: party.legalLastName,
       email: party.email,
       address,
+      // THE ONE PLACE an SSN leaves this system (§4.3), and it leaves it ONCE. doola derives
+      // US-vs-non-US from any one person's `ssn`, and the responsible party is the IRS-relevant
+      // one, so sending it here is sufficient — `createCustomer` takes none and `members[].ssn`
+      // is never populated, which is the minimum exposure that still gets the EIN issued.
+      //
+      // Spread conditionally so an absent SSN produces a body with NO `ssn` key at all: an
+      // explicit `ssn: undefined` serializes away in JSON, but the shape of the object is what a
+      // reader of this file has to trust, and "the key is not there" is the honest one.
+      //
+      // ⚠ THE ONLY `.reveal()` IN THE SYSTEM. Everywhere else the decrypted value is a `Secret`
+      // that stringifies to "[redacted]"; this line is the wire boundary, and a second caller of
+      // `reveal()` is a review question by construction (`grep -rn "\.reveal()" src`).
+      ...(ssn !== undefined ? { ssn: ssn.reveal() } : {}),
     },
     // doola's own registered agent provides both addresses. This is not a convenience: an AGENT
     // has no premises, and a mailing address it does not control is the difference between a
@@ -641,11 +925,17 @@ function confirm(
   // B's sweeper test; the retry path had no coverage before it.
   const from = requests.find(companyId, "create_provider")?.state ?? row.state;
   if (from === "confirmed" || from === "abandoned") return;
-  requests.transition(companyId, "create_provider", from, "confirmed", {
-    providerRef: doolaCompanyId,
-    detail: JSON.stringify(detail),
-    error: null,
-  });
+  // §4.4's transaction again, and this is the arm that covers the ADOPT path: a company found by
+  // the pre-create lookup, or resumed from a persisted ref, reaches its `provider_ref` here and
+  // nowhere else. `eraseSsn` is idempotent, so the create path passing through both writes is a
+  // no-op the second time.
+  persistRefAndEraseSsn(d, () =>
+    requests.transition(companyId, "create_provider", from, "confirmed", {
+      providerRef: doolaCompanyId,
+      detail: JSON.stringify(detail),
+      error: null,
+    }),
+  );
   recordCompanyEvent(
     d.repo,
     d.company.companyId,
@@ -685,6 +975,7 @@ function failStep(
   row: FormationRequestRecord,
   error: string,
   cause?: unknown,
+  detailPatch?: Partial<CreateProviderDetail>,
 ): void {
   const companyId = d.company.companyId;
   const described: { code?: string; requestId?: string } = cause ? describeDoolaError(cause) : {};
@@ -692,7 +983,18 @@ function failStep(
   // sweeper park rows too, and three copies of that contract would be three chances to burn an
   // attempt without parking the row (or the reverse). What stays HERE is what is specific to the
   // create: the entity audit event, and doola's own error code on the ops line.
-  failFormationStep(d, companyId, "create_provider", error, { code: described.code });
+  //
+  // The detail patch rides INSIDE that transaction rather than being a second write after it: the
+  // `awaitingIntakeEdit` flag is what stops the sweeper retrying, and a crash between the fail and
+  // a separate flag write is exactly the window in which the unchanged body goes out again.
+  failFormationStep(
+    d,
+    companyId,
+    "create_provider",
+    error,
+    { code: described.code },
+    { detailPatch },
+  );
   recordCompanyEvent(
     d.repo,
     d.company.companyId,
@@ -705,4 +1007,68 @@ function failStep(
     code: described.code,
     requestId: described.requestId,
   });
+}
+
+/**
+ * Tell somebody that a filing is now waiting on a HUMAN (§4.7).
+ *
+ * A rejected create no longer retries itself, which is the fix — and the cost of that fix is that
+ * nothing else will ever move this company either. Silence would be the worse failure of the two,
+ * so the park announces itself on both surfaces that exist: `formation_stale` CRITICAL for the
+ * operator (the same event the seven-day alarm uses, because it is the same class of fact — a
+ * filing that has stopped and will not restart on its own), and a required-action event on every
+ * agent attached to the company, which is where the UI already renders one.
+ *
+ * Once, at the moment it happens, rather than daily from the sweeper: the sweeper is now
+ * deliberately not looking at this row.
+ */
+function parkedForIntakeEdit(d: FormationCreateDeps, message: string): void {
+  opsLog("formation_stale", {
+    level: "error",
+    severity: "CRITICAL",
+    companyId: d.company.companyId,
+    step: "create_provider",
+    reason: "create_rejected_awaiting_intake_edit",
+    // Third-party text: redacted at the choke point in `opsLog`, like every other `message`.
+    message,
+    environment: d.environment,
+  });
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
+    "formationStale",
+    "action required: the provider REJECTED this filing, so it will NOT be retried as it stands — nothing more happens until the intake is corrected. Edit the company's details (and re-supply the SSN if one was given) to retry it.",
+  );
+}
+
+/**
+ * Tell somebody that a filing is waiting on a human because the PARTY was refused (review 5b).
+ *
+ * Its OWN event and its own sentence, not a re-use of the intake one, for the reason an operator
+ * cares about: these two parks are answered differently. `formation_stale` /
+ * `create_rejected_awaiting_intake_edit` is a self-service fix — the owner edits the company and
+ * the filing retries itself. This one has no such door until A3, so the message must not tell
+ * anybody to go and edit a company: the fields doola refused are not on that form, and an edit
+ * there would clear nothing.
+ *
+ * CRITICAL for the same reason, and arguably more so: a company parked here needs a person to
+ * pick it up, and nothing in the system will nudge anybody a second time.
+ */
+function parkedForPartyEdit(d: FormationCreateDeps, message: string): void {
+  opsLog("formation_party_rejected", {
+    level: "error",
+    severity: "CRITICAL",
+    companyId: d.company.companyId,
+    step: "create_provider",
+    reason: "customer_rejected_awaiting_party_edit",
+    // Third-party text: redacted at the choke point in `opsLog`, like every other `message`.
+    message,
+    environment: d.environment,
+  });
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
+    "formationStale",
+    "action required: the provider REFUSED the responsible party's details (name, email, phone or address), so this filing will NOT be retried as it stands. Editing a party is not yet self-service — it arrives with the legal-identity form — so please contact support to correct them.",
+  );
 }

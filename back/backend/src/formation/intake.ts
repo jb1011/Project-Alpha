@@ -81,6 +81,60 @@ export function normalizeCompanyName(raw: string): string {
     .toLowerCase();
 }
 
+// ── canonicalization + limits (design §5, A2) ───────────────────────────────────────────────
+
+/**
+ * CANONICALIZE, once, at the door: NFC then trim, and nothing else.
+ *
+ * Two forms of one string must not become two candidates, and the stored value must be the value
+ * SENT — the filer forwards `name_options` verbatim, and the §5 matcher compares doola's reported
+ * name against exactly these rows. Any further transformation here would be a value the caller
+ * did not type being filed with the state.
+ */
+export function canonicalizeIntakeText(raw: string): string {
+  return raw.normalize("NFC").trim();
+}
+
+/** Exactly three candidates (§5). Wyoming refuses a taken name and a retry is a second fee. */
+export const NAME_OPTION_COUNT = 3;
+/** The stored/sent length bound, matching A1's single-name limit. */
+export const NAME_MAX_LENGTH = 120;
+/** doola requires a description and does not document a maximum; this keeps the body sane and
+ *  the filed purpose readable. */
+export const PURPOSE_MAX_LENGTH = 500;
+
+/**
+ * The characters Wyoming accepts in an entity name — deliberately NARROW.
+ *
+ * ASCII letters, digits, spaces and `& ' - , . ( ) +`. The two errors are not symmetric: a name
+ * we refuse that Wyoming would have accepted is an annoyance with a message naming the character,
+ * while a name Wyoming refuses costs a filing fee, parks the company and needs a human. Widening
+ * this set later is one line and a test; narrowing it after a caller has filed is not.
+ *
+ * Accented letters are OUT for the same reason — the Secretary of State's published standard is
+ * English letters and Arabic numerals, and a canonicalized "Café" would be filed as typed.
+ */
+const NAME_CHARSET = /^[A-Za-z0-9 &'\-,.()+]*$/;
+
+/** The first character the charset refuses, or null. Returned rather than a boolean so the
+ *  refusal can name it. */
+export function firstIllegalNameChar(name: string): string | null {
+  for (const ch of name) if (!NAME_CHARSET.test(ch)) return ch;
+  return null;
+}
+
+/**
+ * The DUPLICATE comparison form.
+ *
+ * `normalizeCompanyName` plus a whitespace collapse: "Acme  Robotics" and "Acme Robotics LLC" are
+ * one candidate as far as Wyoming is concerned, and three candidates that are really one leave
+ * the filing with no fallback at all. The collapse lives HERE and not in the stored value,
+ * because storage must stay the string the caller typed (see `canonicalizeIntakeText`).
+ */
+export function duplicateKey(name: string): string {
+  return normalizeCompanyName(name).replace(/\s+/g, " ");
+}
+
 /** The intake a company row is minted from. A1 synthesizes it; A2 collects it. */
 export interface CompanyIntake {
   nameOptions: CompanyNameOption[];

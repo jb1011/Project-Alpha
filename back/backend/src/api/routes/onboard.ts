@@ -4,15 +4,22 @@ import type { GuardianPasskey } from "../../adapters/turnkey/provisioner";
 import type { AuthVars } from "../../auth/middleware";
 import { custodyUnavailableMessage } from "../../custody";
 import {
+  companyNamesRequiredMessage,
   createFormationParty,
   formationDoorRefusal,
   formationUnavailableMessage,
   truncateTenant,
 } from "../../formation";
-import { createCompany } from "../../formation/company";
+import { createCompany, updateCompanyIntake } from "../../formation/company";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
-import { AgentSpecSchema, FormationPartySchema } from "../../policy/agentSpec";
+import {
+  AgentSpecSchema,
+  CreateCompanyBodySchema,
+  FormationPartySchema,
+  UpdateCompanyIntakeBodySchema,
+  firstIssueMessage,
+} from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 import { listCompanyViews, toEntityView, toEntityViews } from "../views";
@@ -103,37 +110,79 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    * and the A1 onboard shim call too — one function, so the three doors cannot disagree about
    * what a company costs.
    *
-   * A1 accepts the SYNTHESIZED intake (a name, and the defaults); A2 replaces it with the real
-   * three-candidate form, the business purpose, the industry and the SSN. The stored shape is
-   * already canonical, so that is a change to this handler and not to the row.
+   * It takes the PRODUCTION intake (§5): three ranked name candidates, the company's own
+   * business purpose, an industry from the shipped reference list — and, on a production
+   * deployment only, the responsible party's SSN. Everything is validated inside
+   * `createCompany`, so the two doors refuse the same things in the same words; this handler
+   * only decides what is a well-formed HTTP body.
+   *
+   * **This is the ONLY door that takes an SSN** (§4.1), and it takes it on THIS request because
+   * the AAD it is encrypted under is `party_id || company_id` — the company id does not exist
+   * until the create mints it. Never echoed back, never logged, never in a view.
    */
   app.post("/companies", async (c) => {
     const tenantId = c.get("tenantId");
     if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
 
-    let body: { partyId?: unknown; name?: unknown; synthetic?: unknown };
-    try {
-      body = await c.req.json();
-    } catch {
-      throw new ApiError("validation_error", 400, "invalid JSON body");
-    }
-    if (typeof body.partyId !== "string" || !body.partyId)
-      throw new ApiError("validation_error", 400, "partyId is required");
-    if (typeof body.name !== "string" || !body.name.trim())
-      throw new ApiError("validation_error", 400, "name is required");
+    // TYPE checks only, from the ONE schema both company doors parse — the CONTENT rules (length,
+    // charset, restricted words, duplicates, the industry list, the SSN format) all live in
+    // `createCompany`, where MCP meets them too.
+    const body = CreateCompanyBodySchema.safeParse(await readJson(c));
+    if (!body.success) throw new ApiError("validation_error", 400, firstIssueMessage(body.error));
 
     const result = createCompany(
       // The composition root's ONE dependency set; this door supplies only its transaction.
       { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
       tenantId,
       {
-        partyId: body.partyId,
-        name: body.name,
-        synthetic: body.synthetic === true ? true : undefined,
+        partyId: body.data.partyId,
+        names: body.data.names,
+        businessPurpose: body.data.businessPurpose,
+        industryLabel: body.data.industryLabel,
+        ssn: body.data.ssn,
+        synthetic: body.data.synthetic === true ? true : undefined,
       },
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+    // The companyId and nothing else. Echoing the intake back would put the SSN in a response
+    // body, in any client that persists responses, and in any proxy log along the way.
     return c.json({ companyId: result.companyId }, 201);
+  });
+
+  /**
+   * EDIT-AND-RETRY (design §4.7) — re-open a frozen intake, with a fresh SSN capture.
+   *
+   * REST only, and for the same reason `POST /companies` is: this is the door that may carry an
+   * SSN, and an SSN never travels as an MCP tool argument. There is no MCP twin, deliberately.
+   *
+   * The freeze itself is a property of the ROW (`companies.updateIntake`'s WHERE clause), not of
+   * this handler: three surfaces can reach a company, and a route-level check is a check one more
+   * door can forget. This handler decides only what is a well-formed HTTP body.
+   */
+  app.patch("/companies/:companyId", async (c) => {
+    const tenantId = c.get("tenantId");
+    if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
+
+    const body = UpdateCompanyIntakeBodySchema.safeParse(await readJson(c));
+    if (!body.success) throw new ApiError("validation_error", 400, firstIssueMessage(body.error));
+
+    const result = updateCompanyIntake(
+      { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
+      tenantId,
+      c.req.param("companyId"),
+      {
+        names: body.data.names,
+        businessPurpose: body.data.businessPurpose,
+        industryLabel: body.data.industryLabel,
+        ssn: body.data.ssn,
+        // The §4.6a decision, and deliberately a strict `=== true`: "file without one" is a
+        // choice a caller makes, never something a truthy value makes for them.
+        proceedWithoutSsn: body.data.proceedWithoutSsn === true ? true : undefined,
+      },
+    );
+    if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+    // The id and nothing else — the same rule the create follows, for the same reason.
+    return c.json({ companyId: result.companyId });
   });
 
   /**
@@ -249,4 +298,12 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       throw new ApiError("pocket_funding_failed", 502, (e as Error).message);
     }
   });
+} /** The body, or the door's own 400 — a malformed JSON body is not a schema violation, and saying
+ *  so is more use to a caller than a list of missing fields. */
+async function readJson(c: { req: { json(): Promise<unknown> } }): Promise<unknown> {
+  try {
+    return await c.req.json();
+  } catch {
+    throw new ApiError("validation_error", 400, "invalid JSON body");
+  }
 }

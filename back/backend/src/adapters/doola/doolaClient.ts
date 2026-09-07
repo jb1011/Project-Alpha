@@ -1,3 +1,4 @@
+import { redactPii } from "../../formation/pii";
 import { opsLog } from "../../observability/opsLog";
 import { withDeadline } from "../../util/deadline";
 import { readCappedText } from "../../util/readStreamCapped";
@@ -11,6 +12,7 @@ import type {
   DoolaDocument,
   DoolaDocumentDownload,
   DoolaErrorEnvelope,
+  DoolaNaicsCode,
   DoolaPlaygroundResult,
   DoolaRequiredAction,
 } from "./types";
@@ -114,10 +116,23 @@ export function describeDoolaError(e: unknown): {
   requestId?: string;
 } {
   if (e instanceof DoolaApiError)
-    return { message: `${e.code}: ${e.message}`, code: e.code, requestId: e.requestId };
-  if (e instanceof DoolaTimeoutError) return { message: e.message, code: "E_TIMEOUT" };
-  return { message: (e as Error)?.message ?? String(e) };
+    return { message: redactPii(`${e.code}: ${e.message}`), code: e.code, requestId: e.requestId };
+  if (e instanceof DoolaTimeoutError) return { message: redactPii(e.message), code: "E_TIMEOUT" };
+  return { message: redactPii((e as Error)?.message ?? String(e)) };
 }
+
+/**
+ * The message a doola failure carries is a THIRD PARTY's text, and a validation error that quotes
+ * the offending field is an ordinary thing for an API to return — doola's error envelope carries
+ * a `fields` map, and our own `E_REQUEST_BODY_INVALID` handling passes the message straight into
+ * `formation_requests.error`, the entity event trail and the ops line.
+ *
+ * So it is redacted here as well as at the three choke points, and `redactPii` is idempotent, so
+ * passing through both costs nothing. The definition lives in `formation/pii.ts` beside the
+ * validator it is derived from — this file is one producer of many, and the defence stopped being
+ * a property of doola's client the moment there was a second way for a nine-digit run to reach a
+ * log line.
+ */
 
 /**
  * What a failed doola call actually tells us about doola's state (C1).
@@ -169,6 +184,15 @@ export interface DoolaApi {
   getDocumentDownloadUrl(companyId: string, documentId: string): Promise<DoolaDocumentDownload>;
   listRequiredActions(companyId: string): Promise<DoolaRequiredAction[]>;
   getComplianceCalendar(companyId: string): Promise<DoolaComplianceEvent[]>;
+  /**
+   * The NAICS reference table. **SCRIPT-ONLY** (design §5).
+   *
+   * It exists for `scripts/refresh-naics.mts`, which regenerates
+   * `src/formation/naicsLabels.ts` — a BUILD-TIME constant. Nothing in the request path may call
+   * it: the industry picker sits at the very top of the funnel, and putting a partner round trip
+   * there would make a form that cannot render when doola is slow, plus a cache nobody specified.
+   */
+  listNaicsCodes(): Promise<DoolaNaicsCode[]>;
   /** SANDBOX ONLY: force the formation to complete. Refused against production by construction.
    *  Resolves with the webhook events the call actually fired (`triggeredEvents`). */
   playgroundCompleteFormation(companyId: string): Promise<DoolaPlaygroundResult | undefined>;
@@ -416,6 +440,15 @@ export function buildDoolaApi(cfg: DoolaClientConfig): DoolaApi {
         `${API_PREFIX}/companies/${companyId}/compliance/calendar`,
       );
       return cal?.events ?? [];
+    },
+    async listNaicsCodes() {
+      // A bare array in the envelope, and `payload: null` is a legitimate empty list.
+      return (
+        (await callPayload<DoolaNaicsCode[] | null>(
+          "GET",
+          `${API_PREFIX}/references/naics-codes`,
+        )) ?? []
+      );
     },
     async playgroundCompleteFormation(companyId) {
       assertSandbox("playgroundCompleteFormation");

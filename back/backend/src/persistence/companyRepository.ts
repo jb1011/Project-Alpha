@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { DoolaEnvironment } from "../adapters/doola/types";
+import { INTAKE_FROZEN_SQL } from "../formation/freeze";
 import type { CompanyNameOption } from "../formation/intake";
 
 /**
@@ -161,6 +162,29 @@ export interface CompanyRepository {
   ): boolean;
   /** The EIN, once the IRS has issued it. Returns whether anything changed. */
   recordEin(companyId: string, ein: string): boolean;
+
+  /**
+   * INTAKE IMMUTABILITY (design 2026-08-26 §4.7), enforced HERE rather than at the route.
+   *
+   * Name options, purpose and industry are FROZEN once the first create has been sent, and the
+   * freeze is a property of the ROW, not of a door: three surfaces can reach a company and only
+   * one predicate may decide whether it is still editable. So the whole rule is the WHERE clause
+   * of one UPDATE, and a caller learns the answer from whether it changed anything.
+   *
+   * The predicate is `INTAKE_FROZEN_SQL`, imported from `formation/freeze.ts` — which is also
+   * where the prose explaining each of its four clauses lives, and where the TypeScript twin the
+   * filer uses sits beside it under a test that asserts the two agree.
+   *
+   * `intake_synthesized` is cleared: a human typed these values.
+   */
+  updateIntake(
+    companyId: string,
+    intake: {
+      nameOptions: CompanyNameOption[];
+      businessPurpose: string;
+      industryLabel: string;
+    },
+  ): boolean;
 }
 
 export class SqliteCompanyRepository implements CompanyRepository {
@@ -217,6 +241,25 @@ export class SqliteCompanyRepository implements CompanyRepository {
       ein: db.prepare(
         `UPDATE companies SET ein = ?, updated_at = CURRENT_TIMESTAMP
           WHERE company_id = ? AND (ein IS NULL OR ein <> ?)`,
+      ),
+      // The §4.7 freeze, as the WHERE clause of the one UPDATE that can re-open an intake — and
+      // the predicate itself is IMPORTED, not written here: the filer asks the same question of
+      // the same row (`resolveSsn`), and two spellings of the idempotency contract is one
+      // spelling too many. See `formation/freeze.ts` for why each disjunct is there.
+      //
+      // The company-level arm stays local, because it is a predicate over the row being updated
+      // rather than over the sub-saga: an `abandoned` company is over, whatever its step says.
+      updateIntake: db.prepare(
+        `UPDATE companies
+            SET name_options = @name_options,
+                business_purpose = @business_purpose,
+                industry_label = @industry_label,
+                -- A human typed these.
+                intake_synthesized = 0,
+                updated_at = CURRENT_TIMESTAMP
+          WHERE company_id = @company_id
+            AND status <> 'abandoned'
+            AND NOT ${INTAKE_FROZEN_SQL}`,
       ),
     };
   }
@@ -337,5 +380,23 @@ export class SqliteCompanyRepository implements CompanyRepository {
 
   recordEin(companyId: string, ein: string): boolean {
     return this.stmts.ein.run(ein, companyId, ein).changes === 1;
+  }
+
+  updateIntake(
+    companyId: string,
+    intake: {
+      nameOptions: CompanyNameOption[];
+      businessPurpose: string;
+      industryLabel: string;
+    },
+  ): boolean {
+    return (
+      this.stmts.updateIntake.run({
+        company_id: companyId,
+        name_options: JSON.stringify(intake.nameOptions),
+        business_purpose: intake.businessPurpose,
+        industry_label: intake.industryLabel,
+      }).changes === 1
+    );
   }
 }

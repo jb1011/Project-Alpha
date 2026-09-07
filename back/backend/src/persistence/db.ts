@@ -58,6 +58,15 @@ const FORMATION_PARTIES_DDL = `
       -- PREVIOUS key is SELECTED rather than trial-decrypted. Written by A2; the columns exist
       -- now so the erasure statement below is complete from the day the first one is written.
       ssn_ciphertext BLOB, ssn_iv BLOB, ssn_key_id TEXT, ssn_deleted_at TEXT,
+      -- WHEN the SSN was captured, which is what the 7-day clock actually runs from (§4.6a).
+      -- NOT the company's created_at: the §4.7 edit-and-retry captures a NEW number onto a
+      -- company that may be days old, and a clock keyed to the company would erase it on the
+      -- next sweep — deleting, within minutes, a number a caller had just been asked for.
+      ssn_captured_at TEXT,
+      -- WHY this row holds no SSN: provider_persisted | terminal | ttl | intake_reopened. It is
+      -- written by every erase path, and it is read by code rather than only by an operator: a
+      -- filing that finds the SSN gone needs to know what took it.
+      ssn_erased_reason TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       deleted_at TEXT
     );
@@ -72,6 +81,16 @@ const FORMATION_PARTIES_INDEX_DDL = `
   -- every unbound party still coexists happily.
   CREATE UNIQUE INDEX IF NOT EXISTS idx_formation_parties_company
     ON formation_parties(company_id);
+  -- The RETENTION SWEEP's index, and PARTIAL on purpose (§4.6a).
+  --
+  -- listSsnRetention asks "which parties still hold an SSN?", and the answer is a handful at any
+  -- moment — exactly the companies between an intake and a provider_ref — inside a table that
+  -- grows forever and whose rows keep their PII columns NULL for the rest of their lives. A full
+  -- index over company_id would carry every one of those dead rows; the WHERE clause makes the
+  -- index hold only the live ones, so the sweep's cost tracks the work outstanding rather than
+  -- the history.
+  CREATE INDEX IF NOT EXISTS idx_formation_parties_ssn_held
+    ON formation_parties(company_id) WHERE ssn_ciphertext IS NOT NULL;
 `;
 
 /**
@@ -707,6 +726,11 @@ export function migrate(db: Database.Database): void {
     ["ssn_iv", "BLOB"],
     ["ssn_key_id", "TEXT"],
     ["ssn_deleted_at", "TEXT"],
+    // A2: the capture clock and the erasure reason. NULL on every existing row, which both
+    // readers handle — the retention query falls back to the company's `created_at` (the clock
+    // A2 shipped with), and a NULL reason means "nothing was ever erased here".
+    ["ssn_captured_at", "TEXT"],
+    ["ssn_erased_reason", "TEXT"],
   ] as const)
     if (!partyColsNow.includes(col))
       db.exec(`ALTER TABLE formation_parties ADD COLUMN ${col} ${type}`);

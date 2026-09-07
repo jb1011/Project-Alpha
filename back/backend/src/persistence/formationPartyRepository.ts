@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import { everSubmitted } from "../formation/freeze";
+import type { EncryptedSsn } from "../formation/pii";
+import type { SsnErasedReason } from "../formation/ssnErasure";
+import type { CompanyStatus } from "./companyRepository";
+import type { FormationState } from "./formationRepository";
 
 /**
  * The formation party — the natural person legally answerable for a filed entity (design §3/§5).
@@ -48,6 +53,15 @@ export interface FormationPartyRecord {
   synthetic: boolean;
   /** Erasure marker for a party that never reached a filing. */
   deletedAt: string | null;
+  /**
+   * WHY this row holds no SSN, or null when the question has never arisen (§4.6a).
+   *
+   * Read by the FILER, not only by an operator: `ttl` means the CLOCK took a number the caller
+   * supplied, before anything was ever sent — and a filing that discovers that must park for a
+   * human rather than quietly file a body without it. `none` is the mark left by a human who
+   * decided to proceed without one.
+   */
+  ssnErasedReason: SsnErasedReason | null;
 }
 
 /**
@@ -59,7 +73,7 @@ export interface FormationPartyRecord {
  */
 export type NewFormationParty = Omit<
   FormationPartyRecord,
-  "partyId" | "entityKey" | "companyId" | "deletedAt" | "createdAt"
+  "partyId" | "entityKey" | "companyId" | "deletedAt" | "createdAt" | "ssnErasedReason"
 > & {
   partyId?: string;
 };
@@ -82,6 +96,7 @@ interface Row {
   synthetic: number;
   created_at: string;
   deleted_at: string | null;
+  ssn_erased_reason: string | null;
 }
 
 function toRecord(r: Row): FormationPartyRecord {
@@ -103,7 +118,50 @@ function toRecord(r: Row): FormationPartyRecord {
     synthetic: r.synthetic === 1,
     createdAt: r.created_at,
     deletedAt: r.deleted_at,
+    ssnErasedReason: (r.ssn_erased_reason as SsnErasedReason | null) ?? null,
   };
+}
+
+/**
+ * One SSN-holding row, with everything the TTL sweeper needs to decide (design §4.6a).
+ *
+ * It is a JOIN rather than four reads because the decision is a conjunction over three tables,
+ * and it is answered in TypeScript rather than in SQL because the set is tiny by construction —
+ * only rows that still hold an SSN, which is the handful of companies between an intake and a
+ * `provider_ref`. A predicate this consequential is worth reading as prose.
+ */
+export interface SsnRetentionRow {
+  partyId: string;
+  companyId: string;
+  /**
+   * When the SSN was captured, as a SQLite UTC TEXT — `formation_parties.ssn_captured_at`.
+   *
+   * It used to be the COMPANY's `created_at`, on the argument that the SSN rides the same
+   * request that mints the company. That is true of the FIRST capture and false of every other
+   * one: §4.7's edit-and-retry captures a fresh number onto a company that may be a week old, and
+   * a clock keyed to the company row would erase it on the next sweep — deleting, within minutes,
+   * a number the caller had just been asked for and believes is in flight. The clock has to run
+   * from the CAPTURE, so the capture is what the column records.
+   *
+   * Rows written before the column existed have NULL, and the query falls back to the company's
+   * `created_at`: the same answer those rows have always had.
+   */
+  capturedAt: string;
+  companyStatus: CompanyStatus;
+  /** `create_provider`'s state, or null when the step was never opened at all. */
+  createState: FormationState | null;
+  providerRef: string | null;
+  /**
+   * Has this company's filing EVER been in flight at doola?
+   *
+   * Deliberately broader than "the row is currently `submitted`", because a row that was
+   * submitted and then failed is back at `failed` and its state no longer remembers. It is true
+   * for a live/terminal state, for a persisted `provider_ref`, and for a `detail` carrying a
+   * customer id or a `companySentAttempt` — any one of which means we have talked to doola about
+   * this company. The failure direction is deliberate: keeping an SSN a week too long is a
+   * retention miss, while erasing one mid-flight wedges a same-key retry (§4.4).
+   */
+  everSubmitted: boolean;
 }
 
 /** The narrow surface the doors and the saga use. Injectable so tests fake it honestly. */
@@ -150,6 +208,54 @@ export interface FormationPartyRepository {
    * Returns false when the row was already erased (idempotent under a re-run of the sweep).
    */
   erase(partyId: string): boolean;
+
+  // ── THE SSN (design 2026-08-26 §4) ────────────────────────────────────────────────────────
+  //
+  // Three operations and one query, and every one of them is keyed by the COMPANY as well as the
+  // party. That is not redundancy: the AAD the ciphertext is sealed under is `party_id ||
+  // company_id`, so a read that did not know the company could not decrypt anyway, and a write
+  // that did not check it could seal a row under a binding nothing will ever satisfy.
+
+  /**
+   * Store an encrypted SSN against a bound party. Returns whether it was written.
+   *
+   * CAS on the (party, company) pair AND on there being no live ciphertext, so an SSN is
+   * WRITE-ONCE for as long as one exists. `ssn_deleted_at` is cleared, because the one path that
+   * writes over an erased row is the §4.7 edit-and-retry re-capture, and a row holding a live
+   * ciphertext under an "erased on" stamp would be a lie in the audit trail.
+   */
+  storeSsn(partyId: string, companyId: string, rec: EncryptedSsn): boolean;
+
+  /**
+   * The stored SSN for a company, with the party id the AAD needs. Undefined when there is none —
+   * which is the ordinary state of every company past its `provider_ref`.
+   */
+  findSsnByCompanyId(companyId: string): (EncryptedSsn & { partyId: string }) | undefined;
+
+  /**
+   * ERASE the SSN, stamp `ssn_deleted_at`, and RECORD WHY, leaving the rest of the party intact.
+   *
+   * Its own operation, distinct from `erase`: the SSN dies at the moment the filing no longer
+   * needs it (§4.4 — the transaction that persists `provider_ref`), which is typically YEARS
+   * before the party row itself is erasable, if ever. Idempotent: false means there was nothing
+   * to erase, which is what every backstop pass sees.
+   *
+   * The reason is REQUIRED rather than optional: the record is the only thing that remains once
+   * the value is gone. Call it through `eraseSsnLogged`, which is what makes the ops line
+   * unforgettable too.
+   */
+  eraseSsn(companyId: string, reason: Exclude<SsnErasedReason, "none">): boolean;
+
+  /**
+   * Record that a human chose to file WITHOUT an SSN after the clock erased one (§4.6a).
+   *
+   * The second exit from the park a `ttl` erasure causes. Returns whether the row moved — false
+   * when the company holds a live SSN (nothing to decide) or has no party.
+   */
+  proceedWithoutSsn(companyId: string): boolean;
+
+  /** Every party still holding an SSN, with what the TTL clock needs to judge it (§4.6a). */
+  listSsnRetention(): SsnRetentionRow[];
 }
 
 export class SqliteFormationPartyRepository implements FormationPartyRepository {
@@ -213,8 +319,75 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
                 -- person's data erased and half not is exactly the window this shape avoids.
                 ssn_ciphertext = NULL, ssn_iv = NULL, ssn_key_id = NULL,
                 ssn_deleted_at = COALESCE(ssn_deleted_at, CURRENT_TIMESTAMP),
+                -- COALESCE, so an erasure that already has a reason keeps it. C7 only ever
+                -- fires for a company that provably never filed, or for a party that was never
+                -- used at all, which is the same terminal fact 'terminal' names.
+                ssn_erased_reason = COALESCE(ssn_erased_reason, 'terminal'),
                 deleted_at = CURRENT_TIMESTAMP
           WHERE party_id = ? AND deleted_at IS NULL`,
+      ),
+      // ── the SSN (§4) ──────────────────────────────────────────────────────────────────────
+      // Keyed on the (party, company) PAIR, which is the pair the ciphertext's AAD is sealed
+      // under: a write against the wrong company would produce a row nothing can ever open.
+      storeSsn: db.prepare(
+        `UPDATE formation_parties
+            SET ssn_ciphertext = @ciphertext, ssn_iv = @iv, ssn_key_id = @key_id,
+                -- THE CLOCK STARTS HERE, on every capture including a re-capture (§4.6a).
+                ssn_captured_at = CURRENT_TIMESTAMP,
+                -- Cleared, not kept: the one path that writes over an erased row is the §4.7
+                -- re-capture, and a live ciphertext under an "erased on" stamp is a lie. The
+                -- reason goes with it — a row that HOLDS an SSN has no explanation to give for
+                -- why it does not.
+                ssn_deleted_at = NULL,
+                ssn_erased_reason = NULL
+          WHERE party_id = @party_id AND company_id = @company_id
+            AND deleted_at IS NULL
+            -- WRITE-ONCE while one exists. A second SSN for a live filing would change the body
+            -- under an idempotency key doola is already holding (§4.4/§4.5).
+            AND ssn_ciphertext IS NULL`,
+      ),
+      findSsn: db.prepare(
+        `SELECT party_id, ssn_ciphertext, ssn_iv, ssn_key_id FROM formation_parties
+          WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
+      ),
+      eraseSsn: db.prepare(
+        `UPDATE formation_parties
+            SET ssn_ciphertext = NULL, ssn_iv = NULL, ssn_key_id = NULL,
+                ssn_deleted_at = CURRENT_TIMESTAMP,
+                -- WHY, on the row, in the same statement that destroys the value. Two writes
+                -- would be two chances to record one and not the other.
+                ssn_erased_reason = @reason,
+                -- The capture clock ends with the value it timed. Leaving it would make a
+                -- re-capture's freshness ambiguous, and ssn_deleted_at already records the
+                -- other end of the interval.
+                ssn_captured_at = NULL
+          WHERE company_id = @company_id AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
+      ),
+      // A human's decision to file WITHOUT one, after the clock took theirs (§4.6a). It is the
+      // OTHER exit from the parked filing — the first being a fresh capture — and it is a fact
+      // rather than a flag: the row stops saying "the clock took it" and starts saying "the
+      // owner said go ahead", which is what lets the next pass send a body with no `ssn` key.
+      proceedWithoutSsn: db.prepare(
+        `UPDATE formation_parties SET ssn_erased_reason = 'none'
+          WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NULL`,
+      ),
+      // Only rows that still HOLD an SSN — a handful at any moment, being exactly the companies
+      // between an intake and a `provider_ref`.
+      ssnRetention: db.prepare(
+        `SELECT p.party_id      AS party_id,
+                p.company_id    AS company_id,
+                -- The CAPTURE, falling back to the company for rows written before the column
+                -- existed — which is the clock those rows have always been judged by.
+                COALESCE(p.ssn_captured_at, c.created_at) AS captured_at,
+                c.status        AS company_status,
+                f.state         AS create_state,
+                f.provider_ref  AS provider_ref,
+                f.detail        AS detail
+           FROM formation_parties p
+           JOIN companies c ON c.company_id = p.company_id
+           LEFT JOIN formation_requests f
+             ON f.company_id = p.company_id AND f.step = 'create_provider'
+          WHERE p.deleted_at IS NULL AND p.ssn_ciphertext IS NOT NULL`,
       ),
     };
   }
@@ -272,4 +445,68 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
   erase(partyId: string): boolean {
     return this.stmts.erase.run(partyId).changes === 1;
   }
+
+  storeSsn(partyId: string, companyId: string, rec: EncryptedSsn): boolean {
+    return (
+      this.stmts.storeSsn.run({
+        party_id: partyId,
+        company_id: companyId,
+        ciphertext: rec.ciphertext,
+        iv: rec.iv,
+        key_id: rec.keyId,
+      }).changes === 1
+    );
+  }
+
+  findSsnByCompanyId(companyId: string): (EncryptedSsn & { partyId: string }) | undefined {
+    const r = this.stmts.findSsn.get(companyId) as
+      | {
+          party_id: string;
+          ssn_ciphertext: Buffer;
+          ssn_iv: Buffer;
+          ssn_key_id: string;
+        }
+      | undefined;
+    return r
+      ? {
+          partyId: r.party_id,
+          ciphertext: r.ssn_ciphertext,
+          iv: r.ssn_iv,
+          keyId: r.ssn_key_id,
+        }
+      : undefined;
+  }
+
+  eraseSsn(companyId: string, reason: Exclude<SsnErasedReason, "none">): boolean {
+    return this.stmts.eraseSsn.run({ company_id: companyId, reason }).changes === 1;
+  }
+
+  proceedWithoutSsn(companyId: string): boolean {
+    return this.stmts.proceedWithoutSsn.run(companyId).changes === 1;
+  }
+
+  listSsnRetention(): SsnRetentionRow[] {
+    const rows = this.stmts.ssnRetention.all() as {
+      party_id: string;
+      company_id: string;
+      captured_at: string;
+      company_status: CompanyStatus;
+      create_state: FormationState | null;
+      provider_ref: string | null;
+      detail: string | null;
+    }[];
+    return rows.map((r) => ({
+      partyId: r.party_id,
+      companyId: r.company_id,
+      capturedAt: r.captured_at,
+      companyStatus: r.company_status,
+      createState: r.create_state,
+      providerRef: r.provider_ref,
+      everSubmitted: everSubmitted(r.create_state, r.provider_ref, r.detail),
+    }));
+  }
 }
+
+// `everSubmitted` used to live here. It is now in `formation/freeze.ts`, beside the freeze
+// predicate: both are read off the same `create_provider` row, both treat an unreadable `detail`
+// as the cautious answer, and keeping them apart is how the two definitions of "in flight" drift.

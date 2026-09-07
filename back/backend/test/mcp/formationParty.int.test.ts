@@ -11,7 +11,9 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import type { GuardianPasskey } from "../../src/adapters/turnkey/provisioner";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
-import { createCompany } from "../../src/formation/company";
+import { ssnNotOnThisDoorMessage } from "../../src/formation";
+import { createCompany, shimCompanyIntake } from "../../src/formation/company";
+import { describeIndustryLabels } from "../../src/formation/naicsLabels";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -111,10 +113,13 @@ function buildTestApp(
           requests,
           maxAgentsPerCompany: 10,
           createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
-            const result = createCompany({ ...companyDeps, transaction: (fn) => fn() }, tenantId, {
-              ...intake,
-              synthetic: formation.syntheticPii ? true : undefined,
-            });
+            const result = createCompany(
+              { ...companyDeps, transaction: (fn) => fn() },
+              tenantId,
+              // The SHARED mapping (A2), not a literal: four copies of "what the shim sends" is
+              // four chances for it to mean something different on one surface.
+              shimCompanyIntake(intake, formation.syntheticPii ?? false),
+            );
             if ("error" in result) throw new Error(result.error);
             return result.companyId;
           },
@@ -410,6 +415,13 @@ test("the quota refuses onboard_agent before the entity is minted", async () => 
 /** The company projection's key set, asserted IDENTICALLY on both surfaces (§7). Its twin lives
  *  in test/api/formationParty.routes.test.ts; a field added to one door and not the other fails
  *  whichever of the two was forgotten. */
+/** The PRODUCTION intake over MCP (A2 §5) — the same three fields REST takes, minus the ssn. */
+const MCP_INTAKE = {
+  names: ["Acme Robotics LLC", "Acme Automata", "Acme Mechanicals"],
+  businessPurpose: "Operating autonomous software agents.",
+  industryLabel: "Software development",
+};
+
 const COMPANY_VIEW_KEYS = [
   "agents",
   "businessPurpose",
@@ -434,13 +446,28 @@ test("create_company is gated on FORMATION; list_companies on the company store,
   const create = tools.find((t) => t.name === "create_company")!;
   expect(create).toBeDefined();
   expect(tools.map((t) => t.name)).toContain("list_companies");
-  // ⚠ PERMANENT: an SSN in a tool argument would sit in an LLM client's context window and in
-  // its logs. The web form is the only place one is ever collected (§4.1).
+  // The PRODUCTION intake (A2 §5). `ssn` IS declared — and declared in order to be REFUSED: an
+  // undeclared field is not rejected by the SDK, it is silently STRIPPED by the tool's zod schema
+  // before the handler ever sees it, so a model that helpfully passed one would have got back a
+  // companyId with no indication the number had been thrown away and the slow EIN route taken —
+  // while the number sat in the client's context window and its logs, which is the entire harm
+  // §4.1 exists to prevent. The web form is the only place one is ever collected.
   expect(Object.keys(create.inputSchema.properties ?? {})).toEqual([
     "partyId",
-    "name",
+    "names",
+    "businessPurpose",
+    "industryLabel",
     "synthetic",
+    "ssn",
   ]);
+  expect(create.description).toMatch(/NEVER takes an SSN/);
+  expect(create.description).toMatch(/web form/);
+  // The industries are NAMED in the description: an agent-first caller has no GET /config, so
+  // the description is its only discovery surface for the one enumerated field — rendered by the
+  // SAME capped function the REST refusal uses, so a refreshed list of hundreds cannot turn this
+  // description into something that crowds out every other tool in the client's context window.
+  expect(create.description).toContain(`(${describeIndustryLabels()})`);
+  expect(create.description).toContain("Software development");
 
   const off = buildTestApp(undefined);
   const { key: key2 } = apiKeys.mint(TENANT, { capability: "provision" });
@@ -455,6 +482,44 @@ test("create_company is gated on FORMATION; list_companies on the company store,
   expect(offNames).toContain("list_companies");
 });
 
+test("an `ssn` argument is REFUSED, loudly, and NOTHING is created", async () => {
+  // The bug this pins: `ssn` was not declared on the tool, and an undeclared field is not
+  // rejected by the SDK — it is silently STRIPPED by the tool's zod schema before the handler
+  // sees it. A model that had read "US persons should supply an SSN" on the web form and helpfully
+  // passed one here would have got back a companyId, filed under the slow EIN route, with no
+  // indication the field had been thrown away — and with the number still sitting in the client's
+  // context window and its logs, which is the entire harm §4.1 exists to prevent.
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+
+  await withClient(app, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    const refused = await c.callTool({
+      name: "create_company",
+      arguments: { partyId, ...MCP_INTAKE, ssn: "123-45-6789" },
+    });
+    expect(refused.isError).toBe(true);
+    // It says where the field DOES belong — a refusal a caller cannot act on is a dead end.
+    expect(textOf(refused)).toBe(ssnNotOnThisDoorMessage());
+    // The refusal is the WHOLE answer: nothing exists afterwards to clean up, and the quota was
+    // not spent. The check therefore runs before any other validation.
+    expect(
+      JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} }))).companies,
+    ).toHaveLength(0);
+    // …and no digits of it are anywhere in the answer.
+    expect(textOf(refused)).not.toMatch(/\d{3}-\d{2}-\d{4}/);
+
+    // The very same call WITHOUT the field is accepted, so the refusal is about the ssn alone.
+    const ok = await c.callTool({
+      name: "create_company",
+      arguments: { partyId, ...MCP_INTAKE },
+    });
+    expect(JSON.parse(textOf(ok)).companyId).toBeTruthy();
+  });
+});
+
 test("MCP and REST mint the SAME company — one domain function, one set of refusals", async () => {
   const app = buildTestApp({ required: true });
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
@@ -465,18 +530,37 @@ test("MCP and REST mint the SAME company — one domain function, one set of ref
       textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
     );
     const { companyId } = JSON.parse(
-      textOf(
-        await c.callTool({ name: "create_company", arguments: { partyId, name: "Acme LLC" } }),
-      ),
+      textOf(await c.callTool({ name: "create_company", arguments: { partyId, ...MCP_INTAKE } })),
     );
     expect(companyId).toBeTruthy();
 
     // The single-use rule reaches this door too: one identity, one company.
     const reused = await c.callTool({
       name: "create_company",
-      arguments: { partyId, name: "Second" },
+      arguments: { partyId, ...MCP_INTAKE, names: ["Beta One", "Beta Two", "Beta Three"] },
     });
     expect(textOf(reused)).toMatch(/unknown, not yours, or already bound/);
+
+    // …and the INTAKE refusals are the same function's, so MCP and REST refuse in one voice.
+    const { partyId: fresh } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    expect(
+      textOf(
+        await c.callTool({
+          name: "create_company",
+          arguments: { partyId: fresh, ...MCP_INTAKE, names: ["Acme Bank", "B Works", "C Works"] },
+        }),
+      ),
+    ).toMatch(/restricted word "bank"/);
+    expect(
+      textOf(
+        await c.callTool({
+          name: "create_company",
+          arguments: { partyId: fresh, ...MCP_INTAKE, industryLabel: "Interpretive Dance" },
+        }),
+      ),
+    ).toMatch(/is not one of the industries we can file under/);
 
     // list_companies renders the same projection REST does, newest first — FIELD FOR FIELD.
     // The two are one API-level contract (the picker's ordering and its labels), and MCP was

@@ -171,6 +171,120 @@ production`) BOOT-FAILS** without all three `WORLD_*` credentials, without
 passes everyone when the World block is only half-configured, so the invariant asserts the wired
 dependency rather than the env strings.
 
+## A2: `FORMATION_PII_KEY` — the SSN encryption key
+
+Production formation collects the responsible party's SSN on the same request that mints the
+company, encrypts it immediately (AES-256-GCM, per-record IV, AAD = `party_id || company_id`), and
+deletes it in the transaction that records the doola company id. This is the key that does it.
+
+**It is a boot invariant.** `DOOLA_ENVIRONMENT=production` refuses to start without it. A sandbox
+deployment refuses to start WITH it — a sandbox box refuses the SSN field outright, so a key there
+is at best dead weight and at worst a production key pasted into the wrong `.env`.
+
+### Generating one
+
+```
+openssl rand -base64 32
+```
+
+32 bytes, base64 or hex. Anything that does not decode to exactly 32 bytes fails at boot with the
+variable named. The key's ID (a truncated SHA-256 of the material, prefixed `fpk1:`) appears in the
+boot log and in the ops trail; the material never does — `redact()` covers it, which matters
+because an un-redacted `Buffer` stringifies to its bytes.
+
+### Rotating
+
+Rotation is a two-key window, and it is a LOOKUP rather than a trial decrypt: every stored row
+names the key it was written with, so the previous key is *selected* for the rows that need it.
+
+1. generate a new key;
+2. set `FORMATION_PII_KEY` to the NEW key and `FORMATION_PII_KEY_PREVIOUS` to the one being
+   retired. **Both, in one restart** — `_PREVIOUS` alone is refused at boot, and the same key in
+   both slots is refused too (that is a rotation somebody believes they have done);
+3. restart. New captures use the new key immediately; existing rows keep decrypting under the old
+   one. In practice the window is short: an SSN's whole life is from the create-company request to
+   the moment doola returns a company id, and any that outlive 7 days without a filing are erased
+   by the sweeper;
+4. once `SELECT COUNT(*) FROM formation_parties WHERE ssn_key_id = '<old id>'` is zero, drop
+   `FORMATION_PII_KEY_PREVIOUS` and restart again. Two distinct key ids in the ops trail is how
+   you can see the rotation actually happening.
+
+### If the key is LOST
+
+Every SSN written under it is unrecoverable, permanently. That is the intended property of the
+scheme, and the consequences are bounded but real:
+
+- companies whose filing already returned a company id lose NOTHING: their SSN was deleted at that
+  moment. This is the overwhelming majority of rows;
+- a company whose create is still in flight — sent under a live idempotency key, no company id
+  back — will PARK with `formation_ssn_unreadable` (CRITICAL) rather than re-send. It cannot send
+  the body without the SSN (a different body under a live key is a 409 `E_IDEMPOTENCY_KEY_REUSED`)
+  and it must not re-key (that would file a SECOND real Wyoming LLC). Resolve it by restoring the
+  key as `FORMATION_PII_KEY_PREVIOUS`, or — only if the key is genuinely gone —
+  `npm run cli -- formation:abandon <entityKey>` and re-file with a fresh intake.
+
+**Back the key up where you back up the JWT secret and the doola API key, and nowhere else.**
+
+### What this key does and does not defend
+
+Stated honestly, because the runbook is where an operator forms their mental model: the key lives
+in the same `.env` as everything else on the box. Encryption at rest here defends the
+**Litestream→R2 replica** and any copy of the database file that leaves the machine. It does not
+defend against a compromised box. The controls that do the work there are the short retention (the
+SSN exists for minutes in the happy path) and the fact that it is forwarded exactly once.
+
+### The SSN's clocks (design §4.6a)
+
+Two, and they are separate on purpose:
+
+| Trigger | What happens |
+|---|---|
+| `provider_ref` persisted (create or adopt) | SSN erased in the SAME transaction. `formation_ssn_erased` with `reason: provider_persisted`. |
+| Company terminal (`abandoned`, or `create_provider` `confirmed`/`abandoned`) | SSN erased by the sweeper. `reason: terminal`. The `confirmed` arm is an idempotent backstop to the row above. |
+| SSN older than 7 days AND the filing never reached doola | SSN erased. `reason: ttl`. |
+| Day 7, filing DID reach doola, still no company id | **Nothing is erased.** `formation_stale` (CRITICAL) + a required-action event on every attached agent. A NULL `provider_ref` is not proof no company exists at doola, and an erased party makes the adopt path unrecoverable. |
+
+**No clock ever sets `abandoned`.** That still has exactly three writers: draft expiry (B1), the
+max-attempt path, and `formation:abandon`.
+
+Useful queries:
+
+```sql
+-- how many SSNs are we holding right now, and under which key?
+SELECT ssn_key_id, COUNT(*) FROM formation_parties
+ WHERE ssn_ciphertext IS NOT NULL GROUP BY ssn_key_id;
+
+-- anything stuck past its clock (should be empty; each row is a formation_stale alert)
+SELECT p.company_id, c.created_at
+  FROM formation_parties p JOIN companies c ON c.company_id = p.company_id
+ WHERE p.ssn_ciphertext IS NOT NULL
+   AND c.created_at < datetime('now', '-7 days');
+```
+
+## A2: the industry list
+
+`src/formation/naicsLabels.ts` is a GENERATED build-time constant, and the create door accepts
+only labels that are in it. **It currently holds one label** ("Software development", the only one
+verified live against doola's reference table), because no sandbox key was available when A2 was
+written. Before A3 ships the industry picker, run:
+
+```
+DOOLA_API_KEY=dk_test_… npx tsx scripts/refresh-naics.mts
+```
+
+and commit the result. The script refuses to write an empty list, and refuses to write one that no
+longer contains `DEFAULT_INDUSTRY` — every migrated and shimmed company carries that label, so
+losing it would make our own rows unedittable at our own door.
+
+## A2: the SSN wire shape cannot be smoke-tested
+
+Every other consequential doola contract here was settled by a sandbox probe. The SSN cannot be: a
+sandbox deployment refuses the field by invariant and the synthetic fixture omits it by design, so
+there is no way to send a real SSN to a sandbox and no way to send a fake one to production. It is
+pinned against doola's published OpenAPI instead — `test/adapters/doola/ssnWireShape.test.ts`
+records the field, its format (`XXX-XX-XXXX`) and the date it was fetched. **If doola changes the
+field, that file is where the change gets recorded.**
+
 ## A1 merge gates — the three things a human still has to run
 
 None of these can be a test: two of them cost real sandbox companies and need a live key, and no

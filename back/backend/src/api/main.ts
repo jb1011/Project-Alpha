@@ -37,7 +37,7 @@ import {
   loadConfig,
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
-import { createCompany } from "../formation/company";
+import { createCompany, shimCompanyIntake } from "../formation/company";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -359,6 +359,9 @@ async function main() {
         sandboxSyntheticPii: formationCfg.sandboxSyntheticPii,
         maxPerTenant: formationCfg.maxPerTenant,
         dailyCeiling: formationCfg.dailyCeiling,
+        // The SSN keyring (§4.2). Absent everywhere except production doola, where it is a boot
+        // invariant — and its absence makes the door REFUSE the field, never store it in clear.
+        pii: formationCfg.pii,
         world: worldId,
       }
     : undefined;
@@ -398,6 +401,9 @@ async function main() {
             parties: formationParties,
             companies,
             environment: cfg.doola!.environment,
+            // The SSN keyring (§4.2): the create forwards it ONCE and deletes it in the
+            // transaction that records the company id.
+            pii: formationCfg.pii,
           }
         : undefined,
     });
@@ -423,13 +429,10 @@ async function main() {
               // nested one, so a 409 below rolls the company back with everything else.
               { ...companyDeps!, transaction: (fn) => fn() },
               tenantId,
-              {
-                partyId: intake.partyId,
-                name: intake.name,
-                // The shim never invents a claim: it mirrors the deployment, which is what the
-                // party it is binding was already created against.
-                synthetic: formationCfg.sandboxSyntheticPii ? true : undefined,
-              },
+              // ONE mapping, shared with every test wiring of this shim — see
+              // `shimCompanyIntake`. It reaches `synthesizedName`, the field spelled for what it
+              // is, so no production door can fall into the derived-name path by accident.
+              shimCompanyIntake(intake, formationCfg.sandboxSyntheticPii),
             );
             if ("error" in result) throw new ApiError("validation_error", 400, result.error);
             return result.companyId;
@@ -481,6 +484,9 @@ async function main() {
     doola: doolaApi,
     // The DEPLOYMENT's environment, which is what every entity's pin is compared against.
     environment: cfg.doola!.environment,
+    // The SSN keyring (§4.2). The sweeper hands it to the filing step, which needs it to rebuild
+    // a body it already sent, and to the TTL leg, which needs only to erase.
+    pii: formationCfg.pii,
     intervalMs: cfg.formation?.sweepMs ?? 60_000,
     // The anchor sub-saga (design §7). The SAME `anchors` repo the saga writes the v1 row with
     // and the SAME `arc` adapter the saga mints through — a second adapter would be a second

@@ -1,3 +1,4 @@
+import { redactPii } from "../formation/pii";
 import {
   POLL_BASE_MS,
   POLL_CAP_MS,
@@ -123,19 +124,40 @@ export function failFormationStep(
   step: FormationStep,
   error: string,
   logExtra: Record<string, unknown> = {},
+  opts: {
+    /**
+     * Fields to merge into the row's `detail` INSIDE the fail transaction.
+     *
+     * It exists for `awaitingIntakeEdit` (§4.7): the flag is what stops the sweeper re-sending a
+     * body doola has already refused, and writing it after the fail would leave a crash window in
+     * which exactly that happens.
+     */
+    detailPatch?: Record<string, unknown>;
+  } = {},
 ): void {
   // Re-read rather than trusting a caller's snapshot: between the read that produced it and this
   // call there may have been a whole doola round trip.
   const row = d.requests.find(companyId, step);
   if (!row || row.state === "confirmed" || row.state === "abandoned") return;
   const from = row.state;
+  // A step's `error` reaches `formation_requests.error`, the entity event trail and an ops line,
+  // and it is very often a THIRD PARTY's sentence — which is the one that can carry an SSN a
+  // provider echoed back at us (§4). Redacted where it is written down, not where it was
+  // produced, so no producer can forget.
+  const safe = redactPii(error);
+  const fields =
+    opts.detailPatch === undefined
+      ? { error: safe }
+      : {
+          error: safe,
+          detail: JSON.stringify({ ...parseDetail(row.detail), ...opts.detailPatch }),
+        };
   d.repo.transaction(() => {
     const bumped = d.requests.bumpAttempt(companyId, step, from);
-    if (bumped !== undefined)
-      d.requests.transition(companyId, step, "pending", "failed", { error });
+    if (bumped !== undefined) d.requests.transition(companyId, step, "pending", "failed", fields);
     // Lost the bump race: another driver moved the row. Park it from wherever it now is, which
     // the CAS will simply refuse if that driver already parked it.
-    else d.requests.transition(companyId, step, from, "failed", { error });
+    else d.requests.transition(companyId, step, from, "failed", fields);
   });
   logFormationStep(companyId, step, "failed", row.attempt + 1, logExtra);
 }
@@ -174,7 +196,9 @@ export function parkFormationStep(
   const retryIntervalMs = nextInterval(detail.retryIntervalMs, RETRY_BASE_MS, RETRY_CAP_MS);
   const nextRetryAt = (d.now ?? Date.now)() + retryIntervalMs;
   d.requests.transition(companyId, step, row.state, "failed", {
-    error,
+    // Redacted here for the reason `failFormationStep` gives: this column is read by humans and
+    // its contents are frequently somebody else's sentence.
+    error: redactPii(error),
     detail: JSON.stringify({ ...detail, retryIntervalMs, nextRetryAt }),
     // A PARK IS NOT A FACT (2026-08-26 §3). Nothing was learned — a lost answer, a transient read
     // failure, a config mismatch — and the only thing written is the retry schedule. Moving
