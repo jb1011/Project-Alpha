@@ -217,21 +217,33 @@ export function buildApiApp(deps: ApiDeps) {
   if (deps.x402Demo) mountX402DemoRoutes(app, deps.x402Demo);
   mountAuthRoutes(app, deps);
   mountPasskeyRoutes(app, deps);
-  app.use("/onboard", requireAuth(deps.jwtSecret));
-  app.use("/formation-party", requireAuth(deps.jwtSecret));
-  app.use("/companies", requireAuth(deps.jwtSecret));
-  // The SUBPATH too, exactly as `/entities` has both: Hono's `use` on a bare path matches that
-  // path only, so `PATCH /companies/:companyId` (A2's edit-and-retry, which carries an SSN) would
-  // otherwise be UNAUTHENTICATED with no tenant to scope it by. A3's document routes move under
-  // here as well.
-  app.use("/companies/*", requireAuth(deps.jwtSecret));
-  app.use("/entities", requireAuth(deps.jwtSecret));
-  app.use("/entities/*", requireAuth(deps.jwtSecret));
-  app.use("/jobs/*", requireAuth(deps.jwtSecret));
-  app.use("/api-keys", requireAuth(deps.jwtSecret));
-  app.use("/api-keys/*", requireAuth(deps.jwtSecret));
-  app.use("/connection-package", requireAuth(deps.jwtSecret));
-  app.use("/bootstrap-connection", requireAuth(deps.jwtSecret));
+  /**
+   * REQUIRE AUTH ON A PREFIX — the bare path AND everything under it, always both.
+   *
+   * Hono's `use` on a bare path matches THAT PATH ONLY. The list here was written by hand and had
+   * already drifted into three shapes — some prefixes with `/*`, some without, one pair added
+   * later — and every missing `/*` is a route somebody adds next month that answers without a
+   * tenant. `PATCH /companies/:companyId` was exactly that: A2's edit-and-retry, the second door
+   * that can carry an SSN, unauthenticated because `/companies` had no `/*` beside it.
+   *
+   * A helper rather than a list of pairs, so the question "is this prefix protected?" has one
+   * answer per prefix instead of two that can disagree. Registration order still matters: this
+   * runs after the public routes are mounted and before the protected ones, which is why the call
+   * sites stay here rather than moving next to each `mount*`.
+   */
+  const protect = (path: string) => {
+    app.use(path, requireAuth(deps.jwtSecret));
+    app.use(`${path}/*`, requireAuth(deps.jwtSecret));
+  };
+  protect("/onboard");
+  protect("/formation-party");
+  // A3's document routes move under `/companies` as well, and inherit this.
+  protect("/companies");
+  protect("/entities");
+  protect("/jobs");
+  protect("/api-keys");
+  protect("/connection-package");
+  protect("/bootstrap-connection");
   mountWorldIdRoutes(app, deps); // routes carry their own requireAuth (like /passkey)
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
