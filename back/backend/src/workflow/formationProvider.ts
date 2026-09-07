@@ -496,14 +496,11 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
   //       And this is the transaction §4.4 names: the SSN dies with the write that records the
   //       company id. It has been forwarded, once; nothing downstream ever needs it again.
   detail = { ...detail, companyId: company.doolaCompanyId };
-  persistRefAndEraseSsn(
-    d,
-    () =>
-      requests.transition(companyId, "create_provider", "submitted", "submitted", {
-        providerRef: company.doolaCompanyId,
-        detail: JSON.stringify(detail),
-      }),
-    "provider_persisted",
+  persistRefAndEraseSsn(d, () =>
+    requests.transition(companyId, "create_provider", "submitted", "submitted", {
+      providerRef: company.doolaCompanyId,
+      detail: JSON.stringify(detail),
+    }),
   );
   logStep(companyId, "submitted", row.attempt, { providerRef: company.doolaCompanyId });
 
@@ -593,12 +590,11 @@ function resolveSsn(
  * The erase is NOT conditional on the CAS winning. A lost CAS means another driver persisted the
  * same ref in the same instant, so the design's condition — "the transaction that persists
  * `doola_company_id`" — holds either way, and `eraseSsn` is idempotent.
+ *
+ * The reason is not a parameter. Both call sites are this one fact — a `provider_ref` reached the
+ * row — and a single-literal argument is a knob nobody may turn.
  */
-function persistRefAndEraseSsn(
-  d: FormationCreateDeps,
-  write: () => boolean,
-  reason: "provider_persisted",
-): boolean {
+function persistRefAndEraseSsn(d: FormationCreateDeps, write: () => boolean): boolean {
   let moved = false;
   d.repo.transaction(() => {
     moved = write();
@@ -607,7 +603,7 @@ function persistRefAndEraseSsn(
       // the one place their data outlived the erasure.
       opsLog("formation_ssn_erased", {
         companyId: d.company.companyId,
-        reason,
+        reason: "provider_persisted",
         environment: d.environment,
       });
   });
@@ -827,15 +823,12 @@ function confirm(
   // the pre-create lookup, or resumed from a persisted ref, reaches its `provider_ref` here and
   // nowhere else. `eraseSsn` is idempotent, so the create path passing through both writes is a
   // no-op the second time.
-  persistRefAndEraseSsn(
-    d,
-    () =>
-      requests.transition(companyId, "create_provider", from, "confirmed", {
-        providerRef: doolaCompanyId,
-        detail: JSON.stringify(detail),
-        error: null,
-      }),
-    "provider_persisted",
+  persistRefAndEraseSsn(d, () =>
+    requests.transition(companyId, "create_provider", from, "confirmed", {
+      providerRef: doolaCompanyId,
+      detail: JSON.stringify(detail),
+      error: null,
+    }),
   );
   recordCompanyEvent(
     d.repo,

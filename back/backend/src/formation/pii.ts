@@ -1,10 +1,4 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-  timingSafeEqual,
-} from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { inspect } from "node:util";
 
 /**
@@ -231,11 +225,16 @@ export function decryptSsn(
   return toSecret(Buffer.concat([decipher.update(body), decipher.final()]).toString("utf8"));
 }
 
-/** Exact-id lookup, in constant time over the two candidates. */
+/**
+ * Exact-id lookup over the two candidates.
+ *
+ * A plain `===`. It used to be a `timingSafeEqual`, which was ceremony: a key ID is a PUBLISHED
+ * value (it is written into every row it keys and printed in the ops trail), the comparison is
+ * against at most two candidates, and there is no secret whose bytes a timing signal could
+ * recover — the whole point of the fingerprint scheme is that the id is safe to know.
+ */
 function selectKey(keyring: PiiKeyring, id: string): PiiKey | undefined {
-  for (const k of [keyring.current, keyring.previous])
-    if (k && k.id.length === id.length && timingSafeEqual(Buffer.from(k.id), Buffer.from(id)))
-      return k;
+  for (const k of [keyring.current, keyring.previous]) if (k && k.id === id) return k;
   return undefined;
 }
 
