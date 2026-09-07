@@ -22,7 +22,7 @@ import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import { sqliteUtcTimestamp } from "../../src/util/sqliteTime";
-import { FormationSweeper } from "../../src/workflow/formationSweeper";
+import { AMORTISED_EVERY_N_TICKS, FormationSweeper } from "../../src/workflow/formationSweeper";
 
 const TENANT = "0x000000000000000000000000000000000000000A";
 const SSN = "123-45-6789";
@@ -292,6 +292,27 @@ test("the stale alarm is once a day, not once a tick", async () => {
   await s.tick();
   expect(opsLines().filter((l) => l.opslog === "formation_stale")).toHaveLength(1);
   expect(companyId).toBeTruthy();
+});
+
+test("the retention sweep is AMORTISED — every Nth tick, like the backstops beside it", async () => {
+  // Both of its clauses are measured in DAYS: a seven-day retention promise, and a terminal-
+  // company backstop for an erase §4.4 already performed in the `provider_ref` transaction.
+  // Running it every 60 seconds bought an hour of precision on a week-long deadline and paid a
+  // table scan a minute for it, forever, on every deployment including the ones that have never
+  // filed anything.
+  const s = sweeper();
+  // Tick 0 IS an amortised tick — the boot reconcile — so the first pass still erases.
+  const first = holding(SSN_MAX_AGE_MS + DAY);
+  await s.tick();
+  expect(held(first.companyId)).toBe(false);
+
+  // A row that becomes due between amortised ticks waits for the next one, and nothing else
+  // about the tick changes.
+  const second = holding(SSN_MAX_AGE_MS + DAY);
+  for (let i = 1; i < AMORTISED_EVERY_N_TICKS; i++) await s.tick();
+  expect(held(second.companyId)).toBe(true);
+  await s.tick(); // the Nth
+  expect(held(second.companyId)).toBe(false);
 });
 
 // ── the other clock is untouched ───────────────────────────────────────────────────────────

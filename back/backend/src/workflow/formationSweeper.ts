@@ -220,9 +220,14 @@ export class FormationSweeper {
       await this.retryFailedSteps();
       await this.pollInFlight();
       await this.advanceAnchors();
-      this.eraseExpiredSsns();
       this.erasePii();
       if (amortised) {
+        // AMORTISED, like the other backstops beside it. Both of its clauses are measured in
+        // DAYS — a 7-day retention promise and a terminal-company backstop for an erase §4.4
+        // already did in the `provider_ref` transaction — so running it every 60 seconds bought
+        // an hour of precision on a week-long deadline and paid for it with a table scan a
+        // minute, forever, on every deployment including the ones that have never filed anything.
+        this.eraseExpiredSsns();
         this.warnStale();
         this.sweepEvents();
         this.pruneWarned();

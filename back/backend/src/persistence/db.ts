@@ -81,6 +81,16 @@ const FORMATION_PARTIES_INDEX_DDL = `
   -- every unbound party still coexists happily.
   CREATE UNIQUE INDEX IF NOT EXISTS idx_formation_parties_company
     ON formation_parties(company_id);
+  -- The RETENTION SWEEP's index, and PARTIAL on purpose (§4.6a).
+  --
+  -- listSsnRetention asks "which parties still hold an SSN?", and the answer is a handful at any
+  -- moment — exactly the companies between an intake and a provider_ref — inside a table that
+  -- grows forever and whose rows keep their PII columns NULL for the rest of their lives. A full
+  -- index over company_id would carry every one of those dead rows; the WHERE clause makes the
+  -- index hold only the live ones, so the sweep's cost tracks the work outstanding rather than
+  -- the history.
+  CREATE INDEX IF NOT EXISTS idx_formation_parties_ssn_held
+    ON formation_parties(company_id) WHERE ssn_ciphertext IS NOT NULL;
 `;
 
 /**

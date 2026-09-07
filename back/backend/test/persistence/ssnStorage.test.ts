@@ -340,3 +340,25 @@ test("a filed, in-flight or abandoned company is FROZEN, whatever the detail say
   expect(companies.setStatus(abandonedCompany.companyId, "ready", "abandoned")).toBe(true);
   expect(companies.updateIntake(abandonedCompany.companyId, edit)).toBe(false);
 });
+
+test("the retention sweep reads a PARTIAL index — it does not scan the history", () => {
+  // `listSsnRetention` runs on a table that grows forever and whose rows keep their PII columns
+  // NULL for the rest of their lives, to find the handful of companies between an intake and a
+  // `provider_ref`. The WHERE clause on the index is what keeps its cost proportional to the work
+  // outstanding rather than to everything the platform has ever filed.
+  const index = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+    .get("idx_formation_parties_ssn_held") as { sql: string } | undefined;
+  expect(index?.sql).toContain("WHERE ssn_ciphertext IS NOT NULL");
+
+  // …and the planner actually uses it, which is the property the index exists for.
+  const held = bound();
+  store(held);
+  const plan = db
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT party_id FROM formation_parties WHERE ssn_ciphertext IS NOT NULL",
+    )
+    .all() as { detail: string }[];
+  expect(plan.map((r) => r.detail).join(" ")).toContain("idx_formation_parties_ssn_held");
+  expect(parties.listSsnRetention().map((r) => r.companyId)).toEqual([held.companyId]);
+});
