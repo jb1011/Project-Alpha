@@ -106,8 +106,29 @@ export interface CreateProviderDetail {
    * and forecloses the edit-and-retry §4.7 exists to offer. So the row waits instead, and the
    * ONLY thing that clears the flag is a successful `PATCH /companies/:id` — the edit IS the
    * evidence that the next body will be different.
+   *
+   * It is the COMPANY's intake specifically, which is why its twin below exists.
    */
   awaitingIntakeEdit?: boolean;
+  /**
+   * PARKED FOR A HUMAN, on the PARTY's data rather than the company's (§4.7, review 5b).
+   *
+   * `create_provider` makes TWO doola calls — `createCustomer` with the responsible party, then
+   * `createCompany` with the intake — and both can come back `rejected`. The same park serves
+   * both (an unchanged body is as doomed either way, and burning eight attempts to prove it ends
+   * in `abandonFormation`, which erases the party's data overnight), but they are NOT the same
+   * flag, because they do not have the same exit.
+   *
+   * `PATCH /companies/:companyId` edits names, purpose, industry and the SSN. None of those is
+   * what `createCustomer` refused: a rejected party is a name, an email, a phone or an address
+   * doola will not accept. Clearing this flag from that door would re-arm a retry of a customer
+   * body that had not changed at all — the exact loop the park exists to stop.
+   *
+   * So there is deliberately NO self-service exit today; the party-edit route is A3's, and
+   * `rearmAfterPartyEdit` is exported and waiting for it. Until then the operator trail says so,
+   * in as many words, on both surfaces.
+   */
+  awaitingPartyEdit?: boolean;
   /**
    * The `attempt` under which `POST /companies` was last SENT — written BEFORE the call, so it
    * survives a crash inside it (C1).
@@ -704,6 +725,14 @@ function onCallFailure(
   const kind: DoolaFailureKind = classifyDoolaFailure(e);
   const described = describeDoolaError(e);
   if (kind === "rejected") {
+    // WHICH body was refused decides which flag, because the flags do not have the same exit
+    // (review 5b). Both park identically — the attempt is burned once and never again, nothing
+    // is re-sent unchanged — but only the company's has a door that can clear it today.
+    if (endpoint === "createCustomer") {
+      failStep(d, row, described.message, e, { awaitingPartyEdit: true });
+      parkedForPartyEdit(d, described.message);
+      return;
+    }
     failStep(d, row, described.message, e, { awaitingIntakeEdit: true });
     parkedForIntakeEdit(d, described.message);
     return;
@@ -1009,5 +1038,37 @@ function parkedForIntakeEdit(d: FormationCreateDeps, message: string): void {
     d.company.companyId,
     "formationStale",
     "action required: the provider REJECTED this filing, so it will NOT be retried as it stands — nothing more happens until the intake is corrected. Edit the company's details (and re-supply the SSN if one was given) to retry it.",
+  );
+}
+
+/**
+ * Tell somebody that a filing is waiting on a human because the PARTY was refused (review 5b).
+ *
+ * Its OWN event and its own sentence, not a re-use of the intake one, for the reason an operator
+ * cares about: these two parks are answered differently. `formation_stale` /
+ * `create_rejected_awaiting_intake_edit` is a self-service fix — the owner edits the company and
+ * the filing retries itself. This one has no such door until A3, so the message must not tell
+ * anybody to go and edit a company: the fields doola refused are not on that form, and an edit
+ * there would clear nothing.
+ *
+ * CRITICAL for the same reason, and arguably more so: a company parked here needs a person to
+ * pick it up, and nothing in the system will nudge anybody a second time.
+ */
+function parkedForPartyEdit(d: FormationCreateDeps, message: string): void {
+  opsLog("formation_party_rejected", {
+    level: "error",
+    severity: "CRITICAL",
+    companyId: d.company.companyId,
+    step: "create_provider",
+    reason: "customer_rejected_awaiting_party_edit",
+    // Third-party text: redacted at the choke point in `opsLog`, like every other `message`.
+    message,
+    environment: d.environment,
+  });
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
+    "formationStale",
+    "action required: the provider REFUSED the responsible party's details (name, email, phone or address), so this filing will NOT be retried as it stands. Editing a party is not yet self-service — it arrives with the legal-identity form — so please contact support to correct them.",
   );
 }

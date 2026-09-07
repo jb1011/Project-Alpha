@@ -18,6 +18,7 @@ import type { CreateCompanyInput } from "../../src/adapters/doola/types";
 import {
   type CreateCompanyDeps,
   createCompany,
+  rearmAfterPartyEdit,
   updateCompanyIntake,
 } from "../../src/formation/company";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
@@ -121,6 +122,22 @@ function rejectingDoola(): DoolaApi & { bodies: CreateCompanyInput[] } {
   } as unknown as DoolaApi & { bodies: CreateCompanyInput[] };
 }
 
+/** A doola that rejects `createCustomer` — the PARTY's details — and never reaches the company. */
+function rejectingCustomerDoola(): DoolaApi & { bodies: CreateCompanyInput[] } {
+  const api = rejectingDoola();
+  let customerCalls = 0;
+  return {
+    ...api,
+    createCustomer: async () => {
+      customerCalls++;
+      throw new DoolaApiError("E_VALIDATION_FAILED", 400, "phone is not a valid number", "req_2");
+    },
+    get customerCalls() {
+      return customerCalls;
+    },
+  } as unknown as DoolaApi & { bodies: CreateCompanyInput[] };
+}
+
 function file(companyId: string, doola: DoolaApi): Promise<void> {
   return runFormationCreateProvider({
     company: companies.find(companyId)!,
@@ -153,9 +170,12 @@ function sweeper(doola: DoolaApi): FormationSweeper {
 }
 
 const rowOf = (companyId: string) => requests.find(companyId, "create_provider")!;
-const parked = (companyId: string) =>
-  parseDetail<{ awaitingIntakeEdit?: boolean }>(rowOf(companyId).detail).awaitingIntakeEdit ===
-  true;
+const flags = (companyId: string) =>
+  parseDetail<{ awaitingIntakeEdit?: boolean; awaitingPartyEdit?: boolean }>(
+    rowOf(companyId).detail,
+  );
+const parked = (companyId: string) => flags(companyId).awaitingIntakeEdit === true;
+const partyParked = (companyId: string) => flags(companyId).awaitingPartyEdit === true;
 
 const EDIT = {
   names: ["Filable One", "Filable Two", "Filable Three"],
@@ -237,4 +257,93 @@ test("a PATCH that does not land leaves the park in place", async () => {
   ).toHaveProperty("error");
   expect(rowOf(companyId).detail).toBe(before.detail);
   expect(parked(companyId)).toBe(true);
+});
+
+// ── review 5b: the OTHER body `create_provider` sends ──────────────────────────────────────
+
+test("a rejected PARTY parks under its OWN flag — not the one the company PATCH can clear", async () => {
+  // `create_provider` sends two bodies: the responsible party to `createCustomer`, then the
+  // intake to `createCompany`. Both can come back `rejected`, and the park used to be shared — so
+  // a refused phone number or address set `awaitingIntakeEdit`, whose only exit is a door that
+  // rewrites names, purpose, industry and the SSN. None of those is what doola objected to, so
+  // that door would have re-armed a retry of an unchanged customer body.
+  const companyId = mint();
+  const doola = rejectingCustomerDoola();
+  await file(companyId, doola);
+
+  // It never got as far as the company call.
+  expect(doola.bodies).toHaveLength(0);
+  expect(partyParked(companyId)).toBe(true);
+  expect(parked(companyId)).toBe(false);
+
+  const row = rowOf(companyId);
+  expect(row.state).toBe("failed");
+  // The attempt is burned ONCE — `rejected` releases doola's key — and never again.
+  expect(row.attempt).toBe(1);
+  expect(row.error).toContain("phone is not a valid number");
+
+  // Its own event, because the two parks are answered by different people: the intake's is
+  // self-service, this one is not.
+  expect(printed().find((l) => l.opslog === "formation_party_rejected")).toMatchObject({
+    severity: "CRITICAL",
+    companyId,
+    reason: "customer_rejected_awaiting_party_edit",
+  });
+  // …and NOT the intake's event, which would send somebody to a form that cannot fix this.
+  expect(printed().find((l) => l.opslog === "formation_stale")).toBeUndefined();
+});
+
+test("the sweeper skips a party-parked row too — an unchanged party body is equally doomed", async () => {
+  const companyId = mint();
+  const doola = rejectingCustomerDoola();
+  await file(companyId, doola);
+
+  // Eight passes, each a year past every backoff. Retrying to the attempt bound would end in
+  // `abandonFormation`, which erases the very PII doola is asking somebody to correct.
+  for (let i = 0; i < 8; i++) await sweeper(doola).tick();
+
+  expect(rowOf(companyId).attempt).toBe(1);
+  expect(partyParked(companyId)).toBe(true);
+  expect(companies.find(companyId)!.status).not.toBe("abandoned");
+});
+
+test("a company PATCH does NOT clear the party flag — it changes nothing createCustomer reads", async () => {
+  const companyId = mint();
+  const doola = rejectingCustomerDoola();
+  await file(companyId, doola);
+  expect(partyParked(companyId)).toBe(true);
+
+  // A perfectly valid edit of the company's own intake. It succeeds — there is no reason to
+  // refuse it — and it leaves the party park exactly where it was.
+  expect(updateCompanyIntake(deps(), TENANT, companyId, EDIT)).toEqual({ companyId });
+  expect(companies.find(companyId)!.businessPurpose).toBe("Corrected purpose.");
+  expect(partyParked(companyId)).toBe(true);
+
+  // Which means the sweeper still will not touch it: no unchanged customer body goes back out.
+  await sweeper(doola).tick();
+  expect(rowOf(companyId).attempt).toBe(1);
+  expect(partyParked(companyId)).toBe(true);
+});
+
+test("the A3 hook clears the party flag with the same CAS, and only that flag", async () => {
+  // `rearmAfterPartyEdit` is exported and has no caller yet: editing a responsible party is A3's
+  // route. It exists here so that door is one call rather than a second opinion about the CAS,
+  // the preserved error text and `touchFacts: false`.
+  const companyId = mint();
+  await file(companyId, rejectingCustomerDoola());
+  const before = rowOf(companyId);
+
+  rearmAfterPartyEdit({ requests }, companyId);
+
+  expect(partyParked(companyId)).toBe(false);
+  // The operator trail still says what doola refused, and no attempt was spent clearing a flag.
+  expect(rowOf(companyId).error).toBe(before.error);
+  expect(rowOf(companyId).attempt).toBe(before.attempt);
+
+  // …and it is not a general un-parker: an intake park is the intake door's to clear.
+  const other = mint();
+  await file(other, rejectingDoola());
+  expect(parked(other)).toBe(true);
+  rearmAfterPartyEdit({ requests }, other);
+  expect(parked(other)).toBe(true);
 });

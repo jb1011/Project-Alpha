@@ -385,7 +385,10 @@ export function updateCompanyIntake(
       // edit. A `rejected` create parks for a human precisely so it is never retried with the body
       // doola already refused; the successful PATCH is the evidence that the body has changed, and
       // therefore the only thing that may put the row back in the sweeper's reach.
-      rearmAfterIntakeEdit(deps, companyId);
+      //
+      // THIS flag and no other: a rejected `createCustomer` parks under `awaitingPartyEdit`, and
+      // none of the four fields this door rewrites is one `createCustomer` reads.
+      rearmAfterEdit(deps, companyId, "awaitingIntakeEdit");
     });
   } catch (e) {
     // SYMMETRY with the create, which has caught this since A2's first commit. The sentinel is
@@ -446,22 +449,33 @@ function gateSsn(
 /**
  * Put a create step that is PARKED AWAITING AN EDIT back in the sweeper's reach (§4.7).
  *
- * A `rejected` create marks itself `awaitingIntakeEdit` and the sweeper skips it: re-sending a
- * body doola has already looked at and refused cannot succeed, and the eight backoff retries it
- * used to burn ended in `abandonFormation` — which erases the responsible party's data overnight
- * and forecloses the edit-and-retry the design offers.
+ * A `rejected` create marks itself parked and the sweeper skips it: re-sending a body doola has
+ * already looked at and refused cannot succeed, and the eight backoff retries it used to burn
+ * ended in `abandonFormation` — which erases the responsible party's data overnight and forecloses
+ * the edit-and-retry the design offers.
  *
  * Clearing the flag is therefore not bookkeeping, it is the whole point of the door: the edit IS
  * the evidence that the next body will be different. It is a CAS from `failed` onto itself, so a
  * row another driver has since moved is left alone, and the error text is preserved — the operator
  * trail should still say what doola refused.
+ *
+ * ⚠ THE FLAG IS AN ARGUMENT, and each door clears ITS OWN. `create_provider` sends two bodies —
+ * the responsible party to `createCustomer`, then the intake to `createCompany` — and either can
+ * be the one doola refused. `PATCH /companies/:companyId` changes names, purpose, industry and
+ * the SSN; NONE of those is what a rejected `createCustomer` objected to. A door that cleared
+ * both flags would re-arm a retry of a customer body that had not changed at all, which is the
+ * exact loop this park exists to stop.
  */
-function rearmAfterIntakeEdit(deps: CreateCompanyDeps, companyId: string): void {
+function rearmAfterEdit(
+  deps: Pick<CreateCompanyDeps, "requests">,
+  companyId: string,
+  flag: "awaitingIntakeEdit" | "awaitingPartyEdit",
+): void {
   const row = deps.requests.find(companyId, "create_provider");
   if (!row || row.state !== "failed") return;
-  const detail = parseDetail<{ awaitingIntakeEdit?: boolean }>(row.detail);
-  if (!detail.awaitingIntakeEdit) return;
-  const { awaitingIntakeEdit: _cleared, ...rest } = detail;
+  const detail = parseDetail<Record<string, unknown>>(row.detail);
+  if (detail[flag] !== true) return;
+  const { [flag]: _cleared, ...rest } = detail;
   deps.requests.transition(companyId, "create_provider", "failed", "failed", {
     detail: JSON.stringify(rest),
     error: row.error ?? null,
@@ -469,6 +483,26 @@ function rearmAfterIntakeEdit(deps: CreateCompanyDeps, companyId: string): void 
     // would re-derive and re-hash the manifest of every agent attached to this company.
     touchFacts: false,
   });
+}
+
+/**
+ * The PARTY half of the same hook, EXPORTED and not yet called (review 5b).
+ *
+ * A `createCustomer` rejection parks under `awaitingPartyEdit`, and there is no door that can
+ * clear it: editing a responsible party is A3's route, and until it exists a company parked here
+ * needs a person. That is stated on both operator surfaces rather than left to be discovered.
+ *
+ * This lives here, beside the intake's, so that A3's party-edit door is one call rather than a
+ * second opinion about the CAS, the preserved error text and the `touchFacts: false` — every one
+ * of which is a decision the intake door had to get right and would otherwise be re-derived.
+ * Call it inside the transaction that actually rewrote the party, exactly as
+ * `updateCompanyIntake` calls the intake one: the edit is the evidence.
+ */
+export function rearmAfterPartyEdit(
+  deps: Pick<CreateCompanyDeps, "requests">,
+  companyId: string,
+): void {
+  rearmAfterEdit(deps, companyId, "awaitingPartyEdit");
 }
 
 /**

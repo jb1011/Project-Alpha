@@ -381,12 +381,16 @@ export class FormationSweeper {
       //    `abandon` the company — which erases the responsible party's data and forecloses the
       //    edit-and-retry §4.7 offers, all within about eight hours and usually overnight.
       //
-      //    The row therefore leaves the sweeper's reach entirely until the intake is EDITED: a
-      //    successful `PATCH /companies/:id` clears the flag in the same transaction as the edit,
-      //    which is the only evidence that exists that the next body will be different. The
-      //    abandon check is BELOW this on purpose — a verdict belongs to the human who owns the
-      //    row, not to a counter.
-      if (this.awaitingIntakeEdit(row)) continue;
+      //    The row therefore leaves the sweeper's reach entirely until its input is EDITED: a
+      //    successful edit clears the flag in the same transaction, which is the only evidence
+      //    that exists that the next body will be different. The abandon check is BELOW this on
+      //    purpose — a verdict belongs to the human who owns the row, not to a counter.
+      //
+      //    Either of the step's two bodies can be the one doola refused, and they have different
+      //    doors: the COMPANY's intake has `PATCH /companies/:id` today, the responsible PARTY's
+      //    details have nothing until A3. The sweeper treats them identically anyway, because an
+      //    unchanged party body is exactly as doomed as an unchanged company body.
+      if (this.awaitingHumanEdit(row)) continue;
       // The terminal verdict: a row past the attempt bound is not retried once more.
       if (row.attempt >= MAX_FORMATION_ATTEMPTS) {
         this.abandon(row);
@@ -407,14 +411,23 @@ export class FormationSweeper {
   }
 
   /**
-   * Is this row waiting on a human to correct the intake (§4.7)?
+   * Is this row waiting on a human (§4.7)?
    *
    * Only `create_provider` can be: it is the only step whose input a caller can edit, and the
-   * flag is written by the one failure class that re-opens the intake — a doola `rejected`.
+   * flags are written by the one failure class that re-opens an input — a doola `rejected`.
+   *
+   * TWO flags, because `create_provider` makes two calls and either body can be the one doola
+   * refused: `awaitingIntakeEdit` for the COMPANY's intake, which `PATCH /companies/:id` can fix,
+   * and `awaitingPartyEdit` for the responsible PARTY's details, which nothing can fix until A3
+   * ships the party-edit door. The sweeper's answer is the same for both — do not touch this row
+   * — and it is the doors that differ, so this predicate is deliberately their OR.
    */
-  private awaitingIntakeEdit(row: FormationRequestRecord): boolean {
+  private awaitingHumanEdit(row: FormationRequestRecord): boolean {
     if (row.step !== "create_provider") return false;
-    return parseDetail<{ awaitingIntakeEdit?: boolean }>(row.detail).awaitingIntakeEdit === true;
+    const detail = parseDetail<{ awaitingIntakeEdit?: boolean; awaitingPartyEdit?: boolean }>(
+      row.detail,
+    );
+    return detail.awaitingIntakeEdit === true || detail.awaitingPartyEdit === true;
   }
 
   /**
