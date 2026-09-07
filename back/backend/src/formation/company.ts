@@ -16,9 +16,6 @@ import {
   formationQuotaExhaustedMessage,
   industryLabelRequiredMessage,
   industryLabelUnknownMessage,
-  shimAgentNameBlankMessage,
-  shimAgentNameEndingOnlyMessage,
-  shimAgentNameTooLongMessage,
   sqliteUtcTimestamp,
   ssnFormatMessage,
   ssnRefusedHereMessage,
@@ -42,7 +39,6 @@ import {
   duplicateKey,
   firstIllegalNameChar,
   stripEntityEnding,
-  synthesizeIntake,
 } from "./intake";
 import { isKnownIndustryLabel } from "./naicsLabels";
 import { type PiiKeyring, encryptSsn, isWellFormedSsn } from "./pii";
@@ -108,27 +104,23 @@ export interface CreateCompanyDeps {
 }
 
 /**
- * The intake, in the TWO shapes that exist (design §5/§10) — and they are structurally distinct
- * on purpose, so a door cannot fall into the wrong one by leaving a field out.
+ * The intake, in the ONE shape that exists (design §5) since A3 removed the shim.
  *
- * **Production** (`names` + `businessPurpose` + `industryLabel`) is what REST and MCP send. Three
- * validated candidates, a purpose of the COMPANY's own — the agent's description is no longer
- * doola-visible — and an industry from the shipped reference list.
- *
- * **Synthesized** (`synthesizedName`) is the A1 SHIM and nothing else: a party-only onboard mints
- * a 1:1 company from the agent's name and the two defaults, marked `intake_synthesized = 1`. It
- * is named for what it is rather than `name`, because the shim is removed in A3 and this field
- * goes with it; a door reaching for it would be a door filing a company nobody described.
- *
- * The two are mutually exclusive and one of them is required.
+ * Three validated name candidates, a purpose of the COMPANY's own — the agent's description is
+ * not doola-visible — and an industry from the shipped reference list. A2 kept a second,
+ * structurally distinct shape (`synthesizedName`) for the A1 shim, so that no production door
+ * could fall into the derived-name path by leaving a field out; with the shim gone the derived
+ * path has no callers at all, and the safest version of that rule is that the field does not
+ * exist. `intake_synthesized = 1` survives only on rows the MIGRATION wrote, which is exactly
+ * what it was for.
  */
 export interface CompanyIntakeInput {
   partyId: string;
-  /** PRODUCTION: exactly three ranked candidates. */
+  /** Exactly three ranked candidates. */
   names?: string[];
-  /** PRODUCTION: required, and the company's own — never the agent's description. */
+  /** Required, and the company's own — never the agent's description. */
   businessPurpose?: string;
-  /** PRODUCTION: one of the shipped NAICS labels. */
+  /** One of the shipped NAICS labels. */
   industryLabel?: string;
   /**
    * The responsible party's SSN, in doola's `XXX-XX-XXXX` (§4.1).
@@ -148,8 +140,6 @@ export interface CompanyIntakeInput {
    * supplying another, file the SS-4 route instead.
    */
   proceedWithoutSsn?: boolean;
-  /** THE A1 SHIM ONLY: synthesize a 1:1 intake from the agent's name. Removed in A3. */
-  synthesizedName?: string;
   /** The caller's CLAIM about the deployment, checked against it — never the stored value. */
   synthetic?: boolean;
 }
@@ -332,7 +322,7 @@ export function updateCompanyIntake(
   deps: CreateCompanyDeps,
   tenantId: string,
   companyId: string,
-  intake: Omit<CompanyIntakeInput, "partyId" | "synthesizedName">,
+  intake: Omit<CompanyIntakeInput, "partyId">,
 ): { companyId: string } | { error: string } {
   // Ownership first, and the same not-an-oracle rule the rest of the door follows: an unknown id
   // and somebody else's id get one answer.
@@ -506,30 +496,6 @@ export function rearmAfterPartyEdit(
 }
 
 /**
- * THE A1 SHIM's intake, as ONE mapping (§10's A1 bullet). Removed in A3 with the shim itself.
- *
- * A party-only onboard — every client that exists today — mints its own 1:1 company from the
- * agent's name and the two defaults. The mapping is a function rather than an object literal at
- * each call site because there are four of those (the composition root and three test wirings),
- * and A2 changing the field name from `name` to `synthesizedName` broke all three of the tests
- * at once: four literals is four chances for the shim to mean something slightly different on
- * one surface. It carries NO `ssn`, structurally — the shim's door is onboard, and PII has never
- * ridden on it (§7).
- */
-export function shimCompanyIntake(
-  intake: { partyId: string; name: string },
-  sandboxSyntheticPii: boolean,
-): CompanyIntakeInput {
-  return {
-    partyId: intake.partyId,
-    synthesizedName: intake.name,
-    // The shim never invents a claim: it mirrors the deployment, which is what the party it is
-    // binding was already created against.
-    synthetic: sandboxSyntheticPii ? true : undefined,
-  };
-}
-
-/**
  * The intake validator (§5) — ONE function, used by the create and by the §4.7 re-capture.
  *
  * Exported because edit-and-retry writes the same three fields under the same rules, and two
@@ -541,30 +507,8 @@ export function shimCompanyIntake(
  * industry. A caller fixing a form gets the first thing wrong with it, in the order they typed.
  */
 export function validateIntake(
-  intake: Pick<
-    CompanyIntakeInput,
-    "names" | "businessPurpose" | "industryLabel" | "synthesizedName"
-  >,
+  intake: Pick<CompanyIntakeInput, "names" | "businessPurpose" | "industryLabel">,
 ): { intake: CompanyIntake } | { error: string } {
-  // ── THE A1 SHIM. One derived name, the two defaults, `intake_synthesized = 1`. It skips the
-  //    validation below because the values are OURS, not a caller's: the agent name has already
-  //    been through `AgentSpecSchema`, and refusing it here would refuse an onboard for a
-  //    company nobody was asked to describe. The one guard it keeps is the ending-only check,
-  //    because "LLC LLC" is a real filing either way.
-  if (intake.synthesizedName !== undefined) {
-    const name = canonicalizeIntakeText(intake.synthesizedName);
-    // The SHIM's OWN sentences, deliberately. This caller sent an agent name through `onboard`
-    // and there is no `names` array anywhere in their request, so "names[0] is blank — all three
-    // candidates are required" named a field they had never heard of and could not have sent.
-    // Same rules, same order; they go away with the shim in A3.
-    if (!name) return { error: shimAgentNameBlankMessage() };
-    if (name.length > NAME_MAX_LENGTH)
-      return { error: shimAgentNameTooLongMessage(NAME_MAX_LENGTH) };
-    if (!stripEntityEnding(name)) return { error: shimAgentNameEndingOnlyMessage() };
-    return { intake: synthesizeIntake(name, intake.businessPurpose) };
-  }
-
-  // ── THE PRODUCTION SHAPE.
   const raw = intake.names;
   if (!Array.isArray(raw) || raw.length !== NAME_OPTION_COUNT)
     return { error: companyNamesRequiredMessage() };

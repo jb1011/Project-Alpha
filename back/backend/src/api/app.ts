@@ -201,9 +201,9 @@ export function buildApiApp(deps: ApiDeps) {
       // this route can produce. The wizard labels a sandbox filing amber off this value.
       formationAvailable: Boolean(deps.formation),
       formationEnvironment: deps.formation?.environment ?? null,
-      // Whether onboard will REFUSE without a partyId. The wizard needs it to know whether the
-      // legal-identity phase is a step or an option, and it is only advertised now because the
-      // door gate below actually enforces it.
+      // Whether onboard will REFUSE without a companyId. The wizard needs it to know whether the
+      // legal-body phase is a step or an option. (It said "without a partyId" until A3 removed
+      // the shim; the FLAG is unchanged, what satisfies it is now a company handle.)
       formationRequired: Boolean(deps.formation?.required),
     }),
   );

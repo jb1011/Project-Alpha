@@ -144,20 +144,6 @@ export interface CompanyIntake {
   synthesized: boolean;
 }
 
-/**
- * The A1 intake: one name candidate derived from the agent's name, the default purpose and the
- * default industry, marked `synthesized` on the ROW (never as a key inside `name_options`, which
- * keeps exactly one shape).
- */
-export function synthesizeIntake(agentName: string, description?: string | null): CompanyIntake {
-  return {
-    nameOptions: companyNameOptions(agentName),
-    businessPurpose: description?.trim() || DEFAULT_DESCRIPTION,
-    industryLabel: DEFAULT_INDUSTRY,
-    synthesized: true,
-  };
-}
-
 /** What the company row pins a filing to. Written from the DEPLOYMENT, never from caller input. */
 export interface CompanyPin {
   provider: string;

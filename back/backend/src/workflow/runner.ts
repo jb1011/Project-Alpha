@@ -53,20 +53,6 @@ export class OnboardingRunner {
         requests: FormationRepository;
         /** FORMATION_MAX_AGENTS_PER_COMPANY, re-checked inside the transaction. */
         maxAgentsPerCompany: number;
-        /**
-         * The A1 SHIM (design §10): a party-only onboard — every caller that exists today —
-         * mints a 1:1 company for that party and attaches the new agent to it, so no client
-         * changes and nothing is left unfiled. Removed in A3, when the wizard learns to create
-         * a company of its own.
-         *
-         * It runs INSIDE the claim transaction: a 409 on the entity key must roll the company
-         * back with it, or a duplicate onboard would leave an orphan company holding a spent
-         * identity.
-         */
-        createCompanyForParty?: (
-          tenantId: string,
-          intake: { partyId: string; name: string },
-        ) => string;
       };
     },
   ) {}
@@ -79,11 +65,14 @@ export class OnboardingRunner {
     /** Tier-0 custody choice, resolved by the caller (route/tool applies the platform default).
      *  Recorded on the claim so a restart resumes the RIGHT provider path. */
     custody?: "turnkey" | "circle";
-    /** Formation party handle, already validated by the door (owned + unbound). The A1 shim
-     *  turns it into a company inside the claim transaction. */
-    partyId?: string;
-    /** ATTACH: an existing company this agent joins (design §3). Validated at the door and
-     *  re-validated by a CAS inside the claim transaction. */
+    /**
+     * ATTACH: the company this agent joins (design §3).
+     *
+     * The ONLY formation handle this method takes. A1's shim also accepted a `partyId` and minted
+     * a 1:1 company for it inside the claim; A3 removed it, so a company is created at its own
+     * door and this one only ever attaches to a company that already exists. Validated at the
+     * door and re-validated by a CAS inside the claim transaction.
+     */
     companyId?: string;
   }): {
     id: string;
@@ -132,13 +121,13 @@ export class OnboardingRunner {
     // any on-chain side effect. Replaces the old non-atomic inFlight/find pre-check.
     const f = this.deps.formation;
     const claim = () => {
-      // The A1 shim: a party-only onboard mints its own 1:1 company first, INSIDE this
-      // transaction, so a 409 below rolls it back rather than orphaning a spent identity.
-      const companyId =
-        p.companyId ??
-        (p.partyId && f?.createCompanyForParty
-          ? f.createCompanyForParty(p.tenantId, { partyId: p.partyId, name: p.spec.name })
-          : undefined);
+      // A company handle is honoured only where there is a formation block to VALIDATE it
+      // against. Without one there is nothing to re-read, nothing to copy a pin from, and no cap
+      // to check — so attaching would write an unresolvable `company_id` onto the row, and
+      // `entities.company_id` is write-once by trigger and published in the anchored manifest,
+      // so it has no repair. The door refuses this combination up front
+      // (`formationUnavailableMessage`); this is what the claim does if it ever gets past it.
+      const companyId = f ? p.companyId : undefined;
 
       // ── The ATTACH CAS (design §3). Re-read the company HERE, in the transaction, because the
       //    door's check happened before it: a company abandoned, paid-for or filled to its agent
@@ -148,6 +137,9 @@ export class OnboardingRunner {
         | undefined;
       /** What the filing looked like AT THE MOMENT OF ATTACH — the joining agent's history. */
       let attachedSummary: string | undefined;
+      /** Agents already on this company, read inside the transaction — the cap check and the
+       *  `company_reused` ops line are two readings of one number, not two queries. */
+      let attachedAgents = 0;
       if (companyId && f) {
         const fresh = f.companies.findOwned(p.tenantId, companyId);
         const steps = f.requests.stepsOf(companyId);
@@ -160,7 +152,8 @@ export class OnboardingRunner {
           )
         )
           throw new ApiError("validation_error", 400, companyUnavailableMessage());
-        if (f.companies.countAgents(companyId) >= f.maxAgentsPerCompany)
+        attachedAgents = f.companies.countAgents(companyId);
+        if (attachedAgents >= f.maxAgentsPerCompany)
           throw new ApiError("limit_exceeded", 400, companyAgentCapMessage(f.maxAgentsPerCompany));
         // Pin fields FROM THE COMPANY ROW, never from config.
         company = { provider: fresh.provider, environment: fresh.environment };
@@ -193,9 +186,19 @@ export class OnboardingRunner {
       if (companyId && !this.deps.repo.attachCompany(id, companyId))
         throw new ApiError("validation_error", 400, companyUnavailableMessage());
       // The ops trail for sharing (§7). Ids only — a company id is an opaque handle, and nothing
-      // about the party behind it belongs in a log line. `shim` says whether this attach created
-      // the company it is attaching to, which is what tells A3 when the shim can be removed.
-      if (companyId) opsLog("company_attach", { companyId, entityKey: id, shim: !p.companyId });
+      // about the party behind it belongs in a log line.
+      //
+      // TWO events, because they answer different questions. `company_attach` is every attach.
+      // `company_reused` is the one §7 asks for: an agent joining a company that ALREADY has
+      // agents on it — the N:1 fan-out actually happening, which is what bounds the anchor
+      // traffic (`agents × late facts × 2 sponsored writes`) and what makes two agents publicly
+      // linkable through their anchored manifests. `agents` is the count BEFORE this attach, read
+      // in the same transaction as the cap check above.
+      if (companyId) {
+        opsLog("company_attach", { companyId, entityKey: id, agents: attachedAgents });
+        if (attachedAgents > 0)
+          opsLog("company_reused", { companyId, entityKey: id, agents: attachedAgents });
+      }
       // ONE event on the JOINING entity, carrying the filing as it stands right now (§3).
       //
       // The sub-saga's own events are fanned out at the moment each fact lands, over whichever
@@ -204,18 +207,17 @@ export class OnboardingRunner {
       // history, because every event that describes that filing had already been written. This
       // is the row that says what it joined.
       //
-      // Gated on `p.companyId`, the SAME signal the `shim:` field above reads — not on the local
-      // `companyId`, which the A1 shim also fills in. A shim onboard did not JOIN anything: it
-      // created the 1:1 company it is attached to, milliseconds ago, and there is no prior
-      // history for this event to describe. Recording one there wrote a spurious
-      // `status: "none"` row on every party-only onboard, which is every client that exists.
-      if (p.companyId && attachedSummary)
+      // Every attach records one, now that every attach IS a join: A1's shim created the company
+      // it attached to milliseconds earlier and had no prior history to describe, which is why
+      // this used to be gated on the caller's own `companyId` rather than the local one. With the
+      // shim gone the two are the same value.
+      if (attachedSummary)
         this.deps.repo.recordEvent(id, "formationAttached", "pending", null, attachedSummary);
     };
-    // Only formation takes the transaction: without a company or a party there is exactly one
-    // write, and every pre-formation caller (including the tests that hand in a repo stub) keeps
-    // its existing single-statement path.
-    if (p.partyId || p.companyId) this.deps.repo.transaction(claim);
+    // Only an ATTACH takes the transaction: without a company there is exactly one write, and
+    // every pre-formation caller (including the tests that hand in a repo stub) keeps its
+    // existing single-statement path.
+    if (p.companyId) this.deps.repo.transaction(claim);
     else claim();
     this.run(id, () =>
       this.deps.runSaga({

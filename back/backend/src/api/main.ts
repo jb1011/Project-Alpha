@@ -37,7 +37,7 @@ import {
   loadConfig,
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
-import { createCompany, shimCompanyIntake } from "../formation/company";
+import { createCompany } from "../formation/company";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -421,22 +421,6 @@ async function main() {
           companies,
           requests: formationRequests,
           maxAgentsPerCompany: formationCfg.maxAgentsPerCompany,
-          // The A1 SHIM: a party-only onboard — every client that exists today — mints its own
-          // 1:1 company inside the claim transaction. Removed in A3.
-          createCompanyForParty: (tenantId, intake) => {
-            const result = createCompany(
-              // Already inside the claim's transaction: `fn()` runs in it rather than opening a
-              // nested one, so a 409 below rolls the company back with everything else.
-              { ...companyDeps!, transaction: (fn) => fn() },
-              tenantId,
-              // ONE mapping, shared with every test wiring of this shim — see
-              // `shimCompanyIntake`. It reaches `synthesizedName`, the field spelled for what it
-              // is, so no production door can fall into the derived-name path by accident.
-              shimCompanyIntake(intake, formationCfg.sandboxSyntheticPii),
-            );
-            if ("error" in result) throw new ApiError("validation_error", 400, result.error);
-            return result.companyId;
-          },
         }
       : undefined,
   });

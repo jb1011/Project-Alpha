@@ -12,7 +12,7 @@ import type { GuardianPasskey } from "../../src/adapters/turnkey/provisioner";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
 import { ssnNotOnThisDoorMessage } from "../../src/formation";
-import { createCompany, shimCompanyIntake } from "../../src/formation/company";
+import { createCompany } from "../../src/formation/company";
 import { describeIndustryLabels } from "../../src/formation/naicsLabels";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
@@ -106,25 +106,9 @@ function buildTestApp(
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
-    // The A1 shim: a party-only onboard mints its 1:1 company inside the claim (design §10).
-    formation: formation
-      ? {
-          companies,
-          requests,
-          maxAgentsPerCompany: 10,
-          createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
-            const result = createCompany(
-              { ...companyDeps, transaction: (fn) => fn() },
-              tenantId,
-              // The SHARED mapping (A2), not a literal: four copies of "what the shim sends" is
-              // four chances for it to mean something different on one surface.
-              shimCompanyIntake(intake, formation.syntheticPii ?? false),
-            );
-            if ("error" in result) throw new Error(result.error);
-            return result.companyId;
-          },
-        }
-      : undefined,
+    // The claim ATTACHES only (2026-08-26 §3). A3 removed the A1 shim that minted a 1:1 company
+    // inside it for a party-only onboard.
+    formation: formation ? { companies, requests, maxAgentsPerCompany: 10 } : undefined,
   });
   return buildApiApp({
     webOrigin: "*",
@@ -262,6 +246,13 @@ test("the synthetic rule is refused in BOTH directions, with the REST wording", 
 
 // ── the door on onboard_agent ───────────────────────────────────────────────────────────────
 
+/** The PRODUCTION intake over MCP (A2 §5) — the same three fields REST takes, minus the ssn. */
+const MCP_INTAKE = {
+  names: ["Acme Robotics LLC", "Acme Automata", "Acme Mechanicals"],
+  businessPurpose: "Operating autonomous software agents.",
+  industryLabel: "Software development",
+};
+
 test("REQUIRED: onboard_agent without a partyId is refused with the REST message, nothing claimed", async () => {
   const app = buildTestApp({ required: true });
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
@@ -274,7 +265,32 @@ test("REQUIRED: onboard_agent without a partyId is refused with the REST message
   expect(repo.listByTenant(TENANT)).toHaveLength(0);
 });
 
-test("REQUIRED: a valid party onboards and is bound; a second use is refused", async () => {
+test("A3: a partyId on onboard_agent is REFUSED — declared so it cannot be silently stripped", async () => {
+  // The `ssn` precedent, one door along. An UNDECLARED field is discarded by the SDK's zod parse
+  // before the handler runs, so a model that had just called `create_formation_party` and passed
+  // the handle here would have got back an entity id with nothing filed — and no way to tell.
+  const app = buildTestApp({ required: true });
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  await withClient(app, key, async (c) => {
+    const tool = (await c.listTools()).tools.find((t) => t.name === "onboard_agent")!;
+    expect(Object.keys(tool.inputSchema.properties ?? {})).toContain("partyId");
+    expect(tool.description).toMatch(/partyId is NOT accepted here/);
+
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    const res = await c.callTool({
+      name: "onboard_agent",
+      arguments: { spec: VALID_SPEC, passkeyId: handle, partyId },
+    });
+    expect((res as { isError?: boolean }).isError).toBe(true);
+    expect(textOf(res)).toMatch(/partyId is not accepted here/);
+  });
+  expect(repo.listByTenant(TENANT)).toHaveLength(0);
+});
+
+test("REQUIRED: create_company then onboard_agent — and the party is single-use at the CREATE", async () => {
   const app = buildTestApp({ required: true });
   const handle = passkeys.store(TENANT, VALID_PASSKEY);
   const { key } = apiKeys.mint(TENANT, { capability: "provision" });
@@ -282,29 +298,33 @@ test("REQUIRED: a valid party onboards and is bound; a second use is refused", a
     const { partyId } = JSON.parse(
       textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
     );
+    const { companyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_company", arguments: { partyId, ...MCP_INTAKE } })),
+    );
+    expect(parties.findByCompanyId(companyId)!.partyId).toBe(partyId);
+
     const out = JSON.parse(
       textOf(
         await c.callTool({
           name: "onboard_agent",
-          arguments: { spec: VALID_SPEC, passkeyId: handle, partyId },
+          arguments: { spec: VALID_SPEC, passkeyId: handle, companyId },
         }),
       ),
     );
     expect(out.status).toBe("pending");
-    expect(parties.findByCompanyId(repo.findByIdempotencyKey(out.id)!.companyId!)!.partyId).toBe(
-      partyId,
-    );
+    expect(repo.findByIdempotencyKey(out.id)!.companyId).toBe(companyId);
 
+    // Single use, at the door that spends it.
     const second = await c.callTool({
-      name: "onboard_agent",
-      arguments: { spec: { ...VALID_SPEC, name: "Second" }, passkeyId: handle, partyId },
+      name: "create_company",
+      arguments: { partyId, ...MCP_INTAKE },
     });
     expect(textOf(second)).toMatch(/unknown, not yours, or already bound/);
   });
   expect(repo.listByTenant(TENANT)).toHaveLength(1);
 });
 
-test("a FOREIGN party is refused as if it did not exist", async () => {
+test("a FOREIGN party is refused at the CREATE door, as if it did not exist", async () => {
   const app = buildTestApp({ required: true });
   const foreign = parties.create({
     tenantId: OTHER,
@@ -320,13 +340,9 @@ test("a FOREIGN party is refused as if it did not exist", async () => {
     country: "USA",
     synthetic: false,
   });
-  const handle = passkeys.store(TENANT, VALID_PASSKEY);
   const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   const res = await withClient(app, key, async (c) =>
-    c.callTool({
-      name: "onboard_agent",
-      arguments: { spec: VALID_SPEC, passkeyId: handle, partyId: foreign },
-    }),
+    c.callTool({ name: "create_company", arguments: { partyId: foreign, ...MCP_INTAKE } }),
   );
   expect(textOf(res)).toMatch(/unknown, not yours, or already bound/);
   expect(repo.listByTenant(TENANT)).toHaveLength(0);
@@ -372,42 +388,33 @@ test("MIRROR: custody is refused BEFORE formation, exactly as on REST", async ()
   ).toMatch(/circle custody is not available/);
 });
 
-test("the quota refuses onboard_agent before the entity is minted", async () => {
+test("the quota refuses create_company, which is the door that spends", async () => {
+  // It used to be asserted on onboard_agent, because A1's shim made that the spending door. A3
+  // moved the money to `create_company` and the quota went with it.
   const app = buildTestApp({ required: true, maxPerTenant: 1 });
-  const handle = passkeys.store(TENANT, VALID_PASSKEY);
   const { key } = apiKeys.mint(TENANT, { capability: "provision" });
   await withClient(app, key, async (c) => {
     const first = JSON.parse(
       textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
     );
-    const out = JSON.parse(
+    JSON.parse(
       textOf(
         await c.callTool({
-          name: "onboard_agent",
-          arguments: { spec: VALID_SPEC, passkeyId: handle, partyId: first.partyId },
+          name: "create_company",
+          arguments: { partyId: first.partyId, ...MCP_INTAKE },
         }),
       ),
-    );
-    // The COMPANY's create_provider row is what burns the door's quota since the re-key.
-    db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
-      repo.findByIdempotencyKey(out.id)!.companyId!,
-      "create_provider",
-      "pending",
     );
     const second = JSON.parse(
       textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
     );
     const res = await c.callTool({
-      name: "onboard_agent",
-      arguments: {
-        spec: { ...VALID_SPEC, name: "Second" },
-        passkeyId: handle,
-        partyId: second.partyId,
-      },
+      name: "create_company",
+      arguments: { partyId: second.partyId, ...MCP_INTAKE },
     });
     expect(textOf(res)).toMatch(/formation quota exhausted/);
   });
-  expect(repo.listByTenant(TENANT)).toHaveLength(1);
+  expect(new SqliteCompanyRepository(db).listByTenant(TENANT)).toHaveLength(1);
 });
 
 // ── COMPANIES over MCP (design 2026-08-26 §7) ───────────────────────────────────────────────
@@ -415,13 +422,6 @@ test("the quota refuses onboard_agent before the entity is minted", async () => 
 /** The company projection's key set, asserted IDENTICALLY on both surfaces (§7). Its twin lives
  *  in test/api/formationParty.routes.test.ts; a field added to one door and not the other fails
  *  whichever of the two was forgotten. */
-/** The PRODUCTION intake over MCP (A2 §5) — the same three fields REST takes, minus the ssn. */
-const MCP_INTAKE = {
-  names: ["Acme Robotics LLC", "Acme Automata", "Acme Mechanicals"],
-  businessPurpose: "Operating autonomous software agents.",
-  industryLabel: "Software development",
-};
-
 const COMPANY_VIEW_KEYS = [
   "agents",
   "businessPurpose",

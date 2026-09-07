@@ -55,11 +55,16 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     if (custody === "turnkey" && !deps.turnkeyCustodyAvailable)
       throw new ApiError("validation_error", 400, custodyUnavailableMessage("turnkey"));
 
-    // Formation gate (design §2/§5): AFTER custody, BEFORE the World gate. The order is mirrored
-    // exactly by the MCP onboard_agent tool, and the checks themselves live in ONE function so
-    // the two surfaces cannot drift — see src/formation.ts. Everything it refuses is refused
-    // BEFORE the claim: formation is real money in production, and an entity must never be left
-    // live with a mandatory formation that can never happen.
+    // Formation gate (design §2/§5/§7): AFTER custody, BEFORE the World gate. The order is
+    // mirrored exactly by the MCP onboard_agent tool, and the checks themselves live in ONE
+    // function so the two surfaces cannot drift — see src/formation.ts. Everything it refuses is
+    // refused BEFORE the claim: an entity must never be left live with a mandatory formation that
+    // can never happen.
+    //
+    // `partyId` is still READ, and it is read in order to be REFUSED (A3). The A1 shim used to
+    // turn one into a 1:1 company inside the claim; with the shim gone, silently ignoring the
+    // field would accept an onboard from a caller who had just posted a real legal identity and
+    // believed it was being filed. `formationDoorRefusal` answers it with the door that files.
     if (body.partyId !== undefined && typeof body.partyId !== "string")
       throw new ApiError("validation_error", 400, "partyId must be a string");
     if (body.companyId !== undefined && typeof body.companyId !== "string")
@@ -95,7 +100,6 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       tenantId: getAddress(tenantId),
       guardianPasskey: body.guardianPasskey as GuardianPasskey,
       custody,
-      partyId,
       companyId,
     });
     return c.json({ id, status }, 202);

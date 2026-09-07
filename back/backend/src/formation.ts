@@ -49,9 +49,18 @@ export function resolveFormationDeployment(
 // non-null to a 400, MCP to an `isError` text — so the ORDER of the checks cannot differ
 // between the surfaces either, which is the property `server.ts:489-491` asks for.
 
-/** Formation is mandatory here and the caller sent neither a company nor a party handle. */
+/**
+ * Formation is mandatory here and the caller sent no company handle — OR sent a `partyId`, which
+ * this door stopped accepting when the A1 shim was removed (design §7, A3).
+ *
+ * ONE message for both, because they are one instruction: onboard attaches an agent to a company
+ * that already exists, and a company is created at its own door. The shim used to mint a 1:1
+ * company from a party-only onboard, which is why `partyId` was ever a field here; with it gone,
+ * a `partyId` on this request is a caller who believes onboard will file something for them, and
+ * telling them where the create door is IS the refusal.
+ */
 export function formationPartyRequiredMessage(): string {
-  return "formation is required on this deployment: create or reuse a company (POST /companies, or the create_company tool) and pass its companyId to onboard — or pass a partyId and one will be created for you";
+  return "formation is required on this deployment: create a company first (POST /companies, or the create_company tool) and pass its companyId to onboard — onboard no longer creates a company for you, so a partyId is not accepted here";
 }
 
 /** The company handle is unknown, not yours, or not in a state an agent may attach to. ONE
@@ -162,30 +171,6 @@ export function companyNameCharsetMessage(position: number, char: string): strin
  *  name in it at all, and would be filed as "LLC LLC". */
 export function companyNameEndingOnlyMessage(position: number): string {
   return `names[${position - 1}] must contain something other than an entity ending`;
-}
-
-/**
- * THE A1 SHIM's refusals, spelled for the door the caller is actually standing at.
- *
- * A party-only `POST /onboard` (or `onboard_agent`) sends an AGENT NAME. There is no `names`
- * array anywhere in that request — the shim derives a 1:1 company from the agent's name — so
- * "names[0] is blank, all three candidates are required" told that caller to fix a field they
- * had never heard of and could not have sent. A refusal a caller cannot act on is a dead end
- * even when the underlying rule is right, and the underlying rule IS right: "LLC" alone would be
- * filed with Wyoming as "LLC LLC".
- *
- * Same rules, same order, different sentence. They go away with the shim in A3.
- */
-export function shimAgentNameBlankMessage(): string {
-  return "name is blank — this agent's name becomes its company's name, so it has to say something";
-}
-
-export function shimAgentNameTooLongMessage(max: number): string {
-  return `name is longer than ${max} characters, which is the limit Wyoming files a company name under — this agent's name becomes its company's name`;
-}
-
-export function shimAgentNameEndingOnlyMessage(): string {
-  return 'name must contain something other than an entity ending — this agent\'s name becomes its company\'s name, and "LLC" on its own would be filed as "LLC LLC"';
 }
 
 /** Wyoming reserves this word to licensed or chartered entities (see wyRestrictedWords.ts). */
@@ -314,13 +299,19 @@ export function syntheticFormationParty(partyId: string): {
   };
 }
 
-/** Counting surface behind the two spend controls. Implemented by the formation repository. */
-export interface FormationQuotaReader {
-  /** Lifetime formations opened by one tenant. */
-  createRequestsByTenant(tenantId: string): number;
-  /** Formations opened across the whole deployment since a UTC "YYYY-MM-DD HH:MM:SS" instant. */
-  createRequestsSince(sinceUtc: string): number;
-  /** The attach predicate's steps read. Optional so the pre-company fakes still satisfy it. */
+/**
+ * What the onboard door reads of the sub-saga: the attach predicate's steps, and nothing else.
+ *
+ * It used to be the COUNTING surface behind the two spend controls as well (a per-tenant count of
+ * `create_provider` rows, and `createRequestsSince`). Those controls moved to `createCompany`
+ * with the company door in A1 and are enforced there — this door spends nothing, because
+ * attaching an agent to a company somebody already paid for is free (§3). With the shim gone
+ * there is no remaining path from onboard to a filing, so the counters are not read here at all,
+ * and the per-tenant one is deleted outright: `companies.countChargeableByTenant` is the quota.
+ *
+ * `stepsOf` stays optional so the pre-company fakes still satisfy it.
+ */
+export interface FormationStepsReader {
   stepsOf?(companyId: string): import("./persistence/formationRepository").FormationRequestRecord[];
 }
 
@@ -328,57 +319,57 @@ export interface FormationQuotaReader {
 export interface FormationDoorDeps {
   formation?: {
     required: boolean;
-    maxPerTenant: number;
-    dailyCeiling: number;
     maxAgentsPerCompany: number;
-    parties: import("./persistence/formationPartyRepository").FormationPartyRepository;
-    /** The sub-saga rows. Typed as the narrow COUNTING surface here — the door needs nothing
-     *  else from them, and the full repository satisfies it structurally. */
-    requests: FormationQuotaReader;
+    /** The sub-saga rows, narrowed to the one read the attach predicate makes. */
+    requests: FormationStepsReader;
     /** Companies: what an ATTACH resolves against. The door's check is advisory — the binding
      *  answer is the CAS inside the claim transaction (§3) — but refusing here means an
      *  unattachable company never costs a claim. */
     companies: import("./persistence/companyRepository").CompanyRepository;
   };
-  now?: () => number;
 }
-
-const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** The SQLite TEXT-timestamp formatter, defined beside its parser in `util/sqliteTime` (M4) and
  *  re-exported here for the door's own callers. */
 export { sqliteUtcTimestamp };
 
 /**
- * The formation door gate, in the ONE order both surfaces run it (design §2/§5).
+ * The formation door gate, in the ONE order both surfaces run it (design §2/§5/§7).
  *
  * Returns the refusal message, or null when the request may proceed. Everything here happens
- * BEFORE the entity is claimed: formation is real money in production ($100–150 each), and the
- * user-facing answer to an exhausted quota or pack is a door that refuses, never an entity left
- * live with a mandatory formation that can never happen.
+ * BEFORE the entity is claimed: an entity is never left live owing a mandatory formation that can
+ * never happen.
+ *
+ * ⚠ **It no longer spends anything.** A1's shim made a party-only onboard mint a company, so this
+ * door carried the tenant quota, the platform daily ceiling and the party's single-use check.
+ * A3 removed the shim: onboard now ATTACHES to a company that already exists, which is free
+ * (billing is per company, §3), and every control that guards the money lives in `createCompany`
+ * behind `POST /companies` / `create_company`. What is left here is availability, the mandatory
+ * flag, and the attach predicate.
  */
 export function formationDoorRefusal(
   deps: FormationDoorDeps,
   input: { tenantId: string; partyId?: string; companyId?: string },
 ): string | null {
   const f = deps.formation;
-  const now = deps.now ?? Date.now;
 
   // 1. A deployment that forms nothing. A party or company handle here is a caller who believes
   //    a legal body is being filed; say so instead of dropping it.
   if (!f) return input.partyId || input.companyId ? formationUnavailableMessage() : null;
 
-  // 2. Mandatory formation with no handle of either kind.
-  if (f.required && !input.partyId && !input.companyId) return formationPartyRequiredMessage();
+  // 2. A `partyId` at THIS door, on any deployment that forms. It is not ignored and it is not
+  //    quietly treated as "create me a company": the shim that did that is gone, and a caller
+  //    who sends one believes a filing is being opened for them. The refusal names the door that
+  //    actually opens one. (The field is still READ — by both surfaces, and declared in MCP's
+  //    schema — precisely so that passing one is refused rather than silently dropped.)
+  if (input.partyId) return formationPartyRequiredMessage();
 
-  // 3. ATTACH (§3). An existing company costs nothing new — the filing is already paid for and
-  //    already open — so it short-circuits the spend controls below entirely. Billing is per
-  //    COMPANY: attaching an agent to one is free. The binding check is the CAS inside the claim
-  //    transaction; this one exists so an unattachable company never costs a claim.
+  // 3. Mandatory formation with no company handle.
+  if (f.required && !input.companyId) return formationPartyRequiredMessage();
+
+  // 4. ATTACH (§3). The binding check is the CAS inside the claim transaction; this one exists so
+  //    an unattachable company never costs a claim.
   if (input.companyId) {
-    // Both at once would be ambiguous about which identity the filing is under.
-    if (input.partyId)
-      return "pass either companyId (attach to an existing company) or partyId (create one), not both";
     const company = f.companies.findOwned(input.tenantId, input.companyId);
     if (!company) return companyUnavailableMessage();
     if (
@@ -391,49 +382,8 @@ export function formationDoorRefusal(
       return companyUnavailableMessage();
     if (f.companies.countAgents(input.companyId) >= f.maxAgentsPerCompany)
       return companyAgentCapMessage(f.maxAgentsPerCompany);
-    return null;
   }
 
-  // 4. Ownership + single-use. Uniform message (see formationPartyUnavailableMessage).
-  if (input.partyId) {
-    const party = f.parties.findOwned(input.tenantId, input.partyId);
-    if (!party || party.companyId) return formationPartyUnavailableMessage();
-  }
-
-  // 5. Spend controls, only when a filing will ACTUALLY be initiated — which is exactly when a
-  //    party handle is passed and a NEW company will be minted for it, on EVERY deployment (the
-  //    opt-in semantic). Keyed on the partyId rather than on `required`, because an opt-in filing
-  //    on a `required=false` box costs the same $100–150 as a mandatory one and must count
-  //    against the same limits. `createCompany` re-checks all of it inside the claim.
-  if (!input.partyId) return null;
-
-  const used = f.requests.createRequestsByTenant(input.tenantId);
-  if (used >= f.maxPerTenant) {
-    opsLog("formation_quota_rejected", {
-      reason: "tenant-formation-quota",
-      tenantId: truncateTenant(input.tenantId),
-      used,
-      limit: f.maxPerTenant,
-    });
-    return formationQuotaExhaustedMessage(f.maxPerTenant);
-  }
-
-  const inWindow = f.requests.createRequestsSince(sqliteUtcTimestamp(now() - DAY_MS));
-  if (inWindow >= f.dailyCeiling) {
-    opsLog("formation_ceiling_rejected", {
-      reason: "platform-formation-ceiling",
-      windowCount: inWindow,
-      limit: f.dailyCeiling,
-    });
-    return formationCeilingReachedMessage(f.dailyCeiling);
-  }
-
-  // Within 20% of either limit AFTER this formation: the operator hears about it while there is
-  // still headroom, not when the door starts refusing.
-  warnIfNearLimit("formation_quota_warning", used + 1, f.maxPerTenant, {
-    tenantId: truncateTenant(input.tenantId),
-  });
-  warnIfNearLimit("formation_ceiling_warning", inWindow + 1, f.dailyCeiling, {});
   return null;
 }
 

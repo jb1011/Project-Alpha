@@ -92,7 +92,7 @@ export interface McpToolDeps extends EntityViewDeps {
  * Availability sentence for the onboard_agent description — agent-first callers have no GET
  * /config, so the tool description is their capability discovery surface. The formation note
  * follows the same pattern for the same reason: an agent that cannot read /config must still be
- * able to learn that this deployment will refuse an onboard without a partyId, and in WHICH
+ * able to learn that this deployment will refuse an onboard without a companyId, and in WHICH
  * environment it files (the honesty invariant reaches the agent surface too).
  */
 function custodyCapabilityNote(
@@ -567,7 +567,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       "create_formation_party",
       {
         title: "Create formation party",
-        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to onboard_agent. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in onboard_agent's spec. A real party requires legalFirstName, legalLastName, email, PHONE and address (doola will not file a responsible party without a phone number). The response contains the handle and nothing else.`,
+        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to create_company. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in create_company's arguments and never in onboard_agent's spec. A real party requires legalFirstName, legalLastName, email, PHONE and address (doola will not file a responsible party without a phone number). The response contains the handle and nothing else.`,
         inputSchema: {
           /** The sandbox shortcut: no personal data at all. */
           synthetic: z.boolean().optional(),
@@ -733,12 +733,22 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "onboard_agent",
     {
       title: "Onboard agent",
-      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} companyId attaches this agent to a company you already own (free, and the fastest path — see list_companies); partyId instead creates a fresh 1:1 company for a new legal identity. Never put personal data in spec. ${formationCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
+      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} companyId attaches this agent to a company you already own and is REQUIRED wherever formation is: attaching is free, and a company is created at its own door (create_company, after create_formation_party) — see list_companies for the ones you have. partyId is NOT accepted here and never will be; passing one is refused, not ignored. Never put personal data in spec. ${formationCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
         idempotencyKey: z.string().optional(),
         custody: z.enum(["turnkey", "circle"]).optional(),
+        /**
+         * ⚠ DECLARED IN ORDER TO BE REFUSED (A3), exactly like `ssn` on `create_company`.
+         *
+         * A1's shim minted a 1:1 company for a party-only onboard; A3 removed it, so this door
+         * attaches and never creates. An UNDECLARED field is not rejected by the SDK — it is
+         * silently STRIPPED before the handler runs, because the tool's zod schema discards what
+         * it does not know. A model that had just called `create_formation_party` and passed the
+         * handle here would therefore have got back an entity id, with nothing filed and no
+         * indication that the identity it registered was going nowhere.
+         */
         partyId: z.string().optional(),
         companyId: z.string().optional(),
       },
@@ -765,8 +775,13 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             isError: true,
           };
         // Formation gate: AFTER custody, BEFORE the World check — the SAME order as the REST
-        // /onboard route, running the SAME function (src/formation.ts), so a request that is
-        // both party-less and quota-exhausted gets the identical primary error on both surfaces.
+        // /onboard route, running the SAME function (src/formation.ts), so a request that is both
+        // company-less and unattachable gets the identical primary error on both surfaces.
+        //
+        // `partyId` stays DECLARED in the schema below in order to be REFUSED here (A3, and the
+        // same argument as `ssn` on create_company): an undeclared field is silently stripped by
+        // the SDK's zod parse, so a model passing one would have got back an entity id with no
+        // indication that the legal identity it had just registered was never going to be filed.
         const formationRefusal = formationDoorRefusal(deps, { tenantId, partyId, companyId });
         if (formationRefusal)
           return { content: [{ type: "text", text: formationRefusal }], isError: true };
@@ -787,7 +802,6 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           tenantId,
           guardianPasskey: passkey,
           custody: resolvedCustody,
-          partyId,
           companyId,
         });
         return { content: [{ type: "text", text: JSON.stringify({ id, status }) }] };

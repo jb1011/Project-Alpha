@@ -1,21 +1,23 @@
 /**
- * The formation door gate (design §2/§5) — ONE function, so REST /onboard and MCP onboard_agent
- * cannot disagree about the ORDER of the checks or the wording of a refusal.
+ * The formation door gate (design §2/§5/§7) — ONE function, so REST /onboard and MCP
+ * onboard_agent cannot disagree about the ORDER of the checks or the wording of a refusal.
  *
- * The spend controls are the money-facing half (audit H6): formation is $100–150 each in
- * production, so an exhausted quota or ceiling refuses BEFORE the entity is minted. An entity is
- * never left live with a mandatory formation that can never happen.
+ * ⚠ A3 REMOVED THE SHIM, and with it everything this door used to spend. Under A1 a party-only
+ * onboard minted a company inside the claim, so the tenant quota, the platform daily ceiling and
+ * the party's single-use rule all had to be enforced HERE. They now live in `createCompany`
+ * behind `POST /companies` / `create_company`, where the money is actually spent, and
+ * `test/formation/createCompany.test.ts` is where they are asserted. What is left is
+ * availability, the mandatory flag, and the ATTACH predicate — and the one new rule, which is
+ * that a `partyId` at this door is REFUSED rather than ignored.
  */
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import {
-  formationCeilingReachedMessage,
+  companyAgentCapMessage,
+  companyUnavailableMessage,
   formationDoorRefusal,
   formationPartyRequiredMessage,
-  formationPartyUnavailableMessage,
-  formationQuotaExhaustedMessage,
   formationUnavailableMessage,
-  sqliteUtcTimestamp,
 } from "../../src/formation";
 import { companyNameOptions } from "../../src/formation/intake";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -25,17 +27,16 @@ import { SqliteFormationRepository } from "../../src/persistence/formationReposi
 
 const TENANT = "0x000000000000000000000000000000000000000A";
 const OTHER = "0x000000000000000000000000000000000000000B";
-const NOW = Date.parse("2026-08-21T12:00:00Z");
 
 let db: DatabaseType.Database;
 let parties: SqliteFormationPartyRepository;
-let quota: SqliteFormationRepository;
+let requests: SqliteFormationRepository;
 let companies: SqliteCompanyRepository;
 beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   parties = new SqliteFormationPartyRepository(db);
-  quota = new SqliteFormationRepository(db);
+  requests = new SqliteFormationRepository(db);
   companies = new SqliteCompanyRepository(db);
 });
 afterEach(() => db.close());
@@ -57,25 +58,14 @@ function newParty(tenantId = TENANT): string {
   });
 }
 
-function deps(
-  over: {
-    required?: boolean;
-    maxPerTenant?: number;
-    dailyCeiling?: number;
-    maxAgentsPerCompany?: number;
-  } = {},
-) {
+function deps(over: { required?: boolean; maxAgentsPerCompany?: number } = {}) {
   return {
     formation: {
       required: over.required ?? true,
-      maxPerTenant: over.maxPerTenant ?? 3,
-      dailyCeiling: over.dailyCeiling ?? 10,
       maxAgentsPerCompany: over.maxAgentsPerCompany ?? 10,
-      parties,
-      requests: quota,
+      requests,
       companies,
     },
-    now: () => NOW,
   };
 }
 
@@ -97,17 +87,6 @@ function newCompany(
   });
 }
 
-/** A past formation for `tenantId`: an entity row plus its create_provider row (what the quota
- *  actually counts — the join is how a per-tenant limit reaches rows keyed only by entity). */
-function pastFormation(key: string, tenantId: string, atUtc = sqliteUtcTimestamp(NOW - 60_000)) {
-  // The quota counts `create_provider` rows, which are keyed by COMPANY since the re-key — so a
-  // past formation is a company with an opened filing, and the tenant join goes through it.
-  newCompany({ tenantId, companyId: key });
-  db.prepare(
-    "INSERT INTO formation_requests (company_id, step, state, created_at) VALUES (?,?,?,?)",
-  ).run(key, "create_provider", "confirmed", atUtc);
-}
-
 // ── availability ────────────────────────────────────────────────────────────────────────────
 
 test("a deployment that forms nothing: no gate at all, but a partyId is REFUSED not ignored", () => {
@@ -119,121 +98,98 @@ test("a deployment that forms nothing: no gate at all, but a partyId is REFUSED 
   );
 });
 
-// ── the party gate: required / optional × present / missing / foreign / bound ────────────────
+// ── the party handle: REFUSED, never ignored (A3) ───────────────────────────────────────────
 
-test("REQUIRED + no partyId → the single-sourced refusal", () => {
-  expect(formationDoorRefusal(deps(), { tenantId: TENANT })).toBe(formationPartyRequiredMessage());
+test("a partyId at THIS door is refused, and the refusal names the door that mints a company", () => {
+  // A1's shim turned one into a 1:1 company inside the claim. With it gone, ignoring the field
+  // would accept an onboard from a caller who had just registered a real legal identity and
+  // believed it was being filed — the exact failure `formationUnavailableMessage` exists to
+  // prevent on the other kind of deployment.
+  const msg = formationDoorRefusal(deps(), { tenantId: TENANT, partyId: newParty() });
+  expect(msg).toBe(formationPartyRequiredMessage());
+  expect(msg).toMatch(/POST \/companies/);
+  expect(msg).toMatch(/create_company/);
+  expect(msg).toMatch(/partyId is not accepted here/);
 });
 
-test("REQUIRED + a valid unbound party → allowed", () => {
-  expect(formationDoorRefusal(deps(), { tenantId: TENANT, partyId: newParty() })).toBeNull();
+test("…on EVERY deployment that forms, mandatory or not, valid handle or not", () => {
+  for (const required of [true, false])
+    for (const partyId of [newParty(), "00000000-0000-4000-8000-000000000000", newParty(OTHER)])
+      expect(formationDoorRefusal(deps({ required }), { tenantId: TENANT, partyId })).toBe(
+        formationPartyRequiredMessage(),
+      );
 });
 
-test("NOT required + no partyId → allowed (formation is opt-in there)", () => {
-  expect(formationDoorRefusal(deps({ required: false }), { tenantId: TENANT })).toBeNull();
-});
-
-test("NOT required + a valid party → allowed, and still ownership-checked", () => {
-  const mine = newParty();
-  const theirs = newParty(OTHER);
-  const d = deps({ required: false });
-  expect(formationDoorRefusal(d, { tenantId: TENANT, partyId: mine })).toBeNull();
-  expect(formationDoorRefusal(d, { tenantId: TENANT, partyId: theirs })).toBe(
-    formationPartyUnavailableMessage(),
-  );
-});
-
-test("unknown, FOREIGN and already-BOUND parties are refused with the SAME message", () => {
-  const foreign = newParty(OTHER);
-  const bound = newParty();
-  parties.bindToCompany(bound, newCompany(), TENANT);
-
-  // One message for all three: distinguishing them turns the door into an existence oracle over
-  // another tenant's party ids.
-  for (const partyId of ["00000000-0000-4000-8000-000000000000", foreign, bound])
-    expect(formationDoorRefusal(deps(), { tenantId: TENANT, partyId })).toBe(
-      formationPartyUnavailableMessage(),
-    );
-});
-
-// ── spend controls ──────────────────────────────────────────────────────────────────────────
-
-test("the per-tenant LIFETIME quota refuses before the entity is minted", () => {
-  pastFormation("k1", TENANT);
-  pastFormation("k2", TENANT);
-  expect(
-    formationDoorRefusal(deps({ maxPerTenant: 3 }), { tenantId: TENANT, partyId: newParty() }),
-  ).toBeNull();
-
-  pastFormation("k3", TENANT);
-  expect(
-    formationDoorRefusal(deps({ maxPerTenant: 3 }), { tenantId: TENANT, partyId: newParty() }),
-  ).toBe(formationQuotaExhaustedMessage(3));
-
-  // …and it is PER TENANT: another tenant's three formations do not touch this one's quota.
-  expect(
-    formationDoorRefusal(deps({ maxPerTenant: 3 }), { tenantId: OTHER, partyId: newParty(OTHER) }),
-  ).toBeNull();
-});
-
-test("the quota counts FAILED formations too — a failed create can already have cost a company", () => {
-  newCompany({ companyId: "kf" });
-  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES ('kf',?,?)").run(
-    "create_provider",
-    "failed",
-  );
-  expect(
-    formationDoorRefusal(deps({ maxPerTenant: 1 }), { tenantId: TENANT, partyId: newParty() }),
-  ).toBe(formationQuotaExhaustedMessage(1));
-});
-
-test("the rolling 24h deployment ceiling counts ACROSS tenants and expires", () => {
-  const d = deps({ dailyCeiling: 2, maxPerTenant: 99 });
-  pastFormation("a", TENANT, sqliteUtcTimestamp(NOW - 3_600_000)); // 1h ago
-  pastFormation("b", OTHER, sqliteUtcTimestamp(NOW - 3_600_000)); // another tenant, same window
-  expect(formationDoorRefusal(d, { tenantId: TENANT, partyId: newParty() })).toBe(
-    formationCeilingReachedMessage(2),
-  );
-
-  // A formation older than the window does not count: move both outside it.
-  db.prepare("UPDATE formation_requests SET created_at = ?").run(
-    sqliteUtcTimestamp(NOW - 25 * 3_600_000),
-  );
-  expect(formationDoorRefusal(d, { tenantId: TENANT, partyId: newParty() })).toBeNull();
-});
-
-test("ORDER: the party gate runs BEFORE the spend controls (most specific reason first)", () => {
-  pastFormation("k1", TENANT);
-  // Quota is exhausted AND the party is missing: the caller hears about the party, which is the
-  // thing they can act on, and both surfaces hear the same one.
-  expect(formationDoorRefusal(deps({ maxPerTenant: 1 }), { tenantId: TENANT })).toBe(
+test("a partyId BESIDE a valid companyId is still refused — one handle, one meaning", () => {
+  // It used to be its own "pass either… not both" sentence. There is no longer a `both` to
+  // disambiguate: the party door and the company door are different doors, and neither is here.
+  const companyId = newCompany();
+  expect(formationDoorRefusal(deps(), { tenantId: TENANT, companyId, partyId: newParty() })).toBe(
     formationPartyRequiredMessage(),
   );
 });
 
-test("C5: spend controls key on the PARTY, not on `required` — an opt-in filing costs the same", () => {
-  // Supersedes PR 2 decision #2. A bound party is always pinned and always filed, so an opt-in
-  // formation on a `required=false` box spends the same $100–150 as a mandatory one and must
-  // count against the same limits. Keyed on `required`, that money was unmetered.
-  pastFormation("k1", TENANT);
-  pastFormation("k2", TENANT);
-  pastFormation("k3", TENANT);
-  expect(
-    formationDoorRefusal(deps({ required: false, maxPerTenant: 1, dailyCeiling: 1 }), {
-      tenantId: TENANT,
-      partyId: newParty(),
-    }),
-  ).toMatch(/formation quota exhausted/);
+// ── the mandatory flag ──────────────────────────────────────────────────────────────────────
+
+test("REQUIRED + no companyId → the single-sourced refusal", () => {
+  expect(formationDoorRefusal(deps(), { tenantId: TENANT })).toBe(formationPartyRequiredMessage());
 });
 
-test("C5: no party means no filing, so the controls do not run at all", () => {
-  // The wizard's shape today: no partyId, nothing pinned, nothing filed, nothing spent — and
-  // therefore nothing to refuse, however exhausted the quota is.
-  pastFormation("k1", TENANT);
-  pastFormation("k2", TENANT);
+test("NOT required + no handle at all → allowed (formation is opt-in there)", () => {
+  expect(formationDoorRefusal(deps({ required: false }), { tenantId: TENANT })).toBeNull();
+});
+
+// ── attach ──────────────────────────────────────────────────────────────────────────────────
+
+test("a READY company the tenant owns is attachable", () => {
+  expect(formationDoorRefusal(deps(), { tenantId: TENANT, companyId: newCompany() })).toBeNull();
+});
+
+test("unknown, FOREIGN, DRAFT and ABANDONED companies get the SAME message", () => {
+  // One message for all four, for the reason the party rule had one: distinguishing them turns
+  // the door into an existence oracle over another tenant's company ids.
+  const foreign = newCompany({ tenantId: OTHER, companyId: "c-foreign" });
+  const draft = newCompany({ status: "draft", companyId: "c-draft" });
+  const abandoned = newCompany({ status: "abandoned", companyId: "c-abandoned" });
+  for (const companyId of ["c-nope", foreign, draft, abandoned])
+    expect(formationDoorRefusal(deps(), { tenantId: TENANT, companyId })).toBe(
+      companyUnavailableMessage(),
+    );
+});
+
+test("a company whose create_provider FAILED is refused — the filing will not happen", () => {
+  const companyId = newCompany({ companyId: "c-failed" });
+  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
+    companyId,
+    "create_provider",
+    "failed",
+  );
+  expect(formationDoorRefusal(deps(), { tenantId: TENANT, companyId })).toBe(
+    companyUnavailableMessage(),
+  );
+});
+
+test("a company already at the agent cap is refused, and the message says the limit", () => {
+  const companyId = newCompany({ companyId: "c-full" });
+  db.prepare(
+    "INSERT INTO entities (idempotency_key, name, status, manager, guardian, amendment_delay, ein, formation_date, owner_tenant_id, spec_json, company_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+  ).run("e-1", "n", "bound", "0x1", "0x2", "0", "STUB", 0, TENANT, "{}", companyId);
   expect(
-    formationDoorRefusal(deps({ required: false, maxPerTenant: 1, dailyCeiling: 1 }), {
-      tenantId: TENANT,
-    }),
+    formationDoorRefusal(deps({ maxAgentsPerCompany: 1 }), { tenantId: TENANT, companyId }),
+  ).toBe(companyAgentCapMessage(1));
+  // …and one under the cap is still allowed.
+  expect(
+    formationDoorRefusal(deps({ maxAgentsPerCompany: 2 }), { tenantId: TENANT, companyId }),
   ).toBeNull();
+});
+
+test("ORDER: the party refusal runs BEFORE the mandatory flag and before the attach", () => {
+  // Both surfaces hear the same primary error, and it is the one the caller can act on: they are
+  // holding a handle this door does not take.
+  expect(formationDoorRefusal(deps(), { tenantId: TENANT, partyId: newParty() })).toBe(
+    formationPartyRequiredMessage(),
+  );
+  expect(
+    formationDoorRefusal(deps(), { tenantId: TENANT, partyId: newParty(), companyId: "c-nope" }),
+  ).toBe(formationPartyRequiredMessage());
 });
