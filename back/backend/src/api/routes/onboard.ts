@@ -13,7 +13,13 @@ import {
 import { createCompany, updateCompanyIntake } from "../../formation/company";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
-import { AgentSpecSchema, FormationPartySchema } from "../../policy/agentSpec";
+import {
+  AgentSpecSchema,
+  CreateCompanyBodySchema,
+  FormationPartySchema,
+  UpdateCompanyIntakeBodySchema,
+  firstIssueMessage,
+} from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 import { listCompanyViews, toEntityView, toEntityViews } from "../views";
@@ -118,44 +124,23 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     const tenantId = c.get("tenantId");
     if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
 
-    let body: {
-      partyId?: unknown;
-      names?: unknown;
-      businessPurpose?: unknown;
-      industryLabel?: unknown;
-      ssn?: unknown;
-      synthetic?: unknown;
-    };
-    try {
-      body = await c.req.json();
-    } catch {
-      throw new ApiError("validation_error", 400, "invalid JSON body");
-    }
-    if (typeof body.partyId !== "string" || !body.partyId)
-      throw new ApiError("validation_error", 400, "partyId is required");
-    // TYPE checks only — the CONTENT rules (length, charset, restricted words, duplicates, the
-    // industry list, the SSN format) all live in `createCompany`, where MCP meets them too.
-    if (body.names !== undefined && !Array.isArray(body.names))
-      throw new ApiError("validation_error", 400, companyNamesRequiredMessage());
-    for (const [field, value] of [
-      ["businessPurpose", body.businessPurpose],
-      ["industryLabel", body.industryLabel],
-      ["ssn", body.ssn],
-    ] as const)
-      if (value !== undefined && typeof value !== "string")
-        throw new ApiError("validation_error", 400, `${field} must be a string`);
+    // TYPE checks only, from the ONE schema both company doors parse — the CONTENT rules (length,
+    // charset, restricted words, duplicates, the industry list, the SSN format) all live in
+    // `createCompany`, where MCP meets them too.
+    const body = CreateCompanyBodySchema.safeParse(await readJson(c));
+    if (!body.success) throw new ApiError("validation_error", 400, firstIssueMessage(body.error));
 
     const result = createCompany(
       // The composition root's ONE dependency set; this door supplies only its transaction.
       { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
       tenantId,
       {
-        partyId: body.partyId,
-        names: body.names as string[] | undefined,
-        businessPurpose: body.businessPurpose as string | undefined,
-        industryLabel: body.industryLabel as string | undefined,
-        ssn: body.ssn as string | undefined,
-        synthetic: body.synthetic === true ? true : undefined,
+        partyId: body.data.partyId,
+        names: body.data.names,
+        businessPurpose: body.data.businessPurpose,
+        industryLabel: body.data.industryLabel,
+        ssn: body.data.ssn,
+        synthetic: body.data.synthetic === true ? true : undefined,
       },
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);
@@ -178,40 +163,21 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     const tenantId = c.get("tenantId");
     if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
 
-    let body: {
-      names?: unknown;
-      businessPurpose?: unknown;
-      industryLabel?: unknown;
-      ssn?: unknown;
-      proceedWithoutSsn?: unknown;
-    };
-    try {
-      body = await c.req.json();
-    } catch {
-      throw new ApiError("validation_error", 400, "invalid JSON body");
-    }
-    if (body.names !== undefined && !Array.isArray(body.names))
-      throw new ApiError("validation_error", 400, companyNamesRequiredMessage());
-    for (const [field, value] of [
-      ["businessPurpose", body.businessPurpose],
-      ["industryLabel", body.industryLabel],
-      ["ssn", body.ssn],
-    ] as const)
-      if (value !== undefined && typeof value !== "string")
-        throw new ApiError("validation_error", 400, `${field} must be a string`);
+    const body = UpdateCompanyIntakeBodySchema.safeParse(await readJson(c));
+    if (!body.success) throw new ApiError("validation_error", 400, firstIssueMessage(body.error));
 
     const result = updateCompanyIntake(
       { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
       tenantId,
       c.req.param("companyId"),
       {
-        names: body.names as string[] | undefined,
-        businessPurpose: body.businessPurpose as string | undefined,
-        industryLabel: body.industryLabel as string | undefined,
-        ssn: body.ssn as string | undefined,
+        names: body.data.names,
+        businessPurpose: body.data.businessPurpose,
+        industryLabel: body.data.industryLabel,
+        ssn: body.data.ssn,
         // The §4.6a decision, and deliberately a strict `=== true`: "file without one" is a
         // choice a caller makes, never something a truthy value makes for them.
-        proceedWithoutSsn: body.proceedWithoutSsn === true ? true : undefined,
+        proceedWithoutSsn: body.data.proceedWithoutSsn === true ? true : undefined,
       },
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);
@@ -332,4 +298,12 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       throw new ApiError("pocket_funding_failed", 502, (e as Error).message);
     }
   });
+} /** The body, or the door's own 400 — a malformed JSON body is not a schema violation, and saying
+ *  so is more use to a caller than a list of missing fields. */
+async function readJson(c: { req: { json(): Promise<unknown> } }): Promise<unknown> {
+  try {
+    return await c.req.json();
+  } catch {
+    throw new ApiError("validation_error", 400, "invalid JSON body");
+  }
 }

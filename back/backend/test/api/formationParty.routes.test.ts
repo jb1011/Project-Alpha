@@ -555,6 +555,16 @@ test("POST /companies requires a session and the FULL intake, naming what is mis
   // A TYPE error is caught by the route; the CONTENT rules all live in `createCompany`.
   expect(await message({ partyId, ...COMPANY_INTAKE, names: "Acme" })).toMatch(/^names must be/);
   expect(await message({ partyId, ...COMPANY_INTAKE, ssn: 123 })).toBe("ssn must be a string");
+  // STRICT, and this is the case it exists for: an unknown key is SILENTLY DROPPED by a
+  // permissive schema, so a caller who typed `SSN` or `ssn_number` would have got back a
+  // companyId filed under the slow EIN route with no indication their number went nowhere — the
+  // same failure the MCP door had, on the one surface that actually collects it.
+  expect(await message({ partyId, ...COMPANY_INTAKE, SSN: "123-45-6789" })).toBe(
+    "unknown field: SSN",
+  );
+  expect(await message({ partyId, ...COMPANY_INTAKE, ssn_number: "x", nickname: "y" })).toMatch(
+    /^unknown fields: /,
+  );
 
   const anon = await app.request("/companies", {
     method: "POST",
