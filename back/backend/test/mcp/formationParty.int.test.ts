@@ -670,3 +670,112 @@ test("PARITY: get_company is tenant-scoped, and unknown reads exactly like not-y
     expect(textOf(theirs)).toBe(textOf(missing));
   });
 });
+
+// ── update_formation_party (design §7, A3) ──────────────────────────────────────────────────
+
+test("the party-edit door exists on MCP too, takes no ssn, and is gated on formation", async () => {
+  // A park with a browser-only exit is a park an agent-first caller cannot leave — and they can
+  // reach it, because `create_formation_party` is theirs.
+  const on = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const tool = await withClient(on, key, async (c) =>
+    (await c.listTools()).tools.find((t) => t.name === "update_formation_party"),
+  );
+  expect(tool).toBeDefined();
+  // `ssn` IS declared, and declared in order to be REFUSED — `create_company`'s rule, and this
+  // door reached the same bug on its own: leaving it undeclared meant the SDK's zod parse
+  // stripped it silently and a model passing one got back a SUCCESS, with the number still in
+  // its context window and its logs. "There was nothing it could have meant" is exactly why the
+  // caller has to be told rather than quietly agreed with.
+  expect(Object.keys(tool!.inputSchema.properties ?? {})).toEqual([
+    "partyId",
+    "legalFirstName",
+    "legalLastName",
+    "email",
+    "phone",
+    "address",
+    "ssn",
+  ]);
+  expect(tool!.description).toMatch(/NEVER an ssn/);
+  expect(tool!.description).toMatch(/awaitingPartyEdit/);
+
+  const off = buildTestApp(undefined);
+  const { key: key2 } = apiKeys.mint(TENANT, { capability: "provision" });
+  const offNames = await withClient(off, key2, async (c) =>
+    (await c.listTools()).tools.map((t) => t.name),
+  );
+  expect(offNames).not.toContain("update_formation_party");
+});
+
+test("MCP and REST edit through ONE function: same refusals, same strictness, same result", async () => {
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  const { token } = await signSession(TENANT, "s", 3600, Math.floor(Date.now() / 1000));
+
+  await withClient(app, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    const corrected = {
+      ...REAL_PARTY,
+      legalFirstName: "Grace",
+      legalLastName: "Hopper",
+      email: "grace@example.com",
+    };
+
+    const ok = await c.callTool({
+      name: "update_formation_party",
+      arguments: { partyId, ...corrected },
+    });
+    expect(JSON.parse(textOf(ok))).toEqual({ partyId });
+    expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Grace");
+
+    // The SAME `.strict()` schema REST parses: an `ssn` key is refused by the schema itself
+    // rather than by a check somebody has to remember to write on each surface.
+    const withSsn = await c.callTool({
+      name: "update_formation_party",
+      arguments: { partyId, ...corrected, ssn: "123-45-6789" },
+    });
+    expect((withSsn as { isError?: boolean }).isError).toBe(true);
+    expect(textOf(withSsn)).toBe(ssnNotOnThisDoorMessage());
+    expect(textOf(withSsn)).not.toMatch(/\d{3}-\d{2}-\d{4}/);
+    // The refusal is the WHOLE answer: the identity is untouched.
+    expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Grace");
+
+    // …and the ownership refusal is the same sentence REST gives.
+    const foreign = await c.callTool({
+      name: "update_formation_party",
+      arguments: { partyId: "00000000-0000-4000-8000-000000000000", ...corrected },
+    });
+    expect(textOf(foreign)).toMatch(/unknown, not yours, or already bound/);
+  });
+
+  // The REST door, on the same app and the same tenant, answers the same way — one function.
+  const { partyId } = await (
+    await app.request("/formation-party", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(REAL_PARTY),
+    })
+  ).json();
+  const res = await app.request(`/formation-party/${partyId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ ...REAL_PARTY, legalFirstName: "Grace" }),
+  });
+  expect(res.status).toBe(200);
+  expect(Object.keys(await res.json())).toEqual(["partyId"]);
+});
+
+test("update_formation_party needs the PROVISION rung — it decides whose name a filing carries", async () => {
+  const app = buildTestApp({ required: true });
+  const { key: readKey } = apiKeys.mint(TENANT, { capability: "read" });
+  const res = await withClient(app, readKey, async (c) =>
+    c.callTool({
+      name: "update_formation_party",
+      arguments: { partyId: "p", ...REAL_PARTY },
+    }),
+  );
+  expect((res as { isError?: boolean }).isError).toBe(true);
+  expect(textOf(res)).toBe("not authorized");
+});

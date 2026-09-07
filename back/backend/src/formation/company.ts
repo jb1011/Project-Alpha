@@ -16,6 +16,7 @@ import {
   formationQuotaExhaustedMessage,
   industryLabelRequiredMessage,
   industryLabelUnknownMessage,
+  partyFrozenMessage,
   sqliteUtcTimestamp,
   ssnFormatMessage,
   ssnRefusedHereMessage,
@@ -27,8 +28,12 @@ import {
 } from "../formation";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRepository, CompanyStatus } from "../persistence/companyRepository";
-import type { FormationPartyRepository } from "../persistence/formationPartyRepository";
+import type {
+  EditablePartyFields,
+  FormationPartyRepository,
+} from "../persistence/formationPartyRepository";
 import { parseDetail } from "../persistence/formationRepository";
+import { partyEditAllowed } from "./freeze";
 import type { CompanyIntake, CompanyPin } from "./intake";
 import {
   NAME_MAX_LENGTH,
@@ -400,6 +405,64 @@ export function updateCompanyIntake(
     proceedWithoutSsn: intake.proceedWithoutSsn === true,
   });
   return { companyId };
+}
+
+/**
+ * THE PARTY-EDIT DOOR (design §7, A3) — correct the responsible person doola refused.
+ *
+ * A2 left a company that doola rejected on its PARTY parked with no exit at all: the flag was
+ * written, `rearmAfterPartyEdit` was exported, and the note on both operator surfaces said
+ * "correcting a party is not yet self-service". This is that door.
+ *
+ * It lives beside `updateCompanyIntake` because it is the same shape and the same three
+ * obligations — ownership, validation, and a RE-ARM in the transaction that made the edit — and
+ * because the two are the only writes in the system that reopen a parked filing. What differs is
+ * WHICH flag it clears, and that is the whole of A2's finding 5b: `PATCH /companies/:id` rewrites
+ * names, purpose, industry and the SSN, none of which is what a rejected `createCustomer`
+ * objected to. Each door clears its own, and neither touches the other's.
+ *
+ * ⚠ NO `ssn`, structurally. The party's SSN is written by `POST /companies` (which mints the AAD
+ * the ciphertext is sealed under) and re-captured by `PATCH /companies/:companyId`. There is no
+ * field for one here, on either surface, so an SSN cannot arrive at a door that would then have
+ * to decide what to do with it.
+ */
+export function updateFormationParty(
+  deps: Pick<CreateCompanyDeps, "parties" | "requests" | "transaction">,
+  tenantId: string,
+  partyId: string,
+  fields: EditablePartyFields,
+): { partyId: string } | { error: string } {
+  // Ownership first, and the same not-an-oracle rule the rest of the door follows: an unknown id,
+  // somebody else's, and an erased one get ONE answer.
+  const party = deps.parties.findOwned(tenantId, partyId);
+  if (!party) return { error: formationPartyUnavailableMessage() };
+
+  // An UNBOUND party has no filing to be frozen by — `partyEditAllowed` says so from an
+  // `undefined` step, and reading the step at all would need a company id there is none of.
+  const step = party.companyId ? deps.requests.find(party.companyId, "create_provider") : undefined;
+  if (!partyEditAllowed(step)) return { error: partyFrozenMessage() };
+
+  let moved = false;
+  deps.transaction(() => {
+    moved = deps.parties.update(partyId, tenantId, fields);
+    if (!moved) return;
+    // …and RE-ARM the filing step this edit exists to unblock, in the SAME transaction as the
+    // edit — `updateCompanyIntake`'s rule with the other flag. The edit IS the evidence that the
+    // next body will be different, and it is the only thing that may put the row back in the
+    // sweeper's reach. A no-op for an unbound party, and for one whose row is not parked.
+    if (party.companyId) rearmAfterPartyEdit(deps, party.companyId);
+  });
+  // The row vanished between the read and the write (an erasure sweep). Same sentence as above.
+  if (!moved) return { error: formationPartyUnavailableMessage() };
+
+  // The ONLY trail this leaves, exactly as the create's: which tenant edited which handle. No
+  // name, no address, no email — and no diff, which would be the whole identity in a log line.
+  opsLog("formation_party_updated", {
+    tenantId: truncateTenant(tenantId),
+    partyId,
+    companyId: party.companyId,
+  });
+  return { partyId };
 }
 
 /**

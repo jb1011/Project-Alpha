@@ -20,7 +20,7 @@ import {
   ssnNotOnThisDoorMessage,
   truncateTenant,
 } from "../formation";
-import { createCompany } from "../formation/company";
+import { createCompany, updateFormationParty } from "../formation/company";
 import { describeIndustryLabels } from "../formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
@@ -610,6 +610,87 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             tenantId: truncateTenant(tenantId),
             partyId: result.partyId,
           });
+          return { content: [{ type: "text", text: JSON.stringify({ partyId: result.partyId }) }] };
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+        }
+      },
+    );
+
+  /**
+   * `update_formation_party` — the MCP twin of `PATCH /formation-party/:partyId` (design §7, A3).
+   *
+   * The one door that reopens a company doola refused on its PARTY, and it exists on BOTH
+   * surfaces because an agent-first caller who registered an identity through
+   * `create_formation_party` can equally have it refused, and a park with a browser-only exit is
+   * a park an agent cannot leave.
+   *
+   * ⚠ It takes NO `ssn`, and — exactly like `create_company` — the field is DECLARED so that
+   * passing one is refused rather than silently stripped (A2's finding 1, and this door reached
+   * the same bug on its own: the first version left `ssn` undeclared on the reasoning that
+   * nothing an SSN could mean here, and a test proved that a model passing one got back a
+   * success while the number sat in its context window and its logs. "There was nothing it could
+   * mean" is precisely why the caller has to be TOLD, not quietly agreed with.)
+   *
+   * Where it does belong: an SSN is sealed under an AAD of `party_id || company_id`, so it is
+   * captured by `POST /companies` (which mints the pair) and re-captured by
+   * `PATCH /companies/:companyId`. Never here, and never over MCP at all.
+   */
+  if (deps.formation)
+    server.registerTool(
+      "update_formation_party",
+      {
+        title: "Update formation party",
+        description: `Correct the legal identity of the responsible person on a filing the provider REFUSED — the one exit from a company parked on awaitingPartyEdit (see get_company). Editable only until the filing has been sent: once the provider has the person, it is never asked for them again, and an edit here would change our copy and nothing else. Takes the same fields as create_formation_party and NEVER an ssn — an SSN is collected only by the web form, which is also the only place it can be re-captured. ${formationCapabilityNote(deps)} The response contains the handle and nothing else.`,
+        inputSchema: {
+          partyId: z.string(),
+          legalFirstName: z.string(),
+          legalLastName: z.string(),
+          email: z.string(),
+          /** REQUIRED, exactly as at intake (C6): doola will not file a party with no phone. */
+          phone: z.string(),
+          address: z.record(z.unknown()),
+          /** ⚠ DECLARED IN ORDER TO BE REFUSED (§4.1) — see the block comment above. */
+          ssn: z.string().optional(),
+        },
+      },
+      async (args) => {
+        // The same rung `create_formation_party` sits on: this call decides whose identity a real
+        // Wyoming filing names.
+        if (!hasCapability(scope, "provision") || scope.entityId !== null)
+          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        // BEFORE anything else, so the refusal is the whole answer and nothing exists afterwards
+        // for the caller to clean up. Same order, same sentence, as `create_company`.
+        if ((args as { ssn?: unknown }).ssn !== undefined)
+          return { content: [{ type: "text", text: ssnNotOnThisDoorMessage() }], isError: true };
+        try {
+          const { partyId, ssn: _ssn, ...rest } = args as Record<string, unknown>;
+          // The SAME `.strict()` schema the create parses, so a field one door refuses cannot be
+          // quietly accepted by the other — and an `ssn` key is refused BY that strictness rather
+          // than by a check somebody has to remember to write.
+          const body = FormationPartySchema.parse(rest);
+          const result = updateFormationParty(
+            {
+              ...deps.formation!.companyDeps,
+              transaction: (fn) => deps.repo.transaction(fn),
+            },
+            tenantId,
+            partyId as string,
+            {
+              legalFirstName: body.legalFirstName,
+              legalLastName: body.legalLastName,
+              email: body.email,
+              phone: body.phone,
+              line1: body.address.line1,
+              line2: body.address.line2 ?? null,
+              city: body.address.city,
+              region: body.address.region ?? null,
+              postalCode: body.address.postalCode,
+              country: body.address.country,
+            },
+          );
+          if ("error" in result)
+            return { content: [{ type: "text", text: result.error }], isError: true };
           return { content: [{ type: "text", text: JSON.stringify({ partyId: result.partyId }) }] };
         } catch (e) {
           return { content: [{ type: "text", text: (e as Error).message }], isError: true };

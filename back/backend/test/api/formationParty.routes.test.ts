@@ -181,6 +181,22 @@ const post = (app: ReturnType<typeof buildApiApp>, path: string, token: string, 
     body: JSON.stringify(body),
   });
 
+const patch = (app: ReturnType<typeof buildApiApp>, path: string, token: string, body: unknown) =>
+  app.request(path, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+
+/** The correction a caller sends when doola refuses the person. */
+const CORRECTED_PARTY = {
+  ...REAL_PARTY,
+  legalFirstName: "Grace",
+  legalLastName: "Hopper",
+  email: "grace@example.com",
+  phone: "+13075550142",
+};
+
 // ── POST /formation-party ───────────────────────────────────────────────────────────────────
 
 test("real PII in, an opaque handle out — and NOTHING else in the response", async () => {
@@ -731,4 +747,71 @@ test("a FOREIGN company id is refused with the same message as an unknown one", 
   expect((await foreign.json()).error.message).toBe((await unknown.json()).error.message);
   // …and the OTHER tenant's company is untouched.
   expect(repo.listByTenant(account.address)).toHaveLength(0);
+});
+
+// ── PATCH /formation-party/:partyId (design §7, A3) ─────────────────────────────────────────
+
+test("the party-edit door rewrites the identity and answers with the handle alone", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+
+  const res = await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY);
+  expect(res.status).toBe(200);
+  // Exactly one key, for the reason the create gives: echoing the stored identity back would put
+  // PII in a response body and in every client that caches one.
+  expect(Object.keys(await res.json())).toEqual(["partyId"]);
+  expect(parties.findOwned(account.address, partyId)).toMatchObject({
+    legalFirstName: "Grace",
+    email: "grace@example.com",
+  });
+});
+
+test("it requires a session, and another tenant's handle is refused as if it did not exist", async () => {
+  const app = makeApp({ required: true });
+  const mine = await login(app);
+  const theirs = await login(app, other);
+  const { partyId } = await (await post(app, "/formation-party", mine, REAL_PARTY)).json();
+
+  const noAuth = await app.request(`/formation-party/${partyId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(CORRECTED_PARTY),
+  });
+  expect(noAuth.status).toBe(401);
+
+  const foreign = await patch(app, `/formation-party/${partyId}`, theirs, CORRECTED_PARTY);
+  expect(foreign.status).toBe(400);
+  expect((await foreign.json()).error.message).toMatch(/unknown, not yours, or already bound/);
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
+});
+
+test("it parses the SAME .strict() schema the create does — an `ssn` key is refused, not dropped", async () => {
+  // There is no `ssn` field on this door and there never will be: the AAD a ciphertext is sealed
+  // under is minted by `POST /companies`, and re-captured only by `PATCH /companies/:companyId`.
+  // `.strict()` is what turns "not a field" into a refusal rather than a silent drop.
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+
+  const res = await patch(app, `/formation-party/${partyId}`, token, {
+    ...CORRECTED_PARTY,
+    ssn: "123-45-6789",
+  });
+  expect(res.status).toBe(400);
+  // …and no digits of it come back in the refusal.
+  expect(await res.text()).not.toMatch(/\d{3}-\d{2}-\d{4}/);
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
+
+  // The same body WITHOUT it is accepted, so the refusal is about that key alone.
+  expect((await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY)).status).toBe(
+    200,
+  );
+});
+
+test("a deployment that forms nothing has no party-edit door either (503)", async () => {
+  const app = makeApp(undefined);
+  const token = await login(app);
+  const res = await patch(app, "/formation-party/whatever", token, CORRECTED_PARTY);
+  expect(res.status).toBe(503);
 });

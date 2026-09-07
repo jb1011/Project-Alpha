@@ -131,6 +131,44 @@ export function everSubmitted(
   return parsed.customerId !== undefined || parsed.companySentAttempt !== undefined;
 }
 
+/**
+ * MAY THE RESPONSIBLE PARTY STILL BE EDITED? (design §7, A3's party-edit door.)
+ *
+ * Two disjuncts, and the second is the one the door exists for:
+ *
+ *  1. **Nothing has ever been sent about this company** (`!everSubmitted`). The party's fields
+ *     feed BOTH bodies `create_provider` sends — `createCustomer` directly, and the company
+ *     create's responsible party — so an edit is free exactly while neither has gone out.
+ *     `everSubmitted` is used rather than `isIntakeFrozen` deliberately: it is the broader,
+ *     safer question, and it counts a recorded `customerId`, which the freeze does not. That
+ *     matters here and nowhere else, because the create step re-sends `createCustomer` only when
+ *     `detail.customerId` is absent — so once a customer exists at doola, an edit would change
+ *     our copy of a person and change NOTHING about the filing, while telling the caller it had.
+ *     A door that pretended to fix a rejected identity is worse than one that refuses.
+ *  2. **The row is parked awaiting a party edit.** By construction this is a `createCustomer`
+ *     doola LOOKED at and refused, so no customer id exists and disjunct 1 already holds — it is
+ *     stated anyway because the whole point of the park is that this door reopens it, and a
+ *     company that could reach the park without satisfying disjunct 1 would be stranded forever
+ *     with no exit at all.
+ *
+ * An unbound party has no company and no step: `everSubmitted(null, null, null)` is false, so it
+ * is editable, which is right — nothing has been filed with it.
+ */
+export function partyEditAllowed(step: FreezableStep | undefined): boolean {
+  if (parkedForPartyEdit(step)) return true;
+  return !everSubmitted(step?.state ?? null, step?.providerRef ?? null, step?.detail ?? null);
+}
+
+/** `detail.awaitingPartyEdit` — the flag `onCallFailure` writes when doola refuses the PARTY's
+ *  body, and the one `rearmAfterPartyEdit` clears. An unreadable blob is not a park. */
+export function parkedForPartyEdit(step: FreezableStep | undefined): boolean {
+  if (!step?.detail) return false;
+  const parsed = parseJson(step.detail);
+  return (
+    parsed !== undefined && (parsed as { awaitingPartyEdit?: unknown }).awaitingPartyEdit === true
+  );
+}
+
 /** `undefined` means "not valid JSON", which both readers above treat as the cautious answer. */
 function parseJson(raw: string): { customerId?: unknown; companySentAttempt?: number } | undefined {
   try {

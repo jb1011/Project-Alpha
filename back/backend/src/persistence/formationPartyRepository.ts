@@ -78,6 +78,29 @@ export type NewFormationParty = Omit<
   partyId?: string;
 };
 
+/**
+ * The ten columns the party-edit door may rewrite (design §7, A3) — the identity, and nothing
+ * that decides what happens to it.
+ *
+ * Its own type rather than an `Omit` of `NewFormationParty`, so that what a caller may change is
+ * a positive list somebody wrote down. `tenant_id` (ownership), `synthetic` (a property of the
+ * DEPLOYMENT the party was created against), `company_id` (single-use, and this is not a re-bind)
+ * and every `ssn_*` column are absent by construction, not by subtraction.
+ */
+export type EditablePartyFields = Pick<
+  FormationPartyRecord,
+  | "legalFirstName"
+  | "legalLastName"
+  | "email"
+  | "phone"
+  | "line1"
+  | "line2"
+  | "city"
+  | "region"
+  | "postalCode"
+  | "country"
+>;
+
 interface Row {
   party_id: string;
   entity_key: string | null;
@@ -173,6 +196,24 @@ export interface FormationPartyRepository {
    *  once — the return value says whether THIS caller made the binding, and a `false` is what
    *  rolls back the company insert it sits beside. */
   bindToCompany(partyId: string, companyId: string, tenantId: string): boolean;
+
+  /**
+   * REWRITE the identity, and NOTHING else (design §7, A3's party-edit door).
+   *
+   * The ten PII columns, tenant-scoped and refusing an erased row. Deliberately NOT in the
+   * statement: `company_id` (the bind is single-use and this is not a re-bind), `synthetic` (a
+   * property of the DEPLOYMENT the party was created against, never of a request), `tenant_id`,
+   * and every `ssn_*` column — an SSN is not editable here and never travels to this door, which
+   * is why there is no field for one to arrive in.
+   *
+   * Returns whether the row moved. WHEN it may move is `partyEditAllowed`, asked in the same
+   * transaction by the one domain function both doors call: unlike the company intake, whose
+   * freeze is a predicate over the row being updated and therefore lives in its own WHERE clause,
+   * this rule is a predicate over a DIFFERENT row (the company's `create_provider` step), and a
+   * correlated subquery reaching across two tables to restate a predicate that already exists in
+   * TypeScript would be a second spelling of it.
+   */
+  update(partyId: string, tenantId: string, fields: EditablePartyFields): boolean;
   /** The bound party for a company — what `create_provider` files with. */
   findByCompanyId(companyId: string): FormationPartyRecord | undefined;
   /**
@@ -292,6 +333,16 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
       bindToCompany: db.prepare(
         `UPDATE formation_parties SET company_id = ?
           WHERE party_id = ? AND tenant_id = ? AND company_id IS NULL AND deleted_at IS NULL`,
+      ),
+      // The ten PII columns and nothing else — see the interface comment for what is deliberately
+      // absent from this list.
+      update: db.prepare(
+        `UPDATE formation_parties
+            SET legal_first_name = @legal_first_name, legal_last_name = @legal_last_name,
+                email = @email, phone = @phone,
+                line1 = @line1, line2 = @line2, city = @city, region = @region,
+                postal_code = @postal_code, country = @country
+          WHERE party_id = @party_id AND tenant_id = @tenant_id AND deleted_at IS NULL`,
       ),
       findByCompany: db.prepare(
         "SELECT * FROM formation_parties WHERE company_id = ? AND deleted_at IS NULL",
@@ -443,6 +494,25 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
     // believe they own it, and the `company_id` UNIQUE index is the second lock (one party per
     // company, one company per party).
     return this.stmts.bindToCompany.run(companyId, partyId, tenantId).changes === 1;
+  }
+
+  update(partyId: string, tenantId: string, fields: EditablePartyFields): boolean {
+    return (
+      this.stmts.update.run({
+        party_id: partyId,
+        tenant_id: tenantId,
+        legal_first_name: fields.legalFirstName,
+        legal_last_name: fields.legalLastName,
+        email: fields.email,
+        phone: fields.phone,
+        line1: fields.line1,
+        line2: fields.line2,
+        city: fields.city,
+        region: fields.region,
+        postal_code: fields.postalCode,
+        country: fields.country,
+      }).changes === 1
+    );
   }
 
   findByCompanyId(companyId: string): FormationPartyRecord | undefined {

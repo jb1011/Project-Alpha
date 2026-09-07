@@ -256,6 +256,19 @@ export const SSN_COPY = {
 } as const;
 
 /**
+ * The party-edit door's refusal (design §7, A3).
+ *
+ * It names the ONE case that is editable, exactly as `companyIntakeFrozenMessage` does, because
+ * that is the actionable half — and it is a different case: a company intake re-opens after doola
+ * REJECTED it, while a responsible party is editable only until the filing has been sent at all.
+ * Once `createCustomer` has committed, the create step never sends it again, so an edit here
+ * would change our copy of a person and change nothing about the filing.
+ */
+export function partyFrozenMessage(): string {
+  return "this responsible party can no longer be changed: the filing has already been sent, and the provider will not be asked for this person again. If the provider REFUSED the party, the filing is parked and this door re-opens it; otherwise the identity on a filed company is corrected with the provider directly";
+}
+
+/**
  * The §4.7 freeze, refused in the caller's terms.
  *
  * It names the one case that IS editable, because that is the actionable half: a filing doola

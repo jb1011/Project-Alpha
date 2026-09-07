@@ -10,7 +10,7 @@ import {
   formationUnavailableMessage,
   truncateTenant,
 } from "../../formation";
-import { createCompany, updateCompanyIntake } from "../../formation/company";
+import { createCompany, updateCompanyIntake, updateFormationParty } from "../../formation/company";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
 import {
@@ -264,6 +264,49 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       partyId: result.partyId,
     });
     return c.json({ partyId: result.partyId }, 201);
+  });
+
+  /**
+   * PATCH /formation-party/:partyId — the PARTY-EDIT DOOR (design §7, A3).
+   *
+   * The exit A2 wrote a park for and could not give: a company whose `createCustomer` doola
+   * REJECTED parks under `awaitingPartyEdit`, and none of the four fields `PATCH /companies/:id`
+   * rewrites is one `createCustomer` reads. This door rewrites the identity and re-arms exactly
+   * one retry, in one transaction.
+   *
+   * It takes the SAME body as `POST /formation-party`, parsed by the SAME `.strict()` schema, so
+   * a field the create refuses is not quietly accepted by the edit. It takes NO `ssn` — there is
+   * no field for one — and the response is the handle and nothing else, for the reason the create
+   * gives: echoing a stored identity back puts it in a response body and in every client that
+   * caches one.
+   */
+  app.patch("/formation-party/:partyId", async (c) => {
+    const tenantId = c.get("tenantId");
+    if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
+
+    // ZodError -> 400, exactly as the create does. There is deliberately no `synthetic` shortcut:
+    // the labeled sandbox fixture is ours, not a caller's, and re-typing it would be a caller
+    // writing a fixture we generate.
+    const body = FormationPartySchema.parse(await readJson(c));
+    const result = updateFormationParty(
+      { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
+      tenantId,
+      c.req.param("partyId"),
+      {
+        legalFirstName: body.legalFirstName,
+        legalLastName: body.legalLastName,
+        email: body.email,
+        phone: body.phone,
+        line1: body.address.line1,
+        line2: body.address.line2 ?? null,
+        city: body.address.city,
+        region: body.address.region ?? null,
+        postalCode: body.address.postalCode,
+        country: body.address.country,
+      },
+    );
+    if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+    return c.json({ partyId: result.partyId });
   });
 
   // The batched projection: one formation-steps read and one documents read for the whole page,
