@@ -164,6 +164,30 @@ export function companyNameEndingOnlyMessage(position: number): string {
   return `names[${position - 1}] must contain something other than an entity ending`;
 }
 
+/**
+ * THE A1 SHIM's refusals, spelled for the door the caller is actually standing at.
+ *
+ * A party-only `POST /onboard` (or `onboard_agent`) sends an AGENT NAME. There is no `names`
+ * array anywhere in that request — the shim derives a 1:1 company from the agent's name — so
+ * "names[0] is blank, all three candidates are required" told that caller to fix a field they
+ * had never heard of and could not have sent. A refusal a caller cannot act on is a dead end
+ * even when the underlying rule is right, and the underlying rule IS right: "LLC" alone would be
+ * filed with Wyoming as "LLC LLC".
+ *
+ * Same rules, same order, different sentence. They go away with the shim in A3.
+ */
+export function shimAgentNameBlankMessage(): string {
+  return "name is blank — this agent's name becomes its company's name, so it has to say something";
+}
+
+export function shimAgentNameTooLongMessage(max: number): string {
+  return `name is longer than ${max} characters, which is the limit Wyoming files a company name under — this agent's name becomes its company's name`;
+}
+
+export function shimAgentNameEndingOnlyMessage(): string {
+  return 'name must contain something other than an entity ending — this agent\'s name becomes its company\'s name, and "LLC" on its own would be filed as "LLC LLC"';
+}
+
 /** Wyoming reserves this word to licensed or chartered entities (see wyRestrictedWords.ts). */
 export function companyNameRestrictedMessage(position: number, word: string): string {
   return `names[${position - 1}] contains the restricted word "${word}" — Wyoming will not file it without a licence or charter we cannot supply on your behalf, so it would come back rejected after the fee was paid`;

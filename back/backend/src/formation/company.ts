@@ -16,6 +16,9 @@ import {
   formationQuotaExhaustedMessage,
   industryLabelRequiredMessage,
   industryLabelUnknownMessage,
+  shimAgentNameBlankMessage,
+  shimAgentNameEndingOnlyMessage,
+  shimAgentNameTooLongMessage,
   sqliteUtcTimestamp,
   ssnFormatMessage,
   ssnRefusedHereMessage,
@@ -516,10 +519,14 @@ export function validateIntake(
   //    because "LLC LLC" is a real filing either way.
   if (intake.synthesizedName !== undefined) {
     const name = canonicalizeIntakeText(intake.synthesizedName);
-    if (!name) return { error: companyNameBlankMessage(1) };
+    // The SHIM's OWN sentences, deliberately. This caller sent an agent name through `onboard`
+    // and there is no `names` array anywhere in their request, so "names[0] is blank — all three
+    // candidates are required" named a field they had never heard of and could not have sent.
+    // Same rules, same order; they go away with the shim in A3.
+    if (!name) return { error: shimAgentNameBlankMessage() };
     if (name.length > NAME_MAX_LENGTH)
-      return { error: companyNameTooLongMessage(1, NAME_MAX_LENGTH) };
-    if (!stripEntityEnding(name)) return { error: companyNameEndingOnlyMessage(1) };
+      return { error: shimAgentNameTooLongMessage(NAME_MAX_LENGTH) };
+    if (!stripEntityEnding(name)) return { error: shimAgentNameEndingOnlyMessage() };
     return { intake: synthesizeIntake(name, intake.businessPurpose) };
   }
 

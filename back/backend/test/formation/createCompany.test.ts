@@ -29,6 +29,9 @@ import {
   formationQuotaExhaustedMessage,
   industryLabelRequiredMessage,
   industryLabelUnknownMessage,
+  shimAgentNameBlankMessage,
+  shimAgentNameEndingOnlyMessage,
+  shimAgentNameTooLongMessage,
   sqliteUtcTimestamp,
   ssnFormatMessage,
   ssnRefusedHereMessage,
@@ -175,6 +178,31 @@ test("the A1 SHIM still mints its 1:1 synthesized company — every existing cli
   ]);
   expect(company.businessPurpose).toBe(DEFAULT_DESCRIPTION);
   expect(company.industryLabel).toBe(DEFAULT_INDUSTRY);
+});
+
+test("the SHIM refuses in its OWN words — it never names a field its caller cannot send", () => {
+  // The bug: a party-only `POST /onboard` sends an AGENT NAME. There is no `names` array anywhere
+  // in that request, so "names[0] is blank — all three candidates are required" told the caller
+  // to fix a field they had never heard of. Same rules, same order, a sentence they can act on.
+  for (const [label, name, expected] of [
+    ["blank", "   ", shimAgentNameBlankMessage()],
+    ["ending only", "LLC", shimAgentNameEndingOnlyMessage()],
+    ["too long", "A".repeat(NAME_MAX_LENGTH + 1), shimAgentNameTooLongMessage(NAME_MAX_LENGTH)],
+  ] as const) {
+    const result = createCompany(deps(), TENANT, shimIntake(newParty(), { synthesizedName: name }));
+    expect(result, label).toEqual({ error: expected });
+    // …and no `names[` anywhere in it, which is the property rather than the wording.
+    expect((result as { error: string }).error, label).not.toContain("names[");
+  }
+  expect(companies.listByTenant(TENANT)).toHaveLength(0);
+});
+
+test("the PRODUCTION door still names the position — three candidates, three places to be wrong", () => {
+  // The other half: the shim's softer wording must not have leaked onto the door that really does
+  // take three candidates, where "names[1]" is exactly what a caller needs to hear.
+  expect(
+    createCompany(deps(), TENANT, intake(newParty(), { names: ["Acme One", "  ", "Acme Three"] })),
+  ).toEqual({ error: companyNameBlankMessage(2) });
 });
 
 test("the production doors REQUIRE the full shape — no defaults, no single name", () => {
