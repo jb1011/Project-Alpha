@@ -124,6 +124,16 @@ export function failFormationStep(
   step: FormationStep,
   error: string,
   logExtra: Record<string, unknown> = {},
+  opts: {
+    /**
+     * Fields to merge into the row's `detail` INSIDE the fail transaction.
+     *
+     * It exists for `awaitingIntakeEdit` (§4.7): the flag is what stops the sweeper re-sending a
+     * body doola has already refused, and writing it after the fail would leave a crash window in
+     * which exactly that happens.
+     */
+    detailPatch?: Record<string, unknown>;
+  } = {},
 ): void {
   // Re-read rather than trusting a caller's snapshot: between the read that produced it and this
   // call there may have been a whole doola round trip.
@@ -135,13 +145,19 @@ export function failFormationStep(
   // provider echoed back at us (§4). Redacted where it is written down, not where it was
   // produced, so no producer can forget.
   const safe = redactPii(error);
+  const fields =
+    opts.detailPatch === undefined
+      ? { error: safe }
+      : {
+          error: safe,
+          detail: JSON.stringify({ ...parseDetail(row.detail), ...opts.detailPatch }),
+        };
   d.repo.transaction(() => {
     const bumped = d.requests.bumpAttempt(companyId, step, from);
-    if (bumped !== undefined)
-      d.requests.transition(companyId, step, "pending", "failed", { error: safe });
+    if (bumped !== undefined) d.requests.transition(companyId, step, "pending", "failed", fields);
     // Lost the bump race: another driver moved the row. Park it from wherever it now is, which
     // the CAS will simply refuse if that driver already parked it.
-    else d.requests.transition(companyId, step, from, "failed", { error: safe });
+    else d.requests.transition(companyId, step, from, "failed", fields);
   });
   logFormationStep(companyId, step, "failed", row.attempt + 1, logExtra);
 }

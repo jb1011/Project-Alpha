@@ -28,6 +28,7 @@ import {
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRepository, CompanyStatus } from "../persistence/companyRepository";
 import type { FormationPartyRepository } from "../persistence/formationPartyRepository";
+import { parseDetail } from "../persistence/formationRepository";
 import type { CompanyIntake, CompanyPin } from "./intake";
 import {
   NAME_MAX_LENGTH,
@@ -69,9 +70,19 @@ import { findRestrictedWord } from "./wyRestrictedWords";
 export interface CreateCompanyDeps {
   companies: CompanyRepository;
   parties: FormationPartyRepository;
-  /** The platform DAILY ceiling still counts `create_provider` rows — where the fee is actually
-   *  incurred. With payment on, a company can sit in draft for days before its create fires. */
-  requests: { createRequestsSince(sinceUtc: string): number };
+  /**
+   * The sub-saga rows. Narrow on purpose — the door needs exactly three things from them:
+   *
+   *  - `createRequestsSince` for the platform DAILY ceiling, which still counts `create_provider`
+   *    rows because that is where the fee is actually incurred (with payment on, a company can
+   *    sit in draft for days before its create fires);
+   *  - `find` + `transition` so a successful edit-and-retry can RE-ARM the filing step it just
+   *    unblocked, in the same transaction as the edit (§4.7 — see `updateCompanyIntake`).
+   */
+  requests: Pick<
+    import("../persistence/formationRepository").FormationRepository,
+    "createRequestsSince" | "find" | "transition"
+  >;
   /** What this deployment pins a company to. Never caller input. */
   pin: CompanyPin;
   /** True = this deployment files with a labeled sandbox identity and refuses real PII. */
@@ -379,6 +390,11 @@ export function updateCompanyIntake(
       // one. Recorded as a FACT on the row, which is what lets the parked filing resume.
       deps.parties.proceedWithoutSsn(companyId);
     }
+    // …and RE-ARM the filing step this edit exists to unblock, in the same transaction as the
+    // edit. A `rejected` create parks for a human precisely so it is never retried with the body
+    // doola already refused; the successful PATCH is the evidence that the body has changed, and
+    // therefore the only thing that may put the row back in the sweeper's reach.
+    rearmAfterIntakeEdit(deps, companyId);
   });
   if (frozen) return { error: companyIntakeFrozenMessage() };
 
@@ -390,6 +406,34 @@ export function updateCompanyIntake(
     proceedWithoutSsn: intake.proceedWithoutSsn === true,
   });
   return { companyId };
+}
+
+/**
+ * Put a create step that is PARKED AWAITING AN EDIT back in the sweeper's reach (§4.7).
+ *
+ * A `rejected` create marks itself `awaitingIntakeEdit` and the sweeper skips it: re-sending a
+ * body doola has already looked at and refused cannot succeed, and the eight backoff retries it
+ * used to burn ended in `abandonFormation` — which erases the responsible party's data overnight
+ * and forecloses the edit-and-retry the design offers.
+ *
+ * Clearing the flag is therefore not bookkeeping, it is the whole point of the door: the edit IS
+ * the evidence that the next body will be different. It is a CAS from `failed` onto itself, so a
+ * row another driver has since moved is left alone, and the error text is preserved — the operator
+ * trail should still say what doola refused.
+ */
+function rearmAfterIntakeEdit(deps: CreateCompanyDeps, companyId: string): void {
+  const row = deps.requests.find(companyId, "create_provider");
+  if (!row || row.state !== "failed") return;
+  const detail = parseDetail<{ awaitingIntakeEdit?: boolean }>(row.detail);
+  if (!detail.awaitingIntakeEdit) return;
+  const { awaitingIntakeEdit: _cleared, ...rest } = detail;
+  deps.requests.transition(companyId, "create_provider", "failed", "failed", {
+    detail: JSON.stringify(rest),
+    error: row.error ?? null,
+    // Nothing about the WORLD moved — a flag came off a row. Moving `facts_updated_at` here
+    // would re-derive and re-hash the manifest of every agent attached to this company.
+    touchFacts: false,
+  });
 }
 
 /**

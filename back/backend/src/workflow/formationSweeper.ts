@@ -369,7 +369,20 @@ export class FormationSweeper {
   private async retryFailedSteps(): Promise<void> {
     const now = this.now();
     for (const row of this.d.requests.listByState("failed")) {
-      // The terminal verdict comes first: a row past the attempt bound is not retried once more.
+      // ── PARKED FOR A HUMAN, and it comes FIRST — before the attempt bound, deliberately.
+      //
+      //    doola REJECTED this intake. Re-sending the identical body cannot succeed, so the
+      //    sweeper used to spend seven more attempts on a doubling backoff proving it and then
+      //    `abandon` the company — which erases the responsible party's data and forecloses the
+      //    edit-and-retry §4.7 offers, all within about eight hours and usually overnight.
+      //
+      //    The row therefore leaves the sweeper's reach entirely until the intake is EDITED: a
+      //    successful `PATCH /companies/:id` clears the flag in the same transaction as the edit,
+      //    which is the only evidence that exists that the next body will be different. The
+      //    abandon check is BELOW this on purpose — a verdict belongs to the human who owns the
+      //    row, not to a counter.
+      if (this.awaitingIntakeEdit(row)) continue;
+      // The terminal verdict: a row past the attempt bound is not retried once more.
       if (row.attempt >= MAX_FORMATION_ATTEMPTS) {
         this.abandon(row);
         continue;
@@ -386,6 +399,17 @@ export class FormationSweeper {
         });
       }
     }
+  }
+
+  /**
+   * Is this row waiting on a human to correct the intake (§4.7)?
+   *
+   * Only `create_provider` can be: it is the only step whose input a caller can edit, and the
+   * flag is written by the one failure class that re-opens the intake — a doola `rejected`.
+   */
+  private awaitingIntakeEdit(row: FormationRequestRecord): boolean {
+    if (row.step !== "create_provider") return false;
+    return parseDetail<{ awaitingIntakeEdit?: boolean }>(row.detail).awaitingIntakeEdit === true;
   }
 
   /**

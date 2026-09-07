@@ -97,6 +97,18 @@ export interface CreateProviderDetail {
    *  than created by this attempt. The one field that says "we did not file this one twice". */
   adopted?: boolean;
   /**
+   * PARKED FOR A HUMAN: doola REJECTED this intake, and the same body must never go out again.
+   *
+   * A `rejected` is doola looking at the request and refusing it — a name it will not file, a
+   * malformed field, a person it cannot accept. Re-sending it changes nothing, and the sweeper's
+   * doubling backoff used to send it seven more times over about eight hours and then
+   * `abandonFormation` it: which erases the responsible party's data, sets the company terminal,
+   * and forecloses the edit-and-retry §4.7 exists to offer. So the row waits instead, and the
+   * ONLY thing that clears the flag is a successful `PATCH /companies/:id` — the edit IS the
+   * evidence that the next body will be different.
+   */
+  awaitingIntakeEdit?: boolean;
+  /**
    * The `attempt` under which `POST /companies` was last SENT — written BEFORE the call, so it
    * survives a crash inside it (C1).
    *
@@ -692,7 +704,8 @@ function onCallFailure(
   const kind: DoolaFailureKind = classifyDoolaFailure(e);
   const described = describeDoolaError(e);
   if (kind === "rejected") {
-    failStep(d, row, described.message, e);
+    failStep(d, row, described.message, e, { awaitingIntakeEdit: true });
+    parkedForIntakeEdit(d, described.message);
     return;
   }
   const reason =
@@ -933,6 +946,7 @@ function failStep(
   row: FormationRequestRecord,
   error: string,
   cause?: unknown,
+  detailPatch?: Partial<CreateProviderDetail>,
 ): void {
   const companyId = d.company.companyId;
   const described: { code?: string; requestId?: string } = cause ? describeDoolaError(cause) : {};
@@ -940,7 +954,18 @@ function failStep(
   // sweeper park rows too, and three copies of that contract would be three chances to burn an
   // attempt without parking the row (or the reverse). What stays HERE is what is specific to the
   // create: the entity audit event, and doola's own error code on the ops line.
-  failFormationStep(d, companyId, "create_provider", error, { code: described.code });
+  //
+  // The detail patch rides INSIDE that transaction rather than being a second write after it: the
+  // `awaitingIntakeEdit` flag is what stops the sweeper retrying, and a crash between the fail and
+  // a separate flag write is exactly the window in which the unchanged body goes out again.
+  failFormationStep(
+    d,
+    companyId,
+    "create_provider",
+    error,
+    { code: described.code },
+    { detailPatch },
+  );
   recordCompanyEvent(
     d.repo,
     d.company.companyId,
@@ -953,4 +978,36 @@ function failStep(
     code: described.code,
     requestId: described.requestId,
   });
+}
+
+/**
+ * Tell somebody that a filing is now waiting on a HUMAN (§4.7).
+ *
+ * A rejected create no longer retries itself, which is the fix — and the cost of that fix is that
+ * nothing else will ever move this company either. Silence would be the worse failure of the two,
+ * so the park announces itself on both surfaces that exist: `formation_stale` CRITICAL for the
+ * operator (the same event the seven-day alarm uses, because it is the same class of fact — a
+ * filing that has stopped and will not restart on its own), and a required-action event on every
+ * agent attached to the company, which is where the UI already renders one.
+ *
+ * Once, at the moment it happens, rather than daily from the sweeper: the sweeper is now
+ * deliberately not looking at this row.
+ */
+function parkedForIntakeEdit(d: FormationCreateDeps, message: string): void {
+  opsLog("formation_stale", {
+    level: "error",
+    severity: "CRITICAL",
+    companyId: d.company.companyId,
+    step: "create_provider",
+    reason: "create_rejected_awaiting_intake_edit",
+    // Third-party text: redacted at the choke point in `opsLog`, like every other `message`.
+    message,
+    environment: d.environment,
+  });
+  recordCompanyEvent(
+    d.repo,
+    d.company.companyId,
+    "formationStale",
+    "action required: the provider REJECTED this filing, so it will NOT be retried as it stands — nothing more happens until the intake is corrected. Edit the company's details (and re-supply the SSN if one was given) to retry it.",
+  );
 }
