@@ -467,7 +467,8 @@ test("create_company is gated on FORMATION; list_companies on the company store,
   // SAME capped function the REST refusal uses, so a refreshed list of hundreds cannot turn this
   // description into something that crowds out every other tool in the client's context window.
   expect(create.description).toContain(`(${describeIndustryLabels()})`);
-  expect(create.description).toContain("Software development");
+  // The real list is doola's full table (821 labels), so the cap MUST have engaged.
+  expect(create.description).toMatch(/…and \d+ more\)/);
 
   const off = buildTestApp(undefined);
   const { key: key2 } = apiKeys.mint(TENANT, { capability: "provision" });
