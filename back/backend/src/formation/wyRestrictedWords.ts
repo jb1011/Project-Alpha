@@ -1,3 +1,5 @@
+import { canonicalizeIntakeText } from "./intake";
+
 /**
  * Wyoming's RESTRICTED words for an LLC name, as DATA (design 2026-08-26 §5).
  *
@@ -124,18 +126,28 @@ export const WY_RESTRICTED_WORDS: readonly string[] = [
  * transformation to keep in step with the storage shape.
  */
 export function findRestrictedWord(name: string): string | null {
-  const haystack = name.normalize("NFC").toLowerCase();
-  for (const word of WY_RESTRICTED_WORDS) if (containsTerm(haystack, word)) return word;
+  const haystack = canonicalizeIntakeText(name).toLowerCase();
+  for (const [word, pattern] of TERM_PATTERNS) if (pattern.test(haystack)) return word;
   return null;
 }
 
-/** Boundary-anchored phrase match, with any run of separators between a phrase's words. */
-function containsTerm(haystack: string, term: string): boolean {
-  const pattern = term.split(/\s+/).map(escapeRegExp).join("[^\\p{L}\\p{N}]+");
+/**
+ * The list, COMPILED ONCE at module load.
+ *
+ * It used to build a `RegExp` per word per call: eighty-odd compiles for every candidate, three
+ * candidates per create, and again on every §4.7 edit. The patterns are a function of the list
+ * alone, so nothing about them can change between calls — and the list is only going to get
+ * longer, since a word joins it whenever Wyoming says so and never leaves.
+ *
+ * NOT `/g`: a global regex carries `lastIndex` across calls, so a shared instance would answer
+ * differently on the second name it was asked about. `test` with no `/g` is stateless.
+ */
+const TERM_PATTERNS: readonly (readonly [string, RegExp])[] = WY_RESTRICTED_WORDS.map((word) => {
+  const pattern = word.split(/\s+/).map(escapeRegExp).join("[^\\p{L}\\p{N}]+");
   // \p{L}\p{N} rather than \w: an accented letter is a letter, and `\w` would treat "Banké" as
   // a boundary after "Bank" and refuse it.
-  return new RegExp(`(?<![\\p{L}\\p{N}])${pattern}(?![\\p{L}\\p{N}])`, "u").test(haystack);
-}
+  return [word, new RegExp(`(?<![\\p{L}\\p{N}])${pattern}(?![\\p{L}\\p{N}])`, "u")] as const;
+});
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

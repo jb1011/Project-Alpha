@@ -56,3 +56,22 @@ test("an accented letter is a letter, not a word boundary", () => {
 test("the FIRST offending word is the one reported, so the message is stable", () => {
   expect(findRestrictedWord("Bank Insurance Group")).toBe("bank");
 });
+
+test("the patterns are STATELESS — the same name answers the same way every time", () => {
+  // The compiled-once patterns are shared across calls, which is the whole point of compiling
+  // them once. A `/g` flag would carry `lastIndex` between calls and make the second answer about
+  // a name differ from the first — a filing refused on Tuesday and accepted on Wednesday.
+  for (const name of ["Acme Bank Holdings", "Acme Robotics", "Trustworthy Systems"]) {
+    const first = findRestrictedWord(name);
+    for (let i = 0; i < 5; i++) expect(findRestrictedWord(name), `${name} #${i}`).toBe(first);
+  }
+});
+
+test("an untrimmed or denormalized name is judged like the canonical one", () => {
+  // `canonicalizeIntakeText` is what the intake stores and what the filer sends, so the refusal
+  // has to be asked of the same string — otherwise a name can pass the door and be filed in a
+  // form the door would have refused.
+  expect(findRestrictedWord("  Acme Bank  ")).toBe("bank");
+  // NFD "é" (e + combining acute) normalizes to the NFC form the boundary rule was written for.
+  expect(findRestrictedWord("Banke\u0301 Robotics")).toBeNull();
+});
