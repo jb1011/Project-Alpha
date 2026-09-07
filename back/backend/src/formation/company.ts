@@ -224,24 +224,13 @@ export function createCompany(
     return { error: formationCeilingReachedMessage(deps.dailyCeiling) };
   }
 
-  // 6. THE SSN GATE (§4.1), before any validation that could accept it. A sandbox or synthetic
-  //    deployment refuses the FIELD, never merely ignores it: quietly dropping it leaves a caller
-  //    believing they supplied one, and quietly accepting it puts a real person's Social Security
-  //    Number in a partner's DEVELOPMENT environment. The environment is the deployment's PIN,
-  //    not caller input.
+  // 6. THE SSN GATE (§4.1), before any validation that could accept it. ONE helper, shared with
+  //    the §4.7 re-capture door — see `gateSsn`. The environment here is the DEPLOYMENT's pin,
+  //    because the company being gated does not exist yet.
   const ssn = intake.ssn;
-  // Narrowed HERE and carried as a pair, so the mint below cannot reach an SSN without the key
-  // that seals it — a non-null assertion at the write would be the same claim, unchecked.
-  let sealed: { ssn: string; pii: PiiKeyring } | undefined;
-  if (ssn !== undefined) {
-    if (deps.sandboxSyntheticPii || deps.pin.environment !== "production")
-      return { error: ssnRefusedHereMessage() };
-    if (!isWellFormedSsn(ssn)) return { error: ssnFormatMessage() };
-    // Unreachable on a correctly-booted production box — `FORMATION_PII_KEY` is a boot invariant
-    // (§4.2). It exists so that a misconfiguration is a REFUSAL rather than a plaintext write.
-    if (!deps.pii) return { error: ssnUnavailableMessage() };
-    sealed = { ssn, pii: deps.pii };
-  }
+  const gated = gateSsn(ssn, deps.pin.environment, deps);
+  if ("error" in gated) return gated;
+  const sealed = gated.sealed;
 
   // 7. Intake validation, in whichever of the two shapes this caller sent (§5).
   const validated = validateIntake(intake);
@@ -350,17 +339,15 @@ export function updateCompanyIntake(
   const party = deps.parties.findByCompanyId(companyId);
   if (!party) return { error: formationPartyUnavailableMessage() };
 
-  // The SSN gate, IDENTICAL to the create's — the same three refusals in the same order, because
-  // this door captures an SSN under exactly the same terms.
+  // The SSN gate — the SAME function the create runs, so the two doors refuse the same things in
+  // the same words. The environment is the COMPANY's pin rather than the deployment's: the pin is
+  // stamped at claim and immutable after (audit M5), it is what actually routes the filing, and a
+  // company pinned to sandbox on a box that has since been re-pointed at production must still
+  // refuse the field.
   const ssn = intake.ssn;
-  let sealed: { ssn: string; pii: PiiKeyring } | undefined;
-  if (ssn !== undefined) {
-    if (deps.sandboxSyntheticPii || company.environment !== "production")
-      return { error: ssnRefusedHereMessage() };
-    if (!isWellFormedSsn(ssn)) return { error: ssnFormatMessage() };
-    if (!deps.pii) return { error: ssnUnavailableMessage() };
-    sealed = { ssn, pii: deps.pii };
-  }
+  const gated = gateSsn(ssn, company.environment, deps);
+  if ("error" in gated) return gated;
+  const sealed = gated.sealed;
 
   const validated = validateIntake(intake);
   if ("error" in validated) return validated;
@@ -370,32 +357,43 @@ export function updateCompanyIntake(
   if (built.synthesized) return { error: companyNamesRequiredMessage() };
 
   let frozen = false;
-  deps.transaction(() => {
-    if (!deps.companies.updateIntake(companyId, built)) {
-      frozen = true;
-      return;
-    }
-    // Erase FIRST and ALWAYS — see the ⚠ above. `storeSsn` is write-once while a ciphertext
-    // exists, so this is also what makes room for a replacement, and it clears `ssn_deleted_at`
-    // so the row never holds a live ciphertext under a deletion stamp.
-    eraseSsnLogged(deps.parties, companyId, "intake_reopened", company.environment);
-    if (sealed) {
-      const bind = { partyId: party.partyId, companyId };
-      if (
-        !deps.parties.storeSsn(party.partyId, companyId, encryptSsn(sealed.pii, sealed.ssn, bind))
-      )
-        throw new PartyBindLost();
-    } else if (intake.proceedWithoutSsn === true) {
-      // §4.6a's second exit: the clock took their number and they have decided to file without
-      // one. Recorded as a FACT on the row, which is what lets the parked filing resume.
-      deps.parties.proceedWithoutSsn(companyId);
-    }
-    // …and RE-ARM the filing step this edit exists to unblock, in the same transaction as the
-    // edit. A `rejected` create parks for a human precisely so it is never retried with the body
-    // doola already refused; the successful PATCH is the evidence that the body has changed, and
-    // therefore the only thing that may put the row back in the sweeper's reach.
-    rearmAfterIntakeEdit(deps, companyId);
-  });
+  try {
+    deps.transaction(() => {
+      if (!deps.companies.updateIntake(companyId, built)) {
+        frozen = true;
+        return;
+      }
+      // Erase FIRST and ALWAYS — see the ⚠ above. `storeSsn` is write-once while a ciphertext
+      // exists, so this is also what makes room for a replacement, and it clears `ssn_deleted_at`
+      // so the row never holds a live ciphertext under a deletion stamp.
+      eraseSsnLogged(deps.parties, companyId, "intake_reopened", company.environment);
+      if (sealed) {
+        const bind = { partyId: party.partyId, companyId };
+        if (
+          !deps.parties.storeSsn(party.partyId, companyId, encryptSsn(sealed.pii, sealed.ssn, bind))
+        )
+          throw new PartyBindLost();
+      } else if (intake.proceedWithoutSsn === true) {
+        // §4.6a's second exit: the clock took their number and they have decided to file without
+        // one. Recorded as a FACT on the row, which is what lets the parked filing resume.
+        deps.parties.proceedWithoutSsn(companyId);
+      }
+      // …and RE-ARM the filing step this edit exists to unblock, in the same transaction as the
+      // edit. A `rejected` create parks for a human precisely so it is never retried with the body
+      // doola already refused; the successful PATCH is the evidence that the body has changed, and
+      // therefore the only thing that may put the row back in the sweeper's reach.
+      rearmAfterIntakeEdit(deps, companyId);
+    });
+  } catch (e) {
+    // SYMMETRY with the create, which has caught this since A2's first commit. The sentinel is
+    // thrown rather than returned because better-sqlite3 rolls back on an EXCEPTION and on
+    // nothing else — and an uncaught one leaves the door answering 500 to a race the create door
+    // answers with a sentence. It is not reachable through the normal path (the party was read
+    // and the freeze checked moments earlier), which is exactly why it must not be the one arm
+    // that behaves differently.
+    if (e instanceof PartyBindLost) return { error: formationPartyUnavailableMessage() };
+    throw e;
+  }
   if (frozen) return { error: companyIntakeFrozenMessage() };
 
   opsLog("company_intake_updated", {
@@ -406,6 +404,40 @@ export function updateCompanyIntake(
     proceedWithoutSsn: intake.proceedWithoutSsn === true,
   });
   return { companyId };
+}
+
+/**
+ * THE SSN GATE (§4.1), as ONE function for the two doors that can carry one.
+ *
+ * Three refusals in a fixed order, and every one of them is a REFUSAL rather than a quiet drop:
+ *
+ *  1. a sandbox or synthetic deployment refuses the FIELD. Quietly dropping it leaves a caller
+ *     believing they supplied one; quietly accepting it puts a real person's Social Security
+ *     Number in a partner's DEVELOPMENT environment;
+ *  2. a malformed value is a specific 400, not a blob nobody can inspect and a `rejected` filing
+ *     on a real fee;
+ *  3. no keyring is a refusal, not a plaintext write. Unreachable on a correctly-booted
+ *     production box — `FORMATION_PII_KEY` is a boot invariant (§4.2) — which is exactly why it
+ *     must be here: the failure mode it guards is a misconfiguration.
+ *
+ * It had two copies, and they had already drifted on the one input that is genuinely different
+ * between the doors: WHICH environment is authoritative. That argument is therefore the caller's,
+ * and each call site states its reasoning.
+ *
+ * The success value is a PAIR, narrowed here, so no caller can reach an SSN without the key that
+ * seals it — a non-null assertion at the write would be the same claim, unchecked.
+ */
+function gateSsn(
+  ssn: string | undefined,
+  environment: string,
+  deps: Pick<CreateCompanyDeps, "sandboxSyntheticPii" | "pii">,
+): { sealed?: { ssn: string; pii: PiiKeyring } } | { error: string } {
+  if (ssn === undefined) return {};
+  if (deps.sandboxSyntheticPii || environment !== "production")
+    return { error: ssnRefusedHereMessage() };
+  if (!isWellFormedSsn(ssn)) return { error: ssnFormatMessage() };
+  if (!deps.pii) return { error: ssnUnavailableMessage() };
+  return { sealed: { ssn, pii: deps.pii } };
 }
 
 /**
