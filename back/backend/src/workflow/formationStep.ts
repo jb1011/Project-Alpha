@@ -130,13 +130,18 @@ export function failFormationStep(
   const row = d.requests.find(companyId, step);
   if (!row || row.state === "confirmed" || row.state === "abandoned") return;
   const from = row.state;
+  // A step's `error` reaches `formation_requests.error`, the entity event trail and an ops line,
+  // and it is very often a THIRD PARTY's sentence — which is the one that can carry an SSN a
+  // provider echoed back at us (§4). Redacted where it is written down, not where it was
+  // produced, so no producer can forget.
+  const safe = redactPii(error);
   d.repo.transaction(() => {
     const bumped = d.requests.bumpAttempt(companyId, step, from);
     if (bumped !== undefined)
-      d.requests.transition(companyId, step, "pending", "failed", { error });
+      d.requests.transition(companyId, step, "pending", "failed", { error: safe });
     // Lost the bump race: another driver moved the row. Park it from wherever it now is, which
     // the CAS will simply refuse if that driver already parked it.
-    else d.requests.transition(companyId, step, from, "failed", { error });
+    else d.requests.transition(companyId, step, from, "failed", { error: safe });
   });
   logFormationStep(companyId, step, "failed", row.attempt + 1, logExtra);
 }
