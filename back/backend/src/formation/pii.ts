@@ -27,6 +27,13 @@ import { inspect } from "node:util";
  * else on the box. Encryption at rest here defends the **Litestream→R2 replica** and any copy of
  * the database file that leaves the machine. It does NOT defend against a compromised box, and
  * nothing in this module pretends otherwise.
+ *
+ * This module is also the home of the two things that keep a plaintext SSN from LEAKING once it
+ * has been decrypted: the `Secret` wrapper (below) and `redactPii` (bottom). Both are here rather
+ * than beside their callers because they are derived from the SAME format facts as the validator,
+ * and three modules each holding their own idea of "what an SSN looks like" is how a redactor
+ * ends up narrower than the field it defends. It imports NOTHING but node builtins, deliberately:
+ * `opsLog` redacts through it, so anything it imported back would be an import cycle.
  */
 
 /** The scheme prefix on every stored key id. Bump it if the algorithm or the AAD ever changes —
@@ -238,19 +245,74 @@ function selectKey(keyring: PiiKeyring, id: string): PiiKey | undefined {
   return undefined;
 }
 
-// ── format ─────────────────────────────────────────────────────────────────────────────────
+// ── format: ONE description of an SSN's shape, two readers ─────────────────────────────────
+//
+// The validator and the redactor derive from the SAME digit groups, deliberately. They had
+// separate literals in two files, and a redactor that is narrower than the field it defends is
+// exactly how a number gets through: widen one and the other must widen with it.
 
 /**
  * doola's documented format: `XXX-XX-XXXX` (OpenAPI `PartnerResponsiblePartyDto.ssn`, fetched
- * 2026-08-31 — "Social Security Number or ITIN. Optional. Format: XXX-XX-XXXX.").
+ * 2026-08-31 — "Social Security Number or ITIN. Optional. Format: XXX-XX-XXXX.") — three digit
+ * groups of these lengths.
+ */
+const SSN_GROUPS = [3, 2, 4] as const;
+const digits = (n: number) => `\\d{${n}}`;
+
+/**
+ * THE VALIDATOR: strictly `XXX-XX-XXXX`, whole string.
  *
  * Validated at the DOOR, before anything is encrypted, so a typo is a specific 400 rather than a
  * blob we cannot inspect later and a doola `rejected` on a real fee. Deliberately NOT normalizing
  * a bare nine digits into the dashed form: an SSN is not ours to reformat, and a caller who typed
  * nine digits may equally have typed eight and a stray one.
  */
-const SSN_PATTERN = /^\d{3}-\d{2}-\d{4}$/;
+const SSN_EXACT = new RegExp(`^${SSN_GROUPS.map(digits).join("-")}$`);
+
+/**
+ * THE REDACTOR: the same three groups with the separators loosened to `-`, `.`, a space or
+ * nothing at all, so `123-45-6789`, `123 45 6789`, `123.45.6789` and a bare `123456789` are all
+ * one shape.
+ *
+ * NOT `\b`-anchored. `\b` fails on exactly the case that matters most — a body echoed back as
+ * `{"ssn":"..."}` or a message reading `ssn123456789`, where the digits are adjacent to word
+ * characters and there is therefore no word boundary in front of them.
+ *
+ * The boundaries are instead "not a HEX digit", on both sides, and that is load-bearing in two
+ * directions:
+ *
+ *  - it keeps a LONGER digit run from being mistaken for an SSN. A 13-digit epoch (every
+ *    `nextRetryAt` in a `detail` blob) contains nine consecutive digits, and redacting the middle
+ *    of one would corrupt the retry schedule while protecting nothing;
+ *  - it keeps a nine-digit run INSIDE a hash out of the redactor's reach. Roughly one transaction
+ *    hash in ten contains one, and the event trail is the audit record this system exists to
+ *    keep: a `[redacted]` in the middle of a `manifestHash` destroys the fact it was recorded to
+ *    prove. Inside a hex token every neighbour is itself a hex digit, so the run is never
+ *    isolated; a real SSN in prose is always bounded by a space, a quote or punctuation.
+ *
+ * It will still occasionally redact a bare nine-digit EIN out of a provider's error message. That
+ * trade is deliberate and it is the same one the design makes: an EIN lives in a column of its
+ * own and an operator can read it there, while an SSN that has reached a log line cannot be
+ * un-logged.
+ */
+const SSN_SHAPE = new RegExp(
+  `(?<![0-9A-Fa-f])${SSN_GROUPS.map(digits).join("[-. ]?")}(?![0-9A-Fa-f])`,
+  "g",
+);
 
 export function isWellFormedSsn(value: string): boolean {
-  return SSN_PATTERN.test(value);
+  return SSN_EXACT.test(value);
+}
+
+/**
+ * Strip anything SSN-shaped out of a string before it is logged or persisted (§4).
+ *
+ * It lives HERE, beside the validator it is derived from, rather than in doola's client where it
+ * started. The leak vector is text we did not write — a provider's validation error quoting the
+ * offending field, an exception whose message embeds the request body — and doola's client is
+ * only ONE producer of that text. A redactor that is a property of one adapter is a redactor the
+ * next producer does not get.
+ */
+export function redactPii(message: string): string {
+  return message.replace(SSN_SHAPE, REDACTED);
 }

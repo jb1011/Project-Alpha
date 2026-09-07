@@ -1,3 +1,4 @@
+import { redactPii } from "../../formation/pii";
 import { opsLog } from "../../observability/opsLog";
 import { withDeadline } from "../../util/deadline";
 import { readCappedText } from "../../util/readStreamCapped";
@@ -121,22 +122,17 @@ export function describeDoolaError(e: unknown): {
 }
 
 /**
- * Strip anything SSN-shaped out of an error message before it is logged or persisted (§4).
+ * The message a doola failure carries is a THIRD PARTY's text, and a validation error that quotes
+ * the offending field is an ordinary thing for an API to return — doola's error envelope carries
+ * a `fields` map, and our own `E_REQUEST_BODY_INVALID` handling passes the message straight into
+ * `formation_requests.error`, the entity event trail and the ops line.
  *
- * The message here is a THIRD PARTY's text, and a validation error that quotes the offending
- * field is an ordinary thing for an API to return — doola's error envelope carries a `fields`
- * map, and our own `E_REQUEST_BODY_INVALID` handling has always passed the message straight into
- * `formation_requests.error`, the entity event trail and the ops line. That is three places a
- * responsible party's Social Security Number could come to rest because somebody else echoed it.
- *
- * So: any `XXX-XX-XXXX` or bare nine-digit run becomes `[redacted]`. It is a blunt rule and it
- * will occasionally redact an EIN (also nine digits) out of an error message. That is an
- * acceptable trade: an EIN we hold in a column of its own, and an operator who needs it can read
- * it there, while an SSN that has reached a log line cannot be un-logged.
+ * So it is redacted here as well as at the three choke points, and `redactPii` is idempotent, so
+ * passing through both costs nothing. The definition lives in `formation/pii.ts` beside the
+ * validator it is derived from — this file is one producer of many, and the defence stopped being
+ * a property of doola's client the moment there was a second way for a nine-digit run to reach a
+ * log line.
  */
-export function redactPii(message: string): string {
-  return message.replace(/\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b/g, "[redacted]");
-}
 
 /**
  * What a failed doola call actually tells us about doola's state (C1).

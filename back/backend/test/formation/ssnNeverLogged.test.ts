@@ -11,10 +11,10 @@
  */
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { type DoolaApi, redactPii } from "../../src/adapters/doola/doolaClient";
+import type { DoolaApi } from "../../src/adapters/doola/doolaClient";
 import { type CreateCompanyDeps, createCompany } from "../../src/formation/company";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
-import { parsePiiKey } from "../../src/formation/pii";
+import { parsePiiKey, redactPii } from "../../src/formation/pii";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";

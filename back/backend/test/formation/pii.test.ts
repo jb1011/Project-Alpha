@@ -21,6 +21,7 @@ import {
   encryptSsn,
   isWellFormedSsn,
   parsePiiKey,
+  redactPii,
   toSecret,
 } from "../../src/formation/pii";
 
@@ -201,4 +202,34 @@ test("a decrypted SSN cannot be stringified by ACCIDENT — only by asking", () 
 test("toSecret wraps any value the same way", () => {
   expect(`${toSecret("123-45-6789")}`).toBe("[redacted]");
   expect(toSecret("x").reveal()).toBe("x");
+});
+
+// ── the redactor ───────────────────────────────────────────────────────────────────────────
+
+test("redactPii catches every spelling of an SSN, including the ones \\b misses", () => {
+  for (const carrier of [
+    "ssn 123-45-6789 is invalid",
+    // NO word boundary in front of the digits — the case a `\b`-anchored pattern silently
+    // misses, and the shape an echoed-back body or a concatenated message actually has.
+    "ssn123456789",
+    'field "ssn":"123456789" rejected',
+    "123 45 6789",
+    "123.45.6789",
+    "123456789",
+  ])
+    expect(redactPii(carrier), carrier).toContain("[redacted]");
+  expect(redactPii("ssn 123-45-6789 is invalid")).toBe("ssn [redacted] is invalid");
+});
+
+test("redactPii leaves hashes and epochs alone — the audit trail has to survive it", () => {
+  // A 13-digit epoch. Nine of its digits in a row are not an SSN, and redacting the middle of a
+  // `nextRetryAt` would corrupt a retry schedule to protect nothing.
+  const epoch = '{"nextRetryAt":1756642800000}';
+  expect(redactPii(epoch)).toBe(epoch);
+  // A hash whose hex happens to contain nine consecutive decimal digits — roughly one in ten do,
+  // and `manifestHash` is written into the entity event trail on every anchor.
+  const hash = "0xab123456789cdef0112233445566778899aabbccddeeff00112233445566778899";
+  expect(redactPii(hash)).toBe(hash);
+  // A 10-digit phone number is not an SSN either.
+  expect(redactPii("call 2125550100")).toBe("call 2125550100");
 });
