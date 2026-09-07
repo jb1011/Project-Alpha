@@ -2,19 +2,27 @@ import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { documentFileName } from "../../persistence/documentIndexRepository";
 import type { ApiDeps } from "../app";
-import { ApiError, requireOwnedEntity } from "../errors";
+import { ApiError, requireOwnedCompany } from "../errors";
 import { toDocumentView } from "../views";
 
 /**
- * The tenant's legal documents (design §8).
+ * The tenant's legal documents (design §8, re-keyed by §7/A3).
  *
- * `GET /entities/:id/documents`         — the index (hashes, sizes, types)
- * `GET /entities/:id/documents/:docId`  — the PDF bytes
+ * `GET /companies/:companyId/documents`         — the index (hashes, sizes, types)
+ * `GET /companies/:companyId/documents/:docId`  — the PDF bytes
  *
- * Mounted after the `/entities/*` `requireAuth` line, so both inherit authentication, and
- * ownership is the two-line house idiom: look the entity up by key, compare `ownerTenantId`, and
- * answer a UNIFORM 404 for unknown-and-not-yours alike. Distinguishing them would turn the route
- * into an existence oracle over other tenants' entity ids.
+ * **The entity-keyed paths are GONE, in the same change rather than kept as an alias.** A1
+ * re-keyed the store itself (`documentIndexId(companyId, …)`, `listByCompany`,
+ * `findOwned(companyId, id)`) and left the ROUTES going through an entity, which meant a company
+ * with documents and no agent attached — an ordinary state, since a filing can complete before
+ * anyone onboards — had documents nothing could fetch. An alias would also have left two URL
+ * shapes for one resource across a proxy whose cache and download headers are keyed on the path
+ * (design defect #18), which is precisely the drift the path guard now forbids.
+ *
+ * Mounted after the `/companies/*` `requireAuth` line, so both inherit authentication, and
+ * ownership is the house idiom: look the company up by id, scoped to the tenant, and answer a
+ * UNIFORM 404 for unknown-and-not-yours alike. Distinguishing them would turn the route into an
+ * existence oracle over other tenants' company ids.
  *
  * The download is deliberately a bytes route rather than a signed redirect. doola's own URLs
  * expire in about an hour and are not single-use, so handing one to a browser would be handing
@@ -25,13 +33,11 @@ import { toDocumentView } from "../views";
  * fetches to a blob (`downloadDocument` in the api client) and creates an object URL.
  */
 export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
-  app.get("/entities/:id/documents", (c) => {
-    const rec = requireOwnedEntity(deps, c);
+  app.get("/companies/:companyId/documents", (c) => {
+    const company = requireOwnedCompany(deps, c);
     // No lookup wired (a deployment that has never formed anything) reads as "no documents",
     // which is the truth, rather than as an error.
-    // Company-scoped since the re-key: the documents belong to the FILING, and every agent
-    // attached to it may read them. Ownership was already asserted on the entity above.
-    const docs = rec.companyId ? (deps.documents?.listByCompany(rec.companyId) ?? []) : [];
+    const docs = deps.documents?.listByCompany(company.companyId) ?? [];
     return c.json({
       // The SAME projection the entity view renders (M4) — `sha256` is the hash a verifier
       // re-computes from the bytes below, and from PR 3 the one the OA bundle manifest commits
@@ -40,13 +46,11 @@ export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
     });
   });
 
-  app.get("/entities/:id/documents/:docId", async (c) => {
-    const rec = requireOwnedEntity(deps, c);
+  app.get("/companies/:companyId/documents/:docId", async (c) => {
+    const company = requireOwnedCompany(deps, c);
     // `findOwned` re-asserts the COMPANY id, so a document id belonging to another company is a
     // 404 here even though it is a perfectly valid id somewhere else.
-    const doc = rec.companyId
-      ? deps.documents?.findOwned(rec.companyId, c.req.param("docId"))
-      : undefined;
+    const doc = deps.documents?.findOwned(company.companyId, c.req.param("docId"));
     if (!doc) throw new ApiError("not_found", 404, "document not found");
 
     let bytes: Buffer;

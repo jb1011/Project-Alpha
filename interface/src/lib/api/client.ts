@@ -350,7 +350,11 @@ export function worldIdWaiver(token: string, code: string): Promise<WorldIdStatu
 }
 
 /**
- * Download one legal document as a Blob.
+ * Download one legal document as a Blob, by COMPANY (design §7, A3).
+ *
+ * Keyed by the company rather than by an entity because that is what the documents belong to: a
+ * filing can complete, and its Articles and Operating Agreement arrive, before any agent is
+ * attached to it.
  *
  * The only bytes-returning call in this client, and it has to exist: an `<a href>` cannot carry a
  * Bearer token, so the browser path is fetch -> blob -> objectURL rather than a plain link. The
@@ -363,11 +367,11 @@ export function worldIdWaiver(token: string, code: string): Promise<WorldIdStatu
  */
 export async function downloadDocument(
   token: string,
-  id: string,
+  companyId: string,
   docId: string,
 ): Promise<{ blob: Blob; filename: string | null }> {
   const res = await fetch(
-    `${API_URL}/entities/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`,
+    `${API_URL}/companies/${encodeURIComponent(companyId)}/documents/${encodeURIComponent(docId)}`,
     { headers: { authorization: `Bearer ${token}` } },
   );
 

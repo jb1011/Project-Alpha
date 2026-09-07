@@ -242,7 +242,7 @@ export function buildApiApp(deps: ApiDeps) {
   };
   protect("/onboard");
   protect("/formation-party");
-  // A3's document routes move under `/companies` as well, and inherit this.
+  // A3's document routes live under `/companies` too, and inherit this.
   protect("/companies");
   protect("/entities");
   protect("/jobs");
@@ -253,7 +253,7 @@ export function buildApiApp(deps: ApiDeps) {
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);
-  // After the `/entities/*` requireAuth line above, so both document routes inherit auth.
+  // After the `/companies/*` requireAuth line above, so both document routes inherit auth.
   mountDocumentRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);

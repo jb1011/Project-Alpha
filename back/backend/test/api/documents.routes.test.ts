@@ -1,9 +1,13 @@
 /**
- * The tenant's legal-document surfaces (design §8).
+ * The tenant's legal-document surfaces (design §8, re-keyed by §7/A3).
  *
  * Two properties, and the ownership one is the reason this route exists as a bytes endpoint at
  * all: a signed doola URL handed to a browser would be an unrevocable bearer capability, whereas
  * this route re-checks who is asking on every single request.
+ *
+ * The paths are `/companies/:companyId/documents…` as of A3, and the entity-keyed ones are gone
+ * rather than aliased — see the route module for why, and `test/api/proxyHeaders.test.ts` for the
+ * guard that fails a half-done rename.
  */
 import type Database from "better-sqlite3";
 import { getAddress } from "viem";
@@ -54,6 +58,7 @@ function app() {
     repo,
     docStore,
     documents,
+    companies,
     formationSteps: (k: string) => requests.stepsOf(k),
   } as never);
 }
@@ -88,7 +93,8 @@ beforeEach(() => {
   requests = new SqliteFormationRepository(db);
   docStore = new MemoryDocumentStore();
   companies = new SqliteCompanyRepository(db);
-  seedCompany(companies);
+  // Ownership is the COMPANY's since A3: it is what the route scopes by.
+  seedCompany(companies, { tenantId: OWNER });
   repo.upsert(formedEntity({ ownerTenantId: OWNER }));
 });
 afterEach(() => db.close());
@@ -97,7 +103,7 @@ afterEach(() => db.close());
 
 test("the owner sees the index: id, type, derived name, size, sha256", async () => {
   storeDoc(COMPANY_KEY, "d-aoo", "ArticlesOfOrganization");
-  const res = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents`, OWNER);
+  const res = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents`, OWNER);
   expect(res.status).toBe(200);
   const body = (await res.json()) as { documents: Record<string, unknown>[] };
   expect(body.documents).toHaveLength(1);
@@ -109,44 +115,36 @@ test("the owner sees the index: id, type, derived name, size, sha256", async () 
   });
 });
 
-test("an entity with no documents lists an empty array, not an error", async () => {
-  const res = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents`, OWNER);
+test("a company with no documents lists an empty array, not an error", async () => {
+  const res = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents`, OWNER);
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ documents: [] });
 });
 
 // ── ownership ──────────────────────────────────────────────────────────────────────────────
 
-test("another tenant gets the SAME 404 as a caller asking for an entity that does not exist", async () => {
+test("another tenant gets the SAME 404 as a caller asking for a company that does not exist", async () => {
   storeDoc(COMPANY_KEY, "d-aoo", "ArticlesOfOrganization");
-  const mine = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents`, OTHER);
-  const missing = await get("/entities/nope/documents", OTHER);
+  const mine = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents`, OTHER);
+  const missing = await get("/companies/nope/documents", OTHER);
   expect(mine.status).toBe(404);
   expect(missing.status).toBe(404);
-  // Identical bodies: the route is not an existence oracle over other tenants' entity ids.
+  // Identical bodies: the route is not an existence oracle over other tenants' company ids.
   expect(await mine.text()).toBe(await missing.text());
 });
 
 test("both routes require authentication", async () => {
-  const list = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents`);
+  const list = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents`);
   expect(list.status).toBe(401);
-  const one = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents/whatever`);
+  const one = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents/whatever`);
   expect(one.status).toBe(401);
 });
 
 test("a document id belonging to ANOTHER company is a 404 even for its rightful owner", async () => {
-  seedCompany(companies, { companyId: "company-2" });
-  repo.upsert(
-    formedEntity({
-      idempotencyKey: "tenant-a:agent-2",
-      publicId: undefined,
-      ownerTenantId: OWNER,
-      companyId: "company-2",
-    }),
-  );
+  seedCompany(companies, { companyId: "company-2", tenantId: OWNER });
   const theirs = storeDoc("company-2", "d-oa", "OperatingAgreement");
-  // Same tenant, same valid document id — but asked for through an entity on another company.
-  const res = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents/${theirs}`, OWNER);
+  // Same tenant, same valid document id — but asked for under another company.
+  const res = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents/${theirs}`, OWNER);
   expect(res.status).toBe(404);
 });
 
@@ -154,7 +152,7 @@ test("a document id belonging to ANOTHER company is a 404 even for its rightful 
 
 test("the download serves the bytes with the headers a PDF download needs", async () => {
   const id = storeDoc(COMPANY_KEY, "d-aoo", "ArticlesOfOrganization");
-  const res = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents/${id}`, OWNER);
+  const res = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents/${id}`, OWNER);
   expect(res.status).toBe(200);
   expect(res.headers.get("content-type")).toBe("application/pdf");
   expect(res.headers.get("content-disposition")).toBe(
@@ -181,7 +179,7 @@ test("the served content type is always application/pdf, whatever doola stored i
     path,
   });
   const res = await get(
-    `/entities/${encodeURIComponent(ENTITY_KEY)}/documents/${documentIndexId(COMPANY_KEY, "d-ein")}`,
+    `/companies/${encodeURIComponent(COMPANY_KEY)}/documents/${documentIndexId(COMPANY_KEY, "d-ein")}`,
     OWNER,
   );
   expect(res.headers.get("content-type")).toBe("application/pdf");
@@ -201,7 +199,7 @@ test("an indexed document whose bytes are missing is a 404, never a 500", async 
     providerDocId: "d-gone",
     path: "doc-does-not-exist.pdf",
   });
-  const res = await get(`/entities/${encodeURIComponent(ENTITY_KEY)}/documents/${id}`, OWNER);
+  const res = await get(`/companies/${encodeURIComponent(COMPANY_KEY)}/documents/${id}`, OWNER);
   expect(res.status).toBe(404);
 });
 

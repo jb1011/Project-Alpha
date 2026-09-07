@@ -10,6 +10,9 @@
  * filename, one whose `x-content-type-options` is dropped is sniffable, and one whose
  * `cache-control` is dropped can be cached by an intermediary that has no business holding one
  * tenant's legal documents. All three are silent failures — the download still "works".
+ *
+ * Two of these tests are now PATH guards rather than text guards: they extract the two route
+ * predicates and run them against a real path. See the block comment above them.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -104,12 +107,53 @@ test("C9: content-length is never forwarded beside a content-encoding", () => {
   expect(fn).toContain("return FORWARDED_RESPONSE_HEADERS");
 });
 
-test("C9: only the BYTES route is a document-download path, not the JSON index above it", () => {
+/**
+ * THE PATH GUARD (design §7 / gate finding #18).
+ *
+ * This used to assert that the source CONTAINED the fragment `documents\/[^/]+$` — a fragment
+ * that survives a rename of the prefix, which is exactly the half-done rename it was supposed to
+ * catch. A3 moved the document routes from `/entities/:id/documents/:docId` to
+ * `/companies/:companyId/documents/:docId`, and a predicate left on `entities` would have gone on
+ * matching nothing at all: no `content-disposition` (no filename), no `x-content-type-options`
+ * (sniffable), no `cache-control: private, no-store` (an intermediary free to cache one tenant's
+ * legal documents) — and the download would still "work", which is why nothing would have said so.
+ *
+ * So the guard now EXTRACTS each regex literal from the source and RUNS it: positive on a real
+ * `companies/…` path, negative on the `entities/…` shape it replaced. A rename that touches one
+ * predicate and not the other fails here.
+ */
+function extractRegex(fnName: string): RegExp {
   const s = source();
-  const fn = s.slice(s.indexOf("export function isDocumentDownloadPath"));
-  // Two path segments after `documents`, not one: the index route returns JSON and needs none of
+  const fn = s.slice(s.indexOf(`export function ${fnName}`));
+  const literal = /\/\^[^\n]*?\/\.test\(/.exec(fn);
+  expect(literal, `no regex literal found in ${fnName}`).not.toBeNull();
+  // Strip the trailing `/.test(` the match includes, leaving `/…/`.
+  const body = literal![0].slice(1, literal![0].lastIndexOf("/"));
+  return new RegExp(body);
+}
+
+test("PATH GUARD: the download predicate matches companies/…, never entities/…", () => {
+  const re = extractRegex("isDocumentDownloadPath");
+  expect(re.test("companies/abc/documents/def")).toBe(true);
+  // The shape it replaced. Matching it would mean the rename was reverted, or never finished.
+  expect(re.test("entities/abc/documents/def")).toBe(false);
+  // Two path segments after `documents`, not one: the INDEX route returns JSON and needs none of
   // the four headers.
-  expect(fn).toContain("documents\\/[^/]+$");
+  expect(re.test("companies/abc/documents")).toBe(false);
+  // …and it is anchored at both ends, so a longer path is not a download.
+  expect(re.test("companies/abc/documents/def/extra")).toBe(false);
+  expect(re.test("x/companies/abc/documents/def")).toBe(false);
+});
+
+test("PATH GUARD: the no-store predicate covers BOTH company document routes, never entities", () => {
+  const re = extractRegex("isNoStorePath");
+  expect(re.test("companies/abc/documents")).toBe(true);
+  expect(re.test("companies/abc/documents/def")).toBe(true);
+  expect(re.test("entities/abc/documents")).toBe(false);
+  expect(re.test("entities/abc/documents/def")).toBe(false);
+  // Not every company route: only the ones that carry legal bytes.
+  expect(re.test("companies/abc")).toBe(false);
+  expect(re.test("companies")).toBe(false);
 });
 
 test("the request allowlist still carries what the non-browser protocols need", () => {
@@ -136,14 +180,11 @@ test("the proxy must NOT forward the doola signature header", () => {
   expect(source().toLowerCase()).not.toContain('"x-doola-signature"');
 });
 
-test("the document paths are in the no-store branch", () => {
+test("the credential-bearing routes are still in the no-store branch", () => {
   const s = source();
-  // The credential-bearing routes that were already there…
+  // These two are matched by EQUALITY, not by a pattern, so the path guard above cannot see them.
   expect(s).toContain('"connection-package"');
   expect(s).toContain('"bootstrap-connection"');
-  // …plus documents, matched as a path pattern because the entity id is in the middle.
-  const fn = s.slice(s.indexOf("export function isNoStorePath"));
-  expect(fn).toContain("documents");
 });
 
 test("the route file uses the allowlists rather than a second copy of them", () => {

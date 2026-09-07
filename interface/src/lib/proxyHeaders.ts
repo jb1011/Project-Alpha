@@ -88,10 +88,17 @@ export function forwardedResponseHeaders(
   ];
 }
 
-/** `entities/<id>/documents/<docId>` — the bytes route, and only it. The INDEX route above it
- *  returns JSON and needs none of the four. */
+/** `companies/<companyId>/documents/<docId>` — the bytes route, and only it. The INDEX route
+ *  above it returns JSON and needs none of the four.
+ *
+ *  ⚠ The prefix is `companies`, not `entities`: the backend re-keyed the document routes in A3
+ *  (design §7), and a predicate left on the old shape would have gone on matching nothing while
+ *  every legal PDF crossed this proxy with no filename, no `nosniff` and no `no-store` — a
+ *  silent failure in which the download still "works". The backend's drift guard
+ *  (`test/api/proxyHeaders.test.ts`) now asserts these regexes against a real path in both
+ *  directions, so a half-done rename fails CI. */
 export function isDocumentDownloadPath(joinedPath: string): boolean {
-  return /^entities\/[^/]+\/documents\/[^/]+$/.test(joinedPath);
+  return /^companies\/[^/]+\/documents\/[^/]+$/.test(joinedPath);
 }
 
 /**
@@ -106,7 +113,7 @@ export function isNoStorePath(joinedPath: string): boolean {
   return (
     joinedPath === "connection-package" ||
     joinedPath === "bootstrap-connection" ||
-    // entities/<id>/documents and entities/<id>/documents/<docId>
-    /^entities\/[^/]+\/documents(\/|$)/.test(joinedPath)
+    // companies/<companyId>/documents and companies/<companyId>/documents/<docId>
+    /^companies\/[^/]+\/documents(\/|$)/.test(joinedPath)
   );
 }

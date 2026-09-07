@@ -37,17 +37,12 @@ type Formation = NonNullable<EntityView["formation"]>;
  * Rendered only for entities that HAVE a formation block — a legacy or stub row has none, forever,
  * and inventing a "not formed" card for it would describe an absence as a stage.
  */
-export function FormationCard({
-  entityId,
-  formation,
-}: {
-  entityId: string;
-  formation: Formation;
-}) {
+export function FormationCard({ formation }: { formation: Formation }) {
   const { session } = useAuth();
   const [busyDocId, setBusyDocId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const companyId = formation.companyId;
   const environment = formationEnvironmentOf(formation.environment);
   const confirmedReal = environment === "production";
   // Amber covers "sandbox" AND "unknown" — everything that is not a confirmed real filing.
@@ -61,13 +56,20 @@ export function FormationCard({
       setError("Sign in again to download documents.");
       return;
     }
+    // The route is COMPANY-keyed since A3, and a backend that predates it serves no company id.
+    // Saying so beats building a URL out of an entity key the route no longer takes and handing
+    // the user a 404.
+    if (!companyId) {
+      setError("This deployment does not report which company these documents belong to yet.");
+      return;
+    }
     setError(null);
     setBusyDocId(doc.id);
     try {
       // fetch -> blob -> objectURL, because an `<a href>` cannot carry a Bearer token and this
       // route is owner-only. The filename comes from the response when the proxy forwarded the
       // header, and from the document's own derived name when it did not.
-      const { blob, filename } = await downloadDocument(token, entityId, doc.id);
+      const { blob, filename } = await downloadDocument(token, companyId, doc.id);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;

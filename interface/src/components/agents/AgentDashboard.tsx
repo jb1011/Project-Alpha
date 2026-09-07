@@ -322,7 +322,7 @@ export function AgentDashboard({
           {/* Only for entities that HAVE a formation block: a legacy or stub row has none,
               forever, and a "not formed" card would describe an absence as a stage. */}
           {entity?.formation && (
-            <FormationCard entityId={entityId} formation={entity.formation} />
+            <FormationCard formation={entity.formation} />
           )}
 
           <Card className="p-5">

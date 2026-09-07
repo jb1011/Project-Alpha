@@ -85,6 +85,12 @@ export type EntityView = {
   formation?: {
     provider: string;
     environment: "sandbox" | "production";
+    /** OUR company id — what the document routes, the compliance calendar and the Companies
+     *  section are addressed by. Owner-visible only, like `ein` and `documents`; the public
+     *  surfaces carry doola's `providerRef` instead. Optional for deploy-order safety: a backend
+     *  that predates A3 serves no company id, and the card then offers no download rather than
+     *  building a URL out of an entity key the route no longer takes. */
+    companyId?: string;
     /** Derived from the formation sub-saga: nothing opened / opened but nothing legally true
      *  yet / the state has FILED it / the EIN has issued / the filing step is in error. */
     status: FormationStatus;

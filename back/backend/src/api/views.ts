@@ -208,6 +208,17 @@ export interface EntityView {
   formation:
     | (FormationSummary & {
         /**
+         * OUR company id — the key the legal documents, the compliance calendar and the company
+         * detail page are all addressed by (§7, A3). ⚠ AUTHENTICATED VIEWS ONLY, like the two
+         * fields below it: it is an opaque handle, but it is a handle to the tenant's own
+         * filing, and the public surfaces publish doola's `providerRef` instead.
+         *
+         * It is here because the document routes moved to `/companies/:companyId/documents/:id`:
+         * without it a dashboard holding an entity view could not build the URL for a document
+         * the same view had just listed.
+         */
+        companyId: string;
+        /**
          * ⚠ AUTHENTICATED VIEWS ONLY. The EIN is a tax identifier: it belongs to the entity's
          * owner and to nobody else. It reaches this projection — which serves GET /entities and
          * the MCP read tools, both tenant-scoped — and it must NEVER reach `/transparency` or
@@ -305,6 +316,8 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
     formation: summary
       ? {
           ...summary,
+          // Non-null by construction: `summary` is null unless `companyId` is set.
+          companyId: companyId as string,
           // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
           // mint and is never served as a legal fact.
           // The EIN now lives on the COMPANY: one filing, one EIN, however many agents share it.
