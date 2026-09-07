@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { AuthVars } from "../auth/middleware";
 import { requireAuth } from "../auth/middleware";
+import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
 import { mountMcpRoute } from "../mcp/transport";
 import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
@@ -216,6 +217,21 @@ export function buildApiApp(deps: ApiDeps) {
       // legal-body phase is a step or an option. (It said "without a partyId" until A3 removed
       // the shim; the FLAG is unchanged, what satisfies it is now a company handle.)
       formationRequired: Boolean(deps.formation?.required),
+      /**
+       * PRODUCT COPY the wizard and the Companies section render verbatim (§7) — a deliberate
+       * departure from this route's booleans-only rule, and the same one §6.7 makes for the fee.
+       *
+       * Every sentence in here makes a CLAIM about what this system does: that an SSN is deleted
+       * when the company id is recorded, that one edit buys one retry, that two agents sharing a
+       * company are publicly linkable. A claim that lives in the browser bundle drifts from the
+       * code that keeps it — silently, and in the direction of the older promise. Serving it from
+       * the box that implements the behaviour is what keeps the two together.
+       *
+       * Public-safe by inspection: three constants of prose, no addresses, no prices, no
+       * per-tenant anything. The revenue address stays off this route (§6.7) and so does
+       * everything else that is not a capability or a sentence about one.
+       */
+      formationCopy: { ssn: SSN_COPY, park: PARK_COPY, reuseDisclosure: COMPANY_REUSE_DISCLOSURE },
     }),
   );
   mountSchemaRoutes(app);

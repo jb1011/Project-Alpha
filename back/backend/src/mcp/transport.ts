@@ -1,6 +1,7 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { Hono } from "hono";
 import type { ApiDeps } from "../api/app";
+import { entityViewDepsOf } from "../api/views";
 import type { AuthVars } from "../auth/middleware";
 import { resolveKey } from "./auth";
 import { buildMcpServer } from "./server";
@@ -38,17 +39,15 @@ export function mountMcpRoute(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps)
       arc: deps.arc,
       worldId: deps.worldId,
       formation: deps.formation,
-      // The view dependencies, taken from the SAME object the REST routes read (C8). This line
-      // used to name them one by one and forgot the document index, so `get_entity` over MCP
-      // described an entity with no legal documents while REST described the same entity with
-      // two. `EntityViewDeps` is now inherited by both dep types, so the pick cannot be partial.
-      formationSteps: deps.formationSteps,
-      formationStepsMany: deps.formationStepsMany,
-      // The company lookups joined the set with the 2026-08-26 re-key: the formation block is
-      // read off the COMPANY row now, so an MCP surface without them would describe every formed
-      // entity as unformed — the exact class of quiet divergence the C8 note above is about.
-      company: deps.company,
-      companyMany: deps.companyMany,
+      // The view dependencies, taken WHOLE from the same object the REST routes read (C8).
+      //
+      // This line used to name them one by one, and forgot the document index — `get_entity`
+      // over MCP described an entity with no legal documents while REST described the same
+      // entity with two. `EntityViewDeps` was made one object to stop that, which stopped the
+      // object being PARTIAL but not this pick being a SUBSET of it: A3's sharing label reached
+      // REST and not MCP the same way, field for field. `entityViewDepsOf` copies the whole set,
+      // and its key list is compile-checked against the interface.
+      ...entityViewDepsOf(deps),
       companies: deps.companies,
       documents: deps.documents,
       ens: deps.ens

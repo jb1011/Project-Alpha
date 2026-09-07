@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { loadConfig } from "../../src/config/env";
 import { resolveFormationDeployment } from "../../src/formation";
 import { createCompany } from "../../src/formation/company";
@@ -822,4 +822,64 @@ test("C1: a credential-less deployment pins nothing — the stub shape, unchange
   expect(repo.findByIdempotencyKey(id)?.companyId).toBeNull();
   expect(repo.findByIdempotencyKey(id)?.formationProvider).toBeNull();
   expect(fx.parties.findOwned(TENANT, fx.partyId)?.companyId).toBeNull();
+});
+
+test("A3: `company_reused` fires only when an agent JOINS a company that already has one", () => {
+  // §7's ops event. `company_attach` is every attach; `company_reused` is the N:1 fan-out
+  // actually happening — which is what bounds the anchor traffic (agents × late facts × two
+  // sponsored writes) and what makes two agents publicly linkable through their manifests. The
+  // FIRST agent on a company is not a reuse, and logging it as one would make the event useless
+  // for exactly the question it exists to answer.
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  try {
+    const fx = partyFixture();
+    const pin = resolveFormationDeployment(doolaCfg())!;
+    const runner = new OnboardingRunner({
+      repo,
+      runSaga,
+      fundCaps: TEST_FUND_CAPS,
+      formation: formationDeps(fx, pin),
+    });
+    const companyId = newCompany(fx, pin);
+
+    runner.start({
+      spec,
+      userKey: "reuse-1",
+      tenantId: TENANT,
+      guardianPasskey: passkey,
+      companyId,
+    });
+    const ops = () =>
+      lines
+        .filter((l) => l.includes('"opslog"'))
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(ops().filter((l) => l.opslog === "company_attach")).toHaveLength(1);
+    // …and the count it carries is the one BEFORE this attach, read in the same transaction as
+    // the cap check: zero agents, so no reuse.
+    expect(ops().find((l) => l.opslog === "company_attach")).toMatchObject({
+      companyId,
+      agents: 0,
+    });
+    expect(ops().filter((l) => l.opslog === "company_reused")).toHaveLength(0);
+
+    runner.start({
+      spec,
+      userKey: "reuse-2",
+      tenantId: TENANT,
+      guardianPasskey: passkey,
+      companyId,
+    });
+    expect(ops().filter((l) => l.opslog === "company_attach")).toHaveLength(2);
+    const reused = ops().filter((l) => l.opslog === "company_reused");
+    expect(reused).toHaveLength(1);
+    expect(reused[0]).toMatchObject({ companyId, entityKey: `${TENANT}:reuse-2`, agents: 1 });
+    // Ids only: a company id is an opaque handle, and nothing about the party behind it belongs
+    // in a log line.
+    expect(JSON.stringify(reused[0])).not.toMatch(/Ada|Lovelace|@example/);
+  } finally {
+    spy.mockRestore();
+  }
 });

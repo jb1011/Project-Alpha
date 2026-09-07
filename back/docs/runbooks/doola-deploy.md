@@ -24,11 +24,14 @@ What that changes for an operator:
   **refuses when the row holds a doola company id** — a create that reached doola is adopted, never
   abandoned by hand, because abandoning it is what erases the responsible party's data for a
   company that may really exist in Wyoming's records. Run it, then restart;
-- **every existing client keeps working.** A party-only onboard (which is every client today) mints
-  a 1:1 company inside the claim transaction — the A1 shim — so nothing about the wizard changes;
-- **new doors:** `POST /companies` + `GET /companies`, and MCP `create_company` + `list_companies`.
-  `POST /onboard` and `onboard_agent` now also take `companyId` to ATTACH an agent to a company
-  that already exists. Attaching is free; only creating a company costs a filing.
+- **A1 kept every existing client working with a SHIM** — a party-only onboard minted a 1:1
+  company inside the claim transaction. **A3 REMOVED IT.** `POST /onboard` and `onboard_agent`
+  now take a `companyId` and nothing else: a `partyId` on either is REFUSED, with a message
+  naming the door that mints a company. Every client that onboards has to create or pick a
+  company first. See the door table below, which is the version to trust;
+- **new doors:** `POST /companies` + `GET /companies` + `GET /companies/:id`, and MCP
+  `create_company` + `list_companies` + `get_company`. Attaching is free; only creating a company
+  costs a filing.
 
 Before the upgrade, on the box:
 
@@ -68,32 +71,52 @@ there is no `DB_PATH` override.
 
 ## The one sentence
 
-**A bound formation party is always pinned and always filed. `FORMATION_REQUIRED` decides only
-whether the door REFUSES an onboard that carries no party.**
+**A company handle is always honoured. `FORMATION_REQUIRED` decides only whether the onboard door
+REFUSES a request that carries none.**
 
-This supersedes PR 2's decision #2, in which `FORMATION_REQUIRED=false` also meant "pin nothing".
-That coupling had a hole: a caller who had posted a real legal identity and handed over its
-`partyId` got an unpinned stub entity, and their party sat bound to an entity nothing would ever
-file. The identity was silently dropped — which is exactly the failure
-`formationUnavailableMessage` exists to prevent on a credential-less box.
+This is PR 2's decision #2, superseded twice: first at party scope (a caller who posted a real
+legal identity and handed over its `partyId` got an unpinned stub, and their identity was silently
+dropped), then at COMPANY scope in A3, when the party stopped being an onboard-door concept at
+all. A `companyId` on a `required=false` box is pinned and filed exactly as on a `required=true`
+one; the flag is about the ABSENCE of a handle and nothing else.
 
 ## What each setting actually does
 
 | `DOOLA_API_KEY` + `DOOLA_WEBHOOK_SECRET` | `FORMATION_REQUIRED` | Result |
 |---|---|---|
-| unset | (must be unset) | No formation anywhere. A `partyId` on an onboard is **refused**, never ignored. No webhook route, no sweeper. |
-| set | `false` | Formation is **available, not mandatory**. An onboard with no `partyId` succeeds and files nothing. An onboard WITH a `partyId` is pinned and filed, and counts against the spend controls. |
-| set | `true` (the default when the block is present) | An onboard **without** a `partyId` is refused at the door (REST 400 / MCP `isError`). `cli create-entity` refuses every request, because it cannot carry a party. |
+| unset | (must be unset) | No formation anywhere. A `companyId` (or a `partyId`) on an onboard is **refused**, never ignored. No webhook route, no sweeper. |
+| set | `false` | Formation is **available, not mandatory**. An onboard with no `companyId` succeeds and files nothing. An onboard WITH one attaches to that company, on any deployment. |
+| set | `true` (the default when the block is present) | An onboard **without** a `companyId` is refused at the door (REST 400 / MCP `isError`). `cli create-entity` refuses every request, because it cannot carry one. |
 
-### The doors, as of PR 3
+### The doors, as of A3
 
-There are **three**, and only the first two can onboard:
+**A3 removed the A1 shim.** Onboard ATTACHES; it never creates. Everything that spends money is
+behind the company-create door, and a `partyId` at the onboard door is refused rather than
+ignored — the field is still read (and still DECLARED in MCP's schema) precisely so that passing
+one is a loud refusal instead of a silent strip.
 
-| Door | Carries a `partyId`? | With `FORMATION_REQUIRED=true` |
-|---|---|---|
-| REST `POST /onboard` (the wizard API) | yes | pins and files; refuses an onboard without one |
-| MCP `onboard_agent` | yes | pins and files; refuses an onboard without one |
-| `cli create-entity` | no — a separate process with no PII intake | **refuses at command time** (`legacyDoorRefusalMessage`) |
+| Action | REST | MCP | CLI |
+|---|---|---|---|
+| register a responsible person | `POST /formation-party` | `create_formation_party` | — |
+| **edit** that person | `PATCH /formation-party/:partyId` | `update_formation_party` | — |
+| create a company (**spends**) | `POST /companies` | `create_company` | — |
+| edit a company's intake (+ SSN) | `PATCH /companies/:companyId` | — (**never**: an SSN would sit in an LLM client's context) | — |
+| list companies | `GET /companies` | `list_companies` | — |
+| one company, in full | `GET /companies/:companyId` | `get_company` | — |
+| compliance calendar | `GET /companies/:companyId/compliance` | — | — |
+| legal documents | `GET /companies/:companyId/documents[/:docId]` | (metadata on the entity views) | — |
+| **attach** an agent (free) | `POST /onboard` with `companyId` | `onboard_agent` with `companyId` | **refuses** (`legacyDoorRefusalMessage`) |
+| abandon a parked filing | — | — | `npm run cli -- formation:abandon <entityKey>` |
+
+Two of those doors are the exits from a PARKED filing, and each clears its OWN flag: a company
+`PATCH` clears `awaitingIntakeEdit`, the party `PATCH` clears `awaitingPartyEdit`, and neither
+touches the other's. `GET /companies/:companyId` is where an operator (or the owner) sees which
+park a company is in, including the §4.6a SSN decision, which is not a flag at all.
+
+⚠ **The document routes MOVED in A3**, from `/entities/:id/documents…` to
+`/companies/:companyId/documents…`, with no alias. Anything pointing at the old path — a bookmark,
+a script, a monitoring probe — gets a 404. The interface's proxy predicates moved with them, and a
+backend test runs both regexes against a real path so a half-done rename fails CI.
 
 The standalone onboarding server (`src/onboarding/{server,main}.ts`) was **RETIRED in PR 3** and is
 no longer a door: it had no auth, no World gate and no custody gate, and it bypassed `claimKey`,
@@ -105,20 +128,22 @@ deployment cannot mint stub entities, and it cannot point at doola sandbox.
 
 ## Deploy note — the testnet box
 
-**Run `FORMATION_REQUIRED=false` on the testnet box until the PR-4 wizard collects a legal
-identity.**
+**Keep `FORMATION_REQUIRED=false` on the testnet box.**
 
-The wizard (`interface/`) does not send a `partyId` today. With `FORMATION_REQUIRED=true` the door
-refuses every wizard onboard, so the box's only working onboarding surface would be MCP/REST with
-a hand-created party. With `false`:
+A3's wizard DOES collect a legal identity and DOES create a company, so `true` is finally a
+workable setting — but `false` is still the right one on testnet, for the reason it always was:
+every filing costs a real fee even in sandbox terms of operator attention, and with `false`:
 
-- the wizard keeps working exactly as it did before formation existed, and pins nothing;
-- an MCP or REST caller can opt in by creating a party (`POST /formation-party` or the
-  `create_formation_party` tool) and passing its handle — that entity IS pinned and IS filed, in
-  the environment the box is configured for;
+- the wizard's legal-body phase is an OPTION rather than a gate, so an agent can be onboarded
+  without one;
+- a caller who does supply a `companyId` is pinned and filed exactly as on a `required=true` box;
 - the sandbox end-to-end can be exercised on demand without every test agent costing a filing.
 
-Boot says so out loud, and this warning is the one to look for in journald after a deploy:
+⚠ On `true`, EVERY onboard now needs a company — including any script that used to pass a
+`partyId`. That combination is refused since A3.
+
+Boot says so out loud, and this warning is the one to look for in journald after a deploy (its
+wording still says "partyId"; since A3 the handle is a `companyId`):
 
 ```
 ⚠ doola formation ENABLED (sandbox, required=false)
@@ -261,20 +286,27 @@ SELECT p.company_id, c.created_at
    AND c.created_at < datetime('now', '-7 days');
 ```
 
-## A2: the industry list
+## The industry list
 
-`src/formation/naicsLabels.ts` is a GENERATED build-time constant, and the create door accepts
-only labels that are in it. **It currently holds one label** ("Software development", the only one
-verified live against doola's reference table), because no sandbox key was available when A2 was
-written. Before A3 ships the industry picker, run:
+`src/formation/naicsLabelsData.ts` is a GENERATED build-time constant, and the create door accepts
+only labels that are in it. A2 shipped it holding ONE label ("Software development", the only one
+verified live against doola's reference table at the time); it was refreshed for A3 on 2026-09-07
+and now holds doola's full table, **821 labels**. To refresh it again:
 
 ```
 DOOLA_API_KEY=dk_test_… npx tsx scripts/refresh-naics.mts
 ```
 
 and commit the result. The script refuses to write an empty list, and refuses to write one that no
-longer contains `DEFAULT_INDUSTRY` — every migrated and shimmed company carries that label, so
-losing it would make our own rows unedittable at our own door.
+longer contains `DEFAULT_INDUSTRY` — every migrated company carries that label, so losing it would
+make our own rows unedittable at our own door.
+
+Three surfaces read the list, and all three read the SAME array: the REST refusal and the MCP tool
+description name it CAPPED at eight plus a count (uncapped, 821 labels is an error nobody reads and
+a tool description that crowds out every other tool in an agent's context window), and A3's form
+reads it whole from **`GET /formation/industries`** — public, day-cacheable, and deliberately not a
+`/config` field, since `/config` is fetched by every page before auth and cached for the life of
+the tab.
 
 ## A2: the SSN wire shape cannot be smoke-tested
 

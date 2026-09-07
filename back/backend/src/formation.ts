@@ -256,6 +256,57 @@ export const SSN_COPY = {
 } as const;
 
 /**
+ * THE THREE PARKS, IN THE OWNER'S WORDS (design §4.6a/§4.7/§7).
+ *
+ * A filing can stop and wait for a human in three ways. All three are correct, all three used to
+ * look identical from outside — a company that had simply stopped — and two of the three have an
+ * exit only the owner can take. `GET /companies/:companyId` reports WHICH; this is what the
+ * section says about it.
+ *
+ * Constants here, beside the code that writes the flags, and served through `/config` so the
+ * browser cannot hold a stale description of a behaviour the backend has since changed. That is
+ * the point of putting copy on a capability document at all: these sentences make CLAIMS about
+ * what the system does, and a claim that drifts from the code is the failure the honesty
+ * invariant exists to prevent.
+ *
+ * `what` is what happened. `youCan` is the sentence next to the button.
+ */
+export const PARK_COPY = {
+  awaitingIntakeEdit: {
+    title: "The filing agent refused this company's details",
+    what: "The provider looked at the company you asked for — the names, the purpose, the industry — and refused it. Re-sending the same request cannot succeed, so nothing is being retried and nothing more will be spent until you change something.",
+    youCan:
+      "Edit the company details below. One edit buys one retry, with the new details, and you will see the result here.",
+  },
+  awaitingPartyEdit: {
+    title: "The filing agent refused the responsible person's details",
+    what: "The provider refused the identity the company would be filed under — a name, an email, a phone number or an address it will not accept. This is a different refusal from the company's own details, and changing those would not fix it.",
+    youCan:
+      "Correct the responsible person below. One correction buys one retry. We do not repeat the provider's own wording, which can name the person.",
+  },
+  awaitingSsnDecision: {
+    title: "The SSN you supplied was deleted before the filing was sent",
+    what: "We delete an SSN within 7 days if the filing has not started, and this filing had not. Sending it now would file under the slower EIN route you did not choose, so nothing has been sent.",
+    youCan:
+      "Supply the number again, or confirm you want the slower SS-4 route. Either choice starts the filing; we will not choose for you.",
+  },
+} as const;
+
+/**
+ * THE PUBLIC-LINKABILITY DISCLOSURE (§7) — said BEFORE the owner confirms, never after.
+ *
+ * Attaching a second agent to a company is free and it is the fastest path, and it has one
+ * consequence nobody would guess: every agent's anchored manifest publishes
+ * `legal.providerCompanyId`, so two agents sharing a company can be linked to each other by
+ * anyone reading the chain. That is a property of anchoring the legal body honestly, not a bug —
+ * and the design's rule is that it is disclosed rather than hidden.
+ *
+ * It lives here so the sentence the user reads is versioned with the manifest field it describes.
+ */
+export const COMPANY_REUSE_DISCLOSURE =
+  "Agents that share a company are publicly linkable. Each agent anchors a record on-chain naming the company it is filed under, so anyone can see that these agents belong to the same legal body — and, through it, to each other. Create a separate company if two agents should not be publicly connected.";
+
+/**
  * The party-edit door's refusal (design §7, A3).
  *
  * It names the ONE case that is editable, exactly as `companyIntakeFrozenMessage` does, because

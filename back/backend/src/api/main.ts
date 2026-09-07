@@ -453,6 +453,10 @@ async function main() {
     company: (companyId: string) => companies.find(companyId),
     companyMany: (companyIds: string[]) => companies.findMany(companyIds),
     companies,
+    // The §7 sharing label, on the authenticated surfaces only. The SAME store, narrowed to the
+    // two counting reads by `EntityViewDeps` — `/transparency` and `/metadata` build their rows
+    // from `formationSummary` and never receive this object.
+    companyAgents: companies,
     documents: formationDocuments,
   };
 

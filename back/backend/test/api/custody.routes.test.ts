@@ -4,6 +4,7 @@ import { createSiweMessage } from "viem/siwe";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
+import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../../src/formation";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -39,12 +40,25 @@ const SPEC = {
 };
 const PASSKEY = { attestation: { credentialId: "cred-1" } };
 
-/** What a deployment with no doola block advertises (design §2): formation off, environment null.
- *  Every credential-less deployment — dev, CI, self-hosts — serves exactly this. */
+const FORMATION_COPY = {
+  ssn: SSN_COPY,
+  park: PARK_COPY,
+  reuseDisclosure: COMPANY_REUSE_DISCLOSURE,
+};
+
+/**
+ * What a deployment with no doola block advertises (design §2): formation off, environment null.
+ * Every credential-less deployment — dev, CI, self-hosts — serves exactly this.
+ *
+ * `formationCopy` is on EVERY response, deployment-independent, because it is product copy rather
+ * than a capability: the sentences the wizard and the Companies section render, served from the
+ * box that implements the behaviour they describe (§7).
+ */
 const FORMATION_OFF = {
   formationAvailable: false,
   formationEnvironment: null,
   formationRequired: false,
+  formationCopy: FORMATION_COPY,
 };
 
 let db: Database.Database;
@@ -250,6 +264,7 @@ test("GET /config reports formation availability and its ENVIRONMENT (honesty in
     formationAvailable: true,
     formationEnvironment: "sandbox",
     formationRequired: false,
+    formationCopy: FORMATION_COPY,
   });
 
   // Production formation is a DIFFERENT advertised value, never a missing one: the environment is

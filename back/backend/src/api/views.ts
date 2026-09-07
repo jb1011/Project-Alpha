@@ -65,6 +65,55 @@ export interface EntityViewDeps {
    */
   documents?: Pick<DocumentIndexRepository, "listByCompany"> &
     Partial<Pick<DocumentIndexRepository, "listByCompanies">>;
+  /**
+   * How many agents share each company — the §7 SHARING LABEL's one input.
+   *
+   * Narrowed to the two counting reads, batched twin included, because a page of ten agents may
+   * be one company and asking ten times is the N+1 `toEntityViews` exists to remove.
+   *
+   * ⚠ AUTHENTICATED SURFACES ONLY, and structurally so: this dependency reaches `EntityView`,
+   * which serves `GET /entities` and the three tenant-scoped MCP read tools. `/transparency` and
+   * `/metadata` build their row shapes from `formationSummary` and never see this object at all.
+   */
+  companyAgents?: Pick<
+    import("../persistence/companyRepository").CompanyRepository,
+    "countAgents" | "countAgentsMany"
+  >;
+}
+
+/**
+ * EVERY KEY OF `EntityViewDeps`, as a runtime list — and a COMPILE ERROR if one is missing.
+ *
+ * `EntityViewDeps` was made one object because the MCP transport used to enumerate the view
+ * dependencies by hand and forgot the document index: `get_entity` over MCP described an entity
+ * with no legal documents while REST described the same entity with two, and nothing failed.
+ * The type stopped the object from being PARTIAL; it did not stop a second surface from picking
+ * a subset of it, and the transport went on doing exactly that — so A3's sharing label reached
+ * REST and not MCP, and the bug reappeared field-for-field.
+ *
+ * This is the fix that closes the class rather than the instance. `entityViewDepsOf` copies the
+ * whole set, the list lives NEXT TO the interface where a field is actually added, and
+ * `_assertEveryEntityViewDepListed` below fails to COMPILE if a new key is not added to it.
+ */
+export const ENTITY_VIEW_DEP_KEYS = [
+  "formationSteps",
+  "formationStepsMany",
+  "company",
+  "companyMany",
+  "documents",
+  "companyAgents",
+] as const satisfies readonly (keyof EntityViewDeps)[];
+
+/** Fails to compile the moment `EntityViewDeps` grows a key the list above does not name. */
+type MissingEntityViewDep = Exclude<keyof EntityViewDeps, (typeof ENTITY_VIEW_DEP_KEYS)[number]>;
+const _assertEveryEntityViewDepListed: MissingEntityViewDep extends never ? true : never = true;
+void _assertEveryEntityViewDepListed;
+
+/** The view slice of a larger dependency object — the ONE way a second surface takes it. */
+export function entityViewDepsOf(deps: EntityViewDeps): EntityViewDeps {
+  const out: Record<string, unknown> = {};
+  for (const key of ENTITY_VIEW_DEP_KEYS) out[key] = deps[key];
+  return out as EntityViewDeps;
 }
 
 /**
@@ -241,6 +290,23 @@ export interface EntityView {
          */
         companyId: string;
         /**
+         * HOW MANY AGENTS SHARE THIS FILING, including this one (§7 sharing labels).
+         *
+         * `1` means not shared. The total rather than "others" deliberately: an off-by-one that
+         * lives in the FIELD is an off-by-one every renderer inherits, whereas a UI that wants
+         * "shared with 2 others" subtracts once, at the edge, where the sentence is written.
+         *
+         * ⚠ AUTHENTICATED VIEWS ONLY, exactly like the EIN below. Two agents sharing a company
+         * are already publicly linkable through their anchored manifests (`legal.providerCompanyId`
+         * is in every one of them) — which is a fact the reuse picker DISCLOSES before a caller
+         * confirms — but publishing the COUNT on `/transparency` would hand a stranger the size
+         * of a tenant's fleet, which no public surface has ever carried.
+         *
+         * `null` = this surface did not count, never "not shared": an attached entity always has
+         * at least itself, so a 0 here would be a lie and a 1 would be a guess.
+         */
+        sharedWith: number | null;
+        /**
          * ⚠ AUTHENTICATED VIEWS ONLY. The EIN is a tax identifier: it belongs to the entity's
          * owner and to nobody else. It reaches this projection — which serves GET /entities and
          * the MCP read tools, both tenant-scoped — and it must NEVER reach `/transparency` or
@@ -340,6 +406,7 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
           ...summary,
           // Non-null by construction: `summary` is null unless `companyId` is set.
           companyId: companyId as string,
+          sharedWith: companyId ? (deps.companyAgents?.countAgents(companyId) ?? null) : null,
           // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
           // mint and is never served as a legal fact.
           // The EIN now lives on the COMPANY: one filing, one EIN, however many agents share it.
@@ -378,7 +445,10 @@ export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): 
   // → documents and back through a join, which is a round trip to recover a key the caller was
   // already holding — and one that cannot answer for a company with no agent attached.
   const docs = deps.documents?.listByCompanies?.(companyIds);
-  if (!steps && !docs && !companies) return rows.map((r) => toEntityView(r, deps));
+  // ONE grouped scan for the whole page's sharing labels, for the reason every other lookup here
+  // is batched: under N:1 a page of ten agents may be one company.
+  const shared = deps.companyAgents?.countAgentsMany(companyIds);
+  if (!steps && !docs && !companies && !shared) return rows.map((r) => toEntityView(r, deps));
 
   const batched: EntityViewDeps = {
     ...deps,
@@ -388,6 +458,16 @@ export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): 
     // `listByEntities: () => docs` stub that ignored its argument entirely, which is a lie in the
     // type system's own terms and would have answered any caller with the whole page's rows.
     documents: docs ? { listByCompany: (c) => docs.get(c) ?? [] } : deps.documents,
+    companyAgents: shared
+      ? {
+          // A company absent from the map has no rows, which is a count of zero — but a company
+          // an ENTITY is attached to always has at least that entity, so this branch is reached
+          // only for a page whose row set and count set disagree, and `?? 0` is the honest
+          // arithmetic rather than a guess.
+          countAgents: (c) => shared.get(c) ?? 0,
+          countAgentsMany: () => shared,
+        }
+      : deps.companyAgents,
   };
   return rows.map((r) => toEntityView(r, batched));
 }

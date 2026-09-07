@@ -260,6 +260,48 @@ test("the public surface NEVER carries the EIN, the filing number, or anything a
     expect(text).not.toContain(forbidden);
 });
 
+test("§7 SHARING LABELS: the count of agents sharing a filing is NOT on the public surface", async () => {
+  // The label reaches `EntityView.formation` and the three tenant-scoped MCP read tools, and
+  // stops there. Two agents sharing a company are ALREADY publicly linkable through their
+  // anchored manifests — `legal.providerCompanyId` is in every one, which is why the reuse picker
+  // discloses it before a caller confirms — but the COUNT is the size of a tenant's fleet, and no
+  // public surface has ever carried that.
+  //
+  // Structural, not incidental: `/transparency` builds its row from `formationSummary`, which is
+  // the shape that is safe anywhere, and never receives the `companyAgents` dependency at all.
+  // This asserts the RESULT, because a future edit could spread the authenticated block here.
+  repo.upsert({ ...base, formationProvider: "doola", formationEnvironment: "sandbox" });
+  repo.attachCompany(base.idempotencyKey, COMPANY_KEY);
+  repo.upsert({
+    ...base,
+    idempotencyKey: "tenant-a:agent-2",
+    publicId: "44444444-4444-4444-4444-444444444444",
+    formationProvider: "doola",
+    formationEnvironment: "sandbox",
+  });
+  repo.attachCompany("tenant-a:agent-2", COMPANY_KEY);
+
+  const built = buildApiApp({
+    webOrigin: "*",
+    repo,
+    jobs,
+    formationSteps: () => [],
+    company: () => PUBLIC_COMPANY,
+    // Wired ON PURPOSE, with a real count: the guard is worthless if it passes because the
+    // dependency happened to be absent.
+    companyAgents: { countAgents: () => 2, countAgentsMany: () => new Map([[COMPANY_KEY, 2]]) },
+  } as never);
+  const body = await (await built.request("/transparency")).json();
+  expect(body.entities).toHaveLength(2);
+  for (const e of body.entities) {
+    expect(e.formation).not.toHaveProperty("sharedWith");
+    // …nor the company id it would be a count of, nor the two other owner-only fields.
+    expect(e.formation).not.toHaveProperty("companyId");
+    expect(e.formation).not.toHaveProperty("ein");
+    expect(e.formation).not.toHaveProperty("documents");
+  }
+});
+
 // ── M5: the short in-process cache ─────────────────────────────────────────────────────────
 
 test("M5: /transparency is cached for a few seconds, and refreshes after the TTL", async () => {

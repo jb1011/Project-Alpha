@@ -212,6 +212,11 @@ Every line is one JSON object on stdout → journald.
 | `formation_ssn_erased` | The SSN was destroyed. `reason`: `provider_persisted` (the transaction that recorded the company id — the normal path), `terminal`, `ttl`, or `intake_reopened` (an edit-and-retry re-capture). Never carries the value or the person |
 | `formation_ssn_unreadable` | **CRITICAL** — a create body frozen WITH an SSN can no longer be rebuilt (the key is gone, or the row was erased out from under a live idempotency key). The filing is PARKED without burning the attempt: sending the body without the SSN is a different body under a live key, and re-keying would file a SECOND real Wyoming LLC. See `doola-deploy.md`, "If the key is LOST" |
 | `company_intake_updated` | An intake was re-opened after a rejected filing (§4.7) |
+| `formation_party_rejected` | **CRITICAL** — doola refused the responsible PERSON's body, not the company's. The row parks under `awaitingPartyEdit`, and since A3 its exit is `PATCH /formation-party/:partyId` (or MCP `update_formation_party`), NOT the company PATCH — none of the four fields that door rewrites is one `createCustomer` reads |
+| `formation_party_updated` | A responsible party was corrected through the A3 door. Carries the tenant (truncated), the `partyId` and the `companyId` — never a name, an address, an email, and never a diff, which would be the whole identity in a log line |
+| `formation_ssn_erased_before_send` | **CRITICAL**, and NOT an engineering failure — the §4.6a retention clock destroyed an SSN before the filing was ever sent. The row parks WITHOUT burning an attempt, and the two exits are the OWNER's: re-supply the number, or `proceedWithoutSsn`. `GET /companies/:companyId` reports it as `park.awaitingSsnDecision`, which is what the Companies section explains |
+| `company_attach` | An agent joined a company. `agents` is the count BEFORE this attach |
+| `company_reused` | The N:1 fan-out actually happening: an agent joined a company that ALREADY had one. This is what bounds anchor traffic (`agents × late facts × 2 sponsored writes`), and it is what makes two agents publicly linkable through their anchored manifests — a fact the reuse picker discloses before the owner confirms |
 | `formation_intake_unreadable` | **CRITICAL** — the company's stored `name_options` blob is empty or unreadable. The filing is PARKED and nothing was sent; it never files under an invented name. Fix the row, then let the sweeper retry |
 | `anchor_batch_full` | INFO. One anchor page hit `ANCHOR_BATCH`; the cursor carries the rest to the next tick. Reports `companies` (how much of the due set the page covered) and `entities` (what the tick actually drove). Full on EVERY tick ⇒ the deployment has outgrown `ANCHOR_BATCH` |
 
@@ -235,6 +240,22 @@ sqlite3 /var/lib/legalbody/legalbody.db \
      FROM formation_requests f
      LEFT JOIN entities e ON e.company_id = f.company_id
     WHERE f.state IN ('failed','abandoned') GROUP BY f.company_id, f.step;"
+
+# Which filings are PARKED waiting on a human, and on WHICH of the three decisions (A2/A3).
+# `GET /companies/:companyId` answers the same question for one company, in the owner's words.
+sqlite3 /var/lib/legalbody/legalbody.db \
+  "SELECT f.company_id,
+          json_extract(f.detail,'$.awaitingIntakeEdit') AS intake_edit,
+          json_extract(f.detail,'$.awaitingPartyEdit')  AS party_edit,
+          p.ssn_erased_reason
+     FROM formation_requests f
+     LEFT JOIN formation_parties p
+       ON p.company_id = f.company_id AND p.deleted_at IS NULL
+    WHERE f.step = 'create_provider'
+      AND json_valid(f.detail)
+      AND (json_extract(f.detail,'$.awaitingIntakeEdit') = 1
+           OR json_extract(f.detail,'$.awaitingPartyEdit') = 1
+           OR (p.ssn_erased_reason = 'ttl' AND p.ssn_ciphertext IS NULL));"
 
 # Events the sweeper still owes work on
 sqlite3 /var/lib/legalbody/legalbody.db \
