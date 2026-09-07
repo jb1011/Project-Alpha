@@ -7,6 +7,7 @@ import { mountMcpRoute } from "../mcp/transport";
 import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
+import { mountComplianceRoutes } from "./routes/compliance";
 import { mountConnectionRoutes } from "./routes/connection";
 import { mountDocumentRoutes } from "./routes/documents";
 import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
@@ -116,6 +117,16 @@ export interface ApiDeps extends EntityViewDeps {
     companies: import("../persistence/companyRepository").CompanyRepository;
     /** The deployment's pin, copied onto every company this box mints. */
     pin: { provider: string; environment: DoolaEnvironment };
+    /**
+     * The compliance-calendar reader — the FIRST consumption of `getComplianceCalendar` (§7).
+     *
+     * Narrowed to the ONE method at the seam, so this dependency cannot become a general-purpose
+     * doola handle sitting on the API deps. It lives under `formation` because reading it needs
+     * the credentials, and it is optional so every existing test wiring builds unchanged; absent
+     * reads as "this box cannot ask", which the route answers 503 to rather than pretending the
+     * calendar is empty.
+     */
+    compliance?: import("./routes/compliance").ComplianceReader;
     /**
      * The `createCompany` dependency set, built ONCE by the composition root (§7).
      *
@@ -255,6 +266,9 @@ export function buildApiApp(deps: ApiDeps) {
   mountProtectedRoutes(app, deps);
   // After the `/companies/*` requireAuth line above, so both document routes inherit auth.
   mountDocumentRoutes(app, deps);
+  // …and the compliance calendar, which is company-scoped for the same reason and inherits the
+  // same auth. Mounted always: it answers 503 where the deployment cannot ask doola anything.
+  mountComplianceRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);
   mountPerTxCapRoutes(app, deps);

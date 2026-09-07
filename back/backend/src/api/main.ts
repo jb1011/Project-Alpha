@@ -560,6 +560,9 @@ async function main() {
             requests: formationRequests,
             companies,
             pin: { provider: "doola", environment: cfg.doola!.environment },
+            // The ONE method the compliance route calls, narrowed here rather than handed the
+            // whole client (§7). Present only with a client to call it on.
+            compliance: doolaApi,
             // The same object the shim uses; the doors add only their own transaction.
             companyDeps,
           }

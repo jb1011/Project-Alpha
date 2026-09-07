@@ -266,6 +266,30 @@ export function companyIntakeFrozenMessage(): string {
 }
 
 /**
+ * THE WYOMING ANNUAL REPORT, as a placeholder — and as an admission (§7).
+ *
+ * Every Wyoming LLC owes an annual report and a licence-tax filing. What we do NOT know is who
+ * files THIS one: doola's pack includes the registered agent for year one, and the question of
+ * who files the annual report, at what price, and how the reminder arrives went to doola on
+ * 2026-08-27 and has not come back (§10, Externals — there is no renewal webhook event either).
+ *
+ * So the Companies section carries a row that says so, in our words, rather than either
+ * inventing a due date or omitting the obligation entirely. Omitting it is the worse of the two:
+ * an owner reading a compliance calendar with nothing in it concludes there is nothing to do,
+ * and the thing they would have missed costs the company its good standing.
+ *
+ * A constant because it is product copy the UI renders verbatim, and because the day the answer
+ * arrives this is the one place it changes.
+ */
+export const COMPLIANCE_ANNUAL_REPORT = {
+  label: "Wyoming annual report + licence tax",
+  /** Deliberately not a date. We do not know it, and a guess here is a missed filing. */
+  due: "Annually, on the first day of the anniversary month of formation",
+  handledBy: "(ask doola)",
+  note: "Your registered agent is included for the first year. Who files the annual report after that, and at what price, is an open question with the filing agent — we will not guess it here. Confirm it with them before your first anniversary.",
+} as const;
+
+/**
  * The labeled sandbox identity (§3, audit H7).
  *
  * doola's own registered-agent address in Sheridan, WY — the address a formed company already
