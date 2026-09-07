@@ -386,12 +386,17 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
     });
     return;
   }
-  const { ssn, ssnIncluded, expedited } = resolved;
+  const { ssn, expedited } = resolved;
   detail = {
     ...detail,
     nameOptions: nameOptions.map((n) => `${n.name} ${n.entityTypeEnding}`),
     expedited,
-    ssnIncluded,
+    // DERIVED HERE, at the one place the frozen body is written down, from the one value that
+    // decides it: `resolveSsn` returns the SSN this body will carry, or nothing, and every one of
+    // its exits agrees with that (a frozen body that claims an SSN it cannot produce PARKS rather
+    // than returning). Two computations of "did we send one?" is how the boolean in `detail` and
+    // the body on the wire come to disagree — which is a 409 on the next retry.
+    ssnIncluded: ssn !== undefined,
   };
 
   // `submitted` means "we are about to talk to doola". Written BEFORE the first call so a crash
@@ -523,14 +528,21 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
  * hold a body under the key we are about to use, the body has to be rebuilt BYTE-IDENTICALLY.
  *
  * The SSN is part of that body, and §4.4 deletes it in the very transaction that persists
- * `provider_ref`. Those two facts have to be reconciled, and this is the reconciliation:
+ * `provider_ref`. Those two facts have to be reconciled, and this is the reconciliation.
+ *
+ * It returns the SSN THIS BODY WILL CARRY, or nothing — never a separate boolean saying whether it
+ * did. `detail.ssnIncluded` is then derived at the single site that writes the frozen body down,
+ * because two computations of "did we send one?" is how the flag in `detail` and the bytes on the
+ * wire come to disagree, which is a 409 on the next retry:
  *
  *  - `frozen` is the shared freeze predicate (`formation/freeze.ts`), whose load-bearing clause
  *    here is `detail.companySentAttempt === row.attempt` — "a company create has ALREADY gone out
  *    under the key we would use next". That is exactly the condition under which the body may not
  *    change;
- *  - when frozen, `ssnIncluded` and `expedited` are READ FROM `detail`, never recomputed. The row
- *    may have been erased since; the body must not notice;
+ *  - when frozen, the SSN's presence and `expedited` are READ FROM `detail`, never recomputed.
+ *    The row may have been erased since; the body must not notice. A frozen body that carried NO
+ *    SSN short-circuits before the repository read: there is nothing to fetch and nothing to
+ *    decide, and that is the common case on every retry of every filing that never had one;
  *  - when not frozen (a first send, or a retry after a `rejected` that burned the attempt and so
  *    released the key), both are computed from the row as it is NOW. A `rejected` create is the
  *    one case doola releases the key, which is also the one case §4.7 re-opens the intake — the
@@ -551,19 +563,25 @@ function resolveSsn(
   row: FormationRequestRecord,
   detail: CreateProviderDetail,
   party: FormationPartyRecord,
-): { ssn?: Secret; ssnIncluded: boolean; expedited: boolean } | { park: string; reason: string } {
+): { ssn?: Secret; expedited: boolean } | { park: string; reason: string } {
   const companyId = d.company.companyId;
-  const stored = d.parties.findSsnByCompanyId(companyId);
   // The SHARED predicate, not a local re-spelling of it: the PATCH door asks the same question of
   // the same row in SQL, and two spellings of the idempotency contract is one spelling too many.
   const frozen = isIntakeFrozen(row);
+
+  // The frozen-WITHOUT-an-SSN body: nothing to read, nothing to decide, and no reason to touch
+  // the PII table at all. Checked before the repository read because this is the common case on
+  // every retry of every filing that never had one.
+  if (frozen && detail.ssnIncluded === false) return { expedited: Boolean(detail.expedited) };
+
+  const stored = d.parties.findSsnByCompanyId(companyId);
   const ssnIncluded = frozen ? Boolean(detail.ssnIncluded) : Boolean(stored);
   // A function of the SSN, so it is frozen by the same rule (§4.5).
   const expedited = frozen
     ? Boolean(detail.expedited)
     : isNonUsResponsibleParty({ hasSsn: ssnIncluded, country: party.country });
 
-  if (!ssnIncluded) return { ssnIncluded: false, expedited };
+  if (!ssnIncluded) return { expedited };
   // Frozen WITH an SSN, and the row no longer has one (or this box has lost the key).
   if (!stored || !d.pii)
     return { park: ssnUnreadableError(), reason: stored ? "ssn_no_key" : "ssn_erased" };
@@ -573,7 +591,6 @@ function resolveSsn(
       // `Secret`, so the only way it reaches the wire is the explicit `reveal()` in
       // `buildCompanyInput` — every accidental stringification on the way is "[redacted]".
       ssn: decryptSsn(d.pii, stored, { partyId: stored.partyId, companyId }),
-      ssnIncluded: true,
       expedited,
     };
   } catch {
