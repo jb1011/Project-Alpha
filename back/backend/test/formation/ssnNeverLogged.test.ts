@@ -29,10 +29,10 @@ const RING = { current: parsePiiKey(Buffer.alloc(32, 6).toString("base64"), "FOR
 /**
  * "Nothing here looks like an SSN" — asked of the very function that redacts them.
  *
- * `redactPii` is what strips SSN-shaped runs out of a provider's error text, so reusing it here
- * means the assertion and the defence cannot drift: widening one widens the other. It is
- * boundary-anchored (`\b\d{9}\b`), which is what keeps a 13-digit epoch in `nextRetryAt` from
- * reading as a false positive while a bare nine-digit run still does.
+ * `redactPii` is what strips SSN-shaped runs out of the text this system writes down, so reusing
+ * it here means the assertion and the defence cannot drift: widening one widens the other. Its
+ * boundaries are "not a hex digit", which is what keeps a 13-digit epoch in `nextRetryAt` and a
+ * `manifestHash` from reading as false positives while a bare nine-digit run still does.
  */
 function expectNoSsnShape(text: string, label?: string): void {
   expect(redactPii(text), label).toBe(text);
@@ -154,6 +154,16 @@ function assertClean(companyId: string) {
     expectNoSsnShape(text, label);
     expect(text, label).not.toContain(SSN);
   }
+
+  // …and the EVENT TRAIL, which is the permanent record: an ops line ages out of journald, an
+  // `events` row does not.
+  const events = db.prepare("SELECT detail FROM events WHERE detail IS NOT NULL").all() as {
+    detail: string;
+  }[];
+  for (const e of events) {
+    expectNoSsnShape(e.detail, "events.detail");
+    expect(e.detail, "events.detail").not.toContain(SSN);
+  }
 }
 
 test("the CREATE path logs no nine-digit pattern — and does log the boolean", () => {
@@ -228,4 +238,37 @@ test("a provider error that ECHOES the SSN is redacted before it is stored anywh
   const row = requests.find(companyId, "create_provider")!;
   expect(row.error).toContain("[redacted]");
   expect(row.error).not.toContain(SSN);
+});
+
+test("the CHOKE POINTS catch the spellings `\\b` misses, whatever the producer said", async () => {
+  // The producers here are deliberately NOT doola-shaped. `describeDoolaError` redacts the errors
+  // it recognises; these are the ones nothing upstream recognises — a bare `Error` with the digits
+  // welded to a word, and the space-separated form — and they are caught because the redaction is
+  // at the WRITE (`opsLog`, `failFormationStep`/`parkFormationStep`, `recordEvent`) rather than at
+  // any one producer.
+  for (const [label, message] of [
+    ["no word boundary at all", "ssn123456789 rejected by underwriting"],
+    ["space-separated", "the number 123 45 6789 was refused"],
+    ["dot-separated", "field ssn=123.45.6789 invalid"],
+  ] as const) {
+    printed = [];
+    const companyId = mintWithSsn();
+    await file(
+      companyId,
+      doola({
+        createCompany: async () => {
+          throw new Error(message);
+        },
+      }),
+    );
+    expect(printed.length, label).toBeGreaterThan(0);
+    expectNoSsnShape(printed.join("\n"), label);
+    // An unrecognised error is a `lost` park, so the message lands in the `error` column rather
+    // than on an ops line — which is precisely why redacting at the WRITE and not at one
+    // producer is the thing being asserted.
+    const row = requests.find(companyId, "create_provider")!;
+    expect(row.error, `${label}: error column`).toContain("[redacted]");
+    expectNoSsnShape(row.error ?? "", `${label}: error column`);
+    assertClean(companyId);
+  }
 });

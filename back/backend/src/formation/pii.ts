@@ -307,11 +307,12 @@ export function isWellFormedSsn(value: string): boolean {
 /**
  * Strip anything SSN-shaped out of a string before it is logged or persisted (§4).
  *
- * It lives HERE, beside the validator it is derived from, rather than in doola's client where it
- * started. The leak vector is text we did not write — a provider's validation error quoting the
- * offending field, an exception whose message embeds the request body — and doola's client is
- * only ONE producer of that text. A redactor that is a property of one adapter is a redactor the
- * next producer does not get.
+ * It is applied at the CHOKE POINTS rather than at each producer — `opsLog`, the two writers that
+ * persist a step error, and `EntityRepository.recordEvent`'s detail — because the leak vector is
+ * text we did not write: a provider's validation error quoting the offending field, an exception
+ * whose message embeds the request body. Redacting at `describeDoolaError` alone covered doola's
+ * errors and nothing else; redacting where the text is WRITTEN DOWN covers every producer that
+ * exists and every one added later.
  */
 export function redactPii(message: string): string {
   return message.replace(SSN_SHAPE, REDACTED);

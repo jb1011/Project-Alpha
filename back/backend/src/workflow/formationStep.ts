@@ -1,3 +1,4 @@
+import { redactPii } from "../formation/pii";
 import {
   POLL_BASE_MS,
   POLL_CAP_MS,
@@ -174,7 +175,9 @@ export function parkFormationStep(
   const retryIntervalMs = nextInterval(detail.retryIntervalMs, RETRY_BASE_MS, RETRY_CAP_MS);
   const nextRetryAt = (d.now ?? Date.now)() + retryIntervalMs;
   d.requests.transition(companyId, step, row.state, "failed", {
-    error,
+    // Redacted here for the reason `failFormationStep` gives: this column is read by humans and
+    // its contents are frequently somebody else's sentence.
+    error: redactPii(error),
     detail: JSON.stringify({ ...detail, retryIntervalMs, nextRetryAt }),
     // A PARK IS NOT A FACT (2026-08-26 §3). Nothing was learned — a lost answer, a transient read
     // failure, a config mismatch — and the only thing written is the retry schedule. Moving
