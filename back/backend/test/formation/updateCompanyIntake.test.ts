@@ -95,6 +95,13 @@ function mint(tenantId = TENANT, ssn: string | undefined = SSN): string {
   return r.companyId;
 }
 
+const reasonOn = (companyId: string) =>
+  (
+    db
+      .prepare("SELECT ssn_erased_reason FROM formation_parties WHERE company_id = ?")
+      .get(companyId) as { ssn_erased_reason: string | null }
+  ).ssn_erased_reason;
+
 const EDIT = {
   names: ["Fixed One", "Fixed Two", "Fixed Three"],
   businessPurpose: "Corrected purpose.",
@@ -139,14 +146,28 @@ test("after a REJECTED create, the intake is re-openable and the SSN re-captured
   expect(row.ssn_deleted_at).toBeNull();
 });
 
-test("the intake can be re-opened WITHOUT a new SSN — the old one is kept, not silently dropped", () => {
-  // Omitting a field is not the same as clearing it. A caller fixing a NAME must not lose the
-  // fast EIN route as a side effect.
+test("re-opening WITHOUT a new SSN ERASES the old one — omission is how you correct it", () => {
+  // The asymmetry that decides this: a `rejected` filing is often rejected BECAUSE of the number
+  // (a typo, an ITIN where doola wanted an SSN, a person who turns out not to be a US taxpayer),
+  // and "leave it out this time" is the most natural correction a caller can make. If the stored
+  // value survived an omission, that gesture would silently re-send the very number doola
+  // refused, on a real fee. So the retried body carries an SSN only if THIS request supplied one.
   const companyId = mint();
   rejected(companyId);
   expect(updateCompanyIntake(deps(), TENANT, companyId, EDIT)).toEqual({ companyId });
-  const stored = parties.findSsnByCompanyId(companyId)!;
-  expect(decryptSsn(RING, stored, { partyId: stored.partyId, companyId }).reveal()).toBe(SSN);
+  expect(parties.findSsnByCompanyId(companyId)).toBeUndefined();
+  expect(reasonOn(companyId)).toBe("intake_reopened");
+});
+
+test("…and 'proceed without one' is recorded as a fact, not as the absence of one", () => {
+  // The §4.6a exit. `intake_reopened` says the door took the number away; `none` says a human
+  // decided to file without it, which is what lets a parked filing resume (see `resolveSsn`).
+  const companyId = mint();
+  rejected(companyId);
+  expect(
+    updateCompanyIntake(deps(), TENANT, companyId, { ...EDIT, proceedWithoutSsn: true }),
+  ).toEqual({ companyId });
+  expect(reasonOn(companyId)).toBe("none");
 });
 
 // ── the freeze ─────────────────────────────────────────────────────────────────────────────

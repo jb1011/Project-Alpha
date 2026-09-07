@@ -317,6 +317,13 @@ export function createCompany(
  *
  * The whole thing is ONE transaction: a re-opened intake with the old SSN still attached, or a
  * new SSN attached to un-rewritten names, are both worse than either half failing.
+ *
+ * ⚠ THE STORED SSN IS ERASED UNCONDITIONALLY on a successful re-open, and that is a decision, not
+ * a side effect. A `rejected` filing is often rejected BECAUSE of the number — a typo, an ITIN
+ * where doola wanted an SSN, a person who turns out not to be a US taxpayer — and "correct it by
+ * leaving it out" is the most natural thing a caller can do. If the old value survived an
+ * omission, that gesture would silently re-send the very number doola refused. So the retried
+ * body carries an SSN only if THIS request supplied one.
  */
 export function updateCompanyIntake(
   deps: CreateCompanyDeps,
@@ -357,12 +364,11 @@ export function updateCompanyIntake(
       frozen = true;
       return;
     }
+    // Erase FIRST and ALWAYS — see the ⚠ above. `storeSsn` is write-once while a ciphertext
+    // exists, so this is also what makes room for a replacement, and it clears `ssn_deleted_at`
+    // so the row never holds a live ciphertext under a deletion stamp.
+    eraseSsnLogged(deps.parties, companyId, "intake_reopened", company.environment);
     if (sealed) {
-      // Erase-then-store, in this order and in this transaction. The old SSN belonged to the body
-      // doola rejected; the new one belongs to the body we are about to send. `storeSsn` is
-      // write-once while a ciphertext exists, so the erase is what makes room for it — and it
-      // clears `ssn_deleted_at`, so the row never holds a live ciphertext under a deletion stamp.
-      eraseSsnLogged(deps.parties, companyId, "intake_reopened", company.environment);
       const bind = { partyId: party.partyId, companyId };
       if (
         !deps.parties.storeSsn(party.partyId, companyId, encryptSsn(sealed.pii, sealed.ssn, bind))
