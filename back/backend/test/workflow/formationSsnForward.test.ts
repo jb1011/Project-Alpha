@@ -250,7 +250,7 @@ test("a same-key RESUME rebuilds the SAME body from the frozen flags, not from t
     detail: JSON.stringify({ customerId: "cus_1", companySentAttempt: 0, ssnIncluded: true }),
   });
   // …and the SSN is gone.
-  parties.eraseSsn(companyId);
+  parties.eraseSsn(companyId, "provider_persisted");
 
   const api = doola();
   await file(companyId, api);

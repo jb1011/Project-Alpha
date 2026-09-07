@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { everSubmitted } from "../formation/freeze";
 import type { EncryptedSsn } from "../formation/pii";
+import type { SsnErasedReason } from "../formation/ssnErasure";
 import type { CompanyStatus } from "./companyRepository";
 import type { FormationState } from "./formationRepository";
 
@@ -217,14 +218,18 @@ export interface FormationPartyRepository {
   findSsnByCompanyId(companyId: string): (EncryptedSsn & { partyId: string }) | undefined;
 
   /**
-   * ERASE the SSN and stamp `ssn_deleted_at`, leaving the rest of the party intact.
+   * ERASE the SSN, stamp `ssn_deleted_at`, and RECORD WHY, leaving the rest of the party intact.
    *
    * Its own operation, distinct from `erase`: the SSN dies at the moment the filing no longer
    * needs it (§4.4 — the transaction that persists `provider_ref`), which is typically YEARS
    * before the party row itself is erasable, if ever. Idempotent: false means there was nothing
    * to erase, which is what every backstop pass sees.
+   *
+   * The reason is REQUIRED rather than optional: the record is the only thing that remains once
+   * the value is gone. Call it through `eraseSsnLogged`, which is what makes the ops line
+   * unforgettable too.
    */
-  eraseSsn(companyId: string): boolean;
+  eraseSsn(companyId: string, reason: Exclude<SsnErasedReason, "none">): boolean;
 
   /** Every party still holding an SSN, with what the TTL clock needs to judge it (§4.6a). */
   listSsnRetention(): SsnRetentionRow[];
@@ -291,6 +296,10 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
                 -- person's data erased and half not is exactly the window this shape avoids.
                 ssn_ciphertext = NULL, ssn_iv = NULL, ssn_key_id = NULL,
                 ssn_deleted_at = COALESCE(ssn_deleted_at, CURRENT_TIMESTAMP),
+                -- COALESCE, so an erasure that already has a reason keeps it. C7 only ever
+                -- fires for a company that provably never filed, or for a party that was never
+                -- used at all, which is the same terminal fact 'terminal' names.
+                ssn_erased_reason = COALESCE(ssn_erased_reason, 'terminal'),
                 deleted_at = CURRENT_TIMESTAMP
           WHERE party_id = ? AND deleted_at IS NULL`,
       ),
@@ -316,8 +325,11 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
       eraseSsn: db.prepare(
         `UPDATE formation_parties
             SET ssn_ciphertext = NULL, ssn_iv = NULL, ssn_key_id = NULL,
-                ssn_deleted_at = CURRENT_TIMESTAMP
-          WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
+                ssn_deleted_at = CURRENT_TIMESTAMP,
+                -- WHY, on the row, in the same statement that destroys the value. Two writes
+                -- would be two chances to record one and not the other.
+                ssn_erased_reason = @reason
+          WHERE company_id = @company_id AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
       ),
       // Only rows that still HOLD an SSN — a handful at any moment, being exactly the companies
       // between an intake and a `provider_ref`.
@@ -423,8 +435,8 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
       : undefined;
   }
 
-  eraseSsn(companyId: string): boolean {
-    return this.stmts.eraseSsn.run(companyId).changes === 1;
+  eraseSsn(companyId: string, reason: Exclude<SsnErasedReason, "none">): boolean {
+    return this.stmts.eraseSsn.run({ company_id: companyId, reason }).changes === 1;
   }
 
   listSsnRetention(): SsnRetentionRow[] {

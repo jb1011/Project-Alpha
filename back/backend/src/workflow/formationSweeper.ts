@@ -15,6 +15,7 @@ import {
   UNBOUND_PARTY_MAX_AGE_MS,
   retryDelayMs,
 } from "../formation/schedule";
+import { eraseSsnLogged } from "../formation/ssnErasure";
 import { deriveFormationStatus } from "../formation/status";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
@@ -688,14 +689,14 @@ export class FormationSweeper {
       const expired = ageMs >= SSN_MAX_AGE_MS && !row.everSubmitted;
 
       if (terminal || expired) {
-        if (this.d.parties.eraseSsn(row.companyId))
-          // The company, the reason, and nothing else — an erasure line that named the person
-          // would be the one place their data outlived the erasure.
-          opsLog("formation_ssn_erased", {
-            companyId: row.companyId,
-            reason: terminal ? "terminal" : "ttl",
-            environment: this.d.environment,
-          });
+        // ONE helper for every erase in the system, so the row's reason and the ops line are
+        // written by the same code and an erase without an audit trail is unwritable.
+        eraseSsnLogged(
+          this.d.parties,
+          row.companyId,
+          terminal ? "terminal" : "ttl",
+          this.d.environment,
+        );
         continue;
       }
 

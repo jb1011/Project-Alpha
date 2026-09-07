@@ -20,6 +20,7 @@ import {
   companyNameOptions,
 } from "../formation/intake";
 import { type PiiKeyring, type Secret, decryptSsn } from "../formation/pii";
+import { eraseSsnLogged } from "../formation/ssnErasure";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
@@ -619,14 +620,8 @@ function persistRefAndEraseSsn(d: FormationCreateDeps, write: () => boolean): bo
   let moved = false;
   d.repo.transaction(() => {
     moved = write();
-    if (d.parties.eraseSsn(d.company.companyId))
-      // The reason, the company, and nothing else. An erasure line that named the person would be
-      // the one place their data outlived the erasure.
-      opsLog("formation_ssn_erased", {
-        companyId: d.company.companyId,
-        reason: "provider_persisted",
-        environment: d.environment,
-      });
+    // ONE helper, so an erase and its audit line cannot be separated (see `ssnErasure.ts`).
+    eraseSsnLogged(d.parties, d.company.companyId, "provider_persisted", d.environment);
   });
   return moved;
 }

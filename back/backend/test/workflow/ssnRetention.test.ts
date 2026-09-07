@@ -114,6 +114,12 @@ function sweeper(): FormationSweeper {
 }
 
 const held = (companyId: string) => parties.findSsnByCompanyId(companyId) !== undefined;
+const reasonOn = (companyId: string) =>
+  (
+    db
+      .prepare("SELECT ssn_erased_reason FROM formation_parties WHERE company_id = ?")
+      .get(companyId) as { ssn_erased_reason: string | null }
+  ).ssn_erased_reason;
 const opsLines = () => printed.filter((l) => l.includes('"opslog"')).map((l) => JSON.parse(l));
 
 // ── erase: terminal ────────────────────────────────────────────────────────────────────────
@@ -159,6 +165,8 @@ test("an SSN older than 7 days whose filing NEVER started is erased", async () =
     companyId,
     reason: "ttl",
   });
+  // …and the reason is on the ROW too, not only in journald: the filer reads it back (§4.6a).
+  expect(reasonOn(companyId)).toBe("ttl");
   // The company itself is UNTOUCHED — no clock manufactures `abandoned` (§4.6a).
   expect(companies.find(companyId)!.status).toBe("ready");
 });

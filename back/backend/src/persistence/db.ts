@@ -58,6 +58,10 @@ const FORMATION_PARTIES_DDL = `
       -- PREVIOUS key is SELECTED rather than trial-decrypted. Written by A2; the columns exist
       -- now so the erasure statement below is complete from the day the first one is written.
       ssn_ciphertext BLOB, ssn_iv BLOB, ssn_key_id TEXT, ssn_deleted_at TEXT,
+      -- WHY this row holds no SSN: provider_persisted | terminal | ttl | intake_reopened. It is
+      -- written by every erase path, and it is read by code rather than only by an operator: a
+      -- filing that finds the SSN gone needs to know what took it.
+      ssn_erased_reason TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       deleted_at TEXT
     );
@@ -707,6 +711,9 @@ export function migrate(db: Database.Database): void {
     ["ssn_iv", "BLOB"],
     ["ssn_key_id", "TEXT"],
     ["ssn_deleted_at", "TEXT"],
+    // A2: the erasure reason. NULL on every existing row, which reads as "nothing was ever
+    // erased here" — the answer those rows have always had.
+    ["ssn_erased_reason", "TEXT"],
   ] as const)
     if (!partyColsNow.includes(col))
       db.exec(`ALTER TABLE formation_parties ADD COLUMN ${col} ${type}`);

@@ -63,6 +63,14 @@ function bound(): { partyId: string; companyId: string } {
   return { partyId, companyId };
 }
 
+function reasonOf(partyId: string): string | null {
+  return (
+    db.prepare("SELECT ssn_erased_reason FROM formation_parties WHERE party_id = ?").get(partyId) as
+      | { ssn_erased_reason: string | null }
+      | undefined
+  )?.ssn_erased_reason as string | null;
+}
+
 function store(b: { partyId: string; companyId: string }): boolean {
   return parties.storeSsn(b.partyId, b.companyId, encryptSsn(RING, SSN, b));
 }
@@ -97,10 +105,10 @@ test("WRITE-ONCE while one exists — a second SSN under a live key is refused",
   expect(store(b)).toBe(false);
 });
 
-test("eraseSsn NULLs the three columns, stamps the date, and leaves the party intact", () => {
+test("eraseSsn NULLs the three columns, stamps the date, records WHY, and leaves the party intact", () => {
   const b = bound();
   store(b);
-  expect(parties.eraseSsn(b.companyId)).toBe(true);
+  expect(parties.eraseSsn(b.companyId, "provider_persisted")).toBe(true);
   expect(parties.findSsnByCompanyId(b.companyId)).toBeUndefined();
 
   const row = db
@@ -108,6 +116,8 @@ test("eraseSsn NULLs the three columns, stamps the date, and leaves the party in
     .get(b.partyId) as Record<string, unknown>;
   expect([row.ssn_ciphertext, row.ssn_iv, row.ssn_key_id]).toEqual([null, null, null]);
   expect(row.ssn_deleted_at).toBeTruthy();
+  // The record is the only thing that survives the value, so it is written by the SAME statement.
+  expect(row.ssn_erased_reason).toBe("provider_persisted");
   // The SSN dies at `provider_ref`; the party lives for as long as the filing does.
   expect(row.deleted_at).toBeNull();
   expect(row.legal_first_name).toBe("Ada");
@@ -117,9 +127,9 @@ test("eraseSsn NULLs the three columns, stamps the date, and leaves the party in
 test("eraseSsn is idempotent — every backstop pass after the first says false", () => {
   const b = bound();
   store(b);
-  expect(parties.eraseSsn(b.companyId)).toBe(true);
-  expect(parties.eraseSsn(b.companyId)).toBe(false);
-  expect(parties.eraseSsn("no-such-company")).toBe(false);
+  expect(parties.eraseSsn(b.companyId, "ttl")).toBe(true);
+  expect(parties.eraseSsn(b.companyId, "ttl")).toBe(false);
+  expect(parties.eraseSsn("no-such-company", "ttl")).toBe(false);
 });
 
 test("a RE-CAPTURE after an erasure clears the deletion stamp", () => {
@@ -127,7 +137,8 @@ test("a RE-CAPTURE after an erasure clears the deletion stamp", () => {
   // a lie in the audit trail.
   const b = bound();
   store(b);
-  parties.eraseSsn(b.companyId);
+  expect(parties.eraseSsn(b.companyId, "intake_reopened")).toBe(true);
+  expect(reasonOf(b.partyId)).toBe("intake_reopened");
   expect(store(b)).toBe(true);
   const row = db
     .prepare("SELECT ssn_deleted_at FROM formation_parties WHERE party_id = ?")
@@ -156,7 +167,7 @@ test("listSsnRetention returns only rows that still HOLD an SSN, with the captur
   store(held);
   const erased = bound();
   store(erased);
-  parties.eraseSsn(erased.companyId);
+  parties.eraseSsn(erased.companyId, "terminal");
   bound(); // never had one
 
   const rows = parties.listSsnRetention();
@@ -234,7 +245,7 @@ test("everSubmitted is TRUE for every witness of a filing in flight, not just th
     apply(b.companyId);
     const row = parties.listSsnRetention().find((r) => r.companyId === b.companyId)!;
     expect(row.everSubmitted, label).toBe(want);
-    parties.eraseSsn(b.companyId); // keep the next case's listing clean
+    parties.eraseSsn(b.companyId, "terminal"); // keep the next case's listing clean
   }
 });
 

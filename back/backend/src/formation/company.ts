@@ -42,6 +42,7 @@ import {
 } from "./intake";
 import { isKnownIndustryLabel } from "./naicsLabels";
 import { type PiiKeyring, encryptSsn, isWellFormedSsn } from "./pii";
+import { eraseSsnLogged } from "./ssnErasure";
 import { findRestrictedWord } from "./wyRestrictedWords";
 
 /**
@@ -351,12 +352,7 @@ export function updateCompanyIntake(
       // doola rejected; the new one belongs to the body we are about to send. `storeSsn` is
       // write-once while a ciphertext exists, so the erase is what makes room for it — and it
       // clears `ssn_deleted_at`, so the row never holds a live ciphertext under a deletion stamp.
-      if (deps.parties.eraseSsn(companyId))
-        opsLog("formation_ssn_erased", {
-          companyId,
-          reason: "intake_reopened",
-          environment: company.environment,
-        });
+      eraseSsnLogged(deps.parties, companyId, "intake_reopened", company.environment);
       const bind = { partyId: party.partyId, companyId };
       if (
         !deps.parties.storeSsn(party.partyId, companyId, encryptSsn(sealed.pii, sealed.ssn, bind))
