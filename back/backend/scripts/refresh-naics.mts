@@ -1,5 +1,5 @@
 /**
- * Regenerate `src/formation/naicsLabels.ts` from doola's reference table (design §5).
+ * Regenerate `src/formation/naicsLabelsData.ts` from doola's reference table (design §5).
  *
  *     DOOLA_API_KEY=dk_test_… npx tsx scripts/refresh-naics.mts
  *
@@ -7,6 +7,11 @@
  * a BUILD-TIME constant rather than a request-time lookup: no partner round trip in the form, no
  * cache with an unspecified TTL, no staleness nobody can observe. This script is the only thing
  * that writes that file, and `listNaicsCodes` exists on the client only for this script.
+ *
+ * It writes a DATA-ONLY module. The behaviour that reads the list — the membership check, the
+ * capped renderer, the prose — is hand-written in `naicsLabels.ts`, which this never touches: a
+ * generator that also emits behaviour silently reverts any fix to that behaviour the next time
+ * somebody refreshes the labels, and buries the one line that changed in a hundred that did not.
  *
  * SANDBOX-GUARDED like every other probe in this directory. Not because a GET is dangerous — it
  * is the one reference call that costs nothing — but because a production key in a developer's
@@ -23,7 +28,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildDoolaApi } from "../src/adapters/doola/doolaClient";
 import { DOOLA_BASE_URLS } from "../src/config/env";
-import { DEFAULT_INDUSTRY } from "../src/formation/intake";
+import { DEFAULT_INDUSTRY, canonicalizeIntakeText } from "../src/formation/intake";
 
 const apiKey = process.env.DOOLA_API_KEY;
 if (!apiKey) throw new Error("DOOLA_API_KEY is required (sandbox key: dk_test_…)");
@@ -39,46 +44,28 @@ const api = buildDoolaApi({
   environment,
 });
 
-const OUT = join(dirname(fileURLToPath(import.meta.url)), "../src/formation/naicsLabels.ts");
+/** The DATA file, and only the data file. `naicsLabels.ts` beside it is hand-written and is
+ *  never touched by this script — see the header it emits for why. */
+const OUT = join(dirname(fileURLToPath(import.meta.url)), "../src/formation/naicsLabelsData.ts");
 
 function render(labels: string[]): string {
   return `/**
- * The doola INDUSTRY LABELS a company may be filed under — a BUILD-TIME constant (design §5).
- *
- * ⚠ GENERATED FILE. Refresh it with:
+ * ⚠ GENERATED FILE — DO NOT EDIT. Regenerate with:
  *
  *     DOOLA_API_KEY=dk_test_… npx tsx scripts/refresh-naics.mts
  *
- * and commit the result. Do not hand-edit the array: the point of the script is that the list is
- * doola's, verbatim, and a hand-edited entry is a label we invented and a filing doola will
- * reject.
+ * DATA ONLY, deliberately. Everything that READS this list — the membership check, the capped
+ * renderer, and the prose explaining why the list is a build-time constant at all — lives in the
+ * hand-written \`naicsLabels.ts\` beside it, which imports this. Keeping them apart means a
+ * refresh is a diff of the array and nothing else: a generator that also emits behaviour is a
+ * generator that silently reverts a fix to that behaviour the next time somebody runs it, and the
+ * reviewer of the refresh PR has to re-read a hundred lines of unchanged prose to notice.
  *
- * Why a constant and not a lookup: \`industry\` is chosen at the very TOP of the create-company
- * funnel. A partner round trip there is a form that cannot render when doola is slow, plus a
- * cache with a TTL nobody specified and a staleness nobody can observe. The list is a federal
- * reference table that changes about as often as NAICS itself does, so it belongs in the build.
- *
- * Generated ${new Date().toISOString().slice(0, 10)} from the ${environment} reference table
- * (${labels.length} label(s)).
+ * Generated ${new Date().toISOString().slice(0, 10)} from the ${environment} reference table: ${labels.length} label${labels.length === 1 ? "" : "s"}.
  */
 
 /** Every label the create-company endpoint accepts, exactly as doola spells it. */
-export const NAICS_LABELS: readonly string[] = ${JSON.stringify(labels, null, 2).replace(/\n/g, "\n")};
-
-/** O(1) membership, built once. */
-const LABEL_SET = new Set(NAICS_LABELS);
-
-/**
- * Is this one of the shipped labels?
- *
- * EXACT, after a trim and an NFC normalize — the same canonicalization the intake applies before
- * storing, so "accepted at the door" and "stored" cannot disagree. Deliberately case-SENSITIVE:
- * doola matches the label it published, and a case-folded accept here would store a string we
- * then send verbatim and doola then refuses.
- */
-export function isKnownIndustryLabel(label: string): boolean {
-  return LABEL_SET.has(label.normalize("NFC").trim());
-}
+export const NAICS_LABELS: readonly string[] = ${JSON.stringify(labels, null, 2)};
 `;
 }
 
@@ -89,7 +76,10 @@ async function main() {
   const labels = [
     ...new Set(
       rows
-        .map((r) => (r.industry ?? "").normalize("NFC").trim())
+        // The SAME canonicalization the intake applies, called rather than re-spelled: a label
+        // generated in one normal form and compared in another is a label the door refuses for
+        // a reason nobody can see.
+        .map((r) => canonicalizeIntakeText(r.industry ?? ""))
         .filter((s): s is string => s.length > 0),
     ),
   ].sort((a, b) => a.localeCompare(b, "en"));

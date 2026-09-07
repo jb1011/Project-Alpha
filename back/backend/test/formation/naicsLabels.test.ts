@@ -2,6 +2,7 @@
  * The shipped industry labels (design §5) — a BUILD-TIME constant, and the properties the intake
  * relies on.
  */
+import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
 import {
@@ -51,4 +52,30 @@ test("the label list is rendered CAPPED, by one function both surfaces use", () 
   expect(rendered).toContain(`Label ${LABEL_LIST_CAP - 1}`);
   expect(rendered).not.toContain(`Label ${LABEL_LIST_CAP}`);
   expect(rendered).toContain("…and 5 more");
+});
+
+test("the GENERATED file carries data and nothing else", () => {
+  // `scripts/refresh-naics.mts` overwrites `naicsLabelsData.ts` wholesale. If behaviour lived in
+  // it, the next refresh would silently revert any fix made to that behaviour — and bury the one
+  // line that actually changed in a hundred that did not, where no reviewer would find it. So the
+  // generated module exports the array and nothing else, and everything that reads the list lives
+  // in the hand-written `naicsLabels.ts` beside it.
+  const generated = readFileSync(
+    new URL("../../src/formation/naicsLabelsData.ts", import.meta.url),
+    "utf8",
+  );
+  expect(generated).toContain("GENERATED FILE");
+  expect(generated.match(/^export /gm)).toEqual(["export "]);
+  expect(generated).toContain("export const NAICS_LABELS");
+  // No behaviour: no functions, no derived structures, nothing to revert.
+  for (const forbidden of ["function", "new Set", "=>", "import "])
+    expect(generated, forbidden).not.toContain(forbidden);
+
+  // …and the hand-written module is what the rest of the system imports from.
+  const stable = readFileSync(
+    new URL("../../src/formation/naicsLabels.ts", import.meta.url),
+    "utf8",
+  );
+  expect(stable).toContain('from "./naicsLabelsData"');
+  expect(stable).toContain("export function isKnownIndustryLabel");
 });
