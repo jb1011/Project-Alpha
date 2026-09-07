@@ -183,6 +183,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       businessPurpose?: unknown;
       industryLabel?: unknown;
       ssn?: unknown;
+      proceedWithoutSsn?: unknown;
     };
     try {
       body = await c.req.json();
@@ -208,6 +209,9 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
         businessPurpose: body.businessPurpose as string | undefined,
         industryLabel: body.industryLabel as string | undefined,
         ssn: body.ssn as string | undefined,
+        // The §4.6a decision, and deliberately a strict `=== true`: "file without one" is a
+        // choice a caller makes, never something a truthy value makes for them.
+        proceedWithoutSsn: body.proceedWithoutSsn === true ? true : undefined,
       },
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);

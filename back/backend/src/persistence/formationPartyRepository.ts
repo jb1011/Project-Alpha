@@ -53,6 +53,15 @@ export interface FormationPartyRecord {
   synthetic: boolean;
   /** Erasure marker for a party that never reached a filing. */
   deletedAt: string | null;
+  /**
+   * WHY this row holds no SSN, or null when the question has never arisen (§4.6a).
+   *
+   * Read by the FILER, not only by an operator: `ttl` means the CLOCK took a number the caller
+   * supplied, before anything was ever sent — and a filing that discovers that must park for a
+   * human rather than quietly file a body without it. `none` is the mark left by a human who
+   * decided to proceed without one.
+   */
+  ssnErasedReason: SsnErasedReason | null;
 }
 
 /**
@@ -64,7 +73,7 @@ export interface FormationPartyRecord {
  */
 export type NewFormationParty = Omit<
   FormationPartyRecord,
-  "partyId" | "entityKey" | "companyId" | "deletedAt" | "createdAt"
+  "partyId" | "entityKey" | "companyId" | "deletedAt" | "createdAt" | "ssnErasedReason"
 > & {
   partyId?: string;
 };
@@ -87,6 +96,7 @@ interface Row {
   synthetic: number;
   created_at: string;
   deleted_at: string | null;
+  ssn_erased_reason: string | null;
 }
 
 function toRecord(r: Row): FormationPartyRecord {
@@ -108,6 +118,7 @@ function toRecord(r: Row): FormationPartyRecord {
     synthetic: r.synthetic === 1,
     createdAt: r.created_at,
     deletedAt: r.deleted_at,
+    ssnErasedReason: (r.ssn_erased_reason as SsnErasedReason | null) ?? null,
   };
 }
 
@@ -235,6 +246,14 @@ export interface FormationPartyRepository {
    */
   eraseSsn(companyId: string, reason: Exclude<SsnErasedReason, "none">): boolean;
 
+  /**
+   * Record that a human chose to file WITHOUT an SSN after the clock erased one (§4.6a).
+   *
+   * The second exit from the park a `ttl` erasure causes. Returns whether the row moved — false
+   * when the company holds a live SSN (nothing to decide) or has no party.
+   */
+  proceedWithoutSsn(companyId: string): boolean;
+
   /** Every party still holding an SSN, with what the TTL clock needs to judge it (§4.6a). */
   listSsnRetention(): SsnRetentionRow[];
 }
@@ -344,6 +363,14 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
                 ssn_captured_at = NULL
           WHERE company_id = @company_id AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
       ),
+      // A human's decision to file WITHOUT one, after the clock took theirs (§4.6a). It is the
+      // OTHER exit from the parked filing — the first being a fresh capture — and it is a fact
+      // rather than a flag: the row stops saying "the clock took it" and starts saying "the
+      // owner said go ahead", which is what lets the next pass send a body with no `ssn` key.
+      proceedWithoutSsn: db.prepare(
+        `UPDATE formation_parties SET ssn_erased_reason = 'none'
+          WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NULL`,
+      ),
       // Only rows that still HOLD an SSN — a handful at any moment, being exactly the companies
       // between an intake and a `provider_ref`.
       ssnRetention: db.prepare(
@@ -452,6 +479,10 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
 
   eraseSsn(companyId: string, reason: Exclude<SsnErasedReason, "none">): boolean {
     return this.stmts.eraseSsn.run({ company_id: companyId, reason }).changes === 1;
+  }
+
+  proceedWithoutSsn(companyId: string): boolean {
+    return this.stmts.proceedWithoutSsn.run(companyId).changes === 1;
   }
 
   listSsnRetention(): SsnRetentionRow[] {

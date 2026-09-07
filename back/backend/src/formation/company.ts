@@ -124,6 +124,16 @@ export interface CompanyIntakeInput {
    * function mints it. MCP never passes it and sandbox deployments refuse it outright.
    */
   ssn?: string;
+  /**
+   * "File without one" — the §4.6a decision, and the OTHER way out of the park a TTL erasure
+   * causes (`updateCompanyIntake` only).
+   *
+   * It is a deliberate statement rather than the absence of one, because an omitted `ssn` on a
+   * PATCH already means something else (see the erase in `updateCompanyIntake`). This is the
+   * caller saying: the number I gave you was destroyed by the retention clock, I am not
+   * supplying another, file the SS-4 route instead.
+   */
+  proceedWithoutSsn?: boolean;
   /** THE A1 SHIM ONLY: synthesize a 1:1 intake from the agent's name. Removed in A3. */
   synthesizedName?: string;
   /** The caller's CLAIM about the deployment, checked against it — never the stored value. */
@@ -358,6 +368,10 @@ export function updateCompanyIntake(
         !deps.parties.storeSsn(party.partyId, companyId, encryptSsn(sealed.pii, sealed.ssn, bind))
       )
         throw new PartyBindLost();
+    } else if (intake.proceedWithoutSsn === true) {
+      // §4.6a's second exit: the clock took their number and they have decided to file without
+      // one. Recorded as a FACT on the row, which is what lets the parked filing resume.
+      deps.parties.proceedWithoutSsn(companyId);
     }
   });
   if (frozen) return { error: companyIntakeFrozenMessage() };
@@ -367,6 +381,7 @@ export function updateCompanyIntake(
     tenantId: truncateTenant(tenantId),
     environment: company.environment,
     ssnCaptured: ssn !== undefined,
+    proceedWithoutSsn: intake.proceedWithoutSsn === true,
   });
   return { companyId };
 }

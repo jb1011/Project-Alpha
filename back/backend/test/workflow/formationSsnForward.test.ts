@@ -12,12 +12,12 @@
  *     PARKS for a human rather than sending a different one or re-keying.
  */
 import type DatabaseType from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { type DoolaApi, DoolaApiError } from "../../src/adapters/doola/doolaClient";
 import type { CreateCompanyInput } from "../../src/adapters/doola/types";
 import { createCompany } from "../../src/formation/company";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
-import { type PiiKeyring, parsePiiKey } from "../../src/formation/pii";
+import { type PiiKeyring, encryptSsn, parsePiiKey } from "../../src/formation/pii";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -34,6 +34,7 @@ import {
 
 const TENANT = "0x000000000000000000000000000000000000000A";
 const SSN = "123-45-6789";
+const SSN_2 = "987-65-4321";
 const KEY_A = Buffer.alloc(32, 11).toString("base64");
 const KEY_B = Buffer.alloc(32, 22).toString("base64");
 const RING: PiiKeyring = { current: parsePiiKey(KEY_A, "FORMATION_PII_KEY") };
@@ -43,6 +44,10 @@ let companies: SqliteCompanyRepository;
 let parties: SqliteFormationPartyRepository;
 let requests: SqliteFormationRepository;
 let repo: SqliteEntityRepository;
+let stdout: string[];
+
+/** Every ops line this test's run produced, parsed. */
+const printed = () => stdout.filter((l) => l.includes('"opslog"')).map((l) => JSON.parse(l));
 
 beforeEach(() => {
   db = openDatabase(":memory:");
@@ -51,8 +56,15 @@ beforeEach(() => {
   parties = new SqliteFormationPartyRepository(db);
   requests = new SqliteFormationRepository(db);
   repo = new SqliteEntityRepository(db);
+  stdout = [];
+  vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    stdout.push(args.map(String).join(" "));
+  });
 });
-afterEach(() => db.close());
+afterEach(() => {
+  vi.restoreAllMocks();
+  db.close();
+});
 
 function newParty(country = "USA"): string {
   return parties.create({
@@ -315,4 +327,67 @@ test("a REJECTED create releases the key, and the next attempt recomputes from t
   await file(companyId, api);
   expect(api.bodies[0]!.responsibleParty.ssn).toBe(SSN);
   expect(detailOf(companyId).companySentAttempt).toBe(1);
+});
+
+// ── §4.6a: the CLOCK took it BEFORE the first send ─────────────────────────────────────────
+
+test("a TTL-erased SSN and a first send PARKS — it does not quietly file without one", async () => {
+  // The two ways a company reaches its first send with no SSN look identical in `detail`: the
+  // caller never supplied one, or the caller supplied one and the seven-day clock destroyed it
+  // while the filing sat parked. They are completely different filings — the second files a US
+  // person under the slow EIN route they explicitly opted out of, weeks later, silently — so the
+  // row's `ssn_erased_reason` is what tells them apart.
+  const companyId = mint({ ssn: SSN });
+  parties.eraseSsn(companyId, "ttl");
+
+  const api = doola();
+  await file(companyId, api);
+
+  expect(api.bodies).toHaveLength(0);
+  const row = rowOf(companyId);
+  expect(row.state).toBe("failed");
+  // NO ATTEMPT BURNED: nothing was sent, so the idempotency key is untouched and the filing can
+  // still go out under it once a human has answered.
+  expect(row.attempt).toBe(0);
+  expect(row.error).toMatch(/retention clock erased it before the filing was ever sent/);
+  // The operator surface, and it is its OWN event: an unreadable blob wants an engineer, this
+  // wants the company's owner.
+  expect(printed().find((l) => l.opslog === "formation_ssn_erased_before_send")).toMatchObject({
+    severity: "CRITICAL",
+    companyId,
+    reason: "ssn_erased_before_send",
+  });
+  // (`recordCompanyEvent` fans the same sentence out over every AGENT attached to the company —
+  // there are none in this fixture, so the ops line and the `error` column are the whole surface.)
+});
+
+test("EXIT 1 — a re-supplied SSN un-parks it, and the body carries the new number", async () => {
+  const companyId = mint({ ssn: SSN });
+  const partyId = parties.findByCompanyId(companyId)!.partyId;
+  parties.eraseSsn(companyId, "ttl");
+  await file(companyId, doola());
+
+  // The PATCH's re-capture: `storeSsn` clears the reason with the same statement that writes the
+  // ciphertext, which is what makes "the clock took it" un-sayable of a row that holds one.
+  parties.storeSsn(partyId, companyId, encryptSsn(RING, SSN_2, { partyId, companyId }));
+
+  const api = doola();
+  await file(companyId, api);
+  expect(api.bodies).toHaveLength(1);
+  expect(api.bodies[0]!.responsibleParty.ssn).toBe(SSN_2);
+});
+
+test("EXIT 2 — 'proceed without one' un-parks it, and the body has NO ssn key", async () => {
+  const companyId = mint({ ssn: SSN });
+  parties.eraseSsn(companyId, "ttl");
+  await file(companyId, doola());
+
+  // The owner's decision, recorded as a fact on the row rather than as a flag somewhere else.
+  expect(parties.proceedWithoutSsn(companyId)).toBe(true);
+
+  const api = doola();
+  await file(companyId, api);
+  expect(api.bodies).toHaveLength(1);
+  expect("ssn" in api.bodies[0]!.responsibleParty).toBe(false);
+  expect(detailOf(companyId).ssnIncluded).toBe(false);
 });

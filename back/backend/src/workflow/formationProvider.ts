@@ -189,6 +189,32 @@ export function ssnUnreadableError(): string {
 }
 
 /**
+ * A filing that has STOPPED and needs a human, with the ops event an operator greps for.
+ *
+ * The event is part of the answer rather than derived from the reason at the log line, because
+ * the two parks want different people: `formation_ssn_unreadable` is a lost key or a bug and
+ * wants an engineer, `formation_ssn_erased_before_send` is the retention promise working exactly
+ * as written and wants the company's OWNER.
+ */
+interface ParkedSsn {
+  park: string;
+  reason: string;
+  event: "formation_ssn_unreadable" | "formation_ssn_erased_before_send";
+}
+
+/**
+ * The refusal when the seven-day clock erased an SSN BEFORE the filing ever went out (§4.6a).
+ *
+ * Not an error, and nothing is wrong with doola: the retention promise did exactly what it says.
+ * But the two ways to proceed are a product decision the owner has to make — supply the number
+ * again, or accept the slower SS-4 route — and filing without one is neither. It parks without
+ * burning an attempt, because nothing was sent.
+ */
+export function ssnErasedBeforeSendError(): string {
+  return "this filing was given an SSN, and the 7-day retention clock erased it before the filing was ever sent — sending now would file under the slow EIN route the applicant did not choose. Re-supply the SSN, or confirm you want to proceed without one, through PATCH /companies/:companyId";
+}
+
+/**
  * The two idempotency keys of one attempt — one per ENDPOINT (C1 hardening).
  *
  * The customer create and the company create are different requests with different bodies, and a
@@ -378,7 +404,11 @@ async function runStep(d: FormationCreateDeps, row: FormationRequestRecord): Pro
       "formationCreate",
       `formation create parked: ${resolved.reason}`,
     );
-    opsLog("formation_ssn_unreadable", {
+    // The event NAME distinguishes the two parks, because an operator greps by name and the two
+    // have different answers: `unreadable` is a key or a bug and needs an engineer, while
+    // `erased_before_send` is the retention promise working as designed and needs the OWNER to
+    // choose between re-supplying the number and the slower route.
+    opsLog(resolved.event, {
       level: "error",
       severity: "CRITICAL",
       companyId,
@@ -564,7 +594,7 @@ function resolveSsn(
   row: FormationRequestRecord,
   detail: CreateProviderDetail,
   party: FormationPartyRecord,
-): { ssn?: Secret; expedited: boolean } | { park: string; reason: string } {
+): { ssn?: Secret; expedited: boolean } | ParkedSsn {
   const companyId = d.company.companyId;
   // The SHARED predicate, not a local re-spelling of it: the PATCH door asks the same question of
   // the same row in SQL, and two spellings of the idempotency contract is one spelling too many.
@@ -582,10 +612,24 @@ function resolveSsn(
     ? Boolean(detail.expedited)
     : isNonUsResponsibleParty({ hasSsn: ssnIncluded, country: party.country });
 
-  if (!ssnIncluded) return { expedited };
+  if (!ssnIncluded) {
+    // NOT frozen, no stored SSN — and the clock is why. See the block comment above: filing now
+    // would quietly send a body the caller did not choose.
+    if (!frozen && party.ssnErasedReason === "ttl")
+      return {
+        park: ssnErasedBeforeSendError(),
+        reason: "ssn_erased_before_send",
+        event: "formation_ssn_erased_before_send",
+      };
+    return { expedited };
+  }
   // Frozen WITH an SSN, and the row no longer has one (or this box has lost the key).
   if (!stored || !d.pii)
-    return { park: ssnUnreadableError(), reason: stored ? "ssn_no_key" : "ssn_erased" };
+    return {
+      park: ssnUnreadableError(),
+      reason: stored ? "ssn_no_key" : "ssn_erased",
+      event: "formation_ssn_unreadable",
+    };
   try {
     return {
       // Decrypted HERE, at send time, and held for the length of the call and no longer. A
@@ -597,7 +641,11 @@ function resolveSsn(
   } catch {
     // The message is deliberately NOT propagated: it names a key id, which is fine, but the catch
     // is broad and this is the one path where a stack could carry ciphertext.
-    return { park: ssnUnreadableError(), reason: "ssn_undecryptable" };
+    return {
+      park: ssnUnreadableError(),
+      reason: "ssn_undecryptable",
+      event: "formation_ssn_unreadable",
+    };
   }
 }
 
