@@ -123,13 +123,17 @@ export interface SsnRetentionRow {
   partyId: string;
   companyId: string;
   /**
-   * When the SSN was captured, as a SQLite UTC TEXT.
+   * When the SSN was captured, as a SQLite UTC TEXT — `formation_parties.ssn_captured_at`.
    *
-   * The COMPANY's `created_at`, deliberately, and it is exact rather than an approximation: the
-   * SSN rides the same request that mints the company (§4.1), so the two happen in one
-   * transaction. The party's own `created_at` would be wrong — it predates the company by
-   * however long the caller took to fill in the second form — and a fifth `ssn_*` column would
-   * be a second source of truth for a fact the company row already states.
+   * It used to be the COMPANY's `created_at`, on the argument that the SSN rides the same
+   * request that mints the company. That is true of the FIRST capture and false of every other
+   * one: §4.7's edit-and-retry captures a fresh number onto a company that may be a week old, and
+   * a clock keyed to the company row would erase it on the next sweep — deleting, within minutes,
+   * a number the caller had just been asked for and believes is in flight. The clock has to run
+   * from the CAPTURE, so the capture is what the column records.
+   *
+   * Rows written before the column existed have NULL, and the query falls back to the company's
+   * `created_at`: the same answer those rows have always had.
    */
   capturedAt: string;
   companyStatus: CompanyStatus;
@@ -309,9 +313,14 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
       storeSsn: db.prepare(
         `UPDATE formation_parties
             SET ssn_ciphertext = @ciphertext, ssn_iv = @iv, ssn_key_id = @key_id,
+                -- THE CLOCK STARTS HERE, on every capture including a re-capture (§4.6a).
+                ssn_captured_at = CURRENT_TIMESTAMP,
                 -- Cleared, not kept: the one path that writes over an erased row is the §4.7
-                -- re-capture, and a live ciphertext under an "erased on" stamp is a lie.
-                ssn_deleted_at = NULL
+                -- re-capture, and a live ciphertext under an "erased on" stamp is a lie. The
+                -- reason goes with it — a row that HOLDS an SSN has no explanation to give for
+                -- why it does not.
+                ssn_deleted_at = NULL,
+                ssn_erased_reason = NULL
           WHERE party_id = @party_id AND company_id = @company_id
             AND deleted_at IS NULL
             -- WRITE-ONCE while one exists. A second SSN for a live filing would change the body
@@ -328,7 +337,11 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
                 ssn_deleted_at = CURRENT_TIMESTAMP,
                 -- WHY, on the row, in the same statement that destroys the value. Two writes
                 -- would be two chances to record one and not the other.
-                ssn_erased_reason = @reason
+                ssn_erased_reason = @reason,
+                -- The capture clock ends with the value it timed. Leaving it would make a
+                -- re-capture's freshness ambiguous, and ssn_deleted_at already records the
+                -- other end of the interval.
+                ssn_captured_at = NULL
           WHERE company_id = @company_id AND deleted_at IS NULL AND ssn_ciphertext IS NOT NULL`,
       ),
       // Only rows that still HOLD an SSN — a handful at any moment, being exactly the companies
@@ -336,7 +349,9 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
       ssnRetention: db.prepare(
         `SELECT p.party_id      AS party_id,
                 p.company_id    AS company_id,
-                c.created_at    AS captured_at,
+                -- The CAPTURE, falling back to the company for rows written before the column
+                -- existed — which is the clock those rows have always been judged by.
+                COALESCE(p.ssn_captured_at, c.created_at) AS captured_at,
                 c.status        AS company_status,
                 f.state         AS create_state,
                 f.provider_ref  AS provider_ref,

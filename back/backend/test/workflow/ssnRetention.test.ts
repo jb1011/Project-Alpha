@@ -57,8 +57,9 @@ afterEach(() => {
 /**
  * A company holding an SSN, captured `ageMs` ago.
  *
- * The company's `created_at` IS the capture time (§4.6a): the SSN rides the same request that
- * mints the company, so the two are one transaction and no fifth column is needed to say so.
+ * Both clocks are backdated together, because the ordinary case is that they agree: the SSN rides
+ * the same request that mints the company. `ssn_captured_at` is the one the sweeper reads, and
+ * `recaptured` below is the case where they DISAGREE.
  */
 function holding(ageMs: number): { partyId: string; companyId: string } {
   const partyId = parties.create({
@@ -92,6 +93,10 @@ function holding(ageMs: number): { partyId: string; companyId: string } {
   );
   parties.bindToCompany(partyId, companyId, TENANT);
   parties.storeSsn(partyId, companyId, encryptSsn(RING, SSN, { partyId, companyId }));
+  db.prepare("UPDATE formation_parties SET ssn_captured_at = ? WHERE party_id = ?").run(
+    sqliteUtcTimestamp(NOW - ageMs),
+    partyId,
+  );
   return { partyId, companyId };
 }
 
@@ -114,6 +119,12 @@ function sweeper(): FormationSweeper {
 }
 
 const held = (companyId: string) => parties.findSsnByCompanyId(companyId) !== undefined;
+const capturedAtOn = (partyId: string) =>
+  (
+    db.prepare("SELECT ssn_captured_at FROM formation_parties WHERE party_id = ?").get(partyId) as {
+      ssn_captured_at: string | null;
+    }
+  ).ssn_captured_at;
 const reasonOn = (companyId: string) =>
   (
     db
@@ -169,6 +180,38 @@ test("an SSN older than 7 days whose filing NEVER started is erased", async () =
   expect(reasonOn(companyId)).toBe("ttl");
   // The company itself is UNTOUCHED — no clock manufactures `abandoned` (§4.6a).
   expect(companies.find(companyId)!.status).toBe("ready");
+});
+
+test("a RE-CAPTURED SSN starts a FRESH clock — the company's age is not the SSN's age", async () => {
+  // The bug this pins: the clock used to read `companies.created_at`, which is the moment the
+  // company was minted and NOT the moment the number was supplied. §4.7's edit-and-retry captures
+  // a new SSN onto a company that may be a week old, so the very next sweep — minutes later —
+  // erased a number the caller had just been asked for and believed was in flight.
+  const { partyId, companyId } = holding(SSN_MAX_AGE_MS + DAY);
+  const wasCapturedAt = capturedAtOn(partyId);
+  // The re-capture: erase, then store, exactly as `updateCompanyIntake` does it.
+  parties.eraseSsn(companyId, "intake_reopened");
+  parties.storeSsn(partyId, companyId, encryptSsn(RING, SSN, { partyId, companyId }));
+  // `storeSsn` re-stamped the clock — that is the whole mechanism.
+  expect(capturedAtOn(partyId)).not.toBe(wasCapturedAt);
+  // Pinned to the sweeper's clock rather than the wall clock, so the assertion below is about
+  // the RULE and not about what today's date happens to be.
+  db.prepare("UPDATE formation_parties SET ssn_captured_at = ? WHERE party_id = ?").run(
+    sqliteUtcTimestamp(NOW - DAY),
+    partyId,
+  );
+
+  await sweeper().tick();
+
+  expect(held(companyId)).toBe(true);
+  // The company is still eight days old; only the SSN is new.
+  expect(
+    (
+      db.prepare("SELECT created_at FROM companies WHERE company_id = ?").get(companyId) as {
+        created_at: string;
+      }
+    ).created_at,
+  ).toBe(sqliteUtcTimestamp(NOW - (SSN_MAX_AGE_MS + DAY)));
 });
 
 test("a YOUNG SSN is kept, however open the filing is", async () => {
