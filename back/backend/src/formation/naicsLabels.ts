@@ -14,21 +14,23 @@ import { NAICS_LABELS } from "./naicsLabelsData";
  * cache with a TTL nobody specified and a staleness nobody can observe. The list is a federal
  * reference table that changes about as often as NAICS itself does, so it belongs in the build.
  *
- * ── STATE OF THE LIST (2026-08-31) ─────────────────────────────────────────────────────────
+ * ── STATE OF THE LIST (2026-09-07) ─────────────────────────────────────────────────────────
  *
- * It holds the ONE label that has actually been verified against doola's reference endpoint
- * (live sandbox 2026-08-21, maps to NAICS 541511) — because no sandbox key was available when A2
- * was written, and a list of plausible-looking labels is worse than a short true one: an
- * unverified label passes our validation, reaches doola, and comes back `rejected`, which burns
- * an attempt on a company a human then has to look at.
+ * doola's FULL reference table, 821 labels, pulled from the live sandbox
+ * (`GET /references/naics-codes`) by `scripts/refresh-naics.mts` on 2026-09-07. Before that
+ * refresh the array held the single label verified by hand in A1 ("Software development", live
+ * sandbox 2026-08-21, NAICS 541511), because a list of plausible-looking labels is worse than a
+ * short true one: an unverified label passes our validation, reaches doola, and comes back
+ * `rejected`, which burns an attempt on a company a human then has to look at.
  *
- * The OpenAPI document's example for `industry` is "Custom Computer Programming Services" (the
- * official NAICS 541511 title). It is deliberately NOT in the array: it is a documentation
- * example, not an observed value of the reference table, and the same code already answers to
- * "Software development".
+ * Every label in the array is therefore a value doola itself published, not a guess and not a
+ * documentation example — the OpenAPI document's `industry` sample ("Custom Computer Programming
+ * Services", the official NAICS 541511 title) is in the array only if doola's own table has it.
  *
- * **Run the refresher before A3 ships the industry picker** — until then the picker has one
- * option, which is honest but not a product.
+ * A3's industry picker reads the list from `GET /formation/industries`, which serves this array
+ * verbatim. That is a separate route rather than a field on `/config` deliberately: `/config` is
+ * unauthenticated, fetched by every page in the interface, and cached for the life of the tab —
+ * 821 labels on it would be ~20 KB paid for by the landing page to serve one form.
  */
 
 export { NAICS_LABELS };

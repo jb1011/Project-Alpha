@@ -11,6 +11,7 @@ import { mountConnectionRoutes } from "./routes/connection";
 import { mountDocumentRoutes } from "./routes/documents";
 import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
+import { mountIndustryRoutes } from "./routes/industries";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
@@ -207,6 +208,10 @@ export function buildApiApp(deps: ApiDeps) {
     }),
   );
   mountSchemaRoutes(app);
+  // Public, like `/schema` and for the same reason: a build-time reference table the wizard's
+  // create-company form reads, carrying nothing about this deployment. See the route for why it
+  // is not a `/config` field.
+  mountIndustryRoutes(app);
   // PUBLIC, and necessarily so: doola authenticates with an HMAC over the body, not with our JWT.
   // Mounted BEFORE the /entities auth middleware for the same reason every other public route is,
   // and gated on the credentials that make verification possible at all.
