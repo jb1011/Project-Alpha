@@ -1,15 +1,19 @@
 import { readFileSync } from "node:fs";
 import {
+  BaseError,
   BlockNotFoundError,
   ContractFunctionExecutionError,
   ContractFunctionRevertedError,
+  EstimateGasExecutionError,
   ExecutionRevertedError,
+  InsufficientFundsError,
   TransactionReceiptNotFoundError,
   decodeFunctionData,
   encodeErrorResult,
   keccak256,
   toFunctionSelector,
 } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, test } from "vitest";
 import { ContractRevertError } from "../../src/adapters/arc/relay";
 import {
@@ -72,6 +76,8 @@ describe("verifier chain pin (design v3 §1.3, audit H1)", () => {
 
 /** A funded-looking key that exists only in this file; it never signs anything real. */
 const TEST_KEY = `0x${"ab".repeat(32)}` as const;
+/** The same account the registrar derives, for the errors viem stamps an account into. */
+const SUBMITTER = privateKeyToAccount(TEST_KEY);
 const REGISTER_ARGS = {
   agent: AGENT,
   root: 2n,
@@ -231,17 +237,38 @@ describe("signRegister", () => {
 
   test("a revert found during gas estimation is classified, not leaked as viem prose", async () => {
     // Simulate passed, then the world moved (someone else registered this agent) and
-    // `prepareTransactionRequest`'s estimate reverts. That is deterministic: retrying cannot fix it.
+    // `prepareTransactionRequest`'s estimate reverts. That is deterministic: retrying cannot fix
+    // it. Shaped the way viem raises it — the revert nested inside the estimate error.
     const registrar = registrarWith(
       readClientThatRefusesToSend,
       walletStub({
         prepareTransactionRequest: () =>
-          Promise.reject(new ExecutionRevertedError({ message: "execution reverted: 0xdeadbeef" })),
+          Promise.reject(
+            new EstimateGasExecutionError(
+              new ExecutionRevertedError({ message: "execution reverted: 0xdeadbeef" }),
+              { account: SUBMITTER },
+            ),
+          ),
       }),
     );
     const err = await registrar.signRegister(REGISTER_ARGS).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ContractRevertError);
     expect((err as Error).message).toBe("AgentBook.register reverted: unknown");
+  });
+
+  test("an estimate that failed for want of GAS MONEY is not a revert", async () => {
+    // A drained submitter is an operations problem: the route turns transport-shaped failures into
+    // a 503 and checks the balance separately. Calling it a revert would tell the reconciler the
+    // proof is bad and stop it retrying a registration that only needs the wallet topped up.
+    const broke = new EstimateGasExecutionError(
+      new InsufficientFundsError({ cause: new BaseError("insufficient funds for gas * price") }),
+      { account: SUBMITTER },
+    );
+    const registrar = registrarWith(
+      readClientThatRefusesToSend,
+      walletStub({ prepareTransactionRequest: () => Promise.reject(broke) }),
+    );
+    await expect(registrar.signRegister(REGISTER_ARGS)).rejects.toBe(broke);
   });
 });
 

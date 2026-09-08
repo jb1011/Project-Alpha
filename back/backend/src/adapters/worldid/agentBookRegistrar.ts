@@ -5,7 +5,6 @@ import {
   BaseError,
   type Chain,
   ContractFunctionRevertedError,
-  EstimateGasExecutionError,
   ExecutionRevertedError,
   type Hex,
   type PublicClient,
@@ -135,11 +134,14 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
         { cause: e },
       );
     // Gas estimation reverts too, and it does so with no ABI in hand: the node just says
-    // "execution reverted". No name is recoverable, but the failure is every bit as deterministic
-    // as a decoded one — the class, not the name, is what the caller acts on.
-    const bare = e.walk(
-      (x) => x instanceof ExecutionRevertedError || x instanceof EstimateGasExecutionError,
-    );
+    // "execution reverted", which viem raises as `ExecutionRevertedError`. No name is recoverable,
+    // but the failure is every bit as deterministic as a decoded one — the class, not the name, is
+    // what the caller acts on. Only that class: an estimate can also fail for want of gas money or
+    // too little intrinsic gas, and viem wraps ALL of them in `EstimateGasExecutionError`. Those
+    // are the submitter's problem, not the proof's — matching the wrapper would tell the
+    // reconciler to stop retrying a registration that just needs the wallet topped up, so they
+    // stay transport-shaped and travel on unchanged.
+    const bare = e.walk((x) => x instanceof ExecutionRevertedError);
     if (bare)
       return new ContractRevertError("AgentBook.register reverted: unknown", undefined, {
         cause: e,
