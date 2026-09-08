@@ -182,6 +182,12 @@ const EnvSchema = z.object({
   WORLD_AGENTBOOK_ADDRESS: addressSchema.default("0xA23aB2712eA7BBa896930544C7d6636a96b944dA"),
   WORLD_ALLOWANCE_PER_HUMAN: z.coerce.number().int().nonnegative().default(3),
   WORLD_ENVIRONMENT: z.enum(["production", "staging", "sandbox"]).default("production"),
+  /** AgentBook registration (design 2026-08-25 v3 §4.2). The submitter holds World Chain ETH only.
+   *  No fallback to any other key: the equality invariant below refuses boot. */
+  WORLDCHAIN_SUBMITTER_PRIVATE_KEY: privKeySchema.optional(),
+  /** Write endpoint for registrations; defaults to WORLD_CHAIN_RPC. Lets ops pin a paid key for
+   *  writes without exposing it to the read path. */
+  WORLDCHAIN_SUBMITTER_RPC: z.string().url().optional(),
   /** Identity-Check step-up. Absent -> the whole attestation surface stays unmounted, so merging
    *  the feature is a no-op until this is deliberately set. */
   WORLD_ATTEST_ACTION: z.string().optional(),
@@ -377,6 +383,8 @@ export interface Config {
     agentBook: Address;
     allowancePerHuman: number;
   };
+  /** Present iff WORLDCHAIN_SUBMITTER_PRIVATE_KEY is set. Registration also needs `world`. */
+  agentBook?: { submitterPrivateKey: Hex; rpcUrl: string };
   /** Ops webhook for monitor alerts. SECRET (bearer credential in the URL) — see redact(). */
   alertWebhookUrl?: string;
   /** Controller monitoring (design §8). Optional in the TYPE only, for the same reason as
@@ -471,6 +479,14 @@ export function canProvisionTurnkey(cfg: Pick<Config, "turnkey">): boolean {
  *  advertised availability can never drift apart. Credential-less deployments keep the stub. */
 export function canFormEntities(cfg: Pick<Config, "doola">): boolean {
   return Boolean(cfg.doola);
+}
+
+/** The one definition of "this deployment can write AgentBook registrations": a submitter key AND
+ *  the World portal block (the Orb gate reads `WorldStore`). Twin of `canFormEntities`: main.ts
+ *  builds the AgentBook deps iff this is true, and `GET /config` and the route mount reflect
+ *  whether those deps exist — so the boot gate and the advertised availability cannot drift. */
+export function canRegisterAgentBook(cfg: Pick<Config, "agentBook" | "world">): boolean {
+  return Boolean(cfg.agentBook && cfg.world);
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -602,6 +618,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       agentBook: e.WORLD_AGENTBOOK_ADDRESS,
       allowancePerHuman: e.WORLD_ALLOWANCE_PER_HUMAN,
     },
+    agentBook: e.WORLDCHAIN_SUBMITTER_PRIVATE_KEY
+      ? {
+          submitterPrivateKey: e.WORLDCHAIN_SUBMITTER_PRIVATE_KEY,
+          rpcUrl: e.WORLDCHAIN_SUBMITTER_RPC ?? e.WORLD_CHAIN_RPC,
+        }
+      : undefined,
     alertWebhookUrl: e.ALERT_WEBHOOK_URL,
     monitor: {
       pollSec: e.MONITOR_POLL_SEC,
@@ -655,6 +677,33 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
 
   const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
+
+  // AgentBook (design 2026-08-25 v3 §4.2). The submitter is a SINGLE-PURPOSE key holding World
+  // Chain gas: sharing it with a platform signer would put a key that moves USDC on Arc into a
+  // hot path on another chain. Checked in EVERY environment — the reuse is as wrong on a dev box.
+  if (cfg.agentBook) {
+    const others: Array<[string, string | undefined]> = [
+      ["PLATFORM_PRIVATE_KEY", cfg.platformPrivateKey],
+      ["CUSTOMER_PRIVATE_KEY", cfg.customerPrivateKey],
+      ["OPERATOR_PRIVATE_KEY", cfg.operatorPrivateKey],
+      ["JOB_CLIENT_PRIVATE_KEY", cfg.jobClientPrivateKey],
+      ["JOB_EVALUATOR_PRIVATE_KEY", cfg.jobEvaluatorPrivateKey],
+      ["X402_PROOF_AGENT_KEY", cfg.x402ProofAgentKey],
+    ];
+    const sub = cfg.agentBook.submitterPrivateKey.toLowerCase();
+    for (const [name, value] of others) {
+      if (value && value.toLowerCase() === sub)
+        throw new Error(
+          `Invalid config: WORLDCHAIN_SUBMITTER_PRIVATE_KEY must not equal ${name} — the submitter holds World Chain gas only`,
+        );
+    }
+    // A half-configured feature is worse than an absent one: the key would sit funded and unused
+    // while the surface it pays for stays unmounted.
+    if (isProd && !cfg.world)
+      throw new Error(
+        "Invalid config: WORLDCHAIN_SUBMITTER_PRIVATE_KEY is set but the WORLD_* portal block is absent — a half-configured AgentBook feature is refused in production",
+      );
+  }
 
   // Fail-closed: never let production boot with the insecure dev defaults.
   if (isProd) {
@@ -901,6 +950,11 @@ export function redact(cfg: Config): Record<string, unknown> {
     jobClientPrivateKey: "REDACTED",
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
     x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
+    // The World Chain submitter key: gas-only, but still key material and never a log line. The
+    // RPC survives on purpose — it is the first thing an operator checks when a write stalls.
+    agentBook: cfg.agentBook
+      ? { submitterPrivateKey: "REDACTED", rpcUrl: cfg.agentBook.rpcUrl }
+      : undefined,
     // The API key files real companies and the webhook secret authenticates inbound state changes:
     // both are bearer credentials, and neither may ever reach a log line.
     doola: cfg.doola
