@@ -157,7 +157,11 @@ export function LegalBodyStep({
     mode: effectiveMode,
     attachable,
     selected,
-  } = legalBodyBranch(companies.data?.companies ?? [], mode, picked);
+    // ⚠ `companies.data?.companies` and NOT `?? []`: an unresolved list is a third mode, not an
+    // empty one. With `?? []` a returning user with four companies got the CREATE form first — a
+    // full intake, an industry type-ahead and, on production, a request for their Social Security
+    // Number — and watched it be replaced by a picker the moment the list arrived.
+  } = legalBodyBranch(companies.data?.companies, mode, picked);
 
   const industries = useIndustriesQuery(resolved && effectiveMode === "create");
   const industryOptions = industries.data?.industries ?? [];
@@ -216,7 +220,9 @@ export function LegalBodyStep({
         title={legalBodyTitle({
           environment: attachedEnvironment,
           attached: companyId !== null,
-          mode: effectiveMode,
+          // While the list is loading the header claims no branch: `attach` is the honest
+          // placeholder for "we have not asked yet", and the panel below says so out loud.
+          mode: effectiveMode === "create" ? "create" : "attach",
         })}
         intro={
           !resolved
@@ -238,11 +244,15 @@ export function LegalBodyStep({
         <UnresolvedPanel environment={environment} retrying={retrying} onRetry={retry} />
       ) : (
         <div className="flex flex-col gap-6">
-          {attachable.length > 0 && (
+          {/* The tabs appear once the list has ANSWERED and there is something to attach to —
+              never while it is loading, or the mode they highlight is a guess. */}
+          {effectiveMode !== "loading" && attachable.length > 0 && (
             <ModeTabs mode={effectiveMode} count={attachable.length} onMode={setMode} />
           )}
 
-          {effectiveMode === "attach" ? (
+          {effectiveMode === "loading" ? (
+            <LoadingCompaniesPanel />
+          ) : effectiveMode === "attach" ? (
             <AttachPicker
               companies={attachable}
               selected={selected}
@@ -353,6 +363,11 @@ export function LegalBodyStep({
           // Neutral: no create, no attach, no skip — just the way to ask again.
           <Button variant="ghost" loading={retrying} onClick={retry}>
             {environment === "loading" ? "Checking…" : "Retry"}
+          </Button>
+        ) : effectiveMode === "loading" ? (
+          // Neither action is offered while we do not know whether there is anything to attach to.
+          <Button disabled loading>
+            Loading your companies…
           </Button>
         ) : effectiveMode === "attach" ? (
           <Button
@@ -521,6 +536,31 @@ function AttachedPanel({
       >
         Use a different company
       </button>
+    </Card>
+  );
+}
+
+/**
+ * The company list has not resolved yet — so this screen offers NEITHER branch.
+ *
+ * The create form is a consequential default: it is the paying path, it asks for a full company
+ * intake and, on production, for a Social Security Number. Showing it while the answer to "do you
+ * already own a company?" is still in flight put a returning user in front of a fee they did not
+ * need to pay, and then swapped the screen out from under them — losing whatever they had typed
+ * from view — the moment their four companies arrived.
+ */
+function LoadingCompaniesPanel() {
+  return (
+    <Card className="p-6">
+      <div className="flex items-center gap-2.5 text-[13px] text-muted">
+        <Spinner className="h-3.5 w-3.5" />
+        Looking for companies you already own…
+      </div>
+      <p className="mt-3 text-[12.5px] leading-[1.6] text-muted-2">
+        Attaching a new agent to a company you already have is free, so this screen asks that
+        question before it offers to create one. Nothing has been recorded and nothing has been
+        sent.
+      </p>
     </Card>
   );
 }

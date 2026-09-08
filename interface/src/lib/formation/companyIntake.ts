@@ -198,17 +198,28 @@ export function companyLabel(company: Pick<CompanyView, "legalNameFiled" | "name
  *     re-sorted here. An explicit pick wins, and a pick that is no longer attachable (the list
  *     refreshed, the company was abandoned) falls back rather than pointing at a row that is not
  *     on screen.
+ *
+ * ⚠ `undefined` companies means the LIST HAS NOT RESOLVED, and it is a third mode rather than an
+ * empty list. It was `companies.data?.companies ?? []`, so a returning user with four companies
+ * got the CREATE form first — a full intake form, an industry type-ahead and, on production, a
+ * request for their Social Security Number — and then watched it be replaced by a picker the
+ * moment the list arrived. Everything typed in the meantime is still in state but no longer on
+ * screen, and the free path was hidden behind a fee at exactly the moment the choice was made.
+ * "No companies yet" and "we have not asked yet" are different facts, and only the first is a
+ * reason to show a create form.
+ *
+ * A mode the caller CHOSE still wins, loading or not: a click is an answer, and a list arriving
+ * afterwards must not overrule it.
  */
 export function legalBodyBranch(
-  companies: readonly CompanyView[],
+  /** `undefined` = the list has not resolved. An empty array is a resolved answer. */
+  companies: readonly CompanyView[] | undefined,
   chosenMode: "attach" | "create" | null,
   pickedCompanyId: string | null,
-): { mode: "attach" | "create"; attachable: CompanyView[]; selected: string | null } {
-  const attachable = companies.filter(canAttach);
+): { mode: "attach" | "create" | "loading"; attachable: CompanyView[]; selected: string | null } {
+  const attachable = (companies ?? []).filter(canAttach);
   const picked = attachable.some((c) => c.companyId === pickedCompanyId) ? pickedCompanyId : null;
-  return {
-    mode: chosenMode ?? (attachable.length > 0 ? "attach" : "create"),
-    attachable,
-    selected: picked ?? attachable[0]?.companyId ?? null,
-  };
+  const mode =
+    chosenMode ?? (companies === undefined ? "loading" : attachable.length > 0 ? "attach" : "create");
+  return { mode, attachable, selected: picked ?? attachable[0]?.companyId ?? null };
 }

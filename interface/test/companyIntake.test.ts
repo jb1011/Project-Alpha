@@ -195,3 +195,25 @@ test("BRANCH: a pick that is no longer attachable FALLS BACK rather than pointin
   expect(legalBodyBranch(rows, null, "gone").selected).toBe("usable");
   expect(legalBodyBranch([], null, "gone").selected).toBeNull();
 });
+
+test("BRANCH: an UNRESOLVED list is `loading` — never the create form", () => {
+  // The bug: the step passed `companies.data?.companies ?? []`, so a returning user with four
+  // companies got the CREATE form first — a full intake, an industry type-ahead and, on
+  // production, a request for their Social Security Number — and watched it be replaced by a
+  // picker the moment the list arrived. "No companies yet" and "we have not asked yet" are
+  // different facts, and only the first is a reason to show a create form.
+  expect(legalBodyBranch(undefined, null, null).mode).toBe("loading");
+  // An EMPTY list is a resolved answer, and it does mean create.
+  expect(legalBodyBranch([], null, null).mode).toBe("create");
+});
+
+test("BRANCH: a mode the caller CHOSE sticks, loading or not — a click is an answer", () => {
+  expect(legalBodyBranch(undefined, "create", null).mode).toBe("create");
+  expect(legalBodyBranch(undefined, "attach", null).mode).toBe("attach");
+});
+
+test("BRANCH: an unresolved list offers nothing to attach to and selects nothing", () => {
+  const branch = legalBodyBranch(undefined, null, "some-company");
+  expect(branch.attachable).toEqual([]);
+  expect(branch.selected).toBeNull();
+});
