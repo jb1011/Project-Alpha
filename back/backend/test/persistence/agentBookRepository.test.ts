@@ -74,6 +74,19 @@ test("transition reports whether this caller won", () => {
   expect(repo.transition("s1", "pending", "expired")).toBe(true);
 });
 
+test("confirming clears the last-attempt error, failing keeps it", () => {
+  session({ sessionId: "s1" });
+  repo.claimSubmit("s1", { nullifier: "0x1", rawTx: "0x02", submitterNonce: 1 });
+  repo.bumpAttempt("s1", "RpcTimeout");
+  expect(repo.transition("s1", "submitted", "confirmed", { confirmedBlock: 100 })).toBe(true);
+  expect(repo.findBySession("s1")).toMatchObject({ errorCode: null, attempt: 1 });
+
+  session({ sessionId: "s2", entityKey: "agent-2" });
+  repo.claimSubmit("s2", { nullifier: "0x2", rawTx: "0x02", submitterNonce: 2 });
+  expect(repo.transition("s2", "submitted", "failed", { errorCode: "reverted" })).toBe(true);
+  expect(repo.findBySession("s2")).toMatchObject({ status: "failed", errorCode: "reverted" });
+});
+
 test("per-tenant session count is windowed", () => {
   session({ sessionId: "s1" });
   session({ sessionId: "s2" });

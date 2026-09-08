@@ -60,6 +60,9 @@ export interface AgentBookRepository {
     p: { nullifier: string; rawTx: string; submitterNonce: number },
   ): "won" | "lost" | "inflight";
   setTxHash(sessionId: string, txHash: string): void;
+  /** CAS state move. `errorCode` is the LAST-ATTEMPT diagnostic, meaningful only on a `failed` or
+   *  `disputed` row: a transition to `confirmed` CLEARS it, so a row that succeeded on a retry does
+   *  not keep advertising the transport error that made the earlier attempt fail. */
   transition(
     sessionId: string,
     from: AgentBookStatus,
@@ -129,6 +132,8 @@ export class SqliteAgentBookRepository implements AgentBookRepository {
            (session_id, entity_key, tenant_id, address, nonce, status, expires_at)
          VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
       )
+      // `address` is lowercased here; `tenant_id` is stored as the auth layer gives it (EIP-55
+      // checksummed). The two columns are therefore NEVER directly comparable.
       .run(p.sessionId, p.entityKey, p.tenantId, p.address.toLowerCase(), p.nonce, p.expiresAt);
     const row = this.findBySession(p.sessionId);
     if (!row) throw new Error(`agentbook session ${p.sessionId} vanished after insert`);
@@ -232,11 +237,12 @@ export class SqliteAgentBookRepository implements AgentBookRepository {
     const res = this.db
       .prepare(
         `UPDATE agentbook_registrations
-            SET status = ?, error_code = COALESCE(?, error_code),
+            SET status = ?,
+                error_code = CASE WHEN ? = 'confirmed' THEN NULL ELSE COALESCE(?, error_code) END,
                 confirmed_block = COALESCE(?, confirmed_block), updated_at = CURRENT_TIMESTAMP
           WHERE session_id = ? AND status = ?`,
       )
-      .run(to, patch.errorCode ?? null, patch.confirmedBlock ?? null, sessionId, from);
+      .run(to, to, patch.errorCode ?? null, patch.confirmedBlock ?? null, sessionId, from);
     return res.changes === 1;
   }
 
