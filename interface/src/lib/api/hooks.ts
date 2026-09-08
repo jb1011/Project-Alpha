@@ -370,14 +370,28 @@ export function useIndustriesQuery(enabled = true) {
   });
 }
 
-/** The tenant's companies, NEWEST FIRST — the ordering the picker's default depends on, taken
- *  from the server rather than re-sorted here. */
+/**
+ * The tenant's companies, NEWEST FIRST — the ordering the picker's default depends on, taken from
+ * the server rather than re-sorted here.
+ *
+ * `staleTime` because React Query's default is ZERO, which means every mount of every component
+ * that asks for this list issues a request: the wizard's legal-body step, the Companies page, and
+ * a back-navigation between them. A company list changes when its owner creates or edits one, and
+ * both writers already invalidate this exact key — so a refetch on mount is a request that can
+ * only ever return what the cache is holding.
+ *
+ * Five minutes rather than `Infinity`: the FILING moves without anybody clicking (the sub-saga
+ * runs on its own clock), so a list left open should eventually catch up on its own.
+ */
+export const COMPANY_STALE_MS = 5 * 60 * 1000;
+
 export function useCompaniesQuery(enabled = true) {
   const token = useAuthToken();
   return useQuery({
     queryKey: apiKeys.companies(token ?? ""),
     queryFn: () => listCompanies(token!),
     enabled: enabled && !!token,
+    staleTime: COMPANY_STALE_MS,
   });
 }
 
@@ -409,6 +423,12 @@ export function useCompanyQuery(
     queryKey: apiKeys.company(token ?? "", companyId ?? ""),
     queryFn: () => getCompany(token!, companyId!),
     enabled: (options?.enabled ?? true) && !!token && !!companyId,
+    // Same reasoning as the list, and it matters more here: THREE surfaces mount this query for
+    // the same company (the dashboard's formation card, the wizard's confirm screen, the company
+    // page), and at React Query's default `staleTime: 0` each mount is its own request for a row
+    // the cache already has. The two writers that can change it — the intake edit and the party
+    // edit — invalidate this key by hand.
+    staleTime: COMPANY_STALE_MS,
   });
 }
 
@@ -446,7 +466,20 @@ export function useCreateCompanyMutation() {
     mutationFn: async (intake: CompanyIntakeInput) => createCompany(await ensureToken(), intake),
     onSuccess: async () => {
       const token = await ensureToken();
-      await queryClient.invalidateQueries({ queryKey: apiKeys.companies(token) });
+      // MARK STALE, do not refetch — and do not AWAIT one.
+      //
+      // `invalidateQueries` refetches every ACTIVE observer of the key and returns a promise that
+      // resolves when they have all answered; awaiting it inside `onSuccess` holds
+      // `mutation.isPending` open until then. So the wizard's "Create the company" button stayed
+      // in its loading state through a second round trip for a list the very next screen does not
+      // read — and if that refetch failed, the create looked like it had failed too.
+      //
+      // The list this marks stale is re-read when something mounts it, which is the next time it
+      // is actually looked at.
+      queryClient.invalidateQueries({
+        queryKey: apiKeys.companies(token),
+        refetchType: "none",
+      });
     },
   });
 }
