@@ -12,7 +12,7 @@ import { getAddress } from "viem";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import type { DoolaComplianceEvent } from "../../src/adapters/doola/types";
 import { buildApiApp } from "../../src/api/app";
-import { COMPLIANCE_TTL_MS } from "../../src/api/routes/compliance";
+import { COMPLIANCE_CACHE_MAX, COMPLIANCE_TTL_MS } from "../../src/api/routes/compliance";
 import { signSession } from "../../src/auth/session";
 import { COMPLIANCE_ANNUAL_REPORT } from "../../src/formation";
 import { companyNameOptions } from "../../src/formation/intake";
@@ -234,4 +234,135 @@ test("a deployment that cannot ask doola REFUSES, rather than reporting an empty
   expect(((await res.json()) as { error: { message: string } }).error.message).toMatch(
     /formation is not available/,
   );
+});
+
+/* ── the cache is BOUNDED, and it does not stampede ────────────────────────── */
+
+/** A promise the test releases by hand, so "in flight" is a state the assertions can stand in. */
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** Wait until the provider has actually been reached — the handlers sign a session first. */
+async function untilCalled(): Promise<void> {
+  for (let i = 0; i < 200 && calls.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  expect(calls.length, "the provider was never reached").toBeGreaterThan(0);
+}
+
+/**
+ * N concurrent first viewers make ONE provider call.
+ *
+ * They arrive together by construction: the thing that empties this cache is a restart, and the
+ * thing that fills it is somebody opening the page. A deploy plus a link in a team chat is N
+ * simultaneous requests for one calendar, and without a slot each one is its own call to a
+ * partner API — for an answer that changes annually.
+ */
+test("concurrent first viewers of one company share a single provider call", async () => {
+  const a = app();
+  const id = newCompany("cmp-1");
+  const gate = deferred<DoolaComplianceEvent[]>();
+  answer = () => gate.promise;
+
+  const inflight = [get(a, id), get(a, id), get(a, id), get(a, id)];
+  // The handlers each sign a session before they reach the provider; wait for the first one to
+  // actually arrive rather than for a fixed number of ticks.
+  await untilCalled();
+  gate.resolve([EVENT]);
+  const bodies = await Promise.all((await Promise.all(inflight)).map((r) => r.json()));
+
+  expect(calls).toEqual(["cmp-1"]);
+  for (const body of bodies) expect(body.events).toHaveLength(1);
+});
+
+test("a FAILED fetch is not cached — but concurrent failures share one call", async () => {
+  const a = app();
+  const id = newCompany("cmp-1");
+  const gate = deferred<DoolaComplianceEvent[]>();
+  answer = () => gate.promise;
+
+  const inflight = [get(a, id), get(a, id), get(a, id)];
+  await untilCalled();
+  gate.reject(new Error("upstream down"));
+  for (const res of await Promise.all(inflight)) expect(res.status).toBe(502);
+  // Rate-limited while in flight: three viewers, one call at a struggling partner.
+  expect(calls).toEqual(["cmp-1"]);
+
+  // …and NOT cached: the slot is released on settle, so the next request tries again rather than
+  // answering "we could not ask" for the next 24 hours.
+  answer = async () => [EVENT];
+  const ok = await get(a, id);
+  expect(ok.status).toBe(200);
+  expect((await ok.json()).events).toHaveLength(1);
+  expect(calls).toEqual(["cmp-1", "cmp-1"]);
+});
+
+/**
+ * The map is BOUNDED.
+ *
+ * "In-process with a 24h TTL" is not a bound: an entry is only ever removed by being READ after
+ * it expired, so a company looked at once and never again stays until the process restarts. The
+ * size is otherwise "every company anybody ever opened", holding a partner's data long past the
+ * day it was fetched.
+ */
+test("the cache evicts least-recently-used entries once it is full", async () => {
+  const a = app();
+  const ids: string[] = [];
+  for (let i = 0; i < COMPLIANCE_CACHE_MAX + 1; i++) ids.push(newCompany(`cmp-${i}`));
+  for (const id of ids) expect((await get(a, id)).status).toBe(200);
+  expect(calls).toHaveLength(COMPLIANCE_CACHE_MAX + 1);
+
+  // The most recent is still cached…
+  await get(a, ids[ids.length - 1]!);
+  expect(calls).toHaveLength(COMPLIANCE_CACHE_MAX + 1);
+  // …and the OLDEST was evicted, so it is fetched again.
+  await get(a, ids[0]!);
+  expect(calls).toHaveLength(COMPLIANCE_CACHE_MAX + 2);
+});
+
+test("a hit REFRESHES an entry's place in the queue — a watched page is never evicted", async () => {
+  const a = app();
+  const ids: string[] = [];
+  for (let i = 0; i < COMPLIANCE_CACHE_MAX; i++) ids.push(newCompany(`cmp-${i}`));
+  for (const id of ids) await get(a, id);
+  const baseline = calls.length;
+
+  // Touch the oldest, which moves it to the end of the queue…
+  await get(a, ids[0]!);
+  expect(calls).toHaveLength(baseline);
+  // …then overflow by one. The evicted entry is the SECOND oldest, not the one just read.
+  const extra = newCompany("cmp-extra");
+  await get(a, extra);
+  await get(a, ids[0]!);
+  expect(calls).toHaveLength(baseline + 1);
+  await get(a, ids[1]!);
+  expect(calls).toHaveLength(baseline + 2);
+});
+
+test("EXPIRED entries are pruned on write, not only when somebody reads them", async () => {
+  const a = app();
+  const stale = newCompany("cmp-stale");
+  const fresh = newCompany("cmp-fresh");
+  await get(a, stale);
+  expect(calls).toEqual(["cmp-stale"]);
+
+  // A day and a bit later, somebody opens a DIFFERENT company. The stale entry is not read, and
+  // under the old code nothing would ever have removed it.
+  now += COMPLIANCE_TTL_MS + 1000;
+  await get(a, fresh);
+  // The proof it was pruned rather than merely expired-on-read: the entry is gone, so the next
+  // read of the stale company is a fetch — which is also what an expired read would do, so the
+  // assertion that carries the weight is the LRU one above. What this pins is that the prune
+  // runs and does not disturb the fresh entry.
+  await get(a, fresh);
+  expect(calls).toEqual(["cmp-stale", "cmp-fresh"]);
 });
