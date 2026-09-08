@@ -5,6 +5,8 @@ import {
   BaseError,
   type Chain,
   ContractFunctionRevertedError,
+  EstimateGasExecutionError,
+  ExecutionRevertedError,
   type Hex,
   type PublicClient,
   TransactionReceiptNotFoundError,
@@ -18,6 +20,7 @@ import {
   toHex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import { getTransactionCount } from "viem/actions";
 import { worldchain } from "viem/chains";
 import { AGENT_BOOK_ABI, AGENT_BOOK_ADDRESS } from "../../payments/agentBookReader";
 import { withKeyedLock } from "../../payments/keyedMutex";
@@ -78,6 +81,9 @@ export interface AgentBookRegistrar {
   signRegister(args: RegisterArgs): Promise<{ rawTx: Hex; submitterNonce: number }>;
   broadcast(rawTx: Hex): Promise<Hex>;
   receiptStatus(txHash: Hex): Promise<"success" | "reverted" | null>;
+  /** The submitter's MINED transaction count on the write provider — the count that tells a
+   *  registration we were REPLACED (the chain moved past the nonce we signed) from one that is
+   *  still pending. Never the pending count: that one includes our own unmined transaction. */
   submitterNonce(): Promise<number>;
   submitterBalance(): Promise<bigint>;
 }
@@ -115,18 +121,29 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
    * `relayRevertError` cannot be reused for it: that one needs the relay's target/controller pair
    * and folds `shortMessage` into the message, and NOTHING but the error NAME may leave this
    * adapter (an RPC's prose can carry the calldata, and the calldata carries the proof).
-   * Anything without revert bytes is transport, and transport says nothing about the contract.
+   * Used by BOTH write paths — `simulateContract` and the gas estimate inside `signRegister` —
+   * because the second is where a state change since simulation shows up. Anything that is neither
+   * a revert nor an estimate revert is transport, and transport says nothing about the contract.
    */
   const revertOf = (e: unknown): ContractRevertError | undefined => {
-    if (e instanceof BaseError) {
-      const r = e.walk((x) => x instanceof ContractFunctionRevertedError);
-      if (r instanceof ContractFunctionRevertedError)
-        return new ContractRevertError(
-          `AgentBook.register reverted: ${r.data?.errorName ?? "unknown"}`,
-          r.data?.errorName,
-          { cause: e },
-        );
-    }
+    if (!(e instanceof BaseError)) return undefined;
+    const named = e.walk((x) => x instanceof ContractFunctionRevertedError);
+    if (named instanceof ContractFunctionRevertedError)
+      return new ContractRevertError(
+        `AgentBook.register reverted: ${named.data?.errorName ?? "unknown"}`,
+        named.data?.errorName,
+        { cause: e },
+      );
+    // Gas estimation reverts too, and it does so with no ABI in hand: the node just says
+    // "execution reverted". No name is recoverable, but the failure is every bit as deterministic
+    // as a decoded one — the class, not the name, is what the caller acts on.
+    const bare = e.walk(
+      (x) => x instanceof ExecutionRevertedError || x instanceof EstimateGasExecutionError,
+    );
+    if (bare)
+      return new ContractRevertError("AgentBook.register reverted: unknown", undefined, {
+        cause: e,
+      });
     return undefined;
   };
 
@@ -169,18 +186,32 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
     },
     async signRegister(args) {
       return withKeyedLock(SUBMITTER_LOCK, async () => {
-        const request = await walletClient.prepareTransactionRequest({
-          account,
-          chain: worldchain,
-          to: contract,
-          data: encodeRegister(args),
-        });
-        const rawTx = await walletClient.signTransaction(request);
-        return { rawTx, submitterNonce: Number(request.nonce) };
+        try {
+          const request = await walletClient.prepareTransactionRequest({
+            account,
+            chain: worldchain,
+            to: contract,
+            data: encodeRegister(args),
+          });
+          // The nonce is the whole reason this returns before broadcasting: the caller records it,
+          // so a replacement can be built later. An unrecorded `NaN` would make that impossible,
+          // and quietly — better to fail here than to persist a hole.
+          if (request.nonce === undefined)
+            throw new Error("signRegister: prepared request has no nonce");
+          const rawTx = await walletClient.signTransaction(request);
+          return { rawTx, submitterNonce: Number(request.nonce) };
+        } catch (e) {
+          // Simulation happened earlier and against a different block: by now someone else may
+          // have registered this agent, and the estimate inside `prepareTransactionRequest` is
+          // where we find out. Classify it exactly like a simulate revert.
+          const revert = revertOf(e);
+          if (revert) throw revert;
+          throw e;
+        }
       });
     },
     async broadcast(rawTx) {
-      return publicClient.sendRawTransaction({ serializedTransaction: rawTx });
+      return walletClient.sendRawTransaction({ serializedTransaction: rawTx });
     },
     async receiptStatus(txHash) {
       try {
@@ -200,7 +231,14 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
       }
     },
     async submitterNonce() {
-      return publicClient.getTransactionCount({ address: account.address, blockTag: "pending" });
+      // "latest", NOT "pending": the caller compares this with the nonce it signed, and a pending
+      // count includes OUR OWN transaction still sitting in the mempool — which would read as
+      // "the chain has moved past us, we were replaced" for a registration that is merely slow.
+      // Deliberately the WRITE provider too: the number is only meaningful next to the nonce the
+      // signer took, and two RPCs can disagree by a transaction. `getTransactionCount` is a public
+      // action, so it is called on the wallet client rather than decorating a second client onto
+      // the same URL.
+      return getTransactionCount(walletClient, { address: account.address, blockTag: "latest" });
     },
     async submitterBalance() {
       return publicClient.getBalance({ address: account.address });
