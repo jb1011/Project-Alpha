@@ -9,6 +9,7 @@
 import { expect, test } from "vitest";
 import {
   deriveFormationEnvironment,
+  filingEnvironment,
   formationEnvironmentOf,
   isKnownEnvironment,
 } from "@/lib/api/formationEnvironment";
@@ -75,4 +76,70 @@ test("G1: isKnownEnvironment is the gate every consequential action sits behind"
   expect(isKnownEnvironment("production")).toBe(true);
   expect(isKnownEnvironment("loading")).toBe(false);
   expect(isKnownEnvironment("unknown")).toBe(false);
+});
+
+/* ── the filing's own environment, and what a retry has to retry (§7, A3) ──── */
+
+test("A3: an agent with NO company reads the deployment, and retries /config", () => {
+  // A deployment that can form entities still onboards agents that asked for no filing.
+  for (const deployment of ["loading", "unknown", "sandbox", "production"] as const)
+    expect(
+      filingEnvironment({
+        forming: false,
+        deployment,
+        company: { hasData: false, isError: false },
+      }),
+    ).toEqual({ environment: deployment, retryTarget: "config" });
+});
+
+test("A3: a FILING agent reads the COMPANY ROW, and the deployment cannot override it", () => {
+  // The pin is stamped at creation and immutable after, so a company minted in sandbox stays a
+  // sandbox filing on a box since re-pointed at production — which the deployment's own answer
+  // would get exactly backwards.
+  expect(
+    filingEnvironment({
+      forming: true,
+      deployment: "production",
+      company: { environment: "sandbox", hasData: true, isError: false },
+    }),
+  ).toEqual({ environment: "sandbox", retryTarget: "company" });
+  expect(
+    filingEnvironment({
+      forming: true,
+      deployment: "sandbox",
+      company: { environment: "production", hasData: true, isError: false },
+    }),
+  ).toEqual({ environment: "production", retryTarget: "company" });
+});
+
+test("A3: a word from a newer backend is `unknown`, never a guess at `sandbox`", () => {
+  expect(
+    filingEnvironment({
+      forming: true,
+      deployment: "production",
+      company: { environment: "staging", hasData: true, isError: false },
+    }).environment,
+  ).toBe("unknown");
+});
+
+test("A3: the RETRY targets the query that would actually change the answer", () => {
+  // The bug: this screen read the company row while its Retry button refetched `/config`. On the
+  // one screen where the button matters it refetched a query the screen was not using — the
+  // spinner spun, and the blocked submit stayed blocked forever.
+  expect(
+    filingEnvironment({
+      forming: true,
+      deployment: "production",
+      company: { hasData: false, isError: true },
+    }),
+  ).toEqual({ environment: "unknown", retryTarget: "company" });
+  expect(
+    filingEnvironment({
+      forming: true,
+      deployment: "production",
+      company: { hasData: false, isError: false },
+    }),
+  ).toEqual({ environment: "loading", retryTarget: "company" });
+  // …and both of those are NEUTRAL, so the confirm stays disabled while they hold.
+  for (const env of ["loading", "unknown"] as const) expect(isKnownEnvironment(env)).toBe(false);
 });

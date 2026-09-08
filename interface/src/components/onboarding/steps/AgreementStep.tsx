@@ -11,7 +11,7 @@ import {
   useRetryPublicConfig,
 } from "@/lib/api/hooks";
 import {
-  formationEnvironmentOf,
+  filingEnvironment,
   isKnownEnvironment,
   type FormationEnvironment,
 } from "@/lib/api/formationEnvironment";
@@ -55,7 +55,7 @@ export function AgreementStep({
 }: Props) {
   const { address } = useAuth();
   const deploymentEnvironment = useFormationEnvironment();
-  const { retry, retrying } = useRetryPublicConfig();
+  const { retry: retryConfig, retrying: retryingConfig } = useRetryPublicConfig();
   const onboardEntity = useOnboardEntityMutation();
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -73,13 +73,22 @@ export function AgreementStep({
   // would get exactly backwards. `/config` remains the fallback while the row is still loading,
   // and its two ways of not knowing are preserved rather than collapsed into "sandbox".
   const company = useCompanyQuery(companyId);
-  const environment: FormationEnvironment = !forming
-    ? deploymentEnvironment
-    : company.data
-      ? formationEnvironmentOf(company.data.environment)
-      : company.isError
-        ? "unknown"
-        : "loading";
+  // ONE function decides the environment AND which query a retry has to hit. They used to be
+  // decided apart, and the second was wrong: this screen reads the COMPANY row while its Retry
+  // button refetched `/config`, so on the one screen where the button matters it refetched a
+  // query whose answer the screen was not using — the spinner spun and the blocked submit stayed
+  // blocked.
+  const { environment, retryTarget } = filingEnvironment({
+    forming,
+    deployment: deploymentEnvironment,
+    company: {
+      environment: company.data?.environment,
+      hasData: company.data !== undefined,
+      isError: company.isError,
+    },
+  });
+  const retry = retryTarget === "company" ? () => void company.refetch() : retryConfig;
+  const retrying = retryTarget === "company" ? company.isFetching : retryingConfig;
   // The gate. Confirming here starts a filing, and a filing whose environment we cannot name is
   // one this screen cannot describe honestly — so it does not let the user start it. This is the
   // exact case that used to render "Demo — nothing is filed" over a real Wyoming filing.
