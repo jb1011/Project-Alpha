@@ -513,7 +513,7 @@ export interface CompanyDetailView extends CompanyView {
     /** A doola-rejected INTAKE. Exit: `PATCH /companies/:companyId` with new names/purpose/
      *  industry — one edit buys one retry. */
     awaitingIntakeEdit: boolean;
-    /** A doola-rejected responsible PARTY. Exit: `PATCH /formation-party/:partyId`. */
+    /** A doola-rejected responsible PARTY. Exit: `PATCH /companies/:companyId/party`. */
     awaitingPartyEdit: boolean;
     /** The §4.6a clock erased an SSN before the filing was ever sent. Exit:
      *  `PATCH /companies/:companyId` with a fresh `ssn`, or `proceedWithoutSsn: true`. */

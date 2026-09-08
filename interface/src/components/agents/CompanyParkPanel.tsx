@@ -4,7 +4,7 @@ import { useState } from "react";
 import {
   usePublicConfigQuery,
   useUpdateCompanyIntakeMutation,
-  useUpdateFormationPartyMutation,
+  useUpdateCompanyPartyMutation,
 } from "@/lib/api/hooks";
 import type { CompanyDetailView } from "@/lib/api/types";
 import {
@@ -20,7 +20,6 @@ import {
   Callout,
   Card,
   Field,
-  SectionTitle,
   TextInput,
   Textarea,
 } from "@/components/onboarding/primitives";
@@ -262,7 +261,7 @@ function SsnDecisionForm({ company }: { company: CompanyDetailView }) {
   );
 }
 
-/* ── awaitingPartyEdit: `PATCH /formation-party/:partyId` ─────────────────── */
+/* ── awaitingPartyEdit: `PATCH /companies/:companyId/party` ───────────────── */
 
 /**
  * The responsible person, corrected.
@@ -272,23 +271,26 @@ function SsnDecisionForm({ company }: { company: CompanyDetailView }) {
  * correcting it is the person whose details they are, and the alternative is an endpoint that
  * echoes PII into a response body and into every client that caches one.
  *
+ * ⚠ There is NO party-handle field. The door is addressed by COMPANY and resolves the party from
+ * it, so the form has nothing to ask for — where it used to demand a uuid this system never
+ * serves back, on a page the owner reached precisely because their filing had stopped.
+ *
  * It also takes NO SSN: that number is captured by the company doors, which mint the (party,
  * company) pair it is sealed under. There is no field for one here on either surface.
  */
 function PartyEditForm({ company }: { company: CompanyDetailView }) {
-  const update = useUpdateFormationPartyMutation(company.companyId);
+  const update = useUpdateCompanyPartyMutation(company.companyId);
   const [party, setParty] = useState<FormationParty>(emptyParty);
-  const [partyId, setPartyId] = useState("");
   const [showErrors, setShowErrors] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const errors = validateParty(party);
 
   async function submit() {
     setShowErrors(true);
-    if (!isPartyValid(party) || !partyId.trim()) return;
+    if (!isPartyValid(party)) return;
     setError(null);
     try {
-      await update.mutateAsync({ partyId: partyId.trim(), body: toFormationPartyInput(party) });
+      await update.mutateAsync(toFormationPartyInput(party));
       // The identity leaves this browser the moment the backend has it, exactly as at intake.
       setParty(emptyParty());
     } catch (e) {
@@ -298,24 +300,6 @@ function PartyEditForm({ company }: { company: CompanyDetailView }) {
 
   return (
     <div className="flex flex-col gap-5">
-      <Card className="p-5">
-        <SectionTitle>Which identity</SectionTitle>
-        <p className="mt-2 text-[12px] leading-[1.6] text-muted-2">
-          The handle this company was created with. We do not serve it back with the company — no
-          surface in this system ever returns a stored identity — so paste the one the create
-          returned, or ask the operator.
-        </p>
-        <Field label="Party handle" htmlFor="party-handle" className="mt-4">
-          <TextInput
-            id="party-handle"
-            autoComplete="off"
-            placeholder="00000000-0000-0000-0000-000000000000"
-            className="font-mono text-[12px]"
-            value={partyId}
-            onChange={(e) => setPartyId(e.target.value)}
-          />
-        </Field>
-      </Card>
       <PartyFields
         party={party}
         errors={showErrors ? errors : {}}
@@ -328,11 +312,7 @@ function PartyEditForm({ company }: { company: CompanyDetailView }) {
         </Callout>
       )}
       <div>
-        <Button
-          loading={update.isPending}
-          disabled={!partyId.trim()}
-          onClick={() => void submit()}
-        >
+        <Button loading={update.isPending} onClick={() => void submit()}>
           Save and try the filing again
         </Button>
       </div>

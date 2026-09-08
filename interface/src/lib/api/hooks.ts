@@ -40,7 +40,7 @@ import {
   schedulePolicyUpdate,
   storePasskey,
   updateCompanyIntake,
-  updateFormationParty,
+  updateCompanyParty,
   verifySiwe,
   worldIdAttestContext,
   worldIdAttestVerify,
@@ -452,15 +452,19 @@ export function useUpdateCompanyIntakeMutation(companyId: string) {
  * A mutation for the reason `useCreateFormationPartyMutation` is one: personal data must never
  * become a React Query key. It invalidates the COMPANY, because what visibly changed is that
  * company's park state — the identity itself is never rendered anywhere.
+ *
+ * `companyId` is REQUIRED, and it is the door's own address since the backend re-keyed it: the
+ * party is resolved from the company rather than named by the caller. It was optional, with a
+ * `if (!companyId) return` guard in `onSuccess` that no call site could reach — a dead branch
+ * that would have silently skipped the invalidation if one ever did.
  */
-export function useUpdateFormationPartyMutation(companyId?: string) {
+export function useUpdateCompanyPartyMutation(companyId: string) {
   const queryClient = useQueryClient();
   const ensureToken = useEnsureAuthToken();
   return useMutation({
-    mutationFn: async ({ partyId, body }: { partyId: string; body: FormationPartyInput }) =>
-      updateFormationParty(await ensureToken(), partyId, body),
+    mutationFn: async (body: FormationPartyInput) =>
+      updateCompanyParty(await ensureToken(), companyId, body),
     onSuccess: async () => {
-      if (!companyId) return;
       const token = await ensureToken();
       await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
     },

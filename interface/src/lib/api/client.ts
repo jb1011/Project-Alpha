@@ -227,13 +227,18 @@ export async function getCompanyCompliance(
  * The one exit from a company parked on `awaitingPartyEdit`. Editable only until the filing has
  * been sent: once the provider holds the person it is never asked for them again, so an edit
  * afterwards would change our copy and nothing else. NO ssn — there is no field for one.
+ *
+ * ⚠ Addressed by COMPANY. The door took a party handle first, which meant this form had to ask a
+ * human to paste a uuid no surface in the system ever serves back — and a mistyped one rewrote
+ * the responsible person of a different company. The backend resolves the party from the
+ * company's UNIQUE `company_id`, so the wrong-company edit is not a request that can be made.
  */
-export async function updateFormationParty(
+export async function updateCompanyParty(
   token: string,
-  partyId: string,
+  companyId: string,
   body: FormationPartyInput,
 ): Promise<{ partyId: string }> {
-  return request(`/formation-party/${encodeURIComponent(partyId)}`, {
+  return request(`/companies/${encodeURIComponent(companyId)}/party`, {
     method: "PATCH",
     token,
     body,

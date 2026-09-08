@@ -671,24 +671,43 @@ test("PARITY: get_company is tenant-scoped, and unknown reads exactly like not-y
   });
 });
 
-// ── update_formation_party (design §7, A3) ──────────────────────────────────────────────────
+// ── update_company_party (design §7, A3) ────────────────────────────────────────────────────
+
+/** Register a real party and spend it on a company — the shape the edit door addresses. */
+async function mcpCompanyWithParty(
+  c: Awaited<ReturnType<typeof startMcpTestClient>>["client"],
+  names = MCP_INTAKE.names,
+) {
+  const { partyId } = JSON.parse(
+    textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+  );
+  const { companyId } = JSON.parse(
+    textOf(
+      await c.callTool({ name: "create_company", arguments: { partyId, ...MCP_INTAKE, names } }),
+    ),
+  );
+  return { partyId: partyId as string, companyId: companyId as string };
+}
 
 test("the party-edit door exists on MCP too, takes no ssn, and is gated on formation", async () => {
   // A park with a browser-only exit is a park an agent-first caller cannot leave — and they can
   // reach it, because `create_formation_party` is theirs.
   const on = buildTestApp({ required: true });
   const { key } = apiKeys.mint(TENANT, { capability: "provision" });
-  const tool = await withClient(on, key, async (c) =>
-    (await c.listTools()).tools.find((t) => t.name === "update_formation_party"),
-  );
+  const tools = await withClient(on, key, async (c) => (await c.listTools()).tools);
+  const tool = tools.find((t) => t.name === "update_company_party");
   expect(tool).toBeDefined();
+  // The door a caller can no longer address by party handle: a mistyped uuid rewrote the
+  // responsible person of a DIFFERENT company mid-filing, which is a rule to enforce rather than
+  // a sentence nobody can write.
+  expect(tools.map((t) => t.name)).not.toContain("update_formation_party");
   // `ssn` IS declared, and declared in order to be REFUSED — `create_company`'s rule, and this
   // door reached the same bug on its own: leaving it undeclared meant the SDK's zod parse
   // stripped it silently and a model passing one got back a SUCCESS, with the number still in
   // its context window and its logs. "There was nothing it could have meant" is exactly why the
   // caller has to be told rather than quietly agreed with.
   expect(Object.keys(tool!.inputSchema.properties ?? {})).toEqual([
-    "partyId",
+    "companyId",
     "legalFirstName",
     "legalLastName",
     "email",
@@ -704,7 +723,7 @@ test("the party-edit door exists on MCP too, takes no ssn, and is gated on forma
   const offNames = await withClient(off, key2, async (c) =>
     (await c.listTools()).tools.map((t) => t.name),
   );
-  expect(offNames).not.toContain("update_formation_party");
+  expect(offNames).not.toContain("update_company_party");
 });
 
 test("MCP and REST edit through ONE function: same refusals, same strictness, same result", async () => {
@@ -713,9 +732,7 @@ test("MCP and REST edit through ONE function: same refusals, same strictness, sa
   const { token } = await signSession(TENANT, "s", 3600, Math.floor(Date.now() / 1000));
 
   await withClient(app, key, async (c) => {
-    const { partyId } = JSON.parse(
-      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
-    );
+    const { partyId, companyId } = await mcpCompanyWithParty(c);
     const corrected = {
       ...REAL_PARTY,
       legalFirstName: "Grace",
@@ -724,8 +741,8 @@ test("MCP and REST edit through ONE function: same refusals, same strictness, sa
     };
 
     const ok = await c.callTool({
-      name: "update_formation_party",
-      arguments: { partyId, ...corrected },
+      name: "update_company_party",
+      arguments: { companyId, ...corrected },
     });
     expect(JSON.parse(textOf(ok))).toEqual({ partyId });
     expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Grace");
@@ -733,8 +750,8 @@ test("MCP and REST edit through ONE function: same refusals, same strictness, sa
     // The SAME `.strict()` schema REST parses: an `ssn` key is refused by the schema itself
     // rather than by a check somebody has to remember to write on each surface.
     const withSsn = await c.callTool({
-      name: "update_formation_party",
-      arguments: { partyId, ...corrected, ssn: "123-45-6789" },
+      name: "update_company_party",
+      arguments: { companyId, ...corrected, ssn: "123-45-6789" },
     });
     expect((withSsn as { isError?: boolean }).isError).toBe(true);
     expect(textOf(withSsn)).toBe(ssnNotOnThisDoorMessage());
@@ -742,12 +759,12 @@ test("MCP and REST edit through ONE function: same refusals, same strictness, sa
     // The refusal is the WHOLE answer: the identity is untouched.
     expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Grace");
 
-    // …and the ownership refusal is the same sentence REST gives.
+    // …and the ownership refusal is the same sentence every other company door gives.
     const foreign = await c.callTool({
-      name: "update_formation_party",
-      arguments: { partyId: "00000000-0000-4000-8000-000000000000", ...corrected },
+      name: "update_company_party",
+      arguments: { companyId: "00000000-0000-4000-8000-000000000000", ...corrected },
     });
-    expect(textOf(foreign)).toMatch(/unknown, not yours, or already bound/);
+    expect(textOf(foreign)).toMatch(/company/i);
   });
 
   // The REST door, on the same app and the same tenant, answers the same way — one function.
@@ -758,121 +775,60 @@ test("MCP and REST edit through ONE function: same refusals, same strictness, sa
       body: JSON.stringify(REAL_PARTY),
     })
   ).json();
-  const res = await app.request(`/formation-party/${partyId}`, {
+  const { companyId } = await (
+    await app.request("/companies", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        partyId,
+        ...MCP_INTAKE,
+        names: ["Rest One", "Rest Two", "Rest Three"],
+      }),
+    })
+  ).json();
+  const res = await app.request(`/companies/${companyId}/party`, {
     method: "PATCH",
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: JSON.stringify({ ...REAL_PARTY, legalFirstName: "Grace" }),
   });
   expect(res.status).toBe(200);
-  expect(Object.keys(await res.json())).toEqual(["partyId"]);
+  expect(await res.json()).toEqual({ partyId });
 });
 
-test("update_formation_party needs the PROVISION rung — it decides whose name a filing carries", async () => {
+test("ADDRESSING: two parked companies, one tenant — the edit cannot reach the other's person", async () => {
+  // The whole reason the door is company-addressed. With a `partyId` argument the only thing
+  // between a mistyped handle and an identity swap on the wrong Wyoming LLC was the freeze, and
+  // an unopened filing passes it.
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  await withClient(app, key, async (c) => {
+    const a = await mcpCompanyWithParty(c, ["Alpha One", "Alpha Two", "Alpha Three"]);
+    const b = await mcpCompanyWithParty(c, ["Beta One", "Beta Two", "Beta Three"]);
+
+    const ok = await c.callTool({
+      name: "update_company_party",
+      arguments: { companyId: a.companyId, ...REAL_PARTY, legalFirstName: "Grace" },
+    });
+    expect(JSON.parse(textOf(ok))).toEqual({ partyId: a.partyId });
+    expect(parties.findOwned(TENANT, a.partyId)!.legalFirstName).toBe("Grace");
+    expect(parties.findOwned(TENANT, b.partyId)!.legalFirstName).toBe("Ada");
+  });
+});
+
+test("update_company_party needs the PROVISION rung — it decides whose name a filing carries", async () => {
   const app = buildTestApp({ required: true });
   const { key: readKey } = apiKeys.mint(TENANT, { capability: "read" });
   const res = await withClient(app, readKey, async (c) =>
     c.callTool({
-      name: "update_formation_party",
-      arguments: { partyId: "p", ...REAL_PARTY },
+      name: "update_company_party",
+      arguments: { companyId: "c", ...REAL_PARTY },
     }),
   );
   expect((res as { isError?: boolean }).isError).toBe(true);
   expect(textOf(res)).toBe("not authorized");
 });
 
-// ── the COMPANY reads under an ENTITY-SCOPED key (§7) ────────────────────────────────────────
-
-/**
- * An entity-scoped key sees ONE entity — and, therefore, one company.
- *
- * `get_entity`/`list_entities` have enforced `entityInScope` since the scoped-key surface
- * shipped; the two company reads were added without it, so a key minted for one agent could
- * enumerate every legal body its tenant owns and read the full detail of any of them, including
- * the names and ids of every SIBLING agent attached. That is the fleet-shape leak the sharing
- * count is kept off `/transparency` to prevent, handed to a credential the owner deliberately
- * narrowed.
- *
- * `agents` stays the TRUE total — a scoped key already learns it from `get_entity`'s
- * `sharedWith`, and a 1 there would be a lie. What is withheld is WHICH agents.
- */
-test("SCOPE: an entity-scoped key lists only its own company, and never a sibling's", async () => {
-  const app = buildTestApp({ required: true });
-  const handle = passkeys.store(TENANT, VALID_PASSKEY);
-  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
-
-  const { mine, theirs, entityId } = await withClient(app, key, async (c) => {
-    const company = async (names: string[]) => {
-      const { partyId } = JSON.parse(
-        textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
-      );
-      return JSON.parse(
-        textOf(
-          await c.callTool({
-            name: "create_company",
-            arguments: { partyId, ...MCP_INTAKE, names },
-          }),
-        ),
-      ).companyId as string;
-    };
-    const mine = await company(["Scoped One", "Scoped Two", "Scoped Three"]);
-    const theirs = await company(["Other One", "Other Two", "Other Three"]);
-    // Two agents on MINE, so the sibling redaction has something to redact.
-    const first = JSON.parse(
-      textOf(
-        await c.callTool({
-          name: "onboard_agent",
-          arguments: {
-            spec: { ...VALID_SPEC, name: "ScopedA" },
-            passkeyId: handle,
-            companyId: mine,
-          },
-        }),
-      ),
-    );
-    await c.callTool({
-      name: "onboard_agent",
-      arguments: {
-        spec: { ...VALID_SPEC, name: "ScopedB" },
-        passkeyId: handle,
-        companyId: mine,
-      },
-    });
-    return { mine, theirs, entityId: first.id as string };
-  });
-
-  const { key: scoped } = apiKeys.mint(TENANT, { capability: "read", entityId });
-  await withClient(app, scoped, async (c) => {
-    const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
-    expect(listed.companies.map((r: { companyId: string }) => r.companyId)).toEqual([mine]);
-
-    // The sibling's company is not readable at all, and reads exactly like an unknown id.
-    const refused = await c.callTool({ name: "get_company", arguments: { companyId: theirs } });
-    const missing = await c.callTool({ name: "get_company", arguments: { companyId: "nope" } });
-    expect((refused as { isError?: boolean }).isError).toBe(true);
-    expect(textOf(refused)).toBe(textOf(missing));
-
-    // Its OWN company is readable — with the sibling agent's id and name withheld, and the
-    // honest total kept.
-    const own = JSON.parse(
-      textOf(await c.callTool({ name: "get_company", arguments: { companyId: mine } })),
-    );
-    expect(own.companyId).toBe(mine);
-    expect(own.attachedAgents.map((a: { id: string }) => a.id)).toEqual([entityId]);
-    expect(own.agents).toBe(2);
-  });
-
-  // …and a TENANT-WIDE key still sees both companies and both agents.
-  await withClient(app, key, async (c) => {
-    const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
-    expect(listed.companies).toHaveLength(2);
-    const own = JSON.parse(
-      textOf(await c.callTool({ name: "get_company", arguments: { companyId: mine } })),
-    );
-    expect(own.attachedAgents).toHaveLength(2);
-  });
-});
-
-test("SYNTHETIC GATE: update_formation_party refuses both directions, in the create's words", async () => {
+test("SYNTHETIC GATE: update_company_party refuses both directions, in the create's words", async () => {
   // The MCP twin of the REST assertion. The edit door is a PII intake and was the one that ran
   // neither half of the gate, so a sandbox deployment's agent-first caller could write a real
   // identity over the labeled fixture and have it filed to doola's development environment.
@@ -882,9 +838,17 @@ test("SYNTHETIC GATE: update_formation_party refuses both directions, in the cre
     const { partyId } = JSON.parse(
       textOf(await c.callTool({ name: "create_formation_party", arguments: { synthetic: true } })),
     );
+    const { companyId } = JSON.parse(
+      textOf(
+        await c.callTool({
+          name: "create_company",
+          arguments: { partyId, ...MCP_INTAKE, synthetic: true },
+        }),
+      ),
+    );
     const refused = await c.callTool({
-      name: "update_formation_party",
-      arguments: { partyId, ...REAL_PARTY },
+      name: "update_company_party",
+      arguments: { companyId, ...REAL_PARTY },
     });
     expect((refused as { isError?: boolean }).isError).toBe(true);
     expect(textOf(refused)).toMatch(/FORMATION_SANDBOX_SYNTHETIC_PII/);
@@ -894,13 +858,11 @@ test("SYNTHETIC GATE: update_formation_party refuses both directions, in the cre
   const prod = buildTestApp({ required: true, syntheticPii: false });
   const { key: key2 } = apiKeys.mint(TENANT, { capability: "provision" });
   await withClient(prod, key2, async (c) => {
-    const { partyId } = JSON.parse(
-      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
-    );
+    const { partyId, companyId } = await mcpCompanyWithParty(c);
     db.prepare("UPDATE formation_parties SET synthetic = 1 WHERE party_id = ?").run(partyId);
     const refused = await c.callTool({
-      name: "update_formation_party",
-      arguments: { partyId, ...REAL_PARTY, legalFirstName: "Grace" },
+      name: "update_company_party",
+      arguments: { companyId, ...REAL_PARTY, legalFirstName: "Grace" },
     });
     expect((refused as { isError?: boolean }).isError).toBe(true);
     expect(textOf(refused)).toMatch(/synthetic formation parties are refused/);

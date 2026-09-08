@@ -21,7 +21,7 @@ import {
   createCompany,
   rearmAfterPartyEdit,
   updateCompanyIntake,
-  updateFormationParty,
+  updateCompanyParty,
 } from "../../src/formation/company";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
 import { parsePiiKey } from "../../src/formation/pii";
@@ -374,15 +374,16 @@ test("A3: a PARTY edit re-arms exactly one retry, and it goes out with the CORRE
     expect(partyParked(companyId)).toBe(true);
 
     expect(
-      updateFormationParty(
+      updateCompanyParty(
         {
+          companies,
           parties,
           requests,
           sandboxSyntheticPii: false,
           transaction: (fn) => db.transaction(fn)(),
         },
         TENANT,
-        partyId,
+        companyId,
         {
           legalFirstName: "Grace",
           legalLastName: "Hopper",
@@ -432,10 +433,16 @@ test("A3: a company parked on its INTAKE has a party doola already holds — and
     expect(parked(companyId)).toBe(true);
     expect(parseDetail<{ customerId?: string }>(rowOf(companyId).detail).customerId).toBe("cus_1");
 
-    const refused = updateFormationParty(
-      { parties, requests, sandboxSyntheticPii: false, transaction: (fn) => db.transaction(fn)() },
+    const refused = updateCompanyParty(
+      {
+        companies,
+        parties,
+        requests,
+        sandboxSyntheticPii: false,
+        transaction: (fn) => db.transaction(fn)(),
+      },
       TENANT,
-      partyId,
+      companyId,
       {
         legalFirstName: "Grace",
         legalLastName: "Hopper",

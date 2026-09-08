@@ -10,7 +10,7 @@ import {
   formationUnavailableMessage,
   truncateTenant,
 } from "../../formation";
-import { createCompany, updateCompanyIntake, updateFormationParty } from "../../formation/company";
+import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../formation/company";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
 import {
@@ -267,12 +267,18 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
   });
 
   /**
-   * PATCH /formation-party/:partyId — the PARTY-EDIT DOOR (design §7, A3).
+   * PATCH /companies/:companyId/party — the PARTY-EDIT DOOR (design §7, A3).
    *
    * The exit A2 wrote a park for and could not give: a company whose `createCustomer` doola
    * REJECTED parks under `awaitingPartyEdit`, and none of the four fields `PATCH /companies/:id`
    * rewrites is one `createCustomer` reads. This door rewrites the identity and re-arms exactly
    * one retry, in one transaction.
+   *
+   * ⚠ ADDRESSED BY COMPANY, not by party handle. The party is RESOLVED from the company's UNIQUE
+   * `company_id`, so the door cannot reach another company's responsible person at all — where a
+   * `partyId` address made that a rule to enforce rather than a sentence nobody can write. It
+   * also removes the uuid the form had to ask a human to paste, which no surface in this system
+   * serves back.
    *
    * It takes the SAME body as `POST /formation-party`, parsed by the SAME `.strict()` schema, so
    * a field the create refuses is not quietly accepted by the edit. It takes NO `ssn` — there is
@@ -280,7 +286,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    * gives: echoing a stored identity back puts it in a response body and in every client that
    * caches one.
    */
-  app.patch("/formation-party/:partyId", async (c) => {
+  app.patch("/companies/:companyId/party", async (c) => {
     const tenantId = c.get("tenantId");
     if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
 
@@ -288,10 +294,10 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     // the labeled sandbox fixture is ours, not a caller's, and re-typing it would be a caller
     // writing a fixture we generate.
     const body = FormationPartySchema.parse(await readJson(c));
-    const result = updateFormationParty(
+    const result = updateCompanyParty(
       { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
       tenantId,
-      c.req.param("partyId"),
+      c.req.param("companyId"),
       {
         legalFirstName: body.legalFirstName,
         legalLastName: body.legalLastName,

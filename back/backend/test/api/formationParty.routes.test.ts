@@ -749,41 +749,82 @@ test("a FOREIGN company id is refused with the same message as an unknown one", 
   expect(repo.listByTenant(account.address)).toHaveLength(0);
 });
 
-// ── PATCH /formation-party/:partyId (design §7, A3) ─────────────────────────────────────────
+// ── PATCH /companies/:companyId/party (design §7, A3) ───────────────────────────────────────
+
+/** A company with a real bound party, its filing not yet opened — the everyday editable case. */
+async function companyWithParty(app: ReturnType<typeof buildApiApp>, token: string) {
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
+  ).json();
+  return { partyId, companyId };
+}
 
 test("the party-edit door rewrites the identity and answers with the handle alone", async () => {
   const app = makeApp({ required: true });
   const token = await login(app);
-  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { partyId, companyId } = await companyWithParty(app, token);
 
-  const res = await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY);
+  const res = await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY);
   expect(res.status).toBe(200);
   // Exactly one key, for the reason the create gives: echoing the stored identity back would put
   // PII in a response body and in every client that caches one.
-  expect(Object.keys(await res.json())).toEqual(["partyId"]);
+  expect(await res.json()).toEqual({ partyId });
   expect(parties.findOwned(account.address, partyId)).toMatchObject({
     legalFirstName: "Grace",
     email: "grace@example.com",
   });
 });
 
-test("it requires a session, and another tenant's handle is refused as if it did not exist", async () => {
+test("it requires a session, and another tenant's company is refused as if it did not exist", async () => {
   const app = makeApp({ required: true });
   const mine = await login(app);
   const theirs = await login(app, other);
-  const { partyId } = await (await post(app, "/formation-party", mine, REAL_PARTY)).json();
+  const { partyId, companyId } = await companyWithParty(app, mine);
 
-  const noAuth = await app.request(`/formation-party/${partyId}`, {
+  const noAuth = await app.request(`/companies/${companyId}/party`, {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(CORRECTED_PARTY),
   });
   expect(noAuth.status).toBe(401);
 
-  const foreign = await patch(app, `/formation-party/${partyId}`, theirs, CORRECTED_PARTY);
-  expect(foreign.status).toBe(400);
-  expect((await foreign.json()).error.message).toMatch(/unknown, not yours, or already bound/);
+  const foreign = await patch(app, `/companies/${companyId}/party`, theirs, CORRECTED_PARTY);
+  const unknown = await patch(
+    app,
+    "/companies/00000000-0000-4000-8000-000000000000/party",
+    theirs,
+    CORRECTED_PARTY,
+  );
+  expect([foreign.status, unknown.status]).toEqual([400, 400]);
+  // One answer for both, or the door is an existence oracle over another tenant's company ids.
+  expect((await foreign.json()).error.message).toBe((await unknown.json()).error.message);
   expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
+});
+
+/**
+ * WHY THE DOOR IS ADDRESSED BY COMPANY.
+ *
+ * Its first version took a `partyId`, so the only thing between a mistyped uuid and an identity
+ * swap on the wrong Wyoming LLC was the freeze — and an unopened filing passes it. Addressed by
+ * company the party is RESOLVED rather than named, so "edit the other company's person" is not a
+ * request this API can express.
+ */
+test("a tenant with two companies cannot cross-edit: the party is resolved, never named", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const a = await companyWithParty(app, token);
+  const b = await companyWithParty(app, token);
+
+  expect((await patch(app, `/companies/${a.companyId}/party`, token, CORRECTED_PARTY)).status).toBe(
+    200,
+  );
+  expect(parties.findOwned(account.address, a.partyId)!.legalFirstName).toBe("Grace");
+  expect(parties.findOwned(account.address, b.partyId)!.legalFirstName).toBe("Ada");
+  // …and there is no door left that takes a party handle at all.
+  expect((await patch(app, `/formation-party/${b.partyId}`, token, CORRECTED_PARTY)).status).toBe(
+    404,
+  );
 });
 
 test("it parses the SAME .strict() schema the create does — an `ssn` key is refused, not dropped", async () => {
@@ -792,9 +833,9 @@ test("it parses the SAME .strict() schema the create does — an `ssn` key is re
   // `.strict()` is what turns "not a field" into a refusal rather than a silent drop.
   const app = makeApp({ required: true });
   const token = await login(app);
-  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { partyId, companyId } = await companyWithParty(app, token);
 
-  const res = await patch(app, `/formation-party/${partyId}`, token, {
+  const res = await patch(app, `/companies/${companyId}/party`, token, {
     ...CORRECTED_PARTY,
     ssn: "123-45-6789",
   });
@@ -804,7 +845,7 @@ test("it parses the SAME .strict() schema the create does — an `ssn` key is re
   expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
 
   // The same body WITHOUT it is accepted, so the refusal is about that key alone.
-  expect((await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY)).status).toBe(
+  expect((await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY)).status).toBe(
     200,
   );
 });
@@ -823,8 +864,11 @@ test("SANDBOX: the edit door refuses a real identity, in the create door's own w
   const { partyId } = await (
     await post(app, "/formation-party", token, { synthetic: true })
   ).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE, synthetic: true })
+  ).json();
 
-  const res = await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY);
+  const res = await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY);
   expect(res.status).toBe(400);
   expect((await res.json()).error.message).toMatch(/FORMATION_SANDBOX_SYNTHETIC_PII/);
   // Nothing was written: the fixture is intact.
@@ -837,10 +881,10 @@ test("PRODUCTION: the edit door refuses a SYNTHETIC party row, in the create doo
   // filing labeled synthetic on every surface that shows it.
   const app = makeApp({ required: true, syntheticPii: false });
   const token = await login(app);
-  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { partyId, companyId } = await companyWithParty(app, token);
   db.prepare("UPDATE formation_parties SET synthetic = 1 WHERE party_id = ?").run(partyId);
 
-  const res = await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY);
+  const res = await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY);
   expect(res.status).toBe(400);
   expect((await res.json()).error.message).toMatch(/synthetic formation parties are refused/);
   expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
@@ -849,6 +893,6 @@ test("PRODUCTION: the edit door refuses a SYNTHETIC party row, in the create doo
 test("a deployment that forms nothing has no party-edit door either (503)", async () => {
   const app = makeApp(undefined);
   const token = await login(app);
-  const res = await patch(app, "/formation-party/whatever", token, CORRECTED_PARTY);
+  const res = await patch(app, "/companies/whatever/party", token, CORRECTED_PARTY);
   expect(res.status).toBe(503);
 });

@@ -408,7 +408,8 @@ export function updateCompanyIntake(
 }
 
 /**
- * THE PARTY-EDIT DOOR (design §7, A3) — correct the responsible person doola refused.
+ * THE PARTY-EDIT DOOR (design §7, A3) — correct the responsible person doola refused, ADDRESSED
+ * BY COMPANY.
  *
  * A2 left a company that doola rejected on its PARTY parked with no exit at all: the flag was
  * written, `rearmAfterPartyEdit` was exported, and the note on both operator surfaces said
@@ -420,6 +421,19 @@ export function updateCompanyIntake(
  * WHICH flag it clears, and that is the whole of A2's finding 5b: `PATCH /companies/:id` rewrites
  * names, purpose, industry and the SSN, none of which is what a rejected `createCustomer`
  * objected to. Each door clears its own, and neither touches the other's.
+ *
+ * ⚠ THE ADDRESS IS THE COMPANY, and that is a security property rather than a convenience. The
+ * first version took a `partyId`, which made the door capable of touching ANY party the tenant
+ * owns — including the one bound to a DIFFERENT company, mid-filing — with only a
+ * `partyEditAllowed` check standing between a mistyped handle and an identity swap on the wrong
+ * Wyoming LLC. It also forced the UI to ask a human to paste a uuid that no surface serves, which
+ * is a field people get wrong. Addressed by company, the party is RESOLVED (`findByCompanyId`, a
+ * UNIQUE column), so touching another company's party is not a rule this function enforces — it
+ * is a sentence that cannot be expressed.
+ *
+ * The cost, stated: an UNBOUND party — created by `POST /formation-party` and never spent on a
+ * company — has no edit door. It also has no filing, no park and nothing to correct, and the C7
+ * sweep erases it after seven days; the caller's move is to register a new identity.
  *
  * ⚠ NO `ssn`, structurally. The party's SSN is written by `POST /companies` (which mints the AAD
  * the ciphertext is sealed under) and re-captured by `PATCH /companies/:companyId`. There is no
@@ -434,10 +448,13 @@ export function updateCompanyIntake(
  * address could be written over a labeled fixture and then filed to doola's DEVELOPMENT
  * environment as the responsible person — the precise harm the sandbox refusal exists to prevent.
  */
-export function updateFormationParty(
-  deps: Pick<CreateCompanyDeps, "parties" | "requests" | "transaction" | "sandboxSyntheticPii">,
+export function updateCompanyParty(
+  deps: Pick<
+    CreateCompanyDeps,
+    "companies" | "parties" | "requests" | "transaction" | "sandboxSyntheticPii"
+  >,
   tenantId: string,
-  partyId: string,
+  companyId: string,
   fields: EditablePartyFields,
 ): { partyId: string } | { error: string } {
   // The DEPLOYMENT's half of the gate, first and without a lookup — `createCompany`'s order, and
@@ -446,29 +463,31 @@ export function updateFormationParty(
   // deployment refuses all of them.
   if (deps.sandboxSyntheticPii) return { error: syntheticPiiRequiredMessage() };
 
-  // Ownership second, and the same not-an-oracle rule the rest of the door follows: an unknown id,
-  // somebody else's, and an erased one get ONE answer.
-  const party = deps.parties.findOwned(tenantId, partyId);
+  // Ownership of the COMPANY, exactly as `updateCompanyIntake` checks it, and with the same
+  // not-an-oracle rule: an unknown id and somebody else's get ONE answer.
+  const company = deps.companies.findOwned(tenantId, companyId);
+  if (!company) return { error: companyUnavailableMessage() };
+  // The party is RESOLVED from the company, never named by the caller — `company_id` is UNIQUE on
+  // `formation_parties`, so this is the one identity that filing was opened with.
+  const party = deps.parties.findByCompanyId(companyId);
   if (!party) return { error: formationPartyUnavailableMessage() };
-  // …and the ROW's half. A synthetic party on a production box is a bug rather than a request —
-  // the row was minted through the same gate — but it is the bug that would put a real person's
-  // identity onto a filing labeled synthetic on every surface that shows it.
+  // …and the ROW's half of the synthetic gate. A synthetic party on a production box is a bug
+  // rather than a request — the row was minted through the same gate — but it is the bug that
+  // would put a real person's identity onto a filing labeled synthetic on every surface.
   if (party.synthetic) return { error: syntheticPiiRefusedMessage() };
 
-  // An UNBOUND party has no filing to be frozen by — `partyEditAllowed` says so from an
-  // `undefined` step, and reading the step at all would need a company id there is none of.
-  const step = party.companyId ? deps.requests.find(party.companyId, "create_provider") : undefined;
+  const step = deps.requests.find(companyId, "create_provider");
   if (!partyEditAllowed(step)) return { error: partyFrozenMessage() };
 
   let moved = false;
   deps.transaction(() => {
-    moved = deps.parties.update(partyId, tenantId, fields);
+    moved = deps.parties.update(party.partyId, tenantId, fields);
     if (!moved) return;
     // …and RE-ARM the filing step this edit exists to unblock, in the SAME transaction as the
     // edit — `updateCompanyIntake`'s rule with the other flag. The edit IS the evidence that the
     // next body will be different, and it is the only thing that may put the row back in the
-    // sweeper's reach. A no-op for an unbound party, and for one whose row is not parked.
-    if (party.companyId) rearmAfterPartyEdit(deps, party.companyId);
+    // sweeper's reach. A no-op for a row that is not parked.
+    rearmAfterPartyEdit(deps, companyId);
   });
   // The row vanished between the read and the write (an erasure sweep). Same sentence as above.
   if (!moved) return { error: formationPartyUnavailableMessage() };
@@ -477,10 +496,10 @@ export function updateFormationParty(
   // name, no address, no email — and no diff, which would be the whole identity in a log line.
   opsLog("formation_party_updated", {
     tenantId: truncateTenant(tenantId),
-    partyId,
-    companyId: party.companyId,
+    partyId: party.partyId,
+    companyId,
   });
-  return { partyId };
+  return { partyId: party.partyId };
 }
 
 /**

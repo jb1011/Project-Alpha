@@ -19,12 +19,13 @@
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import {
+  companyUnavailableMessage,
   formationPartyUnavailableMessage,
   partyFrozenMessage,
   syntheticPiiRefusedMessage,
   syntheticPiiRequiredMessage,
 } from "../../src/formation";
-import { updateFormationParty } from "../../src/formation/company";
+import { updateCompanyParty } from "../../src/formation/company";
 import { companyNameOptions } from "../../src/formation/intake";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -49,6 +50,7 @@ beforeEach(() => {
 afterEach(() => db.close());
 
 const deps = (sandboxSyntheticPii = false) => ({
+  companies,
   parties,
   requests,
   sandboxSyntheticPii,
@@ -85,9 +87,9 @@ function newParty(tenantId = TENANT): string {
   });
 }
 
-function newCompany(partyId: string): string {
+function newCompany(partyId: string, tenantId = TENANT): string {
   const companyId = companies.create({
-    tenantId: TENANT,
+    tenantId,
     status: "ready",
     provider: "doola",
     environment: "sandbox",
@@ -97,7 +99,7 @@ function newCompany(partyId: string): string {
     industryLabel: "Software development",
     intakeSynthesized: false,
   });
-  parties.bindToCompany(partyId, companyId, TENANT);
+  parties.bindToCompany(partyId, companyId, tenantId);
   return companyId;
 }
 
@@ -127,7 +129,7 @@ test("a SANDBOX deployment refuses a real identity at the edit door, in the crea
   const companyId = newCompany(partyId);
   parkAwaitingPartyEdit(companyId);
 
-  expect(updateFormationParty(deps(true), TENANT, partyId, CORRECTED)).toEqual({
+  expect(updateCompanyParty(deps(true), TENANT, companyId, CORRECTED)).toEqual({
     error: syntheticPiiRequiredMessage(),
   });
   // Nothing was written: the refusal is the whole answer, as it is on every other door.
@@ -155,7 +157,7 @@ test("a PRODUCTION deployment refuses to edit a SYNTHETIC party, in the create's
   const companyId = newCompany(partyId);
   parkAwaitingPartyEdit(companyId);
 
-  expect(updateFormationParty(deps(false), TENANT, partyId, CORRECTED)).toEqual({
+  expect(updateCompanyParty(deps(false), TENANT, companyId, CORRECTED)).toEqual({
     error: syntheticPiiRefusedMessage(),
   });
   expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Sandbox");
@@ -163,14 +165,73 @@ test("a PRODUCTION deployment refuses to edit a SYNTHETIC party, in the create's
 
 // ── ownership ───────────────────────────────────────────────────────────────────────────────
 
-test("unknown, FOREIGN and erased parties get the SAME message the other doors give", () => {
-  const foreign = newParty(OTHER);
-  const erased = newParty();
-  parties.erase(erased);
-  for (const partyId of ["00000000-0000-4000-8000-000000000000", foreign, erased])
-    expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED)).toEqual({
-      error: formationPartyUnavailableMessage(),
+test("unknown and FOREIGN companies get the SAME message every other company door gives", () => {
+  const foreign = newCompany(newParty(OTHER), OTHER);
+  for (const companyId of ["00000000-0000-4000-8000-000000000000", foreign])
+    expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({
+      error: companyUnavailableMessage(),
     });
+  // …and the other tenant's identity is untouched.
+  expect(parties.findByCompanyId(foreign)!.legalFirstName).toBe("Ada");
+});
+
+/**
+ * THE REASON THE DOOR IS ADDRESSED BY COMPANY (§7).
+ *
+ * Its first version took a `partyId`, so the only thing between a mistyped uuid and an identity
+ * swap on the WRONG Wyoming LLC was `partyEditAllowed` — and both of this tenant's companies are
+ * parked, so both pass it. Addressed by company the party is RESOLVED rather than named, and
+ * "edit the other company's person" is not a request that can be expressed.
+ */
+test("two parked companies, one tenant: fixing one cannot touch the other's person", () => {
+  const partyA = newParty();
+  const companyA = newCompany(partyA);
+  parkAwaitingPartyEdit(companyA);
+  const partyB = parties.create({
+    tenantId: TENANT,
+    legalFirstName: "Alan",
+    legalLastName: "Turing",
+    email: "alan@example.com",
+    phone: "+12125550111",
+    line1: "3 Bletchley Rd",
+    line2: null,
+    city: "Cheyenne",
+    region: "WY",
+    postalCode: "82001",
+    country: "USA",
+    synthetic: false,
+  });
+  const companyB = newCompany(partyB);
+  parkAwaitingPartyEdit(companyB);
+
+  expect(updateCompanyParty(deps(), TENANT, companyA, CORRECTED)).toEqual({ partyId: partyA });
+
+  // A got the correction; B is untouched, identity and park alike.
+  expect(parties.findOwned(TENANT, partyA)!.legalFirstName).toBe("Grace");
+  expect(parties.findOwned(TENANT, partyB)!.legalFirstName).toBe("Alan");
+  expect(JSON.parse(requests.find(companyB, "create_provider")!.detail!).awaitingPartyEdit).toBe(
+    true,
+  );
+});
+
+test("a company with NO bound party is refused rather than answered with somebody else's", () => {
+  // Unreachable through the doors (`createCompany` binds inside the mint transaction), and that
+  // is exactly why the refusal must exist: a resolve that found nothing must never fall through
+  // to a scan.
+  const companyId = companies.create({
+    tenantId: TENANT,
+    status: "ready",
+    provider: "doola",
+    environment: "sandbox",
+    synthetic: false,
+    nameOptions: companyNameOptions("Orphan One", "Orphan Two", "Orphan Three"),
+    businessPurpose: "p",
+    industryLabel: "Software development",
+    intakeSynthesized: false,
+  });
+  expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({
+    error: formationPartyUnavailableMessage(),
+  });
 });
 
 // ── the park, and its one retry ─────────────────────────────────────────────────────────────
@@ -180,7 +241,7 @@ test("a PARKED party is edited, and the edit buys exactly one retry with the new
   const companyId = newCompany(partyId);
   parkAwaitingPartyEdit(companyId);
 
-  expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED)).toEqual({ partyId });
+  expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({ partyId });
 
   // 1. The identity is the NEW one — which is the body the next `createCustomer` will send.
   const after = parties.findOwned(TENANT, partyId)!;
@@ -199,7 +260,7 @@ test("a PARKED party is edited, and the edit buys exactly one retry with the new
   expect(JSON.parse(row.detail!)).not.toHaveProperty("awaitingPartyEdit");
   // 3. ONE retry: a second edit is needed for a second one, which is the whole rule. Re-arming a
   //    row that is not parked is a no-op, so the flag does not come back.
-  expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED)).toEqual({ partyId });
+  expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({ partyId });
   expect(JSON.parse(requests.find(companyId, "create_provider")!.detail!)).not.toHaveProperty(
     "awaitingPartyEdit",
   );
@@ -212,7 +273,7 @@ test("it clears its OWN flag only — an intake park is NOT re-armed by a party 
   const companyId = newCompany(partyId);
   parkAwaitingPartyEdit(companyId, { awaitingIntakeEdit: true });
 
-  updateFormationParty(deps(), TENANT, partyId, CORRECTED);
+  updateCompanyParty(deps(), TENANT, companyId, CORRECTED);
   const detail = JSON.parse(requests.find(companyId, "create_provider")!.detail!);
   expect(detail.awaitingPartyEdit).toBeUndefined();
   expect(detail.awaitingIntakeEdit).toBe(true);
@@ -230,7 +291,7 @@ test("a party whose filing has a CUSTOMER at doola is frozen — the edit would 
     detail: JSON.stringify({ customerId: "cus-1" }),
   });
 
-  expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED)).toEqual({
+  expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({
     error: partyFrozenMessage(),
   });
   expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Ada");
@@ -264,20 +325,15 @@ test("a SENT, SUBMITTED or FILED company's party is frozen; an unopened one's is
     const companyId = newCompany(partyId);
     requests.claimStep(companyId, "create_provider");
     apply(companyId);
-    expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED), label).toEqual({
+    expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED), label).toEqual({
       error: partyFrozenMessage(),
     });
   }
 
   // …and the everyday case: a company whose filing has not been opened at all.
   const partyId = newParty();
-  newCompany(partyId);
-  expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED)).toEqual({ partyId });
-});
-
-test("an UNBOUND party is editable — nothing has been filed with it", () => {
-  const partyId = newParty();
-  expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED)).toEqual({ partyId });
+  const companyId = newCompany(partyId);
+  expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({ partyId });
   expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Grace");
 });
 
@@ -297,7 +353,7 @@ test("the bind, the synthetic marker and the SSN columns all survive an edit", (
       WHERE party_id = ?`,
   ).run(partyId);
 
-  expect(updateFormationParty(deps(), TENANT, partyId, CORRECTED)).toEqual({ partyId });
+  expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({ partyId });
 
   const row = db.prepare("SELECT * FROM formation_parties WHERE party_id = ?").get(partyId) as {
     company_id: string;

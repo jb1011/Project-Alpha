@@ -20,7 +20,7 @@ import {
   ssnNotOnThisDoorMessage,
   truncateTenant,
 } from "../formation";
-import { createCompany, updateFormationParty } from "../formation/company";
+import { createCompany, updateCompanyParty } from "../formation/company";
 import { describeIndustryLabels } from "../formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
@@ -641,12 +641,17 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     );
 
   /**
-   * `update_formation_party` — the MCP twin of `PATCH /formation-party/:partyId` (design §7, A3).
+   * `update_company_party` — the MCP twin of `PATCH /companies/:companyId/party` (design §7, A3).
    *
    * The one door that reopens a company doola refused on its PARTY, and it exists on BOTH
    * surfaces because an agent-first caller who registered an identity through
    * `create_formation_party` can equally have it refused, and a park with a browser-only exit is
    * a park an agent cannot leave.
+   *
+   * ⚠ ADDRESSED BY COMPANY. It took a `partyId` first, which let a mistyped handle rewrite the
+   * responsible person of a DIFFERENT company mid-filing — a rule to enforce rather than a
+   * sentence nobody can write. The party is resolved from the company's UNIQUE `company_id`, and
+   * `companyId` is the id `get_company` already hands the caller for the park it is fixing.
    *
    * ⚠ It takes NO `ssn`, and — exactly like `create_company` — the field is DECLARED so that
    * passing one is refused rather than silently stripped (A2's finding 1, and this door reached
@@ -661,12 +666,12 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
    */
   if (deps.formation)
     server.registerTool(
-      "update_formation_party",
+      "update_company_party",
       {
-        title: "Update formation party",
-        description: `Correct the legal identity of the responsible person on a filing the provider REFUSED — the one exit from a company parked on awaitingPartyEdit (see get_company). Editable only until the filing has been sent: once the provider has the person, it is never asked for them again, and an edit here would change our copy and nothing else. Takes the same fields as create_formation_party and NEVER an ssn — an SSN is collected only by the web form, which is also the only place it can be re-captured. ${formationCapabilityNote(deps)} The response contains the handle and nothing else.`,
+        title: "Update the company's responsible party",
+        description: `Correct the legal identity of the responsible person on a filing the provider REFUSED — the one exit from a company parked on awaitingPartyEdit (see get_company). It is addressed by companyId: the party is the one this company was filed with, so no other company's person can be touched. Editable only until the filing has been sent: once the provider has the person, it is never asked for them again, and an edit here would change our copy and nothing else. Takes the same identity fields as create_formation_party and NEVER an ssn — an SSN is collected only by the web form, which is also the only place it can be re-captured. ${formationCapabilityNote(deps)} The response contains the handle and nothing else.`,
         inputSchema: {
-          partyId: z.string(),
+          companyId: z.string(),
           legalFirstName: z.string(),
           legalLastName: z.string(),
           email: z.string(),
@@ -687,18 +692,18 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         if ((args as { ssn?: unknown }).ssn !== undefined)
           return { content: [{ type: "text", text: ssnNotOnThisDoorMessage() }], isError: true };
         try {
-          const { partyId, ssn: _ssn, ...rest } = args as Record<string, unknown>;
+          const { companyId, ssn: _ssn, ...rest } = args as Record<string, unknown>;
           // The SAME `.strict()` schema the create parses, so a field one door refuses cannot be
           // quietly accepted by the other — and an `ssn` key is refused BY that strictness rather
           // than by a check somebody has to remember to write.
           const body = FormationPartySchema.parse(rest);
-          const result = updateFormationParty(
+          const result = updateCompanyParty(
             {
               ...deps.formation!.companyDeps,
               transaction: (fn) => deps.repo.transaction(fn),
             },
             tenantId,
-            partyId as string,
+            companyId as string,
             {
               legalFirstName: body.legalFirstName,
               legalLastName: body.legalLastName,
@@ -853,7 +858,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       {
         title: "Get company",
         description:
-          "Fetch one of your legal bodies in full: its filing state, the documents filed for it, the agents attached to it, and — if the filing has STOPPED — which of the three human decisions it is waiting on. A parked company does nothing until its owner acts: awaitingIntakeEdit is fixed by re-submitting names/purpose/industry, awaitingPartyEdit by correcting the responsible party, awaitingSsnDecision by re-supplying an SSN or confirming the slower EIN route. The last two go through the web form and the party-edit call respectively; an SSN is never an argument here.",
+          "Fetch one of your legal bodies in full: its filing state, the documents filed for it, the agents attached to it, and — if the filing has STOPPED — which of the three human decisions it is waiting on. A parked company does nothing until its owner acts: awaitingIntakeEdit is fixed by re-submitting names/purpose/industry, awaitingPartyEdit by correcting the responsible party, awaitingSsnDecision by re-supplying an SSN or confirming the slower EIN route. The last two go through the web form and update_company_party respectively; an SSN is never an argument here.",
         inputSchema: { companyId: z.string() },
       },
       async ({ companyId }) => {
