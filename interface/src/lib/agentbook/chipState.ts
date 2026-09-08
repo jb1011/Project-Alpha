@@ -21,6 +21,12 @@ import type { AgentBookStatusView } from "@/lib/api/types";
  *  runs on, so this is deliberately not the agent's chain explorer. */
 export const WORLDCHAIN_EXPLORER_URL = "https://worldscan.org";
 
+/** AgentBook itself, on World Chain (design §1.2). Where the chip points when we know a vouch
+ *  exists but not which transaction wrote it: the agent's own pocket has never transacted on World
+ *  Chain — Novi Corpus sends the registration — so its address page is empty, and an empty page is
+ *  a worse answer than the registry it is an entry in. */
+export const AGENT_BOOK_ADDRESS = "0xA23aB2712eA7BBa896930544C7d6636a96b944dA";
+
 /** §5.2's states, minus the ones only the vouch dialog is ever in (`awaiting-approval`). */
 export type AgentBookChipKind =
   | "vouched"
@@ -88,10 +94,12 @@ const FAILED: AgentBookChipState = {
   note: FAILURE_COPY,
 };
 
-function explorerHref(view: AgentBookStatusView): string | undefined {
-  if (view.txHash) return `${WORLDCHAIN_EXPLORER_URL}/tx/${view.txHash}`;
-  if (view.address) return `${WORLDCHAIN_EXPLORER_URL}/address/${view.address}`;
-  return undefined;
+/** The transaction that wrote the vouch when we know it, else AgentBook itself. Never the pocket:
+ *  it has no World Chain history to show. */
+function explorerHref(view: AgentBookStatusView): string {
+  return view.txHash
+    ? `${WORLDCHAIN_EXPLORER_URL}/tx/${view.txHash}`
+    : `${WORLDCHAIN_EXPLORER_URL}/address/${AGENT_BOOK_ADDRESS}`;
 }
 
 /**
@@ -113,6 +121,10 @@ export function agentBookChipState(
     case "submitted":
       return SUBMITTING;
     case "failed":
+      // A live `registered` outranks a failed row: the registry is the truth and the row is
+      // history. This is the case the failure copy anticipates out loud — "it may still have gone
+      // through" — so once the chain says it did, saying "could not check" is the false statement.
+      if (view.outcome === "registered") break;
       return FAILED;
     case "disputed":
       return DISPUTED;

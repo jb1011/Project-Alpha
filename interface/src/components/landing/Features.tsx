@@ -28,7 +28,7 @@ const features: Feature[] = [
   {
     tag: "Identity",
     title: "World ID accountability",
-    body: "Wyoming DAO LLCs need a natural person. World ID proves one unique human per account without storing name, document, or face. AgentBook on World Chain powers human-backed payment trust.",
+    body: "Wyoming DAO LLCs need a natural person. World ID proves one unique human per account without storing name, document, or face. In World's AgentBook on World Chain, a World ID verified human can vouch for an agent's payment address, and a seller can check it before accepting a payment.",
     icon: <IconWorld />,
   },
   {

@@ -20,9 +20,13 @@ const IN_FLIGHT = "Vouch submitted, checking the registry";
 const FAILURE_COPY =
   "We could not confirm the registration. It may still have gone through; we are checking the registry and will update this.";
 
+/** The agent's own payment address — the thing AgentBook is asked about, and the thing the chip
+ *  must never link to (it has no World Chain history of its own). */
+const ADDRESS = "0x00000000000000000000000000000000000000a1";
+
 const view = (over: Partial<AgentBookStatusView> = {}): AgentBookStatusView => ({
   registered: false,
-  address: "0x00000000000000000000000000000000000000a1",
+  address: ADDRESS,
   ...over,
 });
 
@@ -65,7 +69,11 @@ describe("every status × outcome combination", () => {
   for (const status of STATUSES) {
     for (const outcome of OUTCOMES) {
       const expected =
-        (status && BY_STATUS[status]) ?? BY_OUTCOME[String(outcome)];
+        // The one place the chain overrules our row: a failed submit whose registration the
+        // registry can nonetheless see.
+        status === "failed" && outcome === "registered"
+          ? VOUCHED
+          : (status && BY_STATUS[status]) ?? BY_OUTCOME[String(outcome)];
       test(`status=${status ?? "none"} outcome=${outcome ?? "none"} → "${expected}"`, () => {
         const state = agentBookChipState(
           view({ status, outcome, registered: outcome === "registered" }),
@@ -98,10 +106,28 @@ test("a failed submit shows §5.2's copy verbatim, as visible text and not only 
   expect(state?.label).not.toBe(NOT_IN);
 });
 
+test("a failed row does not outlive the registry: a live 'registered' still reads as vouched", () => {
+  // The failure copy says out loud that the transaction may still have gone through. Once the
+  // chain says it did, repeating "could not check" is the false statement.
+  const state = agentBookChipState(
+    view({ status: "failed", registered: true, outcome: "registered", errorCode: "replaced" }),
+  );
+  expect(state?.label).toBe(VOUCHED);
+  expect(state?.note).toBeUndefined();
+});
+
 test("an agent with no payment address gets NO chip at all", () => {
   expect(agentBookChipState(view({ reason: "no-pocket-yet", address: undefined }))).toBeNull();
   expect(agentBookChipState(null)).toBeNull();
   expect(agentBookChipState(undefined)).toBeNull();
+});
+
+test("a live row still speaks even when the view claims there is no address yet", () => {
+  // Ordering guard, not a real backend shape: `reason` must never suppress a vouch that is in
+  // flight. Silence at that moment is the same false "it didn't happen" §5.2 forbids.
+  const state = agentBookChipState(view({ status: "pending", reason: "no-pocket-yet" }));
+  expect(state?.label).toBe(IN_FLIGHT);
+  expect(state).not.toBeNull();
 });
 
 test("an absent outcome is 'could not check', never a vouch — even with registered: true", () => {
@@ -121,18 +147,21 @@ test("an expired row falls back to the chain, exactly like no row", () => {
   expect(agentBookChipState(view({ status: "expired", outcome: "registered" }))?.label).toBe(VOUCHED);
 });
 
-test("the vouched chip links to World Chain — the transaction when there is one, else the address", () => {
+test("the vouched chip links to the transaction, or to AgentBook itself — never to the pocket", () => {
+  // The pocket has no World Chain history: Novi Corpus sends the registration, so the pocket's
+  // address page there is empty. An empty page is a worse answer than the registry it is in.
+  const pocketPage = `https://worldscan.org/address/${ADDRESS}`;
   expect(
     agentBookChipState(view({ registered: true, outcome: "registered", txHash: "0xdeadbeef" }))?.href,
   ).toBe("https://worldscan.org/tx/0xdeadbeef");
-  expect(
-    agentBookChipState(view({ registered: true, outcome: "registered", txHash: null }))?.href,
-  ).toBe("https://worldscan.org/address/0x00000000000000000000000000000000000000a1");
-  expect(
-    agentBookChipState(
-      view({ registered: true, outcome: "registered", address: undefined }),
-    )?.href,
-  ).toBeUndefined();
+  for (const view_ of [
+    view({ registered: true, outcome: "registered", txHash: null }),
+    view({ registered: true, outcome: "registered", address: undefined }),
+  ]) {
+    const href = agentBookChipState(view_)?.href;
+    expect(href).toBe("https://worldscan.org/address/0xA23aB2712eA7BBa896930544C7d6636a96b944dA");
+    expect(href).not.toBe(pocketPage);
+  }
 });
 
 test("no label anywhere claims 'human-backed', and only the vouch links out", () => {

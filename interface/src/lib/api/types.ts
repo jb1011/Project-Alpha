@@ -530,8 +530,12 @@ export type AgentBookRowStatus =
  *
  * Everything the vouch feature added is optional for deploy-order safety: the interface and the
  * API deploy separately and this route predates the feature, so a new browser can meet an old
- * backend. Absent `outcome` means exactly that, and `registered` is then the whole answer —
- * `outcome ?? (registered ? "registered" : "unregistered")`; absent `disputed` is `false`.
+ * backend. An absent `outcome` is exactly that backend, and it is read as **`unknown`** — "could
+ * not check", never a vouch. It is tempting to fall back to `registered`, but that boolean cannot
+ * distinguish "no entry" from "we could not reach World Chain", and both of the claims it would
+ * then make are public statements about a real person (design v3 §5.4, D9). Absent `disputed` is
+ * `false`. `src/lib/agentbook/chipState.ts` is the one implementation of this rule; render through
+ * it rather than reading these fields directly.
  */
 export type AgentBookStatusView = {
   registered: boolean;

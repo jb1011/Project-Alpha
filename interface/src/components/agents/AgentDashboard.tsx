@@ -434,7 +434,7 @@ export function AgentDashboard({
                     ? entity.trustPolicy === "verified-legal-bodies-only"
                       ? "Strictest — legal bodies only (own setting)"
                       : entity.trustPolicy === "verified-sellers-only"
-                        ? "Strict — human-backed sellers (own setting)"
+                        ? "Strict — sellers vouched for in AgentBook (own setting)"
                         : "Open (own setting)"
                     : "Platform default"
                 }
