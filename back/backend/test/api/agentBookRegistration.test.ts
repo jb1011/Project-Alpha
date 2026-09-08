@@ -32,6 +32,8 @@ let db: Database.Database;
 let repo: SqliteEntityRepository;
 let world: SqliteWorldStore;
 let abRepo: SqliteAgentBookRepository;
+/** The status route's plain-lookup path. A spy, so a test can prove it was NOT consulted. */
+let reader: { lookupHuman: ReturnType<typeof vi.fn> };
 let logs: string[];
 
 beforeEach(() => {
@@ -40,6 +42,7 @@ beforeEach(() => {
   repo = new SqliteEntityRepository(db);
   world = new SqliteWorldStore(db);
   abRepo = new SqliteAgentBookRepository(db);
+  reader = { lookupHuman: vi.fn(async () => null) };
   logs = [];
   vi.spyOn(console, "log").mockImplementation((...a) => {
     logs.push(a.map(String).join(" "));
@@ -131,7 +134,7 @@ function makeApp(
     },
     agentBook: {
       repo: abRepo,
-      reader: { lookupHuman: async () => null },
+      reader,
       store: world,
       network: "testnet",
       caps,
@@ -492,6 +495,41 @@ test("an exhausted WRITE budget stops a vouch but never blinds the status chip",
 test("a deployment WITH a submitter key advertises the vouch dialog", async () => {
   const cfg = await (await makeApp().request("/config")).json();
   expect(cfg.agentBookRegistrationAvailable).toBe(true);
+});
+
+test("a confirming reconcile beats the negative the previous poll cached", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const reg = registrar();
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  await call(app, "/register", proofBody(sessionId));
+
+  // Poll 1: still in flight, nobody registered yet. This caches `null` for 60 seconds — the
+  // entry that used to be served BESIDE a confirmed row for the rest of that minute.
+  const first = await (await call(app, "")).json();
+  expect(first).toMatchObject({ status: "submitted", registered: false, outcome: "unregistered" });
+
+  // Poll 2: the chain has moved, and lookupHuman answers with OUR nullifier (minimal hex for the
+  // padded value we stored — the reconciler compares numerically).
+  reg.getNextNonce.mockResolvedValue(1n);
+  reg.lookupHuman.mockResolvedValue("0xbadf00d");
+  const second = await (await call(app, "")).json();
+  expect(second).toMatchObject({
+    status: "confirmed",
+    registered: true,
+    outcome: "registered",
+    humanId: "0xbadf00d",
+    disputed: false,
+  });
+  // The reader was consulted ONCE — by poll 1. Poll 2 answered from the reconciled row and
+  // refreshed the cache on the way past instead of reading it.
+  expect(reader.lookupHuman).toHaveBeenCalledTimes(1);
+  // Cached in the SAME spelling every other writer uses (minimal hex), because worldVerifier
+  // keys its per-human allowance off this value.
+  expect(world.getCachedLookup(POCKET, Date.now(), 600_000, 60_000)).toEqual({
+    humanId: "0xbadf00d",
+  });
 });
 
 test("GET after submit reconciles and reports the row", async () => {

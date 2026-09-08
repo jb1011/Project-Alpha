@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { type Address, getAddress } from "viem";
+import { type Address, getAddress, toHex } from "viem";
 import { z } from "zod";
 import { ContractRevertError } from "../../adapters/arc/relay";
 import {
@@ -97,6 +97,26 @@ const RegisterBody = z.object({
   nullifierHash: uint,
   proof: z.array(uint).length(8),
 });
+
+/**
+ * A stored nullifier in the spelling every OTHER writer of the lookup cache uses.
+ *
+ * The submit route stores the nullifier exactly as World sent it (zero-padded, `0x0badf00d`),
+ * while `lookupHuman` — and therefore `sellerTrust`, `worldVerifier` and the reconciler's
+ * `disputed` branch — writes viem's minimal hex for the same number (`0xbadf00d`). That cached
+ * value is not just displayed: `worldVerifier` uses it as the ALLOWANCE KEY
+ * (`tryIncrementUsage(humanId, …)`), so two spellings of one human would be two buckets and twice
+ * the allowance. `null` when the stored value is not a number we can canonicalise, which routes
+ * the caller to a fresh lookup rather than poisoning the cache with a guess.
+ */
+function asHumanId(nullifier: string | null): string | null {
+  if (nullifier === null) return null;
+  try {
+    return toHex(BigInt(nullifier));
+  } catch {
+    return null;
+  }
+}
 
 export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
   const ab = deps.agentBook;
@@ -367,14 +387,19 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     // cannot answer. Either one spends ONE read token, taken BEFORE the call — a dashboard full
     // of chips must never be able to drain the World Chain quota the trust dials share. Out of
     // budget the answer is `unknown` ("could not check"), never `unregistered`.
-    const cacheProbe = () =>
-      ab.store.getCachedLookup(address, now(), LOOKUP_POSITIVE_TTL_MS, LOOKUP_NEGATIVE_TTL_MS);
+    const cached = ab.store.getCachedLookup(
+      address,
+      now(),
+      LOOKUP_POSITIVE_TTL_MS,
+      LOOKUP_NEGATIVE_TTL_MS,
+    );
     // Reconcile needs the registrar; a read-only deployment serves the row exactly as stored.
     const registrar = ab.registrar;
     const needsReconcile =
       Boolean(registrar) && (row?.status === "pending" || row?.status === "submitted");
-    const budgeted = needsReconcile || !cacheProbe() ? ab.readBudget.take() : false;
-    if (registrar && needsReconcile && budgeted && row)
+    const budgeted = needsReconcile || !cached ? ab.readBudget.take() : false;
+    let reconciled = false;
+    if (registrar && needsReconcile && budgeted && row) {
       row = await reconcileRow(row, {
         repo: ab.repo,
         registrar,
@@ -382,12 +407,26 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
         now,
         log: opsLog,
       });
-    // Probed AGAIN after the reconcile: its `disputed` branch writes a fresh `cacheLookup`, and
-    // reading that here saves a second round trip for the answer it just fetched.
-    const cached = cacheProbe();
+      reconciled = true;
+    }
+    /**
+     * ONCE A RECONCILE HAS RUN, THE CACHE IS DEAD TO US.
+     *
+     * The reconciler writes the cache on its `disputed` branch only, never on `confirmed` — so a
+     * `null` this route cached on the previous poll (60s TTL) would outlive the confirmation and
+     * be served beside it, producing `{ status: "confirmed", registered: false }` in one body.
+     * Polling makes that the NORMAL path, not a race. The reconciled row is strictly fresher than
+     * anything cached, so it answers for itself and refreshes the cache on the way past.
+     */
+    const confirmedId = reconciled && row?.status === "confirmed" ? asHumanId(row.nullifier) : null;
     let humanId: string | null | undefined;
-    if (cached) humanId = cached.humanId;
+    if (confirmedId !== null) {
+      humanId = confirmedId;
+      ab.store.cacheLookup(address, humanId, now());
+    } else if (!reconciled && cached) humanId = cached.humanId;
     else if (budgeted) {
+      // Reconciled to something other than `confirmed`: ask the contract. The read token was
+      // already spent on the reconcile, so this costs no further budget.
       try {
         humanId = await ab.reader.lookupHuman(address);
         // Only a DEFINITIVE answer is cached — `lookupHuman` throws rather than returning null on
