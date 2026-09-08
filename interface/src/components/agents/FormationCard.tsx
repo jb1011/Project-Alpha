@@ -1,17 +1,19 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 import { downloadDocument } from "@/lib/api/client";
+import { useCompanyQuery } from "@/lib/api/hooks";
 import {
   formationEnvironmentOf,
   type FormationEnvironment,
 } from "@/lib/api/formationEnvironment";
 import {
-  isKnownFormationStatus,
   type EntityView,
   type FormationDocument,
   type FormationStatus,
 } from "@/lib/api/types";
+import { filingTone, mayRenderConfirmed } from "@/lib/formation/honesty";
 import { formatDate } from "@/lib/format";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { AmberPill, Card, SectionTitle, Spinner, cx } from "@/components/onboarding/primitives";
@@ -44,6 +46,28 @@ export function FormationCard({ formation }: { formation: Formation }) {
 
   const companyId = formation.companyId;
   const environment = formationEnvironmentOf(formation.environment);
+  /**
+   * The company row, for the ONE thing an entity view cannot carry: whether this filing is PARKED
+   * waiting on a human (§4.6a/§4.7).
+   *
+   * The three parks are a property of the COMPANY, and a dashboard that showed "filing in
+   * progress" over a filing that stopped three weeks ago and is waiting for its owner is the
+   * failure this whole phase exists to fix. What the card does NOT do is offer the forms: those
+   * live on the company page, once, so an owner is never editing an identity in two places.
+   */
+  const company = useCompanyQuery(companyId);
+  const park = company.data?.park;
+  const parked = park
+    ? (["awaitingIntakeEdit", "awaitingPartyEdit", "awaitingSsnDecision"] as const).filter(
+        (k) => park[k],
+      )
+    : [];
+  /**
+   * The §7 SHARING LABEL. `sharedWith` is the TOTAL attached, including this agent, so "1" means
+   * not shared — the subtraction happens HERE, once, where the sentence is written. `null`/absent
+   * is a backend that did not count, and it renders nothing rather than "not shared".
+   */
+  const sharedWith = formation.sharedWith ?? null;
   const confirmedReal = environment === "production";
   // Amber covers "sandbox" AND "unknown" — everything that is not a confirmed real filing.
   const sandbox = environment === "sandbox";
@@ -122,7 +146,41 @@ export function FormationCard({ formation }: { formation: Formation }) {
         {/* Owner-visible only: the authenticated entity view is the ONLY surface that carries it,
             and this dashboard is the only place it is rendered. */}
         <Row k="EIN" v={formation.ein ?? "—"} mono={!!formation.ein} />
+        {sharedWith !== null && (
+          <Row
+            k="Shared with"
+            v={
+              sharedWith > 1
+                ? `${sharedWith - 1} other agent${sharedWith === 2 ? "" : "s"}`
+                : "No other agents"
+            }
+          />
+        )}
       </dl>
+
+      {/* The filing has STOPPED and is waiting on this owner. It sits above the documents, and
+          it links rather than duplicating the forms: an identity edited in two places is an
+          identity edited in the wrong one. */}
+      {parked.length > 0 && companyId && (
+        <div className="mt-5 rounded-xl border border-[#febc2e]/30 bg-[#febc2e]/[0.07] px-4 py-3">
+          <div className="text-[12px] font-medium text-ink">
+            This filing has stopped and is waiting on you
+          </div>
+          <ul className="mt-2 flex flex-col gap-1.5">
+            {parked.map((k) => (
+              <li key={k} className="text-[11.5px] leading-[1.5] text-[#f3cd72]">
+                {PARK_SUMMARY[k]}
+              </li>
+            ))}
+          </ul>
+          <Link
+            href={`/agents/companies/${encodeURIComponent(companyId)}`}
+            className="mt-3 inline-flex text-[11.5px] text-accent-soft underline-offset-2 hover:underline"
+          >
+            Open the company to fix it →
+          </Link>
+        </div>
+      )}
 
       {requiredActions.length > 0 && (
         <div className="mt-5 rounded-xl border border-[#febc2e]/30 bg-[#febc2e]/[0.07] px-4 py-3">
@@ -139,7 +197,17 @@ export function FormationCard({ formation }: { formation: Formation }) {
       )}
 
       <div className="mt-5 border-t hairline pt-4">
-        <SectionTitle>Legal documents{sandbox && " (demo)"}</SectionTitle>
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <SectionTitle>Legal documents{sandbox && " (demo)"}</SectionTitle>
+          {companyId && (
+            <Link
+              href={`/agents/companies/${encodeURIComponent(companyId)}`}
+              className="text-[11.5px] text-muted transition-colors hover:text-ink"
+            >
+              The company →
+            </Link>
+          )}
+        </div>
         {documents.length === 0 ? (
           <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
             None yet. The filing agent produces the Articles of Organization and the Operating
@@ -195,8 +263,9 @@ function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
  *  whatever the sub-status says, never for an environment we could not read, and never for a
  *  status this build has never heard of. */
 function statusTone(status: FormationStatus, environment: FormationEnvironment): string {
-  if (status === "failed") return "text-[#ff8a84]";
-  if (environment !== "production" || !isKnownFormationStatus(status)) return "text-[#f3cd72]";
+  const tone = filingTone(environment, status);
+  if (tone === "failed") return "text-[#ff8a84]";
+  if (!mayRenderConfirmed(tone)) return "text-[#f3cd72]";
   if (status === "filed" || status === "complete") return "text-emerald-300";
   return "text-muted";
 }
@@ -294,3 +363,16 @@ function formatBytes(size: number): string {
   if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+/**
+ * One line per park, in the SUMMARY register the dashboard needs.
+ *
+ * Deliberately not `/config.formationCopy.park`, which is the fuller explanation the Companies
+ * page renders next to the form that fixes it. Here the job is only to name which of the three
+ * it is, so the owner knows whether the next click is theirs.
+ */
+const PARK_SUMMARY = {
+  awaitingIntakeEdit: "The filing agent refused the company's details.",
+  awaitingPartyEdit: "The filing agent refused the responsible person's details.",
+  awaitingSsnDecision: "An SSN was deleted by the retention clock before the filing was sent.",
+} as const;

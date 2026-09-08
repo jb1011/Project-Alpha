@@ -20,9 +20,9 @@ import {
 import { isKnownEnvironment, type FormationEnvironment } from "@/lib/api/formationEnvironment";
 import type { CompanyView } from "@/lib/api/types";
 import {
-  canAttach,
   companyLabel,
   isCompanyIntakeValid,
+  legalBodyBranch,
   validateCompanyIntake,
   type CompanyIntakeForm,
 } from "@/lib/formation/companyIntake";
@@ -119,21 +119,15 @@ export function LegalBodyStep({
   const paymentRequired = publicConfig?.formationPaymentRequired === true;
 
   const companies = useCompaniesQuery(resolved && !companyId);
-  const attachable = (companies.data?.companies ?? []).filter(canAttach);
-  // The list is NEWEST FIRST — an API-level contract, not a convenience — so the first row is the
-  // last-used company, which is the picker's default. Never re-sorted here: two renderers sorting
-  // for themselves is how a picker ends up disagreeing with the list behind it.
   const [picked, setPicked] = useState<string | null>(null);
-  const selected = picked ?? attachable[0]?.companyId ?? null;
-
-  /**
-   * ATTACH or CREATE. Defaults to attach WHENEVER there is something to attach to, because that
-   * is the free path and the fast one — but only once the list has actually arrived, so the
-   * screen does not flip out from under somebody who started typing.
-   */
   const [mode, setMode] = useState<"attach" | "create" | null>(null);
-  const effectiveMode: "attach" | "create" =
-    mode ?? (attachable.length > 0 ? "attach" : "create");
+  // The whole branch state, in ONE pure function so it can be asserted: which branch, what is
+  // attachable, and which row is selected. See `legalBodyBranch` for each of the three rules.
+  const {
+    mode: effectiveMode,
+    attachable,
+    selected,
+  } = legalBodyBranch(companies.data?.companies ?? [], mode, picked);
 
   const industries = useIndustriesQuery(resolved && effectiveMode === "create");
   const industryOptions = industries.data?.industries ?? [];

@@ -180,3 +180,35 @@ export function companyLabel(company: Pick<CompanyView, "legalNameFiled" | "name
   const first = company.nameOptions[0];
   return first ? `${first.name} ${first.entityTypeEnding}`.trim() : "Unnamed company";
 }
+
+/**
+ * THE WIZARD'S LEGAL-BODY BRANCH, as one pure function (design §7).
+ *
+ * Three decisions the step used to make inline, which is three decisions no test could reach —
+ * and the interface runner is deliberately not a component runner, so anything worth asserting
+ * has to be a function a component calls:
+ *
+ *  1. WHICH BRANCH. Attach is the default whenever there is anything to attach to, because that
+ *     is the free path and the fast one — but only once the caller has not chosen otherwise. A
+ *     caller who clicked "create" stays on create even if their company list arrives afterwards,
+ *     or the screen flips out from under somebody who has started typing.
+ *  2. WHAT IS ATTACHABLE. `canAttach`, which mirrors the backend's own predicate.
+ *  3. WHICH IS SELECTED. The FIRST attachable row, because the server orders newest first and
+ *     that is the last-used company — an API-level contract shared with `list_companies`, never
+ *     re-sorted here. An explicit pick wins, and a pick that is no longer attachable (the list
+ *     refreshed, the company was abandoned) falls back rather than pointing at a row that is not
+ *     on screen.
+ */
+export function legalBodyBranch(
+  companies: readonly CompanyView[],
+  chosenMode: "attach" | "create" | null,
+  pickedCompanyId: string | null,
+): { mode: "attach" | "create"; attachable: CompanyView[]; selected: string | null } {
+  const attachable = companies.filter(canAttach);
+  const picked = attachable.some((c) => c.companyId === pickedCompanyId) ? pickedCompanyId : null;
+  return {
+    mode: chosenMode ?? (attachable.length > 0 ? "attach" : "create"),
+    attachable,
+    selected: picked ?? attachable[0]?.companyId ?? null,
+  };
+}

@@ -21,6 +21,7 @@ import {
   duplicateKey,
   emptyCompanyIntake,
   isCompanyIntakeValid,
+  legalBodyBranch,
   stripEntityEnding,
   validateCompanyIntake,
 } from "@/lib/formation/companyIntake";
@@ -150,4 +151,47 @@ test("the picker's label prefers the FILED name, and never invents one", () => {
   // A company whose candidates are unreadable gets a placeholder rather than an empty string —
   // and it is not called a filed name anywhere, which is why the two are separate fields.
   expect(companyLabel(company({ nameOptions: [] }))).toBe("Unnamed company");
+});
+
+/* ── the wizard's branch ─────────────────────────────────────────────────── */
+
+test("BRANCH: attach is the default when there is anything to attach to, create when there is not", () => {
+  expect(legalBodyBranch([], null, null).mode).toBe("create");
+  expect(legalBodyBranch([company()], null, null).mode).toBe("attach");
+  // A company nobody can attach to is not something to attach to.
+  expect(legalBodyBranch([company({ state: "draft" })], null, null).mode).toBe("create");
+});
+
+test("BRANCH: an explicit choice WINS, even when the list arrives afterwards", () => {
+  // The screen must not flip out from under somebody who clicked "create" and started typing —
+  // which is exactly what happens if the default is recomputed as the query resolves.
+  expect(legalBodyBranch([company()], "create", null).mode).toBe("create");
+  expect(legalBodyBranch([], "attach", null).mode).toBe("attach");
+});
+
+test("BRANCH: the default selection is the FIRST attachable row — the server's ordering", () => {
+  // `GET /companies` is newest-first, which is an API-level contract shared with the picker's
+  // "last used" default. Re-sorting here is how a picker disagrees with the list behind it.
+  const rows = [company({ companyId: "newest" }), company({ companyId: "older" })];
+  expect(legalBodyBranch(rows, null, null).selected).toBe("newest");
+  expect(legalBodyBranch(rows, null, "older").selected).toBe("older");
+});
+
+test("BRANCH: unattachable rows are filtered OUT, and never selected by default", () => {
+  const rows = [
+    company({ companyId: "draft", state: "draft" }),
+    company({ companyId: "abandoned", state: "abandoned" }),
+    company({ companyId: "usable", state: "filed" }),
+  ];
+  const branch = legalBodyBranch(rows, null, null);
+  expect(branch.attachable.map((c) => c.companyId)).toEqual(["usable"]);
+  expect(branch.selected).toBe("usable");
+});
+
+test("BRANCH: a pick that is no longer attachable FALLS BACK rather than pointing at nothing", () => {
+  // The list refreshed and the company was abandoned in between. Keeping the id would leave the
+  // confirm button pointing at a row that is not on screen — and the onboard would be refused.
+  const rows = [company({ companyId: "usable" })];
+  expect(legalBodyBranch(rows, null, "gone").selected).toBe("usable");
+  expect(legalBodyBranch([], null, "gone").selected).toBeNull();
 });
