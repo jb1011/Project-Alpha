@@ -127,9 +127,6 @@ export function LegalBodyStep({
   // fields below are NEVER gated on it: a sentence that has not arrived is a sentence, and a
   // form field that disappears with it is a route silently taken away.
   const copy = formationCopyOf(publicConfig);
-  // Absent means false, and that is the honest reading: a backend that predates the field takes
-  // no payment. B1 ships the field and the payment step together.
-  const paymentRequired = publicConfig?.formationPaymentRequired === true;
 
   // The environment THIS SCREEN may claim: the attached company's row when there is one, the
   // deployment's own answer while the next action is still to create a company. One function,
@@ -311,7 +308,11 @@ export function LegalBodyStep({
           Straight to doola, the filing agent, and into one table on this deployment that no view,
           no log, no metadata document and no on-chain record ever reads from. Your agent&apos;s
           public surfaces carry the company — never the person behind it.
-          {!paymentRequired && " Formation is included during the beta."}
+          {/* UNCONDITIONAL, because it is unconditionally true of every deployment this build
+              can talk to: nothing serves `formationPaymentRequired`, so the branch that used to
+              guard this sentence could never be false. B1 ships the field, the quote route and
+              the payment step together, and this sentence changes with them. */}
+          {" Formation is included during the beta."}
         </Callout>
       )}
 

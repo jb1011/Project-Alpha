@@ -186,15 +186,14 @@ export type PublicConfig = {
    *  enforces nothing, which is exactly what absent should mean. */
   formationRequired?: boolean;
   /**
-   * Whether a company must be PAID for before it can be filed (B1).
+   * ⚠ `formationPaymentRequired` and `formationFeeUsdc` are DELIBERATELY ABSENT from this type.
    *
-   * Absent means false, and that is the honest reading rather than a convenience: a backend that
-   * predates the field takes no payment, so the wizard says formation is included during the beta.
-   * B1 ships the field and the payment step together; A3's wizard has neither.
+   * B1 ships them together with the payment step and the quote route. Declaring them here first
+   * bought a branch that could not be reached — no deployment serves either field, so
+   * `formationPaymentRequired === true` was always false — and an optional-typed field that is
+   * always undefined is the shape a reader mistakes for a live capability. The wizard states the
+   * beta unconditionally, which is what is true of every deployment this build can talk to.
    */
-  formationPaymentRequired?: boolean;
-  /** All-in fee in whole USDC, advertised so the beta copy can name what it is waiving (B1). */
-  formationFeeUsdc?: number;
   /**
    * PRODUCT COPY the wizard and the Companies section render verbatim (§7).
    *
