@@ -15,4 +15,12 @@ export const apiKeys = {
   apiKeys: (token: string) => [...apiKeys.all, "apiKeys", token] as const,
   passkeys: (token: string) => [...apiKeys.all, "passkeys", token] as const,
   worldIdMe: (token: string) => [...apiKeys.all, "worldIdMe", token] as const,
+  /* COMPANIES (design §7). Token-scoped like every other authenticated key, so a sign-out cannot
+   * leave one tenant's legal bodies in another's cache. */
+  companies: (token: string) => [...apiKeys.all, "companies", token] as const,
+  company: (token: string, id: string) => [...apiKeys.all, "company", token, id] as const,
+  companyCompliance: (token: string, id: string) =>
+    [...apiKeys.all, "companyCompliance", token, id] as const,
+  /** PUBLIC and token-free: a build-time reference table that is the same for everybody. */
+  industries: () => [...apiKeys.all, "industries"] as const,
 };
