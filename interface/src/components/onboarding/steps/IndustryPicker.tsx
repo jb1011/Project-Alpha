@@ -1,6 +1,7 @@
 "use client";
 
 import { useId, useMemo, useRef, useState } from "react";
+import type { IndustryIndex } from "@/lib/formation/companyIntake";
 import { Field, TextInput, cx } from "../primitives";
 
 /**
@@ -18,13 +19,20 @@ import { Field, TextInput, cx } from "../primitives";
  */
 export function IndustryPicker({
   value,
-  options,
+  industries,
   error,
   loading,
   onChange,
 }: {
   value: string;
-  options: readonly string[];
+  /**
+   * The list, PREPARED ONCE (`industryIndex`).
+   *
+   * It used to be the raw array, and this component walked all 821 labels three times per
+   * keystroke: once to filter, once for the exact-match hint, and once inside `onChange`. All
+   * three lowercased every label each time, for a list that changes on a deploy.
+   */
+  industries: IndustryIndex;
   error?: string;
   loading?: boolean;
   onChange: (label: string) => void;
@@ -38,21 +46,22 @@ export function IndustryPicker({
 
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return options.slice(0, MAX_SUGGESTIONS);
+    if (!q) return industries.options.slice(0, MAX_SUGGESTIONS);
     // Prefix matches first — a founder typing "cons" means "Consulting", not "Air conditioning
     // contractors" — then everything else that contains the query, capped.
     const starts: string[] = [];
     const contains: string[] = [];
-    for (const label of options) {
-      const l = label.toLowerCase();
-      if (l.startsWith(q)) starts.push(label);
-      else if (l.includes(q)) contains.push(label);
+    for (const { label, lower } of industries.lowered) {
+      if (lower.startsWith(q)) starts.push(label);
+      else if (lower.includes(q)) contains.push(label);
       if (starts.length >= MAX_SUGGESTIONS) break;
     }
     return [...starts, ...contains].slice(0, MAX_SUGGESTIONS);
-  }, [query, options]);
+  }, [query, industries]);
 
-  const exact = options.find((o) => o.toLowerCase() === query.trim().toLowerCase());
+  // O(1), and it hands back the label in its CANONICAL casing — which is what must be committed,
+  // because the create door accepts the labels exactly as it ships them.
+  const exact = industries.byLower.get(query.trim().toLowerCase());
 
   function commit(label: string) {
     setQuery(label);
@@ -64,7 +73,7 @@ export function IndustryPicker({
     <Field
       label="Industry"
       htmlFor={id}
-      hint={loading ? "Loading the list…" : `${options.length} to choose from`}
+      hint={loading ? "Loading the list…" : `${industries.options.length} to choose from`}
       error={error}
     >
       <div className="relative">
@@ -90,7 +99,7 @@ export function IndustryPicker({
             // The committed value follows the TEXT only when the text is exactly a label. Anything
             // else clears it: a half-typed query is not a choice, and committing the nearest match
             // would file under an industry nobody picked.
-            const hit = options.find((o) => o.toLowerCase() === e.target.value.trim().toLowerCase());
+            const hit = industries.byLower.get(e.target.value.trim().toLowerCase());
             onChange(hit ?? "");
           }}
         />

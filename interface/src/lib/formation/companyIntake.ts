@@ -57,6 +57,43 @@ export function duplicateKey(raw: string): string {
     .replace(/\s+/g, " ");
 }
 
+/**
+ * THE INDUSTRY LIST, PREPARED ONCE (design §5/§7).
+ *
+ * 821 federal labels, and three consumers that each walked all of them per keystroke: the
+ * type-ahead's filter lowercased every label on every render, its exact-match check lowercased
+ * them all AGAIN on the same render, and `validateCompanyIntake` ran `includes` over the raw
+ * array — which the form calls on every keystroke of every field, not only the industry one.
+ *
+ * One pass, built when the list arrives and not again:
+ *
+ *  - `lowered` is the filter's input, already folded;
+ *  - `byLower` makes "is what they typed exactly a label?" an O(1) lookup, and returns the label
+ *    in its CANONICAL casing — which is what must be committed, because the door accepts the
+ *    labels as shipped;
+ *  - `known` is the exact-match set the validator asks.
+ */
+export interface IndustryIndex {
+  /** As served, in the order doola published it — the picker sorts nothing for itself. */
+  options: readonly string[];
+  lowered: readonly { label: string; lower: string }[];
+  byLower: ReadonlyMap<string, string>;
+  known: ReadonlySet<string>;
+}
+
+/** `undefined` (the list has not arrived) yields an EMPTY index rather than a null one, so every
+ *  consumer reads the same shape and nothing is claimed about a label until the list is in. */
+export function industryIndex(options: readonly string[] | undefined): IndustryIndex {
+  const list = options ?? [];
+  const lowered = list.map((label) => ({ label, lower: label.toLowerCase() }));
+  return {
+    options: list,
+    lowered,
+    byLower: new Map(lowered.map(({ label, lower }) => [lower, label])),
+    known: new Set(list),
+  };
+}
+
 export type CompanyIntakeForm = {
   /** Exactly three, in order of preference. */
   names: string[];
@@ -82,12 +119,16 @@ export const emptyCompanyIntake = (): CompanyIntakeForm => ({
  *
  * `industryLabel` is checked against the list the backend served, not against a bundled copy —
  * the picker's options and the door's accepted set are one array, fetched from
- * `GET /formation/industries`. An empty `known` list means the list has not arrived yet, and
+ * `GET /formation/industries`. An empty `known` set means the list has not arrived yet, and
  * nothing is claimed about the label until it does.
+ *
+ * A `Set` rather than an array: this function runs on every keystroke of every field, and
+ * `Array.includes` over 821 labels is a linear scan each time — paid on the name inputs too,
+ * which have nothing to do with industries.
  */
 export function validateCompanyIntake(
   form: CompanyIntakeForm,
-  known: readonly string[] = [],
+  known: ReadonlySet<string> = EMPTY_KNOWN,
 ): CompanyIntakeErrors {
   const names: (string | null)[] = [];
   const seen = new Map<string, number>();
@@ -132,15 +173,18 @@ export function validateCompanyIntake(
         : null,
     industryLabel: !industry
       ? "Choose an industry."
-      : known.length > 0 && !known.includes(industry)
+      : known.size > 0 && !known.has(industry)
         ? "Choose one of the listed industries — the filing agent only accepts those."
         : null,
   };
 }
 
+/** Shared so the two defaults are one object rather than an allocation per call. */
+const EMPTY_KNOWN: ReadonlySet<string> = new Set();
+
 export function isCompanyIntakeValid(
   form: CompanyIntakeForm,
-  known: readonly string[] = [],
+  known: ReadonlySet<string> = EMPTY_KNOWN,
 ): boolean {
   const e = validateCompanyIntake(form, known);
   return !e.businessPurpose && !e.industryLabel && e.names.every((n) => n === null);

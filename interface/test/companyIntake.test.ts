@@ -21,13 +21,16 @@ import {
   duplicateKey,
   emptyCompanyIntake,
   isCompanyIntakeValid,
+  industryIndex,
   legalBodyBranch,
   stripEntityEnding,
   validateCompanyIntake,
 } from "@/lib/formation/companyIntake";
 import type { CompanyState, CompanyView } from "@/lib/api/types";
 
-const KNOWN = ["Software development", "Consulting"];
+/** The picker's options and the door's accepted set are one list — held as a SET since A3,
+ *  because the validator runs on every keystroke of every field. */
+const KNOWN = new Set(["Software development", "Consulting"]);
 const VALID = {
   names: ["Acme Robotics", "Acme Automata", "Acme Mechanicals"],
   businessPurpose: "Operating autonomous software agents.",
@@ -100,7 +103,9 @@ test("the industry is checked against the SERVED list, and nothing is claimed be
     /Choose an industry/,
   );
   // Empty list = the fetch has not landed. Refusing here would refuse every label on a slow box.
-  expect(validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, []).industryLabel).toBeNull();
+  expect(
+    validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, new Set()).industryLabel,
+  ).toBeNull();
 });
 
 test("Wyoming's RESTRICTED WORDS are deliberately not checked here", () => {
@@ -216,4 +221,39 @@ test("BRANCH: an unresolved list offers nothing to attach to and selects nothing
   const branch = legalBodyBranch(undefined, null, "some-company");
   expect(branch.attachable).toEqual([]);
   expect(branch.selected).toBeNull();
+});
+
+/* ── the industry index (§5/§7) ────────────────────────────────────────────── */
+
+test("INDEX: one pass over the list gives the filter, the lookup and the validator's set", () => {
+  // Three consumers used to walk all 821 labels per keystroke — the filter, the exact-match hint
+  // and `onChange` — each lowercasing every one of them, for a list that changes on a deploy.
+  const index = industryIndex(["Software development", "Consulting", "Coffee shops"]);
+  expect(index.options).toHaveLength(3);
+  expect(index.lowered.map((l) => l.lower)).toEqual([
+    "software development",
+    "consulting",
+    "coffee shops",
+  ]);
+  expect(index.known.has("Consulting")).toBe(true);
+  expect(index.known.has("consulting")).toBe(false);
+});
+
+test("INDEX: the lookup is case-insensitive and returns the CANONICAL casing", () => {
+  // What is committed must be the label as SHIPPED: the create door accepts exactly those, so a
+  // lower-cased near-miss would reach doola and come back rejected on a real fee.
+  const index = industryIndex(["Software development"]);
+  expect(index.byLower.get("software development")).toBe("Software development");
+  expect(index.byLower.get("SOFTWARE DEVELOPMENT".toLowerCase())).toBe("Software development");
+  expect(index.byLower.get("software")).toBeUndefined();
+});
+
+test("INDEX: an unarrived list is an EMPTY index, not a null one", () => {
+  const index = industryIndex(undefined);
+  expect(index.options).toEqual([]);
+  expect(index.known.size).toBe(0);
+  // …and nothing is claimed about a label until it arrives.
+  expect(
+    validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, index.known).industryLabel,
+  ).toBeNull();
 });

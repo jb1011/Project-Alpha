@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   usePublicConfigQuery,
   useUpdateCompanyIntakeMutation,
@@ -8,6 +8,7 @@ import {
 } from "@/lib/api/hooks";
 import type { CompanyDetailView } from "@/lib/api/types";
 import {
+  industryIndex,
   isCompanyIntakeValid,
   validateCompanyIntake,
   type CompanyIntakeForm,
@@ -96,8 +97,11 @@ function ParkCard({
 /* ── awaitingIntakeEdit: `PATCH /companies/:id` ───────────────────────────── */
 
 function IntakeEditForm({ company }: { company: CompanyDetailView }) {
-  const industries = useIndustriesQuery();
-  const options = industries.data?.industries ?? [];
+  const industriesQuery = useIndustriesQuery();
+  const industries = useMemo(
+    () => industryIndex(industriesQuery.data?.industries),
+    [industriesQuery.data?.industries],
+  );
   const update = useUpdateCompanyIntakeMutation(company.companyId);
   const [form, setForm] = useState<CompanyIntakeForm>(() => ({
     // Pre-filled from what was FILED, so a caller fixes the one field the provider objected to
@@ -111,11 +115,11 @@ function IntakeEditForm({ company }: { company: CompanyDetailView }) {
   }));
   const [showErrors, setShowErrors] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const errors = validateCompanyIntake(form, options);
+  const errors = validateCompanyIntake(form, industries.known);
 
   async function submit() {
     setShowErrors(true);
-    if (!isCompanyIntakeValid(form, options)) return;
+    if (!isCompanyIntakeValid(form, industries.known)) return;
     setError(null);
     try {
       await update.mutateAsync({
@@ -164,8 +168,8 @@ function IntakeEditForm({ company }: { company: CompanyDetailView }) {
       </Field>
       <IndustryPicker
         value={form.industryLabel}
-        options={options}
-        loading={industries.isPending}
+        industries={industries}
+        loading={industriesQuery.isPending}
         error={showErrors ? (errors.industryLabel ?? undefined) : undefined}
         onChange={(industryLabel) => setForm({ ...form, industryLabel })}
       />

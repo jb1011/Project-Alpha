@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { StepNav } from "../OnboardingFlow";
 import {
   isPartyValid,
@@ -26,6 +26,7 @@ import {
 import type { CompanyView } from "@/lib/api/types";
 import {
   companyLabel,
+  industryIndex,
   isCompanyIntakeValid,
   legalBodyBranch,
   validateCompanyIntake,
@@ -163,11 +164,17 @@ export function LegalBodyStep({
     // Number — and watched it be replaced by a picker the moment the list arrived.
   } = legalBodyBranch(companies.data?.companies, mode, picked);
 
-  const industries = useIndustriesQuery(resolved && effectiveMode === "create");
-  const industryOptions = industries.data?.industries ?? [];
+  const industriesQuery = useIndustriesQuery(resolved && effectiveMode === "create");
+  // ONE pass over the 821 labels, when they arrive and not again — see `industryIndex`. The
+  // dependency is the QUERY's array (a stable reference between renders), never a fresh `?? []`,
+  // which would rebuild the index on every keystroke and defeat the memo entirely.
+  const industries = useMemo(
+    () => industryIndex(industriesQuery.data?.industries),
+    [industriesQuery.data?.industries],
+  );
 
   const partyErrors = validateParty(party);
-  const intakeErrors = validateCompanyIntake(intake, industryOptions);
+  const intakeErrors = validateCompanyIntake(intake, industries.known);
   const busy = createParty.isPending || createCompany.isPending;
 
   function setPartyField<K extends keyof FormationParty>(key: K, value: FormationParty[K]) {
@@ -183,7 +190,7 @@ export function LegalBodyStep({
    */
   async function create(syntheticParty: boolean) {
     setShowErrors(true);
-    if (!isCompanyIntakeValid(intake, industryOptions)) return;
+    if (!isCompanyIntakeValid(intake, industries.known)) return;
     if (!syntheticParty && !isPartyValid(party)) return;
     setError(null);
     try {
@@ -307,8 +314,8 @@ export function LegalBodyStep({
                   </Field>
                   <IndustryPicker
                     value={intake.industryLabel}
-                    options={industryOptions}
-                    loading={industries.isPending}
+                    industries={industries}
+                    loading={industriesQuery.isPending}
                     error={showErrors ? (intakeErrors.industryLabel ?? undefined) : undefined}
                     onChange={(industryLabel) => onIntake({ ...intake, industryLabel })}
                   />
