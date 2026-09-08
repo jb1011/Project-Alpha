@@ -431,15 +431,15 @@ const COMPANY_VIEW_KEYS = [
   "environment",
   "filedAt",
   "filingNumber",
-  "formationStatus",
   "industryLabel",
   "legalNameFiled",
   "nameOptions",
-  "paying",
   "state",
-  "status",
-  "synthetic",
 ];
+
+/** The four the LIST does not carry and the DETAIL does — `state`'s own inputs, served beside it
+ *  only on the page that has room to explain them. */
+const COMPANY_DETAIL_ONLY_KEYS = ["status", "synthetic", "formationStatus", "paying"];
 
 test("create_company is gated on FORMATION; list_companies on the company store, like REST", async () => {
   const on = buildTestApp({ required: true });
@@ -573,11 +573,11 @@ test("MCP and REST mint the SAME company — one domain function, one set of ref
     const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
     expect(listed.companies).toHaveLength(1);
     expect(Object.keys(listed.companies[0]).sort()).toEqual(COMPANY_VIEW_KEYS);
+    for (const unread of COMPANY_DETAIL_ONLY_KEYS)
+      expect(Object.keys(listed.companies[0]), unread).not.toContain(unread);
     expect(listed.companies[0]).toMatchObject({
       companyId,
-      status: "ready",
-      formationStatus: "none",
-      paying: false,
+      state: "ready",
       agents: 0,
       businessPurpose: expect.any(String),
       industryLabel: expect.any(String),
@@ -630,6 +630,7 @@ test("PARITY: get_company and GET /companies/:companyId answer with the SAME bod
     expect(Object.keys(overMcp).sort()).toEqual(
       [
         ...COMPANY_VIEW_KEYS,
+        ...COMPANY_DETAIL_ONLY_KEYS,
         "attachedAgents",
         "documents",
         "ein",

@@ -1,5 +1,6 @@
 import { DOOLA_DEFAULT_TIMEOUT_MS, describeDoolaError } from "../adapters/doola/doolaClient";
 import { sqliteUtcTimestamp } from "../formation";
+import { parkedForIntakeEdit, parkedForPartyEdit } from "../formation/freeze";
 import type { PiiKeyring } from "../formation/pii";
 import {
   EVENT_RETENTION_MS,
@@ -425,10 +426,10 @@ export class FormationSweeper {
    */
   private awaitingHumanEdit(row: FormationRequestRecord): boolean {
     if (row.step !== "create_provider") return false;
-    const detail = parseDetail<{ awaitingIntakeEdit?: boolean; awaitingPartyEdit?: boolean }>(
-      row.detail,
-    );
-    return detail.awaitingIntakeEdit === true || detail.awaitingPartyEdit === true;
+    // The SHARED predicates, from `freeze.ts` — the module the filer, the detail view and the
+    // party-edit door read these flags with. This used to be its own `parseDetail` with its own
+    // inline shape, which is a fourth place deciding what an unreadable blob means.
+    return parkedForIntakeEdit(row) || parkedForPartyEdit(row);
   }
 
   /**

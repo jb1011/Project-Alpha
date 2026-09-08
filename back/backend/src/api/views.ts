@@ -1,4 +1,4 @@
-import { awaitsSsnDecision } from "../formation/freeze";
+import { awaitsSsnDecision, parkedForIntakeEdit, parkedForPartyEdit } from "../formation/freeze";
 import {
   type CompanyState,
   type FormationStatus,
@@ -130,23 +130,21 @@ export function entityViewDepsOf(deps: EntityViewDeps): EntityViewDeps {
  */
 export interface CompanyView {
   companyId: string;
-  status: CompanyRecord["status"];
   environment: CompanyRecord["environment"];
-  synthetic: boolean;
   nameOptions: CompanyRecord["nameOptions"];
   legalNameFiled: string | null;
   businessPurpose: string;
   industryLabel: string;
-  /** DERIVED from the sub-saga rows; nothing about progress is stored on the company. */
-  formationStatus: FormationStatus;
-  /** DERIVED from `formation_payments`; nothing about payment is stored on the company either. */
-  paying: boolean;
   /**
-   * The three facts above, combined into the ONE word §7's Companies section renders.
+   * The eight-word state §7's Companies section renders — the row's status, a live payment and
+   * the derived filing status, combined ONCE, server-side.
    *
-   * Kept BESIDE its inputs rather than replacing them: a picker filtering for "attachable" wants
-   * the raw `status`, and the honesty invariant is asserted against `environment`. The
-   * combination is what three renderers would otherwise each do for themselves.
+   * It used to be served BESIDE its three inputs (`status`, `formationStatus`, `paying`) on the
+   * reasoning that a picker filtering for "attachable" would want the raw status. Nothing ever
+   * did: `canAttach` reads this word, the pill reads this word, and the list page reads this
+   * word. Three fields nobody reads are three fields a fourth renderer can re-combine for itself
+   * — differently — which is the exact disagreement combining once was for. They stay on the
+   * DETAIL view, where a page showing one company can honestly show its parts.
    */
   state: CompanyState;
   filedAt: number | null;
@@ -191,30 +189,51 @@ export function listCompanyViews(deps: CompanyListDeps, tenantId: string): Compa
   const agents = deps.companies.countAgentsMany(ids);
   const paying = livePaymentLookup(deps.companies, ids);
   return rows.map((company) => {
-    // ONE steps read and ONE payment read per row, named once each: `formationStatus` and
-    // `state` are two projections of the same rows, and asking twice is two queries AND two
-    // possibly-different answers.
+    // ONE steps read and ONE payment read per row, named once each: `state` is a projection of
+    // those rows, and asking twice is two queries AND two possibly-different answers.
     const rowSteps =
       steps?.get(company.companyId) ?? deps.formationSteps?.(company.companyId) ?? [];
-    const rowPaying = paying(company.companyId);
-    return {
-      companyId: company.companyId,
-      status: company.status,
-      environment: company.environment,
-      synthetic: company.synthetic,
-      nameOptions: company.nameOptions,
-      legalNameFiled: company.legalNameFiled,
-      businessPurpose: company.businessPurpose,
-      industryLabel: company.industryLabel,
-      formationStatus: deriveFormationStatus(rowSteps),
-      paying: rowPaying,
-      state: companyState(company, rowSteps, rowPaying),
-      filedAt: company.filedAt,
-      filingNumber: company.filingNumber,
-      agents: agents.get(company.companyId) ?? 0,
-      createdAt: parseSqliteUtc(company.createdAt),
-    };
+    return toCompanyView(
+      company,
+      rowSteps,
+      paying(company.companyId),
+      agents.get(company.companyId) ?? 0,
+    );
   });
+}
+
+/**
+ * ONE company row → the LIST projection, and the base of the detail one (§7).
+ *
+ * The two used to be two object literals over the same twelve fields, and the class of bug that
+ * produces is not hypothetical: `list_companies` had already drifted from `GET /companies` once,
+ * silently dropping the business purpose, the industry and both filing facts, and nothing failed
+ * — the agent surface was simply less true than the browser one. `toCompanyDetailView` SPREADS
+ * this, so a field added here reaches both by construction.
+ *
+ * `paying` and `agents` are arguments rather than lookups because the two callers count them
+ * differently and both are right: the list batches one query for the whole page, and the detail
+ * counts the agent rows it is already about to render.
+ */
+export function toCompanyView(
+  company: CompanyRecord,
+  steps: FormationRequestRecord[],
+  paying: boolean,
+  agents: number,
+): CompanyView {
+  return {
+    companyId: company.companyId,
+    environment: company.environment,
+    nameOptions: company.nameOptions,
+    legalNameFiled: company.legalNameFiled,
+    businessPurpose: company.businessPurpose,
+    industryLabel: company.industryLabel,
+    state: companyState(company, steps, paying),
+    filedAt: company.filedAt,
+    filingNumber: company.filingNumber,
+    agents,
+    createdAt: parseSqliteUtc(company.createdAt),
+  };
 }
 
 /**
@@ -509,6 +528,15 @@ export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): 
  * and a NULL-check and no personal column at all.
  */
 export interface CompanyDetailView extends CompanyView {
+  /** The row's own column. On the DETAIL only: a page about one company can honestly show the
+   *  parts `state` combines, where a list has neither the room nor a reader for them. */
+  status: CompanyRecord["status"];
+  /** Whether this filing is a labeled sandbox one. Detail only, for the same reason. */
+  synthetic: boolean;
+  /** DERIVED from the sub-saga rows; nothing about progress is stored on the company. */
+  formationStatus: FormationStatus;
+  /** DERIVED from `formation_payments`; nothing about payment is stored on the company either. */
+  paying: boolean;
   /** True = the intake was DERIVED by the migration, not typed by a human. The section says so:
    *  a company nobody described is one whose names are worth checking before it files. */
   intakeSynthesized: boolean;
@@ -571,28 +599,17 @@ export function toCompanyDetailView(
     status: e.status,
   }));
   const create = steps.find((s) => s.step === "create_provider");
-  const detail = parseDetail<{ awaitingIntakeEdit?: boolean; awaitingPartyEdit?: boolean }>(
-    create?.detail ?? null,
-  );
   const paying = hasLivePayment(deps.companies, company.companyId);
   return {
-    companyId: company.companyId,
+    // The LIST projection, spread — so a field added there reaches this page by construction,
+    // rather than by somebody remembering to add it twice. `agents` is this page's
+    // `attachedAgents.length`: one number, counted from the rows it names rather than from a
+    // second query that could disagree with them.
+    ...toCompanyView(company, steps, paying, attachedAgents.length),
     status: company.status,
-    environment: company.environment,
     synthetic: company.synthetic,
-    nameOptions: company.nameOptions,
-    legalNameFiled: company.legalNameFiled,
-    businessPurpose: company.businessPurpose,
-    industryLabel: company.industryLabel,
     formationStatus: deriveFormationStatus(steps),
     paying,
-    state: companyState(company, steps, paying),
-    filedAt: company.filedAt,
-    filingNumber: company.filingNumber,
-    // The list's own field, and this page's `attachedAgents.length` — one number, counted from
-    // the rows it names rather than from a second query that could disagree with them.
-    agents: attachedAgents.length,
-    createdAt: parseSqliteUtc(company.createdAt),
     intakeSynthesized: company.intakeSynthesized,
     providerRef: providerRefOf(steps),
     ein: company.ein,
@@ -600,8 +617,11 @@ export function toCompanyDetailView(
     documents: (deps.documents?.listByCompany(company.companyId) ?? []).map(toDocumentView),
     attachedAgents,
     park: {
-      awaitingIntakeEdit: detail.awaitingIntakeEdit === true,
-      awaitingPartyEdit: detail.awaitingPartyEdit === true,
+      // The SHARED predicates, from the module the filer and the sweeper read them with. Three
+      // surfaces used to spell `parseDetail<{…}>(row.detail).awaitingIntakeEdit === true` for
+      // themselves, and each copy re-decides what an unreadable blob means.
+      awaitingIntakeEdit: parkedForIntakeEdit(create),
+      awaitingPartyEdit: parkedForPartyEdit(create),
       // The SHARED predicate — the filer asks the same question of the same row, and two
       // spellings of "is this waiting for the owner?" is one spelling too many.
       awaitingSsnDecision: awaitsSsnDecision(

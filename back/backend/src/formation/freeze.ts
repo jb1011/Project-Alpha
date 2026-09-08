@@ -201,14 +201,35 @@ export const PARTY_EDIT_ALLOWED_SQL = `(
                     AND (   json_type(f.detail, '$.customerId') IS NOT NULL
                          OR json_type(f.detail, '$.companySentAttempt') IS NOT NULL)))))`;
 
-/** `detail.awaitingPartyEdit` — the flag `onCallFailure` writes when doola refuses the PARTY's
- *  body, and the one `rearmAfterPartyEdit` clears. An unreadable blob is not a park. */
+/**
+ * THE TWO PARK FLAGS, read the same way (design §4.7).
+ *
+ * `create_provider` makes two doola calls and either body can be the one it refused, so `detail`
+ * carries two flags with two different exits: `awaitingIntakeEdit` is cleared by
+ * `PATCH /companies/:companyId`, `awaitingPartyEdit` by `PATCH /companies/:companyId/party`.
+ *
+ * They live HERE, beside the freeze, because four places read them — the filer, the sweeper, the
+ * company detail view and the party-edit door — and three of those used to do it with their own
+ * inline `parseDetail<{…}>(row.detail).awaitingIntakeEdit === true`. Each copy re-decides what an
+ * UNREADABLE blob means, and the honest answer is "not a park": a park is a claim that a specific
+ * human decision is outstanding, and a corrupt blob is not evidence of one.
+ */
 export function parkedForPartyEdit(step: FreezableStep | undefined): boolean {
+  return parkedFlag(step, "awaitingPartyEdit");
+}
+
+/** The INTAKE half. Same rule, other flag — see `parkedForPartyEdit`. */
+export function parkedForIntakeEdit(step: FreezableStep | undefined): boolean {
+  return parkedFlag(step, "awaitingIntakeEdit");
+}
+
+function parkedFlag(
+  step: FreezableStep | undefined,
+  flag: "awaitingPartyEdit" | "awaitingIntakeEdit",
+): boolean {
   if (!step?.detail) return false;
-  const parsed = parseJson(step.detail);
-  return (
-    parsed !== undefined && (parsed as { awaitingPartyEdit?: unknown }).awaitingPartyEdit === true
-  );
+  const parsed = parseJson(step.detail) as Record<string, unknown> | undefined;
+  return parsed !== undefined && parsed[flag] === true;
 }
 
 /** `undefined` means "not valid JSON", which both readers above treat as the cautious answer. */

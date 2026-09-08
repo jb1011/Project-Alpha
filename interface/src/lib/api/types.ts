@@ -531,15 +531,19 @@ export type CompanyNameOption = { name: string; entityTypeEnding: string; positi
  */
 export type CompanyView = {
   companyId: string;
-  status: "draft" | "ready" | "abandoned";
   environment: "sandbox" | "production";
-  synthetic: boolean;
   nameOptions: CompanyNameOption[];
   legalNameFiled: string | null;
   businessPurpose: string;
   industryLabel: string;
-  formationStatus: FormationStatus;
-  paying: boolean;
+  /**
+   * The eight-word state — the row's status, a live payment and the derived filing status,
+   * combined ONCE, server-side.
+   *
+   * Its three inputs used to be served beside it and nothing here read them: `canAttach` reads
+   * this word, the pill reads this word, the list page reads this word. They remain on
+   * `CompanyDetailView`, where a page about one company can show the parts.
+   */
   state: CompanyState;
   filedAt: number | null;
   filingNumber: string | null;
@@ -551,6 +555,11 @@ export type CompanyView = {
 
 /** `GET /companies/:companyId` — the list row plus what a list has no room for. */
 export type CompanyDetailView = CompanyView & {
+  /** The row's own column — DETAIL only; the list serves the combined `state`. */
+  status: "draft" | "ready" | "abandoned";
+  synthetic: boolean;
+  formationStatus: FormationStatus;
+  paying: boolean;
   /** True = the intake was DERIVED by the migration, not typed by a human. */
   intakeSynthesized: boolean;
   providerRef: string | null;

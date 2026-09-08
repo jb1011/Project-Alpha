@@ -129,8 +129,13 @@ test("the batched counts agree with the per-row ones, including for a company wi
   expect(paying.has(lonely)).toBe(false);
 
   const views = listCompanyViews({ companies }, TENANT);
-  expect(views.find((v) => v.companyId === lonely)).toMatchObject({ agents: 0, paying: false });
-  expect(views.find((v) => v.companyId === withAgents)).toMatchObject({ agents: 2, paying: true });
+  // `paying` is no longer a LIST field — it is one of the three inputs `state` combines, and the
+  // combination is what the list serves. A live quote reads as `paying` in the one word.
+  expect(views.find((v) => v.companyId === lonely)).toMatchObject({ agents: 0, state: "ready" });
+  expect(views.find((v) => v.companyId === withAgents)).toMatchObject({
+    agents: 2,
+    state: "paying",
+  });
 });
 
 test("createdAt is EPOCH MS — a number, like every other instant this API serves", () => {

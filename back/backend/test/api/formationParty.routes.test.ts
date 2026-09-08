@@ -523,22 +523,22 @@ test("POST /companies mints a company through the ONE domain function, and lists
     "environment",
     "filedAt",
     "filingNumber",
-    "formationStatus",
     "industryLabel",
     "legalNameFiled",
     "nameOptions",
-    "paying",
     "state",
-    "status",
-    "synthetic",
   ]);
+  // …and NOT the four the list has no reader for. `state` is the row's status, its live payment
+  // and its derived filing status combined ONCE, server-side; serving the parts beside it is
+  // three fields nobody reads and an invitation for a fourth renderer to re-combine them
+  // differently. They stay on the DETAIL view.
+  for (const unread of ["status", "synthetic", "formationStatus", "paying"])
+    expect(Object.keys(list.companies[0]), unread).not.toContain(unread);
   expect(list.companies[0]).toMatchObject({
     companyId,
-    status: "ready",
     environment: "sandbox",
-    // DERIVED, both of them: nothing about progress or payment is stored on the company row.
-    formationStatus: "none",
-    paying: false,
+    // The ONE word: paid for (there is nothing to pay during the beta), not filed yet.
+    state: "ready",
     agents: 0,
     // All THREE candidates, canonical, ending split off — the shape the filer sends verbatim.
     nameOptions: [
