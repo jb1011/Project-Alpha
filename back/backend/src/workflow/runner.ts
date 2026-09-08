@@ -138,7 +138,7 @@ export class OnboardingRunner {
       /** What the filing looked like AT THE MOMENT OF ATTACH — the joining agent's history. */
       let attachedSummary: string | undefined;
       /** Agents already on this company, read inside the transaction — the cap check and the
-       *  `company_reused` ops line are two readings of one number, not two queries. */
+       *  `company_attach` ops line are two readings of one number, not two queries. */
       let attachedAgents = 0;
       if (companyId && f) {
         const fresh = f.companies.findOwned(p.tenantId, companyId);
@@ -188,17 +188,16 @@ export class OnboardingRunner {
       // The ops trail for sharing (§7). Ids only — a company id is an opaque handle, and nothing
       // about the party behind it belongs in a log line.
       //
-      // TWO events, because they answer different questions. `company_attach` is every attach.
-      // `company_reused` is the one §7 asks for: an agent joining a company that ALREADY has
-      // agents on it — the N:1 fan-out actually happening, which is what bounds the anchor
-      // traffic (`agents × late facts × 2 sponsored writes`) and what makes two agents publicly
-      // linkable through their anchored manifests. `agents` is the count BEFORE this attach, read
-      // in the same transaction as the cap check above.
-      if (companyId) {
-        opsLog("company_attach", { companyId, entityKey: id, agents: attachedAgents });
-        if (attachedAgents > 0)
-          opsLog("company_reused", { companyId, entityKey: id, agents: attachedAgents });
-      }
+      // ONE event, carrying the count. §7 also names `company_reused`, and it was written as a
+      // second line whose only difference from this one was that it fired when `agents > 0` — the
+      // same ids, the same number, on the same attach. Two lines saying one thing is two lines to
+      // keep in step and twice the journald volume, and the fan-out question is a QUERY over this
+      // event rather than a second event: `company_attach agents>0` is the N:1 sharing actually
+      // happening, which is what bounds the anchor traffic (`agents × late facts × 2 sponsored
+      // writes`) and what makes two agents publicly linkable through their manifests.
+      //
+      // `agents` is the count BEFORE this attach, read in the same transaction as the cap check.
+      if (companyId) opsLog("company_attach", { companyId, entityKey: id, agents: attachedAgents });
       // ONE event on the JOINING entity, carrying the filing as it stands right now (§3).
       //
       // The sub-saga's own events are fanned out at the moment each fact lands, over whichever

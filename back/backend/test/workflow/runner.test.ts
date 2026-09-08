@@ -824,12 +824,16 @@ test("C1: a credential-less deployment pins nothing — the stub shape, unchange
   expect(fx.parties.findOwned(TENANT, fx.partyId)?.companyId).toBeNull();
 });
 
-test("A3: `company_reused` fires only when an agent JOINS a company that already has one", () => {
-  // §7's ops event. `company_attach` is every attach; `company_reused` is the N:1 fan-out
-  // actually happening — which is what bounds the anchor traffic (agents × late facts × two
-  // sponsored writes) and what makes two agents publicly linkable through their manifests. The
-  // FIRST agent on a company is not a reuse, and logging it as one would make the event useless
-  // for exactly the question it exists to answer.
+test("A3: `company_attach` carries the count BEFORE the attach — reuse is a query over it", () => {
+  // §7 names two events, `company_attach` and `company_reused`, and the second was written as a
+  // line whose only difference from the first was that it fired when `agents > 0`: same ids, same
+  // number, same attach. So there is ONE line and the fan-out question is a query over it —
+  // `company_attach agents>0` is the N:1 sharing actually happening, which is what bounds the
+  // anchor traffic (agents × late facts × two sponsored writes) and what makes two agents
+  // publicly linkable through their manifests.
+  //
+  // The property that makes the query answerable is asserted here: `agents` is the count BEFORE
+  // this attach, so the FIRST agent on a company reads 0 and the second reads 1.
   const lines: string[] = [];
   const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(" "));
@@ -863,6 +867,7 @@ test("A3: `company_reused` fires only when an agent JOINS a company that already
       companyId,
       agents: 0,
     });
+    // …and no second line saying the same thing: one attach, one event.
     expect(ops().filter((l) => l.opslog === "company_reused")).toHaveLength(0);
 
     runner.start({
@@ -872,13 +877,14 @@ test("A3: `company_reused` fires only when an agent JOINS a company that already
       guardianPasskey: passkey,
       companyId,
     });
-    expect(ops().filter((l) => l.opslog === "company_attach")).toHaveLength(2);
-    const reused = ops().filter((l) => l.opslog === "company_reused");
-    expect(reused).toHaveLength(1);
-    expect(reused[0]).toMatchObject({ companyId, entityKey: `${TENANT}:reuse-2`, agents: 1 });
+    const attaches = ops().filter((l) => l.opslog === "company_attach");
+    expect(attaches).toHaveLength(2);
+    // The SECOND attach is the reuse, and it says so with a number rather than with an event.
+    expect(attaches[1]).toMatchObject({ companyId, entityKey: `${TENANT}:reuse-2`, agents: 1 });
+    expect(ops().filter((l) => l.opslog === "company_reused")).toHaveLength(0);
     // Ids only: a company id is an opaque handle, and nothing about the party behind it belongs
     // in a log line.
-    expect(JSON.stringify(reused[0])).not.toMatch(/Ada|Lovelace|@example/);
+    expect(JSON.stringify(attaches[1])).not.toMatch(/Ada|Lovelace|@example/);
   } finally {
     spy.mockRestore();
   }
