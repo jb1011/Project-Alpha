@@ -125,7 +125,10 @@ export function migrateOnboardingV2(raw: string): PersistedOnboarding | null {
   const companyId = typeof session.companyId === "string" ? session.companyId : null;
   const hadParty = typeof session.partyId === "string" && session.partyId.length > 0;
 
-  const { "legal-identity": _retired, ...done } = blob.done ?? {};
+  // The retired key is REMOVED rather than destructured away: an unused binding is a lint warning
+  // in this package, and `delete` on a fresh copy says the same thing without one.
+  const done = { ...(blob.done ?? {}) };
+  delete done["legal-identity"];
   const phase = blob.phase === "legal-identity" ? "legal-body" : (blob.phase as Phase | undefined);
 
   return {
