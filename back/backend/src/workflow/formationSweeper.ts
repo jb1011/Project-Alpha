@@ -387,9 +387,10 @@ export class FormationSweeper {
       //    purpose — a verdict belongs to the human who owns the row, not to a counter.
       //
       //    Either of the step's two bodies can be the one doola refused, and they have different
-      //    doors: the COMPANY's intake has `PATCH /companies/:id` today, the responsible PARTY's
-      //    details have nothing until A3. The sweeper treats them identically anyway, because an
-      //    unchanged party body is exactly as doomed as an unchanged company body.
+      //    doors: the COMPANY's intake is fixed by `PATCH /companies/:companyId`, the responsible
+      //    PARTY's details by `PATCH /companies/:companyId/party`. The sweeper treats them
+      //    identically anyway, because an unchanged party body is exactly as doomed as an
+      //    unchanged company body.
       if (this.awaitingHumanEdit(row)) continue;
       // The terminal verdict: a row past the attempt bound is not retried once more.
       if (row.attempt >= MAX_FORMATION_ATTEMPTS) {
@@ -417,10 +418,10 @@ export class FormationSweeper {
    * flags are written by the one failure class that re-opens an input — a doola `rejected`.
    *
    * TWO flags, because `create_provider` makes two calls and either body can be the one doola
-   * refused: `awaitingIntakeEdit` for the COMPANY's intake, which `PATCH /companies/:id` can fix,
-   * and `awaitingPartyEdit` for the responsible PARTY's details, which nothing can fix until A3
-   * ships the party-edit door. The sweeper's answer is the same for both — do not touch this row
-   * — and it is the doors that differ, so this predicate is deliberately their OR.
+   * refused: `awaitingIntakeEdit` for the COMPANY's intake, which `PATCH /companies/:companyId`
+   * fixes, and `awaitingPartyEdit` for the responsible PARTY's details, which
+   * `PATCH /companies/:companyId/party` fixes. The sweeper's answer is the same for both — do not
+   * touch this row — and it is the doors that differ, so this predicate is deliberately their OR.
    */
   private awaitingHumanEdit(row: FormationRequestRecord): boolean {
     if (row.step !== "create_provider") return false;

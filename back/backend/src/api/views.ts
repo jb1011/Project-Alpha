@@ -332,8 +332,10 @@ export interface DocumentView {
   sha256: string;
 }
 
-/** One projection for `GET /entities/:id/documents`, the entity view, and the MCP read tools —
- *  three renderers of the same row is three chances for them to describe it differently. */
+/** One projection for `GET /companies/:companyId/documents`, the entity view, and the MCP read
+ *  tools — three renderers of the same row is three chances for them to describe it differently.
+ *  (The route is COMPANY-keyed since A3: documents belong to the FILING, and a company can hold
+ *  them before any agent attaches to it.) */
 export function toDocumentView(d: DocumentIndexRecord): DocumentView {
   return {
     id: d.id,

@@ -621,16 +621,15 @@ function rearmAfterEdit(
 }
 
 /**
- * The PARTY half of the same hook, EXPORTED and not yet called (review 5b).
+ * The PARTY half of the same hook (review 5b).
  *
- * A `createCustomer` rejection parks under `awaitingPartyEdit`, and there is no door that can
- * clear it: editing a responsible party is A3's route, and until it exists a company parked here
- * needs a person. That is stated on both operator surfaces rather than left to be discovered.
+ * A `createCustomer` rejection parks under `awaitingPartyEdit`, and its exit is
+ * `updateCompanyParty` — `PATCH /companies/:companyId/party` and MCP `update_company_party`.
  *
- * This lives here, beside the intake's, so that A3's party-edit door is one call rather than a
+ * This lives here, beside the intake's, so that the party-edit door is one call rather than a
  * second opinion about the CAS, the preserved error text and the `touchFacts: false` — every one
- * of which is a decision the intake door had to get right and would otherwise be re-derived.
- * Call it inside the transaction that actually rewrote the party, exactly as
+ * of which is a decision the intake door had to get right and would otherwise be re-derived. It
+ * is called inside the transaction that actually rewrote the party, exactly as
  * `updateCompanyIntake` calls the intake one: the edit is the evidence.
  */
 export function rearmAfterPartyEdit(

@@ -318,7 +318,7 @@ async function main() {
   // `formation_requests` table a week later.
   if (doolaApi && !cfg.formation?.required)
     console.warn(
-      "⚠ FORMATION_REQUIRED=false — formation is AVAILABLE, not mandatory: an onboard is only pinned and filed when it carries a partyId, and the wizard does not send one yet (docs/runbooks/doola-deploy.md)",
+      "⚠ FORMATION_REQUIRED=false — formation is AVAILABLE, not mandatory: an onboard is only pinned and filed when it carries a companyId, and the wizard offers a Skip that sends none (docs/runbooks/doola-deploy.md)",
     );
 
   const worldStore = new SqliteWorldStore(db);
