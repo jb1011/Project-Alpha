@@ -1,18 +1,18 @@
 /**
- * Drift guard over the Vercel proxy's header allowlists (design §8, audit M14/15).
+ * Cross-package drift guard over the Vercel proxy's header allowlists (design §8, audit M14/15).
  *
- * The interface package has no test runner, and the proxy sits between every browser request and
- * this backend — so the guard lives here, in the suite that actually runs in CI. It reads
- * `interface/src/lib/proxyHeaders.ts` as text, exactly like the ABI drift-guard the design calls
- * for on the guardian ABI fragment.
+ * The proxy sits between every browser request and this backend, and it lives in the OTHER
+ * package. What this file can usefully assert is exactly what a reader in this package cannot
+ * check for themselves: that the module and the route file are still where the backend expects
+ * them, and that the allowlists still name — and still do not name — specific headers.
  *
  * What it protects: a document download whose `content-disposition` is dropped arrives with no
  * filename, one whose `x-content-type-options` is dropped is sniffable, and one whose
  * `cache-control` is dropped can be cached by an intermediary that has no business holding one
  * tenant's legal documents. All three are silent failures — the download still "works".
  *
- * Two of these tests are now PATH guards rather than text guards: they extract the two route
- * predicates and run them against a real path. See the block comment above them.
+ * ⚠ The BEHAVIOUR of the predicates is asserted in `interface/test/proxyHeaders.test.ts`, which
+ * imports and calls them. This file no longer tries to re-derive it from source text.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -108,53 +108,20 @@ test("C9: content-length is never forwarded beside a content-encoding", () => {
 });
 
 /**
- * THE PATH GUARD (design §7 / gate finding #18).
+ * ⚠ THE PATH GUARDS ARE GONE FROM HERE, and that is the point.
  *
- * This used to assert that the source CONTAINED the fragment `documents\/[^/]+$` — a fragment
- * that survives a rename of the prefix, which is exactly the half-done rename it was supposed to
- * catch. A3 moved the document routes from `/entities/:id/documents/:docId` to
- * `/companies/:companyId/documents/:docId`, and a predicate left on `entities` would have gone on
- * matching nothing at all: no `content-disposition` (no filename), no `x-content-type-options`
- * (sniffable), no `cache-control: private, no-store` (an intermediary free to cache one tenant's
- * legal documents) — and the download would still "work", which is why nothing would have said so.
+ * They used to extract each regex literal from the source with a regex of their own and run it —
+ * a guard whose failure mode is that the EXTRACTOR stops matching, at which point it passes
+ * vacuously and nobody hears about it. It existed because the interface package had no runner.
+ * It has one now: `interface/test/proxyHeaders.test.ts` IMPORTS `isDocumentDownloadPath`,
+ * `isNoStorePath`, `isPublicReferencePath`, `forwardedRequestHeaders` and
+ * `forwardedResponseHeaders` and calls them, which is the thing text can never do.
  *
- * So the guard now EXTRACTS each regex literal from the source and RUNS it: positive on a real
- * `companies/…` path, negative on the `entities/…` shape it replaced. A rename that touches one
- * predicate and not the other fails here.
+ * What stays here is what only a cross-package guard can say: that the module and the route file
+ * are still WHERE the backend expects them, and that the two allowlists still name — and still do
+ * not name — specific headers. Those are text claims about a file in another package, and text is
+ * the right instrument for them.
  */
-function extractRegex(fnName: string): RegExp {
-  const s = source();
-  const fn = s.slice(s.indexOf(`export function ${fnName}`));
-  const literal = /\/\^[^\n]*?\/\.test\(/.exec(fn);
-  expect(literal, `no regex literal found in ${fnName}`).not.toBeNull();
-  // Strip the trailing `/.test(` the match includes, leaving `/…/`.
-  const body = literal![0].slice(1, literal![0].lastIndexOf("/"));
-  return new RegExp(body);
-}
-
-test("PATH GUARD: the download predicate matches companies/…, never entities/…", () => {
-  const re = extractRegex("isDocumentDownloadPath");
-  expect(re.test("companies/abc/documents/def")).toBe(true);
-  // The shape it replaced. Matching it would mean the rename was reverted, or never finished.
-  expect(re.test("entities/abc/documents/def")).toBe(false);
-  // Two path segments after `documents`, not one: the INDEX route returns JSON and needs none of
-  // the four headers.
-  expect(re.test("companies/abc/documents")).toBe(false);
-  // …and it is anchored at both ends, so a longer path is not a download.
-  expect(re.test("companies/abc/documents/def/extra")).toBe(false);
-  expect(re.test("x/companies/abc/documents/def")).toBe(false);
-});
-
-test("PATH GUARD: the no-store predicate covers BOTH company document routes, never entities", () => {
-  const re = extractRegex("isNoStorePath");
-  expect(re.test("companies/abc/documents")).toBe(true);
-  expect(re.test("companies/abc/documents/def")).toBe(true);
-  expect(re.test("entities/abc/documents")).toBe(false);
-  expect(re.test("entities/abc/documents/def")).toBe(false);
-  // Not every company route: only the ones that carry legal bytes.
-  expect(re.test("companies/abc")).toBe(false);
-  expect(re.test("companies")).toBe(false);
-});
 
 test("the request allowlist still carries what the non-browser protocols need", () => {
   const s = source();
