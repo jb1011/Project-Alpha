@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { FormationParty, PartyFieldErrors } from "../types";
 import { Card, Field, SectionTitle, TextInput } from "../primitives";
+import { SsnInput } from "./SsnInput";
 
 /**
  * THE RESPONSIBLE PERSON, and the one optional field that is a Social Security Number.
@@ -122,32 +123,16 @@ export function PartyFields({
               field on the presence of its own label is how a form silently loses the fast-EIN
               route on a deployment that simply had not shipped `/config.formationCopy` yet.
 
-              `autoComplete="off"` and `type="password"` are not security — the value is in the
-              DOM either way — but they keep it out of the browser's form-fill store and off the
-              screen in a shared room, which are the two ways it leaks from here. */}
+              The INPUT itself is shared with the §4.6a re-capture screen — one box for the single
+              worst field in this codebase to get wrong. */}
           {ssn !== undefined && onSsn && ssnCopy && (
-            <Field
-              label={ssnCopy.label}
-              htmlFor="party-ssn"
-              hint="Optional"
+            <SsnInput
+              id="party-ssn"
+              value={ssn}
+              onChange={onSsn}
+              copy={ssnCopy}
               className="sm:col-span-2"
-            >
-              <TextInput
-                id="party-ssn"
-                type="password"
-                inputMode="numeric"
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="XXX-XX-XXXX"
-                className="max-w-[220px] font-mono"
-                value={ssn}
-                onChange={(e) => onSsn(e.target.value)}
-              />
-              <p className="mt-1 text-[11.5px] leading-[1.55] text-muted-2">{ssnCopy.help}</p>
-              <p className="mt-1.5 text-[11.5px] leading-[1.55] text-muted-2">
-                {ssnCopy.retention}
-              </p>
-            </Field>
+            />
           )}
         </div>
       </Card>

@@ -9,20 +9,19 @@ import {
 import type { CompanyDetailView } from "@/lib/api/types";
 import {
   industryIndex,
+  intakeFormOf,
   isCompanyIntakeValid,
   validateCompanyIntake,
   type CompanyIntakeForm,
 } from "@/lib/formation/companyIntake";
 import { emptyParty, isPartyValid, toFormationPartyInput, validateParty, type FormationParty } from "@/components/onboarding/types";
-import { IndustryPicker } from "@/components/onboarding/steps/IndustryPicker";
+import { CompanyIntakeFields } from "@/components/onboarding/steps/CompanyIntakeFields";
 import { PartyFields } from "@/components/onboarding/steps/PartyFields";
+import { SsnInput } from "@/components/onboarding/steps/SsnInput";
 import {
   Button,
   Callout,
   Card,
-  Field,
-  TextInput,
-  Textarea,
 } from "@/components/onboarding/primitives";
 import { useIndustriesQuery } from "@/lib/api/hooks";
 import { formationCopyOf } from "@/lib/formation/copy";
@@ -103,16 +102,11 @@ function IntakeEditForm({ company }: { company: CompanyDetailView }) {
     [industriesQuery.data?.industries],
   );
   const update = useUpdateCompanyIntakeMutation(company.companyId);
-  const [form, setForm] = useState<CompanyIntakeForm>(() => ({
-    // Pre-filled from what was FILED, so a caller fixes the one field the provider objected to
-    // rather than retyping three names from memory.
-    names: [0, 1, 2].map((i) => {
-      const o = company.nameOptions[i];
-      return o ? `${o.name} ${o.entityTypeEnding}`.trim() : "";
-    }),
-    businessPurpose: company.businessPurpose,
-    industryLabel: company.industryLabel,
-  }));
+  // Pre-filled from what was FILED, so a caller fixes the one field the provider objected to
+  // rather than retyping three names from memory. ONE mapping, shared with the SSN-decision form
+  // below — which re-sends the intake UNCHANGED, so a difference between the two would be a
+  // silent rewrite of a filing's names.
+  const [form, setForm] = useState<CompanyIntakeForm>(() => intakeFormOf(company));
   const [showErrors, setShowErrors] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const errors = validateCompanyIntake(form, industries.known);
@@ -134,44 +128,14 @@ function IntakeEditForm({ company }: { company: CompanyDetailView }) {
 
   return (
     <div className="flex flex-col gap-5">
-      {[0, 1, 2].map((i) => (
-        <Field
-          key={i}
-          label={i === 0 ? "Company name (first choice)" : `Alternative ${i}`}
-          htmlFor={`edit-name-${i}`}
-          error={showErrors ? (errors.names[i] ?? undefined) : undefined}
-        >
-          <TextInput
-            id={`edit-name-${i}`}
-            value={form.names[i] ?? ""}
-            invalid={showErrors && !!errors.names[i]}
-            onChange={(e) => {
-              const names = [...form.names];
-              names[i] = e.target.value;
-              setForm({ ...form, names });
-            }}
-          />
-        </Field>
-      ))}
-      <Field
-        label="What the company does"
-        htmlFor="edit-purpose"
-        error={showErrors ? (errors.businessPurpose ?? undefined) : undefined}
-      >
-        <Textarea
-          id="edit-purpose"
-          rows={3}
-          value={form.businessPurpose}
-          invalid={showErrors && !!errors.businessPurpose}
-          onChange={(e) => setForm({ ...form, businessPurpose: e.target.value })}
-        />
-      </Field>
-      <IndustryPicker
-        value={form.industryLabel}
+      <CompanyIntakeFields
+        form={form}
+        errors={errors}
+        showErrors={showErrors}
         industries={industries}
         loading={industriesQuery.isPending}
-        error={showErrors ? (errors.industryLabel ?? undefined) : undefined}
-        onChange={(industryLabel) => setForm({ ...form, industryLabel })}
+        idPrefix="edit"
+        onChange={setForm}
       />
       {error && <Callout tone="warn" title="The filing agent refused this too">{error}</Callout>}
       <div>
@@ -196,15 +160,13 @@ function SsnDecisionForm({ company }: { company: CompanyDetailView }) {
   // rather than ignoring it, so a box on screen would be collecting a number nothing will take.
   const production = company.environment === "production";
 
-  /** `intake` is UNCHANGED — this PATCH exists to carry the SSN decision, not to rewrite names. */
-  const unchanged = {
-    names: [0, 1, 2].map((i) => {
-      const o = company.nameOptions[i];
-      return o ? `${o.name} ${o.entityTypeEnding}`.trim() : "";
-    }),
-    businessPurpose: company.businessPurpose,
-    industryLabel: company.industryLabel,
-  };
+  /**
+   * `intake` is UNCHANGED — this PATCH exists to carry the SSN decision, not to rewrite names.
+   *
+   * The SAME mapping the edit form above pre-fills with. Two spellings of "the intake as stored"
+   * is how a decision about an SSN quietly renames a company.
+   */
+  const unchanged = intakeFormOf(company);
 
   async function submit(withSsn: boolean) {
     setError(null);
@@ -223,24 +185,12 @@ function SsnDecisionForm({ company }: { company: CompanyDetailView }) {
     <div className="flex flex-col gap-4">
       {/* The gate is the ENVIRONMENT and nothing else: the backend refuses the field outright on
           a sandbox company, and the copy always resolves. Gating a field on the presence of its
-          own label is how a form silently loses the fast-EIN route. */}
+          own label is how a form silently loses the fast-EIN route.
+
+          `showHelp` off: the park card above has just explained the choice in full, and repeating
+          it under the box would be the same paragraph twice. */}
       {production && (
-        <Field label={ssnCopy.label} htmlFor="park-ssn">
-          <TextInput
-            id="park-ssn"
-            type="password"
-            inputMode="numeric"
-            autoComplete="off"
-            spellCheck={false}
-            placeholder="XXX-XX-XXXX"
-            className="max-w-[220px] font-mono"
-            value={ssn}
-            onChange={(e) => setSsn(e.target.value)}
-          />
-          <p className="mt-1 text-[11.5px] leading-[1.55] text-muted-2">
-            {ssnCopy.retention}
-          </p>
-        </Field>
+        <SsnInput id="park-ssn" value={ssn} onChange={setSsn} copy={ssnCopy} showHelp={false} />
       )}
       {error && <Callout tone="warn" title="Could not record the decision">{error}</Callout>}
       <div className="flex flex-wrap gap-3">

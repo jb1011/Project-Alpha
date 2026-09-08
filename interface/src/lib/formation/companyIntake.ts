@@ -1,4 +1,4 @@
-import type { CompanyView } from "@/lib/api/types";
+import type { CompanyNameOption, CompanyView } from "@/lib/api/types";
 
 /**
  * THE CREATE-COMPANY FORM'S OWN RULES (design §5) — a courtesy, and honest about being one.
@@ -113,6 +113,34 @@ export const emptyCompanyIntake = (): CompanyIntakeForm => ({
   businessPurpose: "",
   industryLabel: "",
 });
+
+/**
+ * A stored company row → the form that edits it (design §7).
+ *
+ * The row keeps the three candidates SPLIT — `{ name, entityTypeEnding, position }` — because
+ * that is the shape the filer sends and the shape the §5 matcher compares against. A form binds
+ * to whole strings, so somebody has to rejoin them, and three screens each did it inline with
+ * `[0, 1, 2].map(...)`: the intake-edit form, the SSN-decision form (which re-sends the intake
+ * UNCHANGED, so a difference there is a silent rewrite of a filing's names) and the park panel.
+ *
+ * One function, so "what the form shows" and "what an unchanged resubmission sends" cannot drift
+ * — and a company with fewer than three stored options fills the gaps with empty strings rather
+ * than shortening the array, because the door requires exactly three.
+ */
+export function intakeFormOf(company: {
+  nameOptions: readonly CompanyNameOption[];
+  businessPurpose: string;
+  industryLabel: string;
+}): CompanyIntakeForm {
+  return {
+    names: Array.from({ length: NAME_OPTION_COUNT }, (_, i) => {
+      const option = company.nameOptions[i];
+      return option ? `${option.name} ${option.entityTypeEnding}`.trim() : "";
+    }),
+    businessPurpose: company.businessPurpose,
+    industryLabel: company.industryLabel,
+  };
+}
 
 /**
  * Validate the three company fields, in the ORDER a caller typed them.

@@ -22,6 +22,7 @@ import {
   emptyCompanyIntake,
   isCompanyIntakeValid,
   industryIndex,
+  intakeFormOf,
   legalBodyBranch,
   stripEntityEnding,
   validateCompanyIntake,
@@ -256,4 +257,36 @@ test("INDEX: an unarrived list is an EMPTY index, not a null one", () => {
   expect(
     validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, index.known).industryLabel,
   ).toBeNull();
+});
+
+test("INTAKE FORM: a stored row becomes exactly three whole-string candidates", () => {
+  // The row keeps candidates SPLIT (`{name, entityTypeEnding, position}`), which is the shape the
+  // filer sends and the §5 matcher compares against; a form binds to whole strings. Three screens
+  // rejoined them inline, and one of those three re-sends the intake UNCHANGED — so a difference
+  // between the copies would be a silent rewrite of a filing's names.
+  const form = intakeFormOf({
+    nameOptions: [
+      { name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 },
+      { name: "Acme Automata", entityTypeEnding: "LLC", position: 2 },
+      { name: "Acme Mechanicals", entityTypeEnding: "LLC", position: 3 },
+    ],
+    businessPurpose: "Operating autonomous software agents.",
+    industryLabel: "Software development",
+  });
+  expect(form.names).toEqual(["Acme Robotics LLC", "Acme Automata LLC", "Acme Mechanicals LLC"]);
+  expect(form.businessPurpose).toBe("Operating autonomous software agents.");
+  expect(form.industryLabel).toBe("Software development");
+  // …and it round-trips: what the form shows is a body the door accepts.
+  expect(isCompanyIntakeValid(form, new Set(["Software development"]))).toBe(true);
+});
+
+test("INTAKE FORM: a row with fewer than three options fills the gaps, never shortens", () => {
+  // The door requires exactly three, so a short array would render two inputs and submit a body
+  // refused for its shape rather than its content.
+  const form = intakeFormOf({
+    nameOptions: [{ name: "Only One", entityTypeEnding: "LLC", position: 1 }],
+    businessPurpose: "p",
+    industryLabel: "Software development",
+  });
+  expect(form.names).toEqual(["Only One LLC", "", ""]);
 });

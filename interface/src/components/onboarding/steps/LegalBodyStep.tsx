@@ -41,15 +41,12 @@ import {
   Callout,
   Card,
   CheckIcon,
-  Field,
   SectionTitle,
   Spinner,
   StepHeader,
-  Textarea,
-  TextInput,
   cx,
 } from "../primitives";
-import { IndustryPicker } from "./IndustryPicker";
+import { CompanyIntakeFields } from "./CompanyIntakeFields";
 import { PartyFields } from "./PartyFields";
 
 type Props = {
@@ -276,48 +273,14 @@ export function LegalBodyStep({
                   order of preference. The alternates are what let it proceed without a second fee.
                 </p>
                 <div className="mt-5 flex flex-col gap-5">
-                  {[0, 1, 2].map((i) => (
-                    <Field
-                      key={i}
-                      label={i === 0 ? "Company name (first choice)" : `Alternative ${i}`}
-                      htmlFor={`company-name-${i}`}
-                      hint="LLC is added by the filing"
-                      error={showErrors ? (intakeErrors.names[i] ?? undefined) : undefined}
-                    >
-                      <TextInput
-                        id={`company-name-${i}`}
-                        autoComplete="off"
-                        value={intake.names[i] ?? ""}
-                        invalid={showErrors && !!intakeErrors.names[i]}
-                        onChange={(e) => {
-                          const names = [...intake.names];
-                          names[i] = e.target.value;
-                          onIntake({ ...intake, names });
-                        }}
-                      />
-                    </Field>
-                  ))}
-                  <Field
-                    label="What the company does"
-                    htmlFor="company-purpose"
-                    hint="Filed with the company"
-                    error={showErrors ? (intakeErrors.businessPurpose ?? undefined) : undefined}
-                  >
-                    <Textarea
-                      id="company-purpose"
-                      rows={3}
-                      placeholder="Operating autonomous software agents."
-                      value={intake.businessPurpose}
-                      invalid={showErrors && !!intakeErrors.businessPurpose}
-                      onChange={(e) => onIntake({ ...intake, businessPurpose: e.target.value })}
-                    />
-                  </Field>
-                  <IndustryPicker
-                    value={intake.industryLabel}
+                  <CompanyIntakeFields
+                    form={intake}
+                    errors={intakeErrors}
+                    showErrors={showErrors}
                     industries={industries}
                     loading={industriesQuery.isPending}
-                    error={showErrors ? (intakeErrors.industryLabel ?? undefined) : undefined}
-                    onChange={(industryLabel) => onIntake({ ...intake, industryLabel })}
+                    idPrefix="company"
+                    onChange={onIntake}
                   />
                 </div>
               </Card>

@@ -1,18 +1,25 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
-import { downloadDocument } from "@/lib/api/client";
-import { useAuth } from "@/components/onboarding/AuthProvider";
 import { useCompanyComplianceQuery, useCompanyQuery } from "@/lib/api/hooks";
-import type { CompanyDetailView, FormationDocument } from "@/lib/api/types";
+import type { CompanyDetailView } from "@/lib/api/types";
 import { companyLabel } from "@/lib/formation/companyIntake";
 import { companyPill, mayRenderConfirmed } from "@/lib/formation/honesty";
+import { requiredActionCopy } from "@/lib/formation/documents";
+import { DocumentList } from "@/components/agents/DocumentList";
+import { FactRow } from "@/components/agents/FactRow";
 import { formatDate } from "@/lib/format";
 import { CompanyStatePill } from "@/components/agents/CompanyStatePill";
 import { CompanyParkPanel } from "@/components/agents/CompanyParkPanel";
 import { LoadingState } from "@/components/agents/RequireAuth";
-import { Button, Callout, Card, SectionTitle, Spinner, cx } from "@/components/onboarding/primitives";
+import {
+  Button,
+  Callout,
+  Card,
+  SectionTitle,
+  Spinner,
+  cx,
+} from "@/components/onboarding/primitives";
 
 /**
  * ONE LEGAL BODY (design §7) — everything about a filing, in the place it belongs.
@@ -105,37 +112,36 @@ function FilingFacts({ company }: { company: CompanyDetailView }) {
             The filing agent is waiting on something
           </div>
           <ul className="mt-2 flex flex-col gap-1.5">
+            {/* The sentence AND the code, exactly as the dashboard renders them: the sentence is
+                ours and can go stale, and the code is what an operator searches for. This page
+                used to print the bare code, so the same required action was explained on one
+                surface and not on the other. */}
             {company.requiredActions.map((code) => (
-              <li key={code} className="font-mono text-[11px] text-[#f3cd72]">
-                {code}
+              <li key={code} className="text-[11.5px] leading-[1.5] text-[#f3cd72]">
+                {requiredActionCopy(code)}
+                <span className="ml-1.5 font-mono text-[10.5px] text-muted-2">{code}</span>
               </li>
             ))}
           </ul>
         </div>
       )}
       <dl className="mt-4 flex flex-col gap-3 text-[12.5px]">
-        <Row k="Filing agent" v="doola" />
-        <Row k="Environment" v={company.environment} />
-        {company.providerRef && <Row k="Provider reference" v={company.providerRef} mono />}
-        <Row
-          k="Filed"
-          v={company.filedAt ? formatDate(company.filedAt * 1000) : "—"}
-        />
-        <Row k="Filing number" v={company.filingNumber ?? "—"} mono={!!company.filingNumber} />
+        <FactRow k="Filing agent" v="doola" />
+        <FactRow k="Environment" v={company.environment} />
+        {company.providerRef && <FactRow k="Provider reference" v={company.providerRef} mono />}
+        <FactRow k="Filed" v={company.filedAt ? formatDate(company.filedAt * 1000) : "—"} />
+        <FactRow k="Filing number" v={company.filingNumber ?? "—"} mono={!!company.filingNumber} />
         {/* The name the STATE accepted, which is one of OUR candidates — never provider free
             text. Null until a match is made, which is what keeps the anchored manifest honest. */}
-        <Row k="Filed name" v={company.legalNameFiled ?? "—"} />
+        <FactRow k="Filed name" v={company.legalNameFiled ?? "—"} />
         {/* ⚠ Owner-visible only. This page is tenant-scoped; no public surface carries it. */}
-        <Row k="EIN" v={company.ein ?? "—"} mono={!!company.ein} />
+        <FactRow k="EIN" v={company.ein ?? "—"} mono={!!company.ein} />
       </dl>
     </Card>
   );
 }
 
 function Documents({ company }: { company: CompanyDetailView }) {
-  const { session } = useAuth();
-  const [busyDocId, setBusyDocId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   /**
    * ⚠ NOT `environment !== "production"`, which is what this was.
    *
@@ -148,72 +154,17 @@ function Documents({ company }: { company: CompanyDetailView }) {
   const demo = environment === "sandbox";
   const unverified = !mayRenderConfirmed(tone);
 
-  async function download(doc: FormationDocument) {
-    const token = session?.token;
-    if (!token) {
-      setError("Sign in again to download documents.");
-      return;
-    }
-    setError(null);
-    setBusyDocId(doc.id);
-    try {
-      // fetch → blob → objectURL, because an `<a href>` cannot carry a Bearer token and the route
-      // is owner-only. Company-keyed since A3: the documents belong to the FILING.
-      const { blob, filename } = await downloadDocument(token, company.companyId, doc.id);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename ?? doc.name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not download the document.");
-    } finally {
-      setBusyDocId(null);
-    }
-  }
-
   return (
     <Card className={cx("p-5", unverified && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
       <SectionTitle>
         Legal documents
         {demo ? " (demo)" : unverified ? " (environment not reported)" : ""}
       </SectionTitle>
-      {company.documents.length === 0 ? (
-        <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
-          None yet. The filing agent produces the Articles of Organization and the Operating
-          Agreement once the company is filed; they appear here, and their hashes go into the next
-          version of each attached agent&apos;s on-chain anchor.
-        </p>
-      ) : (
-        <ul className="mt-3 flex flex-col gap-2">
-          {company.documents.map((doc) => (
-            <li
-              key={doc.id}
-              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border hairline bg-paper/50 px-3 py-2.5"
-            >
-              <div className="min-w-0">
-                <div className="truncate text-[12.5px] text-ink">{humanDocType(doc.type)}</div>
-                <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-2">
-                  sha256 {doc.sha256.slice(0, 18)}… · {formatBytes(doc.size)}
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => void download(doc)}
-                disabled={busyDocId !== null}
-                className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {busyDocId === doc.id && <Spinner className="h-3 w-3" />}
-                {busyDocId === doc.id ? "Downloading…" : "Download PDF"}
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-      {error && <p className="mt-2 text-[11.5px] leading-[1.4] text-[#ff8a84]">{error}</p>}
+      <DocumentList
+        companyId={company.companyId}
+        documents={company.documents}
+        emptyNote="None yet. The filing agent produces the Articles of Organization and the Operating Agreement once the company is filed; they appear here, and their hashes go into the next version of each attached agent's on-chain anchor."
+      />
     </Card>
   );
 }
@@ -351,28 +302,4 @@ function IntakeCard({ company }: { company: CompanyDetailView }) {
       </div>
     </Card>
   );
-}
-
-function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
-  return (
-    <div className="flex items-baseline justify-between gap-3">
-      <dt className="shrink-0 text-muted-2">{k}</dt>
-      <dd className={cx("min-w-0 truncate text-right text-ink", mono && "font-mono text-[11.5px]")}>
-        {v}
-      </dd>
-    </div>
-  );
-}
-
-function humanDocType(type: string): string {
-  return type
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .trim();
-}
-
-function formatBytes(size: number): string {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
