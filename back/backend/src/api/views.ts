@@ -20,6 +20,7 @@ import {
 import { parseDetail } from "../persistence/formationRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
+import { parseSqliteUtc } from "../util/sqliteTime";
 import { usesManifestScheme } from "../workflow/onboarding";
 
 /** The formation sub-saga rows of one COMPANY. A function rather than the repository so the view
@@ -152,7 +153,19 @@ export interface CompanyView {
   filingNumber: string | null;
   /** How many agents SHARE this filing. Authenticated surfaces only (§7 sharing labels). */
   agents: number;
-  createdAt: string;
+  /**
+   * EPOCH MILLISECONDS — a number, like every other instant this API serves.
+   *
+   * It used to be the raw `CURRENT_TIMESTAMP` TEXT the column holds
+   * (`"YYYY-MM-DD HH:MM:SS"`, UTC, with no zone marker), which made every client responsible for
+   * knowing that last fact. The interface's did it with `Date.parse(\`${x}Z\`)` — a string
+   * concatenation reconstructing a timezone the wire format had thrown away, in a browser, on a
+   * legal surface. Any client that forgot the `Z` would render a company's creation date shifted
+   * by its own offset, which is a wrong fact quietly, and only for some readers.
+   *
+   * Converted here, once, by the same parser the sweeper reads these columns with.
+   */
+  createdAt: number;
 }
 
 /** What a company list needs beyond the rows themselves. */
@@ -199,7 +212,7 @@ export function listCompanyViews(deps: CompanyListDeps, tenantId: string): Compa
       filedAt: company.filedAt,
       filingNumber: company.filingNumber,
       agents: agents.get(company.companyId) ?? 0,
-      createdAt: company.createdAt,
+      createdAt: parseSqliteUtc(company.createdAt),
     };
   });
 }
@@ -579,7 +592,7 @@ export function toCompanyDetailView(
     // The list's own field, and this page's `attachedAgents.length` — one number, counted from
     // the rows it names rather than from a second query that could disagree with them.
     agents: attachedAgents.length,
-    createdAt: company.createdAt,
+    createdAt: parseSqliteUtc(company.createdAt),
     intakeSynthesized: company.intakeSynthesized,
     providerRef: providerRefOf(steps),
     ein: company.ein,

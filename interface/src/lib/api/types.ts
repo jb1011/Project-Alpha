@@ -545,7 +545,8 @@ export type CompanyView = {
   filingNumber: string | null;
   /** How many agents share this filing. The picker's sharing label. */
   agents: number;
-  createdAt: string;
+  /** EPOCH MILLISECONDS — what `formatDate` takes, with no reconstruction at the edge. */
+  createdAt: number;
 };
 
 /** `GET /companies/:companyId` — the list row plus what a list has no room for. */

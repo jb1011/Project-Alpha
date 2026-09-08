@@ -59,7 +59,11 @@ function CompanyBody({ company }: { company: CompanyDetailView }) {
         <div className="min-w-0">
           <h1 className="truncate text-[22px] font-medium text-ink">{companyLabel(company)}</h1>
           <p className="mt-1 text-[12.5px] text-muted-2">
-            {company.industryLabel} · created {formatDate(Date.parse(`${company.createdAt}Z`))}
+            {/* EPOCH MS on the wire since A3. It used to be the backend's raw SQLite TEXT and
+                this line reconstructed the timezone the format had thrown away — a `Z` concatenated
+                on in a browser, on a legal surface, where forgetting it shifts a company's
+                creation date by the reader's own offset. */}
+            {company.industryLabel} · created {formatDate(company.createdAt)}
           </p>
         </div>
         <CompanyStatePill state={company.state} environment={company.environment} />
