@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { WorldStore } from "../persistence/worldStore";
 import type { Address } from "../types";
-import { createAgentBookReader } from "./agentBookReader";
+import { AGENT_BOOK_CAIP2, createAgentBookReader } from "./agentBookReader";
 
 /**
  * Seller-side "is this agent backed by a real, unique human?" check.
@@ -47,7 +47,8 @@ export interface AgentkitSellerConfig {
   domain: string;
   /** Full public resource URL (through the proxy) — must match what the client signed. */
   resourceUrl: string;
-  /** CAIP-2 of the paid route's chain (Arc), advertised in supportedChains. */
+  /** CAIP-2 of the paid route's chain (Arc); World Chain is always advertised beside it because
+   *  every AgentKit client in the wild signs for `eip155:480` (design v3 D10). */
   network: string;
   store: WorldStore;
   /** Per-human authorization allowance for this resource before settlement is required. */
@@ -82,7 +83,12 @@ export async function mintAgentkitExtension(cfg: {
   const ext = declareAgentkitExtension({
     domain: cfg.domain,
     resourceUri: cfg.resourceUrl,
-    network: cfg.network,
+    // Two chains, deliberately (design v3 D10). Settlement is on Arc, but AgentBook lives on
+    // World Chain and every AgentKit client in the wild signs its challenge for `eip155:480` —
+    // advertising only Arc makes those clients skip the proof. The SDK accepts a string or an
+    // array here (`declareAgentkitExtension`, agentkit/dist/cjs/index.js) and emits one
+    // {chainId, type} entry per signature scheme for each `eip155:*` network.
+    network: [cfg.network, AGENT_BOOK_CAIP2],
     statement:
       "Prove this agent is backed by a verified unique human to be authorized on this resource",
   }) as unknown as { agentkit: { info: Record<string, unknown> } };

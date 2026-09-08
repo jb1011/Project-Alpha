@@ -16,6 +16,7 @@ import type { PaymentReceipt } from "../persistence/paymentIdempotencyStore";
 import type { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import { usdToUnits } from "../policy/units";
 import type { Address, EntityRecord, Hex } from "../types";
+import { AGENT_BOOK_CHAIN_ID } from "./agentBookReader";
 import type { AuthorityDeps, AuthorizeRequest, AuthorizeResult } from "./authority";
 import { authorizePayment } from "./authority";
 import { buyWithX402 } from "./buyer";
@@ -126,6 +127,10 @@ export function buildEntityPaymentService(
   // Tier-0 provider dispatch for the two pocket-signing surfaces (x402 typed-data + AgentKit
   // EIP-191). `turnkey` derives the local hot key from the master seed (unchanged); `circle`
   // signs through the Circle API against the MPC-held pocket EOA — same seams, different signer.
+  // The AgentKit signers announce WORLD CHAIN, not Arc (design v3 D10): EIP-191 is chain-agnostic
+  // for a key, so the chain id only selects the RPC a seller verifies against — and sellers
+  // advertise `eip155:480` because that is where AgentBook lives. x402 signing stays on
+  // cfg.chainId; only the human-backing proof moved.
   const pocketSigners = (
     entity: EntityRecord,
   ): { x402: BatchEvmSigner; agentkit: AgentkitSigner } => {
@@ -143,13 +148,13 @@ export function buildEntityPaymentService(
           address: ref.address,
           signTypedData: (td) => typed.signTypedData(td),
         }),
-        agentkit: circleAgentkitSigner(api, ref, cfg.chainId),
+        agentkit: circleAgentkitSigner(api, ref, AGENT_BOOK_CHAIN_ID),
       };
     }
     const pocketKey = derivePocketKey(requireMasterSeed(cfg), entity.idempotencyKey);
     return {
       x402: pocketSignerFromKey(pocketKey),
-      agentkit: agentkitSignerFromKey(pocketKey, cfg.chainId),
+      agentkit: agentkitSignerFromKey(pocketKey, AGENT_BOOK_CHAIN_ID),
     };
   };
 

@@ -42,7 +42,7 @@ import { resolveFormationDeployment } from "../formation";
 import { createCompany } from "../formation/company";
 import { buildJobDeps } from "../jobs/composition";
 import { opsLog } from "../observability/opsLog";
-import { createAgentBookReader } from "../payments/agentBookReader";
+import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
 import { PaymentLedger } from "../payments/ledger";
 import { buildOutflowMeter } from "../payments/outflowMeter";
@@ -509,7 +509,9 @@ async function main() {
       allowancePerHuman: cfg.worldChain.allowancePerHuman,
       worldChainRpc: cfg.worldChain.rpcUrl,
       agentBookAddress: cfg.worldChain.agentBook,
-      rpcUrls: { [x402Demo.network]: cfg.rpcUrl },
+      // Arc for the paid route, World Chain for the AgentKit challenge the client signs
+      // (design v3 D10) — an ERC-1271 verification against `eip155:480` needs an RPC here.
+      rpcUrls: { [x402Demo.network]: cfg.rpcUrl, [AGENT_BOOK_CAIP2]: cfg.worldChain.rpcUrl },
       rateWindowMs: (cfg.worldRateWindowHours ?? 24) * 3_600_000,
     };
     x402Demo.trustPolicy = cfg.x402TrustPolicy ?? "open";
