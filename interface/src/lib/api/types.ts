@@ -410,11 +410,37 @@ export type PasskeyView = {
   revokedAt: number | null;
 };
 
+/** One failed field of a `validation_error`: the backend maps every Zod issue to this shape. */
+export type ApiValidationIssue = { path: string; message: string };
+
+/**
+ * The `details` of a refusal that is not a `validation_error` — a small object the route attached
+ * to say WHICH refusal it is, where the code alone is too coarse to act on.
+ *
+ * Open-ended on purpose: it is a bag of route-specific hints, not a schema, and a caller that does
+ * not recognise a key must ignore it rather than break. The named keys are the ones a surface
+ * currently branches on; everything else stays `unknown` so reading it forces a check.
+ */
+export type ApiErrorDetail = {
+  /** `not_ready` (AgentBook): `"no-pocket-yet"`, `"no-agent-id-yet"`, or `"entity-is-<status>"`. */
+  reason?: string;
+  /** `proof_rejected` (AgentBook): the contract error name the registry reverted with. NEVER the
+   *  revert message — that would carry the proof arguments. */
+  errorName?: string;
+  /** `not_eligible` (AgentBook): the World ID credential on file, null when there is none. */
+  credential?: string | null;
+  [key: string]: unknown;
+};
+
+/** Either shape the `details` field can take. Discriminate with `Array.isArray`, or use
+ *  `apiErrorDetail()` below. */
+export type ApiErrorDetails = ApiValidationIssue[] | ApiErrorDetail;
+
 export type ApiErrorBody = {
   error: {
     code: string;
     message: string;
-    details?: { path: string; message: string }[];
+    details?: ApiErrorDetails;
   };
 };
 
@@ -571,7 +597,7 @@ export type AgentBookRegisterResult = { status: "submitted"; txHash: string | nu
 export class ApiError extends Error {
   code: string;
   status: number;
-  details?: { path: string; message: string }[];
+  details?: ApiErrorDetails;
 
   constructor(status: number, body: ApiErrorBody["error"]) {
     super(body.message);
@@ -746,3 +772,15 @@ export type CompanyIntakeUpdate = Omit<CompanyIntakeInput, "partyId" | "syntheti
   /** The §4.6a decision: the clock took the number and the owner is choosing the slower route. */
   proceedWithoutSsn?: true;
 };
+
+/**
+ * `ApiError.details` as the hint object, or undefined.
+ *
+ * The one place the two shapes are told apart, so no surface has to cast. A `validation_error`'s
+ * issue array is NOT a hint object and comes back undefined rather than as an array with no
+ * `reason` on it — a caller reading `?.reason` gets the same answer either way, and one that
+ * wants the issues can still ask `Array.isArray(err.details)`.
+ */
+export function apiErrorDetail(details: ApiErrorDetails | undefined): ApiErrorDetail | undefined {
+  return details !== undefined && !Array.isArray(details) ? details : undefined;
+}

@@ -804,8 +804,16 @@ export function useWorldIdAttestVerifyMutation() {
 
 /* ── AgentBook mutations ──────────────────────────────────────────────────── */
 
-/** Open a vouch session. Nothing is invalidated: the session is a handle, and no cached view of
- *  the agent has changed until the proof comes back through `useAgentBookRegisterMutation`. */
+/**
+ * Open a vouch session.
+ *
+ * This DOES move the status view even though nothing is registered yet: the route inserts a
+ * `pending` row and the GET serves the latest row, so the chip reads `status: "pending"` from here
+ * on. No invalidation is wired in, and `useEntityAgentBookQuery` has no `refetchInterval` — the
+ * dialog is the only thing that knows when a session opened and when the flow is still in flight,
+ * so Task 9 invalidates `apiKeys.entityAgentBook` after this resolves and polls while in flight,
+ * rather than every dashboard paying for a poll it does not need.
+ */
 export function useAgentBookSessionMutation(entityId: string) {
   const ensureToken = useEnsureAuthToken();
 
