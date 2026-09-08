@@ -96,6 +96,60 @@ export interface McpToolDeps extends EntityViewDeps {
 }
 
 /**
+ * EVERY KEY OF `McpToolDeps` THAT IS COPIED VERBATIM — and a COMPILE ERROR if one is missing.
+ *
+ * `ENTITY_VIEW_DEP_KEYS`, one object out. The transport enumerated these by hand and dropped two
+ * of them without a sound: the document index first (`get_entity` over MCP described an entity
+ * with no legal documents while REST described the same entity with two), and then `now` — the
+ * injectable clock, which every REST surface honours and which the MCP tools therefore could not
+ * be tested against or frozen for. A hand-written pick is a subset by default, and the field it
+ * omits is always the one added last.
+ *
+ * `ens` is deliberately ABSENT from this list: it is the one dependency the MCP layer takes a
+ * NARROWING of rather than a copy, because `ApiDeps["ens"]` carries the gateway's signing account
+ * and the tools have no business holding a private key. `mcpToolDepsOf` constructs it, and the
+ * exhaustiveness check below excludes it by name so that omission is a decision somebody wrote
+ * down rather than a gap.
+ */
+export const MCP_TOOL_DEP_KEYS = [
+  "repo",
+  "runner",
+  "passkeys",
+  "walletProviderDefault",
+  "circleCustodyAvailable",
+  "turnkeyCustodyAvailable",
+  "platformManagerAddress",
+  "jobs",
+  "payments",
+  "pocketFunding",
+  "jobRunner",
+  "jobClientAddress",
+  "jobEvaluatorAddress",
+  "maxJobBudget",
+  "maxInflightJobsPerTenant",
+  "linkCodes",
+  "arc",
+  "worldId",
+  "formation",
+  "companies",
+  "formationSteps",
+  "now",
+  // The `EntityViewDeps` half — inherited, and listed here too because this list is about what
+  // the TRANSPORT copies, and a view dep that reached REST and not MCP is the bug that started
+  // all of this (A3's sharing label, field for field).
+  "formationStepsMany",
+  "company",
+  "companyMany",
+  "documents",
+  "companyAgents",
+] as const satisfies readonly (keyof McpToolDeps)[];
+
+/** Fails to compile the moment `McpToolDeps` grows a key that is neither listed nor `ens`. */
+type MissingMcpToolDep = Exclude<keyof McpToolDeps, (typeof MCP_TOOL_DEP_KEYS)[number] | "ens">;
+const _assertEveryMcpToolDepListed: MissingMcpToolDep extends never ? true : never = true;
+void _assertEveryMcpToolDepListed;
+
+/**
  * Availability sentence for the onboard_agent description — agent-first callers have no GET
  * /config, so the tool description is their capability discovery surface. The formation note
  * follows the same pattern for the same reason: an agent that cannot read /config must still be
