@@ -7,6 +7,7 @@ import { useAuth } from "@/components/onboarding/AuthProvider";
 import { useCompanyComplianceQuery, useCompanyQuery } from "@/lib/api/hooks";
 import type { CompanyDetailView, FormationDocument } from "@/lib/api/types";
 import { companyLabel } from "@/lib/formation/companyIntake";
+import { companyPill, mayRenderConfirmed } from "@/lib/formation/honesty";
 import { formatDate } from "@/lib/format";
 import { CompanyStatePill } from "@/components/agents/CompanyStatePill";
 import { CompanyParkPanel } from "@/components/agents/CompanyParkPanel";
@@ -131,7 +132,17 @@ function Documents({ company }: { company: CompanyDetailView }) {
   const { session } = useAuth();
   const [busyDocId, setBusyDocId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const demo = company.environment !== "production";
+  /**
+   * ⚠ NOT `environment !== "production"`, which is what this was.
+   *
+   * Two values cannot carry three facts, and the one that got lost was "we don't know" — which
+   * this spelling then rendered as "demo", labelling a filing whose environment could not be read
+   * as one that legally does not exist. `companyPill` is the shared decision: the demo WORD
+   * follows the environment, the COLOUR follows the tone, and an unreported environment says so.
+   */
+  const { tone, environment } = companyPill(company.state, company.environment);
+  const demo = environment === "sandbox";
+  const unverified = !mayRenderConfirmed(tone);
 
   async function download(doc: FormationDocument) {
     const token = session?.token;
@@ -161,8 +172,11 @@ function Documents({ company }: { company: CompanyDetailView }) {
   }
 
   return (
-    <Card className={cx("p-5", demo && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
-      <SectionTitle>Legal documents{demo && " (demo)"}</SectionTitle>
+    <Card className={cx("p-5", unverified && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
+      <SectionTitle>
+        Legal documents
+        {demo ? " (demo)" : unverified ? " (environment not reported)" : ""}
+      </SectionTitle>
       {company.documents.length === 0 ? (
         <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
           None yet. The filing agent produces the Articles of Organization and the Operating

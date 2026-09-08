@@ -1,7 +1,7 @@
 "use client";
 
-import { formationEnvironmentOf } from "@/lib/api/formationEnvironment";
-import { isKnownCompanyState, type CompanyState } from "@/lib/api/types";
+import type { CompanyState } from "@/lib/api/types";
+import { companyPill, mayRenderConfirmed } from "@/lib/formation/honesty";
 import { AmberPill, cx } from "@/components/onboarding/primitives";
 
 /**
@@ -14,8 +14,11 @@ import { AmberPill, cx } from "@/components/onboarding/primitives";
  * one real. And a STATE this build has never heard of (a value from a newer backend) is amber
  * with its own wording, never a blank badge.
  *
- * Rendered by the reuse picker, the Companies list and the Companies detail page, so that the
- * three cannot describe the same row differently.
+ * ⚠ The DECISION is `companyPill`, not this file. This component spelled the colour rule inline
+ * as `env !== "production" || !known` — which is `companyTone` with the failed arm dropped and
+ * the vocabulary re-derived — while `CompanyDetail` spelled a third version that collapsed
+ * "unknown" into "demo". Three spellings of one invariant is three chances for one of them to
+ * render green over a sandbox company; this one renders what the shared function decided.
  */
 export function CompanyStatePill({
   state,
@@ -24,46 +27,37 @@ export function CompanyStatePill({
   state: CompanyState | string;
   environment: string;
 }) {
-  const env = formationEnvironmentOf(environment);
-  const known = isKnownCompanyState(state);
-  const label = known ? STATE_LABEL[state] : "Unrecognised state";
+  const { tone, label, note } = companyPill(state, environment);
+
+  // RED first, and independent of the environment: a filing that failed says so whether it was a
+  // demo or not. Dressing it as amber-but-fine would hide the one state that needs a human, and a
+  // sandbox failure is still a failure of the thing being demonstrated.
+  if (tone === "failed")
+    return (
+      <span className={cx(PILL, "text-[#ff8a84]")}>
+        {label}
+        {note}
+      </span>
+    );
 
   // Amber covers sandbox, unknown environments and unknown states — everything that is not a
   // confirmed real filing in a word this build understands.
-  if (env !== "production" || !known)
+  if (!mayRenderConfirmed(tone))
     return (
       <AmberPill>
-        {env === "sandbox" ? `${label} (demo)` : label}
-        {env === "unknown" || env === "loading" ? " · environment not reported" : ""}
+        {label}
+        {note}
       </AmberPill>
     );
 
   return (
     <span
-      className={cx(
-        "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1 text-[11.5px]",
-        state === "failed" || state === "abandoned" ? "text-[#ff8a84]" : "text-muted-2",
-        state === "filed" || state === "complete" ? "text-emerald-300" : "",
-      )}
+      className={cx(PILL, state === "filed" || state === "complete" ? "text-emerald-300" : "text-muted-2")}
     >
       {label}
     </span>
   );
 }
 
-/**
- * The eight words, in the owner's language.
- *
- * Deliberately NOT the backend's identifiers: `ready` means "paid for, not filed yet", which is a
- * sentence, and `none` never appears at all because the backend already turned it into `ready`.
- */
-const STATE_LABEL: Record<CompanyState, string> = {
-  draft: "Draft",
-  paying: "Awaiting payment",
-  ready: "Ready to file",
-  in_progress: "Filing in progress",
-  filed: "Filed",
-  complete: "Filed · EIN issued",
-  failed: "Filing failed",
-  abandoned: "Abandoned",
-};
+const PILL =
+  "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1 text-[11.5px]";

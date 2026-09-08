@@ -1,4 +1,8 @@
-import { isKnownEnvironment, type FormationEnvironment } from "@/lib/api/formationEnvironment";
+import {
+  formationEnvironmentOf,
+  isKnownEnvironment,
+  type FormationEnvironment,
+} from "@/lib/api/formationEnvironment";
 import {
   isKnownCompanyState,
   isKnownFormationStatus,
@@ -100,4 +104,55 @@ export function legalBodyTitle(input: {
   return input.mode === "attach"
     ? "Which company is this agent filed under?"
     : "Create the company this agent is filed under";
+}
+
+/**
+ * The eight company words, in the OWNER's language.
+ *
+ * Deliberately not the backend's identifiers: `ready` means "paid for, not filed yet", which is a
+ * sentence, and `none` never appears at all because the backend already turned it into `ready`.
+ */
+export const COMPANY_STATE_LABEL: Record<CompanyState, string> = {
+  draft: "Draft",
+  paying: "Awaiting payment",
+  ready: "Ready to file",
+  in_progress: "Filing in progress",
+  filed: "Filed",
+  complete: "Filed · EIN issued",
+  failed: "Filing failed",
+  abandoned: "Abandoned",
+};
+
+/**
+ * THE COMPANY PILL, decided once — tone and words together (§2/§7).
+ *
+ * `CompanyStatePill` spelled the colour rule inline as `env !== "production" || !known`, which is
+ * `companyTone` with the failed arm dropped and the vocabulary re-derived, and `CompanyDetail`
+ * spelled a THIRD version as `environment !== "production"` — which collapses "we don't know"
+ * into "demo", the wrong direction and the one this whole module exists to prevent. So the
+ * decision is here, the components render it, and this is what the tests can reach.
+ *
+ * `state` and `environment` are `string` on purpose: they arrive from a backend that deploys
+ * independently, and a word from a newer one must produce a labelled amber pill rather than a
+ * blank badge or a type error.
+ */
+export function companyPill(
+  state: CompanyState | string,
+  environment: string,
+): { tone: FilingTone; environment: FormationEnvironment; label: string; note: string } {
+  const env = formationEnvironmentOf(environment);
+  const tone = companyTone(env, state);
+  const label = isKnownCompanyState(state) ? COMPANY_STATE_LABEL[state] : "Unrecognised state";
+  return {
+    tone,
+    // The NORMALISED environment, returned rather than re-derived by each caller: the surfaces
+    // that need "is this a demo?" separately from "may I claim anything?" would otherwise each
+    // call `formationEnvironmentOf` again, which is the second spelling this function replaces.
+    environment: env,
+    // The demo word follows the ENVIRONMENT and the colour follows the TONE, because they answer
+    // different questions: "is this a real register?" and "may this build claim anything?".
+    label: env === "sandbox" ? `${label} (demo)` : label,
+    // …and an environment nobody reported says so, rather than borrowing either wording.
+    note: env === "unknown" || env === "loading" ? " · environment not reported" : "",
+  };
 }

@@ -14,12 +14,13 @@
 import { expect, test } from "vitest";
 import type { FormationEnvironment } from "@/lib/api/formationEnvironment";
 import {
+  companyPill,
   companyTone,
   filingTone,
   legalBodyTitle,
   mayRenderConfirmed,
 } from "@/lib/formation/honesty";
-import { COMPANY_STATES, FORMATION_STATUSES } from "@/lib/api/types";
+import { COMPANY_STATES, FORMATION_STATUSES, type CompanyState } from "@/lib/api/types";
 
 const NOT_PRODUCTION: FormationEnvironment[] = ["sandbox", "unknown", "loading"];
 
@@ -111,4 +112,59 @@ test("A3: before anything is attached, the DEPLOYMENT's answer is the right one"
   for (const environment of ["loading", "unknown"] as const)
     for (const mode of ["attach", "create"] as const)
       expect(legalBodyTitle({ environment, attached: false, mode })).toBe("Legal body");
+});
+
+/* ── the company pill, tone AND words (§2/§7) ─────────────────────────────── */
+
+/**
+ * What the badge actually renders, asserted through the function that decides it.
+ *
+ * The runner is deliberately not a component runner (see `vitest.config.ts`), so the decision is
+ * a pure function and the component renders what it returns — which is the same constraint that
+ * stopped `CompanyStatePill` from spelling the invariant a second time and `CompanyDetail` from
+ * spelling it a third.
+ */
+const HEALTHY: CompanyState[] = ["draft", "paying", "ready", "in_progress", "filed", "complete"];
+
+test("A3: sandbox, unknown and loading are AMBER — never the confirmed colour", () => {
+  for (const environment of ["sandbox", "not-a-word", ""]) {
+    for (const state of HEALTHY) {
+      const pill = companyPill(state, environment);
+      expect(mayRenderConfirmed(pill.tone), `${state}/${environment}`).toBe(false);
+      expect(pill.tone).not.toBe("failed");
+    }
+  }
+});
+
+test("A3: only production + a state this build knows renders green", () => {
+  for (const state of HEALTHY)
+    expect(mayRenderConfirmed(companyPill(state, "production").tone), state).toBe(true);
+  // A word from a newer backend is amber with its own label, never a blank badge.
+  const unknownWord = companyPill("mid_flight", "production");
+  expect(mayRenderConfirmed(unknownWord.tone)).toBe(false);
+  expect(unknownWord.label).toBe("Unrecognised state");
+});
+
+test("A3: failed and abandoned are RED on any environment", () => {
+  for (const environment of ["production", "sandbox", "not-a-word"])
+    for (const state of ["failed", "abandoned"] as const)
+      expect(companyPill(state, environment).tone, `${state}/${environment}`).toBe("failed");
+});
+
+test("A3: the demo WORD follows the environment; the unreported note is its own", () => {
+  expect(companyPill("filed", "sandbox").label).toBe("Filed (demo)");
+  expect(companyPill("filed", "production").label).toBe("Filed");
+  expect(companyPill("filed", "production").note).toBe("");
+  // …and an environment nobody reported borrows NEITHER wording.
+  const unknown = companyPill("filed", "not-a-word");
+  expect(unknown.label).toBe("Filed");
+  expect(unknown.note).toMatch(/environment not reported/);
+});
+
+test("A3: every state in the union has a label — a badge is never blank", () => {
+  for (const state of COMPANY_STATES) {
+    const { label } = companyPill(state, "production");
+    expect(label, state).toBeTruthy();
+    expect(label, state).not.toBe("Unrecognised state");
+  }
 });
