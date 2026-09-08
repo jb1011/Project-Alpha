@@ -213,6 +213,11 @@ export type PublicConfig = {
     >;
     reuseDisclosure: string;
   };
+  /** Whether this deployment can WRITE an AgentBook registration (design 2026-08-25 v3 §4.5).
+   *  The READ side is wired everywhere, so the status chip answers regardless; only the vouch
+   *  flow is gated on this. Optional for deploy-order safety: absent means the backend predates
+   *  the feature, i.e. unavailable. */
+  agentBookRegistrationAvailable?: boolean;
 };
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).
@@ -469,6 +474,99 @@ export type WorldIdStatusView = {
   attestation?: { minAge: number; credential?: string | null; verifiedAt: number };
 };
 
+/* ── AgentBook (World's registry on World Chain) ──────────────────────────── */
+
+/**
+ * What the registry says about this agent's wallet, after every source has been reconciled.
+ *
+ * `unknown` is its own answer, and the reason this exists beside `registered`: a World Chain read
+ * we could not make must never render as a refusal. `disputed` means a human answers for the
+ * wallet who is not the one we registered.
+ */
+export type AgentBookOutcome = "registered" | "unregistered" | "unknown" | "disputed";
+
+/** Where OUR registration attempt got to. Deliberately independent of `AgentBookOutcome`: the row
+ *  can read `confirmed` while the chain reads `disputed`. */
+export type AgentBookRowStatus =
+  | "pending"
+  | "submitted"
+  | "confirmed"
+  | "disputed"
+  | "failed"
+  | "expired";
+
+/**
+ * AgentBook standing for one agent (GET /entities/:id/agentbook).
+ *
+ * `registered` is the CHAIN's answer and `status` is OURS; they are separate on purpose, because a
+ * registration that is signed and broadcast but not yet mined is honestly `status: "submitted"`
+ * with `registered: false`. Render `outcome` — it folds "could not check" out of the boolean.
+ *
+ * Everything the vouch feature added is optional for deploy-order safety: the interface and the
+ * API deploy separately and this route predates the feature, so a new browser can meet an old
+ * backend. Absent `outcome` means exactly that, and `registered` is then the whole answer —
+ * `outcome ?? (registered ? "registered" : "unregistered")`; absent `disputed` is `false`.
+ */
+export type AgentBookStatusView = {
+  registered: boolean;
+  /** The pseudonym of the human AgentBook binds to the wallet, when there is one. */
+  humanId?: string;
+  /** The address AgentBook was queried for: the agent's pocket EOA, which is what signs AgentKit
+   *  challenges and therefore what a seller looks up. Absent only before the pocket exists. */
+  address?: string;
+  /** Why there is nothing to look up yet. The current API emits only `no-pocket-yet`; the other
+   *  two are kept so this build still parses a backend that predates the pocket-address fix. */
+  reason?: "not registered" | "no-operator-yet" | "no-pocket-yet";
+  outcome?: AgentBookOutcome;
+  /** Absent when nothing has ever been registered for this agent from here. */
+  status?: AgentBookRowStatus;
+  /** null while the transaction is signed and recorded but not yet on the wire. The reconciler
+   *  re-broadcasts the same raw transaction, so that is "hash pending", never "failed". */
+  txHash?: string | null;
+  disputed?: boolean;
+  /** The contract error name from the last attempt. Only sent when `status` is `"failed"`. */
+  errorCode?: string;
+};
+
+/** POST /entities/:id/agentbook/session — everything the World App round trip needs. */
+export type AgentBookSessionView = {
+  /** Opaque handle, handed back verbatim on register. */
+  sessionId: string;
+  appId: string;
+  action: string;
+  /** `encodePacked(address, uint256 nonce)`: what the proof commits to, so neither the address nor
+   *  the nonce can move between session and register. */
+  signal: `0x${string}`;
+  /** The registry nonce, decimal. Hand it back unchanged — a mismatch is a 409. */
+  nonce: string;
+  /** The address AgentBook will bind, checksummed. */
+  pocketAddress: `0x${string}`;
+  /** The agent's on-chain id. Always a string: the route refuses a session for an agent that has
+   *  none. */
+  agentId: string;
+  /** Epoch ms. Past it, register answers 409 and the guardian starts again. */
+  expiresAt: number;
+  network: "testnet" | "mainnet";
+  /** Confirmed vouches this GUARDIAN'S TENANT has already made — per tenant, not per human: our
+   *  World ID pseudonym for this account is not the guardian's AgentBook pseudonym. */
+  priorVouches: number;
+};
+
+/** POST /entities/:id/agentbook/register — the World ID proof, as the widget produced it. */
+export type AgentBookRegisterBody = {
+  sessionId: string;
+  root: string;
+  /** The nonce the session handed out, unchanged. */
+  nonce: string;
+  nullifierHash: string;
+  /** Exactly 8 elements; the backend rejects any other length. */
+  proof: string[];
+};
+
+/** The register route's answer. `txHash` is null when the transaction is signed and recorded but
+ *  the broadcast did not land — the reconciler re-broadcasts the same raw transaction, so that is
+ *  "submitted, hash pending" and NOT something for the caller to retry. */
+export type AgentBookRegisterResult = { status: "submitted"; txHash: string | null };
 
 export class ApiError extends Error {
   code: string;

@@ -9,6 +9,8 @@ import {
 import { useCallback } from "react";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import {
+  agentBookRegister,
+  agentBookSession,
   bootstrapConnection,
   createCompany,
   createConnectionPackage,
@@ -56,6 +58,7 @@ import {
 import { apiKeys } from "./keys";
 import { TERMINAL } from "./poll";
 import type {
+  AgentBookRegisterBody,
   AgentSpec,
   BootstrapPackage,
   Capability,
@@ -795,6 +798,53 @@ export function useWorldIdAttestVerifyMutation() {
     onSuccess: async () => {
       const token = await ensureToken();
       await queryClient.invalidateQueries({ queryKey: apiKeys.worldIdMe(token) });
+    },
+  });
+}
+
+/* ── AgentBook mutations ──────────────────────────────────────────────────── */
+
+/** Open a vouch session. Nothing is invalidated: the session is a handle, and no cached view of
+ *  the agent has changed until the proof comes back through `useAgentBookRegisterMutation`. */
+export function useAgentBookSessionMutation(entityId: string) {
+  const ensureToken = useEnsureAuthToken();
+
+  return useMutation({
+    mutationFn: async () => {
+      const token = await ensureToken();
+      return agentBookSession(token, entityId);
+    },
+  });
+}
+
+/**
+ * Submit the World ID proof.
+ *
+ * `onSettled`, not `onSuccess`: the failures here move the stored row too — a 409 means a
+ * registration is already in flight, and a 400 `proof_rejected` records an `errorCode` the status
+ * chip shows. Refetching only on success would leave the chip stale in exactly the cases the
+ * guardian most needs to see.
+ *
+ * Two different tokens on purpose. The REQUEST takes the ensured one, because the World App round
+ * trip between session and register is minutes long and the session may have been refreshed in
+ * between. The invalidation KEY takes the rendered one, which is what `useEntityAgentBookQuery`
+ * keyed its cache entry with — an ensured token that had just rotated would build a key matching
+ * no cached query and silently invalidate nothing.
+ */
+export function useAgentBookRegisterMutation(entityId: string) {
+  const queryClient = useQueryClient();
+  const token = useAuthToken();
+  const ensureToken = useEnsureAuthToken();
+
+  return useMutation({
+    mutationFn: async (body: AgentBookRegisterBody) => {
+      const fresh = await ensureToken();
+      return agentBookRegister(fresh, entityId, body);
+    },
+    onSettled: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: apiKeys.entityAgentBook(token ?? "", entityId),
+      });
     },
   });
 }
