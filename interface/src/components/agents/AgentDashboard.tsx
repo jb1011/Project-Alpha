@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useQueryClient } from "@tanstack/react-query";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
+import { agentBookChipState } from "@/lib/agentbook/chipState";
 import { useAgentDashboardQueries } from "@/lib/api/hooks";
 import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
@@ -19,6 +20,11 @@ import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
 import { FormationCard } from "@/components/agents/FormationCard";
 import { AmberPill, Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
+
+/** One class for every AgentBook state. The chip used to turn emerald with a filled dot when the
+ *  registry answered yes — a registry entry is a fact to link to, not a badge (design v3 D9). */
+const AGENTBOOK_CHIP_CLASS =
+  "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-muted-2 transition-colors hover:text-ink";
 
 export function AgentDashboard({
   entityId,
@@ -44,7 +50,7 @@ export function AgentDashboard({
   const entity = entityQuery.data ?? null;
   const treasury = treasuryQuery.data ?? null;
   const runs = runsQuery.data ?? [];
-  const agentBook = agentBookQuery.data ?? null;
+  const agentBookChip = agentBookChipState(agentBookQuery.data);
   const loadError =
     entityQuery.error instanceof Error
       ? entityQuery.error.message
@@ -188,37 +194,24 @@ export function AgentDashboard({
               On-chain identity
             </div>
             <div className="flex flex-wrap items-center gap-2">
-            {agentBook && (
-              <span
-                title={
-                  agentBook.registered
-                    ? `AgentBook (World Chain): human ${agentBook.humanId?.slice(0, 14)}… answers for this agent's wallet`
-                    : agentBook.reason === "no-pocket-yet" ||
-                        agentBook.reason === "no-operator-yet"
-                      ? "Agent still provisioning — payment wallet not set yet"
-                      : "Not registered in AgentBook"
-                }
-                className={
-                  agentBook.registered
-                    ? "inline-flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1.5 text-[11.5px] text-emerald-300"
-                    : "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-muted-2"
-                }
-              >
-                <span
-                  aria-hidden
-                  className={
-                    agentBook.registered
-                      ? "h-1.5 w-1.5 rounded-full bg-emerald-300"
-                      : "h-1.5 w-1.5 rounded-full border border-muted-2"
-                  }
-                />
-                {agentBook.registered
-                  ? "AgentBook · human-backed"
-                  : agentBook.reason === "no-operator-yet"
-                    ? "AgentBook · provisioning"
-                    : "AgentBook · not registered"}
-              </span>
-            )}
+            {/* One neutral chip, one claim, whatever the answer is (design v3 §5.4, D9). The
+                wording and the order the answers are read in live in agentBookChipState. */}
+            {agentBookChip &&
+              (agentBookChip.href ? (
+                <a
+                  href={agentBookChip.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={agentBookChip.title}
+                  className={AGENTBOOK_CHIP_CLASS}
+                >
+                  {agentBookChip.label}
+                </a>
+              ) : (
+                <span title={agentBookChip.title} className={AGENTBOOK_CHIP_CLASS}>
+                  {agentBookChip.label}
+                </span>
+              ))}
             {ensName(entity) && (
               <a
                 href={`${ENS_EXPLORER_URL}/${ensName(entity)}`}
@@ -234,6 +227,13 @@ export function AgentDashboard({
             )}
             </div>
           </div>
+          {/* Said out loud, not on hover: a submit we could not confirm is not a registration that
+              did not happen, and the chip has no room to say so (§5.2, verbatim). */}
+          {agentBookChip?.note && (
+            <p className="mt-3 max-w-[70ch] text-[11.5px] leading-[1.55] text-muted-2">
+              {agentBookChip.note}
+            </p>
+          )}
           <dl className="mt-4 grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
             {entity.agentId && <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />}
             {entity.treasury && (

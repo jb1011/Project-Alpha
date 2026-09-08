@@ -1,0 +1,134 @@
+import type { AgentBookStatusView } from "@/lib/api/types";
+
+/**
+ * What the AgentBook chip is allowed to say — the claims ceiling (design 2026-08-25 v3 §5.4, D9)
+ * expressed once, as a pure function, so the dashboard and the vouch dialog cannot drift apart.
+ *
+ * The ceiling exists because every one of these labels is a statement about a real person. The
+ * only permitted positive claim is "a World ID verified human has vouched for this agent's payment
+ * address in AgentBook" — not that the guardian vouched, not that anything is proven about who
+ * controls the address, and never the word "human-backed" on a chip. Nothing here is green: a
+ * public registry entry is a fact to link to, not a badge to award.
+ *
+ * The order the answers are read in is the other half of the ceiling (§5.2). OUR row comes first,
+ * because while a vouch is submitted the chain still honestly reads "no entry" — and rendering
+ * that as "Not in AgentBook" tells someone that a permanent, public statement about them did not
+ * happen, at the one moment they cannot check for themselves. The chain's answer is used only
+ * once our row has stopped moving.
+ */
+
+/** World Chain's public explorer. Vouches live on World Chain whatever chain the agent itself
+ *  runs on, so this is deliberately not the agent's chain explorer. */
+export const WORLDCHAIN_EXPLORER_URL = "https://worldscan.org";
+
+/** §5.2's states, minus the ones only the vouch dialog is ever in (`awaiting-approval`). */
+export type AgentBookChipKind =
+  | "vouched"
+  | "not-registered"
+  | "unknown"
+  | "disputed"
+  | "submitting"
+  | "failed";
+
+export type AgentBookChipState = {
+  kind: AgentBookChipKind;
+  /** One of the five permitted labels. Neutral styling only — never emerald, never "human-backed". */
+  label: string;
+  /** Hover copy. Expands the label; never claims more than the label does. */
+  title: string;
+  /** The registry entry on World Chain, when there is something to link to. */
+  href?: string;
+  /** Copy that has to be READ rather than hovered, because it corrects an impression the label
+   *  alone would leave. Only the failure state sets it (§5.2, verbatim). */
+  note?: string;
+};
+
+/** §5.2, verbatim. A failed submit is not a failed registration: the transaction may have landed
+ *  and the reconciler may still be reading the chain. */
+const FAILURE_COPY =
+  "We could not confirm the registration. It may still have gone through; we are checking the registry and will update this.";
+
+const VOUCHED: AgentBookChipState = {
+  kind: "vouched",
+  label: "Vouched in AgentBook ↗",
+  title: "A World ID verified human has vouched for this agent's payment address in AgentBook.",
+};
+
+const NOT_REGISTERED: AgentBookChipState = {
+  kind: "not-registered",
+  label: "Not in AgentBook",
+  title: "No AgentBook entry for this agent's payment address.",
+};
+
+const UNKNOWN: AgentBookChipState = {
+  kind: "unknown",
+  label: "Could not check",
+  title: "AgentBook could not be read; this says nothing about whether a vouch exists.",
+};
+
+const DISPUTED: AgentBookChipState = {
+  kind: "disputed",
+  label: "Disputed in AgentBook",
+  title: "Someone else has replaced the vouch for this address in AgentBook.",
+};
+
+const SUBMITTING: AgentBookChipState = {
+  kind: "submitting",
+  label: "Vouch submitted, checking the registry",
+  title:
+    "A vouch for this address has been submitted. We are reading World Chain and will update this when the registry answers.",
+};
+
+/** The failure state wears a permitted neutral label and carries §5.2's sentence as visible copy —
+ *  a chip label cannot fit "it may still have gone through", and that clause is the whole point. */
+const FAILED: AgentBookChipState = {
+  kind: "failed",
+  label: "Could not check",
+  title: FAILURE_COPY,
+  note: FAILURE_COPY,
+};
+
+function explorerHref(view: AgentBookStatusView): string | undefined {
+  if (view.txHash) return `${WORLDCHAIN_EXPLORER_URL}/tx/${view.txHash}`;
+  if (view.address) return `${WORLDCHAIN_EXPLORER_URL}/address/${view.address}`;
+  return undefined;
+}
+
+/**
+ * Derive the chip from a status view. `null` means render NO chip.
+ *
+ * Nothing is said about an agent that has no payment address yet: there is no address to look up,
+ * so "Not in AgentBook" would be an answer to a question nobody asked.
+ */
+export function agentBookChipState(
+  view: AgentBookStatusView | null | undefined,
+): AgentBookChipState | null {
+  if (!view) return null;
+
+  // 1. Our own row, while it is still moving (§5.2). `confirmed` and `expired` fall through: a
+  //    confirmed row is only as good as the chain's current answer, and an expired one never
+  //    reached the chain at all.
+  switch (view.status) {
+    case "pending":
+    case "submitted":
+      return SUBMITTING;
+    case "failed":
+      return FAILED;
+    case "disputed":
+      return DISPUTED;
+    default:
+      break;
+  }
+
+  // 2. No address, no question (D9).
+  if (view.reason === "no-pocket-yet") return null;
+
+  // 3. The chain's answer. An absent `outcome` is a backend that predates the field, which is
+  //    exactly "we have not been told": it reads as `unknown`, never as a vouch, because
+  //    `registered: true` from an older shape is not enough to make a public claim about a person.
+  if (view.outcome === undefined || view.outcome === "unknown") return UNKNOWN;
+  // A disputed row outranks a registered outcome: of two claims, the more conservative wins.
+  if (view.outcome === "disputed" || view.disputed === true) return DISPUTED;
+  if (view.outcome === "registered") return { ...VOUCHED, href: explorerHref(view) };
+  return NOT_REGISTERED;
+}

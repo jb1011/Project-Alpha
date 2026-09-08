@@ -29,6 +29,10 @@ export function TenantRecord({
   passkeys: ReactNode;
 }) {
   const verified = me?.verified ?? false;
+  /** A waiver grants access, not personhood. `/world-id/me` returns `verified: true` for one, so
+   *  without this branch an admin waiver wears the same green as an Orb proof — the card would
+   *  state something about a person that nobody proved. Same treatment as GuardianRecord. */
+  const waived = me?.credential === "waiver";
   const formationReady = me?.formationReady ?? false;
 
   return (
@@ -48,12 +52,18 @@ export function TenantRecord({
               <span
                 className={cx(
                   "rounded-full border px-2.5 py-0.5 text-[10px] uppercase tracking-[0.16em]",
-                  verified
+                  verified && !waived
                     ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
-                    : "border-line-strong bg-paper-3/70 text-muted-2",
+                    : waived
+                      ? "border-amber-400/30 bg-amber-400/10 text-amber-300"
+                      : "border-line-strong bg-paper-3/70 text-muted-2",
                 )}
               >
-                {verified ? "Human-backed" : "No human on record"}
+                {verified && !waived
+                  ? "Human-backed"
+                  : waived
+                    ? "Admin waiver"
+                    : "No human on record"}
               </span>
             </div>
 
@@ -80,20 +90,30 @@ export function TenantRecord({
               href="/guardian"
               className={cx(
                 "group flex items-center gap-2 text-[14px]",
-                verified ? "text-emerald-300" : "text-muted",
+                verified ? (waived ? "text-amber-300" : "text-emerald-300") : "text-muted",
               )}
             >
               <span
                 aria-hidden
-                className={cx("h-1.5 w-1.5 rounded-full", verified ? "bg-emerald-300" : "bg-muted-2")}
+                className={cx(
+                  "h-1.5 w-1.5 rounded-full",
+                  verified ? (waived ? "bg-amber-300" : "bg-emerald-300") : "bg-muted-2",
+                )}
               />
               <span className="underline-offset-2 group-hover:underline">
-                {verified ? "Accountable human" : "Verify on the guardian page"}
+                {verified
+                  ? waived
+                    ? "Waiver on record"
+                    : "Accountable human"
+                  : "Verify on the guardian page"}
               </span>
             </Link>
           </Cell>
 
-          <Cell label="Credential" hint={verified ? "proof of personhood" : "none yet"}>
+          <Cell
+            label="Credential"
+            hint={verified ? (waived ? "access granted, not verified" : "proof of personhood") : "none yet"}
+          >
             <span className="text-[14px] text-ink">{verified ? (me?.credential ?? "verified") : "—"}</span>
           </Cell>
 

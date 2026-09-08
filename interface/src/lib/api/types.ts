@@ -514,9 +514,9 @@ export type AgentBookStatusView = {
   /** The address AgentBook was queried for: the agent's pocket EOA, which is what signs AgentKit
    *  challenges and therefore what a seller looks up. Absent only before the pocket exists. */
   address?: string;
-  /** Why there is nothing to look up yet. The current API emits only `no-pocket-yet`; the other
-   *  two are kept so this build still parses a backend that predates the pocket-address fix. */
-  reason?: "not registered" | "no-operator-yet" | "no-pocket-yet";
+  /** Why there is nothing to look up yet, and the API has exactly one: the agent has no payment
+   *  address, so there is no question to put to AgentBook and the dashboard shows no chip. */
+  reason?: "no-pocket-yet";
   outcome?: AgentBookOutcome;
   /** Absent when nothing has ever been registered for this agent from here. */
   status?: AgentBookRowStatus;

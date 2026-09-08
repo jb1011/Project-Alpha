@@ -61,14 +61,16 @@ export default function PersonhoodPage() {
           <div className="mx-auto max-w-[840px] px-6 py-16 lg:px-10 lg:py-20">
             <h2 className="text-[24px] font-medium tracking-[-0.01em]">AgentBook on World Chain</h2>
             <p className="mt-4 text-[15px] leading-[1.65] text-muted">
-              AgentBook answers a simple question: does a verified human publicly
-              answer for this wallet? Live reads on World Chain power the buyer
-              trust dial tier &ldquo;verified sellers only&rdquo; and the dashboard
-              &ldquo;human-backed&rdquo; chip.
+              AgentBook is World&rsquo;s public registry on World Chain. Sellers who
+              check it can see whether a World ID verified human has vouched for this
+              agent&rsquo;s payment address. The agent dashboard shows &ldquo;Vouched in
+              AgentBook&rdquo; when one has.
             </p>
             <p className="mt-4 text-[15px] leading-[1.65] text-muted">
-              When your agent pays via x402, the World agentkit fronts every buy
-              so sellers can see an accountable buyer backed by a verified human.
+              When your agent pays via x402, the World agentkit fronts every buy, so
+              the address a seller looks up is the address that paid. A vouch says a
+              verified human put their World ID behind that address. It is not a
+              statement about who controls it.
             </p>
           </div>
         </section>
