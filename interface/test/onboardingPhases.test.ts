@@ -25,10 +25,10 @@ test("G2: a phase that IS on the list is returned untouched", () => {
   for (const p of withoutFormation) expect(snapToVisiblePhase(withoutFormation, p.id)).toBe(p.id);
 });
 
-test("G2: a restored `legal-identity` on a list without it snaps FORWARD to custody", () => {
+test("G2: a restored `legal-body` on a list without it snaps FORWARD to custody", () => {
   // The three ways this happens: /config still in flight, /config failed, formation turned off
   // between two visits. All three hide the step while storage still points at it.
-  expect(snapToVisiblePhase(withoutFormation, "legal-identity")).toBe("custody");
+  expect(snapToVisiblePhase(withoutFormation, "legal-body")).toBe("custody");
   // Snapping backwards to `guardian` would re-run the accountable-human step for somebody who has
   // already completed it — custody is where the flow itself sends a user who skips this step.
 });
@@ -50,19 +50,19 @@ test("G2: a phase from corrupt storage falls back to the first visible phase", (
 
 test("G2: snapping never carries a user PAST a step, except the skipped one", () => {
   // Every snap either stays put, or lands earlier in the canonical order — the single exception
-  // being `legal-identity`, whose whole point is that the flow skips it.
+  // being `legal-body`, whose whole point is that the flow skips it.
   const canonical = (id: string) => PHASES.findIndex((p) => p.id === id);
   for (const p of PHASES) {
-    if (p.id === "legal-identity") continue;
+    if (p.id === "legal-body") continue;
     const snapped = snapToVisiblePhase(withoutFormation, p.id);
     expect(canonical(snapped), p.id).toBeLessThanOrEqual(canonical(p.id));
   }
 });
 
 test("G9: neighbours come from the VISIBLE list, so the optional step drops out of both", () => {
-  expect(nextPhase(withFormation, "guardian")).toBe("legal-identity");
+  expect(nextPhase(withFormation, "guardian")).toBe("legal-body");
   expect(nextPhase(withoutFormation, "guardian")).toBe("custody");
-  expect(prevPhase(withFormation, "custody")).toBe("legal-identity");
+  expect(prevPhase(withFormation, "custody")).toBe("legal-body");
   expect(prevPhase(withoutFormation, "custody")).toBe("guardian");
 });
 

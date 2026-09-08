@@ -100,9 +100,12 @@ test("G6: buildPersistedOnboarding strips PII BY VALUE, not by where it came fro
   const config = { ...emptyConfig(), name: "Wizard agent", ...PII_FIELDS } as unknown as AgentConfig;
   const session = {
     ...emptySession(),
-    partyId: "party_opaque_handle",
-    partySynthetic: true,
+    companyId: "company_opaque_handle",
     party: { ...PII_FIELDS },
+    // The one field that would be worst of all. A2 gave the wizard an SSN to collect, and the
+    // shape this guard exists to catch is somebody hanging it off the session "just until the
+    // user comes back" — one line, and the wizard keeps working perfectly.
+    ssn: "123-45-6789",
   } as unknown as OnboardingSession;
 
   const bytes = JSON.stringify(
@@ -111,15 +114,23 @@ test("G6: buildPersistedOnboarding strips PII BY VALUE, not by where it came fro
 
   for (const value of PII_VALUES) expect(bytes, value).not.toContain(value);
   for (const field of PII_KEYS) expect(bytes, field).not.toContain(field);
-  // …and the handle, which identifies a row rather than a person, does survive — otherwise this
-  // test would pass just as happily against a function that persisted nothing at all.
-  expect(bytes).toContain("party_opaque_handle");
+  // ⚠ THE SSN, by value AND by key name. It never belongs in a browser store, in any shape.
+  expect(bytes).not.toContain("123-45-6789");
+  expect(bytes).not.toContain("ssn");
+  // …and the handle, which identifies a FILING rather than a person, does survive — otherwise
+  // this test would pass just as happily against a function that persisted nothing at all.
+  expect(bytes).toContain("company_opaque_handle");
 });
 
-test("G6: only the OPAQUE handle survives a reload — never the credential", () => {
+test("G6: only the OPAQUE COMPANY handle survives a reload — never the credential", () => {
   const session: string[] = [...PERSISTED_SESSION_KEYS];
-  expect(session).toContain("partyId");
-  expect(session).toContain("partySynthetic");
+  // A3: `companyId` REPLACES `partyId` and `partySynthetic`. The party handle is no longer an
+  // onboard concept (the door refuses one), and "is this a demo?" is no longer wizard state at
+  // all — it is read from the company row, whose pin is stamped at creation and immutable after,
+  // so a remembered boolean would get a re-pointed deployment exactly backwards.
+  expect(session).toContain("companyId");
+  expect(session).not.toContain("partyId");
+  expect(session).not.toContain("partySynthetic");
   // A passkey attestation is a single-use credential: a restored session re-does the ceremony
   // rather than replaying a stale one.
   expect(session).not.toContain("guardianPasskey");

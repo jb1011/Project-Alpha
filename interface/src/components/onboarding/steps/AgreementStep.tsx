@@ -5,11 +5,13 @@ import { AgentConfig, formatUsdc } from "../types";
 import { StepNav } from "../OnboardingFlow";
 import { useAuth } from "../AuthProvider";
 import {
+  useCompanyQuery,
   useFormationEnvironment,
   useOnboardEntityMutation,
   useRetryPublicConfig,
 } from "@/lib/api/hooks";
 import {
+  formationEnvironmentOf,
   isKnownEnvironment,
   type FormationEnvironment,
 } from "@/lib/api/formationEnvironment";
@@ -31,11 +33,13 @@ type Props = {
   config: AgentConfig;
   guardianPasskey: GuardianPasskey | null;
   idempotencyKey: string | null;
-  /** The opaque formation-party handle, when the legal-identity step produced one. Never the
-   *  identity — that is gone from this browser by the time the wizard reaches here. */
-  partyId: string | null;
-  /** Whether that handle is the labeled sandbox fixture. Amber, never green. */
-  partySynthetic: boolean;
+  /**
+   * The COMPANY this agent will be attached to, when the legal-body step produced or picked one
+   * (§7, A3). An opaque handle; the identity behind it left this browser at the create.
+   *
+   * It replaces the `partyId` A1's shim took: onboard attaches, it never creates.
+   */
+  companyId: string | null;
   onBack: () => void;
   onSubmitted: (entityId: string, idempotencyKey: string) => void;
 };
@@ -45,8 +49,7 @@ export function AgreementStep({
   config,
   guardianPasskey,
   idempotencyKey,
-  partyId,
-  partySynthetic,
+  companyId,
   onBack,
   onSubmitted,
 }: Props) {
@@ -60,11 +63,23 @@ export function AgreementStep({
 
   // "Formation applies to THIS agent" is the handle, not the deployment: a deployment that can
   // form entities still onboards agents that asked for no filing.
-  const forming = partyId !== null;
-  // A SYNTHETIC handle is the labeled sandbox fixture — a fact about the handle the backend
-  // already told us, true whatever `/config` says or fails to say. Everything else defers to the
-  // deployment's answer, INCLUDING its two ways of not having one.
-  const environment: FormationEnvironment = partySynthetic ? "sandbox" : deploymentEnvironment;
+  const forming = companyId !== null;
+  // ⚠ THE ENVIRONMENT COMES FROM THE COMPANY ROW, not from `/config` (§7, A3).
+  //
+  // It used to be a boolean on the wizard's own session (`partySynthetic`), which was a fact
+  // about the HANDLE we happened to remember. The company row is where the pin actually lives:
+  // it is stamped at creation and immutable after, so a company minted in sandbox stays a sandbox
+  // filing on a box that has since been re-pointed at production — which the deployment's answer
+  // would get exactly backwards. `/config` remains the fallback while the row is still loading,
+  // and its two ways of not knowing are preserved rather than collapsed into "sandbox".
+  const company = useCompanyQuery(companyId);
+  const environment: FormationEnvironment = !forming
+    ? deploymentEnvironment
+    : company.data
+      ? formationEnvironmentOf(company.data.environment)
+      : company.isError
+        ? "unknown"
+        : "loading";
   // The gate. Confirming here starts a filing, and a filing whose environment we cannot name is
   // one this screen cannot describe honestly — so it does not let the user start it. This is the
   // exact case that used to render "Demo — nothing is filed" over a real Wyoming filing.
@@ -90,8 +105,9 @@ export function AgreementStep({
         idempotencyKey: key,
         custody: config.custody,
         // The HANDLE, never the identity: `spec` is persisted verbatim by the backend, and PII
-        // that entered it would land in a column every read path touches.
-        partyId: partyId ?? undefined,
+        // that entered it would land in a column every read path touches. A `partyId` here is
+        // refused outright since A3 — a company is created at its own door.
+        companyId: companyId ?? undefined,
       });
       onSubmitted(id, key);
     } catch (e) {

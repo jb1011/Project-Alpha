@@ -10,6 +10,7 @@ import { useCallback } from "react";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import {
   bootstrapConnection,
+  createCompany,
   createConnectionPackage,
   createFormationParty,
   entityAgentBook,
@@ -19,13 +20,17 @@ import {
   getEntity,
   getEntityReputation,
   getEntityRuns,
+  getCompany,
+  getCompanyCompliance,
   getEntityTreasury,
   getNonce,
   getPasskeyChallenge,
   getPublicConfig,
   listApiKeys,
+  listCompanies,
   listEntities,
   listEntityJobs,
+  listIndustries,
   listPasskeys,
   onboardEntity,
   patchPerTxCap,
@@ -34,6 +39,8 @@ import {
   revokePasskey,
   schedulePolicyUpdate,
   storePasskey,
+  updateCompanyIntake,
+  updateFormationParty,
   verifySiwe,
   worldIdAttestContext,
   worldIdAttestVerify,
@@ -52,6 +59,8 @@ import type {
   AgentSpec,
   BootstrapPackage,
   Capability,
+  CompanyIntakeInput,
+  CompanyIntakeUpdate,
   ConnectionPackage,
   EntityStatus,
   EntityView,
@@ -303,17 +312,18 @@ export function useOnboardEntityMutation() {
       guardianPasskey,
       idempotencyKey,
       custody,
-      partyId,
+      companyId,
     }: {
       spec: AgentSpec;
       guardianPasskey: GuardianPasskey;
       idempotencyKey?: string;
       custody?: "turnkey" | "circle";
-      /** The opaque formation-party handle. Never the identity — that never reaches this layer. */
-      partyId?: string;
+      /** The company this agent ATTACHES to (§7, A3). Never a party handle: that door is gone,
+       *  and the backend refuses one rather than ignoring it. */
+      companyId?: string;
     }) => {
       const token = await ensureToken();
-      return onboardEntity(token, spec, guardianPasskey, idempotencyKey, custody, partyId);
+      return onboardEntity(token, spec, guardianPasskey, idempotencyKey, custody, companyId);
     },
     onSuccess: async () => {
       const token = await ensureToken();
@@ -338,6 +348,121 @@ export function useCreateFormationPartyMutation() {
     mutationFn: async (body: { synthetic: true } | FormationPartyInput) => {
       const token = await ensureToken();
       return createFormationParty(token, body);
+    },
+  });
+}
+
+/* ── COMPANIES (design §7) ─────────────────────────────────────────────────── */
+
+/**
+ * The industry list, fetched ONCE per page and never again.
+ *
+ * A build-time reference table on the backend, so it changes on a deploy and not on a request —
+ * the same reasoning `usePublicConfigQuery` uses, and the same `staleTime`. Public, so no token
+ * and no token in the key.
+ */
+export function useIndustriesQuery(enabled = true) {
+  return useQuery({
+    queryKey: apiKeys.industries(),
+    queryFn: listIndustries,
+    enabled,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+}
+
+/** The tenant's companies, NEWEST FIRST — the ordering the picker's default depends on, taken
+ *  from the server rather than re-sorted here. */
+export function useCompaniesQuery(enabled = true) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.companies(token ?? ""),
+    queryFn: () => listCompanies(token!),
+    enabled: enabled && !!token,
+  });
+}
+
+export function useCompanyQuery(companyId: string | null | undefined, refetchInterval?: number) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.company(token ?? "", companyId ?? ""),
+    queryFn: () => getCompany(token!, companyId!),
+    enabled: !!token && !!companyId,
+    refetchInterval: refetchInterval ?? false,
+  });
+}
+
+/**
+ * The compliance calendar. LAZY BY CONSTRUCTION on both sides.
+ *
+ * The backend fetches it from the filing agent on view and caches it for a day; this asks only
+ * when the section that shows it is mounted, and does not retry a refusal — "the provider did not
+ * answer" is a fact worth showing once with a retry button, not a loop against somebody else's
+ * outage.
+ */
+export function useCompanyComplianceQuery(companyId: string | null | undefined, enabled = true) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.companyCompliance(token ?? "", companyId ?? ""),
+    queryFn: () => getCompanyCompliance(token!, companyId!),
+    enabled: enabled && !!token && !!companyId,
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/**
+ * Create the legal body (design §5/§7).
+ *
+ * ⚠ A MUTATION, never a query, and for a reason beyond the HTTP verb: this call may carry an SSN,
+ * React Query keys live in memory for the life of the page and are the first thing a devtools
+ * panel prints, and a query would put the intake in one. The hook takes the value, hands it to
+ * the client, and keeps nothing.
+ */
+export function useCreateCompanyMutation() {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (intake: CompanyIntakeInput) => createCompany(await ensureToken(), intake),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companies(token) });
+    },
+  });
+}
+
+/** The §4.7 edit-and-retry. A mutation for the same reason the create is one — it can carry an
+ *  SSN — and it invalidates the company it reopened, whose park state has just changed. */
+export function useUpdateCompanyIntakeMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (intake: CompanyIntakeUpdate) =>
+      updateCompanyIntake(await ensureToken(), companyId, intake),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companies(token) });
+    },
+  });
+}
+
+/**
+ * Correct the responsible person on a filing the provider refused (§7).
+ *
+ * A mutation for the reason `useCreateFormationPartyMutation` is one: personal data must never
+ * become a React Query key. It invalidates the COMPANY, because what visibly changed is that
+ * company's park state — the identity itself is never rendered anywhere.
+ */
+export function useUpdateFormationPartyMutation(companyId?: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async ({ partyId, body }: { partyId: string; body: FormationPartyInput }) =>
+      updateFormationParty(await ensureToken(), partyId, body),
+    onSuccess: async () => {
+      if (!companyId) return;
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
     },
   });
 }

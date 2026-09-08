@@ -17,8 +17,10 @@ export const ONBOARDING_STORAGE_KEY = "pa-onboarding-v2";
  * writing its name is the moment to ask whether it belongs in a browser store at all.
  *
  * The rule this encodes: **no personal data is ever written to localStorage.** The wizard's PII
- * slice (`FormationParty`) is not on either list and must never be added. What survives a reload
- * is the opaque `partyId` handle the backend issued — which identifies a row, not a person.
+ * slice (`FormationParty`) is not on either list and must never be added — and since A2 that
+ * slice can carry a SOCIAL SECURITY NUMBER, which is the single worst field in this codebase to
+ * get wrong. What survives a reload is the opaque `companyId` the backend issued: it identifies a
+ * filing, not a person.
  */
 export const PERSISTED_CONFIG_KEYS = [
   "name",
@@ -35,14 +37,18 @@ export const PERSISTED_CONFIG_KEYS = [
 /**
  * `guardianPasskey` is absent by design and always has been: a passkey attestation is a
  * single-use credential, and a restored session re-does the ceremony rather than replay a stale
- * one. `partyId`/`partySynthetic` are opaque — a handle and a boolean.
+ * one.
+ *
+ * `companyId` is opaque — it identifies a filing, not a person — and it REPLACES `partyId` and
+ * `partySynthetic`, both retired with A1's shim (§7, A3). The party handle is no longer an
+ * onboard concept, and "is this a demo?" is no longer wizard state at all: it is read from the
+ * COMPANY ROW, whose pin is stamped at creation and immutable after.
  */
 export const PERSISTED_SESSION_KEYS = [
   "entityId",
   "idempotencyKey",
   "entity",
-  "partyId",
-  "partySynthetic",
+  "companyId",
 ] as const satisfies readonly (keyof OnboardingSession)[];
 
 export type PersistedOnboarding = {

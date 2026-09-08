@@ -7,6 +7,11 @@ import type {
   AuthSession,
   BootstrapPackage,
   Capability,
+  CompanyDetailView,
+  CompanyIntakeInput,
+  CompanyIntakeUpdate,
+  CompanyView,
+  ComplianceView,
   ConnectionPackage,
   EntityView,
   FormationPartyInput,
@@ -114,14 +119,20 @@ export async function onboardEntity(
   guardianPasskey: GuardianPasskey,
   idempotencyKey?: string,
   custody?: "turnkey" | "circle",
-  /** The OPAQUE handle from `createFormationParty` — never the identity itself. On a deployment
-   *  where formation is required, onboarding refuses without it. */
-  partyId?: string,
+  /**
+   * The company this agent is ATTACHED to (design §7, A3).
+   *
+   * ⚠ Never a `partyId`. A1's backend shim used to mint a 1:1 company for a party-only onboard;
+   * A3 removed it, and the door now REFUSES a party handle rather than ignoring it. The wizard
+   * sequences the two calls instead: `createCompany` then `onboardEntity` — which is what keeps
+   * personal data (and, since A2, a potential SSN) off this request entirely.
+   */
+  companyId?: string,
 ): Promise<{ id: string; status: string }> {
   return request("/onboard", {
     method: "POST",
     token,
-    body: { spec, guardianPasskey, idempotencyKey, custody, partyId },
+    body: { spec, guardianPasskey, idempotencyKey, custody, companyId },
   });
 }
 
@@ -142,6 +153,91 @@ export async function createFormationParty(
   body: { synthetic: true } | FormationPartyInput,
 ): Promise<{ partyId: string }> {
   return request("/formation-party", { method: "POST", token, body });
+}
+
+/* ── COMPANIES (design §7) ─────────────────────────────────────────────────── */
+
+/**
+ * The industry labels a company may be filed under — PUBLIC, and cached hard.
+ *
+ * A federal reference table compiled into the backend build (821 labels), served from its own
+ * route rather than from `/config` because `/config` is fetched by every page before auth and
+ * cached for the life of the tab. The picker validates against what this returns, and the door
+ * validates against the same array, so a form cannot offer a label the create would refuse.
+ */
+export async function listIndustries(): Promise<{ industries: string[] }> {
+  return request("/formation/industries");
+}
+
+/**
+ * Create the legal body, and get back an opaque company id.
+ *
+ * ⚠ THE ONE CALL IN THIS CLIENT THAT CAN CARRY AN SSN (§4.1), and the reason the wizard is two
+ * calls rather than a field on `/onboard`: the number is sealed under an AAD of
+ * `party_id || company_id`, so it has to ride the request that mints the company. It is a plain
+ * argument here — never a React Query key, never a stored value, never echoed back.
+ */
+export async function createCompany(
+  token: string,
+  intake: CompanyIntakeInput,
+): Promise<{ companyId: string }> {
+  return request("/companies", { method: "POST", token, body: intake });
+}
+
+/** The §4.7 edit-and-retry: re-open a rejected intake, with a fresh SSN capture. */
+export async function updateCompanyIntake(
+  token: string,
+  companyId: string,
+  intake: CompanyIntakeUpdate,
+): Promise<{ companyId: string }> {
+  return request(`/companies/${encodeURIComponent(companyId)}`, {
+    method: "PATCH",
+    token,
+    body: intake,
+  });
+}
+
+/** The tenant's companies, NEWEST FIRST — the ordering the reuse picker's default depends on. */
+export async function listCompanies(token: string): Promise<{ companies: CompanyView[] }> {
+  return request("/companies", { token });
+}
+
+export async function getCompany(token: string, companyId: string): Promise<CompanyDetailView> {
+  return request(`/companies/${encodeURIComponent(companyId)}`, { token });
+}
+
+/**
+ * The compliance calendar — LAZY, and it may refuse.
+ *
+ * The backend fetches it from the filing agent on view and caches it for a day. A provider that
+ * did not answer is a 502 here, deliberately: "we could not ask" and "nothing is due" are
+ * opposite facts, and a page that rendered the first as the second would tell an owner their
+ * annual report is not due when nobody asked.
+ */
+export async function getCompanyCompliance(
+  token: string,
+  companyId: string,
+): Promise<ComplianceView> {
+  return request(`/companies/${encodeURIComponent(companyId)}/compliance`, { token });
+}
+
+/**
+ * Correct the responsible person on a filing the provider REFUSED (design §7, A3).
+ *
+ * The one exit from a company parked on `awaitingPartyEdit`. Editable only until the filing has
+ * been sent: once the provider holds the person it is never asked for them again, so an edit
+ * afterwards would change our copy and nothing else. NO ssn — there is no field for one.
+ */
+export async function updateFormationParty(
+  token: string,
+  partyId: string,
+  body: FormationPartyInput,
+): Promise<{ partyId: string }> {
+  return request(`/formation-party/${encodeURIComponent(partyId)}`, {
+    method: "PATCH",
+    token,
+    body,
+  });
 }
 
 export async function getEntity(

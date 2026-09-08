@@ -28,6 +28,10 @@ import {
   visiblePhases,
 } from "./types";
 import type { EntityView } from "@/lib/api/types";
+import {
+  emptyCompanyIntake,
+  type CompanyIntakeForm,
+} from "@/lib/formation/companyIntake";
 import { usePublicConfigQuery } from "@/lib/api/hooks";
 import {
   buildPersistedOnboarding,
@@ -39,7 +43,7 @@ import {
 } from "@/lib/onboarding/storage";
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { GuardianStep } from "./steps/GuardianStep";
-import { LegalIdentityStep } from "./steps/LegalIdentityStep";
+import { LegalBodyStep } from "./steps/LegalBodyStep";
 import { CustodyStep } from "./steps/CustodyStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
@@ -90,6 +94,16 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * name a single field of it — and the flow clears it the moment the backend returns a handle.
    */
   const [party, setParty] = useState<FormationParty>(emptyParty);
+  /**
+   * The COMPANY's own intake — three name candidates, the purpose, the industry.
+   *
+   * Not personal data, and not persisted either. It is typed once and consumed by one call, and
+   * from the moment `POST /companies` returns it lives on the server, where the Companies section
+   * reads it. Keeping it beside `party` rather than on `config` is the same discipline the PII
+   * slice follows: `config` is what gets persisted and what becomes the AgentSpec, and a company
+   * name that lived on it would follow it into both.
+   */
+  const [intake, setIntake] = useState<CompanyIntakeForm>(emptyCompanyIntake);
 
   // Which phases this deployment HAS. Anything other than an explicit `true` hides the
   // legal-identity step: a backend that predates the field forms nothing, and a deployment we
@@ -100,7 +114,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const phases = useMemo(() => visiblePhases(formationAvailable), [formationAvailable]);
 
   /**
-   * Past the legal-identity step with no party handle, on a deployment that REQUIRES one → the
+   * Past the legal-body step with no company handle, on a deployment that REQUIRES one → the
    * wizard shows that step again.
    *
    * The passkey precedent: a restored session that lost the credential a step produces re-does
@@ -112,7 +126,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * paint the wrong screen first and cascade a second render to fix it.
    *
    * NEVER once the entity exists: by `deploy` the handle has already been consumed by /onboard,
-   * and sending the user back to collect another one would be nonsense.
+   * and sending the user back to pick another company would be nonsense.
    */
   const requestedPhase: Phase =
     formationRequired &&
@@ -120,11 +134,11 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     // dep). If one ever did not, this guard is what stops the correction from sending the wizard
     // to a phase that is not in the list and rendering nothing at all.
     formationAvailable &&
-    !session.partyId &&
+    !session.companyId &&
     !session.entityId &&
     storedPhase !== "dashboard" &&
-    indexIn(phases, storedPhase) > indexIn(phases, "legal-identity")
-      ? "legal-identity"
+    indexIn(phases, storedPhase) > indexIn(phases, "legal-body")
+      ? "legal-body"
       : storedPhase;
 
   /**
@@ -158,6 +172,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     setConfig(emptyConfig());
     setSession(emptySession());
     setParty(emptyParty());
+    setIntake(emptyCompanyIntake());
     setDone({});
     setResumed(false);
     goTo("welcome");
@@ -304,24 +319,27 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 }
               />
             )}
-            {phase === "legal-identity" && (
-              <LegalIdentityStep
-                eyebrow={screenLabel(phases, "legal-identity")}
+            {phase === "legal-body" && (
+              <LegalBodyStep
+                eyebrow={screenLabel(phases, "legal-body")}
                 party={party}
                 onParty={setParty}
-                partyId={session.partyId}
-                synthetic={session.partySynthetic}
-                onCreated={(partyId, synthetic) => {
-                  setSession((s) => ({ ...s, partyId, partySynthetic: synthetic }));
+                intake={intake}
+                onIntake={setIntake}
+                companyId={session.companyId}
+                onCompany={(companyId) => {
+                  setSession((s) => ({ ...s, companyId }));
                   // Belt and braces on top of the allowlist: once the backend holds the identity
-                  // and has issued a handle, there is no reason for this browser to keep a copy
-                  // of it in memory either.
+                  // and has issued a company handle, there is no reason for this browser to keep
+                  // a copy of either in memory. (The SSN never reaches this component at all —
+                  // it lives in the step's own state and is cleared there.)
                   setParty(emptyParty());
-                  completePhase("legal-identity", "custody");
+                  setIntake(emptyCompanyIntake());
+                  completePhase("legal-body", "custody");
                 }}
-                onClear={() => setSession((s) => ({ ...s, partyId: null, partySynthetic: false }))}
+                onClear={() => setSession((s) => ({ ...s, companyId: null }))}
                 onBack={() => goTo("guardian")}
-                onComplete={() => completePhase("legal-identity", "custody")}
+                onComplete={() => completePhase("legal-body", "custody")}
               />
             )}
             {phase === "custody" && (
@@ -348,8 +366,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 config={config}
                 guardianPasskey={session.guardianPasskey}
                 idempotencyKey={session.idempotencyKey}
-                partyId={session.partyId}
-                partySynthetic={session.partySynthetic}
+                companyId={session.companyId}
                 onBack={() => goTo("configure")}
                 onSubmitted={(entityId, idempotencyKey) => {
                   setSession((s) => ({
