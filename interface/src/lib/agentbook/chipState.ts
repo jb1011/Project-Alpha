@@ -50,8 +50,9 @@ export type AgentBookChipState = {
 };
 
 /** §5.2, verbatim. A failed submit is not a failed registration: the transaction may have landed
- *  and the reconciler may still be reading the chain. */
-const FAILURE_COPY =
+ *  and the reconciler may still be reading the chain. Exported because the vouch dialog owes the
+ *  same sentence for a submit failure it cannot classify — one copy, one claim. */
+export const FAILURE_COPY =
   "We could not confirm the registration. It may still have gone through; we are checking the registry and will update this.";
 
 const VOUCHED: AgentBookChipState = {

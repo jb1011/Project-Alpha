@@ -10,10 +10,18 @@ import {
   useWorldIdMeQuery,
 } from "@/lib/api/hooks";
 import { apiKeys } from "@/lib/api/keys";
-import { ApiError, apiErrorDetail, type AgentBookSessionView } from "@/lib/api/types";
+import { ApiError, type AgentBookSessionView } from "@/lib/api/types";
+import {
+  bridgeMessage,
+  failureFor,
+  isRegistryMoved,
+  GENERIC_COPY,
+  NOT_ELIGIBLE_COPY,
+  NO_POCKET_COPY,
+} from "@/lib/agentbook/failure";
 import { checkPin } from "@/lib/agentbook/pin";
 import { normalizeProof } from "@/lib/agentbook/proof";
-import { signalMatches } from "@/lib/agentbook/signal";
+import { buildSignal, signalMatches } from "@/lib/agentbook/signal";
 import { WORLDCHAIN_EXPLORER_URL } from "@/lib/agentbook/chipState";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { Button, Spinner } from "@/components/onboarding/primitives";
@@ -22,44 +30,22 @@ import { Button, Spinner } from "@/components/onboarding/primitives";
  * The vouch dialog: a guardian, as a person, putting their World ID behind an agent's payment
  * address in AgentBook — World's public registry on World Chain (design 2026-08-25 v3 §3, §5).
  *
- * Three things here are load-bearing and easy to lose in a refactor:
+ * Four things here are load-bearing and easy to lose in a refactor:
  *
- * 1. **The signal is recomputed locally (D8).** The session hands us `signal` next to the address
- *    and nonce it claims to have built it from. We rebuild it and refuse to show a QR unless they
- *    agree. A backend that is the sole author of what a guardian signs can put a human behind an
- *    address the dialog never showed them, and no amount of copy fixes that.
- * 2. **The address is pinned in this browser.** Trust on first use. It cannot catch a backend that
- *    lied from the start; it catches one that starts lying later.
- * 3. **Nothing here says more than "a World ID verified human has vouched for this agent's payment
- *    address in AgentBook"** (D9). Not "human-backed", not "proves control", not "permanent proof".
+ * 1. **The signal is derived locally (D8).** The session hands us `signal` next to the address and
+ *    nonce it claims to have built it from. We rebuild it, refuse to continue unless they agree,
+ *    and hand OUR bytes to World's bridge. A backend that is the sole author of what a guardian
+ *    signs can put a human behind an address the dialog never showed them.
+ * 2. **The address is pinned in this browser, and re-checked against the confirm step.** Trust on
+ *    first use catches a backend that starts lying later; the second check catches an address that
+ *    changed between the paragraph the guardian read and the request they approve.
+ * 3. **Nothing is ever restarted automatically.** A conflict returns to the confirmation step with
+ *    the box unticked: re-vouching is deliberate (§5.2), never a retry loop.
+ * 4. **"Nothing was written" is a claim, not a consolation.** It is said only for failures the
+ *    route raises before it claims the row; everything else gets §5.2's sentence.
  */
 
-/* ── Copy. Every string a guardian can see lives here, so the ceiling can be read in one place ── */
-
-/** §5.3, one message for every non-Orb guardian. Byte-identical to the backend's
- *  `NOT_ELIGIBLE_MESSAGE`, so the local check and the 403 read the same. */
-export const NOT_ELIGIBLE_COPY =
-  "AgentBook vouching needs a World ID from an Orb. Your access here is unaffected. AgentBook is World's public registry and only accepts Orb-verified proofs. There is nothing we can substitute for that, and we will not fake it.";
-
-/** The disabled-button reason and the `not_ready` 409 for an agent with no pocket yet. */
-export const NO_POCKET_COPY = "Available once the agent has a payment address";
-
-const NOT_ON_CHAIN_COPY =
-  "This agent is not fully on chain yet. Vouching becomes available once it is. Nothing was sent.";
-
-/** Both caps (per-agent lifetime, per-account per hour) arrive as `limit_exceeded`. The design's
- *  "after that, contact support" for a re-vouch after a dispute is enforced by the lifetime cap,
- *  so this is where a guardian learns what to do next. */
-const LIMIT_COPY =
-  "This agent has reached its AgentBook vouch limit. Nothing was sent. If your vouch was replaced and you need another, contact support.";
-
-const UNAVAILABLE_COPY =
-  "AgentBook is not reachable right now. Nothing was sent. Try again in a minute.";
-
-const CONFLICT_COPY =
-  "The registry moved while you were approving. Nothing was written. Start again when you are ready.";
-
-const GENERIC_COPY = "Something went wrong before anything was written. Try again.";
+/* ── Copy owned by the dialog. The error/gate copy lives in lib/agentbook/failure.ts ── */
 
 const SIGNAL_MISMATCH_COPY =
   "The server's request did not match this agent's payment address. Nothing was signed.";
@@ -67,15 +53,22 @@ const SIGNAL_MISMATCH_COPY =
 const PIN_CHANGED_COPY =
   "This agent's payment address differs from the one this browser saw before. Nothing was signed. Check the address on Arcscan before trying again.";
 
+const ADDRESS_DRIFT_COPY =
+  "The payment address in this request is not the one shown on the previous step. Nothing was signed.";
+
 const TIMEOUT_COPY = "Timed out waiting for World App. Nothing was written.";
 
 const BRIDGE_UNREACHABLE_COPY = "World App could not be reached. Nothing was signed.";
 
 const PROOF_SHAPE_COPY = "World App returned a proof in an unexpected format. Nothing was written.";
 
-/** The one automatic restart: a fresh session, and the guardian approves once more. */
-const CONFLICT_RETRY_NOTICE =
-  "The registry changed while you were approving, so nothing was written. Here is a fresh request — approving it completes the vouch.";
+/** A conflict sends the guardian back to the confirmation step. Both notices say the same two
+ *  things: nothing was written, and the next step is a decision rather than a retry. */
+const CONFLICT_NOTICE =
+  "That request is no longer valid, and nothing was written. Read the terms again and confirm if you still want to vouch — World App will show a fresh request.";
+
+const REGISTRY_MOVED_NOTICE =
+  "The registry moved while you were approving, so nothing was written: someone else's vouch for this address may have landed. Read the terms again and confirm only if you still want to vouch.";
 
 /* ── Constants ──────────────────────────────────────────────────────────────── */
 
@@ -101,6 +94,9 @@ type Phase =
   | { kind: "submitting" }
   | { kind: "vouched"; txHash: string | null }
   | { kind: "failed"; message: string; retryable: boolean };
+
+/** Whether the confirmation step warns that another vouch for this address exists, or might. */
+type Linkage = "none" | "disputed" | "maybe";
 
 /**
  * Mount/unmount is the reset.
@@ -142,8 +138,8 @@ function VouchDialogBody({
   const [accepted, setAccepted] = useState(false);
   const [details, setDetails] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [registryMoved, setRegistryMoved] = useState(false);
   const cancelled = useRef(false);
-  const conflictRetried = useRef(false);
 
   // The poll loop below outlives a close by up to one tick; this is what stops it.
   useEffect(() => {
@@ -160,7 +156,9 @@ function VouchDialogBody({
   }, [queryClient, token, entityId]);
 
   // While our row is moving, re-read it. Only the dialog knows a flow is in flight, so the poll
-  // lives here rather than on the query every dashboard mounts (Task 7's note on `hooks.ts`).
+  // lives here rather than on the query every dashboard mounts (Task 7's note on `hooks.ts`). It
+  // also runs on `submitted`, which is the state a submit failure we could not classify leaves
+  // behind: the chip, not this dialog, is what finally answers whether the vouch landed.
   const rowStatus = status.data?.status;
   const inFlight = rowStatus === "pending" || rowStatus === "submitted";
   useEffect(() => {
@@ -173,27 +171,46 @@ function VouchDialogBody({
   const eligible = credential !== null && ORB.has(credential);
   const pocketAddress = status.data?.address ?? null;
   const disputed = status.data?.outcome === "disputed" || status.data?.disputed === true;
+  const linkage: Linkage = disputed ? "disputed" : registryMoved ? "maybe" : "none";
 
-  /** `carryNotice` survives the restart: the only caller that passes one is the conflict retry,
-   *  and it is the line that explains why a second QR just appeared. */
-  async function start(carryNotice: string | null = null) {
-    setNotice(carryNotice);
+  /** Back to the decision, never around it: the box is unticked and a NEW session needs a click. */
+  function returnToConfirm(text: string, movedOnChain: boolean) {
+    setAccepted(false);
+    setDetails(false);
+    setNotice(text);
+    setRegistryMoved((was) => was || movedOnChain);
+    setPhase({ kind: "confirm" });
+  }
+
+  async function start() {
+    // A dialog that is closing must not leave a session row behind it.
+    if (cancelled.current) return;
+    setNotice(null);
     setPhase({ kind: "starting" });
 
     let s: AgentBookSessionView;
     try {
       s = await sessionMutation.mutateAsync();
     } catch (e) {
-      setPhase(failureFor(e));
+      const f = failureFor(e, "session");
+      setPhase({ kind: "failed", message: f.message, retryable: f.retryable });
       return;
     }
     // A pending row exists from here on: the chip must stop saying "not in AgentBook".
     refreshStatus();
 
-    // D8: recompute the signal locally and refuse a session whose signal differs. Never show a QR
-    // for bytes this client did not derive itself.
+    // D8: rebuild the signal from the address and nonce, and refuse a session whose signal
+    // disagrees. Never ask for a proof over bytes this client did not derive.
     if (!signalMatches(s.pocketAddress, s.nonce, s.signal)) {
       setPhase({ kind: "failed", message: SIGNAL_MISMATCH_COPY, retryable: false });
+      return;
+    }
+    const localSignal = buildSignal(s.pocketAddress, s.nonce);
+    // The address the guardian actually read on the confirmation step. Equal to `s.pocketAddress`
+    // in every honest case; a difference means the paragraph they agreed to is about a different
+    // address than the request they are being asked to approve.
+    if (!pocketAddress || pocketAddress.toLowerCase() !== s.pocketAddress.toLowerCase()) {
+      setPhase({ kind: "failed", message: ADDRESS_DRIFT_COPY, retryable: false });
       return;
     }
     if (checkPin(entityId, s.pocketAddress) === "changed") {
@@ -218,11 +235,11 @@ function VouchDialogBody({
       await bridge.getState().createClient({
         app_id: appId,
         action: s.action,
-        // The 52-byte packed signal we just recomputed. IDKit hex-validates a string signal and
-        // hashes those exact bytes, which is byte-for-byte the backend's `hashSignal(buildSignal)`
-        // — and unlike handing it `solidityEncode(...)`, the bytes the guardian commits to are the
-        // ones this client derived (D8).
-        signal: s.signal,
+        // OUR 52 bytes, not the server's string. IDKit hex-validates a string signal and hashes
+        // exactly these bytes, which is byte-for-byte the backend's `hashSignal(buildSignal(…))` —
+        // so the invariant D8 asks for lives in the code rather than in a comparison we then
+        // throw away.
+        signal: localSignal,
       });
       connectorURI = bridge.getState().connectorURI;
     } catch {
@@ -269,21 +286,22 @@ function VouchDialogBody({
           });
           setPhase({ kind: "vouched", txHash: out.txHash });
         } catch (e) {
-          // One automatic restart on a conflict: the nonce moved or the session expired while the
-          // guardian was approving, so the proof is spent and only a fresh session can work.
-          if (e instanceof ApiError && e.code === "conflict" && !conflictRetried.current) {
-            conflictRetried.current = true;
-            await start(CONFLICT_RETRY_NOTICE);
+          // A conflict is a DECISION point, never an automatic restart (§5.2): the proof is spent,
+          // a new session means a new World App approval, and when the registry moved someone
+          // else's vouch may now stand — which the guardian must weigh before doing it again.
+          if (e instanceof ApiError && e.code === "conflict") {
+            const moved = isRegistryMoved(e);
+            returnToConfirm(moved ? REGISTRY_MOVED_NOTICE : CONFLICT_NOTICE, moved);
             return;
           }
-          setPhase(failureFor(e));
+          const f = failureFor(e, "register");
+          setPhase({ kind: "failed", message: f.message, retryable: f.retryable });
         }
         return;
       }
       await sleep(BRIDGE_POLL_MS);
     }
-    if (!cancelled.current)
-      setPhase({ kind: "failed", message: TIMEOUT_COPY, retryable: true });
+    if (!cancelled.current) setPhase({ kind: "failed", message: TIMEOUT_COPY, retryable: true });
   }
 
   const gate = confirmGate({
@@ -307,6 +325,10 @@ function VouchDialogBody({
           Vouch for this agent in AgentBook
         </h2>
 
+        {notice && (phase.kind === "confirm" || phase.kind === "awaiting") && (
+          <p className="mt-4 text-[12.5px] leading-[1.55] text-amber-300">{notice}</p>
+        )}
+
         {phase.kind === "confirm" &&
           (gate ? (
             gate.loading ? (
@@ -320,7 +342,7 @@ function VouchDialogBody({
             <ConfirmBody
               agentId={agentId}
               pocketAddress={pocketAddress ?? ""}
-              disputed={disputed}
+              linkage={linkage}
               accepted={accepted}
               onAccepted={setAccepted}
               details={details}
@@ -336,9 +358,6 @@ function VouchDialogBody({
 
         {phase.kind === "awaiting" && (
           <div className="mt-4 flex flex-col items-center gap-3">
-            {notice && (
-              <p className="w-full text-[12.5px] leading-[1.55] text-amber-300">{notice}</p>
-            )}
             {/* eslint-disable-next-line @next/next/no-img-element -- a data: URI generated in the
                 browser; next/image has nothing to optimise and would only add a loader. */}
             <img src={phase.qr} alt="Scan with World App to approve the vouch" width={240} height={240} />
@@ -434,7 +453,7 @@ function VouchDialogBody({
 function ConfirmBody(p: {
   agentId: string;
   pocketAddress: string;
-  disputed: boolean;
+  linkage: Linkage;
   accepted: boolean;
   onAccepted: (v: boolean) => void;
   details: boolean;
@@ -505,10 +524,11 @@ function ConfirmBody(p: {
           </p>
         </div>
       )}
-      {p.disputed && (
+      {p.linkage !== "none" && (
         <p className="text-[12.5px] leading-[1.6] text-amber-300">
-          Someone else has vouched for this address. Vouching again replaces theirs in the registry.
-          Every record stays public, and every vouch you make is linkable to the others.
+          {p.linkage === "disputed"
+            ? "Someone else has vouched for this address. Vouching again replaces theirs in the registry. Every record stays public, and every vouch you make is linkable to the others."
+            : "Someone else may have vouched for this address already. Vouching again replaces theirs in the registry. Every record stays public, and every vouch you make is linkable to the others."}
         </p>
       )}
       <label className="mt-2 flex items-start gap-2 text-ink">
@@ -527,9 +547,7 @@ function ConfirmBody(p: {
 /* ── Small parts ────────────────────────────────────────────────────────────── */
 
 function Line(p: { children: React.ReactNode }) {
-  return (
-    <p className="mt-4 flex items-center gap-2 text-[13.5px] text-muted-1">{p.children}</p>
-  );
+  return <p className="mt-4 flex items-center gap-2 text-[13.5px] text-muted-1">{p.children}</p>;
 }
 
 /** Seconds left on the session. The first tick lands within half a second of mounting; nothing is
@@ -550,9 +568,7 @@ function Countdown(p: { deadline: number }) {
 
 /* ── Pure helpers ───────────────────────────────────────────────────────────── */
 
-type BridgeStore = ReturnType<
-  (typeof import("idkit-core-v2"))["createWorldBridgeStore"]
->;
+type BridgeStore = ReturnType<(typeof import("idkit-core-v2"))["createWorldBridgeStore"]>;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -589,53 +605,4 @@ function confirmGate(input: {
     };
   if (!input.pocketAddress) return { loading: false, text: NO_POCKET_COPY };
   return null;
-}
-
-/**
- * Server error → what the guardian is told. Never the raw message: a route's text is not copy, and
- * a contract revert carries the proof arguments (§4.7).
- */
-function failureFor(e: unknown): { kind: "failed"; message: string; retryable: boolean } {
-  const fail = (message: string, retryable: boolean) =>
-    ({ kind: "failed" as const, message, retryable });
-  if (!(e instanceof ApiError)) return fail(GENERIC_COPY, true);
-  const detail = apiErrorDetail(e.details);
-  switch (e.code) {
-    case "not_eligible":
-      return fail(NOT_ELIGIBLE_COPY, false);
-    case "not_ready":
-      return fail(detail?.reason === "no-pocket-yet" ? NO_POCKET_COPY : NOT_ON_CHAIN_COPY, false);
-    case "limit_exceeded":
-      return fail(LIMIT_COPY, false);
-    case "unavailable":
-      return fail(UNAVAILABLE_COPY, true);
-    case "conflict":
-      return fail(CONFLICT_COPY, true);
-    case "proof_rejected":
-      return fail(
-        detail?.errorName
-          ? `World rejected the proof (${detail.errorName}). Nothing was written.`
-          : "World rejected the proof. Nothing was written.",
-        false,
-      );
-    default:
-      return fail(GENERIC_COPY, true);
-  }
-}
-
-/** World App's own refusal codes. The code is an enum value, never World App's error text. */
-function bridgeMessage(code: string): string {
-  switch (code) {
-    case "verification_rejected":
-      return "You declined the request in World App. Nothing was written.";
-    case "credential_unavailable":
-      return NOT_ELIGIBLE_COPY;
-    case "max_verifications_reached":
-      return "Your World ID has already been used for this AgentBook action as often as World allows. Nothing was written.";
-    case "inclusion_proof_pending":
-    case "inclusion_proof_failed":
-      return "World is still publishing your World ID to the on-chain set. Try again in a few minutes. Nothing was written.";
-    default:
-      return `World App did not complete the request (${code}). Nothing was written.`;
-  }
 }
