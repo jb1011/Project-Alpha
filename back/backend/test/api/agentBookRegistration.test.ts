@@ -478,6 +478,17 @@ test("a deployment with no submitter key refuses both write routes with 503 and 
   expect(cfg.agentBookRegistrationAvailable).toBe(false);
 });
 
+test("an exhausted WRITE budget stops a vouch but never blinds the status chip", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const app = makeApp(registrar(), undefined, new TokenBucket(0, 0));
+  expect((await call(app, "/session", {})).status).toBe(503);
+  // The two budgets are separate: the status read has its own allowance and still answers.
+  const res = await call(app, "");
+  expect(res.status).toBe(200);
+  expect((await res.json()).outcome).toBe("unregistered");
+});
+
 test("a deployment WITH a submitter key advertises the vouch dialog", async () => {
   const cfg = await (await makeApp().request("/config")).json();
   expect(cfg.agentBookRegistrationAvailable).toBe(true);
