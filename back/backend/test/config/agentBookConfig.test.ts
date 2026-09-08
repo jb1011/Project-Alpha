@@ -52,9 +52,34 @@ test("the submitter key may never equal the platform key", () => {
   ).toThrow(/WORLDCHAIN_SUBMITTER_PRIVATE_KEY/);
 });
 
-test("redact hides the key and keeps the RPC", () => {
+test("the submitter key may never equal another key material var either", () => {
+  expect(() =>
+    loadConfig({
+      ...BASE,
+      ...WORLD,
+      ENS_GATEWAY_SIGNER_KEY: KEY,
+      WORLDCHAIN_SUBMITTER_PRIVATE_KEY: KEY,
+    }),
+  ).toThrow(/WORLDCHAIN_SUBMITTER_PRIVATE_KEY must not equal ENS_GATEWAY_SIGNER_KEY/);
+});
+
+test("redact hides the key and keeps the rpcUrl field", () => {
   const cfg = loadConfig({ ...BASE, ...WORLD, WORLDCHAIN_SUBMITTER_PRIVATE_KEY: KEY });
   const out = JSON.stringify(redact(cfg));
   expect(out).not.toContain(KEY);
   expect(out).toContain('"rpcUrl"');
+});
+
+// A dedicated write endpoint is normally an Alchemy/Infura URL with the API key in the path — the
+// same bearer-credential shape as `alertWebhookUrl`, so it is redacted like one.
+test("redact hides a dedicated write RPC's embedded credential", () => {
+  const cfg = loadConfig({
+    ...BASE,
+    ...WORLD,
+    WORLDCHAIN_SUBMITTER_PRIVATE_KEY: KEY,
+    WORLDCHAIN_SUBMITTER_RPC: "https://paid.example/v2/sekrit-key-123",
+  });
+  const out = JSON.stringify(redact(cfg));
+  expect(out).toContain('"rpcUrl"');
+  expect(out).not.toContain("sekrit-key-123");
 });

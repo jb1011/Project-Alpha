@@ -679,8 +679,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
 
   // AgentBook (design 2026-08-25 v3 §4.2). The submitter is a SINGLE-PURPOSE key holding World
-  // Chain gas: sharing it with a platform signer would put a key that moves USDC on Arc into a
-  // hot path on another chain. Checked in EVERY environment — the reuse is as wrong on a dev box.
+  // Chain gas: sharing it with ANY other configured key would put a key that signs elsewhere —
+  // USDC on Arc, resolver answers, every derived pocket — into a hot path on another chain.
+  // Checked in EVERY environment: the reuse is exactly as wrong on a dev box.
   if (cfg.agentBook) {
     const others: Array<[string, string | undefined]> = [
       ["PLATFORM_PRIVATE_KEY", cfg.platformPrivateKey],
@@ -689,6 +690,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       ["JOB_CLIENT_PRIVATE_KEY", cfg.jobClientPrivateKey],
       ["JOB_EVALUATOR_PRIVATE_KEY", cfg.jobEvaluatorPrivateKey],
       ["X402_PROOF_AGENT_KEY", cfg.x402ProofAgentKey],
+      // Not signers on the money path, but key material all the same: the ENS gateway signer
+      // authors resolver answers, and the pocket seed derives every legacy pocket.
+      ["ENS_GATEWAY_SIGNER_KEY", cfg.ens?.signerKey],
+      ["POCKET_MASTER_SEED", cfg.pocketMasterSeed],
     ];
     const sub = cfg.agentBook.submitterPrivateKey.toLowerCase();
     for (const [name, value] of others) {
@@ -951,10 +956,9 @@ export function redact(cfg: Config): Record<string, unknown> {
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
     x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
     // The World Chain submitter key: gas-only, but still key material and never a log line. The
-    // RPC survives on purpose — it is the first thing an operator checks when a write stalls.
-    agentBook: cfg.agentBook
-      ? { submitterPrivateKey: "REDACTED", rpcUrl: cfg.agentBook.rpcUrl }
-      : undefined,
+    // write RPC goes with it for the same reason as `alertWebhookUrl` above — a dedicated endpoint
+    // is normally an Alchemy/Infura URL with the API key in the path, i.e. a bearer credential.
+    agentBook: cfg.agentBook ? { submitterPrivateKey: "REDACTED", rpcUrl: "REDACTED" } : undefined,
     // The API key files real companies and the webhook secret authenticates inbound state changes:
     // both are bearer credentials, and neither may ever reach a log line.
     doola: cfg.doola
