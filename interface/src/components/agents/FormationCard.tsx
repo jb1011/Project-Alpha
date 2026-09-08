@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useState } from "react";
 import { downloadDocument } from "@/lib/api/client";
-import { useCompanyQuery } from "@/lib/api/hooks";
+import { useCompanyQuery, usePublicConfigQuery } from "@/lib/api/hooks";
+import { formationCopyOf, parkSummary } from "@/lib/formation/copy";
 import {
   formationEnvironmentOf,
   type FormationEnvironment,
@@ -41,6 +42,12 @@ type Formation = NonNullable<EntityView["formation"]>;
  */
 export function FormationCard({ formation }: { formation: Formation }) {
   const { session } = useAuth();
+  const { data: config } = usePublicConfigQuery();
+  // ONE table for the three parks — the same sentences the Companies page renders beside the form
+  // that clears each, taken in the summary register. This card held a fourth hand-written
+  // paraphrase of them, which is a second description of one behaviour and the one nobody looks
+  // at is the one that goes stale.
+  const copy = formationCopyOf(config);
   const [busyDocId, setBusyDocId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -169,7 +176,7 @@ export function FormationCard({ formation }: { formation: Formation }) {
           <ul className="mt-2 flex flex-col gap-1.5">
             {parked.map((k) => (
               <li key={k} className="text-[11.5px] leading-[1.5] text-[#f3cd72]">
-                {PARK_SUMMARY[k]}
+                {parkSummary(copy, k)}
               </li>
             ))}
           </ul>
@@ -364,15 +371,3 @@ function formatBytes(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/**
- * One line per park, in the SUMMARY register the dashboard needs.
- *
- * Deliberately not `/config.formationCopy.park`, which is the fuller explanation the Companies
- * page renders next to the form that fixes it. Here the job is only to name which of the three
- * it is, so the owner knows whether the next click is theirs.
- */
-const PARK_SUMMARY = {
-  awaitingIntakeEdit: "The filing agent refused the company's details.",
-  awaitingPartyEdit: "The filing agent refused the responsible person's details.",
-  awaitingSsnDecision: "An SSN was deleted by the retention clock before the filing was sent.",
-} as const;

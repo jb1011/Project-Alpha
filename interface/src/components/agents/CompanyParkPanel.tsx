@@ -24,6 +24,7 @@ import {
   Textarea,
 } from "@/components/onboarding/primitives";
 import { useIndustriesQuery } from "@/lib/api/hooks";
+import { formationCopyOf } from "@/lib/formation/copy";
 
 /**
  * A PARKED FILING, and the one thing its owner can do about it (design §4.6a/§4.7/§7).
@@ -45,30 +46,28 @@ import { useIndustriesQuery } from "@/lib/api/hooks";
  */
 export function CompanyParkPanel({ company }: { company: CompanyDetailView }) {
   const { data: config } = usePublicConfigQuery();
-  const copy = config?.formationCopy?.park;
+  // Served where the backend answered, bundled where it did not (`formationCopyOf`). It used to
+  // be `config?.formationCopy?.park` with a bare fallback TITLE and no fallback sentences, so a
+  // deployment that had not shipped the field showed a parked filing as a heading and a form
+  // with nothing saying what had happened or what one edit buys.
+  const copy = formationCopyOf(config).park;
   const { awaitingIntakeEdit, awaitingPartyEdit, awaitingSsnDecision } = company.park;
   if (!awaitingIntakeEdit && !awaitingPartyEdit && !awaitingSsnDecision) return null;
 
   return (
     <div className="flex flex-col gap-5">
       {awaitingIntakeEdit && (
-        <ParkCard copy={copy?.awaitingIntakeEdit} fallbackTitle="This filing is waiting on you">
+        <ParkCard copy={copy.awaitingIntakeEdit}>
           <IntakeEditForm company={company} />
         </ParkCard>
       )}
       {awaitingSsnDecision && (
-        <ParkCard
-          copy={copy?.awaitingSsnDecision}
-          fallbackTitle="This filing is waiting on a decision about the SSN"
-        >
+        <ParkCard copy={copy.awaitingSsnDecision}>
           <SsnDecisionForm company={company} />
         </ParkCard>
       )}
       {awaitingPartyEdit && (
-        <ParkCard
-          copy={copy?.awaitingPartyEdit}
-          fallbackTitle="The filing agent refused the responsible person"
-        >
+        <ParkCard copy={copy.awaitingPartyEdit}>
           <PartyEditForm company={company} />
         </ParkCard>
       )}
@@ -78,24 +77,17 @@ export function CompanyParkPanel({ company }: { company: CompanyDetailView }) {
 
 function ParkCard({
   copy,
-  fallbackTitle,
   children,
 }: {
-  copy?: { title: string; what: string; youCan: string };
-  fallbackTitle: string;
+  /** Always present — served or bundled, resolved once by `formationCopyOf`. */
+  copy: { title: string; what: string; youCan: string };
   children: React.ReactNode;
 }) {
   return (
     <Card className="border-[#febc2e]/30 bg-[#febc2e]/[0.05] p-6">
-      <div className="text-[14px] font-medium text-ink">{copy?.title ?? fallbackTitle}</div>
-      {/* A backend that predates `/config.formationCopy` serves no sentences, and this renders
-          none rather than a stale one of its own — the whole reason the copy is served. */}
-      {copy && (
-        <>
-          <p className="mt-2.5 text-[12.5px] leading-[1.65] text-muted">{copy.what}</p>
-          <p className="mt-2 text-[12.5px] leading-[1.65] text-[#f3cd72]">{copy.youCan}</p>
-        </>
-      )}
+      <div className="text-[14px] font-medium text-ink">{copy.title}</div>
+      <p className="mt-2.5 text-[12.5px] leading-[1.65] text-muted">{copy.what}</p>
+      <p className="mt-2 text-[12.5px] leading-[1.65] text-[#f3cd72]">{copy.youCan}</p>
       <div className="mt-5">{children}</div>
     </Card>
   );
@@ -191,6 +183,7 @@ function IntakeEditForm({ company }: { company: CompanyDetailView }) {
 
 function SsnDecisionForm({ company }: { company: CompanyDetailView }) {
   const { data: config } = usePublicConfigQuery();
+  const ssnCopy = formationCopyOf(config).ssn;
   const update = useUpdateCompanyIntakeMutation(company.companyId);
   // ⚠ Its own state, never merged into anything that leaves this component.
   const [ssn, setSsn] = useState("");
@@ -224,8 +217,11 @@ function SsnDecisionForm({ company }: { company: CompanyDetailView }) {
 
   return (
     <div className="flex flex-col gap-4">
-      {production && config?.formationCopy?.ssn && (
-        <Field label={config.formationCopy.ssn.label} htmlFor="park-ssn">
+      {/* The gate is the ENVIRONMENT and nothing else: the backend refuses the field outright on
+          a sandbox company, and the copy always resolves. Gating a field on the presence of its
+          own label is how a form silently loses the fast-EIN route. */}
+      {production && (
+        <Field label={ssnCopy.label} htmlFor="park-ssn">
           <TextInput
             id="park-ssn"
             type="password"
@@ -238,7 +234,7 @@ function SsnDecisionForm({ company }: { company: CompanyDetailView }) {
             onChange={(e) => setSsn(e.target.value)}
           />
           <p className="mt-1 text-[11.5px] leading-[1.55] text-muted-2">
-            {config.formationCopy.ssn.retention}
+            {ssnCopy.retention}
           </p>
         </Field>
       )}

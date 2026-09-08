@@ -38,8 +38,16 @@ export function PartyFields({
    */
   ssn?: string;
   onSsn?: (ssn: string) => void;
-  /** The §4.1 copy, from `/config` — served rather than bundled, because it makes a claim about
-   *  retention that the backend is the one keeping. Absent = no field. */
+  /**
+   * The §4.1 copy — served by `/config` where the backend answered, bundled where it did not
+   * (`formationCopyOf`). REQUIRED wherever the field is rendered.
+   *
+   * It used to be optional and to GATE the field, which meant a deployment whose `/config`
+   * predates `formationCopy` — or whose `/config` had not arrived yet — rendered a production
+   * create form with no SSN input at all. That is not a cosmetic degradation: the field is the
+   * fast-EIN route, and its absence silently files every US person under the slow one. The
+   * gate is the ENVIRONMENT, and it is the caller's (see `ssn`).
+   */
   ssnCopy?: { label: string; help: string; retention: string };
   sectionLetter?: string;
 }) {
@@ -104,16 +112,20 @@ export function PartyFields({
               onChange={(e) => set("phone", e.target.value)}
             />
           </Field>
-          {/* ⚠ THE SSN (§4.1) — rendered ONLY when the caller supplies both the value and the
-              copy, which happens on exactly one screen of one kind of deployment: the create form
-              on a confirmed PRODUCTION box. Sandbox and unknown never render it, because the
-              backend refuses the field there outright rather than ignoring it, and a box on
-              screen would be collecting a number nothing will accept.
+          {/* ⚠ THE SSN (§4.1) — rendered when the CALLER passes a value and a setter, which
+              happens on exactly one screen of one kind of deployment: the create form on a
+              confirmed PRODUCTION box. Sandbox and unknown never pass them, because the backend
+              refuses the field there outright rather than ignoring it, and a box on screen would
+              be collecting a number nothing will accept.
+
+              It is NOT gated on the copy, which always resolves (served, else bundled): gating a
+              field on the presence of its own label is how a form silently loses the fast-EIN
+              route on a deployment that simply had not shipped `/config.formationCopy` yet.
 
               `autoComplete="off"` and `type="password"` are not security — the value is in the
               DOM either way — but they keep it out of the browser's form-fill store and off the
               screen in a shared room, which are the two ways it leaks from here. */}
-          {ssnCopy && ssn !== undefined && onSsn && (
+          {ssn !== undefined && onSsn && ssnCopy && (
             <Field
               label={ssnCopy.label}
               htmlFor="party-ssn"

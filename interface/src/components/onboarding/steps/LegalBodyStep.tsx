@@ -33,6 +33,7 @@ import {
 } from "@/lib/formation/companyIntake";
 import { CompanyStatePill } from "@/components/agents/CompanyStatePill";
 import { legalBodyTitle } from "@/lib/formation/honesty";
+import { formationCopyOf } from "@/lib/formation/copy";
 import {
   AmberPill,
   Button,
@@ -124,7 +125,10 @@ export function LegalBodyStep({
 
   const resolved = isKnownEnvironment(environment);
   const required = publicConfig?.formationRequired === true;
-  const copy = publicConfig?.formationCopy;
+  // Served where the backend answered, bundled where it did not — one table, one helper. The
+  // fields below are NEVER gated on it: a sentence that has not arrived is a sentence, and a
+  // form field that disappears with it is a route silently taken away.
+  const copy = formationCopyOf(publicConfig);
   // Absent means false, and that is the honest reading: a backend that predates the field takes
   // no payment. B1 ships the field and the payment step together.
   const paymentRequired = publicConfig?.formationPaymentRequired === true;
@@ -243,7 +247,7 @@ export function LegalBodyStep({
               companies={attachable}
               selected={selected}
               onSelect={setPicked}
-              disclosure={copy?.reuseDisclosure}
+              disclosure={copy.reuseDisclosure}
             />
           ) : (
             <>
@@ -308,7 +312,7 @@ export function LegalBodyStep({
                   set={setPartyField}
                   ssn={ssn}
                   onSsn={setSsn}
-                  ssnCopy={copy?.ssn}
+                  ssnCopy={copy.ssn}
                 />
               )}
             </>
@@ -428,7 +432,8 @@ function AttachPicker({
   companies: CompanyView[];
   selected: string | null;
   onSelect: (companyId: string) => void;
-  disclosure?: string;
+  /** Always present — served or bundled. It is the sentence the picker owes before a confirm. */
+  disclosure: string;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -462,11 +467,9 @@ function AttachPicker({
           </li>
         ))}
       </ul>
-      {disclosure && (
-        <Callout tone="warn" title="Agents that share a company are publicly linkable">
-          {disclosure}
-        </Callout>
-      )}
+      <Callout tone="warn" title="Agents that share a company are publicly linkable">
+        {disclosure}
+      </Callout>
     </div>
   );
 }
