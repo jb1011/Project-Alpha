@@ -27,6 +27,7 @@ import { buildTurnkeyProvisionDeps } from "../adapters/turnkey/clients";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
 import { type GuardianPasskey, provisionAgentVault } from "../adapters/turnkey/provisioner";
 import { TurnkeySigner } from "../adapters/turnkey/turnkeySigner";
+import { createAgentBookRegistrar } from "../adapters/worldid/agentBookRegistrar";
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
@@ -34,11 +35,13 @@ import {
   WORLD_CHAIN_DEFAULTS,
   canFormEntities,
   canProvisionTurnkey,
+  canRegisterAgentBook,
   loadConfig,
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
 import { createCompany } from "../formation/company";
 import { buildJobDeps } from "../jobs/composition";
+import { opsLog } from "../observability/opsLog";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
 import { PaymentLedger } from "../payments/ledger";
@@ -46,6 +49,7 @@ import { buildOutflowMeter } from "../payments/outflowMeter";
 import { buildPocketFunding } from "../payments/pocketFunding";
 import { buildSellerTrust } from "../payments/sellerTrust";
 import { buildReadExposure } from "../payments/standingExposure";
+import { SqliteAgentBookRepository } from "../persistence/agentBookRepository";
 import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteBridgeLegRepository } from "../persistence/bridgeLegRepository";
@@ -71,12 +75,14 @@ import { SqliteWorldStore } from "../persistence/worldStore";
 import { usdToUnits } from "../policy/units";
 import type { Address } from "../types";
 import { TaskTracker } from "../util/taskTracker";
+import { reconcileAgentBook } from "../workflow/agentBookReconcile";
 import { processDoolaEvent } from "../workflow/formationProcessor";
 import { FormationSweeper } from "../workflow/formationSweeper";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
 import { ApiError } from "./errors";
+import { TokenBucket } from "./routes/agentBook";
 import { buildWorldIdDeps } from "./routes/worldId";
 import { buildX402DemoDeps } from "./routes/x402Demo";
 import { installShutdownHandlers, shouldInstallSignalHandlers } from "./shutdown";
@@ -514,6 +520,39 @@ async function main() {
   if (x402Demo)
     console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);
 
+  // AgentBook registration (design 2026-08-25 v3). One predicate shared with the env.ts
+  // invariants and GET /config, so the boot gate and the advertised availability cannot drift.
+  // The READ endpoint is the trust dials' `WORLD_CHAIN_RPC`; the submitter's own RPC is the WRITE
+  // endpoint, and the contract address is the SAME one the reader above is built from — a reader
+  // and a registrar pointed at two different AgentBooks would confirm registrations that the
+  // seller check can never see.
+  const agentBookContract = cfg.worldChain?.agentBook ?? WORLD_CHAIN_DEFAULTS.agentBook;
+  // Through the predicate, so the submitter block is only in hand when the World portal block is
+  // there too (the Orb gate reads `WorldStore`) — and so the presence of THIS value, not a second
+  // hand-written condition, is what the deps below are built from.
+  const submitter = canRegisterAgentBook(cfg) ? cfg.agentBook : undefined;
+  const agentBook = submitter
+    ? {
+        registrar: createAgentBookRegistrar({
+          submitterPrivateKey: submitter.submitterPrivateKey,
+          readRpcUrl: cfg.worldChain?.rpcUrl ?? submitter.rpcUrl,
+          writeRpcUrl: submitter.rpcUrl,
+          contractAddress: agentBookContract,
+        }),
+        repo: new SqliteAgentBookRepository(db),
+        reader: createAgentBookReader({
+          rpcUrl: cfg.worldChain?.rpcUrl ?? WORLD_CHAIN_DEFAULTS.rpcUrl,
+          contractAddress: agentBookContract,
+        }),
+        store: new SqliteWorldStore(db),
+        network: cfg.arcNetwork ?? ("testnet" as const),
+        caps: { perEntityLifetime: 3, perTenantPerHour: 5 },
+        budget: new TokenBucket(30, 0.5),
+      }
+    : undefined;
+  if (agentBook)
+    console.warn("⚠ AgentBook registration ENABLED at /entities/:id/agentbook/session");
+
   const ens = cfg.ens
     ? {
         signer: privateKeyToAccount(cfg.ens.signerKey),
@@ -609,6 +648,7 @@ async function main() {
     x402Demo,
     ens,
     worldId,
+    agentBook,
     standingExposure,
   });
 
@@ -632,6 +672,20 @@ async function main() {
   if (formationSweeper) {
     formationSweeper.start();
     console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
+  }
+
+  // AgentBook reconcile at boot (D12), and AFTER the socket is listening for the same reason C4
+  // moved the formation reconcile down here: every in-flight row costs a World Chain round trip
+  // to a third party, and a slow or unreachable RPC must never be able to keep /healthz from
+  // answering. Usually a no-op — with nothing in flight it makes no call at all.
+  if (agentBook) {
+    const r = await reconcileAgentBook({
+      repo: agentBook.repo,
+      registrar: agentBook.registrar,
+      store: agentBook.store,
+      log: opsLog,
+    });
+    console.log(`AgentBook reconcile at boot: ${r.checked} checked, ${r.changed} changed`);
   }
 
   // The API process's FIRST signal handlers (design §7). Until part B every unit of work was a

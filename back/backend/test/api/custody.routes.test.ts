@@ -61,6 +61,10 @@ const FORMATION_OFF = {
   formationCopy: FORMATION_COPY,
 };
 
+/** What a deployment with no AgentBook submitter key advertises (design v3 §4.5): no vouch
+ *  dialog. Every fixture in this file is such a deployment. */
+const AGENTBOOK_OFF = { agentBookRegistrationAvailable: false };
+
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 beforeEach(() => {
@@ -215,6 +219,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     circleCustodyAvailable: true,
     turnkeyCustodyAvailable: true,
     ...FORMATION_OFF,
+    ...AGENTBOOK_OFF,
   });
 
   // A turnkey-only deployment (the pre-Tier-0 shape: Turnkey creds, no Circle creds) must
@@ -225,6 +230,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     circleCustodyAvailable: false,
     turnkeyCustodyAvailable: true,
     ...FORMATION_OFF,
+    ...AGENTBOOK_OFF,
   });
 
   // A genuinely bare deployment (no creds at all — the dev/CI shape that still boots) advertises
@@ -236,6 +242,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     circleCustodyAvailable: false,
     turnkeyCustodyAvailable: false,
     ...FORMATION_OFF,
+    ...AGENTBOOK_OFF,
   });
 
   // The mainnet shape: circle-only, so the wizard hides the turnkey card instead of offering
@@ -246,6 +253,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     circleCustodyAvailable: true,
     turnkeyCustodyAvailable: false,
     ...FORMATION_OFF,
+    ...AGENTBOOK_OFF,
   });
 });
 
@@ -265,6 +273,7 @@ test("GET /config reports formation availability and its ENVIRONMENT (honesty in
     formationEnvironment: "sandbox",
     formationRequired: false,
     formationCopy: FORMATION_COPY,
+    ...AGENTBOOK_OFF,
   });
 
   // Production formation is a DIFFERENT advertised value, never a missing one: the environment is

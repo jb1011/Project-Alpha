@@ -6,6 +6,7 @@ import { requireAuth } from "../auth/middleware";
 import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
 import { mountMcpRoute } from "../mcp/transport";
 import { apiOnError } from "./errors";
+import { mountAgentBookRoutes } from "./routes/agentBook";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
 import { mountComplianceRoutes } from "./routes/compliance";
@@ -168,6 +169,10 @@ export interface ApiDeps extends EntityViewDeps {
   /** Optional World ID guardian gate (proof-of-personhood). Present only when the WORLD_*
    *  portal credentials are set; absent -> routes not mounted and onboarding is ungated. */
   worldId?: import("./routes/worldId").WorldIdDeps;
+  /** AgentBook registration (design 2026-08-25 v3). Present iff `canRegisterAgentBook(cfg)` —
+   *  that predicate is the single definition, and `/config` plus the route mount are both
+   *  projections of THIS object's presence, so the boot gate and what we advertise cannot drift. */
+  agentBook?: import("./routes/agentBook").AgentBookDeps;
   /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
    *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
    *  `ceilingAtomic` is the configured MAX_POCKET_FLOAT_USDC, atomic USDC string. Optional for the
@@ -232,6 +237,10 @@ export function buildApiApp(deps: ApiDeps) {
        * everything else that is not a capability or a sentence about one.
        */
       formationCopy: { ssn: SSN_COPY, park: PARK_COPY, reuseDisclosure: COMPANY_REUSE_DISCLOSURE },
+      // Whether this deployment can WRITE an AgentBook registration. The vouch dialog is hidden
+      // without it: a box with no submitter key could take the guardian through the whole World
+      // App flow and then have nothing to broadcast.
+      agentBookRegistrationAvailable: Boolean(deps.agentBook),
     }),
   );
   mountSchemaRoutes(app);
@@ -277,6 +286,9 @@ export function buildApiApp(deps: ApiDeps) {
   protect("/connection-package");
   protect("/bootstrap-connection");
   mountWorldIdRoutes(app, deps); // routes carry their own requireAuth (like /passkey)
+  // AgentBook session/register/status. Mounted only where `agentBook` is wired, which is the same
+  // boolean `/config` advertises above.
+  mountAgentBookRoutes(app, deps);
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);
