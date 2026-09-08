@@ -294,9 +294,19 @@ export function createCompany(
   });
   // The door gate's own rule, at company scope — the SAME function, so "near" cannot mean two
   // different things on two doors that spend the same money.
+  //
+  // BOTH limits, because they warn different people about different things: the quota is one
+  // tenant approaching their own ceiling, and the DAILY CEILING is the PLATFORM approaching a
+  // limit that will then refuse every tenant at once. The second was written by the door gate
+  // A3 deleted and was not carried over with the first, so the only remaining signal for it was
+  // `formation_ceiling_rejected` — which fires when the platform has already stopped forming
+  // companies, i.e. after the outage rather than before it.
   warnIfNearLimit("formation_quota_warning", used + 1, deps.maxPerTenant, {
     tenantId: truncateTenant(tenantId),
   });
+  // No tenant in the fields: this limit is not about one, and naming the tenant that happened to
+  // trip it would read as blame for a platform-wide condition.
+  warnIfNearLimit("formation_ceiling_warning", inWindow + 1, deps.dailyCeiling, {});
   return { companyId };
 }
 

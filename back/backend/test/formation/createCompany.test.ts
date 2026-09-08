@@ -10,7 +10,7 @@
  * Everything refuses BEFORE a row is minted, and the mint itself is one transaction.
  */
 import type DatabaseType from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ApiError } from "../../src/api/errors";
 import { type WorldIdDeps, buildWorldIdDeps } from "../../src/api/routes/worldId";
 import { loadConfig } from "../../src/config/env";
@@ -290,6 +290,69 @@ test("the platform DAILY ceiling counts create_provider rows, where the fee is i
   expect("companyId" in createCompany(deps({ dailyCeiling: 2 }), TENANT, intake(newParty()))).toBe(
     true,
   );
+});
+
+/**
+ * BOTH near-limit warnings, because they warn different people about different things.
+ *
+ * The quota is one tenant approaching their own ceiling. The DAILY CEILING is the PLATFORM
+ * approaching a limit that will then refuse every tenant at once — and its warning was written by
+ * the door gate A3 deleted, and not carried over with the quota's. The only remaining signal for
+ * it was `formation_ceiling_rejected`, which fires once the platform has already stopped forming
+ * companies: an alert that arrives after the outage rather than before it.
+ */
+test("both near-limit warnings fire while there is still headroom", () => {
+  const printed: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    printed.push(args.map(String).join(" "));
+  });
+  try {
+    // One `create_provider` row already in the window, and a ceiling of 2: this create takes the
+    // platform to the limit, which is "within 20% after this request".
+    db.prepare(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
+                              name_options, business_purpose, industry_label)
+       VALUES ('c1', ?, 'ready', 'doola', 'sandbox', '[]', 'p', 'i')`,
+    ).run(OTHER);
+    db.prepare(
+      "INSERT INTO formation_requests (company_id, step, state, created_at) VALUES (?,?,?,?)",
+    ).run("c1", "create_provider", "confirmed", sqliteUtcTimestamp(NOW - 60_000));
+
+    expect(
+      "companyId" in
+        createCompany(deps({ dailyCeiling: 2, maxPerTenant: 1 }), TENANT, intake(newParty())),
+    ).toBe(true);
+
+    const lines = printed.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const quota = lines.find((l) => l.opslog === "formation_quota_warning");
+    const ceiling = lines.find((l) => l.opslog === "formation_ceiling_warning");
+    expect(quota).toMatchObject({ level: "warn", used: 1, limit: 1, remaining: 0 });
+    expect(ceiling).toMatchObject({ level: "warn", used: 2, limit: 2, remaining: 0 });
+    // The ceiling is a PLATFORM condition: naming the tenant that happened to trip it would read
+    // as blame for something no tenant caused.
+    expect(ceiling).not.toHaveProperty("tenantId");
+    // …and the quota's does name one, because that one is exactly who it is about.
+    expect(quota).toHaveProperty("tenantId");
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("neither warning fires while both limits have real headroom", () => {
+  const printed: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    printed.push(args.map(String).join(" "));
+  });
+  try {
+    expect(
+      "companyId" in
+        createCompany(deps({ dailyCeiling: 100, maxPerTenant: 100 }), TENANT, intake(newParty())),
+    ).toBe(true);
+    expect(printed.join("\n")).not.toContain("formation_quota_warning");
+    expect(printed.join("\n")).not.toContain("formation_ceiling_warning");
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 // ── the synthetic-PII refusals, in BOTH directions ─────────────────────────────────────────
