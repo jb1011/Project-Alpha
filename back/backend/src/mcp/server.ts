@@ -154,6 +154,29 @@ function formationCapabilityNote(deps: Pick<McpToolDeps, "formation">): string {
   return `Formation is ${deps.formation.required ? "REQUIRED" : "available"} on this deployment (doola, ${deps.formation.environment}). ${identity}`;
 }
 
+/**
+ * THE COMPANY an ENTITY-SCOPED key may see — `entityInScope`, one key along (§7).
+ *
+ * `get_entity` and `list_entities` have narrowed to the key's own entity since the scoped-key
+ * surface shipped. The two COMPANY reads were added without the equivalent, and a company is a
+ * strictly wider object than the entity that points at it: an entity-scoped key could enumerate
+ * every legal body its tenant owns and read any of them in full, including the ids and names of
+ * every SIBLING agent attached. That is the fleet shape `/transparency` deliberately does not
+ * publish, handed to a credential whose owner narrowed it on purpose.
+ *
+ * Returns `null` for a tenant-wide key — "no restriction" — and the entity's `company_id`
+ * otherwise, which is `undefined` when the entity is unknown or attached to nothing. `undefined`
+ * therefore matches no company at all, which is the right answer: an agent with no company has
+ * no company to read.
+ */
+function scopedCompanyId(
+  scope: VerifiedKey,
+  repo: Pick<EntityRepository, "findByIdempotencyKey">,
+): string | null | undefined {
+  if (scope.entityId === null) return null;
+  return repo.findByIdempotencyKey(scope.entityId)?.companyId ?? undefined;
+}
+
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
 export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
   // The ACTING tools (fund_treasury/onboard_agent) enforce capability + entity scope, on top of the
@@ -798,20 +821,16 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       async () => {
         if (!hasCapability(scope, "read"))
           return { content: [{ type: "text", text: "not authorized" }], isError: true };
-        return {
-          content: [
-            {
-              type: "text",
-              // The SAME projection REST `GET /companies` renders — literally the same function,
-              // because the two are one API-level contract (the picker's ordering and its
-              // labels) and two literals is how the agent surface quietly ended up dropping the
-              // business purpose, the industry and both filing facts.
-              text: JSON.stringify({
-                companies: listCompanyViews({ ...deps, companies: deps.companies! }, tenantId),
-              }),
-            },
-          ],
-        };
+        // The SAME projection REST `GET /companies` renders — literally the same function,
+        // because the two are one API-level contract (the picker's ordering and its labels) and
+        // two literals is how the agent surface quietly ended up dropping the business purpose,
+        // the industry and both filing facts.
+        const rows = listCompanyViews({ ...deps, companies: deps.companies! }, tenantId);
+        // …and then `entityInScope`'s rule, one key along: a key minted for ONE agent lists the
+        // one company that agent is filed under, never its tenant's whole fleet.
+        const only = scopedCompanyId(scope, deps.repo);
+        const companies = only === null ? rows : rows.filter((r) => r.companyId === only);
+        return { content: [{ type: "text", text: JSON.stringify({ companies }) }] };
       },
     );
   }
@@ -843,14 +862,27 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         // Tenant-scoped, and the SAME uniform answer REST gives: unknown and not-yours are one
         // reply, or the tool becomes an existence oracle over other tenants' company ids.
         const company = deps.companies!.findOwned(tenantId, companyId);
-        if (!company)
+        // …and an ENTITY-scoped key reads only the company its own agent is filed under, with the
+        // SAME uniform answer for "not yours" — a third reply here would make the tool an oracle
+        // over the rest of its own tenant's fleet, which is precisely what narrowing a key is for.
+        const only = scopedCompanyId(scope, deps.repo);
+        if (!company || (only !== null && company.companyId !== only))
           return { content: [{ type: "text", text: "company not found" }], isError: true };
+        const view = toCompanyDetailView({ ...deps, companies: deps.companies! }, company);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
-                toCompanyDetailView({ ...deps, companies: deps.companies! }, company),
+                only === null
+                  ? view
+                  : {
+                      ...view,
+                      // WHICH agents share the filing is withheld; HOW MANY is not. The count is
+                      // already on this key's own `get_entity` (`sharedWith`), so redacting it
+                      // would buy nothing and a `1` here would be a lie.
+                      attachedAgents: view.attachedAgents.filter((a) => a.id === scope.entityId),
+                    },
               ),
             },
           ],

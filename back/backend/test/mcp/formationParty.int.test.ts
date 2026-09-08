@@ -779,3 +779,95 @@ test("update_formation_party needs the PROVISION rung — it decides whose name 
   expect((res as { isError?: boolean }).isError).toBe(true);
   expect(textOf(res)).toBe("not authorized");
 });
+
+// ── the COMPANY reads under an ENTITY-SCOPED key (§7) ────────────────────────────────────────
+
+/**
+ * An entity-scoped key sees ONE entity — and, therefore, one company.
+ *
+ * `get_entity`/`list_entities` have enforced `entityInScope` since the scoped-key surface
+ * shipped; the two company reads were added without it, so a key minted for one agent could
+ * enumerate every legal body its tenant owns and read the full detail of any of them, including
+ * the names and ids of every SIBLING agent attached. That is the fleet-shape leak the sharing
+ * count is kept off `/transparency` to prevent, handed to a credential the owner deliberately
+ * narrowed.
+ *
+ * `agents` stays the TRUE total — a scoped key already learns it from `get_entity`'s
+ * `sharedWith`, and a 1 there would be a lie. What is withheld is WHICH agents.
+ */
+test("SCOPE: an entity-scoped key lists only its own company, and never a sibling's", async () => {
+  const app = buildTestApp({ required: true });
+  const handle = passkeys.store(TENANT, VALID_PASSKEY);
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+
+  const { mine, theirs, entityId } = await withClient(app, key, async (c) => {
+    const company = async (names: string[]) => {
+      const { partyId } = JSON.parse(
+        textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+      );
+      return JSON.parse(
+        textOf(
+          await c.callTool({
+            name: "create_company",
+            arguments: { partyId, ...MCP_INTAKE, names },
+          }),
+        ),
+      ).companyId as string;
+    };
+    const mine = await company(["Scoped One", "Scoped Two", "Scoped Three"]);
+    const theirs = await company(["Other One", "Other Two", "Other Three"]);
+    // Two agents on MINE, so the sibling redaction has something to redact.
+    const first = JSON.parse(
+      textOf(
+        await c.callTool({
+          name: "onboard_agent",
+          arguments: {
+            spec: { ...VALID_SPEC, name: "ScopedA" },
+            passkeyId: handle,
+            companyId: mine,
+          },
+        }),
+      ),
+    );
+    await c.callTool({
+      name: "onboard_agent",
+      arguments: {
+        spec: { ...VALID_SPEC, name: "ScopedB" },
+        passkeyId: handle,
+        companyId: mine,
+      },
+    });
+    return { mine, theirs, entityId: first.id as string };
+  });
+
+  const { key: scoped } = apiKeys.mint(TENANT, { capability: "read", entityId });
+  await withClient(app, scoped, async (c) => {
+    const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
+    expect(listed.companies.map((r: { companyId: string }) => r.companyId)).toEqual([mine]);
+
+    // The sibling's company is not readable at all, and reads exactly like an unknown id.
+    const refused = await c.callTool({ name: "get_company", arguments: { companyId: theirs } });
+    const missing = await c.callTool({ name: "get_company", arguments: { companyId: "nope" } });
+    expect((refused as { isError?: boolean }).isError).toBe(true);
+    expect(textOf(refused)).toBe(textOf(missing));
+
+    // Its OWN company is readable — with the sibling agent's id and name withheld, and the
+    // honest total kept.
+    const own = JSON.parse(
+      textOf(await c.callTool({ name: "get_company", arguments: { companyId: mine } })),
+    );
+    expect(own.companyId).toBe(mine);
+    expect(own.attachedAgents.map((a: { id: string }) => a.id)).toEqual([entityId]);
+    expect(own.agents).toBe(2);
+  });
+
+  // …and a TENANT-WIDE key still sees both companies and both agents.
+  await withClient(app, key, async (c) => {
+    const listed = JSON.parse(textOf(await c.callTool({ name: "list_companies", arguments: {} })));
+    expect(listed.companies).toHaveLength(2);
+    const own = JSON.parse(
+      textOf(await c.callTool({ name: "get_company", arguments: { companyId: mine } })),
+    );
+    expect(own.attachedAgents).toHaveLength(2);
+  });
+});
