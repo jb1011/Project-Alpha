@@ -1,3 +1,4 @@
+import type { AgentkitExtension } from "@worldcoin/agentkit";
 import Database from "better-sqlite3";
 import { beforeEach, expect, test, vi } from "vitest";
 import type { CircleWalletsApi } from "../../src/adapters/circle/circleWallets";
@@ -8,9 +9,11 @@ import { AGENT_BOOK_CAIP2, AGENT_BOOK_CHAIN_ID } from "../../src/payments/agentB
 import type { TreasuryReader } from "../../src/payments/entityPayment";
 import { buildEntityPaymentService } from "../../src/payments/entityPayment";
 import { PaymentLedger } from "../../src/payments/ledger";
-import { mintAgentkitExtension } from "../../src/payments/worldVerifier";
+import type { AgentkitSellerConfig } from "../../src/payments/worldVerifier";
+import { mintAgentkitExtension, verifyAgentkitRequest } from "../../src/payments/worldVerifier";
 import { migrate } from "../../src/persistence/db";
 import { SqlitePaymentIdempotencyStore } from "../../src/persistence/paymentIdempotencyStore";
+import { SqliteWorldStore } from "../../src/persistence/worldStore";
 import type { Address, EntityRecord, Hex } from "../../src/types";
 
 /**
@@ -40,6 +43,26 @@ vi.mock("../../src/adapters/worldid/agentkitSigner", async (importOriginal) => {
     wrapFetchWithAgentkit: (baseFetch: typeof fetch, signer: AgentkitSigner) => {
       captured.push(signer);
       return baseFetch;
+    },
+  };
+});
+
+// The SDK's `verifyAgentkitSignature`, stubbed so the second argument it receives is observable
+// without a live RPC. Everything else in the package (declareAgentkitExtension,
+// createAgentkitClient, parseAgentkitHeader, validateAgentkitMessage) is the real thing, so the
+// header these tests verify is a genuinely signed one.
+const verifyCalls = vi.hoisted(() => [] as Array<{ chainId: string; rpcUrl: unknown }>);
+type SdkModule = typeof import("@worldcoin/agentkit");
+vi.mock("@worldcoin/agentkit", async (importOriginal) => {
+  const actual = await importOriginal<SdkModule>();
+  return {
+    ...actual,
+    verifyAgentkitSignature: async (
+      payload: { chainId: string; address: string },
+      rpcUrl?: unknown,
+    ) => {
+      verifyCalls.push({ chainId: payload.chainId, rpcUrl });
+      return { valid: true, address: payload.address };
     },
   };
 });
@@ -213,6 +236,7 @@ let idempotency: SqlitePaymentIdempotencyStore;
 
 beforeEach(() => {
   captured.length = 0;
+  verifyCalls.length = 0;
   db = new Database(":memory:");
   migrate(db);
   ledger = new PaymentLedger(db);
@@ -269,4 +293,68 @@ test("pay() on the circle custody path also announces World Chain", async () => 
   expect(captured).toHaveLength(1);
   expect(captured[0]?.chainId).toBe(AGENT_BOOK_CAIP2);
   expect(captured[0]?.address).toBe(POCKET_ADDR);
+});
+
+// ------------------------------------------------- the RPC url handed to the SDK verifier
+
+const RESOURCE_URL = "https://example.com/x402-demo/quote";
+const DOMAIN = "example.com";
+const HUMAN = "0x051dbcb350abbe853a25ef35c88c7a582281f88d1d8e26ed014bad0e34a7d234";
+const ARC_RPC = "https://arc.rpc.test.invalid";
+const WORLD_RPC = "https://worldchain.rpc.test.invalid";
+const AGENT_KEY: Hex = `0x${"7".repeat(64)}`;
+
+/** A really-signed header for `chainId`, minted from our own seller's real 402 extension.
+ *  A hand-written payload would be thrown out by parseAgentkitHeader long before the RPC url is
+ *  chosen, so it could say nothing about this. */
+async function realHeader(chainId: number): Promise<string> {
+  const ext = (await mintAgentkitExtension({
+    domain: DOMAIN,
+    resourceUrl: RESOURCE_URL,
+    network: ARC_CAIP2,
+    allowancePerHuman: 9,
+  })) as unknown as { agentkit: AgentkitExtension };
+  const { createAgentkitClient } = await import("@worldcoin/agentkit");
+  const client = createAgentkitClient({ signer: agentkitSignerFromKey(AGENT_KEY, chainId) });
+  return client.createHeader(ext.agentkit);
+}
+
+function sellerCfg(store: SqliteWorldStore): AgentkitSellerConfig {
+  return {
+    domain: DOMAIN,
+    resourceUrl: RESOURCE_URL,
+    network: ARC_CAIP2,
+    store,
+    allowancePerHuman: 9,
+    agentBook: { lookupHuman: async () => HUMAN },
+    rpcUrls: { [ARC_CAIP2]: ARC_RPC, [AGENT_BOOK_CAIP2]: WORLD_RPC },
+  };
+}
+
+test("the verifier gets the RPC url for the chain the payload names, not the whole map", async () => {
+  // REGRESSION: this used to pass `{ rpcUrls: {...} }` behind an `as any`, but the SDK's second
+  // parameter is `rpcUrl?: string` and goes straight into viem's `http()`. The object made that
+  // transport unusable — EIP-191 survived only because viem falls back to local ECDSA recovery,
+  // and ERC-1271 (a contract call on the account's own chain) could never have worked.
+  const store = new SqliteWorldStore(db);
+  const worldHeader = await realHeader(AGENT_BOOK_CHAIN_ID);
+  const arcHeader = await realHeader(5042002);
+
+  const world = await verifyAgentkitRequest(worldHeader, sellerCfg(store));
+  expect(world.authorized, JSON.stringify(world)).toBe(true);
+  expect(verifyCalls).toEqual([{ chainId: AGENT_BOOK_CAIP2, rpcUrl: WORLD_RPC }]);
+
+  const arc = await verifyAgentkitRequest(arcHeader, sellerCfg(store));
+  expect(arc.authorized, JSON.stringify(arc)).toBe(true);
+  expect(verifyCalls[1]).toEqual({ chainId: ARC_CAIP2, rpcUrl: ARC_RPC });
+});
+
+test("a chain we have no RPC url for verifies with undefined, not with the map", async () => {
+  // Undefined is the SDK's documented "use viem's default endpoint for this chain" — the point is
+  // that a missing entry must not silently degrade into passing something viem cannot use.
+  const store = new SqliteWorldStore(db);
+  const header = await realHeader(AGENT_BOOK_CHAIN_ID);
+  const r = await verifyAgentkitRequest(header, { ...sellerCfg(store), rpcUrls: undefined });
+  expect(r.authorized, JSON.stringify(r)).toBe(true);
+  expect(verifyCalls).toEqual([{ chainId: AGENT_BOOK_CAIP2, rpcUrl: undefined }]);
 });

@@ -57,7 +57,10 @@ export interface AgentkitSellerConfig {
   worldChainRpc?: string;
   /** AgentBook address (optional; SDK default is the canonical World Chain deployment). */
   agentBookAddress?: string;
-  /** RPC overrides for signature verification, keyed by CAIP-2 (e.g. Arc). */
+  /** RPC URLs for signature verification, keyed by CAIP-2. The verifier takes ONE url — the one
+   *  for the chain the inbound payload names — so this needs an entry per chain we advertise.
+   *  EIP-191 needs none (the address is recovered locally); ERC-1271 needs the url for the chain
+   *  the smart account lives on, because verification is a contract call there. */
   rpcUrls?: Record<string, string>;
   /** Test seam: inject a verifier instead of hitting World Chain. */
   agentBook?: { lookupHuman(address: string): Promise<string | null> };
@@ -132,11 +135,14 @@ export async function verifyAgentkitRequest(
     if (!validation.valid)
       return { authorized: false, reason: `invalid-message:${validation.error ?? "unknown"}` };
 
-    const sig = await verifyAgentkitSignature(
-      payload,
-      // biome-ignore lint/suspicious/noExplicitAny: options accept string | { rpcUrls }.
-      (cfg.rpcUrls ? { rpcUrls: cfg.rpcUrls } : undefined) as any,
-    );
+    // ONE url, for the chain THIS payload names — the SDK's second parameter is
+    // `rpcUrl?: string` (agentkit-core `verifyAgentkitSignature`, re-exported unchanged by
+    // `@worldcoin/agentkit`), and it goes straight into viem's `http()`. Passing the whole map
+    // (which we did until this was caught) made that transport unusable: EIP-191 still passed
+    // because viem's verifyMessage falls back to local ECDSA recovery when the call fails, but
+    // ERC-1271 — a contract call on the account's own chain — could never succeed. Undefined is
+    // fine and means "use viem's default endpoint for this chain".
+    const sig = await verifyAgentkitSignature(payload, cfg.rpcUrls?.[payload.chainId]);
     if (!sig.valid || !sig.address)
       return { authorized: false, reason: `invalid-signature:${sig.error ?? "unknown"}` };
     const agentAddress = sig.address;

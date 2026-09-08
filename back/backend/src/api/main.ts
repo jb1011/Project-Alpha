@@ -509,8 +509,11 @@ async function main() {
       allowancePerHuman: cfg.worldChain.allowancePerHuman,
       worldChainRpc: cfg.worldChain.rpcUrl,
       agentBookAddress: cfg.worldChain.agentBook,
-      // Arc for the paid route, World Chain for the AgentKit challenge the client signs
-      // (design v3 D10) — an ERC-1271 verification against `eip155:480` needs an RPC here.
+      // One url per chain we advertise (design v3 D10): the verifier is handed the url for
+      // whichever chain the inbound payload names — Arc for a client that signed against the paid
+      // route, World Chain for one that signed against `eip155:480`. An EIP-191 proof needs
+      // neither (the address is recovered locally); an ERC-1271 proof needs the url for the chain
+      // its smart account lives on, since verifying it is a contract call there.
       rpcUrls: { [x402Demo.network]: cfg.rpcUrl, [AGENT_BOOK_CAIP2]: cfg.worldChain.rpcUrl },
       rateWindowMs: (cfg.worldRateWindowHours ?? 24) * 3_600_000,
     };
