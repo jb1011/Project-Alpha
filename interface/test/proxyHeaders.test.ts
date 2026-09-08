@@ -16,10 +16,13 @@
 import { expect, test } from "vitest";
 import {
   DOCUMENT_RESPONSE_HEADERS,
+  FORWARDED_REQUEST_HEADERS,
   FORWARDED_RESPONSE_HEADERS,
+  forwardedRequestHeaders,
   forwardedResponseHeaders,
   isDocumentDownloadPath,
   isNoStorePath,
+  isPublicReferencePath,
 } from "@/lib/proxyHeaders";
 
 test("the download path is the COMPANY route, and never the entity one it replaced", () => {
@@ -70,4 +73,51 @@ test("content-length is dropped beside a content-encoding — a lying length TRU
   // …and the other three still cross, so the download keeps its filename and its no-store.
   for (const h of ["content-disposition", "cache-control", "x-content-type-options"])
     expect(headers, h).toContain(h);
+});
+
+/* ── the public reference route (§7, A3) ───────────────────────────────────── */
+
+test("the industry list is the ONE public cacheable path, and nothing near it is", () => {
+  expect(isPublicReferencePath("formation/industries")).toBe(true);
+  // Anchored: a prefix is not a match, and neither is anything under it.
+  expect(isPublicReferencePath("formation/industries/extra")).toBe(false);
+  expect(isPublicReferencePath("x/formation/industries")).toBe(false);
+  expect(isPublicReferencePath("formation-party")).toBe(false);
+  expect(isPublicReferencePath("companies")).toBe(false);
+});
+
+test("`if-none-match` crosses on that path ONLY — otherwise the ETag is decorative", () => {
+  // Dropping it means the browser holds a validator it can never send, so every revalidation
+  // after `max-age` re-downloads ~20 KB of federal labels to learn they have not changed.
+  expect(forwardedRequestHeaders("formation/industries")).toContain("if-none-match");
+  expect(forwardedRequestHeaders("companies")).not.toContain("if-none-match");
+  // …and the global list is intact on both.
+  for (const header of FORWARDED_REQUEST_HEADERS) {
+    expect(forwardedRequestHeaders("formation/industries")).toContain(header);
+    expect(forwardedRequestHeaders("companies")).toContain(header);
+  }
+});
+
+test("`etag` and `cache-control` come BACK on that path, and `cache-control` on no other", () => {
+  const headers = new Headers();
+  const reference = forwardedResponseHeaders("formation/industries", headers);
+  expect(reference).toContain("etag");
+  expect(reference).toContain("cache-control");
+  // Echoing a backend `cache-control` onto every route would silently override the proxy's own
+  // policy, which is why it is scoped rather than global.
+  expect(forwardedResponseHeaders("entities", headers)).not.toContain("cache-control");
+  expect(forwardedResponseHeaders("entities", headers)).not.toContain("etag");
+});
+
+test("the reference route never picks up the DOCUMENT headers, or vice versa", () => {
+  const headers = new Headers();
+  expect(forwardedResponseHeaders("formation/industries", headers)).not.toContain(
+    "content-disposition",
+  );
+  expect(forwardedResponseHeaders("companies/abc/documents/def", headers)).toContain(
+    "content-disposition",
+  );
+  // …and the document route is still forced to `no-store` by the second lock.
+  expect(isNoStorePath("companies/abc/documents/def")).toBe(true);
+  expect(isNoStorePath("formation/industries")).toBe(false);
 });

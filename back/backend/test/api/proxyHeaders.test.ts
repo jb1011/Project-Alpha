@@ -189,7 +189,10 @@ test("the credential-bearing routes are still in the no-store branch", () => {
 
 test("the route file uses the allowlists rather than a second copy of them", () => {
   const route = readFileSync(PROXY_ROUTE, "utf8");
-  expect(route).toContain("FORWARDED_REQUEST_HEADERS");
+  // Both RESOLVERS, not the raw lists: which headers cross now depends on the route in BOTH
+  // directions — `if-none-match` on the public reference path, the four download headers on the
+  // document bytes — and a route reading a constant directly would forward one set everywhere.
+  expect(route).toContain("forwardedRequestHeaders(joined)");
   // The RESOLVER, not the raw list: which headers cross now depends on the route and on what the
   // backend answered, and a route that read the constant directly would forward the four
   // download headers everywhere again.

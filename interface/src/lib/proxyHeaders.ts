@@ -12,7 +12,7 @@
  * backend, and an unlisted response header cannot leak backend detail to the browser.
  */
 
-/** Request headers the browser may send THROUGH the proxy. */
+/** Request headers the browser may send THROUGH the proxy, on EVERY route. */
 export const FORWARDED_REQUEST_HEADERS = [
   "authorization",
   "content-type",
@@ -67,6 +67,29 @@ export const DOCUMENT_RESPONSE_HEADERS = [
 ] as const;
 
 /**
+ * Request headers forwarded ONLY on the public reference route (`isPublicReferencePath`).
+ *
+ * `if-none-match` is a CONDITIONAL request, and dropping it makes the backend's ETag decorative:
+ * the browser holds a validator it can never send, so every revalidation after `max-age` expires
+ * re-downloads 20 KB of federal industry labels to learn they have not changed.
+ *
+ * Scoped rather than global for the reason the response list is: a conditional request reaching a
+ * route that happens to grow an ETag later would start producing 304s the client did not opt into
+ * on that path, and "which requests may be conditional" is a decision worth writing down once.
+ */
+export const REFERENCE_REQUEST_HEADERS = ["if-none-match"] as const;
+
+/**
+ * Response headers forwarded ONLY on the public reference route.
+ *
+ * Both halves of the same bargain: `etag` is the validator the browser sends back, and
+ * `cache-control` is what tells it when to bother. `cache-control` is NOT in the global list on
+ * purpose — echoing a backend's caching policy onto every route would silently override the
+ * proxy's — so it is named here, for the one path whose policy is the point.
+ */
+export const REFERENCE_RESPONSE_HEADERS = ["etag", "cache-control"] as const;
+
+/**
  * Which response headers this path may carry, given what the backend actually answered.
  *
  * `content-length` is dropped whenever the response is ENCODED. The header the backend sent
@@ -80,12 +103,34 @@ export function forwardedResponseHeaders(
   joinedPath: string,
   headers: { get(name: string): string | null },
 ): readonly string[] {
+  if (isPublicReferencePath(joinedPath))
+    return [...FORWARDED_RESPONSE_HEADERS, ...REFERENCE_RESPONSE_HEADERS];
   if (!isDocumentDownloadPath(joinedPath)) return FORWARDED_RESPONSE_HEADERS;
   const encoded = Boolean(headers.get("content-encoding"));
   return [
     ...FORWARDED_RESPONSE_HEADERS,
     ...DOCUMENT_RESPONSE_HEADERS.filter((h) => !(encoded && h === "content-length")),
   ];
+}
+
+/** Which request headers this path may carry — the global allowlist, plus the conditional-request
+ *  header on the one public path whose answers are validated. */
+export function forwardedRequestHeaders(joinedPath: string): readonly string[] {
+  return isPublicReferencePath(joinedPath)
+    ? [...FORWARDED_REQUEST_HEADERS, ...REFERENCE_REQUEST_HEADERS]
+    : FORWARDED_REQUEST_HEADERS;
+}
+
+/**
+ * The PUBLIC, CACHEABLE reference route — the industry labels the create form types ahead over.
+ *
+ * One path, named beside `isDocumentDownloadPath` for the same reason that one is: "which paths
+ * get which headers" is a decision, and a decision spread across a request handler is one nobody
+ * reviews. It is the only route in this API whose answer is a build-time constant, which is what
+ * makes a strong ETag and a day of `max-age` correct for it and wrong everywhere else.
+ */
+export function isPublicReferencePath(joinedPath: string): boolean {
+  return joinedPath === "formation/industries";
 }
 
 /** `companies/<companyId>/documents/<docId>` — the bytes route, and only it. The INDEX route
