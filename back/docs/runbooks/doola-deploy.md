@@ -98,25 +98,55 @@ one is a loud refusal instead of a silent strip.
 | Action | REST | MCP | CLI |
 |---|---|---|---|
 | register a responsible person | `POST /formation-party` | `create_formation_party` | — |
-| **edit** that person | `PATCH /formation-party/:partyId` | `update_formation_party` | — |
+| **edit** that person | `PATCH /companies/:companyId/party` | `update_company_party` | — |
 | create a company (**spends**) | `POST /companies` | `create_company` | — |
 | edit a company's intake (+ SSN) | `PATCH /companies/:companyId` | — (**never**: an SSN would sit in an LLM client's context) | — |
 | list companies | `GET /companies` | `list_companies` | — |
 | one company, in full | `GET /companies/:companyId` | `get_company` | — |
 | compliance calendar | `GET /companies/:companyId/compliance` | — | — |
 | legal documents | `GET /companies/:companyId/documents[/:docId]` | (metadata on the entity views) | — |
+| the intake RULES (public) | `GET /formation/rules` | (industries named in `create_company`'s description, capped) | — |
 | **attach** an agent (free) | `POST /onboard` with `companyId` | `onboard_agent` with `companyId` | **refuses** (`legacyDoorRefusalMessage`) |
 | abandon a parked filing | — | — | `npm run cli -- formation:abandon <entityKey>` |
 
-Two of those doors are the exits from a PARKED filing, and each clears its OWN flag: a company
-`PATCH` clears `awaitingIntakeEdit`, the party `PATCH` clears `awaitingPartyEdit`, and neither
-touches the other's. `GET /companies/:companyId` is where an operator (or the owner) sees which
-park a company is in, including the §4.6a SSN decision, which is not a flag at all.
+Two of those doors are the exits from a PARKED filing, and each clears its OWN flag:
+`PATCH /companies/:companyId` clears `awaitingIntakeEdit`, `PATCH /companies/:companyId/party`
+clears `awaitingPartyEdit`, and neither touches the other's. `GET /companies/:companyId` is where
+an operator (or the owner) sees which park a company is in, including the §4.6a SSN decision,
+which is not a flag at all.
+
+⚠ **The party-edit door is addressed by COMPANY, not by party handle.** It took a `partyId` first,
+which meant a mistyped uuid could rewrite the responsible person of a DIFFERENT company mid-filing
+— the only thing in the way was the freeze, which an unopened filing passes. The party is now
+RESOLVED from the company's UNIQUE `company_id`, so touching another company's person is not a
+request this API can express, and the browser form no longer has to ask a human to paste a handle
+no surface ever serves back. An UNBOUND party (registered, never spent on a company) therefore has
+no edit door: it has no filing, no park and nothing to correct, and the C7 sweep erases it after
+seven days.
+
+⚠ **An unchanged party edit is REFUSED** (`partyUnchangedMessage`). SQLite's `changes` counts rows
+MATCHED, not rows whose values differ, so re-submitting the details already on file used to clear
+the park and hand doola a retry of the exact body it refused. The freeze also rides in the
+`UPDATE formation_parties` WHERE clause now (`PARTY_EDIT_ALLOWED_SQL`), not only above the write.
+
+⚠ **`GET /formation/industries` was RENAMED to `GET /formation/rules`** in the same phase, and it
+now serves the four intake limits (`nameOptionCount`, `nameMaxLength`, `purposeMaxLength`,
+`nameCharset`) beside the labels — the interface used to mirror those as constants of its own.
+Wyoming's restricted words stay server-only: the matcher is the rule, not the data. The route is
+ETag-validated, and the Vercel proxy forwards `if-none-match`/`etag` for that one path.
+
+⚠ **The wizard's localStorage key moved to `pa-onboarding-v3`.** A v2 blob is migrated once on
+read: the phase `legal-identity` becomes `legal-body`, `done["legal-identity"]` is dropped (its
+product was a party handle, which is no longer what "the legal body is settled" means), and
+`partyId`/`partySynthetic` are dropped with it. A v2 session that carried a party and no company
+is sent back to the legal-body step on any deployment that forms. "Start over" clears both keys.
 
 ⚠ **The document routes MOVED in A3**, from `/entities/:id/documents…` to
 `/companies/:companyId/documents…`, with no alias. Anything pointing at the old path — a bookmark,
-a script, a monitoring probe — gets a 404. The interface's proxy predicates moved with them, and a
-backend test runs both regexes against a real path so a half-done rename fails CI.
+a script, a monitoring probe — gets a 404. The interface's proxy predicates moved with them, and
+`interface/test/proxyHeaders.test.ts` imports and RUNS those predicates against real paths, so a
+half-done rename fails CI. (The backend's text-scraped version of that guard is gone: its failure
+mode was that the extractor stopped matching and it passed vacuously.)
 
 The standalone onboarding server (`src/onboarding/{server,main}.ts`) was **RETIRED in PR 3** and is
 no longer a door: it had no auth, no World gate and no custody gate, and it bypassed `claimKey`,
