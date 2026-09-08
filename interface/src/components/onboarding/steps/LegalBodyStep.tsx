@@ -10,6 +10,7 @@ import {
 } from "../types";
 import {
   useCompaniesQuery,
+  useCompanyQuery,
   useCreateCompanyMutation,
   useCreateFormationPartyMutation,
   useFormationEnvironment,
@@ -17,7 +18,11 @@ import {
   usePublicConfigQuery,
   useRetryPublicConfig,
 } from "@/lib/api/hooks";
-import { isKnownEnvironment, type FormationEnvironment } from "@/lib/api/formationEnvironment";
+import {
+  filingEnvironment,
+  isKnownEnvironment,
+  type FormationEnvironment,
+} from "@/lib/api/formationEnvironment";
 import type { CompanyView } from "@/lib/api/types";
 import {
   companyLabel,
@@ -27,6 +32,7 @@ import {
   type CompanyIntakeForm,
 } from "@/lib/formation/companyIntake";
 import { CompanyStatePill } from "@/components/agents/CompanyStatePill";
+import { legalBodyTitle } from "@/lib/formation/honesty";
 import {
   AmberPill,
   Button,
@@ -55,7 +61,11 @@ type Props = {
   intake: CompanyIntakeForm;
   onIntake: (intake: CompanyIntakeForm) => void;
   companyId: string | null;
-  onCompany: (companyId: string) => void;
+  /** The picked company's ROW, when the flow is carrying one — see `OnboardingSession.company`. */
+  company: CompanyView | null;
+  /** The handle, and the ROW when the branch that produced it had one. The attach branch picked
+   *  its row out of a list; a create has only the handle until somebody reads it back. */
+  onCompany: (companyId: string, company?: CompanyView) => void;
   onBack: () => void;
   onComplete: () => void;
   /** Drop the recorded company and choose again. */
@@ -89,6 +99,7 @@ export function LegalBodyStep({
   intake,
   onIntake,
   companyId,
+  company,
   onCompany,
   onBack,
   onComplete,
@@ -117,6 +128,21 @@ export function LegalBodyStep({
   // Absent means false, and that is the honest reading: a backend that predates the field takes
   // no payment. B1 ships the field and the payment step together.
   const paymentRequired = publicConfig?.formationPaymentRequired === true;
+
+  // The environment THIS SCREEN may claim: the attached company's row when there is one, the
+  // deployment's own answer while the next action is still to create a company. One function,
+  // shared with the confirm screen, so the two cannot describe the same filing differently.
+  const attachedCompany = useCompanyQuery(companyId, { enabled: companyId !== null && !company });
+  const attachedRow = company ?? attachedCompany.data ?? null;
+  const { environment: attachedEnvironment } = filingEnvironment({
+    forming: companyId !== null,
+    deployment: environment,
+    company: {
+      environment: attachedRow?.environment,
+      hasData: attachedRow !== null,
+      isError: attachedCompany.isError,
+    },
+  });
 
   const companies = useCompaniesQuery(resolved && !companyId);
   const [picked, setPicked] = useState<string | null>(null);
@@ -179,28 +205,31 @@ export function LegalBodyStep({
     <div>
       <StepHeader
         eyebrow={eyebrow}
-        title={
-          !resolved
-            ? "Legal body"
-            : companyId
-              ? "Legal body"
-              : environment === "sandbox"
-                ? "Legal body (demo filing)"
-                : effectiveMode === "attach"
-                  ? "Which company is this agent filed under?"
-                  : "Create the company this agent is filed under"
-        }
+        // ⚠ "(demo filing)" is a CLAIM, and once a company is attached it is a claim about THAT
+        // COMPANY. `attachedEnvironment` is the row's, which is stamped at creation and immutable
+        // after; the deployment's answer is used only while the next action is still to create
+        // one, because a new company takes the deployment's pin.
+        title={legalBodyTitle({
+          environment: attachedEnvironment,
+          attached: companyId !== null,
+          mode: effectiveMode,
+        })}
         intro={
           !resolved
             ? "Checking what this deployment can file."
-            : environment === "sandbox"
+            : attachedEnvironment === "sandbox"
               ? "This deployment files in doola's sandbox, so no real identity is collected or sent. The filing uses a labeled demo identity and produces a demo company — nothing legally exists at the end of it."
               : "Your agent acts through a Wyoming LLC. One company can carry several agents, and attaching a new agent to a company you already have costs nothing."
         }
       />
 
       {companyId ? (
-        <AttachedPanel companyId={companyId} onClear={onClear} />
+        <AttachedPanel
+          companyId={companyId}
+          state={attachedRow?.state ?? null}
+          environment={attachedRow?.environment ?? null}
+          onClear={onClear}
+        />
       ) : !resolved ? (
         <UnresolvedPanel environment={environment} retrying={retrying} onRetry={retry} />
       ) : (
@@ -325,7 +354,8 @@ export function LegalBodyStep({
           <Button
             disabled={!selected}
             onClick={() => {
-              if (selected) onCompany(selected);
+              const row = attachable.find((c) => c.companyId === selected);
+              if (row) onCompany(row.companyId, row);
             }}
           >
             Use this company
@@ -441,12 +471,38 @@ function AttachPicker({
   );
 }
 
-function AttachedPanel({ companyId, onClear }: { companyId: string; onClear: () => void }) {
+/**
+ * The company this agent will be filed under — after a create OR an attach.
+ *
+ * It used to render a green tick and an opaque handle, with no word about WHAT had been created.
+ * A sandbox company and a real Wyoming LLC produced the identical screen, in the identical
+ * colour, on the step whose entire subject is which of the two this is. The pill is the same one
+ * the list, the detail page and the reuse picker render, so the four cannot describe one row
+ * differently — and until the row is in hand it says so rather than guessing.
+ */
+function AttachedPanel({
+  companyId,
+  state,
+  environment,
+  onClear,
+}: {
+  companyId: string;
+  state: string | null;
+  environment: string | null;
+  onClear: () => void;
+}) {
   return (
     <Card className="p-6">
-      <div className="flex items-center gap-2 text-[13px] text-emerald-300">
-        <CheckIcon className="h-4 w-4" />
-        This agent will be filed under the company below
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-[13px] text-emerald-300">
+          <CheckIcon className="h-4 w-4" />
+          This agent will be filed under the company below
+        </div>
+        {state !== null && environment !== null ? (
+          <CompanyStatePill state={state} environment={environment} />
+        ) : (
+          <AmberPill>Reading this company&apos;s filing state…</AmberPill>
+        )}
       </div>
       <p className="mt-3 text-[12.5px] leading-[1.6] text-muted">
         The wizard kept the company handle and nothing else — no identity is held in this browser.

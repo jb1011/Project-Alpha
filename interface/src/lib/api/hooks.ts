@@ -381,13 +381,34 @@ export function useCompaniesQuery(enabled = true) {
   });
 }
 
-export function useCompanyQuery(companyId: string | null | undefined, refetchInterval?: number) {
+/**
+ * ONE company, in full.
+ *
+ * `enabled` is how the wizard SKIPS this fetch entirely: the legal-body step already holds the
+ * row the user picked (`session.company`), and the two screens after it need exactly two of its
+ * fields — the environment and the state. Handing them the row they have removes a beat of
+ * `loading` on the confirm screen, during which the submit is blocked because the environment
+ * cannot be named.
+ *
+ * ⚠ It is `enabled` and NOT React Query's `initialData`, deliberately. The carried row is a LIST
+ * row (`CompanyView`); this query's shape is the DETAIL (`CompanyDetailView`), whose extra fields
+ * include `park` — three booleans the Companies page destructures. Seeding a partial under this
+ * key would write it into the SHARED cache, and the next surface to read that key (the company
+ * page, the dashboard's formation card) would read a row whose type promises `park` and whose
+ * value has none. Not fetching is the honest version of the same optimisation.
+ *
+ * The fetch is the fallback and not an optimisation to skip: a freshly CREATED company has no
+ * carried row, and a page opened cold has none either.
+ */
+export function useCompanyQuery(
+  companyId: string | null | undefined,
+  options?: { enabled?: boolean },
+) {
   const token = useAuthToken();
   return useQuery({
     queryKey: apiKeys.company(token ?? "", companyId ?? ""),
     queryFn: () => getCompany(token!, companyId!),
-    enabled: !!token && !!companyId,
-    refetchInterval: refetchInterval ?? false,
+    enabled: (options?.enabled ?? true) && !!token && !!companyId,
   });
 }
 

@@ -337,8 +337,12 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 intake={intake}
                 onIntake={setIntake}
                 companyId={session.companyId}
-                onCompany={(companyId) => {
-                  setSession((s) => ({ ...s, companyId }));
+                company={session.company}
+                onCompany={(companyId, company) => {
+                  // The ROW travels with the handle when we have one (the attach branch picked
+                  // it out of a list); a freshly created company has none, and the screens after
+                  // this one fetch it. It is in-memory state only — never in the allowlist.
+                  setSession((s) => ({ ...s, companyId, company: company ?? null }));
                   // Belt and braces on top of the allowlist: once the backend holds the identity
                   // and has issued a company handle, there is no reason for this browser to keep
                   // a copy of either in memory. (The SSN never reaches this component at all —
@@ -347,7 +351,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                   setIntake(emptyCompanyIntake());
                   completePhase("legal-body", "custody");
                 }}
-                onClear={() => setSession((s) => ({ ...s, companyId: null }))}
+                onClear={() => setSession((s) => ({ ...s, companyId: null, company: null }))}
                 onBack={() => goTo("guardian")}
                 onComplete={() => completePhase("legal-body", "custody")}
               />
@@ -377,6 +381,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 guardianPasskey={session.guardianPasskey}
                 idempotencyKey={session.idempotencyKey}
                 companyId={session.companyId}
+                company={session.company}
                 onBack={() => goTo("configure")}
                 onSubmitted={(entityId, idempotencyKey) => {
                   setSession((s) => ({

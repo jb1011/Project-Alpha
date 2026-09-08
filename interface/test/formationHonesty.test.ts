@@ -13,7 +13,12 @@
  */
 import { expect, test } from "vitest";
 import type { FormationEnvironment } from "@/lib/api/formationEnvironment";
-import { companyTone, filingTone, mayRenderConfirmed } from "@/lib/formation/honesty";
+import {
+  companyTone,
+  filingTone,
+  legalBodyTitle,
+  mayRenderConfirmed,
+} from "@/lib/formation/honesty";
 import { COMPANY_STATES, FORMATION_STATUSES } from "@/lib/api/types";
 
 const NOT_PRODUCTION: FormationEnvironment[] = ["sandbox", "unknown", "loading"];
@@ -72,4 +77,38 @@ test("an ABANDONED company reads as failed, not as a quiet amber", () => {
   // still coming" waits for something that will never happen.
   expect(companyTone("production", "abandoned")).toBe("failed");
   expect(companyTone("sandbox", "abandoned")).toBe("failed");
+});
+
+/* ── the legal-body header (§7, A3) ────────────────────────────────────────── */
+
+test("A3: once a company is attached, the heading describes THAT COMPANY", () => {
+  // The bug: the "(demo filing)" suffix came from `/config`. A user attaching an agent to a
+  // company they minted in sandbox, on a box since re-pointed at production, read a heading that
+  // said nothing about a demo over a filing that is one — and the reverse, which is worse.
+  expect(legalBodyTitle({ environment: "sandbox", attached: true, mode: "attach" })).toBe(
+    "Legal body (demo filing)",
+  );
+  expect(legalBodyTitle({ environment: "production", attached: true, mode: "attach" })).toBe(
+    "Legal body",
+  );
+  // Neither claim while the row is still being read.
+  for (const environment of ["loading", "unknown"] as const)
+    expect(legalBodyTitle({ environment, attached: true, mode: "create" })).toBe("Legal body");
+});
+
+test("A3: before anything is attached, the DEPLOYMENT's answer is the right one", () => {
+  // The next action is to create a company, and a new company takes the deployment's pin.
+  expect(legalBodyTitle({ environment: "sandbox", attached: false, mode: "create" })).toBe(
+    "Legal body (demo filing)",
+  );
+  expect(legalBodyTitle({ environment: "production", attached: false, mode: "attach" })).toBe(
+    "Which company is this agent filed under?",
+  );
+  expect(legalBodyTitle({ environment: "production", attached: false, mode: "create" })).toBe(
+    "Create the company this agent is filed under",
+  );
+  // …and an unknown deployment claims nothing at all — the neutral panel owns the screen.
+  for (const environment of ["loading", "unknown"] as const)
+    for (const mode of ["attach", "create"] as const)
+      expect(legalBodyTitle({ environment, attached: false, mode })).toBe("Legal body");
 });

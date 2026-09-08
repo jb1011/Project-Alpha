@@ -30,7 +30,12 @@ export type AllowlistEntry = {
   address: string;
 };
 
-import type { EntityView, FormationPartyInput, GuardianPasskey } from "@/lib/api/types";
+import type {
+  CompanyView,
+  EntityView,
+  FormationPartyInput,
+  GuardianPasskey,
+} from "@/lib/api/types";
 
 export type AgentConfig = {
   name: string;
@@ -67,6 +72,20 @@ export type OnboardingSession = {
    * re-pointed at production, which a remembered boolean would get exactly backwards.
    */
   companyId: string | null;
+  /**
+   * The picked company's ROW, carried so the screens after the legal-body step can name its
+   * environment without asking for it again (§7, A3).
+   *
+   * ⚠ IN MEMORY ONLY. It is not in `PERSISTED_SESSION_KEYS` and must not be: `companyId` is the
+   * handle that survives a reload, and a restored session re-reads the row from the server rather
+   * than trusting a copy that may be days old. Carrying it within a session is what removes the
+   * blocking `loading` beat on the confirm screen — the row is seeded into the company query,
+   * which still FETCHES when there is no seed.
+   *
+   * No PII: a company view carries name candidates, a purpose, an industry and filing facts. The
+   * responsible party is not projected onto it on any surface.
+   */
+  company: CompanyView | null;
 };
 
 export const emptySession = (): OnboardingSession => ({
@@ -75,6 +94,7 @@ export const emptySession = (): OnboardingSession => ({
   entity: null,
   guardianPasskey: null,
   companyId: null,
+  company: null,
 });
 
 export type PhaseMeta = { id: Phase; label: string };

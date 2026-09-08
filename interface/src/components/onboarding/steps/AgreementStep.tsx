@@ -16,7 +16,7 @@ import {
   type FormationEnvironment,
 } from "@/lib/api/formationEnvironment";
 import { configToAgentSpec } from "@/lib/api/spec";
-import type { GuardianPasskey } from "@/lib/api/types";
+import type { CompanyView, GuardianPasskey } from "@/lib/api/types";
 import {
   Button,
   Callout,
@@ -40,6 +40,14 @@ type Props = {
    * It replaces the `partyId` A1's shim took: onboard attaches, it never creates.
    */
   companyId: string | null;
+  /**
+   * That company's ROW, when the legal-body step is still holding it (§7, A3).
+   *
+   * The environment on this screen is a CLAIM about a specific filing, and the row is where the
+   * pin actually lives. Carrying it removes the fetch entirely; absent (a reload, or a company
+   * created rather than picked) the query below is the fallback.
+   */
+  company: CompanyView | null;
   onBack: () => void;
   onSubmitted: (entityId: string, idempotencyKey: string) => void;
 };
@@ -50,6 +58,7 @@ export function AgreementStep({
   guardianPasskey,
   idempotencyKey,
   companyId,
+  company,
   onBack,
   onSubmitted,
 }: Props) {
@@ -72,7 +81,12 @@ export function AgreementStep({
   // filing on a box that has since been re-pointed at production — which the deployment's answer
   // would get exactly backwards. `/config` remains the fallback while the row is still loading,
   // and its two ways of not knowing are preserved rather than collapsed into "sandbox".
-  const company = useCompanyQuery(companyId);
+  // The row the legal-body step already picked, carried in memory. Where it exists there is
+  // nothing to wait for and nothing to fetch: the confirm screen's `loading` beat — during which
+  // the submit is blocked because the environment cannot be named — was a round trip for two
+  // fields the wizard was already holding.
+  const query = useCompanyQuery(companyId, { enabled: company === null });
+  const row = company ?? query.data ?? null;
   // ONE function decides the environment AND which query a retry has to hit. They used to be
   // decided apart, and the second was wrong: this screen reads the COMPANY row while its Retry
   // button refetched `/config`, so on the one screen where the button matters it refetched a
@@ -81,14 +95,10 @@ export function AgreementStep({
   const { environment, retryTarget } = filingEnvironment({
     forming,
     deployment: deploymentEnvironment,
-    company: {
-      environment: company.data?.environment,
-      hasData: company.data !== undefined,
-      isError: company.isError,
-    },
+    company: { environment: row?.environment, hasData: row !== null, isError: query.isError },
   });
-  const retry = retryTarget === "company" ? () => void company.refetch() : retryConfig;
-  const retrying = retryTarget === "company" ? company.isFetching : retryingConfig;
+  const retry = retryTarget === "company" ? () => void query.refetch() : retryConfig;
+  const retrying = retryTarget === "company" ? query.isFetching : retryingConfig;
   // The gate. Confirming here starts a filing, and a filing whose environment we cannot name is
   // one this screen cannot describe honestly — so it does not let the user start it. This is the
   // exact case that used to render "Demo — nothing is filed" over a real Wyoming filing.
