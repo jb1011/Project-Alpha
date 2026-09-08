@@ -27,7 +27,7 @@ import { NAICS_LABELS } from "./naicsLabelsData";
  * documentation example — the OpenAPI document's `industry` sample ("Custom Computer Programming
  * Services", the official NAICS 541511 title) is in the array only if doola's own table has it.
  *
- * A3's industry picker reads the list from `GET /formation/industries`, which serves this array
+ * A3's industry picker reads the list from `GET /formation/rules`, which serves this array
  * verbatim. That is a separate route rather than a field on `/config` deliberately: `/config` is
  * unauthenticated, fetched by every page in the interface, and cached for the life of the tab —
  * 821 labels on it would be ~20 KB paid for by the landing page to serve one form.

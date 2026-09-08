@@ -515,6 +515,32 @@ export function isKnownCompanyState(value: string): value is CompanyState {
   return (COMPANY_STATES as readonly string[]).includes(value);
 }
 
+/**
+ * `GET /formation/rules` — everything the create-company form enforces, from the backend that
+ * enforces it (design §5/§7).
+ *
+ * The four scalars were MIRRORED constants in this bundle until A3, each with a comment naming
+ * what it copied. A mirror is a second copy with a promise attached: the day one moves, the form
+ * either refuses a name the door would take — an annoyance — or PROMISES one the door refuses,
+ * after a founder has typed three of them and paid for the first.
+ *
+ * ⚠ Wyoming's ~80 RESTRICTED WORDS are deliberately absent, and a test asserts it. They are
+ * matched on letter boundaries (so "Banksy" survives "bank"), which makes the MATCHER the rule
+ * rather than the data; a client holding the words without it would disagree with the server in
+ * both directions. The server's refusal names the offending word and the form renders it.
+ */
+export type FormationRules = {
+  /** As served, in the order doola published it — the picker sorts nothing for itself. */
+  industries: string[];
+  /** Wyoming refuses a taken name, and a retry is a second fee: the alternates are the point. */
+  nameOptionCount: number;
+  nameMaxLength: number;
+  purposeMaxLength: number;
+  /** A character-CLASS BODY, compiled as `^[…]$` and tested one character at a time — never a
+   *  whole pattern, which would carry an anchor and a quantifier this client did not choose. */
+  nameCharset: string;
+};
+
 /** One stored name candidate, in the canonical shape the backend files under. */
 export type CompanyNameOption = { name: string; entityTypeEnding: string; position: number };
 
@@ -603,7 +629,7 @@ export type ComplianceView = {
 };
 
 /** The production create-company intake (§5). Three ranked candidates, the company's own purpose,
- *  and an industry from `GET /formation/industries`. */
+ *  and an industry from `GET /formation/rules`. */
 export type CompanyIntakeInput = {
   partyId: string;
   names: [string, string, string] | string[];

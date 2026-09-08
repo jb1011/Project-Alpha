@@ -30,7 +30,7 @@ import {
   listCompanies,
   listEntities,
   listEntityJobs,
-  listIndustries,
+  fetchFormationRules,
   listPasskeys,
   onboardEntity,
   patchPerTxCap,
@@ -355,16 +355,16 @@ export function useCreateFormationPartyMutation() {
 /* ── COMPANIES (design §7) ─────────────────────────────────────────────────── */
 
 /**
- * The industry list, fetched ONCE per page and never again.
+ * The intake RULES, fetched ONCE per page and never again.
  *
- * A build-time reference table on the backend, so it changes on a deploy and not on a request —
- * the same reasoning `usePublicConfigQuery` uses, and the same `staleTime`. Public, so no token
- * and no token in the key.
+ * Build-time constants on the backend, so they change on a deploy and not on a request — the same
+ * reasoning `usePublicConfigQuery` uses, and the same `staleTime`. Public, so no token and no
+ * token in the key.
  */
-export function useIndustriesQuery(enabled = true) {
+export function useFormationRulesQuery(enabled = true) {
   return useQuery({
-    queryKey: apiKeys.industries(),
-    queryFn: listIndustries,
+    queryKey: apiKeys.formationRules(),
+    queryFn: fetchFormationRules,
     enabled,
     staleTime: Number.POSITIVE_INFINITY,
   });

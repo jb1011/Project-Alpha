@@ -1,4 +1,4 @@
-import type { CompanyNameOption, CompanyView } from "@/lib/api/types";
+import type { CompanyNameOption, CompanyView, FormationRules } from "@/lib/api/types";
 
 /**
  * THE CREATE-COMPANY FORM'S OWN RULES (design §5) — a courtesy, and honest about being one.
@@ -8,32 +8,20 @@ import type { CompanyNameOption, CompanyView } from "@/lib/api/types";
  * a round trip, so a founder fixing three name fields does it in the form rather than one 400 at
  * a time.
  *
- * ⚠ **Wyoming's restricted-word list is deliberately NOT here.** It is ~80 words of data that the
- * backend holds (`src/formation/wyRestrictedWords.ts`), matched on letter boundaries so "Banksy"
- * is not refused for containing "bank". A copy in the bundle would be a second list, and the day
- * the two disagree the form either refuses a filable name or promises a name Wyoming will not
- * take — after the fee. The server's refusal NAMES the offending word, and the form shows it.
+ * ⚠ **Wyoming's restricted-word list is deliberately NOT here, and not served either.** It is ~80
+ * words that the backend holds (`src/formation/wyRestrictedWords.ts`), matched on letter
+ * boundaries so "Banksy" is not refused for containing "bank" — which makes the MATCHER the rule
+ * rather than the data. A copy in the bundle would be a second list, and the day the two disagree
+ * the form either refuses a filable name or promises a name Wyoming will not take, after the fee.
+ * The server's refusal NAMES the offending word, and the form shows it.
  *
- * The other rules are structural and cannot drift in the same way: three candidates, non-blank,
- * a length, a charset, an ending that is not the whole name, and no duplicates.
+ * ⚠ **The four LIMITS are no longer mirrored either.** They used to be four constants here, each
+ * with a `Mirrors …` comment naming the backend value it copied — which is a second copy with a
+ * promise attached. They come from `GET /formation/rules` now, and what stays local is only the
+ * three PURE CANONICALIZATION functions below: they are string transforms, they are what the
+ * validator has to apply before comparing anything, and a round trip cannot canonicalize a value
+ * the user is still typing.
  */
-
-/** Mirrors `NAME_OPTION_COUNT`. Wyoming refuses a taken name, and a retry is a second fee. */
-export const NAME_OPTION_COUNT = 3;
-/** Mirrors `NAME_MAX_LENGTH`. */
-export const NAME_MAX_LENGTH = 120;
-/** Mirrors `PURPOSE_MAX_LENGTH`. */
-export const PURPOSE_MAX_LENGTH = 500;
-
-/**
- * Mirrors the backend's `NAME_CHARSET`: ASCII letters, digits, space and `& ' - , . ( ) +`.
- *
- * Narrow on purpose, and the asymmetry is the reason: a name we refuse that Wyoming would have
- * taken is an annoyance with a message naming the character, while one Wyoming refuses costs a
- * fee and parks the company. Accented letters are out — the Secretary of State's published
- * standard is English letters and Arabic numerals.
- */
-const NAME_CHARSET = /^[A-Za-z0-9 &'\-,.()+]$/;
 
 /** Mirrors `canonicalizeIntakeText`: what the backend stores is what it compares. */
 export function canonicalizeIntakeText(raw: string): string {
@@ -127,13 +115,16 @@ export const emptyCompanyIntake = (): CompanyIntakeForm => ({
  * — and a company with fewer than three stored options fills the gaps with empty strings rather
  * than shortening the array, because the door requires exactly three.
  */
-export function intakeFormOf(company: {
-  nameOptions: readonly CompanyNameOption[];
-  businessPurpose: string;
-  industryLabel: string;
-}): CompanyIntakeForm {
+export function intakeFormOf(
+  company: {
+    nameOptions: readonly CompanyNameOption[];
+    businessPurpose: string;
+    industryLabel: string;
+  },
+  rules: IntakeRules = FALLBACK_INTAKE_RULES,
+): CompanyIntakeForm {
   return {
-    names: Array.from({ length: NAME_OPTION_COUNT }, (_, i) => {
+    names: Array.from({ length: rules.nameOptionCount }, (_, i) => {
       const option = company.nameOptions[i];
       return option ? `${option.name} ${option.entityTypeEnding}`.trim() : "";
     }),
@@ -147,7 +138,7 @@ export function intakeFormOf(company: {
  *
  * `industryLabel` is checked against the list the backend served, not against a bundled copy —
  * the picker's options and the door's accepted set are one array, fetched from
- * `GET /formation/industries`. An empty `known` set means the list has not arrived yet, and
+ * `GET /formation/rules`. An empty `known` set means the list has not arrived yet, and
  * nothing is claimed about the label until it does.
  *
  * A `Set` rather than an array: this function runs on every keystroke of every field, and
@@ -156,23 +147,25 @@ export function intakeFormOf(company: {
  */
 export function validateCompanyIntake(
   form: CompanyIntakeForm,
+  rules: IntakeRules = FALLBACK_INTAKE_RULES,
   known: ReadonlySet<string> = EMPTY_KNOWN,
 ): CompanyIntakeErrors {
   const names: (string | null)[] = [];
   const seen = new Map<string, number>();
+  const charset = charsetOf(rules.nameCharset);
 
-  for (let i = 0; i < NAME_OPTION_COUNT; i++) {
+  for (let i = 0; i < rules.nameOptionCount; i++) {
     const position = i + 1;
     const name = canonicalizeIntakeText(form.names[i] ?? "");
     if (!name) {
       names.push(`Enter name option ${position}. Wyoming refuses a name that is already taken, and the alternates are what let the filing proceed without a second fee.`);
       continue;
     }
-    if (name.length > NAME_MAX_LENGTH) {
-      names.push(`Keep this under ${NAME_MAX_LENGTH} characters — that is the limit Wyoming files a company name under.`);
+    if (name.length > rules.nameMaxLength) {
+      names.push(`Keep this under ${rules.nameMaxLength} characters — that is the limit Wyoming files a company name under.`);
       continue;
     }
-    const illegal = [...name].find((ch) => !NAME_CHARSET.test(ch));
+    const illegal = [...name].find((ch) => !charset.test(ch));
     if (illegal) {
       names.push(`"${illegal}" is not a character Wyoming accepts in a company name. Letters, digits, spaces and & ' - , . ( ) + only.`);
       continue;
@@ -196,8 +189,8 @@ export function validateCompanyIntake(
     names,
     businessPurpose: !purpose
       ? "Say what the company does. This is filed with it, and it is the company's own purpose — not your agent's description."
-      : purpose.length > PURPOSE_MAX_LENGTH
-        ? `Keep this under ${PURPOSE_MAX_LENGTH} characters.`
+      : purpose.length > rules.purposeMaxLength
+        ? `Keep this under ${rules.purposeMaxLength} characters.`
         : null,
     industryLabel: !industry
       ? "Choose an industry."
@@ -210,11 +203,63 @@ export function validateCompanyIntake(
 /** Shared so the two defaults are one object rather than an allocation per call. */
 const EMPTY_KNOWN: ReadonlySet<string> = new Set();
 
+/** The four served limits — everything `validateCompanyIntake` needs beyond the label set. */
+export type IntakeRules = Pick<
+  FormationRules,
+  "nameOptionCount" | "nameMaxLength" | "purposeMaxLength" | "nameCharset"
+>;
+
+/**
+ * What to enforce while `GET /formation/rules` is still in flight.
+ *
+ * A form has to validate the keystroke in front of it, and a round trip is not available for
+ * that. These are the values the backend ships today, and the failure mode of a drift is the
+ * benign one: the served rules replace them the moment they arrive, before any submit that
+ * matters — and the DOOR is the authority either way, refusing in sentences this form renders
+ * verbatim.
+ */
+export const FALLBACK_INTAKE_RULES: IntakeRules = {
+  nameOptionCount: 3,
+  nameMaxLength: 120,
+  purposeMaxLength: 500,
+  nameCharset: "A-Za-z0-9 &'\\-,.()+",
+};
+
+/**
+ * The served class body, compiled — `^[…]$`, tested ONE CHARACTER at a time, exactly as the
+ * backend's `firstIllegalNameChar` does.
+ *
+ * Cached by source string, because `validateCompanyIntake` runs on every keystroke of every field
+ * and compiling a regex per call is the kind of cost that only shows up on somebody's older
+ * laptop. A source the browser cannot compile falls back rather than throwing on a form: an
+ * exception here would take the whole step down over a character class.
+ */
+const CHARSET_CACHE = new Map<string, RegExp>();
+
+function charsetOf(source: string): RegExp {
+  const hit = CHARSET_CACHE.get(source);
+  if (hit) return hit;
+  let compiled: RegExp;
+  try {
+    compiled = new RegExp(`^[${source}]$`);
+  } catch {
+    compiled = new RegExp(`^[${FALLBACK_INTAKE_RULES.nameCharset}]$`);
+  }
+  CHARSET_CACHE.set(source, compiled);
+  return compiled;
+}
+
+/** The rules a render should use: served where the fetch has landed, bundled where it has not. */
+export function intakeRulesOf(rules: FormationRules | undefined): IntakeRules {
+  return rules ?? FALLBACK_INTAKE_RULES;
+}
+
 export function isCompanyIntakeValid(
   form: CompanyIntakeForm,
+  rules: IntakeRules = FALLBACK_INTAKE_RULES,
   known: ReadonlySet<string> = EMPTY_KNOWN,
 ): boolean {
-  const e = validateCompanyIntake(form, known);
+  const e = validateCompanyIntake(form, rules, known);
   return !e.businessPurpose && !e.industryLabel && e.names.every((n) => n === null);
 }
 

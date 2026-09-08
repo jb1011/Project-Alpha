@@ -122,7 +122,8 @@ export function forwardedRequestHeaders(joinedPath: string): readonly string[] {
 }
 
 /**
- * The PUBLIC, CACHEABLE reference route — the industry labels the create form types ahead over.
+ * The PUBLIC, CACHEABLE reference route — the intake RULES the create form enforces (the 821
+ * industry labels it types ahead over, plus the four limits it used to mirror as constants).
  *
  * One path, named beside `isDocumentDownloadPath` for the same reason that one is: "which paths
  * get which headers" is a decision, and a decision spread across a request handler is one nobody
@@ -130,7 +131,7 @@ export function forwardedRequestHeaders(joinedPath: string): readonly string[] {
  * makes a strong ETag and a day of `max-age` correct for it and wrong everywhere else.
  */
 export function isPublicReferencePath(joinedPath: string): boolean {
-  return joinedPath === "formation/industries";
+  return joinedPath === "formation/rules";
 }
 
 /** `companies/<companyId>/documents/<docId>` — the bytes route, and only it. The INDEX route

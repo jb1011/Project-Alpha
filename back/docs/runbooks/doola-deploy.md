@@ -304,7 +304,7 @@ make our own rows unedittable at our own door.
 Three surfaces read the list, and all three read the SAME array: the REST refusal and the MCP tool
 description name it CAPPED at eight plus a count (uncapped, 821 labels is an error nobody reads and
 a tool description that crowds out every other tool in an agent's context window), and A3's form
-reads it whole from **`GET /formation/industries`** — public, day-cacheable, and deliberately not a
+reads it whole from **`GET /formation/rules`** — public, day-cacheable, ETag-validated, and deliberately not a
 `/config` field, since `/config` is fetched by every page before auth and cached for the life of
 the tab.
 

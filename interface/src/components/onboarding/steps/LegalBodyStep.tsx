@@ -14,7 +14,7 @@ import {
   useCreateCompanyMutation,
   useCreateFormationPartyMutation,
   useFormationEnvironment,
-  useIndustriesQuery,
+  useFormationRulesQuery,
   usePublicConfigQuery,
   useRetryPublicConfig,
 } from "@/lib/api/hooks";
@@ -27,6 +27,7 @@ import type { CompanyView } from "@/lib/api/types";
 import {
   companyLabel,
   industryIndex,
+  intakeRulesOf,
   isCompanyIntakeValid,
   legalBodyBranch,
   validateCompanyIntake,
@@ -158,17 +159,20 @@ export function LegalBodyStep({
     // Number — and watched it be replaced by a picker the moment the list arrived.
   } = legalBodyBranch(companies.data?.companies, mode, picked);
 
-  const industriesQuery = useIndustriesQuery(resolved && effectiveMode === "create");
+  // THE INTAKE RULES, from the backend that enforces them — the labels AND the four limits this
+  // form used to mirror as constants of its own.
+  const rulesQuery = useFormationRulesQuery(resolved && effectiveMode === "create");
+  const rules = intakeRulesOf(rulesQuery.data);
   // ONE pass over the 821 labels, when they arrive and not again — see `industryIndex`. The
   // dependency is the QUERY's array (a stable reference between renders), never a fresh `?? []`,
   // which would rebuild the index on every keystroke and defeat the memo entirely.
   const industries = useMemo(
-    () => industryIndex(industriesQuery.data?.industries),
-    [industriesQuery.data?.industries],
+    () => industryIndex(rulesQuery.data?.industries),
+    [rulesQuery.data?.industries],
   );
 
   const partyErrors = validateParty(party);
-  const intakeErrors = validateCompanyIntake(intake, industries.known);
+  const intakeErrors = validateCompanyIntake(intake, rules, industries.known);
   const busy = createParty.isPending || createCompany.isPending;
 
   function setPartyField<K extends keyof FormationParty>(key: K, value: FormationParty[K]) {
@@ -184,7 +188,7 @@ export function LegalBodyStep({
    */
   async function create(syntheticParty: boolean) {
     setShowErrors(true);
-    if (!isCompanyIntakeValid(intake, industries.known)) return;
+    if (!isCompanyIntakeValid(intake, rules, industries.known)) return;
     if (!syntheticParty && !isPartyValid(party)) return;
     setError(null);
     try {
@@ -275,7 +279,7 @@ export function LegalBodyStep({
                     errors={intakeErrors}
                     showErrors={showErrors}
                     industries={industries}
-                    loading={industriesQuery.isPending}
+                    loading={rulesQuery.isPending}
                     idPrefix="company"
                     onChange={onIntake}
                   />

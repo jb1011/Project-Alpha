@@ -1,14 +1,36 @@
 import { createHash } from "node:crypto";
 import type { Hono } from "hono";
+import {
+  NAME_CHARSET_SOURCE,
+  NAME_MAX_LENGTH,
+  NAME_OPTION_COUNT,
+  PURPOSE_MAX_LENGTH,
+} from "../../formation/intake";
 import { NAICS_LABELS } from "../../formation/naicsLabels";
 
 /**
- * `GET /formation/industries` — the industry labels a company may be filed under (design §5/§7).
+ * `GET /formation/rules` — THE INTAKE RULES, as the backend actually holds them (design §5/§7).
  *
- * A3's create-company form is a type-ahead over 821 federal labels, and it has to get them from
- * somewhere. The three candidates were: hard-code them in the bundle (two copies of a partner's
- * reference table, and the browser's copy is the one nobody re-runs the refresher against), put
- * them on `/config`, or serve them here.
+ * It began as `/formation/industries`, serving the one field that obviously could not be
+ * hard-coded. The four rules beside it were hard-coded anyway: the interface carried its own
+ * `NAME_OPTION_COUNT = 3`, `NAME_MAX_LENGTH = 120`, `PURPOSE_MAX_LENGTH = 500` and a re-typed
+ * character class, each with a `/** Mirrors … *\/` comment naming the constant it mirrored.
+ *
+ * A mirror is a second copy with a promise attached. The day one moves, the form either refuses a
+ * name the door would take — an annoyance — or PROMISES one the door refuses, after the founder
+ * has typed three of them. Serving them costs four scalars on a response that already carries
+ * 20 KB of labels, and it removes the promise entirely: there is one definition, and the browser
+ * reads it.
+ *
+ * What is NOT served, deliberately: Wyoming's ~80 restricted words. That list is matched on
+ * letter boundaries (so "Banksy" is not refused for containing "bank"), the matcher is the rule
+ * rather than the data, and shipping the words without it would produce a client-side check that
+ * disagrees with the server's in both directions. The server's refusal NAMES the offending word
+ * and the form shows it.
+ *
+ * The three candidates for the LABELS were: hard-code them in the bundle (two copies of a
+ * partner's reference table, and the browser's copy is the one nobody re-runs the refresher
+ * against), put them on `/config`, or serve them here.
  *
  * **Not `/config`.** That route is fetched by every page in the interface — the landing page
  * included — before auth, and cached for the life of the tab (`staleTime: Infinity`). 821 labels
@@ -35,7 +57,17 @@ import { NAICS_LABELS } from "../../formation/naicsLabels";
  * cheapest possible thing to get wrong: the answer cannot change without a redeploy, so the work
  * belongs at load time, not per request.
  */
-const INDUSTRIES_BODY = JSON.stringify({ industries: NAICS_LABELS });
+const RULES_BODY = JSON.stringify({
+  industries: NAICS_LABELS,
+  // The four the interface used to mirror. Scalars, on a response that already carries the list.
+  nameOptionCount: NAME_OPTION_COUNT,
+  nameMaxLength: NAME_MAX_LENGTH,
+  purposeMaxLength: PURPOSE_MAX_LENGTH,
+  // A character-CLASS BODY, not a pattern: the client compiles `^[…]$` around it and tests one
+  // character at a time, exactly as `firstIllegalNameChar` does. Handing over a whole pattern
+  // would hand over an anchor and a quantifier the client did not choose.
+  nameCharset: NAME_CHARSET_SOURCE,
+});
 
 /**
  * A STRONG ETag over that exact body.
@@ -49,22 +81,22 @@ const INDUSTRIES_BODY = JSON.stringify({ industries: NAICS_LABELS });
  * It is a hash of the body rather than a version string, so it changes when and only when the
  * bytes do: `refresh-naics.mts` cannot forget to bump it.
  */
-export const INDUSTRIES_ETAG = `"${createHash("sha256").update(INDUSTRIES_BODY).digest("hex").slice(0, 32)}"`;
+export const FORMATION_RULES_ETAG = `"${createHash("sha256").update(RULES_BODY).digest("hex").slice(0, 32)}"`;
 
-export function mountIndustryRoutes(
+export function mountFormationRulesRoutes(
   // biome-ignore lint/suspicious/noExplicitAny: intentional — this route is env-agnostic
   app: Hono<any>,
 ) {
-  app.get("/formation/industries", (c) => {
+  app.get("/formation/rules", (c) => {
     c.header("Cache-Control", "public, max-age=86400");
-    c.header("ETag", INDUSTRIES_ETAG);
+    c.header("ETag", FORMATION_RULES_ETAG);
     // The conditional request. A 304 carries NO body by definition, and the headers above are
     // already set — which is what a client revalidating after `max-age` needs to hear.
-    if (c.req.header("if-none-match") === INDUSTRIES_ETAG) return c.body(null, 304);
+    if (c.req.header("if-none-match") === FORMATION_RULES_ETAG) return c.body(null, 304);
     // The array as shipped, in the order doola published it — the picker sorts nothing for
     // itself, and the ORDER is part of what `describeIndustryLabels` caps for the two text
     // surfaces, so three renderers reading one array is what keeps them describing one list.
     c.header("Content-Type", "application/json");
-    return c.body(INDUSTRIES_BODY);
+    return c.body(RULES_BODY);
   });
 }

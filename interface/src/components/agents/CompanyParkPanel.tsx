@@ -10,6 +10,7 @@ import type { CompanyDetailView } from "@/lib/api/types";
 import {
   industryIndex,
   intakeFormOf,
+  intakeRulesOf,
   isCompanyIntakeValid,
   validateCompanyIntake,
   type CompanyIntakeForm,
@@ -23,7 +24,7 @@ import {
   Callout,
   Card,
 } from "@/components/onboarding/primitives";
-import { useIndustriesQuery } from "@/lib/api/hooks";
+import { useFormationRulesQuery } from "@/lib/api/hooks";
 import { formationCopyOf } from "@/lib/formation/copy";
 
 /**
@@ -96,10 +97,11 @@ function ParkCard({
 /* ── awaitingIntakeEdit: `PATCH /companies/:id` ───────────────────────────── */
 
 function IntakeEditForm({ company }: { company: CompanyDetailView }) {
-  const industriesQuery = useIndustriesQuery();
+  const rulesQuery = useFormationRulesQuery();
+  const rules = intakeRulesOf(rulesQuery.data);
   const industries = useMemo(
-    () => industryIndex(industriesQuery.data?.industries),
-    [industriesQuery.data?.industries],
+    () => industryIndex(rulesQuery.data?.industries),
+    [rulesQuery.data?.industries],
   );
   const update = useUpdateCompanyIntakeMutation(company.companyId);
   // Pre-filled from what was FILED, so a caller fixes the one field the provider objected to
@@ -109,11 +111,11 @@ function IntakeEditForm({ company }: { company: CompanyDetailView }) {
   const [form, setForm] = useState<CompanyIntakeForm>(() => intakeFormOf(company));
   const [showErrors, setShowErrors] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const errors = validateCompanyIntake(form, industries.known);
+  const errors = validateCompanyIntake(form, rules, industries.known);
 
   async function submit() {
     setShowErrors(true);
-    if (!isCompanyIntakeValid(form, industries.known)) return;
+    if (!isCompanyIntakeValid(form, rules, industries.known)) return;
     setError(null);
     try {
       await update.mutateAsync({
@@ -133,7 +135,7 @@ function IntakeEditForm({ company }: { company: CompanyDetailView }) {
         errors={errors}
         showErrors={showErrors}
         industries={industries}
-        loading={industriesQuery.isPending}
+        loading={rulesQuery.isPending}
         idPrefix="edit"
         onChange={setForm}
       />

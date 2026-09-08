@@ -114,7 +114,18 @@ export const PURPOSE_MAX_LENGTH = 500;
  * Accented letters are OUT for the same reason — the Secretary of State's published standard is
  * English letters and Arabic numerals, and a canonicalized "Café" would be filed as typed.
  */
-const NAME_CHARSET = /^[A-Za-z0-9 &'\-,.()+]*$/;
+/**
+ * The class body, as a SOURCE STRING — so `GET /formation/rules` can serve it and the browser can
+ * compile the same rule rather than keeping a second copy of it (§5/§7).
+ *
+ * A string rather than the `RegExp` because a regex does not survive JSON, and the CLASS BODY
+ * rather than a whole pattern because the client must not be handed an anchor, a flag set or a
+ * quantifier it did not choose: it compiles `^[…]$` around this and tests one character at a
+ * time, exactly as `firstIllegalNameChar` does below.
+ */
+export const NAME_CHARSET_SOURCE = "A-Za-z0-9 &'\\-,.()+";
+
+const NAME_CHARSET = new RegExp(`^[${NAME_CHARSET_SOURCE}]*$`);
 
 /** The first character the charset refuses, or null. Returned rather than a boolean so the
  *  refusal can name it. */

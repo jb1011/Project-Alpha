@@ -78,10 +78,10 @@ test("content-length is dropped beside a content-encoding — a lying length TRU
 /* ── the public reference route (§7, A3) ───────────────────────────────────── */
 
 test("the industry list is the ONE public cacheable path, and nothing near it is", () => {
-  expect(isPublicReferencePath("formation/industries")).toBe(true);
+  expect(isPublicReferencePath("formation/rules")).toBe(true);
   // Anchored: a prefix is not a match, and neither is anything under it.
-  expect(isPublicReferencePath("formation/industries/extra")).toBe(false);
-  expect(isPublicReferencePath("x/formation/industries")).toBe(false);
+  expect(isPublicReferencePath("formation/rules/extra")).toBe(false);
+  expect(isPublicReferencePath("x/formation/rules")).toBe(false);
   expect(isPublicReferencePath("formation-party")).toBe(false);
   expect(isPublicReferencePath("companies")).toBe(false);
 });
@@ -89,18 +89,18 @@ test("the industry list is the ONE public cacheable path, and nothing near it is
 test("`if-none-match` crosses on that path ONLY — otherwise the ETag is decorative", () => {
   // Dropping it means the browser holds a validator it can never send, so every revalidation
   // after `max-age` re-downloads ~20 KB of federal labels to learn they have not changed.
-  expect(forwardedRequestHeaders("formation/industries")).toContain("if-none-match");
+  expect(forwardedRequestHeaders("formation/rules")).toContain("if-none-match");
   expect(forwardedRequestHeaders("companies")).not.toContain("if-none-match");
   // …and the global list is intact on both.
   for (const header of FORWARDED_REQUEST_HEADERS) {
-    expect(forwardedRequestHeaders("formation/industries")).toContain(header);
+    expect(forwardedRequestHeaders("formation/rules")).toContain(header);
     expect(forwardedRequestHeaders("companies")).toContain(header);
   }
 });
 
 test("`etag` and `cache-control` come BACK on that path, and `cache-control` on no other", () => {
   const headers = new Headers();
-  const reference = forwardedResponseHeaders("formation/industries", headers);
+  const reference = forwardedResponseHeaders("formation/rules", headers);
   expect(reference).toContain("etag");
   expect(reference).toContain("cache-control");
   // Echoing a backend `cache-control` onto every route would silently override the proxy's own
@@ -111,7 +111,7 @@ test("`etag` and `cache-control` come BACK on that path, and `cache-control` on 
 
 test("the reference route never picks up the DOCUMENT headers, or vice versa", () => {
   const headers = new Headers();
-  expect(forwardedResponseHeaders("formation/industries", headers)).not.toContain(
+  expect(forwardedResponseHeaders("formation/rules", headers)).not.toContain(
     "content-disposition",
   );
   expect(forwardedResponseHeaders("companies/abc/documents/def", headers)).toContain(
@@ -119,5 +119,5 @@ test("the reference route never picks up the DOCUMENT headers, or vice versa", (
   );
   // …and the document route is still forced to `no-store` by the second lock.
   expect(isNoStorePath("companies/abc/documents/def")).toBe(true);
-  expect(isNoStorePath("formation/industries")).toBe(false);
+  expect(isNoStorePath("formation/rules")).toBe(false);
 });

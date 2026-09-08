@@ -21,6 +21,6 @@ export const apiKeys = {
   company: (token: string, id: string) => [...apiKeys.all, "company", token, id] as const,
   companyCompliance: (token: string, id: string) =>
     [...apiKeys.all, "companyCompliance", token, id] as const,
-  /** PUBLIC and token-free: a build-time reference table that is the same for everybody. */
-  industries: () => [...apiKeys.all, "industries"] as const,
+  /** PUBLIC and token-free: build-time rules that are the same for everybody. */
+  formationRules: () => [...apiKeys.all, "formationRules"] as const,
 };

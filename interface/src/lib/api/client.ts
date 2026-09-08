@@ -9,6 +9,7 @@ import type {
   Capability,
   CompanyDetailView,
   CompanyIntakeInput,
+  FormationRules,
   CompanyIntakeUpdate,
   CompanyView,
   ComplianceView,
@@ -165,8 +166,17 @@ export async function createFormationParty(
  * cached for the life of the tab. The picker validates against what this returns, and the door
  * validates against the same array, so a form cannot offer a label the create would refuse.
  */
-export async function listIndustries(): Promise<{ industries: string[] }> {
-  return request("/formation/industries");
+/**
+ * THE INTAKE RULES — the industry labels, and the four limits the form enforces (§5/§7).
+ *
+ * It was `/formation/industries`, serving the one field that obviously could not be hard-coded
+ * while the four beside it were hard-coded anyway, each with a `Mirrors …` comment naming the
+ * backend constant it copied. A mirror is a second copy with a promise attached: the day one
+ * moves, this form either refuses a name the door would take, or PROMISES one the door refuses —
+ * after a founder has typed three of them.
+ */
+export async function fetchFormationRules(): Promise<FormationRules> {
+  return request("/formation/rules");
 }
 
 /**

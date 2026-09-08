@@ -14,8 +14,8 @@
  */
 import { expect, test } from "vitest";
 import {
-  NAME_MAX_LENGTH,
-  PURPOSE_MAX_LENGTH,
+  FALLBACK_INTAKE_RULES,
+  intakeRulesOf,
   canAttach,
   companyLabel,
   duplicateKey,
@@ -32,6 +32,19 @@ import type { CompanyState, CompanyView } from "@/lib/api/types";
 /** The picker's options and the door's accepted set are one list — held as a SET since A3,
  *  because the validator runs on every keystroke of every field. */
 const KNOWN = new Set(["Software development", "Consulting"]);
+/**
+ * The SERVED rules, as `GET /formation/rules` answers them.
+ *
+ * The four used to be constants in this bundle, each with a `Mirrors …` comment naming the
+ * backend value it copied — a second copy with a promise attached. These tests now assert against
+ * the served values, so a limit that moves on the backend moves here too.
+ */
+const RULES = {
+  nameOptionCount: 3,
+  nameMaxLength: 120,
+  purposeMaxLength: 500,
+  nameCharset: "A-Za-z0-9 &'\\-,.()+",
+};
 const VALID = {
   names: ["Acme Robotics", "Acme Automata", "Acme Mechanicals"],
   businessPurpose: "Operating autonomous software agents.",
@@ -39,14 +52,14 @@ const VALID = {
 };
 
 test("the happy path passes, and an empty form does not", () => {
-  expect(isCompanyIntakeValid(VALID, KNOWN)).toBe(true);
-  expect(isCompanyIntakeValid(emptyCompanyIntake(), KNOWN)).toBe(false);
+  expect(isCompanyIntakeValid(VALID, RULES, KNOWN)).toBe(true);
+  expect(isCompanyIntakeValid(emptyCompanyIntake(), RULES, KNOWN)).toBe(false);
 });
 
 test("all THREE candidates are required, and each error lands under its own field", () => {
   // Wyoming refuses a name that is already taken, and a retry is a second fee — the alternates
   // are the whole reason the form asks for three.
-  const errors = validateCompanyIntake({ ...VALID, names: ["Acme Robotics", "", "  "] }, KNOWN);
+  const errors = validateCompanyIntake({ ...VALID, names: ["Acme Robotics", "", "  "] }, RULES, KNOWN);
   expect(errors.names[0]).toBeNull();
   expect(errors.names[1]).toMatch(/Enter name option 2/);
   expect(errors.names[2]).toMatch(/Enter name option 3/);
@@ -55,13 +68,13 @@ test("all THREE candidates are required, and each error lands under its own fiel
 test("the charset NAMES the character it refused", () => {
   // The asymmetry: a name we refuse that Wyoming would have taken is an annoyance, and the
   // message is what makes it a fixable one. A name Wyoming refuses costs a fee.
-  const errors = validateCompanyIntake({ ...VALID, names: ["Café Robotics", "B", "C"] }, KNOWN);
+  const errors = validateCompanyIntake({ ...VALID, names: ["Café Robotics", "B", "C"] }, RULES, KNOWN);
   expect(errors.names[0]).toContain('"é"');
 });
 
 test("a name that is ONLY an entity ending is refused — it would be filed as \"LLC LLC\"", () => {
   for (const only of ["LLC", "l.l.c.", "  LLC  "])
-    expect(validateCompanyIntake({ ...VALID, names: [only, "B", "C"] }, KNOWN).names[0], only).toMatch(
+    expect(validateCompanyIntake({ ...VALID, names: [only, "B", "C"] }, RULES, KNOWN).names[0], only).toMatch(
       /entity ending/,
     );
   // …and the helper it rests on, which is the backend's `stripEntityEnding` behaviour: a bare
@@ -75,6 +88,7 @@ test("DUPLICATES are caught in the form Wyoming would compare them in", () => {
   // three candidates that are really one leave the filing with no fallback at all.
   const errors = validateCompanyIntake(
     { ...VALID, names: ["Acme Robotics", "Acme Robotics LLC", "Acme  Robotics"] },
+    RULES,
     KNOWN,
   );
   expect(errors.names[0]).toBeNull();
@@ -85,27 +99,27 @@ test("DUPLICATES are caught in the form Wyoming would compare them in", () => {
 
 test("the length bounds are the backend's, and they are checked after the blank check", () => {
   expect(
-    validateCompanyIntake({ ...VALID, names: ["A".repeat(NAME_MAX_LENGTH + 1), "B", "C"] }, KNOWN)
+    validateCompanyIntake({ ...VALID, names: ["A".repeat(RULES.nameMaxLength + 1), "B", "C"] }, RULES, KNOWN)
       .names[0],
-  ).toContain(String(NAME_MAX_LENGTH));
+  ).toContain(String(RULES.nameMaxLength));
   expect(
-    validateCompanyIntake({ ...VALID, businessPurpose: "x".repeat(PURPOSE_MAX_LENGTH + 1) }, KNOWN)
+    validateCompanyIntake({ ...VALID, businessPurpose: "x".repeat(RULES.purposeMaxLength + 1) }, RULES, KNOWN)
       .businessPurpose,
-  ).toContain(String(PURPOSE_MAX_LENGTH));
+  ).toContain(String(RULES.purposeMaxLength));
 });
 
 test("the industry is checked against the SERVED list, and nothing is claimed before it arrives", () => {
   // The picker's options and the door's accepted set are ONE array, fetched from
-  // `GET /formation/industries`. An unlisted label reaches doola and comes back rejected on a
+  // `GET /formation/rules`. An unlisted label reaches doola and comes back rejected on a
   // real fee, so the form refuses it — but only once it knows what the list is.
-  expect(validateCompanyIntake({ ...VALID, industryLabel: "Interpretive Dance" }, KNOWN).industryLabel)
+  expect(validateCompanyIntake({ ...VALID, industryLabel: "Interpretive Dance" }, RULES, KNOWN).industryLabel)
     .toMatch(/listed industries/);
-  expect(validateCompanyIntake({ ...VALID, industryLabel: "" }, KNOWN).industryLabel).toMatch(
+  expect(validateCompanyIntake({ ...VALID, industryLabel: "" }, RULES, KNOWN).industryLabel).toMatch(
     /Choose an industry/,
   );
   // Empty list = the fetch has not landed. Refusing here would refuse every label on a slow box.
   expect(
-    validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, new Set()).industryLabel,
+    validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, RULES, new Set()).industryLabel,
   ).toBeNull();
 });
 
@@ -114,7 +128,7 @@ test("Wyoming's RESTRICTED WORDS are deliberately not checked here", () => {
   // for containing "bank". A copy in this bundle would be a second list, and the day the two
   // disagree the form either refuses a filable name or promises one Wyoming will not take — after
   // the fee. The server's refusal names the offending word, and the form renders it.
-  expect(validateCompanyIntake({ ...VALID, names: ["Acme Bank", "B Works", "C Works"] }, KNOWN)
+  expect(validateCompanyIntake({ ...VALID, names: ["Acme Bank", "B Works", "C Works"] }, RULES, KNOWN)
     .names[0]).toBeNull();
 });
 
@@ -255,7 +269,7 @@ test("INDEX: an unarrived list is an EMPTY index, not a null one", () => {
   expect(index.known.size).toBe(0);
   // …and nothing is claimed about a label until it arrives.
   expect(
-    validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, index.known).industryLabel,
+    validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, RULES, index.known).industryLabel,
   ).toBeNull();
 });
 
@@ -277,7 +291,7 @@ test("INTAKE FORM: a stored row becomes exactly three whole-string candidates", 
   expect(form.businessPurpose).toBe("Operating autonomous software agents.");
   expect(form.industryLabel).toBe("Software development");
   // …and it round-trips: what the form shows is a body the door accepts.
-  expect(isCompanyIntakeValid(form, new Set(["Software development"]))).toBe(true);
+  expect(isCompanyIntakeValid(form, RULES, new Set(["Software development"]))).toBe(true);
 });
 
 test("INTAKE FORM: a row with fewer than three options fills the gaps, never shortens", () => {
@@ -289,4 +303,74 @@ test("INTAKE FORM: a row with fewer than three options fills the gaps, never sho
     industryLabel: "Software development",
   });
   expect(form.names).toEqual(["Only One LLC", "", ""]);
+});
+
+/* ── the rules come from the SERVER (§5/§7) ────────────────────────────────── */
+
+test("RULES: the limits enforced are the SERVED ones, not a bundled copy", () => {
+  // The whole point of the rename from `/formation/industries` to `/formation/rules`. If a limit
+  // moves on the backend, the form moves with it — where a mirrored constant would keep promising
+  // the old one until somebody noticed.
+  const served = { ...RULES, nameMaxLength: 8, purposeMaxLength: 5 };
+  const errors = validateCompanyIntake(
+    { names: ["Acme Robotics", "B Works", "C Works"], businessPurpose: "way too long", industryLabel: "Software development" },
+    served,
+    KNOWN,
+  );
+  expect(errors.names[0]).toMatch(/under 8 characters/);
+  expect(errors.businessPurpose).toMatch(/under 5 characters/);
+  // …and the same form against the real limits is fine.
+  expect(
+    validateCompanyIntake(
+      { names: ["Acme Robotics", "B Works", "C Works"], businessPurpose: "way too long", industryLabel: "Software development" },
+      RULES,
+      KNOWN,
+    ).businessPurpose,
+  ).toBeNull();
+});
+
+test("RULES: the CHARSET is the served class body, compiled and tested per character", () => {
+  // A class BODY, never a whole pattern: the client adds its own `^[…]$` so it cannot be handed
+  // an anchor or a quantifier it did not choose.
+  const strict = { ...RULES, nameCharset: "A-Z " };
+  expect(
+    validateCompanyIntake({ ...VALID, names: ["ACME ROBOTICS", "B", "C"] }, strict, KNOWN).names[0],
+  ).toBeNull();
+  expect(
+    validateCompanyIntake({ ...VALID, names: ["Acme Robotics", "B", "C"] }, strict, KNOWN).names[0],
+  ).toContain('"c"');
+});
+
+test("RULES: an uncompilable charset falls back instead of throwing on a form", () => {
+  // An exception in a validator that runs on every keystroke takes the whole step down. A source
+  // the browser cannot compile is a backend problem, and the form's job is to keep working.
+  // A reversed range: /^[z-a]$/ is a SyntaxError in every engine.
+  const broken = { ...RULES, nameCharset: "z-a" };
+  expect(() => validateCompanyIntake(VALID, broken, KNOWN)).not.toThrow();
+  expect(validateCompanyIntake(VALID, broken, KNOWN).names[0]).toBeNull();
+});
+
+test("RULES: the count of name options is served too — three is not hard-coded", () => {
+  const two = { ...RULES, nameOptionCount: 2 };
+  expect(validateCompanyIntake({ ...VALID, names: ["A Works", "B Works"] }, two, KNOWN).names).toHaveLength(2);
+  expect(intakeFormOf({ nameOptions: [], businessPurpose: "p", industryLabel: "i" }, two).names).toEqual(["", ""]);
+});
+
+test("RULES: nothing served has landed yet — the bundled fallback keeps the form working", () => {
+  // A form has to validate the keystroke in front of it, and a round trip is not available for
+  // that. The DOOR is the authority either way, and the served rules replace these the moment
+  // they arrive.
+  expect(intakeRulesOf(undefined)).toEqual(FALLBACK_INTAKE_RULES);
+  expect(FALLBACK_INTAKE_RULES.nameOptionCount).toBe(3);
+  expect(isCompanyIntakeValid(VALID, intakeRulesOf(undefined), KNOWN)).toBe(true);
+});
+
+test("Wyoming's restricted words are not in the bundle and are not served", async () => {
+  // ~80 words matched on LETTER boundaries, so "Banksy" is not refused for containing "bank" —
+  // the MATCHER is the rule, not the data. A client copy would disagree with the server in both
+  // directions; the server's refusal names the word and this form renders it verbatim.
+  const source = await import("@/lib/formation/companyIntake");
+  const printed = JSON.stringify(Object.keys(source));
+  for (const word of ["restricted", "wyRestricted"]) expect(printed).not.toContain(word);
+  expect(validateCompanyIntake({ ...VALID, names: ["Acme Bank", "B Works", "C Works"] }, RULES, KNOWN).names[0]).toBeNull();
 });
