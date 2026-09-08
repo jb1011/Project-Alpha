@@ -679,9 +679,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
 
   // AgentBook (design 2026-08-25 v3 §4.2). The submitter is a SINGLE-PURPOSE key holding World
-  // Chain gas: sharing it with ANY other configured key would put a key that signs elsewhere —
-  // USDC on Arc, resolver answers, every derived pocket — into a hot path on another chain.
-  // Checked in EVERY environment: the reuse is exactly as wrong on a dev box.
+  // Chain gas: sharing it with ANY other configured SIGNING key would put a key that signs
+  // elsewhere — USDC on Arc, resolver answers, every derived pocket — into a hot path on another
+  // chain. Checked in EVERY environment: the reuse is exactly as wrong on a dev box.
   if (cfg.agentBook) {
     const others: Array<[string, string | undefined]> = [
       ["PLATFORM_PRIVATE_KEY", cfg.platformPrivateKey],
@@ -986,6 +986,11 @@ export function redact(cfg: Config): Record<string, unknown> {
     },
     ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
     world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
+    // The READ endpoint, redacted for the same reason as the write one: .env.example tells
+    // operators to replace the shared public default with their own, and "their own" is an
+    // Alchemy/Infura URL with the API key in the path. It is also where `agentBook.rpcUrl`
+    // comes from whenever WORLDCHAIN_SUBMITTER_RPC is unset, so leaving it would undo that.
+    worldChain: cfg.worldChain ? { ...cfg.worldChain, rpcUrl: "REDACTED" } : undefined,
     turnkey: cfg.turnkey
       ? {
           ...cfg.turnkey,

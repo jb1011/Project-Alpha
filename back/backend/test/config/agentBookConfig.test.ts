@@ -17,6 +17,14 @@ const WORLD = {
   WORLD_RP_ID: "app.example",
   WORLD_RP_SIGNING_KEY: "0xsigning",
 };
+/** What the production block's OWN guards need, so the only thing a prod load can fail on here is
+ *  the AgentBook invariant. */
+const PROD = {
+  NODE_ENV: "production",
+  AUTH_JWT_SECRET: "a-real-secret-at-least-16",
+  WEB_ORIGIN: "https://app.example",
+  METADATA_BASE_URL: "https://api.example",
+};
 
 test("absent key: no agentBook block, registration unavailable", () => {
   const cfg = loadConfig(BASE);
@@ -63,11 +71,18 @@ test("the submitter key may never equal another key material var either", () => 
   ).toThrow(/WORLDCHAIN_SUBMITTER_PRIVATE_KEY must not equal ENS_GATEWAY_SIGNER_KEY/);
 });
 
-test("redact hides the key and keeps the rpcUrl field", () => {
+// Half-configured in production is worse than absent: the key sits funded while the surface it
+// pays for stays unmounted. Everywhere else the same shape is a legitimate work-in-progress.
+test("production refuses a submitter key with no World portal block", () => {
+  expect(() => loadConfig({ ...BASE, ...PROD, WORLDCHAIN_SUBMITTER_PRIVATE_KEY: KEY })).toThrow(
+    /WORLD_\*|portal/,
+  );
+});
+
+test("redact replaces the whole agentBook block", () => {
   const cfg = loadConfig({ ...BASE, ...WORLD, WORLDCHAIN_SUBMITTER_PRIVATE_KEY: KEY });
-  const out = JSON.stringify(redact(cfg));
-  expect(out).not.toContain(KEY);
-  expect(out).toContain('"rpcUrl"');
+  expect(JSON.stringify(redact(cfg))).not.toContain(KEY);
+  expect(redact(cfg).agentBook).toEqual({ submitterPrivateKey: "REDACTED", rpcUrl: "REDACTED" });
 });
 
 // A dedicated write endpoint is normally an Alchemy/Infura URL with the API key in the path — the
@@ -79,7 +94,20 @@ test("redact hides a dedicated write RPC's embedded credential", () => {
     WORLDCHAIN_SUBMITTER_PRIVATE_KEY: KEY,
     WORLDCHAIN_SUBMITTER_RPC: "https://paid.example/v2/sekrit-key-123",
   });
-  const out = JSON.stringify(redact(cfg));
-  expect(out).toContain('"rpcUrl"');
-  expect(out).not.toContain("sekrit-key-123");
+  expect(JSON.stringify(redact(cfg))).not.toContain("sekrit-key-123");
+  expect(redact(cfg).agentBook).toEqual({ submitterPrivateKey: "REDACTED", rpcUrl: "REDACTED" });
+});
+
+// With no dedicated write RPC the submitter writes through WORLD_CHAIN_RPC, so redacting only the
+// write endpoint would leak the same credential from `worldChain` — where it is a paid endpoint
+// just as often, because .env.example tells operators to replace the shared public default.
+test("redact hides the read RPC's embedded credential too", () => {
+  const cfg = loadConfig({
+    ...BASE,
+    ...WORLD,
+    WORLD_CHAIN_RPC: "https://paid.example/v2/read-sekrit-456",
+    WORLDCHAIN_SUBMITTER_PRIVATE_KEY: KEY,
+  });
+  expect(cfg.agentBook?.rpcUrl).toBe("https://paid.example/v2/read-sekrit-456");
+  expect(JSON.stringify(redact(cfg))).not.toContain("read-sekrit-456");
 });
