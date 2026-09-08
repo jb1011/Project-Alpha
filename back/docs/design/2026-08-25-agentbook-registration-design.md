@@ -463,9 +463,13 @@ replaced while the monitor rule is deferred (§6).
 
 "Details" expands to the v2 paragraphs, verbatim:
 
+✎✎ **v3.1 (2026-09-08).** One sentence changed: "Sellers who check AgentBook will see this agent as
+human-backed" is replaced by the permitted claim below — §5.4 bans that phrase everywhere, and the
+shipped dialog (`VouchDialog.tsx`) carries the replacement. Nothing else in §5.1 changed.
+
 > **What this does.** It writes a record in AgentBook, a public registry on World Chain, saying that
 > a World ID verified human stands behind this agent's payment address. Sellers who check AgentBook
-> will see this agent as human-backed.
+> will see that a World ID verified human has vouched for this agent's payment address.
 >
 > **What becomes public, forever.** A pseudonym derived from your World ID is published on a public
 > blockchain, linked to this address. It does not reveal your name. But it is the same pseudonym
