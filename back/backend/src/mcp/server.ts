@@ -686,13 +686,25 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
    * The identity travels in its OWN tool call, never inside `spec` — spec_json is persisted and
    * rendered — and the response is the handle alone: echoing the stored identity back would put
    * PII in a tool result, a transcript, and any client that logs them.
+   *
+   * ⚠ It DECLARES `ssn` IN ORDER TO REFUSE IT (§4.1), exactly like `create_company` and
+   * `update_company_party`. This is the door a model reaches with an identity in hand, so it is
+   * the likeliest of the three to be handed one — and an UNDECLARED field is not rejected by the
+   * SDK, it is silently STRIPPED by the tool's zod parse before the handler runs. A model that
+   * read "US persons should supply an SSN" on the web form and helpfully passed one here got back
+   * a partyId, with the number thrown away and still sitting in the client's context window and
+   * its logs, which is the entire harm §4.1 exists to prevent.
+   *
+   * Where it DOES belong: an SSN is sealed under an AAD of `party_id || company_id`, so it is
+   * captured by `POST /companies` (which mints the pair) and re-captured by
+   * `PATCH /companies/:companyId`. Never here, and never over MCP at all.
    */
   if (deps.formation)
     server.registerTool(
       "create_formation_party",
       {
         title: "Create formation party",
-        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to create_company. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in create_company's arguments and never in onboard_agent's spec. A real party requires legalFirstName, legalLastName, email, PHONE and address (doola will not file a responsible party without a phone number). The response contains the handle and nothing else.`,
+        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to create_company. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in create_company's arguments and never in onboard_agent's spec. A real party requires legalFirstName, legalLastName, email, PHONE and address (doola will not file a responsible party without a phone number). ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs; the field is declared only so that passing one is REFUSED rather than silently dropped. An SSN is collected only by the web form (POST /companies), which mints the (party, company) pair it is sealed under. The response contains the handle and nothing else.`,
         inputSchema: {
           /** The sandbox shortcut: no personal data at all. */
           synthetic: z.boolean().optional(),
@@ -704,15 +716,23 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
            *  a responsible party with no phone. */
           phone: z.string().optional(),
           address: z.record(z.unknown()).optional(),
+          /** ⚠ DECLARED IN ORDER TO BE REFUSED (§4.1) — see the block comment above. */
+          ssn: z.string().optional(),
         },
       },
       async (args) => {
         // "provision" — the same rung onboard_agent sits on, and for the same reason: this call
-        // is a step of provisioning a legal body, and it commits the tenant to a real filing.
-        const denied = requireProvisionTenantWide(scope);
+        // is a step of provisioning a legal body, and it commits the tenant to a real filing. Then
+        // the ssn, BEFORE anything is created, so the refusal is the whole answer and nothing
+        // exists afterwards for the caller to clean up. Same order, same sentence, as the other
+        // two PII doors.
+        const denied = requireProvisionTenantWide(scope) ?? refuseSsn(args);
         if (denied) return denied;
         try {
-          const { synthetic, ...body } = args as Record<string, unknown>;
+          // `ssn` is destructured OUT as well as refused above: `FormationPartySchema` is
+          // `.strict()`, so a key that reached it would be a validation error rather than the
+          // sentence that says where the field belongs.
+          const { synthetic, ssn: _ssn, ...body } = args as Record<string, unknown>;
           // The synthetic shortcut carries no PII, so it is never parsed as a party body.
           const parsed = synthetic === true ? undefined : FormationPartySchema.parse(body);
           const result = createFormationParty(

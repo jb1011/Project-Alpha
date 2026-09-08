@@ -213,6 +213,42 @@ test("C6: create_formation_party refuses a real party with no phone, exactly as 
   expect(db.prepare("SELECT COUNT(*) AS n FROM formation_parties").get()).toEqual({ n: 0 });
 });
 
+test("an `ssn` argument is REFUSED here too, and NOTHING is created", async () => {
+  // The A2 finding-1 class, on the THIRD PII door — and the likeliest of the three to be handed
+  // one, because this is the call a model reaches with an identity in hand. An UNDECLARED field
+  // is not rejected by the SDK: it is silently STRIPPED by the tool's zod parse before the
+  // handler runs, so a model that read "US persons should supply an SSN" on the web form and
+  // helpfully passed one here got back a partyId, with the number thrown away and still sitting
+  // in the client's context window and its logs — which is the entire harm §4.1 exists to prevent.
+  const app = buildTestApp({ required: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+
+  const tool = await withClient(app, key, async (c) =>
+    (await c.listTools()).tools.find((t) => t.name === "create_formation_party"),
+  );
+  expect(Object.keys(tool!.inputSchema.properties ?? {})).toContain("ssn");
+  expect(tool!.description).toMatch(/NEVER takes an SSN/);
+
+  await withClient(app, key, async (c) => {
+    const refused = await c.callTool({
+      name: "create_formation_party",
+      arguments: { ...REAL_PARTY, ssn: "123-45-6789" },
+    });
+    expect((refused as { isError?: boolean }).isError).toBe(true);
+    // It says where the field DOES belong — a refusal a caller cannot act on is a dead end.
+    expect(textOf(refused)).toBe(ssnNotOnThisDoorMessage());
+    // …and no digits of it are anywhere in the answer.
+    expect(textOf(refused)).not.toMatch(/\d{3}-\d{2}-\d{4}/);
+    // The refusal is the WHOLE answer: no party row exists afterwards to clean up, so the check
+    // runs before any other validation.
+    expect(db.prepare("SELECT COUNT(*) AS n FROM formation_parties").get()).toEqual({ n: 0 });
+
+    // The very same call WITHOUT the field is accepted, so the refusal is about the ssn alone.
+    const ok = await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY });
+    expect(JSON.parse(textOf(ok)).partyId).toBeTruthy();
+  });
+});
+
 test("it needs the provision capability and a tenant-wide key (onboard_agent's rung)", async () => {
   const app = buildTestApp({ required: true });
   const { key: readKey } = apiKeys.mint(TENANT, { capability: "read" });
