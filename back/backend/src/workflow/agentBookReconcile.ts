@@ -10,8 +10,12 @@ import type { WorldStore } from "../persistence/worldStore";
  *   3. getNextNonce(pocket) at `safe` moved past the row's nonce -> lookupHuman at `safe`:
  *      equal to our nullifier -> confirmed; different -> disputed (and cached, so the dials stop
  *      serving the stale id).
- *   4. nonce unmoved and the row older than STALE_AFTER_MS: re-broadcast the stored raw tx while
- *      the submitter's EVM nonce has not passed ours; once it has, the tx was replaced -> failed.
+ *   4. a receipt with status 1 but a `safe` nonce that has not moved yet -> leave it alone: the
+ *      registration is MINED, `safe` is simply behind `latest`, and every rule below this one
+ *      reasons about a transaction that is not on chain.
+ *   5. nonce unmoved and the row older than STALE_AFTER_MS: re-broadcast the stored raw tx while
+ *      the submitter's MINED nonce has not passed ours; once it has, and only if a fresh receipt
+ *      read still says our tx is not mined, the tx was replaced -> failed.
  * Transport failures change nothing: "could not tell" is never a state.
  */
 export interface ReconcileDeps {
@@ -65,9 +69,18 @@ export async function reconcileRow(row: AgentBookRow, deps: ReconcileDeps): Prom
   }
   if (row.status !== "submitted") return row;
 
+  /** Mined and successful: `safe` has not caught up with `latest` yet, and that is all. Nothing
+   *  below the nonce rule may run on a mined row — the stale rule would re-broadcast a
+   *  transaction the chain already has, or call a succeeded registration `replaced`. */
+  const awaitingSafe = () => {
+    log("agentbook_awaiting_safe", { entity: row.entityKey });
+    return row;
+  };
+
   try {
+    let receipt: "success" | "reverted" | null = null;
     if (row.txHash) {
-      const receipt = await deps.registrar.receiptStatus(row.txHash as Hex);
+      receipt = await deps.registrar.receiptStatus(row.txHash as Hex);
       if (receipt === "reverted") {
         deps.repo.transition(row.sessionId, "submitted", "failed", { errorCode: "reverted" });
         log("agentbook_failed", { entity: row.entityKey, reason: "reverted" });
@@ -89,15 +102,23 @@ export async function reconcileRow(row: AgentBookRow, deps: ReconcileDeps): Prom
       }
       return reload();
     }
+    if (receipt === "success") return awaitingSafe();
     if (ageMs(row, now()) < STALE_AFTER_MS) return row;
     const chainNonce = await deps.registrar.submitterNonce();
     if (row.submitterNonce !== null && chainNonce > row.submitterNonce) {
+      // `submitterNonce()` counts MINED transactions, so a higher count means the chain moved past
+      // the nonce we signed. It could have moved past it by mining OUR tx, in the window between
+      // the receipt read above and this one — so ask again before declaring a success a failure.
+      if (row.txHash && (await deps.registrar.receiptStatus(row.txHash as Hex)) === "success")
+        return awaitingSafe();
       deps.repo.transition(row.sessionId, "submitted", "failed", { errorCode: "replaced" });
       log("agentbook_failed", { entity: row.entityKey, reason: "replaced" });
       return reload();
     }
     if (row.rawTx) {
       const hash = await deps.registrar.broadcast(row.rawTx as Hex);
+      // `setTxHash` also stamps `updated_at`, which is what bounds re-broadcast to once per
+      // STALE_AFTER_MS per row: the next sweep sees a row that is fresh again.
       deps.repo.setTxHash(row.sessionId, hash);
       log("agentbook_rebroadcast", { entity: row.entityKey });
     }

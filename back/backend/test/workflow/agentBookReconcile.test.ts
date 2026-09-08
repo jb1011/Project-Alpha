@@ -83,15 +83,12 @@ test("nonce moved and lookupHuman differs -> disputed, and the foreign id is cac
   expect(store.getCachedLookup(POCKET, T0, 60_000, 60_000)?.humanId).toBe("0x5714a9e7");
 });
 
-test("receipt reverted -> failed immediately", async () => {
+test("receipt reverted -> failed immediately, before any contract read", async () => {
   const row = submitted({ txHash: "0xh" });
-  const out = await reconcileRow(row, {
-    repo,
-    registrar: registrar({ nonce: 5n, receipt: "reverted" }),
-    store,
-    now: () => T0,
-  });
+  const r = registrar({ nonce: 5n, receipt: "reverted" });
+  const out = await reconcileRow(row, { repo, registrar: r, store, now: () => T0 });
   expect(out).toMatchObject({ status: "failed", errorCode: "reverted" });
+  expect(r.getNextNonce).not.toHaveBeenCalled();
 });
 
 test("nonce unmoved, fresh -> unchanged", async () => {
@@ -117,15 +114,63 @@ test("nonce unmoved, stale, no tx hash, submitter nonce not passed -> re-broadca
   expect(out.status).toBe("submitted");
 });
 
-test("nonce unmoved, stale, submitter nonce passed -> failed as replaced", async () => {
+test("nonce unmoved, stale, submitter nonce passed, still no receipt -> failed as replaced", async () => {
   const row = submitted({ txHash: "0xh" });
+  // `receipt: null` on BOTH reads: the mined count moved because somebody ELSE used our nonce.
+  const r = registrar({ nonce: 5n, chainNonce: 10, receipt: null });
   const out = await reconcileRow(row, {
     repo,
-    registrar: registrar({ nonce: 5n, chainNonce: 10 }),
+    registrar: r,
     store,
     now: () => rowClock(row) + STALE_AFTER_MS + 1,
   });
   expect(out).toMatchObject({ status: "failed", errorCode: "replaced" });
+  expect(r.receiptStatus).toHaveBeenCalledTimes(2);
+  expect(r.broadcast).not.toHaveBeenCalled();
+});
+
+test("mined but `safe` has not caught up -> left alone, never re-broadcast or failed", async () => {
+  const row = submitted({ txHash: "0xh" });
+  const r = registrar({ nonce: 5n, receipt: "success", chainNonce: 10 });
+  const out = await reconcileRow(row, {
+    repo,
+    registrar: r,
+    store,
+    now: () => rowClock(row) + STALE_AFTER_MS + 1,
+  });
+  expect(out.status).toBe("submitted");
+  expect(repo.findBySession("s1")?.status).toBe("submitted");
+  expect(r.submitterNonce).not.toHaveBeenCalled();
+  expect(r.broadcast).not.toHaveBeenCalled();
+});
+
+test("stale with a tx hash and no receipt yet -> re-broadcast, not failed", async () => {
+  const row = submitted({ txHash: "0xh" });
+  const r = registrar({ nonce: 5n, chainNonce: 9 });
+  const out = await reconcileRow(row, {
+    repo,
+    registrar: r,
+    store,
+    now: () => rowClock(row) + STALE_AFTER_MS + 1,
+  });
+  expect(r.broadcast).toHaveBeenCalledWith("0x02raw");
+  expect(out).toMatchObject({ status: "submitted", txHash: "0xrebroadcast" });
+});
+
+test("the tx mines between the receipt read and the nonce read -> unchanged, never replaced", async () => {
+  const row = submitted({ txHash: "0xh" });
+  const r = registrar({ nonce: 5n, chainNonce: 10 });
+  r.receiptStatus.mockResolvedValueOnce(null).mockResolvedValueOnce("success");
+  const out = await reconcileRow(row, {
+    repo,
+    registrar: r,
+    store,
+    now: () => rowClock(row) + STALE_AFTER_MS + 1,
+  });
+  expect(out.status).toBe("submitted");
+  expect(repo.findBySession("s1")?.status).toBe("submitted");
+  expect(r.receiptStatus).toHaveBeenCalledTimes(2);
+  expect(r.broadcast).not.toHaveBeenCalled();
 });
 
 test("a pending session past expiry -> expired", async () => {
@@ -152,6 +197,27 @@ test("a transport failure leaves the row untouched", async () => {
   r.getNextNonce.mockRejectedValueOnce(new Error("rpc down"));
   const out = await reconcileRow(row, { repo, registrar: r, store, now: () => T0 });
   expect(out.status).toBe("submitted");
+});
+
+test("a transport failure logs the error NAME and nothing else", async () => {
+  const row = submitted({ txHash: "0xh" });
+  const r = registrar({ nonce: 5n });
+  // The prose an RPC returns can carry the calldata, and the calldata carries the proof.
+  r.getNextNonce.mockRejectedValueOnce(new TypeError("fetch failed: https://rpc.example/KEY"));
+  const logged: { event: string; fields: Record<string, unknown> }[] = [];
+  await reconcileRow(row, {
+    repo,
+    registrar: r,
+    store,
+    now: () => T0,
+    log: (event, fields) => logged.push({ event, fields }),
+  });
+  expect(logged).toEqual([
+    {
+      event: "agentbook_reconcile_unavailable",
+      fields: { entity: "agent-1", errorName: "TypeError" },
+    },
+  ]);
 });
 
 test("the sweep walks every in-flight row and counts the ones it moved", async () => {
