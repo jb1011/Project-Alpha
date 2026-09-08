@@ -11,30 +11,33 @@ import { expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { INDUSTRIES_ETAG } from "../../src/api/routes/industries";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
-import { NAICS_LABELS, isKnownIndustryLabel } from "../../src/formation/naicsLabels";
+import { NAICS_LABELS } from "../../src/formation/naicsLabels";
 
 const get = () => buildApiApp({ webOrigin: "*" } as never).request("/formation/industries");
 
-test("the route serves the SHIPPED list, in order, and every label passes the door's own check", async () => {
+/**
+ * ONE test for the route's contract, because it is one claim in three clauses.
+ *
+ * It was three: the list, "it is PUBLIC" (which called the same unauthenticated `get()` and
+ * asserted the same 200 — a second copy of clause one), and the cache header. The list test also
+ * looped `isKnownIndustryLabel` over every label it had just asserted was `NAICS_LABELS`, which
+ * is the same array the predicate is built from: a loop that cannot fail while the line above it
+ * passes.
+ *
+ * What the contract actually is: the array the picker offers is the array `createCompany`
+ * validates against, it is reachable with no token, and it is cacheable for a day. A picker built
+ * from a second copy is a form that lets a founder choose a label the door then refuses — or,
+ * worse, one doola refuses on a real fee.
+ */
+test("the SHIPPED list, in order, public and cacheable for a day", async () => {
   const res = await get();
   expect(res.status).toBe(200);
   const body = (await res.json()) as { industries: string[] };
+  // The identity that makes this a contract rather than a copy — asserted once, by equality.
   expect(body.industries).toEqual([...NAICS_LABELS]);
-  // The one assertion that makes this a contract rather than a copy: everything the picker can
-  // offer is something `createCompany` accepts.
-  for (const label of body.industries) expect(isKnownIndustryLabel(label), label).toBe(true);
   expect(body.industries).toContain(DEFAULT_INDUSTRY);
-});
-
-test("it is PUBLIC — no token, on a deployment that forms nothing", async () => {
-  // The list is a federal reference table compiled into the build. It says nothing about this
-  // deployment, and putting a token dance in front of a form field would buy nothing.
-  const res = await get();
-  expect(res.status).toBe(200);
-});
-
-test("it is cacheable for a day: the list changes on a deploy, never on a request", async () => {
-  const res = await get();
+  // No token, on a deployment that forms nothing: the list is a federal reference table compiled
+  // into the build, and putting a token dance in front of a form field would buy nothing.
   expect(res.headers.get("cache-control")).toBe("public, max-age=86400");
 });
 
