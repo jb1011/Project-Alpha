@@ -6,7 +6,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
 import { agentBookChipState } from "@/lib/agentbook/chipState";
-import { useAgentDashboardQueries } from "@/lib/api/hooks";
+import { useAgentDashboardQueries, usePublicConfigQuery } from "@/lib/api/hooks";
 import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
@@ -17,6 +17,7 @@ import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { JobsReputationCard } from "@/components/agents/JobsReputationCard";
 import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
+import { NO_POCKET_COPY, VouchDialog } from "@/components/agents/VouchDialog";
 import { FormationCard } from "@/components/agents/FormationCard";
 import { AmberPill, Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
@@ -51,6 +52,7 @@ export function AgentDashboard({
   const treasury = treasuryQuery.data ?? null;
   const runs = runsQuery.data ?? [];
   const agentBookChip = agentBookChipState(agentBookQuery.data);
+  const agentBookView = agentBookQuery.data ?? null;
   const loadError =
     entityQuery.error instanceof Error
       ? entityQuery.error.message
@@ -60,6 +62,27 @@ export function AgentDashboard({
 
   const [pausing, setPausing] = useState(false);
   const [pauseError, setPauseError] = useState<string | null>(null);
+
+  /**
+   * The vouch affordance (design v3 §3, §5). Shown DISABLED with the reason rather than hidden:
+   * an owner who cannot vouch is owed the reason, and a button that appears and disappears with a
+   * poll is worse than one that says why it is off. `disputed` deliberately re-enables it — a
+   * guardian may answer a replacement once; the backend's lifetime cap is what stops the loop.
+   */
+  const publicConfig = usePublicConfigQuery();
+  const [vouchOpen, setVouchOpen] = useState(false);
+  const canVouch = publicConfig.data?.agentBookRegistrationAvailable === true;
+  const vouchDisabledReason = !canVouch
+    ? "Vouching is not enabled on this deployment"
+    : !agentBookView
+      ? "Checking this agent's AgentBook standing"
+      : agentBookView.reason === "no-pocket-yet"
+        ? NO_POCKET_COPY
+        : agentBookChip?.kind === "submitting"
+          ? "A vouch for this address is already in flight"
+          : agentBookChip?.kind === "vouched"
+            ? "Already vouched"
+            : null;
 
   const treasuryAddr = entity?.treasury ?? null;
 
@@ -225,8 +248,23 @@ export function AgentDashboard({
                 <span aria-hidden className="text-[10px] opacity-70">↗</span>
               </a>
             )}
+            <button
+              type="button"
+              disabled={vouchDisabledReason !== null}
+              title={vouchDisabledReason ?? "Vouch for this agent in AgentBook"}
+              onClick={() => setVouchOpen(true)}
+              className="rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-ink transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {agentBookChip?.kind === "disputed" ? "Vouch again in AgentBook" : "Vouch in AgentBook"}
+            </button>
             </div>
           </div>
+          <VouchDialog
+            entityId={entityId}
+            agentId={entity.agentId ?? ""}
+            open={vouchOpen}
+            onClose={() => setVouchOpen(false)}
+          />
           {/* Said out loud, not on hover: a submit we could not confirm is not a registration that
               did not happen, and the chip has no room to say so (§5.2, verbatim). */}
           {agentBookChip?.note && (
