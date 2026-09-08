@@ -522,37 +522,42 @@ async function main() {
   if (x402Demo)
     console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);
 
-  // AgentBook registration (design 2026-08-25 v3). One predicate shared with the env.ts
-  // invariants and GET /config, so the boot gate and the advertised availability cannot drift.
-  // The READ endpoint is the trust dials' `WORLD_CHAIN_RPC`; the submitter's own RPC is the WRITE
-  // endpoint, and the contract address is the SAME one the reader above is built from — a reader
-  // and a registrar pointed at two different AgentBooks would confirm registrations that the
-  // seller check can never see.
+  // AgentBook (design 2026-08-25 v3), in two halves.
+  //
+  // READING is unconditional: "does a verified human answer for this agent?" needs nothing but an
+  // RPC URL, both of which have defaults, and the seller/buyer trust dials already read exactly
+  // this way. WRITING is the optional half — it needs a funded submitter key AND the World portal
+  // block, which is precisely `canRegisterAgentBook`, the same predicate the env.ts invariants and
+  // GET /config use, so the boot gate and the advertised availability cannot drift.
+  //
+  // ONE rpc/contract pair for both halves: a reader and a registrar pointed at two different
+  // AgentBooks would confirm registrations the seller check can never see.
+  const agentBookRpc = cfg.worldChain?.rpcUrl ?? WORLD_CHAIN_DEFAULTS.rpcUrl;
   const agentBookContract = cfg.worldChain?.agentBook ?? WORLD_CHAIN_DEFAULTS.agentBook;
   // Through the predicate, so the submitter block is only in hand when the World portal block is
   // there too (the Orb gate reads `WorldStore`) — and so the presence of THIS value, not a second
-  // hand-written condition, is what the deps below are built from.
+  // hand-written condition, is what the write half below is built from.
   const submitter = canRegisterAgentBook(cfg) ? cfg.agentBook : undefined;
-  const agentBook = submitter
-    ? {
-        registrar: createAgentBookRegistrar({
+  const agentBook = {
+    repo: new SqliteAgentBookRepository(db),
+    reader: createAgentBookReader({ rpcUrl: agentBookRpc, contractAddress: agentBookContract }),
+    store: new SqliteWorldStore(db),
+    network: cfg.arcNetwork ?? ("testnet" as const),
+    caps: { perEntityLifetime: 3, perTenantPerHour: 5 },
+    // Status reads: their own allowance, so a dashboard refresh storm cannot starve a vouch and a
+    // vouch storm cannot blind the chip. Reads are cached, so this covers misses only.
+    readBudget: new TokenBucket(60, 2),
+    registrar: submitter
+      ? createAgentBookRegistrar({
           submitterPrivateKey: submitter.submitterPrivateKey,
-          readRpcUrl: cfg.worldChain?.rpcUrl ?? submitter.rpcUrl,
+          readRpcUrl: agentBookRpc,
           writeRpcUrl: submitter.rpcUrl,
           contractAddress: agentBookContract,
-        }),
-        repo: new SqliteAgentBookRepository(db),
-        reader: createAgentBookReader({
-          rpcUrl: cfg.worldChain?.rpcUrl ?? WORLD_CHAIN_DEFAULTS.rpcUrl,
-          contractAddress: agentBookContract,
-        }),
-        store: new SqliteWorldStore(db),
-        network: cfg.arcNetwork ?? ("testnet" as const),
-        caps: { perEntityLifetime: 3, perTenantPerHour: 5 },
-        budget: new TokenBucket(30, 0.5),
-      }
-    : undefined;
-  if (agentBook)
+        })
+      : undefined,
+    budget: submitter ? new TokenBucket(30, 0.5) : undefined,
+  };
+  if (submitter)
     console.warn("⚠ AgentBook registration ENABLED at /entities/:id/agentbook/session");
 
   const ens = cfg.ens
@@ -680,7 +685,7 @@ async function main() {
   // moved the formation reconcile down here: every in-flight row costs a World Chain round trip
   // to a third party, and a slow or unreachable RPC must never be able to keep /healthz from
   // answering. Usually a no-op — with nothing in flight it makes no call at all.
-  if (agentBook) {
+  if (agentBook.registrar) {
     const r = await reconcileAgentBook({
       repo: agentBook.repo,
       registrar: agentBook.registrar,

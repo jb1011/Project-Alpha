@@ -69,16 +69,17 @@ const base = (over: Partial<EntityRecord> = {}): EntityRecord =>
     ...over,
   }) as EntityRecord;
 
+/** The READ side only — no registrar, no write budget. That is the shape a deployment without a
+ *  submitter key serves, and the status route must work on exactly it. */
 function makeApp(
   reader?: { lookupHuman(a: string): Promise<string | null> },
-  budget = new TokenBucket(100, 100),
+  readBudget = new TokenBucket(100, 100),
 ) {
   return buildApiApp({
     webOrigin: "*",
     jwtSecret: JWT_SECRET,
     repo,
-    // The AgentBook routes live beside the World ID block, so they are only mounted on a
-    // deployment that has World portal config — the Orb gate reads the same store.
+    // Present but irrelevant to this route: the Orb gate is the WRITE routes' business.
     worldId: {
       cfg: {
         appId: "app_x",
@@ -91,13 +92,12 @@ function makeApp(
       requireGuardian: false,
     },
     agentBook: {
-      registrar: {} as never,
       repo: new SqliteAgentBookRepository(db),
       reader: reader ?? { lookupHuman: async () => null },
       store: world,
       network: "testnet",
       caps: { perEntityLifetime: 3, perTenantPerHour: 5 },
-      budget,
+      readBudget,
     },
   } as never);
 }
@@ -160,7 +160,7 @@ test("an RPC failure is 'unknown', never 'not registered'", async () => {
   expect(body).toMatchObject({ registered: false, outcome: "unknown" });
 });
 
-test("an exhausted budget is 'unknown' too, and costs no RPC call", async () => {
+test("an exhausted READ budget is 'unknown' too, and costs no RPC call", async () => {
   repo.upsert(base());
   let calls = 0;
   const app = makeApp(
@@ -175,4 +175,60 @@ test("an exhausted budget is 'unknown' too, and costs no RPC call", async () => 
   const body = await get(app);
   expect(body).toMatchObject({ registered: false, outcome: "unknown" });
   expect(calls).toBe(0);
+});
+
+test("a cached positive lookup answers without touching the reader OR the budget", async () => {
+  repo.upsert(base());
+  world.cacheLookup(POCKET, "0xdeadbeef", Date.now());
+  let calls = 0;
+  const app = makeApp(
+    {
+      lookupHuman: async () => {
+        calls += 1;
+        return "0xdeadbeef";
+      },
+    },
+    // Empty on purpose: a cache hit must not need a token, so this bucket proves the hit.
+    new TokenBucket(0, 0),
+  );
+  const body = await get(app);
+  expect(body).toMatchObject({ registered: true, humanId: "0xdeadbeef", outcome: "registered" });
+  expect(calls).toBe(0);
+});
+
+test("a fresh lookup is written back to the cache, so the second read is free", async () => {
+  repo.upsert(base());
+  let calls = 0;
+  const app = makeApp({
+    lookupHuman: async () => {
+      calls += 1;
+      return "0xdeadbeef";
+    },
+  });
+  expect((await get(app)).outcome).toBe("registered");
+  expect((await get(app)).outcome).toBe("registered");
+  expect(calls).toBe(1);
+});
+
+test("an outage is never cached: the next read asks again instead of serving a stale refusal", async () => {
+  repo.upsert(base());
+  let calls = 0;
+  const app = makeApp({
+    lookupHuman: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("rpc down");
+      return "0xdeadbeef";
+    },
+  });
+  expect((await get(app)).outcome).toBe("unknown");
+  expect((await get(app)).outcome).toBe("registered");
+});
+
+test("the status route works on a deployment with NO registrar — reading needs no submitter key", async () => {
+  repo.upsert(base());
+  const app = makeApp({ lookupHuman: async () => "0xdeadbeef" });
+  expect(await get(app)).toMatchObject({ registered: true, outcome: "registered" });
+  // …and such a deployment says so, rather than offering a dialog it cannot finish.
+  const cfg = await (await app.request("/config")).json();
+  expect(cfg.agentBookRegistrationAvailable).toBe(false);
 });

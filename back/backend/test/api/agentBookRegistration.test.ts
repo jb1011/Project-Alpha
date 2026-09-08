@@ -107,8 +107,10 @@ const registrar = () => ({
   submitterBalance: vi.fn(async () => 10n ** 16n),
 });
 
+/** `reg: null` builds the READ-ONLY deployment shape — no submitter key, so no write half.
+ *  (`undefined` cannot mean that: it is what a default parameter fills in.) */
 function makeApp(
-  reg = registrar(),
+  reg: ReturnType<typeof registrar> | null = registrar(),
   caps = { perEntityLifetime: 3, perTenantPerHour: 5 },
   budget = new TokenBucket(100, 100),
 ) {
@@ -128,25 +130,33 @@ function makeApp(
       requireGuardian: false,
     },
     agentBook: {
-      registrar: reg,
       repo: abRepo,
       reader: { lookupHuman: async () => null },
       store: world,
       network: "testnet",
       caps,
-      budget,
+      readBudget: new TokenBucket(100, 100),
+      registrar: reg ?? undefined,
+      budget: reg ? budget : undefined,
     },
   } as never);
 }
 
 const token = async () =>
   (await signSession(TENANT, JWT_SECRET, 3600, Math.floor(Date.now() / 1000))).token;
-const call = async (app: ReturnType<typeof buildApiApp>, path: string, body?: unknown) =>
-  app.request(`/entities/agent-1/agentbook${path}`, {
+const callEntity = async (
+  app: ReturnType<typeof buildApiApp>,
+  entityId: string,
+  path: string,
+  body?: unknown,
+) =>
+  app.request(`/entities/${entityId}/agentbook${path}`, {
     method: body === undefined ? "GET" : "POST",
     headers: { authorization: `Bearer ${await token()}`, "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+const call = (app: ReturnType<typeof buildApiApp>, path: string, body?: unknown) =>
+  callEntity(app, "agent-1", path, body);
 
 const proofBody = (sessionId: string, over: Record<string, unknown> = {}) => ({
   sessionId,
@@ -359,6 +369,118 @@ test("register: input validation rejects 7 proof elements and a malformed sessio
   expect((await call(app, "/register", proofBody("nope"))).status).toBe(400);
   // Well-formed but not ours: the session simply does not exist, which is a state conflict.
   expect((await call(app, "/register", proofBody(randomUUID()))).status).toBe(409);
+});
+
+test("register: the transaction is signed over the SESSION's address, not the entity's current one", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const reg = registrar();
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  // The guardian's proof carries `buildSignal(POCKET, 0)`. Moving the entity's pocket afterwards
+  // must not move what we sign: the proof would be spent on a certain revert.
+  repo.upsert(entity({ pocketAddress: "0x4444444444444444444444444444444444444444" }));
+  expect((await call(app, "/register", proofBody(sessionId))).status).toBe(200);
+  expect(reg.simulateRegister).toHaveBeenCalledWith(
+    expect.objectContaining({ agent: getAddress(POCKET) }),
+  );
+  expect(reg.signRegister).toHaveBeenCalledWith(
+    expect.objectContaining({ agent: getAddress(POCKET) }),
+  );
+});
+
+test("register: a broadcast that fails is still 200 — the raw tx is stored and the reconciler owns it", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const reg = registrar();
+  reg.broadcast.mockRejectedValue(new Error("mempool unreachable"));
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  const res = await call(app, "/register", proofBody(sessionId));
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ status: "submitted", txHash: null });
+  expect(abRepo.findBySession(sessionId)).toMatchObject({
+    status: "submitted",
+    rawTx: "0x02raw",
+    txHash: null,
+  });
+});
+
+test("register: another submission already in flight for this agent is a 409, and nothing is broadcast", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  // The partial unique index on `submitted` is the atomic in-flight claim.
+  const other = abRepo.createSession({
+    sessionId: randomUUID(),
+    entityKey: "agent-1",
+    tenantId: TENANT,
+    address: POCKET,
+    nonce: "0",
+    expiresAt: Date.now() + 60_000,
+  });
+  abRepo.claimSubmit(other.sessionId, {
+    nullifier: NULLIFIER,
+    rawTx: "0x01raw",
+    submitterNonce: 0,
+  });
+  const reg = registrar();
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  const res = await call(app, "/register", proofBody(sessionId));
+  expect(res.status).toBe(409);
+  expect((await res.json()).error.code).toBe("conflict");
+  expect(reg.broadcast).not.toHaveBeenCalled();
+});
+
+test("register: losing the claim race is a 409, and nothing is broadcast", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const reg = registrar();
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  vi.spyOn(abRepo, "claimSubmit").mockReturnValue("lost");
+  const res = await call(app, "/register", proofBody(sessionId));
+  expect(res.status).toBe(409);
+  expect((await res.json()).error.code).toBe("conflict");
+  expect(reg.broadcast).not.toHaveBeenCalled();
+});
+
+test("both write routes answer 404 for an entity that is not this tenant's", async () => {
+  repo.upsert(entity());
+  repo.upsert(
+    entity({
+      idempotencyKey: "agent-2",
+      ownerTenantId: getAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+      publicId: "44444444-4444-4444-4444-444444444444",
+    }),
+  );
+  verifyGuardian();
+  const app = makeApp();
+  expect((await callEntity(app, "agent-2", "/session", {})).status).toBe(404);
+  expect((await callEntity(app, "agent-2", "/register", proofBody(randomUUID()))).status).toBe(404);
+  expect((await callEntity(app, "no-such-agent", "/session", {})).status).toBe(404);
+});
+
+test("a deployment with no submitter key refuses both write routes with 503 and advertises false", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const app = makeApp(null);
+  for (const path of ["/session", "/register"]) {
+    const res = await call(app, path, path === "/session" ? {} : proofBody(randomUUID()));
+    expect(res.status).toBe(503);
+    const b = await res.json();
+    expect(b.error.code).toBe("unavailable");
+    expect(b.error.message).toBe("AgentBook registration is not configured on this deployment");
+  }
+  // No session row was created: the refusal lands before any cap or repository work.
+  expect(abRepo.countSessionsSince(TENANT, 0)).toBe(0);
+  const cfg = await (await app.request("/config")).json();
+  expect(cfg.agentBookRegistrationAvailable).toBe(false);
+});
+
+test("a deployment WITH a submitter key advertises the vouch dialog", async () => {
+  const cfg = await (await makeApp().request("/config")).json();
+  expect(cfg.agentBookRegistrationAvailable).toBe(true);
 });
 
 test("GET after submit reconciles and reports the row", async () => {

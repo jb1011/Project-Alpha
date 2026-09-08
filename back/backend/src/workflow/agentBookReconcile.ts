@@ -48,8 +48,11 @@ const ageMs = (row: AgentBookRow, now: number): number => {
  * (`0xbadf00d`). A stored value that is not a parseable number cannot be matched to anything on
  * chain, so it is simply not ours — which routes the row to `disputed`, the branch that shows a
  * human the id the contract actually holds.
+ *
+ * EXPORTED because the status route asks the same question of a fresher read than the last
+ * reconcile saw. Two copies of this comparison would be two chances to write the string one.
  */
-function sameHuman(human: string | null, nullifier: string | null): boolean {
+export function sameHuman(human: string | null, nullifier: string | null): boolean {
   if (human === null || nullifier === null) return false;
   try {
     return BigInt(human) === BigInt(nullifier);

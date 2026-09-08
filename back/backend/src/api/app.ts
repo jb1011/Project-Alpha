@@ -169,9 +169,11 @@ export interface ApiDeps extends EntityViewDeps {
   /** Optional World ID guardian gate (proof-of-personhood). Present only when the WORLD_*
    *  portal credentials are set; absent -> routes not mounted and onboarding is ungated. */
   worldId?: import("./routes/worldId").WorldIdDeps;
-  /** AgentBook registration (design 2026-08-25 v3). Present iff `canRegisterAgentBook(cfg)` —
-   *  that predicate is the single definition, and `/config` plus the route mount are both
-   *  projections of THIS object's presence, so the boot gate and what we advertise cannot drift. */
+  /** AgentBook (design 2026-08-25 v3). Present wherever the World Chain READ config is, which is
+   *  everywhere — reading "is this agent human-backed?" needs nothing but an RPC URL. Its
+   *  `registrar` is the optional WRITE half, present iff `canRegisterAgentBook(cfg)`; that
+   *  predicate is the single definition, and `/config` plus the write routes' 503 are both
+   *  projections of it, so the boot gate and what we advertise cannot drift. */
   agentBook?: import("./routes/agentBook").AgentBookDeps;
   /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
    *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
@@ -237,10 +239,11 @@ export function buildApiApp(deps: ApiDeps) {
        * everything else that is not a capability or a sentence about one.
        */
       formationCopy: { ssn: SSN_COPY, park: PARK_COPY, reuseDisclosure: COMPANY_REUSE_DISCLOSURE },
-      // Whether this deployment can WRITE an AgentBook registration. The vouch dialog is hidden
-      // without it: a box with no submitter key could take the guardian through the whole World
-      // App flow and then have nothing to broadcast.
-      agentBookRegistrationAvailable: Boolean(deps.agentBook),
+      // Whether this deployment can WRITE an AgentBook registration — the REGISTRAR, not the
+      // deps object, because the read side is wired everywhere and only the write side needs a
+      // funded submitter key. The vouch dialog is hidden without it: a box with no key could take
+      // the guardian through the whole World App flow and then have nothing to broadcast.
+      agentBookRegistrationAvailable: Boolean(deps.agentBook?.registrar),
     }),
   );
   mountSchemaRoutes(app);
