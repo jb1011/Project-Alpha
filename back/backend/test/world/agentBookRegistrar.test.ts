@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import {
+  BlockNotFoundError,
   ContractFunctionExecutionError,
   ContractFunctionRevertedError,
+  TransactionReceiptNotFoundError,
   decodeFunctionData,
   encodeErrorResult,
   keccak256,
@@ -77,17 +79,19 @@ const REGISTER_ARGS = {
   proof: [5n, 6n, 7n, 8n, 9n, 10n, 11n, 12n],
 };
 
-/** Only `simulateContract` is stubbed: simulation touches neither the wallet client nor an RPC. */
-function registrarWithSimulate(simulateContract: () => Promise<unknown>) {
+/** Only the one viem call under test is stubbed; neither path touches the wallet client. */
+function registrarWith(publicClient: Record<string, unknown>) {
   return createAgentBookRegistrar({
     submitterPrivateKey: TEST_KEY,
     readRpcUrl: "http://127.0.0.1:0",
     writeRpcUrl: "http://127.0.0.1:0",
-    clients: { publicClient: { simulateContract }, walletClient: {} } as unknown as NonNullable<
+    clients: { publicClient, walletClient: {} } as unknown as NonNullable<
       RegistrarOptions["clients"]
     >,
   });
 }
+const registrarWithSimulate = (simulateContract: () => Promise<unknown>) =>
+  registrarWith({ simulateContract });
 
 describe("simulateRegister tells a deterministic revert from a bad minute at the RPC", () => {
   test("a decoded contract revert becomes ContractRevertError carrying the error NAME", async () => {
@@ -119,5 +123,32 @@ describe("simulateRegister tells a deterministic revert from a bad minute at the
     const transport = new Error("HTTP 429 Too Many Requests");
     const registrar = registrarWithSimulate(() => Promise.reject(transport));
     await expect(registrar.simulateRegister(REGISTER_ARGS)).rejects.toBe(transport);
+  });
+});
+
+describe("receiptStatus: 'not mined yet' is one specific viem error, not a shape of words", () => {
+  const HASH = `0x${"11".repeat(32)}` as const;
+
+  test("a missing receipt is null — the reconciler's 'still pending' branch", async () => {
+    const registrar = registrarWith({
+      getTransactionReceipt: () =>
+        Promise.reject(new TransactionReceiptNotFoundError({ hash: HASH })),
+    });
+    expect(await registrar.receiptStatus(HASH)).toBeNull();
+  });
+
+  test("a transport failure is re-thrown UNCHANGED — an outage is not a pending transaction", async () => {
+    const transport = new Error("rpc down");
+    const registrar = registrarWith({ getTransactionReceipt: () => Promise.reject(transport) });
+    await expect(registrar.receiptStatus(HASH)).rejects.toBe(transport);
+  });
+
+  test("another viem 'could not be found' error is NOT read as 'not mined yet'", async () => {
+    // Why the typed check replaced a regex on `shortMessage`: viem has several not-found errors and
+    // only ONE of them means "no receipt yet". Swallowing the others as null parks a broken read in
+    // the reconciler's pending branch forever, waiting on a receipt nobody is fetching.
+    const other = new BlockNotFoundError({ blockNumber: 123n });
+    const registrar = registrarWith({ getTransactionReceipt: () => Promise.reject(other) });
+    await expect(registrar.receiptStatus(HASH)).rejects.toBe(other);
   });
 });

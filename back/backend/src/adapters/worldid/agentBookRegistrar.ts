@@ -7,6 +7,7 @@ import {
   ContractFunctionRevertedError,
   type Hex,
   type PublicClient,
+  TransactionReceiptNotFoundError,
   type Transport,
   type WalletClient,
   createPublicClient,
@@ -186,7 +187,15 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
         const r = await publicClient.getTransactionReceipt({ hash: txHash });
         return r.status === "success" ? "success" : "reverted";
       } catch (e) {
-        if (e instanceof BaseError && /not (be )?found/i.test(e.shortMessage)) return null;
+        // `null` means ONE thing: the chain has no receipt for this hash yet, so the reconciler
+        // should keep waiting. viem says exactly that with `TransactionReceiptNotFoundError` —
+        // matched by type, not by its prose, because several other viem errors ("Block at number
+        // ... could not be found", any wrapper carrying that text) also read as "not found" and
+        // mean the read BROKE. Parking those in the pending branch would wait forever on a receipt
+        // nobody is fetching. `walk` (which tests the error itself first) because a transport or a
+        // caller's client may have wrapped it.
+        if (e instanceof BaseError && e.walk((x) => x instanceof TransactionReceiptNotFoundError))
+          return null;
         throw e;
       }
     },
