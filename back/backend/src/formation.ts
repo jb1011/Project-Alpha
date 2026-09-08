@@ -320,6 +320,26 @@ export function partyFrozenMessage(): string {
 }
 
 /**
+ * A party edit that changes NOTHING, refused (design §7, A3).
+ *
+ * The edit is what buys a parked filing its one retry: the door clears `awaitingPartyEdit`
+ * because a changed identity is evidence that the next `createCustomer` will carry a different
+ * body. A resubmission of the details already on file is not that evidence — it re-arms a retry
+ * of the exact body doola looked at and refused, which is the loop the park exists to stop, and
+ * it burns an attempt to do it.
+ *
+ * It is a REFUSAL rather than a silent success because the caller needs to know: from the form's
+ * side, "saved" and "saved, and nothing will happen" look identical, and the second is the one
+ * that leaves somebody waiting on a filing that has already given up.
+ *
+ * ⚠ It cannot be detected from the write. SQLite's `changes` counts rows MATCHED, not rows whose
+ * values differ, so an UPDATE that sets every column to the value it already held reports 1.
+ */
+export function partyUnchangedMessage(): string {
+  return "none of these details is different from the one already on file. Correcting the responsible party is what re-opens a filing the provider refused, and re-sending the same body would only have it refused again — change what the provider objected to, or contact the operator if you do not know which field it was";
+}
+
+/**
  * The §4.7 freeze, refused in the caller's terms.
  *
  * It names the one case that IS editable, because that is the actionable half: a filing doola

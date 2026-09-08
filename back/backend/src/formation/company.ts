@@ -17,6 +17,7 @@ import {
   industryLabelRequiredMessage,
   industryLabelUnknownMessage,
   partyFrozenMessage,
+  partyUnchangedMessage,
   sqliteUtcTimestamp,
   ssnFormatMessage,
   ssnRefusedHereMessage,
@@ -476,12 +477,26 @@ export function updateCompanyParty(
   // would put a real person's identity onto a filing labeled synthetic on every surface.
   if (party.synthetic) return { error: syntheticPiiRefusedMessage() };
 
+  // The TypeScript twin of the predicate the UPDATE itself carries (`PARTY_EDIT_ALLOWED_SQL`).
+  // Asked here so the caller gets the ACTIONABLE refusal rather than a bare "nothing moved"; the
+  // statement's own copy is what holds for any caller that reaches `parties.update` another way.
   const step = deps.requests.find(companyId, "create_provider");
   if (!partyEditAllowed(step)) return { error: partyFrozenMessage() };
 
   let moved = false;
+  let unchanged = false;
   deps.transaction(() => {
-    moved = deps.parties.update(party.partyId, tenantId, fields);
+    // RE-READ inside the transaction and compare, because SQLite's `changes` counts rows MATCHED
+    // rather than rows whose values differ: an UPDATE setting every column to the value it already
+    // held reports 1, and the re-arm below would then hand a parked filing a retry of the exact
+    // body doola refused. The comparison is over the ten editable columns and nothing else.
+    const current = deps.parties.findByCompanyId(companyId);
+    if (!current) return;
+    if (samePartyFields(current, fields)) {
+      unchanged = true;
+      return;
+    }
+    moved = deps.parties.update(party.partyId, tenantId, companyId, fields);
     if (!moved) return;
     // …and RE-ARM the filing step this edit exists to unblock, in the SAME transaction as the
     // edit — `updateCompanyIntake`'s rule with the other flag. The edit IS the evidence that the
@@ -489,7 +504,12 @@ export function updateCompanyParty(
     // sweeper's reach. A no-op for a row that is not parked.
     rearmAfterPartyEdit(deps, companyId);
   });
-  // The row vanished between the read and the write (an erasure sweep). Same sentence as above.
+  // …and the caller is TOLD, rather than given a success that will change nothing: from a form's
+  // side "saved" and "saved, and nothing will happen" look identical, and the second is the one
+  // that leaves somebody waiting on a filing that has already given up.
+  if (unchanged) return { error: partyUnchangedMessage() };
+  // The row vanished between the read and the write (an erasure sweep), or the freeze in the
+  // statement's own WHERE clause caught a race the read above did not. Same sentence as above.
   if (!moved) return { error: formationPartyUnavailableMessage() };
 
   // The ONLY trail this leaves, exactly as the create's: which tenant edited which handle. No
@@ -500,6 +520,21 @@ export function updateCompanyParty(
     companyId,
   });
   return { partyId: party.partyId };
+}
+
+/**
+ * IS THIS EDIT A NO-OP? — the ten editable columns, compared field for field.
+ *
+ * Its own function rather than an inline `every`, because the LIST is the thing that has to stay
+ * right: `EditablePartyFields` is a positive list somebody wrote down, and a comparison that
+ * missed one of its keys would report "unchanged" for an edit that changed exactly that field —
+ * refusing a correction the caller had actually made. `Object.keys(fields)` reads the list off
+ * the value being written, so the two cannot disagree.
+ */
+function samePartyFields(current: EditablePartyFields, submitted: EditablePartyFields): boolean {
+  return (Object.keys(submitted) as (keyof EditablePartyFields)[]).every(
+    (key) => current[key] === submitted[key],
+  );
 }
 
 /**

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { everSubmitted } from "../formation/freeze";
+import { PARTY_EDIT_ALLOWED_SQL, everSubmitted } from "../formation/freeze";
 import type { EncryptedSsn } from "../formation/pii";
 import type { SsnErasedReason } from "../formation/ssnErasure";
 import type { CompanyStatus } from "./companyRepository";
@@ -206,14 +206,23 @@ export interface FormationPartyRepository {
    * and every `ssn_*` column — an SSN is not editable here and never travels to this door, which
    * is why there is no field for one to arrive in.
    *
-   * Returns whether the row moved. WHEN it may move is `partyEditAllowed`, asked in the same
-   * transaction by the one domain function both doors call: unlike the company intake, whose
-   * freeze is a predicate over the row being updated and therefore lives in its own WHERE clause,
-   * this rule is a predicate over a DIFFERENT row (the company's `create_provider` step), and a
-   * correlated subquery reaching across two tables to restate a predicate that already exists in
-   * TypeScript would be a second spelling of it.
+   * Returns whether the row moved. WHEN it may move is `PARTY_EDIT_ALLOWED_SQL`, carried IN THE
+   * WHERE CLAUSE — the `INTAKE_FROZEN_SQL` precedent. It is a correlated subquery over a
+   * DIFFERENT table (the company's `create_provider` step), which is why it was left in
+   * TypeScript at first; but a rule that lives only above the write is a rule the next caller of
+   * this method has to remember, and `test/formation/freeze.test.ts` runs the two spellings over
+   * one matrix so they cannot drift. The domain function asks the TypeScript twin as well,
+   * because that is what produces the actionable refusal rather than a bare `false`.
+   *
+   * `companyId` is REQUIRED and is part of the WHERE: the door is company-addressed, and the
+   * statement will only move a party that is bound to the company the caller named.
    */
-  update(partyId: string, tenantId: string, fields: EditablePartyFields): boolean;
+  update(
+    partyId: string,
+    tenantId: string,
+    companyId: string,
+    fields: EditablePartyFields,
+  ): boolean;
   /** The bound party for a company — what `create_provider` files with. */
   findByCompanyId(companyId: string): FormationPartyRecord | undefined;
   /**
@@ -342,7 +351,15 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
                 email = @email, phone = @phone,
                 line1 = @line1, line2 = @line2, city = @city, region = @region,
                 postal_code = @postal_code, country = @country
-          WHERE party_id = @party_id AND tenant_id = @tenant_id AND deleted_at IS NULL`,
+          WHERE party_id = @party_id AND tenant_id = @tenant_id
+            AND company_id = @company_id
+            AND deleted_at IS NULL
+            -- THE FREEZE, in the statement itself (design §7, A3) — the INTAKE_FROZEN_SQL
+            -- precedent, one predicate along. The domain function asks the TypeScript twin so it
+            -- can return the actionable refusal; this is the lock that holds for a caller who
+            -- reaches this method some other way, which is the failure mode a check living only
+            -- above the write has always had.
+            AND ${PARTY_EDIT_ALLOWED_SQL}`,
       ),
       findByCompany: db.prepare(
         "SELECT * FROM formation_parties WHERE company_id = ? AND deleted_at IS NULL",
@@ -496,11 +513,17 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
     return this.stmts.bindToCompany.run(companyId, partyId, tenantId).changes === 1;
   }
 
-  update(partyId: string, tenantId: string, fields: EditablePartyFields): boolean {
+  update(
+    partyId: string,
+    tenantId: string,
+    companyId: string,
+    fields: EditablePartyFields,
+  ): boolean {
     return (
       this.stmts.update.run({
         party_id: partyId,
         tenant_id: tenantId,
+        company_id: companyId,
         legal_first_name: fields.legalFirstName,
         legal_last_name: fields.legalLastName,
         email: fields.email,

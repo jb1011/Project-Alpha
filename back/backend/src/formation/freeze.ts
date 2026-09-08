@@ -159,6 +159,48 @@ export function partyEditAllowed(step: FreezableStep | undefined): boolean {
   return !everSubmitted(step?.state ?? null, step?.providerRef ?? null, step?.detail ?? null);
 }
 
+/**
+ * `partyEditAllowed`, in SQL — so the `UPDATE formation_parties` can carry the rule in its own
+ * WHERE clause, exactly as `INTAKE_FROZEN_SQL` does for the company intake.
+ *
+ * The TypeScript predicate stays: it is what produces `partyFrozenMessage()`, which is the
+ * actionable half of the refusal. This is the second lock, and it is the one that holds when a
+ * caller reaches `parties.update` some other way — a new door, a script, a future repository
+ * method that forgot to ask. A rule enforced only above the write is a rule the next writer has
+ * to remember.
+ *
+ * Bound by `@company_id`, like `INTAKE_FROZEN_SQL`, so the same text works inside the correlated
+ * UPDATE and in a standalone SELECT — which is what lets `test/formation/freeze.test.ts` run the
+ * two spellings over one matrix and assert they agree.
+ *
+ * Two disjuncts, mirroring `partyEditAllowed` clause for clause:
+ *
+ *  1. the row is PARKED awaiting a party edit — `json_type(...) = 'true'` rather than
+ *     `json_extract(...) = 1`, because the TypeScript is `=== true` and `json_extract` cannot
+ *     tell `true` from `1`;
+ *  2. nothing has EVER been sent about this company (`everSubmitted` negated). `json_type` again,
+ *     for a different reason: the TypeScript tests `!== undefined`, so a key present with a JSON
+ *     `null` value counts — and `json_extract` would return SQL NULL for it and lose the fact.
+ */
+export const PARTY_EDIT_ALLOWED_SQL = `(
+      EXISTS (
+        SELECT 1 FROM formation_requests f
+         WHERE f.company_id = @company_id
+           AND f.step = 'create_provider'
+           AND f.detail IS NOT NULL
+           AND json_valid(f.detail) = 1
+           AND json_type(f.detail, '$.awaitingPartyEdit') = 'true')
+      OR NOT EXISTS (
+        SELECT 1 FROM formation_requests f
+         WHERE f.company_id = @company_id
+           AND f.step = 'create_provider'
+           AND (   f.state IN ('submitted','confirmed')
+                OR f.provider_ref IS NOT NULL
+                OR (f.detail IS NOT NULL AND json_valid(f.detail) = 0)
+                OR (f.detail IS NOT NULL AND json_valid(f.detail) = 1
+                    AND (   json_type(f.detail, '$.customerId') IS NOT NULL
+                         OR json_type(f.detail, '$.companySentAttempt') IS NOT NULL)))))`;
+
 /** `detail.awaitingPartyEdit` — the flag `onCallFailure` writes when doola refuses the PARTY's
  *  body, and the one `rearmAfterPartyEdit` clears. An unreadable blob is not a park. */
 export function parkedForPartyEdit(step: FreezableStep | undefined): boolean {

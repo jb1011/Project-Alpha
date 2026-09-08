@@ -22,6 +22,7 @@ import {
   companyUnavailableMessage,
   formationPartyUnavailableMessage,
   partyFrozenMessage,
+  partyUnchangedMessage,
   syntheticPiiRefusedMessage,
   syntheticPiiRequiredMessage,
 } from "../../src/formation";
@@ -103,10 +104,12 @@ function newCompany(partyId: string, tenantId = TENANT): string {
   return companyId;
 }
 
-/** The shape `onCallFailure` leaves behind when doola REFUSES the party's body. */
+/** The shape `onCallFailure` leaves behind when doola REFUSES the party's body. Re-parkable, so
+ *  a test can put a company back where a second rejection would. */
 function parkAwaitingPartyEdit(companyId: string, detail: Record<string, unknown> = {}) {
-  requests.claimStep(companyId, "create_provider");
-  requests.transition(companyId, "create_provider", "pending", "failed", {
+  const existing = requests.find(companyId, "create_provider");
+  if (!existing) requests.claimStep(companyId, "create_provider");
+  requests.transition(companyId, "create_provider", existing?.state ?? "pending", "failed", {
     detail: JSON.stringify({ awaitingPartyEdit: true, ...detail }),
     error: "E_VALIDATION_FAILED: one or more fields are invalid",
   });
@@ -260,10 +263,127 @@ test("a PARKED party is edited, and the edit buys exactly one retry with the new
   expect(JSON.parse(row.detail!)).not.toHaveProperty("awaitingPartyEdit");
   // 3. ONE retry: a second edit is needed for a second one, which is the whole rule. Re-arming a
   //    row that is not parked is a no-op, so the flag does not come back.
-  expect(updateCompanyParty(deps(), TENANT, companyId, CORRECTED)).toEqual({ partyId });
+  expect(updateCompanyParty(deps(), TENANT, companyId, { ...CORRECTED, city: "Casper" })).toEqual({
+    partyId,
+  });
   expect(JSON.parse(requests.find(companyId, "create_provider")!.detail!)).not.toHaveProperty(
     "awaitingPartyEdit",
   );
+});
+
+// ── an edit that changes NOTHING ────────────────────────────────────────────────────────────
+
+/**
+ * Re-submitting the details already on file is not evidence of anything.
+ *
+ * The park is cleared because a CHANGED identity is evidence that the next `createCustomer` will
+ * carry a different body. An unchanged resubmission re-arms a retry of the exact body doola
+ * looked at and refused — the loop the park exists to stop — and burns an attempt doing it.
+ *
+ * It cannot be detected from the write: SQLite's `changes` counts rows MATCHED, not rows whose
+ * values differ, so an UPDATE setting every column to the value it already held reports 1.
+ */
+test("an UNCHANGED resubmission does not clear the park and does not burn an attempt", () => {
+  const partyId = newParty();
+  const companyId = newCompany(partyId);
+  parkAwaitingPartyEdit(companyId);
+  const before = requests.find(companyId, "create_provider")!;
+
+  // The identity exactly as `newParty` wrote it, re-sent field for field.
+  const same = {
+    legalFirstName: "Ada",
+    legalLastName: "Lovelace",
+    email: "ada@example.com",
+    phone: "+12125550100",
+    line1: "1 Analytical Way",
+    line2: null,
+    city: "Cheyenne",
+    region: "WY",
+    postalCode: "82001",
+    country: "USA",
+  };
+  expect(updateCompanyParty(deps(), TENANT, companyId, same)).toEqual({
+    error: partyUnchangedMessage(),
+  });
+
+  const after = requests.find(companyId, "create_provider")!;
+  expect(JSON.parse(after.detail!).awaitingPartyEdit).toBe(true);
+  expect(after.attempt).toBe(before.attempt);
+  expect(after.state).toBe(before.state);
+});
+
+test("ONE field different is a change — and it re-arms exactly once", () => {
+  const partyId = newParty();
+  const companyId = newCompany(partyId);
+  parkAwaitingPartyEdit(companyId);
+
+  const oneFieldDifferent = {
+    legalFirstName: "Ada",
+    legalLastName: "Lovelace",
+    email: "ada@example.com",
+    phone: "+12125550100",
+    line1: "1 Analytical Way",
+    line2: null,
+    city: "Cheyenne",
+    region: "WY",
+    postalCode: "82001",
+    // The one the provider might well have objected to.
+    country: "GBR",
+  };
+  expect(updateCompanyParty(deps(), TENANT, companyId, oneFieldDifferent)).toEqual({ partyId });
+  expect(JSON.parse(requests.find(companyId, "create_provider")!.detail!)).not.toHaveProperty(
+    "awaitingPartyEdit",
+  );
+  expect(parties.findOwned(TENANT, partyId)!.country).toBe("GBR");
+
+  // …and re-sending THAT body is now the unchanged case, so it does not re-arm anything either.
+  parkAwaitingPartyEdit(companyId);
+  expect(updateCompanyParty(deps(), TENANT, companyId, oneFieldDifferent)).toEqual({
+    error: partyUnchangedMessage(),
+  });
+  expect(JSON.parse(requests.find(companyId, "create_provider")!.detail!).awaitingPartyEdit).toBe(
+    true,
+  );
+});
+
+/**
+ * THE FREEZE LIVES IN THE STATEMENT, not only above it.
+ *
+ * The domain function asks the TypeScript predicate so it can return the actionable refusal. This
+ * asserts the second lock: a caller reaching `parties.update` directly — a new door, a script, a
+ * repository method somebody adds next month — cannot rewrite the identity on a filing that has
+ * already been sent.
+ */
+test("parties.update refuses a frozen row by itself, with no domain function above it", () => {
+  const partyId = newParty();
+  const companyId = newCompany(partyId);
+  requests.claimStep(companyId, "create_provider");
+  requests.transition(companyId, "create_provider", "pending", "failed", {
+    detail: JSON.stringify({ customerId: "cus-1" }),
+  });
+
+  expect(parties.update(partyId, TENANT, companyId, CORRECTED)).toBe(false);
+  expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Ada");
+
+  // …and the statement is bound to the (party, company) PAIR: naming another company does not
+  // move this row either.
+  const otherParty = parties.create({
+    tenantId: TENANT,
+    legalFirstName: "Alan",
+    legalLastName: "Turing",
+    email: "alan@example.com",
+    phone: "+12125550111",
+    line1: "3 Bletchley Rd",
+    line2: null,
+    city: "Cheyenne",
+    region: "WY",
+    postalCode: "82001",
+    country: "USA",
+    synthetic: false,
+  });
+  const otherCompany = newCompany(otherParty);
+  expect(parties.update(partyId, TENANT, otherCompany, CORRECTED)).toBe(false);
+  expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Ada");
 });
 
 test("it clears its OWN flag only — an intake park is NOT re-armed by a party edit", () => {
