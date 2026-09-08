@@ -20,12 +20,16 @@
 import { expect, test } from "vitest";
 import {
   buildPersistedOnboarding,
+  migrateOnboardingV2,
+  ONBOARDING_STORAGE_KEY,
+  ONBOARDING_STORAGE_KEY_V2,
   PERSISTED_CONFIG_KEYS,
   PERSISTED_SESSION_KEYS,
 } from "@/lib/onboarding/storage";
 import {
   emptyConfig,
   emptySession,
+  PHASES,
   type AgentConfig,
   type FormationParty,
   type OnboardingSession,
@@ -151,4 +155,97 @@ test("G6: the entity's formation block never reaches storage, EIN and documents 
   // The rest of the view is untouched — a wizard that lost the entity id could not resume.
   expect(persisted.session.entityId).toBe("ent_1");
   expect(persisted.session.entity?.id).toBe("ent_1");
+});
+
+/* ── v2 → v3 (design §7, A3) ───────────────────────────────────────────────── */
+
+/**
+ * A blob written by A2's wizard, in the shape it was actually stored.
+ *
+ * The three things that changed under a returning user: the phase `legal-identity`, a
+ * `done` entry naming it, and a session carrying `partyId`/`partySynthetic`.
+ */
+function v2Blob(over: { phase?: string; session?: Record<string, unknown> } = {}) {
+  return JSON.stringify({
+    phase: over.phase ?? "legal-identity",
+    config: { name: "Wizard agent", purpose: "p", custody: "circle", perTxCap: "5" },
+    done: { welcome: true, guardian: true, "legal-identity": true },
+    session: {
+      entityId: null,
+      idempotencyKey: null,
+      entity: null,
+      partyId: "party_handle_from_v2",
+      partySynthetic: false,
+      ...over.session,
+    },
+  });
+}
+
+test("A3: the storage key is v3 — the v2 shape is not readable as v3", () => {
+  // `legal-identity` is not on `PHASES`, and `partyId` is a field the onboard door now REFUSES
+  // rather than ignores. Re-using the key would have made every returning user's blob a liar.
+  expect(ONBOARDING_STORAGE_KEY).toBe("pa-onboarding-v3");
+  expect(ONBOARDING_STORAGE_KEY_V2).toBe("pa-onboarding-v2");
+});
+
+test("A3: a v2 session parked on `legal-identity` resumes on `legal-body`", () => {
+  const migrated = migrateOnboardingV2(v2Blob())!;
+  expect(migrated.phase).toBe("legal-body");
+  // …and it is a RESUME, not a restart: the banner condition is "a phase past welcome", and the
+  // completed steps behind it survive.
+  expect(PHASES.findIndex((p) => p.id === migrated.phase)).toBeGreaterThan(0);
+  expect(migrated.done.welcome).toBe(true);
+  expect(migrated.done.guardian).toBe(true);
+  expect(migrated.config.name).toBe("Wizard agent");
+});
+
+test("A3: `done['legal-identity']` is DROPPED, never renamed onto the new phase", () => {
+  // What that step produced was a party handle, and a party handle is no longer what "the legal
+  // body is settled" means. Renaming it would let the Stepper jump a user forward past a company
+  // they never picked.
+  const migrated = migrateOnboardingV2(v2Blob())!;
+  expect(migrated.done).not.toHaveProperty("legal-identity");
+  expect(migrated.done).not.toHaveProperty("legal-body");
+});
+
+test("A3: the retired session keys do not survive the migration", () => {
+  const migrated = migrateOnboardingV2(v2Blob())!;
+  const bytes = JSON.stringify(migrated.session);
+  expect(bytes).not.toContain("partyId");
+  expect(bytes).not.toContain("party_handle_from_v2");
+  expect(bytes).not.toContain("partySynthetic");
+  expect(migrated.session.companyId).toBeNull();
+});
+
+test("A3: a v2 session PAST the step with a party and no company is flagged for a bounce", () => {
+  const migrated = migrateOnboardingV2(v2Blob({ phase: "agreement" }))!;
+  // The phase itself is left alone — the correction is the flow's, because whether it applies
+  // depends on `GET /config`, which storage cannot ask.
+  expect(migrated.phase).toBe("agreement");
+  expect(migrated.resumeNeedsCompany).toBe(true);
+});
+
+test("A3: a v2 session that already had a company is complete in v3 terms", () => {
+  const migrated = migrateOnboardingV2(
+    v2Blob({ phase: "agreement", session: { companyId: "company_handle", partyId: undefined } }),
+  )!;
+  expect(migrated.session.companyId).toBe("company_handle");
+  expect(migrated.resumeNeedsCompany).toBeUndefined();
+});
+
+test("A3: an unreadable v2 blob is null, exactly as a corrupt v3 one is", () => {
+  expect(migrateOnboardingV2("{not json")).toBeNull();
+  expect(migrateOnboardingV2("null")).toBeNull();
+});
+
+test("A3: `buildPersistedOnboarding` never re-writes the migration flag", () => {
+  // It is a fact about a RESTORE, not durable state: the first save after the migration drops it,
+  // and the bounce is a one-time correction rather than a permanent gate.
+  const persisted = buildPersistedOnboarding({
+    phase: "legal-body",
+    config: emptyConfig(),
+    done: {},
+    session: emptySession(),
+  });
+  expect(persisted).not.toHaveProperty("resumeNeedsCompany");
 });

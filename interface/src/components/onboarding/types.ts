@@ -153,6 +153,53 @@ export function snapToVisiblePhase(phases: PhaseMeta[], phase: Phase): Phase {
 }
 
 /**
+ * THE RESUME RULE: may this restored session go on from where it left off? (design §7, A3.)
+ *
+ * Pure, and its own function, because it is the one decision in the wizard that is about a
+ * session that was written by a DIFFERENT version of this code — and the interface runner is
+ * deliberately not a component runner, so anything worth asserting has to be a function a
+ * component calls.
+ *
+ * Two reasons a session is sent back to `legal-body`, and they are not the same reason:
+ *
+ *  1. **the deployment REQUIRES a filing** and this session has no company. The passkey
+ *     precedent: a restored session that lost the credential a step produces re-does that step,
+ *     rather than carrying the user to a submit that will be refused. It corrects a race too (a
+ *     fast click while `GET /config` is still in flight);
+ *  2. **the session came from v2 carrying a PARTY HANDLE** (`needsCompany`). That handle bought
+ *     a company under A1's shim; A3 removed the shim, so it now buys nothing and the onboard
+ *     door refuses it outright. Such a session is past a step whose product no longer exists,
+ *     and it is sent back on ANY deployment that forms — not only a requiring one — because the
+ *     user did ask for a legal body and the wizard would otherwise quietly drop it.
+ *
+ * ⚠ Reason 2 is spent by the first deliberate navigation (the flow clears `needsCompany` in
+ * `goTo`). Without that, a user on a deployment where formation is OPTIONAL who answers the
+ * bounce by clicking "Skip — no legal filing" would be bounced straight back, forever.
+ *
+ * NEVER once the entity exists: by `deploy` the handle has been consumed by /onboard, and sending
+ * the user back to pick another company would be nonsense.
+ */
+export function resumePhase(input: {
+  phases: PhaseMeta[];
+  storedPhase: Phase;
+  /** `GET /config`: anything other than an explicit `true` means "does not form". */
+  formationAvailable: boolean;
+  formationRequired: boolean;
+  companyId: string | null;
+  entityId: string | null;
+  /** A v2 session that carried a party handle and no company. */
+  needsCompany: boolean;
+}): Phase {
+  const { phases, storedPhase } = input;
+  if (!input.formationAvailable) return storedPhase;
+  if (!input.formationRequired && !input.needsCompany) return storedPhase;
+  if (input.companyId || input.entityId) return storedPhase;
+  if (storedPhase === "dashboard") return storedPhase;
+  // Never FORWARD: a session that has not reached the legal-body step yet is left where it is.
+  return indexIn(phases, storedPhase) > indexIn(phases, "legal-body") ? "legal-body" : storedPhase;
+}
+
+/**
  * The neighbours of a phase IN THE VISIBLE LIST — the only list that knows.
  *
  * These replace hand-rolled ternaries at the two seams where the optional legal-body step

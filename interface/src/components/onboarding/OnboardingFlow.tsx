@@ -23,6 +23,7 @@ import {
   Phase,
   PHASES,
   prevPhase,
+  resumePhase,
   screenLabel,
   snapToVisiblePhase,
   visiblePhases,
@@ -86,6 +87,17 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     () => !wantsNewAgent && !!(initial?.phase && phaseIndex(initial.phase) > 0),
   );
   /**
+   * This session was migrated from v2 and carried a PARTY HANDLE with no company (§7, A3).
+   *
+   * A one-time fact about the restore, held like `resumed` and spent the same way — `goTo` clears
+   * it — because it corrects where a returning user LANDS, not where they may go. Without the
+   * clearing, somebody on a deployment where formation is optional who answers the bounce by
+   * clicking "Skip — no legal filing" would be bounced straight back to it, forever.
+   */
+  const [needsCompany, setNeedsCompany] = useState(
+    () => !wantsNewAgent && initial?.resumeNeedsCompany === true,
+  );
+  /**
    * The PII slice (design §3, audit 16/L8).
    *
    * Deliberately its own piece of state, beside `config` rather than inside it: `config` is what
@@ -114,32 +126,28 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const phases = useMemo(() => visiblePhases(formationAvailable), [formationAvailable]);
 
   /**
-   * Past the legal-body step with no company handle, on a deployment that REQUIRES one → the
-   * wizard shows that step again.
+   * Past the legal-body step with no company handle → the wizard shows that step again.
    *
-   * The passkey precedent: a restored session that lost the credential a step produces re-does
-   * that step, explicitly, rather than carrying the user to a submit that will be refused. It
-   * corrects a race too (a fast click while `GET /config` is still in flight), which is strictly
-   * safer than a restore-only check.
+   * ONE pure function (`resumePhase`), because there are now two reasons and they are not the
+   * same reason: the deployment REQUIRES a filing, or this session was migrated from v2 carrying
+   * a party handle that A3's onboard door refuses. See `resumePhase` for both, and for why the
+   * second is spent by the first deliberate navigation.
    *
    * DERIVED during render rather than corrected by an effect — an effect that called `goTo` would
    * paint the wrong screen first and cascade a second render to fix it.
-   *
-   * NEVER once the entity exists: by `deploy` the handle has already been consumed by /onboard,
-   * and sending the user back to pick another company would be nonsense.
    */
-  const requestedPhase: Phase =
-    formationRequired &&
+  const requestedPhase: Phase = resumePhase({
+    phases,
+    storedPhase,
     // A box that reports `required` always reports `available` too (they are projections of one
     // dep). If one ever did not, this guard is what stops the correction from sending the wizard
     // to a phase that is not in the list and rendering nothing at all.
-    formationAvailable &&
-    !session.companyId &&
-    !session.entityId &&
-    storedPhase !== "dashboard" &&
-    indexIn(phases, storedPhase) > indexIn(phases, "legal-body")
-      ? "legal-body"
-      : storedPhase;
+    formationAvailable,
+    formationRequired,
+    companyId: session.companyId,
+    entityId: session.entityId,
+    needsCompany,
+  });
 
   /**
    * THE INVARIANT: the phase we render is always a member of `phases`.
@@ -162,6 +170,8 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const goTo = useCallback((next: Phase) => {
     setPhase(next);
     setResumed(false);
+    // The v2 correction is spent by the first deliberate move — see `resumePhase`.
+    setNeedsCompany(false);
     if (typeof window !== "undefined") {
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
