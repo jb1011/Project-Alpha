@@ -20,6 +20,7 @@ import {
   ssnNotOnThisDoorMessage,
   truncateTenant,
 } from "../formation";
+import { partyFieldsOf } from "../formation";
 import { createCompany, updateCompanyParty } from "../formation/company";
 import { describeIndustryLabels } from "../formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
@@ -175,6 +176,47 @@ function scopedCompanyId(
 ): string | null | undefined {
   if (scope.entityId === null) return null;
   return repo.findByIdempotencyKey(scope.entityId)?.companyId ?? undefined;
+}
+
+/** What a refused tool call looks like. One shape, so the guards below can compose. */
+type ToolRefusal = { content: { type: "text"; text: string }[]; isError: true };
+
+const refuse = (text: string): ToolRefusal => ({
+  content: [{ type: "text", text }],
+  isError: true,
+});
+
+/**
+ * THE PROVISIONING RUNG, asked once (§7).
+ *
+ * Four tools sit on it — `create_formation_party`, `create_company`, `update_company_party` and
+ * `onboard_agent` — and every one of them spelled `if (!hasCapability(scope, "provision") ||
+ * scope.entityId !== null) return { … "not authorized" … }` for itself. Both halves matter and
+ * both are easy to half-write: "provision" is the top rung (these calls commit a tenant to a real
+ * filing or provision a platform resource), and a TENANT-WIDE key is required because they create
+ * something rather than acting on an existing entity — an entity-scoped key has no business
+ * minting a second one. `null` = allowed.
+ */
+function requireProvisionTenantWide(scope: VerifiedKey): ToolRefusal | null {
+  if (!hasCapability(scope, "provision") || scope.entityId !== null)
+    return refuse("not authorized");
+  return null;
+}
+
+/**
+ * ⚠ AN `ssn` ARGUMENT IS REFUSED, on every tool that declares one (§4.1).
+ *
+ * The field is declared IN ORDER TO BE REFUSED: an undeclared field is not rejected by the SDK,
+ * it is silently STRIPPED by the tool's zod schema before the handler runs — so a model that read
+ * "US persons should supply an SSN" on the web form and helpfully passed one here would have got
+ * back a success, with the number still sitting in the client's context window and its logs,
+ * which is the entire harm §4.1 exists to prevent.
+ *
+ * Called FIRST in each handler, before any other validation, so the refusal is the whole answer
+ * and nothing exists afterwards for the caller to clean up. `null` = no ssn was passed.
+ */
+function refuseSsn(args: unknown): ToolRefusal | null {
+  return (args as { ssn?: unknown }).ssn !== undefined ? refuse(ssnNotOnThisDoorMessage()) : null;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -613,8 +655,8 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       async (args) => {
         // "provision" — the same rung onboard_agent sits on, and for the same reason: this call
         // is a step of provisioning a legal body, and it commits the tenant to a real filing.
-        if (!hasCapability(scope, "provision") || scope.entityId !== null)
-          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
         try {
           const { synthetic, ...body } = args as Record<string, unknown>;
           // The synthetic shortcut carries no PII, so it is never parsed as a party body.
@@ -684,13 +726,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       },
       async (args) => {
         // The same rung `create_formation_party` sits on: this call decides whose identity a real
-        // Wyoming filing names.
-        if (!hasCapability(scope, "provision") || scope.entityId !== null)
-          return { content: [{ type: "text", text: "not authorized" }], isError: true };
-        // BEFORE anything else, so the refusal is the whole answer and nothing exists afterwards
-        // for the caller to clean up. Same order, same sentence, as `create_company`.
-        if ((args as { ssn?: unknown }).ssn !== undefined)
-          return { content: [{ type: "text", text: ssnNotOnThisDoorMessage() }], isError: true };
+        // Wyoming filing names. And the ssn refusal BEFORE anything else, so it is the whole
+        // answer — same order, same sentence, as `create_company`.
+        const denied = requireProvisionTenantWide(scope) ?? refuseSsn(args);
+        if (denied) return denied;
         try {
           const { companyId, ssn: _ssn, ...rest } = args as Record<string, unknown>;
           // The SAME `.strict()` schema the create parses, so a field one door refuses cannot be
@@ -704,18 +743,8 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             },
             tenantId,
             companyId as string,
-            {
-              legalFirstName: body.legalFirstName,
-              legalLastName: body.legalLastName,
-              email: body.email,
-              phone: body.phone,
-              line1: body.address.line1,
-              line2: body.address.line2 ?? null,
-              city: body.address.city,
-              region: body.address.region ?? null,
-              postalCode: body.address.postalCode,
-              country: body.address.country,
-            },
+            // The SAME wire→column mapping the REST door and the create use.
+            partyFieldsOf(body),
           );
           if ("error" in result)
             return { content: [{ type: "text", text: result.error }], isError: true };
@@ -771,12 +800,11 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         },
       },
       async ({ partyId, names, businessPurpose, industryLabel, synthetic, ssn }) => {
-        if (!hasCapability(scope, "provision") || scope.entityId !== null)
-          return { content: [{ type: "text", text: "not authorized" }], isError: true };
-        // BEFORE anything is created, and before any other validation: the refusal must be the
-        // whole answer, so that nothing exists afterwards for the caller to have to clean up.
-        if (ssn !== undefined)
-          return { content: [{ type: "text", text: ssnNotOnThisDoorMessage() }], isError: true };
+        // The rung, then the ssn — the latter BEFORE anything is created and before any other
+        // validation, so the refusal is the whole answer and nothing exists afterwards for the
+        // caller to have to clean up.
+        const denied = requireProvisionTenantWide(scope) ?? refuseSsn({ ssn });
+        if (denied) return denied;
         try {
           const result = createCompany(
             // The composition root's ONE dependency set; this door supplies only its transaction.
@@ -921,8 +949,8 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       },
     },
     async ({ spec, passkeyId, idempotencyKey, custody, partyId, companyId }) => {
-      if (!hasCapability(scope, "provision") || scope.entityId !== null)
-        return { content: [{ type: "text", text: "not authorized" }], isError: true };
+      const denied = requireProvisionTenantWide(scope);
+      if (denied) return denied;
       const passkey = deps.passkeys.get(tenantId, passkeyId);
       if (!passkey)
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };

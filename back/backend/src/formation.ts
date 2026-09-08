@@ -531,6 +531,37 @@ export interface FormationPartyIntakeDeps {
 export type FormationPartyIntakeResult = { partyId: string } | { error: string };
 
 /**
+ * THE WIRE SHAPE → THE COLUMN SHAPE, once (design §5/§7).
+ *
+ * `FormationPartySchema` parses a NESTED body (the address is an object, because that is what
+ * doola's API takes and what a form binds to); the table is FLAT, and `line2`/`region` are
+ * `null` rather than absent. Three doors crossed that boundary with their own ten-line literal —
+ * `POST /formation-party`, `PATCH /companies/:companyId/party` and its MCP twin — and each copy
+ * is a chance to write `line2: body.address.line2` (undefined, not null) or to forget `region`
+ * on the door that a French founder uses.
+ *
+ * One function, so the mapping is reviewed once and the doors cannot disagree about what an
+ * omitted optional means.
+ */
+export function partyFieldsOf(
+  parsed: import("./policy/agentSpec").FormationPartyInput,
+): import("./persistence/formationPartyRepository").EditablePartyFields {
+  return {
+    legalFirstName: parsed.legalFirstName,
+    legalLastName: parsed.legalLastName,
+    email: parsed.email,
+    phone: parsed.phone,
+    line1: parsed.address.line1,
+    // NULL, not undefined: the column is nullable and better-sqlite3 refuses an undefined bind.
+    line2: parsed.address.line2 ?? null,
+    city: parsed.address.city,
+    region: parsed.address.region ?? null,
+    postalCode: parsed.address.postalCode,
+    country: parsed.address.country,
+  };
+}
+
+/**
  * Create a formation party from a validated body, or from the sandbox shortcut.
  *
  * Shared by `POST /formation-party` and the `create_formation_party` MCP tool so the two intake
@@ -564,22 +595,10 @@ export function createFormationParty(
   }
   if (deps.sandboxSyntheticPii) return { error: syntheticPiiRequiredMessage() };
   if (!body.parsed) return { error: "a formation party body is required" };
-  const p = body.parsed;
   return {
-    partyId: deps.parties.create({
-      tenantId,
-      legalFirstName: p.legalFirstName,
-      legalLastName: p.legalLastName,
-      email: p.email,
-      phone: p.phone,
-      line1: p.address.line1,
-      line2: p.address.line2 ?? null,
-      city: p.address.city,
-      region: p.address.region ?? null,
-      postalCode: p.address.postalCode,
-      country: p.address.country,
-      synthetic: false,
-    }),
+    // The SAME mapping the edit doors use — see `partyFieldsOf`. `synthetic` is the deployment's,
+    // never the caller's, which is why it is added here rather than being part of the shape.
+    partyId: deps.parties.create({ tenantId, ...partyFieldsOf(body.parsed), synthetic: false }),
   };
 }
 

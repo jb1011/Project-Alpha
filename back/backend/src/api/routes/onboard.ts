@@ -8,6 +8,7 @@ import {
   createFormationParty,
   formationDoorRefusal,
   formationUnavailableMessage,
+  partyFieldsOf,
   truncateTenant,
 } from "../../formation";
 import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../formation/company";
@@ -298,18 +299,8 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
       tenantId,
       c.req.param("companyId"),
-      {
-        legalFirstName: body.legalFirstName,
-        legalLastName: body.legalLastName,
-        email: body.email,
-        phone: body.phone,
-        line1: body.address.line1,
-        line2: body.address.line2 ?? null,
-        city: body.address.city,
-        region: body.address.region ?? null,
-        postalCode: body.address.postalCode,
-        country: body.address.country,
-      },
+      // The SAME wire→column mapping the create door and the MCP twin use.
+      partyFieldsOf(body),
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);
     return c.json({ partyId: result.partyId });
