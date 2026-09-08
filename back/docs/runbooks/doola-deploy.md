@@ -186,10 +186,13 @@ only find out from an empty `formation_requests` table a week later.
 
 ## Flipping it on
 
-When PR 4 lands the identity step in the wizard:
+When the wizard's legal-body step is live (A3):
 
-1. confirm the wizard sends `partyId` on `POST /onboard` (the `/config` response already
-   advertises `formationRequired`, and the wizard branches on it);
+1. confirm the wizard sends **`companyId`** on `POST /onboard` (the `/config` response already
+   advertises `formationRequired`, and the wizard branches on it). ⚠ NOT `partyId`: A3 removed the
+   A1 shim, so the onboard door ATTACHES and never creates, and a `partyId` there is REFUSED
+   rather than ignored — a checklist that told an operator to look for one would have them
+   confirming the exact field that now fails the door;
 2. set `FORMATION_REQUIRED=true` and restart;
 3. check the boot line no longer carries the second warning;
 4. onboard one agent end-to-end and confirm `formation_requests` has four rows for it and
