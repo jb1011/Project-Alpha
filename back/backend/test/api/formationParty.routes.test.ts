@@ -809,6 +809,43 @@ test("it parses the SAME .strict() schema the create does — an `ssn` key is re
   );
 });
 
+/**
+ * The party-edit door is a PII INTAKE, and it was the one that did not run the intake gate.
+ *
+ * `POST /formation-party` refuses real personal data on a sandbox deployment; this door rewrote
+ * the same ten columns with no check at all, so a real name, email, phone and home address could
+ * be written over the labeled fixture and filed to doola's DEVELOPMENT environment as the
+ * responsible person.
+ */
+test("SANDBOX: the edit door refuses a real identity, in the create door's own words", async () => {
+  const app = makeApp({ required: true, syntheticPii: true });
+  const token = await login(app);
+  const { partyId } = await (
+    await post(app, "/formation-party", token, { synthetic: true })
+  ).json();
+
+  const res = await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY);
+  expect(res.status).toBe(400);
+  expect((await res.json()).error.message).toMatch(/FORMATION_SANDBOX_SYNTHETIC_PII/);
+  // Nothing was written: the fixture is intact.
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).not.toBe("Grace");
+});
+
+test("PRODUCTION: the edit door refuses a SYNTHETIC party row, in the create door's own words", async () => {
+  // The mirror image, checked against the ROW rather than the request: the row was minted through
+  // the same gate, so a mismatch is a bug — the bug that puts a real person's identity onto a
+  // filing labeled synthetic on every surface that shows it.
+  const app = makeApp({ required: true, syntheticPii: false });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  db.prepare("UPDATE formation_parties SET synthetic = 1 WHERE party_id = ?").run(partyId);
+
+  const res = await patch(app, `/formation-party/${partyId}`, token, CORRECTED_PARTY);
+  expect(res.status).toBe(400);
+  expect((await res.json()).error.message).toMatch(/synthetic formation parties are refused/);
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
+});
+
 test("a deployment that forms nothing has no party-edit door either (503)", async () => {
   const app = makeApp(undefined);
   const token = await login(app);

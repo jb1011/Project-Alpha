@@ -871,3 +871,39 @@ test("SCOPE: an entity-scoped key lists only its own company, and never a siblin
     expect(own.attachedAgents).toHaveLength(2);
   });
 });
+
+test("SYNTHETIC GATE: update_formation_party refuses both directions, in the create's words", async () => {
+  // The MCP twin of the REST assertion. The edit door is a PII intake and was the one that ran
+  // neither half of the gate, so a sandbox deployment's agent-first caller could write a real
+  // identity over the labeled fixture and have it filed to doola's development environment.
+  const sandbox = buildTestApp({ required: true, syntheticPii: true });
+  const { key } = apiKeys.mint(TENANT, { capability: "provision" });
+  await withClient(sandbox, key, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: { synthetic: true } })),
+    );
+    const refused = await c.callTool({
+      name: "update_formation_party",
+      arguments: { partyId, ...REAL_PARTY },
+    });
+    expect((refused as { isError?: boolean }).isError).toBe(true);
+    expect(textOf(refused)).toMatch(/FORMATION_SANDBOX_SYNTHETIC_PII/);
+    expect(parties.findOwned(TENANT, partyId)!.legalFirstName).not.toBe("Ada");
+  });
+
+  const prod = buildTestApp({ required: true, syntheticPii: false });
+  const { key: key2 } = apiKeys.mint(TENANT, { capability: "provision" });
+  await withClient(prod, key2, async (c) => {
+    const { partyId } = JSON.parse(
+      textOf(await c.callTool({ name: "create_formation_party", arguments: REAL_PARTY })),
+    );
+    db.prepare("UPDATE formation_parties SET synthetic = 1 WHERE party_id = ?").run(partyId);
+    const refused = await c.callTool({
+      name: "update_formation_party",
+      arguments: { partyId, ...REAL_PARTY, legalFirstName: "Grace" },
+    });
+    expect((refused as { isError?: boolean }).isError).toBe(true);
+    expect(textOf(refused)).toMatch(/synthetic formation parties are refused/);
+    expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Ada");
+  });
+});

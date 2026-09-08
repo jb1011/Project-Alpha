@@ -425,17 +425,35 @@ export function updateCompanyIntake(
  * the ciphertext is sealed under) and re-captured by `PATCH /companies/:companyId`. There is no
  * field for one here, on either surface, so an SSN cannot arrive at a door that would then have
  * to decide what to do with it.
+ *
+ * ⚠ It DOES carry the synthetic-PII gate, in both directions, because it is a PII INTAKE and was
+ * the one that did not run it. `createFormationParty` refuses real personal data on a
+ * `sandboxSyntheticPii` deployment and refuses the synthetic shortcut on a production one, and
+ * `createCompany` re-asserts the same rule against the party ROW. This door rewrote the ten
+ * identity columns with neither check: on a sandbox box a real name, email, phone and home
+ * address could be written over a labeled fixture and then filed to doola's DEVELOPMENT
+ * environment as the responsible person — the precise harm the sandbox refusal exists to prevent.
  */
 export function updateFormationParty(
-  deps: Pick<CreateCompanyDeps, "parties" | "requests" | "transaction">,
+  deps: Pick<CreateCompanyDeps, "parties" | "requests" | "transaction" | "sandboxSyntheticPii">,
   tenantId: string,
   partyId: string,
   fields: EditablePartyFields,
 ): { partyId: string } | { error: string } {
-  // Ownership first, and the same not-an-oracle rule the rest of the door follows: an unknown id,
+  // The DEPLOYMENT's half of the gate, first and without a lookup — `createCompany`'s order, and
+  // the same words. This door has no synthetic shortcut (the labeled fixture is ours to generate,
+  // never a caller's to re-type), so every body reaching it is real personal data and a sandbox
+  // deployment refuses all of them.
+  if (deps.sandboxSyntheticPii) return { error: syntheticPiiRequiredMessage() };
+
+  // Ownership second, and the same not-an-oracle rule the rest of the door follows: an unknown id,
   // somebody else's, and an erased one get ONE answer.
   const party = deps.parties.findOwned(tenantId, partyId);
   if (!party) return { error: formationPartyUnavailableMessage() };
+  // …and the ROW's half. A synthetic party on a production box is a bug rather than a request —
+  // the row was minted through the same gate — but it is the bug that would put a real person's
+  // identity onto a filing labeled synthetic on every surface that shows it.
+  if (party.synthetic) return { error: syntheticPiiRefusedMessage() };
 
   // An UNBOUND party has no filing to be frozen by — `partyEditAllowed` says so from an
   // `undefined` step, and reading the step at all would need a company id there is none of.

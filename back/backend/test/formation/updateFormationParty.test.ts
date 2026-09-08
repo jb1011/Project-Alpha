@@ -18,7 +18,12 @@
  */
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { formationPartyUnavailableMessage, partyFrozenMessage } from "../../src/formation";
+import {
+  formationPartyUnavailableMessage,
+  partyFrozenMessage,
+  syntheticPiiRefusedMessage,
+  syntheticPiiRequiredMessage,
+} from "../../src/formation";
 import { updateFormationParty } from "../../src/formation/company";
 import { companyNameOptions } from "../../src/formation/intake";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -43,7 +48,12 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-const deps = () => ({ parties, requests, transaction: <T>(fn: () => T) => fn() });
+const deps = (sandboxSyntheticPii = false) => ({
+  parties,
+  requests,
+  sandboxSyntheticPii,
+  transaction: <T>(fn: () => T) => fn(),
+});
 
 const CORRECTED = {
   legalFirstName: "Grace",
@@ -99,6 +109,57 @@ function parkAwaitingPartyEdit(companyId: string, detail: Record<string, unknown
     error: "E_VALIDATION_FAILED: one or more fields are invalid",
   });
 }
+
+// ── the synthetic-PII gate, in BOTH directions (§3, audit H7) ───────────────────────────────
+
+/**
+ * The edit door is a PII intake, and it was the one that did not run the intake gate.
+ *
+ * `createFormationParty` refuses real personal data on a `sandboxSyntheticPii` deployment and
+ * refuses the synthetic shortcut on a production one; `createCompany` re-asserts the same rule
+ * against the party ROW. This door rewrote the ten identity columns with neither check, so on a
+ * sandbox box a real name, email, phone and home address could be written into a party the
+ * deployment had minted as a labeled fixture — and then filed to doola's DEVELOPMENT environment
+ * as the responsible person, which is exactly the harm the sandbox refusal exists to prevent.
+ */
+test("a SANDBOX deployment refuses a real identity at the edit door, in the create's words", () => {
+  const partyId = newParty();
+  const companyId = newCompany(partyId);
+  parkAwaitingPartyEdit(companyId);
+
+  expect(updateFormationParty(deps(true), TENANT, partyId, CORRECTED)).toEqual({
+    error: syntheticPiiRequiredMessage(),
+  });
+  // Nothing was written: the refusal is the whole answer, as it is on every other door.
+  expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Ada");
+});
+
+test("a PRODUCTION deployment refuses to edit a SYNTHETIC party, in the create's words", () => {
+  // The mirror image, and the reason it is checked against the ROW rather than the request: the
+  // party was minted through the same gate, so a mismatch is a bug — but a bug that would put a
+  // real person's identity onto a filing labeled synthetic on every surface that shows it.
+  const partyId = parties.create({
+    tenantId: TENANT,
+    legalFirstName: "Sandbox",
+    legalLastName: "Fixture",
+    email: "sandbox@novicorpus.com",
+    phone: "+13075550100",
+    line1: "1 Demo Way",
+    line2: null,
+    city: "Cheyenne",
+    region: "WY",
+    postalCode: "82001",
+    country: "USA",
+    synthetic: true,
+  });
+  const companyId = newCompany(partyId);
+  parkAwaitingPartyEdit(companyId);
+
+  expect(updateFormationParty(deps(false), TENANT, partyId, CORRECTED)).toEqual({
+    error: syntheticPiiRefusedMessage(),
+  });
+  expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Sandbox");
+});
 
 // ── ownership ───────────────────────────────────────────────────────────────────────────────
 
@@ -225,9 +286,13 @@ test("an UNBOUND party is editable — nothing has been filed with it", () => {
 test("the bind, the synthetic marker and the SSN columns all survive an edit", () => {
   const partyId = newParty();
   const companyId = newCompany(partyId);
+  // NOT `synthetic = 1`: a synthetic row is unreachable through this door on EITHER kind of
+  // deployment (a production box refuses the row, a sandbox box refuses the real body), which is
+  // the gate asserted above. What this test pins is that the marker the row does carry is not
+  // rewritten by an edit, together with the bind and the sealed SSN.
   db.prepare(
     `UPDATE formation_parties
-        SET synthetic = 1, ssn_ciphertext = X'0102', ssn_iv = X'03', ssn_key_id = 'fpk1:abc',
+        SET ssn_ciphertext = X'0102', ssn_iv = X'03', ssn_key_id = 'fpk1:abc',
             ssn_captured_at = '2026-09-01 00:00:00'
       WHERE party_id = ?`,
   ).run(partyId);
@@ -246,7 +311,7 @@ test("the bind, the synthetic marker and the SSN columns all survive an edit", (
   // the party was created against, not of a request; and an SSN cannot arrive at this door at all,
   // so nothing here may disturb the one already sealed against (party, company).
   expect(row.company_id).toBe(companyId);
-  expect(row.synthetic).toBe(1);
+  expect(row.synthetic).toBe(0);
   expect(row.tenant_id).toBe(TENANT);
   expect(row.ssn_ciphertext).not.toBeNull();
   expect(row.ssn_key_id).toBe("fpk1:abc");
