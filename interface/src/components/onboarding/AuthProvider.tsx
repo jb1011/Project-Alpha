@@ -38,6 +38,9 @@ type AuthContextValue = {
   session: AuthSession | null;
   address: `0x${string}` | undefined;
   isConnected: boolean;
+  /** A `connectWallet()` is in flight. Distinct from `isLoggingIn` on purpose: they are two
+   *  different wallet round-trips, and one spinner for both means each can misreport the other. */
+  isConnecting: boolean;
   isLoggingIn: boolean;
   login: () => Promise<void>;
   logout: () => void;
@@ -70,6 +73,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
   const nonceMutation = useAuthNonceMutation();
   const verifyMutation = useSiweLoginMutation();
+  const [isConnecting, setIsConnecting] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   // A session authenticates ONE address — the tenant every API call acts as. Switching accounts in
@@ -84,9 +88,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const connectWallet = useCallback(async () => {
     const connector = connectors[0];
     if (!connector) throw new Error("No wallet connector available.");
-    await connectAsync({ connector, chainId: arcTestnet.id });
-    if (activeChainId !== arcTestnet.id) {
-      await switchChainAsync({ chainId: arcTestnet.id });
+    setIsConnecting(true);
+    try {
+      await connectAsync({ connector, chainId: arcTestnet.id });
+      if (activeChainId !== arcTestnet.id) {
+        await switchChainAsync({ chainId: arcTestnet.id });
+      }
+    } finally {
+      // `login()` has had this since it was written; the connect never did, and a wallet request
+      // with no pending state is a button a user clicks again — which is how a second
+      // `eth_requestAccounts` reaches MetaMask and comes back -32002 with nothing on screen.
+      setIsConnecting(false);
     }
   }, [connectAsync, connectors, activeChainId, switchChainAsync]);
 
@@ -133,6 +145,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       session,
       address,
       isConnected,
+      isConnecting,
       isLoggingIn,
       login,
       logout,
@@ -143,6 +156,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       session,
       address,
       isConnected,
+      isConnecting,
       isLoggingIn,
       login,
       logout,
