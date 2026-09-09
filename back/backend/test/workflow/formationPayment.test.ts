@@ -11,7 +11,7 @@ import { keccak256, verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { CANCEL_AUTHORIZATION_TYPES } from "../../src/adapters/arc/usdcToken";
-import type { FormationPaymentConfig } from "../../src/formation/payment";
+import { type FormationPaymentConfig, quoteOf } from "../../src/formation/payment";
 import type { FormationExecutorDeps } from "../../src/payments/formationSettle";
 import { TRANSFER_WITH_AUTHORIZATION_TYPES } from "../../src/payments/transferAuthorization";
 import {
@@ -236,6 +236,17 @@ function deps(executor: FormationExecutorDeps): FormationPaymentDeps {
   };
 }
 
+/**
+ * Sign THE SERVED QUOTE (finding C1).
+ *
+ * `quoteOf` is the one thing in the system that builds this message, and it is what a guardian is
+ * handed. A test that rebuilt the six fields by hand would pass while the product served
+ * something else — which is the exact bug the single construction exists to prevent — so the
+ * happy path here signs the product's own object, field for field.
+ *
+ * `over` is for the UNhappy paths, and each override is a deliberate divergence FROM the served
+ * quote: a different signer, a different amount, a different payee.
+ */
 async function sign(
   c: CompanyRecord,
   over: Partial<{
@@ -247,17 +258,18 @@ async function sign(
   }> = {},
 ): Promise<Hex> {
   const row = payments.findLive(c.companyId, "formation")!;
+  const served = quoteOf(row, TENANT, domain).typedData;
   return (await (over.signer ?? guardian).signTypedData({
-    domain,
-    types: TRANSFER_WITH_AUTHORIZATION_TYPES,
-    primaryType: "TransferWithAuthorization",
+    domain: served.domain,
+    types: served.types,
+    primaryType: served.primaryType,
     message: {
-      from: TENANT,
-      to: over.to ?? REVENUE,
-      value: over.value ?? row.amountUsdc,
-      validAfter: 0n,
-      validBefore: BigInt(over.validBefore ?? row.validBefore),
-      nonce: over.nonce ?? row.nonce,
+      from: served.message.from,
+      to: over.to ?? served.message.to,
+      value: over.value ?? BigInt(served.message.value),
+      validAfter: BigInt(served.message.validAfter),
+      validBefore: BigInt(over.validBefore ?? served.message.validBefore),
+      nonce: over.nonce ?? served.message.nonce,
     },
   })) as Hex;
 }

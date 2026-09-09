@@ -50,6 +50,37 @@ export interface SettleAuthorization {
 }
 
 /**
+ * THE ONE STRING→BIGINT CONVERSION (finding C1).
+ *
+ * The message a guardian signs is built ONCE, by `quoteOf`, and it is built in the shape the wire
+ * and EIP-712 want: decimal strings. The token's calldata wants bigints. Between those two shapes
+ * there used to be three separate constructions of the same six fields — the served quote, the
+ * object handed to local verification, and the object handed to the executor — each free to
+ * disagree with the others about `validAfter` or the payee, and each disagreement producing a
+ * signature that verifies here and reverts on-chain.
+ *
+ * So: one builder (`quoteOf`) and one converter (this). Everything downstream consumes the served
+ * message.
+ */
+export function toSettleAuthorization(message: {
+  from: Address;
+  to: Address;
+  value: string;
+  validAfter: string;
+  validBefore: string;
+  nonce: Hex;
+}): SettleAuthorization {
+  return {
+    from: message.from,
+    to: message.to,
+    value: BigInt(message.value),
+    validAfter: BigInt(message.validAfter),
+    validBefore: BigInt(message.validBefore),
+    nonce: message.nonce,
+  };
+}
+
+/**
  * Default receipt wait. Arc has sub-second blocks, so this is a long time to be wrong about —
  * and being wrong is cheap now: an unresolved broadcast is resolved by the token's own logs on
  * the next sweeper pass, not by our patience here. Callers on a human's hot path pass less.

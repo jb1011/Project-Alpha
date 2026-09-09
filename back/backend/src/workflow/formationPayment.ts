@@ -16,6 +16,7 @@ import {
   chainTimeSec,
   submitCancelAuthorization,
   submitTransferWithAuthorization,
+  toSettleAuthorization,
 } from "../payments/formationSettle";
 import {
   type TransferAuthorizationDomain,
@@ -134,19 +135,17 @@ export async function settleFormationPayment(
       reason: "the payment must be signed by this company's guardian wallet",
     };
 
-  // Every field off the ROW, including the PAYEE (B1 gate A1): `deps.payment.revenueAddress` is
-  // where a quote's payee came from at insert time, and reading it again here would let an
-  // operator's Ledger rotation re-target a signature the guardian has already given.
-  const authorization = {
-    from: guardian,
-    to: row.payTo,
-    value: row.amountUsdc.toString(),
-    validAfter: "0",
-    validBefore: String(row.validBefore),
-    nonce: row.nonce,
-  };
+  // ⚠ THE MESSAGE IS BUILT ONCE, BY `quoteOf` (finding C1), from the ROW — including the PAYEE
+  // (gate A1): `deps.payment.revenueAddress` is where a quote's payee came from at insert time,
+  // and reading it again here would let a Ledger rotation re-target a signature already given.
+  //
+  // This is THE SAME object the guardian was served and signed. Reconstructing it here — as this
+  // code used to, twice, once for verification and once for the executor — is three chances for
+  // one field to differ, and every difference yields a signature that verifies locally and
+  // reverts on-chain.
+  const quote = quoteOf(row, guardian, domain);
   const verdict = await verifyTransferAuthorization({
-    authorization,
+    authorization: quote.typedData.message,
     signature: body.signature,
     domain,
     payTo: row.payTo,
@@ -191,14 +190,7 @@ export async function settleFormationPayment(
   const outcome = await broadcast(
     deps,
     row.paymentId,
-    {
-      from: guardian,
-      to: row.payTo,
-      value: row.amountUsdc,
-      validAfter: 0n,
-      validBefore: BigInt(row.validBefore),
-      nonce: row.nonce,
-    },
+    toSettleAuthorization(quote.typedData.message),
     body.signature,
     0,
   );
@@ -400,17 +392,15 @@ export async function advancePaymentOnChain(
   // while we were down; this one takes the current pending nonce and a bumped fee, so a stalled
   // settle is not stranded by a number that has nothing to do with the guardian.
   deps.payment.payments.bumpAttempt(row.paymentId);
+  // The SAME construction the settle route used (finding C1): the message the guardian signed is
+  // a function of the row, and `quoteOf` is the only thing that computes it. A resume that built
+  // its own would be a second chance to re-submit a subtly different authorization.
   const broadcastOutcome = await broadcast(
     deps,
     row.paymentId,
-    {
-      from: guardian,
-      to: row.payTo,
-      value: row.amountUsdc,
-      validAfter: 0n,
-      validBefore: BigInt(row.validBefore),
-      nonce: row.nonce,
-    },
+    toSettleAuthorization(
+      quoteOf(row, guardian, deps.payment.domain as TransferAuthorizationDomain).typedData.message,
+    ),
     row.signature,
     row.broadcastCount,
   );

@@ -340,18 +340,23 @@ test("PARITY: get_company_payment answers exactly what GET /companies/:id/paymen
 test("PARITY: submit_company_payment settles exactly as the REST door does", async () => {
   const { companyId } = seedCompanyWithQuote();
   const application = app(paymentCfg(true));
-  const row = payments.findLive(companyId, "formation")!;
+  // SIGNS WHAT THE TOOL SERVED (finding C1), through get_company_payment — the same object a
+  // real agent would hand to a guardian's wallet.
+  const served = JSON.parse(
+    (await callTool(application, "read", "get_company_payment", { companyId })).text,
+  ) as { quote: { typedData: { message: Record<string, string> } } };
+  const td = served.quote.typedData;
   const signature = await guardian.signTypedData({
     domain: { name: "USDC", version: "2", chainId: 5042002, verifyingContract: USDC },
     types: TRANSFER_WITH_AUTHORIZATION_TYPES,
     primaryType: "TransferWithAuthorization",
     message: {
-      from: OWNER,
-      to: REVENUE,
-      value: row.amountUsdc,
-      validAfter: 0n,
-      validBefore: BigInt(row.validBefore),
-      nonce: row.nonce,
+      from: td.message.from as `0x${string}`,
+      to: td.message.to as `0x${string}`,
+      value: BigInt(td.message.value!),
+      validAfter: BigInt(td.message.validAfter!),
+      validBefore: BigInt(td.message.validBefore!),
+      nonce: td.message.nonce as `0x${string}`,
     },
   });
   const { text, isError } = await callTool(application, "provision", "submit_company_payment", {

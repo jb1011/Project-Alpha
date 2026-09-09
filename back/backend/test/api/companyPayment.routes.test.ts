@@ -14,7 +14,6 @@ import { buildApiApp } from "../../src/api/app";
 import { signSession } from "../../src/auth/session";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
 import type { FormationPaymentConfig } from "../../src/formation/payment";
-import { TRANSFER_WITH_AUTHORIZATION_TYPES } from "../../src/payments/transferAuthorization";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -377,6 +376,36 @@ function appWithExecutor(
   } as any);
 }
 
+/** The served quote, as a caller receives it over the wire. */
+type ServedQuote = { typedData: Parameters<typeof signQuote>[0] };
+
+/** Sign a SERVED EIP-712 message, converting only the three uint256 strings viem wants as
+ *  bigints — the same translation the browser's `toWagmiTypedData` does. */
+async function signQuote(td: {
+  domain: Record<string, unknown>;
+  types: Record<string, { name: string; type: string }[]>;
+  primaryType: string;
+  message: Record<string, string>;
+}): Promise<`0x${string}`> {
+  return guardian.signTypedData({
+    // biome-ignore lint/suspicious/noExplicitAny: a served EIP-712 request, typed at the wire
+    domain: td.domain as any,
+    // biome-ignore lint/suspicious/noExplicitAny: as above
+    types: td.types as any,
+    // biome-ignore lint/suspicious/noExplicitAny: as above
+    primaryType: td.primaryType as any,
+    message: {
+      from: td.message.from,
+      to: td.message.to,
+      value: BigInt(td.message.value!),
+      validAfter: BigInt(td.message.validAfter!),
+      validBefore: BigInt(td.message.validBefore!),
+      nonce: td.message.nonce,
+      // biome-ignore lint/suspicious/noExplicitAny: as above
+    } as any,
+  });
+}
+
 async function post(
   application: ReturnType<typeof buildApiApp>,
   path: string,
@@ -398,20 +427,10 @@ test("settle: a real guardian signature settles through the door and readies the
   const executor = fakeExecutor();
   const { body } = await create(cfg);
   const companyId = body.companyId as unknown as string;
-  const row = payments.findLive(companyId, "formation")!;
-  const signature = await guardian.signTypedData({
-    domain: cfg.domain,
-    types: TRANSFER_WITH_AUTHORIZATION_TYPES,
-    primaryType: "TransferWithAuthorization",
-    message: {
-      from: OWNER,
-      to: REVENUE,
-      value: row.amountUsdc,
-      validAfter: 0n,
-      validBefore: BigInt(row.validBefore),
-      nonce: row.nonce,
-    },
-  });
+  // ⚠ SIGNS WHAT THE DOOR SERVED (finding C1) — the typed data off the create response, not a
+  // rebuild of the same six fields. A test that rebuilds them passes while the product serves
+  // something else, which is the one failure the single construction exists to prevent.
+  const signature = await signQuote((body.payment as unknown as ServedQuote).typedData);
   const res = await post(appWithExecutor(cfg, executor), `/companies/${companyId}/payment/settle`, {
     signature,
     from: OWNER,
