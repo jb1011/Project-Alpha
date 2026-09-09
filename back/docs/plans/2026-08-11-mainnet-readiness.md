@@ -85,6 +85,58 @@ browser at all.
    hardware wallet still cannot push a silent fleet-wide upgrade. A timelock also gives agent operators
    a window to observe a pending upgrade and exit. Target this before open signup, not before launch.
 
+### 📋 Hardware wallet checklist — device in hand 2026-08-28
+
+The Ledger has arrived, so the four requirements above become concrete steps. Nothing here is on the
+critical path this week; it is recorded so it can be picked up deliberately rather than improvised on
+deploy day.
+
+**Device discipline (do first, once)**
+
+- [ ] Dedicated device, used for this and nothing else. No other accounts, no other chains in daily use.
+- [ ] Recovery phrase written on paper, stored offline in **≥2 physical locations**, never typed into
+      any computer, never photographed, never entered into a password manager.
+- [ ] Record the address (not the key) here and in the deploy config as the designated mainnet admin.
+
+**Prove control — the gate we skipped last time**
+
+- [ ] Send at least one transaction **from** the Ledger address on Arc and confirm it on-chain.
+      When beacon ownership moved to the MetaMask account on testnet the destination had nonce 0, so
+      we relied on EIP-55 checksum validity plus the recoverability of testnet. Repeat this on
+      **mainnet before the address is used there**: it is mandatory, no exceptions (§ above).
+
+**Rehearse the tooling on testnet — the real reason to do this early**
+
+- [ ] Ledger sits behind MetaMask as the account; our one-click ceremony page drives MetaMask
+      (the 2026 MetaMask UI has no hex-data field, which is why the page exists).
+- [ ] **Blind signing must be enabled on the device** for contract calldata. Discovering on mainnet
+      deploy day that the device will not sign our calls would be an expensive hour.
+- [ ] Optional but recommended: transfer the **testnet** controller admin to the Ledger as a full
+      rehearsal of the two-step — `beginDefaultAdminTransfer` → 24h wait → `acceptDefaultAdminTransfer`,
+      cancellable during the window. Side effect: every later testnet role change needs the device
+      plugged in.
+
+**Mainnet shape — deploy with it, do not transfer to it**
+
+- [ ] `BEACON_OWNER` and `CONTROLLER_ADMIN` are **deploy parameters** set to the hardware address, so
+      the roles are never collapsed on mainnet even briefly. There is no handover ceremony on mainnet
+      if this is done right.
+
+**Second operator (deferred, deliberately)**
+
+- [ ] Decide which controller selectors a second operator would hold, and write the `grantRole` /
+      `revokeRole` commands into the mainnet deploy runbook so it is a rehearsed step.
+- [ ] Do **not** grant it before there is a task that needs it. Nothing in the 2026-08-24 hardening
+      batch requires on-chain signing, and the one task that does (the `file://` metadata backfill)
+      cannot use a controller credential at all: those are legacy agents whose manager is the platform
+      key itself, immutable in `AgentTreasury` with no setter in `LegalManager`, so they route direct
+      forever. Grant at mainnet deploy or first on-call need, scoped, and revoke when done.
+
+**Still not the final shape**
+
+- [ ] A single hardware wallet remains a single point of failure. Multisig + timelock stays the target
+      **before open signup**, not before launch (§ above, item 4).
+
 ### 🟠 Remaining S4 work, in blast-radius order
 
 | # | Role still on the platform key | Fix | Gate |
