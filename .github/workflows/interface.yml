@@ -1,0 +1,56 @@
+name: Interface
+
+# The interface had no CI at all: `interface/**` could go red on main with nothing to say so, and
+# this branch is the first to put load-bearing claims copy behind a test suite (the AgentBook chip
+# says, in five permitted labels, whether a real person vouched for an address).
+#
+# Deliberately NOT here:
+#   - `npm run lint` — 21 findings (13 errors) predate this workflow, all in components no branch
+#     has touched. A job that is red on arrival teaches everyone to ignore it. Add it in the PR
+#     that clears the baseline.
+#   - `next build` — needs the deployment's env to render; Vercel builds every push already.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "interface/**"
+      - ".github/workflows/interface.yml"
+  push:
+    branches: [main]
+    paths:
+      - "interface/**"
+      - ".github/workflows/interface.yml"
+
+# A newer push to the same branch/PR cancels the older in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  interface:
+    name: Interface (tsc + vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: interface
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.18.2" # same as the backend job in ci.yml
+          cache: npm
+          cache-dependency-path: interface/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npx vitest run

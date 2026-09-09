@@ -98,6 +98,15 @@ browser at all.
 Item 2 is the one with a schedule risk: it is a **contract change**, so it needs to land before the
 mainnet deploy or every mainnet agent inherits the same collapsed-role problem permanently.
 
+### Keys added since, deliberately NOT on the platform key
+
+The rule this section exists to establish, applied going forward: a new capability gets its own key,
+scoped to one chain and one job, with a boot invariant that refuses to share it.
+
+| Key | Scope | Custody | Invariant |
+|---|---|---|---|
+| `WORLDCHAIN_SUBMITTER_PRIVATE_KEY` (2026-09-08) | World Chain ETH only, AgentBook registrations | hot, on the API box | refuses equality with every other configured key at boot, in every environment. Absent = the feature is simply off (`GET /config.agentBookRegistrationAvailable: false`); in production, set without the `WORLD_*` portal block, boot refuses. Runbook: [`../runbooks/agentbook-registration.md`](../runbooks/agentbook-registration.md) |
+
 ---
 
 ## 2. Pocket master seed (security item **S3**) — ⚪ decision pending

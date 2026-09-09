@@ -213,6 +213,11 @@ export type PublicConfig = {
     >;
     reuseDisclosure: string;
   };
+  /** Whether this deployment can WRITE an AgentBook registration (design 2026-08-25 v3 §4.5).
+   *  The READ side is wired everywhere, so the status chip answers regardless; only the vouch
+   *  flow is gated on this. Optional for deploy-order safety: absent means the backend predates
+   *  the feature, i.e. unavailable. */
+  agentBookRegistrationAvailable?: boolean;
 };
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).
@@ -405,11 +410,37 @@ export type PasskeyView = {
   revokedAt: number | null;
 };
 
+/** One failed field of a `validation_error`: the backend maps every Zod issue to this shape. */
+export type ApiValidationIssue = { path: string; message: string };
+
+/**
+ * The `details` of a refusal that is not a `validation_error` — a small object the route attached
+ * to say WHICH refusal it is, where the code alone is too coarse to act on.
+ *
+ * Open-ended on purpose: it is a bag of route-specific hints, not a schema, and a caller that does
+ * not recognise a key must ignore it rather than break. The named keys are the ones a surface
+ * currently branches on; everything else stays `unknown` so reading it forces a check.
+ */
+export type ApiErrorDetail = {
+  /** `not_ready` (AgentBook): `"no-pocket-yet"`, `"no-agent-id-yet"`, or `"entity-is-<status>"`. */
+  reason?: string;
+  /** `proof_rejected` (AgentBook): the contract error name the registry reverted with. NEVER the
+   *  revert message — that would carry the proof arguments. */
+  errorName?: string;
+  /** `not_eligible` (AgentBook): the World ID credential on file, null when there is none. */
+  credential?: string | null;
+  [key: string]: unknown;
+};
+
+/** Either shape the `details` field can take. Discriminate with `Array.isArray`, or use
+ *  `apiErrorDetail()` below. */
+export type ApiErrorDetails = ApiValidationIssue[] | ApiErrorDetail;
+
 export type ApiErrorBody = {
   error: {
     code: string;
     message: string;
-    details?: { path: string; message: string }[];
+    details?: ApiErrorDetails;
   };
 };
 
@@ -469,11 +500,128 @@ export type WorldIdStatusView = {
   attestation?: { minAge: number; credential?: string | null; verifiedAt: number };
 };
 
+/* ── AgentBook (World's registry on World Chain) ──────────────────────────── */
+
+/**
+ * What the registry says about this agent's wallet, after every source has been reconciled.
+ *
+ * `unknown` is its own answer, and the reason this exists beside `registered`: a World Chain read
+ * we could not make must never render as a refusal. `disputed` means a human answers for the
+ * wallet who is not the one we registered.
+ */
+export type AgentBookOutcome = "registered" | "unregistered" | "unknown" | "disputed";
+
+/** Where OUR registration attempt got to. Deliberately independent of `AgentBookOutcome`: the row
+ *  can read `confirmed` while the chain reads `disputed`. */
+export type AgentBookRowStatus =
+  | "pending"
+  | "submitted"
+  | "confirmed"
+  | "disputed"
+  | "failed"
+  | "expired";
+
+/**
+ * AgentBook standing for one agent (GET /entities/:id/agentbook).
+ *
+ * `registered` is the CHAIN's answer and `status` is OURS; they are separate on purpose, because a
+ * registration that is signed and broadcast but not yet mined is honestly `status: "submitted"`
+ * with `registered: false`. Render `outcome` — it folds "could not check" out of the boolean.
+ *
+ * Everything the vouch feature added is optional for deploy-order safety: the interface and the
+ * API deploy separately and this route predates the feature, so a new browser can meet an old
+ * backend. An absent `outcome` is exactly that backend, and it is read as **`unknown`** — "could
+ * not check", never a vouch. It is tempting to fall back to `registered`, but that boolean cannot
+ * distinguish "no entry" from "we could not reach World Chain", and both of the claims it would
+ * then make are public statements about a real person (design v3 §5.4, D9). Absent `disputed` is
+ * `false`. `src/lib/agentbook/chipState.ts` is the one implementation of this rule; render through
+ * it rather than reading these fields directly.
+ */
+export type AgentBookStatusView = {
+  registered: boolean;
+  /** The pseudonym of the human AgentBook binds to the wallet, when there is one. */
+  humanId?: string;
+  /** The address AgentBook was queried for: the agent's pocket EOA, which is what signs AgentKit
+   *  challenges and therefore what a seller looks up. Absent only before the pocket exists.
+   *  EIP-55 checksummed, the same form the session response uses — the guardian is asked to
+   *  compare the two by eye. Compare it in code case-insensitively regardless: an older backend
+   *  serves the stored form. */
+  address?: string;
+  /** Why there is nothing to look up yet, and the API has exactly one: the agent has no payment
+   *  address, so there is no question to put to AgentBook and the dashboard shows no chip. */
+  reason?: "no-pocket-yet";
+  outcome?: AgentBookOutcome;
+  /** Absent when nothing has ever been registered for this agent from here. */
+  status?: AgentBookRowStatus;
+  /** null while the transaction is signed and recorded but not yet on the wire. The reconciler
+   *  re-broadcasts the same raw transaction, so that is "hash pending", never "failed". */
+  txHash?: string | null;
+  disputed?: boolean;
+  /** The contract error name from the last attempt. Only sent when `status` is `"failed"`. */
+  errorCode?: string;
+  /**
+   * The network the AGENT runs on — not AgentBook's, which is always World Chain mainnet.
+   *
+   * The same value the session response carries, served here so the consent step can say
+   * "this agent runs on Arc testnet, the vouch is on mainnet and is just as permanent" BEFORE the
+   * checkbox rather than after it (design §5.1, final review FR-F). Absent from a backend that
+   * predates the field: the line is then omitted rather than guessed, because guessing "mainnet"
+   * would suppress a warning that is true and guessing "testnet" would print one that is false.
+   */
+  network?: "testnet" | "mainnet";
+  /**
+   * Confirmed vouches this GUARDIAN'S TENANT has already made — per tenant, not per human. Also
+   * from the session response, for the second §5.1 line. Absent means "not told": the linkability
+   * line is omitted rather than rendered with a zero, which would read as a claim that this is
+   * their first vouch.
+   */
+  priorVouches?: number;
+};
+
+/** POST /entities/:id/agentbook/session — everything the World App round trip needs. */
+export type AgentBookSessionView = {
+  /** Opaque handle, handed back verbatim on register. */
+  sessionId: string;
+  appId: string;
+  action: string;
+  /** `encodePacked(address, uint256 nonce)`: what the proof commits to, so neither the address nor
+   *  the nonce can move between session and register. */
+  signal: `0x${string}`;
+  /** The registry nonce, decimal. Hand it back unchanged — a mismatch is a 409. */
+  nonce: string;
+  /** The address AgentBook will bind, checksummed. */
+  pocketAddress: `0x${string}`;
+  /** The agent's on-chain id. Always a string: the route refuses a session for an agent that has
+   *  none. */
+  agentId: string;
+  /** Epoch ms. Past it, register answers 409 and the guardian starts again. */
+  expiresAt: number;
+  network: "testnet" | "mainnet";
+  /** Confirmed vouches this GUARDIAN'S TENANT has already made — per tenant, not per human: our
+   *  World ID pseudonym for this account is not the guardian's AgentBook pseudonym. */
+  priorVouches: number;
+};
+
+/** POST /entities/:id/agentbook/register — the World ID proof, as the widget produced it. */
+export type AgentBookRegisterBody = {
+  sessionId: string;
+  root: string;
+  /** The nonce the session handed out, unchanged. */
+  nonce: string;
+  nullifierHash: string;
+  /** Exactly 8 elements; the backend rejects any other length. */
+  proof: string[];
+};
+
+/** The register route's answer. `txHash` is null when the transaction is signed and recorded but
+ *  the broadcast did not land — the reconciler re-broadcasts the same raw transaction, so that is
+ *  "submitted, hash pending" and NOT something for the caller to retry. */
+export type AgentBookRegisterResult = { status: "submitted"; txHash: string | null };
 
 export class ApiError extends Error {
   code: string;
   status: number;
-  details?: { path: string; message: string }[];
+  details?: ApiErrorDetails;
 
   constructor(status: number, body: ApiErrorBody["error"]) {
     super(body.message);
@@ -648,3 +796,15 @@ export type CompanyIntakeUpdate = Omit<CompanyIntakeInput, "partyId" | "syntheti
   /** The §4.6a decision: the clock took the number and the owner is choosing the slower route. */
   proceedWithoutSsn?: true;
 };
+
+/**
+ * `ApiError.details` as the hint object, or undefined.
+ *
+ * The one place the two shapes are told apart, so no surface has to cast. A `validation_error`'s
+ * issue array is NOT a hint object and comes back undefined rather than as an array with no
+ * `reason` on it — a caller reading `?.reason` gets the same answer either way, and one that
+ * wants the issues can still ask `Array.isArray(err.details)`.
+ */
+export function apiErrorDetail(details: ApiErrorDetails | undefined): ApiErrorDetail | undefined {
+  return details !== undefined && !Array.isArray(details) ? details : undefined;
+}

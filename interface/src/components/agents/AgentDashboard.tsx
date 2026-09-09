@@ -5,7 +5,8 @@ import Link from "next/link";
 import { useQueryClient } from "@tanstack/react-query";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
-import { useAgentDashboardQueries } from "@/lib/api/hooks";
+import { agentBookChipState } from "@/lib/agentbook/chipState";
+import { useAgentDashboardQueries, usePublicConfigQuery } from "@/lib/api/hooks";
 import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
@@ -16,9 +17,16 @@ import { treasuryAbi } from "@/lib/treasuryAbi";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { JobsReputationCard } from "@/components/agents/JobsReputationCard";
 import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
+import { VouchDialog } from "@/components/agents/VouchDialog";
+import { NO_POCKET_COPY } from "@/lib/agentbook/failure";
 import { FormationCard } from "@/components/agents/FormationCard";
 import { AmberPill, Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
+
+/** One class for every AgentBook state. The chip used to turn emerald with a filled dot when the
+ *  registry answered yes — a registry entry is a fact to link to, not a badge (design v3 D9). */
+const AGENTBOOK_CHIP_CLASS =
+  "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-muted-2 transition-colors hover:text-ink";
 
 export function AgentDashboard({
   entityId,
@@ -44,7 +52,8 @@ export function AgentDashboard({
   const entity = entityQuery.data ?? null;
   const treasury = treasuryQuery.data ?? null;
   const runs = runsQuery.data ?? [];
-  const agentBook = agentBookQuery.data ?? null;
+  const agentBookChip = agentBookChipState(agentBookQuery.data);
+  const agentBookView = agentBookQuery.data ?? null;
   const loadError =
     entityQuery.error instanceof Error
       ? entityQuery.error.message
@@ -55,6 +64,34 @@ export function AgentDashboard({
   const [pausing, setPausing] = useState(false);
   const [pauseError, setPauseError] = useState<string | null>(null);
 
+  /**
+   * The vouch affordance (design v3 §3, §5). Shown DISABLED with the reason rather than hidden:
+   * an owner who cannot vouch is owed the reason, and a button that appears and disappears with a
+   * poll is worse than one that says why it is off. `disputed` deliberately re-enables it — a
+   * guardian may answer a replacement once; the backend's lifetime cap is what stops the loop.
+   */
+  const publicConfig = usePublicConfigQuery();
+  const [vouchOpen, setVouchOpen] = useState(false);
+  const canVouch = publicConfig.data?.agentBookRegistrationAvailable === true;
+  // A `pending` row does NOT disable this. It is a session waiting for World App, and
+  // `POST /entities/:id/agentbook/session` (back/backend/src/api/routes/agentBook.ts) does not
+  // refuse while one exists — it opens another, bounded by the lifetime and per-hour caps. So the
+  // only honest states here are the ones the chip already distinguishes: `submitting` is a
+  // broadcast transaction, `vouched` an entry in the registry (final review FR-B).
+  const vouchDisabledReason = publicConfig.isPending
+    ? "Checking whether vouching is enabled here"
+    : !canVouch
+      ? "Vouching is not enabled on this deployment"
+      : !agentBookView
+        ? "Checking this agent's AgentBook standing"
+        : agentBookView.reason === "no-pocket-yet"
+          ? NO_POCKET_COPY
+          : agentBookChip?.kind === "submitting"
+            ? "A vouch for this address is already in flight"
+            : agentBookChip?.kind === "vouched"
+              ? "Already vouched"
+              : null;
+
   const treasuryAddr = entity?.treasury ?? null;
 
   async function refreshDashboard() {
@@ -64,6 +101,9 @@ export function AgentDashboard({
       queryClient.invalidateQueries({ queryKey: apiKeys.entity(token, entityId) }),
       queryClient.invalidateQueries({ queryKey: apiKeys.entityTreasury(token, entityId) }),
       queryClient.invalidateQueries({ queryKey: apiKeys.entityRuns(token, entityId) }),
+      // The chip is on this card too, and the dialog's poll dies with the dialog: without this,
+      // Refresh is the one control that cannot refresh the one answer that changes on its own.
+      queryClient.invalidateQueries({ queryKey: apiKeys.entityAgentBook(token, entityId) }),
     ]);
   }
 
@@ -188,37 +228,24 @@ export function AgentDashboard({
               On-chain identity
             </div>
             <div className="flex flex-wrap items-center gap-2">
-            {agentBook && (
-              <span
-                title={
-                  agentBook.registered
-                    ? `AgentBook (World Chain): human ${agentBook.humanId?.slice(0, 14)}… answers for this agent's wallet`
-                    : agentBook.reason === "no-pocket-yet" ||
-                        agentBook.reason === "no-operator-yet"
-                      ? "Agent still provisioning — payment wallet not set yet"
-                      : "Not registered in AgentBook"
-                }
-                className={
-                  agentBook.registered
-                    ? "inline-flex items-center gap-1.5 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1.5 text-[11.5px] text-emerald-300"
-                    : "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-muted-2"
-                }
-              >
-                <span
-                  aria-hidden
-                  className={
-                    agentBook.registered
-                      ? "h-1.5 w-1.5 rounded-full bg-emerald-300"
-                      : "h-1.5 w-1.5 rounded-full border border-muted-2"
-                  }
-                />
-                {agentBook.registered
-                  ? "AgentBook · human-backed"
-                  : agentBook.reason === "no-operator-yet"
-                    ? "AgentBook · provisioning"
-                    : "AgentBook · not registered"}
-              </span>
-            )}
+            {/* One neutral chip, one claim, whatever the answer is (design v3 §5.4, D9). The
+                wording and the order the answers are read in live in agentBookChipState. */}
+            {agentBookChip &&
+              (agentBookChip.href ? (
+                <a
+                  href={agentBookChip.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={agentBookChip.title}
+                  className={AGENTBOOK_CHIP_CLASS}
+                >
+                  {agentBookChip.label}
+                </a>
+              ) : (
+                <span title={agentBookChip.title} className={AGENTBOOK_CHIP_CLASS}>
+                  {agentBookChip.label}
+                </span>
+              ))}
             {ensName(entity) && (
               <a
                 href={`${ENS_EXPLORER_URL}/${ensName(entity)}`}
@@ -232,8 +259,30 @@ export function AgentDashboard({
                 <span aria-hidden className="text-[10px] opacity-70">↗</span>
               </a>
             )}
+            <button
+              type="button"
+              disabled={vouchDisabledReason !== null}
+              title={vouchDisabledReason ?? "Vouch for this agent in AgentBook"}
+              onClick={() => setVouchOpen(true)}
+              className="rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-ink transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {agentBookChip?.kind === "disputed" ? "Vouch again in AgentBook" : "Vouch in AgentBook"}
+            </button>
             </div>
           </div>
+          <VouchDialog
+            entityId={entityId}
+            agentId={entity.agentId ?? ""}
+            open={vouchOpen}
+            onClose={() => setVouchOpen(false)}
+          />
+          {/* Said out loud, not on hover: a submit we could not confirm is not a registration that
+              did not happen, and the chip has no room to say so (§5.2, verbatim). */}
+          {agentBookChip?.note && (
+            <p className="mt-3 max-w-[70ch] text-[11.5px] leading-[1.55] text-muted-2">
+              {agentBookChip.note}
+            </p>
+          )}
           <dl className="mt-4 grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
             {entity.agentId && <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />}
             {entity.treasury && (
@@ -396,7 +445,7 @@ export function AgentDashboard({
                     ? entity.trustPolicy === "verified-legal-bodies-only"
                       ? "Strictest — legal bodies only (own setting)"
                       : entity.trustPolicy === "verified-sellers-only"
-                        ? "Strict — human-backed sellers (own setting)"
+                        ? "Strict — sellers vouched for in AgentBook (own setting)"
                         : "Open (own setting)"
                     : "Platform default"
                 }

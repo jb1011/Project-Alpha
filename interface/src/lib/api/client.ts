@@ -1,5 +1,9 @@
 import { API_URL } from "./config";
 import type {
+  AgentBookRegisterBody,
+  AgentBookRegisterResult,
+  AgentBookSessionView,
+  AgentBookStatusView,
   AgentRun,
   AgentSpec,
   ApiErrorBody,
@@ -417,20 +421,31 @@ export function worldIdStatus(token: string, requestId: string): Promise<WorldId
 }
 
 /** AgentBook standing for an agent: does a verified human publicly answer for its wallet? */
-export function entityAgentBook(
+export function entityAgentBook(token: string, id: string): Promise<AgentBookStatusView> {
+  return request<AgentBookStatusView>(`/entities/${encodeURIComponent(id)}/agentbook`, { token });
+}
+
+/** Start a vouch: the backend reads the registry nonce and records a pending session. 403 when the
+ *  guardian's World ID is not from an Orb, 409 before the agent is on chain, 503 where this
+ *  deployment cannot write (`PublicConfig.agentBookRegistrationAvailable`). */
+export function agentBookSession(token: string, id: string): Promise<AgentBookSessionView> {
+  return request<AgentBookSessionView>(`/entities/${encodeURIComponent(id)}/agentbook/session`, {
+    token,
+    body: {},
+  });
+}
+
+/** Hand the World ID proof to the backend, which submits the registration on World Chain. A proof
+ *  is single-use, so a 400 `proof_rejected` means starting the whole flow again, not retrying. */
+export function agentBookRegister(
   token: string,
   id: string,
-): Promise<{
-  registered: boolean;
-  /** `no-operator-yet` is kept only so a browser running an older build still parses a response
-   *  from a backend that predates the pocket-address fix; the API no longer emits it. */
-  reason?: "not registered" | "no-operator-yet" | "no-pocket-yet";
-  humanId?: string;
-  /** The address AgentBook was queried for: the agent's pocket EOA, which is what signs AgentKit
-   *  challenges and therefore what a seller looks up. */
-  address?: string;
-}> {
-  return request(`/entities/${encodeURIComponent(id)}/agentbook`, { token });
+  body: AgentBookRegisterBody,
+): Promise<AgentBookRegisterResult> {
+  return request<AgentBookRegisterResult>(`/entities/${encodeURIComponent(id)}/agentbook/register`, {
+    token,
+    body,
+  });
 }
 
 /** Params for the identity step-up widget. 404 when the deployment has no attest action; 403

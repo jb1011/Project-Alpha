@@ -354,7 +354,9 @@ export function AgentSettings({ entityId }: { entityId: string }) {
             >
               <option value="inherit">Platform default</option>
               <option value="open">Open — pay any seller the on-chain policy allows</option>
-              <option value="verified-sellers-only">Strict — only human-backed sellers (World AgentBook)</option>
+              <option value="verified-sellers-only">
+                Strict — only sellers vouched for in World&rsquo;s AgentBook
+              </option>
               <option value="verified-legal-bodies-only">Strictest — only active Novi Corpus legal bodies</option>
             </select>
           </Field>

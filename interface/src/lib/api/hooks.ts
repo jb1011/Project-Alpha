@@ -9,6 +9,8 @@ import {
 import { useCallback } from "react";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import {
+  agentBookRegister,
+  agentBookSession,
   bootstrapConnection,
   createCompany,
   createConnectionPackage,
@@ -55,7 +57,9 @@ import {
 } from "./formationEnvironment";
 import { apiKeys } from "./keys";
 import { TERMINAL } from "./poll";
+import { ApiError } from "./types";
 import type {
+  AgentBookRegisterBody,
   AgentSpec,
   BootstrapPackage,
   Capability,
@@ -795,6 +799,71 @@ export function useWorldIdAttestVerifyMutation() {
     onSuccess: async () => {
       const token = await ensureToken();
       await queryClient.invalidateQueries({ queryKey: apiKeys.worldIdMe(token) });
+    },
+  });
+}
+
+/* ── AgentBook mutations ──────────────────────────────────────────────────── */
+
+/**
+ * Open a vouch session.
+ *
+ * This DOES move the status view even though nothing is registered yet: the route inserts a
+ * `pending` row and the GET serves the latest row, so the chip reads `status: "pending"` from here
+ * on. No invalidation is wired in, and `useEntityAgentBookQuery` has no `refetchInterval` — the
+ * dialog is the only thing that knows when a session opened and when the flow is still in flight,
+ * so Task 9 invalidates `apiKeys.entityAgentBook` after this resolves and polls while in flight,
+ * rather than every dashboard paying for a poll it does not need.
+ */
+export function useAgentBookSessionMutation(entityId: string) {
+  const ensureToken = useEnsureAuthToken();
+
+  return useMutation({
+    mutationFn: async () => {
+      const token = await ensureToken();
+      return agentBookSession(token, entityId);
+    },
+  });
+}
+
+/**
+ * Submit the World ID proof.
+ *
+ * `onSettled`, not `onSuccess`: the failures here move the stored row too — a 409 means a
+ * registration is already in flight, and a 400 `proof_rejected` fails the row with an `errorCode`
+ * (the chip does not render the code; it falls through to the chain's answer, which for a row that
+ * never broadcast is the whole truth). Refetching only on success would leave the chip stale in
+ * exactly the cases the guardian most needs to see.
+ *
+ * Two different tokens on purpose. The REQUEST takes the ensured one, because the World App round
+ * trip between session and register is minutes long and the session may have been refreshed in
+ * between. The invalidation KEY takes the rendered one, which is what `useEntityAgentBookQuery`
+ * keyed its cache entry with — an ensured token that had just rotated would build a key matching
+ * no cached query and silently invalidate nothing.
+ */
+export function useAgentBookRegisterMutation(entityId: string) {
+  const queryClient = useQueryClient();
+  const token = useAuthToken();
+  const ensureToken = useEnsureAuthToken();
+
+  return useMutation({
+    mutationFn: async (body: AgentBookRegisterBody) => {
+      // Ensuring the token can prompt a SIWE signature, and the guardian may dismiss it. That
+      // failure is PRE-FLIGHT: no request left the browser. Left as a bare `Error` the classifier
+      // would read it as "we do not know" and tell them the registration may still have gone
+      // through — a false statement in one of the few cases we positively know nothing was sent.
+      let fresh: string;
+      try {
+        fresh = await ensureToken();
+      } catch {
+        throw new ApiError(401, { code: "unauthorized", message: "sign-in required" });
+      }
+      return agentBookRegister(fresh, entityId, body);
+    },
+    onSettled: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: apiKeys.entityAgentBook(token ?? "", entityId),
+      });
     },
   });
 }

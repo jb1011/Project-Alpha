@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { WorldStore } from "../persistence/worldStore";
 import type { Address } from "../types";
-import { createAgentBookReader } from "./agentBookReader";
+import { AGENT_BOOK_ADDRESS, AGENT_BOOK_CAIP2, createAgentBookReader } from "./agentBookReader";
 
 /**
  * Seller-side "is this agent backed by a real, unique human?" check.
@@ -25,9 +25,6 @@ const loadAgentkit = () => {
   return agentkitMod;
 };
 
-/** Canonical World Chain deployment — same address our config defaults to. */
-const AGENT_BOOK_DEFAULT = "0xA23aB2712eA7BBa896930544C7d6636a96b944dA";
-
 const CACHE_TTL_MS = 60 * 60_000; // 1h — a registration is stable once made
 /** Deliberately much shorter than the positive TTL: "not registered" is a state the agent is
  *  actively trying to leave, so a stale negative is a bad checkout experience. Long enough to
@@ -38,7 +35,10 @@ const NEGATIVE_CACHE_TTL_MS = 60_000; // 1 min
 function defaultAgentBook(cfg: AgentkitSellerConfig) {
   return createAgentBookReader({
     ...(cfg.worldChainRpc ? { rpcUrl: cfg.worldChainRpc } : {}),
-    contractAddress: (cfg.agentBookAddress ?? AGENT_BOOK_DEFAULT) as Address,
+    // ONE constant for the whole codebase (§4.1): the registrar writes to it, the reader and this
+    // seller check read it. Three hand-copied literals is how a redeployment ends up confirming
+    // every vouch in a registry no seller looks the agent up in.
+    contractAddress: (cfg.agentBookAddress ?? AGENT_BOOK_ADDRESS) as Address,
   });
 }
 
@@ -47,7 +47,8 @@ export interface AgentkitSellerConfig {
   domain: string;
   /** Full public resource URL (through the proxy) — must match what the client signed. */
   resourceUrl: string;
-  /** CAIP-2 of the paid route's chain (Arc), advertised in supportedChains. */
+  /** CAIP-2 of the paid route's chain (Arc); World Chain is always advertised beside it because
+   *  every AgentKit client in the wild signs for `eip155:480` (design v3 D10). */
   network: string;
   store: WorldStore;
   /** Per-human authorization allowance for this resource before settlement is required. */
@@ -56,7 +57,10 @@ export interface AgentkitSellerConfig {
   worldChainRpc?: string;
   /** AgentBook address (optional; SDK default is the canonical World Chain deployment). */
   agentBookAddress?: string;
-  /** RPC overrides for signature verification, keyed by CAIP-2 (e.g. Arc). */
+  /** RPC URLs for signature verification, keyed by CAIP-2. The verifier takes ONE url — the one
+   *  for the chain the inbound payload names — so this needs an entry per chain we advertise.
+   *  EIP-191 needs none (the address is recovered locally); ERC-1271 needs the url for the chain
+   *  the smart account lives on, because verification is a contract call there. */
   rpcUrls?: Record<string, string>;
   /** Test seam: inject a verifier instead of hitting World Chain. */
   agentBook?: { lookupHuman(address: string): Promise<string | null> };
@@ -82,7 +86,12 @@ export async function mintAgentkitExtension(cfg: {
   const ext = declareAgentkitExtension({
     domain: cfg.domain,
     resourceUri: cfg.resourceUrl,
-    network: cfg.network,
+    // Two chains, deliberately (design v3 D10). Settlement is on Arc, but AgentBook lives on
+    // World Chain and every AgentKit client in the wild signs its challenge for `eip155:480` —
+    // advertising only Arc makes those clients skip the proof. The SDK accepts a string or an
+    // array here (`declareAgentkitExtension`, agentkit/dist/cjs/index.js) and emits one
+    // {chainId, type} entry per signature scheme for each `eip155:*` network.
+    network: [cfg.network, AGENT_BOOK_CAIP2],
     statement:
       "Prove this agent is backed by a verified unique human to be authorized on this resource",
   }) as unknown as { agentkit: { info: Record<string, unknown> } };
@@ -126,11 +135,14 @@ export async function verifyAgentkitRequest(
     if (!validation.valid)
       return { authorized: false, reason: `invalid-message:${validation.error ?? "unknown"}` };
 
-    const sig = await verifyAgentkitSignature(
-      payload,
-      // biome-ignore lint/suspicious/noExplicitAny: options accept string | { rpcUrls }.
-      (cfg.rpcUrls ? { rpcUrls: cfg.rpcUrls } : undefined) as any,
-    );
+    // ONE url, for the chain THIS payload names — the SDK's second parameter is
+    // `rpcUrl?: string` (agentkit-core `verifyAgentkitSignature`, re-exported unchanged by
+    // `@worldcoin/agentkit`), and it goes straight into viem's `http()`. Passing the whole map
+    // (which we did until this was caught) made that transport unusable: EIP-191 still passed
+    // because viem's verifyMessage falls back to local ECDSA recovery when the call fails, but
+    // ERC-1271 — a contract call on the account's own chain — could never succeed. Undefined is
+    // fine and means "use viem's default endpoint for this chain".
+    const sig = await verifyAgentkitSignature(payload, cfg.rpcUrls?.[payload.chainId]);
     if (!sig.valid || !sig.address)
       return { authorized: false, reason: `invalid-signature:${sig.error ?? "unknown"}` };
     const agentAddress = sig.address;

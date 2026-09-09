@@ -1,6 +1,11 @@
 import { http, type PublicClient, createPublicClient, toHex } from "viem";
 import type { Address } from "../types";
 
+export const AGENT_BOOK_CHAIN_ID = 480;
+export const AGENT_BOOK_CAIP2 = "eip155:480";
+/** Canonical World Chain deployment; the SDK verifier and our reader both resolve here. */
+export const AGENT_BOOK_ADDRESS = "0xA23aB2712eA7BBa896930544C7d6636a96b944dA" as const;
+
 /**
  * AgentBook `lookupHuman` read that distinguishes "not registered" from "could not tell".
  *
@@ -17,17 +22,49 @@ import type { Address } from "../types";
  *   - returns non-zero -> hex id   : registered
  *   - throws           -> throws   : we do not know, and must not pretend we do
  *
- * The ABI is one function and the address is already in our own config (`WORLD_AGENTBOOK_ADDRESS`,
- * same canonical World Chain deployment the SDK defaults to), so this duplicates nothing we were
- * not already carrying.
+ * The address is already in our own config (`WORLD_AGENTBOOK_ADDRESS`, same canonical World Chain
+ * deployment the SDK defaults to), so this duplicates nothing we were not already carrying.
  */
-const AGENT_BOOK_ABI = [
+
+/** Vendored as named args on purpose: `register` has three adjacent uint256s, and an ABI
+ *  reconstructed from a selector reorders them silently (design v3 §4.1). The registrar writes
+ *  through the same ABI, so the read and the write can never drift apart. */
+export const AGENT_BOOK_ABI = [
   {
     inputs: [{ internalType: "address", name: "agent", type: "address" }],
     name: "lookupHuman",
     outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
     stateMutability: "view",
     type: "function",
+  },
+  {
+    inputs: [{ internalType: "address", name: "agent", type: "address" }],
+    name: "getNextNonce",
+    outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [
+      { internalType: "address", name: "agent", type: "address" },
+      { internalType: "uint256", name: "root", type: "uint256" },
+      { internalType: "uint256", name: "nonce", type: "uint256" },
+      { internalType: "uint256", name: "nullifierHash", type: "uint256" },
+      { internalType: "uint256[8]", name: "proof", type: "uint256[8]" },
+    ],
+    name: "register",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, internalType: "address", name: "agent", type: "address" },
+      { indexed: true, internalType: "uint256", name: "humanId", type: "uint256" },
+    ],
+    name: "AgentRegistered",
+    type: "event",
   },
 ] as const;
 

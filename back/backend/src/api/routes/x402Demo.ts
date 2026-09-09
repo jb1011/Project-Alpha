@@ -1,6 +1,7 @@
 import type { Hono } from "hono";
 import { agentkitSignerFromKey } from "../../adapters/worldid/agentkitSigner";
 import type { Config } from "../../config/env";
+import { AGENT_BOOK_CHAIN_ID } from "../../payments/agentBookReader";
 import { buildPaywall } from "../../payments/seller";
 import { makeSettle } from "../../payments/settle";
 import { usdToUnits } from "../../policy/units";
@@ -126,7 +127,9 @@ export function mountX402DemoRoutes(
           };
           const { createAgentkitClient } = await import("@worldcoin/agentkit");
           const client = createAgentkitClient({
-            signer: agentkitSignerFromKey(deps.proofAgentKey, chainIdOf(deps.network)),
+            // World Chain, not Arc (design v3 D10): the seller advertises `eip155:480`
+            // beside Arc, and every AgentKit client in the wild signs for it.
+            signer: agentkitSignerFromKey(deps.proofAgentKey, AGENT_BOOK_CHAIN_ID),
             // biome-ignore lint/suspicious/noExplicitAny: client options typing varies across SDK versions.
           } as any) as { createHeader(ext: unknown): Promise<string> };
           // createHeader wants the INNER extension ({info, supportedChains, schema}).
@@ -163,9 +166,4 @@ export function mountX402DemoRoutes(
       });
     });
   }
-}
-
-/** "eip155:5042002" -> 5042002. */
-function chainIdOf(network: string): number {
-  return Number(network.split(":")[1] ?? 0);
 }

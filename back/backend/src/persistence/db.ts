@@ -485,6 +485,35 @@ export function migrate(db: Database.Database): void {
       cached_at     INTEGER NOT NULL
     );
 
+    -- AgentBook registrations (design 2026-08-25 v3 §4.4). A 'pending' row IS the session; the
+    -- partial unique index on 'submitted' is the atomic in-flight claim; raw_tx is persisted
+    -- BEFORE broadcast (the bridge-legs rule) so a crash re-broadcasts the same transaction.
+    CREATE TABLE IF NOT EXISTS agentbook_registrations (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id      TEXT NOT NULL UNIQUE,
+      entity_key      TEXT NOT NULL,
+      tenant_id       TEXT NOT NULL,
+      address         TEXT NOT NULL,
+      nonce           TEXT NOT NULL,
+      status          TEXT NOT NULL CHECK (status IN
+                        ('pending','submitted','confirmed','disputed','failed','expired')),
+      nullifier       TEXT,
+      raw_tx          TEXT,
+      submitter_nonce INTEGER,
+      tx_hash         TEXT,
+      attempt         INTEGER NOT NULL DEFAULT 0,
+      error_code      TEXT,
+      expires_at      INTEGER NOT NULL,
+      created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agentbook_inflight
+      ON agentbook_registrations(entity_key) WHERE status = 'submitted';
+    CREATE INDEX IF NOT EXISTS idx_agentbook_entity
+      ON agentbook_registrations(entity_key, id);
+    CREATE INDEX IF NOT EXISTS idx_agentbook_tenant_created
+      ON agentbook_registrations(tenant_id, created_at);
+
     -- S5: every platform-wallet outflow, all paths, ONE table — the rolling-window SUM behind
     -- the aggregate ceiling. Amounts are 6-dec atomic USDC (callers normalize; gas seeds /1e12).
     CREATE TABLE IF NOT EXISTS platform_outflows (
