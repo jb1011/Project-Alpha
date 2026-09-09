@@ -15,6 +15,7 @@ import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../fo
 import { FORMATION_PRODUCT, guardianOf, paymentView } from "../../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
+import { ROUTE_RECEIPT_TIMEOUT_MS } from "../../payments/formationSettle";
 import { withKeyedLock } from "../../payments/keyedMutex";
 import {
   AgentSpecSchema,
@@ -214,7 +215,10 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       // to the company and not only the ops log (gate A5).
       entities: deps.repo,
       payment,
-      executor,
+      // …and the REQUEST PATH's receipt wait (finding B3): 12 seconds, because a `pending` answer
+      // is complete — the client polls this company's payment every 4 seconds and the sweeper is
+      // the backstop — and holding a connection open for a minute only makes it feel broken.
+      executor: { ...executor, receiptTimeoutMs: ROUTE_RECEIPT_TIMEOUT_MS },
       transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
       now: deps.now,
       company,

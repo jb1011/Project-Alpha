@@ -550,6 +550,12 @@ export function useCompanyPaymentQuery(
     retry: false,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
+      // 4 SECONDS while a broadcast is in flight, and that number is half of a contract: the
+      // settle route waits only 12 seconds for a receipt (`ROUTE_RECEIPT_TIMEOUT_MS`) and answers
+      // `pending` rather than holding the connection for a minute. This poll is what turns that
+      // `pending` into "settled" on screen, usually within a second or two of the transaction
+      // landing. Slow it down and a settled payment looks stuck; remove it and `pending` is where
+      // the screen stops.
       if (status === "settling") return options?.pollMs ?? 4000;
       if (status === "quoted") return options?.pollMs ?? 10_000;
       return false;

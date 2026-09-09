@@ -57,6 +57,19 @@ export interface SettleAuthorization {
 export const SETTLE_RECEIPT_TIMEOUT_MS = 60_000;
 
 /**
+ * What the REQUEST PATH waits (finding B3) — the settle route and MCP's `submit_company_payment`.
+ *
+ * Twelve seconds, not sixty. On Arc a settle confirms in about a second, so twelve is already
+ * generous; what the extra forty-eight buys is a request holding a connection open, a browser fetch
+ * that may time out first, and an MCP client waiting on a tool call — for an answer the caller does
+ * not need from THIS response. A `pending` answer is a complete answer: the row is `settling`, the
+ * client's 4-second poll of `GET /companies/:id/payment` reports the settlement the moment it
+ * lands, and the sweeper is the backstop if the client goes away. Sixty seconds only makes the
+ * unhappy path feel broken.
+ */
+export const ROUTE_RECEIPT_TIMEOUT_MS = 12_000;
+
+/**
  * When to say the submitter is running out of gas, in wei of Arc's native token — which IS USDC,
  * at 18 decimals. One dollar: a settle costs cents, so this is many settles of warning, and the
  * failure it prevents is quiet — a dry submitter does not refuse loudly, it leaves rows

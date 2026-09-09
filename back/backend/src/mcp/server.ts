@@ -29,6 +29,7 @@ import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
+import { ROUTE_RECEIPT_TIMEOUT_MS } from "../payments/formationSettle";
 import { withKeyedLock } from "../payments/keyedMutex";
 import type { PocketFundingFn } from "../payments/pocketFunding";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
@@ -943,7 +944,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       companies: deps.companies,
       entities: deps.repo,
       payment,
-      executor,
+      // The request path's wait (finding B3), same as REST: an MCP client is a caller waiting on
+      // a tool result, and `pending` + "poll get_company_payment" is the honest answer.
+      executor: { ...executor, receiptTimeoutMs: ROUTE_RECEIPT_TIMEOUT_MS },
       transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
       now: deps.now,
       company,

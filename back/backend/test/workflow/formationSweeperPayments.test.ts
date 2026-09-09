@@ -414,10 +414,11 @@ test("the leg waits SECONDS for a receipt, not the request path's minute", async
   stall(id);
   let sawTimeout: number | undefined;
   const chain = fakeChain({ receipt: "timeout" });
-  chain.executor.publicClient.waitForTransactionReceipt = async ({
-    timeout,
-  }: { timeout: number }) => {
-    sawTimeout = timeout;
+  // biome-ignore lint/suspicious/noExplicitAny: replacing one method on a stub client
+  (chain.executor.publicClient as any).waitForTransactionReceipt = async (args: {
+    timeout?: number;
+  }) => {
+    sawTimeout = args.timeout;
     throw new Error("receipt timeout");
   };
   await sweeper(chain.executor).tick();
@@ -439,7 +440,8 @@ test("PAYMENTS ARE RESOLVED BEFORE FILINGS ARE OPENED — the order is the point
     order.push("filings");
     return originalList(...args);
   }) as typeof originalList;
-  chain.executor.publicClient.readContract = async () => {
+  // biome-ignore lint/suspicious/noExplicitAny: replacing one method on a stub client
+  (chain.executor.publicClient as any).readContract = async () => {
     order.push("payments");
     return false;
   };
