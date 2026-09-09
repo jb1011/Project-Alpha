@@ -193,20 +193,99 @@ test("the payment tools are NOT registered on a deployment that does not charge"
   expect(names).not.toContain("get_company_payment");
   expect(names).not.toContain("submit_company_payment");
   expect(names).not.toContain("cancel_company_payment");
+  expect(names).not.toContain("requote_company_payment");
   // …and the ordinary company tools are still there, so this is a payment gate rather than a
   // formation one.
   expect(names).toContain("list_companies");
 });
 
-test("all three are registered where it does", async () => {
+test("all FOUR are registered where it does — including the re-quote (finding B7)", async () => {
+  // REST has four payment doors and MCP had three: an agent whose quote expired could read the
+  // expiry, could not act on it, and had no described way to get a new one. "Create another
+  // company" is not the answer — it spends the quota and leaves an orphan draft.
   const names = await listToolNames(app(paymentCfg(true)));
   expect(names).toEqual(
     expect.arrayContaining([
       "get_company_payment",
       "submit_company_payment",
       "cancel_company_payment",
+      "requote_company_payment",
     ]),
   );
+});
+
+test("PARITY: requote_company_payment refuses while live and issues a NEW nonce once terminal", async () => {
+  const { companyId, nonce } = seedCompanyWithQuote();
+  const application = app(paymentCfg(true));
+
+  const live = await callTool(application, "provision", "requote_company_payment", { companyId });
+  expect(live.isError).toBe(true);
+
+  payments.markExpired(payments.findLive(companyId, "formation")!.paymentId, "quoted");
+  const { text } = await callTool(application, "provision", "requote_company_payment", {
+    companyId,
+  });
+  const quote = JSON.parse(text) as { nonce: string; paymentId: string };
+  expect(quote.nonce).not.toBe(nonce);
+  // …and it is the SAME shape the REST door returns: a quote, ready to sign.
+  expect(Object.keys(quote).sort()).toEqual(
+    [
+      "amountDisplayUsdc",
+      "amountUsdc",
+      "expiresAt",
+      "nonce",
+      "paymentId",
+      "payTo",
+      "typedData",
+      "validAfter",
+      "validBefore",
+    ].sort(),
+  );
+});
+
+test("the create_company description NAMES the fee, the draft state and the four tools (B7)", async () => {
+  // An agent's only discovery surface. Told merely that the call "SPENDS", it reports "the
+  // company was created" and leaves a guardian with an unfileable draft and an unexplained quote.
+  const mcp = await startMcpTestClient(
+    app(paymentCfg(true)),
+    apiKeys.mint(OWNER, {
+      capability: "provision",
+    }).key,
+  );
+  try {
+    const { tools } = await mcp.client.listTools();
+    const description = tools.find((t) => t.name === "create_company")?.description ?? "";
+    expect(description).toContain("$399 USDC");
+    expect(description).toContain("draft");
+    for (const tool of [
+      "get_company_payment",
+      "submit_company_payment",
+      "cancel_company_payment",
+      "requote_company_payment",
+    ])
+      expect(description).toContain(tool);
+    // …and that only the GUARDIAN can settle it, which is the part an agent cannot do for itself.
+    expect(description).toMatch(/GUARDIAN'S own wallet|GUARDIAN's own wallet/);
+  } finally {
+    await mcp.close();
+  }
+});
+
+test("with payment OFF the same description says formation is included, and names no tools", async () => {
+  const mcp = await startMcpTestClient(
+    app(paymentCfg(false)),
+    apiKeys.mint(OWNER, {
+      capability: "provision",
+    }).key,
+  );
+  try {
+    const { tools } = await mcp.client.listTools();
+    const description = tools.find((t) => t.name === "create_company")?.description ?? "";
+    expect(description).toContain("included on this deployment");
+    expect(description).not.toContain("submit_company_payment");
+  } finally {
+    await mcp.close();
+  }
 });
 
 test("PARITY: get_company_payment answers exactly what GET /companies/:id/payment does", async () => {
@@ -300,13 +379,14 @@ test("NO PII rides on any payment tool — the whole surface is a handle, a sign
       "get_company_payment",
       "submit_company_payment",
       "cancel_company_payment",
+      "requote_company_payment",
     ]) {
       const tool = tools.find((t) => t.name === name)!;
       const fields = Object.keys(
         (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {},
       );
       expect(fields.sort()).toEqual(
-        name === "get_company_payment"
+        name === "get_company_payment" || name === "requote_company_payment"
           ? ["companyId"]
           : name === "cancel_company_payment"
             ? ["companyId", "signature"]

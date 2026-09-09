@@ -113,9 +113,9 @@ test("the check may SCAN, and that is the trade it should make (finding B4)", ()
   // plan is allowed to be whatever SQLite decides.
   seed({ previousOperator: OLD_OPERATOR, pocketAddress: POCKET });
   for (const address of [OPERATOR, OLD_OPERATOR, POCKET])
-    expect(() => assertPaymentAddressSeparation(db, { required: true, revenueAddress: address })).toThrow(
-      /operator or pocket address/,
-    );
+    expect(() =>
+      assertPaymentAddressSeparation(db, { required: true, revenueAddress: address }),
+    ).toThrow(/operator or pocket address/);
   expect(() =>
     assertPaymentAddressSeparation(db, { required: true, revenueAddress: LEDGER }),
   ).not.toThrow();

@@ -108,6 +108,16 @@ one is a loud refusal instead of a silent strip.
 | the intake RULES (public) | `GET /formation/rules` | (industries named in `create_company`'s description, capped) | — |
 | **attach** an agent (free) | `POST /onboard` with `companyId` | `onboard_agent` with `companyId` | **refuses** (`legacyDoorRefusalMessage`) |
 | abandon a parked filing | — | — | `npm run cli -- formation:abandon <entityKey>` |
+| read a formation payment | `GET /companies/:companyId/payment` | `get_company_payment` | — |
+| settle it (guardian's signature) | `POST /companies/:companyId/payment/settle` | `submit_company_payment` | — |
+| cancel a stuck one (2nd signature) | `POST /companies/:companyId/payment/cancel` | `cancel_company_payment` | — |
+| re-quote once nothing is live | `POST /companies/:companyId/payment/requote` | `requote_company_payment` | — |
+| resolve one payment from the chain | — | — | `npm run cli -- formation:reconcile <paymentId>` |
+| RECORD a Ledger refund | — | — | `npm run cli -- formation:refund --payment-id <id> --tx <hash> --yes` |
+
+The four payment doors exist only where `FORMATION_PAYMENT_REQUIRED` is on: REST answers 404 and
+the MCP tools are not registered at all, so an agent cannot discover a tool whose every call would
+fail. The two READ surfaces are the exception — see "after a rollback" below.
 
 Two of those doors are the exits from a PARKED filing, and each clears its OWN flag:
 `PATCH /companies/:companyId` clears `awaitingIntakeEdit`, `PATCH /companies/:companyId/party`

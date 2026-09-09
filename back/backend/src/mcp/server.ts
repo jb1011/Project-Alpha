@@ -37,7 +37,11 @@ import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema, FormationPartySchema } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
-import { cancelFormationPayment, settleFormationPayment } from "../workflow/formationPayment";
+import {
+  cancelFormationPayment,
+  requoteFormationPayment,
+  settleFormationPayment,
+} from "../workflow/formationPayment";
 import type { OnboardingRunner } from "../workflow/runner";
 import { entityInScope, hasCapability } from "./scope";
 
@@ -193,14 +197,36 @@ const CREATE_COMPANY_DESCRIPTION =
   " businessPurpose is a short description of what the COMPANY does, filed with it." +
   " industryLabel must be one of the industries we can file under (%INDUSTRIES%)." +
   " This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling." +
+  " %PAYMENT%" +
   " ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs; the field is declared only so that passing one is REFUSED rather than silently dropped." +
   " If the responsible party is a US person and wants the fast EIN route, create the company through the web form (POST /companies) instead." +
   " Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.";
 
 function createCompanyDescription(deps: Pick<McpToolDeps, "formation">): string {
-  return CREATE_COMPANY_DESCRIPTION.replace("%CAPABILITY%", formationCapabilityNote(deps)).replace(
-    "%INDUSTRIES%",
-    describeIndustryLabels(),
+  return CREATE_COMPANY_DESCRIPTION.replace("%CAPABILITY%", formationCapabilityNote(deps))
+    .replace("%PAYMENT%", formationPaymentNote(deps))
+    .replace("%INDUSTRIES%", describeIndustryLabels());
+}
+
+/**
+ * ⚠ WHAT THIS CALL COSTS, AND WHAT HAPPENS NEXT (finding B7).
+ *
+ * An agent reading `create_company` used to be told the call "SPENDS" against a quota and
+ * nothing else. On a deployment that charges, the company then lands in `draft` owing a real fee,
+ * the answer carries a quote the agent has no described way to act on, and the agent reports "the
+ * company was created" — which is true and useless. What it needs to say, in the one place an
+ * agent reads before calling: the amount, the state the company lands in, that a HUMAN's wallet
+ * must sign (we cannot), and the names of the four tools that finish the job.
+ */
+function formationPaymentNote(deps: Pick<McpToolDeps, "formation">): string {
+  const payment = deps.formation?.payment;
+  if (!payment?.required)
+    return "Formation is included on this deployment: no fee is charged and the company is ready to file immediately.";
+  return (
+    `⚠ THIS DEPLOYMENT CHARGES A FORMATION FEE of $${payment.feeUsdc} USDC per company.` +
+    " The company lands in `draft` and the answer carries a QUOTE (amount, payee, nonce, expiry and the exact EIP-712 message to sign)." +
+    " It cannot be filed until that quote is settled, and it can only be settled by the GUARDIAN's own wallet — we cannot sign it for them, because it authorizes a transfer of their USDC." +
+    " Four tools finish the job: get_company_payment (re-read the quote, or find out what happened), submit_company_payment (their signature), cancel_company_payment (withdraw a stuck one — a second signature) and requote_company_payment (a fresh quote once nothing is live)."
   );
 }
 
@@ -210,7 +236,10 @@ function formationCapabilityNote(deps: Pick<McpToolDeps, "formation">): string {
   const identity = deps.formation.sandboxSyntheticPii
     ? "This deployment files with a labeled SYNTHETIC sandbox identity: pass synthetic:true and no personal data — real personal data is refused."
     : "This deployment files real legal entities: real personal data is required and synthetic:true is refused.";
-  return `Formation is ${deps.formation.required ? "REQUIRED" : "available"} on this deployment (doola, ${deps.formation.environment}). ${identity}`;
+  const fee = deps.formation.payment?.required
+    ? ` This deployment CHARGES $${deps.formation.payment.feeUsdc} USDC per company, payable by the guardian's own wallet before the filing can start (see create_company).`
+    : "";
+  return `Formation is ${deps.formation.required ? "REQUIRED" : "available"} on this deployment (doola, ${deps.formation.environment}). ${identity}${fee}`;
 }
 
 /**
@@ -1020,6 +1049,31 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             },
           ],
         };
+      },
+    );
+
+    server.registerTool(
+      "requote_company_payment",
+      {
+        title: "Re-quote company payment",
+        description:
+          "Ask for a NEW quote, with a new nonce, after the previous one ended without paying — expired, or a transfer that reverted. Deliberately its own call and not part of cancel: it is REFUSED while any payment is live, because issuing a second quote while the first authorization can still be mined is how a guardian gets charged twice. If this refuses with 'still settling', poll get_company_payment; if it refuses with 'a live quote', that quote is the one to sign.",
+        inputSchema: { companyId: z.string() },
+      },
+      async ({ companyId }) => {
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const runner = paymentRunner(company);
+        if (!runner) return refuse("this deployment does not take formation payments");
+        // The keyed lock, as on the other two: a re-quote races a settle for the same company,
+        // and the live-rows index is the backstop rather than the first line.
+        const result = await withKeyedLock(`payment:${company.companyId}`, async () =>
+          requoteFormationPayment(runner, company),
+        );
+        if (!result.ok) return refuse(result.reason);
+        return { content: [{ type: "text", text: JSON.stringify(result.quote) }] };
       },
     );
 
