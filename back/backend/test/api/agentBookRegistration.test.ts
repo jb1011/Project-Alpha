@@ -866,6 +866,49 @@ test("FR-D: a confirmed row beats a cached negative — the sweep can confirm wi
   });
 });
 
+/**
+ * A NEWER DISPUTED VERDICT SUPPRESSES THE OLDER CONFIRMATION (verify R1-b)
+ *
+ * A `disputed` row is only ever written when the reconciler READ a different human out of the
+ * registry, so it is the entity's latest verdict on who holds the entry. Rescuing an unreadable
+ * registry with the older confirmed row answered "Vouched in AgentBook", disabled the button with
+ * "Already vouched", linked the guardian's own superseded transaction — and wrote that stale id
+ * into the shared lookup cache the seller gate and the buyer dial read.
+ */
+test("R1-b: a newer DISPUTED verdict is not rescued by an older confirmed row when the registry is unreadable", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xh1" });
+  seedRow("disputed", NULLIFIER, { txHash: "0xh2" });
+  reader.lookupHuman.mockRejectedValue(new Error("rpc down"));
+  const b = await (await call(makeApp(null), "")).json();
+  expect(b).toMatchObject({
+    registered: false,
+    outcome: "disputed",
+    disputed: true,
+    status: "disputed",
+  });
+  // …and nothing of ours reaches the cache worldVerifier and the buyer dial read.
+  expect(world.getCachedLookup(POCKET, Date.now(), 600_000, 60_000)).toBeUndefined();
+});
+
+test("R1-b: a newer FAILED row is not a verdict — the older confirmation still beats a cached negative (FR-D)", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xh1" });
+  // A re-vouch that reverted wrote NOTHING to the registry, so it says nothing about who holds the
+  // entry and must not suppress the confirmation the way a `disputed` verdict does.
+  seedRow("failed", NULLIFIER);
+  world.cacheLookup(POCKET, null, Date.now());
+  const b = await (await call(makeApp(null), "")).json();
+  expect(b).toMatchObject({
+    registered: true,
+    outcome: "registered",
+    disputed: false,
+    humanId: "0xbadf00d",
+    status: "confirmed",
+  });
+  expect(reader.lookupHuman).not.toHaveBeenCalled();
+});
+
 test("R2: a poll that only read the CACHE does not re-stamp it", async () => {
   repo.upsert(entity());
   seedRow("confirmed", NULLIFIER, { txHash: "0xh" });

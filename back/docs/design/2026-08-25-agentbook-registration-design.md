@@ -275,8 +275,8 @@ would otherwise race `eth_getTransactionCount`. `attempt` is bumped only on a de
 (`ContractRevertError`, `relay.ts:99-113`), never on transport, following `oaAnchorRepository.ts`.
 
 ✎✎ **Reconcile order** (§6): contract state first, `getNextNonce(pocket)`; receipts as a fast path;
-`confirmed` is written from a read at `blockTag: "safe"`, never `latest`, and records
-`confirmed_block`.
+`confirmed` is written from a read at `blockTag: "safe"`, never `latest`. (It records no
+`confirmed_block`: that column was dropped during the build — see §11.)
 
 
 ### 4.2 Key
@@ -331,7 +331,7 @@ CREATE TABLE IF NOT EXISTS agentbook_registrations (
   raw_tx          BLOB,                     -- signed before broadcast
   submitter_nonce INTEGER,                  -- EVM nonce used, for replacement detection
   tx_hash         TEXT,
-  confirmed_block INTEGER,
+  -- confirmed_block INTEGER,               -- DROPPED during the build (§11); tx_hash answers "when"
   attempt         INTEGER NOT NULL DEFAULT 0,
   error_code      TEXT,
   expires_at      INTEGER NOT NULL,         -- session expiry (epoch ms), like world_requests
@@ -573,13 +573,18 @@ chip to a page whose first one is wrong compounds exactly the failure this desig
    `submitted_at` is older than 10 minutes, nothing landed: re-broadcast `raw_tx` if the submitter's
    account nonce has not passed `submitter_nonce`, else mark `failed` with `error_code = replaced`
    (retryable through a new session).
-2. If the nonce moved, read `lookupHuman(pocket)` at `safe`: equal to our nullifier → `confirmed`
-   with `confirmed_block`; different → `disputed`.
+2. If the nonce moved, read `lookupHuman(pocket)` at `safe`: equal to our nullifier → `confirmed`;
+   different → `disputed`. (No `confirmed_block`: the column was dropped during the build — §11.)
 3. Receipts are a fast path only: a receipt with status 0 → `failed` immediately.
 4. `pending` rows past `expires_at` → `expired`.
 5. `confirmed` rows are re-checked on every tick with one `getLogs(AgentRegistered)` filtered by our
    addresses (indexed topic), not N `lookupHuman` calls; a newer event with a different nullifier →
    `disputed`.
+
+✎✎ The positive lookup cache is written only when a row answered the read — a confirm, a reconcile,
+or the entity's newest verdict row being `confirmed` — and never re-stamped on a poll the cache
+itself answered, so an open dashboard keeps re-reading the contract at the TTL instead of holding a
+positive alive for as long as anyone is looking.
 
 **Monitoring.** ✎✎ The monitor rule is deferred for the hackathon; the reconciler above already
 produces `disputed`. When built: a second `MonitorRpc` for World Chain (viem ships `worldchain`), a
@@ -823,6 +828,26 @@ Everything else in §4 and §5 stands as written.
   So: a non-null lookup with no row of ours behind it is `disputed`, not `registered`; and a
   `failed` or `expired` row whose nullifier the registry now holds is `registered` — the registry
   outranks our own record of the attempt.
+- **"Ours" is a question about the ENTITY, never about one row** (re-review R1, same file). The
+  snippet above is the version that shipped first, and it was false in one reachable combination:
+  `currentForEntity` answers with the NEWEST row once nothing is in flight, and a session opened in
+  a second tab and abandoned carries no nullifier, so it can match nothing on chain. Asked of that
+  row alone, the entry our own guardian wrote came back a stranger's — a permanent "Someone else
+  has replaced the vouch", with the vouch button re-opened for a second, pointless on-chain write.
+  As implemented now:
+
+  ```ts
+  const vouched = ab.repo.rowsWithNullifierForEntity(rec.idempotencyKey);   // nullifier IS NOT NULL
+  const registryId = humanId ?? null;
+  const ours = vouched.some((r) => sameHuman(registryId, r.nullifier));
+  const foreign = humanId != null && !ours;
+  const shown = inFlight ?? confirmedOurs ?? row;
+  const disputed = shown?.status === "disputed" || foreign;
+  ```
+
+  So: **"ours"** is any row of the entity whose nullifier the registry holds; the **displayed row**
+  is the in-flight `submitted` row, else the `confirmed` row the registry matches, else the newest
+  row; and a nullifier-less abandoned session never turns our own entry into `disputed`.
 
 ## 12. Traceability (audit finding → section)
 

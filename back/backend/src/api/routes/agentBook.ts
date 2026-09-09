@@ -457,11 +457,15 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
      * saying both "we vouched" and "not in AgentBook". A positive cache entry is used as it stands:
      * it can disagree with our row, and that disagreement is exactly the `disputed` case below.
      *
-     * The entity's newest CONFIRMED row, not `row`'s own status: an abandoned session opened after
-     * the confirmation is the newest row and carries nothing, and letting it hide the confirmation
-     * would serve exactly the poisoned negative this rule exists to discard (R1).
+     * The entity's newest VERDICT row when it is confirmed, not `row`'s own status: an abandoned
+     * session opened after the confirmation is the newest row and carries nothing, and letting it
+     * hide the confirmation would serve exactly the poisoned negative this rule exists to discard
+     * (R1).
      */
-    const confirmedId = asHumanId(vouched.find((r) => r.status === "confirmed")?.nullifier ?? null);
+    // A `disputed` row is written only when the reconciler READ a stranger's id, so a newer one
+    // overrules the older confirmation; rows that answered nothing never suppress it (R1-b).
+    const verdict = vouched.find((r) => r.status === "confirmed" || r.status === "disputed");
+    const confirmedId = verdict?.status === "confirmed" ? asHumanId(verdict.nullifier) : null;
     const usableCache = cached && (cached.humanId !== null || confirmedId === null) ? cached : null;
     let humanId: string | null | undefined;
     /** Did OUR ROW answer, rather than the cache or a fresh read? Only then is the cache written
