@@ -139,23 +139,27 @@ export interface ApiDeps extends EntityViewDeps {
      */
     companyDeps: Omit<import("../formation/company").CreateCompanyDeps, "transaction">;
     /**
-     * FORMATION PAYMENTS (§6), present on every deployment that CAN quote — `required` inside it
-     * is the switch, and it is false during the beta.
+     * FORMATION PAYMENTS (§6) — present on EVERY deployment, with `required` inside it as the
+     * switch (finding B8).
      *
-     * It carries the payment repository, the fee, the Ledger revenue address and the USDC domain
-     * READ AND PINNED at boot, so the quote route, the settle route and the sweeper all build the
-     * same message from the same four facts. Optional so every existing test wiring builds
-     * unchanged; absent reads as "this box does not charge", which is what the whole beta is.
+     * It carries the payment repository, the fee, the Ledger revenue address and (only where the
+     * box charges) the USDC domain READ AND PINNED at boot, so the quote route, the settle route
+     * and the sweeper all build the same message from the same facts. Optional in the TYPE so
+     * every existing test wiring builds unchanged; the composition root always supplies it, which
+     * is what keeps a payment already taken readable after the flag is rolled back.
      */
     payment?: import("../formation/payment").FormationPaymentConfig;
     /**
      * The fee in whole USDC, served on `/config` WHETHER OR NOT this deployment charges.
      *
-     * Separate from `payment` above, and that separation is the point: during the beta `payment`
-     * is absent (nothing quotes, no domain is read, no revenue address is needed) but the wizard
-     * still says "included during the beta, normally $399" — and that number has to come from the
-     * box that would charge it, not from the browser bundle, or the sentence on screen drifts
-     * from the price the backend would actually quote.
+     * Separate from `payment.feeUsdc` above, and that separation is the point: during the beta
+     * nothing quotes, but the wizard still says "included during the beta, normally $399" — and
+     * that number has to come from the box that would charge it, not from the browser bundle, or
+     * the sentence on screen drifts from the price the backend would actually quote.
+     *
+     * REQUIRED, not optional: a deployment that forms companies has a price for doing so even
+     * when it is not collecting it, and an optional field here would let a wiring omit it and
+     * serve `null` — which the wizard renders as a beta sentence with no number, silently.
      */
     feeUsdc: number;
     /**

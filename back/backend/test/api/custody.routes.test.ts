@@ -2,11 +2,12 @@ import type Database from "better-sqlite3";
 import { privateKeyToAccount } from "viem/accounts";
 import { createSiweMessage } from "viem/siwe";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { buildApiApp } from "../../src/api/app";
+import { type ApiDeps, buildApiApp } from "../../src/api/app";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
 import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../../src/formation";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
@@ -102,17 +103,12 @@ function makeApp(opts: {
     walletProviderDefault: opts.def ?? "turnkey",
     circleCustodyAvailable: opts.circleAvailable,
     turnkeyCustodyAvailable: opts.turnkeyAvailable ?? true,
-    formation: opts.formation
-      ? {
-          environment: opts.formation.environment,
-          required: opts.formation.required ?? false,
-          sandboxSyntheticPii: opts.formation.environment === "sandbox",
-          maxPerTenant: 3,
-          dailyCeiling: 10,
-          parties: new SqliteFormationPartyRepository(db),
-          requests: new SqliteFormationRepository(db),
-        }
-      : undefined,
+    // ⚠ TYPED, not cast (finding B11). The whole deps object below is still `as never` for the
+    // half-dozen collaborators this file has no use for, and that cast used to swallow the
+    // formation block too — so `feeUsdc`, which `/config` serves as public PRICING, could simply
+    // be missing and the route answered `null`. A fixture that silently omits a served field is a
+    // test that pins the omission. This one is annotated, so leaving a field out fails to compile.
+    formation: formationDeps(opts.formation),
     repo,
     runner,
     passkeyRpId: "wizard.local",
@@ -125,6 +121,43 @@ function makeApp(opts: {
     arc: {} as never,
     agentRuns: {} as never,
   } as never);
+}
+
+/**
+ * The formation half of the API deps, TYPED — so what this fixture serves on `/config` is what a
+ * real composition root would have to supply.
+ */
+function formationDeps(
+  opts: { environment: "sandbox" | "production"; required?: boolean } | undefined,
+): ApiDeps["formation"] {
+  if (!opts) return undefined;
+  const companies = new SqliteCompanyRepository(db);
+  const parties = new SqliteFormationPartyRepository(db);
+  const requests = new SqliteFormationRepository(db);
+  const pin = { provider: "doola", environment: opts.environment } as const;
+  return {
+    environment: opts.environment,
+    required: opts.required ?? false,
+    sandboxSyntheticPii: opts.environment === "sandbox",
+    maxPerTenant: 3,
+    dailyCeiling: 10,
+    maxAgentsPerCompany: 10,
+    parties,
+    requests,
+    companies,
+    pin,
+    companyDeps: {
+      companies,
+      parties,
+      requests,
+      pin,
+      sandboxSyntheticPii: opts.environment === "sandbox",
+      maxPerTenant: 3,
+      dailyCeiling: 10,
+    },
+    // The PRICE this deployment would charge, served whether or not it is charging.
+    feeUsdc: 399,
+  };
 }
 
 async function login(app: ReturnType<typeof buildApiApp>) {
@@ -281,9 +314,10 @@ test("GET /config reports formation availability and its ENVIRONMENT (honesty in
     // B1: a formation deployment that does not charge. The fee is still served — it is the
     // number in "included during the beta, normally $399".
     formationPaymentRequired: false,
-    // Null HERE because this fixture's formation block predates `feeUsdc`; a real deployment that
-    // forms always serves the number, which is what the beta sentence quotes.
-    formationFeeUsdc: null,
+    // The PRICE, served even where nothing is being collected: it is the number in "included
+    // during the beta, normally $399", and a wizard that bundled it would drift from what the
+    // backend would actually quote.
+    formationFeeUsdc: 399,
     formationCopy: FORMATION_COPY,
     ...AGENTBOOK_OFF,
   });
