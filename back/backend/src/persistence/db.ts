@@ -255,6 +255,13 @@ const FORMATION_PAYMENTS_DDL = `
       ON formation_payments(company_id, product) WHERE status IN ('quoted','settling');
     CREATE INDEX IF NOT EXISTS idx_formation_payments_company
       ON formation_payments(company_id, status);
+    -- The SWEEPER's two readers (finding B4): every settling row, and every quoted row whose
+    -- window has closed. Both run on a 60-second timer forever, and both were scanning the whole
+    -- table to find the handful of rows that are live — on a deployment whose payments table only
+    -- ever grows. (status, valid_before) answers the first on its leading column and the second
+    -- on both.
+    CREATE INDEX IF NOT EXISTS idx_formation_payments_status_window
+      ON formation_payments(status, valid_before);
 `;
 
 /** Create tables if absent. Idempotent. */
@@ -696,40 +703,20 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN operator_rotated_at INTEGER");
   if (!cols.includes("public_id")) db.exec("ALTER TABLE entities ADD COLUMN public_id TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_public_id ON entities(public_id)");
-  // ── The FLEET's operator addresses, indexed (2026-08-26 §6.6) ────────────────────────────
+  // ── The FLEET's operator addresses: NOT indexed (finding B4) ──────────────────────────────
   //
-  // Read by exactly one thing: the boot invariant that refuses to let
-  // `FORMATION_REVENUE_ADDRESS` be an address this platform signs with
-  // (`assertRevenueAddressSeparation`). It is a point lookup on three columns, and the design
-  // asks for an indexed EXISTS rather than a fleet scan — a deployment with a thousand agents
-  // must not read a thousand rows to answer a yes/no question at every boot.
+  // Three partial NOCASE indexes lived here, to make `assertPaymentAddressSeparation` an indexed
+  // EXISTS rather than a scan. They are dropped, and the check may scan.
   //
-  // PARTIAL on NOT NULL: every legacy row has NULLs here, and indexing them buys nothing.
-  //
-  // COLLATE NOCASE, and that is the whole trick. Addresses are stored in whatever casing wrote
-  // them — viem checksums, older paths and hand-written rows do not — so the comparison has to be
-  // case-insensitive, and the obvious spelling (`LOWER(operator) = ?`) puts a function on the
-  // indexed side and silently turns the lookup back into a table scan. A NOCASE index is used by
-  // a NOCASE comparison, so the check is both correct and indexed.
-  //
-  // Guarded per column and read FRESH, because a genuinely old database can be missing any of
-  // them: `pocket_address` and `previous_operator` are ALTERed in above, but `operator` predates
-  // that machinery and a pre-formation fixture has neither the column nor a path that adds one.
-  // Indexing a column that is not there throws and takes the whole migration with it.
-  const addressCols = (db.prepare("PRAGMA table_info(entities)").all() as { name: string }[]).map(
-    (c) => c.name,
-  );
-  const addressIndexes: Array<[column: string, index: string]> = [
-    ["operator", "idx_entities_operator_addr"],
-    ["previous_operator", "idx_entities_previous_operator_addr"],
-    ["pocket_address", "idx_entities_pocket_addr"],
-  ];
-  for (const [column, index] of addressIndexes) {
-    if (!addressCols.includes(column)) continue;
-    db.exec(
-      `CREATE INDEX IF NOT EXISTS ${index} ON entities(${column} COLLATE NOCASE) WHERE ${column} IS NOT NULL`,
-    );
-  }
+  // It runs ONCE, at API boot, on a deployment that charges. A scan of `entities` at that moment
+  // costs microseconds on any fleet this system will have in the next several years — while an
+  // index is paid for on EVERY write to the table, forever, on every deployment including the
+  // ones that never charge for anything. That is the wrong trade for a yes/no question asked at
+  // startup. Dropped rather than left in place: an index nobody needs is still a thing to keep
+  // correct through every future column change.
+  db.exec("DROP INDEX IF EXISTS idx_entities_operator_addr");
+  db.exec("DROP INDEX IF EXISTS idx_entities_previous_operator_addr");
+  db.exec("DROP INDEX IF EXISTS idx_entities_pocket_addr");
 
   // doola formation (design §3). Purely additive: NULL formation_provider = legacy/stub forever
   // (the 13 testnet + existing prod agents are never backfilled). The three hash/version columns

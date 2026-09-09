@@ -89,10 +89,11 @@ export function assertCircleCoverage(
  * Three columns, because an operator that has been ROTATED AWAY is still an address this
  * deployment held a key for, and a pocket is derived from a seed that is still on the box.
  *
- * ONE indexed EXISTS per address rather than a fleet scan (each arm has its own partial index,
- * added in `migrate`): a thousand-agent deployment must not read a thousand rows to answer a
- * yes/no question at every boot. Called from the API composition root beside
- * `assertCircleCoverage`, and a no-op on every deployment that does not charge.
+ * It MAY SCAN, and that is deliberate (finding B4). It runs ONCE, at API boot, on a deployment
+ * that charges — microseconds against any fleet this system will have — where the three partial
+ * indexes it used to rely on were paid for on every write to `entities`, forever, on every
+ * deployment including the ones that never charge for anything. Called from the API composition
+ * root beside `assertCircleCoverage`, and a no-op where payment is off.
  */
 export function assertPaymentAddressSeparation(
   db: Database.Database,
@@ -102,9 +103,8 @@ export function assertPaymentAddressSeparation(
   const held = (address: string): boolean => {
     // SQLite's default `=` on TEXT is case-SENSITIVE, and a miss on casing would PASS this check
     // and lose the money — addresses are stored in whatever casing wrote them (viem checksums,
-    // older paths and hand-written rows do not). `COLLATE NOCASE` rather than `LOWER(column)`:
-    // both are correct, but a function on the indexed side is not sargable, and the three partial
-    // indexes `migrate` creates are declared NOCASE precisely so this stays a lookup.
+    // older paths and hand-written rows do not). `COLLATE NOCASE` is how the comparison stays
+    // correct for all of them.
     const checksummed = getAddress(address);
     return (
       db

@@ -105,28 +105,25 @@ test("the comparison is case-insensitive: stored checksummed, configured lowerca
   ).toThrow(/operator or pocket address/);
 });
 
-test("the three arms are answered by an INDEXED lookup, not a fleet scan (§6.6)", () => {
-  // The design asks for this in as many words: a thousand-agent deployment must not read a
-  // thousand rows to answer a yes/no question at every boot. Asserted through the QUERY PLAN,
-  // because "fast enough today" is not a property that survives a growing fleet — and because the
-  // obvious spelling of the case-insensitive comparison (`LOWER(operator) = ?`) silently turns
-  // this back into a scan by putting a function on the indexed side. `COLLATE NOCASE` on both the
-  // index and the comparison is the spelling that is correct AND indexed.
+test("the check may SCAN, and that is the trade it should make (finding B4)", () => {
+  // It used to be backed by three partial indexes on `entities`, asserted here through the query
+  // plan. They are gone: this question is asked ONCE, at boot, on a deployment that charges,
+  // where an index is paid for on every write to that table forever on every deployment. What
+  // matters is that the ANSWER is right — so that is what is asserted, at every arm — and the
+  // plan is allowed to be whatever SQLite decides.
   seed({ previousOperator: OLD_OPERATOR, pocketAddress: POCKET });
-  const plan = db
-    .prepare(
-      `EXPLAIN QUERY PLAN SELECT 1 FROM entities
-        WHERE operator = ? COLLATE NOCASE
-           OR previous_operator = ? COLLATE NOCASE
-           OR pocket_address = ? COLLATE NOCASE
-        LIMIT 1`,
-    )
-    .all("a", "a", "a") as { detail: string }[];
-  const detail = plan.map((r) => r.detail).join(" | ");
-  expect(detail).not.toMatch(/SCAN entities/);
-  expect(detail).toMatch(/idx_entities_operator_addr/);
-  expect(detail).toMatch(/idx_entities_previous_operator_addr/);
-  expect(detail).toMatch(/idx_entities_pocket_addr/);
+  for (const address of [OPERATOR, OLD_OPERATOR, POCKET])
+    expect(() => assertPaymentAddressSeparation(db, { required: true, revenueAddress: address })).toThrow(
+      /operator or pocket address/,
+    );
+  expect(() =>
+    assertPaymentAddressSeparation(db, { required: true, revenueAddress: LEDGER }),
+  ).not.toThrow();
+  // …and the indexes really are gone, so nothing pays for them on the write path.
+  const indexes = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'entities'")
+    .all() as { name: string }[];
+  expect(indexes.map((i) => i.name)).not.toContain("idx_entities_operator_addr");
 });
 
 test("ANY casing matches — including one that is neither checksummed nor lowercase", () => {
