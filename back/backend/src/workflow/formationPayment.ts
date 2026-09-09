@@ -1,5 +1,5 @@
 import { getAddress, verifyTypedData } from "viem";
-import { CANCEL_AUTHORIZATION_TYPES } from "../adapters/arc/usdcToken";
+import { CANCEL_AUTHORIZATION_TYPES, resolveAuthorizationOutcome } from "../adapters/arc/usdcToken";
 import {
   FORMATION_PRODUCT,
   type FormationPaymentConfig,
@@ -13,7 +13,6 @@ import {
   type BroadcastOutcome,
   type FormationExecutorDeps,
   authorizationUsed,
-  confirmBroadcast,
   submitCancelAuthorization,
   submitTransferWithAuthorization,
 } from "../payments/formationSettle";
@@ -245,19 +244,18 @@ function finishSettle(
 }
 
 /**
- * RESUME a `settling` row whose outcome we never saw (§6.4) — the sweeper's per-row work.
+ * RESUME a `settling` row whose outcome we never saw (§6.4, rebuilt by the B1 gate).
  *
- * Three rules, in this order and for these reasons:
+ * Three steps, in this order and for these reasons:
  *
- *  1. ask the CHAIN first. `authorizationState(from, nonce) === true` means the nonce is spent:
- *     either our transfer landed or the guardian cancelled it. Either way the row is over, and
- *     re-broadcasting would be a wasted transaction against a nonce the token has already
- *     retired;
- *  2. otherwise RE-BROADCAST the persisted bytes. Never re-quote — the guardian's signature is
- *     still live, and asking for a second one while the first can still be mined is the double
- *     charge this whole leg exists to prevent;
- *  3. only when `now > validBefore` AND the state still reads false is the authorization
- *     genuinely dead. Then, and only then, `expired`.
+ *  1. ASK THE TOKEN'S LOGS. `AuthorizationUsed` + a matching `Transfer` is a settlement whoever
+ *     sent it; `AuthorizationCanceled` is a withdrawal. Both are terminal and both are facts
+ *     about the CHAIN rather than about our bookkeeping;
+ *  2. an UNKNOWN outcome is never a failure. A spent nonce with no visible log waits; a window
+ *     that has closed with the nonce unused expires (and that is what frees the re-quote);
+ *  3. otherwise re-submit the SAME authorization in a freshly composed transaction. Never
+ *     re-quote — the guardian's signature is still live, and asking for a second one while the
+ *     first can still be mined is the double charge this whole leg exists to prevent.
  */
 export async function resumeSettlingPayment(
   deps: FormationPaymentDeps,
@@ -265,29 +263,62 @@ export async function resumeSettlingPayment(
   row: FormationPaymentRecord,
 ): Promise<"settled" | "expired" | "failed" | "pending"> {
   const guardian = row.payerAddress ?? guardianOf(company);
-  const used = await authorizationUsed(deps.executor, guardian, row.nonce);
-  if (used) {
-    // ⚠ SPENT. Never re-broadcast: a second transaction carrying a retired authorization reverts,
-    // and a revert on a spent nonce says NOTHING about where the money went. The only honest
-    // moves are to read the receipt of what we last sent, or to leave the row `settling`.
-    if (row.txHash) {
-      const outcome = await confirmBroadcast(deps.executor, row.txHash);
-      if (outcome.kind === "settled") {
-        const result = finishSettle(deps, company, row, outcome);
-        if (result.ok && result.status === "settled") return "settled";
-      }
-    }
+
+  // ── 1. ASK THE TOKEN'S LOGS (B1 gate A3) ────────────────────────────────────────────────
+  //
+  // Not "read the receipt of the hash we broadcast". A signed authorization is public and
+  // self-authorizing, so the transaction that settles it need not be ours — a relayer, another
+  // process, or anyone holding the bytes can mine it, after which OUR transaction reverts with
+  // `authorization is used` and a receipt-based reader concludes `failed` for a payment whose
+  // money is at the revenue address. The logs name the authorizer and the nonce (both indexed)
+  // and, with the matching Transfer, say the payee got the amount.
+  const outcome = await resolveAuthorizationOutcome({
+    client: deps.executor.publicClient,
+    usdc: deps.executor.usdc,
+    authorizer: guardian,
+    nonce: row.nonce,
+    payTo: row.payTo,
+    value: row.amountUsdc,
+    fromBlock: row.quotedBlock === null ? null : BigInt(row.quotedBlock),
+  });
+  if (outcome.kind === "settled") {
+    const result = finishSettle(deps, company, row, {
+      kind: "settled",
+      txHash: outcome.txHash,
+      // The chain knows what it cost; we only observed it. Reporting 0 here rather than
+      // pretending is the honest shape, and nothing but an ops line reads it.
+      gasUsed: 0n,
+    });
+    if (result.ok && result.status === "settled") return "settled";
+    // The CAS was lost (something else moved the row first). Nothing to do.
+    return "pending";
+  }
+  if (outcome.kind === "cancelled") {
+    // An out-of-band cancellation — the guardian cancelled through some other client, or our own
+    // cancel route confirmed and crashed before writing. The nonce is retired: nothing can ever
+    // settle it, and expiring is what lets them re-quote.
+    return expire(deps, company, row, "cancelled-on-chain") ? "expired" : "pending";
+  }
+
+  // ── 2. UNKNOWN. Never a failure — decide only whether to wait, expire or try again ────────
+  //
+  // A nonce the token reports as SPENT while the logs say nothing is the case where our window
+  // missed it (a pruned endpoint, a lagging node). Re-broadcasting there would revert and be
+  // read as a failure; expiring would invite a second payment for a company already paid for.
+  // Waiting is the only move that cannot cost anyone money.
+  if (await authorizationUsed(deps.executor, guardian, row.nonce)) {
     opsLog("formation_payment_pending", {
       level: "warn",
       companyId: company.companyId,
       paymentId: row.paymentId,
-      reason: "authorization nonce is spent but no receipt could be read — NOT expiring",
+      reason: "nonce is spent but no AuthorizationUsed/Canceled log is visible — NOT expiring",
     });
     return "pending";
   }
 
   if (row.validBefore <= nowSec(deps))
-    // Past its window AND never used: this authorization can no longer settle, whoever holds it.
+    // Past its window, no log, and the nonce is still unused: this authorization can no longer
+    // settle, whoever holds it.
     return expire(deps, company, row, "window-closed") ? "expired" : "pending";
 
   if (!row.signature) {
@@ -303,12 +334,13 @@ export async function resumeSettlingPayment(
     return "pending";
   }
 
-  // RE-BROADCAST — composed FRESH around the same signature (B1 gate A1). The previous attempt's
-  // executor nonce may have been consumed by something else entirely while we were down; this one
-  // takes the current pending nonce and a bumped fee, so a stalled settle is not stranded by a
-  // number that has nothing to do with the guardian.
+  // ── 3. RE-BROADCAST — composed FRESH around the same signature (B1 gate A1) ───────────────
+  //
+  // The previous attempt's submitter nonce may have been consumed by something else entirely
+  // while we were down; this one takes the current pending nonce and a bumped fee, so a stalled
+  // settle is not stranded by a number that has nothing to do with the guardian.
   deps.payment.payments.bumpAttempt(row.paymentId);
-  const outcome = await broadcast(
+  const broadcastOutcome = await broadcast(
     deps,
     row.paymentId,
     {
@@ -322,7 +354,7 @@ export async function resumeSettlingPayment(
     row.signature,
     row.broadcastCount,
   );
-  const result = finishSettle(deps, company, row, outcome);
+  const result = finishSettle(deps, company, row, broadcastOutcome);
   if (result.ok && result.status === "settled") return "settled";
   if (!result.ok) return "failed";
   return "pending";

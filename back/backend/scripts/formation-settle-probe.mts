@@ -111,6 +111,7 @@ function row(nonce: Hex, validBefore: number) {
     amountUsdc: amount,
     nonce,
     validBefore,
+    quotedBlock: null,
     payTo: revenue,
     payerAddress: null,
     signature: null,

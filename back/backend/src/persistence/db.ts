@@ -206,6 +206,11 @@ const FORMATION_PAYMENTS_DDL = `
       -- a derived nonce is one-shot and would brick the company after any failed attempt.
       nonce       TEXT NOT NULL,
       valid_before INTEGER NOT NULL,
+      -- The chain head when this quote was issued (B1 gate A3). It is the LOWER BOUND of the log
+      -- window that later resolves the payment from the token's own AuthorizationUsed /
+      -- AuthorizationCanceled events. NULL is survivable (the reader falls back to a capped
+      -- lookback), it is just a wider scan.
+      quoted_block INTEGER,
       -- Where the money goes, STORED AT QUOTE TIME (§6.1, B1 gate A1). Never re-read from live
       -- config on verify, settle or cancel: a revenue-address change between quote and settle
       -- would otherwise silently re-target a signature the guardian has already given, and the
@@ -831,6 +836,7 @@ export function migrate(db: Database.Database): void {
     ["pay_to", "TEXT"],
     ["signature", "TEXT"],
     ["broadcast_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["quoted_block", "INTEGER"],
   ] as const)
     if (!payCols.includes(col)) db.exec(`ALTER TABLE formation_payments ADD COLUMN ${col} ${type}`);
 

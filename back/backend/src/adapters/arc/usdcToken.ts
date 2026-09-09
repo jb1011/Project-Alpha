@@ -1,5 +1,6 @@
 import { type Hex as ViemHex, hashDomain } from "viem";
 import type { PublicClient } from "viem";
+import { chunkRange, isRangeTooLargeError } from "../../monitor/scan";
 import type { TransferAuthorizationDomain } from "../../payments/transferAuthorization";
 import type { Address, Hex } from "../../types";
 
@@ -22,7 +23,53 @@ import type { Address, Hex } from "../../types";
  * here, deliberately: with both present viem would need an explicit overload selection at every
  * call site, and the `bytes` form is the one a browser wallet's signature drops straight into.
  */
+/**
+ * The three EVENTS that make an authorization's outcome READABLE (B1 gate A3).
+ *
+ * `authorizationState` answers "is this nonce spent?" and nothing else — and the two ways a nonce
+ * is spent (our transfer landed / it was cancelled) are the two answers a payment needs to tell
+ * apart. The token says which in its own logs, and BOTH parameters are indexed, so the question
+ * is a topic filter rather than a scan.
+ *
+ * `Transfer` is here because `AuthorizationUsed` alone does not say the money went where WE said:
+ * it names an authorizer and a nonce, not a recipient or an amount. Matching a
+ * Transfer(authorizer → payTo, value) in the same transaction is what makes "settled" mean
+ * "the revenue address has the fee".
+ */
+export const AUTHORIZATION_USED_EVENT = {
+  type: "event",
+  name: "AuthorizationUsed",
+  inputs: [
+    { name: "authorizer", type: "address", indexed: true },
+    { name: "nonce", type: "bytes32", indexed: true },
+  ],
+} as const;
+
+/** Spelled the American way BY THE CONTRACT (FiatTokenV2_2: `AuthorizationCanceled`). Copying the
+ *  British spelling here would produce a topic hash that matches nothing, silently. */
+export const AUTHORIZATION_CANCELED_EVENT = {
+  type: "event",
+  name: "AuthorizationCanceled",
+  inputs: [
+    { name: "authorizer", type: "address", indexed: true },
+    { name: "nonce", type: "bytes32", indexed: true },
+  ],
+} as const;
+
+export const TRANSFER_EVENT = {
+  type: "event",
+  name: "Transfer",
+  inputs: [
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "value", type: "uint256", indexed: false },
+  ],
+} as const;
+
 export const FIAT_TOKEN_ABI = [
+  AUTHORIZATION_USED_EVENT,
+  AUTHORIZATION_CANCELED_EVENT,
+  TRANSFER_EVENT,
   {
     type: "function",
     name: "name",
@@ -162,4 +209,167 @@ export async function readAuthorizationState(
     functionName: "authorizationState",
     args: [authorizer, nonce],
   })) as boolean;
+}
+
+/**
+ * ── RESOLVING AN AUTHORIZATION FROM THE TOKEN'S OWN LOGS (B1 gate A3) ────────────────────────
+ *
+ * The question a stalled payment asks is "what happened to this authorization?", and for a long
+ * time this code answered it with "read the receipt of the hash WE broadcast". That answer is
+ * wrong in two directions at once:
+ *
+ *  - a THIRD PARTY (or a relayer, or a re-send from another process) can settle a signed
+ *    authorization, because it is public and self-authorizing. Our own transaction then reverts
+ *    with `FiatTokenV2: authorization is used`, and reading only our receipt concludes `failed`
+ *    for a payment whose money is sitting at the revenue address;
+ *  - an out-of-band `cancelAuthorization` leaves `authorizationState` true with no receipt of
+ *    ours to read at all — the "spent but unreadable" dead end, where the row could only sit
+ *    `settling` forever.
+ *
+ * The logs answer both, from the chain rather than from our bookkeeping.
+ */
+
+/**
+ * Window sizes to try, largest first (the monitor's live lesson, restated for this reader).
+ *
+ * Arc RPCs reject an over-wide `eth_getLogs` with `-32012 requested range too large`, and the
+ * ceiling DIFFERS PER ENDPOINT — the box's token'd RPC accepts 100,000 while the public one
+ * served 5,000. So the scan walks down the ladder on a range rejection instead of failing, and
+ * never asks for an unbounded range in the first place.
+ */
+export const LOG_WINDOW_LADDER = [90_000n, 20_000n, 5_000n, 1_000n] as const;
+
+/** How far back to look when a payment row predates `quoted_block` (or the box never recorded
+ *  one). A quote lives 30 minutes plus a settlement grace, and Arc blocks are sub-second, so this
+ *  is days of slack — and it is a CAP, never an unbounded "from genesis". */
+export const DEFAULT_RESOLVE_LOOKBACK = 250_000n;
+/** The hard ceiling on any window, whatever a row claims. A corrupt or ancient `quoted_block`
+ *  must not turn one payment's resolution into a full-chain scan. */
+export const MAX_RESOLVE_LOOKBACK = 500_000n;
+
+export type AuthorizationOutcome =
+  /** The money moved: an `AuthorizationUsed` for this nonce AND a matching Transfer to the payee
+   *  in the same transaction. `txHash` is the transaction that did it — ours or anyone's. */
+  | { kind: "settled"; txHash: Hex; blockNumber: bigint }
+  /** The authorizer cancelled it. The nonce is retired and nothing can ever settle it. */
+  | { kind: "cancelled"; txHash: Hex }
+  /** Nothing about this nonce is on-chain in the window we can see. NOT a failure. */
+  | { kind: "unknown" };
+
+export interface ResolveAuthorizationInput {
+  client: PublicClient;
+  usdc: Address;
+  authorizer: Address;
+  nonce: Hex;
+  /** Where the money was supposed to go — the payee STORED on the row, never live config. */
+  payTo: Address;
+  /** The exact atomic amount the authorization committed to. */
+  value: bigint;
+  /** The chain head when the quote was issued. The window starts here (capped). */
+  fromBlock?: bigint | null;
+}
+
+/**
+ * What happened to (authorizer, nonce)?
+ *
+ * Both parameters are INDEXED on both events, so this is a two-topic filter over a bounded window
+ * — not a scan of the token's traffic. A `settled` verdict additionally requires a
+ * Transfer(authorizer → payTo, value) in the same transaction: `AuthorizationUsed` says a nonce
+ * was consumed, and only the transfer says our revenue address is the one that has the fee.
+ */
+export async function resolveAuthorizationOutcome(
+  input: ResolveAuthorizationInput,
+): Promise<AuthorizationOutcome> {
+  const latest = await input.client.getBlockNumber();
+  const floor = latest > MAX_RESOLVE_LOOKBACK ? latest - MAX_RESOLVE_LOOKBACK : 0n;
+  const hinted =
+    input.fromBlock != null && input.fromBlock > 0n
+      ? input.fromBlock
+      : latest > DEFAULT_RESOLVE_LOOKBACK
+        ? latest - DEFAULT_RESOLVE_LOOKBACK
+        : 0n;
+  const from = hinted > floor ? hinted : floor;
+
+  const args = { authorizer: input.authorizer, nonce: input.nonce };
+  // The CANCEL first: it is terminal and cheap, and a cancelled authorization can never have a
+  // matching transfer, so finding one saves the second and third queries.
+  const cancelled = await scanLogs(input.client, {
+    address: input.usdc,
+    event: AUTHORIZATION_CANCELED_EVENT,
+    args,
+    from,
+    to: latest,
+  });
+  if (cancelled.length > 0)
+    return { kind: "cancelled", txHash: cancelled[0]?.transactionHash as Hex };
+
+  const used = await scanLogs(input.client, {
+    address: input.usdc,
+    event: AUTHORIZATION_USED_EVENT,
+    args,
+    from,
+    to: latest,
+  });
+  const hit = used[0];
+  if (!hit) return { kind: "unknown" };
+
+  // The transfer that goes with it — read at the USED log's own block, which is one block rather
+  // than a window, and filtered on both indexed parties.
+  const block = hit.blockNumber as bigint;
+  const transfers = await scanLogs(input.client, {
+    address: input.usdc,
+    event: TRANSFER_EVENT,
+    args: { from: input.authorizer, to: input.payTo },
+    from: block,
+    to: block,
+  });
+  const paid = transfers.find(
+    (t) =>
+      t.transactionHash === hit.transactionHash &&
+      ((t.args as { value?: bigint } | undefined)?.value ?? -1n) === input.value,
+  );
+  // A used nonce with NO matching transfer is not a settlement of OURS — it is an authorization
+  // consumed some other way, and saying "settled" for it would credit a company nobody paid for.
+  if (!paid) return { kind: "unknown" };
+  return { kind: "settled", txHash: hit.transactionHash as Hex, blockNumber: block };
+}
+
+/** Chunked `getLogs` that walks DOWN the window ladder when an endpoint rejects the range. */
+async function scanLogs(
+  client: PublicClient,
+  q: {
+    address: Address;
+    // biome-ignore lint/suspicious/noExplicitAny: three different const event shapes, one reader
+    event: any;
+    args: Record<string, unknown>;
+    from: bigint;
+    to: bigint;
+  },
+  // biome-ignore lint/suspicious/noExplicitAny: viem's log type is generic over the event
+): Promise<any[]> {
+  let lastRangeError: unknown;
+  for (const size of LOG_WINDOW_LADDER) {
+    try {
+      // biome-ignore lint/suspicious/noExplicitAny: as above
+      const out: any[] = [];
+      for (const range of chunkRange(q.from, q.to, size))
+        out.push(
+          ...(await client.getLogs({
+            address: q.address,
+            event: q.event,
+            args: q.args,
+            fromBlock: range.from,
+            toBlock: range.to,
+          })),
+        );
+      return out;
+    } catch (err) {
+      // Only a RANGE rejection is worth retrying narrower. Anything else (an RPC that is down, a
+      // malformed filter) must surface: the caller treats a throw as "unknown", which leaves the
+      // payment where it is, and swallowing it here would hide a broken endpoint behind a verdict.
+      if (!isRangeTooLargeError(err)) throw err;
+      lastRangeError = err;
+    }
+  }
+  throw lastRangeError ?? new Error("getLogs: exhausted the window ladder");
 }

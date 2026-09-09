@@ -11,9 +11,13 @@ import { type Hex as ViemHex, hashDomain } from "viem";
 import { expect, test } from "vitest";
 import {
   CANCEL_AUTHORIZATION_TYPES,
+  DEFAULT_RESOLVE_LOOKBACK,
   FIAT_TOKEN_ABI,
+  LOG_WINDOW_LADDER,
+  MAX_RESOLVE_LOOKBACK,
   readAuthorizationState,
   readUsdcDomain,
+  resolveAuthorizationOutcome,
 } from "../../../src/adapters/arc/usdcToken";
 import type { Address, Hex } from "../../../src/types";
 
@@ -137,4 +141,153 @@ test("CancelAuthorization is (authorizer, nonce) — what FiatTokenV2_2 hashes",
     { name: "authorizer", type: "address" },
     { name: "nonce", type: "bytes32" },
   ]);
+});
+
+// ── resolveAuthorizationOutcome (B1 gate A3) ───────────────────────────────────────────────
+//
+// What happened to (authorizer, nonce)? Answered from the TOKEN's logs rather than from the
+// receipt of a transaction we happened to send — because a signed authorization is public, and
+// the transaction that settles it need not be ours.
+
+const AUTHORIZER = "0x000000000000000000000000000000000000000A" as Address;
+const PAYEE = "0x000000000000000000000000000000000000bEEF" as Address;
+const NONCE = `0x${"a1".repeat(32)}` as Hex;
+const VALUE = 399_000_000n;
+
+interface StubLog {
+  name: string;
+  args: Record<string, unknown>;
+  blockNumber: bigint;
+  transactionHash: Hex;
+}
+
+/** A client that serves logs and remembers every range it was ASKED for — which is the property
+ *  under test as much as the verdict is. */
+function logChain(logs: StubLog[], opts: { head?: bigint; rejectWider?: bigint } = {}) {
+  const asked: Array<{ event: string; from: bigint; to: bigint }> = [];
+  const client = {
+    getBlockNumber: async () => opts.head ?? 1_000_000n,
+    getLogs: async (q: {
+      event: { name: string };
+      args?: Record<string, unknown>;
+      fromBlock: bigint;
+      toBlock: bigint;
+    }) => {
+      asked.push({ event: q.event.name, from: q.fromBlock, to: q.toBlock });
+      // The live lesson: an endpoint REJECTS a window it considers too wide, and the ceiling
+      // differs per endpoint. The reader must walk down rather than fail.
+      if (opts.rejectWider !== undefined && q.toBlock - q.fromBlock + 1n > opts.rejectWider)
+        throw new Error("-32012 requested range too large");
+      return logs.filter(
+        (l) =>
+          l.name === q.event.name &&
+          l.blockNumber >= q.fromBlock &&
+          l.blockNumber <= q.toBlock &&
+          Object.entries(q.args ?? {}).every(
+            ([k, v]) => String(l.args[k]).toLowerCase() === String(v).toLowerCase(),
+          ),
+      );
+    },
+    // biome-ignore lint/suspicious/noExplicitAny: a two-method stub of viem's PublicClient
+  } as any;
+  return { client, asked };
+}
+
+function settlement(txHash: Hex, block = 999_000n, value = VALUE): StubLog[] {
+  return [
+    {
+      name: "AuthorizationUsed",
+      args: { authorizer: AUTHORIZER, nonce: NONCE },
+      blockNumber: block,
+      transactionHash: txHash,
+    },
+    {
+      name: "Transfer",
+      args: { from: AUTHORIZER, to: PAYEE, value },
+      blockNumber: block,
+      transactionHash: txHash,
+    },
+  ];
+}
+
+const resolve = (client: unknown, fromBlock: bigint | null = 998_000n) =>
+  resolveAuthorizationOutcome({
+    // biome-ignore lint/suspicious/noExplicitAny: the stub above
+    client: client as any,
+    usdc: USDC,
+    authorizer: AUTHORIZER,
+    nonce: NONCE,
+    payTo: PAYEE,
+    value: VALUE,
+    fromBlock,
+  });
+
+test("AuthorizationUsed + a matching Transfer is a SETTLEMENT, whoever sent it", async () => {
+  const txHash = `0x${"ab".repeat(32)}` as Hex;
+  const { client } = logChain(settlement(txHash));
+  expect(await resolve(client)).toMatchObject({ kind: "settled", txHash });
+});
+
+test("AuthorizationCanceled is CANCELLED — and is answered before anything else is asked", async () => {
+  const { client, asked } = logChain([
+    {
+      name: "AuthorizationCanceled",
+      args: { authorizer: AUTHORIZER, nonce: NONCE },
+      blockNumber: 999_000n,
+      transactionHash: `0x${"cd".repeat(32)}` as Hex,
+    },
+  ]);
+  expect(await resolve(client)).toMatchObject({ kind: "cancelled" });
+  // A cancelled authorization can never have a matching transfer, so the other two queries are
+  // work nobody needs.
+  expect(asked.every((a) => a.event === "AuthorizationCanceled")).toBe(true);
+});
+
+test("a used nonce with NO matching transfer is UNKNOWN — never a settlement of ours", async () => {
+  // The log says a nonce was consumed. Only the Transfer says OUR payee got THIS amount, and
+  // reading the first as a settlement would ready a company nobody paid for.
+  const [used] = settlement(`0x${"ab".repeat(32)}` as Hex);
+  const { client } = logChain([used!]);
+  expect(await resolve(client)).toEqual({ kind: "unknown" });
+});
+
+test("a transfer of the WRONG AMOUNT does not settle the payment", async () => {
+  const txHash = `0x${"ab".repeat(32)}` as Hex;
+  const { client } = logChain(settlement(txHash, 999_000n, 1n));
+  expect(await resolve(client)).toEqual({ kind: "unknown" });
+});
+
+test("nothing on-chain is UNKNOWN, which is never a failure", async () => {
+  const { client } = logChain([]);
+  expect(await resolve(client)).toEqual({ kind: "unknown" });
+});
+
+test("the window is BOUNDED even with no hint — never a range from genesis", async () => {
+  // The public-RPC lesson. An unbounded `fromBlock: 0` is rejected outright by some endpoints and
+  // times out on the rest, and either way the payment stays unresolved.
+  const { client, asked } = logChain([], { head: 1_000_000n });
+  await resolve(client, null);
+  expect(asked.length).toBeGreaterThan(0);
+  for (const a of asked) {
+    expect(a.from).toBeGreaterThanOrEqual(1_000_000n - DEFAULT_RESOLVE_LOOKBACK);
+    expect(a.to - a.from).toBeLessThan(LOG_WINDOW_LADDER[0]!);
+  }
+});
+
+test("an ANCIENT quoted_block is capped — one payment cannot become a full-chain scan", async () => {
+  const { client, asked } = logChain([], { head: 1_000_000n });
+  await resolve(client, 1n);
+  expect(asked[0]!.from).toBe(1_000_000n - MAX_RESOLVE_LOOKBACK);
+});
+
+test("an endpoint that rejects the range makes the reader WALK DOWN the ladder", async () => {
+  // Measured live: the box's token'd RPC served 100,000 blocks where the public one refused
+  // 50,000 and served 5,000. A hardcoded chunk size produces the worst possible failure — a
+  // process that is up, logging, and permanently unable to resolve a payment.
+  const txHash = `0x${"ab".repeat(32)}` as Hex;
+  const { client, asked } = logChain(settlement(txHash), { rejectWider: 5_000n });
+  expect(await resolve(client, 900_000n)).toMatchObject({ kind: "settled" });
+  const widths = asked.map((a) => a.to - a.from + 1n);
+  expect(widths[0]).toBe(LOG_WINDOW_LADDER[0]);
+  expect(widths.some((w) => w <= 5_000n)).toBe(true);
 });

@@ -47,6 +47,19 @@ export interface FormationPaymentConfig {
   quoteTtlMs: number;
   /** The USDC token's own EIP-712 domain, read and pinned at boot. */
   domain: TransferAuthorizationDomain;
+  /**
+   * The chain head as this box last saw it, synchronously (B1 gate A3).
+   *
+   * A quote is written INSIDE a database transaction, so it cannot await a block number. This is
+   * a cached value — refreshed at boot and on each sweeper pass — and being a little STALE is
+   * harmless by construction: it is only ever used as the LOWER BOUND of the log window that
+   * resolves the payment later, so an older number costs a wider scan and never a wrong answer.
+   * Absent (test fixtures, a box that could not read one) simply records no hint.
+   */
+  chainHead?: () => bigint | null;
+  /** How the cache above is kept fresh: the sweeper reads the head every pass anyway, and hands
+   *  it back here rather than each surface keeping its own idea of the chain. */
+  noteChainHead?: (block: bigint) => void;
   payments: FormationPaymentRepository;
 }
 
@@ -227,10 +240,14 @@ export function paymentView(
  * converting it later is a rounding bug waiting for a fee to depend on it.
  */
 export function insertQuote(
-  cfg: Pick<FormationPaymentConfig, "feeAtomic" | "quoteTtlMs" | "payments" | "revenueAddress">,
+  cfg: Pick<
+    FormationPaymentConfig,
+    "feeAtomic" | "quoteTtlMs" | "payments" | "revenueAddress" | "chainHead"
+  >,
   companyId: string,
   nowMs: number,
 ): string {
+  const head = cfg.chainHead?.() ?? null;
   return cfg.payments.create({
     companyId,
     product: FORMATION_PRODUCT,
@@ -241,5 +258,30 @@ export function insertQuote(
     // the served quote, local verification, the executor's calldata, the cancel message — takes
     // the payee off the row.
     payTo: cfg.revenueAddress,
+    // …and the window floor for the log-based resolver (B1 gate A3).
+    quotedBlock: head === null ? null : Number(head),
   });
+}
+
+/**
+ * The chain-head cache behind `chainHead`/`noteChainHead`.
+ *
+ * A quote is written inside a database transaction and cannot await a block number, so the head
+ * is read asynchronously (at boot, and on every sweeper pass) and read back synchronously here.
+ * Staleness is harmless BY CONSTRUCTION: the value is only ever the lower bound of a log window,
+ * so an old number costs a wider scan and can never produce a wrong verdict.
+ */
+export function newChainHeadCache(initial: bigint | null = null): {
+  get: () => bigint | null;
+  set: (block: bigint) => void;
+} {
+  let value = initial;
+  return {
+    get: () => value,
+    // MONOTONIC: a reorg or a lagging endpoint must not walk the floor forwards past a block a
+    // quote was issued at, which would start its window after its own settlement.
+    set: (block: bigint) => {
+      if (value === null || block > value) value = block;
+    },
+  };
 }

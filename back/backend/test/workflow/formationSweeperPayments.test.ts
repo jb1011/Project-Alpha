@@ -58,13 +58,62 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-/** The chain, as much of it as this leg touches: a spent-nonce set and a receipt verdict. */
-function fakeChain(opts: { receipt?: "success" | "reverted" | "timeout"; spent?: string[] } = {}) {
+interface FakeLog {
+  name: "AuthorizationUsed" | "AuthorizationCanceled" | "Transfer";
+  args: Record<string, unknown>;
+  blockNumber: bigint;
+  transactionHash: Hex;
+}
+
+/** The pair of logs a real settlement leaves: the nonce retired, and the money moved. */
+function settlementLogs(nonce: Hex, txHash: Hex, block = 100n): FakeLog[] {
+  return [
+    {
+      name: "AuthorizationUsed",
+      args: { authorizer: TENANT, nonce },
+      blockNumber: block,
+      transactionHash: txHash,
+    },
+    {
+      name: "Transfer",
+      args: { from: TENANT, to: REVENUE, value: 399_000_000n },
+      blockNumber: block,
+      transactionHash: txHash,
+    },
+  ];
+}
+
+/** The chain, as much of it as this leg touches: the token's logs, a spent-nonce set and a
+ *  receipt verdict. */
+function fakeChain(
+  opts: {
+    receipt?: "success" | "reverted" | "timeout";
+    spent?: string[];
+    logs?: FakeLog[];
+  } = {},
+) {
   const sent: Hex[] = [];
   const spent = new Set((opts.spent ?? []).map((n) => n.toLowerCase()));
+  const logs = opts.logs ?? [];
   const executor: FormationExecutorDeps = {
     publicClient: {
       getTransactionCount: async () => 1,
+      getBlockNumber: async () => 1_000n,
+      getLogs: async (q: {
+        event: { name: string };
+        args?: Record<string, unknown>;
+        fromBlock: bigint;
+        toBlock: bigint;
+      }) =>
+        logs.filter(
+          (l) =>
+            l.name === q.event.name &&
+            l.blockNumber >= q.fromBlock &&
+            l.blockNumber <= q.toBlock &&
+            Object.entries(q.args ?? {}).every(
+              ([k, v]) => String(l.args[k]).toLowerCase() === String(v).toLowerCase(),
+            ),
+        ),
       estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
       sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
         sent.push(serializedTransaction);
@@ -255,20 +304,18 @@ test("EXPIRY needs BOTH: the window closed AND the nonce still unused", async ()
   expect(chain.sent).toHaveLength(0);
 });
 
-test("a SPENT nonce past the window resolves to SETTLED — never expired", async () => {
+test("a SETTLEMENT IN THE LOGS past the window resolves to SETTLED — never expired", async () => {
   // The nightmare this rule prevents: telling a guardian who has already paid us that their quote
-  // expired, and taking a second 399 USDC when they re-quote.
+  // expired, and taking a second 399 USDC when they re-quote. The logs are the evidence, so it
+  // holds even when the settling transaction was not ours.
   const c = company();
   const nonce = `0x${"b2".repeat(32)}` as Hex;
   const id = quote(c, { validBefore: nowSec() - 1, nonce });
   payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
-  // A broadcast HAPPENED — that is what makes a receipt readable, and reading it is the only
-  // honest way to tell "our transfer landed" from "somebody cancelled".
-  payments.recordBroadcast(id, TX);
   stall(id);
-  const chain = fakeChain({ spent: [nonce] });
+  const chain = fakeChain({ spent: [nonce], logs: settlementLogs(nonce, TX) });
   await sweeper(chain.executor).tick();
-  expect(payments.find(id)?.status).toBe("settled");
+  expect(payments.find(id)).toMatchObject({ status: "settled", txHash: TX });
   expect(companies.find(c)?.status).toBe("ready");
 });
 

@@ -42,6 +42,7 @@ import {
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
 import { createCompany } from "../formation/company";
+import { newChainHeadCache } from "../formation/payment";
 import { buildJobDeps } from "../jobs/composition";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
@@ -385,6 +386,11 @@ async function main() {
    * A box that cannot read the token therefore does not boot. That is the right direction: the
    * alternative is booting a deployment that will quote a price for a signature it cannot settle.
    */
+  // The chain head, read once here and refreshed by the sweeper. Recorded on every quote as the
+  // floor of the log window that resolves it later (B1 gate A3).
+  const chainHead = newChainHeadCache(
+    formationCfg.payment.required ? await publicClient.getBlockNumber().catch(() => null) : null,
+  );
   const formationPayment = formationCfg.payment.required
     ? {
         required: true,
@@ -394,6 +400,8 @@ async function main() {
         revenueAddress: formationCfg.payment.revenueAddress as Address,
         quoteTtlMs: formationCfg.payment.quoteTtlMs,
         domain: await readUsdcDomain(publicClient, cfg.usdc, cfg.chainId),
+        chainHead: chainHead.get,
+        noteChainHead: chainHead.set,
         payments: formationPayments,
       }
     : undefined;

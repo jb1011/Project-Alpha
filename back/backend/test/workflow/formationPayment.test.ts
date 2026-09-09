@@ -66,6 +66,9 @@ function fakeChain(
     receipt?: "success" | "reverted" | "timeout";
     spent?: Set<string>;
     accountNonce?: number;
+    /** The token's own logs, which is where an outcome actually comes from (gate A3). */
+    logs?: FakeLog[];
+    head?: bigint;
   } = {},
 ) {
   const sent: Hex[] = [];
@@ -75,9 +78,27 @@ function fakeChain(
     accountNonce: opts.accountNonce ?? 7,
     /** Hashes the node ACCEPTED. A receipt exists for nothing else. */
     accepted: new Set<string>(),
+    logs: opts.logs ?? [],
+    head: opts.head ?? 5_000n,
   };
   const publicClient = {
     getTransactionCount: async () => state.accountNonce,
+    getBlockNumber: async () => state.head,
+    getLogs: async (q: {
+      event: { name: string };
+      args?: Record<string, unknown>;
+      fromBlock: bigint;
+      toBlock: bigint;
+    }) =>
+      state.logs.filter(
+        (l) =>
+          l.name === q.event.name &&
+          l.blockNumber >= q.fromBlock &&
+          l.blockNumber <= q.toBlock &&
+          Object.entries(q.args ?? {}).every(
+            ([k, v]) => String(l.args[k]).toLowerCase() === String(v).toLowerCase(),
+          ),
+      ),
     estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
     sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
       const nonce = decodeFakeTx(serializedTransaction).nonce;
@@ -117,6 +138,31 @@ function fakeChain(
     chainId: CHAIN,
   };
   return { executor, sent, state };
+}
+
+interface FakeLog {
+  name: "AuthorizationUsed" | "AuthorizationCanceled" | "Transfer";
+  args: Record<string, unknown>;
+  blockNumber: bigint;
+  transactionHash: Hex;
+}
+
+/** The pair of logs a REAL settlement leaves: the nonce retired, and the money moved. */
+function settlementLogs(nonce: Hex, txHash: Hex, value = 399_000_000n, block = 4_000n): FakeLog[] {
+  return [
+    {
+      name: "AuthorizationUsed",
+      args: { authorizer: TENANT, nonce },
+      blockNumber: block,
+      transactionHash: txHash,
+    },
+    {
+      name: "Transfer",
+      args: { from: TENANT, to: REVENUE, value },
+      blockNumber: block,
+      transactionHash: txHash,
+    },
+  ];
 }
 
 /** The inverse of the stub signer below: read back what a composed transaction committed to. */
@@ -418,22 +464,88 @@ test("resume expires ONLY when the window has closed AND the nonce is still unus
   expect(chain.sent).toHaveLength(0);
 });
 
-test("a SPENT nonce past the window resolves to `settled` from the receipt, never `expired`", async () => {
+test("a settlement in the token's LOGS resolves `settled`, past the window and all", async () => {
   // `authorizationState === true` past `validBefore` means the transfer DID happen — expiring the
-  // row there would tell a guardian who paid us that they owe us again. And nothing is
-  // re-broadcast: a second transaction carrying a retired authorization only reverts.
+  // row there would tell a guardian who paid us that they owe us again. The LOGS are what say so,
+  // and nothing is re-broadcast: a second transaction carrying a retired authorization reverts.
   const c = company();
   const id = quoteFor(c, nowSec - 1);
   const row = payments.find(id)!;
-  const broadcastHash = `0x${"cc".repeat(32)}` as Hex;
+  const onChain = `0x${"ee".repeat(32)}` as Hex;
   payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
-  payments.recordBroadcast(id, broadcastHash);
-  const chain = fakeChain({ spent: new Set([row.nonce.toLowerCase()]) });
-  chain.state.accepted.add(broadcastHash); // the node has it, and the receipt reads
+  const chain = fakeChain({
+    spent: new Set([row.nonce.toLowerCase()]),
+    logs: settlementLogs(row.nonce, onChain),
+  });
   expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("settled");
-  expect(payments.find(id)?.status).toBe("settled");
+  expect(payments.find(id)).toMatchObject({ status: "settled", txHash: onChain });
   expect(companies.find(c.companyId)?.status).toBe("ready");
   expect(chain.sent).toHaveLength(0);
+});
+
+test("⚠ a THIRD PARTY's settlement resolves SETTLED — never `failed` (gate A3)", async () => {
+  // The bug this replaces: a signed authorization is public, so anyone holding the bytes can mine
+  // it. Our own transaction then reverts with "authorization is used", and a reader that only
+  // knew its own receipt wrote the payment off as FAILED — for a company whose 399 USDC is
+  // sitting at the revenue address.
+  const c = company();
+  const id = quoteFor(c);
+  const stalled = fakeChain({ receipt: "timeout" });
+  await settleFormationPayment(deps(stalled.executor), c, {
+    signature: await sign(c),
+    from: TENANT,
+  });
+  const row = payments.find(id)!;
+  const theirs = `0x${"ab".repeat(32)}` as Hex;
+  const chain = fakeChain({
+    receipt: "reverted", // ours would revert, if we were foolish enough to send it
+    spent: new Set([row.nonce.toLowerCase()]),
+    logs: settlementLogs(row.nonce, theirs),
+  });
+  expect(await resumeSettlingPayment(deps(chain.executor), c, row)).toBe("settled");
+  expect(payments.find(id)).toMatchObject({ status: "settled", txHash: theirs });
+  expect(companies.find(c.companyId)?.status).toBe("ready");
+  expect(chain.sent).toHaveLength(0);
+});
+
+test("an OUT-OF-BAND cancellation resolves `expired`, and the guardian may re-quote", async () => {
+  // The other half of "spent but unreadable": a cancel we did not submit. The logs name it, so
+  // the row does not have to sit `settling` until its window closes.
+  const c = company();
+  const id = quoteFor(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  const row = payments.find(id)!;
+  const chain = fakeChain({
+    spent: new Set([row.nonce.toLowerCase()]),
+    logs: [
+      {
+        name: "AuthorizationCanceled",
+        args: { authorizer: TENANT, nonce: row.nonce },
+        blockNumber: 4_000n,
+        transactionHash: `0x${"cd".repeat(32)}` as Hex,
+      },
+    ],
+  });
+  expect(await resumeSettlingPayment(deps(chain.executor), c, row)).toBe("expired");
+  expect(payments.find(id)?.status).toBe("expired");
+  expect(companies.find(c.companyId)?.status).toBe("draft");
+  expect(requoteFormationPayment(deps(chain.executor), c)).toMatchObject({ ok: true });
+});
+
+test("an AuthorizationUsed with NO matching transfer is NOT our settlement", async () => {
+  // The log says a nonce was consumed; only the Transfer says OUR payee got THIS amount. Reading
+  // the first as a settlement would ready a company nobody paid for.
+  const c = company();
+  const id = quoteFor(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  const row = payments.find(id)!;
+  const chain = fakeChain({
+    spent: new Set([row.nonce.toLowerCase()]),
+    logs: [settlementLogs(row.nonce, `0x${"ef".repeat(32)}` as Hex)[0]!],
+  });
+  expect(await resumeSettlingPayment(deps(chain.executor), c, row)).toBe("pending");
+  expect(payments.find(id)?.status).toBe("settling");
+  expect(companies.find(c.companyId)?.status).toBe("draft");
 });
 
 // ── cancel + re-quote ──────────────────────────────────────────────────────────────────────
@@ -507,10 +619,10 @@ test("a READY company has nothing left to pay for", async () => {
   expect((result as { reason: string }).reason).toMatch(/nothing left to pay/);
 });
 
-test("⚠ a SPENT nonce whose receipt we cannot read stays SETTLING — never expired", async () => {
+test("⚠ a SPENT nonce with NO VISIBLE LOG stays SETTLING — never expired", async () => {
   // The costliest wrong move available here. "The nonce is gone, so they must have cancelled, so
-  // let them re-quote" is tempting and wrong: the OTHER reason a nonce is spent is that our
-  // transfer landed and the receipt is merely unreadable right now (a pruned or lagging RPC).
+  // let them re-quote" is tempting and wrong: the other reason a nonce is spent is that our
+  // transfer landed and the log is merely out of view right now (a pruned or lagging endpoint).
   // Expiring would invite a second 399 USDC payment for a company already paid for.
   const c = company();
   const id = quoteFor(c, nowSec - 1);

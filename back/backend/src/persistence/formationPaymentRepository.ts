@@ -65,6 +65,9 @@ export interface FormationPaymentRecord {
   nonce: Hex;
   /** Unix SECONDS. What the guardian signed as `validBefore`. */
   validBefore: number;
+  /** The chain head when the quote was issued — the lower bound of the log window that resolves
+   *  this payment's outcome. NULL where the box could not read one. */
+  quotedBlock: number | null;
   /** The payee, COPIED ONTO THE ROW at quote time. Verification, settlement and cancellation all
    *  read THIS, never live config — a revenue-address change must not re-target a signature that
    *  has already been given. */
@@ -92,6 +95,7 @@ interface Row {
   amount_usdc: string;
   nonce: string;
   valid_before: number;
+  quoted_block: number | null;
   pay_to: string | null;
   payer_address: string | null;
   signature: string | null;
@@ -112,6 +116,7 @@ function toRecord(r: Row): FormationPaymentRecord {
     amountUsdc: BigInt(r.amount_usdc),
     nonce: r.nonce as Hex,
     validBefore: r.valid_before,
+    quotedBlock: r.quoted_block ?? null,
     payTo: r.pay_to as Address,
     payerAddress: (r.payer_address as Address) ?? null,
     signature: (r.signature as Hex) ?? null,
@@ -133,6 +138,8 @@ export interface NewFormationPayment {
   validBefore: number;
   /** The payee, pinned now so nothing downstream ever reads it from live config. */
   payTo: Address;
+  /** The chain head, if this box knows it. Recorded so the log-based resolver has a floor. */
+  quotedBlock?: number | null;
   paymentId?: string;
 }
 
@@ -209,9 +216,10 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
     this.stmts = {
       insert: db.prepare(
         `INSERT INTO formation_payments
-           (payment_id, company_id, product, status, amount_usdc, nonce, valid_before, pay_to)
+           (payment_id, company_id, product, status, amount_usdc, nonce, valid_before, pay_to,
+            quoted_block)
          VALUES (@payment_id, @company_id, @product, 'quoted', @amount_usdc, @nonce,
-                 @valid_before, @pay_to)`,
+                 @valid_before, @pay_to, @quoted_block)`,
       ),
       find: db.prepare("SELECT * FROM formation_payments WHERE payment_id = ?"),
       findLive: db.prepare(
@@ -287,6 +295,7 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
       nonce: input.nonce,
       valid_before: input.validBefore,
       pay_to: input.payTo,
+      quoted_block: input.quotedBlock ?? null,
     });
     return paymentId;
   }
