@@ -194,9 +194,13 @@ export function PaymentStep({ eyebrow, companyId, onBack, onComplete }: Props) {
             <Row label="Amount" value={`${formatAtomicUsdc(payment.quote.amountUsdc)} USDC`} />
             <Row label="To" value={payment.quote.payTo} mono />
             <Row label="From" value={address ?? "—"} mono />
+            {/* THE QUOTE's deadline, not the token's. The signature stays valid a little longer
+                (the settlement grace, so a last-second signature can still be mined), but this is
+                the moment we stop offering it — promising the later time would be promising
+                minutes the settle door refuses. */}
             <Row
-              label="Valid until"
-              value={new Date(payment.quote.validBefore * 1000).toLocaleString()}
+              label="Quote valid until"
+              value={new Date(payment.quote.expiresAt * 1000).toLocaleString()}
             />
           </dl>
         </Card>

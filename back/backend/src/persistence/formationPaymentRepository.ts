@@ -63,8 +63,12 @@ export interface FormationPaymentRecord {
   /** 32 random bytes, hex — from the ROW, never derived from the company id (a derived nonce is
    *  one-shot and would brick the company after any failed attempt). */
   nonce: Hex;
-  /** Unix SECONDS. What the guardian signed as `validBefore`. */
+  /** Unix SECONDS. What the guardian signed as `validBefore` — the TOKEN's deadline, which
+   *  carries the settlement grace. */
   validBefore: number;
+  /** Unix SECONDS. When the QUOTE stops being offered — earlier than `validBefore` by the grace.
+   *  This is the countdown a guardian sees and the deadline the settle door enforces. */
+  ttlAt: number;
   /** The chain head when the quote was issued — the lower bound of the log window that resolves
    *  this payment's outcome. NULL where the box could not read one. */
   quotedBlock: number | null;
@@ -95,6 +99,7 @@ interface Row {
   amount_usdc: string;
   nonce: string;
   valid_before: number;
+  ttl_at: number | null;
   quoted_block: number | null;
   pay_to: string | null;
   payer_address: string | null;
@@ -116,6 +121,9 @@ function toRecord(r: Row): FormationPaymentRecord {
     amountUsdc: BigInt(r.amount_usdc),
     nonce: r.nonce as Hex,
     validBefore: r.valid_before,
+    // A row written before the grace existed has no `ttl_at`; its quote deadline WAS its
+    // `valid_before`, which is exactly what the fallback says.
+    ttlAt: r.ttl_at ?? r.valid_before,
     quotedBlock: r.quoted_block ?? null,
     payTo: r.pay_to as Address,
     payerAddress: (r.payer_address as Address) ?? null,
@@ -134,8 +142,11 @@ export interface NewFormationPayment {
   product: FormationPaymentProduct;
   amountUsdc: bigint;
   nonce: Hex;
-  /** Unix SECONDS. */
+  /** Unix SECONDS — what the guardian signs, quote TTL plus the settlement grace. */
   validBefore: number;
+  /** Unix SECONDS — when the quote stops being offered. Defaults to `validBefore`, i.e. no
+   *  settlement grace, which is what a deployment that configures none has. */
+  ttlAt?: number;
   /** The payee, pinned now so nothing downstream ever reads it from live config. */
   payTo: Address;
   /** The chain head, if this box knows it. Recorded so the log-based resolver has a floor. */
@@ -170,7 +181,8 @@ export interface FormationPaymentRepository {
   listByCompany(companyId: string): FormationPaymentRecord[];
   /** Every row in one status, oldest first — the sweeper's reader. */
   listByStatus(status: FormationPaymentStatus, limit?: number): FormationPaymentRecord[];
-  /** `quoted` rows whose `valid_before` has passed (unix seconds), oldest first. */
+  /** `quoted` rows whose `valid_before` has passed (unix seconds), oldest first. Candidates for
+   *  expiry — the CHAIN's clock decides, this only narrows the set. */
   listExpiredQuotes(nowSec: number, limit?: number): FormationPaymentRecord[];
 
   /**
@@ -216,10 +228,10 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
     this.stmts = {
       insert: db.prepare(
         `INSERT INTO formation_payments
-           (payment_id, company_id, product, status, amount_usdc, nonce, valid_before, pay_to,
-            quoted_block)
+           (payment_id, company_id, product, status, amount_usdc, nonce, valid_before, ttl_at,
+            pay_to, quoted_block)
          VALUES (@payment_id, @company_id, @product, 'quoted', @amount_usdc, @nonce,
-                 @valid_before, @pay_to, @quoted_block)`,
+                 @valid_before, @ttl_at, @pay_to, @quoted_block)`,
       ),
       find: db.prepare("SELECT * FROM formation_payments WHERE payment_id = ?"),
       findLive: db.prepare(
@@ -294,6 +306,7 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
       amount_usdc: input.amountUsdc.toString(),
       nonce: input.nonce,
       valid_before: input.validBefore,
+      ttl_at: input.ttlAt ?? input.validBefore,
       pay_to: input.payTo,
       quoted_block: input.quotedBlock ?? null,
     });

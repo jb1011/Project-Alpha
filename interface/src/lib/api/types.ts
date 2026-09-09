@@ -800,8 +800,12 @@ export type FormationQuote = {
   payTo: `0x${string}`;
   nonce: `0x${string}`;
   validAfter: number;
-  /** Unix SECONDS. */
+  /** Unix SECONDS — what the guardian SIGNS. Later than `expiresAt` by the settlement grace, so
+   *  a signature given at the last second still has time to be broadcast and mined. */
   validBefore: number;
+  /** Unix SECONDS — WHEN THE QUOTE STOPS BEING OFFERED. This is the countdown a person is shown;
+   *  showing `validBefore` would promise minutes the settle door will refuse. */
+  expiresAt: number;
   typedData: PaymentTypedData;
 };
 
@@ -828,6 +832,8 @@ export type FormationPaymentView = {
   amountUsdc: string;
   amountDisplayUsdc: number;
   validBefore: number;
+  /** When the quote stops being offered (unix seconds) — the countdown, not the token's clock. */
+  expiresAt: number;
   payerAddress: `0x${string}` | null;
   txHash: `0x${string}` | null;
   refundTxHash: string | null;
@@ -846,7 +852,7 @@ export type FormationPaymentView = {
 
 /** `POST /companies/:id/payment/settle` — `settled` when the receipt confirmed, `pending` while
  *  the transaction is in flight (poll, never sign again). */
-export type SettlePaymentResult = { status: "settled" | "pending"; txHash: `0x${string}` };
+export type SettlePaymentResult = { status: "settled" | "pending"; txHash?: `0x${string}` };
 
 /** One row of `GET /companies/:companyId/compliance`. Every field is explicitly null when the
  *  provider did not say, never absent — a renderer must not have to guess which it is. */

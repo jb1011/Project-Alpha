@@ -300,6 +300,25 @@ const EnvSchema = z.object({
    * revenue address or any other key this box signs with (the invariants below).
    */
   FORMATION_SETTLE_SUBMITTER_KEY: privKeySchema.optional(),
+  /**
+   * THE SETTLEMENT GRACE (B1 gate A4) — how much longer than the QUOTE the AUTHORIZATION stays
+   * valid for.
+   *
+   * They are two different deadlines and conflating them cost us both ends. The quote's TTL is a
+   * promise to a human: "this price stands for 30 minutes". `validBefore` is a promise to the
+   * TOKEN, and it has to survive the whole settlement — the signature arriving, the transaction
+   * being composed, broadcast, mined and (if the box crashes) re-composed by the sweeper. With
+   * one deadline for both, an authorization signed at minute 29 expires while its own transfer
+   * is in the mempool, and the guardian is told to pay again for a payment that may still land.
+   *
+   * So `validBefore = quote TTL + this`, the countdown a guardian sees is the TTL, and a settle
+   * request past the TTL is refused with a re-quote even though the token would still accept it.
+   */
+  FORMATION_SETTLE_GRACE_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(15 * 60 * 1000),
   /** How long a quote stands before the sweeper expires it. 30 minutes: long enough to read the
    *  page and open a wallet, short enough that a forgotten tab is not a live authorization. */
   FORMATION_QUOTE_TTL_MS: z.coerce
@@ -507,6 +526,8 @@ export interface Config {
        *  single-purpose EOA to submit through. */
       submitterKey?: Hex;
       quoteTtlMs: number;
+      /** How much longer than the quote the AUTHORIZATION stays valid (§6.4, gate A4). */
+      settleGraceMs: number;
     };
   };
 }
@@ -747,6 +768,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         revenueAddress: e.FORMATION_REVENUE_ADDRESS,
         submitterKey: e.FORMATION_SETTLE_SUBMITTER_KEY,
         quoteTtlMs: e.FORMATION_QUOTE_TTL_MS,
+        settleGraceMs: e.FORMATION_SETTLE_GRACE_MS,
       },
     },
   };

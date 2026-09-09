@@ -387,7 +387,8 @@ flag is deliberately set.
 | `FORMATION_FEE_USDC` | `399` | The all-in fee in WHOLE dollars. Public: served on `/config` and rendered verbatim. The Wyoming state fee ($100, outside doola's pack) is a BREAKDOWN LINE in copy, never added at checkout. |
 | `FORMATION_REVENUE_ADDRESS` | — | The Ledger account. Required when payment is required. |
 | `FORMATION_SETTLE_SUBMITTER_KEY` | — | The DEDICATED EOA that submits guardians' authorizations. Required when payment is required. Its own nonce space, its own USDC gas float, no authority anywhere. |
-| `FORMATION_QUOTE_TTL_MS` | `1800000` | How long a quote stands (30 min). |
+| `FORMATION_QUOTE_TTL_MS` | `1800000` | How long a QUOTE stands (30 min) — the countdown a guardian is shown, and the deadline the settle door enforces. |
+| `FORMATION_SETTLE_GRACE_MS` | `900000` | How much longer the AUTHORIZATION stays valid (15 min). `validBefore = TTL + this`, so a signature given at the last second still has time to be broadcast, mined and (after a crash) re-composed. |
 
 ### ⚠ S4 KEY INVENTORY — the revenue address
 
@@ -497,7 +498,7 @@ There is **no fund-moving refund path in the software, by design.** To refund a 
 
 | What you see | What it means | What to do |
 |---|---|---|
-| `quoted`, past `validBefore` | The guardian never signed, or signed too late. | Nothing. The sweeper expires it, and the guardian can re-quote (`POST /companies/:id/payment/requote`). |
+| `quoted`, past its TTL | The guardian never signed, or signed too late. | Nothing, for a few minutes. The row can only be expired once the CHAIN's clock is past `validBefore` (TTL + grace) by the 120-second finality margin, because an authorization signed at the last second is still live. The guardian may cancel to skip the wait, then re-quote. |
 | `settling`, `formation_payment_pending` lines | Broadcast, outcome not observed. | Nothing, at first. The sweeper re-broadcasts the PERSISTED bytes each pass with backoff. **Never re-quote:** the signature is still live and a second one is a double charge. |
 | `settling` for a long time, guardian waiting | The bytes may never have been accepted (e.g. the executor's nonce moved past them). | The guardian signs a `CancelAuthorization` in the UI (`POST /companies/:id/payment/cancel`); the executor submits it and the row expires at once. Then re-quote. |
 | `failed` | The transfer REVERTED on chain — usually an insufficient USDC balance. | The guardian re-quotes and pays again. Nothing was taken. |

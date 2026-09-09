@@ -50,6 +50,7 @@ function paymentCfg(over: Partial<FormationPaymentConfig> = {}): FormationPaymen
     feeUsdc: 399,
     revenueAddress: REVENUE,
     quoteTtlMs: 30 * 60 * 1000,
+    settleGraceMs: 15 * 60 * 1000,
     // Read and pinned at boot in production; a literal here, because this file is about the row
     // and the transaction rather than about the chain read (see usdcToken.test.ts for that).
     domain: { name: "USD Coin", version: "2", chainId: 5042002, verifyingContract: USDC },
@@ -105,6 +106,13 @@ function created(over: Partial<CreateCompanyDeps> = {}) {
   return result;
 }
 
+/** …and the same, for the tests that are ABOUT the quote and would otherwise need a `!` each. */
+function createdWithQuote(over: Partial<CreateCompanyDeps> = {}) {
+  const result = created(over);
+  if (!result.quote) throw new Error("expected a quote");
+  return { companyId: result.companyId, quote: result.quote };
+}
+
 test("payment ON: the company lands DRAFT and carries a quoted row", () => {
   const { companyId, quote } = created();
   expect(companies.find(companyId)?.status).toBe("draft");
@@ -130,7 +138,7 @@ test("a deployment with no payment config at all is the beta shape", () => {
 });
 
 test("the quote is bound to the STORED row: amount, nonce, expiry, payee", () => {
-  const { companyId, quote } = created();
+  const { companyId, quote } = createdWithQuote();
   const row = payments.findLive(companyId, "formation")!;
   expect(quote).toMatchObject({
     paymentId: row.paymentId,
@@ -140,9 +148,26 @@ test("the quote is bound to the STORED row: amount, nonce, expiry, payee", () =>
     nonce: row.nonce,
     validAfter: 0,
     validBefore: row.validBefore,
+    expiresAt: row.ttlAt,
   });
   // The TTL, in seconds, from the injected clock — not "about now".
-  expect(row.validBefore).toBe(Math.floor((NOW + 30 * 60 * 1000) / 1000));
+  expect(row.ttlAt).toBe(Math.floor((NOW + 30 * 60 * 1000) / 1000));
+});
+
+test("⚠ TWO DEADLINES: what the guardian SIGNS outlives what they are SHOWN (gate A4)", () => {
+  // `validBefore` is the TOKEN's deadline and carries the settlement grace, so a signature given
+  // at the last second of the quote still has time to be composed, broadcast, mined and — after a
+  // crash — re-composed by the sweeper. `expiresAt` is the countdown a human reads. One deadline
+  // for both meant an authorization expiring while its own transfer sat in the mempool.
+  const { quote } = createdWithQuote();
+  expect(quote.validBefore - quote.expiresAt).toBe(15 * 60);
+  expect(quote.typedData.message.validBefore).toBe(String(quote.validBefore));
+});
+
+test("no configured grace means the two deadlines coincide — nothing is invented", () => {
+  const { companyId } = created({ payment: paymentCfg({ settleGraceMs: undefined }) });
+  const row = payments.findLive(companyId, "formation")!;
+  expect(row.validBefore).toBe(row.ttlAt);
 });
 
 test("the nonce is 32 random bytes from the ROW — two companies never share one", () => {

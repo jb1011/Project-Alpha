@@ -13,6 +13,7 @@ import {
   type BroadcastOutcome,
   type FormationExecutorDeps,
   authorizationUsed,
+  chainTimeSec,
   submitCancelAuthorization,
   submitTransferWithAuthorization,
 } from "../payments/formationSettle";
@@ -58,6 +59,18 @@ const nowMs = (deps: FormationPaymentDeps) => (deps.now ?? Date.now)();
 const nowSec = (deps: FormationPaymentDeps) => Math.floor(nowMs(deps) / 1000);
 
 /**
+ * How far past `validBefore` the CHAIN's clock must be before an authorization is called dead
+ * (gate A4).
+ *
+ * Block timestamps are a miner's declaration rather than a wall clock, and nodes disagree about
+ * the head by a block or two. Two minutes is far more than that on a sub-second chain, and the
+ * cost of the margin is a payment that stays re-quotable two minutes later than it could have
+ * been — against the cost of being early, which is telling a guardian their quote is dead while
+ * a transfer they signed is still mineable.
+ */
+export const FINALITY_MARGIN_S = 120;
+
+/**
  * Verify a guardian's signature LOCALLY, persist the signed transaction, and only then broadcast.
  *
  * The order is the design's, and every step of it is load-bearing:
@@ -88,7 +101,10 @@ export async function settleFormationPayment(
       reason:
         "this payment is already being settled — wait for it to finish rather than signing again",
     };
-  if (row.validBefore <= nowSec(deps))
+  // THE QUOTE's clock, not the token's (gate A4). The authorization is still valid for another
+  // grace period, and that grace exists so a signature given at the last second can be composed,
+  // broadcast and mined — not so that a guardian can start a new settlement inside it.
+  if (row.ttlAt <= nowSec(deps))
     return { ok: false, reason: "this quote has expired — request a new one" };
 
   const guardian = guardianOf(company);
@@ -244,7 +260,13 @@ function finishSettle(
 }
 
 /**
- * RESUME a `settling` row whose outcome we never saw (§6.4, rebuilt by the B1 gate).
+ * ADVANCE a live payment against the chain (§6.4, rebuilt by the B1 gate).
+ *
+ * ONE procedure for both live shapes, because they ask the same question of the same evidence: a
+ * `settling` row is an authorization we broadcast and lost sight of, a `quoted` row is one that
+ * may never have been signed at all, and in both cases "may this be written off?" is answered by
+ * the token's logs, the token's `authorizationState` and the CHAIN's clock — never by ours. Two
+ * procedures would be two chances for one of them to expire a payment the other would not.
  *
  * Three steps, in this order and for these reasons:
  *
@@ -257,7 +279,7 @@ function finishSettle(
  *     re-quote — the guardian's signature is still live, and asking for a second one while the
  *     first can still be mined is the double charge this whole leg exists to prevent.
  */
-export async function resumeSettlingPayment(
+export async function advancePaymentOnChain(
   deps: FormationPaymentDeps,
   company: CompanyRecord,
   row: FormationPaymentRecord,
@@ -313,24 +335,36 @@ export async function resumeSettlingPayment(
       paymentId: row.paymentId,
       reason: "nonce is spent but no AuthorizationUsed/Canceled log is visible — NOT expiring",
     });
+    // An attempt is burned even here, so the backoff spaces the chain reads out rather than
+    // asking the same unanswerable question every tick.
+    if (row.status === "settling") deps.payment.payments.bumpAttempt(row.paymentId);
     return "pending";
   }
 
-  if (row.validBefore <= nowSec(deps))
-    // Past its window, no log, and the nonce is still unused: this authorization can no longer
-    // settle, whoever holds it.
+  // EXPIRY, ON THE CHAIN'S CLOCK AND WITH A MARGIN (gate A4). Three conditions, all of them
+  // already established here: the logs say nothing (above), the nonce is unused (above), and the
+  // block timestamp is past `validBefore` by more than a block-timestamp's worth of slack. The
+  // server's own clock is never enough — the token enforces `validBefore` against the BLOCK, so a
+  // fast box would expire an authorization the chain still considers live.
+  const chainNow = await chainTimeSec(deps.executor);
+  if (chainNow !== null && chainNow > row.validBefore + FINALITY_MARGIN_S)
     return expire(deps, company, row, "window-closed") ? "expired" : "pending";
 
   if (!row.signature) {
-    // A `settling` row with no signature should be impossible — `markSettling` writes it in the
-    // same statement that sets the status. If it ever happens, waiting is still the safe
-    // behaviour: the guardian's authorization may have been broadcast by something we cannot see.
-    opsLog("formation_payment_pending", {
-      level: "warn",
-      companyId: company.companyId,
-      paymentId: row.paymentId,
-      reason: "settling row with no persisted authorization signature",
-    });
+    // A `quoted` row has no signature and never had one — there is nothing to re-submit, and
+    // waiting for its window to close is the whole of its life. A `settling` row without one
+    // should be impossible (`markSettling` writes it in the same statement that sets the status);
+    // if it ever happens, waiting is still the safe behaviour, because the guardian's
+    // authorization may have been broadcast by something we cannot see.
+    if (row.status === "settling") {
+      opsLog("formation_payment_pending", {
+        level: "warn",
+        companyId: company.companyId,
+        paymentId: row.paymentId,
+        reason: "settling row with no persisted authorization signature",
+      });
+      deps.payment.payments.bumpAttempt(row.paymentId);
+    }
     return "pending";
   }
 

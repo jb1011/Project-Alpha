@@ -99,6 +99,11 @@ function fakeChain(
     publicClient: {
       getTransactionCount: async () => 1,
       getBlockNumber: async () => 1_000n,
+      // THE CHAIN'S CLOCK (gate A4): 200 seconds ahead of the fixture's `now`, which is past the
+      // 120-second finality margin for a window that closed a moment ago and nowhere near the
+      // half-hour windows of the live quotes here. The margin itself is asserted in
+      // test/workflow/formationPayment.test.ts.
+      getBlock: async () => ({ number: 1_000n, timestamp: BigInt(nowSec() + 200) }),
       getLogs: async (q: {
         event: { name: string };
         args?: Record<string, unknown>;

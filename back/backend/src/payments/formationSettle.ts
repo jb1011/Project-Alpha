@@ -208,6 +208,23 @@ async function composeAndSend(
 }
 
 /**
+ * The CHAIN's clock — the timestamp of the latest block, in unix seconds.
+ *
+ * `validBefore` is enforced by the token against the BLOCK's timestamp, not against ours. A box
+ * whose clock runs fast would otherwise expire an authorization the chain still considers live,
+ * tell the guardian to pay again, and then watch the original transfer land (gate A4). `null`
+ * when the chain cannot be read, which callers must treat as "do not expire anything".
+ */
+export async function chainTimeSec(deps: FormationExecutorDeps): Promise<number | null> {
+  try {
+    const block = await deps.publicClient.getBlock();
+    return Number(block.timestamp);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Was this authorization already used (or cancelled)?
  *
  * `true` means the nonce is spent — the transfer happened, or it was cancelled — and `false`

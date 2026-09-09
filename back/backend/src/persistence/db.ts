@@ -205,7 +205,15 @@ const FORMATION_PAYMENTS_DDL = `
       -- 32 random bytes, hex. Uniqueness comes from the ROW, never derived from the company id —
       -- a derived nonce is one-shot and would brick the company after any failed attempt.
       nonce       TEXT NOT NULL,
+      -- ⚠ TWO DEADLINES (B1 gate A4), and they are not the same promise.
+      --
+      -- valid_before is what the guardian SIGNED and what the token enforces. ttl_at is when the
+      -- QUOTE stops being offered — earlier by FORMATION_SETTLE_GRACE_MS, so that a signature
+      -- given at the last second of the quote still has time to be composed, broadcast, mined and
+      -- (after a crash) re-composed. One deadline for both meant an authorization expiring while
+      -- its own transfer sat in the mempool.
       valid_before INTEGER NOT NULL,
+      ttl_at      INTEGER,
       -- The chain head when this quote was issued (B1 gate A3). It is the LOWER BOUND of the log
       -- window that later resolves the payment from the token's own AuthorizationUsed /
       -- AuthorizationCanceled events. NULL is survivable (the reader falls back to a capped
@@ -837,6 +845,7 @@ export function migrate(db: Database.Database): void {
     ["signature", "TEXT"],
     ["broadcast_count", "INTEGER NOT NULL DEFAULT 0"],
     ["quoted_block", "INTEGER"],
+    ["ttl_at", "INTEGER"],
   ] as const)
     if (!payCols.includes(col)) db.exec(`ALTER TABLE formation_payments ADD COLUMN ${col} ${type}`);
 

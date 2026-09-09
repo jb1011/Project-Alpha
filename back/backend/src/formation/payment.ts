@@ -45,6 +45,9 @@ export interface FormationPaymentConfig {
   /** The Ledger account. Never on `/config` — it rides the quote, on an authenticated route. */
   revenueAddress: Address;
   quoteTtlMs: number;
+  /** How much longer than the quote the AUTHORIZATION stays valid (§6.4, gate A4). Absent in
+   *  fixtures, where it reads as no grace at all. */
+  settleGraceMs?: number;
   /** The USDC token's own EIP-712 domain, read and pinned at boot. */
   domain: TransferAuthorizationDomain;
   /**
@@ -81,8 +84,13 @@ export interface FormationQuote {
   nonce: Hex;
   /** Always 0 (§6.1): the authorization is valid from the moment it is signed. */
   validAfter: number;
-  /** Unix SECONDS. */
+  /** Unix SECONDS — what the guardian SIGNS. It carries the settlement grace, so it is later
+   *  than the countdown below; a signature given at the last second of the quote still has time
+   *  to be composed, broadcast and mined. */
   validBefore: number;
+  /** Unix SECONDS — WHEN THE QUOTE STOPS BEING OFFERED, and the deadline a guardian is shown.
+   *  The settle door refuses past this even though the token would still accept the signature. */
+  expiresAt: number;
   typedData: {
     domain: TransferAuthorizationDomain;
     types: typeof TRANSFER_WITH_AUTHORIZATION_TYPES;
@@ -107,6 +115,8 @@ export interface FormationPaymentView {
   amountUsdc: string;
   amountDisplayUsdc: number;
   validBefore: number;
+  /** When the quote stops being offered (unix seconds) — the countdown, not the token's clock. */
+  expiresAt: number;
   payerAddress: Address | null;
   txHash: Hex | null;
   refundTxHash: string | null;
@@ -185,6 +195,7 @@ export function quoteOf(
     nonce: payment.nonce,
     validAfter: 0,
     validBefore: payment.validBefore,
+    expiresAt: payment.ttlAt,
     typedData: {
       domain: cfg.domain,
       types: TRANSFER_WITH_AUTHORIZATION_TYPES,
@@ -215,7 +226,9 @@ export function paymentView(
   cfg: Pick<FormationPaymentConfig, "domain">,
   nowSec: number,
 ): FormationPaymentView {
-  const signable = payment.status === "quoted" && payment.validBefore > nowSec;
+  // The QUOTE's clock, not the token's: past the TTL we stop offering to sign even though the
+  // authorization would still be accepted for another grace period (gate A4).
+  const signable = payment.status === "quoted" && payment.ttlAt > nowSec;
   return {
     paymentId: payment.paymentId,
     companyId: payment.companyId,
@@ -224,6 +237,7 @@ export function paymentView(
     amountUsdc: payment.amountUsdc.toString(),
     amountDisplayUsdc: Number(payment.amountUsdc / 1_000_000n),
     validBefore: payment.validBefore,
+    expiresAt: payment.ttlAt,
     payerAddress: payment.payerAddress,
     txHash: payment.txHash,
     refundTxHash: payment.refundTxHash,
@@ -242,18 +256,21 @@ export function paymentView(
 export function insertQuote(
   cfg: Pick<
     FormationPaymentConfig,
-    "feeAtomic" | "quoteTtlMs" | "payments" | "revenueAddress" | "chainHead"
+    "feeAtomic" | "quoteTtlMs" | "payments" | "revenueAddress" | "chainHead" | "settleGraceMs"
   >,
   companyId: string,
   nowMs: number,
 ): string {
   const head = cfg.chainHead?.() ?? null;
+  const ttlAt = Math.floor((nowMs + cfg.quoteTtlMs) / 1000);
   return cfg.payments.create({
     companyId,
     product: FORMATION_PRODUCT,
     amountUsdc: cfg.feeAtomic,
     nonce: newPaymentNonce(),
-    validBefore: Math.floor((nowMs + cfg.quoteTtlMs) / 1000),
+    // TWO deadlines (gate A4): the token's, which carries the grace, and the quote's.
+    validBefore: ttlAt + Math.floor((cfg.settleGraceMs ?? 0) / 1000),
+    ttlAt,
     // The ONE read of live config in a payment's life (B1 gate A1). Everything afterwards —
     // the served quote, local verification, the executor's calldata, the cancel message — takes
     // the payee off the row.

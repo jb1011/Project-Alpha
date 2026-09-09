@@ -60,7 +60,8 @@ function payment(over: Partial<FormationPaymentView> = {}): FormationPaymentView
     status: "quoted",
     amountUsdc: "399000000",
     amountDisplayUsdc: 399,
-    validBefore: 1_800_001_800,
+    validBefore: 1_800_002_700,
+    expiresAt: 1_800_001_800,
     payerAddress: null,
     txHash: null,
     refundTxHash: null,
@@ -73,7 +74,9 @@ function payment(over: Partial<FormationPaymentView> = {}): FormationPaymentView
       payTo: "0x000000000000000000000000000000000000bEEF",
       nonce: `0x${"a1".repeat(32)}`,
       validAfter: 0,
-      validBefore: 1_800_001_800,
+      // What the guardian SIGNS carries the settlement grace; what they are SHOWN is the TTL.
+      validBefore: 1_800_002_700,
+      expiresAt: 1_800_001_800,
       typedData,
     },
     ...over,
@@ -132,11 +135,17 @@ test("a payment stuck long enough offers CANCEL — a second signature, not a re
   ).toBe("cancel");
 });
 
-test("a `quoted` row with NO quote offers a re-quote — the clock, not the status", () => {
-  // The backend withholds the typed data past `validBefore` even before the sweeper moves the
+test("a `quoted` row with NO quote offers CANCEL — the clock, not the status (gate A4)", () => {
+  // The backend withholds the typed data past the QUOTE's TTL even before the sweeper moves the
   // row. Offering a sign button off the STATUS alone would walk a guardian through a wallet
-  // prompt for an authorization the token would reject.
-  expect(paymentAction(payment({ quote: undefined }), { nowMs: NOW })).toBe("requote");
+  // prompt for a quote we would then refuse to settle.
+  //
+  // And the exit is a CANCEL, not a re-quote: an authorization signed in the last seconds of the
+  // quote is still valid for the settlement grace, so the backend will not issue a second quote
+  // until that window provably closes. Cancelling retires the nonce on-chain at once.
+  const stale = payment({ quote: undefined });
+  expect(paymentAction(stale, { nowMs: NOW })).toBe("cancel");
+  expect(paymentExplanation(stale)).toMatch(/cancel it to clear the way/i);
 });
 
 test("expired and failed both offer a re-quote; settled and refunded offer nothing", () => {

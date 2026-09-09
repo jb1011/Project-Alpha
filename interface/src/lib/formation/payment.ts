@@ -71,10 +71,16 @@ export function paymentAction(
   if (!payment) return "unknown";
   switch (payment.status) {
     case "quoted":
-      // The QUOTE is the authority, not the status: the backend withholds it past `validBefore`
-      // even before the sweeper has moved the row, because the clock is the truth and the status
-      // is only when somebody last looked.
-      return payment.quote ? "sign" : "requote";
+      // The QUOTE is the authority, not the status: the backend withholds it past the TTL even
+      // before the sweeper has moved the row, because the clock is the truth and the status is
+      // only when somebody last looked.
+      //
+      // Withheld, the exit is CANCEL rather than re-quote. The authorization the guardian may
+      // have signed is still valid for the settlement grace, so the backend will not issue a
+      // second quote until that window provably closes — and a cancel retires the nonce on-chain
+      // at once, which is exactly what the fast path is for. (Waiting a few minutes also works,
+      // and the explanation says so.)
+      return payment.quote ? "sign" : "cancel";
     case "settling":
       return opts.settlingSinceMs !== undefined &&
         opts.nowMs - opts.settlingSinceMs > STUCK_AFTER_MS
@@ -100,7 +106,7 @@ export function paymentExplanation(payment: FormationPaymentView | undefined): s
     case "quoted":
       return payment.quote
         ? "Your wallet will ask you to authorize this exact transfer. Nothing moves until you approve it."
-        : "This quote's window has closed. Request a new one — nothing was charged.";
+        : "This quote has expired and nothing was charged. If you already signed it, that authorization stays valid for a few more minutes — cancel it to clear the way for a new quote now, or wait for it to lapse.";
     case "settling":
       return "Your authorization has been submitted and we are waiting for it to confirm. Do not sign again: the transfer may still complete, and a second signature could charge you twice.";
     case "settled":

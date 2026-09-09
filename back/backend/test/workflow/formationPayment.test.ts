@@ -23,9 +23,9 @@ import { SqliteFormationPaymentRepository } from "../../src/persistence/formatio
 import type { Address, Hex } from "../../src/types";
 import {
   type FormationPaymentDeps,
+  advancePaymentOnChain,
   cancelFormationPayment,
   requoteFormationPayment,
-  resumeSettlingPayment,
   settleFormationPayment,
 } from "../../src/workflow/formationPayment";
 
@@ -69,6 +69,8 @@ function fakeChain(
     /** The token's own logs, which is where an outcome actually comes from (gate A3). */
     logs?: FakeLog[];
     head?: bigint;
+    /** The latest block's timestamp, unix seconds (gate A4). */
+    blockTimestamp?: number;
   } = {},
 ) {
   const sent: Hex[] = [];
@@ -80,10 +82,14 @@ function fakeChain(
     accepted: new Set<string>(),
     logs: opts.logs ?? [],
     head: opts.head ?? 5_000n,
+    /** THE CHAIN'S CLOCK (gate A4) — the only clock that may expire an authorization. Defaults to
+     *  the test's own `now`, so a test that wants an expiry has to say the chain has moved on. */
+    blockTimestamp: BigInt(opts.blockTimestamp ?? nowSec),
   };
   const publicClient = {
     getTransactionCount: async () => state.accountNonce,
     getBlockNumber: async () => state.head,
+    getBlock: async () => ({ number: state.head, timestamp: state.blockTimestamp }),
     getLogs: async (q: {
       event: { name: string };
       args?: Record<string, unknown>;
@@ -197,13 +203,14 @@ function company(status: "draft" | "ready" = "draft"): CompanyRecord {
   return companies.find(id)!;
 }
 
-function quoteFor(c: CompanyRecord, validBefore = nowSec + 1800) {
+function quoteFor(c: CompanyRecord, validBefore = nowSec + 1800, ttlAt = validBefore) {
   return payments.create({
     companyId: c.companyId,
     product: "formation",
     amountUsdc: 399_000_000n,
     nonce: `0x${"a1".repeat(32)}` as Hex,
     validBefore,
+    ttlAt,
     payTo: REVENUE,
   });
 }
@@ -335,6 +342,22 @@ test("an authorization for a DIFFERENT amount or a DIFFERENT payee never reaches
   expect(chain.sent).toHaveLength(0);
 });
 
+test("⚠ a settle INSIDE THE GRACE but past the QUOTE is refused with a re-quote (gate A4)", async () => {
+  // The grace exists so a signature given at the last second of the quote can still be composed,
+  // broadcast and mined — not so that a NEW settlement can start inside it. The token would
+  // accept this signature; we do not, and the guardian gets a fresh quote instead.
+  const c = company();
+  quoteFor(c, nowSec + 900, nowSec - 1);
+  const chain = fakeChain();
+  const result = await settleFormationPayment(deps(chain.executor), c, {
+    signature: await sign(c),
+    from: TENANT,
+  });
+  expect(result).toMatchObject({ ok: false });
+  expect((result as { reason: string }).reason).toMatch(/expired/);
+  expect(chain.sent).toHaveLength(0);
+});
+
 test("an EXPIRED quote is refused by the clock, before anything expensive", async () => {
   const c = company();
   quoteFor(c, nowSec - 1);
@@ -406,7 +429,7 @@ test("resume re-submits THE SAME AUTHORIZATION in a freshly composed transaction
   expect(payments.find(id)!.signature).toBe(signature);
 
   const recovered = fakeChain();
-  const verdict = await resumeSettlingPayment(deps(recovered.executor), c, payments.find(id)!);
+  const verdict = await advancePaymentOnChain(deps(recovered.executor), c, payments.find(id)!);
   expect(verdict).toBe("settled");
   // A new transaction — but carrying the guardian's ORIGINAL signature, which is what the token
   // verifies. Anything else would be a second authorization, i.e. a second charge.
@@ -430,7 +453,7 @@ test("⚠ a resume settles even when another transaction consumed the submitter'
 
   // …something else spends nonce 7 while we are down.
   const recovered = fakeChain({ accountNonce: 9 });
-  expect(await resumeSettlingPayment(deps(recovered.executor), c, payments.find(id)!)).toBe(
+  expect(await advancePaymentOnChain(deps(recovered.executor), c, payments.find(id)!)).toBe(
     "settled",
   );
   expect(decodeFakeTx(recovered.sent[0]!).nonce).toBe(9);
@@ -447,7 +470,7 @@ test("resume does NOT expire a row whose window is still open and whose nonce is
     from: TENANT,
   });
   const still = fakeChain({ receipt: "timeout" });
-  expect(await resumeSettlingPayment(deps(still.executor), c, payments.find(id)!)).toBe("pending");
+  expect(await advancePaymentOnChain(deps(still.executor), c, payments.find(id)!)).toBe("pending");
   expect(payments.find(id)?.status).toBe("settling");
   // …and it burned an attempt, which is what makes the sweeper's backoff move.
   expect(payments.find(id)?.attempt).toBe(1);
@@ -455,12 +478,47 @@ test("resume does NOT expire a row whose window is still open and whose nonce is
 
 test("resume expires ONLY when the window has closed AND the nonce is still unused", async () => {
   const c = company();
-  const id = quoteFor(c, nowSec - 1);
+  const id = quoteFor(c, nowSec - 1000);
   payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
   const chain = fakeChain({ receipt: "timeout" });
-  expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("expired");
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("expired");
   expect(payments.find(id)?.status).toBe("expired");
   // Nothing was re-broadcast: the authorization is past its window and can never settle.
+  expect(chain.sent).toHaveLength(0);
+});
+
+test("⚠ the SERVER's clock alone never expires a payment — the CHAIN's does (gate A4)", async () => {
+  // The token enforces `validBefore` against the BLOCK's timestamp. A box whose clock runs fast
+  // would otherwise write off an authorization the chain still considers live, tell the guardian
+  // to pay again, and then watch the original transfer land.
+  const c = company();
+  const id = quoteFor(c, nowSec - 1000);
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  // The chain is still well before this window's end, whatever our clock says.
+  const behind = fakeChain({ receipt: "timeout", blockTimestamp: nowSec - 5000 });
+  expect(await advancePaymentOnChain(deps(behind.executor), c, payments.find(id)!)).toBe("pending");
+  expect(payments.find(id)?.status).toBe("settling");
+});
+
+test("the FINALITY MARGIN holds a just-closed window open", async () => {
+  // Block timestamps are a declaration, not a wall clock, and nodes disagree about the head. The
+  // margin is the difference between "provably dead" and "dead by a second, on one node".
+  const c = company();
+  const id = quoteFor(c, nowSec - 1);
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  const chain = fakeChain({ receipt: "timeout", blockTimestamp: nowSec + 60 });
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("pending");
+  expect(payments.find(id)?.status).toBe("settling");
+});
+
+test("a QUOTE goes through the SAME procedure — no signature, no broadcast, one verdict", async () => {
+  // A quoted row may have been signed in a browser we never heard back from, so it is expired on
+  // the same evidence as a settling one and never on our clock alone.
+  const c = company();
+  const id = quoteFor(c, nowSec - 1000);
+  const chain = fakeChain({ receipt: "timeout" });
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("expired");
+  expect(payments.find(id)?.status).toBe("expired");
   expect(chain.sent).toHaveLength(0);
 });
 
@@ -469,7 +527,7 @@ test("a settlement in the token's LOGS resolves `settled`, past the window and a
   // row there would tell a guardian who paid us that they owe us again. The LOGS are what say so,
   // and nothing is re-broadcast: a second transaction carrying a retired authorization reverts.
   const c = company();
-  const id = quoteFor(c, nowSec - 1);
+  const id = quoteFor(c, nowSec - 1000);
   const row = payments.find(id)!;
   const onChain = `0x${"ee".repeat(32)}` as Hex;
   payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
@@ -477,7 +535,7 @@ test("a settlement in the token's LOGS resolves `settled`, past the window and a
     spent: new Set([row.nonce.toLowerCase()]),
     logs: settlementLogs(row.nonce, onChain),
   });
-  expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("settled");
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("settled");
   expect(payments.find(id)).toMatchObject({ status: "settled", txHash: onChain });
   expect(companies.find(c.companyId)?.status).toBe("ready");
   expect(chain.sent).toHaveLength(0);
@@ -502,7 +560,7 @@ test("⚠ a THIRD PARTY's settlement resolves SETTLED — never `failed` (gate A
     spent: new Set([row.nonce.toLowerCase()]),
     logs: settlementLogs(row.nonce, theirs),
   });
-  expect(await resumeSettlingPayment(deps(chain.executor), c, row)).toBe("settled");
+  expect(await advancePaymentOnChain(deps(chain.executor), c, row)).toBe("settled");
   expect(payments.find(id)).toMatchObject({ status: "settled", txHash: theirs });
   expect(companies.find(c.companyId)?.status).toBe("ready");
   expect(chain.sent).toHaveLength(0);
@@ -526,7 +584,7 @@ test("an OUT-OF-BAND cancellation resolves `expired`, and the guardian may re-qu
       },
     ],
   });
-  expect(await resumeSettlingPayment(deps(chain.executor), c, row)).toBe("expired");
+  expect(await advancePaymentOnChain(deps(chain.executor), c, row)).toBe("expired");
   expect(payments.find(id)?.status).toBe("expired");
   expect(companies.find(c.companyId)?.status).toBe("draft");
   expect(requoteFormationPayment(deps(chain.executor), c)).toMatchObject({ ok: true });
@@ -543,7 +601,7 @@ test("an AuthorizationUsed with NO matching transfer is NOT our settlement", asy
     spent: new Set([row.nonce.toLowerCase()]),
     logs: [settlementLogs(row.nonce, `0x${"ef".repeat(32)}` as Hex)[0]!],
   });
-  expect(await resumeSettlingPayment(deps(chain.executor), c, row)).toBe("pending");
+  expect(await advancePaymentOnChain(deps(chain.executor), c, row)).toBe("pending");
   expect(payments.find(id)?.status).toBe("settling");
   expect(companies.find(c.companyId)?.status).toBe("draft");
 });
@@ -629,7 +687,7 @@ test("⚠ a SPENT nonce with NO VISIBLE LOG stays SETTLING — never expired", a
   const nonce = payments.find(id)!.nonce;
   payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
   const chain = fakeChain({ receipt: "timeout", spent: new Set([nonce.toLowerCase()]) });
-  expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("pending");
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("pending");
   expect(payments.find(id)?.status).toBe("settling");
   expect(companies.find(c.companyId)?.status).toBe("draft");
 });

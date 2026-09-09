@@ -33,7 +33,7 @@ import {
 } from "../persistence/formationRepository";
 import { parseSqliteUtc } from "../util/sqliteTime";
 import { advanceAnchor, newAnchorReadCache } from "./anchorLoop";
-import { expire as expirePayment, resumeSettlingPayment } from "./formationPayment";
+import { advancePaymentOnChain } from "./formationPayment";
 import {
   type FormationAdvanceDeps,
   advanceFormation,
@@ -431,7 +431,7 @@ export class FormationSweeper {
       });
       try {
         await withKeyedLock(`payment:${row.companyId}`, () =>
-          resumeSettlingPayment(
+          advancePaymentOnChain(
             { ...payment, companies: this.d.companies, now: this.now.bind(this) },
             company,
             row,
@@ -449,17 +449,30 @@ export class FormationSweeper {
       }
     }
 
-    // The quiet half: quotes whose window has closed. No chain read is needed — nothing was ever
-    // broadcast, and `validBefore` alone settles it.
+    // The quieter half: quotes whose window has closed by OUR clock, which only makes them
+    // CANDIDATES. They go through the same procedure as a stalled settle (gate A4) — the chain's
+    // clock plus a finality margin, the token's logs, and `authorizationState` — because a quote
+    // may have been signed in a browser we never heard back from, and expiring one on a fast
+    // server clock is how a guardian is asked to pay twice.
     for (const row of payment.payment.payments.listExpiredQuotes(nowSec, STRANDED_BATCH)) {
       const company = this.d.companies.find(row.companyId);
       if (!company) continue;
-      expirePayment(
-        { ...payment, companies: this.d.companies, now: this.now.bind(this) },
-        company,
-        row,
-        "quote-window-closed",
-      );
+      try {
+        await withKeyedLock(`payment:${row.companyId}`, () =>
+          advancePaymentOnChain(
+            { ...payment, companies: this.d.companies, now: this.now.bind(this) },
+            company,
+            row,
+          ),
+        );
+      } catch (err) {
+        opsLog("formation_payment_resume_failed", {
+          level: "warn",
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          ...describeDoolaError(err),
+        });
+      }
     }
   }
 

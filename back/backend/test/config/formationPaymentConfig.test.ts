@@ -60,6 +60,9 @@ test("the fee defaults to 399 whole USDC and is converted ONCE to atomic", () =>
     feeUsdc: 399,
     feeAtomic: 399_000_000n,
     quoteTtlMs: 30 * 60 * 1000,
+    // The settlement GRACE (gate A4): how much longer than the quote the signature stays valid,
+    // so a last-second authorization can still be composed, broadcast and mined.
+    settleGraceMs: 15 * 60 * 1000,
   });
   const cheap = loadConfig({ ...BASE, FORMATION_FEE_USDC: "1" });
   expect(cheap.formation?.payment.feeAtomic).toBe(1_000_000n);
