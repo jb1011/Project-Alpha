@@ -162,15 +162,54 @@ test("payment ON: the create response carries the quote, ready to sign", async (
   });
 });
 
-test("GET the payment: 404 where the deployment does not charge", async () => {
-  // Not an empty object: there is no payment RESOURCE on a box that takes no money, and
-  // inventing one would have every client render a payment section for it.
+test("GET the payment: 404 where there is NO PAYMENT — not where the flag is off", async () => {
+  // A company with no payment row has no payment resource, and inventing an empty one would have
+  // every client render a payment section for a deployment that takes no money.
   const { body } = await create(paymentCfg({ required: false }));
   const res = await app(paymentCfg({ required: false })).request(
     `/companies/${body.companyId}/payment`,
     { headers: { authorization: `Bearer ${await token(OWNER)}` } },
   );
   expect(res.status).toBe(404);
+});
+
+test("⚠ B8: a payment already taken stays READABLE after the flag is rolled back", async () => {
+  // Gating the read on `payment.required` meant that turning charging off after taking money made
+  // every settled payment invisible: a guardian who paid 399 USDC saw no payment at all and
+  // support had nothing to point at. Rolling a flag back must not erase history.
+  const cfg = paymentCfg();
+  const { body } = await create(cfg);
+  const companyId = body.companyId as unknown as string;
+  const row = payments.findLive(companyId, "formation")!;
+  payments.markSettling(row.paymentId, {
+    payerAddress: OWNER as Address,
+    signature: `0x${"11".repeat(65)}`,
+  });
+  payments.markSettled(row.paymentId, `0x${"cc".repeat(32)}`);
+
+  const rolledBack = paymentCfg({ required: false, domain: undefined });
+  const res = await app(rolledBack).request(`/companies/${companyId}/payment`, {
+    headers: { authorization: `Bearer ${await token(OWNER)}` },
+  });
+  expect(res.status).toBe(200);
+  const view = (await res.json()) as Record<string, unknown>;
+  expect(view).toMatchObject({ status: "settled", txHash: `0x${"cc".repeat(32)}` });
+  // Nothing SIGNABLE, though: no quote, and no domain to sign one against.
+  expect(view.quote).toBeUndefined();
+  expect(view.domain).toBeNull();
+
+  // …and the ACTION doors are still closed, which is the half that must stay gated.
+  for (const action of ["settle", "cancel", "requote"]) {
+    const denied = await app(rolledBack).request(`/companies/${companyId}/payment/${action}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${await token(OWNER)}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ signature: `0x${"11".repeat(65)}`, from: OWNER }),
+    });
+    expect(denied.status).toBe(404);
+  }
 });
 
 test("GET the payment: the live quote, re-servable after a reload", async () => {

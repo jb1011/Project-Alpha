@@ -991,7 +991,10 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     return company;
   };
 
-  if (deps.formation?.payment?.required && deps.companies) {
+  // The READ tool wherever a payment store exists — a deployment that has STOPPED charging must
+  // still be able to answer "what happened to the fee I paid?" (finding B8). The three ACTION
+  // tools stay behind `required`: they are doors onto money moving.
+  if (deps.formation?.payment && deps.companies) {
     server.registerTool(
       "get_company_payment",
       {
@@ -1018,7 +1021,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         };
       },
     );
+  }
 
+  if (deps.formation?.payment?.required && deps.companies) {
     server.registerTool(
       "submit_company_payment",
       {

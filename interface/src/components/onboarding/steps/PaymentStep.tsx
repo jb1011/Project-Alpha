@@ -101,7 +101,9 @@ export function PaymentStep({ eyebrow, companyId, onBack, onComplete }: Props) {
 
   async function onCancel() {
     setProblem(null);
-    if (!payment || !address) return;
+    // No domain, no cancel: `paymentAction` does not offer one, and a deployment that has stopped
+    // charging serves none (finding B8).
+    if (!payment?.domain || !address) return;
     try {
       const signature = await signTypedDataAsync(
         cancelTypedData(payment.domain, address, payment.nonce),

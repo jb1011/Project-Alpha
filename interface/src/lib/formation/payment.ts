@@ -92,9 +92,17 @@ export function paymentAction(
       // second quote until that window provably closes — and a cancel retires the nonce on-chain
       // at once, which is exactly what the fast path is for. (Waiting a few minutes also works,
       // and the explanation says so.)
-      return payment.quote ? "sign" : "cancel";
+      //
+      // …unless there is no domain to sign a cancel against, on a deployment that has stopped
+      // charging (finding B8): then nothing is owed and nothing can be signed.
+      if (payment.quote) return "sign";
+      return payment.domain === null ? "wait" : "cancel";
     case "settling":
-      return opts.settlingSinceMs !== undefined &&
+      // A cancel needs a DOMAIN to sign against, and a deployment that has stopped charging
+      // serves none (finding B8). Waiting is then the only honest offer: the row is history, and
+      // the sweeper is what resolves it.
+      return payment.domain !== null &&
+        opts.settlingSinceMs !== undefined &&
         opts.nowMs - opts.settlingSinceMs > STUCK_AFTER_MS
         ? "cancel"
         : "wait";

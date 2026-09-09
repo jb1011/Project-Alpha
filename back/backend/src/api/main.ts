@@ -391,23 +391,38 @@ async function main() {
   const chainHead = newChainHeadCache(
     formationCfg.payment.required ? await publicClient.getBlockNumber().catch(() => null) : null,
   );
-  const formationPayment = formationCfg.payment.required
-    ? {
-        required: true,
-        feeAtomic: formationCfg.payment.feeAtomic,
-        feeUsdc: formationCfg.payment.feeUsdc,
-        // Non-null by the boot invariant in env.ts: payment required ⇒ a revenue address is set.
-        revenueAddress: formationCfg.payment.revenueAddress as Address,
-        quoteTtlMs: formationCfg.payment.quoteTtlMs,
-        domain: await readUsdcDomain(publicClient, cfg.usdc, cfg.chainId),
-        chainHead: chainHead.get,
-        noteChainHead: chainHead.set,
-        payments: formationPayments,
-      }
-    : undefined;
-  if (formationPayment)
+  /**
+   * ALWAYS CONSTRUCTED (finding B8), and `required` inside it is the switch.
+   *
+   * It used to exist only where the deployment charges, which made every payment surface vanish
+   * with the flag — including the READ ones. Turn charging off after taking money and the
+   * settled rows become invisible: a guardian who paid 399 USDC sees no payment at all, and
+   * support has nothing to point at. Rolling a flag back must not erase history.
+   *
+   * The DOMAIN is the one part that stays conditional: reading the token at boot is right for a
+   * box that quotes (better to refuse to start than to quote a price for a signature it could not
+   * settle) and wrong for one that does not, where a token it cannot see would be a boot failure
+   * for a feature it does not use.
+   */
+  const formationPayment = {
+    required: formationCfg.payment.required,
+    feeAtomic: formationCfg.payment.feeAtomic,
+    feeUsdc: formationCfg.payment.feeUsdc,
+    // Non-null WHEN REQUIRED, by the boot invariant in env.ts; the empty string is never read on
+    // a deployment that does not charge, because nothing quotes.
+    revenueAddress: (formationCfg.payment.revenueAddress ?? "0x") as Address,
+    quoteTtlMs: formationCfg.payment.quoteTtlMs,
+    settleGraceMs: formationCfg.payment.settleGraceMs,
+    domain: formationCfg.payment.required
+      ? await readUsdcDomain(publicClient, cfg.usdc, cfg.chainId)
+      : undefined,
+    chainHead: chainHead.get,
+    noteChainHead: chainHead.set,
+    payments: formationPayments,
+  };
+  if (formationPayment.required)
     console.warn(
-      `⚠ FORMATION PAYMENTS ENABLED: $${formationPayment.feeUsdc} USDC to ${formationPayment.revenueAddress} (USDC domain "${formationPayment.domain.name}" v${formationPayment.domain.version}, pinned on-chain)`,
+      `⚠ FORMATION PAYMENTS ENABLED: $${formationPayment.feeUsdc} USDC to ${formationPayment.revenueAddress} (USDC domain "${formationPayment.domain?.name}" v${formationPayment.domain?.version}, pinned on-chain)`,
     );
 
   /**
@@ -431,7 +446,7 @@ async function main() {
         chainId: cfg.chainId,
       }
     : undefined;
-  if (formationPayment && formationExecutor) {
+  if (formationPayment.required && formationExecutor) {
     const submitter = formationExecutor.walletClient.account?.address as Address;
     // The gas float, read once and stated. It is USDC on Arc, so "low" is a number an operator
     // can act on directly — and a submitter that runs dry does not fail a settle loudly, it
@@ -578,7 +593,7 @@ async function main() {
     // holds, so the sweeper and the route resolve one payment through one set of rules. Absent
     // where the deployment does not charge, and the leg is then a no-op.
     payment:
-      formationPayment && formationExecutor
+      formationPayment.required && formationExecutor
         ? {
             payment: formationPayment,
             executor: formationExecutor,
@@ -728,9 +743,9 @@ async function main() {
             payment: formationPayment,
             // …and the fee ITSELF, whether or not this box charges: the beta sentence quotes it.
             feeUsdc: formationCfg.payment.feeUsdc,
-            // The submitter. Present exactly where `payment` is, so a box that does not charge
-            // has no settle path wired at all rather than one that refuses at the last moment.
-            paymentExecutor: formationPayment ? formationExecutor : undefined,
+            // The submitter. Present only where the box CHARGES, so a deployment that has
+            // stopped can still read its payments while having no settle path wired at all.
+            paymentExecutor: formationPayment.required ? formationExecutor : undefined,
           }
         : undefined,
     // The view dependencies, as ONE object shared with the MCP surface below (C8).

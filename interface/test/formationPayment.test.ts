@@ -155,6 +155,18 @@ test("expired and failed both offer a re-quote; settled and refunded offer nothi
     expect(paymentAction(payment({ status, quote: undefined }), { nowMs: NOW })).toBe("done");
 });
 
+test("⚠ B8: with no DOMAIN there is nothing to sign, so a stuck payment only waits", () => {
+  // A deployment that has stopped charging still SHOWS the payments it took, but it reads no
+  // token domain at boot — so there is nothing to sign a cancellation against, and offering the
+  // button would produce a wallet prompt nobody could honour.
+  const rolledBack = payment({ status: "settling", quote: undefined, domain: null });
+  expect(
+    paymentAction(rolledBack, { nowMs: NOW, settlingSinceMs: NOW - STUCK_AFTER_MS - 1 }),
+  ).toBe("wait");
+  // …and the same for a quote past its TTL, whose exit is normally a cancel.
+  expect(paymentAction(payment({ quote: undefined, domain: null }), { nowMs: NOW })).toBe("wait");
+});
+
 test("a status from a NEWER backend is inert, never guessed at", () => {
   const future = payment({ status: "escrowed" as never, quote: undefined });
   expect(paymentAction(future, { nowMs: NOW })).toBe("unknown");

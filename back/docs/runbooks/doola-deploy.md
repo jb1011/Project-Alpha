@@ -115,9 +115,16 @@ one is a loud refusal instead of a silent strip.
 | resolve one payment from the chain | — | — | `npm run cli -- formation:reconcile <paymentId>` |
 | RECORD a Ledger refund | — | — | `npm run cli -- formation:refund --payment-id <id> --tx <hash> --yes` |
 
-The four payment doors exist only where `FORMATION_PAYMENT_REQUIRED` is on: REST answers 404 and
-the MCP tools are not registered at all, so an agent cannot discover a tool whose every call would
-fail. The two READ surfaces are the exception — see "after a rollback" below.
+The three ACTION doors (settle, cancel, re-quote) exist only where `FORMATION_PAYMENT_REQUIRED` is
+on: REST answers 404 and the MCP tools are not registered at all, so an agent cannot discover a
+tool whose every call would fail.
+
+⚠ **The READ surfaces are NOT gated on the flag.** `GET /companies/:id/payment`,
+`get_company_payment` and the Companies-page panel answer wherever a payment row exists, so
+turning charging OFF after taking money does not make those payments invisible — a guardian who
+paid $399 can still see it, and support has something to point at. Rolling a flag back must not
+erase history. Such a payment carries no `quote` and a null `domain` (the token's domain is read
+at boot only where the box charges), so nothing on it is signable.
 
 Two of those doors are the exits from a PARKED filing, and each clears its OWN flag:
 `PATCH /companies/:companyId` clears `awaitingIntakeEdit`, `PATCH /companies/:companyId/party`

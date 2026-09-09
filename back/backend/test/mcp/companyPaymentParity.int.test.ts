@@ -61,7 +61,11 @@ function paymentCfg(required: boolean): FormationPaymentConfig {
     feeUsdc: 399,
     revenueAddress: REVENUE,
     quoteTtlMs: 30 * 60 * 1000,
-    domain: { name: "USD Coin", version: "2", chainId: 5042002, verifyingContract: USDC },
+    // Present only where the box CHARGES, exactly as the composition root builds it: the token's
+    // domain is READ at boot, and a deployment that quotes nothing never reads it (finding B8).
+    domain: required
+      ? { name: "USDC", version: "2", chainId: 5042002, verifyingContract: USDC }
+      : undefined,
     payments,
   };
 }
@@ -188,15 +192,37 @@ async function listToolNames(application: ReturnType<typeof buildApiApp>): Promi
   }
 }
 
-test("the payment tools are NOT registered on a deployment that does not charge", async () => {
+test("the ACTION tools are not registered on a deployment that does not charge", async () => {
   const names = await listToolNames(app(paymentCfg(false)));
-  expect(names).not.toContain("get_company_payment");
   expect(names).not.toContain("submit_company_payment");
   expect(names).not.toContain("cancel_company_payment");
   expect(names).not.toContain("requote_company_payment");
+  // …but the READ is (finding B8). A box that has STOPPED charging still has to answer "what
+  // happened to the fee I paid?" — rolling a flag back must not erase history.
+  expect(names).toContain("get_company_payment");
   // …and the ordinary company tools are still there, so this is a payment gate rather than a
   // formation one.
   expect(names).toContain("list_companies");
+});
+
+test("⚠ B8: a SETTLED payment is still readable after the flag is rolled back", async () => {
+  const { companyId } = seedCompanyWithQuote();
+  const row = payments.findLive(companyId, "formation")!;
+  payments.markSettling(row.paymentId, {
+    payerAddress: OWNER as Address,
+    signature: `0x${"11".repeat(65)}`,
+  });
+  payments.markSettled(row.paymentId, `0x${"cc".repeat(32)}`);
+
+  const { text, isError } = await callTool(app(paymentCfg(false)), "read", "get_company_payment", {
+    companyId,
+  });
+  expect(isError).toBeFalsy();
+  const view = JSON.parse(text) as Record<string, unknown>;
+  expect(view).toMatchObject({ status: "settled", amountUsdc: "399000000" });
+  // No domain, because the token was never read on a box that does not charge — and nothing here
+  // is signable anyway.
+  expect(view.domain).toBeNull();
 });
 
 test("all FOUR are registered where it does — including the re-quote (finding B7)", async () => {
@@ -316,7 +342,7 @@ test("PARITY: submit_company_payment settles exactly as the REST door does", asy
   const application = app(paymentCfg(true));
   const row = payments.findLive(companyId, "formation")!;
   const signature = await guardian.signTypedData({
-    domain: { name: "USD Coin", version: "2", chainId: 5042002, verifyingContract: USDC },
+    domain: { name: "USDC", version: "2", chainId: 5042002, verifyingContract: USDC },
     types: TRANSFER_WITH_AUTHORIZATION_TYPES,
     primaryType: "TransferWithAuthorization",
     message: {

@@ -17,7 +17,11 @@ import {
   submitCancelAuthorization,
   submitTransferWithAuthorization,
 } from "../payments/formationSettle";
-import { verifySignature, verifyTransferAuthorization } from "../payments/transferAuthorization";
+import {
+  type TransferAuthorizationDomain,
+  verifySignature,
+  verifyTransferAuthorization,
+} from "../payments/transferAuthorization";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationPaymentRecord } from "../persistence/formationPaymentRepository";
@@ -101,6 +105,10 @@ export async function settleFormationPayment(
 ): Promise<SettleResult> {
   const row = deps.payment.payments.findLive(company.companyId, FORMATION_PRODUCT);
   if (!row) return { ok: false, reason: "no live payment for this company" };
+  // Non-null wherever an action door is reachable: `payment.required` implies the domain was read
+  // and pinned at boot (§6.1). Named rather than asserted at four call sites.
+  const domain = deps.payment.domain;
+  if (!domain) return { ok: false, reason: "this deployment does not take formation payments" };
   if (row.status !== "quoted")
     return {
       ok: false,
@@ -140,7 +148,7 @@ export async function settleFormationPayment(
   const verdict = await verifyTransferAuthorization({
     authorization,
     signature: body.signature,
-    domain: deps.payment.domain,
+    domain,
     payTo: row.payTo,
     // THE STORED amount, never `deps.payment.feeAtomic`: a fee change between quote and settle
     // must not re-price a signature already given (§6.3).
@@ -487,6 +495,8 @@ export async function cancelFormationPayment(
 ): Promise<{ ok: true; txHash: Hex } | { ok: false; reason: string }> {
   const row = deps.payment.payments.findLive(company.companyId, FORMATION_PRODUCT);
   if (!row) return { ok: false, reason: "no live payment for this company" };
+  const domain = deps.payment.domain;
+  if (!domain) return { ok: false, reason: "this deployment does not take formation payments" };
   const guardian = row.payerAddress ?? guardianOf(company);
 
   // Verified LOCALLY first, exactly as the settle is — through the SAME helper and the same
@@ -496,7 +506,7 @@ export async function cancelFormationPayment(
   const verdict = await verifySignature({
     client: deps.executor.publicClient,
     address: guardian,
-    domain: deps.payment.domain,
+    domain,
     types: CANCEL_AUTHORIZATION_TYPES,
     primaryType: "CancelAuthorization",
     message: { authorizer: guardian, nonce: row.nonce },
@@ -570,5 +580,8 @@ export function requoteFormationPayment(
     validBefore: row.validBefore,
     requote: true,
   });
-  return { ok: true, quote: quoteOf(row, guardianOf(company), deps.payment) };
+  return {
+    ok: true,
+    quote: quoteOf(row, guardianOf(company), deps.payment.domain as TransferAuthorizationDomain),
+  };
 }

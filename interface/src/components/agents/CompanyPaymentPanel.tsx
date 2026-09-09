@@ -114,14 +114,16 @@ export function CompanyPaymentPanel({ companyId }: { companyId: string }) {
               {settle.isPending ? "Submitting…" : "Sign and pay"}
             </Button>
           )}
-          {action === "cancel" && (
+          {action === "cancel" && payment.domain && (
             <Button
               variant="subtle"
               disabled={busy || !address}
               onClick={() =>
                 void run(async () => {
                   const signature = await signTypedDataAsync(
-                    cancelTypedData(payment.domain, address as `0x${string}`, payment.nonce),
+                    // Non-null in this branch: `paymentAction` does not offer a cancel without a
+                    // domain to sign it against (finding B8).
+                    cancelTypedData(payment.domain!, address as `0x${string}`, payment.nonce),
                   );
                   await cancel.mutateAsync({ signature });
                 })

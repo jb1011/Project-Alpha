@@ -28,6 +28,7 @@ import {
   warnIfNearLimit,
 } from "../formation";
 import { opsLog } from "../observability/opsLog";
+import type { TransferAuthorizationDomain } from "../payments/transferAuthorization";
 import type { CompanyRepository, CompanyStatus } from "../persistence/companyRepository";
 import type {
   EditablePartyFields,
@@ -360,7 +361,13 @@ export function createCompany(
       });
       return {
         companyId,
-        quote: quoteOf(payment, guardianOf({ tenantId }), deps.payment),
+        // Non-null by the boot invariant: a deployment that charges reads the token's domain at
+        // boot or does not start (§6.1).
+        quote: quoteOf(
+          payment,
+          guardianOf({ tenantId }),
+          deps.payment.domain as TransferAuthorizationDomain,
+        ),
       };
     }
   }

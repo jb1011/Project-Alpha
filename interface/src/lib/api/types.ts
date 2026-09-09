@@ -846,7 +846,9 @@ export type FormationPaymentView = {
    * signature the token rejects — a stuck payment, never a moved one.
    */
   nonce: `0x${string}`;
-  domain: PaymentTypedData["domain"];
+  /** NULL on a deployment that no longer charges: the token's domain is read at boot only where
+   *  it does, and a payment there is history rather than something to sign. */
+  domain: PaymentTypedData["domain"] | null;
   quote?: FormationQuote;
 };
 

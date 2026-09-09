@@ -48,8 +48,19 @@ export interface FormationPaymentConfig {
   /** How much longer than the quote the AUTHORIZATION stays valid (§6.4, gate A4). Absent in
    *  fixtures, where it reads as no grace at all. */
   settleGraceMs?: number;
-  /** The USDC token's own EIP-712 domain, read and pinned at boot. */
-  domain: TransferAuthorizationDomain;
+  /**
+   * The USDC token's own EIP-712 domain, read and pinned at boot — ONLY where this deployment
+   * charges (finding B8).
+   *
+   * Optional because this whole object is now constructed everywhere, so that a deployment which
+   * has STOPPED charging can still SHOW the payments it already took. Reading the token at boot is
+   * right for a box that quotes (better to refuse to start than to quote a price for a signature
+   * it could not settle) and wrong for one that does not: a token it cannot see would become a
+   * boot failure for a feature it does not use.
+   *
+   * Everything that needs it is behind `required`; everything that does not is a read.
+   */
+  domain?: TransferAuthorizationDomain;
   /**
    * The chain head as this box last saw it, synchronously (B1 gate A3).
    *
@@ -137,7 +148,9 @@ export interface FormationPaymentView {
    * cancellations against a domain the token does not verify.
    */
   nonce: Hex;
-  domain: TransferAuthorizationDomain;
+  /** NULL on a deployment that does not charge (finding B8): there is no domain to serve because
+   *  the token was never read, and there is nothing live to cancel either. */
+  domain: TransferAuthorizationDomain | null;
   /**
    * The signable quote — present ONLY while the row is `quoted` and still inside its window.
    *
@@ -178,7 +191,7 @@ export function guardianOf(company: { tenantId: string }): Address {
 export function quoteOf(
   payment: FormationPaymentRecord,
   guardian: Address,
-  cfg: Pick<FormationPaymentConfig, "domain">,
+  domain: TransferAuthorizationDomain,
 ): FormationQuote {
   const value = payment.amountUsdc.toString();
   const validBefore = String(payment.validBefore);
@@ -197,7 +210,7 @@ export function quoteOf(
     validBefore: payment.validBefore,
     expiresAt: payment.ttlAt,
     typedData: {
-      domain: cfg.domain,
+      domain,
       types: TRANSFER_WITH_AUTHORIZATION_TYPES,
       primaryType: "TransferWithAuthorization",
       message: {
@@ -227,8 +240,10 @@ export function paymentView(
   nowSec: number,
 ): FormationPaymentView {
   // The QUOTE's clock, not the token's: past the TTL we stop offering to sign even though the
-  // authorization would still be accepted for another grace period (gate A4).
-  const signable = payment.status === "quoted" && payment.ttlAt > nowSec;
+  // authorization would still be accepted for another grace period (gate A4). …And a domain: a
+  // box that no longer charges can still SHOW this row, but it has nothing to sign against.
+  const signable =
+    payment.status === "quoted" && payment.ttlAt > nowSec && cfg.domain !== undefined;
   return {
     paymentId: payment.paymentId,
     companyId: payment.companyId,
@@ -242,8 +257,8 @@ export function paymentView(
     txHash: payment.txHash,
     refundTxHash: payment.refundTxHash,
     nonce: payment.nonce,
-    domain: cfg.domain,
-    ...(signable ? { quote: quoteOf(payment, guardian, cfg) } : {}),
+    domain: cfg.domain ?? null,
+    ...(signable && cfg.domain ? { quote: quoteOf(payment, guardian, cfg.domain) } : {}),
   };
 }
 

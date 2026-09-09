@@ -140,7 +140,7 @@ async function main(): Promise<void> {
   // (b) THE QUOTE, built by the product's own function.
   const validBefore = Math.floor(Date.now() / 1000) + 30 * 60;
   const nonce = newPaymentNonce();
-  const quote = quoteOf(row(nonce, validBefore), guardian.address as Address, { domain });
+  const quote = quoteOf(row(nonce, validBefore), guardian.address as Address, domain);
   console.log(`quote: ${quote.amountUsdc} atomic USDC -> ${quote.payTo}, nonce ${quote.nonce}`);
 
   // (c) THE GUARDIAN'S SIGNATURE, verified through the product's own verifier.

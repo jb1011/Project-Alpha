@@ -189,8 +189,13 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    */
   app.get("/companies/:companyId/payment", (c) => {
     const company = requireOwnedCompany(deps, c);
+    // ⚠ A READ, so it does NOT require `payment.required` (finding B8). Gating it on the switch
+    // meant that turning charging off after taking money made every settled payment invisible: a
+    // guardian who paid 399 USDC would see no payment at all, and support would have nothing to
+    // point at. Rolling a flag back must not erase history. The ACTIONS below are a different
+    // question and are gated.
     const payment = deps.formation?.payment;
-    if (!payment?.required) throw new ApiError("not_found", 404, "payment not found");
+    if (!payment) throw new ApiError("not_found", 404, "payment not found");
     const row = payment.payments.findCurrent(company.companyId, FORMATION_PRODUCT);
     if (!row) throw new ApiError("not_found", 404, "payment not found");
     const now = Math.floor((deps.now ? deps.now() : Date.now()) / 1000);
