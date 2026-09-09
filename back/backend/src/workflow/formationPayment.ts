@@ -151,7 +151,13 @@ export async function settleFormationPayment(
     txHash: signed.txHash,
   });
 
-  return finishSettle(deps, company, row, await broadcastAndConfirm(deps.executor, signed));
+  return finishSettle(
+    deps,
+    company,
+    row,
+    await broadcastAndConfirm(deps.executor, signed),
+    signed.txHash,
+  );
 }
 
 /**
@@ -167,6 +173,10 @@ function finishSettle(
   company: CompanyRecord,
   row: FormationPaymentRecord,
   outcome: Awaited<ReturnType<typeof broadcastAndConfirm>>,
+  /** The hash of the bytes we actually broadcast. Passed in rather than read off `row`, which was
+   *  loaded BEFORE `markSettling` wrote it and therefore still carries null on the first pass —
+   *  a `pending` answer with no hash gives a caller nothing to look up. */
+  broadcastHash: Hex,
 ): SettleResult {
   if (outcome.kind === "settled") {
     deps.transaction(() => {
@@ -207,7 +217,7 @@ function finishSettle(
     paymentId: row.paymentId,
     reason: outcome.reason,
   });
-  return { ok: true, status: "pending", txHash: row.txHash ?? ("0x" as Hex) };
+  return { ok: true, status: "pending", txHash: broadcastHash };
 }
 
 /**
@@ -233,20 +243,37 @@ export async function resumeSettlingPayment(
   const guardian = row.payerAddress ?? guardianOf(company);
   const used = await authorizationUsed(deps.executor, guardian, row.nonce);
   if (used) {
-    // The nonce is spent. The receipt we hold a hash for is the evidence of WHICH way, and
-    // `broadcastAndConfirm` re-reads it (the send is a no-op for an already-mined transaction).
+    // The nonce is spent — by our transfer, or by a cancellation. The receipt is what tells the
+    // two apart, and `broadcastAndConfirm` re-reads it (the send is a no-op for an already-mined
+    // transaction).
     if (row.rawTx) {
       const outcome = await broadcastAndConfirm(deps.executor, {
         rawTx: row.rawTx,
         txHash: row.txHash as Hex,
       });
-      const result = finishSettle(deps, company, row, outcome);
+      const result = finishSettle(deps, company, row, outcome, row.txHash as Hex);
       if (result.ok && result.status === "settled") return "settled";
       if (!result.ok) return "failed";
     }
-    // Spent, but not by a transaction we can produce a receipt for — the guardian cancelled it.
-    // The authorization is dead, so the row is `expired` and a re-quote is the way forward.
-    return expire(deps, company, row, "cancelled-on-chain") ? "expired" : "pending";
+    // ⚠ SPENT, AND WE CANNOT SEE WHICH WAY. The row STAYS `settling` and this returns `pending`.
+    //
+    // The tempting move is `expired` — "the nonce is gone, so the guardian must have cancelled,
+    // so let them re-quote". It is wrong, and it is wrong in the direction that costs money: the
+    // other reason a nonce is spent is that OUR TRANSFER LANDED and the receipt is merely
+    // unreadable right now (a pruned or lagging RPC, a node that has not caught up). Expiring
+    // there would invite a second 399 USDC payment for a company already paid for.
+    //
+    // The genuine cancellation has its own resolution and does not need this one: the cancel
+    // route expires the row itself the moment the cancellation confirms. What is left here is a
+    // cancel made out of band, which is rare, safe to leave `settling`, and visible to a human in
+    // the ops trail — the failure direction to prefer.
+    opsLog("formation_payment_pending", {
+      level: "warn",
+      companyId: company.companyId,
+      paymentId: row.paymentId,
+      reason: "authorization nonce is spent but no receipt could be read — NOT expiring",
+    });
+    return "pending";
   }
 
   if (row.validBefore <= nowSec(deps))
@@ -271,7 +298,7 @@ export async function resumeSettlingPayment(
     rawTx: row.rawTx,
     txHash: row.txHash as Hex,
   });
-  const result = finishSettle(deps, company, row, outcome);
+  const result = finishSettle(deps, company, row, outcome, row.txHash as Hex);
   if (result.ok && result.status === "settled") return "settled";
   if (!result.ok) return "failed";
   return "pending";

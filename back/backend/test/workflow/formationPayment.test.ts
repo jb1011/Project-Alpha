@@ -470,3 +470,41 @@ test("a READY company has nothing left to pay for", async () => {
   expect(result).toMatchObject({ ok: false });
   expect((result as { reason: string }).reason).toMatch(/nothing left to pay/);
 });
+
+test("⚠ a SPENT nonce whose receipt we cannot read stays SETTLING — never expired", async () => {
+  // The costliest wrong move available here. "The nonce is gone, so they must have cancelled, so
+  // let them re-quote" is tempting and wrong: the OTHER reason a nonce is spent is that our
+  // transfer landed and the receipt is merely unreadable right now (a pruned or lagging RPC).
+  // Expiring would invite a second 399 USDC payment for a company already paid for.
+  const c = company();
+  const id = quoteFor(c, nowSec - 1);
+  const nonce = payments.find(id)!.nonce;
+  payments.markSettling(id, {
+    payerAddress: TENANT,
+    rawTx: "0x02aa",
+    txHash: `0x${"cc".repeat(32)}`,
+  });
+  const chain = fakeChain({ receipt: "timeout", spent: new Set([nonce.toLowerCase()]) });
+  expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("pending");
+  expect(payments.find(id)?.status).toBe("settling");
+  expect(companies.find(c.companyId)?.status).toBe("draft");
+});
+
+test("a `pending` settle answers with the hash of the bytes we actually broadcast", async () => {
+  // It used to answer with the row's `tx_hash` read BEFORE `markSettling` wrote it — i.e. `0x` —
+  // which gives a caller nothing to look up for a transaction that is genuinely in flight.
+  const c = company();
+  quoteFor(c);
+  const chain = fakeChain({ receipt: "timeout" });
+  const result = await settleFormationPayment(deps(chain.executor), c, {
+    signature: await sign(c),
+    from: TENANT,
+  });
+  expect(result).toMatchObject({ ok: true, status: "pending" });
+  // keccak256 of the serialized transaction — 32 bytes — and the SAME value persisted on the row
+  // before the broadcast, which is what makes a `pending` answer something a caller can look up.
+  expect((result as { txHash: string }).txHash).toMatch(/^0x[0-9a-f]{64}$/);
+  expect((result as { txHash: string }).txHash).toBe(
+    payments.findLive(c.companyId, "formation")!.txHash,
+  );
+});
