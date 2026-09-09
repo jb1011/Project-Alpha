@@ -4,12 +4,14 @@ import {
   CIRCLE_BATCHING_VERSION,
 } from "@circle-fin/x402-batching";
 import { Hono } from "hono";
-import { getAddress, verifyTypedData } from "viem";
-import { evm } from "x402/types";
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { decodeX402Header } from "../adapters/x402/signX402";
 import type { Address } from "../types";
 import type { SettleFn } from "./settle";
+import {
+  type VerifyTransferAuthorizationResult,
+  verifyTransferAuthorization,
+} from "./transferAuthorization";
 import {
   type AgentkitSellerConfig,
   mintAgentkitExtension,
@@ -40,7 +42,7 @@ export function buildRequirements(cfg: SellerConfig) {
   };
 }
 
-export type VerifyResult = { ok: true; nonce: `0x${string}` } | { ok: false; reason: string };
+export type VerifyResult = VerifyTransferAuthorizationResult;
 
 /**
  * Verify an inbound X-PAYMENT against this seller's requirements.
@@ -50,6 +52,14 @@ export type VerifyResult = { ok: true; nonce: `0x${string}` } | { ok: false; rea
  * then check recipient, amount, and expiry. BatchFacilitatorClient.verify from @circle-fin/x402-batching/server
  * makes a remote HTTP call to Circle's Gateway API (requires Circle API key + network), so the
  * structural self-verify is the correct local path.
+ *
+ * The four EIP-3009 checks and the recovery itself moved to
+ * `payments/transferAuthorization.ts` (design 2026-08-26 §6.3): formation payments need the same
+ * question answered against the USDC TOKEN's domain with an EXACT amount, and two copies of
+ * "did this person really authorize this transfer?" is two places for the recipient check to be
+ * forgotten. What stays here is what is genuinely this rail's: the x402 ENVELOPE, Circle's
+ * GATEWAY BATCHING domain (`verifyingContract` = the GatewayWallet, not USDC), and the amount
+ * FLOOR that lets a buyer over-pay a paywall.
  */
 export async function verifyPayment(header: string, cfg: SellerConfig): Promise<VerifyResult> {
   let env: ReturnType<typeof decodeX402Header>;
@@ -58,44 +68,20 @@ export async function verifyPayment(header: string, cfg: SellerConfig): Promise<
   } catch {
     return { ok: false, reason: "malformed X-PAYMENT" };
   }
-  const a = env.payload.authorization;
-  if (a.to.toLowerCase() !== cfg.payTo.toLowerCase()) {
-    return { ok: false, reason: "wrong recipient" };
-  }
-  if (BigInt(a.value) < cfg.price) {
-    return { ok: false, reason: "underpriced" };
-  }
-  if (BigInt(a.validBefore) <= BigInt(Math.floor(Date.now() / 1000))) {
-    return { ok: false, reason: "expired" };
-  }
   const chainId = Number(cfg.network.split(":")[1]); // "eip155:5042002" -> 5042002
-  let recovered: boolean;
-  try {
-    recovered = await verifyTypedData({
-      address: getAddress(a.from),
-      domain: {
-        name: CIRCLE_BATCHING_NAME,
-        version: CIRCLE_BATCHING_VERSION,
-        chainId,
-        verifyingContract: arcBatchingConfig.verifyingContract,
-      },
-      types: evm.authorizationTypes,
-      primaryType: "TransferWithAuthorization",
-      message: {
-        from: getAddress(a.from),
-        to: getAddress(a.to),
-        value: BigInt(a.value),
-        validAfter: BigInt(a.validAfter),
-        validBefore: BigInt(a.validBefore),
-        nonce: a.nonce,
-      },
-      signature: env.payload.signature,
-    });
-  } catch {
-    return { ok: false, reason: "bad-signature" };
-  }
-  if (!recovered) return { ok: false, reason: "bad-signature" };
-  return { ok: true, nonce: a.nonce as `0x${string}` };
+  return verifyTransferAuthorization({
+    authorization: env.payload.authorization,
+    signature: env.payload.signature,
+    domain: {
+      name: CIRCLE_BATCHING_NAME,
+      version: CIRCLE_BATCHING_VERSION,
+      chainId,
+      verifyingContract: arcBatchingConfig.verifyingContract,
+    },
+    payTo: cfg.payTo,
+    value: cfg.price,
+    mode: "floor",
+  });
 }
 
 export interface PaywallConfig extends SellerConfig {
