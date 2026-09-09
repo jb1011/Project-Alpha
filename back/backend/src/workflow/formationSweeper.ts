@@ -33,7 +33,7 @@ import {
 } from "../persistence/formationRepository";
 import { parseSqliteUtc } from "../util/sqliteTime";
 import { advanceAnchor, newAnchorReadCache } from "./anchorLoop";
-import { advancePaymentOnChain } from "./formationPayment";
+import { advancePaymentOnChain, checkForDoublePayment } from "./formationPayment";
 import {
   type FormationAdvanceDeps,
   advanceFormation,
@@ -244,6 +244,7 @@ export class FormationSweeper {
         this.warnStale();
         this.sweepEvents();
         this.pruneWarned();
+        this.detectDoublePayments();
       }
     } finally {
       this.ticks++;
@@ -432,7 +433,12 @@ export class FormationSweeper {
       try {
         await withKeyedLock(`payment:${row.companyId}`, () =>
           advancePaymentOnChain(
-            { ...payment, companies: this.d.companies, now: this.now.bind(this) },
+            {
+              ...payment,
+              companies: this.d.companies,
+              entities: this.d.repo,
+              now: this.now.bind(this),
+            },
             company,
             row,
           ),
@@ -460,7 +466,12 @@ export class FormationSweeper {
       try {
         await withKeyedLock(`payment:${row.companyId}`, () =>
           advancePaymentOnChain(
-            { ...payment, companies: this.d.companies, now: this.now.bind(this) },
+            {
+              ...payment,
+              companies: this.d.companies,
+              entities: this.d.repo,
+              now: this.now.bind(this),
+            },
             company,
             row,
           ),
@@ -474,6 +485,26 @@ export class FormationSweeper {
         });
       }
     }
+  }
+
+  /**
+   * ⚠ THE DOUBLE-CHARGE BACKSTOP (B1 gate A5), amortised.
+   *
+   * Every rule in this feature exists to make this list empty: one live row per company, a
+   * `quoted`-only CAS on the settle, a resume that never re-quotes, an expiry that needs the
+   * chain's own evidence. This is the measurement rather than the argument, and it belongs on
+   * the slow path because it is a GROUP BY over a small table and it is answering a question
+   * whose expected answer is "none".
+   *
+   * The terminal transitions check the same thing per-company as they happen; this catches a
+   * duplicate that arrived some other way (an operator's SQL, a restore, a bug we have not
+   * thought of), on a company nobody is looking at.
+   */
+  private detectDoublePayments(): void {
+    const payment = this.d.payment;
+    if (!payment) return;
+    for (const companyId of payment.payment.payments.listDoublePaidCompanies())
+      checkForDoublePayment({ ...payment, entities: this.d.repo }, companyId);
   }
 
   // ── (c) retry, then give up ───────────────────────────────────────────────────────────────

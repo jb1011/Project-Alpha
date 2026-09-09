@@ -19,8 +19,10 @@ import {
 } from "../payments/formationSettle";
 import { verifyTransferAuthorization } from "../payments/transferAuthorization";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
+import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationPaymentRecord } from "../persistence/formationPaymentRepository";
 import type { Address, Hex } from "../types";
+import { recordCompanyEvent } from "./formationStep";
 
 /**
  * SETTLING a formation payment (design 2026-08-26 §6.3/§6.4).
@@ -40,6 +42,10 @@ import type { Address, Hex } from "../types";
 
 export interface FormationPaymentDeps {
   companies: CompanyRepository;
+  /** The entity store, for the AUDIT TRAIL of a company-level event (§3's fan-out rule). Optional
+   *  only so fixtures that never reach a terminal transition can omit it; every composition root
+   *  wires it, because a duplicate charge has to be visible where an owner looks. */
+  entities?: EntityRepository;
   payment: FormationPaymentConfig;
   executor: FormationExecutorDeps;
   /** The company status move and the payment status move commit together. */
@@ -230,6 +236,8 @@ function finishSettle(
       txHash: outcome.txHash,
       gasUsed: outcome.gasUsed.toString(),
     });
+    // …and immediately: is this the SECOND time this company has paid? (gate A5)
+    checkForDoublePayment(deps, company.companyId);
     return { ok: true, status: "settled", txHash: outcome.txHash };
   }
   if (outcome.kind === "reverted") {
@@ -392,6 +400,45 @@ export async function advancePaymentOnChain(
   if (result.ok && result.status === "settled") return "settled";
   if (!result.ok) return "failed";
   return "pending";
+}
+
+/**
+ * ⚠ THE DETECTOR (B1 gate A5): has this company paid MORE THAN ONCE?
+ *
+ * Everything in this feature is built so that it cannot happen — one live row per company by a
+ * unique index, a `quoted`-only CAS on the settle, a resume that never re-quotes, an expiry that
+ * needs the chain's own evidence. All of which is an argument, and an argument is not a
+ * measurement. This counts.
+ *
+ * It is deliberately loud: CRITICAL in the ops trail AND an entity event on every agent attached
+ * to the company, because the person who needs to know is the one who was charged twice, and the
+ * only acceptable way to find out is from us rather than from them. It changes nothing on its
+ * own — a refund is a human decision made at a Ledger — and reversing money automatically on the
+ * strength of a COUNT would be a worse bug than the one it is watching for.
+ *
+ * Called on every terminal transition (cheap: one indexed COUNT) and by an amortised sweep.
+ */
+export function checkForDoublePayment(
+  deps: Pick<FormationPaymentDeps, "payment" | "entities">,
+  companyId: string,
+): boolean {
+  const paid = deps.payment.payments.countPaid(companyId);
+  if (paid <= 1) return false;
+  opsLog("formation_payment_duplicate", {
+    severity: "CRITICAL",
+    level: "error",
+    companyId,
+    paidRows: paid,
+    detail: "this company has more than one settled/refunded formation payment",
+  });
+  if (deps.entities)
+    recordCompanyEvent(
+      deps.entities,
+      companyId,
+      "formation_payment_duplicate",
+      `${paid} paid formation payments exist for this company — a refund decision is needed`,
+    );
+  return true;
 }
 
 /** `quoted|settling → expired`, ops-logged. Returns whether THIS caller made the move. */

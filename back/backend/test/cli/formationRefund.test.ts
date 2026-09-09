@@ -1,13 +1,18 @@
 /**
- * `formation:refund` — the command that RECORDS a refund and moves nothing (design §6.6).
+ * `formation:refund` — the command that RECORDS a refund and moves nothing (design §6.6, B1 gate
+ * A5).
  *
- * Two properties, and both of them are about what the command does NOT do:
+ * Three properties, and the first two are about what the command does NOT do:
  *
  *  1. it moves no money. `FORMATION_REVENUE_ADDRESS` is a Ledger account with no key on the box,
  *     so a human signs the transfer at the device and this command tells the system it happened;
  *  2. it never enters `platform_outflows`. A 399 USDC row in the S5 meter would exceed the 200
  *     USDC rolling ceiling on its own and block every agent's treasury funding, gas seeds and job
- *     funding for 24 hours — a refund taking the fleet down with it.
+ *     funding for 24 hours — a refund taking the fleet down with it;
+ *  3. it NAMES THE PAYMENT and asks for confirmation. "The most recent settled row for this
+ *     company" is exactly the wrong default for the case this command is for — a company with two
+ *     settled rows IS the double charge, and picking one by date is a guess made silently at a
+ *     Ledger about somebody's 399 USDC.
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -86,9 +91,9 @@ function reopen() {
   return { db, payments: new SqliteFormationPaymentRepository(db) };
 }
 
-test("it records the refund on the settled row, with the Ledger hash", async () => {
-  const { companyId, paymentId } = seed("settled");
-  await run(["formation:refund", companyId, LEDGER_TX]);
+test("it records the refund on the NAMED payment, with the Ledger hash", async () => {
+  const { paymentId } = seed("settled");
+  await run(["formation:refund", "--payment-id", paymentId, "--tx", LEDGER_TX, "--yes"]);
   const { db, payments } = reopen();
   expect(payments.find(paymentId)).toMatchObject({
     status: "refunded",
@@ -101,35 +106,58 @@ test("it records the refund on the settled row, with the Ledger hash", async () 
 });
 
 test("THE S5 METER IS UNTOUCHED — a refund is not a platform outflow (§6.6)", async () => {
-  const { companyId } = seed("settled");
-  await run(["formation:refund", companyId, LEDGER_TX]);
+  const { paymentId } = seed("settled");
+  await run(["formation:refund", "--payment-id", paymentId, "--tx", LEDGER_TX, "--yes"]);
   const { db } = reopen();
   const outflows = db.prepare("SELECT COUNT(*) AS n FROM platform_outflows").get() as { n: number };
   expect(outflows.n).toBe(0);
   db.close();
 });
 
-test("it refuses a company with nothing settled — a refund records money actually taken", async () => {
-  const { companyId } = seed("quoted");
-  await expect(run(["formation:refund", companyId, LEDGER_TX])).rejects.toThrow(/no SETTLED/);
+test("it refuses a payment that is not settled, and points at reconcile", async () => {
+  const { paymentId } = seed("quoted");
+  await expect(
+    run(["formation:refund", "--payment-id", paymentId, "--tx", LEDGER_TX, "--yes"]),
+  ).rejects.toThrow(/not settled.*formation:reconcile/s);
+});
+
+test("⚠ WITHOUT --yes it prints the row and records NOTHING", async () => {
+  // The confirmation is not ceremony. The operator has just signed a transfer at a hardware
+  // wallet and is about to write the only pointer we will ever hold to it; seeing which payment,
+  // whose wallet and how much BEFORE the write is the point of the command.
+  const { paymentId } = seed("settled");
+  await run(["formation:refund", "--payment-id", paymentId, "--tx", LEDGER_TX]);
+  const { db, payments } = reopen();
+  expect(payments.find(paymentId)?.status).toBe("settled");
+  db.close();
+});
+
+test("⚠ a MALFORMED hash is refused — it is the only record of the transfer", async () => {
+  // A truncated paste reads perfectly plausibly and is unrecoverable: the money has moved and the
+  // pointer to it is wrong, once and forever.
+  const { paymentId } = seed("settled");
+  for (const bad of ["0xdeadbeef", `0x${"fe".repeat(31)}`, "not-a-hash"])
+    await expect(
+      run(["formation:refund", "--payment-id", paymentId, "--tx", bad, "--yes"]),
+    ).rejects.toThrow(/not a 32-byte transaction hash/);
 });
 
 test("it refuses a SECOND recording — the first hash is the only pointer we hold", async () => {
-  const { companyId } = seed("settled");
-  await run(["formation:refund", companyId, LEDGER_TX]);
+  const { companyId, paymentId } = seed("settled");
+  await run(["formation:refund", "--payment-id", paymentId, "--tx", LEDGER_TX, "--yes"]);
   // …and the refusal NAMES the hash already on the row. "no settled payment" would read as "your
   // refund was never registered", and an operator would go and make a second one.
-  await expect(run(["formation:refund", companyId, `0x${"11".repeat(32)}`])).rejects.toThrow(
-    new RegExp(`ALREADY recorded as refunded \\(tx ${LEDGER_TX}\\)`),
-  );
+  await expect(
+    run(["formation:refund", "--payment-id", paymentId, "--tx", `0x${"11".repeat(32)}`, "--yes"]),
+  ).rejects.toThrow(new RegExp(`ALREADY recorded as refunded \\(tx ${LEDGER_TX}\\)`));
   const { db, payments } = reopen();
   expect(payments.listByCompany(companyId)[0]?.refundTxHash).toBe(LEDGER_TX);
   db.close();
 });
 
-test("an unknown company is refused rather than silently doing nothing", async () => {
+test("an unknown payment is refused rather than silently doing nothing", async () => {
   seed("settled");
-  await expect(run(["formation:refund", "does-not-exist", LEDGER_TX])).rejects.toThrow(
-    /no SETTLED/,
-  );
+  await expect(
+    run(["formation:refund", "--payment-id", "does-not-exist", "--tx", LEDGER_TX, "--yes"]),
+  ).rejects.toThrow(/no payment does-not-exist/);
 });

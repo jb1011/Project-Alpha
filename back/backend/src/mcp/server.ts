@@ -941,6 +941,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     if (!payment?.required || !executor || !deps.companies) return undefined;
     return {
       companies: deps.companies,
+      entities: deps.repo,
       payment,
       executor,
       transaction: <T>(fn: () => T) => deps.repo.transaction(fn),

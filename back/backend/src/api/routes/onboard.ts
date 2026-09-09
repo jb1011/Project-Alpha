@@ -210,6 +210,9 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     if (!payment?.required || !executor) throw new ApiError("not_found", 404, "payment not found");
     return {
       companies: deps.companies!,
+      // The entity store, so a duplicate charge reaches the AUDIT TRAIL of every agent attached
+      // to the company and not only the ops log (gate A5).
+      entities: deps.repo,
       payment,
       executor,
       transaction: <T>(fn: () => T) => deps.repo.transaction(fn),

@@ -480,11 +480,19 @@ There is **no fund-moving refund path in the software, by design.** To refund a 
    destination on the DEVICE SCREEN, not in the wallet UI.
 4. **Record it**, so the system stops believing the fee was kept:
    ```
-   npm run cli -- formation:refund <companyId> <ledgerTxHash>
+   npm run cli -- formation:refund --payment-id <paymentId> --tx <ledgerTxHash>        # prints, records nothing
+   npm run cli -- formation:refund --payment-id <paymentId> --tx <ledgerTxHash> --yes  # records it
    ```
-   It moves nothing. It flips the newest `settled` row to `refunded`, stores the hash beside the
-   settlement hash, and writes a CRITICAL `formation_payment_refunded` ops line. It refuses a
-   second recording and names the hash already on the row — an operator who re-runs it must not
+   It moves nothing. Without `--yes` it PRINTS the payment, the payer, the amount and the two
+   hashes and writes nothing — read that before confirming. With `--yes` it flips that `settled`
+   row to `refunded`, stores the hash beside the settlement hash, and writes a CRITICAL
+   `formation_payment_refunded` ops line.
+
+   It **names the PAYMENT, never the company**: a company with two settled rows is the double
+   charge, and "the most recent settled row" would be a guess made silently about somebody's $399.
+   It refuses a malformed hash (that hash is the only record of the transfer you just signed), a
+   row that is not `settled` (run `formation:reconcile` first and let the chain say so), and a
+   second recording — naming the hash already on the row, so an operator who re-runs it does not
    read "no settled payment" and go and make a second transfer.
 5. ⚠ **The refund is NOT a platform outflow and never enters `platform_outflows`.** A 399 USDC row
    in the S5 meter would exceed the 200 USDC rolling ceiling on its own and block every agent's
@@ -493,6 +501,35 @@ There is **no fund-moving refund path in the software, by design.** To refund a 
    env invariant that `PLATFORM_OUTFLOW_CEILING_USDC >= FORMATION_FEE_USDC`.
 6. The company stays `ready` and its filing is untouched. Refunding does not un-file a Wyoming
    LLC, and pretending otherwise in the data would be the dishonest part.
+
+### Reconciling ONE payment against the chain
+
+```
+npm run cli -- formation:reconcile <paymentId>
+```
+
+It runs the same log-based resolver the sweeper does — `AuthorizationUsed` + a matching `Transfer`
+to the payee, or `AuthorizationCanceled`, filtered on both indexed topics over a bounded window —
+PRINTS what the chain said, and only then writes:
+
+- **settled** → the row goes `settled` with the OBSERVED transaction hash (which may not be ours:
+  a signed authorization is public, and anyone holding it can mine it) and the company moves
+  `draft → ready`. If the company then has more than one paid row it says so, CRITICAL;
+- **cancelled** → the row goes `expired`, and the guardian can re-quote;
+- **unknown** → **nothing is written**. A payment whose outcome nobody can see is exactly the one
+  that must not be written off.
+
+### ⚠ If `formation_payment_duplicate` appears
+
+A CRITICAL ops line (and an event on every agent attached to the company) saying one company has
+more than one `settled`/`refunded` payment. It is written on every terminal transition and by an
+amortised sweep, and it is the measurement behind everything else here — the invariants are an
+argument that this cannot happen, and an argument is not a measurement.
+
+It changes nothing on its own, deliberately: reversing money automatically on the strength of a
+COUNT would be a worse bug than the one it watches for. Read both rows
+(`formation:reconcile <paymentId>` on each if their state is unclear), decide, refund the
+duplicate from the Ledger by the procedure above, and record it against **that payment id**.
 
 ### When a payment is stuck
 

@@ -219,6 +219,20 @@ export interface FormationPaymentRepository {
   /** Burn an attempt on a stalled settle and return the new count (the bridge-legs primitive).
    *  The STATUS is untouched: the row stays `settling`, because the broadcast still is. */
   bumpAttempt(paymentId: string): number;
+
+  /**
+   * How many times this company has actually PAID (`settled` or `refunded` — a refunded row was
+   * paid first, and the refund is a separate movement).
+   *
+   * More than one is the failure this whole feature is built to prevent, and the only honest way
+   * to know it happened is to count. Read on every terminal transition and by an amortised sweep
+   * (B1 gate A5): the invariants make a double charge very unlikely, and "very unlikely" is not
+   * a thing to find out about from a guardian's email.
+   */
+  countPaid(companyId: string): number;
+  /** Companies with MORE THAN ONE paid row. The sweep's reader — a list that must always be
+   *  empty, which is why it is worth looking at. */
+  listDoublePaidCompanies(limit?: number): string[];
 }
 
 export class SqliteFormationPaymentRepository implements FormationPaymentRepository {
@@ -288,6 +302,16 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
         `UPDATE formation_payments
             SET status = 'refunded', refund_tx_hash = ?, updated_at = CURRENT_TIMESTAMP
           WHERE payment_id = ? AND status = 'settled' AND refund_tx_hash IS NULL`,
+      ),
+      countPaid: db.prepare(
+        `SELECT COUNT(*) AS n FROM formation_payments
+          WHERE company_id = ? AND status IN ('settled','refunded')`,
+      ),
+      doublePaid: db.prepare(
+        `SELECT company_id FROM formation_payments
+          WHERE status IN ('settled','refunded')
+          GROUP BY company_id HAVING COUNT(*) > 1
+          ORDER BY company_id LIMIT ?`,
       ),
       bump: db.prepare(
         `UPDATE formation_payments SET attempt = attempt + 1, updated_at = CURRENT_TIMESTAMP
@@ -376,6 +400,14 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
 
   markRefunded(paymentId: string, ledgerTxHash: string): boolean {
     return this.stmts.markRefunded.run(ledgerTxHash, paymentId).changes === 1;
+  }
+
+  countPaid(companyId: string): number {
+    return (this.stmts.countPaid.get(companyId) as { n: number }).n;
+  }
+
+  listDoublePaidCompanies(limit = 50): string[] {
+    return (this.stmts.doublePaid.all(limit) as { company_id: string }[]).map((r) => r.company_id);
   }
 
   bumpAttempt(paymentId: string): number {

@@ -19,12 +19,14 @@ import {
   SqliteCompanyRepository,
 } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
+import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
 import type { Address, Hex } from "../../src/types";
 import {
   type FormationPaymentDeps,
   advancePaymentOnChain,
   cancelFormationPayment,
+  checkForDoublePayment,
   requoteFormationPayment,
   settleFormationPayment,
 } from "../../src/workflow/formationPayment";
@@ -44,12 +46,14 @@ const domain = { name: "USD Coin", version: "2", chainId: CHAIN, verifyingContra
 let db: DatabaseType.Database;
 let companies: SqliteCompanyRepository;
 let payments: SqliteFormationPaymentRepository;
+let repo: SqliteEntityRepository;
 
 beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   companies = new SqliteCompanyRepository(db);
   payments = new SqliteFormationPaymentRepository(db);
+  repo = new SqliteEntityRepository(db);
 });
 afterEach(() => db.close());
 
@@ -218,6 +222,7 @@ function quoteFor(c: CompanyRecord, validBefore = nowSec + 1800, ttlAt = validBe
 function deps(executor: FormationExecutorDeps): FormationPaymentDeps {
   return {
     companies,
+    entities: repo,
     payment: paymentCfg(),
     executor,
     transaction: <T>(fn: () => T) => db.transaction(fn)(),
@@ -709,4 +714,126 @@ test("a `pending` settle answers with the hash of the bytes we actually broadcas
   expect((result as { txHash: string }).txHash).toBe(
     payments.findLive(c.companyId, "formation")!.txHash,
   );
+});
+
+// ── THE DETECTOR (B1 gate A5) ───────────────────────────────────────────────────────────────
+//
+// Every rule in this file exists so a company cannot pay twice. That is an argument, and an
+// argument is not a measurement — so we count, and say so loudly when the count is wrong.
+
+/** An agent filed under this company — the audience for the company-level event. */
+function attachAgent(c: CompanyRecord): void {
+  repo.upsert({
+    idempotencyKey: "t:dup",
+    name: "dup",
+    status: "bound",
+    manager: "0x000000000000000000000000000000000000000A",
+    guardian: TENANT,
+    operator: "0x000000000000000000000000000000000000000C",
+    amendmentDelay: "0",
+    ein: "",
+    formationDate: 0,
+    oaHash: null,
+    metadataURI: null,
+    docPath: null,
+    treasuryConfig: null,
+    agentId: null,
+    proxy: null,
+    treasury: null,
+    createTxHash: null,
+    bindTxHash: null,
+    fundTxHash: null,
+    ownerTenantId: TENANT,
+    // biome-ignore lint/suspicious/noExplicitAny: the record type is wider than this fixture
+  } as any);
+  repo.attachCompany("t:dup", c.companyId);
+}
+
+/** Run something with `console.log` captured, and hand back the ops lines it wrote. */
+function opsLines(fn: () => void): Record<string, unknown>[] {
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (l: string) => lines.push(l);
+  try {
+    fn();
+  } finally {
+    console.log = orig;
+  }
+  return lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+function settledRow(c: CompanyRecord, nonce: string): string {
+  const id = payments.create({
+    companyId: c.companyId,
+    product: "formation",
+    amountUsdc: 399_000_000n,
+    nonce: nonce as Hex,
+    validBefore: nowSec + 1800,
+    payTo: REVENUE,
+  });
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  payments.markSettled(id, `0x${"cc".repeat(32)}`);
+  return id;
+}
+
+test("one paid row is silent — the detector says nothing about the ordinary case", () => {
+  const c = company();
+  settledRow(c, `0x${"a1".repeat(32)}`);
+  const lines = opsLines(() => {
+    expect(checkForDoublePayment({ payment: paymentCfg() }, c.companyId)).toBe(false);
+  });
+  expect(lines.find((l) => l.opslog === "formation_payment_duplicate")).toBeUndefined();
+});
+
+test("⚠ TWO paid rows are CRITICAL, in the ops trail and in the company's own history", () => {
+  const c = company();
+  attachAgent(c);
+  settledRow(c, `0x${"a1".repeat(32)}`);
+  settledRow(c, `0x${"b2".repeat(32)}`);
+  const lines = opsLines(() => {
+    expect(checkForDoublePayment({ payment: paymentCfg(), entities: repo }, c.companyId)).toBe(
+      true,
+    );
+  });
+  expect(lines.find((l) => l.opslog === "formation_payment_duplicate")).toMatchObject({
+    severity: "CRITICAL",
+    companyId: c.companyId,
+    paidRows: 2,
+  });
+  // …and on the AGENT attached to the company, because the person who needs to know is the one
+  // who was charged twice.
+  const events = repo.listEvents("t:dup");
+  expect(events.some((e) => e.step === "formation_payment_duplicate")).toBe(true);
+});
+
+test("a REFUNDED row still counts as paid — the money was taken before it was given back", () => {
+  const c = company();
+  const first = settledRow(c, `0x${"a1".repeat(32)}`);
+  settledRow(c, `0x${"b2".repeat(32)}`);
+  payments.markRefunded(first, `0x${"fe".repeat(32)}`);
+  const lines = opsLines(() => {
+    expect(checkForDoublePayment({ payment: paymentCfg() }, c.companyId)).toBe(true);
+  });
+  expect(lines.find((l) => l.opslog === "formation_payment_duplicate")).toBeTruthy();
+});
+
+test("a settle that lands on an ALREADY-PAID company trips the detector on the spot", async () => {
+  const c = company();
+  settledRow(c, `0x${"b2".repeat(32)}`);
+  quoteFor(c);
+  const chain = fakeChain();
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (l: string) => lines.push(l);
+  try {
+    await settleFormationPayment(deps(chain.executor), c, {
+      signature: await sign(c),
+      from: TENANT,
+    });
+  } finally {
+    console.log = orig;
+  }
+  expect(
+    lines.map((l) => JSON.parse(l)).find((l) => l.opslog === "formation_payment_duplicate"),
+  ).toMatchObject({ severity: "CRITICAL", paidRows: 2 });
 });
