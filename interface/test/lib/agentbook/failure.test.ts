@@ -19,6 +19,8 @@ import {
   LIMIT_COPY,
   NOT_ELIGIBLE_COPY,
   NO_POCKET_COPY,
+  TOO_LARGE_COPY,
+  UNAUTHORIZED_COPY,
 } from "@/lib/agentbook/failure";
 
 const SECRET = "0xdeadbeefnullifier-and-call-arguments";
@@ -73,12 +75,54 @@ describe("failureFor — route-classified codes say what did not happen", () => 
     );
   });
 
-  test("only `unavailable` and `conflict` offer a retry; nothing that ended the attempt for good", () => {
+  test("only the codes a second attempt could get past offer a retry", () => {
     expect(failureFor(apiError("unavailable", 503), "register").retryable).toBe(true);
     expect(failureFor(apiError("conflict", 409), "register").retryable).toBe(true);
+    // Signing in again is exactly what a retry would do first.
+    expect(failureFor(apiError("unauthorized", 401), "register").retryable).toBe(true);
     expect(failureFor(apiError("proof_rejected", 400), "register").retryable).toBe(false);
     expect(failureFor(apiError("limit_exceeded", 429), "register").retryable).toBe(false);
     expect(failureFor(apiError("not_eligible", 403), "register").retryable).toBe(false);
+  });
+});
+
+describe("the two codes the route never authors, which still mean nothing was sent (FR-H)", () => {
+  // Both are raised by MIDDLEWARE, above every handler: the 401 by the auth middleware both write
+  // routes mount, the 413 by hono's body-limit. Neither reaches the session row, so "it may still
+  // have gone through" is false in the one direction that matters — and `retryable: false` on it
+  // leaves the guardian without even a Try again.
+
+  test("a 401 says the sign-in lapsed and nothing was sent", () => {
+    const out = failureFor(apiError("unauthorized", 401), "register");
+    expect(out.message).toBe(UNAUTHORIZED_COPY);
+    expect(out.message).toMatch(/Nothing was sent/);
+    expect(out.unresolved).toBe(false);
+    expect(out.message).not.toContain(SECRET);
+  });
+
+  test("the 5-minute World App round trip is what makes the 401 reachable", () => {
+    // The token is taken before the QR is shown and used again minutes later; the register
+    // mutation raises this shape when the refresh does not complete.
+    expect(failureFor(apiError("unauthorized", 401), "session").message).toBe(UNAUTHORIZED_COPY);
+  });
+
+  test("hono's body-limit 413 arrives with no code of its own and still gets a definite answer", () => {
+    // `api/errors.ts` falls back to `code: "error"` for any thrown error carrying a status.
+    for (const code of ["error", "http_error"]) {
+      const out = failureFor(apiError(code, 413, "Payload Too Large"), "register");
+      expect(out.message).toBe(TOO_LARGE_COPY);
+      expect(out.unresolved).toBe(false);
+      expect(out.retryable).toBe(false);
+      expect(out.message).not.toContain(SECRET);
+    }
+  });
+
+  test("a generic `error` that is NOT the body limit is still unclassified", () => {
+    // "error" is `api/errors.ts`'s fallback for anything with a status, so only the 413 pairing is
+    // the route speaking. A 500 wearing the same code must keep §5.2's sentence.
+    const out = failureFor(apiError("error", 500), "register");
+    expect(out.message).toBe(FAILURE_COPY);
+    expect(out.unresolved).toBe(true);
   });
 });
 

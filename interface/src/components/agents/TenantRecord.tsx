@@ -59,8 +59,13 @@ export function TenantRecord({
                       : "border-line-strong bg-paper-3/70 text-muted-2",
                 )}
               >
+                {/* Not "Human-backed" (design §5.4 bans the phrase) and not "Orb-verified"
+                    either: the guardian gate accepts passport, MNC and secure-document
+                    credentials as well as an Orb (`guardianGate.ts` ACCEPTED_CREDENTIALS), so
+                    naming the Orb here would be false for a guardian who used a passport. The
+                    ledger strip below names the actual credential. */}
                 {verified && !waived
-                  ? "Human-backed"
+                  ? "World ID verified"
                   : waived
                     ? "Admin waiver"
                     : "No human on record"}

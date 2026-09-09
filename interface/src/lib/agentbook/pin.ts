@@ -23,15 +23,6 @@ function store(): Storage | null {
   }
 }
 
-/** The address this browser first saw for `entityId`, lowercased; null when there is none. */
-export function readPin(entityId: string): string | null {
-  try {
-    return store()?.getItem(key(entityId)) ?? null;
-  } catch {
-    return null;
-  }
-}
-
 /** Pin `address` for `entityId`. Returns false when the store refused it. */
 export function writePin(entityId: string, address: string): boolean {
   try {

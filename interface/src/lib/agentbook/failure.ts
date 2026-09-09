@@ -43,8 +43,13 @@ export const NOT_FOUND_COPY = "This agent could not be found. Nothing was writte
 
 export const GENERIC_COPY = "Something went wrong before anything was written. Try again.";
 
-/** §5.2, verbatim, via the chip helper so the dialog and the chip cannot drift. */
-export { FAILURE_COPY };
+/** The 401 from the `auth` middleware. Reachable because the World App round trip is minutes long:
+ *  the token taken before the QR can lapse before the proof comes back. */
+export const UNAUTHORIZED_COPY =
+  "Your sign-in expired. Nothing was sent. Sign in again and retry.";
+
+/** hono's `bodyLimit` refusing an oversized request, above every handler. */
+export const TOO_LARGE_COPY = "That request was too large to send. Nothing was sent.";
 
 /* ── Classification ─────────────────────────────────────────────────────────── */
 
@@ -68,6 +73,8 @@ export type VouchFailure = {
  * `validation_error` precede the session lookup; `unavailable` and `proof_rejected` come from
  * simulate/balance/sign, all above the claim; and the only two conflicts raised after the claim
  * (`inflight`, `lost`) mean ANOTHER submission owns the row, so this request still wrote nothing.
+ * `unauthorized` is the auth middleware refusing above every handler (`auth/siwe.ts`), which is
+ * further above the claim than any of them.
  * A code that is not on this list is not the route speaking, and we must not speak for it.
  */
 export const CLASSIFIED_CODES = [
@@ -79,9 +86,23 @@ export const CLASSIFIED_CODES = [
   "not_ready",
   "not_eligible",
   "not_found",
+  "unauthorized",
 ] as const;
 
 const CLASSIFIED = new Set<string>(CLASSIFIED_CODES);
+
+/**
+ * hono's `bodyLimit` refusing the request before the handler runs.
+ *
+ * It throws an `HTTPException`, which `api/errors.ts` turns into `{ code: "error" }` (its fallback
+ * for anything carrying a status) with a 413 — so unlike every code above, this one is matched on
+ * the status as well. "error" alone is not the route speaking: a 500 wearing it must keep §5.2's
+ * sentence. `http_error` is the same status seen through the client's own synthesised envelope
+ * (`client.ts`) when the body could not be read back.
+ */
+function isBodyLimit(e: ApiError): boolean {
+  return e.status === 413 && (e.code === "error" || e.code === "http_error");
+}
 
 /** A conflict whose cause is the on-chain nonce having moved: someone else's vouch may have landed
  *  while the guardian was approving. Matched on the route's message, never shown. */
@@ -102,6 +123,7 @@ export function failureFor(e: unknown, stage: VouchStage): VouchFailure {
     stage === "register" ? fail(FAILURE_COPY, false, true) : fail(GENERIC_COPY, true);
 
   if (!(e instanceof ApiError)) return unclassified();
+  if (isBodyLimit(e)) return fail(TOO_LARGE_COPY, false);
   if (!CLASSIFIED.has(e.code)) return unclassified();
 
   const detail = apiErrorDetail(e.details);
@@ -120,6 +142,10 @@ export function failureFor(e: unknown, stage: VouchStage): VouchFailure {
       return fail(VALIDATION_COPY, false);
     case "not_found":
       return fail(NOT_FOUND_COPY, false);
+    case "unauthorized":
+      // Retryable: signing in again is the first thing a retry does, and a fresh session means a
+      // fresh World App request rather than a resubmitted proof.
+      return fail(UNAUTHORIZED_COPY, true);
     case "proof_rejected":
       return fail(
         detail?.errorName

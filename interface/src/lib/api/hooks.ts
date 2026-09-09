@@ -57,6 +57,7 @@ import {
 } from "./formationEnvironment";
 import { apiKeys } from "./keys";
 import { TERMINAL } from "./poll";
+import { ApiError } from "./types";
 import type {
   AgentBookRegisterBody,
   AgentSpec,
@@ -829,9 +830,10 @@ export function useAgentBookSessionMutation(entityId: string) {
  * Submit the World ID proof.
  *
  * `onSettled`, not `onSuccess`: the failures here move the stored row too — a 409 means a
- * registration is already in flight, and a 400 `proof_rejected` records an `errorCode` the status
- * chip shows. Refetching only on success would leave the chip stale in exactly the cases the
- * guardian most needs to see.
+ * registration is already in flight, and a 400 `proof_rejected` fails the row with an `errorCode`
+ * (the chip does not render the code; it falls through to the chain's answer, which for a row that
+ * never broadcast is the whole truth). Refetching only on success would leave the chip stale in
+ * exactly the cases the guardian most needs to see.
  *
  * Two different tokens on purpose. The REQUEST takes the ensured one, because the World App round
  * trip between session and register is minutes long and the session may have been refreshed in
@@ -846,7 +848,16 @@ export function useAgentBookRegisterMutation(entityId: string) {
 
   return useMutation({
     mutationFn: async (body: AgentBookRegisterBody) => {
-      const fresh = await ensureToken();
+      // Ensuring the token can prompt a SIWE signature, and the guardian may dismiss it. That
+      // failure is PRE-FLIGHT: no request left the browser. Left as a bare `Error` the classifier
+      // would read it as "we do not know" and tell them the registration may still have gone
+      // through — a false statement in one of the few cases we positively know nothing was sent.
+      let fresh: string;
+      try {
+        fresh = await ensureToken();
+      } catch {
+        throw new ApiError(401, { code: "unauthorized", message: "sign-in required" });
+      }
       return agentBookRegister(fresh, entityId, body);
     },
     onSettled: async () => {

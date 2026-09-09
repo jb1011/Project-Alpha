@@ -73,17 +73,24 @@ export function AgentDashboard({
   const publicConfig = usePublicConfigQuery();
   const [vouchOpen, setVouchOpen] = useState(false);
   const canVouch = publicConfig.data?.agentBookRegistrationAvailable === true;
-  const vouchDisabledReason = !canVouch
-    ? "Vouching is not enabled on this deployment"
-    : !agentBookView
-      ? "Checking this agent's AgentBook standing"
-      : agentBookView.reason === "no-pocket-yet"
-        ? NO_POCKET_COPY
-        : agentBookChip?.kind === "submitting"
-          ? "A vouch for this address is already in flight"
-          : agentBookChip?.kind === "vouched"
-            ? "Already vouched"
-            : null;
+  // A `pending` row does NOT disable this. It is a session waiting for World App, and
+  // `POST /entities/:id/agentbook/session` (back/backend/src/api/routes/agentBook.ts) does not
+  // refuse while one exists — it opens another, bounded by the lifetime and per-hour caps. So the
+  // only honest states here are the ones the chip already distinguishes: `submitting` is a
+  // broadcast transaction, `vouched` an entry in the registry (final review FR-B).
+  const vouchDisabledReason = publicConfig.isPending
+    ? "Checking whether vouching is enabled here"
+    : !canVouch
+      ? "Vouching is not enabled on this deployment"
+      : !agentBookView
+        ? "Checking this agent's AgentBook standing"
+        : agentBookView.reason === "no-pocket-yet"
+          ? NO_POCKET_COPY
+          : agentBookChip?.kind === "submitting"
+            ? "A vouch for this address is already in flight"
+            : agentBookChip?.kind === "vouched"
+              ? "Already vouched"
+              : null;
 
   const treasuryAddr = entity?.treasury ?? null;
 
@@ -94,6 +101,9 @@ export function AgentDashboard({
       queryClient.invalidateQueries({ queryKey: apiKeys.entity(token, entityId) }),
       queryClient.invalidateQueries({ queryKey: apiKeys.entityTreasury(token, entityId) }),
       queryClient.invalidateQueries({ queryKey: apiKeys.entityRuns(token, entityId) }),
+      // The chip is on this card too, and the dialog's poll dies with the dialog: without this,
+      // Refresh is the one control that cannot refresh the one answer that changes on its own.
+      queryClient.invalidateQueries({ queryKey: apiKeys.entityAgentBook(token, entityId) }),
     ]);
   }
 

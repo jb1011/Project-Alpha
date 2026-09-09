@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import QRCode from "qrcode";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getAddress } from "viem";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   useAgentBookRegisterMutation,
@@ -17,6 +17,7 @@ import {
   isRegistryMoved,
   GENERIC_COPY,
   NOT_ELIGIBLE_COPY,
+  NOT_ON_CHAIN_COPY,
   NO_POCKET_COPY,
 } from "@/lib/agentbook/failure";
 import { checkPin } from "@/lib/agentbook/pin";
@@ -169,9 +170,22 @@ function VouchDialogBody({
 
   const credential = me.data?.credential ?? null;
   const eligible = credential !== null && ORB.has(credential);
-  const pocketAddress = status.data?.address ?? null;
+  // ONE casing on both steps. The guardian is asked (D8) to compare this against the address that
+  // pays on Arcscan, so a checksummed session address beside a stored-form status address would
+  // put a visible discrepancy in front of exactly that comparison. The GET checksums it too; this
+  // also covers the deploy window where a new interface meets the API that does not yet. Equality
+  // is never done on the rendered form: every comparison below lowercases first.
+  const rawAddress = status.data?.address ?? null;
+  const pocketAddress = useMemo(() => checksum(rawAddress), [rawAddress]);
   const disputed = status.data?.outcome === "disputed" || status.data?.disputed === true;
-  const linkage: Linkage = disputed ? "disputed" : registryMoved ? "maybe" : "none";
+  // "Someone else MAY have vouched" is retired only by a positive answer: the registry now holds
+  // an entry that is not foreign (a foreign one reads `disputed` and is handled above), so the
+  // address the nonce moved for is ours. An `unregistered` read does NOT retire it — registrations
+  // are never cleared, so a moved nonce with no entry behind it means our read lags, and dropping
+  // the warning on it would be the under-claiming direction.
+  const registryAnswered = status.data?.outcome === "registered";
+  const linkage: Linkage =
+    disputed ? "disputed" : registryMoved && !registryAnswered ? "maybe" : "none";
 
   /** Back to the decision, never around it: the box is unticked and a NEW session needs a click. */
   function returnToConfirm(text: string, movedOnChain: boolean) {
@@ -196,8 +210,12 @@ function VouchDialogBody({
       setPhase({ kind: "failed", message: f.message, retryable: f.retryable });
       return;
     }
-    // A pending row exists from here on: the chip must stop saying "not in AgentBook".
+    // A pending row exists from here on, and the chip re-reads it.
     refreshStatus();
+    // Closing DURING the session POST used to carry on into the bridge: a live request to
+    // World's bridge for a QR nobody will ever see. The mount-effect guard only covers the poll
+    // loop below, so the awaits above need their own check.
+    if (cancelled.current) return;
 
     // D8: rebuild the signal from the address and nonce, and refuse a session whose signal
     // disagrees. Never ask for a proof over bytes this client did not derive.
@@ -251,7 +269,12 @@ function VouchDialogBody({
       return;
     }
     const client = bridge;
+    if (cancelled.current) return;
 
+    // Loaded here, beside the bridge, for the same reason: this dialog is statically imported by
+    // the agent dashboard, and a QR encoder used on exactly one line must not sit in the first
+    // load of the page every agent owner opens (final review FR-G).
+    const QRCode = (await import("qrcode")).default;
     const qr = await QRCode.toDataURL(connectorURI, { margin: 1, width: 240 });
     const deadline = Date.now() + Math.min(TIMEOUT_MS, Math.max(0, s.expiresAt - Date.now()));
     setPhase({ kind: "awaiting", session: s, connectorURI, qr, deadline });
@@ -311,6 +334,7 @@ function VouchDialogBody({
     statusLoading: status.isPending,
     statusFailed: status.isError,
     pocketAddress,
+    agentId,
   });
 
   return (
@@ -342,6 +366,8 @@ function VouchDialogBody({
             <ConfirmBody
               agentId={agentId}
               pocketAddress={pocketAddress ?? ""}
+              network={status.data?.network}
+              priorVouches={status.data?.priorVouches}
               linkage={linkage}
               accepted={accepted}
               onAccepted={setAccepted}
@@ -453,6 +479,13 @@ function VouchDialogBody({
 function ConfirmBody(p: {
   agentId: string;
   pocketAddress: string;
+  /** The AGENT's network. Absent from a backend that predates the field — the line is then
+   *  omitted, never guessed: "mainnet" would suppress a true warning and "testnet" would print a
+   *  false one. */
+  network?: "testnet" | "mainnet";
+  /** Confirmed vouches from this account. Absent means "not told"; a rendered 0 would read as a
+   *  claim that this is their first. */
+  priorVouches?: number;
   linkage: Linkage;
   accepted: boolean;
   onAccepted: (v: boolean) => void;
@@ -524,6 +557,22 @@ function ConfirmBody(p: {
           </p>
         </div>
       )}
+      {/* §5.1's two conditional lines, "inserted before the checkbox" — the consent has to carry
+          them, not the screen after it (final review FR-F). They are repeated on the QR step,
+          where the guardian is looking at the request itself. */}
+      {p.network === "testnet" && (
+        <p className="text-[12.5px] leading-[1.6] text-muted-2">
+          This agent runs on Arc testnet. The vouch is on World Chain mainnet and is just as
+          permanent.
+        </p>
+      )}
+      {p.priorVouches !== undefined && p.priorVouches > 0 && (
+        <p className="text-[12.5px] leading-[1.6] text-muted-2">
+          You have already vouched for {p.priorVouches}{" "}
+          {p.priorVouches === 1 ? "agent" : "agents"} from this account. This vouch will be publicly
+          linkable to them.
+        </p>
+      )}
       {p.linkage !== "none" && (
         <p className="text-[12.5px] leading-[1.6] text-amber-300">
           {p.linkage === "disputed"
@@ -591,6 +640,7 @@ function confirmGate(input: {
   statusLoading: boolean;
   statusFailed: boolean;
   pocketAddress: string | null;
+  agentId: string;
 }): { loading: boolean; text: string } | null {
   if (input.meLoading) return { loading: true, text: "Checking your World ID…" };
   if (input.meFailed)
@@ -604,5 +654,20 @@ function confirmGate(input: {
       text: "We could not read this agent's AgentBook standing. Nothing was sent.",
     };
   if (!input.pocketAddress) return { loading: false, text: NO_POCKET_COPY };
+  // An entity can have a pocket and no on-chain id yet — the state the session route refuses with
+  // `no-agent-id-yet`. Without this the guardian reads a consent paragraph naming "agent #" with
+  // nothing after it, and only learns the agent is not ready after clicking.
+  if (!input.agentId) return { loading: false, text: NOT_ON_CHAIN_COPY };
   return null;
+}
+
+/** EIP-55, or the value unchanged when it is not an address we can checksum (an older backend's
+ *  stored form still renders; an absent one stays absent). Never used for comparison. */
+function checksum(address: string | null | undefined): string | null {
+  if (!address) return null;
+  try {
+    return getAddress(address);
+  } catch {
+    return address;
+  }
 }

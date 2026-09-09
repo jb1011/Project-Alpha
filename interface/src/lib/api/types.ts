@@ -542,7 +542,10 @@ export type AgentBookStatusView = {
   /** The pseudonym of the human AgentBook binds to the wallet, when there is one. */
   humanId?: string;
   /** The address AgentBook was queried for: the agent's pocket EOA, which is what signs AgentKit
-   *  challenges and therefore what a seller looks up. Absent only before the pocket exists. */
+   *  challenges and therefore what a seller looks up. Absent only before the pocket exists.
+   *  EIP-55 checksummed, the same form the session response uses — the guardian is asked to
+   *  compare the two by eye. Compare it in code case-insensitively regardless: an older backend
+   *  serves the stored form. */
   address?: string;
   /** Why there is nothing to look up yet, and the API has exactly one: the agent has no payment
    *  address, so there is no question to put to AgentBook and the dashboard shows no chip. */
@@ -556,6 +559,23 @@ export type AgentBookStatusView = {
   disputed?: boolean;
   /** The contract error name from the last attempt. Only sent when `status` is `"failed"`. */
   errorCode?: string;
+  /**
+   * The network the AGENT runs on — not AgentBook's, which is always World Chain mainnet.
+   *
+   * The same value the session response carries, served here so the consent step can say
+   * "this agent runs on Arc testnet, the vouch is on mainnet and is just as permanent" BEFORE the
+   * checkbox rather than after it (design §5.1, final review FR-F). Absent from a backend that
+   * predates the field: the line is then omitted rather than guessed, because guessing "mainnet"
+   * would suppress a warning that is true and guessing "testnet" would print one that is false.
+   */
+  network?: "testnet" | "mainnet";
+  /**
+   * Confirmed vouches this GUARDIAN'S TENANT has already made — per tenant, not per human. Also
+   * from the session response, for the second §5.1 line. Absent means "not told": the linkability
+   * line is omitted rather than rendered with a zero, which would read as a claim that this is
+   * their first vouch.
+   */
+  priorVouches?: number;
 };
 
 /** POST /entities/:id/agentbook/session — everything the World App round trip needs. */

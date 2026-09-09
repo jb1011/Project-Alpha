@@ -10,11 +10,12 @@ import type { AgentBookStatusView } from "@/lib/api/types";
  * controls the address, and never the word "human-backed" on a chip. Nothing here is green: a
  * public registry entry is a fact to link to, not a badge to award.
  *
- * The order the answers are read in is the other half of the ceiling (§5.2). OUR row comes first,
- * because while a vouch is submitted the chain still honestly reads "no entry" — and rendering
- * that as "Not in AgentBook" tells someone that a permanent, public statement about them did not
- * happen, at the one moment they cannot check for themselves. The chain's answer is used only
- * once our row has stopped moving.
+ * The order the answers are read in is the other half of the ceiling (§5.2). Our row comes first
+ * in exactly ONE state — `submitted` — because a signed and broadcast transaction makes the chain's
+ * "no entry" a timing artefact, and rendering that as "Not in AgentBook" tells someone a permanent,
+ * public statement about them did not happen at the one moment they cannot check for themselves.
+ * Everywhere else the chain outranks the row, in both directions: a `pending` row has not been
+ * submitted at all, and a `failed` one is history the registry may already have overtaken.
  */
 
 /** World Chain's public explorer. Vouches live on World Chain whatever chain the agent itself
@@ -95,10 +96,19 @@ const FAILED: AgentBookChipState = {
   note: FAILURE_COPY,
 };
 
-/** The transaction that wrote the vouch when we know it, else AgentBook itself. Never the pocket:
- *  it has no World Chain history to show. */
+/**
+ * The transaction that wrote the vouch when we know it, else AgentBook itself. Never the pocket:
+ * it has no World Chain history to show.
+ *
+ * A hash is only the vouch's transaction on a `confirmed` row (final review FR-A). Every other row
+ * that carries a hash carries one we know did NOT write the entry the chip is pointing at: a
+ * `failed` row keeps the hash of a transaction that reverted (`errorCode: "reverted"`) or was never
+ * mined at all (`"replaced"`, where the explorer 404s), and a `submitted`/`pending` row's hash has
+ * not been read back yet. When the registry nonetheless says "registered" — someone else's vouch,
+ * or our own re-broadcast landing later — the honest link is the registry, not our receipt.
+ */
 function explorerHref(view: AgentBookStatusView): string {
-  return view.txHash
+  return view.status === "confirmed" && view.txHash
     ? `${WORLDCHAIN_EXPLORER_URL}/tx/${view.txHash}`
     : `${WORLDCHAIN_EXPLORER_URL}/address/${AGENT_BOOK_ADDRESS}`;
 }
@@ -114,18 +124,31 @@ export function agentBookChipState(
 ): AgentBookChipState | null {
   if (!view) return null;
 
-  // 1. Our own row, while it is still moving (§5.2). `confirmed` and `expired` fall through: a
-  //    confirmed row is only as good as the chain's current answer, and an expired one never
-  //    reached the chain at all.
+  // 1. Our own row, while it is still moving (§5.2). `pending`, `confirmed` and `expired` fall
+  //    through: a confirmed row is only as good as the chain's current answer, an expired one never
+  //    reached the chain at all, and a PENDING one has not been submitted (see below).
   switch (view.status) {
-    case "pending":
     case "submitted":
+      // The one state where our row outranks the chain. The transaction is signed and broadcast,
+      // so the chain honestly reading "no entry" is a timing artefact, not an answer.
       return SUBMITTING;
+    case "pending":
+      // A pending row is a session waiting for the guardian to approve in World App — opened by
+      // the dialog before a QR code is even shown. Nothing has been signed or sent, so the
+      // in-flight label would claim a submission that may never happen (final review FR-B): a
+      // declined or abandoned dialog would keep saying "Vouch submitted" for the whole session
+      // TTL. The chain's answer is true at that moment, whatever it is.
+      break;
     case "failed":
-      // A live `registered` outranks a failed row: the registry is the truth and the row is
-      // history. This is the case the failure copy anticipates out loud — "it may still have gone
-      // through" — so once the chain says it did, saying "could not check" is the false statement.
-      if (view.outcome === "registered") break;
+      // The registry outranks a failed row in BOTH directions: the row is history, the chain is
+      // the truth. This is the case the failure copy anticipates out loud — "it may still have
+      // gone through" — so once the chain says it did (or that someone else's vouch now stands),
+      // repeating "could not check" is the false statement.
+      if (view.outcome === "registered" || view.outcome === "disputed") break;
+      // A refusal above the broadcast (a rejected proof, a refused signature) fails the row
+      // without ever putting a transaction on the wire. There is no submission whose fate is
+      // unknown, so §5.2's "it may still have gone through" would be false here too.
+      if (view.txHash == null) break;
       return FAILED;
     case "disputed":
       return DISPUTED;

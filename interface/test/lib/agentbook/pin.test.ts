@@ -7,7 +7,7 @@
  * type-checks and renders this component's module graph on the server too.
  */
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { checkPin, readPin, writePin } from "@/lib/agentbook/pin";
+import { checkPin, writePin } from "@/lib/agentbook/pin";
 
 /** A minimal Storage. Not jsdom: this suite has no DOM, by design. */
 function memoryStorage(overrides: Partial<Storage> = {}): Storage {
@@ -78,18 +78,11 @@ describe("checkPin (trust on first use)", () => {
   });
 });
 
-describe("readPin / writePin", () => {
-  test("write then read round-trips, lowercased", () => {
-    vi.stubGlobal("localStorage", memoryStorage());
-    expect(writePin("agent-1", "0xAbC")).toBe(true);
-    expect(readPin("agent-1")).toBe("0xabc");
-  });
-
-  test("an unpinned entity reads null, and a dead store reads null rather than throwing", () => {
-    vi.stubGlobal("localStorage", memoryStorage());
-    expect(readPin("agent-9")).toBeNull();
+describe("writePin", () => {
+  test("a store that refuses the write says so rather than throwing", () => {
+    // `checkPin` turns this into "unavailable": a browser setting must never read as "changed",
+    // which is the one answer the dialog refuses to proceed on.
     vi.stubGlobal("localStorage", undefined);
-    expect(readPin("agent-9")).toBeNull();
     expect(writePin("agent-9", "0xaaa")).toBe(false);
   });
 });
