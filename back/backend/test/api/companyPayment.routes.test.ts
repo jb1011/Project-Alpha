@@ -434,3 +434,32 @@ test("requote: refused while a quote is live, and issues a NEW nonce once it is 
   expect(quote.nonce).not.toBe(first.nonce);
   expect(quote.paymentId).not.toBe(first.paymentId);
 });
+
+test("a settling payment still carries the NONCE and the DOMAIN — the cancel path needs them", async () => {
+  // The quote is withheld while a broadcast is in flight (signing again is the double charge),
+  // but the guardian's exit from a stuck payment is a CancelAuthorization signature, and that
+  // needs the nonce and the token's domain. Serving those two is safe where serving the quote is
+  // not: a transfer authorization also commits to the VALUE, the RECIPIENT and the WINDOW, and
+  // none of them is here — the worst a wrong cancel message can do is get rejected by the token.
+  const cfg = paymentCfg();
+  const { body } = await create(cfg);
+  const companyId = body.companyId as unknown as string;
+  const row = payments.findLive(companyId, "formation")!;
+  payments.markSettling(row.paymentId, {
+    payerAddress: OWNER as Address,
+    rawTx: "0x02aa",
+    txHash: `0x${"cc".repeat(32)}`,
+  });
+  const res = await app(cfg).request(`/companies/${companyId}/payment`, {
+    headers: { authorization: `Bearer ${await token(OWNER)}` },
+  });
+  const view = (await res.json()) as Record<string, unknown>;
+  expect(view.quote).toBeUndefined();
+  expect(view.nonce).toBe(row.nonce);
+  expect(view.domain).toEqual({
+    name: "USD Coin",
+    version: "2",
+    chainId: 5042002,
+    verifyingContract: USDC,
+  });
+});

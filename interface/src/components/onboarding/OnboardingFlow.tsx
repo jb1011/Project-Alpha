@@ -45,6 +45,7 @@ import {
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { GuardianStep } from "./steps/GuardianStep";
 import { LegalBodyStep } from "./steps/LegalBodyStep";
+import { PaymentStep } from "./steps/PaymentStep";
 import { CustodyStep } from "./steps/CustodyStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
@@ -123,7 +124,14 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const { data: publicConfig } = usePublicConfigQuery();
   const formationAvailable = publicConfig?.formationAvailable === true;
   const formationRequired = publicConfig?.formationRequired === true;
-  const phases = useMemo(() => visiblePhases(formationAvailable), [formationAvailable]);
+  // B1: the fee step, present only where the deployment charges. Anything other than an explicit
+  // `true` hides it — a backend that predates the field does not charge, and a payment step whose
+  // every endpoint would 404 is worse than no step.
+  const paymentRequired = publicConfig?.formationPaymentRequired === true;
+  const phases = useMemo(
+    () => visiblePhases(formationAvailable, paymentRequired),
+    [formationAvailable, paymentRequired],
+  );
 
   /**
    * Past the legal-body step with no company handle → the wizard shows that step again.
@@ -349,11 +357,23 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                   // it lives in the step's own state and is cleared there.)
                   setParty(emptyParty());
                   setIntake(emptyCompanyIntake());
-                  completePhase("legal-body", "custody");
+                  // The NEXT phase is asked of the visible list, never named: `payment` sits
+                  // between this step and custody on a deployment that charges, and re-deriving
+                  // it from `paymentRequired` here would be a second answer to a question
+                  // `visiblePhases` already holds.
+                  completePhase("legal-body", nextPhase(phases, "legal-body"));
                 }}
                 onClear={() => setSession((s) => ({ ...s, companyId: null, company: null }))}
                 onBack={() => goTo("guardian")}
-                onComplete={() => completePhase("legal-body", "custody")}
+                onComplete={() => completePhase("legal-body", nextPhase(phases, "legal-body"))}
+              />
+            )}
+            {phase === "payment" && (
+              <PaymentStep
+                eyebrow={screenLabel(phases, "payment")}
+                companyId={session.companyId}
+                onBack={() => goTo("legal-body")}
+                onComplete={() => completePhase("payment", "custody")}
               />
             )}
             {phase === "custody" && (

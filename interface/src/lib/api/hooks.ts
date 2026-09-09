@@ -12,6 +12,7 @@ import {
   agentBookRegister,
   agentBookSession,
   bootstrapConnection,
+  cancelCompanyPayment,
   createCompany,
   createConnectionPackage,
   createFormationParty,
@@ -24,6 +25,7 @@ import {
   getEntityRuns,
   getCompany,
   getCompanyCompliance,
+  getCompanyPayment,
   getEntityTreasury,
   getNonce,
   getPasskeyChallenge,
@@ -37,9 +39,11 @@ import {
   onboardEntity,
   patchPerTxCap,
   patchTrustPolicy,
+  requoteCompanyPayment,
   revokeApiKey,
   revokePasskey,
   schedulePolicyUpdate,
+  settleCompanyPayment,
   storePasskey,
   updateCompanyIntake,
   updateCompanyParty,
@@ -516,6 +520,92 @@ export function useUpdateCompanyIntakeMutation(companyId: string) {
  * `if (!companyId) return` guard in `onSuccess` that no call site could reach — a dead branch
  * that would have silently skipped the invalidation if one ever did.
  */
+/**
+ * ── FORMATION PAYMENTS (design §6) ──────────────────────────────────────────────────────────
+ *
+ * The hook layer's whole job here is to make "sign once per quote" the only expressible flow:
+ * the query is the ONLY source of a signable quote and stops serving one the instant a broadcast
+ * is in flight, and there is no mutation that could produce a second signature for the same
+ * nonce.
+ *
+ * `refetchInterval` is the poll §6 asks for. It runs ONLY while the payment is genuinely in
+ * motion — `settling`, or a `quoted` row somebody is looking at — and stops dead on every
+ * terminal state, so a settled company does not poll its receipt forever.
+ */
+export function useCompanyPaymentQuery(
+  companyId: string | null | undefined,
+  options?: { enabled?: boolean; pollMs?: number },
+) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.companyPayment(token ?? "", companyId ?? ""),
+    queryFn: () => getCompanyPayment(token!, companyId!),
+    enabled: (options?.enabled ?? true) && !!token && !!companyId,
+    // NO staleTime, unlike its siblings: this row changes underneath the page (the sweeper
+    // resolves a stalled settle) and a cached "settling" shown for a minute is the one thing that
+    // would make a guardian reach for a second signature.
+    staleTime: 0,
+    // A 404 is the honest answer on a deployment that does not charge, and on a company with no
+    // payment at all. Retrying it is a loop against a fact.
+    retry: false,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      if (status === "settling") return options?.pollMs ?? 4000;
+      if (status === "quoted") return options?.pollMs ?? 10_000;
+      return false;
+    },
+  });
+}
+
+/**
+ * Submit the guardian's signature.
+ *
+ * It invalidates the payment AND the company, because both change at once when a settle
+ * confirms: the payment becomes `settled` and the company leaves `draft` for `ready`. A page that
+ * refreshed only the first would show a paid payment beside a company still described as unpaid.
+ */
+export function useSettleCompanyPaymentMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (body: { signature: `0x${string}`; from: `0x${string}` }) =>
+      settleCompanyPayment(await ensureToken(), companyId, body),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companyPayment(token, companyId) });
+      await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
+      queryClient.invalidateQueries({ queryKey: apiKeys.companies(token), refetchType: "none" });
+    },
+  });
+}
+
+/** The guardian's cancel — a SECOND signature, over a different message. */
+export function useCancelCompanyPaymentMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (body: { signature: `0x${string}` }) =>
+      cancelCompanyPayment(await ensureToken(), companyId, body),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companyPayment(token, companyId) });
+    },
+  });
+}
+
+/** A new quote with a new nonce. Refused by the backend while anything is live. */
+export function useRequoteCompanyPaymentMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async () => requoteCompanyPayment(await ensureToken(), companyId),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companyPayment(token, companyId) });
+    },
+  });
+}
+
 export function useUpdateCompanyPartyMutation(companyId: string) {
   const queryClient = useQueryClient();
   const ensureToken = useEnsureAuthToken();

@@ -21,6 +21,11 @@ export const apiKeys = {
   company: (token: string, id: string) => [...apiKeys.all, "company", token, id] as const,
   companyCompliance: (token: string, id: string) =>
     [...apiKeys.all, "companyCompliance", token, id] as const,
+  /** The formation PAYMENT for one company (B1 §6). Token-scoped like its siblings — a quote
+   *  names a payee and an amount one wallet is being asked to authorize, and it must never
+   *  survive a sign-out into another tenant's cache. */
+  companyPayment: (token: string, id: string) =>
+    [...apiKeys.all, "companyPayment", token, id] as const,
   /** PUBLIC and token-free: build-time rules that are the same for everybody. */
   formationRules: () => [...apiKeys.all, "formationRules"] as const,
 };

@@ -49,15 +49,47 @@ test("G2: a phase from corrupt storage falls back to the first visible phase", (
   expect(snapToVisiblePhase(withFormation, "not-a-phase" as never)).toBe("welcome");
 });
 
-test("G2: snapping never carries a user PAST a step, except the skipped one", () => {
-  // Every snap either stays put, or lands earlier in the canonical order — the single exception
-  // being `legal-body`, whose whole point is that the flow skips it.
+test("G2: snapping never carries a user PAST a step, except the skipped ones", () => {
+  // Every snap either stays put, or lands earlier in the canonical order — the exceptions being
+  // the OPTIONAL steps, whose whole point is that the flow skips them. `payment` (B1) joins
+  // `legal-body` in that list: both snap forward to `custody`, which is where the flow itself
+  // sends users when either is absent, and snapping backwards would re-run a completed step.
   const canonical = (id: string) => PHASES.findIndex((p) => p.id === id);
   for (const p of PHASES) {
-    if (p.id === "legal-body") continue;
+    if (p.id === "legal-body" || p.id === "payment") continue;
     const snapped = snapToVisiblePhase(withoutFormation, p.id);
     expect(canonical(snapped), p.id).toBeLessThanOrEqual(canonical(p.id));
   }
+});
+
+/* ── the PAYMENT phase (B1, design §6.1) ───────────────────────────────────── */
+
+test("B1: the payment step is absent during the beta, on every deployment", () => {
+  // `visiblePhases(true)` is the beta shape and the default: a backend that predates
+  // `/config.formationPaymentRequired` does not charge, and a step whose every endpoint would 404
+  // is worse than no step at all.
+  expect(withFormation.map((p) => p.id)).not.toContain("payment");
+  expect(visiblePhases(true, false).map((p) => p.id)).not.toContain("payment");
+});
+
+test("B1: it appears between the legal body and custody where the deployment charges", () => {
+  const charging = visiblePhases(true, true);
+  expect(nextPhase(charging, "legal-body")).toBe("payment");
+  expect(nextPhase(charging, "payment")).toBe("custody");
+  expect(prevPhase(charging, "custody")).toBe("payment");
+});
+
+test("B1: a deployment that forms NOTHING cannot charge for a formation", () => {
+  // Subordinate, not independent: the payment phase goes wherever the legal-body one does,
+  // whatever the flag says. A box that cannot form a company has nothing to take money for.
+  expect(visiblePhases(false, true).map((p) => p.id)).not.toContain("payment");
+  expect(visiblePhases(false, true).map((p) => p.id)).not.toContain("legal-body");
+});
+
+test("B1: a session stranded on `payment` after the flag goes off snaps FORWARD to custody", () => {
+  // The `legal-body` rule, for the same reason: the fee step is one the flow itself skips, and
+  // sending somebody back to re-pick a company they already chose would be worse than the snap.
+  expect(snapToVisiblePhase(withFormation, "payment")).toBe("custody");
 });
 
 test("G9: neighbours come from the VISIBLE list, so the optional step drops out of both", () => {

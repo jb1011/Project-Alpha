@@ -98,6 +98,24 @@ export interface FormationPaymentView {
   txHash: Hex | null;
   refundTxHash: string | null;
   /**
+   * The authorization's nonce, and the token's EIP-712 domain — ALWAYS present, including on a
+   * `settling` row that deliberately carries no quote.
+   *
+   * They are here for exactly one caller: the guardian's CANCEL fast path, which needs to build
+   * `CancelAuthorization(authorizer, nonce)` for a payment whose quote is (rightly) withheld.
+   * Serving them is safe in a way serving the quote is not — a nonce and a domain cannot
+   * authorize a transfer, because a transfer authorization commits to the VALUE, the RECIPIENT
+   * and the WINDOW as well, and none of those is here. The worst a wrong cancel message can do is
+   * produce a signature the token rejects, which leaves the payment stuck rather than moving
+   * anyone's money.
+   *
+   * The domain is served rather than let a client assemble one, for the same reason the quote's
+   * is: it is READ from the token at boot, and a client that hardcoded "USD Coin"/"2" would sign
+   * cancellations against a domain the token does not verify.
+   */
+  nonce: Hex;
+  domain: TransferAuthorizationDomain;
+  /**
    * The signable quote — present ONLY while the row is `quoted` and still inside its window.
    *
    * Absent on a `settling` row deliberately: re-signing one is exactly the double charge §6.4
@@ -193,6 +211,8 @@ export function paymentView(
     payerAddress: payment.payerAddress,
     txHash: payment.txHash,
     refundTxHash: payment.refundTxHash,
+    nonce: payment.nonce,
+    domain: cfg.domain,
     ...(signable ? { quote: quoteOf(payment, guardian, cfg) } : {}),
   };
 }
