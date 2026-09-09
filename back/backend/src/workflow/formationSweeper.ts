@@ -121,6 +121,19 @@ export const POLL_BATCH = 200;
 export const STRANDED_BATCH = 50;
 
 /**
+ * PAYMENTS (finding B2): how many stalled settles one tick may drive, and how long it waits for a
+ * receipt while doing it.
+ *
+ * Both are much smaller than the filing legs' equivalents, for the same reason: every settle here
+ * costs several CHAIN calls, and the resolver for a row this tick cannot finish is the NEXT
+ * tick's log read rather than this tick's patience. Arc's finality is sub-second, so a receipt
+ * that has not appeared in five seconds is not going to — where the request path can afford to
+ * wait a minute because a human is watching and the answer might still arrive.
+ */
+export const MAX_SETTLES_PER_TICK = 5;
+export const SWEEP_RECEIPT_TIMEOUT_MS = 5_000;
+
+/**
  * How many entities one tick may drive through the ANCHOR sub-saga, and how many at once.
  *
  * Smaller than `POLL_BATCH` because the work is heavier: an anchor pass is several sequential
@@ -176,6 +189,15 @@ export class FormationSweeper {
   private readonly warned = new Set<string>();
 
   /**
+   * The last verdict this process saw for each live payment (finding B2).
+   *
+   * In memory and deliberately so, exactly like `warned`: it de-duplicates an ops LINE, not
+   * state anything depends on. A restart re-warns, which is the failure direction to prefer.
+   * Entries are dropped the moment a payment reaches a terminal verdict.
+   */
+  private readonly paymentVerdicts = new Map<string, string>();
+
+  /**
    * Where the last anchor batch stopped (2026-08-26 §3) — PERSISTED in `meta.anchor_cursor`.
    *
    * It used to live only in memory, on the argument that it is a fairness aid rather than state
@@ -227,9 +249,14 @@ export class FormationSweeper {
     const amortised = this.ticks % AMORTISED_EVERY_N_TICKS === 0;
     try {
       await this.redriveEvents();
+      // ⚠ PAYMENTS BEFORE FILINGS (finding B2). `openStrandedFormations` is what SPENDS money at
+      // doola, and what makes a company eligible for it is having nothing owed. Resolving the
+      // payments first means a company that settled between ticks is filed on this pass rather
+      // than the next one, and — more importantly — a payment that just resolved `expired` or
+      // `failed` is visible to the filing leg before it opens anything.
+      await this.resumeStalledSettles();
       await this.openStrandedFormations();
       await this.resumeStalledCreates();
-      await this.resumeStalledSettles();
       await this.retryFailedSteps();
       await this.pollInFlight();
       await this.advanceAnchors();
@@ -411,8 +438,27 @@ export class FormationSweeper {
     if (!payment) return;
     const now = this.now();
     const nowSec = Math.floor(now / 1000);
+    // ⚠ THE EXECUTOR THIS LEG USES HAS ITS OWN, SHORT RECEIPT TIMEOUT (finding B2).
+    //
+    // 60 seconds is right on a request path, where a human is waiting and the answer might still
+    // arrive. It is wrong here: Arc's finality is sub-second, so a receipt that has not appeared
+    // in five seconds is not going to, and the RESOLVER for this row is the NEXT tick's log read
+    // rather than this tick's patience. Waiting a minute per row would let a handful of stalled
+    // payments consume the whole sweep and starve every other leg behind it.
+    const deps = {
+      ...payment,
+      executor: { ...payment.executor, receiptTimeoutMs: SWEEP_RECEIPT_TIMEOUT_MS },
+      companies: this.d.companies,
+      entities: this.d.repo,
+      now: this.now.bind(this),
+    };
+    let settles = 0;
 
     for (const row of payment.payment.payments.listByStatus("settling", STRANDED_BATCH)) {
+      // …and a CAP per tick, for the same reason the timeout is short: this leg makes chain calls
+      // per row, and a backlog must be worked through over several passes rather than turned into
+      // one sweep that never finishes.
+      if (settles >= MAX_SETTLES_PER_TICK) break;
       // The stall bound first: a row written seconds ago belongs to a request that is still
       // running, and re-broadcasting under it would race the handler for the same nonce.
       if (now - parseSqliteUtc(row.updatedAt) < SUBMITTED_STALL_MS) continue;
@@ -423,26 +469,27 @@ export class FormationSweeper {
         continue;
       const company = this.d.companies.find(row.companyId);
       if (!company) continue;
-      opsLog("formation_payment_resumed", {
-        level: "warn",
-        companyId: row.companyId,
-        paymentId: row.paymentId,
-        attempt: row.attempt,
-        stalledMs: now - parseSqliteUtc(row.updatedAt),
-      });
+      settles++;
       try {
-        await withKeyedLock(`payment:${row.companyId}`, () =>
-          advancePaymentOnChain(
-            {
-              ...payment,
-              companies: this.d.companies,
-              entities: this.d.repo,
-              now: this.now.bind(this),
-            },
-            company,
-            row,
-          ),
+        const verdict = await withKeyedLock(`payment:${row.companyId}`, () =>
+          advancePaymentOnChain(deps, company, row),
         );
+        // ⚠ WARN ONLY WHEN IT IS NEWS (finding B2). A payment that is pending is pending every
+        // sixty seconds, and a leg that warns each time trains an operator to filter out the one
+        // line that would have told them something. Loud on the FIRST pass, and loud again when
+        // the verdict CHANGES; informational in between.
+        const previous = this.paymentVerdicts.get(row.paymentId);
+        const news = row.attempt === 0 || previous !== verdict;
+        this.paymentVerdicts.set(row.paymentId, verdict);
+        opsLog("formation_payment_resumed", {
+          level: news ? "warn" : "info",
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          attempt: row.attempt,
+          stalledMs: now - parseSqliteUtc(row.updatedAt),
+          verdict,
+        });
+        if (verdict !== "pending") this.paymentVerdicts.delete(row.paymentId);
       } catch (err) {
         // A chain read or a broadcast failed. The row stays `settling`, which is the safe place
         // for it: the next tick tries again, and nothing has been written off.
@@ -465,16 +512,7 @@ export class FormationSweeper {
       if (!company) continue;
       try {
         await withKeyedLock(`payment:${row.companyId}`, () =>
-          advancePaymentOnChain(
-            {
-              ...payment,
-              companies: this.d.companies,
-              entities: this.d.repo,
-              now: this.now.bind(this),
-            },
-            company,
-            row,
-          ),
+          advancePaymentOnChain(deps, company, row),
         );
       } catch (err) {
         opsLog("formation_payment_resume_failed", {

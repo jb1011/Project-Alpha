@@ -27,7 +27,9 @@ import type { Address, Hex } from "../../src/types";
 import {
   FormationSweeper,
   type FormationSweeperDeps,
+  MAX_SETTLES_PER_TICK,
   SUBMITTED_STALL_MS,
+  SWEEP_RECEIPT_TIMEOUT_MS,
 } from "../../src/workflow/formationSweeper";
 import { MemoryDocumentStore, fakeDoola } from "../helpers/formationFakes";
 
@@ -381,4 +383,67 @@ test("a live maintenance_year quote does NOT hold up the formation filing", () =
     )
     .get(c) as { n: number };
   expect(blocked.n).toBe(0);
+});
+
+// ── the leg's own budget (finding B2) ───────────────────────────────────────────────────────
+
+test("a tick drives at most MAX_SETTLES_PER_TICK rows — a backlog is worked down, not swallowed", async () => {
+  // Every settle here costs several chain calls. A tick is a timer, not a batch job: five rows a
+  // pass finishes a backlog over a few minutes, where fifty would hold the process and starve
+  // every leg behind it.
+  const ids: string[] = [];
+  for (let i = 0; i < MAX_SETTLES_PER_TICK + 3; i++) {
+    const c = company();
+    const id = quote(c, { nonce: `0x${i.toString(16).padStart(2, "0").repeat(32)}` as Hex });
+    payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+    stall(id);
+    ids.push(id);
+  }
+  const chain = fakeChain({ receipt: "timeout" });
+  await sweeper(chain.executor).tick();
+  const touched = ids.filter((id) => (payments.find(id)?.attempt ?? 0) > 0);
+  expect(touched).toHaveLength(MAX_SETTLES_PER_TICK);
+});
+
+test("the leg waits SECONDS for a receipt, not the request path's minute", async () => {
+  // Asserted through the timeout the leg actually passes down, because the alternative is a test
+  // that sleeps. The resolver for a row this tick cannot finish is the next tick's log read.
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  let sawTimeout: number | undefined;
+  const chain = fakeChain({ receipt: "timeout" });
+  chain.executor.publicClient.waitForTransactionReceipt = async ({
+    timeout,
+  }: { timeout: number }) => {
+    sawTimeout = timeout;
+    throw new Error("receipt timeout");
+  };
+  await sweeper(chain.executor).tick();
+  expect(sawTimeout).toBe(SWEEP_RECEIPT_TIMEOUT_MS);
+});
+
+test("PAYMENTS ARE RESOLVED BEFORE FILINGS ARE OPENED — the order is the point", async () => {
+  // `openStrandedFormations` is what spends money at doola, and eligibility is "nothing owed". A
+  // payment that resolves on this tick must be visible to the filing leg on THIS tick.
+  const order: string[] = [];
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const chain = fakeChain({ receipt: "timeout" });
+  const s = sweeper(chain.executor);
+  const originalList = requests.listUnopenedFormations.bind(requests);
+  requests.listUnopenedFormations = ((...args: Parameters<typeof originalList>) => {
+    order.push("filings");
+    return originalList(...args);
+  }) as typeof originalList;
+  chain.executor.publicClient.readContract = async () => {
+    order.push("payments");
+    return false;
+  };
+  await s.tick();
+  expect(order.indexOf("payments")).toBeGreaterThan(-1);
+  expect(order.indexOf("payments")).toBeLessThan(order.indexOf("filings"));
 });
