@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import type { Hex } from "../types";
@@ -65,5 +66,50 @@ export function assertCircleCoverage(
   if (r.n > 0)
     throw new Error(
       `${r.n} agent(s) use the circle custody path but CIRCLE_API_KEY/CIRCLE_ENTITY_SECRET are not configured — refusing to boot (they would be unserviceable)`,
+    );
+}
+
+/**
+ * The DB half of the revenue-address separation invariant (design 2026-08-26 §6.6).
+ *
+ * `config/env.ts` refuses a `FORMATION_REVENUE_ADDRESS` that equals the executor or any key in
+ * the fixed env set. It cannot see the OTHER half of "every platform key": the per-agent operator
+ * and pocket addresses, which are rows rather than variables — env parsing has no database, and a
+ * pocket address is derived from a seed rather than configured.
+ *
+ * The harm is the same one, one layer along: formation revenue landing on a hot wallet this
+ * platform can sign for, on a box where the whole point of the revenue address is that no key for
+ * it exists here. Three columns, because an operator that has been ROTATED AWAY is still an
+ * address this deployment held a key for, and a pocket is derived from a seed that is still on
+ * the box.
+ *
+ * ONE indexed EXISTS rather than a fleet scan (each arm has its own partial index, added in
+ * `migrate`): a thousand-agent deployment must not read a thousand rows to answer a yes/no
+ * question at every boot. Called from the API composition root beside `assertCircleCoverage`, and
+ * a no-op on every deployment that does not charge.
+ */
+export function assertRevenueAddressSeparation(
+  db: Database.Database,
+  payment: { required: boolean; revenueAddress?: string },
+): void {
+  if (!payment.required || !payment.revenueAddress) return;
+  // SQLite's default `=` on TEXT is case-SENSITIVE, and a miss on casing would PASS this check
+  // and lose the money — addresses are stored in whatever casing wrote them (viem checksums,
+  // older paths and hand-written rows do not). `COLLATE NOCASE` rather than `LOWER(column)`:
+  // both are correct, but a function on the indexed side is not sargable, and the three partial
+  // indexes `migrate` creates are declared NOCASE precisely so this stays a lookup.
+  const revenue = getAddress(payment.revenueAddress);
+  const hit = db
+    .prepare(
+      `SELECT 1 AS hit FROM entities
+        WHERE operator = ? COLLATE NOCASE
+           OR previous_operator = ? COLLATE NOCASE
+           OR pocket_address = ? COLLATE NOCASE
+        LIMIT 1`,
+    )
+    .get(revenue, revenue, revenue) as { hit: number } | undefined;
+  if (hit)
+    throw new Error(
+      "Invalid config: FORMATION_REVENUE_ADDRESS is an agent operator or pocket address held by this deployment — formation revenue lands on a receive-only Ledger account, never on a wallet this box can sign for (refusing to boot)",
     );
 }

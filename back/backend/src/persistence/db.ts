@@ -663,6 +663,30 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN operator_rotated_at INTEGER");
   if (!cols.includes("public_id")) db.exec("ALTER TABLE entities ADD COLUMN public_id TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_public_id ON entities(public_id)");
+  // ── The FLEET's operator addresses, indexed (2026-08-26 §6.6) ────────────────────────────
+  //
+  // Read by exactly one thing: the boot invariant that refuses to let
+  // `FORMATION_REVENUE_ADDRESS` be an address this platform signs with
+  // (`assertRevenueAddressSeparation`). It is a point lookup on three columns, and the design
+  // asks for an indexed EXISTS rather than a fleet scan — a deployment with a thousand agents
+  // must not read a thousand rows to answer a yes/no question at every boot.
+  //
+  // PARTIAL on NOT NULL: every legacy row has NULLs here, and indexing them buys nothing.
+  //
+  // COLLATE NOCASE, and that is the whole trick. Addresses are stored in whatever casing wrote
+  // them — viem checksums, older paths and hand-written rows do not — so the comparison has to be
+  // case-insensitive, and the obvious spelling (`LOWER(operator) = ?`) puts a function on the
+  // indexed side and silently turns the lookup back into a table scan. A NOCASE index is used by
+  // a NOCASE comparison, so the check is both correct and indexed.
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_entities_operator_addr ON entities(operator COLLATE NOCASE) WHERE operator IS NOT NULL",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_entities_previous_operator_addr ON entities(previous_operator COLLATE NOCASE) WHERE previous_operator IS NOT NULL",
+  );
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_entities_pocket_addr ON entities(pocket_address COLLATE NOCASE) WHERE pocket_address IS NOT NULL",
+  );
 
   // doola formation (design §3). Purely additive: NULL formation_provider = legacy/stub forever
   // (the 13 testnet + existing prod agents are never backfilled). The three hash/version columns

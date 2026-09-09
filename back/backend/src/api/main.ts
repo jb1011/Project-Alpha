@@ -68,6 +68,7 @@ import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import {
   assertCircleCoverage,
+  assertRevenueAddressSeparation,
   assertTurnkeyCoverage,
   backfillPocketAddresses,
 } from "../persistence/tier0";
@@ -106,6 +107,13 @@ async function main() {
   assertCircleCoverage(db, cfg.circle);
   assertTurnkeyCoverage(db, turnkeyServiceable);
   if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
+  // ...and, AFTER the pocket backfill so every derived address is a row this can see: the DB half
+  // of the revenue-address separation invariant (2026-08-26 §6.6). env.ts checks the fixed key
+  // set; only the database knows the fleet's operator and pocket addresses. A no-op on every
+  // deployment that does not charge.
+  // `formation` is optional in the TYPE only (test fixtures build Config literals); loadConfig
+  // always populates it, and a fixture that does not simply has no payment to separate.
+  if (cfg.formation) assertRevenueAddressSeparation(db, cfg.formation.payment);
   const repo = new SqliteEntityRepository(db);
   // Same db handle as `repo`, deliberately: the v1 anchor row is written INSIDE the entity row's
   // transaction at create-confirm, so the entity store and the anchor history can never disagree
