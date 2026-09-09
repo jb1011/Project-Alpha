@@ -678,15 +678,25 @@ export function migrate(db: Database.Database): void {
   // case-insensitive, and the obvious spelling (`LOWER(operator) = ?`) puts a function on the
   // indexed side and silently turns the lookup back into a table scan. A NOCASE index is used by
   // a NOCASE comparison, so the check is both correct and indexed.
-  db.exec(
-    "CREATE INDEX IF NOT EXISTS idx_entities_operator_addr ON entities(operator COLLATE NOCASE) WHERE operator IS NOT NULL",
+  //
+  // Guarded per column and read FRESH, because a genuinely old database can be missing any of
+  // them: `pocket_address` and `previous_operator` are ALTERed in above, but `operator` predates
+  // that machinery and a pre-formation fixture has neither the column nor a path that adds one.
+  // Indexing a column that is not there throws and takes the whole migration with it.
+  const addressCols = (db.prepare("PRAGMA table_info(entities)").all() as { name: string }[]).map(
+    (c) => c.name,
   );
-  db.exec(
-    "CREATE INDEX IF NOT EXISTS idx_entities_previous_operator_addr ON entities(previous_operator COLLATE NOCASE) WHERE previous_operator IS NOT NULL",
-  );
-  db.exec(
-    "CREATE INDEX IF NOT EXISTS idx_entities_pocket_addr ON entities(pocket_address COLLATE NOCASE) WHERE pocket_address IS NOT NULL",
-  );
+  const addressIndexes: Array<[column: string, index: string]> = [
+    ["operator", "idx_entities_operator_addr"],
+    ["previous_operator", "idx_entities_previous_operator_addr"],
+    ["pocket_address", "idx_entities_pocket_addr"],
+  ];
+  for (const [column, index] of addressIndexes) {
+    if (!addressCols.includes(column)) continue;
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS ${index} ON entities(${column} COLLATE NOCASE) WHERE ${column} IS NOT NULL`,
+    );
+  }
 
   // doola formation (design §3). Purely additive: NULL formation_provider = legacy/stub forever
   // (the 13 testnet + existing prod agents are never backfilled). The three hash/version columns

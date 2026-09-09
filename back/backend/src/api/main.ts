@@ -542,6 +542,16 @@ async function main() {
     // The SSN keyring (§4.2). The sweeper hands it to the filing step, which needs it to rebuild
     // a body it already sent, and to the TTL leg, which needs only to erase.
     pii: formationCfg.pii,
+    // The eighth leg's wiring (§6.4) — the SAME payment config and executor the settle route
+    // holds, so the sweeper and the route resolve one payment through one set of rules. Absent
+    // where the deployment does not charge, and the leg is then a no-op.
+    payment: formationPayment
+      ? {
+          payment: formationPayment,
+          executor: formationExecutor,
+          transaction: <T>(fn: () => T) => repo.transaction(fn),
+        }
+      : undefined,
     intervalMs: cfg.formation?.sweepMs ?? 60_000,
     // The anchor sub-saga (design §7). The SAME `anchors` repo the saga writes the v1 row with
     // and the SAME `arc` adapter the saga mints through — a second adapter would be a second

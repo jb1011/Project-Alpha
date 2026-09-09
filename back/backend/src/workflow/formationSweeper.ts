@@ -33,6 +33,7 @@ import {
 } from "../persistence/formationRepository";
 import { parseSqliteUtc } from "../util/sqliteTime";
 import { advanceAnchor, newAnchorReadCache } from "./anchorLoop";
+import { expire as expirePayment, resumeSettlingPayment } from "./formationPayment";
 import {
   type FormationAdvanceDeps,
   advanceFormation,
@@ -145,6 +146,16 @@ export interface FormationSweeperDeps extends FormationAdvanceDeps {
   /** The SSN keyring (§4.2), handed on to the filing step so a resumed create can rebuild the
    *  body it originally sent. Absent on every deployment that never collected one. */
   pii?: PiiKeyring;
+  /**
+   * FORMATION PAYMENTS (2026-08-26 §6.4). Present only where this deployment charges; absent
+   * everywhere else, and the leg then does nothing at all.
+   *
+   * It carries the payment repository, the pinned USDC domain and the executor, so the sweeper
+   * resolves a stalled settle through THE SAME functions the settle route uses. Two
+   * implementations of "what happened to this payment?" is how a row ends up `failed` in one
+   * place and re-broadcast in the other.
+   */
+  payment?: Omit<import("./formationPayment").FormationPaymentDeps, "companies" | "now">;
   /** `FORMATION_SWEEP_MS`. */
   intervalMs: number;
 }
@@ -218,6 +229,7 @@ export class FormationSweeper {
       await this.redriveEvents();
       await this.openStrandedFormations();
       await this.resumeStalledCreates();
+      await this.resumeStalledSettles();
       await this.retryFailedSteps();
       await this.pollInFlight();
       await this.advanceAnchors();
@@ -367,6 +379,87 @@ export class FormationSweeper {
           ...describeDoolaError(err),
         });
       }
+    }
+  }
+
+  /**
+   * ── (b2) THE PAYMENT CRASH WINDOW (2026-08-26 §6.4) — the eighth leg ─────────────────────
+   *
+   * Two shapes, and they are not symmetric.
+   *
+   * A `settling` row is a broadcast whose outcome nobody recorded: the request handler died, the
+   * RPC timed out, the box restarted. It is the DANGEROUS one, because the guardian's signature
+   * is public and self-authorizing until `validBefore` — anyone holding the bytes can still get
+   * them mined. So this leg NEVER re-quotes such a row. It asks the chain whether the nonce is
+   * spent, re-broadcasts the persisted bytes if it is not, and expires the row only once the
+   * window has closed AND the nonce is still unused. All of that lives in
+   * `resumeSettlingPayment`, which is also what the settle route calls, so both actors reach the
+   * same verdict from the same evidence.
+   *
+   * A `quoted` row past its window is the ordinary one: nothing was broadcast, nothing can be,
+   * and `expired` is simply the truth catching up with the clock. It is what lets the guardian
+   * re-quote — and it has to happen even on a company nobody is looking at, because the unique
+   * live-rows index would otherwise refuse their next quote forever.
+   *
+   * Modelled on `resumeStalledCreates`: `SUBMITTED_STALL_MS` before a row is presumed stranded,
+   * `retryDelayMs(attempt)` between re-broadcasts (`resumeSettlingPayment` burns the attempt),
+   * and the per-company keyed lock so a sweep and a live settle never touch one payment at once.
+   */
+  private async resumeStalledSettles(): Promise<void> {
+    const payment = this.d.payment;
+    if (!payment) return;
+    const now = this.now();
+    const nowSec = Math.floor(now / 1000);
+
+    for (const row of payment.payment.payments.listByStatus("settling", STRANDED_BATCH)) {
+      // The stall bound first: a row written seconds ago belongs to a request that is still
+      // running, and re-broadcasting under it would race the handler for the same nonce.
+      if (now - parseSqliteUtc(row.updatedAt) < SUBMITTED_STALL_MS) continue;
+      // …then the backoff, which only exists once an attempt has been burned. A row on its first
+      // pass has attempt 0 and `retryDelayMs(0)` is one minute, which is the right first wait for
+      // something we have already decided is stranded.
+      if (row.attempt > 0 && now - parseSqliteUtc(row.updatedAt) < retryDelayMs(row.attempt))
+        continue;
+      const company = this.d.companies.find(row.companyId);
+      if (!company) continue;
+      opsLog("formation_payment_resumed", {
+        level: "warn",
+        companyId: row.companyId,
+        paymentId: row.paymentId,
+        attempt: row.attempt,
+        stalledMs: now - parseSqliteUtc(row.updatedAt),
+      });
+      try {
+        await withKeyedLock(`payment:${row.companyId}`, () =>
+          resumeSettlingPayment(
+            { ...payment, companies: this.d.companies, now: this.now.bind(this) },
+            company,
+            row,
+          ),
+        );
+      } catch (err) {
+        // A chain read or a broadcast failed. The row stays `settling`, which is the safe place
+        // for it: the next tick tries again, and nothing has been written off.
+        opsLog("formation_payment_resume_failed", {
+          level: "warn",
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          ...describeDoolaError(err),
+        });
+      }
+    }
+
+    // The quiet half: quotes whose window has closed. No chain read is needed — nothing was ever
+    // broadcast, and `validBefore` alone settles it.
+    for (const row of payment.payment.payments.listExpiredQuotes(nowSec, STRANDED_BATCH)) {
+      const company = this.d.companies.find(row.companyId);
+      if (!company) continue;
+      expirePayment(
+        { ...payment, companies: this.d.companies, now: this.now.bind(this) },
+        company,
+        row,
+        "quote-window-closed",
+      );
     }
   }
 
