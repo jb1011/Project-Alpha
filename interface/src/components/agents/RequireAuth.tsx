@@ -1,12 +1,16 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
-import { Button, Card, Spinner } from "@/components/onboarding/primitives";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Button, Callout, Card, Spinner } from "@/components/onboarding/primitives";
 import { useAuth } from "@/components/onboarding/AuthProvider";
+import { authPanelState } from "./authPanel";
+import { shortenErr } from "@/lib/errors";
 
 export function RequireAuth({ children }: { children: ReactNode }) {
-  const { session, isConnected, isLoggingIn, connectWallet, login } = useAuth();
+  const { session, isConnected, isConnecting, isLoggingIn, connectWallet, login } =
+    useAuth();
   const [ready, setReady] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   // Session lives in sessionStorage; the server always sees "logged out". Wait for the
   // client snapshot before branching, or React throws a hydration mismatch on /guardian,
@@ -14,6 +18,26 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   useEffect(() => {
     setReady(true);
   }, []);
+
+  const panel = authPanelState({ isConnected, isConnecting, isLoggingIn });
+
+  // Every rejection on this surface used to be discarded by `void connectWallet()`: a rejected
+  // request, a locked wallet, a wallet already mid-connect (-32002), a SIWE verify that failed —
+  // all of them left the button exactly as it was and printed an unhandled rejection to a console
+  // nobody had open. The wizard's own connect has always caught and shown these
+  // (`WelcomeStep.handleConnect`), which is why the same wallet appeared to work there and to be
+  // dead here.
+  const run = useCallback(
+    async (action: () => Promise<void>, fallback: string) => {
+      setError(null);
+      try {
+        await action();
+      } catch (e) {
+        setError(e instanceof Error ? shortenErr(e.message) : fallback);
+      }
+    },
+    [],
+  );
 
   if (!ready) {
     return <LoadingState />;
@@ -29,15 +53,21 @@ export function RequireAuth({ children }: { children: ReactNode }) {
           Connect the guardian wallet you used when creating your agents.
         </p>
         <div className="mt-6 flex flex-col gap-3">
-          {!isConnected ? (
-            <Button onClick={() => void connectWallet()} loading={isLoggingIn}>
-              Connect wallet
-            </Button>
-          ) : (
-            <Button onClick={() => void login()} loading={isLoggingIn}>
-              Sign in with wallet
-            </Button>
-          )}
+          <Button
+            onClick={() =>
+              void (panel.action === "connect"
+                ? run(connectWallet, "Wallet connection failed.")
+                : run(login, "Sign-in failed."))
+            }
+            loading={panel.pending}
+          >
+            {panel.label}
+          </Button>
+          {error ? (
+            <Callout tone="warn" title="Something went wrong" className="text-left">
+              {error}
+            </Callout>
+          ) : null}
         </div>
       </Card>
     </div>
