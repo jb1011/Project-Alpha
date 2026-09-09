@@ -206,11 +206,31 @@ const FORMATION_PAYMENTS_DDL = `
       -- a derived nonce is one-shot and would brick the company after any failed attempt.
       nonce       TEXT NOT NULL,
       valid_before INTEGER NOT NULL,
+      -- Where the money goes, STORED AT QUOTE TIME (§6.1, B1 gate A1). Never re-read from live
+      -- config on verify, settle or cancel: a revenue-address change between quote and settle
+      -- would otherwise silently re-target a signature the guardian has already given, and the
+      -- token would reject it (or, worse, we would verify against the new address and broadcast
+      -- an authorization naming the old one).
+      pay_to      TEXT,
       payer_address TEXT,
-      -- Persisted BEFORE broadcast (the bridge-legs rule): a crash mid-settle re-broadcasts the
-      -- SAME signed transaction rather than re-quoting, which is how a double charge is avoided.
+      -- ⚠ THE DURABLE ARTIFACT (B1 gate A1). The guardian's EIP-3009 SIGNATURE, persisted BEFORE
+      -- any broadcast. It is what makes a crash mid-settle recoverable, and it is nonce-free:
+      -- the executor transaction is COMPOSED FRESH at every broadcast (current pending nonce,
+      -- current fees), because a signed raw transaction commits to an executor nonce that
+      -- another transaction can consume while we are down — after which the persisted bytes are
+      -- permanently unsendable. The authorization has no such problem; the token's own
+      -- authorizationState and its AuthorizationUsed log are the exactly-once.
+      signature   TEXT,
+      -- DEPRECATED (B1 gate A1). Was the persisted raw transaction back when re-broadcasting the
+      -- same bytes was the recovery story. Nothing reads or writes it; the column stays because
+      -- dropping one buys nothing and an old SQLite cannot.
       raw_tx      BLOB,
+      -- The LAST hash we broadcast, and how many times we have broadcast at all. Neither is an
+      -- outcome: the outcome comes from the token's logs (resolveAuthorizationOutcome), which
+      -- is what lets a THIRD PARTY's settlement of the same public authorization resolve
+      -- as settled rather than as failed.
       tx_hash     TEXT,
+      broadcast_count INTEGER NOT NULL DEFAULT 0,
       attempt     INTEGER NOT NULL DEFAULT 0,
       refund_tx_hash TEXT,
       created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -798,6 +818,21 @@ export function migrate(db: Database.Database): void {
     if (!partyColsNow.includes(col))
       db.exec(`ALTER TABLE formation_parties ADD COLUMN ${col} ${type}`);
   db.exec(FORMATION_PARTIES_INDEX_DDL);
+
+  // formation_payments: the B1-gate columns, ALTER-if-missing (the house idiom). The table
+  // itself is A1's; these four are what turn the AUTHORIZATION into the durable artifact —
+  // `pay_to` pins the payee at quote time, `signature` is the thing a resume re-submits, and
+  // `broadcast_count` says how many times we have composed a transaction for it (which is also
+  // the fee-bump ladder). A database created before this build has the table without them.
+  const payCols = (
+    db.prepare("PRAGMA table_info(formation_payments)").all() as { name: string }[]
+  ).map((c) => c.name);
+  for (const [col, type] of [
+    ["pay_to", "TEXT"],
+    ["signature", "TEXT"],
+    ["broadcast_count", "INTEGER NOT NULL DEFAULT 0"],
+  ] as const)
+    if (!payCols.includes(col)) db.exec(`ALTER TABLE formation_payments ADD COLUMN ${col} ${type}`);
 
   // formation_requests.next_poll_at: ALTER-if-missing, the house idiom. A database created by
   // PR 2's first migration has the column; one created by an earlier build of PR 2 does not, and

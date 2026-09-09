@@ -52,7 +52,10 @@ import {
 } from "../src/adapters/arc/usdcToken";
 import { ARC_TESTNET_CHAIN_ID, loadConfig } from "../src/config/env";
 import { newPaymentNonce, quoteOf } from "../src/formation/payment";
-import { broadcastAndConfirm, signCancelTx, signSettleTx } from "../src/payments/formationSettle";
+import {
+  submitCancelAuthorization,
+  submitTransferWithAuthorization,
+} from "../src/payments/formationSettle";
 import { verifyTransferAuthorization } from "../src/payments/transferAuthorization";
 import type { Address, Hex } from "../src/types";
 
@@ -97,9 +100,11 @@ function row(nonce: Hex, validBefore: number) {
     amountUsdc: amount,
     nonce,
     validBefore,
+    payTo: revenue,
     payerAddress: null,
-    rawTx: null,
+    signature: null,
     txHash: null,
+    broadcastCount: 0,
     attempt: 0,
     refundTxHash: null,
     createdAt: "",
@@ -120,11 +125,7 @@ async function main(): Promise<void> {
   // (b) THE QUOTE, built by the product's own function.
   const validBefore = Math.floor(Date.now() / 1000) + 30 * 60;
   const nonce = newPaymentNonce();
-  const quote = quoteOf(row(nonce, validBefore), guardian.address as Address, {
-    revenueAddress: revenue,
-    domain,
-    feeUsdc: Number(amount / 1_000_000n),
-  });
+  const quote = quoteOf(row(nonce, validBefore), guardian.address as Address, { domain });
   console.log(`quote: ${quote.amountUsdc} atomic USDC -> ${quote.payTo}, nonce ${quote.nonce}`);
 
   // (c) THE GUARDIAN'S SIGNATURE, verified through the product's own verifier.
@@ -153,8 +154,9 @@ async function main(): Promise<void> {
   if (!verdict.ok) throw new Error(`local verification FAILED: ${verdict.reason}`);
   console.log("local verification ✓\n");
 
-  // (d) THE SETTLE, through the executor path the route uses.
-  const settleTx = await signSettleTx(
+  // (d) THE SETTLE, through the executor path the route uses — composed fresh, exactly as a
+  //     resume would compose it.
+  const settled = await submitTransferWithAuthorization(
     executorDeps,
     {
       from: guardian.address as Address,
@@ -165,9 +167,8 @@ async function main(): Promise<void> {
       nonce,
     },
     signature,
+    { onBroadcast: (txHash) => console.log(`settle tx ${txHash} — broadcasting…`) },
   );
-  console.log(`settle tx ${settleTx.txHash} — broadcasting…`);
-  const settled = await broadcastAndConfirm(executorDeps, settleTx);
   if (settled.kind !== "settled") throw new Error(`settle did not confirm: ${settled.kind}`);
   const usedAfterSettle = await readAuthorizationState(
     publicClient,
@@ -189,14 +190,16 @@ async function main(): Promise<void> {
     primaryType: "CancelAuthorization",
     message: { authorizer: guardian.address as Address, nonce: cancelNonce },
   })) as Hex;
-  const cancelTx = await signCancelTx(
+  const cancelled = await submitCancelAuthorization(
     executorDeps,
     guardian.address as Address,
     cancelNonce,
     cancelSignature,
+    {
+      onBroadcast: (txHash) =>
+        console.log(`cancel tx ${txHash} (nonce ${cancelNonce}) — broadcasting…`),
+    },
   );
-  console.log(`cancel tx ${cancelTx.txHash} (nonce ${cancelNonce}) — broadcasting…`);
-  const cancelled = await broadcastAndConfirm(executorDeps, cancelTx);
   if (cancelled.kind !== "settled") throw new Error(`cancel did not confirm: ${cancelled.kind}`);
   const usedAfterCancel = await readAuthorizationState(
     publicClient,

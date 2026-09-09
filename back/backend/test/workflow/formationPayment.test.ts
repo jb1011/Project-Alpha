@@ -54,27 +54,43 @@ beforeEach(() => {
 afterEach(() => db.close());
 
 /**
- * A FAKE CHAIN, in as few moving parts as the tests need: a nonce, a fee, a set of
- * already-broadcast transactions and a verdict per hash. `authorizationState` is a set of spent
- * nonces, which is exactly what the token's storage is.
+ * A FAKE CHAIN with the one property that matters for the B1 gate: THE SUBMITTER HAS A NONCE, and
+ * a transaction whose nonce is below the account's is rejected forever ("nonce too low"). That is
+ * the failure the persisted-raw-transaction scheme could not survive and the persisted
+ * AUTHORIZATION does.
+ *
+ * `authorizationState` is a set of spent nonces, which is exactly what the token's storage is.
  */
 function fakeChain(
   opts: {
     receipt?: "success" | "reverted" | "timeout";
     spent?: Set<string>;
+    accountNonce?: number;
   } = {},
 ) {
   const sent: Hex[] = [];
-  const state = { receipt: opts.receipt ?? "success", spent: opts.spent ?? new Set<string>() };
+  const state = {
+    receipt: opts.receipt ?? "success",
+    spent: opts.spent ?? new Set<string>(),
+    accountNonce: opts.accountNonce ?? 7,
+    /** Hashes the node ACCEPTED. A receipt exists for nothing else. */
+    accepted: new Set<string>(),
+  };
   const publicClient = {
-    getTransactionCount: async () => 7,
+    getTransactionCount: async () => state.accountNonce,
     estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
     sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+      const nonce = decodeFakeTx(serializedTransaction).nonce;
+      if (nonce < state.accountNonce) throw new Error("nonce too low");
+      state.accountNonce = nonce + 1;
       sent.push(serializedTransaction);
-      return keccak256(serializedTransaction);
+      const hash = keccak256(serializedTransaction);
+      state.accepted.add(hash);
+      return hash;
     },
     waitForTransactionReceipt: async ({ hash }: { hash: Hex }) => {
-      if (state.receipt === "timeout") throw new Error("timed out waiting for receipt");
+      if (state.receipt === "timeout" || !state.accepted.has(hash))
+        throw new Error("timed out waiting for receipt");
       return { status: state.receipt, gasUsed: 118_000n, transactionHash: hash };
     },
     readContract: async ({ args }: { args: unknown[] }) =>
@@ -101,6 +117,11 @@ function fakeChain(
     chainId: CHAIN,
   };
   return { executor, sent, state };
+}
+
+/** The inverse of the stub signer below: read back what a composed transaction committed to. */
+function decodeFakeTx(raw: Hex): { nonce: number; data: string } {
+  return JSON.parse(Buffer.from(raw.slice(4), "hex").toString());
 }
 
 function paymentCfg(): FormationPaymentConfig {
@@ -137,6 +158,7 @@ function quoteFor(c: CompanyRecord, validBefore = nowSec + 1800) {
     amountUsdc: 399_000_000n,
     nonce: `0x${"a1".repeat(32)}` as Hex,
     validBefore,
+    payTo: REVENUE,
   });
 }
 
@@ -192,14 +214,14 @@ test("a valid signature settles: rows terminal, company READY, one broadcast", a
   expect(chain.sent).toHaveLength(1);
 });
 
-test("the RAW TX is persisted BEFORE it is broadcast (§6.4)", async () => {
+test("the AUTHORIZATION is persisted BEFORE anything is broadcast (§6.4, gate A1)", async () => {
   // The whole recovery story. Asserted by watching the row at the moment the send happens rather
   // than after: a row written afterwards would look identical at the end and be unrecoverable in
   // the middle.
   const c = company();
   const id = quoteFor(c);
   const chain = fakeChain();
-  let rowAtSend: { status: string; rawTx: string | null } | undefined;
+  let rowAtSend: { status: string; signature: string | null } | undefined;
   const send = chain.executor.publicClient.sendRawTransaction;
   // Wrapped rather than spied: the stub is a plain object, and the point is to observe the ROW at
   // the exact instant the bytes leave — not after, where a row written late would look identical.
@@ -207,7 +229,7 @@ test("the RAW TX is persisted BEFORE it is broadcast (§6.4)", async () => {
     serializedTransaction: Hex;
   }): Promise<Hex> => {
     const row = payments.find(id)!;
-    rowAtSend = { status: row.status, rawTx: row.rawTx };
+    rowAtSend = { status: row.status, signature: row.signature };
     return send(args);
   };
   await settleFormationPayment(deps(chain.executor), c, {
@@ -215,7 +237,7 @@ test("the RAW TX is persisted BEFORE it is broadcast (§6.4)", async () => {
     from: TENANT,
   });
   expect(rowAtSend?.status).toBe("settling");
-  expect(rowAtSend?.rawTx).toBeTruthy();
+  expect(rowAtSend?.signature).toBeTruthy();
 });
 
 // ── refusals: nothing reaches the chain ────────────────────────────────────────────────────
@@ -329,22 +351,45 @@ test("a TIMEOUT is NOT a failure: the row stays `settling` and the guardian is n
 
 // ── resume (§6.4) ──────────────────────────────────────────────────────────────────────────
 
-test("resume RE-BROADCASTS the persisted bytes — it never re-quotes", async () => {
+test("resume re-submits THE SAME AUTHORIZATION in a freshly composed transaction", async () => {
   const c = company();
   const id = quoteFor(c);
   const stalled = fakeChain({ receipt: "timeout" });
-  await settleFormationPayment(deps(stalled.executor), c, {
-    signature: await sign(c),
-    from: TENANT,
-  });
-  const persisted = payments.find(id)!.rawTx;
+  const signature = await sign(c);
+  await settleFormationPayment(deps(stalled.executor), c, { signature, from: TENANT });
+  expect(payments.find(id)!.signature).toBe(signature);
 
   const recovered = fakeChain();
   const verdict = await resumeSettlingPayment(deps(recovered.executor), c, payments.find(id)!);
   expect(verdict).toBe("settled");
-  // THE SAME BYTES. Anything else would be a second authorization.
-  expect(recovered.sent).toEqual([persisted]);
+  // A new transaction — but carrying the guardian's ORIGINAL signature, which is what the token
+  // verifies. Anything else would be a second authorization, i.e. a second charge.
+  expect(recovered.sent).toHaveLength(1);
+  expect(decodeFakeTx(recovered.sent[0]!).data).toContain(signature.slice(2));
   expect(payments.listByCompany(c.companyId)).toHaveLength(1);
+});
+
+test("⚠ a resume settles even when another transaction consumed the submitter's nonce", async () => {
+  // THE FAILURE THE PERSISTED RAW TRANSACTION COULD NOT SURVIVE (B1 gate A1). We sign at nonce 7,
+  // crash before the outcome, and while we are down the submitter's nonce moves on. Re-sending
+  // the old bytes is "nonce too low" forever, and the guardian's paid-for company would sit
+  // unfileable until the window closed. Composing fresh takes the CURRENT nonce and lands.
+  const c = company();
+  const id = quoteFor(c);
+  const stalled = fakeChain({ receipt: "timeout", accountNonce: 7 });
+  await settleFormationPayment(deps(stalled.executor), c, {
+    signature: await sign(c),
+    from: TENANT,
+  });
+
+  // …something else spends nonce 7 while we are down.
+  const recovered = fakeChain({ accountNonce: 9 });
+  expect(await resumeSettlingPayment(deps(recovered.executor), c, payments.find(id)!)).toBe(
+    "settled",
+  );
+  expect(decodeFakeTx(recovered.sent[0]!).nonce).toBe(9);
+  expect(payments.find(id)?.status).toBe("settled");
+  expect(companies.find(c.companyId)?.status).toBe("ready");
 });
 
 test("resume does NOT expire a row whose window is still open and whose nonce is unused", async () => {
@@ -365,11 +410,7 @@ test("resume does NOT expire a row whose window is still open and whose nonce is
 test("resume expires ONLY when the window has closed AND the nonce is still unused", async () => {
   const c = company();
   const id = quoteFor(c, nowSec - 1);
-  payments.markSettling(id, {
-    payerAddress: TENANT,
-    rawTx: "0x02aa",
-    txHash: `0x${"cc".repeat(32)}`,
-  });
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
   const chain = fakeChain({ receipt: "timeout" });
   expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("expired");
   expect(payments.find(id)?.status).toBe("expired");
@@ -377,23 +418,22 @@ test("resume expires ONLY when the window has closed AND the nonce is still unus
   expect(chain.sent).toHaveLength(0);
 });
 
-test("a SPENT nonce resolves to `settled` from the receipt, never to `expired`", async () => {
+test("a SPENT nonce past the window resolves to `settled` from the receipt, never `expired`", async () => {
   // `authorizationState === true` past `validBefore` means the transfer DID happen — expiring the
-  // row there would tell a guardian who paid us that they owe us again.
+  // row there would tell a guardian who paid us that they owe us again. And nothing is
+  // re-broadcast: a second transaction carrying a retired authorization only reverts.
   const c = company();
   const id = quoteFor(c, nowSec - 1);
-  const nonce = payments.find(id)!.nonce;
-  const stalled = fakeChain({ receipt: "timeout" });
-  payments.markSettling(id, {
-    payerAddress: TENANT,
-    rawTx: "0x02aa",
-    txHash: `0x${"cc".repeat(32)}`,
-  });
-  void stalled;
-  const chain = fakeChain({ spent: new Set([nonce.toLowerCase()]) });
+  const row = payments.find(id)!;
+  const broadcastHash = `0x${"cc".repeat(32)}` as Hex;
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  payments.recordBroadcast(id, broadcastHash);
+  const chain = fakeChain({ spent: new Set([row.nonce.toLowerCase()]) });
+  chain.state.accepted.add(broadcastHash); // the node has it, and the receipt reads
   expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("settled");
   expect(payments.find(id)?.status).toBe("settled");
   expect(companies.find(c.companyId)?.status).toBe("ready");
+  expect(chain.sent).toHaveLength(0);
 });
 
 // ── cancel + re-quote ──────────────────────────────────────────────────────────────────────
@@ -445,11 +485,7 @@ test("RE-QUOTE is two-step: refused while anything is live, allowed once it is t
   expect(requoteFormationPayment(deps(chain.executor), c)).toMatchObject({ ok: false });
 
   // A SETTLING row: refused, and with the reason that matters — the transfer may still land.
-  payments.markSettling(id, {
-    payerAddress: TENANT,
-    rawTx: "0x02aa",
-    txHash: `0x${"cc".repeat(32)}`,
-  });
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
   const mid = requoteFormationPayment(deps(chain.executor), c);
   expect(mid).toMatchObject({ ok: false });
   expect((mid as { reason: string }).reason).toMatch(/still settling/);
@@ -479,11 +515,7 @@ test("⚠ a SPENT nonce whose receipt we cannot read stays SETTLING — never ex
   const c = company();
   const id = quoteFor(c, nowSec - 1);
   const nonce = payments.find(id)!.nonce;
-  payments.markSettling(id, {
-    payerAddress: TENANT,
-    rawTx: "0x02aa",
-    txHash: `0x${"cc".repeat(32)}`,
-  });
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
   const chain = fakeChain({ receipt: "timeout", spent: new Set([nonce.toLowerCase()]) });
   expect(await resumeSettlingPayment(deps(chain.executor), c, payments.find(id)!)).toBe("pending");
   expect(payments.find(id)?.status).toBe("settling");

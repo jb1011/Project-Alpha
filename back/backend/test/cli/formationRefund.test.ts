@@ -17,7 +17,7 @@ import { buildCli } from "../../src/cli/index";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
-import type { Hex } from "../../src/types";
+import type { Address, Hex } from "../../src/types";
 
 const LEDGER_TX = `0x${"fe".repeat(32)}`;
 const TX = `0x${"cc".repeat(32)}` as Hex;
@@ -36,6 +36,8 @@ beforeEach(() => {
 afterEach(() => {
   process.env = { ...savedEnv };
 });
+
+const REVENUE = "0x000000000000000000000000000000000000bEEF" as Address;
 
 const run = (args: string[]) =>
   buildCli(() => {
@@ -65,13 +67,14 @@ function seed(status: "settled" | "quoted"): { companyId: string; paymentId: str
     amountUsdc: 399_000_000n,
     nonce: `0x${"a1".repeat(32)}` as Hex,
     validBefore: 2_000_000_000,
+    payTo: REVENUE,
   });
   if (status === "settled") {
     payments.markSettling(paymentId, {
       payerAddress: "0x000000000000000000000000000000000000000A",
-      rawTx: "0x02aa",
-      txHash: TX,
+      signature: `0x${"11".repeat(65)}`,
     });
+    payments.recordBroadcast(paymentId, TX);
     payments.markSettled(paymentId, TX);
   }
   db.close();

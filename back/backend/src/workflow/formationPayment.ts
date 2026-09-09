@@ -10,11 +10,12 @@ import {
 } from "../formation/payment";
 import { opsLog } from "../observability/opsLog";
 import {
+  type BroadcastOutcome,
   type FormationExecutorDeps,
   authorizationUsed,
-  broadcastAndConfirm,
-  signCancelTx,
-  signSettleTx,
+  confirmBroadcast,
+  submitCancelAuthorization,
+  submitTransferWithAuthorization,
 } from "../payments/formationSettle";
 import { verifyTransferAuthorization } from "../payments/transferAuthorization";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
@@ -48,8 +49,10 @@ export interface FormationPaymentDeps {
 
 export type SettleResult =
   | { ok: true; status: "settled"; txHash: Hex }
-  /** Broadcast, outcome not yet observed. The row stays `settling` and the sweeper owns it. */
-  | { ok: true; status: "pending"; txHash: Hex }
+  /** Broadcast, outcome not yet observed. The row stays `settling` and the sweeper owns it.
+   *  `txHash` is the attempt we are waiting on, and is absent only if the compose itself never
+   *  produced one. */
+  | { ok: true; status: "pending"; txHash?: Hex }
   | { ok: false; reason: string };
 
 const nowMs = (deps: FormationPaymentDeps) => (deps.now ?? Date.now)();
@@ -102,9 +105,12 @@ export async function settleFormationPayment(
       reason: "the payment must be signed by this company's guardian wallet",
     };
 
+  // Every field off the ROW, including the PAYEE (B1 gate A1): `deps.payment.revenueAddress` is
+  // where a quote's payee came from at insert time, and reading it again here would let an
+  // operator's Ledger rotation re-target a signature the guardian has already given.
   const authorization = {
     from: guardian,
-    to: deps.payment.revenueAddress,
+    to: row.payTo,
     value: row.amountUsdc.toString(),
     validAfter: "0",
     validBefore: String(row.validBefore),
@@ -114,7 +120,7 @@ export async function settleFormationPayment(
     authorization,
     signature: body.signature,
     domain: deps.payment.domain,
-    payTo: deps.payment.revenueAddress,
+    payTo: row.payTo,
     // THE STORED amount, never `deps.payment.feeAtomic`: a fee change between quote and settle
     // must not re-price a signature already given (§6.3).
     value: row.amountUsdc,
@@ -123,22 +129,15 @@ export async function settleFormationPayment(
   });
   if (!verdict.ok) return { ok: false, reason: verdict.reason };
 
-  const signed = await signSettleTx(
-    deps.executor,
-    {
-      from: guardian,
-      to: deps.payment.revenueAddress,
-      value: row.amountUsdc,
-      validAfter: 0n,
-      validBefore: BigInt(row.validBefore),
-      nonce: row.nonce,
-    },
-    body.signature,
-  );
-
-  // PERSIST BEFORE BROADCAST. A crash after this line is recoverable — the sweeper re-broadcasts
-  // these exact bytes. A crash before it has sent nothing.
-  if (!deps.payment.payments.markSettling(row.paymentId, { payerAddress: from, ...signed }))
+  // PERSIST THE AUTHORIZATION BEFORE ANY BROADCAST (B1 gate A1). The signature is the recovery
+  // artifact: a crash after this line is resumable, because a fresh executor transaction can be
+  // composed around it at any time before `validBefore`. A crash before it has sent nothing.
+  if (
+    !deps.payment.payments.markSettling(row.paymentId, {
+      payerAddress: from,
+      signature: body.signature,
+    })
+  )
     return {
       ok: false,
       reason:
@@ -148,16 +147,43 @@ export async function settleFormationPayment(
     companyId: company.companyId,
     paymentId: row.paymentId,
     amountUsdc: row.amountUsdc.toString(),
-    txHash: signed.txHash,
   });
 
-  return finishSettle(
+  const outcome = await broadcast(
     deps,
-    company,
-    row,
-    await broadcastAndConfirm(deps.executor, signed),
-    signed.txHash,
+    row.paymentId,
+    {
+      from: guardian,
+      to: row.payTo,
+      value: row.amountUsdc,
+      validAfter: 0n,
+      validBefore: BigInt(row.validBefore),
+      nonce: row.nonce,
+    },
+    body.signature,
+    0,
   );
+  return finishSettle(deps, company, row, outcome);
+}
+
+/**
+ * One broadcast: compose fresh, record the hash we are waiting on, send, wait.
+ *
+ * `recordBroadcast` runs BETWEEN signing and sending (`onBroadcast`), which is the only placement
+ * that survives a crash in the send itself — a hash written afterwards is missing from exactly
+ * the failure that makes it worth having.
+ */
+async function broadcast(
+  deps: FormationPaymentDeps,
+  paymentId: string,
+  auth: Parameters<typeof submitTransferWithAuthorization>[1],
+  signature: Hex,
+  bumps: number,
+): Promise<BroadcastOutcome> {
+  return submitTransferWithAuthorization(deps.executor, auth, signature, {
+    bumps,
+    onBroadcast: (txHash) => deps.payment.payments.recordBroadcast(paymentId, txHash),
+  });
 }
 
 /**
@@ -172,11 +198,7 @@ function finishSettle(
   deps: FormationPaymentDeps,
   company: CompanyRecord,
   row: FormationPaymentRecord,
-  outcome: Awaited<ReturnType<typeof broadcastAndConfirm>>,
-  /** The hash of the bytes we actually broadcast. Passed in rather than read off `row`, which was
-   *  loaded BEFORE `markSettling` wrote it and therefore still carries null on the first pass —
-   *  a `pending` answer with no hash gives a caller nothing to look up. */
-  broadcastHash: Hex,
+  outcome: BroadcastOutcome,
 ): SettleResult {
   if (outcome.kind === "settled") {
     deps.transaction(() => {
@@ -217,7 +239,9 @@ function finishSettle(
     paymentId: row.paymentId,
     reason: outcome.reason,
   });
-  return { ok: true, status: "pending", txHash: broadcastHash };
+  // The hash comes off the OUTCOME, which is the attempt that just happened — never off `row`,
+  // which was loaded before this broadcast and carries the previous attempt's hash (or none).
+  return { ok: true, status: "pending", txHash: outcome.txHash };
 }
 
 /**
@@ -243,30 +267,16 @@ export async function resumeSettlingPayment(
   const guardian = row.payerAddress ?? guardianOf(company);
   const used = await authorizationUsed(deps.executor, guardian, row.nonce);
   if (used) {
-    // The nonce is spent — by our transfer, or by a cancellation. The receipt is what tells the
-    // two apart, and `broadcastAndConfirm` re-reads it (the send is a no-op for an already-mined
-    // transaction).
-    if (row.rawTx) {
-      const outcome = await broadcastAndConfirm(deps.executor, {
-        rawTx: row.rawTx,
-        txHash: row.txHash as Hex,
-      });
-      const result = finishSettle(deps, company, row, outcome, row.txHash as Hex);
-      if (result.ok && result.status === "settled") return "settled";
-      if (!result.ok) return "failed";
+    // ⚠ SPENT. Never re-broadcast: a second transaction carrying a retired authorization reverts,
+    // and a revert on a spent nonce says NOTHING about where the money went. The only honest
+    // moves are to read the receipt of what we last sent, or to leave the row `settling`.
+    if (row.txHash) {
+      const outcome = await confirmBroadcast(deps.executor, row.txHash);
+      if (outcome.kind === "settled") {
+        const result = finishSettle(deps, company, row, outcome);
+        if (result.ok && result.status === "settled") return "settled";
+      }
     }
-    // ⚠ SPENT, AND WE CANNOT SEE WHICH WAY. The row STAYS `settling` and this returns `pending`.
-    //
-    // The tempting move is `expired` — "the nonce is gone, so the guardian must have cancelled,
-    // so let them re-quote". It is wrong, and it is wrong in the direction that costs money: the
-    // other reason a nonce is spent is that OUR TRANSFER LANDED and the receipt is merely
-    // unreadable right now (a pruned or lagging RPC, a node that has not caught up). Expiring
-    // there would invite a second 399 USDC payment for a company already paid for.
-    //
-    // The genuine cancellation has its own resolution and does not need this one: the cancel
-    // route expires the row itself the moment the cancellation confirms. What is left here is a
-    // cancel made out of band, which is rare, safe to leave `settling`, and visible to a human in
-    // the ops trail — the failure direction to prefer.
     opsLog("formation_payment_pending", {
       level: "warn",
       companyId: company.companyId,
@@ -280,25 +290,39 @@ export async function resumeSettlingPayment(
     // Past its window AND never used: this authorization can no longer settle, whoever holds it.
     return expire(deps, company, row, "window-closed") ? "expired" : "pending";
 
-  if (!row.rawTx) {
-    // A `settling` row with no bytes should be impossible — `markSettling` writes them in the
+  if (!row.signature) {
+    // A `settling` row with no signature should be impossible — `markSettling` writes it in the
     // same statement that sets the status. If it ever happens, waiting is still the safe
     // behaviour: the guardian's authorization may have been broadcast by something we cannot see.
     opsLog("formation_payment_pending", {
       level: "warn",
       companyId: company.companyId,
       paymentId: row.paymentId,
-      reason: "settling row with no persisted raw transaction",
+      reason: "settling row with no persisted authorization signature",
     });
     return "pending";
   }
 
+  // RE-BROADCAST — composed FRESH around the same signature (B1 gate A1). The previous attempt's
+  // executor nonce may have been consumed by something else entirely while we were down; this one
+  // takes the current pending nonce and a bumped fee, so a stalled settle is not stranded by a
+  // number that has nothing to do with the guardian.
   deps.payment.payments.bumpAttempt(row.paymentId);
-  const outcome = await broadcastAndConfirm(deps.executor, {
-    rawTx: row.rawTx,
-    txHash: row.txHash as Hex,
-  });
-  const result = finishSettle(deps, company, row, outcome, row.txHash as Hex);
+  const outcome = await broadcast(
+    deps,
+    row.paymentId,
+    {
+      from: guardian,
+      to: row.payTo,
+      value: row.amountUsdc,
+      validAfter: 0n,
+      validBefore: BigInt(row.validBefore),
+      nonce: row.nonce,
+    },
+    row.signature,
+    row.broadcastCount,
+  );
+  const result = finishSettle(deps, company, row, outcome);
   if (result.ok && result.status === "settled") return "settled";
   if (!result.ok) return "failed";
   return "pending";
@@ -363,8 +387,12 @@ export async function cancelFormationPayment(
       reason: "the cancellation must be signed by this company's guardian wallet",
     };
 
-  const signed = await signCancelTx(deps.executor, guardian, row.nonce, body.signature);
-  const outcome = await broadcastAndConfirm(deps.executor, signed);
+  const outcome = await submitCancelAuthorization(
+    deps.executor,
+    guardian,
+    row.nonce,
+    body.signature,
+  );
   if (outcome.kind !== "settled")
     return {
       ok: false,

@@ -24,11 +24,14 @@ import type { Address, Hex } from "../types";
  * writer names the state it believes it is leaving, and learns from the row count whether it was
  * right. A caller that loses a CAS has not failed — it has been overtaken, and must do nothing.
  *
- * ⚠ `markSettling` persists the SIGNED RAW TRANSACTION and its hash BEFORE the broadcast (§6.4,
- * the `bridgeLegRepository` rule). That is what makes a crash mid-settle recoverable without
- * re-quoting: the resume leg re-broadcasts THE SAME bytes, which is idempotent on-chain, where
- * re-quoting would ask the guardian to sign a second authorization while the first is still live
- * and self-authorizing — i.e. a double charge.
+ * ⚠ `markSettling` persists THE GUARDIAN'S AUTHORIZATION — the signature and the payer — BEFORE
+ * the broadcast (§6.4, the `bridgeLegRepository` rule, amended by the B1 gate). The durable
+ * artifact is the AUTHORIZATION and never a nonce-bound raw transaction: a signed executor
+ * transaction commits to an executor nonce, and a nonce another transaction consumes while we
+ * are down makes those bytes permanently unsendable. The authorization has no nonce of ours in
+ * it, so a resume COMPOSES A FRESH transaction (current pending nonce, current fees, a fee bump
+ * per re-broadcast) around the same signature. Exactly-once is the TOKEN's job, not ours: it
+ * retires the (authorizer, nonce) pair on first use and says so in `AuthorizationUsed`.
  */
 
 export type FormationPaymentProduct = "formation" | "maintenance_year";
@@ -62,10 +65,19 @@ export interface FormationPaymentRecord {
   nonce: Hex;
   /** Unix SECONDS. What the guardian signed as `validBefore`. */
   validBefore: number;
+  /** The payee, COPIED ONTO THE ROW at quote time. Verification, settlement and cancellation all
+   *  read THIS, never live config — a revenue-address change must not re-target a signature that
+   *  has already been given. */
+  payTo: Address;
   payerAddress: Address | null;
-  /** The signed transaction, persisted BEFORE broadcast. */
-  rawTx: Hex | null;
+  /** The guardian's EIP-3009 signature, persisted BEFORE the first broadcast. The recovery
+   *  artifact: a resume composes a fresh executor transaction around it. */
+  signature: Hex | null;
+  /** The hash of the LAST transaction we broadcast. A pointer for a human, never an outcome. */
   txHash: Hex | null;
+  /** How many executor transactions we have composed for this authorization. Drives the fee
+   *  bump, and tells an operator that a settle has been re-sent rather than sat still. */
+  broadcastCount: number;
   attempt: number;
   refundTxHash: string | null;
   createdAt: string;
@@ -80,25 +92,15 @@ interface Row {
   amount_usdc: string;
   nonce: string;
   valid_before: number;
+  pay_to: string | null;
   payer_address: string | null;
-  raw_tx: Buffer | Uint8Array | string | null;
+  signature: string | null;
   tx_hash: string | null;
+  broadcast_count: number;
   attempt: number;
   refund_tx_hash: string | null;
   created_at: string;
   updated_at: string;
-}
-
-/**
- * `raw_tx` is a BLOB column and a signed transaction is hex. Stored as the hex STRING rather than
- * as decoded bytes: it is what `sendRawTransaction` takes, so round-tripping it through a Buffer
- * would buy nothing but a conversion that could be got wrong in one direction only. better-sqlite3
- * hands a BLOB back as a Buffer regardless of what went in, so the read normalises both shapes.
- */
-function toHex(raw: Row["raw_tx"]): Hex | null {
-  if (raw === null || raw === undefined) return null;
-  if (typeof raw === "string") return raw as Hex;
-  return Buffer.from(raw).toString("utf8") as Hex;
 }
 
 function toRecord(r: Row): FormationPaymentRecord {
@@ -110,9 +112,11 @@ function toRecord(r: Row): FormationPaymentRecord {
     amountUsdc: BigInt(r.amount_usdc),
     nonce: r.nonce as Hex,
     validBefore: r.valid_before,
+    payTo: r.pay_to as Address,
     payerAddress: (r.payer_address as Address) ?? null,
-    rawTx: toHex(r.raw_tx),
+    signature: (r.signature as Hex) ?? null,
     txHash: (r.tx_hash as Hex) ?? null,
+    broadcastCount: r.broadcast_count ?? 0,
     attempt: r.attempt,
     refundTxHash: r.refund_tx_hash,
     createdAt: r.created_at,
@@ -127,6 +131,8 @@ export interface NewFormationPayment {
   nonce: Hex;
   /** Unix SECONDS. */
   validBefore: number;
+  /** The payee, pinned now so nothing downstream ever reads it from live config. */
+  payTo: Address;
   paymentId?: string;
 }
 
@@ -167,11 +173,16 @@ export interface FormationPaymentRepository {
    * in flight or crashed, and the resume leg owns it. Two settle requests for one quote therefore
    * produce one broadcast and one refusal, not two transfers.
    */
-  markSettling(
-    paymentId: string,
-    submission: { payerAddress: Address; rawTx: Hex; txHash: Hex },
-  ): boolean;
-  /** `settling → settled`, pinning the hash the receipt came from. */
+  markSettling(paymentId: string, submission: { payerAddress: Address; signature: Hex }): boolean;
+  /**
+   * Record that we have composed and sent an executor transaction for this authorization.
+   *
+   * Deliberately NOT part of `markSettling`: the hash is not durable state, it is the last thing
+   * we tried. It exists so an operator can look one up and so the fee bump has a counter, and it
+   * is written on every broadcast including the resume leg's.
+   */
+  recordBroadcast(paymentId: string, txHash: Hex): boolean;
+  /** `settling → settled`, pinning the hash the outcome was observed at. */
   markSettled(paymentId: string, txHash: Hex): boolean;
   /** `quoted|settling → expired`. The caller has PROVEN the authorization can no longer be used
    *  (§6.4 rule 2: past `validBefore` AND `authorizationState === false`). */
@@ -198,8 +209,9 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
     this.stmts = {
       insert: db.prepare(
         `INSERT INTO formation_payments
-           (payment_id, company_id, product, status, amount_usdc, nonce, valid_before)
-         VALUES (@payment_id, @company_id, @product, 'quoted', @amount_usdc, @nonce, @valid_before)`,
+           (payment_id, company_id, product, status, amount_usdc, nonce, valid_before, pay_to)
+         VALUES (@payment_id, @company_id, @product, 'quoted', @amount_usdc, @nonce,
+                 @valid_before, @pay_to)`,
       ),
       find: db.prepare("SELECT * FROM formation_payments WHERE payment_id = ?"),
       findLive: db.prepare(
@@ -227,9 +239,15 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
       ),
       markSettling: db.prepare(
         `UPDATE formation_payments
-            SET status = 'settling', payer_address = @payer_address, raw_tx = @raw_tx,
-                tx_hash = @tx_hash, updated_at = CURRENT_TIMESTAMP
+            SET status = 'settling', payer_address = @payer_address, signature = @signature,
+                updated_at = CURRENT_TIMESTAMP
           WHERE payment_id = @payment_id AND status = 'quoted'`,
+      ),
+      // `settling` only: a broadcast against a terminal row is a bug we would rather not record.
+      recordBroadcast: db.prepare(
+        `UPDATE formation_payments
+            SET tx_hash = ?, broadcast_count = broadcast_count + 1, updated_at = CURRENT_TIMESTAMP
+          WHERE payment_id = ? AND status = 'settling'`,
       ),
       markSettled: db.prepare(
         `UPDATE formation_payments
@@ -268,6 +286,7 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
       amount_usdc: input.amountUsdc.toString(),
       nonce: input.nonce,
       valid_before: input.validBefore,
+      pay_to: input.payTo,
     });
     return paymentId;
   }
@@ -307,18 +326,18 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
     return (this.stmts.listExpiredQuotes.all(nowSec, limit) as Row[]).map(toRecord);
   }
 
-  markSettling(
-    paymentId: string,
-    submission: { payerAddress: Address; rawTx: Hex; txHash: Hex },
-  ): boolean {
+  markSettling(paymentId: string, submission: { payerAddress: Address; signature: Hex }): boolean {
     return (
       this.stmts.markSettling.run({
         payment_id: paymentId,
         payer_address: submission.payerAddress,
-        raw_tx: submission.rawTx,
-        tx_hash: submission.txHash,
+        signature: submission.signature,
       }).changes === 1
     );
+  }
+
+  recordBroadcast(paymentId: string, txHash: Hex): boolean {
+    return this.stmts.recordBroadcast.run(txHash, paymentId).changes === 1;
   }
 
   markSettled(paymentId: string, txHash: Hex): boolean {

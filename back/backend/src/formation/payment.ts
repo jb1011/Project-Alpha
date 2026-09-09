@@ -155,7 +155,7 @@ export function guardianOf(company: { tenantId: string }): Address {
 export function quoteOf(
   payment: FormationPaymentRecord,
   guardian: Address,
-  cfg: Pick<FormationPaymentConfig, "revenueAddress" | "domain" | "feeUsdc">,
+  cfg: Pick<FormationPaymentConfig, "domain">,
 ): FormationQuote {
   const value = payment.amountUsdc.toString();
   const validBefore = String(payment.validBefore);
@@ -165,7 +165,10 @@ export function quoteOf(
     // Derived from the ROW rather than from `cfg.feeUsdc`, so a fee change never re-prices what a
     // guardian is looking at. Exact for whole-dollar fees, which is all this ever quotes.
     amountDisplayUsdc: Number(payment.amountUsdc / 1_000_000n),
-    payTo: cfg.revenueAddress,
+    // …and the PAYEE from the row too (B1 gate A1). `cfg.revenueAddress` is where a quote's payee
+    // comes FROM, once, at insert; after that the row is the authority. An operator who rotates
+    // the Ledger between quote and settle must not silently re-target a signature already given.
+    payTo: payment.payTo,
     nonce: payment.nonce,
     validAfter: 0,
     validBefore: payment.validBefore,
@@ -175,7 +178,7 @@ export function quoteOf(
       primaryType: "TransferWithAuthorization",
       message: {
         from: guardian,
-        to: cfg.revenueAddress,
+        to: payment.payTo,
         value,
         validAfter: "0",
         validBefore,
@@ -196,7 +199,7 @@ export function quoteOf(
 export function paymentView(
   payment: FormationPaymentRecord,
   guardian: Address,
-  cfg: Pick<FormationPaymentConfig, "revenueAddress" | "domain" | "feeUsdc">,
+  cfg: Pick<FormationPaymentConfig, "domain">,
   nowSec: number,
 ): FormationPaymentView {
   const signable = payment.status === "quoted" && payment.validBefore > nowSec;
@@ -224,7 +227,7 @@ export function paymentView(
  * converting it later is a rounding bug waiting for a fee to depend on it.
  */
 export function insertQuote(
-  cfg: Pick<FormationPaymentConfig, "feeAtomic" | "quoteTtlMs" | "payments">,
+  cfg: Pick<FormationPaymentConfig, "feeAtomic" | "quoteTtlMs" | "payments" | "revenueAddress">,
   companyId: string,
   nowMs: number,
 ): string {
@@ -234,5 +237,9 @@ export function insertQuote(
     amountUsdc: cfg.feeAtomic,
     nonce: newPaymentNonce(),
     validBefore: Math.floor((nowMs + cfg.quoteTtlMs) / 1000),
+    // The ONE read of live config in a payment's life (B1 gate A1). Everything afterwards —
+    // the served quote, local verification, the executor's calldata, the cancel message — takes
+    // the payee off the row.
+    payTo: cfg.revenueAddress,
   });
 }

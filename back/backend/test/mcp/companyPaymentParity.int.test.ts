@@ -149,6 +149,7 @@ function seedCompanyWithQuote(): { companyId: string; nonce: Hex } {
     amountUsdc: 399_000_000n,
     nonce,
     validBefore: Math.floor(Date.now() / 1000) + 1800,
+    payTo: REVENUE,
   });
   return { companyId, nonce };
 }

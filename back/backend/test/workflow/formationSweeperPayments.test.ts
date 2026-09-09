@@ -34,6 +34,7 @@ const guardian = privateKeyToAccount(`0x${"7".repeat(64)}`);
 const TENANT = guardian.address as Address;
 const REVENUE = "0x000000000000000000000000000000000000bEEF" as Address;
 const USDC = "0x3600000000000000000000000000000000000000" as Address;
+const SIG = `0x${"11".repeat(65)}` as Hex;
 const RAW = "0x02aabbcc" as Hex;
 const TX = `0x${"cc".repeat(32)}` as Hex;
 
@@ -146,6 +147,7 @@ function quote(companyId: string, over: { validBefore?: number; nonce?: Hex } = 
     amountUsdc: 399_000_000n,
     nonce: over.nonce ?? (`0x${"a1".repeat(32)}` as Hex),
     validBefore: over.validBefore ?? nowSec() + 1800,
+    payTo: REVENUE,
   });
 }
 
@@ -194,22 +196,22 @@ test("a FRESHLY settling row is not touched — the request that wrote it may st
   // Re-broadcasting under a live handler would race it for the same nonce.
   const c = company();
   const id = quote(c);
-  payments.markSettling(id, { payerAddress: TENANT, rawTx: RAW, txHash: TX });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
   const chain = fakeChain();
   await sweeper(chain.executor).tick();
   expect(chain.sent).toHaveLength(0);
   expect(payments.find(id)?.status).toBe("settling");
 });
 
-test("a STALLED settling row is RE-BROADCAST from its persisted bytes — never re-quoted", async () => {
+test("a STALLED settling row is re-submitted from its persisted AUTHORIZATION — never re-quoted", async () => {
   const c = company();
   const id = quote(c);
-  payments.markSettling(id, { payerAddress: TENANT, rawTx: RAW, txHash: TX });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
   stall(id);
   const chain = fakeChain();
   await sweeper(chain.executor).tick();
   expect(chain.sent).toEqual([RAW]);
-  expect(payments.find(id)?.status).toBe("settled");
+  expect(payments.find(id)).toMatchObject({ status: "settled", broadcastCount: 1 });
   expect(companies.find(c)?.status).toBe("ready");
   // ONE row. A re-quote would be a second live authorization for the same fee.
   expect(payments.listByCompany(c)).toHaveLength(1);
@@ -218,7 +220,7 @@ test("a STALLED settling row is RE-BROADCAST from its persisted bytes — never 
 test("a stalled settle whose outcome is STILL unknown stays settling and burns an attempt", async () => {
   const c = company();
   const id = quote(c);
-  payments.markSettling(id, { payerAddress: TENANT, rawTx: RAW, txHash: TX });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
   stall(id);
   const chain = fakeChain({ receipt: "timeout" });
   await sweeper(chain.executor).tick();
@@ -228,7 +230,7 @@ test("a stalled settle whose outcome is STILL unknown stays settling and burns a
 test("BACKOFF: a row that has already burned an attempt is not retried immediately", async () => {
   const c = company();
   const id = quote(c);
-  payments.markSettling(id, { payerAddress: TENANT, rawTx: RAW, txHash: TX });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
   stall(id);
   const first = fakeChain({ receipt: "timeout" });
   await sweeper(first.executor).tick();
@@ -245,7 +247,7 @@ test("BACKOFF: a row that has already burned an attempt is not retried immediate
 test("EXPIRY needs BOTH: the window closed AND the nonce still unused", async () => {
   const c = company();
   const id = quote(c, { validBefore: nowSec() - 1 });
-  payments.markSettling(id, { payerAddress: TENANT, rawTx: RAW, txHash: TX });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
   stall(id);
   const chain = fakeChain({ receipt: "timeout" });
   await sweeper(chain.executor).tick();
@@ -259,7 +261,10 @@ test("a SPENT nonce past the window resolves to SETTLED — never expired", asyn
   const c = company();
   const nonce = `0x${"b2".repeat(32)}` as Hex;
   const id = quote(c, { validBefore: nowSec() - 1, nonce });
-  payments.markSettling(id, { payerAddress: TENANT, rawTx: RAW, txHash: TX });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  // A broadcast HAPPENED — that is what makes a receipt readable, and reading it is the only
+  // honest way to tell "our transfer landed" from "somebody cancelled".
+  payments.recordBroadcast(id, TX);
   stall(id);
   const chain = fakeChain({ spent: [nonce] });
   await sweeper(chain.executor).tick();
@@ -270,7 +275,7 @@ test("a SPENT nonce past the window resolves to SETTLED — never expired", asyn
 test("the leg survives a chain that throws — the row stays settling for the next tick", async () => {
   const c = company();
   const id = quote(c);
-  payments.markSettling(id, { payerAddress: TENANT, rawTx: RAW, txHash: TX });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
   stall(id);
   const chain = fakeChain();
   chain.executor.publicClient.readContract = async () => {
@@ -308,6 +313,7 @@ test("a live maintenance_year quote does NOT hold up the formation filing", () =
     amountUsdc: 99_000_000n,
     nonce: `0x${"c3".repeat(32)}` as Hex,
     validBefore: nowSec() + 1800,
+    payTo: REVENUE,
   });
   const blocked = db
     .prepare(

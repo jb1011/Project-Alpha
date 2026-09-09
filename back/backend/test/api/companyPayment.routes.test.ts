@@ -199,8 +199,7 @@ test("GET the payment: a SETTLING row carries NO quote — re-signing is the dou
   const row = payments.findLive(body.companyId as unknown as string, "formation")!;
   payments.markSettling(row.paymentId, {
     payerAddress: OWNER as Address,
-    rawTx: "0x02aa",
-    txHash: `0x${"cc".repeat(32)}`,
+    signature: `0x${"11".repeat(65)}`,
   });
   const res = await app(cfg).request(`/companies/${body.companyId}/payment`, {
     headers: { authorization: `Bearer ${await token(OWNER)}` },
@@ -447,8 +446,7 @@ test("a settling payment still carries the NONCE and the DOMAIN — the cancel p
   const row = payments.findLive(companyId, "formation")!;
   payments.markSettling(row.paymentId, {
     payerAddress: OWNER as Address,
-    rawTx: "0x02aa",
-    txHash: `0x${"cc".repeat(32)}`,
+    signature: `0x${"11".repeat(65)}`,
   });
   const res = await app(cfg).request(`/companies/${companyId}/payment`, {
     headers: { authorization: `Bearer ${await token(OWNER)}` },
