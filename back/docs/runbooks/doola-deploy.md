@@ -386,6 +386,7 @@ flag is deliberately set.
 | `FORMATION_PAYMENT_REQUIRED` | **false** | Whether a company must be paid for before it can be filed. Nothing derives it on — unlike `FORMATION_REQUIRED`, which turns itself on with the provider. |
 | `FORMATION_FEE_USDC` | `399` | The all-in fee in WHOLE dollars. Public: served on `/config` and rendered verbatim. The Wyoming state fee ($100, outside doola's pack) is a BREAKDOWN LINE in copy, never added at checkout. |
 | `FORMATION_REVENUE_ADDRESS` | — | The Ledger account. Required when payment is required. |
+| `FORMATION_SETTLE_SUBMITTER_KEY` | — | The DEDICATED EOA that submits guardians' authorizations. Required when payment is required. Its own nonce space, its own USDC gas float, no authority anywhere. |
 | `FORMATION_QUOTE_TTL_MS` | `1800000` | How long a quote stands (30 min). |
 
 ### ⚠ S4 KEY INVENTORY — the revenue address
@@ -405,6 +406,28 @@ every other rule here follow:
 Add it to the S4 inventory as: **formation revenue — Ledger, receive-only, no key on any server,
 holder: Martin.**
 
+### ⚠ S4 KEY INVENTORY — the settle submitter
+
+`FORMATION_SETTLE_SUBMITTER_KEY` is a **dedicated hot EOA on the box whose only job is to submit
+`transferWithAuthorization` and `cancelAuthorization`**. It is deliberately NOT the platform key:
+
+- **nonce space.** The platform key signs registry writes, sweeps and job transactions. Two
+  producers on one nonce lets unrelated traffic starve or replace a settle at the moment a
+  guardian is watching a spinner;
+- **gas.** On Arc the gas token IS USDC, so this address holds a small, visible, single-purpose
+  float. **Keep it funded** — a dry submitter does not fail loudly, it leaves payments `settling`
+  with authorizations already signed. The boot line prints the address and its balance, and warns
+  below ~1 USDC;
+- **authority.** It has none. Not the factory owner, not the controller, not a treasury signer.
+  A compromise wastes gas and nothing more, which is the point of separating it.
+
+Boot refuses it if it equals `PLATFORM_PRIVATE_KEY`'s address, `FORMATION_REVENUE_ADDRESS`, any
+other key in the env set, or any agent operator / rotated-away operator / pocket address in the
+database.
+
+Add it to the S4 inventory as: **formation settle submitter — hot EOA on the API box, gas-only,
+no authority, funded with a few USDC.**
+
 ### Flip-on checklist
 
 Run in this order. Steps 1–3 are refused at boot if they are wrong, which is the point.
@@ -421,6 +444,9 @@ Run in this order. Steps 1–3 are refused at boot if they are wrong, which is t
 3. **Set `FORMATION_REVENUE_ADDRESS`** to the Ledger account and confirm it against the device
    before restarting. It is printed in the boot line — `redact()` does not hide it, deliberately,
    because this is exactly the value an operator must be able to check.
+3b. **Generate `FORMATION_SETTLE_SUBMITTER_KEY`** — a fresh key used for nothing else — and fund
+   its address with a few USDC for gas. The KEY is redacted from the boot log; the ADDRESS and its
+   balance are printed. If it collides with anything this box signs with, the boot refuses.
 4. **Pin the gas constants from the live probe.** `TRANSFER_WITH_AUTHORIZATION_GAS` (150_000) and
    `CANCEL_AUTHORIZATION_GAS` (100_000) in `src/adapters/arc/gas.ts` are BOUNDED ESTIMATES until
    `scripts/formation-settle-probe.mts` has printed a real `gasUsed`. Set each to the measured

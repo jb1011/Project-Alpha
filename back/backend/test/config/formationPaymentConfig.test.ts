@@ -26,6 +26,8 @@ const WORLD = {
 };
 
 const REVENUE = "0x000000000000000000000000000000000000BEeF";
+/** The DEDICATED settle submitter (B1 gate A2) — its own key, and nothing else's. */
+const SUBMITTER_KEY = `0x${"c".repeat(64)}` as const;
 
 /** The smallest env that may legally charge: production provider environment, the identity floor
  *  wired, and somewhere to be paid. */
@@ -35,6 +37,7 @@ const PAYING = {
   DOOLA_ENVIRONMENT: "production",
   FORMATION_PAYMENT_REQUIRED: "true",
   FORMATION_REVENUE_ADDRESS: REVENUE,
+  FORMATION_SETTLE_SUBMITTER_KEY: SUBMITTER_KEY,
 };
 
 test("payment is OFF by default, and nothing derives it on", () => {
@@ -90,11 +93,56 @@ test("SANDBOX CAN NEVER CHARGE — a demo record is not a legal body", () => {
   expect(() => loadConfig(noProvider)).toThrow(/DOOLA_ENVIRONMENT=sandbox/);
 });
 
-test("the revenue address must not be the EXECUTOR — the wallet that submits the transfer", () => {
-  const executor = privateKeyToAccount(PLATFORM_KEY).address;
-  expect(() => loadConfig({ ...PAYING, FORMATION_REVENUE_ADDRESS: executor })).toThrow(
+test("the revenue address must not be the PLATFORM key — a hot wallet on this box", () => {
+  const platform = privateKeyToAccount(PLATFORM_KEY).address;
+  expect(() => loadConfig({ ...PAYING, FORMATION_REVENUE_ADDRESS: platform })).toThrow(
     /equals the PLATFORM_PRIVATE_KEY address/,
   );
+});
+
+// ── THE DEDICATED SETTLE SUBMITTER (B1 gate A2) ────────────────────────────────────────────
+//
+// Its own EOA: its own nonce space, its own USDC gas float, no authority anywhere. Each refusal
+// below is a distinct harm, not a variation on one.
+
+test("charging with no submitter key refuses to boot", () => {
+  const { FORMATION_SETTLE_SUBMITTER_KEY: _drop, ...noSubmitter } = PAYING;
+  expect(() => loadConfig(noSubmitter)).toThrow(/FORMATION_SETTLE_SUBMITTER_KEY is missing/);
+});
+
+test("the submitter is wired onto the payment block, and REDACTED in the boot log", async () => {
+  const cfg = loadConfig(PAYING);
+  expect(cfg.formation?.payment.submitterKey).toBe(SUBMITTER_KEY);
+  const { redact } = await import("../../src/config/env");
+  const printed = JSON.stringify(redact(cfg));
+  expect(printed).not.toContain(SUBMITTER_KEY);
+  expect(printed).toContain('"submitterKey":"REDACTED"');
+});
+
+test("the submitter must not be the PLATFORM key — that is the nonce space it exists to leave", () => {
+  expect(() => loadConfig({ ...PAYING, FORMATION_SETTLE_SUBMITTER_KEY: PLATFORM_KEY })).toThrow(
+    /is the PLATFORM_PRIVATE_KEY/,
+  );
+});
+
+test("the submitter must not be the REVENUE address — the fee would come back to the payer of gas", () => {
+  expect(() =>
+    loadConfig({
+      ...PAYING,
+      FORMATION_REVENUE_ADDRESS: privateKeyToAccount(SUBMITTER_KEY).address,
+    }),
+  ).toThrow(/is the FORMATION_REVENUE_ADDRESS/);
+});
+
+test("the submitter must not be ANY other key this box signs with", () => {
+  const jobKey = `0x${"d".repeat(64)}`;
+  expect(() =>
+    loadConfig({
+      ...PAYING,
+      JOB_CLIENT_PRIVATE_KEY: jobKey,
+      FORMATION_SETTLE_SUBMITTER_KEY: jobKey,
+    }),
+  ).toThrow(/is the JOB_CLIENT_PRIVATE_KEY/);
 });
 
 test("the revenue address must not be ANY other key this box signs with", () => {

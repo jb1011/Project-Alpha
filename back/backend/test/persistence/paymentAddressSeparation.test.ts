@@ -1,18 +1,23 @@
 /**
- * The DB half of the revenue-address separation invariant (design 2026-08-26 §6.6).
+ * The DB half of the payment-address separation invariants (design 2026-08-26 §6.6, B1 gate A2).
  *
- * `config/env.ts` refuses a revenue address equal to the executor or to any key in the fixed env
- * set. Only the DATABASE knows the other half of "every platform key": the per-agent operator
- * addresses, the ones rotated away from, and the pockets derived from the master seed. Paying the
- * formation fee into one of those would look exactly like a successful payment while leaving the
- * money on a wallet this box can sign for — which is the opposite of the receive-only Ledger the
- * revenue address is.
+ * `config/env.ts` refuses a revenue address or a settle submitter equal to the platform key or to
+ * any key in the fixed env set. Only the DATABASE knows the other half of "every platform key":
+ * the per-agent operator addresses, the ones rotated away from, and the pockets derived from the
+ * master seed.
+ *
+ * Paying the formation fee into one of those would look exactly like a successful payment while
+ * leaving the money on a wallet this box can sign for — the opposite of the receive-only Ledger
+ * the revenue address is. And SUBMITTING from one of them puts a guardian's settle back into a
+ * nonce space shared with agent operations, which is precisely what a dedicated submitter exists
+ * to escape.
  */
 import Database from "better-sqlite3";
+import { privateKeyToAccount } from "viem/accounts";
 import { beforeEach, expect, test } from "vitest";
 import { migrate } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
-import { assertRevenueAddressSeparation } from "../../src/persistence/tier0";
+import { assertPaymentAddressSeparation } from "../../src/persistence/tier0";
 
 const LEDGER = "0x000000000000000000000000000000000000bEEF";
 const OPERATOR = "0x000000000000000000000000000000000000000C";
@@ -56,35 +61,35 @@ function seed(over: Record<string, unknown> = {}) {
 test("a deployment that does not charge is never asked the question", () => {
   seed();
   expect(() =>
-    assertRevenueAddressSeparation(db, { required: false, revenueAddress: OPERATOR }),
+    assertPaymentAddressSeparation(db, { required: false, revenueAddress: OPERATOR }),
   ).not.toThrow();
 });
 
 test("a genuine Ledger address passes with a fleet in the database", () => {
   seed();
   expect(() =>
-    assertRevenueAddressSeparation(db, { required: true, revenueAddress: LEDGER }),
+    assertPaymentAddressSeparation(db, { required: true, revenueAddress: LEDGER }),
   ).not.toThrow();
 });
 
 test("refuses an address that is a LIVE agent operator", () => {
   seed();
   expect(() =>
-    assertRevenueAddressSeparation(db, { required: true, revenueAddress: OPERATOR }),
+    assertPaymentAddressSeparation(db, { required: true, revenueAddress: OPERATOR }),
   ).toThrow(/operator or pocket address/);
 });
 
 test("refuses an address this deployment has ROTATED AWAY from — the key existed here", () => {
   seed({ previousOperator: OLD_OPERATOR });
   expect(() =>
-    assertRevenueAddressSeparation(db, { required: true, revenueAddress: OLD_OPERATOR }),
+    assertPaymentAddressSeparation(db, { required: true, revenueAddress: OLD_OPERATOR }),
   ).toThrow(/operator or pocket address/);
 });
 
 test("refuses a POCKET address — derived from a seed that is still on the box", () => {
   seed({ pocketAddress: POCKET });
   expect(() =>
-    assertRevenueAddressSeparation(db, { required: true, revenueAddress: POCKET }),
+    assertPaymentAddressSeparation(db, { required: true, revenueAddress: POCKET }),
   ).toThrow(/operator or pocket address/);
 });
 
@@ -93,7 +98,7 @@ test("the comparison is case-insensitive: stored checksummed, configured lowerca
   // money, which is why the comparison and the index are both NOCASE.
   seed();
   expect(() =>
-    assertRevenueAddressSeparation(db, {
+    assertPaymentAddressSeparation(db, {
       required: true,
       revenueAddress: OPERATOR.toLowerCase(),
     }),
@@ -130,6 +135,32 @@ test("ANY casing matches — including one that is neither checksummed nor lower
   // check and the fee lands on a wallet this box can sign for.
   seed({ operator: "0x000000000000000000000000000000000000000c" });
   expect(() =>
-    assertRevenueAddressSeparation(db, { required: true, revenueAddress: OPERATOR }),
+    assertPaymentAddressSeparation(db, { required: true, revenueAddress: OPERATOR }),
   ).toThrow(/operator or pocket address/);
+});
+
+// ── the SUBMITTER arm (B1 gate A2) ──────────────────────────────────────────────────────────
+
+const SUBMITTER_KEY = `0x${"9".repeat(64)}` as const;
+
+test("a submitter key whose address the fleet already uses is refused", () => {
+  seed({ operator: privateKeyToAccount(SUBMITTER_KEY).address });
+  expect(() =>
+    assertPaymentAddressSeparation(db, {
+      required: true,
+      revenueAddress: LEDGER,
+      submitterKey: SUBMITTER_KEY,
+    }),
+  ).toThrow(/own nonce space/);
+});
+
+test("a dedicated submitter passes with a fleet in the database", () => {
+  seed();
+  expect(() =>
+    assertPaymentAddressSeparation(db, {
+      required: true,
+      revenueAddress: LEDGER,
+      submitterKey: SUBMITTER_KEY,
+    }),
+  ).not.toThrow();
 });

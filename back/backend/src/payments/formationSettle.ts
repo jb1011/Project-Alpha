@@ -56,6 +56,14 @@ export interface SettleAuthorization {
  */
 export const SETTLE_RECEIPT_TIMEOUT_MS = 60_000;
 
+/**
+ * When to say the submitter is running out of gas, in wei of Arc's native token — which IS USDC,
+ * at 18 decimals. One dollar: a settle costs cents, so this is many settles of warning, and the
+ * failure it prevents is quiet — a dry submitter does not refuse loudly, it leaves rows
+ * `settling` with guardians' authorizations already signed.
+ */
+export const LOW_SUBMITTER_BALANCE_WEI = 1_000_000_000_000_000_000n;
+
 /** The outcome of putting a transaction on-chain, as the caller must treat it. */
 export type BroadcastOutcome =
   | { kind: "settled"; txHash: Hex; gasUsed: bigint }

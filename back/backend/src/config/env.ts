@@ -281,6 +281,25 @@ const EnvSchema = z.object({
    * deployment signs with (the invariants below).
    */
   FORMATION_REVENUE_ADDRESS: addressSchema.optional(),
+  /**
+   * THE DEDICATED SETTLE SUBMITTER (B1 gate A2) — the EOA that puts guardians' authorizations
+   * on-chain, and does nothing else.
+   *
+   * Its own key rather than `PLATFORM_PRIVATE_KEY` for three separable reasons, each of which
+   * would justify it alone:
+   *
+   *  1. NONCE SPACE. The platform key signs registry writes, sweeps and job transactions. Two
+   *     producers on one nonce means a settle can be starved (or replaced) by unrelated traffic
+   *     at exactly the moment a guardian is watching a spinner;
+   *  2. GAS BALANCE. On Arc the gas token IS USDC, so the submitter's balance is a visible,
+   *     top-uppable, single-purpose float — not a number that moves whenever anything else runs;
+   *  3. AUTHORITY. This key needs none. It is not the factory owner, not the controller, not a
+   *     treasury signer; a compromise of it can waste gas and nothing more.
+   *
+   * Required when payment is required, and refused when it collides with the executor, the
+   * revenue address or any other key this box signs with (the invariants below).
+   */
+  FORMATION_SETTLE_SUBMITTER_KEY: privKeySchema.optional(),
   /** How long a quote stands before the sweeper expires it. 30 minutes: long enough to read the
    *  page and open a wallet, short enough that a forgotten tab is not a live authorization. */
   FORMATION_QUOTE_TTL_MS: z.coerce
@@ -483,6 +502,10 @@ export interface Config {
       /** 6-decimal atomic USDC — the same number, in the unit the token speaks. */
       feeAtomic: bigint;
       revenueAddress?: Address;
+      /** The dedicated settle submitter's key. Optional in the TYPE and required by a boot
+       *  invariant whenever `required` is true, so a deployment that charges always has a
+       *  single-purpose EOA to submit through. */
+      submitterKey?: Hex;
       quoteTtlMs: number;
     };
   };
@@ -722,6 +745,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         // integer number of dollars, so this is integer arithmetic all the way down.
         feeAtomic: BigInt(e.FORMATION_FEE_USDC) * 1_000_000n,
         revenueAddress: e.FORMATION_REVENUE_ADDRESS,
+        submitterKey: e.FORMATION_SETTLE_SUBMITTER_KEY,
         quoteTtlMs: e.FORMATION_QUOTE_TTL_MS,
       },
     },
@@ -886,11 +910,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     // FLEET are checked separately, against the database, at API boot — see
     // `assertRevenueAddressSeparation`: they are rows, not env, and env parsing has no DB.
     const revenue = cfg.formation.payment.revenueAddress.toLowerCase();
-    const executor = privateKeyToAccount(cfg.platformPrivateKey).address.toLowerCase();
-    if (revenue === executor)
+    const platform = privateKeyToAccount(cfg.platformPrivateKey).address.toLowerCase();
+    if (revenue === platform)
       throw new Error(
-        "Invalid config: FORMATION_REVENUE_ADDRESS equals the PLATFORM_PRIVATE_KEY address — that key is the EXECUTOR that submits the transfer, so every settlement would move the fee from the guardian to us and back to the same wallet that paid the gas. The revenue address is a Ledger account with no key on this box",
+        "Invalid config: FORMATION_REVENUE_ADDRESS equals the PLATFORM_PRIVATE_KEY address — that is a hot key on this box, and formation revenue lands on a receive-only Ledger account with no key here",
       );
+    // ONE list, used by BOTH separation checks below. A key added to Config without being added
+    // here is then a single visible omission rather than two.
     const signingKeys: Array<[string, Hex | undefined]> = [
       ["CUSTOMER_PRIVATE_KEY", cfg.customerPrivateKey],
       ["OPERATOR_PRIVATE_KEY", cfg.operatorPrivateKey],
@@ -904,6 +930,34 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       if (key && privateKeyToAccount(key).address.toLowerCase() === revenue)
         throw new Error(
           `Invalid config: FORMATION_REVENUE_ADDRESS equals the ${name} address — formation revenue lands on a receive-only Ledger account, never on a key this box holds`,
+        );
+    }
+
+    // ── THE SETTLE SUBMITTER (B1 gate A2) ─────────────────────────────────────────────────
+    //
+    // A dedicated EOA: its own nonce space, its own USDC gas float, no authority anywhere. The
+    // invariants say what it must NOT be, and each collision is a distinct harm — sharing the
+    // platform key's nonce space starves settles behind unrelated traffic; being the revenue
+    // address means the fee is paid to the wallet that just paid the gas to move it; being any
+    // other platform key gives a gas-only role authority it must never have.
+    const submitterKey = cfg.formation.payment.submitterKey;
+    if (!submitterKey)
+      throw new Error(
+        "Invalid config: FORMATION_PAYMENT_REQUIRED is on but FORMATION_SETTLE_SUBMITTER_KEY is missing — settlements go out through a DEDICATED EOA (its own nonce space, its own USDC gas balance, no governance authority); see docs/runbooks/doola-deploy.md",
+      );
+    const submitter = privateKeyToAccount(submitterKey).address.toLowerCase();
+    if (submitter === platform)
+      throw new Error(
+        "Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is the PLATFORM_PRIVATE_KEY — the submitter exists precisely to have its own nonce space and no authority, and sharing the platform key gives it both problems back",
+      );
+    if (submitter === revenue)
+      throw new Error(
+        "Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is the FORMATION_REVENUE_ADDRESS — every settlement would pay the fee to the same wallet that just paid the gas to move it, which looks exactly like a successful payment while moving the money nowhere",
+      );
+    for (const [name, key] of signingKeys) {
+      if (key && privateKeyToAccount(key).address.toLowerCase() === submitter)
+        throw new Error(
+          `Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is the ${name} — the settle submitter is a gas-only identity and must hold no other role on this box`,
         );
     }
   }
@@ -1129,7 +1183,12 @@ export function redact(cfg: Config): Record<string, unknown> {
       // needs to read in the boot line. It stays off `/config` for a different reason: that is a
       // PUBLIC capability document, and pricing belongs there while a payee does not (§6.8).
       payment: cfg.formation
-        ? { ...cfg.formation.payment, feeAtomic: cfg.formation.payment.feeAtomic.toString() }
+        ? {
+            ...cfg.formation.payment,
+            feeAtomic: cfg.formation.payment.feeAtomic.toString(),
+            // …but the SUBMITTER KEY is key material, and the boot log is journald.
+            submitterKey: cfg.formation.payment.submitterKey ? "REDACTED" : undefined,
+          }
         : undefined,
       pii: cfg.formation?.pii
         ? {

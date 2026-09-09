@@ -33,7 +33,9 @@
  *   PROBE_GUARDIAN_PRIVATE_KEY=0x…   a TEST EOA holding a few testnet USDC (it is the payer)
  *   PROBE_REVENUE_ADDRESS=0x…        a TEST destination — NEVER the production Ledger
  *   PROBE_AMOUNT_USDC=0.10           optional, whole/decimal USDC (default 0.10)
- *   ARC_TESTNET_RPC_URL / PLATFORM_PRIVATE_KEY   from .env, as everywhere else
+ *   ARC_TESTNET_RPC_URL              from .env, as everywhere else
+ *   FORMATION_SETTLE_SUBMITTER_KEY   the dedicated submitter, if this box has one; otherwise the
+ *                                    probe falls back to PLATFORM_PRIVATE_KEY and says so
  *
  *   npx tsx scripts/formation-settle-probe.mts
  *
@@ -44,7 +46,11 @@
 import "dotenv/config";
 import { parseUnits } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { managerWalletClient, publicClientFor } from "../src/adapters/arc/clients";
+import {
+  managerWalletClient,
+  publicClientFor,
+  walletClientForKey,
+} from "../src/adapters/arc/clients";
 import {
   CANCEL_AUTHORIZATION_TYPES,
   readAuthorizationState,
@@ -82,9 +88,14 @@ if (revenue.toLowerCase() === (cfg.formation?.payment.revenueAddress ?? "").toLo
 
 const guardian = privateKeyToAccount(guardianKey);
 const publicClient = publicClientFor(cfg);
+// THE SUBMITTER, exactly as the product picks it (B1 gate A2): the dedicated
+// `FORMATION_SETTLE_SUBMITTER_KEY` where one is configured, and the platform key only as a
+// fallback for a box that has not set one up yet — this probe is often run BEFORE the flip-on
+// checklist assigns the dedicated key, and refusing to run then would make the gate unrunnable.
+const submitterKey = cfg.formation?.payment.submitterKey;
 const executorDeps = {
   publicClient,
-  walletClient: managerWalletClient(cfg),
+  walletClient: submitterKey ? walletClientForKey(cfg, submitterKey) : managerWalletClient(cfg),
   usdc: cfg.usdc,
   chainId: cfg.chainId,
 };
@@ -115,7 +126,9 @@ function row(nonce: Hex, validBefore: number) {
 async function main(): Promise<void> {
   console.log(`chain ${cfg.chainId}  usdc ${cfg.usdc}`);
   console.log(`guardian (payer)  ${guardian.address}`);
-  console.log(`executor (gas)    ${executorDeps.walletClient.account?.address}`);
+  console.log(
+    `submitter (gas)   ${executorDeps.walletClient.account?.address}${submitterKey ? "" : "  (PLATFORM key — no FORMATION_SETTLE_SUBMITTER_KEY set)"}`,
+  );
   console.log(`revenue (test)    ${revenue}\n`);
 
   // (a) THE DOMAIN, read and pinned. A mismatch throws here rather than after a signature.

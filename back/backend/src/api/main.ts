@@ -14,6 +14,7 @@ import {
   managerWalletClient,
   platformManagerAddress as platformManagerAddressOf,
   publicClientFor,
+  walletClientForKey,
 } from "../adapters/arc/clients";
 import { readUsdcDomain } from "../adapters/arc/usdcToken";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
@@ -45,6 +46,7 @@ import { buildJobDeps } from "../jobs/composition";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
+import { LOW_SUBMITTER_BALANCE_WEI } from "../payments/formationSettle";
 import { PaymentLedger } from "../payments/ledger";
 import { buildOutflowMeter } from "../payments/outflowMeter";
 import { buildPocketFunding } from "../payments/pocketFunding";
@@ -70,7 +72,7 @@ import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import {
   assertCircleCoverage,
-  assertRevenueAddressSeparation,
+  assertPaymentAddressSeparation,
   assertTurnkeyCoverage,
   backfillPocketAddresses,
 } from "../persistence/tier0";
@@ -110,12 +112,12 @@ async function main() {
   assertTurnkeyCoverage(db, turnkeyServiceable);
   if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
   // ...and, AFTER the pocket backfill so every derived address is a row this can see: the DB half
-  // of the revenue-address separation invariant (2026-08-26 §6.6). env.ts checks the fixed key
-  // set; only the database knows the fleet's operator and pocket addresses. A no-op on every
-  // deployment that does not charge.
+  // of the payment-address separation invariants (2026-08-26 §6.6, B1 gate A2). env.ts checks the
+  // fixed key set; only the database knows the fleet's operator and pocket addresses. A no-op on
+  // every deployment that does not charge.
   // `formation` is optional in the TYPE only (test fixtures build Config literals); loadConfig
   // always populates it, and a fixture that does not simply has no payment to separate.
-  if (cfg.formation) assertRevenueAddressSeparation(db, cfg.formation.payment);
+  if (cfg.formation) assertPaymentAddressSeparation(db, cfg.formation.payment);
   const repo = new SqliteEntityRepository(db);
   // Same db handle as `repo`, deliberately: the v1 anchor row is written INSIDE the entity row's
   // transaction at create-confirm, so the entity store and the anchor history can never disagree
@@ -401,18 +403,40 @@ async function main() {
     );
 
   /**
-   * The EXECUTOR's clients — the platform EOA that submits a guardian's authorization.
+   * THE SETTLE SUBMITTER's clients (B1 gate A2) — a DEDICATED EOA, not the platform key.
    *
-   * The SAME wallet client every other platform write goes through (`managerWalletClient`), which
-   * is the point: there is one executor identity on this box, it is the one the S4 key inventory
-   * names, and formation settlement is not allowed to invent a second.
+   * `managerWalletClient` was the obvious choice and the wrong one. The platform key signs
+   * registry writes, sweeps and job transactions, so sharing it means sharing a NONCE SPACE: a
+   * guardian's settle can be starved or replaced by traffic that has nothing to do with them,
+   * while they watch a spinner. It also means the gas float for settlements is not a number
+   * anyone can look at. And it hands a gas-only job the factory owner's authority.
+   *
+   * So: its own key, its own nonce, its own USDC balance (on Arc the gas token IS USDC), and no
+   * role anywhere else — enforced at boot by the invariants in `config/env.ts`, which refuse a
+   * submitter that collides with the platform key, the revenue address or any other signer.
    */
-  const formationExecutor = {
-    publicClient,
-    walletClient: managerWalletClient(cfg),
-    usdc: cfg.usdc,
-    chainId: cfg.chainId,
-  };
+  const formationExecutor = formationCfg.payment.submitterKey
+    ? {
+        publicClient,
+        walletClient: walletClientForKey(cfg, formationCfg.payment.submitterKey),
+        usdc: cfg.usdc,
+        chainId: cfg.chainId,
+      }
+    : undefined;
+  if (formationPayment && formationExecutor) {
+    const submitter = formationExecutor.walletClient.account?.address as Address;
+    // The gas float, read once and stated. It is USDC on Arc, so "low" is a number an operator
+    // can act on directly — and a submitter that runs dry does not fail a settle loudly, it
+    // leaves rows `settling` until somebody notices.
+    const balance = await publicClient.getBalance({ address: submitter }).catch(() => null);
+    console.warn(
+      `⚠ FORMATION SETTLE SUBMITTER: ${submitter} (gas balance ${balance ?? "unknown"})`,
+    );
+    if (balance !== null && balance < LOW_SUBMITTER_BALANCE_WEI)
+      console.warn(
+        `⚠ FORMATION SETTLE SUBMITTER IS LOW ON GAS (${balance}) — top ${submitter} up with USDC, or settles will stall with guardians' authorizations already signed`,
+      );
+  }
 
   const companyDeps = formationDeployment
     ? {
@@ -545,13 +569,14 @@ async function main() {
     // The eighth leg's wiring (§6.4) — the SAME payment config and executor the settle route
     // holds, so the sweeper and the route resolve one payment through one set of rules. Absent
     // where the deployment does not charge, and the leg is then a no-op.
-    payment: formationPayment
-      ? {
-          payment: formationPayment,
-          executor: formationExecutor,
-          transaction: <T>(fn: () => T) => repo.transaction(fn),
-        }
-      : undefined,
+    payment:
+      formationPayment && formationExecutor
+        ? {
+            payment: formationPayment,
+            executor: formationExecutor,
+            transaction: <T>(fn: () => T) => repo.transaction(fn),
+          }
+        : undefined,
     intervalMs: cfg.formation?.sweepMs ?? 60_000,
     // The anchor sub-saga (design §7). The SAME `anchors` repo the saga writes the v1 row with
     // and the SAME `arc` adapter the saga mints through — a second adapter would be a second
@@ -695,8 +720,8 @@ async function main() {
             payment: formationPayment,
             // …and the fee ITSELF, whether or not this box charges: the beta sentence quotes it.
             feeUsdc: formationCfg.payment.feeUsdc,
-            // The executor. Present exactly where `payment` is, so a box that does not charge has
-            // no settle path wired at all rather than one that refuses at the last moment.
+            // The submitter. Present exactly where `payment` is, so a box that does not charge
+            // has no settle path wired at all rather than one that refuses at the last moment.
             paymentExecutor: formationPayment ? formationExecutor : undefined,
           }
         : undefined,
