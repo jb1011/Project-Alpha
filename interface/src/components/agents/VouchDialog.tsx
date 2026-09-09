@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { getAddress } from "viem";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -106,6 +107,14 @@ type Linkage = "none" | "disputed" | "maybe";
  * effect when an `open` prop flips leaves a poll loop running against a store the next open will
  * not use. The parent renders this only while open, so closing unmounts and the ref-guarded loop
  * stops on its own.
+ *
+ * **It has to be a portal.** The dashboard renders this from inside a `<Card>`, and `Card` carries
+ * `backdrop-blur-sm`. A non-`none` `backdrop-filter` makes that card the containing block for
+ * `position: fixed` descendants AND its own stacking context, so an inline overlay would size
+ * `inset-0` to the card instead of the viewport and have its `z-50` clamped below the later
+ * sibling cards ("Treasury balance", "Spent this period", "Per-tx cap"), which are `Card`s too and
+ * therefore stacking contexts of their own, painted after it. `document.body` is the only parent
+ * with no such ancestor between it and the viewport.
  */
 export function VouchDialog(props: {
   entityId: string;
@@ -113,9 +122,13 @@ export function VouchDialog(props: {
   open: boolean;
   onClose: () => void;
 }) {
-  if (!props.open) return null;
-  return (
-    <VouchDialogBody entityId={props.entityId} agentId={props.agentId} onClose={props.onClose} />
+  // `open` is false on the server and on the first client render alike (it only turns true from a
+  // click), so there is nothing to hydrate here and no mismatch to guard against — the `document`
+  // check is only so this file stays importable in a server render.
+  if (!props.open || typeof document === "undefined") return null;
+  return createPortal(
+    <VouchDialogBody entityId={props.entityId} agentId={props.agentId} onClose={props.onClose} />,
+    document.body,
   );
 }
 
@@ -344,7 +357,7 @@ function VouchDialogBody({
       aria-labelledby="vouch-dialog-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
     >
-      <div className="max-h-[90vh] w-full max-w-[560px] overflow-y-auto rounded-2xl border hairline bg-paper-2 p-6">
+      <div className="max-h-[calc(100vh-2rem)] w-full max-w-[560px] overflow-y-auto rounded-2xl border hairline bg-paper-2 p-6">
         <h2 id="vouch-dialog-title" className="text-[20px] font-medium text-ink">
           Vouch for this agent in AgentBook
         </h2>
