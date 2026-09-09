@@ -41,6 +41,10 @@ from that predicate, `GET /config.agentBookRegistrationAvailable` reports exactl
 
 ## The submitter wallet
 
+> **Production submitter (since 2026-09-09):** `0x35DC45aFD562D67c5cad7FE518F6407224a0d104`, key generated on the box
+> and never exported. The box's env file is `/home/novi/Project-Alpha/back/backend/.env` (service
+> `legalbody-api`, user `novi`); a backup of the pre-key env sits beside it as `.env.bak-2026-09-09`.
+
 - **Generate a fresh key** (`cast wallet new`). It is `WORLDCHAIN_SUBMITTER_PRIVATE_KEY`. Never
   reuse another key: boot refuses equality with every other configured key material —
   `PLATFORM_PRIVATE_KEY`, `CUSTOMER_PRIVATE_KEY`, `OPERATOR_PRIVATE_KEY`, `JOB_CLIENT_PRIVATE_KEY`,
