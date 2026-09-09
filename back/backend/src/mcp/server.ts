@@ -23,17 +23,20 @@ import {
 import { partyFieldsOf } from "../formation";
 import { createCompany, updateCompanyParty } from "../formation/company";
 import { describeIndustryLabels } from "../formation/naicsLabels";
+import { FORMATION_PRODUCT, guardianOf, paymentView } from "../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
+import { withKeyedLock } from "../payments/keyedMutex";
 import type { PocketFundingFn } from "../payments/pocketFunding";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema, FormationPartySchema } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
+import { cancelFormationPayment, settleFormationPayment } from "../workflow/formationPayment";
 import type { OnboardingRunner } from "../workflow/runner";
 import { entityInScope, hasCapability } from "./scope";
 
@@ -898,11 +901,148 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           if ("error" in result)
             return { content: [{ type: "text", text: result.error }], isError: true };
           return {
-            content: [{ type: "text", text: JSON.stringify({ companyId: result.companyId }) }],
+            content: [
+              {
+                type: "text",
+                // The QUOTE rides along when this deployment charges (§6.1), in the SAME shape
+                // REST returns — a parity test asserts the key sets are identical, because an
+                // agent that got a companyId with no mention of a fee would report a company as
+                // created and leave a guardian with an unfileable draft.
+                text: JSON.stringify(
+                  result.quote
+                    ? { companyId: result.companyId, payment: result.quote }
+                    : { companyId: result.companyId },
+                ),
+              },
+            ],
           };
         } catch (e) {
           return { content: [{ type: "text", text: (e as Error).message }], isError: true };
         }
+      },
+    );
+  }
+
+  /**
+   * THE PAYMENT TOOLS (design §6, MCP parity).
+   *
+   * Registered only where this deployment CHARGES — a box in the beta has no payment resource at
+   * all, and an agent must not discover a tool whose every call would 404.
+   *
+   * ⚠ NO PII rides on any of them, and none is possible: a signature, an address and a company
+   * handle are the whole surface. The guardian's SIGNATURE, though, is the one thing an agent
+   * cannot produce for itself — it comes from a wallet a human controls — which is why
+   * `create_company`'s answer says so and `submit_company_payment` takes the signature as an
+   * argument rather than pretending to obtain one.
+   */
+  const paymentRunner = (company: import("../persistence/companyRepository").CompanyRecord) => {
+    const payment = deps.formation?.payment;
+    const executor = deps.formation?.paymentExecutor;
+    if (!payment?.required || !executor || !deps.companies) return undefined;
+    return {
+      companies: deps.companies,
+      payment,
+      executor,
+      transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
+      now: deps.now,
+      company,
+    };
+  };
+
+  /** Own the company, on the same terms `get_company` does — and narrow an entity-scoped key to
+   *  the one company its agent is filed under. One helper, three tools. */
+  const ownedCompany = (companyId: string) => {
+    const company = deps.companies?.findOwned(tenantId, companyId);
+    const only = scopedCompanyId(scope, deps.repo);
+    if (!company || (only !== null && company.companyId !== only)) return undefined;
+    return company;
+  };
+
+  if (deps.formation?.payment?.required && deps.companies) {
+    server.registerTool(
+      "get_company_payment",
+      {
+        title: "Get company payment",
+        description:
+          "What this company owes for its formation, and what has happened to the payment so far. While a quote is live and unexpired the answer carries `quote.typedData` — the exact EIP-712 message the GUARDIAN's wallet must sign (we cannot sign it; it authorizes a transfer of their USDC). A `settling` payment carries no quote on purpose: signing again while a broadcast is in flight would charge the guardian twice. Statuses: quoted (owed), settling (broadcast, outcome pending), settled (paid), expired (the window closed — request a new quote), failed (the transfer reverted on-chain), refunded.",
+        inputSchema: { companyId: z.string() },
+      },
+      async ({ companyId }) => {
+        if (!hasCapability(scope, "read")) return refuse("not authorized");
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const payment = deps.formation!.payment!;
+        const row = payment.payments.findCurrent(company.companyId, FORMATION_PRODUCT);
+        if (!row) return refuse("no payment for this company");
+        const now = Math.floor((deps.now ? deps.now() : Date.now()) / 1000);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(paymentView(row, guardianOf(company), payment, now)),
+            },
+          ],
+        };
+      },
+    );
+
+    server.registerTool(
+      "submit_company_payment",
+      {
+        title: "Submit company payment",
+        description:
+          "Submit the guardian's signature over the quote from get_company_payment, so we can put the transfer on-chain and the company becomes fileable. `signature` is what their wallet returned for `quote.typedData`; `from` is the guardian's address, which must be the wallet this company is owned by. Nothing else is accepted from you: the amount, the payee, the nonce and the expiry all come from the stored quote, so this call cannot change what is paid or to whom. Answers `settled` when the receipt confirmed, or `pending` when the transaction is in flight — in which case poll get_company_payment rather than signing again.",
+        inputSchema: { companyId: z.string(), signature: z.string(), from: z.string() },
+      },
+      async ({ companyId, signature, from }) => {
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const runner = paymentRunner(company);
+        if (!runner) return refuse("this deployment does not take formation payments");
+        const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+          settleFormationPayment(runner, company, {
+            signature: signature as `0x${string}`,
+            from: from as `0x${string}`,
+          }),
+        );
+        if (!result.ok) return refuse(result.reason);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ status: result.status, txHash: result.txHash }),
+            },
+          ],
+        };
+      },
+    );
+
+    server.registerTool(
+      "cancel_company_payment",
+      {
+        title: "Cancel company payment",
+        description:
+          "Withdraw a formation payment that is stuck, using a SECOND signature from the guardian — over `CancelAuthorization(authorizer, nonce)` against the USDC token's domain, with the nonce from get_company_payment. We cannot do this alone: the token verifies the guardian's signature, because the authorization is their promise and only they may take it back. Once it confirms, the payment is expired immediately and a new quote can be requested.",
+        inputSchema: { companyId: z.string(), signature: z.string() },
+      },
+      async ({ companyId, signature }) => {
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const runner = paymentRunner(company);
+        if (!runner) return refuse("this deployment does not take formation payments");
+        const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+          cancelFormationPayment(runner, company, { signature: signature as `0x${string}` }),
+        );
+        if (!result.ok) return refuse(result.reason);
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ status: "expired", txHash: result.txHash }) },
+          ],
+        };
       },
     );
   }
