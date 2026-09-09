@@ -468,13 +468,15 @@ Run in this order. Steps 1–3 are refused at boot if they are wrong, which is t
 3b. **Generate `FORMATION_SETTLE_SUBMITTER_KEY`** — a fresh key used for nothing else — and fund
    its address with a few USDC for gas. The KEY is redacted from the boot log; the ADDRESS and its
    balance are printed. If it collides with anything this box signs with, the boot refuses.
-4. **Pin the gas constants from the live probe.** `TRANSFER_WITH_AUTHORIZATION_GAS` (150_000) and
-   `CANCEL_AUTHORIZATION_GAS` (100_000) in `src/adapters/arc/gas.ts` are BOUNDED ESTIMATES until
-   `scripts/formation-settle-probe.mts` has printed a real `gasUsed`. Set each to the measured
-   figure plus ~20%. Unused gas is refunded, so being generous costs nothing and being short is a
-   reverted settle on a signature the guardian already gave.
+4. **The gas constants are already PINNED from the live probe** (2026-09-09, Arc testnet):
+   `TRANSFER_WITH_AUTHORIZATION_GAS = 140_000` (measured 117,079) and
+   `CANCEL_AUTHORIZATION_GAS = 86_000` (measured 71,265), in `src/adapters/arc/gas.ts`. Nothing to
+   do unless the token is upgraded — in which case re-run `scripts/formation-settle-probe.mts` and
+   set each to the new figure plus ~20%. Transcript and what it establishes:
+   `docs/runbooks/formation-settle-probe-2026-09.md`.
 5. `FORMATION_PAYMENT_REQUIRED=true`, restart, and confirm the boot line:
-   `⚠ FORMATION PAYMENTS ENABLED: $399 USDC to 0x… (USDC domain "USD Coin" v2, pinned on-chain)`.
+   `⚠ FORMATION PAYMENTS ENABLED: $399 USDC to 0x… (USDC domain "USDC" v2, pinned on-chain)`,
+   and the line after it naming the settle submitter and its gas balance.
    The domain is READ from the token and checked against its own `DOMAIN_SEPARATOR()` at boot — a
    box that cannot read it does not start, which is better than one that quotes a price for a
    signature it could not settle.
@@ -574,7 +576,10 @@ the executor path, confirms the receipt, reads back `authorizationState == true`
 `gasUsed`, and then signs and submits a `cancelAuthorization` for a SECOND unused nonce and
 confirms that too. It refuses any chain id that is not Arc testnet.
 
-The two `gasUsed` figures it prints are what step 4 of the flip-on checklist pins.
+The two `gasUsed` figures it prints are the ones step 4 of the flip-on checklist already carries —
+see `docs/runbooks/formation-settle-probe-2026-09.md` for the 2026-09-09 run, including the finding
+that Arc's token reports `name: "USDC"` and not the `"USD Coin"` every reference implementation
+quotes.
 
 ## Boot ordering (C4)
 

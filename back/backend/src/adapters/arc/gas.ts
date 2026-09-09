@@ -18,36 +18,36 @@ export const USDC_TRANSFER_GAS = 100_000n;
 /**
  * Explicit gas for `transferWithAuthorization` on Arc's USDC predeploy (design §6.4).
  *
+ * ⚠ MEASURED, not estimated. The live merge gate settled a real signed authorization on Arc
+ * testnet (chain 5042002) on 2026-09-09 — tx `0x2c5d0648b47cbd176825c51f7dab79f089c6eb5bac79f586
+ * 5365498d7dad61df` — and the receipt reported **gasUsed = 117,079**. 140,000 is that plus ~20%,
+ * which is the right side to be wrong on: unused gas is refunded, so being generous costs nothing
+ * and being short is a reverted settle on a signature the guardian already gave. The transcript
+ * is at `docs/runbooks/formation-settle-probe-2026-09.md`.
+ *
  * NOT the 100k above, and not for the same reason. `USDC_TRANSFER_GAS` exists because the SENDER
  * is paying gas in the very token it is transferring, so viem's fee-bearing estimate reserves the
  * balance and the estimate itself reverts. That footgun does NOT bite here: the token sender is
- * the GUARDIAN, and the account paying gas is the platform EXECUTOR, which sends no USDC in this
- * transaction and therefore always has its whole balance available to the estimate.
+ * the GUARDIAN, and the account paying gas is the dedicated SETTLE SUBMITTER, which sends no USDC
+ * in this transaction and therefore always has its whole balance available to an estimate.
  *
  * The explicit figure is here for the other reason an explicit figure is ever right — an estimate
  * is a round trip that can fail, be throttled, or answer against a state one block stale, on the
  * hot path of a payment that has already been signed. A settle that dies in `eth_estimateGas`
  * costs the guardian a wallet interaction and buys nothing.
  *
- * The WORK is genuinely more than a plain transfer: an `ecrecover`, the EIP-712 digest, a
- * `_authorizationStates` SSTORE from zero (the expensive kind — 20k), and then the balance
- * updates a transfer would have done anyway. FiatTokenV2_2's own gas reports put the call in the
- * 90–110k range, so a plain-transfer 100k has no headroom at all and a first-time SSTORE would
- * push a real call over it.
- *
- * ⚠ 150_000 is a BOUNDED ESTIMATE, not a measured one, and the live merge gate is what replaces
- * it with a measurement: `scripts/formation-settle-probe.mts` prints `gasUsed` from a real Arc
- * testnet receipt (§6.9). Pin this constant to that number + ~20% headroom before payment is ever
- * turned on. Unused gas is refunded, so the cost of being generous is zero and the cost of being
- * short is a reverted settle on a signature the guardian already gave.
+ * (The work, for anyone re-deriving it: an `ecrecover`, the EIP-712 digest, a
+ * `_authorizationStates` SSTORE from zero — the expensive kind — and then the balance updates a
+ * plain transfer would have done anyway. Which is why the plain-transfer 100k above has no
+ * headroom at all here.)
  */
-export const TRANSFER_WITH_AUTHORIZATION_GAS = 150_000n;
+export const TRANSFER_WITH_AUTHORIZATION_GAS = 140_000n;
 
 /**
  * Explicit gas for `cancelAuthorization` — the guardian's fast path out of a stuck payment.
  *
- * The same shape of work minus the transfer: an `ecrecover`, a digest, and the same
- * zero-to-non-zero SSTORE that marks the nonce used. Bounded the same way and pinned by the same
- * probe, which cancels a second unused nonce and prints ITS `gasUsed` too.
+ * ⚠ MEASURED the same way, in the same run: tx `0x33d591a90f490e7dd93e789ed065f0fd5e4397ccfdc4d3
+ * ee945291fd873948ff`, **gasUsed = 71,265**, +~20% = 86,000. The same shape of work minus the
+ * transfer: an `ecrecover`, a digest, and the same zero-to-non-zero SSTORE that retires the nonce.
  */
-export const CANCEL_AUTHORIZATION_GAS = 100_000n;
+export const CANCEL_AUTHORIZATION_GAS = 86_000n;
