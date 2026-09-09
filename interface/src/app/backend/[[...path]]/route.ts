@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server";
 import {
-  FORWARDED_REQUEST_HEADERS,
+  forwardedRequestHeaders,
   forwardedResponseHeaders,
   isNoStorePath,
 } from "../../../lib/proxyHeaders";
@@ -28,12 +28,15 @@ async function proxy(
 ): Promise<NextResponse> {
   const { path } = await ctx.params;
   const url = backendUrl(path, req.nextUrl.search);
+  const joined = path?.join("/") ?? "";
 
   // Both allowlists live in ../../../lib/proxyHeaders: "which headers cross the boundary" is a
   // security decision, and a Next.js route file cannot export it for review or for the backend's
-  // drift guard.
+  // drift guard. The REQUEST list is path-aware for one header — `if-none-match` on the public
+  // reference route — because dropping it makes that route's ETag decorative: the browser holds a
+  // validator it can never send, and every revalidation re-downloads the whole list.
   const headers = new Headers();
-  for (const name of FORWARDED_REQUEST_HEADERS) {
+  for (const name of forwardedRequestHeaders(joined)) {
     const value = req.headers.get(name);
     if (value) headers.set(name, value);
   }
@@ -50,7 +53,6 @@ async function proxy(
   // `content-length` is dropped whenever the response is encoded, because the backend's byte
   // count would then be a lie about the bytes on the wire — and a lying Content-Length truncates
   // the download rather than merely annoying the browser.
-  const joined = path?.join("/") ?? "";
   const outHeaders: Record<string, string> = {};
   for (const name of forwardedResponseHeaders(joined, res.headers)) {
     const v = res.headers.get(name);

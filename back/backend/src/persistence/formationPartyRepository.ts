@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { everSubmitted } from "../formation/freeze";
+import { PARTY_EDIT_ALLOWED_SQL, everSubmitted } from "../formation/freeze";
 import type { EncryptedSsn } from "../formation/pii";
 import type { SsnErasedReason } from "../formation/ssnErasure";
 import type { CompanyStatus } from "./companyRepository";
@@ -77,6 +77,29 @@ export type NewFormationParty = Omit<
 > & {
   partyId?: string;
 };
+
+/**
+ * The ten columns the party-edit door may rewrite (design §7, A3) — the identity, and nothing
+ * that decides what happens to it.
+ *
+ * Its own type rather than an `Omit` of `NewFormationParty`, so that what a caller may change is
+ * a positive list somebody wrote down. `tenant_id` (ownership), `synthetic` (a property of the
+ * DEPLOYMENT the party was created against), `company_id` (single-use, and this is not a re-bind)
+ * and every `ssn_*` column are absent by construction, not by subtraction.
+ */
+export type EditablePartyFields = Pick<
+  FormationPartyRecord,
+  | "legalFirstName"
+  | "legalLastName"
+  | "email"
+  | "phone"
+  | "line1"
+  | "line2"
+  | "city"
+  | "region"
+  | "postalCode"
+  | "country"
+>;
 
 interface Row {
   party_id: string;
@@ -173,6 +196,33 @@ export interface FormationPartyRepository {
    *  once — the return value says whether THIS caller made the binding, and a `false` is what
    *  rolls back the company insert it sits beside. */
   bindToCompany(partyId: string, companyId: string, tenantId: string): boolean;
+
+  /**
+   * REWRITE the identity, and NOTHING else (design §7, A3's party-edit door).
+   *
+   * The ten PII columns, tenant-scoped and refusing an erased row. Deliberately NOT in the
+   * statement: `company_id` (the bind is single-use and this is not a re-bind), `synthetic` (a
+   * property of the DEPLOYMENT the party was created against, never of a request), `tenant_id`,
+   * and every `ssn_*` column — an SSN is not editable here and never travels to this door, which
+   * is why there is no field for one to arrive in.
+   *
+   * Returns whether the row moved. WHEN it may move is `PARTY_EDIT_ALLOWED_SQL`, carried IN THE
+   * WHERE CLAUSE — the `INTAKE_FROZEN_SQL` precedent. It is a correlated subquery over a
+   * DIFFERENT table (the company's `create_provider` step), which is why it was left in
+   * TypeScript at first; but a rule that lives only above the write is a rule the next caller of
+   * this method has to remember, and `test/formation/freeze.test.ts` runs the two spellings over
+   * one matrix so they cannot drift. The domain function asks the TypeScript twin as well,
+   * because that is what produces the actionable refusal rather than a bare `false`.
+   *
+   * `companyId` is REQUIRED and is part of the WHERE: the door is company-addressed, and the
+   * statement will only move a party that is bound to the company the caller named.
+   */
+  update(
+    partyId: string,
+    tenantId: string,
+    companyId: string,
+    fields: EditablePartyFields,
+  ): boolean;
   /** The bound party for a company — what `create_provider` files with. */
   findByCompanyId(companyId: string): FormationPartyRecord | undefined;
   /**
@@ -256,6 +306,20 @@ export interface FormationPartyRepository {
 
   /** Every party still holding an SSN, with what the TTL clock needs to judge it (§4.6a). */
   listSsnRetention(): SsnRetentionRow[];
+
+  /**
+   * The §4.6a DECISION STATE of a company's responsible party — an enum and a boolean, and
+   * deliberately nothing else (A3).
+   *
+   * `awaitsSsnDecision` (formation/freeze.ts) is the predicate; this is the half of its input
+   * that lives in the PII table. It exists as its own method rather than as a `findByCompanyId`
+   * at the call site because the company detail VIEW asks it, and a view holding a whole party
+   * record is a legal name one careless spread away from a response body. Undefined = no party
+   * (or an erased one), which is not a state that can be waiting for a decision.
+   */
+  ssnState(
+    companyId: string,
+  ): { ssnErasedReason: SsnErasedReason | null; hasSsn: boolean } | undefined;
 }
 
 export class SqliteFormationPartyRepository implements FormationPartyRepository {
@@ -278,6 +342,24 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
       bindToCompany: db.prepare(
         `UPDATE formation_parties SET company_id = ?
           WHERE party_id = ? AND tenant_id = ? AND company_id IS NULL AND deleted_at IS NULL`,
+      ),
+      // The ten PII columns and nothing else — see the interface comment for what is deliberately
+      // absent from this list.
+      update: db.prepare(
+        `UPDATE formation_parties
+            SET legal_first_name = @legal_first_name, legal_last_name = @legal_last_name,
+                email = @email, phone = @phone,
+                line1 = @line1, line2 = @line2, city = @city, region = @region,
+                postal_code = @postal_code, country = @country
+          WHERE party_id = @party_id AND tenant_id = @tenant_id
+            AND company_id = @company_id
+            AND deleted_at IS NULL
+            -- THE FREEZE, in the statement itself (design §7, A3) — the INTAKE_FROZEN_SQL
+            -- precedent, one predicate along. The domain function asks the TypeScript twin so it
+            -- can return the actionable refusal; this is the lock that holds for a caller who
+            -- reaches this method some other way, which is the failure mode a check living only
+            -- above the write has always had.
+            AND ${PARTY_EDIT_ALLOWED_SQL}`,
       ),
       findByCompany: db.prepare(
         "SELECT * FROM formation_parties WHERE company_id = ? AND deleted_at IS NULL",
@@ -371,6 +453,13 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
         `UPDATE formation_parties SET ssn_erased_reason = 'none'
           WHERE company_id = ? AND deleted_at IS NULL AND ssn_ciphertext IS NULL`,
       ),
+      // The §4.6a decision state, with NO personal column in the SELECT list at all: an enum and
+      // a NULL-check, which is the whole of what `awaitsSsnDecision` reads.
+      ssnState: db.prepare(
+        `SELECT ssn_erased_reason AS reason, ssn_ciphertext IS NOT NULL AS has_ssn
+           FROM formation_parties
+          WHERE company_id = ? AND deleted_at IS NULL`,
+      ),
       // Only rows that still HOLD an SSN — a handful at any moment, being exactly the companies
       // between an intake and a `provider_ref`.
       ssnRetention: db.prepare(
@@ -422,6 +511,31 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
     // believe they own it, and the `company_id` UNIQUE index is the second lock (one party per
     // company, one company per party).
     return this.stmts.bindToCompany.run(companyId, partyId, tenantId).changes === 1;
+  }
+
+  update(
+    partyId: string,
+    tenantId: string,
+    companyId: string,
+    fields: EditablePartyFields,
+  ): boolean {
+    return (
+      this.stmts.update.run({
+        party_id: partyId,
+        tenant_id: tenantId,
+        company_id: companyId,
+        legal_first_name: fields.legalFirstName,
+        legal_last_name: fields.legalLastName,
+        email: fields.email,
+        phone: fields.phone,
+        line1: fields.line1,
+        line2: fields.line2,
+        city: fields.city,
+        region: fields.region,
+        postal_code: fields.postalCode,
+        country: fields.country,
+      }).changes === 1
+    );
   }
 
   findByCompanyId(companyId: string): FormationPartyRecord | undefined {
@@ -483,6 +597,17 @@ export class SqliteFormationPartyRepository implements FormationPartyRepository 
 
   proceedWithoutSsn(companyId: string): boolean {
     return this.stmts.proceedWithoutSsn.run(companyId).changes === 1;
+  }
+
+  ssnState(
+    companyId: string,
+  ): { ssnErasedReason: SsnErasedReason | null; hasSsn: boolean } | undefined {
+    const r = this.stmts.ssnState.get(companyId) as
+      | { reason: string | null; has_ssn: number }
+      | undefined;
+    return r
+      ? { ssnErasedReason: (r.reason as SsnErasedReason | null) ?? null, hasSsn: r.has_ssn === 1 }
+      : undefined;
   }
 
   listSsnRetention(): SsnRetentionRow[] {

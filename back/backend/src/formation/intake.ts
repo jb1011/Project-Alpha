@@ -114,7 +114,18 @@ export const PURPOSE_MAX_LENGTH = 500;
  * Accented letters are OUT for the same reason — the Secretary of State's published standard is
  * English letters and Arabic numerals, and a canonicalized "Café" would be filed as typed.
  */
-const NAME_CHARSET = /^[A-Za-z0-9 &'\-,.()+]*$/;
+/**
+ * The class body, as a SOURCE STRING — so `GET /formation/rules` can serve it and the browser can
+ * compile the same rule rather than keeping a second copy of it (§5/§7).
+ *
+ * A string rather than the `RegExp` because a regex does not survive JSON, and the CLASS BODY
+ * rather than a whole pattern because the client must not be handed an anchor, a flag set or a
+ * quantifier it did not choose: it compiles `^[…]$` around this and tests one character at a
+ * time, exactly as `firstIllegalNameChar` does below.
+ */
+export const NAME_CHARSET_SOURCE = "A-Za-z0-9 &'\\-,.()+";
+
+const NAME_CHARSET = new RegExp(`^[${NAME_CHARSET_SOURCE}]*$`);
 
 /** The first character the charset refuses, or null. Returned rather than a boolean so the
  *  refusal can name it. */
@@ -142,20 +153,6 @@ export interface CompanyIntake {
   industryLabel: string;
   /** True = the values above were DERIVED (the migration or the A1 shim), not typed by a human. */
   synthesized: boolean;
-}
-
-/**
- * The A1 intake: one name candidate derived from the agent's name, the default purpose and the
- * default industry, marked `synthesized` on the ROW (never as a key inside `name_options`, which
- * keeps exactly one shape).
- */
-export function synthesizeIntake(agentName: string, description?: string | null): CompanyIntake {
-  return {
-    nameOptions: companyNameOptions(agentName),
-    businessPurpose: description?.trim() || DEFAULT_DESCRIPTION,
-    industryLabel: DEFAULT_INDUSTRY,
-    synthesized: true,
-  };
 }
 
 /** What the company row pins a filing to. Written from the DEPLOYMENT, never from caller input. */

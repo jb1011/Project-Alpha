@@ -8,9 +8,10 @@ import {
   createFormationParty,
   formationDoorRefusal,
   formationUnavailableMessage,
+  partyFieldsOf,
   truncateTenant,
 } from "../../formation";
-import { createCompany, updateCompanyIntake } from "../../formation/company";
+import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../formation/company";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
 import {
@@ -21,8 +22,8 @@ import {
   firstIssueMessage,
 } from "../../policy/agentSpec";
 import type { ApiDeps } from "../app";
-import { ApiError } from "../errors";
-import { listCompanyViews, toEntityView, toEntityViews } from "../views";
+import { ApiError, requireOwnedCompany } from "../errors";
+import { listCompanyViews, toCompanyDetailView, toEntityView, toEntityViews } from "../views";
 import { assertGuardianAllowed } from "./worldId";
 
 export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
@@ -55,11 +56,16 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     if (custody === "turnkey" && !deps.turnkeyCustodyAvailable)
       throw new ApiError("validation_error", 400, custodyUnavailableMessage("turnkey"));
 
-    // Formation gate (design §2/§5): AFTER custody, BEFORE the World gate. The order is mirrored
-    // exactly by the MCP onboard_agent tool, and the checks themselves live in ONE function so
-    // the two surfaces cannot drift — see src/formation.ts. Everything it refuses is refused
-    // BEFORE the claim: formation is real money in production, and an entity must never be left
-    // live with a mandatory formation that can never happen.
+    // Formation gate (design §2/§5/§7): AFTER custody, BEFORE the World gate. The order is
+    // mirrored exactly by the MCP onboard_agent tool, and the checks themselves live in ONE
+    // function so the two surfaces cannot drift — see src/formation.ts. Everything it refuses is
+    // refused BEFORE the claim: an entity must never be left live with a mandatory formation that
+    // can never happen.
+    //
+    // `partyId` is still READ, and it is read in order to be REFUSED (A3). The A1 shim used to
+    // turn one into a 1:1 company inside the claim; with the shim gone, silently ignoring the
+    // field would accept an onboard from a caller who had just posted a real legal identity and
+    // believed it was being filed. `formationDoorRefusal` answers it with the door that files.
     if (body.partyId !== undefined && typeof body.partyId !== "string")
       throw new ApiError("validation_error", 400, "partyId must be a string");
     if (body.companyId !== undefined && typeof body.companyId !== "string")
@@ -95,7 +101,6 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       tenantId: getAddress(tenantId),
       guardianPasskey: body.guardianPasskey as GuardianPasskey,
       custody,
-      partyId,
       companyId,
     });
     return c.json({ id, status }, 202);
@@ -205,6 +210,24 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
   });
 
   /**
+   * ONE COMPANY, in full (design §7) — what the Companies section's detail page reads.
+   *
+   * Registered wherever a company STORE is, exactly like `GET /companies` and for the same
+   * reason: a box whose doola credentials have been pulled still holds real Wyoming LLCs, and a
+   * tenant must be able to read the filings they already have. It is `deps.companies`, not
+   * `deps.formation`, that gates it.
+   *
+   * `requireOwnedCompany` answers the same uniform 404 for unknown and not-yours that every other
+   * ownership check in this file does.
+   */
+  app.get("/companies/:companyId", (c) => {
+    const company = requireOwnedCompany(deps, c);
+    // The SHARED deps object, narrowed only where the route already proved the store exists:
+    // `requireOwnedCompany` answered a 404 without it.
+    return c.json(toCompanyDetailView({ ...deps, companies: deps.companies! }, company));
+  });
+
+  /**
    * PII intake (design §3/§5). The ONE place a legal identity enters the system.
    *
    * It is a separate call, not a field on /onboard, because PII must never ride in `spec`
@@ -242,6 +265,45 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       partyId: result.partyId,
     });
     return c.json({ partyId: result.partyId }, 201);
+  });
+
+  /**
+   * PATCH /companies/:companyId/party — the PARTY-EDIT DOOR (design §7, A3).
+   *
+   * The exit A2 wrote a park for and could not give: a company whose `createCustomer` doola
+   * REJECTED parks under `awaitingPartyEdit`, and none of the four fields `PATCH /companies/:id`
+   * rewrites is one `createCustomer` reads. This door rewrites the identity and re-arms exactly
+   * one retry, in one transaction.
+   *
+   * ⚠ ADDRESSED BY COMPANY, not by party handle. The party is RESOLVED from the company's UNIQUE
+   * `company_id`, so the door cannot reach another company's responsible person at all — where a
+   * `partyId` address made that a rule to enforce rather than a sentence nobody can write. It
+   * also removes the uuid the form had to ask a human to paste, which no surface in this system
+   * serves back.
+   *
+   * It takes the SAME body as `POST /formation-party`, parsed by the SAME `.strict()` schema, so
+   * a field the create refuses is not quietly accepted by the edit. It takes NO `ssn` — there is
+   * no field for one — and the response is the handle and nothing else, for the reason the create
+   * gives: echoing a stored identity back puts it in a response body and in every client that
+   * caches one.
+   */
+  app.patch("/companies/:companyId/party", async (c) => {
+    const tenantId = c.get("tenantId");
+    if (!deps.formation) throw new ApiError("unavailable", 503, formationUnavailableMessage());
+
+    // ZodError -> 400, exactly as the create does. There is deliberately no `synthetic` shortcut:
+    // the labeled sandbox fixture is ours, not a caller's, and re-typing it would be a caller
+    // writing a fixture we generate.
+    const body = FormationPartySchema.parse(await readJson(c));
+    const result = updateCompanyParty(
+      { ...deps.formation.companyDeps, transaction: (fn) => deps.repo.transaction(fn) },
+      tenantId,
+      c.req.param("companyId"),
+      // The SAME wire→column mapping the create door and the MCP twin use.
+      partyFieldsOf(body),
+    );
+    if ("error" in result) throw new ApiError("validation_error", 400, result.error);
+    return c.json({ partyId: result.partyId });
   });
 
   // The batched projection: one formation-steps read and one documents read for the whole page,

@@ -5,7 +5,13 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
 import { assertGuardianAllowed } from "../api/routes/worldId";
-import { type EntityViewDeps, listCompanyViews, toEntityView, toEntityViews } from "../api/views";
+import {
+  type EntityViewDeps,
+  listCompanyViews,
+  toCompanyDetailView,
+  toEntityView,
+  toEntityViews,
+} from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
 import {
   createFormationParty,
@@ -14,7 +20,8 @@ import {
   ssnNotOnThisDoorMessage,
   truncateTenant,
 } from "../formation";
-import { createCompany } from "../formation/company";
+import { partyFieldsOf } from "../formation";
+import { createCompany, updateCompanyParty } from "../formation/company";
 import { describeIndustryLabels } from "../formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
@@ -89,10 +96,64 @@ export interface McpToolDeps extends EntityViewDeps {
 }
 
 /**
+ * EVERY KEY OF `McpToolDeps` THAT IS COPIED VERBATIM — and a COMPILE ERROR if one is missing.
+ *
+ * `ENTITY_VIEW_DEP_KEYS`, one object out. The transport enumerated these by hand and dropped two
+ * of them without a sound: the document index first (`get_entity` over MCP described an entity
+ * with no legal documents while REST described the same entity with two), and then `now` — the
+ * injectable clock, which every REST surface honours and which the MCP tools therefore could not
+ * be tested against or frozen for. A hand-written pick is a subset by default, and the field it
+ * omits is always the one added last.
+ *
+ * `ens` is deliberately ABSENT from this list: it is the one dependency the MCP layer takes a
+ * NARROWING of rather than a copy, because `ApiDeps["ens"]` carries the gateway's signing account
+ * and the tools have no business holding a private key. `mcpToolDepsOf` constructs it, and the
+ * exhaustiveness check below excludes it by name so that omission is a decision somebody wrote
+ * down rather than a gap.
+ */
+export const MCP_TOOL_DEP_KEYS = [
+  "repo",
+  "runner",
+  "passkeys",
+  "walletProviderDefault",
+  "circleCustodyAvailable",
+  "turnkeyCustodyAvailable",
+  "platformManagerAddress",
+  "jobs",
+  "payments",
+  "pocketFunding",
+  "jobRunner",
+  "jobClientAddress",
+  "jobEvaluatorAddress",
+  "maxJobBudget",
+  "maxInflightJobsPerTenant",
+  "linkCodes",
+  "arc",
+  "worldId",
+  "formation",
+  "companies",
+  "formationSteps",
+  "now",
+  // The `EntityViewDeps` half — inherited, and listed here too because this list is about what
+  // the TRANSPORT copies, and a view dep that reached REST and not MCP is the bug that started
+  // all of this (A3's sharing label, field for field).
+  "formationStepsMany",
+  "company",
+  "companyMany",
+  "documents",
+  "companyAgents",
+] as const satisfies readonly (keyof McpToolDeps)[];
+
+/** Fails to compile the moment `McpToolDeps` grows a key that is neither listed nor `ens`. */
+type MissingMcpToolDep = Exclude<keyof McpToolDeps, (typeof MCP_TOOL_DEP_KEYS)[number] | "ens">;
+const _assertEveryMcpToolDepListed: MissingMcpToolDep extends never ? true : never = true;
+void _assertEveryMcpToolDepListed;
+
+/**
  * Availability sentence for the onboard_agent description — agent-first callers have no GET
  * /config, so the tool description is their capability discovery surface. The formation note
  * follows the same pattern for the same reason: an agent that cannot read /config must still be
- * able to learn that this deployment will refuse an onboard without a partyId, and in WHICH
+ * able to learn that this deployment will refuse an onboard without a companyId, and in WHICH
  * environment it files (the honesty invariant reaches the agent surface too).
  */
 function custodyCapabilityNote(
@@ -146,6 +207,70 @@ function formationCapabilityNote(deps: Pick<McpToolDeps, "formation">): string {
     ? "This deployment files with a labeled SYNTHETIC sandbox identity: pass synthetic:true and no personal data — real personal data is refused."
     : "This deployment files real legal entities: real personal data is required and synthetic:true is refused.";
   return `Formation is ${deps.formation.required ? "REQUIRED" : "available"} on this deployment (doola, ${deps.formation.environment}). ${identity}`;
+}
+
+/**
+ * THE COMPANY an ENTITY-SCOPED key may see — `entityInScope`, one key along (§7).
+ *
+ * `get_entity` and `list_entities` have narrowed to the key's own entity since the scoped-key
+ * surface shipped. The two COMPANY reads were added without the equivalent, and a company is a
+ * strictly wider object than the entity that points at it: an entity-scoped key could enumerate
+ * every legal body its tenant owns and read any of them in full, including the ids and names of
+ * every SIBLING agent attached. That is the fleet shape `/transparency` deliberately does not
+ * publish, handed to a credential whose owner narrowed it on purpose.
+ *
+ * Returns `null` for a tenant-wide key — "no restriction" — and the entity's `company_id`
+ * otherwise, which is `undefined` when the entity is unknown or attached to nothing. `undefined`
+ * therefore matches no company at all, which is the right answer: an agent with no company has
+ * no company to read.
+ */
+function scopedCompanyId(
+  scope: VerifiedKey,
+  repo: Pick<EntityRepository, "findByIdempotencyKey">,
+): string | null | undefined {
+  if (scope.entityId === null) return null;
+  return repo.findByIdempotencyKey(scope.entityId)?.companyId ?? undefined;
+}
+
+/** What a refused tool call looks like. One shape, so the guards below can compose. */
+type ToolRefusal = { content: { type: "text"; text: string }[]; isError: true };
+
+const refuse = (text: string): ToolRefusal => ({
+  content: [{ type: "text", text }],
+  isError: true,
+});
+
+/**
+ * THE PROVISIONING RUNG, asked once (§7).
+ *
+ * Four tools sit on it — `create_formation_party`, `create_company`, `update_company_party` and
+ * `onboard_agent` — and every one of them spelled `if (!hasCapability(scope, "provision") ||
+ * scope.entityId !== null) return { … "not authorized" … }` for itself. Both halves matter and
+ * both are easy to half-write: "provision" is the top rung (these calls commit a tenant to a real
+ * filing or provision a platform resource), and a TENANT-WIDE key is required because they create
+ * something rather than acting on an existing entity — an entity-scoped key has no business
+ * minting a second one. `null` = allowed.
+ */
+function requireProvisionTenantWide(scope: VerifiedKey): ToolRefusal | null {
+  if (!hasCapability(scope, "provision") || scope.entityId !== null)
+    return refuse("not authorized");
+  return null;
+}
+
+/**
+ * ⚠ AN `ssn` ARGUMENT IS REFUSED, on every tool that declares one (§4.1).
+ *
+ * The field is declared IN ORDER TO BE REFUSED: an undeclared field is not rejected by the SDK,
+ * it is silently STRIPPED by the tool's zod schema before the handler runs — so a model that read
+ * "US persons should supply an SSN" on the web form and helpfully passed one here would have got
+ * back a success, with the number still sitting in the client's context window and its logs,
+ * which is the entire harm §4.1 exists to prevent.
+ *
+ * Called FIRST in each handler, before any other validation, so the refusal is the whole answer
+ * and nothing exists afterwards for the caller to clean up. `null` = no ssn was passed.
+ */
+function refuseSsn(args: unknown): ToolRefusal | null {
+  return (args as { ssn?: unknown }).ssn !== undefined ? refuse(ssnNotOnThisDoorMessage()) : null;
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -561,13 +686,25 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
    * The identity travels in its OWN tool call, never inside `spec` — spec_json is persisted and
    * rendered — and the response is the handle alone: echoing the stored identity back would put
    * PII in a tool result, a transcript, and any client that logs them.
+   *
+   * ⚠ It DECLARES `ssn` IN ORDER TO REFUSE IT (§4.1), exactly like `create_company` and
+   * `update_company_party`. This is the door a model reaches with an identity in hand, so it is
+   * the likeliest of the three to be handed one — and an UNDECLARED field is not rejected by the
+   * SDK, it is silently STRIPPED by the tool's zod parse before the handler runs. A model that
+   * read "US persons should supply an SSN" on the web form and helpfully passed one here got back
+   * a partyId, with the number thrown away and still sitting in the client's context window and
+   * its logs, which is the entire harm §4.1 exists to prevent.
+   *
+   * Where it DOES belong: an SSN is sealed under an AAD of `party_id || company_id`, so it is
+   * captured by `POST /companies` (which mints the pair) and re-captured by
+   * `PATCH /companies/:companyId`. Never here, and never over MCP at all.
    */
   if (deps.formation)
     server.registerTool(
       "create_formation_party",
       {
         title: "Create formation party",
-        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to onboard_agent. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in onboard_agent's spec. A real party requires legalFirstName, legalLastName, email, PHONE and address (doola will not file a responsible party without a phone number). The response contains the handle and nothing else.`,
+        description: `Register the legal identity of the natural person your agent's legal entity will be filed under, and get back an opaque partyId to pass to create_company. ${formationCapabilityNote(deps)} Personal data belongs ONLY in this call — never in create_company's arguments and never in onboard_agent's spec. A real party requires legalFirstName, legalLastName, email, PHONE and address (doola will not file a responsible party without a phone number). ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs; the field is declared only so that passing one is REFUSED rather than silently dropped. An SSN is collected only by the web form (POST /companies), which mints the (party, company) pair it is sealed under. The response contains the handle and nothing else.`,
         inputSchema: {
           /** The sandbox shortcut: no personal data at all. */
           synthetic: z.boolean().optional(),
@@ -579,15 +716,23 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
            *  a responsible party with no phone. */
           phone: z.string().optional(),
           address: z.record(z.unknown()).optional(),
+          /** ⚠ DECLARED IN ORDER TO BE REFUSED (§4.1) — see the block comment above. */
+          ssn: z.string().optional(),
         },
       },
       async (args) => {
         // "provision" — the same rung onboard_agent sits on, and for the same reason: this call
-        // is a step of provisioning a legal body, and it commits the tenant to a real filing.
-        if (!hasCapability(scope, "provision") || scope.entityId !== null)
-          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        // is a step of provisioning a legal body, and it commits the tenant to a real filing. Then
+        // the ssn, BEFORE anything is created, so the refusal is the whole answer and nothing
+        // exists afterwards for the caller to clean up. Same order, same sentence, as the other
+        // two PII doors.
+        const denied = requireProvisionTenantWide(scope) ?? refuseSsn(args);
+        if (denied) return denied;
         try {
-          const { synthetic, ...body } = args as Record<string, unknown>;
+          // `ssn` is destructured OUT as well as refused above: `FormationPartySchema` is
+          // `.strict()`, so a key that reached it would be a validation error rather than the
+          // sentence that says where the field belongs.
+          const { synthetic, ssn: _ssn, ...body } = args as Record<string, unknown>;
           // The synthetic shortcut carries no PII, so it is never parsed as a party body.
           const parsed = synthetic === true ? undefined : FormationPartySchema.parse(body);
           const result = createFormationParty(
@@ -604,6 +749,79 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             tenantId: truncateTenant(tenantId),
             partyId: result.partyId,
           });
+          return { content: [{ type: "text", text: JSON.stringify({ partyId: result.partyId }) }] };
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+        }
+      },
+    );
+
+  /**
+   * `update_company_party` — the MCP twin of `PATCH /companies/:companyId/party` (design §7, A3).
+   *
+   * The one door that reopens a company doola refused on its PARTY, and it exists on BOTH
+   * surfaces because an agent-first caller who registered an identity through
+   * `create_formation_party` can equally have it refused, and a park with a browser-only exit is
+   * a park an agent cannot leave.
+   *
+   * ⚠ ADDRESSED BY COMPANY. It took a `partyId` first, which let a mistyped handle rewrite the
+   * responsible person of a DIFFERENT company mid-filing — a rule to enforce rather than a
+   * sentence nobody can write. The party is resolved from the company's UNIQUE `company_id`, and
+   * `companyId` is the id `get_company` already hands the caller for the park it is fixing.
+   *
+   * ⚠ It takes NO `ssn`, and — exactly like `create_company` — the field is DECLARED so that
+   * passing one is refused rather than silently stripped (A2's finding 1, and this door reached
+   * the same bug on its own: the first version left `ssn` undeclared on the reasoning that
+   * nothing an SSN could mean here, and a test proved that a model passing one got back a
+   * success while the number sat in its context window and its logs. "There was nothing it could
+   * mean" is precisely why the caller has to be TOLD, not quietly agreed with.)
+   *
+   * Where it does belong: an SSN is sealed under an AAD of `party_id || company_id`, so it is
+   * captured by `POST /companies` (which mints the pair) and re-captured by
+   * `PATCH /companies/:companyId`. Never here, and never over MCP at all.
+   */
+  if (deps.formation)
+    server.registerTool(
+      "update_company_party",
+      {
+        title: "Update the company's responsible party",
+        description: `Correct the legal identity of the responsible person on a filing the provider REFUSED — the one exit from a company parked on awaitingPartyEdit (see get_company). It is addressed by companyId: the party is the one this company was filed with, so no other company's person can be touched. Editable only until the filing has been sent: once the provider has the person, it is never asked for them again, and an edit here would change our copy and nothing else. Takes the same identity fields as create_formation_party and NEVER an ssn — an SSN is collected only by the web form, which is also the only place it can be re-captured. ${formationCapabilityNote(deps)} The response contains the handle and nothing else.`,
+        inputSchema: {
+          companyId: z.string(),
+          legalFirstName: z.string(),
+          legalLastName: z.string(),
+          email: z.string(),
+          /** REQUIRED, exactly as at intake (C6): doola will not file a party with no phone. */
+          phone: z.string(),
+          address: z.record(z.unknown()),
+          /** ⚠ DECLARED IN ORDER TO BE REFUSED (§4.1) — see the block comment above. */
+          ssn: z.string().optional(),
+        },
+      },
+      async (args) => {
+        // The same rung `create_formation_party` sits on: this call decides whose identity a real
+        // Wyoming filing names. And the ssn refusal BEFORE anything else, so it is the whole
+        // answer — same order, same sentence, as `create_company`.
+        const denied = requireProvisionTenantWide(scope) ?? refuseSsn(args);
+        if (denied) return denied;
+        try {
+          const { companyId, ssn: _ssn, ...rest } = args as Record<string, unknown>;
+          // The SAME `.strict()` schema the create parses, so a field one door refuses cannot be
+          // quietly accepted by the other — and an `ssn` key is refused BY that strictness rather
+          // than by a check somebody has to remember to write.
+          const body = FormationPartySchema.parse(rest);
+          const result = updateCompanyParty(
+            {
+              ...deps.formation!.companyDeps,
+              transaction: (fn) => deps.repo.transaction(fn),
+            },
+            tenantId,
+            companyId as string,
+            // The SAME wire→column mapping the REST door and the create use.
+            partyFieldsOf(body),
+          );
+          if ("error" in result)
+            return { content: [{ type: "text", text: result.error }], isError: true };
           return { content: [{ type: "text", text: JSON.stringify({ partyId: result.partyId }) }] };
         } catch (e) {
           return { content: [{ type: "text", text: (e as Error).message }], isError: true };
@@ -656,12 +874,11 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         },
       },
       async ({ partyId, names, businessPurpose, industryLabel, synthetic, ssn }) => {
-        if (!hasCapability(scope, "provision") || scope.entityId !== null)
-          return { content: [{ type: "text", text: "not authorized" }], isError: true };
-        // BEFORE anything is created, and before any other validation: the refusal must be the
-        // whole answer, so that nothing exists afterwards for the caller to have to clean up.
-        if (ssn !== undefined)
-          return { content: [{ type: "text", text: ssnNotOnThisDoorMessage() }], isError: true };
+        // The rung, then the ssn — the latter BEFORE anything is created and before any other
+        // validation, so the refusal is the whole answer and nothing exists afterwards for the
+        // caller to have to clean up.
+        const denied = requireProvisionTenantWide(scope) ?? refuseSsn({ ssn });
+        if (denied) return denied;
         try {
           const result = createCompany(
             // The composition root's ONE dependency set; this door supplies only its transaction.
@@ -711,17 +928,69 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       async () => {
         if (!hasCapability(scope, "read"))
           return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        // The SAME projection REST `GET /companies` renders — literally the same function,
+        // because the two are one API-level contract (the picker's ordering and its labels) and
+        // two literals is how the agent surface quietly ended up dropping the business purpose,
+        // the industry and both filing facts.
+        const rows = listCompanyViews({ ...deps, companies: deps.companies! }, tenantId);
+        // …and then `entityInScope`'s rule, one key along: a key minted for ONE agent lists the
+        // one company that agent is filed under, never its tenant's whole fleet.
+        const only = scopedCompanyId(scope, deps.repo);
+        const companies = only === null ? rows : rows.filter((r) => r.companyId === only);
+        return { content: [{ type: "text", text: JSON.stringify({ companies }) }] };
+      },
+    );
+  }
+
+  /**
+   * `get_company` — the MCP twin of REST `GET /companies/:companyId`, rendered by the SAME
+   * function over the SAME dependency object (§7).
+   *
+   * Registered beside `list_companies` and gated the same way, on the company STORE rather than
+   * on `deps.formation`: reading the legal bodies you already own is not a formation capability.
+   *
+   * A parity test asserts the two doors answer with an identical key set. That is not ceremony —
+   * `list_companies` had already silently drifted from `GET /companies` once, dropping the
+   * business purpose, the industry and both filing facts, and nothing failed: the agent surface
+   * was simply less true than the browser one.
+   */
+  if (deps.companies) {
+    server.registerTool(
+      "get_company",
+      {
+        title: "Get company",
+        description:
+          "Fetch one of your legal bodies in full: its filing state, the documents filed for it, the agents attached to it, and — if the filing has STOPPED — which of the three human decisions it is waiting on. A parked company does nothing until its owner acts: awaitingIntakeEdit is fixed by re-submitting names/purpose/industry, awaitingPartyEdit by correcting the responsible party, awaitingSsnDecision by re-supplying an SSN or confirming the slower EIN route. The last two go through the web form and update_company_party respectively; an SSN is never an argument here.",
+        inputSchema: { companyId: z.string() },
+      },
+      async ({ companyId }) => {
+        if (!hasCapability(scope, "read"))
+          return { content: [{ type: "text", text: "not authorized" }], isError: true };
+        // Tenant-scoped, and the SAME uniform answer REST gives: unknown and not-yours are one
+        // reply, or the tool becomes an existence oracle over other tenants' company ids.
+        const company = deps.companies!.findOwned(tenantId, companyId);
+        // …and an ENTITY-scoped key reads only the company its own agent is filed under, with the
+        // SAME uniform answer for "not yours" — a third reply here would make the tool an oracle
+        // over the rest of its own tenant's fleet, which is precisely what narrowing a key is for.
+        const only = scopedCompanyId(scope, deps.repo);
+        if (!company || (only !== null && company.companyId !== only))
+          return { content: [{ type: "text", text: "company not found" }], isError: true };
+        const view = toCompanyDetailView({ ...deps, companies: deps.companies! }, company);
         return {
           content: [
             {
               type: "text",
-              // The SAME projection REST `GET /companies` renders — literally the same function,
-              // because the two are one API-level contract (the picker's ordering and its
-              // labels) and two literals is how the agent surface quietly ended up dropping the
-              // business purpose, the industry and both filing facts.
-              text: JSON.stringify({
-                companies: listCompanyViews({ ...deps, companies: deps.companies! }, tenantId),
-              }),
+              text: JSON.stringify(
+                only === null
+                  ? view
+                  : {
+                      ...view,
+                      // WHICH agents share the filing is withheld; HOW MANY is not. The count is
+                      // already on this key's own `get_entity` (`sharedWith`), so redacting it
+                      // would buy nothing and a `1` here would be a lie.
+                      attachedAgents: view.attachedAgents.filter((a) => a.id === scope.entityId),
+                    },
+              ),
             },
           ],
         };
@@ -733,19 +1002,29 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     "onboard_agent",
     {
       title: "Onboard agent",
-      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} companyId attaches this agent to a company you already own (free, and the fastest path — see list_companies); partyId instead creates a fresh 1:1 company for a new legal identity. Never put personal data in spec. ${formationCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
+      description: `Create an agent legal body. spec must match schema://agent-spec; the guardian is set automatically to your tenant and the manager is set automatically to the platform manager account — you don't need to know or supply either. passkeyId references a previously stored guardian passkey (POST /passkey). custody optionally picks the operator key custody: 'circle' (Novi-managed smart account, gasless) or 'turnkey' (guardian-passkey-rooted key vault) — omitted uses the platform default ${custodyCapabilityNote(deps)} companyId attaches this agent to a company you already own and is REQUIRED wherever formation is: attaching is free, and a company is created at its own door (create_company, after create_formation_party) — see list_companies for the ones you have. partyId is NOT accepted here and never will be; passing one is refused, not ignored. Never put personal data in spec. ${formationCapabilityNote(deps)} Returns immediately with status 'pending' — poll get_entity until 'bound'. Requires the provision capability and a tenant-wide key.`,
       inputSchema: {
         spec: z.record(z.unknown()),
         passkeyId: z.string(),
         idempotencyKey: z.string().optional(),
         custody: z.enum(["turnkey", "circle"]).optional(),
+        /**
+         * ⚠ DECLARED IN ORDER TO BE REFUSED (A3), exactly like `ssn` on `create_company`.
+         *
+         * A1's shim minted a 1:1 company for a party-only onboard; A3 removed it, so this door
+         * attaches and never creates. An UNDECLARED field is not rejected by the SDK — it is
+         * silently STRIPPED before the handler runs, because the tool's zod schema discards what
+         * it does not know. A model that had just called `create_formation_party` and passed the
+         * handle here would therefore have got back an entity id, with nothing filed and no
+         * indication that the identity it registered was going nowhere.
+         */
         partyId: z.string().optional(),
         companyId: z.string().optional(),
       },
     },
     async ({ spec, passkeyId, idempotencyKey, custody, partyId, companyId }) => {
-      if (!hasCapability(scope, "provision") || scope.entityId !== null)
-        return { content: [{ type: "text", text: "not authorized" }], isError: true };
+      const denied = requireProvisionTenantWide(scope);
+      if (denied) return denied;
       const passkey = deps.passkeys.get(tenantId, passkeyId);
       if (!passkey)
         return { content: [{ type: "text", text: "passkey handle not found" }], isError: true };
@@ -765,8 +1044,13 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             isError: true,
           };
         // Formation gate: AFTER custody, BEFORE the World check — the SAME order as the REST
-        // /onboard route, running the SAME function (src/formation.ts), so a request that is
-        // both party-less and quota-exhausted gets the identical primary error on both surfaces.
+        // /onboard route, running the SAME function (src/formation.ts), so a request that is both
+        // company-less and unattachable gets the identical primary error on both surfaces.
+        //
+        // `partyId` stays DECLARED in the schema below in order to be REFUSED here (A3, and the
+        // same argument as `ssn` on create_company): an undeclared field is silently stripped by
+        // the SDK's zod parse, so a model passing one would have got back an entity id with no
+        // indication that the legal identity it had just registered was never going to be filed.
         const formationRefusal = formationDoorRefusal(deps, { tenantId, partyId, companyId });
         if (formationRefusal)
           return { content: [{ type: "text", text: formationRefusal }], isError: true };
@@ -787,7 +1071,6 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           tenantId,
           guardianPasskey: passkey,
           custody: resolvedCustody,
-          partyId,
           companyId,
         });
         return { content: [{ type: "text", text: JSON.stringify({ id, status }) }] };

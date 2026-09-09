@@ -36,13 +36,16 @@ test("the list has no blanks and no duplicates — the refresher's own guarantee
 });
 
 test("the label list is rendered CAPPED, by one function both surfaces use", () => {
-  // Today's list is one label and the cap does nothing. The day `refresh-naics.mts` runs against
-  // a real sandbox key it becomes a few hundred federal labels, and there are two surfaces that
-  // name them: the REST refusal (REST's only discovery surface for this field) and MCP's tool
-  // description (an agent's). Uncapped, the second is a description that crowds out every other
-  // tool in the client's context window, paid for on every request.
-  expect(describeIndustryLabels()).toBe(NAICS_LABELS.join(", "));
-  expect(describeIndustryLabels()).not.toContain("more");
+  // The list is doola's full reference table (821 labels since the 2026-09-07 refresh), and two
+  // surfaces name it: the REST refusal (REST's only discovery surface for this field) and MCP's
+  // tool description (an agent's). Uncapped, the second is a description that crowds out every
+  // other tool in the client's context window, paid for on every request — so the real list must
+  // render capped, with the remainder counted.
+  expect(NAICS_LABELS.length).toBeGreaterThan(LABEL_LIST_CAP);
+  const real = describeIndustryLabels();
+  expect(real.startsWith(NAICS_LABELS.slice(0, LABEL_LIST_CAP).join(", "))).toBe(true);
+  expect(real).toContain(`…and ${NAICS_LABELS.length - LABEL_LIST_CAP} more`);
+  expect(real).not.toContain(NAICS_LABELS[LABEL_LIST_CAP]);
 
   // The behaviour once the list IS long, asked of the renderer itself — the parameter exists so
   // this can be asserted today rather than discovered the morning after the refresher runs.

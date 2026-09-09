@@ -21,6 +21,10 @@ export function AgentShell({ children }: { children: ReactNode }) {
           {/* Scrolls rather than forcing the page wider than the viewport on narrow screens. */}
           <nav className="flex min-w-0 flex-1 items-center justify-end gap-2 overflow-x-auto [&>*]:shrink-0">
             <NavLink href="/agents">My agents</NavLink>
+            {/* The legal bodies, as their own section (§7): a company can be filed, hold its
+                documents and have its EIN issued before any agent attaches to it, and ten agents
+                can share one — neither of which an agent-scoped page can show. */}
+            <NavLink href="/agents/companies">Legal bodies</NavLink>
             <NavLink href="/agents/account">Account</NavLink>
             <NavLink href="/agents/connect">Connect an agent</NavLink>
             <GuardianBadge />

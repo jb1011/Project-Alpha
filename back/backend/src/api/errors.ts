@@ -53,3 +53,26 @@ export function requireOwnedEntity(
     throw new ApiError("not_found", 404, "entity not found");
   return rec;
 }
+
+/**
+ * Company-or-404, the same idiom one key along (design §7, A3).
+ *
+ * The document routes moved from `/entities/:id/documents` to
+ * `/companies/:companyId/documents` when the store was re-keyed: documents belong to the FILING,
+ * a company can have them before any agent attaches, and asking for them through an entity was a
+ * round trip to recover a key the caller already held.
+ *
+ * `findOwned` answers undefined for unknown AND for not-yours, and this turns both into the same
+ * 404 — for the reason `requireOwnedEntity` does: distinguishing them would make the route an
+ * existence oracle over other tenants' company ids.
+ */
+export function requireOwnedCompany(
+  deps: { companies?: import("../persistence/companyRepository").CompanyRepository },
+  c: { req: { param(k: string): string }; get(k: "tenantId"): string },
+): import("../persistence/companyRepository").CompanyRecord {
+  // A deployment with no company store cannot own a company, so every id is a 404 — the same
+  // answer a real store gives for an id it does not hold, and never a 500.
+  const rec = deps.companies?.findOwned(c.get("tenantId"), c.req.param("companyId"));
+  if (!rec) throw new ApiError("not_found", 404, "company not found");
+  return rec;
+}

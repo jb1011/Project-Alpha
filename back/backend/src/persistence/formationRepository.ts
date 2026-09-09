@@ -145,7 +145,8 @@ export interface FormationRepository {
    *
    * THE PIN IS PART OF THE PREDICATE, not a check the caller makes afterwards. Opening a company
    * MINTS a `create_provider` row, and that row is what the platform daily ceiling
-   * (`createRequestsSince`) and the per-tenant quota (`createRequestsByTenant`) count. A company
+   * (`createRequestsSince`) counts, and the tenant quota
+   * (`companies.countChargeableByTenant`) already counted the company row itself. A company
    * pinned to the other environment is refused by the create step — but only AFTER the row
    * exists, so every tick of a mixed-pin deployment used to burn a ceiling slot on a company it
    * was never going to file, and could exhaust the day's ceiling against filings that can
@@ -177,7 +178,6 @@ export interface FormationRepository {
     },
   ): boolean;
   bumpAttempt(companyId: string, step: FormationStep, from: FormationState): number | undefined;
-  createRequestsByTenant(tenantId: string): number;
   createRequestsSince(sinceUtc: string): number;
 }
 
@@ -284,17 +284,19 @@ export class SqliteFormationRepository implements FormationRepository {
       // One statement, not an UPDATE followed by a SELECT: the read-back could otherwise return
       // a DIFFERENT driver's attempt number (this repo exists because two drivers meet on these
       // rows), and a retry would then derive an idempotency key for an attempt it does not own.
-      // ── Spend controls (design §2, audit H6). Both count `create_provider` rows, which is one
-      //    row per entity a filing was ever OPENED for — including failed ones, deliberately: a
-      //    create that failed after doola committed has already cost a real company and a real
-      //    fee, and a quota that only counted successes would let a retry loop spend without
-      //    bound. The join is how a per-TENANT quota reaches rows keyed only by entity.
-      countByTenant: db.prepare(
-        `SELECT COUNT(*) AS n
-           FROM formation_requests f
-           JOIN companies c ON c.company_id = f.company_id
-          WHERE f.step = 'create_provider' AND c.tenant_id = ?`,
-      ),
+      // ── The platform daily ceiling (design §2, audit H6). It counts `create_provider` rows,
+      //    which is one row per company a filing was ever OPENED for — including failed ones,
+      //    deliberately: a create that failed after doola committed has already cost a real
+      //    company and a real fee, and a ceiling that only counted successes would let a retry
+      //    loop spend without bound.
+      //
+      //    Its per-TENANT twin (`countByTenant`, a join back to `companies`) is GONE as of A3.
+      //    The tenant quota is `companies.countChargeableByTenant` — `ready`, or carrying a live
+      //    payment — which §6.7 requires because with payment on a company sits in draft for days
+      //    before its create fires, and a quota keyed to `create_provider` rows would not see it.
+      //    Both readers existed only because A1's onboard shim ran its own quota check before the
+      //    company row existed; with the shim gone, `createCompany` is the single quota site and
+      //    a second definition of "how many has this tenant had" is a second answer.
       // Lexicographic on the TEXT CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC) the schema
       // writes — the caller supplies the cutoff so the window is testable with an injected clock,
       // which `datetime('now','-24 hours')` would not be.
@@ -448,11 +450,6 @@ export class SqliteFormationRepository implements FormationRepository {
       | { attempt: number }
       | undefined;
     return row?.attempt;
-  }
-
-  /** Lifetime formations opened by one tenant (FORMATION_MAX_PER_TENANT). */
-  createRequestsByTenant(tenantId: string): number {
-    return (this.stmts.countByTenant.get(tenantId) as { n: number }).n;
   }
 
   /** Formations opened across the deployment since a UTC "YYYY-MM-DD HH:MM:SS" instant

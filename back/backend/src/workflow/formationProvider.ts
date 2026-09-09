@@ -10,7 +10,7 @@ import type {
   DoolaCompany,
   DoolaEnvironment,
 } from "../adapters/doola/types";
-import { isIntakeFrozen } from "../formation/freeze";
+import { awaitsSsnDecision, isIntakeFrozen } from "../formation/freeze";
 import {
   type CompanyNameOption,
   DEFAULT_DESCRIPTION,
@@ -124,9 +124,9 @@ export interface CreateProviderDetail {
    * doola will not accept. Clearing this flag from that door would re-arm a retry of a customer
    * body that had not changed at all — the exact loop the park exists to stop.
    *
-   * So there is deliberately NO self-service exit today; the party-edit route is A3's, and
-   * `rearmAfterPartyEdit` is exported and waiting for it. Until then the operator trail says so,
-   * in as many words, on both surfaces.
+   * The exit is therefore its OWN door: `PATCH /companies/:companyId/party` (and MCP
+   * `update_company_party`), which clears this flag and no other. Each door re-arms exactly the
+   * body it rewrote.
    */
   awaitingPartyEdit?: boolean;
   /**
@@ -648,7 +648,11 @@ function resolveSsn(
   if (!ssnIncluded) {
     // NOT frozen, no stored SSN — and the clock is why. See the block comment above: filing now
     // would quietly send a body the caller did not choose.
-    if (!frozen && party.ssnErasedReason === "ttl")
+    //
+    // ONE predicate, shared with the company detail view (A3): a surface that re-derived this
+    // would be a second opinion about a filing's state, and the one that gets it wrong tells the
+    // owner to wait for something that is waiting for them.
+    if (awaitsSsnDecision(row, { ssnErasedReason: party.ssnErasedReason, hasSsn: Boolean(stored) }))
       return {
         park: ssnErasedBeforeSendError(),
         reason: "ssn_erased_before_send",
@@ -1045,14 +1049,14 @@ function parkedForIntakeEdit(d: FormationCreateDeps, message: string): void {
  * Tell somebody that a filing is waiting on a human because the PARTY was refused (review 5b).
  *
  * Its OWN event and its own sentence, not a re-use of the intake one, for the reason an operator
- * cares about: these two parks are answered differently. `formation_stale` /
- * `create_rejected_awaiting_intake_edit` is a self-service fix — the owner edits the company and
- * the filing retries itself. This one has no such door until A3, so the message must not tell
- * anybody to go and edit a company: the fields doola refused are not on that form, and an edit
- * there would clear nothing.
+ * cares about: these two parks have two different exits, and pointing an owner at the wrong form
+ * is worse than saying nothing. `create_rejected_awaiting_intake_edit` is fixed by editing the
+ * COMPANY's details; this one is fixed by correcting the responsible PERSON, on the same page,
+ * through a different form. None of the fields the company form rewrites is one `createCustomer`
+ * refused.
  *
- * CRITICAL for the same reason, and arguably more so: a company parked here needs a person to
- * pick it up, and nothing in the system will nudge anybody a second time.
+ * Still CRITICAL: both parks stop a filing until a human acts, and nothing in the system will
+ * nudge anybody a second time.
  */
 function parkedForPartyEdit(d: FormationCreateDeps, message: string): void {
   opsLog("formation_party_rejected", {
@@ -1069,6 +1073,6 @@ function parkedForPartyEdit(d: FormationCreateDeps, message: string): void {
     d.repo,
     d.company.companyId,
     "formationStale",
-    "action required: the provider REFUSED the responsible party's details (name, email, phone or address), so this filing will NOT be retried as it stands. Editing a party is not yet self-service — it arrives with the legal-identity form — so please contact support to correct them.",
+    "action required: the provider REFUSED the responsible party's details (name, email, phone or address), so this filing will NOT be retried as it stands. Open this company's page and use the responsible-person form to correct them — one correction buys one retry. Editing the company's own details (names, purpose, industry) would clear nothing: they are not what was refused.",
   );
 }

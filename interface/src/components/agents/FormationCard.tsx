@@ -1,20 +1,19 @@
 "use client";
 
-import { useState } from "react";
-import { downloadDocument } from "@/lib/api/client";
+import Link from "next/link";
+import { useCompanyQuery, usePublicConfigQuery } from "@/lib/api/hooks";
+import { formationCopyOf, parkSummary } from "@/lib/formation/copy";
+import { requiredActionCopy } from "@/lib/formation/documents";
+import { DocumentList } from "@/components/agents/DocumentList";
+import { FactRow } from "@/components/agents/FactRow";
 import {
   formationEnvironmentOf,
   type FormationEnvironment,
 } from "@/lib/api/formationEnvironment";
-import {
-  isKnownFormationStatus,
-  type EntityView,
-  type FormationDocument,
-  type FormationStatus,
-} from "@/lib/api/types";
+import { type EntityView, type FormationStatus } from "@/lib/api/types";
+import { filingTone, mayRenderConfirmed } from "@/lib/formation/honesty";
 import { formatDate } from "@/lib/format";
-import { useAuth } from "@/components/onboarding/AuthProvider";
-import { AmberPill, Card, SectionTitle, Spinner, cx } from "@/components/onboarding/primitives";
+import { AmberPill, Card, SectionTitle, cx } from "@/components/onboarding/primitives";
 
 type Formation = NonNullable<EntityView["formation"]>;
 
@@ -37,51 +36,43 @@ type Formation = NonNullable<EntityView["formation"]>;
  * Rendered only for entities that HAVE a formation block — a legacy or stub row has none, forever,
  * and inventing a "not formed" card for it would describe an absence as a stage.
  */
-export function FormationCard({
-  entityId,
-  formation,
-}: {
-  entityId: string;
-  formation: Formation;
-}) {
-  const { session } = useAuth();
-  const [busyDocId, setBusyDocId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export function FormationCard({ formation }: { formation: Formation }) {
+  const { data: config } = usePublicConfigQuery();
+  // ONE table for the three parks — the same sentences the Companies page renders beside the form
+  // that clears each, taken in the summary register. This card held a fourth hand-written
+  // paraphrase of them, which is a second description of one behaviour and the one nobody looks
+  // at is the one that goes stale.
+  const copy = formationCopyOf(config);
 
+  const companyId = formation.companyId;
   const environment = formationEnvironmentOf(formation.environment);
+  /**
+   * The company row, for the ONE thing an entity view cannot carry: whether this filing is PARKED
+   * waiting on a human (§4.6a/§4.7).
+   *
+   * The three parks are a property of the COMPANY, and a dashboard that showed "filing in
+   * progress" over a filing that stopped three weeks ago and is waiting for its owner is the
+   * failure this whole phase exists to fix. What the card does NOT do is offer the forms: those
+   * live on the company page, once, so an owner is never editing an identity in two places.
+   */
+  const company = useCompanyQuery(companyId);
+  const park = company.data?.park;
+  const parked = park
+    ? (["awaitingIntakeEdit", "awaitingPartyEdit", "awaitingSsnDecision"] as const).filter(
+        (k) => park[k],
+      )
+    : [];
+  /**
+   * The §7 SHARING LABEL. `sharedWith` is the TOTAL attached, including this agent, so "1" means
+   * not shared — the subtraction happens HERE, once, where the sentence is written. `null`/absent
+   * is a backend that did not count, and it renders nothing rather than "not shared".
+   */
+  const sharedWith = formation.sharedWith ?? null;
   const confirmedReal = environment === "production";
   // Amber covers "sandbox" AND "unknown" — everything that is not a confirmed real filing.
   const sandbox = environment === "sandbox";
   const documents = formation.documents ?? [];
   const requiredActions = formation.requiredActions ?? [];
-
-  async function download(doc: FormationDocument) {
-    const token = session?.token;
-    if (!token) {
-      setError("Sign in again to download documents.");
-      return;
-    }
-    setError(null);
-    setBusyDocId(doc.id);
-    try {
-      // fetch -> blob -> objectURL, because an `<a href>` cannot carry a Bearer token and this
-      // route is owner-only. The filename comes from the response when the proxy forwarded the
-      // header, and from the document's own derived name when it did not.
-      const { blob, filename } = await downloadDocument(token, entityId, doc.id);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename ?? doc.name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not download the document.");
-    } finally {
-      setBusyDocId(null);
-    }
-  }
 
   return (
     <Card className={cx("p-5", !confirmedReal && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
@@ -111,16 +102,50 @@ export function FormationCard({
       </p>
 
       <dl className="mt-4 flex flex-col gap-3 text-[12.5px]">
-        <Row k="Filing agent" v={formation.provider} />
-        {formation.providerRef && <Row k="Provider reference" v={formation.providerRef} mono />}
+        <FactRow k="Filing agent" v={formation.provider} />
+        {formation.providerRef && <FactRow k="Provider reference" v={formation.providerRef} mono />}
         {/* The view carries unix SECONDS; the shared formatter takes milliseconds and the
             conversion is written here, where the unit is visible. */}
-        <Row k="Filed" v={formation.filedAt ? formatDate(formation.filedAt * 1000) : "—"} />
-        <Row k="Filing number" v={formation.filingNumber ?? "—"} mono={!!formation.filingNumber} />
+        <FactRow k="Filed" v={formation.filedAt ? formatDate(formation.filedAt * 1000) : "—"} />
+        <FactRow k="Filing number" v={formation.filingNumber ?? "—"} mono={!!formation.filingNumber} />
         {/* Owner-visible only: the authenticated entity view is the ONLY surface that carries it,
             and this dashboard is the only place it is rendered. */}
-        <Row k="EIN" v={formation.ein ?? "—"} mono={!!formation.ein} />
+        <FactRow k="EIN" v={formation.ein ?? "—"} mono={!!formation.ein} />
+        {sharedWith !== null && (
+          <FactRow
+            k="Shared with"
+            v={
+              sharedWith > 1
+                ? `${sharedWith - 1} other agent${sharedWith === 2 ? "" : "s"}`
+                : "No other agents"
+            }
+          />
+        )}
       </dl>
+
+      {/* The filing has STOPPED and is waiting on this owner. It sits above the documents, and
+          it links rather than duplicating the forms: an identity edited in two places is an
+          identity edited in the wrong one. */}
+      {parked.length > 0 && companyId && (
+        <div className="mt-5 rounded-xl border border-[#febc2e]/30 bg-[#febc2e]/[0.07] px-4 py-3">
+          <div className="text-[12px] font-medium text-ink">
+            This filing has stopped and is waiting on you
+          </div>
+          <ul className="mt-2 flex flex-col gap-1.5">
+            {parked.map((k) => (
+              <li key={k} className="text-[11.5px] leading-[1.5] text-[#f3cd72]">
+                {parkSummary(copy, k)}
+              </li>
+            ))}
+          </ul>
+          <Link
+            href={`/agents/companies/${encodeURIComponent(companyId)}`}
+            className="mt-3 inline-flex text-[11.5px] text-accent-soft underline-offset-2 hover:underline"
+          >
+            Open the company to fix it →
+          </Link>
+        </div>
+      )}
 
       {requiredActions.length > 0 && (
         <div className="mt-5 rounded-xl border border-[#febc2e]/30 bg-[#febc2e]/[0.07] px-4 py-3">
@@ -137,40 +162,22 @@ export function FormationCard({
       )}
 
       <div className="mt-5 border-t hairline pt-4">
-        <SectionTitle>Legal documents{sandbox && " (demo)"}</SectionTitle>
-        {documents.length === 0 ? (
-          <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
-            None yet. The filing agent produces the Articles of Organization and the Operating
-            Agreement once the company is filed; they appear here, and their hashes go into the
-            next version of the on-chain anchor.
-          </p>
-        ) : (
-          <ul className="mt-3 flex flex-col gap-2">
-            {documents.map((doc) => (
-              <li
-                key={doc.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border hairline bg-paper/50 px-3 py-2.5"
-              >
-                <div className="min-w-0">
-                  <div className="truncate text-[12.5px] text-ink">{humanDocType(doc.type)}</div>
-                  <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-2">
-                    sha256 {doc.sha256.slice(0, 18)}… · {formatBytes(doc.size)}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void download(doc)}
-                  disabled={busyDocId !== null}
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {busyDocId === doc.id && <Spinner className="h-3 w-3" />}
-                  {busyDocId === doc.id ? "Downloading…" : "Download PDF"}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-        {error && <p className="mt-2 text-[11.5px] leading-[1.4] text-[#ff8a84]">{error}</p>}
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <SectionTitle>Legal documents{sandbox && " (demo)"}</SectionTitle>
+          {companyId && (
+            <Link
+              href={`/agents/companies/${encodeURIComponent(companyId)}`}
+              className="text-[11.5px] text-muted transition-colors hover:text-ink"
+            >
+              The company →
+            </Link>
+          )}
+        </div>
+        <DocumentList
+          companyId={companyId ?? null}
+          documents={documents}
+          emptyNote="None yet. The filing agent produces the Articles of Organization and the Operating Agreement once the company is filed; they appear here, and their hashes go into the next version of the on-chain anchor."
+        />
       </div>
     </Card>
   );
@@ -178,23 +185,14 @@ export function FormationCard({
 
 /* ------------------------------------------------------------------ */
 
-function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
-  return (
-    <div className="flex items-baseline justify-between gap-3">
-      <dt className="shrink-0 text-muted-2">{k}</dt>
-      <dd className={cx("min-w-0 truncate text-right text-ink", mono && "font-mono text-[11.5px]")}>
-        {v}
-      </dd>
-    </div>
-  );
-}
 
 /** Amber for everything that is not a CONFIRMED real filing — never the confirmed colour,
  *  whatever the sub-status says, never for an environment we could not read, and never for a
  *  status this build has never heard of. */
 function statusTone(status: FormationStatus, environment: FormationEnvironment): string {
-  if (status === "failed") return "text-[#ff8a84]";
-  if (environment !== "production" || !isKnownFormationStatus(status)) return "text-[#f3cd72]";
+  const tone = filingTone(environment, status);
+  if (tone === "failed") return "text-[#ff8a84]";
+  if (!mayRenderConfirmed(tone)) return "text-[#f3cd72]";
   if (status === "filed" || status === "complete") return "text-emerald-300";
   return "text-muted";
 }
@@ -261,34 +259,4 @@ function statusDetail(status: FormationStatus, environment: FormationEnvironment
   }
 }
 
-/**
- * The two required-action codes the provider can raise, in plain language.
- *
- * The CODE is always shown beside the sentence: the sentence is ours and can go stale, and the
- * code is what an operator searches for. An unrecognised code renders as itself rather than as a
- * guess — the view deliberately never carries the provider's free-text reason, which their
- * operators write and which can name the responsible party.
- */
-function requiredActionCopy(code: string): string {
-  switch (code) {
-    case "FORMATION_NAME_OPTIONS_EXHAUSTED":
-      return "Every company name you offered was rejected by the state. New name options are needed before this can file.";
-    case "FORMATION_SIGNATURE_SS4_RESET":
-      return "The SS-4 signature session expired. A replacement signature is needed; this closes itself once you complete it.";
-    default:
-      return "The filing agent is waiting on something before this can proceed:";
-  }
-}
 
-function humanDocType(type: string): string {
-  return type
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .trim();
-}
-
-function formatBytes(size: number): string {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}

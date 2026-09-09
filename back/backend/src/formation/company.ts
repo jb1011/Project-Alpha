@@ -16,9 +16,8 @@ import {
   formationQuotaExhaustedMessage,
   industryLabelRequiredMessage,
   industryLabelUnknownMessage,
-  shimAgentNameBlankMessage,
-  shimAgentNameEndingOnlyMessage,
-  shimAgentNameTooLongMessage,
+  partyFrozenMessage,
+  partyUnchangedMessage,
   sqliteUtcTimestamp,
   ssnFormatMessage,
   ssnRefusedHereMessage,
@@ -30,8 +29,12 @@ import {
 } from "../formation";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyRepository, CompanyStatus } from "../persistence/companyRepository";
-import type { FormationPartyRepository } from "../persistence/formationPartyRepository";
+import type {
+  EditablePartyFields,
+  FormationPartyRepository,
+} from "../persistence/formationPartyRepository";
 import { parseDetail } from "../persistence/formationRepository";
+import { partyEditAllowed } from "./freeze";
 import type { CompanyIntake, CompanyPin } from "./intake";
 import {
   NAME_MAX_LENGTH,
@@ -42,7 +45,6 @@ import {
   duplicateKey,
   firstIllegalNameChar,
   stripEntityEnding,
-  synthesizeIntake,
 } from "./intake";
 import { isKnownIndustryLabel } from "./naicsLabels";
 import { type PiiKeyring, encryptSsn, isWellFormedSsn } from "./pii";
@@ -108,27 +110,23 @@ export interface CreateCompanyDeps {
 }
 
 /**
- * The intake, in the TWO shapes that exist (design §5/§10) — and they are structurally distinct
- * on purpose, so a door cannot fall into the wrong one by leaving a field out.
+ * The intake, in the ONE shape that exists (design §5) since A3 removed the shim.
  *
- * **Production** (`names` + `businessPurpose` + `industryLabel`) is what REST and MCP send. Three
- * validated candidates, a purpose of the COMPANY's own — the agent's description is no longer
- * doola-visible — and an industry from the shipped reference list.
- *
- * **Synthesized** (`synthesizedName`) is the A1 SHIM and nothing else: a party-only onboard mints
- * a 1:1 company from the agent's name and the two defaults, marked `intake_synthesized = 1`. It
- * is named for what it is rather than `name`, because the shim is removed in A3 and this field
- * goes with it; a door reaching for it would be a door filing a company nobody described.
- *
- * The two are mutually exclusive and one of them is required.
+ * Three validated name candidates, a purpose of the COMPANY's own — the agent's description is
+ * not doola-visible — and an industry from the shipped reference list. A2 kept a second,
+ * structurally distinct shape (`synthesizedName`) for the A1 shim, so that no production door
+ * could fall into the derived-name path by leaving a field out; with the shim gone the derived
+ * path has no callers at all, and the safest version of that rule is that the field does not
+ * exist. `intake_synthesized = 1` survives only on rows the MIGRATION wrote, which is exactly
+ * what it was for.
  */
 export interface CompanyIntakeInput {
   partyId: string;
-  /** PRODUCTION: exactly three ranked candidates. */
+  /** Exactly three ranked candidates. */
   names?: string[];
-  /** PRODUCTION: required, and the company's own — never the agent's description. */
+  /** Required, and the company's own — never the agent's description. */
   businessPurpose?: string;
-  /** PRODUCTION: one of the shipped NAICS labels. */
+  /** One of the shipped NAICS labels. */
   industryLabel?: string;
   /**
    * The responsible party's SSN, in doola's `XXX-XX-XXXX` (§4.1).
@@ -148,8 +146,6 @@ export interface CompanyIntakeInput {
    * supplying another, file the SS-4 route instead.
    */
   proceedWithoutSsn?: boolean;
-  /** THE A1 SHIM ONLY: synthesize a 1:1 intake from the agent's name. Removed in A3. */
-  synthesizedName?: string;
   /** The caller's CLAIM about the deployment, checked against it — never the stored value. */
   synthetic?: boolean;
 }
@@ -298,9 +294,19 @@ export function createCompany(
   });
   // The door gate's own rule, at company scope — the SAME function, so "near" cannot mean two
   // different things on two doors that spend the same money.
+  //
+  // BOTH limits, because they warn different people about different things: the quota is one
+  // tenant approaching their own ceiling, and the DAILY CEILING is the PLATFORM approaching a
+  // limit that will then refuse every tenant at once. The second was written by the door gate
+  // A3 deleted and was not carried over with the first, so the only remaining signal for it was
+  // `formation_ceiling_rejected` — which fires when the platform has already stopped forming
+  // companies, i.e. after the outage rather than before it.
   warnIfNearLimit("formation_quota_warning", used + 1, deps.maxPerTenant, {
     tenantId: truncateTenant(tenantId),
   });
+  // No tenant in the fields: this limit is not about one, and naming the tenant that happened to
+  // trip it would read as blame for a platform-wide condition.
+  warnIfNearLimit("formation_ceiling_warning", inWindow + 1, deps.dailyCeiling, {});
   return { companyId };
 }
 
@@ -332,7 +338,7 @@ export function updateCompanyIntake(
   deps: CreateCompanyDeps,
   tenantId: string,
   companyId: string,
-  intake: Omit<CompanyIntakeInput, "partyId" | "synthesizedName">,
+  intake: Omit<CompanyIntakeInput, "partyId">,
 ): { companyId: string } | { error: string } {
   // Ownership first, and the same not-an-oracle rule the rest of the door follows: an unknown id
   // and somebody else's id get one answer.
@@ -413,6 +419,135 @@ export function updateCompanyIntake(
 }
 
 /**
+ * THE PARTY-EDIT DOOR (design §7, A3) — correct the responsible person doola refused, ADDRESSED
+ * BY COMPANY.
+ *
+ * A2 left a company that doola rejected on its PARTY parked with no exit at all: the flag was
+ * written, `rearmAfterPartyEdit` was exported, and the note on both operator surfaces said
+ * "correcting a party is not yet self-service". This is that door.
+ *
+ * It lives beside `updateCompanyIntake` because it is the same shape and the same three
+ * obligations — ownership, validation, and a RE-ARM in the transaction that made the edit — and
+ * because the two are the only writes in the system that reopen a parked filing. What differs is
+ * WHICH flag it clears, and that is the whole of A2's finding 5b: `PATCH /companies/:id` rewrites
+ * names, purpose, industry and the SSN, none of which is what a rejected `createCustomer`
+ * objected to. Each door clears its own, and neither touches the other's.
+ *
+ * ⚠ THE ADDRESS IS THE COMPANY, and that is a security property rather than a convenience. The
+ * first version took a `partyId`, which made the door capable of touching ANY party the tenant
+ * owns — including the one bound to a DIFFERENT company, mid-filing — with only a
+ * `partyEditAllowed` check standing between a mistyped handle and an identity swap on the wrong
+ * Wyoming LLC. It also forced the UI to ask a human to paste a uuid that no surface serves, which
+ * is a field people get wrong. Addressed by company, the party is RESOLVED (`findByCompanyId`, a
+ * UNIQUE column), so touching another company's party is not a rule this function enforces — it
+ * is a sentence that cannot be expressed.
+ *
+ * The cost, stated: an UNBOUND party — created by `POST /formation-party` and never spent on a
+ * company — has no edit door. It also has no filing, no park and nothing to correct, and the C7
+ * sweep erases it after seven days; the caller's move is to register a new identity.
+ *
+ * ⚠ NO `ssn`, structurally. The party's SSN is written by `POST /companies` (which mints the AAD
+ * the ciphertext is sealed under) and re-captured by `PATCH /companies/:companyId`. There is no
+ * field for one here, on either surface, so an SSN cannot arrive at a door that would then have
+ * to decide what to do with it.
+ *
+ * ⚠ It DOES carry the synthetic-PII gate, in both directions, because it is a PII INTAKE and was
+ * the one that did not run it. `createFormationParty` refuses real personal data on a
+ * `sandboxSyntheticPii` deployment and refuses the synthetic shortcut on a production one, and
+ * `createCompany` re-asserts the same rule against the party ROW. This door rewrote the ten
+ * identity columns with neither check: on a sandbox box a real name, email, phone and home
+ * address could be written over a labeled fixture and then filed to doola's DEVELOPMENT
+ * environment as the responsible person — the precise harm the sandbox refusal exists to prevent.
+ */
+export function updateCompanyParty(
+  deps: Pick<
+    CreateCompanyDeps,
+    "companies" | "parties" | "requests" | "transaction" | "sandboxSyntheticPii"
+  >,
+  tenantId: string,
+  companyId: string,
+  fields: EditablePartyFields,
+): { partyId: string } | { error: string } {
+  // The DEPLOYMENT's half of the gate, first and without a lookup — `createCompany`'s order, and
+  // the same words. This door has no synthetic shortcut (the labeled fixture is ours to generate,
+  // never a caller's to re-type), so every body reaching it is real personal data and a sandbox
+  // deployment refuses all of them.
+  if (deps.sandboxSyntheticPii) return { error: syntheticPiiRequiredMessage() };
+
+  // Ownership of the COMPANY, exactly as `updateCompanyIntake` checks it, and with the same
+  // not-an-oracle rule: an unknown id and somebody else's get ONE answer.
+  const company = deps.companies.findOwned(tenantId, companyId);
+  if (!company) return { error: companyUnavailableMessage() };
+  // The party is RESOLVED from the company, never named by the caller — `company_id` is UNIQUE on
+  // `formation_parties`, so this is the one identity that filing was opened with.
+  const party = deps.parties.findByCompanyId(companyId);
+  if (!party) return { error: formationPartyUnavailableMessage() };
+  // …and the ROW's half of the synthetic gate. A synthetic party on a production box is a bug
+  // rather than a request — the row was minted through the same gate — but it is the bug that
+  // would put a real person's identity onto a filing labeled synthetic on every surface.
+  if (party.synthetic) return { error: syntheticPiiRefusedMessage() };
+
+  // The TypeScript twin of the predicate the UPDATE itself carries (`PARTY_EDIT_ALLOWED_SQL`).
+  // Asked here so the caller gets the ACTIONABLE refusal rather than a bare "nothing moved"; the
+  // statement's own copy is what holds for any caller that reaches `parties.update` another way.
+  const step = deps.requests.find(companyId, "create_provider");
+  if (!partyEditAllowed(step)) return { error: partyFrozenMessage() };
+
+  let moved = false;
+  let unchanged = false;
+  deps.transaction(() => {
+    // RE-READ inside the transaction and compare, because SQLite's `changes` counts rows MATCHED
+    // rather than rows whose values differ: an UPDATE setting every column to the value it already
+    // held reports 1, and the re-arm below would then hand a parked filing a retry of the exact
+    // body doola refused. The comparison is over the ten editable columns and nothing else.
+    const current = deps.parties.findByCompanyId(companyId);
+    if (!current) return;
+    if (samePartyFields(current, fields)) {
+      unchanged = true;
+      return;
+    }
+    moved = deps.parties.update(party.partyId, tenantId, companyId, fields);
+    if (!moved) return;
+    // …and RE-ARM the filing step this edit exists to unblock, in the SAME transaction as the
+    // edit — `updateCompanyIntake`'s rule with the other flag. The edit IS the evidence that the
+    // next body will be different, and it is the only thing that may put the row back in the
+    // sweeper's reach. A no-op for a row that is not parked.
+    rearmAfterPartyEdit(deps, companyId);
+  });
+  // …and the caller is TOLD, rather than given a success that will change nothing: from a form's
+  // side "saved" and "saved, and nothing will happen" look identical, and the second is the one
+  // that leaves somebody waiting on a filing that has already given up.
+  if (unchanged) return { error: partyUnchangedMessage() };
+  // The row vanished between the read and the write (an erasure sweep), or the freeze in the
+  // statement's own WHERE clause caught a race the read above did not. Same sentence as above.
+  if (!moved) return { error: formationPartyUnavailableMessage() };
+
+  // The ONLY trail this leaves, exactly as the create's: which tenant edited which handle. No
+  // name, no address, no email — and no diff, which would be the whole identity in a log line.
+  opsLog("formation_party_updated", {
+    tenantId: truncateTenant(tenantId),
+    partyId: party.partyId,
+    companyId,
+  });
+  return { partyId: party.partyId };
+}
+
+/**
+ * IS THIS EDIT A NO-OP? — the ten editable columns, compared field for field.
+ *
+ * Its own function rather than an inline `every`, because the LIST is the thing that has to stay
+ * right: `EditablePartyFields` is a positive list somebody wrote down, and a comparison that
+ * missed one of its keys would report "unchanged" for an edit that changed exactly that field —
+ * refusing a correction the caller had actually made. `Object.keys(fields)` reads the list off
+ * the value being written, so the two cannot disagree.
+ */
+function samePartyFields(current: EditablePartyFields, submitted: EditablePartyFields): boolean {
+  return (Object.keys(submitted) as (keyof EditablePartyFields)[]).every(
+    (key) => current[key] === submitted[key],
+  );
+}
+
+/**
  * THE SSN GATE (§4.1), as ONE function for the two doors that can carry one.
  *
  * Three refusals in a fixed order, and every one of them is a REFUSAL rather than a quiet drop:
@@ -486,16 +621,15 @@ function rearmAfterEdit(
 }
 
 /**
- * The PARTY half of the same hook, EXPORTED and not yet called (review 5b).
+ * The PARTY half of the same hook (review 5b).
  *
- * A `createCustomer` rejection parks under `awaitingPartyEdit`, and there is no door that can
- * clear it: editing a responsible party is A3's route, and until it exists a company parked here
- * needs a person. That is stated on both operator surfaces rather than left to be discovered.
+ * A `createCustomer` rejection parks under `awaitingPartyEdit`, and its exit is
+ * `updateCompanyParty` — `PATCH /companies/:companyId/party` and MCP `update_company_party`.
  *
- * This lives here, beside the intake's, so that A3's party-edit door is one call rather than a
+ * This lives here, beside the intake's, so that the party-edit door is one call rather than a
  * second opinion about the CAS, the preserved error text and the `touchFacts: false` — every one
- * of which is a decision the intake door had to get right and would otherwise be re-derived.
- * Call it inside the transaction that actually rewrote the party, exactly as
+ * of which is a decision the intake door had to get right and would otherwise be re-derived. It
+ * is called inside the transaction that actually rewrote the party, exactly as
  * `updateCompanyIntake` calls the intake one: the edit is the evidence.
  */
 export function rearmAfterPartyEdit(
@@ -503,30 +637,6 @@ export function rearmAfterPartyEdit(
   companyId: string,
 ): void {
   rearmAfterEdit(deps, companyId, "awaitingPartyEdit");
-}
-
-/**
- * THE A1 SHIM's intake, as ONE mapping (§10's A1 bullet). Removed in A3 with the shim itself.
- *
- * A party-only onboard — every client that exists today — mints its own 1:1 company from the
- * agent's name and the two defaults. The mapping is a function rather than an object literal at
- * each call site because there are four of those (the composition root and three test wirings),
- * and A2 changing the field name from `name` to `synthesizedName` broke all three of the tests
- * at once: four literals is four chances for the shim to mean something slightly different on
- * one surface. It carries NO `ssn`, structurally — the shim's door is onboard, and PII has never
- * ridden on it (§7).
- */
-export function shimCompanyIntake(
-  intake: { partyId: string; name: string },
-  sandboxSyntheticPii: boolean,
-): CompanyIntakeInput {
-  return {
-    partyId: intake.partyId,
-    synthesizedName: intake.name,
-    // The shim never invents a claim: it mirrors the deployment, which is what the party it is
-    // binding was already created against.
-    synthetic: sandboxSyntheticPii ? true : undefined,
-  };
 }
 
 /**
@@ -541,30 +651,8 @@ export function shimCompanyIntake(
  * industry. A caller fixing a form gets the first thing wrong with it, in the order they typed.
  */
 export function validateIntake(
-  intake: Pick<
-    CompanyIntakeInput,
-    "names" | "businessPurpose" | "industryLabel" | "synthesizedName"
-  >,
+  intake: Pick<CompanyIntakeInput, "names" | "businessPurpose" | "industryLabel">,
 ): { intake: CompanyIntake } | { error: string } {
-  // ── THE A1 SHIM. One derived name, the two defaults, `intake_synthesized = 1`. It skips the
-  //    validation below because the values are OURS, not a caller's: the agent name has already
-  //    been through `AgentSpecSchema`, and refusing it here would refuse an onboard for a
-  //    company nobody was asked to describe. The one guard it keeps is the ending-only check,
-  //    because "LLC LLC" is a real filing either way.
-  if (intake.synthesizedName !== undefined) {
-    const name = canonicalizeIntakeText(intake.synthesizedName);
-    // The SHIM's OWN sentences, deliberately. This caller sent an agent name through `onboard`
-    // and there is no `names` array anywhere in their request, so "names[0] is blank — all three
-    // candidates are required" named a field they had never heard of and could not have sent.
-    // Same rules, same order; they go away with the shim in A3.
-    if (!name) return { error: shimAgentNameBlankMessage() };
-    if (name.length > NAME_MAX_LENGTH)
-      return { error: shimAgentNameTooLongMessage(NAME_MAX_LENGTH) };
-    if (!stripEntityEnding(name)) return { error: shimAgentNameEndingOnlyMessage() };
-    return { intake: synthesizeIntake(name, intake.businessPurpose) };
-  }
-
-  // ── THE PRODUCTION SHAPE.
   const raw = intake.names;
   if (!Array.isArray(raw) || raw.length !== NAME_OPTION_COUNT)
     return { error: companyNamesRequiredMessage() };

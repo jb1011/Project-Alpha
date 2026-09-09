@@ -85,6 +85,24 @@ export type EntityView = {
   formation?: {
     provider: string;
     environment: "sandbox" | "production";
+    /**
+     * HOW MANY AGENTS SHARE THIS FILING, including this one (§7 sharing labels).
+     *
+     * `1` means not shared. The TOTAL rather than "others": an off-by-one that lives in the field
+     * is one every renderer inherits, so a UI that wants "shared with 2 others" subtracts once,
+     * where the sentence is written. `null`/absent = this backend did not count — never "not
+     * shared", because an attached entity always has at least itself.
+     *
+     * Owner-visible only: the public surfaces do not carry it, and a backend test asserts they
+     * cannot grow it.
+     */
+    sharedWith?: number | null;
+    /** OUR company id — what the document routes, the compliance calendar and the Companies
+     *  section are addressed by. Owner-visible only, like `ein` and `documents`; the public
+     *  surfaces carry doola's `providerRef` instead. Optional for deploy-order safety: a backend
+     *  that predates A3 serves no company id, and the card then offers no download rather than
+     *  building a URL out of an entity key the route no longer takes. */
+    companyId?: string;
     /** Derived from the formation sub-saga: nothing opened / opened but nothing legally true
      *  yet / the state has FILED it / the EIN has issued / the filing step is in error. */
     status: FormationStatus;
@@ -167,6 +185,34 @@ export type PublicConfig = {
    *  mandatory or optional. Optional for deploy-order safety: a backend that predates it
    *  enforces nothing, which is exactly what absent should mean. */
   formationRequired?: boolean;
+  /**
+   * ⚠ `formationPaymentRequired` and `formationFeeUsdc` are DELIBERATELY ABSENT from this type.
+   *
+   * B1 ships them together with the payment step and the quote route. Declaring them here first
+   * bought a branch that could not be reached — no deployment serves either field, so
+   * `formationPaymentRequired === true` was always false — and an optional-typed field that is
+   * always undefined is the shape a reader mistakes for a live capability. The wizard states the
+   * beta unconditionally, which is what is true of every deployment this build can talk to.
+   */
+  /**
+   * PRODUCT COPY the wizard and the Companies section render verbatim (§7).
+   *
+   * Served rather than bundled because every sentence makes a CLAIM about what the backend does —
+   * that an SSN dies with the company id, that one edit buys one retry, that agents sharing a
+   * company are publicly linkable. Copy in the browser bundle drifts from the code that keeps it,
+   * silently, in the direction of the older promise.
+   *
+   * Optional for deploy-order safety: a backend that predates it serves none, and the surfaces
+   * that need a sentence render nothing rather than a stale one of their own.
+   */
+  formationCopy?: {
+    ssn: { label: string; help: string; retention: string };
+    park: Record<
+      "awaitingIntakeEdit" | "awaitingPartyEdit" | "awaitingSsnDecision",
+      { title: string; what: string; youCan: string }
+    >;
+    reuseDisclosure: string;
+  };
 };
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).
@@ -437,3 +483,168 @@ export class ApiError extends Error {
     this.details = body.details;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* COMPANIES — the legal body an agent is filed under (design §7)      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * THE EIGHT-WORD STATE the Companies section renders, derived by the backend
+ * (`src/formation/status.ts#companyState`) from three facts a UI must never combine for itself.
+ *
+ * §7 names a ninth, `empty`, which is the state of a LIST with no rows rather than of a company.
+ *
+ * Exported as a runtime array as well as a type, for the reason `FORMATION_STATUSES` is: "is this
+ * a state this build knows?" is a question asked at render time of a value that arrived over the
+ * wire, and a switch with no default renders a blank line where a company's status should be.
+ */
+export const COMPANY_STATES = [
+  "draft",
+  "paying",
+  "ready",
+  "in_progress",
+  "filed",
+  "complete",
+  "failed",
+  "abandoned",
+] as const;
+
+export type CompanyState = (typeof COMPANY_STATES)[number];
+
+export function isKnownCompanyState(value: string): value is CompanyState {
+  return (COMPANY_STATES as readonly string[]).includes(value);
+}
+
+/**
+ * `GET /formation/rules` — everything the create-company form enforces, from the backend that
+ * enforces it (design §5/§7).
+ *
+ * The four scalars were MIRRORED constants in this bundle until A3, each with a comment naming
+ * what it copied. A mirror is a second copy with a promise attached: the day one moves, the form
+ * either refuses a name the door would take — an annoyance — or PROMISES one the door refuses,
+ * after a founder has typed three of them and paid for the first.
+ *
+ * ⚠ Wyoming's ~80 RESTRICTED WORDS are deliberately absent, and a test asserts it. They are
+ * matched on letter boundaries (so "Banksy" survives "bank"), which makes the MATCHER the rule
+ * rather than the data; a client holding the words without it would disagree with the server in
+ * both directions. The server's refusal names the offending word and the form renders it.
+ */
+export type FormationRules = {
+  /** As served, in the order doola published it — the picker sorts nothing for itself. */
+  industries: string[];
+  /** Wyoming refuses a taken name, and a retry is a second fee: the alternates are the point. */
+  nameOptionCount: number;
+  nameMaxLength: number;
+  purposeMaxLength: number;
+  /** A character-CLASS BODY, compiled as `^[…]$` and tested one character at a time — never a
+   *  whole pattern, which would carry an anchor and a quantifier this client did not choose. */
+  nameCharset: string;
+};
+
+/** One stored name candidate, in the canonical shape the backend files under. */
+export type CompanyNameOption = { name: string; entityTypeEnding: string; position: number };
+
+/**
+ * ONE ROW of `GET /companies` — and of MCP `list_companies`, which renders the same projection.
+ *
+ * The ORDERING is an API-level contract (newest first) shared with the wizard's reuse picker,
+ * whose default is the last-used company. Never re-sorted here: two renderers sorting for
+ * themselves is how a picker ends up disagreeing with the list behind it.
+ *
+ * NO PII. The responsible party is not projected, and a company's own name candidates are not
+ * personal data.
+ */
+export type CompanyView = {
+  companyId: string;
+  environment: "sandbox" | "production";
+  nameOptions: CompanyNameOption[];
+  legalNameFiled: string | null;
+  businessPurpose: string;
+  industryLabel: string;
+  /**
+   * The eight-word state — the row's status, a live payment and the derived filing status,
+   * combined ONCE, server-side.
+   *
+   * Its three inputs used to be served beside it and nothing here read them: `canAttach` reads
+   * this word, the pill reads this word, the list page reads this word. They remain on
+   * `CompanyDetailView`, where a page about one company can show the parts.
+   */
+  state: CompanyState;
+  filedAt: number | null;
+  filingNumber: string | null;
+  /** How many agents share this filing. The picker's sharing label. */
+  agents: number;
+  /** EPOCH MILLISECONDS — what `formatDate` takes, with no reconstruction at the edge. */
+  createdAt: number;
+};
+
+/** `GET /companies/:companyId` — the list row plus what a list has no room for. */
+export type CompanyDetailView = CompanyView & {
+  /** The row's own column — DETAIL only; the list serves the combined `state`. */
+  status: "draft" | "ready" | "abandoned";
+  synthetic: boolean;
+  formationStatus: FormationStatus;
+  paying: boolean;
+  /** True = the intake was DERIVED by the migration, not typed by a human. */
+  intakeSynthesized: boolean;
+  providerRef: string | null;
+  /** ⚠ Owner-scoped surfaces only. */
+  ein: string | null;
+  requiredActions: string[];
+  documents: FormationDocument[];
+  attachedAgents: { id: string; name: string; status: EntityStatus }[];
+  /**
+   * WHAT STOPPED THIS FILING, and who can restart it (§4.6a/§4.7).
+   *
+   * Three flags rather than one, because they have three different exits — and the section
+   * renders the sentence and the form that clears each. All false on a healthy company.
+   */
+  park: {
+    awaitingIntakeEdit: boolean;
+    awaitingPartyEdit: boolean;
+    awaitingSsnDecision: boolean;
+  };
+};
+
+/** One row of `GET /companies/:companyId/compliance`. Every field is explicitly null when the
+ *  provider did not say, never absent — a renderer must not have to guess which it is. */
+export type ComplianceEventView = {
+  type: string | null;
+  state: string | null;
+  nextDueDate: string | null;
+  lastFiledDate: string | null;
+  status: string | null;
+};
+
+export type ComplianceView = {
+  companyId: string;
+  /** doola's id, or null when no filing has been opened — then `events` is empty because there is
+   *  nothing to have a calendar about, which is not an error. */
+  providerRef: string | null;
+  /** Epoch ms the provider was last asked; null when it was not. */
+  fetchedAt: number | null;
+  events: ComplianceEventView[];
+  /** The Wyoming annual report — a PLACEHOLDER and an admission, not provider data. */
+  annualReport: { label: string; due: string; handledBy: string; note: string };
+};
+
+/** The production create-company intake (§5). Three ranked candidates, the company's own purpose,
+ *  and an industry from `GET /formation/rules`. */
+export type CompanyIntakeInput = {
+  partyId: string;
+  names: [string, string, string] | string[];
+  businessPurpose: string;
+  industryLabel: string;
+  /** PRODUCTION REST ONLY, and optional even there (§4.1). Never persisted, never logged, never
+   *  put in a React Query key — it travels as a mutation argument and is forgotten. */
+  ssn?: string;
+  /** The sandbox deployment's marker, checked against the box's own setting — never a claim the
+   *  caller gets to make about a production filing. */
+  synthetic?: true;
+};
+
+/** `PATCH /companies/:companyId` — the §4.7 edit-and-retry, with a fresh SSN capture. */
+export type CompanyIntakeUpdate = Omit<CompanyIntakeInput, "partyId" | "synthetic"> & {
+  /** The §4.6a decision: the clock took the number and the owner is choosing the slower route. */
+  proceedWithoutSsn?: true;
+};

@@ -75,6 +75,38 @@ export function isIntakeFrozen(row: FreezableStep | undefined): boolean {
 }
 
 /**
+ * IS THIS FILING WAITING ON THE OWNER'S SSN DECISION? (design §4.6a.)
+ *
+ * The third park, and the only one that is not a flag in `detail`. A company reaches its first
+ * send with no SSN for two indistinguishable reasons — nobody supplied one, or the seven-day
+ * retention clock destroyed the one they did — and the difference is the whole decision, because
+ * the second files a US person under the slow EIN route they explicitly opted out of. So the
+ * filer PARKS, and the two exits are both `PATCH /companies/:companyId`: re-supply a number, or
+ * say `proceedWithoutSsn`.
+ *
+ * It lives here, beside `isIntakeFrozen`, because it is read off the same `create_provider` row
+ * by the same rule, and because TWO callers now need it: the FILER (`resolveSsn`, deciding
+ * whether to send) and the company detail VIEW (explaining to the owner why nothing is happening
+ * and what they can do about it). A view that re-derived it would be a second opinion about a
+ * filing's state, and the one that gets it wrong tells an owner to wait for something that is
+ * waiting for them.
+ *
+ * Deliberately NOT a PII read: `erasedReason` is an enum and `hasSsn` is a boolean, which is the
+ * whole of what the question needs.
+ */
+export function awaitsSsnDecision(
+  step: FreezableStep | undefined,
+  party: { ssnErasedReason: string | null; hasSsn: boolean } | undefined,
+): boolean {
+  if (!party) return false;
+  // A frozen body's SSN question was settled at the first send and is read back from `detail`;
+  // this park is only ever about a body that has NOT gone out yet.
+  if (isIntakeFrozen(step)) return false;
+  if (party.hasSsn) return false;
+  return party.ssnErasedReason === "ttl";
+}
+
+/**
  * "Has this company's filing ever been in flight at doola?" — read from three independent
  * witnesses, ANY of which is enough (§4.6a).
  *
@@ -97,6 +129,107 @@ export function everSubmitted(
   // that KEEPS the data — the same direction clause 4 of the freeze takes, for the same reason.
   if (parsed === undefined) return true;
   return parsed.customerId !== undefined || parsed.companySentAttempt !== undefined;
+}
+
+/**
+ * MAY THE RESPONSIBLE PARTY STILL BE EDITED? (design §7, A3's party-edit door.)
+ *
+ * Two disjuncts, and the second is the one the door exists for:
+ *
+ *  1. **Nothing has ever been sent about this company** (`!everSubmitted`). The party's fields
+ *     feed BOTH bodies `create_provider` sends — `createCustomer` directly, and the company
+ *     create's responsible party — so an edit is free exactly while neither has gone out.
+ *     `everSubmitted` is used rather than `isIntakeFrozen` deliberately: it is the broader,
+ *     safer question, and it counts a recorded `customerId`, which the freeze does not. That
+ *     matters here and nowhere else, because the create step re-sends `createCustomer` only when
+ *     `detail.customerId` is absent — so once a customer exists at doola, an edit would change
+ *     our copy of a person and change NOTHING about the filing, while telling the caller it had.
+ *     A door that pretended to fix a rejected identity is worse than one that refuses.
+ *  2. **The row is parked awaiting a party edit.** By construction this is a `createCustomer`
+ *     doola LOOKED at and refused, so no customer id exists and disjunct 1 already holds — it is
+ *     stated anyway because the whole point of the park is that this door reopens it, and a
+ *     company that could reach the park without satisfying disjunct 1 would be stranded forever
+ *     with no exit at all.
+ *
+ * An unbound party has no company and no step: `everSubmitted(null, null, null)` is false, so it
+ * is editable, which is right — nothing has been filed with it.
+ */
+export function partyEditAllowed(step: FreezableStep | undefined): boolean {
+  if (parkedForPartyEdit(step)) return true;
+  return !everSubmitted(step?.state ?? null, step?.providerRef ?? null, step?.detail ?? null);
+}
+
+/**
+ * `partyEditAllowed`, in SQL — so the `UPDATE formation_parties` can carry the rule in its own
+ * WHERE clause, exactly as `INTAKE_FROZEN_SQL` does for the company intake.
+ *
+ * The TypeScript predicate stays: it is what produces `partyFrozenMessage()`, which is the
+ * actionable half of the refusal. This is the second lock, and it is the one that holds when a
+ * caller reaches `parties.update` some other way — a new door, a script, a future repository
+ * method that forgot to ask. A rule enforced only above the write is a rule the next writer has
+ * to remember.
+ *
+ * Bound by `@company_id`, like `INTAKE_FROZEN_SQL`, so the same text works inside the correlated
+ * UPDATE and in a standalone SELECT — which is what lets `test/formation/freeze.test.ts` run the
+ * two spellings over one matrix and assert they agree.
+ *
+ * Two disjuncts, mirroring `partyEditAllowed` clause for clause:
+ *
+ *  1. the row is PARKED awaiting a party edit — `json_type(...) = 'true'` rather than
+ *     `json_extract(...) = 1`, because the TypeScript is `=== true` and `json_extract` cannot
+ *     tell `true` from `1`;
+ *  2. nothing has EVER been sent about this company (`everSubmitted` negated). `json_type` again,
+ *     for a different reason: the TypeScript tests `!== undefined`, so a key present with a JSON
+ *     `null` value counts — and `json_extract` would return SQL NULL for it and lose the fact.
+ */
+export const PARTY_EDIT_ALLOWED_SQL = `(
+      EXISTS (
+        SELECT 1 FROM formation_requests f
+         WHERE f.company_id = @company_id
+           AND f.step = 'create_provider'
+           AND f.detail IS NOT NULL
+           AND json_valid(f.detail) = 1
+           AND json_type(f.detail, '$.awaitingPartyEdit') = 'true')
+      OR NOT EXISTS (
+        SELECT 1 FROM formation_requests f
+         WHERE f.company_id = @company_id
+           AND f.step = 'create_provider'
+           AND (   f.state IN ('submitted','confirmed')
+                OR f.provider_ref IS NOT NULL
+                OR (f.detail IS NOT NULL AND json_valid(f.detail) = 0)
+                OR (f.detail IS NOT NULL AND json_valid(f.detail) = 1
+                    AND (   json_type(f.detail, '$.customerId') IS NOT NULL
+                         OR json_type(f.detail, '$.companySentAttempt') IS NOT NULL)))))`;
+
+/**
+ * THE TWO PARK FLAGS, read the same way (design §4.7).
+ *
+ * `create_provider` makes two doola calls and either body can be the one it refused, so `detail`
+ * carries two flags with two different exits: `awaitingIntakeEdit` is cleared by
+ * `PATCH /companies/:companyId`, `awaitingPartyEdit` by `PATCH /companies/:companyId/party`.
+ *
+ * They live HERE, beside the freeze, because four places read them — the filer, the sweeper, the
+ * company detail view and the party-edit door — and three of those used to do it with their own
+ * inline `parseDetail<{…}>(row.detail).awaitingIntakeEdit === true`. Each copy re-decides what an
+ * UNREADABLE blob means, and the honest answer is "not a park": a park is a claim that a specific
+ * human decision is outstanding, and a corrupt blob is not evidence of one.
+ */
+export function parkedForPartyEdit(step: FreezableStep | undefined): boolean {
+  return parkedFlag(step, "awaitingPartyEdit");
+}
+
+/** The INTAKE half. Same rule, other flag — see `parkedForPartyEdit`. */
+export function parkedForIntakeEdit(step: FreezableStep | undefined): boolean {
+  return parkedFlag(step, "awaitingIntakeEdit");
+}
+
+function parkedFlag(
+  step: FreezableStep | undefined,
+  flag: "awaitingPartyEdit" | "awaitingIntakeEdit",
+): boolean {
+  if (!step?.detail) return false;
+  const parsed = parseJson(step.detail) as Record<string, unknown> | undefined;
+  return parsed !== undefined && parsed[flag] === true;
 }
 
 /** `undefined` means "not valid JSON", which both readers above treat as the cautious answer. */

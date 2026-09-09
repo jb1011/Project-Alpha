@@ -1,15 +1,18 @@
 /**
- * Drift guard over the Vercel proxy's header allowlists (design §8, audit M14/15).
+ * Cross-package drift guard over the Vercel proxy's header allowlists (design §8, audit M14/15).
  *
- * The interface package has no test runner, and the proxy sits between every browser request and
- * this backend — so the guard lives here, in the suite that actually runs in CI. It reads
- * `interface/src/lib/proxyHeaders.ts` as text, exactly like the ABI drift-guard the design calls
- * for on the guardian ABI fragment.
+ * The proxy sits between every browser request and this backend, and it lives in the OTHER
+ * package. What this file can usefully assert is exactly what a reader in this package cannot
+ * check for themselves: that the module and the route file are still where the backend expects
+ * them, and that the allowlists still name — and still do not name — specific headers.
  *
  * What it protects: a document download whose `content-disposition` is dropped arrives with no
  * filename, one whose `x-content-type-options` is dropped is sniffable, and one whose
  * `cache-control` is dropped can be cached by an intermediary that has no business holding one
  * tenant's legal documents. All three are silent failures — the download still "works".
+ *
+ * ⚠ The BEHAVIOUR of the predicates is asserted in `interface/test/proxyHeaders.test.ts`, which
+ * imports and calls them. This file no longer tries to re-derive it from source text.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -104,13 +107,21 @@ test("C9: content-length is never forwarded beside a content-encoding", () => {
   expect(fn).toContain("return FORWARDED_RESPONSE_HEADERS");
 });
 
-test("C9: only the BYTES route is a document-download path, not the JSON index above it", () => {
-  const s = source();
-  const fn = s.slice(s.indexOf("export function isDocumentDownloadPath"));
-  // Two path segments after `documents`, not one: the index route returns JSON and needs none of
-  // the four headers.
-  expect(fn).toContain("documents\\/[^/]+$");
-});
+/**
+ * ⚠ THE PATH GUARDS ARE GONE FROM HERE, and that is the point.
+ *
+ * They used to extract each regex literal from the source with a regex of their own and run it —
+ * a guard whose failure mode is that the EXTRACTOR stops matching, at which point it passes
+ * vacuously and nobody hears about it. It existed because the interface package had no runner.
+ * It has one now: `interface/test/proxyHeaders.test.ts` IMPORTS `isDocumentDownloadPath`,
+ * `isNoStorePath`, `isPublicReferencePath`, `forwardedRequestHeaders` and
+ * `forwardedResponseHeaders` and calls them, which is the thing text can never do.
+ *
+ * What stays here is what only a cross-package guard can say: that the module and the route file
+ * are still WHERE the backend expects them, and that the two allowlists still name — and still do
+ * not name — specific headers. Those are text claims about a file in another package, and text is
+ * the right instrument for them.
+ */
 
 test("the request allowlist still carries what the non-browser protocols need", () => {
   const s = source();
@@ -136,19 +147,19 @@ test("the proxy must NOT forward the doola signature header", () => {
   expect(source().toLowerCase()).not.toContain('"x-doola-signature"');
 });
 
-test("the document paths are in the no-store branch", () => {
+test("the credential-bearing routes are still in the no-store branch", () => {
   const s = source();
-  // The credential-bearing routes that were already there…
+  // These two are matched by EQUALITY, not by a pattern, so the path guard above cannot see them.
   expect(s).toContain('"connection-package"');
   expect(s).toContain('"bootstrap-connection"');
-  // …plus documents, matched as a path pattern because the entity id is in the middle.
-  const fn = s.slice(s.indexOf("export function isNoStorePath"));
-  expect(fn).toContain("documents");
 });
 
 test("the route file uses the allowlists rather than a second copy of them", () => {
   const route = readFileSync(PROXY_ROUTE, "utf8");
-  expect(route).toContain("FORWARDED_REQUEST_HEADERS");
+  // Both RESOLVERS, not the raw lists: which headers cross now depends on the route in BOTH
+  // directions — `if-none-match` on the public reference path, the four download headers on the
+  // document bytes — and a route reading a constant directly would forward one set everywhere.
+  expect(route).toContain("forwardedRequestHeaders(joined)");
   // The RESOLVER, not the raw list: which headers cross now depends on the route and on what the
   // backend answered, and a route that read the constant directly would forward the four
   // download headers everywhere again.

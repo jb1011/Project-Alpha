@@ -15,11 +15,13 @@ import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { type DoolaApi, DoolaApiError } from "../../src/adapters/doola/doolaClient";
 import type { CreateCompanyInput } from "../../src/adapters/doola/types";
+import { partyFrozenMessage } from "../../src/formation";
 import {
   type CreateCompanyDeps,
   createCompany,
   rearmAfterPartyEdit,
   updateCompanyIntake,
+  updateCompanyParty,
 } from "../../src/formation/company";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
 import { parsePiiKey } from "../../src/formation/pii";
@@ -122,20 +124,29 @@ function rejectingDoola(): DoolaApi & { bodies: CreateCompanyInput[] } {
   } as unknown as DoolaApi & { bodies: CreateCompanyInput[] };
 }
 
-/** A doola that rejects `createCustomer` — the PARTY's details — and never reaches the company. */
-function rejectingCustomerDoola(): DoolaApi & { bodies: CreateCompanyInput[] } {
+/**
+ * A doola that rejects `createCustomer` — the PARTY's details — and never reaches the company.
+ *
+ * It RECORDS every customer body it was asked for, which is what makes "the retry went out with
+ * the corrected person" an assertion about the wire rather than about our own row.
+ */
+function rejectingCustomerDoola(): DoolaApi & {
+  bodies: CreateCompanyInput[];
+  customers: Record<string, unknown>[];
+} {
   const api = rejectingDoola();
-  let customerCalls = 0;
+  const customers: Record<string, unknown>[] = [];
   return {
     ...api,
-    createCustomer: async () => {
-      customerCalls++;
+    createCustomer: async (input: Record<string, unknown>) => {
+      customers.push(input);
       throw new DoolaApiError("E_VALIDATION_FAILED", 400, "phone is not a valid number", "req_2");
     },
-    get customerCalls() {
-      return customerCalls;
-    },
-  } as unknown as DoolaApi & { bodies: CreateCompanyInput[] };
+    customers,
+  } as unknown as DoolaApi & {
+    bodies: CreateCompanyInput[];
+    customers: Record<string, unknown>[];
+  };
 }
 
 function file(companyId: string, doola: DoolaApi): Promise<void> {
@@ -346,4 +357,108 @@ test("the A3 hook clears the party flag with the same CAS, and only that flag", 
   expect(parked(other)).toBe(true);
   rearmAfterPartyEdit({ requests }, other);
   expect(parked(other)).toBe(true);
+});
+
+test("A3: a PARTY edit re-arms exactly one retry, and it goes out with the CORRECTED person", () => {
+  // The counterpart of the intake test above, through the door A3 finally gives this park. The
+  // assertion is about the WIRE: the second `createCustomer` carries the new person, not our own
+  // row saying it does.
+  const companyId = mint();
+  const doola = rejectingCustomerDoola();
+  const partyId = parties.findByCompanyId(companyId)!.partyId;
+
+  return (async () => {
+    await file(companyId, doola);
+    expect(doola.customers).toHaveLength(1);
+    expect(doola.customers[0]).toMatchObject({ firstName: "Ada", phoneNumber: "+12125550100" });
+    expect(partyParked(companyId)).toBe(true);
+
+    expect(
+      updateCompanyParty(
+        {
+          companies,
+          parties,
+          requests,
+          sandboxSyntheticPii: false,
+          transaction: (fn) => db.transaction(fn)(),
+        },
+        TENANT,
+        companyId,
+        {
+          legalFirstName: "Grace",
+          legalLastName: "Hopper",
+          email: "grace@example.com",
+          phone: "+13075550142",
+          line1: "30 N Gould St",
+          line2: null,
+          city: "Sheridan",
+          region: "WY",
+          postalCode: "82801",
+          country: "USA",
+        },
+      ),
+    ).toEqual({ partyId });
+    // The flag comes off in the SAME transaction as the edit — the edit is the evidence.
+    expect(partyParked(companyId)).toBe(false);
+    // …and the operator trail still says what doola refused.
+    expect(rowOf(companyId).error).toContain("phone is not a valid number");
+
+    await sweeper(doola).tick();
+
+    expect(doola.customers).toHaveLength(2);
+    expect(doola.customers[1]).toMatchObject({
+      firstName: "Grace",
+      lastName: "Hopper",
+      email: "grace@example.com",
+      phoneNumber: "+13075550142",
+    });
+    // One edit buys ONE retry: doola refused this person too, so it is parked again and the next
+    // sweep does not touch it.
+    expect(partyParked(companyId)).toBe(true);
+    await sweeper(doola).tick();
+    expect(doola.customers).toHaveLength(2);
+  })();
+});
+
+test("A3: a company parked on its INTAKE has a party doola already holds — and it is frozen", () => {
+  // The freeze, seen from the case that actually arises. Reaching `awaitingIntakeEdit` at all
+  // means `createCustomer` SUCCEEDED — `detail.customerId` is set — so doola has this person and
+  // the create step will never ask for them again. Editing our copy would change nothing about
+  // the filing while telling the caller it had, so the door refuses and says where the identity
+  // on a live filing is actually corrected.
+  const companyId = mint();
+  const partyId = parties.findByCompanyId(companyId)!.partyId;
+  return (async () => {
+    await file(companyId, rejectingDoola());
+    expect(parked(companyId)).toBe(true);
+    expect(parseDetail<{ customerId?: string }>(rowOf(companyId).detail).customerId).toBe("cus_1");
+
+    const refused = updateCompanyParty(
+      {
+        companies,
+        parties,
+        requests,
+        sandboxSyntheticPii: false,
+        transaction: (fn) => db.transaction(fn)(),
+      },
+      TENANT,
+      companyId,
+      {
+        legalFirstName: "Grace",
+        legalLastName: "Hopper",
+        email: "grace@example.com",
+        phone: "+13075550142",
+        line1: "30 N Gould St",
+        line2: null,
+        city: "Sheridan",
+        region: "WY",
+        postalCode: "82801",
+        country: "USA",
+      },
+    );
+    expect(refused).toEqual({ error: partyFrozenMessage() });
+    // Nothing moved: not the identity, and not the intake park, which is the intake door's.
+    expect(parties.findOwned(TENANT, partyId)!.legalFirstName).toBe("Ada");
+    expect(parked(companyId)).toBe(true);
+  })();
 });

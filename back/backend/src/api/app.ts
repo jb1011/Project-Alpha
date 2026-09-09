@@ -3,14 +3,17 @@ import { cors } from "hono/cors";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { AuthVars } from "../auth/middleware";
 import { requireAuth } from "../auth/middleware";
+import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
 import { mountMcpRoute } from "../mcp/transport";
 import { apiOnError } from "./errors";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
+import { mountComplianceRoutes } from "./routes/compliance";
 import { mountConnectionRoutes } from "./routes/connection";
 import { mountDocumentRoutes } from "./routes/documents";
 import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
+import { mountFormationRulesRoutes } from "./routes/formationRules";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
@@ -116,6 +119,16 @@ export interface ApiDeps extends EntityViewDeps {
     /** The deployment's pin, copied onto every company this box mints. */
     pin: { provider: string; environment: DoolaEnvironment };
     /**
+     * The compliance-calendar reader — the FIRST consumption of `getComplianceCalendar` (§7).
+     *
+     * Narrowed to the ONE method at the seam, so this dependency cannot become a general-purpose
+     * doola handle sitting on the API deps. It lives under `formation` because reading it needs
+     * the credentials, and it is optional so every existing test wiring builds unchanged; absent
+     * reads as "this box cannot ask", which the route answers 503 to rather than pretending the
+     * calendar is empty.
+     */
+    compliance?: import("./routes/compliance").ComplianceReader;
+    /**
      * The `createCompany` dependency set, built ONCE by the composition root (§7).
      *
      * REST `POST /companies`, MCP `create_company` and the A1 onboard shim all call the same
@@ -200,13 +213,32 @@ export function buildApiApp(deps: ApiDeps) {
       // this route can produce. The wizard labels a sandbox filing amber off this value.
       formationAvailable: Boolean(deps.formation),
       formationEnvironment: deps.formation?.environment ?? null,
-      // Whether onboard will REFUSE without a partyId. The wizard needs it to know whether the
-      // legal-identity phase is a step or an option, and it is only advertised now because the
-      // door gate below actually enforces it.
+      // Whether onboard will REFUSE without a companyId. The wizard needs it to know whether the
+      // legal-body phase is a step or an option. (It said "without a partyId" until A3 removed
+      // the shim; the FLAG is unchanged, what satisfies it is now a company handle.)
       formationRequired: Boolean(deps.formation?.required),
+      /**
+       * PRODUCT COPY the wizard and the Companies section render verbatim (§7) — a deliberate
+       * departure from this route's booleans-only rule, and the same one §6.7 makes for the fee.
+       *
+       * Every sentence in here makes a CLAIM about what this system does: that an SSN is deleted
+       * when the company id is recorded, that one edit buys one retry, that two agents sharing a
+       * company are publicly linkable. A claim that lives in the browser bundle drifts from the
+       * code that keeps it — silently, and in the direction of the older promise. Serving it from
+       * the box that implements the behaviour is what keeps the two together.
+       *
+       * Public-safe by inspection: three constants of prose, no addresses, no prices, no
+       * per-tenant anything. The revenue address stays off this route (§6.7) and so does
+       * everything else that is not a capability or a sentence about one.
+       */
+      formationCopy: { ssn: SSN_COPY, park: PARK_COPY, reuseDisclosure: COMPANY_REUSE_DISCLOSURE },
     }),
   );
   mountSchemaRoutes(app);
+  // Public, like `/schema` and for the same reason: a build-time reference table the wizard's
+  // create-company form reads, carrying nothing about this deployment. See the route for why it
+  // is not a `/config` field.
+  mountFormationRulesRoutes(app);
   // PUBLIC, and necessarily so: doola authenticates with an HMAC over the body, not with our JWT.
   // Mounted BEFORE the /entities auth middleware for the same reason every other public route is,
   // and gated on the credentials that make verification possible at all.
@@ -237,7 +269,7 @@ export function buildApiApp(deps: ApiDeps) {
   };
   protect("/onboard");
   protect("/formation-party");
-  // A3's document routes move under `/companies` as well, and inherit this.
+  // A3's document routes live under `/companies` too, and inherit this.
   protect("/companies");
   protect("/entities");
   protect("/jobs");
@@ -248,8 +280,11 @@ export function buildApiApp(deps: ApiDeps) {
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);
-  // After the `/entities/*` requireAuth line above, so both document routes inherit auth.
+  // After the `/companies/*` requireAuth line above, so both document routes inherit auth.
   mountDocumentRoutes(app, deps);
+  // …and the compliance calendar, which is company-scoped for the same reason and inherits the
+  // same auth. Mounted always: it answers 503 where the deployment cannot ask doola anything.
+  mountComplianceRoutes(app, deps);
   mountTreasuryRoutes(app, deps);
   mountPolicyRoutes(app, deps);
   mountPerTxCapRoutes(app, deps);

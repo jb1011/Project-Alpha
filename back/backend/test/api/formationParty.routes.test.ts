@@ -17,7 +17,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { ApiError } from "../../src/api/errors";
 import { SqliteNonceStore } from "../../src/auth/nonceStore";
-import { createCompany, shimCompanyIntake } from "../../src/formation/company";
+import { createCompany } from "../../src/formation/company";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -108,26 +108,9 @@ function makeApp(
     repo,
     runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
     fundCaps: TEST_FUND_CAPS,
-    // The claim attaches a company and copies the pin off ITS row (2026-08-26 §3); the A1 shim
-    // is what turns a party-only onboard into one.
-    formation: formation
-      ? {
-          companies,
-          requests,
-          maxAgentsPerCompany: 10,
-          createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
-            const result = createCompany(
-              { ...companyDeps, transaction: (fn) => fn() },
-              tenantId,
-              // The SHARED mapping (A2), not a literal: four copies of "what the shim sends" is
-              // four chances for it to mean something different on one surface.
-              shimCompanyIntake(intake, formation.syntheticPii ?? false),
-            );
-            if ("error" in result) throw new ApiError("validation_error", 400, result.error);
-            return result.companyId;
-          },
-        }
-      : undefined,
+    // The claim ATTACHES a company and copies the pin off ITS row (2026-08-26 §3). A3 removed
+    // the shim, so a company is created at its own door and never inside the claim.
+    formation: formation ? { companies, requests, maxAgentsPerCompany: 10 } : undefined,
   });
   return buildApiApp({
     webOrigin: "*",
@@ -198,6 +181,22 @@ const post = (app: ReturnType<typeof buildApiApp>, path: string, token: string, 
     body: JSON.stringify(body),
   });
 
+const patch = (app: ReturnType<typeof buildApiApp>, path: string, token: string, body: unknown) =>
+  app.request(path, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+
+/** The correction a caller sends when doola refuses the person. */
+const CORRECTED_PARTY = {
+  ...REAL_PARTY,
+  legalFirstName: "Grace",
+  legalLastName: "Hopper",
+  email: "grace@example.com",
+  phone: "+13075550142",
+};
+
 // ── POST /formation-party ───────────────────────────────────────────────────────────────────
 
 test("real PII in, an opaque handle out — and NOTHING else in the response", async () => {
@@ -254,12 +253,10 @@ test("it requires auth, and the party belongs to the AUTHENTICATED tenant only",
   const theirs = await login(app, other);
   const { partyId } = await (await post(app, "/formation-party", mine, REAL_PARTY)).json();
   expect(parties.findOwned(other.address, partyId)).toBeUndefined();
-  // …and the other tenant cannot onboard with it: the door refuses it as if it did not exist.
-  const res = await post(app, "/onboard", theirs, {
-    spec: SPEC,
-    guardianPasskey: PASSKEY,
-    partyId,
-  });
+  // …and the other tenant cannot SPEND it: the create door refuses it as if it did not exist.
+  // (It used to be onboard that proved this. A3 removed the party handle from that door, so the
+  // rule is asserted where the party is now actually consumed.)
+  const res = await post(app, "/companies", theirs, { partyId, ...COMPANY_INTAKE });
   expect(res.status).toBe(400);
   expect((await res.json()).error.message).toMatch(/unknown, not yours, or already bound/);
 });
@@ -334,27 +331,45 @@ test("REQUIRED: onboard without a partyId is refused, and NOTHING is claimed", a
   expect(repo.listByTenant(account.address)).toHaveLength(0);
 });
 
-test("REQUIRED: a valid party onboards and is BOUND to the entity the claim mints", async () => {
+test("A3: a partyId at the onboard door is REFUSED, and NOTHING is claimed", async () => {
+  // A1's shim minted a 1:1 company for exactly this request. With it gone, ignoring the field
+  // would take an onboard from a caller who had just posted a real legal identity and believed a
+  // filing was being opened — so the refusal names the door that opens one.
   const app = makeApp({ required: true });
   const token = await login(app);
   const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const res = await post(app, "/onboard", token, { spec: SPEC, guardianPasskey: PASSKEY, partyId });
+  expect(res.status).toBe(400);
+  const message = (await res.json()).error.message as string;
+  expect(message).toMatch(/partyId is not accepted here/);
+  expect(message).toMatch(/POST \/companies/);
+  expect(repo.listByTenant(account.address)).toHaveLength(0);
+  // The party is untouched, and still spendable at the door that takes it.
+  expect(parties.findOwned(account.address, partyId)!.companyId).toBeNull();
+});
+
+test("REQUIRED: create-then-onboard is the whole flow, and the party is bound by the CREATE", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
+  ).json();
+  expect(parties.findByCompanyId(companyId)!.partyId).toBe(partyId);
+
   const res = await post(app, "/onboard", token, {
     spec: SPEC,
     guardianPasskey: PASSKEY,
-    partyId,
+    companyId,
   });
   expect(res.status).toBe(202);
   const { id } = await res.json();
-  expect(parties.findByCompanyId(repo.findByIdempotencyKey(id)!.companyId!)!.partyId).toBe(partyId);
+  expect(repo.findByIdempotencyKey(id)!.companyId).toBe(companyId);
 
-  // Single use: the same handle cannot file a second company.
-  const second = await post(app, "/onboard", token, {
-    spec: { ...SPEC, name: "Second Agent" },
-    guardianPasskey: PASSKEY,
-    partyId,
-  });
+  // Single use, at the door that spends it: the same handle cannot file a second company.
+  const second = await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE });
   expect(second.status).toBe(400);
-  expect(repo.listByTenant(account.address)).toHaveLength(1);
+  expect((await second.json()).error.message).toMatch(/already bound/);
 });
 
 test("NOT required: onboard without a partyId succeeds (formation is opt-in there)", async () => {
@@ -364,14 +379,22 @@ test("NOT required: onboard without a partyId succeeds (formation is opt-in ther
   expect(res.status).toBe(202);
 });
 
-test("C5: NOT required + a party — the entity is PINNED and the party is bound (opt-in filing)", async () => {
-  // ⚠ Supersedes PR 2 decision #2. A bound party is always pinned and always filed; `required`
-  // only decides whether the door refuses an onboard that carries no party. An MCP or REST
-  // caller can therefore opt in to formation on a box where the wizard does not.
+test("C5: NOT required + a company — the entity is PINNED from its row (opt-in filing)", async () => {
+  // ⚠ Supersedes PR 2 decision #2, restated at company scope after A3. A supplied handle is
+  // always honoured; `required` only decides whether the door refuses an onboard that carries
+  // none. An MCP or REST caller can therefore opt in to formation on a box where the wizard
+  // does not.
   const app = makeApp({ required: false });
   const token = await login(app);
   const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
-  const res = await post(app, "/onboard", token, { spec: SPEC, guardianPasskey: PASSKEY, partyId });
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
+  ).json();
+  const res = await post(app, "/onboard", token, {
+    spec: SPEC,
+    guardianPasskey: PASSKEY,
+    companyId,
+  });
   expect(res.status).toBe(202);
   const { id } = await res.json();
   const rec = repo.findByIdempotencyKey(id)!;
@@ -404,36 +427,31 @@ test("ABSENT: a partyId sent to a deployment that forms nothing is refused, neve
   expect(repo.listByTenant(account.address)).toHaveLength(0);
 });
 
-test("the tenant QUOTA refuses the onboard before the entity is minted", async () => {
+test("the tenant QUOTA refuses the CREATE, which is the door that spends", async () => {
+  // It used to be asserted on onboard, because A1's shim made onboard the door that spent. A3
+  // moved the money to `POST /companies` and the quota went with it — `createCompany` counts
+  // CHARGEABLE companies (`ready`, or carrying a live payment), so the first create is what
+  // exhausts a limit of one.
   const app = makeApp({ required: true, maxPerTenant: 1 });
   const token = await login(app);
   const first = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
-  const { id } = await (
-    await post(app, "/onboard", token, {
-      spec: SPEC,
-      guardianPasskey: PASSKEY,
-      partyId: first.partyId,
-    })
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId: first.partyId, ...COMPANY_INTAKE })
   ).json();
-  // The first COMPANY's create_provider row is what burns the door's quota (the company row it
-  // was minted with already burns `createCompany`'s).
-  db.prepare("INSERT INTO formation_requests (company_id, step, state) VALUES (?,?,?)").run(
-    repo.findByIdempotencyKey(id)!.companyId!,
-    "create_provider",
-    "pending",
-  );
+  expect(companyId).toBeTruthy();
 
   const second = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
-  const res = await post(app, "/onboard", token, {
-    spec: { ...SPEC, name: "Second Agent" },
-    guardianPasskey: PASSKEY,
+  const res = await post(app, "/companies", token, {
     partyId: second.partyId,
+    ...COMPANY_INTAKE,
   });
   expect(res.status).toBe(400);
   expect((await res.json()).error.message).toMatch(/formation quota exhausted/);
-  expect(repo.listByTenant(account.address)).toHaveLength(1);
-  // The refused party is still unbound — a refused onboard consumes nothing.
-  expect(parties.findOwned(account.address, second.partyId)!.entityKey).toBeNull();
+  // Read through a repository of its own over the SAME database — `makeApp` keeps its stores
+  // private, exactly as the composition root does.
+  expect(new SqliteCompanyRepository(db).listByTenant(account.address)).toHaveLength(1);
+  // The refused party is still unbound — a refused create consumes nothing.
+  expect(parties.findOwned(account.address, second.partyId)!.companyId).toBeNull();
 });
 
 test("gate ORDER: custody is refused before formation (the REST↔MCP mirror)", async () => {
@@ -466,8 +484,11 @@ test("no PII reaches the entity record or its spec_json", async () => {
   const app = makeApp({ required: true });
   const token = await login(app);
   const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
+  ).json();
   const { id } = await (
-    await post(app, "/onboard", token, { spec: SPEC, guardianPasskey: PASSKEY, partyId })
+    await post(app, "/onboard", token, { spec: SPEC, guardianPasskey: PASSKEY, companyId })
   ).json();
   const rec = repo.findByIdempotencyKey(id)!;
   const printed = JSON.stringify(rec);
@@ -502,21 +523,22 @@ test("POST /companies mints a company through the ONE domain function, and lists
     "environment",
     "filedAt",
     "filingNumber",
-    "formationStatus",
     "industryLabel",
     "legalNameFiled",
     "nameOptions",
-    "paying",
-    "status",
-    "synthetic",
+    "state",
   ]);
+  // …and NOT the four the list has no reader for. `state` is the row's status, its live payment
+  // and its derived filing status combined ONCE, server-side; serving the parts beside it is
+  // three fields nobody reads and an invitation for a fourth renderer to re-combine them
+  // differently. They stay on the DETAIL view.
+  for (const unread of ["status", "synthetic", "formationStatus", "paying"])
+    expect(Object.keys(list.companies[0]), unread).not.toContain(unread);
   expect(list.companies[0]).toMatchObject({
     companyId,
-    status: "ready",
     environment: "sandbox",
-    // DERIVED, both of them: nothing about progress or payment is stored on the company row.
-    formationStatus: "none",
-    paying: false,
+    // The ONE word: paid for (there is nothing to pay during the beta), not filed yet.
+    state: "ready",
     agents: 0,
     // All THREE candidates, canonical, ending split off — the shape the filer sends verbatim.
     nameOptions: [
@@ -677,7 +699,7 @@ test("ATTACH: onboard takes a companyId, and a second agent joins the SAME filin
   expect(repo.listByTenant(account.address)).toHaveLength(2);
 });
 
-test("onboard refuses BOTH handles at once — which identity would the filing be under?", async () => {
+test("A3: a partyId BESIDE a valid companyId is refused too — one handle, one meaning", async () => {
   const app = makeApp({ required: true });
   const token = await login(app);
   const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
@@ -692,7 +714,9 @@ test("onboard refuses BOTH handles at once — which identity would the filing b
     partyId: second.partyId,
   });
   expect(res.status).toBe(400);
-  expect((await res.json()).error.message).toMatch(/not both/);
+  // It used to be its own "pass either… not both" sentence. There is no `both` to disambiguate
+  // any more: the party door and the company door are different doors, and neither is onboard.
+  expect((await res.json()).error.message).toMatch(/partyId is not accepted here/);
 });
 
 test("a FOREIGN company id is refused with the same message as an unknown one", async () => {
@@ -723,4 +747,152 @@ test("a FOREIGN company id is refused with the same message as an unknown one", 
   expect((await foreign.json()).error.message).toBe((await unknown.json()).error.message);
   // …and the OTHER tenant's company is untouched.
   expect(repo.listByTenant(account.address)).toHaveLength(0);
+});
+
+// ── PATCH /companies/:companyId/party (design §7, A3) ───────────────────────────────────────
+
+/** A company with a real bound party, its filing not yet opened — the everyday editable case. */
+async function companyWithParty(app: ReturnType<typeof buildApiApp>, token: string) {
+  const { partyId } = await (await post(app, "/formation-party", token, REAL_PARTY)).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE })
+  ).json();
+  return { partyId, companyId };
+}
+
+test("the party-edit door rewrites the identity and answers with the handle alone", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId, companyId } = await companyWithParty(app, token);
+
+  const res = await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY);
+  expect(res.status).toBe(200);
+  // Exactly one key, for the reason the create gives: echoing the stored identity back would put
+  // PII in a response body and in every client that caches one.
+  expect(await res.json()).toEqual({ partyId });
+  expect(parties.findOwned(account.address, partyId)).toMatchObject({
+    legalFirstName: "Grace",
+    email: "grace@example.com",
+  });
+});
+
+test("it requires a session, and another tenant's company is refused as if it did not exist", async () => {
+  const app = makeApp({ required: true });
+  const mine = await login(app);
+  const theirs = await login(app, other);
+  const { partyId, companyId } = await companyWithParty(app, mine);
+
+  const noAuth = await app.request(`/companies/${companyId}/party`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(CORRECTED_PARTY),
+  });
+  expect(noAuth.status).toBe(401);
+
+  const foreign = await patch(app, `/companies/${companyId}/party`, theirs, CORRECTED_PARTY);
+  const unknown = await patch(
+    app,
+    "/companies/00000000-0000-4000-8000-000000000000/party",
+    theirs,
+    CORRECTED_PARTY,
+  );
+  expect([foreign.status, unknown.status]).toEqual([400, 400]);
+  // One answer for both, or the door is an existence oracle over another tenant's company ids.
+  expect((await foreign.json()).error.message).toBe((await unknown.json()).error.message);
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
+});
+
+/**
+ * WHY THE DOOR IS ADDRESSED BY COMPANY.
+ *
+ * Its first version took a `partyId`, so the only thing between a mistyped uuid and an identity
+ * swap on the wrong Wyoming LLC was the freeze — and an unopened filing passes it. Addressed by
+ * company the party is RESOLVED rather than named, so "edit the other company's person" is not a
+ * request this API can express.
+ */
+test("a tenant with two companies cannot cross-edit: the party is resolved, never named", async () => {
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const a = await companyWithParty(app, token);
+  const b = await companyWithParty(app, token);
+
+  expect((await patch(app, `/companies/${a.companyId}/party`, token, CORRECTED_PARTY)).status).toBe(
+    200,
+  );
+  expect(parties.findOwned(account.address, a.partyId)!.legalFirstName).toBe("Grace");
+  expect(parties.findOwned(account.address, b.partyId)!.legalFirstName).toBe("Ada");
+  // …and there is no door left that takes a party handle at all.
+  expect((await patch(app, `/formation-party/${b.partyId}`, token, CORRECTED_PARTY)).status).toBe(
+    404,
+  );
+});
+
+test("it parses the SAME .strict() schema the create does — an `ssn` key is refused, not dropped", async () => {
+  // There is no `ssn` field on this door and there never will be: the AAD a ciphertext is sealed
+  // under is minted by `POST /companies`, and re-captured only by `PATCH /companies/:companyId`.
+  // `.strict()` is what turns "not a field" into a refusal rather than a silent drop.
+  const app = makeApp({ required: true });
+  const token = await login(app);
+  const { partyId, companyId } = await companyWithParty(app, token);
+
+  const res = await patch(app, `/companies/${companyId}/party`, token, {
+    ...CORRECTED_PARTY,
+    ssn: "123-45-6789",
+  });
+  expect(res.status).toBe(400);
+  // …and no digits of it come back in the refusal.
+  expect(await res.text()).not.toMatch(/\d{3}-\d{2}-\d{4}/);
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
+
+  // The same body WITHOUT it is accepted, so the refusal is about that key alone.
+  expect((await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY)).status).toBe(
+    200,
+  );
+});
+
+/**
+ * The party-edit door is a PII INTAKE, and it was the one that did not run the intake gate.
+ *
+ * `POST /formation-party` refuses real personal data on a sandbox deployment; this door rewrote
+ * the same ten columns with no check at all, so a real name, email, phone and home address could
+ * be written over the labeled fixture and filed to doola's DEVELOPMENT environment as the
+ * responsible person.
+ */
+test("SANDBOX: the edit door refuses a real identity, in the create door's own words", async () => {
+  const app = makeApp({ required: true, syntheticPii: true });
+  const token = await login(app);
+  const { partyId } = await (
+    await post(app, "/formation-party", token, { synthetic: true })
+  ).json();
+  const { companyId } = await (
+    await post(app, "/companies", token, { partyId, ...COMPANY_INTAKE, synthetic: true })
+  ).json();
+
+  const res = await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY);
+  expect(res.status).toBe(400);
+  expect((await res.json()).error.message).toMatch(/FORMATION_SANDBOX_SYNTHETIC_PII/);
+  // Nothing was written: the fixture is intact.
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).not.toBe("Grace");
+});
+
+test("PRODUCTION: the edit door refuses a SYNTHETIC party row, in the create door's own words", async () => {
+  // The mirror image, checked against the ROW rather than the request: the row was minted through
+  // the same gate, so a mismatch is a bug — the bug that puts a real person's identity onto a
+  // filing labeled synthetic on every surface that shows it.
+  const app = makeApp({ required: true, syntheticPii: false });
+  const token = await login(app);
+  const { partyId, companyId } = await companyWithParty(app, token);
+  db.prepare("UPDATE formation_parties SET synthetic = 1 WHERE party_id = ?").run(partyId);
+
+  const res = await patch(app, `/companies/${companyId}/party`, token, CORRECTED_PARTY);
+  expect(res.status).toBe(400);
+  expect((await res.json()).error.message).toMatch(/synthetic formation parties are refused/);
+  expect(parties.findOwned(account.address, partyId)!.legalFirstName).toBe("Ada");
+});
+
+test("a deployment that forms nothing has no party-edit door either (503)", async () => {
+  const app = makeApp(undefined);
+  const token = await login(app);
+  const res = await patch(app, "/companies/whatever/party", token, CORRECTED_PARTY);
+  expect(res.status).toBe(503);
 });

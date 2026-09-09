@@ -49,9 +49,18 @@ export function resolveFormationDeployment(
 // non-null to a 400, MCP to an `isError` text — so the ORDER of the checks cannot differ
 // between the surfaces either, which is the property `server.ts:489-491` asks for.
 
-/** Formation is mandatory here and the caller sent neither a company nor a party handle. */
+/**
+ * Formation is mandatory here and the caller sent no company handle — OR sent a `partyId`, which
+ * this door stopped accepting when the A1 shim was removed (design §7, A3).
+ *
+ * ONE message for both, because they are one instruction: onboard attaches an agent to a company
+ * that already exists, and a company is created at its own door. The shim used to mint a 1:1
+ * company from a party-only onboard, which is why `partyId` was ever a field here; with it gone,
+ * a `partyId` on this request is a caller who believes onboard will file something for them, and
+ * telling them where the create door is IS the refusal.
+ */
 export function formationPartyRequiredMessage(): string {
-  return "formation is required on this deployment: create or reuse a company (POST /companies, or the create_company tool) and pass its companyId to onboard — or pass a partyId and one will be created for you";
+  return "formation is required on this deployment: create a company first (POST /companies, or the create_company tool) and pass its companyId to onboard — onboard no longer creates a company for you, so a partyId is not accepted here";
 }
 
 /** The company handle is unknown, not yours, or not in a state an agent may attach to. ONE
@@ -164,30 +173,6 @@ export function companyNameEndingOnlyMessage(position: number): string {
   return `names[${position - 1}] must contain something other than an entity ending`;
 }
 
-/**
- * THE A1 SHIM's refusals, spelled for the door the caller is actually standing at.
- *
- * A party-only `POST /onboard` (or `onboard_agent`) sends an AGENT NAME. There is no `names`
- * array anywhere in that request — the shim derives a 1:1 company from the agent's name — so
- * "names[0] is blank, all three candidates are required" told that caller to fix a field they
- * had never heard of and could not have sent. A refusal a caller cannot act on is a dead end
- * even when the underlying rule is right, and the underlying rule IS right: "LLC" alone would be
- * filed with Wyoming as "LLC LLC".
- *
- * Same rules, same order, different sentence. They go away with the shim in A3.
- */
-export function shimAgentNameBlankMessage(): string {
-  return "name is blank — this agent's name becomes its company's name, so it has to say something";
-}
-
-export function shimAgentNameTooLongMessage(max: number): string {
-  return `name is longer than ${max} characters, which is the limit Wyoming files a company name under — this agent's name becomes its company's name`;
-}
-
-export function shimAgentNameEndingOnlyMessage(): string {
-  return 'name must contain something other than an entity ending — this agent\'s name becomes its company\'s name, and "LLC" on its own would be filed as "LLC LLC"';
-}
-
 /** Wyoming reserves this word to licensed or chartered entities (see wyRestrictedWords.ts). */
 export function companyNameRestrictedMessage(position: number, word: string): string {
   return `names[${position - 1}] contains the restricted word "${word}" — Wyoming will not file it without a licence or charter we cannot supply on your behalf, so it would come back rejected after the fee was paid`;
@@ -271,6 +256,90 @@ export const SSN_COPY = {
 } as const;
 
 /**
+ * THE THREE PARKS, IN THE OWNER'S WORDS (design §4.6a/§4.7/§7).
+ *
+ * A filing can stop and wait for a human in three ways. All three are correct, all three used to
+ * look identical from outside — a company that had simply stopped — and two of the three have an
+ * exit only the owner can take. `GET /companies/:companyId` reports WHICH; this is what the
+ * section says about it.
+ *
+ * Constants here, beside the code that writes the flags, and served through `/config` so the
+ * browser cannot hold a stale description of a behaviour the backend has since changed. That is
+ * the point of putting copy on a capability document at all: these sentences make CLAIMS about
+ * what the system does, and a claim that drifts from the code is the failure the honesty
+ * invariant exists to prevent.
+ *
+ * `what` is what happened. `youCan` is the sentence next to the button.
+ */
+export const PARK_COPY = {
+  awaitingIntakeEdit: {
+    title: "The filing agent refused this company's details",
+    what: "The provider looked at the company you asked for — the names, the purpose, the industry — and refused it. Re-sending the same request cannot succeed, so nothing is being retried and nothing more will be spent until you change something.",
+    youCan:
+      "Edit the company details below. One edit buys one retry, with the new details, and you will see the result here.",
+  },
+  awaitingPartyEdit: {
+    title: "The filing agent refused the responsible person's details",
+    what: "The provider refused the identity the company would be filed under — a name, an email, a phone number or an address it will not accept. This is a different refusal from the company's own details, and changing those would not fix it.",
+    youCan:
+      "Correct the responsible person below. One correction buys one retry. We do not repeat the provider's own wording, which can name the person.",
+  },
+  awaitingSsnDecision: {
+    title: "The SSN you supplied was deleted before the filing was sent",
+    what: "We delete an SSN within 7 days if the filing has not started, and this filing had not. Sending it now would file under the slower EIN route you did not choose, so nothing has been sent.",
+    youCan:
+      "Supply the number again, or confirm you want the slower SS-4 route. Either choice starts the filing; we will not choose for you.",
+  },
+} as const;
+
+/**
+ * THE PUBLIC-LINKABILITY DISCLOSURE (§7) — said BEFORE the owner confirms, never after.
+ *
+ * Attaching a second agent to a company is free and it is the fastest path, and it has one
+ * consequence nobody would guess: every agent's anchored manifest publishes
+ * `legal.providerCompanyId`, so two agents sharing a company can be linked to each other by
+ * anyone reading the chain. That is a property of anchoring the legal body honestly, not a bug —
+ * and the design's rule is that it is disclosed rather than hidden.
+ *
+ * It lives here so the sentence the user reads is versioned with the manifest field it describes.
+ */
+export const COMPANY_REUSE_DISCLOSURE =
+  "Agents that share a company are publicly linkable. Each agent anchors a record on-chain naming the company it is filed under, so anyone can see that these agents belong to the same legal body — and, through it, to each other. Create a separate company if two agents should not be publicly connected.";
+
+/**
+ * The party-edit door's refusal (design §7, A3).
+ *
+ * It names the ONE case that is editable, exactly as `companyIntakeFrozenMessage` does, because
+ * that is the actionable half — and it is a different case: a company intake re-opens after doola
+ * REJECTED it, while a responsible party is editable only until the filing has been sent at all.
+ * Once `createCustomer` has committed, the create step never sends it again, so an edit here
+ * would change our copy of a person and change nothing about the filing.
+ */
+export function partyFrozenMessage(): string {
+  return "this responsible party can no longer be changed: the filing has already been sent, and the provider will not be asked for this person again. If the provider REFUSED the party, the filing is parked and this door re-opens it; otherwise the identity on a filed company is corrected with the provider directly";
+}
+
+/**
+ * A party edit that changes NOTHING, refused (design §7, A3).
+ *
+ * The edit is what buys a parked filing its one retry: the door clears `awaitingPartyEdit`
+ * because a changed identity is evidence that the next `createCustomer` will carry a different
+ * body. A resubmission of the details already on file is not that evidence — it re-arms a retry
+ * of the exact body doola looked at and refused, which is the loop the park exists to stop, and
+ * it burns an attempt to do it.
+ *
+ * It is a REFUSAL rather than a silent success because the caller needs to know: from the form's
+ * side, "saved" and "saved, and nothing will happen" look identical, and the second is the one
+ * that leaves somebody waiting on a filing that has already given up.
+ *
+ * ⚠ It cannot be detected from the write. SQLite's `changes` counts rows MATCHED, not rows whose
+ * values differ, so an UPDATE that sets every column to the value it already held reports 1.
+ */
+export function partyUnchangedMessage(): string {
+  return "none of these details is different from the one already on file. Correcting the responsible party is what re-opens a filing the provider refused, and re-sending the same body would only have it refused again — change what the provider objected to, or contact the operator if you do not know which field it was";
+}
+
+/**
  * The §4.7 freeze, refused in the caller's terms.
  *
  * It names the one case that IS editable, because that is the actionable half: a filing doola
@@ -279,6 +348,30 @@ export const SSN_COPY = {
 export function companyIntakeFrozenMessage(): string {
   return "this company's intake can no longer be changed: a filing has already been sent for it. Intake is re-openable only after the provider REJECTED the filing, which is the one case that releases the request — otherwise create a new company";
 }
+
+/**
+ * THE WYOMING ANNUAL REPORT, as a placeholder — and as an admission (§7).
+ *
+ * Every Wyoming LLC owes an annual report and a licence-tax filing. What we do NOT know is who
+ * files THIS one: doola's pack includes the registered agent for year one, and the question of
+ * who files the annual report, at what price, and how the reminder arrives went to doola on
+ * 2026-08-27 and has not come back (§10, Externals — there is no renewal webhook event either).
+ *
+ * So the Companies section carries a row that says so, in our words, rather than either
+ * inventing a due date or omitting the obligation entirely. Omitting it is the worse of the two:
+ * an owner reading a compliance calendar with nothing in it concludes there is nothing to do,
+ * and the thing they would have missed costs the company its good standing.
+ *
+ * A constant because it is product copy the UI renders verbatim, and because the day the answer
+ * arrives this is the one place it changes.
+ */
+export const COMPLIANCE_ANNUAL_REPORT = {
+  label: "Wyoming annual report + licence tax",
+  /** Deliberately not a date. We do not know it, and a guess here is a missed filing. */
+  due: "Annually, on the first day of the anniversary month of formation",
+  handledBy: "(ask doola)",
+  note: "Your registered agent is included for the first year. Who files the annual report after that, and at what price, is an open question with the filing agent — we will not guess it here. Confirm it with them before your first anniversary.",
+} as const;
 
 /**
  * The labeled sandbox identity (§3, audit H7).
@@ -314,13 +407,19 @@ export function syntheticFormationParty(partyId: string): {
   };
 }
 
-/** Counting surface behind the two spend controls. Implemented by the formation repository. */
-export interface FormationQuotaReader {
-  /** Lifetime formations opened by one tenant. */
-  createRequestsByTenant(tenantId: string): number;
-  /** Formations opened across the whole deployment since a UTC "YYYY-MM-DD HH:MM:SS" instant. */
-  createRequestsSince(sinceUtc: string): number;
-  /** The attach predicate's steps read. Optional so the pre-company fakes still satisfy it. */
+/**
+ * What the onboard door reads of the sub-saga: the attach predicate's steps, and nothing else.
+ *
+ * It used to be the COUNTING surface behind the two spend controls as well (a per-tenant count of
+ * `create_provider` rows, and `createRequestsSince`). Those controls moved to `createCompany`
+ * with the company door in A1 and are enforced there — this door spends nothing, because
+ * attaching an agent to a company somebody already paid for is free (§3). With the shim gone
+ * there is no remaining path from onboard to a filing, so the counters are not read here at all,
+ * and the per-tenant one is deleted outright: `companies.countChargeableByTenant` is the quota.
+ *
+ * `stepsOf` stays optional so the pre-company fakes still satisfy it.
+ */
+export interface FormationStepsReader {
   stepsOf?(companyId: string): import("./persistence/formationRepository").FormationRequestRecord[];
 }
 
@@ -328,57 +427,57 @@ export interface FormationQuotaReader {
 export interface FormationDoorDeps {
   formation?: {
     required: boolean;
-    maxPerTenant: number;
-    dailyCeiling: number;
     maxAgentsPerCompany: number;
-    parties: import("./persistence/formationPartyRepository").FormationPartyRepository;
-    /** The sub-saga rows. Typed as the narrow COUNTING surface here — the door needs nothing
-     *  else from them, and the full repository satisfies it structurally. */
-    requests: FormationQuotaReader;
+    /** The sub-saga rows, narrowed to the one read the attach predicate makes. */
+    requests: FormationStepsReader;
     /** Companies: what an ATTACH resolves against. The door's check is advisory — the binding
      *  answer is the CAS inside the claim transaction (§3) — but refusing here means an
      *  unattachable company never costs a claim. */
     companies: import("./persistence/companyRepository").CompanyRepository;
   };
-  now?: () => number;
 }
-
-const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** The SQLite TEXT-timestamp formatter, defined beside its parser in `util/sqliteTime` (M4) and
  *  re-exported here for the door's own callers. */
 export { sqliteUtcTimestamp };
 
 /**
- * The formation door gate, in the ONE order both surfaces run it (design §2/§5).
+ * The formation door gate, in the ONE order both surfaces run it (design §2/§5/§7).
  *
  * Returns the refusal message, or null when the request may proceed. Everything here happens
- * BEFORE the entity is claimed: formation is real money in production ($100–150 each), and the
- * user-facing answer to an exhausted quota or pack is a door that refuses, never an entity left
- * live with a mandatory formation that can never happen.
+ * BEFORE the entity is claimed: an entity is never left live owing a mandatory formation that can
+ * never happen.
+ *
+ * ⚠ **It no longer spends anything.** A1's shim made a party-only onboard mint a company, so this
+ * door carried the tenant quota, the platform daily ceiling and the party's single-use check.
+ * A3 removed the shim: onboard now ATTACHES to a company that already exists, which is free
+ * (billing is per company, §3), and every control that guards the money lives in `createCompany`
+ * behind `POST /companies` / `create_company`. What is left here is availability, the mandatory
+ * flag, and the attach predicate.
  */
 export function formationDoorRefusal(
   deps: FormationDoorDeps,
   input: { tenantId: string; partyId?: string; companyId?: string },
 ): string | null {
   const f = deps.formation;
-  const now = deps.now ?? Date.now;
 
   // 1. A deployment that forms nothing. A party or company handle here is a caller who believes
   //    a legal body is being filed; say so instead of dropping it.
   if (!f) return input.partyId || input.companyId ? formationUnavailableMessage() : null;
 
-  // 2. Mandatory formation with no handle of either kind.
-  if (f.required && !input.partyId && !input.companyId) return formationPartyRequiredMessage();
+  // 2. A `partyId` at THIS door, on any deployment that forms. It is not ignored and it is not
+  //    quietly treated as "create me a company": the shim that did that is gone, and a caller
+  //    who sends one believes a filing is being opened for them. The refusal names the door that
+  //    actually opens one. (The field is still READ — by both surfaces, and declared in MCP's
+  //    schema — precisely so that passing one is refused rather than silently dropped.)
+  if (input.partyId) return formationPartyRequiredMessage();
 
-  // 3. ATTACH (§3). An existing company costs nothing new — the filing is already paid for and
-  //    already open — so it short-circuits the spend controls below entirely. Billing is per
-  //    COMPANY: attaching an agent to one is free. The binding check is the CAS inside the claim
-  //    transaction; this one exists so an unattachable company never costs a claim.
+  // 3. Mandatory formation with no company handle.
+  if (f.required && !input.companyId) return formationPartyRequiredMessage();
+
+  // 4. ATTACH (§3). The binding check is the CAS inside the claim transaction; this one exists so
+  //    an unattachable company never costs a claim.
   if (input.companyId) {
-    // Both at once would be ambiguous about which identity the filing is under.
-    if (input.partyId)
-      return "pass either companyId (attach to an existing company) or partyId (create one), not both";
     const company = f.companies.findOwned(input.tenantId, input.companyId);
     if (!company) return companyUnavailableMessage();
     if (
@@ -391,49 +490,8 @@ export function formationDoorRefusal(
       return companyUnavailableMessage();
     if (f.companies.countAgents(input.companyId) >= f.maxAgentsPerCompany)
       return companyAgentCapMessage(f.maxAgentsPerCompany);
-    return null;
   }
 
-  // 4. Ownership + single-use. Uniform message (see formationPartyUnavailableMessage).
-  if (input.partyId) {
-    const party = f.parties.findOwned(input.tenantId, input.partyId);
-    if (!party || party.companyId) return formationPartyUnavailableMessage();
-  }
-
-  // 5. Spend controls, only when a filing will ACTUALLY be initiated — which is exactly when a
-  //    party handle is passed and a NEW company will be minted for it, on EVERY deployment (the
-  //    opt-in semantic). Keyed on the partyId rather than on `required`, because an opt-in filing
-  //    on a `required=false` box costs the same $100–150 as a mandatory one and must count
-  //    against the same limits. `createCompany` re-checks all of it inside the claim.
-  if (!input.partyId) return null;
-
-  const used = f.requests.createRequestsByTenant(input.tenantId);
-  if (used >= f.maxPerTenant) {
-    opsLog("formation_quota_rejected", {
-      reason: "tenant-formation-quota",
-      tenantId: truncateTenant(input.tenantId),
-      used,
-      limit: f.maxPerTenant,
-    });
-    return formationQuotaExhaustedMessage(f.maxPerTenant);
-  }
-
-  const inWindow = f.requests.createRequestsSince(sqliteUtcTimestamp(now() - DAY_MS));
-  if (inWindow >= f.dailyCeiling) {
-    opsLog("formation_ceiling_rejected", {
-      reason: "platform-formation-ceiling",
-      windowCount: inWindow,
-      limit: f.dailyCeiling,
-    });
-    return formationCeilingReachedMessage(f.dailyCeiling);
-  }
-
-  // Within 20% of either limit AFTER this formation: the operator hears about it while there is
-  // still headroom, not when the door starts refusing.
-  warnIfNearLimit("formation_quota_warning", used + 1, f.maxPerTenant, {
-    tenantId: truncateTenant(input.tenantId),
-  });
-  warnIfNearLimit("formation_ceiling_warning", inWindow + 1, f.dailyCeiling, {});
   return null;
 }
 
@@ -473,6 +531,37 @@ export interface FormationPartyIntakeDeps {
 export type FormationPartyIntakeResult = { partyId: string } | { error: string };
 
 /**
+ * THE WIRE SHAPE → THE COLUMN SHAPE, once (design §5/§7).
+ *
+ * `FormationPartySchema` parses a NESTED body (the address is an object, because that is what
+ * doola's API takes and what a form binds to); the table is FLAT, and `line2`/`region` are
+ * `null` rather than absent. Three doors crossed that boundary with their own ten-line literal —
+ * `POST /formation-party`, `PATCH /companies/:companyId/party` and its MCP twin — and each copy
+ * is a chance to write `line2: body.address.line2` (undefined, not null) or to forget `region`
+ * on the door that a French founder uses.
+ *
+ * One function, so the mapping is reviewed once and the doors cannot disagree about what an
+ * omitted optional means.
+ */
+export function partyFieldsOf(
+  parsed: import("./policy/agentSpec").FormationPartyInput,
+): import("./persistence/formationPartyRepository").EditablePartyFields {
+  return {
+    legalFirstName: parsed.legalFirstName,
+    legalLastName: parsed.legalLastName,
+    email: parsed.email,
+    phone: parsed.phone,
+    line1: parsed.address.line1,
+    // NULL, not undefined: the column is nullable and better-sqlite3 refuses an undefined bind.
+    line2: parsed.address.line2 ?? null,
+    city: parsed.address.city,
+    region: parsed.address.region ?? null,
+    postalCode: parsed.address.postalCode,
+    country: parsed.address.country,
+  };
+}
+
+/**
  * Create a formation party from a validated body, or from the sandbox shortcut.
  *
  * Shared by `POST /formation-party` and the `create_formation_party` MCP tool so the two intake
@@ -506,22 +595,10 @@ export function createFormationParty(
   }
   if (deps.sandboxSyntheticPii) return { error: syntheticPiiRequiredMessage() };
   if (!body.parsed) return { error: "a formation party body is required" };
-  const p = body.parsed;
   return {
-    partyId: deps.parties.create({
-      tenantId,
-      legalFirstName: p.legalFirstName,
-      legalLastName: p.legalLastName,
-      email: p.email,
-      phone: p.phone,
-      line1: p.address.line1,
-      line2: p.address.line2 ?? null,
-      city: p.address.city,
-      region: p.address.region ?? null,
-      postalCode: p.address.postalCode,
-      country: p.address.country,
-      synthetic: false,
-    }),
+    // The SAME mapping the edit doors use — see `partyFieldsOf`. `synthetic` is the deployment's,
+    // never the caller's, which is why it is added here rather than being part of the shape.
+    partyId: deps.parties.create({ tenantId, ...partyFieldsOf(body.parsed), synthetic: false }),
   };
 }
 

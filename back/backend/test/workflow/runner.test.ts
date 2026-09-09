@@ -1,8 +1,8 @@
 import type Database from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { loadConfig } from "../../src/config/env";
 import { resolveFormationDeployment } from "../../src/formation";
-import { createCompany, shimCompanyIntake } from "../../src/formation/company";
+import { createCompany } from "../../src/formation/company";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -494,48 +494,87 @@ function partyFixture() {
 }
 
 /**
- * The runner's formation wiring, with the A1 SHIM (design §10).
+ * The runner's formation wiring after A3 (design §3/§7).
  *
- * A party-only onboard — every client that exists today — mints its own 1:1 company inside the
- * claim transaction and attaches the new agent to it. The shim calls the ONE domain function, so
- * this fixture is the composition root in miniature.
+ * There is no shim any more: a company is minted at its own door and this fixture only ever
+ * ATTACHES to one. `newCompany` is what the composition root's `POST /companies` does, called
+ * directly so these tests exercise the claim rather than the create.
  */
 function formationDeps(
   fx: ReturnType<typeof partyFixture>,
   pin: { provider: string; environment: "sandbox" | "production" } | null,
 ) {
   if (!pin) return undefined;
-  return {
-    companies: fx.companies,
-    requests: fx.requests,
-    maxAgentsPerCompany: 10,
-    createCompanyForParty: (tenantId: string, intake: { partyId: string; name: string }) => {
-      const result = createCompany(
-        {
-          companies: fx.companies,
-          parties: fx.parties,
-          requests: fx.requests,
-          pin,
-          sandboxSyntheticPii: false,
-          maxPerTenant: 3,
-          dailyCeiling: 10,
-          transaction: (fn) => fn(),
-        },
-        tenantId,
-        // The SHARED mapping (A2): four copies of "what the shim sends" is four chances for it
-        // to mean something different on one surface.
-        shimCompanyIntake(intake, false),
-      );
-      if ("error" in result) throw new Error(result.error);
-      return result.companyId;
+  return { companies: fx.companies, requests: fx.requests, maxAgentsPerCompany: 10 };
+}
+
+/** A company the tenant owns, through the ONE domain function every real door calls. */
+function newCompany(
+  fx: ReturnType<typeof partyFixture>,
+  pin: { provider: string; environment: "sandbox" | "production" },
+  partyId = fx.partyId,
+): string {
+  const result = createCompany(
+    {
+      companies: fx.companies,
+      parties: fx.parties,
+      requests: fx.requests,
+      pin,
+      sandboxSyntheticPii: false,
+      maxPerTenant: 3,
+      dailyCeiling: 10,
+      transaction: (fn) => fn(),
     },
-  };
+    TENANT,
+    {
+      partyId,
+      names: ["Demo Alpha LLC", "Demo Beta LLC", "Demo Gamma LLC"],
+      businessPurpose: "An autonomous software agent.",
+      industryLabel: "Software development",
+    },
+  );
+  if ("error" in result) throw new Error(result.error);
+  return result.companyId;
 }
 
 const doolaCfg = (over: Record<string, string> = {}) =>
   loadConfig({ ...CFG_BASE, DOOLA_API_KEY: "dk", DOOLA_WEBHOOK_SECRET: "whsec", ...over });
 
-test("C5/A1 shim: a party-only claim mints a company, attaches it, and pins FROM ITS ROW", () => {
+test("A3: an attaching claim pins FROM THE COMPANY ROW, never from config", () => {
+  // Replaces the A1 shim's own test. The shim minted a company inside the claim; A3 removed it,
+  // so the claim's whole formation job is: re-read the company, copy its pin, attach.
+  const fx = partyFixture();
+  const pin = resolveFormationDeployment(doolaCfg())!;
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga,
+    fundCaps: TEST_FUND_CAPS,
+    formation: formationDeps(fx, pin),
+  });
+  const companyId = newCompany(fx, pin);
+  const { id } = runner.start({
+    spec,
+    userKey: "pin-1",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+    companyId,
+  });
+  const rec = repo.findByIdempotencyKey(id)!;
+  expect(rec.companyId).toBe(companyId);
+  expect(rec.formationProvider).toBe("doola");
+  expect(rec.formationEnvironment).toBe("sandbox");
+  // The bind happened at the CREATE door, not here — but it is still one fact: an entity that
+  // owes a filing always has an identity behind it.
+  expect(fx.parties.findByCompanyId(companyId)?.partyId).toBe(fx.partyId);
+  const company = fx.companies.find(companyId)!;
+  expect(company.status).toBe("ready");
+  // A HUMAN typed this intake. `intake_synthesized` survives only on rows the migration wrote.
+  expect(company.intakeSynthesized).toBe(false);
+});
+
+test("A3: the claim no longer takes a partyId at all — the shim's door is gone", () => {
+  // The type says so, and this asserts the RUNTIME shape behind it: a caller who somehow reaches
+  // `start` with a party handle gets an unpinned stub rather than a silently minted company.
   const fx = partyFixture();
   const runner = new OnboardingRunner({
     repo,
@@ -545,22 +584,16 @@ test("C5/A1 shim: a party-only claim mints a company, attaches it, and pins FROM
   });
   const { id } = runner.start({
     spec,
-    userKey: "pin-1",
+    userKey: "no-shim",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId: fx.partyId,
+    ...({ partyId: fx.partyId } as unknown as Record<string, never>),
   });
   const rec = repo.findByIdempotencyKey(id)!;
-  expect(rec.companyId).toBeTruthy();
-  expect(rec.formationProvider).toBe("doola");
-  expect(rec.formationEnvironment).toBe("sandbox");
-  // Attach and bind are ONE fact: an entity that owes a filing always has an identity behind it.
-  expect(fx.parties.findByCompanyId(rec.companyId!)?.partyId).toBe(fx.partyId);
-  // The company landed `ready` with the SYNTHESIZED intake — never `draft`, which would owe a
-  // payment step that does not exist in A1.
-  const company = fx.companies.find(rec.companyId!)!;
-  expect(company.status).toBe("ready");
-  expect(company.intakeSynthesized).toBe(true);
+  expect(rec.companyId).toBeNull();
+  expect(rec.formationProvider).toBeNull();
+  // …and the party is untouched, free for a real company at the door that mints one.
+  expect(fx.parties.findOwned(TENANT, fx.partyId)?.companyId).toBeNull();
 });
 
 test("ATTACH: a second agent joins an existing company, and the party is NOT reused", () => {
@@ -571,14 +604,14 @@ test("ATTACH: a second agent joins an existing company, and the party is NOT reu
     fundCaps: TEST_FUND_CAPS,
     formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
   });
-  const first = runner.start({
+  const companyId = newCompany(fx, resolveFormationDeployment(doolaCfg())!);
+  runner.start({
     spec,
     userKey: "attach-1",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId: fx.partyId,
+    companyId,
   });
-  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
 
   const second = runner.start({
     spec,
@@ -606,14 +639,14 @@ test("ATTACH records what the agent JOINED — an agent attached after the filin
     fundCaps: TEST_FUND_CAPS,
     formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
   });
+  const companyId = newCompany(fx, resolveFormationDeployment(doolaCfg())!);
   const first = runner.start({
     spec,
     userKey: "hist-1",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId: fx.partyId,
+    companyId,
   });
-  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
   // The filing happens BEFORE the second agent exists.
   fx.requests.claimAllSteps(companyId);
   fx.requests.transition(companyId, "create_provider", "pending", "confirmed", {
@@ -631,11 +664,17 @@ test("ATTACH records what the agent JOINED — an agent attached after the filin
     companyId,
   });
 
-  // The SHIM path records nothing: the first agent did not JOIN a filing, it created the 1:1
-  // company it is attached to, and there is no prior history for an event to describe. A
-  // `formationAttached` there would be a spurious `status: "none"` row on every party-only
-  // onboard — which is every client that exists today.
-  expect(repo.listEvents(first.id).filter((e) => e.step === "formationAttached")).toHaveLength(0);
+  // EVERY attach records one now, because every attach IS a join: the first agent joined a
+  // company that already existed, before it had been filed, so its row is the honest `none`.
+  // (Under A1's shim the first agent CREATED its company inside the claim and a
+  // `formationAttached` there would have been a spurious row on every client that existed.)
+  const firstEvents = repo.listEvents(first.id).filter((e) => e.step === "formationAttached");
+  expect(firstEvents).toHaveLength(1);
+  expect(JSON.parse(firstEvents[0]!.detail!)).toMatchObject({
+    companyId,
+    status: "none",
+    ein: false,
+  });
 
   const events = repo.listEvents(second.id).filter((e) => e.step === "formationAttached");
   expect(events).toHaveLength(1);
@@ -664,14 +703,14 @@ test("ATTACH is bounded: FORMATION_MAX_AGENTS_PER_COMPANY refuses inside the cla
     fundCaps: TEST_FUND_CAPS,
     formation: { ...deps, maxAgentsPerCompany: 1 },
   });
-  const first = runner.start({
+  const companyId = newCompany(fx, resolveFormationDeployment(doolaCfg())!);
+  runner.start({
     spec,
     userKey: "cap-1",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId: fx.partyId,
+    companyId,
   });
-  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
   expect(() =>
     runner.start({
       spec,
@@ -694,14 +733,14 @@ test("ATTACH refuses an ABANDONED company — the CAS re-reads it inside the tra
     fundCaps: TEST_FUND_CAPS,
     formation: formationDeps(fx, resolveFormationDeployment(doolaCfg())),
   });
-  const first = runner.start({
+  const companyId = newCompany(fx, resolveFormationDeployment(doolaCfg())!);
+  runner.start({
     spec,
     userKey: "cas-1",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId: fx.partyId,
+    companyId,
   });
-  const companyId = repo.findByIdempotencyKey(first.id)!.companyId!;
   // The race the door check cannot close: the company is abandoned between the door and here.
   fx.companies.setStatus(companyId, "ready", "abandoned");
   expect(() =>
@@ -737,26 +776,25 @@ test("C5: no party and no company pins NOTHING, even with the credentials presen
   expect(rec.formationEnvironment).toBeNull();
 });
 
-test("C5: FORMATION_REQUIRED=false still pins and files an onboard that CARRIES a party", () => {
-  // ⚠ Supersedes PR 2 decision #2. `required` decides whether the door refuses a handle-less
-  // onboard — it does NOT decide whether a supplied party is honoured. Dropping one silently was
-  // the bug: a caller posted a real legal identity, handed over its handle, and got a stub.
+test("C5: FORMATION_REQUIRED=false still pins an onboard that CARRIES a company", () => {
+  // ⚠ Supersedes PR 2 decision #2, restated at company scope. `required` decides whether the door
+  // refuses a handle-less onboard — it does NOT decide whether a supplied handle is honoured.
+  // Dropping one silently was the bug: a caller who had paid for a legal body, handed over its
+  // handle, and got a stub.
   const fx = partyFixture();
+  const pin = resolveFormationDeployment(doolaCfg({ FORMATION_REQUIRED: "false" }))!;
   const runner = new OnboardingRunner({
     repo,
     runSaga,
     fundCaps: TEST_FUND_CAPS,
-    formation: formationDeps(
-      fx,
-      resolveFormationDeployment(doolaCfg({ FORMATION_REQUIRED: "false" })),
-    ),
+    formation: formationDeps(fx, pin),
   });
   const { id } = runner.start({
     spec,
     userKey: "pin-4",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId: fx.partyId,
+    companyId: newCompany(fx, pin),
   });
   const rec = repo.findByIdempotencyKey(id)!;
   expect(rec.formationProvider).toBe("doola");
@@ -771,17 +809,83 @@ test("C1: a credential-less deployment pins nothing — the stub shape, unchange
     fundCaps: TEST_FUND_CAPS,
     formation: formationDeps(fx, resolveFormationDeployment(loadConfig(CFG_BASE))),
   });
+  // A company id from a box that HAD credentials, arriving at one that does not. There is no
+  // formation block to attach through, so the row is a stub — the door refuses this combination
+  // up front (`formationUnavailableMessage`); this is what the claim does if it gets past it.
   const { id } = runner.start({
     spec,
     userKey: "pin-3",
     tenantId: TENANT,
     guardianPasskey: passkey,
-    partyId: fx.partyId,
+    companyId: "company-from-another-box",
   });
-  // Even with a party: there is no provider to pin to, so no company is minted, the row is a stub
-  // and the party stays UNBOUND — free for a real filing later. The door refuses this combination
-  // up front (`formationUnavailableMessage`); this is what the claim does if it gets past it.
   expect(repo.findByIdempotencyKey(id)?.companyId).toBeNull();
   expect(repo.findByIdempotencyKey(id)?.formationProvider).toBeNull();
   expect(fx.parties.findOwned(TENANT, fx.partyId)?.companyId).toBeNull();
+});
+
+test("A3: `company_attach` carries the count BEFORE the attach — reuse is a query over it", () => {
+  // §7 names two events, `company_attach` and `company_reused`, and the second was written as a
+  // line whose only difference from the first was that it fired when `agents > 0`: same ids, same
+  // number, same attach. So there is ONE line and the fan-out question is a query over it —
+  // `company_attach agents>0` is the N:1 sharing actually happening, which is what bounds the
+  // anchor traffic (agents × late facts × two sponsored writes) and what makes two agents
+  // publicly linkable through their manifests.
+  //
+  // The property that makes the query answerable is asserted here: `agents` is the count BEFORE
+  // this attach, so the FIRST agent on a company reads 0 and the second reads 1.
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  try {
+    const fx = partyFixture();
+    const pin = resolveFormationDeployment(doolaCfg())!;
+    const runner = new OnboardingRunner({
+      repo,
+      runSaga,
+      fundCaps: TEST_FUND_CAPS,
+      formation: formationDeps(fx, pin),
+    });
+    const companyId = newCompany(fx, pin);
+
+    runner.start({
+      spec,
+      userKey: "reuse-1",
+      tenantId: TENANT,
+      guardianPasskey: passkey,
+      companyId,
+    });
+    const ops = () =>
+      lines
+        .filter((l) => l.includes('"opslog"'))
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(ops().filter((l) => l.opslog === "company_attach")).toHaveLength(1);
+    // …and the count it carries is the one BEFORE this attach, read in the same transaction as
+    // the cap check: zero agents, so no reuse.
+    expect(ops().find((l) => l.opslog === "company_attach")).toMatchObject({
+      companyId,
+      agents: 0,
+    });
+    // …and no second line saying the same thing: one attach, one event.
+    expect(ops().filter((l) => l.opslog === "company_reused")).toHaveLength(0);
+
+    runner.start({
+      spec,
+      userKey: "reuse-2",
+      tenantId: TENANT,
+      guardianPasskey: passkey,
+      companyId,
+    });
+    const attaches = ops().filter((l) => l.opslog === "company_attach");
+    expect(attaches).toHaveLength(2);
+    // The SECOND attach is the reuse, and it says so with a number rather than with an event.
+    expect(attaches[1]).toMatchObject({ companyId, entityKey: `${TENANT}:reuse-2`, agents: 1 });
+    expect(ops().filter((l) => l.opslog === "company_reused")).toHaveLength(0);
+    // Ids only: a company id is an opaque handle, and nothing about the party behind it belongs
+    // in a log line.
+    expect(JSON.stringify(attaches[1])).not.toMatch(/Ada|Lovelace|@example/);
+  } finally {
+    spy.mockRestore();
+  }
 });

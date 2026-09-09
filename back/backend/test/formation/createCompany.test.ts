@@ -10,7 +10,7 @@
  * Everything refuses BEFORE a row is minted, and the mint itself is one transaction.
  */
 import type DatabaseType from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ApiError } from "../../src/api/errors";
 import { type WorldIdDeps, buildWorldIdDeps } from "../../src/api/routes/worldId";
 import { loadConfig } from "../../src/config/env";
@@ -29,9 +29,6 @@ import {
   formationQuotaExhaustedMessage,
   industryLabelRequiredMessage,
   industryLabelUnknownMessage,
-  shimAgentNameBlankMessage,
-  shimAgentNameEndingOnlyMessage,
-  shimAgentNameTooLongMessage,
   sqliteUtcTimestamp,
   ssnFormatMessage,
   ssnRefusedHereMessage,
@@ -40,12 +37,7 @@ import {
   syntheticPiiRequiredMessage,
 } from "../../src/formation";
 import { type CreateCompanyDeps, createCompany } from "../../src/formation/company";
-import {
-  DEFAULT_DESCRIPTION,
-  DEFAULT_INDUSTRY,
-  NAME_MAX_LENGTH,
-  PURPOSE_MAX_LENGTH,
-} from "../../src/formation/intake";
+import { DEFAULT_INDUSTRY, NAME_MAX_LENGTH, PURPOSE_MAX_LENGTH } from "../../src/formation/intake";
 import { decryptSsn, parsePiiKey } from "../../src/formation/pii";
 import { hasLivePayment } from "../../src/formation/status";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -131,13 +123,6 @@ const intake = (partyId: string, over: Record<string, unknown> = {}) => ({
 /** A second, distinct set of candidates, for the tests that mint twice. */
 const SECOND_NAMES = ["Beta Works", "Beta Systems", "Beta Foundry"];
 
-/** The A1 SHIM's intake, which is the ONLY caller that may derive a name (§10). */
-const shimIntake = (partyId: string, over: Record<string, unknown> = {}) => ({
-  partyId,
-  synthesizedName: "Acme Robotics LLC",
-  ...over,
-});
-
 // ── the happy path ─────────────────────────────────────────────────────────────────────────
 
 test("A2 mints a READY company from the REAL intake, in the canonical shape", () => {
@@ -167,45 +152,37 @@ test("A2 mints a READY company from the REAL intake, in the canonical shape", ()
   expect(parties.findOwned(TENANT, partyId)!.companyId).toBe(company.companyId);
 });
 
-test("the A1 SHIM still mints its 1:1 synthesized company — every existing client keeps working", () => {
-  // §10: the synthesized path survives A2 for the shim ALONE, and is removed in A3. It is spelled
-  // `synthesizedName` rather than `name` precisely so a production door cannot reach it.
-  const result = createCompany(deps(), TENANT, shimIntake(newParty()));
-  const company = companies.find((result as { companyId: string }).companyId)!;
-  expect(company.intakeSynthesized).toBe(true);
-  expect(company.nameOptions).toEqual([
-    { name: "Acme Robotics", entityTypeEnding: "LLC", position: 1 },
-  ]);
-  expect(company.businessPurpose).toBe(DEFAULT_DESCRIPTION);
-  expect(company.industryLabel).toBe(DEFAULT_INDUSTRY);
-});
-
-test("the SHIM refuses in its OWN words — it never names a field its caller cannot send", () => {
-  // The bug: a party-only `POST /onboard` sends an AGENT NAME. There is no `names` array anywhere
-  // in that request, so "names[0] is blank — all three candidates are required" told the caller
-  // to fix a field they had never heard of. Same rules, same order, a sentence they can act on.
-  for (const [label, name, expected] of [
-    ["blank", "   ", shimAgentNameBlankMessage()],
-    ["ending only", "LLC", shimAgentNameEndingOnlyMessage()],
-    ["too long", "A".repeat(NAME_MAX_LENGTH + 1), shimAgentNameTooLongMessage(NAME_MAX_LENGTH)],
-  ] as const) {
-    const result = createCompany(deps(), TENANT, shimIntake(newParty(), { synthesizedName: name }));
-    expect(result, label).toEqual({ error: expected });
-    // …and no `names[` anywhere in it, which is the property rather than the wording.
-    expect((result as { error: string }).error, label).not.toContain("names[");
-  }
+test("A3: there is NO derived-name path left — the shim's field does not exist", () => {
+  // A2 kept `synthesizedName` as a structurally distinct shape so no production door could fall
+  // into the derived path by leaving a field out. A3 removed the shim, so the safest version of
+  // that rule is that the field is not a field: an object carrying it is an object with three
+  // name candidates missing, and the door says exactly that.
+  const result = createCompany(deps(), TENANT, {
+    partyId: newParty(),
+    ...({ synthesizedName: "Acme Robotics LLC" } as unknown as Record<string, never>),
+  });
+  expect(result).toEqual({ error: companyNamesRequiredMessage() });
   expect(companies.listByTenant(TENANT)).toHaveLength(0);
 });
 
-test("the PRODUCTION door still names the position — three candidates, three places to be wrong", () => {
-  // The other half: the shim's softer wording must not have leaked onto the door that really does
-  // take three candidates, where "names[1]" is exactly what a caller needs to hear.
+test("A3: an intake a HUMAN typed is never marked synthesized", () => {
+  // `intake_synthesized = 1` now means exactly one thing: the MIGRATION derived this row. With
+  // the shim gone nothing else can write it, which is what makes the column readable.
+  const result = createCompany(deps(), TENANT, intake(newParty()));
+  expect(companies.find((result as { companyId: string }).companyId)!.intakeSynthesized).toBe(
+    false,
+  );
+});
+
+test("the door names the POSITION — three candidates, three places to be wrong", () => {
+  // "names[1]" is exactly what a caller filling in three fields needs to hear. (The shim had its
+  // own softer sentences for a caller who had never seen a `names` array; those went with it.)
   expect(
     createCompany(deps(), TENANT, intake(newParty(), { names: ["Acme One", "  ", "Acme Three"] })),
   ).toEqual({ error: companyNameBlankMessage(2) });
 });
 
-test("the production doors REQUIRE the full shape — no defaults, no single name", () => {
+test("the doors REQUIRE the full shape — no defaults, no single name", () => {
   // A door that could fall back to a derived name is a door that files a company nobody
   // described, under a purpose nobody wrote.
   expect(createCompany(deps(), TENANT, intake(newParty(), { names: undefined }))).toEqual({
@@ -313,6 +290,69 @@ test("the platform DAILY ceiling counts create_provider rows, where the fee is i
   expect("companyId" in createCompany(deps({ dailyCeiling: 2 }), TENANT, intake(newParty()))).toBe(
     true,
   );
+});
+
+/**
+ * BOTH near-limit warnings, because they warn different people about different things.
+ *
+ * The quota is one tenant approaching their own ceiling. The DAILY CEILING is the PLATFORM
+ * approaching a limit that will then refuse every tenant at once — and its warning was written by
+ * the door gate A3 deleted, and not carried over with the quota's. The only remaining signal for
+ * it was `formation_ceiling_rejected`, which fires once the platform has already stopped forming
+ * companies: an alert that arrives after the outage rather than before it.
+ */
+test("both near-limit warnings fire while there is still headroom", () => {
+  const printed: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    printed.push(args.map(String).join(" "));
+  });
+  try {
+    // One `create_provider` row already in the window, and a ceiling of 2: this create takes the
+    // platform to the limit, which is "within 20% after this request".
+    db.prepare(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment,
+                              name_options, business_purpose, industry_label)
+       VALUES ('c1', ?, 'ready', 'doola', 'sandbox', '[]', 'p', 'i')`,
+    ).run(OTHER);
+    db.prepare(
+      "INSERT INTO formation_requests (company_id, step, state, created_at) VALUES (?,?,?,?)",
+    ).run("c1", "create_provider", "confirmed", sqliteUtcTimestamp(NOW - 60_000));
+
+    expect(
+      "companyId" in
+        createCompany(deps({ dailyCeiling: 2, maxPerTenant: 1 }), TENANT, intake(newParty())),
+    ).toBe(true);
+
+    const lines = printed.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const quota = lines.find((l) => l.opslog === "formation_quota_warning");
+    const ceiling = lines.find((l) => l.opslog === "formation_ceiling_warning");
+    expect(quota).toMatchObject({ level: "warn", used: 1, limit: 1, remaining: 0 });
+    expect(ceiling).toMatchObject({ level: "warn", used: 2, limit: 2, remaining: 0 });
+    // The ceiling is a PLATFORM condition: naming the tenant that happened to trip it would read
+    // as blame for something no tenant caused.
+    expect(ceiling).not.toHaveProperty("tenantId");
+    // …and the quota's does name one, because that one is exactly who it is about.
+    expect(quota).toHaveProperty("tenantId");
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("neither warning fires while both limits have real headroom", () => {
+  const printed: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    printed.push(args.map(String).join(" "));
+  });
+  try {
+    expect(
+      "companyId" in
+        createCompany(deps({ dailyCeiling: 100, maxPerTenant: 100 }), TENANT, intake(newParty())),
+    ).toBe(true);
+    expect(printed.join("\n")).not.toContain("formation_quota_warning");
+    expect(printed.join("\n")).not.toContain("formation_ceiling_warning");
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 // ── the synthetic-PII refusals, in BOTH directions ─────────────────────────────────────────

@@ -262,8 +262,8 @@ test("C2: a READY company with a party but NO formation rows is opened and filed
 test("C2: a company pinned to the OTHER environment is not opened, and mints no row at all", async () => {
   // The pin is part of the due-set query, not a check the create step makes afterwards. Opening
   // a company mints a `create_provider` row, and that row is what `createRequestsSince` (the
-  // platform DAILY ceiling) and `createRequestsByTenant` (the tenant quota) count — so a company
-  // this deployment can never file used to burn a ceiling slot on every single tick.
+  // platform DAILY ceiling) counts — so a company this deployment can never file used to burn a
+  // ceiling slot on every single tick.
   seedCompany(companies, { environment: "production" });
   repo.upsert(
     formedEntity({

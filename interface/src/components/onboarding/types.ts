@@ -1,9 +1,16 @@
 export type Phase =
   | "welcome"
   | "guardian"
-  /** The responsible natural person a real filing names (design §3/§8). Present only where the
-   *  deployment can actually form entities — see `visiblePhases`. */
-  | "legal-identity"
+  /**
+   * The LEGAL BODY this agent is filed under (design §7, A3).
+   *
+   * It was `legal-identity` — a screen that collected one person and handed the backend's shim a
+   * party handle. With the shim gone the phase does what its name now says: pick a company you
+   * already own, or create one (which collects the person as part of doing so).
+   *
+   * Present only where the deployment can actually form entities — see `visiblePhases`.
+   */
+  | "legal-body"
   | "custody"
   | "configure"
   | "agreement"
@@ -23,7 +30,12 @@ export type AllowlistEntry = {
   address: string;
 };
 
-import type { EntityView, FormationPartyInput, GuardianPasskey } from "@/lib/api/types";
+import type {
+  CompanyView,
+  EntityView,
+  FormationPartyInput,
+  GuardianPasskey,
+} from "@/lib/api/types";
 
 export type AgentConfig = {
   name: string;
@@ -48,13 +60,32 @@ export type OnboardingSession = {
   idempotencyKey: string | null;
   entity: EntityView | null;
   guardianPasskey: GuardianPasskey | null;
-  /** The OPAQUE handle `POST /formation-party` returned — never the identity behind it. This is
-   *  the only thing the legal-identity phase leaves in wizard state, and the only formation datum
-   *  the persistence allowlist carries. */
-  partyId: string | null;
-  /** Whether that handle is the labeled sandbox fixture rather than a real person. Kept so the
-   *  wizard can keep saying "demo" after a reload instead of quietly promoting it. */
-  partySynthetic: boolean;
+  /**
+   * The OPAQUE company handle this agent will be attached to — the ONE thing the legal-body phase
+   * leaves in wizard state, and the only formation datum the persistence allowlist carries
+   * (§7, A3).
+   *
+   * It replaces `partyId` and `partySynthetic` together. The party handle is no longer an onboard
+   * concept at all (the door refuses one), and the "is this a demo?" flag is no longer wizard
+   * state: it is the COMPANY ROW's `environment`, which is stamped at creation and immutable
+   * after — so a company minted in sandbox stays a sandbox filing on a box that has since been
+   * re-pointed at production, which a remembered boolean would get exactly backwards.
+   */
+  companyId: string | null;
+  /**
+   * The picked company's ROW, carried so the screens after the legal-body step can name its
+   * environment without asking for it again (§7, A3).
+   *
+   * ⚠ IN MEMORY ONLY. It is not in `PERSISTED_SESSION_KEYS` and must not be: `companyId` is the
+   * handle that survives a reload, and a restored session re-reads the row from the server rather
+   * than trusting a copy that may be days old. Carrying it within a session is what removes the
+   * blocking `loading` beat on the confirm screen — the row is seeded into the company query,
+   * which still FETCHES when there is no seed.
+   *
+   * No PII: a company view carries name candidates, a purpose, an industry and filing facts. The
+   * responsible party is not projected onto it on any surface.
+   */
+  company: CompanyView | null;
 };
 
 export const emptySession = (): OnboardingSession => ({
@@ -62,8 +93,8 @@ export const emptySession = (): OnboardingSession => ({
   idempotencyKey: null,
   entity: null,
   guardianPasskey: null,
-  partyId: null,
-  partySynthetic: false,
+  companyId: null,
+  company: null,
 });
 
 export type PhaseMeta = { id: Phase; label: string };
@@ -79,7 +110,7 @@ export type PhaseMeta = { id: Phase; label: string };
 export const PHASES: PhaseMeta[] = [
   { id: "welcome", label: "Wallet & passkey" },
   { id: "guardian", label: "Accountable human" },
-  { id: "legal-identity", label: "Legal identity" },
+  { id: "legal-body", label: "Legal body" },
   { id: "custody", label: "Key custody" },
   { id: "configure", label: "Define agent" },
   { id: "agreement", label: "Operating agreement" },
@@ -97,7 +128,7 @@ export const PHASES: PhaseMeta[] = [
  * endpoint would answer 503.
  */
 export function visiblePhases(formationAvailable: boolean): PhaseMeta[] {
-  return formationAvailable ? PHASES : PHASES.filter((p) => p.id !== "legal-identity");
+  return formationAvailable ? PHASES : PHASES.filter((p) => p.id !== "legal-body");
 }
 
 export function indexIn(phases: PhaseMeta[], phase: Phase): number {
@@ -113,13 +144,13 @@ export function indexIn(phases: PhaseMeta[], phase: Phase): number {
  * The wizard keeps working, and every position it reports is wrong by one screen.
  *
  * It breaks for reasons that are ordinary rather than exotic: a session restored from storage on
- * the `legal-identity` step while `GET /config` is still in flight (formation unknown → the step
+ * the `legal-body` step while `GET /config` is still in flight (formation unknown → the step
  * is hidden), the same session after `/config` failed, or a deployment that turned formation off
  * between two visits. All three are "the stored phase is no longer on the list", and all three
  * used to render the phantom step.
  *
  * Where it snaps to:
- *   - `legal-identity` → `custody`, the phase the flow itself sends users to when the step is
+ *   - `legal-body` → `custody`, the phase the flow itself sends users to when the step is
  *     skipped or absent. Snapping BACKWARDS here would re-run the accountable-human step for
  *     somebody who already completed it.
  *   - anything else → the nearest surviving phase BEFORE it, so a snap can never carry someone
@@ -131,7 +162,7 @@ export function indexIn(phases: PhaseMeta[], phase: Phase): number {
  */
 export function snapToVisiblePhase(phases: PhaseMeta[], phase: Phase): Phase {
   if (indexIn(phases, phase) >= 0) return phase;
-  if (phase === "legal-identity" && indexIn(phases, "custody") >= 0) return "custody";
+  if (phase === "legal-body" && indexIn(phases, "custody") >= 0) return "custody";
 
   const canonical = PHASES.findIndex((p) => p.id === phase);
   for (let i = canonical - 1; i >= 0; i--) {
@@ -142,9 +173,56 @@ export function snapToVisiblePhase(phases: PhaseMeta[], phase: Phase): Phase {
 }
 
 /**
+ * THE RESUME RULE: may this restored session go on from where it left off? (design §7, A3.)
+ *
+ * Pure, and its own function, because it is the one decision in the wizard that is about a
+ * session that was written by a DIFFERENT version of this code — and the interface runner is
+ * deliberately not a component runner, so anything worth asserting has to be a function a
+ * component calls.
+ *
+ * Two reasons a session is sent back to `legal-body`, and they are not the same reason:
+ *
+ *  1. **the deployment REQUIRES a filing** and this session has no company. The passkey
+ *     precedent: a restored session that lost the credential a step produces re-does that step,
+ *     rather than carrying the user to a submit that will be refused. It corrects a race too (a
+ *     fast click while `GET /config` is still in flight);
+ *  2. **the session came from v2 carrying a PARTY HANDLE** (`needsCompany`). That handle bought
+ *     a company under A1's shim; A3 removed the shim, so it now buys nothing and the onboard
+ *     door refuses it outright. Such a session is past a step whose product no longer exists,
+ *     and it is sent back on ANY deployment that forms — not only a requiring one — because the
+ *     user did ask for a legal body and the wizard would otherwise quietly drop it.
+ *
+ * ⚠ Reason 2 is spent by the first deliberate navigation (the flow clears `needsCompany` in
+ * `goTo`). Without that, a user on a deployment where formation is OPTIONAL who answers the
+ * bounce by clicking "Skip — no legal filing" would be bounced straight back, forever.
+ *
+ * NEVER once the entity exists: by `deploy` the handle has been consumed by /onboard, and sending
+ * the user back to pick another company would be nonsense.
+ */
+export function resumePhase(input: {
+  phases: PhaseMeta[];
+  storedPhase: Phase;
+  /** `GET /config`: anything other than an explicit `true` means "does not form". */
+  formationAvailable: boolean;
+  formationRequired: boolean;
+  companyId: string | null;
+  entityId: string | null;
+  /** A v2 session that carried a party handle and no company. */
+  needsCompany: boolean;
+}): Phase {
+  const { phases, storedPhase } = input;
+  if (!input.formationAvailable) return storedPhase;
+  if (!input.formationRequired && !input.needsCompany) return storedPhase;
+  if (input.companyId || input.entityId) return storedPhase;
+  if (storedPhase === "dashboard") return storedPhase;
+  // Never FORWARD: a session that has not reached the legal-body step yet is left where it is.
+  return indexIn(phases, storedPhase) > indexIn(phases, "legal-body") ? "legal-body" : storedPhase;
+}
+
+/**
  * The neighbours of a phase IN THE VISIBLE LIST — the only list that knows.
  *
- * These replace hand-rolled ternaries at the two seams where the optional legal-identity step
+ * These replace hand-rolled ternaries at the two seams where the optional legal-body step
  * sits (`guardian → ?` forwards, `custody → ?` backwards). Each ternary re-derived the same fact
  * `visiblePhases` already holds, from a different input (`formationAvailable` rather than the list
  * itself), which is two answers to one question — and the day a second optional phase appears,

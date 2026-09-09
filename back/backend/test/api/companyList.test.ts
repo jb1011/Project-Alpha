@@ -129,6 +129,28 @@ test("the batched counts agree with the per-row ones, including for a company wi
   expect(paying.has(lonely)).toBe(false);
 
   const views = listCompanyViews({ companies }, TENANT);
-  expect(views.find((v) => v.companyId === lonely)).toMatchObject({ agents: 0, paying: false });
-  expect(views.find((v) => v.companyId === withAgents)).toMatchObject({ agents: 2, paying: true });
+  // `paying` is no longer a LIST field — it is one of the three inputs `state` combines, and the
+  // combination is what the list serves. A live quote reads as `paying` in the one word.
+  expect(views.find((v) => v.companyId === lonely)).toMatchObject({ agents: 0, state: "ready" });
+  expect(views.find((v) => v.companyId === withAgents)).toMatchObject({
+    agents: 2,
+    state: "paying",
+  });
+});
+
+test("createdAt is EPOCH MS — a number, like every other instant this API serves", () => {
+  // It used to be the raw `CURRENT_TIMESTAMP` TEXT ("YYYY-MM-DD HH:MM:SS", UTC, no zone marker),
+  // which made every client responsible for knowing that last fact — and the interface's did it
+  // by concatenating a "Z" back on, in a browser, on a legal surface. A client that forgot would
+  // shift a company's creation date by its own offset: a wrong fact, quietly, for some readers.
+  const before = Date.now();
+  seed(1);
+  const [row] = listCompanyViews({ companies, formationSteps: () => [] }, TENANT);
+
+  expect(typeof row!.createdAt).toBe("number");
+  // Within a minute of now, and in the right MILLENNIUM — a seconds-vs-milliseconds mix-up is the
+  // failure this assertion is actually shaped to catch.
+  expect(row!.createdAt).toBeGreaterThan(before - 60_000);
+  expect(row!.createdAt).toBeLessThan(before + 60_000);
+  expect(new Date(row!.createdAt).getUTCFullYear()).toBe(new Date(before).getUTCFullYear());
 });

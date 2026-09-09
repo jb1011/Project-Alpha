@@ -1,9 +1,15 @@
+import { awaitsSsnDecision, parkedForIntakeEdit, parkedForPartyEdit } from "../formation/freeze";
 import {
+  type CompanyState,
   type FormationStatus,
   type FormationSummary,
+  companyState,
   deriveFormationStatus,
   formationSummary,
+  hasLivePayment,
   livePaymentLookup,
+  providerRefOf,
+  requiredActionCodesOf,
 } from "../formation/status";
 import type { CompanyRecord } from "../persistence/companyRepository";
 import {
@@ -11,8 +17,10 @@ import {
   type DocumentIndexRepository,
   documentFileName,
 } from "../persistence/documentIndexRepository";
+import { parseDetail } from "../persistence/formationRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
 import type { EntityRecord } from "../types";
+import { parseSqliteUtc } from "../util/sqliteTime";
 import { usesManifestScheme } from "../workflow/onboarding";
 
 /** The formation sub-saga rows of one COMPANY. A function rather than the repository so the view
@@ -58,6 +66,55 @@ export interface EntityViewDeps {
    */
   documents?: Pick<DocumentIndexRepository, "listByCompany"> &
     Partial<Pick<DocumentIndexRepository, "listByCompanies">>;
+  /**
+   * How many agents share each company — the §7 SHARING LABEL's one input.
+   *
+   * Narrowed to the two counting reads, batched twin included, because a page of ten agents may
+   * be one company and asking ten times is the N+1 `toEntityViews` exists to remove.
+   *
+   * ⚠ AUTHENTICATED SURFACES ONLY, and structurally so: this dependency reaches `EntityView`,
+   * which serves `GET /entities` and the three tenant-scoped MCP read tools. `/transparency` and
+   * `/metadata` build their row shapes from `formationSummary` and never see this object at all.
+   */
+  companyAgents?: Pick<
+    import("../persistence/companyRepository").CompanyRepository,
+    "countAgents" | "countAgentsMany"
+  >;
+}
+
+/**
+ * EVERY KEY OF `EntityViewDeps`, as a runtime list — and a COMPILE ERROR if one is missing.
+ *
+ * `EntityViewDeps` was made one object because the MCP transport used to enumerate the view
+ * dependencies by hand and forgot the document index: `get_entity` over MCP described an entity
+ * with no legal documents while REST described the same entity with two, and nothing failed.
+ * The type stopped the object from being PARTIAL; it did not stop a second surface from picking
+ * a subset of it, and the transport went on doing exactly that — so A3's sharing label reached
+ * REST and not MCP, and the bug reappeared field-for-field.
+ *
+ * This is the fix that closes the class rather than the instance. `entityViewDepsOf` copies the
+ * whole set, the list lives NEXT TO the interface where a field is actually added, and
+ * `_assertEveryEntityViewDepListed` below fails to COMPILE if a new key is not added to it.
+ */
+export const ENTITY_VIEW_DEP_KEYS = [
+  "formationSteps",
+  "formationStepsMany",
+  "company",
+  "companyMany",
+  "documents",
+  "companyAgents",
+] as const satisfies readonly (keyof EntityViewDeps)[];
+
+/** Fails to compile the moment `EntityViewDeps` grows a key the list above does not name. */
+type MissingEntityViewDep = Exclude<keyof EntityViewDeps, (typeof ENTITY_VIEW_DEP_KEYS)[number]>;
+const _assertEveryEntityViewDepListed: MissingEntityViewDep extends never ? true : never = true;
+void _assertEveryEntityViewDepListed;
+
+/** The view slice of a larger dependency object — the ONE way a second surface takes it. */
+export function entityViewDepsOf(deps: EntityViewDeps): EntityViewDeps {
+  const out: Record<string, unknown> = {};
+  for (const key of ENTITY_VIEW_DEP_KEYS) out[key] = deps[key];
+  return out as EntityViewDeps;
 }
 
 /**
@@ -73,22 +130,40 @@ export interface EntityViewDeps {
  */
 export interface CompanyView {
   companyId: string;
-  status: CompanyRecord["status"];
   environment: CompanyRecord["environment"];
-  synthetic: boolean;
   nameOptions: CompanyRecord["nameOptions"];
   legalNameFiled: string | null;
   businessPurpose: string;
   industryLabel: string;
-  /** DERIVED from the sub-saga rows; nothing about progress is stored on the company. */
-  formationStatus: FormationStatus;
-  /** DERIVED from `formation_payments`; nothing about payment is stored on the company either. */
-  paying: boolean;
+  /**
+   * The eight-word state §7's Companies section renders — the row's status, a live payment and
+   * the derived filing status, combined ONCE, server-side.
+   *
+   * It used to be served BESIDE its three inputs (`status`, `formationStatus`, `paying`) on the
+   * reasoning that a picker filtering for "attachable" would want the raw status. Nothing ever
+   * did: `canAttach` reads this word, the pill reads this word, and the list page reads this
+   * word. Three fields nobody reads are three fields a fourth renderer can re-combine for itself
+   * — differently — which is the exact disagreement combining once was for. They stay on the
+   * DETAIL view, where a page showing one company can honestly show its parts.
+   */
+  state: CompanyState;
   filedAt: number | null;
   filingNumber: string | null;
   /** How many agents SHARE this filing. Authenticated surfaces only (§7 sharing labels). */
   agents: number;
-  createdAt: string;
+  /**
+   * EPOCH MILLISECONDS — a number, like every other instant this API serves.
+   *
+   * It used to be the raw `CURRENT_TIMESTAMP` TEXT the column holds
+   * (`"YYYY-MM-DD HH:MM:SS"`, UTC, with no zone marker), which made every client responsible for
+   * knowing that last fact. The interface's did it with `Date.parse(\`${x}Z\`)` — a string
+   * concatenation reconstructing a timezone the wire format had thrown away, in a browser, on a
+   * legal surface. Any client that forgot the `Z` would render a company's creation date shifted
+   * by its own offset, which is a wrong fact quietly, and only for some readers.
+   *
+   * Converted here, once, by the same parser the sweeper reads these columns with.
+   */
+  createdAt: number;
 }
 
 /** What a company list needs beyond the rows themselves. */
@@ -113,24 +188,52 @@ export function listCompanyViews(deps: CompanyListDeps, tenantId: string): Compa
   const steps = deps.formationStepsMany?.(ids);
   const agents = deps.companies.countAgentsMany(ids);
   const paying = livePaymentLookup(deps.companies, ids);
-  return rows.map((company) => ({
+  return rows.map((company) => {
+    // ONE steps read and ONE payment read per row, named once each: `state` is a projection of
+    // those rows, and asking twice is two queries AND two possibly-different answers.
+    const rowSteps =
+      steps?.get(company.companyId) ?? deps.formationSteps?.(company.companyId) ?? [];
+    return toCompanyView(
+      company,
+      rowSteps,
+      paying(company.companyId),
+      agents.get(company.companyId) ?? 0,
+    );
+  });
+}
+
+/**
+ * ONE company row → the LIST projection, and the base of the detail one (§7).
+ *
+ * The two used to be two object literals over the same twelve fields, and the class of bug that
+ * produces is not hypothetical: `list_companies` had already drifted from `GET /companies` once,
+ * silently dropping the business purpose, the industry and both filing facts, and nothing failed
+ * — the agent surface was simply less true than the browser one. `toCompanyDetailView` SPREADS
+ * this, so a field added here reaches both by construction.
+ *
+ * `paying` and `agents` are arguments rather than lookups because the two callers count them
+ * differently and both are right: the list batches one query for the whole page, and the detail
+ * counts the agent rows it is already about to render.
+ */
+export function toCompanyView(
+  company: CompanyRecord,
+  steps: FormationRequestRecord[],
+  paying: boolean,
+  agents: number,
+): CompanyView {
+  return {
     companyId: company.companyId,
-    status: company.status,
     environment: company.environment,
-    synthetic: company.synthetic,
     nameOptions: company.nameOptions,
     legalNameFiled: company.legalNameFiled,
     businessPurpose: company.businessPurpose,
     industryLabel: company.industryLabel,
-    formationStatus: deriveFormationStatus(
-      steps?.get(company.companyId) ?? deps.formationSteps?.(company.companyId) ?? [],
-    ),
-    paying: paying(company.companyId),
+    state: companyState(company, steps, paying),
     filedAt: company.filedAt,
     filingNumber: company.filingNumber,
-    agents: agents.get(company.companyId) ?? 0,
-    createdAt: company.createdAt,
-  }));
+    agents,
+    createdAt: parseSqliteUtc(company.createdAt),
+  };
 }
 
 /**
@@ -208,6 +311,34 @@ export interface EntityView {
   formation:
     | (FormationSummary & {
         /**
+         * OUR company id — the key the legal documents, the compliance calendar and the company
+         * detail page are all addressed by (§7, A3). ⚠ AUTHENTICATED VIEWS ONLY, like the two
+         * fields below it: it is an opaque handle, but it is a handle to the tenant's own
+         * filing, and the public surfaces publish doola's `providerRef` instead.
+         *
+         * It is here because the document routes moved to `/companies/:companyId/documents/:id`:
+         * without it a dashboard holding an entity view could not build the URL for a document
+         * the same view had just listed.
+         */
+        companyId: string;
+        /**
+         * HOW MANY AGENTS SHARE THIS FILING, including this one (§7 sharing labels).
+         *
+         * `1` means not shared. The total rather than "others" deliberately: an off-by-one that
+         * lives in the FIELD is an off-by-one every renderer inherits, whereas a UI that wants
+         * "shared with 2 others" subtracts once, at the edge, where the sentence is written.
+         *
+         * ⚠ AUTHENTICATED VIEWS ONLY, exactly like the EIN below. Two agents sharing a company
+         * are already publicly linkable through their anchored manifests (`legal.providerCompanyId`
+         * is in every one of them) — which is a fact the reuse picker DISCLOSES before a caller
+         * confirms — but publishing the COUNT on `/transparency` would hand a stranger the size
+         * of a tenant's fleet, which no public surface has ever carried.
+         *
+         * `null` = this surface did not count, never "not shared": an attached entity always has
+         * at least itself, so a 0 here would be a lie and a 1 would be a guess.
+         */
+        sharedWith: number | null;
+        /**
          * ⚠ AUTHENTICATED VIEWS ONLY. The EIN is a tax identifier: it belongs to the entity's
          * owner and to nobody else. It reaches this projection — which serves GET /entities and
          * the MCP read tools, both tenant-scoped — and it must NEVER reach `/transparency` or
@@ -233,8 +364,10 @@ export interface DocumentView {
   sha256: string;
 }
 
-/** One projection for `GET /entities/:id/documents`, the entity view, and the MCP read tools —
- *  three renderers of the same row is three chances for them to describe it differently. */
+/** One projection for `GET /companies/:companyId/documents`, the entity view, and the MCP read
+ *  tools — three renderers of the same row is three chances for them to describe it differently.
+ *  (The route is COMPANY-keyed since A3: documents belong to the FILING, and a company can hold
+ *  them before any agent attaches to it.) */
 export function toDocumentView(d: DocumentIndexRecord): DocumentView {
   return {
     id: d.id,
@@ -305,6 +438,9 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
     formation: summary
       ? {
           ...summary,
+          // Non-null by construction: `summary` is null unless `companyId` is set.
+          companyId: companyId as string,
+          sharedWith: companyId ? (deps.companyAgents?.countAgents(companyId) ?? null) : null,
           // The real EIN, once the IRS issues one. `r.ein` is the placeholder frozen on-chain at
           // mint and is never served as a legal fact.
           // The EIN now lives on the COMPANY: one filing, one EIN, however many agents share it.
@@ -343,7 +479,10 @@ export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): 
   // → documents and back through a join, which is a round trip to recover a key the caller was
   // already holding — and one that cannot answer for a company with no agent attached.
   const docs = deps.documents?.listByCompanies?.(companyIds);
-  if (!steps && !docs && !companies) return rows.map((r) => toEntityView(r, deps));
+  // ONE grouped scan for the whole page's sharing labels, for the reason every other lookup here
+  // is batched: under N:1 a page of ten agents may be one company.
+  const shared = deps.companyAgents?.countAgentsMany(companyIds);
+  if (!steps && !docs && !companies && !shared) return rows.map((r) => toEntityView(r, deps));
 
   const batched: EntityViewDeps = {
     ...deps,
@@ -353,6 +492,142 @@ export function toEntityViews(rows: EntityRecord[], deps: EntityViewDeps = {}): 
     // `listByEntities: () => docs` stub that ignored its argument entirely, which is a lie in the
     // type system's own terms and would have answered any caller with the whole page's rows.
     documents: docs ? { listByCompany: (c) => docs.get(c) ?? [] } : deps.documents,
+    companyAgents: shared
+      ? {
+          // A company absent from the map has no rows, which is a count of zero — but a company
+          // an ENTITY is attached to always has at least that entity, so this branch is reached
+          // only for a page whose row set and count set disagree, and `?? 0` is the honest
+          // arithmetic rather than a guess.
+          countAgents: (c) => shared.get(c) ?? 0,
+          countAgentsMany: () => shared,
+        }
+      : deps.companyAgents,
   };
   return rows.map((r) => toEntityView(r, batched));
+}
+
+/**
+ * ONE COMPANY, in full (design §7) — what the Companies section's detail page renders, and what
+ * MCP `get_company` answers with.
+ *
+ * It EXTENDS the list row rather than restating it, so the two cannot describe the same company
+ * differently, and adds the four things a list has no room for: the documents, the agents sharing
+ * the filing, the open required actions, and — the reason this view exists at all — the PARK
+ * STATE.
+ *
+ * **The park state is the product decision here.** A2 gave a filing three ways to stop and wait
+ * for a human, all of them correct and none of them visible: a rejected intake
+ * (`awaitingIntakeEdit`), a rejected responsible party (`awaitingPartyEdit`), and an SSN the
+ * seven-day clock erased before the first send (§4.6a). To the owner all three looked identical —
+ * a company that had simply stopped — and two of the three have an exit they alone can take. So
+ * the view says which one it is, and the section renders the sentence and the form that clears it.
+ *
+ * NO PII, exactly as everywhere else. `awaitingPartyEdit` says a party field was refused; it does
+ * not say WHICH, because doola's rejection prose is free text their operators write and can name
+ * the responsible party. The SSN park is read through `parties.ssnState`, which selects an enum
+ * and a NULL-check and no personal column at all.
+ */
+export interface CompanyDetailView extends CompanyView {
+  /** The row's own column. On the DETAIL only: a page about one company can honestly show the
+   *  parts `state` combines, where a list has neither the room nor a reader for them. */
+  status: CompanyRecord["status"];
+  /** Whether this filing is a labeled sandbox one. Detail only, for the same reason. */
+  synthetic: boolean;
+  /** DERIVED from the sub-saga rows; nothing about progress is stored on the company. */
+  formationStatus: FormationStatus;
+  /** DERIVED from `formation_payments`; nothing about payment is stored on the company either. */
+  paying: boolean;
+  /** True = the intake was DERIVED by the migration, not typed by a human. The section says so:
+   *  a company nobody described is one whose names are worth checking before it files. */
+  intakeSynthesized: boolean;
+  /** doola's company id, once the create has returned one. An opaque provider reference. */
+  providerRef: string | null;
+  /** The real EIN, once the IRS issues one. ⚠ Owner-scoped surfaces only, like `EntityView`'s. */
+  ein: string | null;
+  /** Open required-action CODES only — never doola's free-text reason (see `FormationSummary`). */
+  requiredActions: string[];
+  /** The legal documents fetched so far. Metadata only; the bytes come from the download route,
+   *  which re-asserts ownership of its own. */
+  documents: DocumentView[];
+  /** The agents attached to this filing. `agents` (inherited) is this array's length. */
+  attachedAgents: { id: string; name: string; status: EntityRecord["status"] }[];
+  /** What stopped this filing and who can restart it. All three are false on a healthy company. */
+  park: {
+    /** A doola-rejected INTAKE. Exit: `PATCH /companies/:companyId` with new names/purpose/
+     *  industry — one edit buys one retry. */
+    awaitingIntakeEdit: boolean;
+    /** A doola-rejected responsible PARTY. Exit: `PATCH /companies/:companyId/party`. */
+    awaitingPartyEdit: boolean;
+    /** The §4.6a clock erased an SSN before the filing was ever sent. Exit:
+     *  `PATCH /companies/:companyId` with a fresh `ssn`, or `proceedWithoutSsn: true`. */
+    awaitingSsnDecision: boolean;
+  };
+}
+
+/**
+ * What a company detail needs beyond the company row — shaped so that the SHARED dependency
+ * object both doors already hold satisfies it structurally.
+ *
+ * That is the parity mechanism, and it is the `EntityViewDeps` lesson applied one view along:
+ * REST `GET /companies/:companyId` and MCP `get_company` are handed the same object, so a field
+ * cannot be wired on one surface and forgotten on the other. `parties` sits under `formation`
+ * because that is where the composition root puts it, and it is optional because a box that
+ * merely DESCRIBES old filings has no PII surface at all — such a company simply reports no SSN
+ * park, which is the truth.
+ */
+export interface CompanyDetailDeps {
+  companies: import("../persistence/companyRepository").CompanyRepository;
+  formationSteps?: FormationStepsLookup;
+  documents?: Pick<DocumentIndexRepository, "listByCompany">;
+  repo: Pick<import("../persistence/entityRepository").EntityRepository, "listByCompany">;
+  formation?: {
+    parties: Pick<
+      import("../persistence/formationPartyRepository").FormationPartyRepository,
+      "ssnState"
+    >;
+  };
+}
+
+export function toCompanyDetailView(
+  deps: CompanyDetailDeps,
+  company: CompanyRecord,
+): CompanyDetailView {
+  const steps = deps.formationSteps?.(company.companyId) ?? [];
+  const attachedAgents = deps.repo.listByCompany(company.companyId).map((e) => ({
+    id: e.idempotencyKey,
+    name: e.name,
+    status: e.status,
+  }));
+  const create = steps.find((s) => s.step === "create_provider");
+  const paying = hasLivePayment(deps.companies, company.companyId);
+  return {
+    // The LIST projection, spread — so a field added there reaches this page by construction,
+    // rather than by somebody remembering to add it twice. `agents` is this page's
+    // `attachedAgents.length`: one number, counted from the rows it names rather than from a
+    // second query that could disagree with them.
+    ...toCompanyView(company, steps, paying, attachedAgents.length),
+    status: company.status,
+    synthetic: company.synthetic,
+    formationStatus: deriveFormationStatus(steps),
+    paying,
+    intakeSynthesized: company.intakeSynthesized,
+    providerRef: providerRefOf(steps),
+    ein: company.ein,
+    requiredActions: requiredActionCodesOf(steps),
+    documents: (deps.documents?.listByCompany(company.companyId) ?? []).map(toDocumentView),
+    attachedAgents,
+    park: {
+      // The SHARED predicates, from the module the filer and the sweeper read them with. Three
+      // surfaces used to spell `parseDetail<{…}>(row.detail).awaitingIntakeEdit === true` for
+      // themselves, and each copy re-decides what an unreadable blob means.
+      awaitingIntakeEdit: parkedForIntakeEdit(create),
+      awaitingPartyEdit: parkedForPartyEdit(create),
+      // The SHARED predicate — the filer asks the same question of the same row, and two
+      // spellings of "is this waiting for the owner?" is one spelling too many.
+      awaitingSsnDecision: awaitsSsnDecision(
+        create,
+        deps.formation?.parties.ssnState(company.companyId),
+      ),
+    },
+  };
 }

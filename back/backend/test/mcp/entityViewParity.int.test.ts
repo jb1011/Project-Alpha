@@ -66,6 +66,8 @@ function app() {
     formationSteps: (companyId: string) => requests.stepsOf(companyId),
     company: (companyId: string) => companies.find(companyId),
     companies,
+    // §7's sharing label: the SAME store, narrowed by `EntityViewDeps` to the two counting reads.
+    companyAgents: companies,
     documents,
   };
   return buildApiApp({
@@ -131,6 +133,57 @@ test("C8: MCP get_entity lists the SAME documents as REST", async () => {
     expect(view.formation.documents).toEqual(rest.formation.documents);
     expect(view.formation.status).toBe(rest.formation.status);
     expect(view.formation.providerRef).toBe(rest.formation.providerRef);
+  } finally {
+    await mcp.close();
+  }
+});
+
+test("§7 SHARING LABELS: `sharedWith` is on BOTH read surfaces, and it is the TOTAL", async () => {
+  // The three MCP entity tools mirror `EntityView`, which is the whole point of one projection
+  // over one dependency object — the asymmetry this file exists for was a MISSING field on the
+  // agent surface, and a label the browser has and an agent does not is the same bug again.
+  repo.upsert(formedEntity({ ownerTenantId: OWNER }));
+  repo.upsert(
+    formedEntity({
+      idempotencyKey: "tenant-a:agent-2",
+      publicId: "44444444-4444-4444-4444-444444444444",
+      ownerTenantId: OWNER,
+    }),
+  );
+
+  const a = app();
+  const { token } = await signSession(OWNER, JWT_SECRET, 3600, Math.floor(Date.now() / 1000));
+  const one = await (
+    await a.request(`/entities/${encodeURIComponent(ENTITY_KEY)}`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+  ).json();
+  // TWO agents share this filing, and the field is the TOTAL including the one being read —
+  // "shared with 1 other" is a subtraction a renderer makes once, at the edge, where the
+  // sentence is written. An off-by-one in the FIELD is one every renderer inherits.
+  expect(one.formation.sharedWith).toBe(2);
+  expect(one.formation.companyId).toBe(COMPANY_KEY);
+
+  // …and the LIST path, which counts in one grouped scan rather than per row.
+  const list = await (
+    await a.request("/entities", { headers: { authorization: `Bearer ${token}` } })
+  ).json();
+  expect(list.map((e: { formation: { sharedWith: number } }) => e.formation.sharedWith)).toEqual([
+    2, 2,
+  ]);
+
+  const { key } = apiKeys.mint(OWNER, { capability: "read" });
+  const mcp = await startMcpTestClient(a, key);
+  try {
+    for (const [tool, args] of [
+      ["get_entity", { id: ENTITY_KEY }],
+      ["list_entities", {}],
+    ] as const) {
+      const out = await mcp.client.callTool({ name: tool, arguments: args });
+      const parsed = JSON.parse((out as { content: { text: string }[] }).content[0]!.text);
+      const view = Array.isArray(parsed) ? parsed[0] : parsed;
+      expect(view.formation.sharedWith, tool).toBe(2);
+    }
   } finally {
     await mcp.close();
   }

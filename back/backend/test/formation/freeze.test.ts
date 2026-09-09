@@ -14,7 +14,13 @@
  */
 import type DatabaseType from "better-sqlite3";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { type FreezableStep, INTAKE_FROZEN_SQL, isIntakeFrozen } from "../../src/formation/freeze";
+import {
+  type FreezableStep,
+  INTAKE_FROZEN_SQL,
+  PARTY_EDIT_ALLOWED_SQL,
+  isIntakeFrozen,
+  partyEditAllowed,
+} from "../../src/formation/freeze";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import type { FormationState } from "../../src/persistence/formationRepository";
 
@@ -32,6 +38,14 @@ function frozenInSql(companyId: string): boolean {
     .prepare(`SELECT ${INTAKE_FROZEN_SQL} AS frozen`)
     .get({ company_id: companyId }) as { frozen: number };
   return row.frozen === 1;
+}
+
+/** The PARTY half's SQL, run standalone — the same text the `UPDATE formation_parties` embeds. */
+function partyEditAllowedInSql(companyId: string): boolean {
+  const row = db.prepare(`SELECT ${PARTY_EDIT_ALLOWED_SQL} AS allowed`).get({
+    company_id: companyId,
+  }) as { allowed: number };
+  return row.allowed === 1;
 }
 
 /** One `create_provider` row, written straight to the table so a corrupt blob is reachable. */
@@ -124,4 +138,110 @@ test("a corrupt detail blob does not THROW in SQL — which is what made a PATCH
   writeStep("corrupt", { state: "failed", providerRef: null, attempt: 0, detail: "}}" });
   expect(() => frozenInSql("corrupt")).not.toThrow();
   expect(frozenInSql("corrupt")).toBe(true);
+});
+
+/**
+ * THE PARTY-EDIT PREDICATE, IN BOTH SPELLINGS (design §7, A3).
+ *
+ * `PARTY_EDIT_ALLOWED_SQL` is what the `UPDATE formation_parties` carries in its WHERE clause;
+ * `partyEditAllowed` is what the domain function asks so it can return the actionable refusal.
+ * Two spellings of one sentence, and this matrix is the only thing that keeps them that way — the
+ * `INTAKE_FROZEN_SQL` precedent, one predicate along.
+ */
+const PARTY_CASES: { label: string; step: FreezableStep; allowed: boolean }[] = [
+  {
+    label: "parked awaiting a party edit — the whole reason the door exists",
+    step: {
+      state: "failed",
+      providerRef: null,
+      attempt: 0,
+      detail: JSON.stringify({ awaitingPartyEdit: true }),
+    },
+    allowed: true,
+  },
+  {
+    label: "parked, AND a customer exists — the park wins, or the company is stranded",
+    step: {
+      state: "failed",
+      providerRef: null,
+      attempt: 1,
+      detail: JSON.stringify({ awaitingPartyEdit: true, customerId: "cus_1" }),
+    },
+    allowed: true,
+  },
+  {
+    label: "a customer at doola — the create never asks for the person again",
+    step: {
+      state: "failed",
+      providerRef: null,
+      attempt: 0,
+      detail: JSON.stringify({ customerId: "cus_1" }),
+    },
+    allowed: false,
+  },
+  {
+    label: "a customerId present but JSON null — `!== undefined` counts it, and so must the SQL",
+    step: { state: "failed", providerRef: null, attempt: 0, detail: '{"customerId":null}' },
+    allowed: false,
+  },
+  {
+    label: "awaitingPartyEdit: 1 is not `=== true` — json_extract could not tell them apart",
+    step: { state: "failed", providerRef: null, attempt: 0, detail: '{"awaitingPartyEdit":1}' },
+    allowed: true,
+  },
+  {
+    label: "submitted — in flight",
+    step: { state: "submitted", providerRef: null, attempt: 0, detail: null },
+    allowed: false,
+  },
+  {
+    label: "confirmed — done",
+    step: { state: "confirmed", providerRef: null, attempt: 1, detail: null },
+    allowed: false,
+  },
+  {
+    label: "a provider_ref — a company exists at doola",
+    step: { state: "failed", providerRef: "cmp_1", attempt: 3, detail: null },
+    allowed: false,
+  },
+  {
+    label: "a company body was sent",
+    step: {
+      state: "failed",
+      providerRef: null,
+      attempt: 0,
+      detail: JSON.stringify({ companySentAttempt: 0 }),
+    },
+    allowed: false,
+  },
+  {
+    label:
+      "a CORRUPT detail blob — unreadable keeps the identity, and answers rather than throwing",
+    step: { state: "failed", providerRef: null, attempt: 0, detail: "{not json" },
+    allowed: false,
+  },
+  {
+    label: "pending, nothing sent — the everyday editable case",
+    step: { state: "pending", providerRef: null, attempt: 0, detail: null },
+    allowed: true,
+  },
+  {
+    label: "abandoned, with nothing ever sent — our saga gave up, doola never heard of it",
+    step: { state: "abandoned", providerRef: null, attempt: 8, detail: null },
+    allowed: true,
+  },
+];
+
+test("the party-edit SQL and the party-edit TypeScript agree on every row", () => {
+  for (const [i, c] of PARTY_CASES.entries()) {
+    const companyId = `party-company-${i}`;
+    writeStep(companyId, c.step);
+    expect(partyEditAllowedInSql(companyId), `${c.label} (sql)`).toBe(c.allowed);
+    expect(partyEditAllowed(c.step), `${c.label} (ts)`).toBe(c.allowed);
+  }
+});
+
+test("a company with NO create_provider row is editable in both spellings", () => {
+  expect(partyEditAllowedInSql("party-company-none")).toBe(true);
+  expect(partyEditAllowed(undefined)).toBe(true);
 });

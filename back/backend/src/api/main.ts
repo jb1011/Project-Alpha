@@ -37,7 +37,7 @@ import {
   loadConfig,
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
-import { createCompany, shimCompanyIntake } from "../formation/company";
+import { createCompany } from "../formation/company";
 import { buildJobDeps } from "../jobs/composition";
 import { createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -318,7 +318,7 @@ async function main() {
   // `formation_requests` table a week later.
   if (doolaApi && !cfg.formation?.required)
     console.warn(
-      "⚠ FORMATION_REQUIRED=false — formation is AVAILABLE, not mandatory: an onboard is only pinned and filed when it carries a partyId, and the wizard does not send one yet (docs/runbooks/doola-deploy.md)",
+      "⚠ FORMATION_REQUIRED=false — formation is AVAILABLE, not mandatory: an onboard is only pinned and filed when it carries a companyId, and the wizard offers a Skip that sends none (docs/runbooks/doola-deploy.md)",
     );
 
   const worldStore = new SqliteWorldStore(db);
@@ -421,22 +421,6 @@ async function main() {
           companies,
           requests: formationRequests,
           maxAgentsPerCompany: formationCfg.maxAgentsPerCompany,
-          // The A1 SHIM: a party-only onboard — every client that exists today — mints its own
-          // 1:1 company inside the claim transaction. Removed in A3.
-          createCompanyForParty: (tenantId, intake) => {
-            const result = createCompany(
-              // Already inside the claim's transaction: `fn()` runs in it rather than opening a
-              // nested one, so a 409 below rolls the company back with everything else.
-              { ...companyDeps!, transaction: (fn) => fn() },
-              tenantId,
-              // ONE mapping, shared with every test wiring of this shim — see
-              // `shimCompanyIntake`. It reaches `synthesizedName`, the field spelled for what it
-              // is, so no production door can fall into the derived-name path by accident.
-              shimCompanyIntake(intake, formationCfg.sandboxSyntheticPii),
-            );
-            if ("error" in result) throw new ApiError("validation_error", 400, result.error);
-            return result.companyId;
-          },
         }
       : undefined,
   });
@@ -469,6 +453,10 @@ async function main() {
     company: (companyId: string) => companies.find(companyId),
     companyMany: (companyIds: string[]) => companies.findMany(companyIds),
     companies,
+    // The §7 sharing label, on the authenticated surfaces only. The SAME store, narrowed to the
+    // two counting reads by `EntityViewDeps` — `/transparency` and `/metadata` build their rows
+    // from `formationSummary` and never receive this object.
+    companyAgents: companies,
     documents: formationDocuments,
   };
 
@@ -576,6 +564,9 @@ async function main() {
             requests: formationRequests,
             companies,
             pin: { provider: "doola", environment: cfg.doola!.environment },
+            // The ONE method the compliance route calls, narrowed here rather than handed the
+            // whole client (§7). Present only with a client to call it on.
+            compliance: doolaApi,
             // The same object the shim uses; the doors add only their own transaction.
             companyDeps,
           }

@@ -10,6 +10,7 @@ import { useCallback } from "react";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import {
   bootstrapConnection,
+  createCompany,
   createConnectionPackage,
   createFormationParty,
   entityAgentBook,
@@ -19,13 +20,17 @@ import {
   getEntity,
   getEntityReputation,
   getEntityRuns,
+  getCompany,
+  getCompanyCompliance,
   getEntityTreasury,
   getNonce,
   getPasskeyChallenge,
   getPublicConfig,
   listApiKeys,
+  listCompanies,
   listEntities,
   listEntityJobs,
+  fetchFormationRules,
   listPasskeys,
   onboardEntity,
   patchPerTxCap,
@@ -34,6 +39,8 @@ import {
   revokePasskey,
   schedulePolicyUpdate,
   storePasskey,
+  updateCompanyIntake,
+  updateCompanyParty,
   verifySiwe,
   worldIdAttestContext,
   worldIdAttestVerify,
@@ -52,6 +59,8 @@ import type {
   AgentSpec,
   BootstrapPackage,
   Capability,
+  CompanyIntakeInput,
+  CompanyIntakeUpdate,
   ConnectionPackage,
   EntityStatus,
   EntityView,
@@ -303,17 +312,18 @@ export function useOnboardEntityMutation() {
       guardianPasskey,
       idempotencyKey,
       custody,
-      partyId,
+      companyId,
     }: {
       spec: AgentSpec;
       guardianPasskey: GuardianPasskey;
       idempotencyKey?: string;
       custody?: "turnkey" | "circle";
-      /** The opaque formation-party handle. Never the identity — that never reaches this layer. */
-      partyId?: string;
+      /** The company this agent ATTACHES to (§7, A3). Never a party handle: that door is gone,
+       *  and the backend refuses one rather than ignoring it. */
+      companyId?: string;
     }) => {
       const token = await ensureToken();
-      return onboardEntity(token, spec, guardianPasskey, idempotencyKey, custody, partyId);
+      return onboardEntity(token, spec, guardianPasskey, idempotencyKey, custody, companyId);
     },
     onSuccess: async () => {
       const token = await ensureToken();
@@ -338,6 +348,179 @@ export function useCreateFormationPartyMutation() {
     mutationFn: async (body: { synthetic: true } | FormationPartyInput) => {
       const token = await ensureToken();
       return createFormationParty(token, body);
+    },
+  });
+}
+
+/* ── COMPANIES (design §7) ─────────────────────────────────────────────────── */
+
+/**
+ * The intake RULES, fetched ONCE per page and never again.
+ *
+ * Build-time constants on the backend, so they change on a deploy and not on a request — the same
+ * reasoning `usePublicConfigQuery` uses, and the same `staleTime`. Public, so no token and no
+ * token in the key.
+ */
+export function useFormationRulesQuery(enabled = true) {
+  return useQuery({
+    queryKey: apiKeys.formationRules(),
+    queryFn: fetchFormationRules,
+    enabled,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+}
+
+/**
+ * The tenant's companies, NEWEST FIRST — the ordering the picker's default depends on, taken from
+ * the server rather than re-sorted here.
+ *
+ * `staleTime` because React Query's default is ZERO, which means every mount of every component
+ * that asks for this list issues a request: the wizard's legal-body step, the Companies page, and
+ * a back-navigation between them. A company list changes when its owner creates or edits one, and
+ * both writers already invalidate this exact key — so a refetch on mount is a request that can
+ * only ever return what the cache is holding.
+ *
+ * Five minutes rather than `Infinity`: the FILING moves without anybody clicking (the sub-saga
+ * runs on its own clock), so a list left open should eventually catch up on its own.
+ */
+export const COMPANY_STALE_MS = 5 * 60 * 1000;
+
+export function useCompaniesQuery(enabled = true) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.companies(token ?? ""),
+    queryFn: () => listCompanies(token!),
+    enabled: enabled && !!token,
+    staleTime: COMPANY_STALE_MS,
+  });
+}
+
+/**
+ * ONE company, in full.
+ *
+ * `enabled` is how the wizard SKIPS this fetch entirely: the legal-body step already holds the
+ * row the user picked (`session.company`), and the two screens after it need exactly two of its
+ * fields — the environment and the state. Handing them the row they have removes a beat of
+ * `loading` on the confirm screen, during which the submit is blocked because the environment
+ * cannot be named.
+ *
+ * ⚠ It is `enabled` and NOT React Query's `initialData`, deliberately. The carried row is a LIST
+ * row (`CompanyView`); this query's shape is the DETAIL (`CompanyDetailView`), whose extra fields
+ * include `park` — three booleans the Companies page destructures. Seeding a partial under this
+ * key would write it into the SHARED cache, and the next surface to read that key (the company
+ * page, the dashboard's formation card) would read a row whose type promises `park` and whose
+ * value has none. Not fetching is the honest version of the same optimisation.
+ *
+ * The fetch is the fallback and not an optimisation to skip: a freshly CREATED company has no
+ * carried row, and a page opened cold has none either.
+ */
+export function useCompanyQuery(
+  companyId: string | null | undefined,
+  options?: { enabled?: boolean },
+) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.company(token ?? "", companyId ?? ""),
+    queryFn: () => getCompany(token!, companyId!),
+    enabled: (options?.enabled ?? true) && !!token && !!companyId,
+    // Same reasoning as the list, and it matters more here: THREE surfaces mount this query for
+    // the same company (the dashboard's formation card, the wizard's confirm screen, the company
+    // page), and at React Query's default `staleTime: 0` each mount is its own request for a row
+    // the cache already has. The two writers that can change it — the intake edit and the party
+    // edit — invalidate this key by hand.
+    staleTime: COMPANY_STALE_MS,
+  });
+}
+
+/**
+ * The compliance calendar. LAZY BY CONSTRUCTION on both sides.
+ *
+ * The backend fetches it from the filing agent on view and caches it for a day; this asks only
+ * when the section that shows it is mounted, and does not retry a refusal — "the provider did not
+ * answer" is a fact worth showing once with a retry button, not a loop against somebody else's
+ * outage.
+ */
+export function useCompanyComplianceQuery(companyId: string | null | undefined, enabled = true) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.companyCompliance(token ?? "", companyId ?? ""),
+    queryFn: () => getCompanyCompliance(token!, companyId!),
+    enabled: enabled && !!token && !!companyId,
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/**
+ * Create the legal body (design §5/§7).
+ *
+ * ⚠ A MUTATION, never a query, and for a reason beyond the HTTP verb: this call may carry an SSN,
+ * React Query keys live in memory for the life of the page and are the first thing a devtools
+ * panel prints, and a query would put the intake in one. The hook takes the value, hands it to
+ * the client, and keeps nothing.
+ */
+export function useCreateCompanyMutation() {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (intake: CompanyIntakeInput) => createCompany(await ensureToken(), intake),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      // MARK STALE, do not refetch — and do not AWAIT one.
+      //
+      // `invalidateQueries` refetches every ACTIVE observer of the key and returns a promise that
+      // resolves when they have all answered; awaiting it inside `onSuccess` holds
+      // `mutation.isPending` open until then. So the wizard's "Create the company" button stayed
+      // in its loading state through a second round trip for a list the very next screen does not
+      // read — and if that refetch failed, the create looked like it had failed too.
+      //
+      // The list this marks stale is re-read when something mounts it, which is the next time it
+      // is actually looked at.
+      queryClient.invalidateQueries({
+        queryKey: apiKeys.companies(token),
+        refetchType: "none",
+      });
+    },
+  });
+}
+
+/** The §4.7 edit-and-retry. A mutation for the same reason the create is one — it can carry an
+ *  SSN — and it invalidates the company it reopened, whose park state has just changed. */
+export function useUpdateCompanyIntakeMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (intake: CompanyIntakeUpdate) =>
+      updateCompanyIntake(await ensureToken(), companyId, intake),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companies(token) });
+    },
+  });
+}
+
+/**
+ * Correct the responsible person on a filing the provider refused (§7).
+ *
+ * A mutation for the reason `useCreateFormationPartyMutation` is one: personal data must never
+ * become a React Query key. It invalidates the COMPANY, because what visibly changed is that
+ * company's park state — the identity itself is never rendered anywhere.
+ *
+ * `companyId` is REQUIRED, and it is the door's own address since the backend re-keyed it: the
+ * party is resolved from the company rather than named by the caller. It was optional, with a
+ * `if (!companyId) return` guard in `onSuccess` that no call site could reach — a dead branch
+ * that would have silently skipped the invalidation if one ever did.
+ */
+export function useUpdateCompanyPartyMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (body: FormationPartyInput) =>
+      updateCompanyParty(await ensureToken(), companyId, body),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
     },
   });
 }

@@ -65,3 +65,37 @@ export function deriveFormationEnvironment(query: {
   if (!query.data) return "loading";
   return formationEnvironmentOf(query.data.formationEnvironment);
 }
+
+/**
+ * WHICH ENVIRONMENT THIS PARTICULAR FILING IS IN — and WHICH QUERY the retry button must retry.
+ *
+ * Two facts, decided together, because they were decided apart and the second one was wrong.
+ * `AgreementStep` reads the environment off the COMPANY ROW when an agent is being filed (the pin
+ * is stamped at creation and immutable after, so a company minted in sandbox stays a sandbox
+ * filing on a box since re-pointed at production) — and its "Retry" button called
+ * `useRetryPublicConfig`, which refetches `/config`. On the one screen where the button matters,
+ * it refetched a query whose answer the screen was not using: the callout said "Retry", the
+ * spinner spun, `/config` came back, and the blocked submit stayed blocked forever.
+ *
+ * `retryTarget` names the query that would actually change the answer, so the button cannot be
+ * wired to the other one.
+ */
+export function filingEnvironment(input: {
+  /** Is a company attached to THIS agent? A deployment that can form still onboards agents that
+   *  asked for no filing, and for those the deployment's own answer is the right one. */
+  forming: boolean;
+  /** `deriveFormationEnvironment` over `GET /config`. */
+  deployment: FormationEnvironment;
+  /** The company query's state, narrowed to the three things this decision reads. */
+  company: { environment?: string | null; hasData: boolean; isError: boolean };
+}): { environment: FormationEnvironment; retryTarget: "config" | "company" } {
+  if (!input.forming) return { environment: input.deployment, retryTarget: "config" };
+  if (input.company.hasData)
+    return {
+      environment: formationEnvironmentOf(input.company.environment),
+      retryTarget: "company",
+    };
+  // Both ways of not knowing are PRESERVED rather than collapsed into "sandbox": one is a spinner
+  // that will resolve itself, the other is a retry button, and both render neutral.
+  return { environment: input.company.isError ? "unknown" : "loading", retryTarget: "company" };
+}

@@ -23,11 +23,16 @@ import {
   Phase,
   PHASES,
   prevPhase,
+  resumePhase,
   screenLabel,
   snapToVisiblePhase,
   visiblePhases,
 } from "./types";
 import type { EntityView } from "@/lib/api/types";
+import {
+  emptyCompanyIntake,
+  type CompanyIntakeForm,
+} from "@/lib/formation/companyIntake";
 import { usePublicConfigQuery } from "@/lib/api/hooks";
 import {
   buildPersistedOnboarding,
@@ -39,7 +44,7 @@ import {
 } from "@/lib/onboarding/storage";
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { GuardianStep } from "./steps/GuardianStep";
-import { LegalIdentityStep } from "./steps/LegalIdentityStep";
+import { LegalBodyStep } from "./steps/LegalBodyStep";
 import { CustodyStep } from "./steps/CustodyStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
@@ -82,6 +87,17 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     () => !wantsNewAgent && !!(initial?.phase && phaseIndex(initial.phase) > 0),
   );
   /**
+   * This session was migrated from v2 and carried a PARTY HANDLE with no company (§7, A3).
+   *
+   * A one-time fact about the restore, held like `resumed` and spent the same way — `goTo` clears
+   * it — because it corrects where a returning user LANDS, not where they may go. Without the
+   * clearing, somebody on a deployment where formation is optional who answers the bounce by
+   * clicking "Skip — no legal filing" would be bounced straight back to it, forever.
+   */
+  const [needsCompany, setNeedsCompany] = useState(
+    () => !wantsNewAgent && initial?.resumeNeedsCompany === true,
+  );
+  /**
    * The PII slice (design §3, audit 16/L8).
    *
    * Deliberately its own piece of state, beside `config` rather than inside it: `config` is what
@@ -90,6 +106,16 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * name a single field of it — and the flow clears it the moment the backend returns a handle.
    */
   const [party, setParty] = useState<FormationParty>(emptyParty);
+  /**
+   * The COMPANY's own intake — three name candidates, the purpose, the industry.
+   *
+   * Not personal data, and not persisted either. It is typed once and consumed by one call, and
+   * from the moment `POST /companies` returns it lives on the server, where the Companies section
+   * reads it. Keeping it beside `party` rather than on `config` is the same discipline the PII
+   * slice follows: `config` is what gets persisted and what becomes the AgentSpec, and a company
+   * name that lived on it would follow it into both.
+   */
+  const [intake, setIntake] = useState<CompanyIntakeForm>(emptyCompanyIntake);
 
   // Which phases this deployment HAS. Anything other than an explicit `true` hides the
   // legal-identity step: a backend that predates the field forms nothing, and a deployment we
@@ -100,32 +126,28 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const phases = useMemo(() => visiblePhases(formationAvailable), [formationAvailable]);
 
   /**
-   * Past the legal-identity step with no party handle, on a deployment that REQUIRES one → the
-   * wizard shows that step again.
+   * Past the legal-body step with no company handle → the wizard shows that step again.
    *
-   * The passkey precedent: a restored session that lost the credential a step produces re-does
-   * that step, explicitly, rather than carrying the user to a submit that will be refused. It
-   * corrects a race too (a fast click while `GET /config` is still in flight), which is strictly
-   * safer than a restore-only check.
+   * ONE pure function (`resumePhase`), because there are now two reasons and they are not the
+   * same reason: the deployment REQUIRES a filing, or this session was migrated from v2 carrying
+   * a party handle that A3's onboard door refuses. See `resumePhase` for both, and for why the
+   * second is spent by the first deliberate navigation.
    *
    * DERIVED during render rather than corrected by an effect — an effect that called `goTo` would
    * paint the wrong screen first and cascade a second render to fix it.
-   *
-   * NEVER once the entity exists: by `deploy` the handle has already been consumed by /onboard,
-   * and sending the user back to collect another one would be nonsense.
    */
-  const requestedPhase: Phase =
-    formationRequired &&
+  const requestedPhase: Phase = resumePhase({
+    phases,
+    storedPhase,
     // A box that reports `required` always reports `available` too (they are projections of one
     // dep). If one ever did not, this guard is what stops the correction from sending the wizard
     // to a phase that is not in the list and rendering nothing at all.
-    formationAvailable &&
-    !session.partyId &&
-    !session.entityId &&
-    storedPhase !== "dashboard" &&
-    indexIn(phases, storedPhase) > indexIn(phases, "legal-identity")
-      ? "legal-identity"
-      : storedPhase;
+    formationAvailable,
+    formationRequired,
+    companyId: session.companyId,
+    entityId: session.entityId,
+    needsCompany,
+  });
 
   /**
    * THE INVARIANT: the phase we render is always a member of `phases`.
@@ -148,6 +170,8 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const goTo = useCallback((next: Phase) => {
     setPhase(next);
     setResumed(false);
+    // The v2 correction is spent by the first deliberate move — see `resumePhase`.
+    setNeedsCompany(false);
     if (typeof window !== "undefined") {
       window.scrollTo({ top: 0, behavior: "smooth" });
     }
@@ -158,6 +182,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     setConfig(emptyConfig());
     setSession(emptySession());
     setParty(emptyParty());
+    setIntake(emptyCompanyIntake());
     setDone({});
     setResumed(false);
     goTo("welcome");
@@ -304,24 +329,31 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 }
               />
             )}
-            {phase === "legal-identity" && (
-              <LegalIdentityStep
-                eyebrow={screenLabel(phases, "legal-identity")}
+            {phase === "legal-body" && (
+              <LegalBodyStep
+                eyebrow={screenLabel(phases, "legal-body")}
                 party={party}
                 onParty={setParty}
-                partyId={session.partyId}
-                synthetic={session.partySynthetic}
-                onCreated={(partyId, synthetic) => {
-                  setSession((s) => ({ ...s, partyId, partySynthetic: synthetic }));
+                intake={intake}
+                onIntake={setIntake}
+                companyId={session.companyId}
+                company={session.company}
+                onCompany={(companyId, company) => {
+                  // The ROW travels with the handle when we have one (the attach branch picked
+                  // it out of a list); a freshly created company has none, and the screens after
+                  // this one fetch it. It is in-memory state only — never in the allowlist.
+                  setSession((s) => ({ ...s, companyId, company: company ?? null }));
                   // Belt and braces on top of the allowlist: once the backend holds the identity
-                  // and has issued a handle, there is no reason for this browser to keep a copy
-                  // of it in memory either.
+                  // and has issued a company handle, there is no reason for this browser to keep
+                  // a copy of either in memory. (The SSN never reaches this component at all —
+                  // it lives in the step's own state and is cleared there.)
                   setParty(emptyParty());
-                  completePhase("legal-identity", "custody");
+                  setIntake(emptyCompanyIntake());
+                  completePhase("legal-body", "custody");
                 }}
-                onClear={() => setSession((s) => ({ ...s, partyId: null, partySynthetic: false }))}
+                onClear={() => setSession((s) => ({ ...s, companyId: null, company: null }))}
                 onBack={() => goTo("guardian")}
-                onComplete={() => completePhase("legal-identity", "custody")}
+                onComplete={() => completePhase("legal-body", "custody")}
               />
             )}
             {phase === "custody" && (
@@ -348,8 +380,8 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 config={config}
                 guardianPasskey={session.guardianPasskey}
                 idempotencyKey={session.idempotencyKey}
-                partyId={session.partyId}
-                partySynthetic={session.partySynthetic}
+                companyId={session.companyId}
+                company={session.company}
                 onBack={() => goTo("configure")}
                 onSubmitted={(entityId, idempotencyKey) => {
                   setSession((s) => ({
