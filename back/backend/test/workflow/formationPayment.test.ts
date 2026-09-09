@@ -7,7 +7,7 @@
  * of it, and each is asserted against the failure it prevents rather than against its own shape.
  */
 import type DatabaseType from "better-sqlite3";
-import { keccak256 } from "viem";
+import { keccak256, verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { CANCEL_AUTHORIZATION_TYPES } from "../../src/adapters/arc/usdcToken";
@@ -93,6 +93,12 @@ function fakeChain(
   const publicClient = {
     getTransactionCount: async () => state.accountNonce,
     getBlockNumber: async () => state.head,
+    // The CLIENT-BOUND verification the product now uses (gate A6). A real client tries ECDSA
+    // first and only then ERC-1271; these fixtures sign with EOAs, so viem's offline check is
+    // exactly what a real node would conclude — and `getCode` answering "no code" is true of
+    // every account here.
+    verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
+    getCode: async () => undefined,
     getBlock: async () => ({ number: state.head, timestamp: state.blockTimestamp }),
     getLogs: async (q: {
       event: { name: string };

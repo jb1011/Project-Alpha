@@ -1,4 +1,5 @@
 import { getAddress, verifyTypedData } from "viem";
+import type { PublicClient, TypedDataDomain } from "viem";
 import type { Address, Hex } from "../types";
 
 /**
@@ -61,6 +62,20 @@ export interface VerifyTransferAuthorizationInput {
   /** Atomic USDC the caller expects, compared per `mode`. */
   value: bigint;
   mode: AuthorizationAmountMode;
+  /**
+   * A public client, when the caller has one (B1 gate A6).
+   *
+   * With it, the signature is checked through viem's CLIENT-BOUND `verifyTypedData`, which falls
+   * back to an on-chain ERC-1271 `isValidSignature` call (and understands ERC-6492 wrappers for
+   * an account that is not deployed yet). Without it, the check is the offline ECDSA recovery.
+   *
+   * The difference is not academic: the TOKEN verifies EIP-3009 signatures the same way, so a
+   * smart-account guardian — a Safe, a Circle SCA, a 4337 wallet — produces a signature the token
+   * would accept and our offline recovery would not. We would refuse a valid payment and tell the
+   * guardian their own wallet is wrong. The x402 rail passes no client and keeps the offline path,
+   * which is what it has always done.
+   */
+  client?: PublicClient;
   /** Epoch MILLISECONDS. Injectable so the time checks are testable without faking the clock. */
   now?: () => number;
 }
@@ -142,24 +157,97 @@ export async function verifyTransferAuthorization(
   if (validAfter > nowSec) return { ok: false, reason: "not-yet-valid" };
   if (validBefore <= nowSec) return { ok: false, reason: "expired" };
 
-  let recovered: boolean;
-  try {
-    recovered = await verifyTypedData({
-      address: from,
-      domain: {
-        name: input.domain.name,
-        version: input.domain.version,
-        chainId: input.domain.chainId,
-        verifyingContract: getAddress(input.domain.verifyingContract),
-      },
-      types: TRANSFER_WITH_AUTHORIZATION_TYPES,
-      primaryType: "TransferWithAuthorization",
-      message: { from, to, value, validAfter, validBefore, nonce: a.nonce },
-      signature: input.signature,
-    });
-  } catch {
-    return { ok: false, reason: "bad-signature" };
-  }
-  if (!recovered) return { ok: false, reason: "bad-signature" };
+  const verdict = await verifySignature({
+    client: input.client,
+    address: from,
+    domain: {
+      name: input.domain.name,
+      version: input.domain.version,
+      chainId: input.domain.chainId,
+      verifyingContract: getAddress(input.domain.verifyingContract),
+    },
+    types: TRANSFER_WITH_AUTHORIZATION_TYPES,
+    primaryType: "TransferWithAuthorization",
+    message: { from, to, value, validAfter, validBefore, nonce: a.nonce },
+    signature: input.signature,
+  });
+  if (!verdict.ok) return verdict;
   return { ok: true, nonce: a.nonce };
+}
+
+/** A 65-byte ECDSA signature: r, s and v. Anything else is a contract account's own encoding. */
+const ECDSA_SIGNATURE_BYTES = 65;
+
+export interface VerifySignatureInput {
+  client?: PublicClient;
+  address: Address;
+  domain: TypedDataDomain;
+  // biome-ignore lint/suspicious/noExplicitAny: the two call sites pass two different const shapes
+  types: any;
+  primaryType: string;
+  message: Record<string, unknown>;
+  signature: Hex;
+}
+
+/**
+ * "Would the TOKEN accept this signature?" — asked in the way the token asks it (B1 gate A6).
+ *
+ * One helper for the transfer authorization and for `CancelAuthorization`, because both are
+ * EIP-712 messages the same guardian signs and the same contract verifies, and two spellings of
+ * "verify" is how the cancel path ends up refusing a wallet the settle path accepts.
+ *
+ * ⚠ THE `unsupported-signer` REASON. A signature that is not 65 bytes, from an address with NO
+ * CODE, cannot be verified by anyone: it is not ECDSA, and there is no contract to ask. Calling
+ * that `bad-signature` tells a guardian their wallet produced a wrong signature, when what
+ * actually happened is that we cannot check this KIND of signature — most often a smart account
+ * whose deployment we cannot see, or a wallet returning an ERC-6492 wrapper we could not unwrap.
+ * The distinction is the difference between "you did something wrong" and "we cannot serve this
+ * wallet", and only one of those is true.
+ */
+export async function verifySignature(
+  input: VerifySignatureInput,
+): Promise<{ ok: true } | { ok: false; reason: "bad-signature" | "unsupported-signer" }> {
+  const args = {
+    address: input.address,
+    domain: input.domain,
+    types: input.types,
+    primaryType: input.primaryType,
+    message: input.message,
+    signature: input.signature,
+  };
+  let valid = false;
+  try {
+    // The CLIENT-bound action where we have one: it does the ECDSA recovery first and falls back
+    // to an on-chain ERC-1271 call, which is exactly what the token does.
+    valid = input.client
+      ? // biome-ignore lint/suspicious/noExplicitAny: viem's typed-data generics over a runtime shape
+        await input.client.verifyTypedData(args as any)
+      : // biome-ignore lint/suspicious/noExplicitAny: as above
+        await verifyTypedData(args as any);
+  } catch {
+    valid = false;
+  }
+  if (valid) return { ok: true };
+
+  // Not an ECDSA signature? Then WHY it failed depends on whether there was anything that could
+  // have checked it. With code at the address, the ERC-1271 call above was made and said no —
+  // that IS a bad signature. With no code, nothing could have checked it at all.
+  //
+  // ⚠ The claim needs a CLIENT to make it. Without one (the x402 rail) we cannot know whether the
+  // signer has code, and guessing would change that rail's long-standing refusal for every
+  // malformed signature it sees. No client ⇒ the answer it has always given.
+  const bytes = (input.signature.length - 2) / 2;
+  if (bytes !== ECDSA_SIGNATURE_BYTES && input.client) {
+    let hasCode = false;
+    try {
+      const code = await input.client.getCode({ address: input.address });
+      hasCode = code !== undefined && code !== "0x";
+    } catch {
+      // The read failed, so we still have not verified anything and still cannot blame the
+      // signature. "We cannot check this here" is the honest sentence either way.
+      hasCode = false;
+    }
+    if (!hasCode) return { ok: false, reason: "unsupported-signer" };
+  }
+  return { ok: false, reason: "bad-signature" };
 }

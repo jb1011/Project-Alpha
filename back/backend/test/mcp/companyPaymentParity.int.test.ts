@@ -11,7 +11,7 @@
  * tools are not registered at all. An agent must not discover a tool whose every call would 404.
  */
 import type Database from "better-sqlite3";
-import { getAddress } from "viem";
+import { getAddress, verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
@@ -78,7 +78,13 @@ function fakeExecutor() {
         transactionHash: hash,
       }),
       readContract: async () => false,
-      // biome-ignore lint/suspicious/noExplicitAny: a five-method stub of viem's PublicClient
+      getBlockNumber: async () => 1_000n,
+      getBlock: async () => ({ number: 1_000n, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
+      getLogs: async () => [],
+      // Client-bound verification (gate A6); the guardian here is an EOA, so ECDSA is the answer.
+      verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
+      getCode: async () => undefined,
+      // biome-ignore lint/suspicious/noExplicitAny: a stub of viem's PublicClient
     } as any,
     walletClient: {
       account: privateKeyToAccount(`0x${"9".repeat(64)}`),

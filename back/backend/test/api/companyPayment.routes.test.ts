@@ -7,7 +7,7 @@
  * the beta, and it is asserted here rather than assumed.
  */
 import type Database from "better-sqlite3";
-import { getAddress } from "viem";
+import { getAddress, verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { buildApiApp } from "../../src/api/app";
@@ -276,6 +276,13 @@ function fakeExecutor() {
         transactionHash: hash,
       }),
       readContract: async () => false,
+      getBlockNumber: async () => 1_000n,
+      getBlock: async () => ({ number: 1_000n, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
+      getLogs: async () => [],
+      // Client-bound verification (gate A6): a real client tries ECDSA first, which for the EOA
+      // guardian in this file is the whole answer.
+      verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
+      getCode: async () => undefined,
       // biome-ignore lint/suspicious/noExplicitAny: a five-method stub of viem's PublicClient
     } as any,
     walletClient: {

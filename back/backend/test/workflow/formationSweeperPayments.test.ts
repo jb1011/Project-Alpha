@@ -10,6 +10,7 @@
  * doola filing, and this leg does not touch doola at all.
  */
 import type Database from "better-sqlite3";
+import { verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import type { FormationPaymentConfig } from "../../src/formation/payment";
@@ -99,6 +100,12 @@ function fakeChain(
     publicClient: {
       getTransactionCount: async () => 1,
       getBlockNumber: async () => 1_000n,
+      // The CLIENT-BOUND verification the product now uses (gate A6). A real client tries ECDSA
+      // first and only then ERC-1271; these fixtures sign with EOAs, so viem's offline check is
+      // exactly what a real node would conclude — and `getCode` answering "no code" is true of
+      // every account here.
+      verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
+      getCode: async () => undefined,
       // THE CHAIN'S CLOCK (gate A4): 200 seconds ahead of the fixture's `now`, which is past the
       // 120-second finality margin for a window that closed a moment ago and nowhere near the
       // half-hour windows of the live quotes here. The margin itself is asserted in

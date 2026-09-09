@@ -1,4 +1,4 @@
-import { getAddress, verifyTypedData } from "viem";
+import { getAddress } from "viem";
 import { CANCEL_AUTHORIZATION_TYPES, resolveAuthorizationOutcome } from "../adapters/arc/usdcToken";
 import {
   FORMATION_PRODUCT,
@@ -17,7 +17,7 @@ import {
   submitCancelAuthorization,
   submitTransferWithAuthorization,
 } from "../payments/formationSettle";
-import { verifyTransferAuthorization } from "../payments/transferAuthorization";
+import { verifySignature, verifyTransferAuthorization } from "../payments/transferAuthorization";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationPaymentRecord } from "../persistence/formationPaymentRepository";
@@ -146,9 +146,19 @@ export async function settleFormationPayment(
     // must not re-price a signature already given (§6.3).
     value: row.amountUsdc,
     mode: "exact",
+    // The CLIENT, so what we accept locally is what the token accepts on-chain (gate A6): ECDSA
+    // first, then ERC-1271 for a smart-account guardian.
+    client: deps.executor.publicClient,
     now: () => nowMs(deps),
   });
-  if (!verdict.ok) return { ok: false, reason: verdict.reason };
+  if (!verdict.ok)
+    return {
+      ok: false,
+      reason:
+        verdict.reason === "unsupported-signer"
+          ? "this wallet's signature format cannot be verified here — it is not a 65-byte signature and the account has no on-chain code to ask"
+          : verdict.reason,
+    };
 
   // PERSIST THE AUTHORIZATION BEFORE ANY BROADCAST (B1 gate A1). The signature is the recovery
   // artifact: a crash after this line is resumable, because a fresh executor transaction can be
@@ -479,25 +489,26 @@ export async function cancelFormationPayment(
   if (!row) return { ok: false, reason: "no live payment for this company" };
   const guardian = row.payerAddress ?? guardianOf(company);
 
-  // Verified LOCALLY first, exactly as the settle is: an invalid cancel would revert on-chain and
-  // cost the platform gas for a message that was never the guardian's.
-  let recovered: boolean;
-  try {
-    recovered = await verifyTypedData({
-      address: guardian,
-      domain: deps.payment.domain,
-      types: CANCEL_AUTHORIZATION_TYPES,
-      primaryType: "CancelAuthorization",
-      message: { authorizer: guardian, nonce: row.nonce },
-      signature: body.signature,
-    });
-  } catch {
-    recovered = false;
-  }
-  if (!recovered)
+  // Verified LOCALLY first, exactly as the settle is — through the SAME helper and the same
+  // client, so a smart-account guardian whose settle we accepted cannot have its cancellation
+  // refused (gate A6). An invalid cancel would revert on-chain and cost the platform gas for a
+  // message that was never the guardian's.
+  const verdict = await verifySignature({
+    client: deps.executor.publicClient,
+    address: guardian,
+    domain: deps.payment.domain,
+    types: CANCEL_AUTHORIZATION_TYPES,
+    primaryType: "CancelAuthorization",
+    message: { authorizer: guardian, nonce: row.nonce },
+    signature: body.signature,
+  });
+  if (!verdict.ok)
     return {
       ok: false,
-      reason: "the cancellation must be signed by this company's guardian wallet",
+      reason:
+        verdict.reason === "unsupported-signer"
+          ? "this wallet's signature format cannot be verified here — it is not a 65-byte signature and the account has no on-chain code to ask"
+          : "the cancellation must be signed by this company's guardian wallet",
     };
 
   const outcome = await submitCancelAuthorization(

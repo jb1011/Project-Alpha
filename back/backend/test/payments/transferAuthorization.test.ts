@@ -249,3 +249,118 @@ describe("verifyTransferAuthorization", () => {
     expect(r.ok).toBe(true);
   });
 });
+
+// ── ERC-1271: verifying the way the TOKEN verifies (B1 gate A6) ────────────────────────────
+//
+// The token checks EIP-3009 signatures with an ECDSA recovery AND, failing that, an on-chain
+// `isValidSignature` call. An offline-only check therefore refuses signatures the token would
+// accept — every smart-account guardian, which on Arc is most of them — and tells the guardian
+// their own wallet is wrong.
+
+const SMART_ACCOUNT = "0x000000000000000000000000000000000000C0DE" as Address;
+
+/** A client that answers like a node: ERC-1271 for the contract account, code where there is
+ *  code. `verifyTypedData` on a real client already does the ECDSA half itself. */
+function clientAcceptingContractSignature(opts: { accepts: boolean; hasCode?: boolean }) {
+  return {
+    verifyTypedData: async ({ address }: { address: string }) =>
+      address.toLowerCase() === SMART_ACCOUNT.toLowerCase() ? opts.accepts : false,
+    getCode: async () => ((opts.hasCode ?? true) ? "0x60006000" : undefined),
+    // biome-ignore lint/suspicious/noExplicitAny: a two-method stub of viem's PublicClient
+  } as any;
+}
+
+test("a SMART ACCOUNT's signature is accepted through the client, as the token would", async () => {
+  const a = authorization({ from: SMART_ACCOUNT });
+  const verdict = await verifyTransferAuthorization({
+    authorization: a,
+    // Not 65 bytes: a contract account's signature is whatever its own validator understands.
+    signature: `0x${"cd".repeat(100)}` as Hex,
+    domain,
+    payTo: REVENUE,
+    value: 399_000_000n,
+    mode: "exact",
+    client: clientAcceptingContractSignature({ accepts: true }),
+    now,
+  });
+  expect(verdict).toMatchObject({ ok: true });
+});
+
+test("a smart account whose validator says NO is a bad signature, not an unsupported one", async () => {
+  // There IS code, so the question was asked and answered. Blaming our own gap here would hide a
+  // genuinely invalid signature behind a shrug.
+  const verdict = await verifyTransferAuthorization({
+    authorization: authorization({ from: SMART_ACCOUNT }),
+    signature: `0x${"cd".repeat(100)}` as Hex,
+    domain,
+    payTo: REVENUE,
+    value: 399_000_000n,
+    mode: "exact",
+    client: clientAcceptingContractSignature({ accepts: false }),
+    now,
+  });
+  expect(verdict).toEqual({ ok: false, reason: "bad-signature" });
+});
+
+test("⚠ a non-ECDSA signature from an account with NO CODE is `unsupported-signer`", async () => {
+  // Nothing could have checked this: it is not 65 bytes, and there is no contract to ask. Calling
+  // it `bad-signature` would tell a guardian their wallet produced a wrong signature, when what
+  // happened is that we cannot verify this KIND of signature — an undeployed smart account, or an
+  // ERC-6492 wrapper we could not unwrap. Those are different sentences and only one is true.
+  const verdict = await verifyTransferAuthorization({
+    authorization: authorization({ from: SMART_ACCOUNT }),
+    signature: `0x${"cd".repeat(100)}` as Hex,
+    domain,
+    payTo: REVENUE,
+    value: 399_000_000n,
+    mode: "exact",
+    client: clientAcceptingContractSignature({ accepts: false, hasCode: false }),
+    now,
+  });
+  expect(verdict).toEqual({ ok: false, reason: "unsupported-signer" });
+});
+
+test("with no client, a malformed signature keeps its old answer — the x402 rail is untouched", async () => {
+  // The `unsupported-signer` claim needs a client to make it: without one we cannot know whether
+  // the signer has code, and guessing would change a refusal this rail has always given.
+  expect(
+    await verifyTransferAuthorization({
+      authorization: authorization(),
+      signature: "0xdeadbeef" as Hex,
+      domain,
+      payTo: REVENUE,
+      value: 399_000_000n,
+      mode: "exact",
+      now,
+    }),
+  ).toEqual({ ok: false, reason: "bad-signature" });
+});
+
+test("a WRONG 65-byte signature stays `bad-signature` — the ordinary EOA mistake", async () => {
+  const a = authorization();
+  const verdict = await verifyTransferAuthorization({
+    authorization: a,
+    signature: await sign(a, stranger),
+    domain,
+    payTo: REVENUE,
+    value: 399_000_000n,
+    mode: "exact",
+    now,
+  });
+  expect(verdict).toEqual({ ok: false, reason: "bad-signature" });
+});
+
+test("with NO client the offline path is unchanged — the x402 rail keeps what it had", async () => {
+  const a = authorization();
+  expect(
+    await verifyTransferAuthorization({
+      authorization: a,
+      signature: await sign(a),
+      domain,
+      payTo: REVENUE,
+      value: 399_000_000n,
+      mode: "exact",
+      now,
+    }),
+  ).toMatchObject({ ok: true });
+});
