@@ -148,7 +148,11 @@ export const CANCEL_AUTHORIZATION_TYPES = {
 /**
  * Read the token's EIP-712 domain and PIN it against the token's own `DOMAIN_SEPARATOR()`.
  *
- * Why not just hardcode `{ name: "USD Coin", version: "2" }`? Because those two strings are the
+ * Why not just hardcode `{ name: "USD Coin", version: "2" }`? Because ARC'S TOKEN DOES NOT SAY
+ * THAT — the live merge gate read `name: "USDC"` (2026-09-09,
+ * docs/runbooks/formation-settle-probe-2026-09.md), where every reference implementation and most
+ * of Circle's own documentation quotes "USD Coin". Which is the whole point: those two strings are
+ * the
  * difference between a signature that settles and one that reverts, they are per-deployment
  * facts about somebody else's contract, and getting them wrong is INVISIBLE until a guardian has
  * signed: the wizard would show a wallet prompt, the guardian would approve it, our local

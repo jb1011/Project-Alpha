@@ -10,10 +10,8 @@
  * doola filing, and this leg does not touch doola at all.
  */
 import type Database from "better-sqlite3";
-import { verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import type { FormationPaymentConfig } from "../../src/formation/payment";
 import type { FormationExecutorDeps } from "../../src/payments/formationSettle";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -32,14 +30,24 @@ import {
   SWEEP_RECEIPT_TIMEOUT_MS,
 } from "../../src/workflow/formationSweeper";
 import { MemoryDocumentStore, fakeDoola } from "../helpers/formationFakes";
+import {
+  REVENUE,
+  fakeChain as chainWithClock,
+  decodeFakeTx,
+  paymentCfg,
+  settlementLogs,
+} from "../helpers/formationPayment";
 
 const guardian = privateKeyToAccount(`0x${"7".repeat(64)}`);
 const TENANT = guardian.address as Address;
-const REVENUE = "0x000000000000000000000000000000000000bEEF" as Address;
-const USDC = "0x3600000000000000000000000000000000000000" as Address;
 const SIG = `0x${"11".repeat(65)}` as Hex;
-const RAW = "0x02aabbcc" as Hex;
 const TX = `0x${"cc".repeat(32)}` as Hex;
+
+/** The shared chain (finding C6), wound to THIS file's clock — every rule here is about a window
+ *  against a block timestamp, and 200 seconds ahead clears the 120-second finality margin for a
+ *  window that has just closed while staying inside the half-hour ones of the live quotes. */
+const fakeChain = (opts: Parameters<typeof chainWithClock>[0] = {}) =>
+  chainWithClock({ blockTimestamp: nowSec() + 200, ...opts });
 
 let now = Date.parse("2026-08-26T12:00:00Z");
 const nowSec = () => Math.floor(now / 1000);
@@ -61,109 +69,6 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-interface FakeLog {
-  name: "AuthorizationUsed" | "AuthorizationCanceled" | "Transfer";
-  args: Record<string, unknown>;
-  blockNumber: bigint;
-  transactionHash: Hex;
-}
-
-/** The pair of logs a real settlement leaves: the nonce retired, and the money moved. */
-function settlementLogs(nonce: Hex, txHash: Hex, block = 100n): FakeLog[] {
-  return [
-    {
-      name: "AuthorizationUsed",
-      args: { authorizer: TENANT, nonce },
-      blockNumber: block,
-      transactionHash: txHash,
-    },
-    {
-      name: "Transfer",
-      args: { from: TENANT, to: REVENUE, value: 399_000_000n },
-      blockNumber: block,
-      transactionHash: txHash,
-    },
-  ];
-}
-
-/** The chain, as much of it as this leg touches: the token's logs, a spent-nonce set and a
- *  receipt verdict. */
-function fakeChain(
-  opts: {
-    receipt?: "success" | "reverted" | "timeout";
-    spent?: string[];
-    logs?: FakeLog[];
-  } = {},
-) {
-  const sent: Hex[] = [];
-  const spent = new Set((opts.spent ?? []).map((n) => n.toLowerCase()));
-  const logs = opts.logs ?? [];
-  const executor: FormationExecutorDeps = {
-    publicClient: {
-      getTransactionCount: async () => 1,
-      getBlockNumber: async () => 1_000n,
-      // The CLIENT-BOUND verification the product now uses (gate A6). A real client tries ECDSA
-      // first and only then ERC-1271; these fixtures sign with EOAs, so viem's offline check is
-      // exactly what a real node would conclude — and `getCode` answering "no code" is true of
-      // every account here.
-      verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
-      getCode: async () => undefined,
-      // THE CHAIN'S CLOCK (gate A4): 200 seconds ahead of the fixture's `now`, which is past the
-      // 120-second finality margin for a window that closed a moment ago and nowhere near the
-      // half-hour windows of the live quotes here. The margin itself is asserted in
-      // test/workflow/formationPayment.test.ts.
-      getBlock: async () => ({ number: 1_000n, timestamp: BigInt(nowSec() + 200) }),
-      getLogs: async (q: {
-        event: { name: string };
-        args?: Record<string, unknown>;
-        fromBlock: bigint;
-        toBlock: bigint;
-      }) =>
-        logs.filter(
-          (l) =>
-            l.name === q.event.name &&
-            l.blockNumber >= q.fromBlock &&
-            l.blockNumber <= q.toBlock &&
-            Object.entries(q.args ?? {}).every(
-              ([k, v]) => String(l.args[k]).toLowerCase() === String(v).toLowerCase(),
-            ),
-        ),
-      estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
-      sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
-        sent.push(serializedTransaction);
-        return TX;
-      },
-      waitForTransactionReceipt: async ({ hash }: { hash: Hex }) => {
-        if ((opts.receipt ?? "success") === "timeout") throw new Error("receipt timeout");
-        return { status: opts.receipt ?? "success", gasUsed: 118_000n, transactionHash: hash };
-      },
-      readContract: async ({ args }: { args: unknown[] }) =>
-        spent.has(String(args[1]).toLowerCase()),
-      // biome-ignore lint/suspicious/noExplicitAny: a five-method stub of viem's PublicClient
-    } as any,
-    walletClient: {
-      account: privateKeyToAccount(`0x${"9".repeat(64)}`),
-      signTransaction: async () => RAW,
-      // biome-ignore lint/suspicious/noExplicitAny: a two-field stub of viem's WalletClient
-    } as any,
-    usdc: USDC,
-    chainId: 5042002,
-  };
-  return { executor, sent };
-}
-
-function paymentCfg(): FormationPaymentConfig {
-  return {
-    required: true,
-    feeAtomic: 399_000_000n,
-    feeUsdc: 399,
-    revenueAddress: REVENUE,
-    quoteTtlMs: 30 * 60 * 1000,
-    domain: { name: "USD Coin", version: "2", chainId: 5042002, verifyingContract: USDC },
-    payments,
-  };
-}
-
 function sweeper(executor: FormationExecutorDeps, wired = true): FormationSweeper {
   const doola = fakeDoola();
   const d: FormationSweeperDeps = {
@@ -180,7 +85,7 @@ function sweeper(executor: FormationExecutorDeps, wired = true): FormationSweepe
     now: () => now,
     payment: wired
       ? {
-          payment: paymentCfg(),
+          payment: paymentCfg(payments),
           executor,
           transaction: <T>(fn: () => T) => db.transaction(fn)(),
         }
@@ -273,7 +178,10 @@ test("a STALLED settling row is re-submitted from its persisted AUTHORIZATION �
   stall(id);
   const chain = fakeChain();
   await sweeper(chain.executor).tick();
-  expect(chain.sent).toEqual([RAW]);
+  // ONE transaction, carrying the guardian's ORIGINAL signature — composed fresh around it rather
+  // than replayed from bytes that commit to a nonce nobody can guarantee any more.
+  expect(chain.sent).toHaveLength(1);
+  expect(decodeFakeTx(chain.sent[0]!).data).toContain(SIG.slice(2));
   expect(payments.find(id)).toMatchObject({ status: "settled", broadcastCount: 1 });
   expect(companies.find(c)?.status).toBe("ready");
   // ONE row. A re-quote would be a second live authorization for the same fee.
@@ -327,7 +235,10 @@ test("a SETTLEMENT IN THE LOGS past the window resolves to SETTLED — never exp
   const id = quote(c, { validBefore: nowSec() - 1, nonce });
   payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
   stall(id);
-  const chain = fakeChain({ spent: [nonce], logs: settlementLogs(nonce, TX) });
+  const chain = fakeChain({
+    spent: [nonce],
+    logs: settlementLogs({ authorizer: TENANT, payTo: REVENUE, nonce, txHash: TX }),
+  });
   await sweeper(chain.executor).tick();
   expect(payments.find(id)).toMatchObject({ status: "settled", txHash: TX });
   expect(companies.find(c)?.status).toBe("ready");

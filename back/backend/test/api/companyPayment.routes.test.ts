@@ -21,13 +21,12 @@ import { SqliteFormationPartyRepository } from "../../src/persistence/formationP
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import type { Address } from "../../src/types";
+import { REVENUE, USDC, USDC_DOMAIN, fakeChain, paymentCfg } from "../helpers/formationPayment";
 
 const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
 const guardian = privateKeyToAccount(`0x${"7".repeat(64)}`);
 const OWNER = getAddress(guardian.address);
 const OTHER = getAddress("0x000000000000000000000000000000000000000b");
-const REVENUE = "0x000000000000000000000000000000000000bEEF" as Address;
-const USDC = "0x3600000000000000000000000000000000000000" as Address;
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
@@ -50,19 +49,6 @@ afterEach(() => db.close());
 async function token(tenantId: string): Promise<string> {
   const { token } = await signSession(tenantId, JWT_SECRET, 3600, Math.floor(Date.now() / 1000));
   return token;
-}
-
-function paymentCfg(over: Partial<FormationPaymentConfig> = {}): FormationPaymentConfig {
-  return {
-    required: true,
-    feeAtomic: 399_000_000n,
-    feeUsdc: 399,
-    revenueAddress: REVENUE,
-    quoteTtlMs: 30 * 60 * 1000,
-    domain: { name: "USD Coin", version: "2", chainId: 5042002, verifyingContract: USDC },
-    payments,
-    ...over,
-  };
 }
 
 function app(payment?: FormationPaymentConfig) {
@@ -138,13 +124,13 @@ async function create(payment?: FormationPaymentConfig, tenantId = OWNER) {
 }
 
 test("payment OFF: the create response is the companyId and NOTHING else", async () => {
-  const { res, body } = await create(paymentCfg({ required: false }));
+  const { res, body } = await create(paymentCfg(payments, { required: false }));
   expect(res.status).toBe(201);
   expect(Object.keys(body)).toEqual(["companyId"]);
 });
 
 test("payment ON: the create response carries the quote, ready to sign", async () => {
-  const { res, body } = await create(paymentCfg());
+  const { res, body } = await create(paymentCfg(payments));
   expect(res.status).toBe(201);
   const payment = body.payment as unknown as Record<string, unknown>;
   expect(payment).toMatchObject({
@@ -156,7 +142,7 @@ test("payment ON: the create response carries the quote, ready to sign", async (
   // The whole EIP-712 request, so no client assembles the message for itself.
   expect(payment.typedData).toMatchObject({
     primaryType: "TransferWithAuthorization",
-    domain: { name: "USD Coin", version: "2", chainId: 5042002, verifyingContract: USDC },
+    domain: USDC_DOMAIN,
     message: { from: OWNER, to: REVENUE, value: "399000000", validAfter: "0" },
   });
 });
@@ -164,8 +150,8 @@ test("payment ON: the create response carries the quote, ready to sign", async (
 test("GET the payment: 404 where there is NO PAYMENT — not where the flag is off", async () => {
   // A company with no payment row has no payment resource, and inventing an empty one would have
   // every client render a payment section for a deployment that takes no money.
-  const { body } = await create(paymentCfg({ required: false }));
-  const res = await app(paymentCfg({ required: false })).request(
+  const { body } = await create(paymentCfg(payments, { required: false }));
+  const res = await app(paymentCfg(payments, { required: false })).request(
     `/companies/${body.companyId}/payment`,
     { headers: { authorization: `Bearer ${await token(OWNER)}` } },
   );
@@ -176,7 +162,7 @@ test("⚠ B8: a payment already taken stays READABLE after the flag is rolled ba
   // Gating the read on `payment.required` meant that turning charging off after taking money made
   // every settled payment invisible: a guardian who paid 399 USDC saw no payment at all and
   // support had nothing to point at. Rolling a flag back must not erase history.
-  const cfg = paymentCfg();
+  const cfg = paymentCfg(payments);
   const { body } = await create(cfg);
   const companyId = body.companyId as unknown as string;
   const row = payments.findLive(companyId, "formation")!;
@@ -186,7 +172,7 @@ test("⚠ B8: a payment already taken stays READABLE after the flag is rolled ba
   });
   payments.markSettled(row.paymentId, `0x${"cc".repeat(32)}`);
 
-  const rolledBack = paymentCfg({ required: false, domain: undefined });
+  const rolledBack = paymentCfg(payments, { required: false, domain: undefined });
   const res = await app(rolledBack).request(`/companies/${companyId}/payment`, {
     headers: { authorization: `Bearer ${await token(OWNER)}` },
   });
@@ -212,7 +198,7 @@ test("⚠ B8: a payment already taken stays READABLE after the flag is rolled ba
 });
 
 test("GET the payment: the live quote, re-servable after a reload", async () => {
-  const cfg = paymentCfg();
+  const cfg = paymentCfg(payments);
   const { body } = await create(cfg);
   const res = await app(cfg).request(`/companies/${body.companyId}/payment`, {
     headers: { authorization: `Bearer ${await token(OWNER)}` },
@@ -232,7 +218,7 @@ test("GET the payment: the live quote, re-servable after a reload", async () => 
 });
 
 test("GET the payment: a SETTLING row carries NO quote — re-signing is the double charge", async () => {
-  const cfg = paymentCfg();
+  const cfg = paymentCfg(payments);
   const { body } = await create(cfg);
   const row = payments.findLive(body.companyId as unknown as string, "formation")!;
   payments.markSettling(row.paymentId, {
@@ -250,7 +236,7 @@ test("GET the payment: a SETTLING row carries NO quote — re-signing is the dou
 test("GET the payment: an EXPIRED-BY-THE-CLOCK quote offers nothing, sweeper or not", async () => {
   // The clock is the truth; the row's status is a record of when we last looked at it. Offering
   // typed data here would walk a guardian through a wallet prompt the token would reject.
-  const cfg = paymentCfg({ quoteTtlMs: 1 });
+  const cfg = paymentCfg(payments, { quoteTtlMs: 1 });
   const { body } = await create(cfg);
   const res = await app(cfg).request(`/companies/${body.companyId}/payment`, {
     headers: { authorization: `Bearer ${await token(OWNER)}` },
@@ -261,7 +247,7 @@ test("GET the payment: an EXPIRED-BY-THE-CLOCK quote offers nothing, sweeper or 
 });
 
 test("GET the payment: somebody else's company is the SAME 404 as an unknown one", async () => {
-  const cfg = paymentCfg();
+  const cfg = paymentCfg(payments);
   const { body } = await create(cfg);
   const res = await app(cfg).request(`/companies/${body.companyId}/payment`, {
     headers: { authorization: `Bearer ${await token(OTHER)}` },
@@ -274,7 +260,10 @@ test("GET the payment: somebody else's company is the SAME 404 as an unknown one
 });
 
 test("/config serves the two payment fields, and NEVER the revenue address", async () => {
-  const on = (await (await app(paymentCfg()).request("/config")).json()) as Record<string, unknown>;
+  const on = (await (await app(paymentCfg(payments)).request("/config")).json()) as Record<
+    string,
+    unknown
+  >;
   expect(on.formationPaymentRequired).toBe(true);
   expect(on.formationFeeUsdc).toBe(399);
   // The payee belongs on the QUOTE — authenticated, and bound to an exact amount and nonce.
@@ -282,7 +271,7 @@ test("/config serves the two payment fields, and NEVER the revenue address", asy
   expect(JSON.stringify(on).toLowerCase()).not.toContain(REVENUE.toLowerCase());
 
   const off = (await (
-    await app(paymentCfg({ required: false })).request("/config")
+    await app(paymentCfg(payments, { required: false })).request("/config")
   ).json()) as Record<string, unknown>;
   expect(off.formationPaymentRequired).toBe(false);
   // The FEE is still served with payment off: it is the number in the beta sentence
@@ -297,47 +286,7 @@ test("/config serves the two payment fields, and NEVER the revenue address", asy
 // chain. What these add is the DOOR: ownership, the 404 on a box that does not charge, and the
 // body validation that stands between a stranger's POST and the executor.
 
-/** The smallest executor stub that lets a settle reach a verdict. */
-function fakeExecutor() {
-  const sent: string[] = [];
-  return {
-    publicClient: {
-      getTransactionCount: async () => 1,
-      estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
-      sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: string }) => {
-        sent.push(serializedTransaction);
-        return "0x00";
-      },
-      waitForTransactionReceipt: async ({ hash }: { hash: string }) => ({
-        status: "success",
-        gasUsed: 118_000n,
-        transactionHash: hash,
-      }),
-      readContract: async () => false,
-      getBlockNumber: async () => 1_000n,
-      getBlock: async () => ({ number: 1_000n, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
-      getLogs: async () => [],
-      // Client-bound verification (gate A6): a real client tries ECDSA first, which for the EOA
-      // guardian in this file is the whole answer.
-      verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
-      getCode: async () => undefined,
-      // biome-ignore lint/suspicious/noExplicitAny: a five-method stub of viem's PublicClient
-    } as any,
-    walletClient: {
-      account: privateKeyToAccount(`0x${"9".repeat(64)}`),
-      signTransaction: async () => "0x02aabb",
-      // biome-ignore lint/suspicious/noExplicitAny: a two-field stub of viem's WalletClient
-    } as any,
-    usdc: USDC,
-    chainId: 5042002,
-    sent,
-  };
-}
-
-function appWithExecutor(
-  payment: FormationPaymentConfig,
-  executor: ReturnType<typeof fakeExecutor>,
-) {
+function appWithExecutor(payment: FormationPaymentConfig, executor: ReturnType<typeof fakeChain>) {
   const built = app(payment);
   void built;
   const companyDeps = {
@@ -370,7 +319,7 @@ function appWithExecutor(
       companyDeps,
       payment,
       feeUsdc: 399,
-      paymentExecutor: executor,
+      paymentExecutor: executor.executor,
     },
     // biome-ignore lint/suspicious/noExplicitAny: the app deps are wider than this file needs
   } as any);
@@ -423,8 +372,8 @@ async function post(
 }
 
 test("settle: a real guardian signature settles through the door and readies the company", async () => {
-  const cfg = paymentCfg();
-  const executor = fakeExecutor();
+  const cfg = paymentCfg(payments);
+  const executor = fakeChain();
   const { body } = await create(cfg);
   const companyId = body.companyId as unknown as string;
   // ⚠ SIGNS WHAT THE DOOR SERVED (finding C1) — the typed data off the create response, not a
@@ -441,8 +390,8 @@ test("settle: a real guardian signature settles through the door and readies the
 });
 
 test("settle: a body with no signature is a 400, and nothing reaches the executor", async () => {
-  const cfg = paymentCfg();
-  const executor = fakeExecutor();
+  const cfg = paymentCfg(payments);
+  const executor = fakeChain();
   const { body } = await create(cfg);
   const res = await post(
     appWithExecutor(cfg, executor),
@@ -454,8 +403,8 @@ test("settle: a body with no signature is a 400, and nothing reaches the executo
 });
 
 test("settle: another tenant's company is the same 404 as an unknown one", async () => {
-  const cfg = paymentCfg();
-  const executor = fakeExecutor();
+  const cfg = paymentCfg(payments);
+  const executor = fakeChain();
   const { body } = await create(cfg);
   const res = await post(
     appWithExecutor(cfg, executor),
@@ -467,8 +416,8 @@ test("settle: another tenant's company is the same 404 as an unknown one", async
 });
 
 test("the three action doors 404 on a deployment that does not charge", async () => {
-  const off = paymentCfg({ required: false });
-  const executor = fakeExecutor();
+  const off = paymentCfg(payments, { required: false });
+  const executor = fakeChain();
   const { body } = await create(off);
   const application = appWithExecutor(off, executor);
   for (const action of ["settle", "cancel", "requote"]) {
@@ -481,8 +430,8 @@ test("the three action doors 404 on a deployment that does not charge", async ()
 });
 
 test("requote: refused while a quote is live, and issues a NEW nonce once it is terminal", async () => {
-  const cfg = paymentCfg();
-  const executor = fakeExecutor();
+  const cfg = paymentCfg(payments);
+  const executor = fakeChain();
   const { body } = await create(cfg);
   const companyId = body.companyId as unknown as string;
   const application = appWithExecutor(cfg, executor);
@@ -503,7 +452,7 @@ test("⚠ C2: a live payment carries the CANCELLATION whole, authorizer and all"
   // The client used to build this from `nonce` + `domain` with its own copy of the type list.
   // The authorizer is the part it could not know: the address that SIGNED, which is the PAYER
   // once a settle has been attempted rather than whichever wallet is connected now.
-  const cfg = paymentCfg();
+  const cfg = paymentCfg(payments);
   const { body } = await create(cfg);
   const companyId = body.companyId as unknown as string;
   const row = payments.findLive(companyId, "formation")!;
@@ -543,7 +492,7 @@ test("a settling payment still carries the NONCE and the DOMAIN — the cancel p
   // needs the nonce and the token's domain. Serving those two is safe where serving the quote is
   // not: a transfer authorization also commits to the VALUE, the RECIPIENT and the WINDOW, and
   // none of them is here — the worst a wrong cancel message can do is get rejected by the token.
-  const cfg = paymentCfg();
+  const cfg = paymentCfg(payments);
   const { body } = await create(cfg);
   const companyId = body.companyId as unknown as string;
   const row = payments.findLive(companyId, "formation")!;
@@ -557,10 +506,5 @@ test("a settling payment still carries the NONCE and the DOMAIN — the cancel p
   const view = (await res.json()) as Record<string, unknown>;
   expect(view.quote).toBeUndefined();
   expect(view.nonce).toBe(row.nonce);
-  expect(view.domain).toEqual({
-    name: "USD Coin",
-    version: "2",
-    chainId: 5042002,
-    verifyingContract: USDC,
-  });
+  expect(view.domain).toEqual(USDC_DOMAIN);
 });

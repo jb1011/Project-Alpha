@@ -145,7 +145,8 @@ export interface FormationPaymentView {
    * anyone's money.
    *
    * The domain is served rather than let a client assemble one, for the same reason the quote's
-   * is: it is READ from the token at boot, and a client that hardcoded "USD Coin"/"2" would sign
+   * is: it is READ from the token at boot, and a client that hardcoded "USD Coin"/"2" — which is
+   * what the documentation says and NOT what Arc's token reports — would sign
    * cancellations against a domain the token does not verify.
    */
   nonce: Hex;

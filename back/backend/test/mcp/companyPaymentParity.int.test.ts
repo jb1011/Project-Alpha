@@ -26,12 +26,17 @@ import { SqliteFormationPartyRepository } from "../../src/persistence/formationP
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import type { Address, Hex } from "../../src/types";
+import {
+  REVENUE,
+  USDC_DOMAIN,
+  fakeChain,
+  paymentCfg as sharedPaymentCfg,
+} from "../helpers/formationPayment";
 import { startMcpTestClient } from "./helpers";
 
 const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
 const guardian = privateKeyToAccount(`0x${"7".repeat(64)}`);
 const OWNER = getAddress(guardian.address);
-const REVENUE = "0x000000000000000000000000000000000000bEEF" as Address;
 const USDC = "0x3600000000000000000000000000000000000000" as Address;
 
 let db: Database.Database;
@@ -54,50 +59,10 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
+/** The shared fixture (finding C6), with the one thing this file varies: whether the box charges
+ *  — and therefore whether the token's domain was ever read (finding B8). */
 function paymentCfg(required: boolean): FormationPaymentConfig {
-  return {
-    required,
-    feeAtomic: 399_000_000n,
-    feeUsdc: 399,
-    revenueAddress: REVENUE,
-    quoteTtlMs: 30 * 60 * 1000,
-    // Present only where the box CHARGES, exactly as the composition root builds it: the token's
-    // domain is READ at boot, and a deployment that quotes nothing never reads it (finding B8).
-    domain: required
-      ? { name: "USDC", version: "2", chainId: 5042002, verifyingContract: USDC }
-      : undefined,
-    payments,
-  };
-}
-
-function fakeExecutor() {
-  return {
-    publicClient: {
-      getTransactionCount: async () => 1,
-      estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
-      sendRawTransaction: async () => `0x${"cc".repeat(32)}`,
-      waitForTransactionReceipt: async ({ hash }: { hash: string }) => ({
-        status: "success",
-        gasUsed: 118_000n,
-        transactionHash: hash,
-      }),
-      readContract: async () => false,
-      getBlockNumber: async () => 1_000n,
-      getBlock: async () => ({ number: 1_000n, timestamp: BigInt(Math.floor(Date.now() / 1000)) }),
-      getLogs: async () => [],
-      // Client-bound verification (gate A6); the guardian here is an EOA, so ECDSA is the answer.
-      verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
-      getCode: async () => undefined,
-      // biome-ignore lint/suspicious/noExplicitAny: a stub of viem's PublicClient
-    } as any,
-    walletClient: {
-      account: privateKeyToAccount(`0x${"9".repeat(64)}`),
-      signTransaction: async () => "0x02aabb",
-      // biome-ignore lint/suspicious/noExplicitAny: a two-field stub of viem's WalletClient
-    } as any,
-    usdc: USDC,
-    chainId: 5042002,
-  };
+  return sharedPaymentCfg(payments, { required, domain: required ? USDC_DOMAIN : undefined });
 }
 
 function app(payment: FormationPaymentConfig) {
@@ -134,7 +99,7 @@ function app(payment: FormationPaymentConfig) {
       companyDeps,
       payment,
       feeUsdc: 399,
-      paymentExecutor: fakeExecutor(),
+      paymentExecutor: fakeChain().executor,
     },
     // biome-ignore lint/suspicious/noExplicitAny: the app deps are wider than this file needs
   } as any);
@@ -347,7 +312,7 @@ test("PARITY: submit_company_payment settles exactly as the REST door does", asy
   ) as { quote: { typedData: { message: Record<string, string> } } };
   const td = served.quote.typedData;
   const signature = await guardian.signTypedData({
-    domain: { name: "USDC", version: "2", chainId: 5042002, verifyingContract: USDC },
+    domain: USDC_DOMAIN,
     types: TRANSFER_WITH_AUTHORIZATION_TYPES,
     primaryType: "TransferWithAuthorization",
     message: {

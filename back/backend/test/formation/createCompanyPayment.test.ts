@@ -11,7 +11,6 @@ import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { type CreateCompanyDeps, createCompany } from "../../src/formation/company";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
-import type { FormationPaymentConfig } from "../../src/formation/payment";
 import { hasLivePayment } from "../../src/formation/status";
 import { verifyTransferAuthorization } from "../../src/payments/transferAuthorization";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
@@ -20,11 +19,11 @@ import { SqliteFormationPartyRepository } from "../../src/persistence/formationP
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import type { Address, Hex } from "../../src/types";
+import { REVENUE, USDC_DOMAIN, paymentCfg } from "../helpers/formationPayment";
 
 const guardian = privateKeyToAccount(`0x${"7".repeat(64)}`);
 const TENANT = guardian.address as Address;
-const REVENUE = "0x000000000000000000000000000000000000bEEF" as Address;
-const USDC = "0x3600000000000000000000000000000000000000" as Address;
+
 const NOW = Date.parse("2026-08-26T12:00:00Z");
 
 let db: DatabaseType.Database;
@@ -43,22 +42,6 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-function paymentCfg(over: Partial<FormationPaymentConfig> = {}): FormationPaymentConfig {
-  return {
-    required: true,
-    feeAtomic: 399_000_000n,
-    feeUsdc: 399,
-    revenueAddress: REVENUE,
-    quoteTtlMs: 30 * 60 * 1000,
-    settleGraceMs: 15 * 60 * 1000,
-    // Read and pinned at boot in production; a literal here, because this file is about the row
-    // and the transaction rather than about the chain read (see usdcToken.test.ts for that).
-    domain: { name: "USD Coin", version: "2", chainId: 5042002, verifyingContract: USDC },
-    payments,
-    ...over,
-  };
-}
-
 function deps(over: Partial<CreateCompanyDeps> = {}): CreateCompanyDeps {
   return {
     companies,
@@ -70,7 +53,7 @@ function deps(over: Partial<CreateCompanyDeps> = {}): CreateCompanyDeps {
     dailyCeiling: 10,
     transaction: (fn) => db.transaction(fn)(),
     now: () => NOW,
-    payment: paymentCfg(),
+    payment: paymentCfg(payments),
     ...over,
   };
 }
@@ -124,7 +107,7 @@ test("payment ON: the company lands DRAFT and carries a quoted row", () => {
 });
 
 test("payment OFF changes NOTHING — no row, `ready`, and no quote in the answer", () => {
-  const { companyId, quote } = created({ payment: paymentCfg({ required: false }) });
+  const { companyId, quote } = created({ payment: paymentCfg(payments, { required: false }) });
   expect(companies.find(companyId)?.status).toBe("ready");
   expect(quote).toBeUndefined();
   expect(payments.listByCompany(companyId)).toEqual([]);
@@ -165,7 +148,7 @@ test("⚠ TWO DEADLINES: what the guardian SIGNS outlives what they are SHOWN (g
 });
 
 test("no configured grace means the two deadlines coincide — nothing is invented", () => {
-  const { companyId } = created({ payment: paymentCfg({ settleGraceMs: undefined }) });
+  const { companyId } = created({ payment: paymentCfg(payments, { settleGraceMs: undefined }) });
   const row = payments.findLive(companyId, "formation")!;
   expect(row.validBefore).toBe(row.ttlAt);
 });

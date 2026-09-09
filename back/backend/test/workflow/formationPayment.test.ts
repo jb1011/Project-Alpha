@@ -7,11 +7,10 @@
  * of it, and each is asserted against the failure it prevents rather than against its own shape.
  */
 import type DatabaseType from "better-sqlite3";
-import { keccak256, verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { CANCEL_AUTHORIZATION_TYPES } from "../../src/adapters/arc/usdcToken";
-import { type FormationPaymentConfig, quoteOf } from "../../src/formation/payment";
+import { quoteOf } from "../../src/formation/payment";
 import type { FormationExecutorDeps } from "../../src/payments/formationSettle";
 import { TRANSFER_WITH_AUTHORIZATION_TYPES } from "../../src/payments/transferAuthorization";
 import {
@@ -30,18 +29,32 @@ import {
   requoteFormationPayment,
   settleFormationPayment,
 } from "../../src/workflow/formationPayment";
+import {
+  REVENUE,
+  USDC_DOMAIN,
+  cancelLog,
+  fakeChain as chainWithClock,
+  decodeFakeTx,
+  paymentCfg,
+  settlementLogs,
+} from "../helpers/formationPayment";
 
 const guardian = privateKeyToAccount(`0x${"7".repeat(64)}`);
 const stranger = privateKeyToAccount(`0x${"8".repeat(64)}`);
 const executorAccount = privateKeyToAccount(`0x${"9".repeat(64)}`);
 const TENANT = guardian.address as Address;
-const REVENUE = "0x000000000000000000000000000000000000bEEF" as Address;
-const USDC = "0x3600000000000000000000000000000000000000" as Address;
-const CHAIN = 5042002;
 const NOW = 1_800_000_000_000;
 const nowSec = Math.floor(NOW / 1000);
 
-const domain = { name: "USD Coin", version: "2", chainId: CHAIN, verifyingContract: USDC };
+/** The shared fixture (finding C6) — one paymentCfg, one fake chain, and the REAL pinned domain
+ *  (`USDC`, not `USD Coin`, per the live probe). */
+const domain = USDC_DOMAIN;
+
+/** The shared chain, wound to THIS file's injected clock: every expiry rule here is about the
+ *  relationship between a window and the block timestamp, and a fake running on the wall clock
+ *  would make those tests about how long the suite took to reach them. */
+const fakeChain = (opts: Parameters<typeof chainWithClock>[0] = {}) =>
+  chainWithClock({ blockTimestamp: nowSec, ...opts });
 
 let db: DatabaseType.Database;
 let companies: SqliteCompanyRepository;
@@ -56,147 +69,6 @@ beforeEach(() => {
   repo = new SqliteEntityRepository(db);
 });
 afterEach(() => db.close());
-
-/**
- * A FAKE CHAIN with the one property that matters for the B1 gate: THE SUBMITTER HAS A NONCE, and
- * a transaction whose nonce is below the account's is rejected forever ("nonce too low"). That is
- * the failure the persisted-raw-transaction scheme could not survive and the persisted
- * AUTHORIZATION does.
- *
- * `authorizationState` is a set of spent nonces, which is exactly what the token's storage is.
- */
-function fakeChain(
-  opts: {
-    receipt?: "success" | "reverted" | "timeout";
-    spent?: Set<string>;
-    accountNonce?: number;
-    /** The token's own logs, which is where an outcome actually comes from (gate A3). */
-    logs?: FakeLog[];
-    head?: bigint;
-    /** The latest block's timestamp, unix seconds (gate A4). */
-    blockTimestamp?: number;
-  } = {},
-) {
-  const sent: Hex[] = [];
-  const state = {
-    receipt: opts.receipt ?? "success",
-    spent: opts.spent ?? new Set<string>(),
-    accountNonce: opts.accountNonce ?? 7,
-    /** Hashes the node ACCEPTED. A receipt exists for nothing else. */
-    accepted: new Set<string>(),
-    logs: opts.logs ?? [],
-    head: opts.head ?? 5_000n,
-    /** THE CHAIN'S CLOCK (gate A4) — the only clock that may expire an authorization. Defaults to
-     *  the test's own `now`, so a test that wants an expiry has to say the chain has moved on. */
-    blockTimestamp: BigInt(opts.blockTimestamp ?? nowSec),
-  };
-  const publicClient = {
-    getTransactionCount: async () => state.accountNonce,
-    getBlockNumber: async () => state.head,
-    // The CLIENT-BOUND verification the product now uses (gate A6). A real client tries ECDSA
-    // first and only then ERC-1271; these fixtures sign with EOAs, so viem's offline check is
-    // exactly what a real node would conclude — and `getCode` answering "no code" is true of
-    // every account here.
-    verifyTypedData: async (args: Parameters<typeof verifyTypedData>[0]) => verifyTypedData(args),
-    getCode: async () => undefined,
-    getBlock: async () => ({ number: state.head, timestamp: state.blockTimestamp }),
-    getLogs: async (q: {
-      event: { name: string };
-      args?: Record<string, unknown>;
-      fromBlock: bigint;
-      toBlock: bigint;
-    }) =>
-      state.logs.filter(
-        (l) =>
-          l.name === q.event.name &&
-          l.blockNumber >= q.fromBlock &&
-          l.blockNumber <= q.toBlock &&
-          Object.entries(q.args ?? {}).every(
-            ([k, v]) => String(l.args[k]).toLowerCase() === String(v).toLowerCase(),
-          ),
-      ),
-    estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
-    sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
-      const nonce = decodeFakeTx(serializedTransaction).nonce;
-      if (nonce < state.accountNonce) throw new Error("nonce too low");
-      state.accountNonce = nonce + 1;
-      sent.push(serializedTransaction);
-      const hash = keccak256(serializedTransaction);
-      state.accepted.add(hash);
-      return hash;
-    },
-    waitForTransactionReceipt: async ({ hash }: { hash: Hex }) => {
-      if (state.receipt === "timeout" || !state.accepted.has(hash))
-        throw new Error("timed out waiting for receipt");
-      return { status: state.receipt, gasUsed: 118_000n, transactionHash: hash };
-    },
-    readContract: async ({ args }: { args: unknown[] }) =>
-      state.spent.has(String(args[1]).toLowerCase()),
-    // biome-ignore lint/suspicious/noExplicitAny: a five-method stub of viem's PublicClient
-  } as any;
-  const walletClient = {
-    account: executorAccount,
-    signTransaction: async (tx: Record<string, unknown>) =>
-      // A deterministic stand-in for a serialized transaction: the tests care that the SAME bytes
-      // come back out of the row and go to the chain, not that they are RLP. Bigints are
-      // stringified explicitly — JSON has none, and the real serializer has no such problem.
-      `0x02${Buffer.from(
-        JSON.stringify({ ...tx, account: undefined }, (_k, v) =>
-          typeof v === "bigint" ? v.toString() : v,
-        ),
-      ).toString("hex")}` as Hex,
-    // biome-ignore lint/suspicious/noExplicitAny: a two-field stub of viem's WalletClient
-  } as any;
-  const executor: FormationExecutorDeps = {
-    publicClient,
-    walletClient,
-    usdc: USDC,
-    chainId: CHAIN,
-  };
-  return { executor, sent, state };
-}
-
-interface FakeLog {
-  name: "AuthorizationUsed" | "AuthorizationCanceled" | "Transfer";
-  args: Record<string, unknown>;
-  blockNumber: bigint;
-  transactionHash: Hex;
-}
-
-/** The pair of logs a REAL settlement leaves: the nonce retired, and the money moved. */
-function settlementLogs(nonce: Hex, txHash: Hex, value = 399_000_000n, block = 4_000n): FakeLog[] {
-  return [
-    {
-      name: "AuthorizationUsed",
-      args: { authorizer: TENANT, nonce },
-      blockNumber: block,
-      transactionHash: txHash,
-    },
-    {
-      name: "Transfer",
-      args: { from: TENANT, to: REVENUE, value },
-      blockNumber: block,
-      transactionHash: txHash,
-    },
-  ];
-}
-
-/** The inverse of the stub signer below: read back what a composed transaction committed to. */
-function decodeFakeTx(raw: Hex): { nonce: number; data: string } {
-  return JSON.parse(Buffer.from(raw.slice(4), "hex").toString());
-}
-
-function paymentCfg(): FormationPaymentConfig {
-  return {
-    required: true,
-    feeAtomic: 399_000_000n,
-    feeUsdc: 399,
-    revenueAddress: REVENUE,
-    quoteTtlMs: 30 * 60 * 1000,
-    domain,
-    payments,
-  };
-}
 
 function company(status: "draft" | "ready" = "draft"): CompanyRecord {
   const id = companies.create({
@@ -229,7 +101,7 @@ function deps(executor: FormationExecutorDeps): FormationPaymentDeps {
   return {
     companies,
     entities: repo,
-    payment: paymentCfg(),
+    payment: paymentCfg(payments),
     executor,
     transaction: <T>(fn: () => T) => db.transaction(fn)(),
     now: () => NOW,
@@ -556,7 +428,13 @@ test("a settlement in the token's LOGS resolves `settled`, past the window and a
   payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
   const chain = fakeChain({
     spent: new Set([row.nonce.toLowerCase()]),
-    logs: settlementLogs(row.nonce, onChain),
+    logs: settlementLogs({
+      authorizer: TENANT,
+      payTo: REVENUE,
+      nonce: row.nonce,
+      txHash: onChain,
+      block: 4_000n,
+    }),
   });
   expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("settled");
   expect(payments.find(id)).toMatchObject({ status: "settled", txHash: onChain });
@@ -581,7 +459,13 @@ test("⚠ a THIRD PARTY's settlement resolves SETTLED — never `failed` (gate A
   const chain = fakeChain({
     receipt: "reverted", // ours would revert, if we were foolish enough to send it
     spent: new Set([row.nonce.toLowerCase()]),
-    logs: settlementLogs(row.nonce, theirs),
+    logs: settlementLogs({
+      authorizer: TENANT,
+      payTo: REVENUE,
+      nonce: row.nonce,
+      txHash: theirs,
+      block: 4_000n,
+    }),
   });
   expect(await advancePaymentOnChain(deps(chain.executor), c, row)).toBe("settled");
   expect(payments.find(id)).toMatchObject({ status: "settled", txHash: theirs });
@@ -599,12 +483,12 @@ test("an OUT-OF-BAND cancellation resolves `expired`, and the guardian may re-qu
   const chain = fakeChain({
     spent: new Set([row.nonce.toLowerCase()]),
     logs: [
-      {
-        name: "AuthorizationCanceled",
-        args: { authorizer: TENANT, nonce: row.nonce },
-        blockNumber: 4_000n,
-        transactionHash: `0x${"cd".repeat(32)}` as Hex,
-      },
+      cancelLog({
+        authorizer: TENANT,
+        nonce: row.nonce,
+        txHash: `0x${"cd".repeat(32)}` as Hex,
+        block: 4_000n,
+      }),
     ],
   });
   expect(await advancePaymentOnChain(deps(chain.executor), c, row)).toBe("expired");
@@ -622,7 +506,15 @@ test("an AuthorizationUsed with NO matching transfer is NOT our settlement", asy
   const row = payments.find(id)!;
   const chain = fakeChain({
     spent: new Set([row.nonce.toLowerCase()]),
-    logs: [settlementLogs(row.nonce, `0x${"ef".repeat(32)}` as Hex)[0]!],
+    logs: [
+      settlementLogs({
+        authorizer: TENANT,
+        payTo: REVENUE,
+        nonce: row.nonce,
+        txHash: `0x${"ef".repeat(32)}` as Hex,
+        block: 4_000n,
+      })[0]!,
+    ],
   });
   expect(await advancePaymentOnChain(deps(chain.executor), c, row)).toBe("pending");
   expect(payments.find(id)?.status).toBe("settling");
@@ -689,7 +581,9 @@ test("RE-QUOTE is two-step: refused while anything is live, allowed once it is t
   expect(requoted).toMatchObject({ ok: true });
   const fresh = payments.findLive(c.companyId, "formation")!;
   expect(fresh.nonce).not.toBe(payments.find(id)!.nonce);
-  expect(fresh.validBefore).toBe(Math.floor((NOW + 30 * 60 * 1000) / 1000));
+  // The QUOTE's deadline is the TTL; what the guardian signs carries the settlement grace on top.
+  expect(fresh.ttlAt).toBe(Math.floor((NOW + 30 * 60 * 1000) / 1000));
+  expect(fresh.validBefore).toBe(fresh.ttlAt + 15 * 60);
 });
 
 test("a READY company has nothing left to pay for", async () => {
@@ -798,7 +692,7 @@ test("one paid row is silent — the detector says nothing about the ordinary ca
   const c = company();
   settledRow(c, `0x${"a1".repeat(32)}`);
   const lines = opsLines(() => {
-    expect(checkForDoublePayment({ payment: paymentCfg() }, c.companyId)).toBe(false);
+    expect(checkForDoublePayment({ payment: paymentCfg(payments) }, c.companyId)).toBe(false);
   });
   expect(lines.find((l) => l.opslog === "formation_payment_duplicate")).toBeUndefined();
 });
@@ -809,9 +703,9 @@ test("⚠ TWO paid rows are CRITICAL, in the ops trail and in the company's own 
   settledRow(c, `0x${"a1".repeat(32)}`);
   settledRow(c, `0x${"b2".repeat(32)}`);
   const lines = opsLines(() => {
-    expect(checkForDoublePayment({ payment: paymentCfg(), entities: repo }, c.companyId)).toBe(
-      true,
-    );
+    expect(
+      checkForDoublePayment({ payment: paymentCfg(payments), entities: repo }, c.companyId),
+    ).toBe(true);
   });
   expect(lines.find((l) => l.opslog === "formation_payment_duplicate")).toMatchObject({
     severity: "CRITICAL",
@@ -830,7 +724,7 @@ test("a REFUNDED row still counts as paid — the money was taken before it was 
   settledRow(c, `0x${"b2".repeat(32)}`);
   payments.markRefunded(first, `0x${"fe".repeat(32)}`);
   const lines = opsLines(() => {
-    expect(checkForDoublePayment({ payment: paymentCfg() }, c.companyId)).toBe(true);
+    expect(checkForDoublePayment({ payment: paymentCfg(payments) }, c.companyId)).toBe(true);
   });
   expect(lines.find((l) => l.opslog === "formation_payment_duplicate")).toBeTruthy();
 });

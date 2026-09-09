@@ -19,6 +19,7 @@ import {
   readUsdcDomain,
   resolveAuthorizationOutcome,
 } from "../../../src/adapters/arc/usdcToken";
+import { TRANSFER_WITH_AUTHORIZATION_TYPES } from "../../../src/payments/transferAuthorization";
 import type { Address, Hex } from "../../../src/types";
 
 const USDC = "0x3600000000000000000000000000000000000000" as Address;
@@ -54,13 +55,18 @@ function tokenAt(answers: { name: string; version: string; separator: ViemHex })
 }
 
 test("reads name/version off the token and returns them as the domain", async () => {
+  // ⚠ "USDC", not "USD Coin". Arc's predeploy reports the former (measured by the live merge
+  // gate, 2026-09-09 — docs/runbooks/formation-settle-probe-2026-09.md) where every reference
+  // implementation quotes the latter. That is not a detail: it is the whole argument for READING
+  // the domain instead of hardcoding it, since a wrong pair verifies against itself and only
+  // fails on-chain, after a guardian has approved the prompt.
   const domain = await readUsdcDomain(
-    tokenAt({ name: "USD Coin", version: "2", separator: separatorFor("USD Coin", "2") }),
+    tokenAt({ name: "USDC", version: "2", separator: separatorFor("USDC", "2") }),
     USDC,
     CHAIN,
   );
   expect(domain).toEqual({
-    name: "USD Coin",
+    name: "USDC",
     version: "2",
     chainId: CHAIN,
     verifyingContract: USDC,
@@ -136,11 +142,20 @@ test("the ABI declares only the `bytes signature` overloads, and both cancel + s
   expect(byName("authorizationState")).toHaveLength(1);
 });
 
-test("CancelAuthorization is (authorizer, nonce) — what FiatTokenV2_2 hashes", () => {
-  expect(CANCEL_AUTHORIZATION_TYPES.CancelAuthorization).toEqual([
-    { name: "authorizer", type: "address" },
-    { name: "nonce", type: "bytes32" },
-  ]);
+test("the EIP-712 type lists ARE the token's own function inputs, minus the signature", () => {
+  // Asserted against the ABI rather than against a second copy of the same literal (finding C6).
+  // A copy-vs-copy test passes while the two drift, and this pair drifting is invisible until a
+  // guardian has signed: the digest would be built over one field list and verified by the token
+  // over another, so every signature would revert `invalid signature` with nothing to point at.
+  const inputsOf = (fn: string) =>
+    FIAT_TOKEN_ABI.find((f) => f.type === "function" && f.name === fn)!
+      .inputs.filter((i) => i.name !== "signature")
+      .map((i) => ({ name: i.name, type: i.type }));
+
+  expect(CANCEL_AUTHORIZATION_TYPES.CancelAuthorization).toEqual(inputsOf("cancelAuthorization"));
+  expect(TRANSFER_WITH_AUTHORIZATION_TYPES.TransferWithAuthorization).toEqual(
+    inputsOf("transferWithAuthorization"),
+  );
 });
 
 // ── resolveAuthorizationOutcome (B1 gate A3) ───────────────────────────────────────────────
