@@ -499,6 +499,44 @@ test("requote: refused while a quote is live, and issues a NEW nonce once it is 
   expect(quote.paymentId).not.toBe(first.paymentId);
 });
 
+test("⚠ C2: a live payment carries the CANCELLATION whole, authorizer and all", async () => {
+  // The client used to build this from `nonce` + `domain` with its own copy of the type list.
+  // The authorizer is the part it could not know: the address that SIGNED, which is the PAYER
+  // once a settle has been attempted rather than whichever wallet is connected now.
+  const cfg = paymentCfg();
+  const { body } = await create(cfg);
+  const companyId = body.companyId as unknown as string;
+  const row = payments.findLive(companyId, "formation")!;
+  const payer = "0x00000000000000000000000000000000000000Ab" as Address;
+  payments.markSettling(row.paymentId, { payerAddress: payer, signature: `0x${"11".repeat(65)}` });
+
+  const res = await app(cfg).request(`/companies/${companyId}/payment`, {
+    headers: { authorization: `Bearer ${await token(OWNER)}` },
+  });
+  const view = (await res.json()) as Record<string, unknown>;
+  expect(view.cancelTypedData).toMatchObject({
+    primaryType: "CancelAuthorization",
+    domain: cfg.domain,
+    types: {
+      CancelAuthorization: [
+        { name: "authorizer", type: "address" },
+        { name: "nonce", type: "bytes32" },
+      ],
+    },
+    message: { authorizer: payer, nonce: row.nonce },
+  });
+
+  // …and a TERMINAL row carries none: its nonce is retired or dead, and offering a cancellation
+  // would be a wallet prompt for a transaction that can only revert.
+  payments.markSettled(row.paymentId, `0x${"cc".repeat(32)}`);
+  const settled = (await (
+    await app(cfg).request(`/companies/${companyId}/payment`, {
+      headers: { authorization: `Bearer ${await token(OWNER)}` },
+    })
+  ).json()) as Record<string, unknown>;
+  expect(settled.cancelTypedData).toBeUndefined();
+});
+
 test("a settling payment still carries the NONCE and the DOMAIN — the cancel path needs them", async () => {
   // The quote is withheld while a broadcast is in flight (signing again is the double charge),
   // but the guardian's exit from a stuck payment is a CancelAuthorization signature, and that

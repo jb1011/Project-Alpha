@@ -850,6 +850,21 @@ export type FormationPaymentView = {
    *  it does, and a payment there is history rather than something to sign. */
   domain: PaymentTypedData["domain"] | null;
   quote?: FormationQuote;
+  /**
+   * The CANCELLATION, served whole — present exactly while there is something live to cancel.
+   *
+   * This package used to hold its own copy of the `CancelAuthorization` type list and assemble
+   * the message from `nonce` + `domain`. That is a second place for a type list, a field order
+   * and — worst — an AUTHORIZER to be got wrong: the authorizer is the address that SIGNED, which
+   * is the payer once a settle has been attempted and the connected wallet only before that. The
+   * server knows which; a browser guessing produces a signature the token rejects.
+   */
+  cancelTypedData?: {
+    domain: PaymentTypedData["domain"];
+    types: Record<string, { name: string; type: string }[]>;
+    primaryType: string;
+    message: { authorizer: `0x${string}`; nonce: `0x${string}` };
+  };
 };
 
 /** `POST /companies/:id/payment/settle` — `settled` when the receipt confirmed, `pending` while

@@ -10,7 +10,6 @@ import {
 } from "@/lib/api/hooks";
 import {
   FEE_BREAKDOWN,
-  cancelTypedData,
   formatAtomicUsdc,
   paymentAction,
   paymentExplanation,
@@ -23,7 +22,7 @@ import { Button, Callout, Card, SectionTitle, Spinner } from "@/components/onboa
  * same actions).
  *
  * The SAME functions the wizard's `PaymentStep` uses — `paymentAction`, `paymentExplanation`,
- * `toWagmiTypedData`, `cancelTypedData` — and that sharing is the point rather than an economy.
+ * `toWagmiTypedData` — and that sharing is the point rather than an economy.
  * Two components deciding for themselves whether a payment may be signed is how a page ends up
  * offering "pay" for a transfer that is already in flight, which is a guardian charged twice.
  *
@@ -114,16 +113,16 @@ export function CompanyPaymentPanel({ companyId }: { companyId: string }) {
               {settle.isPending ? "Submitting…" : "Sign and pay"}
             </Button>
           )}
-          {action === "cancel" && payment.domain && (
+          {action === "cancel" && payment.cancelTypedData && (
             <Button
               variant="subtle"
               disabled={busy || !address}
               onClick={() =>
                 void run(async () => {
                   const signature = await signTypedDataAsync(
-                    // Non-null in this branch: `paymentAction` does not offer a cancel without a
-                    // domain to sign it against (finding B8).
-                    cancelTypedData(payment.domain!, address as `0x${string}`, payment.nonce),
+                    // The SERVED message (finding C2), authorizer and all.
+                    // biome-ignore lint/suspicious/noExplicitAny: a served EIP-712 request
+                    payment.cancelTypedData as any,
                   );
                   await cancel.mutateAsync({ signature });
                 })

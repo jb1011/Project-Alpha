@@ -11,7 +11,6 @@ import {
 } from "@/lib/api/hooks";
 import {
   FEE_BREAKDOWN,
-  cancelTypedData,
   feeSentence,
   formatAtomicUsdc,
   paymentAction,
@@ -101,13 +100,14 @@ export function PaymentStep({ eyebrow, companyId, onBack, onComplete }: Props) {
 
   async function onCancel() {
     setProblem(null);
-    // No domain, no cancel: `paymentAction` does not offer one, and a deployment that has stopped
-    // charging serves none (finding B8).
-    if (!payment?.domain || !address) return;
+    // The SERVED message (finding C2) — including the authorizer, which is the address that
+    // signed rather than whichever wallet happens to be connected now. Absent where there is
+    // nothing live to cancel, or on a deployment that no longer charges (finding B8).
+    const td = payment?.cancelTypedData;
+    if (!td || !address) return;
     try {
-      const signature = await signTypedDataAsync(
-        cancelTypedData(payment.domain, address, payment.nonce),
-      );
+      // biome-ignore lint/suspicious/noExplicitAny: a served EIP-712 request, typed at the wire
+      const signature = await signTypedDataAsync(td as any);
       await cancel.mutateAsync({ signature });
     } catch (e) {
       setProblem(messageOf(e));

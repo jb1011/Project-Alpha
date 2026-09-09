@@ -167,28 +167,15 @@ export function toWagmiTypedData(td: PaymentTypedData) {
 }
 
 /**
- * The `CancelAuthorization` message, built HERE because there is no quote to carry it.
+ * ⚠ THERE IS NO `cancelTypedData` BUILDER HERE ANY MORE (finding C2).
  *
- * The one place this package constructs typed data rather than relaying it, and it is safe to do
- * so for a reason worth stating: a wrong cancel message produces a signature the token REJECTS,
- * so the failure mode is a reverted cancellation and a payment that stays stuck — never a
- * transfer of the guardian's money. The domain is still the server's, taken off the quote or the
- * settled payment, never assembled from constants here.
+ * This package used to construct the `CancelAuthorization` message from the view's `nonce` and
+ * `domain`, holding its own copy of the type list. The server now serves the whole request as
+ * `payment.cancelTypedData`, for the reason the transfer message was always served: a second
+ * place to get a type list, a field order or an AUTHORIZER wrong. The authorizer in particular is
+ * not something a browser can know — it is the address that SIGNED, which is the payer once a
+ * settle has been attempted and the connected wallet only before that.
+ *
+ * The message needs no translation on the way to wagmi: unlike the transfer authorization it has
+ * no uint256 fields, only an address and a bytes32.
  */
-export function cancelTypedData(
-  domain: PaymentTypedData["domain"],
-  authorizer: `0x${string}`,
-  nonce: `0x${string}`,
-) {
-  return {
-    domain,
-    types: {
-      CancelAuthorization: [
-        { name: "authorizer", type: "address" },
-        { name: "nonce", type: "bytes32" },
-      ],
-    },
-    primaryType: "CancelAuthorization",
-    message: { authorizer, nonce },
-  } as const;
-}

@@ -13,7 +13,6 @@ import { expect, test } from "vitest";
 import type { FormationPaymentView, PaymentTypedData } from "@/lib/api/types";
 import {
   STUCK_AFTER_MS,
-  cancelTypedData,
   feeSentence,
   formatAtomicUsdc,
   paymentAction,
@@ -202,19 +201,35 @@ test("the wagmi message is a TRANSLATION of the server's, field for field", () =
   });
 });
 
-test("the CANCEL message uses the SERVER's domain and the row's nonce", () => {
-  // The one message this package constructs. Safe to: a wrong one yields a signature the token
-  // REJECTS — a stuck payment, never a moved one. The domain is still the server's, because a
-  // hardcoded "USD Coin"/"2" would sign against a domain the token does not verify.
-  const td = cancelTypedData(DOMAIN, "0x000000000000000000000000000000000000000a", `0x${"a1".repeat(32)}`);
-  expect(td.domain).toBe(DOMAIN);
-  expect(td.primaryType).toBe("CancelAuthorization");
-  expect(td.types.CancelAuthorization).toEqual([
-    { name: "authorizer", type: "address" },
-    { name: "nonce", type: "bytes32" },
-  ]);
-  expect(td.message).toEqual({
-    authorizer: "0x000000000000000000000000000000000000000a",
-    nonce: `0x${"a1".repeat(32)}`,
+test("⚠ C2: the cancellation is SERVED, not built here — including the authorizer", () => {
+  // This package used to construct the CancelAuthorization message from `nonce` + `domain`,
+  // holding its own copy of the type list, and asserting that copy against itself. The authorizer
+  // is the part a browser cannot know: it is the address that SIGNED — the payer once a settle
+  // has been attempted, the connected wallet only before that — so a client guessing produces a
+  // signature the token rejects.
+  const settling = payment({
+    status: "settling",
+    quote: undefined,
+    payerAddress: "0x00000000000000000000000000000000000000ab",
+    cancelTypedData: {
+      domain: DOMAIN,
+      types: {
+        CancelAuthorization: [
+          { name: "authorizer", type: "address" },
+          { name: "nonce", type: "bytes32" },
+        ],
+      },
+      primaryType: "CancelAuthorization",
+      message: {
+        authorizer: "0x00000000000000000000000000000000000000ab",
+        nonce: `0x${"a1".repeat(32)}`,
+      },
+    },
   });
+  // The screen offers a cancel exactly when the server served one to sign.
+  expect(
+    paymentAction(settling, { nowMs: NOW, settlingSinceMs: NOW - STUCK_AFTER_MS - 1 }),
+  ).toBe("cancel");
+  // …and the authorizer is the PAYER, which is not the wallet a browser would have supplied.
+  expect(settling.cancelTypedData?.message.authorizer).toBe(settling.payerAddress);
 });

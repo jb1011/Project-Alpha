@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { CANCEL_AUTHORIZATION_TYPES } from "../adapters/arc/usdcToken";
 import {
   TRANSFER_WITH_AUTHORIZATION_TYPES,
   type TransferAuthorizationDomain,
@@ -152,6 +153,23 @@ export interface FormationPaymentView {
    *  the token was never read, and there is nothing live to cancel either. */
   domain: TransferAuthorizationDomain | null;
   /**
+   * THE CANCELLATION, SERVED WHOLE (finding C2) — present exactly while there is something live
+   * to cancel.
+   *
+   * The client used to hold its own copy of the `CancelAuthorization` type list and assemble this
+   * from `nonce` + `domain`. That is a second place for a type list, a field order and an
+   * authorizer to be got wrong, in a package that already relays the transfer message rather than
+   * building it — and the authorizer is the part a client cannot get right on its own: it is the
+   * address that SIGNED, which is `payer_address` once a settle has been attempted and the
+   * guardian's wallet only before that.
+   */
+  cancelTypedData?: {
+    domain: TransferAuthorizationDomain;
+    types: typeof CANCEL_AUTHORIZATION_TYPES;
+    primaryType: "CancelAuthorization";
+    message: { authorizer: Address; nonce: Hex };
+  };
+  /**
    * The signable quote — present ONLY while the row is `quoted` and still inside its window.
    *
    * Absent on a `settling` row deliberately: re-signing one is exactly the double charge §6.4
@@ -244,6 +262,12 @@ export function paymentView(
   // box that no longer charges can still SHOW this row, but it has nothing to sign against.
   const signable =
     payment.status === "quoted" && payment.ttlAt > nowSec && cfg.domain !== undefined;
+  // A cancellation is offerable while the row is LIVE — including the `settling` one the fast
+  // path exists for, and the `quoted` one whose TTL has passed while its authorization has not.
+  // The AUTHORIZER is the address that signed: `payer_address` once a settle has been attempted,
+  // and the guardian's wallet before that. Nothing else is cancellable: a terminal row's nonce is
+  // already retired or already dead.
+  const live = payment.status === "quoted" || payment.status === "settling";
   return {
     paymentId: payment.paymentId,
     companyId: payment.companyId,
@@ -259,6 +283,16 @@ export function paymentView(
     nonce: payment.nonce,
     domain: cfg.domain ?? null,
     ...(signable && cfg.domain ? { quote: quoteOf(payment, guardian, cfg.domain) } : {}),
+    ...(live && cfg.domain
+      ? {
+          cancelTypedData: {
+            domain: cfg.domain,
+            types: CANCEL_AUTHORIZATION_TYPES,
+            primaryType: "CancelAuthorization" as const,
+            message: { authorizer: payment.payerAddress ?? guardian, nonce: payment.nonce },
+          },
+        }
+      : {}),
   };
 }
 
