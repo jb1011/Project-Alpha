@@ -290,52 +290,110 @@ no Circle service in the path, no new external dependency.
 
 Flow:
 1. `POST /companies` (payment ON) → company stays `draft`; a `formation_payments` row `quoted`
-   makes it derived-paying; quote `{amountUsdc, payTo: FORMATION_REVENUE_ADDRESS, nonce, validUntil}`.
-   `nonce` = random 32 bytes, stored on the row (uniqueness from the row, NOT derived from companyId
-   — a derived nonce is one-shot and bricks the company after any failed attempt). The client signs
-   `validAfter = 0` and `validBefore = validUntil`.
+   makes it derived-paying; quote `{amountUsdc, payTo, nonce, validAfter: 0, validBefore, expiresAt,
+   typedData}`. `nonce` = random 32 bytes, stored on the row (uniqueness from the row, NOT derived
+   from companyId — a derived nonce is one-shot and bricks the company after any failed attempt).
+   **Three more facts are PINNED ON THE ROW at quote time (2026-09-09 gate):** `pay_to` (the payee —
+   never re-read from live config on verify, settle or cancel, so a Ledger rotation cannot re-target
+   a signature already given), `quoted_block` (the chain head, which is the floor of the log window
+   that later resolves this payment) and `ttl_at`. **`ttl_at` and `valid_before` are TWO DEADLINES**
+   (gate A4): `ttl_at` is the quote's — the countdown a human sees, and what the settle door
+   enforces — and `valid_before = ttl_at + FORMATION_SETTLE_GRACE_MS` (default 15 min) is the
+   TOKEN's, so a signature given at the last second of the quote still has time to be composed,
+   broadcast, mined and (after a crash) re-composed. One deadline for both meant an authorization
+   expiring while its own transfer sat in the mempool.
 2. Guardian signs with wagmi `useSignTypedData` against the **USDC domain** — NEW frontend work,
    budgeted as such (no typed-data signing exists in the interface; SIWE is personal_sign).
 3. Backend verifies LOCALLY before touching the chain through ONE shared helper,
-   `verifyTransferAuthorization({ authorization, signature, domain, payTo, value, mode })`, extracted
-   from the recovery core of `seller.ts` and called by both rails (x402: Gateway domain, `floor`;
-   formation: USDC domain, `exact`): recipient == revenue address, value == the STORED quote amount
-   (never live config — a fee change between quote and settle must not re-price a signature),
-   `validAfter <= now`, `validBefore` in the future, signature recovers the guardian.
-4. **Crash-window discipline (same class as the doola create, same primitives as the bridge legs):**
-   persist `settling` + the signed RAW tx + its hash BEFORE broadcast (`markSubmitted`-before-network,
-   as `bridgeLegRepository`); the executor — the platform EOA, `writeContract` with EXPLICIT gas via a
-   new `TRANSFER_WITH_AUTHORIZATION_GAS` beside `USDC_TRANSFER_GAS` (ecrecover + an
-   `authorizationState` SSTORE; do not reuse the 100k plain-transfer figure; the Arc estimate footgun
-   does not bite here because the guardian, not the executor, is the token sender) — submits; gas is
-   USDC cents on Arc, the platform pays it, stated; confirm receipt → `settled` → company `ready` in
-   one transaction. **Resume is owned by a NEW eighth sweeper leg, `resumeStalledSettles()`**,
-   modelled on `resumeStalledCreates` (`SUBMITTED_STALL_MS`, `attempt`/`bumpAttempt`, `retryDelayMs`
-   from `formation/schedule.ts`), with three rules: (1) `settling` with an unknown outcome NEVER
-   re-quotes — it re-broadcasts the persisted raw tx; (2) it moves to `expired` only when `now >
-   validBefore` AND `authorizationState(from, nonce) === false`; if that reads true, it resolves
-   `settled` from the receipt; (3) the fast path is an explicit guardian action — a second
-   `useSignTypedData` over `CancelAuthorization`, submitted by the executor (the platform cannot cancel
-   unilaterally), after which the row may go `expired` at once. The same leg moves `quoted` rows past
-   `validBefore` to `expired`. Re-quote is therefore two-step: `quoted → expired` or `settling →
-   expired/failed` THEN a new row with a new nonce (the live-rows index admits it). Why: a signed
-   authorization is public and self-authorizing until `validBefore`; `authorizationState == false`
-   means "not yet used", not "dead", so re-quoting on it can charge the guardian twice — and B1 ships
-   no fund-moving refund.
+   `verifyTransferAuthorization({ authorization, signature, domain, payTo, value, mode, client })`,
+   extracted from the recovery core of `seller.ts` and called by both rails (x402: Gateway domain,
+   `floor`; formation: USDC domain, `exact`): recipient == the payee ON THE ROW, value == the STORED
+   quote amount (never live config — a fee change between quote and settle must not re-price a
+   signature), `validAfter <= now`, `validBefore` in the future, signature verifies for the guardian.
+   **Verification is CLIENT-BOUND wherever a client exists (gate A6):** viem's `verifyTypedData` on a
+   public client does the ECDSA recovery and then an on-chain ERC-1271 `isValidSignature` — which is
+   exactly what the token does, so what we accept locally equals what the token accepts. An
+   offline-only check refuses every smart-account guardian (Safe, Circle SCA, any 4337 wallet) and
+   tells them their own wallet is wrong. A signature that is not 65 bytes from an address with no
+   code returns `unsupported-signer`, not `bad-signature`: nothing could have checked it, and the
+   distinction is "we cannot serve this wallet" versus "you did something wrong". The x402 rail
+   passes no client and keeps the offline path unchanged. The SAME helper verifies
+   `CancelAuthorization`, so a wallet whose settle we accept cannot have its cancellation refused.
+4. **Crash-window discipline — REBUILT BY THE 2026-09-09 GATE (A1-A5).** The first cut persisted
+   the SIGNED RAW TRANSACTION before broadcast (the `bridgeLegRepository` rule) and re-broadcast
+   those bytes on resume. That is the right rule for the wrong object: a signed transaction commits
+   to an EXECUTOR NONCE, and a nonce consumed by anything else while the box is down makes the
+   persisted bytes permanently unsendable, stranding a paid-for company until its window closes for
+   a reason that has nothing to do with the guardian. The AUTHORIZATION carries no nonce of ours, so
+   it is the durable artifact:
+
+   - **persist the AUTHORIZATION** (`signature` + `payer_address`) via the `quoted → settling` CAS,
+     BEFORE anything is broadcast. Every executor transaction is then **composed fresh at each
+     broadcast** — current pending nonce, current fees, a fee bump per re-broadcast — and `tx_hash` /
+     `broadcast_count` record only what we last tried. Exactly-once is the TOKEN's job and always
+     was: it retires the (authorizer, nonce) pair on first use;
+   - **the submitter is a DEDICATED EOA** (`FORMATION_SETTLE_SUBMITTER_KEY`, gate A2): its own nonce
+     space (the platform key's is shared with registry writes, sweeps and job transactions, which
+     can starve or replace a settle while a guardian watches), its own USDC gas float (visible and
+     top-uppable), and no authority anywhere (a compromise wastes gas). Boot invariants: present when
+     payment is required, and ≠ the platform key, ≠ the revenue address, ≠ every other env signing
+     key, ≠ any agent operator/rotated-operator/pocket address in the database;
+   - **the OUTCOME comes from the token's own logs** (gate A3), never from the receipt of a
+     transaction we happened to send. `FIAT_TOKEN_ABI` carries `AuthorizationUsed`,
+     `AuthorizationCanceled` and `Transfer`; `resolveAuthorizationOutcome` filters on BOTH indexed
+     topics over a BOUNDED window starting at `quoted_block` and stepping down `LOG_WINDOW_LADDER`
+     (90k → 1k) when an endpoint rejects the range — the monitor's live lesson. `settled` requires
+     `AuthorizationUsed` AND a matching `Transfer(authorizer → payTo, value)` in the same
+     transaction, so a consumed nonce alone never readies a company nobody paid for. This is what
+     makes a THIRD PARTY's settlement of the public authorization resolve `settled` (the money IS at
+     the revenue address) instead of `failed`, and an out-of-band cancel resolve `expired` instead of
+     sitting `settling` forever;
+   - **expiry needs the CHAIN's clock** (gate A4). A `quoted` or `settling` row may go `expired` ONLY
+     when `latestBlock.timestamp > validBefore + FINALITY_MARGIN_S` (120s) AND the logs report no
+     Used/Canceled AND `authorizationState === false`. The token enforces `validBefore` against the
+     block, so a box whose clock runs fast would otherwise write off a live authorization. Both live
+     shapes go through ONE procedure (`advancePaymentOnChain`), which the sweeper calls for both
+     legs: a `quoted` row may have been signed in a browser we never heard back from;
+   - **a settle request past `ttl_at` is refused with a re-quote**, even though the token would still
+     accept the signature. The grace exists to finish a settlement, not to start one;
+   - **the guardian cancel fast path** is unchanged in spirit (a second `useSignTypedData` over
+     `CancelAuthorization`, submitted by the submitter — the platform cannot cancel unilaterally),
+     and is now also the guardian's way out of a quote that has passed its TTL while its
+     authorization is still inside the grace;
+   - **the DETECTOR** (gate A5): `formation_payment_duplicate`, CRITICAL, in the ops trail and as an
+     entity event on every agent attached to the company, whenever a company has more than one
+     `settled`/`refunded` row. Checked on every terminal transition and by an amortised sweep. It
+     changes nothing on its own — reversing money on the strength of a COUNT would be worse than the
+     bug it watches for — because every other rule here is an ARGUMENT that this cannot happen, and
+     an argument is not a measurement.
+
+   Re-quote stays two-step (`quoted → expired` or `settling → expired/failed`, THEN a new row with a
+   new nonce; the live-rows index admits it). Why, still: a signed authorization is public and
+   self-authorizing until `validBefore`, `authorizationState == false` means "not yet used" rather
+   than "dead", and B1 ships no fund-moving refund.
+
 5. `create_provider` refuses while `hasLivePayment` (CAS-guarded). With payment OFF the payment
    states never exist and beta copy says formation is included.
 6. **Refunds and revenue custody DECIDED (2026-08-27):** `FORMATION_REVENUE_ADDRESS` is a Ledger
    hardware-wallet account — receive-only, NO key on the box, listed in the S4 key inventory. Refunds
    are signed MANUALLY from the Ledger by runbook, so B1 ships NO fund-moving refund path and NO hot
    float: the CLI only RECORDS a refund (`settled → refunded` with the Ledger tx hash +
-   `opsLog(formation_payment_refunded)`) and moves nothing. **A refund is NOT a platform-wallet
+   `opsLog(formation_payment_refunded)`) and moves nothing. **The CLI names the PAYMENT, not the
+   company** (gate A5): `formation:refund --payment-id <id> --tx <hash>` validates the hash as
+   32-byte hex (it is the only record of a transfer already signed at a device), prints the row and
+   writes nothing without `--yes`, and accepts only a `settled` row. "The most recent settled row for
+   this company" was exactly the wrong default for the case the command exists for — a company with
+   two settled rows IS the double charge. Beside it, `formation:reconcile <paymentId>` runs the
+   log-based resolver for one row, PRINTS what the chain said, and only then drives the row terminal
+   (`settled` with the OBSERVED hash, or `expired`); an `unknown` verdict writes nothing. **A refund is NOT a platform-wallet
    outflow and never enters `platform_outflows`**: a 399 USDC record would exceed the 200 USDC S5
    ceiling and block every agent's treasury funding, gas seeds and job funding for 24 hours. The
    later hot-float phase (built only if refund volume justifies it) adds `formation_refund` to
    `OutflowPath` TOGETHER WITH an env invariant `PLATFORM_OUTFLOW_CEILING_USDC >= FORMATION_FEE_USDC`
-   beside the existing `maxTreasuryFund` guard. Boot invariants: revenue address ≠ executor and ≠
-   every platform key (a fixed set plus an indexed `EXISTS` over operator addresses, not a fleet scan);
-   payment cannot be required in sandbox.
+   beside the existing `maxTreasuryFund` guard. Boot invariants: revenue address ≠ the platform key and ≠
+   every other platform key (a fixed set plus an indexed `EXISTS` over operator addresses, not a fleet
+   scan), the same separation for `FORMATION_SETTLE_SUBMITTER_KEY`, and payment cannot be required in
+   sandbox.
 7. **Identity floor (the anonymous-USDC-buys-real-LLCs finding):** production formation
    (`DOOLA_ENVIRONMENT=production` OR payment required) boot-FAILS unless `cfg.world` is CONSTRUCTED
    (all three `WORLD_*` present) AND `world.requireGuardian` AND `world.maxCompaniesPerHuman != null`
@@ -362,7 +420,13 @@ Flow:
    `formation` only. Billing is per COMPANY: attaching an agent to an existing company is free.
 9. **B1 merge gate: a live probe settling a real signed authorization to a test revenue address
    on Arc testnet** (the house six-probes precedent; B1 touches no doola so it needs its own
-   live gate).
+   live gate). **RUN 2026-09-09 on Arc testnet 5042002 — PASSED**, transcript committed at
+   `docs/runbooks/formation-settle-probe-2026-09.md`. It measured `transferWithAuthorization`
+   gasUsed = 117,079 and `cancelAuthorization` gasUsed = 71,265, which is what the pinned constants
+   in `adapters/arc/gas.ts` now carry (+~20%), and it pinned the token's real domain as
+   `name: "USDC", version: "2"` — NOT the "USD Coin" every reference implementation quotes, which is
+   precisely why the domain is read from the chain rather than hardcoded. The probe submits through
+   `FORMATION_SETTLE_SUBMITTER_KEY` where one is configured.
 
 ## 7. Surfaces and doors
 
@@ -511,3 +575,14 @@ paperwork (counsel list; `company_id` is write-once meanwhile); automatic refund
 | 18 | Proxy path predicates silently miss the new document route | §7 |
 | 19 | `listDue` batch starvation under N:1; polls invalidate the anchor gate | §3 |
 | 20 | Compliance-calendar table and unspecified NAICS cache | §5, §7 |
+
+### 2026-09-09 B1 gate — the six architecture rulings
+
+| # | Finding (verified against the B1 branch) | Resolved in |
+|---|---|---|
+| 21 | The durable artifact was a NONCE-BOUND raw transaction: a submitter nonce consumed while the box is down strands a paid-for company until its window closes | §6.1 (`signature`, `pay_to`, `broadcast_count`), §6.4 (compose fresh at every broadcast) |
+| 22 | Settlement went out through `PLATFORM_PRIVATE_KEY` — a shared nonce space, an invisible gas float, and a gas-only role holding the factory owner's key | §6.4 (`FORMATION_SETTLE_SUBMITTER_KEY` + its four boot invariants) |
+| 23 | Outcome was read from OUR receipt: a third party settling the public authorization resolved `failed` (money at the revenue address, company written off), and an out-of-band cancel was a permanent "spent but unreadable" dead end | §6.4 (`resolveAuthorizationOutcome` over `AuthorizationUsed`/`AuthorizationCanceled`/`Transfer`, bounded window from `quoted_block`) |
+| 24 | Expiry ran on the SERVER's clock, and the quote's deadline was the token's — an authorization could expire while its own transfer sat in the mempool | §6.1 (`ttl_at` + `FORMATION_SETTLE_GRACE_MS`), §6.4 (chain timestamp + `FINALITY_MARGIN_S`, all three conditions) |
+| 25 | Nothing MEASURED the property everything else argues for; the refund CLI picked "the most recent settled row" — a silent guess in exactly the double-charge case | §6.4 (`formation_payment_duplicate`), §6.6 (`formation:refund --payment-id … --yes`, `formation:reconcile`) |
+| 26 | Local verification was offline ECDSA only, so every smart-account guardian was refused a signature the token would accept | §6.3 (client-bound `verifyTypedData`, ERC-1271/6492, `unsupported-signer`) |
