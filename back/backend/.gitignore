@@ -2,6 +2,7 @@ node_modules/
 dist/
 # Local runtime data (SQLite + generated operating-agreement docs)
 data/
+data-p3/
 legalbody.db
 legalbody.db-shm
 legalbody.db-wal
