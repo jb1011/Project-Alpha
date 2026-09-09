@@ -247,8 +247,29 @@ export function resumePhase(input: {
   entityId: string | null;
   /** A v2 session that carried a party handle and no company. */
   needsCompany: boolean;
+  /**
+   * The picked company's SERVER-DERIVED state, when we know it (finding B6).
+   *
+   * Read rather than inferred from `companyId != null`: the question is not "is there a company"
+   * but "is that company still waiting to be paid for", and only the server's word answers it.
+   */
+  companyState?: string | null;
 }): Phase {
   const { phases, storedPhase } = input;
+  // ⚠ THE FEE WENT AWAY WHILE THIS SESSION WAS PARKED ON IT (finding B6).
+  //
+  // Snapping forward to custody is right for a company that is READY — the step was skipped and
+  // nothing is owed. It is wrong for one still `draft`/`paying`: with payment off, no door will
+  // ever move that company out of draft, so the wizard would carry the user through custody,
+  // configure and agreement towards a submit for a company that cannot be filed. Landing on the
+  // legal-body step is where they can pick or create one that can, and the flow says why.
+  if (
+    storedPhase === "payment" &&
+    indexIn(phases, "payment") < 0 &&
+    indexIn(phases, "legal-body") >= 0 &&
+    (input.companyState === "draft" || input.companyState === "paying")
+  )
+    return "legal-body";
   if (!input.formationAvailable) return storedPhase;
   if (!input.formationRequired && !input.needsCompany) return storedPhase;
   if (input.companyId || input.entityId) return storedPhase;

@@ -37,6 +37,18 @@ export function feeSentence(config: Pick<PublicConfig, "formationPaymentRequired
  */
 export const FEE_BREAKDOWN = "Includes the $100 Wyoming state filing fee — nothing is added at checkout.";
 
+/**
+ * What a session parked on the fee step is told when the deployment stops charging (finding B6).
+ *
+ * The situation is real and unglamorous: an operator turns `FORMATION_PAYMENT_REQUIRED` off while
+ * somebody has a `draft` company and an unfinished payment. Nothing was charged, and nothing ever
+ * will be — but nothing will move that company out of draft either, because the door that did it
+ * is gone. Saying so beats carrying them through four more screens towards a submit that cannot
+ * succeed.
+ */
+export const PAYMENT_NO_LONGER_REQUIRED =
+  "This deployment no longer charges a formation fee, and nothing was charged to you. The company you started is still a draft and cannot be filed as it stands — pick or create another one below to carry on, or contact support and we will open that filing for you.";
+
 /** Atomic USDC (6 decimals) as a human amount. Exact for the whole-dollar fees we quote. */
 export function formatAtomicUsdc(atomic: string): string {
   const n = Number(atomic) / 1_000_000;

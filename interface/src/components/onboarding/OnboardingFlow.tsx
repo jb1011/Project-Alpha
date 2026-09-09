@@ -33,7 +33,8 @@ import {
   emptyCompanyIntake,
   type CompanyIntakeForm,
 } from "@/lib/formation/companyIntake";
-import { usePublicConfigQuery } from "@/lib/api/hooks";
+import { useCompanyQuery, usePublicConfigQuery } from "@/lib/api/hooks";
+import { PAYMENT_NO_LONGER_REQUIRED } from "@/lib/formation/payment";
 import {
   buildPersistedOnboarding,
   clearOnboardingStorage,
@@ -148,6 +149,19 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * DERIVED during render rather than corrected by an effect — an effect that called `goTo` would
    * paint the wrong screen first and cascade a second render to fix it.
    */
+  /**
+   * The company's state, for the one correction that needs it (finding B6).
+   *
+   * Fetched ONLY in the situation that reads it — a session parked on the fee step of a
+   * deployment that has stopped charging — because `session.company` is in-memory and is exactly
+   * what a resumed session does not have. Everywhere else this is a request nobody needs.
+   */
+  const strandedOnFee = storedPhase === "payment" && indexIn(phases, "payment") < 0;
+  const { data: fetchedCompany } = useCompanyQuery(session.companyId, {
+    enabled: strandedOnFee && !session.company,
+  });
+  const companyState = session.company?.state ?? fetchedCompany?.state ?? null;
+
   const requestedPhase: Phase = resumePhase({
     phases,
     storedPhase,
@@ -159,6 +173,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     companyId: session.companyId,
     entityId: session.entityId,
     needsCompany,
+    companyState,
   });
 
   /**
@@ -178,6 +193,10 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * visible and required again, `storedPhase` is untouched and the user lands back on it.
    */
   const phase = snapToVisiblePhase(phases, requestedPhase);
+  // …and if that correction is the B6 one, the legal-body step says why rather than appearing for
+  // no reason a user could name.
+  const legalBodyNotice =
+    strandedOnFee && requestedPhase === "legal-body" ? PAYMENT_NO_LONGER_REQUIRED : undefined;
 
   const goTo = useCallback((next: Phase) => {
     setPhase(next);
@@ -350,6 +369,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 onIntake={setIntake}
                 companyId={session.companyId}
                 company={session.company}
+                notice={legalBodyNotice}
                 onCompany={(companyId, company) => {
                   // The ROW travels with the handle when we have one (the attach branch picked
                   // it out of a list); a freshly created company has none, and the screens after

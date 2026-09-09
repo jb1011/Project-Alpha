@@ -103,6 +103,31 @@ test("B1: a session stranded on `payment` after the flag goes off snaps FORWARD 
   expect(snapToVisiblePhase(withFormation, "payment")).toBe("custody");
 });
 
+test("⚠ B6: …unless the company is still UNPAID, which nothing can now resolve", () => {
+  // Snapping forward is right for a READY company: the step was skipped and nothing is owed. It
+  // is wrong for a draft: with payment off, no door will ever move that company out of draft, so
+  // the wizard would carry the user through custody, configure and agreement towards a submit
+  // that cannot succeed. The company's SERVER-DERIVED STATE decides, not the presence of a handle.
+  const stranded = (companyState: string | null) =>
+    resumePhase({
+      phases: withFormation,
+      storedPhase: "payment",
+      formationAvailable: true,
+      formationRequired: false,
+      companyId: "c1",
+      entityId: null,
+      needsCompany: false,
+      companyState,
+    });
+  expect(stranded("draft")).toBe("legal-body");
+  // `paying` is the same situation one step earlier: a live quote nobody can settle any more.
+  expect(stranded("paying")).toBe("legal-body");
+  // A company that is READY owes nothing, and the ordinary forward snap applies.
+  expect(snapToVisiblePhase(withFormation, stranded("ready"))).toBe("custody");
+  // …and with the state unknown we do not invent a correction.
+  expect(snapToVisiblePhase(withFormation, stranded(null))).toBe("custody");
+});
+
 test("G9: neighbours come from the VISIBLE list, so the optional step drops out of both", () => {
   expect(nextPhase(withFormation, "guardian")).toBe("legal-body");
   expect(nextPhase(withoutFormation, "guardian")).toBe("custody");
