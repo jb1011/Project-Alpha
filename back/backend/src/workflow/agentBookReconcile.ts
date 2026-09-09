@@ -97,6 +97,13 @@ export async function reconcileRow(row: AgentBookRow, deps: ReconcileDeps): Prom
       if (sameHuman(human, row.nullifier)) {
         // No patch: `transition` to `confirmed` clears the last-attempt error code in SQL.
         deps.repo.transition(row.sessionId, "submitted", "confirmed");
+        // The cache, exactly as the disputed branch below does it (FR-D). The status route caches
+        // a `null` on every poll that finds the row still in flight, and that null outlives this
+        // confirmation for its whole 60-second TTL — long enough for our OWN seller gate and buyer
+        // dial (which read the same cache) to refuse the agent we just vouched for. `human` rather
+        // than the row's nullifier: it is the same number in the minimal-hex spelling every other
+        // writer of this cache uses, and `worldVerifier` keys its per-human allowance off it.
+        deps.store.cacheLookup(agent, human, now());
         log("agentbook_confirmed", { entity: row.entityKey });
       } else {
         deps.repo.transition(row.sessionId, "submitted", "disputed");

@@ -501,7 +501,6 @@ export function migrate(db: Database.Database): void {
       raw_tx          TEXT,
       submitter_nonce INTEGER,
       tx_hash         TEXT,
-      confirmed_block INTEGER,
       attempt         INTEGER NOT NULL DEFAULT 0,
       error_code      TEXT,
       expires_at      INTEGER NOT NULL,

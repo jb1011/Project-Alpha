@@ -358,3 +358,47 @@ test("a chain we have no RPC url for verifies with undefined, not with the map",
   expect(r.authorized, JSON.stringify(r)).toBe(true);
   expect(verifyCalls).toEqual([{ chainId: AGENT_BOOK_CAIP2, rpcUrl: undefined }]);
 });
+
+/**
+ * THE JOIN (removed-behaviour F1). The two halves above are each pinned in isolation: the seller
+ * advertises World Chain, and the signer `buildEntityPaymentService` builds announces it. Nothing
+ * proved they agree — and the SDK's `selectSupportedChain` is an EXACT match on
+ * `{chainId, type}`, so a drift between the two constants makes `createHeader` throw, which
+ * `agentkit.fetch` swallows into `agentkit_skipped`: our agents would quietly pay without
+ * presenting the human backing they have.
+ */
+test("the signer the payment service builds can sign our own seller's 402", async () => {
+  const svc = buildEntityPaymentService(makeConfig(), {
+    reader,
+    ledger,
+    idempotency,
+    fetchImpl: fakeFetch() as unknown as typeof fetch,
+    readPocketFloat: async () => 1_000_000_000n,
+  });
+  await svc.pay(seedEntity(), {
+    url: "https://vendor.example/resource",
+    amountUsdc: 1_000n,
+    idempotencyKey: "k-join",
+    tenantId: "tenantA",
+  });
+  const signer = captured[0];
+  expect(signer).toBeDefined();
+
+  const ext = (await mintAgentkitExtension({
+    domain: DOMAIN,
+    resourceUrl: RESOURCE_URL,
+    network: ARC_CAIP2,
+    allowancePerHuman: 9,
+  })) as unknown as { agentkit: AgentkitExtension };
+  expect(
+    ext.agentkit.supportedChains.map(
+      (c: { chainId: string; type: string }) => `${c.chainId}/${c.type}`,
+    ),
+  ).toContain(`${signer?.chainId}/${signer?.type}`);
+
+  // The real join, not a restatement of it: createHeader picks a chain out of the advertised set
+  // and throws when the signer's is not in it.
+  const { createAgentkitClient } = await import("@worldcoin/agentkit");
+  const header = await createAgentkitClient({ signer: signer as never }).createHeader(ext.agentkit);
+  expect(header).toBeTruthy();
+});

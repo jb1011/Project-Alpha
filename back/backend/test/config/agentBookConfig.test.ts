@@ -100,8 +100,11 @@ test("redact hides a dedicated write RPC's embedded credential", () => {
 
 // With no dedicated write RPC the submitter writes through WORLD_CHAIN_RPC, so redacting only the
 // write endpoint would leak the same credential from `worldChain` — where it is a paid endpoint
-// just as often, because .env.example tells operators to replace the shared public default.
-test("redact hides the read RPC's embedded credential too", () => {
+// just as often, because .env.example tells operators to replace the shared public default. The
+// ORIGIN survives (removed-behaviour F3): the API key lives in the path, and an operator
+// diagnosing "the chip says could not check" has to be able to see which endpoint the box resolved
+// to. The write endpoint stays fully redacted — it is the one that travels with the key.
+test("redact keeps the read RPC's host and drops its embedded credential", () => {
   const cfg = loadConfig({
     ...BASE,
     ...WORLD,
@@ -110,4 +113,14 @@ test("redact hides the read RPC's embedded credential too", () => {
   });
   expect(cfg.agentBook?.rpcUrl).toBe("https://paid.example/v2/read-sekrit-456");
   expect(JSON.stringify(redact(cfg))).not.toContain("read-sekrit-456");
+  expect(redact(cfg).worldChain).toMatchObject({ rpcUrl: "https://paid.example" });
+  expect(redact(cfg).agentBook).toEqual({ submitterPrivateKey: "REDACTED", rpcUrl: "REDACTED" });
+});
+
+// The schema refuses a malformed WORLD_CHAIN_RPC at boot, so this can only be reached by handing
+// `redact` a config built in code — which is exactly when a printed guess would be worst.
+test("a read RPC that is not a parseable URL is redacted whole rather than printed", () => {
+  const cfg = loadConfig({ ...BASE, ...WORLD });
+  const broken = { ...cfg, worldChain: { ...cfg.worldChain!, rpcUrl: "not a url" } };
+  expect(redact(broken).worldChain).toMatchObject({ rpcUrl: "REDACTED" });
 });

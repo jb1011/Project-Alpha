@@ -15,7 +15,6 @@ import {
   createWalletClient,
   encodeFunctionData,
   encodePacked,
-  keccak256,
   toHex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -37,11 +36,6 @@ export const SUBMITTER_LOCK = "worldchain-submitter";
  *  and reverts on-chain AFTER the guardian has done the work (design v3 §4.1). */
 export function buildSignal(agent: Address, nonce: bigint): Hex {
   return encodePacked(["address", "uint256"], [agent, nonce]);
-}
-
-/** World's `hashToField`: keccak256 of the packed bytes, shifted right by 8 bits. */
-export function hashSignal(signal: Hex): bigint {
-  return BigInt(keccak256(signal)) >> 8n;
 }
 
 export interface RegisterArgs {
@@ -68,6 +62,34 @@ export function encodeRegister(a: RegisterArgs): Hex {
   });
 }
 
+/** The signed transaction and the EVM nonce it was signed under, handed to the caller's persist
+ *  step BEFORE anything reaches the wire (the bridge-legs rule). */
+export interface SignedRegistration {
+  rawTx: Hex;
+  submitterNonce: number;
+}
+
+/**
+ * What the caller's persist step reports back. Only `"won"` — the row this submission now owns —
+ * earns a broadcast; `"lost"` and `"inflight"` mean another submission holds the row and ours must
+ * never reach the chain unrecorded.
+ *
+ * Spelled the same as `AgentBookRepository.claimSubmit`'s result, which is what the route hands in,
+ * and declared here rather than imported so an adapter does not depend on persistence.
+ */
+export type SubmitClaim = "won" | "lost" | "inflight";
+
+export interface SubmitResult {
+  signed: SignedRegistration;
+  claim: SubmitClaim;
+  /** `null` when the claim was not won (nothing was sent) or the broadcast itself failed. */
+  txHash: Hex | null;
+  /** Set only when the broadcast failed: the error NAME, never its prose — viem prints the call
+   *  arguments and the call arguments are the proof. The caller logs it; the reconciler owns the
+   *  re-broadcast from the stored raw transaction. */
+  broadcastErrorName?: string;
+}
+
 export interface AgentBookRegistrar {
   address: Address;
   getNextNonce(agent: Address, blockTag?: "latest" | "safe"): Promise<bigint>;
@@ -75,12 +97,23 @@ export interface AgentBookRegistrar {
   lookupHuman(agent: Address, blockTag?: "latest" | "safe"): Promise<string | null>;
   /** Throws `ContractRevertError` for a deterministic revert, anything else for transport. */
   simulateRegister(args: RegisterArgs): Promise<void>;
-  /** Signs under the submitter lock and returns the raw transaction plus the EVM nonce it used.
-   *  Nothing is broadcast here: the caller persists first (bridge-legs rule), then broadcasts. */
-  signRegister(args: RegisterArgs): Promise<{ rawTx: Hex; submitterNonce: number }>;
+  /**
+   * Sign → persist → broadcast, the WHOLE sequence under the submitter lock (design v3 §4.1).
+   *
+   * The EVM nonce is taken inside `prepareTransactionRequest` and is only unique while nothing
+   * else signs or sends on this account, so the persist step has to happen inside the same lock:
+   * with it outside, two guardians vouching at once prepare on the same nonce and one proof is
+   * thrown away. Throws `ContractRevertError` when the estimate reverts (deterministic — the same
+   * classification `simulateRegister` makes), anything else for transport; a failed BROADCAST is
+   * not a failure at all (the raw tx is recorded) and comes back as `txHash: null`.
+   */
+  submitRegister(
+    args: RegisterArgs,
+    persist: (signed: SignedRegistration) => SubmitClaim | Promise<SubmitClaim>,
+  ): Promise<SubmitResult>;
   broadcast(rawTx: Hex): Promise<Hex>;
   receiptStatus(txHash: Hex): Promise<"success" | "reverted" | null>;
-  /** The submitter's MINED transaction count on the write provider — the count that tells a
+  /** The submitter's MINED transaction count on the READ provider — the count that tells a
    *  registration we were REPLACED (the chain moved past the nonce we signed) from one that is
    *  still pending. Never the pending count: that one includes our own unmined transaction. */
   submitterNonce(): Promise<number>;
@@ -120,7 +153,7 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
    * `relayRevertError` cannot be reused for it: that one needs the relay's target/controller pair
    * and folds `shortMessage` into the message, and NOTHING but the error NAME may leave this
    * adapter (an RPC's prose can carry the calldata, and the calldata carries the proof).
-   * Used by BOTH write paths — `simulateContract` and the gas estimate inside `signRegister` —
+   * Used by BOTH write paths — `simulateContract` and the gas estimate inside `submitRegister` —
    * because the second is where a state change since simulation shows up. Anything that is neither
    * a revert nor an estimate revert is transport, and transport says nothing about the contract.
    */
@@ -147,6 +180,36 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
         cause: e,
       });
     return undefined;
+  };
+
+  /**
+   * Prepare and sign. NOT locked itself: its only caller already holds `SUBMITTER_LOCK`, and
+   * `withKeyedLock` is a promise chain, not a re-entrant mutex — taking it twice on one path
+   * would wait forever on the entry that is still running.
+   */
+  const prepareAndSign = async (args: RegisterArgs): Promise<SignedRegistration> => {
+    try {
+      const request = await walletClient.prepareTransactionRequest({
+        account,
+        chain: worldchain,
+        to: contract,
+        data: encodeRegister(args),
+      });
+      // The nonce is the whole reason the caller sees this before anything is broadcast: it
+      // records it, so a replacement can be built later. An unrecorded `NaN` would make that
+      // impossible, and quietly — better to fail here than to persist a hole.
+      if (request.nonce === undefined)
+        throw new Error("submitRegister: prepared request has no nonce");
+      const rawTx = await walletClient.signTransaction(request);
+      return { rawTx, submitterNonce: Number(request.nonce) };
+    } catch (e) {
+      // Simulation happened earlier and against a different block: by now someone else may have
+      // registered this agent, and the estimate inside `prepareTransactionRequest` is where we
+      // find out. Classify it exactly like a simulate revert.
+      const revert = revertOf(e);
+      if (revert) throw revert;
+      throw e;
+    }
   };
 
   return {
@@ -186,29 +249,27 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
         throw e;
       }
     },
-    async signRegister(args) {
+    async submitRegister(args, persist) {
       return withKeyedLock(SUBMITTER_LOCK, async () => {
+        const signed = await prepareAndSign(args);
+        const claim = await persist(signed);
+        // Not ours to send. The signature is spent, but a transaction nobody recorded is worse:
+        // it would consume the submitter's nonce and land a registration no row points at.
+        if (claim !== "won") return { signed, claim, txHash: null };
         try {
-          const request = await walletClient.prepareTransactionRequest({
-            account,
-            chain: worldchain,
-            to: contract,
-            data: encodeRegister(args),
+          const txHash = await walletClient.sendRawTransaction({
+            serializedTransaction: signed.rawTx,
           });
-          // The nonce is the whole reason this returns before broadcasting: the caller records it,
-          // so a replacement can be built later. An unrecorded `NaN` would make that impossible,
-          // and quietly — better to fail here than to persist a hole.
-          if (request.nonce === undefined)
-            throw new Error("signRegister: prepared request has no nonce");
-          const rawTx = await walletClient.signTransaction(request);
-          return { rawTx, submitterNonce: Number(request.nonce) };
+          return { signed, claim, txHash };
         } catch (e) {
-          // Simulation happened earlier and against a different block: by now someone else may
-          // have registered this agent, and the estimate inside `prepareTransactionRequest` is
-          // where we find out. Classify it exactly like a simulate revert.
-          const revert = revertOf(e);
-          if (revert) throw revert;
-          throw e;
+          // Persisted before broadcast: the reconciler re-broadcasts the same raw tx (§6 rule 4),
+          // so "submitted with no hash yet" is the honest answer and not a failure.
+          return {
+            signed,
+            claim,
+            txHash: null,
+            broadcastErrorName: e instanceof Error ? e.name : "unknown",
+          };
         }
       });
     },
@@ -233,14 +294,17 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
       }
     },
     async submitterNonce() {
-      // "latest", NOT "pending": the caller compares this with the nonce it signed, and a pending
-      // count includes OUR OWN transaction still sitting in the mempool — which would read as
-      // "the chain has moved past us, we were replaced" for a registration that is merely slow.
-      // Deliberately the WRITE provider too: the number is only meaningful next to the nonce the
-      // signer took, and two RPCs can disagree by a transaction. `getTransactionCount` is a public
-      // action, so it is called on the wallet client rather than decorating a second client onto
-      // the same URL.
-      return getTransactionCount(walletClient, { address: account.address, blockTag: "latest" });
+      // "latest", NOT "pending": the only caller (the reconciler) compares this with the nonce it
+      // signed, and a pending count includes OUR OWN transaction still sitting in the mempool —
+      // which would read as "the chain has moved past us, we were replaced" for a registration
+      // that is merely slow.
+      //
+      // Deliberately the READ provider (FR-E): the verdict this feeds is "our nonce was used by
+      // something else AND `receiptStatus` still cannot find our transaction", and `receiptStatus`
+      // reads through `publicClient`. Two providers a transaction apart would let those two facts
+      // contradict each other and mark a successful vouch `failed`. Signing keeps its own pending
+      // nonce on the wallet client, where the broadcast goes.
+      return getTransactionCount(publicClient, { address: account.address, blockTag: "latest" });
     },
     async submitterBalance() {
       return publicClient.getBalance({ address: account.address });

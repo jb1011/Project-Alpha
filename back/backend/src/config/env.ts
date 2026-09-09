@@ -927,6 +927,16 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return cfg;
 }
 
+/** A URL's `scheme://host`, or "REDACTED" if it does not parse. Credentials in an RPC endpoint
+ *  live in the PATH (Alchemy/Infura) or in userinfo, and `URL.origin` carries neither. */
+function rpcOrigin(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "REDACTED";
+  }
+}
+
 /**
  * Safe-to-log view: secrets replaced with "REDACTED".
  * WARNING: this spreads all Config fields. If you add a NEW secret field to Config,
@@ -986,11 +996,16 @@ export function redact(cfg: Config): Record<string, unknown> {
     },
     ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
     world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
-    // The READ endpoint, redacted for the same reason as the write one: .env.example tells
-    // operators to replace the shared public default with their own, and "their own" is an
-    // Alchemy/Infura URL with the API key in the path. It is also where `agentBook.rpcUrl`
-    // comes from whenever WORLDCHAIN_SUBMITTER_RPC is unset, so leaving it would undo that.
-    worldChain: cfg.worldChain ? { ...cfg.worldChain, rpcUrl: "REDACTED" } : undefined,
+    // The READ endpoint: ORIGIN only. .env.example tells operators to replace the shared public
+    // default with their own, and "their own" is an Alchemy/Infura URL with the API key in the
+    // PATH — which is what this drops. The host survives because the boot log is where an operator
+    // diagnosing "the chip says could not check" confirms which endpoint the box resolved to, and
+    // nothing else names it. The WRITE endpoint stays fully redacted: it travels with the
+    // submitter key, and `agentBook.rpcUrl` is this same URL whenever WORLDCHAIN_SUBMITTER_RPC is
+    // unset. A URL we cannot parse is redacted whole rather than printed on a guess.
+    worldChain: cfg.worldChain
+      ? { ...cfg.worldChain, rpcUrl: rpcOrigin(cfg.worldChain.rpcUrl) }
+      : undefined,
     turnkey: cfg.turnkey
       ? {
           ...cfg.turnkey,

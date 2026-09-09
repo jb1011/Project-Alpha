@@ -27,7 +27,6 @@ export interface AgentBookRow {
   rawTx: string | null;
   submitterNonce: number | null;
   txHash: string | null;
-  confirmedBlock: number | null;
   attempt: number;
   errorCode: string | null;
   expiresAt: number;
@@ -45,7 +44,18 @@ export interface AgentBookRepository {
     expiresAt: number;
   }): AgentBookRow;
   findBySession(sessionId: string): AgentBookRow | undefined;
-  latestForEntity(entityKey: string): AgentBookRow | undefined;
+  /**
+   * The row that answers for this entity RIGHT NOW: the in-flight `submitted` one if there is one,
+   * otherwise the newest.
+   *
+   * Not simply the newest (design §5.2, altitude F10): a second session can be opened while a
+   * first is `submitted` — the lifetime cap allows three and the partial unique index only refuses
+   * the second *claim* — and when that second session expires it becomes the newest row. Serving
+   * it would let the status route fall through to the chain's "not registered" while our own
+   * transaction is on its way, which is exactly the terminal answer over an in-flight row §5.2
+   * forbids. At most one `submitted` row per entity exists, so "the in-flight one" is unambiguous.
+   */
+  currentForEntity(entityKey: string): AgentBookRow | undefined;
   /** Rows that count toward the per-entity lifetime cap (D13). */
   countLifetime(entityKey: string): number;
   /** Sessions this tenant created since `sinceMs` (epoch ms), for the per-tenant window. */
@@ -67,13 +77,13 @@ export interface AgentBookRepository {
     sessionId: string,
     from: AgentBookStatus,
     to: AgentBookStatus,
-    patch?: { errorCode?: string; confirmedBlock?: number },
+    patch?: { errorCode?: string },
   ): boolean;
   bumpAttempt(sessionId: string, errorCode: string): void;
 }
 
 const COLS = `id, session_id, entity_key, tenant_id, address, nonce, status, nullifier, raw_tx,
-  submitter_nonce, tx_hash, confirmed_block, attempt, error_code, expires_at, created_at, updated_at`;
+  submitter_nonce, tx_hash, attempt, error_code, expires_at, created_at, updated_at`;
 
 type Raw = {
   id: number;
@@ -87,7 +97,6 @@ type Raw = {
   raw_tx: string | null;
   submitter_nonce: number | null;
   tx_hash: string | null;
-  confirmed_block: number | null;
   attempt: number;
   error_code: string | null;
   expires_at: number;
@@ -107,7 +116,6 @@ const toRow = (r: Raw): AgentBookRow => ({
   rawTx: r.raw_tx,
   submitterNonce: r.submitter_nonce,
   txHash: r.tx_hash,
-  confirmedBlock: r.confirmed_block,
   attempt: r.attempt,
   errorCode: r.error_code,
   expiresAt: r.expires_at,
@@ -147,10 +155,14 @@ export class SqliteAgentBookRepository implements AgentBookRepository {
     return r ? toRow(r) : undefined;
   }
 
-  latestForEntity(entityKey: string): AgentBookRow | undefined {
+  currentForEntity(entityKey: string): AgentBookRow | undefined {
+    // `status = 'submitted'` is 1 or 0 in SQLite, so DESC puts the in-flight row first and the
+    // ordinary "newest wins" rule decides everything else. One query, and `idx_agentbook_entity`
+    // still serves it.
     const r = this.db
       .prepare(
-        `SELECT ${COLS} FROM agentbook_registrations WHERE entity_key = ? ORDER BY id DESC LIMIT 1`,
+        `SELECT ${COLS} FROM agentbook_registrations WHERE entity_key = ?
+          ORDER BY (status = 'submitted') DESC, id DESC LIMIT 1`,
       )
       .get(entityKey) as Raw | undefined;
     return r ? toRow(r) : undefined;
@@ -232,17 +244,17 @@ export class SqliteAgentBookRepository implements AgentBookRepository {
     sessionId: string,
     from: AgentBookStatus,
     to: AgentBookStatus,
-    patch: { errorCode?: string; confirmedBlock?: number } = {},
+    patch: { errorCode?: string } = {},
   ): boolean {
     const res = this.db
       .prepare(
         `UPDATE agentbook_registrations
             SET status = ?,
                 error_code = CASE WHEN ? = 'confirmed' THEN NULL ELSE COALESCE(?, error_code) END,
-                confirmed_block = COALESCE(?, confirmed_block), updated_at = CURRENT_TIMESTAMP
+                updated_at = CURRENT_TIMESTAMP
           WHERE session_id = ? AND status = ?`,
       )
-      .run(to, to, patch.errorCode ?? null, patch.confirmedBlock ?? null, sessionId, from);
+      .run(to, to, patch.errorCode ?? null, sessionId, from);
     return res.changes === 1;
   }
 

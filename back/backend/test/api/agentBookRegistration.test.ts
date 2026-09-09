@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import { getAddress } from "viem";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ContractRevertError } from "../../src/adapters/arc/relay";
+import type { SubmitClaim } from "../../src/adapters/worldid/agentBookRegistrar";
 import { buildApiApp } from "../../src/api/app";
 import { TokenBucket } from "../../src/api/routes/agentBook";
 import { signSession } from "../../src/auth/session";
@@ -98,17 +99,49 @@ function verifyGuardian(credential = "proof_of_human") {
   });
 }
 
-const registrar = () => ({
-  address: "0x9999999999999999999999999999999999999999",
-  getNextNonce: vi.fn(async () => 0n),
-  lookupHuman: vi.fn(async (): Promise<string | null> => null),
-  simulateRegister: vi.fn(async () => {}),
-  signRegister: vi.fn(async () => ({ rawTx: "0x02raw" as const, submitterNonce: 1 })),
-  broadcast: vi.fn(async () => "0xtxhash" as const),
-  receiptStatus: vi.fn(async (): Promise<"success" | "reverted" | null> => null),
-  submitterNonce: vi.fn(async () => 1),
-  submitterBalance: vi.fn(async () => 10n ** 16n),
-});
+/**
+ * The registrar stub. `submitRegister` is spelled out rather than mocked flat because it is the
+ * locked sign → persist → broadcast entry point (FR-C) and the route's behaviour depends on the
+ * ORDER of those three: this fake performs them in the real order, delegating to the `signRegister`
+ * and `broadcast` spies so a test can still make either one fail or assert it was never reached.
+ */
+const registrar = () => {
+  const r = {
+    address: "0x9999999999999999999999999999999999999999",
+    getNextNonce: vi.fn(async () => 0n),
+    lookupHuman: vi.fn(async (): Promise<string | null> => null),
+    simulateRegister: vi.fn(async () => {}),
+    signRegister: vi.fn(async (_args: unknown) => ({
+      rawTx: "0x02raw" as const,
+      submitterNonce: 1,
+    })),
+    broadcast: vi.fn(async (_rawTx: string) => "0xtxhash" as const),
+    receiptStatus: vi.fn(async (): Promise<"success" | "reverted" | null> => null),
+    submitterNonce: vi.fn(async () => 1),
+    submitterBalance: vi.fn(async () => 10n ** 16n),
+    submitRegister: vi.fn(
+      async (
+        args: unknown,
+        persist: (s: { rawTx: `0x${string}`; submitterNonce: number }) => SubmitClaim,
+      ) => {
+        const signed = await r.signRegister(args);
+        const claim = await persist(signed);
+        if (claim !== "won") return { signed, claim, txHash: null };
+        try {
+          return { signed, claim, txHash: await r.broadcast(signed.rawTx) };
+        } catch (e) {
+          return {
+            signed,
+            claim,
+            txHash: null,
+            broadcastErrorName: e instanceof Error ? e.name : "unknown",
+          };
+        }
+      },
+    ),
+  };
+  return r;
+};
 
 /** `reg: null` builds the READ-ONLY deployment shape — no submitter key, so no write half.
  *  (`undefined` cannot mean that: it is what a default parameter fills in.) */
@@ -293,8 +326,17 @@ test("register: a deterministic revert is proof_rejected with the error NAME onl
   repo.upsert(entity());
   verifyGuardian();
   const reg = registrar();
+  // The fixture is shaped like the REAL leak vector (backend F5): viem's contract errors print the
+  // call arguments, and the call arguments are `agent, root, nonce, nullifierHash, proof[8]`. So
+  // both the message and the cause chain of this one carry the nullifier and a proof word — the
+  // three negative assertions below are vacuous against an error that contains neither.
+  const leaky = new Error(
+    `The contract function "register" reverted.\n\nArgs: (${POCKET}, 0x1, 0, ${NULLIFIER}, [${PROOF.join(", ")}])`,
+  );
   reg.simulateRegister.mockRejectedValue(
-    new ContractRevertError("AgentBook.register reverted: InvalidNonce", "InvalidNonce"),
+    new ContractRevertError("AgentBook.register reverted: InvalidNonce", "InvalidNonce", {
+      cause: leaky,
+    }),
   );
   const app = makeApp(reg);
   const { sessionId } = await (await call(app, "/session", {})).json();
@@ -304,9 +346,13 @@ test("register: a deterministic revert is proof_rejected with the error NAME onl
   expect(text).toContain("InvalidNonce");
   expect(text).not.toContain(NULLIFIER);
   expect(text).not.toContain(PROOF[3]);
+  expect(text).not.toContain("reverted.");
   expect(logs.join("\n")).not.toContain(NULLIFIER);
+  expect(logs.join("\n")).not.toContain(PROOF[3]);
+  // FR-B: the contract decided, and the proof cannot be replayed — the session ends `failed` with
+  // the diagnostic rather than staying open until it expires.
   expect(abRepo.findBySession(sessionId)).toMatchObject({
-    status: "pending",
+    status: "failed",
     attempt: 1,
     errorCode: "InvalidNonce",
   });
@@ -329,7 +375,7 @@ test("register: a revert raised by the SIGNING estimate is proof_rejected too, n
   });
   expect(reg.broadcast).not.toHaveBeenCalled();
   expect(abRepo.findBySession(sessionId)).toMatchObject({
-    status: "pending",
+    status: "failed",
     attempt: 1,
     errorCode: "AlreadyRegistered",
   });
@@ -345,7 +391,31 @@ test("register: a transport failure while signing is 503, and the session stays 
   const res = await call(app, "/register", proofBody(sessionId));
   expect(res.status).toBe(503);
   expect((await res.json()).error.code).toBe("unavailable");
-  expect(abRepo.findBySession(sessionId)).toMatchObject({ status: "pending", attempt: 1 });
+  // FR-B: nothing was decided, so NOTHING is written — not even the attempt counter. That count is
+  // a record of what the contract rejected (§4.1); spending it on a bad minute at the RPC would
+  // burn one of the guardian's three lifetime attempts for free. The proof is still good.
+  expect(abRepo.findBySession(sessionId)).toMatchObject({
+    status: "pending",
+    attempt: 0,
+    errorCode: null,
+  });
+  expect(logs.join("\n")).toContain("agentbook_write_unavailable");
+});
+
+test("register: a transport failure at SIMULATE writes nothing either (FR-B)", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const reg = registrar();
+  reg.simulateRegister.mockRejectedValue(new Error("HTTP 429 Too Many Requests"));
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  expect((await call(app, "/register", proofBody(sessionId))).status).toBe(503);
+  expect(abRepo.findBySession(sessionId)).toMatchObject({
+    status: "pending",
+    attempt: 0,
+    errorCode: null,
+  });
+  expect(reg.signRegister).not.toHaveBeenCalled();
 });
 
 test("register: a submitter balance that cannot be read is 503, never a 500", async () => {
@@ -549,4 +619,193 @@ test("GET after submit reconciles and reports the row", async () => {
     address: POCKET,
   });
   expect(b.errorCode).toBeUndefined();
+});
+
+/**
+ * Whose vouch is it? (design §3 precondition 5, §8 HIGH-2, ruling FR-A)
+ *
+ * The question the status route answers is NOT "is this address registered". A non-null lookup we
+ * did not write means someone else vouched — `disputed`, the state that keeps the vouch button
+ * open — and never a finished "registered" that would lock the guardian out of overwriting a
+ * stranger's binding. The mirror image matters just as much: a `failed` row whose nullifier the
+ * registry now holds IS our vouch, mined after we gave up on it.
+ */
+const seedRow = (
+  status: "failed" | "confirmed" | "disputed",
+  nullifier: string,
+  over: { txHash?: string } = {},
+) => {
+  const sessionId = randomUUID();
+  abRepo.createSession({
+    sessionId,
+    entityKey: "agent-1",
+    tenantId: TENANT,
+    address: POCKET,
+    nonce: "0",
+    expiresAt: Date.now() + 60_000,
+  });
+  abRepo.claimSubmit(sessionId, { nullifier, rawTx: "0x02raw", submitterNonce: 0 });
+  if (over.txHash) abRepo.setTxHash(sessionId, over.txHash);
+  abRepo.transition(
+    sessionId,
+    "submitted",
+    status,
+    status === "failed" ? { errorCode: "reverted" } : {},
+  );
+  return sessionId;
+};
+
+test("FR-A: a stranger's vouch with NO row of ours is disputed, not registered", async () => {
+  repo.upsert(entity());
+  reader.lookupHuman.mockResolvedValue("0x5714a9e7");
+  const b = await (await call(makeApp(), "")).json();
+  // The lock-out §8 HIGH-2 describes: outcome "registered" here would render "Vouched in AgentBook"
+  // and disable the button with "Already vouched", over a binding that points at a stranger.
+  expect(b).toMatchObject({
+    registered: false,
+    outcome: "disputed",
+    disputed: true,
+    humanId: "0x5714a9e7",
+  });
+  expect(b.status).toBeUndefined();
+});
+
+test("FR-A: a failed row and a DIFFERENT nullifier on chain is disputed", async () => {
+  repo.upsert(entity());
+  seedRow("failed", NULLIFIER);
+  reader.lookupHuman.mockResolvedValue("0x5714a9e7");
+  const b = await (await call(makeApp(), "")).json();
+  expect(b).toMatchObject({
+    registered: false,
+    outcome: "disputed",
+    disputed: true,
+    status: "failed",
+    errorCode: "reverted",
+  });
+});
+
+test("FR-A: a failed row whose nullifier the registry now holds is REGISTERED — the registry outranks our record", async () => {
+  repo.upsert(entity());
+  seedRow("failed", NULLIFIER, { txHash: "0xh" });
+  // Minimal hex for the padded value the row stores: the same human, as the contract spells it.
+  reader.lookupHuman.mockResolvedValue("0xbadf00d");
+  const b = await (await call(makeApp(), "")).json();
+  expect(b).toMatchObject({
+    registered: true,
+    outcome: "registered",
+    disputed: false,
+    humanId: "0xbadf00d",
+    status: "failed",
+  });
+});
+
+test("FR-A: a CONFIRMED row and a different nullifier on chain is disputed (someone overwrote us)", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER);
+  reader.lookupHuman.mockResolvedValue("0x5714a9e7");
+  const b = await (await call(makeApp(), "")).json();
+  expect(b).toMatchObject({
+    registered: false,
+    outcome: "disputed",
+    disputed: true,
+    humanId: "0x5714a9e7",
+    status: "confirmed",
+  });
+});
+
+test("FR-A: a reconcile that lands on someone else's nullifier reports disputed at the route", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const reg = registrar();
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  await call(app, "/register", proofBody(sessionId));
+  // The chain moved, and the human it now names is not the one our proof carried: the reconciler
+  // writes `disputed` and caches the foreign id so the trust dials stop serving ours.
+  reg.getNextNonce.mockResolvedValue(1n);
+  reg.lookupHuman.mockResolvedValue("0x5714a9e7");
+  reader.lookupHuman.mockResolvedValue("0x5714a9e7");
+  const b = await (await call(app, "")).json();
+  expect(b).toMatchObject({
+    registered: false,
+    status: "disputed",
+    outcome: "disputed",
+    disputed: true,
+  });
+  expect(abRepo.findBySession(sessionId)?.status).toBe("disputed");
+});
+
+test("FR-D: a confirmed row beats a cached negative — the sweep can confirm without this request", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xh" });
+  // What the previous poll cached while the row was still in flight, and what the background
+  // reconciler's confirmation does not reach: 60 seconds of "not in AgentBook" over our own vouch,
+  // which our seller gate and buyer dial read out of the same cache.
+  world.cacheLookup(POCKET, null, Date.now());
+  const b = await (await call(makeApp(null), "")).json();
+  expect(b).toMatchObject({
+    registered: true,
+    outcome: "registered",
+    humanId: "0xbadf00d",
+    status: "confirmed",
+  });
+  expect(reader.lookupHuman).not.toHaveBeenCalled();
+  // …and the poisoned entry is replaced on the way past, in the spelling worldVerifier keys its
+  // per-human allowance off.
+  expect(world.getCachedLookup(POCKET, Date.now(), 600_000, 60_000)).toEqual({
+    humanId: "0xbadf00d",
+  });
+});
+
+test("FR-F: the status body carries network and priorVouches on both the registered and the unregistered branch", async () => {
+  repo.upsert(entity());
+  const unregistered = await (await call(makeApp(null), "")).json();
+  // The dialog renders §5.1's testnet-permanence line and the "you have vouched for N agents" line
+  // off the status it already polls, without having to open a session first.
+  expect(unregistered).toMatchObject({
+    outcome: "unregistered",
+    network: "testnet",
+    priorVouches: 0,
+  });
+  seedRow("confirmed", NULLIFIER);
+  reader.lookupHuman.mockResolvedValue("0xbadf00d");
+  const registered = await (await call(makeApp(null), "")).json();
+  expect(registered).toMatchObject({
+    outcome: "registered",
+    network: "testnet",
+    priorVouches: 1,
+  });
+});
+
+test("an agent with no pocket says 'could not check', never 'not registered'", async () => {
+  repo.upsert(entity({ pocketAddress: null }));
+  const b = await (await call(makeApp(null), "")).json();
+  // There is no address to be unregistered AT: we asked the contract nothing (§3.2).
+  expect(b).toEqual({
+    registered: false,
+    reason: "no-pocket-yet",
+    outcome: "unknown",
+    disputed: false,
+  });
+});
+
+test("the status address is EIP-55 checksummed, like the session route's", async () => {
+  // Circle stores a pocket exactly as it returns it (lowercase); the dialog shows the GET's address
+  // beside the session's and asks the guardian to compare both with Arcscan (D8).
+  const lower = "0x4bbeeb066ed09b7aed07bf39eee0460dfa261520";
+  repo.upsert(entity({ pocketAddress: lower }));
+  const b = await (await call(makeApp(null), "")).json();
+  expect(b.address).toBe(getAddress(lower));
+  expect(b.address).not.toBe(lower);
+});
+
+test("a decimal uint above 2^256-1 is a validation error, not a 503 from the RPC path", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  const reg = registrar();
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  const res = await call(app, "/register", proofBody(sessionId, { root: "9".repeat(78) }));
+  expect(res.status).toBe(400);
+  expect(reg.simulateRegister).not.toHaveBeenCalled();
 });

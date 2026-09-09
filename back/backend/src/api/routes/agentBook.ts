@@ -89,7 +89,14 @@ const LOOKUP_NEGATIVE_TTL_MS = 60_000;
 const NOT_ELIGIBLE_MESSAGE =
   "AgentBook vouching needs a World ID from an Orb. Your access here is unaffected. AgentBook is World's public registry and only accepts Orb-verified proofs. There is nothing we can substitute for that, and we will not fake it.";
 
-const uint = z.string().regex(/^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$/);
+/** A uint256 as World sends it: 0x-hex or decimal. The hex branch is bounded by its 64-nibble cap;
+ *  the decimal one is not (2^256−1 is itself 78 digits), so the range check is what stops a
+ *  too-large decimal from reaching viem and coming back as a misleading 503 (§4.7 makes the schema
+ *  the shape gate). */
+const uint = z
+  .string()
+  .regex(/^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$/)
+  .refine((s) => BigInt(s) < 2n ** 256n, { message: "value exceeds uint256" });
 const RegisterBody = z.object({
   sessionId: z.string().uuid(),
   root: uint,
@@ -269,10 +276,10 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     /**
      * The ONE place a write-path failure is turned into an answer.
      *
-     * `simulateRegister` and `signRegister` both raise `ContractRevertError` for a deterministic
-     * revert — the second is where a state change since the simulation shows up, and it is every
-     * bit as certain as the first, so it gets the same 400 rather than a 500. Everything else is
-     * transport and says nothing about the proof.
+     * `simulateRegister` and `submitRegister` both raise `ContractRevertError` for a deterministic
+     * revert — the second is where a state change since the simulation shows up (its gas estimate
+     * runs against a later block), and it is every bit as certain as the first, so it gets the same
+     * 400 rather than a 500. Everything else is transport and says nothing about the proof.
      *
      * NOTHING but the error NAME may leave here: a viem contract error prints the call arguments,
      * the call arguments are `agent, root, nonce, nullifierHash, proof[8]`, and a failed attempt's
@@ -281,7 +288,13 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     const refuse = (e: unknown, stage: "simulate" | "balance" | "sign"): never => {
       if (e instanceof ContractRevertError) {
         const errorName = e.errorName ?? "revert";
+        // FR-B: the contract has DECIDED, and a World proof is not replayable — this session can
+        // never succeed. It ends here as `failed` carrying the diagnostic rather than sitting
+        // `pending` for the rest of its TTL, where the chip would keep calling it an open session
+        // and the guardian would keep waiting on a QR that is already spent. `bumpAttempt` first,
+        // so the row records both the count and the last-attempt code.
         ab.repo.bumpAttempt(row.sessionId, errorName);
+        ab.repo.transition(row.sessionId, "pending", "failed", { errorCode: errorName });
         opsLog("agentbook_proof_rejected", {
           entity: rec.idempotencyKey,
           tenantPrefix: tenantPrefix(tenantId),
@@ -292,8 +305,11 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
           errorName,
         });
       }
-      const errorName = e instanceof Error ? e.name : "unavailable";
-      ab.repo.bumpAttempt(row.sessionId, errorName);
+      // TRANSPORT, which says nothing about the proof: NOTHING is written (FR-B). No attempt bump
+      // either — the count is a record of what the CONTRACT rejected (§4.1), and spending it on a
+      // bad minute at the RPC would burn a retry the guardian still has. The row stays `pending`,
+      // the proof stays usable, and the caller is told to try again.
+      const errorName = e instanceof Error ? e.name : "unknown";
       opsLog("agentbook_write_unavailable", {
         entity: rec.idempotencyKey,
         tenantPrefix: tenantPrefix(tenantId),
@@ -323,34 +339,38 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       });
       throw new ApiError("unavailable", 503, "registrations are paused");
     }
-    let signed: { rawTx: `0x${string}`; submitterNonce: number };
+    // SIGN → PERSIST → BROADCAST, all three inside the registrar's submitter lock (FR-C, §4.1).
+    // The persist step is handed in rather than run here because the EVM nonce is only unique
+    // while nothing else signs or sends on the submitter account: with the claim outside the lock,
+    // two guardians vouching at once prepare on the same nonce and one of the two proofs — which
+    // cannot be re-created — is thrown away.
+    let submitted: Awaited<ReturnType<typeof registrar.submitRegister>>;
     try {
-      signed = await registrar.signRegister(args);
+      submitted = await registrar.submitRegister(args, (signed) =>
+        // VERBATIM, exactly the hex the guardian's proof carried: the reconciler compares it with
+        // `lookupHuman` numerically, and re-encoding it here would only lose the padding World
+        // sent.
+        ab.repo.claimSubmit(row.sessionId, {
+          nullifier: body.nullifierHash,
+          rawTx: signed.rawTx,
+          submitterNonce: signed.submitterNonce,
+        }),
+      );
     } catch (e) {
       return refuse(e, "sign");
     }
-    // VERBATIM, exactly the hex the guardian's proof carried: the reconciler compares it with
-    // `lookupHuman` numerically, and re-encoding it here would only lose the padding World sent.
-    const claim = ab.repo.claimSubmit(row.sessionId, {
-      nullifier: body.nullifierHash,
-      rawTx: signed.rawTx,
-      submitterNonce: signed.submitterNonce,
-    });
-    if (claim === "inflight")
+    if (submitted.claim === "inflight")
       throw new ApiError("conflict", 409, "a registration for this agent is already in flight");
-    if (claim === "lost") throw new ApiError("conflict", 409, "session already used");
-    let txHash: string | null = null;
-    try {
-      txHash = await registrar.broadcast(signed.rawTx);
-    } catch (e) {
-      // Persisted before broadcast: the reconciler re-broadcasts the same raw tx (§6 rule 4), so
-      // "submitted with no hash yet" is the honest answer and NOT a failure the caller must retry.
+    if (submitted.claim === "lost") throw new ApiError("conflict", 409, "session already used");
+    const txHash: string | null = submitted.txHash;
+    if (submitted.broadcastErrorName)
+      // The raw tx is persisted, so the reconciler re-broadcasts it (§6 rule 4): "submitted with
+      // no hash yet" is the honest answer and NOT a failure the caller must retry.
       opsLog("agentbook_broadcast_unavailable", {
         entity: rec.idempotencyKey,
         tenantPrefix: tenantPrefix(tenantId),
-        errorName: e instanceof Error ? e.name : "unknown",
+        errorName: submitted.broadcastErrorName,
       });
-    }
     if (txHash !== null) {
       // OUTSIDE the broadcast try: a local write that fails here must not be mistaken for a
       // broadcast that failed. The transaction is on the wire either way, and the caller gets its
@@ -378,11 +398,20 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       return c.json({
         registered: false,
         reason: "no-pocket-yet",
-        outcome: "unregistered",
+        // NOT "unregistered": there is no address to be unregistered AT. We never asked the
+        // contract anything, so the honest value is the union's "could not check" (§3.2).
+        outcome: "unknown",
         disputed: false,
       });
-    const address = rec.pocketAddress;
-    let row = ab.repo.latestForEntity(rec.idempotencyKey);
+    // EIP-55, like the session route's `pocketAddress` (:169). The dialog puts the two side by
+    // side and asks the guardian to compare the address with the one that paid on Arcscan (D8), so
+    // one lowercase and one checksummed spelling of the same address reads as a discrepancy that
+    // is not one. Every equality downstream is case-insensitive: the lookup cache lowercases its
+    // key (`worldStore.cacheLookup`) and viem accepts either.
+    const address = getAddress(rec.pocketAddress);
+    // The IN-FLIGHT row if there is one, not simply the newest (§5.2): a second session that
+    // expired after the first was submitted must not shadow a transaction still on its way.
+    let row = ab.repo.currentForEntity(rec.idempotencyKey);
     // Two things can cost an RPC call here: reconciling an in-flight row, and a lookup the cache
     // cannot answer. Either one spends ONE read token, taken BEFORE the call — a dashboard full
     // of chips must never be able to drain the World Chain quota the trust dials share. Out of
@@ -410,23 +439,25 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       reconciled = true;
     }
     /**
-     * ONCE A RECONCILE HAS RUN, THE CACHE IS DEAD TO US.
+     * A CONFIRMED ROW OF OUR OWN OUTRANKS A CACHED NEGATIVE (FR-D).
      *
-     * The reconciler writes the cache on its `disputed` branch only, never on `confirmed` — so a
-     * `null` this route cached on the previous poll (60s TTL) would outlive the confirmation and
-     * be served beside it, producing `{ status: "confirmed", registered: false }` in one body.
-     * Polling makes that the NORMAL path, not a race. The reconciled row is strictly fresher than
-     * anything cached, so it answers for itself and refreshes the cache on the way past.
+     * The reconciler now writes the cache on `confirmed` as well as `disputed`, but the confirming
+     * sweep may have run in the background (or in an older process), leaving the `null` this route
+     * cached on a previous poll (60s TTL) to be served beside `status: "confirmed"` — one body
+     * saying both "we vouched" and "not in AgentBook". A positive cache entry is used as it stands:
+     * it can disagree with our row, and that disagreement is exactly the `disputed` case below.
      */
-    const confirmedId = reconciled && row?.status === "confirmed" ? asHumanId(row.nullifier) : null;
+    const confirmedId = row?.status === "confirmed" ? asHumanId(row.nullifier) : null;
+    const usableCache = cached && (cached.humanId !== null || confirmedId === null) ? cached : null;
     let humanId: string | null | undefined;
-    if (confirmedId !== null) {
-      humanId = confirmedId;
-      ab.store.cacheLookup(address, humanId, now());
-    } else if (!reconciled && cached) humanId = cached.humanId;
+    // A reconcile that just confirmed is strictly fresher than anything cached, and it read the
+    // contract itself at `safe` to get there.
+    if (reconciled && confirmedId !== null) humanId = confirmedId;
+    else if (!reconciled && usableCache) humanId = usableCache.humanId;
     else if (budgeted) {
-      // Reconciled to something other than `confirmed`: ask the contract. The read token was
-      // already spent on the reconcile, so this costs no further budget.
+      // Reconciled to something other than `confirmed`, or nothing usable cached: ask the
+      // contract. When a reconcile ran, the read token was already spent on it and this costs no
+      // further budget.
       try {
         humanId = await ab.reader.lookupHuman(address);
         // Only a DEFINITIVE answer is cached — `lookupHuman` throws rather than returning null on
@@ -437,8 +468,26 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
         humanId = undefined;
       }
     }
-    const foreign =
-      humanId != null && row?.status === "confirmed" && !sameHuman(humanId, row.nullifier);
+    // A read we could not make must not turn a vouch we confirmed into "could not tell". A FRESH
+    // definitive `null` is left alone: the contract is the authority on its own state.
+    if (humanId === undefined && confirmedId !== null) humanId = confirmedId;
+    // Refresh the cache whenever the row is what answered, in the minimal-hex spelling every other
+    // writer uses — `worldVerifier` keys its per-human allowance off this value, so two spellings
+    // of one human would be two buckets and twice the allowance.
+    if (confirmedId !== null && humanId === confirmedId)
+      ab.store.cacheLookup(address, humanId, now());
+    /**
+     * IS THIS VOUCH OURS? (§3 precondition 5, FR-A)
+     *
+     * Not "is this address registered": a non-null lookup we did not write means SOMEONE ELSE
+     * vouched, which is `disputed` — the state that keeps the vouch button open — and never a
+     * finished "registered" that would lock the guardian out of overwriting a stranger's binding
+     * (§8 HIGH-2). `ours` deliberately does not require a `confirmed` row: a `failed` or `expired`
+     * row whose nullifier the registry now holds IS our vouch, mined after we gave up on it, and
+     * the registry outranks our record of it.
+     */
+    const ours = row != null && row.nullifier != null && sameHuman(humanId ?? null, row.nullifier);
+    const foreign = humanId != null && !ours;
     const disputed = row?.status === "disputed" || foreign;
     const outcome = disputed
       ? "disputed"
@@ -456,6 +505,11 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       ...(row ? { status: row.status, txHash: row.txHash } : {}),
       // The last-attempt diagnostic is only meaningful on a failed row (agentBookRepository.ts).
       ...(row?.status === "failed" && row.errorCode ? { errorCode: row.errorCode } : {}),
+      // The same two values the session route returns, so the dialog can render §5.1's conditional
+      // lines (the testnet-permanence sentence, the "you have vouched for N agents" line) from the
+      // status it already polls, without opening a session first (FR-F).
+      network: ab.network,
+      priorVouches: ab.repo.countConfirmedForTenant(c.get("tenantId")),
     });
   });
 }

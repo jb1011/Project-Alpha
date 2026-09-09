@@ -10,7 +10,6 @@ import {
   TransactionReceiptNotFoundError,
   decodeFunctionData,
   encodeErrorResult,
-  keccak256,
   toFunctionSelector,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -21,7 +20,6 @@ import {
   buildSignal,
   createAgentBookRegistrar,
   encodeRegister,
-  hashSignal,
 } from "../../src/adapters/worldid/agentBookRegistrar";
 import { AGENT_BOOK_ABI, AGENT_BOOK_ADDRESS } from "../../src/payments/agentBookReader";
 
@@ -32,10 +30,6 @@ describe("signal", () => {
     const sig = buildSignal(AGENT, 1n);
     expect(sig).toBe(`0x${"11".repeat(20)}${"00".repeat(31)}01`);
     expect((sig.length - 2) / 2).toBe(52);
-  });
-  test("hashSignal is keccak256 >> 8 (World's hashToField)", () => {
-    const sig = buildSignal(AGENT, 7n);
-    expect(hashSignal(sig)).toBe(BigInt(keccak256(sig)) >> 8n);
   });
 });
 
@@ -168,27 +162,79 @@ describe("receiptStatus: 'not mined yet' is one specific viem error, not a shape
   });
 });
 
-describe("signRegister", () => {
-  /** A wallet client that prepares, signs, and screams if asked to broadcast. */
+describe("submitRegister", () => {
+  /** A wallet client that prepares, signs and broadcasts, with a PENDING nonce that only moves
+   *  when something is actually sent — the shape a real node has, and the only shape in which the
+   *  lock's job (sign → persist → broadcast, one writer at a time) is observable. */
   function walletStub(over: Record<string, unknown> = {}) {
+    let pendingNonce = 7;
     return {
-      prepareTransactionRequest: async (args: Record<string, unknown>) => ({ ...args, nonce: 7 }),
+      prepareTransactionRequest: async (args: Record<string, unknown>) => ({
+        ...args,
+        nonce: pendingNonce,
+      }),
       signTransaction: async () => "0x02signed",
-      sendRawTransaction: () => {
-        throw new Error("signRegister broadcast");
+      sendRawTransaction: async () => {
+        pendingNonce += 1;
+        return "0xtxhash";
       },
       ...over,
     };
   }
+  const won = () => "won" as const;
 
-  test("returns the raw tx and the EVM nonce it signed under, and broadcasts NOTHING", async () => {
-    // The caller persists the attempt BEFORE broadcasting (bridge-legs rule), so a signRegister
-    // that also sent would put an unrecorded transaction on chain.
+  test("signs, persists, then broadcasts — and hands back the nonce it signed under", async () => {
+    const order: string[] = [];
     const registrar = registrarWith(readClientThatRefusesToSend, walletStub());
-    expect(await registrar.signRegister(REGISTER_ARGS)).toEqual({
-      rawTx: "0x02signed",
-      submitterNonce: 7,
+    const res = await registrar.submitRegister(REGISTER_ARGS, (signed) => {
+      order.push(`persist:${signed.rawTx}:${signed.submitterNonce}`);
+      return "won";
     });
+    expect(res).toEqual({
+      signed: { rawTx: "0x02signed", submitterNonce: 7 },
+      claim: "won",
+      txHash: "0xtxhash",
+    });
+    expect(order).toEqual(["persist:0x02signed:7"]);
+  });
+
+  test("a persist that did not win the row broadcasts NOTHING (FR-C)", async () => {
+    // The raw transaction exists but the row belongs to another submission: putting it on the wire
+    // would spend the submitter's nonce on a registration nobody recorded.
+    const sent: string[] = [];
+    const registrar = registrarWith(
+      readClientThatRefusesToSend,
+      walletStub({
+        sendRawTransaction: async () => {
+          sent.push("sent");
+          return "0xtxhash";
+        },
+      }),
+    );
+    const res = await registrar.submitRegister(REGISTER_ARGS, () => "inflight");
+    expect(res).toEqual({
+      signed: { rawTx: "0x02signed", submitterNonce: 7 },
+      claim: "inflight",
+      txHash: null,
+    });
+    expect(sent).toEqual([]);
+  });
+
+  test("a broadcast failure returns the error NAME and a null hash, never viem's prose", async () => {
+    class MempoolError extends Error {
+      name = "MempoolError";
+    }
+    const registrar = registrarWith(
+      readClientThatRefusesToSend,
+      walletStub({
+        sendRawTransaction: () =>
+          Promise.reject(new MempoolError(`rejected tx for ${REGISTER_ARGS.nullifierHash}`)),
+      }),
+    );
+    const res = await registrar.submitRegister(REGISTER_ARGS, won);
+    expect(res.txHash).toBeNull();
+    expect(res.broadcastErrorName).toBe("MempoolError");
+    expect(JSON.stringify(res)).not.toContain("rejected tx");
   });
 
   test("a prepared request with no nonce fails loudly instead of recording NaN", async () => {
@@ -196,43 +242,54 @@ describe("signRegister", () => {
       readClientThatRefusesToSend,
       walletStub({ prepareTransactionRequest: async () => ({}) }),
     );
-    await expect(registrar.signRegister(REGISTER_ARGS)).rejects.toThrow(/has no nonce/);
+    await expect(registrar.submitRegister(REGISTER_ARGS, won)).rejects.toThrow(/has no nonce/);
   });
 
-  test("one submitter EOA, one nonce sequence: signing is serialized by the keyed lock", async () => {
+  test("one submitter EOA, one nonce sequence: the lock spans sign, persist AND broadcast (FR-C)", async () => {
+    // The stub's pending nonce advances only when something is BROADCAST — exactly like a node.
+    // So this test can only pass if the second submission's `prepareTransactionRequest` runs after
+    // the first submission's `sendRawTransaction`: the whole sequence, not just the signature,
+    // has to be inside the lock.
     const events: string[] = [];
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
-    let firstSign = true;
+    let firstPersist = true;
+    let pendingNonce = 7;
     const registrar = registrarWith(
       readClientThatRefusesToSend,
       walletStub({
         prepareTransactionRequest: async (args: Record<string, unknown>) => {
-          events.push("prepare");
-          return { ...args, nonce: 7 };
+          events.push(`prepare:${pendingNonce}`);
+          return { ...args, nonce: pendingNonce };
         },
-        signTransaction: async () => {
-          events.push("sign");
-          if (firstSign) {
-            firstSign = false;
-            await held; // the first signature is still in flight
-          }
-          return "0x02signed";
+        sendRawTransaction: async () => {
+          events.push("send");
+          pendingNonce += 1;
+          return "0xtxhash";
         },
       }),
     );
+    const persist = async () => {
+      events.push("persist");
+      if (firstPersist) {
+        firstPersist = false;
+        await held; // the first submission is still writing its row
+      }
+      return "won" as const;
+    };
 
-    const a = registrar.signRegister(REGISTER_ARGS);
-    const b = registrar.signRegister(REGISTER_ARGS);
+    const a = registrar.submitRegister(REGISTER_ARGS, persist);
+    const b = registrar.submitRegister(REGISTER_ARGS, persist);
     await new Promise((r) => setTimeout(r, 0));
-    // Without the lock the second call would have read the same pending nonce here and both
-    // transactions would fight for it; one of them would be dropped.
-    expect(events).toEqual(["prepare", "sign"]);
+    // The second call has not even prepared: it is waiting on the lock the first still holds.
+    expect(events).toEqual(["prepare:7", "persist"]);
     release();
-    await Promise.all([a, b]);
-    expect(events).toEqual(["prepare", "sign", "prepare", "sign"]);
+    const [first, second] = await Promise.all([a, b]);
+    expect(events).toEqual(["prepare:7", "persist", "send", "prepare:8", "persist", "send"]);
+    // Distinct nonces, in the order they were broadcast — the whole point of the lock.
+    expect([first.signed.submitterNonce, second.signed.submitterNonce]).toEqual([7, 8]);
   });
 
   test("a revert found during gas estimation is classified, not leaked as viem prose", async () => {
@@ -251,7 +308,7 @@ describe("signRegister", () => {
           ),
       }),
     );
-    const err = await registrar.signRegister(REGISTER_ARGS).catch((e: unknown) => e);
+    const err = await registrar.submitRegister(REGISTER_ARGS, won).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ContractRevertError);
     expect((err as Error).message).toBe("AgentBook.register reverted: unknown");
   });
@@ -268,7 +325,7 @@ describe("signRegister", () => {
       readClientThatRefusesToSend,
       walletStub({ prepareTransactionRequest: () => Promise.reject(broke) }),
     );
-    await expect(registrar.signRegister(REGISTER_ARGS)).rejects.toBe(broke);
+    await expect(registrar.submitRegister(REGISTER_ARGS, won)).rejects.toBe(broke);
   });
 });
 
@@ -285,22 +342,23 @@ describe("write and read providers stay on their own RPC", () => {
     expect(sent).toEqual(["0x02signed"]);
   });
 
-  test("submitterNonce is the WRITE provider's MINED count, not the read provider's", async () => {
-    // Two things are pinned here. The provider: two RPCs can disagree by a transaction, and this
-    // number is only meaningful next to the nonce the signer took. And the block tag: "latest",
-    // because a "pending" count includes our own unmined registration, which the reconciler would
-    // read as "the chain moved past our nonce, we were replaced" while it is merely slow.
+  test("submitterNonce is the READ provider's MINED count — one provider, one verdict (FR-E)", async () => {
+    // Two things are pinned here. The provider: the reconciler compares this count with the
+    // receipt it just read through `receiptStatus`, i.e. the READ client, and a "replaced" verdict
+    // built from two providers that disagree by one transaction marks a successful vouch failed.
+    // And the block tag: "latest", because a "pending" count includes our own unmined
+    // registration, which would read as "the chain moved past our nonce" while it is merely slow.
     const asked: unknown[] = [];
     const registrar = registrarWith(
-      {
-        getTransactionCount: () => {
-          throw new Error("nonce read from the read client");
-        },
-      },
       {
         request: async (req: { method: string; params: unknown }) => {
           asked.push(req);
           return "0x9";
+        },
+      },
+      {
+        getTransactionCount: () => {
+          throw new Error("nonce read from the write client");
         },
       },
     );

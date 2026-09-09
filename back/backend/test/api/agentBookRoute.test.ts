@@ -32,12 +32,14 @@ const POCKET = "0x2222222222222222222222222222222222222222";
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 let world: SqliteWorldStore;
+let abRepo: SqliteAgentBookRepository;
 
 beforeEach(() => {
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
   world = new SqliteWorldStore(db);
+  abRepo = new SqliteAgentBookRepository(db);
 });
 afterEach(() => db.close());
 
@@ -92,7 +94,7 @@ function makeApp(
       requireGuardian: false,
     },
     agentBook: {
-      repo: new SqliteAgentBookRepository(db),
+      repo: abRepo,
       reader: reader ?? { lookupHuman: async () => null },
       store: world,
       network: "testnet",
@@ -100,6 +102,24 @@ function makeApp(
       readBudget,
     },
   } as never);
+}
+
+/**
+ * A vouch of OUR OWN, confirmed. Needed wherever a test means "registered": the route answers
+ * "did WE vouch, and does the registry still agree?" (§3 precondition 5), so a lookup with no row
+ * behind it is `disputed` — someone else's vouch — however valid the id is.
+ */
+function vouched(humanId: string) {
+  abRepo.createSession({
+    sessionId: "s1",
+    entityKey: "agent-1",
+    tenantId: TENANT,
+    address: POCKET,
+    nonce: "0",
+    expiresAt: Date.now() + 60_000,
+  });
+  abRepo.claimSubmit("s1", { nullifier: humanId, rawTx: "0x02raw", submitterNonce: 0 });
+  abRepo.transition("s1", "submitted", "confirmed");
 }
 
 const token = async () =>
@@ -114,6 +134,7 @@ const get = async (app: ReturnType<typeof buildApiApp>) =>
 
 test("reports the human registered against the POCKET address", async () => {
   repo.upsert(base());
+  vouched("0xdeadbeef");
   const app = makeApp({ lookupHuman: async (a) => (a === POCKET ? "0xdeadbeef" : null) });
   const body = await get(app);
   expect(body).toMatchObject({
@@ -121,6 +142,18 @@ test("reports the human registered against the POCKET address", async () => {
     humanId: "0xdeadbeef",
     address: POCKET,
     outcome: "registered",
+  });
+});
+
+test("a human bound to the pocket by SOMEONE ELSE is disputed, never registered (FR-A)", async () => {
+  repo.upsert(base());
+  const app = makeApp({ lookupHuman: async () => "0xdeadbeef" });
+  const body = await get(app);
+  expect(body).toMatchObject({
+    registered: false,
+    outcome: "disputed",
+    disputed: true,
+    humanId: "0xdeadbeef",
   });
 });
 
@@ -179,6 +212,7 @@ test("an exhausted READ budget is 'unknown' too, and costs no RPC call", async (
 
 test("a cached positive lookup answers without touching the reader OR the budget", async () => {
   repo.upsert(base());
+  vouched("0xdeadbeef");
   world.cacheLookup(POCKET, "0xdeadbeef", Date.now());
   let calls = 0;
   const app = makeApp(
@@ -198,6 +232,7 @@ test("a cached positive lookup answers without touching the reader OR the budget
 
 test("a fresh lookup is written back to the cache, so the second read is free", async () => {
   repo.upsert(base());
+  vouched("0xdeadbeef");
   let calls = 0;
   const app = makeApp({
     lookupHuman: async () => {
@@ -221,11 +256,15 @@ test("an outage is never cached: the next read asks again instead of serving a s
     },
   });
   expect((await get(app)).outcome).toBe("unknown");
-  expect((await get(app)).outcome).toBe("registered");
+  // Asked again rather than serving a stale refusal. `disputed` and not `registered` because this
+  // agent has no vouch of ours behind it (FR-A) — what matters here is that the second read
+  // reached the contract at all.
+  expect((await get(app)).outcome).toBe("disputed");
 });
 
 test("the status route works on a deployment with NO registrar — reading needs no submitter key", async () => {
   repo.upsert(base());
+  vouched("0xdeadbeef");
   const app = makeApp({ lookupHuman: async () => "0xdeadbeef" });
   expect(await get(app)).toMatchObject({ registered: true, outcome: "registered" });
   // …and such a deployment says so, rather than offering a dialog it cannot finish.

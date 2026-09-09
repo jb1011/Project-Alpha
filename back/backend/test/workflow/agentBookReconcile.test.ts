@@ -62,13 +62,19 @@ const registrar = (o: {
   submitterNonce: vi.fn(async () => o.chainNonce ?? 9),
 });
 
-test("nonce moved and lookupHuman equals ours -> confirmed, read at safe", async () => {
+test("nonce moved and lookupHuman equals ours -> confirmed, read at safe, and cached (FR-D)", async () => {
   const row = submitted({ txHash: "0xh" });
   const r = registrar({ nonce: 6n, human: "0xbadf00d", receipt: "success" });
   const out = await reconcileRow(row, { repo, registrar: r, store, now: () => T0 });
   expect(out.status).toBe("confirmed");
   expect(r.getNextNonce).toHaveBeenCalledWith(POCKET, "safe");
   expect(r.lookupHuman).toHaveBeenCalledWith(POCKET, "safe");
+  // The confirming branch writes the lookup cache exactly as the disputed one does. Without it a
+  // `null` cached by the status route on the previous poll outlives the confirmation for its whole
+  // 60-second TTL, and OUR OWN seller gate reads that null and refuses the agent it just vouched
+  // for. Minimal hex, the spelling `lookupHuman` produces and `worldVerifier` keys its allowance
+  // off (the row stores World's zero-padded `0x0badf00d`).
+  expect(store.getCachedLookup(POCKET, T0, 600_000, 60_000)).toEqual({ humanId: "0xbadf00d" });
 });
 
 test("nonce moved and lookupHuman differs -> disputed, and the foreign id is cached", async () => {

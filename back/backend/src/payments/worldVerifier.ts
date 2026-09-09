@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { WorldStore } from "../persistence/worldStore";
 import type { Address } from "../types";
-import { AGENT_BOOK_CAIP2, createAgentBookReader } from "./agentBookReader";
+import { AGENT_BOOK_ADDRESS, AGENT_BOOK_CAIP2, createAgentBookReader } from "./agentBookReader";
 
 /**
  * Seller-side "is this agent backed by a real, unique human?" check.
@@ -25,9 +25,6 @@ const loadAgentkit = () => {
   return agentkitMod;
 };
 
-/** Canonical World Chain deployment — same address our config defaults to. */
-const AGENT_BOOK_DEFAULT = "0xA23aB2712eA7BBa896930544C7d6636a96b944dA";
-
 const CACHE_TTL_MS = 60 * 60_000; // 1h — a registration is stable once made
 /** Deliberately much shorter than the positive TTL: "not registered" is a state the agent is
  *  actively trying to leave, so a stale negative is a bad checkout experience. Long enough to
@@ -38,7 +35,10 @@ const NEGATIVE_CACHE_TTL_MS = 60_000; // 1 min
 function defaultAgentBook(cfg: AgentkitSellerConfig) {
   return createAgentBookReader({
     ...(cfg.worldChainRpc ? { rpcUrl: cfg.worldChainRpc } : {}),
-    contractAddress: (cfg.agentBookAddress ?? AGENT_BOOK_DEFAULT) as Address,
+    // ONE constant for the whole codebase (§4.1): the registrar writes to it, the reader and this
+    // seller check read it. Three hand-copied literals is how a redeployment ends up confirming
+    // every vouch in a registry no seller looks the agent up in.
+    contractAddress: (cfg.agentBookAddress ?? AGENT_BOOK_ADDRESS) as Address,
   });
 }
 

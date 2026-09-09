@@ -21,6 +21,11 @@ accident, and so that no surface ever claims one that did not happen.
 | **Read** | nothing (`WORLD_CHAIN_RPC` and `WORLD_AGENTBOOK_ADDRESS` both have defaults) | `GET /entities/:id/agentbook`, the dashboard chip, the buyer/seller trust dials |
 | **Write** | `WORLDCHAIN_SUBMITTER_PRIVATE_KEY` **and** the existing `WORLD_*` portal block | `POST /entities/:id/agentbook/session` + `…/register`, the "Vouch in AgentBook" button |
 
+> **`WORLD_AGENTBOOK_ADDRESS` moves the BACKEND only.** The browser hard-codes the contract
+> address and the worldscan link behind the dashboard chip, so pointing the backend at a different
+> AgentBook leaves the chip linking to the canonical one. Overriding it is unsupported for anything
+> but a local experiment.
+
 `canRegisterAgentBook(cfg)` (`src/config/env.ts`) is the one definition of the write half: a
 submitter key **and** `cfg.world` (the Orb gate reads `WorldStore`). `main.ts` builds the registrar
 from that predicate, `GET /config.agentBookRegistrationAvailable` reports exactly
@@ -61,10 +66,11 @@ from that predicate, `GET /config.agentBookRegistrationAvailable` reports exactl
 cast balance <submitter-address> --rpc-url https://worldchain-mainnet.g.alchemy.com/public
 ```
 
-- **Log hygiene.** Nothing prints the config today, so no RPC URL reaches journald at boot. If a
-  config dump is ever added, `redact()` already prints both `worldChain.rpcUrl` and
-  `agentBook.rpcUrl` as `REDACTED` — an Alchemy URL carries its API key in the path. `opsLog`
-  events never carry either.
+- **Log hygiene.** Nothing prints the config today. If a config dump is ever added, `redact()`
+  prints `agentBook.rpcUrl` (the WRITE endpoint, which travels with the submitter key) as
+  `REDACTED` and `worldChain.rpcUrl` (the READ endpoint) as its ORIGIN alone — an Alchemy URL
+  carries its API key in the path, so the host is safe to see and is what tells you which endpoint
+  the box resolved to. `opsLog` events never carry either.
 - **Boot confirmation.** With the write half configured, boot prints
   `⚠ AgentBook registration ENABLED at /entities/:id/agentbook/session`, then
   `AgentBook reconcile at boot: N checked, M changed`.
@@ -73,8 +79,10 @@ cast balance <submitter-address> --rpc-url https://worldchain-mainnet.g.alchemy.
 
 ## Deploy order
 
-**1. PR #98 deployed and verified.** The live API still reports waiver guardians as human-verified;
-that must be false before anything writes a personhood claim to a public chain.
+**1. Re-check the waiver claim on the live API.** PR #98 is deployed and verified as of
+2026-09-09: both waiver agents read `humanVerified:false`. This is no longer a blocker, it is a
+pre-deploy re-check — a rollback or a stale build would put the false claim back, and a personhood
+claim written to a public chain is permanent.
 
 ```bash
 curl -s https://api.novicorpus.com/transparency | grep -c '"credential":"waiver"'
@@ -143,7 +151,7 @@ cast call 0xA23aB2712eA7BBa896930544C7d6636a96b944dA "lookupHuman(address)(uint2
 | Response | Meaning | What to do |
 |---|---|---|
 | **403 `not_eligible`** | the guardian's stored credential is not Orb-grade (`orb` / `proof_of_human`); `details.credential` names what it is | nothing to fix on our side. AgentBook accepts nothing else, and we do not fake it |
-| **409 `not_ready`** | `no-pocket-yet` (no payment address stored), `entity-is-<status>` (below `bound`), `no-agent-id-yet` | wait for the agent to finish binding; the button is disabled with the reason anyway |
+| **409 `not_ready`** | `no-pocket-yet` (no payment address stored), `entity-is-<status>` (below `bound`), `no-agent-id-yet` | wait for the agent to finish binding. Only `no-pocket-yet` disables the button (it is the one reason the status route emits); the other two are raised by `POST …/session` and surface in the dialog as a message |
 | **409 `conflict`** | no open session / session expired (5 min) / nonce mismatch / "the registry moved" (someone else vouched between session and submit) / a registration already in flight / session already used | start again; the dialog offers the retry and carries the notice |
 | **429 `limit_exceeded`** | **per entity, lifetime:** 3 rows that reached the chain (`submitted`, `confirmed`, `disputed` — an `expired` or `failed` session costs nothing); **per tenant:** 5 sessions an hour | deliberate (design D13). Not raisable from the runbook — the caps are constants in `main.ts` |
 | **503 `unavailable`** | no submitter key ("not configured on this deployment"); **zero balance** ("registrations are paused", logged `agentbook_submitter_low`); RPC budget exhausted ("AgentBook is busy"); World Chain unreachable ("could not read AgentBook" / "could not submit the registration") | check `/config`, then the balance, then the RPC. Nothing was written in any of these |

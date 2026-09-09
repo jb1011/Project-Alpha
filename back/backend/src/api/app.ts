@@ -241,8 +241,10 @@ export function buildApiApp(deps: ApiDeps) {
       formationCopy: { ssn: SSN_COPY, park: PARK_COPY, reuseDisclosure: COMPANY_REUSE_DISCLOSURE },
       // Whether this deployment can WRITE an AgentBook registration — the REGISTRAR, not the
       // deps object, because the read side is wired everywhere and only the write side needs a
-      // funded submitter key. The vouch dialog is hidden without it: a box with no key could take
-      // the guardian through the whole World App flow and then have nothing to broadcast.
+      // funded submitter key. Without it the dashboard still RENDERS the vouch button, disabled
+      // and carrying the reason — a control that quietly disappears reads as a missing feature,
+      // while a box with no key must not take the guardian through the whole World App flow and
+      // then have nothing to broadcast.
       agentBookRegistrationAvailable: Boolean(deps.agentBook?.registrar),
     }),
   );

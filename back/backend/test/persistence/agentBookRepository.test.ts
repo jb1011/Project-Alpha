@@ -58,7 +58,7 @@ test("the partial unique index allows ONE in-flight submission per entity", () =
 test("a confirmed row coexists with a new submitted row (lifetime count sees both)", () => {
   session({ sessionId: "s1" });
   repo.claimSubmit("s1", { nullifier: "0x1", rawTx: "0x02", submitterNonce: 1 });
-  expect(repo.transition("s1", "submitted", "confirmed", { confirmedBlock: 100 })).toBe(true);
+  expect(repo.transition("s1", "submitted", "confirmed")).toBe(true);
   session({ sessionId: "s2" });
   expect(repo.claimSubmit("s2", { nullifier: "0x1", rawTx: "0x02", submitterNonce: 2 })).toBe(
     "won",
@@ -78,7 +78,7 @@ test("confirming clears the last-attempt error, failing keeps it", () => {
   session({ sessionId: "s1" });
   repo.claimSubmit("s1", { nullifier: "0x1", rawTx: "0x02", submitterNonce: 1 });
   repo.bumpAttempt("s1", "RpcTimeout");
-  expect(repo.transition("s1", "submitted", "confirmed", { confirmedBlock: 100 })).toBe(true);
+  expect(repo.transition("s1", "submitted", "confirmed")).toBe(true);
   expect(repo.findBySession("s1")).toMatchObject({ errorCode: null, attempt: 1 });
 
   session({ sessionId: "s2", entityKey: "agent-2" });
@@ -94,12 +94,30 @@ test("per-tenant session count is windowed", () => {
   expect(repo.countSessionsSince("0xTenant", Date.now() + 1_000)).toBe(0);
 });
 
-test("latestForEntity and listInFlight", () => {
+test("currentForEntity and listInFlight", () => {
   session({ sessionId: "s1" });
   repo.claimSubmit("s1", { nullifier: "0x1", rawTx: "0x02", submitterNonce: 1 });
   repo.setTxHash("s1", "0xhash");
-  expect(repo.latestForEntity("agent-1")).toMatchObject({ sessionId: "s1", txHash: "0xhash" });
+  expect(repo.currentForEntity("agent-1")).toMatchObject({ sessionId: "s1", txHash: "0xhash" });
   expect(repo.listInFlight().map((r) => r.sessionId)).toEqual(["s1"]);
   repo.bumpAttempt("s1", "InvalidProof");
   expect(repo.findBySession("s1")).toMatchObject({ attempt: 1, errorCode: "InvalidProof" });
+});
+
+// §5.2 (altitude F10): a terminal row must never shadow one that is still on its way. A second
+// session opened while the first is in flight expires 5 minutes later and becomes the NEWEST row;
+// serving that would tell the guardian the vouch is not in AgentBook while our transaction is
+// being mined.
+test("currentForEntity prefers the in-flight row over a newer expired one", () => {
+  session({ sessionId: "s1" });
+  repo.claimSubmit("s1", { nullifier: "0x1", rawTx: "0x02", submitterNonce: 1 });
+  session({ sessionId: "s2" });
+  repo.transition("s2", "pending", "expired");
+  expect(repo.currentForEntity("agent-1")).toMatchObject({
+    sessionId: "s1",
+    status: "submitted",
+  });
+  // With nothing in flight it is the newest row again.
+  repo.transition("s1", "submitted", "failed", { errorCode: "replaced" });
+  expect(repo.currentForEntity("agent-1")).toMatchObject({ sessionId: "s2", status: "expired" });
 });

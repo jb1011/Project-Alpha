@@ -793,6 +793,37 @@ Recorded so the next reader trusts the corrections rather than the confident pro
 - Citations drifted: `worldId.ts:365-403` → `415-455`; `env.ts:756` → `815`; `onboarding.ts:489` →
   `479`; `app.ts:172-187` → `172-192`.
 
+### Corrections made during the build (2026-09-09 final review)
+
+Three sentences elsewhere in this document describe something the code deliberately does not do.
+Everything else in §4 and §5 stands as written.
+
+- **`confirmed_block` is DROPPED.** §4.1 says a confirmation "records `confirmed_block`" and §4.4
+  lists the column; nothing ever wrote it and nothing reads it — the surfaces answer with `txHash`.
+  The column, the `confirmedBlock` patch field and the row-type field are gone rather than left as
+  a schema promising a value it never holds. A forensic "when did this land?" is answered from the
+  transaction hash.
+- **A `pending` row is AWAITING APPROVAL, never "submitted".** §5.2's state list has
+  `awaiting-approval` before `submitting`, and `pending` is the first of the two: nothing is signed,
+  broadcast or written while a row is `pending`. Chips and buttons must not say a vouch was
+  submitted over one — an abandoned QR would otherwise claim a permanent public act for the whole
+  5-minute session TTL. Only `submitted` carries the in-flight label. (A `proof_rejected` refusal,
+  which is raised before anything is claimed, now ends the row as `failed` with the error name
+  instead of leaving it `pending` until it expires.)
+- **The `foreign` rule, as implemented** (`src/api/routes/agentBook.ts`), is §3 precondition 5 in
+  code — the earlier draft only asked the question over a `confirmed` row, which let a stranger's
+  vouch read as `registered` and lock the guardian out (the §8 HIGH-2 lock-out):
+
+  ```ts
+  const ours = row != null && row.nullifier != null && sameHuman(humanId ?? null, row.nullifier);
+  const foreign = humanId != null && !ours;
+  const disputed = row?.status === "disputed" || foreign;
+  ```
+
+  So: a non-null lookup with no row of ours behind it is `disputed`, not `registered`; and a
+  `failed` or `expired` row whose nullifier the registry now holds is `registered` — the registry
+  outranks our own record of the attempt.
+
 ## 12. Traceability (audit finding → section)
 
 | Audit finding | Section |
