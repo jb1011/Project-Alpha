@@ -843,3 +843,52 @@ test("a settle that lands on an ALREADY-PAID company trips the detector on the s
     lines.map((l) => JSON.parse(l)).find((l) => l.opslog === "formation_payment_duplicate"),
   ).toMatchObject({ severity: "CRITICAL", paidRows: 2 });
 });
+
+// ── EVERY EXIT IS ACCOUNTED FOR (B1 gate, finding B1) ───────────────────────────────────────
+//
+// The resume leg runs on a timer against a row nobody is watching. An exit that leaves the row
+// EXACTLY as it found it — same status, same attempt — is an invisible loop: the sweeper asks the
+// same question of the same chain every tick, forever, and the backoff never engages because
+// nothing marks that a pass happened. So every non-terminal exit burns an attempt.
+
+test("EXIT: spent nonce, no visible log → pending, and the attempt is burned", async () => {
+  const c = company();
+  const id = quoteFor(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  const row = payments.find(id)!;
+  const chain = fakeChain({ spent: new Set([row.nonce.toLowerCase()]) });
+  expect(await advancePaymentOnChain(deps(chain.executor), c, row)).toBe("pending");
+  expect(payments.find(id)).toMatchObject({ status: "settling", attempt: 1 });
+});
+
+test("EXIT: a settling row with NO signature → pending, and the attempt is burned", async () => {
+  // Impossible by construction (`markSettling` writes the signature in the same statement), which
+  // is exactly why it must not be the exit that spins silently if it ever happens.
+  const c = company();
+  const id = quoteFor(c);
+  db.prepare("UPDATE formation_payments SET status = 'settling' WHERE payment_id = ?").run(id);
+  const chain = fakeChain({ receipt: "timeout" });
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("pending");
+  expect(payments.find(id)).toMatchObject({ status: "settling", attempt: 1 });
+});
+
+test("EXIT: a re-broadcast whose outcome is unknown → pending, and the attempt is burned", async () => {
+  const c = company();
+  const id = quoteFor(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: await sign(c) });
+  const chain = fakeChain({ receipt: "timeout" });
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("pending");
+  expect(payments.find(id)).toMatchObject({ status: "settling", attempt: 1 });
+});
+
+test("EXIT: the expiry check is REACHABLE past every earlier branch", async () => {
+  // It sits behind the log verdict and the spent-nonce guard, and both of those return early. A
+  // row that is genuinely dead has to be able to get through them: unknown logs, unused nonce,
+  // chain clock past the window plus the margin.
+  const c = company();
+  const id = quoteFor(c, nowSec - 1000);
+  payments.markSettling(id, { payerAddress: TENANT, signature: await sign(c) });
+  const chain = fakeChain({ receipt: "timeout" });
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("expired");
+  expect(payments.find(id)?.status).toBe("expired");
+});
