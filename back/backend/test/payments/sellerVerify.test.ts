@@ -154,14 +154,26 @@ test("NEW: an authorization that is NOT YET VALID is refused as such", async () 
   // It would revert on-chain, and answering "verified" for one is a promise the executor cannot
   // keep. Before the shared verifier this check did not exist on this rail at all.
   const future = String(Math.floor(Date.now() / 1000) + 3600);
-  expect(await refusal(await tampered((a) => (a.validAfter = future)))).toBe("not-yet-valid");
+  expect(
+    await refusal(
+      await tampered((a) => {
+        a.validAfter = future;
+      }),
+    ),
+  ).toBe("not-yet-valid");
 });
 
 test("UNCHANGED: under-priced, expired and forged still refuse by their own names", async () => {
   expect(await refusal(await makeHeader(1n))).toBe("underpriced");
 
   const past = String(Math.floor(Date.now() / 1000) - 3600);
-  expect(await refusal(await tampered((a) => (a.validBefore = past)))).toBe("expired");
+  expect(
+    await refusal(
+      await tampered((a) => {
+        a.validBefore = past;
+      }),
+    ),
+  ).toBe("expired");
 
   const env = decodeX402Header(await makeHeader(50n));
   env.payload.signature = `0x${"11".repeat(65)}`;

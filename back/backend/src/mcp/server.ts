@@ -222,12 +222,12 @@ function formationPaymentNote(deps: Pick<McpToolDeps, "formation">): string {
   const payment = deps.formation?.payment;
   if (!payment?.required)
     return "Formation is included on this deployment: no fee is charged and the company is ready to file immediately.";
-  return (
-    `⚠ THIS DEPLOYMENT CHARGES A FORMATION FEE of $${payment.feeUsdc} USDC per company.` +
-    " The company lands in `draft` and the answer carries a QUOTE (amount, payee, nonce, expiry and the exact EIP-712 message to sign)." +
-    " It cannot be filed until that quote is settled, and it can only be settled by the GUARDIAN's own wallet — we cannot sign it for them, because it authorizes a transfer of their USDC." +
-    " Four tools finish the job: get_company_payment (re-read the quote, or find out what happened), submit_company_payment (their signature), cancel_company_payment (withdraw a stuck one — a second signature) and requote_company_payment (a fresh quote once nothing is live)."
-  );
+  return [
+    `⚠ THIS DEPLOYMENT CHARGES A FORMATION FEE of $${payment.feeUsdc} USDC per company.`,
+    "The company lands in `draft` and the answer carries a QUOTE (amount, payee, nonce, expiry and the exact EIP-712 message to sign).",
+    "It cannot be filed until that quote is settled, and it can only be settled by the GUARDIAN's own wallet — we cannot sign it for them, because it authorizes a transfer of their USDC.",
+    "Four tools finish the job: get_company_payment (re-read the quote, or find out what happened), submit_company_payment (their signature), cancel_company_payment (withdraw a stuck one — a second signature) and requote_company_payment (a fresh quote once nothing is live).",
+  ].join(" ");
 }
 
 /** Formation availability sentence for the onboard_agent / create_formation_party descriptions. */
