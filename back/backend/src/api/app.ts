@@ -138,6 +138,26 @@ export interface ApiDeps extends EntityViewDeps {
      * per call site, because that is the only thing that legitimately differs.
      */
     companyDeps: Omit<import("../formation/company").CreateCompanyDeps, "transaction">;
+    /**
+     * FORMATION PAYMENTS (§6), present on every deployment that CAN quote — `required` inside it
+     * is the switch, and it is false during the beta.
+     *
+     * It carries the payment repository, the fee, the Ledger revenue address and the USDC domain
+     * READ AND PINNED at boot, so the quote route, the settle route and the sweeper all build the
+     * same message from the same four facts. Optional so every existing test wiring builds
+     * unchanged; absent reads as "this box does not charge", which is what the whole beta is.
+     */
+    payment?: import("../formation/payment").FormationPaymentConfig;
+    /**
+     * The fee in whole USDC, served on `/config` WHETHER OR NOT this deployment charges.
+     *
+     * Separate from `payment` above, and that separation is the point: during the beta `payment`
+     * is absent (nothing quotes, no domain is read, no revenue address is needed) but the wizard
+     * still says "included during the beta, normally $399" — and that number has to come from the
+     * box that would charge it, not from the browser bundle, or the sentence on screen drifts
+     * from the price the backend would actually quote.
+     */
+    feeUsdc: number;
   };
 
   /**
@@ -224,6 +244,22 @@ export function buildApiApp(deps: ApiDeps) {
       // legal-body phase is a step or an option. (It said "without a partyId" until A3 removed
       // the shim; the FLAG is unchanged, what satisfies it is now a company handle.)
       formationRequired: Boolean(deps.formation?.required),
+      /**
+       * PAYMENTS (§6.8) — the second deliberate departure from this route's booleans-only rule,
+       * and the same one `formationCopy` makes: public PRICING.
+       *
+       * The wizard needs both before auth: `formationPaymentRequired` decides whether the payment
+       * step exists at all, and `formationFeeUsdc` is the number in the beta sentence
+       * ("included during the beta, normally $399") on every deployment where it is FALSE. A fee
+       * bundled into the browser build would drift from the fee the backend actually quotes,
+       * silently, which is the same failure `formationCopy` exists to prevent.
+       *
+       * ⚠ The REVENUE ADDRESS stays off this route. It is not secret, but this document is public
+       * and unauthenticated, and the payee belongs on the QUOTE — which is authenticated, and
+       * carries it as `payTo` beside the exact amount and nonce it is bound to.
+       */
+      formationPaymentRequired: Boolean(deps.formation?.payment?.required),
+      formationFeeUsdc: deps.formation?.feeUsdc ?? null,
       /**
        * PRODUCT COPY the wizard and the Companies section render verbatim (§7) — a deliberate
        * departure from this route's booleans-only rule, and the same one §6.7 makes for the fee.

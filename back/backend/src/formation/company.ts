@@ -47,6 +47,7 @@ import {
   stripEntityEnding,
 } from "./intake";
 import { isKnownIndustryLabel } from "./naicsLabels";
+import { guardianOf, insertQuote, quoteOf } from "./payment";
 import { type PiiKeyring, encryptSsn, isWellFormedSsn } from "./pii";
 import { eraseSsnLogged } from "./ssnErasure";
 import { findRestrictedWord } from "./wyRestrictedWords";
@@ -106,6 +107,16 @@ export interface CreateCompanyDeps {
   /** The World gate. Absent (or unwired) = no personhood check, exactly as on every other door —
    *  which is why production formation has a BOOT invariant that this is constructed. */
   world?: import("../api/routes/worldId").WorldIdDeps;
+  /**
+   * FORMATION PAYMENTS (§6.1). Present on every deployment that can quote; `required` inside it
+   * is the switch.
+   *
+   * It is one object rather than a scattering of knobs because the quote is written in the SAME
+   * TRANSACTION as the company (below), and a half-configured payment would mean a company that
+   * lands `draft` with nothing to leave it by — permanently unfileable, and counted against its
+   * tenant's quota forever.
+   */
+  payment?: import("./payment").FormationPaymentConfig;
   now?: () => number;
 }
 
@@ -150,7 +161,17 @@ export interface CompanyIntakeInput {
   synthetic?: boolean;
 }
 
-export type CreateCompanyResult = { companyId: string } | { error: string };
+/**
+ * What a door gets back.
+ *
+ * `quote` is present exactly when payment is on: the company then lands `draft` and owes the fee,
+ * and the caller needs the typed data to put in front of the guardian's wallet. With payment off
+ * the field does not exist at all rather than being null — an optional that is always absent is
+ * the shape a reader mistakes for a live capability (A3's own `/config` finding).
+ */
+export type CreateCompanyResult =
+  | { companyId: string; quote?: import("./payment").FormationQuote }
+  | { error: string };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -240,11 +261,20 @@ export function createCompany(
   //    losing the CAS — another request took this party between step 3 and here — rolls all
   //    three back, and an SSN can never outlive the company row it was sealed against.
   //
-  //    A1 lands `ready` unconditionally, because payment is off: a `draft` company would owe a
-  //    payment step that does not exist yet and would never be filed. B1 is what makes `draft`
-  //    reachable, together with the quote that leaves it.
-  const status: CompanyStatus = "ready";
+  //    ⚠ AND, with payment ON, the QUOTE (§6.1). The company lands `draft` and the `quoted` row
+  //    that is its only way out is written in the SAME transaction — because the alternative,
+  //    inserting the quote afterwards, has a crash window in which a company exists in `draft`
+  //    owing a fee nothing can ever ask for: unfileable, unpayable, and counted against its
+  //    tenant's quota forever (`countChargeableByTenant` counts drafts with a live payment, and
+  //    this one would have none). The live-rows unique index makes a second live quote a
+  //    constraint violation rather than a race this code has to reason about.
+  //
+  //    With payment OFF the status is `ready` exactly as A1 wrote it and no payment row is ever
+  //    touched: `hasLivePayment` keeps answering false, and every surface behaves as it does today.
+  const paying = deps.payment?.required === true;
+  const status: CompanyStatus = paying ? "draft" : "ready";
   let companyId: string;
+  let paymentId: string | undefined;
   try {
     companyId = deps.transaction(() => {
       const id = deps.companies.create({
@@ -274,6 +304,9 @@ export function createCompany(
         if (!deps.parties.storeSsn(intake.partyId, id, encryptSsn(sealed.pii, sealed.ssn, bind)))
           throw new PartyBindLost();
       }
+      // The quote, last and inside: a company that is `draft` because it owes a fee, and the row
+      // that says what the fee is, are one fact.
+      if (paying && deps.payment) paymentId = insertQuote(deps.payment, id, now());
       return id;
     });
   } catch (e) {
@@ -307,6 +340,30 @@ export function createCompany(
   // No tenant in the fields: this limit is not about one, and naming the tenant that happened to
   // trip it would read as blame for a platform-wide condition.
   warnIfNearLimit("formation_ceiling_warning", inWindow + 1, deps.dailyCeiling, {});
+
+  if (paying && deps.payment && paymentId) {
+    const payment = deps.payment.payments.find(paymentId);
+    // Defensive rather than expected: the row was inserted in the transaction that just
+    // committed. Reading it back rather than reconstructing the quote from what we passed in is
+    // the anti-drift rule of §6.1 — the quote a caller signs is built from THE ROW, always, so
+    // the settle route and this door cannot disagree about what was promised.
+    if (payment) {
+      // The amount and the payer, never the nonce: a nonce is not a secret, but an ops line is
+      // read by people reconciling a Ledger statement, and the two numbers that matter there are
+      // how much and for which company.
+      opsLog("formation_payment_quoted", {
+        companyId,
+        paymentId,
+        product: payment.product,
+        amountUsdc: payment.amountUsdc.toString(),
+        validBefore: payment.validBefore,
+      });
+      return {
+        companyId,
+        quote: quoteOf(payment, guardianOf({ tenantId }), deps.payment),
+      };
+    }
+  }
   return { companyId };
 }
 

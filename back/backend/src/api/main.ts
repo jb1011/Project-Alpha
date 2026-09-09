@@ -15,6 +15,7 @@ import {
   platformManagerAddress as platformManagerAddressOf,
   publicClientFor,
 } from "../adapters/arc/clients";
+import { readUsdcDomain } from "../adapters/arc/usdcToken";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
 import {
   activateCircleSca,
@@ -61,6 +62,7 @@ import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteDoolaEventRepository } from "../persistence/doolaEventRepository";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../persistence/formationPartyRepository";
+import { SqliteFormationPaymentRepository } from "../persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../persistence/formationRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
@@ -127,6 +129,11 @@ async function main() {
   // a box that has lost its doola block must still describe (and serve documents for) the filings
   // it already made.
   const companies = new SqliteCompanyRepository(db);
+  // Same db handle, and for the sharpest version of the reason: the `quoted` row is inserted in
+  // the SAME TRANSACTION as the company it belongs to (§6.1), so a second handle would make that
+  // impossible to express. Always constructed, like `companies` and for the same reason — a box
+  // that stops charging must still be able to read the payments it already took.
+  const formationPayments = new SqliteFormationPaymentRepository(db);
   // Same db handle again: a stored document's index row and the step it confirms have to commit
   // against the same database, and the webhook ledger is the sweeper's work queue.
   const formationDocuments = new SqliteDocumentIndexRepository(db);
@@ -364,6 +371,35 @@ async function main() {
    * one domain function exists to prevent. Only `transaction` differs per call site: the shim
    * already runs inside the claim's transaction, the two doors open their own.
    */
+  /**
+   * FORMATION PAYMENTS (§6.1) — assembled ONCE, and only where this deployment charges.
+   *
+   * The USDC EIP-712 domain is READ FROM THE CHAIN HERE, at boot, and pinned against the token's
+   * own `DOMAIN_SEPARATOR()` (`readUsdcDomain` throws otherwise). Once, because it is four
+   * constants about somebody else's predeploy: reading it per quote would put a chain round trip
+   * — and a way to fail — on the hot path of every company creation, and hardcoding it would
+   * produce signatures that revert only after a guardian has approved them.
+   *
+   * A box that cannot read the token therefore does not boot. That is the right direction: the
+   * alternative is booting a deployment that will quote a price for a signature it cannot settle.
+   */
+  const formationPayment = formationCfg.payment.required
+    ? {
+        required: true,
+        feeAtomic: formationCfg.payment.feeAtomic,
+        feeUsdc: formationCfg.payment.feeUsdc,
+        // Non-null by the boot invariant in env.ts: payment required ⇒ a revenue address is set.
+        revenueAddress: formationCfg.payment.revenueAddress as Address,
+        quoteTtlMs: formationCfg.payment.quoteTtlMs,
+        domain: await readUsdcDomain(publicClient, cfg.usdc, cfg.chainId),
+        payments: formationPayments,
+      }
+    : undefined;
+  if (formationPayment)
+    console.warn(
+      `⚠ FORMATION PAYMENTS ENABLED: $${formationPayment.feeUsdc} USDC to ${formationPayment.revenueAddress} (USDC domain "${formationPayment.domain.name}" v${formationPayment.domain.version}, pinned on-chain)`,
+    );
+
   const companyDeps = formationDeployment
     ? {
         companies,
@@ -377,6 +413,9 @@ async function main() {
         // invariant — and its absence makes the door REFUSE the field, never store it in clear.
         pii: formationCfg.pii,
         world: worldId,
+        // With payment on, `createCompany` lands the company `draft` and writes its quote in the
+        // same transaction. Absent = the beta shape, where every company lands `ready`.
+        payment: formationPayment,
       }
     : undefined;
 
@@ -626,6 +665,12 @@ async function main() {
             compliance: doolaApi,
             // The same object the shim uses; the doors add only their own transaction.
             companyDeps,
+            // …and the payment config the quote/settle/cancel routes read. The SAME object
+            // `companyDeps` carries, so the door that quotes and the door that settles can never
+            // disagree about the fee, the payee or the domain.
+            payment: formationPayment,
+            // …and the fee ITSELF, whether or not this box charges: the beta sentence quotes it.
+            feeUsdc: formationCfg.payment.feeUsdc,
           }
         : undefined,
     // The view dependencies, as ONE object shared with the MCP surface below (C8).

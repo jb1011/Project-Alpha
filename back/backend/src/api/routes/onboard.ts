@@ -12,6 +12,7 @@ import {
   truncateTenant,
 } from "../../formation";
 import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../formation/company";
+import { FORMATION_PRODUCT, guardianOf, paymentView } from "../../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
 import {
@@ -149,9 +150,44 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       },
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);
-    // The companyId and nothing else. Echoing the intake back would put the SSN in a response
-    // body, in any client that persists responses, and in any proxy log along the way.
-    return c.json({ companyId: result.companyId }, 201);
+    // The companyId and — when payment is on — the QUOTE (§6.1). Never the intake: echoing it
+    // back would put the SSN in a response body, in any client that persists responses, and in
+    // any proxy log along the way. A quote is the opposite kind of thing: an amount, a payee, a
+    // nonce and an expiry, all of which the guardian is about to publish by signing them.
+    return c.json(
+      result.quote
+        ? { companyId: result.companyId, payment: result.quote }
+        : { companyId: result.companyId },
+      201,
+    );
+  });
+
+  /**
+   * `GET /companies/:companyId/payment` — what this company owes, and what happened to it (§6.1).
+   *
+   * ONE route for both questions, because a guardian who reloads the page mid-payment has to be
+   * able to ask either. It answers with the LIVE row if there is one and otherwise the most
+   * recent terminal one, so "your payment settled" is expressible — a route that only answered
+   * "what do you owe?" would tell somebody whose payment had just gone through that they had no
+   * payment at all.
+   *
+   * The signable `typedData` rides along ONLY while the row is `quoted` AND still inside its
+   * window. Not on `settling`: re-signing a payment whose broadcast is in flight is exactly the
+   * double charge §6.4 exists to prevent, and a client that could see a quote would render the
+   * button.
+   *
+   * 404 for a deployment that does not charge, deliberately — the same answer as for a company
+   * that does not exist. There is no payment resource here, and inventing an empty one would have
+   * every client render a payment section on a box that never takes money.
+   */
+  app.get("/companies/:companyId/payment", (c) => {
+    const company = requireOwnedCompany(deps, c);
+    const payment = deps.formation?.payment;
+    if (!payment?.required) throw new ApiError("not_found", 404, "payment not found");
+    const row = payment.payments.findCurrent(company.companyId, FORMATION_PRODUCT);
+    if (!row) throw new ApiError("not_found", 404, "payment not found");
+    const now = Math.floor((deps.now ? deps.now() : Date.now()) / 1000);
+    return c.json(paymentView(row, guardianOf(company), payment, now));
   });
 
   /**

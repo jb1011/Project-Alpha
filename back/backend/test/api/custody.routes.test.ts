@@ -58,6 +58,12 @@ const FORMATION_OFF = {
   formationAvailable: false,
   formationEnvironment: null,
   formationRequired: false,
+  // B1 (§6.8): the two PRICING fields, present on every deployment because the wizard branches on
+  // the first before auth and renders the second in the beta sentence. A box that forms nothing
+  // charges nothing, and `formationFeeUsdc` is null there rather than 399 — quoting a price on a
+  // deployment that cannot form a company would be a claim it cannot keep.
+  formationPaymentRequired: false,
+  formationFeeUsdc: null,
   formationCopy: FORMATION_COPY,
 };
 
@@ -272,6 +278,12 @@ test("GET /config reports formation availability and its ENVIRONMENT (honesty in
     formationAvailable: true,
     formationEnvironment: "sandbox",
     formationRequired: false,
+    // B1: a formation deployment that does not charge. The fee is still served — it is the
+    // number in "included during the beta, normally $399".
+    formationPaymentRequired: false,
+    // Null HERE because this fixture's formation block predates `feeUsdc`; a real deployment that
+    // forms always serves the number, which is what the beta sentence quotes.
+    formationFeeUsdc: null,
     formationCopy: FORMATION_COPY,
     ...AGENTBOOK_OFF,
   });
