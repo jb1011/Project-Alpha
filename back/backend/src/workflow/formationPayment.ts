@@ -12,6 +12,7 @@ import { opsLog } from "../observability/opsLog";
 import {
   type BroadcastOutcome,
   type FormationExecutorDeps,
+  ROUTE_RECEIPT_TIMEOUT_MS,
   authorizationUsed,
   chainTimeSec,
   submitCancelAuthorization,
@@ -65,6 +66,45 @@ export type SettleResult =
    *  produced one. */
   | { ok: true; status: "pending"; txHash?: Hex }
   | { ok: false; reason: string };
+
+/**
+ * THE ACTION DOORS' DEPENDENCIES, BUILT ONCE (finding C4).
+ *
+ * REST and MCP each assembled this object for themselves — the same six fields, the same
+ * `transaction` closure, the same receipt timeout, and (in both) a `company` field that
+ * `FormationPaymentDeps` has never had and nothing has ever read. Two copies of a money path's
+ * wiring is two places for one of them to be given the wrong clock, the wrong transaction or the
+ * sweeper's timeout instead of the request path's.
+ *
+ * Returns `undefined` where this deployment does not take payments, which each door turns into
+ * its own kind of refusal: a 404 on REST, an `isError` on MCP.
+ */
+export function formationPaymentDeps(deps: {
+  companies?: CompanyRepository;
+  repo: EntityRepository & { transaction: <T>(fn: () => T) => T };
+  formation?: {
+    payment?: FormationPaymentConfig;
+    paymentExecutor?: FormationExecutorDeps;
+  };
+  now?: () => number;
+}): FormationPaymentDeps | undefined {
+  const payment = deps.formation?.payment;
+  const executor = deps.formation?.paymentExecutor;
+  if (!payment?.required || !executor || !deps.companies) return undefined;
+  return {
+    companies: deps.companies,
+    // The entity store, so a duplicate charge reaches the AUDIT TRAIL of every agent attached to
+    // the company and not only the ops log (gate A5).
+    entities: deps.repo,
+    payment,
+    // The REQUEST PATH's receipt wait (finding B3): 12 seconds, because a `pending` answer is
+    // complete — the client polls this company's payment every 4 seconds and the sweeper is the
+    // backstop — and holding a connection open for a minute only makes it feel broken.
+    executor: { ...executor, receiptTimeoutMs: ROUTE_RECEIPT_TIMEOUT_MS },
+    transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
+    now: deps.now,
+  };
+}
 
 const nowMs = (deps: FormationPaymentDeps) => (deps.now ?? Date.now)();
 const nowSec = (deps: FormationPaymentDeps) => Math.floor(nowMs(deps) / 1000);

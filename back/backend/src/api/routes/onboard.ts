@@ -15,7 +15,6 @@ import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../fo
 import { FORMATION_PRODUCT, guardianOf, paymentView } from "../../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
-import { ROUTE_RECEIPT_TIMEOUT_MS } from "../../payments/formationSettle";
 import { withKeyedLock } from "../../payments/keyedMutex";
 import {
   AgentSpecSchema,
@@ -26,6 +25,7 @@ import {
 } from "../../policy/agentSpec";
 import {
   cancelFormationPayment,
+  formationPaymentDeps,
   requoteFormationPayment,
   settleFormationPayment,
 } from "../../workflow/formationPayment";
@@ -210,24 +210,10 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    * makes "at most one broadcast per quote" true under a double-clicked button, on top of the
    * database CAS that makes it true under two processes.
    */
-  const paymentRunner = (company: import("../../persistence/companyRepository").CompanyRecord) => {
-    const payment = deps.formation?.payment;
-    const executor = deps.formation?.paymentExecutor;
-    if (!payment?.required || !executor) throw new ApiError("not_found", 404, "payment not found");
-    return {
-      companies: deps.companies!,
-      // The entity store, so a duplicate charge reaches the AUDIT TRAIL of every agent attached
-      // to the company and not only the ops log (gate A5).
-      entities: deps.repo,
-      payment,
-      // …and the REQUEST PATH's receipt wait (finding B3): 12 seconds, because a `pending` answer
-      // is complete — the client polls this company's payment every 4 seconds and the sweeper is
-      // the backstop — and holding a connection open for a minute only makes it feel broken.
-      executor: { ...executor, receiptTimeoutMs: ROUTE_RECEIPT_TIMEOUT_MS },
-      transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
-      now: deps.now,
-      company,
-    };
+  const paymentRunner = () => {
+    const runner = formationPaymentDeps(deps);
+    if (!runner) throw new ApiError("not_found", 404, "payment not found");
+    return runner;
   };
 
   /**
@@ -240,7 +226,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    */
   app.post("/companies/:companyId/payment/settle", async (c) => {
     const company = requireOwnedCompany(deps, c);
-    const runner = paymentRunner(company);
+    const runner = paymentRunner();
     const body = await readJson(c);
     const { signature, from } = (body ?? {}) as { signature?: unknown; from?: unknown };
     if (typeof signature !== "string" || !signature.startsWith("0x"))
@@ -266,7 +252,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    */
   app.post("/companies/:companyId/payment/cancel", async (c) => {
     const company = requireOwnedCompany(deps, c);
-    const runner = paymentRunner(company);
+    const runner = paymentRunner();
     const { signature } = ((await readJson(c)) ?? {}) as { signature?: unknown };
     if (typeof signature !== "string" || !signature.startsWith("0x"))
       throw new ApiError("validation_error", 400, "signature is required");
@@ -288,7 +274,7 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
    */
   app.post("/companies/:companyId/payment/requote", (c) => {
     const company = requireOwnedCompany(deps, c);
-    const runner = paymentRunner(company);
+    const runner = paymentRunner();
     const result = requoteFormationPayment(runner, company);
     if (!result.ok) throw new ApiError("validation_error", 400, result.reason);
     return c.json(result.quote, 201);

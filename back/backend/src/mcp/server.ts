@@ -29,7 +29,6 @@ import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
-import { ROUTE_RECEIPT_TIMEOUT_MS } from "../payments/formationSettle";
 import { withKeyedLock } from "../payments/keyedMutex";
 import type { PocketFundingFn } from "../payments/pocketFunding";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
@@ -39,6 +38,7 @@ import { AgentSpecSchema, FormationPartySchema } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import {
   cancelFormationPayment,
+  formationPaymentDeps,
   requoteFormationPayment,
   settleFormationPayment,
 } from "../workflow/formationPayment";
@@ -965,22 +965,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
    * `create_company`'s answer says so and `submit_company_payment` takes the signature as an
    * argument rather than pretending to obtain one.
    */
-  const paymentRunner = (company: import("../persistence/companyRepository").CompanyRecord) => {
-    const payment = deps.formation?.payment;
-    const executor = deps.formation?.paymentExecutor;
-    if (!payment?.required || !executor || !deps.companies) return undefined;
-    return {
-      companies: deps.companies,
-      entities: deps.repo,
-      payment,
-      // The request path's wait (finding B3), same as REST: an MCP client is a caller waiting on
-      // a tool result, and `pending` + "poll get_company_payment" is the honest answer.
-      executor: { ...executor, receiptTimeoutMs: ROUTE_RECEIPT_TIMEOUT_MS },
-      transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
-      now: deps.now,
-      company,
-    };
-  };
+  const paymentRunner = () => formationPaymentDeps(deps);
 
   /** Own the company, on the same terms `get_company` does — and narrow an entity-scoped key to
    *  the one company its agent is filed under. One helper, three tools. */
@@ -1037,7 +1022,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         if (denied) return denied;
         const company = ownedCompany(companyId);
         if (!company) return refuse("company not found");
-        const runner = paymentRunner(company);
+        const runner = paymentRunner();
         if (!runner) return refuse("this deployment does not take formation payments");
         const result = await withKeyedLock(`payment:${company.companyId}`, () =>
           settleFormationPayment(runner, company, {
@@ -1070,7 +1055,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         if (denied) return denied;
         const company = ownedCompany(companyId);
         if (!company) return refuse("company not found");
-        const runner = paymentRunner(company);
+        const runner = paymentRunner();
         if (!runner) return refuse("this deployment does not take formation payments");
         // The keyed lock, as on the other two: a re-quote races a settle for the same company,
         // and the live-rows index is the backstop rather than the first line.
@@ -1095,7 +1080,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         if (denied) return denied;
         const company = ownedCompany(companyId);
         if (!company) return refuse("company not found");
-        const runner = paymentRunner(company);
+        const runner = paymentRunner();
         if (!runner) return refuse("this deployment does not take formation payments");
         const result = await withKeyedLock(`payment:${company.companyId}`, () =>
           cancelFormationPayment(runner, company, { signature: signature as `0x${string}` }),
