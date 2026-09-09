@@ -121,6 +121,31 @@ export function PaymentStep({ eyebrow, companyId, onBack, onComplete }: Props) {
     }
   }
 
+  // ⚠ NO COMPANY, NO FEE (finding B5). `visiblePhases` does not show this step without a company
+  // handle, so this branch should be unreachable — which is exactly why it must not be a dead
+  // end if the list and the session ever disagree (a restored session, a `/config` that arrives
+  // late, a skipped legal-body step). A screen with no company has nothing to quote, nothing to
+  // sign and no endpoint that would answer; it says so and lets the user carry on.
+  if (!companyId)
+    return (
+      <div>
+        <StepHeader
+          eyebrow={eyebrow}
+          title="No formation fee to pay"
+          intro="This step is for a company's formation fee, and this agent has no company yet."
+        />
+        <Card>
+          <p className="text-sm">
+            You skipped the legal body, or it has not been created yet — so there is nothing owed
+            and nothing to sign. You can add a company later from the Companies section.
+          </p>
+        </Card>
+        <StepNav onBack={onBack}>
+          <Button onClick={onComplete}>Continue</Button>
+        </StepNav>
+      </div>
+    );
+
   return (
     <div>
       <StepHeader

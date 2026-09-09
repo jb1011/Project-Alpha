@@ -144,13 +144,23 @@ export const PHASES: PhaseMeta[] = [
  * payment step whose every endpoint would 404 is worse than no step at all. It is also
  * subordinate — a deployment that forms nothing cannot charge for a formation, so the payment
  * phase is dropped whenever the legal-body one is, whatever the flag says.
+ *
+ * ⚠ AND IT NEEDS A COMPANY (finding B5). `hasCompany` is the third input because a fee is owed BY
+ * SOMETHING: with `FORMATION_REQUIRED=false` a user may SKIP the legal-body step entirely, and
+ * the payment phase then has no company to quote for, no endpoint that would answer, and no exit.
+ * The step exists from the moment `POST /companies` returns a handle and not before — which is
+ * also the moment the debt exists.
  */
-export function visiblePhases(formationAvailable: boolean, paymentRequired = false): PhaseMeta[] {
+export function visiblePhases(
+  formationAvailable: boolean,
+  paymentRequired = false,
+  hasCompany = false,
+): PhaseMeta[] {
   const hidden = new Set<Phase>();
   if (!formationAvailable) {
     hidden.add("legal-body");
     hidden.add("payment");
-  } else if (!paymentRequired) {
+  } else if (!paymentRequired || !hasCompany) {
     hidden.add("payment");
   }
   return hidden.size === 0 ? PHASES : PHASES.filter((p) => !hidden.has(p.id));

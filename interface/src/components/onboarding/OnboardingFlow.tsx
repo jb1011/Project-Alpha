@@ -128,9 +128,13 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   // `true` hides it — a backend that predates the field does not charge, and a payment step whose
   // every endpoint would 404 is worse than no step.
   const paymentRequired = publicConfig?.formationPaymentRequired === true;
+  // …and only once there is a COMPANY to owe it (finding B5). With formation optional a user can
+  // skip the legal-body step, and a payment phase behind that skip has nothing to quote for and
+  // no way out. The step appears the moment `POST /companies` returns a handle — which is the
+  // moment the fee is actually owed.
   const phases = useMemo(
-    () => visiblePhases(formationAvailable, paymentRequired),
-    [formationAvailable, paymentRequired],
+    () => visiblePhases(formationAvailable, paymentRequired, session.companyId !== null),
+    [formationAvailable, paymentRequired, session.companyId],
   );
 
   /**

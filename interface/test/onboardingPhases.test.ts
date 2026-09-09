@@ -73,17 +73,28 @@ test("B1: the payment step is absent during the beta, on every deployment", () =
 });
 
 test("B1: it appears between the legal body and custody where the deployment charges", () => {
-  const charging = visiblePhases(true, true);
+  const charging = visiblePhases(true, true, true);
   expect(nextPhase(charging, "legal-body")).toBe("payment");
   expect(nextPhase(charging, "payment")).toBe("custody");
   expect(prevPhase(charging, "custody")).toBe("payment");
 });
 
+test("⚠ B5: with NO COMPANY there is no fee step — the skip must not land on one", () => {
+  // With formation optional a user can skip the legal body entirely. A payment phase behind that
+  // skip has no company to quote for, no endpoint that would answer and no exit: the wizard
+  // would carry them into a dead end on a deployment that charges.
+  const skipped = visiblePhases(true, true, false);
+  expect(skipped.map((p) => p.id)).not.toContain("payment");
+  expect(nextPhase(skipped, "legal-body")).toBe("custody");
+  // …and the moment a company exists, the step is there.
+  expect(nextPhase(visiblePhases(true, true, true), "legal-body")).toBe("payment");
+});
+
 test("B1: a deployment that forms NOTHING cannot charge for a formation", () => {
   // Subordinate, not independent: the payment phase goes wherever the legal-body one does,
   // whatever the flag says. A box that cannot form a company has nothing to take money for.
-  expect(visiblePhases(false, true).map((p) => p.id)).not.toContain("payment");
-  expect(visiblePhases(false, true).map((p) => p.id)).not.toContain("legal-body");
+  expect(visiblePhases(false, true, true).map((p) => p.id)).not.toContain("payment");
+  expect(visiblePhases(false, true, true).map((p) => p.id)).not.toContain("legal-body");
 });
 
 test("B1: a session stranded on `payment` after the flag goes off snaps FORWARD to custody", () => {
