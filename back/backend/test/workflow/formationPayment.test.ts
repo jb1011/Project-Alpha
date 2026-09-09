@@ -9,7 +9,7 @@
 import type DatabaseType from "better-sqlite3";
 import { keccak256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test } from "vitest";
 import { CANCEL_AUTHORIZATION_TYPES } from "../../src/adapters/arc/usdcToken";
 import type { FormationPaymentConfig } from "../../src/formation/payment";
 import type { FormationExecutorDeps } from "../../src/payments/formationSettle";
@@ -201,13 +201,15 @@ test("the RAW TX is persisted BEFORE it is broadcast (§6.4)", async () => {
   const chain = fakeChain();
   let rowAtSend: { status: string; rawTx: string | null } | undefined;
   const send = chain.executor.publicClient.sendRawTransaction;
-  vi.spyOn(chain.executor.publicClient, "sendRawTransaction").mockImplementation(
-    async (args: never) => {
-      const row = payments.find(id)!;
-      rowAtSend = { status: row.status, rawTx: row.rawTx };
-      return send(args);
-    },
-  );
+  // Wrapped rather than spied: the stub is a plain object, and the point is to observe the ROW at
+  // the exact instant the bytes leave — not after, where a row written late would look identical.
+  chain.executor.publicClient.sendRawTransaction = async (args: {
+    serializedTransaction: Hex;
+  }): Promise<Hex> => {
+    const row = payments.find(id)!;
+    rowAtSend = { status: row.status, rawTx: row.rawTx };
+    return send(args);
+  };
   await settleFormationPayment(deps(chain.executor), c, {
     signature: await sign(c),
     from: TENANT,
