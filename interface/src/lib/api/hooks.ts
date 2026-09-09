@@ -509,18 +509,6 @@ export function useUpdateCompanyIntakeMutation(companyId: string) {
 }
 
 /**
- * Correct the responsible person on a filing the provider refused (§7).
- *
- * A mutation for the reason `useCreateFormationPartyMutation` is one: personal data must never
- * become a React Query key. It invalidates the COMPANY, because what visibly changed is that
- * company's park state — the identity itself is never rendered anywhere.
- *
- * `companyId` is REQUIRED, and it is the door's own address since the backend re-keyed it: the
- * party is resolved from the company rather than named by the caller. It was optional, with a
- * `if (!companyId) return` guard in `onSuccess` that no call site could reach — a dead branch
- * that would have silently skipped the invalidation if one ever did.
- */
-/**
  * ── FORMATION PAYMENTS (design §6) ──────────────────────────────────────────────────────────
  *
  * The hook layer's whole job here is to make "sign once per quote" the only expressible flow:
@@ -532,15 +520,21 @@ export function useUpdateCompanyIntakeMutation(companyId: string) {
  * motion — `settling`, or a `quoted` row somebody is looking at — and stops dead on every
  * terminal state, so a settled company does not poll its receipt forever.
  */
-export function useCompanyPaymentQuery(
-  companyId: string | null | undefined,
-  options?: { enabled?: boolean; pollMs?: number },
-) {
+/**
+ * How often a payment in motion is re-read. Named rather than passed in (finding C5): the
+ * `options` parameter this replaces had two knobs — `enabled` and `pollMs` — and neither had ever
+ * been supplied by a caller, while the SETTLING interval is half of a contract with the settle
+ * route (see below) that a caller must not be able to lengthen.
+ */
+const SETTLING_POLL_MS = 4000;
+const QUOTED_POLL_MS = 10_000;
+
+export function useCompanyPaymentQuery(companyId: string | null | undefined) {
   const token = useAuthToken();
   return useQuery({
     queryKey: apiKeys.companyPayment(token ?? "", companyId ?? ""),
     queryFn: () => getCompanyPayment(token!, companyId!),
-    enabled: (options?.enabled ?? true) && !!token && !!companyId,
+    enabled: !!token && !!companyId,
     // NO staleTime, unlike its siblings: this row changes underneath the page (the sweeper
     // resolves a stalled settle) and a cached "settling" shown for a minute is the one thing that
     // would make a guardian reach for a second signature.
@@ -556,8 +550,8 @@ export function useCompanyPaymentQuery(
       // `pending` into "settled" on screen, usually within a second or two of the transaction
       // landing. Slow it down and a settled payment looks stuck; remove it and `pending` is where
       // the screen stops.
-      if (status === "settling") return options?.pollMs ?? 4000;
-      if (status === "quoted") return options?.pollMs ?? 10_000;
+      if (status === "settling") return SETTLING_POLL_MS;
+      if (status === "quoted") return QUOTED_POLL_MS;
       return false;
     },
   });
@@ -612,6 +606,18 @@ export function useRequoteCompanyPaymentMutation(companyId: string) {
   });
 }
 
+/**
+ * Correct the responsible person on a filing the provider refused (§7).
+ *
+ * A mutation for the reason `useCreateFormationPartyMutation` is one: personal data must never
+ * become a React Query key. It invalidates the COMPANY, because what visibly changed is that
+ * company's park state — the identity itself is never rendered anywhere.
+ *
+ * `companyId` is REQUIRED, and it is the door's own address since the backend re-keyed it: the
+ * party is resolved from the company rather than named by the caller. It was optional, with a
+ * `if (!companyId) return` guard in `onSuccess` that no call site could reach — a dead branch
+ * that would have silently skipped the invalidation if one ever did.
+ */
 export function useUpdateCompanyPartyMutation(companyId: string) {
   const queryClient = useQueryClient();
   const ensureToken = useEnsureAuthToken();
