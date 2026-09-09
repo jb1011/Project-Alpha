@@ -921,6 +921,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         "Invalid config: FORMATION_PAYMENT_REQUIRED is on with DOOLA_ENVIRONMENT=sandbox — a sandbox filing is a DEMO record, not a legal body, and charging for one would take real USDC for nothing (set DOOLA_ENVIRONMENT=production, or unset FORMATION_PAYMENT_REQUIRED)",
       );
 
+    // ⚠ AND A BOX THAT CANNOT FILE MUST NOT CHARGE FOR A FILING (finding B9).
+    //
+    // The sandbox refusal above catches the ordinary shape of this — a deployment with no doola
+    // block reads `DOOLA_ENVIRONMENT=sandbox` by default. It does NOT catch the deliberate one:
+    // `DOOLA_ENVIRONMENT=production` with no credentials, which boots, prints "FORMATION PAYMENTS
+    // ENABLED", quotes the fee, takes the money and can never open a filing, because every
+    // formation door is behind `canFormEntities`. The fee would be the only thing on the box that
+    // worked.
+    if (!canFormEntities(cfg))
+      throw new Error(
+        "Invalid config: FORMATION_PAYMENT_REQUIRED is on but this deployment cannot file anything — DOOLA_API_KEY and DOOLA_WEBHOOK_SECRET are not both set, so canFormEntities is false and every formation door is closed. It would quote and take a formation fee for a filing it could never open",
+      );
+
     // The revenue address must not be a key this box signs with (§6.6). Two different harms sit
     // behind the two arms: the EXECUTOR is the wallet that SUBMITS the transfer, so paying it
     // would make every settlement a no-op that still looks settled; any OTHER platform key is a

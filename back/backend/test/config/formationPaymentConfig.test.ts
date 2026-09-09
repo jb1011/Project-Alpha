@@ -29,12 +29,15 @@ const REVENUE = "0x000000000000000000000000000000000000BEeF";
 /** The DEDICATED settle submitter (B1 gate A2) — its own key, and nothing else's. */
 const SUBMITTER_KEY = `0x${"c".repeat(64)}` as const;
 
-/** The smallest env that may legally charge: production provider environment, the identity floor
- *  wired, and somewhere to be paid. */
+/** The smallest env that may legally charge: a provider it can actually file with, a production
+ *  provider environment, the identity floor wired, and somewhere to be paid. */
 const PAYING = {
   ...BASE,
   ...WORLD,
   DOOLA_ENVIRONMENT: "production",
+  DOOLA_API_KEY: "dk_live_key",
+  DOOLA_WEBHOOK_SECRET: "whsec_live",
+  FORMATION_PII_KEY: Buffer.alloc(32, 7).toString("base64"),
   FORMATION_PAYMENT_REQUIRED: "true",
   FORMATION_REVENUE_ADDRESS: REVENUE,
   FORMATION_SETTLE_SUBMITTER_KEY: SUBMITTER_KEY,
@@ -94,6 +97,15 @@ test("SANDBOX CAN NEVER CHARGE — a demo record is not a legal body", () => {
   // not take money for a formation.
   const { DOOLA_ENVIRONMENT: _drop, ...noProvider } = PAYING;
   expect(() => loadConfig(noProvider)).toThrow(/DOOLA_ENVIRONMENT=sandbox/);
+});
+
+test("⚠ B9: a box that CANNOT FILE refuses to charge, even pointed at production", () => {
+  // The deliberate shape the sandbox rule misses: `DOOLA_ENVIRONMENT=production` with no
+  // credentials. It used to boot, print "FORMATION PAYMENTS ENABLED", quote $399 and take the
+  // money — while every formation door stayed shut behind `canFormEntities`. The fee would have
+  // been the only thing on the box that worked.
+  const { DOOLA_API_KEY: _key, DOOLA_WEBHOOK_SECRET: _secret, ...noCredentials } = PAYING;
+  expect(() => loadConfig(noCredentials)).toThrow(/cannot file anything/);
 });
 
 test("the revenue address must not be the PLATFORM key — a hot wallet on this box", () => {

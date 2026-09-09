@@ -450,6 +450,9 @@ no authority, funded with a few USDC.**
 
 Run in this order. Steps 1–3 are refused at boot if they are wrong, which is the point.
 
+0. **This box must be able to FILE.** `DOOLA_API_KEY` + `DOOLA_WEBHOOK_SECRET` present, i.e.
+   `canFormEntities`. Charging without them is refused at boot: every formation door is closed
+   behind that predicate, so the fee would be the only thing on the box that worked.
 1. **The identity floor must already be satisfied** — `WORLD_APP_ID` + `WORLD_RP_ID` +
    `WORLD_RP_SIGNING_KEY` all present, `WORLD_REQUIRE_GUARDIAN=true`,
    `WORLD_MAX_COMPANIES_PER_HUMAN` set. Charging is production formation whatever the provider
