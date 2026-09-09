@@ -56,6 +56,20 @@ export interface AgentBookRepository {
    * forbids. At most one `submitted` row per entity exists, so "the in-flight one" is unambiguous.
    */
   currentForEntity(entityKey: string): AgentBookRow | undefined;
+  /**
+   * Every row of this entity that carries a NULLIFIER, newest first.
+   *
+   * "Is this vouch ours?" is a question about all of them, never about `currentForEntity`'s single
+   * answer (re-review R1): a `pending` session and the `expired` row it becomes carry no nullifier,
+   * so they can match nothing on chain — and one of them is the newest row from the moment a
+   * guardian opens the dialog in a second tab and walks away. Asked of that row alone, the entry we
+   * wrote ourselves came back a stranger's, permanently.
+   *
+   * Only rows a proof was actually submitted for, which is also what keeps the result small: those
+   * are bounded by what the lifetime cap lets onto the chain, while the abandoned sessions are
+   * capped per tenant per hour and not per entity at all.
+   */
+  rowsWithNullifierForEntity(entityKey: string): AgentBookRow[];
   /** Rows that count toward the per-entity lifetime cap (D13). */
   countLifetime(entityKey: string): number;
   /** Sessions this tenant created since `sinceMs` (epoch ms), for the per-tenant window. */
@@ -166,6 +180,18 @@ export class SqliteAgentBookRepository implements AgentBookRepository {
       )
       .get(entityKey) as Raw | undefined;
     return r ? toRow(r) : undefined;
+  }
+
+  rowsWithNullifierForEntity(entityKey: string): AgentBookRow[] {
+    // One statement, and `idx_agentbook_entity` serves it exactly as it serves `currentForEntity`.
+    return (
+      this.db
+        .prepare(
+          `SELECT ${COLS} FROM agentbook_registrations
+            WHERE entity_key = ? AND nullifier IS NOT NULL ORDER BY id DESC`,
+        )
+        .all(entityKey) as Raw[]
+    ).map(toRow);
   }
 
   countLifetime(entityKey: string): number {

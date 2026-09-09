@@ -439,6 +439,16 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       reconciled = true;
     }
     /**
+     * EVERY VOUCH THIS ENTITY EVER PUT ON THE WIRE, newest first, read AFTER the reconcile above so
+     * a row it just confirmed is in the set.
+     *
+     * `row` alone cannot answer the two questions below (re-review R1). It is the newest row once
+     * nothing is in flight, and the newest row is a nullifier-less abandoned session whenever a
+     * guardian opened the dialog twice — which turned our own registry entry into a stranger's and
+     * hid the confirmation the transaction link is built from.
+     */
+    const vouched = ab.repo.rowsWithNullifierForEntity(rec.idempotencyKey);
+    /**
      * A CONFIRMED ROW OF OUR OWN OUTRANKS A CACHED NEGATIVE (FR-D).
      *
      * The reconciler now writes the cache on `confirmed` as well as `disputed`, but the confirming
@@ -446,14 +456,27 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
      * cached on a previous poll (60s TTL) to be served beside `status: "confirmed"` — one body
      * saying both "we vouched" and "not in AgentBook". A positive cache entry is used as it stands:
      * it can disagree with our row, and that disagreement is exactly the `disputed` case below.
+     *
+     * The entity's newest CONFIRMED row, not `row`'s own status: an abandoned session opened after
+     * the confirmation is the newest row and carries nothing, and letting it hide the confirmation
+     * would serve exactly the poisoned negative this rule exists to discard (R1).
      */
-    const confirmedId = row?.status === "confirmed" ? asHumanId(row.nullifier) : null;
+    const confirmedId = asHumanId(vouched.find((r) => r.status === "confirmed")?.nullifier ?? null);
     const usableCache = cached && (cached.humanId !== null || confirmedId === null) ? cached : null;
     let humanId: string | null | undefined;
+    /** Did OUR ROW answer, rather than the cache or a fresh read? Only then is the cache written
+     *  below. */
+    let rowAnswered = false;
     // A reconcile that just confirmed is strictly fresher than anything cached, and it read the
-    // contract itself at `safe` to get there.
-    if (reconciled && confirmedId !== null) humanId = confirmedId;
-    else if (!reconciled && usableCache) humanId = usableCache.humanId;
+    // contract itself at `safe` to get there. The row THIS request reconciled, deliberately not
+    // `confirmedId`: an older confirmation of ours says nothing about a submission still in flight,
+    // and answering with it would skip the read that would notice a stranger overwriting us.
+    const reconciledId =
+      reconciled && row?.status === "confirmed" ? asHumanId(row.nullifier) : null;
+    if (reconciledId !== null) {
+      humanId = reconciledId;
+      rowAnswered = true;
+    } else if (!reconciled && usableCache) humanId = usableCache.humanId;
     else if (budgeted) {
       // Reconciled to something other than `confirmed`, or nothing usable cached: ask the
       // contract. When a reconcile ran, the read token was already spent on it and this costs no
@@ -470,14 +493,19 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     }
     // A read we could not make must not turn a vouch we confirmed into "could not tell". A FRESH
     // definitive `null` is left alone: the contract is the authority on its own state.
-    if (humanId === undefined && confirmedId !== null) humanId = confirmedId;
-    // Refresh the cache whenever the row is what answered, in the minimal-hex spelling every other
+    if (humanId === undefined && confirmedId !== null) {
+      humanId = confirmedId;
+      rowAnswered = true;
+    }
+    // Refresh the cache when OUR ROW is what answered, in the minimal-hex spelling every other
     // writer uses — `worldVerifier` keys its per-human allowance off this value, so two spellings
-    // of one human would be two buckets and twice the allowance.
-    if (confirmedId !== null && humanId === confirmedId)
-      ab.store.cacheLookup(address, humanId, now());
+    // of one human would be two buckets and twice the allowance. Not when the CACHE answered
+    // (re-review R2): re-stamping a positive on every dashboard poll would hold it past its TTL for
+    // as long as anyone is looking, and the contract read that TTL exists to force — the one that
+    // would notice a stranger overwriting us — would never happen.
+    if (rowAnswered && humanId != null) ab.store.cacheLookup(address, humanId, now());
     /**
-     * IS THIS VOUCH OURS? (§3 precondition 5, FR-A)
+     * IS THIS VOUCH OURS? (§3 precondition 5, FR-A, re-review R1)
      *
      * Not "is this address registered": a non-null lookup we did not write means SOMEONE ELSE
      * vouched, which is `disputed` — the state that keeps the vouch button open — and never a
@@ -485,10 +513,39 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
      * (§8 HIGH-2). `ours` deliberately does not require a `confirmed` row: a `failed` or `expired`
      * row whose nullifier the registry now holds IS our vouch, mined after we gave up on it, and
      * the registry outranks our record of it.
+     *
+     * Asked of EVERY row of ours that carries a nullifier, never of the current one alone (R1): a
+     * nullifier-less session from a second tab matches nothing, and asking it turned our own entry
+     * into "someone else has replaced the vouch" for good — re-opening the button over an entry
+     * that is already ours, for a second on-chain write that would spend gas and one of the three
+     * lifetime slots. Numerically, via `sameHuman`, like every other comparison of these two
+     * spellings.
      */
-    const ours = row != null && row.nullifier != null && sameHuman(humanId ?? null, row.nullifier);
+    const registryId = humanId ?? null;
+    const ours = vouched.some((r) => sameHuman(registryId, r.nullifier));
     const foreign = humanId != null && !ours;
-    const disputed = row?.status === "disputed" || foreign;
+    /**
+     * WHICH ROW THE BODY DESCRIBES.
+     *
+     * 1. The in-flight one if there is one — `currentForEntity` puts it first for §5.2's reason: no
+     *    terminal answer over a transaction still on its way.
+     * 2. Otherwise, when the vouch is ours, the CONFIRMED row whose nullifier the registry holds.
+     *    The chip builds the link to the guardian's own transaction out of
+     *    `status === "confirmed" && txHash`, so an abandoned session standing in its place costs
+     *    them that link and shows a session's status as the agent's registry status.
+     * 3. Otherwise the newest row, which is what everything above reconciled and read.
+     */
+    const inFlight = row?.status === "submitted" ? row : undefined;
+    const confirmedOurs = ours
+      ? vouched.find((r) => r.status === "confirmed" && sameHuman(registryId, r.nullifier))
+      : undefined;
+    const shown = inFlight ?? confirmedOurs ?? row;
+    // `shown`, not the newest row: a `disputed` row records the id the registry held when the
+    // reconciler looked. If the registry holds a nullifier of ours again — a re-vouch that landed
+    // after that verdict — `shown` is the confirmed row it belongs to and the honest answer is
+    // "registered": the entry moved BACK to us. Reading the newest row here would keep the stale
+    // verdict on screen for good, which is the same shape of permanent falsehood as R1.
+    const disputed = shown?.status === "disputed" || foreign;
     const outcome = disputed
       ? "disputed"
       : humanId === undefined
@@ -502,9 +559,9 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       address,
       outcome,
       disputed,
-      ...(row ? { status: row.status, txHash: row.txHash } : {}),
+      ...(shown ? { status: shown.status, txHash: shown.txHash } : {}),
       // The last-attempt diagnostic is only meaningful on a failed row (agentBookRepository.ts).
-      ...(row?.status === "failed" && row.errorCode ? { errorCode: row.errorCode } : {}),
+      ...(shown?.status === "failed" && shown.errorCode ? { errorCode: shown.errorCode } : {}),
       // The same two values the session route returns, so the dialog can render §5.1's conditional
       // lines (the testnet-permanence sentence, the "you have vouched for N agents" line) from the
       // status it already polls, without opening a session first (FR-F).

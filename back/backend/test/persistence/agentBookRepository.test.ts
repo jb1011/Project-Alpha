@@ -121,3 +121,23 @@ test("currentForEntity prefers the in-flight row over a newer expired one", () =
   repo.transition("s1", "submitted", "failed", { errorCode: "replaced" });
   expect(repo.currentForEntity("agent-1")).toMatchObject({ sessionId: "s2", status: "expired" });
 });
+
+// Re-review R1: "is this vouch ours?" is asked of every row that ever carried a nullifier, because
+// the nullifier-less ones — an abandoned session and the expired row it becomes — can match nothing
+// on chain and yet are the newest row the moment a guardian opens the dialog in a second tab.
+test("rowsWithNullifierForEntity: the rows a proof was submitted for, newest first, this entity only", () => {
+  session({ sessionId: "s1" });
+  repo.claimSubmit("s1", { nullifier: "0x1", rawTx: "0x02", submitterNonce: 1 });
+  repo.transition("s1", "submitted", "confirmed");
+  session({ sessionId: "s2" });
+  repo.claimSubmit("s2", { nullifier: "0x2", rawTx: "0x02", submitterNonce: 2 });
+  repo.transition("s2", "submitted", "failed", { errorCode: "reverted" });
+  session({ sessionId: "s3" });
+  repo.transition("s3", "pending", "expired");
+  session({ sessionId: "s4", entityKey: "agent-2" });
+  repo.claimSubmit("s4", { nullifier: "0x3", rawTx: "0x02", submitterNonce: 3 });
+  expect(repo.rowsWithNullifierForEntity("agent-1").map((r) => r.sessionId)).toEqual(["s2", "s1"]);
+  // The row it leaves out is precisely the one `currentForEntity` answers with.
+  expect(repo.currentForEntity("agent-1")).toMatchObject({ sessionId: "s3", status: "expired" });
+  expect(repo.rowsWithNullifierForEntity("agent-3")).toEqual([]);
+});

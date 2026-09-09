@@ -631,7 +631,7 @@ test("GET after submit reconciles and reports the row", async () => {
  * registry now holds IS our vouch, mined after we gave up on it.
  */
 const seedRow = (
-  status: "failed" | "confirmed" | "disputed",
+  status: "submitted" | "failed" | "confirmed" | "disputed",
   nullifier: string,
   over: { txHash?: string } = {},
 ) => {
@@ -646,12 +646,32 @@ const seedRow = (
   });
   abRepo.claimSubmit(sessionId, { nullifier, rawTx: "0x02raw", submitterNonce: 0 });
   if (over.txHash) abRepo.setTxHash(sessionId, over.txHash);
-  abRepo.transition(
+  // `claimSubmit` already left the row `submitted`; anything else is one CAS move past it.
+  if (status !== "submitted")
+    abRepo.transition(
+      sessionId,
+      "submitted",
+      status,
+      status === "failed" ? { errorCode: "reverted" } : {},
+    );
+  return sessionId;
+};
+
+/**
+ * A session opened and abandoned: the dialog wrote the row, no proof was ever submitted, so it
+ * carries NO nullifier — and it is the newest row from the moment it exists.
+ */
+const seedAbandoned = (status: "pending" | "expired") => {
+  const sessionId = randomUUID();
+  abRepo.createSession({
     sessionId,
-    "submitted",
-    status,
-    status === "failed" ? { errorCode: "reverted" } : {},
-  );
+    entityKey: "agent-1",
+    tenantId: TENANT,
+    address: POCKET,
+    nonce: "0",
+    expiresAt: Date.now() + 60_000,
+  });
+  if (status === "expired") abRepo.transition(sessionId, "pending", "expired");
   return sessionId;
 };
 
@@ -735,6 +755,95 @@ test("FR-A: a reconcile that lands on someone else's nullifier reports disputed 
   expect(abRepo.findBySession(sessionId)?.status).toBe("disputed");
 });
 
+/**
+ * AN ABANDONED SESSION MUST NOT SHADOW A CONFIRMED VOUCH (re-review R1)
+ *
+ * `currentForEntity` answers with the NEWEST row once nothing is in flight, and a session opened
+ * in a second tab and never finished carries no nullifier — so it can match nothing on chain.
+ * Asking "is this vouch ours?" of that row alone answered "no" about an entry we wrote ourselves:
+ * a permanent "Someone else has replaced the vouch", with the button re-opened for a second,
+ * pointless on-chain write. The question belongs to the ENTITY.
+ */
+test("R1: a newer EXPIRED session does not shadow our confirmed vouch", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xh" });
+  seedAbandoned("expired");
+  reader.lookupHuman.mockResolvedValue("0xbadf00d");
+  const b = await (await call(makeApp(null), "")).json();
+  expect(b).toMatchObject({
+    registered: true,
+    outcome: "registered",
+    disputed: false,
+    humanId: "0xbadf00d",
+    // The CONFIRMED row is what the body describes, not the abandoned one: the chip builds the
+    // link to the guardian's own transaction out of `status === "confirmed" && txHash`
+    // (chipState.explorerHref), and falls back to the contract page without it.
+    status: "confirmed",
+    txHash: "0xh",
+  });
+});
+
+test("R1: with a newer expired session, a registry that holds SOMEONE ELSE's id is still disputed", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xh" });
+  seedAbandoned("expired");
+  reader.lookupHuman.mockResolvedValue("0x5714a9e7");
+  const b = await (await call(makeApp(null), "")).json();
+  expect(b).toMatchObject({
+    registered: false,
+    outcome: "disputed",
+    disputed: true,
+    humanId: "0x5714a9e7",
+  });
+});
+
+test("R1: a newer PENDING session does not shadow our confirmed vouch either", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xh" });
+  seedAbandoned("pending");
+  reader.lookupHuman.mockResolvedValue("0xbadf00d");
+  const b = await (await call(makeApp(null), "")).json();
+  // Not `status: "pending"`: a session waiting in a second tab is not what this agent's AgentBook
+  // entry is, and the chip would drop the transaction link on it.
+  expect(b).toMatchObject({
+    registered: true,
+    outcome: "registered",
+    disputed: false,
+    status: "confirmed",
+    txHash: "0xh",
+  });
+});
+
+test("R1: a pending session with no vouch of ours behind it is disputed, as before", async () => {
+  repo.upsert(entity());
+  seedAbandoned("pending");
+  reader.lookupHuman.mockResolvedValue("0x5714a9e7");
+  const b = await (await call(makeApp(null), "")).json();
+  // The entity has never written a nullifier, so the id on chain really is a stranger's.
+  expect(b).toMatchObject({
+    registered: false,
+    outcome: "disputed",
+    disputed: true,
+    humanId: "0x5714a9e7",
+    status: "pending",
+  });
+});
+
+test("R1: an in-flight submitted row still outranks an older confirmed one (§5.2)", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xold" });
+  seedRow("submitted", NULLIFIER, { txHash: "0xnew" });
+  reader.lookupHuman.mockResolvedValue("0xbadf00d");
+  const b = await (await call(makeApp(null), "")).json();
+  // The displayed row is the one still on its way, not the older confirmation it will replace.
+  expect(b).toMatchObject({
+    status: "submitted",
+    txHash: "0xnew",
+    outcome: "registered",
+    disputed: false,
+  });
+});
+
 test("FR-D: a confirmed row beats a cached negative — the sweep can confirm without this request", async () => {
   repo.upsert(entity());
   seedRow("confirmed", NULLIFIER, { txHash: "0xh" });
@@ -755,6 +864,20 @@ test("FR-D: a confirmed row beats a cached negative — the sweep can confirm wi
   expect(world.getCachedLookup(POCKET, Date.now(), 600_000, 60_000)).toEqual({
     humanId: "0xbadf00d",
   });
+});
+
+test("R2: a poll that only read the CACHE does not re-stamp it", async () => {
+  repo.upsert(entity());
+  seedRow("confirmed", NULLIFIER, { txHash: "0xh" });
+  // Nine minutes into the ten-minute life of a positive a real contract read established.
+  world.cacheLookup(POCKET, "0xbadf00d", Date.now() - 9 * 60_000);
+  const b = await (await call(makeApp(null), "")).json();
+  expect(b).toMatchObject({ registered: true, outcome: "registered", status: "confirmed" });
+  expect(reader.lookupHuman).not.toHaveBeenCalled();
+  // It still ages out on its ORIGINAL stamp: re-stamping a positive on every dashboard poll would
+  // hold it past its TTL for as long as anyone is looking, and the contract read that TTL exists to
+  // force — the one that would notice a stranger overwriting us — would never be made.
+  expect(world.getCachedLookup(POCKET, Date.now() + 2 * 60_000, 600_000, 60_000)).toBeUndefined();
 });
 
 test("FR-F: the status body carries network and priorVouches on both the registered and the unregistered branch", async () => {
