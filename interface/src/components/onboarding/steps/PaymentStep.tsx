@@ -1,24 +1,24 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { useAccount, useSignTypedData } from "wagmi";
-import {
-  useCancelCompanyPaymentMutation,
-  useCompanyPaymentQuery,
-  usePublicConfigQuery,
-  useRequoteCompanyPaymentMutation,
-  useSettleCompanyPaymentMutation,
-} from "@/lib/api/hooks";
+import { usePublicConfigQuery } from "@/lib/api/hooks";
 import {
   FEE_BREAKDOWN,
   feeSentence,
   formatAtomicUsdc,
-  paymentAction,
   paymentExplanation,
-  toWagmiTypedData,
 } from "@/lib/formation/payment";
+import { messageOf, useFormationPayment } from "@/lib/formation/useFormationPayment";
 import { StepNav } from "../OnboardingFlow";
-import { AmberPill, Button, Callout, Card, CheckIcon, SectionTitle, Spinner, StepHeader } from "../primitives";
+import {
+  AmberPill,
+  Button,
+  Callout,
+  Card,
+  CheckIcon,
+  SectionTitle,
+  Spinner,
+  StepHeader,
+} from "../primitives";
 
 type Props = {
   eyebrow: string;
@@ -47,106 +47,18 @@ type Props = {
  * prevent it as reliably as not rendering the button.
  *
  * The exits, in the order a stuck guardian meets them: wait (the sweeper re-broadcasts the
- * persisted transaction), cancel (a SECOND signature, over a different message, which retires the
- * authorization on-chain), re-quote (a new nonce, only once nothing is live).
+ * persisted authorization), cancel (a SECOND signature, over a different message, which retires
+ * the authorization on-chain), re-quote (a new nonce, only once nothing is live).
+ *
+ * The state and the three handlers are `useFormationPayment` (finding C3) — the same controller
+ * the Companies page's panel uses, because two components deciding for themselves whether a
+ * payment may be signed is how one of them ends up offering "pay" for a transfer already in
+ * flight.
  */
 export function PaymentStep({ eyebrow, companyId, onBack, onComplete }: Props) {
-  const { address } = useAccount();
-  const { data: config } = usePublicConfigQuery();
-  const { data: payment, isLoading, isError, error, refetch } = useCompanyPaymentQuery(companyId);
-  const settle = useSettleCompanyPaymentMutation(companyId ?? "");
-  const cancel = useCancelCompanyPaymentMutation(companyId ?? "");
-  const requote = useRequoteCompanyPaymentMutation(companyId ?? "");
-  const { signTypedDataAsync } = useSignTypedData();
-  const [problem, setProblem] = useState<string | null>(null);
-
-  /**
-   * When this browser first SAW the payment enter `settling`.
-   *
-   * In memory and per-visit, deliberately: it drives one thing, whether the cancel button has
-   * appeared yet, and a persisted timestamp would offer that button instantly on a reload — to
-   * somebody whose transfer is one second old and about to confirm. Re-starting the clock on a
-   * reload errs towards waiting, which is the safe direction.
-   */
-  const settlingSince = useRef<number | null>(null);
-  useEffect(() => {
-    if (payment?.status === "settling") settlingSince.current ??= Date.now();
-    else settlingSince.current = null;
-  }, [payment?.status]);
-
-  const action = paymentAction(payment, {
-    nowMs: Date.now(),
-    settlingSinceMs: settlingSince.current ?? undefined,
-  });
-  const busy = settle.isPending || cancel.isPending || requote.isPending;
-
-  async function onSign() {
-    setProblem(null);
-    const quote = payment?.quote;
-    if (!quote || !address) return;
-    try {
-      const signature = await signTypedDataAsync(toWagmiTypedData(quote.typedData));
-      // `from` is OUR connected address rather than anything off the quote: the backend checks it
-      // against the company's guardian, so a mismatch is caught there. Sending the quote's own
-      // `from` back would make this field decorative.
-      await settle.mutateAsync({ signature, from: address });
-    } catch (e) {
-      // A wallet REJECTION is not a failure of the payment — nothing was submitted, the quote is
-      // untouched, and the button is still there. Saying "payment failed" here would be a lie
-      // about the guardian's own decision.
-      setProblem(messageOf(e));
-    }
-  }
-
-  async function onCancel() {
-    setProblem(null);
-    // The SERVED message (finding C2) — including the authorizer, which is the address that
-    // signed rather than whichever wallet happens to be connected now. Absent where there is
-    // nothing live to cancel, or on a deployment that no longer charges (finding B8).
-    const td = payment?.cancelTypedData;
-    if (!td || !address) return;
-    try {
-      // biome-ignore lint/suspicious/noExplicitAny: a served EIP-712 request, typed at the wire
-      const signature = await signTypedDataAsync(td as any);
-      await cancel.mutateAsync({ signature });
-    } catch (e) {
-      setProblem(messageOf(e));
-    }
-  }
-
-  async function onRequote() {
-    setProblem(null);
-    try {
-      await requote.mutateAsync();
-    } catch (e) {
-      setProblem(messageOf(e));
-    }
-  }
-
-  // ⚠ NO COMPANY, NO FEE (finding B5). `visiblePhases` does not show this step without a company
-  // handle, so this branch should be unreachable — which is exactly why it must not be a dead
-  // end if the list and the session ever disagree (a restored session, a `/config` that arrives
-  // late, a skipped legal-body step). A screen with no company has nothing to quote, nothing to
-  // sign and no endpoint that would answer; it says so and lets the user carry on.
-  if (!companyId)
-    return (
-      <div>
-        <StepHeader
-          eyebrow={eyebrow}
-          title="No formation fee to pay"
-          intro="This step is for a company's formation fee, and this agent has no company yet."
-        />
-        <Card>
-          <p className="text-sm">
-            You skipped the legal body, or it has not been created yet — so there is nothing owed
-            and nothing to sign. You can add a company later from the Companies section.
-          </p>
-        </Card>
-        <StepNav onBack={onBack}>
-          <Button onClick={onComplete}>Continue</Button>
-        </StepNav>
-      </div>
-    );
+    const { data: config } = usePublicConfigQuery();
+  const p = useFormationPayment(companyId);
+  const { payment, action, busy, problem, address } = p;
 
   return (
     <div>
@@ -165,17 +77,17 @@ export function PaymentStep({ eyebrow, companyId, onBack, onComplete }: Props) {
             part of the total a reader can check against Wyoming's published schedule. */}
         <p className="mt-1 text-sm opacity-70">{FEE_BREAKDOWN}</p>
 
-        {isLoading && (
+        {p.isLoading && (
           <p className="mt-4 flex items-center gap-2 text-sm opacity-70">
             <Spinner /> Reading your quote…
           </p>
         )}
 
-        {isError && (
+        {p.isError && (
           <Callout tone="warn" className="mt-4">
             <p>We could not read this company&apos;s payment. Nothing has been charged.</p>
-            <p className="mt-1 text-sm opacity-80">{messageOf(error)}</p>
-            <Button variant="subtle" className="mt-3" onClick={() => void refetch()}>
+            <p className="mt-1 text-sm opacity-80">{messageOf(p.error)}</p>
+            <Button variant="subtle" className="mt-3" onClick={p.refetch}>
               Try again
             </Button>
           </Callout>
@@ -235,18 +147,18 @@ export function PaymentStep({ eyebrow, companyId, onBack, onComplete }: Props) {
 
       <StepNav onBack={onBack}>
         {action === "sign" && (
-          <Button onClick={() => void onSign()} disabled={busy || !address}>
-            {settle.isPending ? "Submitting…" : "Sign and pay"}
+          <Button onClick={() => void p.sign()} disabled={busy || !address}>
+            {p.settling ? "Submitting…" : "Sign and pay"}
           </Button>
         )}
         {action === "cancel" && (
-          <Button variant="subtle" onClick={() => void onCancel()} disabled={busy}>
-            {cancel.isPending ? "Cancelling…" : "Cancel this payment"}
+          <Button variant="subtle" onClick={() => void p.cancel()} disabled={busy || !address}>
+            {p.cancelling ? "Cancelling…" : "Cancel this payment"}
           </Button>
         )}
         {action === "requote" && (
-          <Button onClick={() => void onRequote()} disabled={busy}>
-            {requote.isPending ? "Requesting…" : "Request a new quote"}
+          <Button onClick={() => void p.requote()} disabled={busy}>
+            {p.requoting ? "Requesting…" : "Request a new quote"}
           </Button>
         )}
         {action === "done" && <Button onClick={onComplete}>Continue</Button>}
@@ -262,11 +174,4 @@ function Row({ label, value, mono }: { label: string; value: string; mono?: bool
       <dd className={mono ? "font-mono text-xs break-all" : "tabular-nums"}>{value}</dd>
     </div>
   );
-}
-
-/** A wallet rejection, an RPC failure and an API refusal all arrive as different shapes. One
- *  reader, so no branch renders `[object Object]` at a guardian. */
-function messageOf(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  return typeof e === "string" ? e : "Something went wrong.";
 }
