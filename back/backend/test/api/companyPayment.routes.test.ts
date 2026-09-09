@@ -14,6 +14,7 @@ import { buildApiApp } from "../../src/api/app";
 import { signSession } from "../../src/auth/session";
 import { DEFAULT_INDUSTRY } from "../../src/formation/intake";
 import type { FormationPaymentConfig } from "../../src/formation/payment";
+import { TRANSFER_WITH_AUTHORIZATION_TYPES } from "../../src/payments/transferAuthorization";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -251,4 +252,185 @@ test("/config serves the two payment fields, and NEVER the revenue address", asy
   // ("included during the beta, normally $399"), and bundling it in the browser build is how a
   // price on screen drifts from the price the backend would quote.
   expect(off.formationFeeUsdc).toBe(399);
+});
+
+// ── the ACTION doors (§6.3/§6.4) ───────────────────────────────────────────────────────────
+//
+// The domain behaviour is asserted in test/workflow/formationPayment.test.ts against a fake
+// chain. What these add is the DOOR: ownership, the 404 on a box that does not charge, and the
+// body validation that stands between a stranger's POST and the executor.
+
+/** The smallest executor stub that lets a settle reach a verdict. */
+function fakeExecutor() {
+  const sent: string[] = [];
+  return {
+    publicClient: {
+      getTransactionCount: async () => 1,
+      estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
+      sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: string }) => {
+        sent.push(serializedTransaction);
+        return "0x00";
+      },
+      waitForTransactionReceipt: async ({ hash }: { hash: string }) => ({
+        status: "success",
+        gasUsed: 118_000n,
+        transactionHash: hash,
+      }),
+      readContract: async () => false,
+      // biome-ignore lint/suspicious/noExplicitAny: a five-method stub of viem's PublicClient
+    } as any,
+    walletClient: {
+      account: privateKeyToAccount(`0x${"9".repeat(64)}`),
+      signTransaction: async () => "0x02aabb",
+      // biome-ignore lint/suspicious/noExplicitAny: a two-field stub of viem's WalletClient
+    } as any,
+    usdc: USDC,
+    chainId: 5042002,
+    sent,
+  };
+}
+
+function appWithExecutor(
+  payment: FormationPaymentConfig,
+  executor: ReturnType<typeof fakeExecutor>,
+) {
+  const built = app(payment);
+  void built;
+  const companyDeps = {
+    companies,
+    parties,
+    requests,
+    pin: { provider: "doola", environment: "sandbox" },
+    sandboxSyntheticPii: false,
+    maxPerTenant: 3,
+    dailyCeiling: 10,
+    payment,
+  };
+  return buildApiApp({
+    webOrigin: "*",
+    jwtSecret: JWT_SECRET,
+    repo,
+    companies,
+    formationSteps: (id: string) => requests.stepsOf(id),
+    formation: {
+      environment: "sandbox",
+      required: true,
+      sandboxSyntheticPii: false,
+      maxPerTenant: 3,
+      dailyCeiling: 10,
+      maxAgentsPerCompany: 10,
+      parties,
+      requests,
+      companies,
+      pin: { provider: "doola", environment: "sandbox" },
+      companyDeps,
+      payment,
+      feeUsdc: 399,
+      paymentExecutor: executor,
+    },
+    // biome-ignore lint/suspicious/noExplicitAny: the app deps are wider than this file needs
+  } as any);
+}
+
+async function post(
+  application: ReturnType<typeof buildApiApp>,
+  path: string,
+  body: unknown,
+  tenantId = OWNER,
+) {
+  return application.request(path, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${await token(tenantId)}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+test("settle: a real guardian signature settles through the door and readies the company", async () => {
+  const cfg = paymentCfg();
+  const executor = fakeExecutor();
+  const { body } = await create(cfg);
+  const companyId = body.companyId as unknown as string;
+  const row = payments.findLive(companyId, "formation")!;
+  const signature = await guardian.signTypedData({
+    domain: cfg.domain,
+    types: TRANSFER_WITH_AUTHORIZATION_TYPES,
+    primaryType: "TransferWithAuthorization",
+    message: {
+      from: OWNER,
+      to: REVENUE,
+      value: row.amountUsdc,
+      validAfter: 0n,
+      validBefore: BigInt(row.validBefore),
+      nonce: row.nonce,
+    },
+  });
+  const res = await post(appWithExecutor(cfg, executor), `/companies/${companyId}/payment/settle`, {
+    signature,
+    from: OWNER,
+  });
+  expect(res.status).toBe(200);
+  expect((await res.json()).status).toBe("settled");
+  expect(companies.find(companyId)?.status).toBe("ready");
+});
+
+test("settle: a body with no signature is a 400, and nothing reaches the executor", async () => {
+  const cfg = paymentCfg();
+  const executor = fakeExecutor();
+  const { body } = await create(cfg);
+  const res = await post(
+    appWithExecutor(cfg, executor),
+    `/companies/${body.companyId}/payment/settle`,
+    { from: OWNER },
+  );
+  expect(res.status).toBe(400);
+  expect(executor.sent).toHaveLength(0);
+});
+
+test("settle: another tenant's company is the same 404 as an unknown one", async () => {
+  const cfg = paymentCfg();
+  const executor = fakeExecutor();
+  const { body } = await create(cfg);
+  const res = await post(
+    appWithExecutor(cfg, executor),
+    `/companies/${body.companyId}/payment/settle`,
+    { signature: `0x${"11".repeat(65)}`, from: OWNER },
+    OTHER,
+  );
+  expect(res.status).toBe(404);
+});
+
+test("the three action doors 404 on a deployment that does not charge", async () => {
+  const off = paymentCfg({ required: false });
+  const executor = fakeExecutor();
+  const { body } = await create(off);
+  const application = appWithExecutor(off, executor);
+  for (const action of ["settle", "cancel", "requote"]) {
+    const res = await post(application, `/companies/${body.companyId}/payment/${action}`, {
+      signature: `0x${"11".repeat(65)}`,
+      from: OWNER,
+    });
+    expect(res.status).toBe(404);
+  }
+});
+
+test("requote: refused while a quote is live, and issues a NEW nonce once it is terminal", async () => {
+  const cfg = paymentCfg();
+  const executor = fakeExecutor();
+  const { body } = await create(cfg);
+  const companyId = body.companyId as unknown as string;
+  const application = appWithExecutor(cfg, executor);
+
+  const live = await post(application, `/companies/${companyId}/payment/requote`, {});
+  expect(live.status).toBe(400);
+
+  const first = payments.findLive(companyId, "formation")!;
+  payments.markExpired(first.paymentId, "quoted");
+  const res = await post(application, `/companies/${companyId}/payment/requote`, {});
+  expect(res.status).toBe(201);
+  const quote = (await res.json()) as { nonce: string; paymentId: string };
+  expect(quote.nonce).not.toBe(first.nonce);
+  expect(quote.paymentId).not.toBe(first.paymentId);
 });

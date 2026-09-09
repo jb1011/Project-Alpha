@@ -15,6 +15,7 @@ import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../fo
 import { FORMATION_PRODUCT, guardianOf, paymentView } from "../../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
+import { withKeyedLock } from "../../payments/keyedMutex";
 import {
   AgentSpecSchema,
   CreateCompanyBodySchema,
@@ -22,6 +23,11 @@ import {
   UpdateCompanyIntakeBodySchema,
   firstIssueMessage,
 } from "../../policy/agentSpec";
+import {
+  cancelFormationPayment,
+  requoteFormationPayment,
+  settleFormationPayment,
+} from "../../workflow/formationPayment";
 import type { ApiDeps } from "../app";
 import { ApiError, requireOwnedCompany } from "../errors";
 import { listCompanyViews, toCompanyDetailView, toEntityView, toEntityViews } from "../views";
@@ -188,6 +194,92 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     if (!row) throw new ApiError("not_found", 404, "payment not found");
     const now = Math.floor((deps.now ? deps.now() : Date.now()) / 1000);
     return c.json(paymentView(row, guardianOf(company), payment, now));
+  });
+
+  /**
+   * The three payment ACTIONS (design §6.3/§6.4), all on one company and all guardian-driven.
+   *
+   * They share a preamble — own the company, this box charges, an executor is wired — and are
+   * serialised PER COMPANY by the same keyed lock the formation sweeper uses. The lock is what
+   * makes "at most one broadcast per quote" true under a double-clicked button, on top of the
+   * database CAS that makes it true under two processes.
+   */
+  const paymentRunner = (company: import("../../persistence/companyRepository").CompanyRecord) => {
+    const payment = deps.formation?.payment;
+    const executor = deps.formation?.paymentExecutor;
+    if (!payment?.required || !executor) throw new ApiError("not_found", 404, "payment not found");
+    return {
+      companies: deps.companies!,
+      payment,
+      executor,
+      transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
+      now: deps.now,
+      company,
+    };
+  };
+
+  /**
+   * `POST /companies/:companyId/payment/settle` — the guardian's signature, and the only thing
+   * that turns a `draft` company into a `ready` one on a deployment that charges.
+   *
+   * The body is the signature and the address that produced it. Everything else — the amount, the
+   * payee, the nonce, the window — comes off the STORED ROW, deliberately: a body that could name
+   * its own amount would be a body that could pay one dollar for a Wyoming LLC.
+   */
+  app.post("/companies/:companyId/payment/settle", async (c) => {
+    const company = requireOwnedCompany(deps, c);
+    const runner = paymentRunner(company);
+    const body = await readJson(c);
+    const { signature, from } = (body ?? {}) as { signature?: unknown; from?: unknown };
+    if (typeof signature !== "string" || !signature.startsWith("0x"))
+      throw new ApiError("validation_error", 400, "signature is required");
+    if (typeof from !== "string") throw new ApiError("validation_error", 400, "from is required");
+    const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+      settleFormationPayment(runner, company, {
+        signature: signature as `0x${string}`,
+        from: from as `0x${string}`,
+      }),
+    );
+    if (!result.ok) throw new ApiError("validation_error", 400, result.reason);
+    return c.json({ status: result.status, txHash: result.txHash });
+  });
+
+  /**
+   * `POST /companies/:companyId/payment/cancel` — the fast path out of a stuck `settling` row.
+   *
+   * A SECOND signature, over a DIFFERENT message (`CancelAuthorization(authorizer, nonce)`),
+   * because the platform cannot cancel unilaterally: the token verifies the authorizer. That is
+   * the design and not a limitation — an authorization is the guardian's promise, and we only
+   * carry the letter.
+   */
+  app.post("/companies/:companyId/payment/cancel", async (c) => {
+    const company = requireOwnedCompany(deps, c);
+    const runner = paymentRunner(company);
+    const { signature } = ((await readJson(c)) ?? {}) as { signature?: unknown };
+    if (typeof signature !== "string" || !signature.startsWith("0x"))
+      throw new ApiError("validation_error", 400, "signature is required");
+    const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+      cancelFormationPayment(runner, company, { signature: signature as `0x${string}` }),
+    );
+    if (!result.ok) throw new ApiError("validation_error", 400, result.reason);
+    return c.json({ status: "expired", txHash: result.txHash });
+  });
+
+  /**
+   * `POST /companies/:companyId/payment/requote` — a NEW row with a NEW nonce.
+   *
+   * Deliberately its own door (§6.4). "Expire, then re-quote" is two acts: the first is a claim
+   * about the CHAIN (this authorization can never settle), the second a promise to the guardian
+   * (this is what you owe now). Fusing them would let a UI re-quote its way out of a `settling`
+   * row whose transfer was still in flight — the double charge in its most natural disguise — so
+   * this door REFUSES while any row is live and says which kind of live it is.
+   */
+  app.post("/companies/:companyId/payment/requote", (c) => {
+    const company = requireOwnedCompany(deps, c);
+    const runner = paymentRunner(company);
+    const result = requoteFormationPayment(runner, company);
+    if (!result.ok) throw new ApiError("validation_error", 400, result.reason);
+    return c.json(result.quote, 201);
   });
 
   /**

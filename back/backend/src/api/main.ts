@@ -400,6 +400,20 @@ async function main() {
       `⚠ FORMATION PAYMENTS ENABLED: $${formationPayment.feeUsdc} USDC to ${formationPayment.revenueAddress} (USDC domain "${formationPayment.domain.name}" v${formationPayment.domain.version}, pinned on-chain)`,
     );
 
+  /**
+   * The EXECUTOR's clients — the platform EOA that submits a guardian's authorization.
+   *
+   * The SAME wallet client every other platform write goes through (`managerWalletClient`), which
+   * is the point: there is one executor identity on this box, it is the one the S4 key inventory
+   * names, and formation settlement is not allowed to invent a second.
+   */
+  const formationExecutor = {
+    publicClient,
+    walletClient: managerWalletClient(cfg),
+    usdc: cfg.usdc,
+    chainId: cfg.chainId,
+  };
+
   const companyDeps = formationDeployment
     ? {
         companies,
@@ -671,6 +685,9 @@ async function main() {
             payment: formationPayment,
             // …and the fee ITSELF, whether or not this box charges: the beta sentence quotes it.
             feeUsdc: formationCfg.payment.feeUsdc,
+            // The executor. Present exactly where `payment` is, so a box that does not charge has
+            // no settle path wired at all rather than one that refuses at the last moment.
+            paymentExecutor: formationPayment ? formationExecutor : undefined,
           }
         : undefined,
     // The view dependencies, as ONE object shared with the MCP surface below (C8).

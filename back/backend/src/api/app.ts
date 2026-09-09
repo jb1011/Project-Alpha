@@ -158,6 +158,12 @@ export interface ApiDeps extends EntityViewDeps {
      * from the price the backend would actually quote.
      */
     feeUsdc: number;
+    /**
+     * The EXECUTOR — the platform EOA that submits the guardian's authorization, and the clients
+     * it needs. Present with `payment` and absent without it, so a box that does not charge has
+     * no settle path wired at all rather than one that would refuse at the last moment.
+     */
+    paymentExecutor?: import("../payments/formationSettle").FormationExecutorDeps;
   };
 
   /**
