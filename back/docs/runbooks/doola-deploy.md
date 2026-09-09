@@ -372,6 +372,126 @@ test in this repo makes a live doola call.
 Both probes are sandbox-only by construction (they refuse a key that is not `dk_test_…`) and read
 `DOOLA_API_KEY` from the environment, writing it to no file.
 
+## B1: FORMATION PAYMENTS — the whole procedure (design §6)
+
+**Shipped OFF.** With `FORMATION_PAYMENT_REQUIRED` unset, every company lands `ready` exactly as
+it does today, no `formation_payments` row is ever written, `hasLivePayment` keeps answering
+false, and the wizard says formation is included during the beta. Nothing below is live until the
+flag is deliberately set.
+
+### The four env vars
+
+| Variable | Default | What it is |
+|---|---|---|
+| `FORMATION_PAYMENT_REQUIRED` | **false** | Whether a company must be paid for before it can be filed. Nothing derives it on — unlike `FORMATION_REQUIRED`, which turns itself on with the provider. |
+| `FORMATION_FEE_USDC` | `399` | The all-in fee in WHOLE dollars. Public: served on `/config` and rendered verbatim. The Wyoming state fee ($100, outside doola's pack) is a BREAKDOWN LINE in copy, never added at checkout. |
+| `FORMATION_REVENUE_ADDRESS` | — | The Ledger account. Required when payment is required. |
+| `FORMATION_QUOTE_TTL_MS` | `1800000` | How long a quote stands (30 min). |
+
+### ⚠ S4 KEY INVENTORY — the revenue address
+
+`FORMATION_REVENUE_ADDRESS` **is a Ledger hardware-wallet account, and NO PRIVATE KEY FOR IT
+EXISTS ON THE BOX.** It is receive-only. That is the decision (2026-08-27), and it is what makes
+every other rule here follow:
+
+- the box can never move formation revenue, so a compromise of the server cannot drain it;
+- refunds are therefore signed by a human at the device (below) and only RECORDED here;
+- three boot invariants enforce the separation and refuse to start otherwise: the address must not
+  equal the EXECUTOR (`PLATFORM_PRIVATE_KEY`), must not equal any other key in the env set
+  (`CUSTOMER_`, `OPERATOR_`, `JOB_CLIENT_`, `JOB_EVALUATOR_`, `X402_PROOF_AGENT_`,
+  `ENS_GATEWAY_SIGNER_`, `WORLDCHAIN_SUBMITTER_`), and must not be any agent operator, rotated-away
+  operator or pocket address in the database.
+
+Add it to the S4 inventory as: **formation revenue — Ledger, receive-only, no key on any server,
+holder: Martin.**
+
+### Flip-on checklist
+
+Run in this order. Steps 1–3 are refused at boot if they are wrong, which is the point.
+
+1. **The identity floor must already be satisfied** — `WORLD_APP_ID` + `WORLD_RP_ID` +
+   `WORLD_RP_SIGNING_KEY` all present, `WORLD_REQUIRE_GUARDIAN=true`,
+   `WORLD_MAX_COMPANIES_PER_HUMAN` set. Charging is production formation whatever the provider
+   credentials say, so the floor now fires on the payment switch as well as on
+   `DOOLA_ENVIRONMENT`. A box that charges without it is anonymous USDC buying real Wyoming LLCs.
+2. **`DOOLA_ENVIRONMENT=production`.** A sandbox filing is a DEMO-watermarked record that is not a
+   legal body, and the invariant refuses to boot rather than let one be charged for. It is keyed
+   on the raw value, so the box with no doola credentials at all (whose value is the `sandbox`
+   DEFAULT) is covered too.
+3. **Set `FORMATION_REVENUE_ADDRESS`** to the Ledger account and confirm it against the device
+   before restarting. It is printed in the boot line — `redact()` does not hide it, deliberately,
+   because this is exactly the value an operator must be able to check.
+4. **Pin the gas constants from the live probe.** `TRANSFER_WITH_AUTHORIZATION_GAS` (150_000) and
+   `CANCEL_AUTHORIZATION_GAS` (100_000) in `src/adapters/arc/gas.ts` are BOUNDED ESTIMATES until
+   `scripts/formation-settle-probe.mts` has printed a real `gasUsed`. Set each to the measured
+   figure plus ~20%. Unused gas is refunded, so being generous costs nothing and being short is a
+   reverted settle on a signature the guardian already gave.
+5. `FORMATION_PAYMENT_REQUIRED=true`, restart, and confirm the boot line:
+   `⚠ FORMATION PAYMENTS ENABLED: $399 USDC to 0x… (USDC domain "USD Coin" v2, pinned on-chain)`.
+   The domain is READ from the token and checked against its own `DOMAIN_SEPARATOR()` at boot — a
+   box that cannot read it does not start, which is better than one that quotes a price for a
+   signature it could not settle.
+6. Create one company end to end and watch the ops trail:
+   `formation_payment_quoted` → `formation_payment_settling` → `formation_payment_settled`, then
+   the company moving `draft → ready` and `create_provider` opening.
+
+### The manual refund procedure
+
+There is **no fund-moving refund path in the software, by design.** To refund a formation fee:
+
+1. **Decide and record why**, outside this system (the fee is real money and the decision is not
+   the software's).
+2. **Read the payment** you are refunding — `GET /companies/:companyId/payment`, or:
+   ```sql
+   SELECT payment_id, status, amount_usdc, payer_address, tx_hash
+     FROM formation_payments WHERE company_id = '<companyId>' ORDER BY created_at DESC;
+   ```
+   `payer_address` is where the money came from and is where it goes back. `amount_usdc` is
+   ATOMIC (6 decimals): 399000000 = $399.
+3. **Sign the transfer from the Ledger.** A plain USDC transfer on Arc from
+   `FORMATION_REVENUE_ADDRESS` to `payer_address` for exactly `amount_usdc`. Confirm the
+   destination on the DEVICE SCREEN, not in the wallet UI.
+4. **Record it**, so the system stops believing the fee was kept:
+   ```
+   npm run cli -- formation:refund <companyId> <ledgerTxHash>
+   ```
+   It moves nothing. It flips the newest `settled` row to `refunded`, stores the hash beside the
+   settlement hash, and writes a CRITICAL `formation_payment_refunded` ops line. It refuses a
+   second recording and names the hash already on the row — an operator who re-runs it must not
+   read "no settled payment" and go and make a second transfer.
+5. ⚠ **The refund is NOT a platform outflow and never enters `platform_outflows`.** A 399 USDC row
+   in the S5 meter would exceed the 200 USDC rolling ceiling on its own and block every agent's
+   treasury funding, gas seeds and job funding for 24 hours — a refund taking the fleet down. The
+   `formation_refund` outflow path arrives only with the later hot-float phase, together with an
+   env invariant that `PLATFORM_OUTFLOW_CEILING_USDC >= FORMATION_FEE_USDC`.
+6. The company stays `ready` and its filing is untouched. Refunding does not un-file a Wyoming
+   LLC, and pretending otherwise in the data would be the dishonest part.
+
+### When a payment is stuck
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `quoted`, past `validBefore` | The guardian never signed, or signed too late. | Nothing. The sweeper expires it, and the guardian can re-quote (`POST /companies/:id/payment/requote`). |
+| `settling`, `formation_payment_pending` lines | Broadcast, outcome not observed. | Nothing, at first. The sweeper re-broadcasts the PERSISTED bytes each pass with backoff. **Never re-quote:** the signature is still live and a second one is a double charge. |
+| `settling` for a long time, guardian waiting | The bytes may never have been accepted (e.g. the executor's nonce moved past them). | The guardian signs a `CancelAuthorization` in the UI (`POST /companies/:id/payment/cancel`); the executor submits it and the row expires at once. Then re-quote. |
+| `failed` | The transfer REVERTED on chain — usually an insufficient USDC balance. | The guardian re-quotes and pays again. Nothing was taken. |
+
+### B1 merge gate — the live probe
+
+```
+PROBE_GUARDIAN_PRIVATE_KEY=0x…   # a TEST EOA holding a few testnet USDC
+PROBE_REVENUE_ADDRESS=0x…        # a test destination, NOT the production Ledger
+npx tsx scripts/formation-settle-probe.mts
+```
+
+It builds the quote's typed data from the REAL on-chain domain, signs it as the guardian, verifies
+it through the same shared helper the settle route uses, submits `transferWithAuthorization` via
+the executor path, confirms the receipt, reads back `authorizationState == true`, prints the
+`gasUsed`, and then signs and submits a `cancelAuthorization` for a SECOND unused nonce and
+confirms that too. It refuses any chain id that is not Arc testnet.
+
+The two `gasUsed` figures it prints are what step 4 of the flip-on checklist pins.
+
 ## Boot ordering (C4)
 
 The formation sweeper starts **after** the HTTP port is listening, and its first loop iteration is

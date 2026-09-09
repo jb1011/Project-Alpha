@@ -418,6 +418,76 @@ export function buildCli(
       console.log(`abandoned create_provider for ${key}`);
     });
 
+  // ── formation:refund — RECORD a refund the Ledger already made (design 2026-08-26 §6.6) ────
+  //
+  // ⚠ IT MOVES NOTHING, AND THAT IS THE FEATURE. `FORMATION_REVENUE_ADDRESS` is a Ledger
+  // hardware-wallet account with NO KEY ON THIS BOX (the S4 key inventory says so in as many
+  // words), so a refund is signed by a human at the device, by runbook, and this command is how
+  // the system learns it happened. A refund path that could move funds would need a hot float
+  // holding real revenue on a server, which is exactly what the Ledger decision refuses.
+  //
+  // ⚠ AND IT NEVER TOUCHES `platform_outflows`. A 399 USDC row in the S5 meter would exceed the
+  // 200 USDC rolling ceiling on its own and block every agent's treasury funding, gas seeds and
+  // job funding for 24 hours — a refund taking the fleet down. `formation_refund` joins
+  // `OutflowPath` only in the later hot-float phase, together with an env invariant that the
+  // ceiling is at least the fee.
+  program
+    .command("formation:refund")
+    .argument("<companyId>", "the company whose settled payment was refunded")
+    .argument("<ledgerTxHash>", "the on-chain hash of the transfer signed from the Ledger")
+    .description("RECORD (never execute) a refund of a settled formation payment")
+    .action(async (companyId: string, ledgerTxHash: string) => {
+      const { config: loadDotenv } = await import("dotenv");
+      const { loadConfig } = await import("../config/env");
+      const { openDatabase } = await import("../persistence/db");
+      const { SqliteFormationPaymentRepository } = await import(
+        "../persistence/formationPaymentRepository"
+      );
+      const { opsLog } = await import("../observability/opsLog");
+      loadDotenv();
+      // `loadConfig().dbPath`, like every other DB-only command here: there is no DB_PATH knob,
+      // and an operator who moved DATA_DIR must not silently open a different, empty database.
+      const db = openDatabase(loadConfig().dbPath);
+      const payments = new SqliteFormationPaymentRepository(db);
+
+      const all = payments.listByCompany(companyId); // newest first
+      const settled = all.filter((p) => p.status === "settled");
+      if (settled.length === 0) {
+        // An ALREADY-REFUNDED row is its own answer, not "nothing was settled". An operator who
+        // re-runs the command (or runs it twice from two terminals) has to be told that the
+        // record already exists and which hash it carries — otherwise the honest refusal reads
+        // like the refund was never registered, and they go looking for a second one to make.
+        const refunded = all.find((p) => p.status === "refunded");
+        if (refunded)
+          throw new Error(
+            `refusing: payment ${refunded.paymentId} for company "${companyId}" is ALREADY recorded as refunded (tx ${refunded.refundTxHash}). A second recording would overwrite the only pointer we hold to the money that moved`,
+          );
+        throw new Error(
+          `no SETTLED payment for company "${companyId}" — a refund records money that was actually taken, and nothing here was`,
+        );
+      }
+      // The most recent settled payment. Named in the output either way, so an operator refunding
+      // an older one sees immediately that this is not the row they meant.
+      const target = settled[0]!;
+      if (!payments.markRefunded(target.paymentId, ledgerTxHash))
+        throw new Error(
+          `refusing: payment ${target.paymentId} is not settled, or already carries a refund hash. A second recording would overwrite the only pointer we hold to the money that moved`,
+        );
+      opsLog("formation_payment_refunded", {
+        severity: "CRITICAL",
+        level: "warn",
+        companyId,
+        paymentId: target.paymentId,
+        amountUsdc: target.amountUsdc.toString(),
+        settledTxHash: target.txHash,
+        refundTxHash: ledgerTxHash,
+        by: "operator",
+      });
+      console.log(
+        `recorded refund of ${target.amountUsdc} atomic USDC for payment ${target.paymentId} (tx ${ledgerTxHash}). Nothing was moved by this command.`,
+      );
+    });
+
   return program;
 }
 
