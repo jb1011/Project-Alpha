@@ -328,7 +328,9 @@ export interface Config {
   maxTreasuryFundedPerTenant: bigint;
   platformOutflowCeiling: bigint;
   platformOutflowWindowMs: number;
-  customerPrivateKey: Hex;
+  /** The live runner's simulated customer signer. Absent = the runner refuses; it must never
+   *  fall back to the platform governance key, which would sign customer payments as the platform. */
+  customerPrivateKey: Hex | undefined;
   authJwtSecret: string;
   authJwtTtlSec: number;
   webOrigin: string;
@@ -565,7 +567,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     maxTreasuryFundedPerTenant: usdToUnits(e.MAX_TREASURY_FUNDED_PER_TENANT_USDC),
     platformOutflowCeiling: usdToUnits(e.PLATFORM_OUTFLOW_CEILING_USDC),
     platformOutflowWindowMs: e.PLATFORM_OUTFLOW_WINDOW_HOURS * 3_600_000,
-    customerPrivateKey: e.CUSTOMER_PRIVATE_KEY ?? e.PLATFORM_PRIVATE_KEY,
+    customerPrivateKey: e.CUSTOMER_PRIVATE_KEY,
     authJwtSecret: e.AUTH_JWT_SECRET,
     authJwtTtlSec: e.AUTH_JWT_TTL_SEC,
     webOrigin: e.WEB_ORIGIN,
@@ -951,7 +953,7 @@ export function redact(cfg: Config): Record<string, unknown> {
     maxTreasuryFundedPerTenant: cfg.maxTreasuryFundedPerTenant.toString(),
     platformOutflowCeiling: cfg.platformOutflowCeiling.toString(),
     platformPrivateKey: "REDACTED",
-    customerPrivateKey: "REDACTED",
+    customerPrivateKey: cfg.customerPrivateKey ? "REDACTED" : undefined,
     authJwtSecret: "REDACTED",
     operatorPrivateKey: cfg.operatorPrivateKey ? "REDACTED" : undefined,
     pocketMasterSeed: cfg.pocketMasterSeed ? "REDACTED" : undefined,
