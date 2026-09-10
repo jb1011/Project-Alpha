@@ -31,3 +31,16 @@ test("price must be > 0 and <= 1.0 USDC", () => {
   expect(() => loadConfig({ ...baseEnv, X402_DEMO_PRICE_USDC: "2" })).toThrow(/1.0 USDC/);
   expect(loadConfig({ ...baseEnv, X402_DEMO_PRICE_USDC: "0.05" }).x402DemoPriceUsdc).toBe("0.05");
 });
+
+test("X402_TRUST_POLICY accepts the three policies, and nothing else", () => {
+  expect(loadConfig(baseEnv).x402TrustPolicy).toBe("open");
+  expect(loadConfig({ ...baseEnv, X402_TRUST_POLICY: "accountable-only" }).x402TrustPolicy).toBe(
+    "accountable-only",
+  );
+  // The legal-body tier (design 2026-09-10 D4): accountable-only PLUS a registered Novi legal
+  // body in good standing behind the payer address.
+  expect(loadConfig({ ...baseEnv, X402_TRUST_POLICY: "legal-bodies-only" }).x402TrustPolicy).toBe(
+    "legal-bodies-only",
+  );
+  expect(() => loadConfig({ ...baseEnv, X402_TRUST_POLICY: "legal-bodies" })).toThrow();
+});

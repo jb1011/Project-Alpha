@@ -7,6 +7,7 @@ import { Hono } from "hono";
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { decodeX402Header } from "../adapters/x402/signX402";
 import type { Address } from "../types";
+import type { LegalBodyResolver } from "./legalBody";
 import type { SettleFn } from "./settle";
 import {
   type VerifyTransferAuthorizationResult,
@@ -84,6 +85,26 @@ export async function verifyPayment(header: string, cfg: SellerConfig): Promise<
   });
 }
 
+/** The seller-side trust dial. Ordered by strictness: each policy is the one before it plus one
+ *  more question the buyer has to be able to answer. */
+export type SellerTrustPolicy = "open" | "accountable-only" | "legal-bodies-only";
+
+/** What `legal-bodies-only` needs to ask its question and to say something useful when the answer
+ *  is no. The links are passed in rather than hard-coded because the refusal is a PUBLIC document
+ *  a stranger's agent will follow: it has to point at this deployment's own lookup. */
+export interface SellerLegalBodyConfig {
+  /** The ONE resolver (design 2026-09-10 D1) — the same instance the buyer dial and the public
+   *  lookup hold, so a suspension cannot mean one thing here and another there. It caches
+   *  nothing: standing is read fresh on every request, which is the point. */
+  resolver: LegalBodyResolver;
+  /** Public API base the refusal's `how.lookup` is composed from: `<base>/legal-bodies/<address>`. */
+  lookupBaseUrl: string;
+  /** Where an agent with no legal body goes to get one. */
+  onboardUrl: string;
+  /** The human-readable list of the bodies this seller will trade with. */
+  transparencyUrl: string;
+}
+
 export interface PaywallConfig extends SellerConfig {
   serve: (req: Request) => unknown | Promise<unknown>;
   resource?: string; // default "/api/insight"
@@ -94,8 +115,14 @@ export interface PaywallConfig extends SellerConfig {
   agentkit?: AgentkitSellerConfig;
   /** Whom this seller trades with. "open" (default) = today's behavior. "accountable-only" =
    *  agents no verified human answers for are REFUSED (403) — their payment is not wanted;
-   *  human-backed agents proceed to the normal payment path. Requires `agentkit`. */
-  trustPolicy?: "open" | "accountable-only";
+   *  human-backed agents proceed to the normal payment path. "legal-bodies-only" = the same, plus
+   *  a registered Novi legal body in good standing behind the payer address. Both strict policies
+   *  require `agentkit`; "legal-bodies-only" additionally requires `legalBody`. */
+  trustPolicy?: SellerTrustPolicy;
+  /** Required by `legal-bodies-only`, ignored by every other policy. ABSENT under that policy is
+   *  a misconfiguration, not a permission: every request is refused 503 (D8 — fail closed), so a
+   *  deployment that forgets to wire the resolver cannot silently sell to anyone who asks. */
+  legalBody?: SellerLegalBodyConfig;
 }
 
 /** A paywalled Hono sub-app: [agentkit authorization] -> 402 -> verify X-PAYMENT -> serve. */
@@ -113,7 +140,25 @@ export function buildPaywall(cfg: PaywallConfig) {
       ? { ...buildRequirements(cfg), extensions: await mintAgentkitExtension(cfg.agentkit) }
       : buildRequirements(cfg);
 
-  const strict = cfg.trustPolicy === "accountable-only" && !!cfg.agentkit;
+  // Both strict policies share the human gate; `legalGate` is the SECOND question, asked only
+  // after the first one has been answered. Widening `strict` here is what keeps the two policies
+  // from drifting apart: `legal-bodies-only` cannot accidentally become laxer than
+  // `accountable-only` about proofs, rate caps or receipts.
+  const strict =
+    (cfg.trustPolicy === "accountable-only" || cfg.trustPolicy === "legal-bodies-only") &&
+    !!cfg.agentkit;
+  const legalGate = cfg.trustPolicy === "legal-bodies-only" && !!cfg.agentkit;
+
+  // Said ONCE, at mount, because a request-time log for a misconfiguration this permanent is just
+  // noise — and because a policy that is silently not in force is the failure worth shouting about.
+  if (cfg.trustPolicy === "legal-bodies-only" && !cfg.agentkit)
+    console.warn(
+      "⚠ x402 seller policy legal-bodies-only is INERT: no agentkit config, so the paywall behaves as 'open'",
+    );
+  if (legalGate && !cfg.legalBody)
+    console.warn(
+      "⚠ x402 seller policy legal-bodies-only has NO legal-body resolver wired: every request is refused 503",
+    );
 
   /** Strict refusal: a doorway, not a wall. 403 (never 402 — payment would not help), with the
    *  remediation AND the standard challenge, so a capable agent can fix its situation from the
@@ -131,8 +176,39 @@ export function buildPaywall(cfg: PaywallConfig) {
     extensions: await mintAgentkitExtension(cfg.agentkit as AgentkitSellerConfig),
   });
 
+  /** The SECOND doorway (D4/D7). Same shape as the human refusal — 403, a reason, a remediation
+   *  and the challenge — because the situations are the same kind: something is missing that the
+   *  agent can go and get. `how.lookup` names the address we actually checked (the proof's
+   *  signer), so following the link asks the very question this refusal answered.
+   *
+   *  The vocabulary is fixed (D7): "a registered legal body in good standing", never "verified
+   *  company", "KYC'd" or "licensed" — the chain carries a status, not a guarantee. */
+  const legalRefusal = async (reason: string, agentAddress: string) => {
+    // Safe: every caller is inside `legalGate` past the cfg.legalBody guard.
+    const lb = cfg.legalBody as SellerLegalBodyConfig;
+    return {
+      error: "legal_body_required",
+      detail:
+        "this seller trades only with agents that a registered legal body in good standing stands behind",
+      reason,
+      how: {
+        lookup: `${lb.lookupBaseUrl.replace(/\/+$/, "")}/legal-bodies/${agentAddress}`,
+        onboard: lb.onboardUrl,
+        transparency: lb.transparencyUrl,
+      },
+      extensions: await mintAgentkitExtension(cfg.agentkit as AgentkitSellerConfig),
+    };
+  };
+
+  /** 503, not 403: "we could not tell" is a different fact from "no", and an agent that IS a
+   *  legal body must be able to read the difference and retry rather than go and re-register. */
+  const checkUnavailable = (detail: string) => ({ error: "legal_body_check_unavailable", detail });
+
   app.get(path, async (c) => {
     const akHeader = c.req.header("agentkit");
+    /** Set only when the legal gate ran and passed; `undefined` means the question was never
+     *  asked (any other policy), which is why the receipt below distinguishes the two. */
+    let legalBodyAgentId: string | null | undefined;
 
     // ── accountable-only: accountability is a PRECONDITION of commerce ──────────────────────
     // No valid proof of a human backer -> refused outright; their money is not wanted (403,
@@ -140,6 +216,14 @@ export function buildPaywall(cfg: PaywallConfig) {
     // path below — everyone pays. The per-human counter acts as a rate cap (429), not a free
     // allowance: one human backing fifty agents still gets one budget.
     if (strict) {
+      // Before anything else: a policy this deployment cannot EVALUATE authorizes nobody, not
+      // even to the point of being told what proof to bring. Refusing here rather than after the
+      // human check keeps the misconfiguration from reading like a working strict seller.
+      if (legalGate && !cfg.legalBody)
+        return c.json(
+          checkUnavailable("this seller's legal-body check is not configured right now"),
+          503,
+        );
       if (!akHeader) return c.json(await refusal("no-proof-presented"), 403);
       const outcome = await verifyAgentkitRequest(akHeader, cfg.agentkit as AgentkitSellerConfig);
       if (!outcome.authorized) {
@@ -154,7 +238,32 @@ export function buildPaywall(cfg: PaywallConfig) {
       }
       c.header("X-AGENTKIT-HUMAN", outcome.humanId);
       c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
-      // fall through to payment — accountability grants no discount
+
+      // ── legal-bodies-only: the SECOND question ───────────────────────────────────────────
+      // A human vouches for this agent — now, does a registered legal body stand behind the
+      // address that is about to pay? The address checked is the PROOF'S SIGNER, never anything
+      // the caller asserted: an attacker cannot present a body it cannot sign for.
+      if (legalGate) {
+        const resolved = await (cfg.legalBody as SellerLegalBodyConfig).resolver.resolve(
+          outcome.agentAddress,
+        );
+        if (resolved.kind === "none")
+          return c.json(await legalRefusal("not-legal-body", outcome.agentAddress), 403);
+        if (resolved.standing === "inactive")
+          return c.json(await legalRefusal("legal-body-inactive", outcome.agentAddress), 403);
+        if (resolved.standing === "unknown")
+          // Fail closed, and remember NOTHING (D8): an RPC blip must not be able to brand a live
+          // body inactive, nor to let one through on the next request by being cached as fine.
+          return c.json(
+            checkUnavailable("the legal-body check could not be completed just now"),
+            503,
+          );
+        legalBodyAgentId = resolved.entity.agentId ?? null;
+        // Named on the receipt, not merely implied by a 200. Omitted rather than faked when the
+        // record has no agent id yet — an empty header value is a claim we cannot support.
+        if (legalBodyAgentId) c.header("X-NOVI-LEGAL-BODY", legalBodyAgentId);
+      }
+      // fall through to payment — accountability grants no discount, and neither does standing
     }
 
     // World gate FIRST (open mode): an agent proving it is backed by a verified unique human may
@@ -204,8 +313,18 @@ export function buildPaywall(cfg: PaywallConfig) {
       if (r.transferId) c.header("X-PAYMENT-RESPONSE", r.transferId);
     }
     const served = (await cfg.serve(c.req.raw)) as Record<string, unknown>;
-    // In strict mode the buyer proved a human backer before paying — say so on the receipt.
-    return c.json(strict ? { ...served, humanBacked: true } : served, 200);
+    // In strict mode the buyer proved a human backer before paying — say so on the receipt, and
+    // under legal-bodies-only name the body it proved too.
+    return c.json(
+      strict
+        ? {
+            ...served,
+            humanBacked: true,
+            ...(legalBodyAgentId !== undefined ? { legalBody: { agentId: legalBodyAgentId } } : {}),
+          }
+        : served,
+      200,
+    );
   });
   return app;
 }

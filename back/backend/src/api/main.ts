@@ -651,6 +651,10 @@ async function main() {
     x402Demo.proofAgentKey = cfg.x402ProofAgentKey;
     if (x402Demo.trustPolicy === "accountable-only")
       console.warn("⚠ x402 seller policy: ACCOUNTABLE-ONLY — anonymous agents are refused (403)");
+    if (x402Demo.trustPolicy === "legal-bodies-only")
+      console.warn(
+        "⚠ x402 seller policy: LEGAL-BODIES-ONLY — only agents a registered legal body in good standing stands behind are served (403 otherwise)",
+      );
   }
   if (x402Demo)
     console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);
@@ -724,6 +728,20 @@ async function main() {
     }
     return `${cfg.metadataBaseUrl}/transparency`;
   })();
+
+  // The legal-body half of the demo seller (design 2026-09-10 D4/D5). Wired HERE rather than up
+  // in the x402 block because the refusal quotes `transparencyLink`, which is derived just above.
+  //
+  // The SAME resolver instance the buyer dial and the public lookup hold (D1), and the SAME base
+  // url the lookup's own links are built from — a refusal that pointed a stranger's agent at a
+  // different host, or at a second resolver, is how one suspension ends up meaning two things.
+  if (x402Demo?.agentkit)
+    x402Demo.legalBody = {
+      resolver: legalBody,
+      lookupBaseUrl: cfg.metadataBaseUrl,
+      onboardUrl: "https://www.novicorpus.com/",
+      transparencyUrl: transparencyLink,
+    };
 
   const app = buildApiApp({
     webOrigin: cfg.webOrigin,

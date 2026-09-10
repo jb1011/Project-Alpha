@@ -126,8 +126,10 @@ const EnvSchema = z.object({
   X402_DEMO_PAYTO: addressSchema.optional(),
   /** Seller trust policy. "open" = today's behavior (AgentKit authorizes within the allowance,
    *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
-   *  outright (403); human-backed agents still pay. */
-  X402_TRUST_POLICY: z.enum(["open", "accountable-only"]).default("open"),
+   *  outright (403); human-backed agents still pay. "legal-bodies-only" = accountable-only PLUS a
+   *  registered Novi legal body in good standing behind the payer address (design 2026-09-10 D4);
+   *  it needs a legal-body resolver wired, and refuses 503 rather than serving without one. */
+  X402_TRUST_POLICY: z.enum(["open", "accountable-only", "legal-bodies-only"]).default("open"),
   /** Buyer-side trust dial: "verified-sellers-only" refuses to pay any address AgentBook does not
    *  vouch a human for. Default "open" = today's behavior. docs/design/2026-07-30-trust-policy-dials.md */
   X402_BUYER_TRUST_POLICY: z.enum(["open", "verified-sellers-only"]).default("open"),
@@ -418,7 +420,7 @@ export interface Config {
   x402DemoPayTo: Address;
   x402DemoPriceUsdc: string;
   /** Optional in the type (test fixtures build Config literals); loadConfig always sets them. */
-  x402TrustPolicy?: "open" | "accountable-only";
+  x402TrustPolicy?: "open" | "accountable-only" | "legal-bodies-only";
   x402BuyerTrustPolicy: "open" | "verified-sellers-only";
   worldRateWindowHours?: number;
   x402ProofAgentKey?: Hex;

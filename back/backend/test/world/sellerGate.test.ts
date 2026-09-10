@@ -1,17 +1,22 @@
 import Database from "better-sqlite3";
 import { Hono } from "hono";
 import type { Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { beforeEach, describe, expect, test } from "vitest";
 import {
   agentkitSignerFromKey,
   wrapFetchWithAgentkit,
 } from "../../src/adapters/worldid/agentkitSigner";
+import { arcBatchingConfig, pocketSignerFromKey } from "../../src/adapters/x402/pocket";
+import { makeSignX402 } from "../../src/adapters/x402/signX402";
+import type { LegalBodyResolution } from "../../src/payments/legalBody";
+import type { SellerLegalBodyConfig } from "../../src/payments/seller";
 import { buildPaywall } from "../../src/payments/seller";
 import type { AgentkitSellerConfig } from "../../src/payments/worldVerifier";
 import { mintAgentkitExtension, verifyAgentkitRequest } from "../../src/payments/worldVerifier";
 import { migrate } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
-import type { Address } from "../../src/types";
+import type { Address, EntityRecord } from "../../src/types";
 
 const RESOURCE_URL = "https://example.com/x402-demo/quote";
 const HUMAN = "0x051dbcb350abbe853a25ef35c88c7a582281f88d1d8e26ed014bad0e34a7d234";
@@ -506,5 +511,251 @@ describe("rate budgets are keyed independently", () => {
     for (let i = 0; i < 50; i++) expect(store.consumeNonce(`new-${i}`, later)).toBe(true);
     const after = db.prepare("SELECT COUNT(*) AS n FROM world_nonces").get() as { n: number };
     expect(after.n).toBeLessThan(60);
+  });
+});
+
+// ── legal-bodies-only: AgentBook's "is there a human?" PLUS "is there a legal body?" ──────────
+// (design 2026-09-10 D4/D7/D8)
+//
+// The property under test throughout: this policy is accountable-only with a SECOND gate bolted
+// after it, and it never softens the first one. A human-backed agent with no legal body is still
+// refused; a failed legal read refuses too (fail-closed, D8) rather than waving the agent through.
+describe("legal-bodies-only trust policy", () => {
+  const PAYOUT = "0x00000000000000000000000000000000000000ab" as Address;
+  const LOOKUP_BASE = "https://api.novicorpus.test";
+  const ONBOARD = "https://www.novicorpus.test/";
+  const TRANSPARENCY = "https://www.novicorpus.test/transparency";
+  const AGENT_ADDRESS = privateKeyToAccount(AGENT_KEY).address;
+
+  /** Only the fields the seller path actually reads — the resolver is stubbed, so the rest of
+   *  EntityRecord would be decoration that could drift away from the real record for free. */
+  const bodyEntity = (agentId: string | null = "843704") =>
+    ({ name: "TestMB2", status: "funded", agentId }) as unknown as EntityRecord;
+
+  const asBody = (standing: "active" | "inactive" | "unknown", agentId?: string | null) =>
+    ({
+      kind: "body",
+      entity: bodyEntity(agentId),
+      standing,
+      matchedBy: "pocket",
+    }) as LegalBodyResolution;
+
+  /** The resolver stub records every address it was asked for: the refusal has to point the
+   *  caller at the address that was actually CHECKED (the proof's signer), and a test that only
+   *  asserted the verdict could not tell the difference if that ever drifted. */
+  function legalDeps(
+    answer: LegalBodyResolution | (() => Promise<LegalBodyResolution>),
+    seen: string[] = [],
+  ): { deps: SellerLegalBodyConfig; seen: string[] } {
+    return {
+      seen,
+      deps: {
+        resolver: {
+          resolve: async (address: string) => {
+            seen.push(address);
+            return typeof answer === "function" ? await answer() : answer;
+          },
+        },
+        lookupBaseUrl: LOOKUP_BASE,
+        onboardUrl: ONBOARD,
+        transparencyUrl: TRANSPARENCY,
+      },
+    };
+  }
+
+  function legalApp(legalBody?: SellerLegalBodyConfig, agentkit: AgentkitSellerConfig = cfg()) {
+    const a = new Hono();
+    a.route(
+      "/",
+      buildPaywall({
+        trustPolicy: "legal-bodies-only",
+        price: 10_000n,
+        payTo: PAYOUT,
+        asset: arcBatchingConfig.asset,
+        network: "eip155:5042002",
+        resource: "/x402-demo/quote",
+        resourceUrl: RESOURCE_URL,
+        agentkit,
+        legalBody,
+        serve: () => ({ quote: "demo" }),
+      }),
+    );
+    return a;
+  }
+
+  /** A real, signed X-PAYMENT for this wall — the only way to reach the 200 that carries the
+   *  legal-body header, since the policy grants no free service. */
+  async function payment(amount: bigint) {
+    const signX402 = makeSignX402({
+      signer: pocketSignerFromKey(`0x${"2".repeat(64)}` as Hex),
+      chainId: 5042002,
+      network: arcBatchingConfig.network,
+      verifyingContract: arcBatchingConfig.verifyingContract,
+    });
+    return (
+      await signX402({
+        payTo: PAYOUT,
+        amount,
+        asset: arcBatchingConfig.asset,
+        network: arcBatchingConfig.network,
+        maxTimeoutSeconds: 60,
+      })
+    ).header;
+  }
+
+  test("no proof at all -> the accountable-only refusal, unchanged", async () => {
+    const { deps, seen } = legalDeps({ kind: "none" });
+    const res = await legalApp(deps).request("/x402-demo/quote");
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; reason: string };
+    expect(body.error).toBe("human_backing_required");
+    expect(body.reason).toBe("no-proof-presented");
+    expect(seen).toEqual([]); // no human -> the legal question is never even asked
+  });
+
+  test("garbage proof -> the human refusal, and no legal read is spent on it", async () => {
+    const { deps, seen } = legalDeps({ kind: "none" });
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: "garbage" },
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("human_backing_required");
+    expect(seen).toEqual([]);
+  });
+
+  test("human-backed but NOT a legal body -> 403 legal_body_required, pointing at its own address", async () => {
+    const { deps, seen } = legalDeps({ kind: "none" });
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as {
+      error: string;
+      detail: string;
+      reason: string;
+      how: { lookup: string; onboard: string; transparency: string };
+      extensions?: { agentkit?: { info?: { nonce?: string } } };
+    };
+    expect(body.error).toBe("legal_body_required");
+    expect(body.detail).toBe(
+      "this seller trades only with agents that a registered legal body in good standing stands behind",
+    );
+    expect(body.reason).toBe("not-legal-body");
+    // The address CHECKED is the proof's signer — and it is the address the refusal tells the
+    // caller to look up, so following the link cannot land on a different question.
+    expect(seen.length).toBe(1);
+    const asked = seen[0] ?? "";
+    expect(asked.toLowerCase()).toBe(AGENT_ADDRESS.toLowerCase());
+    expect(body.how.lookup).toBe(`${LOOKUP_BASE}/legal-bodies/${asked}`);
+    expect(body.how.onboard).toBe(ONBOARD);
+    expect(body.how.transparency).toBe(TRANSPARENCY);
+    // Still a doorway, not a wall: the challenge rides along so a capable agent can retry.
+    expect(body.extensions?.agentkit?.info?.nonce).toBeTruthy();
+    // The human header is still set — we DID verify the human, and said so.
+    expect(res.headers.get("X-AGENTKIT-HUMAN")).toBe(HUMAN);
+    expect(res.headers.get("X-NOVI-LEGAL-BODY")).toBeNull();
+  });
+
+  test("a suspended body -> 403 with reason legal-body-inactive (a different fact, said plainly)", async () => {
+    const { deps } = legalDeps(asBody("inactive"));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: string; reason: string; how: { lookup: string } };
+    expect(body.error).toBe("legal_body_required");
+    expect(body.reason).toBe("legal-body-inactive");
+    expect(body.how.lookup).toContain("/legal-bodies/");
+    expect(res.headers.get("X-NOVI-LEGAL-BODY")).toBeNull();
+  });
+
+  test("a failed chain read -> 503, never a guess in either direction (D8)", async () => {
+    const { deps } = legalDeps(asBody("unknown"));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; detail: string };
+    expect(body.error).toBe("legal_body_check_unavailable");
+    expect(body.detail).toBeTruthy();
+    expect(res.headers.get("X-NOVI-LEGAL-BODY")).toBeNull();
+  });
+
+  test("no resolver wired -> every request 503, fail-closed (never open by omission)", async () => {
+    const app = legalApp(undefined);
+    // Even the anonymous caller: a policy this deployment cannot evaluate authorizes nobody.
+    const anon = await app.request("/x402-demo/quote");
+    expect(anon.status).toBe(503);
+    expect(((await anon.json()) as { error: string }).error).toBe("legal_body_check_unavailable");
+    const proven = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(proven.status).toBe(503);
+  });
+
+  test("an ACTIVE legal body still pays — and the 402 already carries X-NOVI-LEGAL-BODY", async () => {
+    const { deps, seen } = legalDeps(asBody("active"));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    // Standing is not a discount: the gate opens onto the normal invoice.
+    expect(res.status).toBe(402);
+    expect(seen.length).toBe(1);
+    expect(res.headers.get("X-NOVI-LEGAL-BODY")).toBe("843704");
+    expect(res.headers.get("X-AGENTKIT-HUMAN")).toBe(HUMAN);
+    const body = (await res.json()) as { accepts: unknown[] };
+    expect(body.accepts.length).toBe(1);
+  });
+
+  test("ACTIVE + a valid payment -> 200 with the header and legalBody on the receipt", async () => {
+    const { deps } = legalDeps(asBody("active"));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-NOVI-LEGAL-BODY")).toBe("843704");
+    const body = (await res.json()) as {
+      quote: string;
+      humanBacked: boolean;
+      legalBody: { agentId: string | null };
+    };
+    expect(body.quote).toBe("demo");
+    expect(body.humanBacked).toBe(true);
+    expect(body.legalBody).toEqual({ agentId: "843704" });
+  });
+
+  test("an active body with no agent id yet -> served, header omitted rather than faked", async () => {
+    const { deps } = legalDeps(asBody("active", null));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-NOVI-LEGAL-BODY")).toBeNull();
+    expect(((await res.json()) as { legalBody: unknown }).legalBody).toEqual({ agentId: null });
+  });
+
+  test("REGRESSION: accountable-only never consults the legal resolver", async () => {
+    const { deps, seen } = legalDeps({ kind: "none" });
+    const a = new Hono();
+    a.route(
+      "/",
+      buildPaywall({
+        trustPolicy: "accountable-only",
+        price: 10_000n,
+        payTo: PAYOUT,
+        asset: arcBatchingConfig.asset,
+        network: "eip155:5042002",
+        resource: "/x402-demo/quote",
+        resourceUrl: RESOURCE_URL,
+        agentkit: cfg(),
+        legalBody: deps,
+        serve: () => ({ quote: "demo" }),
+      }),
+    );
+    const res = await a.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(res.status).toBe(402); // the old behaviour, to the byte
+    expect(seen).toEqual([]);
   });
 });
