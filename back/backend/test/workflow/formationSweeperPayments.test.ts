@@ -69,9 +69,10 @@ beforeEach(() => {
 });
 afterEach(() => db.close());
 
-function sweeper(executor: FormationExecutorDeps, wired = true): FormationSweeper {
+/** Everything the sweeper needs EXCEPT the payment wiring — so one test can vary that alone. */
+function baseDeps(): Omit<FormationSweeperDeps, "payment"> {
   const doola = fakeDoola();
-  const d: FormationSweeperDeps = {
+  return {
     repo,
     companies,
     requests,
@@ -83,6 +84,12 @@ function sweeper(executor: FormationExecutorDeps, wired = true): FormationSweepe
     environment: "production",
     intervalMs: 60_000,
     now: () => now,
+  };
+}
+
+function sweeper(executor: FormationExecutorDeps, wired = true): FormationSweeper {
+  const d: FormationSweeperDeps = {
+    ...baseDeps(),
     payment: wired
       ? {
           payment: paymentCfg(payments),
@@ -359,4 +366,40 @@ test("PAYMENTS ARE RESOLVED BEFORE FILINGS ARE OPENED — the order is the point
   await s.tick();
   expect(order.indexOf("payments")).toBeGreaterThan(-1);
   expect(order.indexOf("payments")).toBeLessThan(order.indexOf("filings"));
+});
+
+test("R2: the chain head is refreshed every tick, not left at the one read at boot", async () => {
+  // `noteChainHead` was wired and never called, so `quoted_block` on every new quote pointed at a
+  // block from process start — and every later log scan walked the ladder from there.
+  const heads: bigint[] = [];
+  const c = company();
+  quote(c);
+  const chain = fakeChain();
+  const cfg = paymentCfg(payments, { noteChainHead: (b) => heads.push(b) });
+  const d: FormationSweeperDeps = {
+    ...baseDeps(),
+    payment: {
+      payment: cfg,
+      executor: chain.executor,
+      transaction: <T>(fn: () => T) => db.transaction(fn)(),
+    },
+  };
+  await new FormationSweeper(d).tick();
+  expect(heads).toEqual([5_000n]); // the shared fixture's head
+});
+
+test("R3: the per-tick budget covers the EXPIRED-QUOTE loop too", async () => {
+  // Each of these rows costs the same handful of chain calls as a stalled settle. A tick that has
+  // spent its budget on settles must not then walk fifty expired quotes.
+  for (let i = 0; i < MAX_SETTLES_PER_TICK + 3; i++)
+    quote(company(), {
+      validBefore: nowSec() - 1,
+      nonce: `0x${(0xa0 + i).toString(16).repeat(32)}` as Hex,
+    });
+  const chain = fakeChain();
+  await sweeper(chain.executor).tick();
+  const expired = payments
+    .listByStatus("expired", 100)
+    .filter((r) => r.status === "expired").length;
+  expect(expired).toBe(MAX_SETTLES_PER_TICK);
 });

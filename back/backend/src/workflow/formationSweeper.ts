@@ -463,6 +463,18 @@ export class FormationSweeper {
     };
     let settles = 0;
 
+    // ⚠ THE CHAIN HEAD, REFRESHED (2026-09-10 verifier, R2). `noteChainHead` was wired and never
+    // called, so the head a new quote recorded was the one read at BOOT — which on a long-lived
+    // process means every `quoted_block` points at a block from days ago and every later log scan
+    // walks the ladder from there. Read once per tick, here, because this leg is the only thing
+    // that runs on a timer with the payment config in hand. A failure is not fatal: a stale head
+    // costs a wider scan and never a wrong answer, which is why it can be swallowed.
+    try {
+      payment.payment.noteChainHead?.(await payment.executor.publicClient.getBlockNumber());
+    } catch {
+      // …and the leg carries on. The rows below are what this pass is for.
+    }
+
     for (const row of payment.payment.payments.listByStatus("settling", STRANDED_BATCH)) {
       // …and a CAP per tick, for the same reason the timeout is short: this leg makes chain calls
       // per row, and a backlog must be worked through over several passes rather than turned into
@@ -517,8 +529,13 @@ export class FormationSweeper {
     // may have been signed in a browser we never heard back from, and expiring one on a fast
     // server clock is how a guardian is asked to pay twice.
     for (const row of payment.payment.payments.listExpiredQuotes(nowSec, STRANDED_BATCH)) {
+      // ⚠ THE SAME BUDGET AS THE LOOP ABOVE (R3), and deliberately the same counter rather than a
+      // second one: these rows cost the same handful of chain calls each, and a tick that had
+      // already spent its budget on stalled settles must not then walk fifty expired quotes.
+      if (settles >= MAX_SETTLES_PER_TICK) break;
       const company = this.d.companies.find(row.companyId);
       if (!company) continue;
+      settles++;
       try {
         await withKeyedLock(`payment:${row.companyId}`, () =>
           advancePaymentOnChain(deps, company, row),
