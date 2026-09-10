@@ -7,21 +7,22 @@ For a seller already running World's AgentKit. Nothing here needs a change on Wo
 AgentKit answers one question about the agent paying you: does a verified unique human vouch for
 this address? `createLegalBodyAgentBook` adds the second: is this address the payment address of a
 Novi legal body in good standing? It answers both through one object, because AgentKit takes one
-object. A non-null answer now means both are true; `null` means at least one is not, which is the
-only refusal shape AgentKit has.
+object. A non-null answer means both are true; `null` means at least one is not — the only refusal
+shape AgentKit has.
+
+AgentKit reports every `null` as `agent_not_verified`, so if you show the buyer a reason, say the
+address did not meet **both** conditions and link the lookup for it — never "no verified human",
+which sends an agent with a good human off to fix the wrong thing.
 
 ## The swap
 
-Verified against the installed packages, `@worldcoin/agentkit` 0.2.0 and
-`@worldcoin/agentkit-core` 0.2.0.
-
+Verified against the installed `@worldcoin/agentkit` 0.2.0 and `@worldcoin/agentkit-core` 0.2.0.
 `createAgentkitHooks(options)` takes `options.agentBook: AgentBookVerifier`
-(`node_modules/@worldcoin/agentkit/dist/cjs/index.d.ts`, `CreateAgentkitHooksOptions` at line 111,
-the `agentBook` field at line 112, the factory at line 119). `AgentBookVerifier` is just the return
-type of `createAgentBookVerifier(options?)` from `@worldcoin/agentkit-core`
-(`dist/cjs/index.d.ts:188`), which is an object with a single method,
-`lookupHuman(address: string): Promise<string | null>` (line 194); the type alias is on line 196.
-So anything with that one method is a valid `agentBook`, and the swap is three lines:
+(`node_modules/@worldcoin/agentkit/dist/cjs/index.d.ts`: `CreateAgentkitHooksOptions` line 111, the
+`agentBook` field line 112, the factory line 119). `AgentBookVerifier` is the return type of
+`createAgentBookVerifier(options?)` from `@worldcoin/agentkit-core` (`dist/cjs/index.d.ts:188`,
+alias on 196): one method, `lookupHuman(address: string): Promise<string | null>` (line 194). So
+anything with that method is a valid `agentBook`, and the swap is three lines:
 
 ```ts
 import { createAgentkitHooks } from "@worldcoin/agentkit";
@@ -30,21 +31,27 @@ import { createLegalBodyAgentBook } from "./legalBodyAgentBook";
 
 const hooks = createAgentkitHooks({
   agentBook: createLegalBodyAgentBook({
-    agentBook: createAgentBookVerifier(),          // the real World Chain read, unchanged
-    lookupBaseUrl: "https://api.novicorpus.com",   // your Novi deployment
+    // the real World Chain read, untouched — its AgentBookOptions still apply (d.ts 180-186)
+    agentBook: createAgentBookVerifier(),
+    lookupBaseUrl: "https://api.novicorpus.com", // your Novi deployment
   }),
 });
 ```
 
-`createAgentBookVerifier()` still takes its usual `AgentBookOptions` (`client`, `contractAddress`,
-`rpcUrl`, lines 180-186) — the wrapper does not touch them.
+## Where the wrapper belongs, and where it does not
 
-The same object fits a seller that verifies the header itself instead of using the hooks. Our
-backend's `verifyAgentkitRequest` accepts an optional `agentBook` of exactly this shape
-(`back/backend/src/payments/worldVerifier.ts:66`) and calls `verifier.lookupHuman(agentAddress)`
-with the address recovered from the proof's signature (line 167), so passing
-`createLegalBodyAgentBook({ ... })` as `cfg.agentBook` turns that gate into a legal-body gate with
-no other change.
+The hooks path above is what this is built for: `createAgentkitHooks` calls `lookupHuman` once per
+request and caches nothing (its `AgentKitStorage` holds usage counters and nonces only,
+`agentkit/dist/cjs/index.d.ts:67-78`), so a suspension is visible on the very next request. Another
+gate with the same one-method shape works too, provided it does not cache the answer.
+
+**If your gate caches `lookupHuman` answers, cap positives to seconds and never cache `null`.** A
+cached yes keeps a suspended legal body trading for the whole TTL; a cached `null` records a failed
+read as a definitive no and refuses an agent in good standing until it expires. Our own
+`verifyAgentkitRequest` has exactly this shape (`back/backend/src/payments/worldVerifier.ts:66`,
+called at line 167) but memoises the reader's answer for an hour, sixty seconds for a negative
+(lines 28-32), so the wrapper does not go there; Novi's own `legal-bodies-only` seller verifies the
+AgentKit proof and then resolves the legal body directly, fresh, on every request.
 
 ## The lookup contract
 
@@ -66,23 +73,24 @@ no other change.
 ```
 
 An address we have no entity for answers 200 with `legalBody: false`, `standing: null`. A malformed
-address answers 400.
+address answers 400. `standing` has three values and only three:
 
-`standing` has three values and only three:
-
-- `active` — the entity's on-chain legal status is good and its treasury is not paused. This is the
-  only value the checker treats as a yes.
+- `active` — on-chain legal status good, treasury not paused. The only value the checker calls yes.
 - `inactive` — a definitive negative read: suspended, dissolved, or a paused treasury.
-- `unknown` — the chain read failed. It is not a yes and not a no, and it is never guessed or
-  remembered. Treat it as "we do not know", and refuse if your policy is fail-closed.
+- `unknown` — the chain read failed. Not a yes and not a no; never guessed, never remembered. Treat
+  it as "we do not know", and refuse if your policy is fail-closed.
 
-`formation` reports the filing state of the company behind the entity. It is reported, never
-gating: what a seller can verify is the on-chain legal body.
+`formation` reports the filing state of the company behind the entity, and never gates anything:
+what a seller can verify is the on-chain legal body.
+
+**Rate limit.** A token bucket of 30 refilling at 1 per second brakes the route, shared by every
+caller of that API process rather than held per caller. A throttled request is refused (429, or 503
+where a drained budget is spelled so) and reads, like any 5xx, as `null`: fail closed. Keep your
+request volume proportional to your traffic.
 
 ## What you may say
 
-The lookup reports what the chain says and no more. When the checker returns an id, the honest
-sentence is:
+The lookup reports what the chain says and no more, so when the checker returns an id, say:
 
 > a registered legal body in good standing stands behind this address
 
@@ -92,25 +100,21 @@ the agent: the human identifier stays anonymous.
 
 ## Spoofing
 
-The check is about an address, so only ask it about an address someone has just proved they
-control. AgentKit hands `lookupHuman` the signer recovered from the proof, which is why wrapping
-the verifier is safe: an attacker cannot present a legal body it cannot sign for. Calling the
-lookup with an address out of a request body, a query string or a form field proves nothing —
-anyone can name a legal body they do not control.
+The check is about an address, so only ask it about one someone has just proved they control.
+AgentKit hands `lookupHuman` the signer recovered from the proof, which is why wrapping the
+verifier is safe: an attacker cannot present a legal body it cannot sign for. Calling the lookup
+with an address out of a request body, a query string or a form field proves nothing at all.
 
 ## When something goes wrong
 
-Every doubt is `null`: no human, an AgentBook read that threw, any status other than 200, a body
-that is not the contract above, unparseable JSON, a network error, or no answer within `timeoutMs`
-(default 5000). The checker never throws, so it cannot take your 402 path down with it.
-
-If the extra call costs you too much, cache it yourself — but cache positive answers only (a
-negative is a state the agent is actively trying to leave), and keep the TTL short: a suspension
-takes effect on the next lookup, so a long cache is how you keep trading with an entity that is no
-longer in good standing. Our own lookup already memoises definitive answers for 15 seconds.
+Every doubt is `null`: no human, an AgentBook read that threw, any status other than 200 (a
+throttle and a 5xx included), a body that is not the contract above, unparseable JSON, a network
+error, or no answer within `timeoutMs` (default 5000). The checker never throws, so it cannot take
+your 402 path down with it, and it has no cache of its own — if you add one, seconds, positives only.
 
 ## Copying the file
 
 `back/backend/src/payments/legalBodyAgentBook.ts` imports nothing — not from this backend, not from
-npm. Copy it into your project, keep the header comment (it carries the two rules above), and it
-compiles as-is. It is not published to npm today.
+npm. Copy it in, keep the header comment (it carries the two rules above), and it compiles as-is
+against `@types/node` 18+ or `lib: ["dom"]` — the source of `fetch`, `AbortController` and
+`setTimeout`. It is not published to npm today.
