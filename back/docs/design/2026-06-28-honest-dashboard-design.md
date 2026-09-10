@@ -9,7 +9,7 @@
 
 ## 1. Context & goal
 
-The deployed onboarding wizard (`project-alpha-pi.vercel.app` + VPS backend `159.223.137.183:8789`)
+The deployed onboarding wizard (`project-alpha-pi.vercel.app` + VPS backend `<VPS_IP>:8789`)
 is real end-to-end — SIWE login, passkey, on-chain deploy, treasury funding all work (4 agents
 onboarded, 2 `funded`). But the final dashboard screen
 (`interface/src/components/onboarding/steps/DashboardStep.tsx`) shows **mocked** data:
@@ -108,7 +108,7 @@ New route **`GET /entities/:id/treasury`** (JWT, tenant-scoped — same auth/own
 
 ## 6. Deploy (order matters: backend first)
 
-- **Backend (me, via SSH):** on the VPS, `git -C /root/Project-Alpha pull` the merged code,
+- **Backend (me, via SSH):** on the VPS, `git -C <REPO_DIR> pull` the merged code,
   `npm install` if deps changed, `systemctl restart legalbody-api`, confirm `/healthz` + a curl of
   the new `/entities/:id/treasury` (with a token).
 - **Frontend (user, Vercel):** deploy after the backend endpoint is live, else the dashboard 404s.

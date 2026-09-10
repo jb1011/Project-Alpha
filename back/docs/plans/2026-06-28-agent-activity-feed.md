@@ -381,8 +381,8 @@ export function persistAgentRun(
 
 - [ ] Generate a fresh **pocket** + **customer** keypair (e.g. `cast wallet new` ×2, or viem `generatePrivateKey`). Record the pocket address.
 - [ ] Fund the **pocket** address with a small amount of Arc-testnet USDC (faucet `faucet.circle.com`) for gas + the float.
-- [ ] On the VPS, add to `/root/Project-Alpha/back/backend/.env`: `ANTHROPIC_API_KEY=…`, `POCKET_PRIVATE_KEY=…`, `CUSTOMER_PRIVATE_KEY=…`, `TREASURY_ADDRESS=0x9f01EF223BdB596625d8eE2E30F13A8aB527B0a5` (TestAgentMB_1), `VENDOR_PAYOUT_ADDRESS=…`, `AGENT_PAYOUT_ADDRESS=…` (distinct, ≠ treasury). Confirm `FUNDING_FLOAT_USDC` is small (default 0.50).
-- [ ] Check out `feat/agent-activity-feed` on the VPS so the persistence code is present: `cd /root/Project-Alpha && git fetch && git checkout feat/agent-activity-feed`.
+- [ ] On the VPS, add to `<REPO_DIR>/back/backend/.env`: `ANTHROPIC_API_KEY=…`, `POCKET_PRIVATE_KEY=…`, `CUSTOMER_PRIVATE_KEY=…`, `TREASURY_ADDRESS=0x9f01EF223BdB596625d8eE2E30F13A8aB527B0a5` (TestAgentMB_1), `VENDOR_PAYOUT_ADDRESS=…`, `AGENT_PAYOUT_ADDRESS=…` (distinct, ≠ treasury). Confirm `FUNDING_FLOAT_USDC` is small (default 0.50).
+- [ ] Check out `feat/agent-activity-feed` on the VPS so the persistence code is present: `cd <REPO_DIR> && git fetch && git checkout feat/agent-activity-feed`.
 - [ ] Run: `cd back/backend && npm run cli -- agent ask "What are USDC flows on Arc?"` (this is the FIRST live run — expect to iterate). Confirm it completes with a P&L line and prints settle transfer ids.
 - [ ] Confirm a receipt landed in the backend DB: `node -e` quick query of `agent_runs`/`run_payments`, or wait for Phase 2's endpoint.
 - [ ] **Do NOT restart the production backend onto this branch** — the live run writes to the same DB file; the prod service keeps serving the honest dashboard. (Switching the prod service to this branch only happens at deliberate merge time.)

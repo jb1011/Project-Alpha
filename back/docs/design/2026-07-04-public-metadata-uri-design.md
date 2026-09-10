@@ -8,7 +8,7 @@ local `file://` path, so the agent's legal identity is fetchable and verifiable 
 ## Problem
 
 At onboarding, the agent's metadata JSON is written to the local doc store and its `file://` URI
-(`file:///root/Project-Alpha/.../meta-<key>.json`) is baked **on-chain** via `createEntity(..., metadataURI,
+(`file://<REPO_DIR>/.../meta-<key>.json`) is baked **on-chain** via `createEntity(..., metadataURI,
 ...)` (`onboarding.ts:164` → `:200` → `arcAdapter.broadcastCreateEntity`). A `file://` path only resolves on
 our one VPS box, so any third party — another agent, a counterparty, an agent directory, a block explorer —
 that reads the agent's on-chain identity (e.g. agentId 842839) and follows the metadata link hits a dead end.

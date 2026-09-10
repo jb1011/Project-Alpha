@@ -24,7 +24,7 @@
 Four problems, one move fixes all of them:
 
 1. **The backend is reachable unencrypted.** The browser→Vercel hop is HTTPS, but Vercel→VPS is
-   plain HTTP (`http://159.223.137.183:8789`, the hardcoded fallback in
+   plain HTTP (`http://<VPS_IP>:8789`, the hardcoded fallback in
    `interface/src/app/backend/[[...path]]/route.ts`). The VPS has **no TLS listener at all**.
    Session JWTs and MCP API keys cross the public internet in the clear on that hop, and the API
    port answers directly from the internet — bypassing Vercel entirely.
@@ -62,11 +62,11 @@ In-flight work is also safe: onboarding and job sagas are resumable from SQLite
 
 ## Current state (ground truth for whoever executes this)
 
-- Host `159.223.137.183` (DigitalOcean, NYC1), Ubuntu, 1 vCPU / 458 MB RAM / 9.3 GB, 2 GB swap
+- Host `<VPS_IP>` (DigitalOcean, NYC1), Ubuntu, 1 vCPU / 458 MB RAM / 9.3 GB, 2 GB swap
 - Node **v20.20.2**; service `legalbody-api.service` (systemd, `User=root`,
-  `WorkingDirectory=/root/Project-Alpha/back/backend`, `ExecStart=/usr/bin/npm run api`,
+  `WorkingDirectory=<REPO_DIR>/back/backend`, `ExecStart=/usr/bin/npm run api`,
   `EnvironmentFile=…/.env`), listening on `*:8789`
-- Repo at `/root/Project-Alpha`, deployed by `git pull` + `systemctl restart` (manual)
+- Repo at `<REPO_DIR>`, deployed by `git pull` + `systemctl restart` (manual)
 - **Data to migrate:** `back/backend/data/legalbody.db` (~140 KB, 11 entities / 4 jobs) **and**
   `back/backend/data/documents/` (~26 files, 4 MB)
 - `.env`: ~45 vars incl. secrets. Circle API key is **IP-pinned** to this host.

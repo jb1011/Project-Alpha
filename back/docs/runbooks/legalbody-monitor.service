@@ -15,7 +15,7 @@
 
 [Unit]
 Description=Novi Corpus controller monitor
-Documentation=file:///root/Project-Alpha/back/docs/runbooks/controller-monitoring.md
+Documentation=file://<REPO_DIR>/back/docs/runbooks/controller-monitoring.md
 After=network-online.target
 Wants=network-online.target
 
@@ -23,8 +23,8 @@ Wants=network-online.target
 Type=simple
 User=novi
 Group=novi
-WorkingDirectory=/root/Project-Alpha/back/backend
-EnvironmentFile=/root/Project-Alpha/back/backend/.env
+WorkingDirectory=<REPO_DIR>/back/backend
+EnvironmentFile=<REPO_DIR>/back/backend/.env
 Environment=NODE_ENV=production
 ExecStart=/usr/bin/npm run monitor
 
@@ -45,7 +45,7 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 # ReadWritePaths must cover DATA_DIR (monitor.db lives there). Adjust if DATA_DIR moves.
-ReadWritePaths=/root/Project-Alpha/back/backend/data
+ReadWritePaths=<REPO_DIR>/back/backend/data
 
 [Install]
 WantedBy=multi-user.target

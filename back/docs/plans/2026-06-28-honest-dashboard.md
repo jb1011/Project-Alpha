@@ -287,7 +287,7 @@ export const treasuryAbi = [
 
 ## Deploy (order: backend first)
 
-- [ ] **Backend** (over SSH, by the controller). Once the backend tasks are merged to `main`: `ssh root@159.223.137.183`, then `cd /root/Project-Alpha && git checkout main && git pull`, `cd back/backend` (no new deps, so skip `npm install`), `systemctl restart legalbody-api`. Confirm: `curl -s localhost:8789/healthz` → `{"ok":true}`, then `curl` the new `/entities/:id/treasury` with a valid token for a funded agent → real numbers matching that treasury on Arcscan. (If demoing before merge, `git fetch && git checkout feat/honest-dashboard` on the box instead.)
+- [ ] **Backend** (over SSH, by the controller). Once the backend tasks are merged to `main`: `ssh <VPS_USER>@<VPS_IP>`, then `cd <REPO_DIR> && git checkout main && git pull`, `cd back/backend` (no new deps, so skip `npm install`), `systemctl restart legalbody-api`. Confirm: `curl -s localhost:8789/healthz` → `{"ok":true}`, then `curl` the new `/entities/:id/treasury` with a valid token for a funded agent → real numbers matching that treasury on Arcscan. (If demoing before merge, `git fetch && git checkout feat/honest-dashboard` on the box instead.)
 - [ ] **Frontend** (Vercel, by the user): deploy `feat/honest-dashboard` (preview) or merge → production **after** the backend endpoint is live.
 
 ## Self-Review
