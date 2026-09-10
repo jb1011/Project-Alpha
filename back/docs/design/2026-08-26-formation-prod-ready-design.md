@@ -391,9 +391,10 @@ Flow:
    later hot-float phase (built only if refund volume justifies it) adds `formation_refund` to
    `OutflowPath` TOGETHER WITH an env invariant `PLATFORM_OUTFLOW_CEILING_USDC >= FORMATION_FEE_USDC`
    beside the existing `maxTreasuryFund` guard. Boot invariants: revenue address ≠ the platform key and ≠
-   every other platform key (a fixed set plus an indexed `EXISTS` over operator addresses, not a fleet
-   scan), the same separation for `FORMATION_SETTLE_SUBMITTER_KEY`, and payment cannot be required in
-   sandbox.
+   every other platform key (a fixed env set, plus an `EXISTS` over the fleet's operator and pocket
+   addresses — which MAY SCAN, and does: it runs once, at boot, on a deployment that charges, where
+   an index on `entities` would be paid for on every write to that table forever), the same
+   separation for `FORMATION_SETTLE_SUBMITTER_KEY`, and payment cannot be required in sandbox.
 7. **Identity floor (the anonymous-USDC-buys-real-LLCs finding):** production formation
    (`DOOLA_ENVIRONMENT=production` OR payment required) boot-FAILS unless `cfg.world` is CONSTRUCTED
    (all three `WORLD_*` present) AND `world.requireGuardian` AND `world.maxCompaniesPerHuman != null`
