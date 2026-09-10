@@ -49,6 +49,7 @@ import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookRe
 import { buildEntityPaymentService } from "../payments/entityPayment";
 import { LOW_SUBMITTER_BALANCE_WEI } from "../payments/formationSettle";
 import { PaymentLedger } from "../payments/ledger";
+import { createLegalBodyResolver } from "../payments/legalBody";
 import { buildOutflowMeter } from "../payments/outflowMeter";
 import { buildPocketFunding } from "../payments/pocketFunding";
 import { buildSellerTrust } from "../payments/sellerTrust";
@@ -203,6 +204,23 @@ async function main() {
       `⚠ NoviController mode: manager identity = ${platformManagerAddress}, executor (signing key) = ${executor.address}, factory = ${factoryAddress}`,
     );
 
+  // The ONE resolver for "is this address a Novi legal body in good standing?" (design
+  // 2026-09-10 D1): built once, here, from the repository and the SAME two Arc reads the buyer
+  // dial has always used, and shared by every surface that asks the question — the buyer dial
+  // below today, the public lookup and the `legal-bodies-only` seller policy next. It holds no
+  // state and caches nothing (D8), so sharing it costs nothing and guarantees that a suspension
+  // means the same thing to every caller.
+  // (Task 2 hands this same instance to `buildApiApp` as `deps.legalBody` — one added optional
+  // field on `ApiDeps` in app.ts, which is that task's file, and the public lookup route reads it
+  // from there. Nothing else about the wiring changes.)
+  const legalBody = createLegalBodyResolver({
+    // Payer-keyed (D2): an AgentKit proof carries the pocket, not the treasury.
+    findByPocketAddress: (addr) => repo.findByPocketAddress(addr),
+    findByTreasury: (addr) => repo.findByTreasury(addr),
+    legalStatus: (proxy) => arc.legalStatus(proxy),
+    treasuryPaused: (treasury) => arc.treasuryPaused(treasury),
+  });
+
   // Per-entity payment service (treasury_status/pay tools) needs a pocket-derivation seed; leave
   // it undefined on deployments that haven't set POCKET_MASTER_SEED so they keep working (the
   // tools then return "payments unavailable" instead of failing to boot).
@@ -222,15 +240,9 @@ async function main() {
             rpcUrl: cfg.worldChain?.rpcUrl ?? WORLD_CHAIN_DEFAULTS.rpcUrl,
             contractAddress: cfg.worldChain?.agentBook ?? WORLD_CHAIN_DEFAULTS.agentBook,
           }),
-          // Legal-bodies tier: local registry lookup + the same Arc reads the dashboard trusts.
-          legalBodies: {
-            findByTreasury: (addr) => {
-              const rec = repo.findByTreasury(addr);
-              return rec ? { proxy: rec.proxy, treasury: rec.treasury } : undefined;
-            },
-            legalStatus: (proxy) => arc.legalStatus(proxy),
-            treasuryPaused: (treasury) => arc.treasuryPaused(treasury),
-          },
+          // Legal-bodies tier: the shared resolver above — the same instance, and therefore the
+          // same definition of standing, that the public lookup and the seller policy use.
+          legalBody,
         }),
         circleApi,
       })
