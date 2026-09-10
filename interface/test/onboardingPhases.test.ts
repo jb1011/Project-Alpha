@@ -49,15 +49,83 @@ test("G2: a phase from corrupt storage falls back to the first visible phase", (
   expect(snapToVisiblePhase(withFormation, "not-a-phase" as never)).toBe("welcome");
 });
 
-test("G2: snapping never carries a user PAST a step, except the skipped one", () => {
-  // Every snap either stays put, or lands earlier in the canonical order — the single exception
-  // being `legal-body`, whose whole point is that the flow skips it.
+test("G2: snapping never carries a user PAST a step, except the skipped ones", () => {
+  // Every snap either stays put, or lands earlier in the canonical order — the exceptions being
+  // the OPTIONAL steps, whose whole point is that the flow skips them. `payment` (B1) joins
+  // `legal-body` in that list: both snap forward to `custody`, which is where the flow itself
+  // sends users when either is absent, and snapping backwards would re-run a completed step.
   const canonical = (id: string) => PHASES.findIndex((p) => p.id === id);
   for (const p of PHASES) {
-    if (p.id === "legal-body") continue;
+    if (p.id === "legal-body" || p.id === "payment") continue;
     const snapped = snapToVisiblePhase(withoutFormation, p.id);
     expect(canonical(snapped), p.id).toBeLessThanOrEqual(canonical(p.id));
   }
+});
+
+/* ── the PAYMENT phase (B1, design §6.1) ───────────────────────────────────── */
+
+test("B1: the payment step is absent during the beta, on every deployment", () => {
+  // `visiblePhases(true)` is the beta shape and the default: a backend that predates
+  // `/config.formationPaymentRequired` does not charge, and a step whose every endpoint would 404
+  // is worse than no step at all.
+  expect(withFormation.map((p) => p.id)).not.toContain("payment");
+  expect(visiblePhases(true, false).map((p) => p.id)).not.toContain("payment");
+});
+
+test("B1: it appears between the legal body and custody where the deployment charges", () => {
+  const charging = visiblePhases(true, true, true);
+  expect(nextPhase(charging, "legal-body")).toBe("payment");
+  expect(nextPhase(charging, "payment")).toBe("custody");
+  expect(prevPhase(charging, "custody")).toBe("payment");
+});
+
+test("⚠ B5: with NO COMPANY there is no fee step — the skip must not land on one", () => {
+  // With formation optional a user can skip the legal body entirely. A payment phase behind that
+  // skip has no company to quote for, no endpoint that would answer and no exit: the wizard
+  // would carry them into a dead end on a deployment that charges.
+  const skipped = visiblePhases(true, true, false);
+  expect(skipped.map((p) => p.id)).not.toContain("payment");
+  expect(nextPhase(skipped, "legal-body")).toBe("custody");
+  // …and the moment a company exists, the step is there.
+  expect(nextPhase(visiblePhases(true, true, true), "legal-body")).toBe("payment");
+});
+
+test("B1: a deployment that forms NOTHING cannot charge for a formation", () => {
+  // Subordinate, not independent: the payment phase goes wherever the legal-body one does,
+  // whatever the flag says. A box that cannot form a company has nothing to take money for.
+  expect(visiblePhases(false, true, true).map((p) => p.id)).not.toContain("payment");
+  expect(visiblePhases(false, true, true).map((p) => p.id)).not.toContain("legal-body");
+});
+
+test("B1: a session stranded on `payment` after the flag goes off snaps FORWARD to custody", () => {
+  // The `legal-body` rule, for the same reason: the fee step is one the flow itself skips, and
+  // sending somebody back to re-pick a company they already chose would be worse than the snap.
+  expect(snapToVisiblePhase(withFormation, "payment")).toBe("custody");
+});
+
+test("⚠ B6: …unless the company is still UNPAID, which nothing can now resolve", () => {
+  // Snapping forward is right for a READY company: the step was skipped and nothing is owed. It
+  // is wrong for a draft: with payment off, no door will ever move that company out of draft, so
+  // the wizard would carry the user through custody, configure and agreement towards a submit
+  // that cannot succeed. The company's SERVER-DERIVED STATE decides, not the presence of a handle.
+  const stranded = (companyState: string | null) =>
+    resumePhase({
+      phases: withFormation,
+      storedPhase: "payment",
+      formationAvailable: true,
+      formationRequired: false,
+      companyId: "c1",
+      entityId: null,
+      needsCompany: false,
+      companyState,
+    });
+  expect(stranded("draft")).toBe("legal-body");
+  // `paying` is the same situation one step earlier: a live quote nobody can settle any more.
+  expect(stranded("paying")).toBe("legal-body");
+  // A company that is READY owes nothing, and the ordinary forward snap applies.
+  expect(snapToVisiblePhase(withFormation, stranded("ready"))).toBe("custody");
+  // …and with the state unknown we do not invent a correction.
+  expect(snapToVisiblePhase(withFormation, stranded(null))).toBe("custody");
 });
 
 test("G9: neighbours come from the VISIBLE list, so the optional step drops out of both", () => {

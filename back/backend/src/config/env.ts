@@ -255,6 +255,77 @@ const EnvSchema = z.object({
   /** The PREVIOUS key, during a rotation window only. Rows name the key they were written with,
    *  so this one is SELECTED for the rows that need it, never trial-decrypted. */
   FORMATION_PII_KEY_PREVIOUS: z.string().optional(),
+
+  // --- FORMATION PAYMENTS (2026-08-26 §6; B1). Built now, shipped OFF. -----------------------
+  /**
+   * Whether a company must be PAID FOR before it can be filed.
+   *
+   * Tri-state like its siblings, but the derived default is a flat FALSE rather than "on when the
+   * provider is configured": formation is free during the beta by decision (§6, decision 3), and
+   * turning on a real charge is never something another variable gets to do implicitly.
+   */
+  FORMATION_PAYMENT_REQUIRED: z.string().optional(),
+  /**
+   * The all-in formation fee in WHOLE USDC (provisional 399, §6.8).
+   *
+   * An integer, deliberately. It is public pricing rendered verbatim on `/config` and in copy,
+   * and the Wyoming state fee ($100, OUTSIDE doola's pack) is shown as a BREAKDOWN LINE rather
+   * than added at checkout — so nothing here ever needs a cent. It is converted to 6-decimal
+   * atomic USDC once, when a quote row is written, and the ROW is what verification compares
+   * against for the rest of that payment's life.
+   */
+  FORMATION_FEE_USDC: z.coerce.number().int().positive().default(399),
+  /**
+   * Where the fee is paid — a LEDGER hardware-wallet account, receive-only, no key on the box
+   * (§6.6). Required when payment is required, and refused when it equals any key this
+   * deployment signs with (the invariants below).
+   */
+  FORMATION_REVENUE_ADDRESS: addressSchema.optional(),
+  /**
+   * THE DEDICATED SETTLE SUBMITTER (B1 gate A2) — the EOA that puts guardians' authorizations
+   * on-chain, and does nothing else.
+   *
+   * Its own key rather than `PLATFORM_PRIVATE_KEY` for three separable reasons, each of which
+   * would justify it alone:
+   *
+   *  1. NONCE SPACE. The platform key signs registry writes, sweeps and job transactions. Two
+   *     producers on one nonce means a settle can be starved (or replaced) by unrelated traffic
+   *     at exactly the moment a guardian is watching a spinner;
+   *  2. GAS BALANCE. On Arc the gas token IS USDC, so the submitter's balance is a visible,
+   *     top-uppable, single-purpose float — not a number that moves whenever anything else runs;
+   *  3. AUTHORITY. This key needs none. It is not the factory owner, not the controller, not a
+   *     treasury signer; a compromise of it can waste gas and nothing more.
+   *
+   * Required when payment is required, and refused when it collides with the executor, the
+   * revenue address or any other key this box signs with (the invariants below).
+   */
+  FORMATION_SETTLE_SUBMITTER_KEY: privKeySchema.optional(),
+  /**
+   * THE SETTLEMENT GRACE (B1 gate A4) — how much longer than the QUOTE the AUTHORIZATION stays
+   * valid for.
+   *
+   * They are two different deadlines and conflating them cost us both ends. The quote's TTL is a
+   * promise to a human: "this price stands for 30 minutes". `validBefore` is a promise to the
+   * TOKEN, and it has to survive the whole settlement — the signature arriving, the transaction
+   * being composed, broadcast, mined and (if the box crashes) re-composed by the sweeper. With
+   * one deadline for both, an authorization signed at minute 29 expires while its own transfer
+   * is in the mempool, and the guardian is told to pay again for a payment that may still land.
+   *
+   * So `validBefore = quote TTL + this`, the countdown a guardian sees is the TTL, and a settle
+   * request past the TTL is refused with a re-quote even though the token would still accept it.
+   */
+  FORMATION_SETTLE_GRACE_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(15 * 60 * 1000),
+  /** How long a quote stands before the sweeper expires it. 30 minutes: long enough to read the
+   *  page and open a wallet, short enough that a forgotten tab is not a live authorization. */
+  FORMATION_QUOTE_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(30 * 60 * 1000),
 });
 
 /** doola API hosts per environment. `DOOLA_BASE_URL` overrides both (staging/mock/replay). */
@@ -434,6 +505,30 @@ export interface Config {
      * of a throw at the first filing — and so nothing downstream ever holds the env string.
      */
     pii?: import("../formation/pii").PiiKeyring;
+    /**
+     * PAYMENTS (§6). One object, present on every deployment (the knobs always have values), with
+     * `required` the only switch that changes behaviour.
+     *
+     * `revenueAddress` is OPTIONAL in the type and REQUIRED by a boot invariant whenever
+     * `required` is true, so a deployment that charges can never be one that has nowhere to be
+     * paid. It is deliberately kept OFF `/config`: the quote carries `payTo` on an authenticated
+     * route instead (§6.8).
+     */
+    payment: {
+      required: boolean;
+      /** Whole USDC. The atomic conversion happens once, at quote time. */
+      feeUsdc: number;
+      /** 6-decimal atomic USDC — the same number, in the unit the token speaks. */
+      feeAtomic: bigint;
+      revenueAddress?: Address;
+      /** The dedicated settle submitter's key. Optional in the TYPE and required by a boot
+       *  invariant whenever `required` is true, so a deployment that charges always has a
+       *  single-purpose EOA to submit through. */
+      submitterKey?: Hex;
+      quoteTtlMs: number;
+      /** How much longer than the quote the AUTHORIZATION stays valid (§6.4, gate A4). */
+      settleGraceMs: number;
+    };
   };
 }
 
@@ -658,6 +753,23 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
               : undefined,
           }
         : undefined,
+      payment: {
+        // FALSE unless explicitly set — unlike `required`/`sandboxSyntheticPii`, nothing derives
+        // it. Charging for something is a decision an operator makes in as many words.
+        required: boolWithDerivedDefault(
+          e.FORMATION_PAYMENT_REQUIRED,
+          false,
+          "FORMATION_PAYMENT_REQUIRED",
+        ),
+        feeUsdc: e.FORMATION_FEE_USDC,
+        // ONE conversion, here, so no caller multiplies by 1e6 for itself. Exact: the fee is an
+        // integer number of dollars, so this is integer arithmetic all the way down.
+        feeAtomic: BigInt(e.FORMATION_FEE_USDC) * 1_000_000n,
+        revenueAddress: e.FORMATION_REVENUE_ADDRESS,
+        submitterKey: e.FORMATION_SETTLE_SUBMITTER_KEY,
+        quoteTtlMs: e.FORMATION_QUOTE_TTL_MS,
+        settleGraceMs: e.FORMATION_SETTLE_GRACE_MS,
+      },
     },
   };
 
@@ -748,19 +860,32 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   //
   // Not gated on NODE_ENV: the testnet box runs NODE_ENV=production against doola SANDBOX by
   // design, and a production doola environment is always a deliberate act.
-  if (cfg.doola?.environment === "production") {
+  //
+  // TWO deployments are "production formation" for this purpose (§6.7): a box pointed at doola
+  // production, and a box that CHARGES. The second is not a subset of the first — a deployment
+  // could in principle take money with no provider credentials at all — and an anonymous wallet
+  // buying a legal body is the same harm either way, so the floor is asserted for both. The
+  // clause names whichever one applies, because an operator reading a refusal needs to know
+  // which switch it came from.
+  const paymentRequired = cfg.formation.payment.required;
+  if (cfg.doola?.environment === "production" || paymentRequired) {
+    const because = paymentRequired
+      ? "FORMATION_PAYMENT_REQUIRED is on"
+      : "DOOLA_ENVIRONMENT=production";
     if (!cfg.world)
       throw new Error(
-        "Invalid config: DOOLA_ENVIRONMENT=production requires the World ID block (WORLD_APP_ID + WORLD_RP_ID + WORLD_RP_SIGNING_KEY) — production formation files real Wyoming LLCs, and without all three the guardian gate silently passes everyone",
+        `Invalid config: ${because} requires the World ID block (WORLD_APP_ID + WORLD_RP_ID + WORLD_RP_SIGNING_KEY) — production formation files real Wyoming LLCs, and without all three the guardian gate silently passes everyone`,
       );
     if (!cfg.world.requireGuardian)
       throw new Error(
-        "Invalid config: DOOLA_ENVIRONMENT=production with WORLD_REQUIRE_GUARDIAN off — production formation spends real money on a real legal record and the guardian must be a verified unique human",
+        `Invalid config: ${because} with WORLD_REQUIRE_GUARDIAN off — production formation spends real money on a real legal record and the guardian must be a verified unique human`,
       );
     if (cfg.world.maxCompaniesPerHuman == null)
       throw new Error(
-        "Invalid config: DOOLA_ENVIRONMENT=production requires WORLD_MAX_COMPANIES_PER_HUMAN — an unbounded per-human filing count is how one verified human buys a hundred LLCs",
+        `Invalid config: ${because} requires WORLD_MAX_COMPANIES_PER_HUMAN — an unbounded per-human filing count is how one verified human buys a hundred LLCs`,
       );
+  }
+  if (cfg.doola?.environment === "production") {
     // ── THE PII KEY (2026-08-26 §4.2) ────────────────────────────────────────────────────────
     //
     // Production formation is the ONLY deployment that collects an SSN, and it collects one on
@@ -771,6 +896,105 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       throw new Error(
         "Invalid config: DOOLA_ENVIRONMENT=production requires FORMATION_PII_KEY — production formation collects the responsible party's SSN and it is stored encrypted (generate one with: openssl rand -base64 32)",
       );
+  }
+
+  // ── FORMATION PAYMENTS (2026-08-26 §6.6/§6.7) ──────────────────────────────────────────────
+  //
+  // Everything here refuses at BOOT rather than at the first quote, for the reason every other
+  // money invariant in this file does: the other side of that request is a guardian's wallet and
+  // a real 399 USDC transfer, and the failure modes are silent ones — a fee paid to an address
+  // nobody holds a key for, or a fee paid to OUR OWN hot wallet, which would look exactly like a
+  // successful payment while moving the money nowhere.
+  if (paymentRequired) {
+    if (!cfg.formation.payment.revenueAddress)
+      throw new Error(
+        "Invalid config: FORMATION_PAYMENT_REQUIRED is on but FORMATION_REVENUE_ADDRESS is missing — a deployment that charges for formation must say where the money goes (a Ledger account; see docs/runbooks/doola-deploy.md)",
+      );
+
+    // ⚠ SANDBOX MUST NEVER CHARGE. A sandbox filing is a DEMO-watermarked record that is not a
+    // legal body at all, and taking 399 USDC for one is not a misconfiguration, it is a
+    // deception. Keyed on the RAW env value rather than on `cfg.doola`, deliberately: a box with
+    // no doola credentials at all still reads `DOOLA_ENVIRONMENT=sandbox`, and a deployment that
+    // forms nothing is exactly the one that must not charge for a formation.
+    if (e.DOOLA_ENVIRONMENT === "sandbox")
+      throw new Error(
+        "Invalid config: FORMATION_PAYMENT_REQUIRED is on with DOOLA_ENVIRONMENT=sandbox — a sandbox filing is a DEMO record, not a legal body, and charging for one would take real USDC for nothing (set DOOLA_ENVIRONMENT=production, or unset FORMATION_PAYMENT_REQUIRED)",
+      );
+
+    // ⚠ AND A BOX THAT CANNOT FILE MUST NOT CHARGE FOR A FILING (finding B9).
+    //
+    // The sandbox refusal above catches the ordinary shape of this — a deployment with no doola
+    // block reads `DOOLA_ENVIRONMENT=sandbox` by default. It does NOT catch the deliberate one:
+    // `DOOLA_ENVIRONMENT=production` with no credentials, which boots, prints "FORMATION PAYMENTS
+    // ENABLED", quotes the fee, takes the money and can never open a filing, because every
+    // formation door is behind `canFormEntities`. The fee would be the only thing on the box that
+    // worked.
+    if (!canFormEntities(cfg))
+      throw new Error(
+        "Invalid config: FORMATION_PAYMENT_REQUIRED is on but this deployment cannot file anything — DOOLA_API_KEY and DOOLA_WEBHOOK_SECRET are not both set, so canFormEntities is false and every formation door is closed. It would quote and take a formation fee for a filing it could never open",
+      );
+
+    // The revenue address must not be a key this box signs with (§6.6). Two different harms sit
+    // behind the two arms: the EXECUTOR is the wallet that SUBMITS the transfer, so paying it
+    // would make every settlement a no-op that still looks settled; any OTHER platform key is a
+    // hot wallet on the box, which is the opposite of the receive-only Ledger the revenue
+    // address is supposed to be.
+    //
+    // The fixed set is enumerated rather than derived, so a key added to Config without being
+    // added here is a compile-time-visible omission in ONE place. Operator addresses of the
+    // FLEET are checked separately, against the database, at API boot — see
+    // `assertRevenueAddressSeparation`: they are rows, not env, and env parsing has no DB.
+    const revenue = cfg.formation.payment.revenueAddress.toLowerCase();
+    const platform = privateKeyToAccount(cfg.platformPrivateKey).address.toLowerCase();
+    if (revenue === platform)
+      throw new Error(
+        "Invalid config: FORMATION_REVENUE_ADDRESS equals the PLATFORM_PRIVATE_KEY address — that is a hot key on this box, and formation revenue lands on a receive-only Ledger account with no key here",
+      );
+    // ONE list, used by BOTH separation checks below. A key added to Config without being added
+    // here is then a single visible omission rather than two.
+    const signingKeys: Array<[string, Hex | undefined]> = [
+      ["CUSTOMER_PRIVATE_KEY", cfg.customerPrivateKey],
+      ["OPERATOR_PRIVATE_KEY", cfg.operatorPrivateKey],
+      ["JOB_CLIENT_PRIVATE_KEY", cfg.jobClientPrivateKey],
+      ["JOB_EVALUATOR_PRIVATE_KEY", cfg.jobEvaluatorPrivateKey],
+      ["X402_PROOF_AGENT_KEY", cfg.x402ProofAgentKey],
+      ["ENS_GATEWAY_SIGNER_KEY", cfg.ens?.signerKey],
+      ["WORLDCHAIN_SUBMITTER_PRIVATE_KEY", cfg.agentBook?.submitterPrivateKey],
+    ];
+    for (const [name, key] of signingKeys) {
+      if (key && privateKeyToAccount(key).address.toLowerCase() === revenue)
+        throw new Error(
+          `Invalid config: FORMATION_REVENUE_ADDRESS equals the ${name} address — formation revenue lands on a receive-only Ledger account, never on a key this box holds`,
+        );
+    }
+
+    // ── THE SETTLE SUBMITTER (B1 gate A2) ─────────────────────────────────────────────────
+    //
+    // A dedicated EOA: its own nonce space, its own USDC gas float, no authority anywhere. The
+    // invariants say what it must NOT be, and each collision is a distinct harm — sharing the
+    // platform key's nonce space starves settles behind unrelated traffic; being the revenue
+    // address means the fee is paid to the wallet that just paid the gas to move it; being any
+    // other platform key gives a gas-only role authority it must never have.
+    const submitterKey = cfg.formation.payment.submitterKey;
+    if (!submitterKey)
+      throw new Error(
+        "Invalid config: FORMATION_PAYMENT_REQUIRED is on but FORMATION_SETTLE_SUBMITTER_KEY is missing — settlements go out through a DEDICATED EOA (its own nonce space, its own USDC gas balance, no governance authority); see docs/runbooks/doola-deploy.md",
+      );
+    const submitter = privateKeyToAccount(submitterKey).address.toLowerCase();
+    if (submitter === platform)
+      throw new Error(
+        "Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is the PLATFORM_PRIVATE_KEY — the submitter exists precisely to have its own nonce space and no authority, and sharing the platform key gives it both problems back",
+      );
+    if (submitter === revenue)
+      throw new Error(
+        "Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is the FORMATION_REVENUE_ADDRESS — every settlement would pay the fee to the same wallet that just paid the gas to move it, which looks exactly like a successful payment while moving the money nowhere",
+      );
+    for (const [name, key] of signingKeys) {
+      if (key && privateKeyToAccount(key).address.toLowerCase() === submitter)
+        throw new Error(
+          `Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is the ${name} — the settle submitter is a gas-only identity and must hold no other role on this box`,
+        );
+    }
   }
 
   // A rotation with nothing to rotate FROM is a typo, and the shape it produces is silent: every
@@ -985,6 +1209,22 @@ export function redact(cfg: Config): Record<string, unknown> {
     // a rotation actually in progress.
     formation: {
       ...cfg.formation,
+      // The fee, as a STRING — the `maxJobBudget` rule, for the same reason: `redact` exists to be
+      // JSON.stringify'd into the boot log, and a bigint anywhere in the object throws
+      // "Do not know how to serialize a BigInt", which would take the whole boot line with it.
+      //
+      // The revenue ADDRESS is NOT redacted, deliberately. It is not a secret (it is on-chain the
+      // moment anyone pays), and it is exactly what an operator checking a box against the Ledger
+      // needs to read in the boot line. It stays off `/config` for a different reason: that is a
+      // PUBLIC capability document, and pricing belongs there while a payee does not (§6.8).
+      payment: cfg.formation
+        ? {
+            ...cfg.formation.payment,
+            feeAtomic: cfg.formation.payment.feeAtomic.toString(),
+            // …but the SUBMITTER KEY is key material, and the boot log is journald.
+            submitterKey: cfg.formation.payment.submitterKey ? "REDACTED" : undefined,
+          }
+        : undefined,
       pii: cfg.formation?.pii
         ? {
             current: { id: cfg.formation.pii.current.id, key: "REDACTED" },

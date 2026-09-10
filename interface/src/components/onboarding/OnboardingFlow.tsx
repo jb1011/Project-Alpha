@@ -33,7 +33,8 @@ import {
   emptyCompanyIntake,
   type CompanyIntakeForm,
 } from "@/lib/formation/companyIntake";
-import { usePublicConfigQuery } from "@/lib/api/hooks";
+import { useCompanyQuery, usePublicConfigQuery } from "@/lib/api/hooks";
+import { PAYMENT_NO_LONGER_REQUIRED } from "@/lib/formation/payment";
 import {
   buildPersistedOnboarding,
   clearOnboardingStorage,
@@ -45,6 +46,7 @@ import {
 import { WelcomeStep } from "./steps/WelcomeStep";
 import { GuardianStep } from "./steps/GuardianStep";
 import { LegalBodyStep } from "./steps/LegalBodyStep";
+import { PaymentStep } from "./steps/PaymentStep";
 import { CustodyStep } from "./steps/CustodyStep";
 import { ConfigureStep } from "./steps/ConfigureStep";
 import { AgreementStep } from "./steps/AgreementStep";
@@ -123,7 +125,18 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
   const { data: publicConfig } = usePublicConfigQuery();
   const formationAvailable = publicConfig?.formationAvailable === true;
   const formationRequired = publicConfig?.formationRequired === true;
-  const phases = useMemo(() => visiblePhases(formationAvailable), [formationAvailable]);
+  // B1: the fee step, present only where the deployment charges. Anything other than an explicit
+  // `true` hides it — a backend that predates the field does not charge, and a payment step whose
+  // every endpoint would 404 is worse than no step.
+  const paymentRequired = publicConfig?.formationPaymentRequired === true;
+  // …and only once there is a COMPANY to owe it (finding B5). With formation optional a user can
+  // skip the legal-body step, and a payment phase behind that skip has nothing to quote for and
+  // no way out. The step appears the moment `POST /companies` returns a handle — which is the
+  // moment the fee is actually owed.
+  const phases = useMemo(
+    () => visiblePhases(formationAvailable, paymentRequired, session.companyId !== null),
+    [formationAvailable, paymentRequired, session.companyId],
+  );
 
   /**
    * Past the legal-body step with no company handle → the wizard shows that step again.
@@ -136,6 +149,19 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * DERIVED during render rather than corrected by an effect — an effect that called `goTo` would
    * paint the wrong screen first and cascade a second render to fix it.
    */
+  /**
+   * The company's state, for the one correction that needs it (finding B6).
+   *
+   * Fetched ONLY in the situation that reads it — a session parked on the fee step of a
+   * deployment that has stopped charging — because `session.company` is in-memory and is exactly
+   * what a resumed session does not have. Everywhere else this is a request nobody needs.
+   */
+  const strandedOnFee = storedPhase === "payment" && indexIn(phases, "payment") < 0;
+  const { data: fetchedCompany } = useCompanyQuery(session.companyId, {
+    enabled: strandedOnFee && !session.company,
+  });
+  const companyState = session.company?.state ?? fetchedCompany?.state ?? null;
+
   const requestedPhase: Phase = resumePhase({
     phases,
     storedPhase,
@@ -147,6 +173,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
     companyId: session.companyId,
     entityId: session.entityId,
     needsCompany,
+    companyState,
   });
 
   /**
@@ -166,6 +193,10 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
    * visible and required again, `storedPhase` is untouched and the user lands back on it.
    */
   const phase = snapToVisiblePhase(phases, requestedPhase);
+  // …and if that correction is the B6 one, the legal-body step says why rather than appearing for
+  // no reason a user could name.
+  const legalBodyNotice =
+    strandedOnFee && requestedPhase === "legal-body" ? PAYMENT_NO_LONGER_REQUIRED : undefined;
 
   const goTo = useCallback((next: Phase) => {
     setPhase(next);
@@ -334,6 +365,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                 onIntake={setIntake}
                 companyId={session.companyId}
                 company={session.company}
+                notice={legalBodyNotice}
                 onCompany={(companyId, company) => {
                   // The ROW travels with the handle when we have one (the attach branch picked
                   // it out of a list); a freshly created company has none, and the screens after
@@ -345,11 +377,23 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
                   // it lives in the step's own state and is cleared there.)
                   setParty(emptyParty());
                   setIntake(emptyCompanyIntake());
-                  completePhase("legal-body", "custody");
+                  // The NEXT phase is asked of the visible list, never named: `payment` sits
+                  // between this step and custody on a deployment that charges, and re-deriving
+                  // it from `paymentRequired` here would be a second answer to a question
+                  // `visiblePhases` already holds.
+                  completePhase("legal-body", nextPhase(phases, "legal-body"));
                 }}
                 onClear={() => setSession((s) => ({ ...s, companyId: null, company: null }))}
                 onBack={() => goTo("guardian")}
-                onComplete={() => completePhase("legal-body", "custody")}
+                onComplete={() => completePhase("legal-body", nextPhase(phases, "legal-body"))}
+              />
+            )}
+            {phase === "payment" && (
+              <PaymentStep
+                eyebrow={screenLabel(phases, "payment")}
+                companyId={session.companyId}
+                onBack={() => goTo("legal-body")}
+                onComplete={() => completePhase("payment", "custody")}
               />
             )}
             {phase === "custody" && (

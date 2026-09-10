@@ -186,14 +186,24 @@ export type PublicConfig = {
    *  enforces nothing, which is exactly what absent should mean. */
   formationRequired?: boolean;
   /**
-   * ⚠ `formationPaymentRequired` and `formationFeeUsdc` are DELIBERATELY ABSENT from this type.
+   * FORMATION PAYMENTS (B1, design §6.8) — the two fields A3 deliberately left out until the
+   * branch they gate could actually be reached.
    *
-   * B1 ships them together with the payment step and the quote route. Declaring them here first
-   * bought a branch that could not be reached — no deployment serves either field, so
-   * `formationPaymentRequired === true` was always false — and an optional-typed field that is
-   * always undefined is the shape a reader mistakes for a live capability. The wizard states the
-   * beta unconditionally, which is what is true of every deployment this build can talk to.
+   * `formationPaymentRequired` decides whether the wizard has a payment STEP at all. Optional for
+   * deploy-order safety: a backend that predates B1 serves neither, and absent must read as
+   * "this deployment does not charge" — which is true of it.
+   *
+   * `formationFeeUsdc` is the PRICE, in whole USDC, and it is served on every formation
+   * deployment INCLUDING the ones that do not charge: it is the number in the beta sentence
+   * ("included during the beta, normally $399"). Bundling that number into the browser build is
+   * how a price on screen drifts from the price the backend would quote — the same argument
+   * `formationCopy` exists for. Null where the backend cannot form companies at all.
+   *
+   * ⚠ There is no revenue address here and there never will be. `/config` is public and
+   * unauthenticated; the payee rides the QUOTE, bound to an exact amount and nonce.
    */
+  formationPaymentRequired?: boolean;
+  formationFeeUsdc?: number | null;
   /**
    * PRODUCT COPY the wizard and the Companies section render verbatim (§7).
    *
@@ -753,6 +763,113 @@ export type CompanyDetailView = CompanyView & {
     awaitingSsnDecision: boolean;
   };
 };
+
+/**
+ * THE EIP-712 REQUEST the guardian's wallet signs (design §6.1).
+ *
+ * Served WHOLE by the backend rather than assembled here, and that is the point: a client that
+ * built the message itself would be a second place to get the domain, the type list or the field
+ * ORDER wrong, and each of those produces a signature that verifies against nothing and reverts
+ * on-chain after the guardian has approved it. It is passed to wagmi's `useSignTypedData`
+ * essentially untouched.
+ *
+ * `value`/`validAfter`/`validBefore` are decimal STRINGS: JSON has no bigint, and viem accepts
+ * strings for `uint256`.
+ */
+export type PaymentTypedData = {
+  domain: { name: string; version: string; chainId: number; verifyingContract: `0x${string}` };
+  types: Record<string, { name: string; type: string }[]>;
+  primaryType: string;
+  message: {
+    from: `0x${string}`;
+    to: `0x${string}`;
+    value: string;
+    validAfter: string;
+    validBefore: string;
+    nonce: `0x${string}`;
+  };
+};
+
+/** A live, signable quote. Present only while the payment is `quoted` AND inside its window. */
+export type FormationQuote = {
+  paymentId: string;
+  /** Atomic USDC (6 decimals), as a decimal string. */
+  amountUsdc: string;
+  /** Whole USDC — the price a human reads. */
+  amountDisplayUsdc: number;
+  payTo: `0x${string}`;
+  nonce: `0x${string}`;
+  validAfter: number;
+  /** Unix SECONDS — what the guardian SIGNS. Later than `expiresAt` by the settlement grace, so
+   *  a signature given at the last second still has time to be broadcast and mined. */
+  validBefore: number;
+  /** Unix SECONDS — WHEN THE QUOTE STOPS BEING OFFERED. This is the countdown a person is shown;
+   *  showing `validBefore` would promise minutes the settle door will refuse. */
+  expiresAt: number;
+  typedData: PaymentTypedData;
+};
+
+/**
+ * `GET /companies/:companyId/payment` — what is owed, or what happened.
+ *
+ * The status union is the backend's, enumerated once (`formation_payments.status`). A `settling`
+ * row deliberately carries NO `quote`: signing again while a broadcast is in flight is how a
+ * guardian gets charged twice, and a screen that could see a quote would render the button.
+ */
+export type FormationPaymentStatus =
+  | "quoted"
+  | "settling"
+  | "settled"
+  | "expired"
+  | "failed"
+  | "refunded";
+
+export type FormationPaymentView = {
+  paymentId: string;
+  companyId: string;
+  product: "formation" | "maintenance_year";
+  status: FormationPaymentStatus;
+  amountUsdc: string;
+  amountDisplayUsdc: number;
+  validBefore: number;
+  /** When the quote stops being offered (unix seconds) — the countdown, not the token's clock. */
+  expiresAt: number;
+  payerAddress: `0x${string}` | null;
+  txHash: `0x${string}` | null;
+  refundTxHash: string | null;
+  /**
+   * ALWAYS present, including on a `settling` row that carries no quote — they are what the
+   * guardian's CANCEL path needs to build `CancelAuthorization(authorizer, nonce)`.
+   *
+   * Safe where the quote is not: a transfer authorization also commits to the value, the
+   * recipient and the window, and none of those is here. A wrong cancel message yields a
+   * signature the token rejects — a stuck payment, never a moved one.
+   */
+  nonce: `0x${string}`;
+  /** NULL on a deployment that no longer charges: the token's domain is read at boot only where
+   *  it does, and a payment there is history rather than something to sign. */
+  domain: PaymentTypedData["domain"] | null;
+  quote?: FormationQuote;
+  /**
+   * The CANCELLATION, served whole — present exactly while there is something live to cancel.
+   *
+   * This package used to hold its own copy of the `CancelAuthorization` type list and assemble
+   * the message from `nonce` + `domain`. That is a second place for a type list, a field order
+   * and — worst — an AUTHORIZER to be got wrong: the authorizer is the address that SIGNED, which
+   * is the payer once a settle has been attempted and the connected wallet only before that. The
+   * server knows which; a browser guessing produces a signature the token rejects.
+   */
+  cancelTypedData?: {
+    domain: PaymentTypedData["domain"];
+    types: Record<string, { name: string; type: string }[]>;
+    primaryType: string;
+    message: { authorizer: `0x${string}`; nonce: `0x${string}` };
+  };
+};
+
+/** `POST /companies/:id/payment/settle` — `settled` when the receipt confirmed, `pending` while
+ *  the transaction is in flight (poll, never sign again). */
+export type SettlePaymentResult = { status: "settled" | "pending"; txHash?: `0x${string}` };
 
 /** One row of `GET /companies/:companyId/compliance`. Every field is explicitly null when the
  *  provider did not say, never absent — a renderer must not have to guess which it is. */

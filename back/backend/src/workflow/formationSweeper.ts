@@ -34,6 +34,11 @@ import {
 import { parseSqliteUtc } from "../util/sqliteTime";
 import { advanceAnchor, newAnchorReadCache } from "./anchorLoop";
 import {
+  advancePaymentOnChain,
+  checkForDoublePayment,
+  flagMineableTerminalRows,
+} from "./formationPayment";
+import {
   type FormationAdvanceDeps,
   advanceFormation,
   currentPolledStep,
@@ -120,6 +125,19 @@ export const POLL_BATCH = 200;
 export const STRANDED_BATCH = 50;
 
 /**
+ * PAYMENTS (finding B2): how many stalled settles one tick may drive, and how long it waits for a
+ * receipt while doing it.
+ *
+ * Both are much smaller than the filing legs' equivalents, for the same reason: every settle here
+ * costs several CHAIN calls, and the resolver for a row this tick cannot finish is the NEXT
+ * tick's log read rather than this tick's patience. Arc's finality is sub-second, so a receipt
+ * that has not appeared in five seconds is not going to — where the request path can afford to
+ * wait a minute because a human is watching and the answer might still arrive.
+ */
+export const MAX_SETTLES_PER_TICK = 5;
+export const SWEEP_RECEIPT_TIMEOUT_MS = 5_000;
+
+/**
  * How many entities one tick may drive through the ANCHOR sub-saga, and how many at once.
  *
  * Smaller than `POLL_BATCH` because the work is heavier: an anchor pass is several sequential
@@ -145,6 +163,16 @@ export interface FormationSweeperDeps extends FormationAdvanceDeps {
   /** The SSN keyring (§4.2), handed on to the filing step so a resumed create can rebuild the
    *  body it originally sent. Absent on every deployment that never collected one. */
   pii?: PiiKeyring;
+  /**
+   * FORMATION PAYMENTS (2026-08-26 §6.4). Present only where this deployment charges; absent
+   * everywhere else, and the leg then does nothing at all.
+   *
+   * It carries the payment repository, the pinned USDC domain and the executor, so the sweeper
+   * resolves a stalled settle through THE SAME functions the settle route uses. Two
+   * implementations of "what happened to this payment?" is how a row ends up `failed` in one
+   * place and re-broadcast in the other.
+   */
+  payment?: Omit<import("./formationPayment").FormationPaymentDeps, "companies" | "now">;
   /** `FORMATION_SWEEP_MS`. */
   intervalMs: number;
 }
@@ -163,6 +191,19 @@ export class FormationSweeper {
    * a persisted marker that could suppress a warning about a formation nobody is watching.
    */
   private readonly warned = new Set<string>();
+
+  /**
+   * The last verdict this process saw for each live payment (finding B2).
+   *
+   * In memory and deliberately so, exactly like `warned`: it de-duplicates an ops LINE, not
+   * state anything depends on. A restart re-warns, which is the failure direction to prefer.
+   * Entries are dropped the moment a payment reaches a terminal verdict.
+   */
+  private readonly paymentVerdicts = new Map<string, string>();
+
+  /** Written-off payments already reported as duplicate CANDIDATES (R1c) — de-duplication of a
+   *  CRITICAL line, in memory, exactly like `warned`. */
+  private readonly flaggedWriteOffs = new Set<string>();
 
   /**
    * Where the last anchor batch stopped (2026-08-26 §3) — PERSISTED in `meta.anchor_cursor`.
@@ -216,6 +257,12 @@ export class FormationSweeper {
     const amortised = this.ticks % AMORTISED_EVERY_N_TICKS === 0;
     try {
       await this.redriveEvents();
+      // ⚠ PAYMENTS BEFORE FILINGS (finding B2). `openStrandedFormations` is what SPENDS money at
+      // doola, and what makes a company eligible for it is having nothing owed. Resolving the
+      // payments first means a company that settled between ticks is filed on this pass rather
+      // than the next one, and — more importantly — a payment that just resolved `expired` or
+      // `failed` is visible to the filing leg before it opens anything.
+      await this.resumeStalledSettles();
       await this.openStrandedFormations();
       await this.resumeStalledCreates();
       await this.retryFailedSteps();
@@ -232,6 +279,8 @@ export class FormationSweeper {
         this.warnStale();
         this.sweepEvents();
         this.pruneWarned();
+        this.detectDoublePayments();
+        await this.detectMineableWriteOffs();
       }
     } finally {
       this.ticks++;
@@ -367,6 +416,194 @@ export class FormationSweeper {
           ...describeDoolaError(err),
         });
       }
+    }
+  }
+
+  /**
+   * ── (b2) THE PAYMENT CRASH WINDOW (2026-08-26 §6.4) — the eighth leg ─────────────────────
+   *
+   * Two shapes, and they are not symmetric.
+   *
+   * A `settling` row is a broadcast whose outcome nobody recorded: the request handler died, the
+   * RPC timed out, the box restarted. It is the DANGEROUS one, because the guardian's signature
+   * is public and self-authorizing until `validBefore` — anyone holding the bytes can still get
+   * them mined. So this leg NEVER re-quotes such a row. It asks the chain whether the nonce is
+   * spent, re-broadcasts the persisted bytes if it is not, and expires the row only once the
+   * window has closed AND the nonce is still unused. All of that lives in
+   * `resumeSettlingPayment`, which is also what the settle route calls, so both actors reach the
+   * same verdict from the same evidence.
+   *
+   * A `quoted` row past its window is the ordinary one: nothing was broadcast, nothing can be,
+   * and `expired` is simply the truth catching up with the clock. It is what lets the guardian
+   * re-quote — and it has to happen even on a company nobody is looking at, because the unique
+   * live-rows index would otherwise refuse their next quote forever.
+   *
+   * Modelled on `resumeStalledCreates`: `SUBMITTED_STALL_MS` before a row is presumed stranded,
+   * `retryDelayMs(attempt)` between re-broadcasts (`resumeSettlingPayment` burns the attempt),
+   * and the per-company keyed lock so a sweep and a live settle never touch one payment at once.
+   */
+  private async resumeStalledSettles(): Promise<void> {
+    const payment = this.d.payment;
+    if (!payment) return;
+    const now = this.now();
+    const nowSec = Math.floor(now / 1000);
+    // ⚠ THE EXECUTOR THIS LEG USES HAS ITS OWN, SHORT RECEIPT TIMEOUT (finding B2).
+    //
+    // 60 seconds is right on a request path, where a human is waiting and the answer might still
+    // arrive. It is wrong here: Arc's finality is sub-second, so a receipt that has not appeared
+    // in five seconds is not going to, and the RESOLVER for this row is the NEXT tick's log read
+    // rather than this tick's patience. Waiting a minute per row would let a handful of stalled
+    // payments consume the whole sweep and starve every other leg behind it.
+    const deps = {
+      ...payment,
+      executor: { ...payment.executor, receiptTimeoutMs: SWEEP_RECEIPT_TIMEOUT_MS },
+      companies: this.d.companies,
+      entities: this.d.repo,
+      now: this.now.bind(this),
+    };
+    let settles = 0;
+
+    // ⚠ THE CHAIN HEAD, REFRESHED (2026-09-10 verifier, R2). `noteChainHead` was wired and never
+    // called, so the head a new quote recorded was the one read at BOOT — which on a long-lived
+    // process means every `quoted_block` points at a block from days ago and every later log scan
+    // walks the ladder from there. Read once per tick, here, because this leg is the only thing
+    // that runs on a timer with the payment config in hand. A failure is not fatal: a stale head
+    // costs a wider scan and never a wrong answer, which is why it can be swallowed.
+    try {
+      payment.payment.noteChainHead?.(await payment.executor.publicClient.getBlockNumber());
+    } catch {
+      // …and the leg carries on. The rows below are what this pass is for.
+    }
+
+    for (const row of payment.payment.payments.listByStatus("settling", STRANDED_BATCH)) {
+      // …and a CAP per tick, for the same reason the timeout is short: this leg makes chain calls
+      // per row, and a backlog must be worked through over several passes rather than turned into
+      // one sweep that never finishes.
+      if (settles >= MAX_SETTLES_PER_TICK) break;
+      // The stall bound first: a row written seconds ago belongs to a request that is still
+      // running, and re-broadcasting under it would race the handler for the same nonce.
+      if (now - parseSqliteUtc(row.updatedAt) < SUBMITTED_STALL_MS) continue;
+      // …then the backoff, which only exists once an attempt has been burned. A row on its first
+      // pass has attempt 0 and `retryDelayMs(0)` is one minute, which is the right first wait for
+      // something we have already decided is stranded.
+      if (row.attempt > 0 && now - parseSqliteUtc(row.updatedAt) < retryDelayMs(row.attempt))
+        continue;
+      const company = this.d.companies.find(row.companyId);
+      if (!company) continue;
+      settles++;
+      try {
+        const verdict = await withKeyedLock(`payment:${row.companyId}`, () =>
+          advancePaymentOnChain(deps, company, row),
+        );
+        // ⚠ WARN ONLY WHEN IT IS NEWS (finding B2). A payment that is pending is pending every
+        // sixty seconds, and a leg that warns each time trains an operator to filter out the one
+        // line that would have told them something. Loud on the FIRST pass, and loud again when
+        // the verdict CHANGES; informational in between.
+        const previous = this.paymentVerdicts.get(row.paymentId);
+        const news = row.attempt === 0 || previous !== verdict;
+        this.paymentVerdicts.set(row.paymentId, verdict);
+        opsLog("formation_payment_resumed", {
+          level: news ? "warn" : "info",
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          attempt: row.attempt,
+          stalledMs: now - parseSqliteUtc(row.updatedAt),
+          verdict,
+        });
+        if (verdict !== "pending") this.paymentVerdicts.delete(row.paymentId);
+      } catch (err) {
+        // A chain read or a broadcast failed. The row stays `settling`, which is the safe place
+        // for it: the next tick tries again, and nothing has been written off.
+        opsLog("formation_payment_resume_failed", {
+          level: "warn",
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          ...describeDoolaError(err),
+        });
+      }
+    }
+
+    // The quieter half: quotes whose window has closed by OUR clock, which only makes them
+    // CANDIDATES. They go through the same procedure as a stalled settle (gate A4) — the chain's
+    // clock plus a finality margin, the token's logs, and `authorizationState` — because a quote
+    // may have been signed in a browser we never heard back from, and expiring one on a fast
+    // server clock is how a guardian is asked to pay twice.
+    for (const row of payment.payment.payments.listExpiredQuotes(nowSec, STRANDED_BATCH)) {
+      // ⚠ THE SAME BUDGET AS THE LOOP ABOVE (R3), and deliberately the same counter rather than a
+      // second one: these rows cost the same handful of chain calls each, and a tick that had
+      // already spent its budget on stalled settles must not then walk fifty expired quotes.
+      if (settles >= MAX_SETTLES_PER_TICK) break;
+      const company = this.d.companies.find(row.companyId);
+      if (!company) continue;
+      settles++;
+      try {
+        await withKeyedLock(`payment:${row.companyId}`, () =>
+          advancePaymentOnChain(deps, company, row),
+        );
+      } catch (err) {
+        opsLog("formation_payment_resume_failed", {
+          level: "warn",
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          ...describeDoolaError(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * ⚠ THE DOUBLE-CHARGE BACKSTOP (B1 gate A5), amortised.
+   *
+   * Every rule in this feature exists to make this list empty: one live row per company, a
+   * `quoted`-only CAS on the settle, a resume that never re-quotes, an expiry that needs the
+   * chain's own evidence. This is the measurement rather than the argument, and it belongs on
+   * the slow path because it is a GROUP BY over a small table and it is answering a question
+   * whose expected answer is "none".
+   *
+   * The terminal transitions check the same thing per-company as they happen; this catches a
+   * duplicate that arrived some other way (an operator's SQL, a restore, a bug we have not
+   * thought of), on a company nobody is looking at.
+   */
+  private detectDoublePayments(): void {
+    const payment = this.d.payment;
+    if (!payment) return;
+    for (const companyId of payment.payment.payments.listDoublePaidCompanies())
+      checkForDoublePayment({ ...payment, entities: this.d.repo }, companyId);
+  }
+
+  /**
+   * …and the half a row count cannot see (R1c): a payment we WROTE OFF whose authorization was
+   * mined anyway.
+   *
+   * A `failed` or `expired` row is not a paid row, so `listDoublePaidCompanies` will never name
+   * it — and yet its nonce can be spent, because an authorization stays mineable until
+   * `validBefore` and we can only write a row off against the chain as it was at that moment.
+   * Only rows whose window is still open can newly gain a spent nonce, so this drains on its own
+   * clock rather than growing with the table.
+   *
+   * Its own async pass rather than a line in `detectDoublePayments`, because it reads the CHAIN.
+   */
+  private async detectMineableWriteOffs(): Promise<void> {
+    const payment = this.d.payment;
+    if (!payment) return;
+    const rows = payment.payment.payments
+      .listMineableTerminal(Math.floor(this.now() / 1000))
+      .filter((r) => !this.flaggedWriteOffs.has(r.paymentId));
+    if (rows.length === 0) return;
+    try {
+      const flagged = await flagMineableTerminalRows(
+        { ...payment, companies: this.d.companies, entities: this.d.repo },
+        rows,
+      );
+      // In memory, like `warned`: this de-duplicates a CRITICAL LINE, not state anything depends
+      // on. A restart re-flags, which is the direction to fail in.
+      for (const id of flagged) this.flaggedWriteOffs.add(id);
+    } catch (err) {
+      opsLog("formation_payment_resume_failed", {
+        level: "warn",
+        reason: "could not check written-off authorizations",
+        ...describeDoolaError(err),
+      });
     }
   }
 

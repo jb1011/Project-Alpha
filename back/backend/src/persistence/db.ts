@@ -205,12 +205,56 @@ const FORMATION_PAYMENTS_DDL = `
       -- 32 random bytes, hex. Uniqueness comes from the ROW, never derived from the company id —
       -- a derived nonce is one-shot and would brick the company after any failed attempt.
       nonce       TEXT NOT NULL,
+      -- ⚠ TWO DEADLINES (B1 gate A4), and they are not the same promise.
+      --
+      -- valid_before is what the guardian SIGNED and what the token enforces. ttl_at is when the
+      -- QUOTE stops being offered — earlier by FORMATION_SETTLE_GRACE_MS, so that a signature
+      -- given at the last second of the quote still has time to be composed, broadcast, mined and
+      -- (after a crash) re-composed. One deadline for both meant an authorization expiring while
+      -- its own transfer sat in the mempool.
       valid_before INTEGER NOT NULL,
+      ttl_at      INTEGER,
+      -- The chain head when this quote was issued (B1 gate A3). It is the LOWER BOUND of the log
+      -- window that later resolves the payment from the token's own AuthorizationUsed /
+      -- AuthorizationCanceled events. NULL is survivable (the reader falls back to a capped
+      -- lookback), it is just a wider scan.
+      quoted_block INTEGER,
+      -- Where the money goes, STORED AT QUOTE TIME (§6.1, B1 gate A1). Never re-read from live
+      -- config on verify, settle or cancel: a revenue-address change between quote and settle
+      -- would otherwise silently re-target a signature the guardian has already given, and the
+      -- token would reject it (or, worse, we would verify against the new address and broadcast
+      -- an authorization naming the old one).
+      pay_to      TEXT,
       payer_address TEXT,
-      -- Persisted BEFORE broadcast (the bridge-legs rule): a crash mid-settle re-broadcasts the
-      -- SAME signed transaction rather than re-quoting, which is how a double charge is avoided.
+      -- ⚠ THE DURABLE ARTIFACT (B1 gate A1). The guardian's EIP-3009 SIGNATURE, persisted BEFORE
+      -- any broadcast. It is what makes a crash mid-settle recoverable, and it is nonce-free:
+      -- the executor transaction is COMPOSED FRESH at every broadcast (current pending nonce,
+      -- current fees), because a signed raw transaction commits to an executor nonce that
+      -- another transaction can consume while we are down — after which the persisted bytes are
+      -- permanently unsendable. The authorization has no such problem; the token's own
+      -- authorizationState and its AuthorizationUsed log are the exactly-once.
+      signature   TEXT,
+      -- DEPRECATED (B1 gate A1). Was the persisted raw transaction back when re-broadcasting the
+      -- same bytes was the recovery story. Nothing reads or writes it; the column stays because
+      -- dropping one buys nothing and an old SQLite cannot.
       raw_tx      BLOB,
+      -- The LAST hash we broadcast, and how many times we have broadcast at all. Neither is an
+      -- outcome: the outcome comes from the token's logs (resolveAuthorizationOutcome), which
+      -- is what lets a THIRD PARTY's settlement of the same public authorization resolve
+      -- as settled rather than as failed.
       tx_hash     TEXT,
+      broadcast_count INTEGER NOT NULL DEFAULT 0,
+      -- ⚠ THE SUBMITTER NONCE AND FEES OF THAT LAST BROADCAST (2026-09-10 verifier, R1).
+      --
+      -- Without them a resume takes the next PENDING nonce, which produces a SECOND transaction
+      -- rather than a replacement — and nonces are ordered, so the first one mines (the money
+      -- moves), the second reverts with authorization-is-used, and a receipt-reader writes the
+      -- payment off as failed. With them, a re-broadcast whose predecessor is still pending
+      -- REPLACES it at the same nonce with a higher fee, which is what an underpriced
+      -- transaction actually needs.
+      last_nonce  INTEGER,
+      last_max_fee TEXT,
+      last_priority_fee TEXT,
       attempt     INTEGER NOT NULL DEFAULT 0,
       refund_tx_hash TEXT,
       created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -222,6 +266,13 @@ const FORMATION_PAYMENTS_DDL = `
       ON formation_payments(company_id, product) WHERE status IN ('quoted','settling');
     CREATE INDEX IF NOT EXISTS idx_formation_payments_company
       ON formation_payments(company_id, status);
+    -- The SWEEPER's two readers (finding B4): every settling row, and every quoted row whose
+    -- window has closed. Both run on a 60-second timer forever, and both were scanning the whole
+    -- table to find the handful of rows that are live — on a deployment whose payments table only
+    -- ever grows. (status, valid_before) answers the first on its leading column and the second
+    -- on both.
+    CREATE INDEX IF NOT EXISTS idx_formation_payments_status_window
+      ON formation_payments(status, valid_before);
 `;
 
 /** Create tables if absent. Idempotent. */
@@ -663,6 +714,20 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE entities ADD COLUMN operator_rotated_at INTEGER");
   if (!cols.includes("public_id")) db.exec("ALTER TABLE entities ADD COLUMN public_id TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_public_id ON entities(public_id)");
+  // ── The FLEET's operator addresses: NOT indexed (finding B4) ──────────────────────────────
+  //
+  // Three partial NOCASE indexes lived here, to make `assertPaymentAddressSeparation` an indexed
+  // EXISTS rather than a scan. They are dropped, and the check may scan.
+  //
+  // It runs ONCE, at API boot, on a deployment that charges. A scan of `entities` at that moment
+  // costs microseconds on any fleet this system will have in the next several years — while an
+  // index is paid for on EVERY write to the table, forever, on every deployment including the
+  // ones that never charge for anything. That is the wrong trade for a yes/no question asked at
+  // startup. Dropped rather than left in place: an index nobody needs is still a thing to keep
+  // correct through every future column change.
+  db.exec("DROP INDEX IF EXISTS idx_entities_operator_addr");
+  db.exec("DROP INDEX IF EXISTS idx_entities_previous_operator_addr");
+  db.exec("DROP INDEX IF EXISTS idx_entities_pocket_addr");
 
   // doola formation (design §3). Purely additive: NULL formation_provider = legacy/stub forever
   // (the 13 testnet + existing prod agents are never backfilled). The three hash/version columns
@@ -764,6 +829,26 @@ export function migrate(db: Database.Database): void {
     if (!partyColsNow.includes(col))
       db.exec(`ALTER TABLE formation_parties ADD COLUMN ${col} ${type}`);
   db.exec(FORMATION_PARTIES_INDEX_DDL);
+
+  // formation_payments: the B1-gate columns, ALTER-if-missing (the house idiom). The table
+  // itself is A1's; these four are what turn the AUTHORIZATION into the durable artifact —
+  // `pay_to` pins the payee at quote time, `signature` is the thing a resume re-submits, and
+  // `broadcast_count` says how many times we have composed a transaction for it (which is also
+  // the fee-bump ladder). A database created before this build has the table without them.
+  const payCols = (
+    db.prepare("PRAGMA table_info(formation_payments)").all() as { name: string }[]
+  ).map((c) => c.name);
+  for (const [col, type] of [
+    ["pay_to", "TEXT"],
+    ["signature", "TEXT"],
+    ["broadcast_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["quoted_block", "INTEGER"],
+    ["ttl_at", "INTEGER"],
+    ["last_nonce", "INTEGER"],
+    ["last_max_fee", "TEXT"],
+    ["last_priority_fee", "TEXT"],
+  ] as const)
+    if (!payCols.includes(col)) db.exec(`ALTER TABLE formation_payments ADD COLUMN ${col} ${type}`);
 
   // formation_requests.next_poll_at: ALTER-if-missing, the house idiom. A database created by
   // PR 2's first migration has the column; one created by an earlier build of PR 2 does not, and

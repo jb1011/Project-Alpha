@@ -1,0 +1,405 @@
+/**
+ * THE EIGHTH SWEEPER LEG — `resumeStalledSettles` (design 2026-08-26 §6.4).
+ *
+ * A `settling` row is a broadcast nobody recorded the outcome of, and the guardian's signature is
+ * still public and self-authorizing. The leg's whole job is to be the actor that resolves such a
+ * row WITHOUT ever asking for a second signature, and to expire a payment only when the chain
+ * says it can never settle.
+ *
+ * Its own file rather than more cases in `formationSweeper.test.ts`: that file's fixture is a
+ * doola filing, and this leg does not touch doola at all.
+ */
+import type Database from "better-sqlite3";
+import { privateKeyToAccount } from "viem/accounts";
+import { afterEach, beforeEach, expect, test } from "vitest";
+import type { FormationExecutorDeps } from "../../src/payments/formationSettle";
+import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
+import { migrate, openDatabase } from "../../src/persistence/db";
+import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
+import { SqliteDoolaEventRepository } from "../../src/persistence/doolaEventRepository";
+import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
+import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
+import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
+import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
+import type { Address, Hex } from "../../src/types";
+import {
+  FormationSweeper,
+  type FormationSweeperDeps,
+  MAX_SETTLES_PER_TICK,
+  SUBMITTED_STALL_MS,
+  SWEEP_RECEIPT_TIMEOUT_MS,
+} from "../../src/workflow/formationSweeper";
+import { MemoryDocumentStore, fakeDoola } from "../helpers/formationFakes";
+import {
+  REVENUE,
+  fakeChain as chainWithClock,
+  decodeFakeTx,
+  paymentCfg,
+  settlementLogs,
+} from "../helpers/formationPayment";
+
+const guardian = privateKeyToAccount(`0x${"7".repeat(64)}`);
+const TENANT = guardian.address as Address;
+const SIG = `0x${"11".repeat(65)}` as Hex;
+const TX = `0x${"cc".repeat(32)}` as Hex;
+
+/** The shared chain (finding C6), wound to THIS file's clock — every rule here is about a window
+ *  against a block timestamp, and 200 seconds ahead clears the 120-second finality margin for a
+ *  window that has just closed while staying inside the half-hour ones of the live quotes. */
+const fakeChain = (opts: Parameters<typeof chainWithClock>[0] = {}) =>
+  chainWithClock({ blockTimestamp: nowSec() + 200, ...opts });
+
+let now = Date.parse("2026-08-26T12:00:00Z");
+const nowSec = () => Math.floor(now / 1000);
+
+let db: Database.Database;
+let repo: SqliteEntityRepository;
+let companies: SqliteCompanyRepository;
+let requests: SqliteFormationRepository;
+let payments: SqliteFormationPaymentRepository;
+
+beforeEach(() => {
+  now = Date.parse("2026-08-26T12:00:00Z");
+  db = openDatabase(":memory:");
+  migrate(db);
+  repo = new SqliteEntityRepository(db);
+  companies = new SqliteCompanyRepository(db);
+  requests = new SqliteFormationRepository(db);
+  payments = new SqliteFormationPaymentRepository(db);
+});
+afterEach(() => db.close());
+
+/** Everything the sweeper needs EXCEPT the payment wiring — so one test can vary that alone. */
+function baseDeps(): Omit<FormationSweeperDeps, "payment"> {
+  const doola = fakeDoola();
+  return {
+    repo,
+    companies,
+    requests,
+    documents: new SqliteDocumentIndexRepository(db),
+    parties: new SqliteFormationPartyRepository(db),
+    docStore: new MemoryDocumentStore(),
+    events: new SqliteDoolaEventRepository(db),
+    doola: doola.api,
+    environment: "production",
+    intervalMs: 60_000,
+    now: () => now,
+  };
+}
+
+function sweeper(executor: FormationExecutorDeps, wired = true): FormationSweeper {
+  const d: FormationSweeperDeps = {
+    ...baseDeps(),
+    payment: wired
+      ? {
+          payment: paymentCfg(payments),
+          executor,
+          transaction: <T>(fn: () => T) => db.transaction(fn)(),
+        }
+      : undefined,
+  };
+  return new FormationSweeper(d);
+}
+
+function company(status: "draft" | "ready" = "draft"): string {
+  return companies.create({
+    tenantId: TENANT,
+    status,
+    provider: "doola",
+    environment: "production",
+    synthetic: false,
+    nameOptions: [{ name: "Acme", entityTypeEnding: "LLC", position: 1 }],
+    businessPurpose: "software",
+    industryLabel: "Software development",
+    intakeSynthesized: false,
+  });
+}
+
+function quote(companyId: string, over: { validBefore?: number; nonce?: Hex } = {}) {
+  return payments.create({
+    companyId,
+    product: "formation",
+    amountUsdc: 399_000_000n,
+    nonce: over.nonce ?? (`0x${"a1".repeat(32)}` as Hex),
+    validBefore: over.validBefore ?? nowSec() + 1800,
+    payTo: REVENUE,
+  });
+}
+
+/** Push a row's `updated_at` into the past so it is genuinely stalled by the sweeper's clock. */
+function stall(paymentId: string, ms = SUBMITTED_STALL_MS + 60_000) {
+  db.prepare("UPDATE formation_payments SET updated_at = ? WHERE payment_id = ?").run(
+    new Date(now - ms)
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d+Z$/, ""),
+    paymentId,
+  );
+}
+
+test("a deployment that does not charge runs the leg and does nothing", async () => {
+  const c = company();
+  const id = quote(c, { validBefore: nowSec() - 1 });
+  const chain = fakeChain();
+  await sweeper(chain.executor, false).tick();
+  // Not expired: with no payment wiring there is no leg, and a row nobody quoted cannot exist
+  // anyway. The assertion is that the tick is a no-op rather than a crash.
+  expect(payments.find(id)?.status).toBe("quoted");
+  expect(chain.sent).toHaveLength(0);
+});
+
+test("a `quoted` row past its window is expired — and that is what frees the re-quote", async () => {
+  const c = company();
+  const id = quote(c, { validBefore: nowSec() - 1 });
+  const chain = fakeChain();
+  await sweeper(chain.executor).tick();
+  expect(payments.find(id)?.status).toBe("expired");
+  // The unique live-rows index would otherwise refuse the guardian's next quote forever.
+  expect(payments.findLive(c, "formation")).toBeUndefined();
+  // Nothing was broadcast: nothing ever was.
+  expect(chain.sent).toHaveLength(0);
+});
+
+test("a `quoted` row still inside its window is left alone", async () => {
+  const c = company();
+  const id = quote(c);
+  await sweeper(fakeChain().executor).tick();
+  expect(payments.find(id)?.status).toBe("quoted");
+});
+
+test("a FRESHLY settling row is not touched — the request that wrote it may still be running", async () => {
+  // Re-broadcasting under a live handler would race it for the same nonce.
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  const chain = fakeChain();
+  await sweeper(chain.executor).tick();
+  expect(chain.sent).toHaveLength(0);
+  expect(payments.find(id)?.status).toBe("settling");
+});
+
+test("a STALLED settling row is re-submitted from its persisted AUTHORIZATION — never re-quoted", async () => {
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const chain = fakeChain();
+  await sweeper(chain.executor).tick();
+  // ONE transaction, carrying the guardian's ORIGINAL signature — composed fresh around it rather
+  // than replayed from bytes that commit to a nonce nobody can guarantee any more.
+  expect(chain.sent).toHaveLength(1);
+  expect(decodeFakeTx(chain.sent[0]!).data).toContain(SIG.slice(2));
+  expect(payments.find(id)).toMatchObject({ status: "settled", broadcastCount: 1 });
+  expect(companies.find(c)?.status).toBe("ready");
+  // ONE row. A re-quote would be a second live authorization for the same fee.
+  expect(payments.listByCompany(c)).toHaveLength(1);
+});
+
+test("a stalled settle whose outcome is STILL unknown stays settling and burns an attempt", async () => {
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const chain = fakeChain({ receipt: "timeout" });
+  await sweeper(chain.executor).tick();
+  expect(payments.find(id)).toMatchObject({ status: "settling", attempt: 1 });
+});
+
+test("BACKOFF: a row that has already burned an attempt is not retried immediately", async () => {
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const first = fakeChain({ receipt: "timeout" });
+  await sweeper(first.executor).tick();
+  expect(payments.find(id)?.attempt).toBe(1);
+
+  // `bumpAttempt` stamped `updated_at` to NOW, so the next tick is inside `retryDelayMs(1)`.
+  const second = fakeChain({ receipt: "timeout" });
+  now += 30_000;
+  await sweeper(second.executor).tick();
+  expect(second.sent).toHaveLength(0);
+  expect(payments.find(id)?.attempt).toBe(1);
+});
+
+test("EXPIRY needs BOTH: the window closed AND the nonce still unused", async () => {
+  const c = company();
+  const id = quote(c, { validBefore: nowSec() - 1 });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const chain = fakeChain({ receipt: "timeout" });
+  await sweeper(chain.executor).tick();
+  expect(payments.find(id)?.status).toBe("expired");
+  expect(chain.sent).toHaveLength(0);
+});
+
+test("a SETTLEMENT IN THE LOGS past the window resolves to SETTLED — never expired", async () => {
+  // The nightmare this rule prevents: telling a guardian who has already paid us that their quote
+  // expired, and taking a second 399 USDC when they re-quote. The logs are the evidence, so it
+  // holds even when the settling transaction was not ours.
+  const c = company();
+  const nonce = `0x${"b2".repeat(32)}` as Hex;
+  const id = quote(c, { validBefore: nowSec() - 1, nonce });
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const chain = fakeChain({
+    spent: [nonce],
+    logs: settlementLogs({ authorizer: TENANT, payTo: REVENUE, nonce, txHash: TX }),
+  });
+  await sweeper(chain.executor).tick();
+  expect(payments.find(id)).toMatchObject({ status: "settled", txHash: TX });
+  expect(companies.find(c)?.status).toBe("ready");
+});
+
+test("the leg survives a chain that throws — the row stays settling for the next tick", async () => {
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const chain = fakeChain();
+  chain.executor.publicClient.readContract = async () => {
+    throw new Error("rpc down");
+  };
+  await sweeper(chain.executor).tick();
+  expect(payments.find(id)?.status).toBe("settling");
+});
+
+test("create_provider is NOT opened while the formation fee is unpaid (§6.5)", () => {
+  // `listUnopened` is where a filing that costs us $150 at doola actually begins. `status =
+  // 'ready'` already excludes the ordinary unpaid company (it is a draft); the explicit clause is
+  // for the path that readies a company some other way.
+  const c = company("ready");
+  const id = quote(c);
+  expect(requests.listUnopenedFormations("production", 10)).not.toContain(c);
+  payments.markExpired(id, "quoted");
+  // …and once nothing is owed, it is fileable again. (No party bound here, so the JOIN still
+  // excludes it — the assertion that matters is the payment clause, checked directly.)
+  const live = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM formation_payments
+        WHERE company_id = ? AND product = 'formation' AND status IN ('quoted','settling')`,
+    )
+    .get(c) as { n: number };
+  expect(live.n).toBe(0);
+});
+
+test("a live maintenance_year quote does NOT hold up the formation filing", () => {
+  // A different bill. Blocking the filing on it would be the wrong reading of "unpaid".
+  const c = company("ready");
+  payments.create({
+    companyId: c,
+    product: "maintenance_year",
+    amountUsdc: 99_000_000n,
+    nonce: `0x${"c3".repeat(32)}` as Hex,
+    validBefore: nowSec() + 1800,
+    payTo: REVENUE,
+  });
+  const blocked = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM formation_payments
+        WHERE company_id = ? AND product = 'formation' AND status IN ('quoted','settling')`,
+    )
+    .get(c) as { n: number };
+  expect(blocked.n).toBe(0);
+});
+
+// ── the leg's own budget (finding B2) ───────────────────────────────────────────────────────
+
+test("a tick drives at most MAX_SETTLES_PER_TICK rows — a backlog is worked down, not swallowed", async () => {
+  // Every settle here costs several chain calls. A tick is a timer, not a batch job: five rows a
+  // pass finishes a backlog over a few minutes, where fifty would hold the process and starve
+  // every leg behind it.
+  const ids: string[] = [];
+  for (let i = 0; i < MAX_SETTLES_PER_TICK + 3; i++) {
+    const c = company();
+    const id = quote(c, { nonce: `0x${i.toString(16).padStart(2, "0").repeat(32)}` as Hex });
+    payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+    stall(id);
+    ids.push(id);
+  }
+  const chain = fakeChain({ receipt: "timeout" });
+  await sweeper(chain.executor).tick();
+  const touched = ids.filter((id) => (payments.find(id)?.attempt ?? 0) > 0);
+  expect(touched).toHaveLength(MAX_SETTLES_PER_TICK);
+});
+
+test("the leg waits SECONDS for a receipt, not the request path's minute", async () => {
+  // Asserted through the timeout the leg actually passes down, because the alternative is a test
+  // that sleeps. The resolver for a row this tick cannot finish is the next tick's log read.
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  let sawTimeout: number | undefined;
+  const chain = fakeChain({ receipt: "timeout" });
+  // biome-ignore lint/suspicious/noExplicitAny: replacing one method on a stub client
+  (chain.executor.publicClient as any).waitForTransactionReceipt = async (args: {
+    timeout?: number;
+  }) => {
+    sawTimeout = args.timeout;
+    throw new Error("receipt timeout");
+  };
+  await sweeper(chain.executor).tick();
+  expect(sawTimeout).toBe(SWEEP_RECEIPT_TIMEOUT_MS);
+});
+
+test("PAYMENTS ARE RESOLVED BEFORE FILINGS ARE OPENED — the order is the point", async () => {
+  // `openStrandedFormations` is what spends money at doola, and eligibility is "nothing owed". A
+  // payment that resolves on this tick must be visible to the filing leg on THIS tick.
+  const order: string[] = [];
+  const c = company();
+  const id = quote(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: SIG });
+  stall(id);
+  const chain = fakeChain({ receipt: "timeout" });
+  const s = sweeper(chain.executor);
+  const originalList = requests.listUnopenedFormations.bind(requests);
+  requests.listUnopenedFormations = ((...args: Parameters<typeof originalList>) => {
+    order.push("filings");
+    return originalList(...args);
+  }) as typeof originalList;
+  // biome-ignore lint/suspicious/noExplicitAny: replacing one method on a stub client
+  (chain.executor.publicClient as any).readContract = async () => {
+    order.push("payments");
+    return false;
+  };
+  await s.tick();
+  expect(order.indexOf("payments")).toBeGreaterThan(-1);
+  expect(order.indexOf("payments")).toBeLessThan(order.indexOf("filings"));
+});
+
+test("R2: the chain head is refreshed every tick, not left at the one read at boot", async () => {
+  // `noteChainHead` was wired and never called, so `quoted_block` on every new quote pointed at a
+  // block from process start — and every later log scan walked the ladder from there.
+  const heads: bigint[] = [];
+  const c = company();
+  quote(c);
+  const chain = fakeChain();
+  const cfg = paymentCfg(payments, { noteChainHead: (b) => heads.push(b) });
+  const d: FormationSweeperDeps = {
+    ...baseDeps(),
+    payment: {
+      payment: cfg,
+      executor: chain.executor,
+      transaction: <T>(fn: () => T) => db.transaction(fn)(),
+    },
+  };
+  await new FormationSweeper(d).tick();
+  expect(heads).toEqual([5_000n]); // the shared fixture's head
+});
+
+test("R3: the per-tick budget covers the EXPIRED-QUOTE loop too", async () => {
+  // Each of these rows costs the same handful of chain calls as a stalled settle. A tick that has
+  // spent its budget on settles must not then walk fifty expired quotes.
+  for (let i = 0; i < MAX_SETTLES_PER_TICK + 3; i++)
+    quote(company(), {
+      validBefore: nowSec() - 1,
+      nonce: `0x${(0xa0 + i).toString(16).repeat(32)}` as Hex,
+    });
+  const chain = fakeChain();
+  await sweeper(chain.executor).tick();
+  const expired = payments
+    .listByStatus("expired", 100)
+    .filter((r) => r.status === "expired").length;
+  expect(expired).toBe(MAX_SETTLES_PER_TICK);
+});

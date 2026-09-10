@@ -36,6 +36,7 @@ import {
 import { CompanyStatePill } from "@/components/agents/CompanyStatePill";
 import { legalBodyTitle } from "@/lib/formation/honesty";
 import { formationCopyOf } from "@/lib/formation/copy";
+import { FEE_BREAKDOWN, feeSentence } from "@/lib/formation/payment";
 import {
   AmberPill,
   Button,
@@ -70,6 +71,15 @@ type Props = {
   onComplete: () => void;
   /** Drop the recorded company and choose again. */
   onClear: () => void;
+  /**
+   * A sentence explaining why the wizard sent them BACK here (finding B6).
+   *
+   * Today there is one: the deployment stopped charging a formation fee while this session was
+   * parked on the fee step, leaving a draft company nothing can move. A screen that reappears
+   * with no explanation reads as a bug, and the user's next move — pick another company, or ask
+   * us — is not one they can guess.
+   */
+  notice?: string;
 };
 
 /**
@@ -104,6 +114,7 @@ export function LegalBodyStep({
   onBack,
   onComplete,
   onClear,
+  notice,
 }: Props) {
   const { data: publicConfig } = usePublicConfigQuery();
   const environment = useFormationEnvironment();
@@ -238,6 +249,14 @@ export function LegalBodyStep({
         }
       />
 
+      {/* Why the wizard came BACK here, when it did (finding B6). A step that reappears without
+          a reason reads as a bug, and the next move is not one a user could guess. */}
+      {notice && (
+        <Callout tone="warn" className="mb-5" title="The formation fee has been turned off">
+          {notice}
+        </Callout>
+      )}
+
       {companyId ? (
         <AttachedPanel
           companyId={companyId}
@@ -312,11 +331,18 @@ export function LegalBodyStep({
           Straight to doola, the filing agent, and into one table on this deployment that no view,
           no log, no metadata document and no on-chain record ever reads from. Your agent&apos;s
           public surfaces carry the company — never the person behind it.
-          {/* UNCONDITIONAL, because it is unconditionally true of every deployment this build
-              can talk to: nothing serves `formationPaymentRequired`, so the branch that used to
-              guard this sentence could never be false. B1 ships the field, the quote route and
-              the payment step together, and this sentence changes with them. */}
-          {" Formation is included during the beta."}
+          {/* B1: the sentence now comes from `/config`, and it says one of two things — the beta
+              line WITH the price it would otherwise be, or the price itself on a deployment that
+              charges. Both halves are served rather than bundled: a fee compiled into this build
+              would drift from the fee the backend quotes, silently, and the number on this screen
+              is the one a person decides on. */}
+          {` ${feeSentence(publicConfig)}`}
+          {publicConfig?.formationPaymentRequired === true && (
+            <>
+              {" "}
+              {FEE_BREAKDOWN}
+            </>
+          )}
         </Callout>
       )}
 

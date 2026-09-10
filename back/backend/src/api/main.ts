@@ -14,7 +14,9 @@ import {
   managerWalletClient,
   platformManagerAddress as platformManagerAddressOf,
   publicClientFor,
+  walletClientForKey,
 } from "../adapters/arc/clients";
+import { readUsdcDomain } from "../adapters/arc/usdcToken";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
 import {
   activateCircleSca,
@@ -40,10 +42,12 @@ import {
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
 import { createCompany } from "../formation/company";
+import { newChainHeadCache } from "../formation/payment";
 import { buildJobDeps } from "../jobs/composition";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
+import { LOW_SUBMITTER_BALANCE_WEI } from "../payments/formationSettle";
 import { PaymentLedger } from "../payments/ledger";
 import { buildOutflowMeter } from "../payments/outflowMeter";
 import { buildPocketFunding } from "../payments/pocketFunding";
@@ -61,6 +65,7 @@ import { FileDocumentStore } from "../persistence/documentStore";
 import { SqliteDoolaEventRepository } from "../persistence/doolaEventRepository";
 import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../persistence/formationPartyRepository";
+import { SqliteFormationPaymentRepository } from "../persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../persistence/formationRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
@@ -68,6 +73,7 @@ import { SqlitePasskeyStore } from "../persistence/passkeyStore";
 import { SqlitePaymentIdempotencyStore } from "../persistence/paymentIdempotencyStore";
 import {
   assertCircleCoverage,
+  assertPaymentAddressSeparation,
   assertTurnkeyCoverage,
   backfillPocketAddresses,
 } from "../persistence/tier0";
@@ -106,6 +112,13 @@ async function main() {
   assertCircleCoverage(db, cfg.circle);
   assertTurnkeyCoverage(db, turnkeyServiceable);
   if (cfg.pocketMasterSeed) backfillPocketAddresses(db, cfg.pocketMasterSeed);
+  // ...and, AFTER the pocket backfill so every derived address is a row this can see: the DB half
+  // of the payment-address separation invariants (2026-08-26 §6.6, B1 gate A2). env.ts checks the
+  // fixed key set; only the database knows the fleet's operator and pocket addresses. A no-op on
+  // every deployment that does not charge.
+  // `formation` is optional in the TYPE only (test fixtures build Config literals); loadConfig
+  // always populates it, and a fixture that does not simply has no payment to separate.
+  if (cfg.formation) assertPaymentAddressSeparation(db, cfg.formation.payment);
   const repo = new SqliteEntityRepository(db);
   // Same db handle as `repo`, deliberately: the v1 anchor row is written INSIDE the entity row's
   // transaction at create-confirm, so the entity store and the anchor history can never disagree
@@ -119,6 +132,11 @@ async function main() {
   // a box that has lost its doola block must still describe (and serve documents for) the filings
   // it already made.
   const companies = new SqliteCompanyRepository(db);
+  // Same db handle, and for the sharpest version of the reason: the `quoted` row is inserted in
+  // the SAME TRANSACTION as the company it belongs to (§6.1), so a second handle would make that
+  // impossible to express. Always constructed, like `companies` and for the same reason — a box
+  // that stops charging must still be able to read the payments it already took.
+  const formationPayments = new SqliteFormationPaymentRepository(db);
   // Same db handle again: a stored document's index row and the step it confirms have to commit
   // against the same database, and the webhook ledger is the sweeper's work queue.
   const formationDocuments = new SqliteDocumentIndexRepository(db);
@@ -356,6 +374,93 @@ async function main() {
    * one domain function exists to prevent. Only `transaction` differs per call site: the shim
    * already runs inside the claim's transaction, the two doors open their own.
    */
+  /**
+   * FORMATION PAYMENTS (§6.1) — assembled ONCE, and only where this deployment charges.
+   *
+   * The USDC EIP-712 domain is READ FROM THE CHAIN HERE, at boot, and pinned against the token's
+   * own `DOMAIN_SEPARATOR()` (`readUsdcDomain` throws otherwise). Once, because it is four
+   * constants about somebody else's predeploy: reading it per quote would put a chain round trip
+   * — and a way to fail — on the hot path of every company creation, and hardcoding it would
+   * produce signatures that revert only after a guardian has approved them.
+   *
+   * A box that cannot read the token therefore does not boot. That is the right direction: the
+   * alternative is booting a deployment that will quote a price for a signature it cannot settle.
+   */
+  // The chain head, read once here and refreshed by the sweeper. Recorded on every quote as the
+  // floor of the log window that resolves it later (B1 gate A3).
+  const chainHead = newChainHeadCache(
+    formationCfg.payment.required ? await publicClient.getBlockNumber().catch(() => null) : null,
+  );
+  /**
+   * ALWAYS CONSTRUCTED (finding B8), and `required` inside it is the switch.
+   *
+   * It used to exist only where the deployment charges, which made every payment surface vanish
+   * with the flag — including the READ ones. Turn charging off after taking money and the
+   * settled rows become invisible: a guardian who paid 399 USDC sees no payment at all, and
+   * support has nothing to point at. Rolling a flag back must not erase history.
+   *
+   * The DOMAIN is the one part that stays conditional: reading the token at boot is right for a
+   * box that quotes (better to refuse to start than to quote a price for a signature it could not
+   * settle) and wrong for one that does not, where a token it cannot see would be a boot failure
+   * for a feature it does not use.
+   */
+  const formationPayment = {
+    required: formationCfg.payment.required,
+    feeAtomic: formationCfg.payment.feeAtomic,
+    feeUsdc: formationCfg.payment.feeUsdc,
+    // Non-null WHEN REQUIRED, by the boot invariant in env.ts; the empty string is never read on
+    // a deployment that does not charge, because nothing quotes.
+    revenueAddress: (formationCfg.payment.revenueAddress ?? "0x") as Address,
+    quoteTtlMs: formationCfg.payment.quoteTtlMs,
+    settleGraceMs: formationCfg.payment.settleGraceMs,
+    domain: formationCfg.payment.required
+      ? await readUsdcDomain(publicClient, cfg.usdc, cfg.chainId)
+      : undefined,
+    chainHead: chainHead.get,
+    noteChainHead: chainHead.set,
+    payments: formationPayments,
+  };
+  if (formationPayment.required)
+    console.warn(
+      `⚠ FORMATION PAYMENTS ENABLED: $${formationPayment.feeUsdc} USDC to ${formationPayment.revenueAddress} (USDC domain "${formationPayment.domain?.name}" v${formationPayment.domain?.version}, pinned on-chain)`,
+    );
+
+  /**
+   * THE SETTLE SUBMITTER's clients (B1 gate A2) — a DEDICATED EOA, not the platform key.
+   *
+   * `managerWalletClient` was the obvious choice and the wrong one. The platform key signs
+   * registry writes, sweeps and job transactions, so sharing it means sharing a NONCE SPACE: a
+   * guardian's settle can be starved or replaced by traffic that has nothing to do with them,
+   * while they watch a spinner. It also means the gas float for settlements is not a number
+   * anyone can look at. And it hands a gas-only job the factory owner's authority.
+   *
+   * So: its own key, its own nonce, its own USDC balance (on Arc the gas token IS USDC), and no
+   * role anywhere else — enforced at boot by the invariants in `config/env.ts`, which refuse a
+   * submitter that collides with the platform key, the revenue address or any other signer.
+   */
+  const formationExecutor = formationCfg.payment.submitterKey
+    ? {
+        publicClient,
+        walletClient: walletClientForKey(cfg, formationCfg.payment.submitterKey),
+        usdc: cfg.usdc,
+        chainId: cfg.chainId,
+      }
+    : undefined;
+  if (formationPayment.required && formationExecutor) {
+    const submitter = formationExecutor.walletClient.account?.address as Address;
+    // The gas float, read once and stated. It is USDC on Arc, so "low" is a number an operator
+    // can act on directly — and a submitter that runs dry does not fail a settle loudly, it
+    // leaves rows `settling` until somebody notices.
+    const balance = await publicClient.getBalance({ address: submitter }).catch(() => null);
+    console.warn(
+      `⚠ FORMATION SETTLE SUBMITTER: ${submitter} (gas balance ${balance ?? "unknown"})`,
+    );
+    if (balance !== null && balance < LOW_SUBMITTER_BALANCE_WEI)
+      console.warn(
+        `⚠ FORMATION SETTLE SUBMITTER IS LOW ON GAS (${balance}) — top ${submitter} up with USDC, or settles will stall with guardians' authorizations already signed`,
+      );
+  }
+
   const companyDeps = formationDeployment
     ? {
         companies,
@@ -369,6 +474,9 @@ async function main() {
         // invariant — and its absence makes the door REFUSE the field, never store it in clear.
         pii: formationCfg.pii,
         world: worldId,
+        // With payment on, `createCompany` lands the company `draft` and writes its quote in the
+        // same transaction. Absent = the beta shape, where every company lands `ready`.
+        payment: formationPayment,
       }
     : undefined;
 
@@ -481,6 +589,17 @@ async function main() {
     // The SSN keyring (§4.2). The sweeper hands it to the filing step, which needs it to rebuild
     // a body it already sent, and to the TTL leg, which needs only to erase.
     pii: formationCfg.pii,
+    // The eighth leg's wiring (§6.4) — the SAME payment config and executor the settle route
+    // holds, so the sweeper and the route resolve one payment through one set of rules. Absent
+    // where the deployment does not charge, and the leg is then a no-op.
+    payment:
+      formationPayment.required && formationExecutor
+        ? {
+            payment: formationPayment,
+            executor: formationExecutor,
+            transaction: <T>(fn: () => T) => repo.transaction(fn),
+          }
+        : undefined,
     intervalMs: cfg.formation?.sweepMs ?? 60_000,
     // The anchor sub-saga (design §7). The SAME `anchors` repo the saga writes the v1 row with
     // and the SAME `arc` adapter the saga mints through — a second adapter would be a second
@@ -618,6 +737,15 @@ async function main() {
             compliance: doolaApi,
             // The same object the shim uses; the doors add only their own transaction.
             companyDeps,
+            // …and the payment config the quote/settle/cancel routes read. The SAME object
+            // `companyDeps` carries, so the door that quotes and the door that settles can never
+            // disagree about the fee, the payee or the domain.
+            payment: formationPayment,
+            // …and the fee ITSELF, whether or not this box charges: the beta sentence quotes it.
+            feeUsdc: formationCfg.payment.feeUsdc,
+            // The submitter. Present only where the box CHARGES, so a deployment that has
+            // stopped can still read its payments while having no settle path wired at all.
+            paymentExecutor: formationPayment.required ? formationExecutor : undefined,
           }
         : undefined,
     // The view dependencies, as ONE object shared with the MCP surface below (C8).

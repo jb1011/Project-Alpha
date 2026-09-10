@@ -278,6 +278,17 @@ export class SqliteFormationRepository implements FormationRepository {
             AND c.provider = 'doola'
             AND NOT EXISTS (
                   SELECT 1 FROM formation_requests f WHERE f.company_id = c.company_id)
+            -- ⚠ AND NOT WHILE THE FORMATION FEE IS UNPAID (2026-08-26 §6.5). The status = ready
+            -- clause above already excludes the ordinary unpaid company, which is a draft — this
+            -- is the explicit statement of the rule, so a later path that readies a company
+            -- without settling its fee cannot silently spend $150 at doola. Scoped to the
+            -- FORMATION product: a live maintenance_year quote is a different bill and must not
+            -- hold up the filing it renews.
+            AND NOT EXISTS (
+                  SELECT 1 FROM formation_payments p2
+                   WHERE p2.company_id = c.company_id
+                     AND p2.product = 'formation'
+                     AND p2.status IN ('quoted','settling'))
           ORDER BY c.company_id
           LIMIT @limit`,
       ),

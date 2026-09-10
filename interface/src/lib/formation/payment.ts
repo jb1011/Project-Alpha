@@ -1,0 +1,181 @@
+import type { FormationPaymentView, PaymentTypedData, PublicConfig } from "@/lib/api/types";
+
+/**
+ * FORMATION-PAYMENT PRESENTATION, as pure functions (design §6.8).
+ *
+ * The wizard step and the Companies page render the same payment, and every question they ask of
+ * it — "may this be signed?", "what does this say?", "what may the guardian do next?" — has one
+ * answer here rather than two in two components. That is the `honesty.ts` precedent applied to
+ * money: a picker and a detail page disagreeing about a filing is a bug; disagreeing about
+ * whether a guardian still owes 399 USDC is a bug that takes money.
+ */
+
+/**
+ * THE FEE SENTENCE.
+ *
+ * Both halves come from `/config`, never from the bundle: the fee a screen names has to be the
+ * fee the backend would quote, and a number compiled into the browser build drifts from it
+ * silently. When we do not know the price we do not name one — "included during the beta" is
+ * still true and complete without it.
+ */
+export function feeSentence(config: Pick<PublicConfig, "formationPaymentRequired" | "formationFeeUsdc"> | undefined): string {
+  const fee = config?.formationFeeUsdc;
+  if (config?.formationPaymentRequired === true)
+    return fee == null ? "Formation fee" : `$${fee} USDC, one time`;
+  return fee == null
+    ? "Formation is included during the beta."
+    : `Formation is included during the beta, normally $${fee}.`;
+}
+
+/**
+ * The breakdown line (§6.8).
+ *
+ * The Wyoming state fee is OUTSIDE the filing partner's pack and is NOT added at checkout — the
+ * quoted price already covers it. Saying so is the difference between a price a person can check
+ * and a number they have to trust, and it is the one part of the fee a reader can verify against
+ * Wyoming's own published schedule.
+ */
+export const FEE_BREAKDOWN = "Includes the $100 Wyoming state filing fee — nothing is added at checkout.";
+
+/**
+ * What a session parked on the fee step is told when the deployment stops charging (finding B6).
+ *
+ * The situation is real and unglamorous: an operator turns `FORMATION_PAYMENT_REQUIRED` off while
+ * somebody has a `draft` company and an unfinished payment. Nothing was charged, and nothing ever
+ * will be — but nothing will move that company out of draft either, because the door that did it
+ * is gone. Saying so beats carrying them through four more screens towards a submit that cannot
+ * succeed.
+ */
+export const PAYMENT_NO_LONGER_REQUIRED =
+  "This deployment no longer charges a formation fee, and nothing was charged to you. The company you started is still a draft and cannot be filed as it stands — pick or create another one below to carry on, or contact support and we will open that filing for you.";
+
+/** Atomic USDC (6 decimals) as a human amount. Exact for the whole-dollar fees we quote. */
+export function formatAtomicUsdc(atomic: string): string {
+  const n = Number(atomic) / 1_000_000;
+  return Number.isFinite(n)
+    ? n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : "—";
+}
+
+/**
+ * WHAT THE GUARDIAN MAY DO NEXT — one function, so the wizard and the Companies page cannot offer
+ * different buttons for the same row.
+ *
+ *  - `sign`    a live quote, inside its window;
+ *  - `wait`    a broadcast whose outcome is not yet known. **No sign button exists in this
+ *              state**, and that is the whole point: signing again while a transfer may still be
+ *              mined is how a guardian is charged twice;
+ *  - `cancel`  the same state, once it has been stuck long enough that waiting is not an answer.
+ *              A cancel is a second signature, and it retires the authorization on-chain;
+ *  - `requote` a terminal-but-unpaid row: expired, or a transfer that reverted;
+ *  - `done`    settled or refunded — nothing is owed.
+ */
+export type PaymentAction = "sign" | "wait" | "cancel" | "requote" | "done" | "unknown";
+
+/** How long a `settling` row must sit before the cancel button appears. Long enough that an
+ *  ordinary confirmation is not interrupted; short enough that nobody watches a spinner. */
+export const STUCK_AFTER_MS = 90_000;
+
+export function paymentAction(
+  payment: FormationPaymentView | undefined,
+  opts: { nowMs: number; settlingSinceMs?: number },
+): PaymentAction {
+  if (!payment) return "unknown";
+  switch (payment.status) {
+    case "quoted":
+      // The QUOTE is the authority, not the status: the backend withholds it past the TTL even
+      // before the sweeper has moved the row, because the clock is the truth and the status is
+      // only when somebody last looked.
+      //
+      // Withheld, the exit is CANCEL rather than re-quote. The authorization the guardian may
+      // have signed is still valid for the settlement grace, so the backend will not issue a
+      // second quote until that window provably closes — and a cancel retires the nonce on-chain
+      // at once, which is exactly what the fast path is for. (Waiting a few minutes also works,
+      // and the explanation says so.)
+      //
+      // …unless there is no domain to sign a cancel against, on a deployment that has stopped
+      // charging (finding B8): then nothing is owed and nothing can be signed.
+      if (payment.quote) return "sign";
+      return payment.domain === null ? "wait" : "cancel";
+    case "settling":
+      // A cancel needs a DOMAIN to sign against, and a deployment that has stopped charging
+      // serves none (finding B8). Waiting is then the only honest offer: the row is history, and
+      // the sweeper is what resolves it.
+      return payment.domain !== null &&
+        opts.settlingSinceMs !== undefined &&
+        opts.nowMs - opts.settlingSinceMs > STUCK_AFTER_MS
+        ? "cancel"
+        : "wait";
+    case "expired":
+    case "failed":
+      return "requote";
+    case "settled":
+    case "refunded":
+      return "done";
+    default:
+      // A status from a newer backend. `unknown` renders as "we cannot read this" rather than as
+      // anything actionable — the honesty rule the formation status union already follows.
+      return "unknown";
+  }
+}
+
+/** One sentence per state, in the register of somebody who is owed an explanation and not a log
+ *  line. Kept beside `paymentAction` so a state can never gain a button without gaining words. */
+export function paymentExplanation(payment: FormationPaymentView | undefined): string {
+  switch (payment?.status) {
+    case "quoted":
+      return payment.quote
+        ? "Your wallet will ask you to authorize this exact transfer. Nothing moves until you approve it."
+        : "This quote has expired and nothing was charged. If you already signed it, that authorization stays valid for a few more minutes — cancel it to clear the way for a new quote now, or wait for it to lapse.";
+    case "settling":
+      return "Your authorization has been submitted and we are waiting for it to confirm. Do not sign again: the transfer may still complete, and a second signature could charge you twice.";
+    case "settled":
+      return "Paid. Your company can now be filed.";
+    case "expired":
+      return "This quote expired before it was used. Nothing was charged. Request a new one when you are ready.";
+    case "failed":
+      return "The transfer did not go through — most often because the wallet did not hold enough USDC. Nothing was charged. Request a new quote and try again.";
+    case "refunded":
+      return "This payment was refunded.";
+    default:
+      return "";
+  }
+}
+
+/**
+ * The typed data, in the shape wagmi's `useSignTypedData` takes.
+ *
+ * A translation and NOT a construction: every field comes from the server's object, and the only
+ * work is turning the three decimal strings into bigints, which is what viem's encoder wants.
+ * Building the message here instead would be a second place to get the domain, the type list or
+ * the field ORDER wrong, and each of those yields a signature that reverts after approval.
+ */
+export function toWagmiTypedData(td: PaymentTypedData) {
+  return {
+    domain: td.domain,
+    types: td.types,
+    primaryType: td.primaryType,
+    message: {
+      from: td.message.from,
+      to: td.message.to,
+      value: BigInt(td.message.value),
+      validAfter: BigInt(td.message.validAfter),
+      validBefore: BigInt(td.message.validBefore),
+      nonce: td.message.nonce,
+    },
+  } as const;
+}
+
+/**
+ * ⚠ THERE IS NO `cancelTypedData` BUILDER HERE ANY MORE (finding C2).
+ *
+ * This package used to construct the `CancelAuthorization` message from the view's `nonce` and
+ * `domain`, holding its own copy of the type list. The server now serves the whole request as
+ * `payment.cancelTypedData`, for the reason the transfer message was always served: a second
+ * place to get a type list, a field order or an AUTHORIZER wrong. The authorizer in particular is
+ * not something a browser can know — it is the address that SIGNED, which is the payer once a
+ * settle has been attempted and the connected wallet only before that.
+ *
+ * The message needs no translation on the way to wagmi: unlike the transfer authorization it has
+ * no uint256 fields, only an address and a bytes32.
+ */
