@@ -62,7 +62,7 @@ AgentKit proof and then resolves the legal body directly, fresh, on every reques
   "address": "0x…",
   "legalBody": true,
   "standing": "active",
-  "agentId": 843704,
+  "agentId": "843704",
   "publicId": "…",
   "name": "…",
   "network": "testnet",
@@ -72,8 +72,8 @@ AgentKit proof and then resolves the legal body directly, fresh, on every reques
 }
 ```
 
-An address we have no entity for answers 200 with `legalBody: false`, `standing: null`. A malformed
-address answers 400. `standing` has three values and only three:
+An address we have no entity for answers 200 with `legalBody: false`, `standing: null`. `standing` has
+three values and only three:
 
 - `active` — on-chain legal status good, treasury not paused. The only value the checker calls yes.
 - `inactive` — a definitive negative read: suspended, dissolved, or a paused treasury.
@@ -83,15 +83,15 @@ address answers 400. `standing` has three values and only three:
 `formation` reports the filing state of the company behind the entity, and never gates anything:
 what a seller can verify is the on-chain legal body.
 
-**Rate limit.** A token bucket of 30 refilling at 1 per second brakes the route, shared by every
-caller of that API process rather than held per caller. A throttled request is refused (429, or 503
-where a drained budget is spelled so) and reads, like any 5xx, as `null`: fail closed. Keep your
-request volume proportional to your traffic.
-
-**Non-200 answers.** Three: 400 (the address is neither all-lowercase nor valid EIP-55), 429 (a
-throttle — from the per-caller bucket or the shared one, with the same body either way), and 503
-(the lookup's own read failed). The checker reads all three as `null`, and so does a 200 whose
-`standing` is anything but `active`.
+**Rate limit, freshness and the three non-200 answers.** Two token buckets brake the route: a
+per-client one (10 burst, refilling 0.5 per second, keyed by the first `X-Forwarded-For` entry) in
+front of one shared by every caller of that API process (30 burst, 1 per second). Both are spent on a
+cache miss only — the lookup memoises the last definitive answer per address for 15 seconds and a memo
+hit costs no token — and either refuses with 429 and the same body, so keep your volume proportional
+to your traffic. The non-200 answers are exactly three: 400 (the address is neither all-lowercase nor
+valid EIP-55), that 429, and 503 (the lookup's own read failed); the checker reads all three as `null`
+— fail closed — as it does a 200 whose `standing` is anything but `active`. A definitive 200 carries
+`Cache-Control: public, max-age=15`, every other answer `no-store`.
 
 ## What you may say
 

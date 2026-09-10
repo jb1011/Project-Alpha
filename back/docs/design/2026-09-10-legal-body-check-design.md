@@ -153,7 +153,7 @@ reference implementation of the issuer side.
 
 ## 8. Corrections after implementation
 
-Written against the code as it landed (tasks 1–4, branch `feat/legal-body-check`). Each item names
+Written against the code as it landed (tasks 1–6, branch `feat/legal-body-check`). Each item names
 the decision it amends; §1–§7 above are the design as it was gated, unedited.
 
 **D1 — "behaviour and tests unchanged" is wrong in two places, both deliberate.** Refactoring
@@ -211,6 +211,47 @@ working one.
 
 **D5 — the run probes its OWN wall instance.** `/legal-bodies-run` does not probe the settling wall;
 it builds a second paywall from the same deps with no `settle` and its own rate key
-(`…#legal-bodies-run`). The per-human allowance is spent before the legal check, so sharing the
-settling wall's key would turn leg 2 into a 429 after a handful of page views — the same reason
-`/proof-run` keeps its own key. Leg 2 signs leg 1's own challenge rather than minting a second.
+(`…#legal-bodies-run`). The per-human allowance is spent on every definitive answer, refusals
+included, so sharing the settling wall's key would turn leg 2 into a 429 after a few page views —
+the same reason `/proof-run` keeps its own key. Leg 2 signs leg 1's own challenge, not a second one.
+
+**D5 — the run wall's meter.** The run's instance is also built with `allowancePerHuman: 10_000`, an
+effectively unlimited meter (ruling T3-R2). Its own rate key is not enough on its own: the allowance
+is per human per window, and at the production default of 3 per 24 h the second leg would answer 429
+from the fourth page view onward — beside an `expected` block still promising 403, contradicting
+itself mid-demo. The settling wall keeps the deployment's allowance, because that budget protects
+something; this one settles nothing.
+
+**D4 — `PUBLIC_API_URL`, a new optional env** (ruling T3-R1/R5). Every public link this deployment
+hands to a STRANGER — the refusal's `how.lookup`, the advertised demo wall, the run url — is composed
+from `cfg.publicApiUrl ?? cfg.metadataBaseUrl`. `METADATA_BASE_URL` is the `www/backend` proxy in
+production, and that hop forwards allowlists only: no CORS header, no `Cache-Control`, and (until the
+interface carrying this branch is deployed) no `X-NOVI-LEGAL-BODY`. Unset, everything behaves exactly
+as before, so no box has to change to boot. `interface/src/lib/proxyHeaders.ts` gains
+`x-novi-legal-body` on the response allowlist for buyers that do come through the proxy.
+
+**D4 — the meter is charged AFTER the decision, and exhaustion is checked first.** Under
+`legal-bodies-only` the AgentKit verification runs with `chargeAllowance: false`: the human is
+identified and an exhausted one is still refused 429 — before any Arc read — but the unit is spent
+only once the legal answer is definitive. On the 402 a passing check leads to, and on both legal
+403s, one unit is charged and reported in `X-AGENTKIT-AUTHORIZATION`; on the 503 nothing is charged,
+because the store has no release and an RPC blip would otherwise lock out the buyer this policy
+exists to serve for the rest of the window (ruling T3-R3).
+
+**D4 — `legal-bodies-only` without `agentkit` fails CLOSED.** Missing EITHER half (the AgentKit
+config or the resolver) refuses every request 503, ahead of the no-proof 403, each with its own
+mount-time warning. Without this, a box that lost its World config would have fallen through to
+`open` and sold to anonymous payers while its own env still said `legal-bodies-only` (ruling T3-R4).
+`accountable-only`'s pre-existing fail-open is untouched here — see the plan's Deferred list.
+
+**D5 — the buyer recovers from a strict wall's 403, once** (ruling T6, Task 6). `buyWithX402` answers
+a 403 whose body carries `extensions.agentkit`: it mints the human-backing proof with the agent's own
+pocket AgentKit signer and retries the SAME request ONCE, then continues down the unchanged 402 →
+authorize → pay path with the proof header still attached. Never on the first request — a non-strict
+but AgentKit-aware seller would otherwise spend one of the human's allowance units on every purchase
+— and never twice: a second 403 is terminal and throws
+`resource-403-after-proof: <error> (<reason>): <detail>`, quoting the seller so the reason a user
+reads names the missing thing. Nothing is signed for money on the proof leg, so the idempotency claim
+is released and the same key retries cleanly. This is what makes design D5's third leg reachable from
+the product (`pay`), which it was not when §1–§7 were written: World's own client returns any
+non-402 response untouched.
