@@ -472,8 +472,9 @@ Run in this order. Steps 1–3 are refused at boot if they are wrong, which is t
    `TRANSFER_WITH_AUTHORIZATION_GAS = 140_000` (measured 117,079) and
    `CANCEL_AUTHORIZATION_GAS = 86_000` (measured 71,265), in `src/adapters/arc/gas.ts`. Nothing to
    do unless the token is upgraded — in which case re-run `scripts/formation-settle-probe.mts` and
-   set each to the new figure plus ~20%. Transcript and what it establishes:
-   `docs/runbooks/formation-settle-probe-2026-09.md`.
+   set each to the new figure plus ~20%. Both live runs (2026-09-09 through the platform key,
+   2026-09-10 through the dedicated submitter) agree to within twenty gas — transcripts and what
+   they establish: `docs/runbooks/formation-settle-probe-2026-09.md`.
 5. `FORMATION_PAYMENT_REQUIRED=true`, restart, and confirm the boot line:
    `⚠ FORMATION PAYMENTS ENABLED: $399 USDC to 0x… (USDC domain "USDC" v2, pinned on-chain)`,
    and the line after it naming the settle submitter and its gas balance.
