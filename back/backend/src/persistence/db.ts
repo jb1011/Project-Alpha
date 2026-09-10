@@ -244,6 +244,17 @@ const FORMATION_PAYMENTS_DDL = `
       -- as settled rather than as failed.
       tx_hash     TEXT,
       broadcast_count INTEGER NOT NULL DEFAULT 0,
+      -- ⚠ THE SUBMITTER NONCE AND FEES OF THAT LAST BROADCAST (2026-09-10 verifier, R1).
+      --
+      -- Without them a resume takes the next PENDING nonce, which produces a SECOND transaction
+      -- rather than a replacement — and nonces are ordered, so the first one mines (the money
+      -- moves), the second reverts with authorization-is-used, and a receipt-reader writes the
+      -- payment off as failed. With them, a re-broadcast whose predecessor is still pending
+      -- REPLACES it at the same nonce with a higher fee, which is what an underpriced
+      -- transaction actually needs.
+      last_nonce  INTEGER,
+      last_max_fee TEXT,
+      last_priority_fee TEXT,
       attempt     INTEGER NOT NULL DEFAULT 0,
       refund_tx_hash TEXT,
       created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -833,6 +844,9 @@ export function migrate(db: Database.Database): void {
     ["broadcast_count", "INTEGER NOT NULL DEFAULT 0"],
     ["quoted_block", "INTEGER"],
     ["ttl_at", "INTEGER"],
+    ["last_nonce", "INTEGER"],
+    ["last_max_fee", "TEXT"],
+    ["last_priority_fee", "TEXT"],
   ] as const)
     if (!payCols.includes(col)) db.exec(`ALTER TABLE formation_payments ADD COLUMN ${col} ${type}`);
 

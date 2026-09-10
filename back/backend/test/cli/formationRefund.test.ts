@@ -79,7 +79,12 @@ function seed(status: "settled" | "quoted"): { companyId: string; paymentId: str
       payerAddress: "0x000000000000000000000000000000000000000A",
       signature: `0x${"11".repeat(65)}`,
     });
-    payments.recordBroadcast(paymentId, TX);
+    payments.recordBroadcast(paymentId, {
+      txHash: TX,
+      nonce: 1,
+      maxFeePerGas: 2n,
+      maxPriorityFeePerGas: 1n,
+    });
     payments.markSettled(paymentId, TX);
   }
   db.close();

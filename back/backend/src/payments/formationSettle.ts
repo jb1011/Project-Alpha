@@ -116,24 +116,53 @@ export type BroadcastOutcome =
    *  may be settled by somebody else entirely. */
   | { kind: "unknown"; reason: string; txHash?: Hex };
 
-export interface BroadcastOptions {
-  /**
-   * How many times this authorization has already been broadcast. Each one bumps the fee, because
-   * a previous transaction may still be sitting in the mempool under the same account nonce, and
-   * a replacement at the same price is simply rejected.
-   */
-  bumps?: number;
-  /** Called with the hash of the bytes about to go out, BEFORE they go out, so the caller can
-   *  record what it is waiting on. */
-  onBroadcast?: (txHash: Hex) => void;
+/** What one broadcast committed to — reported BEFORE the send, so the caller can record it. */
+export interface BroadcastAttempt {
+  txHash: Hex;
+  nonce: number;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
 }
 
-/** Fee bump for re-broadcast n: +25% each, capped so a long-stalled row cannot walk the price up
- *  without bound. 12.5% is the protocol minimum for a replacement; 25% is one that lands. */
+export interface BroadcastOptions {
+  /**
+   * How many times this authorization has already been broadcast. Each one bumps the fee off the
+   * current estimate, for the case where the previous attempt is genuinely gone.
+   */
+  bumps?: number;
+  /**
+   * ⚠ THE PREVIOUS ATTEMPT, when there is one (2026-09-10 verifier, R1).
+   *
+   * If the submitter's CONFIRMED nonce is still at or below it, that transaction is sitting in
+   * the mempool — underpriced, most likely — and the right move is to REPLACE it: same nonce,
+   * higher fee. Taking the next PENDING nonce instead queues a second transaction behind the
+   * first, and nonces are ordered, so the first one mines (the money moves) and the second
+   * reverts with `authorization is used`. A receipt-reader then writes off a payment that
+   * succeeded.
+   */
+  previous?: { nonce: number; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+  /** Called with what is about to go out, BEFORE it goes out, so the caller can record what it
+   *  is waiting on — and what the attempt after this one has to outbid. */
+  onBroadcast?: (attempt: BroadcastAttempt) => void;
+}
+
+/**
+ * Fee bump for re-broadcast n: +25% each, capped so a long-stalled row cannot walk the price up
+ * without bound. 10-12.5% is the protocol minimum for a replacement; 25% is one that lands.
+ *
+ * ⚠ STRICTLY INCREASING when it bumps at all. These are bigints, so `fee * 5n / 4n` rounds DOWN —
+ * and at small values it rounds straight back onto `fee`, which would produce a "replacement" at
+ * the same price that the node simply rejects, leaving the original transaction stuck exactly
+ * where it was.
+ */
 export function bumpedFee(fee: bigint, bumps: number): bigint {
   const n = BigInt(Math.max(0, Math.min(bumps, 8)));
-  return (fee * (4n + n)) / 4n;
+  if (n === 0n) return fee;
+  const bumped = (fee * (4n + n)) / 4n;
+  return bumped > fee ? bumped : fee + n;
 }
+
+const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
 
 /**
  * Submit `transferWithAuthorization` — the whole settle, composed fresh.
@@ -205,15 +234,46 @@ async function composeAndSend(
 ): Promise<BroadcastOutcome> {
   const account = deps.walletClient.account;
   if (!account) throw new Error("formation settle: the submitter wallet client has no account");
-  // `pending` so two settles in the same block do not sign the same nonce. The caller also holds
-  // a per-company lock, but the submitter is shared across companies, so the node is the
-  // authority — and the submitter is DEDICATED, so nothing else on this box moves that nonce.
-  const nonce = await deps.publicClient.getTransactionCount({
-    address: account.address,
-    blockTag: "pending",
-  });
-  const fees = await deps.publicClient.estimateFeesPerGas();
+  const estimate = await deps.publicClient.estimateFeesPerGas();
   const bumps = opts.bumps ?? 0;
+
+  // ── WHICH NONCE, AND AT WHAT PRICE (R1) ─────────────────────────────────────────────────
+  //
+  // `latest` rather than `pending`, because the question is not "what would a new transaction
+  // use" but "has our previous one been mined yet". A confirmed count still at or below the
+  // previous attempt's nonce means that transaction is unconfirmed — so this attempt REPLACES it
+  // at the same nonce and a strictly higher price (the protocol minimum for a replacement is
+  // +10%; +25% is one that lands), rather than queueing behind it.
+  const confirmed = await deps.publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: "latest",
+  });
+  const replacing = opts.previous !== undefined && confirmed <= opts.previous.nonce;
+  const nonce = replacing
+    ? (opts.previous as { nonce: number }).nonce
+    : // `pending` so two settles in the same block do not sign the same nonce. The caller also
+      // holds a per-company lock, but the submitter is shared across companies, so the node is
+      // the authority — and the submitter is DEDICATED, so nothing else on this box moves it.
+      await deps.publicClient.getTransactionCount({
+        address: account.address,
+        blockTag: "pending",
+      });
+  // A replacement must outbid ITS OWN predecessor, not merely the current estimate: a network
+  // that has calmed down since would otherwise price the replacement below the transaction it is
+  // trying to displace, and the node would reject it outright.
+  const maxFeePerGas = replacing
+    ? max(
+        bumpedFee((opts.previous as { maxFeePerGas: bigint }).maxFeePerGas, 1),
+        estimate.maxFeePerGas,
+      )
+    : bumpedFee(estimate.maxFeePerGas, bumps);
+  const maxPriorityFeePerGas = replacing
+    ? max(
+        bumpedFee((opts.previous as { maxPriorityFeePerGas: bigint }).maxPriorityFeePerGas, 1),
+        estimate.maxPriorityFeePerGas ?? 0n,
+      )
+    : bumpedFee(estimate.maxPriorityFeePerGas ?? 0n, bumps);
+
   const rawTx = (await deps.walletClient.signTransaction({
     account,
     chain: null,
@@ -225,14 +285,14 @@ async function composeAndSend(
     // guardian has already signed.
     gas,
     nonce,
-    maxFeePerGas: bumpedFee(fees.maxFeePerGas, bumps),
-    maxPriorityFeePerGas: bumpedFee(fees.maxPriorityFeePerGas ?? 0n, bumps),
+    maxFeePerGas,
+    maxPriorityFeePerGas,
     chainId: deps.chainId,
   })) as Hex;
   // keccak256 of exactly what goes out — the same value `sendRawTransaction` returns, computed
   // without a node so it is available BEFORE the send.
   const txHash = keccak256(rawTx);
-  opts.onBroadcast?.(txHash);
+  opts.onBroadcast?.({ txHash, nonce, maxFeePerGas, maxPriorityFeePerGas });
   try {
     await deps.publicClient.sendRawTransaction({ serializedTransaction: rawTx });
   } catch (err) {
@@ -286,26 +346,12 @@ export async function authorizationUsed(
 }
 
 /**
- * Wait for the receipt of a hash we already broadcast — WITHOUT sending anything.
+ * ⚠ THERE IS NO `confirmBroadcast` HERE (2026-09-10 verifier, R1).
  *
- * The resume leg's use for it: an authorization whose nonce the token reports as SPENT must never
- * be re-broadcast (the second transaction would revert, and a revert on a spent nonce says
- * nothing about where the money went). Reading the receipt of what we last sent is the cheap way
- * to learn that our own transfer is what spent it.
+ * One existed — "wait for the receipt of a hash we already broadcast, without sending anything" —
+ * written for the A1-era resume and left unused once A3 made the TOKEN'S LOGS the resolver. It is
+ * deleted rather than kept, because a plausible-looking helper on a money path is a trap: the
+ * receipt of OUR transaction is exactly the evidence that answers `failed` for a payment somebody
+ * else settled, which is the bug this review found. `resolveAuthorizationOutcome` is the resolver;
+ * there is no second one to reach for.
  */
-export async function confirmBroadcast(
-  deps: FormationExecutorDeps,
-  txHash: Hex,
-): Promise<BroadcastOutcome> {
-  try {
-    const receipt = await deps.publicClient.waitForTransactionReceipt({
-      hash: txHash,
-      timeout: deps.receiptTimeoutMs ?? SETTLE_RECEIPT_TIMEOUT_MS,
-    });
-    return receipt.status === "success"
-      ? { kind: "settled", txHash, gasUsed: receipt.gasUsed }
-      : { kind: "reverted", txHash };
-  } catch (err) {
-    return { kind: "unknown", reason: (err as Error).message, txHash };
-  }
-}

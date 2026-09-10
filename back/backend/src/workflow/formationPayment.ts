@@ -65,7 +65,9 @@ export type SettleResult =
    *  `txHash` is the attempt we are waiting on, and is absent only if the compose itself never
    *  produced one. */
   | { ok: true; status: "pending"; txHash?: Hex }
-  | { ok: false; reason: string };
+  /** `outcome` says WHICH terminal state this refusal wrote, for the sweeper's verdict. Absent on
+   *  the door refusals that write nothing at all. */
+  | { ok: false; reason: string; outcome?: "failed" | "expired" };
 
 /**
  * THE ACTION DOORS' DEPENDENCIES, BUILT ONCE (finding C4).
@@ -229,10 +231,9 @@ export async function settleFormationPayment(
 
   const outcome = await broadcast(
     deps,
-    row.paymentId,
+    row,
     toSettleAuthorization(quote.typedData.message),
     body.signature,
-    0,
   );
   return finishSettle(deps, company, row, outcome);
 }
@@ -246,14 +247,24 @@ export async function settleFormationPayment(
  */
 async function broadcast(
   deps: FormationPaymentDeps,
-  paymentId: string,
+  row: FormationPaymentRecord,
   auth: Parameters<typeof submitTransferWithAuthorization>[1],
   signature: Hex,
-  bumps: number,
 ): Promise<BroadcastOutcome> {
   return submitTransferWithAuthorization(deps.executor, auth, signature, {
-    bumps,
-    onBroadcast: (txHash) => deps.payment.payments.recordBroadcast(paymentId, txHash),
+    bumps: row.broadcastCount,
+    // ⚠ THE PREVIOUS ATTEMPT (R1). If its nonce is still unconfirmed, this one REPLACES it at
+    // that nonce and a higher price. Queueing a second transaction behind an underpriced first
+    // one is how the first mines (moving the money) and the second reverts.
+    previous:
+      row.lastNonce !== null && row.lastMaxFeePerGas !== null && row.lastPriorityFeePerGas !== null
+        ? {
+            nonce: row.lastNonce,
+            maxFeePerGas: row.lastMaxFeePerGas,
+            maxPriorityFeePerGas: row.lastPriorityFeePerGas,
+          }
+        : undefined,
+    onBroadcast: (attempt) => deps.payment.payments.recordBroadcast(row.paymentId, attempt),
   });
 }
 
@@ -265,47 +276,89 @@ async function broadcast(
  * would leave a paid company that cannot be filed (or a filed one nobody paid for) in the crash
  * window between them.
  */
-function finishSettle(
+async function finishSettle(
   deps: FormationPaymentDeps,
   company: CompanyRecord,
   row: FormationPaymentRecord,
   outcome: BroadcastOutcome,
-): SettleResult {
-  if (outcome.kind === "settled") {
-    deps.transaction(() => {
-      deps.payment.payments.markSettled(row.paymentId, outcome.txHash);
-      // `draft → ready`, a CAS like every other status move. It legitimately does nothing when
-      // the company was already `ready` — a company can be paid for after an operator readied it,
-      // and re-writing the status would be the drift, not the fix.
-      deps.companies.setStatus(company.companyId, "draft", "ready");
-    });
-    opsLog("formation_payment_settled", {
-      companyId: company.companyId,
-      paymentId: row.paymentId,
-      amountUsdc: row.amountUsdc.toString(),
-      txHash: outcome.txHash,
-      gasUsed: outcome.gasUsed.toString(),
-    });
-    // …and immediately: is this the SECOND time this company has paid? (gate A5)
-    checkForDoublePayment(deps, company.companyId);
-    return { ok: true, status: "settled", txHash: outcome.txHash };
-  }
+): Promise<SettleResult> {
+  if (outcome.kind === "settled")
+    return settled(deps, company, row, outcome.txHash, outcome.gasUsed);
+
   if (outcome.kind === "reverted") {
-    // A REVERT is an outcome we observed: the transfer did not happen and this authorization
-    // cannot be made to happen (insufficient balance, or a nonce the token already knows). The
-    // row is terminal, and the guardian may re-quote.
+    // ⚠ A REVERT IS NOT AUTOMATICALLY A FAILURE (2026-09-10 verifier, R1).
+    //
+    // `transferWithAuthorization` reverts for two completely different reasons, and they demand
+    // opposite answers. The guardian's balance was short — nothing moved, the row is `failed`,
+    // they may re-quote. OR the nonce is already spent, in which case the money HAS moved and
+    // this transaction merely arrived second: our own earlier broadcast at a lower nonce, a
+    // relayer, anyone holding the public authorization. Writing THAT off as `failed` frees a
+    // re-quote and charges the guardian twice for one company, and the paid-row detector cannot
+    // see it because a `failed` row is not a paid row.
+    //
+    // So the token is asked before anything is written.
+    const authorizer = row.payerAddress ?? guardianOf(company);
+    const used = await authorizationUsed(deps.executor, authorizer, row.nonce);
+    if (used) {
+      const verdict = await resolveAuthorizationOutcome({
+        client: deps.executor.publicClient,
+        usdc: deps.executor.usdc,
+        authorizer,
+        nonce: row.nonce,
+        payTo: row.payTo,
+        value: row.amountUsdc,
+        fromBlock: row.quotedBlock === null ? null : BigInt(row.quotedBlock),
+      });
+      if (verdict.kind === "settled") {
+        opsLog("formation_payment_settled_elsewhere", {
+          level: "warn",
+          companyId: company.companyId,
+          paymentId: row.paymentId,
+          revertedTxHash: outcome.txHash,
+          settledTxHash: verdict.txHash,
+          reason: "our transaction reverted on a nonce another transaction had already settled",
+        });
+        return settled(deps, company, row, verdict.txHash, 0n);
+      }
+      if (verdict.kind === "cancelled") {
+        expire(deps, company, row, "cancelled-on-chain");
+        return {
+          ok: false,
+          outcome: "expired",
+          reason: "this authorization was cancelled on-chain — request a new quote",
+        };
+      }
+      // SPENT, but the logs do not say by what. Never `failed`: the money may be at the revenue
+      // address. The row stays `settling` and the next pass looks again.
+      opsLog("formation_payment_pending", {
+        level: "warn",
+        companyId: company.companyId,
+        paymentId: row.paymentId,
+        reason:
+          "our transaction reverted and the nonce is spent, but no Used/Canceled log is visible — NOT failing",
+      });
+      return { ok: true, status: "pending", txHash: outcome.txHash };
+    }
+
+    // A revert with the nonce STILL UNUSED is the honest failure: the transfer did not happen and
+    // this authorization cannot make it happen (an insufficient balance, most often).
     deps.payment.payments.markFailed(row.paymentId);
     opsLog("formation_payment_failed", {
       level: "warn",
       companyId: company.companyId,
       paymentId: row.paymentId,
       txHash: outcome.txHash,
-      reason: "reverted",
+      reason: "reverted with the authorization still unused",
     });
-    return { ok: false, reason: "the payment transaction reverted on-chain — request a new quote" };
+    return {
+      ok: false,
+      outcome: "failed",
+      reason: "the payment transaction reverted on-chain — request a new quote",
+    };
   }
-  // UNKNOWN. Left `settling` deliberately (§6.4 rule 1): the bytes are public and may still be
-  // mined, and a re-quote here is how a guardian gets charged twice.
+
+  // UNKNOWN. Left `settling` deliberately (§6.4 rule 1): the authorization is public and may still
+  // be mined, and a re-quote here is how a guardian gets charged twice.
   opsLog("formation_payment_pending", {
     level: "warn",
     companyId: company.companyId,
@@ -315,6 +368,34 @@ function finishSettle(
   // The hash comes off the OUTCOME, which is the attempt that just happened — never off `row`,
   // which was loaded before this broadcast and carries the previous attempt's hash (or none).
   return { ok: true, status: "pending", txHash: outcome.txHash };
+}
+
+/** `settling → settled` + the company's `draft → ready`, in ONE transaction, from whichever
+ *  transaction hash actually did it — ours or anyone's. */
+function settled(
+  deps: FormationPaymentDeps,
+  company: CompanyRecord,
+  row: FormationPaymentRecord,
+  txHash: Hex,
+  gasUsed: bigint,
+): SettleResult {
+  deps.transaction(() => {
+    deps.payment.payments.markSettled(row.paymentId, txHash);
+    // `draft → ready`, a CAS like every other status move. It legitimately does nothing when the
+    // company was already `ready` — a company can be paid for after an operator readied it, and
+    // re-writing the status would be the drift, not the fix.
+    deps.companies.setStatus(company.companyId, "draft", "ready");
+  });
+  opsLog("formation_payment_settled", {
+    companyId: company.companyId,
+    paymentId: row.paymentId,
+    amountUsdc: row.amountUsdc.toString(),
+    txHash,
+    gasUsed: gasUsed.toString(),
+  });
+  // …and immediately: is this the SECOND time this company has paid? (gate A5)
+  checkForDoublePayment(deps, company.companyId);
+  return { ok: true, status: "settled", txHash };
 }
 
 /**
@@ -362,7 +443,7 @@ export async function advancePaymentOnChain(
     fromBlock: row.quotedBlock === null ? null : BigInt(row.quotedBlock),
   });
   if (outcome.kind === "settled") {
-    const result = finishSettle(deps, company, row, {
+    const result = await finishSettle(deps, company, row, {
       kind: "settled",
       txHash: outcome.txHash,
       // The chain knows what it cost; we only observed it. Reporting 0 here rather than
@@ -437,16 +518,15 @@ export async function advancePaymentOnChain(
   // its own would be a second chance to re-submit a subtly different authorization.
   const broadcastOutcome = await broadcast(
     deps,
-    row.paymentId,
+    row,
     toSettleAuthorization(
       quoteOf(row, guardian, deps.payment.domain as TransferAuthorizationDomain).typedData.message,
     ),
     row.signature,
-    row.broadcastCount,
   );
-  const result = finishSettle(deps, company, row, broadcastOutcome);
+  const result = await finishSettle(deps, company, row, broadcastOutcome);
   if (result.ok && result.status === "settled") return "settled";
-  if (!result.ok) return "failed";
+  if (!result.ok) return result.outcome ?? "failed";
   return "pending";
 }
 
@@ -487,6 +567,56 @@ export function checkForDoublePayment(
       `${paid} paid formation payments exist for this company — a refund decision is needed`,
     );
   return true;
+}
+
+/**
+ * ⚠ THE OTHER HALF OF THE DETECTOR (2026-09-10 verifier, R1c): a payment we WROTE OFF whose
+ * authorization was mined anyway.
+ *
+ * `checkForDoublePayment` counts rows we know were paid. This one looks for the row nobody would
+ * count: `failed` or `expired`, therefore not a paid row, therefore invisible to that count — and
+ * yet its nonce reads spent, which means the money moved. It happens because we can only write a
+ * row off against the chain AS IT IS AT THAT MOMENT, and an authorization stays mineable until
+ * `validBefore`: a transaction can land minutes after we told the guardian to re-quote.
+ *
+ * Bounded by construction. Only rows whose window is still open can newly gain a spent nonce, so
+ * the candidate set drains on its own clock, and the caller caps how many are read per pass.
+ *
+ * Like its sibling it changes nothing: a refund is a human decision made at a Ledger, and
+ * reversing money on the strength of a chain read would be a worse bug than the one it watches
+ * for. Returns the payment ids it flagged.
+ */
+export async function flagMineableTerminalRows(
+  deps: Pick<FormationPaymentDeps, "payment" | "entities" | "executor" | "companies">,
+  rows: FormationPaymentRecord[],
+): Promise<string[]> {
+  const flagged: string[] = [];
+  for (const row of rows) {
+    const company = deps.companies.find(row.companyId);
+    const authorizer = row.payerAddress ?? (company ? guardianOf(company) : null);
+    if (!authorizer) continue;
+    if (!(await authorizationUsed(deps.executor, authorizer, row.nonce))) continue;
+    flagged.push(row.paymentId);
+    opsLog("formation_payment_duplicate_candidate", {
+      severity: "CRITICAL",
+      level: "error",
+      companyId: row.companyId,
+      paymentId: row.paymentId,
+      status: row.status,
+      amountUsdc: row.amountUsdc.toString(),
+      nonce: row.nonce,
+      detail:
+        "this payment was written off, but its authorization nonce is SPENT on-chain — the money may have moved after we called it dead",
+    });
+    if (deps.entities)
+      recordCompanyEvent(
+        deps.entities,
+        row.companyId,
+        "formation_payment_duplicate_candidate",
+        `payment ${row.paymentId} is ${row.status} but its authorization was used on-chain — check whether this company paid twice`,
+      );
+  }
+  return flagged;
 }
 
 /** `quoted|settling → expired`, ops-logged. Returns whether THIS caller made the move. */
@@ -596,7 +726,12 @@ export function requoteFormationPayment(
           ? "this company already has a live quote"
           : "this payment is still settling — cancel it or wait for it to finish before re-quoting",
     };
-  if (company.status !== "draft")
+  // ⚠ THE COMPANY AS IT IS NOW, not as the caller found it. Both doors re-read it per request,
+  // so this is belt and braces — but the failure it removes is a second quote issued against a
+  // stale `draft` for a company that has since been paid for and readied, which the live-rows
+  // index would happily admit because the settled row is terminal.
+  const current = deps.companies.find(company.companyId) ?? company;
+  if (current.status !== "draft")
     return { ok: false, reason: "this company has nothing left to pay for" };
 
   const paymentId = insertQuote(deps.payment, company.companyId, nowMs(deps));

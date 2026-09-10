@@ -541,6 +541,22 @@ PRINTS what the chain said, and only then writes:
 - **unknown** → **nothing is written**. A payment whose outcome nobody can see is exactly the one
   that must not be written off.
 
+### ⚠ If `formation_payment_duplicate_candidate` appears
+
+A CRITICAL line naming a payment we WROTE OFF (`failed` or `expired`) whose authorization nonce
+reads SPENT on-chain. It is not the same alarm as the one below: no row here says "paid", which is
+exactly why a count of paid rows cannot see it.
+
+How it happens: a row can only be written off against the chain AS IT WAS at that moment, and an
+authorization stays mineable until `validBefore`. So a transaction can land minutes after we told
+the guardian to re-quote — and if they re-quoted and paid, that company has paid twice.
+
+What to do: `formation:reconcile <paymentId>` on the company's LIVE row (it prints this warning
+too, before its verdict), then read every row for that company. If two payments genuinely moved,
+refund one from the Ledger by the procedure above, recording it against **that payment id**. The
+sweeper stops flagging a row once its window closes, because a nonce that can no longer be spent
+can no longer surprise anyone.
+
 ### ⚠ If `formation_payment_duplicate` appears
 
 A CRITICAL ops line (and an event on every agent attached to the company) saying one company has

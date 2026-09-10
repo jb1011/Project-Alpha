@@ -106,6 +106,9 @@ export function cancelLog(opts: {
 
 export interface FakeChainOptions {
   receipt?: "success" | "reverted" | "timeout";
+  /** Transactions the node ACCEPTS but never mines — by nonce. A pending transaction holds its
+   *  nonce, so the next attempt must REPLACE it rather than queue behind it (R1). */
+  stuckNonces?: number[];
   /** Nonces the token reports as spent (`authorizationState`), lower-cased. */
   spent?: Iterable<string>;
   /** The submitter's account nonce. A transaction below it is rejected forever. */
@@ -137,6 +140,10 @@ export function fakeChain(opts: FakeChainOptions = {}) {
     receipt: opts.receipt ?? ("success" as "success" | "reverted" | "timeout"),
     spent: new Set([...(opts.spent ?? [])].map((n) => n.toLowerCase())),
     accountNonce: opts.accountNonce ?? 7,
+    /** The CONFIRMED count — what `blockTag: "latest"` answers. It advances only when a
+     *  transaction actually mines, which is the distinction the replacement rule turns on. */
+    confirmedNonce: opts.accountNonce ?? 7,
+    stuck: new Set(opts.stuckNonces ?? []),
     /** Hashes the node ACCEPTED. A receipt exists for nothing else. */
     accepted: new Set<string>(),
     logs: opts.logs ?? [],
@@ -144,7 +151,8 @@ export function fakeChain(opts: FakeChainOptions = {}) {
     blockTimestamp: BigInt(opts.blockTimestamp ?? Math.floor(Date.now() / 1000)),
   };
   const publicClient = {
-    getTransactionCount: async () => state.accountNonce,
+    getTransactionCount: async ({ blockTag }: { blockTag?: string } = {}) =>
+      blockTag === "latest" ? state.confirmedNonce : state.accountNonce,
     getBlockNumber: async () => state.head,
     getBlock: async () => ({ number: state.head, timestamp: state.blockTimestamp }),
     getLogs: async (q: {
@@ -165,8 +173,11 @@ export function fakeChain(opts: FakeChainOptions = {}) {
     estimateFeesPerGas: async () => ({ maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }),
     sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
       const { nonce } = decodeFakeTx(serializedTransaction);
-      if (nonce < state.accountNonce) throw new Error("nonce too low");
-      state.accountNonce = nonce + 1;
+      if (nonce < state.confirmedNonce) throw new Error("nonce too low");
+      // A transaction the node keeps in the mempool advances the PENDING count and nothing else.
+      // One that mines advances both.
+      state.accountNonce = Math.max(state.accountNonce, nonce + 1);
+      if (!state.stuck.has(nonce)) state.confirmedNonce = Math.max(state.confirmedNonce, nonce + 1);
       sent.push(serializedTransaction);
       const hash = keccak256(serializedTransaction);
       state.accepted.add(hash);

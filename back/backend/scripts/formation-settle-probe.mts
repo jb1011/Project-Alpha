@@ -118,6 +118,9 @@ function row(nonce: Hex, validBefore: number) {
     signature: null,
     txHash: null,
     broadcastCount: 0,
+    lastNonce: null,
+    lastMaxFeePerGas: null,
+    lastPriorityFeePerGas: null,
     attempt: 0,
     refundTxHash: null,
     createdAt: "",
@@ -182,7 +185,7 @@ async function main(): Promise<void> {
       nonce,
     },
     signature,
-    { onBroadcast: (txHash) => console.log(`settle tx ${txHash} — broadcasting…`) },
+    { onBroadcast: ({ txHash }) => console.log(`settle tx ${txHash} — broadcasting…`) },
   );
   if (settled.kind !== "settled") throw new Error(`settle did not confirm: ${settled.kind}`);
   const usedAfterSettle = await readAuthorizationState(
@@ -211,7 +214,7 @@ async function main(): Promise<void> {
     cancelNonce,
     cancelSignature,
     {
-      onBroadcast: (txHash) =>
+      onBroadcast: ({ txHash }) =>
         console.log(`cancel tx ${txHash} (nonce ${cancelNonce}) — broadcasting…`),
     },
   );

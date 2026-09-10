@@ -82,6 +82,16 @@ export interface FormationPaymentRecord {
   signature: Hex | null;
   /** The hash of the LAST transaction we broadcast. A pointer for a human, never an outcome. */
   txHash: Hex | null;
+  /**
+   * The submitter NONCE and FEES that last transaction went out with (R1).
+   *
+   * A re-broadcast whose predecessor is still pending must REPLACE it at the same nonce and a
+   * higher price. Taking the next pending nonce instead produces a second transaction, and since
+   * nonces are ordered the first one mines — moving the money — while the second reverts.
+   */
+  lastNonce: number | null;
+  lastMaxFeePerGas: bigint | null;
+  lastPriorityFeePerGas: bigint | null;
   /** How many executor transactions we have composed for this authorization. Drives the fee
    *  bump, and tells an operator that a settle has been re-sent rather than sat still. */
   broadcastCount: number;
@@ -106,6 +116,9 @@ interface Row {
   signature: string | null;
   tx_hash: string | null;
   broadcast_count: number;
+  last_nonce: number | null;
+  last_max_fee: string | null;
+  last_priority_fee: string | null;
   attempt: number;
   refund_tx_hash: string | null;
   created_at: string;
@@ -130,11 +143,22 @@ function toRecord(r: Row): FormationPaymentRecord {
     signature: (r.signature as Hex) ?? null,
     txHash: (r.tx_hash as Hex) ?? null,
     broadcastCount: r.broadcast_count ?? 0,
+    lastNonce: r.last_nonce ?? null,
+    lastMaxFeePerGas: r.last_max_fee === null ? null : BigInt(r.last_max_fee),
+    lastPriorityFeePerGas: r.last_priority_fee === null ? null : BigInt(r.last_priority_fee),
     attempt: r.attempt,
     refundTxHash: r.refund_tx_hash,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
+}
+
+/** What one broadcast committed to. `recordBroadcast` writes it; the next attempt reads it. */
+export interface BroadcastAttempt {
+  txHash: Hex;
+  nonce: number;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
 }
 
 export interface NewFormationPayment {
@@ -194,13 +218,14 @@ export interface FormationPaymentRepository {
    */
   markSettling(paymentId: string, submission: { payerAddress: Address; signature: Hex }): boolean;
   /**
-   * Record that we have composed and sent an executor transaction for this authorization.
+   * Record that we have composed and sent an executor transaction for this authorization — its
+   * hash, and the submitter NONCE and FEES it committed to.
    *
-   * Deliberately NOT part of `markSettling`: the hash is not durable state, it is the last thing
-   * we tried. It exists so an operator can look one up and so the fee bump has a counter, and it
-   * is written on every broadcast including the resume leg's.
+   * Deliberately NOT part of `markSettling`: none of it is durable state, it is the last thing we
+   * tried. The hash is so an operator can look one up; the nonce and fees are what let the next
+   * attempt REPLACE this one rather than queue a second transaction behind it (R1).
    */
-  recordBroadcast(paymentId: string, txHash: Hex): boolean;
+  recordBroadcast(paymentId: string, attempt: BroadcastAttempt): boolean;
   /** `settling → settled`, pinning the hash the outcome was observed at. */
   markSettled(paymentId: string, txHash: Hex): boolean;
   /** `quoted|settling → expired`. The caller has PROVEN the authorization can no longer be used
@@ -233,6 +258,16 @@ export interface FormationPaymentRepository {
   /** Companies with MORE THAN ONE paid row. The sweep's reader — a list that must always be
    *  empty, which is why it is worth looking at. */
   listDoublePaidCompanies(limit?: number): string[];
+  /**
+   * Rows written off as `failed`/`expired` whose AUTHORIZATION IS STILL MINEABLE (R1c).
+   *
+   * We write one off only after asking the token, but an authorization stays live until
+   * `validBefore`: somebody can mine it minutes AFTER we called the payment dead and the guardian
+   * re-quoted. That window is exactly this query — terminal-unpaid rows whose window has not yet
+   * closed — and it drains by itself, because a row whose `valid_before` has passed can never
+   * gain a spent nonce.
+   */
+  listMineableTerminal(nowSec: number, limit?: number): FormationPaymentRecord[];
 }
 
 export class SqliteFormationPaymentRepository implements FormationPaymentRepository {
@@ -280,8 +315,10 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
       // `settling` only: a broadcast against a terminal row is a bug we would rather not record.
       recordBroadcast: db.prepare(
         `UPDATE formation_payments
-            SET tx_hash = ?, broadcast_count = broadcast_count + 1, updated_at = CURRENT_TIMESTAMP
-          WHERE payment_id = ? AND status = 'settling'`,
+            SET tx_hash = @tx_hash, broadcast_count = broadcast_count + 1,
+                last_nonce = @last_nonce, last_max_fee = @last_max_fee,
+                last_priority_fee = @last_priority_fee, updated_at = CURRENT_TIMESTAMP
+          WHERE payment_id = @payment_id AND status = 'settling'`,
       ),
       markSettled: db.prepare(
         `UPDATE formation_payments
@@ -306,6 +343,12 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
       countPaid: db.prepare(
         `SELECT COUNT(*) AS n FROM formation_payments
           WHERE company_id = ? AND status IN ('settled','refunded')`,
+      ),
+      // Uses idx_formation_payments_status_window on both columns.
+      mineableTerminal: db.prepare(
+        `SELECT * FROM formation_payments
+          WHERE status IN ('failed','expired') AND valid_before >= ?
+          ORDER BY valid_before LIMIT ?`,
       ),
       doublePaid: db.prepare(
         `SELECT company_id FROM formation_payments
@@ -382,8 +425,16 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
     );
   }
 
-  recordBroadcast(paymentId: string, txHash: Hex): boolean {
-    return this.stmts.recordBroadcast.run(txHash, paymentId).changes === 1;
+  recordBroadcast(paymentId: string, attempt: BroadcastAttempt): boolean {
+    return (
+      this.stmts.recordBroadcast.run({
+        payment_id: paymentId,
+        tx_hash: attempt.txHash,
+        last_nonce: attempt.nonce,
+        last_max_fee: attempt.maxFeePerGas.toString(),
+        last_priority_fee: attempt.maxPriorityFeePerGas.toString(),
+      }).changes === 1
+    );
   }
 
   markSettled(paymentId: string, txHash: Hex): boolean {
@@ -404,6 +455,10 @@ export class SqliteFormationPaymentRepository implements FormationPaymentReposit
 
   countPaid(companyId: string): number {
     return (this.stmts.countPaid.get(companyId) as { n: number }).n;
+  }
+
+  listMineableTerminal(nowSec: number, limit = 20): FormationPaymentRecord[] {
+    return (this.stmts.mineableTerminal.all(nowSec, limit) as Row[]).map(toRecord);
   }
 
   listDoublePaidCompanies(limit = 50): string[] {

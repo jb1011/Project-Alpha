@@ -23,6 +23,14 @@ const PAY_TO = "0x000000000000000000000000000000000000bEEF" as Address;
 const SIG = `0x${"11".repeat(65)}` as Hex;
 const TX = `0x${"cc".repeat(32)}` as Hex;
 
+/** One broadcast attempt: the hash, and the submitter nonce and fees it committed to (R1). */
+const attempt = (txHash: Hex, nonce: number) => ({
+  txHash,
+  nonce,
+  maxFeePerGas: 2n,
+  maxPriorityFeePerGas: 1n,
+});
+
 let db: Database.Database;
 let payments: FormationPaymentRepository;
 let companies: SqliteCompanyRepository;
@@ -76,6 +84,7 @@ test("a quote round-trips with its amount as a bigint and its nonce intact", () 
     signature: null,
     txHash: null,
     broadcastCount: 0,
+    lastNonce: null,
     attempt: 0,
     refundTxHash: null,
   });
@@ -136,14 +145,22 @@ test("recordBroadcast counts the attempts and keeps the LAST hash, on settling r
   // broadcast against a terminal row is a bug we would rather not record.
   const c = company();
   const id = quote(c);
-  expect(payments.recordBroadcast(id, TX)).toBe(false); // still `quoted`
+  expect(payments.recordBroadcast(id, attempt(TX, 1))).toBe(false); // still `quoted`
   payments.markSettling(id, { payerAddress: PAYER, signature: SIG });
-  expect(payments.recordBroadcast(id, TX)).toBe(true);
+  expect(payments.recordBroadcast(id, attempt(TX, 1))).toBe(true);
   const second = `0x${"dd".repeat(32)}` as Hex;
-  expect(payments.recordBroadcast(id, second)).toBe(true);
-  expect(payments.find(id)).toMatchObject({ txHash: second, broadcastCount: 2 });
+  expect(payments.recordBroadcast(id, attempt(second, 2))).toBe(true);
+  expect(payments.find(id)).toMatchObject({
+    txHash: second,
+    broadcastCount: 2,
+    // …and the NONCE and FEES that attempt went out with, which is what lets the next one replace
+    // it rather than queue behind it (R1).
+    lastNonce: 2,
+    lastMaxFeePerGas: 2n,
+    lastPriorityFeePerGas: 1n,
+  });
   payments.markSettled(id, second);
-  expect(payments.recordBroadcast(id, TX)).toBe(false);
+  expect(payments.recordBroadcast(id, attempt(TX, 1))).toBe(false);
 });
 
 test("the guardian's signature survives the round trip byte for byte", () => {

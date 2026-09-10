@@ -26,6 +26,7 @@ import {
   advancePaymentOnChain,
   cancelFormationPayment,
   checkForDoublePayment,
+  flagMineableTerminalRows,
   requoteFormationPayment,
   settleFormationPayment,
 } from "../../src/workflow/formationPayment";
@@ -661,6 +662,19 @@ function attachAgent(c: CompanyRecord): void {
   repo.attachCompany("t:dup", c.companyId);
 }
 
+/** The async twin of `opsLines`, for the passes that read a chain. */
+async function opsLinesAsync(fn: () => Promise<void>): Promise<Record<string, unknown>[]> {
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (l: string) => lines.push(l);
+  try {
+    await fn();
+  } finally {
+    console.log = orig;
+  }
+  return lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
 /** Run something with `console.log` captured, and hand back the ops lines it wrote. */
 function opsLines(fn: () => void): Record<string, unknown>[] {
   const lines: string[] = [];
@@ -797,4 +811,181 @@ test("EXIT: the expiry check is REACHABLE past every earlier branch", async () =
   const chain = fakeChain({ receipt: "timeout" });
   expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("expired");
   expect(payments.find(id)?.status).toBe("expired");
+});
+
+// ── R1: THE DOUBLE CHARGE THE REVIEW FOUND (2026-09-10 verifier) ────────────────────────────
+//
+// The sequence, with default config and nothing unusual on the chain: the settle route broadcasts
+// at submitter nonce N and waits 12 s; the transaction is underpriced and sits in the mempool, so
+// the row stays `settling`. Two and a half minutes later the resume leg finds no log and an unused
+// nonce, and re-broadcasts. If that re-broadcast takes the next PENDING nonce it is a SECOND
+// transaction, not a replacement — and nonces are ORDERED, so N mines first and moves the money,
+// then N+1 reverts with `authorization is used`. A receipt-reader marks the payment `failed`, the
+// re-quote door opens, and the guardian pays 399 USDC twice for one company.
+
+test("⚠ R1: an underpriced first attempt is REPLACED at the same nonce, not queued behind", async () => {
+  const c = company();
+  const id = quoteFor(c);
+  const signature = await sign(c);
+  // The first broadcast is accepted and then sits there: pending count moves, confirmed does not.
+  const stalled = fakeChain({ receipt: "timeout", accountNonce: 7, stuckNonces: [7] });
+  await settleFormationPayment(deps(stalled.executor), c, { signature, from: TENANT });
+  expect(payments.find(id)).toMatchObject({ status: "settling", lastNonce: 7 });
+  const firstFee = payments.find(id)!.lastMaxFeePerGas!;
+
+  // The resume leg, against a chain where nonce 7 is STILL unconfirmed.
+  const resume = fakeChain({ accountNonce: 8, stuckNonces: [] });
+  resume.state.confirmedNonce = 7; // 7 is in the mempool, not in a block
+  expect(await advancePaymentOnChain(deps(resume.executor), c, payments.find(id)!)).toBe("settled");
+  // THE SAME NONCE, at a higher price — a replacement, not a second transaction.
+  const replacement = decodeFakeTx(resume.sent[0]!);
+  expect(replacement.nonce).toBe(7);
+  expect(BigInt(payments.find(id)!.lastMaxFeePerGas!)).toBeGreaterThan(BigInt(firstFee));
+});
+
+test("⚠ R1: a revert on a SPENT nonce resolves SETTLED — never `failed`", async () => {
+  // The tail of the same story, for the case where the second transaction went out anyway (an
+  // older row, a node that dropped and re-accepted, a relayer). Ours reverts because the
+  // authorization is already used, and the money is at the revenue address.
+  const c = company();
+  const id = quoteFor(c);
+  const signature = await sign(c);
+  const stalled = fakeChain({ receipt: "timeout" });
+  await settleFormationPayment(deps(stalled.executor), c, { signature, from: TENANT });
+  const row = payments.find(id)!;
+  const theirs = `0x${"ba".repeat(32)}` as Hex;
+
+  const reverting = fakeChain({
+    receipt: "reverted",
+    // The chain state our re-broadcast lands in: the nonce is spent and the transfer happened,
+    // but neither was visible when the leg started.
+    spent: new Set([row.nonce.toLowerCase()]),
+    logs: settlementLogs({
+      authorizer: TENANT,
+      payTo: REVENUE,
+      nonce: row.nonce,
+      txHash: theirs,
+      block: 4_000n,
+    }),
+  });
+  // The pre-broadcast log read must show NOTHING, so the leg actually reaches the re-broadcast and
+  // the revert — which is the path under test.
+  let firstLook = true;
+  const withLateLogs = { ...reverting.executor, publicClient: reverting.executor.publicClient };
+  const realGetLogs = reverting.executor.publicClient.getLogs;
+  // biome-ignore lint/suspicious/noExplicitAny: replacing one method on a stub client
+  (withLateLogs.publicClient as any).getLogs = async (q: any) => {
+    if (firstLook) {
+      firstLook = false;
+      return [];
+    }
+    return realGetLogs(q);
+  };
+  // …and the nonce reads unused on that first look too, so nothing short-circuits.
+  let firstRead = true;
+  // biome-ignore lint/suspicious/noExplicitAny: as above
+  (withLateLogs.publicClient as any).readContract = async () => {
+    if (firstRead) {
+      firstRead = false;
+      return false;
+    }
+    return true;
+  };
+
+  expect(await advancePaymentOnChain(deps(withLateLogs), c, row)).toBe("settled");
+  expect(payments.find(id)).toMatchObject({ status: "settled", txHash: theirs });
+  expect(companies.find(c.companyId)?.status).toBe("ready");
+  // ONE paid row, and the re-quote door stays shut — which is the whole point.
+  expect(payments.countPaid(c.companyId)).toBe(1);
+  expect(requoteFormationPayment(deps(withLateLogs), c)).toMatchObject({ ok: false });
+});
+
+test("R1: a revert with the nonce STILL UNUSED is `failed`, exactly as before", async () => {
+  // The honest failure — an insufficient balance, most often. Nothing moved, so the guardian may
+  // re-quote, and this is the branch that must survive the fix above.
+  const c = company();
+  const id = quoteFor(c);
+  const chain = fakeChain({ receipt: "reverted" });
+  const result = await settleFormationPayment(deps(chain.executor), c, {
+    signature: await sign(c),
+    from: TENANT,
+  });
+  expect(result).toMatchObject({ ok: false, outcome: "failed" });
+  expect(payments.find(id)?.status).toBe("failed");
+  expect(companies.find(c.companyId)?.status).toBe("draft");
+  expect(requoteFormationPayment(deps(chain.executor), c)).toMatchObject({ ok: true });
+});
+
+test("R1: a revert on a nonce spent by a CANCELLATION expires the row", async () => {
+  const c = company();
+  const id = quoteFor(c);
+  const row = payments.find(id)!;
+  payments.markSettling(id, { payerAddress: TENANT, signature: await sign(c) });
+  const chain = fakeChain({
+    receipt: "reverted",
+    spent: new Set([row.nonce.toLowerCase()]),
+    logs: [
+      cancelLog({
+        authorizer: TENANT,
+        nonce: row.nonce,
+        txHash: `0x${"cd".repeat(32)}` as Hex,
+        block: 4_000n,
+      }),
+    ],
+  });
+  // Straight through `finishSettle`: the leg's own log read would have caught the cancellation
+  // first, and this asserts the branch BELOW it.
+  expect(await advancePaymentOnChain(deps(chain.executor), c, payments.find(id)!)).toBe("expired");
+  expect(payments.find(id)?.status).toBe("expired");
+});
+
+test("⚠ R1c: a WRITTEN-OFF payment whose authorization was mined anyway is flagged CRITICAL", async () => {
+  // The row a paid-row COUNT can never see: `failed`, therefore not paid, therefore invisible to
+  // `checkForDoublePayment` — and yet its nonce is spent, because an authorization stays mineable
+  // until `validBefore` and we can only write a row off against the chain as it was at the time.
+  const c = company();
+  attachAgent(c);
+  const id = quoteFor(c);
+  const row = payments.find(id)!;
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  payments.markFailed(id);
+
+  const chain = fakeChain({ spent: new Set([row.nonce.toLowerCase()]) });
+  const lines = await opsLinesAsync(async () => {
+    const flagged = await flagMineableTerminalRows(
+      { ...deps(chain.executor), payment: paymentCfg(payments) },
+      payments.listMineableTerminal(nowSec),
+    );
+    expect(flagged).toEqual([id]);
+  });
+  expect(lines.find((l) => l.opslog === "formation_payment_duplicate_candidate")).toMatchObject({
+    severity: "CRITICAL",
+    paymentId: id,
+    status: "failed",
+  });
+  expect(
+    repo.listEvents("t:dup").some((e) => e.step === "formation_payment_duplicate_candidate"),
+  ).toBe(true);
+});
+
+test("R1c: a written-off row whose nonce is UNUSED is not flagged, and neither is a closed window", async () => {
+  const c = company();
+  const id = quoteFor(c);
+  payments.markSettling(id, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  payments.markFailed(id);
+  const chain = fakeChain();
+  expect(
+    await flagMineableTerminalRows(
+      { ...deps(chain.executor), payment: paymentCfg(payments) },
+      payments.listMineableTerminal(nowSec),
+    ),
+  ).toEqual([]);
+
+  // …and once the window has closed the row leaves the candidate set entirely: a nonce that can
+  // no longer be spent can no longer surprise us, which is what keeps this bounded.
+  const old = company();
+  const oldId = quoteFor(old, nowSec - 10);
+  payments.markSettling(oldId, { payerAddress: TENANT, signature: `0x${"11".repeat(65)}` });
+  payments.markFailed(oldId);
+  expect(payments.listMineableTerminal(nowSec).map((r) => r.paymentId)).not.toContain(oldId);
 });

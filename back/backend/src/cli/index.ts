@@ -435,7 +435,9 @@ export function buildCli(
       const { config: loadDotenv } = await import("dotenv");
       const { loadConfig } = await import("../config/env");
       const { publicClientFor } = await import("../adapters/arc/clients");
-      const { resolveAuthorizationOutcome } = await import("../adapters/arc/usdcToken");
+      const { readAuthorizationState, resolveAuthorizationOutcome } = await import(
+        "../adapters/arc/usdcToken"
+      );
       const { openDatabase } = await import("../persistence/db");
       const { SqliteCompanyRepository } = await import("../persistence/companyRepository");
       const { SqliteFormationPaymentRepository } = await import(
@@ -461,9 +463,33 @@ export function buildCli(
           `payment ${paymentId} is already terminal (${row.status})${row.txHash ? ` at ${row.txHash}` : ""} — there is nothing to reconcile`,
         );
 
+      // ⚠ FIRST, EVERY WRITTEN-OFF ROW ON THIS COMPANY WHOSE AUTHORIZATION IS STILL SPENDABLE
+      // (2026-09-10 verifier, R1c).
+      //
+      // Printed before the verdict, because it changes what the verdict means: a company with a
+      // `failed` row whose nonce reads SPENT may already have paid, and settling the row being
+      // reconciled would then be the second payment. An operator has to see that first.
+      const publicClient = publicClientFor(cfg);
+      const spentWriteOffs: string[] = [];
+      for (const other of payments.listByCompany(row.companyId)) {
+        if (other.paymentId === row.paymentId) continue;
+        if (other.status !== "failed" && other.status !== "expired") continue;
+        const spent = await readAuthorizationState(
+          publicClient,
+          cfg.usdc,
+          other.payerAddress ?? guardianOf(company),
+          other.nonce,
+        );
+        if (spent) spentWriteOffs.push(`${other.paymentId} (${other.status})`);
+      }
+      if (spentWriteOffs.length > 0)
+        console.error(
+          `⚠ CRITICAL: this company has written-off payment(s) whose authorization IS SPENT on-chain: ${spentWriteOffs.join(", ")}. The money may already have moved. Read docs/runbooks/doola-deploy.md before settling anything here.`,
+        );
+
       const authorizer = row.payerAddress ?? guardianOf(company);
       const outcome = await resolveAuthorizationOutcome({
-        client: publicClientFor(cfg),
+        client: publicClient,
         usdc: cfg.usdc,
         authorizer,
         nonce: row.nonce,

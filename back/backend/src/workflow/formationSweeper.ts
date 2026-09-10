@@ -33,7 +33,11 @@ import {
 } from "../persistence/formationRepository";
 import { parseSqliteUtc } from "../util/sqliteTime";
 import { advanceAnchor, newAnchorReadCache } from "./anchorLoop";
-import { advancePaymentOnChain, checkForDoublePayment } from "./formationPayment";
+import {
+  advancePaymentOnChain,
+  checkForDoublePayment,
+  flagMineableTerminalRows,
+} from "./formationPayment";
 import {
   type FormationAdvanceDeps,
   advanceFormation,
@@ -197,6 +201,10 @@ export class FormationSweeper {
    */
   private readonly paymentVerdicts = new Map<string, string>();
 
+  /** Written-off payments already reported as duplicate CANDIDATES (R1c) — de-duplication of a
+   *  CRITICAL line, in memory, exactly like `warned`. */
+  private readonly flaggedWriteOffs = new Set<string>();
+
   /**
    * Where the last anchor batch stopped (2026-08-26 §3) — PERSISTED in `meta.anchor_cursor`.
    *
@@ -272,6 +280,7 @@ export class FormationSweeper {
         this.sweepEvents();
         this.pruneWarned();
         this.detectDoublePayments();
+        await this.detectMineableWriteOffs();
       }
     } finally {
       this.ticks++;
@@ -543,6 +552,42 @@ export class FormationSweeper {
     if (!payment) return;
     for (const companyId of payment.payment.payments.listDoublePaidCompanies())
       checkForDoublePayment({ ...payment, entities: this.d.repo }, companyId);
+  }
+
+  /**
+   * …and the half a row count cannot see (R1c): a payment we WROTE OFF whose authorization was
+   * mined anyway.
+   *
+   * A `failed` or `expired` row is not a paid row, so `listDoublePaidCompanies` will never name
+   * it — and yet its nonce can be spent, because an authorization stays mineable until
+   * `validBefore` and we can only write a row off against the chain as it was at that moment.
+   * Only rows whose window is still open can newly gain a spent nonce, so this drains on its own
+   * clock rather than growing with the table.
+   *
+   * Its own async pass rather than a line in `detectDoublePayments`, because it reads the CHAIN.
+   */
+  private async detectMineableWriteOffs(): Promise<void> {
+    const payment = this.d.payment;
+    if (!payment) return;
+    const rows = payment.payment.payments
+      .listMineableTerminal(Math.floor(this.now() / 1000))
+      .filter((r) => !this.flaggedWriteOffs.has(r.paymentId));
+    if (rows.length === 0) return;
+    try {
+      const flagged = await flagMineableTerminalRows(
+        { ...payment, companies: this.d.companies, entities: this.d.repo },
+        rows,
+      );
+      // In memory, like `warned`: this de-duplicates a CRITICAL LINE, not state anything depends
+      // on. A restart re-flags, which is the direction to fail in.
+      for (const id of flagged) this.flaggedWriteOffs.add(id);
+    } catch (err) {
+      opsLog("formation_payment_resume_failed", {
+        level: "warn",
+        reason: "could not check written-off authorizations",
+        ...describeDoolaError(err),
+      });
+    }
   }
 
   // ── (c) retry, then give up ───────────────────────────────────────────────────────────────
