@@ -77,6 +77,17 @@ redacted from `redact()` and never logged. `chmod 600 .env`.
 
 Only `WARN` and `CRITICAL` are posted. `INFO` is recorded and logged only.
 
+### Payload format: already both. Do not add a format switch.
+
+Spec item 3a (`docs/plans/2026-08-24-mainnet-hardening-batch-spec.md`) leaves room for an
+`ALERT_WEBHOOK_FORMAT=discord|generic` env var. It is not needed and should not be added: the
+sink in `src/monitor/alerts.ts` already sends both fields in one body, so either platform gets
+the key it requires without a switch. Covered by the `test/monitor/alerts.test.ts` test
+"posts WARN and CRITICAL with the documented keys plus Discord/Slack bodies".
+
+So the code half of 3a is done. What is left is operational: create the webhook, then set
+`ALERT_WEBHOOK_URL` on the box and restart the monitor.
+
 ### Config
 
 | Var | Default | Notes |

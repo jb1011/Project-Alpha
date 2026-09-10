@@ -125,6 +125,11 @@ shape against what Discord expects (`{"content": ...}`) and adapt the webhook si
 fine). Test with a mock server asserting the payload. Martin creates the actual webhook URL and
 sets it on the box.
 
+Update: the code half of 3a is done. `alerts.ts` already posts both `content` and `text` in one
+body, so no `ALERT_WEBHOOK_FORMAT` env is added; the decision and the reasons are in
+`docs/runbooks/controller-monitoring.md` under "Payload format: already both. Do not add a format
+switch." What remains is operational: create the webhook, set `ALERT_WEBHOOK_URL` on the box.
+
 **3b. Dead-man's switch.** Today nothing tells us if the monitor itself dies or stalls — the
 one failure mode a watchdog must not have. Preferred design (simplest thing that pages a
 human): systemd `WatchdogSec=` + `sd_notify` heartbeat from the monitor loop each healthy scan
