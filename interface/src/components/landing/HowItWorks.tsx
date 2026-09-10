@@ -101,7 +101,9 @@ function StepCard({
       )}
     >
       <div className="flex items-start justify-between">
-        <div className="font-mono text-[12px] text-muted-dark-2">STEP {step.n}</div>
+        <div className="font-mono text-[12px] text-muted-dark-2">
+          STEP {step.n}
+        </div>
         <div
           className={cx(
             "text-accent-soft/80 transition-transform duration-500",
@@ -121,7 +123,10 @@ function StepCard({
 
       <ul className="mt-7 space-y-2">
         {step.bullets.map((b) => (
-          <li key={b} className="flex items-center gap-2.5 text-[13px] text-ink/85">
+          <li
+            key={b}
+            className="flex items-center gap-2.5 text-[13px] text-ink/85"
+          >
             <span className="h-1 w-1 rounded-full bg-accent" />
             {b}
           </li>
@@ -131,7 +136,13 @@ function StepCard({
   );
 }
 
-function DoneCard({ active, stacked = false }: { active: boolean; stacked?: boolean }) {
+function DoneCard({
+  active,
+  stacked = false,
+}: {
+  active: boolean;
+  stacked?: boolean;
+}) {
   return (
     <div
       className={cx(
@@ -145,7 +156,9 @@ function DoneCard({ active, stacked = false }: { active: boolean; stacked?: bool
             : "relative translate-y-6 scale-[0.98] opacity-40",
       )}
     >
-      <div className="text-[10px] uppercase tracking-[0.2em] text-muted-dark-2">Done</div>
+      <div className="text-[10px] uppercase tracking-[0.2em] text-muted-dark-2">
+        Done
+      </div>
       <p className="mt-4 text-[24px] font-medium leading-snug text-ink lg:text-[28px]">
         Your agent is live on the dashboard.
       </p>
@@ -200,7 +213,11 @@ function StepRail({
                 <span
                   className={cx(
                     "block text-[13px] font-medium leading-snug transition-colors",
-                    active ? "text-ink" : done ? "text-ink/70" : "text-muted-dark",
+                    active
+                      ? "text-ink"
+                      : done
+                        ? "text-ink/70"
+                        : "text-muted-dark",
                   )}
                 >
                   {step.title}
@@ -250,7 +267,9 @@ function MobileProgress({ activeIndex }: { activeIndex: number }) {
         <span>
           Step {Math.min(activeIndex + 1, PANEL_COUNT)} / {PANEL_COUNT}
         </span>
-        <span>{activeIndex >= steps.length ? "Done" : steps[activeIndex]?.title}</span>
+        <span>
+          {activeIndex >= steps.length ? "Done" : steps[activeIndex]?.title}
+        </span>
       </div>
       <div className="mt-2 h-1 overflow-hidden rounded-full bg-line-dark-strong">
         <div
@@ -297,12 +316,18 @@ export function HowItWorks() {
   }, []);
 
   function scrollToStep(index: number) {
-    sentinelRefs.current[index]?.scrollIntoView({ behavior: "smooth", block: "center" });
+    sentinelRefs.current[index]?.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+    });
   }
 
   return (
     <section id="how" className="relative bg-ink-grain text-ink">
-      <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 overflow-hidden"
+      >
         <div className="absolute inset-0 ink-grid" />
         <div className="absolute -left-40 top-1/2 h-[480px] w-[480px] -translate-y-1/2 rounded-full bg-accent/15 blur-[120px]" />
         <div className="absolute -right-40 top-0 h-[420px] w-[420px] rounded-full bg-highlight/10 blur-[120px]" />
@@ -310,17 +335,17 @@ export function HowItWorks() {
 
       <div className="relative mx-auto max-w-[1240px] px-6 py-24 lg:px-10 lg:py-32">
         <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
-        <Reveal variant="left" className="max-w-2xl">
-          <SectionLabel index="01" label="Onboarding" tone="paper" />
-          <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] text-ink sm:text-[46px] lg:text-[56px]">
-            Seven steps from passkey to live agent.
-          </h2>
-        </Reveal>
-        <Reveal variant="right" delay={120} className="max-w-sm">
-          <p className="text-[14.5px] leading-[1.55] text-muted-dark">
-            Scroll through each step — the same flow you walk in onboarding.
-          </p>
-        </Reveal>
+          <Reveal variant="left" className="max-w-2xl">
+            <SectionLabel index="01" label="Onboarding" tone="paper" />
+            <h2 className="mt-4 text-balance text-[36px] font-medium leading-[1.05] tracking-[-0.02em] text-ink sm:text-[46px] lg:text-[56px]">
+              Eight steps from passkey to live agent.
+            </h2>
+          </Reveal>
+          <Reveal variant="right" delay={120} className="max-w-sm">
+            <p className="text-[14.5px] leading-[1.55] text-muted-dark">
+              Scroll through each step — the same flow you walk in onboarding.
+            </p>
+          </Reveal>
         </div>
 
         <div className="mt-10 lg:hidden">
@@ -331,19 +356,25 @@ export function HowItWorks() {
           <div className="sticky top-20 z-10 lg:top-24">
             <div className="flex min-h-[calc(100dvh-5.5rem)] items-center py-4 lg:min-h-[calc(100dvh-6.5rem)] lg:py-6">
               <div className="grid w-full gap-10 lg:grid-cols-[minmax(220px,280px)_minmax(0,1fr)] lg:gap-14">
-              <aside className="hidden lg:block">
-                <p className="mb-4 font-mono text-[11px] uppercase tracking-[0.18em] text-muted-dark-2">
-                  Step {Math.min(activeIndex + 1, PANEL_COUNT)} of {PANEL_COUNT}
-                </p>
-                <StepRail activeIndex={activeIndex} onSelect={scrollToStep} />
-              </aside>
+                <aside className="hidden lg:block">
+                  <p className="mb-4 font-mono text-[11px] uppercase tracking-[0.18em] text-muted-dark-2">
+                    Step {Math.min(activeIndex + 1, PANEL_COUNT)} of{" "}
+                    {PANEL_COUNT}
+                  </p>
+                  <StepRail activeIndex={activeIndex} onSelect={scrollToStep} />
+                </aside>
 
-              <div className="relative min-h-[380px] lg:min-h-[400px]">
-                {steps.map((step, i) => (
-                  <StepCard key={step.n} step={step} active={activeIndex === i} stacked />
-                ))}
-                <DoneCard active={activeIndex === steps.length} stacked />
-              </div>
+                <div className="relative min-h-[380px] lg:min-h-[400px]">
+                  {steps.map((step, i) => (
+                    <StepCard
+                      key={step.n}
+                      step={step}
+                      active={activeIndex === i}
+                      stacked
+                    />
+                  ))}
+                  <DoneCard active={activeIndex === steps.length} stacked />
+                </div>
               </div>
             </div>
           </div>

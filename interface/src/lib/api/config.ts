@@ -13,6 +13,15 @@ export const ENS_EXPLORER_URL =
 const AUTH_STORAGE_KEY = "pa-auth-session";
 export const AUTH_SESSION_EVENT = "pa-auth-session-change";
 
+export function subscribeAuthSession(onStoreChange: () => void) {
+  window.addEventListener("storage", onStoreChange);
+  window.addEventListener(AUTH_SESSION_EVENT, onStoreChange);
+  return () => {
+    window.removeEventListener("storage", onStoreChange);
+    window.removeEventListener(AUTH_SESSION_EVENT, onStoreChange);
+  };
+}
+
 export function notifyAuthSessionChange() {
   invalidateAuthSessionCache();
   if (typeof window !== "undefined") {

@@ -21,12 +21,12 @@ import {
 } from "wagmi";
 import { arcTestnet } from "@/lib/chain";
 import {
-  AUTH_SESSION_EVENT,
   clearAuthSession,
   getAuthSessionSnapshot,
   loadAuthSession,
   saveAuthSession,
   SIWE_DOMAIN,
+  subscribeAuthSession,
 } from "@/lib/api/config";
 import {
   useAuthNonceMutation,
@@ -49,15 +49,6 @@ type AuthContextValue = {
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
-
-function subscribeAuthSession(onStoreChange: () => void) {
-  window.addEventListener("storage", onStoreChange);
-  window.addEventListener(AUTH_SESSION_EVENT, onStoreChange);
-  return () => {
-    window.removeEventListener("storage", onStoreChange);
-    window.removeEventListener(AUTH_SESSION_EVENT, onStoreChange);
-  };
-}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const { address, isConnected, chainId } = useAccount();

@@ -46,13 +46,13 @@ function AgentsList() {
           <div className="mb-4 flex justify-end gap-2">
             <Link
               href="/agents/connect"
-              className="inline-flex rounded-full border hairline-strong bg-paper/40 px-5 py-2.5 text-[13px] font-medium text-ink hover:bg-paper-2"
+              className="inline-flex h-10 items-center rounded-full border hairline-strong bg-paper/40 px-5 text-[13px] font-medium leading-none text-ink hover:bg-paper-2"
             >
               Connect an agent
             </Link>
             <Link
               href="/onboarding?new=1"
-              className="inline-flex rounded-full bg-ink px-5 py-2.5 text-[13px] font-medium text-paper hover:bg-ink-hover"
+              className="inline-flex h-10 items-center rounded-full border border-transparent bg-ink px-5 text-[13px] font-medium leading-none text-paper hover:bg-ink-hover"
             >
               Create another agent
             </Link>

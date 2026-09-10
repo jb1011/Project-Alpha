@@ -254,10 +254,6 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
         <div className="mx-auto flex h-16 max-w-[1180px] items-center justify-between px-5 lg:px-8">
           <div className="flex items-center gap-4">
             <Wordmark />
-            <span className="hidden items-center gap-1.5 rounded-full border hairline-strong bg-paper-2/60 px-2.5 py-1 text-[10.5px] uppercase tracking-[0.16em] text-muted-2 sm:inline-flex">
-              <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-              Live on Arc · Mainnet coming soon
-            </span>
           </div>
           <div className="flex items-center gap-2">
             <span className="hidden text-[12px] text-muted-2 sm:inline">

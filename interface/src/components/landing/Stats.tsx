@@ -2,7 +2,7 @@ import { Reveal } from "./Reveal";
 
 const capabilities = [
   {
-    value: "7",
+    value: "8",
     label: "Onboarding steps",
     sub: "Passkey to live agent",
   },

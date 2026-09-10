@@ -11,19 +11,8 @@ export function Hero() {
 
       <div className="mx-auto grid max-w-[1240px] grid-cols-1 gap-16 px-6 pb-28 pt-16 lg:grid-cols-[1.05fr_0.95fr] lg:gap-12 lg:px-10 lg:pb-36 lg:pt-24">
         <div className="flex flex-col justify-center">
-          <Reveal immediate delay={80}>
-            <div className="inline-flex w-fit items-center gap-2 rounded-full border hairline-strong bg-paper/70 backdrop-blur px-3 py-1 text-[11.5px] uppercase tracking-[0.18em] text-muted">
-              <span className="relative inline-flex h-1.5 w-1.5">
-                <span className="anim-pulse-dot relative inline-block h-1.5 w-1.5 rounded-full text-accent" />
-              </span>
-              <span>Live on Arc</span>
-              <span className="text-line-strong">/</span>
-              <span>Mainnet coming soon</span>
-            </div>
-          </Reveal>
-
           <Reveal immediate delay={180} variant="up" duration={760}>
-            <h1 className="mt-7 text-balance text-[44px] font-medium leading-[1.02] tracking-[-0.025em] text-ink sm:text-[60px] lg:text-[78px]">
+            <h1 className="text-balance text-[44px] font-medium leading-[1.02] tracking-[-0.025em] text-ink sm:text-[60px] lg:text-[78px]">
               <span className="relative inline-block">A company</span>
               <br />
               for your agent.
