@@ -10,9 +10,11 @@ Files: `src/payments/legalBody.ts` (new), `src/persistence/entityRepository.ts` 
 uses), tests `test/payments/legalBody.test.ts`, `test/persistence/entityRepository.test.ts`
 (+pocket lookup), existing `test/payments/sellerTrust.test.ts` unchanged and green.
 Rules: D1, D2, D8. `findByPocketAddress` matches case-insensitively (`COLLATE NOCASE`; stored
-pockets are not uniformly lowercased). Only public on-chain entities resolve to `body`, by the
-`listPublicOnChain` rule verbatim — `proxy` and `treasury` set, status ∈ {`created`, `bound`,
-`funded`} — so `failed` is excluded (amended from "`status` ≥ `created`"; ledger ruling T1-R2).
+pockets are not uniformly lowercased). Only public on-chain entities resolve to `body`, by
+`isPublicOnChain`'s rule — `proxy` and `treasury` set, status ∈ {`created`, `bound`, `funded`} — so
+`failed` is excluded (amended from "`status` ≥ `created`"; ledger ruling T1-R2). That is close to,
+but not the same predicate as, `/transparency`'s `listPublicOnChain` (which keys on `agent_id`); see
+design §8 D2.
 Commit: `feat(legal-body): one resolver for "a Novi legal body in good standing", keyed by payer or treasury`.
 
 ## Task 2 — public lookup `GET /legal-bodies/:address`
@@ -29,8 +31,11 @@ Files: `src/config/env.ts` (enum value), `src/payments/seller.ts` (branch + refu
 tests: the real files are `test/world/sellerGate.test.ts` (+11 policy cases),
 `test/api/x402Demo.route.test.ts` (+4 run legs) and `test/config/x402Demo.test.ts` (+1, pinning the
 three-value enum) — not the `test/payments/` and `test/api/x402Demo.test.ts` paths named above.
-Rules: D4, D5, D7, D8. The existing `accountable-only` behaviour and the configured prod wall are
-untouched; the pinned wall ignores `X402_TRUST_POLICY`. Fix round 1 (rulings T3-R1…R7) also touched
+Rules: D4, D5, D7, D8. The configured prod wall is untouched and the pinned wall ignores
+`X402_TRUST_POLICY`. `accountable-only` is untouched in its REFUSALS, but not in its meter: the T6
+fix round put the paying-request exemption in `seller.ts`, outside the legal gate, so that policy now
+costs one unit per purchase instead of one per verified request — kept deliberately (ruling FP-F4),
+recorded in design §8 and the runbook. Fix round 1 (rulings T3-R1…R7) also touched
 `src/payments/worldVerifier.ts` (the `chargeAllowance` seam), `src/api/main.ts`, `.env.example` (the
 new optional `PUBLIC_API_URL`) and `interface/src/lib/proxyHeaders.ts` (`x-novi-legal-body` on the
 response allowlist) — see design §8.
@@ -59,11 +64,16 @@ World wrapper already builds is also handed to `buyWithX402`; the buyer has no o
 one), tests `test/payments/buyer.test.ts` (+8) and `test/payments/agentkitChains.test.ts` (+2,
 proving the signer reaches the buyer through `pay()`).
 Rule: recover ONLY from a 403 whose body carries `extensions.agentkit`, mint the proof with the
-agent's own pocket signer and retry ONCE, then the unchanged 402 → authorize → pay path with the
-proof header still attached. NEVER a proof on the first request (a non-strict AgentKit-aware seller
-would charge the human's allowance on every purchase), never twice: a second 403 throws
+agent's own pocket signer and retry ONCE, then the unchanged 402 → authorize → pay path carrying a
+FRESH proof minted from the 402's own challenge — a proof is single-use at the seller, so the spent
+one is never replayed. NEVER a proof on the first request (a non-strict AgentKit-aware seller would
+charge the human's allowance on every purchase), never twice: a second 403 throws
 `resource-403-after-proof: <error> (<reason>): <detail>`, nothing is signed, and the idempotency
 claim is released. Without this, design D5's third leg is unreachable from the product.
+Fix rounds 1-2 (rulings T6-R1/R2/R3) also touched `src/payments/seller.ts` (the charge rule),
+`src/payments/worldVerifier.ts` (`enforceAllowance`), new `src/payments/agentkitSdk.ts` (the shared
+lazy SDK loader), `src/payments/entityPayment.ts` (`directFetch`) and a new end-to-end
+`test/payments/strictWallPurchase.test.ts`; challenge origin binding landed with them — see design §8.
 Commit: `feat(x402): the buyer answers a strict seller's 403 challenge once, then pays`.
 
 ## Verification (CI-exact, every task)
@@ -79,4 +89,17 @@ Commit: `feat(x402): the buyer answers a strict seller's 403 challenge once, the
 - **T3-R4** — `accountable-only` fails OPEN without an `agentkit` config (pre-existing: the strict
   block is skipped and the wall behaves as `open`). Align it with `legal-bodies-only`, which now
   refuses 503. Left out of this PR because it changes a policy that is already deployed.
+- **T4-R3/R5/R7** — the drop-in checker's own minors, deferred with the T4 fix round: validate
+  `lookupBaseUrl` at construction (a scheme-less base makes every lookup throw and refuse forever)
+  and/or add an `onDiagnostic` seam, so a misconfiguration is distinguishable from a refusal; test
+  the two D6 defaults that nothing pins today (`timeoutMs` 5000 and the `globalThis.fetch`
+  fallback); and settle the redirect wording — either send `redirect: "manual"` or soften the two
+  comments that say a redirect is refused (with the default `follow`, the checker never sees one).
+- **T4-R4** — `expect(call?.init?.method ?? "GET").toBe("GET")` in
+  `test/payments/legalBodyAgentBook.test.ts` is self-satisfying; assert `call?.init?.method`.
+- **The shared lazy SDK loader is not used everywhere.** `src/payments/agentkitSdk.ts` covers
+  `worldVerifier.ts` and `buyer.ts`; `src/api/routes/x402Demo.ts` still holds two inline
+  `await import("@worldcoin/agentkit")` calls in its route handlers, as does
+  `src/adapters/worldid/agentkitSigner.ts`. Call sites, not loader copies (Node's module cache still
+  gives one load), but they should go through the one module.
 - npm publish of the checker; interface surfaces; the World-side attestation slot (feedback doc).

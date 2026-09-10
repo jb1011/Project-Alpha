@@ -174,12 +174,21 @@ The `sellerTrust` TEST expectations are unchanged (no existing case covers eithe
 were added).
 
 **D2 — "an entity below `created` is `none`" is not the rule that shipped.** The rule is
-`listPublicOnChain`'s, verbatim: `proxy` set, `treasury` set, and status ∈ {`created`, `bound`,
-`funded`}. `failed` is reachable — `runner.ts`'s TERMINAL set omits `created`, so a crash in the
-bind leg can leave a row that reached the chain marked `failed` — and it is excluded, which is the
-tightening named under D1 (ruling T1-R2). Matching is case-insensitive (`COLLATE NOCASE`): stored
-pockets are not uniformly lowercased (turnkey/backfilled rows are viem-checksummed, Circle's are
-whatever the API returned).
+`isPublicOnChain`'s, exactly: `proxy` set, `treasury` set, and status ∈ {`created`, `bound`,
+`funded`} (`payments/legalBody.ts`). It is NOT `listPublicOnChain`'s predicate, which an earlier
+draft of this line said it copied verbatim: `/transparency`'s query is
+`agent_id IS NOT NULL AND status IN (…)` (`entityRepository.ts`), testing the id and not the
+proxy/treasury pair. The two sets therefore differ in one direction — an entity with both addresses
+but no agent id yet is answered by the lookup and served by the seller (`X-NOVI-LEGAL-BODY` omitted,
+`sellerGate.test.ts`) while `/transparency` does not list it. The create leg writes proxy, treasury
+and the agent id in one record save, so that is a crash window rather than a steady state, and the
+two chain reads that standing comes from are exactly the ones this predicate guarantees exist; but
+§4's enumeration argument ("every such entity is already listed on `/transparency`") holds for rows
+that have an agent id, not for that window. `failed` is reachable — `runner.ts`'s TERMINAL set omits
+`created`, so a crash in the bind leg can leave a row that reached the chain marked `failed` — and
+it is excluded, which is the tightening named under D1 (ruling T1-R2). Matching is case-insensitive
+(`COLLATE NOCASE`): stored pockets are not uniformly lowercased (turnkey/backfilled rows are
+viem-checksummed, Circle's are whatever the API returned).
 
 **D3 — three additions to the lookup.**
 
@@ -187,7 +196,8 @@ whatever the API returned).
    `503 {"error":"unavailable","message":"could not check right now; try again shortly"}`, in the
    route's flat error shape, with no `standing` invented. Only the local database read can throw:
    every chain failure is already `unknown`. Consumers of the lookup — the D6 checker included —
-   must therefore expect 400, 429 and 503 beside the 200s (ruling T2-R5).
+   must therefore expect 400, 429 and 503 — and the 404 two items below — beside the 200s
+   (ruling T2-R5).
 2. *A per-client bucket in front of the shared one* (ruling T2-R2). The single process-wide
    `TokenBucket(30, 1)` would let one scanner hold the route empty for everyone, and the checker
    reads a 429 as `null` — our own agents refused by every seller using it. So: `TokenBucket(10,
@@ -203,6 +213,14 @@ whatever the API returned).
 **D3 — `agentId` is a decimal STRING** (`"843704"`), not the sketch's unquoted number: it is a
 uint256 token id, a JSON number loses precision above 2^53, and `/transparency` and `/metadata`
 already serve it as a string.
+
+**D3 — the served shape is wider than the sketch, and 404 is a fourth non-200.** `formation` carries
+four fields, not one: `filed`, `einIssued`, `status` and `environment` (`routes/legalBodies.ts`).
+`environment` is claims-relevant and deliberately inseparable from `status` — a sandbox filing must
+never read as a Wyoming company by omission. And the route is mounted only where a resolver is wired
+(`mountLegalBodyRoutes` returns early without `deps.legalBody`), so a deployment without one answers
+**404**, beside the 400, the 429 and the 503 above; the D6 checker reads it as `null`, like every
+other doubt.
 
 **D4 — the unavailable check runs FIRST.** Under `legal-bodies-only` with no resolver wired, the
 503 is returned before the no-proof 403, not after the human gate: a policy the deployment cannot
@@ -230,13 +248,50 @@ interface carrying this branch is deployed) no `X-NOVI-LEGAL-BODY`. Unset, every
 as before, so no box has to change to boot. `interface/src/lib/proxyHeaders.ts` gains
 `x-novi-legal-body` on the response allowlist for buyers that do come through the proxy.
 
+**D5 — the wall signs against the URL it ADVERTISES** (ruling FP-F1). The AgentKit challenge carries
+a SIWE `domain`/`uri`, and `agentkit-core` refuses any proof whose `domain` is not the hostname of
+the `resourceUrl` the seller validates against. The pinned wall and the run wall build their
+`resourceUrl` from the `PUBLIC_API_URL` base, so they must derive `domain`/`uri` from THAT url and
+not from the seller config they clone, whose `domain` is fixed once in `main.ts` as the
+`METADATA_BASE_URL` host. Inherited, the two hosts diverge on exactly the deploy the runbook
+prescribes and every proof is refused `invalid-message:Domain mismatch` — leg 2 answering
+`human_backing_required` beside an `expected` block promising `legal_body_required`, and leg 3
+failing in the buyer's own origin check before any payment. The rule: a wall that advertises a URL
+mints its challenges from that URL, and a test pins it with `PUBLIC_API_URL` on a different host
+from the metadata base.
+
 **D4 — the meter is charged AFTER the decision, and exhaustion is checked first.** Under
 `legal-bodies-only` the AgentKit verification runs with `chargeAllowance: false`: the human is
 identified and an exhausted one is still refused 429 — before any Arc read — but the unit is spent
 only once the legal answer is definitive. On the 402 a passing check leads to, and on both legal
 403s, one unit is charged and reported in `X-AGENTKIT-AUTHORIZATION`; on the 503 nothing is charged,
 because the store has no release and an RPC blip would otherwise lock out the buyer this policy
-exists to serve for the rest of the window (ruling T3-R3).
+exists to serve for the rest of the window (ruling T3-R3). The one exemption — the paying half of a
+purchase — is the next item.
+
+**D4 — the meter's arithmetic: one unit per purchase, one per refusal, zero on a 503** (rulings
+T6-R2 and FP-F2). A strict wall answers an unpaid request with a 402 and charges it; the buyer comes
+back with the same purchase plus its payment, and charging that half too made every purchase cost
+two of the human's units — at the production default of three per 24 h, one purchase a day. So the
+paying half is exempt, but ONLY when it is actually SERVED: the skip needs a payment we can verify
+locally (recipient, amount, expiry, an EIP-712 signature, a nonce not already spent) AND a
+settlement that succeeds. Everything else charges. A refusal charges one unit whatever headers rode
+along — the reads happened either way, and a signed-but-unfunded authorization would otherwise buy
+unlimited free trips through the AgentBook read and two Arc reads (finding FP-F2) — and a payment
+that fails to settle charges one for the same reason. Only the 503 charges nothing; its retry must
+stay free. Counted end to end against the real paywall, the real SDK wrapper and a real EIP-3009
+payment in `test/payments/strictWallPurchase.test.ts`.
+
+**D4 — `accountable-only`'s meter changed too, and that is deliberate** (ruling FP-F4). The
+paying-request exemption lives in `seller.ts`, outside the legal gate, so it applies under
+`accountable-only` as well: a request carrying a verifiable payment is neither charged nor refused
+for exhaustion (a 429 there lands on a buyer that has already signed its money away, and the 402
+that quoted it was charged). That policy now costs one unit per PURCHASE where it used to cost one
+per verified request. Kept rather than scoped to the legal gate — two strict policies charging
+different numbers of units for the same purchase is the worse thing to explain — and the runbook and
+the plan say so. Its REFUSALS are unchanged: an unverified request is refused exactly as before, and
+a human with no budget and no payment still gets the 429. This is the one place where the plan's
+"the existing `accountable-only` behaviour is untouched" no longer holds.
 
 **D4 — `legal-bodies-only` without `agentkit` fails CLOSED.** Missing EITHER half (the AgentKit
 config or the resolver) refuses every request 503, ahead of the no-proof 403, each with its own
@@ -244,14 +299,48 @@ mount-time warning. Without this, a box that lost its World config would have fa
 `open` and sold to anonymous payers while its own env still said `legal-bodies-only` (ruling T3-R4).
 `accountable-only`'s pre-existing fail-open is untouched here — see the plan's Deferred list.
 
-**D5 — the buyer recovers from a strict wall's 403, once** (ruling T6, Task 6). `buyWithX402` answers
-a 403 whose body carries `extensions.agentkit`: it mints the human-backing proof with the agent's own
-pocket AgentKit signer and retries the SAME request ONCE, then continues down the unchanged 402 →
-authorize → pay path with the proof header still attached. Never on the first request — a non-strict
-but AgentKit-aware seller would otherwise spend one of the human's allowance units on every purchase
-— and never twice: a second 403 is terminal and throws
+**D5 — the buyer recovers from a strict wall's 403, once** (ruling T6, Task 6). `buyWithX402`
+answers a 403 whose body carries `extensions.agentkit`: it mints the human-backing proof with the
+agent's own pocket AgentKit signer and retries the SAME request ONCE, then continues down the
+unchanged 402 → authorize → pay path — carrying a FRESH proof, not the spent one (next item). Never
+on the first request — a non-strict but AgentKit-aware seller would otherwise spend one of the
+human's allowance units on every purchase — and never twice: a second 403 is terminal and throws
 `resource-403-after-proof: <error> (<reason>): <detail>`, quoting the seller so the reason a user
-reads names the missing thing. Nothing is signed for money on the proof leg, so the idempotency claim
-is released and the same key retries cleanly. This is what makes design D5's third leg reachable from
-the product (`pay`), which it was not when §1–§7 were written: World's own client returns any
-non-402 response untouched.
+reads names the missing thing. Nothing is signed for money on the proof leg, so the idempotency
+claim is released and the same key retries cleanly. This is what makes design D5's third leg
+reachable from the product (`pay`), which it was not when §1–§7 were written: World's own client
+returns any non-402 response untouched.
+
+**D5 — a fresh proof for every challenge answered** (ruling T6-R1). An AgentKit proof is SINGLE-USE
+at the seller: `worldVerifier`'s nonce check consumes it on the first verify. The first
+implementation replayed the recovery proof on the paying request and was refused
+`invalid-message:Nonce validation failed` — after the payment had been signed. At HEAD the buyer
+mints a SECOND proof from the 402's own challenge (every `challenge()` carries a fresh nonce), and
+mints it BEFORE `authorize`, so a challenge it cannot answer costs no signature and leaves the
+idempotency claim releasable. A 402 that carries no challenge, or a mint that throws, returns the
+402 untouched (`resource-402`) with nothing signed.
+
+**D5 — every challenge is bound to the origin being bought from** (ruling T6-R3). The signature is a
+SIWE login for whatever `domain`/`uri` the SELLER chose, so `assertChallengeOrigin` runs before both
+mints: `info.domain` must be the purchase URL's hostname (or host), and when `info.uri` is present
+its host must match too. Anything else — an unparseable resource url or challenge uri included — is
+a mismatch, not a pass: it throws `challenge-origin-mismatch: <why> (challenge domain "…", uri "…")`
+with the seller's strings clipped to 200 chars, signs nothing and sends nothing, so a hostile seller
+gets no proof to replay at another AgentKit seller.
+
+**D5 — the legs we prove ourselves go around the AgentKit wrapper** (`directFetch`, T6 fix round 2).
+The SDK client answers ANY 402 carrying the extension by minting its own proof and re-fetching, and
+it cannot know our request already carried one — so through the wrapper a purchase cost TWO units
+(our recovery leg's 402, then the client's own answer to it). `BuyerDeps` gained `directFetch`, the
+same fetch without the client wrapped around it, used for the recovery request, the mints and the
+paying request, and only once we have answered a 403 ourselves. The FIRST request still goes through
+the wrapped fetch, so a non-strict seller's 402 stays the wrapper's job and no first request ever
+carries a proof. Without the field everything falls back to `fetchImpl`, exactly as before.
+
+**§4 — "the seller path reads fresh" is only the legal half.** Under `legal-bodies-only` the FIRST
+gate, the AgentBook human, is still served from `WorldStore`'s lookup memo — `CACHE_TTL_MS` one hour
+for a positive, `NEGATIVE_CACHE_TTL_MS` sixty seconds for a negative (`worldVerifier.ts`), unchanged
+from `accountable-only` and correct there. Only the legal-body read is fresh on every request. So a
+vouch revoked in AgentBook can keep clearing gate 1 for up to an hour while a suspension of the
+legal body bites on the next request. The integration doc already said this to third parties; §8 and
+the runbook now say it too (final-pass finding F10).
