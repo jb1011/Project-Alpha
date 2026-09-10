@@ -150,3 +150,67 @@ Written in the hackathon feedback document: an `attestations` field in the Agent
 (issuer address, schema id, subject = agent address, revocable), or a slot in a versioned AgentBook
 (issue #37), so a seller asks AgentBook once and gets both answers. Our lookup is the working
 reference implementation of the issuer side.
+
+## 8. Corrections after implementation
+
+Written against the code as it landed (tasks 1–4, branch `feat/legal-body-check`). Each item names
+the decision it amends; §1–§7 above are the design as it was gated, unedited.
+
+**D1 — "behaviour and tests unchanged" is wrong in two places, both deliberate.** Refactoring
+`sellerTrust.verifyLegalBody` onto the shared resolver moved the buyer dial in opposite directions
+at once, and both deltas were accepted (ledger ruling T1-R1):
+
+- *a loosening.* The dial used to ask `findByTreasury(payee)` only; the resolver tries
+  `findByPocketAddress` first (D2), so paying a Novi agent's POCKET now resolves to that legal body
+  instead of `not-legal-body`. It is the same body's address, which is why D2 applies in both
+  directions; the cost if that judgement is wrong is a buyer paying a Novi pocket it previously
+  refused.
+- *a tightening.* `isPublicOnChain` excludes entities whose status is `failed`, which the old narrow
+  deps path never looked at: an entity that reached the chain and then failed a later step used to
+  be asked about on chain and now resolves to `none`. Strictly more conservative, and consistent
+  with not listing it publicly.
+
+The `sellerTrust` TEST expectations are unchanged (no existing case covers either delta; two cases
+were added).
+
+**D2 — "an entity below `created` is `none`" is not the rule that shipped.** The rule is
+`listPublicOnChain`'s, verbatim: `proxy` set, `treasury` set, and status ∈ {`created`, `bound`,
+`funded`}. `failed` is reachable — `runner.ts`'s TERMINAL set omits `created`, so a crash in the
+bind leg can leave a row that reached the chain marked `failed` — and it is excluded, which is the
+tightening named under D1 (ruling T1-R2). Matching is case-insensitive (`COLLATE NOCASE`): stored
+pockets are not uniformly lowercased (turnkey/backfilled rows are viem-checksummed, Circle's are
+whatever the API returned).
+
+**D3 — three additions to the lookup.**
+
+1. *A 503 the design did not name.* A resolver that THROWS answers
+   `503 {"error":"unavailable","message":"could not check right now; try again shortly"}`, in the
+   route's flat error shape, with no `standing` invented. Only the local database read can throw:
+   every chain failure is already `unknown`. Consumers of the lookup — the D6 checker included —
+   must therefore expect 400, 429 and 503 beside the 200s (ruling T2-R5).
+2. *A per-client bucket in front of the shared one* (ruling T2-R2). The single process-wide
+   `TokenBucket(30, 1)` would let one scanner hold the route empty for everyone, and the checker
+   reads a 429 as `null` — our own agents refused by every seller using it. So: `TokenBucket(10,
+   0.5)` per caller, keyed by the first `X-Forwarded-For` entry (else `"direct"`), a bounded
+   least-recently-used map of 2000 keys, asked BEFORE the shared bucket, with the same 429 body
+   from either and one `legal_body_lookup_throttled` ops line per 60 s naming the bucket. Memo hits
+   spend from neither.
+3. *`Cache-Control` on every answer* (ruling T2-R1). A definitive 200 carries `public, max-age=15`,
+   matching the memo; `standing: "unknown"`, the 400, the 429 and the 503 carry `no-store`. The
+   worst case is a downstream cache holding an answer this process had already memoised — 30 s,
+   which is the window D3's threat model was chosen against.
+
+**D3 — `agentId` is a decimal STRING** (`"843704"`), not the sketch's unquoted number: it is a
+uint256 token id, a JSON number loses precision above 2^53, and `/transparency` and `/metadata`
+already serve it as a string.
+
+**D4 — the unavailable check runs FIRST.** Under `legal-bodies-only` with no resolver wired, the
+503 is returned before the no-proof 403, not after the human gate: a policy the deployment cannot
+evaluate authorizes nobody, and refusing later would make a broken strict seller look like a
+working one.
+
+**D5 — the run probes its OWN wall instance.** `/legal-bodies-run` does not probe the settling wall;
+it builds a second paywall from the same deps with no `settle` and its own rate key
+(`…#legal-bodies-run`). The per-human allowance is spent before the legal check, so sharing the
+settling wall's key would turn leg 2 into a 429 after a handful of page views — the same reason
+`/proof-run` keeps its own key. Leg 2 signs leg 1's own challenge rather than minting a second.

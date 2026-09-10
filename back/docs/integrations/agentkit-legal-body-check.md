@@ -88,6 +88,11 @@ caller of that API process rather than held per caller. A throttled request is r
 where a drained budget is spelled so) and reads, like any 5xx, as `null`: fail closed. Keep your
 request volume proportional to your traffic.
 
+**Non-200 answers.** Three: 400 (the address is neither all-lowercase nor valid EIP-55), 429 (a
+throttle — from the per-caller bucket or the shared one, with the same body either way), and 503
+(the lookup's own read failed). The checker reads all three as `null`, and so does a 200 whose
+`standing` is anything but `active`.
+
 ## What you may say
 
 The lookup reports what the chain says and no more, so when the checker returns an id, say:
