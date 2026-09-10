@@ -42,6 +42,8 @@ export const WORLD_CHAIN_DEFAULTS = {
   allowancePerHuman: 3,
 } as const;
 
+export const DEFAULT_DATA_DIR = "./data";
+
 const EnvSchema = z.object({
   ARC_TESTNET_RPC_URL: z.string().url(),
   ARC_CHAIN_ID: z.coerce.number().int().positive().default(ARC_TESTNET_CHAIN_ID),
@@ -62,7 +64,7 @@ const EnvSchema = z.object({
   GUARDIAN_ADDRESS: addressSchema.optional(),
   OPERATOR_PRIVATE_KEY: privKeySchema.optional(),
   POCKET_MASTER_SEED: privKeySchema.optional(),
-  DATA_DIR: z.string().default("./data"),
+  DATA_DIR: z.string().default(DEFAULT_DATA_DIR),
   TURNKEY_API_PUBLIC_KEY: z.string().optional(),
   TURNKEY_API_PRIVATE_KEY: z.string().optional(),
   TURNKEY_ORGANIZATION_ID: z.string().optional(),

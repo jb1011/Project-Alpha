@@ -15,7 +15,8 @@
  *      Gas Station) -> evaluator -> sweep.
  *
  * Run: npx tsx scripts/tier0-p3-live.mts [--leg 1|2|3|4]
- * Idempotent-ish: leg 1 reuses the persisted saga record (DATA_DIR=./data-p3).
+ * Idempotent-ish: leg 1 reuses the persisted saga record. The script writes to REHEARSAL_DATA_DIR
+ * (default ./data-p3, resolved against back/backend), never the live DATA_DIR.
  */
 import "dotenv/config";
 import { randomUUID } from "node:crypto";
@@ -30,6 +31,7 @@ import {
   provisionCircleWallets,
 } from "../src/adapters/circle/circleWallets";
 import { loadConfig } from "../src/config/env";
+import { resolveRehearsalDataDir } from "../src/config/rehearsalDataDir";
 import { buildJobDeps } from "../src/jobs/composition";
 import { buildEntityPaymentService } from "../src/payments/entityPayment";
 import { PaymentLedger } from "../src/payments/ledger";
@@ -57,7 +59,8 @@ function banner(s: string) {
 }
 
 async function main() {
-  const cfg = loadConfig();
+  const dataDir = resolveRehearsalDataDir(process.env);
+  const cfg = loadConfig({ ...process.env, DATA_DIR: dataDir });
   if (!cfg.circle?.walletSetId) throw new Error("Circle creds + wallet set required (local .env)");
   const db = openDatabase(cfg.dbPath);
   migrate(db);

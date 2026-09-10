@@ -6,7 +6,7 @@ import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import type { DemoResult } from "../agent/demo";
 import { buildLiveAgentRunner } from "../agent/liveRunner";
 import { toJobView } from "../api/jobViews";
-import { loadConfig } from "../config/env";
+import { DEFAULT_DATA_DIR, loadConfig } from "../config/env";
 import { legacyDoorRefusalMessage, legacyDoorRefused } from "../formation";
 import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
@@ -259,7 +259,8 @@ export function buildCli(
     loadDotenv();
     // Resolve the DB path without loadConfig(): full config validation demands chain keys this
     // command never touches (and local .envs post-P3 deliberately no longer carry them).
-    const dbPath = process.env.DB_PATH ?? `${process.env.DATA_DIR ?? "./data"}/legalbody.db`;
+    const dbPath =
+      process.env.DB_PATH ?? `${process.env.DATA_DIR ?? DEFAULT_DATA_DIR}/legalbody.db`;
     const db = openDatabase(dbPath);
     migrate(db);
     return new SqliteWorldStore(db);
