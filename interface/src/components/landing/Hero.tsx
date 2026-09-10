@@ -13,7 +13,7 @@ export function Hero() {
         <div className="flex flex-col justify-center">
           <Reveal immediate delay={180} variant="up" duration={760}>
             <h1 className="text-balance text-[44px] font-medium leading-[1.02] tracking-[-0.025em] text-ink sm:text-[60px] lg:text-[78px]">
-              <span className="relative inline-block">A company</span>
+              <span className="relative inline-block">Create a company</span>
               <br />
               for your agent.
             </h1>
@@ -21,8 +21,8 @@ export function Hero() {
 
           <Reveal immediate delay={300} variant="up">
             <p className="mt-7 max-w-lg text-pretty text-[17px] leading-[1.5] text-muted lg:text-[18px]">
-              A legal entity, a USDC treasury, and spending rules on Arc. You set
-              the limits and stay the guardian.
+              A legal entity, a USDC treasury, and spending rules on Arc. You
+              set the limits and stay the guardian.
             </p>
           </Reveal>
 
@@ -50,7 +50,13 @@ export function Hero() {
           </Reveal>
         </div>
 
-        <Reveal immediate delay={520} variant="right" duration={820} className="flex items-center justify-center py-6 lg:justify-end lg:py-8">
+        <Reveal
+          immediate
+          delay={520}
+          variant="right"
+          duration={820}
+          className="flex items-center justify-center py-6 lg:justify-end lg:py-8"
+        >
           <div className="w-full max-w-[400px] rotate-[2.5deg] transition-transform duration-500 hover:rotate-[1.5deg] hover:scale-[1.02] lg:max-w-[420px]">
             <AgentDeskPreview />
           </div>
