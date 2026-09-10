@@ -23,6 +23,15 @@ export interface EntityRepository {
   findByAgentId(agentId: string): EntityRecord | undefined;
   findByPublicId(publicId: string): EntityRecord | undefined;
   findByTreasury(treasury: string): EntityRecord | undefined;
+  /**
+   * The entity whose PAYER (pocket) address is this address — the key an AgentKit proof carries
+   * (design 2026-09-10 D2), where `findByTreasury` is the key the buyer dial carries.
+   *
+   * Case-insensitive, like `findByTreasury` and for the same reason: the stored spelling is
+   * whatever custody produced (viem checksums a derived pocket, Circle returns lowercase), so a
+   * caller must never have to know which row it is about to hit.
+   */
+  findByPocketAddress(pocket: string): EntityRecord | undefined;
   list(): EntityRecord[];
   recordEvent(
     key: string,
@@ -349,6 +358,13 @@ export class SqliteEntityRepository implements EntityRepository {
     const r = this.db
       .prepare("SELECT * FROM entities WHERE treasury = ? COLLATE NOCASE")
       .get(treasury) as Row | undefined;
+    return r ? toRecord(r) : undefined;
+  }
+
+  findByPocketAddress(pocket: string): EntityRecord | undefined {
+    const r = this.db
+      .prepare("SELECT * FROM entities WHERE pocket_address = ? COLLATE NOCASE")
+      .get(pocket) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 

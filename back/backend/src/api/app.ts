@@ -16,6 +16,7 @@ import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWe
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
 import { mountFormationRulesRoutes } from "./routes/formationRules";
 import { mountJobRoutes } from "./routes/jobs";
+import { mountLegalBodyRoutes } from "./routes/legalBodies";
 import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
@@ -205,6 +206,16 @@ export interface ApiDeps extends EntityViewDeps {
    *  predicate is the single definition, and `/config` plus the write routes' 503 are both
    *  projections of it, so the boot gate and what we advertise cannot drift. */
   agentBook?: import("./routes/agentBook").AgentBookDeps;
+  /**
+   * The public legal-body lookup (design 2026-09-10 D3). Optional, like every other capability
+   * here: absent, `GET /legal-bodies/:address` is not mounted at all, which is the honest answer
+   * for a deployment that cannot ask the chain — and it keeps every existing wiring (and every
+   * credential-less test app) building unchanged.
+   *
+   * It carries the SAME resolver instance the buyer dial and the `legal-bodies-only` seller
+   * policy hold (D1), so a suspension means one thing on every surface.
+   */
+  legalBody?: import("./routes/legalBodies").LegalBodyLookupDeps;
   /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
    *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
    *  `ceilingAtomic` is the configured MAX_POCKET_FLOAT_USDC, atomic USDC string. Optional for the
@@ -227,7 +238,11 @@ export function buildApiApp(deps: ApiDeps) {
       origin: (_origin, c) =>
         c.req.path.startsWith("/metadata/") ||
         c.req.path.startsWith("/ensgateway") ||
-        c.req.path === "/transparency"
+        c.req.path === "/transparency" ||
+        // The legal-body lookup (D3): a seller's own page, on a domain we will never know, has to
+        // be able to ask. Same class of surface as `/transparency` — it publishes nothing that is
+        // not already on it.
+        c.req.path.startsWith("/legal-bodies/")
           ? "*"
           : deps.webOrigin,
       allowHeaders: ["authorization", "content-type"],
@@ -305,6 +320,9 @@ export function buildApiApp(deps: ApiDeps) {
   if (deps.doola) mountDoolaWebhookRoutes(app, { ...deps, doola: deps.doola });
   mountMetadataRoutes(app, deps);
   mountTransparencyRoutes(app, deps);
+  // Public and unauthenticated for the same reason `/transparency` is, and mounted here so it is
+  // outside `protect()` below: the caller is a seller that has never heard of us.
+  mountLegalBodyRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
   if (deps.x402Demo) mountX402DemoRoutes(app, deps.x402Demo);
   mountAuthRoutes(app, deps);

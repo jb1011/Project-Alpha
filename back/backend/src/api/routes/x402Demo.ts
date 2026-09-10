@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import { agentkitSignerFromKey } from "../../adapters/worldid/agentkitSigner";
 import type { Config } from "../../config/env";
 import { AGENT_BOOK_CHAIN_ID } from "../../payments/agentBookReader";
+import type { SellerLegalBodyConfig, SellerTrustPolicy } from "../../payments/seller";
 import { buildPaywall } from "../../payments/seller";
 import { makeSettle } from "../../payments/settle";
 import { usdToUnits } from "../../policy/units";
@@ -17,10 +18,21 @@ export interface X402DemoDeps {
   resourceUrl: string; // public URL recorded in the settle payload
   /** Optional World AgentKit gate (human-backed agent authorization). Absent -> unchanged. */
   agentkit?: import("../../payments/worldVerifier").AgentkitSellerConfig;
-  /** Seller trust policy ("open" default; "accountable-only" refuses anonymous agents). */
-  trustPolicy?: "open" | "accountable-only";
+  /** Seller trust policy ("open" default; "accountable-only" refuses anonymous agents;
+   *  "legal-bodies-only" additionally requires a legal body behind the payer). Applies to the
+   *  CONFIGURED wall at /x402-demo/quote only — the legal-bodies demo wall pins its own. */
+  trustPolicy?: SellerTrustPolicy;
   /** Registered demo agent key for /proof-run (signs AgentKit messages only, holds no funds). */
   proofAgentKey?: `0x${string}`;
+  /** This API's OWN public origin (PUBLIC_API_URL). The legal-body demo URLs a stranger's agent
+   *  is told to use are composed from it, because `resourceUrl` is built on METADATA_BASE_URL,
+   *  which in production is the www/backend proxy — and that proxy drops `X-NOVI-LEGAL-BODY`,
+   *  CORS and Cache-Control. Absent -> the base `resourceUrl` sits on, as before. */
+  publicApiUrl?: string;
+  /** The legal-body check (design 2026-09-10 D4/D5), for the pinned demo wall and for the
+   *  configured wall when the deployment sets X402_TRUST_POLICY=legal-bodies-only. Absent -> the
+   *  pinned wall refuses 503 rather than serving on an unasked question. */
+  legalBody?: SellerLegalBodyConfig;
 }
 
 /**
@@ -37,10 +49,21 @@ export function buildX402DemoDeps(
     | "x402DemoPriceUsdc"
     | "gatewayFacilitatorUrl"
     | "metadataBaseUrl"
+    | "publicApiUrl"
+    | "x402TrustPolicy"
   >,
 ): X402DemoDeps | undefined {
   if (!cfg.enableX402Demo) return undefined;
   return {
+    // Resolved HERE, not beside the World config (final pass C3): the policy used to be assigned
+    // only inside main.ts's `cfg.worldChain` block, so a box that lost its World credentials while
+    // its own env still said `legal-bodies-only` ran `open` and sold to anonymous payers — the
+    // fail-closed 503 that policy promises was unreachable from the composition root. The seller's
+    // own `legalUnavailable` branch answers 503 once the policy actually reaches it.
+    trustPolicy: cfg.x402TrustPolicy ?? "open",
+    // The API's own origin when the deployment names one; otherwise the base every other public
+    // url here is built on, which keeps a single-host deployment behaving exactly as before.
+    publicApiUrl: cfg.publicApiUrl ?? cfg.metadataBaseUrl,
     payTo: cfg.x402DemoPayTo,
     asset: cfg.usdc,
     network: `eip155:${cfg.chainId}`,
@@ -70,6 +93,7 @@ export function mountX402DemoRoutes(
     resourceUrl: deps.resourceUrl,
     agentkit: deps.agentkit,
     trustPolicy: deps.trustPolicy,
+    legalBody: deps.legalBody,
     settle,
     serve: () => ({ quote: "BYOA x402 demo quote", resource: "/x402-demo/quote" }),
   });
@@ -163,6 +187,165 @@ export function mountX402DemoRoutes(
         resource: deps.resourceUrl,
         statement: "this seller trades only with agents a verified unique human answers for",
         legs,
+      });
+    });
+  }
+
+  // ── the legal-bodies-only wall, and the two refusals that make it legible ─────────────────
+  //
+  // The SECOND question a seller can ask (design 2026-09-10 D4/D5): AgentBook answers "is there a
+  // human?", this wall also asks "is there a legal body?". The policy is PINNED here rather than
+  // read from X402_TRUST_POLICY, so the demo can be shown on a box whose configured seller is
+  // "open" — the deployment's own wall at /x402-demo/quote is not touched by any of this.
+  if (deps.agentkit) {
+    const wallPath = "/x402-demo/legal-bodies-wall";
+    // Both public urls from ONE base, and never by rewriting a known suffix: a `/quote` that
+    // stopped ending in `/quote` used to leave the wall sharing the configured seller's resource
+    // url, which would make a proof minted for one valid at the other — exactly what giving this
+    // wall its own resource url prevents (an AgentKit proof is bound to what it was signed for).
+    const demoBase = deps.publicApiUrl
+      ? `${deps.publicApiUrl.replace(/\/+$/, "")}/x402-demo`
+      : deps.resourceUrl.replace(/\/[^/]+$/, "");
+    const wallResourceUrl = `${demoBase}/legal-bodies-wall`;
+    const runUrl = `${demoBase}/legal-bodies-run`;
+    const wallAgentkit = (rateKey: string, allowancePerHuman?: number) => ({
+      ...(deps.agentkit as NonNullable<X402DemoDeps["agentkit"]>),
+      // Both derived from the url this wall ADVERTISES, never from the base `deps.agentkit` was
+      // built on (final pass F1). `mintAgentkitExtension` signs the challenge for `domain` and
+      // `resourceUri` (= this `resourceUrl`), and `validateAgentkitMessage` then requires
+      // `message.domain === new URL(resourceUrl).hostname` — so on the deploy the runbook
+      // prescribes, where PUBLIC_API_URL (api.…) and METADATA_BASE_URL (www.…) are different
+      // hosts, the wall minted challenges it could not itself accept: every proof came back
+      // "Domain mismatch", and our own buyer refused to sign one at all (its origin check binds
+      // the challenge to the url being bought — buyer.ts `assertChallengeOrigin`).
+      resourceUrl: wallResourceUrl,
+      domain: new URL(wallResourceUrl).hostname,
+      rateKey,
+      ...(allowancePerHuman === undefined ? {} : { allowancePerHuman }),
+    });
+    const pinned = {
+      trustPolicy: "legal-bodies-only" as const,
+      price: deps.price,
+      payTo: deps.payTo,
+      asset: deps.asset,
+      network: deps.network,
+      resource: wallPath,
+      resourceUrl: wallResourceUrl,
+      legalBody: deps.legalBody,
+      serve: () => ({
+        quote: "Novi legal-body demo quote",
+        resource: wallPath,
+      }),
+    };
+
+    // The real wall: a Novi agent's payment lands here and settles, which is the third leg of the
+    // demo and the only one that moves money.
+    app.route(
+      "/",
+      buildPaywall({
+        ...pinned,
+        agentkit: wallAgentkit(`${wallResourceUrl}#legal-bodies-wall`),
+        settle,
+      }),
+    );
+
+    // A SECOND instance of the same wall for the run below — identical policy, deps and code
+    // path, with two deliberate differences. (1) Its own rate key: /legal-bodies-run is a public
+    // GET that any visitor can trigger, and charging the proof agent's budget on the real wall
+    // would turn the second leg into a 429 after a handful of page views — the same reason
+    // /proof-run keeps its own key. (2) No `settle`: this endpoint must be incapable of spending.
+    // …and (3) a meter it cannot exhaust. The real wall keeps the deployment's allowance because
+    // that budget protects something; this one settles nothing and protects nothing, and at the
+    // production default of 3 per 24 h the second leg would answer 429 from the fourth page view
+    // onward — beside an `expected` block still promising 403, i.e. contradicting itself mid-demo.
+    const runWall = buildPaywall({
+      ...pinned,
+      agentkit: wallAgentkit(`${wallResourceUrl}#legal-bodies-run`, 10_000),
+    });
+    const wallFetch = (init?: { headers?: Record<string, string> }) =>
+      runWall.request(wallPath, init);
+
+    let lastLegalRun = 0;
+    app.get("/x402-demo/legal-bodies-run", async (c) => {
+      const now = Date.now();
+      if (now - lastLegalRun < 5_000)
+        return c.json({ error: "slow-down", detail: "one run every 5 seconds" }, 429);
+      lastLegalRun = now;
+
+      // Leg 1 — anonymous: refused before the legal question is ever asked. Its body carries the
+      // freshly minted challenge, which is exactly what leg 2 signs, so the second leg proves the
+      // refusal really is self-service.
+      const anonRes = await wallFetch();
+      const anonBody = (await anonRes.json().catch(() => null)) as Record<string, unknown> | null;
+      const legs: Record<string, unknown>[] = [
+        { name: "anonymous", status: anonRes.status, body: anonBody },
+      ];
+
+      // Leg 2 — human-backed, no legal body: a real SIWE proof from the AgentBook-registered
+      // proof agent (the Lisbon agent: a human vouches for it, no Novi body stands behind it).
+      if (deps.proofAgentKey) {
+        try {
+          const { createAgentkitClient } = await import("@worldcoin/agentkit");
+          const client = createAgentkitClient({
+            // World Chain, not Arc (design v3 D10) — every AgentKit client signs for eip155:480.
+            signer: agentkitSignerFromKey(deps.proofAgentKey, AGENT_BOOK_CHAIN_ID),
+            // biome-ignore lint/suspicious/noExplicitAny: client options typing varies across SDK versions.
+          } as any) as { createHeader(ext: unknown): Promise<string> };
+          // createHeader wants the INNER extension ({info, supportedChains, schema}) — taken from
+          // leg 1's own refusal, so no extra challenge is minted and nothing else is signed.
+          const header = await client.createHeader(
+            (anonBody as { extensions?: { agentkit?: unknown } } | null)?.extensions?.agentkit,
+          );
+          const agentRes = await wallFetch({ headers: { agentkit: header } });
+          legs.push({
+            name: "human-backed, no legal body",
+            status: agentRes.status,
+            humanId: agentRes.headers.get("X-AGENTKIT-HUMAN"),
+            legalBody: agentRes.headers.get("X-NOVI-LEGAL-BODY"),
+            body: await agentRes.json().catch(() => null),
+          });
+        } catch (e) {
+          legs.push({
+            name: "human-backed, no legal body",
+            status: null,
+            body: null,
+            skipped: true,
+            reason: `proof-leg-failed: ${(e as Error).message}`,
+          });
+        }
+      } else {
+        legs.push({
+          name: "human-backed, no legal body",
+          status: null,
+          body: null,
+          skipped: true,
+          // Never signed by anything else: the leg is worth nothing unless the signer is an
+          // address AgentBook actually vouches for.
+          reason: "no proof agent key configured on this deployment (X402_PROOF_AGENT_KEY)",
+        });
+      }
+
+      return c.json({
+        policy: "legal-bodies-only",
+        resource: wallResourceUrl,
+        runUrl,
+        statement:
+          "this seller trades only with agents that a registered legal body in good standing stands behind",
+        legs,
+        expected: {
+          anonymous: {
+            status: 403,
+            error: "human_backing_required",
+            reason: "no-proof-presented",
+          },
+          "human-backed, no legal body": {
+            status: 403,
+            error: "legal_body_required",
+            reason: "not-legal-body",
+          },
+        },
+        thirdLeg:
+          "a payment from an AgentBook-registered Novi legal body reaches 200; run it from the product (MCP pay) — this endpoint spends nothing",
       });
     });
   }

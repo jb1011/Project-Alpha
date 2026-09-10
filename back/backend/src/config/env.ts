@@ -117,6 +117,12 @@ const EnvSchema = z.object({
     .transform((v) => v === "true"),
   MCP_PUBLIC_URL: z.string().default("http://localhost:8789/mcp"),
   METADATA_BASE_URL: z.string().url().default("http://localhost:8789"),
+  /** This API's OWN public origin (e.g. https://api.novicorpus.com), when it differs from the
+   *  base the metadata urls are built on. Public links this deployment hands to STRANGERS — the
+   *  legal-body lookup in an x402 refusal, the demo wall a buyer pays — are composed from it,
+   *  because METADATA_BASE_URL points at the www proxy in production and that proxy drops the
+   *  CORS header, Cache-Control and X-NOVI-LEGAL-BODY. Unset -> METADATA_BASE_URL, as before. */
+  PUBLIC_API_URL: z.string().url().optional(),
   GAS_SEED_FLOOR_USDC: etherSchema.default("0.05"),
   GAS_SEED_TARGET_USDC: etherSchema.default("0.2"),
   ENABLE_X402_DEMO: z
@@ -126,8 +132,10 @@ const EnvSchema = z.object({
   X402_DEMO_PAYTO: addressSchema.optional(),
   /** Seller trust policy. "open" = today's behavior (AgentKit authorizes within the allowance,
    *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
-   *  outright (403); human-backed agents still pay. */
-  X402_TRUST_POLICY: z.enum(["open", "accountable-only"]).default("open"),
+   *  outright (403); human-backed agents still pay. "legal-bodies-only" = accountable-only PLUS a
+   *  registered Novi legal body in good standing behind the payer address (design 2026-09-10 D4);
+   *  it needs a legal-body resolver wired, and refuses 503 rather than serving without one. */
+  X402_TRUST_POLICY: z.enum(["open", "accountable-only", "legal-bodies-only"]).default("open"),
   /** Buyer-side trust dial: "verified-sellers-only" refuses to pay any address AgentBook does not
    *  vouch a human for. Default "open" = today's behavior. docs/design/2026-07-30-trust-policy-dials.md */
   X402_BUYER_TRUST_POLICY: z.enum(["open", "verified-sellers-only"]).default("open"),
@@ -412,13 +420,15 @@ export interface Config {
   jobSweepToTreasury: boolean;
   mcpPublicUrl: string;
   metadataBaseUrl: string;
+  /** The API's own public origin; undefined = use `metadataBaseUrl`. */
+  publicApiUrl?: string;
   gasSeedFloorUsdc: string;
   gasSeedTargetUsdc: string;
   enableX402Demo: boolean;
   x402DemoPayTo: Address;
   x402DemoPriceUsdc: string;
   /** Optional in the type (test fixtures build Config literals); loadConfig always sets them. */
-  x402TrustPolicy?: "open" | "accountable-only";
+  x402TrustPolicy?: "open" | "accountable-only" | "legal-bodies-only";
   x402BuyerTrustPolicy: "open" | "verified-sellers-only";
   worldRateWindowHours?: number;
   x402ProofAgentKey?: Hex;
@@ -673,6 +683,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
     mcpPublicUrl: e.MCP_PUBLIC_URL,
     metadataBaseUrl: e.METADATA_BASE_URL,
+    publicApiUrl: e.PUBLIC_API_URL,
     gasSeedFloorUsdc: e.GAS_SEED_FLOOR_USDC,
     gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,
