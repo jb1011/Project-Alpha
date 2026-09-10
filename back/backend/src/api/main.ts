@@ -43,6 +43,7 @@ import {
 import { resolveFormationDeployment } from "../formation";
 import { createCompany } from "../formation/company";
 import { newChainHeadCache } from "../formation/payment";
+import { formationSummary } from "../formation/status";
 import { buildJobDeps } from "../jobs/composition";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
@@ -210,9 +211,7 @@ async function main() {
   // below today, the public lookup and the `legal-bodies-only` seller policy next. It holds no
   // state and caches nothing (D8), so sharing it costs nothing and guarantees that a suspension
   // means the same thing to every caller.
-  // (Task 2 hands this same instance to `buildApiApp` as `deps.legalBody` — one added optional
-  // field on `ApiDeps` in app.ts, which is that task's file, and the public lookup route reads it
-  // from there. Nothing else about the wiring changes.)
+  // The public lookup (D3) receives THIS instance below, as `deps.legalBody.resolver`.
   const legalBody = createLegalBodyResolver({
     // Payer-keyed (D2): an AgentKit proof carries the pocket, not the treasury.
     findByPocketAddress: (addr) => repo.findByPocketAddress(addr),
@@ -707,6 +706,25 @@ async function main() {
     : undefined;
   if (ens) console.warn(`⚠ ENS gateway ENABLED at /ensgateway (parent ${ens.parentName})`);
 
+  /**
+   * Where the lookup points a seller for the human-readable version of the same facts.
+   *
+   * The transparency PAGE is on the web origin; a deployment with no explicit one (the dev
+   * default, `*`) falls back to this API's own `/transparency`, which every deployment serves.
+   * Wrapped because a misconfigured WEB_ORIGIN — anything `new URL` will not take — must cost a
+   * less useful link and NEVER the API's ability to boot.
+   */
+  const transparencyLink = (() => {
+    for (const base of [cfg.webOrigin, cfg.metadataBaseUrl]) {
+      try {
+        return new URL("/transparency", base).toString();
+      } catch {
+        // next candidate
+      }
+    }
+    return `${cfg.metadataBaseUrl}/transparency`;
+  })();
+
   const app = buildApiApp({
     webOrigin: cfg.webOrigin,
     nonceStore,
@@ -799,6 +817,39 @@ async function main() {
     ens,
     worldId,
     agentBook,
+    /**
+     * The public legal-body lookup, `GET /legal-bodies/:address` (design 2026-09-10 D3).
+     *
+     * The SAME resolver instance the buyer dial got above (D1) — not a second one built from the
+     * same parts, which is how two surfaces end up disagreeing about one suspension.
+     */
+    legalBody: {
+      resolver: legalBody,
+      /**
+       * 30 burst, 1 per second sustained, and spent only on a memo MISS.
+       *
+       * Smaller than the AgentBook status budget on purpose: this route is UNAUTHENTICATED, so
+       * nothing else bounds how often it is asked, and every miss is two Arc reads on the same
+       * RPC the trust dials and the sweeper share. A judge refreshing a page rides the memo.
+       */
+      readBudget: new TokenBucket(30, 1),
+      links: {
+        transparency: transparencyLink,
+        // The base the on-chain `metadataURI` is built from (workflow/onboarding.ts), so the link
+        // a seller follows is the very document the chain points at.
+        metadataBase: cfg.metadataBaseUrl,
+      },
+      // The SHARED projection, through the same two lookups `/transparency` reads (M5's
+      // company-keyed pair), so a public surface cannot describe a filing differently from the
+      // public surface next door.
+      formationSummary: (companyId: string) =>
+        formationSummary(
+          entityViewDeps.company(companyId),
+          entityViewDeps.formationSteps(companyId),
+        ),
+      // The AgentBook status route's derivation, verbatim — one deployment, one named chain.
+      network: agentBook.network,
+    },
     standingExposure,
   });
 
