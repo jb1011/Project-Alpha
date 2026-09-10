@@ -849,12 +849,94 @@ describe("legal-bodies-only trust policy", () => {
     expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
   });
 
-  test("a served request costs exactly one unit, charged once", async () => {
+  test("a served request is charged at most once — and a paying request not at all (R2)", async () => {
+    // A one-shot proof+payment: nothing quoted this buyer a 402, so no unit was spent on its
+    // behalf and none is spent here either. The rule is "the 402 pays the unit"; a client that
+    // skips the 402 skips the charge, and it is paying real USDC for the privilege.
     const { deps } = legalDeps(asBody("active"));
     const res = await legalApp(deps).request("/x402-demo/quote", {
       headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
     });
     expect(res.status).toBe(200);
+    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("0/2");
+  });
+
+  // ── one purchase, one unit (re-review R2) ──────────────────────────────────────────────────
+  //
+  // The buyer's route through a strict wall is three requests: a proofless one it is refused for
+  // free, a proved one it is QUOTED for, and a proved+paying one it is served for. Charging the
+  // third as well made every purchase cost two units of the three a human gets per 24 h — one
+  // purchase a day, with the demo's own rehearsal eating the budget.
+
+  test("a whole purchase costs ONE unit: refusal 0, quote 1, payment 0", async () => {
+    const { deps } = legalDeps(asBody("active"));
+    const app = legalApp(deps);
+
+    // 1. the proofless request the strict wall refuses — free, and it never reaches the meter
+    const refused = await app.request("/x402-demo/quote");
+    expect(refused.status).toBe(403);
+    expect(refused.headers.get("X-AGENTKIT-AUTHORIZATION")).toBeNull();
+
+    // 2. the proved request: quoted, and charged the purchase's one unit
+    const quoted = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402);
+    expect(quoted.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+
+    // 3. the paying request, with the FRESH proof the buyer mints for it: served, charged nothing
+    const served = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(served.status).toBe(200);
+    expect(served.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+
+    // …and the budget really is down by one, not two: the next quote is the SECOND unit.
+    const next = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(next.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
+  });
+
+  test("a REFUSED purchase costs one unit — the refusal did the work, the buyer pays for it", async () => {
+    const { deps } = legalDeps({ kind: "none" });
+    const app = legalApp(deps);
+    expect((await app.request("/x402-demo/quote")).status).toBe(403); // free
+    const refused = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(refused.status).toBe(403);
+    expect(((await refused.json()) as { error: string }).error).toBe("legal_body_required");
+    expect(refused.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+  });
+
+  test("a human with a budget of ONE can still complete a whole purchase", async () => {
+    // The acceptance shape, at the tightest possible meter: if the paying leg were charged, this
+    // buyer would be rate-capped mid-payment — after its money was signed away.
+    const { deps } = legalDeps(asBody("active"));
+    const app = legalApp(deps, cfg({ allowancePerHuman: 1 }));
+    expect((await app.request("/x402-demo/quote")).status).toBe(403);
+    const quoted = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402);
+    expect(quoted.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/1");
+    const served = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(served.status).toBe(200);
+    expect(((await served.json()) as { legalBody: unknown }).legalBody).toEqual({
+      agentId: "843704",
+    });
+  });
+
+  test("a payment we cannot verify buys no discount: the request is charged like any other", async () => {
+    // Otherwise attaching junk would be a free pass through the AgentBook read and both Arc reads.
+    const { deps } = legalDeps(asBody("active"));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": "not-a-payment" },
+    });
+    expect(res.status).toBe(402); // malformed X-PAYMENT -> re-quoted
     expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
   });
 

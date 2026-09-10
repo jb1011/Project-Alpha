@@ -364,7 +364,10 @@ export function buildEntityPaymentService(
             fetchImpl,
             authorize,
             maxAmount: args.amountUsdc,
-            ...(agentkitSigner ? { agentkitSigner } : {}),
+            // The signer AND the unwrapped fetch: once the buyer answers a strict wall's 403
+            // itself, going back through the AgentKit wrapper would spend a second unit of the
+            // human's allowance on a request nobody needed.
+            ...(agentkitSigner ? { agentkitSigner, directFetch: baseFetch } : {}),
             onAuthorized: (id) => {
               signed = true;
               ledgerId = id;

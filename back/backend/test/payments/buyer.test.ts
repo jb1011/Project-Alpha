@@ -126,11 +126,13 @@ const RESOURCE = "https://seller/api/insight";
  *  hyphenated nonce and the client swallows the resulting throw), so what the buyer signs in these
  *  tests is the real shape a strict wall emits. Built from the SDK rather than imported from
  *  worldVerifier so this suite does not drag the seller's dependency graph in. */
-async function sellerChallenge(): Promise<{ agentkit: AgentkitExtension }> {
+async function sellerChallenge(
+  origin: { domain: string; resourceUri: string } = { domain: "seller", resourceUri: RESOURCE },
+): Promise<{ agentkit: AgentkitExtension }> {
   const { declareAgentkitExtension } = await import("@worldcoin/agentkit");
   const ext = declareAgentkitExtension({
-    domain: "seller",
-    resourceUri: RESOURCE,
+    domain: origin.domain,
+    resourceUri: origin.resourceUri,
     network: [requirements.network, `eip155:${WORLD_CHAIN_ID}`],
     statement:
       "Prove this agent is backed by a verified unique human to be authorized on this resource",
@@ -175,23 +177,51 @@ function headersOf(init?: RequestInit): Record<string, string> {
   return (init?.headers as Record<string, string> | undefined) ?? {};
 }
 
-test("a strict wall's 403 challenge is answered with a minted proof, then the normal 402 -> pay path runs", async () => {
-  const challenge = await sellerChallenge();
-  const seen: SeenCall[] = [];
-  const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+/** The nonce inside a minted header — what the seller consumes. */
+function nonceOf(header: string): string {
+  return (JSON.parse(Buffer.from(header, "base64").toString("utf8")) as { nonce: string }).nonce;
+}
+
+/** A strict wall WITH the seller's real replay rule: `validateAgentkitMessage` consumes the
+ *  challenge nonce on first use (worldVerifier.ts `checkNonce` -> worldStore.consumeNonce; "one
+ *  header is good for exactly one verify", test/world/sellerGate.test.ts), so a header presented
+ *  twice is refused 403. Every response carries its OWN fresh challenge, exactly as `refusal()`
+ *  and `challenge()` do — which is what makes re-minting possible. */
+function strictWall(seen: SeenCall[], opts: { quoteWithoutChallenge?: boolean } = {}) {
+  const spent = new Set<string>();
+  return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
     const h = headersOf(init);
     seen.push({ agentkit: h.agentkit, payment: h["X-PAYMENT"] });
-    // The wall: no proof -> 403 + challenge; proof but no payment -> 402; both -> served.
+    const challenge = await sellerChallenge();
     if (!h.agentkit) return new Response(JSON.stringify(humanRefusal(challenge)), { status: 403 });
+    if (spent.has(nonceOf(h.agentkit)))
+      return new Response(
+        JSON.stringify({
+          ...humanRefusal(challenge),
+          reason: "invalid-message:Nonce validation failed (possible replay attack)",
+        }),
+        { status: 403 },
+      );
+    spent.add(nonceOf(h.agentkit));
     if (!h["X-PAYMENT"])
-      return new Response(JSON.stringify({ accepts: [requirements], extensions: challenge }), {
-        status: 402,
-      });
+      return new Response(
+        JSON.stringify(
+          opts.quoteWithoutChallenge
+            ? { accepts: [requirements] }
+            : { accepts: [requirements], extensions: challenge },
+        ),
+        { status: 402 },
+      );
     return new Response(JSON.stringify({ data: "the insight" }), {
       status: 200,
       headers: { "X-NOVI-LEGAL-BODY": "843704" },
     });
   });
+}
+
+test("a strict wall's 403 challenge is answered with a minted proof, then the normal 402 -> pay path runs", async () => {
+  const seen: SeenCall[] = [];
+  const fetchImpl = strictWall(seen);
   const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 7 }));
 
   const res = await buyWithX402(
@@ -213,8 +243,12 @@ test("a strict wall's 403 challenge is answered with a minted proof, then the no
   // 2. the recovery request carries the proof and NO payment (nothing is signed to get past a 403)
   expect(typeof seen[1]?.agentkit).toBe("string");
   expect(seen[1]?.payment).toBeUndefined();
-  // 3. the paid retry keeps the SAME proof — re-minting would burn a second allowance unit
-  expect(seen[2]?.agentkit).toBe(seen[1]?.agentkit);
+  // 3. the paid retry carries a FRESH proof, minted from the 402's own challenge: the recovery
+  //    leg spent that nonce, and this stub refuses a replay exactly as the seller does — reusing
+  //    it would 403 the purchase AFTER the payment was signed (re-review R1).
+  expect(typeof seen[2]?.agentkit).toBe("string");
+  expect(seen[2]?.agentkit).not.toBe(seen[1]?.agentkit);
+  expect(nonceOf(seen[2]?.agentkit as string)).not.toBe(nonceOf(seen[1]?.agentkit as string));
   expect(seen[2]?.payment).toBe("X-PAYMENT-ok");
   expect(authorize).toHaveBeenCalledTimes(1);
 
@@ -368,4 +402,89 @@ test("a signer changes nothing for a plain 402 seller: the first request still c
   expect(res.status).toBe(200);
   // The AgentKit client wrapped around fetchImpl owns the 402 case; the buyer must not pre-empt it.
   expect(seen.every((c) => c.agentkit === undefined)).toBe(true);
+});
+
+test("the paid leg's proof is minted from the 402's own challenge, so a wall that consumes nonces still serves", async () => {
+  // The same wall as above, driven twice: two purchases, four proofs, no replay refusal anywhere.
+  const seen: SeenCall[] = [];
+  const fetchImpl = strictWall(seen);
+  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 }));
+  const deps = {
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+    authorize,
+    agentkitSigner: agentkitSignerFromKey(AGENT_KEY, WORLD_CHAIN_ID),
+  };
+  expect((await buyWithX402(deps, RESOURCE)).status).toBe(200);
+  expect((await buyWithX402(deps, RESOURCE)).status).toBe(200);
+  const proofs = seen.map((c) => c.agentkit).filter((v): v is string => typeof v === "string");
+  expect(proofs).toHaveLength(4);
+  expect(new Set(proofs.map(nonceOf)).size).toBe(4);
+});
+
+test("a 402 that carries no challenge after we proved is returned untouched — nothing is signed", async () => {
+  const seen: SeenCall[] = [];
+  const fetchImpl = strictWall(seen, { quoteWithoutChallenge: true });
+  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 }));
+  const res = await buyWithX402(
+    {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      authorize,
+      agentkitSigner: agentkitSignerFromKey(AGENT_KEY, WORLD_CHAIN_ID),
+    },
+    RESOURCE,
+  );
+  expect(res.status).toBe(402);
+  expect(authorize).not.toHaveBeenCalled();
+  expect(seen).toHaveLength(2);
+});
+
+test("a challenge naming another site is never signed: terminal challenge-origin-mismatch", async () => {
+  const foreign = await sellerChallenge({
+    domain: "app.example.com",
+    resourceUri: "https://app.example.com/login",
+  });
+  const fetchImpl = vi.fn(
+    async () => new Response(JSON.stringify(humanRefusal(foreign)), { status: 403 }),
+  );
+  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 }));
+  await expect(
+    buyWithX402(
+      {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        authorize,
+        agentkitSigner: agentkitSignerFromKey(AGENT_KEY, WORLD_CHAIN_ID),
+      },
+      RESOURCE,
+    ),
+  ).rejects.toThrow(/challenge-origin-mismatch/);
+  // One request, one refusal, no signature of any kind: a hostile seller gets nothing to replay.
+  expect(fetchImpl).toHaveBeenCalledTimes(1);
+  expect(authorize).not.toHaveBeenCalled();
+});
+
+test("the 402's challenge is origin-checked too, before the payment is authorized", async () => {
+  const honest = await sellerChallenge();
+  const foreign = await sellerChallenge({
+    domain: "app.example.com",
+    resourceUri: "https://app.example.com/login",
+  });
+  const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
+    headersOf(init).agentkit
+      ? new Response(JSON.stringify({ accepts: [requirements], extensions: foreign }), {
+          status: 402,
+        })
+      : new Response(JSON.stringify(humanRefusal(honest)), { status: 403 }),
+  );
+  const authorize = vi.fn(async () => ({ ok: true as const, header: "X-PAYMENT-ok", ledgerId: 1 }));
+  await expect(
+    buyWithX402(
+      {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        authorize,
+        agentkitSigner: agentkitSignerFromKey(AGENT_KEY, WORLD_CHAIN_ID),
+      },
+      RESOURCE,
+    ),
+  ).rejects.toThrow(/challenge-origin-mismatch/);
+  expect(authorize).not.toHaveBeenCalled();
 });

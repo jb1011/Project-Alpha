@@ -409,31 +409,51 @@ test("the signer the payment service builds can sign our own seller's 402", asyn
  *  refused 403 WITH the challenge in the body (seller.ts `refusal()`), a proved one is quoted 402,
  *  a proved AND paid one is served. This is the shape that used to make our own agents unable to
  *  buy from our own strict wall through `pay`. */
+const VENDOR_URL = "https://vendor.example/resource";
+
 function strictWallFetch(
   seen: Array<{ agentkit?: string | undefined; payment?: string | undefined }>,
 ) {
+  // Single-use proofs, like the real seller: `validateAgentkitMessage` consumes the challenge
+  // nonce on first verify, so a replayed header is refused 403 (re-review R1). Each response
+  // carries its own fresh challenge, which is what lets the buyer mint a second proof to pay with.
+  const spent = new Set<string>();
+  // The challenge names the host being bought from: the buyer refuses to sign a SIWE message for
+  // any other origin (re-review R3), exactly as it should for a challenge it did not solicit.
+  const challenge = () =>
+    mintAgentkitExtension({
+      domain: new URL(VENDOR_URL).hostname,
+      resourceUrl: VENDOR_URL,
+      network: ARC_CAIP2,
+      allowancePerHuman: 9,
+    });
+  const refused = async (reason: string) =>
+    new Response(
+      JSON.stringify({
+        error: "human_backing_required",
+        detail: "this seller trades only with agents a verified unique human answers for",
+        reason,
+        extensions: await challenge(),
+      }),
+      { status: 403 },
+    );
   return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
     const h = (init?.headers as Record<string, string> | undefined) ?? {};
     seen.push({ agentkit: h.agentkit, payment: h["X-PAYMENT"] });
-    if (!h.agentkit) {
-      const ext = await mintAgentkitExtension({
-        domain: DOMAIN,
-        resourceUrl: RESOURCE_URL,
-        network: ARC_CAIP2,
-        allowancePerHuman: 9,
-      });
-      return new Response(
-        JSON.stringify({
-          error: "human_backing_required",
-          detail: "this seller trades only with agents a verified unique human answers for",
-          reason: "no-proof-presented",
-          extensions: ext,
-        }),
-        { status: 403 },
-      );
-    }
+    if (!h.agentkit) return refused("no-proof-presented");
+    const nonce = (
+      JSON.parse(Buffer.from(h.agentkit, "base64").toString("utf8")) as { nonce: string }
+    ).nonce;
+    if (spent.has(nonce))
+      return refused("invalid-message:Nonce validation failed (possible replay attack)");
+    spent.add(nonce);
     if (!h["X-PAYMENT"])
-      return new Response(JSON.stringify({ accepts: [requirements] }), { status: 402 });
+      return new Response(
+        JSON.stringify({ accepts: [requirements], extensions: await challenge() }),
+        {
+          status: 402,
+        },
+      );
     return new Response("ok", { status: 200 });
   });
 }
@@ -454,8 +474,10 @@ test("pay() recovers from a strict seller's 403 challenge and completes the purc
     tenantId: "tenantA",
   });
   expect(receipt, JSON.stringify(receipt)).toMatchObject({ ok: true });
-  // Proof on the recovery and the paid retry, never on the first request.
+  // Proof on the recovery and the paid retry, never on the first request — and the two proofs are
+  // DIFFERENT: this wall consumes nonces, so the paid leg has to carry a freshly minted one.
   expect(seen.map((c) => typeof c.agentkit)).toEqual(["undefined", "string", "string"]);
+  expect(seen[2]?.agentkit).not.toBe(seen[1]?.agentkit);
   expect(seen[2]?.payment).toBeTruthy();
 });
 

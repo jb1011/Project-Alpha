@@ -217,6 +217,25 @@ export function buildPaywall(cfg: PaywallConfig) {
      *  asked (any other policy), which is why the receipt below distinguishes the two. */
     let legalBodyAgentId: string | null | undefined;
 
+    /** The inbound payment, verified at most ONCE per request although two places ask about it:
+     *  the allowance decision below and the payment path at the bottom. `verifyPayment` is pure
+     *  local crypto (decode + recipient/amount/expiry + a local signature recovery — no chain
+     *  reads, no side effects), so asking early costs nothing and changes no order that matters. */
+    const paymentHeader = c.req.header("X-PAYMENT");
+    let checked: VerifyResult | null | undefined;
+    const checkPayment = async (): Promise<VerifyResult | null> => {
+      if (checked === undefined)
+        checked = paymentHeader ? await verifyPayment(paymentHeader, cfg) : null;
+      return checked;
+    };
+    /** Is this request the PAYING half of a purchase whose 402 we already charged a unit for?
+     *  Only a payment that actually verifies and is not a replay counts — junk must not buy a free
+     *  trip through the gate, or a human-backed agent could hammer the legal check for nothing. */
+    const payingRequest = async () => {
+      const v = await checkPayment();
+      return !!v && v.ok && !seen.has(v.nonce);
+    };
+
     // ── accountable-only: accountability is a PRECONDITION of commerce ──────────────────────
     // No valid proof of a human backer -> refused outright; their money is not wanted (403,
     // never 402). A valid proof unlocks the RIGHT TO BUY: flow continues into the normal x402
@@ -234,13 +253,25 @@ export function buildPaywall(cfg: PaywallConfig) {
 
     if (strict) {
       if (!akHeader) return c.json(await refusal("no-proof-presented"), 403);
-      // Under the legal gate the meter is NOT touched here: the human is identified and an
+      // ONE PURCHASE, ONE UNIT (re-review R2). A strict wall answers an unpaid request with a 402
+      // and charges it; the buyer then comes back with the SAME purchase plus its payment. Charging
+      // that second half too makes every purchase cost two of the human's units — at the production
+      // default of three per 24 h, one purchase a day. So a request that carries a payment we can
+      // verify is not charged; the 402 that quoted it already was.
+      const paying = await payingRequest();
+      // Under the legal gate the meter is NOT touched here either: the human is identified and an
       // exhausted one is still refused, but the unit is spent below, once the second question has
       // a definitive answer (review R3).
       const outcome = await verifyAgentkitRequest(
         akHeader,
         cfg.agentkit as AgentkitSellerConfig,
-        legalGate ? { chargeAllowance: false } : undefined,
+        paying
+          ? // Already paid for by its 402: neither spend a unit nor refuse for want of one. A 429
+            // here lands on a buyer that has just signed its money away.
+            { chargeAllowance: false, enforceAllowance: false }
+          : legalGate
+            ? { chargeAllowance: false }
+            : undefined,
       );
       if (!outcome.authorized) {
         if (outcome.reason === "allowance-exhausted") {
@@ -275,8 +306,11 @@ export function buildPaywall(cfg: PaywallConfig) {
 
         // The answer is definitive, so the request is charged whichever way it went: a refusal
         // still cost a signature verification, an AgentBook read and two Arc reads, and an
-        // unregistered agent must not be able to hammer this wall for free.
-        const charged = chargeAllowance(cfg.agentkit as AgentkitSellerConfig, outcome.humanId);
+        // unregistered agent must not be able to hammer this wall for free. The one exception is
+        // the paying half of a purchase — its 402 was charged a moment ago (see `paying` above).
+        const charged = paying
+          ? { used: outcome.used, limit: outcome.limit, allowed: true }
+          : chargeAllowance(cfg.agentkit as AgentkitSellerConfig, outcome.humanId);
         c.header("X-AGENTKIT-AUTHORIZATION", `${charged.used}/${charged.limit}`);
 
         if (resolved.kind === "none")
@@ -320,9 +354,9 @@ export function buildPaywall(cfg: PaywallConfig) {
       c.header("X-AGENTKIT-REASON", outcome.reason);
     }
 
-    const header = c.req.header("X-PAYMENT");
+    const header = paymentHeader;
     if (!header) return c.json(await challenge(), 402);
-    const v = await verifyPayment(header, cfg);
+    const v = (await checkPayment()) as VerifyResult;
     if (!v.ok) return c.json({ ...(await challenge()), error: v.reason }, 402);
     if (seen.has(v.nonce)) return c.json({ ...(await challenge()), error: "replay" }, 402);
     seen.add(v.nonce);

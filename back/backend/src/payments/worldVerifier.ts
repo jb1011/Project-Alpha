@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import type { WorldStore } from "../persistence/worldStore";
 import type { Address } from "../types";
 import { AGENT_BOOK_ADDRESS, AGENT_BOOK_CAIP2, createAgentBookReader } from "./agentBookReader";
+import { loadAgentkitSdk } from "./agentkitSdk";
 
 /**
  * Seller-side "is this agent backed by a real, unique human?" check.
@@ -14,16 +15,6 @@ import { AGENT_BOOK_ADDRESS, AGENT_BOOK_CAIP2, createAgentBookReader } from "./a
  * Chain separation: the AgentBook lookup always resolves on World Chain (SDK guarantee), while
  * the paid route and settlement stay on Arc. The two never mix.
  */
-
-/** Lazily load @worldcoin/agentkit so its import cost is paid on the FIRST World-layer request,
- *  not at boot by every deployment. Measured on the api import chain under tsx: 209.1 -> 201.2 MB
- *  RSS (~8 MB marginal — much of the SDK's dep tree is shared with viem; the audit's ~29.5 MB was
- *  the full-boot estimate). Cached promise = loaded exactly once. */
-let agentkitMod: Promise<typeof import("@worldcoin/agentkit")> | undefined;
-const loadAgentkit = () => {
-  agentkitMod ??= import("@worldcoin/agentkit");
-  return agentkitMod;
-};
 
 const CACHE_TTL_MS = 60 * 60_000; // 1h — a registration is stable once made
 /** Deliberately much shorter than the positive TTL: "not registered" is a state the agent is
@@ -82,7 +73,7 @@ export async function mintAgentkitExtension(cfg: {
   network: string;
   allowancePerHuman: number;
 }) {
-  const { declareAgentkitExtension } = await loadAgentkit();
+  const { declareAgentkitExtension } = await loadAgentkitSdk();
   const ext = declareAgentkitExtension({
     domain: cfg.domain,
     resourceUri: cfg.resourceUrl,
@@ -121,6 +112,13 @@ export interface VerifyAgentkitOptions {
    *  the buyer a unit it can never get back (`WorldStore` has no release). The caller then calls
    *  `chargeAllowance` itself. */
   chargeAllowance?: boolean;
+  /** Whether an exhausted human is REFUSED here. Default true.
+   *
+   *  `false` is for the paying half of a purchase the seller already charged a unit for when it
+   *  quoted the 402 (re-review R2): refusing it would 429 a buyer that has just signed a payment,
+   *  which is worse than letting a purchase already paid for finish. It implies no charge either —
+   *  a meter that is not enforced must not be spent — so the caller need not pass both. */
+  enforceAllowance?: boolean;
 }
 
 /**
@@ -180,7 +178,7 @@ export async function verifyAgentkitRequest(
   const now = cfg.now ?? Date.now;
   try {
     const { parseAgentkitHeader, validateAgentkitMessage, verifyAgentkitSignature } =
-      await loadAgentkit();
+      await loadAgentkitSdk();
     const payload = parseAgentkitHeader(header);
 
     const validation = await validateAgentkitMessage(payload, cfg.resourceUrl, {
@@ -229,21 +227,24 @@ export async function verifyAgentkitRequest(
       cfg.store.cacheLookup(agentAddress, humanId, now());
     }
 
-    // The cap is checked either way — only the SPENDING is optional. An exhausted human is
-    // refused here, before a deferring caller can spend a chain read on it.
-    const { allowed, used } =
-      opts?.chargeAllowance === false
-        ? (({ used: u }) => ({ allowed: u < cfg.allowancePerHuman, used: u }))(
-            peekUsage(cfg, humanId, now()),
-          )
-        : cfg.store.tryIncrementUsage(
-            humanId,
-            cfg.rateKey ?? cfg.resourceUrl,
-            cfg.allowancePerHuman,
-            now(),
-            cfg.rateWindowMs,
-          );
-    if (!allowed)
+    // The cap is READ either way — only the spending and the refusing are optional. An exhausted
+    // human is refused here, before a deferring caller can spend a chain read on it; an
+    // unenforced meter is never spent, since a unit taken under no cap would be a unit taken for
+    // nothing.
+    const enforcing = opts?.enforceAllowance !== false;
+    const charging = opts?.chargeAllowance !== false && enforcing;
+    const { allowed, used } = charging
+      ? cfg.store.tryIncrementUsage(
+          humanId,
+          cfg.rateKey ?? cfg.resourceUrl,
+          cfg.allowancePerHuman,
+          now(),
+          cfg.rateWindowMs,
+        )
+      : (({ used: u }) => ({ allowed: u < cfg.allowancePerHuman, used: u }))(
+          peekUsage(cfg, humanId, now()),
+        );
+    if (!allowed && enforcing)
       return {
         authorized: false,
         reason: "allowance-exhausted",
