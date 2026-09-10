@@ -325,10 +325,17 @@ export function buildEntityPaymentService(
       // is authorized within its allowance the seller returns 200 and buyWithX402 treats it as a
       // final response (no payment); otherwise the normal 402 -> policy -> sign -> settle path runs.
       let fetchImpl: typeof baseFetch;
+      // The same signer, handed to buyWithX402 as well: the wrapper answers an AgentKit-enabled
+      // 402, the buyer answers a STRICT seller's 403 challenge (which the wrapper ignores). One
+      // signer, two doors — see the strict-wall recovery in buyer.ts.
+      let agentkitSigner: AgentkitSigner | undefined;
       try {
-        fetchImpl = cfg.world
-          ? wrapFetchWithAgentkit(baseFetch, pocketSigners(entity).agentkit)
-          : baseFetch;
+        if (cfg.world) {
+          agentkitSigner = pocketSigners(entity).agentkit;
+          fetchImpl = wrapFetchWithAgentkit(baseFetch, agentkitSigner);
+        } else {
+          fetchImpl = baseFetch;
+        }
       } catch (e) {
         // Signer construction failed (missing circle wallet fields / client) — nothing signed,
         // release the claim so the same key retries cleanly once the config is fixed.
@@ -357,6 +364,7 @@ export function buildEntityPaymentService(
             fetchImpl,
             authorize,
             maxAmount: args.amountUsdc,
+            ...(agentkitSigner ? { agentkitSigner } : {}),
             onAuthorized: (id) => {
               signed = true;
               ledgerId = id;
