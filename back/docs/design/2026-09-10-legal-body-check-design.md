@@ -293,6 +293,27 @@ the plan say so. Its REFUSALS are unchanged: an unverified request is refused ex
 a human with no budget and no payment still gets the 429. This is the one place where the plan's
 "the existing `accountable-only` behaviour is untouched" no longer holds.
 
+**D4 — one paid attempt per issued invoice** (ruling FP-R1). The exemption above also took the
+paying half OUT of the meter, and an EIP-3009 authorization is free to sign: an exhausted human
+sending ten payment-carrying requests reached the FACILITATOR ten times here (two Arc reads each
+first), where origin/main's own seller, executed against the identical loop, answers
+`402×3 then 429×7` — main bounded facilitator calls per human per window by charging inside the
+verify, and this branch had loosened that. So `world_usage` gained a second counter on the same row,
+key and window: `paid_attempts`, how many of the units CHARGED in the window have already been
+answered by a payment-carrying request. One is claimed atomically
+(`WorldStore.tryConsumePaidAttempt`, `paid_attempts < used`) BEFORE the legal read and before
+settlement, so a settlement that fails consumes it as surely as one that succeeds; with none
+outstanding the request gets the ordinary 429 rate-cap body, no chain read and no facilitator call.
+Settle attempts per human per window are therefore capped at the allowance, which is main's cap. The
+arithmetic above is unchanged — purchase 1 unit, both legal 403s charge, a failed settlement
+charges, a served 200 charges nothing more, 503 charges nothing, and the last purchase in a window
+still completes, its 402 having charged the unit its paid leg answers. Two visible consequences: a
+request that was never quoted (a one-shot proof+payment) is now refused 429 where it used to be
+served for free, since nothing was charged for it to answer; and `accountable-only` takes the same
+bound, deliberately — two strict policies with different facilitator bounds is the worse thing to
+explain. The column is additive with `DEFAULT 0`, so on an existing box every human keeps the
+attempts its already-charged units bought.
+
 **D4 — `legal-bodies-only` without `agentkit` fails CLOSED.** Missing EITHER half (the AgentKit
 config or the resolver) refuses every request 503, ahead of the no-proof 403, each with its own
 mount-time warning. Without this, a box that lost its World config would have fallen through to

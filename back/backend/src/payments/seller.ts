@@ -16,6 +16,7 @@ import {
 import {
   type AgentkitSellerConfig,
   chargeAllowance,
+  claimPaidAttempt,
   mintAgentkitExtension,
   verifyAgentkitRequest,
 } from "./worldVerifier";
@@ -298,6 +299,29 @@ export function buildPaywall(cfg: PaywallConfig) {
       }
       c.header("X-AGENTKIT-HUMAN", outcome.humanId);
       if (!legalGate) c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
+
+      // ── ONE PAID ATTEMPT PER ISSUED INVOICE (ruling FP-R1) ────────────────────────────────
+      // The exemption below is what makes a purchase cost one unit; on its own it also takes the
+      // paying half OUT of the meter, and an EIP-3009 authorization costs nothing to sign. So a
+      // human whose allowance was spent could send one payment-carrying request after another and
+      // reach the FACILITATOR every time — where `main` capped those calls at the allowance by
+      // charging inside the verify (measured: `402×3 then 429×7` there, 10/10 settle attempts
+      // here). The bound is restored without losing the exemption: every unit CHARGED in this
+      // window buys exactly one payment-carrying request, and this is where that entitlement is
+      // spent — atomically, before the legal read and before the facilitator, so a settlement
+      // that fails has consumed it just as surely as one that succeeds. A buyer that wants
+      // another attempt asks for another quote; that 402 charges the unit that pays for it.
+      //
+      // `accountable-only` is bounded by the same line, deliberately: it is main's own cap, and
+      // two strict policies with different facilitator bounds is the worse thing to explain.
+      if (
+        paying &&
+        !claimPaidAttempt(cfg.agentkit as AgentkitSellerConfig, outcome.humanId).allowed
+      )
+        return c.json(
+          { error: "rate-capped", detail: "per-human request budget exhausted for this window" },
+          429,
+        );
 
       // ── WHEN the unit is spent (final pass F2) ──────────────────────────────────────────────
       // An X-PAYMENT header is a promise, not a payment: it verifies locally with no funds behind

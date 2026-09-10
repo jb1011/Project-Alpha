@@ -73,13 +73,13 @@ paused. The four refusal bodies, verbatim (`payments/seller.ts`):
   with no resolver or no `agentkit` config: `"detail":"this seller's legal-body check is not configured right now"`.
 
 **The per-human meter: one unit per purchase, one per refusal, zero on a 503.** Exhaustion is checked BEFORE any chain
-read (the 429 above, no Arc read), and the unit is spent once the legal answer is DEFINITIVE. The 402 a passing check
-leads to is charged; the paid request that follows is exempt ONLY because it is SERVED — that skip needs a payment we
-can verify locally (recipient, amount, expiry, signature, an unspent nonce) AND a settlement that succeeds. Everything
-else charges: both legal 403s whatever headers rode along, and a payment that fails to settle, since the signature
-check, the AgentBook read and the two Arc reads happened either way. Only the 503 charges nothing, so
-`X-AGENTKIT-AUTHORIZATION` is absent from it. `accountable-only`'s refusals are unchanged, but its meter now costs one
-unit per PURCHASE too — a request carrying a verifiable payment is neither charged nor refused for exhaustion.
+read (the 429 above), and the unit is spent once the legal answer is DEFINITIVE. The 402 a passing check leads to is
+charged; the paid request that follows is exempt ONLY because it is SERVED — that skip needs a payment we can verify
+locally (recipient, amount, expiry, signature, unspent nonce) AND a settlement that succeeds. Everything else charges:
+both legal 403s whatever rode along, and a payment that fails to settle; only the 503 charges nothing, so
+`X-AGENTKIT-AUTHORIZATION` is absent from it. Each issued 402 buys exactly ONE paid attempt: past that a
+payment-carrying request is refused 429 before the facilitator and before the Arc reads, capping settle attempts per
+human per window at the allowance. `accountable-only` gets that bound and one unit per PURCHASE, refusals unchanged.
 
 Served: `X-AGENTKIT-HUMAN`, `X-AGENTKIT-AUTHORIZATION: <used>/<limit>` and `X-NOVI-LEGAL-BODY: <agentId>` (omitted,
 never blank, when the record has no agent id) — all three already on the 402 invoice a passing check leads to. The 200

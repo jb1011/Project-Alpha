@@ -746,7 +746,14 @@ describe("legal-bodies-only trust policy", () => {
 
   test("ACTIVE + a valid payment -> 200 with the header and legalBody on the receipt", async () => {
     const { deps } = legalDeps(asBody("active"));
-    const res = await legalApp(deps).request("/x402-demo/quote", {
+    const app = legalApp(deps);
+    // The 402 first, as a buyer always gets: it charges the unit that is this purchase's invoice,
+    // and an invoice is what entitles the paying request below to be acted on at all (FP-R1).
+    const quoted = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402);
+    const res = await app.request("/x402-demo/quote", {
       headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
     });
     expect(res.status).toBe(200);
@@ -763,7 +770,12 @@ describe("legal-bodies-only trust policy", () => {
 
   test("an active body with no agent id yet -> served, header omitted rather than faked", async () => {
     const { deps } = legalDeps(asBody("active", null));
-    const res = await legalApp(deps).request("/x402-demo/quote", {
+    const app = legalApp(deps);
+    expect(
+      (await app.request("/x402-demo/quote", { headers: { agentkit: await realAgentkitHeader() } }))
+        .status,
+    ).toBe(402); // the invoice the payment answers (FP-R1)
+    const res = await app.request("/x402-demo/quote", {
       headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
     });
     expect(res.status).toBe(200);
@@ -849,16 +861,20 @@ describe("legal-bodies-only trust policy", () => {
     expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
   });
 
-  test("a served request is charged at most once — and a paying request not at all (R2)", async () => {
-    // A one-shot proof+payment: nothing quoted this buyer a 402, so no unit was spent on its
-    // behalf and none is spent here either. The rule is "the 402 pays the unit"; a client that
-    // skips the 402 skips the charge, and it is paying real USDC for the privilege.
-    const { deps } = legalDeps(asBody("active"));
+  test("a one-shot proof+payment has no invoice to answer: 429, not free service (R2/FP-R1)", async () => {
+    // This used to be SERVED for nothing ("the 402 pays the unit; a client that skips the 402
+    // skips the charge"), which also skipped every bound the meter provides: an authorization is
+    // free to sign, so nothing stopped one human from sending them all day. A payment answers an
+    // invoice, and nothing quoted this buyer — so it is refused before the legal read and before
+    // the facilitator. The buyer's fix is the ordinary one: ask for a quote.
+    const { deps, seen } = legalDeps(asBody("active"));
     const res = await legalApp(deps).request("/x402-demo/quote", {
       headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
     });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("0/2");
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as { error: string }).error).toBe("rate-capped");
+    expect(seen).toEqual([]);
+    expect(store.tryIncrementUsage(HUMAN, RESOURCE_URL, 0, Date.now()).used).toBe(0);
   });
 
   // ── one purchase, one unit (re-review R2) ──────────────────────────────────────────────────
@@ -983,6 +999,14 @@ describe("legal-bodies-only trust policy", () => {
   test("a signed-but-unfunded payment buys no free refusal: the refused request is charged (F2)", async () => {
     const { deps, seen } = legalDeps({ kind: "none" });
     const app = legalApp(deps);
+    // The refusal this buyer already collected: it charges the first unit, and a unit charged in
+    // this window is the invoice that lets a payment-carrying request be evaluated at all (FP-R1).
+    const proofOnly = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(proofOnly.status).toBe(403);
+    expect(used()).toBe(1);
+
     // One authorization, signed once, replayed — the shape the finder used to get six free reads.
     const signed = await payment(10_000n);
 
@@ -991,40 +1015,61 @@ describe("legal-bodies-only trust policy", () => {
     });
     expect(first.status).toBe(403);
     expect(((await first.json()) as { error: string }).error).toBe("legal_body_required");
-    expect(first.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
-    expect(used()).toBe(1);
+    expect(first.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
+    expect(used()).toBe(2); // the budget really moves: a refusal is not free because it paid
 
-    // The budget really moves, so the wall cannot be hammered for free.
+    // The second replay still gets a hearing — its own refusal charged the invoice it answers —
+    // but the charge is capped now, so this is the last one.
     const second = await app.request("/x402-demo/quote", {
       headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": signed },
     });
     expect(second.status).toBe(403);
     expect(second.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
     expect(used()).toBe(2);
-    expect(seen.length).toBe(2); // two definitive legal reads, two units
+    expect(seen.length).toBe(3); // three definitive legal reads, two units — and then:
+
+    // …the hammer stops, in front of the chain read: no budget left to charge, so no invoice left
+    // to answer (FP-R1).
+    const third = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": signed },
+    });
+    expect(third.status).toBe(429);
+    expect(seen.length).toBe(3);
   });
 
   test("a suspended body refuses a paying request too, and charges it (F2)", async () => {
     const { deps } = legalDeps(asBody("inactive"));
-    const res = await legalApp(deps).request("/x402-demo/quote", {
+    const app = legalApp(deps);
+    // Its own earlier refusal is the charge this payment-carrying request answers (FP-R1).
+    expect(
+      (await app.request("/x402-demo/quote", { headers: { agentkit: await realAgentkitHeader() } }))
+        .status,
+    ).toBe(403);
+    const res = await app.request("/x402-demo/quote", {
       headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
     });
     expect(res.status).toBe(403);
     expect(((await res.json()) as { reason: string }).reason).toBe("legal-body-inactive");
-    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
   });
 
   test("a payment that FAILS to settle is charged its unit — the seller did the work (F2)", async () => {
     const { deps } = legalDeps(asBody("active"));
-    const res = await unfundedWall("legal-bodies-only", deps).request("/x402-demo/quote", {
+    const app = unfundedWall("legal-bodies-only", deps);
+    const quoted = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402); // the invoice, charged (FP-R1)
+    const res = await app.request("/x402-demo/quote", {
       headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
     });
     expect(res.status).toBe(402);
     expect(((await res.json()) as { error: string }).error).toBe(
       "settle-failed:insufficient-funds",
     );
-    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
-    expect(used()).toBe(1);
+    // Charged: the attempt was spent AND the request pays for itself, because nothing settled.
+    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
+    expect(used()).toBe(2);
   });
 
   test("a settled purchase is still ONE unit: charged on the 402, never again on the 200 (F2)", async () => {
@@ -1062,6 +1107,175 @@ describe("legal-bodies-only trust policy", () => {
     );
     expect(unfunded.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
     expect(used()).toBe(2);
+  });
+
+  // ── one paid attempt per issued invoice (ruling FP-R1) ─────────────────────────────────────
+  //
+  // The exemption above is what makes a purchase cost one unit — and, on its own, it also takes
+  // the paying half OUT of the meter entirely. Signing an EIP-3009 authorization costs nothing
+  // and needs no balance, so a human whose allowance was gone could send one payment-carrying
+  // request after another and reach the FACILITATOR every time (and, under this policy, two Arc
+  // reads before it). The same loop executed against origin/main's own seller gives
+  // `402×3 then 429×7`: main bounded facilitator calls per human per window by charging inside
+  // the verify, and this branch had loosened that. The bound is back as a second counter on the
+  // same window and the same key: each unit charged there buys exactly ONE paid attempt, claimed
+  // before the legal read and before settlement, so a settlement that fails has spent it just as
+  // surely as one that succeeds.
+
+  /** A strict wall with a COUNTED facilitator and a chosen allowance. */
+  function meteredWall(opts: {
+    trustPolicy: "accountable-only" | "legal-bodies-only";
+    allowancePerHuman: number;
+    legalBody?: SellerLegalBodyConfig;
+    settleOk?: boolean;
+  }) {
+    const settleCalls: string[] = [];
+    const a = new Hono();
+    a.route(
+      "/",
+      buildPaywall({
+        trustPolicy: opts.trustPolicy,
+        price: 10_000n,
+        payTo: PAYOUT,
+        asset: arcBatchingConfig.asset,
+        network: "eip155:5042002",
+        resource: "/x402-demo/quote",
+        resourceUrl: RESOURCE_URL,
+        agentkit: cfg({ allowancePerHuman: opts.allowancePerHuman }),
+        legalBody: opts.legalBody,
+        settle: async (header: string) => {
+          settleCalls.push(header);
+          return opts.settleOk
+            ? { ok: true as const, transferId: "0xdead" }
+            : { ok: false as const, reason: "insufficient-funds" };
+        },
+        serve: () => ({ quote: "demo" }),
+      }),
+    );
+    return { app: a, settleCalls };
+  }
+
+  /** A fresh proof and a fresh, freely-signed authorization — what the loop costs an attacker. */
+  const paidRequest = async (app: Hono) =>
+    app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+
+  test("an exhausted human gets one paid attempt per unit charged, then 429 (FP-R1)", async () => {
+    const { deps, seen } = legalDeps(asBody("active"));
+    const { app, settleCalls } = meteredWall({
+      trustPolicy: "legal-bodies-only",
+      allowancePerHuman: 3,
+      legalBody: deps,
+    });
+    // Three units charged in this window, as three earlier 402s would have — the human is at its
+    // cap and every request below carries a payment it signed for free.
+    for (let i = 0; i < 3; i++)
+      expect(store.tryIncrementUsage(HUMAN, RESOURCE_URL, 3, Date.now()).allowed).toBe(true);
+
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) statuses.push((await paidRequest(app)).status);
+
+    // Three invoices, three attempts at them: exactly main's cap, restored.
+    expect(statuses).toEqual([402, 402, 402, 429, 429, 429, 429, 429, 429, 429]);
+    expect(settleCalls).toHaveLength(3);
+    // …and the seven refusals never reached the chain either: the claim is in FRONT of the legal
+    // read, not behind it, so a hammer costs no Arc reads once its invoices are answered.
+    expect(seen).toHaveLength(3);
+  });
+
+  test("the 429 is the ordinary rate-cap body, with the human named (FP-R1)", async () => {
+    const { deps } = legalDeps(asBody("active"));
+    const { app, settleCalls } = meteredWall({
+      trustPolicy: "legal-bodies-only",
+      allowancePerHuman: 1,
+      legalBody: deps,
+    });
+    const res = await paidRequest(app); // nothing quoted it: no invoice, no attempt
+    expect(res.status).toBe(429);
+    expect(await res.json()).toEqual({
+      error: "rate-capped",
+      detail: "per-human request budget exhausted for this window",
+    });
+    expect(res.headers.get("X-AGENTKIT-HUMAN")).toBe(HUMAN);
+    expect(settleCalls).toHaveLength(0);
+  });
+
+  test("accountable-only is bounded by the same line — this is main's cap (FP-R1)", async () => {
+    const { app, settleCalls } = meteredWall({
+      trustPolicy: "accountable-only",
+      allowancePerHuman: 3,
+    });
+    for (let i = 0; i < 3; i++)
+      expect(store.tryIncrementUsage(HUMAN, RESOURCE_URL, 3, Date.now()).allowed).toBe(true);
+
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) statuses.push((await paidRequest(app)).status);
+    expect(statuses).toEqual([402, 402, 402, 429, 429, 429, 429, 429, 429, 429]);
+    expect(settleCalls).toHaveLength(3);
+  });
+
+  test("a budget of ONE still completes a purchase, and the NEXT payment is 429 (FP-R1)", async () => {
+    // The acceptance shape at the tightest meter: the invoice the 402 charged is the one attempt
+    // the buyer needs, so the bound cannot 429 a buyer mid-payment.
+    const { deps } = legalDeps(asBody("active"));
+    const { app, settleCalls } = meteredWall({
+      trustPolicy: "legal-bodies-only",
+      allowancePerHuman: 1,
+      legalBody: deps,
+      settleOk: true,
+    });
+    const quoted = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402);
+    expect(quoted.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/1");
+
+    const served = await paidRequest(app);
+    expect(served.status).toBe(200);
+    expect(settleCalls).toHaveLength(1);
+
+    // A second payment on the same window has no invoice behind it (and no budget to buy one).
+    const again = await paidRequest(app);
+    expect(again.status).toBe(429);
+    expect(settleCalls).toHaveLength(1);
+  });
+
+  test("a payment after a completed purchase is refused before the facilitator (FP-R1)", async () => {
+    // Budget deliberately larger than the purchase needs, so the ONLY thing refusing the second
+    // payment is that the 402 it already answered was the one invoice it had.
+    const { deps } = legalDeps(asBody("active"));
+    const { app, settleCalls } = meteredWall({
+      trustPolicy: "legal-bodies-only",
+      allowancePerHuman: 3,
+      legalBody: deps,
+      settleOk: true,
+    });
+    const quoted = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402);
+    const signed = await payment(10_000n);
+    const served = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": signed },
+    });
+    expect(served.status).toBe(200);
+    expect(settleCalls).toHaveLength(1);
+    expect(used()).toBe(1);
+
+    // A freshly signed authorization: no 402 stands behind it -> 429, and nothing is settled.
+    const again = await paidRequest(app);
+    expect(again.status).toBe(429);
+    expect(settleCalls).toHaveLength(1);
+
+    // The SAME authorization again is refused by the older seen-nonce guard instead — a different
+    // door, the same outcome: the facilitator is never called twice for one authorization.
+    const replayed = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": signed },
+    });
+    expect(replayed.status).toBe(402);
+    expect(((await replayed.json()) as { error: string }).error).toBe("replay");
+    expect(settleCalls).toHaveLength(1);
   });
 
   test("no agentkit config -> 503, never an OPEN seller under the strictest policy (R4)", async () => {

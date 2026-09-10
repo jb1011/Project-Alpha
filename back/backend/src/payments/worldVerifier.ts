@@ -164,6 +164,32 @@ export function chargeAllowance(
 }
 
 /**
+ * Claim the ONE paid attempt an issued invoice buys (ruling FP-R1).
+ *
+ * The companion to `chargeAllowance`, on the same key and the same window: a unit charged in this
+ * window (the 402 that quoted a purchase, or a refusal that did the work) entitles the human to
+ * exactly one payment-carrying request. The claim is made BEFORE the payment is acted on, so a
+ * settlement that fails has spent the attempt as surely as one that succeeds — otherwise a signed
+ * but unfunded authorization, which costs nothing to mint, would buy an unbounded number of
+ * facilitator calls from an exempted paying request.
+ *
+ * `allowed: false` means no invoice is outstanding: nothing was charged in this window that this
+ * payment could be answering. The caller turns that into the same 429 an exhausted human gets.
+ */
+export function claimPaidAttempt(
+  cfg: AgentkitSellerConfig,
+  humanId: string,
+): { allowed: boolean; paidAttempts: number; unitsCharged: number } {
+  const now = cfg.now ?? Date.now;
+  return cfg.store.tryConsumePaidAttempt(
+    humanId,
+    cfg.rateKey ?? cfg.resourceUrl,
+    now(),
+    cfg.rateWindowMs,
+  );
+}
+
+/**
  * Verify an inbound `agentkit` header and decide authorization.
  *
  * FAIL-CLOSED: any parse/validation/signature/RPC problem returns `authorized: false`, which

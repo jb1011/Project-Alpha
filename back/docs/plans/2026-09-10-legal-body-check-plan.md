@@ -35,7 +35,8 @@ Rules: D4, D5, D7, D8. The configured prod wall is untouched and the pinned wall
 `X402_TRUST_POLICY`. `accountable-only` is untouched in its REFUSALS, but not in its meter: the T6
 fix round put the paying-request exemption in `seller.ts`, outside the legal gate, so that policy now
 costs one unit per purchase instead of one per verified request — kept deliberately (ruling FP-F4),
-recorded in design §8 and the runbook. Fix round 1 (rulings T3-R1…R7) also touched
+recorded in design §8 and the runbook. Its facilitator-call cap comes back with the paid-attempt
+bound (ruling FP-R1, design §8): one paid attempt per unit charged, claimed before the facilitator. Fix round 1 (rulings T3-R1…R7) also touched
 `src/payments/worldVerifier.ts` (the `chargeAllowance` seam), `src/api/main.ts`, `.env.example` (the
 new optional `PUBLIC_API_URL`) and `interface/src/lib/proxyHeaders.ts` (`x-novi-legal-body` on the
 response allowlist) — see design §8.

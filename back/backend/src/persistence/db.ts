@@ -520,11 +520,15 @@ export function migrate(db: Database.Database): void {
 
     -- Per-human AUTHORIZATION allowance per resource (NOT a discount/perk — an execution
     -- limit inside the legal-body governance flow).
+    -- paid_attempts is the second half of that limit (ruling FP-R1): how many of the units
+    -- charged in the CURRENT window have already been answered by a payment-carrying request.
+    -- One row, one transaction, one window anchor (updated_at) for both counters.
     CREATE TABLE IF NOT EXISTS world_usage (
-      human_id   TEXT NOT NULL,
-      resource   TEXT NOT NULL,
-      used       INTEGER NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL,
+      human_id      TEXT NOT NULL,
+      resource      TEXT NOT NULL,
+      used          INTEGER NOT NULL DEFAULT 0,
+      paid_attempts INTEGER NOT NULL DEFAULT 0,
+      updated_at    INTEGER NOT NULL,
       PRIMARY KEY (human_id, resource)
     );
 
@@ -878,6 +882,15 @@ export function migrate(db: Database.Database): void {
   );
   db.exec("CREATE INDEX IF NOT EXISTS idx_documents_entity ON documents(entity_key)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_documents_company ON documents(company_id)");
+
+  // The per-human meter's second counter (ruling FP-R1). DEFAULT 0 is the right value for every
+  // existing row: no paid attempt has been claimed against the units it already carries, so the
+  // first payment-carrying request in the window still gets the attempt its 402 bought.
+  const usageCols = (db.prepare("PRAGMA table_info(world_usage)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!usageCols.includes("paid_attempts"))
+    db.exec("ALTER TABLE world_usage ADD COLUMN paid_attempts INTEGER NOT NULL DEFAULT 0");
 
   const akCols = (db.prepare("PRAGMA table_info(api_keys)").all() as { name: string }[]).map(
     (c) => c.name,

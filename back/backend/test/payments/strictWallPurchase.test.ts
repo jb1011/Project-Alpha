@@ -244,8 +244,14 @@ test("the wall still refuses an agent no legal body stands behind, after its pro
 // second request — the seller charges the human for it, and a purchase costs two of the three
 // units prod gives a human per 24 h.
 
-test("a completed purchase costs exactly ONE unit through the wrapper", async () => {
-  const { requests, fetchImpl } = wall();
+test("a completed purchase costs exactly ONE unit and ONE settle through the wrapper", async () => {
+  const settleCalls: string[] = [];
+  const { requests, fetchImpl } = wall({
+    settle: async (header: string) => {
+      settleCalls.push(header);
+      return { ok: true as const, transferId: "0xdead" };
+    },
+  });
   const signer = agentkitSignerFromKey(POCKET_KEY, CHAIN_ID);
   const res = await buyWithX402(
     {
@@ -260,6 +266,9 @@ test("a completed purchase costs exactly ONE unit through the wrapper", async ()
   expect(unitsUsed()).toBe(1);
   // Three requests, not four: refused, quoted, served.
   expect(requests.map((r) => r.status)).toEqual([403, 402, 200]);
+  // And ONE facilitator call for that one unit: the 402 charged the unit, the unit bought the one
+  // paid attempt, and the attempt was spent settling this purchase (ruling FP-R1).
+  expect(settleCalls).toHaveLength(1);
 });
 
 test("a refused purchase costs exactly ONE unit, and a 503 costs none", async () => {
