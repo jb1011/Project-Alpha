@@ -75,7 +75,7 @@ refusal bodies, verbatim (`payments/seller.ts`, re-verified at HEAD):
 
 **The per-human meter, under this policy only.** Exhaustion is checked BEFORE any chain read (an exhausted human
 gets the 429 above and no Arc read happens); the unit is spent only once the legal answer is DEFINITIVE — on the
-402 invoice a passing check leads to, and on both legal 403s, since a refusal still cost a signature check, an
+402 invoice a passing check leads to (the paid request that follows, carrying a valid payment, is never charged again, so a completed purchase costs one unit), and on both legal 403s, since a refusal still cost a signature check, an
 AgentBook read and two Arc reads — and NEVER on the 503, whose retry must stay free (the store has no release).
 `X-AGENTKIT-AUTHORIZATION` reports the charge, so it is absent from the 503; `accountable-only` still charges
 inside the proof verification, unchanged.
@@ -115,7 +115,7 @@ purchase — so the wall answers **403** `human_backing_required` / `no-proof-pr
 `extensions.agentkit`; (2) the buyer mints the proof from it with the agent's own pocket AgentKit signer (World Chain,
 `eip155:480`) and retries the SAME request ONCE with it, signing nothing for money;
 (3) human-backed AND a legal body → **402** invoice, already carrying `X-AGENTKIT-HUMAN`, `X-AGENTKIT-AUTHORIZATION`
-and `X-NOVI-LEGAL-BODY: 843704`; (4) authorize → the paid retry keeps the proof header and adds `X-PAYMENT` →
+and `X-NOVI-LEGAL-BODY: 843704`; (4) authorize → the paid retry carries a FRESH proof minted from the 402's own challenge (the seller consumes each nonce on first use) and adds `X-PAYMENT` →
 **200**, same header, `legalBody: {"agentId":"843704"}` in the body, and `pay` returns `{"ok":true,
 "txOrTransferId":"<settlement id>"}`. Pay the `api.novicorpus.com` URL: on the proxy that header is dropped unless
 the interface at HEAD is live.
