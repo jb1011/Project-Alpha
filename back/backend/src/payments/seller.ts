@@ -230,11 +230,24 @@ export function buildPaywall(cfg: PaywallConfig) {
     };
     /** Is this request the PAYING half of a purchase whose 402 we already charged a unit for?
      *  Only a payment that actually verifies and is not a replay counts — junk must not buy a free
-     *  trip through the gate, or a human-backed agent could hammer the legal check for nothing. */
+     *  trip through the gate, or a human-backed agent could hammer the legal check for nothing.
+     *
+     *  Note what this does NOT establish: that the payment is FUNDED. `verifyPayment` is local
+     *  crypto over an EIP-3009 authorization — signing one costs nothing and needs no balance — so
+     *  `paying` is a promise to pay, and the meter exemption belongs to the promise that was KEPT
+     *  (see `spendUnit`). */
     const payingRequest = async () => {
       const v = await checkPayment();
       return !!v && v.ok && !seen.has(v.nonce);
     };
+    /** Spend this request's unit, at most once, and put the receipt on the response.
+     *
+     *  Set only inside the strict gate, and only for a request whose charge is DEFERRED: one that
+     *  carries a verifiable payment, and is therefore exempt ONLY if that payment settles and the
+     *  request is served. `undefined` everywhere else means the charge is already decided — spent
+     *  inside the verify (`accountable-only`), spent at the legal decision, or rightly not spent
+     *  at all (a 503 is our failure, and the store has no release). */
+    let spendUnit: (() => { allowed: boolean; used: number; limit: number }) | undefined;
 
     // ── accountable-only: accountability is a PRECONDITION of commerce ──────────────────────
     // No valid proof of a human backer -> refused outright; their money is not wanted (403,
@@ -286,6 +299,31 @@ export function buildPaywall(cfg: PaywallConfig) {
       c.header("X-AGENTKIT-HUMAN", outcome.humanId);
       if (!legalGate) c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
 
+      // ── WHEN the unit is spent (final pass F2) ──────────────────────────────────────────────
+      // An X-PAYMENT header is a promise, not a payment: it verifies locally with no funds behind
+      // it, and on a refusal its nonce is never consumed, so ONE signed authorization used to make
+      // every refusal free while this seller kept doing the work — an AgentBook read and, under
+      // the legal gate, two Arc reads per request. The exemption is therefore not "this request
+      // carries a payment" but "this payment SETTLED and we served the request", which is only
+      // known at the bottom of this handler. So a paying request defers its charge and spends it
+      // at every other exit: both legal 403s, a re-quoted 402, a settlement that failed. A
+      // purchase still costs exactly one unit — the one its 402 spent.
+      //
+      // Deliberate delta for `accountable-only` too (ruling FP-F4, and the one thing about that
+      // policy this branch changes): it used to charge inside the verify on EVERY verified
+      // request, so a purchase cost it two units; now the paying half is exempt when it is served
+      // and charged when it is not. Refusals are unchanged, in both policies: still one unit.
+      const humanId = outcome.humanId;
+      let spent: { allowed: boolean; used: number; limit: number } | undefined;
+      const charge = () => {
+        if (!spent) {
+          spent = chargeAllowance(cfg.agentkit as AgentkitSellerConfig, humanId);
+          c.header("X-AGENTKIT-AUTHORIZATION", `${spent.used}/${spent.limit}`);
+        }
+        return spent;
+      };
+      if (paying) spendUnit = charge;
+
       // ── legal-bodies-only: the SECOND question ───────────────────────────────────────────
       // A human vouches for this agent — now, does a registered legal body stand behind the
       // address that is about to pay? The address checked is the PROOF'S SIGNER, never anything
@@ -306,25 +344,35 @@ export function buildPaywall(cfg: PaywallConfig) {
 
         // The answer is definitive, so the request is charged whichever way it went: a refusal
         // still cost a signature verification, an AgentBook read and two Arc reads, and an
-        // unregistered agent must not be able to hammer this wall for free. The one exception is
-        // the paying half of a purchase — its 402 was charged a moment ago (see `paying` above).
-        const charged = paying
-          ? { used: outcome.used, limit: outcome.limit, allowed: true }
-          : chargeAllowance(cfg.agentkit as AgentkitSellerConfig, outcome.humanId);
-        c.header("X-AGENTKIT-AUTHORIZATION", `${charged.used}/${charged.limit}`);
-
-        if (resolved.kind === "none")
+        // unregistered agent must not be able to hammer this wall for free — with or without a
+        // payment header riding along (F2). `charge()` is the one place a unit is spent, and it
+        // spends at most one per request.
+        if (resolved.kind === "none") {
+          charge();
           return c.json(await legalRefusal("not-legal-body", outcome.agentAddress), 403);
-        if (resolved.standing === "inactive")
+        }
+        if (resolved.standing === "inactive") {
+          charge();
           return c.json(await legalRefusal("legal-body-inactive", outcome.agentAddress), 403);
-        // Lost a race with a concurrent request for the same human (the meter is transactional,
-        // so it can never exceed the limit — the loser is simply told so). Same 429 the peek
-        // above would have produced a moment earlier.
-        if (!charged.allowed)
-          return c.json(
-            { error: "rate-capped", detail: "per-human request budget exhausted for this window" },
-            429,
-          );
+        }
+        // Standing is good, so this request will be quoted or served. A paying one keeps its
+        // charge deferred (it is spent below unless the payment actually settles) and reports
+        // where the human stands; every other one spends its unit here.
+        if (paying) c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
+        else {
+          const charged = charge();
+          // Lost a race with a concurrent request for the same human (the meter is transactional,
+          // so it can never exceed the limit — the loser is simply told so). Same 429 the peek
+          // above would have produced a moment earlier.
+          if (!charged.allowed)
+            return c.json(
+              {
+                error: "rate-capped",
+                detail: "per-human request budget exhausted for this window",
+              },
+              429,
+            );
+        }
         legalBodyAgentId = resolved.entity.agentId ?? null;
         // Named on the receipt, not merely implied by a 200. Omitted rather than faked when the
         // record has no agent id yet — an empty header value is a claim we cannot support.
@@ -357,8 +405,18 @@ export function buildPaywall(cfg: PaywallConfig) {
     const header = paymentHeader;
     if (!header) return c.json(await challenge(), 402);
     const v = (await checkPayment()) as VerifyResult;
-    if (!v.ok) return c.json({ ...(await challenge()), error: v.reason }, 402);
-    if (seen.has(v.nonce)) return c.json({ ...(await challenge()), error: "replay" }, 402);
+    // Every exit from here down that is not a SERVED request spends the deferred unit (F2): the
+    // gate work was done, and only a payment that lands buys the exemption. (`spendUnit` is set
+    // only for a request whose payment verified, so the two 402s below are its race cases; the
+    // settlement failure is the real one — an unfunded authorization.)
+    if (!v.ok) {
+      spendUnit?.();
+      return c.json({ ...(await challenge()), error: v.reason }, 402);
+    }
+    if (seen.has(v.nonce)) {
+      spendUnit?.();
+      return c.json({ ...(await challenge()), error: "replay" }, 402);
+    }
     seen.add(v.nonce);
     if (cfg.settle) {
       const r = await cfg.settle(header, {
@@ -375,8 +433,12 @@ export function buildPaywall(cfg: PaywallConfig) {
         },
         resourceUrl: cfg.resourceUrl ?? cfg.resource ?? "/api/insight",
       });
-      if (!r.ok)
+      if (!r.ok) {
+        // The payment never landed, so this request bought nothing and pays for itself like any
+        // other (F2) — an unfunded authorization is the attack this closes.
+        spendUnit?.();
         return c.json({ ...(await challenge()), error: `settle-failed:${r.reason ?? ""}` }, 402);
+      }
       if (r.transferId) c.header("X-PAYMENT-RESPONSE", r.transferId);
     }
     const served = (await cfg.serve(c.req.raw)) as Record<string, unknown>;

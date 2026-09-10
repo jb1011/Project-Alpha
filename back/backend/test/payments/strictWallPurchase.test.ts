@@ -12,6 +12,7 @@ import { makeSignX402 } from "../../src/adapters/x402/signX402";
 import { buyWithX402 } from "../../src/payments/buyer";
 import type { LegalBodyResolution } from "../../src/payments/legalBody";
 import { buildPaywall } from "../../src/payments/seller";
+import type { SettleFn } from "../../src/payments/settle";
 import { migrate } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
 import type { Address } from "../../src/types";
@@ -55,7 +56,9 @@ function unitsUsed(): number {
 }
 
 /** The wall, plus a fetch that reaches it — counting what the seller actually sees. */
-function wall(opts: { allowancePerHuman?: number; legal?: LegalBodyResolution } = {}) {
+function wall(
+  opts: { allowancePerHuman?: number; legal?: LegalBodyResolution; settle?: SettleFn } = {},
+) {
   const requests: Array<{ proof: boolean; payment: boolean; status: number }> = [];
   const app = new Hono();
   app.route(
@@ -82,6 +85,7 @@ function wall(opts: { allowancePerHuman?: number; legal?: LegalBodyResolution } 
         onboardUrl: "https://www.example/",
         transparencyUrl: "https://www.example/transparency",
       },
+      ...(opts.settle ? { settle: opts.settle } : {}),
       serve: () => ({ quote: "demo" }),
     }),
   );
@@ -363,4 +367,27 @@ test("a NON-strict AgentKit seller is untouched: the wrapper still answers its 4
   expect(requests[0]?.proof).toBe(false); // never on the first request
   expect(requests.map((r) => r.status)).toEqual([402, 200]);
   expect(unitsUsed()).toBe(1);
+});
+
+test("an unfunded payment costs a unit: the purchase dies at settlement, not for free (F2)", async () => {
+  // The whole attack in one purchase: signing an EIP-3009 authorization needs no USDC, and until
+  // this fix the paying request was exempt from the meter on the strength of that signature alone.
+  const { requests, fetchImpl } = wall({
+    settle: async () => ({ ok: false as const, reason: "insufficient-funds" }),
+  });
+  const signer = agentkitSignerFromKey(POCKET_KEY, CHAIN_ID);
+  const res = await buyWithX402(
+    {
+      fetchImpl: wrapFetchWithAgentkit(fetchImpl, signer),
+      directFetch: fetchImpl,
+      authorize: await authorizeReal(),
+      agentkitSigner: signer,
+    },
+    RESOURCE_URL,
+  );
+  expect(res.status, JSON.stringify(requests)).toBe(402);
+  expect(((await res.json()) as { error: string }).error).toBe("settle-failed:insufficient-funds");
+  // One unit for the 402 that quoted it, one for the request that failed to settle.
+  expect(unitsUsed()).toBe(2);
+  expect(requests.map((r) => r.status)).toEqual([403, 402, 402]);
 });

@@ -6,6 +6,7 @@ import type { X402DemoDeps } from "../../src/api/routes/x402Demo";
 import { buildX402DemoDeps, mountX402DemoRoutes } from "../../src/api/routes/x402Demo";
 import type { Config } from "../../src/config/env";
 import { AGENT_BOOK_CHAIN_ID } from "../../src/payments/agentBookReader";
+import { buyWithX402 } from "../../src/payments/buyer";
 import type { LegalBodyResolution } from "../../src/payments/legalBody";
 import { migrate } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
@@ -270,4 +271,120 @@ test("buildX402DemoDeps carries PUBLIC_API_URL, falling back to the metadata bas
       publicApiUrl: "https://api.novicorpus.test",
     } as unknown as Config)?.publicApiUrl,
   ).toBe("https://api.novicorpus.test");
+});
+
+// ── the wall signs against the url it ADVERTISES (final pass F1) ──────────────────────────────
+//
+// `deps.agentkit.domain` is fixed once, from METADATA_BASE_URL's host. The pinned wall overrides
+// `resourceUrl` with its own (PUBLIC_API_URL-based) url, and `validateAgentkitMessage` compares the
+// signed `domain` against THAT url's hostname — so on the deploy the runbook prescribes (two
+// different hosts) every proof was refused "Domain mismatch: expected api…, got www…", i.e. the
+// wall could not accept a proof minted from its own challenge.
+
+const PUBLIC_API = "https://api.novicorpus.test";
+
+test("a proof minted from the wall's own challenge is accepted when PUBLIC_API_URL names another host (F1)", async () => {
+  const app = new Hono();
+  mountX402DemoRoutes(app, legalDemoDeps({ publicApiUrl: PUBLIC_API }));
+
+  const res = await app.request("/x402-demo/legal-bodies-wall", {
+    headers: { agentkit: await mintForWall(app, "/x402-demo/legal-bodies-wall") },
+  });
+
+  // Past the FIRST gate: the human was verified, and the only thing missing is the legal body.
+  // Before the fix this was 403 human_backing_required / invalid-message:Domain mismatch.
+  expect(res.status).toBe(403);
+  const body = (await res.json()) as { error: string; reason: string };
+  expect(body.error).toBe("legal_body_required");
+  expect(body.reason).toBe("not-legal-body");
+  expect(res.headers.get("X-AGENTKIT-HUMAN")).toBe(HUMAN);
+});
+
+test("the run's second leg is the legal refusal, not a domain mismatch, on the prescribed deploy (F1)", async () => {
+  const app = new Hono();
+  mountX402DemoRoutes(app, legalDemoDeps({ publicApiUrl: PUBLIC_API }));
+  const out = (await (await app.request("/x402-demo/legal-bodies-run")).json()) as { legs: Leg[] };
+  const agent = out.legs[1] as Leg;
+  expect(agent.skipped).toBeFalsy();
+  expect(agent.status).toBe(403);
+  // The public self-contradiction this pins: `expected` promises legal_body_required beside a leg
+  // that answered human_backing_required.
+  expect(agent.body?.error).toBe("legal_body_required");
+  expect(agent.body?.reason).toBe("not-legal-body");
+});
+
+test("our own buyer's origin check accepts the wall's challenge on the advertised host (F1)", async () => {
+  const app = new Hono();
+  mountX402DemoRoutes(app, legalDemoDeps({ publicApiUrl: PUBLIC_API }));
+  const wallUrl = `${PUBLIC_API}/x402-demo/legal-bodies-wall`;
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers =
+      input instanceof Request ? new Headers(input.headers) : new Headers(init?.headers ?? {});
+    if (input instanceof Request)
+      new Headers(init?.headers ?? {}).forEach((v, k) => headers.set(k, v));
+    const url = input instanceof Request ? input.url : String(input);
+    return app.request(new URL(url).pathname, { headers });
+  }) as typeof fetch;
+
+  const err = await buyWithX402(
+    {
+      fetchImpl,
+      directFetch: fetchImpl,
+      authorize: async () => ({ ok: false as const, reason: "never-reached" }),
+      agentkitSigner: agentkitSignerFromKey(PROOF_KEY, AGENT_BOOK_CHAIN_ID),
+    },
+    wallUrl,
+  ).catch((e: Error) => e);
+
+  // The buyer refuses to sign a challenge that names another site (T6-R3). A wall whose challenge
+  // says `www` while the url being bought says `api` is exactly that, so leg 3 died here — before
+  // any payment — rather than at the seller.
+  expect((err as Error).message).not.toContain("challenge-origin-mismatch");
+  expect((err as Error).message).toContain("resource-403-after-proof");
+  expect((err as Error).message).toContain("legal_body_required");
+});
+
+// ── the configured policy survives a missing World config (final pass C3) ─────────────────────
+//
+// `trustPolicy` used to be assigned only inside main.ts's `cfg.worldChain` block, so a box that
+// dropped its World config while its env still said `legal-bodies-only` ran `open` — the documented
+// fail-closed 503 was unreachable from the composition root, and neither mount warning printed.
+
+test("X402_TRUST_POLICY reaches the deps even with no World config (C3)", () => {
+  const base = {
+    enableX402Demo: true,
+    x402DemoPayTo: DEPS.payTo,
+    usdc: DEPS.asset,
+    chainId: 5042002,
+    x402DemoPriceUsdc: "0.01",
+    gatewayFacilitatorUrl: DEPS.facilitatorUrl,
+    metadataBaseUrl: "https://example.test/backend",
+  };
+  expect(buildX402DemoDeps(base as unknown as Config)?.trustPolicy).toBe("open");
+  expect(
+    buildX402DemoDeps({
+      ...base,
+      x402TrustPolicy: "legal-bodies-only",
+    } as unknown as Config)?.trustPolicy,
+  ).toBe("legal-bodies-only");
+});
+
+test("legal-bodies-only with no World config refuses 503 — never an OPEN seller (C3)", async () => {
+  const deps = buildX402DemoDeps({
+    enableX402Demo: true,
+    x402DemoPayTo: DEPS.payTo,
+    usdc: DEPS.asset,
+    chainId: 5042002,
+    x402DemoPriceUsdc: "0.01",
+    gatewayFacilitatorUrl: DEPS.facilitatorUrl,
+    metadataBaseUrl: "https://example.test/backend",
+    x402TrustPolicy: "legal-bodies-only",
+  } as unknown as Config) as X402DemoDeps;
+  // Exactly what main.ts would have: no agentkit and no legal-body resolver, because both hang off
+  // the World config this box has lost.
+  const app = new Hono();
+  mountX402DemoRoutes(app, deps);
+  const res = await app.request("/x402-demo/quote");
+  expect(res.status).toBe(503);
+  expect(((await res.json()) as { error: string }).error).toBe("legal_body_check_unavailable");
 });

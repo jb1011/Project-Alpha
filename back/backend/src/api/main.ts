@@ -647,8 +647,14 @@ async function main() {
       rpcUrls: { [x402Demo.network]: cfg.rpcUrl, [AGENT_BOOK_CAIP2]: cfg.worldChain.rpcUrl },
       rateWindowMs: (cfg.worldRateWindowHours ?? 24) * 3_600_000,
     };
-    x402Demo.trustPolicy = cfg.x402TrustPolicy ?? "open";
     x402Demo.proofAgentKey = cfg.x402ProofAgentKey;
+  }
+  // The configured policy is carried by `buildX402DemoDeps` itself and therefore reaches the
+  // paywall whether or not the World config survived (final pass C3) — announced here, outside the
+  // block above, for the same reason: a box running `legal-bodies-only` with no World credentials
+  // must say so and refuse (503), not fall through to `open` in silence.
+  if (x402Demo) {
+    console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);
     if (x402Demo.trustPolicy === "accountable-only")
       console.warn("⚠ x402 seller policy: ACCOUNTABLE-ONLY — anonymous agents are refused (403)");
     if (x402Demo.trustPolicy === "legal-bodies-only")
@@ -656,8 +662,6 @@ async function main() {
         "⚠ x402 seller policy: LEGAL-BODIES-ONLY — only agents a registered legal body in good standing stands behind are served (403 otherwise)",
       );
   }
-  if (x402Demo)
-    console.warn(`⚠ x402 demo seller ENABLED at /x402-demo/quote (payTo ${x402Demo.payTo})`);
 
   // AgentBook (design 2026-08-25 v3), in two halves.
   //

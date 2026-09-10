@@ -50,10 +50,17 @@ export function buildX402DemoDeps(
     | "gatewayFacilitatorUrl"
     | "metadataBaseUrl"
     | "publicApiUrl"
+    | "x402TrustPolicy"
   >,
 ): X402DemoDeps | undefined {
   if (!cfg.enableX402Demo) return undefined;
   return {
+    // Resolved HERE, not beside the World config (final pass C3): the policy used to be assigned
+    // only inside main.ts's `cfg.worldChain` block, so a box that lost its World credentials while
+    // its own env still said `legal-bodies-only` ran `open` and sold to anonymous payers — the
+    // fail-closed 503 that policy promises was unreachable from the composition root. The seller's
+    // own `legalUnavailable` branch answers 503 once the policy actually reaches it.
+    trustPolicy: cfg.x402TrustPolicy ?? "open",
     // The API's own origin when the deployment names one; otherwise the base every other public
     // url here is built on, which keeps a single-host deployment behaving exactly as before.
     publicApiUrl: cfg.publicApiUrl ?? cfg.metadataBaseUrl,
@@ -203,7 +210,16 @@ export function mountX402DemoRoutes(
     const runUrl = `${demoBase}/legal-bodies-run`;
     const wallAgentkit = (rateKey: string, allowancePerHuman?: number) => ({
       ...(deps.agentkit as NonNullable<X402DemoDeps["agentkit"]>),
+      // Both derived from the url this wall ADVERTISES, never from the base `deps.agentkit` was
+      // built on (final pass F1). `mintAgentkitExtension` signs the challenge for `domain` and
+      // `resourceUri` (= this `resourceUrl`), and `validateAgentkitMessage` then requires
+      // `message.domain === new URL(resourceUrl).hostname` — so on the deploy the runbook
+      // prescribes, where PUBLIC_API_URL (api.…) and METADATA_BASE_URL (www.…) are different
+      // hosts, the wall minted challenges it could not itself accept: every proof came back
+      // "Domain mismatch", and our own buyer refused to sign one at all (its origin check binds
+      // the challenge to the url being bought — buyer.ts `assertChallengeOrigin`).
       resourceUrl: wallResourceUrl,
+      domain: new URL(wallResourceUrl).hostname,
       rateKey,
       ...(allowancePerHuman === undefined ? {} : { allowancePerHuman }),
     });

@@ -940,6 +940,130 @@ describe("legal-bodies-only trust policy", () => {
     expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
   });
 
+  // ── an X-PAYMENT header is a promise, not a payment (final pass F2) ────────────────────────
+  //
+  // `verifyPayment` is local crypto: recipient, amount, expiry and an EIP-712 signature. None of
+  // that needs a single USDC, and on a refusal the nonce is never consumed — so ONE signed
+  // authorization made every refusal free while the seller kept doing the AgentBook read and both
+  // Arc reads (the finder measured six refusals, zero units, twelve Arc reads). The exemption
+  // belongs to a purchase that actually SETTLED and was served, and nothing else.
+
+  /** Units of the human's budget spent on this resource so far (limit 0 never writes). */
+  const used = () => store.tryIncrementUsage(HUMAN, RESOURCE_URL, 0, Date.now()).used;
+
+  /** A wall whose settlement always fails, i.e. what an unfunded authorization really meets. */
+  function unfundedWall(
+    trustPolicy: "accountable-only" | "legal-bodies-only",
+    legalBody?: SellerLegalBodyConfig,
+    settleOk = false,
+  ) {
+    const a = new Hono();
+    a.route(
+      "/",
+      buildPaywall({
+        trustPolicy,
+        price: 10_000n,
+        payTo: PAYOUT,
+        asset: arcBatchingConfig.asset,
+        network: "eip155:5042002",
+        resource: "/x402-demo/quote",
+        resourceUrl: RESOURCE_URL,
+        agentkit: cfg(),
+        legalBody,
+        settle: async () =>
+          settleOk
+            ? { ok: true as const, transferId: "0xdead" }
+            : { ok: false as const, reason: "insufficient-funds" },
+        serve: () => ({ quote: "demo" }),
+      }),
+    );
+    return a;
+  }
+
+  test("a signed-but-unfunded payment buys no free refusal: the refused request is charged (F2)", async () => {
+    const { deps, seen } = legalDeps({ kind: "none" });
+    const app = legalApp(deps);
+    // One authorization, signed once, replayed — the shape the finder used to get six free reads.
+    const signed = await payment(10_000n);
+
+    const first = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": signed },
+    });
+    expect(first.status).toBe(403);
+    expect(((await first.json()) as { error: string }).error).toBe("legal_body_required");
+    expect(first.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+    expect(used()).toBe(1);
+
+    // The budget really moves, so the wall cannot be hammered for free.
+    const second = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": signed },
+    });
+    expect(second.status).toBe(403);
+    expect(second.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
+    expect(used()).toBe(2);
+    expect(seen.length).toBe(2); // two definitive legal reads, two units
+  });
+
+  test("a suspended body refuses a paying request too, and charges it (F2)", async () => {
+    const { deps } = legalDeps(asBody("inactive"));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { reason: string }).reason).toBe("legal-body-inactive");
+    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+  });
+
+  test("a payment that FAILS to settle is charged its unit — the seller did the work (F2)", async () => {
+    const { deps } = legalDeps(asBody("active"));
+    const res = await unfundedWall("legal-bodies-only", deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(res.status).toBe(402);
+    expect(((await res.json()) as { error: string }).error).toBe(
+      "settle-failed:insufficient-funds",
+    );
+    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+    expect(used()).toBe(1);
+  });
+
+  test("a settled purchase is still ONE unit: charged on the 402, never again on the 200 (F2)", async () => {
+    const { deps } = legalDeps(asBody("active"));
+    const app = unfundedWall("legal-bodies-only", deps, true);
+    const quoted = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402);
+    expect(quoted.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+    const served = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(served.status).toBe(200);
+    expect(served.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+    expect(used()).toBe(1);
+  });
+
+  test("accountable-only follows the SAME rule: settled purchase 1 unit, failed settlement charged (F2/F4)", async () => {
+    // The deliberate delta from `main` (ruling FP-F4): accountable-only used to charge inside the
+    // verify on EVERY verified request, so a purchase cost it two units. Now the paying half is
+    // exempt only when it is served, and a settlement that fails pays like any other request.
+    const failing = unfundedWall("accountable-only");
+    const quoted = await failing.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(quoted.status).toBe(402);
+    expect(quoted.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+    const unfunded = await failing.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(unfunded.status).toBe(402);
+    expect(((await unfunded.json()) as { error: string }).error).toBe(
+      "settle-failed:insufficient-funds",
+    );
+    expect(unfunded.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("2/2");
+    expect(used()).toBe(2);
+  });
+
   test("no agentkit config -> 503, never an OPEN seller under the strictest policy (R4)", async () => {
     // A box that loses its World config must not quietly start selling to anonymous payers while
     // its own env still says legal-bodies-only.
