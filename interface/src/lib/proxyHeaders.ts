@@ -44,6 +44,10 @@ export const FORWARDED_RESPONSE_HEADERS = [
   // Without these an authorized agent cannot read its own standing.
   "x-agentkit-human",
   "x-agentkit-authorization",
+  // The other half of that answer under the `legal-bodies-only` policy: which Novi legal body the
+  // seller verified stands behind the payer. Dropped here, a buyer that pays at the URL the wall
+  // itself advertises gets a 200 whose headline fact was stripped one hop earlier.
+  "x-novi-legal-body",
 ] as const;
 
 /**

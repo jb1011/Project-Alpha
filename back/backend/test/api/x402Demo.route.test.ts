@@ -1,9 +1,11 @@
 import Database from "better-sqlite3";
 import { Hono } from "hono";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
+import { agentkitSignerFromKey } from "../../src/adapters/worldid/agentkitSigner";
 import type { X402DemoDeps } from "../../src/api/routes/x402Demo";
 import { buildX402DemoDeps, mountX402DemoRoutes } from "../../src/api/routes/x402Demo";
 import type { Config } from "../../src/config/env";
+import { AGENT_BOOK_CHAIN_ID } from "../../src/payments/agentBookReader";
 import type { LegalBodyResolution } from "../../src/payments/legalBody";
 import { migrate } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
@@ -177,4 +179,95 @@ test("no legal-body resolver wired -> the wall refuses 503 rather than serving o
   const res = await app.request("/x402-demo/legal-bodies-wall");
   expect(res.status).toBe(503);
   expect(((await res.json()) as { error: string }).error).toBe("legal_body_check_unavailable");
+});
+
+/** Mint a real AgentKit header for `path` from that route's own 403 challenge. */
+async function mintForWall(app: Hono, path: string) {
+  const probe = await app.request(path);
+  const body = (await probe.json()) as { extensions?: { agentkit?: unknown } };
+  const { createAgentkitClient } = await import("@worldcoin/agentkit");
+  const client = createAgentkitClient({
+    signer: agentkitSignerFromKey(PROOF_KEY, AGENT_BOOK_CHAIN_ID),
+    // biome-ignore lint/suspicious/noExplicitAny: client options typing varies across SDK versions.
+  } as any) as { createHeader(ext: unknown): Promise<string> };
+  return client.createHeader(body.extensions?.agentkit);
+}
+
+test("the run survives repetition: four loads, four identical second legs (R2)", async () => {
+  // The failure this pins: the run's second leg spends a unit of the proof agent's allowance, and
+  // prod's default is 3 per 24 h — so from the fourth page view the endpoint would answer 429
+  // beside an `expected` block still promising 403, publicly contradicting itself mid-demo.
+  const app = new Hono();
+  mountX402DemoRoutes(app, legalDemoDeps());
+  // A second ahead of the real clock, which the challenge's `issuedAt` still reads (`new Date()`):
+  // frozen exactly at "now", the message is minted a few ms into the mocked future and refused.
+  let clock = Date.now() + 1_000;
+  const spy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+  try {
+    for (let i = 0; i < 4; i++) {
+      const res = await app.request("/x402-demo/legal-bodies-run");
+      expect(res.status, `run ${i + 1}`).toBe(200);
+      const leg = ((await res.json()) as { legs: Leg[] }).legs[1] as Leg;
+      expect(leg.status, `run ${i + 1}`).toBe(403);
+      expect(leg.body?.error, `run ${i + 1}`).toBe("legal_body_required");
+      expect(leg.body?.reason, `run ${i + 1}`).toBe("not-legal-body");
+      clock += 6_000; // past the run's own 5-second throttle
+    }
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("the run cannot spend the real wall's budget (R7.3)", async () => {
+  // One unit for the whole window: if the run charged the wall's meter, the buyer below would be
+  // rate-capped instead of receiving the legal-body refusal the wall exists to give.
+  const deps = legalDemoDeps();
+  const app = new Hono();
+  mountX402DemoRoutes(app, {
+    ...deps,
+    agentkit: { ...(deps.agentkit as NonNullable<X402DemoDeps["agentkit"]>), allowancePerHuman: 1 },
+  });
+
+  const run = await app.request("/x402-demo/legal-bodies-run");
+  expect(((await run.json()) as { legs: Leg[] }).legs[1]?.status).toBe(403);
+
+  const res = await app.request("/x402-demo/legal-bodies-wall", {
+    headers: { agentkit: await mintForWall(app, "/x402-demo/legal-bodies-wall") },
+  });
+  expect(res.status).not.toBe(429);
+  expect(((await res.json()) as { error: string }).error).toBe("legal_body_required");
+  expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/1"); // its own first unit
+});
+
+test("the wall and the run advertise the API's own origin when PUBLIC_API_URL is set (R1/R5)", async () => {
+  const app = new Hono();
+  mountX402DemoRoutes(app, legalDemoDeps({ publicApiUrl: "https://api.novicorpus.test" }));
+  const out = (await (await app.request("/x402-demo/legal-bodies-run")).json()) as {
+    resource: string;
+    runUrl: string;
+  };
+  // Not the www/backend proxy: it strips CORS, Cache-Control and X-NOVI-LEGAL-BODY.
+  expect(out.resource).toBe("https://api.novicorpus.test/x402-demo/legal-bodies-wall");
+  expect(out.runUrl).toBe("https://api.novicorpus.test/x402-demo/legal-bodies-run");
+});
+
+test("buildX402DemoDeps carries PUBLIC_API_URL, falling back to the metadata base", () => {
+  const base = {
+    enableX402Demo: true,
+    x402DemoPayTo: DEPS.payTo,
+    usdc: DEPS.asset,
+    chainId: 5042002,
+    x402DemoPriceUsdc: "0.01",
+    gatewayFacilitatorUrl: DEPS.facilitatorUrl,
+    metadataBaseUrl: "https://example.test/backend",
+  };
+  expect(buildX402DemoDeps(base as unknown as Config)?.publicApiUrl).toBe(
+    "https://example.test/backend",
+  );
+  expect(
+    buildX402DemoDeps({
+      ...base,
+      publicApiUrl: "https://api.novicorpus.test",
+    } as unknown as Config)?.publicApiUrl,
+  ).toBe("https://api.novicorpus.test");
 });

@@ -24,6 +24,11 @@ export interface X402DemoDeps {
   trustPolicy?: SellerTrustPolicy;
   /** Registered demo agent key for /proof-run (signs AgentKit messages only, holds no funds). */
   proofAgentKey?: `0x${string}`;
+  /** This API's OWN public origin (PUBLIC_API_URL). The legal-body demo URLs a stranger's agent
+   *  is told to use are composed from it, because `resourceUrl` is built on METADATA_BASE_URL,
+   *  which in production is the www/backend proxy — and that proxy drops `X-NOVI-LEGAL-BODY`,
+   *  CORS and Cache-Control. Absent -> the base `resourceUrl` sits on, as before. */
+  publicApiUrl?: string;
   /** The legal-body check (design 2026-09-10 D4/D5), for the pinned demo wall and for the
    *  configured wall when the deployment sets X402_TRUST_POLICY=legal-bodies-only. Absent -> the
    *  pinned wall refuses 503 rather than serving on an unasked question. */
@@ -44,10 +49,14 @@ export function buildX402DemoDeps(
     | "x402DemoPriceUsdc"
     | "gatewayFacilitatorUrl"
     | "metadataBaseUrl"
+    | "publicApiUrl"
   >,
 ): X402DemoDeps | undefined {
   if (!cfg.enableX402Demo) return undefined;
   return {
+    // The API's own origin when the deployment names one; otherwise the base every other public
+    // url here is built on, which keeps a single-host deployment behaving exactly as before.
+    publicApiUrl: cfg.publicApiUrl ?? cfg.metadataBaseUrl,
     payTo: cfg.x402DemoPayTo,
     asset: cfg.usdc,
     network: `eip155:${cfg.chainId}`,
@@ -183,13 +192,20 @@ export function mountX402DemoRoutes(
   // "open" — the deployment's own wall at /x402-demo/quote is not touched by any of this.
   if (deps.agentkit) {
     const wallPath = "/x402-demo/legal-bodies-wall";
-    // Its own resource URL, because the AgentKit proof is bound to the resource it was signed
-    // for: a header minted for /quote must not be replayable here, and vice versa.
-    const wallResourceUrl = deps.resourceUrl.replace(/\/quote$/, "/legal-bodies-wall");
-    const wallAgentkit = (rateKey: string) => ({
+    // Both public urls from ONE base, and never by rewriting a known suffix: a `/quote` that
+    // stopped ending in `/quote` used to leave the wall sharing the configured seller's resource
+    // url, which would make a proof minted for one valid at the other — exactly what giving this
+    // wall its own resource url prevents (an AgentKit proof is bound to what it was signed for).
+    const demoBase = deps.publicApiUrl
+      ? `${deps.publicApiUrl.replace(/\/+$/, "")}/x402-demo`
+      : deps.resourceUrl.replace(/\/[^/]+$/, "");
+    const wallResourceUrl = `${demoBase}/legal-bodies-wall`;
+    const runUrl = `${demoBase}/legal-bodies-run`;
+    const wallAgentkit = (rateKey: string, allowancePerHuman?: number) => ({
       ...(deps.agentkit as NonNullable<X402DemoDeps["agentkit"]>),
       resourceUrl: wallResourceUrl,
       rateKey,
+      ...(allowancePerHuman === undefined ? {} : { allowancePerHuman }),
     });
     const pinned = {
       trustPolicy: "legal-bodies-only" as const,
@@ -222,9 +238,13 @@ export function mountX402DemoRoutes(
     // GET that any visitor can trigger, and charging the proof agent's budget on the real wall
     // would turn the second leg into a 429 after a handful of page views — the same reason
     // /proof-run keeps its own key. (2) No `settle`: this endpoint must be incapable of spending.
+    // …and (3) a meter it cannot exhaust. The real wall keeps the deployment's allowance because
+    // that budget protects something; this one settles nothing and protects nothing, and at the
+    // production default of 3 per 24 h the second leg would answer 429 from the fourth page view
+    // onward — beside an `expected` block still promising 403, i.e. contradicting itself mid-demo.
     const runWall = buildPaywall({
       ...pinned,
-      agentkit: wallAgentkit(`${wallResourceUrl}#legal-bodies-run`),
+      agentkit: wallAgentkit(`${wallResourceUrl}#legal-bodies-run`, 10_000),
     });
     const wallFetch = (init?: { headers?: Record<string, string> }) =>
       runWall.request(wallPath, init);
@@ -292,6 +312,7 @@ export function mountX402DemoRoutes(
       return c.json({
         policy: "legal-bodies-only",
         resource: wallResourceUrl,
+        runUrl,
         statement:
           "this seller trades only with agents that a registered legal body in good standing stands behind",
         legs,

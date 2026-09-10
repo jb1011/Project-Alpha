@@ -738,7 +738,11 @@ async function main() {
   if (x402Demo?.agentkit)
     x402Demo.legalBody = {
       resolver: legalBody,
-      lookupBaseUrl: cfg.metadataBaseUrl,
+      // The API's OWN origin when the deployment names one (PUBLIC_API_URL). On prod
+      // METADATA_BASE_URL is the www/backend proxy, and that proxy's response allowlist drops
+      // the CORS header and Cache-Control — so a browser-side seller following this link from a
+      // refusal would get a CORS error instead of an answer.
+      lookupBaseUrl: cfg.publicApiUrl ?? cfg.metadataBaseUrl,
       onboardUrl: "https://www.novicorpus.com/",
       transparencyUrl: transparencyLink,
     };

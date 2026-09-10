@@ -110,6 +110,61 @@ export type AgentkitOutcome =
   | { authorized: true; humanId: string; agentAddress: string; used: number; limit: number }
   | { authorized: false; reason: string; humanId?: string; used?: number; limit?: number };
 
+/** What a caller may vary about the verification itself. */
+export interface VerifyAgentkitOptions {
+  /** Whether an authorized proof SPENDS one of the human's units. Default true — the historical
+   *  behaviour, and the right one for every gate whose answer is final at this point.
+   *
+   *  `false` is for a gate that asks a SECOND question afterwards (the `legal-bodies-only` seller
+   *  policy): the human is still identified and an exhausted human is still refused, but the
+   *  meter does not move until that second answer is definitive, so a failure of OURS cannot cost
+   *  the buyer a unit it can never get back (`WorldStore` has no release). The caller then calls
+   *  `chargeAllowance` itself. */
+  chargeAllowance?: boolean;
+}
+
+/**
+ * Read the human's current usage WITHOUT spending any of it.
+ *
+ * `tryIncrementUsage` is the only accessor the store has, and its `used >= limit` guard returns
+ * before the INSERT — so a limit of ZERO makes it a pure read: never allowed, never written, and
+ * an elapsed window still reported as a reset. That is the whole trick, and it is why this needs
+ * no schema or store change.
+ */
+function peekUsage(cfg: AgentkitSellerConfig, humanId: string, now: number): { used: number } {
+  const { used } = cfg.store.tryIncrementUsage(
+    humanId,
+    cfg.rateKey ?? cfg.resourceUrl,
+    0,
+    now,
+    cfg.rateWindowMs,
+  );
+  return { used };
+}
+
+/**
+ * Spend one of the human's units on this resource, and say what is left.
+ *
+ * Exported for the two-phase gate described above. Between a `chargeAllowance: false` verify and
+ * this call another request can slip in — the meter is transactional, so it can never EXCEED the
+ * limit; the loser of that race is simply told `allowed: false`, which its caller turns into the
+ * same 429 it would have produced anyway.
+ */
+export function chargeAllowance(
+  cfg: AgentkitSellerConfig,
+  humanId: string,
+): { allowed: boolean; used: number; limit: number } {
+  const now = cfg.now ?? Date.now;
+  const { allowed, used } = cfg.store.tryIncrementUsage(
+    humanId,
+    cfg.rateKey ?? cfg.resourceUrl,
+    cfg.allowancePerHuman,
+    now(),
+    cfg.rateWindowMs,
+  );
+  return { allowed, used, limit: cfg.allowancePerHuman };
+}
+
 /**
  * Verify an inbound `agentkit` header and decide authorization.
  *
@@ -120,6 +175,7 @@ export type AgentkitOutcome =
 export async function verifyAgentkitRequest(
   header: string,
   cfg: AgentkitSellerConfig,
+  opts?: VerifyAgentkitOptions,
 ): Promise<AgentkitOutcome> {
   const now = cfg.now ?? Date.now;
   try {
@@ -173,13 +229,20 @@ export async function verifyAgentkitRequest(
       cfg.store.cacheLookup(agentAddress, humanId, now());
     }
 
-    const { allowed, used } = cfg.store.tryIncrementUsage(
-      humanId,
-      cfg.rateKey ?? cfg.resourceUrl,
-      cfg.allowancePerHuman,
-      now(),
-      cfg.rateWindowMs,
-    );
+    // The cap is checked either way — only the SPENDING is optional. An exhausted human is
+    // refused here, before a deferring caller can spend a chain read on it.
+    const { allowed, used } =
+      opts?.chargeAllowance === false
+        ? (({ used: u }) => ({ allowed: u < cfg.allowancePerHuman, used: u }))(
+            peekUsage(cfg, humanId, now()),
+          )
+        : cfg.store.tryIncrementUsage(
+            humanId,
+            cfg.rateKey ?? cfg.resourceUrl,
+            cfg.allowancePerHuman,
+            now(),
+            cfg.rateWindowMs,
+          );
     if (!allowed)
       return {
         authorized: false,

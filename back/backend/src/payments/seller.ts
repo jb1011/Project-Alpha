@@ -15,6 +15,7 @@ import {
 } from "./transferAuthorization";
 import {
   type AgentkitSellerConfig,
+  chargeAllowance,
   mintAgentkitExtension,
   verifyAgentkitRequest,
 } from "./worldVerifier";
@@ -147,15 +148,21 @@ export function buildPaywall(cfg: PaywallConfig) {
   const strict =
     (cfg.trustPolicy === "accountable-only" || cfg.trustPolicy === "legal-bodies-only") &&
     !!cfg.agentkit;
-  const legalGate = cfg.trustPolicy === "legal-bodies-only" && !!cfg.agentkit;
+  const legalPolicy = cfg.trustPolicy === "legal-bodies-only";
+  const legalGate = legalPolicy && !!cfg.agentkit;
+  /** Either half missing and the policy cannot be honoured at all. It then refuses EVERYTHING
+   *  (503) rather than degrading: a box that loses its World config must not quietly start
+   *  selling to anonymous payers while its own env still says `legal-bodies-only`. (The same
+   *  omission under `accountable-only` still degrades to `open` — pre-existing, untouched here.) */
+  const legalUnavailable = legalPolicy && (!cfg.agentkit || !cfg.legalBody);
 
   // Said ONCE, at mount, because a request-time log for a misconfiguration this permanent is just
   // noise — and because a policy that is silently not in force is the failure worth shouting about.
-  if (cfg.trustPolicy === "legal-bodies-only" && !cfg.agentkit)
+  if (legalPolicy && !cfg.agentkit)
     console.warn(
-      "⚠ x402 seller policy legal-bodies-only is INERT: no agentkit config, so the paywall behaves as 'open'",
+      "⚠ x402 seller policy legal-bodies-only has NO agentkit config: every request is refused 503",
     );
-  if (legalGate && !cfg.legalBody)
+  if (legalPolicy && !cfg.legalBody)
     console.warn(
       "⚠ x402 seller policy legal-bodies-only has NO legal-body resolver wired: every request is refused 503",
     );
@@ -215,17 +222,26 @@ export function buildPaywall(cfg: PaywallConfig) {
     // never 402). A valid proof unlocks the RIGHT TO BUY: flow continues into the normal x402
     // path below — everyone pays. The per-human counter acts as a rate cap (429), not a free
     // allowance: one human backing fifty agents still gets one budget.
+    // Before anything else, and OUTSIDE the strict block on purpose: a policy this deployment
+    // cannot EVALUATE authorizes nobody, not even to the point of being told what proof to bring.
+    // Without `agentkit` the strict block is skipped entirely, so this check has to sit in front
+    // of it or a misconfigured seller would fall through to `open` and sell to anyone.
+    if (legalUnavailable)
+      return c.json(
+        checkUnavailable("this seller's legal-body check is not configured right now"),
+        503,
+      );
+
     if (strict) {
-      // Before anything else: a policy this deployment cannot EVALUATE authorizes nobody, not
-      // even to the point of being told what proof to bring. Refusing here rather than after the
-      // human check keeps the misconfiguration from reading like a working strict seller.
-      if (legalGate && !cfg.legalBody)
-        return c.json(
-          checkUnavailable("this seller's legal-body check is not configured right now"),
-          503,
-        );
       if (!akHeader) return c.json(await refusal("no-proof-presented"), 403);
-      const outcome = await verifyAgentkitRequest(akHeader, cfg.agentkit as AgentkitSellerConfig);
+      // Under the legal gate the meter is NOT touched here: the human is identified and an
+      // exhausted one is still refused, but the unit is spent below, once the second question has
+      // a definitive answer (review R3).
+      const outcome = await verifyAgentkitRequest(
+        akHeader,
+        cfg.agentkit as AgentkitSellerConfig,
+        legalGate ? { chargeAllowance: false } : undefined,
+      );
       if (!outcome.authorized) {
         if (outcome.reason === "allowance-exhausted") {
           if (outcome.humanId) c.header("X-AGENTKIT-HUMAN", outcome.humanId);
@@ -237,7 +253,7 @@ export function buildPaywall(cfg: PaywallConfig) {
         return c.json(await refusal(outcome.reason ?? "unverified"), 403);
       }
       c.header("X-AGENTKIT-HUMAN", outcome.humanId);
-      c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
+      if (!legalGate) c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
 
       // ── legal-bodies-only: the SECOND question ───────────────────────────────────────────
       // A human vouches for this agent — now, does a registered legal body stand behind the
@@ -247,16 +263,33 @@ export function buildPaywall(cfg: PaywallConfig) {
         const resolved = await (cfg.legalBody as SellerLegalBodyConfig).resolver.resolve(
           outcome.agentAddress,
         );
+        if (resolved.kind === "body" && resolved.standing === "unknown")
+          // Fail closed, remember NOTHING (D8) — and CHARGE NOTHING. This 503 is our failure and
+          // its own detail invites a retry; the store has no release, so a unit spent on an RPC
+          // blip is gone for the window and would lock out exactly the buyer this policy exists
+          // to serve. The meter is untouched, so the retry we asked for is free.
+          return c.json(
+            checkUnavailable("the legal-body check could not be completed just now"),
+            503,
+          );
+
+        // The answer is definitive, so the request is charged whichever way it went: a refusal
+        // still cost a signature verification, an AgentBook read and two Arc reads, and an
+        // unregistered agent must not be able to hammer this wall for free.
+        const charged = chargeAllowance(cfg.agentkit as AgentkitSellerConfig, outcome.humanId);
+        c.header("X-AGENTKIT-AUTHORIZATION", `${charged.used}/${charged.limit}`);
+
         if (resolved.kind === "none")
           return c.json(await legalRefusal("not-legal-body", outcome.agentAddress), 403);
         if (resolved.standing === "inactive")
           return c.json(await legalRefusal("legal-body-inactive", outcome.agentAddress), 403);
-        if (resolved.standing === "unknown")
-          // Fail closed, and remember NOTHING (D8): an RPC blip must not be able to brand a live
-          // body inactive, nor to let one through on the next request by being cached as fine.
+        // Lost a race with a concurrent request for the same human (the meter is transactional,
+        // so it can never exceed the limit — the loser is simply told so). Same 429 the peek
+        // above would have produced a moment earlier.
+        if (!charged.allowed)
           return c.json(
-            checkUnavailable("the legal-body check could not be completed just now"),
-            503,
+            { error: "rate-capped", detail: "per-human request budget exhausted for this window" },
+            429,
           );
         legalBodyAgentId = resolved.entity.agentId ?? null;
         // Named on the receipt, not merely implied by a 200. Omitted rather than faked when the

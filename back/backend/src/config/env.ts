@@ -117,6 +117,12 @@ const EnvSchema = z.object({
     .transform((v) => v === "true"),
   MCP_PUBLIC_URL: z.string().default("http://localhost:8789/mcp"),
   METADATA_BASE_URL: z.string().url().default("http://localhost:8789"),
+  /** This API's OWN public origin (e.g. https://api.novicorpus.com), when it differs from the
+   *  base the metadata urls are built on. Public links this deployment hands to STRANGERS — the
+   *  legal-body lookup in an x402 refusal, the demo wall a buyer pays — are composed from it,
+   *  because METADATA_BASE_URL points at the www proxy in production and that proxy drops the
+   *  CORS header, Cache-Control and X-NOVI-LEGAL-BODY. Unset -> METADATA_BASE_URL, as before. */
+  PUBLIC_API_URL: z.string().url().optional(),
   GAS_SEED_FLOOR_USDC: etherSchema.default("0.05"),
   GAS_SEED_TARGET_USDC: etherSchema.default("0.2"),
   ENABLE_X402_DEMO: z
@@ -414,6 +420,8 @@ export interface Config {
   jobSweepToTreasury: boolean;
   mcpPublicUrl: string;
   metadataBaseUrl: string;
+  /** The API's own public origin; undefined = use `metadataBaseUrl`. */
+  publicApiUrl?: string;
   gasSeedFloorUsdc: string;
   gasSeedTargetUsdc: string;
   enableX402Demo: boolean;
@@ -675,6 +683,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
     mcpPublicUrl: e.MCP_PUBLIC_URL,
     metadataBaseUrl: e.METADATA_BASE_URL,
+    publicApiUrl: e.PUBLIC_API_URL,
     gasSeedFloorUsdc: e.GAS_SEED_FLOOR_USDC,
     gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,

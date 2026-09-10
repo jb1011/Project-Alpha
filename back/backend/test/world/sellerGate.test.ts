@@ -13,7 +13,11 @@ import type { LegalBodyResolution } from "../../src/payments/legalBody";
 import type { SellerLegalBodyConfig } from "../../src/payments/seller";
 import { buildPaywall } from "../../src/payments/seller";
 import type { AgentkitSellerConfig } from "../../src/payments/worldVerifier";
-import { mintAgentkitExtension, verifyAgentkitRequest } from "../../src/payments/worldVerifier";
+import {
+  chargeAllowance,
+  mintAgentkitExtension,
+  verifyAgentkitRequest,
+} from "../../src/payments/worldVerifier";
 import { migrate } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
 import type { Address, EntityRecord } from "../../src/types";
@@ -283,6 +287,36 @@ describe("verifyAgentkitRequest — fail-closed", () => {
       cfg({ agentBook: book }),
     );
     expect(second.authorized).toBe(true); // served from the positive cache, never hits the RPC
+  });
+
+  test("chargeAllowance:false verifies the proof WITHOUT moving the meter", async () => {
+    // The seam the legal-body policy needs: it has to know who the human is before it can ask the
+    // second question, but must not spend the human's budget on an answer we may fail to produce.
+    const one = cfg({ allowancePerHuman: 1 });
+    const a = await verifyAgentkitRequest(await realAgentkitHeader(), one, {
+      chargeAllowance: false,
+    });
+    const b = await verifyAgentkitRequest(await realAgentkitHeader(), one, {
+      chargeAllowance: false,
+    });
+    expect(a.authorized).toBe(true);
+    expect(b.authorized).toBe(true); // a single unit, and it is still there
+    expect((a as { used: number }).used).toBe(0);
+
+    // …and the explicit charge is what spends it.
+    expect(chargeAllowance(one, HUMAN)).toEqual({ allowed: true, used: 1, limit: 1 });
+    expect(chargeAllowance(one, HUMAN)).toEqual({ allowed: false, used: 1, limit: 1 });
+  });
+
+  test("chargeAllowance:false still REFUSES an exhausted human (the cap is not skipped)", async () => {
+    const one = cfg({ allowancePerHuman: 1 });
+    expect(chargeAllowance(one, HUMAN).allowed).toBe(true);
+    const r = await verifyAgentkitRequest(await realAgentkitHeader(), one, {
+      chargeAllowance: false,
+    });
+    expect(r.authorized).toBe(false);
+    expect((r as { reason: string }).reason).toBe("allowance-exhausted");
+    expect((r as { used: number }).used).toBe(1);
   });
 
   test("a valid proof for a registered human IS authorized (positive control)", async () => {
@@ -645,7 +679,10 @@ describe("legal-bodies-only trust policy", () => {
     // caller to look up, so following the link cannot land on a different question.
     expect(seen.length).toBe(1);
     const asked = seen[0] ?? "";
-    expect(asked.toLowerCase()).toBe(AGENT_ADDRESS.toLowerCase());
+    // EIP-55, exactly — Task 2's lookup takes `isAddress(x, {strict: true})`, i.e. checksummed or
+    // all-lowercase and nothing between. siwe enforces the checksum on the proof's address today,
+    // so this holds by construction; pin it, or an SDK that relaxes it ships a 400 link to buyers.
+    expect(asked).toBe(AGENT_ADDRESS);
     expect(body.how.lookup).toBe(`${LOOKUP_BASE}/legal-bodies/${asked}`);
     expect(body.how.onboard).toBe(ONBOARD);
     expect(body.how.transparency).toBe(TRANSPARENCY);
@@ -757,5 +794,95 @@ describe("legal-bodies-only trust policy", () => {
     });
     expect(res.status).toBe(402); // the old behaviour, to the byte
     expect(seen).toEqual([]);
+  });
+
+  // ── the meter (review R3): a refusal we caused must not cost the buyer a unit ───────────────
+  //
+  // The allowance is a RATE CAP, so a definitive refusal is rightly charged: it cost this seller a
+  // signature verification, an AgentBook read and two Arc reads. A 503 is different — it is OUR
+  // failure, and its own detail invites a retry. Charging it would let one bad minute of RPC lock
+  // a legitimate legal body out for the rest of the 24 h window, which is the exact buyer this
+  // policy exists to serve.
+
+  test("an exhausted human is rate-capped BEFORE any legal read is spent on it", async () => {
+    const { deps, seen } = legalDeps({ kind: "none" });
+    // Burn the human's two units on this resource, as earlier requests would have.
+    expect(store.tryIncrementUsage(HUMAN, RESOURCE_URL, 2, Date.now()).allowed).toBe(true);
+    expect(store.tryIncrementUsage(HUMAN, RESOURCE_URL, 2, Date.now()).allowed).toBe(true);
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(res.status).toBe(429);
+    expect(((await res.json()) as { error: string }).error).toBe("rate-capped");
+    // The point of the ordering: a rate-capped caller never reaches the chain.
+    expect(seen).toEqual([]);
+  });
+
+  test("a 503 spends NOTHING: the next request still has the full budget", async () => {
+    let standing: "unknown" | "active" = "unknown";
+    const { deps } = legalDeps(async () => asBody(standing));
+    const app = legalApp(deps);
+
+    const down = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(down.status).toBe(503);
+    // Nothing was charged, so there is no usage to report — the header is absent, not "0/2".
+    expect(down.headers.get("X-AGENTKIT-AUTHORIZATION")).toBeNull();
+
+    // The RPC comes back and the very same agent retries: it is on its FIRST unit, not its second.
+    standing = "active";
+    const up = await app.request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(up.status).toBe(402);
+    expect(up.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+  });
+
+  test("a definitive refusal DOES cost a unit — the meter is a rate cap, not an entitlement", async () => {
+    const { deps } = legalDeps({ kind: "none" });
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader() },
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("legal_body_required");
+    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+  });
+
+  test("a served request costs exactly one unit, charged once", async () => {
+    const { deps } = legalDeps(asBody("active"));
+    const res = await legalApp(deps).request("/x402-demo/quote", {
+      headers: { agentkit: await realAgentkitHeader(), "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-AGENTKIT-AUTHORIZATION")).toBe("1/2");
+  });
+
+  test("no agentkit config -> 503, never an OPEN seller under the strictest policy (R4)", async () => {
+    // A box that loses its World config must not quietly start selling to anonymous payers while
+    // its own env still says legal-bodies-only.
+    const a = new Hono();
+    a.route(
+      "/",
+      buildPaywall({
+        trustPolicy: "legal-bodies-only",
+        price: 10_000n,
+        payTo: PAYOUT,
+        asset: arcBatchingConfig.asset,
+        network: "eip155:5042002",
+        resource: "/x402-demo/quote",
+        resourceUrl: RESOURCE_URL,
+        legalBody: legalDeps(asBody("active")).deps,
+        serve: () => ({ quote: "demo" }),
+      }),
+    );
+    const anon = await a.request("/x402-demo/quote");
+    expect(anon.status).toBe(503);
+    expect(((await anon.json()) as { error: string }).error).toBe("legal_body_check_unavailable");
+    // …and a real payment does not buy its way past it either.
+    const paid = await a.request("/x402-demo/quote", {
+      headers: { "X-PAYMENT": await payment(10_000n) },
+    });
+    expect(paid.status).toBe(503);
   });
 });

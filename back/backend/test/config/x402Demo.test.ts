@@ -44,3 +44,14 @@ test("X402_TRUST_POLICY accepts the three policies, and nothing else", () => {
   );
   expect(() => loadConfig({ ...baseEnv, X402_TRUST_POLICY: "legal-bodies" })).toThrow();
 });
+
+test("PUBLIC_API_URL is optional and must be a url", () => {
+  // The API's OWN origin. Unset, every public link falls back to the metadata base — which on
+  // prod is the www/backend proxy, and that proxy strips CORS, Cache-Control and
+  // X-NOVI-LEGAL-BODY, i.e. exactly what those links exist to deliver.
+  expect(loadConfig(baseEnv).publicApiUrl).toBeUndefined();
+  expect(
+    loadConfig({ ...baseEnv, PUBLIC_API_URL: "https://api.novicorpus.com" }).publicApiUrl,
+  ).toBe("https://api.novicorpus.com");
+  expect(() => loadConfig({ ...baseEnv, PUBLIC_API_URL: "api.novicorpus.com" })).toThrow();
+});
