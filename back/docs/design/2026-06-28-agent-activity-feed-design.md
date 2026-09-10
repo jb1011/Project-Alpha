@@ -84,7 +84,7 @@ Entity resolution: a `EntityRepository.findByTreasury(addr)` helper (small addit
 
 ## 5. Phase 1 — produce real data (the de-risk)
 
-1. **Env on the VPS** (`/root/Project-Alpha/back/backend/.env`): add `ANTHROPIC_API_KEY` (user's), a fresh
+1. **Env on the VPS** (`<REPO_DIR>/back/backend/.env`): add `ANTHROPIC_API_KEY` (user's), a fresh
    `POCKET_PRIVATE_KEY` + `CUSTOMER_PRIVATE_KEY`, `VENDOR_PAYOUT_ADDRESS` + `AGENT_PAYOUT_ADDRESS` (distinct),
    `TREASURY_ADDRESS` = **TestAgentMB_1's** `0x9f01EF223BdB596625d8eE2E30F13A8aB527B0a5`, and a small USDC
    top-up to the pocket (operator one-time gas seed). The loop already reads these (`loadConfig`).

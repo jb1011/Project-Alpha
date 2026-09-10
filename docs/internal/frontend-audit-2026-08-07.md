@@ -57,7 +57,7 @@ The user wants the frontend to talk more about **World** and **Doola** and how t
 
 The backend itself is **testnet-only** (chain hardcoded 5042002, Circle enum `ARC-TESTNET`; mainnet lands in Tier-0 P4) — so true "mainnet ready" for the frontend means *parametrized and env-clean*, not switched.
 
-- `interface/src/app/backend/[[...path]]/route.ts:5` — proxy fallback **`http://159.223.137.183:8789`**: plaintext HTTP to a bare IP baked into source; every browser request incl. `Authorization: Bearer <JWT>` traverses it. Must come from env, https, and fail loudly if unset in production.
+- `interface/src/app/backend/[[...path]]/route.ts:5` — proxy fallback **`http://<VPS_IP>:8789`**: plaintext HTTP to a bare IP baked into source; every browser request incl. `Authorization: Bearer <JWT>` traverses it. Must come from env, https, and fail loudly if unset in production.
 - `lib/api/config.ts:3` — `SIWE_DOMAIN` defaults to `localhost`; unset in prod ⇒ **every login fails** (backend verifies domain).
 - `lib/api/config.ts:5-7` — `NEXT_PUBLIC_MANAGER_ADDRESS` is **dead**: backend force-overwrites `roles.manager`/`roles.guardian` (`onboard.ts`). Remove the env + the field from the submitted spec.
 - `app/layout.tsx:16` — `metadataBase: "https://novicorpus.example"` placeholder domain in OG metadata.

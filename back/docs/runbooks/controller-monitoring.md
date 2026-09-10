@@ -26,7 +26,7 @@ sudoedit /etc/systemd/system/legalbody-monitor.service
 #      MONITOR_WATCH_FACTORIES=0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902
 #      MONITOR_WATCH_BEACONS=0xCbE36eC37673805a185a6883f9597613ABB41c97
 #      ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/...
-sudoedit /root/Project-Alpha/back/backend/.env
+sudoedit <REPO_DIR>/back/backend/.env
 
 # 3. start
 sudo systemctl daemon-reload
