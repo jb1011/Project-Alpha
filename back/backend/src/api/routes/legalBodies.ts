@@ -116,7 +116,7 @@ const THROTTLE_LOG_WINDOW_MS = 60_000;
 const MEMO_MAX_ENTRIES = 1000;
 
 /** The filing facts this surface reports (D1: reported, never gating). */
-interface FormationFacts {
+export interface FormationFacts {
   /** The STATE has filed the company: it legally exists. */
   filed: boolean;
   /** The IRS has issued the EIN. The EIN ITSELF is never on a public surface. */
@@ -140,32 +140,40 @@ type LookupAnswer =
       checkedAt: string;
     };
 
-export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
-  const lb = deps.legalBody;
-  if (!lb) return;
-  const now = () => (deps.now ?? Date.now)();
-  const memo = new Map<string, { at: number; answer: LookupAnswer }>();
+/** Anything with a request header bag — a Hono `Context`, and nothing more than that. */
+type HeaderBearing = { req: { header(name: string): string | undefined } };
+
+/**
+ * ONE per-client allowance per deployment, shared by every public read surface that asks for it
+ * (audit C9). Keyed on the dependency object, which is the composition root's single instance, so
+ * `/legal-bodies/:address` and the paid `/verify/:publicId` draw from the SAME bucket per caller:
+ * a scanner that has spent its allowance on one of them cannot walk round to the other.
+ */
+const clientLimiters = new WeakMap<ApiDeps, (c: HeaderBearing) => TokenBucket>();
+
+/**
+ * The per-client limiter (R2): hand it a request, get that caller's bucket.
+ *
+ * Who is asking, as well as this can know: the first `X-Forwarded-For` entry the proxy put there,
+ * or `"direct"` for a request that reached the process without one (localhost, a health check, a
+ * misconfigured proxy) — one shared bucket for all of those, deliberately.
+ */
+export function createClientLimiter(deps: ApiDeps): (c: HeaderBearing) => TokenBucket {
+  const existing = clientLimiters.get(deps);
+  if (existing) return existing;
+
   /** One bucket per caller (R2), bounded and least-recently-used-first. */
   const clients = new Map<string, TokenBucket>();
-  /** When the last throttle line was written, so a sustained drain costs one line per minute. */
-  let throttleLoggedAt: number | undefined;
-
-  /** Who is asking, as well as this route can know: the first `X-Forwarded-For` entry the proxy
-   *  put there, or `"direct"` for a request that reached the process without one (localhost, a
-   *  health check, a misconfigured proxy) — one shared bucket for all of those, deliberately. */
-  const clientKey = (c: { req: { header(name: string): string | undefined } }): string => {
+  const limiter = (c: HeaderBearing): TokenBucket => {
     const first = c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
-    return first ? first : "direct";
-  };
-
-  const clientBucket = (key: string): TokenBucket => {
-    const existing = clients.get(key);
+    const key = first ? first : "direct";
+    const found = clients.get(key);
     // Re-inserted on every use, so insertion order IS least-recently-used order and the entry
     // evicted below is the coldest one — never the scanner's own exhausted bucket.
-    if (existing) {
+    if (found) {
       clients.delete(key);
-      clients.set(key, existing);
-      return existing;
+      clients.set(key, found);
+      return found;
     }
     const fresh = new TokenBucket(CLIENT_BURST, CLIENT_REFILL_PER_SECOND);
     clients.set(key, fresh);
@@ -176,6 +184,57 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     }
     return fresh;
   };
+  clientLimiters.set(deps, limiter);
+  return limiter;
+}
+
+/**
+ * The SHARED read allowance, which is the one that protects the RPC itself.
+ *
+ * Deliberately the very instance on `deps.legalBody` and never a copy: two surfaces with two
+ * budgets would let a caller spend the RPC twice over. Callers guard on `deps.legalBody` before
+ * asking — the throw below is the type system's price for that, not a reachable path.
+ */
+export function sharedReadBudget(deps: ApiDeps): TokenBucket {
+  const lb = deps.legalBody;
+  if (!lb) throw new Error("sharedReadBudget requires deps.legalBody");
+  return lb.readBudget;
+}
+
+/**
+ * The filing, as much of it as is safe anywhere (D1: reported, never gating).
+ *
+ * Two booleans and the two fields `/transparency` publishes. Deliberately NOT here: the filing
+ * number and doola's company id (the filing's own identifiers), the EIN (a tax identifier,
+ * authenticated views only), and the open required-action codes (an operational detail of our
+ * relationship with the provider, not a fact about the legal body).
+ *
+ * Exported because the paid attestation (`hedera/attestation.ts`) reports the same facts, and two
+ * public surfaces describing one filing differently is the drift this projection exists to stop.
+ */
+export function formationOf(lb: LegalBodyLookupDeps, e: EntityRecord): FormationFacts | null {
+  if (!e.companyId || !lb.formationSummary) return null;
+  const s = lb.formationSummary(e.companyId);
+  if (!s) return null;
+  return {
+    filed: s.status === "filed" || s.status === "complete",
+    einIssued: s.status === "complete",
+    status: s.status,
+    // Inseparable from the rest (the honesty invariant): a sandbox filing must never be
+    // readable as a Wyoming company by omission.
+    environment: s.environment,
+  };
+}
+
+export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
+  const lb = deps.legalBody;
+  if (!lb) return;
+  const now = () => (deps.now ?? Date.now)();
+  const memo = new Map<string, { at: number; answer: LookupAnswer }>();
+  const clientBucket = createClientLimiter(deps);
+  const readBudget = sharedReadBudget(deps);
+  /** When the last throttle line was written, so a sustained drain costs one line per minute. */
+  let throttleLoggedAt: number | undefined;
 
   /** The same refusal whichever budget ran out — a caller learns that it should slow down, never
    *  which of our limits it is standing in front of — plus at most one ops line per window. */
@@ -188,28 +247,6 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     }
     c.header("Cache-Control", NO_STORE);
     return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
-  };
-
-  /**
-   * The filing, as much of it as is safe anywhere (D1: reported, never gating).
-   *
-   * Two booleans and the two fields `/transparency` publishes. Deliberately NOT here: the filing
-   * number and doola's company id (the filing's own identifiers), the EIN (a tax identifier,
-   * authenticated views only), and the open required-action codes (an operational detail of our
-   * relationship with the provider, not a fact about the legal body).
-   */
-  const formationOf = (e: EntityRecord): FormationFacts | null => {
-    if (!e.companyId || !lb.formationSummary) return null;
-    const s = lb.formationSummary(e.companyId);
-    if (!s) return null;
-    return {
-      filed: s.status === "filed" || s.status === "complete",
-      einIssued: s.status === "complete",
-      status: s.status,
-      // Inseparable from the rest (the honesty invariant): a sandbox filing must never be
-      // readable as a Wyoming company by omission.
-      environment: s.environment,
-    };
   };
 
   app.get("/legal-bodies/:address", async (c) => {
@@ -245,8 +282,8 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     // Both budgets are spent on a MISS ONLY, like the AgentBook status route's read budget: they
     // exist to bound the CHAIN READS, and a memo hit makes none. The caller's own allowance is
     // asked first, so a scanner runs itself out before it can touch the shared one.
-    if (!clientBucket(clientKey(c)).take()) return throttled(c, "client");
-    if (!lb.readBudget.take()) return throttled(c, "shared");
+    if (!clientBucket(c).take()) return throttled(c, "client");
+    if (!readBudget.take()) return throttled(c, "shared");
 
     let resolved: LegalBodyResolution;
     try {
@@ -285,7 +322,7 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
                 ? `${lb.links.metadataBase.replace(/\/+$/, "")}/metadata/${resolved.entity.publicId}`
                 : null,
             },
-            formation: formationOf(resolved.entity),
+            formation: formationOf(lb, resolved.entity),
             checkedAt,
           };
 

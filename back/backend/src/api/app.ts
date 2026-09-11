@@ -28,6 +28,7 @@ import { mountSchemaRoutes } from "./routes/schema";
 import { mountTransparencyRoutes } from "./routes/transparency";
 import { mountTreasuryRoutes } from "./routes/treasury";
 import { mountTrustPolicyRoutes } from "./routes/trustPolicy";
+import { mountVerifyRoutes } from "./routes/verify";
 import { mountWorldIdRoutes } from "./routes/worldId";
 import { mountX402DemoRoutes } from "./routes/x402Demo";
 import type { EntityViewDeps } from "./views";
@@ -329,6 +330,9 @@ export function buildApiApp(deps: ApiDeps) {
   // Public and unauthenticated for the same reason `/transparency` is, and mounted here so it is
   // outside `protect()` below: the caller is a seller that has never heard of us.
   mountLegalBodyRoutes(app, deps);
+  // The PAID standing check, settled on Hedera (task 6). Public and unauthenticated for the same
+  // reason the free lookup above is, and mounted beside it so both sit outside `protect()`.
+  mountVerifyRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
   if (deps.x402Demo) mountX402DemoRoutes(app, deps.x402Demo);
   mountAuthRoutes(app, deps);

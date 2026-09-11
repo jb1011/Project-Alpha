@@ -13,7 +13,7 @@
  * file's suite, so this file reports 12 tests more than it declares.)
  */
 import type Database from "better-sqlite3";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TokenBucket } from "../../src/api/routes/agentBook";
 import { PaymentLedger } from "../../src/payments/ledger";
 import type { EntityRecord } from "../../src/types";
@@ -71,7 +71,35 @@ const acct = (keyHex: string | null) => ({
 });
 
 const openDbs: Database.Database[] = [];
+
+/**
+ * The facilitator's `/supported`, stubbed because `buildApiApp` now also mounts the paid
+ * `GET /verify/:publicId` (task 6) whenever a `hedera` AND a `legalBody` dep are both present —
+ * which every app in this file has. `@x402/hono` fetches that one path in the background at mount,
+ * and without this the suite would make a real outbound request per app built. Everything else
+ * passes through to the real `fetch`: the MCP client below talks to a live loopback server.
+ */
+const realFetch = globalThis.fetch;
+beforeEach(() => {
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (new URL(url).hostname !== "f.test") return realFetch(input as RequestInfo, init);
+    return new Response(
+      JSON.stringify({
+        kinds: [
+          { x402Version: 2, scheme: "exact", network: NETWORK, extra: { feePayer: ACCOUNT } },
+        ],
+        extensions: [],
+        signers: { "hedera:*": [ACCOUNT] },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  });
+});
+
 afterEach(() => {
+  vi.unstubAllGlobals();
   while (openDbs.length) openDbs.pop()?.close();
 });
 
