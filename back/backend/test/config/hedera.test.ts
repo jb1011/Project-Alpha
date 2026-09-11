@@ -40,3 +40,20 @@ test("attestation key equal to the platform key refuses; redacted otherwise", ()
   const cfg = loadConfig({ ...ON, NOVI_ATTESTATION_KEY: `0x${"3".repeat(64)}` });
   expect((redact(cfg).hedera as { attestationKey?: string }).attestationKey).toBe("REDACTED");
 });
+test("attestation key equal to CUSTOMER_PRIVATE_KEY (a signingKeys entry) refuses", () => {
+  expect(() => loadConfig({ ...ON, NOVI_ATTESTATION_KEY: BASE.CUSTOMER_PRIVATE_KEY })).toThrow(
+    "Invalid config: NOVI_ATTESTATION_KEY is the CUSTOMER_PRIVATE_KEY — the attestation key signs statements and holds no other role on this box (design 2026-09-10 D6)",
+  );
+});
+test("attestation key equal to FORMATION_SETTLE_SUBMITTER_KEY refuses", () => {
+  const settleKey = `0x${"4".repeat(64)}`;
+  expect(() =>
+    loadConfig({
+      ...ON,
+      FORMATION_SETTLE_SUBMITTER_KEY: settleKey,
+      NOVI_ATTESTATION_KEY: settleKey,
+    }),
+  ).toThrow(
+    "Invalid config: NOVI_ATTESTATION_KEY is the FORMATION_SETTLE_SUBMITTER_KEY — the attestation key signs statements and holds no other role on this box (design 2026-09-10 D6)",
+  );
+});
