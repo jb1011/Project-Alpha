@@ -19,6 +19,11 @@
  *    is deliberate: an agent wanting to move more than the threshold on Hedera does it on Arc,
  *    where the guardian can actually allowlist the payee.
  *
+ * `allowlistEnabled` is read LIVE from the treasury contract, never from the entity row. The row's
+ * copy is written once at onboarding and never refreshed, so a guardian who turns the allowlist on
+ * after formation would be obeyed on Arc — which reads it on every authorize — and ignored here.
+ * One switch, one answer, whichever rail asks.
+ *
  * Standing comes from the same two Arc reads as everywhere else (`readStanding`'s pair), because
  * a legal body suspended on Arc is suspended for its Hedera spending too — the legal body is one
  * thing with one status, whatever rail the money moves on. A read that THREW yields
@@ -59,33 +64,43 @@ export async function hederaPolicyInput(args: {
   mirror: HederaMirror;
   usdcTokenId: string;
   perTxCap?: bigint;
+  /** The LIVE treasury read (`ArcAdapter.treasuryAllowlistEnabled`). Absent on a deployment with
+   *  no Arc adapter wired, and only then does `allowlistEnabled` below get used. */
+  readAllowlistEnabled?: (treasury: Address) => Promise<boolean>;
+  /** Fallback for the line above: the entity row's stale copy, `true` when the row has none. */
   allowlistEnabled: boolean;
   threshold?: bigint;
 }): Promise<PolicyInput> {
   const { entity, mirror, usdcTokenId } = args;
   const available = await mirror.tokenBalance(entity.hederaAccountId ?? "", usdcTokenId);
-  // Both reads in ONE try, exactly as `readStanding` does them, so a partial answer is never
-  // mixed with a failed one. A throw is not a "no" about the treasury — it is a "we do not
-  // know", and the only safe projection of that onto a two-field shape is an inactive body.
+  // All three reads in ONE try, the way `readStanding` does its pair, so a partial answer is never
+  // mixed with a failed one. A throw is not a "no" about the treasury — it is a "we do not know",
+  // and the only safe projection of that is an inactive body behind a closed allowlist.
   let legalActive = false;
   let paused = false;
+  let allowlistEnabled = true;
   try {
-    const [status, isPaused] = await Promise.all([
+    const [status, isPaused, allowlist] = await Promise.all([
       args.reads.legalStatus(entity.proxy as Address),
       args.reads.treasuryPaused(entity.treasury as Address),
+      args.readAllowlistEnabled
+        ? args.readAllowlistEnabled(entity.treasury as Address)
+        : Promise.resolve(args.allowlistEnabled),
     ]);
     legalActive = status === 0;
     paused = isPaused;
+    allowlistEnabled = allowlist;
   } catch {
     legalActive = false;
     paused = false;
+    allowlistEnabled = true;
   }
   return {
     payee: args.payee,
     amount: args.amount,
     available,
     paused,
-    allowlistEnabled: args.allowlistEnabled,
+    allowlistEnabled,
     isAllowed: false,
     runningPending: 0n,
     perTxCap: args.perTxCap,

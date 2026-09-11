@@ -1429,6 +1429,7 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           };
         if (network !== HEDERA_CAIP2) return json({ ok: false, reason: "unsupported-network" });
         if (!rec.hederaAccountId) return json({ ok: false, reason: "not-linked" });
+        const arc = deps.arc;
         const reads = deps.legalBody?.chainReads;
         // No Arc reads wired means we cannot confirm the body is spendable. D8: an unknown is
         // never an allow, and `legal-not-active` is exactly what we are unable to rule out.
@@ -1442,7 +1443,15 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
             mirror: hedera.mirror,
             usdcTokenId: hedera.cfg.usdcTokenId,
             perTxCap: rec.perTxCap ?? undefined,
-            allowlistEnabled: rec.treasuryConfig?.allowlistEnabled ?? false,
+            // LIVE off the treasury contract, the same read `entityPayment.ts` does on every
+            // Arc authorize. The row's copy is written once at onboarding and never refreshed,
+            // so trusting it would let a guardian turn the allowlist on and be obeyed on Arc
+            // while this rail kept saying yes. Without an adapter the row is all there is, and
+            // a row with no treasury config reads as ENABLED: an unknown is never an allow.
+            readAllowlistEnabled: arc
+              ? (treasury) => arc.treasuryAllowlistEnabled(treasury)
+              : undefined,
+            allowlistEnabled: rec.treasuryConfig?.allowlistEnabled ?? true,
             threshold: hedera.spendAllowlistThreshold,
           });
           const decision = evaluatePolicy(input);
@@ -1495,8 +1504,13 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         // The network is VALIDATED and not merely recorded: it is half of the unique index that
         // makes a transaction id count once, so accepting an arbitrary string would let a caller
         // write rows the index cannot dedupe.
-        if (network !== HEDERA_CAIP2) return json({ ok: false, reason: "unsupported-network" });
-        if (!rec.hederaAccountId) return json({ ok: false, reason: "not-linked" });
+        //
+        // Both refusals answer on `status`, like every other answer this tool gives, so a client
+        // switches on one key and never has to know that some outcomes arrive shaped like
+        // `check_policy`'s. Neither writes a ledger row: nothing was read, so nothing happened.
+        if (network !== HEDERA_CAIP2)
+          return json({ status: "failed", reason: "unsupported-network" });
+        if (!rec.hederaAccountId) return json({ status: "failed", reason: "not-linked" });
         // Canonical dashed form, so the same transaction reported in the `@` and the `-` spelling
         // is one row and not two. `mirrorTxId` passes an already-dashed id through unchanged.
         const ref = mirrorTxId(transactionId);
@@ -1540,8 +1554,12 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
               t.account === rec.hederaAccountId &&
               t.amount === -amount,
           );
+          // The credit leg pins the TOKEN as well as the account and the amount (D13). Without
+          // it, one CRYPTOTRANSFER could debit the agent 1000 USDC to a third party and credit
+          // the payee 1000 units of something worthless, and this would record it as settled.
           const credited = record.tokenTransfers.some(
-            (t) => t.account === payee && t.amount === amount,
+            (t) =>
+              t.tokenId === hedera.cfg.usdcTokenId && t.account === payee && t.amount === amount,
           );
           // A mismatch writes NO ledger row on purpose. The transaction itself SUCCEEDED on
           // Hedera; what failed is the report about it. Burning the transaction id on a failed

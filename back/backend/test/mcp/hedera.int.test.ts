@@ -84,6 +84,8 @@ function setup(
     paused?: boolean;
     throws?: boolean;
     threshold?: bigint;
+    /** The live Arc treasury reads. Undefined = no adapter, and the entity row is the fallback. */
+    arc?: unknown;
   } = {},
 ) {
   const { db, repo, rec, apiKeys } = hederaDb(o.over);
@@ -101,6 +103,7 @@ function setup(
   const app = hederaApp({
     repo,
     apiKeys,
+    arc: o.arc,
     hedera: {
       cfg: HEDERA_CFG,
       mirror,
@@ -167,7 +170,13 @@ const reportArgs = (over: Record<string, unknown> = {}) => ({
 });
 
 const settledTx = (
-  over: { payee?: string; credit?: bigint; debit?: bigint; result?: string } = {},
+  over: {
+    payee?: string;
+    credit?: bigint;
+    debit?: bigint;
+    result?: string;
+    creditToken?: string;
+  } = {},
 ) => [
   {
     transactionId: TX,
@@ -176,7 +185,11 @@ const settledTx = (
     consensusTimestamp: "1788998489.006924053",
     tokenTransfers: [
       { tokenId: USDC, account: ACCOUNT, amount: -(over.debit ?? 1000n) },
-      { account: over.payee ?? PAYEE, amount: over.credit ?? 1000n },
+      {
+        tokenId: over.creditToken ?? USDC,
+        account: over.payee ?? PAYEE,
+        amount: over.credit ?? 1000n,
+      },
     ],
   },
 ];
@@ -297,6 +310,21 @@ test("check_policy denies when the treasury allowlist is on", async () => {
   });
 });
 
+test("check_policy reads the allowlist LIVE — the chain overrules the entity row", async () => {
+  // The row says the allowlist is off, because that is what it said at onboarding; the guardian
+  // has since turned it on. Arc reads it on every authorize, so this rail must too, or one switch
+  // means two things. The scaffold's row carries `allowlistEnabled: false`.
+  const { app, key } = setup({
+    link: true,
+    mirror: { tokenBalance: 5000n },
+    arc: arcReads({ allowlistEnabled: true }),
+  });
+  expect(parse(await call(app, key, "check_policy", policyArgs()))).toEqual({
+    ok: false,
+    reason: "not-allowlisted",
+  });
+});
+
 test("check_policy denies above the allowlist threshold — a Hedera payee is never allowlisted", async () => {
   const { app, key } = setup({ link: true, threshold: 500n, mirror: { tokenBalance: 5000n } });
   expect(parse(await call(app, key, "check_policy", policyArgs()))).toEqual({
@@ -396,6 +424,18 @@ test("report_payment refuses a transfer that credited somebody else, and writes 
   expect(ledgerRows(db)).toHaveLength(0);
 });
 
+test("report_payment refuses a credit leg paid in some other token", async () => {
+  const { app, key, db } = setup({
+    link: true,
+    mirror: { transaction: settledTx({ creditToken: "0.0.999999" }) },
+  });
+  expect(parse(await call(app, key, "report_payment", reportArgs()))).toEqual({
+    status: "failed",
+    reason: "transfer-mismatch",
+  });
+  expect(ledgerRows(db)).toHaveLength(0);
+});
+
 test("report_payment refuses a transfer whose amount is not the reported one", async () => {
   const { app, key, db } = setup({
     link: true,
@@ -404,6 +444,22 @@ test("report_payment refuses a transfer whose amount is not the reported one", a
   expect(parse(await call(app, key, "report_payment", reportArgs()))).toEqual({
     status: "failed",
     reason: "transfer-mismatch",
+  });
+  expect(ledgerRows(db)).toHaveLength(0);
+});
+
+test("report_payment refuses a network other than hedera:testnet, keyed on status", async () => {
+  const { app, key, db } = setup({ link: true, mirror: { transaction: settledTx() } });
+  const res = await call(app, key, "report_payment", reportArgs({ network: "eip155:5042002" }));
+  expect(parse(res)).toEqual({ status: "failed", reason: "unsupported-network" });
+  expect(ledgerRows(db)).toHaveLength(0);
+});
+
+test("report_payment on an unlinked entity refuses, keyed on status", async () => {
+  const { app, key, db } = setup({ mirror: { transaction: settledTx() } });
+  expect(parse(await call(app, key, "report_payment", reportArgs()))).toEqual({
+    status: "failed",
+    reason: "not-linked",
   });
   expect(ledgerRows(db)).toHaveLength(0);
 });

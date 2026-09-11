@@ -59,8 +59,12 @@ export function hederaDb(over: Partial<EntityRecord> = {}) {
   return { db, repo, rec, apiKeys: new SqliteApiKeyStore(db) };
 }
 
-/** The Arc reads a legal body needs, scripted. */
-export const arcReads = (o: { status?: number; paused?: boolean; throws?: boolean } = {}) => ({
+/** The Arc reads a legal body needs, scripted. Shaped to stand in for BOTH `legalBody.chainReads`
+ *  (two methods) and the `arc` adapter's live treasury reads, which is why `treasuryAllowlistEnabled`
+ *  lives here too: the allowlist flag is read from the chain on every check, never from the row. */
+export const arcReads = (
+  o: { status?: number; paused?: boolean; allowlistEnabled?: boolean; throws?: boolean } = {},
+) => ({
   legalStatus: async () => {
     if (o.throws) throw new Error("rpc down");
     return o.status ?? 0;
@@ -68,6 +72,10 @@ export const arcReads = (o: { status?: number; paused?: boolean; throws?: boolea
   treasuryPaused: async () => {
     if (o.throws) throw new Error("rpc down");
     return o.paused ?? false;
+  },
+  treasuryAllowlistEnabled: async () => {
+    if (o.throws) throw new Error("rpc down");
+    return o.allowlistEnabled ?? false;
   },
 });
 
@@ -77,6 +85,9 @@ export function hederaApp(o: {
   repo: SqliteEntityRepository;
   apiKeys?: SqliteApiKeyStore;
   hedera?: unknown;
+  /** The Arc adapter, for the LIVE treasury reads (`treasuryAllowlistEnabled`). Left undefined by
+   *  default so a test that does not script it falls back to the entity row, as before. */
+  arc?: unknown;
   legalBody?: unknown;
   worldId?: unknown;
   ens?: unknown;
@@ -91,6 +102,7 @@ export function hederaApp(o: {
     apiKeys: o.apiKeys,
     now: o.now ?? (() => 1_789_100_000_000), // 2026-09-10, the design date
     hedera: o.hedera,
+    arc: o.arc,
     legalBody: o.legalBody ?? {
       resolver: { resolve: async () => ({ kind: "none" }) },
       chainReads: arcReads(),
