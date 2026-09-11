@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useQueryClient } from "@tanstack/react-query";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
-import { agentBookChipState } from "@/lib/agentbook/chipState";
+import { agentBookChipState, vouchButtonVisible } from "@/lib/agentbook/chipState";
 import { useAgentDashboardQueries, usePublicConfigQuery } from "@/lib/api/hooks";
 import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
@@ -69,6 +69,10 @@ export function AgentDashboard({
    * an owner who cannot vouch is owed the reason, and a button that appears and disappears with a
    * poll is worse than one that says why it is off. `disputed` deliberately re-enables it — a
    * guardian may answer a replacement once; the backend's lifetime cap is what stops the loop.
+   *
+   * The ONE exception is a vouch that already exists, and it is not a disabled state: the button
+   * is not rendered at all (`vouchButtonVisible`). There is nothing left to offer — AgentBook has
+   * no second vouch to make and no removal function — so the chip is the whole answer.
    */
   const publicConfig = usePublicConfigQuery();
   const [vouchOpen, setVouchOpen] = useState(false);
@@ -88,9 +92,7 @@ export function AgentDashboard({
           ? NO_POCKET_COPY
           : agentBookChip?.kind === "submitting"
             ? "A vouch for this address is already in flight"
-            : agentBookChip?.kind === "vouched"
-              ? "Already vouched"
-              : null;
+            : null;
 
   const treasuryAddr = entity?.treasury ?? null;
 
@@ -259,15 +261,22 @@ export function AgentDashboard({
                 <span aria-hidden className="text-[10px] opacity-70">↗</span>
               </a>
             )}
-            <button
-              type="button"
-              disabled={vouchDisabledReason !== null}
-              title={vouchDisabledReason ?? "Vouch for this agent in AgentBook"}
-              onClick={() => setVouchOpen(true)}
-              className="rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-ink transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {agentBookChip?.kind === "disputed" ? "Vouch again in AgentBook" : "Vouch in AgentBook"}
-            </button>
+            {/* Gone, not disabled, once the registry answers yes: a control that says "you cannot
+                do this" about something the guardian has already done is noise beside the chip
+                that says they did it. */}
+            {vouchButtonVisible(agentBookChip) && (
+              <button
+                type="button"
+                disabled={vouchDisabledReason !== null}
+                title={vouchDisabledReason ?? "Vouch for this agent in AgentBook"}
+                onClick={() => setVouchOpen(true)}
+                className="rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-ink transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {agentBookChip?.kind === "disputed"
+                  ? "Vouch again in AgentBook"
+                  : "Vouch in AgentBook"}
+              </button>
+            )}
             </div>
           </div>
           <VouchDialog
