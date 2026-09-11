@@ -29,6 +29,7 @@ import {
   getEntityTreasury,
   getNonce,
   getPasskeyChallenge,
+  getLegalBody,
   getPublicConfig,
   listApiKeys,
   listCompanies,
@@ -230,6 +231,29 @@ export function useEntityJobsQuery(entityId: string, refetchInterval = 5000) {
   });
 }
 
+/**
+ * "Is this address a Novi legal body in good standing?" — the PUBLIC lookup (design 2026-09-10
+ * D3), asked about the agent's own payment address.
+ *
+ * No token, and no poll. Standing changes only when a guardian pauses the treasury or the legal
+ * status moves on chain — both of which this dashboard either performs itself (and invalidates
+ * afterwards) or reloads to see — so a polling chip would spend two Arc reads every few seconds
+ * for an answer that almost never changes. `retry: false` for the same reason the AgentBook
+ * status query has it: all four non-200s here (400, 404, 429, 503) mean "could not check", and
+ * three retries of a throttle is the wrong answer to a throttle.
+ *
+ * Disabled until there is an address to ask about: an agent with no pocket has nothing to look
+ * up, and an empty lookup would be a question nobody asked.
+ */
+export function useLegalBodyQuery(address: string | null | undefined) {
+  return useQuery({
+    queryKey: apiKeys.legalBody(address ?? ""),
+    queryFn: () => getLegalBody(address!),
+    enabled: !!address,
+    retry: false,
+  });
+}
+
 export function useEntityAgentBookQuery(entityId: string) {
   const token = useAuthToken();
   return useQuery({
@@ -250,8 +274,13 @@ export function useAgentDashboardQueries(entityId: string) {
   const treasury = useEntityTreasuryQuery(entityId, treasuryReady);
   const runs = useEntityRunsQuery(entityId, treasuryReady, visibilityPollInterval);
   const agentBook = useEntityAgentBookQuery(entityId);
+  // Keyed off the AgentBook view's address rather than the entity's, because the entity view
+  // does not carry the pocket at all — and the pocket is exactly what both questions are about:
+  // the address that signs AgentKit challenges and pays x402 invoices is the address AgentBook
+  // binds and the address a seller looks up here.
+  const legalBody = useLegalBodyQuery(agentBook.data?.address);
 
-  return { entity, treasury, runs, agentBook };
+  return { entity, treasury, runs, agentBook, legalBody };
 }
 
 /* ── Connections & passkeys ───────────────────────────────────────────────── */

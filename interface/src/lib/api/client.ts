@@ -24,6 +24,7 @@ import type {
   FormationQuote,
   GuardianPasskey,
   JobView,
+  LegalBodyLookup,
   PasskeyView,
   PublicConfig,
   ReputationView,
@@ -119,6 +120,23 @@ export async function getPublicConfig(): Promise<PublicConfig> {
 /** Public transparency surface — no auth. Platform stats + the on-chain entity registry. */
 export async function getTransparency(): Promise<TransparencyView> {
   return request("/transparency");
+}
+
+/**
+ * The public legal-body lookup — no auth, keyed by an ADDRESS (design 2026-09-10 D3).
+ *
+ * Deliberately the same unauthenticated route a seller on someone else's stack calls, asked
+ * through the same `/backend` origin as everything else here. The dashboard could have been given
+ * an owner-only field on the entity view instead; reading the public answer means the chip an
+ * owner sees is the answer their counterparties get, and a deployment where the route is missing
+ * or throttled shows "could not check" here too rather than a confident claim nobody else can
+ * verify.
+ *
+ * Throws `ApiError` for all four non-200s (400, 404, 429, 503). Every one of them is "we could
+ * not check": none is an answer about the address, and none may be rendered as one.
+ */
+export async function getLegalBody(address: string): Promise<LegalBodyLookup> {
+  return request(`/legal-bodies/${encodeURIComponent(address)}`);
 }
 
 export async function onboardEntity(

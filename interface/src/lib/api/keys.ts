@@ -28,4 +28,12 @@ export const apiKeys = {
     [...apiKeys.all, "companyPayment", token, id] as const,
   /** PUBLIC and token-free: build-time rules that are the same for everybody. */
   formationRules: () => [...apiKeys.all, "formationRules"] as const,
+  /**
+   * PUBLIC and token-free, keyed by ADDRESS rather than by entity: `GET /legal-bodies/:address`
+   * is the unauthenticated lookup a seller calls, and the answer is the same for everyone who
+   * asks. Lowercased, because the address reaches us EIP-55 checksummed from one surface and in
+   * whatever form the wallet provider returned from another — two spellings of one address must
+   * not become two cache entries (and two lookups) for one chip.
+   */
+  legalBody: (address: string) => [...apiKeys.all, "legalBody", address.toLowerCase()] as const,
 };
