@@ -2,6 +2,8 @@
 
 **Date:** 2026-09-10 · **Area:** `back/backend` (Hono/TS) plus a new `back/hedera-client` package · **Type:** flag-gated feature, testnet only · **Target:** ETHOnline 2026, Hedera "AI & Agentic Payments" track, deadline 2026-09-16 · **Plan:** `docs/plans/2026-09-10-hedera-rail.md`
 
+> **Status:** DESIGN v3, 2026-09-10, sound to build. v1 came out of a brainstorming pass with Alex that settled the custody shape and the names (D1 to D13). v2 followed a grilling pass over the design tree (D14 to D21). v3 followed an independent second review that verified sixteen claims by execution or source, found five gaps against the definition of done and three wrong facts, all folded here (D22 to D27; the Pre-cleared section corrected in place, no ✎ marks kept since the doc was unmerged). Grounded on `main` at `bea70d1` (PRs #120 and #126 in) and on the signer spike executed on Hedera testnet 2026-09-09. **Method:** decisions are the table under "Decided"; facts a task may cite without re-checking are under "Pre-cleared"; anything not in either is the plan's to verify. Companions: the idea brief and the start-now note in Alex's vault, `docs/research/2026-09-09-hedera-signer-spike-findings.md`.
+
 ## Goal
 
 Three things, built in this order, one pull request each:
