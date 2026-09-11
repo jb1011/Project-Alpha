@@ -25,12 +25,16 @@ import { createCompany, updateCompanyParty } from "../formation/company";
 import { describeIndustryLabels } from "../formation/naicsLabels";
 import { FORMATION_PRODUCT, guardianOf, paymentView } from "../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
+import { type DecodedKey, decodeHederaKey } from "../hedera/keyDecode";
+import { mirrorTxId } from "../hedera/mirror";
+import { HEDERA_CAIP2, hederaPolicyInput } from "../hedera/policy";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
 import { withKeyedLock } from "../payments/keyedMutex";
 import type { PocketFundingFn } from "../payments/pocketFunding";
+import { evaluatePolicy } from "../payments/policyGate";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
@@ -99,6 +103,13 @@ export interface McpToolDeps extends EntityViewDeps {
    *  the SAME objects ApiDeps carries, so MCP and REST cannot describe a company differently. */
   companies?: import("../api/app").ApiDeps["companies"];
   formationSteps?: import("../api/app").ApiDeps["formationSteps"];
+  /** The Hedera rail's config, mirror client, ledger and threshold. Absent = `HEDERA_ENABLED` is
+   *  off and the three Hedera tools are not registered at all. */
+  hedera?: import("../hedera/policy").HederaDeps;
+  /** The public lookup's dependencies, carried here for ONE field: `chainReads`, the two Arc reads
+   *  `check_policy` needs to say whether the legal body is spendable. The SAME object `ApiDeps`
+   *  holds, so a suspension cannot mean one thing on the lookup and another on the Hedera rail. */
+  legalBody?: import("../api/app").ApiDeps["legalBody"];
   /** Injectable clock (ms) for tests; defaults to Date.now. */
   now?: () => number;
 }
@@ -141,6 +152,8 @@ export const MCP_TOOL_DEP_KEYS = [
   "formation",
   "companies",
   "formationSteps",
+  "hedera",
+  "legalBody",
   "now",
   // The `EntityViewDeps` half — inherited, and listed here too because this list is about what
   // the TRANSPORT copies, and a view dep that reached REST and not MCP is the bug that started
@@ -304,6 +317,29 @@ function requireProvisionTenantWide(scope: VerifiedKey): ToolRefusal | null {
  */
 function refuseSsn(args: unknown): ToolRefusal | null {
   return (args as { ssn?: unknown }).ssn !== undefined ? refuse(ssnNotOnThisDoorMessage()) : null;
+}
+
+/** One JSON object as a tool result. The Hedera tools answer in DATA, not in the isError channel:
+ *  "your policy says no" and "your transfer did not match" are answers the client acts on, not
+ *  transport failures. `isError` stays for refusals the caller cannot do anything with. */
+const json = (value: unknown) => ({
+  content: [{ type: "text" as const, text: JSON.stringify(value) }],
+});
+
+/**
+ * Run a `*OnNetwork` ledger insert whose idempotency IS the partial unique index on
+ * `(network, batch_ref)`; `null` means this transaction id was already recorded.
+ *
+ * Insert-and-catch rather than select-then-insert on purpose: two concurrent reports of the same
+ * transaction id both pass a pre-check, and only the index can decide between them.
+ */
+function onceOnNetwork(insert: () => number): number | null {
+  try {
+    return insert();
+  } catch (e) {
+    if ((e as Error).message.includes("UNIQUE")) return null;
+    throw e;
+  }
 }
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
@@ -1267,6 +1303,265 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       }
     },
   );
+
+  // ── The Hedera rail (design 2026-09-10) ──────────────────────────────────────────────────────
+  //
+  // Registered ONLY where this deployment has a Hedera config. A tool that exists and answers
+  // "hedera unavailable" still ADVERTISES a capability the box does not have, and tool discovery
+  // is the only capability surface an agent-first caller has. With HEDERA_ENABLED off the tool
+  // list is byte for byte what it was before this rail existed.
+  //
+  // NOTHING here signs and nothing here holds the agent's key (D2). `check_policy` returns a
+  // DECISION and the CLIENT is what refuses; `report_payment` reads the mirror node and records
+  // what already happened. The server's copy of the truth is always downstream of Hedera's, which
+  // is why "settled" is only ever written after a mirror read (D13) and never from a reply.
+  if (deps.hedera) {
+    // Bound once so the narrowing survives into the handlers below (a property access does not).
+    const hedera = deps.hedera;
+
+    server.registerTool(
+      "link_hedera_account",
+      {
+        title: "Link a Hedera float account",
+        description:
+          "Record this entity's self-custodied Hedera float account. The account must carry a 1-of-2 key list of the guardian and the agent; the agent's public key must be one of the two.",
+        inputSchema: { id: z.string(), accountId: z.string(), publicKey: z.string() },
+      },
+      async ({ id, accountId, publicKey }) => {
+        if (!hasCapability(scope, "spend"))
+          return { content: [{ type: "text", text: "not found" }], isError: true };
+        const rec = repo.findByIdempotencyKey(id);
+        if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+          return { content: [{ type: "text", text: "not found" }], isError: true };
+        const acct = await hedera.mirror.account(accountId);
+        if (!acct?.keyHex) return json({ ok: false, reason: "account-not-found-or-hollow" });
+        let key: DecodedKey;
+        try {
+          key = decodeHederaKey(acct.keyHex);
+        } catch {
+          // `decodeHederaKey` throws rather than hand on a key that reads as satisfied (a 0-of-n,
+          // an m-of-n over too few members, an unsupported field). Every one of those is, for
+          // this door's purposes, simply not a 1-of-2 list — and REFUSING is the safe direction,
+          // so the throw becomes the same refusal rather than a transport error.
+          return json({ ok: false, reason: "not-a-1-of-2-list" });
+        }
+        // Design D24: threshold 1, exactly two members, both compressed ECDSA (33 bytes = 66 hex
+        // characters). The `.some` is the negative form deliberately: `.every` over an empty list
+        // is vacuously TRUE, which is the trap `keyDecode.ts`'s header warns about. The length
+        // check pins the member count before either quantifier runs, so an empty KeyList — the
+        // way Hedera encodes an account nobody can sign for — is refused here too.
+        if (
+          key.kind !== "threshold" ||
+          key.threshold !== 1 ||
+          key.keys.length !== 2 ||
+          key.keys.some((k) => k.kind !== "single" || k.keyHex.length !== 66)
+        )
+          return json({ ok: false, reason: "not-a-1-of-2-list" });
+        const pub = publicKey.toLowerCase();
+        const singles = key.keys.map((k) => (k as { keyHex: string }).keyHex.toLowerCase());
+        // A 1-of-2 holding the SAME key twice decodes and satisfies every shape check above, but
+        // it is a 1-of-1 wearing a costume: there is no second party, so there is no guardian to
+        // record and nothing about the account is co-signed. Refused here rather than downstream,
+        // where `find(k => k !== pub)` would be `undefined` and the column write would throw.
+        if (singles[0] === singles[1]) return json({ ok: false, reason: "not-a-1-of-2-list" });
+        if (!singles.includes(pub)) return json({ ok: false, reason: "public-key-not-in-list" });
+        const guardian = singles.find((k) => k !== pub) as string;
+        if (rec.hederaAccountId) {
+          // Re-linking is IDEMPOTENT for the same pair and REFUSED for a different one: the
+          // guardian agreed to co-sign for one account, and silently repointing the entity at
+          // another would move that consent without asking. Unlinking is a guardian operation.
+          const same = rec.hederaAccountId === accountId && rec.hederaAgentPublicKey === pub;
+          return json(
+            same
+              ? { ok: true, accountId, guardianPublicKey: rec.hederaGuardianPublicKey }
+              : { ok: false, reason: "already-linked" },
+          );
+        }
+        // Through `setHederaLink`, never `upsert`: `upsert`'s ON CONFLICT list would overwrite
+        // every Hedera column from whatever the in-memory record happened to carry.
+        repo.setHederaLink(id, {
+          accountId,
+          agentPublicKey: pub,
+          guardianPublicKey: guardian,
+          linkedAt: Math.floor((deps.now ? deps.now() : Date.now()) / 1000),
+        });
+        return json({ ok: true, accountId, guardianPublicKey: guardian });
+      },
+    );
+
+    server.registerTool(
+      "check_policy",
+      {
+        title: "Check the spend policy",
+        description:
+          "Ask whether your legal body's policy allows a Hedera USDC payment BEFORE you sign it. " +
+          "Returns a DECISION — `{ok:true,available}` or `{ok:false,reason}` — and nothing else: " +
+          "this server never holds your key and never signs, so YOU are what refuses on a deny. " +
+          "amountUsdc is atomic USDC (6 decimals); payee is a Hedera account id; network is the " +
+          "CAIP-2 id `hedera:testnet`. A Hedera payee is never on the Arc treasury allowlist, so " +
+          "anything above the allowlist threshold is denied on this rail — pay it on Arc instead.",
+        inputSchema: {
+          id: z.string(),
+          payee: z.string(),
+          amountUsdc: z.string(),
+          network: z.string(),
+        },
+      },
+      async ({ id, payee, amountUsdc, network }) => {
+        if (!hasCapability(scope, "spend"))
+          return { content: [{ type: "text", text: "not found" }], isError: true };
+        const rec = repo.findByIdempotencyKey(id);
+        if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+          return { content: [{ type: "text", text: "not found" }], isError: true };
+        // Same decimal-integer + positive validation as `pay` (atomic USDC, 6 decimals).
+        if (!/^-?\d+$/.test(amountUsdc))
+          return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+        let amount: bigint;
+        try {
+          amount = BigInt(amountUsdc);
+        } catch {
+          return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+        }
+        if (amount <= 0n)
+          return {
+            content: [{ type: "text", text: "amountUsdc must be positive" }],
+            isError: true,
+          };
+        if (network !== HEDERA_CAIP2) return json({ ok: false, reason: "unsupported-network" });
+        if (!rec.hederaAccountId) return json({ ok: false, reason: "not-linked" });
+        const reads = deps.legalBody?.chainReads;
+        // No Arc reads wired means we cannot confirm the body is spendable. D8: an unknown is
+        // never an allow, and `legal-not-active` is exactly what we are unable to rule out.
+        if (!reads) return json({ ok: false, reason: "legal-not-active" });
+        try {
+          const input = await hederaPolicyInput({
+            entity: rec,
+            amount,
+            payee,
+            reads,
+            mirror: hedera.mirror,
+            usdcTokenId: hedera.cfg.usdcTokenId,
+            perTxCap: rec.perTxCap ?? undefined,
+            allowlistEnabled: rec.treasuryConfig?.allowlistEnabled ?? false,
+            threshold: hedera.spendAllowlistThreshold,
+          });
+          const decision = evaluatePolicy(input);
+          return json(decision.ok ? { ok: true, available: input.available.toString() } : decision);
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+        }
+      },
+    );
+
+    server.registerTool(
+      "report_payment",
+      {
+        title: "Report a Hedera payment",
+        description:
+          "Tell your legal body about a Hedera USDC payment you have already signed and submitted, " +
+          "so it lands in the spend ledger. Returns `pending` while the mirror node has not indexed " +
+          "the transaction yet — poll; `settled` only after the mirror node shows a successful " +
+          "record carrying the exact transfer you reported; `failed` with the network's own result " +
+          "otherwise. idempotencyKey is accepted for symmetry with `pay` and is NOT consulted: the " +
+          "transaction id is the identity, and recording it twice is the same payment once.",
+        inputSchema: {
+          id: z.string(),
+          payee: z.string(),
+          amountUsdc: z.string(),
+          network: z.string(),
+          transactionId: z.string(),
+          idempotencyKey: z.string(),
+        },
+      },
+      async ({ id, payee, amountUsdc, network, transactionId }) => {
+        if (!hasCapability(scope, "spend"))
+          return { content: [{ type: "text", text: "not found" }], isError: true };
+        const rec = repo.findByIdempotencyKey(id);
+        if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
+          return { content: [{ type: "text", text: "not found" }], isError: true };
+        if (!/^-?\d+$/.test(amountUsdc))
+          return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+        let amount: bigint;
+        try {
+          amount = BigInt(amountUsdc);
+        } catch {
+          return { content: [{ type: "text", text: "invalid amountUsdc" }], isError: true };
+        }
+        if (amount <= 0n)
+          return {
+            content: [{ type: "text", text: "amountUsdc must be positive" }],
+            isError: true,
+          };
+        // The network is VALIDATED and not merely recorded: it is half of the unique index that
+        // makes a transaction id count once, so accepting an arbitrary string would let a caller
+        // write rows the index cannot dedupe.
+        if (network !== HEDERA_CAIP2) return json({ ok: false, reason: "unsupported-network" });
+        if (!rec.hederaAccountId) return json({ ok: false, reason: "not-linked" });
+        // Canonical dashed form, so the same transaction reported in the `@` and the `-` spelling
+        // is one row and not two. `mirrorTxId` passes an already-dashed id through unchanged.
+        const ref = mirrorTxId(transactionId);
+        try {
+          const records = await hedera.mirror.waitTransaction(transactionId, {
+            timeoutMs: 10_000,
+            intervalMs: 1_000,
+          });
+          // `waitTransaction` ABORTS on a transient mirror 5xx rather than retrying, so `null`
+          // covers both "not indexed yet" and "we could not ask". Both are the caller's cue to
+          // poll again — never `failed`, which would brand a live payment dead, and never
+          // `settled`, which D13 permits only after a successful read.
+          if (!records) return json({ status: "pending" });
+          const record = records.find((r) => r.name === "CRYPTOTRANSFER");
+          if (!record || record.result !== "SUCCESS") {
+            // A consensus failure SPENDS the transaction id: it will never succeed, and the row
+            // is what keeps a second report of the same dead id from being a second failure.
+            if (record && record.result !== "SUCCESS") {
+              const rowId = onceOnNetwork(() =>
+                hedera.ledger.recordFailedOnNetwork(
+                  rec.idempotencyKey,
+                  payee,
+                  amount,
+                  network,
+                  ref,
+                ),
+              );
+              return json(
+                rowId === null
+                  ? { status: "failed", reason: record.result, duplicate: true }
+                  : { status: "failed", reason: record.result },
+              );
+            }
+            // An id whose records carry no CRYPTOTRANSFER at all is not a payment we can confirm
+            // or deny; it is a MISREPORT, and it writes nothing (see the mismatch branch below).
+            return json({ status: "failed", reason: "transfer-mismatch" });
+          }
+          const debited = record.tokenTransfers.some(
+            (t) =>
+              t.tokenId === hedera.cfg.usdcTokenId &&
+              t.account === rec.hederaAccountId &&
+              t.amount === -amount,
+          );
+          const credited = record.tokenTransfers.some(
+            (t) => t.account === payee && t.amount === amount,
+          );
+          // A mismatch writes NO ledger row on purpose. The transaction itself SUCCEEDED on
+          // Hedera; what failed is the report about it. Burning the transaction id on a failed
+          // row here would mean one mistyped payee could permanently block the correct report of
+          // a payment that really happened, and the id is the only handle the caller has.
+          if (!debited || !credited) return json({ status: "failed", reason: "transfer-mismatch" });
+          const ledgerId = onceOnNetwork(() =>
+            hedera.ledger.recordSettledOnNetwork(rec.idempotencyKey, payee, amount, network, ref),
+          );
+          return json(
+            ledgerId === null
+              ? { status: "settled", duplicate: true }
+              : { status: "settled", ledgerId },
+          );
+        } catch (e) {
+          return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+        }
+      },
+    );
+  }
 
   return server;
 }

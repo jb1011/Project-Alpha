@@ -3,7 +3,11 @@ import { getAddress, isAddress } from "viem";
 import type { AuthVars } from "../../auth/middleware";
 import type { FormationSummary } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
-import type { LegalBodyResolution, LegalBodyResolver } from "../../payments/legalBody";
+import type {
+  LegalBodyChainReads,
+  LegalBodyResolution,
+  LegalBodyResolver,
+} from "../../payments/legalBody";
 import type { EntityRecord } from "../../types";
 import type { ApiDeps } from "../app";
 import { TokenBucket } from "./agentBook";
@@ -37,6 +41,18 @@ export interface LegalBodyLookupDeps {
   /** The route's own read allowance, spent only on a MEMO MISS: two Arc reads per miss, and this
    *  is an unauthenticated surface where nothing else bounds the volume (§4, RPC drain). */
   readBudget: TokenBucket;
+  /**
+   * The two Arc reads standing is made of, UNWRAPPED — the same pair `resolver` was built from.
+   *
+   * This route does not use them (it asks the resolver, which owns the address indexes too); the
+   * Hedera `check_policy` tool does. That tool holds an entity record already, so it needs the
+   * READS and not the address lookup, and taking them from here rather than from a second object
+   * is what keeps one deployment from answering "suspended" on Arc and "active" on Hedera.
+   *
+   * Optional so every existing construction of this object still compiles; a deployment without
+   * it cannot confirm standing, and `check_policy` fails CLOSED rather than guessing (D8).
+   */
+  chainReads?: LegalBodyChainReads;
   links: {
     /** Absolute url of the human-readable transparency page. */
     transparency: string;

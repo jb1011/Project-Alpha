@@ -1,7 +1,9 @@
-import type { Address } from "../types";
-
 export interface PolicyInput {
-  payee?: Address;
+  /** The payee, in whatever form its rail names one: an EVM address on Arc, a `0.0.x` account id
+   *  on Hedera. This gate never parses it — it only ever hands it to `isAllowed`, which the
+   *  caller has already resolved — so a `string` is the honest type and the widening changes no
+   *  behaviour on the Arc path. */
+  payee?: string;
   amount: bigint; // USDC base units (6 decimals)
   available: bigint; // treasury.available() at check time
   paused: boolean;

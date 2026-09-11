@@ -216,6 +216,12 @@ export interface ApiDeps extends EntityViewDeps {
    * policy hold (D1), so a suspension means one thing on every surface.
    */
   legalBody?: import("./routes/legalBodies").LegalBodyLookupDeps;
+  /**
+   * The Hedera rail (design 2026-09-10). Present exactly when `HEDERA_ENABLED` produced a whole
+   * `cfg.hedera` block; absent, the three MCP tools are NOT REGISTERED at all — not registered
+   * and refusing, which would still advertise a capability this deployment does not have.
+   */
+  hedera?: import("../hedera/policy").HederaDeps;
   /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
    *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
    *  `ceilingAtomic` is the configured MAX_POCKET_FLOAT_USDC, atomic USDC string. Optional for the
