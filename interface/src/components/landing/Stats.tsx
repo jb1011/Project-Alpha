@@ -1,15 +1,16 @@
+import { ONBOARDING_STEP_COUNT } from "./copy";
 import { Reveal } from "./Reveal";
 
 const capabilities = [
   {
-    value: "8",
+    value: String(ONBOARDING_STEP_COUNT),
     label: "Onboarding steps",
-    sub: "Passkey to live agent",
+    sub: "Passkey to a live company",
   },
   {
     value: "2",
     label: "Custody paths",
-    sub: "Novi-managed or passkey-rooted",
+    sub: "Novi managed or under your passkey",
   },
   {
     value: "MCP",

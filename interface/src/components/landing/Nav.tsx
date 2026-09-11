@@ -6,6 +6,7 @@ import {
   getAuthSessionSnapshot,
   subscribeAuthSession,
 } from "@/lib/api/config";
+import { CREATE_COMPANY_CTA } from "./copy";
 import { Wordmark } from "./Wordmark";
 
 export function Nav() {
@@ -39,7 +40,7 @@ export function Nav() {
             href="/onboarding"
             className="group inline-flex items-center gap-1.5 rounded-full bg-ink px-4 py-2 text-[13px] font-medium text-paper hover:bg-ink-hover transition-colors"
           >
-            <span>Create agent</span>
+            <span>{CREATE_COMPANY_CTA}</span>
             <span
               aria-hidden
               className="transition-transform group-hover:translate-x-0.5"

@@ -17,9 +17,16 @@ import {
   snapToVisiblePhase,
   visiblePhases,
 } from "@/components/onboarding/types";
+import { ONBOARDING_STEP_COUNT } from "@/components/landing/copy";
 
 const withFormation = visiblePhases(true);
 const withoutFormation = visiblePhases(false);
+
+test("landing step count matches the formation walk to a live company", () => {
+  expect(PHASES.filter((p) => p.id !== "dashboard")).toHaveLength(
+    ONBOARDING_STEP_COUNT,
+  );
+});
 
 test("G2: a phase that IS on the list is returned untouched", () => {
   for (const p of withFormation) expect(snapToVisiblePhase(withFormation, p.id)).toBe(p.id);

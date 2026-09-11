@@ -5,9 +5,9 @@ const columns: { title: string; links: { label: string; href: string }[] }[] = [
     title: "Product",
     links: [
       { label: "Onboarding", href: "/onboarding" },
-      { label: "Spending policy", href: "#features" },
-      { label: "Guardian controls", href: "#features" },
-      { label: "MCP agent connect", href: "#mcp" },
+      { label: "Spending policy", href: "#how" },
+      { label: "Guardian controls", href: "#how" },
+      { label: "MCP agent connect", href: "/agents/connect" },
       { label: "Proof of personhood", href: "/personhood" },
     ],
   },
@@ -15,7 +15,7 @@ const columns: { title: string; links: { label: string; href: string }[] }[] = [
     title: "Developers",
     links: [
       { label: "Agent connect", href: "/agents/connect" },
-      { label: "MCP server", href: "#mcp" },
+      { label: "MCP server", href: "/agents/connect" },
       { label: "My agents", href: "/agents" },
     ],
   },
@@ -23,14 +23,14 @@ const columns: { title: string; links: { label: string; href: string }[] }[] = [
     title: "Company",
     links: [
       { label: "How it works", href: "#how" },
-      { label: "Wyoming jurisdiction", href: "#wyoming" },
+      { label: "Wyoming jurisdiction", href: "#how" },
       { label: "Transparency", href: "/transparency" },
     ],
   },
   {
     title: "Legal",
     links: [
-      { label: "Wyoming DAO LLC act", href: "#wyoming" },
+      { label: "Wyoming DAO LLC act", href: "https://wyoleg.gov/statutes/compress/title17.pdf" },
     ],
   },
 ];

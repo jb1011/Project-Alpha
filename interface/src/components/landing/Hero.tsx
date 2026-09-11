@@ -1,3 +1,4 @@
+import { CREATE_COMPANY_CTA, SEE_THE_STEPS_CTA } from "./copy";
 import { Reveal } from "./Reveal";
 
 export function Hero() {
@@ -32,7 +33,7 @@ export function Hero() {
                 href="/onboarding"
                 className="group inline-flex items-center gap-2 rounded-full bg-ink px-5 py-3 text-[14px] font-medium text-paper transition-all duration-300 hover:bg-ink-hover hover:scale-[1.03] active:scale-[0.98]"
               >
-                <span>Create my agent</span>
+                <span>{CREATE_COMPANY_CTA}</span>
                 <span
                   aria-hidden
                   className="transition-transform group-hover:translate-x-0.5"
@@ -44,7 +45,7 @@ export function Hero() {
                 href="#how"
                 className="inline-flex items-center gap-2 rounded-full border hairline-strong bg-paper/60 px-5 py-3 text-[14px] text-ink transition-all duration-300 hover:bg-paper-2 hover:scale-[1.03] active:scale-[0.98]"
               >
-                See how it works
+                {SEE_THE_STEPS_CTA}
               </a>
             </div>
           </Reveal>
@@ -121,7 +122,7 @@ function AgentDeskPreview() {
                       Your agent
                     </div>
                     <div className="mt-0.5 text-[12px] text-muted">
-                      Wyoming LLC · Novi-managed · World ID
+                      Wyoming LLC · Novi managed · World ID
                     </div>
                   </div>
                   <span className="shrink-0 rounded-full bg-ink px-2 py-0.5 text-[10px] font-medium text-paper">
@@ -148,7 +149,7 @@ function AgentDeskPreview() {
             <div>
               <div className="text-[13px] font-medium text-ink">You</div>
               <div className="text-[11.5px] text-muted-2">
-                Guardian · pause & veto
+                Guardian · pause and veto
               </div>
             </div>
           </div>
