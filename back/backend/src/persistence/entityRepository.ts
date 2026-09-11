@@ -55,6 +55,18 @@ export interface EntityRepository {
    */
   attachCompany(entityKey: string, companyId: string): boolean;
   listInFlight(): EntityRecord[];
+  /** Link an entity's agent key to a Hedera account (`link_hedera_account`). */
+  setHederaLink(
+    key: string,
+    link: {
+      accountId: string;
+      agentPublicKey: string;
+      guardianPublicKey: string;
+      linkedAt: number;
+    },
+  ): void;
+  /** Record the Hedera identity registration for an entity (`hedera-register-identity.mts`). */
+  setHederaIdentity(key: string, id: { agentId: string; registerTx: string; uaid: string }): void;
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
   transaction<T>(fn: () => T): T;
   /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
@@ -135,6 +147,13 @@ interface Row {
   oa_manifest_pending_hash: string | null;
   oa_manifest_pending_version: number | null;
   oa_amendment_executable_at: number | null;
+  hedera_account_id: string | null;
+  hedera_agent_public_key: string | null;
+  hedera_guardian_public_key: string | null;
+  hedera_linked_at: number | null;
+  hedera_agent_id: string | null;
+  hedera_register_tx: string | null;
+  uaid: string | null;
 }
 
 function serializeTreasury(tc: TreasuryConfig | null): string | null {
@@ -205,6 +224,13 @@ function toRecord(r: Row): EntityRecord {
     oaManifestPendingHash: (r.oa_manifest_pending_hash as Hex) ?? null,
     oaManifestPendingVersion: r.oa_manifest_pending_version ?? null,
     oaAmendmentExecutableAt: r.oa_amendment_executable_at ?? null,
+    hederaAccountId: r.hedera_account_id ?? null,
+    hederaAgentPublicKey: r.hedera_agent_public_key ?? null,
+    hederaGuardianPublicKey: r.hedera_guardian_public_key ?? null,
+    hederaLinkedAt: r.hedera_linked_at ?? null,
+    hederaAgentId: r.hedera_agent_id ?? null,
+    hederaRegisterTx: r.hedera_register_tx ?? null,
+    uaid: r.uaid ?? null,
   };
 }
 
@@ -260,6 +286,13 @@ export class SqliteEntityRepository implements EntityRepository {
       oa_manifest_pending_hash: rec.oaManifestPendingHash ?? null,
       oa_manifest_pending_version: rec.oaManifestPendingVersion ?? null,
       oa_amendment_executable_at: rec.oaAmendmentExecutableAt ?? null,
+      hedera_account_id: rec.hederaAccountId ?? null,
+      hedera_agent_public_key: rec.hederaAgentPublicKey ?? null,
+      hedera_guardian_public_key: rec.hederaGuardianPublicKey ?? null,
+      hedera_linked_at: rec.hederaLinkedAt ?? null,
+      hedera_agent_id: rec.hederaAgentId ?? null,
+      hedera_register_tx: rec.hederaRegisterTx ?? null,
+      uaid: rec.uaid ?? null,
     };
   }
 
@@ -274,6 +307,8 @@ export class SqliteEntityRepository implements EntityRepository {
         formation_provider, formation_environment, ein_real, formation_filed_at, formation_filing_number,
         oa_manifest_version, oa_manifest_anchored_hash, oa_manifest_pending_hash,
         oa_manifest_pending_version, oa_amendment_executable_at,
+        hedera_account_id, hedera_agent_public_key, hedera_guardian_public_key, hedera_linked_at,
+        hedera_agent_id, hedera_register_tx, uaid,
         updated_at`;
 
   private static readonly INSERT_VALUES = `
@@ -287,6 +322,8 @@ export class SqliteEntityRepository implements EntityRepository {
         @formation_provider, @formation_environment, @ein_real, @formation_filed_at, @formation_filing_number,
         @oa_manifest_version, @oa_manifest_anchored_hash, @oa_manifest_pending_hash,
         @oa_manifest_pending_version, @oa_amendment_executable_at,
+        @hedera_account_id, @hedera_agent_public_key, @hedera_guardian_public_key, @hedera_linked_at,
+        @hedera_agent_id, @hedera_register_tx, @uaid,
         CURRENT_TIMESTAMP`;
 
   upsert(rec: EntityRecord): void {
@@ -316,6 +353,9 @@ export class SqliteEntityRepository implements EntityRepository {
           oa_manifest_pending_hash=excluded.oa_manifest_pending_hash,
           oa_manifest_pending_version=excluded.oa_manifest_pending_version,
           oa_amendment_executable_at=excluded.oa_amendment_executable_at,
+          hedera_account_id=excluded.hedera_account_id, hedera_agent_public_key=excluded.hedera_agent_public_key,
+          hedera_guardian_public_key=excluded.hedera_guardian_public_key, hedera_linked_at=excluded.hedera_linked_at,
+          hedera_agent_id=excluded.hedera_agent_id, hedera_register_tx=excluded.hedera_register_tx, uaid=excluded.uaid,
           updated_at=CURRENT_TIMESTAMP
       `)
       .run(SqliteEntityRepository.bindings(rec));
@@ -436,6 +476,30 @@ export class SqliteEntityRepository implements EntityRepository {
         )
         .all() as Row[]
     ).map(toRecord);
+  }
+
+  setHederaLink(
+    key: string,
+    link: {
+      accountId: string;
+      agentPublicKey: string;
+      guardianPublicKey: string;
+      linkedAt: number;
+    },
+  ): void {
+    this.db
+      .prepare(
+        "UPDATE entities SET hedera_account_id=?, hedera_agent_public_key=?, hedera_guardian_public_key=?, hedera_linked_at=?, updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",
+      )
+      .run(link.accountId, link.agentPublicKey, link.guardianPublicKey, link.linkedAt, key);
+  }
+
+  setHederaIdentity(key: string, id: { agentId: string; registerTx: string; uaid: string }): void {
+    this.db
+      .prepare(
+        "UPDATE entities SET hedera_agent_id=?, hedera_register_tx=?, uaid=?, updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",
+      )
+      .run(id.agentId, id.registerTx, id.uaid, key);
   }
 
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */

@@ -37,6 +37,22 @@ export class PaymentLedger {
     this.db.prepare("UPDATE payments_ledger SET status='failed' WHERE id=?").run(id);
   }
 
+  /** A Hedera payment reported by the agent and CONFIRMED on the mirror node (design D13). */
+  recordSettledOnNetwork(
+    entityKey: string,
+    payee: Address,
+    amount: bigint,
+    network: string,
+    ref: string,
+  ): number {
+    const info = this.db
+      .prepare(
+        "INSERT INTO payments_ledger (entity_key, payee, amount, status, batch_ref, network, created_at, settled_at) VALUES (?, ?, ?, 'settled', ?, ?, ?, ?)",
+      )
+      .run(entityKey, payee, amount.toString(), ref, network, nowSeconds(), nowSeconds());
+    return Number(info.lastInsertRowid);
+  }
+
   /** Sum of THIS ENTITY'S authorized-but-not-yet-settled amounts (the off-chain spend not yet
    *  reflected on-chain). Scoped per entity so one tenant's pending spend never counts against
    *  another's cap. */
