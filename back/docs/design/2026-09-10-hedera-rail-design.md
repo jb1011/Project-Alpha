@@ -1,0 +1,121 @@
+# Hedera rail — governed x402 payments, a paid legal-standing check, and portable identity
+
+**Date:** 2026-09-10 · **Area:** `back/backend` (Hono/TS) plus a new `back/hedera-client` package · **Type:** flag-gated feature, testnet only · **Target:** ETHOnline 2026, Hedera "AI & Agentic Payments" track, deadline 2026-09-16 · **Plan:** `docs/plans/2026-09-10-hedera-rail.md`
+
+## Goal
+
+Three things, built in this order, one pull request each:
+
+1. **The rail.** A Novi Corpus entity's agent pays x402 resources priced in Hedera USDC through the Blocky402 facilitator, under the same policy gate, caps and guardian pause as on Arc. Novi Corpus hosts one x402 route settled on Hedera. Both halves are what the track requires.
+2. **Portable identity.** Each Novi Corpus company is registered in the ERC-8004 registry on Hedera testnet, carries an HCS-14 universal agent id (UAID), and publishes an HCS-11 profile, so a Hedera-native agent can find it and check it before dealing with it.
+3. **The legal-standing check.** `GET /verify/:publicId`, priced at $0.001 in Hedera USDC, answers "is this a registered legal body in good standing, with a verified human controller?" as a signed attestation a buyer can verify offline.
+
+Definition of done is the live run, not a green suite: a scripted buyer discovers a Novi Corpus company by UAID, pays `/verify` through Blocky402 with the settlement visible on HashScan, the guardian pauses the entity and the buyer's next payment is refused by the client, then the guardian rotates the agent key and the chain refuses the one after.
+
+## Pre-cleared, do not re-verify
+
+Read in source or executed on testnet on 2026-09-09 and 2026-09-10 (`docs/research/2026-09-09-hedera-signer-spike-findings.md`):
+
+- A secp256k1 signer that only sees a 32-byte digest signs Hedera transactions byte-identically to the SDK, via `transaction.signWith`. The custody boundary is one function: `rawSign(digest32) => sig64`.
+- One guardian-signed USDC transfer to the agent key's EVM address creates the float account with USDC associated and unlimited auto-associations. No HBAR is ever needed on the agent account: the facilitator pays the fee, and the network completed the hollow account inside its first x402 settlement.
+- A 1-of-2 `KeyList(guardian, agent)` on the float account lets the agent pay alone; the guardian alone rotates the agent key out; the next agent payment fails on chain with `INVALID_SIGNATURE`. Blocky402 submits it and reports `transaction_failed` after the fact.
+- Blocky402 testnet: `https://api.testnet.blocky402.com`, lists `hedera:testnet`, scheme `exact`, fee payer `0.0.7162784`, default `aliasPolicy: reject` on `payTo` (sellers need a completed account; payers may be hollow). USDC is HTS token `0.0.429274`, 6 decimals. Requirements shape: `{ scheme: "exact", network: "hedera:testnet", payTo, price: { amount: "1000", asset: "0.0.429274" } }`.
+- Verified x402 v2 API names: server `HTTPFacilitatorClient` (`@x402/core/server`), `x402ResourceServer(...).register("hedera:*", new ExactHederaScheme())` (`@x402/hedera/exact/server`); client `x402Client().register("hedera:*", new ExactHederaScheme(signer))` (`@x402/hedera/exact/client`), `wrapFetchWithPayment`, `decodePaymentResponseHeader` (`@x402/fetch`); response header `PAYMENT-RESPONSE`.
+- `@x402/hedera@2.25.0` pins `@hiero-ledger/sdk@2.85.0` and `@x402/core ~2.25`. Import SDK symbols from `@x402/hedera`; `AccountUpdateTransaction` and `KeyList` from `@hiero-ledger/sdk`. Never install `@hashgraph/sdk` beside it.
+- The backend imports nothing from `@x402/*` or `x402` in `src/`; only `@circle-fin/x402-batching` (peer `@x402/core ^2.3`) and one test. Bumping `@x402/evm` to `^2.25` is low risk and is still task 1.
+- ERC-8004 on Hedera testnet (chain id 296, relay `https://testnet.hashio.io/api`): bytecode present at `0x8004A818BFB912233c491871b3d84c89A494BD9e` (identity), `0x8004B663…8713` (reputation), `0x8004Cb1B…4272` (validation).
+- HCS-14: a UAID is derived, no chain write; `nativeId` must be CAIP-10 for chain agents. The Hashgraph Online standards SDK (`@hashgraphonline/standards-sdk@0.1.186`) depends on `@hashgraph/sdk`, so it is not installed; the derivation is reimplemented and tested against the SDK's own vector.
+- Testnet accounts: treasury and guardian `0.0.10412145` (ECDSA, USDC-associated), spare `0.0.10412694` (ECDSA, 1000 HBAR, no tokens) as the platform operator, spike agent `0.0.10450558` (key rotated to the guardian). Keys live in 1Password vault "Novi Corpus"; scripts run under `op run --env-file=.env.tpl`.
+- Main already has: `payments/legalBody.ts` (one definition of standing), `GET /legal-bodies/:address` (PR #126, claims ceiling D7), `formationSummary`, the metadata route's `worldId` and `registrations[]` blocks, and Martin's rule from PR #120 that a settlement outcome comes from the chain, never from the submitter's reply.
+
+## Decided, do not re-litigate
+
+Settled with Alex on 2026-09-10. Each is reversible later; none is reopened inside this build.
+
+| # | Decision |
+|---|---|
+| D1 | **Custody is "self-custody."** The customer's runtime holds the agent key. Novi Corpus's server never signs a Hedera transaction and never holds a key over customer funds. The two server-side alternatives ("Turnkey delegate", "Novi Corpus-held key") differ only in what `rawSign` calls; their delta is isolated in the plan's last task. |
+| D2 | **Enforcement is said out loud.** The server cannot block a payment it does not sign. The rules hold because the client package refuses when `check_policy` says no, and because the guardian controls the float on chain (its size, and key rotation). The design doc, the README and the demo say exactly this. |
+| D3 | **Novi Corpus provisions nothing on Hedera in this build.** Every provisioning signature is the customer's (guardian funds the float, agent and guardian set the key list). The client's `provision` command does it; `link_hedera_account` records the result. A Novi Corpus-side seed transfer at formation is a later option, noted in Non-goals. |
+| D4 | **The client lives in `back/hedera-client/`**, a standalone package like the other three in the monorepo (no workspaces exist). It holds the signer, the commands and the demo buyer. Moving it under `back/backend/` later is a folder move. |
+| D5 | **Names.** Flag `HEDERA_ENABLED`; family `HEDERA_*`; attestation key `NOVI_ATTESTATION_KEY`. Ledger column `payments_ledger.network`, CAIP-2 values, default `eip155:5042002`. Full table in the plan. |
+| D6 | **The attestation key is dedicated.** secp256k1, EIP-712, address published in the metadata JSON. Boot refuses it if it equals any other key or operator address on the box (the PR #120 invariant list). Redacted in the config dump. Testnet only this window; lives in Alex's 1Password for the demo, in the VPS `.env` if it ever runs there. |
+| D7 | **`/anchor` is cut.** Idea 2 is `/verify` plus the scripted buyer. |
+| D8 | **`check_policy` is a pure read.** No reservation row: an authorization the agent never closes would count against the cap forever and the server cannot force the close. `report_payment` writes `settled` or `failed` after reading the mirror node. |
+| D9 | **`/verify` is the paid, signed twin of `/legal-bodies/:address`**: same resolver, same claims ceiling ("a registered legal body in good standing", never "verified company" or "KYC'd"), keyed by `publicId`, plus the controller-verified flag, the operating-agreement hash and version, and a signature with `issuedAt` and a 5-minute `expiresAt`. |
+| D10 | **UAID parameters.** `nativeId=eip155:5042002:<treasury>` (stable, and what the public lookup resolves), `uid=<Arc ERC-8004 agentId>`, `registry=novicorpus`, `proto=mcp`. Derivation identical to the standards SDK, with a code comment stating why the SDK is not imported. |
+| D11 | **HCS-11 profile is in, last, droppable.** One JSON message on a platform-owned topic; topic id and sequence on the entity row. Linking it from the account memo needs the customer's key, so the client's `provision` command does it. |
+| D12 | **`custody: "self"` is not added to the enum** (15 code sites, and the onboarding saga branches on it). An entity is on the Hedera rail when it has a linked Hedera account. Its Arc custody is untouched. |
+| D13 | **Settled means seen on chain.** `report_payment` accepts a transaction id, reads it from the mirror node, and marks `settled` only for `SUCCESS` with a USDC transfer from the linked account to the reported payee of the reported amount. Anything else is `failed`; an unresolvable read is retried, never guessed. |
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph customer["Customer runtime (holds the agent key)"]
+    C["hedera-client<br/>signer · provision · revoke · pay"]
+    B["demo buyer"]
+  end
+  subgraph novi["Novi Corpus backend (HEDERA_ENABLED)"]
+    M["MCP: link_hedera_account<br/>check_policy · report_payment"]
+    V["GET /verify/:publicId<br/>x402 hedera:testnet · signed"]
+    L["payments_ledger.network"]
+    R["scripts: register on ERC-8004,<br/>derive UAID, publish HCS-11"]
+  end
+  F["Blocky402 facilitator"]
+  H["Hedera testnet<br/>float 1-of-2 · USDC · mirror node"]
+  C -- "1 check_policy" --> M
+  C -- "2 PAYMENT-SIGNATURE" --> V
+  V -- "verify · settle" --> F
+  F -- "submit, pays fee" --> H
+  C -- "3 report_payment(txId)" --> M
+  M -- "read tx" --> H
+  M --> L
+  R --> H
+  B --> C
+```
+
+The Arc buyer path (`pay` → `EntityPaymentService` → Circle Gateway) is untouched. Hedera adds a second sell route, three MCP tools, one ledger column, a handful of entity columns, and a client package.
+
+## Components
+
+### 1. Config — `src/config/env.ts`
+`HEDERA_ENABLED` (truthy string, the `WORLD_REQUIRE_GUARDIAN` idiom). When on, a `hedera` block is required whole: `HEDERA_NETWORK=testnet`, `HEDERA_FACILITATOR_URL`, `HEDERA_MIRROR_URL`, `HEDERA_JSON_RPC_URL`, `HEDERA_USDC_TOKEN_ID`, `HEDERA_PAYTO_ACCOUNT_ID`, `HEDERA_VERIFY_PRICE_USDC` (default `0.001`), `HEDERA_IDENTITY_REGISTRY`, `HEDERA_OPERATOR_ACCOUNT_ID`, `HEDERA_OPERATOR_KEY`, `NOVI_ATTESTATION_KEY`. A half-configured block refuses to boot, with the key-role invariants of D6. Both keys redacted in the dump.
+
+### 2. Persistence — `src/persistence/db.ts`
+ALTER-if-missing, the house idiom. `payments_ledger.network TEXT NOT NULL DEFAULT 'eip155:5042002'`; a partial unique index on `(network, batch_ref)` for Hedera rows so a transaction id is reported once. `entities` gains `hedera_account_id`, `hedera_agent_public_key`, `hedera_linked_at`, `hedera_agent_id`, `hedera_register_tx`, `uaid`, `hcs11_topic_id`, `hcs11_sequence`. The outflow meter and `runningPending` sum across networks; nothing filters on `network` except the report path.
+
+### 3. Sell route — `src/api/routes/verify.ts`, `src/payments/hederaSeller.ts`
+Public, unauthenticated, mounted only when the flag is on, beside `mountLegalBodyRoutes`. A Hono handler around `x402ResourceServer` + `HTTPFacilitatorClient` from `@x402/core` (the `@x402/express` middleware is Express-only, and `@x402/hono` peer-requires `@x402/paywall`). No header → 402 with the `hedera:testnet` requirements. Valid header → facilitator verify → settle → serve the attestation. The served body is built by `src/hedera/attestation.ts` from `LegalBodyResolver.readStanding`, `formationSummary`, the World verification store and the entity row, then EIP-712-signed with `NOVI_ATTESTATION_KEY` (domain `{ name: "Novi Corpus Attestation", version: "1" }`). Rate limiting mirrors `/legal-bodies`. _Labelled assumption:_ the exact `x402ResourceServer` call sequence inside a Hono handler is verified in plan task 1 against the spike's Express usage.
+
+### 4. MCP tools — `src/mcp/server.ts`
+Three `registerTool` additions, snake_case like the other eighteen, tenant- and scope-gated like `pay`:
+- `link_hedera_account { id, accountId, publicKey }` writes the two columns and `hedera_linked_at`; refuses a second link unless the same values.
+- `check_policy { id, payee, amountUsdc, network }` runs `evaluatePolicy` with the live treasury reads and returns `{ ok }` or `{ ok: false, reason }`. Pure read (D8).
+- `report_payment { id, payee, amountUsdc, network, transactionId, idempotencyKey }` reads the mirror node (`src/hedera/mirror.ts`), applies D13, inserts the ledger row with `network`, returns the verdict.
+
+### 5. Identity — `src/hedera/uaid.ts`, `src/hedera/registry.ts`, `src/hedera/hcs11.ts`, `scripts/hedera-register-identity.mts`
+The script takes `--entity <id>` or `--all`. Registration is a viem write to the Hedera identity registry over the JSON-RPC relay with the platform operator key and the same metadata URI as Arc; the Hedera agent id and transaction hash land on the row. UAID derivation is pure and unit-tested against the SDK vector. HCS-11 publishing uses `@hiero-ledger/sdk` (`TopicMessageSubmitTransaction`) from the operator account. The metadata route adds the Hedera entry to `registrations[]`, `uaid`, and a `hedera { accountId, verifyUrl }` block.
+
+### 6. Client — `back/hedera-client/`
+`@novicorpus/hedera-client`, private. Pinned `@x402/hedera@2.25.0`, `@x402/fetch@2.25.0`, `@x402/core@2.25.0`, `@noble/curves@1.8.1`, `@noble/hashes@1.7.1`, `@modelcontextprotocol/sdk@1.29.0`. Modules: `signer.ts` (the spike's `custodyAgnosticSigner` with `rawSign` injected; `localKey` adapter now, KMS and Turnkey adapters are the same interface), `policy.ts` (MCP client for the three tools), `pay.ts` (`wrapFetchWithPayment`; refuses on a `check_policy` deny; reports after `PAYMENT-RESPONSE`). Commands under `novi-hedera`: `provision` (float account by guardian USDC transfer, 1-of-2 key list, optional HCS-11 memo), `revoke` (guardian-only rotation), `pay <url>`, `demo-buyer` (resolve by UAID → pay `/verify` → pay a job). Secrets only via `op run`.
+
+## Security
+
+- Novi Corpus holds no key over customer funds (D1). The platform operator key signs registry and topic writes from its own account; the attestation key signs statements. Both are role-locked at boot (D6).
+- `/verify` says only what the on-chain status and the stored formation record carry (D9). `standing: "unknown"` is served as unknown, never memoised, `Cache-Control: no-store`.
+- `report_payment` is a claim the server checks on chain before it counts (D13); a transaction id counts once.
+- Public routes are rate-limited like `/legal-bodies`; no user input reaches config; the paid body has no PII (no EIN, no filing number, no party data).
+- Testnet only. No `.env` is read by any script; `op run` injects secrets.
+
+## Testing
+
+Unit, no network: config boot matrix (flag off, on and whole, on and partial, key-role collisions); ledger `network` default and the partial unique index; `check_policy` decision table; `report_payment` against a mocked mirror (success, wrong payee, wrong amount, `INVALID_SIGNATURE`, not-yet-visible); attestation build and EIP-712 verify round trip; UAID equals the SDK vector; `/verify` 402 body, malformed header, and a happy path with facilitator stubbed. Live, gated by env and run from 1Password: task-1 bump suite, one paid `/verify` on testnet, registration of one entity, the demo script end to end. Every plan task names its expected output as a literal string and a "do not proceed if" line.
+
+## If the team picks a server-side custody instead
+
+"Turnkey delegate" or "Novi Corpus-held key": add a `hedera:testnet` branch to `EntityPaymentService.pay` that builds the same signer with `rawSign` bound to Turnkey raw-payload signing or a KMS; provisioning moves into onboarding Step 0 beside the Circle branch; `link_hedera_account` becomes unnecessary; `check_policy` and `report_payment` stay useful for outside runtimes. One plan task, swappable.
+
+## Non-goals
+
+`/anchor` (D7). `custody: "self"` in the enum (D12). Formation-time or Novi Corpus-seeded provisioning (D3). Native Hedera allowances instead of the float account. Mainnet. A seller-side ledger of inflows. Any change to the Arc rail or its wire format. The idea 4 HCS audit trail per company. Continuity README and video (separate, last).
