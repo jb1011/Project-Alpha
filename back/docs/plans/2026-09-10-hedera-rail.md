@@ -10,17 +10,19 @@
 
 **Tech Stack:** TypeScript, Hono 4, better-sqlite3, viem 2, zod 3, vitest 2, Biome 1.9 (backend); `@x402/core`, `@x402/hono`, `@x402/hedera`, `@x402/fetch` all pinned `2.25.0`; `@hiero-ledger/sdk@2.85.0` (client only, pinned by `@x402/hedera`); `@noble/curves@1.8.1`, `@noble/hashes@1.7.1`, `@scure/base@1.2.4`; `@modelcontextprotocol/sdk@1.29.0`.
 
-**Spec:** `back/docs/design/2026-09-10-hedera-rail-design.md` (v3, D1 to D27). Read "Pre-cleared" and "Decided" before starting. Every D-number below refers to that table. Facts under "Pre-cleared" are citable without re-checking; anything not in the spec is this plan's to verify, and each such step says so.
+**Spec:** `back/docs/design/2026-09-10-hedera-rail-design.md` (v4, D1 to D29; adversarially audited 2026-09-10, this plan corrected in the same pass). Read "Pre-cleared" and "Decided" before starting. Every D-number below refers to that table. Facts under "Pre-cleared" are citable without re-checking; anything not in the spec is this plan's to verify, and each such step says so.
 
 ## Global Constraints
 
 - **Flag-gated.** `HEDERA_ENABLED` (`"1"` or `"true"`) turns everything on; off means no route, no tools, no config block, and every existing test unchanged.
-- **Arc untouched.** No change to the Arc buyer path, its wire format, `buildPaywall`, or `EntityPaymentService.pay`. The one shared file edit is a type widening in `policyGate.ts` (`payee` accepts a string), behaviour identical.
+- **Arc untouched.** No change to the Arc buyer path, its wire format, `buildPaywall`, or `EntityPaymentService.pay`. The one edit on the Arc payment path is a type widening in `policyGate.ts` (`payee` accepts a string), behaviour identical; the other shared files this plan touches (`legalBodies.ts`, `metadata.ts`, `ledger.ts`, `db.ts`, `server.ts`, `app.ts`, `main.ts`, `env.ts`) gain additions only, listed under File structure.
+- **Prod is the demo target (D28).** PR 1 and PR 2 deploy to the VPS before the demo buyer runs; task 16 is required and precedes task 15. Pre-merge live checks run on a local backend whose `DATA_DIR` holds a copy of the prod database (task 0). The fallback if the deploys cannot land by Sunday 2026-09-14 is in D28.
 - **The x402 bump is task 1 and gates everything.** `@x402/evm` to `^2.25.0`, add `@x402/core`, `@x402/hono`, `@x402/hedera` at `2.25.0`, drop `x402-fetch`. Full suite green before any Hedera code.
 - **No `.env` is ever read by Claude or printed by a script.** Secrets reach a process only through `op run --env-file=<tpl> -- <command>`; `op run` masks matches in output. 1Password vault: **Novi Corpus**.
 - **Testnet only.** `HEDERA_NETWORK` must be `testnet`; a config with any other value refuses to boot.
 - **Names come from the naming table below.** No executor invents an env var, column, tool, route, module or package name.
-- **One task, one commit,** message given in the task. Branch `feat/hedera-rail`, three pull requests (tasks 1 to 8, 9 to 12, 13 to 15), merged with `gh pr merge --merge` (D20), never squash.
+- **One task, one commit,** message given in the task. Branch `feat/hedera-rail`, three pull requests (tasks 1 to 8, 9 to 12, 13 to 15), merged with `gh pr merge --merge` (D20), never squash. Each code PR goes to Martin with a 24-hour review window; after that, green CI and Alex's diff read, Alex self-merges (D29). Before each PR is opened, run `superpowers:requesting-code-review` on the branch against this plan.
+- **CI covers `back/backend` only today.** Task 7 adds a `hedera-client` job to `.github/workflows/ci.yml`; until it is in, "CI green" says nothing about the client, and the client's three checks run locally before every client commit.
 - **"Settled" is written only after a mirror-node read** (D13). No code path marks a Hedera row settled from a facilitator reply or an HTTP status.
 - **Claims ceiling** (D9): the served body says "a registered legal body in good standing"; never "verified company", "KYC'd", "licensed".
 - **Backend commands run in `back/backend`; client commands in `back/hedera-client`.** Checks before every commit: `npm run lint` (Biome, line width 100), `npm run typecheck`, `npm test`.
@@ -30,7 +32,7 @@
 
 ## How every task runs (defined once, literally; tasks reference these by name)
 
-**The TDD loop.** Write the failing test, run it and see it fail for the stated reason, implement, run it green, run the three checks, commit. Test files sit under `back/backend/test/<area>/` and use `import { expect, test } from "vitest"`. Line anchors were verified against `feat/hedera-rail` at `f8b83cc` (equal to `origin/main` `bea70d1` plus docs); if a quoted anchor line has moved, search for the quoted text; if the text is gone, stop and report.
+**The TDD loop.** Write the failing test, run it and see it fail for the stated reason, implement, run it green, run the three checks, commit. Test files sit under `back/backend/test/<area>/` and use `import { expect, test } from "vitest"`. Line anchors were re-verified on 2026-09-10 against `feat/hedera-rail` at `6d37398` (equal to `origin/main` `bea70d1` plus docs), 22 anchor groups, four corrected in place; if a quoted anchor line has moved, search for the quoted text; if the text is gone, stop and report.
 
 **The shared test scaffold** is one file, created in task 2 and committed with it: `back/backend/test/helpers/hederaApp.ts`. Every route and MCP test in this plan imports it and passes its own values. Its content:
 
@@ -48,7 +50,7 @@ import type { EntityRecord } from "../../src/types";
 export const WEB = "https://www.novicorpus.test";
 export const METADATA_BASE = "https://api.novicorpus.test";
 export const PUBLIC_ID = "9f8003f5-4c70-435a-9980-9a54625691b7";
-export const TREASURY = "0xAD0F7d07Fe643e65dA4a6aB79560fbdB19d69A7d";
+export const TREASURY = "0x92ae7c6b6eB9470d7E01F8fEb352714bD80A7AAf"; // FormationE2E_1's, so a scaffold UAID equals the task 9 golden vector
 export const PROXY = "0x0b92fe9A51f04784A96ed8346bF876EBE93163eE";
 export const TENANT = "0x000000000000000000000000000000000000000A";
 
@@ -126,7 +128,7 @@ export function hederaApp(o: {
     chainId: 5042002,
     repo: o.repo,
     apiKeys: o.apiKeys,
-    now: o.now ?? (() => 1_757_500_000_000),
+    now: o.now ?? (() => 1_789_100_000_000), // 2026-09-10, the design date
     hedera: o.hedera,
     legalBody: o.legalBody ?? {
       resolver: { resolve: async () => ({ kind: "none" }) },
@@ -184,7 +186,8 @@ Where a step says **Do not proceed if**, the executor stops, writes what it saw 
 | Env, server | `HEDERA_VERIFY_PRICE_USDC` | default `0.001` → atomic `1000n` |
 | Env, server, PR 3 | `NOVI_ATTESTATION_KEY` | 32-byte hex secp256k1 private key |
 | Env, script only | `HEDERA_JSON_RPC_URL` | `https://testnet.hashio.io/api` (chain id 296) |
-| Env, script only | `HEDERA_IDENTITY_REGISTRY` | `0x8004A818BFB912233c491871b3d84c89A494BD9e` |
+| Constant | `HEDERA_IDENTITY_REGISTRY` | `0x8004A818BFB912233c491871b3d84c89A494BD9e`, exported from `src/hedera/registry.ts`; the script and the metadata route import it; never an env var (audit C3) |
+| Demo target (D28) | prod URLs | `https://www.novicorpus.com/backend` for the buyer's HTTP hops, `https://www.novicorpus.com/backend/mcp` for the three tools; the local backend is `http://127.0.0.1:8787` and serves pre-merge checks only |
 | Env, script only | `HEDERA_OPERATOR_ACCOUNT_ID`, `HEDERA_OPERATOR_KEY` | `0.0.10412694` and its ECDSA key |
 | Env, script only | `DEMO_GUARDIAN_KEY` | the demo entity's Arc guardian key |
 | Config | `cfg.hedera` | `{ network: "testnet"; facilitatorUrl; mirrorUrl; usdcTokenId; payToAccountId; verifyPriceUsdc: string; verifyPriceAtomic: bigint; attestationKey?: Hex }` or `undefined` |
@@ -197,9 +200,10 @@ Where a step says **Do not proceed if**, the executor stops, writes what it saw 
 | MCP tools | | `link_hedera_account`, `check_policy`, `report_payment` |
 | Routes | | `GET /verify/:publicId`, `GET /metadata/:publicId/profile` |
 | Modules | backend | `src/hedera/mirror.ts`, `src/hedera/keyDecode.ts`, `src/hedera/policy.ts`, `src/hedera/attestation.ts`, `src/hedera/uaid.ts`, `src/api/routes/verify.ts`, `src/api/routes/profile.ts` |
-| Dep on `ApiDeps` | `hedera?: HederaDeps` | `{ cfg: NonNullable<Config["hedera"]>; mirror: HederaMirror; ledger: PaymentLedger }` |
+| Dep on `ApiDeps` | `hedera?: HederaDeps` | `{ cfg: NonNullable<Config["hedera"]>; mirror: HederaMirror; ledger: PaymentLedger; spendAllowlistThreshold: bigint }` (the threshold copied from `cfg.spendAllowlistThreshold`, `env.ts:403`; audit B7) |
 | Scripts | backend | `scripts/hedera-register-identity.mts`, `scripts/guardian-pause.mts` |
-| Package | client | `back/hedera-client`, name `@novicorpus/hedera-client`, bin `novi-hedera`, commands `provision`, `revoke`, `pay`, `demo-buyer` |
+| Package | client | `back/hedera-client`, name `@novicorpus/hedera-client`, bin `novi-hedera`, commands `provision` (flag `--memo-only`), `link`, `revoke`, `pay`, `demo-buyer` |
+| Script flags | `hedera-register-identity.mts` | `--entity <name|key>` (repeatable), `--all-entities`, `--execute`, `--record --entity <id> --agent-id <n> --tx <hash> --uaid <uaid>` |
 | EIP-712 | domain | `{ name: "Novi Corpus Attestation", version: "1" }` (no `chainId`) |
 | UAID | inputs (D10) | `registry=novicorpus`, `name=<entity.name>`, `version=1`, `protocol=mcp`, `nativeId=eip155:<cfg.chainId>:<treasury lowercased>`, `skills=[]`; params `uid=<agentId>`, `registry`, `proto`, `nativeId` |
 | Demo entity checked (D18) | `FormationE2E_1` | `publicId 9f8003f5-4c70-435a-9980-9a54625691b7`, Arc agent id `886257`, treasury `0x92ae7c6b6eB9470d7E01F8fEb352714bD80A7AAf`, Martin's |
@@ -208,28 +212,48 @@ Where a step says **Do not proceed if**, the executor stops, writes what it saw 
 
 ## File structure
 
-**Backend `back/backend` (modify):** `package.json`, `.env.example`, `src/config/env.ts`, `src/persistence/db.ts`, `src/persistence/entityRepository.ts`, `src/types.ts`, `src/payments/ledger.ts`, `src/payments/policyGate.ts`, `src/mcp/server.ts` (tools and `MCP_TOOL_DEP_KEYS`), `src/api/app.ts` (`ApiDeps.hedera`, mounts), `src/api/main.ts` (build `hedera` deps), `src/api/routes/legalBodies.ts` (export the per-client limiter), `src/api/routes/metadata.ts` (ungated `registrations[]`, `uaid`, `hedera` block), `README.md`.
+**Backend `back/backend` (modify):** `package.json`, `.env.example`, `src/config/env.ts`, `src/persistence/db.ts`, `src/persistence/entityRepository.ts`, `src/types.ts`, `src/payments/ledger.ts`, `src/payments/policyGate.ts`, `src/mcp/server.ts` (tools and `MCP_TOOL_DEP_KEYS`), `src/api/app.ts` (`ApiDeps.hedera`, mounts), `src/api/main.ts` (build `hedera` deps), `src/api/routes/legalBodies.ts` (export both limiters, add `chainReads` to `LegalBodyLookupDeps`, export `formationOf`), `src/api/routes/metadata.ts` (ungated `registrations[]`, `uaid`, `hedera` block), `README.md`, `docs/README.md` (index the two Hedera docs, task 15), `.github/workflows/ci.yml` (client job, task 7).
+
+**Backend docs (create):** `docs/runbooks/hedera-demo.md` (task 15: the five legs, the prod URLs, the 1Password items by title only).
 
 **Backend (create):** `src/hedera/mirror.ts` (REST reads and the tx-id form), `src/hedera/keyDecode.ts` (protobuf `Key` decoder), `src/hedera/policy.ts` (`PolicyInput` for a Hedera payment), `src/hedera/attestation.ts` (body builder, PR 3 adds signing), `src/hedera/uaid.ts` (canonical JSON, SHA-384, Base58), `src/api/routes/verify.ts`, `src/api/routes/profile.ts`, `scripts/hedera-register-identity.mts`, `scripts/guardian-pause.mts`, tests under `test/hedera/`, `test/api/`, `test/mcp/`, `test/config/`.
 
-**Client `back/hedera-client` (create):** `package.json`, `tsconfig.json`, `.env.tpl`, `src/signer.ts`, `src/novi.ts` (MCP client), `src/pay.ts`, `src/mirror.ts`, `src/commands/provision.ts`, `src/commands/revoke.ts`, `src/commands/pay.ts`, `src/commands/demo-buyer.ts`, `src/cli.ts`, `test/signer.test.ts`, `test/pay.test.ts`.
+**Client `back/hedera-client` (create):** `package.json`, `tsconfig.json`, `.env.tpl`, `src/signer.ts`, `src/novi.ts` (MCP client), `src/pay.ts`, `src/mirror.ts`, `src/commands/provision.ts`, `src/commands/link.ts`, `src/commands/revoke.ts`, `src/commands/pay.ts`, `src/commands/demo-buyer.ts`, `src/cli.ts`, `test/signer.test.ts`, `test/pay.test.ts`.
+
+## Schedule (the clock the D27 cut line runs on)
+
+About 40 hours from Thursday 2026-09-11 to the deadline; the start-now note's 42-hour estimate less the design work already done. Hours are estimates; the stop condition is the literal expected line of the task named.
+
+| Day | Tasks | Hours | Stop condition |
+|---|---|---|---|
+| Thu 2026-09-11 | 0, 1, 2, 3, 4 | 8 | Martin's deploy answer recorded; baseline suite green after the bump; decoder vectors green |
+| Fri 2026-09-12 | 5, 6, 7, 8 | 9 | One paid `/verify` settled on HashScan from the local backend (the D27 line) |
+| Sat 2026-09-13 | PR 1 review window, 9, 10 | 6 | `FormationE2E_1` and `HederaDemo_1` registered on Hedera with UAIDs |
+| Sun 2026-09-14 | 11, 12, PR 2, 16 (both deploys) | 6 | Prod answers `/verify` with 402 and `/metadata/…/profile` with 200 |
+| Mon 2026-09-15 | 13, 14, 15 | 7 | The five legs recorded against prod; PR 3 open |
+| Tue 2026-09-16 | runbook, docs index, continuity README, video, submit | 4 | Submitted |
+
+If Friday slips, D27 applies on Saturday morning. If Sunday's deploys slip, the D28 fallback (local backend owning every hop, tunnel URL) starts Sunday evening.
 
 ---
 
 ## Phase 0 — Preflight
 
-### Task 0: Branch, demo entity, accounts, and the two low-confidence facts
+### Task 0: Branch, demo entities, accounts, and the topology
 
 **Files:** none committed except a Records line appended to this plan.
 
-- [ ] **Step 1: Branch state.** Run `git -C ~/Desktop/Solidity_Project_Files/arc-Circle/Project-Alpha-monorepo status --short && git log --oneline -1 && git fetch origin && git rev-list --count HEAD..origin/main`. Expected: empty status, HEAD `f8b83cc` or later, `0` behind. **Do not proceed if** behind: `git merge --ff-only origin/main` first and re-verify anchors in step 4 of "How every task runs".
+- [ ] **Step 0: USER TASK: the two asks to Martin (D28, D29).** Post in Discord, with the four questions from the start-now note: (5) merge policy for the window (merge commits, 24-hour review window, self-merge after), and (6) two deploys to the VPS, PR 1 and PR 2, by Sunday 2026-09-14, plus a copy of the prod SQLite database for local pre-merge checks (API keys are stored hashed; the copy lives under `back/backend/data-prod-copy/`, gitignored, deleted after the demo). Expected: a yes on both, recorded in Records with the date. **If the deploy answer is no or silent by Friday evening,** the D28 fallback applies from Sunday: onboard both demo entities on the local backend and point `PUBLIC_API_URL` and the metadata base at a tunnel URL.
+- [ ] **Step 1: Branch state.** Run `git -C ~/Desktop/Solidity_Project_Files/arc-Circle/Project-Alpha-monorepo status --short && git log --oneline -1 && git fetch origin && git rev-list --count HEAD..origin/main`. Expected: empty status, HEAD `6d37398` or later, `0` behind. **Do not proceed if** behind: `git merge --ff-only origin/main` first and re-verify anchors in step 4 of "How every task runs".
 - [ ] **Step 2: Baseline test count.** `cd back/backend && npx vitest run 2>&1 | tail -5`. Record the `Tests N passed` line in Records. Every later task compares against it.
 - [ ] **Step 3: Demo entity is public on chain with a verified human.** `curl -s https://www.novicorpus.com/backend/transparency | python3 -c 'import sys,json; [print(e) for e in json.load(sys.stdin)["entities"] if e.get("publicId")=="9f8003f5-4c70-435a-9980-9a54625691b7"]'`. Expected: one line with `'status': 'funded'`, `'humanVerified': True`, `'agentId': '886257'`. Then `curl -s https://www.novicorpus.com/backend/legal-bodies/<treasury>` once the treasury is known from `/metadata/9f8003f5-…`'s `legalBody` block; expected `"standing":"active"`. **Do not proceed if** standing is not `active`: fall back to `TestBootstrapMB_1` (`061441c6-cc58-466b-b44f-5e627d823e09`) and update D18 in the design.
-- [ ] **Step 4: Onboard the paying entity `HederaDemo_1` (D18, D22).** `FormationE2E_1` was onboarded by Martin (confirmed by Alex 2026-09-10), so its tenant and guardian keys are not Alex's. Generate a guardian key into 1Password as `Demo Guardian Key` (`private_key_hex`), and onboard a new entity through the dashboard or the API with that key's address as guardian and Alex's wallet as the tenant, custody `circle` (the platform default), name `HederaDemo_1`. Follow the sequence in `test/cli.int.test.ts` for the API calls. Expected: the entity reaches `funded` (or at least `bound`) and appears on `/transparency` with a `publicId`. Record its `publicId`, treasury, guardian. This entity links the Hedera float account (task 8), mints the demo API key (task 8), and is paused in task 14; `FormationE2E_1` is the one `/verify` answers about. **Do not proceed to task 14 if** the guardian is a browser wallet with no exportable key: the fallback is to onboard a fresh demo entity through the API with a guardian key generated into 1Password (the `cli.int.test.ts` bootstrap flow shows the calls), and to re-run this step.
+- [ ] **Step 4: Onboard the paying entity `HederaDemo_1` on prod (D18, D22).** `FormationE2E_1` was onboarded by Martin (confirmed by Alex 2026-09-10), so its tenant and guardian keys are not Alex's; `HederaDemo_1` does not exist on prod as of 2026-09-10 (16 entities, none by that name). Prod's `/config` says `formationPaymentRequired: false` and the doola environment is `sandbox`, so this costs nothing (pre-cleared). Generate a guardian key into 1Password as `Demo Guardian Key` (`private_key_hex`), and onboard a new entity through the dashboard or the API with that key's address as guardian and Alex's wallet as the tenant, custody `circle` (the platform default), name `HederaDemo_1`. Follow the sequence in `test/cli.int.test.ts` for the API calls. Expected: the entity reaches `funded` (not `bound`: `check_policy` reads `legalStatus` on the proxy and `paused` on the treasury, so both must exist), appears on `/transparency` with a `publicId`, and `curl -s https://www.novicorpus.com/backend/legal-bodies/<its treasury>` answers `"standing":"active"`. Record its `publicId`, treasury, guardian. This entity links the Hedera float account (task 8), owns the demo API key (task 8 locally, task 16 on prod), is registered on Hedera (task 10), carries the memo (task 12) and is paused in task 14; `FormationE2E_1` is the one `/verify` answers about. **Do not proceed to task 14 if** the guardian is a browser wallet with no exportable key: the fallback is to onboard a fresh demo entity through the API with a guardian key generated into 1Password (the `cli.int.test.ts` bootstrap flow shows the calls), and to re-run this step.
 - [ ] **Step 5: USER TASK: 1Password items.** Alex creates, in vault **Novi Corpus**: `Hedera Platform Operator` with `account_id=0.0.10412694` and `private_key_hex` (the portal key, ECDSA), `Novi Corpus Attestation Key` with `private_key_hex` (generate: `node -e "console.log('0x'+require('crypto').randomBytes(32).toString('hex'))"` and paste, never print again), `Demo Guardian Key` with `private_key_hex` from step 4. Expected: `op item get "Hedera Platform Operator" --vault "Novi Corpus" --fields label=account_id` prints `0.0.10412694`.
 - [ ] **Step 6: LIVE: associate the spare account with USDC (D26).** In `back/hedera-client` after task 7 exists, or now from the spike folder: `op run --env-file=.env.tpl -- npx tsx src/01-associate.ts` with `TREASURY_ACCOUNT_ID`/`TREASURY_PRIVATE_KEY` pointed at the `Hedera Platform Operator` item in a copy of `.env.tpl`. Expected: `TOKENASSOCIATE SUCCESS`, and `curl -s https://testnet.mirrornode.hedera.com/api/v1/accounts/0.0.10412694/tokens` lists `0.0.429274`. Record the consensus timestamp.
-- [ ] **Step 7: HCS-11 memo form, re-read from source.** `gh api repos/hashgraph-online/hcs-improvement-proposals/contents/docs/libraries/standards-sdk/hcs-11/overview.mdx --jq .content | base64 -d | grep -n -i "https\|memo"` and the same for the standard's page. Expected: a line stating that `hcs-11:` accepts an HTTPS reference. **If it does not,** D11 changes to an HCS-1 inscription from the operator account in task 12; note it in Records and continue (nothing before task 12 depends on it).
-- [ ] **Step 8: Records.** Append under "Records" at the end of this plan: baseline test count, demo entity treasury and guardian, the association transaction, the HCS-11 answer.
+- [ ] **Step 7: HCS-11 memo form, answered 2026-09-10 (pre-cleared).** The spec at hol.org lists `https://{url}` as a valid `hcs-11:` reference; the standards SDK resolver (0.1.186) follows `hcs://`, `ipfs://` and `ar://` only. D11 stands for the demo; task 12 carries the HCS-1 inscription as an upgrade if time allows, and the README says which resolvers work. Nothing to run.
+- [ ] **Step 8: Testnet reset check.** Open `https://status.hedera.com/` and look for a scheduled testnet reset between now and 2026-09-16 (the last reset was 2024-02-01; later scheduled ones were skipped). Expected: none scheduled. **If one is scheduled inside the window,** record the date and move every live step ahead of it.
+- [ ] **Step 9: Local database copy for pre-merge checks (D28).** Once Martin sends the copy: `mkdir -p back/backend/data-prod-copy && mv <file> back/backend/data-prod-copy/legalbody.db`, confirm `back/backend/.gitignore` covers `data-prod-copy/` (add the line if not), and `sqlite3 back/backend/data-prod-copy/legalbody.db "select name, public_id from entities where public_id in ('9f8003f5-4c70-435a-9980-9a54625691b7', '<HederaDemo_1 publicId>')"`. Expected: two rows. **Do not proceed to task 8 if** the copy has not arrived: run task 8's live steps against a freshly onboarded local entity instead and say so in Records.
+- [ ] **Step 10: Records.** Append under "Records" at the end of this plan: Martin's two answers with dates, baseline test count, both demo entities' `publicId`, treasury and guardian, the association transaction, the reset-check result.
 
 ---
 
@@ -253,8 +277,8 @@ Where a step says **Do not proceed if**, the executor stops, writes what it saw 
 ### Task 2: Config block, invariants, redaction, `.env.example`
 
 **Files:**
-- Modify: `src/config/env.ts` (schema after `:131`; `Config` type after the `world?` block closing at `:461`; value after the `world:` ternary ending `:721`; invariants block, add after `:1009`; `redact` at `:1180`, add beside `:1236`)
-- Modify: `.env.example` (insert after line 173, before the `PUBLIC_API_URL` comment at `:175`)
+- Modify: `src/config/env.ts` (schema after `:131`; `Config` type after the `world?` block closing at `:457`; value after the `world:` ternary ending `:720`; invariants block, add after `:1009`; `redact` at `:1180`, add beside `:1236`)
+- Modify: `.env.example` (insert after line 178, before the `PUBLIC_API_URL` comment at `:180`)
 - Create: `test/helpers/hederaApp.ts` (the shared scaffold, verbatim from "How every task runs")
 - Test: `test/config/hedera.test.ts`
 
@@ -325,7 +349,7 @@ Run `npx vitest run test/config/hedera.test.ts`. Expected: FAIL, `hedera` is `un
   NOVI_ATTESTATION_KEY: privKeySchema.optional(),
 ```
 
-- [ ] **Step 3: Type.** After the `world?` block (`:461`) add:
+- [ ] **Step 3: Type.** After the `world?` block (`:457`) add:
 
 ```ts
   /** Hedera rail (design 2026-09-10). Present only when HEDERA_ENABLED and the block is whole. */
@@ -344,7 +368,7 @@ Run `npx vitest run test/config/hedera.test.ts`. Expected: FAIL, `hedera` is `un
 
 and beside the other exported types: `export type HederaConfig = NonNullable<Config["hedera"]>;`
 
-- [ ] **Step 4: Value.** After the `world:` ternary (`:721`) add `hedera: buildHedera(e),` and define above `loadConfig`:
+- [ ] **Step 4: Value.** After the `world:` ternary (`:720`) add `hedera: buildHedera(e),` and define above `loadConfig` (the parsed-schema type in this file is inferred from `EnvSchema` at `:45`; name the parameter with `z.infer<typeof EnvSchema>` or the alias the file already uses):
 
 ```ts
 function buildHedera(e: Env): Config["hedera"] {
@@ -382,7 +406,7 @@ function buildHedera(e: Env): Config["hedera"] {
 
 - [ ] **Step 5: Invariants.** After the settle-submitter block closes (`:1009`) add a block that runs whenever `cfg.hedera?.attestationKey` is set: compare `privateKeyToAccount(key).address.toLowerCase()` against `platform`, against every entry of a `signingKeys` list built exactly like `:966-973` (hoist that list above both blocks so it is declared once), and against `cfg.formation?.payment.submitterKey`. Each collision throws `Invalid config: NOVI_ATTESTATION_KEY is the ${name} — the attestation key signs statements and holds no other role on this box (design 2026-09-10 D6)`.
 - [ ] **Step 6: Redaction.** In `redact` add `hedera: cfg.hedera ? { ...cfg.hedera, verifyPriceAtomic: cfg.hedera.verifyPriceAtomic.toString(), attestationKey: cfg.hedera.attestationKey ? "REDACTED" : undefined } : undefined,`.
-- [ ] **Step 7: `.env.example`.** After line 173 insert a commented block, one line per var from the naming table's server rows, with the sentence: `# Hedera rail (design 2026-09-10). Testnet only. The operator key lives with the scripts, never here.`
+- [ ] **Step 7: `.env.example`.** After line 178 insert a commented block, one line per var from the naming table's server rows, with the sentence: `# Hedera rail (design 2026-09-10). Testnet only. The operator key lives with the scripts, never here.`
 - [ ] **Step 8: The shared scaffold.** Create `test/helpers/hederaApp.ts` with the exact content shown under "How every task runs". It must pass `npm run typecheck` now, before any test uses it (the `as never` cast keeps it compiling as `ApiDeps` grows in tasks 5 and 6).
 - [ ] **Step 9:** Run the test file: PASS, 5 tests. Then the three checks. Expected suite: baseline plus 5.
 - [ ] **Step 10: Commit.** → `feat(hedera): HEDERA_* config block, attestation-key invariants, redaction, shared test scaffold (task 2)`.
@@ -395,7 +419,7 @@ function buildHedera(e: Env): Config["hedera"] {
 - Modify: `src/types.ts:36-112` (`EntityRecord`), `src/persistence/entityRepository.ts` (`Row` at `:91`, `toRecord` at `:160-209`, `INSERT_COLUMNS`/`INSERT_VALUES` at `:266-290`, the `ON CONFLICT ... SET` list, `toRow`)
 - Test: `test/persistence/hederaColumns.test.ts`, `test/payments/ledgerNetwork.test.ts`
 
-**Interfaces:** Produces `PaymentLedger.recordSettledOnNetwork(entityKey, payee, amount, network, ref): number` (throws on a duplicate `(network, ref)`), `PaymentLedger.settledOnNetwork(entityKey, network): { payee: string; amount: bigint; ref: string; settledAt: number }[]`, `EntityRepository.setHederaLink(key, { accountId, agentPublicKey, guardianPublicKey, linkedAt })`, `EntityRepository.setHederaIdentity(key, { agentId, registerTx, uaid })`, and the seven `EntityRecord` fields.
+**Interfaces:** Produces `PaymentLedger.recordSettledOnNetwork(entityKey, payee, amount, network, ref): number` (throws on a duplicate `(network, ref)`), `EntityRepository.setHederaLink(key, { accountId, agentPublicKey, guardianPublicKey, linkedAt })`, `EntityRepository.setHederaIdentity(key, { agentId, registerTx, uaid })`, and the seven `EntityRecord` fields.
 
 - [ ] **Step 1: Failing tests.** `ledgerNetwork.test.ts`: insert two settled Hedera rows with different refs → both present; the same ref twice → second throws `/UNIQUE/`; `recordAuthorized` still works with `network` `NULL` and `runningPending` counts it. `hederaColumns.test.ts`: `migrate` twice on one db is idempotent; `upsert` an entity, `setHederaLink`, `findByPublicId` returns the four link fields; `setHederaIdentity` returns the three identity fields; an entity never linked returns `null` for all seven.
 - [ ] **Step 2: Migration** in `migrate`, after the `formation_payments` block:
@@ -443,19 +467,9 @@ function buildHedera(e: Env): Config["hedera"] {
       .run(entityKey, payee, amount.toString(), ref, network, nowSeconds(), nowSeconds());
     return Number(info.lastInsertRowid);
   }
-
-  settledOnNetwork(
-    entityKey: string,
-    network: string,
-  ): { payee: string; amount: bigint; ref: string; settledAt: number }[] {
-    const rows = this.db
-      .prepare(
-        "SELECT payee, amount, batch_ref, settled_at FROM payments_ledger WHERE entity_key = ? AND network = ? AND status = 'settled' ORDER BY id",
-      )
-      .all(entityKey, network) as { payee: string; amount: string; batch_ref: string; settled_at: number }[];
-    return rows.map((r) => ({ payee: r.payee, amount: BigInt(r.amount), ref: r.batch_ref, settledAt: r.settled_at }));
-  }
 ```
+
+No read helper: nothing in this build consumes Hedera ledger rows (design Non-goals; audit C18). Task 8 step 6 reads the row with `sqlite3`.
 
 - [ ] **Step 4: Types and repository.** Add the seven optional nullable fields to `EntityRecord` after `oaAmendmentExecutableAt` (`types.ts:111`), the seven snake-case columns to `Row`, seven lines to `toRecord` in the `?? null` style of `:191-196`, the columns to `INSERT_COLUMNS`, `INSERT_VALUES` (as `@hedera_account_id` …) and the `ON CONFLICT` set list, and the two methods:
 
@@ -512,14 +526,17 @@ export type DecodedKey =
 export function decodeHederaKey(hex: string): DecodedKey;
 ```
 
-- [ ] **Step 1: Failing tests.** `mirror.test.ts` with a fake `fetch` returning canned JSON: `mirrorTxId` both forms; `account` maps `key._type`/`key.key`/`evm_address`; `tokenBalance` reads `tokens[0].balance` and returns `0n` for `{ tokens: [] }`; `transaction` returns `null` on 404 and maps `token_transfers[].amount` to `bigint`; `waitTransaction` polls with injected `sleep` until non-null and returns `null` after `timeoutMs`. `keyDecode.test.ts` pins these three golden vectors (generated 2026-09-10 from `@hiero-ledger/proto` in the spike folder; keys `a`, `b` are the public keys of private keys `0x11…11` and `0x22…22`):
+- [ ] **Step 1: Failing tests.** `mirror.test.ts` with a fake `fetch` returning canned JSON: `mirrorTxId` both forms; `account` maps `key._type`/`key.key`/`evm_address`; `tokenBalance` reads `tokens[0].balance` and returns `0n` for `{ tokens: [] }`; `transaction` returns `null` on 404 and maps `token_transfers[].amount` to `bigint`; `waitTransaction` polls with injected `sleep` until non-null and returns `null` after `timeoutMs`. `keyDecode.test.ts` pins these five golden vectors (hand-built 2026-09-10 from the Hedera protobuf `Key` layout and re-derived in the audit; keys `A`, `B`, `C` are the compressed public keys of private keys `0x11…11`, `0x22…22`, `0x33…33`, re-derived with `@noble/curves`). Export `A`, `B`, `C` and the five vectors from the test file so task 5 imports them:
 
 ```ts
-const A = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
-const B = "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27";
-const SINGLE = `3a21${A}`;
-const ONE_OF_TWO = `2a4e0801124a0a233a21${A}0a233a21${B}`;
-const TWO_OF_TWO = `324a0a233a21${A}0a233a21${B}`;
+export const A = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
+export const B = "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27";
+export const C = "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1";
+export const SINGLE = `3a21${A}`;
+export const ONE_OF_TWO = `2a4e0801124a0a233a21${A}0a233a21${B}`;
+export const TWO_OF_TWO = `324a0a233a21${A}0a233a21${B}`;
+export const ONE_OF_THREE = `2a730801126f0a233a21${A}0a233a21${B}0a233a21${C}`;
+export const THRESHOLD_TWO = `2a4e0802124a0a233a21${A}0a233a21${B}`;
 test("single ECDSA key", () => expect(decodeHederaKey(SINGLE)).toEqual({ kind: "single", keyHex: A }));
 test("1-of-2 threshold", () =>
   expect(decodeHederaKey(ONE_OF_TWO)).toEqual({
@@ -528,9 +545,16 @@ test("1-of-2 threshold", () =>
   }));
 test("plain two-key list is 2-of-2", () =>
   expect(decodeHederaKey(TWO_OF_TWO)).toEqual({ kind: "list", keys: [{ kind: "single", keyHex: A }, { kind: "single", keyHex: B }] }));
+test("1-of-3 threshold decodes with three members", () =>
+  expect(decodeHederaKey(ONE_OF_THREE)).toMatchObject({ kind: "threshold", threshold: 1 }) &&
+  expect((decodeHederaKey(ONE_OF_THREE) as { keys: unknown[] }).keys).toHaveLength(3));
+test("2-of-2 threshold decodes with threshold 2", () =>
+  expect(decodeHederaKey(THRESHOLD_TWO)).toMatchObject({ kind: "threshold", threshold: 2 }));
 ```
 
-- [ ] **Step 2: `keyDecode.ts`.** A 60-line protobuf reader: varint tag, wire type 2 length-delimited only. `Key` fields: `5` = `ThresholdKey { 1: uint32 threshold; 2: KeyList keys }`, `6` = `KeyList { 1: repeated Key }`, `7` = `bytes ECDSA_secp256k1`, `2` = `bytes ed25519` (decode as `single` too, tagged in `keyHex` by length 64). Any other field number throws `unsupported key field ${n}`. Comment at the top: why hand-written (design D24: the backend carries no Hedera SDK; the mirror node returns key lists only as protobuf hex).
+Layout, for the reader: `2a` is field 5 (`ThresholdKey`) wire type 2; `08 01` its `threshold`; `12 <len>` its `KeyList`; each `0a 23 3a 21 <33 bytes>` is one `Key` holding field 7 (`ECDSA_secp256k1`); `32` is field 6 (`KeyList`) at the top level.
+
+- [ ] **Step 2: `keyDecode.ts`.** A 60-line protobuf reader: varint tag, wire type 2 length-delimited only. `Key` fields: `5` = `ThresholdKey { 1: uint32 threshold; 2: KeyList keys }`, `6` = `KeyList { 1: repeated Key }`, `7` = `bytes ECDSA_secp256k1`, `2` = `bytes ed25519` (decode as `single` too, tagged in `keyHex` by length 64). Any other field number throws `unsupported key field ${n}`. Comment at the top: why hand-written (design D24: the server keeps its Hedera surface to REST and never constructs SDK transaction objects; `@hiero-ledger/sdk` is in `node_modules` only as `@x402/hedera`'s dependency and is not imported by `src/`; the mirror node returns key lists only as protobuf hex).
 - [ ] **Step 3: `mirror.ts`.** Paths: `/api/v1/accounts/${id}`, `/api/v1/accounts/${id}/tokens?token.id=${tokenId}`, `/api/v1/transactions/${mirrorTxId(txId)}`. A non-200 other than 404 throws `mirror ${path} -> ${status}`. `waitTransaction` loops `transaction()` until non-null or `now() - start >= timeoutMs`, sleeping `intervalMs` (default `sleep` = `setTimeout` promise).
 - [ ] **Step 4:** Tests green; three checks. **Commit** → `feat(hedera): mirror node client and protobuf key decoder with golden vectors (task 4)`.
 
@@ -539,10 +563,10 @@ test("plain two-key list is 2-of-2", () =>
 **Files:**
 - Create: `src/hedera/policy.ts`
 - Modify: `src/payments/policyGate.ts:4` (`payee?: Address` → `payee?: string`), `src/api/app.ts` (`ApiDeps`, add `hedera?: HederaDeps` beside `legalBody?` at `:218`), `src/mcp/server.ts` (`McpToolDeps` `:57-104` add `hedera?`, `MCP_TOOL_DEP_KEYS` `:122-153` add `"hedera"`, three `registerTool` calls after `onboard_agent` which ends before `:1272`)
-- Modify: `src/api/main.ts` (build `hedera` beside `legalBody` at `:215`; pass it in `buildApiApp` at `:838-880`)
+- Modify: `src/api/main.ts` (build `hedera` beside `legalBody` at `:215`; pass it in the `buildApiApp` call that starts at `:754` and closes at `:880`)
 - Test: `test/mcp/hedera.int.test.ts`
 
-**Interfaces:** Consumes task 3 and 4. Produces on `ApiDeps`: `hedera?: { cfg: HederaConfig; mirror: HederaMirror; ledger: PaymentLedger }` (`export interface HederaDeps` in `src/hedera/policy.ts`), and
+**Interfaces:** Consumes task 3 and 4. Produces on `ApiDeps`: `hedera?: { cfg: HederaConfig; mirror: HederaMirror; ledger: PaymentLedger; spendAllowlistThreshold: bigint }` (`export interface HederaDeps` in `src/hedera/policy.ts`; the threshold is copied from `cfg.spendAllowlistThreshold` in `main.ts`, the same value `entityPayment.ts:216` forwards for Arc), and
 
 ```ts
 export async function hederaPolicyInput(args: {
@@ -554,10 +578,10 @@ export async function hederaPolicyInput(args: {
 
 which sets `available` = float balance (D14), `runningPending = 0n` (D8), `isAllowed = false` (D15), `legalActive` and `paused` from the Arc reads.
 
-- [ ] **Step 1: Failing test.** Scaffold: `const { db, repo, rec, apiKeys } = hederaDb();` then `hederaApp({ repo, apiKeys, hedera: { cfg: HEDERA_CFG, mirror: fakeMirror({...}), ledger: new PaymentLedger(db) }, legalBody: { ...defaults, chainReads: arcReads({ paused }) } })` and `startMcpTestClient(app, apiKey)`, where `HEDERA_CFG = { network: "testnet", facilitatorUrl: "https://f.test", mirrorUrl: "https://m.test", usdcTokenId: "0.0.429274", payToAccountId: "0.0.10412694", verifyPriceUsdc: "0.001", verifyPriceAtomic: 1000n }`. Cases, each a `client.callTool({ name, arguments })` and a `JSON.parse(result.content[0].text)`:
-  - `link_hedera_account` with a mirror account whose key is `ONE_OF_TWO` and `publicKey = A` → `{ ok: true, accountId, guardianPublicKey: B }` and the entity row carries the four fields; with `SINGLE` → `{ ok: false, reason: "not-a-1-of-2-list" }`; with `TWO_OF_TWO` → same reason; with `ONE_OF_TWO` and `publicKey = "03" + "ff".repeat(32)` → `{ ok: false, reason: "public-key-not-in-list" }`; a second call with the same values → `{ ok: true }`; with different values → `{ ok: false, reason: "already-linked" }`.
-  - `check_policy` before any link → `{ ok: false, reason: "not-linked" }`; linked, paused on Arc → `paused`; linked, `allowlistEnabled: true` on the treasury config → `not-allowlisted`; linked, balance `500n`, amount `1000` → `over-cap`; linked, balance `5000n`, amount `1000` → `{ ok: true, available: "5000" }`.
-  - `report_payment` with a mirror transaction `SUCCESS` carrying `{ tokenId: usdc, account: linkedAccount, amount: -1000n }` and `{ account: payee, amount: 1000n }` → `{ status: "settled", ledgerId }`; the same `transactionId` again → `{ status: "settled", duplicate: true }` and no second row; result `INVALID_SIGNATURE` → `{ status: "failed", reason: "INVALID_SIGNATURE" }` and a `failed` row; mirror returns `null` throughout → `{ status: "pending" }` and no row; wrong payee → `{ status: "failed", reason: "transfer-mismatch" }`.
+- [ ] **Step 1: Failing test.** Scaffold: `const { db, repo, rec, apiKeys } = hederaDb();` then `hederaApp({ repo, apiKeys, hedera: { cfg: HEDERA_CFG, mirror: fakeMirror({...}), ledger: new PaymentLedger(db), spendAllowlistThreshold: 1_000_000_000n }, legalBody: { ...defaults, chainReads: arcReads({ paused }) } })` and `startMcpTestClient(app, apiKey)`, where `HEDERA_CFG = { network: "testnet", facilitatorUrl: "https://f.test", mirrorUrl: "https://m.test", usdcTokenId: "0.0.429274", payToAccountId: "0.0.10412694", verifyPriceUsdc: "0.001", verifyPriceAtomic: 1000n }`. Cases, each a `client.callTool({ name, arguments })` and a `JSON.parse(result.content[0].text)`:
+  - `link_hedera_account` with a mirror account whose key is `ONE_OF_TWO` and `publicKey = A` → `{ ok: true, accountId, guardianPublicKey: B }` and the entity row carries the four fields; with `SINGLE` → `{ ok: false, reason: "not-a-1-of-2-list" }`; with `TWO_OF_TWO` → same reason; with `ONE_OF_THREE` → same reason (three members); with `THRESHOLD_TWO` → same reason (threshold 2); with a 1-of-2 list whose second member is a 32-byte ed25519 key (build it as `2a4d080112490a233a21${A}0a221220${"ab".repeat(32)}`: field 2 inside the second `Key`, list length 73, threshold-key length 77) → same reason (design D24: ECDSA members only); with `ONE_OF_TWO` and `publicKey = "03" + "ff".repeat(32)` → `{ ok: false, reason: "public-key-not-in-list" }`; a second call with the same values → `{ ok: true }`; with different values → `{ ok: false, reason: "already-linked" }`. Import the vectors from `test/hedera/keyDecode.test.ts`.
+  - `check_policy` before any link → `{ ok: false, reason: "not-linked" }`; linked, paused on Arc → `paused`; linked, `allowlistEnabled: true` on the treasury config → `not-allowlisted`; linked, allowlist off, `spendAllowlistThreshold: 500n` in the deps and amount `1000` → `over-threshold-needs-allowlist` (D15: `isAllowed` is always false on Hedera, so the threshold rule fails closed above it; the scaffold's default threshold is deliberately high); linked, balance `500n`, amount `1000` → `over-cap`; linked, balance `5000n`, amount `1000` → `{ ok: true, available: "5000" }`.
+  - `report_payment` with a mirror transaction `SUCCESS` carrying `{ tokenId: usdc, account: linkedAccount, amount: -1000n }` and `{ account: payee, amount: 1000n }` → `{ status: "settled", ledgerId }`; the same `transactionId` again → `{ status: "settled", duplicate: true }` and no second row; result `INVALID_SIGNATURE` with `tokenTransfers: []` (the shape the mirror node returns for the spike's failed transfer, pre-cleared) → `{ status: "failed", reason: "INVALID_SIGNATURE" }` and a `failed` row; mirror returns `null` throughout → `{ status: "pending" }` and no row; wrong payee → `{ status: "failed", reason: "transfer-mismatch" }`; right payee, amount `999n` against a reported `1000` → `transfer-mismatch` too.
   - Every tool with an id owned by another tenant → `isError: true`, text `not found`.
 - [ ] **Step 2: `policy.ts`** implementing `HederaDeps` and `hederaPolicyInput` as specified; `legalActive` is `(await reads.legalStatus(proxy)) === 0`, `paused` is `reads.treasuryPaused(treasury)`, both inside the same try as `readStanding` (`payments/legalBody.ts:85-99`); a failed read yields `legalActive: false` (fail closed, D8 spirit).
 - [ ] **Step 3: Tools** in `server.ts`, after `onboard_agent`, each starting with the `pay` tool's guard lines (`:514-517`) and `if (!deps.hedera) return { content: [{ type: "text", text: "hedera unavailable" }], isError: true };`:
@@ -576,7 +600,13 @@ which sets `available` = float balance (D14), `runningPending = 0n` (D8), `isAll
       const acct = await deps.hedera.mirror.account(accountId);
       if (!acct?.keyHex) return json({ ok: false, reason: "account-not-found-or-hollow" });
       const key = decodeHederaKey(acct.keyHex);
-      if (key.kind !== "threshold" || key.threshold !== 1 || key.keys.length !== 2 || key.keys.some((k) => k.kind !== "single"))
+      // Design D24: threshold 1, exactly two members, both compressed ECDSA (33 bytes = 66 hex chars).
+      if (
+        key.kind !== "threshold" ||
+        key.threshold !== 1 ||
+        key.keys.length !== 2 ||
+        key.keys.some((k) => k.kind !== "single" || k.keyHex.length !== 66)
+      )
         return json({ ok: false, reason: "not-a-1-of-2-list" });
       const pub = publicKey.toLowerCase();
       const singles = key.keys.map((k) => (k as { keyHex: string }).keyHex.toLowerCase());
@@ -592,16 +622,16 @@ which sets `available` = float balance (D14), `runningPending = 0n` (D8), `isAll
   );
 ```
 
-`json = (v) => ({ content: [{ type: "text", text: JSON.stringify(v) }] })`. `check_policy` takes `{ id, payee, amountUsdc, network }`, validates `amountUsdc` exactly as `pay` does (`:518-529`), refuses `network !== "hedera:testnet"` with `unsupported-network`, returns `not-linked` without a `hederaAccountId`, then `evaluatePolicy(await hederaPolicyInput({...}))` with `perTxCap: rec.perTxCap ?? undefined`, `allowlistEnabled: rec.treasuryConfig?.allowlistEnabled ?? false`, `threshold: deps.spendAllowlistThreshold` (add that scalar to `McpToolDeps` and the key list if it is not already there), and answers `{ ok: true, available }` or the decision. `report_payment` takes `{ id, payee, amountUsdc, network, transactionId, idempotencyKey }`: `waitTransaction(transactionId, { timeoutMs: 10_000, intervalMs: 1_000 })` (D16); `null` → `pending`; the `CRYPTOTRANSFER` record with `result !== "SUCCESS"` → `failed` with the result string and `recordAuthorized`+`markFailed` is NOT used, instead a direct `failed` insert helper `recordFailedOnNetwork` (add it to the ledger beside `recordSettledOnNetwork`, same shape, status `'failed'`, no unique conflict since `batch_ref` is the tx id and the partial index covers `failed` rows too, so a failed id also counts once); `SUCCESS` → find one transfer `{ tokenId === usdcTokenId, account === rec.hederaAccountId, amount === -amount }` and one `{ account === payee, amount === amount }`, else `failed` with `transfer-mismatch`; then `recordSettledOnNetwork`, catching the `UNIQUE` error as `{ status: "settled", duplicate: true }`.
+`json = (v) => ({ content: [{ type: "text", text: JSON.stringify(v) }] })`. `check_policy` takes `{ id, payee, amountUsdc, network }`, validates `amountUsdc` exactly as `pay` does (`:518-529`), refuses `network !== "hedera:testnet"` with `unsupported-network`, returns `not-linked` without a `hederaAccountId`, then `evaluatePolicy(await hederaPolicyInput({...}))` with `perTxCap: rec.perTxCap ?? undefined`, `allowlistEnabled: rec.treasuryConfig?.allowlistEnabled ?? false`, `threshold: deps.hedera.spendAllowlistThreshold` (it rides on `HederaDeps`; nothing else on `McpToolDeps` changes), and answers `{ ok: true, available }` or the decision. `report_payment` takes `{ id, payee, amountUsdc, network, transactionId, idempotencyKey }` (`idempotencyKey` is accepted for symmetry with `pay` and is not consulted: the partial unique index governs, D5; say so in the tool description): `waitTransaction(transactionId, { timeoutMs: 10_000, intervalMs: 1_000 })` (D16); `null` → `pending`; the `CRYPTOTRANSFER` record with `result !== "SUCCESS"` → `failed` with the result string and `recordAuthorized`+`markFailed` is NOT used, instead a direct `failed` insert helper `recordFailedOnNetwork` (add it to the ledger beside `recordSettledOnNetwork`, same shape, status `'failed'`, no unique conflict since `batch_ref` is the tx id and the partial index covers `failed` rows too, so a failed id also counts once); `SUCCESS` → find one transfer `{ tokenId === usdcTokenId, account === rec.hederaAccountId, amount === -amount }` and one `{ account === payee, amount === amount }`, else `failed` with `transfer-mismatch`; then `recordSettledOnNetwork`, catching the `UNIQUE` error as `{ status: "settled", duplicate: true }`.
 
-- [ ] **Step 4: Wiring.** `main.ts`: `const hedera = cfg.hedera ? { cfg: cfg.hedera, mirror: new HederaMirror(cfg.hedera.mirrorUrl), ledger: new PaymentLedger(db) } : undefined;` and `hedera,` in the `buildApiApp` object. `transport.ts` needs nothing: the key list copies it.
+- [ ] **Step 4: Wiring.** `main.ts`: `const hedera = cfg.hedera ? { cfg: cfg.hedera, mirror: new HederaMirror(cfg.hedera.mirrorUrl), ledger: new PaymentLedger(db), spendAllowlistThreshold: cfg.spendAllowlistThreshold } : undefined;` and `hedera,` in the `buildApiApp` object. `transport.ts` needs nothing: the key list copies it.
 - [ ] **Step 5:** Tests green; three checks. `MCP_TOOL_DEP_KEYS` fails to compile until `"hedera"` is listed: that is the expected first typecheck failure. **Commit** → `feat(hedera): link_hedera_account, check_policy, report_payment MCP tools (task 5)`.
 
 ### Task 6: `GET /verify/:publicId`, unsigned, paid on Hedera
 
 **Files:**
 - Create: `src/api/routes/verify.ts`, `src/hedera/attestation.ts`
-- Modify: `src/api/routes/legalBodies.ts` (export `createClientLimiter(deps): (c) => TokenBucket` built from the closure at `:141-166`, and reuse it in place), `src/api/app.ts:325` (mount after `mountLegalBodyRoutes`), `src/api/main.ts` (nothing new; `hedera` and `legalBody` deps already pass)
+- Modify: `src/api/routes/legalBodies.ts` (export `createClientLimiter(deps): (c) => TokenBucket` built from the closure at `:141-166` and the shared bucket beside it as `sharedReadBudget(deps): TokenBucket`, reusing both in place, audit C9), `src/api/app.ts:325` (mount after `mountLegalBodyRoutes`), `src/api/main.ts` (nothing new; `hedera` and `legalBody` deps already pass)
 - Test: `test/api/verify.route.test.ts`
 
 **Interfaces:** Produces `mountVerifyRoutes(app, deps: ApiDeps): void` (returns early without `deps.hedera` or `deps.legalBody`), and
@@ -618,16 +648,17 @@ export interface AttestationBody {
 export async function buildAttestation(entity: EntityRecord, deps: { lookup: LegalBodyLookupDeps; worldId?: ApiDeps["worldId"]; chainId: number; identityRegistry: string; now: () => number }): Promise<AttestationBody>
 ```
 
-- [ ] **Step 1: Failing test.** Scaffold: `hederaDb()` then `hederaApp({ repo, hedera: { cfg: HEDERA_CFG, mirror: fakeMirror({}), ledger }, worldId: { store: { findByTenant: () => ({ credential: "orb", nullifier: "n", verifiedAt: 1, environment: "production" }) }, cfg: { action: "guardian-verification" } } })`, with a `fetch` stub for the facilitator injected through `HTTPFacilitatorClient`'s `fetch` option if it has one, otherwise `vi.stubGlobal("fetch", …)`:
+- [ ] **Step 1: Failing test.** Scaffold: `hederaDb()` then `hederaApp({ repo, hedera: { cfg: HEDERA_CFG, mirror: fakeMirror({}), ledger, spendAllowlistThreshold: 1_000_000_000n }, worldId: { store: { findByTenant: () => ({ credential: "orb", nullifier: "n", verifiedAt: 1, environment: "production" }) }, cfg: { action: "guardian-verification" } } })`. `HTTPFacilitatorClient` has no `fetch` option (pre-cleared), so stub the global with `vi.stubGlobal("fetch", …)` in `beforeEach` and restore it in `afterEach`. The stub answers three paths on `HEDERA_CFG.facilitatorUrl`: `GET /supported` → `{ kinds: [{ x402Version: 2, scheme: "exact", network: "hedera:testnet", extra: { feePayer: "0.0.7162784" } }], extensions: [], signers: { "hedera:*": ["0.0.7162784"] } }` (the middleware fetches it at mount, and `ExactHederaScheme` copies `extra.feePayer` into every requirement from it; without this the mount throws), `POST /verify` and `POST /settle` as each case says. Decode the 402 with `decodePaymentRequiredHeader` from `@x402/core/http` (or the equivalent export the `.d.ts` shows): in v2 the requirements travel in the `PAYMENT-REQUIRED` header and the JSON body is `{}` (pre-cleared).
   - flag off (`hedera` undefined) → `GET /verify/<uuid>` is 404.
-  - unknown `publicId` → 404 with `{ error: "not_found" }` and **no** `PAYMENT-REQUIRED` header, and the facilitator stub was never called.
+  - unknown `publicId` → 404 with `{ error: "not_found" }` and **no** `PAYMENT-REQUIRED` header, and the stub saw only `/supported`.
   - known entity not public on chain (`status: "pending"`) → 404 likewise.
-  - known, no payment header → 402; body `accepts[0]` matches `{ scheme: "exact", network: "hedera:testnet", payTo: "0.0.10412694", asset: "0.0.429274", amount: "1000" }` (read the exact v2 field names from the response the middleware produces; pin them in the assertion).
-  - the per-client limiter exhausted → 429 before any 402.
+  - known, no payment header → 402; the decoded header's `accepts[0]` matches `{ scheme: "exact", network: "hedera:testnet", payTo: "0.0.10412694", asset: "0.0.429274", amount: "1000", extra: { feePayer: "0.0.7162784" } }`; the body is `{}`.
+  - the per-client limiter exhausted → 429 before any 402; the shared bucket exhausted → 429 likewise.
+  - a malformed `PAYMENT-SIGNATURE` header (not base64 JSON) → 402 and the stub never saw `/verify`.
   - facilitator `verify` returns `{ isValid: false, invalidReason: "x" }` for a well-formed header → 402 and no body fields from the attestation.
   - facilitator `verify` valid and `settle` `{ success: true, transaction: "0.0.7162784@1788998489.006924053", network: "hedera:testnet" }` → 200, body has `subject.publicId`, `standing: "active"`, `controller.humanVerified: true` when the World store has a verification, `expiresAt` 300 s after `issuedAt`, no `signature` field yet, and header `PAYMENT-RESPONSE` present.
   - facilitator `settle` `{ success: false, errorReason: "transaction_failed" }` → 402 and no attestation body.
-- [ ] **Step 2: `attestation.ts`** building `AttestationBody` from `lookup.resolver`'s `readStanding` (call `readStanding(deps.lookup.chainReads, proxy, treasury)`; add `chainReads: LegalBodyChainReads` to `LegalBodyLookupDeps` in `legalBodies.ts` and pass `arc` for it in `main.ts:852-878`), `lookup.formationSummary` via the `formationOf` shape at `legalBodies.ts:180-196` (lift that function to an export), `worldId.store.findByTenant` as `metadata.ts:54-66` does (`humanVerified: gv.credential !== "waiver"`), and `entity.oaHash`/`oaManifestVersion`.
+- [ ] **Step 2: `attestation.ts`** building `AttestationBody` from `lookup.resolver`'s `readStanding` (call `readStanding(deps.lookup.chainReads, proxy, treasury)`; add `chainReads: LegalBodyChainReads` to `LegalBodyLookupDeps` in `legalBodies.ts` and pass `arc` for it in `main.ts:852-878`), `lookup.formationSummary` via the `formationOf` shape at `legalBodies.ts:185-196` (lift that function to an export), `worldId.store.findByTenant` as `metadata.ts:55-69` does (`humanVerified: gv.credential !== "waiver"`), and `entity.oaHash`/`oaManifestVersion`.
 - [ ] **Step 3: `verify.ts`:**
 
 ```ts
@@ -636,6 +667,7 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   const lb = deps.legalBody;
   if (!h || !lb) return;
   const limiter = createClientLimiter(deps);
+  const shared = sharedReadBudget(deps);
   const facilitator = new HTTPFacilitatorClient({ url: h.cfg.facilitatorUrl });
   const server = new x402ResourceServer(facilitator).register("hedera:*", new ExactHederaScheme());
   const routes: RoutesConfig = {
@@ -652,7 +684,8 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   };
   // Layer 1: limiter and the 404 guard, BEFORE any 402 is issued (design D9).
   app.use("/verify/:publicId", async (c, next) => {
-    if (!limiter(c).take()) return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
+    if (!limiter(c).take() || !shared.take())
+      return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
     const publicId = c.req.param("publicId");
     const ent = UUID.test(publicId) ? deps.repo.findByPublicId(publicId) : undefined;
     if (!ent || !isPublicOnChain(ent)) return c.json({ error: "not_found" }, 404);
@@ -660,7 +693,9 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
     await next();
   });
   // Layer 2: the x402 middleware (402, verify, settle; discards our body on a failed settle).
-  app.use("/verify/:publicId", paymentMiddleware(routes, server, undefined, undefined, false));
+  // syncFacilitatorOnStart stays at its default (true): with false the middleware never
+  // initializes and every request answers 500 (design Pre-cleared, audit B8).
+  app.use("/verify/:publicId", paymentMiddleware(routes, server));
   // Layer 3: the handler.
   app.get("/verify/:publicId", async (c) => {
     const ent = c.get("verifyEntity") as EntityRecord;
@@ -671,7 +706,7 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
 }
 ```
 
-`syncFacilitatorOnStart` is passed `false` so tests do not hit the network at mount; production calls `server.initialize()` lazily on first request (the middleware does). Declare `verifyEntity` in the app's `Variables` type or use `c.set` with a cast; pick whichever keeps `typecheck` green. Register the mount at `app.ts` after `:325`: `mountVerifyRoutes(app, deps);`.
+The mount fetches the facilitator's `/supported` once (a background promise; a failure there is retried on the first request by the middleware's own `initializeHttpServer`), which is why every route test stubs that path. Declare `verifyEntity` in the app's `Variables` type or use `c.set` with a cast; pick whichever keeps `typecheck` green. Register the mount at `app.ts` after `:325`: `mountVerifyRoutes(app, deps);`.
 
 - [ ] **Step 4:** Tests green; three checks. **Commit** → `feat(hedera): GET /verify/:publicId paid on hedera:testnet through @x402/hono, unsigned body (task 6)`.
 
@@ -683,9 +718,9 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
 
 **Interfaces:** Produces the `novi-hedera` commands and, for task 8 and 15, `createNoviClient({ mcpUrl, apiKey }): { checkPolicy, reportPayment, linkHederaAccount }`, `custodyAgnosticSigner(accountId, pub, rawSign)`, `localRawSigner(privHex)`, `payFetchFor({ signer, novi, entityId }): typeof fetch`.
 
-- [ ] **Step 1: Scaffold.** `package.json`: `{ "name": "@novicorpus/hedera-client", "private": true, "type": "module", "bin": { "novi-hedera": "src/cli.ts" }, "scripts": { "test": "vitest run", "lint": "biome check .", "typecheck": "tsc --noEmit" }, "dependencies": { "@x402/core": "2.25.0", "@x402/fetch": "2.25.0", "@x402/hedera": "2.25.0", "@hiero-ledger/sdk": "2.85.0", "@noble/curves": "1.8.1", "@noble/hashes": "1.7.1", "@modelcontextprotocol/sdk": "1.29.0", "tsx": "^4.23.13" }, "devDependencies": { "vitest": "^2.1.0", "@biomejs/biome": "^1.9.0", "typescript": "^5.6.0" } }`. Copy `back/backend/biome.json` and a minimal `tsconfig.json` (`"module": "NodeNext"`, `"strict": true`). `.env.tpl` with `op://` references: `TREASURY_ACCOUNT_ID`, `TREASURY_PRIVATE_KEY` (item `Hedera Testnet Treasury`), `AGENT_ACCOUNT_ID`, `AGENT_PRIVATE_KEY` (item `Hedera Spike Agent Key`), `NOVI_MCP_URL=http://127.0.0.1:8787/mcp`, `NOVI_API_KEY` (item `Novi Corpus Demo API Key`, created in task 8), `NOVI_ENTITY_ID`, `HEDERA_MIRROR_URL`, `USDC_TOKEN_ID=0.0.429274`. Confirm `npm install` reports no `@hashgraph/sdk`.
-- [ ] **Step 2: Failing tests.** `signer.test.ts` is the spike's step 0 as a test: build `custodyAgnosticSigner` from `localRawSigner("0x" + "11".repeat(32))`, call `createPartiallySignedTransferTransaction({ scheme: "exact", network: "hedera:testnet", payTo: "0.0.10412694", asset: "0.0.429274", amount: "1000", extra: { feePayer: "0.0.7162784" }, ... })`, decode the base64 with `Transaction.fromBytes`, and assert `PublicKey.verifyTransaction` is true and the signature equals the one `tx.sign(PrivateKey)` produces on an identical transaction. `pay.test.ts`: `payFetchFor` with a fake `novi.checkPolicy` returning `{ ok: false, reason: "paused" }` → the wrapped fetch rejects with `Error("policy denied: paused")` before any signing (assert the signer was never called); with `{ ok: true }` and a fake 402/200 server → `reportPayment` is called with the `transaction` from the decoded `PAYMENT-RESPONSE`, and is retried once when it answers `pending`.
-- [ ] **Step 3: `signer.ts`** = the spike's `localRawSigner` and `custodyAgnosticSigner` verbatim (`hedera-signer-spike/src/lib.ts:18-48`), `RawSign` exported, plus the doc comment "A1/A2 adapters implement `RawSign` against Turnkey raw-payload or a KMS; nothing else changes."
+- [ ] **Step 1: Scaffold.** `package.json`: `{ "name": "@novicorpus/hedera-client", "private": true, "type": "module", "bin": { "novi-hedera": "src/cli.ts" }, "scripts": { "test": "vitest run", "lint": "biome check .", "typecheck": "tsc --noEmit" }, "dependencies": { "@x402/core": "2.25.0", "@x402/fetch": "2.25.0", "@x402/hedera": "2.25.0", "@hiero-ledger/sdk": "2.85.0", "@noble/curves": "1.8.1", "@noble/hashes": "1.7.1", "@modelcontextprotocol/sdk": "1.29.0", "tsx": "^4.23.13" }, "devDependencies": { "vitest": "^2.1.0", "@biomejs/biome": "^1.9.0", "typescript": "^5.6.0" } }`. Copy `back/backend/biome.json` and a minimal `tsconfig.json` (`"module": "NodeNext"`, `"strict": true`). `.env.tpl` with `op://` references: `TREASURY_ACCOUNT_ID`, `TREASURY_PRIVATE_KEY` (item `Hedera Testnet Treasury`), `AGENT_ACCOUNT_ID`, `AGENT_PRIVATE_KEY` (item `Hedera Spike Agent Key`), `NOVI_MCP_URL` (`http://127.0.0.1:8787/mcp` for task 8, `https://www.novicorpus.com/backend/mcp` for the demo, D28), `NOVI_API_KEY` (item `Novi Corpus Demo API Key`, created in task 8 locally and re-minted on prod in task 16), `NOVI_ENTITY_ID` (`HederaDemo_1`'s id), `NOVI_PROFILE_URL` (`HederaDemo_1`'s own profile URL, task 12), `HEDERA_MIRROR_URL`, `USDC_TOKEN_ID=0.0.429274`. Confirm `npm install` reports no `@hashgraph/sdk`. Add a `hedera-client` job to `.github/workflows/ci.yml` mirroring the backend job (`working-directory: back/hedera-client`, `npm ci`, typecheck, lint, test), gated on the same paths filter idiom with `back/hedera-client/**` (audit U4).
+- [ ] **Step 2: Failing tests.** `signer.test.ts` is the spike's step 0 as a test: build `const signer = custodyAgnosticSigner("0.0.10450558", pub, localRawSigner("0x" + "11".repeat(32)))`, call `signer.createPartiallySignedTransferTransaction({ scheme: "exact", network: "hedera:testnet", payTo: "0.0.10412694", asset: "0.0.429274", amount: "1000", extra: { feePayer: "0.0.7162784" }, ... })` (a method on `ClientHederaSigner`, not a package export, pre-cleared), decode the base64 with `Transaction.fromBytes`, and assert `PublicKey.verifyTransaction` is true and the signature equals the one `tx.sign(PrivateKey)` produces on an identical transaction. `pay.test.ts`: `payFetchFor` with a fake `novi.checkPolicy` returning `{ ok: false, reason: "paused" }` → the wrapped fetch rejects with an error matching `/policy denied: paused/` (the SDK wraps it as `Failed to create payment payload: Payment creation aborted: policy denied: paused`, pre-cleared) before any signing (assert the signer was never called); with `{ ok: true }` and a fake 402/200 server → `reportPayment` is called with the `transaction` from the decoded `PAYMENT-RESPONSE`, and is retried once when it answers `pending`.
+- [ ] **Step 3: `signer.ts`** = the spike's `localRawSigner` and `custodyAgnosticSigner` verbatim (`hedera-signer-spike/src/lib.ts:20-50`; the spike's type-only `PublicKey` import from `@x402/hedera` is not a real export there, import the type from `@hiero-ledger/sdk`), `RawSign` exported, plus the doc comment "A1/A2 adapters implement `RawSign` against Turnkey raw-payload or a KMS; nothing else changes."
 - [ ] **Step 4: `novi.ts`:** an MCP client (`Client` + `StreamableHTTPClientTransport` with `authorization: Bearer <apiKey>`, exactly `back/backend/test/mcp/helpers.ts:14-17`) exposing the three tools as typed functions that parse `content[0].text` as JSON.
 - [ ] **Step 5: `pay.ts`:**
 
@@ -709,22 +744,22 @@ export function payFetchFor(o: { signer: ClientHederaSigner; novi: NoviClient; e
 }
 ```
 
-`reportUntilSettled` calls `reportPayment` with `{ id, payee, amountUsdc, network: "hedera:testnet", transactionId: s.transaction, idempotencyKey: s.transaction }` (payee and amount from the requirements the hook saw, kept in a closure) up to 3 times, 4 seconds apart, while the answer is `pending`. Confirm at implementation time that the abort surfaces as a thrown error from `wrapFetchWithPayment`; if it surfaces as a 402 response instead, the command layer treats "policy denied" in the error/reason as the refusal and prints it.
+`reportUntilSettled` calls `reportPayment` with `{ id, payee, amountUsdc, network: "hedera:testnet", transactionId: s.transaction, idempotencyKey: s.transaction }` (payee and amount from the requirements the hook saw, kept in a closure) up to 3 times, 4 seconds apart, while the answer is `pending`. The abort surfaces as a thrown error from `wrapFetchWithPayment` (pre-cleared); the command layer catches it, prints `policy denied: <reason>` and exits 2, so leg 3 of the demo shows the refusal and no HashScan link. A refused settlement (402 with `PAYMENT-RESPONSE` `success: false`) is not reported and never reaches the ledger; the README says so (design Component 7).
 
-- [ ] **Step 6: Commands.** `provision`: generate or read the agent key (spike `02-hollow-account.ts`), transfer 1 USDC from the treasury item to the agent's EVM alias, wait for the account on the mirror, then set the 1-of-2 key list (spike `04-keylist.ts` `list` branch) **without any payment in between**, then set the memo `hcs-11:<NOVI_PROFILE_URL>` when that env var is present, then print `accountId` and `publicKey` and the exact `link_hedera_account` call. **Do not proceed if** the key-list update on the still-hollow account fails with anything but `SUCCESS`: fall back to a 0.001 USDC self-transfer signed by the agent key to complete the account, retry, and record which order worked (design component 7). `revoke`: the spike's `rotate` branch. `pay <url>`: `payFetchFor` and print status, body head, and the HashScan link. `demo-buyer`: task 15.
+- [ ] **Step 6: Commands.** `provision`: generate or read the agent key (spike `02-hollow-account.ts`), transfer 1 USDC from the treasury item to the agent's EVM alias, wait for the account on the mirror, then set the 1-of-2 key list (spike `04-keylist.ts` `list` branch) **without any payment in between**, then set the memo `hcs-11:<NOVI_PROFILE_URL>` when that env var is present, then print `accountId` and `publicKey` and the exact `link_hedera_account` call; `provision --memo-only` skips to the memo step on the existing `AGENT_ACCOUNT_ID`. **Do not proceed if** the key-list update on the still-hollow account fails with anything but `SUCCESS`: fall back to a 0.001 USDC self-transfer signed by the agent key to complete the account, retry, and record which order worked (design component 7). `link`: calls `linkHederaAccount` with `NOVI_ENTITY_ID`, `AGENT_ACCOUNT_ID` and the agent public key, prints the JSON answer. `revoke`: the spike's `rotate` branch. `pay <url>`: `payFetchFor` and print status, body head, and the HashScan link. `demo-buyer`: task 15.
 - [ ] **Step 7:** `npm test`, `npm run lint`, `npm run typecheck` in the client. **Commit** → `feat(hedera-client): signer, MCP policy client, paying fetch with check_policy hook, provision/revoke/pay commands (task 7)`.
 
 ### Task 8: LIVE: the rail end to end, then pull request 1
 
 **Files:** `back/backend/README.md` (a "Hedera rail" section: the flag, the three tools, D2 and D15 said plainly, the run below), this plan's Records.
 
-- [ ] **Step 1:** Start the backend locally with the flag on: `cd back/backend && op run --env-file=.env.hedera.tpl -- npm run api` where `.env.hedera.tpl` is a copy of the deployment's template with the `HEDERA_*` server values from the naming table (`HEDERA_PAYTO_ACCOUNT_ID=0.0.10412694`). Expected boot line includes `hedera: { network: 'testnet'` and `attestationKey: undefined`.
-- [ ] **Step 2:** Create an API key for the demo entity's tenant with `spend` capability through the existing `/api-keys` flow (the `cli.int.test.ts` sequence), store it in 1Password as `Novi Corpus Demo API Key`. Expected: `whoami` over MCP returns the tenant.
+- [ ] **Step 1:** Start the backend locally with the flag on and the prod database copy (D28, task 0 step 9): `cd back/backend && DATA_DIR=./data-prod-copy op run --env-file=.env.hedera.tpl -- npm run api` where `.env.hedera.tpl` is a copy of the deployment's template with the `HEDERA_*` server values from the naming table (`HEDERA_PAYTO_ACCOUNT_ID=0.0.10412694`). Expected boot line includes `hedera: { network: 'testnet'` and `attestationKey: undefined`, and `curl -s http://127.0.0.1:8787/legal-bodies/0x92ae7c6b6eB9470d7E01F8fEb352714bD80A7AAf` answers `"standing":"active"` (the row is there).
+- [ ] **Step 2:** Create an API key for `HederaDemo_1`'s tenant (Alex's wallet) with `spend` capability through the existing `/api-keys` flow on the local backend (the `cli.int.test.ts` sequence), store it in 1Password as `Novi Corpus Demo API Key`. Expected: `whoami` over MCP returns Alex's tenant. This key exists only in the local copy; task 16 mints the prod one into the same 1Password item.
 - [ ] **Step 3:** `cd back/hedera-client && op run --env-file=.env.tpl -- npx tsx src/cli.ts provision`. Expected last lines: `account 0.0.<new> key ThresholdKey(1 of 2)` and the printed link call. Record the account id and the two transaction ids.
 - [ ] **Step 4:** Link: `op run … -- npx tsx src/cli.ts link` (a thin command that calls `linkHederaAccount`). Expected: `{"ok":true,"accountId":"0.0.<new>","guardianPublicKey":"03afcd…"}`.
-- [ ] **Step 5:** Pay: `op run … -- npx tsx src/cli.ts pay http://127.0.0.1:8787/verify/9f8003f5-4c70-435a-9980-9a54625691b7`. Expected: `HTTP 200`, body starting `{"subject":{"publicId":"9f8003f5-`, `settlement: OK https://hashscan.io/testnet/transaction/0.0.7162784@…`, then `report_payment -> settled`. Open the HashScan link: `CRYPTOTRANSFER SUCCESS`, 0.001 USDC to `0.0.10412694`. **Do not proceed if** the report stays `pending` after three tries: read the mirror node by timestamp, fix `mirrorTxId`, and rerun.
-- [ ] **Step 6:** `sqlite3 <dbPath> "select network, status, batch_ref, amount from payments_ledger order by id desc limit 1"`. Expected: `hedera:testnet|settled|0.0.7162784@…|1000`.
-- [ ] **Step 7:** README section; three checks; **commit** → `docs(hedera): README section for the rail, live run recorded (task 8)`. Then `git push -u origin feat/hedera-rail` and `gh pr create --title "feat(hedera): the rail — self-custody payments on Hedera testnet, /verify unsigned (PR 1 of 3)" --body-file <a body listing tasks 1–8, the HashScan links, D1/D2/D15 in one paragraph each, and the AI-attribution line>`. **Merge step (ends phase 1):** Alex reads the diff, CI green, `gh pr merge --merge --delete-branch` (D20; the self-merge rule is in the workflow note in Alex's Obsidian vault), then `git checkout -b feat/hedera-identity origin/main`.
+- [ ] **Step 5:** Pay: `op run … -- npx tsx src/cli.ts pay http://127.0.0.1:8787/verify/9f8003f5-4c70-435a-9980-9a54625691b7`. Expected: `HTTP 200`, body starting `{"subject":{"publicId":"9f8003f5-`, `settlement: OK https://hashscan.io/testnet/transaction/0.0.7162784@…`, then `report_payment -> settled`. Open the HashScan link: `CRYPTOTRANSFER SUCCESS`, 0.001 USDC to `0.0.10412694`. Record the transaction id and a screen capture at once: this is the D27 line and the evidence if Blocky402 is down later (audit U3). **Do not proceed if** the report stays `pending` after three tries: read the mirror node by timestamp, fix `mirrorTxId`, and rerun. **If Blocky402 answers 5xx or times out on every try,** run the facilitator locally from `@x402/hedera`'s `x402Facilitator` with the spare account as fee payer (the start-now note's fallback), point `HEDERA_FACILITATOR_URL` at it, and record that the settlement was self-facilitated.
+- [ ] **Step 6:** `sqlite3 data-prod-copy/legalbody.db "select network, status, batch_ref, amount from payments_ledger order by id desc limit 1"`. Expected: `hedera:testnet|settled|0.0.7162784@…|1000`.
+- [ ] **Step 7:** README section (no key material, no 1Password field values, item titles only; the repo is public, audit U9); three checks; `superpowers:requesting-code-review` on the branch; **commit** → `docs(hedera): README section for the rail, live run recorded (task 8)`. Then `git push -u origin feat/hedera-rail` and `gh pr create --title "feat(hedera): the rail — self-custody payments on Hedera testnet, /verify unsigned (PR 1 of 3)" --body-file <a body listing tasks 1–8, the HashScan links, D1/D2/D15 in one paragraph each, and the AI-attribution line>`, reviewer Martin. **Merge step (ends phase 1):** D29: Martin has 24 hours; after that, CI green and Alex's diff read, `gh pr merge --merge --delete-branch` (D20), then `git checkout -b feat/hedera-identity origin/main`.
 
 ---
 
@@ -764,8 +799,8 @@ uaid:          uaid:aid:7yCVPN2iLzHZ244fEcpayKQbhzHaMVWhEZgWZoessWWnP13s19RKoa8Y
 
 - [ ] **Step 1: Failing test** for `registerOnHedera` with fake viem clients: `simulateContract` returns `{ result: 12n, request }`, `writeContract` returns a hash, `waitForTransactionReceipt` returns `status: "success"` → `{ agentId: "12", txHash }`; receipt `reverted` → throws `register reverted`.
 - [ ] **Step 2: `registry.ts`:** `simulateContract({ address: registry, abi: iIdentityRegistryAbi, functionName: "register", args: [metadataURI], account })` → `writeContract(request)` → `waitForTransactionReceipt`. The agent id is the simulate result (the ABI carries no event to parse).
-- [ ] **Step 3: Script** `scripts/hedera-register-identity.mts --entity <name|key> | --all [--execute]`, idiom `scripts/sweep-standing-float.mts:1-40`: `loadConfig()` for `dbPath` and `chainId`; script-only env `HEDERA_JSON_RPC_URL`, `HEDERA_IDENTITY_REGISTRY`, `HEDERA_OPERATOR_KEY` read from `process.env` and refused if missing; viem chain object `{ id: 296, name: "hedera-testnet", nativeCurrency: { name: "HBAR", symbol: "HBAR", decimals: 18 }, rpcUrls: { default: { http: [rpc] } } }`; for each entity with `metadataURI` and no `hederaAgentId`: dry-run prints the metadata URI and the UAID; `--execute` registers, derives the UAID with `uaidInputsFor(entity, cfg.chainId)` and `uid = entity.agentId`, calls `setHederaIdentity`, prints `hashscan.io/testnet/transaction/<txHash>`.
-- [ ] **Step 4: LIVE.** `op run --env-file=.env.register.tpl -- npx tsx scripts/hedera-register-identity.mts --entity FormationE2E_1 --execute`. Expected: `registered agentId=<n> tx=0x… uaid=uaid:aid:…`. Then `--all --execute` if HBAR allows (each call ~0.05 HBAR). Record.
+- [ ] **Step 3: Script** `scripts/hedera-register-identity.mts --entity <name|key> [--entity …] | --all-entities [--execute]` and `--record --entity <id> --agent-id <n> --tx <hash> --uaid <uaid>`, idiom `scripts/sweep-standing-float.mts:1-40`: `loadConfig()` for `dbPath` and `chainId`; script-only env `HEDERA_JSON_RPC_URL`, `HEDERA_OPERATOR_KEY` read from `process.env` and refused if missing; the registry address is `HEDERA_IDENTITY_REGISTRY` exported from `src/hedera/registry.ts` (audit C3); viem chain object `{ id: 296, name: "hedera-testnet", nativeCurrency: { name: "HBAR", symbol: "HBAR", decimals: 18 }, rpcUrls: { default: { http: [rpc] } } }`; for each named entity with `metadataURI` and no `hederaAgentId`: dry-run prints the metadata URI and the UAID; `--execute` registers, derives the UAID with `uaidInputsFor(entity, cfg.chainId)` and `uid = entity.agentId`, calls `setHederaIdentity`, prints `hashscan.io/testnet/transaction/<txHash>` and the exact `--record` line to run on the box. `--all-entities` is refused without `--execute --yes` and prints the count first (audit C17: 16 entities on prod, other tenants' included). `--record` writes the three values with `setHederaIdentity` and no chain call, for the box (D28).
+- [ ] **Step 4: LIVE.** `op run --env-file=.env.register.tpl -- npx tsx scripts/hedera-register-identity.mts --entity FormationE2E_1 --entity HederaDemo_1 --execute` (the operator key's EVM alias equals the account's `evm_address`, pre-cleared, so the write spends `0.0.10412694`'s HBAR). Expected, twice: `registered agentId=<n> tx=0x… uaid=uaid:aid:…` and a `--record …` line. Record both, and hand the two `--record` lines to task 16.
 - [ ] **Step 5:** Three checks; **commit** → `feat(hedera): ERC-8004 registration on Hedera testnet, identity script, UAID stored (task 10)`.
 
 ### Task 11: The profile route and the metadata cross-links
@@ -775,21 +810,21 @@ uaid:          uaid:aid:7yCVPN2iLzHZ244fEcpayKQbhzHaMVWhEZgWZoessWWnP13s19RKoa8Y
 - Modify: `src/api/routes/metadata.ts:35-42` (ungate `registrations[]`), add `uaid` and `hedera` blocks before `:96`; `src/api/app.ts` mount after the metadata mount at `:321`
 
 - [ ] **Step 1: Failing tests.** `/metadata/:publicId` with ENS unset and `hederaAgentId` set → `registrations` has one entry `{ agentId, agentRegistry: "eip155:296:0x8004a818…" }`; with both → two entries, Arc first; `uaid` present when set; `hedera: { accountId, verifyUrl, profileUrl }` present when linked. `/metadata/:publicId/profile` → 200 JSON with `version: "1.0"`, `type: 1`, `display_name: entity.name`, `uaid`, `aiAgent: { type: 1, capabilities: [], model: "novi-corpus-legal-body" }`, `properties: { legalBody: { standing?: never }, verifyUrl, metadataUrl, registrations }` (no standing, the profile is static; the claims ceiling applies to `properties.description`: "a registered legal body; check standing at verifyUrl"); 404 when no `uaid`; `Cache-Control: public, max-age=300`.
-- [ ] **Step 2:** Implement; the Hedera registry address for `registrations[]` comes from a new optional `ApiDeps.hederaIdentityRegistry?: string` set in `main.ts` from `process.env.HEDERA_IDENTITY_REGISTRY ?? "0x8004A818BFB912233c491871b3d84c89A494BD9e"` (a public constant, not a secret; keep it out of `Config`).
+- [ ] **Step 2:** Implement; the Hedera registry address for `registrations[]` is the `HEDERA_IDENTITY_REGISTRY` constant imported from `src/hedera/registry.ts` (a public address; never `process.env`, never `Config`; audit C3). The `hedera.verifyUrl` and `profileUrl` are built from the same base the metadata links use (`links.metadataBase`), so on prod they are prod URLs (D28).
 - [ ] **Step 3:** Tests; three checks; **commit** → `feat(hedera): HCS-11 profile route, metadata registrations ungated, uaid and hedera blocks (task 11)`.
 
 ### Task 12: Memo link from `provision`, then pull request 2
 
-- [ ] **Step 1:** In the client, `provision` reads `NOVI_PROFILE_URL` and sets the account memo `hcs-11:<url>` (`AccountUpdateTransaction().setAccountMemo`, signed by the agent key and the guardian as the key-list update was). If task 0 step 7 found HTTPS unsupported, this step instead inscribes the profile JSON as one HCS-1 file from the operator account and the memo points at `hcs://1/<topicId>`; say which in Records.
-- [ ] **Step 2: LIVE.** Re-run `provision --memo-only` on the linked account. Expected on the mirror node: `"memo": "hcs-11:https://…/metadata/9f8003f5-…/profile"`.
-- [ ] **Step 3:** README paragraph "Resolving a Novi Corpus company from Hedera" (D23, the three hops). **Commit** → `feat(hedera-client): provision sets the HCS-11 memo; docs for resolution (task 12)`. **Merge step (ends phase 2):** push, `gh pr create` with title "feat(hedera): portable identity, ERC-8004 on Hedera, UAID, HCS-11 profile (PR 2 of 3)", Alex reads the diff, CI green, `gh pr merge --merge --delete-branch`, then `git checkout -b feat/hedera-attest origin/main`.
+- [ ] **Step 1:** In the client, `provision` reads `NOVI_PROFILE_URL` and sets the account memo `hcs-11:<url>` (`AccountUpdateTransaction().setAccountMemo`, signed by the agent key and the guardian as the key-list update was). The URL is `HederaDemo_1`'s own profile, `https://www.novicorpus.com/backend/metadata/<HederaDemo_1 publicId>/profile`: an HCS-11 memo describes its own account, and `FormationE2E_1` has no Hedera account (audit C7; D23 is how a buyer reaches `FormationE2E_1`'s profile). HTTPS is a valid reference in the spec and the standards SDK resolver does not follow it (pre-cleared); **if Monday 2026-09-15 has slack,** add `provision --inscribe`: inscribe the profile JSON as one HCS-1 file from the operator account and set the memo to `hcs://1/<topicId>` so SDK-based agents resolve it too; say which memo is live in Records and the README.
+- [ ] **Step 2: LIVE.** `provision --memo-only` on the linked account, with `NOVI_PROFILE_URL` set to `HederaDemo_1`'s profile. Expected on the mirror node: `"memo": "hcs-11:https://www.novicorpus.com/backend/metadata/<HederaDemo_1 publicId>/profile"`. (The URL answers 404 until task 16's second deploy; that is expected on Sunday morning and checked again in task 16.)
+- [ ] **Step 3:** README paragraph "Resolving a Novi Corpus company from Hedera" (D23, the three hops, and which resolvers follow an HTTPS memo). `superpowers:requesting-code-review` on the branch. **Commit** → `feat(hedera-client): provision sets the HCS-11 memo; docs for resolution (task 12)`. **Merge step (ends phase 2):** push, `gh pr create` with title "feat(hedera): portable identity, ERC-8004 on Hedera, UAID, HCS-11 profile (PR 2 of 3)", reviewer Martin, then D29 (24 hours, CI green, Alex's diff read, `gh pr merge --merge --delete-branch`), then `git checkout -b feat/hedera-attest origin/main`.
 
 ---
 
 ## Phase 3 — Pull request 3: the signed attestation and the demo (branch `feat/hedera-attest`)
 
-**Must already be on `main`:** pull requests 1 and 2 merged with `--merge`; the demo entity linked (task 8) and registered with a UAID (task 10); `NOVI_ATTESTATION_KEY` and `Demo Guardian Key` in 1Password (task 0). Branch: `feat/hedera-attest` from `origin/main`.
-**Ends with:** task 15's merge step. Under D27, task 13 is dropped and task 15 runs the five legs against the unsigned `/verify`; the video shows that.
+**Must already be on `main`:** pull requests 1 and 2 merged with `--merge` and deployed to the VPS (task 16); `HederaDemo_1` linked (task 8) and both demo entities registered with UAIDs (task 10); `NOVI_ATTESTATION_KEY` and `Demo Guardian Key` in 1Password (task 0). Branch: `feat/hedera-attest` from `origin/main`.
+**Ends with:** task 15's merge step. Under D27, task 13 is dropped and task 15 runs the five legs against the unsigned `/verify`; the video shows that. Task order inside this phase: 13, 14, 16 (the deploys, if not already done on Sunday), 15.
 
 ### Task 13: EIP-712 signature on `/verify`
 
@@ -800,7 +835,7 @@ uaid:          uaid:aid:7yCVPN2iLzHZ244fEcpayKQbhzHaMVWhEZgWZoessWWnP13s19RKoa8Y
 **Interfaces:** Produces `ATTESTATION_DOMAIN = { name: "Novi Corpus Attestation", version: "1" } as const`, `ATTESTATION_TYPES` (one primary type `LegalBodyAttestation` whose fields are the flattened body: `publicId string, agentId string, treasury address, uaid string, standing string, formationStatus string, formationEnvironment string, humanVerified bool, oaHash bytes32, manifestVersion uint256, issuedAt uint256, expiresAt uint256`), `signAttestation(body, key): Promise<{ attestor: Address; signature: Hex }>`, `verifyAttestation(body, attestor, signature): Promise<boolean>`.
 
 - [ ] **Step 1: Failing test:** sign with `privateKeyToAccount(key).signTypedData`, verify with viem `verifyTypedData` → true; flip `standing` → false; `verifyAttestation` on the body a test route call returned → true.
-- [ ] **Step 2:** Implement; the route adds `attestor` and `signature` when the key is present, and `issuedAt`/`expiresAt` are serialised as unix seconds strings in the typed data and ISO strings in the JSON body (state both in the body: `issuedAt`, `issuedAtUnix`).
+- [ ] **Step 2:** Implement; the route adds `attestor` and `signature` when the key is present, and `issuedAt`/`expiresAt` are serialised as unix seconds strings in the typed data and ISO strings in the JSON body (state both in the body: `issuedAt`, `issuedAtUnix`, `expiresAt`, `expiresAtUnix`). Null mapping into the typed data, applied identically by `signAttestation` and `verifyAttestation` and stated in the README (design Component 3, audit C12): `oaHash null` → `0x` + 64 zeros, `manifestVersion null` → `0`, `uaid null` → `""`, `agentId null` → `""`. Add one test: a body with all four null signs and verifies, and flipping `oaHash` from the zero sentinel to any other value fails verification.
 - [ ] **Step 3:** Tests; three checks; **commit** → `feat(hedera): EIP-712-signed legal-standing attestation on /verify (task 13)`.
 
 ### Task 14: The guardian pause script (D22)
@@ -808,29 +843,33 @@ uaid:          uaid:aid:7yCVPN2iLzHZ244fEcpayKQbhzHaMVWhEZgWZoessWWnP13s19RKoa8Y
 **Files:** Create `scripts/guardian-pause.mts`; Test: `test/hedera/guardianPause.test.ts` for the pure address check.
 
 - [ ] **Step 1:** Script `pause|unpause --entity <name|key>`: `loadConfig()`, find the entity, read `guardian()` from the treasury with `publicClientFor(cfg)` and `agentTreasuryAbi` (`src/abis/generated.ts:8`), refuse unless `privateKeyToAccount(process.env.DEMO_GUARDIAN_KEY).address` equals it (`guardian key does not match on-chain guardian`), then `walletClientForKey(cfg, key).writeContract({ address: treasury, abi: agentTreasuryAbi, functionName: mode })` and wait for the receipt; print `paused()` after.
-- [ ] **Step 2: LIVE round trip:** `op run --env-file=.env.guardian.tpl -- npx tsx scripts/guardian-pause.mts pause --entity FormationE2E_1` → `paused: true`; `check_policy` over MCP → `{ ok: false, reason: "paused" }`; `unpause` → `paused: false`. Record both hashes.
+- [ ] **Step 2: LIVE round trip:** `op run --env-file=.env.guardian.tpl -- npx tsx scripts/guardian-pause.mts pause --entity HederaDemo_1` (the paying entity, whose guardian key is `Demo Guardian Key`; `FormationE2E_1`'s guardian is Martin's, and the buyer's refusal comes from `check_policy` on the payer, D18, audit B1) → `paused: true`; `check_policy` over MCP for `HederaDemo_1` → `{ ok: false, reason: "paused" }`; `unpause` → `paused: false`. Record both hashes.
 - [ ] **Step 3:** **Commit** → `feat(hedera): guardian pause/unpause script for the demo (task 14)`.
 
 ### Task 15: The demo buyer and the definition of done
 
-**Files:** `back/hedera-client/src/commands/demo-buyer.ts`, `back/backend/README.md` (demo section), Records.
+**Files:** `back/hedera-client/src/commands/demo-buyer.ts`, `back/backend/README.md` (demo section), `back/docs/runbooks/hedera-demo.md` (new), `back/docs/README.md` (index), Records.
 
-- [ ] **Step 1:** `demo-buyer <uaid>`: `parseUaidNativeId` → `GET /legal-bodies/<address>` → follow `links.metadata` → read `hedera.profileUrl` and `hedera.verifyUrl` → `payFetchFor(...)` on `verifyUrl` → print `standing`, `humanVerified`, `attestor`, and `verifyAttestation(...)` result, plus the HashScan link.
-- [ ] **Step 2: LIVE, the five legs, recorded in order:**
-  1. `demo-buyer uaid:aid:…` → `HTTP 200 … signature valid: true … settlement OK <hashscan>`.
-  2. `guardian-pause.mts pause` → `paused: true`.
+- [ ] **Step 1:** `demo-buyer <uaid>`: `parseUaidNativeId` → `GET https://www.novicorpus.com/backend/legal-bodies/<address>` (the base comes from `NOVI_API_BASE`, prod for the demo, D28) → follow `links.metadata` → read `hedera.profileUrl` and `hedera.verifyUrl` → `payFetchFor(...)` on `verifyUrl` → print `standing`, `humanVerified`, `attestor`, and `verifyAttestation(...)` result, plus the HashScan link. `NOVI_MCP_URL` and `NOVI_API_KEY` in `.env.tpl` point at prod and the prod key (task 16).
+- [ ] **Step 2: LIVE against prod, the five legs, recorded in order:**
+  1. `demo-buyer uaid:aid:…` (`FormationE2E_1`'s UAID) → `HTTP 200 … signature valid: true … settlement OK <hashscan>`.
+  2. `guardian-pause.mts pause --entity HederaDemo_1` → `paused: true`.
   3. `demo-buyer` again → `policy denied: paused` and **no** HashScan link.
-  4. `guardian-pause.mts unpause`, then `revoke` (guardian rotates the agent key out) → `SUCCESS`.
-  5. `demo-buyer` again → `HTTP 402`, `PAYMENT-RESPONSE … transaction_failed`, HashScan shows `CRYPTOTRANSFER INVALID_SIGNATURE`.
-  **Do not call this done if** any leg differs from its expected line. Record all five.
-- [ ] **Step 3:** README demo section with the five commands and expected lines; **commit** → `feat(hedera-client): demo buyer; live five-leg run recorded (task 15)`. **Merge step (ends phase 3):** push, `gh pr create` with title "feat(hedera): signed /verify attestation, guardian script, demo buyer (PR 3 of 3)", Alex reads the diff, CI green, `gh pr merge --merge --delete-branch`. The continuity README and the video follow on `main`, outside this plan.
+  4. `guardian-pause.mts unpause --entity HederaDemo_1`, then `revoke` (guardian rotates the agent key out) → `SUCCESS`.
+  5. `demo-buyer` again → `HTTP 402`, `PAYMENT-RESPONSE … transaction_failed`, HashScan shows `CRYPTOTRANSFER INVALID_SIGNATURE` under the facilitator's account.
+  **Do not call this done if** any leg differs from its expected line. Record all five with transaction ids and a screen capture each.
+- [ ] **Step 3:** README demo section with the five commands and expected lines; `docs/runbooks/hedera-demo.md` (the five legs, the prod URLs, the 1Password item titles, the D28 fallback, which resolvers follow the memo; audit U6); add both Hedera docs and the runbook to `docs/README.md` (audit U8). `superpowers:requesting-code-review` on the branch. **Commit** → `feat(hedera-client): demo buyer; live five-leg run recorded; demo runbook (task 15)`. **Merge step (ends phase 3):** push, `gh pr create` with title "feat(hedera): signed /verify attestation, guardian script, demo buyer (PR 3 of 3)", reviewer Martin, then D29. The continuity README and the video follow on `main`, outside this plan.
 
 ---
 
-## Phase 4 — Optional and swappable
+## Phase 4 — Required deploys, and the swappable task
 
-### Task 16 (optional, last day): `/verify` on the VPS (D21)
-With Martin: add the server-row `HEDERA_*` values and `NOVI_ATTESTATION_KEY` to the VPS `.env` (runbook `docs/runbooks/doola-deploy.md` shows how env changes are made), restart, `curl -I https://www.novicorpus.com/backend/verify/9f8003f5-…` → `402`. Not part of the definition of done.
+### Task 16 (required, Sunday 2026-09-14, before task 15): PR 1 and PR 2 on the VPS (D28)
+With Martin, after each merge (runbook `docs/runbooks/doola-deploy.md` shows how env changes are made):
+- [ ] **Step 1: PR 1 deploy.** Add the server-row `HEDERA_*` values from the naming table to the VPS `.env`, restart. Expected: `curl -sI https://www.novicorpus.com/backend/verify/9f8003f5-4c70-435a-9980-9a54625691b7 | head -1` → `HTTP/2 402` and the response carries a `PAYMENT-REQUIRED` header. Then mint the prod demo API key for `HederaDemo_1`'s tenant through `/api-keys` and update the 1Password item `Novi Corpus Demo API Key`; `link` from the client against `NOVI_MCP_URL=https://www.novicorpus.com/backend/mcp` → `{"ok":true,…}` (the float account is already provisioned; this writes the prod row).
+- [ ] **Step 2: PR 2 deploy.** Restart on the new build; on the box run the two `--record` lines from task 10 (`npx tsx scripts/hedera-register-identity.mts --record --entity … --agent-id … --tx … --uaid …`, no key needed). Expected: `curl -s https://www.novicorpus.com/backend/metadata/9f8003f5-…` shows two `registrations[]` entries and a `uaid`; `curl -s https://www.novicorpus.com/backend/metadata/<HederaDemo_1 publicId>/profile` → 200 with `uaid`; the mirror node's memo URL for the float account now answers 200.
+- [ ] **Step 3: PR 3 deploy (Monday, before leg 1).** Add `NOVI_ATTESTATION_KEY` to the VPS `.env` (the value from 1Password, pasted by Martin or Alex over SSH, never through chat), restart. Expected: a paid `/verify` answer carries `attestor` and `signature`, and the boot dump shows `attestationKey: 'REDACTED'`.
+**Do not run task 15 against prod if** any expected line above differs; apply the D28 fallback instead and say so in Records.
 
 ### Task 17 (swappable, only if the team picks a server-side custody): the `rawSign` adapter
 Add `hedera:testnet` to `EntityPaymentService.pay` as a branch that builds `custodyAgnosticSigner` (moved from the client into `src/hedera/signer.ts`) with `rawSign` bound to Turnkey raw-payload signing (`adapters/turnkey`) or a KMS; provisioning moves to `workflow/onboarding.ts:254` beside the Circle branch; `link_hedera_account` becomes a no-op. Everything else in this plan stands.
@@ -839,9 +878,9 @@ Add `hedera:testnet` to `EntityPaymentService.pay` as a branch that builds `cust
 
 ## Self-review
 
-- **Spec coverage.** Goal 1 → tasks 1 to 8. Goal 2 → tasks 9 to 12. Goal 3 → tasks 13 to 15. D5 → task 2 and 3. D6 → task 2. D8, D14, D15 → task 5. D9 → tasks 6 and 13. D10 → task 9. D11 → tasks 11 and 12. D13, D16 → task 5. D17, D18 → task 15 and task 0. D19 → task 10. D20 → tasks 8, 12, 15. D21 → task 16. D22 → task 14. D23 → task 15 and README. D24 → tasks 4 and 5. D25 → task 6 in PR 1. D26 → task 0 step 6. D27 → the executor applies it on Friday: skip task 12's inscription fallback and task 13, keep task 15 against the unsigned body. Components 1 to 7 map to tasks 2, 3, 6, 5, 9 to 11, 14, 7. Files-touched baseline is the File structure above.
-- **Placeholders.** Every code step shows code or an exact command and expected line. Steps that depend on a fact this plan could not verify (facilitator response field names in task 6, whether the client abort throws or returns 402 in task 7, the key-list update order in task 7, the HCS-11 memo form in task 12) say so and give the fallback.
-- **Type consistency.** `HederaMirror`, `decodeHederaKey`, `DecodedKey` (task 4) are what task 5 imports; `recordSettledOnNetwork`, `recordFailedOnNetwork`, `setHederaLink`, `setHederaIdentity` (task 3, with the failed variant added in task 5) are the names the tools call; `HederaDeps` (task 5) is what `verify.ts` reads as `deps.hedera`; `buildAttestation`/`AttestationBody` (task 6) is what task 13 signs and task 15 verifies; `uaidInputsFor`, `deriveUaid`, `parseUaidNativeId` (task 9) are what tasks 10, 11 and 15 call; `payFetchFor`, `createNoviClient`, `custodyAgnosticSigner`, `localRawSigner` (task 7) are what tasks 8, 12 and 15 use.
+- **Spec coverage.** Goal 1 → tasks 1 to 8. Goal 2 → tasks 9 to 12. Goal 3 → tasks 13 to 15. D5 → task 2 and 3. D6 → task 2. D8, D14, D15 → task 5. D9 → tasks 6 and 13. D10 → task 9. D11 → tasks 11 and 12. D13, D16 → task 5. D17, D18 → task 15 and task 0. D19 → task 10. D20, D29 → tasks 8, 12, 15. D21 → superseded by D28. D22 → task 14. D23 → task 15 and README. D24 → tasks 4 and 5. D25 → task 6 in PR 1. D26 → task 0 step 6. D27 → the executor applies it on Saturday morning: skip task 12's inscription upgrade and task 13, keep task 15 against the unsigned body. D28 → task 0 steps 0 and 9, task 8 step 1, task 16, task 15. Components 1 to 7 map to tasks 2, 3, 6, 5, 9 to 11, 14, 7. Files-touched baseline is the File structure above. The 2026-09-10 audit's findings are traced in the design's last section; every plan change carries its finding id inline.
+- **Placeholders.** Every code step shows code or an exact command and expected line. The facts the v3 plan could not verify (402 field names and where they travel, whether the client abort throws, the HCS-11 memo form, the operator alias) are now pre-cleared in the design. The one remaining fallback is the key-list update order on a hollow account in task 7 step 6.
+- **Type consistency.** `HederaMirror`, `decodeHederaKey`, `DecodedKey` and the five vectors (task 4) are what task 5 imports; `recordSettledOnNetwork`, `recordFailedOnNetwork`, `setHederaLink`, `setHederaIdentity` (task 3, with the failed variant added in task 5) are the names the tools call; `HederaDeps` with `spendAllowlistThreshold` (task 5) is what `verify.ts` reads as `deps.hedera`; `createClientLimiter` and `sharedReadBudget` (task 6) are the two `legalBodies.ts` exports; `HEDERA_IDENTITY_REGISTRY` (task 10) is what task 11 imports; `buildAttestation`/`AttestationBody` (task 6) is what task 13 signs and task 15 verifies; `uaidInputsFor`, `deriveUaid`, `parseUaidNativeId` (task 9) are what tasks 10, 11 and 15 call; `payFetchFor`, `createNoviClient`, `custodyAgnosticSigner`, `localRawSigner` (task 7) are what tasks 8, 12 and 15 use.
 
 ## Records
 
