@@ -234,3 +234,23 @@ test("a 200 whose body is not JSON surfaces as a MirrorError, not a bare SyntaxE
   );
   expect((err as MirrorError).status).toBe(200);
 });
+
+test("a failed record keeps the mirror node's own result and has no transfers", async () => {
+  const { impl } = scriptedFetch({
+    [`/api/v1/transactions/${TX_PATH}`]: {
+      body: {
+        transactions: [
+          {
+            transaction_id: TX_PATH,
+            name: "CRYPTOTRANSFER",
+            result: "INSUFFICIENT_TOKEN_BALANCE",
+            consensus_timestamp: "1788998499.123456789",
+          },
+        ],
+      },
+    },
+  });
+  const got = await new HederaMirror(BASE, impl).transaction(TX);
+  expect(got?.[0]?.result).toBe("INSUFFICIENT_TOKEN_BALANCE");
+  expect(got?.[0]?.tokenTransfers).toEqual([]);
+});

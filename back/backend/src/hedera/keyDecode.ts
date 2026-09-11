@@ -25,6 +25,18 @@
  */
 
 /** A Hedera key as the policy engine consumes it: one key, an m-of-n, or a plain list (n-of-n). */
+/**
+ * A Hedera key as the policy engine consumes it: one key, an m-of-n, or a plain list (n-of-n).
+ *
+ * A `threshold` is always at least 1 and never exceeds `keys.length` — `readThresholdKey` refuses
+ * anything else rather than hand on a key that reads as satisfied.
+ *
+ * **An empty `list` MUST be treated as unsatisfiable by every consumer.** `{ kind: "list", keys:
+ * [] }` is legitimate and decodes on purpose: it is how Hedera encodes an account nobody can sign
+ * for, which is the standard way to make an account or a token unmodifiable. An n-of-n over zero
+ * members is vacuous to a loop that checks "did every listed key sign", so a policy check written
+ * as `keys.every(signed)` silently returns `true` for it. That is the opposite of the truth.
+ */
 export type DecodedKey =
   | { kind: "single"; keyHex: string }
   | { kind: "threshold"; threshold: number; keys: DecodedKey[] }
@@ -111,6 +123,17 @@ function readThresholdKey(buf: Uint8Array): DecodedKey {
     else if (field === 2 && wire === WIRE_LENGTH_DELIMITED) keys = readKeyList(reader.bytes());
     else throw new Error(`unsupported threshold key field ${field}`);
   }
+  // Both of these are structurally decodable, and both read as SATISFIED to a consumer that
+  // trusts the struct it is handed. That is why they are refused here rather than passed on.
+  // proto3 omits a zero-valued scalar, so an absent `threshold` is indistinguishable on the wire
+  // from a literal 0 — and a 0-of-n is a key nothing has to sign for. A threshold above the member
+  // count is the mirror image: an m-of-n that can never be met, which a naive check reads as an m
+  // it already has. A real consensus node emits neither, so the only thing that produces one is a
+  // corrupted or hand-forged key, which is exactly when guessing is most expensive.
+  if (threshold === 0)
+    throw new Error("threshold key with threshold 0 in Hedera key: nothing would need to sign it");
+  if (threshold > keys.length)
+    throw new Error(`threshold key with threshold ${threshold} over ${keys.length} keys`);
   return { kind: "threshold", threshold, keys };
 }
 

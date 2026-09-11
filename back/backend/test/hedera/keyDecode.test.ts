@@ -77,3 +77,20 @@ test("a 0x-prefixed vector decodes the same as the bare one", () =>
 test("a truncated vector throws instead of returning a half-read key", () => {
   expect(() => decodeHederaKey(SINGLE.slice(0, -4))).toThrow();
 });
+
+// A malformed ThresholdKey is the one shape this decoder must never hand on intact: both of these
+// read as "satisfied" to a consumer that trusts the struct. A real consensus node emits neither.
+const NO_THRESHOLD = `2a4c124a0a233a21${A}0a233a21${B}`; // KeyList present, threshold field omitted
+const NO_KEYLIST = "2a020801"; // threshold 1, no KeyList at all
+
+test("a ThresholdKey with no threshold throws rather than decoding to threshold 0", () => {
+  expect(() => decodeHederaKey(NO_THRESHOLD)).toThrow("threshold key with threshold 0");
+});
+
+test("a ThresholdKey demanding more signatures than it lists throws", () => {
+  expect(() => decodeHederaKey(NO_KEYLIST)).toThrow("threshold key with threshold 1 over 0 keys");
+});
+
+test("an empty KeyList still decodes — it is how Hedera encodes an unmodifiable account", () => {
+  expect(decodeHederaKey("3200")).toEqual({ kind: "list", keys: [] });
+});
