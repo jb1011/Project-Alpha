@@ -6,6 +6,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { usePublicClient, useWriteContract } from "wagmi";
 import { agentBookChipState, vouchButtonVisible } from "@/lib/agentbook/chipState";
+import {
+  legalBodyChipState,
+  type LegalBodyChipKind,
+  type LegalBodyChipState,
+} from "@/lib/legalBody/chipState";
 import { useAgentDashboardQueries, usePublicConfigQuery } from "@/lib/api/hooks";
 import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
@@ -28,6 +33,27 @@ import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/t
 const AGENTBOOK_CHIP_CLASS =
   "inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-muted-2 transition-colors hover:text-ink";
 
+const CHIP_SHAPE =
+  "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11.5px] transition-colors";
+
+/**
+ * The Legal body chip, per state (design 2026-09-10).
+ *
+ * It MAY be positive where the AgentBook chip may not, and the difference is what each one is a
+ * statement about. AgentBook's is a claim about a person, so it stays neutral whatever the answer
+ * (D9). This one is two on-chain reads — a LegalManager status and a treasury pause flag — and
+ * "in good standing" is exactly what they say, so `active` wears the same accent the rest of the
+ * card uses for a live on-chain fact. `inactive` takes the amber the paused pill takes, because
+ * it is usually the same pause seen from the other side, and `unknown` takes AgentBook's neutral:
+ * a read that failed looks like the other things we could not check.
+ */
+const LEGAL_BODY_CHIP_CLASS: Record<LegalBodyChipKind, string> = {
+  active:
+    "border-accent/30 bg-accent/[0.07] text-accent-soft hover:bg-accent/[0.14] hover:text-ink",
+  inactive: "border-[#febc2e]/40 bg-[#febc2e]/10 text-[#f3cd72] hover:text-ink",
+  unknown: "hairline-strong bg-paper-3/60 text-muted-2 hover:text-ink",
+};
+
 export function AgentDashboard({
   entityId,
   config,
@@ -47,6 +73,7 @@ export function AgentDashboard({
     treasury: treasuryQuery,
     runs: runsQuery,
     agentBook: agentBookQuery,
+    legalBody: legalBodyQuery,
   } = useAgentDashboardQueries(entityId);
 
   const entity = entityQuery.data ?? null;
@@ -54,6 +81,17 @@ export function AgentDashboard({
   const runs = runsQuery.data ?? [];
   const agentBookChip = agentBookChipState(agentBookQuery.data);
   const agentBookView = agentBookQuery.data ?? null;
+  /** The address both questions are about: the pocket that signs AgentKit challenges and pays
+   *  x402 invoices. It is what AgentBook binds and what a seller looks up. */
+  const pocketAddress = agentBookView?.address ?? null;
+  /**
+   * The SECOND chip (design 2026-09-10): Novi's own registry, read from the chain, beside
+   * AgentBook's answer about a human. A lookup that could not be read is its own variant, not a
+   * fabricated `standing` — the helper decides that both wear "Could not check".
+   */
+  const legalBodyChip = legalBodyChipState(
+    legalBodyQuery.error ? { unreadable: true } : legalBodyQuery.data,
+  );
   const loadError =
     entityQuery.error instanceof Error
       ? entityQuery.error.message
@@ -97,6 +135,14 @@ export function AgentDashboard({
   const treasuryAddr = entity?.treasury ?? null;
 
   async function refreshDashboard() {
+    // The legal-body lookup FIRST, and outside the token check: it is the public route, keyed by
+    // address rather than by session, and the one answer here that a guardian's own pause changed
+    // a moment ago — standing is `legalStatus === 0 && !treasuryPaused`. (The backend memoises a
+    // definitive answer for 15 s, so an unpause can take that long to show; the alternative is
+    // asking again every few seconds for an answer that changes twice a year.)
+    if (pocketAddress) {
+      await queryClient.invalidateQueries({ queryKey: apiKeys.legalBody(pocketAddress) });
+    }
     const token = session?.token;
     if (!token) return;
     await Promise.all([
@@ -248,6 +294,10 @@ export function AgentDashboard({
                   {agentBookChip.label}
                 </span>
               ))}
+            {/* The second question, beside the first and never folded into it: AgentBook says
+                whether a human vouched, this says whether Novi's registry holds a legal body in
+                good standing. Two sources, two chips (design 2026-09-10 §1). */}
+            {legalBodyChip && <LegalBodyChip state={legalBodyChip} />}
             {ensName(entity) && (
               <a
                 href={`${ENS_EXPLORER_URL}/${ensName(entity)}`}
@@ -518,6 +568,39 @@ export function AgentDashboard({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The Legal body chip. Its WORDING and its link live in `lib/legalBody/chipState`, where they are
+ * tested; this is the rendering and nothing else.
+ *
+ * The ↗ is a separate glyph rather than part of the label so the label stays exactly the string
+ * the ceiling fixed, and so a chip with no link (the lookup could not be read) does not advertise
+ * one.
+ */
+function LegalBodyChip({ state }: { state: LegalBodyChipState }) {
+  const className = cx(CHIP_SHAPE, LEGAL_BODY_CHIP_CLASS[state.kind]);
+  if (!state.href) {
+    return (
+      <span title={state.title} className={className}>
+        {state.label}
+      </span>
+    );
+  }
+  return (
+    <a
+      href={state.href}
+      target="_blank"
+      rel="noreferrer"
+      title={state.title}
+      className={className}
+    >
+      {state.label}
+      <span aria-hidden className="text-[10px] opacity-70">
+        ↗
+      </span>
+    </a>
   );
 }
 

@@ -261,6 +261,57 @@ export type TransparencyView = {
   entities: TransparencyEntity[];
 };
 
+/**
+ * The public legal-body lookup (GET /legal-bodies/:address, design 2026-09-10 D3).
+ *
+ * The question a seller asks about an address that is about to pay it: is this the payment
+ * address of a Novi legal body, and is that body in good standing? Unauthenticated, because the
+ * caller is a stranger holding nothing but the address — which is why the dashboard reads exactly
+ * the same surface a seller would, rather than an owner-only view of the same fact.
+ *
+ * `standing` is a THREE-valued answer and the third value matters (D8): `unknown` is a chain read
+ * that failed, not a negative. Never render it as one.
+ *
+ * Non-200s a caller must expect beside these shapes (§8): 400 (a malformed address), 404 (a
+ * deployment with no resolver wired), 429 (either rate budget) and 503 (the local read failed).
+ * All four are "we could not check", and none of them is an answer about the address.
+ */
+export type LegalBodyFormation = {
+  /** The STATE has filed the company: it legally exists. */
+  filed: boolean;
+  /** The IRS has issued the EIN. The EIN itself is never on this surface. */
+  einIssued: boolean;
+  status: FormationStatus;
+  /** Inseparable from `status` (the honesty invariant): a sandbox filing must never be readable
+   *  as a real Wyoming company by omission. */
+  environment: "sandbox" | "production";
+};
+
+export type LegalBodyLookup =
+  | {
+      address: string;
+      legalBody: false;
+      standing: null;
+      checkedAt: string;
+    }
+  | {
+      address: string;
+      legalBody: true;
+      standing: "active" | "inactive" | "unknown";
+      /** A DECIMAL STRING: an agent id is a uint256 token id and a JSON number loses precision
+       *  above 2^53. Null for a body that reached the chain before its id was recorded. */
+      agentId: string | null;
+      publicId: string | null;
+      name: string;
+      /** The chain the AGENT runs on. */
+      network: "testnet" | "mainnet";
+      links: { transparency: string; metadata: string | null };
+      /** The filing, REPORTED and never gating (D1). Null where this deployment cannot read
+       *  filings, or for an entity with no company. */
+      formation: LegalBodyFormation | null;
+      checkedAt: string;
+    };
+
 /** Real on-chain treasury state (from GET /entities/:id/treasury). All USDC fields are atomic strings (6 decimals). */
 export type TreasuryView = {
   usdcBalance: string;
