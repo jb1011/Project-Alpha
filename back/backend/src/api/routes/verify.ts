@@ -69,15 +69,33 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
 
   // Layer 1: the limiter and the 404 guard, BEFORE any 402 is issued (D9).
   typed.use("/verify/:publicId", async (c, next) => {
-    // Both allowances are the SAME instances `/legal-bodies/:address` spends (audit C9), so a
-    // caller cannot walk from one public read surface to the other to double its budget.
-    if (!limiter(c).take() || !shared.take())
+    // Nothing a caller is refused may be reused by a shared cache — not a throttle, not a 404.
+    const noStore = () => c.header("Cache-Control", "no-store");
+    // The PER-CLIENT allowance first, and it is the SAME instance `/legal-bodies/:address` spends
+    // (audit C9): a caller cannot walk from one public read surface to the other to double it.
+    if (!limiter(c).take()) {
+      noStore();
       return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
+    }
     const publicId = c.req.param("publicId");
     // One 404 for malformed, unknown and not-yet-on-chain alike: three different answers would
     // tell an unpaying caller which UUIDs exist.
     const ent = UUID.test(publicId) ? deps.repo.findByPublicId(publicId) : undefined;
-    if (!ent || !isPublicOnChain(ent)) return c.json({ error: "not_found" }, 404);
+    if (!ent || !isPublicOnChain(ent)) {
+      noStore();
+      return c.json({ error: "not_found" }, 404);
+    }
+    // The SHARED budget bounds ARC READS, so it is spent only once we know a read can follow.
+    // Taking it above the 404 guard let a walk over random ids — or unpaid re-quotes behind a
+    // rotating `x-forwarded-for` — drain the deployment-wide bucket and throttle the free
+    // `/legal-bodies` lookup, which makes no chain read for any of them either.
+    //
+    // Still in layer 1, ahead of the 402, and it must never move past the payment middleware: a
+    // 429 raised after settlement would take the buyer's money and return nothing.
+    if (!shared.take()) {
+      noStore();
+      return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
+    }
     c.set("verifyEntity", ent);
     await next();
   });
@@ -96,7 +114,7 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
       lookup: lb,
       worldId: deps.worldId,
       chainId: deps.chainId,
-      identityRegistry: deps.ens?.identityRegistry ?? "",
+      identityRegistry: deps.identityRegistry,
       now: deps.now ?? Date.now,
     });
     // Never reusable: standing is live, the body is paid for, and a shared cache holding it would

@@ -774,6 +774,7 @@ async function main() {
     nonceStore,
     siweDomain: cfg.siweDomain,
     chainId: cfg.chainId,
+    identityRegistry: cfg.identityRegistry,
     jwtSecret: cfg.authJwtSecret,
     jwtTtlSec: cfg.authJwtTtlSec,
     platformManagerAddress,

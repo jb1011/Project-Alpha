@@ -14,6 +14,9 @@ export const PUBLIC_ID = "9f8003f5-4c70-435a-9980-9a54625691b7";
 export const TREASURY = "0x92ae7c6b6eB9470d7E01F8fEb352714bD80A7AAf"; // FormationE2E_1's, so a scaffold UAID equals the task 9 golden vector
 export const PROXY = "0x0b92fe9A51f04784A96ed8346bF876EBE93163eE";
 export const TENANT = "0x000000000000000000000000000000000000000A";
+/** The ERC-8004 identity registry on Arc testnet — a fact about the chain, wired on every
+ *  deployment, and NOT read off the optional ENS gateway (design Component 5). */
+export const IDENTITY_REGISTRY = "0x8004A818BFB912233c491871b3d84c89A494BD9e";
 
 /** The demo entity's shape, public on chain, verified controller absent unless overridden. */
 export const entity = (over: Partial<EntityRecord> = {}): EntityRecord =>
@@ -98,6 +101,7 @@ export function hederaApp(o: {
     webOrigin: WEB,
     jwtSecret: "s",
     chainId: 5042002,
+    identityRegistry: IDENTITY_REGISTRY,
     repo: o.repo,
     apiKeys: o.apiKeys,
     now: o.now ?? (() => 1_789_100_000_000), // 2026-09-10, the design date

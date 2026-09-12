@@ -18,6 +18,7 @@ import { TokenBucket } from "../../src/api/routes/agentBook";
 import { PaymentLedger } from "../../src/payments/ledger";
 import type { EntityRecord } from "../../src/types";
 import {
+  IDENTITY_REGISTRY,
   METADATA_BASE,
   PUBLIC_ID,
   TENANT,
@@ -237,6 +238,16 @@ test("a client that exhausts its own allowance is refused before any 402", async
   expect(res.headers.get("PAYMENT-REQUIRED")).toBeNull();
 });
 
+test("a 404 walk never spends the shared read budget", async () => {
+  // The shared bucket bounds ARC READS. A 404 makes none, so a walk over ids that do not exist
+  // must leave the deployment-wide allowance — and the free `/legal-bodies` lookup behind it —
+  // untouched. One token, no refill: if any of the five 404s below spent it, the 402 cannot come.
+  const { app } = setup({ readBudget: new TokenBucket(1, 0) });
+  for (let i = 0; i < 5; i++)
+    expect((await get(app, UNKNOWN_ID, { "x-forwarded-for": `8.8.8.${i}` })).status).toBe(404);
+  expect((await get(app, PUBLIC_ID, { "x-forwarded-for": "8.8.9.9" })).status).toBe(402);
+});
+
 test("an exhausted SHARED read budget refuses every caller, before any 402", async () => {
   const { app } = setup({ readBudget: new TokenBucket(0, 0) });
   const res = await get(app, PUBLIC_ID);
@@ -356,4 +367,13 @@ test("the per-client allowance is the SAME one the free lookup spends (audit C9)
     headers: { "x-forwarded-for": "7.7.7.7" },
   });
   expect(res.status).toBe(429);
+});
+
+test("the subject carries the identity registry even with no ENS gateway wired", async () => {
+  // `deps.ens` is undefined throughout this file, which is the point: a paying buyer must never
+  // be handed an `agentId` with no registry to resolve it in (design Component 5).
+  const { app } = setup();
+  const header = await paidHeader(app, PUBLIC_ID, "8.8.8.8");
+  const res = await get(app, PUBLIC_ID, { "PAYMENT-SIGNATURE": header });
+  expect((await res.json()).subject.registry).toBe(`eip155:5042002:${IDENTITY_REGISTRY}`);
 });

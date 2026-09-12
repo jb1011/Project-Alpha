@@ -55,6 +55,15 @@ export interface ApiDeps extends EntityViewDeps {
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
   chainId: number;
+  /**
+   * The ERC-8004 identity registry an agent id lives in, from `cfg.identityRegistry`.
+   *
+   * Beside `chainId` and NOT inside `ens`, deliberately (design Component 5): the ENS gateway is
+   * an optional capability, and reading the registry off it would leave a paying buyer of
+   * `/verify` holding an `agentId` with no registry to resolve it in on every deployment that
+   * never configured a gateway. The registry is a fact about this chain, not about ENS.
+   */
+  identityRegistry: import("../types").Address;
   jwtSecret: string;
   jwtTtlSec: number;
   /** Audit fix C: the platform/manager account address (Factory owner + setAgentWallet caller,
