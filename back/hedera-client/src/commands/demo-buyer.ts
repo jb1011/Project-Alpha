@@ -86,7 +86,13 @@ async function getJson<T>(url: string, fetchImpl: typeof fetch): Promise<T> {
   console.log(`→ GET ${url}`);
   const res = await fetchImpl(url);
   if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
-  return (await res.json()) as T;
+  try {
+    return (await res.json()) as T;
+  } catch {
+    // A proxy or a tunnel answering 200 with an HTML error page is the likely cause, and a bare
+    // `SyntaxError: Unexpected token '<'` would not say which of the two hops produced it.
+    throw new Error(`GET ${url} -> body is not JSON`);
+  }
 }
 
 /**
@@ -233,7 +239,7 @@ export function printRefusal(res: Response) {
  * the runbook asks the operator to do by eye during the recording.
  *
  * @param text - The response body
- * @returns Nothing; prints the four lines the demo shows
+ * @returns Nothing; prints the four lines the demo shows, and fails the run on a bad signature
  */
 export async function printAttestation(text: string) {
   let body: AttestationBody;
@@ -253,7 +259,12 @@ export async function printAttestation(text: string) {
     return;
   }
   console.log(`attestor: ${body.attestor}`);
-  console.log(`signature valid: ${await verifyAttestation(body, body.attestor, body.signature)}`);
+  const valid = await verifyAttestation(body, body.attestor, body.signature);
+  console.log(`signature valid: ${valid}`);
+  // A forged or drifted body would otherwise read as success to anything scripting this command,
+  // which is the one outcome an offline check exists to prevent. The settlement line still prints:
+  // the payment did happen, and the operator needs its transaction id either way.
+  if (!valid) process.exitCode = 1;
 }
 
 /**

@@ -37,9 +37,30 @@ field values, and nothing below ever prints one:
 Client commands run from `back/hedera-client` under `.env.tpl`; the guardian script runs from
 `back/backend` under `.env.guardian.tpl`, which maps `DEMO_GUARDIAN_KEY` and nothing else.
 
-Set the buyer's environment before the first leg: `NOVI_API_BASE=https://www.novicorpus.com/backend`,
-`NOVI_MCP_URL=https://www.novicorpus.com/backend/mcp`, `NOVI_ENTITY_ID=<HederaDemo_1's id>`, and
-`NOVI_API_KEY` on the `prod` field.
+**Write the guardian template first.** `back/backend/.env.guardian.tpl` is not in the repo and
+cannot be: `back/backend/.gitignore` ignores every `.env.*` and allowlists only `.env.example` and
+`.env.sandbox.example`. That is by design, and the file is never committed. Create it by hand
+before leg 2, with this single line and nothing else:
+
+```
+DEMO_GUARDIAN_KEY=op://Novi Corpus/<guardian key item>/<field>
+```
+
+The item is `HederaDemo_1`'s Arc guardian key, named only in 1Password. Legs 2 and 4 fail at their
+first line without this file.
+
+**Point the buyer at prod.** `NOVI_API_BASE`, `NOVI_MCP_URL`, `NOVI_ENTITY_ID` and the field
+`NOVI_API_KEY` selects are edited in `back/hedera-client/.env.tpl`, not exported in the shell:
+`op run --env-file` injects the template's values into the child process, so an exported variable
+of the same name does not survive. Task 16 of the plan is what makes that flip on the recording
+day. The four values for the demo:
+
+| Variable | Demo value |
+|---|---|
+| `NOVI_API_BASE` | `https://www.novicorpus.com/backend` |
+| `NOVI_MCP_URL` | `https://www.novicorpus.com/backend/mcp` |
+| `NOVI_ENTITY_ID` | `HederaDemo_1`'s id, recorded in task 0 |
+| `NOVI_API_KEY` | the `prod` field of `Novi Corpus Demo API Key`, not `local` |
 
 ## The five legs
 
@@ -54,10 +75,21 @@ cd back/hedera-client
 HEDERA_DEMO_LOCAL=1 op run --env-file=.env.tpl -- npx tsx src/cli.ts demo-buyer '<uaid>'
 ```
 
-Three hops print as `→ GET …` — `/legal-bodies/<treasury>`, the metadata link, then the paid
-`/verify/<publicId>` — followed by `report_payment -> settled`, `HTTP 200`, the document, and:
+The whole run, in the order it prints. Two hops narrate as `→ GET …`, then the profile the second
+one carried, then the paid hop, then `report_payment`, then four summary lines drawn from the
+attestation and the settlement. The body itself is never printed:
 
 ```
+DEMO ONLY
+→ GET https://www.novicorpus.com/backend/legal-bodies/<treasury>
+→ GET https://www.novicorpus.com/backend/metadata/<publicId>
+profile: https://www.novicorpus.com/backend/metadata/<publicId>/profile
+→ GET https://www.novicorpus.com/backend/verify/<publicId>
+report_payment -> settled
+HTTP 200
+standing: active
+humanVerified: true
+attestor: 0x<attestor address>
 signature valid: true
 settlement: OK https://hashscan.io/testnet/transaction/<transaction id>
 ```
@@ -65,6 +97,10 @@ settlement: OK https://hashscan.io/testnet/transaction/<transaction id>
 The signature is checked offline, against the `attestor` the body itself names. Compare that
 address by eye with the `hedera.attestor` the metadata document publishes: that is the half a
 forged body cannot restate.
+
+`signature valid: false` exits 1 and stops the recording, even though the payment settled and the
+settlement line still prints. It means the served body and the signature on it disagree, which is
+either a drifted attestation key or a document nobody should act on.
 
 ### 2. Guardian pauses the payer
 

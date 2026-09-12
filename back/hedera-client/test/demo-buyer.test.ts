@@ -145,6 +145,19 @@ describe("resolveHederaLinks", () => {
       `GET ${BASE}/legal-bodies/${ADDRESS} -> 404`,
     );
   });
+
+  it("names the hop when a 200 carries something that is not JSON", async () => {
+    const impl = vi.fn(
+      async () =>
+        new Response("<html>502 Bad Gateway</html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+    ) as unknown as typeof fetch;
+    await expect(resolveHederaLinks(UAID, BASE, impl)).rejects.toThrow(
+      `GET ${BASE}/legal-bodies/${ADDRESS} -> body is not JSON`,
+    );
+  });
 });
 
 // ── The lines the recording shows ───────────────────────────────────────────────────────────────
@@ -221,6 +234,28 @@ describe("printAttestation", () => {
     await printAttestation(JSON.stringify(attestation));
     c.restore();
     expect(c.lines.at(-1)).toBe("attestor: unsigned");
+  });
+
+  it("fails the run when the signature does not hold", async () => {
+    const account = privateKeyToAccount(SYNTHETIC_KEY);
+    const signature = await account.signTypedData({
+      domain: ATTESTATION_DOMAIN,
+      types: ATTESTATION_TYPES,
+      primaryType: "LegalBodyAttestation",
+      message: attestationMessage(attestation),
+    });
+    // The same signature over a body whose standing was flipped after it was signed.
+    const forged = {
+      ...attestation,
+      standing: "inactive" as const,
+      attestor: account.address,
+      signature,
+    };
+    const c = captured();
+    await printAttestation(JSON.stringify(forged));
+    c.restore();
+    expect(c.lines.at(-1)).toBe("signature valid: false");
+    expect(process.exitCode).toBe(1);
   });
 
   it("reports a body that is not an attestation instead of throwing", async () => {
