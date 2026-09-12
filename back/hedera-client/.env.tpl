@@ -24,7 +24,7 @@ NOVI_API_KEY=op://Novi Corpus/Novi Corpus Demo API Key/local
 NOVI_ENTITY_ID=0x6AB681DbFa81CA0D4acec965bDEd3A17292Ac142:FormationE2E_1
 # HederaDemo_1's own HCS-11 profile URL, set as the float account's memo (task 12).
 # Public value, fill in when task 12 lands. Shape: https://www.novicorpus.com/backend/metadata/<publicId>/profile
-NOVI_PROFILE_URL=
+NOVI_PROFILE_URL=https://www.novicorpus.com/backend/metadata/9f8003f5-4c70-435a-9980-9a54625691b7/profile
 
 HEDERA_MIRROR_URL=https://testnet.mirrornode.hedera.com
 USDC_TOKEN_ID=0.0.429274
