@@ -216,7 +216,10 @@ export async function main(): Promise<void> {
     account: keyAccount,
     chain: walletClient.chain,
   });
-  await publicClient.waitForTransactionReceipt({ hash: txHash });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+  if (receipt.status !== "success") {
+    throw new Error(`${parsed.mode} reverted (tx ${txHash}, status ${receipt.status})`);
+  }
 
   const paused = await publicClient.readContract({
     address: treasury,
