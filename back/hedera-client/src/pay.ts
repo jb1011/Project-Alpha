@@ -101,7 +101,13 @@ export function payFetchFor(o: {
     // header that is missing the field, or that did not decode at all, is UNREADABLE rather
     // than refused, and unreadable is reported: the alternative is losing a real payment from
     // the ledger with no second chance.
-    if (settle?.success === false) return res;
+    if (settle?.success === false) {
+      // Spent all the same. The hook ran for THIS response, and the slot holds one approval: left
+      // set, a refusal would hand the next header that skips the hook this payment's payee and
+      // amount. Refused and reported are different outcomes; both consume the approval.
+      approved = undefined;
+      return res;
+    }
 
     const decoded = typeof settle?.transaction === "string" ? settle.transaction : "";
     const transaction = decoded || salvageTransactionId(hdr);

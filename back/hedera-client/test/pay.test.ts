@@ -62,6 +62,26 @@ function stubFetch(settlement: SettleResponse | null = settled) {
   });
 }
 
+/** 402 first, then one 200 per entry: each entry is that response's settlement, or null for a
+ *  response with no `PAYMENT-RESPONSE` header at all. Lets one reused fetch answer differently
+ *  on the second call than it did on the first, which `stubFetch` cannot do. */
+function stubFetchSequence(settlements: (SettleResponse | null)[]) {
+  let calls = 0;
+  return vi.fn(async (): Promise<Response> => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response("{}", {
+        status: 402,
+        headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(paymentRequired) },
+      });
+    }
+    const settlement = settlements[calls - 2] ?? null;
+    const headers = new Headers({ "content-type": "application/json" });
+    if (settlement) headers.set("PAYMENT-RESPONSE", encodePaymentResponseHeader(settlement));
+    return new Response(JSON.stringify({ standing: "active" }), { status: 200, headers });
+  });
+}
+
 /** Like `stubFetch`, but puts a raw string in `PAYMENT-RESPONSE` rather than a valid header. */
 function stubFetchRawHeader(raw: string) {
   let calls = 0;
@@ -233,6 +253,40 @@ describe("payFetchFor", () => {
 
     await paid(RESOURCE_URL);
     expect(novi.reportPayment).not.toHaveBeenCalled();
+  });
+
+  it("a refused settlement leaves no approval behind for the next response", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const signer = stubSigner();
+    const novi = stubNovi({ ok: true, available: "1000000" }, []);
+    const refused: SettleResponse = {
+      success: false,
+      errorReason: "transaction_failed",
+      transaction: TX_ID,
+      network: "hedera:testnet",
+    };
+    // Refused on the first call, SETTLED on the second — and the second never reaches the policy
+    // hook, because only the first call was answered with a 402. A refusal that left its approval
+    // in the slot would hand that second header the refused payment's payee and amount, and the
+    // ledger would record a payment this client never authorized on this transaction id.
+    const paid = payFetchFor({
+      signer,
+      novi,
+      entityId: ENTITY_ID,
+      fetchImpl: stubFetchSequence([refused, settled]) as unknown as typeof fetch,
+    });
+
+    await paid(RESOURCE_URL);
+    const second = await paid(RESOURCE_URL);
+
+    expect(second.status).toBe(200);
+    expect(second.headers.get("PAYMENT-RESPONSE")).toBeTruthy();
+    expect(novi.reportPayment).not.toHaveBeenCalled();
+    expect(signer.createPartiallySignedTransferTransaction).toHaveBeenCalledOnce();
+    expect(errors).toHaveBeenCalledWith(
+      "PAYMENT-RESPONSE arrived with no approved payment behind it; not reporting it",
+    );
+    errors.mockRestore();
   });
 });
 
