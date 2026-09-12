@@ -19,6 +19,9 @@
  *   - paused       → `policy denied: paused`, exit 2, and NO HashScan link, because nothing was
  *                    signed and there is no transaction to link to (D2)
  *   - key revoked  → `HTTP 402` and the facilitator's own error, exit 1
+ *   - bad signature → settled, but `signature valid: false` and exit 1: the payment went through
+ *                    and the document is not the server's (drift or forgery), so a script must not
+ *                    read it as success
  *
  * Every hop prints `→ GET <url>` first. Nothing here prints a key, an API key or a header.
  */
