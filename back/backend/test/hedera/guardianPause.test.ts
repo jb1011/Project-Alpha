@@ -8,7 +8,7 @@
  */
 import type { Address } from "viem";
 import { describe, expect, test } from "vitest";
-import { assertGuardianMatches, parseArgs } from "../../scripts/guardian-pause.mjs";
+import { assertGuardianMatches, configModeFor, parseArgs } from "../../scripts/guardian-pause.mjs";
 
 const GUARDIAN = "0x1111111111111111111111111111111111111111" as Address;
 const OTHER = "0x2222222222222222222222222222222222222222" as Address;
@@ -73,5 +73,15 @@ describe("parseArgs", () => {
 
   test("rejects a flag with no value following it", () => {
     expect(() => parseArgs(["pause", "--entity"])).toThrow("--entity needs a value");
+  });
+});
+
+describe("configModeFor", () => {
+  test("--entity resolves against the local database", () => {
+    expect(configModeFor(parseArgs(["pause", "--entity", "FormationE2E_1"]))).toBe("database");
+  });
+
+  test("--treasury never touches the database (task 10's --from-prod ruling, D28)", () => {
+    expect(configModeFor(parseArgs(["pause", "--treasury", GUARDIAN]))).toBe("env-only");
   });
 });
