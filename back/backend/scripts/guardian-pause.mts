@@ -29,7 +29,7 @@
  *   op run --env-file=.env.guardian.tpl -- npx tsx scripts/guardian-pause.mts pause --treasury 0x…
  *
  *   npx tsx scripts/guardian-pause.mts pause --entity FormationE2E_1
- *   npx tsx scripts/guardian-pause.mts unpause --treasury 0x92aE7c6B6eB9470d7E01F8fEb352714bD80A7AAf
+ *   npx tsx scripts/guardian-pause.mts unpause --treasury 0x92ae7c6b6eB9470d7E01F8fEb352714bD80A7AAf
  *
  * `dotenv` is loaded inside `main()` rather than at import time (the `hedera-register-identity.mts`
  * idiom): this module is imported by `test/hedera/guardianPause.test.ts` for its pure helpers, and
