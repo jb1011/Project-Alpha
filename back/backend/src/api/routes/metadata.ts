@@ -187,6 +187,9 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
           verifyUrl: `${base}/verify/${publicId}`,
           profileUrl: `${base}/metadata/${publicId}/profile`,
         };
+        // The Hedera registration transaction, for a UI that wants a HashScan link
+        // (`https://hashscan.io/testnet/transaction/<registerTx>`). Only once recorded.
+        if (ent.hederaRegisterTx) meta.hedera.registerTx = ent.hederaRegisterTx;
         // WHICH key signs the paid attestation, published on the FREE surface (task 13). This is
         // the half that makes the signature worth anything: a verifier that read the attestor out
         // of the signed document alone would accept any key that signed it. Only where a key is

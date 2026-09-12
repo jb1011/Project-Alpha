@@ -213,6 +213,22 @@ test("the hedera block appears only once an account is LINKED, and its urls are 
   });
 });
 
+test("the hedera block carries registerTx once the Hedera registration is recorded", async () => {
+  seed({ hederaAccountId: "0.0.10412694" });
+  expect((await (await app().request(`/metadata/${PUBLIC_ID}`)).json()).hedera).not.toHaveProperty(
+    "registerTx",
+  );
+  const tx = "0xc5389a0a6f38fdecb6792c0b07442026f86e3d710168c6ae108ecf855c521eb7";
+  seed({ hederaAccountId: "0.0.10412694", hederaAgentId: "113", hederaRegisterTx: tx });
+  const body = await (await app().request(`/metadata/${PUBLIC_ID}`)).json();
+  expect(body.hedera).toEqual({
+    accountId: "0.0.10412694",
+    verifyUrl: VERIFY_URL,
+    profileUrl: PROFILE_URL,
+    registerTx: tx,
+  });
+});
+
 test("the attestor address is published on the FREE surface once a key is configured (task 13)", async () => {
   seed({ hederaAccountId: "0.0.10412694" });
   const body = await (
