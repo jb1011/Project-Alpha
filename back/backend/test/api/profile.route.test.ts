@@ -11,7 +11,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { TokenBucket } from "../../src/api/routes/agentBook";
 import { HEDERA_IDENTITY_REGISTRY } from "../../src/hedera/registry";
@@ -39,6 +39,36 @@ const HEDERA_REGISTRY = `eip155:296:${HEDERA_IDENTITY_REGISTRY}`;
 const VERIFY_URL = `${METADATA_BASE}/verify/${PUBLIC_ID}`;
 const PROFILE_URL = `${METADATA_BASE}/metadata/${PUBLIC_ID}/profile`;
 
+/** The `cfg.hedera` block `HEDERA_ENABLED` produces. Presence is the whole gate for the profile
+ *  route; `/verify`, which mounts on the same object, is what reads the price and the facilitator. */
+const HEDERA = {
+  cfg: {
+    network: "testnet",
+    facilitatorUrl: "https://f.test",
+    mirrorUrl: "https://m.test",
+    usdcTokenId: "0.0.429274",
+    payToAccountId: "0.0.10412694",
+    verifyPriceUsdc: "0.001",
+    verifyPriceAtomic: 1000n,
+  },
+} as const;
+
+/** The facilitator's `/supported`, in Blocky402's shape. Wiring `hedera` mounts `/verify` beside
+ *  the profile, and that fetches this once in the background at mount time — stubbed so this file
+ *  never reaches the network. */
+const SUPPORTED = {
+  kinds: [
+    {
+      x402Version: 2,
+      scheme: "exact",
+      network: "hedera:testnet",
+      extra: { feePayer: "0.0.7162784" },
+    },
+  ],
+  extensions: [],
+  signers: { "hedera:*": ["0.0.7162784"] },
+};
+
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 let docStore: FileDocumentStore;
@@ -56,7 +86,7 @@ function seed(over: Partial<EntityRecord> = {}): EntityRecord {
 
 /** The app the two public routes are served from. `ens` absent unless a test asks for it — the
  *  whole point of the ungating is that `registrations[]` no longer waits on it. */
-function app(o: { ens?: boolean; legalBody?: boolean } = {}) {
+function app(o: { ens?: boolean; legalBody?: boolean; hedera?: boolean } = {}) {
   return buildApiApp({
     webOrigin: WEB,
     jwtSecret: "s",
@@ -65,6 +95,9 @@ function app(o: { ens?: boolean; legalBody?: boolean } = {}) {
     repo,
     docStore,
     now: () => 1_789_100_000_000,
+    // On unless a test turns it off — `HEDERA_ENABLED` off is the exception this file tests, not
+    // the state the rest of it runs in.
+    hedera: o.hedera === false ? undefined : HEDERA,
     legalBody:
       o.legalBody === false
         ? undefined
@@ -87,12 +120,23 @@ function app(o: { ens?: boolean; legalBody?: boolean } = {}) {
 }
 
 beforeEach(() => {
+  vi.stubGlobal(
+    "fetch",
+    async () =>
+      new Response(JSON.stringify(SUPPORTED), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  );
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
   docStore = new FileDocumentStore(mkdtempSync(join(tmpdir(), "profile-")));
 });
-afterEach(() => db.close());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  db.close();
+});
 
 // ── /metadata/:publicId — registrations[], ungated from ENS ───────────────────────────────────
 
@@ -236,4 +280,27 @@ test("no legal-body links wired: the profile's urls are null rather than invente
   ).json();
   expect(body.properties.verifyUrl).toBeNull();
   expect(body.properties.metadataUrl).toBeNull();
+});
+
+// ── the flag ─────────────────────────────────────────────────────────────────────────────────
+
+test("with the Hedera flag off the profile route is not mounted", async () => {
+  // A row that WOULD serve a profile: registered, with a uaid. The flag is the only thing missing.
+  seed({ uaid: "uaid:aid:abc;uid=886257", hederaAgentId: "12" });
+  expect((await app({ hedera: false }).request(`/metadata/${PUBLIC_ID}/profile`)).status).toBe(404);
+  // And the metadata beside it still serves, unchanged: the flag takes the rail, not the route.
+  expect((await app({ hedera: false }).request(`/metadata/${PUBLIC_ID}`)).status).toBe(200);
+});
+
+test("the hedera block is absent with the flag off, even for a LINKED row", async () => {
+  seed({ hederaAccountId: "0.0.10412694", uaid: "uaid:aid:abc;uid=886257", hederaAgentId: "12" });
+  const body = await (await app({ hedera: false }).request(`/metadata/${PUBLIC_ID}`)).json();
+  // Neither url is published, because neither route is mounted to answer it.
+  expect(body).not.toHaveProperty("hedera");
+  // The identity facts are NOT flag-gated: they are true of the company either way.
+  expect(body.uaid).toBe("uaid:aid:abc;uid=886257");
+  expect(body.registrations).toEqual([
+    { agentId: "886257", agentRegistry: ARC_REGISTRY },
+    { agentId: "12", agentRegistry: HEDERA_REGISTRY },
+  ]);
 });

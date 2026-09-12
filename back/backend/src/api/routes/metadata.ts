@@ -32,6 +32,11 @@ export interface AgentRegistration {
  * The Hedera registry address is the `HEDERA_IDENTITY_REGISTRY` constant: a public, immutable
  * address, never an environment variable (audit C3).
  *
+ * NOT gated on `HEDERA_ENABLED`. A registration is a fact about the company's on-chain identity:
+ * the entry stays true whether or not this deployment sells anything over the Hedera rail, and a
+ * verifier resolving the company needs it either way. Only the `hedera` link block below, which
+ * points at routes this deployment serves, moves with the flag.
+ *
  * Both addresses are EIP-55 CHECKSUMMED, and neither is re-cased here. The Arc one is whatever
  * `cfg.identityRegistry` already is — `env.ts` puts every address through viem's `getAddress`, so
  * it is checksummed, and that is the string this field has served since it shipped. Lowercasing it
@@ -162,7 +167,8 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
       // a public surface that reads as a capability this entity does not have.
 
       // The HCS-14 universal agent id (task 9): the one identifier that names this company across
-      // both chains, and the string a demo buyer starts from.
+      // both chains, and the string a demo buyer starts from. Ungated for the same reason
+      // `registrations[]` is — it identifies the company, it does not promise a service.
       if (ent.uaid) {
         meta.uaid = ent.uaid;
         touched = true;
@@ -170,8 +176,11 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
 
       // The two entry points a buyer that found us on Hedera needs next: the free profile document
       // and the paid standing check. Composed from the SAME base as `/legal-bodies`' metadata link.
+      //
+      // GATED ON THE FLAG, unlike the two above: these are urls, not facts. With `HEDERA_ENABLED`
+      // off neither route is mounted, so publishing them would hand a buyer two links that 404.
       const base = metadataBaseOf(deps);
-      if (ent.hederaAccountId && base) {
+      if (deps.hedera && ent.hederaAccountId && base) {
         meta.hedera = {
           accountId: ent.hederaAccountId,
           verifyUrl: `${base}/verify/${publicId}`,

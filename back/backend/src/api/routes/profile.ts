@@ -18,6 +18,10 @@ import { metadataBaseOf, registrationsFor } from "./metadata";
  * `properties.description` says so in the vocabulary the claims ceiling allows (D9): "a registered
  * legal body", never "verified", never "KYC'd".
  *
+ * THE FLAG: with `HEDERA_ENABLED` off there is no `deps.hedera`, and this route is NOT MOUNTED —
+ * the same gate, and the same idiom, as `mountVerifyRoutes`. A deployment that cannot sell the
+ * standing check must not publish a profile whose `verifyUrl` points at a route it does not serve.
+ *
  * THE 404 RULE: no UAID, no profile. The UAID is what an HCS-11 reader resolves the document BY,
  * and it is written only by the registration script (task 10) — an entity without one has nothing
  * to serve, and serving a document with a null identifier would advertise a resolvable identity
@@ -36,6 +40,10 @@ const DESCRIPTION = "a registered legal body; check standing at verifyUrl";
 const PROFILE_TYPE = 1;
 
 export function mountProfileRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
+  // No Hedera config, no route — not mounted, rather than mounted and answering with links this
+  // deployment cannot honour. `mountVerifyRoutes` gates on the same object for the same reason.
+  if (!deps.hedera) return;
+
   app.get("/metadata/:publicId/profile", (c) => {
     const publicId = c.req.param("publicId");
     if (!UUID.test(publicId)) throw new ApiError("not_found", 404, "profile not found");
