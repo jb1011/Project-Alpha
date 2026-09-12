@@ -168,3 +168,20 @@ export function agentBookChipState(
   if (view.outcome === "registered") return { ...VOUCHED, href: explorerHref(view) };
   return NOT_REGISTERED;
 }
+
+/**
+ * Whether the dashboard offers the vouch button at all.
+ *
+ * Once a vouch exists there is nothing left to offer: AgentBook has no second vouch to make from
+ * this account and no removal function, so the button could only ever be shown disabled — which
+ * is a control that says "you cannot do this" about something the guardian has already done. The
+ * chip beside it ("Vouched in AgentBook ↗", linking to the transaction) is the whole answer.
+ *
+ * Every other state keeps the button, disabled or not, because in every one of them there is
+ * something a guardian may still do or may still be owed a reason for: `not-registered` and
+ * `unknown` can vouch, `disputed` may answer a replacement once (§5.2), and `submitting` is a
+ * transaction in flight whose button carries the reason it is off.
+ */
+export function vouchButtonVisible(chip: AgentBookChipState | null | undefined): boolean {
+  return chip?.kind !== "vouched";
+}

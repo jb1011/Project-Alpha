@@ -31,3 +31,27 @@ test("price must be > 0 and <= 1.0 USDC", () => {
   expect(() => loadConfig({ ...baseEnv, X402_DEMO_PRICE_USDC: "2" })).toThrow(/1.0 USDC/);
   expect(loadConfig({ ...baseEnv, X402_DEMO_PRICE_USDC: "0.05" }).x402DemoPriceUsdc).toBe("0.05");
 });
+
+test("X402_TRUST_POLICY accepts the three policies, and nothing else", () => {
+  expect(loadConfig(baseEnv).x402TrustPolicy).toBe("open");
+  expect(loadConfig({ ...baseEnv, X402_TRUST_POLICY: "accountable-only" }).x402TrustPolicy).toBe(
+    "accountable-only",
+  );
+  // The legal-body tier (design 2026-09-10 D4): accountable-only PLUS a registered Novi legal
+  // body in good standing behind the payer address.
+  expect(loadConfig({ ...baseEnv, X402_TRUST_POLICY: "legal-bodies-only" }).x402TrustPolicy).toBe(
+    "legal-bodies-only",
+  );
+  expect(() => loadConfig({ ...baseEnv, X402_TRUST_POLICY: "legal-bodies" })).toThrow();
+});
+
+test("PUBLIC_API_URL is optional and must be a url", () => {
+  // The API's OWN origin. Unset, every public link falls back to the metadata base — which on
+  // prod is the www/backend proxy, and that proxy strips CORS, Cache-Control and
+  // X-NOVI-LEGAL-BODY, i.e. exactly what those links exist to deliver.
+  expect(loadConfig(baseEnv).publicApiUrl).toBeUndefined();
+  expect(
+    loadConfig({ ...baseEnv, PUBLIC_API_URL: "https://api.novicorpus.com" }).publicApiUrl,
+  ).toBe("https://api.novicorpus.com");
+  expect(() => loadConfig({ ...baseEnv, PUBLIC_API_URL: "api.novicorpus.com" })).toThrow();
+});

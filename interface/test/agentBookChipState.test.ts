@@ -18,7 +18,7 @@
  *   label.
  */
 import { describe, expect, test } from "vitest";
-import { agentBookChipState } from "@/lib/agentbook/chipState";
+import { agentBookChipState, vouchButtonVisible } from "@/lib/agentbook/chipState";
 import type { AgentBookRowStatus, AgentBookOutcome, AgentBookStatusView } from "@/lib/api/types";
 
 const VOUCHED = "Vouched in AgentBook ↗";
@@ -258,4 +258,49 @@ test("no label anywhere claims 'human-backed', and only the vouch links out", ()
       if (state.kind !== "vouched") expect(state.href).toBeUndefined();
     }
   }
+});
+
+describe("the vouch button is offered in every state except one", () => {
+  // A vouch that exists is the one state with nothing left to offer: AgentBook has no second
+  // vouch to make from this account and no removal function, so a button there could only be a
+  // disabled control telling the guardian they cannot do what they have already done. Everywhere
+  // else the button stays exactly as it was — enabled where a guardian may act, disabled with a
+  // reason where they may not.
+  test("a vouched chip hides it", () => {
+    const chip = agentBookChipState(
+      view({ status: "confirmed", registered: true, outcome: "registered", txHash: "0xabc" }),
+    );
+    expect(chip?.kind).toBe("vouched");
+    expect(vouchButtonVisible(chip)).toBe(false);
+  });
+
+  for (const [name, v] of [
+    ["not-registered", view({ outcome: "unregistered" })],
+    ["unknown", view({ outcome: "unknown" })],
+    ["disputed", view({ outcome: "disputed" })],
+    ["submitting", view({ status: "submitted" })],
+    ["failed", view({ status: "failed", outcome: "unregistered", txHash: "0xabc" })],
+  ] as const) {
+    test(`a ${name} chip keeps it`, () => {
+      expect(vouchButtonVisible(agentBookChipState(v))).toBe(true);
+    });
+  }
+
+  test("no chip at all keeps it: an answer we do not have is not a vouch", () => {
+    // The no-pocket case is refused by the button's own reason (NO_POCKET_COPY), and a view that
+    // has not loaded yet by "Checking this agent's AgentBook standing" — both of which are
+    // reasons a guardian is owed, and neither of which can be shown by a button that is gone.
+    expect(vouchButtonVisible(null)).toBe(true);
+    expect(vouchButtonVisible(undefined)).toBe(true);
+    expect(vouchButtonVisible(agentBookChipState(view({ reason: "no-pocket-yet" })))).toBe(true);
+  });
+
+  test("exactly one kind hides it, across the whole table", () => {
+    for (const status of STATUSES) {
+      for (const outcome of OUTCOMES) {
+        const chip = agentBookChipState(view({ status, outcome, txHash: "0xabc" }));
+        expect(vouchButtonVisible(chip)).toBe(chip?.kind !== "vouched");
+      }
+    }
+  });
 });

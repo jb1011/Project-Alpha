@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import type { Hex } from "../types";
@@ -65,5 +66,65 @@ export function assertCircleCoverage(
   if (r.n > 0)
     throw new Error(
       `${r.n} agent(s) use the circle custody path but CIRCLE_API_KEY/CIRCLE_ENTITY_SECRET are not configured — refusing to boot (they would be unserviceable)`,
+    );
+}
+
+/**
+ * The DB half of the payment-address separation invariants (design 2026-08-26 §6.6, B1 gate A2).
+ *
+ * `config/env.ts` refuses a `FORMATION_REVENUE_ADDRESS` or a `FORMATION_SETTLE_SUBMITTER_KEY`
+ * that collides with the executor or any key in the fixed env set. It cannot see the OTHER half
+ * of "every platform key": the per-agent operator and pocket addresses, which are rows rather
+ * than variables — env parsing has no database, and a pocket address is derived from a seed
+ * rather than configured.
+ *
+ * Two addresses, two harms:
+ *
+ *  - the REVENUE address landing on a hot wallet this platform can sign for, on a box where the
+ *    whole point of it is that no key for it exists here;
+ *  - the SETTLE SUBMITTER being an address the fleet already uses, which puts a guardian's
+ *    settle back into a nonce space shared with agent operations — exactly what the dedicated
+ *    submitter exists to escape.
+ *
+ * Three columns, because an operator that has been ROTATED AWAY is still an address this
+ * deployment held a key for, and a pocket is derived from a seed that is still on the box.
+ *
+ * It MAY SCAN, and that is deliberate (finding B4). It runs ONCE, at API boot, on a deployment
+ * that charges — microseconds against any fleet this system will have — where the three partial
+ * indexes it used to rely on were paid for on every write to `entities`, forever, on every
+ * deployment including the ones that never charge for anything. Called from the API composition
+ * root beside `assertCircleCoverage`, and a no-op where payment is off.
+ */
+export function assertPaymentAddressSeparation(
+  db: Database.Database,
+  payment: { required: boolean; revenueAddress?: string; submitterKey?: Hex },
+): void {
+  if (!payment.required) return;
+  const held = (address: string): boolean => {
+    // SQLite's default `=` on TEXT is case-SENSITIVE, and a miss on casing would PASS this check
+    // and lose the money — addresses are stored in whatever casing wrote them (viem checksums,
+    // older paths and hand-written rows do not). `COLLATE NOCASE` is how the comparison stays
+    // correct for all of them.
+    const checksummed = getAddress(address);
+    return (
+      db
+        .prepare(
+          `SELECT 1 AS hit FROM entities
+            WHERE operator = ? COLLATE NOCASE
+               OR previous_operator = ? COLLATE NOCASE
+               OR pocket_address = ? COLLATE NOCASE
+            LIMIT 1`,
+        )
+        .get(checksummed, checksummed, checksummed) !== undefined
+    );
+  };
+
+  if (payment.revenueAddress && held(payment.revenueAddress))
+    throw new Error(
+      "Invalid config: FORMATION_REVENUE_ADDRESS is an agent operator or pocket address held by this deployment — formation revenue lands on a receive-only Ledger account, never on a wallet this box can sign for (refusing to boot)",
+    );
+  if (payment.submitterKey && held(privateKeyToAccount(payment.submitterKey).address))
+    throw new Error(
+      "Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is an agent operator or pocket key held by this deployment — the settle submitter needs its own nonce space and its own gas float, and sharing one with agent operations is what it exists to avoid (refusing to boot)",
     );
 }

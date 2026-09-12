@@ -12,8 +12,10 @@ import {
   truncateTenant,
 } from "../../formation";
 import { createCompany, updateCompanyIntake, updateCompanyParty } from "../../formation/company";
+import { FORMATION_PRODUCT, guardianOf, paymentView } from "../../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../../formation/status";
 import { opsLog } from "../../observability/opsLog";
+import { withKeyedLock } from "../../payments/keyedMutex";
 import {
   AgentSpecSchema,
   CreateCompanyBodySchema,
@@ -21,6 +23,12 @@ import {
   UpdateCompanyIntakeBodySchema,
   firstIssueMessage,
 } from "../../policy/agentSpec";
+import {
+  cancelFormationPayment,
+  formationPaymentDeps,
+  requoteFormationPayment,
+  settleFormationPayment,
+} from "../../workflow/formationPayment";
 import type { ApiDeps } from "../app";
 import { ApiError, requireOwnedCompany } from "../errors";
 import { listCompanyViews, toCompanyDetailView, toEntityView, toEntityViews } from "../views";
@@ -149,9 +157,127 @@ export function mountProtectedRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       },
     );
     if ("error" in result) throw new ApiError("validation_error", 400, result.error);
-    // The companyId and nothing else. Echoing the intake back would put the SSN in a response
-    // body, in any client that persists responses, and in any proxy log along the way.
-    return c.json({ companyId: result.companyId }, 201);
+    // The companyId and — when payment is on — the QUOTE (§6.1). Never the intake: echoing it
+    // back would put the SSN in a response body, in any client that persists responses, and in
+    // any proxy log along the way. A quote is the opposite kind of thing: an amount, a payee, a
+    // nonce and an expiry, all of which the guardian is about to publish by signing them.
+    return c.json(
+      result.quote
+        ? { companyId: result.companyId, payment: result.quote }
+        : { companyId: result.companyId },
+      201,
+    );
+  });
+
+  /**
+   * `GET /companies/:companyId/payment` — what this company owes, and what happened to it (§6.1).
+   *
+   * ONE route for both questions, because a guardian who reloads the page mid-payment has to be
+   * able to ask either. It answers with the LIVE row if there is one and otherwise the most
+   * recent terminal one, so "your payment settled" is expressible — a route that only answered
+   * "what do you owe?" would tell somebody whose payment had just gone through that they had no
+   * payment at all.
+   *
+   * The signable `typedData` rides along ONLY while the row is `quoted` AND still inside its
+   * window. Not on `settling`: re-signing a payment whose broadcast is in flight is exactly the
+   * double charge §6.4 exists to prevent, and a client that could see a quote would render the
+   * button.
+   *
+   * 404 for a deployment that does not charge, deliberately — the same answer as for a company
+   * that does not exist. There is no payment resource here, and inventing an empty one would have
+   * every client render a payment section on a box that never takes money.
+   */
+  app.get("/companies/:companyId/payment", (c) => {
+    const company = requireOwnedCompany(deps, c);
+    // ⚠ A READ, so it does NOT require `payment.required` (finding B8). Gating it on the switch
+    // meant that turning charging off after taking money made every settled payment invisible: a
+    // guardian who paid 399 USDC would see no payment at all, and support would have nothing to
+    // point at. Rolling a flag back must not erase history. The ACTIONS below are a different
+    // question and are gated.
+    const payment = deps.formation?.payment;
+    if (!payment) throw new ApiError("not_found", 404, "payment not found");
+    const row = payment.payments.findCurrent(company.companyId, FORMATION_PRODUCT);
+    if (!row) throw new ApiError("not_found", 404, "payment not found");
+    const now = Math.floor((deps.now ? deps.now() : Date.now()) / 1000);
+    return c.json(paymentView(row, guardianOf(company), payment, now));
+  });
+
+  /**
+   * The three payment ACTIONS (design §6.3/§6.4), all on one company and all guardian-driven.
+   *
+   * They share a preamble — own the company, this box charges, an executor is wired — and are
+   * serialised PER COMPANY by the same keyed lock the formation sweeper uses. The lock is what
+   * makes "at most one broadcast per quote" true under a double-clicked button, on top of the
+   * database CAS that makes it true under two processes.
+   */
+  const paymentRunner = () => {
+    const runner = formationPaymentDeps(deps);
+    if (!runner) throw new ApiError("not_found", 404, "payment not found");
+    return runner;
+  };
+
+  /**
+   * `POST /companies/:companyId/payment/settle` — the guardian's signature, and the only thing
+   * that turns a `draft` company into a `ready` one on a deployment that charges.
+   *
+   * The body is the signature and the address that produced it. Everything else — the amount, the
+   * payee, the nonce, the window — comes off the STORED ROW, deliberately: a body that could name
+   * its own amount would be a body that could pay one dollar for a Wyoming LLC.
+   */
+  app.post("/companies/:companyId/payment/settle", async (c) => {
+    const company = requireOwnedCompany(deps, c);
+    const runner = paymentRunner();
+    const body = await readJson(c);
+    const { signature, from } = (body ?? {}) as { signature?: unknown; from?: unknown };
+    if (typeof signature !== "string" || !signature.startsWith("0x"))
+      throw new ApiError("validation_error", 400, "signature is required");
+    if (typeof from !== "string") throw new ApiError("validation_error", 400, "from is required");
+    const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+      settleFormationPayment(runner, company, {
+        signature: signature as `0x${string}`,
+        from: from as `0x${string}`,
+      }),
+    );
+    if (!result.ok) throw new ApiError("validation_error", 400, result.reason);
+    return c.json({ status: result.status, txHash: result.txHash });
+  });
+
+  /**
+   * `POST /companies/:companyId/payment/cancel` — the fast path out of a stuck `settling` row.
+   *
+   * A SECOND signature, over a DIFFERENT message (`CancelAuthorization(authorizer, nonce)`),
+   * because the platform cannot cancel unilaterally: the token verifies the authorizer. That is
+   * the design and not a limitation — an authorization is the guardian's promise, and we only
+   * carry the letter.
+   */
+  app.post("/companies/:companyId/payment/cancel", async (c) => {
+    const company = requireOwnedCompany(deps, c);
+    const runner = paymentRunner();
+    const { signature } = ((await readJson(c)) ?? {}) as { signature?: unknown };
+    if (typeof signature !== "string" || !signature.startsWith("0x"))
+      throw new ApiError("validation_error", 400, "signature is required");
+    const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+      cancelFormationPayment(runner, company, { signature: signature as `0x${string}` }),
+    );
+    if (!result.ok) throw new ApiError("validation_error", 400, result.reason);
+    return c.json({ status: "expired", txHash: result.txHash });
+  });
+
+  /**
+   * `POST /companies/:companyId/payment/requote` — a NEW row with a NEW nonce.
+   *
+   * Deliberately its own door (§6.4). "Expire, then re-quote" is two acts: the first is a claim
+   * about the CHAIN (this authorization can never settle), the second a promise to the guardian
+   * (this is what you owe now). Fusing them would let a UI re-quote its way out of a `settling`
+   * row whose transfer was still in flight — the double charge in its most natural disguise — so
+   * this door REFUSES while any row is live and says which kind of live it is.
+   */
+  app.post("/companies/:companyId/payment/requote", (c) => {
+    const company = requireOwnedCompany(deps, c);
+    const runner = paymentRunner();
+    const result = requoteFormationPayment(runner, company);
+    if (!result.ok) throw new ApiError("validation_error", 400, result.reason);
+    return c.json(result.quote, 201);
   });
 
   /**

@@ -1,10 +1,11 @@
 import Database from "better-sqlite3";
 import { beforeEach, describe, expect, test } from "vitest";
+import { createLegalBodyResolver } from "../../src/payments/legalBody";
 import type { LegalBodyLookup } from "../../src/payments/sellerTrust";
 import { buildSellerTrust } from "../../src/payments/sellerTrust";
 import { migrate } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
-import type { Address } from "../../src/types";
+import type { Address, EntityRecord } from "../../src/types";
 
 const SELLER = "0x00000000000000000000000000000000000000AB";
 const PROXY = "0x00000000000000000000000000000000000000CD" as Address;
@@ -157,5 +158,52 @@ describe("verified-legal-bodies-only — the Novi registry root", () => {
   test("tier requested but legalBodies not wired -> fails closed as unavailable", async () => {
     const trust = trustWith({});
     expect(await trust.verify(SELLER, "verified-legal-bodies-only")).toBe("unavailable");
+  });
+});
+
+describe("wired to the shared resolver (design 2026-09-10 D1)", () => {
+  /** Only the four fields the resolver reads matter here; the rest of an EntityRecord is noise
+   *  for this dial, which is exactly why the definition lives in payments/legalBody.ts. */
+  const body = {
+    status: "funded",
+    proxy: PROXY,
+    treasury: SELLER as Address,
+    agentId: "843704",
+  } as EntityRecord;
+
+  test("a seller known by its PAYER address is verified — the key the treasury index cannot see", async () => {
+    let statusCalls = 0;
+    const trust = buildSellerTrust({
+      globalPolicy: "open",
+      store,
+      reader: reader(async () => HUMAN),
+      legalBody: createLegalBodyResolver({
+        findByPocketAddress: () => body,
+        findByTreasury: () => undefined, // nothing is indexed by treasury here
+        legalStatus: async () => {
+          statusCalls++;
+          return 0;
+        },
+        treasuryPaused: async () => false,
+      }),
+    });
+    expect(await trust.verify(SELLER, "verified-legal-bodies-only")).toBe("verified");
+    expect(await trust.verify(SELLER, "verified-legal-bodies-only")).toBe("verified");
+    expect(statusCalls).toBe(2); // still no caching in this tier, resolver or not
+  });
+
+  test("an address the resolver does not know is not-legal-body", async () => {
+    const trust = buildSellerTrust({
+      globalPolicy: "open",
+      store,
+      reader: reader(async () => HUMAN),
+      legalBody: createLegalBodyResolver({
+        findByPocketAddress: () => undefined,
+        findByTreasury: () => undefined,
+        legalStatus: async () => 0,
+        treasuryPaused: async () => false,
+      }),
+    });
+    expect(await trust.verify(SELLER, "verified-legal-bodies-only")).toBe("not-legal-body");
   });
 });

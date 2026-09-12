@@ -23,17 +23,25 @@ import {
 import { partyFieldsOf } from "../formation";
 import { createCompany, updateCompanyParty } from "../formation/company";
 import { describeIndustryLabels } from "../formation/naicsLabels";
+import { FORMATION_PRODUCT, guardianOf, paymentView } from "../formation/payment";
 import { deriveFormationStatus, hasLivePayment } from "../formation/status";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
+import { withKeyedLock } from "../payments/keyedMutex";
 import type { PocketFundingFn } from "../payments/pocketFunding";
 import type { VerifiedKey } from "../persistence/apiKeyStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { PasskeyStore } from "../persistence/passkeyStore";
 import { AgentSpecSchema, FormationPartySchema } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
+import {
+  cancelFormationPayment,
+  formationPaymentDeps,
+  requoteFormationPayment,
+  settleFormationPayment,
+} from "../workflow/formationPayment";
 import type { OnboardingRunner } from "../workflow/runner";
 import { entityInScope, hasCapability } from "./scope";
 
@@ -189,15 +197,37 @@ const CREATE_COMPANY_DESCRIPTION =
   " businessPurpose is a short description of what the COMPANY does, filed with it." +
   " industryLabel must be one of the industries we can file under (%INDUSTRIES%)." +
   " This call SPENDS: it is subject to your tenant's formation quota and the platform's daily ceiling." +
+  " %PAYMENT%" +
   " ⚠ It NEVER takes an SSN, and never will — an SSN in a tool argument would sit in this client's context window and its logs; the field is declared only so that passing one is REFUSED rather than silently dropped." +
   " If the responsible party is a US person and wants the fast EIN route, create the company through the web form (POST /companies) instead." +
   " Agents attached to an existing company are free: pass its companyId to onboard_agent instead of creating a second one.";
 
 function createCompanyDescription(deps: Pick<McpToolDeps, "formation">): string {
-  return CREATE_COMPANY_DESCRIPTION.replace("%CAPABILITY%", formationCapabilityNote(deps)).replace(
-    "%INDUSTRIES%",
-    describeIndustryLabels(),
-  );
+  return CREATE_COMPANY_DESCRIPTION.replace("%CAPABILITY%", formationCapabilityNote(deps))
+    .replace("%PAYMENT%", formationPaymentNote(deps))
+    .replace("%INDUSTRIES%", describeIndustryLabels());
+}
+
+/**
+ * ⚠ WHAT THIS CALL COSTS, AND WHAT HAPPENS NEXT (finding B7).
+ *
+ * An agent reading `create_company` used to be told the call "SPENDS" against a quota and
+ * nothing else. On a deployment that charges, the company then lands in `draft` owing a real fee,
+ * the answer carries a quote the agent has no described way to act on, and the agent reports "the
+ * company was created" — which is true and useless. What it needs to say, in the one place an
+ * agent reads before calling: the amount, the state the company lands in, that a HUMAN's wallet
+ * must sign (we cannot), and the names of the four tools that finish the job.
+ */
+function formationPaymentNote(deps: Pick<McpToolDeps, "formation">): string {
+  const payment = deps.formation?.payment;
+  if (!payment?.required)
+    return "Formation is included on this deployment: no fee is charged and the company is ready to file immediately.";
+  return [
+    `⚠ THIS DEPLOYMENT CHARGES A FORMATION FEE of $${payment.feeUsdc} USDC per company.`,
+    "The company lands in `draft` and the answer carries a QUOTE (amount, payee, nonce, expiry and the exact EIP-712 message to sign).",
+    "It cannot be filed until that quote is settled, and it can only be settled by the GUARDIAN's own wallet — we cannot sign it for them, because it authorizes a transfer of their USDC.",
+    "Four tools finish the job: get_company_payment (re-read the quote, or find out what happened), submit_company_payment (their signature), cancel_company_payment (withdraw a stuck one — a second signature) and requote_company_payment (a fresh quote once nothing is live).",
+  ].join(" ");
 }
 
 /** Formation availability sentence for the onboard_agent / create_formation_party descriptions. */
@@ -206,7 +236,10 @@ function formationCapabilityNote(deps: Pick<McpToolDeps, "formation">): string {
   const identity = deps.formation.sandboxSyntheticPii
     ? "This deployment files with a labeled SYNTHETIC sandbox identity: pass synthetic:true and no personal data — real personal data is refused."
     : "This deployment files real legal entities: real personal data is required and synthetic:true is refused.";
-  return `Formation is ${deps.formation.required ? "REQUIRED" : "available"} on this deployment (doola, ${deps.formation.environment}). ${identity}`;
+  const fee = deps.formation.payment?.required
+    ? ` This deployment CHARGES $${deps.formation.payment.feeUsdc} USDC per company, payable by the guardian's own wallet before the filing can start (see create_company).`
+    : "";
+  return `Formation is ${deps.formation.required ? "REQUIRED" : "available"} on this deployment (doola, ${deps.formation.environment}). ${identity}${fee}`;
 }
 
 /**
@@ -898,11 +931,166 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           if ("error" in result)
             return { content: [{ type: "text", text: result.error }], isError: true };
           return {
-            content: [{ type: "text", text: JSON.stringify({ companyId: result.companyId }) }],
+            content: [
+              {
+                type: "text",
+                // The QUOTE rides along when this deployment charges (§6.1), in the SAME shape
+                // REST returns — a parity test asserts the key sets are identical, because an
+                // agent that got a companyId with no mention of a fee would report a company as
+                // created and leave a guardian with an unfileable draft.
+                text: JSON.stringify(
+                  result.quote
+                    ? { companyId: result.companyId, payment: result.quote }
+                    : { companyId: result.companyId },
+                ),
+              },
+            ],
           };
         } catch (e) {
           return { content: [{ type: "text", text: (e as Error).message }], isError: true };
         }
+      },
+    );
+  }
+
+  /**
+   * THE PAYMENT TOOLS (design §6, MCP parity).
+   *
+   * Registered only where this deployment CHARGES — a box in the beta has no payment resource at
+   * all, and an agent must not discover a tool whose every call would 404.
+   *
+   * ⚠ NO PII rides on any of them, and none is possible: a signature, an address and a company
+   * handle are the whole surface. The guardian's SIGNATURE, though, is the one thing an agent
+   * cannot produce for itself — it comes from a wallet a human controls — which is why
+   * `create_company`'s answer says so and `submit_company_payment` takes the signature as an
+   * argument rather than pretending to obtain one.
+   */
+  const paymentRunner = () => formationPaymentDeps(deps);
+
+  /** Own the company, on the same terms `get_company` does — and narrow an entity-scoped key to
+   *  the one company its agent is filed under. One helper, three tools. */
+  const ownedCompany = (companyId: string) => {
+    const company = deps.companies?.findOwned(tenantId, companyId);
+    const only = scopedCompanyId(scope, deps.repo);
+    if (!company || (only !== null && company.companyId !== only)) return undefined;
+    return company;
+  };
+
+  // The READ tool wherever a payment store exists — a deployment that has STOPPED charging must
+  // still be able to answer "what happened to the fee I paid?" (finding B8). The three ACTION
+  // tools stay behind `required`: they are doors onto money moving.
+  if (deps.formation?.payment && deps.companies) {
+    server.registerTool(
+      "get_company_payment",
+      {
+        title: "Get company payment",
+        description:
+          "What this company owes for its formation, and what has happened to the payment so far. While a quote is live and unexpired the answer carries `quote.typedData` — the exact EIP-712 message the GUARDIAN's wallet must sign (we cannot sign it; it authorizes a transfer of their USDC). A `settling` payment carries no quote on purpose: signing again while a broadcast is in flight would charge the guardian twice. Statuses: quoted (owed), settling (broadcast, outcome pending), settled (paid), expired (the window closed — request a new quote), failed (the transfer reverted on-chain), refunded.",
+        inputSchema: { companyId: z.string() },
+      },
+      async ({ companyId }) => {
+        if (!hasCapability(scope, "read")) return refuse("not authorized");
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const payment = deps.formation!.payment!;
+        const row = payment.payments.findCurrent(company.companyId, FORMATION_PRODUCT);
+        if (!row) return refuse("no payment for this company");
+        const now = Math.floor((deps.now ? deps.now() : Date.now()) / 1000);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(paymentView(row, guardianOf(company), payment, now)),
+            },
+          ],
+        };
+      },
+    );
+  }
+
+  if (deps.formation?.payment?.required && deps.companies) {
+    server.registerTool(
+      "submit_company_payment",
+      {
+        title: "Submit company payment",
+        description:
+          "Submit the guardian's signature over the quote from get_company_payment, so we can put the transfer on-chain and the company becomes fileable. `signature` is what their wallet returned for `quote.typedData`; `from` is the guardian's address, which must be the wallet this company is owned by. Nothing else is accepted from you: the amount, the payee, the nonce and the expiry all come from the stored quote, so this call cannot change what is paid or to whom. Answers `settled` when the receipt confirmed, or `pending` when the transaction is in flight — in which case poll get_company_payment rather than signing again.",
+        inputSchema: { companyId: z.string(), signature: z.string(), from: z.string() },
+      },
+      async ({ companyId, signature, from }) => {
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const runner = paymentRunner();
+        if (!runner) return refuse("this deployment does not take formation payments");
+        const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+          settleFormationPayment(runner, company, {
+            signature: signature as `0x${string}`,
+            from: from as `0x${string}`,
+          }),
+        );
+        if (!result.ok) return refuse(result.reason);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ status: result.status, txHash: result.txHash }),
+            },
+          ],
+        };
+      },
+    );
+
+    server.registerTool(
+      "requote_company_payment",
+      {
+        title: "Re-quote company payment",
+        description:
+          "Ask for a NEW quote, with a new nonce, after the previous one ended without paying — expired, or a transfer that reverted. Deliberately its own call and not part of cancel: it is REFUSED while any payment is live, because issuing a second quote while the first authorization can still be mined is how a guardian gets charged twice. If this refuses with 'still settling', poll get_company_payment; if it refuses with 'a live quote', that quote is the one to sign.",
+        inputSchema: { companyId: z.string() },
+      },
+      async ({ companyId }) => {
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const runner = paymentRunner();
+        if (!runner) return refuse("this deployment does not take formation payments");
+        // The keyed lock, as on the other two: a re-quote races a settle for the same company,
+        // and the live-rows index is the backstop rather than the first line.
+        const result = await withKeyedLock(`payment:${company.companyId}`, async () =>
+          requoteFormationPayment(runner, company),
+        );
+        if (!result.ok) return refuse(result.reason);
+        return { content: [{ type: "text", text: JSON.stringify(result.quote) }] };
+      },
+    );
+
+    server.registerTool(
+      "cancel_company_payment",
+      {
+        title: "Cancel company payment",
+        description:
+          "Withdraw a formation payment that is stuck, using a SECOND signature from the guardian — over `CancelAuthorization(authorizer, nonce)` against the USDC token's domain, with the nonce from get_company_payment. We cannot do this alone: the token verifies the guardian's signature, because the authorization is their promise and only they may take it back. Once it confirms, the payment is expired immediately and a new quote can be requested.",
+        inputSchema: { companyId: z.string(), signature: z.string() },
+      },
+      async ({ companyId, signature }) => {
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
+        const company = ownedCompany(companyId);
+        if (!company) return refuse("company not found");
+        const runner = paymentRunner();
+        if (!runner) return refuse("this deployment does not take formation payments");
+        const result = await withKeyedLock(`payment:${company.companyId}`, () =>
+          cancelFormationPayment(runner, company, { signature: signature as `0x${string}` }),
+        );
+        if (!result.ok) return refuse(result.reason);
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ status: "expired", txHash: result.txHash }) },
+          ],
+        };
       },
     );
   }

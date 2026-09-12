@@ -96,6 +96,24 @@ export interface WorldStore {
     now: number,
     windowMs?: number,
   ): { allowed: boolean; used: number; resetAt?: number };
+  /**
+   * Claim ONE paid attempt against an outstanding invoice, atomically (ruling FP-R1).
+   *
+   * The second counter on the same row, key and window as `tryIncrementUsage`: `paidAttempts` is
+   * how many of the units CHARGED in this window have already been answered by a payment-carrying
+   * request. `paidAttempts < unitsCharged` means an invoice is still outstanding — one 402 (or one
+   * charged refusal), one paid attempt — and the claim consumes it whether the payment then
+   * settles or not, which is what bounds the facilitator calls one human can drive per window.
+   *
+   * An elapsed window is read as 0/0 here exactly as it is there (lazily, at read time), so a
+   * payment that arrives after its window closed finds no invoice and is refused.
+   */
+  tryConsumePaidAttempt(
+    humanId: string,
+    resource: string,
+    now: number,
+    windowMs?: number,
+  ): { allowed: boolean; paidAttempts: number; unitsCharged: number };
   /** Cached AgentBook lookup, positives only. Thin wrapper over `getCachedLookup`. */
   getCachedHuman(agentAddress: string, now: number, ttlMs: number): string | undefined;
   cacheHuman(agentAddress: string, humanId: string, now: number): void;
@@ -386,21 +404,60 @@ export class SqliteWorldStore implements WorldStore {
   ): { allowed: boolean; used: number; resetAt?: number } {
     return this.db.transaction(() => {
       const row = this.db
-        .prepare("SELECT used, updated_at FROM world_usage WHERE human_id = ? AND resource = ?")
-        .get(humanId, resource) as { used: number; updated_at: number } | undefined;
+        .prepare(
+          "SELECT used, paid_attempts, updated_at FROM world_usage WHERE human_id = ? AND resource = ?",
+        )
+        .get(humanId, resource) as
+        | { used: number; paid_attempts: number; updated_at: number }
+        | undefined;
       // An elapsed window resets the count. Reset can only ever grant MORE than the old
       // lifetime behavior, never less, so existing callers are safe.
       const expired = row != null && windowMs != null && now - row.updated_at > windowMs;
       const used = expired ? 0 : (row?.used ?? 0);
+      // The paid-attempt counter belongs to the same window, so it is written back on every
+      // charge: carried while the window stands, and reset to 0 by the write that opens a new one.
+      // Rewriting it HERE is what keeps a stale count from a closed window out of the new one —
+      // the peek (limit 0) and the claim both expire it lazily and never write.
+      const paid = expired ? 0 : (row?.paid_attempts ?? 0);
       const resetAt = row && windowMs != null && !expired ? row.updated_at + windowMs : undefined;
       if (used >= limit) return { allowed: false, used, resetAt };
       this.db
         .prepare(
-          `INSERT INTO world_usage (human_id, resource, used, updated_at) VALUES (?,?,1,?)
-           ON CONFLICT(human_id, resource) DO UPDATE SET used = ?, updated_at = excluded.updated_at`,
+          `INSERT INTO world_usage (human_id, resource, used, paid_attempts, updated_at) VALUES (?,?,1,0,?)
+           ON CONFLICT(human_id, resource) DO UPDATE SET used = ?, paid_attempts = ?, updated_at = excluded.updated_at`,
         )
-        .run(humanId, resource, now, used + 1);
+        .run(humanId, resource, now, used + 1, paid);
       return { allowed: true, used: used + 1, resetAt };
+    })();
+  }
+
+  tryConsumePaidAttempt(
+    humanId: string,
+    resource: string,
+    now: number,
+    windowMs?: number,
+  ): { allowed: boolean; paidAttempts: number; unitsCharged: number } {
+    return this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          "SELECT used, paid_attempts, updated_at FROM world_usage WHERE human_id = ? AND resource = ?",
+        )
+        .get(humanId, resource) as
+        | { used: number; paid_attempts: number; updated_at: number }
+        | undefined;
+      const expired = row != null && windowMs != null && now - row.updated_at > windowMs;
+      const unitsCharged = expired ? 0 : (row?.used ?? 0);
+      const paidAttempts = expired ? 0 : (row?.paid_attempts ?? 0);
+      // No invoice outstanding — nothing was charged in this window that this payment could be
+      // answering. Refused without a write, so a hammering caller cannot even grow the row.
+      if (paidAttempts >= unitsCharged) return { allowed: false, paidAttempts, unitsCharged };
+      // `unitsCharged > 0` implies the row exists and was written in this window, so this is an
+      // UPDATE by construction — and it deliberately leaves `updated_at` alone: answering an
+      // invoice must not extend the window the invoice was charged in.
+      this.db
+        .prepare("UPDATE world_usage SET paid_attempts = ? WHERE human_id = ? AND resource = ?")
+        .run(paidAttempts + 1, humanId, resource);
+      return { allowed: true, paidAttempts: paidAttempts + 1, unitsCharged };
     })();
   }
 

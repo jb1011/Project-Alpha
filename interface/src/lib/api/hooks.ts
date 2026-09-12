@@ -12,6 +12,7 @@ import {
   agentBookRegister,
   agentBookSession,
   bootstrapConnection,
+  cancelCompanyPayment,
   createCompany,
   createConnectionPackage,
   createFormationParty,
@@ -24,9 +25,11 @@ import {
   getEntityRuns,
   getCompany,
   getCompanyCompliance,
+  getCompanyPayment,
   getEntityTreasury,
   getNonce,
   getPasskeyChallenge,
+  getLegalBody,
   getPublicConfig,
   listApiKeys,
   listCompanies,
@@ -37,9 +40,11 @@ import {
   onboardEntity,
   patchPerTxCap,
   patchTrustPolicy,
+  requoteCompanyPayment,
   revokeApiKey,
   revokePasskey,
   schedulePolicyUpdate,
+  settleCompanyPayment,
   storePasskey,
   updateCompanyIntake,
   updateCompanyParty,
@@ -226,6 +231,29 @@ export function useEntityJobsQuery(entityId: string, refetchInterval = 5000) {
   });
 }
 
+/**
+ * "Is this address a Novi legal body in good standing?" — the PUBLIC lookup (design 2026-09-10
+ * D3), asked about the agent's own payment address.
+ *
+ * No token, and no poll. Standing changes only when a guardian pauses the treasury or the legal
+ * status moves on chain — both of which this dashboard either performs itself (and invalidates
+ * afterwards) or reloads to see — so a polling chip would spend two Arc reads every few seconds
+ * for an answer that almost never changes. `retry: false` for the same reason the AgentBook
+ * status query has it: all four non-200s here (400, 404, 429, 503) mean "could not check", and
+ * three retries of a throttle is the wrong answer to a throttle.
+ *
+ * Disabled until there is an address to ask about: an agent with no pocket has nothing to look
+ * up, and an empty lookup would be a question nobody asked.
+ */
+export function useLegalBodyQuery(address: string | null | undefined) {
+  return useQuery({
+    queryKey: apiKeys.legalBody(address ?? ""),
+    queryFn: () => getLegalBody(address!),
+    enabled: !!address,
+    retry: false,
+  });
+}
+
 export function useEntityAgentBookQuery(entityId: string) {
   const token = useAuthToken();
   return useQuery({
@@ -246,8 +274,13 @@ export function useAgentDashboardQueries(entityId: string) {
   const treasury = useEntityTreasuryQuery(entityId, treasuryReady);
   const runs = useEntityRunsQuery(entityId, treasuryReady, visibilityPollInterval);
   const agentBook = useEntityAgentBookQuery(entityId);
+  // Keyed off the AgentBook view's address rather than the entity's, because the entity view
+  // does not carry the pocket at all — and the pocket is exactly what both questions are about:
+  // the address that signs AgentKit challenges and pays x402 invoices is the address AgentBook
+  // binds and the address a seller looks up here.
+  const legalBody = useLegalBodyQuery(agentBook.data?.address);
 
-  return { entity, treasury, runs, agentBook };
+  return { entity, treasury, runs, agentBook, legalBody };
 }
 
 /* ── Connections & passkeys ───────────────────────────────────────────────── */
@@ -500,6 +533,104 @@ export function useUpdateCompanyIntakeMutation(companyId: string) {
       const token = await ensureToken();
       await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
       await queryClient.invalidateQueries({ queryKey: apiKeys.companies(token) });
+    },
+  });
+}
+
+/**
+ * ── FORMATION PAYMENTS (design §6) ──────────────────────────────────────────────────────────
+ *
+ * The hook layer's whole job here is to make "sign once per quote" the only expressible flow:
+ * the query is the ONLY source of a signable quote and stops serving one the instant a broadcast
+ * is in flight, and there is no mutation that could produce a second signature for the same
+ * nonce.
+ *
+ * `refetchInterval` is the poll §6 asks for. It runs ONLY while the payment is genuinely in
+ * motion — `settling`, or a `quoted` row somebody is looking at — and stops dead on every
+ * terminal state, so a settled company does not poll its receipt forever.
+ */
+/**
+ * How often a payment in motion is re-read. Named rather than passed in (finding C5): the
+ * `options` parameter this replaces had two knobs — `enabled` and `pollMs` — and neither had ever
+ * been supplied by a caller, while the SETTLING interval is half of a contract with the settle
+ * route (see below) that a caller must not be able to lengthen.
+ */
+const SETTLING_POLL_MS = 4000;
+const QUOTED_POLL_MS = 10_000;
+
+export function useCompanyPaymentQuery(companyId: string | null | undefined) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.companyPayment(token ?? "", companyId ?? ""),
+    queryFn: () => getCompanyPayment(token!, companyId!),
+    enabled: !!token && !!companyId,
+    // NO staleTime, unlike its siblings: this row changes underneath the page (the sweeper
+    // resolves a stalled settle) and a cached "settling" shown for a minute is the one thing that
+    // would make a guardian reach for a second signature.
+    staleTime: 0,
+    // A 404 is the honest answer on a deployment that does not charge, and on a company with no
+    // payment at all. Retrying it is a loop against a fact.
+    retry: false,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      // 4 SECONDS while a broadcast is in flight, and that number is half of a contract: the
+      // settle route waits only 12 seconds for a receipt (`ROUTE_RECEIPT_TIMEOUT_MS`) and answers
+      // `pending` rather than holding the connection for a minute. This poll is what turns that
+      // `pending` into "settled" on screen, usually within a second or two of the transaction
+      // landing. Slow it down and a settled payment looks stuck; remove it and `pending` is where
+      // the screen stops.
+      if (status === "settling") return SETTLING_POLL_MS;
+      if (status === "quoted") return QUOTED_POLL_MS;
+      return false;
+    },
+  });
+}
+
+/**
+ * Submit the guardian's signature.
+ *
+ * It invalidates the payment AND the company, because both change at once when a settle
+ * confirms: the payment becomes `settled` and the company leaves `draft` for `ready`. A page that
+ * refreshed only the first would show a paid payment beside a company still described as unpaid.
+ */
+export function useSettleCompanyPaymentMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (body: { signature: `0x${string}`; from: `0x${string}` }) =>
+      settleCompanyPayment(await ensureToken(), companyId, body),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companyPayment(token, companyId) });
+      await queryClient.invalidateQueries({ queryKey: apiKeys.company(token, companyId) });
+      queryClient.invalidateQueries({ queryKey: apiKeys.companies(token), refetchType: "none" });
+    },
+  });
+}
+
+/** The guardian's cancel — a SECOND signature, over a different message. */
+export function useCancelCompanyPaymentMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async (body: { signature: `0x${string}` }) =>
+      cancelCompanyPayment(await ensureToken(), companyId, body),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companyPayment(token, companyId) });
+    },
+  });
+}
+
+/** A new quote with a new nonce. Refused by the backend while anything is live. */
+export function useRequoteCompanyPaymentMutation(companyId: string) {
+  const queryClient = useQueryClient();
+  const ensureToken = useEnsureAuthToken();
+  return useMutation({
+    mutationFn: async () => requoteCompanyPayment(await ensureToken(), companyId),
+    onSuccess: async () => {
+      const token = await ensureToken();
+      await queryClient.invalidateQueries({ queryKey: apiKeys.companyPayment(token, companyId) });
     },
   });
 }

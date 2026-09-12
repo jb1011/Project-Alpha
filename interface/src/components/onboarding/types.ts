@@ -11,6 +11,17 @@ export type Phase =
    * Present only where the deployment can actually form entities — see `visiblePhases`.
    */
   | "legal-body"
+  /**
+   * THE FORMATION FEE (B1, design §6.1).
+   *
+   * It sits directly after the legal body, because that is when the debt exists: with payment on,
+   * `POST /companies` lands the company `draft` and returns a quote, and every screen after this
+   * one would otherwise carry the user towards a submit for a company that cannot be filed.
+   *
+   * Present ONLY where `/config.formationPaymentRequired` is true — which is no deployment during
+   * the beta. See `visiblePhases`.
+   */
+  | "payment"
   | "custody"
   | "configure"
   | "agreement"
@@ -111,6 +122,7 @@ export const PHASES: PhaseMeta[] = [
   { id: "welcome", label: "Wallet & passkey" },
   { id: "guardian", label: "Accountable human" },
   { id: "legal-body", label: "Legal body" },
+  { id: "payment", label: "Formation fee" },
   { id: "custody", label: "Key custody" },
   { id: "configure", label: "Define agent" },
   { id: "agreement", label: "Operating agreement" },
@@ -126,9 +138,32 @@ export const PHASES: PhaseMeta[] = [
  * hides the phase — a backend that predates the field forms nothing, which is exactly what
  * absent should mean, and a deployment we cannot ask must not be shown a step whose only
  * endpoint would answer 503.
+ *
+ * `paymentRequired` (B1) is the same rule for the fee, and it DEFAULTS TO FALSE for the same
+ * reason: a backend that predates `/config.formationPaymentRequired` does not charge, and a
+ * payment step whose every endpoint would 404 is worse than no step at all. It is also
+ * subordinate — a deployment that forms nothing cannot charge for a formation, so the payment
+ * phase is dropped whenever the legal-body one is, whatever the flag says.
+ *
+ * ⚠ AND IT NEEDS A COMPANY (finding B5). `hasCompany` is the third input because a fee is owed BY
+ * SOMETHING: with `FORMATION_REQUIRED=false` a user may SKIP the legal-body step entirely, and
+ * the payment phase then has no company to quote for, no endpoint that would answer, and no exit.
+ * The step exists from the moment `POST /companies` returns a handle and not before — which is
+ * also the moment the debt exists.
  */
-export function visiblePhases(formationAvailable: boolean): PhaseMeta[] {
-  return formationAvailable ? PHASES : PHASES.filter((p) => p.id !== "legal-body");
+export function visiblePhases(
+  formationAvailable: boolean,
+  paymentRequired = false,
+  hasCompany = false,
+): PhaseMeta[] {
+  const hidden = new Set<Phase>();
+  if (!formationAvailable) {
+    hidden.add("legal-body");
+    hidden.add("payment");
+  } else if (!paymentRequired || !hasCompany) {
+    hidden.add("payment");
+  }
+  return hidden.size === 0 ? PHASES : PHASES.filter((p) => !hidden.has(p.id));
 }
 
 export function indexIn(phases: PhaseMeta[], phase: Phase): number {
@@ -162,7 +197,10 @@ export function indexIn(phases: PhaseMeta[], phase: Phase): number {
  */
 export function snapToVisiblePhase(phases: PhaseMeta[], phase: Phase): Phase {
   if (indexIn(phases, phase) >= 0) return phase;
-  if (phase === "legal-body" && indexIn(phases, "custody") >= 0) return "custody";
+  // Both optional steps snap FORWARD to `custody`, which is the phase the flow itself sends users
+  // to when either is skipped or absent. Snapping backwards would re-run a step already done.
+  if ((phase === "legal-body" || phase === "payment") && indexIn(phases, "custody") >= 0)
+    return "custody";
 
   const canonical = PHASES.findIndex((p) => p.id === phase);
   for (let i = canonical - 1; i >= 0; i--) {
@@ -209,8 +247,29 @@ export function resumePhase(input: {
   entityId: string | null;
   /** A v2 session that carried a party handle and no company. */
   needsCompany: boolean;
+  /**
+   * The picked company's SERVER-DERIVED state, when we know it (finding B6).
+   *
+   * Read rather than inferred from `companyId != null`: the question is not "is there a company"
+   * but "is that company still waiting to be paid for", and only the server's word answers it.
+   */
+  companyState?: string | null;
 }): Phase {
   const { phases, storedPhase } = input;
+  // ⚠ THE FEE WENT AWAY WHILE THIS SESSION WAS PARKED ON IT (finding B6).
+  //
+  // Snapping forward to custody is right for a company that is READY — the step was skipped and
+  // nothing is owed. It is wrong for one still `draft`/`paying`: with payment off, no door will
+  // ever move that company out of draft, so the wizard would carry the user through custody,
+  // configure and agreement towards a submit for a company that cannot be filed. Landing on the
+  // legal-body step is where they can pick or create one that can, and the flow says why.
+  if (
+    storedPhase === "payment" &&
+    indexIn(phases, "payment") < 0 &&
+    indexIn(phases, "legal-body") >= 0 &&
+    (input.companyState === "draft" || input.companyState === "paying")
+  )
+    return "legal-body";
   if (!input.formationAvailable) return storedPhase;
   if (!input.formationRequired && !input.needsCompany) return storedPhase;
   if (input.companyId || input.entityId) return storedPhase;

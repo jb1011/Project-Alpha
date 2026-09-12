@@ -20,11 +20,15 @@ import type {
   ConnectionPackage,
   EntityView,
   FormationPartyInput,
+  FormationPaymentView,
+  FormationQuote,
   GuardianPasskey,
   JobView,
+  LegalBodyLookup,
   PasskeyView,
   PublicConfig,
   ReputationView,
+  SettlePaymentResult,
   TransparencyView,
   TreasuryView,
   WorldIdAttestContext,
@@ -118,6 +122,23 @@ export async function getTransparency(): Promise<TransparencyView> {
   return request("/transparency");
 }
 
+/**
+ * The public legal-body lookup — no auth, keyed by an ADDRESS (design 2026-09-10 D3).
+ *
+ * Deliberately the same unauthenticated route a seller on someone else's stack calls, asked
+ * through the same `/backend` origin as everything else here. The dashboard could have been given
+ * an owner-only field on the entity view instead; reading the public answer means the chip an
+ * owner sees is the answer their counterparties get, and a deployment where the route is missing
+ * or throttled shows "could not check" here too rather than a confident claim nobody else can
+ * verify.
+ *
+ * Throws `ApiError` for all four non-200s (400, 404, 429, 503). Every one of them is "we could
+ * not check": none is an answer about the address, and none may be rendered as one.
+ */
+export async function getLegalBody(address: string): Promise<LegalBodyLookup> {
+  return request(`/legal-bodies/${encodeURIComponent(address)}`);
+}
+
 export async function onboardEntity(
   token: string,
   spec: AgentSpec,
@@ -194,8 +215,78 @@ export async function fetchFormationRules(): Promise<FormationRules> {
 export async function createCompany(
   token: string,
   intake: CompanyIntakeInput,
-): Promise<{ companyId: string }> {
+): Promise<{ companyId: string; payment?: FormationQuote }> {
   return request("/companies", { method: "POST", token, body: intake });
+}
+
+/**
+ * ── FORMATION PAYMENTS (design §6) ──────────────────────────────────────────────────────────
+ *
+ * Four calls, and between them they express one rule the UI must not be able to break: a
+ * guardian signs ONCE per quote. `getCompanyPayment` is the only source of a signable quote, and
+ * it stops serving one the moment a broadcast is in flight; `requoteCompanyPayment` is a separate
+ * door that REFUSES while anything is live. There is deliberately no "pay again" call.
+ */
+
+/** What this company owes, or what happened to the payment. 404 where the box does not charge. */
+export async function getCompanyPayment(
+  token: string,
+  companyId: string,
+): Promise<FormationPaymentView> {
+  return request(`/companies/${encodeURIComponent(companyId)}/payment`, { token });
+}
+
+/**
+ * Submit the guardian's signature over `quote.typedData`.
+ *
+ * `from` is the guardian's address, and the backend checks it against the company's owner: the
+ * amount, the payee, the nonce and the window all come off the stored quote, so nothing here can
+ * change what is paid or to whom.
+ *
+ * A `pending` answer means the transaction is in flight and the outcome is not yet observed —
+ * POLL `getCompanyPayment`, never sign again.
+ */
+export async function settleCompanyPayment(
+  token: string,
+  companyId: string,
+  body: { signature: `0x${string}`; from: `0x${string}` },
+): Promise<SettlePaymentResult> {
+  return request(`/companies/${encodeURIComponent(companyId)}/payment/settle`, {
+    method: "POST",
+    token,
+    body,
+  });
+}
+
+/**
+ * Withdraw a stuck payment with a SECOND guardian signature, over
+ * `CancelAuthorization(authorizer, nonce)`.
+ *
+ * The platform cannot do this alone — the token verifies the authorizer — which is why this takes
+ * a signature rather than being a plain button the backend could honour by itself.
+ */
+export async function cancelCompanyPayment(
+  token: string,
+  companyId: string,
+  body: { signature: `0x${string}` },
+): Promise<{ status: "expired"; txHash: `0x${string}` }> {
+  return request(`/companies/${encodeURIComponent(companyId)}/payment/cancel`, {
+    method: "POST",
+    token,
+    body,
+  });
+}
+
+/** A NEW quote with a NEW nonce. Refused while any payment is live — expiry comes first. */
+export async function requoteCompanyPayment(
+  token: string,
+  companyId: string,
+): Promise<FormationQuote> {
+  return request(`/companies/${encodeURIComponent(companyId)}/payment/requote`, {
+    method: "POST",
+    token,
+    body: {},
+  });
 }
 
 /** The §4.7 edit-and-retry: re-open a rejected intake, with a fresh SSN capture. */

@@ -1,0 +1,357 @@
+import { encodeFunctionData, keccak256 } from "viem";
+import type { PublicClient, WalletClient } from "viem";
+import { CANCEL_AUTHORIZATION_GAS, TRANSFER_WITH_AUTHORIZATION_GAS } from "../adapters/arc/gas";
+import { FIAT_TOKEN_ABI, readAuthorizationState } from "../adapters/arc/usdcToken";
+import type { Address, Hex } from "../types";
+
+/**
+ * The EXECUTOR side of a formation payment (design 2026-08-26 §6.4, amended by the B1 gate).
+ *
+ * The guardian signs an EIP-3009 authorization; nobody's money moves until somebody puts it
+ * on-chain, and that somebody is us — the dedicated SETTLE SUBMITTER, paying the gas, which on
+ * Arc is USDC cents.
+ *
+ * ── THE DURABLE ARTIFACT IS THE AUTHORIZATION, NOT A TRANSACTION ───────────────────────────────
+ *
+ * The first cut of this module signed the executor transaction, handed its bytes back to be
+ * persisted, and re-broadcast THOSE bytes on resume. That is the bridge-legs rule, and it is the
+ * wrong rule here: a signed transaction commits to an EXECUTOR NONCE, and a nonce that another
+ * transaction consumes while we are down makes the persisted bytes permanently unsendable
+ * ("nonce too low"). The payment would then sit `settling` until its window closed, for a reason
+ * that has nothing to do with the guardian.
+ *
+ * The guardian's AUTHORIZATION has no nonce of ours in it. So it is what we persist, and every
+ * broadcast — the first and each resume — COMPOSES A FRESH transaction around it: the current
+ * pending nonce, the current fees, a fee bump per re-broadcast. Exactly-once is not ours to
+ * enforce and never was: the token retires the (authorizer, nonce) pair on first use, so a second
+ * transaction carrying the same authorization reverts rather than transferring twice.
+ */
+
+export interface FormationExecutorDeps {
+  publicClient: PublicClient;
+  /** The DEDICATED SETTLE SUBMITTER (`FORMATION_SETTLE_SUBMITTER_KEY`) — its own EOA, its own
+   *  nonce space, its own USDC gas balance, no governance authority. It signs and pays the gas;
+   *  it is NOT the token sender. */
+  walletClient: WalletClient;
+  usdc: Address;
+  chainId: number;
+  /** How long to wait for a receipt before treating the outcome as UNKNOWN (never as failed). */
+  receiptTimeoutMs?: number;
+}
+
+/** The EIP-3009 authorization, in the shape the token's calldata wants. */
+export interface SettleAuthorization {
+  from: Address;
+  to: Address;
+  value: bigint;
+  validAfter: bigint;
+  validBefore: bigint;
+  nonce: Hex;
+}
+
+/**
+ * THE ONE STRING→BIGINT CONVERSION (finding C1).
+ *
+ * The message a guardian signs is built ONCE, by `quoteOf`, and it is built in the shape the wire
+ * and EIP-712 want: decimal strings. The token's calldata wants bigints. Between those two shapes
+ * there used to be three separate constructions of the same six fields — the served quote, the
+ * object handed to local verification, and the object handed to the executor — each free to
+ * disagree with the others about `validAfter` or the payee, and each disagreement producing a
+ * signature that verifies here and reverts on-chain.
+ *
+ * So: one builder (`quoteOf`) and one converter (this). Everything downstream consumes the served
+ * message.
+ */
+export function toSettleAuthorization(message: {
+  from: Address;
+  to: Address;
+  value: string;
+  validAfter: string;
+  validBefore: string;
+  nonce: Hex;
+}): SettleAuthorization {
+  return {
+    from: message.from,
+    to: message.to,
+    value: BigInt(message.value),
+    validAfter: BigInt(message.validAfter),
+    validBefore: BigInt(message.validBefore),
+    nonce: message.nonce,
+  };
+}
+
+/**
+ * Default receipt wait. Arc has sub-second blocks, so this is a long time to be wrong about —
+ * and being wrong is cheap now: an unresolved broadcast is resolved by the token's own logs on
+ * the next sweeper pass, not by our patience here. Callers on a human's hot path pass less.
+ */
+export const SETTLE_RECEIPT_TIMEOUT_MS = 60_000;
+
+/**
+ * What the REQUEST PATH waits (finding B3) — the settle route and MCP's `submit_company_payment`.
+ *
+ * Twelve seconds, not sixty. On Arc a settle confirms in about a second, so twelve is already
+ * generous; what the extra forty-eight buys is a request holding a connection open, a browser fetch
+ * that may time out first, and an MCP client waiting on a tool call — for an answer the caller does
+ * not need from THIS response. A `pending` answer is a complete answer: the row is `settling`, the
+ * client's 4-second poll of `GET /companies/:id/payment` reports the settlement the moment it
+ * lands, and the sweeper is the backstop if the client goes away. Sixty seconds only makes the
+ * unhappy path feel broken.
+ */
+export const ROUTE_RECEIPT_TIMEOUT_MS = 12_000;
+
+/**
+ * When to say the submitter is running out of gas, in wei of Arc's native token — which IS USDC,
+ * at 18 decimals. One dollar: a settle costs cents, so this is many settles of warning, and the
+ * failure it prevents is quiet — a dry submitter does not refuse loudly, it leaves rows
+ * `settling` with guardians' authorizations already signed.
+ */
+export const LOW_SUBMITTER_BALANCE_WEI = 1_000_000_000_000_000_000n;
+
+/** The outcome of putting a transaction on-chain, as the caller must treat it. */
+export type BroadcastOutcome =
+  | { kind: "settled"; txHash: Hex; gasUsed: bigint }
+  | { kind: "reverted"; txHash: Hex }
+  /** We do not know. NEVER a failure: the transaction may still be mined, and the authorization
+   *  may be settled by somebody else entirely. */
+  | { kind: "unknown"; reason: string; txHash?: Hex };
+
+/** What one broadcast committed to — reported BEFORE the send, so the caller can record it. */
+export interface BroadcastAttempt {
+  txHash: Hex;
+  nonce: number;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+}
+
+export interface BroadcastOptions {
+  /**
+   * How many times this authorization has already been broadcast. Each one bumps the fee off the
+   * current estimate, for the case where the previous attempt is genuinely gone.
+   */
+  bumps?: number;
+  /**
+   * ⚠ THE PREVIOUS ATTEMPT, when there is one (2026-09-10 verifier, R1).
+   *
+   * If the submitter's CONFIRMED nonce is still at or below it, that transaction is sitting in
+   * the mempool — underpriced, most likely — and the right move is to REPLACE it: same nonce,
+   * higher fee. Taking the next PENDING nonce instead queues a second transaction behind the
+   * first, and nonces are ordered, so the first one mines (the money moves) and the second
+   * reverts with `authorization is used`. A receipt-reader then writes off a payment that
+   * succeeded.
+   */
+  previous?: { nonce: number; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint };
+  /** Called with what is about to go out, BEFORE it goes out, so the caller can record what it
+   *  is waiting on — and what the attempt after this one has to outbid. */
+  onBroadcast?: (attempt: BroadcastAttempt) => void;
+}
+
+/**
+ * Fee bump for re-broadcast n: +25% each, capped so a long-stalled row cannot walk the price up
+ * without bound. 10-12.5% is the protocol minimum for a replacement; 25% is one that lands.
+ *
+ * ⚠ STRICTLY INCREASING when it bumps at all. These are bigints, so `fee * 5n / 4n` rounds DOWN —
+ * and at small values it rounds straight back onto `fee`, which would produce a "replacement" at
+ * the same price that the node simply rejects, leaving the original transaction stuck exactly
+ * where it was.
+ */
+export function bumpedFee(fee: bigint, bumps: number): bigint {
+  const n = BigInt(Math.max(0, Math.min(bumps, 8)));
+  if (n === 0n) return fee;
+  const bumped = (fee * (4n + n)) / 4n;
+  return bumped > fee ? bumped : fee + n;
+}
+
+const max = (a: bigint, b: bigint): bigint => (a > b ? a : b);
+
+/**
+ * Submit `transferWithAuthorization` — the whole settle, composed fresh.
+ *
+ * Nothing about the transaction is persisted or reused: the nonce, the fees and therefore the
+ * hash are all of THIS attempt. What is reused is the guardian's signature, which is what the
+ * token verifies.
+ */
+export async function submitTransferWithAuthorization(
+  deps: FormationExecutorDeps,
+  auth: SettleAuthorization,
+  signature: Hex,
+  opts: BroadcastOptions = {},
+): Promise<BroadcastOutcome> {
+  const data = encodeFunctionData({
+    abi: FIAT_TOKEN_ABI,
+    functionName: "transferWithAuthorization",
+    args: [
+      auth.from,
+      auth.to,
+      auth.value,
+      auth.validAfter,
+      auth.validBefore,
+      auth.nonce,
+      signature,
+    ],
+  });
+  return composeAndSend(deps, data, TRANSFER_WITH_AUTHORIZATION_GAS, opts);
+}
+
+/**
+ * Submit `cancelAuthorization` — the guardian's fast path.
+ *
+ * The platform cannot cancel unilaterally: the token verifies a `CancelAuthorization` signature
+ * from the AUTHORIZER. This submits what the guardian signed, and nothing else.
+ */
+export async function submitCancelAuthorization(
+  deps: FormationExecutorDeps,
+  authorizer: Address,
+  nonce: Hex,
+  signature: Hex,
+  opts: BroadcastOptions = {},
+): Promise<BroadcastOutcome> {
+  const data = encodeFunctionData({
+    abi: FIAT_TOKEN_ABI,
+    functionName: "cancelAuthorization",
+    args: [authorizer, nonce, signature],
+  });
+  return composeAndSend(deps, data, CANCEL_AUTHORIZATION_GAS, opts);
+}
+
+/**
+ * Compose, sign, announce, send, wait.
+ *
+ * The announce step (`onBroadcast`) sits between signing and sending deliberately: it is the last
+ * moment at which the caller can record the hash it is about to be waiting on, and a hash written
+ * after the send would be missing from exactly the crash that makes it useful.
+ *
+ * A send error is swallowed. Re-sending a transaction the node already knows, or losing a race
+ * with our own earlier attempt, are both "these bytes are already in flight" — and if they were
+ * genuinely never accepted the receipt wait below answers `unknown`, which is the honest verdict
+ * and the one the log-based resolver picks up from.
+ */
+async function composeAndSend(
+  deps: FormationExecutorDeps,
+  data: Hex,
+  gas: bigint,
+  opts: BroadcastOptions,
+): Promise<BroadcastOutcome> {
+  const account = deps.walletClient.account;
+  if (!account) throw new Error("formation settle: the submitter wallet client has no account");
+  const estimate = await deps.publicClient.estimateFeesPerGas();
+  const bumps = opts.bumps ?? 0;
+
+  // ── WHICH NONCE, AND AT WHAT PRICE (R1) ─────────────────────────────────────────────────
+  //
+  // `latest` rather than `pending`, because the question is not "what would a new transaction
+  // use" but "has our previous one been mined yet". A confirmed count still at or below the
+  // previous attempt's nonce means that transaction is unconfirmed — so this attempt REPLACES it
+  // at the same nonce and a strictly higher price (the protocol minimum for a replacement is
+  // +10%; +25% is one that lands), rather than queueing behind it.
+  const confirmed = await deps.publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: "latest",
+  });
+  const replacing = opts.previous !== undefined && confirmed <= opts.previous.nonce;
+  const nonce = replacing
+    ? (opts.previous as { nonce: number }).nonce
+    : // `pending` so two settles in the same block do not sign the same nonce. The caller also
+      // holds a per-company lock, but the submitter is shared across companies, so the node is
+      // the authority — and the submitter is DEDICATED, so nothing else on this box moves it.
+      await deps.publicClient.getTransactionCount({
+        address: account.address,
+        blockTag: "pending",
+      });
+  // A replacement must outbid ITS OWN predecessor, not merely the current estimate: a network
+  // that has calmed down since would otherwise price the replacement below the transaction it is
+  // trying to displace, and the node would reject it outright.
+  const maxFeePerGas = replacing
+    ? max(
+        bumpedFee((opts.previous as { maxFeePerGas: bigint }).maxFeePerGas, 1),
+        estimate.maxFeePerGas,
+      )
+    : bumpedFee(estimate.maxFeePerGas, bumps);
+  const maxPriorityFeePerGas = replacing
+    ? max(
+        bumpedFee((opts.previous as { maxPriorityFeePerGas: bigint }).maxPriorityFeePerGas, 1),
+        estimate.maxPriorityFeePerGas ?? 0n,
+      )
+    : bumpedFee(estimate.maxPriorityFeePerGas ?? 0n, bumps);
+
+  const rawTx = (await deps.walletClient.signTransaction({
+    account,
+    chain: null,
+    to: deps.usdc,
+    data,
+    // EXPLICIT (§6.4). Not because of the Arc estimate footgun — that one bites when the SENDER
+    // pays gas in the token it is sending, and here the guardian sends while the submitter pays —
+    // but because an estimate is a round trip that can fail, on the hot path of a payment the
+    // guardian has already signed.
+    gas,
+    nonce,
+    maxFeePerGas,
+    maxPriorityFeePerGas,
+    chainId: deps.chainId,
+  })) as Hex;
+  // keccak256 of exactly what goes out — the same value `sendRawTransaction` returns, computed
+  // without a node so it is available BEFORE the send.
+  const txHash = keccak256(rawTx);
+  opts.onBroadcast?.({ txHash, nonce, maxFeePerGas, maxPriorityFeePerGas });
+  try {
+    await deps.publicClient.sendRawTransaction({ serializedTransaction: rawTx });
+  } catch (err) {
+    void err;
+  }
+  try {
+    const receipt = await deps.publicClient.waitForTransactionReceipt({
+      hash: txHash,
+      timeout: deps.receiptTimeoutMs ?? SETTLE_RECEIPT_TIMEOUT_MS,
+    });
+    return receipt.status === "success"
+      ? { kind: "settled", txHash, gasUsed: receipt.gasUsed }
+      : { kind: "reverted", txHash };
+  } catch (err) {
+    return { kind: "unknown", reason: (err as Error).message, txHash };
+  }
+}
+
+/**
+ * The CHAIN's clock — the timestamp of the latest block, in unix seconds.
+ *
+ * `validBefore` is enforced by the token against the BLOCK's timestamp, not against ours. A box
+ * whose clock runs fast would otherwise expire an authorization the chain still considers live,
+ * tell the guardian to pay again, and then watch the original transfer land (gate A4). `null`
+ * when the chain cannot be read, which callers must treat as "do not expire anything".
+ */
+export async function chainTimeSec(deps: FormationExecutorDeps): Promise<number | null> {
+  try {
+    const block = await deps.publicClient.getBlock();
+    return Number(block.timestamp);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Was this authorization already used (or cancelled)?
+ *
+ * `true` means the nonce is spent — the transfer happened, or it was cancelled — and `false`
+ * means NOT YET USED, which is emphatically not "dead": the signature is still valid and still
+ * self-authorizing until `validBefore`. That asymmetry is the whole of §6.4's rule 2. WHICH of
+ * the two a `true` means is a question for the token's logs (`resolveAuthorizationOutcome`), not
+ * for this call.
+ */
+export async function authorizationUsed(
+  deps: FormationExecutorDeps,
+  authorizer: Address,
+  nonce: Hex,
+): Promise<boolean> {
+  return readAuthorizationState(deps.publicClient, deps.usdc, authorizer, nonce);
+}
+
+/**
+ * ⚠ THERE IS NO `confirmBroadcast` HERE (2026-09-10 verifier, R1).
+ *
+ * One existed — "wait for the receipt of a hash we already broadcast, without sending anything" —
+ * written for the A1-era resume and left unused once A3 made the TOKEN'S LOGS the resolver. It is
+ * deleted rather than kept, because a plausible-looking helper on a money path is a trap: the
+ * receipt of OUR transaction is exactly the evidence that answers `failed` for a payment somebody
+ * else settled, which is the bug this review found. `resolveAuthorizationOutcome` is the resolver;
+ * there is no second one to reach for.
+ */

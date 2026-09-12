@@ -16,6 +16,7 @@ import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWe
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
 import { mountFormationRulesRoutes } from "./routes/formationRules";
 import { mountJobRoutes } from "./routes/jobs";
+import { mountLegalBodyRoutes } from "./routes/legalBodies";
 import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
@@ -138,6 +139,36 @@ export interface ApiDeps extends EntityViewDeps {
      * per call site, because that is the only thing that legitimately differs.
      */
     companyDeps: Omit<import("../formation/company").CreateCompanyDeps, "transaction">;
+    /**
+     * FORMATION PAYMENTS (§6) — present on EVERY deployment, with `required` inside it as the
+     * switch (finding B8).
+     *
+     * It carries the payment repository, the fee, the Ledger revenue address and (only where the
+     * box charges) the USDC domain READ AND PINNED at boot, so the quote route, the settle route
+     * and the sweeper all build the same message from the same facts. Optional in the TYPE so
+     * every existing test wiring builds unchanged; the composition root always supplies it, which
+     * is what keeps a payment already taken readable after the flag is rolled back.
+     */
+    payment?: import("../formation/payment").FormationPaymentConfig;
+    /**
+     * The fee in whole USDC, served on `/config` WHETHER OR NOT this deployment charges.
+     *
+     * Separate from `payment.feeUsdc` above, and that separation is the point: during the beta
+     * nothing quotes, but the wizard still says "included during the beta, normally $399" — and
+     * that number has to come from the box that would charge it, not from the browser bundle, or
+     * the sentence on screen drifts from the price the backend would actually quote.
+     *
+     * REQUIRED, not optional: a deployment that forms companies has a price for doing so even
+     * when it is not collecting it, and an optional field here would let a wiring omit it and
+     * serve `null` — which the wizard renders as a beta sentence with no number, silently.
+     */
+    feeUsdc: number;
+    /**
+     * The EXECUTOR — the platform EOA that submits the guardian's authorization, and the clients
+     * it needs. Present with `payment` and absent without it, so a box that does not charge has
+     * no settle path wired at all rather than one that would refuse at the last moment.
+     */
+    paymentExecutor?: import("../payments/formationSettle").FormationExecutorDeps;
   };
 
   /**
@@ -175,6 +206,16 @@ export interface ApiDeps extends EntityViewDeps {
    *  predicate is the single definition, and `/config` plus the write routes' 503 are both
    *  projections of it, so the boot gate and what we advertise cannot drift. */
   agentBook?: import("./routes/agentBook").AgentBookDeps;
+  /**
+   * The public legal-body lookup (design 2026-09-10 D3). Optional, like every other capability
+   * here: absent, `GET /legal-bodies/:address` is not mounted at all, which is the honest answer
+   * for a deployment that cannot ask the chain — and it keeps every existing wiring (and every
+   * credential-less test app) building unchanged.
+   *
+   * It carries the SAME resolver instance the buyer dial and the `legal-bodies-only` seller
+   * policy hold (D1), so a suspension means one thing on every surface.
+   */
+  legalBody?: import("./routes/legalBodies").LegalBodyLookupDeps;
   /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
    *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
    *  `ceilingAtomic` is the configured MAX_POCKET_FLOAT_USDC, atomic USDC string. Optional for the
@@ -197,7 +238,11 @@ export function buildApiApp(deps: ApiDeps) {
       origin: (_origin, c) =>
         c.req.path.startsWith("/metadata/") ||
         c.req.path.startsWith("/ensgateway") ||
-        c.req.path === "/transparency"
+        c.req.path === "/transparency" ||
+        // The legal-body lookup (D3): a seller's own page, on a domain we will never know, has to
+        // be able to ask. Same class of surface as `/transparency` — it publishes nothing that is
+        // not already on it.
+        c.req.path.startsWith("/legal-bodies/")
           ? "*"
           : deps.webOrigin,
       allowHeaders: ["authorization", "content-type"],
@@ -224,6 +269,22 @@ export function buildApiApp(deps: ApiDeps) {
       // legal-body phase is a step or an option. (It said "without a partyId" until A3 removed
       // the shim; the FLAG is unchanged, what satisfies it is now a company handle.)
       formationRequired: Boolean(deps.formation?.required),
+      /**
+       * PAYMENTS (§6.8) — the second deliberate departure from this route's booleans-only rule,
+       * and the same one `formationCopy` makes: public PRICING.
+       *
+       * The wizard needs both before auth: `formationPaymentRequired` decides whether the payment
+       * step exists at all, and `formationFeeUsdc` is the number in the beta sentence
+       * ("included during the beta, normally $399") on every deployment where it is FALSE. A fee
+       * bundled into the browser build would drift from the fee the backend actually quotes,
+       * silently, which is the same failure `formationCopy` exists to prevent.
+       *
+       * ⚠ The REVENUE ADDRESS stays off this route. It is not secret, but this document is public
+       * and unauthenticated, and the payee belongs on the QUOTE — which is authenticated, and
+       * carries it as `payTo` beside the exact amount and nonce it is bound to.
+       */
+      formationPaymentRequired: Boolean(deps.formation?.payment?.required),
+      formationFeeUsdc: deps.formation?.feeUsdc ?? null,
       /**
        * PRODUCT COPY the wizard and the Companies section render verbatim (§7) — a deliberate
        * departure from this route's booleans-only rule, and the same one §6.7 makes for the fee.
@@ -259,6 +320,9 @@ export function buildApiApp(deps: ApiDeps) {
   if (deps.doola) mountDoolaWebhookRoutes(app, { ...deps, doola: deps.doola });
   mountMetadataRoutes(app, deps);
   mountTransparencyRoutes(app, deps);
+  // Public and unauthenticated for the same reason `/transparency` is, and mounted here so it is
+  // outside `protect()` below: the caller is a seller that has never heard of us.
+  mountLegalBodyRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
   if (deps.x402Demo) mountX402DemoRoutes(app, deps.x402Demo);
   mountAuthRoutes(app, deps);

@@ -11,6 +11,7 @@ import { FactRow } from "@/components/agents/FactRow";
 import { formatDate } from "@/lib/format";
 import { CompanyStatePill } from "@/components/agents/CompanyStatePill";
 import { CompanyParkPanel } from "@/components/agents/CompanyParkPanel";
+import { CompanyPaymentPanel } from "@/components/agents/CompanyPaymentPanel";
 import { LoadingState } from "@/components/agents/RequireAuth";
 import {
   Button,
@@ -79,6 +80,11 @@ function CompanyBody({ company }: { company: CompanyDetailView }) {
       {/* FIRST, above everything: a parked filing is doing nothing until its owner acts, and
           burying that under the facts is how a company sits stopped for a month. */}
       <CompanyParkPanel company={company} />
+
+      {/* …and beside it, for the same reason: an UNPAID company is doing nothing either, and the
+          fee is the one thing its owner can act on immediately. Renders nothing where there is no
+          payment — which is every company on a deployment that does not charge. */}
+      <CompanyPaymentPanel companyId={company.companyId} />
 
       {company.intakeSynthesized && (
         <Callout tone="warn" title="These details were derived, not typed">

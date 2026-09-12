@@ -418,6 +418,229 @@ export function buildCli(
       console.log(`abandoned create_provider for ${key}`);
     });
 
+  // ── formation:reconcile — ASK THE CHAIN what happened to one payment (B1 gate A5) ─────────
+  //
+  // The manual counterpart to the sweeper's leg, for the row an operator is actually looking at.
+  // It runs the SAME log-based resolver (`resolveAuthorizationOutcome`) and then drives the row
+  // terminal from what it FOUND — never from what an operator believes.
+  //
+  // It PRINTS BEFORE IT WRITES, deliberately. This command exists for the situation where
+  // somebody is deciding whether a guardian has paid, and a tool that silently flips a row and
+  // says "done" gives them nothing to check.
+  program
+    .command("formation:reconcile")
+    .argument("<paymentId>", "the payment to resolve against the chain")
+    .description("resolve ONE formation payment from the token's own logs, and record the verdict")
+    .action(async (paymentId: string) => {
+      const { config: loadDotenv } = await import("dotenv");
+      const { loadConfig } = await import("../config/env");
+      const { publicClientFor } = await import("../adapters/arc/clients");
+      const { readAuthorizationState, resolveAuthorizationOutcome } = await import(
+        "../adapters/arc/usdcToken"
+      );
+      const { openDatabase } = await import("../persistence/db");
+      const { SqliteCompanyRepository } = await import("../persistence/companyRepository");
+      const { SqliteFormationPaymentRepository } = await import(
+        "../persistence/formationPaymentRepository"
+      );
+      const { guardianOf } = await import("../formation/payment");
+      const { opsLog } = await import("../observability/opsLog");
+      loadDotenv();
+      const cfg = loadConfig();
+      const db = openDatabase(cfg.dbPath);
+      const payments = new SqliteFormationPaymentRepository(db);
+      const companies = new SqliteCompanyRepository(db);
+
+      const row = payments.find(paymentId);
+      if (!row) throw new Error(`no payment ${paymentId}`);
+      const company = companies.find(row.companyId);
+      if (!company)
+        throw new Error(
+          `payment ${paymentId} names company ${row.companyId}, which does not exist`,
+        );
+      if (row.status !== "quoted" && row.status !== "settling")
+        throw new Error(
+          `payment ${paymentId} is already terminal (${row.status})${row.txHash ? ` at ${row.txHash}` : ""} — there is nothing to reconcile`,
+        );
+
+      // ⚠ FIRST, EVERY WRITTEN-OFF ROW ON THIS COMPANY WHOSE AUTHORIZATION IS STILL SPENDABLE
+      // (2026-09-10 verifier, R1c).
+      //
+      // Printed before the verdict, because it changes what the verdict means: a company with a
+      // `failed` row whose nonce reads SPENT may already have paid, and settling the row being
+      // reconciled would then be the second payment. An operator has to see that first.
+      const publicClient = publicClientFor(cfg);
+      const spentWriteOffs: string[] = [];
+      for (const other of payments.listByCompany(row.companyId)) {
+        if (other.paymentId === row.paymentId) continue;
+        if (other.status !== "failed" && other.status !== "expired") continue;
+        const spent = await readAuthorizationState(
+          publicClient,
+          cfg.usdc,
+          other.payerAddress ?? guardianOf(company),
+          other.nonce,
+        );
+        if (spent) spentWriteOffs.push(`${other.paymentId} (${other.status})`);
+      }
+      if (spentWriteOffs.length > 0)
+        console.error(
+          `⚠ CRITICAL: this company has written-off payment(s) whose authorization IS SPENT on-chain: ${spentWriteOffs.join(", ")}. The money may already have moved. Read docs/runbooks/doola-deploy.md before settling anything here.`,
+        );
+
+      const authorizer = row.payerAddress ?? guardianOf(company);
+      const outcome = await resolveAuthorizationOutcome({
+        client: publicClient,
+        usdc: cfg.usdc,
+        authorizer,
+        nonce: row.nonce,
+        payTo: row.payTo,
+        value: row.amountUsdc,
+        fromBlock: row.quotedBlock === null ? null : BigInt(row.quotedBlock),
+      });
+      console.log(
+        [
+          `payment   ${row.paymentId}  (${row.status})`,
+          `company   ${row.companyId}  (${company.status})`,
+          `amount    ${row.amountUsdc} atomic USDC -> ${row.payTo}`,
+          `authorizer ${authorizer}  nonce ${row.nonce}`,
+          `chain says ${outcome.kind}${"txHash" in outcome ? ` at ${outcome.txHash}` : ""}`,
+        ].join("\n"),
+      );
+
+      if (outcome.kind === "settled") {
+        // The observed hash, not ours: whoever broadcast it, the money is at the payee.
+        const moved = db.transaction(() => {
+          const ok = payments.markSettled(row.paymentId, outcome.txHash);
+          if (ok) companies.setStatus(row.companyId, "draft", "ready");
+          return ok;
+        })();
+        if (!moved && row.status !== "settling")
+          throw new Error(
+            "the chain says settled, but this row is `quoted` — it never reached `settling`, so there is no CAS to make. Investigate before touching it by hand",
+          );
+        opsLog("formation_payment_settled", {
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          amountUsdc: row.amountUsdc.toString(),
+          txHash: outcome.txHash,
+          by: "operator-reconcile",
+        });
+        console.log(`recorded: settled at ${outcome.txHash}`);
+        if (payments.countPaid(row.companyId) > 1)
+          console.error(
+            `⚠ CRITICAL: company ${row.companyId} now has more than one PAID formation payment. See docs/runbooks/doola-deploy.md (manual refund).`,
+          );
+        return;
+      }
+      if (outcome.kind === "cancelled") {
+        payments.markExpired(row.paymentId, row.status);
+        opsLog("formation_payment_expired", {
+          companyId: row.companyId,
+          paymentId: row.paymentId,
+          reason: "cancelled-on-chain",
+          by: "operator-reconcile",
+        });
+        console.log("recorded: expired (the authorization was cancelled on-chain)");
+        return;
+      }
+      // UNKNOWN. Nothing is written: a payment whose outcome nobody can see is exactly the one
+      // that must not be written off, and the row stays where it is for the sweeper to re-try.
+      console.log(
+        "nothing recorded: the chain shows no AuthorizationUsed and no AuthorizationCanceled for this nonce in the window. The row stays as it is — an outcome we cannot see is never a failure.",
+      );
+    });
+
+  // ── formation:refund — RECORD a refund the Ledger already made (design 2026-08-26 §6.6) ────
+  //
+  // ⚠ IT MOVES NOTHING, AND THAT IS THE FEATURE. `FORMATION_REVENUE_ADDRESS` is a Ledger
+  // hardware-wallet account with NO KEY ON THIS BOX (the S4 key inventory says so in as many
+  // words), so a refund is signed by a human at the device, by runbook, and this command is how
+  // the system learns it happened. A refund path that could move funds would need a hot float
+  // holding real revenue on a server, which is exactly what the Ledger decision refuses.
+  //
+  // ⚠ AND IT NEVER TOUCHES `platform_outflows`. A 399 USDC row in the S5 meter would exceed the
+  // 200 USDC rolling ceiling on its own and block every agent's treasury funding, gas seeds and
+  // job funding for 24 hours — a refund taking the fleet down. `formation_refund` joins
+  // `OutflowPath` only in the later hot-float phase, together with an env invariant that the
+  // ceiling is at least the fee.
+  //
+  // ⚠ IT NAMES THE PAYMENT, NOT THE COMPANY (B1 gate A5). The first cut took a companyId and
+  // refunded "the most recent settled row", which is precisely the wrong default for the case
+  // this command is FOR: a company with two settled rows is the double charge, and picking one
+  // by date is a guess made silently, at a Ledger, about somebody's 399 USDC.
+  program
+    .command("formation:refund")
+    .requiredOption("--payment-id <paymentId>", "the SETTLED payment being refunded")
+    .requiredOption("--tx <hash>", "the on-chain hash of the transfer signed from the Ledger")
+    .option("--yes", "confirm: record this refund")
+    .description("RECORD (never execute) a refund of a settled formation payment")
+    .action(async (opts: { paymentId: string; tx: string; yes?: boolean }) => {
+      const { config: loadDotenv } = await import("dotenv");
+      const { loadConfig } = await import("../config/env");
+      const { openDatabase } = await import("../persistence/db");
+      const { SqliteFormationPaymentRepository } = await import(
+        "../persistence/formationPaymentRepository"
+      );
+      const { opsLog } = await import("../observability/opsLog");
+      loadDotenv();
+      // `loadConfig().dbPath`, like every other DB-only command here: there is no DB_PATH knob,
+      // and an operator who moved DATA_DIR must not silently open a different, empty database.
+      const db = openDatabase(loadConfig().dbPath);
+      const payments = new SqliteFormationPaymentRepository(db);
+
+      // A malformed hash is not a small mistake here: it is the ONLY pointer we will ever hold to
+      // the money that moved, and it is written once. A truncated paste that reads plausibly is
+      // the failure this refuses.
+      if (!/^0x[0-9a-fA-F]{64}$/.test(opts.tx))
+        throw new Error(
+          `refusing: "${opts.tx}" is not a 32-byte transaction hash (0x + 64 hex). That hash is the only record of the transfer you just signed`,
+        );
+
+      const row = payments.find(opts.paymentId);
+      if (!row) throw new Error(`no payment ${opts.paymentId}`);
+      if (row.status === "refunded")
+        throw new Error(
+          `refusing: payment ${row.paymentId} is ALREADY recorded as refunded (tx ${row.refundTxHash}). A second recording would overwrite the only pointer we hold to the money that moved`,
+        );
+      if (row.status !== "settled")
+        throw new Error(
+          `refusing: payment ${row.paymentId} is ${row.status}, not settled — a refund records money that was actually taken. If you believe it settled, run \`formation:reconcile ${row.paymentId}\` first and let the chain say so`,
+        );
+
+      console.log(
+        [
+          `payment   ${row.paymentId}`,
+          `company   ${row.companyId}`,
+          `amount    ${row.amountUsdc} atomic USDC  ($${Number(row.amountUsdc) / 1e6})`,
+          `paid by   ${row.payerAddress}`,
+          `settled   ${row.txHash}`,
+          `refund tx ${opts.tx}`,
+        ].join("\n"),
+      );
+      if (!opts.yes) {
+        console.log("\nNothing recorded. Re-run with --yes to record this refund.");
+        return;
+      }
+
+      if (!payments.markRefunded(row.paymentId, opts.tx))
+        throw new Error(
+          `refusing: payment ${row.paymentId} is not settled, or already carries a refund hash. A second recording would overwrite the only pointer we hold to the money that moved`,
+        );
+      opsLog("formation_payment_refunded", {
+        severity: "CRITICAL",
+        level: "warn",
+        companyId: row.companyId,
+        paymentId: row.paymentId,
+        amountUsdc: row.amountUsdc.toString(),
+        settledTxHash: row.txHash,
+        refundTxHash: opts.tx,
+        by: "operator",
+      });
+      console.log(
+        `\nrecorded refund of ${row.amountUsdc} atomic USDC for payment ${row.paymentId} (tx ${opts.tx}). Nothing was moved by this command.`,
+      );
+    });
+
   return program;
 }
 

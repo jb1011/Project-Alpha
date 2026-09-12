@@ -21,6 +21,19 @@ export const apiKeys = {
   company: (token: string, id: string) => [...apiKeys.all, "company", token, id] as const,
   companyCompliance: (token: string, id: string) =>
     [...apiKeys.all, "companyCompliance", token, id] as const,
+  /** The formation PAYMENT for one company (B1 §6). Token-scoped like its siblings — a quote
+   *  names a payee and an amount one wallet is being asked to authorize, and it must never
+   *  survive a sign-out into another tenant's cache. */
+  companyPayment: (token: string, id: string) =>
+    [...apiKeys.all, "companyPayment", token, id] as const,
   /** PUBLIC and token-free: build-time rules that are the same for everybody. */
   formationRules: () => [...apiKeys.all, "formationRules"] as const,
+  /**
+   * PUBLIC and token-free, keyed by ADDRESS rather than by entity: `GET /legal-bodies/:address`
+   * is the unauthenticated lookup a seller calls, and the answer is the same for everyone who
+   * asks. Lowercased, because the address reaches us EIP-55 checksummed from one surface and in
+   * whatever form the wallet provider returned from another — two spellings of one address must
+   * not become two cache entries (and two lookups) for one chip.
+   */
+  legalBody: (address: string) => [...apiKeys.all, "legalBody", address.toLowerCase()] as const,
 };
