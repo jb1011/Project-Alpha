@@ -115,3 +115,48 @@ jobs:
       - name: Test
         working-directory: back/backend
         run: npm test
+
+  hedera-client:
+    name: Hedera client (vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: back/hedera-client
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so path filtering works on push events too
+
+      # The client is a separate npm workspace with no Foundry or anvil dependency: its
+      # tests stub fetch and the MCP client and touch no network. Gated on its own paths so
+      # an unrelated PR does not pay for the install, and still reports a green job.
+      - name: Detect client changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            client:
+              - 'back/hedera-client/**'
+
+      - uses: actions/setup-node@v4
+        if: steps.changes.outputs.client == 'true'
+        with:
+          node-version: "20.18.2"
+          cache: npm
+          cache-dependency-path: back/hedera-client/package-lock.json
+
+      - name: Install
+        if: steps.changes.outputs.client == 'true'
+        run: npm ci
+
+      - name: Typecheck
+        if: steps.changes.outputs.client == 'true'
+        run: npm run typecheck
+
+      - name: Lint
+        if: steps.changes.outputs.client == 'true'
+        run: npm run lint
+
+      - name: Test
+        if: steps.changes.outputs.client == 'true'
+        run: npm test
