@@ -183,11 +183,13 @@ refuses to boot rather than start half-configured.
 header gets a 402 with the price and payment requirements in the `PAYMENT-REQUIRED` header. Your
 client signs a payment with its own Hedera key and resubmits; the facilitator verifies and settles
 the USDC transfer on Hedera testnet and pays the network fee, so the float account needs no HBAR.
-Novi Corpus does not trust the facilitator's reply alone: it reads the transaction back from the
-mirror node with the USDC token pinned on both legs, and only then records the ledger row
-(`network = hedera:testnet`, `batch_ref = <mirror transaction id>`) and serves the attestation
-body (subject, standing, formation, controller flag, operating-agreement hash and version,
-`issuedAt`, `expiresAt`). With `NOVI_ATTESTATION_KEY` set the body is signed; see "Signed attestation".
+The route serves the attestation body (subject, standing, formation, controller flag,
+operating-agreement hash and version, `issuedAt`, `expiresAt`) once the facilitator's settle
+succeeds, and answers 402 with no body when it does not. Novi Corpus does not trust the
+facilitator's reply alone for its books: the ledger row is marked settled
+(`network = hedera:testnet`, `batch_ref = <mirror transaction id>`) only after your client's
+`report_payment` reads the transaction back from the mirror node with the USDC token pinned on
+both legs. With `NOVI_ATTESTATION_KEY` set the body is signed; see "Signed attestation".
 
 ### Signed attestation (pull request 3)
 
