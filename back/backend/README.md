@@ -266,6 +266,27 @@ holding one seeded row of `FormationE2E_1`'s public data:
   `CRYPTOTRANSFER SUCCESS`, fee paid by the facilitator; `report_payment -> settled`; ledger row
   `hedera:testnet|settled|0.0.7162784-1789178320-131369376|1000`.
 
+### Demo: the five legs
+
+The ETHOnline 2026 recording, in order. Full procedure, credentials and fallback:
+[`../docs/runbooks/hedera-demo.md`](../docs/runbooks/hedera-demo.md). Client commands run from
+`back/hedera-client`, the guardian script from `back/backend`, everything against prod
+(`https://www.novicorpus.com/backend`) on testnet money.
+
+| # | Command | Expected last line |
+|---|---|---|
+| 1 | `demo-buyer <uaid>` | `settlement: OK https://hashscan.io/testnet/transaction/<tx>`, above it `signature valid: true` |
+| 2 | `guardian-pause.mts pause --treasury <treasury>` | `paused: true` |
+| 3 | `demo-buyer <uaid>` | `policy denied: paused`, exit 2, **no** HashScan link |
+| 4 | `guardian-pause.mts unpause --treasury <treasury>`, then `revoke` | `paused: false`, then `SUCCESS` and `after: key ECDSA_SECP256K1` |
+| 5 | `demo-buyer <uaid>` | `HTTP 402` and `PAYMENT-RESPONSE transaction_failed <hashscan>`, exit 1 |
+
+Legs 3 and 5 are the two refusals the rail is built around, and they refuse in different places.
+Leg 3 is the CLIENT refusing: `check_policy` answers inside the payment hook and the buyer aborts
+before its key signs anything, so there is no transaction and no link (design D2). Leg 5 is the
+LEDGER refusing: the agent's key is no longer on the float account, the facilitator submits the
+transfer anyway, and Hedera rejects it with `CRYPTOTRANSFER INVALID_SIGNATURE`.
+
 ### Demo-only, do not run in production
 
 These exist only for the ETHOnline 2026 demo. Each refuses to run unless `HEDERA_DEMO_LOCAL=1` is
@@ -275,10 +296,11 @@ set, refuses outright when `NODE_ENV=production`, and prints `DEMO ONLY` as its 
   database row from a production entity's public data (`/transparency` plus factory reads on Arc),
   so pre-merge checks run locally without touching real data. Set `FACTORY_ADDRESS` to the
   production factory the entity was created by.
-- `novi-hedera demo-buyer <uaid>` will resolve a Novi Corpus company from its universal agent id
-  and pay `/verify` against it end to end, the flow the demo video walks through. In this pull
-  request it is a guarded stub that refuses and points at `pay <url>`; the buyer lands with the
-  third pull request. Guarded even though it targets the deployed backend.
+- `novi-hedera demo-buyer <uaid>` resolves a Novi Corpus company from its universal agent id,
+  pays its `/verify` route, and checks the EIP-712 signature on what comes back offline against
+  the `attestor` the body names. Three hops (`/legal-bodies/:address`, the metadata link, the
+  paid route), each printed as `→ GET …`. `NOVI_API_BASE` sets the base and has no default.
+  Guarded even though it targets the deployed backend.
 
 ## v2 hardening
 Known production-hardening items (crash-safety, concurrency, Turnkey, etc.) are tracked in

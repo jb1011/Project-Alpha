@@ -15,6 +15,10 @@ AGENT_PRIVATE_KEY=op://Novi Corpus/Hedera Spike Agent Key/private_key_hex
 # Novi Corpus MCP endpoint. Local backend for task 8, prod for the demo (D28):
 # https://www.novicorpus.com/backend/mcp
 NOVI_MCP_URL=http://127.0.0.1:8787/mcp
+# Base `demo-buyer` resolves its two public hops against, `/legal-bodies/:address` and the
+# metadata link. Prod for the demo (D28); task 8 and any local run point it at
+# http://127.0.0.1:8787 instead, the same backend NOVI_MCP_URL is on. Public value.
+NOVI_API_BASE=https://www.novicorpus.com/backend
 # Field `local` is the key task 8 mints against the local backend; task 16 mints `prod`
 # into the same item. Item: Novi Corpus Demo API Key.
 NOVI_API_KEY=op://Novi Corpus/Novi Corpus Demo API Key/local

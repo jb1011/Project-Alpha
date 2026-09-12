@@ -1,0 +1,79 @@
+import { privateKeyToAccount } from "viem/accounts";
+// The offline attestation check, with a synthetic signer. No network, no real attestation key.
+// Two claims: a body signed over the twelve flattened fields verifies, and a body whose
+// `standing` was flipped after signing does not — which is the whole point of serving a
+// signature beside the document.
+import { describe, expect, it } from "vitest";
+import {
+  ATTESTATION_DOMAIN,
+  ATTESTATION_TYPES,
+  type AttestationBody,
+  attestationMessage,
+  verifyAttestation,
+} from "../src/attest.js";
+
+/** Anvil's public account 1. A published test key, never a Novi Corpus key. */
+const SYNTHETIC_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" as const;
+
+const body = (over: Partial<AttestationBody> = {}): AttestationBody => ({
+  subject: {
+    publicId: "9f8003f5-4c70-435a-9980-9a54625691b7",
+    name: "FormationE2E_1",
+    agentId: "886257",
+    registry: "eip155:5042002:0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    treasury: "0x92ae7c6b6eB9470d7E01F8fEb352714bD80A7AAf",
+    uaid: "uaid:aid:7yCVPN2iLzHZ244fEcpayKQbhzHaMVWhEZgWZoessWWnP13s19RKoa8YEB4kXEazJk",
+  },
+  standing: "active",
+  formation: { status: "complete", environment: "production" },
+  controller: { humanVerified: true, credential: "orb" },
+  legalBody: { oaHash: null, manifestVersion: null },
+  issuedAt: "2026-09-12T00:00:00.000Z",
+  issuedAtUnix: "1789171200",
+  expiresAt: "2026-09-12T00:05:00.000Z",
+  expiresAtUnix: "1789171500",
+  ...over,
+});
+
+/** Signs a body the way the server does, so the test exercises the shared flattener. */
+async function sign(b: AttestationBody) {
+  const account = privateKeyToAccount(SYNTHETIC_KEY);
+  const signature = await account.signTypedData({
+    domain: ATTESTATION_DOMAIN,
+    types: ATTESTATION_TYPES,
+    primaryType: "LegalBodyAttestation",
+    message: attestationMessage(b),
+  });
+  return { attestor: account.address, signature };
+}
+
+describe("verifyAttestation", () => {
+  it("accepts a body signed by the attestor it names", async () => {
+    const b = body();
+    const { attestor, signature } = await sign(b);
+    expect(await verifyAttestation(b, attestor, signature)).toBe(true);
+  });
+
+  it("rejects a body whose standing was flipped after signing", async () => {
+    const b = body();
+    const { attestor, signature } = await sign(b);
+    const tampered = body({ standing: "inactive" });
+    expect(await verifyAttestation(tampered, attestor, signature)).toBe(false);
+  });
+
+  it("returns false rather than throwing on a malformed signature", async () => {
+    const b = body();
+    const { attestor } = await sign(b);
+    expect(await verifyAttestation(b, attestor, "0xdeadbeef")).toBe(false);
+  });
+
+  it("maps the nullable fields to their sentinels", () => {
+    const m = attestationMessage(
+      body({ subject: { ...body().subject, uaid: null, agentId: null } }),
+    );
+    expect(m.uaid).toBe("");
+    expect(m.agentId).toBe("");
+    expect(m.oaHash).toBe(`0x${"0".repeat(64)}`);
+    expect(m.manifestVersion).toBe(0n);
+  });
+});
