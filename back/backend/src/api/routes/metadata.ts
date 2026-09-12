@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { formationSummary } from "../../formation/status";
+import { attestorAddress } from "../../hedera/attestation";
 import { HEDERA_IDENTITY_REGISTRY } from "../../hedera/registry";
 import type { EntityRecord } from "../../types";
 import { usesManifestScheme } from "../../workflow/onboarding";
@@ -186,6 +187,13 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
           verifyUrl: `${base}/verify/${publicId}`,
           profileUrl: `${base}/metadata/${publicId}/profile`,
         };
+        // WHICH key signs the paid attestation, published on the FREE surface (task 13). This is
+        // the half that makes the signature worth anything: a verifier that read the attestor out
+        // of the signed document alone would accept any key that signed it. Only where a key is
+        // configured — an absent field says "this deployment does not sign", where an empty one
+        // would say nothing at all.
+        const key = deps.hedera.cfg.attestationKey;
+        if (key) meta.hedera.attestor = attestorAddress(key);
         touched = true;
       }
 

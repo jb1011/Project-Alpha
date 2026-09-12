@@ -13,10 +13,12 @@
  */
 import { decodePaymentRequiredHeader } from "@x402/core/http";
 import type Database from "better-sqlite3";
+import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TokenBucket } from "../../src/api/routes/agentBook";
+import { verifyAttestation } from "../../src/hedera/attestation";
 import { PaymentLedger } from "../../src/payments/ledger";
-import type { EntityRecord } from "../../src/types";
+import type { EntityRecord, Hex } from "../../src/types";
 import {
   IDENTITY_REGISTRY,
   METADATA_BASE,
@@ -38,6 +40,11 @@ const HEDERA_CFG = {
   verifyPriceUsdc: "0.001",
   verifyPriceAtomic: 1000n,
 } as const;
+
+/** The attestation key the signed tests configure. A PUBLISHED TEST VECTOR (Anvil's account 1),
+ *  never a deployment key: `NOVI_ATTESTATION_KEY` on a real box comes from 1Password. */
+const ATTESTATION_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" as Hex;
+const ATTESTOR = privateKeyToAccount(ATTESTATION_KEY).address;
 
 const NETWORK = "hedera:testnet";
 const FEE_PAYER = "0.0.7162784";
@@ -109,6 +116,9 @@ function setup(
     hedera?: boolean;
     readBudget?: TokenBucket;
     worldId?: unknown;
+    /** Set = the deployment holds `NOVI_ATTESTATION_KEY`; absent = it does not, which is the
+     *  state every test above this option runs in. */
+    attestationKey?: Hex;
   } = {},
 ) {
   const { db, repo } = hederaDb(o.over);
@@ -120,7 +130,9 @@ function setup(
       o.hedera === false
         ? undefined
         : {
-            cfg: HEDERA_CFG,
+            cfg: o.attestationKey
+              ? { ...HEDERA_CFG, attestationKey: o.attestationKey }
+              : HEDERA_CFG,
             mirror: fakeMirror({}),
             ledger,
             spendAllowlistThreshold: 1_000_000_000n,
@@ -319,9 +331,11 @@ test("a payment that settles buys the attestation", async () => {
     controller: { humanVerified: true, credential: "orb" },
     legalBody: { oaHash: null, manifestVersion: null },
   });
-  // Unsigned in this task: the EIP-712 signature arrives in task 13, and an empty or absent
-  // field that a verifier might read as "checked" must not exist before then.
+  // NO ATTESTATION KEY on this deployment, so no signature and no attestor — an empty or
+  // placeholder field is one a verifier could read as "checked", which is worse than an absent
+  // one (task 13).
   expect(body).not.toHaveProperty("signature");
+  expect(body).not.toHaveProperty("attestor");
   expect(Date.parse(body.expiresAt) - Date.parse(body.issuedAt)).toBe(300_000);
   expect(seen).toContain("/settle");
 });
@@ -400,4 +414,65 @@ test("the subject carries the identity registry even with no ENS gateway wired",
   const header = await paidHeader(app, PUBLIC_ID, "8.8.8.8");
   const res = await get(app, PUBLIC_ID, { "PAYMENT-SIGNATURE": header });
   expect((await res.json()).subject.registry).toBe(`eip155:5042002:${IDENTITY_REGISTRY}`);
+});
+
+// ── the EIP-712 signature (task 13) ─────────────────────────────────────────────────────────────
+
+test("with no attestation key the served body carries the unix timestamps and nothing signed", async () => {
+  const { app } = setup();
+  const header = await paidHeader(app, PUBLIC_ID, "12.0.0.1");
+  const body = await (await get(app, PUBLIC_ID, { "PAYMENT-SIGNATURE": header })).json();
+  expect(body).not.toHaveProperty("attestor");
+  expect(body).not.toHaveProperty("signature");
+  // The `…Unix` fields are unconditional: they are a restatement of the ISO strings a verifier
+  // already holds, so an unsigned body and a signed one have the same shape.
+  expect(body.issuedAtUnix).toBe(String(Math.floor(Date.parse(body.issuedAt) / 1000)));
+  expect(body.expiresAtUnix).toBe(String(Math.floor(Date.parse(body.expiresAt) / 1000)));
+  expect(Number(body.expiresAtUnix) - Number(body.issuedAtUnix)).toBe(300);
+});
+
+test("with an attestation key the paid body is signed, and the signature verifies over it", async () => {
+  const { app } = setup({ attestationKey: ATTESTATION_KEY });
+  const header = await paidHeader(app, PUBLIC_ID, "12.0.0.2");
+  const res = await get(app, PUBLIC_ID, { "PAYMENT-SIGNATURE": header });
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.attestor).toBe(ATTESTOR);
+  expect(body.signature).toMatch(/^0x[0-9a-f]{130}$/i);
+  // The whole point of the field: a verifier holding ONLY this JSON can check it.
+  expect(await verifyAttestation(body, body.attestor, body.signature)).toBe(true);
+});
+
+test("a signature is over the body as served: a standing edited in flight no longer verifies", async () => {
+  const { app } = setup({ attestationKey: ATTESTATION_KEY });
+  const header = await paidHeader(app, PUBLIC_ID, "12.0.0.3");
+  const body = await (await get(app, PUBLIC_ID, { "PAYMENT-SIGNATURE": header })).json();
+  expect(body.standing).toBe("active");
+  const edited = { ...body, standing: "inactive" };
+  expect(await verifyAttestation(edited, body.attestor, body.signature)).toBe(false);
+});
+
+test("a suspended body is signed too: the signature attests inactive as readily as active", async () => {
+  const { db, repo } = hederaDb();
+  openDbs.push(db);
+  const app = hederaApp({
+    repo,
+    hedera: {
+      cfg: { ...HEDERA_CFG, attestationKey: ATTESTATION_KEY },
+      mirror: fakeMirror({}),
+      ledger: new PaymentLedger(db),
+      spendAllowlistThreshold: 1_000_000_000n,
+    },
+    legalBody: {
+      resolver: { resolve: async () => ({ kind: "none" }) },
+      chainReads: arcReads({ paused: true }),
+      readBudget: new TokenBucket(30, 1),
+      links: { transparency: `${WEB}/transparency`, metadataBase: METADATA_BASE },
+      network: "testnet" as const,
+    },
+  });
+  const header = await paidHeader(app, PUBLIC_ID, "12.0.0.4");
+  const body = await (await get(app, PUBLIC_ID, { "PAYMENT-SIGNATURE": header })).json();
+  expect(body.standing).toBe("inactive");
+  expect(await verifyAttestation(body, body.attestor, body.signature)).toBe(true);
 });

@@ -3,7 +3,7 @@ import { ExactHederaScheme } from "@x402/hedera/exact/server";
 import { paymentMiddleware } from "@x402/hono";
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
-import { buildAttestation } from "../../hedera/attestation";
+import { buildAttestation, signAttestation } from "../../hedera/attestation";
 import { isPublicOnChain } from "../../payments/legalBody";
 import type { EntityRecord } from "../../types";
 import type { ApiDeps } from "../app";
@@ -15,8 +15,8 @@ import { createClientLimiter, sharedReadBudget } from "./legalBodies";
  *
  * Public and unauthenticated, like `/legal-bodies/:address`, and for the same reason: the caller
  * is an agent on someone else's stack that has never heard of us. What it buys is the document —
- * a body it can keep, quote and (from task 13) verify a signature over — where the free lookup
- * answers one boolean-shaped question about one address.
+ * a body it can keep, quote and verify a signature over — where the free lookup answers one
+ * boolean-shaped question about one address.
  *
  * THREE LAYERS, in this order, and the order is the design:
  *
@@ -130,6 +130,18 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
       identityRegistry: deps.identityRegistry,
       now: deps.now ?? Date.now,
     });
+    // The EIP-712 signature (task 13), where this deployment holds a key. Both fields or
+    // neither: a verifier that sees `attestor` with no `signature` has been handed a claim it
+    // cannot check, which is worse than an unsigned document that says so.
+    //
+    // AFTER the body is complete and over the body as served, so there is no field the buyer
+    // reads that the signature does not cover. It signs whatever standing came back, including
+    // `inactive` and `unknown` — the signature attests what we said, not that the news is good.
+    if (h.cfg.attestationKey) {
+      const { attestor, signature } = await signAttestation(body, h.cfg.attestationKey);
+      body.attestor = attestor;
+      body.signature = signature;
+    }
     // Never reusable: standing is live, the body is paid for, and a shared cache holding it would
     // serve one buyer's document to the next caller for free.
     c.header("Cache-Control", "no-store");
