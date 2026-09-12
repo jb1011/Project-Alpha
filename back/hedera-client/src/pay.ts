@@ -69,7 +69,18 @@ export function payFetchFor(o: {
   ): Promise<Response> => {
     const res = await paid(input, init);
     const hdr = res.headers.get("PAYMENT-RESPONSE") ?? res.headers.get("X-PAYMENT-RESPONSE");
-    if (!hdr || !approved) return res;
+    if (!hdr) return res;
+    // A settlement header with no approval behind it did not pass through the policy hook on this
+    // call: either this fetch was reused and the last payment's approval has already been spent,
+    // or the server volunteered the header on a request that paid nothing. Reporting it would
+    // write the PREVIOUS payment's payee and amount against this transaction id, so it is skipped
+    // — loudly, because a payment that really settled and went unreported is worth investigating.
+    if (!approved) {
+      console.error(
+        "PAYMENT-RESPONSE arrived with no approved payment behind it; not reporting it",
+      );
+      return res;
+    }
 
     let settle: SettleResponse | undefined;
     try {
@@ -97,6 +108,10 @@ export function payFetchFor(o: {
     if (settle && (typeof settle.success !== "boolean" || !decoded))
       console.error("PAYMENT-RESPONSE was not a usable settlement; reporting the payment anyway");
     await reportUntilSettled(o.novi, o.entityId, transaction, approved);
+    // The approval is SPENT. One slot serves one payment, so leaving it set would let the next
+    // response that carries a `PAYMENT-RESPONSE` without passing through the hook be reported
+    // with this payment's payee and amount.
+    approved = undefined;
     return res;
   };
 }

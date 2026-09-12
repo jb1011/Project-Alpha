@@ -24,7 +24,6 @@
  * an unsecured account. A loud failure is the only honest answer.
  */
 
-/** A Hedera key as the policy engine consumes it: one key, an m-of-n, or a plain list (n-of-n). */
 /**
  * A Hedera key as the policy engine consumes it: one key, an m-of-n, or a plain list (n-of-n).
  *

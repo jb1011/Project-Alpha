@@ -248,10 +248,34 @@ test("a 404 walk never spends the shared read budget", async () => {
   expect((await get(app, PUBLIC_ID, { "x-forwarded-for": "8.8.9.9" })).status).toBe(402);
 });
 
-test("an exhausted SHARED read budget refuses every caller, before any 402", async () => {
+test("an unpaid quote never spends the shared read budget either", async () => {
+  // Same argument as the 404 walk, one step further in: a caller with no payment header is only
+  // quoted a price, and the handler — the only thing that reads Arc — never runs for it. Spending
+  // the deployment-wide token on the quote let a caller rotating `x-forwarded-for` over ids it
+  // already knows are public hold the free `/legal-bodies` lookup at 429 for free. One token, no
+  // refill: if any of the five quotes below spent it, the paid request cannot be served.
+  const { app } = setup({ readBudget: new TokenBucket(1, 0) });
+  for (let i = 0; i < 5; i++)
+    expect((await get(app, PUBLIC_ID, { "x-forwarded-for": `10.0.0.${i}` })).status).toBe(402);
+  const header = await paidHeader(app, PUBLIC_ID, "10.0.1.1");
+  const res = await get(app, PUBLIC_ID, {
+    "x-forwarded-for": "10.0.1.1",
+    "PAYMENT-SIGNATURE": header,
+  });
+  expect(res.status).toBe(200);
+});
+
+test("an exhausted SHARED read budget refuses every paying caller, before any 402", async () => {
   const { app } = setup({ readBudget: new TokenBucket(0, 0) });
-  const res = await get(app, PUBLIC_ID);
+  // The budget is spent on the request that can reach Arc, so it is the PAYING one that a spent
+  // bucket refuses — and it is refused in layer 1, ahead of verify and settle, so no buyer is
+  // ever charged for a 429. The header's contents do not matter: nothing reads it before here.
+  const res = await get(app, PUBLIC_ID, { "PAYMENT-SIGNATURE": "any-header-at-all" });
   expect(res.status).toBe(429);
+  expect(await res.json()).toEqual({
+    error: "rate_limited",
+    message: "try again in a few seconds",
+  });
   expect(res.headers.get("PAYMENT-REQUIRED")).toBeNull();
   expect(onlySupported()).toEqual([]);
 });

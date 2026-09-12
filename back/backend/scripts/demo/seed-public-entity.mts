@@ -138,8 +138,10 @@ async function fetchTransparencyEntity(publicId: string): Promise<TransparencyEn
 }
 
 export async function main(): Promise<void> {
-  assertDemoGuard(process.env);
+  // The label goes out BEFORE the guard, so even a refused run says on its first line what this
+  // script is. Matches `hedera-client`'s `demo-buyer` command, which labels itself the same way.
   console.log("DEMO ONLY");
+  assertDemoGuard(process.env);
 
   const { publicId, tenant } = parseArgs(process.argv.slice(2));
   const transparency = await fetchTransparencyEntity(publicId);

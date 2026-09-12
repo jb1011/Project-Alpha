@@ -1565,6 +1565,23 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           // Hedera; what failed is the report about it. Burning the transaction id on a failed
           // row here would mean one mistyped payee could permanently block the correct report of
           // a payment that really happened, and the id is the only handle the caller has.
+          //
+          // One mismatch gets its own reason, because it is the one a client can fix alone: the
+          // right token and the right amount left SOME account, just not the one this entity is
+          // linked to. That is a misconfigured `AGENT_ACCOUNT_ID` paying from a second account,
+          // and `transfer-mismatch` sends the operator looking at the payee and the amount, which
+          // are both correct. Nothing is disclosed by it that the caller did not already send: it
+          // names no account, only that the debit leg was not the linked one.
+          if (!debited) {
+            const debitedElsewhere = record.tokenTransfers.some(
+              (t) =>
+                t.tokenId === hedera.cfg.usdcTokenId &&
+                t.amount === -amount &&
+                t.account !== rec.hederaAccountId,
+            );
+            if (debitedElsewhere)
+              return json({ status: "failed", reason: "payer-not-linked-account" });
+          }
           if (!debited || !credited) return json({ status: "failed", reason: "transfer-mismatch" });
           const ledgerId = onceOnNetwork(() =>
             hedera.ledger.recordSettledOnNetwork(rec.idempotencyKey, payee, amount, network, ref),

@@ -184,6 +184,37 @@ describe("payFetchFor", () => {
     expect(novi.reportPayment).toHaveBeenCalledTimes(2);
   });
 
+  it("does not report a second response against the first payment's approval", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const signer = stubSigner();
+    const novi = stubNovi({ ok: true, available: "1000000" }, [{ status: "settled", ledgerId: 9 }]);
+    // `stubFetch` answers 402 once and 200-with-a-settlement-header ever after, so a reused fetch
+    // sees a `PAYMENT-RESPONSE` on the second call without going through `onBeforePaymentCreation`
+    // at all. The approval from the first payment must not be spent a second time: reporting it
+    // would write that payment's payee and amount against a transaction id it has nothing to do
+    // with, in a ledger whose whole job is to say what this legal body actually paid.
+    const paid = payFetchFor({
+      signer,
+      novi,
+      entityId: ENTITY_ID,
+      fetchImpl: stubFetch() as unknown as typeof fetch,
+    });
+
+    await paid(RESOURCE_URL);
+    expect(novi.reportPayment).toHaveBeenCalledOnce();
+
+    const second = await paid(RESOURCE_URL);
+
+    expect(second.status).toBe(200);
+    expect(second.headers.get("PAYMENT-RESPONSE")).toBeTruthy();
+    expect(signer.createPartiallySignedTransferTransaction).toHaveBeenCalledOnce();
+    expect(novi.reportPayment).toHaveBeenCalledOnce();
+    expect(errors).toHaveBeenCalledWith(
+      "PAYMENT-RESPONSE arrived with no approved payment behind it; not reporting it",
+    );
+    errors.mockRestore();
+  });
+
   it("does not report a refused settlement", async () => {
     const signer = stubSigner();
     const novi = stubNovi({ ok: true, available: "1000000" }, []);

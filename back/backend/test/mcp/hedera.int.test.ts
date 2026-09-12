@@ -7,25 +7,17 @@
  * the ledger, the policy engine, the MCP transport and the tools themselves are the real thing,
  * because every bug this file is here to catch lives in the seams between them.
  *
- * The key vectors are IMPORTED from `test/hedera/keyDecode.test.ts` rather than copied: the two
- * suites have to agree byte for byte about what a 1-of-2 list looks like, and a second copy is a
- * second thing to get wrong. (Vitest re-registers an imported test module's own tests in this
- * file's suite, so this file reports 12 tests more than it declares.)
+ * The key vectors are IMPORTED from `test/helpers/hederaKeys.ts` rather than copied: the two suites
+ * that use them have to agree byte for byte about what a 1-of-2 list looks like, and a second copy
+ * is a second thing to get wrong. They sit in a plain module rather than in the decoder's own test
+ * file because importing from a test file made Vitest re-register that file's tests here, so this
+ * suite reported 12 tests that were not its own.
  */
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { TokenBucket } from "../../src/api/routes/agentBook";
 import { PaymentLedger } from "../../src/payments/ledger";
 import type { EntityRecord } from "../../src/types";
-import {
-  A,
-  B,
-  ONE_OF_THREE,
-  ONE_OF_TWO,
-  SINGLE,
-  THRESHOLD_TWO,
-  TWO_OF_TWO,
-} from "../hedera/keyDecode.test";
 import {
   METADATA_BASE,
   TENANT,
@@ -35,6 +27,15 @@ import {
   hederaApp,
   hederaDb,
 } from "../helpers/hederaApp";
+import {
+  A,
+  B,
+  ONE_OF_THREE,
+  ONE_OF_TWO,
+  SINGLE,
+  THRESHOLD_TWO,
+  TWO_OF_TWO,
+} from "../helpers/hederaKeys";
 import { startMcpTestClient } from "./helpers";
 
 const HEDERA_CFG = {
@@ -204,6 +205,7 @@ const settledTx = (
     debit?: bigint;
     result?: string;
     creditToken?: string;
+    debitAccount?: string;
   } = {},
 ) => [
   {
@@ -212,7 +214,7 @@ const settledTx = (
     result: over.result ?? "SUCCESS",
     consensusTimestamp: "1788998489.006924053",
     tokenTransfers: [
-      { tokenId: USDC, account: ACCOUNT, amount: -(over.debit ?? 1000n) },
+      { tokenId: USDC, account: over.debitAccount ?? ACCOUNT, amount: -(over.debit ?? 1000n) },
       {
         tokenId: over.creditToken ?? USDC,
         account: over.payee ?? PAYEE,
@@ -448,6 +450,22 @@ test("report_payment refuses a transfer that credited somebody else, and writes 
   expect(parse(await call(app, key, "report_payment", reportArgs()))).toEqual({
     status: "failed",
     reason: "transfer-mismatch",
+  });
+  expect(ledgerRows(db)).toHaveLength(0);
+});
+
+test("report_payment names the debit leg when the payer is not the linked account", async () => {
+  // The payee, the token and the amount are all right; the money left a different account. That
+  // is a misconfigured `AGENT_ACCOUNT_ID`, and it is the one mismatch a client can diagnose on
+  // its own — so it gets its own reason rather than the generic one, which would send the
+  // operator looking at the payee and the amount.
+  const { app, key, db } = setup({
+    link: true,
+    mirror: { transaction: settledTx({ debitAccount: "0.0.31337" }) },
+  });
+  expect(parse(await call(app, key, "report_payment", reportArgs()))).toEqual({
+    status: "failed",
+    reason: "payer-not-linked-account",
   });
   expect(ledgerRows(db)).toHaveLength(0);
 });

@@ -86,13 +86,26 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
       return c.json({ error: "not_found" }, 404);
     }
     // The SHARED budget bounds ARC READS, so it is spent only once we know a read can follow.
-    // Taking it above the 404 guard let a walk over random ids — or unpaid re-quotes behind a
-    // rotating `x-forwarded-for` — drain the deployment-wide bucket and throttle the free
-    // `/legal-bodies` lookup, which makes no chain read for any of them either.
+    // Taking it above the 404 guard let a walk over random ids drain the deployment-wide bucket
+    // and throttle the free `/legal-bodies` lookup, which makes no chain read for any of them.
+    //
+    // The same argument rules out spending it on an UNPAID request. A caller with no payment
+    // header is only ever quoted a price: the 402 comes out of the middleware below and the
+    // handler — the only thing that reads Arc — never runs. Charging the shared bucket for it let
+    // a caller rotating `x-forwarded-for` over known public ids hold `/legal-bodies` at 429 while
+    // costing us no chain read at all. So the token is taken only when a payment header is
+    // present, which is the only request that can reach the handler.
+    //
+    // This does NOT close a garbage-header drain: a forged or malformed payment header is refused
+    // by the middleware below, after this line, so it still spends one shared token. What it
+    // costs the attacker is a well-formed-looking header per request instead of one flipped IP
+    // address; bounding that case needs the budget spent inside layer 3, which cannot be done
+    // without either double-reading the entity or moving the take past settlement.
     //
     // Still in layer 1, ahead of the 402, and it must never move past the payment middleware: a
     // 429 raised after settlement would take the buyer's money and return nothing.
-    if (!shared.take()) {
+    const paying = c.req.header("payment-signature") ?? c.req.header("x-payment");
+    if (paying && !shared.take()) {
       noStore();
       return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
     }

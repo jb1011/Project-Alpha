@@ -1,31 +1,22 @@
 /**
- * Golden vectors for the hand-written Hedera `Key` protobuf decoder.
+ * The hand-written Hedera `Key` protobuf decoder, against the golden vectors.
  *
- * The vectors were hand-built on 2026-09-10 from the Hedera protobuf `Key` layout and re-derived
- * in the audit. `A`, `B`, `C` are the compressed secp256k1 public keys of the private keys
- * `0x11…11`, `0x22…22`, `0x33…33`, re-derived with `@noble/curves`.
- *
- * Layout, for the reader: `2a` is field 5 (`ThresholdKey`) wire type 2; `08 01` its `threshold`;
- * `12 <len>` its `KeyList`; each `0a 23 3a 21 <33 bytes>` is one `Key` holding field 7
- * (`ECDSA_secp256k1`); `32` is field 6 (`KeyList`) at the top level.
- *
- * These constants are EXPORTED on purpose: task 5's policy tests build their scripted mirror
- * accounts from the same bytes, so the two suites can never drift apart.
+ * The vectors themselves live in `test/helpers/hederaKeys.ts`, because task 5's policy tests build
+ * their scripted mirror accounts from the same bytes and the two suites have to agree byte for
+ * byte. Their layout is documented there.
  */
 import { expect, test } from "vitest";
 import { decodeHederaKey } from "../../src/hedera/keyDecode";
-
-const A = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
-const B = "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27";
-const C = "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1";
-const SINGLE = `3a21${A}`;
-const ONE_OF_TWO = `2a4e0801124a0a233a21${A}0a233a21${B}`;
-const TWO_OF_TWO = `324a0a233a21${A}0a233a21${B}`;
-const ONE_OF_THREE = `2a730801126f0a233a21${A}0a233a21${B}0a233a21${C}`;
-const THRESHOLD_TWO = `2a4e0802124a0a233a21${A}0a233a21${B}`;
-
-// biome-ignore lint/suspicious/noExportsInTest: deliberate — task 5's policy tests build their scripted mirror accounts from these exact bytes, and a second copy is a second thing to get wrong.
-export { A, B, C, SINGLE, ONE_OF_TWO, TWO_OF_TWO, ONE_OF_THREE, THRESHOLD_TWO };
+import {
+  A,
+  B,
+  C,
+  ONE_OF_THREE,
+  ONE_OF_TWO,
+  SINGLE,
+  THRESHOLD_TWO,
+  TWO_OF_TWO,
+} from "../helpers/hederaKeys";
 
 test("single ECDSA key", () =>
   expect(decodeHederaKey(SINGLE)).toEqual({ kind: "single", keyHex: A }));
