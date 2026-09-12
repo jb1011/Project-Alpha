@@ -174,9 +174,10 @@ export const ATTESTATION_DOMAIN = { name: "Novi Corpus Attestation", version: "1
  * boolean beside it. A verifier that wants any of the three reads them from the JSON and treats
  * them as unattested, which they are.
  *
- * COVERED WITHOUT APPEARING: `formation.filed` and `formation.einIssued` are pure functions of
- * `formationStatus` (`formationOf`: filed = `filed | complete`, einIssued = `complete`), so
- * signing the status signs them. And the ISO `issuedAt` / `expiresAt` strings are NOT signed —
+ * DERIVED, NOT SIGNED: `formation.filed` and `formation.einIssued` are served as conveniences
+ * and are NOT under the signature — flipping either in the JSON still verifies. A verifier
+ * derives both from the signed `formationStatus` (`formationOf`: filed = `filed | complete`,
+ * einIssued = `complete`) and ignores the served booleans. Likewise the ISO `issuedAt` / `expiresAt` strings are NOT signed —
  * only their `…Unix` counterparts are, which is what a `uint256` can hold. A verifier therefore
  * reads the window off `issuedAtUnix` / `expiresAtUnix`; the ISO pair is for humans, and a
  * document whose two forms disagree is one where the signed pair is the one that counts.

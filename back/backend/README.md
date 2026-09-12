@@ -187,7 +187,33 @@ Novi Corpus does not trust the facilitator's reply alone: it reads the transacti
 mirror node with the USDC token pinned on both legs, and only then records the ledger row
 (`network = hedera:testnet`, `batch_ref = <mirror transaction id>`) and serves the attestation
 body (subject, standing, formation, controller flag, operating-agreement hash and version,
-`issuedAt`, `expiresAt`). The body is unsigned in this pull request; the signature is the next one.
+`issuedAt`, `expiresAt`). With `NOVI_ATTESTATION_KEY` set the body is signed; see "Signed attestation".
+
+### Signed attestation (pull request 3)
+
+When `NOVI_ATTESTATION_KEY` is set, the `/verify` body carries `attestor` (the key's address, also
+published as `hedera.attestor` in `/metadata/:publicId`) and an EIP-712 `signature`. Domain
+`{ name: "Novi Corpus Attestation", version: "1" }`, no chain id, no verifying contract. One
+primary type, `LegalBodyAttestation`, with twelve fields in this order: `publicId string`,
+`agentId string`, `treasury address`, `uaid string`, `standing string`, `formationStatus string`,
+`formationEnvironment string`, `humanVerified bool`, `oaHash bytes32`, `manifestVersion uint256`,
+`issuedAt uint256`, `expiresAt uint256`. Every field is read from the served body.
+
+What a verifier must know:
+
+- The signed timestamps are `issuedAtUnix` and `expiresAtUnix` (unix seconds). The ISO `issuedAt`
+  and `expiresAt` strings are a convenience and are not signed; read the unix pair.
+- Null mapping, applied identically when signing and verifying: `oaHash` null → `0x` + 64 zeros,
+  `manifestVersion` null → `0`, `uaid` null → `""`, `agentId` null → `""`, a null `formation` →
+  `""` for both formation fields, an empty treasury → the zero address.
+- `subject.name`, `subject.registry`, the World credential and the `formation.filed` /
+  `formation.einIssued` booleans are not signed. Derive the two booleans from the signed
+  `formationStatus` (`filed` = status `filed` or `complete`; `einIssued` = status `complete`) and
+  treat the rest as display data.
+- Hex case is outside the signature (a lowercased `treasury` still verifies), and extra top-level
+  JSON keys do not break verification. Read only the twelve signed fields.
+- `verifyAttestation(body, attestor, signature)` in `src/hedera/attestation.ts` recomputes the
+  typed data from the body and answers `false` on any malformed input rather than throwing.
 
 V2 note: the client signs whatever asset and amount the 402 names, and `check_policy` never sees
 the asset. Pin the asset in the client before pointing it at a server you do not run.
