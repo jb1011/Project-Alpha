@@ -21,7 +21,7 @@ NOVI_API_KEY=op://Novi Corpus/Novi Corpus Demo API Key/local
 
 # The entity whose policy is checked and whose ledger the payment lands in. The seeded
 # FormationE2E_1 row's id for task 8; HederaDemo_1's for the demo. Public value, fill in.
-NOVI_ENTITY_ID=
+NOVI_ENTITY_ID=0x6AB681DbFa81CA0D4acec965bDEd3A17292Ac142:FormationE2E_1
 # HederaDemo_1's own HCS-11 profile URL, set as the float account's memo (task 12).
 # Public value, fill in when task 12 lands. Shape: https://www.novicorpus.com/backend/metadata/<publicId>/profile
 NOVI_PROFILE_URL=
