@@ -30,10 +30,12 @@ import {
 } from "../helpers/hederaApp";
 
 const CHAIN_ID = 5042002;
-/** The Arc entry, in the form the route serves it: CAIP-2 chain, lowercased registry address. */
-const ARC_REGISTRY = `eip155:${CHAIN_ID}:${IDENTITY_REGISTRY.toLowerCase()}`;
-/** The Hedera entry. Chain id 296 is a literal here because it is Hedera testnet's, not ours. */
-const HEDERA_REGISTRY = `eip155:296:${HEDERA_IDENTITY_REGISTRY.toLowerCase()}`;
+/** The Arc entry, in the form the route serves it: CAIP-2 chain, EIP-55 checksummed address —
+ *  exactly what `cfg.identityRegistry` holds, because `env.ts` checksums every address it parses. */
+const ARC_REGISTRY = `eip155:${CHAIN_ID}:${IDENTITY_REGISTRY}`;
+/** The Hedera entry, checksummed to match. Chain id 296 is a literal here because it is Hedera
+ *  testnet's, not ours. */
+const HEDERA_REGISTRY = `eip155:296:${HEDERA_IDENTITY_REGISTRY}`;
 const VERIFY_URL = `${METADATA_BASE}/verify/${PUBLIC_ID}`;
 const PROFILE_URL = `${METADATA_BASE}/metadata/${PUBLIC_ID}/profile`;
 

@@ -32,20 +32,23 @@ export interface AgentRegistration {
  * The Hedera registry address is the `HEDERA_IDENTITY_REGISTRY` constant: a public, immutable
  * address, never an environment variable (audit C3).
  *
- * Addresses are LOWERCASED. A CAIP-10-shaped id is compared as a string by whoever reads it, so
- * one form has to win, and lowercase is the form CAIP-10 writes eip155 accounts in.
+ * Both addresses are EIP-55 CHECKSUMMED, and neither is re-cased here. The Arc one is whatever
+ * `cfg.identityRegistry` already is — `env.ts` puts every address through viem's `getAddress`, so
+ * it is checksummed, and that is the string this field has served since it shipped. Lowercasing it
+ * now would silently change a published value for every deployment that reads it; the Hedera entry
+ * matches rather than the other way round.
  */
 export function registrationsFor(deps: ApiDeps, ent: EntityRecord): AgentRegistration[] {
   const out: AgentRegistration[] = [];
   if (ent.agentId && deps.identityRegistry)
     out.push({
       agentId: ent.agentId,
-      agentRegistry: `eip155:${deps.chainId}:${deps.identityRegistry.toLowerCase()}`,
+      agentRegistry: `eip155:${deps.chainId}:${deps.identityRegistry}`,
     });
   if (ent.hederaAgentId)
     out.push({
       agentId: ent.hederaAgentId,
-      agentRegistry: `${HEDERA_CAIP2}:${HEDERA_IDENTITY_REGISTRY.toLowerCase()}`,
+      agentRegistry: `${HEDERA_CAIP2}:${HEDERA_IDENTITY_REGISTRY}`,
     });
   return out;
 }
