@@ -119,7 +119,9 @@ const goldenBody = (): AttestationBody => ({
 });
 
 // The same literal is pinned in `back/backend/test/hedera/attestation.test.ts`: if either
-// package's copy of the attestation shape drifts, one of the two suites stops accepting it.
+// package's copy of the signed shape (the twelve typed fields) drifts, one of the two suites
+// stops accepting it. The backend body also carries the unsigned `formation.filed` and
+// `formation.einIssued`; this package's body type never had them.
 const GOLDEN_SIGNATURE =
   "0x086d3f329535207f514a922585edf576587ead89b6c7b88c56d4e019ecd34a804f0aeb1df13fbc27f44d83578b7e837edb3faa7617aa428e3df4dc04d10f05e41b" as const;
 

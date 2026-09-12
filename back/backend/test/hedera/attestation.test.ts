@@ -218,7 +218,9 @@ test("a null formation signs as two empty strings, and a filed one does not coll
 const GOLDEN_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as Hex;
 const GOLDEN_ATTESTOR = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as const;
 
-/** The fixed body both packages sign. Every field is also in `back/hedera-client/test/attest.test.ts`. */
+/** The fixed body both packages sign. The twelve signed fields carry the same values as the body in
+ *  `back/hedera-client/test/attest.test.ts`; the unsigned `formation.filed` and `formation.einIssued`
+ *  exist only on the backend type. */
 const goldenBody = (): AttestationBody => ({
   subject: {
     publicId: "9f8003f5-4c70-435a-9980-9a54625691b7",
@@ -242,7 +244,8 @@ const goldenBody = (): AttestationBody => ({
 });
 
 // The same literal is pinned in `back/hedera-client/test/attest.test.ts`: if either package's
-// copy of the attestation shape drifts, one of the two suites stops reproducing or accepting it.
+// copy of the signed shape (the twelve typed fields) drifts, one of the two suites stops
+// reproducing or accepting it.
 const GOLDEN_SIGNATURE =
   "0x086d3f329535207f514a922585edf576587ead89b6c7b88c56d4e019ecd34a804f0aeb1df13fbc27f44d83578b7e837edb3faa7617aa428e3df4dc04d10f05e41b" as Hex;
 
