@@ -13,7 +13,9 @@ import { describe, expect, test } from "vitest";
 import {
   type ProdEntity,
   assertProdHost,
+  assertRecordedUaidMatches,
   fetchProdEntity,
+  fromProdPlan,
   recordCommandLine,
   resolveEntity,
   uaidForProdEntity,
@@ -230,6 +232,62 @@ describe("recordCommandLine", () => {
         uaid: GOLDEN_UAID,
       }),
     ).toBe(`--record --entity FormationE2E_1 --agent-id 12 --tx ${TX_HASH} --uaid ${GOLDEN_UAID}`);
+  });
+});
+
+describe("fromProdPlan", () => {
+  test("no --execute is a dry run", () => {
+    expect(fromProdPlan({ execute: false, yes: false })).toEqual({ mode: "dry-run" });
+    // --yes on its own never turns a dry run into a write.
+    expect(fromProdPlan({ execute: false, yes: true })).toEqual({ mode: "dry-run" });
+  });
+
+  test("refuses --execute without --yes, naming the flag and the reason", () => {
+    const plan = fromProdPlan({ execute: true, yes: false });
+    expect(plan.mode).toBe("refuse");
+    // Prod publishes no hederaAgentId, so this mode cannot see an entity is already registered:
+    // an unguarded re-run would mint a second ERC-8004 identity for the same legal body.
+    expect(plan.mode === "refuse" && plan.message).toMatch(/--yes/);
+    expect(plan.mode === "refuse" && plan.message).toMatch(/SECOND identity/);
+  });
+
+  test("registers only with both --execute and --yes", () => {
+    expect(fromProdPlan({ execute: true, yes: true })).toEqual({ mode: "execute" });
+  });
+});
+
+describe("assertRecordedUaidMatches", () => {
+  const CHAIN_ID_LOCAL = 5042002;
+
+  test("accepts the UAID the row itself derives", () => {
+    const rec = entity();
+    const own = deriveUaid(uaidInputsFor(rec, CHAIN_ID_LOCAL), { uid: rec.agentId as string });
+    expect(() => assertRecordedUaidMatches(rec, CHAIN_ID_LOCAL, own)).not.toThrow();
+    // And that UAID is the pinned golden vector, so this guard is anchored to task 9.
+    expect(own).toBe(GOLDEN_UAID);
+  });
+
+  test("refuses a line pasted from a DIFFERENT entity", () => {
+    // The realistic mistake: the right --uaid, typed against the wrong --entity. Another legal
+    // body's treasury and name derive a different hash, so the guard catches it.
+    const other = entity({
+      name: "HederaDemo_1",
+      treasury: "0x00000000000000000000000000000000000000dd",
+    });
+    expect(() => assertRecordedUaidMatches(other, CHAIN_ID_LOCAL, GOLDEN_UAID)).toThrow(
+      /--record refused: the pasted --uaid is not HederaDemo_1's own UAID/,
+    );
+  });
+
+  test("refuses when the row and the line disagree about the chain", () => {
+    const rec = entity();
+    expect(() => assertRecordedUaidMatches(rec, 1, GOLDEN_UAID)).toThrow(/--record refused/);
+  });
+
+  test("refuses a row with no Arc agent id, which derives no UAID at all", () => {
+    expect(() =>
+      assertRecordedUaidMatches(entity({ agentId: null }), CHAIN_ID_LOCAL, GOLDEN_UAID),
+    ).toThrow(/has no Arc agent id/);
   });
 });
 

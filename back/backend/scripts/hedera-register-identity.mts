@@ -12,10 +12,13 @@
  *   --all-entities        the same for every eligible row; refuses without --execute --yes
  *   --from-prod <publicId>  read the entity from PROD's public endpoints, register, and PRINT the
  *                         --record line to run on the box — no local database is opened at all,
- *                         because under D28 the local database never holds the prod rows
+ *                         because under D28 the local database never holds the prod rows.
+ *                         Registering needs --execute --yes: prod publishes no hederaAgentId, so
+ *                         this mode cannot see that an entity is already registered
  *   --record --entity <id> --agent-id <n> --tx <hash> --uaid <uaid>
  *                         write those three values to the local row, no chain call — this is the
- *                         half of --from-prod that has to run ON the box
+ *                         half of --from-prod that has to run ON the box. It re-derives the UAID
+ *                         from the row and refuses a pasted line that belongs to another entity
  *
  * DRY RUN BY DEFAULT. Without --execute nothing is signed and no key is even read; the script
  * prints the metadata URI it would register and the UAID it would derive. A dry run is the
@@ -29,7 +32,7 @@
  * (audit C3): see `src/hedera/registry.ts`.
  *
  *   npx tsx scripts/hedera-register-identity.mts --entity FormationE2E_1
- *   npx tsx scripts/hedera-register-identity.mts --from-prod <publicId> --execute
+ *   npx tsx scripts/hedera-register-identity.mts --from-prod <publicId> --execute --yes
  *   npx tsx scripts/hedera-register-identity.mts --record --entity <id> --agent-id 12 --tx 0x… --uaid uaid:aid:…
  *
  * `dotenv` is loaded inside `main()` rather than as a top-level import (the one deviation from
@@ -148,6 +151,57 @@ export function uaidForProdEntity(p: ProdEntity, chainId: number): string {
   return deriveUaid(input, { uid: p.agentId });
 }
 
+/**
+ * What a `--from-prod` run is allowed to do.
+ *
+ * `--execute` needs `--yes` here for the same reason `--all-entities` does, and a sharper one:
+ * prod's public endpoints publish no `hederaAgentId`, so this mode cannot tell an entity that is
+ * already registered from a fresh one. Re-running it would mint a SECOND ERC-8004 identity for a
+ * legal body that already has one, and nothing on chain would undo that. `--yes` is the human
+ * saying they have checked. Kept separate from `runFromProd` so the refusal is testable without a
+ * process exit.
+ */
+export function fromProdPlan(o: {
+  execute: boolean;
+  yes: boolean;
+}): { mode: "dry-run" | "execute" } | { mode: "refuse"; message: string } {
+  if (!o.execute) return { mode: "dry-run" };
+  if (!o.yes) {
+    return {
+      mode: "refuse",
+      message:
+        "--from-prod --execute refuses to run without --yes: prod publishes no hederaAgentId, so a re-run would mint a SECOND identity for an entity that already has one",
+    };
+  }
+  return { mode: "execute" };
+}
+
+/**
+ * Refuses a `--record` line whose UAID is not the one this row's own public facts derive to.
+ *
+ * The three values in a `--record` line are pasted by a human from another machine's output, so
+ * the one failure this has to catch is the paste landing on the wrong row: `--record` would then
+ * write one legal body's on-chain identity onto another's, and the public `/verify` surface would
+ * serve it. Re-deriving from the local row is a complete check, because the UAID is a hash of
+ * exactly the facts the row holds (name, treasury, agent id, chain id).
+ */
+export function assertRecordedUaidMatches(rec: EntityRecord, chainId: number, uaid: string): void {
+  if (!rec.agentId) {
+    throw new Error(`--record refused: ${rec.name} has no Arc agent id, so it derives no UAID`);
+  }
+  const derived = deriveUaid(uaidInputsFor(rec, chainId), { uid: rec.agentId });
+  if (derived !== uaid) {
+    throw new Error(
+      [
+        `--record refused: the pasted --uaid is not ${rec.name}'s own UAID.`,
+        `  pasted  ${uaid}`,
+        `  derived ${derived}`,
+        "  Check the --entity on this line against the entity the registration printed.",
+      ].join("\n"),
+    );
+  }
+}
+
 /** The `--record` line to run on the box, printed verbatim after a `--from-prod` registration. */
 export function recordCommandLine(o: {
   entity: string;
@@ -185,7 +239,7 @@ const USAGE = [
   "usage:",
   "  hedera-register-identity.mts --entity <name|key> [--entity …] [--execute]",
   "  hedera-register-identity.mts --all-entities --execute --yes",
-  "  hedera-register-identity.mts --from-prod <publicId> [--from-prod …] [--execute]",
+  "  hedera-register-identity.mts --from-prod <publicId> [--from-prod …] [--execute --yes]",
   "  hedera-register-identity.mts --record --entity <id> --agent-id <n> --tx <hash> --uaid <uaid>",
 ].join("\n");
 
@@ -242,12 +296,15 @@ function hederaClients() {
 
 /** `--from-prod`: prod's public endpoints in, an on-chain identity and a `--record` line out.
  *  Deliberately never calls `loadConfig()` and never opens a database (D28). */
-async function runFromProd(publicIds: string[], execute: boolean): Promise<void> {
+async function runFromProd(publicIds: string[], execute: boolean, yes: boolean): Promise<void> {
   const chainId = Number(process.env.ARC_CHAIN_ID ?? DEFAULT_ARC_CHAIN_ID);
   if (!Number.isInteger(chainId) || chainId <= 0) {
     usageAndExit(`ARC_CHAIN_ID is not a chain id: ${process.env.ARC_CHAIN_ID}`);
   }
-  const clients = execute ? hederaClients() : null;
+  // A refused run still prints what it WOULD have registered, then refuses at the end: the
+  // operator's next move is to re-read those lines and add --yes, not to run it again blind.
+  const plan = fromProdPlan({ execute, yes });
+  const clients = plan.mode === "execute" ? hederaClients() : null;
   if (clients) console.log(`operator ${clients.operator}  registry ${HEDERA_IDENTITY_REGISTRY}\n`);
 
   for (const publicId of publicIds) {
@@ -262,7 +319,9 @@ async function runFromProd(publicIds: string[], execute: boolean): Promise<void>
     console.log(`   uaid        ${uaid}`);
 
     if (!clients) {
-      console.log("   (dry run — nothing sent)\n");
+      console.log(
+        plan.mode === "refuse" ? "   (not sent: --yes missing)\n" : "   (dry run — nothing sent)\n",
+      );
       continue;
     }
     assertProdHost(p.metadataURI);
@@ -280,6 +339,8 @@ async function runFromProd(publicIds: string[], execute: boolean): Promise<void>
       `   run on the box: ${recordCommandLine({ entity: p.publicId, agentId, txHash, uaid })}\n`,
     );
   }
+
+  if (plan.mode === "refuse") usageAndExit(plan.message);
 }
 
 /** `--record`: write the three values to the local row. No chain call, no key, no network. */
@@ -304,6 +365,9 @@ function runRecord(argv: string[]): void {
   migrate(db);
   const repo = new SqliteEntityRepository(db);
   const rec = resolveEntity(repo.list(), target);
+  // Before the write, not after: a pasted line that belongs to a different entity must never
+  // reach the row. Throws, so nothing is written and the process exits non-zero.
+  assertRecordedUaidMatches(rec, cfg.chainId, uaid);
   repo.setHederaIdentity(rec.idempotencyKey, { agentId, registerTx: txHash, uaid });
   db.close();
   console.log(`recorded ${rec.name}: hederaAgentId=${agentId} tx=${txHash}`);
@@ -395,7 +459,7 @@ export async function main(): Promise<void> {
       usageAndExit("--from-prod cannot be combined with --record, --all-entities or --entity");
     }
     // No loadConfig(), no database: under D28 the local database never holds the prod rows.
-    await runFromProd(fromProd, execute);
+    await runFromProd(fromProd, execute, yes);
     return;
   }
 
