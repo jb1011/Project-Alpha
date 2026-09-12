@@ -200,3 +200,60 @@ test("a null formation signs as two empty strings, and a filed one does not coll
   });
   expect(await verifyAttestation(filed, attestor, signature)).toBe(false);
 });
+
+// ── the golden vector (PR 3 review, I2) ─────────────────────────────────────────────────────────
+
+/**
+ * The drift guard between this package and `back/hedera-client`.
+ *
+ * The client carries a COPY of the domain, the twelve types and the flattener, and until now
+ * each suite signed and verified with its own copy — so a renamed field or a changed sentinel in
+ * either one passed both suites and every demo signature read as invalid at the recording. The
+ * fixed body and the hard-coded signature below also live in `back/hedera-client/test/attest.test.ts`;
+ * change either copy of the shape and one of the two suites fails.
+ *
+ * Anvil's published dev account 0. A test vector printed in Foundry's own documentation, funded
+ * on nothing, and never a deployment key.
+ */
+const GOLDEN_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as Hex;
+const GOLDEN_ATTESTOR = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as const;
+
+/** The fixed body both packages sign. Every field is also in `back/hedera-client/test/attest.test.ts`. */
+const goldenBody = (): AttestationBody => ({
+  subject: {
+    publicId: "9f8003f5-4c70-435a-9980-9a54625691b7",
+    name: "FormationE2E_1",
+    agentId: "886257",
+    registry: "eip155:5042002:0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    treasury: "0x92ae7c6b6eB9470d7E01F8fEb352714bD80A7AAf",
+    uaid: "uaid:aid:7yCVPN2iLzHZ244fEcpayKQbhzHaMVWhEZgWZoessWWnP13s19RKoa8YEB4kXEazJk",
+  },
+  standing: "active",
+  formation: { filed: true, einIssued: true, status: "complete", environment: "production" },
+  controller: { humanVerified: true, credential: "orb" },
+  legalBody: {
+    oaHash: "0x74aa4be2a56224b200da228e61bb1f06dfebfa6a78269988b1627b345a639930",
+    manifestVersion: 3,
+  },
+  issuedAt: "2026-09-12T01:58:40.000Z",
+  issuedAtUnix: "1789178320",
+  expiresAt: "2026-09-12T02:03:40.000Z",
+  expiresAtUnix: "1789178620",
+});
+
+// The same literal is pinned in `back/hedera-client/test/attest.test.ts`: if either package's
+// copy of the attestation shape drifts, one of the two suites stops reproducing or accepting it.
+const GOLDEN_SIGNATURE =
+  "0x086d3f329535207f514a922585edf576587ead89b6c7b88c56d4e019ecd34a804f0aeb1df13fbc27f44d83578b7e837edb3faa7617aa428e3df4dc04d10f05e41b" as Hex;
+
+test("signAttestation reproduces the golden signature byte for byte", async () => {
+  const { attestor, signature } = await signAttestation(goldenBody(), GOLDEN_KEY);
+  expect(attestor).toBe(GOLDEN_ATTESTOR);
+  expect(signature).toBe(GOLDEN_SIGNATURE);
+});
+
+test("verifyAttestation accepts the golden vector, and rejects it once standing is flipped", async () => {
+  expect(await verifyAttestation(goldenBody(), GOLDEN_ATTESTOR, GOLDEN_SIGNATURE)).toBe(true);
+  const tampered = { ...goldenBody(), standing: "inactive" as const };
+  expect(await verifyAttestation(tampered, GOLDEN_ATTESTOR, GOLDEN_SIGNATURE)).toBe(false);
+});

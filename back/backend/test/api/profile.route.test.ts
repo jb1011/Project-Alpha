@@ -338,7 +338,16 @@ test("with the Hedera flag off the profile route is not mounted", async () => {
 });
 
 test("the hedera block is absent with the flag off, even for a LINKED row", async () => {
-  seed({ hederaAccountId: "0.0.10412694", uaid: "uaid:aid:abc;uid=886257", hederaAgentId: "12" });
+  // `registerTx` is seeded so the absence assertion below covers it literally rather than by
+  // implication. `attestor` cannot be seeded beside it: the attestation key lives INSIDE the
+  // hedera config block (`env.ts`: `HEDERA_ENABLED` off produces no block at all), so "flag off
+  // with a key configured" is not a state this deployment can be in.
+  seed({
+    hederaAccountId: "0.0.10412694",
+    uaid: "uaid:aid:abc;uid=886257",
+    hederaAgentId: "12",
+    hederaRegisterTx: "0xc5389a0a6f38fdecb6792c0b07442026f86e3d710168c6ae108ecf855c521eb7",
+  });
   const body = await (await app({ hedera: false }).request(`/metadata/${PUBLIC_ID}`)).json();
   // Neither url is published, because neither route is mounted to answer it.
   expect(body).not.toHaveProperty("hedera");

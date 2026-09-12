@@ -171,7 +171,16 @@ export async function main(): Promise<void> {
   if (!/^0x[0-9a-fA-F]{64}$/.test(guardianKey)) {
     usageAndExit("DEMO_GUARDIAN_KEY must be 0x followed by 64 hex characters");
   }
-  const keyAccount = privateKeyToAccount(guardianKey as Hex);
+  // The regex above only proves 64 hex characters; a value at or above the secp256k1 group order
+  // passes it and makes viem throw a message that RENDERS THE KEY as a decimal integer. Catching
+  // it here is what keeps the header's promise true: the caught error's text never reaches a
+  // stream, and the refusal names the variable alone.
+  let keyAccount: ReturnType<typeof privateKeyToAccount>;
+  try {
+    keyAccount = privateKeyToAccount(guardianKey as Hex);
+  } catch {
+    usageAndExit("DEMO_GUARDIAN_KEY is not a valid secp256k1 private key");
+  }
 
   let treasury: Address;
   let label: string;

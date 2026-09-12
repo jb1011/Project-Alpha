@@ -18,7 +18,7 @@ import type { Address, EntityRecord, Hex } from "../types";
  * SIGNED ONLY WHERE A KEY IS CONFIGURED (task 13). `attestor` and `signature` appear together or
  * not at all: an empty or placeholder field is one a verifier could read as "checked", which is
  * worse than an absent one. A deployment with no `NOVI_ATTESTATION_KEY` serves the same document
- * without them, and it is still worth what it says — just only as far as the caller trusts the
+ * without them, and it is still worth what it says — only as far as the caller trusts the
  * host it came from.
  */
 export interface AttestationBody {
