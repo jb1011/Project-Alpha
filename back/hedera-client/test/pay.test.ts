@@ -62,6 +62,24 @@ function stubFetch(settlement: SettleResponse | null = settled) {
   });
 }
 
+/** Like `stubFetch`, but puts a raw string in `PAYMENT-RESPONSE` rather than a valid header. */
+function stubFetchRawHeader(raw: string) {
+  let calls = 0;
+  return vi.fn(async (): Promise<Response> => {
+    calls += 1;
+    if (calls === 1) {
+      return new Response("{}", {
+        status: 402,
+        headers: { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(paymentRequired) },
+      });
+    }
+    return new Response(JSON.stringify({ standing: "active" }), {
+      status: 200,
+      headers: { "content-type": "application/json", "PAYMENT-RESPONSE": raw },
+    });
+  });
+}
+
 function stubNovi(verdict: PolicyVerdict, reports: PaymentReport[]): NoviClient {
   const queue = [...reports];
   return {
@@ -184,5 +202,49 @@ describe("payFetchFor", () => {
 
     await paid(RESOURCE_URL);
     expect(novi.reportPayment).not.toHaveBeenCalled();
+  });
+});
+
+describe("payFetchFor, when the settlement header is unreadable", () => {
+  it("still reports the payment and still returns the response", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const signer = stubSigner();
+    const novi = stubNovi({ ok: true, available: "1000000" }, []);
+    // Not base64 JSON: `decodePaymentResponseHeader` throws on it. A settlement may still
+    // have happened, so abandoning the report would lose it from the ledger for good.
+    const paid = payFetchFor({
+      signer,
+      novi,
+      entityId: ENTITY_ID,
+      fetchImpl: stubFetchRawHeader("!!! not base64 !!!") as unknown as typeof fetch,
+    });
+
+    const res = await paid(RESOURCE_URL);
+
+    expect(res.status).toBe(200);
+    expect(novi.reportPayment).toHaveBeenCalledOnce();
+    expect(errors).toHaveBeenCalledOnce();
+    errors.mockRestore();
+  });
+
+  it("salvages the transaction id when only the schema is wrong", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const novi = stubNovi({ ok: true, available: "1000000" }, [{ status: "settled" }]);
+    // Valid base64 JSON, but `success` is missing, so the strict decoder returns an object
+    // this client cannot trust. The transaction id in it is still the real one.
+    const header = Buffer.from(JSON.stringify({ transaction: TX_ID })).toString("base64");
+    const paid = payFetchFor({
+      signer: stubSigner(),
+      novi,
+      entityId: ENTITY_ID,
+      fetchImpl: stubFetchRawHeader(header) as unknown as typeof fetch,
+    });
+
+    await paid(RESOURCE_URL);
+
+    expect(novi.reportPayment).toHaveBeenCalledWith(
+      expect.objectContaining({ transactionId: TX_ID, idempotencyKey: TX_ID }),
+    );
+    errors.mockRestore();
   });
 });

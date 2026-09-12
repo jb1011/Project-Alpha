@@ -5,6 +5,7 @@
  * before anything is signed, and this command prints `policy denied: <reason>` and exits 2
  * with no HashScan link, because there is no transaction to link to.
  */
+import type { SettleResponse } from "@x402/core/types";
 import { decodePaymentResponseHeader } from "@x402/fetch";
 import { hashscan, requireEnv } from "../mirror.js";
 import { type NoviClient, type ReportPaymentArgs, createNoviClient } from "../novi.js";
@@ -68,7 +69,16 @@ export async function pay(argv: string[]) {
       console.log("settlement: no PAYMENT-RESPONSE header");
       return;
     }
-    const s = decodePaymentResponseHeader(hdr);
+    // `payFetchFor` has already reported the payment by this point, including when the header
+    // was unreadable, so this decode is only about what to PRINT. It must not throw and undo
+    // a successful run.
+    let s: SettleResponse | undefined;
+    try {
+      s = decodePaymentResponseHeader(hdr);
+    } catch {
+      console.log("settlement: PAYMENT-RESPONSE did not decode; check the mirror node");
+      return;
+    }
     console.log(
       s.success
         ? `settlement: OK ${hashscan(s.transaction)}`

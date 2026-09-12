@@ -13,7 +13,12 @@
  * key and account id ever reach Novi Corpus, through `link`.
  */
 import { execFileSync } from "node:child_process";
-import { AccountUpdateTransaction, KeyList } from "@hiero-ledger/sdk";
+import {
+  AccountUpdateTransaction,
+  KeyList,
+  PrecheckStatusError,
+  ReceiptStatusError,
+} from "@hiero-ledger/sdk";
 import { AccountId, Client, PrivateKey, TokenId, TransferTransaction } from "@x402/hedera";
 import {
   type MirrorAccount,
@@ -65,6 +70,48 @@ function opEdit(title: string, fields: Record<string, string>) {
   execFileSync("op", args, { stdio: ["ignore", "ignore", "inherit"] });
 }
 
+/** The part of a `TransactionResponse` this module reads. Structural, so a test can fake it. */
+type Submittable = {
+  transactionId: { toString(): string };
+  getReceipt(client: Client): Promise<{ status: { toString(): string } }>;
+};
+
+/**
+ * Runs a transaction and returns its status as a string instead of throwing on failure.
+ *
+ * The SDK reports a failed transaction by THROWING, not by handing back a status:
+ * `getReceipt` raises `ReceiptStatusError` for any consensus status that is not SUCCESS
+ * (`lib/transaction/TransactionResponse.cjs:104`), and a node-side refusal raises
+ * `PrecheckStatusError` out of `execute` itself. A caller that reads `receipt.status` and
+ * compares it to "SUCCESS" therefore has a branch it can never reach. `provision`'s dust
+ * fallback was exactly that branch, which is why this helper exists.
+ *
+ * @param send - Submits the transaction and resolves to its response
+ * @param client - The client whose receipt query is used
+ * @returns The status as the network spelled it, and the transaction id when there is one
+ */
+export async function submit(
+  send: () => Promise<Submittable>,
+  client: Client,
+): Promise<{ status: string; txId: string }> {
+  let rx: Submittable;
+  try {
+    rx = await send();
+  } catch (e) {
+    // A precheck refusal never reached consensus, so there is no transaction to link to.
+    if (e instanceof PrecheckStatusError) return { status: e.status.toString(), txId: "" };
+    throw e;
+  }
+  try {
+    const status = (await rx.getReceipt(client)).status.toString();
+    return { status, txId: rx.transactionId.toString() };
+  } catch (e) {
+    if (e instanceof ReceiptStatusError)
+      return { status: e.status.toString(), txId: rx.transactionId.toString() };
+    throw e;
+  }
+}
+
 /**
  * Sets the account memo to the HCS-11 profile reference, when one is configured.
  *
@@ -86,6 +133,8 @@ async function setMemo(accountId: AccountId) {
       .setAccountId(accountId)
       .setAccountMemo(`hcs-11:${profileUrl}`)
       .execute(g.client);
+    // Not through `submit`: there is no fallback for a failed memo, so the SDK's throw is
+    // the right outcome. Anything printed here is therefore always SUCCESS.
     const status = (await tx.getReceipt(g.client)).status.toString();
     console.log(`memo hcs-11:${profileUrl}: ${status} ${hashscan(tx.transactionId.toString())}`);
   } finally {
@@ -116,9 +165,7 @@ async function setKeyList(
     .setKey(list)
     .freezeWith(g.client);
   await tx.sign(agentKey);
-  const rx = await tx.execute(g.client);
-  const status = (await rx.getReceipt(g.client)).status.toString();
-  return { status, txId: rx.transactionId.toString() };
+  return submit(() => tx.execute(g.client), g.client);
 }
 
 /**
@@ -145,9 +192,7 @@ async function completeWithDust(
     .setTransactionMemo("novi: complete float account")
     .freezeWith(g.client);
   await tx.sign(agentKey);
-  const rx = await tx.execute(g.client);
-  const status = (await rx.getReceipt(g.client)).status.toString();
-  return { status, txId: rx.transactionId.toString() };
+  return submit(() => tx.execute(g.client), g.client);
 }
 
 /**
@@ -198,6 +243,8 @@ export async function provision(argv: string[]) {
         .addTokenTransfer(usdc(), alias, FLOAT_ATOMIC)
         .setTransactionMemo("novi: fund float account")
         .execute(g.client);
+      // Not through `submit` either: provision must not continue past a funding that did
+      // not land, so a non-SUCCESS status throws out of the command with the SDK's message.
       const status = (await rx.getReceipt(g.client)).status.toString();
       console.log(`fund alias with 1 USDC: ${status} ${hashscan(rx.transactionId.toString())}`);
     }

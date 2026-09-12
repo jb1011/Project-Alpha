@@ -6,7 +6,9 @@ permissions:
 
 on:
   pull_request:
-    branches: [main]
+    # `hedera` is the integration branch the Hedera-rail pull requests target (D29); without
+    # it here, none of these jobs runs on them and "CI green" would say nothing.
+    branches: [main, hedera]
   push:
     branches: [main]
 

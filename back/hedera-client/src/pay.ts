@@ -69,14 +69,55 @@ export function payFetchFor(o: {
   ): Promise<Response> => {
     const res = await paid(input, init);
     const hdr = res.headers.get("PAYMENT-RESPONSE") ?? res.headers.get("X-PAYMENT-RESPONSE");
-    if (hdr) {
-      const s = decodePaymentResponseHeader(hdr);
-      if (s.success && s.transaction && approved) {
-        await reportUntilSettled(o.novi, o.entityId, s, approved);
-      }
+    if (!hdr || !approved) return res;
+
+    let settle: SettleResponse | undefined;
+    try {
+      settle = decodePaymentResponseHeader(hdr);
+    } catch (e) {
+      // A header we cannot read is not evidence that nothing was paid. `decodePaymentResponseHeader`
+      // throws on anything that is not base64 JSON, and a throw here would abandon a payment that
+      // may well have settled, leaving it out of the ledger with no second chance. So: say so on
+      // stderr, salvage the transaction id if any of the header survives, and report anyway. An id
+      // we could not salvage reaches the server as an empty string, which it cannot find on the
+      // mirror node and answers `pending` for, writing no row. That is the safe direction.
+      console.error(
+        `PAYMENT-RESPONSE did not decode (${(e as Error).message}); reporting the payment anyway`,
+      );
     }
+    // A settlement the facilitator itself reports as refused never reached the ledger, so it
+    // is not reported (design Component 7). Only an explicit `success: false` is that. A
+    // header that is missing the field, or that did not decode at all, is UNREADABLE rather
+    // than refused, and unreadable is reported: the alternative is losing a real payment from
+    // the ledger with no second chance.
+    if (settle?.success === false) return res;
+
+    const decoded = typeof settle?.transaction === "string" ? settle.transaction : "";
+    const transaction = decoded || salvageTransactionId(hdr);
+    if (settle && (typeof settle.success !== "boolean" || !decoded))
+      console.error("PAYMENT-RESPONSE was not a usable settlement; reporting the payment anyway");
+    await reportUntilSettled(o.novi, o.entityId, transaction, approved);
     return res;
   };
+}
+
+/**
+ * Digs a transaction id out of a `PAYMENT-RESPONSE` the strict decoder refused.
+ *
+ * Best effort by design: it exists only so a real settlement is reported with its real id
+ * rather than with nothing. Anything it cannot read becomes an empty string.
+ *
+ * @param header - The raw header value
+ * @returns The transaction id, or an empty string
+ */
+export function salvageTransactionId(header: string): string {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+    const tx = (parsed as { transaction?: unknown })?.transaction;
+    return typeof tx === "string" ? tx : "";
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -88,14 +129,14 @@ export function payFetchFor(o: {
  *
  * @param novi - The three Novi Corpus tools
  * @param entityId - The legal body recording the payment
- * @param s - The decoded `PAYMENT-RESPONSE`
+ * @param transactionId - The Hedera transaction id, which is also the idempotency key
  * @param req - What the policy hook approved
  * @returns The last answer the server gave
  */
 export async function reportUntilSettled(
   novi: NoviClient,
   entityId: string,
-  s: SettleResponse,
+  transactionId: string,
   req: PaidRequirements,
 ) {
   const args = {
@@ -103,8 +144,8 @@ export async function reportUntilSettled(
     payee: req.payee,
     amountUsdc: req.amountUsdc,
     network: "hedera:testnet",
-    transactionId: s.transaction,
-    idempotencyKey: s.transaction,
+    transactionId,
+    idempotencyKey: transactionId,
   };
   let answer = await novi.reportPayment(args);
   for (let i = 1; i < REPORT_TRIES && answer.status === "pending"; i++) {
