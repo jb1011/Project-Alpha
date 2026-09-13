@@ -262,6 +262,39 @@ export type TransparencyView = {
 };
 
 /**
+ * One ERC-8004 registration on GET /metadata/:publicId (`registrations[]`).
+ *
+ * `agentRegistry` is CAIP-10: `eip155:<chainId>:<registryAddress>`. Hedera testnet is chain 296.
+ * Every field is optional on the wire: the array itself is absent until at least one id is known.
+ */
+export type AgentRegistration = {
+  agentId?: string;
+  agentRegistry?: string;
+};
+
+/** The Hedera rail block on GET /metadata/:publicId. Absent until a float account is linked. */
+export type HederaMetadataBlock = {
+  accountId?: string;
+  verifyUrl?: string;
+  profileUrl?: string;
+  registerTx?: string;
+  attestor?: string;
+};
+
+/**
+ * The public metadata document (GET /metadata/:publicId), as far as this UI reads it.
+ *
+ * Hedera fields are additive and independently optional: `uaid` lands when identity is recorded,
+ * the `eip155:296` registration when the Hedera agent id is recorded, the `hedera` block when a
+ * float account is linked. Treat every one as missing until it is a non-empty string.
+ */
+export type PublicMetadata = {
+  uaid?: string;
+  registrations?: AgentRegistration[];
+  hedera?: HederaMetadataBlock;
+};
+
+/**
  * The public legal-body lookup (GET /legal-bodies/:address, design 2026-09-10 D3).
  *
  * The question a seller asks about an address that is about to pay it: is this the payment

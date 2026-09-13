@@ -36,4 +36,9 @@ export const apiKeys = {
    * not become two cache entries (and two lookups) for one chip.
    */
   legalBody: (address: string) => [...apiKeys.all, "legalBody", address.toLowerCase()] as const,
+  /**
+   * PUBLIC and token-free: GET /metadata/:publicId. Keyed by publicId so two agents that share a
+   * document (they should not) still share a cache entry, and a missing id never fetches.
+   */
+  publicMetadata: (publicId: string) => [...apiKeys.all, "publicMetadata", publicId] as const,
 };

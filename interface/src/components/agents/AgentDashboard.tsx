@@ -16,6 +16,12 @@ import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
+import { hashscanAccountUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
+import {
+  hederaIdentityChip,
+  hederaIdentityFromMetadata,
+  shortUaid,
+} from "@/lib/hedera/identity";
 import { shortenErr } from "@/lib/errors";
 import { oaAnchorLabel, pendingAnchorLabel } from "@/lib/oaAnchor";
 import { treasuryAbi } from "@/lib/treasuryAbi";
@@ -74,12 +80,15 @@ export function AgentDashboard({
     runs: runsQuery,
     agentBook: agentBookQuery,
     legalBody: legalBodyQuery,
+    metadata: metadataQuery,
   } = useAgentDashboardQueries(entityId);
 
   const entity = entityQuery.data ?? null;
   const treasury = treasuryQuery.data ?? null;
   const runs = runsQuery.data ?? [];
   const agentBookChip = agentBookChipState(agentBookQuery.data);
+  const hedera = hederaIdentityFromMetadata(metadataQuery.data);
+  const hederaChip = hederaIdentityChip(hedera);
   const agentBookView = agentBookQuery.data ?? null;
   /** The address both questions are about: the pocket that signs AgentKit challenges and pays
    *  x402 invoices. It is what AgentBook binds and what a seller looks up. */
@@ -294,6 +303,17 @@ export function AgentDashboard({
                   {agentBookChip.label}
                 </span>
               ))}
+            {hederaChip && (
+              <a
+                href={hederaChip.href}
+                target="_blank"
+                rel="noreferrer"
+                title={hederaChip.title}
+                className={AGENTBOOK_CHIP_CLASS}
+              >
+                {hederaChip.label}
+              </a>
+            )}
             {/* The second question, beside the first and never folded into it: AgentBook says
                 whether a human vouched, this says whether Novi's registry holds a legal body in
                 good standing. Two sources, two chips (design 2026-09-10 §1). */}
@@ -369,11 +389,60 @@ export function AgentDashboard({
                 chip={pendingAnchorChip(entity)}
               />
             )}
+            {hedera?.uaid && (
+              <OnChainRow
+                label="UAID"
+                value={shortUaid(hedera.uaid)}
+                title={hedera.uaid}
+              />
+            )}
+            {hedera?.hederaAgentId && (
+              <OnChainRow
+                label="Hedera agent"
+                value={`#${hedera.hederaAgentId}`}
+                href={hedera.registerTx ? hashscanTxUrl(hedera.registerTx) : hederaChip?.href}
+              />
+            )}
+            {hedera?.accountId && (
+              <OnChainRow
+                label="Hedera account"
+                value={hedera.accountId}
+                href={hashscanAccountUrl(hedera.accountId)}
+              />
+            )}
+            {hedera?.profileUrl && (
+              <OnChainRow label="Hedera profile" value="HCS-11 profile" href={hedera.profileUrl} />
+            )}
+            {hedera?.verifyUrl && (
+              <OnChainRow
+                label="Paid standing check"
+                value="x402 /verify"
+                title={hedera.verifyUrl}
+              />
+            )}
+            {hedera?.attestor && (
+              <OnChainRow
+                label="Attestor"
+                value={shortAddress(hedera.attestor)}
+                href={hashscanAccountUrl(hedera.attestor)}
+              />
+            )}
           </dl>
           <div className="mt-4 flex flex-wrap gap-3">
             {entity.createTxHash && <TxLink hash={entity.createTxHash} label="Create tx" />}
             {entity.bindTxHash && <TxLink hash={entity.bindTxHash} label="Bind tx" />}
             {entity.fundTxHash && <TxLink hash={entity.fundTxHash} label="Fund tx" />}
+            {hedera?.registerTx && (
+              <a
+                href={hashscanTxUrl(hedera.registerTx)}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft"
+              >
+                Hedera register
+                <ExternalIcon className="h-3 w-3" />
+              </a>
+            )}
           </div>
         </Card>
       )}
@@ -693,11 +762,13 @@ function OnChainRow({
   label,
   value,
   href,
+  title,
   chip,
 }: {
   label: string;
   value: string;
   href?: string;
+  title?: string;
   chip?: ReactNode;
 }) {
   return (
@@ -705,11 +776,17 @@ function OnChainRow({
       <dt className="text-muted-2">{label}</dt>
       <dd className="mt-0.5 flex flex-wrap items-center gap-2 font-mono text-ink">
         {href ? (
-          <a href={href} target="_blank" rel="noreferrer" className="hover:text-accent-soft">
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            title={title}
+            className="hover:text-accent-soft"
+          >
             {value}
           </a>
         ) : (
-          value
+          <span title={title}>{value}</span>
         )}
         {chip}
       </dd>
