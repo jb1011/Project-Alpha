@@ -891,6 +891,11 @@ async function main() {
         // The base the on-chain `metadataURI` is built from (workflow/onboarding.ts), so the link
         // a seller follows is the very document the chain points at.
         metadataBase: cfg.metadataBaseUrl,
+        // …and the API's OWN origin for the PAID link that document publishes (the Hedera
+        // `verifyUrl`), resolved exactly as the demo wall and `lookupBaseUrl` above resolve it.
+        // The www proxy the metadata base names in production forwards no x402 header, so a
+        // buyer following a paid url through it gets a 402 it cannot pay.
+        publicApiBase: cfg.publicApiUrl ?? cfg.metadataBaseUrl,
       },
       // The SHARED projection, through the same two lookups `/transparency` reads (M5's
       // company-keyed pair), so a public surface cannot describe a filing differently from the

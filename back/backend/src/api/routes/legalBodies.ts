@@ -59,6 +59,19 @@ export interface LegalBodyLookupDeps {
     /** Base the per-entity metadata url is composed from — `<base>/metadata/<publicId>`, exactly
      *  the shape `workflow/onboarding.ts` bakes on chain as the entity's `metadataURI`. */
     metadataBase: string;
+    /**
+     * This API's OWN public origin (`PUBLIC_API_URL`), for the links a STRANGER'S x402 client
+     * follows — the same base the demo wall and the lookup in a refusal are built from.
+     *
+     * Separate from `metadataBase` because in production that one is the www/backend proxy, and
+     * that proxy's header allowlist (`interface/src/lib/proxyHeaders.ts`) forwards neither the
+     * `payment-required` challenge nor `payment-signature`/`payment-response`: an x402 buyer
+     * following a paid url through it gets a 402 with an empty body and nothing to pay against.
+     *
+     * Optional so every existing construction of this object still compiles; absent -> the
+     * metadata base, which is exactly today's behaviour on a single-host deployment.
+     */
+    publicApiBase?: string;
   };
   /** The SHARED formation projection (`formation/status.ts`), keyed by company. Optional: absent,
    *  every answer's `formation` is null — the honest shape for a box that cannot read filings,
