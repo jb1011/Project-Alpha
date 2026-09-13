@@ -22,6 +22,7 @@ import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
 import { mountPerTxCapRoutes } from "./routes/perTxCap";
 import { mountPolicyRoutes } from "./routes/policy";
+import { mountProfileRoutes } from "./routes/profile";
 import { mountReputationRoutes } from "./routes/reputation";
 import { mountRunsRoutes } from "./routes/runs";
 import { mountSchemaRoutes } from "./routes/schema";
@@ -335,6 +336,9 @@ export function buildApiApp(deps: ApiDeps) {
   // and gated on the credentials that make verification possible at all.
   if (deps.doola) mountDoolaWebhookRoutes(app, { ...deps, doola: deps.doola });
   mountMetadataRoutes(app, deps);
+  // The HCS-11 profile beside the metadata it cross-links, public for the same reason: it is what
+  // a Hedera account's `hcs-11:` memo points at, read by agents holding no key of ours (task 11).
+  mountProfileRoutes(app, deps);
   mountTransparencyRoutes(app, deps);
   // Public and unauthenticated for the same reason `/transparency` is, and mounted here so it is
   // outside `protect()` below: the caller is a seller that has never heard of us.

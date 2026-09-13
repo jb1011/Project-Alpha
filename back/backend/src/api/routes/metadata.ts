@@ -2,11 +2,74 @@ import { createHash } from "node:crypto";
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { formationSummary } from "../../formation/status";
+import { HEDERA_IDENTITY_REGISTRY } from "../../hedera/registry";
+import type { EntityRecord } from "../../types";
 import { usesManifestScheme } from "../../workflow/onboarding";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** CAIP-2 for Hedera testnet, where the second ERC-8004 registry lives. A literal, and only
+ *  because it is HEDERA's chain id: this deployment's own chain is always `deps.chainId`. */
+const HEDERA_CAIP2 = "eip155:296";
+
+/** One ERC-8004 registration: the agent id, and the CAIP-10 registry it lives in. */
+export interface AgentRegistration {
+  agentId: string;
+  agentRegistry: string;
+}
+
+/**
+ * The ERC-8004 registrations this entity holds — the home chain first, then the Hedera rail.
+ *
+ * UNGATED from ENS (design 2026-09-10, task 11). This array used to be emitted only where an ENS
+ * gateway was configured, because it arrived as ENSIP-25's off-chain half. A Hedera registration
+ * is a fact about the entity whether or not we ever run a gateway, and a buyer resolving a company
+ * from Hedera reads exactly this array — so it is built from the entity's own ids plus the chain
+ * facts that sit on `ApiDeps` (`chainId`, `identityRegistry`), never off the optional `ens` block.
+ *
+ * The Hedera registry address is the `HEDERA_IDENTITY_REGISTRY` constant: a public, immutable
+ * address, never an environment variable (audit C3).
+ *
+ * NOT gated on `HEDERA_ENABLED`. A registration is a fact about the company's on-chain identity:
+ * the entry stays true whether or not this deployment sells anything over the Hedera rail, and a
+ * verifier resolving the company needs it either way. Only the `hedera` link block below, which
+ * points at routes this deployment serves, moves with the flag.
+ *
+ * Both addresses are EIP-55 CHECKSUMMED, and neither is re-cased here. The Arc one is whatever
+ * `cfg.identityRegistry` already is — `env.ts` puts every address through viem's `getAddress`, so
+ * it is checksummed, and that is the string this field has served since it shipped. Lowercasing it
+ * now would silently change a published value for every deployment that reads it; the Hedera entry
+ * matches rather than the other way round.
+ */
+export function registrationsFor(deps: ApiDeps, ent: EntityRecord): AgentRegistration[] {
+  const out: AgentRegistration[] = [];
+  if (ent.agentId && deps.identityRegistry)
+    out.push({
+      agentId: ent.agentId,
+      agentRegistry: `eip155:${deps.chainId}:${deps.identityRegistry}`,
+    });
+  if (ent.hederaAgentId)
+    out.push({
+      agentId: ent.hederaAgentId,
+      agentRegistry: `${HEDERA_CAIP2}:${HEDERA_IDENTITY_REGISTRY}`,
+    });
+  return out;
+}
+
+/**
+ * The base every public per-entity url is composed from, trailing slashes trimmed.
+ *
+ * The SAME base `/legal-bodies/:address` composes its `links.metadata` from, so a buyer that walks
+ * lookup -> metadata -> profile -> verify never crosses a host boundary, and on prod every one of
+ * those is a prod url (D28). Null where no legal-body lookup is wired: a url is not invented for a
+ * deployment that has told us no public base.
+ */
+export function metadataBaseOf(deps: ApiDeps): string | null {
+  const base = deps.legalBody?.links.metadataBase;
+  return base ? base.replace(/\/+$/, "") : null;
+}
 
 /** Public, unauthenticated: resolve publicId -> entity -> served metadata JSON. Uniform 404 for
  *  malformed/unknown/missing-file (no existence oracle). The filename derives from the DB record's
@@ -30,16 +93,19 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
       const meta = JSON.parse(body);
       let touched = false;
 
-      // ENSIP-25 off-chain half: advertise the ENS name + registry binding so a verifier can obtain
-      // the claimed name from the registry's metadata (on-chain half is setMetadata(id,"ens",...)).
+      // Every chain this entity is registered on, ENS or no ENS (see `registrationsFor`).
+      const registrations = registrationsFor(deps, ent);
+      if (registrations.length) {
+        meta.registrations = registrations;
+        touched = true;
+      }
+
+      // ENSIP-25 off-chain half: advertise the ENS NAME so a verifier can obtain the claimed name
+      // from the registry's metadata (on-chain half is setMetadata(id,"ens",...)). Still gated on
+      // the gateway, because a name we do not serve is a name nothing resolves; the registry
+      // binding above is not, because it is true of the entity either way.
       if (deps.ens && ent.agentId) {
         meta.ens = `${publicId}.${deps.ens.parentName}`;
-        meta.registrations = [
-          {
-            agentId: ent.agentId,
-            agentRegistry: `eip155:${deps.ens.chainId}:${deps.ens.identityRegistry}`,
-          },
-        ];
         touched = true;
       }
 
@@ -91,6 +157,35 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
         // What is NOT here, and must never be: the EIN (a tax identifier, authenticated views
         // only), the filing number, doola's company id, and anything at all from
         // `formation_parties`. This route has no authentication of any kind.
+        touched = true;
+      }
+
+      // ── The Hedera rail's cross-links (task 11) ──────────────────────────────────────────────
+      //
+      // Both are written ONLY once the thing they name exists. An empty `uaid`, or a profile url
+      // for an entity that was never registered, is a link a resolver follows to nothing — and on
+      // a public surface that reads as a capability this entity does not have.
+
+      // The HCS-14 universal agent id (task 9): the one identifier that names this company across
+      // both chains, and the string a demo buyer starts from. Ungated for the same reason
+      // `registrations[]` is — it identifies the company, it does not promise a service.
+      if (ent.uaid) {
+        meta.uaid = ent.uaid;
+        touched = true;
+      }
+
+      // The two entry points a buyer that found us on Hedera needs next: the free profile document
+      // and the paid standing check. Composed from the SAME base as `/legal-bodies`' metadata link.
+      //
+      // GATED ON THE FLAG, unlike the two above: these are urls, not facts. With `HEDERA_ENABLED`
+      // off neither route is mounted, so publishing them would hand a buyer two links that 404.
+      const base = metadataBaseOf(deps);
+      if (deps.hedera && ent.hederaAccountId && base) {
+        meta.hedera = {
+          accountId: ent.hederaAccountId,
+          verifyUrl: `${base}/verify/${publicId}`,
+          profileUrl: `${base}/metadata/${publicId}/profile`,
+        };
         touched = true;
       }
 

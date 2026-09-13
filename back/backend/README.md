@@ -192,6 +192,30 @@ body (subject, standing, formation, controller flag, operating-agreement hash an
 V2 note: the client signs whatever asset and amount the 402 names, and `check_policy` never sees
 the asset. Pin the asset in the client before pointing it at a server you do not run.
 
+### Portable identity (pull request 2)
+
+Each Novi Corpus company also gets an ERC-8004 identity on Hedera testnet and a universal agent id.
+
+- `scripts/hedera-register-identity.mts` registers a company on the Hedera identity registry
+  (`0x8004A818BFB912233c491871b3d84c89A494BD9e`, chain 296) from the platform operator account and
+  derives its HCS-14 UAID. `--from-prod <publicId>` reads the company's public data from the
+  deployed backend and needs `--execute --yes` to send (a repeat run would mint a second identity);
+  it prints the `--record` line that writes the result into the deployed database without a chain
+  call. `--record` re-derives the UAID from the row and refuses a line that does not match.
+- The UAID is derived, never indexed: `uaid:aid:<sha384-base58>;uid=<Arc agent id>;registry=novicorpus;proto=mcp;nativeId=eip155:<Arc chain>:<treasury>`.
+  `src/hedera/uaid.ts` copies the standards SDK's canonicalization so the result equals what
+  `@hashgraphonline/standards-sdk` computes, without depending on it.
+- `GET /metadata/:publicId` lists both registrations (Arc first, then Hedera), the `uaid`, and a
+  `hedera` block (float account, `verifyUrl`, `profileUrl`) once the company is linked.
+  `GET /metadata/:publicId/profile` serves the HCS-11 profile.
+
+**Resolving a Novi Corpus company from Hedera.** Nothing on Hedera links a UAID to a float account
+except Novi Corpus itself; discovery is a Novi Corpus resolver, said plainly (design D23). Three hops:
+parse `nativeId` out of the UAID, call `GET /legal-bodies/<treasury address>`, follow its `metadata`
+link to the company's profile. The float account's memo is `hcs-11:<profile URL>` over HTTPS, a valid
+HCS-11 reference that browsers and HTTP clients follow; the standards SDK resolver follows only
+`hcs://` references, so SDK-based agents use the three hops instead.
+
 ### Run the client
 
 The customer-side commands live in `back/hedera-client` (package `@novicorpus/hedera-client`,

@@ -31,6 +31,7 @@
     "@ensdomains/ensjs": "^4.3.1",
     "@hono/node-server": "^2.0.5",
     "@modelcontextprotocol/sdk": "1.29.0",
+    "@scure/base": "1.2.4",
     "@turnkey/sdk-server": "^6.1.1",
     "@turnkey/viem": "^0.14.31",
     "@worldcoin/agentkit": "^0.2.0",
