@@ -72,6 +72,25 @@ export function metadataBaseOf(deps: ApiDeps): string | null {
   return base ? base.replace(/\/+$/, "") : null;
 }
 
+/**
+ * The base a PAID link handed to a stranger's x402 client is composed from (`PUBLIC_API_URL`).
+ *
+ * Not `metadataBaseOf`, and the difference is not cosmetic: in production that base is the
+ * www/backend proxy, whose header allowlist (`interface/src/lib/proxyHeaders.ts`) forwards
+ * neither the `payment-required` challenge nor `payment-signature`/`payment-response`. A buyer
+ * that follows a paid url through it reads a 402 with an empty body — nothing to pay against —
+ * where the same route on the API's own origin answers with the challenge.
+ *
+ * The demo wall and the lookup inside an x402 refusal already resolve their base this way
+ * (`buildX402DemoDeps`, `main.ts`'s `lookupBaseUrl`); this is the same rule for the paid link the
+ * two public documents publish — `hedera.verifyUrl` here and `properties.verifyUrl` on the HCS-11
+ * profile, which must name the same host. Unset -> the metadata base, today's single-host shape.
+ */
+export function publicApiBaseOf(deps: ApiDeps): string | null {
+  const base = deps.legalBody?.links.publicApiBase;
+  return base ? base.replace(/\/+$/, "") : metadataBaseOf(deps);
+}
+
 /** Public, unauthenticated: resolve publicId -> entity -> served metadata JSON. Uniform 404 for
  *  malformed/unknown/missing-file (no existence oracle). The filename derives from the DB record's
  *  key, never raw URL input — the doc store's own containment guard is the last line of defense. */
@@ -176,15 +195,20 @@ export function mountMetadataRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
       }
 
       // The two entry points a buyer that found us on Hedera needs next: the free profile document
-      // and the paid standing check. Composed from the SAME base as `/legal-bodies`' metadata link.
+      // and the paid standing check. The FREE one is composed from the SAME base as
+      // `/legal-bodies`' metadata link; the PAID one from this API's own origin, because the www
+      // proxy the metadata base points at in production strips x402's headers (`payment-required`
+      // on the challenge, `payment-signature`/`payment-response` on the payment) — a buyer sent
+      // through it reads a 402 with an empty body and has nothing to pay against.
       //
       // GATED ON THE FLAG, unlike the two above: these are urls, not facts. With `HEDERA_ENABLED`
       // off neither route is mounted, so publishing them would hand a buyer two links that 404.
       const base = metadataBaseOf(deps);
-      if (deps.hedera && ent.hederaAccountId && base) {
+      const paidBase = publicApiBaseOf(deps);
+      if (deps.hedera && ent.hederaAccountId && base && paidBase) {
         meta.hedera = {
           accountId: ent.hederaAccountId,
-          verifyUrl: `${base}/verify/${publicId}`,
+          verifyUrl: `${paidBase}/verify/${publicId}`,
           profileUrl: `${base}/metadata/${publicId}/profile`,
         };
         // The Hedera registration transaction, for a UI that wants a HashScan link

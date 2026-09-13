@@ -93,7 +93,15 @@ const ATTESTATION_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f46
 const ATTESTOR = privateKeyToAccount(ATTESTATION_KEY).address;
 
 function app(
-  o: { ens?: boolean; legalBody?: boolean; hedera?: boolean; attestationKey?: Hex } = {},
+  o: {
+    ens?: boolean;
+    legalBody?: boolean;
+    hedera?: boolean;
+    attestationKey?: Hex;
+    /** A DISTINCT `PUBLIC_API_URL`, i.e. the prod shape: metadata links on the www proxy, paid
+     *  links on the API's own origin. Absent -> both bases are the metadata one, as before. */
+    publicApiBase?: string;
+  } = {},
 ) {
   return buildApiApp({
     webOrigin: WEB,
@@ -118,7 +126,11 @@ function app(
             resolver: { resolve: async () => ({ kind: "none" }) },
             chainReads: arcReads(),
             readBudget: new TokenBucket(30, 1),
-            links: { transparency: `${WEB}/transparency`, metadataBase: METADATA_BASE },
+            links: {
+              transparency: `${WEB}/transparency`,
+              metadataBase: METADATA_BASE,
+              ...(o.publicApiBase ? { publicApiBase: o.publicApiBase } : {}),
+            },
             network: "testnet" as const,
           },
     ens: o.ens
@@ -213,6 +225,21 @@ test("the hedera block appears only once an account is LINKED, and its urls are 
   });
 });
 
+test("with a distinct PUBLIC_API_URL the PAID url moves to it and the free one does not", async () => {
+  // Prod's shape: metadata lives on the www/backend proxy, which forwards no x402 header — a
+  // `verifyUrl` there answers 402 with an empty body, so the paid link must name the API itself.
+  const publicApiBase = "https://api.example.test";
+  seed({ hederaAccountId: "0.0.10412694" });
+  const body = await (await app({ publicApiBase }).request(`/metadata/${PUBLIC_ID}`)).json();
+  expect(body.hedera).toEqual({
+    accountId: "0.0.10412694",
+    verifyUrl: `${publicApiBase}/verify/${PUBLIC_ID}`,
+    // The profile stays on the metadata base: it is free, it crosses the proxy intact, and the
+    // float account's on-chain `hcs-11:` memo already points at that url.
+    profileUrl: PROFILE_URL,
+  });
+});
+
 test("the hedera block carries registerTx once the Hedera registration is recorded", async () => {
   seed({ hederaAccountId: "0.0.10412694" });
   expect((await (await app().request(`/metadata/${PUBLIC_ID}`)).json()).hedera).not.toHaveProperty(
@@ -286,6 +313,21 @@ test("the profile document has the HCS-11 shape, and carries both registrations"
       ],
     },
   });
+});
+
+test("with a distinct PUBLIC_API_URL the profile's PAID url moves to it, and only that one", async () => {
+  // Same rule as the metadata document's `hedera.verifyUrl`, and the same host as it: the www
+  // proxy the metadata base names on prod forwards no x402 header, so a buyer following this
+  // link there reads a 402 with an empty body. `metadataUrl` is free and stays where it is.
+  const publicApiBase = "https://api.example.test";
+  seed({ uaid: "uaid:aid:abc;uid=886257", hederaAccountId: "0.0.10412694" });
+  const app_ = app({ publicApiBase });
+  const body = await (await app_.request(`/metadata/${PUBLIC_ID}/profile`)).json();
+  expect(body.properties.verifyUrl).toBe(`${publicApiBase}/verify/${PUBLIC_ID}`);
+  expect(body.properties.metadataUrl).toBe(`${METADATA_BASE}/metadata/${PUBLIC_ID}`);
+  // …and the two documents never disagree about which host the paid check lives on.
+  const meta = await (await app_.request(`/metadata/${PUBLIC_ID}`)).json();
+  expect(meta.hedera.verifyUrl).toBe(body.properties.verifyUrl);
 });
 
 test("the profile never STATES standing — it is a static document and standing is live", async () => {
