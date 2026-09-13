@@ -11,6 +11,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
+import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { buildApiApp } from "../../src/api/app";
 import { TokenBucket } from "../../src/api/routes/agentBook";
@@ -18,7 +19,7 @@ import { HEDERA_IDENTITY_REGISTRY } from "../../src/hedera/registry";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
-import type { EntityRecord } from "../../src/types";
+import type { EntityRecord, Hex } from "../../src/types";
 import {
   IDENTITY_REGISTRY,
   METADATA_BASE,
@@ -86,7 +87,14 @@ function seed(over: Partial<EntityRecord> = {}): EntityRecord {
 
 /** The app the two public routes are served from. `ens` absent unless a test asks for it — the
  *  whole point of the ungating is that `registrations[]` no longer waits on it. */
-function app(o: { ens?: boolean; legalBody?: boolean; hedera?: boolean } = {}) {
+/** A PUBLISHED TEST VECTOR (Anvil's account 1), for the deployment that holds an attestation
+ *  key. A real `NOVI_ATTESTATION_KEY` comes from 1Password and never from a file. */
+const ATTESTATION_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" as Hex;
+const ATTESTOR = privateKeyToAccount(ATTESTATION_KEY).address;
+
+function app(
+  o: { ens?: boolean; legalBody?: boolean; hedera?: boolean; attestationKey?: Hex } = {},
+) {
   return buildApiApp({
     webOrigin: WEB,
     jwtSecret: "s",
@@ -97,7 +105,12 @@ function app(o: { ens?: boolean; legalBody?: boolean; hedera?: boolean } = {}) {
     now: () => 1_789_100_000_000,
     // On unless a test turns it off — `HEDERA_ENABLED` off is the exception this file tests, not
     // the state the rest of it runs in.
-    hedera: o.hedera === false ? undefined : HEDERA,
+    hedera:
+      o.hedera === false
+        ? undefined
+        : o.attestationKey
+          ? { cfg: { ...HEDERA.cfg, attestationKey: o.attestationKey } }
+          : HEDERA,
     legalBody:
       o.legalBody === false
         ? undefined
@@ -191,11 +204,43 @@ test("the hedera block appears only once an account is LINKED, and its urls are 
   expect(await (await app().request(`/metadata/${PUBLIC_ID}`)).json()).not.toHaveProperty("hedera");
   seed({ hederaAccountId: "0.0.10412694" });
   const body = await (await app().request(`/metadata/${PUBLIC_ID}`)).json();
-  // The demo buyer reads exactly these two urls off this block (plan task 15).
+  // The demo buyer reads exactly these two urls off this block (plan task 15). No `attestor`:
+  // this deployment holds no attestation key, and an empty field would claim one exists.
   expect(body.hedera).toEqual({
     accountId: "0.0.10412694",
     verifyUrl: VERIFY_URL,
     profileUrl: PROFILE_URL,
+  });
+});
+
+test("the hedera block carries registerTx once the Hedera registration is recorded", async () => {
+  seed({ hederaAccountId: "0.0.10412694" });
+  expect((await (await app().request(`/metadata/${PUBLIC_ID}`)).json()).hedera).not.toHaveProperty(
+    "registerTx",
+  );
+  const tx = "0xc5389a0a6f38fdecb6792c0b07442026f86e3d710168c6ae108ecf855c521eb7";
+  seed({ hederaAccountId: "0.0.10412694", hederaAgentId: "113", hederaRegisterTx: tx });
+  const body = await (await app().request(`/metadata/${PUBLIC_ID}`)).json();
+  expect(body.hedera).toEqual({
+    accountId: "0.0.10412694",
+    verifyUrl: VERIFY_URL,
+    profileUrl: PROFILE_URL,
+    registerTx: tx,
+  });
+});
+
+test("the attestor address is published on the FREE surface once a key is configured (task 13)", async () => {
+  seed({ hederaAccountId: "0.0.10412694" });
+  const body = await (
+    await app({ attestationKey: ATTESTATION_KEY }).request(`/metadata/${PUBLIC_ID}`)
+  ).json();
+  // The key a verifier checks the PAID document's signature against, served where it costs
+  // nothing — reading the attestor out of the signed body alone would accept any signer.
+  expect(body.hedera).toEqual({
+    accountId: "0.0.10412694",
+    verifyUrl: VERIFY_URL,
+    profileUrl: PROFILE_URL,
+    attestor: ATTESTOR,
   });
 });
 
@@ -293,7 +338,16 @@ test("with the Hedera flag off the profile route is not mounted", async () => {
 });
 
 test("the hedera block is absent with the flag off, even for a LINKED row", async () => {
-  seed({ hederaAccountId: "0.0.10412694", uaid: "uaid:aid:abc;uid=886257", hederaAgentId: "12" });
+  // `registerTx` is seeded so the absence assertion below covers it literally rather than by
+  // implication. `attestor` cannot be seeded beside it: the attestation key lives INSIDE the
+  // hedera config block (`env.ts`: `HEDERA_ENABLED` off produces no block at all), so "flag off
+  // with a key configured" is not a state this deployment can be in.
+  seed({
+    hederaAccountId: "0.0.10412694",
+    uaid: "uaid:aid:abc;uid=886257",
+    hederaAgentId: "12",
+    hederaRegisterTx: "0xc5389a0a6f38fdecb6792c0b07442026f86e3d710168c6ae108ecf855c521eb7",
+  });
   const body = await (await app({ hedera: false }).request(`/metadata/${PUBLIC_ID}`)).json();
   // Neither url is published, because neither route is mounted to answer it.
   expect(body).not.toHaveProperty("hedera");

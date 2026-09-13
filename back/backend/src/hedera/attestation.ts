@@ -1,8 +1,10 @@
+import { verifyTypedData } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import type { ApiDeps } from "../api/app";
 import { type FormationFacts, formationOf } from "../api/routes/legalBodies";
 import type { LegalBodyLookupDeps } from "../api/routes/legalBodies";
 import { readStanding } from "../payments/legalBody";
-import type { Address, EntityRecord } from "../types";
+import type { Address, EntityRecord, Hex } from "../types";
 
 /**
  * The attestation body `GET /verify/:publicId` serves once a payment has settled (design D9).
@@ -13,9 +15,11 @@ import type { Address, EntityRecord } from "../types";
  * other surface resolves through (D1): a body suspended on Arc cannot read as active on a
  * document someone paid for.
  *
- * UNSIGNED in this task. The EIP-712 signature arrives in task 13, as a `signature` field this
- * body deliberately does not carry yet: an empty or placeholder field is one a verifier could
- * read as "checked", which is worse than an absent one.
+ * SIGNED ONLY WHERE A KEY IS CONFIGURED (task 13). `attestor` and `signature` appear together or
+ * not at all: an empty or placeholder field is one a verifier could read as "checked", which is
+ * worse than an absent one. A deployment with no `NOVI_ATTESTATION_KEY` serves the same document
+ * without them, and it is still worth what it says — only as far as the caller trusts the
+ * host it came from.
  */
 export interface AttestationBody {
   subject: {
@@ -39,7 +43,31 @@ export interface AttestationBody {
   };
   legalBody: { oaHash: string | null; manifestVersion: number | null };
   issuedAt: string;
+  /**
+   * The same instant as `issuedAt`, in unix SECONDS, as a decimal string.
+   *
+   * Why both: the signature is over the unix seconds (EIP-712 has no date type, and `uint256` is
+   * the only form a Solidity verifier can compare), while the ISO string is what a human reading
+   * the JSON wants. Serving only one of them would make a verifier re-derive the other and hope
+   * it re-derives it the way we did — a rounding rule is a bad thing to leave implicit under a
+   * signature. A STRING, not a number, for the reason `agentId` is one: JSON numbers are doubles.
+   *
+   * UNCONDITIONAL, unlike `attestor` and `signature`: an unsigned body and a signed one differ
+   * only by the two signature fields, so nothing downstream has to branch on the pair's presence
+   * to find a timestamp.
+   */
+  issuedAtUnix: string;
   expiresAt: string;
+  /** `expiresAt` in unix seconds, as a decimal string. See `issuedAtUnix`. */
+  expiresAtUnix: string;
+  /** The address that signed, present only where this deployment holds an attestation key. It is
+   *  in the JSON so a verifier need not be told out of band which key to check against — and it
+   *  is then compared against the `attestor` the `/metadata/:publicId` block publishes, which is
+   *  the half a forged body cannot restate. */
+  attestor?: Address;
+  /** The EIP-712 signature over `attestationMessage(this)`, present with `attestor` or not at
+   *  all. 65 bytes, r ‖ s ‖ v. */
+  signature?: Hex;
 }
 
 /**
@@ -105,6 +133,175 @@ export async function buildAttestation(
       manifestVersion: entity.oaManifestVersion ?? null,
     },
     issuedAt: new Date(issuedAt).toISOString(),
+    issuedAtUnix: unixSeconds(issuedAt),
     expiresAt: new Date(issuedAt + TTL_MS).toISOString(),
+    expiresAtUnix: unixSeconds(issuedAt + TTL_MS),
   };
+}
+
+/** Milliseconds to a unix-seconds decimal string, FLOORED. One rule, used for both timestamps and
+ *  for nothing else, so `issuedAt` and `expiresAt` can never round in different directions. */
+function unixSeconds(ms: number): string {
+  return String(Math.floor(ms / 1000));
+}
+
+// ── EIP-712 (task 13, design Component 3, audit C12) ────────────────────────────────────────────
+
+/**
+ * The EIP-712 domain, from the naming table.
+ *
+ * NO `chainId` and NO `verifyingContract`, deliberately. This statement is not about a chain: it
+ * is Novi Corpus saying something about a company, and the same sentence is true whether the
+ * reader is on Hedera, on Arc, or holding the JSON in a file. Binding it to one chain id would
+ * make a verifier on the other reject a document that is perfectly valid — and there is no
+ * contract to replay it against, so the replay protection those two fields normally buy has
+ * nothing to protect here. What bounds the statement instead is `expiresAt`, which is signed.
+ */
+export const ATTESTATION_DOMAIN = { name: "Novi Corpus Attestation", version: "1" } as const;
+
+/**
+ * The one primary type: the body flattened to twelve fields.
+ *
+ * FLAT, not nested, because the audience is a Solidity verifier as much as a TypeScript one, and
+ * a nested EIP-712 struct is markedly more code to hash on chain. The price of flattening is that
+ * this list and `attestationMessage` below must move together — which is why the test file
+ * asserts the twelve names and types in order, and tampers with every one of them.
+ *
+ * NOT signed, and this is on purpose: `subject.name`, `subject.registry` and
+ * `controller.credential`. The name is not an identifier (it is not unique and it can change);
+ * the registry is derivable from the deployment's own chain id; and the credential names WHICH
+ * proof-of-personhood the guardian holds, where the claim the document actually makes is the
+ * boolean beside it. A verifier that wants any of the three reads them from the JSON and treats
+ * them as unattested, which they are.
+ *
+ * DERIVED, NOT SIGNED: `formation.filed` and `formation.einIssued` are served as conveniences
+ * and are NOT under the signature — flipping either in the JSON still verifies. A verifier
+ * derives both from the signed `formationStatus` (`formationOf`: filed = `filed | complete`,
+ * einIssued = `complete`) and ignores the served booleans. Likewise the ISO `issuedAt` / `expiresAt` strings are NOT signed —
+ * only their `…Unix` counterparts are, which is what a `uint256` can hold. A verifier therefore
+ * reads the window off `issuedAtUnix` / `expiresAtUnix`; the ISO pair is for humans, and a
+ * document whose two forms disagree is one where the signed pair is the one that counts.
+ */
+export const ATTESTATION_TYPES = {
+  LegalBodyAttestation: [
+    { name: "publicId", type: "string" },
+    { name: "agentId", type: "string" },
+    { name: "treasury", type: "address" },
+    { name: "uaid", type: "string" },
+    { name: "standing", type: "string" },
+    { name: "formationStatus", type: "string" },
+    { name: "formationEnvironment", type: "string" },
+    { name: "humanVerified", type: "bool" },
+    { name: "oaHash", type: "bytes32" },
+    { name: "manifestVersion", type: "uint256" },
+    { name: "issuedAt", type: "uint256" },
+    { name: "expiresAt", type: "uint256" },
+  ],
+} as const;
+
+/** `bytes32(0)`: the `oaHash` sentinel. */
+const ZERO_BYTES32 = `0x${"0".repeat(64)}` as Hex;
+/** `address(0)`: what an absent treasury flattens to. */
+const ZERO_ADDRESS = `0x${"0".repeat(40)}` as Address;
+
+/**
+ * The ONE place the served body is flattened into the twelve signed fields.
+ *
+ * Shared by `signAttestation` and `verifyAttestation` on purpose, and it is the most important
+ * line in this file: two copies of this mapping that drift by one null produce a signature that
+ * verifies nowhere, or — far worse — a verifier that accepts a body the signer never saw.
+ *
+ * THE NULL MAPPING (design Component 3, audit C12). EIP-712 has no null, so every nullable field
+ * needs a sentinel, and each one below is a value the real field can never legitimately take:
+ *
+ *   - `oaHash` null          → `0x` + 64 zeros   (a real keccak256 is never zero)
+ *   - `manifestVersion` null → `0`               (versions start at 1)
+ *   - `uaid` null            → `""`              (a real UAID starts `uaid:`)
+ *   - `agentId` null         → `""`              (a real agent id is a decimal string)
+ *
+ * Two more the brief does not name, on the same rule, because the typed data has no room for
+ * "absent" either:
+ *
+ *   - `formation` null       → `formationStatus` and `formationEnvironment` both `""`. Neither
+ *     union has an empty member (`status` is `none | in_progress | filed | complete | failed`),
+ *     so "we have no formation record" cannot be confused with any state one could be in. Both
+ *     halves go empty together: an environment without a status would let a sandbox filing read
+ *     as a real one by omission, which is the honesty invariant `formationOf` exists to hold.
+ *   - `treasury` empty       → `address(0)`. `buildAttestation` writes `""` for a row with no
+ *     treasury, and `""` is not an address viem can encode; the paid route cannot serve such a
+ *     row anyway (`isPublicOnChain` gates it), so this is a totality guard, not a live path.
+ */
+export function attestationMessage(body: AttestationBody) {
+  return {
+    publicId: body.subject.publicId,
+    agentId: body.subject.agentId ?? "",
+    treasury: (body.subject.treasury || ZERO_ADDRESS) as Address,
+    uaid: body.subject.uaid ?? "",
+    standing: body.standing,
+    formationStatus: body.formation?.status ?? "",
+    formationEnvironment: body.formation?.environment ?? "",
+    humanVerified: body.controller.humanVerified,
+    oaHash: (body.legalBody.oaHash ?? ZERO_BYTES32) as Hex,
+    manifestVersion: BigInt(body.legalBody.manifestVersion ?? 0),
+    issuedAt: BigInt(body.issuedAtUnix),
+    expiresAt: BigInt(body.expiresAtUnix),
+  };
+}
+
+/**
+ * The attestor address for a key, derived once.
+ *
+ * `privateKeyToAccount` does a secp256k1 public-key derivation, and `/metadata/:publicId` would
+ * otherwise redo it on every public read to print one constant. The memo holds one entry and no
+ * more of the secret than `cfg.hedera.attestationKey` already holds for the process's lifetime.
+ */
+let attestorMemo: { key: Hex; address: Address } | undefined;
+export function attestorAddress(key: Hex): Address {
+  if (attestorMemo?.key !== key) attestorMemo = { key, address: privateKeyToAccount(key).address };
+  return attestorMemo.address;
+}
+
+/** Sign a served body. The caller puts both halves on the body it serves, or neither. */
+export async function signAttestation(
+  body: AttestationBody,
+  key: Hex,
+): Promise<{ attestor: Address; signature: Hex }> {
+  const account = privateKeyToAccount(key);
+  const signature = await account.signTypedData({
+    domain: ATTESTATION_DOMAIN,
+    types: ATTESTATION_TYPES,
+    primaryType: "LegalBodyAttestation",
+    message: attestationMessage(body),
+  });
+  return { attestor: account.address, signature };
+}
+
+/**
+ * Recompute the typed data from a body and check the signature over it.
+ *
+ * TOTAL: `false`, never a throw, for anything malformed — a signature that is not 65 bytes, an
+ * `oaHash` that is not 32, an `attestor` that is not an address. A verifier asks one question
+ * ("was this signed by that key?") and every wrong answer to it is the same answer.
+ *
+ * It does NOT decide whether the attestor is one you should trust, and it does not look at
+ * `expiresAt`. Both are the caller's: compare `attestor` against the address
+ * `/metadata/:publicId` publishes, and compare `expiresAt` against your own clock.
+ */
+export async function verifyAttestation(
+  body: AttestationBody,
+  attestor: Address,
+  signature: Hex,
+): Promise<boolean> {
+  try {
+    return await verifyTypedData({
+      address: attestor,
+      domain: ATTESTATION_DOMAIN,
+      types: ATTESTATION_TYPES,
+      primaryType: "LegalBodyAttestation",
+      message: attestationMessage(body),
+      signature,
+    });
+  } catch {
+    return false;
+  }
 }
