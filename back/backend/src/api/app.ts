@@ -28,6 +28,7 @@ import { mountSchemaRoutes } from "./routes/schema";
 import { mountTransparencyRoutes } from "./routes/transparency";
 import { mountTreasuryRoutes } from "./routes/treasury";
 import { mountTrustPolicyRoutes } from "./routes/trustPolicy";
+import { mountVerifyRoutes } from "./routes/verify";
 import { mountWorldIdRoutes } from "./routes/worldId";
 import { mountX402DemoRoutes } from "./routes/x402Demo";
 import type { EntityViewDeps } from "./views";
@@ -54,6 +55,15 @@ export interface ApiDeps extends EntityViewDeps {
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
   chainId: number;
+  /**
+   * The ERC-8004 identity registry an agent id lives in, from `cfg.identityRegistry`.
+   *
+   * Beside `chainId` and NOT inside `ens`, deliberately (design Component 5): the ENS gateway is
+   * an optional capability, and reading the registry off it would leave a paying buyer of
+   * `/verify` holding an `agentId` with no registry to resolve it in on every deployment that
+   * never configured a gateway. The registry is a fact about this chain, not about ENS.
+   */
+  identityRegistry: import("../types").Address;
   jwtSecret: string;
   jwtTtlSec: number;
   /** Audit fix C: the platform/manager account address (Factory owner + setAgentWallet caller,
@@ -216,6 +226,12 @@ export interface ApiDeps extends EntityViewDeps {
    * policy hold (D1), so a suspension means one thing on every surface.
    */
   legalBody?: import("./routes/legalBodies").LegalBodyLookupDeps;
+  /**
+   * The Hedera rail (design 2026-09-10). Present exactly when `HEDERA_ENABLED` produced a whole
+   * `cfg.hedera` block; absent, the three MCP tools are NOT REGISTERED at all — not registered
+   * and refusing, which would still advertise a capability this deployment does not have.
+   */
+  hedera?: import("../hedera/policy").HederaDeps;
   /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
    *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
    *  `ceilingAtomic` is the configured MAX_POCKET_FLOAT_USDC, atomic USDC string. Optional for the
@@ -323,6 +339,9 @@ export function buildApiApp(deps: ApiDeps) {
   // Public and unauthenticated for the same reason `/transparency` is, and mounted here so it is
   // outside `protect()` below: the caller is a seller that has never heard of us.
   mountLegalBodyRoutes(app, deps);
+  // The PAID standing check, settled on Hedera (task 6). Public and unauthenticated for the same
+  // reason the free lookup above is, and mounted beside it so both sit outside `protect()`.
+  mountVerifyRoutes(app, deps);
   mountEnsGatewayRoutes(app, deps);
   if (deps.x402Demo) mountX402DemoRoutes(app, deps.x402Demo);
   mountAuthRoutes(app, deps);

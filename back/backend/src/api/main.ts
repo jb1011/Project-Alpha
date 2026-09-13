@@ -44,6 +44,7 @@ import { resolveFormationDeployment } from "../formation";
 import { createCompany } from "../formation/company";
 import { newChainHeadCache } from "../formation/payment";
 import { formationSummary } from "../formation/status";
+import { HederaMirror } from "../hedera/mirror";
 import { buildJobDeps } from "../jobs/composition";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
@@ -219,6 +220,23 @@ async function main() {
     legalStatus: (proxy) => arc.legalStatus(proxy),
     treasuryPaused: (treasury) => arc.treasuryPaused(treasury),
   });
+
+  /**
+   * The Hedera rail (design 2026-09-10), present exactly when HEDERA_ENABLED produced a whole
+   * `cfg.hedera` block. Absent, the three MCP tools are not registered at all.
+   *
+   * `spendAllowlistThreshold` is COPIED from the same config field `entityPayment.ts` forwards to
+   * `evaluatePolicy` for Arc, so one deployment cannot end up with two hybrid thresholds. The
+   * ledger is a second handle on the SAME database — `PaymentLedger` holds no state of its own.
+   */
+  const hedera = cfg.hedera
+    ? {
+        cfg: cfg.hedera,
+        mirror: new HederaMirror(cfg.hedera.mirrorUrl),
+        ledger: new PaymentLedger(db),
+        spendAllowlistThreshold: cfg.spendAllowlistThreshold,
+      }
+    : undefined;
 
   // Per-entity payment service (treasury_status/pay tools) needs a pocket-derivation seed; leave
   // it undefined on deployments that haven't set POCKET_MASTER_SEED so they keep working (the
@@ -756,6 +774,7 @@ async function main() {
     nonceStore,
     siweDomain: cfg.siweDomain,
     chainId: cfg.chainId,
+    identityRegistry: cfg.identityRegistry,
     jwtSecret: cfg.authJwtSecret,
     jwtTtlSec: cfg.authJwtTtlSec,
     platformManagerAddress,
@@ -849,8 +868,16 @@ async function main() {
      * The SAME resolver instance the buyer dial got above (D1) — not a second one built from the
      * same parts, which is how two surfaces end up disagreeing about one suspension.
      */
+    hedera,
     legalBody: {
       resolver: legalBody,
+      // The resolver's own two reads, UNWRAPPED — the Hedera `check_policy` tool holds an entity
+      // record already, so it needs the reads and not the address lookup. Same `arc` adapter the
+      // resolver above closes over, so the two can never answer differently about one suspension.
+      chainReads: {
+        legalStatus: (proxy) => arc.legalStatus(proxy),
+        treasuryPaused: (treasury) => arc.treasuryPaused(treasury),
+      },
       /**
        * 30 burst, 1 per second sustained, and spent only on a memo MISS.
        *
