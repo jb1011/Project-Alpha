@@ -2,7 +2,7 @@ import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
-import { metadataBaseOf, registrationsFor } from "./metadata";
+import { metadataBaseOf, publicApiBaseOf, registrationsFor } from "./metadata";
 
 /**
  * GET /metadata/:publicId/profile — the HCS-11 profile document (design 2026-09-10 D11, task 11).
@@ -53,6 +53,11 @@ export function mountProfileRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
     // Null rather than a guess wherever this deployment has not told us a public base: a url built
     // from nothing would send a resolver somewhere that is not us.
     const base = metadataBaseOf(deps);
+    // The PAID link is the one exception to `base`, and for the reason `hedera.verifyUrl` is
+    // (`publicApiBaseOf`): in production the metadata base is the www/backend proxy, which
+    // forwards no x402 header, so a buyer following a `verifyUrl` there reads a 402 with an empty
+    // body. Same host as the metadata document's own `verifyUrl` — one paid route, one origin.
+    const paidBase = publicApiBaseOf(deps);
     const body = {
       version: "1.0",
       type: PROFILE_TYPE,
@@ -69,7 +74,7 @@ export function mountProfileRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
           oaHash: ent.oaHash ?? null,
           manifestVersion: ent.oaManifestVersion ?? null,
         },
-        verifyUrl: base ? `${base}/verify/${publicId}` : null,
+        verifyUrl: paidBase ? `${paidBase}/verify/${publicId}` : null,
         metadataUrl: base ? `${base}/metadata/${publicId}` : null,
         // The SAME array `/metadata/:publicId` serves, from the same builder: a profile and the
         // metadata beside it must never disagree about which chains this company is registered on.

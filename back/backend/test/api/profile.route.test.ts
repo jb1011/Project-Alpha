@@ -315,6 +315,21 @@ test("the profile document has the HCS-11 shape, and carries both registrations"
   });
 });
 
+test("with a distinct PUBLIC_API_URL the profile's PAID url moves to it, and only that one", async () => {
+  // Same rule as the metadata document's `hedera.verifyUrl`, and the same host as it: the www
+  // proxy the metadata base names on prod forwards no x402 header, so a buyer following this
+  // link there reads a 402 with an empty body. `metadataUrl` is free and stays where it is.
+  const publicApiBase = "https://api.example.test";
+  seed({ uaid: "uaid:aid:abc;uid=886257", hederaAccountId: "0.0.10412694" });
+  const app_ = app({ publicApiBase });
+  const body = await (await app_.request(`/metadata/${PUBLIC_ID}/profile`)).json();
+  expect(body.properties.verifyUrl).toBe(`${publicApiBase}/verify/${PUBLIC_ID}`);
+  expect(body.properties.metadataUrl).toBe(`${METADATA_BASE}/metadata/${PUBLIC_ID}`);
+  // …and the two documents never disagree about which host the paid check lives on.
+  const meta = await (await app_.request(`/metadata/${PUBLIC_ID}`)).json();
+  expect(meta.hedera.verifyUrl).toBe(body.properties.verifyUrl);
+});
+
 test("the profile never STATES standing — it is a static document and standing is live", async () => {
   seed({ uaid: "uaid:aid:abc;uid=886257" });
   const res = await app().request(`/metadata/${PUBLIC_ID}/profile`);

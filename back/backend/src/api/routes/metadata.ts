@@ -82,10 +82,11 @@ export function metadataBaseOf(deps: ApiDeps): string | null {
  * where the same route on the API's own origin answers with the challenge.
  *
  * The demo wall and the lookup inside an x402 refusal already resolve their base this way
- * (`buildX402DemoDeps`, `main.ts`'s `lookupBaseUrl`); this is the same rule for the one paid link
- * the metadata document publishes. Unset -> the metadata base, i.e. today's single-host shape.
+ * (`buildX402DemoDeps`, `main.ts`'s `lookupBaseUrl`); this is the same rule for the paid link the
+ * two public documents publish — `hedera.verifyUrl` here and `properties.verifyUrl` on the HCS-11
+ * profile, which must name the same host. Unset -> the metadata base, today's single-host shape.
  */
-function publicApiBaseOf(deps: ApiDeps): string | null {
+export function publicApiBaseOf(deps: ApiDeps): string | null {
   const base = deps.legalBody?.links.publicApiBase;
   return base ? base.replace(/\/+$/, "") : metadataBaseOf(deps);
 }
