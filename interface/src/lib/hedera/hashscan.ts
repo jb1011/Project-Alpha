@@ -28,12 +28,24 @@ function hashscanBase(network: HederaNetwork | null | undefined): string | null 
   return network ? `https://hashscan.io/${network}` : null;
 }
 
+/**
+ * THE SHAPES, checked before anything is interpolated into a url.
+ *
+ * Every one of these values reaches the page from a public JSON document. A value of the wrong
+ * shape is not a formatting problem: pasted into a HashScan path it produces a link that 404s, or
+ * points at a different kind of object, under a label that says it is this company's proof. So an
+ * unrecognised value builds no url and the caller renders it as plain text.
+ */
+const TX_HASH = /^0x[0-9a-fA-F]{64}$/;
+const ACCOUNT_ID = /^\d+\.\d+\.\d+$/;
+const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
 export function hashscanTxUrl(
   network: HederaNetwork | null | undefined,
   tx: string | null | undefined,
 ): string | undefined {
   const base = hashscanBase(network);
-  if (!base || !tx) return undefined;
+  if (!base || !tx || !TX_HASH.test(tx)) return undefined;
   return `${base}/transaction/${tx}`;
 }
 
@@ -42,7 +54,7 @@ export function hashscanAccountUrl(
   accountId: string | null | undefined,
 ): string | undefined {
   const base = hashscanBase(network);
-  if (!base || !accountId) return undefined;
+  if (!base || !accountId || !ACCOUNT_ID.test(accountId)) return undefined;
   return `${base}/account/${accountId}`;
 }
 
@@ -51,6 +63,6 @@ export function hashscanContractUrl(
   address: string | null | undefined,
 ): string | undefined {
   const base = hashscanBase(network);
-  if (!base || !address) return undefined;
+  if (!base || !address || !EVM_ADDRESS.test(address)) return undefined;
   return `${base}/contract/${address}`;
 }

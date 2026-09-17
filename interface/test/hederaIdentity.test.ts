@@ -19,6 +19,7 @@ import {
   hederaIdentityChip,
   hederaIdentityFromMetadata,
   hederaTransparencyLinks,
+  httpsUrl,
   publicIdFromMetadataUri,
   shortUaid,
 } from "@/lib/hedera/identity";
@@ -223,6 +224,58 @@ describe("the HashScan network comes from the registration's chain id", () => {
     expect(hederaNetworkOfChainId(295)).toBe("mainnet");
     expect(hederaNetworkOfChainId("1")).toBeNull();
     expect(hederaNetworkOfChainId(undefined)).toBeNull();
+  });
+});
+
+// ── A value of the wrong shape is text, never an href (L2) ────────────────────────────────────
+
+describe("every value is checked against its shape before it becomes a link", () => {
+  test("a transaction hash is 0x + 64 hex, or there is no link", () => {
+    expect(hashscanTxUrl("testnet", REGISTER_TX)).toBe(
+      `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
+    );
+    // Uppercase hex is the same hash.
+    expect(hashscanTxUrl("testnet", REGISTER_TX.toUpperCase().replace("0X", "0x"))).toBeTruthy();
+    expect(hashscanTxUrl("testnet", REGISTER_TX.slice(0, 40))).toBeUndefined();
+    expect(hashscanTxUrl("testnet", "0.0.10450558@1789100000.1")).toBeUndefined();
+    expect(hashscanTxUrl("testnet", "../../account/0.0.1")).toBeUndefined();
+    expect(hashscanTxUrl("testnet", "")).toBeUndefined();
+  });
+
+  test("an account id is shard.realm.num, or there is no link", () => {
+    expect(hashscanAccountUrl("testnet", "0.0.10450558")).toBe(
+      "https://hashscan.io/testnet/account/0.0.10450558",
+    );
+    // An EVM address is NOT a Hedera account id, which is exactly the attestor's case.
+    expect(
+      hashscanAccountUrl("testnet", "0x038B40CFf3A948aA596AcFdd113c9Eac96011e2b"),
+    ).toBeUndefined();
+    expect(hashscanAccountUrl("testnet", "0.0")).toBeUndefined();
+    expect(hashscanAccountUrl("testnet", "not an account")).toBeUndefined();
+  });
+
+  test("a registry address is 0x + 40 hex, or there is no link", () => {
+    expect(hashscanContractUrl("testnet", HEDERA_IDENTITY_REGISTRY)).toBe(
+      `https://hashscan.io/testnet/contract/${HEDERA_IDENTITY_REGISTRY}`,
+    );
+    expect(hashscanContractUrl("testnet", "0xnothex")).toBeUndefined();
+  });
+
+  test("a profile url must be https, or the row is plain text", () => {
+    const url = `https://www.novicorpus.com/backend/metadata/${PUBLIC_ID}/profile`;
+    expect(httpsUrl(url)).toBe(url);
+    expect(httpsUrl("http://www.novicorpus.com/x")).toBeUndefined();
+    expect(httpsUrl("javascript:alert(1)")).toBeUndefined();
+    expect(httpsUrl("//evil.example.com/x")).toBeUndefined();
+    expect(httpsUrl(undefined)).toBeUndefined();
+    // …and a row carrying one links the register tx alone.
+    expect(
+      hederaTransparencyLinks({
+        agentId: "113",
+        profileUrl: "javascript:alert(1)",
+        registerTx: REGISTER_TX,
+      }).map((l) => l.label),
+    ).toEqual(["Hedera register"]);
   });
 });
 

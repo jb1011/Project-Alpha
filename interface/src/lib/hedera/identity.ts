@@ -36,6 +36,17 @@ export function parseAgentRegistry(
   return m ? { chainId: m[1], address: m[2] } : null;
 }
 
+/**
+ * A url the page may put in an `href`, or undefined.
+ *
+ * `https:` only, and by prefix rather than by parsing: the profile url arrives as a string in a
+ * public document, and `javascript:`, `data:` or a protocol-relative `//host` is not a document
+ * link at all. Plain http is refused too, since every url we publish is https.
+ */
+export function httpsUrl(value: string | null | undefined): string | undefined {
+  return value && /^https:\/\//.test(value) ? value : undefined;
+}
+
 /** "Hedera testnet" / "Hedera mainnet", or plain "Hedera" where the chain is unknown: copy must
  *  not name a network that no link could be built for. */
 export function hederaNetworkLabel(network: HederaNetwork | null | undefined): string {
@@ -172,10 +183,11 @@ export function hederaTransparencyLinks(
   // same words. A link labeled "Profile" beside three Arcscan links must say where it goes.
   const registered = `Registered on ${hederaNetworkLabel(ROW_NETWORK)} as ERC-8004 agent ${hedera.agentId}.`;
   const links: { label: string; href: string; title: string }[] = [];
-  if (hedera.profileUrl)
+  const profileHref = httpsUrl(hedera.profileUrl);
+  if (profileHref)
     links.push({
       label: "Profile",
-      href: hedera.profileUrl,
+      href: profileHref,
       title: `HCS-11 profile document. ${registered}`,
     });
   const registerHref = hashscanTxUrl(ROW_NETWORK, hedera.registerTx);

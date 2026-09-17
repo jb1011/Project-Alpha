@@ -21,6 +21,7 @@ import {
   hederaIdentityChip,
   hederaIdentityFromMetadata,
   hederaNetworkLabel,
+  httpsUrl,
   shortUaid,
 } from "@/lib/hedera/identity";
 import { shortenErr } from "@/lib/errors";
@@ -426,7 +427,7 @@ export function AgentDashboard({
                 label={`Hedera profile${hederaNet}`}
                 value="HCS-11 profile"
                 title={`The HCS-11 profile document a ${hederaNetworkLabel(hedera.network)} reader resolves this company by.`}
-                href={hedera.profileUrl}
+                href={httpsUrl(hedera.profileUrl)}
               />
             )}
             {hedera?.verifyUrl && (
