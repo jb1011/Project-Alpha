@@ -310,17 +310,24 @@ export function AgentDashboard({
                   {agentBookChip.label}
                 </span>
               ))}
-            {hederaChip && (
-              <a
-                href={hederaChip.href}
-                target="_blank"
-                rel="noreferrer"
-                title={hederaChip.title}
-                className={AGENTBOOK_CHIP_CLASS}
-              >
-                {hederaChip.label}
-              </a>
-            )}
+            {/* Linked only where there is a registration transaction to show. Same shape as the
+                AgentBook chip above: the claim is the chip, the link is a bonus. */}
+            {hederaChip &&
+              (hederaChip.href ? (
+                <a
+                  href={hederaChip.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={hederaChip.title}
+                  className={AGENTBOOK_CHIP_CLASS}
+                >
+                  {hederaChip.label}
+                </a>
+              ) : (
+                <span title={hederaChip.title} className={AGENTBOOK_CHIP_CLASS}>
+                  {hederaChip.label}
+                </span>
+              ))}
             {/* The second question, beside the first and never folded into it: AgentBook says
                 whether a human vouched, this says whether Novi's registry holds a legal body in
                 good standing. Two sources, two chips (design 2026-09-10 §1). */}
@@ -411,7 +418,7 @@ export function AgentDashboard({
                 label={`Hedera agent${hederaNet}`}
                 value={`#${hedera.hederaAgentId}`}
                 title={`Registered on ${hederaNetworkLabel(hedera.network)} as ERC-8004 agent ${hedera.hederaAgentId}.`}
-                href={hashscanTxUrl(hedera.network, hedera.registerTx) ?? hederaChip?.href}
+                href={hederaRegisterHref}
               />
             )}
             {hedera?.accountId && (

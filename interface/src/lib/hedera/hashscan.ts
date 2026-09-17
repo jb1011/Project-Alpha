@@ -38,7 +38,6 @@ function hashscanBase(network: HederaNetwork | null | undefined): string | null 
  */
 const TX_HASH = /^0x[0-9a-fA-F]{64}$/;
 const ACCOUNT_ID = /^\d+\.\d+\.\d+$/;
-const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
 export function hashscanTxUrl(
   network: HederaNetwork | null | undefined,
@@ -56,13 +55,4 @@ export function hashscanAccountUrl(
   const base = hashscanBase(network);
   if (!base || !accountId || !ACCOUNT_ID.test(accountId)) return undefined;
   return `${base}/account/${accountId}`;
-}
-
-export function hashscanContractUrl(
-  network: HederaNetwork | null | undefined,
-  address: string | null | undefined,
-): string | undefined {
-  const base = hashscanBase(network);
-  if (!base || !address || !EVM_ADDRESS.test(address)) return undefined;
-  return `${base}/contract/${address}`;
 }

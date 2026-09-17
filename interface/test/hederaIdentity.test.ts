@@ -10,7 +10,6 @@ import { describe, expect, test } from "vitest";
 import type { PublicMetadata, TransparencyHedera } from "@/lib/api/types";
 import {
   hashscanAccountUrl,
-  hashscanContractUrl,
   hashscanTxUrl,
   hederaNetworkOfChainId,
 } from "@/lib/hedera/hashscan";
@@ -57,7 +56,6 @@ test("FormationE2E_1 yields every field and a HashScan chip", () => {
     network: "testnet",
     uaid: UAID,
     hederaAgentId: "113",
-    registryAddress: HEDERA_IDENTITY_REGISTRY,
     accountId: "0.0.10450558",
     profileUrl: `https://www.novicorpus.com/backend/metadata/${PUBLIC_ID}/profile`,
     verifyUrl: `https://api.novicorpus.com/verify/${PUBLIC_ID}`,
@@ -98,16 +96,20 @@ describe("each field is independently optional", () => {
     expect(hederaIdentityChip(view)).toBeNull();
   });
 
-  test("Hedera registration without a tx links the chip at the registry contract", () => {
+  test("a registration with no tx states itself, and links nowhere", () => {
     const view = hederaIdentityFromMetadata({
       registrations: [
         { agentId: "113", agentRegistry: `eip155:296:${HEDERA_IDENTITY_REGISTRY}` },
       ],
     });
     expect(view?.hederaAgentId).toBe("113");
-    expect(hederaIdentityChip(view)?.href).toBe(
-      hashscanContractUrl("testnet", HEDERA_IDENTITY_REGISTRY),
-    );
+    // The registry CONTRACT is not this company's proof: every registered company shares it. So
+    // the chip keeps its claim, drops the href, and drops the arrow that promises one.
+    expect(hederaIdentityChip(view)).toEqual({
+      label: "Hedera identity",
+      title: "Registered on Hedera testnet as ERC-8004 agent 113.",
+    });
+    expect(hederaIdentityChip(view)).not.toHaveProperty("href");
   });
 
   test("a hedera block without a registration shows account and profile, not a chip", () => {
@@ -216,7 +218,6 @@ describe("the HashScan network comes from the registration's chain id", () => {
     // name, a HashScan url would be a guess.
     expect(hashscanTxUrl(view?.network, REGISTER_TX)).toBeUndefined();
     expect(hashscanAccountUrl(view?.network, "0.0.10450558")).toBeUndefined();
-    expect(hashscanContractUrl(undefined, HEDERA_IDENTITY_REGISTRY)).toBeUndefined();
   });
 
   test("the chain ids themselves", () => {
@@ -252,13 +253,6 @@ describe("every value is checked against its shape before it becomes a link", ()
     ).toBeUndefined();
     expect(hashscanAccountUrl("testnet", "0.0")).toBeUndefined();
     expect(hashscanAccountUrl("testnet", "not an account")).toBeUndefined();
-  });
-
-  test("a registry address is 0x + 40 hex, or there is no link", () => {
-    expect(hashscanContractUrl("testnet", HEDERA_IDENTITY_REGISTRY)).toBe(
-      `https://hashscan.io/testnet/contract/${HEDERA_IDENTITY_REGISTRY}`,
-    );
-    expect(hashscanContractUrl("testnet", "0xnothex")).toBeUndefined();
   });
 
   test("a profile url must be https, or the row is plain text", () => {

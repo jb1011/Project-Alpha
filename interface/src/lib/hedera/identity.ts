@@ -4,12 +4,7 @@ import type {
   PublicMetadata,
   TransparencyHedera,
 } from "@/lib/api/types";
-import {
-  type HederaNetwork,
-  hashscanContractUrl,
-  hashscanTxUrl,
-  hederaNetworkOfChainId,
-} from "@/lib/hedera/hashscan";
+import { type HederaNetwork, hashscanTxUrl, hederaNetworkOfChainId } from "@/lib/hedera/hashscan";
 
 /** Hedera testnet's chain id: the one chain the backend registers companies on today (its
  *  `registrationsFor` publishes `eip155:296:<registry>`). A transparency row carries no CAIP
@@ -91,7 +86,6 @@ export type HederaIdentityView = {
   network?: HederaNetwork;
   uaid?: string;
   hederaAgentId?: string;
-  registryAddress?: string;
   accountId?: string;
   profileUrl?: string;
   verifyUrl?: string;
@@ -102,7 +96,9 @@ export type HederaIdentityView = {
 export type HederaIdentityChip = {
   label: string;
   title: string;
-  href: string;
+  /** Absent when nothing can be linked. The chip still states the registration; it just does not
+   *  offer a click that would not show it. */
+  href?: string;
 };
 
 function hederaBlockOf(block: HederaMetadataBlock | undefined): HederaMetadataBlock | undefined {
@@ -129,7 +125,6 @@ export function hederaIdentityFromMetadata(
   const registration = hederaRegistrationOf(meta.registrations);
   const parsed = parseAgentRegistry(registration?.agentRegistry);
   const hederaAgentId = nonempty(registration?.agentId);
-  const registryAddress = parsed?.address;
   // WHICH Hedera network this company is registered on, read off the registration itself. Every
   // HashScan link below is built on it, and on nothing else.
   const network = hederaNetworkOfChainId(parsed?.chainId) ?? undefined;
@@ -139,7 +134,6 @@ export function hederaIdentityFromMetadata(
     network,
     uaid,
     hederaAgentId,
-    registryAddress,
     accountId: block?.accountId,
     profileUrl: block?.profileUrl,
     verifyUrl: block?.verifyUrl,
@@ -150,21 +144,24 @@ export function hederaIdentityFromMetadata(
 
 /**
  * The chip beside AgentBook. Only when a Hedera ERC-8004 registration exists: that is the line
- * that resolves the agent's Hedera identity. Prefer the HashScan transaction; fall back to the
- * registry contract. No registration → no chip, even if a UAID or float account is present.
+ * that resolves the agent's Hedera identity. No registration → no chip, even if a UAID or a
+ * linked account is present.
+ *
+ * THE LINK IS THE REGISTRATION TRANSACTION OR NOTHING. It used to fall back to the registry
+ * CONTRACT, a page every registered company shares, while the title said "Registered … as agent
+ * N": a click showed the reader something that verified none of that. With no transaction
+ * recorded the chip still states the registration, without an href and without the arrow that
+ * promises one.
  */
 export function hederaIdentityChip(
   view: HederaIdentityView | null | undefined,
 ): HederaIdentityChip | null {
   if (!view?.hederaAgentId) return null;
-  const href =
-    hashscanTxUrl(view.network, view.registerTx) ??
-    hashscanContractUrl(view.network, view.registryAddress);
-  if (!href) return null;
+  const href = hashscanTxUrl(view.network, view.registerTx);
   return {
-    label: "Hedera identity ↗",
+    label: href ? "Hedera identity ↗" : "Hedera identity",
     title: `Registered on ${hederaNetworkLabel(view.network)} as ERC-8004 agent ${view.hederaAgentId}.`,
-    href,
+    ...(href ? { href } : {}),
   };
 }
 
