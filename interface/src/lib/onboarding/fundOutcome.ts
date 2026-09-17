@@ -20,6 +20,8 @@
  * lives inside a `useEffect`.
  */
 
+import { ApiError } from "@/lib/api/types";
+
 /** How long the step watches before it admits it does not know. */
 export const FUND_POLL_TIMEOUT_MS = 90_000;
 
@@ -32,6 +34,52 @@ export const FUND_GENERIC_FAILURE_COPY = "Funding failed.";
 
 /** `{ error }` carries copy that is ALREADY public — the backend sanitises it (`publicError.ts`). */
 export type FundOutcome = "confirmed" | { error: string } | "timeout" | "keep-polling";
+
+/**
+ * ⚠ AN ANSWER THAT PREDATES THIS ATTEMPT IS NOT AN ANSWER (review I-R1, Critical).
+ *
+ * The poll's React Query key is the ENTITY, not the attempt (`apiKeys.entity`), it is shared with
+ * the deploy step and the dashboard, `enabled` only gates FETCHING, and `invalidateQueries` does
+ * not clear data. So the instant a retry flips polling back on, the effect is handed the failed
+ * attempt's cached body — measured at 27ms stale against @tanstack/query-core 5.101.1 — reads its
+ * `error`, and reports the retry as failed before a single poll of it has happened. Every
+ * subsequent retry does the same, while each underlying transfer may well be succeeding: the
+ * precise failure this branch exists to end.
+ *
+ * `dataUpdatedAt` is the right witness because it is the time the data was RECEIVED, and it is 0
+ * when there is none — which reads as "no answer yet" without a special case.
+ *
+ * Sound because `OnboardingRunner.fund` clears the stale error synchronously BEFORE it answers
+ * 202, so every GET issued after the mutation resolves reads a cleared row. The residual race is
+ * an in-flight GET from another observer of the same key landing just after `attemptStartedAt`
+ * with pre-clear data; not reachable in the wizard today (the deploy step is unmounted and a
+ * disabled query is not refetched by an invalidate), and it would cost one poll interval.
+ */
+export function answerForAttempt<T>(
+  polled: T | undefined,
+  dataUpdatedAt: number,
+  attemptStartedAt: number,
+): T | undefined {
+  return polled !== undefined && dataUpdatedAt >= attemptStartedAt ? polled : undefined;
+}
+
+/**
+ * Is this the backend saying "the PREVIOUS attempt is still running"?
+ *
+ * `OnboardingRunner.fund` answers 409 `entity is busy` while a saga is in flight — and "the saga
+ * is still running at 90 seconds" is precisely why the timeout fired in the first place. So the
+ * retry the timeout offers will, in the common case, come straight back with that refusal, and
+ * rendering it as a red error replaces an honest "the transfer may still land" with a failure that
+ * has not happened.
+ *
+ * Matched on the code AND the message because `conflict` also covers a real refusal (`cannot fund
+ * in status "pending"`), which is a different thing and must still be shown.
+ */
+export function isBusyConflict(e: unknown): boolean {
+  return (
+    e instanceof ApiError && e.code === "conflict" && /\bis busy\b/i.test(e.message)
+  );
+}
 
 /** The polled entity, narrowed to the two fields this decision reads. */
 export type PolledFunding = { status: string; error?: string | null };

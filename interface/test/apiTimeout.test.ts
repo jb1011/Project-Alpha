@@ -1,6 +1,12 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { healthCheck } from "@/lib/api/client";
-import { REQUEST_TIMEOUT_MS, TIMEOUT_MESSAGE, fetchWithTimeout } from "@/lib/api/timeout";
+import * as budgets from "@/lib/api/budgets";
+import { healthCheck, schedulePolicyUpdate } from "@/lib/api/client";
+import {
+  REQUEST_TIMEOUT_MS,
+  TIMEOUT_MESSAGE,
+  fetchWithTimeout,
+  readJsonBounded,
+} from "@/lib/api/timeout";
 import { ApiError } from "@/lib/api/types";
 
 /**
@@ -97,6 +103,93 @@ test("every client call carries a signal", async () => {
 
 test("the default budget is 30 seconds — long enough for a real call, short enough to end", () => {
   expect(REQUEST_TIMEOUT_MS).toBe(30_000);
+});
+
+/* ── Minors from the interface review ───────────────────────────────────────────────────────── */
+
+test("R4: an abort during the BODY read surfaces as the timeout, not as null data", () => {
+  // The silent failure in the file whose purpose is to end silent failures: headers at 29.5s, body
+  // cut at 30s, and `res.json().catch(() => null)` handed the caller `null` typed as `T`.
+  const aborted = {
+    json: async () => {
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    },
+  } as unknown as Response;
+  const err = readJsonBounded(aborted).catch((e: unknown) => e);
+  return err.then((e) => {
+    expect(e).toBeInstanceOf(ApiError);
+    expect((e as ApiError).code).toBe("timeout");
+  });
+});
+
+test("R4: a body that is simply not JSON still reads as null", () => {
+  // The behaviour the `.catch(() => null)` existed for — a 204, or an empty body — is unchanged.
+  const empty = {
+    json: async () => {
+      throw new SyntaxError("Unexpected end of JSON input");
+    },
+  } as unknown as Response;
+  return expect(readJsonBounded(empty)).resolves.toBeNull();
+});
+
+test("R5: a caller's own signal is COMPOSED with the budget, not overridden", async () => {
+  const seen: (AbortSignal | null | undefined)[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((_url: string, init?: RequestInit) => {
+      seen.push(init?.signal);
+      return new Promise<Response>((_res, rej) => {
+        init?.signal?.addEventListener("abort", () => rej(init.signal?.reason));
+      });
+    }),
+  );
+  const caller = new AbortController();
+  const pending = fetchWithTimeout("/backend/healthz", { signal: caller.signal }, 60_000).catch(
+    (e: unknown) => e,
+  );
+  // The CALLER aborts, long before the budget. That must not be reported as a slow server.
+  caller.abort(new DOMException("caller changed their mind", "AbortError"));
+  const err = await pending;
+  expect(err).not.toBeInstanceOf(ApiError);
+  // …and the signal handed to fetch is neither the caller's alone nor the budget's alone.
+  expect(seen[0]).toBeInstanceOf(AbortSignal);
+  expect(seen[0]).not.toBe(caller.signal);
+});
+
+test("R5: the budget still fires when a caller's signal is present", async () => {
+  vi.stubGlobal("fetch", stalledFetch());
+  const caller = new AbortController();
+  const err = await fetchWithTimeout("/backend/healthz", { signal: caller.signal }, 5).catch(
+    (e: unknown) => e,
+  );
+  expect(err).toBeInstanceOf(ApiError);
+  expect((err as ApiError).code).toBe("timeout");
+});
+
+test("R3/I-R2: a per-call budget reaches fetch, and the slow routes use the table", async () => {
+  // The knob existed and nothing turned it. These four calls hit handlers that broadcast and then
+  // wait for a receipt; on a direct-to-API deployment (NEXT_PUBLIC_API_URL set, no proxy) the 30s
+  // default reported a policy schedule that was mining as a timeout.
+  const fetchMock = vi.fn(
+    async (_url: string, _init?: RequestInit) =>
+      new Response(JSON.stringify({ txHash: "0x1" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  vi.spyOn(budgets, "clientBudgetMs");
+
+  await schedulePolicyUpdate("t", "0xabc", {
+    capUsdc: "1",
+    periodSeconds: 60,
+    allowlistOn: false,
+    payoutAddress: "0x0000000000000000000000000000000000000001",
+  });
+  // The client asks the shared table, with the method and path of the call it is making.
+  expect(budgets.clientBudgetMs).toHaveBeenCalledWith("POST", "/entities/0xabc/policy");
+  // …and the answer is the policy budget plus the client's margin, not the 30s default.
+  expect(budgets.clientBudgetMs("POST", "/entities/0xabc/policy")).toBe(245_000);
 });
 
 test("the copy says what happened and what to do, and claims nothing about the write", () => {

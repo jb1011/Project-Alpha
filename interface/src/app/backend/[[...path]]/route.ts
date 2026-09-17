@@ -4,6 +4,7 @@ import {
   forwardedResponseHeaders,
   isNoStorePath,
 } from "../../../lib/proxyHeaders";
+import { budgetMs } from "../../../lib/api/budgets";
 import {
   UPSTREAM_TIMEOUT_BODY,
   UPSTREAM_TIMEOUT_HEADERS,
@@ -54,9 +55,24 @@ async function proxy(
 
   // BOUNDED ON THE FIRST BYTE ONLY (2026-09-16). A backend that accepts the connection and then
   // goes quiet used to hold the browser's request open until something else gave up. The timer
-  // dies the moment the headers arrive, so the MCP endpoint's SSE bodies stream untouched — see
+  // dies the moment the headers arrive, so streamed bodies are never cut — see
   // ../../../lib/upstreamTimeout, where that lifetime is the thing under test.
-  const first = await fetchFirstByte((signal) => fetch(url, { ...init, signal }));
+  //
+  // ⚠ WHY THE MCP ENDPOINT IS SAFE UNDER A 25-SECOND FIRST-BYTE BUDGET, and what it depends on:
+  // the transport is built with `enableJsonResponse` UNSET (back/backend/src/mcp/transport.ts), so
+  // a POST /mcp answers `text/event-stream` headers in milliseconds — before the tool handler
+  // runs — and writes the JSON-RPC result later as an SSE event on the already-open body. A
+  // 90-second `onboard_agent` therefore never reaches this timer. Setting `enableJsonResponse:
+  // true` over there would make the headers wait for the whole tool call and this budget WOULD
+  // cut it; that endpoint would then need its own row in `@/lib/api/budgets`.
+  //
+  // The budget is per route (`budgetMs`): the payment-settle and policy handlers broadcast and
+  // then wait for a receipt, and a shared 25 seconds made this proxy the binding deadline on a
+  // transaction that was mining.
+  const first = await fetchFirstByte(
+    (signal) => fetch(url, { ...init, signal }),
+    budgetMs(req.method, joined),
+  );
   if (first.timedOut) {
     return NextResponse.json(UPSTREAM_TIMEOUT_BODY, {
       status: UPSTREAM_TIMEOUT_STATUS,
@@ -85,6 +101,17 @@ async function proxy(
   // Stream the body through (SSE responses must not be buffered).
   return new NextResponse(res.body, { status: res.status, headers: outHeaders });
 }
+
+/**
+ * Long enough for the longest budget in `@/lib/api/budgets` (the policy pair, 240s) plus the
+ * proxy's own overhead.
+ *
+ * Stated explicitly rather than inherited: there is no `vercel.json` and no runtime export in this
+ * app, so the effective limit today is the platform default — which has changed before and is not
+ * a number this route should discover in production. The budget table decides when to give up; the
+ * platform must not decide it first and answer with an error page that carries no envelope.
+ */
+export const maxDuration = 250;
 
 export const GET = proxy;
 export const POST = proxy;

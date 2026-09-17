@@ -48,16 +48,76 @@ function isTimeoutAbort(e: unknown): boolean {
  */
 export async function fetchWithTimeout(
   url: string,
-  init: RequestInit,
+  init: RequestInit = {},
   timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<Response> {
+  // A non-finite budget means NO deadline (a document download). `AbortSignal.timeout(Infinity)`
+  // throws, so this is a branch rather than a value.
+  const budget = Number.isFinite(timeoutMs) ? AbortSignal.timeout(timeoutMs) : undefined;
   try {
-    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    return await fetch(url, { ...init, signal: composeSignals(init.signal, budget) });
   } catch (e) {
-    if (isTimeoutAbort(e))
+    // ⚠ Everything EXCEPT the caller's own cancellation (review R5).
+    //
+    // Gating on `budget.aborted` alone was too narrow: the runtime raises `TimeoutError` for
+    // timeouts of its own (undici's headers/connect timeouts), and "the server took too long" is
+    // the right sentence for those too. The one case that must NOT wear it is a caller who
+    // cancelled deliberately — so that is the exclusion, rather than an allowlist of our own
+    // signal. When both fired, the caller's intent wins: we do not accuse a server of being slow
+    // for a request the user withdrew.
+    if (init.signal?.aborted !== true && isTimeoutAbort(e))
       // Status 0: no response arrived, so there is no HTTP status to report. Not 504 — that would
       // be a claim about a gateway that never spoke.
       throw new ApiError(0, { code: TIMEOUT_CODE, message: TIMEOUT_MESSAGE });
     throw e;
   }
+}
+
+/**
+ * `res.json()` under the same error contract — the body read is part of the exchange.
+ *
+ * The signal from `fetchWithTimeout` bounds the body too (deliberately: a body that stops arriving
+ * half way is as stuck as one that never starts), but the read itself happens at the CALL SITE,
+ * outside the mapped region. `request()` used to do `res.json().catch(() => null)`, so headers at
+ * 29.5 seconds and a body cut at 30 handed the caller `null` typed as `T` — a silent failure in
+ * the file whose whole purpose is to end silent failures.
+ *
+ * A body that is not JSON (a 204, an empty error body) still reads as `null`, which is what that
+ * `.catch` was for. Only an abort is promoted to the timeout error.
+ */
+export async function readJsonBounded<T>(res: Response): Promise<T | null> {
+  try {
+    return (await res.json()) as T;
+  } catch (e) {
+    if (isTimeoutAbort(e)) throw new ApiError(0, { code: TIMEOUT_CODE, message: TIMEOUT_MESSAGE });
+    return null;
+  }
+}
+
+/**
+ * The caller's signal AND ours, rather than ours replacing theirs.
+ *
+ * No caller passes one today, which is exactly why this is worth fixing now: `{ ...init, signal }`
+ * silently discarded it, so the first caller to try cancelling a request would have found that
+ * cancellation did nothing, with no error to explain it.
+ *
+ * `AbortSignal.any` is Node 20+/2023 browsers; the manual relay keeps this correct anywhere it is
+ * missing rather than trusting a target list.
+ */
+function composeSignals(
+  caller: AbortSignal | null | undefined,
+  budget: AbortSignal | undefined,
+): AbortSignal | undefined {
+  const signals = [caller, budget].filter((s): s is AbortSignal => !!s);
+  if (signals.length < 2) return signals[0];
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(signals);
+  const controller = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) {
+      controller.abort(s.reason);
+      break;
+    }
+    s.addEventListener("abort", () => controller.abort(s.reason), { once: true });
+  }
+  return controller.signal;
 }

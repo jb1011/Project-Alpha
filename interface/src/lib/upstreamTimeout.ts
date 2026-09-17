@@ -19,10 +19,17 @@
  * (that is the whole point), and a plain `setTimeout` is also the only form a test's clock can
  * drive — Node does not expose `AbortSignal.timeout`'s internal timer to fake timers.
  */
+import { DEFAULT_TTFB_BUDGET_MS } from "@/lib/api/budgets";
 
-/** The wait for the backend's headers. Under a typical serverless gateway limit, so the 504 below
- *  is what the browser sees rather than a platform error page with no envelope. */
-export const UPSTREAM_TTFB_TIMEOUT_MS = 25_000;
+/**
+ * The DEFAULT wait for the backend's headers.
+ *
+ * ⚠ Per-route budgets live in `@/lib/api/budgets` (`budgetMs`), which the route passes in: a
+ * single 25-second limit made this proxy the binding deadline on the payment-settle and policy
+ * routes, both of which broadcast and then wait for a receipt. This constant is only the
+ * fall-through, re-exported from the table so there is one number, not two.
+ */
+export const UPSTREAM_TTFB_TIMEOUT_MS = DEFAULT_TTFB_BUDGET_MS;
 
 export const UPSTREAM_TIMEOUT_STATUS = 504;
 
@@ -56,16 +63,21 @@ export type FirstByteResult = { timedOut: false; res: Response } | { timedOut: t
  */
 export async function fetchFirstByte(
   doFetch: (signal: AbortSignal) => Promise<Response>,
-  timeoutMs: number = UPSTREAM_TTFB_TIMEOUT_MS,
+  timeoutMs: number = DEFAULT_TTFB_BUDGET_MS,
 ): Promise<FirstByteResult> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // ⚠ A non-finite budget means NO TIMER, not a huge one: `setTimeout(fn, Infinity)` fires
+  // immediately in Node (TimeoutOverflowWarning clamps it to 1ms), so passing it through would
+  // turn "unbounded" into "instant 504" — the worst possible reading of the table.
+  const timer = Number.isFinite(timeoutMs)
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : undefined;
   try {
     return { timedOut: false, res: await doFetch(controller.signal) };
   } catch (e) {
     if (controller.signal.aborted) return { timedOut: true };
     throw e;
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

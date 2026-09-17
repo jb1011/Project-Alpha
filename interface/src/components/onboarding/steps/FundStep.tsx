@@ -8,7 +8,12 @@ import { useEntityFundPollQuery, useFundEntityMutation } from "@/lib/api/hooks";
 import { usdcToAtomic } from "@/lib/api/spec";
 import type { EntityView } from "@/lib/api/types";
 import { txUrl } from "@/lib/chain";
-import { FUND_TIMEOUT_COPY, fundPollOutcome } from "@/lib/onboarding/fundOutcome";
+import {
+  FUND_TIMEOUT_COPY,
+  answerForAttempt,
+  fundPollOutcome,
+  isBusyConflict,
+} from "@/lib/onboarding/fundOutcome";
 import {
   Button,
   Callout,
@@ -85,7 +90,13 @@ export function FundStep({
   // four, and the fourth is the one that stops the spinner honestly.
   useEffect(() => {
     if (!pollFunding || pollStartedAt === null) return;
-    const outcome = fundPollOutcome(fundPoll.data, now - pollStartedAt);
+    // ⚠ `answerForAttempt` first (review I-R1). React Query serves the PREVIOUS attempt's body the
+    // instant polling is re-enabled — the key is the entity, not the attempt — so without this the
+    // retry reports the old failure one frame after it starts, and stops polling.
+    const outcome = fundPollOutcome(
+      answerForAttempt(fundPoll.data, fundPoll.dataUpdatedAt, pollStartedAt),
+      now - pollStartedAt,
+    );
     if (outcome === "keep-polling") return;
     setPollFunding(false);
     if (outcome === "confirmed") {
@@ -98,7 +109,7 @@ export function FundStep({
       setStatus("error");
       setError(outcome.error);
     }
-  }, [fundPoll.data, now, pollFunding, pollStartedAt]);
+  }, [fundPoll.data, fundPoll.dataUpdatedAt, now, pollFunding, pollStartedAt]);
 
   const treasury = entity?.treasury;
   const amountNum = Number(amount);
@@ -125,6 +136,17 @@ export function FundStep({
       setNow(Date.now());
       setPollFunding(true);
     } catch (e) {
+      // "The previous attempt is still running" is not a failure — and after a 90-second timeout
+      // it is the LIKELY answer, because the saga still being in flight is why the timeout fired.
+      // Keep the honest callout, restart the clock, and keep watching.
+      if (isBusyConflict(e)) {
+        setStatus("timeout");
+        setError(null);
+        setPollStartedAt(Date.now());
+        setNow(Date.now());
+        setPollFunding(true);
+        return;
+      }
       setStatus("error");
       // `e` is an `ApiError` for anything the API answered or failed to answer — its message is
       // the backend's own error envelope (or, for a timeout, this client's sentence). Nothing raw
@@ -208,22 +230,34 @@ export function FundStep({
                 </div>
               </div>
 
+              {/* `role="alert"` / `role="status"` on the three new lines: nothing else in this
+                  codebase announces, so a screen-reader user got no notification at all that an
+                  attempt had ended. */}
               {error && (
-                <p className="text-[11.5px] text-[#ff8a84]">{error}</p>
+                <p role="alert" className="text-[11.5px] text-[#ff8a84]">
+                  {error}
+                </p>
               )}
 
               {/* We stopped watching; we did NOT decide. `warn`, not `alarm`, and no claim of
                   failure — the transfer may already have landed. */}
               {timedOut && (
-                <Callout tone="warn" title="Still waiting">
-                  {FUND_TIMEOUT_COPY}
-                </Callout>
+                <div role="status">
+                  <Callout tone="warn" title="Still waiting">
+                    {FUND_TIMEOUT_COPY}
+                  </Callout>
+                </div>
               )}
 
               {/* The 2026-09-16 spinner, explained: the request has not been sent yet because the
                   session expired and MetaMask is asking for a signature somewhere out of sight. */}
               {waitingForWallet && (
-                <p className="flex items-center gap-2 text-[11.5px] text-[#f3cd72]">
+                <p
+                  role="status"
+                  className="flex items-center gap-2 text-[11.5px] text-[#f3cd72]"
+                >
+                  {/* `Spinner` is already `aria-hidden` (primitives.tsx), so the live region
+                      announces the sentence and not the decoration. */}
                   <Spinner className="h-3.5 w-3.5" />
                   {WALLET_WAIT_COPY}
                 </p>
