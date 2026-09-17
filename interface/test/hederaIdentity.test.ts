@@ -8,7 +8,12 @@
  */
 import { describe, expect, test } from "vitest";
 import type { PublicMetadata, TransparencyHedera } from "@/lib/api/types";
-import { hashscanAccountUrl, hashscanContractUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
+import {
+  hashscanAccountUrl,
+  hashscanContractUrl,
+  hashscanTxUrl,
+  hederaNetworkOfChainId,
+} from "@/lib/hedera/hashscan";
 import {
   HEDERA_IDENTITY_REGISTRY,
   hederaIdentityChip,
@@ -48,6 +53,7 @@ const FORMATION_E2E: PublicMetadata = {
 test("FormationE2E_1 yields every field and a HashScan chip", () => {
   const view = hederaIdentityFromMetadata(FORMATION_E2E);
   expect(view).toEqual({
+    network: "testnet",
     uaid: UAID,
     hederaAgentId: "113",
     registryAddress: HEDERA_IDENTITY_REGISTRY,
@@ -60,9 +66,9 @@ test("FormationE2E_1 yields every field and a HashScan chip", () => {
   expect(hederaIdentityChip(view)).toEqual({
     label: "Hedera identity ↗",
     title: "Registered on Hedera testnet as ERC-8004 agent 113.",
-    href: hashscanTxUrl(REGISTER_TX),
+    href: `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
   });
-  expect(hashscanAccountUrl(view!.accountId!)).toBe(
+  expect(hashscanAccountUrl(view!.network, view!.accountId)).toBe(
     "https://hashscan.io/testnet/account/0.0.10450558",
   );
 });
@@ -98,7 +104,9 @@ describe("each field is independently optional", () => {
       ],
     });
     expect(view?.hederaAgentId).toBe("113");
-    expect(hederaIdentityChip(view)?.href).toBe(hashscanContractUrl(HEDERA_IDENTITY_REGISTRY));
+    expect(hederaIdentityChip(view)?.href).toBe(
+      hashscanContractUrl("testnet", HEDERA_IDENTITY_REGISTRY),
+    );
   });
 
   test("a hedera block without a registration shows account and profile, not a chip", () => {
@@ -156,10 +164,66 @@ test("a registered row links the profile and the registration, and nothing else"
     },
     {
       label: "Hedera register",
-      href: hashscanTxUrl(REGISTER_TX),
+      href: `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
       title: "Registered on Hedera testnet as ERC-8004 agent 113.",
     },
   ]);
+});
+
+// ── The network segment is derived, never assumed (L1) ────────────────────────────────────────
+
+describe("the HashScan network comes from the registration's chain id", () => {
+  const registered = (chainId: string) =>
+    hederaIdentityFromMetadata({
+      registrations: [
+        { agentId: "113", agentRegistry: `eip155:${chainId}:${HEDERA_IDENTITY_REGISTRY}` },
+      ],
+      hedera: { accountId: "0.0.10450558", registerTx: REGISTER_TX },
+    });
+
+  test("296 is testnet", () => {
+    const view = registered("296");
+    expect(view?.network).toBe("testnet");
+    expect(hashscanTxUrl(view?.network, REGISTER_TX)).toBe(
+      `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
+    );
+    expect(hashscanAccountUrl(view?.network, "0.0.10450558")).toBe(
+      "https://hashscan.io/testnet/account/0.0.10450558",
+    );
+  });
+
+  test("295 is mainnet, and every link follows it", () => {
+    const view = registered("295");
+    expect(view?.network).toBe("mainnet");
+    expect(hederaIdentityChip(view)).toEqual({
+      label: "Hedera identity ↗",
+      title: "Registered on Hedera mainnet as ERC-8004 agent 113.",
+      href: `https://hashscan.io/mainnet/transaction/${REGISTER_TX}`,
+    });
+    expect(hashscanAccountUrl(view?.network, "0.0.10450558")).toBe(
+      "https://hashscan.io/mainnet/account/0.0.10450558",
+    );
+  });
+
+  test("a chain that is not Hedera's is not a Hedera registration, and builds no link", () => {
+    // Arc's own registry entry sits in the same array, and has always been someone else's chain.
+    const view = registered("5042002");
+    expect(view?.network).toBeUndefined();
+    expect(view?.hederaAgentId).toBeUndefined();
+    expect(hederaIdentityChip(view)).toBeNull();
+    // The `hedera` block is still read (the account and the tx are there), but with no chain to
+    // name, a HashScan url would be a guess.
+    expect(hashscanTxUrl(view?.network, REGISTER_TX)).toBeUndefined();
+    expect(hashscanAccountUrl(view?.network, "0.0.10450558")).toBeUndefined();
+    expect(hashscanContractUrl(undefined, HEDERA_IDENTITY_REGISTRY)).toBeUndefined();
+  });
+
+  test("the chain ids themselves", () => {
+    expect(hederaNetworkOfChainId("296")).toBe("testnet");
+    expect(hederaNetworkOfChainId(295)).toBe("mainnet");
+    expect(hederaNetworkOfChainId("1")).toBeNull();
+    expect(hederaNetworkOfChainId(undefined)).toBeNull();
+  });
 });
 
 test("no row, or a row with only an agent id, links nothing", () => {

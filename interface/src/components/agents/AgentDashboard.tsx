@@ -20,6 +20,7 @@ import { hashscanAccountUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
 import {
   hederaIdentityChip,
   hederaIdentityFromMetadata,
+  hederaNetworkLabel,
   shortUaid,
 } from "@/lib/hedera/identity";
 import { shortenErr } from "@/lib/errors";
@@ -89,6 +90,11 @@ export function AgentDashboard({
   const agentBookChip = agentBookChipState(agentBookQuery.data);
   const hedera = hederaIdentityFromMetadata(metadataQuery.data);
   const hederaChip = hederaIdentityChip(hedera);
+  /** " (testnet)" / " (mainnet)", or nothing at all where the registration named no chain we
+   *  know: a label may not name a network the links could not be built on. */
+  const hederaNet = hedera?.network ? ` (${hedera.network})` : "";
+  /** The registration transaction on HashScan, on the registration's OWN network. */
+  const hederaRegisterHref = hashscanTxUrl(hedera?.network, hedera?.registerTx);
   const agentBookView = agentBookQuery.data ?? null;
   /** The address both questions are about: the pocket that signs AgentKit challenges and pays
    *  x402 invoices. It is what AgentBook binds and what a seller looks up. */
@@ -397,28 +403,29 @@ export function AgentDashboard({
               />
             )}
             {/* Which chain, in the label: these rows sit among Arc facts, and a bare "Hedera
-                agent" beside them would leave a reader to assume the network. */}
+                agent" beside them would leave a reader to assume the network. The network is the
+                registration's own, never this file's guess, so an unknown chain names none. */}
             {hedera?.hederaAgentId && (
               <OnChainRow
-                label="Hedera agent (testnet)"
+                label={`Hedera agent${hederaNet}`}
                 value={`#${hedera.hederaAgentId}`}
-                title={`Registered on Hedera testnet as ERC-8004 agent ${hedera.hederaAgentId}.`}
-                href={hedera.registerTx ? hashscanTxUrl(hedera.registerTx) : hederaChip?.href}
+                title={`Registered on ${hederaNetworkLabel(hedera.network)} as ERC-8004 agent ${hedera.hederaAgentId}.`}
+                href={hashscanTxUrl(hedera.network, hedera.registerTx) ?? hederaChip?.href}
               />
             )}
             {hedera?.accountId && (
               <OnChainRow
-                label="Hedera account (testnet)"
+                label={`Hedera account${hederaNet}`}
                 value={hedera.accountId}
-                title="The Hedera testnet account this agent's key is linked to."
-                href={hashscanAccountUrl(hedera.accountId)}
+                title={`The ${hederaNetworkLabel(hedera.network)} account this agent's key is linked to.`}
+                href={hashscanAccountUrl(hedera.network, hedera.accountId)}
               />
             )}
             {hedera?.profileUrl && (
               <OnChainRow
-                label="Hedera profile (testnet)"
+                label={`Hedera profile${hederaNet}`}
                 value="HCS-11 profile"
-                title="The HCS-11 profile document a Hedera testnet reader resolves this company by."
+                title={`The HCS-11 profile document a ${hederaNetworkLabel(hedera.network)} reader resolves this company by.`}
                 href={hedera.profileUrl}
               />
             )}
@@ -445,12 +452,12 @@ export function AgentDashboard({
             {entity.createTxHash && <TxLink hash={entity.createTxHash} label="Create tx" />}
             {entity.bindTxHash && <TxLink hash={entity.bindTxHash} label="Bind tx" />}
             {entity.fundTxHash && <TxLink hash={entity.fundTxHash} label="Fund tx" />}
-            {hedera?.registerTx && (
+            {hederaRegisterHref && (
               <a
-                href={hashscanTxUrl(hedera.registerTx)}
+                href={hederaRegisterHref}
                 target="_blank"
                 rel="noreferrer"
-                title="The registration transaction on Hedera testnet, on HashScan."
+                title={`The registration transaction on ${hederaNetworkLabel(hedera?.network)}, on HashScan.`}
                 className="inline-flex items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft"
               >
                 Hedera register
