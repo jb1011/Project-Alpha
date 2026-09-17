@@ -7,7 +7,7 @@
  * there. FormationE2E_1's real prod shape is the fixture; an empty document is the other pole.
  */
 import { describe, expect, test } from "vitest";
-import type { PublicMetadata } from "@/lib/api/types";
+import type { PublicMetadata, TransparencyHedera } from "@/lib/api/types";
 import { hashscanAccountUrl, hashscanContractUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
 import {
   HEDERA_IDENTITY_REGISTRY,
@@ -62,10 +62,6 @@ test("FormationE2E_1 yields every field and a HashScan chip", () => {
     title: "Registered on Hedera testnet as ERC-8004 agent 113.",
     href: hashscanTxUrl(REGISTER_TX),
   });
-  expect(hederaTransparencyLinks(view)).toEqual([
-    { label: "Profile", href: view!.profileUrl },
-    { label: "Hedera register", href: hashscanTxUrl(REGISTER_TX) },
-  ]);
   expect(hashscanAccountUrl(view!.accountId!)).toBe(
     "https://hashscan.io/testnet/account/0.0.10450558",
   );
@@ -86,7 +82,6 @@ test("no Hedera identity at all → nothing to render", () => {
     }),
   ).toBeNull();
   expect(hederaIdentityChip(null)).toBeNull();
-  expect(hederaTransparencyLinks(null)).toEqual([]);
 });
 
 describe("each field is independently optional", () => {
@@ -94,7 +89,6 @@ describe("each field is independently optional", () => {
     const view = hederaIdentityFromMetadata({ uaid: UAID });
     expect(view).toEqual({ uaid: UAID });
     expect(hederaIdentityChip(view)).toBeNull();
-    expect(hederaTransparencyLinks(view)).toEqual([]);
   });
 
   test("Hedera registration without a tx links the chip at the registry contract", () => {
@@ -105,9 +99,6 @@ describe("each field is independently optional", () => {
     });
     expect(view?.hederaAgentId).toBe("113");
     expect(hederaIdentityChip(view)?.href).toBe(hashscanContractUrl(HEDERA_IDENTITY_REGISTRY));
-    expect(hederaTransparencyLinks(view)).toEqual([
-      { label: "Hedera identity", href: hashscanContractUrl(HEDERA_IDENTITY_REGISTRY) },
-    ]);
   });
 
   test("a hedera block without a registration shows account and profile, not a chip", () => {
@@ -122,9 +113,6 @@ describe("each field is independently optional", () => {
       profileUrl: "https://www.novicorpus.com/backend/metadata/x/profile",
     });
     expect(hederaIdentityChip(view)).toBeNull();
-    expect(hederaTransparencyLinks(view)).toEqual([
-      { label: "Profile", href: "https://www.novicorpus.com/backend/metadata/x/profile" },
-    ]);
   });
 
   test("empty strings are treated as absent", () => {
@@ -136,13 +124,41 @@ describe("each field is independently optional", () => {
     ).toBeNull();
   });
 
-  test("the paid verifyUrl is never a transparency link", () => {
+  test("the paid verifyUrl is read, and stays on the owner's dashboard", () => {
     const view = hederaIdentityFromMetadata({
       hedera: { verifyUrl: `https://api.novicorpus.com/verify/${PUBLIC_ID}` },
     });
     expect(view?.verifyUrl).toBe(`https://api.novicorpus.com/verify/${PUBLIC_ID}`);
-    expect(hederaTransparencyLinks(view)).toEqual([]);
   });
+});
+
+// ── The public transparency row (GET /transparency) ───────────────────────────────────────────
+//
+// The page renders these links from the ROW, with no request of its own: the backend publishes
+// the same facts per row that `/metadata/:publicId` carries. The row has no `verifyUrl` field at
+// all, which is how the paid link stays off the free page.
+
+/** FormationE2E_1's row, as the backend's `hederaFactsOf` builds it. */
+const ROW: TransparencyHedera = {
+  agentId: "113",
+  registerTx: REGISTER_TX,
+  profileUrl: `https://www.novicorpus.com/backend/metadata/${PUBLIC_ID}/profile`,
+  uaid: UAID,
+};
+
+test("a registered row links the profile and the registration, and nothing else", () => {
+  expect(hederaTransparencyLinks(ROW)).toEqual([
+    { label: "Profile", href: ROW.profileUrl },
+    { label: "Hedera register", href: hashscanTxUrl(REGISTER_TX) },
+  ]);
+});
+
+test("no row, or a row with only an agent id, links nothing", () => {
+  expect(hederaTransparencyLinks(undefined)).toEqual([]);
+  expect(hederaTransparencyLinks(null)).toEqual([]);
+  // An entity registered but not yet anchored to a tx or a profile: the row exists, and there is
+  // still nothing a stranger could click through to.
+  expect(hederaTransparencyLinks({ agentId: "113" })).toEqual([]);
 });
 
 test("publicId is the UUID tail of an https metadataURI, and nothing else", () => {

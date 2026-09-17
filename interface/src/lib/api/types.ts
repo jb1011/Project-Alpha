@@ -253,6 +253,21 @@ export type TransparencyEntity = {
     status: FormationStatus;
     environment: "sandbox" | "production";
   } | null;
+  /** The Hedera registration, published ON THE ROW (see `hederaFactsOf` in the backend's
+   *  transparency route) so this page needs no second request per entity. Absent whenever the
+   *  deployment does not run the rail or the entity was never registered; never a null. */
+  hedera?: TransparencyHedera;
+};
+
+/**
+ * The Hedera facts a transparency row may carry. Every field but `agentId` is independently
+ * optional, and the paid `/verify` url is deliberately not among them: this is the free surface.
+ */
+export type TransparencyHedera = {
+  agentId: string;
+  registerTx?: string;
+  profileUrl?: string;
+  uaid?: string;
 };
 
 /** Public transparency surface: platform stats + the on-chain entity registry. */

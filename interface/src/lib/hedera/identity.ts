@@ -1,4 +1,9 @@
-import type { AgentRegistration, HederaMetadataBlock, PublicMetadata } from "@/lib/api/types";
+import type {
+  AgentRegistration,
+  HederaMetadataBlock,
+  PublicMetadata,
+  TransparencyHedera,
+} from "@/lib/api/types";
 import { hashscanContractUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
 
 /** Hedera testnet CAIP-2. The ERC-8004 identity registry lives on chain 296. */
@@ -117,17 +122,21 @@ export function hederaIdentityChip(view: HederaIdentityView | null | undefined):
   };
 }
 
-/** Extra verify links for the public transparency row. Never includes the paid `/verify` URL. */
+/**
+ * Extra verify links for the public transparency row, built from the row ITSELF.
+ *
+ * Pure, and takes no dependency on `/metadata/:publicId`: GET /transparency publishes these facts
+ * per row, so the page renders them with no request of its own. Never includes the paid `/verify`
+ * url, which the backend does not publish here either.
+ */
 export function hederaTransparencyLinks(
-  view: HederaIdentityView | null | undefined,
+  hedera: TransparencyHedera | null | undefined,
 ): { label: string; href: string }[] {
-  if (!view) return [];
+  if (!hedera) return [];
   const links: { label: string; href: string }[] = [];
-  if (view.profileUrl) links.push({ label: "Profile", href: view.profileUrl });
-  if (view.registerTx) {
-    links.push({ label: "Hedera register", href: hashscanTxUrl(view.registerTx) });
-  } else if (view.hederaAgentId && view.registryAddress) {
-    links.push({ label: "Hedera identity", href: hashscanContractUrl(view.registryAddress) });
+  if (hedera.profileUrl) links.push({ label: "Profile", href: hedera.profileUrl });
+  if (hedera.registerTx) {
+    links.push({ label: "Hedera register", href: hashscanTxUrl(hedera.registerTx) });
   }
   return links;
 }

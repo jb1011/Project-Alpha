@@ -4,14 +4,11 @@ import { useEffect, useState } from "react";
 import { Footer } from "@/components/landing/Footer";
 import { Nav } from "@/components/landing/Nav";
 import { SectionLabel } from "@/components/landing/SectionLabel";
-import { getPublicMetadata, getTransparency } from "@/lib/api/client";
+import { getTransparency } from "@/lib/api/client";
 import type { TransparencyEntity, TransparencyView } from "@/lib/api/types";
 import { API_URL } from "@/lib/api/config";
 import { addressUrl } from "@/lib/chain";
-import {
-  hederaIdentityFromMetadata,
-  hederaTransparencyLinks,
-} from "@/lib/hedera/identity";
+import { hederaTransparencyLinks } from "@/lib/hedera/identity";
 
 /** Atomic USDC (6 decimals) -> "1,234.56". Display-only, so float precision is fine. */
 function formatAtomicUsdc(atomic: string): string {
@@ -62,6 +59,12 @@ function HumanChip({ entity }: { entity: TransparencyEntity }) {
   );
 }
 
+/**
+ * Every link on a row, Arcscan and HashScan alike, built from the row the page already has.
+ *
+ * The Hedera ones used to come from a per-row fetch of GET /metadata/:publicId — one uncached
+ * request per entity, every page view. /transparency publishes those facts itself now.
+ */
 function VerifyLinks({ entity }: { entity: TransparencyEntity }) {
   const links: { label: string; href: string }[] = [];
   if (entity.legalManager)
@@ -70,6 +73,7 @@ function VerifyLinks({ entity }: { entity: TransparencyEntity }) {
     links.push({ label: "Treasury", href: addressUrl(entity.treasury) });
   if (entity.publicId)
     links.push({ label: "Metadata", href: `${API_URL}/metadata/${entity.publicId}` });
+  links.push(...hederaTransparencyLinks(entity.hedera));
   return (
     <span className="flex flex-wrap gap-x-3 gap-y-1">
       {links.map((l) => (
@@ -83,48 +87,7 @@ function VerifyLinks({ entity }: { entity: TransparencyEntity }) {
           {l.label} ↗
         </a>
       ))}
-      {entity.publicId && <HederaVerifyLinks publicId={entity.publicId} />}
     </span>
-  );
-}
-
-/**
- * Extra HashScan / profile links, only when GET /metadata/:publicId carries a Hedera identity.
- * Fetched per row because /transparency does not yet publish these fields; a miss or a 404
- * renders nothing, which is the same silence as an entity that was never linked.
- */
-function HederaVerifyLinks({ publicId }: { publicId: string }) {
-  const [links, setLinks] = useState<{ label: string; href: string }[]>([]);
-
-  useEffect(() => {
-    let cancelled = false;
-    getPublicMetadata(publicId)
-      .then((meta) => {
-        if (!cancelled) setLinks(hederaTransparencyLinks(hederaIdentityFromMetadata(meta)));
-      })
-      .catch(() => {
-        if (!cancelled) setLinks([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [publicId]);
-
-  if (links.length === 0) return null;
-  return (
-    <>
-      {links.map((l) => (
-        <a
-          key={l.label}
-          href={l.href}
-          target="_blank"
-          rel="noreferrer"
-          className="whitespace-nowrap text-[13px] text-accent underline-offset-2 hover:underline"
-        >
-          {l.label} ↗
-        </a>
-      ))}
-    </>
   );
 }
 
