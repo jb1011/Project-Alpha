@@ -1,4 +1,5 @@
 import { API_URL } from "./config";
+import { fetchWithTimeout } from "./timeout";
 import type {
   AgentBookRegisterBody,
   AgentBookRegisterResult,
@@ -44,6 +45,9 @@ type RequestOpts = {
   method?: string;
   token?: string;
   body?: unknown;
+  /** Override the 30-second default (`REQUEST_TIMEOUT_MS`). A call that legitimately takes longer
+   *  than half a minute should say so here rather than have the default raised for everyone. */
+  timeoutMs?: number;
 };
 
 /**
@@ -78,11 +82,18 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
   if (opts.body !== undefined) headers["content-type"] = "application/json";
   if (opts.token) headers.authorization = `Bearer ${opts.token}`;
 
-  const res = await fetch(`${API_URL}${path}`, {
-    method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
-    headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
+  // BOUNDED (2026-09-16). `fetch` has no default timeout, so a stalled backend used to be an
+  // infinite spinner with no error to render. `fetchWithTimeout` maps an expiry onto the same
+  // `ApiError` shape every other failure here already takes, with the code `timeout`.
+  const res = await fetchWithTimeout(
+    `${API_URL}${path}`,
+    {
+      method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    },
+    opts.timeoutMs,
+  );
 
   await throwIfNotOk(res);
   return (await res.json().catch(() => null)) as T;

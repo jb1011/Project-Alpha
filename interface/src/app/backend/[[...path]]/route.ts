@@ -4,6 +4,12 @@ import {
   forwardedResponseHeaders,
   isNoStorePath,
 } from "../../../lib/proxyHeaders";
+import {
+  UPSTREAM_TIMEOUT_BODY,
+  UPSTREAM_TIMEOUT_HEADERS,
+  UPSTREAM_TIMEOUT_STATUS,
+  fetchFirstByte,
+} from "../../../lib/upstreamTimeout";
 
 function apiTarget(): string {
   const configured = process.env.API_PROXY_TARGET?.trim();
@@ -46,7 +52,18 @@ async function proxy(
     init.body = await req.text();
   }
 
-  const res = await fetch(url, init);
+  // BOUNDED ON THE FIRST BYTE ONLY (2026-09-16). A backend that accepts the connection and then
+  // goes quiet used to hold the browser's request open until something else gave up. The timer
+  // dies the moment the headers arrive, so the MCP endpoint's SSE bodies stream untouched — see
+  // ../../../lib/upstreamTimeout, where that lifetime is the thing under test.
+  const first = await fetchFirstByte((signal) => fetch(url, { ...init, signal }));
+  if (first.timedOut) {
+    return NextResponse.json(UPSTREAM_TIMEOUT_BODY, {
+      status: UPSTREAM_TIMEOUT_STATUS,
+      headers: UPSTREAM_TIMEOUT_HEADERS,
+    });
+  }
+  const res = first.res;
 
   // Which headers may cross depends on the ROUTE and on what the backend actually answered (C9):
   // the four download headers are forwarded only for the document bytes route, and
