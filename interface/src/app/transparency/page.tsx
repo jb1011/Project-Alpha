@@ -8,6 +8,7 @@ import { getTransparency } from "@/lib/api/client";
 import type { TransparencyEntity, TransparencyView } from "@/lib/api/types";
 import { API_URL } from "@/lib/api/config";
 import { addressUrl } from "@/lib/chain";
+import { hederaTransparencyLinks } from "@/lib/hedera/identity";
 
 /** Atomic USDC (6 decimals) -> "1,234.56". Display-only, so float precision is fine. */
 function formatAtomicUsdc(atomic: string): string {
@@ -58,14 +59,21 @@ function HumanChip({ entity }: { entity: TransparencyEntity }) {
   );
 }
 
+/**
+ * Every link on a row, Arcscan and HashScan alike, built from the row the page already has.
+ *
+ * The Hedera ones used to come from a per-row fetch of GET /metadata/:publicId — one uncached
+ * request per entity, every page view. /transparency publishes those facts itself now.
+ */
 function VerifyLinks({ entity }: { entity: TransparencyEntity }) {
-  const links: { label: string; href: string }[] = [];
+  const links: { label: string; href: string; title?: string }[] = [];
   if (entity.legalManager)
     links.push({ label: "LegalManager", href: addressUrl(entity.legalManager) });
   if (entity.treasury)
     links.push({ label: "Treasury", href: addressUrl(entity.treasury) });
   if (entity.publicId)
     links.push({ label: "Metadata", href: `${API_URL}/metadata/${entity.publicId}` });
+  links.push(...hederaTransparencyLinks(entity.hedera));
   return (
     <span className="flex flex-wrap gap-x-3 gap-y-1">
       {links.map((l) => (
@@ -74,6 +82,7 @@ function VerifyLinks({ entity }: { entity: TransparencyEntity }) {
           href={l.href}
           target="_blank"
           rel="noreferrer"
+          title={l.title}
           className="whitespace-nowrap text-[13px] text-accent underline-offset-2 hover:underline"
         >
           {l.label} ↗
@@ -115,7 +124,9 @@ export default function TransparencyPage() {
               Novi Corpus runs on Arc testnet. Every entity below is a real
               on-chain deployment: its own governance contracts, an ERC-8004
               identity, and USDC job settlements. Nothing on this page requires
-              trusting us: every row links to Arcscan.
+              trusting us: every row links to Arcscan. Companies that also hold
+              an ERC-8004 registration on Hedera link to HashScan as well, on
+              Hedera testnet.
             </p>
           </div>
         </section>

@@ -27,6 +27,7 @@ import type {
   LegalBodyLookup,
   PasskeyView,
   PublicConfig,
+  PublicMetadata,
   ReputationView,
   SettlePaymentResult,
   TransparencyView,
@@ -137,6 +138,23 @@ export async function getTransparency(): Promise<TransparencyView> {
  */
 export async function getLegalBody(address: string): Promise<LegalBodyLookup> {
   return request(`/legal-bodies/${encodeURIComponent(address)}`);
+}
+
+/**
+ * The public metadata document — no auth (GET /metadata/:publicId).
+ *
+ * 404 is a real answer here ("no document"), not a transport failure: Hedera fields are absent
+ * until a VPS/MCP step writes them, and an unknown publicId is the same silence. The UI hides
+ * every Hedera line in that case, so this returns `null` rather than throwing. Other statuses
+ * still throw (`ApiError`), same as every other public read.
+ */
+export async function getPublicMetadata(publicId: string): Promise<PublicMetadata | null> {
+  try {
+    return await request<PublicMetadata>(`/metadata/${encodeURIComponent(publicId)}`);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
 }
 
 export async function onboardEntity(

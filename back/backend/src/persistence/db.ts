@@ -854,6 +854,28 @@ export function migrate(db: Database.Database): void {
   ] as const)
     if (!payCols.includes(col)) db.exec(`ALTER TABLE formation_payments ADD COLUMN ${col} ${type}`);
 
+  // Hedera rail (design 2026-09-10 D5, D24): network is NULL for every Arc row, so a mainnet
+  // flip never mislabels history; the partial unique index is what makes a reported Hedera
+  // transaction id count once.
+  const ledgerCols = (
+    db.prepare("PRAGMA table_info(payments_ledger)").all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!ledgerCols.includes("network"))
+    db.exec("ALTER TABLE payments_ledger ADD COLUMN network TEXT");
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_ledger_network_ref ON payments_ledger(network, batch_ref) WHERE network IS NOT NULL",
+  );
+  for (const [col, type] of [
+    ["hedera_account_id", "TEXT"],
+    ["hedera_agent_public_key", "TEXT"],
+    ["hedera_guardian_public_key", "TEXT"],
+    ["hedera_linked_at", "INTEGER"],
+    ["hedera_agent_id", "TEXT"],
+    ["hedera_register_tx", "TEXT"],
+    ["uaid", "TEXT"],
+  ] as const)
+    if (!cols.includes(col)) db.exec(`ALTER TABLE entities ADD COLUMN ${col} ${type}`);
+
   // formation_requests.next_poll_at: ALTER-if-missing, the house idiom. A database created by
   // PR 2's first migration has the column; one created by an earlier build of PR 2 does not, and
   // a NULL there reads as "never polled", which is exactly right for every existing row.
