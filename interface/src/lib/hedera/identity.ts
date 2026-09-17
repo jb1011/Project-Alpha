@@ -131,12 +131,24 @@ export function hederaIdentityChip(view: HederaIdentityView | null | undefined):
  */
 export function hederaTransparencyLinks(
   hedera: TransparencyHedera | null | undefined,
-): { label: string; href: string }[] {
+): { label: string; href: string; title: string }[] {
   if (!hedera) return [];
-  const links: { label: string; href: string }[] = [];
-  if (hedera.profileUrl) links.push({ label: "Profile", href: hedera.profileUrl });
+  // The SAME sentence the dashboard chip carries, so the two surfaces name the same chain in the
+  // same words. A link labeled "Profile" beside three Arcscan links must say where it goes.
+  const registered = `Registered on Hedera testnet as ERC-8004 agent ${hedera.agentId}.`;
+  const links: { label: string; href: string; title: string }[] = [];
+  if (hedera.profileUrl)
+    links.push({
+      label: "Profile",
+      href: hedera.profileUrl,
+      title: `HCS-11 profile document. ${registered}`,
+    });
   if (hedera.registerTx) {
-    links.push({ label: "Hedera register", href: hashscanTxUrl(hedera.registerTx) });
+    links.push({
+      label: "Hedera register",
+      href: hashscanTxUrl(hedera.registerTx),
+      title: registered,
+    });
   }
   return links;
 }

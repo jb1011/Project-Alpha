@@ -147,9 +147,18 @@ const ROW: TransparencyHedera = {
 };
 
 test("a registered row links the profile and the registration, and nothing else", () => {
+  // Both links name the chain on hover, in the chip's words: this page is otherwise all Arc.
   expect(hederaTransparencyLinks(ROW)).toEqual([
-    { label: "Profile", href: ROW.profileUrl },
-    { label: "Hedera register", href: hashscanTxUrl(REGISTER_TX) },
+    {
+      label: "Profile",
+      href: ROW.profileUrl,
+      title: "HCS-11 profile document. Registered on Hedera testnet as ERC-8004 agent 113.",
+    },
+    {
+      label: "Hedera register",
+      href: hashscanTxUrl(REGISTER_TX),
+      title: "Registered on Hedera testnet as ERC-8004 agent 113.",
+    },
   ]);
 });
 

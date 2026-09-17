@@ -396,22 +396,31 @@ export function AgentDashboard({
                 title={hedera.uaid}
               />
             )}
+            {/* Which chain, in the label: these rows sit among Arc facts, and a bare "Hedera
+                agent" beside them would leave a reader to assume the network. */}
             {hedera?.hederaAgentId && (
               <OnChainRow
-                label="Hedera agent"
+                label="Hedera agent (testnet)"
                 value={`#${hedera.hederaAgentId}`}
+                title={`Registered on Hedera testnet as ERC-8004 agent ${hedera.hederaAgentId}.`}
                 href={hedera.registerTx ? hashscanTxUrl(hedera.registerTx) : hederaChip?.href}
               />
             )}
             {hedera?.accountId && (
               <OnChainRow
-                label="Hedera account"
+                label="Hedera account (testnet)"
                 value={hedera.accountId}
+                title="The Hedera testnet account this agent's key is linked to."
                 href={hashscanAccountUrl(hedera.accountId)}
               />
             )}
             {hedera?.profileUrl && (
-              <OnChainRow label="Hedera profile" value="HCS-11 profile" href={hedera.profileUrl} />
+              <OnChainRow
+                label="Hedera profile (testnet)"
+                value="HCS-11 profile"
+                title="The HCS-11 profile document a Hedera testnet reader resolves this company by."
+                href={hedera.profileUrl}
+              />
             )}
             {hedera?.verifyUrl && (
               <OnChainRow
@@ -441,6 +450,7 @@ export function AgentDashboard({
                 href={hashscanTxUrl(hedera.registerTx)}
                 target="_blank"
                 rel="noreferrer"
+                title="The registration transaction on Hedera testnet, on HashScan."
                 className="inline-flex items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft"
               >
                 Hedera register
