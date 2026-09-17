@@ -50,8 +50,13 @@ export function hederaNetworkLabel(network: HederaNetwork | null | undefined): s
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** A present, non-blank string, TRIMMED: the trimmed value is the one that gets rendered and
+ *  interpolated into urls, so returning the untrimmed original would test one string and use
+ *  another. */
 function nonempty(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 /**

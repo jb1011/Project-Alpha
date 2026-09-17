@@ -19,6 +19,8 @@ import {
   hederaIdentityFromMetadata,
   hederaTransparencyLinks,
   httpsUrl,
+  isHederaRegistry,
+  parseAgentRegistry,
   publicIdFromMetadataUri,
   shortUaid,
 } from "@/lib/hedera/identity";
@@ -133,6 +135,60 @@ describe("each field is independently optional", () => {
         hedera: { accountId: "   ", verifyUrl: "", profileUrl: "", registerTx: "", attestor: "" },
       }),
     ).toBeNull();
+  });
+
+  test("a padded value is kept TRIMMED, because the trimmed one is what gets linked", () => {
+    const view = hederaIdentityFromMetadata({
+      uaid: `  ${UAID} `,
+      hedera: { accountId: " 0.0.10450558\n", registerTx: `\t${REGISTER_TX} ` },
+    });
+    expect(view?.uaid).toBe(UAID);
+    expect(view?.accountId).toBe("0.0.10450558");
+    expect(view?.registerTx).toBe(REGISTER_TX);
+    // …which is the difference between a link and a row of plain text: the padded strings match
+    // none of the shapes in hashscan.ts.
+    expect(hashscanAccountUrl("testnet", view?.accountId)).toBe(
+      "https://hashscan.io/testnet/account/0.0.10450558",
+    );
+  });
+
+  test("a registration with no agentId is not an identity to show", () => {
+    // The id is the whole claim ("agent N"); a registry entry without one names nothing.
+    const view = hederaIdentityFromMetadata({
+      registrations: [{ agentRegistry: `eip155:296:${HEDERA_IDENTITY_REGISTRY}` }],
+    });
+    expect(view).toBeNull();
+    expect(hederaIdentityChip(view)).toBeNull();
+  });
+});
+
+describe("the CAIP-10 registry string", () => {
+  test("casing is not meaning: an uppercased registration is the same registration", () => {
+    const view = hederaIdentityFromMetadata({
+      registrations: [
+        {
+          agentId: "113",
+          agentRegistry: `EIP155:296:${HEDERA_IDENTITY_REGISTRY.toUpperCase()}`,
+        },
+      ],
+      hedera: { registerTx: REGISTER_TX },
+    });
+    expect(view?.hederaAgentId).toBe("113");
+    expect(view?.network).toBe("testnet");
+  });
+
+  test("a truncated registry string is not parsed, and so is not a Hedera registration", () => {
+    for (const agentRegistry of ["eip155:296:", "eip155:296", "eip155", "", "0x8004"]) {
+      expect(isHederaRegistry(agentRegistry)).toBe(false);
+      expect(parseAgentRegistry(agentRegistry)).toBeNull();
+      expect(
+        hederaIdentityFromMetadata({ registrations: [{ agentId: "113", agentRegistry }] }),
+      ).toBeNull();
+    }
+    expect(parseAgentRegistry(`eip155:296:${HEDERA_IDENTITY_REGISTRY}`)).toEqual({
+      chainId: "296",
+      address: HEDERA_IDENTITY_REGISTRY,
+    });
   });
 
   test("the paid verifyUrl is read, and stays on the owner's dashboard", () => {
@@ -293,4 +349,7 @@ test("publicId is the UUID tail of an https metadataURI, and nothing else", () =
 test("shortUaid keeps the aid prefix and drops routing params", () => {
   expect(shortUaid(UAID)).toBe("uaid:aid:7yCVPN2iL…");
   expect(shortUaid("uaid:aid:short")).toBe("uaid:aid:short");
+  // The row is never rendered for an absent UAID, and the helper still answers rather than throw.
+  expect(shortUaid("")).toBe("");
+  expect(shortUaid(";uid=886257")).toBe("");
 });
