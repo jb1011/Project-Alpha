@@ -128,7 +128,9 @@ test("a failing saga marks the record failed with the error", async () => {
   await runner.settled();
   const row = repo.findByIdempotencyKey(id)!;
   expect(row.status).toBe("failed");
-  expect(row.error).toBe("provision blew up");
+  // The ref suffix (Q4) is part of the STORED error — asserted here rather than relaxed to a
+  // substring, so this still pins the whole string.
+  expect(row.error).toMatch(/^provision blew up \(ref [0-9a-f]{8}\)$/);
 });
 
 test("starting an already in-flight key is a 409 conflict", () => {
@@ -463,12 +465,14 @@ test("a fund saga that throws on a BOUND entity records the failure instead of s
   // The status is still the truth about the entity: it IS bound, and a failed transfer does not
   // un-bind it. What changed is that the attempt is now visible.
   expect(row.status).toBe("bound");
-  expect(row.error).toBe("on-chain fundTreasury tx reverted");
+  expect(row.error).toMatch(/^on-chain fundTreasury tx reverted \(ref [0-9a-f]{8}\)$/);
   // …and the trail shows the attempt, which is what an operator reads after the fact.
   const events = repo.listEvents(bound.idempotencyKey).filter((e) => e.step === "fundTreasury");
   expect(events).toHaveLength(1);
   expect(events[0]!.status).toBe("failed");
-  expect(JSON.parse(events[0]!.detail!)).toEqual({ error: "on-chain fundTreasury tx reverted" });
+  expect(JSON.parse(events[0]!.detail!).error).toMatch(
+    /^on-chain fundTreasury tx reverted \(ref [0-9a-f]{8}\)$/,
+  );
   // ⚠ THE QUOTA IS UNTOUCHED. `sumFundedByTenant` counts `fundTreasury`/`funded` events only, so
   // a `failed` one beside them must not consume a cent of the tenant's lifetime allowance.
   expect(repo.sumFundedByTenant(TENANT)).toBe(0n);
@@ -532,7 +536,9 @@ test("a second fund attempt clears the previous attempt's error BEFORE it runs",
   const bound = seedRecord({ idempotencyKey: `${TENANT}:FundRetry`, status: "bound" });
   failing.fund({ id: bound.idempotencyKey, tenantId: TENANT, amount: usdToUnits("1") });
   await failing.settled();
-  expect(repo.findByIdempotencyKey(bound.idempotencyKey)?.error).toBe("first attempt reverted");
+  expect(repo.findByIdempotencyKey(bound.idempotencyKey)?.error).toMatch(
+    /^first attempt reverted \(ref [0-9a-f]{8}\)$/,
+  );
 
   // The retry: the error must be gone the moment `fund()` returns, not when the saga finishes.
   let errorWhileRunning: string | null | undefined = "unread";
@@ -602,6 +608,156 @@ test("a record already `failed` keeps the FIRST reason a human is reading", asyn
   const row = repo.findByIdempotencyKey(id)!;
   expect(row.status).toBe("failed");
   expect(row.error).toBe("the original reason");
+});
+
+/* ── R3: a fund failure is recorded because we RAN a fund, not because the row looks fundable ─ */
+
+test("R3: an ONBOARD tail failure on a bound row is not labelled a fund failure", async () => {
+  // The mirror image of the 2026-09-14 bug. `fundAttempt` was inferred from the row's status, but
+  // the onboard saga REACHES `bound` and then keeps going (ENS, formation) — so a throw in that
+  // tail was recorded as `fundTreasury`/`failed` on an onboarding that never asked to fund, and
+  // the error landed in the field the wizard reads.
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: async (i) => {
+      const cur = repo.findByIdempotencyKey(i.idempotencyKey)!;
+      repo.upsert({ ...cur, status: "bound", agentId: "5" });
+      throw new Error("formation lookup blew up after the bind");
+    },
+    fundCaps: TEST_FUND_CAPS,
+  });
+  const { id } = runner.start({
+    spec,
+    userKey: "TailFail",
+    tenantId: TENANT,
+    guardianPasskey: passkey,
+  });
+  await runner.settled();
+
+  const row = repo.findByIdempotencyKey(id)!;
+  expect(row.status).toBe("bound");
+  // NOT in the field the wizard reads: no fund was attempted, so nothing here is a fund verdict.
+  expect(row.error).toBeNull();
+  expect(repo.listEvents(id).filter((e) => e.step === "fundTreasury")).toHaveLength(0);
+  // It is still on the trail — a tail failure is not nothing.
+  const tail = repo.listEvents(id).filter((e) => e.step === "sagaTail");
+  expect(tail).toHaveLength(1);
+  expect(tail[0]!.status).toBe("failed");
+  expect(tail[0]!.detail).toContain("formation lookup blew up");
+});
+
+test("R3: a throw AFTER the transfer succeeded never puts an error beside money that moved", async () => {
+  // The dangerous direction. Step 7 succeeded (`funded`, `fundTxHash`, `error: null`) and step 8
+  // then threw. The wizard checks `error` BEFORE `status`, so writing one here reports a failure
+  // for USDC that actually left the platform wallet.
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: async (i) => {
+      const cur = repo.findByIdempotencyKey(i.idempotencyKey)!;
+      repo.transaction(() => {
+        repo.upsert({
+          ...cur,
+          status: "funded",
+          fundTxHash: "0xmoved",
+          error: null,
+        });
+        repo.recordEvent(
+          i.idempotencyKey,
+          "fundTreasury",
+          "funded",
+          "0xmoved",
+          JSON.stringify({ amount: "1000000" }),
+        );
+      });
+      throw new Error("ENS binding blew up after the money moved");
+    },
+    fundCaps: TEST_FUND_CAPS,
+  });
+  const bound = seedRecord({ idempotencyKey: `${TENANT}:AfterMoney`, status: "bound" });
+
+  runner.fund({ id: bound.idempotencyKey, tenantId: TENANT, amount: 1_000_000n });
+  await runner.settled();
+
+  const row = repo.findByIdempotencyKey(bound.idempotencyKey)!;
+  expect(row.status).toBe("funded");
+  expect(row.fundTxHash).toBe("0xmoved");
+  // ⚠ THE ASSERTION: no error beside a successful transfer.
+  expect(row.error).toBeNull();
+  // The fund event stands as `funded`; the tail failure is its own row.
+  expect(
+    repo
+      .listEvents(bound.idempotencyKey)
+      .filter((e) => e.step === "fundTreasury")
+      .map((e) => e.status),
+  ).toEqual(["funded"]);
+  expect(repo.listEvents(bound.idempotencyKey).filter((e) => e.step === "sagaTail")).toHaveLength(
+    1,
+  );
+  // The quota counts the transfer that happened.
+  expect(repo.sumFundedByTenant(TENANT)).toBe(1_000_000n);
+});
+
+test("R3: a genuine fund failure is still recorded as one", async () => {
+  // The guard must not swallow the case it was built around: same kind, no transfer.
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: async () => {
+      throw new Error("on-chain fundTreasury tx reverted");
+    },
+    fundCaps: TEST_FUND_CAPS,
+  });
+  const bound = seedRecord({ idempotencyKey: `${TENANT}:StillRecorded`, status: "bound" });
+  runner.fund({ id: bound.idempotencyKey, tenantId: TENANT, amount: 1_000_000n });
+  await runner.settled();
+
+  const row = repo.findByIdempotencyKey(bound.idempotencyKey)!;
+  expect(row.error).toContain("on-chain fundTreasury tx reverted");
+  expect(
+    repo.listEvents(bound.idempotencyKey).filter((e) => e.step === "fundTreasury"),
+  ).toHaveLength(1);
+});
+
+/* ── Q4: the join key ───────────────────────────────────────────────────────────────────────── */
+
+test("Q4: the stored error carries a ref, and the ops line carries the same ref plus the detail", async () => {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  try {
+    const runner = new OnboardingRunner({
+      repo,
+      runSaga: async () => {
+        throw new Error(SEPTEMBER_MESSAGE);
+      },
+      fundCaps: TEST_FUND_CAPS,
+    });
+    const bound = seedRecord({ idempotencyKey: `${TENANT}:Ref`, status: "bound" });
+    runner.fund({ id: bound.idempotencyKey, tenantId: TENANT, amount: 1_000_000n });
+    await runner.settled();
+
+    const row = repo.findByIdempotencyKey(bound.idempotencyKey)!;
+    const ref = /\(ref ([0-9a-f]{8})\)$/.exec(row.error!)?.[1];
+    expect(ref, row.error ?? "no error").toBeTruthy();
+
+    const ops = lines
+      .filter((l) => l.includes('"opslog"'))
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((l) => l.opslog === "saga_failed")!;
+    // The same key on both sides: a founder's screenshot finds the journald line.
+    expect(ops.ref).toBe(ref);
+    // The operator's copy has what the sentence had to leave out…
+    expect(ops.errorDetail).toContain("HTTP request failed.");
+    expect(ops.errorDetail).toContain("https://arc-sepolia.example.com");
+    // …and none of what neither may carry. journald is a lower bar than the browser, not a vault.
+    expect(JSON.stringify(ops)).not.toContain("AbCdEf0123456789SECRET");
+    expect(JSON.stringify(ops)).not.toContain("0x02f8b2abab");
+    // The field is named `errorDetail` ON PURPOSE: opsLog's free-text redaction keys on
+    // /error|message|reason|detail/i, so a field called `diagnostic` would skip redactPii.
+    expect(Object.keys(ops)).toContain("errorDetail");
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 test("one ops line per swallowed failure, carrying the PUBLIC message only", async () => {
