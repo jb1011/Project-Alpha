@@ -98,6 +98,12 @@ export interface PublicEntityRow {
    *  filing number, and never anything from `formation_parties`. */
   formationProvider: string | null;
   formationEnvironment: EntityRecord["formationEnvironment"];
+  /** The Hedera registration, for the public transparency row. All three are already published
+   *  per-entity by GET /metadata/:publicId; carrying them here is what lets that page render a
+   *  HashScan link without a second request per row. */
+  hederaAgentId: string | null;
+  hederaRegisterTx: string | null;
+  uaid: string | null;
 }
 
 interface Row {
@@ -528,7 +534,8 @@ export class SqliteEntityRepository implements EntityRepository {
                owner_tenant_id AS ownerTenantId, created_at AS createdAt,
                company_id AS companyId,
                formation_provider AS formationProvider,
-               formation_environment AS formationEnvironment
+               formation_environment AS formationEnvironment,
+               hedera_agent_id AS hederaAgentId, hedera_register_tx AS hederaRegisterTx, uaid
         FROM entities
         WHERE agent_id IS NOT NULL AND status IN ('created','bound','funded')
         ORDER BY rowid DESC

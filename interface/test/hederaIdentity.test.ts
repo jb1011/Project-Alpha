@@ -7,13 +7,20 @@
  * there. FormationE2E_1's real prod shape is the fixture; an empty document is the other pole.
  */
 import { describe, expect, test } from "vitest";
-import type { PublicMetadata } from "@/lib/api/types";
-import { hashscanAccountUrl, hashscanContractUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
+import type { PublicMetadata, TransparencyHedera } from "@/lib/api/types";
+import {
+  hashscanAccountUrl,
+  hashscanTxUrl,
+  hederaNetworkOfChainId,
+} from "@/lib/hedera/hashscan";
 import {
   HEDERA_IDENTITY_REGISTRY,
   hederaIdentityChip,
   hederaIdentityFromMetadata,
   hederaTransparencyLinks,
+  httpsUrl,
+  isHederaRegistry,
+  parseAgentRegistry,
   publicIdFromMetadataUri,
   shortUaid,
 } from "@/lib/hedera/identity";
@@ -48,9 +55,9 @@ const FORMATION_E2E: PublicMetadata = {
 test("FormationE2E_1 yields every field and a HashScan chip", () => {
   const view = hederaIdentityFromMetadata(FORMATION_E2E);
   expect(view).toEqual({
+    network: "testnet",
     uaid: UAID,
     hederaAgentId: "113",
-    registryAddress: HEDERA_IDENTITY_REGISTRY,
     accountId: "0.0.10450558",
     profileUrl: `https://www.novicorpus.com/backend/metadata/${PUBLIC_ID}/profile`,
     verifyUrl: `https://api.novicorpus.com/verify/${PUBLIC_ID}`,
@@ -60,13 +67,9 @@ test("FormationE2E_1 yields every field and a HashScan chip", () => {
   expect(hederaIdentityChip(view)).toEqual({
     label: "Hedera identity ↗",
     title: "Registered on Hedera testnet as ERC-8004 agent 113.",
-    href: hashscanTxUrl(REGISTER_TX),
+    href: `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
   });
-  expect(hederaTransparencyLinks(view)).toEqual([
-    { label: "Profile", href: view!.profileUrl },
-    { label: "Hedera register", href: hashscanTxUrl(REGISTER_TX) },
-  ]);
-  expect(hashscanAccountUrl(view!.accountId!)).toBe(
+  expect(hashscanAccountUrl(view!.network, view!.accountId)).toBe(
     "https://hashscan.io/testnet/account/0.0.10450558",
   );
 });
@@ -86,7 +89,6 @@ test("no Hedera identity at all → nothing to render", () => {
     }),
   ).toBeNull();
   expect(hederaIdentityChip(null)).toBeNull();
-  expect(hederaTransparencyLinks(null)).toEqual([]);
 });
 
 describe("each field is independently optional", () => {
@@ -94,20 +96,22 @@ describe("each field is independently optional", () => {
     const view = hederaIdentityFromMetadata({ uaid: UAID });
     expect(view).toEqual({ uaid: UAID });
     expect(hederaIdentityChip(view)).toBeNull();
-    expect(hederaTransparencyLinks(view)).toEqual([]);
   });
 
-  test("Hedera registration without a tx links the chip at the registry contract", () => {
+  test("a registration with no tx states itself, and links nowhere", () => {
     const view = hederaIdentityFromMetadata({
       registrations: [
         { agentId: "113", agentRegistry: `eip155:296:${HEDERA_IDENTITY_REGISTRY}` },
       ],
     });
     expect(view?.hederaAgentId).toBe("113");
-    expect(hederaIdentityChip(view)?.href).toBe(hashscanContractUrl(HEDERA_IDENTITY_REGISTRY));
-    expect(hederaTransparencyLinks(view)).toEqual([
-      { label: "Hedera identity", href: hashscanContractUrl(HEDERA_IDENTITY_REGISTRY) },
-    ]);
+    // The registry CONTRACT is not this company's proof: every registered company shares it. So
+    // the chip keeps its claim, drops the href, and drops the arrow that promises one.
+    expect(hederaIdentityChip(view)).toEqual({
+      label: "Hedera identity",
+      title: "Registered on Hedera testnet as ERC-8004 agent 113.",
+    });
+    expect(hederaIdentityChip(view)).not.toHaveProperty("href");
   });
 
   test("a hedera block without a registration shows account and profile, not a chip", () => {
@@ -122,9 +126,6 @@ describe("each field is independently optional", () => {
       profileUrl: "https://www.novicorpus.com/backend/metadata/x/profile",
     });
     expect(hederaIdentityChip(view)).toBeNull();
-    expect(hederaTransparencyLinks(view)).toEqual([
-      { label: "Profile", href: "https://www.novicorpus.com/backend/metadata/x/profile" },
-    ]);
   });
 
   test("empty strings are treated as absent", () => {
@@ -136,13 +137,204 @@ describe("each field is independently optional", () => {
     ).toBeNull();
   });
 
-  test("the paid verifyUrl is never a transparency link", () => {
+  test("a padded value is kept TRIMMED, because the trimmed one is what gets linked", () => {
+    const view = hederaIdentityFromMetadata({
+      uaid: `  ${UAID} `,
+      hedera: { accountId: " 0.0.10450558\n", registerTx: `\t${REGISTER_TX} ` },
+    });
+    expect(view?.uaid).toBe(UAID);
+    expect(view?.accountId).toBe("0.0.10450558");
+    expect(view?.registerTx).toBe(REGISTER_TX);
+    // …which is the difference between a link and a row of plain text: the padded strings match
+    // none of the shapes in hashscan.ts.
+    expect(hashscanAccountUrl("testnet", view?.accountId)).toBe(
+      "https://hashscan.io/testnet/account/0.0.10450558",
+    );
+  });
+
+  test("a registration with no agentId is not an identity to show", () => {
+    // The id is the whole claim ("agent N"); a registry entry without one names nothing.
+    const view = hederaIdentityFromMetadata({
+      registrations: [{ agentRegistry: `eip155:296:${HEDERA_IDENTITY_REGISTRY}` }],
+    });
+    expect(view).toBeNull();
+    expect(hederaIdentityChip(view)).toBeNull();
+  });
+});
+
+describe("the CAIP-10 registry string", () => {
+  test("casing is not meaning: an uppercased registration is the same registration", () => {
+    const view = hederaIdentityFromMetadata({
+      registrations: [
+        {
+          agentId: "113",
+          agentRegistry: `EIP155:296:${HEDERA_IDENTITY_REGISTRY.toUpperCase()}`,
+        },
+      ],
+      hedera: { registerTx: REGISTER_TX },
+    });
+    expect(view?.hederaAgentId).toBe("113");
+    expect(view?.network).toBe("testnet");
+  });
+
+  test("a truncated registry string is not parsed, and so is not a Hedera registration", () => {
+    for (const agentRegistry of ["eip155:296:", "eip155:296", "eip155", "", "0x8004"]) {
+      expect(isHederaRegistry(agentRegistry)).toBe(false);
+      expect(parseAgentRegistry(agentRegistry)).toBeNull();
+      expect(
+        hederaIdentityFromMetadata({ registrations: [{ agentId: "113", agentRegistry }] }),
+      ).toBeNull();
+    }
+    expect(parseAgentRegistry(`eip155:296:${HEDERA_IDENTITY_REGISTRY}`)).toEqual({
+      chainId: "296",
+      address: HEDERA_IDENTITY_REGISTRY,
+    });
+  });
+
+  test("the paid verifyUrl is read, and stays on the owner's dashboard", () => {
     const view = hederaIdentityFromMetadata({
       hedera: { verifyUrl: `https://api.novicorpus.com/verify/${PUBLIC_ID}` },
     });
     expect(view?.verifyUrl).toBe(`https://api.novicorpus.com/verify/${PUBLIC_ID}`);
-    expect(hederaTransparencyLinks(view)).toEqual([]);
   });
+});
+
+// ── The public transparency row (GET /transparency) ───────────────────────────────────────────
+//
+// The page renders these links from the ROW, with no request of its own: the backend publishes
+// the same facts per row that `/metadata/:publicId` carries. The row has no `verifyUrl` field at
+// all, which is how the paid link stays off the free page.
+
+/** FormationE2E_1's row, as the backend's `hederaFactsOf` builds it. */
+const ROW: TransparencyHedera = {
+  agentId: "113",
+  registerTx: REGISTER_TX,
+  profileUrl: `https://www.novicorpus.com/backend/metadata/${PUBLIC_ID}/profile`,
+  uaid: UAID,
+};
+
+test("a registered row links the profile and the registration, and nothing else", () => {
+  // Both links name the chain on hover, in the chip's words: this page is otherwise all Arc.
+  expect(hederaTransparencyLinks(ROW)).toEqual([
+    {
+      label: "Profile",
+      href: ROW.profileUrl,
+      title: "HCS-11 profile document. Registered on Hedera testnet as ERC-8004 agent 113.",
+    },
+    {
+      label: "Hedera register",
+      href: `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
+      title: "Registered on Hedera testnet as ERC-8004 agent 113.",
+    },
+  ]);
+});
+
+// ── The network segment is derived, never assumed (L1) ────────────────────────────────────────
+
+describe("the HashScan network comes from the registration's chain id", () => {
+  const registered = (chainId: string) =>
+    hederaIdentityFromMetadata({
+      registrations: [
+        { agentId: "113", agentRegistry: `eip155:${chainId}:${HEDERA_IDENTITY_REGISTRY}` },
+      ],
+      hedera: { accountId: "0.0.10450558", registerTx: REGISTER_TX },
+    });
+
+  test("296 is testnet", () => {
+    const view = registered("296");
+    expect(view?.network).toBe("testnet");
+    expect(hashscanTxUrl(view?.network, REGISTER_TX)).toBe(
+      `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
+    );
+    expect(hashscanAccountUrl(view?.network, "0.0.10450558")).toBe(
+      "https://hashscan.io/testnet/account/0.0.10450558",
+    );
+  });
+
+  test("295 is mainnet, and every link follows it", () => {
+    const view = registered("295");
+    expect(view?.network).toBe("mainnet");
+    expect(hederaIdentityChip(view)).toEqual({
+      label: "Hedera identity ↗",
+      title: "Registered on Hedera mainnet as ERC-8004 agent 113.",
+      href: `https://hashscan.io/mainnet/transaction/${REGISTER_TX}`,
+    });
+    expect(hashscanAccountUrl(view?.network, "0.0.10450558")).toBe(
+      "https://hashscan.io/mainnet/account/0.0.10450558",
+    );
+  });
+
+  test("a chain that is not Hedera's is not a Hedera registration, and builds no link", () => {
+    // Arc's own registry entry sits in the same array, and has always been someone else's chain.
+    const view = registered("5042002");
+    expect(view?.network).toBeUndefined();
+    expect(view?.hederaAgentId).toBeUndefined();
+    expect(hederaIdentityChip(view)).toBeNull();
+    // The `hedera` block is still read (the account and the tx are there), but with no chain to
+    // name, a HashScan url would be a guess.
+    expect(hashscanTxUrl(view?.network, REGISTER_TX)).toBeUndefined();
+    expect(hashscanAccountUrl(view?.network, "0.0.10450558")).toBeUndefined();
+  });
+
+  test("the chain ids themselves", () => {
+    expect(hederaNetworkOfChainId("296")).toBe("testnet");
+    expect(hederaNetworkOfChainId(295)).toBe("mainnet");
+    expect(hederaNetworkOfChainId("1")).toBeNull();
+    expect(hederaNetworkOfChainId(undefined)).toBeNull();
+  });
+});
+
+// ── A value of the wrong shape is text, never an href (L2) ────────────────────────────────────
+
+describe("every value is checked against its shape before it becomes a link", () => {
+  test("a transaction hash is 0x + 64 hex, or there is no link", () => {
+    expect(hashscanTxUrl("testnet", REGISTER_TX)).toBe(
+      `https://hashscan.io/testnet/transaction/${REGISTER_TX}`,
+    );
+    // Uppercase hex is the same hash.
+    expect(hashscanTxUrl("testnet", REGISTER_TX.toUpperCase().replace("0X", "0x"))).toBeTruthy();
+    expect(hashscanTxUrl("testnet", REGISTER_TX.slice(0, 40))).toBeUndefined();
+    expect(hashscanTxUrl("testnet", "0.0.10450558@1789100000.1")).toBeUndefined();
+    expect(hashscanTxUrl("testnet", "../../account/0.0.1")).toBeUndefined();
+    expect(hashscanTxUrl("testnet", "")).toBeUndefined();
+  });
+
+  test("an account id is shard.realm.num, or there is no link", () => {
+    expect(hashscanAccountUrl("testnet", "0.0.10450558")).toBe(
+      "https://hashscan.io/testnet/account/0.0.10450558",
+    );
+    // An EVM address is NOT a Hedera account id, which is exactly the attestor's case.
+    expect(
+      hashscanAccountUrl("testnet", "0x038B40CFf3A948aA596AcFdd113c9Eac96011e2b"),
+    ).toBeUndefined();
+    expect(hashscanAccountUrl("testnet", "0.0")).toBeUndefined();
+    expect(hashscanAccountUrl("testnet", "not an account")).toBeUndefined();
+  });
+
+  test("a profile url must be https, or the row is plain text", () => {
+    const url = `https://www.novicorpus.com/backend/metadata/${PUBLIC_ID}/profile`;
+    expect(httpsUrl(url)).toBe(url);
+    expect(httpsUrl("http://www.novicorpus.com/x")).toBeUndefined();
+    expect(httpsUrl("javascript:alert(1)")).toBeUndefined();
+    expect(httpsUrl("//evil.example.com/x")).toBeUndefined();
+    expect(httpsUrl(undefined)).toBeUndefined();
+    // …and a row carrying one links the register tx alone.
+    expect(
+      hederaTransparencyLinks({
+        agentId: "113",
+        profileUrl: "javascript:alert(1)",
+        registerTx: REGISTER_TX,
+      }).map((l) => l.label),
+    ).toEqual(["Hedera register"]);
+  });
+});
+
+test("no row, or a row with only an agent id, links nothing", () => {
+  expect(hederaTransparencyLinks(undefined)).toEqual([]);
+  expect(hederaTransparencyLinks(null)).toEqual([]);
+  // An entity registered but not yet anchored to a tx or a profile: the row exists, and there is
+  // still nothing a stranger could click through to.
+  expect(hederaTransparencyLinks({ agentId: "113" })).toEqual([]);
 });
 
 test("publicId is the UUID tail of an https metadataURI, and nothing else", () => {
@@ -157,4 +349,7 @@ test("publicId is the UUID tail of an https metadataURI, and nothing else", () =
 test("shortUaid keeps the aid prefix and drops routing params", () => {
   expect(shortUaid(UAID)).toBe("uaid:aid:7yCVPN2iL…");
   expect(shortUaid("uaid:aid:short")).toBe("uaid:aid:short");
+  // The row is never rendered for an absent UAID, and the helper still answers rather than throw.
+  expect(shortUaid("")).toBe("");
+  expect(shortUaid(";uid=886257")).toBe("");
 });

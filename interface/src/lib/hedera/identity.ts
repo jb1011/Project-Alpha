@@ -1,16 +1,62 @@
-import type { AgentRegistration, HederaMetadataBlock, PublicMetadata } from "@/lib/api/types";
-import { hashscanContractUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
+import type {
+  AgentRegistration,
+  HederaMetadataBlock,
+  PublicMetadata,
+  TransparencyHedera,
+} from "@/lib/api/types";
+import { type HederaNetwork, hashscanTxUrl, hederaNetworkOfChainId } from "@/lib/hedera/hashscan";
 
-/** Hedera testnet CAIP-2. The ERC-8004 identity registry lives on chain 296. */
-export const HEDERA_CAIP2 = "eip155:296";
+/** Hedera testnet's chain id: the one chain the backend registers companies on today (its
+ *  `registrationsFor` publishes `eip155:296:<registry>`). A transparency row carries no CAIP
+ *  string of its own, so its links resolve their network from here. */
+export const HEDERA_TESTNET_CHAIN_ID = "296";
+
+/** The network a transparency row's links live on. DERIVED from the chain id above rather than
+ *  written out a second time, so there is one place to change when a row can be a mainnet one. */
+const ROW_NETWORK = hederaNetworkOfChainId(HEDERA_TESTNET_CHAIN_ID);
 
 /** ERC-8004 IdentityRegistry on Hedera testnet. Public, immutable, same address the backend publishes. */
 export const HEDERA_IDENTITY_REGISTRY = "0x8004A818BFB912233c491871b3d84c89A494BD9e";
 
+/** CAIP-10, case-insensitive on both halves: a registry may be published `EIP155:296:0xABC…` and
+ *  it is the same registry. Anything that is not a complete `eip155:<chainId>:<address>` is not
+ *  parsed at all, so a truncated string never becomes a link. */
+const CAIP10 = /^eip155:(\d+):(0x[0-9a-fA-F]{40})$/i;
+
+/** The chain id and registry address inside a CAIP-10 `agentRegistry`, or null. */
+export function parseAgentRegistry(
+  agentRegistry: string | null | undefined,
+): { chainId: string; address: string } | null {
+  const m = agentRegistry?.match(CAIP10);
+  return m ? { chainId: m[1], address: m[2] } : null;
+}
+
+/**
+ * A url the page may put in an `href`, or undefined.
+ *
+ * `https:` only, and by prefix rather than by parsing: the profile url arrives as a string in a
+ * public document, and `javascript:`, `data:` or a protocol-relative `//host` is not a document
+ * link at all. Plain http is refused too, since every url we publish is https.
+ */
+export function httpsUrl(value: string | null | undefined): string | undefined {
+  return value && /^https:\/\//.test(value) ? value : undefined;
+}
+
+/** "Hedera testnet" / "Hedera mainnet", or plain "Hedera" where the chain is unknown: copy must
+ *  not name a network that no link could be built for. */
+export function hederaNetworkLabel(network: HederaNetwork | null | undefined): string {
+  return network ? `Hedera ${network}` : "Hedera";
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** A present, non-blank string, TRIMMED: the trimmed value is the one that gets rendered and
+ *  interpolated into urls, so returning the untrimmed original would test one string and use
+ *  another. */
 function nonempty(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 /**
@@ -25,8 +71,11 @@ export function publicIdFromMetadataUri(uri: string | null | undefined): string 
   return label;
 }
 
+/** A registration is Hedera's when its CAIP-10 chain id is one of Hedera's, whichever it is:
+ *  mainnet registrations are the same fact on a different chain, not a foreign one. */
 export function isHederaRegistry(agentRegistry: string | undefined): boolean {
-  return Boolean(agentRegistry?.startsWith(`${HEDERA_CAIP2}:`));
+  const parsed = parseAgentRegistry(agentRegistry);
+  return Boolean(parsed && hederaNetworkOfChainId(parsed.chainId));
 }
 
 export function hederaRegistrationOf(
@@ -35,11 +84,13 @@ export function hederaRegistrationOf(
   return registrations?.find((row) => isHederaRegistry(row.agentRegistry));
 }
 
-/** What the identity card and the transparency row may render. Every field is independently optional. */
+/** What the identity card may render. Every field is independently optional. */
 export type HederaIdentityView = {
+  /** The network the registration names, and so the only network any HashScan link here may be
+   *  built on. Undefined where nothing told us: no registration, or a chain that is not Hedera's. */
+  network?: HederaNetwork;
   uaid?: string;
   hederaAgentId?: string;
-  registryAddress?: string;
   accountId?: string;
   profileUrl?: string;
   verifyUrl?: string;
@@ -50,14 +101,10 @@ export type HederaIdentityView = {
 export type HederaIdentityChip = {
   label: string;
   title: string;
-  href: string;
+  /** Absent when nothing can be linked. The chip still states the registration; it just does not
+   *  offer a click that would not show it. */
+  href?: string;
 };
-
-function registryAddressOf(agentRegistry: string | undefined): string | undefined {
-  if (!agentRegistry) return undefined;
-  const address = agentRegistry.slice(agentRegistry.lastIndexOf(":") + 1);
-  return /^0x[0-9a-fA-F]{40}$/.test(address) ? address : undefined;
-}
 
 function hederaBlockOf(block: HederaMetadataBlock | undefined): HederaMetadataBlock | undefined {
   if (!block) return undefined;
@@ -81,14 +128,17 @@ export function hederaIdentityFromMetadata(
   if (!meta) return null;
   const uaid = nonempty(meta.uaid);
   const registration = hederaRegistrationOf(meta.registrations);
+  const parsed = parseAgentRegistry(registration?.agentRegistry);
   const hederaAgentId = nonempty(registration?.agentId);
-  const registryAddress = registryAddressOf(registration?.agentRegistry);
+  // WHICH Hedera network this company is registered on, read off the registration itself. Every
+  // HashScan link below is built on it, and on nothing else.
+  const network = hederaNetworkOfChainId(parsed?.chainId) ?? undefined;
   const block = hederaBlockOf(meta.hedera);
   if (!uaid && !hederaAgentId && !block) return null;
   return {
+    network,
     uaid,
     hederaAgentId,
-    registryAddress,
     accountId: block?.accountId,
     profileUrl: block?.profileUrl,
     verifyUrl: block?.verifyUrl,
@@ -99,36 +149,51 @@ export function hederaIdentityFromMetadata(
 
 /**
  * The chip beside AgentBook. Only when a Hedera ERC-8004 registration exists: that is the line
- * that resolves the agent's Hedera identity. Prefer the HashScan transaction; fall back to the
- * registry contract. No registration → no chip, even if a UAID or float account is present.
+ * that resolves the agent's Hedera identity. No registration → no chip, even if a UAID or a
+ * linked account is present.
+ *
+ * THE LINK IS THE REGISTRATION TRANSACTION OR NOTHING. It used to fall back to the registry
+ * CONTRACT, a page every registered company shares, while the title said "Registered … as agent
+ * N": a click showed the reader something that verified none of that. With no transaction
+ * recorded the chip still states the registration, without an href and without the arrow that
+ * promises one.
  */
-export function hederaIdentityChip(view: HederaIdentityView | null | undefined): HederaIdentityChip | null {
+export function hederaIdentityChip(
+  view: HederaIdentityView | null | undefined,
+): HederaIdentityChip | null {
   if (!view?.hederaAgentId) return null;
-  const href = view.registerTx
-    ? hashscanTxUrl(view.registerTx)
-    : view.registryAddress
-      ? hashscanContractUrl(view.registryAddress)
-      : null;
-  if (!href) return null;
+  const href = hashscanTxUrl(view.network, view.registerTx);
   return {
-    label: "Hedera identity ↗",
-    title: `Registered on Hedera testnet as ERC-8004 agent ${view.hederaAgentId}.`,
-    href,
+    label: href ? "Hedera identity ↗" : "Hedera identity",
+    title: `Registered on ${hederaNetworkLabel(view.network)} as ERC-8004 agent ${view.hederaAgentId}.`,
+    ...(href ? { href } : {}),
   };
 }
 
-/** Extra verify links for the public transparency row. Never includes the paid `/verify` URL. */
+/**
+ * Extra verify links for the public transparency row, built from the row ITSELF.
+ *
+ * Pure, and takes no dependency on `/metadata/:publicId`: GET /transparency publishes these facts
+ * per row, so the page renders them with no request of its own. Never includes the paid `/verify`
+ * url, which the backend does not publish here either.
+ */
 export function hederaTransparencyLinks(
-  view: HederaIdentityView | null | undefined,
-): { label: string; href: string }[] {
-  if (!view) return [];
-  const links: { label: string; href: string }[] = [];
-  if (view.profileUrl) links.push({ label: "Profile", href: view.profileUrl });
-  if (view.registerTx) {
-    links.push({ label: "Hedera register", href: hashscanTxUrl(view.registerTx) });
-  } else if (view.hederaAgentId && view.registryAddress) {
-    links.push({ label: "Hedera identity", href: hashscanContractUrl(view.registryAddress) });
-  }
+  hedera: TransparencyHedera | null | undefined,
+): { label: string; href: string; title: string }[] {
+  if (!hedera) return [];
+  // The SAME sentence the dashboard chip carries, so the two surfaces name the same chain in the
+  // same words. A link labeled "Profile" beside three Arcscan links must say where it goes.
+  const registered = `Registered on ${hederaNetworkLabel(ROW_NETWORK)} as ERC-8004 agent ${hedera.agentId}.`;
+  const links: { label: string; href: string; title: string }[] = [];
+  const profileHref = httpsUrl(hedera.profileUrl);
+  if (profileHref)
+    links.push({
+      label: "Profile",
+      href: profileHref,
+      title: `HCS-11 profile document. ${registered}`,
+    });
+  const registerHref = hashscanTxUrl(ROW_NETWORK, hedera.registerTx);
+  if (registerHref) links.push({ label: "Hedera register", href: registerHref, title: registered });
   return links;
 }
 
