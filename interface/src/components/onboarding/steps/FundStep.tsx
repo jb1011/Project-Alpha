@@ -8,6 +8,7 @@ import { useEntityFundPollQuery, useFundEntityMutation } from "@/lib/api/hooks";
 import { usdcToAtomic } from "@/lib/api/spec";
 import type { EntityView } from "@/lib/api/types";
 import { txUrl } from "@/lib/chain";
+import { FUND_TIMEOUT_COPY, fundPollOutcome } from "@/lib/onboarding/fundOutcome";
 import {
   Button,
   Callout,
@@ -19,7 +20,24 @@ import {
   StepHeader,
 } from "../primitives";
 
-type FundStatus = "idle" | "pending" | "confirmed" | "error";
+/**
+ * `timeout` is the outcome this step was missing, and the reason it span forever twice in one week
+ * (2026-09-14 and 2026-09-16). It means "we stopped watching", NOT "it failed": the transfer may
+ * well have landed, and saying otherwise would send a founder to re-fund a treasury that is
+ * already full. See `@/lib/onboarding/fundOutcome`.
+ */
+type FundStatus = "idle" | "pending" | "confirmed" | "error" | "timeout";
+
+/** How often the elapsed clock is re-read while polling. The poll itself runs every 2.5s; this is
+ *  a separate tick because a poll that keeps answering the same thing produces no re-render, and
+ *  the timeout has to fire on wall-clock time rather than on a change in the data. */
+const CLOCK_TICK_MS = 1_000;
+
+/** Shown while the fund mutation is waiting on `login()` — the 2026-09-16 failure exactly: the
+ *  session had expired, `ensureToken()` was blocked on a signature, and the MetaMask window was
+ *  behind the browser. The spinner was honest about "busy" and silent about WHO we were waiting
+ *  for. */
+const WALLET_WAIT_COPY = "Waiting for your wallet: open MetaMask to sign in again.";
 
 export function FundStep({
   eyebrow,
@@ -37,7 +55,7 @@ export function FundStep({
   onEntity: (entity: EntityView) => void;
   onComplete: () => void;
 }) {
-  const { address, isConnected } = useAuth();
+  const { address, isConnected, isLoggingIn } = useAuth();
   const fundEntity = useFundEntityMutation();
   const [amount, setAmount] = useState("");
   const [status, setStatus] = useState<FundStatus>(
@@ -45,27 +63,52 @@ export function FundStep({
   );
   const [error, setError] = useState<string | null>(null);
   const [pollFunding, setPollFunding] = useState(false);
+  /** When the current attempt's poll began. `null` means no attempt is being watched. */
+  const [pollStartedAt, setPollStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const fundPoll = useEntityFundPollQuery(entityId, pollFunding);
 
+  // The parent's copy of the entity follows every answer, as before.
   useEffect(() => {
-    const polled = fundPoll.data;
-    if (!polled) return;
-    onEntity(polled);
-    if (polled.status === "funded") {
-      setStatus("confirmed");
-      setPollFunding(false);
-    } else if (polled.status === "failed") {
-      setStatus("error");
-      setError(polled.error ?? "Funding failed.");
-      setPollFunding(false);
-    }
+    if (fundPoll.data) onEntity(fundPoll.data);
   }, [fundPoll.data, onEntity]);
+
+  // The clock, alive only while an attempt is being watched.
+  useEffect(() => {
+    if (!pollFunding) return;
+    const id = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
+    return () => clearInterval(id);
+  }, [pollFunding]);
+
+  // ONE place decides what the poll means, and it is a pure function with a table test
+  // (`fundPollOutcome`). The three ways this used to end — confirmed, failed, or never — are now
+  // four, and the fourth is the one that stops the spinner honestly.
+  useEffect(() => {
+    if (!pollFunding || pollStartedAt === null) return;
+    const outcome = fundPollOutcome(fundPoll.data, now - pollStartedAt);
+    if (outcome === "keep-polling") return;
+    setPollFunding(false);
+    if (outcome === "confirmed") {
+      setStatus("confirmed");
+      setError(null);
+    } else if (outcome === "timeout") {
+      setStatus("timeout");
+      setError(null);
+    } else {
+      setStatus("error");
+      setError(outcome.error);
+    }
+  }, [fundPoll.data, now, pollFunding, pollStartedAt]);
 
   const treasury = entity?.treasury;
   const amountNum = Number(amount);
   const amountValid = amount !== "" && !Number.isNaN(amountNum) && amountNum > 0;
   const busy = status === "pending" || fundEntity.isPending || pollFunding;
   const confirmed = status === "confirmed" || entity?.status === "funded";
+  // A timeout leaves the button enabled: `busy` is false (nothing is in flight any more) and
+  // `confirmed` is false, so the existing button comes back as the retry affordance.
+  const timedOut = status === "timeout";
+  const waitingForWallet = fundEntity.isPending && isLoggingIn;
 
   async function fund() {
     if (!entityId) return;
@@ -76,9 +119,16 @@ export function FundStep({
         entityId,
         amountAtomic: usdcToAtomic(amount),
       });
+      // The clock starts when the backend has accepted the request, so the 90 seconds measure the
+      // on-chain wait rather than however long a wallet signature took.
+      setPollStartedAt(Date.now());
+      setNow(Date.now());
       setPollFunding(true);
     } catch (e) {
       setStatus("error");
+      // `e` is an `ApiError` for anything the API answered or failed to answer — its message is
+      // the backend's own error envelope (or, for a timeout, this client's sentence). Nothing raw
+      // from a chain or an RPC reaches here.
       setError(e instanceof Error ? e.message : "Funding request failed.");
     }
   }
@@ -162,6 +212,23 @@ export function FundStep({
                 <p className="text-[11.5px] text-[#ff8a84]">{error}</p>
               )}
 
+              {/* We stopped watching; we did NOT decide. `warn`, not `alarm`, and no claim of
+                  failure — the transfer may already have landed. */}
+              {timedOut && (
+                <Callout tone="warn" title="Still waiting">
+                  {FUND_TIMEOUT_COPY}
+                </Callout>
+              )}
+
+              {/* The 2026-09-16 spinner, explained: the request has not been sent yet because the
+                  session expired and MetaMask is asking for a signature somewhere out of sight. */}
+              {waitingForWallet && (
+                <p className="flex items-center gap-2 text-[11.5px] text-[#f3cd72]">
+                  <Spinner className="h-3.5 w-3.5" />
+                  {WALLET_WAIT_COPY}
+                </p>
+              )}
+
               {!confirmed ? (
                 <Button
                   size="lg"
@@ -169,7 +236,7 @@ export function FundStep({
                   loading={busy}
                   disabled={!amountValid || busy || !entityId}
                 >
-                  {busy ? "Funding treasury…" : "Fund treasury"}
+                  {busy ? "Funding treasury…" : timedOut ? "Retry funding" : "Fund treasury"}
                 </Button>
               ) : (
                 <div className="rounded-xl border border-accent/30 bg-accent/[0.06] px-4 py-4">
