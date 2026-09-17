@@ -12,6 +12,7 @@ import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationRepository } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { Address, EntityRecord, EntityStatus } from "../types";
+import { publicErrorMessage } from "./publicError";
 
 export type RunSaga = (input: {
   spec: AgentSpec;
@@ -259,6 +260,12 @@ export class OnboardingRunner {
       throw new ApiError("limit_exceeded", 400, "platform outflow ceiling reached");
     }
     const spec = JSON.parse(rec.specJson ?? "{}") as AgentSpec;
+    // CLEAR THE PREVIOUS ATTEMPT'S ERROR, here, after every refusal above and before the saga
+    // exists. A fund failure now leaves `error` on a row whose status does not change, so the
+    // wizard treats any error it sees while polling as belonging to the attempt it just started.
+    // Without this clear the first poll of a retry reads the OLD failure and reports the retry as
+    // failed a second after it began — while it is still in flight.
+    if (rec.error !== null) this.deps.repo.upsert({ ...rec, error: null });
     this.run(p.id, () =>
       this.deps.runSaga({
         spec,
@@ -318,17 +325,64 @@ export class OnboardingRunner {
       try {
         await fn();
       } catch (e) {
-        const cur = this.deps.repo.findByIdempotencyKey(id);
-        if (cur && !TERMINAL.includes(cur.status))
-          this.deps.repo.upsert({
-            ...cur,
-            status: "failed",
-            error: e instanceof Error ? e.message : String(e),
-          });
+        this.recordFailure(id, e);
       } finally {
         this.inFlight.delete(id);
       }
     })();
     this.pending.push(task);
+  }
+
+  /**
+   * EVERY background failure leaves a trace. The 2026-09-14 incident was the absence of this.
+   *
+   * The platform wallet was nearly empty, `fundTreasury` reverted, and nothing at all was written:
+   * no status change, no `error`, no event. The wizard's FundStep polls for `funded` or `failed`,
+   * so it span forever on a transfer that had already failed — and `journalctl` had nothing to say
+   * about it either.
+   *
+   * The cause was a guard that read correctly and behaved wrongly: only a NON-terminal status was
+   * failed-and-recorded, and a fund saga always runs on a `bound` or `funded` entity, both of
+   * which are terminal. So "don't clobber a finished onboarding" silently meant "never report a
+   * fund failure".
+   *
+   * Three cases, and the difference between them is what the status still MEANS afterwards:
+   *
+   *  - **not terminal** — the onboarding itself died part-way. `failed` is the truth; record it.
+   *  - **`bound` / `funded`** — a fund or re-fund attempt failed. The status is still true (the
+   *    entity IS bound; a transfer that never happened does not un-bind it), so the failure is
+   *    recorded BESIDE it: `error` on the row for the poller, and one event on the trail for the
+   *    operator. ⚠ The event is `fundTreasury`/**failed**, and `sumFundedByTenant` sums
+   *    `fundTreasury`/`funded` only — so this cannot consume a cent of anyone's quota.
+   *  - **`failed`** — already dead, with a reason somebody is reading. Left untouched.
+   *
+   * The stored message is ALWAYS `publicErrorMessage(e)`: `entity.error` is served to the browser
+   * and rendered verbatim, which is how a viem diagnostic containing an RPC key put that key on
+   * screen on 2026-09-16.
+   */
+  private recordFailure(id: string, e: unknown) {
+    const error = publicErrorMessage(e);
+    const cur = this.deps.repo.findByIdempotencyKey(id);
+    const fundAttempt = cur?.status === "bound" || cur?.status === "funded";
+    // One line, the PUBLIC message only — `opsLog` redacts PII from an `error` field, but it
+    // cannot know an RPC key when it sees one.
+    opsLog("saga_failed", {
+      entity: id,
+      status: cur?.status ?? "unknown",
+      ...(fundAttempt ? { step: "fundTreasury" } : {}),
+      error,
+    });
+    if (!cur) return;
+    if (!TERMINAL.includes(cur.status)) {
+      this.deps.repo.upsert({ ...cur, status: "failed", error });
+      return;
+    }
+    if (!fundAttempt) return;
+    // Row and trail together: a poll that reads the error and an audit that does not show the
+    // attempt would be two different accounts of the same minute.
+    this.deps.repo.transaction(() => {
+      this.deps.repo.upsert({ ...cur, error });
+      this.deps.repo.recordEvent(id, "fundTreasury", "failed", null, JSON.stringify({ error }));
+    });
   }
 }

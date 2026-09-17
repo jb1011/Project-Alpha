@@ -683,7 +683,12 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       amount: d.fundAmount,
     });
     d.outflows?.record("fund_treasury", d.fundAmount, txHash);
-    const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash };
+    // `error: null` EXPLICITLY, not by inheritance. This spreads `rec`, and since the runner
+    // started recording fund failures without moving the status (2026-09-14), `rec.error` can
+    // carry the previous attempt's reason — `OnboardingRunner.fund` clears it at the door, but a
+    // resume, a reconcile or a direct saga call does not go through that door, and a `funded` row
+    // that still holds an error is read by the wizard as a failure it just caused.
+    const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash, error: null };
     rec = funded;
     d.repo.transaction(() => {
       d.repo.upsert(funded);
