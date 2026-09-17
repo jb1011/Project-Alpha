@@ -421,10 +421,14 @@ export function AgentDashboard({
               />
             )}
             {hedera?.attestor && (
+              // NOT a Hedera account, so it gets no HashScan link: this is the EIP-712 signing
+              // key's EVM address, published on the free document so a verifier knows WHICH key
+              // must have signed a paid attestation. Shown like Operator and Guardian beside it,
+              // which are addresses and not links either.
               <OnChainRow
                 label="Attestor"
                 value={shortAddress(hedera.attestor)}
-                href={hashscanAccountUrl(hedera.attestor)}
+                title="Address of the key that signs this company's paid standing attestations (EIP-712). Not a Hedera account."
               />
             )}
           </dl>
