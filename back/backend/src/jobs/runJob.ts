@@ -19,6 +19,7 @@ import { providerOf, requireCircleWallets } from "../payments/provider";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { EntityRecord } from "../types";
+import { publicErrorMessage } from "../workflow/publicError";
 import type { JobRepository } from "./jobRepository";
 import type { JobRecord } from "./types";
 import type { JobWorker } from "./worker";
@@ -305,7 +306,10 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
         d.jobs.recordEvent(d.jobKey, "reputation", "reputed", repTx, null);
       });
     } catch (e) {
-      rec = { ...rec, error: `reputation pending: ${(e as Error).message}` };
+      // Sanitised (review R7, same class): this is a persisted, caller-visible `error` field on
+      // the JOB record, written from a raw chain error — the exact shape that put an RPC key on
+      // screen on 2026-09-16, one table along.
+      rec = { ...rec, error: `reputation pending: ${publicErrorMessage(e)}` };
       d.jobs.upsert(rec); // stays 'completed' — retryable
     }
   }

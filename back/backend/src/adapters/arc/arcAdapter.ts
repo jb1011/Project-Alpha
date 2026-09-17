@@ -14,6 +14,7 @@ import {
   legalManagerAbi,
   legalManagerFactoryAbi,
 } from "../../abis/generated";
+import { BroadcastUnconfirmedError } from "../../errors";
 import type { TreasuryConfig } from "../../types";
 import { USDC_TRANSFER_GAS } from "./gas";
 import { appendRelayTarget, relayRevertError } from "./relay";
@@ -189,7 +190,14 @@ export class ArcAdapter {
     });
   }
 
-  /** {sendManagerCall} + await the receipt — the tail four of the five relayed sites repeat. */
+  /**
+   * {sendManagerCall} + await the receipt — the tail four of the five relayed sites repeat.
+   *
+   * Goes through the same `confirmed()` as `fundTreasury` (R1). A rule that told the truth about
+   * one receipt and not about the other four would be the next review finding: a bind, a metadata
+   * write and a policy execute all have a post-broadcast window, and a caller that is told
+   * "nothing was sent" about a mined bind resumes into a state it cannot explain.
+   */
   private async sendManagerCallConfirmed(p: {
     target: Address;
     abi: Abi;
@@ -197,9 +205,7 @@ export class ArcAdapter {
     args: readonly unknown[];
     agentManager?: Address;
   }): Promise<Hex> {
-    const hash = await this.sendManagerCall(p);
-    await this.d.publicClient.waitForTransactionReceipt({ hash });
-    return hash;
+    return this.confirmed(await this.sendManagerCall(p), p.functionName);
   }
 
   /**
@@ -260,7 +266,16 @@ export class ArcAdapter {
    * mint on resume rather than broadcasting a second one.
    */
   async confirmCreateEntity(txHash: Hex, agentManager?: Address): Promise<CreateEntityResult> {
-    const receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    // R1, the same window one step earlier and with higher stakes: the agent NFT may already be
+    // minted. A receipt-read failure here is `BroadcastUnconfirmedError` rather than a bare 429,
+    // so nothing above it can say "nothing was sent" about a mint that is on chain — and the
+    // resume path this function's own comment describes stays the honest instruction.
+    let receipt: Awaited<ReturnType<typeof this.d.publicClient.waitForTransactionReceipt>>;
+    try {
+      receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    } catch (e) {
+      throw new BroadcastUnconfirmedError(txHash, "createEntity", { cause: e });
+    }
 
     // Controller mode puts other contracts' logs in this receipt (the controller's own `Relayed`,
     // plus anything the relayed call touches), and EntityCreated(uint256,address,address) is not a
@@ -526,8 +541,62 @@ export class ArcAdapter {
     // Explicit gas (see USDC_TRANSFER_GAS): the manager wallet is well-funded today, but this keeps
     // the near-full-balance estimateGas footgun from biting if it ever runs low.
     const txHash = await this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    // ⚠ EVERYTHING BELOW THIS LINE HAPPENS AFTER THE MONEY LEFT (review R1, Critical).
+    //
+    // `waitForTransactionReceipt` rejects a poll failure verbatim, so the identical
+    // `HttpRequestError{status:429}` that means "the send was refused" also arrives here, where it
+    // means the opposite. This is the only layer that can tell the two apart — it holds the hash —
+    // so it is the layer that says so, and `publicErrorMessage` keys off the TYPE rather than
+    // trying to recover a fact that was never in the text.
+    return await this.confirmed(txHash, "fundTreasury");
+  }
+
+  /**
+   * Await a broadcast transaction's receipt and insist it SUCCEEDED.
+   *
+   * Two failures, told apart because the difference is whether a retry is safe:
+   *  - the receipt could not be READ → `BroadcastUnconfirmedError` (the transaction may be mined;
+   *    nobody may re-send, and the saga reconciles it by hash later);
+   *  - the receipt says `reverted` → a plain failure naming the hash. The transaction is settled
+   *    and it moved nothing, so a retry is fine.
+   *
+   * The revert check is new with R1 and closes a gap nobody had named: `waitForTransactionReceipt`
+   * RESOLVES for a reverted transaction, so `fundTreasury` used to return a hash for a transfer
+   * that moved nothing and step 7 marked the entity `funded`. The reconcile path treats `reverted`
+   * as "send again", and the send path must not be blind to the same fact.
+   */
+  private async confirmed(txHash: Hex, operation: string): Promise<Hex> {
+    let receipt: { status?: string };
+    try {
+      receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    } catch (e) {
+      throw new BroadcastUnconfirmedError(txHash, operation, { cause: e });
+    }
+    if (receipt.status === "reverted")
+      throw new Error(`${operation}: transaction ${txHash} reverted on chain`);
     return txHash;
+  }
+
+  /**
+   * What became of a transaction we already broadcast — asked ONCE, never waited on.
+   *
+   * The reconciliation half of R1: step 7 uses this to resolve a `fundTreasury`/`unconfirmed`
+   * event before it considers sending anything. `getTransactionReceipt` rather than
+   * `waitForTransactionReceipt` on purpose — a saga resuming an old attempt must not block for
+   * viem's 180-second default on a transaction that may have been dropped weeks ago.
+   *
+   * ⚠ `unknown` covers BOTH "still pending" and "dropped", and every transport failure. They are
+   * different facts and this deliberately does not guess between them: the only safe action for
+   * all of them is the same one (refuse, and look again later), and a wrong guess either loses a
+   * mined transfer or sends a second one.
+   */
+  async receiptOutcome(txHash: Hex): Promise<"success" | "reverted" | "unknown"> {
+    try {
+      const receipt = await this.d.publicClient.getTransactionReceipt({ hash: txHash });
+      return receipt.status === "success" ? "success" : "reverted";
+    } catch {
+      return "unknown";
+    }
   }
 
   /** Operator pushes USDC from the treasury to the operator's own EOA, within the cap (onlyOperator). */

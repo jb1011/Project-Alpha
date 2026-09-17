@@ -6,6 +6,7 @@ import type { DoolaApi } from "../adapters/doola/doolaClient";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
+import { BroadcastUnconfirmedError, PriorTransferUnconfirmedError } from "../errors";
 import type { MetadataAnchor } from "../oa/generator";
 import { computeOaHash, renderMetadata, renderOperatingAgreement } from "../oa/generator";
 import {
@@ -27,6 +28,7 @@ import { assertOperatorDistinct, translate } from "../policy/translator";
 import { usdToUnits } from "../policy/units";
 import type { EntityRecord, FormationPin, Hex } from "../types";
 import { runFormationCreateProvider } from "./formationProvider";
+import { publicErrorMessage } from "./publicError";
 
 /** Result of provisioning a per-agent Turnkey vault (the saga only needs these three fields). */
 export interface ProvisionedVault {
@@ -677,29 +679,87 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   //    so this must actually move USDC on a re-run instead of silently skipping it). Skip only if no
   //    amount was requested or the entity isn't funded/fundable yet.
   if (d.fundAmount && d.fundAmount > 0n && (rec.status === "bound" || rec.status === "funded")) {
-    const txHash = await d.arc.fundTreasury({
-      usdc: rec.treasuryConfig!.usdc,
-      treasury: rec.treasury! as Address,
-      amount: d.fundAmount,
-    });
-    d.outflows?.record("fund_treasury", d.fundAmount, txHash);
-    // `error: null` EXPLICITLY, not by inheritance. This spreads `rec`, and since the runner
-    // started recording fund failures without moving the status (2026-09-14), `rec.error` can
-    // carry the previous attempt's reason — `OnboardingRunner.fund` clears it at the door, but a
-    // resume, a reconcile or a direct saga call does not go through that door, and a `funded` row
-    // that still holds an error is read by the wizard as a failure it just caused.
-    const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash, error: null };
-    rec = funded;
-    d.repo.transaction(() => {
-      d.repo.upsert(funded);
-      d.repo.recordEvent(
-        key,
-        "fundTreasury",
-        "funded",
-        txHash,
-        JSON.stringify({ amount: d.fundAmount?.toString() }),
-      );
-    });
+    /**
+     * `error: null` EXPLICITLY, not by inheritance. This spreads `rec`, and since the runner
+     * started recording fund failures without moving the status (2026-09-14), `rec.error` can
+     * carry the previous attempt's reason — `OnboardingRunner.fund` clears it at the door, but a
+     * resume, a reconcile or a direct saga call does not go through that door, and a `funded` row
+     * that still holds an error is read by the wizard as a failure it just caused.
+     */
+    // `base` is passed in rather than read from the enclosing `rec`: inside a closure TypeScript
+    // loses the narrowing that the `if` above established, and a spread of a possibly-undefined
+    // record silently produces a Partial.
+    const finalise = (base: EntityRecord, txHash: Hex, amount: bigint, reconciled: boolean) => {
+      const funded: EntityRecord = { ...base, status: "funded", fundTxHash: txHash, error: null };
+      rec = funded;
+      d.repo.transaction(() => {
+        d.repo.upsert(funded);
+        d.repo.recordEvent(
+          key,
+          "fundTreasury",
+          "funded",
+          txHash,
+          // `amount` is what MOVED, which on the reconcile path is the earlier attempt's amount
+          // rather than this call's — `sumFundedByTenant` reads this field, so a quota that
+          // counted the requested amount instead of the sent one would be fiction.
+          JSON.stringify({ amount: amount.toString(), ...(reconciled ? { reconciled } : {}) }),
+        );
+      });
+    };
+
+    // ── R1(c) RECONCILE BEFORE SENDING. The last `fundTreasury` event is the only one that can
+    //    still be open: a `funded` or `reverted` row after it has already settled the question,
+    //    and reading only the last one is what keeps a later top-up from re-litigating an old hash.
+    const prior = lastFundEvent(d.repo, key);
+    /** Set when a previous broadcast turns out to have landed: this call must not send. */
+    let adopted = false;
+    if (prior?.status === "unconfirmed" && prior.txHash) {
+      const hash = prior.txHash as Hex;
+      const outcome = await d.arc.receiptOutcome(hash);
+      if (outcome === "success") {
+        // It landed. Adopt it and SEND NOTHING — this is the branch that stops the second
+        // transfer the wizard's Retry button would otherwise cause. The outflow was already
+        // recorded when the attempt went unconfirmed, so it is deliberately not recorded again.
+        finalise(rec, hash, priorAmount(prior.detail) ?? d.fundAmount, true);
+        adopted = true;
+      } else if (outcome === "unknown") {
+        // Neither mined nor reverted: finalising would invent a transfer and re-sending might
+        // double one. Refusing is the only honest answer, and the caller is told not to retry yet.
+        throw new PriorTransferUnconfirmedError(hash);
+      } else {
+        // `reverted`: settled, and it moved nothing. Close the row and fall through to a new send.
+        d.repo.recordEvent(key, "fundTreasury", "reverted", hash, JSON.stringify({ outcome }));
+      }
+    }
+
+    if (!adopted) {
+      let txHash: Hex;
+      try {
+        txHash = await d.arc.fundTreasury({
+          usdc: rec.treasuryConfig!.usdc,
+          treasury: rec.treasury! as Address,
+          amount: d.fundAmount,
+        });
+      } catch (e) {
+        // ── R1(b) The money may have left. Record the hash so the next attempt can resolve it,
+        //    and count the outflow NOW: `outflows.record` used to sit after the receipt wait, so a
+        //    transfer that was probably mined was invisible to the S5 ceiling. Over-counting a
+        //    ceiling is conservative; under-counting it is how a brake fails open.
+        if (e instanceof BroadcastUnconfirmedError) {
+          d.repo.recordEvent(
+            key,
+            "fundTreasury",
+            "unconfirmed",
+            e.txHash,
+            JSON.stringify({ amount: d.fundAmount.toString() }),
+          );
+          d.outflows?.record("fund_treasury", d.fundAmount, e.txHash);
+        }
+        throw e;
+      }
+      d.outflows?.record("fund_treasury", d.fundAmount, txHash);
+      finalise(rec, txHash, d.fundAmount, false);
+    }
   }
 
   // ── Step 8 (optional): ENSIP-25 reverse binding. Write the agent's ENS name onto the registry
@@ -726,7 +786,10 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         "setEnsMetadata",
         rec.status,
         null,
-        `ens binding skipped: ${(e as Error).message}`,
+        // Sanitised (review R7): `events.detail` is persisted and goes through `redactPii` only,
+        // which is blind to credentials by its own comment. This is the same raw viem message that
+        // carried the RPC key on 2026-09-16, one column along.
+        `ens binding skipped: ${publicErrorMessage(e)}`,
       );
     }
   }
@@ -764,10 +827,39 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         "formationCreate",
         rec.status,
         null,
-        `formation create skipped: ${(e as Error).message}`,
+        // Sanitised for the reason the ENS catch above is (review R7).
+        `formation create skipped: ${publicErrorMessage(e)}`,
       );
     }
   }
 
   return rec;
+}
+
+/**
+ * The most recent `fundTreasury` event, or undefined.
+ *
+ * "Most recent" is the whole rule (R1c): `listEvents` is ordered by id, so the last row is the
+ * current state of the funding question. An `unconfirmed` row followed by a `funded` or `reverted`
+ * one is settled history, and a top-up months later must not re-resolve it.
+ */
+function lastFundEvent(
+  repo: EntityRepository,
+  key: string,
+): { status: string; txHash: string | null; detail: string | null } | undefined {
+  const rows = repo.listEvents(key).filter((e) => e.step === "fundTreasury");
+  return rows.length ? rows[rows.length - 1] : undefined;
+}
+
+/** The amount an earlier attempt actually sent, off its event detail. */
+function priorAmount(detail: string | null): bigint | undefined {
+  if (!detail) return undefined;
+  try {
+    const amount = (JSON.parse(detail) as { amount?: unknown }).amount;
+    return typeof amount === "string" ? BigInt(amount) : undefined;
+  } catch {
+    // A detail we cannot parse must not crash a reconciliation; the caller falls back to the
+    // amount it was asked for.
+    return undefined;
+  }
 }

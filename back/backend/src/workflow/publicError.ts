@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { BaseError } from "viem";
+import { BroadcastUnconfirmedError, PriorTransferUnconfirmedError } from "../errors";
 
 /**
  * THE ONE PLACE a failure becomes a sentence we are willing to show a stranger.
@@ -35,9 +37,31 @@ import { BaseError } from "viem";
 /** How far to walk a `cause` chain. Same bound as `decodedRevertName` in adapters/arc/relay.ts. */
 const MAX_CAUSE_HOPS = 8;
 
-/** The public sentence for a throttled RPC. "Nothing was sent" is the actionable half. */
+/**
+ * The public sentence for a throttled RPC.
+ *
+ * ⚠ "Nothing was sent" is a claim about a BROADCAST, and it is only true in one of the two windows
+ * a 429 arrives in. It survives here because the other window is now caught above it by type:
+ * `BroadcastUnconfirmedError` is thrown the moment a hash exists, so anything that reaches this
+ * sentence was refused before the send. Two gates keep that true — the type check, and R2's
+ * requirement that a viem error be in the chain at all. Do not add a third caller.
+ */
 export const RATE_LIMIT_MESSAGE =
   "The chain RPC is rate-limiting us right now. Nothing was sent; try again in a minute.";
+
+/** The sent-but-unknown sentence. Names the hash so a founder can read it off the screen, and
+ *  forbids the retry that would otherwise move the same money twice. */
+export const broadcastUnconfirmedMessage = (txHash: string) =>
+  `The transfer was sent (${shortHash(txHash)}) but we could not confirm it yet. Do not retry: it will appear on the dashboard once confirmed.`;
+
+/** The refusal: a previous broadcast is unresolved, so this request did nothing. */
+export const priorTransferUnconfirmedMessage = (txHash: string) =>
+  `A previous transfer (${shortHash(txHash)}) has not been confirmed yet, so nothing new was sent. Do not retry until it appears on the dashboard.`;
+
+/** `0x1234…efab` — enough to find the transaction, short enough to read off a screenshot. */
+function shortHash(txHash: string): string {
+  return txHash.length > 12 ? `${txHash.slice(0, 6)}…${txHash.slice(-4)}` : txHash;
+}
 
 /** The public sentence for the 2026-09-14 incident: the platform wallet was at 0.676 USDC. */
 export const PLATFORM_FUNDS_MESSAGE =
@@ -67,17 +91,144 @@ const RATE_LIMITED =
  */
 const PLATFORM_OUT_OF_FUNDS = /insufficient\s+funds|exceeds\s+the\s+balance|exceeds\s+balance/i;
 
-/** Every scheme-ful URL, greedily up to the first character that cannot be in one. */
-const URL_RUN = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>)\]}\\]+/gi;
+/**
+ * Every scheme-ful URL, greedily up to the first character that cannot be in one.
+ *
+ * ⚠ NO leading `\b` (review R4). It could not match between `_` and `h`, so
+ * `RPC_URL_https://host/v2/KEY` was invisible to the scan and passed through whole, key included.
+ * The pattern needs no anchor: without one it can only ever match MORE.
+ */
+const URL_RUN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>)\]}\\]+/gi;
 
-/** A hex run longer than a 32-byte hash: a raw transaction, calldata, a signature, a blob. */
+/**
+ * A hex run longer than a 32-byte hash: a raw transaction, calldata, a signature, a blob.
+ *
+ * ⚠ The threshold is deliberate and it is a TRADE (review R5): a 64-hex value is kept, because
+ * that is the shape of a transaction hash and an operator needs it — but it is also the shape of a
+ * private key or a seed. Nothing in this codebase prints one today (checked: viem's key validators
+ * throw value-free, and `src/secrets/index.ts` prints the NAME), and the labelled shape
+ * (`private key 0x…`, `seed 0x…`) is caught by `LABELLED_SECRET` below rather than by length.
+ */
 const LONG_HEX = /0x[0-9a-fA-F]{65,}/g;
 
+/**
+ * A credential named by its own label, outside a URL (review R6).
+ *
+ * `Authorization: Bearer …`, `"x-api-key":"…"`, `apiKey=…`, `private key 0x…`. No producer does
+ * this today — viem prints Status/URL/body and never headers — but the whole point of this file is
+ * to hold when a producer surprises us.
+ *
+ * The value must LOOK like a credential (12+ characters from a credential alphabet), which is what
+ * keeps "token expired", "secret invalid" and `DOOLA_WEBHOOK_SECRET is missing` readable: erring
+ * toward redaction is right, erring toward unreadable diagnostics is not.
+ */
+const LABELLED_SECRET =
+  /\b(authorization|bearer|api[-_ ]?key|apikey|x-api-key|token|secret|seed|private[-_ ]?key)\b(\s*["']?\s*[:=]\s*["']?\s*|\s+)([A-Za-z0-9._~+/=-]{12,})/gi;
+
+/** The operator's budget. Bigger than the browser's, and through the same sanitiser. */
+const MAX_DIAGNOSTIC_LENGTH = 600;
+
 export function publicErrorMessage(e: unknown): string {
+  // ── TYPE FIRST, text second. The two money-truth cases are facts the thrower KNEW, and no
+  //    amount of message matching can recover a fact that was never in the text.
+  const unconfirmed = firstInChain(e, isBroadcastUnconfirmed);
+  if (unconfirmed) return broadcastUnconfirmedMessage(unconfirmed.txHash);
+  const prior = firstInChain(e, isPriorTransferUnconfirmed);
+  if (prior) return priorTransferUnconfirmedMessage(prior.txHash);
+
   const diagnostic = fullDiagnostic(e);
-  if (RATE_LIMITED.test(diagnostic)) return RATE_LIMIT_MESSAGE;
+  // ⚠ Gated on a viem error being in the chain (review R2). `fullDiagnostic` reads a numeric
+  // `status` off ANY error, and axios exposes `e.status === 429` — so a Circle or doola 429 used
+  // to be reported as the CHAIN rate-limiting us, and as nothing having been sent, while a Circle
+  // transaction was in flight. The sentence names an actor; it may only be used once that actor
+  // has been identified.
+  if (viemErrorIn(e) && RATE_LIMITED.test(diagnostic)) return RATE_LIMIT_MESSAGE;
   if (PLATFORM_OUT_OF_FUNDS.test(diagnostic)) return PLATFORM_FUNDS_MESSAGE;
-  return sanitise(baseMessage(e));
+  return sanitise(baseMessage(e), MAX_LENGTH);
+}
+
+/**
+ * THE OPERATOR'S VERSION: the whole cause chain, sanitised, no matcher substitution (Q4).
+ *
+ * The browser gets one sentence because a founder can act on one sentence. journald gets the chain
+ * because an operator cannot act on "the chain RPC is rate-limiting us" three days later. One
+ * sanitiser, two budgets, and neither output carries a credential — journald is a lower bar than
+ * the browser (readable by every member of `systemd-journal`, and copied into `/var/log/syslog`
+ * wherever rsyslog is installed), not a vault.
+ */
+export function operatorDiagnostic(e: unknown): string {
+  return sanitise(fullDiagnostic(e, { withNames: true }), MAX_DIAGNOSTIC_LENGTH);
+}
+
+/**
+ * A stable 8-hex join key for one failure (Q4).
+ *
+ * Appended to the stored public sentence and emitted on the ops line, so a founder's screenshot
+ * ("… (ref 4f2a9c11)") finds the journald entry that has the whole chain — with nothing secret in
+ * transit either way. Digested from the RAW diagnostic, deliberately: the digest reveals nothing,
+ * and hashing the raw text is what makes the same failure produce the same ref.
+ */
+export function errorRef(e: unknown): string {
+  return createHash("sha256")
+    .update(fullDiagnostic(e, { withNames: true }))
+    .digest("hex")
+    .slice(0, 8);
+}
+
+/**
+ * The three fields a FAILURE is recorded with: the sentence (ref-suffixed), the operator's chain,
+ * and the key that joins them.
+ *
+ * One function rather than three calls at each site, so a caller cannot store a sentence whose ref
+ * belongs to a different error.
+ */
+export function publicFailure(e: unknown): { error: string; errorDetail: string; ref: string } {
+  const ref = errorRef(e);
+  return {
+    error: `${publicErrorMessage(e)} (ref ${ref})`,
+    errorDetail: operatorDiagnostic(e),
+    ref,
+  };
+}
+
+/** Walk the `cause` chain for the first error a predicate accepts. Hop-bounded (cycles exist). */
+function firstInChain<T>(e: unknown, pick: (x: unknown) => T | undefined): T | undefined {
+  for (let cur: unknown = e, hops = 0; cur != null && hops < MAX_CAUSE_HOPS; hops++) {
+    const hit = pick(cur);
+    if (hit) return hit;
+    if (!(cur instanceof Error)) return undefined;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * `instanceof` by NAME as well as by class.
+ *
+ * The class check is the real one. The name check is the seatbelt: `src/errors.ts` is loaded once,
+ * but a bundler, a duplicated dependency tree or a structured-clone boundary can produce a second
+ * copy of a class, and the cost of a missed `instanceof` here is the message that invites a double
+ * transfer.
+ */
+function isBroadcastUnconfirmed(x: unknown): BroadcastUnconfirmedError | undefined {
+  return x instanceof BroadcastUnconfirmedError ||
+    ((x as Error)?.name === "BroadcastUnconfirmedError" &&
+      typeof (x as BroadcastUnconfirmedError)?.txHash === "string")
+    ? (x as BroadcastUnconfirmedError)
+    : undefined;
+}
+
+function isPriorTransferUnconfirmed(x: unknown): PriorTransferUnconfirmedError | undefined {
+  return x instanceof PriorTransferUnconfirmedError ||
+    ((x as Error)?.name === "PriorTransferUnconfirmedError" &&
+      typeof (x as PriorTransferUnconfirmedError)?.txHash === "string")
+    ? (x as PriorTransferUnconfirmedError)
+    : undefined;
+}
+
+/** The viem error in the chain, if any — the gate on every sentence that blames the chain. */
+function viemErrorIn(e: unknown): BaseError | undefined {
+  return firstInChain(e, (x) => (x instanceof BaseError ? x : undefined));
 }
 
 /**
@@ -88,22 +239,32 @@ export function publicErrorMessage(e: unknown): string {
  * "HTTP request failed." and whose `status` is 429. Matching on text alone would miss it, which is
  * exactly the case the September retry storm was made of.
  *
- * NEVER returned to a caller — only tested against.
+ * NEVER returned to a caller RAW — the matchers test against it, and `operatorDiagnostic` returns
+ * it only after `sanitise`.
+ *
+ * `withNames` adds each hop's class name (and viem's `shortMessage`), which is what makes the
+ * operator's copy readable — `HttpRequestError` before "HTTP request failed." is the difference
+ * between a log line and a diagnosis. The matchers do not need it, so they do not pay for it.
  */
-function fullDiagnostic(e: unknown): string {
+function fullDiagnostic(e: unknown, opts: { withNames?: boolean } = {}): string {
   const parts: string[] = [];
   for (let cur: unknown = e, hops = 0; cur != null && hops < MAX_CAUSE_HOPS; hops++) {
     if (cur instanceof Error) {
-      parts.push(cur.message);
-      const { status, code, details } = cur as {
+      parts.push(opts.withNames ? `${cur.name}: ${cur.message}` : cur.message);
+      const { status, code, details, shortMessage } = cur as {
         status?: unknown;
         code?: unknown;
         details?: unknown;
+        shortMessage?: unknown;
       };
+      // ⚠ The property branch is LOAD-BEARING (review R8): a 429 from a transport that renders no
+      // `Status:` line exists only here. Deleting these lines used to leave the suite green;
+      // `publicError.test.ts` now has a BaseError whose 429 is a property and nothing else.
       if (typeof status === "number") parts.push(`status ${status}`);
       if (typeof code === "number") parts.push(`${code}`);
       if (typeof code === "string") parts.push(code);
       if (typeof details === "string") parts.push(details);
+      if (opts.withNames && typeof shortMessage === "string") parts.push(shortMessage);
       cur = (cur as { cause?: unknown }).cause;
     } else {
       parts.push(String(cur));
@@ -134,17 +295,27 @@ function baseMessage(e: unknown): string {
 /**
  * Strip credentials and bytes, then make it one line of bounded copy.
  *
- * The order matters: URLs go first (so a key in a path is gone before anything else looks at the
- * text), then long hex runs (a raw transaction is not a secret, but it is 600 useless characters
- * that would eat the whole budget), then whitespace, then the cap.
+ * The order matters. URLs go first, so a key in a path is gone before anything else looks at the
+ * text. Then LABELLED credentials — after the URL rule, because a URL is already an origin by
+ * then and cannot be mistaken for a bearer token's value. Then long hex runs (a raw transaction is
+ * not a secret, but it is 600 useless characters that would eat the whole budget), then
+ * whitespace, then the cap.
+ *
+ * The cap is a parameter because there are two audiences with the same safety rules and different
+ * budgets: 300 characters of copy for the browser, 600 for journald.
  */
-function sanitise(message: string): string {
+function sanitise(message: string, cap: number): string {
   const withoutUrls = message.replace(URL_RUN, (raw) => originOf(raw));
+  const withoutSecrets = withoutUrls.replace(LABELLED_SECRET, (_m, label, sep) => {
+    // `sep` keeps the shape recognisable (`Bearer <redacted>`, `"x-api-key":"<redacted>"`) so the
+    // line still reads as the header it was.
+    return `${label}${sep}<redacted>`;
+  });
   // First 10 characters — "0x" plus 8 hex — is enough to correlate with a log line and far too
   // little to be a signature, a key or a transaction.
-  const withoutBlobs = withoutUrls.replace(LONG_HEX, (hex) => `${hex.slice(0, 10)}…`);
+  const withoutBlobs = withoutSecrets.replace(LONG_HEX, (hex) => `${hex.slice(0, 10)}…`);
   const oneLine = withoutBlobs.replace(/\s+/g, " ").trim();
-  return oneLine.length > MAX_LENGTH ? `${oneLine.slice(0, MAX_LENGTH - 1)}…` : oneLine;
+  return oneLine.length > cap ? `${oneLine.slice(0, cap - 1)}…` : oneLine;
 }
 
 /**
