@@ -305,5 +305,5 @@ set, refuses outright when `NODE_ENV=production`, and prints `DEMO ONLY` as its 
   Guarded even though it targets the deployed backend.
 
 ## v2 hardening
-Known production-hardening items (crash-safety, concurrency, Turnkey, etc.) are tracked in
-`../docs/V2_HARDENING_BACKLOG.md`. None block the testnet demo.
+Known production-hardening items (crash-safety, concurrency, Turnkey, etc.) are tracked by the team.
+None block the testnet demo.

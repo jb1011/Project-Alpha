@@ -1,11 +1,9 @@
-# Runbook: testing guardian flows with fake humans (World Sandbox)
+# Runbook: testing guardian flows in the World Sandbox
 
 *2026-07-30. Why this exists: prod enforces `WORLD_REQUIRE_GUARDIAN` and World's sybil protection
 means one real human can back exactly one tenant per action — so your own World ID cannot test the
-"fresh unverified user" path, the sybil rejection path, or multi-human scenarios. During the
-post-hackathon audit we worked around this by flipping the prod action (`guardian-audit`), which
-worked but touched production. The Sandbox makes all of that a local, repeatable, five-minute
-routine. Background: `docs/research/2026-07-30-world-identity-research.md`.*
+"fresh unverified user" path, the sybil rejection path, or multi-human scenarios. The Sandbox makes all of that a local, repeatable, five-minute
+routine.*
 
 ## What the Sandbox gives us
 

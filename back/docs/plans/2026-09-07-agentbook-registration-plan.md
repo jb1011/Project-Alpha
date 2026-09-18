@@ -2710,8 +2710,8 @@ Design: `docs/design/2026-08-25-agentbook-registration-design.md` (v3). Audit: `
 
 ## The first live registration (one-off, mainnet)
 
-Preconditions: prod backend, `NODE_ENV=production`, the founder's own World ID (Orb), a circle
-agent whose `pocketAddress` is stored. The founder accepts that their AgentBook pseudonym is
+Preconditions: prod backend, `NODE_ENV=production`, a team member's own World ID (Orb), a circle
+agent whose `pocketAddress` is stored. They accept that their AgentBook pseudonym is
 permanently linked to this agent and to the `/proof` demo key from Lisbon.
 
 1. Open the agent dashboard, press "Vouch in AgentBook", read the dialog, tick the box.

@@ -96,8 +96,8 @@ the RPC for ERC-1271 checks.
 video can only show "Novi agent passes Novi's seller".
 
 **H5. PR #98 not deployed (P-2).** Live JSON says `humanVerified: true` for waiver guardians. The
-interface page looks amber because it checks `credential` first; the API lies.
-→ Deploy to novi-prod and verify by curl before any AgentBook surface; write "deployed and verified"
+interface page looks amber because it checks `credential` first; the API response is the part that needs the fix (#98).
+→ Deploy to prod and verify by curl before any AgentBook surface; write "deployed and verified"
 into the plan's prerequisites.
 
 **H6. Persistence shape does not carry the flow (A-2, S-3, S-7).** §3 needs a session row, §4.4 has
@@ -161,7 +161,7 @@ Orb group). The track's remote test can cover only the guardian verification and
 gate. Nothing is deployed with `WORLD_ENVIRONMENT=sandbox`.
 → Plan item, not design: a sandbox-pointed backend process plus a Vercel preview with
 `NEXT_PUBLIC_API_URL` at it; the feedback doc states plainly that AgentBook has no sandbox and the
-live registration was done on mainnet with the founder's World ID.
+live registration was done on mainnet with a team member's World ID.
 
 **M7. D9 already violated on prod (P-6, S-4, P-12).** Dashboard chip "AgentBook · human-backed" in
 green; personhood page repeats the wording; `TenantRecord` shows a waiver guardian as green
@@ -173,7 +173,7 @@ decks marked superseded in the plan.
 **M8. World App copy and the one-proof question (P-5).** The requester shown in World App is
 "AgentKit", not "AgentBook"; Face Auth may be requested; the action is configured with
 `max_verifications: 1`, though second proofs per human have been observed in the wild and the CLI
-never calls cloud verify. The founder's World ID already produced one AgentBook proof for the demo
+never calls cloud verify. A team member's World ID already produced one AgentBook proof for the demo
 key.
 → Copy fixed. The one live registration happens on day one of the build, before UI polish, because
 it settles constants, copy and the many-agents-per-human question at once. `max_verifications` goes
@@ -274,11 +274,11 @@ Dual registration on Base.
 1. **Chain.** Register on World Chain now, parameterised and pinned, and ask World which chain the
    verifier will read. Recommended. Alternative: wait for World's answer, which risks the deadline.
 2. **Which agent and which World ID** for the live registration, with the permanent linkage accepted.
-   Recommended: a circle agent on prod, the founder's World ID.
+   Recommended: a circle agent on prod, a team member's World ID.
 3. **Testnet registration.** Prod runs Arc testnet until the 16th; a real pseudonym vouching for a
    testnet agent's pocket is permanent. Recommended: allow, and say "this agent runs on Arc testnet"
    in the dialog. Alternative: gate on `ARC_NETWORK=mainnet` and register after the 16th.
-4. **Who deploys PR #98** to novi-prod, since deploys are in colleagues' hands.
+4. **Who deploys PR #98** to prod, since deploys are in colleagues' hands.
 5. **Sandbox deployment** for the judge's remote test: a second backend process plus a Vercel preview
    (about half a day), or a recorded local sandbox session.
 
