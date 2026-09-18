@@ -944,7 +944,9 @@ async function main() {
   //
   //    One pass, one receipt read per outstanding transfer, and a no-op (with no RPC call at all)
   //    in the normal case where nothing is outstanding.
-  const funding = await sweepUnresolvedFunding({ repo, arc });
+  //    `busy` is the runner's per-entity lock: the socket is already open, so a fund can arrive
+  //    mid-sweep, and the sweep must never resolve a submission a saga is confirming.
+  const funding = await sweepUnresolvedFunding({ repo, arc, busy: (key) => runner.isBusy(key) });
   if (funding.checked)
     console.log(
       `Funding sweep at boot: ${funding.checked} checked, ${funding.finalised} finalised, ${funding.reverted} reverted, ${funding.unresolved} still unresolved`,

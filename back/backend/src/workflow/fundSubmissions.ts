@@ -28,42 +28,100 @@ import type { EntityRecord, Hex } from "../types";
  * the boot sweep (so a process that died inside a receipt wait heals with no user retry at all).
  */
 
-/** What a resolution pass decided about one entity's outstanding transfers. */
-export type Resolution =
-  /** A broadcast landed: finalise from this hash, send nothing. */
-  | { kind: "funded"; txHash: Hex; amount: bigint | undefined }
-  /** Everything outstanding reverted (or there was nothing outstanding): a new send is correct. */
-  | { kind: "clear" }
-  /** At least one transfer is still unreadable: neither finalise nor send. */
-  | { kind: "unresolved"; txHash: Hex };
+/** One transfer that is known to have landed, and the amount it moved. */
+export type Landed = { txHash: Hex; amount: bigint | undefined };
+
+/**
+ * What a resolution pass found. Both halves can be non-empty at once, deliberately: a landed
+ * transfer is a fact worth recording even while a sibling is still unreadable (gate N7 — a pass
+ * adopts EVERY landed submission, because adopting one and leaving the other under-counts the
+ * tenant's quota by a whole transfer).
+ */
+export type Resolution = {
+  /** Every submission confirmed mined in this pass, oldest first. */
+  landed: Landed[];
+  /** Set when something is still neither mined nor settled: no new transfer may be sent. */
+  unresolved?: Hex;
+};
 
 /**
  * Ask the chain about every unresolved submission of one entity and decide what may happen next.
  *
- * Records a `reverted` event for each settled-and-failed transfer as it goes: that is durable
- * progress, and it is what lets a later attempt stop asking about it.
+ * FOUR rules, and the last two are the ones that took a second round to get right. They are the
+ * AgentBook reconciler's rules (`workflow/agentBookReconcile.ts`), applied to money:
  *
- * ⚠ ORDER OF PRECEDENCE when an entity somehow has several outstanding (a restart can leave one;
- * two would need a second process, which today's single-VPS deployment does not have):
- * `unresolved` beats `funded` beats `clear`. An unreadable receipt means we cannot say what this
- * entity's funding totals, and the only safe answer to "should I send more?" is no.
+ *  1. receipt says SUCCESS  → landed; adopt it, send nothing.
+ *  2. receipt says REVERTED → record `reverted`; it moved nothing, so a new send is correct.
+ *  3. no receipt, and the platform account's MINED nonce has moved PAST this transaction's nonce →
+ *     ask for the receipt ONE more time (it may have mined in the gap between the two reads — the
+ *     registrar's rule, and skipping it turns a success into a failure), and if it is still absent,
+ *     record `dropped`. Terminal: the nonce is spent by something else, these bytes can never mine,
+ *     and a new send is allowed. Its S5 entry stays, conservatively.
+ *  4. no receipt and the nonce has NOT moved → the transaction is still pending, or the node never
+ *     accepted it. Re-broadcast the SAME signed bytes (idempotent; at worst the node already has
+ *     them) and stay unresolved. ⚠ Never re-SIGN here: a new signature is a new nonce, which is
+ *     how one transfer becomes two.
+ *
+ * A row from before the raw-tx design (no `rawTx`/`nonce`) simply skips rules 3 and 4 and stays
+ * unresolved — the old, safe behaviour.
  */
 export async function resolveSubmissions(
-  deps: { repo: EntityRepository; arc: Pick<ArcAdapter, "receiptOutcome"> },
+  deps: {
+    repo: EntityRepository;
+    arc: Pick<ArcAdapter, "receiptOutcome" | "platformNonce" | "sendRawFundTreasury">;
+    log?: typeof opsLog;
+  },
   key: string,
 ): Promise<Resolution> {
-  let landed: { txHash: Hex; amount: bigint | undefined } | undefined;
+  const log = deps.log ?? opsLog;
+  const out: Resolution = { landed: [] };
   for (const row of deps.repo.listUnresolvedFundSubmissions(key)) {
     const txHash = row.txHash as Hex;
+    const amount = parseAmount(row.amount);
     const outcome = await deps.arc.receiptOutcome(txHash);
-    if (outcome === "unknown") return { kind: "unresolved", txHash };
     if (outcome === "success") {
-      landed ??= { txHash, amount: parseAmount(row.amount) };
+      out.landed.push({ txHash, amount });
       continue;
     }
-    deps.repo.recordEvent(key, "fundTreasury", "reverted", txHash, JSON.stringify({ outcome }));
+    if (outcome === "reverted") {
+      deps.repo.recordEvent(key, "fundTreasury", "reverted", txHash, JSON.stringify({ outcome }));
+      continue;
+    }
+    // ── Unreadable. Pending, or gone?
+    if (row.nonce !== null) {
+      const chainNonce = await deps.arc.platformNonce();
+      if (chainNonce > row.nonce) {
+        // The chain moved past our nonce. It could have moved past it by mining OUR transaction,
+        // in the window between the receipt read above and this one — so ask again before calling
+        // a success a failure.
+        if ((await deps.arc.receiptOutcome(txHash)) === "success") {
+          out.landed.push({ txHash, amount });
+          continue;
+        }
+        deps.repo.recordEvent(
+          key,
+          "fundTreasury",
+          "dropped",
+          txHash,
+          JSON.stringify({ nonce: row.nonce, chainNonce }),
+        );
+        log("fund_submission_dropped", { entity: key, txHash, nonce: row.nonce, chainNonce });
+        continue;
+      }
+    }
+    if (row.rawTx) {
+      // Rule 4. A failure here changes nothing — the submission is already recorded and the next
+      // pass will try again — so it must not turn into the caller's error.
+      try {
+        await deps.arc.sendRawFundTreasury(row.rawTx as Hex);
+        log("fund_submission_rebroadcast", { entity: key, txHash });
+      } catch {
+        log("fund_submission_rebroadcast_failed", { entity: key, txHash });
+      }
+    }
+    out.unresolved ??= txHash;
   }
-  return landed ? { kind: "funded", ...landed } : { kind: "clear" };
+  return out;
 }
 
 /**
@@ -83,7 +141,7 @@ export function recordSubmission(
     outflows?: { record(path: "fund_treasury", amountAtomic: bigint, ref: string | null): void };
   },
   key: string,
-  txHash: Hex,
+  signed: { txHash: Hex; rawTx: Hex; nonce: number },
   amount: bigint,
 ): void {
   deps.repo.transaction(() => {
@@ -91,10 +149,13 @@ export function recordSubmission(
       key,
       "fundTreasury",
       "submitted",
-      txHash,
-      JSON.stringify({ amount: amount.toString() }),
+      signed.txHash,
+      // `rawTx` is what makes a re-broadcast the SAME transaction rather than a second one, and
+      // `nonce` is the only way to tell a pending transfer from a dropped one. Both are public
+      // facts about a transaction we are about to put on a public chain.
+      JSON.stringify({ amount: amount.toString(), rawTx: signed.rawTx, nonce: signed.nonce }),
     );
-    deps.outflows?.record("fund_treasury", amount, txHash);
+    deps.outflows?.record("fund_treasury", amount, signed.txHash);
   });
 }
 
@@ -115,14 +176,19 @@ export function finaliseFunded(
   const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash, error: null };
   repo.transaction(() => {
     repo.upsert(funded);
-    repo.recordEvent(
+    // ⚠ IDEMPOTENT PER HASH, and the guard is IN the INSERT (gate N5). The boot sweep is awaited
+    // after `serve()`, so it walks its queue while `POST /entities/:id/fund` is being served: the
+    // sweep and a live saga could both finalise the same transfer, and the measured result was two
+    // `funded` rows for one transfer with the tenant's lifetime cap charged twice. A check-then-
+    // insert in TypeScript would only narrow that window; `recordFundedOnce` is one statement, so
+    // there is no window at all.
+    //
+    // `amount` is what MOVED, which on a reconcile is the earlier attempt's figure rather than
+    // this call's — `sumFundedByTenant` reads this field, so a quota that counted the requested
+    // amount instead of the sent one would be fiction.
+    repo.recordFundedOnce(
       rec.idempotencyKey,
-      "fundTreasury",
-      "funded",
       txHash,
-      // `amount` is what MOVED, which on a reconcile is the earlier attempt's figure rather than
-      // this call's — `sumFundedByTenant` reads this field, so a quota that counted the requested
-      // amount instead of the sent one would be fiction.
       JSON.stringify({ amount: amount.toString(), ...(reconciled ? { reconciled } : {}) }),
     );
   });
@@ -144,35 +210,68 @@ export function finaliseFunded(
  */
 export async function sweepUnresolvedFunding(deps: {
   repo: EntityRepository;
-  arc: Pick<ArcAdapter, "receiptOutcome">;
+  arc: Pick<ArcAdapter, "receiptOutcome" | "platformNonce" | "sendRawFundTreasury">;
+  /**
+   * Is a saga already working on this entity? The runner's per-entity `inFlight` lock (gate N5).
+   *
+   * The sweep runs after `serve()`, so the socket is open and a fund can arrive at any moment
+   * during it. Skipping a busy entity is what keeps the sweep from resolving a submission the saga
+   * is in the middle of confirming; a skipped row is not lost, it is simply someone else's job
+   * right now, and the next boot (or the next attempt) sees it.
+   */
+  busy?: (key: string) => boolean;
   log?: typeof opsLog;
-}): Promise<{ checked: number; finalised: number; reverted: number; unresolved: number }> {
+}): Promise<{
+  checked: number;
+  finalised: number;
+  reverted: number;
+  dropped: number;
+  unresolved: number;
+  skipped: number;
+}> {
   const log = deps.log ?? opsLog;
   const rows = deps.repo.listUnresolvedFundSubmissions();
-  const out = { checked: rows.length, finalised: 0, reverted: 0, unresolved: 0 };
-  for (const row of rows) {
-    const txHash = row.txHash as Hex;
-    const rec = deps.repo.findByIdempotencyKey(row.idempotencyKey);
-    if (!rec) continue;
-    const outcome = await deps.arc.receiptOutcome(txHash);
-    if (outcome === "success") {
-      finaliseFunded(deps.repo, rec, txHash, parseAmount(row.amount) ?? 0n, true);
-      out.finalised++;
-    } else if (outcome === "reverted") {
-      deps.repo.recordEvent(
-        row.idempotencyKey,
-        "fundTreasury",
-        "reverted",
-        txHash,
-        JSON.stringify({ outcome }),
-      );
-      out.reverted++;
-    } else {
-      // Still unreadable. Left exactly as it is — and still counted against the tenant's cap,
-      // because the money is still presumed gone.
-      out.unresolved++;
+  const out = {
+    checked: rows.length,
+    finalised: 0,
+    reverted: 0,
+    dropped: 0,
+    unresolved: 0,
+    skipped: 0,
+  };
+  // One pass per ENTITY, not per row: `resolveSubmissions` already adopts every landed submission
+  // an entity has (gate N7), and asking about the same entity twice would re-read receipts that
+  // the first pass just settled.
+  for (const key of [...new Set(rows.map((r) => r.idempotencyKey))]) {
+    if (deps.busy?.(key)) {
+      out.skipped += rows.filter((r) => r.idempotencyKey === key).length;
+      log("fund_sweep_skipped_busy", { entity: key });
+      continue;
     }
-    log("fund_submission_swept", { entity: row.idempotencyKey, txHash, outcome });
+    const before = deps.repo.listUnresolvedFundSubmissions(key).length;
+    const resolution = await resolveSubmissions(deps, key);
+    for (const landed of resolution.landed) {
+      const rec = deps.repo.findByIdempotencyKey(key);
+      if (!rec) continue;
+      finaliseFunded(deps.repo, rec, landed.txHash, landed.amount ?? 0n, true);
+      out.finalised++;
+    }
+    // Whatever is still open after the pass was neither mined nor settled; the rest were closed as
+    // `reverted` or `dropped`, and those two are told apart by re-reading the rows.
+    const stillOpen = deps.repo.listUnresolvedFundSubmissions(key).length;
+    out.unresolved += stillOpen;
+    const settled = before - out.finalised - stillOpen;
+    if (settled > 0) {
+      const closed = deps.repo
+        .listEvents(key)
+        .filter(
+          (e) => e.step === "fundTreasury" && (e.status === "reverted" || e.status === "dropped"),
+        )
+        .slice(-settled);
+      out.reverted += closed.filter((e) => e.status === "reverted").length;
+      out.dropped += closed.filter((e) => e.status === "dropped").length;
+    }
+    log("fund_submission_swept", { entity: key, landed: resolution.landed.length });
   }
   return out;
 }

@@ -79,11 +79,17 @@ function makeFakeArc() {
     setAgentWallet: vi.fn(async () => "0xbind" as const),
     walletSetDeadline: vi.fn(async () => 9_999_999_999n),
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
-    // The saga uses the broadcast/confirm seam (the hash must be durable before anything waits on
-    // a receipt); `fundTreasury` stays for the CLI and the anvil tests.
-    broadcastFundTreasury: vi.fn(async () => "0xfund" as `0x${string}`),
+    // The saga signs, records, sends and then confirms (the hash must be ours — and written down —
+    // before anything is on the wire); `fundTreasury` stays for the CLI and the anvil tests.
+    signFundTreasury: vi.fn(async () => ({
+      rawTx: "0xrawfund" as `0x${string}`,
+      txHash: "0xfund" as `0x${string}`,
+      nonce: 1,
+    })),
+    sendRawFundTreasury: vi.fn(async () => "0xfund" as `0x${string}`),
     confirmFundTreasury: vi.fn(async (h: `0x${string}`) => h),
     receiptOutcome: vi.fn(async () => "success" as const),
+    platformNonce: vi.fn(async () => 1),
     fundTreasury: vi.fn(async () => "0xfund" as `0x${string}`),
     getAgentMetadata: vi.fn(async () => "0x" as `0x${string}`),
     setAgentMetadata: vi.fn(async () => "0xens" as `0x${string}`),
@@ -380,9 +386,10 @@ test("NON-FATAL: doola throwing leaves funding and ENS untouched and the saga re
 
   // The onboarding completed in full: money moved, ENS was written, the record is `funded`.
   expect(rec.status).toBe("funded");
-  // The saga funds through the broadcast/confirm seam now (the hash has to be durable before
-  // anything waits on a receipt); "funding happened exactly once" is the same assertion.
-  expect(arc.broadcastFundTreasury).toHaveBeenCalledTimes(1);
+  // The saga funds through the sign/send/confirm seam now (the hash has to be ours and recorded
+  // before anything is sent); "funding happened exactly once" is the same assertion.
+  expect(arc.signFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc.sendRawFundTreasury).toHaveBeenCalledTimes(1);
   expect(arc.setAgentMetadata).toHaveBeenCalledTimes(1);
 
   // …and the failure is recorded rather than swallowed.

@@ -27,7 +27,7 @@ import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import type { AgentSpec } from "../../src/policy/agentSpec";
-import { sweepUnresolvedFunding } from "../../src/workflow/fundSubmissions";
+import { finaliseFunded, sweepUnresolvedFunding } from "../../src/workflow/fundSubmissions";
 import { runOnboarding } from "../../src/workflow/onboarding";
 import { publicErrorMessage } from "../../src/workflow/publicError";
 import { OnboardingRunner } from "../../src/workflow/runner";
@@ -76,20 +76,51 @@ const receiptThrottled = () =>
 type Outcome = "success" | "reverted" | "unknown";
 
 /**
- * A fake chain with the broadcast/confirm seam exposed SEPARATELY — which is the whole point of
- * the redesign: the hash exists (and is recorded) before anything waits for a receipt.
+ * A fake chain with the THREE-STEP seam the redesign needs: sign locally, send the raw bytes,
+ * confirm the receipt. `signFundTreasury` is what mints a hash, so a hash exists — and is
+ * recorded — before anything at all is sent.
  */
-function makeFakeArc(opts: { hashes?: string[]; confirm?: Outcome; receipt?: Outcome } = {}) {
+function makeFakeArc(
+  opts: {
+    hashes?: string[];
+    nonce?: number;
+    /** What `sendRawFundTreasury` does. "lost" and "refused" are indistinguishable HERE — that is
+     *  the point: only the chain knows, and only a later receipt read can say. */
+    send?: "ok" | "throws";
+    confirm?: Outcome;
+    receipt?: Outcome | Outcome[];
+    /** The platform account's MINED transaction count at "latest". */
+    platformNonce?: number;
+  } = {},
+) {
   const hashes = [...(opts.hashes ?? [FIRST_TX])];
-  const broadcastFundTreasury = vi.fn(async () => (hashes.shift() ?? SECOND_TX) as `0x${string}`);
+  let signed = 0;
+  const signFundTreasury = vi.fn(async () => {
+    const txHash = (hashes.shift() ?? SECOND_TX) as `0x${string}`;
+    return {
+      rawTx: `0xraw${txHash.slice(2, 10)}` as `0x${string}`,
+      txHash,
+      nonce: (opts.nonce ?? 7) + signed++,
+    };
+  });
+  const sendRawFundTreasury = vi.fn(async (rawTx: `0x${string}`) => {
+    if (opts.send === "throws") throw receiptThrottled();
+    return `0x${rawTx.slice(5)}` as `0x${string}`;
+  });
   const confirmFundTreasury = vi.fn(async (txHash: `0x${string}`) => {
     const outcome = opts.confirm ?? "success";
     if (outcome === "unknown")
       throw new BroadcastUnconfirmedError(txHash, "fundTreasury", { cause: receiptThrottled() });
     if (outcome === "reverted")
       throw new Error(`fundTreasury: transaction ${txHash} reverted on chain`);
+    return txHash;
   });
-  const receiptOutcome = vi.fn(async () => opts.receipt ?? "unknown");
+  // An array lets a test answer differently on the re-check the `dropped` rule makes.
+  const receipts = Array.isArray(opts.receipt) ? [...opts.receipt] : undefined;
+  const receiptOutcome = vi.fn(async () =>
+    receipts ? (receipts.shift() ?? "unknown") : ((opts.receipt as Outcome) ?? "unknown"),
+  );
+  const platformNonce = vi.fn(async () => opts.platformNonce ?? 0);
   const arc = {
     chainId: 31337,
     identityRegistry: "0x0000000000000000000000000000000000000001" as const,
@@ -103,9 +134,11 @@ function makeFakeArc(opts: { hashes?: string[]; confirm?: Outcome; receipt?: Out
     setAgentWallet: vi.fn(async () => "0xbind" as const),
     walletSetDeadline: vi.fn(async () => 9_999_999_999n),
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
-    broadcastFundTreasury,
+    signFundTreasury,
+    sendRawFundTreasury,
     confirmFundTreasury,
     receiptOutcome,
+    platformNonce,
   };
   return arc as unknown as ArcAdapter & typeof arc;
 }
@@ -177,7 +210,7 @@ async function attemptOneUnconfirmed() {
   const runner = makeRunner(arc);
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
-  expect(arc.broadcastFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc.signFundTreasury).toHaveBeenCalledTimes(1);
   return arc;
 }
 
@@ -190,6 +223,7 @@ test("the hash is durable BEFORE the receipt wait — N2's restart window is clo
   // a row that names the hash it was confirming.)
   expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
   expect(JSON.parse(fundEvents()[0]!.detail!)).toMatchObject({ amount: AMOUNT.toString() });
+  expect(arc.sendRawFundTreasury).toHaveBeenCalledTimes(1);
   expect(arc.confirmFundTreasury).toHaveBeenCalledWith(FIRST_TX);
 
   // ⚠ NO `failed` event for an unconfirmed broadcast: it is not a settled failure, and a `failed`
@@ -214,7 +248,7 @@ test("N1 THE DOUBLE SEND: a retry after an unconfirmed broadcast sends NOTHING",
   await runner.settled();
 
   // ⚠ THE ASSERTION THE WHOLE FINDING IS ABOUT.
-  expect(arc2.broadcastFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
   expect(arc2.receiptOutcome).toHaveBeenCalledWith(FIRST_TX);
 
   const row = repo.findByIdempotencyKey(KEY)!;
@@ -240,7 +274,7 @@ test("N1 defence in depth: a `failed` row after the submission does not hide it"
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
 
-  expect(arc2.broadcastFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
   expect(repo.findByIdempotencyKey(KEY)?.fundTxHash).toBe(FIRST_TX);
 });
 
@@ -261,8 +295,15 @@ test("N2 A RESTART heals itself: a new process over the same database sends noth
     const arcBoot = makeFakeArc({ receipt: "success" });
     const swept = await sweepUnresolvedFunding({ repo: repo2, arc: arcBoot });
 
-    expect(swept).toEqual({ checked: 1, finalised: 1, reverted: 0, unresolved: 0 });
-    expect(arcBoot.broadcastFundTreasury).not.toHaveBeenCalled();
+    expect(swept).toEqual({
+      checked: 1,
+      finalised: 1,
+      reverted: 0,
+      dropped: 0,
+      unresolved: 0,
+      skipped: 0,
+    });
+    expect(arcBoot.signFundTreasury).not.toHaveBeenCalled();
     const row = repo2.findByIdempotencyKey(KEY)!;
     expect(row.status).toBe("funded");
     expect(row.fundTxHash).toBe(FIRST_TX);
@@ -285,7 +326,7 @@ test("N2: a restart followed by a user retry still sends nothing", async () => {
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
 
-  expect(arc2.broadcastFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
   expect(repo.findByIdempotencyKey(KEY)?.fundTxHash).toBe(FIRST_TX);
 });
 
@@ -299,7 +340,7 @@ test("a REVERTED previous submission allows exactly one new send", async () => {
   await runner.settled();
 
   // Settled and it moved nothing, so re-sending is correct — and it happens exactly once.
-  expect(arc2.broadcastFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc2.signFundTreasury).toHaveBeenCalledTimes(1);
   expect(fundEventShape()).toEqual([
     `submitted:${FIRST_TX}`,
     `reverted:${FIRST_TX}`,
@@ -323,7 +364,7 @@ test("a receipt we still cannot read REFUSES, and sends nothing", async () => {
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
 
-  expect(arc2.broadcastFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
   const row = repo.findByIdempotencyKey(KEY)!;
   expect(row.status).toBe("bound");
   expect(row.error).toContain("A previous transfer (0xfeed…0001)");
@@ -374,7 +415,7 @@ test("a pre-broadcast failure records no submission and no outflow", async () =>
   // recorded as submitted, the S5 meter must not move, and this one IS a fund failure.
   await onboard(makeFakeArc());
   const arc = makeFakeArc();
-  arc.broadcastFundTreasury.mockRejectedValue(
+  arc.signFundTreasury.mockRejectedValue(
     new Error("execution reverted: ERC20: transfer amount exceeds balance"),
   );
   const runner = makeRunner(arc);
@@ -401,7 +442,9 @@ test("the boot sweep is a no-op when nothing is unresolved, and never guesses", 
     checked: 0,
     finalised: 0,
     reverted: 0,
+    dropped: 0,
     unresolved: 0,
+    skipped: 0,
   });
   expect(arcBoot.receiptOutcome).not.toHaveBeenCalled();
 });
@@ -415,11 +458,286 @@ test("the boot sweep leaves an unreadable receipt alone for next time", async ()
     checked: 1,
     finalised: 0,
     reverted: 0,
+    dropped: 0,
     unresolved: 1,
+    skipped: 0,
   });
   // Untouched: still one submission, still unresolved, still counted against the cap.
   expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
   expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT);
+});
+
+/* ── N4: the send's RESPONSE can be lost, and that is not "nothing was sent" ─────────────────── */
+
+/** Sign, persist, then have the send throw. What the chain did is decided by the NEXT pass. */
+async function attemptOneSendThrew(opts: { hashes?: string[]; nonce?: number } = {}) {
+  const arc = makeFakeArc({ send: "throws", ...opts });
+  const runner = makeRunner(arc);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+  return arc;
+}
+
+test("N4: a send that throws still leaves a `submitted` row — the hash existed before the send", async () => {
+  await onboard(makeFakeArc());
+  const arc = await attemptOneSendThrew();
+
+  // Signed locally, so the hash is ours before anything is on the wire; persisted before the send,
+  // so a response lost AFTER the node accepted the transaction is still a recorded submission.
+  expect(arc.signFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc.sendRawFundTreasury).toHaveBeenCalledTimes(1);
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
+  const detail = JSON.parse(fundEvents()[0]!.detail!);
+  expect(detail).toMatchObject({ amount: AMOUNT.toString(), nonce: 7 });
+  expect(detail.rawTx).toMatch(/^0xraw/);
+  expect(outflows).toEqual([{ kind: "fund_treasury", amount: AMOUNT, ref: FIRST_TX }]);
+
+  // ⚠ THE SENTENCE. It used to say "Nothing was sent" for exactly this case.
+  const stored = repo.findByIdempotencyKey(KEY)!.error!;
+  expect(stored).not.toContain("Nothing was sent");
+  expect(stored).toContain("The transfer was sent (0xfeed…0001)");
+});
+
+test("N4 LOST RESPONSE: the node had it — the retry signs nothing, sends nothing, finalises", async () => {
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+
+  // The transfer was mined all along; only our HTTP response went missing.
+  const arc2 = makeFakeArc({ receipt: "success", hashes: [SECOND_TX] });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.sendRawFundTreasury).not.toHaveBeenCalled();
+  const row = repo.findByIdempotencyKey(KEY)!;
+  expect(row.status).toBe("funded");
+  expect(row.fundTxHash).toBe(FIRST_TX);
+  expect(outflows).toHaveLength(1);
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT);
+});
+
+test("N4 REFUSED SEND: the SAME raw tx is re-broadcast, never a second signature", async () => {
+  // The other half of the indistinguishable pair: the node never accepted it. Re-sending the same
+  // signed bytes is idempotent — at worst the node already has them. Signing AGAIN would build a
+  // second transaction at a NEW nonce, which is how one transfer becomes two.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+
+  const arc2 = makeFakeArc({ receipt: "unknown", platformNonce: 7, hashes: [SECOND_TX] });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  // ⚠ No new signature, and the re-broadcast carries the ORIGINAL bytes.
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.sendRawFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc2.sendRawFundTreasury.mock.calls[0]![0]).toMatch(/^0xraw/);
+  // Still one submission, still unresolved, still refusing.
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
+  expect(repo.findByIdempotencyKey(KEY)!.error).toContain("A previous transfer (0xfeed…0001)");
+  expect(outflows).toHaveLength(1);
+});
+
+test("N6 DROPPED: the nonce moved past it and no receipt exists — one new send is allowed", async () => {
+  // A transfer dropped from the mempool used to lock the entity out of funding forever, while
+  // still consuming the tenant's quota. `latest` counts MINED transactions, so a higher count than
+  // ours means the chain moved past our nonce without us.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ nonce: 7 });
+
+  // receipt reads: the first is the normal check, the second is the re-check the rule insists on
+  // before it calls a success a failure. Both absent => genuinely dropped.
+  const arc2 = makeFakeArc({
+    receipt: ["unknown", "unknown"],
+    platformNonce: 9,
+    hashes: [SECOND_TX],
+  });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  expect(arc2.receiptOutcome).toHaveBeenCalledTimes(2);
+  // Exactly ONE new send, and it is a NEW signature (the old bytes are dead — their nonce is used).
+  expect(arc2.signFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc2.sendRawFundTreasury).toHaveBeenCalledTimes(1);
+  expect(fundEventShape()).toEqual([
+    `submitted:${FIRST_TX}`,
+    `dropped:${FIRST_TX}`,
+    `submitted:${SECOND_TX}`,
+    `funded:${SECOND_TX}`,
+  ]);
+  const row = repo.findByIdempotencyKey(KEY)!;
+  expect(row.status).toBe("funded");
+  expect(row.fundTxHash).toBe(SECOND_TX);
+  // A dropped transfer moved nothing, so it stops consuming the tenant's quota…
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT);
+  // …but its S5 entry stays. That meter brakes on what we asked the chain to move, and it must
+  // fail safe by over-counting rather than under-counting.
+  expect(outflows).toHaveLength(2);
+});
+
+test("N6: a tx that mines DURING the drop check is adopted, not declared dropped", async () => {
+  // The window the AgentBook reconciler guards with the same re-check: the nonce advanced because
+  // OUR transaction mined, between the first receipt read and the nonce read.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ nonce: 7 });
+
+  const arc2 = makeFakeArc({ receipt: ["unknown", "success"], platformNonce: 9 });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
+  expect(repo.findByIdempotencyKey(KEY)!.fundTxHash).toBe(FIRST_TX);
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`, `funded:${FIRST_TX}`]);
+});
+
+/* ── N5: the sweep must not charge a transfer twice ──────────────────────────────────────────── */
+
+test("N5: finalising the same hash twice writes ONE funded row, and charges the quota once", async () => {
+  await onboard(makeFakeArc());
+  const runner = makeRunner(makeFakeArc({ confirm: "success" }));
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`, `funded:${FIRST_TX}`]);
+
+  // The sweep arrives at a row it has no business finalising again — the exact race the gate
+  // measured (sweep + live saga = two `funded` rows for one transfer, quota charged twice).
+  // Idempotence is enforced in the INSERT itself, so no ordering can produce a second row.
+  const rec = repo.findByIdempotencyKey(KEY)!;
+  finaliseFunded(repo, rec, FIRST_TX, AMOUNT, true);
+  finaliseFunded(repo, rec, FIRST_TX, AMOUNT, true);
+
+  expect(fundEvents().filter((e) => e.status === "funded")).toHaveLength(1);
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT);
+});
+
+test("N5: the boot sweep SKIPS an entity the runner is working on", async () => {
+  // The sweep is awaited after `serve()`, so it walks its queue while `POST /entities/:id/fund` is
+  // being served. It must never run beside a saga that is mid-fund.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+
+  const arcBoot = makeFakeArc({ receipt: "success" });
+  const swept = await sweepUnresolvedFunding({
+    repo,
+    arc: arcBoot,
+    busy: (key) => key === KEY,
+  });
+
+  expect(swept).toEqual({
+    checked: 1,
+    finalised: 0,
+    reverted: 0,
+    dropped: 0,
+    unresolved: 0,
+    skipped: 1,
+  });
+  expect(arcBoot.receiptOutcome).not.toHaveBeenCalled();
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
+});
+
+test("N5: a sweep INTERLEAVED with a user retry still leaves exactly one funded row", async () => {
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+
+  // A real interleaving, made deterministic: the sweep runs INSIDE the retry's receipt read, so
+  // both resolve the same submission and both reach `finaliseFunded` for the same hash — which is
+  // exactly the race the gate measured (two `funded` rows, the tenant's cap charged twice).
+  const arcBoot = makeFakeArc({ receipt: "success" });
+  const arc2 = makeFakeArc({ receipt: "success", hashes: [SECOND_TX] });
+  arc2.receiptOutcome.mockImplementation(async () => {
+    await sweepUnresolvedFunding({ repo, arc: arcBoot });
+    return "success";
+  });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  // The sweep got there first; the saga's own finalise is a no-op rather than a second row.
+  expect(fundEvents().filter((e) => e.status === "funded")).toHaveLength(1);
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT);
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
+  expect(outflows).toHaveLength(1);
+  const row = repo.findByIdempotencyKey(KEY)!;
+  expect(row.status).toBe("funded");
+  expect(row.fundTxHash).toBe(FIRST_TX);
+});
+
+/* ── N7: one pass adopts EVERY landed submission ─────────────────────────────────────────────── */
+
+test("N7: two landed submissions are both adopted in a single pass", async () => {
+  // Reachable after a restart: two broadcasts, neither confirmed, both mined. Adopting one and
+  // leaving the other would under-count the tenant's quota by a whole transfer.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ hashes: [FIRST_TX] });
+  // A second unresolved submission on the same entity, as a restart could leave.
+  repo.recordEvent(
+    KEY,
+    "fundTreasury",
+    "submitted",
+    SECOND_TX,
+    JSON.stringify({ amount: "500000", rawTx: "0xrawsecond", nonce: 8 }),
+  );
+
+  const arcBoot = makeFakeArc({ receipt: "success" });
+  const swept = await sweepUnresolvedFunding({ repo, arc: arcBoot });
+
+  expect(swept).toMatchObject({ checked: 2, finalised: 2 });
+  expect(
+    fundEvents()
+      .filter((e) => e.status === "funded")
+      .map((e) => e.txHash),
+  ).toEqual([FIRST_TX, SECOND_TX]);
+  // Both transfers are counted, each at the amount that actually moved.
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT + 500_000n);
+});
+
+test("N7: a saga pass adopts both, and sends nothing", async () => {
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ hashes: [FIRST_TX] });
+  repo.recordEvent(
+    KEY,
+    "fundTreasury",
+    "submitted",
+    SECOND_TX,
+    JSON.stringify({ amount: "500000", rawTx: "0xrawsecond", nonce: 8 }),
+  );
+
+  const arc2 = makeFakeArc({ receipt: "success", hashes: ["0xthird"] });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
+  expect(fundEvents().filter((e) => e.status === "funded")).toHaveLength(2);
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT + 500_000n);
+});
+
+test("EVERY unresolved sentence avoids the words that invite a second transfer", async () => {
+  // One table, one property: nothing we say about a transfer we cannot account for may suggest
+  // that sending again is safe.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+  const afterSend = repo.findByIdempotencyKey(KEY)!.error!;
+
+  const arc2 = makeFakeArc({ receipt: "unknown", platformNonce: 7 });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+  const afterRefusal = repo.findByIdempotencyKey(KEY)!.error!;
+
+  for (const [label, message] of [
+    ["send threw", afterSend],
+    ["refused to re-send", afterRefusal],
+    ["unconfirmed", publicErrorMessage(new BroadcastUnconfirmedError(FIRST_TX, "fundTreasury"))],
+    ["prior unresolved", publicErrorMessage(new PriorTransferUnconfirmedError(FIRST_TX))],
+  ] as const) {
+    expect(message, label).not.toContain("Nothing was sent");
+    expect(message, label).not.toContain("nothing was sent");
+    expect(message, label).toContain("Do not retry");
+  }
 });
 
 test("the public sentences survive the round trip through the runner", async () => {

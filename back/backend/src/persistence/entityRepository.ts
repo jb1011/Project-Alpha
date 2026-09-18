@@ -18,6 +18,12 @@ export interface FundSubmissionRow {
   /** The atomic amount, as it was written on the `submitted` event. Null only if that row was
    *  written without one, which no current writer does. */
   amount: string | null;
+  /** The SIGNED BYTES. What makes a re-broadcast the same transaction rather than a second one at
+   *  a new nonce. Null on rows written before the sign-then-persist design. */
+  rawTx: string | null;
+  /** The nonce those bytes were signed at — the only way to tell "still pending" from "dropped".
+   *  Null on rows written before the sign-then-persist design. */
+  nonce: number | null;
 }
 
 export interface EntityRepository {
@@ -102,6 +108,15 @@ export interface EntityRepository {
    * Without `key`, every entity: that is the boot sweep's work queue.
    */
   listUnresolvedFundSubmissions(key?: string): FundSubmissionRow[];
+  /**
+   * Write a `fundTreasury`/`funded` event for this hash, UNLESS one already exists.
+   *
+   * One statement, so the check and the write cannot be separated by a race. The boot sweep runs
+   * while the API is serving, so it and a live fund saga can reach the same transfer at the same
+   * moment; two `funded` rows for one transfer charge the tenant's lifetime cap twice and tell the
+   * audit trail the treasury was funded twice (gate N5). Returns whether a row was written.
+   */
+  recordFundedOnce(key: string, txHash: string, detail: string): boolean;
   /** Entities with an on-chain ERC-8004 identity that finished the on-chain leg of onboarding
    *  (created/bound/funded) — the rows the public transparency surface may enumerate. Selected
    *  directly (not via EntityRecord) because the surface needs created_at, which toRecord does
@@ -565,7 +580,7 @@ export class SqliteEntityRepository implements EntityRepository {
             AND NOT EXISTS (
               SELECT 1 FROM events r
               WHERE r.idempotency_key = s.idempotency_key AND r.step = 'fundTreasury'
-                AND r.status IN ('funded', 'reverted') AND r.tx_hash = s.tx_hash
+                AND r.status IN ('funded', 'reverted', 'dropped') AND r.tx_hash = s.tx_hash
             )
         )
       `)
@@ -577,18 +592,39 @@ export class SqliteEntityRepository implements EntityRepository {
     return this.db
       .prepare(`
         SELECT s.idempotency_key AS idempotencyKey, s.tx_hash AS txHash,
-               json_extract(s.detail, '$.amount') AS amount
+               json_extract(s.detail, '$.amount') AS amount,
+               json_extract(s.detail, '$.rawTx') AS rawTx,
+               json_extract(s.detail, '$.nonce') AS nonce
         FROM events s
         WHERE s.step = 'fundTreasury' AND s.status = 'submitted' AND s.tx_hash IS NOT NULL
           AND (? IS NULL OR s.idempotency_key = ?)
           AND NOT EXISTS (
             SELECT 1 FROM events r
             WHERE r.idempotency_key = s.idempotency_key AND r.step = 'fundTreasury'
-              AND r.status IN ('funded', 'reverted') AND r.tx_hash = s.tx_hash
+              AND r.status IN ('funded', 'reverted', 'dropped') AND r.tx_hash = s.tx_hash
           )
         ORDER BY s.id
       `)
       .all(key ?? null, key ?? null) as FundSubmissionRow[];
+  }
+
+  recordFundedOnce(key: string, txHash: string, detail: string): boolean {
+    // INSERT ... SELECT ... WHERE NOT EXISTS: the guard and the write are ONE statement, so no
+    // interleaving can produce a second `funded` row for the same transfer. (A partial UNIQUE
+    // index was the alternative; it would have to be added by a migration that fails at boot on
+    // any database already holding a duplicate, and this needs no migration at all.)
+    const info = this.db
+      .prepare(`
+        INSERT INTO events (idempotency_key, step, status, tx_hash, detail)
+        SELECT ?, 'fundTreasury', 'funded', ?, ?
+        WHERE NOT EXISTS (
+          SELECT 1 FROM events
+          WHERE idempotency_key = ? AND step = 'fundTreasury' AND status = 'funded'
+            AND tx_hash = ?
+        )
+      `)
+      .run(key, txHash, detail, key, txHash);
+    return info.changes > 0;
   }
 
   listPublicOnChain(): PublicEntityRow[] {

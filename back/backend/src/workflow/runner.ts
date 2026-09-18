@@ -333,6 +333,17 @@ export class OnboardingRunner {
     return resumed;
   }
 
+  /**
+   * Is a saga running for this entity right now?
+   *
+   * The per-entity lock, read-only, for the boot funding sweep (gate N5): the sweep runs after the
+   * socket is open, so a fund can arrive in the middle of it, and it must never resolve a
+   * submission the saga is in the middle of confirming.
+   */
+  isBusy(id: string): boolean {
+    return this.inFlight.has(id);
+  }
+
   /** Await all background work (tests/shutdown). */
   async settled(): Promise<void> {
     await Promise.allSettled(this.pending);

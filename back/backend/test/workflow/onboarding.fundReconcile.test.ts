@@ -68,13 +68,21 @@ function makeFakeArc(
     outcome?: "success" | "reverted" | "unknown";
   } = {},
 ) {
-  // The seam the saga uses: a hash exists (and is recorded) before anything waits on it.
-  const broadcastFundTreasury = vi.fn(async () => opts.hash ?? FUND_TX);
+  // The seam the saga uses: the hash is ours (and recorded) before anything is sent.
+  const signFundTreasury = vi.fn(async () => ({
+    rawTx: "0xrawtx" as `0x${string}`,
+    txHash: opts.hash ?? FUND_TX,
+    nonce: 3,
+  }));
+  const sendRawFundTreasury = vi.fn(async () => opts.hash ?? FUND_TX);
   const confirmFundTreasury = vi.fn(async (txHash: `0x${string}`) => {
     if (opts.unconfirmed) throw unconfirmed();
     return txHash;
   });
   const receiptOutcome = vi.fn(async () => opts.outcome ?? "unknown");
+  // High enough that an unreadable receipt reads as "still pending" rather than "dropped", which
+  // is the state these tests are about.
+  const platformNonce = vi.fn(async () => 0);
   const arc = {
     chainId: 31337,
     identityRegistry: "0x0000000000000000000000000000000000000001" as const,
@@ -88,9 +96,11 @@ function makeFakeArc(
     setAgentWallet: vi.fn(async () => "0xbind" as const),
     walletSetDeadline: vi.fn(async () => 9_999_999_999n),
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
-    broadcastFundTreasury,
+    signFundTreasury,
+    sendRawFundTreasury,
     confirmFundTreasury,
     receiptOutcome,
+    platformNonce,
   };
   return arc as unknown as ArcAdapter & typeof arc;
 }
@@ -173,7 +183,7 @@ test("THE DOUBLE-SPEND GUARD: a since-mined transfer is adopted, not sent again"
   const rec = await runOnboarding(deps(second, 2_000_000n));
 
   // ⚠ THE ASSERTION THE WHOLE FINDING IS ABOUT: no second transfer.
-  expect(second.broadcastFundTreasury).not.toHaveBeenCalled();
+  expect(second.signFundTreasury).not.toHaveBeenCalled();
   expect(second.receiptOutcome).toHaveBeenCalledWith(FUND_TX);
 
   // The entity is finalised from the transfer that actually happened.
@@ -200,7 +210,7 @@ test("a previous transfer that REVERTED clears the way for a new send", async ()
   const rec = await runOnboarding(deps(second, 2_000_000n));
 
   // Settled and moved nothing, so sending again is correct — and it is the only case that sends.
-  expect(second.broadcastFundTreasury).toHaveBeenCalledTimes(1);
+  expect(second.signFundTreasury).toHaveBeenCalledTimes(1);
   expect(rec.status).toBe("funded");
   expect(rec.fundTxHash).toBe("0xnew");
   expect(fundEvents().map((e) => e.status)).toEqual([
@@ -221,7 +231,7 @@ test("a receipt we still cannot read REFUSES, and says so without blaming anyone
   const err = await runOnboarding(deps(second, 2_000_000n)).catch((e: unknown) => e);
 
   expect(err).toBeInstanceOf(PriorTransferUnconfirmedError);
-  expect(second.broadcastFundTreasury).not.toHaveBeenCalled();
+  expect(second.signFundTreasury).not.toHaveBeenCalled();
   const message = publicErrorMessage(err);
   expect(message).toContain("A previous transfer (0xfeed…0001)");
   expect(message).toContain("nothing new was sent");
@@ -233,7 +243,7 @@ test("with no unconfirmed history, step 7 sends exactly once and records the out
   const arc = makeFakeArc();
   const rec = await runOnboarding(deps(arc, 2_000_000n));
   expect(arc.receiptOutcome).not.toHaveBeenCalled();
-  expect(arc.broadcastFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc.signFundTreasury).toHaveBeenCalledTimes(1);
   expect(rec.status).toBe("funded");
   expect(fundEvents().map((e) => e.status)).toEqual(["submitted", "funded"]);
   expect(recorded).toEqual([{ kind: "fund_treasury", amount: 2_000_000n, txHash: FUND_TX }]);
@@ -247,5 +257,5 @@ test("a RESOLVED unconfirmed row is not reconciled a second time", async () => {
   const again = makeFakeArc({ hash: "0xsecond" });
   await runOnboarding(deps(again, 1_000_000n));
   expect(again.receiptOutcome).not.toHaveBeenCalled();
-  expect(again.broadcastFundTreasury).toHaveBeenCalledTimes(1);
+  expect(again.signFundTreasury).toHaveBeenCalledTimes(1);
 });

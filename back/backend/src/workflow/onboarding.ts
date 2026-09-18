@@ -6,6 +6,7 @@ import type { DoolaApi } from "../adapters/doola/doolaClient";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
+import { BroadcastUnconfirmedError } from "../errors";
 import type { MetadataAnchor } from "../oa/generator";
 import { computeOaHash, renderMetadata, renderOperatingAgreement } from "../oa/generator";
 import {
@@ -689,33 +690,45 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     //    transaction HASH, so no row appended afterwards — a runner `failed`, a `sagaTail`, a
     //    future writer's anything — can make an outstanding transfer look settled.
     const resolution = await resolveSubmissions(d, key);
-    if (resolution.kind === "unresolved")
-      // Neither mined nor reverted. Finalising would invent a transfer; sending would risk a
-      // second one. Refusing is the only honest answer, and the caller is told not to retry yet.
-      throw priorTransferError(resolution.txHash);
+    // EVERY landed submission is adopted, not just the first (gate N7): each one is a real
+    // transfer, and leaving one unrecorded under-counts the tenant's quota by its whole amount.
+    for (const landed of resolution.landed)
+      rec = finaliseFunded(d.repo, rec, landed.txHash, landed.amount ?? d.fundAmount, true);
+    if (resolution.unresolved)
+      // Neither mined nor settled. Finalising would invent a transfer; sending would risk a second
+      // one. Refusing is the only honest answer, and the caller is told not to retry yet.
+      throw priorTransferError(resolution.unresolved);
 
-    if (resolution.kind === "funded") {
-      // A previous broadcast landed: adopt it and SEND NOTHING. This is the branch that stops the
-      // second transfer a Retry would otherwise cause. Its outflow was recorded when it was
-      // submitted, so it is deliberately not recorded again.
-      rec = finaliseFunded(d.repo, rec, resolution.txHash, resolution.amount ?? d.fundAmount, true);
-    } else {
-      // ── BROADCAST, then RECORD, then confirm. The order is the fix for gate N2: the hash used
-      //    to be written only in a catch, so a restart anywhere inside the receipt wait (viem's
-      //    default is 180 seconds) lost it, and the next attempt sent a second transfer. Nothing
-      //    waits on this transaction until the database knows it exists.
-      const txHash = await d.arc.broadcastFundTreasury({
+    if (resolution.landed.length === 0) {
+      // ── SIGN → PERSIST → SEND. The order is the whole of gates N2 and N4, and it is the
+      //    sequence this repository already proved for AgentBook registrations
+      //    (`api/routes/agentBook.ts`): sign locally so the hash is ours before anything is on the
+      //    wire, write it down, and only then broadcast. Persisting after the send left one window
+      //    open — an `eth_sendRawTransaction` whose response was lost after the node accepted the
+      //    transaction produced no hash at all, and the retry sent a second transfer.
+      //
+      //    Everything `signFundTreasury` raises happens BEFORE the signature: an empty platform
+      //    wallet reverts in its simulate, nothing was sent, and that sentence stays true.
+      const signed = await d.arc.signFundTreasury({
         usdc: rec.treasuryConfig!.usdc,
         treasury: rec.treasury! as Address,
         amount: d.fundAmount,
       });
-      recordSubmission(d, key, txHash, d.fundAmount);
-      // Everything from here on happens after the money left. A failure to READ the receipt throws
-      // `BroadcastUnconfirmedError` and leaves the `submitted` row standing, which is exactly what
-      // the next attempt (or the boot sweep) resolves; a REVERTED receipt throws a plain error,
-      // and the `reverted` row is written by whoever resolves the submission.
-      await d.arc.confirmFundTreasury(txHash);
-      rec = finaliseFunded(d.repo, rec, txHash, d.fundAmount, false);
+      recordSubmission(d, key, signed, d.fundAmount);
+      // ⚠ PAST THIS LINE NOTHING MAY SAY "NOTHING WAS SENT". The transaction is signed, recorded
+      // and about to be — or already — on the wire; a send that throws may still have been
+      // accepted, which is exactly the case this ordering exists for. The `submitted` row stands,
+      // and the next attempt (or the boot sweep) resolves it by receipt.
+      try {
+        await d.arc.sendRawFundTreasury(signed.rawTx);
+      } catch (e) {
+        throw new BroadcastUnconfirmedError(signed.txHash, "fundTreasury", { cause: e });
+      }
+      // A failure to READ the receipt throws `BroadcastUnconfirmedError` and leaves the row
+      // standing; a REVERTED receipt throws a plain error, and the `reverted` row is written by
+      // whoever resolves the submission next.
+      await d.arc.confirmFundTreasury(signed.txHash);
+      rec = finaliseFunded(d.repo, rec, signed.txHash, d.fundAmount, false);
     }
   }
 

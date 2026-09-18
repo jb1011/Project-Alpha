@@ -1,11 +1,15 @@
 import {
   type Abi,
+  type Account,
   type Address,
+  type Chain,
   type Hex,
   type PublicClient,
+  type Transport,
   type WalletClient,
   encodeFunctionData,
   isAddressEqual,
+  keccak256,
   parseEventLogs,
 } from "viem";
 import {
@@ -527,6 +531,103 @@ export class ArcAdapter {
       functionName: "meta",
     })) as readonly [string, bigint, Hex, bigint];
     return meta[2];
+  }
+
+  /**
+   * SIGN the treasury top-up locally. Nothing is sent, and the hash is ours before anything is.
+   *
+   * The last window (gate N4): persisting after the SEND still lost a transfer whose
+   * `eth_sendRawTransaction` response never came back — the node had accepted it, we had no hash,
+   * and the public sentence said nothing was sent. The fix is the sequence this repository already
+   * proved for AgentBook registrations (`api/routes/agentBook.ts`, "SIGN → PERSIST → BROADCAST",
+   * whose comment says exactly why: "the raw tx is persisted, so the reconciler re-broadcasts it").
+   *
+   * Three things come back and all three are persisted before the send:
+   *  - `rawTx` — the signed bytes, so a re-broadcast is the SAME transaction rather than a second
+   *    one at a new nonce;
+   *  - `txHash` — `keccak256(rawTx)`, which is what the chain will call it;
+   *  - `nonce` — the only way to tell "still pending" from "dropped" later.
+   *
+   * ⚠ WHO PAYS. The account is `managerWallet`'s, in controller mode too: a treasury top-up is a
+   * plain ERC-20 `transfer` from the platform wallet, NOT a role-gated manager call, so it never
+   * goes through `sendManagerCall`'s relay. In controller mode that wallet is the executor — the
+   * account that actually holds and spends the USDC — which is precisely the one that must sign.
+   *
+   * ⚠ EXPLICIT GAS, still. `USDC_TRANSFER_GAS` is passed so `prepareTransactionRequest` does not
+   * estimate: on Arc the gas token IS USDC, and an estimate against a nearly-full balance reserves
+   * the whole of it and fails the transfer (the 2026-07 footgun, fixed once and kept fixed here).
+   *
+   * `simulateContract` runs first and its revert is raised BEFORE anything is signed or recorded,
+   * which is what keeps "nothing was sent" true for the one case where it is true.
+   */
+  async signFundTreasury(p: {
+    usdc: Address;
+    treasury: Address;
+    amount: bigint;
+  }): Promise<{ rawTx: Hex; txHash: Hex; nonce: number }> {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to sign as the zero address",
+      );
+    // Pre-flight, and deliberately before the signature: an empty platform wallet (2026-09-14)
+    // reverts here, with nothing sent and nothing recorded.
+    await this.d.publicClient.simulateContract({
+      address: p.usdc,
+      abi: erc20TransferAbi,
+      functionName: "transfer",
+      args: [p.treasury, p.amount],
+      account,
+    });
+    // viem's bare `WalletClient` is a union over "account known" and "account per call", and
+    // neither `prepareTransactionRequest` nor `signTransaction` is callable on that union — the
+    // AgentBook registrar annotates its client for the same reason. Ours always carries an account
+    // (checked above).
+    const wallet = this.d.managerWallet as WalletClient<Transport, Chain, Account>;
+    const request = await wallet.prepareTransactionRequest({
+      account,
+      chain: wallet.chain,
+      to: p.usdc,
+      data: encodeFunctionData({
+        abi: erc20TransferAbi,
+        functionName: "transfer",
+        args: [p.treasury, p.amount],
+      }),
+      gas: USDC_TRANSFER_GAS,
+    });
+    // The nonce is the whole reason this is visible before anything is broadcast: it is recorded,
+    // so "pending" and "dropped" can be told apart later. A quietly missing one would make that
+    // impossible — better to fail here than to persist a hole (the registrar's rule, verbatim).
+    if (request.nonce === undefined)
+      throw new Error("signFundTreasury: prepared request has no nonce");
+    const rawTx = await wallet.signTransaction(request);
+    return { rawTx, txHash: keccak256(rawTx), nonce: Number(request.nonce) };
+  }
+
+  /** Put signed bytes on the wire. Idempotent by construction: re-sending the same transaction is
+   *  at worst a no-op the node already knows about, which is what makes a re-broadcast safe. */
+  async sendRawFundTreasury(rawTx: Hex): Promise<Hex> {
+    return (this.d.managerWallet as WalletClient<Transport, Chain, Account>).sendRawTransaction({
+      serializedTransaction: rawTx,
+    });
+  }
+
+  /**
+   * The platform account's MINED transaction count at `latest`.
+   *
+   * Never the pending count — that one includes our own unmined transaction, so it could never
+   * tell us the chain had moved past it. A count HIGHER than a submission's nonce means the chain
+   * advanced without that transaction, which (after a second receipt read) is what makes it
+   * `dropped` rather than merely slow. Same rule, same reason, as `submitterNonce()` in the
+   * AgentBook registrar.
+   */
+  async platformNonce(): Promise<number> {
+    const account = this.d.managerWallet.account;
+    if (!account) throw new Error("ArcAdapter: manager wallet has no account");
+    return this.d.publicClient.getTransactionCount({
+      address: account.address,
+      blockTag: "latest",
+    });
   }
 
   /**
