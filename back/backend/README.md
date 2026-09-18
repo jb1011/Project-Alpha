@@ -139,6 +139,171 @@ and management tools to Claude/Cursor.
 4. Call `fund_treasury` with `id` and amount to top up the treasury (atomic USDC)
 5. Call `list_entities` to review all owned legal bodies
 
+## Hedera rail (ETHOnline 2026)
+
+Novi Corpus adds a second, flag-gated payment rail on Hedera testnet, built for ETHGlobal
+ETHOnline 2026's "AI & Agentic Payments on Hedera" track. Where the Arc rail settles through
+Circle, the Hedera rail prices `GET /verify/:publicId`, a paid legal-standing check, in HTS USDC
+and settles it through x402 v2 and the Blocky402 facilitator. The Arc rail is untouched; with the
+flag off, nothing in this section exists at runtime.
+
+Custody is self-custody with a leash. Your agent runtime holds its own Hedera key and signs every
+payment locally; the Novi Corpus server never holds or sees that key. A human guardian co-owns the
+float account through a 1-of-2 key list, so the guardian can rotate the agent key out at any time
+(`revoke`). The policy gate is enforced by the client and the float, not by the server: before
+paying, the client asks `check_policy`, and a deny stops the payment before anything is signed.
+
+### Enable it
+
+Set `HEDERA_ENABLED=1` and the rest of the block (the commented `HEDERA_*` lines in
+`.env.example`). The block is all-or-nothing: if any required variable is missing, the server
+refuses to boot rather than start half-configured.
+
+| Variable | Value | Notes |
+|---|---|---|
+| `HEDERA_ENABLED` | `1` or `true` | Turns the whole block on. |
+| `HEDERA_NETWORK` | `testnet` | The only accepted value; this build is testnet only. |
+| `HEDERA_FACILITATOR_URL` | `https://api.testnet.blocky402.com` | The Blocky402 testnet facilitator. |
+| `HEDERA_MIRROR_URL` | `https://testnet.mirrornode.hedera.com` | Read-only settlement confirmation. |
+| `HEDERA_USDC_TOKEN_ID` | `0.0.429274` | HTS USDC, 6 decimals. |
+| `HEDERA_PAYTO_ACCOUNT_ID` | your pay-to account | Where `/verify` payments land. Must be associated with the USDC token. |
+| `HEDERA_VERIFY_PRICE_USDC` | `0.001` (default) | Price of one `/verify` call. |
+
+### MCP tools (require an API key with the `spend` capability)
+
+| Tool | Input | Description |
+|---|---|---|
+| `link_hedera_account` | `id`, `accountId`, `publicKey` | Record the entity's float account. The server reads the account from the mirror node and accepts only a 1-of-2 key list of two ECDSA keys, one equal to `publicKey`; the other is recorded as the guardian key. |
+| `check_policy` | `id`, `payee`, `amountUsdc`, `network` | Answer `{ ok: true, available }` or `{ ok: false, reason }` (`paused`, `over-cap`, `not-linked`, `legal-not-active`, and so on) from the float account's USDC balance, the entity's caps, the guardian pause on Arc and the payee allowlist. The allowlist is read live from Arc; an unreadable state never allows. |
+| `report_payment` | `id`, `payee`, `amountUsdc`, `network`, `transactionId`, `idempotencyKey` | Turn a settled transaction into a ledger row. Answers `{ status: settled }` only after the mirror node shows the USDC transfer on both legs; `pending` while the mirror node lags; `failed` with a reason otherwise. |
+
+### How `/verify` is paid
+
+`GET /verify/:publicId` is public and unauthenticated, but paid. A request without a payment
+header gets a 402 with the price and payment requirements in the `PAYMENT-REQUIRED` header. Your
+client signs a payment with its own Hedera key and resubmits; the facilitator verifies and settles
+the USDC transfer on Hedera testnet and pays the network fee, so the float account needs no HBAR.
+The route serves the attestation body (subject, standing, formation, controller flag,
+operating-agreement hash and version, `issuedAt`, `expiresAt`) once the facilitator's settle
+succeeds, and answers 402 with no body when it does not. Novi Corpus does not trust the
+facilitator's reply alone for its books: the ledger row is marked settled
+(`network = hedera:testnet`, `batch_ref = <mirror transaction id>`) only after your client's
+`report_payment` reads the transaction back from the mirror node with the USDC token pinned on
+both legs. With `NOVI_ATTESTATION_KEY` set the body is signed; see "Signed attestation".
+
+### Signed attestation (pull request 3)
+
+When `NOVI_ATTESTATION_KEY` is set, the `/verify` body carries `attestor` (the key's address, also
+published as `hedera.attestor` in `/metadata/:publicId`) and an EIP-712 `signature`. Domain
+`{ name: "Novi Corpus Attestation", version: "1" }`, no chain id, no verifying contract. One
+primary type, `LegalBodyAttestation`, with twelve fields in this order: `publicId string`,
+`agentId string`, `treasury address`, `uaid string`, `standing string`, `formationStatus string`,
+`formationEnvironment string`, `humanVerified bool`, `oaHash bytes32`, `manifestVersion uint256`,
+`issuedAt uint256`, `expiresAt uint256`. Every field is read from the served body.
+
+What a verifier must know:
+
+- The signed timestamps are `issuedAtUnix` and `expiresAtUnix` (unix seconds). The ISO `issuedAt`
+  and `expiresAt` strings are a convenience and are not signed; read the unix pair.
+- Null mapping, applied identically when signing and verifying: `oaHash` null → `0x` + 64 zeros,
+  `manifestVersion` null → `0`, `uaid` null → `""`, `agentId` null → `""`, a null `formation` →
+  `""` for both formation fields, an empty treasury → the zero address.
+- `subject.name`, `subject.registry`, the World credential and the `formation.filed` /
+  `formation.einIssued` booleans are not signed. Derive the two booleans from the signed
+  `formationStatus` (`filed` = status `filed` or `complete`; `einIssued` = status `complete`) and
+  treat the rest as display data.
+- Hex case is outside the signature (a lowercased `treasury` still verifies), and extra top-level
+  JSON keys do not break verification. Read only the twelve signed fields.
+- `verifyAttestation(body, attestor, signature)` in `src/hedera/attestation.ts` recomputes the
+  typed data from the body and answers `false` on any malformed input rather than throwing.
+
+V2 note: the client signs whatever asset and amount the 402 names, and `check_policy` never sees
+the asset. Pin the asset in the client before pointing it at a server you do not run.
+
+### Portable identity (pull request 2)
+
+Each Novi Corpus company also gets an ERC-8004 identity on Hedera testnet and a universal agent id.
+
+- `scripts/hedera-register-identity.mts` registers a company on the Hedera identity registry
+  (`0x8004A818BFB912233c491871b3d84c89A494BD9e`, chain 296) from the platform operator account and
+  derives its HCS-14 UAID. `--from-prod <publicId>` reads the company's public data from the
+  deployed backend and needs `--execute --yes` to send (a repeat run would mint a second identity);
+  it prints the `--record` line that writes the result into the deployed database without a chain
+  call. `--record` re-derives the UAID from the row and refuses a line that does not match.
+- The UAID is derived, never indexed: `uaid:aid:<sha384-base58>;uid=<Arc agent id>;registry=novicorpus;proto=mcp;nativeId=eip155:<Arc chain>:<treasury>`.
+  `src/hedera/uaid.ts` copies the standards SDK's canonicalization so the result equals what
+  `@hashgraphonline/standards-sdk` computes, without depending on it.
+- `GET /metadata/:publicId` lists both registrations (Arc first, then Hedera), the `uaid`, and a
+  `hedera` block (float account, `verifyUrl`, `profileUrl`) once the company is linked.
+  `GET /metadata/:publicId/profile` serves the HCS-11 profile.
+
+**Resolving a Novi Corpus company from Hedera.** Nothing on Hedera links a UAID to a float account
+except Novi Corpus itself; discovery is a Novi Corpus resolver, said plainly (design D23). Three hops:
+parse `nativeId` out of the UAID, call `GET /legal-bodies/<treasury address>`, follow its `metadata`
+link to the company's profile. The float account's memo is `hcs-11:<profile URL>` over HTTPS, a valid
+HCS-11 reference that browsers and HTTP clients follow; the standards SDK resolver follows only
+`hcs://` references, so SDK-based agents use the three hops instead.
+
+### Run the client
+
+The customer-side commands live in `back/hedera-client` (package `@novicorpus/hedera-client`,
+bin `novi-hedera`). Run them as `op run --env-file=.env.tpl -- npx tsx src/cli.ts <command>` so
+secrets resolve from 1Password into the child process only (the template lists item titles, never
+values).
+
+- `provision` creates the float account (the guardian funds it with USDC), sets its 1-of-2 key
+  list while the account is still hollow, and sets the account memo. `--memo-only` re-sets the memo.
+- `link` records the provisioned account with Novi Corpus by calling `link_hedera_account`.
+- `revoke` rotates the agent's key out from the guardian, the on-chain kill switch.
+- `pay <url>` asks `check_policy`, pays a Novi Corpus x402 route, and reports the settlement.
+
+### Live run, 2026-09-12 (testnet)
+
+Recorded in the plan (`docs/plans/2026-09-10-hedera-rail.md`, task 8) against a local backend
+holding one seeded row of `FormationE2E_1`'s public data:
+
+- `provision` set the 1-of-2 key list on float account `0.0.10450558`; `link` answered `ok: true`.
+- `pay` on `/verify/9f8003f5-4c70-435a-9980-9a54625691b7` settled 0.001 USDC to `0.0.10412694`
+  on the first try: [HashScan 0.0.7162784@1789178320.131369376](https://hashscan.io/testnet/transaction/0.0.7162784@1789178320.131369376),
+  `CRYPTOTRANSFER SUCCESS`, fee paid by the facilitator; `report_payment -> settled`; ledger row
+  `hedera:testnet|settled|0.0.7162784-1789178320-131369376|1000`.
+
+### Demo: the five legs
+
+The ETHOnline 2026 recording, in order. Full procedure, credentials and fallback:
+[`../docs/runbooks/hedera-demo.md`](../docs/runbooks/hedera-demo.md). Client commands run from
+`back/hedera-client`, the guardian script from `back/backend`, everything against prod
+(`https://www.novicorpus.com/backend`) on testnet money.
+
+| # | Command | Expected last line |
+|---|---|---|
+| 1 | `demo-buyer <uaid>` | `settlement: OK https://hashscan.io/testnet/transaction/<tx>`, above it `signature valid: true` |
+| 2 | `guardian-pause.mts pause --treasury <treasury>` | `paused: true` |
+| 3 | `demo-buyer <uaid>` | `policy denied: paused`, exit 2, **no** HashScan link |
+| 4 | `guardian-pause.mts unpause --treasury <treasury>`, then `revoke` | `paused: false`, then `SUCCESS` and `after: key ECDSA_SECP256K1` |
+| 5 | `demo-buyer <uaid>` | `HTTP 402` and `PAYMENT-RESPONSE transaction_failed <hashscan>`, exit 1 |
+
+Legs 3 and 5 are the two refusals the rail is built around, and they refuse in different places.
+Leg 3 is the CLIENT refusing: `check_policy` answers inside the payment hook and the buyer aborts
+before its key signs anything, so there is no transaction and no link (design D2). Leg 5 is the
+LEDGER refusing: the agent's key is no longer on the float account, the facilitator submits the
+transfer anyway, and Hedera rejects it with `CRYPTOTRANSFER INVALID_SIGNATURE`.
+
+### Demo-only, do not run in production
+
+These exist only for the ETHOnline 2026 demo. Each refuses to run unless `HEDERA_DEMO_LOCAL=1` is
+set, refuses outright when `NODE_ENV=production`, and prints `DEMO ONLY` as its first line.
+
+- `scripts/demo/seed-public-entity.mts --from-prod <publicId> --tenant <address>` seeds one local
+  database row from a production entity's public data (`/transparency` plus factory reads on Arc),
+  so pre-merge checks run locally without touching real data. Set `FACTORY_ADDRESS` to the
+  production factory the entity was created by.
+- `novi-hedera demo-buyer <uaid>` resolves a Novi Corpus company from its universal agent id,
+  pays its `/verify` route, and checks the EIP-712 signature on what comes back offline against
+  the `attestor` the body names. Three hops (`/legal-bodies/:address`, the metadata link, the
+  paid route), each printed as `→ GET …`. `NOVI_API_BASE` sets the base and has no default.
+  Guarded even though it targets the deployed backend.
+
 ## v2 hardening
 Known production-hardening items (crash-safety, concurrency, Turnkey, etc.) are tracked in
 `../docs/V2_HARDENING_BACKLOG.md`. None block the testnet demo.

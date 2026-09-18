@@ -31,6 +31,7 @@ import {
   getPasskeyChallenge,
   getLegalBody,
   getPublicConfig,
+  getPublicMetadata,
   listApiKeys,
   listCompanies,
   listEntities,
@@ -60,6 +61,7 @@ import {
   deriveFormationEnvironment,
   type FormationEnvironment,
 } from "./formationEnvironment";
+import { publicIdFromMetadataUri } from "@/lib/hedera/identity";
 import { apiKeys } from "./keys";
 import { TERMINAL } from "./poll";
 import { ApiError } from "./types";
@@ -254,6 +256,23 @@ export function useLegalBodyQuery(address: string | null | undefined) {
   });
 }
 
+/**
+ * Public metadata document (GET /metadata/:publicId). Token-free, no poll.
+ *
+ * Hedera fields appear one VPS/MCP step at a time and then stay put, so refetching on an interval
+ * would spend a public read for an answer that does not move. `retry: false`: a 404 is already
+ * mapped to `null` in the client (hide every Hedera line); any other failure is also hide, not a
+ * chip that claims we could not check.
+ */
+export function usePublicMetadataQuery(publicId: string | null | undefined) {
+  return useQuery({
+    queryKey: apiKeys.publicMetadata(publicId ?? ""),
+    queryFn: () => getPublicMetadata(publicId!),
+    enabled: !!publicId,
+    retry: false,
+  });
+}
+
 export function useEntityAgentBookQuery(entityId: string) {
   const token = useAuthToken();
   return useQuery({
@@ -279,8 +298,9 @@ export function useAgentDashboardQueries(entityId: string) {
   // the address that signs AgentKit challenges and pays x402 invoices is the address AgentBook
   // binds and the address a seller looks up here.
   const legalBody = useLegalBodyQuery(agentBook.data?.address);
+  const metadata = usePublicMetadataQuery(publicIdFromMetadataUri(entity.data?.metadataURI));
 
-  return { entity, treasury, runs, agentBook, legalBody };
+  return { entity, treasury, runs, agentBook, legalBody, metadata };
 }
 
 /* ── Connections & passkeys ───────────────────────────────────────────────── */

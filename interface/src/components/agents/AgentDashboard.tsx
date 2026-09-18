@@ -16,6 +16,14 @@ import { apiKeys } from "@/lib/api/keys";
 import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
+import { hashscanAccountUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
+import {
+  hederaIdentityChip,
+  hederaIdentityFromMetadata,
+  hederaNetworkLabel,
+  httpsUrl,
+  shortUaid,
+} from "@/lib/hedera/identity";
 import { shortenErr } from "@/lib/errors";
 import { oaAnchorLabel, pendingAnchorLabel } from "@/lib/oaAnchor";
 import { treasuryAbi } from "@/lib/treasuryAbi";
@@ -74,12 +82,20 @@ export function AgentDashboard({
     runs: runsQuery,
     agentBook: agentBookQuery,
     legalBody: legalBodyQuery,
+    metadata: metadataQuery,
   } = useAgentDashboardQueries(entityId);
 
   const entity = entityQuery.data ?? null;
   const treasury = treasuryQuery.data ?? null;
   const runs = runsQuery.data ?? [];
   const agentBookChip = agentBookChipState(agentBookQuery.data);
+  const hedera = hederaIdentityFromMetadata(metadataQuery.data);
+  const hederaChip = hederaIdentityChip(hedera);
+  /** " (testnet)" / " (mainnet)", or nothing at all where the registration named no chain we
+   *  know: a label may not name a network the links could not be built on. */
+  const hederaNet = hedera?.network ? ` (${hedera.network})` : "";
+  /** The registration transaction on HashScan, on the registration's OWN network. */
+  const hederaRegisterHref = hashscanTxUrl(hedera?.network, hedera?.registerTx);
   const agentBookView = agentBookQuery.data ?? null;
   /** The address both questions are about: the pocket that signs AgentKit challenges and pays
    *  x402 invoices. It is what AgentBook binds and what a seller looks up. */
@@ -294,6 +310,24 @@ export function AgentDashboard({
                   {agentBookChip.label}
                 </span>
               ))}
+            {/* Linked only where there is a registration transaction to show. Same shape as the
+                AgentBook chip above: the claim is the chip, the link is a bonus. */}
+            {hederaChip &&
+              (hederaChip.href ? (
+                <a
+                  href={hederaChip.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={hederaChip.title}
+                  className={AGENTBOOK_CHIP_CLASS}
+                >
+                  {hederaChip.label}
+                </a>
+              ) : (
+                <span title={hederaChip.title} className={AGENTBOOK_CHIP_CLASS}>
+                  {hederaChip.label}
+                </span>
+              ))}
             {/* The second question, beside the first and never folded into it: AgentBook says
                 whether a human vouched, this says whether Novi's registry holds a legal body in
                 good standing. Two sources, two chips (design 2026-09-10 §1). */}
@@ -369,11 +403,75 @@ export function AgentDashboard({
                 chip={pendingAnchorChip(entity)}
               />
             )}
+            {hedera?.uaid && (
+              <OnChainRow
+                label="UAID"
+                value={shortUaid(hedera.uaid)}
+                title={hedera.uaid}
+              />
+            )}
+            {/* Which chain, in the label: these rows sit among Arc facts, and a bare "Hedera
+                agent" beside them would leave a reader to assume the network. The network is the
+                registration's own, never this file's guess, so an unknown chain names none. */}
+            {hedera?.hederaAgentId && (
+              <OnChainRow
+                label={`Hedera agent${hederaNet}`}
+                value={`#${hedera.hederaAgentId}`}
+                title={`Registered on ${hederaNetworkLabel(hedera.network)} as ERC-8004 agent ${hedera.hederaAgentId}.`}
+                href={hederaRegisterHref}
+              />
+            )}
+            {hedera?.accountId && (
+              <OnChainRow
+                label={`Hedera account${hederaNet}`}
+                value={hedera.accountId}
+                title={`The ${hederaNetworkLabel(hedera.network)} account this agent's key is linked to.`}
+                href={hashscanAccountUrl(hedera.network, hedera.accountId)}
+              />
+            )}
+            {hedera?.profileUrl && (
+              <OnChainRow
+                label={`Hedera profile${hederaNet}`}
+                value="HCS-11 profile"
+                title={`The HCS-11 profile document a ${hederaNetworkLabel(hedera.network)} reader resolves this company by.`}
+                href={httpsUrl(hedera.profileUrl)}
+              />
+            )}
+            {hedera?.verifyUrl && (
+              <OnChainRow
+                label="Paid standing check"
+                value="x402 /verify"
+                title={hedera.verifyUrl}
+              />
+            )}
+            {hedera?.attestor && (
+              // NOT a Hedera account, so it gets no HashScan link: this is the EIP-712 signing
+              // key's EVM address, published on the free document so a verifier knows WHICH key
+              // must have signed a paid attestation. Shown like Operator and Guardian beside it,
+              // which are addresses and not links either.
+              <OnChainRow
+                label="Attestor"
+                value={shortAddress(hedera.attestor)}
+                title="Address of the key that signs this company's paid standing attestations (EIP-712). Not a Hedera account."
+              />
+            )}
           </dl>
           <div className="mt-4 flex flex-wrap gap-3">
             {entity.createTxHash && <TxLink hash={entity.createTxHash} label="Create tx" />}
             {entity.bindTxHash && <TxLink hash={entity.bindTxHash} label="Bind tx" />}
             {entity.fundTxHash && <TxLink hash={entity.fundTxHash} label="Fund tx" />}
+            {hederaRegisterHref && (
+              <a
+                href={hederaRegisterHref}
+                target="_blank"
+                rel="noreferrer"
+                title={`The registration transaction on ${hederaNetworkLabel(hedera?.network)}, on HashScan.`}
+                className="inline-flex items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft"
+              >
+                Hedera register
+                <ExternalIcon className="h-3 w-3" />
+              </a>
+            )}
           </div>
         </Card>
       )}
@@ -693,11 +791,13 @@ function OnChainRow({
   label,
   value,
   href,
+  title,
   chip,
 }: {
   label: string;
   value: string;
   href?: string;
+  title?: string;
   chip?: ReactNode;
 }) {
   return (
@@ -705,11 +805,17 @@ function OnChainRow({
       <dt className="text-muted-2">{label}</dt>
       <dd className="mt-0.5 flex flex-wrap items-center gap-2 font-mono text-ink">
         {href ? (
-          <a href={href} target="_blank" rel="noreferrer" className="hover:text-accent-soft">
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            title={title}
+            className="hover:text-accent-soft"
+          >
             {value}
           </a>
         ) : (
-          value
+          <span title={title}>{value}</span>
         )}
         {chip}
       </dd>

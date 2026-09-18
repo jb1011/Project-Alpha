@@ -110,4 +110,20 @@ export interface EntityRecord {
   oaManifestPendingVersion?: number | null;
   /** Unix seconds the pending amendment becomes executable (feeds the guardian veto countdown). */
   oaAmendmentExecutableAt?: number | null;
+  // ── Hedera rail (design 2026-09-10). All seven are additive and nullable; an entity never
+  //    linked to Hedera carries null in every one of them.
+  /** The Hedera account id the agent's key is linked to (`link_hedera_account`). */
+  hederaAccountId?: string | null;
+  /** The agent's Hedera public key, hex, as reported at link time. */
+  hederaAgentPublicKey?: string | null;
+  /** The guardian's Hedera public key, hex, as reported at link time. */
+  hederaGuardianPublicKey?: string | null;
+  /** Unix seconds the Hedera link was established. */
+  hederaLinkedAt?: number | null;
+  /** The ERC-8004-style identity id assigned on Hedera (`hedera-register-identity.mts`). */
+  hederaAgentId?: string | null;
+  /** The transaction hash that registered the Hedera identity. */
+  hederaRegisterTx?: string | null;
+  /** The UAID computed for this entity's Hedera identity (design D10). */
+  uaid?: string | null;
 }

@@ -18,6 +18,7 @@ Status legend: ✅ current · 📓 historical record (the work it plans/designs 
 ## Design (architecture decisions)
 | Doc | Status | What it is |
 |---|---|---|
+| [design/2026-09-10-hedera-rail-design.md](./design/2026-09-10-hedera-rail-design.md) | ✅ | **Hedera rail (ETHGlobal ETHOnline 2026):** a second, flag-gated payment rail on Hedera testnet. Prices `GET /verify/:publicId` — a signed legal-standing attestation — in HTS USDC, settled by the customer's own self-custodied key with a guardian kill switch, plus ERC-8004 identity, an HCS-14 UAID and an HCS-11 profile. The Arc rail is untouched. |
 | [design/2026-06-16-nanopayments-x402-agent-design.md](./design/2026-06-16-nanopayments-x402-agent-design.md) | ✅ | **Hackathon (Lepton, Arc × Circle):** additive layer giving the live legal body a two-sided x402/Circle-Gateway nanopayment agent, governed by a policy-gated Payment Authority. Existing contracts/onboarding/signer unchanged. |
 | [design/2026-06-08-wallet-and-treasury-architecture.md](./design/2026-06-08-wallet-and-treasury-architecture.md) | ✅ | The custody decision: non-custodial Turnkey signer + on-chain `AgentTreasury` (not a Circle custody wallet). The current source of truth for custody. |
 | [design/2026-06-08-agent-treasury-vault-design.md](./design/2026-06-08-agent-treasury-vault-design.md) | ✅ | Design of the `AgentTreasury` vault (rolling cap + allowlist, guardian powers). |
@@ -27,6 +28,7 @@ Status legend: ✅ current · 📓 historical record (the work it plans/designs 
 ## Plans (implementation plans)
 | Doc | Status | What it is |
 |---|---|---|
+| [plans/2026-09-10-hedera-rail.md](./plans/2026-09-10-hedera-rail.md) | ✅ | Implementation plan for the [Hedera rail design](./design/2026-09-10-hedera-rail-design.md). Sixteen tasks in four phases across three pull requests, each with its literal expected output and its "do not proceed if" line; ends in the recorded five-leg demo. |
 | [plans/2026-06-16-nanopayments-x402-agent-implementation.md](./plans/2026-06-16-nanopayments-x402-agent-implementation.md) | ✅ | Implementation plan for the [nanopayments x402 agent design](./design/2026-06-16-nanopayments-x402-agent-design.md). Phase 0 (Gateway/x402 spike) + Phase 1 (Payment Authority core) in full TDD detail; Phases 2–4 (buyer/seller, Claude agent, dashboard) as a post-spike roadmap. |
 | [plans/2026-06-18-nanopayments-x402-phase2-implementation.md](./plans/2026-06-18-nanopayments-x402-phase2-implementation.md) | 📓 | Phase-2 implementation plan — **completed** (x402 signer adapter, funding bridge, buyer, seller, Payment Authority wiring, e2e harness). Records the 2026-06-18 wiring decisions (X-PAYMENT codec, self-hosted seller verify, governed top-up flow). |
 | [plans/2026-05-29-smart-contract-layer.md](./plans/2026-05-29-smart-contract-layer.md) | 📓 | Phase-1 contract plan — **completed** (contracts built, audited, deployed). |
@@ -47,6 +49,7 @@ Status legend: ✅ current · 📓 historical record (the work it plans/designs 
 ## Runbooks (operator-triggered live operations)
 | Doc | Status | What it is |
 |---|---|---|
+| [runbooks/hedera-demo.md](./runbooks/hedera-demo.md) | ✅ | **The Hedera demo, five legs (testnet):** a buyer resolves a company from its UAID and pays for a signed attestation, the guardian pauses it and the payment is refused before signing, the guardian rotates the agent key out and the next payment dies on the ledger. Operator-triggered only. |
 | [runbooks/2026-06-19-live-agent-run.md](./runbooks/2026-06-19-live-agent-run.md) | ✅ | **Live governed agent cycle (Arc testnet):** governed funding → agent buys data (settles) → simulated customer buys the answer (settles into the treasury) → real P&L. Operator-triggered only (`--settle`). |
 
 ## Audit

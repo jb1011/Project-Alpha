@@ -1,11 +1,13 @@
 import type Database from "better-sqlite3";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { buildApiApp } from "../../src/api/app";
+import { TokenBucket } from "../../src/api/routes/agentBook";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import type { JobRecord } from "../../src/jobs/types";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import type { EntityRecord } from "../../src/types";
+import { arcReads } from "../helpers/hederaApp";
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
@@ -66,12 +68,25 @@ function app(worldId?: unknown) {
 }
 
 beforeEach(() => {
+  // Wiring `hedera` beside a legal body also mounts `/verify`, whose facilitator client asks for
+  // `/supported` once at mount time. Stubbed so this file never reaches the network.
+  vi.stubGlobal(
+    "fetch",
+    async () =>
+      new Response(JSON.stringify({ kinds: [], extensions: [], signers: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  );
   db = openDatabase(":memory:");
   migrate(db);
   repo = new SqliteEntityRepository(db);
   jobs = new SqliteJobRepository(db);
 });
-afterEach(() => db.close());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  db.close();
+});
 
 test("serves stats + entity rows with NO auth, cacheable, and leaks no tenant/idempotency keys", async () => {
   repo.upsert(base);
@@ -300,6 +315,87 @@ test("§7 SHARING LABELS: the count of agents sharing a filing is NOT on the pub
     expect(e.formation).not.toHaveProperty("ein");
     expect(e.formation).not.toHaveProperty("documents");
   }
+});
+
+// ── The Hedera rail on the public row (UI review M1) ───────────────────────────────────────
+
+/** The per-entity public base every link on this surface is composed from. */
+const METADATA_BASE = "https://api.novicorpus.test";
+const REGISTER_TX = `0x${"c5".repeat(32)}`;
+const UAID = "uaid:aid:7yCVPN2iLzHZ244fEcpayKQbhzHaMVWhEZgWZoessWWnP13s19RKoa8YEB4kXEazJk";
+/** A registered entity: the three columns `hedera-register-identity.mts` writes. */
+const REGISTERED: Partial<EntityRecord> = {
+  hederaAgentId: "113",
+  hederaRegisterTx: REGISTER_TX,
+  uaid: UAID,
+};
+
+/** The `cfg.hedera` block `HEDERA_ENABLED` produces. This route reads nothing out of it: its mere
+ *  PRESENCE is the gate, exactly as in `routes/metadata.ts`. */
+const HEDERA = {
+  cfg: {
+    network: "testnet",
+    facilitatorUrl: "https://f.test",
+    mirrorUrl: "https://m.test",
+    usdcTokenId: "0.0.429274",
+    payToAccountId: "0.0.10412694",
+    verifyPriceUsdc: "0.001",
+    verifyPriceAtomic: 1000n,
+  },
+} as const;
+
+/** The app a deployment WITH a public base serves. `hedera: false` is the flag off, and the only
+ *  difference between the two: everything else a row shows is identical either way. */
+function railApp(o: { hedera?: boolean } = {}) {
+  return buildApiApp({
+    webOrigin: "https://app.example.com",
+    repo,
+    jobs,
+    hedera: o.hedera === false ? undefined : HEDERA,
+    legalBody: {
+      resolver: { resolve: async () => ({ kind: "none" }) },
+      chainReads: arcReads(),
+      readBudget: new TokenBucket(30, 1),
+      links: {
+        transparency: "https://app.example.com/transparency",
+        metadataBase: METADATA_BASE,
+      },
+      network: "testnet" as const,
+    },
+  } as never);
+}
+
+test("the rail OFF: a registered entity publishes no hedera key at all", async () => {
+  repo.upsert({ ...base, ...REGISTERED });
+  const body = await (await railApp({ hedera: false }).request("/transparency")).json();
+  // Not a null placeholder either: with the routes unmounted there is nothing true to say.
+  expect(body.entities[0]).not.toHaveProperty("hedera");
+});
+
+test("the rail ON: a registered entity carries the facts the page links from, and nothing more", async () => {
+  repo.upsert({ ...base, ...REGISTERED });
+  const body = await (await railApp().request("/transparency")).json();
+  expect(body.entities[0].hedera).toEqual({
+    agentId: "113",
+    registerTx: REGISTER_TX,
+    profileUrl: `${METADATA_BASE}/metadata/${base.publicId}/profile`,
+    uaid: UAID,
+  });
+  // The PAID standing check is not a public-page link: it answers 402, and through the www proxy
+  // it answers 402 with an empty body.
+  expect(JSON.stringify(body)).not.toContain("/verify/");
+});
+
+test("the rail ON, entity not registered: still no hedera key", async () => {
+  repo.upsert(base);
+  const body = await (await railApp().request("/transparency")).json();
+  expect(body.entities[0]).not.toHaveProperty("hedera");
+});
+
+test("no UAID, no profile url — the profile route 404s without one", async () => {
+  repo.upsert({ ...base, ...REGISTERED, uaid: null });
+  const body = await (await railApp().request("/transparency")).json();
+  expect(body.entities[0].hedera).toEqual({ agentId: "113", registerTx: REGISTER_TX });
 });
 
 // ── M5: the short in-process cache ─────────────────────────────────────────────────────────

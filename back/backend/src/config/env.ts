@@ -130,6 +130,26 @@ const EnvSchema = z.object({
     .optional()
     .transform((v) => v === "true" || v === "1"),
   X402_DEMO_PAYTO: addressSchema.optional(),
+  // --- Hedera rail (design 2026-09-10). Flag-gated, all-or-nothing, testnet only. -------------
+  HEDERA_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
+  HEDERA_NETWORK: z.string().optional(),
+  HEDERA_FACILITATOR_URL: z.string().url().optional(),
+  HEDERA_MIRROR_URL: z.string().url().optional(),
+  HEDERA_USDC_TOKEN_ID: z
+    .string()
+    .regex(/^0\.0\.\d+$/)
+    .optional(),
+  HEDERA_PAYTO_ACCOUNT_ID: z
+    .string()
+    .regex(/^0\.0\.\d+$/)
+    .optional(),
+  HEDERA_VERIFY_PRICE_USDC: z.string().default("0.001"),
+  /** PR 3: signs /verify statements. Absent = the route serves the unsigned body. Never equal to
+   *  the platform key or any other signing key on this box (invariant below, design 2026-09-10 D6). */
+  NOVI_ATTESTATION_KEY: privKeySchema.optional(),
   /** Seller trust policy. "open" = today's behavior (AgentKit authorizes within the allowance,
    *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
    *  outright (403); human-backed agents still pay. "legal-bodies-only" = accountable-only PLUS a
@@ -336,6 +356,9 @@ const EnvSchema = z.object({
     .default(30 * 60 * 1000),
 });
 
+/** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
+type Env = z.infer<typeof EnvSchema>;
+
 /** doola API hosts per environment. `DOOLA_BASE_URL` overrides both (staging/mock/replay). */
 export const DOOLA_BASE_URLS = {
   sandbox: "https://api.test.doola.com",
@@ -456,6 +479,18 @@ export interface Config {
     /** Age threshold proven by the attestation (never a birthdate). */
     attestMinAge: number;
   };
+  /** Hedera rail (design 2026-09-10). Present only when HEDERA_ENABLED and the block is whole. */
+  hedera?: {
+    network: "testnet";
+    facilitatorUrl: string;
+    mirrorUrl: string;
+    usdcTokenId: string;
+    payToAccountId: string;
+    verifyPriceUsdc: string;
+    verifyPriceAtomic: bigint;
+    /** PR 3: signs /verify. Absent = the route serves the unsigned body. */
+    attestationKey?: Hex;
+  };
   /** AgentBook read config — independent of `world` so the seller check can run standalone.
    *  Optional in the type (test fixtures build Config literals); loadConfig always populates it,
    *  and consumers should fall back to WORLD_CHAIN_DEFAULTS when absent. */
@@ -542,6 +577,9 @@ export interface Config {
   };
 }
 
+/** Hedera rail (design 2026-09-10), narrowed to present-and-whole. */
+export type HederaConfig = NonNullable<Config["hedera"]>;
+
 /** Validate + shape env into Config. Throws a readable error on the first invalid field. */
 /** "demo=abc,staging=def" -> { demo: "abc", staging: "def" }. Malformed pairs are ignored. */
 function parseLabelAliases(raw: string | undefined): Record<string, string> | undefined {
@@ -592,6 +630,37 @@ export function canFormEntities(cfg: Pick<Config, "doola">): boolean {
  *  whether those deps exist — so the boot gate and the advertised availability cannot drift. */
 export function canRegisterAgentBook(cfg: Pick<Config, "agentBook" | "world">): boolean {
   return Boolean(cfg.agentBook && cfg.world);
+}
+
+/** Hedera rail (design 2026-09-10). All-or-nothing over the five required vars, testnet only. */
+function buildHedera(e: Env): Config["hedera"] {
+  if (!e.HEDERA_ENABLED) return undefined;
+  const required = {
+    HEDERA_NETWORK: e.HEDERA_NETWORK,
+    HEDERA_FACILITATOR_URL: e.HEDERA_FACILITATOR_URL,
+    HEDERA_MIRROR_URL: e.HEDERA_MIRROR_URL,
+    HEDERA_USDC_TOKEN_ID: e.HEDERA_USDC_TOKEN_ID,
+    HEDERA_PAYTO_ACCOUNT_ID: e.HEDERA_PAYTO_ACCOUNT_ID,
+  };
+  for (const [name, value] of Object.entries(required))
+    if (!value)
+      throw new Error(
+        `Invalid config: HEDERA_ENABLED is on but ${name} is missing — the Hedera block is all-or-nothing (design 2026-09-10 D5)`,
+      );
+  if (e.HEDERA_NETWORK !== "testnet")
+    throw new Error(
+      `Invalid config: HEDERA_NETWORK=${e.HEDERA_NETWORK} — this build is testnet only (design 2026-09-10 Global Constraints)`,
+    );
+  return {
+    network: "testnet",
+    facilitatorUrl: e.HEDERA_FACILITATOR_URL as string,
+    mirrorUrl: (e.HEDERA_MIRROR_URL as string).replace(/\/+$/, ""),
+    usdcTokenId: e.HEDERA_USDC_TOKEN_ID as string,
+    payToAccountId: e.HEDERA_PAYTO_ACCOUNT_ID as string,
+    verifyPriceUsdc: e.HEDERA_VERIFY_PRICE_USDC,
+    verifyPriceAtomic: usdToUnits(e.HEDERA_VERIFY_PRICE_USDC),
+    attestationKey: e.NOVI_ATTESTATION_KEY,
+  };
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
@@ -719,6 +788,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
             attestMinAge: e.WORLD_ATTEST_MIN_AGE,
           }
         : undefined,
+    hedera: buildHedera(e),
     worldChain: {
       rpcUrl: e.WORLD_CHAIN_RPC,
       agentBook: e.WORLD_AGENTBOOK_ADDRESS,
@@ -909,6 +979,20 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       );
   }
 
+  // ONE list of every OTHER signing key this box may hold, used by the revenue/submitter
+  // separation checks below AND by the attestation-key invariant after them. Hoisted here
+  // (rather than declared inside `if (paymentRequired)`) so it exists once regardless of which
+  // blocks run, and a key added to Config without being added here is a single visible omission.
+  const signingKeys: Array<[string, Hex | undefined]> = [
+    ["CUSTOMER_PRIVATE_KEY", cfg.customerPrivateKey],
+    ["OPERATOR_PRIVATE_KEY", cfg.operatorPrivateKey],
+    ["JOB_CLIENT_PRIVATE_KEY", cfg.jobClientPrivateKey],
+    ["JOB_EVALUATOR_PRIVATE_KEY", cfg.jobEvaluatorPrivateKey],
+    ["X402_PROOF_AGENT_KEY", cfg.x402ProofAgentKey],
+    ["ENS_GATEWAY_SIGNER_KEY", cfg.ens?.signerKey],
+    ["WORLDCHAIN_SUBMITTER_PRIVATE_KEY", cfg.agentBook?.submitterPrivateKey],
+  ];
+
   // ── FORMATION PAYMENTS (2026-08-26 §6.6/§6.7) ──────────────────────────────────────────────
   //
   // Everything here refuses at BOOT rather than at the first quote, for the reason every other
@@ -961,17 +1045,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       throw new Error(
         "Invalid config: FORMATION_REVENUE_ADDRESS equals the PLATFORM_PRIVATE_KEY address — that is a hot key on this box, and formation revenue lands on a receive-only Ledger account with no key here",
       );
-    // ONE list, used by BOTH separation checks below. A key added to Config without being added
-    // here is then a single visible omission rather than two.
-    const signingKeys: Array<[string, Hex | undefined]> = [
-      ["CUSTOMER_PRIVATE_KEY", cfg.customerPrivateKey],
-      ["OPERATOR_PRIVATE_KEY", cfg.operatorPrivateKey],
-      ["JOB_CLIENT_PRIVATE_KEY", cfg.jobClientPrivateKey],
-      ["JOB_EVALUATOR_PRIVATE_KEY", cfg.jobEvaluatorPrivateKey],
-      ["X402_PROOF_AGENT_KEY", cfg.x402ProofAgentKey],
-      ["ENS_GATEWAY_SIGNER_KEY", cfg.ens?.signerKey],
-      ["WORLDCHAIN_SUBMITTER_PRIVATE_KEY", cfg.agentBook?.submitterPrivateKey],
-    ];
     for (const [name, key] of signingKeys) {
       if (key && privateKeyToAccount(key).address.toLowerCase() === revenue)
         throw new Error(
@@ -1006,6 +1079,34 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
           `Invalid config: FORMATION_SETTLE_SUBMITTER_KEY is the ${name} — the settle submitter is a gas-only identity and must hold no other role on this box`,
         );
     }
+  }
+
+  // ── THE ATTESTATION KEY (design 2026-09-10 D6) ───────────────────────────────────────────────
+  //
+  // NOVI_ATTESTATION_KEY signs /verify statements and holds no other role on this box. Reusing
+  // the platform key, any other signing key, or the formation settle submitter would let a
+  // compromise of the attestation surface reach money or governance — so every collision refuses
+  // at boot, the same way the revenue/submitter separation above does.
+  if (cfg.hedera?.attestationKey) {
+    const attester = privateKeyToAccount(cfg.hedera.attestationKey).address.toLowerCase();
+    const platform = privateKeyToAccount(cfg.platformPrivateKey).address.toLowerCase();
+    if (attester === platform)
+      throw new Error(
+        "Invalid config: NOVI_ATTESTATION_KEY is the PLATFORM_PRIVATE_KEY — the attestation key signs statements and holds no other role on this box (design 2026-09-10 D6)",
+      );
+    for (const [name, key] of signingKeys) {
+      if (key && privateKeyToAccount(key).address.toLowerCase() === attester)
+        throw new Error(
+          `Invalid config: NOVI_ATTESTATION_KEY is the ${name} — the attestation key signs statements and holds no other role on this box (design 2026-09-10 D6)`,
+        );
+    }
+    if (
+      cfg.formation?.payment.submitterKey &&
+      privateKeyToAccount(cfg.formation.payment.submitterKey).address.toLowerCase() === attester
+    )
+      throw new Error(
+        "Invalid config: NOVI_ATTESTATION_KEY is the FORMATION_SETTLE_SUBMITTER_KEY — the attestation key signs statements and holds no other role on this box (design 2026-09-10 D6)",
+      );
   }
 
   // A rotation with nothing to rotate FROM is a typo, and the shape it produces is silent: every
@@ -1247,6 +1348,15 @@ export function redact(cfg: Config): Record<string, unknown> {
     },
     ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
     world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
+    // The verify price as a STRING (the `maxJobBudget` rule) and the attestation key, if any —
+    // it signs statements and is key material, never a log line.
+    hedera: cfg.hedera
+      ? {
+          ...cfg.hedera,
+          verifyPriceAtomic: cfg.hedera.verifyPriceAtomic.toString(),
+          attestationKey: cfg.hedera.attestationKey ? "REDACTED" : undefined,
+        }
+      : undefined,
     // The READ endpoint: ORIGIN only. .env.example tells operators to replace the shared public
     // default with their own, and "their own" is an Alchemy/Infura URL with the API key in the
     // PATH — which is what this drops. The host survives because the boot log is where an operator

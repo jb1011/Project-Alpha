@@ -253,12 +253,60 @@ export type TransparencyEntity = {
     status: FormationStatus;
     environment: "sandbox" | "production";
   } | null;
+  /** The Hedera registration, published ON THE ROW (see `hederaFactsOf` in the backend's
+   *  transparency route) so this page needs no second request per entity. Absent whenever the
+   *  deployment does not run the rail or the entity was never registered; never a null. */
+  hedera?: TransparencyHedera;
+};
+
+/**
+ * The Hedera facts a transparency row may carry. Every field but `agentId` is independently
+ * optional, and the paid `/verify` url is deliberately not among them: this is the free surface.
+ */
+export type TransparencyHedera = {
+  agentId: string;
+  registerTx?: string;
+  profileUrl?: string;
+  uaid?: string;
 };
 
 /** Public transparency surface: platform stats + the on-chain entity registry. */
 export type TransparencyView = {
   stats: { entities: number; jobsSettled: number; usdcSettledAtomic: string };
   entities: TransparencyEntity[];
+};
+
+/**
+ * One ERC-8004 registration on GET /metadata/:publicId (`registrations[]`).
+ *
+ * `agentRegistry` is CAIP-10: `eip155:<chainId>:<registryAddress>`. Hedera testnet is chain 296.
+ * Every field is optional on the wire: the array itself is absent until at least one id is known.
+ */
+export type AgentRegistration = {
+  agentId?: string;
+  agentRegistry?: string;
+};
+
+/** The Hedera rail block on GET /metadata/:publicId. Absent until a float account is linked. */
+export type HederaMetadataBlock = {
+  accountId?: string;
+  verifyUrl?: string;
+  profileUrl?: string;
+  registerTx?: string;
+  attestor?: string;
+};
+
+/**
+ * The public metadata document (GET /metadata/:publicId), as far as this UI reads it.
+ *
+ * Hedera fields are additive and independently optional: `uaid` lands when identity is recorded,
+ * the `eip155:296` registration when the Hedera agent id is recorded, the `hedera` block when a
+ * float account is linked. Treat every one as missing until it is a non-empty string.
+ */
+export type PublicMetadata = {
+  uaid?: string;
+  registrations?: AgentRegistration[];
+  hedera?: HederaMetadataBlock;
 };
 
 /**

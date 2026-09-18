@@ -1,11 +1,41 @@
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { formationSummary } from "../../formation/status";
+import type { PublicEntityRow } from "../../persistence/entityRepository";
 import type { ApiDeps } from "../app";
+import { metadataBaseOf } from "./metadata";
 
 /** A job is "settled" once escrowed USDC has paid out on-chain. `reputed` is a settled job that
  *  also earned reputation — same canonical definition as routes/reputation.ts. */
 const SETTLED = new Set(["completed", "reputed"]);
+
+/**
+ * The Hedera facts a row may carry, or nothing at all.
+ *
+ * ON THE ROW on purpose: the public page renders a HashScan link per entity, and reading these
+ * three strings off `/metadata/:publicId` instead cost one uncached request PER ROW through the
+ * www proxy (which drops this route's caching headers) every time the page was opened.
+ *
+ * Gated exactly like the `hedera` block in `routes/metadata.ts`: this deployment must actually run
+ * the rail (`deps.hedera`), and the entity must hold a recorded registration. An absent fact is an
+ * ABSENT KEY, never a null — a null reads as "checked, and there is none" where the truth is that
+ * nothing was ever registered. The PAID `/verify` url is deliberately not here: this is the free
+ * public surface, and a link that answers 402 does not belong on it.
+ */
+function hederaFactsOf(deps: ApiDeps, e: PublicEntityRow, base: string | null) {
+  if (!deps.hedera || !e.hederaAgentId) return undefined;
+  // The profile route 404s without a UAID — that is the identifier an HCS-11 reader resolves the
+  // document BY — so the url is published only once the entity has one. Same base, and so the
+  // same host, as every other per-entity public link (`metadataBaseOf`).
+  const profileUrl =
+    base && e.publicId && e.uaid ? `${base}/metadata/${e.publicId}/profile` : undefined;
+  return {
+    agentId: e.hederaAgentId,
+    ...(e.hederaRegisterTx ? { registerTx: e.hederaRegisterTx } : {}),
+    ...(profileUrl ? { profileUrl } : {}),
+    ...(e.uaid ? { uaid: e.uaid } : {}),
+  };
+}
 
 /** Public, unauthenticated transparency surface: the platform's on-chain footprint as one JSON.
  *  Everything served here is either already public on Arc (addresses, agent ids, settled jobs) or
@@ -71,6 +101,10 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
     const companyOf = (companyId: string) =>
       companiesById ? companiesById.get(companyId) : deps.company?.(companyId);
 
+    // ONE base for the whole page, like the formation batch above: it is the same string for
+    // every row.
+    const metadataBase = metadataBaseOf(deps);
+
     const rows = entities.map((e) => {
       const gv =
         deps.worldId && e.ownerTenantId
@@ -81,6 +115,7 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
       const formation = e.companyId
         ? formationSummary(companyOf(e.companyId), stepsOf(e.companyId))
         : null;
+      const hedera = hederaFactsOf(deps, e, metadataBase);
       return {
         publicId: e.publicId,
         name: e.name,
@@ -102,6 +137,9 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
         formation: formation
           ? { status: formation.status, environment: formation.environment }
           : null,
+        // Spread, not `hedera: … ?? null`: an entity with no Hedera registration carries no key
+        // here at all (see `hederaFactsOf`).
+        ...(hedera ? { hedera } : {}),
         jobsSettled: agg?.jobs ?? 0,
         usdcSettledAtomic: (agg?.usdcAtomic ?? 0n).toString(),
       };
