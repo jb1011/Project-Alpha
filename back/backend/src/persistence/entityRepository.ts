@@ -10,6 +10,16 @@ export interface EventRow {
   createdAt: string;
 }
 
+/** One treasury transfer that was broadcast and never settled. See
+ *  `EntityRepository.listUnresolvedFundSubmissions`. */
+export interface FundSubmissionRow {
+  idempotencyKey: string;
+  txHash: string;
+  /** The atomic amount, as it was written on the `submitted` event. Null only if that row was
+   *  written without one, which no current writer does. */
+  amount: string | null;
+}
+
 export interface EntityRepository {
   upsert(record: EntityRecord): void;
   /**
@@ -69,8 +79,29 @@ export interface EntityRepository {
   setHederaIdentity(key: string, id: { agentId: string; registerTx: string; uaid: string }): void;
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
   transaction<T>(fn: () => T): T;
-  /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
+  /**
+   * Total atomic USDC this tenant's funding has committed: confirmed transfers PLUS unresolved
+   * submissions.
+   *
+   * ⚠ "Presumed moved until proven reverted" (verification gate, 2026-09-18). It used to count
+   * `funded` events only, which meant a broadcast whose receipt we could not read — money that
+   * has very probably left the platform wallet — consumed no quota at all, and none ever if
+   * nobody retried. The lifetime cap is a brake on platform funds, so it has to count the money
+   * we can no longer account for; a `reverted` event is what removes it again.
+   */
   sumFundedByTenant(tenantId: string): bigint;
+  /**
+   * Broadcast treasury transfers whose fate is still unknown: a `fundTreasury`/`submitted` event
+   * with no `funded` or `reverted` event carrying the SAME hash.
+   *
+   * ⚠ Keyed by HASH, never by recency (gate N1). The previous rule — "the last fundTreasury
+   * event" — was silently defeated by the runner appending a `failed` row after the submission,
+   * and the reconcile then never ran, so a retry sent a second real transfer. Any number of
+   * unrelated rows may sit after a submission; only a settlement of the same hash closes it.
+   *
+   * Without `key`, every entity: that is the boot sweep's work queue.
+   */
+  listUnresolvedFundSubmissions(key?: string): FundSubmissionRow[];
   /** Entities with an on-chain ERC-8004 identity that finished the on-chain leg of onboarding
    *  (created/bound/funded) — the rows the public transparency surface may enumerate. Selected
    *  directly (not via EntityRecord) because the surface needs created_at, which toRecord does
@@ -513,16 +544,51 @@ export class SqliteEntityRepository implements EntityRepository {
     return this.db.transaction(fn)();
   }
 
-  /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
+  /**
+   * Confirmed transfers PLUS unresolved submissions — see the interface for why.
+   *
+   * The two halves cannot double-count: a success writes its `funded` event with the SAME hash as
+   * its `submitted` one, which resolves the submission and removes it from the second half.
+   */
   sumFundedByTenant(tenantId: string): bigint {
     const row = this.db
       .prepare(`
-        SELECT COALESCE(SUM(CAST(json_extract(e.detail, '$.amount') AS INTEGER)), 0) AS total
-        FROM events e JOIN entities t ON t.idempotency_key = e.idempotency_key
-        WHERE e.step = 'fundTreasury' AND e.status = 'funded' AND t.owner_tenant_id = ?
+        SELECT COALESCE(SUM(amount), 0) AS total FROM (
+          SELECT CAST(json_extract(e.detail, '$.amount') AS INTEGER) AS amount
+          FROM events e JOIN entities t ON t.idempotency_key = e.idempotency_key
+          WHERE e.step = 'fundTreasury' AND e.status = 'funded' AND t.owner_tenant_id = ?
+          UNION ALL
+          SELECT CAST(json_extract(s.detail, '$.amount') AS INTEGER) AS amount
+          FROM events s JOIN entities t2 ON t2.idempotency_key = s.idempotency_key
+          WHERE s.step = 'fundTreasury' AND s.status = 'submitted' AND s.tx_hash IS NOT NULL
+            AND t2.owner_tenant_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM events r
+              WHERE r.idempotency_key = s.idempotency_key AND r.step = 'fundTreasury'
+                AND r.status IN ('funded', 'reverted') AND r.tx_hash = s.tx_hash
+            )
+        )
       `)
-      .get(tenantId) as { total: number | bigint };
+      .get(tenantId, tenantId) as { total: number | bigint };
     return BigInt(row.total);
+  }
+
+  listUnresolvedFundSubmissions(key?: string): FundSubmissionRow[] {
+    return this.db
+      .prepare(`
+        SELECT s.idempotency_key AS idempotencyKey, s.tx_hash AS txHash,
+               json_extract(s.detail, '$.amount') AS amount
+        FROM events s
+        WHERE s.step = 'fundTreasury' AND s.status = 'submitted' AND s.tx_hash IS NOT NULL
+          AND (? IS NULL OR s.idempotency_key = ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM events r
+            WHERE r.idempotency_key = s.idempotency_key AND r.step = 'fundTreasury'
+              AND r.status IN ('funded', 'reverted') AND r.tx_hash = s.tx_hash
+          )
+        ORDER BY s.id
+      `)
+      .all(key ?? null, key ?? null) as FundSubmissionRow[];
   }
 
   listPublicOnChain(): PublicEntityRow[] {

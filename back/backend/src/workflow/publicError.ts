@@ -94,11 +94,23 @@ const PLATFORM_OUT_OF_FUNDS = /insufficient\s+funds|exceeds\s+the\s+balance|exce
 /**
  * Every scheme-ful URL, greedily up to the first character that cannot be in one.
  *
+ * TWO characters it must NOT stop at, each a measured leak:
+ *
  * ⚠ NO leading `\b` (review R4). It could not match between `_` and `h`, so
  * `RPC_URL_https://host/v2/KEY` was invisible to the scan and passed through whole, key included.
  * The pattern needs no anchor: without one it can only ever match MORE.
+ *
+ * ⚠ `]` IS ALLOWED INSIDE THE RUN (gate N3). Excluding it truncated every bracketed URL at the
+ * bracket and let the tail survive — `http://[::1]:8545/v2/KEY` became
+ * `http://(redacted)]:8545/v2/KEY`, with the key intact, in both the browser sentence and the
+ * journald line. An IPv6 host is the realistic shape (a local or containerised node), and
+ * `?f[x]=1` is the other. `[` was never excluded, which is what made the asymmetry a leak rather
+ * than a truncation.
+ *
+ * The quote, angle-bracket, brace and backslash exclusions stay: those are what keep a URL inside
+ * a JSON body or an HTML fragment from swallowing the text after it.
  */
-const URL_RUN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>)\]}\\]+/gi;
+const URL_RUN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>)}\\]+/gi;
 
 /**
  * A hex run longer than a 32-byte hash: a raw transaction, calldata, a signature, a blob.
@@ -229,6 +241,18 @@ function isPriorTransferUnconfirmed(x: unknown): PriorTransferUnconfirmedError |
 /** The viem error in the chain, if any — the gate on every sentence that blames the chain. */
 function viemErrorIn(e: unknown): BaseError | undefined {
   return firstInChain(e, (x) => (x instanceof BaseError ? x : undefined));
+}
+
+/**
+ * Is this failure about a transfer that MAY HAVE MOVED MONEY, rather than one that did not?
+ *
+ * Both members of the family say the same thing to a caller: a broadcast exists and its fate is
+ * unknown, so do not send anything else. Neither is a settled fund failure, and the runner uses
+ * this to keep a `fundTreasury`/`failed` row off the trail for them — a row which, appended after
+ * the saga's `submitted`, is precisely what defeated the first reconcile (gate N1).
+ */
+export function isUnresolvedTransferError(e: unknown): boolean {
+  return !!firstInChain(e, isBroadcastUnconfirmed) || !!firstInChain(e, isPriorTransferUnconfirmed);
 }
 
 /**

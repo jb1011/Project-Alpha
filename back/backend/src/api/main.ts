@@ -87,6 +87,7 @@ import { TaskTracker } from "../util/taskTracker";
 import { reconcileAgentBook } from "../workflow/agentBookReconcile";
 import { processDoolaEvent } from "../workflow/formationProcessor";
 import { FormationSweeper } from "../workflow/formationSweeper";
+import { sweepUnresolvedFunding } from "../workflow/fundSubmissions";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
@@ -932,6 +933,22 @@ async function main() {
     formationSweeper.start();
     console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
   }
+
+  // ── Unresolved TREASURY TRANSFERS at boot (gate N2), after the socket for the reason C4 gives.
+  //
+  //    A fund broadcasts, records the hash, and then waits for a receipt — viem's default patience
+  //    is 180 seconds. A deploy, an OOM kill or a `systemctl restart` inside that window leaves a
+  //    `fundTreasury`/`submitted` row that nothing else would ever look at: `listInFlight` selects
+  //    only the pre-`bound` statuses, so `reconcileInFlight` does not see a mid-fund entity. The
+  //    entity would sit there, its treasury possibly funded, until a human pressed Retry.
+  //
+  //    One pass, one receipt read per outstanding transfer, and a no-op (with no RPC call at all)
+  //    in the normal case where nothing is outstanding.
+  const funding = await sweepUnresolvedFunding({ repo, arc });
+  if (funding.checked)
+    console.log(
+      `Funding sweep at boot: ${funding.checked} checked, ${funding.finalised} finalised, ${funding.reverted} reverted, ${funding.unresolved} still unresolved`,
+    );
 
   // AgentBook reconcile at boot (D12), and AFTER the socket is listening for the same reason C4
   // moved the formation reconcile down here: every in-flight row costs a World Chain round trip

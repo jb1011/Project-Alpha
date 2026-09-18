@@ -263,6 +263,39 @@ test("R4: a URL glued to a word character is reduced too", () => {
   expect(out).toContain("https://arc-sepolia.example.com");
 });
 
+test("N3: a URL containing BRACKETS is reduced, IPv6 host and bracketed query alike", () => {
+  // `]` was in the excluded character class, so the run stopped at the bracket and the rest of the
+  // URL — key included — survived into `entity.error` and into journald. Any deployment whose
+  // ARC_*_RPC_URL is a bracketed host (a local node, a containerised one, an IPv6-only provider)
+  // would have leaked its key: the 2026-09-16 incident again, through a different door.
+  for (const url of [
+    `http://[::1]:8545/v2/${KEY}`,
+    `https://[2001:db8::1]/rpc/${KEY}`,
+    `https://h.example/a?f[x]=1&key=${KEY}`,
+  ]) {
+    const out = publicErrorMessage(new Error(`connect failed for ${url}`));
+    expect(out, url).not.toContain(KEY);
+    expect(out, url).not.toContain("/v2/");
+    expect(out, url).not.toContain("/rpc/");
+  }
+  // The origin still survives, brackets and port intact — it is what an operator reads.
+  expect(publicErrorMessage(new Error(`connect failed for http://[::1]:8545/v2/${KEY}`))).toContain(
+    "http://[::1]:8545",
+  );
+});
+
+test("N3: the same URL through a real viem error, in BOTH outputs", () => {
+  const e = new HttpRequestError({
+    body: { method: "eth_sendRawTransaction" },
+    status: 500,
+    url: `http://[::1]:8545/v2/${KEY}`,
+  });
+  // The browser sentence takes the shortMessage, so assert the operator's copy too — it is the one
+  // that quotes the URL, and journald is a lower bar than the browser, not a vault.
+  expect(operatorDiagnostic(e)).not.toContain(KEY);
+  expect(operatorDiagnostic(e)).toContain("http://[::1]:8545");
+});
+
 test("R6: a labelled credential OUTSIDE a URL is redacted", () => {
   for (const raw of [
     `Authorization: Bearer ${KEY} rejected`,

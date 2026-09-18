@@ -12,7 +12,7 @@ import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationRepository } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { Address, EntityRecord, EntityStatus } from "../types";
-import { publicFailure } from "./publicError";
+import { isUnresolvedTransferError, publicFailure } from "./publicError";
 
 export type RunSaga = (input: {
   spec: AgentSpec;
@@ -421,7 +421,22 @@ export class OnboardingRunner {
     // Did THIS attempt's transfer land? Step 7 writes `fundTxHash` only on success, so a change
     // here means the money moved and no failure after it may be reported as a fund failure.
     const moved = !!cur?.fundTxHash && cur.fundTxHash !== ctx.fundTxHashBefore;
-    const fundFailure = ctx.fundAttempt && !moved;
+    /**
+     * ⚠ A BROADCAST WE CANNOT ACCOUNT FOR IS NOT A FUND FAILURE (gate N1).
+     *
+     * This is the finding that made the first two rounds compose into a double-send. A
+     * `BroadcastUnconfirmedError` means money has PROBABLY moved, and a
+     * `PriorTransferUnconfirmedError` means we deliberately sent nothing — neither is a settled
+     * failure of a transfer. Recording one as `fundTreasury`/`failed` put a row on the trail after
+     * the saga's `submitted` row, and the old recency-based reconcile then read the entity as
+     * settled and broadcast a second transfer on the very next Retry.
+     *
+     * The reconcile is keyed by hash now and would survive this row, but writing it would still be
+     * a lie on the audit trail, and defence in depth is the point: the state of a transfer is the
+     * saga's to record, never the runner's.
+     */
+    const unresolvedTransfer = isUnresolvedTransferError(e);
+    const fundFailure = ctx.fundAttempt && !moved && !unresolvedTransfer;
     // One line. `errorDetail` is named for `opsLog`'s free-text redaction, which keys on
     // /error|message|reason|detail/i — a field called `diagnostic` would silently skip redactPii.
     opsLog("saga_failed", {
@@ -430,6 +445,7 @@ export class OnboardingRunner {
       status: cur?.status ?? "unknown",
       ...(fundFailure ? { step: "fundTreasury" } : {}),
       ...(moved ? { fundTxMoved: true } : {}),
+      ...(unresolvedTransfer ? { unresolvedTransfer: true } : {}),
       error,
       errorDetail,
       ref,
@@ -440,6 +456,13 @@ export class OnboardingRunner {
       return;
     }
     if (cur.status === "failed") return;
+    if (unresolvedTransfer) {
+      // The row carries the sentence — the wizard must say "sent, not confirmed, do not retry" —
+      // and the TRAIL is left entirely to the saga, which has already written `submitted` with the
+      // hash. Nothing here may add a row that describes the transfer's fate.
+      this.deps.repo.upsert({ ...cur, error });
+      return;
+    }
     if (!fundFailure) {
       // The trail, never the verdict field. A tail failure is not nothing — it is just not a
       // statement about the treasury.

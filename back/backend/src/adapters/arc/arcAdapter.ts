@@ -529,8 +529,27 @@ export class ArcAdapter {
     return meta[2];
   }
 
-  /** Optional v1 step: top up the treasury vault with ERC-20 USDC from the manager wallet. */
-  async fundTreasury(p: { usdc: Address; treasury: Address; amount: bigint }): Promise<Hex> {
+  /**
+   * BROADCAST the treasury top-up and return its hash. Does NOT wait for the receipt.
+   *
+   * The split exists for one reason (verification gate N2): the hash has to reach the database
+   * BEFORE anything waits on it. It used to be written only in the saga's catch, so a deploy, an
+   * OOM kill or a `systemctl restart` anywhere inside the receipt wait — viem's default is 180
+   * seconds — lost the hash entirely, and the next attempt broadcast a second transfer.
+   *
+   * This mirrors the `broadcastCreateEntity` / `confirmCreateEntity` pair a few methods up, which
+   * exists for exactly the same reason and whose comment says so: "re-reading the same mined tx
+   * yields the same agentId, which is what the saga relies on to adopt an in-flight mint on resume
+   * rather than broadcasting a second one." Money deserves at least the guarantee a mint gets.
+   *
+   * Everything here is PRE-broadcast: a simulate revert (the 2026-09-14 empty-wallet shape) throws
+   * before any hash exists, and "nothing was sent" is true of every failure this method raises.
+   */
+  async broadcastFundTreasury(p: {
+    usdc: Address;
+    treasury: Address;
+    amount: bigint;
+  }): Promise<Hex> {
     const { request } = await this.d.publicClient.simulateContract({
       address: p.usdc,
       abi: erc20TransferAbi,
@@ -540,15 +559,28 @@ export class ArcAdapter {
     });
     // Explicit gas (see USDC_TRANSFER_GAS): the manager wallet is well-funded today, but this keeps
     // the near-full-balance estimateGas footgun from biting if it ever runs low.
-    const txHash = await this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
-    // ⚠ EVERYTHING BELOW THIS LINE HAPPENS AFTER THE MONEY LEFT (review R1, Critical).
-    //
-    // `waitForTransactionReceipt` rejects a poll failure verbatim, so the identical
-    // `HttpRequestError{status:429}` that means "the send was refused" also arrives here, where it
-    // means the opposite. This is the only layer that can tell the two apart — it holds the hash —
-    // so it is the layer that says so, and `publicErrorMessage` keys off the TYPE rather than
-    // trying to recover a fact that was never in the text.
-    return await this.confirmed(txHash, "fundTreasury");
+    return this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
+  }
+
+  /**
+   * CONFIRM a broadcast treasury top-up. Everything it raises happens after the money left.
+   *
+   * `waitForTransactionReceipt` rejects a poll failure verbatim, so the identical
+   * `HttpRequestError{status:429}` that means "the send was refused" also arrives here, where it
+   * means the opposite. This is the only layer that can tell the two apart — it holds the hash —
+   * so it is the layer that says so, and `publicErrorMessage` keys off the TYPE rather than trying
+   * to recover a fact that was never in the text.
+   */
+  async confirmFundTreasury(txHash: Hex): Promise<Hex> {
+    return this.confirmed(txHash, "fundTreasury");
+  }
+
+  /**
+   * Broadcast + confirm, for callers with nothing to persist between the two (the CLI, the anvil
+   * integration tests). The SAGA must not use this: it has to record the hash in between.
+   */
+  async fundTreasury(p: { usdc: Address; treasury: Address; amount: bigint }): Promise<Hex> {
+    return this.confirmFundTreasury(await this.broadcastFundTreasury(p));
   }
 
   /**

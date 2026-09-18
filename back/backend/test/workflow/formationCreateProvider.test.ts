@@ -79,6 +79,11 @@ function makeFakeArc() {
     setAgentWallet: vi.fn(async () => "0xbind" as const),
     walletSetDeadline: vi.fn(async () => 9_999_999_999n),
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
+    // The saga uses the broadcast/confirm seam (the hash must be durable before anything waits on
+    // a receipt); `fundTreasury` stays for the CLI and the anvil tests.
+    broadcastFundTreasury: vi.fn(async () => "0xfund" as `0x${string}`),
+    confirmFundTreasury: vi.fn(async (h: `0x${string}`) => h),
+    receiptOutcome: vi.fn(async () => "success" as const),
     fundTreasury: vi.fn(async () => "0xfund" as `0x${string}`),
     getAgentMetadata: vi.fn(async () => "0x" as `0x${string}`),
     setAgentMetadata: vi.fn(async () => "0xens" as `0x${string}`),
@@ -375,7 +380,9 @@ test("NON-FATAL: doola throwing leaves funding and ENS untouched and the saga re
 
   // The onboarding completed in full: money moved, ENS was written, the record is `funded`.
   expect(rec.status).toBe("funded");
-  expect(arc.fundTreasury).toHaveBeenCalledTimes(1);
+  // The saga funds through the broadcast/confirm seam now (the hash has to be durable before
+  // anything waits on a receipt); "funding happened exactly once" is the same assertion.
+  expect(arc.broadcastFundTreasury).toHaveBeenCalledTimes(1);
   expect(arc.setAgentMetadata).toHaveBeenCalledTimes(1);
 
   // …and the failure is recorded rather than swallowed.
