@@ -191,7 +191,7 @@ Open [http://localhost:3000](http://localhost:3000).
 - **ENS** — ENSIP-10 wildcard resolution + EIP-3668 CCIP-Read, ENSIP-25 agent-registration binding to ERC-8004 on Arc
 - **ERC-8004 / ERC-8183** — on-chain identity, reputation, and jobs (reused from Arc)
 - **The Graph** — entity subgraph on Arc testnet
-- **Turnkey** — non-custodial passkey-secured signing for the agent operator key
+- **Turnkey** — passkey-secured signing for the agent operator key (legacy custody path)
 - **Wyoming DAO LLC** — legal wrapper; law-to-code binding between the operating agreement and on-chain rules
 
 ## Team
@@ -215,7 +215,6 @@ Public product docs (GitBook, intended host `docs.novicorpus.com`) live in [`doc
 - [back/README.md](./back/README.md) — architecture, deployed contracts, getting started
 - [back/docs/README.md](./back/docs/README.md) — full internal doc index (specs, designs, runbooks)
 - [back/docs/ethglobal-lisbon-2026/](./back/docs/ethglobal-lisbon-2026/) — hackathon specs (ENS T1–T7, World W0–W9, Graph G1–G7) and build references
-- [back/docs/POSITIONING.md](./back/docs/POSITIONING.md) — what makes this different from "just another governed wallet"
 
 ## Status
 

@@ -15,7 +15,7 @@ matches a box that actually ran it.
 | doola company | `3IRxPLrPz7JBWH2PF6WF6UMCfT2` (sandbox, `FormationE2E_1 LLC`, WY) |
 | Filing number | `PLAYGROUND-FILING`, filing date 2026-08-26 |
 | EIN | `12-3456789` (sandbox fixed value), issued via the playground 2026-08-29 |
-| Deployment | `DOOLA_ENVIRONMENT=sandbox`, `FORMATION_REQUIRED=false`, box `novi-prod`, main at `e7a8ebb` (#103) |
+| Deployment | `DOOLA_ENVIRONMENT=sandbox`, `FORMATION_REQUIRED=false`, box `prod`, main at `e7a8ebb` (#103) |
 
 ## Timeline (from `journalctl -u legalbody-api`, UTC)
 

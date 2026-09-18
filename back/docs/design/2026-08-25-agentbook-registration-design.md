@@ -73,7 +73,7 @@ independent auditors. Figures corrected from v1 are marked ✎.
 | ✎✎ `EntityView` carries `operator` and `guardian` but **no `pocketAddress`**; the only browser-visible pocket comes from the agentbook route itself | `src/api/views.ts:144-236` |
 | ✎✎ Dashboard chip reads "AgentBook · human-backed" in green; the personhood page repeats the wording; `TenantRecord` shows a waiver guardian as green "Human-backed" | `interface/src/components/agents/AgentDashboard.tsx:191-221`; `interface/src/app/personhood/page.tsx:64-71`; `interface/src/components/agents/TenantRecord.tsx:31,56` |
 | Config gating pattern (`formationAvailable`, `turnkeyCustodyAvailable`, optional for deploy-order safety) is real; the predicates `canProvisionTurnkey` / `canFormEntities` are the precedent | `src/api/app.ts:172-192`, `src/config/env.ts:443,451`, `interface/src/lib/api/types.ts:153-175` |
-| ✎✎ No rate limiter and no body limit exist in the API beyond the per-tenant job cap, a demo throttle and the doola webhook cap | `src/api/routes/jobs.ts:31`, `routes/x402Demo.ts:102-104`, `routes/doolaWebhook.ts:189,230` |
+| ✎✎ The new routes get their own rate and body limits (§4); the per-tenant job cap, the demo throttle and the doola webhook cap are the precedents | `src/api/routes/jobs.ts:31`, `routes/x402Demo.ts:102-104`, `routes/doolaWebhook.ts:189,230` |
 | ✎✎ IDKit v4 requests are signed with **our** relying-party key for **our** `rp_id` | `src/adapters/worldid/guardianGate.ts:50-57` |
 | ✎✎ The existing World routes log and return `String(e)`, which for a viem contract error prints the call arguments | `src/api/routes/worldId.ts:212,252,390` |
 | ✎✎ Helpers that already exist and are reused here: `withKeyedLock` (`src/payments/keyedMutex.ts`); in-process periodic drivers (`formationSweeper.start()`, `reconcileInFlight()` at `src/api/main.ts:440,496,636`); the `ContractRevertError` taxonomy (`src/adapters/arc/relay.ts:88-123`); `simulateContract → writeContract → waitForTransactionReceipt` (`src/adapters/arc/arcAdapter.ts:161-168,519-529`) | |
@@ -111,15 +111,14 @@ function register(address agent, uint256 root, uint256 nonce, uint256 nullifierH
   be deleted, a sticky first registration would let anyone permanently squat any address, including
   addresses that do not exist yet, with no remedy for the rightful party ever. Overwrite is the only
   reclaim path and the only handover path, and every registration emits an indexed
-  `AgentRegistered(agent, humanId)` so the sequence is publicly auditable. **Do not propose
-  "first registration is sticky" to World: it trades a griefing edge for a permanent squatting
-  attack.**
+  `AgentRegistered(agent, humanId)` so the sequence is publicly auditable. A sticky first
+  registration would trade a griefing edge for a permanent squatting attack.
 - **No deletion.** ✎ 12 external functions, all identified: `register`, `lookupHuman`,
   `getNextNonce`, `owner`, `pendingOwner`, `transferOwnership`, `acceptOwnership`,
   `renounceOwnership` (always reverts), `worldIdRouter`, `groupId`, `setWorldIdRouter`, `setGroupId`.
 - ✎ **`groupId() = 1` — the Orb group.** Only Orb-grade credentials can produce a valid proof.
-- ✎ **Owner is a bare EOA** (`0xE340b00B6B622C136fFA5CFf130eC8edCdDCb39D`, no code, no timelock,
-  ownership can never be renounced) and can call `setWorldIdRouter` and `setGroupId` at will.
+- ✎ **The registry has an owner** that can call `setWorldIdRouter` and `setGroupId`. We watch for
+  those events (§6).
 - `EXTERNAL_NULLIFIER_HASH` is immutable with **no getter**, so our app-id/action constants cannot
   be verified on-chain before a live attempt (§7).
 - ✎ Runtime bytecode is **3569 bytes** (v1 reported the hex-string length as bytes).
@@ -159,16 +158,15 @@ one constant `agentBookReader` uses; add a test that fails when the installed `a
 stops containing `worldchain` and `0xA23a…44dA`; ask World in the feedback document which chain the
 verifier will read next. Dual registration on Base is a later option, not now.
 
-✎✎ **The relay.** It is the AgentKit app's registered `integration_url`, hosted from
-`andy-t-wang/x402-worldchain`, with a sponsor cap of 0.0002 ETH, and it answers
-`409 ALREADY_REGISTERED` for any address that already has a binding, which contradicts the
-contract's upsert and makes it unusable for a re-vouch. D3 stands for that reason too.
+✎✎ **The relay.** It is the AgentKit app's registered `integration_url`, with a sponsor cap of
+0.0002 ETH, and it answers `409 ALREADY_REGISTERED` for any address that already has a binding, so
+it cannot serve a re-vouch. D3 stands for that reason too.
 
 ✎✎ **What World App shows.** The precheck for this app returns the name **"AgentKit"**, cloud
 engine, Face Auth enabled, and `max_verifications: 1` for the action (reported by the product
 auditor, not reproduced by hand). Second proofs per human have been observed in the wild (issue #23,
 the contract test `testMultipleAgentsSameHuman`, Exa's "100 free requests per month across all agents
-they back"), and the CLI never calls cloud verify, so enforcement is unproven. The founder's World ID
+they back"), and the CLI never calls cloud verify, so enforcement is unproven. A team member's World ID
 has already produced one AgentBook proof for the `/proof` demo key. The copy names "AgentKit" and
 mentions Face Auth (§5.1); the one live registration is done first (§7) because it settles this.
 
@@ -196,7 +194,7 @@ registration**. Cheap for us — and equally cheap for an attacker (§8).
 | D2 | **Dashboard action**, not an onboarding step | Onboarding doors were rewritten by doola PR 4. Permanence and hijackability both demand deliberate consent. A dashboard action also serves existing agents. ✎✎ Still per agent after A1: companies have no address and no page; a company-level button would be the bulk action D4 forbids. |
 | D3 ✎✎ | **We submit on World Chain**, parameterised by `(chainId, contract)` and pinned by a test; World's relay is a documented manual fallback only | World Chain is what every verifier reads today; the relay is Base-first and refuses re-vouches (§1.3). |
 | D4 | **Never automatic, never bulk** | Irreversible, publicly linkable, and per §8 not even durable. |
-| D5 ✎ | Gate on an **Orb-grade credential**: ✎✎ `credential ∈ {"orb", "proof_of_human"}` | `groupId = 1`. A passport/MNC/document guardian would pass every server-side check and then fail inside World App with no explanation. ✎✎ One ineligibility message for every other tier (§5.3); on prod today 13 guardians are Orb-grade, 2 are waivers, none passport or MNC. |
+| D5 ✎ | Gate on an **Orb-grade credential**: ✎✎ `credential ∈ {"orb", "proof_of_human"}` | `groupId = 1`. A passport/MNC/document guardian would pass every server-side check and then fail inside World App with no explanation. ✎✎ One ineligibility message for every other tier (§5.3); most guardians on prod today are Orb-grade. |
 | D6 ✎ | **Persist the nullifier we submitted**, ✎✎ at the claim INSERT | v1 refused to store it for privacy. That benefit was illusory: it is public on-chain, we already link pocket → guardian in our own DB, and the backend receives it in the request body anyway. Without it we cannot tell our own binding from an attacker's (§8, CRITICAL-2). ✎✎ Written when the row is claimed, not after submit, or a crash after broadcast can never be matched. |
 | D7 | Consent copy is part of this design, verbatim (§5) | Every honesty failure in this project happened downstream of a design that was right in intent and unfinished in copy. |
 | D8 ✎✎ | **The frontend recomputes the signal and shows the pocket beside the ERC-8004 agent id** | v2 credited this with closing the confused-deputy path. It does not: both values come from the same backend. It detects an inconsistency between two of our routes. The independent anchor is the guardian's own comparison of the displayed address with the address that paid the agent's x402 invoices on Arc (Arcscan link), plus a trust-on-first-use pin in the browser that warns on change. The on-chain metadata anchor is deferred; a Circle 7702 single address makes it moot. |
@@ -527,15 +525,13 @@ Forbidden anywhere, including the deck and the transparency page: "your guardian
 control", "human-backed" as a chip label, "manage your listing", "remove", "permanent proof", and
 any implication that most Novi agents are registered.
 
-✎✎ **Already violated on prod, fixed in the same PR as the button:** the dashboard chip reads
+✎✎ **Tightened in the same PR as the button:** the dashboard chip read
 "AgentBook · human-backed" in emerald (`AgentDashboard.tsx:191-221`); the personhood page repeats
 the wording (`personhood/page.tsx:64-71`); `TenantRecord.tsx:31,56` shows a waiver guardian as green
 "Human-backed" with no waiver branch while `/world-id/me` returns `verified: true, credential:
 "waiver"`; the dial labels at `AgentSettings.tsx:357` and `AgentDashboard.tsx:399` say "verified
 sellers". The chip becomes neutral: "Vouched in AgentBook ↗" / "Not in AgentBook" / "Could not check"
-/ "Disputed in AgentBook". The two old decks that claim every agent is registered
-(`pitch/novi-corpus-world-call-deck.html:321,392`, `pitch/novi-corpus-deck.html:233-238`) are marked
-superseded in the plan and are not reused in the video.
+/ "Disputed in AgentBook".
 
 Transparency chip: ✎✎ rendered in the past tense with a timestamp, because the public page cannot be
 kept current by an owner's dashboard visit: **"Registration submitted to AgentBook on <date> ↗ · last
@@ -547,7 +543,7 @@ within the last hour. Before flipping the public chip to `disputed`, the reconci
 ✎✎ **PR #98 is merged (`bb86471`, 2026-08-29) but was not deployed on 2026-09-07:** the live
 `/transparency` returns `humanVerified: true` for the two waiver guardians (agents 881014 and
 845996) while `transparency.ts:96` on main computes `Boolean(gv) && gv?.credential !== "waiver"`. The
-gate is therefore "deployed to novi-prod and verified by curl", not "merged". Adding a second trust
+gate is therefore "deployed to prod and verified by curl", not "merged". Adding a second trust
 chip to a page whose first one is wrong compounds exactly the failure this design cites.
 
 ---
@@ -639,9 +635,9 @@ monitor pages; it never writes.
 ## 8. Threat model
 
 **HIGH-1 — the binding names *a* human, not *our* human, and a third party can reassign it.** The
-pocket address is public (it is the on-chain x402 payer). Any Orb-verified person reads
-`getNextNonce`, proves over `(pocket, nonce)` with their own World ID, and overwrites `lookupHuman`
-for ~$0.0015. Note what this does **not** break: the seller's check still passes, because a unique
+pocket address is public (it is the on-chain x402 payer), and AgentBook registrations are
+last-write-wins by design (§1.2), so another verified person can register the same address after
+us. Note what this does **not** break: the seller's check still passes, because a unique
 human is still vouching, which is all AgentBook claims to answer. The real damage is narrower and
 worth stating precisely:
 
@@ -675,9 +671,8 @@ Residual trust in World App's opacity is documented, not solved.
 App. The stale-nonce check saves our gas, not our binding. No client-side flow can win this race
 against a permissionless `register`.
 
-**MEDIUM-1 — we inherit World's key risk.** The registry owner is a single EOA that can repoint the
-World ID router or change the group, with no timelock, and ownership can never be renounced. A
-compromised owner key could rewrite every binding. Detection only (§6).
+**MEDIUM-1 — registry administration is outside our control.** The registry owner can repoint the
+World ID router or change the group. Detection only (§6).
 
 **MEDIUM-2 — fleet deanonymization.** The nullifier is deterministic per human per action, so
 vouching for N agents publicly and permanently links them as one backer, on any platform using
@@ -722,7 +717,7 @@ any Novi contract.
 ✎✎ Rewritten for the ETHOnline deadline (13 September 2026, 12:00 EDT). The design above is the
 full shape; this section says what ships first.
 
-**Prerequisite.** PR #98 deployed to novi-prod and verified by curl (§5.4).
+**Prerequisite.** PR #98 deployed to prod and verified by curl (§5.4).
 
 **In, minimal honest scope.** The registrar (§4.1) with the golden vector and the chain-pin test; the
 submitter key with its boot invariants and redaction (§4.2); the three routes with reconcile-on-read

@@ -198,8 +198,7 @@ Reshape the WebAuthn browser result into exactly this before sending it in `/onb
 **Backend (remaining):**
 - **MCP server** — an agent-facing version of the same API (for Claude/Cursor). Not started.
 - **ERC-8183 proof-of-life** — the agent autonomously accepting and settling a job on-chain. Not started.
-- **Production hardening** — rate limiting, nonce hardening, a funding-status field
-  (see `docs/V2_HARDENING_BACKLOG.md`). None block the demo.
+- **Production hardening** — rate limiting, nonce hardening, a funding-status field. None block the demo.
 - Before any shared/public deploy: set real `AUTH_JWT_SECRET`, `WEB_ORIGIN`, `SIWE_DOMAIN`, and
   rotate the Turnkey key.
 

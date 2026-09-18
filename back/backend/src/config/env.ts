@@ -257,7 +257,7 @@ const EnvSchema = z.object({
    *  the provider makes formation mandatory without a second switch. "true"/"1" forces it on. */
   FORMATION_REQUIRED: z.string().optional(),
   FORMATION_SWEEP_MS: z.coerce.number().int().positive().default(60_000),
-  /** Lifetime formation quota per tenant (formation is real money in production: $100–150 each). */
+  /** Lifetime formation quota per tenant (formation is real money in production). */
   FORMATION_MAX_PER_TENANT: z.coerce.number().int().positive().default(3),
   /** Rolling-24h formation count across the whole deployment (platform_outflows twin). */
   FORMATION_DAILY_CEILING: z.coerce.number().int().positive().default(10),

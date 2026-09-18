@@ -13,7 +13,7 @@ On deployments without credentials, onboard still works. The EIN stays `STUB-NOT
 | Environment | What you get | How the UI must speak |
 | --- | --- | --- |
 | Sandbox | Free. Real shaped documents with a DEMO watermark. Synthetic identity allowed (and real personal data refused when that flag is on). | Amber "Demo formation (sandbox)". Never green. |
-| Production | Paid pack ($100 to $150 per company). Real Articles, registered agent, EIN path. Real personal data required. | Ordinary legal copy. |
+| Production | Paid, per company. Real Articles, registered agent, EIN path. Real personal data required. | Ordinary legal copy. |
 
 A mainnet Arc deployment is not allowed to point at Doola sandbox. The backend refuses to boot that combination.
 
