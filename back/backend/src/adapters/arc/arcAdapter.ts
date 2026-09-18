@@ -2,9 +2,11 @@ import {
   type Abi,
   type Account,
   type Address,
+  BaseError,
   type Chain,
   type Hex,
   type PublicClient,
+  TransactionReceiptNotFoundError,
   type Transport,
   type WalletClient,
   encodeFunctionData,
@@ -713,22 +715,37 @@ export class ArcAdapter {
   /**
    * What became of a transaction we already broadcast — asked ONCE, never waited on.
    *
-   * The reconciliation half of R1: step 7 uses this to resolve a `fundTreasury`/`unconfirmed`
-   * event before it considers sending anything. `getTransactionReceipt` rather than
-   * `waitForTransactionReceipt` on purpose — a saga resuming an old attempt must not block for
-   * viem's 180-second default on a transaction that may have been dropped weeks ago.
+   * `getTransactionReceipt` rather than `waitForTransactionReceipt` on purpose: a saga resuming an
+   * old attempt must not block for viem's 180-second default on a transaction that may have been
+   * dropped weeks ago.
    *
-   * ⚠ `unknown` covers BOTH "still pending" and "dropped", and every transport failure. They are
-   * different facts and this deliberately does not guess between them: the only safe action for
-   * all of them is the same one (refuse, and look again later), and a wrong guess either loses a
-   * mined transfer or sends a second one.
+   * ⚠ `absent` MEANS ONE THING: the chain definitively has no receipt for this hash. It does NOT
+   * mean "we could not ask".
+   *
+   * This distinction is a Critical finding (gate N8), and it was introduced the moment `absent`
+   * stopped merely meaning "wait" and started being able to lead — with an advanced nonce — to
+   * `dropped`, which authorises a NEW transfer. A `catch` that swallowed everything then read an
+   * Arc RPC 429 on `eth_getTransactionReceipt` (the documented, recurring prod condition this whole
+   * branch exists for) as "the transaction is gone", and sent the money a second time.
+   *
+   * So: `TransactionReceiptNotFoundError` and nothing else, matched BY TYPE rather than by its
+   * prose — several other viem errors ("Block at number … could not be found", any wrapper
+   * carrying that text) also read as "not found" and mean the read BROKE. `walk` because a
+   * transport or a caller's client may have wrapped it. Everything else RETHROWS, and the caller
+   * refuses rather than guessing.
+   *
+   * Byte-for-byte the rule `agentBookRegistrar.receiptStatus` already applies, for the same reason
+   * its comment gives: parking a broken read in the pending branch waits forever on a receipt
+   * nobody is fetching — and, here, spends money on one.
    */
-  async receiptOutcome(txHash: Hex): Promise<"success" | "reverted" | "unknown"> {
+  async receiptOutcome(txHash: Hex): Promise<"success" | "reverted" | "absent"> {
     try {
       const receipt = await this.d.publicClient.getTransactionReceipt({ hash: txHash });
       return receipt.status === "success" ? "success" : "reverted";
-    } catch {
-      return "unknown";
+    } catch (e) {
+      if (e instanceof BaseError && e.walk((x) => x instanceof TransactionReceiptNotFoundError))
+        return "absent";
+      throw e;
     }
   }
 

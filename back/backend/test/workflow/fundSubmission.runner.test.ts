@@ -73,7 +73,7 @@ const receiptThrottled = () =>
     url: "https://arc.example.com/v2/SECRETKEY123456",
   });
 
-type Outcome = "success" | "reverted" | "unknown";
+type Outcome = "success" | "reverted" | "absent";
 
 /**
  * A fake chain with the THREE-STEP seam the redesign needs: sign locally, send the raw bytes,
@@ -88,9 +88,14 @@ function makeFakeArc(
      *  the point: only the chain knows, and only a later receipt read can say. */
     send?: "ok" | "throws";
     confirm?: Outcome;
-    receipt?: Outcome | Outcome[];
+    /** What `receiptOutcome` answers. "throws" is the READ BREAKING — the documented prod
+     *  condition, an Arc RPC 429 on `eth_getTransactionReceipt` — which is a different fact from a
+     *  chain that definitively has no receipt. */
+    receipt?: Outcome | "throws" | (Outcome | "throws")[];
     /** The platform account's MINED transaction count at "latest". */
     platformNonce?: number;
+    /** Wall clock the age gate reads. */
+    now?: () => number;
   } = {},
 ) {
   const hashes = [...(opts.hashes ?? [FIRST_TX])];
@@ -109,7 +114,7 @@ function makeFakeArc(
   });
   const confirmFundTreasury = vi.fn(async (txHash: `0x${string}`) => {
     const outcome = opts.confirm ?? "success";
-    if (outcome === "unknown")
+    if (outcome === "absent")
       throw new BroadcastUnconfirmedError(txHash, "fundTreasury", { cause: receiptThrottled() });
     if (outcome === "reverted")
       throw new Error(`fundTreasury: transaction ${txHash} reverted on chain`);
@@ -117,9 +122,13 @@ function makeFakeArc(
   });
   // An array lets a test answer differently on the re-check the `dropped` rule makes.
   const receipts = Array.isArray(opts.receipt) ? [...opts.receipt] : undefined;
-  const receiptOutcome = vi.fn(async () =>
-    receipts ? (receipts.shift() ?? "unknown") : ((opts.receipt as Outcome) ?? "unknown"),
-  );
+  const receiptOutcome = vi.fn(async () => {
+    const answer = receipts ? (receipts.shift() ?? "absent") : (opts.receipt ?? "absent");
+    // The adapter rethrows anything that is not a definitive absence; the resolution must then
+    // refuse rather than guess.
+    if (answer === "throws") throw receiptThrottled();
+    return answer as Outcome;
+  });
   const platformNonce = vi.fn(async () => opts.platformNonce ?? 0);
   const arc = {
     chainId: 31337,
@@ -165,7 +174,10 @@ afterEach(() => {
 });
 
 /** The saga wiring a runner gets in `api/main.ts`, with this test's chain and meter. */
-function makeRunner(arc: ArcAdapter, over: { repo?: SqliteEntityRepository } = {}) {
+function makeRunner(
+  arc: ArcAdapter,
+  over: { repo?: SqliteEntityRepository; now?: () => number } = {},
+) {
   const r = over.repo ?? repo;
   return new OnboardingRunner({
     repo: r,
@@ -182,6 +194,7 @@ function makeRunner(arc: ArcAdapter, over: { repo?: SqliteEntityRepository } = {
         specJson: JSON.stringify(spec),
         metadataBaseUrl: "https://host.example/backend",
         fundAmount: i.fundAmount,
+        now: over.now,
         outflows: {
           record: (kind: "fund_treasury", amount: bigint, ref: string | null) =>
             outflows.push({ kind, amount, ref }),
@@ -206,7 +219,7 @@ const fundEventShape = (r: SqliteEntityRepository = repo) =>
 
 /** The first attempt: broadcast lands, the receipt read is throttled. */
 async function attemptOneUnconfirmed() {
-  const arc = makeFakeArc({ confirm: "unknown" });
+  const arc = makeFakeArc({ confirm: "absent" });
   const runner = makeRunner(arc);
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
@@ -359,7 +372,7 @@ test("a receipt we still cannot read REFUSES, and sends nothing", async () => {
   await onboard(makeFakeArc());
   await attemptOneUnconfirmed();
 
-  const arc2 = makeFakeArc({ receipt: "unknown", hashes: [SECOND_TX] });
+  const arc2 = makeFakeArc({ receipt: "absent", hashes: [SECOND_TX] });
   const runner = makeRunner(arc2);
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
@@ -437,7 +450,7 @@ test("the boot sweep is a no-op when nothing is unresolved, and never guesses", 
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
 
-  const arcBoot = makeFakeArc({ receipt: "unknown" });
+  const arcBoot = makeFakeArc({ receipt: "absent" });
   expect(await sweepUnresolvedFunding({ repo, arc: arcBoot })).toEqual({
     checked: 0,
     finalised: 0,
@@ -453,7 +466,7 @@ test("the boot sweep leaves an unreadable receipt alone for next time", async ()
   await onboard(makeFakeArc());
   await attemptOneUnconfirmed();
 
-  const arcBoot = makeFakeArc({ receipt: "unknown" });
+  const arcBoot = makeFakeArc({ receipt: "absent" });
   expect(await sweepUnresolvedFunding({ repo, arc: arcBoot })).toEqual({
     checked: 1,
     finalised: 0,
@@ -524,7 +537,7 @@ test("N4 REFUSED SEND: the SAME raw tx is re-broadcast, never a second signature
   await onboard(makeFakeArc());
   await attemptOneSendThrew();
 
-  const arc2 = makeFakeArc({ receipt: "unknown", platformNonce: 7, hashes: [SECOND_TX] });
+  const arc2 = makeFakeArc({ receipt: "absent", platformNonce: 7, hashes: [SECOND_TX] });
   const runner = makeRunner(arc2);
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
@@ -549,11 +562,13 @@ test("N6 DROPPED: the nonce moved past it and no receipt exists — one new send
   // receipt reads: the first is the normal check, the second is the re-check the rule insists on
   // before it calls a success a failure. Both absent => genuinely dropped.
   const arc2 = makeFakeArc({
-    receipt: ["unknown", "unknown"],
+    receipt: ["absent", "absent"],
     platformNonce: 9,
     hashes: [SECOND_TX],
   });
-  const runner = makeRunner(arc2);
+  // ⚠ And the age gate: `dropped` may not be concluded seconds after a broadcast. Eleven minutes
+  // on, two definitive absences and an advanced nonce are finally enough.
+  const runner = makeRunner(arc2, { now: () => Date.now() + 11 * 60_000 });
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
 
@@ -583,14 +598,121 @@ test("N6: a tx that mines DURING the drop check is adopted, not declared dropped
   await onboard(makeFakeArc());
   await attemptOneSendThrew({ nonce: 7 });
 
-  const arc2 = makeFakeArc({ receipt: ["unknown", "success"], platformNonce: 9 });
-  const runner = makeRunner(arc2);
+  const arc2 = makeFakeArc({ receipt: ["absent", "success"], platformNonce: 9 });
+  const runner = makeRunner(arc2, { now: () => Date.now() + 11 * 60_000 });
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();
 
   expect(arc2.signFundTreasury).not.toHaveBeenCalled();
   expect(repo.findByIdempotencyKey(KEY)!.fundTxHash).toBe(FIRST_TX);
   expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`, `funded:${FIRST_TX}`]);
+});
+
+/* ── N8: "we could not ask" is NOT "the transaction is gone" ─────────────────────────────────── */
+
+test("N8 PROD CONDITION: a THROTTLED receipt read never drops a transfer that mined", async () => {
+  // The exact incident this branch exists for, and the one round 4 introduced a second transfer
+  // into: Arc's RPC 429s `eth_getTransactionReceipt` while the cheaper `eth_getTransactionCount`
+  // still answers — and the count HAS advanced, because our own transaction mined. Round 4 read
+  // the throttle as "no receipt", called it `dropped`, and sent 2 USDC a second time.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ nonce: 7 });
+
+  const arc2 = makeFakeArc({
+    receipt: "throws",
+    platformNonce: 9,
+    hashes: [SECOND_TX],
+    // Old enough that ONLY the read's brokenness is keeping it alive.
+  });
+  const runner = makeRunner(arc2, { now: () => Date.now() + 11 * 60_000 });
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  // ⚠ ZERO of everything that spends money.
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.sendRawFundTreasury).not.toHaveBeenCalled();
+  // No verdict was recorded either: a broken read settles nothing.
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
+  expect(repo.findByIdempotencyKey(KEY)!.error).toContain("A previous transfer (0xfeed…0001)");
+  expect(outflows).toHaveLength(1);
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT);
+});
+
+test("N8: a broken read does not even re-broadcast — we know nothing, so we do nothing", async () => {
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+
+  const arc2 = makeFakeArc({ receipt: "throws", platformNonce: 0 });
+  const runner = makeRunner(arc2);
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  expect(arc2.sendRawFundTreasury).not.toHaveBeenCalled();
+  expect(arc2.platformNonce).not.toHaveBeenCalled();
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
+});
+
+test("N8 AGE GATE: a definitively absent receipt is re-broadcast, not dropped, while it is young", async () => {
+  // The registrar's `STALE_AFTER_MS` rule, which round 4 omitted: the nonce test was applied on the
+  // first pass, seconds after the broadcast, so a founder pressing Retry at 90 seconds was enough
+  // to declare a pending transaction dead.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ nonce: 7 });
+
+  const arc2 = makeFakeArc({
+    receipt: ["absent", "absent"],
+    platformNonce: 9,
+    hashes: [SECOND_TX],
+  });
+  const runner = makeRunner(arc2, { now: () => Date.now() + 60_000 }); // one minute later
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  expect(arc2.signFundTreasury).not.toHaveBeenCalled();
+  // The same bytes go back on the wire, and the submission stays open.
+  expect(arc2.sendRawFundTreasury).toHaveBeenCalledTimes(1);
+  expect(arc2.sendRawFundTreasury.mock.calls[0]![0]).toMatch(/^0xraw/);
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
+});
+
+test("N8: the boot sweep is held to the same three conditions", async () => {
+  // The sweep runs unattended at boot — exactly when an unhealthy RPC is most likely — so it is the
+  // last place that may guess.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ nonce: 7 });
+
+  const arcBoot = makeFakeArc({ receipt: "throws", platformNonce: 9 });
+  const swept = await sweepUnresolvedFunding({
+    repo,
+    arc: arcBoot,
+    now: () => Date.now() + 11 * 60_000,
+  });
+  expect(swept).toMatchObject({ checked: 1, finalised: 0, dropped: 0, unresolved: 1 });
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`]);
+});
+
+test("N10: a resolution row is written at most once per hash, whatever the interleaving", async () => {
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew({ nonce: 7 });
+
+  // Two sweeps, both concluding `dropped` on the same submission.
+  const opts = { receipt: "absent" as const, platformNonce: 9 };
+  const clock = () => Date.now() + 11 * 60_000;
+  await sweepUnresolvedFunding({ repo, arc: makeFakeArc(opts), now: clock });
+  await sweepUnresolvedFunding({ repo, arc: makeFakeArc(opts), now: clock });
+
+  expect(fundEvents().filter((e) => e.status === "dropped")).toHaveLength(1);
+  expect(fundEventShape()).toEqual([`submitted:${FIRST_TX}`, `dropped:${FIRST_TX}`]);
+});
+
+test("N10: the same guard covers `reverted`", async () => {
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+
+  await sweepUnresolvedFunding({ repo, arc: makeFakeArc({ receipt: "reverted" }) });
+  await sweepUnresolvedFunding({ repo, arc: makeFakeArc({ receipt: "reverted" }) });
+
+  expect(fundEvents().filter((e) => e.status === "reverted")).toHaveLength(1);
 });
 
 /* ── N5: the sweep must not charge a transfer twice ──────────────────────────────────────────── */
@@ -722,7 +844,7 @@ test("EVERY unresolved sentence avoids the words that invite a second transfer",
   await attemptOneSendThrew();
   const afterSend = repo.findByIdempotencyKey(KEY)!.error!;
 
-  const arc2 = makeFakeArc({ receipt: "unknown", platformNonce: 7 });
+  const arc2 = makeFakeArc({ receipt: "absent", platformNonce: 7 });
   const runner = makeRunner(arc2);
   runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
   await runner.settled();

@@ -6,7 +6,7 @@ import type { DoolaApi } from "../adapters/doola/doolaClient";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
-import { BroadcastUnconfirmedError } from "../errors";
+import { BroadcastUnconfirmedError, PriorTransferUnconfirmedError } from "../errors";
 import type { MetadataAnchor } from "../oa/generator";
 import { computeOaHash, renderMetadata, renderOperatingAgreement } from "../oa/generator";
 import {
@@ -73,6 +73,8 @@ export interface OnboardingDeps {
   /** Validated AgentSpec JSON; persisted so the reconciler/fund can re-run the saga. */
   specJson?: string;
   fundAmount?: bigint; // optional: top up the treasury after binding (status -> funded)
+  /** Clock the funding age gate reads (tests inject it). Default `Date.now`. */
+  now?: () => number;
   /** S5: records the platform->treasury outflow on success (check happens in runner.fund). */
   outflows?: { record(path: "fund_treasury", amountAtomic: bigint, ref: string | null): void };
   // ── Per-agent Turnkey vault (Step 0). When BOTH `provision` and `guardianPasskey` are present, the
@@ -689,7 +691,19 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
     //    is asked about before a single new one is considered. `resolveSubmissions` keys on the
     //    transaction HASH, so no row appended afterwards — a runner `failed`, a `sagaTail`, a
     //    future writer's anything — can make an outstanding transfer look settled.
-    const resolution = await resolveSubmissions(d, key);
+    let resolution: Awaited<ReturnType<typeof resolveSubmissions>>;
+    try {
+      resolution = await resolveSubmissions(d, key);
+    } catch (e) {
+      // The receipt read BROKE while this entity has money in flight (gate N8). Anything we say
+      // about the chain here would be a guess, and the one sentence we must never reach is the
+      // rate-limit one — it ends "Nothing was sent", which is false while a submission is open.
+      // So: refuse, naming the transfer, and keep the original error as the cause so the operator
+      // diagnostic still carries the 429.
+      const open = d.repo.listUnresolvedFundSubmissions(key)[0];
+      if (open) throw new PriorTransferUnconfirmedError(open.txHash as Hex, { cause: e });
+      throw e;
+    }
     // EVERY landed submission is adopted, not just the first (gate N7): each one is a real
     // transfer, and leaving one unrecorded under-counts the tenant's quota by its whole amount.
     for (const landed of resolution.landed)

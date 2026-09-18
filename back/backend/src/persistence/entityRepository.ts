@@ -24,6 +24,9 @@ export interface FundSubmissionRow {
   /** The nonce those bytes were signed at — the only way to tell "still pending" from "dropped".
    *  Null on rows written before the sign-then-persist design. */
   nonce: number | null;
+  /** When the submission was recorded (SQLite UTC, "YYYY-MM-DD HH:MM:SS"). The age gate reads it:
+   *  below ten minutes, "no receipt" is just a transaction waiting to be mined. */
+  createdAt: string | null;
 }
 
 export interface EntityRepository {
@@ -109,14 +112,23 @@ export interface EntityRepository {
    */
   listUnresolvedFundSubmissions(key?: string): FundSubmissionRow[];
   /**
-   * Write a `fundTreasury`/`funded` event for this hash, UNLESS one already exists.
+   * Write a `fundTreasury` RESOLUTION for this hash — `funded`, `reverted` or `dropped` — unless
+   * this hash already has one.
    *
    * One statement, so the check and the write cannot be separated by a race. The boot sweep runs
    * while the API is serving, so it and a live fund saga can reach the same transfer at the same
    * moment; two `funded` rows for one transfer charge the tenant's lifetime cap twice and tell the
-   * audit trail the treasury was funded twice (gate N5). Returns whether a row was written.
+   * audit trail the treasury was funded twice (gate N5), and two `dropped`/`reverted` rows are the
+   * same defect one column along (gate N10). A hash gets ONE verdict, whoever writes it first.
+   *
+   * Returns whether a row was written.
    */
-  recordFundedOnce(key: string, txHash: string, detail: string): boolean;
+  recordFundResolutionOnce(
+    key: string,
+    txHash: string,
+    status: "funded" | "reverted" | "dropped",
+    detail: string,
+  ): boolean;
   /** Entities with an on-chain ERC-8004 identity that finished the on-chain leg of onboarding
    *  (created/bound/funded) — the rows the public transparency surface may enumerate. Selected
    *  directly (not via EntityRecord) because the surface needs created_at, which toRecord does
@@ -594,7 +606,8 @@ export class SqliteEntityRepository implements EntityRepository {
         SELECT s.idempotency_key AS idempotencyKey, s.tx_hash AS txHash,
                json_extract(s.detail, '$.amount') AS amount,
                json_extract(s.detail, '$.rawTx') AS rawTx,
-               json_extract(s.detail, '$.nonce') AS nonce
+               json_extract(s.detail, '$.nonce') AS nonce,
+               s.created_at AS createdAt
         FROM events s
         WHERE s.step = 'fundTreasury' AND s.status = 'submitted' AND s.tx_hash IS NOT NULL
           AND (? IS NULL OR s.idempotency_key = ?)
@@ -608,22 +621,31 @@ export class SqliteEntityRepository implements EntityRepository {
       .all(key ?? null, key ?? null) as FundSubmissionRow[];
   }
 
-  recordFundedOnce(key: string, txHash: string, detail: string): boolean {
+  recordFundResolutionOnce(
+    key: string,
+    txHash: string,
+    status: "funded" | "reverted" | "dropped",
+    detail: string,
+  ): boolean {
     // INSERT ... SELECT ... WHERE NOT EXISTS: the guard and the write are ONE statement, so no
-    // interleaving can produce a second `funded` row for the same transfer. (A partial UNIQUE
-    // index was the alternative; it would have to be added by a migration that fails at boot on
-    // any database already holding a duplicate, and this needs no migration at all.)
+    // interleaving can produce a second verdict for the same transfer. (A partial UNIQUE index was
+    // the alternative; it would have to be added by a migration that fails at boot on any database
+    // already holding a duplicate, and this needs no migration at all.)
+    //
+    // The guard spans ALL THREE resolution statuses, not just the one being written: a hash that
+    // is already `dropped` must not also become `funded` — that would be two contradictory
+    // verdicts, and the first of them released the tenant's cap.
     const info = this.db
       .prepare(`
         INSERT INTO events (idempotency_key, step, status, tx_hash, detail)
-        SELECT ?, 'fundTreasury', 'funded', ?, ?
+        SELECT ?, 'fundTreasury', ?, ?, ?
         WHERE NOT EXISTS (
           SELECT 1 FROM events
-          WHERE idempotency_key = ? AND step = 'fundTreasury' AND status = 'funded'
-            AND tx_hash = ?
+          WHERE idempotency_key = ? AND step = 'fundTreasury'
+            AND status IN ('funded', 'reverted', 'dropped') AND tx_hash = ?
         )
       `)
-      .run(key, txHash, detail, key, txHash);
+      .run(key, status, txHash, detail, key, txHash);
     return info.changes > 0;
   }
 

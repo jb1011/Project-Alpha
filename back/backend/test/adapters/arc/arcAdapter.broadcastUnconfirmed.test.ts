@@ -11,7 +11,7 @@
  * No Anvil: all chain I/O is mocked, same harness as arcAdapter.policy.test.ts.
  */
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
-import { HttpRequestError, TransactionReceiptNotFoundError } from "viem";
+import { BaseError, HttpRequestError, TransactionReceiptNotFoundError } from "viem";
 import { expect, test, vi } from "vitest";
 import { ArcAdapter } from "../../../src/adapters/arc/arcAdapter";
 import { BroadcastUnconfirmedError } from "../../../src/errors";
@@ -123,7 +123,7 @@ test("the happy path still returns the hash", async () => {
   await expect(fund(adapter)).resolves.toBe(FAKE_HASH);
 });
 
-test("receiptOutcome reads a receipt once and does not wait", async () => {
+test("receiptOutcome: a definitive absence is `absent`, a BROKEN READ THROWS (gate N8)", async () => {
   const { adapter, getTransactionReceipt, waitForTransactionReceipt } = makeAdapter();
 
   getTransactionReceipt.mockResolvedValue({ status: "success" });
@@ -132,14 +132,26 @@ test("receiptOutcome reads a receipt once and does not wait", async () => {
   getTransactionReceipt.mockResolvedValue({ status: "reverted" });
   await expect(adapter.receiptOutcome(FAKE_HASH)).resolves.toBe("reverted");
 
-  // Not found = pending OR dropped. Both are "we do not know", which is the answer that makes the
-  // saga refuse rather than guess.
+  // The chain says it has no receipt. That is an ANSWER, and the caller may act on it.
   getTransactionReceipt.mockRejectedValue(new TransactionReceiptNotFoundError({ hash: FAKE_HASH }));
-  await expect(adapter.receiptOutcome(FAKE_HASH)).resolves.toBe("unknown");
+  await expect(adapter.receiptOutcome(FAKE_HASH)).resolves.toBe("absent");
 
-  // A throttled RPC is also "unknown" — never "reverted".
+  // ⚠ A THROTTLED RPC IS NOT AN ANSWER. This used to come back as the same "unknown" a genuine
+  // absence did, and once `absent` could lead to `dropped`, that conflation authorised a second
+  // transfer of money that had already moved. Matched by TYPE, like the AgentBook registrar: other
+  // viem errors also read as "not found" in their prose and mean the read broke.
   getTransactionReceipt.mockRejectedValue(rpc429());
-  await expect(adapter.receiptOutcome(FAKE_HASH)).resolves.toBe("unknown");
+  await expect(adapter.receiptOutcome(FAKE_HASH)).rejects.toThrow(HttpRequestError);
+
+  // A wrapped not-found is still definitive — `walk` tests the chain, not just the top error.
+  getTransactionReceipt.mockRejectedValue(
+    new BaseError("outer", { cause: new TransactionReceiptNotFoundError({ hash: FAKE_HASH }) }),
+  );
+  await expect(adapter.receiptOutcome(FAKE_HASH)).resolves.toBe("absent");
+
+  // A plain non-viem failure is a broken read too.
+  getTransactionReceipt.mockRejectedValue(new Error("socket hang up"));
+  await expect(adapter.receiptOutcome(FAKE_HASH)).rejects.toThrow(/socket hang up/);
 
   // Reconciliation must never block the saga on a 180-second wait.
   expect(waitForTransactionReceipt).not.toHaveBeenCalled();

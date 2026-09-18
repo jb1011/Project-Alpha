@@ -47,62 +47,75 @@ export type Resolution = {
 /**
  * Ask the chain about every unresolved submission of one entity and decide what may happen next.
  *
- * FOUR rules, and the last two are the ones that took a second round to get right. They are the
- * AgentBook reconciler's rules (`workflow/agentBookReconcile.ts`), applied to money:
+ * FIVE rules. They are the AgentBook reconciler's rules (`workflow/agentBookReconcile.ts`) applied
+ * to money, and the first one is the one whose absence cost a second transfer (gate N8):
  *
- *  1. receipt says SUCCESS  → landed; adopt it, send nothing.
- *  2. receipt says REVERTED → record `reverted`; it moved nothing, so a new send is correct.
- *  3. no receipt, and the platform account's MINED nonce has moved PAST this transaction's nonce →
- *     ask for the receipt ONE more time (it may have mined in the gap between the two reads — the
- *     registrar's rule, and skipping it turns a success into a failure), and if it is still absent,
- *     record `dropped`. Terminal: the nonce is spent by something else, these bytes can never mine,
- *     and a new send is allowed. Its S5 entry stays, conservatively.
- *  4. no receipt and the nonce has NOT moved → the transaction is still pending, or the node never
- *     accepted it. Re-broadcast the SAME signed bytes (idempotent; at worst the node already has
- *     them) and stay unresolved. ⚠ Never re-SIGN here: a new signature is a new nonce, which is
- *     how one transfer becomes two.
+ *  1. the receipt READ BROKE (a throttled RPC, a dead endpoint) → we know NOTHING. Refuse, send
+ *     nothing, re-broadcast nothing, record nothing. `receiptOutcome` distinguishes this from a
+ *     definitive absence by type, and rethrows; catching it here would be guessing.
+ *  2. receipt says SUCCESS  → landed; adopt it, send nothing.
+ *  3. receipt says REVERTED → record `reverted`; it moved nothing, so a new send is correct.
+ *  4. DEFINITIVELY ABSENT, **and** the platform account's MINED nonce has moved past this
+ *     transaction's nonce, **and** the submission is older than {STALE_AFTER_MS} → ask for the
+ *     receipt ONE more time (it may have mined in the gap between the two reads — the registrar's
+ *     rule, and skipping it turns a success into a failure), and if it is still definitively
+ *     absent, record `dropped`. Terminal: the nonce is spent by something else, these bytes can
+ *     never mine, and a new send is allowed. Its S5 entry stays, conservatively.
+ *  5. anything else absent → the transaction is still pending, or the node never accepted it.
+ *     Re-broadcast the SAME signed bytes (idempotent; at worst the node already has them) and stay
+ *     unresolved. ⚠ Never re-SIGN here: a new signature is a new nonce, which is how one transfer
+ *     becomes two.
  *
- * A row from before the raw-tx design (no `rawTx`/`nonce`) simply skips rules 3 and 4 and stays
+ * ALL THREE conditions of rule 4 are load-bearing. The nonce alone is satisfied by our own
+ * transaction mining; the second read alone is satisfied by a throttle answering twice; and
+ * without the age gate the rule ran seconds after a broadcast, so a founder pressing Retry at 90
+ * seconds could declare a pending transfer dead.
+ *
+ * A row from before the raw-tx design (no `rawTx`/`nonce`) simply skips rules 4 and 5 and stays
  * unresolved — the old, safe behaviour.
  */
 export async function resolveSubmissions(
   deps: {
     repo: EntityRepository;
     arc: Pick<ArcAdapter, "receiptOutcome" | "platformNonce" | "sendRawFundTreasury">;
+    now?: () => number;
     log?: typeof opsLog;
   },
   key: string,
 ): Promise<Resolution> {
   const log = deps.log ?? opsLog;
+  const now = deps.now ?? Date.now;
   const out: Resolution = { landed: [] };
   for (const row of deps.repo.listUnresolvedFundSubmissions(key)) {
     const txHash = row.txHash as Hex;
     const amount = parseAmount(row.amount);
+    // Rule 1 lives in the ABSENCE of a catch: `receiptOutcome` throws when the read broke, and that
+    // throw leaves this entity alone — no verdict, no re-broadcast, no new send. The saga turns it
+    // into the unconfirmed sentence, which is the honest answer to "did my money move?".
     const outcome = await deps.arc.receiptOutcome(txHash);
     if (outcome === "success") {
       out.landed.push({ txHash, amount });
       continue;
     }
     if (outcome === "reverted") {
-      deps.repo.recordEvent(key, "fundTreasury", "reverted", txHash, JSON.stringify({ outcome }));
+      deps.repo.recordFundResolutionOnce(key, txHash, "reverted", JSON.stringify({ outcome }));
       continue;
     }
-    // ── Unreadable. Pending, or gone?
-    if (row.nonce !== null) {
+    // ── Definitively absent. Pending, or gone for good?
+    if (row.nonce !== null && olderThan(row.createdAt, STALE_AFTER_MS, now())) {
       const chainNonce = await deps.arc.platformNonce();
       if (chainNonce > row.nonce) {
         // The chain moved past our nonce. It could have moved past it by mining OUR transaction,
         // in the window between the receipt read above and this one — so ask again before calling
-        // a success a failure.
+        // a success a failure. A broken read here throws, exactly as in rule 1.
         if ((await deps.arc.receiptOutcome(txHash)) === "success") {
           out.landed.push({ txHash, amount });
           continue;
         }
-        deps.repo.recordEvent(
+        deps.repo.recordFundResolutionOnce(
           key,
-          "fundTreasury",
-          "dropped",
           txHash,
+          "dropped",
           JSON.stringify({ nonce: row.nonce, chainNonce }),
         );
         log("fund_submission_dropped", { entity: key, txHash, nonce: row.nonce, chainNonce });
@@ -110,7 +123,7 @@ export async function resolveSubmissions(
       }
     }
     if (row.rawTx) {
-      // Rule 4. A failure here changes nothing — the submission is already recorded and the next
+      // Rule 5. A failure here changes nothing — the submission is already recorded and the next
       // pass will try again — so it must not turn into the caller's error.
       try {
         await deps.arc.sendRawFundTreasury(row.rawTx as Hex);
@@ -122,6 +135,23 @@ export async function resolveSubmissions(
     out.unresolved ??= txHash;
   }
   return out;
+}
+
+/**
+ * How long a submission is left alone before the nonce rule may call it dropped.
+ *
+ * The reconciler's `STALE_AFTER_MS`, the same number for the same reason: below it, "no receipt"
+ * is the ordinary condition of a transaction that is simply waiting to be mined.
+ */
+export const STALE_AFTER_MS = 10 * 60_000;
+
+/** Is a `submitted` row older than `ms`? Unparseable (or missing) timestamps read as YOUNG, which
+ *  is the safe direction: an unknown age must never authorise a second transfer. */
+function olderThan(createdAt: string | null, ms: number, nowMs: number): boolean {
+  if (!createdAt) return false;
+  // SQLite's CURRENT_TIMESTAMP is UTC, spelled "YYYY-MM-DD HH:MM:SS" with no zone marker.
+  const at = Date.parse(`${createdAt.replace(" ", "T")}Z`);
+  return Number.isFinite(at) && nowMs - at > ms;
 }
 
 /**
@@ -176,7 +206,7 @@ export function finaliseFunded(
   const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash, error: null };
   repo.transaction(() => {
     repo.upsert(funded);
-    // ⚠ IDEMPOTENT PER HASH, and the guard is IN the INSERT (gate N5). The boot sweep is awaited
+    // ⚠ IDEMPOTENT PER HASH, and the guard is IN the INSERT (gates N5 and N10). The boot sweep is awaited
     // after `serve()`, so it walks its queue while `POST /entities/:id/fund` is being served: the
     // sweep and a live saga could both finalise the same transfer, and the measured result was two
     // `funded` rows for one transfer with the tenant's lifetime cap charged twice. A check-then-
@@ -186,9 +216,10 @@ export function finaliseFunded(
     // `amount` is what MOVED, which on a reconcile is the earlier attempt's figure rather than
     // this call's — `sumFundedByTenant` reads this field, so a quota that counted the requested
     // amount instead of the sent one would be fiction.
-    repo.recordFundedOnce(
+    repo.recordFundResolutionOnce(
       rec.idempotencyKey,
       txHash,
+      "funded",
       JSON.stringify({ amount: amount.toString(), ...(reconciled ? { reconciled } : {}) }),
     );
   });
@@ -220,6 +251,9 @@ export async function sweepUnresolvedFunding(deps: {
    * right now, and the next boot (or the next attempt) sees it.
    */
   busy?: (key: string) => boolean;
+  /** Injectable clock for the age gate — the sweep applies the same three conditions the saga
+   *  does, and it runs unattended at boot, when an unhealthy RPC is most likely. */
+  now?: () => number;
   log?: typeof opsLog;
 }): Promise<{
   checked: number;
@@ -249,7 +283,17 @@ export async function sweepUnresolvedFunding(deps: {
       continue;
     }
     const before = deps.repo.listUnresolvedFundSubmissions(key).length;
-    const resolution = await resolveSubmissions(deps, key);
+    let resolution: Resolution;
+    try {
+      resolution = await resolveSubmissions(deps, key);
+    } catch {
+      // A broken receipt read (gate N8). Nothing is concluded and nothing is written; the row
+      // stays outstanding for the next boot or the next attempt. One unhealthy read must not end
+      // the sweep either — the other entities still deserve theirs.
+      out.unresolved += before;
+      log("fund_sweep_unreadable", { entity: key });
+      continue;
+    }
     for (const landed of resolution.landed) {
       const rec = deps.repo.findByIdempotencyKey(key);
       if (!rec) continue;

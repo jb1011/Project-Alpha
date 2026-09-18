@@ -66,9 +66,13 @@ export class BroadcastUnconfirmedError extends Error {
  * Refusing is the only safe answer, and the message has to say that the refusal is not a failure.
  */
 export class PriorTransferUnconfirmedError extends Error {
-  constructor(readonly txHash: `0x${string}`) {
+  constructor(
+    readonly txHash: `0x${string}`,
+    options?: { cause?: unknown },
+  ) {
     super(
       `a previous fundTreasury broadcast (${txHash}) is still unconfirmed — refusing to send a second transfer`,
+      options,
     );
     this.name = "PriorTransferUnconfirmedError";
   }
