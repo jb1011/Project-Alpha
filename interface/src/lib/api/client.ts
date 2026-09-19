@@ -1,4 +1,6 @@
+import { budgetMs, clientBudgetMs } from "./budgets";
 import { API_URL } from "./config";
+import { fetchWithTimeout, readJsonBounded } from "./timeout";
 import type {
   AgentBookRegisterBody,
   AgentBookRegisterResult,
@@ -44,6 +46,9 @@ type RequestOpts = {
   method?: string;
   token?: string;
   body?: unknown;
+  /** Override the 30-second default (`REQUEST_TIMEOUT_MS`). A call that legitimately takes longer
+   *  than half a minute should say so here rather than have the default raised for everyone. */
+  timeoutMs?: number;
 };
 
 /**
@@ -78,14 +83,29 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
   if (opts.body !== undefined) headers["content-type"] = "application/json";
   if (opts.token) headers.authorization = `Bearer ${opts.token}`;
 
-  const res = await fetch(`${API_URL}${path}`, {
-    method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
-    headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
+  const method = opts.method ?? (opts.body !== undefined ? "POST" : "GET");
+  // BOUNDED (2026-09-16). `fetch` has no default timeout, so a stalled backend used to be an
+  // infinite spinner with no error to render. `fetchWithTimeout` maps an expiry onto the same
+  // `ApiError` shape every other failure here already takes, with the code `timeout`.
+  //
+  // The budget comes from the SHARED per-route table (`@/lib/api/budgets`), the same one the
+  // `/backend` proxy reads, plus a margin so the client is never the first to give up — the
+  // proxy's 504 carries the API's error envelope and is the better thing to show. A caller may
+  // still override it, but the table is what makes the settle and policy routes work without
+  // every call site having to know why.
+  const res = await fetchWithTimeout(
+    `${API_URL}${path}`,
+    {
+      method,
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+    },
+    opts.timeoutMs ?? clientBudgetMs(method, path),
+  );
 
   await throwIfNotOk(res);
-  return (await res.json().catch(() => null)) as T;
+  // Through the bounded reader: an abort DURING the body read is a timeout, not `null` data.
+  return (await readJsonBounded<T>(res)) as T;
 }
 
 export async function healthCheck(): Promise<{ ok: boolean }> {
@@ -605,9 +625,16 @@ export async function downloadDocument(
   companyId: string,
   docId: string,
 ): Promise<{ blob: Blob; filename: string | null }> {
-  const res = await fetch(
-    `${API_URL}/companies/${encodeURIComponent(companyId)}/documents/${encodeURIComponent(docId)}`,
+  // Through the same bounded fetch as everything else, reading the same table — which gives this
+  // ONE route an UNBOUNDED budget (`Infinity`, i.e. no timer at all). It hands back file bytes,
+  // and the budget exists to end silent waits on a JSON API, not to cut a download off part-way.
+  // Routing it through here anyway is the point: the exemption is now a row in a table that a
+  // reviewer can see, rather than the quiet consequence of bypassing `request()`.
+  const path = `/companies/${encodeURIComponent(companyId)}/documents/${encodeURIComponent(docId)}`;
+  const res = await fetchWithTimeout(
+    `${API_URL}${path}`,
     { headers: { authorization: `Bearer ${token}` } },
+    budgetMs("GET", path),
   );
 
   await throwIfNotOk(res);
