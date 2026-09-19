@@ -113,7 +113,13 @@ export interface EntityRepository {
   listUnresolvedFundSubmissions(key?: string): FundSubmissionRow[];
   /**
    * Write a `fundTreasury` RESOLUTION for this hash — `funded`, `reverted` or `dropped` — unless
-   * this hash already has one.
+   * this hash already has one that outranks it.
+   *
+   * ⚠ ONE asymmetry, and it is the point (gate N11): `dropped` is an INFERENCE of ours (two
+   * definitive absences plus an advanced nonce past the age gate), while `funded` and `reverted`
+   * are the CHAIN ANSWERING. So a receipt may supersede a `dropped` — the guard for `funded` asks
+   * only about `funded`/`reverted` rows — but nothing may supersede a receipt, and an inference may
+   * never overwrite anything.
    *
    * One statement, so the check and the write cannot be separated by a race. The boot sweep runs
    * while the API is serving, so it and a live fund saga can reach the same transfer at the same
@@ -632,9 +638,12 @@ export class SqliteEntityRepository implements EntityRepository {
     // the alternative; it would have to be added by a migration that fails at boot on any database
     // already holding a duplicate, and this needs no migration at all.)
     //
-    // The guard spans ALL THREE resolution statuses, not just the one being written: a hash that
-    // is already `dropped` must not also become `funded` — that would be two contradictory
-    // verdicts, and the first of them released the tenant's cap.
+    // WHICH existing verdicts block this one: a receipt (`funded`) is blocked only by another
+    // receipt, so it can still be written over a `dropped` we inferred; an inference is blocked by
+    // any verdict at all. Expressed as data rather than as two statements so the guard and the
+    // write stay one statement.
+    const blockers =
+      status === "funded" ? ["funded", "reverted"] : ["funded", "reverted", "dropped"];
     const info = this.db
       .prepare(`
         INSERT INTO events (idempotency_key, step, status, tx_hash, detail)
@@ -642,10 +651,10 @@ export class SqliteEntityRepository implements EntityRepository {
         WHERE NOT EXISTS (
           SELECT 1 FROM events
           WHERE idempotency_key = ? AND step = 'fundTreasury'
-            AND status IN ('funded', 'reverted', 'dropped') AND tx_hash = ?
+            AND status IN (${blockers.map(() => "?").join(", ")}) AND tx_hash = ?
         )
       `)
-      .run(key, status, txHash, detail, key, txHash);
+      .run(key, status, txHash, detail, key, ...blockers, txHash);
     return info.changes > 0;
   }
 

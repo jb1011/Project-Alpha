@@ -122,7 +122,8 @@ function makeFakeArc(
   });
   // An array lets a test answer differently on the re-check the `dropped` rule makes.
   const receipts = Array.isArray(opts.receipt) ? [...opts.receipt] : undefined;
-  const receiptOutcome = vi.fn(async () => {
+  // Takes the hash so a test can answer per transaction (a batch sweep mixes outcomes).
+  const receiptOutcome = vi.fn(async (_txHash: `0x${string}`) => {
     const answer = receipts ? (receipts.shift() ?? "absent") : (opts.receipt ?? "absent");
     // The adapter rethrows anything that is not a definitive absence; the resolution must then
     // refuse rather than guess.
@@ -713,6 +714,151 @@ test("N10: the same guard covers `reverted`", async () => {
   await sweepUnresolvedFunding({ repo, arc: makeFakeArc({ receipt: "reverted" }) });
 
   expect(fundEvents().filter((e) => e.status === "reverted")).toHaveLength(1);
+});
+
+/* ── N11: the CHAIN outranks our inference ──────────────────────────────────────────────────── */
+
+test("N11: a receipt that says SUCCESS supersedes a `dropped` we inferred", async () => {
+  // Two resolvers can disagree about one hash: the sweep sees two definitive absences and an
+  // advanced nonce past the age gate and writes `dropped`, while a live saga's read comes back
+  // `success` from a healthier replica. `dropped` is our INFERENCE; a receipt is the chain's
+  // ANSWER. Round 5 gave a hash one verdict and left the caller behind: the entity was mutated to
+  // funded with no `funded` event, so the money that moved was uncounted.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+  repo.recordFundResolutionOnce(KEY, FIRST_TX, "dropped", JSON.stringify({ nonce: 7 }));
+  expect(repo.sumFundedByTenant(TENANT)).toBe(0n); // a `dropped` released the cap
+
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+    lines.push(a.map(String).join(" "));
+  });
+  try {
+    const rec = repo.findByIdempotencyKey(KEY)!;
+    finaliseFunded(repo, rec, FIRST_TX, AMOUNT, true);
+  } finally {
+    spy.mockRestore();
+  }
+
+  // The `funded` event is written…
+  expect(fundEventShape()).toEqual([
+    `submitted:${FIRST_TX}`,
+    `dropped:${FIRST_TX}`,
+    `funded:${FIRST_TX}`,
+  ]);
+  // …so the money is counted again (the `dropped` had released it)…
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT);
+  // …the submission reads as resolved…
+  expect(repo.listUnresolvedFundSubmissions(KEY)).toHaveLength(0);
+  // …the entity row agrees…
+  const row = repo.findByIdempotencyKey(KEY)!;
+  expect(row.status).toBe("funded");
+  expect(row.fundTxHash).toBe(FIRST_TX);
+  // …and the contradiction is on the record, because two resolvers disagreeing about one transfer
+  // is something an operator should be able to find later.
+  const ops = lines
+    .filter((l) => l.includes('"opslog"'))
+    .map((l) => JSON.parse(l) as Record<string, unknown>)
+    .filter((l) => l.opslog === "fund_verdict_contradiction");
+  expect(ops).toHaveLength(1);
+  expect(ops[0]).toMatchObject({ entity: KEY, txHash: FIRST_TX, previous: "dropped" });
+});
+
+test("N11: a second `funded` writes nothing and does not touch the entity", async () => {
+  await onboard(makeFakeArc());
+  const runner = makeRunner(makeFakeArc({ confirm: "success" }));
+  runner.fund({ id: KEY, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  // Pretend a later, wrong resolver tries to finalise the same hash with a different amount.
+  const rec = repo.findByIdempotencyKey(KEY)!;
+  const returned = finaliseFunded(repo, { ...rec, error: "stale" }, FIRST_TX, 999n, true);
+
+  expect(fundEvents().filter((e) => e.status === "funded")).toHaveLength(1);
+  expect(repo.sumFundedByTenant(TENANT)).toBe(AMOUNT); // not 999n, and not doubled
+  // The entity is NOT re-written: a no-op finalise must not smuggle in the caller's stale record.
+  expect(repo.findByIdempotencyKey(KEY)!.error).toBeNull();
+  // …and the caller still gets the row as it stands, so it can carry on.
+  expect(returned.status).toBe("funded");
+});
+
+test("N11: a REVERTED verdict is not superseded — that receipt was an answer too", async () => {
+  // `reverted` and `funded` are both the chain speaking, and they cannot both be true of one
+  // transaction. Only an INFERENCE (`dropped`) may be overruled.
+  await onboard(makeFakeArc());
+  await attemptOneSendThrew();
+  repo.recordFundResolutionOnce(KEY, FIRST_TX, "reverted", JSON.stringify({ outcome: "reverted" }));
+
+  const rec = repo.findByIdempotencyKey(KEY)!;
+  finaliseFunded(repo, rec, FIRST_TX, AMOUNT, true);
+
+  expect(fundEvents().filter((e) => e.status === "funded")).toHaveLength(0);
+  expect(repo.sumFundedByTenant(TENANT)).toBe(0n);
+  expect(repo.findByIdempotencyKey(KEY)!.status).toBe("bound");
+});
+
+test("N12: the sweep's tally is per entity, not cumulative", async () => {
+  // `settled` read the running `out.finalised`, so from the second entity onwards it went negative
+  // and the reverted/dropped tallies silently stopped counting. Only the boot line reads these
+  // numbers, but a boot line that under-reports what a sweep did is worse than no line.
+  const entities = ["A", "B", "C"].map((n) => `${TENANT}:${n}`);
+  for (const key of entities) {
+    repo.upsert({
+      idempotencyKey: key,
+      name: key,
+      status: "bound",
+      ownerTenantId: TENANT,
+      manager: "0x000000000000000000000000000000000000aAaa",
+      guardian: TENANT,
+      operator: null,
+      amendmentDelay: "0",
+      ein: "",
+      formationDate: 0,
+      oaHash: null,
+      metadataURI: null,
+      docPath: null,
+      treasuryConfig: null,
+      agentId: null,
+      proxy: null,
+      treasury: null,
+      createTxHash: null,
+      bindTxHash: null,
+      fundTxHash: null,
+      specJson: JSON.stringify(spec),
+      error: null,
+    });
+    repo.recordEvent(
+      key,
+      "fundTreasury",
+      "submitted",
+      `0x${key.slice(-1).toLowerCase().repeat(6)}`,
+      JSON.stringify({ amount: "1000000", rawTx: "0xrawbatch", nonce: 4 }),
+    );
+  }
+
+  // One lands, one reverts, one drops — the three outcomes, in one batch.
+  const outcomes: Record<string, "success" | "reverted" | "absent"> = {
+    "0xaaaaaa": "success",
+    "0xbbbbbb": "reverted",
+    "0xcccccc": "absent",
+  };
+  const arc = makeFakeArc({ platformNonce: 9 });
+  arc.receiptOutcome.mockImplementation(async (h: `0x${string}`) => outcomes[h] ?? "absent");
+
+  const swept = await sweepUnresolvedFunding({
+    repo,
+    arc,
+    now: () => Date.now() + 11 * 60_000,
+  });
+
+  expect(swept).toEqual({
+    checked: 3,
+    finalised: 1,
+    reverted: 1,
+    dropped: 1,
+    unresolved: 0,
+    skipped: 0,
+  });
 });
 
 /* ── N5: the sweep must not charge a transfer twice ──────────────────────────────────────────── */

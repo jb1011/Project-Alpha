@@ -949,7 +949,7 @@ async function main() {
   const funding = await sweepUnresolvedFunding({ repo, arc, busy: (key) => runner.isBusy(key) });
   if (funding.checked)
     console.log(
-      `Funding sweep at boot: ${funding.checked} checked, ${funding.finalised} finalised, ${funding.reverted} reverted, ${funding.unresolved} still unresolved`,
+      `Funding sweep at boot: ${funding.checked} checked, ${funding.finalised} finalised, ${funding.reverted} reverted, ${funding.dropped} dropped, ${funding.skipped} skipped (busy), ${funding.unresolved} still unresolved`,
     );
 
   // AgentBook reconcile at boot (D12), and AFTER the socket is listening for the same reason C4

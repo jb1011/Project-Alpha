@@ -202,27 +202,40 @@ export function finaliseFunded(
   txHash: Hex,
   amount: bigint,
   reconciled: boolean,
+  log: typeof opsLog = opsLog,
 ): EntityRecord {
   const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash, error: null };
+  /** Was this transfer already written off as `dropped`? Read before the write, for the ops line. */
+  const supersedes = repo
+    .listEvents(rec.idempotencyKey)
+    .some((e) => e.step === "fundTreasury" && e.status === "dropped" && e.txHash === txHash);
+  let written = false;
   repo.transaction(() => {
-    repo.upsert(funded);
-    // ⚠ IDEMPOTENT PER HASH, and the guard is IN the INSERT (gates N5 and N10). The boot sweep is awaited
-    // after `serve()`, so it walks its queue while `POST /entities/:id/fund` is being served: the
-    // sweep and a live saga could both finalise the same transfer, and the measured result was two
-    // `funded` rows for one transfer with the tenant's lifetime cap charged twice. A check-then-
-    // insert in TypeScript would only narrow that window; `recordFundedOnce` is one statement, so
-    // there is no window at all.
+    // ⚠ EVENT FIRST, AND ITS ANSWER DECIDES (gate N11). The guard is in the INSERT (gates N5/N10),
+    // so a hash gets one verdict however the sweep and a live saga interleave. Round 5 upserted the
+    // entity BEFORE this call and ignored the boolean, which meant a hash already carrying a
+    // verdict left the entity mutated to `funded` with no `funded` event — money that moved,
+    // invisible to `sumFundedByTenant`.
     //
     // `amount` is what MOVED, which on a reconcile is the earlier attempt's figure rather than
     // this call's — `sumFundedByTenant` reads this field, so a quota that counted the requested
     // amount instead of the sent one would be fiction.
-    repo.recordFundResolutionOnce(
+    written = repo.recordFundResolutionOnce(
       rec.idempotencyKey,
       txHash,
       "funded",
       JSON.stringify({ amount: amount.toString(), ...(reconciled ? { reconciled } : {}) }),
     );
+    // The entity moves only when the event did. A second finalise is then a pure no-op rather than
+    // a chance to write the caller's stale record over the current one.
+    if (written) repo.upsert(funded);
   });
+  if (!written) return repo.findByIdempotencyKey(rec.idempotencyKey) ?? rec;
+  if (supersedes)
+    // Two resolvers reached contradictory conclusions about one transfer. The chain won, which is
+    // right, but an operator should be able to find the disagreement afterwards: it means a
+    // replica served two definitive absences for a transaction that had in fact mined.
+    log("fund_verdict_contradiction", { entity: rec.idempotencyKey, txHash, previous: "dropped" });
   return funded;
 }
 
@@ -294,17 +307,20 @@ export async function sweepUnresolvedFunding(deps: {
       log("fund_sweep_unreadable", { entity: key });
       continue;
     }
+    // Captured per entity: `out.finalised` accumulates across the whole batch, and reading it
+    // below made `settled` go negative from the second entity onwards (gate N12).
+    const finalisedBefore = out.finalised;
     for (const landed of resolution.landed) {
       const rec = deps.repo.findByIdempotencyKey(key);
       if (!rec) continue;
-      finaliseFunded(deps.repo, rec, landed.txHash, landed.amount ?? 0n, true);
+      finaliseFunded(deps.repo, rec, landed.txHash, landed.amount ?? 0n, true, log);
       out.finalised++;
     }
     // Whatever is still open after the pass was neither mined nor settled; the rest were closed as
     // `reverted` or `dropped`, and those two are told apart by re-reading the rows.
     const stillOpen = deps.repo.listUnresolvedFundSubmissions(key).length;
     out.unresolved += stillOpen;
-    const settled = before - out.finalised - stillOpen;
+    const settled = before - (out.finalised - finalisedBefore) - stillOpen;
     if (settled > 0) {
       const closed = deps.repo
         .listEvents(key)
