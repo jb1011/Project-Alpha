@@ -12,6 +12,7 @@ import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationRepository } from "../persistence/formationRepository";
 import type { AgentSpec } from "../policy/agentSpec";
 import type { Address, EntityRecord, EntityStatus } from "../types";
+import { isUnresolvedTransferError, publicFailure } from "./publicError";
 
 export type RunSaga = (input: {
   spec: AgentSpec;
@@ -25,6 +26,15 @@ export type RunSaga = (input: {
 }) => Promise<EntityRecord>;
 
 const TERMINAL: EntityStatus[] = ["bound", "funded", "failed"];
+
+/**
+ * WHAT `run()` IS RUNNING — the fact `recordFailure` may not guess (review R3).
+ *
+ * There are exactly three call sites and each knows its own answer: `start` an onboard, `fund` a
+ * fund, `reconcileInFlight` a resume. Inferring it from the row's status instead is what let an
+ * onboarding's tail failure be recorded as a fund failure.
+ */
+type SagaKind = "onboard" | "fund" | "resume";
 
 /** Drives the resumable onboarding saga in-process: immediate pending record + background run. */
 export class OnboardingRunner {
@@ -218,15 +228,18 @@ export class OnboardingRunner {
     // existing single-statement path.
     if (p.companyId) this.deps.repo.transaction(claim);
     else claim();
-    this.run(id, () =>
-      this.deps.runSaga({
-        spec: p.spec,
-        idempotencyKey: id,
-        tenantId: p.tenantId,
-        guardianPasskey: p.guardianPasskey,
-        specJson,
-        custody: p.custody,
-      }),
+    this.run(
+      id,
+      () =>
+        this.deps.runSaga({
+          spec: p.spec,
+          idempotencyKey: id,
+          tenantId: p.tenantId,
+          guardianPasskey: p.guardianPasskey,
+          specJson,
+          custody: p.custody,
+        }),
+      "onboard",
     );
     return { id, status: "pending" };
   }
@@ -259,14 +272,24 @@ export class OnboardingRunner {
       throw new ApiError("limit_exceeded", 400, "platform outflow ceiling reached");
     }
     const spec = JSON.parse(rec.specJson ?? "{}") as AgentSpec;
-    this.run(p.id, () =>
-      this.deps.runSaga({
-        spec,
-        idempotencyKey: p.id,
-        tenantId: p.tenantId,
-        specJson: rec.specJson ?? "{}",
-        fundAmount: p.amount,
-      }),
+    // CLEAR THE PREVIOUS ATTEMPT'S ERROR, here, after every refusal above and before the saga
+    // exists. A fund failure now leaves `error` on a row whose status does not change, so the
+    // wizard treats any error it sees while polling as belonging to the attempt it just started.
+    // Without this clear the first poll of a retry reads the OLD failure and reports the retry as
+    // failed a second after it began — while it is still in flight.
+    if (rec.error !== null) this.deps.repo.upsert({ ...rec, error: null });
+    this.run(
+      p.id,
+      () =>
+        this.deps.runSaga({
+          spec,
+          idempotencyKey: p.id,
+          tenantId: p.tenantId,
+          specJson: rec.specJson ?? "{}",
+          fundAmount: p.amount,
+        }),
+      "fund",
+      p.amount,
     );
     return { id: p.id, status: rec.status };
   }
@@ -291,17 +314,34 @@ export class OnboardingRunner {
         continue;
       }
       const spec = JSON.parse(rec.specJson ?? "{}") as AgentSpec;
-      this.run(rec.idempotencyKey, () =>
-        this.deps.runSaga({
-          spec,
-          idempotencyKey: rec.idempotencyKey,
-          tenantId: rec.ownerTenantId ?? "",
-          specJson: rec.specJson ?? "{}",
-        }),
+      this.run(
+        rec.idempotencyKey,
+        () =>
+          this.deps.runSaga({
+            spec,
+            idempotencyKey: rec.idempotencyKey,
+            tenantId: rec.ownerTenantId ?? "",
+            specJson: rec.specJson ?? "{}",
+          }),
+        // A resume carries no `fundAmount` today (it re-runs the onboarding steps only), so it can
+        // never produce a fund verdict. The parameter exists so that if one ever does, the verdict
+        // follows the request rather than the row's status.
+        "resume",
       );
       resumed++;
     }
     return resumed;
+  }
+
+  /**
+   * Is a saga running for this entity right now?
+   *
+   * The per-entity lock, read-only, for the boot funding sweep (gate N5): the sweep runs after the
+   * socket is open, so a fund can arrive in the middle of it, and it must never resolve a
+   * submission the saga is in the middle of confirming.
+   */
+  isBusy(id: string): boolean {
+    return this.inFlight.has(id);
   }
 
   /** Await all background work (tests/shutdown). */
@@ -309,8 +349,27 @@ export class OnboardingRunner {
     await Promise.allSettled(this.pending);
   }
 
-  private run(id: string, fn: () => Promise<unknown>) {
+  /**
+   * @param kind WHAT WE RAN, passed down rather than inferred (review R3).
+   *
+   * The first version of `recordFailure` read the row's status and called `bound`/`funded` a fund
+   * attempt. That answers "is this row fundable?" when the question is "did we just try to fund
+   * it?" — the mirror image of the 2026-09-14 bug it replaced. The onboard saga REACHES `bound`
+   * and then keeps going (ENS, formation, both with their own `recordEvent` calls that can throw
+   * on SQLITE_BUSY), so an onboarding that never asked to fund could be recorded as a fund
+   * failure, in the one field the wizard reads as a verdict on the money.
+   */
+  private run(
+    id: string,
+    fn: () => Promise<unknown>,
+    kind: SagaKind,
+    /** Only a resume can carry one implicitly; `fund()` always does. */
+    fundAmount?: bigint,
+  ) {
     this.inFlight.add(id);
+    // What the transfer looked like BEFORE this attempt. The comparison after the throw is what
+    // distinguishes "the fund failed" from "the fund worked and something later did not".
+    const fundTxHashBefore = this.deps.repo.findByIdempotencyKey(id)?.fundTxHash ?? null;
     const task = (async () => {
       // Yield to the current synchronous frame so callers can observe the `pending` record
       // before the saga mutates it. This also matches real async behaviour (network/chain calls).
@@ -318,17 +377,114 @@ export class OnboardingRunner {
       try {
         await fn();
       } catch (e) {
-        const cur = this.deps.repo.findByIdempotencyKey(id);
-        if (cur && !TERMINAL.includes(cur.status))
-          this.deps.repo.upsert({
-            ...cur,
-            status: "failed",
-            error: e instanceof Error ? e.message : String(e),
-          });
+        this.recordFailure(id, e, {
+          fundAttempt: kind === "fund" || (kind === "resume" && (fundAmount ?? 0n) > 0n),
+          kind,
+          fundTxHashBefore,
+        });
       } finally {
         this.inFlight.delete(id);
       }
     })();
     this.pending.push(task);
+  }
+
+  /**
+   * EVERY background failure leaves a trace. The 2026-09-14 incident was the absence of this.
+   *
+   * The platform wallet was nearly empty, `fundTreasury` reverted, and nothing at all was written:
+   * no status change, no `error`, no event. The wizard's FundStep polls for `funded` or `failed`,
+   * so it span forever on a transfer that had already failed — and `journalctl` had nothing to say
+   * about it either.
+   *
+   * The cause was a guard that read correctly and behaved wrongly: only a NON-terminal status was
+   * failed-and-recorded, and a fund saga always runs on a `bound` or `funded` entity, both of
+   * which are terminal. So "don't clobber a finished onboarding" silently meant "never report a
+   * fund failure".
+   *
+   * FOUR cases now, and the difference between them is what the row still MEANS afterwards. Only
+   * ONE of them may write `error`, because `error` is the field the wizard reads as a verdict on
+   * the money (`fundOutcome.ts` checks it before the status):
+   *
+   *  - **not terminal** — the onboarding itself died part-way. `failed` is the truth; record it.
+   *  - **a FUND attempt whose transfer did not happen** — the 2026-09-14 case. The status is still
+   *    true (the entity IS bound; a transfer that never happened does not un-bind it), so the
+   *    failure is recorded BESIDE it: `error` on the row for the poller, and one event on the trail
+   *    for the operator. ⚠ The event is `fundTreasury`/**failed**, and `sumFundedByTenant` sums
+   *    `fundTreasury`/`funded` only — so this cannot consume a cent of anyone's quota.
+   *  - **anything else on a terminal row** — an onboard/resume tail failure, or a fund whose
+   *    transfer SUCCEEDED and whose step 8/9 then threw (review R3, the dangerous direction). The
+   *    row's own facts are true and the money is where the row says it is, so the failure goes on
+   *    the trail as `sagaTail` and NOTHING goes in `error`.
+   *  - **`failed`** — already dead, with a reason somebody is reading. Left untouched.
+   *
+   * The stored message is ALWAYS the public one: `entity.error` is served to the browser and
+   * rendered verbatim, which is how a viem diagnostic containing an RPC key put that key on screen
+   * on 2026-09-16. It carries a `ref` (Q4) that joins it to the ops line's full diagnostic.
+   */
+  private recordFailure(
+    id: string,
+    e: unknown,
+    ctx: { fundAttempt: boolean; kind: SagaKind; fundTxHashBefore: string | null },
+  ) {
+    const { error, errorDetail, ref } = publicFailure(e);
+    const cur = this.deps.repo.findByIdempotencyKey(id);
+    // Did THIS attempt's transfer land? Step 7 writes `fundTxHash` only on success, so a change
+    // here means the money moved and no failure after it may be reported as a fund failure.
+    const moved = !!cur?.fundTxHash && cur.fundTxHash !== ctx.fundTxHashBefore;
+    /**
+     * ⚠ A BROADCAST WE CANNOT ACCOUNT FOR IS NOT A FUND FAILURE (gate N1).
+     *
+     * This is the finding that made the first two rounds compose into a double-send. A
+     * `BroadcastUnconfirmedError` means money has PROBABLY moved, and a
+     * `PriorTransferUnconfirmedError` means we deliberately sent nothing — neither is a settled
+     * failure of a transfer. Recording one as `fundTreasury`/`failed` put a row on the trail after
+     * the saga's `submitted` row, and the old recency-based reconcile then read the entity as
+     * settled and broadcast a second transfer on the very next Retry.
+     *
+     * The reconcile is keyed by hash now and would survive this row, but writing it would still be
+     * a lie on the audit trail, and defence in depth is the point: the state of a transfer is the
+     * saga's to record, never the runner's.
+     */
+    const unresolvedTransfer = isUnresolvedTransferError(e);
+    const fundFailure = ctx.fundAttempt && !moved && !unresolvedTransfer;
+    // One line. `errorDetail` is named for `opsLog`'s free-text redaction, which keys on
+    // /error|message|reason|detail/i — a field called `diagnostic` would silently skip redactPii.
+    opsLog("saga_failed", {
+      entity: id,
+      kind: ctx.kind,
+      status: cur?.status ?? "unknown",
+      ...(fundFailure ? { step: "fundTreasury" } : {}),
+      ...(moved ? { fundTxMoved: true } : {}),
+      ...(unresolvedTransfer ? { unresolvedTransfer: true } : {}),
+      error,
+      errorDetail,
+      ref,
+    });
+    if (!cur) return;
+    if (!TERMINAL.includes(cur.status)) {
+      this.deps.repo.upsert({ ...cur, status: "failed", error });
+      return;
+    }
+    if (cur.status === "failed") return;
+    if (unresolvedTransfer) {
+      // The row carries the sentence — the wizard must say "sent, not confirmed, do not retry" —
+      // and the TRAIL is left entirely to the saga, which has already written `submitted` with the
+      // hash. Nothing here may add a row that describes the transfer's fate.
+      this.deps.repo.upsert({ ...cur, error });
+      return;
+    }
+    if (!fundFailure) {
+      // The trail, never the verdict field. A tail failure is not nothing — it is just not a
+      // statement about the treasury.
+      this.deps.repo.recordEvent(id, "sagaTail", "failed", null, JSON.stringify({ error, ref }));
+      return;
+    }
+    // Row and trail together: a poll that reads the error and an audit that does not show the
+    // attempt would be two different accounts of the same minute.
+    this.deps.repo.transaction(() => {
+      this.deps.repo.upsert({ ...cur, error });
+      this.deps.repo.recordEvent(id, "fundTreasury", "failed", null, JSON.stringify({ error }));
+    });
   }
 }

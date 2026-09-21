@@ -60,6 +60,70 @@ test("fundTreasury passes an explicit gas (same footgun class)", async () => {
   assertExplicitGas(managerWrite.mock.calls[0]![0]);
 });
 
+test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", async () => {
+  // The footgun fix has to hold on the path that actually funds agents. `fundTreasury` above is now
+  // only the CLI's; the saga signs locally (so the hash exists before anything is sent), and
+  // `prepareTransactionRequest` estimates exactly like `writeContract` would unless gas is given.
+  const prepareTransactionRequest = vi.fn().mockResolvedValue({ nonce: 11, marker: "prepared" });
+  const signTransaction = vi.fn().mockResolvedValue("0xsignedbytes" as Hex);
+  const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
+  const managerWallet = {
+    account: { address: "0x000000000000000000000000000000000000000A" },
+    chain: { id: 5042002 },
+    prepareTransactionRequest,
+    signTransaction,
+  } as unknown as WalletClient;
+  const adapter = new ArcAdapter({
+    publicClient: { simulateContract } as unknown as PublicClient,
+    managerWallet,
+    chainId: 5042002,
+    factory: "0x0000000000000000000000000000000000000001" as Address,
+    identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
+  });
+
+  const signed = await adapter.signFundTreasury({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 500_000n,
+  });
+
+  const prepared = prepareTransactionRequest.mock.calls[0]![0] as { gas?: bigint; to?: Address };
+  expect(typeof prepared.gas).toBe("bigint");
+  expect(prepared.gas).toBeGreaterThanOrEqual(60_000n);
+  expect(prepared.to).toBe(USDC);
+  // Signed as the account that actually holds and spends the USDC — the same wallet in controller
+  // mode, where it is the executor: a treasury top-up is a plain transfer, never a relayed call.
+  expect(prepareTransactionRequest.mock.calls[0]![0].account).toBe(managerWallet.account);
+  // The simulate still runs FIRST, which is what keeps "nothing was sent" true for a revert.
+  expect(simulateContract.mock.calls[0]![0].functionName).toBe("transfer");
+  // The hash is derived from the signed bytes, not from a node's answer.
+  expect(signed.txHash).toMatch(/^0x[0-9a-f]{64}$/);
+  expect(signed.nonce).toBe(11);
+  expect(signed.rawTx).toBe("0xsignedbytes");
+});
+
+test("signFundTreasury refuses to persist a hole where the nonce should be", async () => {
+  // An unrecorded nonce would make "pending or dropped?" unanswerable later, and quietly.
+  const managerWallet = {
+    account: { address: "0x000000000000000000000000000000000000000A" },
+    chain: { id: 5042002 },
+    prepareTransactionRequest: vi.fn().mockResolvedValue({ marker: "no-nonce" }),
+    signTransaction: vi.fn(),
+  } as unknown as WalletClient;
+  const adapter = new ArcAdapter({
+    publicClient: {
+      simulateContract: vi.fn().mockResolvedValue({ request: {} }),
+    } as unknown as PublicClient,
+    managerWallet,
+    chainId: 5042002,
+    factory: "0x0000000000000000000000000000000000000001" as Address,
+    identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
+  });
+  await expect(
+    adapter.signFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
+  ).rejects.toThrow(/no nonce/);
+});
+
 test("operatorTransferUsdc still simulates (eth_call) + waits for the receipt", async () => {
   const { adapter, simulateContract, waitForTransactionReceipt } = makeAdapter();
   await adapter.operatorTransferUsdc(USDC, TO, 100_000n);
