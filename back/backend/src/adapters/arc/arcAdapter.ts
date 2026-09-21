@@ -13,6 +13,7 @@ import {
   isAddressEqual,
   keccak256,
   parseEventLogs,
+  parseTransaction,
 } from "viem";
 import {
   agentTreasuryAbi,
@@ -24,6 +25,7 @@ import { BroadcastUnconfirmedError } from "../../errors";
 import type { TreasuryConfig } from "../../types";
 import { USDC_TRANSFER_GAS } from "./gas";
 import { appendRelayTarget, relayRevertError } from "./relay";
+import { nextSenderNonce, noteSenderBroadcast, sendFromSender } from "./senderLock";
 
 /**
  * How long a manager-call receipt is waited for before the caller is told to come back later.
@@ -110,6 +112,44 @@ export class ArcAdapter {
   }
 
   /**
+   * The address that signs and pays for every platform send, or undefined when this adapter was
+   * built for READS ONLY (several compositions pass no manager wallet at all).
+   *
+   * It is the sender lock's key, exposed because the funding saga's nonce-critical window spans
+   * three calls — sign, persist, send — so the lock there is the CALLER's (see {signFundTreasury}).
+   */
+  get platformAddress(): Address | undefined {
+    return this.d.managerWallet?.account?.address;
+  }
+
+  /**
+   * THE CHOKEPOINT for every platform-key transaction that signs and broadcasts in one call.
+   *
+   * One send at a time per signing key, each with a nonce from one ledger (see senderLock.ts): two
+   * sends that read the node's count independently get the same answer and claim the same nonce,
+   * and one of them is then rejected or silently replaced.
+   *
+   * Everything SLOW stays outside: the simulate/estimate preflight happens before the call, and the
+   * receipt wait after it. The locked window is exactly "pick the nonce, hand the bytes to the
+   * node".
+   *
+   * ⚠ LEAF ONLY. The lock is not reentrant, so nothing this callback reaches may take it again for
+   * the same signer — which is why no method here calls another method's send.
+   */
+  private sendAsPlatform(
+    sender: Address,
+    broadcast: (nonce: number) => Promise<Hex>,
+  ): Promise<Hex> {
+    return sendFromSender(sender, () => this.pendingNonce(sender), broadcast);
+  }
+
+  /** What a NEW transaction from this sender would be numbered, before our own floor is applied.
+   *  `pending`, so it counts transactions of ours the chain has accepted but not yet mined. */
+  private pendingNonce(sender: Address): Promise<number> {
+    return this.d.publicClient.getTransactionCount({ address: sender, blockTag: "pending" });
+  }
+
+  /**
    * PER-AGENT relay routing. The controller is the manager of agents created THROUGH it; every
    * agent minted before the cutover still has the old EOA as its immutable `manager`, and a vault
    * only ever obeys its own manager. So "controller mode" is not a global switch — it is a
@@ -172,7 +212,9 @@ export class ArcAdapter {
         args: p.args,
         account,
       });
-      return this.d.managerWallet.writeContract(request);
+      return this.sendAsPlatform(account.address, (nonce) =>
+        this.d.managerWallet.writeContract({ ...request, nonce }),
+      );
     }
 
     const data = appendRelayTarget(
@@ -187,13 +229,39 @@ export class ArcAdapter {
       // untouched so an RPC outage never reads as "reverted in simulation" (see relay.ts).
       throw relayRevertError(err, { ...p, controller });
     }
-    return this.d.managerWallet.sendTransaction({
-      to: controller,
-      data,
-      gas,
-      account,
-      chain: this.d.managerWallet.chain,
-    });
+    return this.sendAsPlatform(account.address, (nonce) =>
+      this.d.managerWallet.sendTransaction({
+        to: controller,
+        data,
+        gas,
+        nonce,
+        account,
+        chain: this.d.managerWallet.chain,
+      }),
+    );
+  }
+
+  /**
+   * Send native value (on Arc the gas token IS USDC) as the platform — the live runner's gas seeds.
+   *
+   * Here rather than at the call site so it shares the one chokepoint: a seed and a treasury top-up
+   * come from the same key, so they compete for the same nonces.
+   */
+  async sendNativeAsPlatform(to: Address, value: bigint): Promise<Hex> {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send as the zero address",
+      );
+    return this.sendAsPlatform(account.address, (nonce) =>
+      this.d.managerWallet.sendTransaction({
+        to,
+        value,
+        nonce,
+        account,
+        chain: this.d.managerWallet.chain,
+      }),
+    );
   }
 
   /**
@@ -561,6 +629,11 @@ export class ArcAdapter {
    *
    * `simulateContract` runs first and its revert is raised BEFORE anything is signed or recorded,
    * which is what keeps "nothing was sent" true for the one case where it is true.
+   *
+   * ⚠ THE CALLER HOLDS THE SENDER LOCK. This is the one platform send whose nonce-critical window
+   * is not a single call — it is sign → persist → send, and the persist is what makes the signature
+   * recoverable, so the lock has to span all three (`workflow/onboarding.ts` step 7). The nonce
+   * picker refuses outside it rather than trusting a convention.
    */
   async signFundTreasury(p: {
     usdc: Address;
@@ -596,6 +669,10 @@ export class ArcAdapter {
         args: [p.treasury, p.amount],
       }),
       gas: USDC_TRANSFER_GAS,
+      // EXPLICIT, from the same ledger every other platform send draws on. Left to viem this is a
+      // fresh `eth_getTransactionCount(pending)` — which is exactly the read that answers the same
+      // number twice when the node has not caught up, or when two funds are in flight at once.
+      nonce: await nextSenderNonce(account.address, () => this.pendingNonce(account.address)),
     });
     // The nonce is the whole reason this is visible before anything is broadcast: it is recorded,
     // so "pending" and "dropped" can be told apart later. A quietly missing one would make that
@@ -606,12 +683,30 @@ export class ArcAdapter {
     return { rawTx, txHash: keccak256(rawTx), nonce: Number(request.nonce) };
   }
 
-  /** Put signed bytes on the wire. Idempotent by construction: re-sending the same transaction is
-   *  at worst a no-op the node already knows about, which is what makes a re-broadcast safe. */
+  /**
+   * Put signed bytes on the wire. Idempotent by construction: re-sending the same transaction is
+   * at worst a no-op the node already knows about, which is what makes a re-broadcast safe.
+   *
+   * Takes NO lock of its own, deliberately: on the saga's path the caller holds it (the window
+   * started at the signature), and the reconciler's re-broadcast picks no nonce at all — the bytes
+   * already carry theirs. A lock here would deadlock the first and buy the second nothing.
+   */
   async sendRawFundTreasury(rawTx: Hex): Promise<Hex> {
-    return (this.d.managerWallet as WalletClient<Transport, Chain, Account>).sendRawTransaction({
-      serializedTransaction: rawTx,
-    });
+    const hash = await (
+      this.d.managerWallet as WalletClient<Transport, Chain, Account>
+    ).sendRawTransaction({ serializedTransaction: rawTx });
+    // The node took it, so its nonce is spent: raise the floor for the next send from this key.
+    // Read from the BYTES, which cannot disagree with what was sent, and never at the cost of the
+    // send — past this line nothing may turn an accepted transfer into an error (gate N4).
+    try {
+      const sender = this.platformAddress;
+      const nonce = parseTransaction(rawTx).nonce;
+      if (sender && nonce !== undefined) noteSenderBroadcast(sender, nonce);
+    } catch {
+      // Unparseable bytes say nothing about a transaction the node has already accepted. The floor
+      // stays where it is; the next send falls back to the node's own count.
+    }
+    return hash;
   }
 
   /**
@@ -653,16 +748,19 @@ export class ArcAdapter {
     treasury: Address;
     amount: bigint;
   }): Promise<Hex> {
+    const account = this.d.managerWallet.account!;
     const { request } = await this.d.publicClient.simulateContract({
       address: p.usdc,
       abi: erc20TransferAbi,
       functionName: "transfer",
       args: [p.treasury, p.amount],
-      account: this.d.managerWallet.account!,
+      account,
     });
     // Explicit gas (see USDC_TRANSFER_GAS): the manager wallet is well-funded today, but this keeps
     // the near-full-balance estimateGas footgun from biting if it ever runs low.
-    return this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
+    return this.sendAsPlatform(account.address, (nonce) =>
+      this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS, nonce }),
+    );
   }
 
   /**

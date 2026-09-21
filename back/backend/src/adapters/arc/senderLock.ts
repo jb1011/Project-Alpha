@@ -28,16 +28,32 @@
  * reads, the CLI is run by hand). A multi-process deployment would need the counter to live
  * somewhere both processes can see.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { withKeyedLock } from "../../payments/keyedMutex";
 import type { Address, Hex } from "../../types";
 
-/** The lock key. Lowercased: the same key spelled two ways is still one nonce space. */
-function keyFor(sender: Address): string {
-  return `sender:${sender.toLowerCase()}`;
+/**
+ * The lock key. Lowercased: the same key spelled two ways is still one nonce space.
+ *
+ * `undefined` is a signer we cannot name — an adapter built for READS holds no wallet, and several
+ * compositions build one that way. Such a section gets one shared key instead of none: it can send
+ * nothing (every send path refuses without an account, and says so), and a shared key is the
+ * conservative direction anyway.
+ */
+function keyFor(sender: Address | undefined): string {
+  return `sender:${sender ? sender.toLowerCase() : "unset"}`;
 }
 
-/** Which senders are inside their locked section right now (at most one holder per key). */
-const held = new Set<string>();
+/**
+ * Which locks the CURRENT call holds — not which locks exist.
+ *
+ * The difference is the whole value of the guard below. A process-wide "somebody is in a section"
+ * flag is satisfied by somebody ELSE's section, so a caller that never took the lock would sail
+ * through the check, pick the nonce the holder is about to sign, and collide with it — which is
+ * exactly the bug this module removes, reintroduced by its own guard. The store travels with the
+ * async call chain, so "held" means held BY ME.
+ */
+const holdings = new AsyncLocalStorage<ReadonlySet<string>>();
 
 /**
  * The lowest nonce this process may still use, per sender — `lastBroadcastNonce + 1`.
@@ -57,23 +73,26 @@ const floors = new Map<string, number>();
  * that persist inside (a synchronous SQLite write, no slower than the signature it records); a
  * receipt wait goes after the section, never inside it.
  */
-export function withSenderLock<T>(sender: Address, fn: () => Promise<T>): Promise<T> {
+export async function withSenderLock<T>(
+  sender: Address | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
   const key = keyFor(sender);
-  return withKeyedLock(key, async () => {
-    held.add(key);
-    try {
-      return await fn();
-    } finally {
-      // Releases on the failure path too: a section that threw must not strand every later send
-      // from this key behind a lock nobody will give back.
-      held.delete(key);
-    }
-  });
+  const mine = holdings.getStore();
+  // Taking it twice on one call chain would wait on an entry that is still running — a deadlock
+  // with no error and no timeout. Say so instead, where the mistake is.
+  if (mine?.has(key))
+    throw new Error(
+      `withSenderLock: already held for ${sender} on this path — nest nothing; lock at the send`,
+    );
+  const nested: ReadonlySet<string> = new Set([...(mine ?? []), key]);
+  // `holdings.run` INSIDE the lock, so the section and the ownership it claims begin together.
+  return withKeyedLock(key, () => holdings.run(nested, fn));
 }
 
-/** Is this sender's lock held by the section we are in? The guard the nonce picker enforces. */
-export function senderLockHeld(sender: Address): boolean {
-  return held.has(keyFor(sender));
+/** Does the CURRENT call hold this sender's lock? The guard the nonce picker enforces. */
+export function senderLockHeld(sender: Address | undefined): boolean {
+  return holdings.getStore()?.has(keyFor(sender)) ?? false;
 }
 
 /**

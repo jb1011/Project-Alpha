@@ -40,6 +40,8 @@ function makeAdapter() {
     simulateContract,
     waitForTransactionReceipt,
     getTransactionReceipt,
+    // Every platform send picks its nonce from this read (see senderLock.ts).
+    getTransactionCount: vi.fn().mockResolvedValue(0),
   } as unknown as PublicClient;
   const managerWallet = {
     account: { address: "0x000000000000000000000000000000000000000B" },

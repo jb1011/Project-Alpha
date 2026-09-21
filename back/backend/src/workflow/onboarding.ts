@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { type Address, hexToString, toHex } from "viem";
 import type { ArcAdapter } from "../adapters/arc/arcAdapter";
+import { withSenderLock } from "../adapters/arc/senderLock";
 import { buildWalletSetTypedData } from "../adapters/arc/walletSet";
 import type { DoolaApi } from "../adapters/doola/doolaClient";
 import type { DoolaEnvironment } from "../adapters/doola/types";
@@ -714,30 +715,46 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       throw priorTransferError(resolution.unresolved);
 
     if (resolution.landed.length === 0) {
-      // ── SIGN → PERSIST → SEND. The order is the whole of gates N2 and N4, and it is the
-      //    sequence this repository already proved for AgentBook registrations
-      //    (`api/routes/agentBook.ts`): sign locally so the hash is ours before anything is on the
-      //    wire, write it down, and only then broadcast. Persisting after the send left one window
-      //    open — an `eth_sendRawTransaction` whose response was lost after the node accepted the
-      //    transaction produced no hash at all, and the retry sent a second transfer.
+      // ── SIGN → PERSIST → SEND, ALL THREE UNDER THE PLATFORM KEY'S SEND LOCK.
+      //
+      //    The order is the whole of gates N2 and N4, and it is the sequence this repository
+      //    already proved for AgentBook registrations (`api/routes/agentBook.ts`): sign locally so
+      //    the hash is ours before anything is on the wire, write it down, and only then broadcast.
+      //    Persisting after the send left one window open — an `eth_sendRawTransaction` whose
+      //    response was lost after the node accepted the transaction produced no hash at all, and
+      //    the retry sent a second transfer.
+      //
+      //    The LOCK spans all three because the nonce is claimed by the SIGNATURE and spent by the
+      //    send: two entities funded in the same moment used to sign the same nonce, and one of the
+      //    two transfers was then rejected or replaced. The persist belongs inside — it is a
+      //    synchronous SQLite write, and it is what makes the claimed nonce recoverable — exactly
+      //    as `submitRegister` does it for the AgentBook submitter. The receipt wait stays OUTSIDE:
+      //    a lock held across it would stop every other platform send for as long as the chain
+      //    takes, and forever on a dropped transaction.
       //
       //    Everything `signFundTreasury` raises happens BEFORE the signature: an empty platform
       //    wallet reverts in its simulate, nothing was sent, and that sentence stays true.
-      const signed = await d.arc.signFundTreasury({
+      // Read off the record BEFORE the section: `rec` is reassigned as the saga advances, and the
+      // transfer must be the one this attempt decided on.
+      const transfer = {
         usdc: rec.treasuryConfig!.usdc,
         treasury: rec.treasury! as Address,
         amount: d.fundAmount,
+      };
+      const signed = await withSenderLock(d.arc.platformAddress, async () => {
+        const signed = await d.arc.signFundTreasury(transfer);
+        recordSubmission(d, key, signed, transfer.amount);
+        // ⚠ PAST THIS LINE NOTHING MAY SAY "NOTHING WAS SENT". The transaction is signed, recorded
+        // and about to be — or already — on the wire; a send that throws may still have been
+        // accepted, which is exactly the case this ordering exists for. The `submitted` row stands,
+        // and the next attempt (or the boot sweep) resolves it by receipt.
+        try {
+          await d.arc.sendRawFundTreasury(signed.rawTx);
+        } catch (e) {
+          throw new BroadcastUnconfirmedError(signed.txHash, "fundTreasury", { cause: e });
+        }
+        return signed;
       });
-      recordSubmission(d, key, signed, d.fundAmount);
-      // ⚠ PAST THIS LINE NOTHING MAY SAY "NOTHING WAS SENT". The transaction is signed, recorded
-      // and about to be — or already — on the wire; a send that throws may still have been
-      // accepted, which is exactly the case this ordering exists for. The `submitted` row stands,
-      // and the next attempt (or the boot sweep) resolves it by receipt.
-      try {
-        await d.arc.sendRawFundTreasury(signed.rawTx);
-      } catch (e) {
-        throw new BroadcastUnconfirmedError(signed.txHash, "fundTreasury", { cause: e });
-      }
       // A failure to READ the receipt throws `BroadcastUnconfirmedError` and leaves the row
       // standing; a REVERTED receipt throws a plain error, and the `reverted` row is written by
       // whoever resolves the submission next.

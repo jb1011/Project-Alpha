@@ -26,7 +26,7 @@ import {
   size,
   slice,
 } from "viem";
-import { expect, test, vi } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import {
   agentTreasuryAbi,
   iIdentityRegistryAbi,
@@ -35,6 +35,10 @@ import {
   noviControllerAbi,
 } from "../../../src/abis/generated";
 import { ArcAdapter, MANAGER_RECEIPT_TIMEOUT_MS } from "../../../src/adapters/arc/arcAdapter";
+import { resetSenderNonces } from "../../../src/adapters/arc/senderLock";
+
+// The nonce floors are process-wide, so each test starts from a fresh ledger (see senderLock.ts).
+beforeEach(() => resetSenderNonces());
 
 const CONTROLLER = "0x4819000000000000000000000000000000000000" as Address;
 /** The manager of the agents that already exist on prod: the platform EOA, not the controller. */
@@ -64,6 +68,8 @@ function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
     call,
     estimateGas,
     waitForTransactionReceipt,
+    // Every platform send picks its nonce from this read (see senderLock.ts).
+    getTransactionCount: vi.fn().mockResolvedValue(0),
   } as unknown as PublicClient;
   const managerWallet = {
     account: opts.noAccount ? undefined : { address: EXECUTOR },
@@ -328,6 +334,10 @@ test("legacy agent in CONTROLLER mode takes the direct path, byte-identical to l
   const legacyDeployment = makeAdapter(); // no controller at all — the pre-flip behavior
 
   for (const { adapter } of [controlled, legacyDeployment]) {
+    // Two DEPLOYMENTS, so two nonce ledgers: the floors are process-wide (one signing key, one
+    // counter), and sharing them here would make the second deployment's calls differ by a number
+    // that has nothing to do with routing.
+    resetSenderNonces();
     await adapter.setAgentWallet({
       agentId: 1n,
       newWallet: PAYOUT,
@@ -360,8 +370,9 @@ test("legacy agent in CONTROLLER mode takes the direct path, byte-identical to l
     [TREASURY, "executePolicyUpdate", EXECUTOR],
   ]);
   expect(controlled.writeContract.mock.calls).toEqual(legacyDeployment.writeContract.mock.calls);
-  for (const c of controlled.writeContract.mock.calls)
-    expect(c[0]).toEqual({ marker: "sim-request" });
+  // The simulated request, forwarded unmodified but for the nonce this process assigned it.
+  for (const [i, c] of controlled.writeContract.mock.calls.entries())
+    expect(c[0]).toEqual({ marker: "sim-request", nonce: i });
 });
 
 test("controller-managed agent in controller mode relays; the same agent has no relay pre-flip", async () => {
@@ -587,7 +598,9 @@ test("legacy mode: every relayed site still simulates against its TARGET and wri
   // Every one signs as the platform account and forwards the SIMULATED request unmodified.
   for (const c of simulateContract.mock.calls) expect(c[0].account?.address).toBe(EXECUTOR);
   expect(writeContract.mock.calls).toHaveLength(5);
-  for (const c of writeContract.mock.calls) expect(c[0]).toEqual({ marker: "sim-request" });
+  // Unmodified but for the nonce, which is consecutive because one key sends one at a time.
+  for (const [i, c] of writeContract.mock.calls.entries())
+    expect(c[0]).toEqual({ marker: "sim-request", nonce: i });
 });
 
 test("legacy mode never opens a relay preflight", async () => {

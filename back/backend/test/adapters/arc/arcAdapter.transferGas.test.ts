@@ -4,8 +4,15 @@
  * reserves ~the sender's whole balance and reverts a near-full-balance USDC transfer). No Anvil.
  */
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
-import { expect, test, vi } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { ArcAdapter } from "../../../src/adapters/arc/arcAdapter";
+import { resetSenderNonces, withSenderLock } from "../../../src/adapters/arc/senderLock";
+
+/** The platform signer these fakes send as — and therefore the lock the saga's path must hold. */
+const PLATFORM = "0x000000000000000000000000000000000000000A" as Address;
+
+// The nonce floors are process-wide, so each test starts from a fresh ledger (see senderLock.ts).
+beforeEach(() => resetSenderNonces());
 
 const USDC = "0x3600000000000000000000000000000000000000" as Address;
 const TO = "0x00000000000000000000000000000000000000cc" as Address;
@@ -17,7 +24,12 @@ function makeAdapter() {
   const operatorWrite = vi.fn().mockResolvedValue(FAKE_HASH);
   const managerWrite = vi.fn().mockResolvedValue(FAKE_HASH);
   const waitForTransactionReceipt = vi.fn().mockResolvedValue({});
-  const publicClient = { simulateContract, waitForTransactionReceipt } as unknown as PublicClient;
+  const publicClient = {
+    simulateContract,
+    waitForTransactionReceipt,
+    // Every platform send picks its nonce from this read (see senderLock.ts).
+    getTransactionCount: vi.fn().mockResolvedValue(0),
+  } as unknown as PublicClient;
   const operatorWallet = {
     account: { address: "0x000000000000000000000000000000000000000B" },
     writeContract: operatorWrite,
@@ -74,18 +86,25 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
     signTransaction,
   } as unknown as WalletClient;
   const adapter = new ArcAdapter({
-    publicClient: { simulateContract } as unknown as PublicClient,
+    publicClient: {
+      simulateContract,
+      getTransactionCount: vi.fn().mockResolvedValue(0),
+    } as unknown as PublicClient,
     managerWallet,
     chainId: 5042002,
     factory: "0x0000000000000000000000000000000000000001" as Address,
     identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
   });
 
-  const signed = await adapter.signFundTreasury({
-    usdc: USDC,
-    treasury: TREASURY,
-    amount: 500_000n,
-  });
+  // Under the sender lock, because on this path the nonce-critical window is the CALLER's: sign,
+  // persist, send (the saga's step 7). Picking a nonce outside it is refused.
+  const signed = await withSenderLock(PLATFORM, () =>
+    adapter.signFundTreasury({
+      usdc: USDC,
+      treasury: TREASURY,
+      amount: 500_000n,
+    }),
+  );
 
   const prepared = prepareTransactionRequest.mock.calls[0]![0] as { gas?: bigint; to?: Address };
   expect(typeof prepared.gas).toBe("bigint");
@@ -113,6 +132,7 @@ test("signFundTreasury refuses to persist a hole where the nonce should be", asy
   const adapter = new ArcAdapter({
     publicClient: {
       simulateContract: vi.fn().mockResolvedValue({ request: {} }),
+      getTransactionCount: vi.fn().mockResolvedValue(0),
     } as unknown as PublicClient,
     managerWallet,
     chainId: 5042002,
@@ -120,7 +140,9 @@ test("signFundTreasury refuses to persist a hole where the nonce should be", asy
     identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
   });
   await expect(
-    adapter.signFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
+    withSenderLock(PLATFORM, () =>
+      adapter.signFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
+    ),
   ).rejects.toThrow(/no nonce/);
 });
 

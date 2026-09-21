@@ -198,8 +198,11 @@ export async function fundPocket(
       transport: http(cfg.rpcUrl),
     });
     const adapter = new ArcAdapter({
+      // The gas seeds below are platform-signed, and they share the platform key's nonce space with
+      // every treasury top-up and manager call — so they go through the adapter's send chokepoint
+      // (`sendNativeAsPlatform`) rather than straight to a wallet client of their own.
       publicClient: pub,
-      managerWallet: undefined as never, // not used by the operator-sent funding txs
+      managerWallet: managerWalletClient(cfg),
       operatorWallet,
       chainId: cfg.chainId,
       factory: (cfg.factoryAddress ?? "0x0") as Address,
@@ -209,16 +212,10 @@ export async function fundPocket(
     const operatorAddress = operatorWallet.account?.address;
     if (!operatorAddress) throw new Error("fundPocket: operator wallet has no account address");
 
-    const managerWallet = managerWalletClient(cfg);
     const seedTxs = await ensureNativeGas([operatorAddress, gateway.address], {
       getBalance: (addr) => pub.getBalance({ address: addr }),
       sendNative: async (to, value) => {
-        const hash = await managerWallet.sendTransaction({
-          to,
-          value,
-          account: managerWallet.account!,
-          chain: managerWallet.chain,
-        });
+        const hash = await adapter.sendNativeAsPlatform(to, value);
         // S5: gas seeds are platform outflows. RECORDED (they count toward the window) but not
         // CHECKED — they are bounded (<= 2x GAS_SEED_TARGET per bridge) and a hard reject here
         // would wedge an in-flight funding saga. Wei -> 6-dec atomic (exact: native IS USDC).

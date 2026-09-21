@@ -158,3 +158,46 @@ test("picking a nonce OUTSIDE the lock is refused", async () => {
   await expect(nextSenderNonce(A, node.pendingNonce)).rejects.toThrow(/sender lock/i);
   expect(node.pendingNonce).not.toHaveBeenCalled();
 });
+
+test("`held` means held BY ME — somebody else's section does not satisfy the guard", async () => {
+  // The guard's failure mode if it were a process-wide flag: an unlocked caller would pass the
+  // check while the real holder was mid-section, pick the nonce that holder is about to sign, and
+  // collide with it. That is the defect, reintroduced through its own guard.
+  const node = fakeNode(4);
+  let releaseHolder: () => void = () => {};
+  const holderInside = new Promise<void>((r) => {
+    releaseHolder = r;
+  });
+  let blocked: () => void = () => {};
+  const holderMayFinish = new Promise<void>((r) => {
+    blocked = r;
+  });
+  const holder = withSenderLock(A, async () => {
+    releaseHolder();
+    await holderMayFinish;
+  });
+  await holderInside;
+
+  expect(senderLockHeld(A)).toBe(false); // this call holds nothing
+  await expect(nextSenderNonce(A, node.pendingNonce)).rejects.toThrow(/sender lock/i);
+  blocked();
+  await holder;
+});
+
+test("taking the lock TWICE on one path is refused, not deadlocked", async () => {
+  // `withKeyedLock` is a FIFO promise chain: the inner take would wait on the outer entry, which
+  // is waiting on it. No error, no timeout, nothing in the log — so the nesting is named here.
+  await expect(withSenderLock(A, () => withSenderLock(A, async () => "never"))).rejects.toThrow(
+    /already held/i,
+  );
+  // ...and the outer lock is still released, so the key keeps working.
+  await expect(withSenderLock(A, async () => "after")).resolves.toBe("after");
+});
+
+test("a send for ANOTHER signer nests without complaint", async () => {
+  // Two keys are two nonce spaces; only the same key's lock may not be taken twice.
+  const node = fakeNode(2);
+  await expect(
+    withSenderLock(A, () => sendFromSender(B, node.pendingNonce, async (n) => hashFor(n))),
+  ).resolves.toBe(hashFor(2));
+});

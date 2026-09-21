@@ -3,8 +3,12 @@
  * No Anvil — all chain I/O is mocked so these run in the normal vitest suite.
  */
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
-import { expect, test, vi } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { ArcAdapter } from "../../../src/adapters/arc/arcAdapter";
+import { resetSenderNonces } from "../../../src/adapters/arc/senderLock";
+
+// The nonce floors are process-wide, so each test starts from a fresh ledger (see senderLock.ts).
+beforeEach(() => resetSenderNonces());
 
 const TREASURY = "0x000000000000000000000000000000000000000F" as Address;
 const FAKE_HASH = "0xdeadbeef00000000000000000000000000000000000000000000000000000001" as Hex;
@@ -19,6 +23,8 @@ function makeAdapter() {
   const publicClient = {
     simulateContract,
     waitForTransactionReceipt,
+    // Every platform send picks its nonce from this read (see senderLock.ts).
+    getTransactionCount: vi.fn().mockResolvedValue(0),
   } as unknown as PublicClient;
 
   const managerWallet = {
@@ -63,7 +69,8 @@ test("schedulePolicyUpdate: simulates correct function + args, signs with manage
   // Must sign with managerWallet, not operatorWallet
   expect(simArgs.account?.address).toBe("0x000000000000000000000000000000000000000B");
 
-  expect(writeContract).toHaveBeenCalledWith(FAKE_REQUEST);
+  // The simulated request, forwarded with the nonce the sender lock assigned it.
+  expect(writeContract).toHaveBeenCalledWith({ ...FAKE_REQUEST, nonce: 0 });
 });
 
 test("executePolicyUpdate: simulates correct function + policyId, signs with managerWallet, returns hash", async () => {
@@ -82,7 +89,8 @@ test("executePolicyUpdate: simulates correct function + policyId, signs with man
   expect(simArgs.args).toEqual([POLICY_ID]);
   expect(simArgs.account?.address).toBe("0x000000000000000000000000000000000000000B");
 
-  expect(writeContract).toHaveBeenCalledWith(FAKE_REQUEST);
+  // The simulated request, forwarded with the nonce the sender lock assigned it.
+  expect(writeContract).toHaveBeenCalledWith({ ...FAKE_REQUEST, nonce: 0 });
 });
 
 test("waitForTransactionReceipt is called after writeContract for schedulePolicyUpdate", async () => {
