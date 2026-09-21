@@ -189,6 +189,12 @@ async function main() {
   if (want("4")) {
     banner("Leg 4 — run_job: 0.05 USDC budget, circle provider ops, evaluator, sweep");
     const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
+    // Leg 4 spends the job client's own USDC on the escrow. No key, no leg — and never the
+    // platform governance key standing in for it.
+    if (!jobDeps.runJob)
+      throw new Error(
+        "set JOB_CLIENT_PRIVATE_KEY to run leg 4: it pays the escrow budget and the gas, from its own funded address",
+      );
     const jobKey = `${ENTITY_KEY}:${Date.now()}-${randomUUID().slice(0, 6)}`;
     const t0 = Date.now();
     const job = await jobDeps.runJob({

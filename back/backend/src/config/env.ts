@@ -440,7 +440,11 @@ export interface Config {
   passkeyRpId: string;
   jobContract: Address;
   reputationRegistry: Address;
-  jobClientPrivateKey: Hex;
+  /** The ERC-8183 job client: it creates the job and FUNDS THE ESCROW, so it is a spending
+   *  identity with its own funded address. Absent = jobs are unavailable and every path that
+   *  would start one refuses; it must never fall back to the platform governance key, which would
+   *  make every job budget an outflow signed by the most powerful key on the box. */
+  jobClientPrivateKey: Hex | undefined;
   jobEvaluatorPrivateKey?: Hex;
   jobSweepToTreasury: boolean;
   mcpPublicUrl: string;
@@ -749,7 +753,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     passkeyRpId: e.PASSKEY_RP_ID,
     jobContract: e.JOB_CONTRACT_ADDRESS,
     reputationRegistry: e.REPUTATION_REGISTRY_ADDRESS,
-    jobClientPrivateKey: e.JOB_CLIENT_PRIVATE_KEY ?? e.PLATFORM_PRIVATE_KEY,
+    jobClientPrivateKey: e.JOB_CLIENT_PRIVATE_KEY,
     jobEvaluatorPrivateKey: e.JOB_EVALUATOR_PRIVATE_KEY,
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
     mcpPublicUrl: e.MCP_PUBLIC_URL,
@@ -1300,7 +1304,7 @@ export function redact(cfg: Config): Record<string, unknown> {
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
     // A Discord/Slack webhook URL embeds its own token — posting to it needs no other credential.
     alertWebhookUrl: cfg.alertWebhookUrl ? "REDACTED" : undefined,
-    jobClientPrivateKey: "REDACTED",
+    jobClientPrivateKey: cfg.jobClientPrivateKey ? "REDACTED" : undefined,
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
     x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
     // The World Chain submitter key: gas-only, but still key material and never a log line. The

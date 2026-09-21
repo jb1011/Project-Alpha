@@ -642,8 +642,19 @@ async function main() {
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
 
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
-  const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
-  if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
+  // Credential-less boot: a deployment with no JOB_CLIENT_PRIVATE_KEY still starts, and jobs are
+  // simply unavailable. Said out loud here because there is no jobs enable flag to hang a boot
+  // refusal on — the routes are mounted on every deployment, so an operator who forgot the var
+  // would otherwise first learn about it from a 503 in front of a user.
+  if (!jobDeps.jobRunner) {
+    console.warn(
+      "⚠ jobs UNAVAILABLE: JOB_CLIENT_PRIVATE_KEY is not set, so there is no escrow payer — " +
+        "creating or running a job answers 503; reading jobs already recorded still works",
+    );
+  } else {
+    const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
+    if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
+  }
 
   const x402Demo = buildX402DemoDeps(cfg);
   // World gate on the demo seller: authorize human-backed agents (AgentBook on World Chain)

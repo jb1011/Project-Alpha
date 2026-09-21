@@ -11,7 +11,7 @@ describe("Job config", () => {
     const cfg = loadConfig(base);
     expect(cfg.jobContract).toBe("0x0747EEf0706327138c69792bF28Cd525089e4583");
     expect(cfg.reputationRegistry).toBe("0x8004B663056A597Dffe9eCcC1965A193B7388713");
-    expect(cfg.jobClientPrivateKey).toBe(cfg.platformPrivateKey);
+    expect(cfg.jobClientPrivateKey).toBeUndefined();
     expect(cfg.jobEvaluatorPrivateKey).toBeUndefined();
     expect(cfg.jobSweepToTreasury).toBe(false);
     // Audit fix A: platform-wallet drain caps on run_job.
@@ -58,8 +58,18 @@ describe("Job config", () => {
     expect(cfg.jobEvaluatorPrivateKey).toBe(evalKey);
   });
 
-  test("jobClientPrivateKey is redacted", () => {
+  // No fallback: the job client funds the ESCROW, so a config that quietly answered the platform
+  // governance key would make every job budget a platform-key outflow signed by the most powerful
+  // key on the box. Unset has to stay undefined and be refused where the client is built.
+  test("jobClientPrivateKey is undefined when unset, never the platform key", () => {
     const cfg = loadConfig(base);
+    expect(cfg.jobClientPrivateKey).toBeUndefined();
+    expect(cfg.jobClientPrivateKey).not.toBe(base.PLATFORM_PRIVATE_KEY);
+    expect(redact(cfg).jobClientPrivateKey).toBeUndefined();
+  });
+
+  test("jobClientPrivateKey is redacted when present", () => {
+    const cfg = loadConfig({ ...base, JOB_CLIENT_PRIVATE_KEY: `0x${"2".repeat(64)}` });
     const redacted = redact(cfg);
     expect(redacted.jobClientPrivateKey).toBe("REDACTED");
   });
