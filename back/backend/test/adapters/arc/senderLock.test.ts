@@ -9,10 +9,12 @@
 import type { Address, Hex } from "viem";
 import { beforeEach, expect, test, vi } from "vitest";
 import {
+  SENDER_FLOOR_TTL_MS,
   nextSenderNonce,
   resetSenderNonces,
   sendFromSender,
   senderLockHeld,
+  trackedSenderCount,
   withSenderLock,
 } from "../../../src/adapters/arc/senderLock";
 
@@ -192,6 +194,111 @@ test("taking the lock TWICE on one path is refused, not deadlocked", async () =>
   );
   // ...and the outer lock is still released, so the key keeps working.
   await expect(withSenderLock(A, async () => "after")).resolves.toBe("after");
+});
+
+// ── The floor EXPIRES (R1) ──────────────────────────────────────────────────────────────────
+//
+// A stale replica and a dropped transaction tell the floor rule the same story — the node says n,
+// we say n+1 — and they need opposite answers. Replica lag lasts seconds; an eviction lasts
+// forever, and believing the floor through one would number every later send behind a nonce
+// nothing will ever fill. So the floor is trusted for a window and then the node wins.
+
+/** A clock the test moves by hand, installed as the module's own. */
+function fakeClock(start = 1_000_000) {
+  let t = start;
+  resetSenderNonces(() => t);
+  return {
+    advance: (ms: number) => {
+      t += ms;
+    },
+  };
+}
+
+test("WITHIN the window a stale pending read still yields nonce + 1", async () => {
+  const clock = fakeClock();
+  const node = fakeNode(7); // never advances: the replica has not seen our transaction
+  const used: number[] = [];
+  const send = () =>
+    sendFromSender(A, node.pendingNonce, async (n) => {
+      used.push(n);
+      return hashFor(n);
+    });
+  await send();
+  clock.advance(SENDER_FLOOR_TTL_MS - 1);
+  await send();
+  expect(used).toEqual([7, 8]);
+});
+
+test("AFTER the window the node is the authority again, and the floor is dropped", async () => {
+  // The dropped-transaction shape: nonce 7 was accepted and then evicted, so the chain will never
+  // move past it. Numbering 8, 9, 10 … behind it would strand every later send from this key until
+  // a restart; reusing 7 fills the hole.
+  const clock = fakeClock();
+  const node = fakeNode(7);
+  const used: number[] = [];
+  const send = () =>
+    sendFromSender(A, node.pendingNonce, async (n) => {
+      used.push(n);
+      return hashFor(n);
+    });
+  await send();
+  expect(trackedSenderCount()).toBe(1);
+
+  clock.advance(SENDER_FLOOR_TTL_MS);
+  // Read the nonce without sending, so the floor is expired and dropped rather than re-noted.
+  await expect(withSenderLock(A, () => nextSenderNonce(A, node.pendingNonce))).resolves.toBe(7);
+  // Dropped, not merely ignored: a long-lived process must not keep an entry per key it ever used.
+  expect(trackedSenderCount()).toBe(0);
+
+  await send();
+  expect(used).toEqual([7, 7]);
+});
+
+test("a broadcast late in the window REFRESHES it", async () => {
+  // The window measures time since we last got a transaction onto the node, not since the first.
+  const clock = fakeClock();
+  const node = fakeNode(3);
+  const used: number[] = [];
+  const send = () =>
+    sendFromSender(A, node.pendingNonce, async (n) => {
+      used.push(n);
+      return hashFor(n);
+    });
+  await send(); // floor 4, noted now
+  clock.advance(SENDER_FLOOR_TTL_MS - 1_000);
+  await send(); // floor 5, noted again
+  clock.advance(SENDER_FLOOR_TTL_MS - 1_000); // past the FIRST note, inside the second
+  await send();
+  expect(used).toEqual([3, 4, 5]);
+});
+
+test("concurrent sends inside the window still get distinct consecutive nonces", async () => {
+  const clock = fakeClock();
+  const node = fakeNode(2);
+  const used = await Promise.all(
+    [0, 1, 2].map(() =>
+      sendFromSender(A, node.pendingNonce, async (n) => {
+        clock.advance(10); // time passes during a broadcast, but nowhere near the window
+        return hashFor(n);
+      }),
+    ),
+  );
+  expect(used).toEqual([hashFor(2), hashFor(3), hashFor(4)]);
+});
+
+test("an expired floor never LOWERS the nonce: the node still wins when it is ahead", async () => {
+  const clock = fakeClock();
+  const node = fakeNode(0);
+  await sendFromSender(A, node.pendingNonce, async (n) => hashFor(n));
+  node.advance();
+  node.advance(); // the chain moved past us, by our transaction and somebody else's
+  clock.advance(SENDER_FLOOR_TTL_MS * 2);
+  const used: number[] = [];
+  await sendFromSender(A, node.pendingNonce, async (n) => {
+    used.push(n);
+    return hashFor(n);
+  });
+  expect(used).toEqual([2]);
 });
 
 test("a send for ANOTHER signer nests without complaint", async () => {

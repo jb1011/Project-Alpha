@@ -14,6 +14,12 @@
  * different configuration names is ONE nonce space and shares its lock without anyone arranging
  * it.
  *
+ * The nonce inside the lock comes from the node, raised by a FLOOR we keep for a short window (see
+ * `floors`) because a replica can answer from behind us. The window matters: a lagging replica and
+ * a transaction the mempool dropped are the same story to that rule, and only one of the two
+ * resolves itself — so past the window the node is the authority again, and the abandoned nonce
+ * gets reused rather than skipped forever.
+ *
  * ⚠ THE LOCK NEVER COVERS A RECEIPT WAIT. It covers the window from picking the nonce to the node
  * accepting the bytes, and nothing else. `withKeyedLock` is a FIFO promise chain, so a section that
  * waits for a receipt inside it would stop every other send from this key for as long as the chain
@@ -56,16 +62,39 @@ function keyFor(sender: Address | undefined): string {
 const holdings = new AsyncLocalStorage<ReadonlySet<string>>();
 
 /**
- * The lowest nonce this process may still use, per sender — `lastBroadcastNonce + 1`.
+ * The lowest nonce this process may still use, per sender — `lastBroadcastNonce + 1` — and WHEN we
+ * last got a transaction onto the node from that sender.
  *
- * It exists because the node's answer can be BEHIND us: a load-balanced RPC may serve a nonce read
- * from a replica that has not seen the transaction we broadcast a moment ago, and that answer,
- * believed, signs the same nonce twice.
+ * The floor exists because the node's answer can be BEHIND us: a load-balanced RPC may serve a
+ * nonce read from a replica that has not seen the transaction we broadcast a moment ago, and that
+ * answer, believed, signs the same nonce twice.
  *
  * It is a FLOOR, never the number itself — `max(node, floor)` — so a node that is AHEAD (another
  * signer of the same key, a restart, our own transaction mining) still wins.
+ *
+ * ⚠ AND IT EXPIRES, which is why the time is stored with it. A lagging replica and a transaction
+ * the mempool has DROPPED look identical to this rule — the node says n, we say n+1 — and they
+ * need opposite answers. Lag is a matter of seconds; a dropped transaction never mines, so
+ * insisting on the floor past it would number every later send from this key behind a nonce
+ * nothing will ever fill, for the life of the process. After {SENDER_FLOOR_TTL_MS} the node is the
+ * authority again and the nonce gets reused, which is what fills the hole.
  */
-const floors = new Map<string, number>();
+const floors = new Map<string, { next: number; notedAt: number }>();
+
+/**
+ * How long a floor is believed: long enough to cover a replica catching up, short enough that a
+ * dropped transaction heals without a restart.
+ */
+export const SENDER_FLOOR_TTL_MS = 60_000;
+
+/** The clock the TTL reads. Replaced only by {resetSenderNonces}, which tests call. */
+let clock: () => number = Date.now;
+
+/** How many senders carry a floor right now. A test seam: proves an expired floor is DROPPED
+ *  rather than merely ignored, so a long-lived process keeps no entry per key it ever used. */
+export function trackedSenderCount(): number {
+  return floors.size;
+}
 
 /**
  * Run `fn` with this sender's send lock held. For the nonce-critical window ONLY: pick, sign,
@@ -103,6 +132,9 @@ export function senderLockHeld(sender: Address | undefined): boolean {
  * that excluded our own unmined transactions would hand the next send a nonce that is already
  * claimed.
  *
+ * The floor is applied only while it is FRESH (see `floors`): past its window, a floor above the
+ * node's count is more likely to be a dropped transaction than a slow replica, and the node wins.
+ *
  * REFUSES outside the lock. Selection is the whole race: a nonce picked unlocked is a nonce two
  * callers can hold, which is the defect, and a helper that quietly allowed it would be the way the
  * defect came back.
@@ -115,8 +147,17 @@ export async function nextSenderNonce(
     throw new Error(
       "nextSenderNonce: the sender lock is not held — pick the nonce inside withSenderLock/sendFromSender",
     );
-  const floor = floors.get(keyFor(sender)) ?? 0;
-  return Math.max(await pendingNonce(), floor);
+  const key = keyFor(sender);
+  const fromNode = await pendingNonce();
+  const floor = floors.get(key);
+  if (!floor) return fromNode;
+  if (clock() - floor.notedAt >= SENDER_FLOOR_TTL_MS) {
+    // Stale beyond its window: forget it, so nothing later mistakes it for a live claim and the
+    // map does not grow an entry for every key this process has ever sent from.
+    floors.delete(key);
+    return fromNode;
+  }
+  return Math.max(fromNode, floor.next);
 }
 
 /**
@@ -128,11 +169,16 @@ export async function nextSenderNonce(
  * queue behind a nonce nothing will ever fill. Reusing it is the recoverable direction — at worst
  * the node already had the first transaction and rejects the second as a duplicate.
  *
- * `max`, so a re-broadcast of older bytes (the fund reconciler's rule 5) can never lower the floor.
+ * `max`, so a re-broadcast of older bytes (the fund reconciler's rule 5) can never lower the floor
+ * — and, because such a re-broadcast says nothing new about how far this sender has got, it does
+ * not restart the floor's window either. Anything that RAISES the floor, or re-asserts it at the
+ * same value, does: the window measures time since we last got a transaction onto the node.
  */
 export function noteSenderBroadcast(sender: Address, nonce: number): void {
   const key = keyFor(sender);
-  floors.set(key, Math.max(floors.get(key) ?? 0, nonce + 1));
+  const current = floors.get(key);
+  if (current && nonce + 1 < current.next) return;
+  floors.set(key, { next: Math.max(current?.next ?? 0, nonce + 1), notedAt: clock() });
 }
 
 /**
@@ -156,9 +202,12 @@ export function sendFromSender(
 }
 
 /**
- * Forget every floor. A TEST SEAM: the floors are process-wide (one key, one counter, whichever
- * client sends), so tests that share a module registry would otherwise inherit each other's.
+ * Forget every floor, and install the clock the TTL reads. A TEST SEAM: the floors are process-wide
+ * (one key, one counter, whichever client sends), so tests that share a module registry would
+ * otherwise inherit each other's — and a test about expiry has to be able to move time. Called
+ * with no argument it restores `Date.now`, which is the only clock production uses.
  */
-export function resetSenderNonces(): void {
+export function resetSenderNonces(now: () => number = Date.now): void {
   floors.clear();
+  clock = now;
 }
