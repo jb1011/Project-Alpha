@@ -1242,6 +1242,50 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     );
   }
 
+  // ── A PUBLISHED PAYWALL MUST NAME ITS OWN PAYOUT ADDRESS ───────────────────────────────────
+  //
+  // The demo seller takes USDC from strangers. Until this config stopped deriving it, a missing
+  // X402_DEMO_PAYTO resolved to the platform account's own address, so forgetting one var pointed
+  // a public wall's revenue at the governance key's wallet. The derivation is gone, and
+  // `buildX402DemoDeps` now declines to mount an unaddressed seller — but a production deployment
+  // that asked for the demo and would silently not get it is itself the misconfiguration, so it
+  // refuses here. Non-production boots: the seller is not mounted and main.ts says why.
+  if (isProd && cfg.enableX402Demo && !cfg.x402DemoPayTo) {
+    throw new Error(
+      "Invalid config: ENABLE_X402_DEMO is on but X402_DEMO_PAYTO is missing — the demo seller settles a stranger's USDC and must name a receive-only payout address (it no longer defaults to the PLATFORM_PRIVATE_KEY address; unset ENABLE_X402_DEMO for a deployment that publishes no wall)",
+    );
+  }
+
+  // ── AND NO OPTIONAL SIGNER MAY *BE* THE PLATFORM KEY ──────────────────────────────────────
+  //
+  // `customerPrivateKey` and `jobClientPrivateKey` used to DEFAULT to the platform governance key
+  // when their var was unset. Dropping the defaults closes the silent path into that arrangement;
+  // this closes the deliberate one, where an operator reading "there is no fallback any more"
+  // pastes the platform key into the var and reproduces it on purpose. Both keys SPEND — one
+  // funds job escrow, one signs a customer's side of a live run — and the harm is the same either
+  // way: the most powerful key in the system doing routine work, with its outflows indistinguish-
+  // able from governance.
+  //
+  // Read off `signingKeys` (the list the revenue/submitter/attestation separation checks already
+  // use) rather than a third list, and NARROWED to those two names on purpose: they are the vars
+  // that had a fallback, so they are the ones with a bypass to close. The other entries are
+  // checked against each other elsewhere; widening this to all of them is a separate decision
+  // about existing deployments, not a consequence of removing a default.
+  //
+  // Outside production a dev box may deliberately run one key — it just may never do so quietly.
+  const platformKeyLower = cfg.platformPrivateKey.toLowerCase();
+  for (const [name, key] of signingKeys) {
+    if (name !== "CUSTOMER_PRIVATE_KEY" && name !== "JOB_CLIENT_PRIVATE_KEY") continue;
+    if (!key || key.toLowerCase() !== platformKeyLower) continue;
+    if (isProd)
+      throw new Error(
+        `Invalid config: ${name} must not equal PLATFORM_PRIVATE_KEY — it is a spending identity and needs its own funded address, or every payment it makes goes out as the platform governance key`,
+      );
+    console.warn(
+      `⚠ ${name} equals PLATFORM_PRIVATE_KEY: this identity is spending as the platform governance key. Refused in production — give it its own funded address`,
+    );
+  }
+
   if (cfg.platformOutflowCeiling < cfg.maxTreasuryFund) {
     throw new Error(
       "Invalid config: PLATFORM_OUTFLOW_CEILING_USDC must be >= MAX_TREASURY_FUND_USDC (a single legal fund call must never be auto-blocked)",
