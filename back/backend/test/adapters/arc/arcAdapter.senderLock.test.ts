@@ -33,7 +33,7 @@ const POLICY_ID = `0x${"cd".repeat(32)}` as Hex;
 const SIG = `0x${"11".repeat(65)}` as Hex;
 
 /** Every send this fake wallet accepts, in the order the node saw them. */
-type Sent = { via: "writeContract" | "sendTransaction" | "sendRawTransaction"; nonce?: number };
+type Sent = { via: "signTransaction" | "sendRawTransaction"; nonce?: number };
 
 function makeAdapter(
   opts: {
@@ -45,17 +45,17 @@ function makeAdapter(
   } = {},
 ) {
   const sent: Sent[] = [];
+  const preparedInLock: boolean[] = [];
   const pending = [...(opts.pending ?? [0])];
-  let mined = 0;
+  /** The nonce of the transaction signed most recently — what the raw bytes would carry. */
+  let signedNonce: number | undefined;
 
-  /** The invariant, enforced where the transaction would leave the process. */
+  /** The invariant, enforced at both steps that may only happen with the lock held. */
   const guard = (via: Sent["via"], nonce: unknown): Hex => {
-    if (!senderLockHeld(EXECUTOR))
-      throw new Error(`${via} reached the wire without the sender lock`);
+    if (!senderLockHeld(EXECUTOR)) throw new Error(`${via} happened without the sender lock`);
     if (typeof nonce !== "number")
-      throw new Error(`${via} reached the wire with no explicit nonce (viem would pick its own)`);
+      throw new Error(`${via} carried no explicit nonce (viem would pick its own)`);
     sent.push({ via, nonce });
-    mined = Math.max(mined, nonce + 1);
     return `0x${(nonce + 1).toString(16).padStart(64, "0")}` as Hex;
   };
 
@@ -72,19 +72,28 @@ function makeAdapter(
     getTransactionCount,
     waitForTransactionReceipt,
     getBlock: vi.fn(async () => ({ timestamp: 1_000n })),
+    // The raw broadcast: the one call that puts the transaction on the wire.
+    sendRawTransaction: vi.fn(async () => guard("sendRawTransaction", signedNonce)),
   } as unknown as PublicClient;
 
   const managerWallet = {
-    account: { address: EXECUTOR },
+    account: {
+      address: EXECUTOR,
+      // Signing is offline and inside the lock — and it is where the nonce becomes part of the
+      // transaction, so this is the other place the invariant has to hold.
+      signTransaction: vi.fn(async (r: { nonce?: number }) => {
+        signedNonce = r.nonce;
+        return guard("signTransaction", r.nonce);
+      }),
+    },
     chain: { id: 5042002 },
-    writeContract: vi.fn(async (r: { nonce?: number }) => guard("writeContract", r.nonce)),
-    sendTransaction: vi.fn(async (r: { nonce?: number }) => guard("sendTransaction", r.nonce)),
-    sendRawTransaction: vi.fn(async () => guard("sendRawTransaction", 0)),
-    prepareTransactionRequest: vi.fn(async (r: { nonce?: number }) => ({
-      ...r,
-      marker: "prepared",
-    })),
-    signTransaction: vi.fn(async () => "0xsignedbytes" as Hex),
+    // Preparation is the UNLOCKED half: gas, fees and the chain id are node round trips, and the
+    // lock must not be held for them. Recorded rather than refused, because the saga's fund window
+    // still prepares inside the caller's lock (see arcAdapter.lockWindow.test.ts).
+    prepareTransactionRequest: vi.fn(async (r: Record<string, unknown>) => {
+      preparedInLock.push(senderLockHeld(EXECUTOR));
+      return { ...r, marker: "prepared" };
+    }),
   } as unknown as WalletClient;
 
   const adapter = new ArcAdapter({
@@ -95,7 +104,15 @@ function makeAdapter(
     identityRegistry: REGISTRY,
     controller: opts.controller,
   });
-  return { adapter, sent, getTransactionCount, managerWallet };
+  return {
+    adapter,
+    sent,
+    preparedInLock,
+    /** Just the broadcasts: one per transaction, in the order the node saw them. */
+    broadcasts: () => sent.filter((x) => x.via === "sendRawTransaction"),
+    getTransactionCount,
+    managerWallet,
+  };
 }
 
 const createParams = {
@@ -169,25 +186,28 @@ const sendPaths: { name: string; run: (a: ArcAdapter) => Promise<unknown> }[] = 
 beforeEach(() => resetSenderNonces());
 
 test.each(sendPaths)("$name sends under the lock, with an explicit nonce", async ({ run }) => {
-  const { adapter, sent } = makeAdapter();
+  const { adapter, sent, broadcasts, preparedInLock } = makeAdapter();
   await run(adapter);
-  expect(sent).toHaveLength(1);
-  expect(sent[0]!.nonce).toBe(0);
+  // One signature and one broadcast, both under the lock, both carrying the assigned nonce.
+  expect(sent.map((x) => x.via)).toEqual(["signTransaction", "sendRawTransaction"]);
+  expect(broadcasts()[0]!.nonce).toBe(0);
+  // …and the slow half — gas, fees, chain id — happened before the lock was taken.
+  expect(preparedInLock).toEqual([false]);
 });
 
 test.each(sendPaths)("$name sends under the lock in CONTROLLER mode too", async ({ run }) => {
   // The relayed path is a different send (raw `sendTransaction` to the controller); it must be
   // locked and numbered exactly like the direct one.
-  const { adapter, sent } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, sent, broadcasts } = makeAdapter({ controller: CONTROLLER });
   await run(adapter);
-  expect(sent).toHaveLength(1);
-  expect(sent[0]!.nonce).toBe(0);
+  expect(sent.map((x) => x.via)).toEqual(["signTransaction", "sendRawTransaction"]);
+  expect(broadcasts()[0]!.nonce).toBe(0);
 });
 
 test("concurrent sends from the adapter get distinct consecutive nonces", async () => {
   // The defect, at the level it was reported: the node answers the same count to every reader
   // until one of our transactions mines. Five sends, five nonces.
-  const { adapter, sent } = makeAdapter({ pending: [0] });
+  const { adapter, broadcasts } = makeAdapter({ pending: [0] });
   await Promise.all([
     adapter.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
     adapter.broadcastCreateEntity(createParams),
@@ -195,14 +215,14 @@ test("concurrent sends from the adapter get distinct consecutive nonces", async 
     adapter.sendNativeAsPlatform(TREASURY, 1n),
     adapter.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 2n }),
   ]);
-  expect(sent.map((s) => s.nonce)).toEqual([0, 1, 2, 3, 4]);
+  expect(broadcasts().map((s) => s.nonce)).toEqual([0, 1, 2, 3, 4]);
 });
 
 test("the lock is NOT held across a receipt wait", async () => {
   // `setAgentWallet` broadcasts and then waits for its receipt. If the lock covered the wait, a
   // transaction that never mines would stop every other send from this key — forever.
   const hung = "0x0000000000000000000000000000000000000000000000000000000000000001" as Hex;
-  const { adapter, sent } = makeAdapter({ hangReceipt: [hung] });
+  const { adapter, broadcasts } = makeAdapter({ hangReceipt: [hung] });
   const waiting = adapter.setAgentWallet({
     agentId: 7n,
     newWallet: createParams.operator,
@@ -212,12 +232,12 @@ test("the lock is NOT held across a receipt wait", async () => {
   });
   // Let the first send reach the wire and enter its (never-ending) receipt wait.
   await new Promise((r) => setTimeout(r, 5));
-  expect(sent).toHaveLength(1);
+  expect(broadcasts()).toHaveLength(1);
 
   await expect(
     adapter.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
   ).resolves.toMatch(/^0x/);
-  expect(sent.map((s) => s.nonce)).toEqual([0, 1]);
+  expect(broadcasts().map((s) => s.nonce)).toEqual([0, 1]);
   void waiting.catch(() => {});
 });
 
@@ -231,14 +251,17 @@ test("signFundTreasury refuses to pick a nonce outside the lock", async () => {
 });
 
 test("the fund window numbers its transactions from the same ledger as every other send", async () => {
-  const { adapter, sent } = makeAdapter({ pending: [0] });
+  const { adapter, broadcasts, preparedInLock } = makeAdapter({ pending: [0] });
   // One atomic send first, so the floor is 1 and the node's stale 0 must not be believed.
   await adapter.sendNativeAsPlatform(TREASURY, 1n);
   const signed = await withSenderLock(EXECUTOR, () =>
     adapter.signFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
   );
   expect(signed.nonce).toBe(1);
-  expect(sent.map((s) => s.nonce)).toEqual([0]); // signing sends nothing
+  // ⚠ The saga's window is the one that still PREPARES inside the lock — measured, and explained,
+  // in arcAdapter.lockWindow.test.ts.
+  expect(preparedInLock).toEqual([false, true]);
+  expect(broadcasts().map((s) => s.nonce)).toEqual([0]); // signing broadcasts nothing
 });
 
 test("the platform address is what the lock is keyed on", async () => {

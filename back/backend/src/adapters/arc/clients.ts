@@ -36,6 +36,39 @@ export function publicClientFor(cfg: Config): PublicClient {
   });
 }
 
+/**
+ * THE IN-LOCK RPC BUDGET (`senderLock.ts`).
+ *
+ * Two calls happen while the platform send lock is held — read the pending nonce, hand over the
+ * signed bytes — and a lock is only as good as its worst case: every other platform send queues
+ * behind whatever the slowest of those two does. viem's bare `http()` is 10 s per attempt with
+ * three retries, and on a 429 it obeys an HTTP `Retry-After` header verbatim and without a cap, so
+ * one throttling endpoint could hold the queue for minutes or longer.
+ *
+ * Short, and NO retries. Retrying is the wrong instinct here: a refused send already has a home to
+ * fall into — the funding path records the signed bytes and re-broadcasts them, the others fail
+ * with nothing sent — whereas a retry inside the lock is paid for by every send behind it. With a
+ * zero retry budget viem also never sleeps on `Retry-After`.
+ */
+export const SEND_TIMEOUT_MS = 8_000;
+export const SEND_RETRY_COUNT = 0;
+
+/**
+ * A client for the calls that happen INSIDE the send lock, and for nothing else.
+ *
+ * Same URL and chain as `publicClientFor`, a bounded transport. Ordinary reads keep the ordinary
+ * client: they are allowed to retry, because nothing waits behind them.
+ */
+export function sendClientFor(cfg: Config): PublicClient {
+  return createPublicClient({
+    chain: chainFor(cfg.chainId, cfg.rpcUrl),
+    transport: http(cfg.rpcUrl, {
+      timeout: SEND_TIMEOUT_MS,
+      retryCount: SEND_RETRY_COUNT,
+    }),
+  });
+}
+
 export function managerWalletClient(cfg: Config): WalletClient {
   return walletClientForKey(cfg, cfg.platformPrivateKey);
 }

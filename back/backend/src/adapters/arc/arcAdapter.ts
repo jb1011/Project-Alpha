@@ -68,9 +68,33 @@ const EIP712_DOMAIN_ABI = [
   },
 ] as const;
 
+/** A wallet client that is known to carry the platform account — the shape the sign path needs. */
+type PlatformWallet = WalletClient<Transport, Chain, Account>;
+
+/** A platform transaction request with everything but the nonce filled in. */
+type PreparedPlatformTx = Omit<
+  Awaited<ReturnType<PlatformWallet["prepareTransactionRequest"]>>,
+  "nonce"
+>;
+
+/**
+ * The two calls that happen INSIDE the send lock, and all this adapter asks of the bounded client.
+ *
+ * Typed structurally rather than as viem's `PublicClient` for the reason `hedera/registry.ts` gives
+ * for its own clients: these two methods are the whole contract, a real viem client satisfies it,
+ * and a test can supply one without inventing a chain.
+ */
+export interface PlatformSendClient {
+  getTransactionCount(args: { address: Address; blockTag: "pending" }): Promise<number>;
+  sendRawTransaction(args: { serializedTransaction: Hex }): Promise<Hex>;
+}
+
 export interface ArcAdapterDeps {
   publicClient: PublicClient;
   managerWallet: WalletClient; // signs/sends as the manager (Factory owner)
+  /** The bounded client for the two in-lock calls — `sendClientFor(cfg)` in `clients.ts`. Every
+   *  composition that SENDS as the platform passes it; read-only adapters need none. */
+  sendClient?: PlatformSendClient;
   operatorWallet?: WalletClient; // signs/sends as the operator (the enclave); required for fundOperator/spend
   chainId: number; // reserved for the M4 setAgentWallet EIP-712 domain (see walletSet.ts)
   factory: Address;
@@ -123,30 +147,93 @@ export class ArcAdapter {
   }
 
   /**
-   * THE CHOKEPOINT for every platform-key transaction that signs and broadcasts in one call.
+   * A platform transaction with everything decided EXCEPT its nonce.
+   *
+   * This is the slow half, and it is deliberately outside the lock: gas estimation, fee estimation
+   * and the chain id are node round trips, and while the lock is held every other platform send
+   * waits on them. `parameters` is viem's default list MINUS `nonce` — picking the nonce is the
+   * locked step, and asking for it here would both waste a call and pick it in the wrong place.
+   *
+   * An explicit `gas` (the Arc `USDC_TRANSFER_GAS` footgun fix, and the relay's estimate) is passed
+   * straight through, so viem skips the estimate exactly as it did before.
+   */
+  private prepareAsPlatform(p: {
+    account: Account;
+    to: Address;
+    data?: Hex;
+    value?: bigint;
+    gas?: bigint;
+  }): Promise<PreparedPlatformTx> {
+    const wallet = this.d.managerWallet as PlatformWallet;
+    return wallet.prepareTransactionRequest({
+      account: p.account,
+      chain: wallet.chain,
+      to: p.to,
+      data: p.data,
+      value: p.value,
+      gas: p.gas,
+      parameters: ["blobVersionedHashes", "chainId", "fees", "gas", "type"],
+    }) as Promise<PreparedPlatformTx>;
+  }
+
+  /**
+   * THE CHOKEPOINT: the only place a platform transaction is numbered and put on the wire.
    *
    * One send at a time per signing key, each with a nonce from one ledger (see senderLock.ts): two
    * sends that read the node's count independently get the same answer and claim the same nonce,
    * and one of them is then rejected or silently replaced.
    *
-   * Everything SLOW stays outside: the simulate/estimate preflight happens before the call, and the
-   * receipt wait after it. The locked window is exactly "pick the nonce, hand the bytes to the
-   * node".
+   * INSIDE the lock, three things and exactly two RPCs: read the pending nonce, sign (offline — the
+   * platform account is a local key), hand the bytes to the node. Everything else is outside it —
+   * the simulate/estimate preflight and the whole of {prepareAsPlatform} before, the receipt wait
+   * after — because the lock is head-of-line blocking for every platform send, so its worst case is
+   * everyone's worst case. Both RPCs go through the bounded client (`clients.ts`) for the same
+   * reason.
    *
-   * ⚠ LEAF ONLY. The lock is not reentrant, so nothing this callback reaches may take it again for
-   * the same signer — which is why no method here calls another method's send.
+   * The signature goes STRAIGHT TO THE ACCOUNT rather than through `walletClient.signTransaction`,
+   * which asks the node for the chain id first — unconditionally, before it looks at whether it
+   * needs it (viem 2.52 `actions/wallet/signTransaction.ts`) — and that would be a third call
+   * inside the window. The prepared request already carries `chainId`, and the chain's own
+   * serializer is handed over exactly as the wallet action would.
+   *
+   * ⚠ LEAF ONLY. The lock is not reentrant, so nothing here may take it again for the same signer —
+   * which is why no method in this class calls another method's send.
    */
-  private sendAsPlatform(
-    sender: Address,
-    broadcast: (nonce: number) => Promise<Hex>,
-  ): Promise<Hex> {
-    return sendFromSender(sender, () => this.pendingNonce(sender), broadcast);
+  private sendAsPlatform(sender: Address, prepared: PreparedPlatformTx): Promise<Hex> {
+    const wallet = this.d.managerWallet as PlatformWallet;
+    const sign = wallet.account.signTransaction;
+    if (!sign)
+      throw new Error(
+        "ArcAdapter: the platform account cannot sign locally — a remote signer would put a network call inside the send lock",
+      );
+    return sendFromSender(
+      sender,
+      () => this.pendingNonce(sender),
+      async (nonce) => {
+        const rawTx = await sign.call(wallet.account, { ...prepared, nonce } as never, {
+          serializer: wallet.chain?.serializers?.transaction,
+        });
+        return this.sendVia.sendRawTransaction({ serializedTransaction: rawTx });
+      },
+    );
   }
 
   /** What a NEW transaction from this sender would be numbered, before our own floor is applied.
    *  `pending`, so it counts transactions of ours the chain has accepted but not yet mined. */
   private pendingNonce(sender: Address): Promise<number> {
-    return this.d.publicClient.getTransactionCount({ address: sender, blockTag: "pending" });
+    return this.sendVia.getTransactionCount({ address: sender, blockTag: "pending" });
+  }
+
+  /**
+   * The client the in-lock calls use: bounded transport, no retries (`clients.ts`).
+   *
+   * Falls back to the ordinary client when a composition does not supply one — the read-only
+   * adapters, and the tests that never reach a send. Every composition that DOES send passes it,
+   * because the fallback carries the app-wide retry budget and that budget is what the lock cannot
+   * afford.
+   */
+  private get sendVia(): PlatformSendClient {
+    return this.d.sendClient ?? this.d.publicClient;
   }
 
   /**
@@ -172,8 +259,8 @@ export class ArcAdapter {
    * about the controller. Returns the broadcast tx hash WITHOUT awaiting a receipt (callers that
    * need confirmation await it themselves, exactly as they did before).
    *
-   * Direct path (no controller, or a legacy agent — see {relayTargetFor}): unchanged —
-   * simulateContract against the target, then write the simulated request.
+   * Direct path (no controller, or a legacy agent — see {relayTargetFor}): simulateContract against
+   * the target for the decoded revert, then the same call, encoded, prepared and sent.
    *
    * Relayed path: the same calldata is encoded, the 20-byte target is appended (Euler relay
    * encoding — see relay.ts) and the whole thing is sent as a RAW transaction to the controller,
@@ -203,24 +290,28 @@ export class ArcAdapter {
         "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send/simulate as the zero address",
       );
 
+    const calldata = encodeFunctionData({
+      abi: p.abi,
+      functionName: p.functionName,
+      args: p.args,
+    });
     const controller = this.relayTargetFor(p.agentManager);
     if (!controller) {
-      const { request } = await this.d.publicClient.simulateContract({
+      // The preflight, and the only reason a revert reaches the caller decoded. Its returned
+      // `request` is no longer forwarded verbatim — the transaction is built from the same encoded
+      // call below — because `writeContract` would estimate gas and fees INSIDE the lock.
+      await this.d.publicClient.simulateContract({
         address: p.target,
         abi: p.abi,
         functionName: p.functionName,
         args: p.args,
         account,
       });
-      return this.sendAsPlatform(account.address, (nonce) =>
-        this.d.managerWallet.writeContract({ ...request, nonce }),
-      );
+      const prepared = await this.prepareAsPlatform({ account, to: p.target, data: calldata });
+      return this.sendAsPlatform(account.address, prepared);
     }
 
-    const data = appendRelayTarget(
-      encodeFunctionData({ abi: p.abi, functionName: p.functionName, args: p.args }),
-      p.target,
-    );
+    const data = appendRelayTarget(calldata, p.target);
     let gas: bigint;
     try {
       gas = await this.d.publicClient.estimateGas({ account, to: controller, data });
@@ -229,16 +320,8 @@ export class ArcAdapter {
       // untouched so an RPC outage never reads as "reverted in simulation" (see relay.ts).
       throw relayRevertError(err, { ...p, controller });
     }
-    return this.sendAsPlatform(account.address, (nonce) =>
-      this.d.managerWallet.sendTransaction({
-        to: controller,
-        data,
-        gas,
-        nonce,
-        account,
-        chain: this.d.managerWallet.chain,
-      }),
-    );
+    const prepared = await this.prepareAsPlatform({ account, to: controller, data, gas });
+    return this.sendAsPlatform(account.address, prepared);
   }
 
   /**
@@ -253,15 +336,8 @@ export class ArcAdapter {
       throw new Error(
         "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send as the zero address",
       );
-    return this.sendAsPlatform(account.address, (nonce) =>
-      this.d.managerWallet.sendTransaction({
-        to,
-        value,
-        nonce,
-        account,
-        chain: this.d.managerWallet.chain,
-      }),
-    );
+    const prepared = await this.prepareAsPlatform({ account, to, value });
+    return this.sendAsPlatform(account.address, prepared);
   }
 
   /**
@@ -679,7 +755,17 @@ export class ArcAdapter {
     // impossible — better to fail here than to persist a hole (the registrar's rule, verbatim).
     if (request.nonce === undefined)
       throw new Error("signFundTreasury: prepared request has no nonce");
-    const rawTx = await wallet.signTransaction(request);
+    // Signed by the ACCOUNT, not through the wallet action, which would ask the node for the chain
+    // id first — one more call inside the caller's lock, for a value the request already carries.
+    // See {sendAsPlatform}, which does the same for every other platform send.
+    const sign = wallet.account.signTransaction;
+    if (!sign)
+      throw new Error(
+        "ArcAdapter: the platform account cannot sign locally — a remote signer would put a network call inside the send lock",
+      );
+    const rawTx = await sign.call(wallet.account, request as never, {
+      serializer: wallet.chain?.serializers?.transaction,
+    });
     return { rawTx, txHash: keccak256(rawTx), nonce: Number(request.nonce) };
   }
 
@@ -692,9 +778,8 @@ export class ArcAdapter {
    * already carry theirs. A lock here would deadlock the first and buy the second nothing.
    */
   async sendRawFundTreasury(rawTx: Hex): Promise<Hex> {
-    const hash = await (
-      this.d.managerWallet as WalletClient<Transport, Chain, Account>
-    ).sendRawTransaction({ serializedTransaction: rawTx });
+    // The bounded client (`clients.ts`): on the saga's path this call happens inside the lock.
+    const hash = await this.sendVia.sendRawTransaction({ serializedTransaction: rawTx });
     // The node took it, so its nonce is spent: raise the floor for the next send from this key.
     // Read from the BYTES, which cannot disagree with what was sent, and never at the cost of the
     // send — past this line nothing may turn an accepted transfer into an error (gate N4).
@@ -749,7 +834,7 @@ export class ArcAdapter {
     amount: bigint;
   }): Promise<Hex> {
     const account = this.d.managerWallet.account!;
-    const { request } = await this.d.publicClient.simulateContract({
+    await this.d.publicClient.simulateContract({
       address: p.usdc,
       abi: erc20TransferAbi,
       functionName: "transfer",
@@ -758,9 +843,17 @@ export class ArcAdapter {
     });
     // Explicit gas (see USDC_TRANSFER_GAS): the manager wallet is well-funded today, but this keeps
     // the near-full-balance estimateGas footgun from biting if it ever runs low.
-    return this.sendAsPlatform(account.address, (nonce) =>
-      this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS, nonce }),
-    );
+    const prepared = await this.prepareAsPlatform({
+      account,
+      to: p.usdc,
+      data: encodeFunctionData({
+        abi: erc20TransferAbi,
+        functionName: "transfer",
+        args: [p.treasury, p.amount],
+      }),
+      gas: USDC_TRANSFER_GAS,
+    });
+    return this.sendAsPlatform(account.address, prepared);
   }
 
   /**

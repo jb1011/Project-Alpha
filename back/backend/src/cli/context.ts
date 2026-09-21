@@ -1,7 +1,7 @@
 import { config as loadDotenv } from "dotenv";
 import type { Address } from "viem";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { managerWalletClient, publicClientFor } from "../adapters/arc/clients";
+import { managerWalletClient, publicClientFor, sendClientFor } from "../adapters/arc/clients";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
 import { buildCircleWalletsApi } from "../adapters/circle/circleWallets";
 import { buildOperatorSigner } from "../adapters/turnkey/operatorSigner";
@@ -47,6 +47,8 @@ export async function buildContext(): Promise<CliContext> {
   const arc = new ArcAdapter({
     publicClient: publicClientFor(cfg),
     managerWallet: managerWalletClient(cfg),
+    // The two calls that happen inside the send lock, on their own bounded transport.
+    sendClient: sendClientFor(cfg),
     chainId: cfg.chainId,
     factory: cfg.factoryAddress as Address,
     identityRegistry: cfg.identityRegistry,

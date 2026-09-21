@@ -22,21 +22,26 @@ const FAKE_HASH = "0xdeadbeef000000000000000000000000000000000000000000000000000
 function makeAdapter() {
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
   const operatorWrite = vi.fn().mockResolvedValue(FAKE_HASH);
-  const managerWrite = vi.fn().mockResolvedValue(FAKE_HASH);
+  // The platform's send path: prepare (outside the lock) -> sign offline -> raw broadcast.
+  const managerPrepare = vi.fn(async (r: Record<string, unknown>) => ({ ...r }));
+  const managerSign = vi.fn().mockResolvedValue("0xsignedbytes");
+  const sendRawTransaction = vi.fn().mockResolvedValue(FAKE_HASH);
   const waitForTransactionReceipt = vi.fn().mockResolvedValue({});
   const publicClient = {
     simulateContract,
     waitForTransactionReceipt,
     // Every platform send picks its nonce from this read (see senderLock.ts).
     getTransactionCount: vi.fn().mockResolvedValue(0),
+    sendRawTransaction,
   } as unknown as PublicClient;
   const operatorWallet = {
     account: { address: "0x000000000000000000000000000000000000000B" },
     writeContract: operatorWrite,
   } as unknown as WalletClient;
   const managerWallet = {
-    account: { address: "0x000000000000000000000000000000000000000A" },
-    writeContract: managerWrite,
+    account: { address: PLATFORM, signTransaction: managerSign },
+    chain: { id: 5042002 },
+    prepareTransactionRequest: managerPrepare,
   } as unknown as WalletClient;
   const adapter = new ArcAdapter({
     publicClient,
@@ -46,7 +51,14 @@ function makeAdapter() {
     factory: "0x0000000000000000000000000000000000000001" as Address,
     identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
   });
-  return { adapter, simulateContract, operatorWrite, managerWrite, waitForTransactionReceipt };
+  return {
+    adapter,
+    simulateContract,
+    operatorWrite,
+    managerPrepare,
+    managerSign,
+    waitForTransactionReceipt,
+  };
 }
 
 /** An explicit bigint gas must be present (its absence is what triggers viem's estimateGas), and the
@@ -66,10 +78,16 @@ test("operatorTransferUsdc passes an explicit gas (skips the fee-fielded estimat
 });
 
 test("fundTreasury passes an explicit gas (same footgun class)", async () => {
-  const { adapter, managerWrite } = makeAdapter();
+  const { adapter, managerPrepare, managerSign } = makeAdapter();
   const hash = await adapter.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n });
   expect(hash).toBe(FAKE_HASH);
-  assertExplicitGas(managerWrite.mock.calls[0]![0]);
+  // The gas is explicit in what is PREPARED, so viem never estimates — and it survives into the
+  // bytes that are signed, which is the only place it matters.
+  const prepared = managerPrepare.mock.calls[0]![0] as { gas?: bigint; to?: Address };
+  expect(typeof prepared.gas).toBe("bigint");
+  expect(prepared.gas).toBeGreaterThanOrEqual(60_000n);
+  expect(prepared.to).toBe(USDC);
+  expect(managerSign.mock.calls[0]![0]).toMatchObject({ gas: prepared.gas, nonce: 0 });
 });
 
 test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", async () => {
@@ -80,10 +98,9 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
   const signTransaction = vi.fn().mockResolvedValue("0xsignedbytes" as Hex);
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
   const managerWallet = {
-    account: { address: "0x000000000000000000000000000000000000000A" },
+    account: { address: PLATFORM, signTransaction },
     chain: { id: 5042002 },
     prepareTransactionRequest,
-    signTransaction,
   } as unknown as WalletClient;
   const adapter = new ArcAdapter({
     publicClient: {
@@ -124,10 +141,9 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
 test("signFundTreasury refuses to persist a hole where the nonce should be", async () => {
   // An unrecorded nonce would make "pending or dropped?" unanswerable later, and quietly.
   const managerWallet = {
-    account: { address: "0x000000000000000000000000000000000000000A" },
+    account: { address: PLATFORM, signTransaction: vi.fn() },
     chain: { id: 5042002 },
     prepareTransactionRequest: vi.fn().mockResolvedValue({ marker: "no-nonce" }),
-    signTransaction: vi.fn(),
   } as unknown as WalletClient;
   const adapter = new ArcAdapter({
     publicClient: {

@@ -17,19 +17,24 @@ const PAYOUT = "0x000000000000000000000000000000000000000A" as Address;
 
 function makeAdapter() {
   const simulateContract = vi.fn();
-  const writeContract = vi.fn().mockResolvedValue(FAKE_HASH);
   const waitForTransactionReceipt = vi.fn().mockResolvedValue({});
+  // The send path: prepare (outside the lock) -> sign offline -> raw broadcast (see senderLock.ts).
+  const prepareTransactionRequest = vi.fn(async (r: Record<string, unknown>) => ({ ...r }));
+  const signTransaction = vi.fn().mockResolvedValue("0xsignedbytes");
+  const sendRawTransaction = vi.fn().mockResolvedValue(FAKE_HASH);
 
   const publicClient = {
     simulateContract,
     waitForTransactionReceipt,
     // Every platform send picks its nonce from this read (see senderLock.ts).
     getTransactionCount: vi.fn().mockResolvedValue(0),
+    sendRawTransaction,
   } as unknown as PublicClient;
 
   const managerWallet = {
-    account: { address: "0x000000000000000000000000000000000000000B" },
-    writeContract,
+    account: { address: "0x000000000000000000000000000000000000000B", signTransaction },
+    chain: { id: 1 },
+    prepareTransactionRequest,
   } as unknown as WalletClient;
 
   const adapter = new ArcAdapter({
@@ -40,11 +45,18 @@ function makeAdapter() {
     identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
   });
 
-  return { adapter, simulateContract, writeContract, waitForTransactionReceipt };
+  return {
+    adapter,
+    simulateContract,
+    prepareTransactionRequest,
+    signTransaction,
+    sendRawTransaction,
+    waitForTransactionReceipt,
+  };
 }
 
 test("schedulePolicyUpdate: simulates correct function + args, signs with managerWallet, returns hash", async () => {
-  const { adapter, simulateContract, writeContract } = makeAdapter();
+  const { adapter, simulateContract, prepareTransactionRequest, signTransaction } = makeAdapter();
 
   const FAKE_REQUEST = { fake: "request" };
   simulateContract.mockResolvedValue({ request: FAKE_REQUEST });
@@ -69,12 +81,15 @@ test("schedulePolicyUpdate: simulates correct function + args, signs with manage
   // Must sign with managerWallet, not operatorWallet
   expect(simArgs.account?.address).toBe("0x000000000000000000000000000000000000000B");
 
-  // The simulated request, forwarded with the nonce the sender lock assigned it.
-  expect(writeContract).toHaveBeenCalledWith({ ...FAKE_REQUEST, nonce: 0 });
+  // The call is sent to the treasury, prepared without a nonce (that is the locked step) and
+  // signed with the one the ledger assigned it.
+  expect(prepareTransactionRequest.mock.calls[0]![0]).toMatchObject({ to: TREASURY });
+  expect(prepareTransactionRequest.mock.calls[0]![0].parameters).not.toContain("nonce");
+  expect(signTransaction.mock.calls[0]![0]).toMatchObject({ to: TREASURY, nonce: 0 });
 });
 
 test("executePolicyUpdate: simulates correct function + policyId, signs with managerWallet, returns hash", async () => {
-  const { adapter, simulateContract, writeContract } = makeAdapter();
+  const { adapter, simulateContract, prepareTransactionRequest, signTransaction } = makeAdapter();
 
   const FAKE_REQUEST = { fake: "exec-request" };
   simulateContract.mockResolvedValue({ request: FAKE_REQUEST });
@@ -89,11 +104,14 @@ test("executePolicyUpdate: simulates correct function + policyId, signs with man
   expect(simArgs.args).toEqual([POLICY_ID]);
   expect(simArgs.account?.address).toBe("0x000000000000000000000000000000000000000B");
 
-  // The simulated request, forwarded with the nonce the sender lock assigned it.
-  expect(writeContract).toHaveBeenCalledWith({ ...FAKE_REQUEST, nonce: 0 });
+  // The call is sent to the treasury, prepared without a nonce (that is the locked step) and
+  // signed with the one the ledger assigned it.
+  expect(prepareTransactionRequest.mock.calls[0]![0]).toMatchObject({ to: TREASURY });
+  expect(prepareTransactionRequest.mock.calls[0]![0].parameters).not.toContain("nonce");
+  expect(signTransaction.mock.calls[0]![0]).toMatchObject({ to: TREASURY, nonce: 0 });
 });
 
-test("waitForTransactionReceipt is called after writeContract for schedulePolicyUpdate", async () => {
+test("waitForTransactionReceipt is called after the broadcast for schedulePolicyUpdate", async () => {
   const { adapter, simulateContract, waitForTransactionReceipt } = makeAdapter();
   simulateContract.mockResolvedValue({ request: {} });
 
@@ -107,7 +125,7 @@ test("waitForTransactionReceipt is called after writeContract for schedulePolicy
   expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: FAKE_HASH });
 });
 
-test("waitForTransactionReceipt is called after writeContract for executePolicyUpdate", async () => {
+test("waitForTransactionReceipt is called after the broadcast for executePolicyUpdate", async () => {
   const { adapter, simulateContract, waitForTransactionReceipt } = makeAdapter();
   simulateContract.mockResolvedValue({ request: {} });
 

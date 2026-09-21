@@ -4,7 +4,7 @@ import Database from "better-sqlite3";
 import { http, type WalletClient, createPublicClient, createWalletClient, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../adapters/arc/arcAdapter";
-import { managerWalletClient } from "../adapters/arc/clients";
+import { managerWalletClient, sendClientFor } from "../adapters/arc/clients";
 import { USDC_TRANSFER_GAS } from "../adapters/arc/gas";
 import { buildOperatorWalletClientForEntity } from "../adapters/turnkey/operatorWallet";
 import { PocketGateway } from "../adapters/x402/gateway";
@@ -203,6 +203,7 @@ export async function fundPocket(
       // (`sendNativeAsPlatform`) rather than straight to a wallet client of their own.
       publicClient: pub,
       managerWallet: managerWalletClient(cfg),
+      sendClient: sendClientFor(cfg),
       operatorWallet,
       chainId: cfg.chainId,
       factory: (cfg.factoryAddress ?? "0x0") as Address,
