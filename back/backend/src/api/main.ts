@@ -14,6 +14,7 @@ import {
   managerWalletClient,
   platformManagerAddress as platformManagerAddressOf,
   publicClientFor,
+  sendClientFor,
   walletClientForKey,
 } from "../adapters/arc/clients";
 import { readUsdcDomain } from "../adapters/arc/usdcToken";
@@ -180,6 +181,8 @@ async function main() {
   const arc = new ArcAdapter({
     publicClient,
     managerWallet: managerWalletClient(cfg),
+    // The two calls that happen inside the send lock, on their own bounded transport.
+    sendClient: sendClientFor(cfg),
     chainId: cfg.chainId,
     factory: factoryAddress,
     identityRegistry: cfg.identityRegistry,

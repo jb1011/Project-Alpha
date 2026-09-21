@@ -23,10 +23,12 @@ import {
   encodeErrorResult,
   encodeEventTopics,
   encodeFunctionData,
+  parseTransaction,
+  serializeTransaction,
   size,
   slice,
 } from "viem";
-import { expect, test, vi } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import {
   agentTreasuryAbi,
   iIdentityRegistryAbi,
@@ -35,6 +37,10 @@ import {
   noviControllerAbi,
 } from "../../../src/abis/generated";
 import { ArcAdapter, MANAGER_RECEIPT_TIMEOUT_MS } from "../../../src/adapters/arc/arcAdapter";
+import { resetSenderNonces } from "../../../src/adapters/arc/senderLock";
+
+// The nonce floors are process-wide, so each test starts from a fresh ledger (see senderLock.ts).
+beforeEach(() => resetSenderNonces());
 
 const CONTROLLER = "0x4819000000000000000000000000000000000000" as Address;
 /** The manager of the agents that already exist on prod: the platform EOA, not the controller. */
@@ -51,25 +57,53 @@ const PROXY = "0x00000000000000000000000000000000000000fa" as Address;
 const OA_HASH = "0xabcdef00000000000000000000000000000000000000000000000000000000ff" as Hex;
 const FAKE_HASH = "0xdeadbeef00000000000000000000000000000000000000000000000000000003" as Hex;
 const GAS = 123_456n;
+/** What the fake `prepareTransactionRequest` estimates when the caller passes no explicit gas. */
+const PREPARED_GAS = 90_000n;
 
 function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
   const call = vi.fn().mockResolvedValue({ data: "0x" });
   const estimateGas = vi.fn().mockResolvedValue(GAS);
   const waitForTransactionReceipt = vi.fn().mockResolvedValue({});
-  const writeContract = vi.fn().mockResolvedValue(FAKE_HASH);
-  const sendTransaction = vi.fn().mockResolvedValue(FAKE_HASH);
+  // Every platform send is now prepare (outside the lock) -> sign offline -> raw broadcast, so
+  // what used to be asserted on the `writeContract`/`sendTransaction` argument is asserted on the
+  // BYTES: this fake serialises for real (no key — an unsigned EIP-1559 payload round-trips
+  // through `parseTransaction` just as well), so the tests read to/data/gas/value/nonce back out
+  // of the wire format, which is where they now live.
+  const prepareTransactionRequest = vi.fn(async (r: Record<string, unknown>) => ({
+    ...r,
+    // What viem's own prepare fills in and the serialiser needs.
+    chainId: 5042002,
+    type: "eip1559",
+    maxFeePerGas: 2n,
+    maxPriorityFeePerGas: 1n,
+    gas: r.gas ?? PREPARED_GAS,
+  }));
+  const signRequests: Record<string, unknown>[] = [];
+  const signTransaction = vi.fn(async (tx: Record<string, unknown>) => {
+    signRequests.push(tx);
+    return serializeTransaction(tx as never);
+  });
+  const raw: Hex[] = [];
+  const sendRawTransaction = vi.fn(
+    async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+      raw.push(serializedTransaction);
+      return FAKE_HASH;
+    },
+  );
   const publicClient = {
     simulateContract,
     call,
     estimateGas,
     waitForTransactionReceipt,
+    // Every platform send picks its nonce from this read (see senderLock.ts).
+    getTransactionCount: vi.fn().mockResolvedValue(0),
+    sendRawTransaction,
   } as unknown as PublicClient;
   const managerWallet = {
-    account: opts.noAccount ? undefined : { address: EXECUTOR },
+    account: opts.noAccount ? undefined : { address: EXECUTOR, signTransaction },
     chain: { id: 5042002 },
-    writeContract,
-    sendTransaction,
+    prepareTransactionRequest,
   } as unknown as WalletClient;
   const adapter = new ArcAdapter({
     publicClient,
@@ -79,14 +113,23 @@ function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
     identityRegistry: REGISTRY,
     controller: opts.controller,
   });
+  /** What the platform actually put on the wire, decoded. */
+  const signed = () => raw.map((r) => parseTransaction(r));
   return {
     adapter,
     simulateContract,
     call,
     estimateGas,
-    writeContract,
-    sendTransaction,
+    managerWallet,
+    prepareTransactionRequest,
+    signTransaction,
+    signRequests,
+    sendRawTransaction,
     waitForTransactionReceipt,
+    signed,
+    /** …split by route: a relayed call goes to the controller, a direct one to its target. */
+    relayed: () => signed().filter((tx) => tx.to === CONTROLLER),
+    direct: () => signed().filter((tx) => tx.to !== CONTROLLER),
   };
 }
 
@@ -134,25 +177,25 @@ const createCalldata = (manager: Address) =>
 /** The relay contract: to == controller, data == <direct calldata> ++ <20-byte target>. */
 function assertRelayed(tx: unknown, expected: { data: Hex; target: Address }) {
   const sent = tx as { to?: Address; data?: Hex; gas?: bigint; account?: { address?: Address } };
-  expect(sent.to).toBe(CONTROLLER);
+  expect(sent.to?.toLowerCase()).toBe(CONTROLLER.toLowerCase());
   const data = sent.data as Hex;
   expect(size(data)).toBe(size(expected.data) + 20);
   expect(slice(data, 0, size(expected.data))).toBe(expected.data); // prefix == the direct calldata
   expect(slice(data, size(data) - 20)).toBe(expected.target.toLowerCase()); // 20-byte suffix
-  expect(sent.account?.address ?? sent.account).toBeDefined(); // still sent BY the executor key
+  expect(typeof (sent as { nonce?: number }).nonce).toBe("number"); // numbered by the ledger
   expect(sent.gas).toBe(GAS); // the preflight's estimate rides along as the limit
 }
 
 // ── the relayed shape, per call site ─────────────────────────────────────
 
 test("createEntity relays to the controller with the FACTORY appended", async () => {
-  const { adapter, estimateGas, sendTransaction, simulateContract } = makeAdapter({
+  const { adapter, estimateGas, relayed, simulateContract, managerWallet } = makeAdapter({
     controller: CONTROLLER,
   });
   const hash = await adapter.broadcastCreateEntity(createParams);
   expect(hash).toBe(FAKE_HASH);
 
-  assertRelayed(sendTransaction.mock.calls[0]![0], {
+  assertRelayed(relayed()[0], {
     data: createCalldata(CONTROLLER),
     target: FACTORY,
   });
@@ -160,13 +203,14 @@ test("createEntity relays to the controller with the FACTORY appended", async ()
   // (an eth_call preflight left viem to execute the transaction a second time to estimate).
   expect(estimateGas).toHaveBeenCalledTimes(1);
   expect(estimateGas.mock.calls[0]![0].to).toBe(CONTROLLER);
-  expect(estimateGas.mock.calls[0]![0].data).toBe(sendTransaction.mock.calls[0]![0].data);
-  expect(estimateGas.mock.calls[0]![0].account).toEqual({ address: EXECUTOR });
+  expect(estimateGas.mock.calls[0]![0].data).toBe(relayed()[0]!.data);
+  // The executor account itself, not a copy of its address: the same object the wallet carries.
+  expect(estimateGas.mock.calls[0]![0].account).toBe(managerWallet.account);
   expect(simulateContract).not.toHaveBeenCalled(); // the direct-mode path must not also run
 });
 
 test("setAgentWallet relays with the REGISTRY appended (the bind the controller owns the NFT for)", async () => {
-  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, relayed } = makeAdapter({ controller: CONTROLLER });
   const args = {
     agentId: 876734n,
     newWallet: "0x00000000000000000000000000000000000005ca" as Address,
@@ -180,22 +224,22 @@ test("setAgentWallet relays with the REGISTRY appended (the bind the controller 
     functionName: "setAgentWallet",
     args: [args.agentId, args.newWallet, args.deadline, args.signature],
   });
-  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: REGISTRY });
+  assertRelayed(relayed()[0], { data: expected, target: REGISTRY });
 });
 
 test("setAgentMetadata relays with the REGISTRY appended (the ENS reverse-bind in EVERY onboarding)", async () => {
-  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, relayed } = makeAdapter({ controller: CONTROLLER });
   await adapter.setAgentMetadata(876734n, "ens", "0x616263", CONTROLLER);
   const expected = encodeFunctionData({
     abi: iIdentityRegistryAbi,
     functionName: "setMetadata",
     args: [876734n, "ens", "0x616263"],
   });
-  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: REGISTRY });
+  assertRelayed(relayed()[0], { data: expected, target: REGISTRY });
 });
 
 test("schedulePolicyUpdate relays with the per-agent TREASURY appended", async () => {
-  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, relayed } = makeAdapter({ controller: CONTROLLER });
   await adapter.schedulePolicyUpdate(
     TREASURY,
     { newCap: 200_000_000n, newPeriod: 86_400n, allowlistOn: false, newPayout: PAYOUT },
@@ -206,24 +250,24 @@ test("schedulePolicyUpdate relays with the per-agent TREASURY appended", async (
     functionName: "schedulePolicyUpdate",
     args: [200_000_000n, 86_400n, false, PAYOUT],
   });
-  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: TREASURY });
+  assertRelayed(relayed()[0], { data: expected, target: TREASURY });
 });
 
 test("executePolicyUpdate relays with the per-agent TREASURY appended", async () => {
-  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, relayed } = makeAdapter({ controller: CONTROLLER });
   await adapter.executePolicyUpdate(TREASURY, POLICY_ID, CONTROLLER);
   const expected = encodeFunctionData({
     abi: agentTreasuryAbi,
     functionName: "executePolicyUpdate",
     args: [POLICY_ID],
   });
-  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: TREASURY });
+  assertRelayed(relayed()[0], { data: expected, target: TREASURY });
 });
 
 // ── the OA amendment pair (design §7): relayed like the treasury pair, BROADCAST-ONLY ──
 
 test("scheduleOperatingAgreementUpdate relays with the per-agent PROXY appended", async () => {
-  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, relayed } = makeAdapter({ controller: CONTROLLER });
   const hash = await adapter.scheduleOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
   expect(hash).toBe(FAKE_HASH);
   const expected = encodeFunctionData({
@@ -231,18 +275,18 @@ test("scheduleOperatingAgreementUpdate relays with the per-agent PROXY appended"
     functionName: "scheduleOperatingAgreementUpdate",
     args: [OA_HASH],
   });
-  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: PROXY });
+  assertRelayed(relayed()[0], { data: expected, target: PROXY });
 });
 
 test("executeOperatingAgreementUpdate relays with the per-agent PROXY appended", async () => {
-  const { adapter, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, relayed } = makeAdapter({ controller: CONTROLLER });
   await adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER);
   const expected = encodeFunctionData({
     abi: legalManagerAbi,
     functionName: "executeOperatingAgreementUpdate",
     args: [OA_HASH],
   });
-  assertRelayed(sendTransaction.mock.calls[0]![0], { data: expected, target: PROXY });
+  assertRelayed(relayed()[0], { data: expected, target: PROXY });
 });
 
 test("A-adapter-1: the OA pair BROADCASTS and returns — it never awaits its own receipt", async () => {
@@ -268,10 +312,10 @@ test("A-adapter-1: the OA pair BROADCASTS and returns — it never awaits its ow
 test("A-adapter-2: a LEGACY agent's amendment goes DIRECT, even in controller mode", async () => {
   // The proxy's manager is immutable. Relaying a pre-cutover agent's amendment would arrive as
   // msg.sender == controller and revert NotManager — permanently.
-  const { adapter, simulateContract, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, simulateContract, relayed } = makeAdapter({ controller: CONTROLLER });
   await adapter.scheduleOperatingAgreementUpdate(PROXY, OA_HASH, LEGACY_MANAGER);
   await adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, LEGACY_MANAGER);
-  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(relayed()).toHaveLength(0);
   expect(simulateContract.mock.calls.map((c) => [c[0].address, c[0].functionName])).toEqual([
     [PROXY, "scheduleOperatingAgreementUpdate"],
     [PROXY, "executeOperatingAgreementUpdate"],
@@ -283,7 +327,7 @@ test("A-adapter-3: Vetoed()/TooEarly()/NotActive() decode by NAME, not as a hex 
   // operator reading `0x...` in journald cannot tell "the guardian stopped this" from "the
   // timelock has not elapsed" from "the body is dissolving".
   for (const errorName of ["Vetoed", "TooEarly", "NotActive"] as const) {
-    const { adapter, estimateGas, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+    const { adapter, estimateGas, relayed } = makeAdapter({ controller: CONTROLLER });
     estimateGas.mockRejectedValueOnce(
       new BaseError("execution reverted", {
         cause: new RawContractError({
@@ -294,7 +338,7 @@ test("A-adapter-3: Vetoed()/TooEarly()/NotActive() decode by NAME, not as a hex 
     await expect(
       adapter.executeOperatingAgreementUpdate(PROXY, OA_HASH, CONTROLLER),
     ).rejects.toThrow(new RegExp(errorName));
-    expect(sendTransaction).not.toHaveBeenCalled();
+    expect(relayed()).toHaveLength(0);
   }
 });
 
@@ -303,19 +347,19 @@ test("relayed writes still await the receipt (except the three broadcast-only on
   const a2 = makeAdapter({ controller: CONTROLLER });
   await a1.adapter.setAgentMetadata(1n, "ens", "0x00", CONTROLLER);
   await a2.adapter.broadcastCreateEntity(createParams);
-  expect(a1.sendTransaction).toHaveBeenCalledTimes(1);
-  expect(a2.sendTransaction).toHaveBeenCalledTimes(1);
+  expect(a1.relayed()).toHaveLength(1);
+  expect(a2.relayed()).toHaveLength(1);
 });
 
 test("fundTreasury is NOT relayed in controller mode — it is a plain USDC transfer by the signer", async () => {
-  const { adapter, simulateContract, writeContract, sendTransaction } = makeAdapter({
+  const { adapter, simulateContract, direct, relayed } = makeAdapter({
     controller: CONTROLLER,
   });
   await adapter.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n });
-  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(relayed()).toHaveLength(0);
   expect(simulateContract.mock.calls[0]![0].address).toBe(USDC);
-  expect(writeContract).toHaveBeenCalledTimes(1);
-  expect(typeof (writeContract.mock.calls[0]![0] as { gas?: bigint }).gas).toBe("bigint");
+  expect(direct()).toHaveLength(1);
+  expect(typeof (direct()[0] as { gas?: bigint }).gas).toBe("bigint");
 });
 
 // ── THE regression that protects the 11 legacy prod agents ───────────────
@@ -328,6 +372,10 @@ test("legacy agent in CONTROLLER mode takes the direct path, byte-identical to l
   const legacyDeployment = makeAdapter(); // no controller at all — the pre-flip behavior
 
   for (const { adapter } of [controlled, legacyDeployment]) {
+    // Two DEPLOYMENTS, so two nonce ledgers: the floors are process-wide (one signing key, one
+    // counter), and sharing them here would make the second deployment's calls differ by a number
+    // that has nothing to do with routing.
+    resetSenderNonces();
     await adapter.setAgentWallet({
       agentId: 1n,
       newWallet: PAYOUT,
@@ -345,9 +393,9 @@ test("legacy agent in CONTROLLER mode takes the direct path, byte-identical to l
   }
 
   // Nothing relayed, on either deployment.
-  expect(controlled.sendTransaction).not.toHaveBeenCalled();
+  expect(controlled.relayed()).toHaveLength(0);
   expect(controlled.estimateGas).not.toHaveBeenCalled();
-  expect(legacyDeployment.sendTransaction).not.toHaveBeenCalled();
+  expect(legacyDeployment.relayed()).toHaveLength(0);
 
   // ...and the direct calls are byte-identical between the two deployments.
   const shape = (m: typeof controlled.simulateContract) =>
@@ -359,37 +407,82 @@ test("legacy agent in CONTROLLER mode takes the direct path, byte-identical to l
     [TREASURY, "schedulePolicyUpdate", EXECUTOR],
     [TREASURY, "executePolicyUpdate", EXECUTOR],
   ]);
-  expect(controlled.writeContract.mock.calls).toEqual(legacyDeployment.writeContract.mock.calls);
-  for (const c of controlled.writeContract.mock.calls)
-    expect(c[0]).toEqual({ marker: "sim-request" });
+  // Byte-identical means exactly that: the serialised transactions match, field for field.
+  expect(controlled.direct()).toEqual(legacyDeployment.direct());
+  // ...and each one carries the call it was asked for, at the nonce this process assigned it.
+  const expectedDirect = [
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setAgentWallet",
+        args: [1n, PAYOUT, 1n, "0x00"],
+      }),
+    },
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setMetadata",
+        args: [1n, "ens", "0x00"],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "schedulePolicyUpdate",
+        args: [1n, 1n, true, PAYOUT],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "executePolicyUpdate",
+        args: [POLICY_ID],
+      }),
+    },
+  ];
+  expect(controlled.direct()).toHaveLength(expectedDirect.length);
+  for (const [i, tx] of controlled.direct().entries()) {
+    expect(tx.to).toBe(expectedDirect[i]!.to.toLowerCase());
+    expect(tx.data).toBe(expectedDirect[i]!.data);
+    expect(tx.value).toBeUndefined(); // a manager call moves no native value
+    expect(tx.gas).toBe(PREPARED_GAS);
+    expect(tx.nonce).toBe(i);
+  }
+  // Signed as the executor on both deployments — the sender is not a field of the wire format.
+  for (const req of controlled.signRequests)
+    expect((req.account as { address?: Address }).address).toBe(EXECUTOR);
 });
 
 test("controller-managed agent in controller mode relays; the same agent has no relay pre-flip", async () => {
   const controlled = makeAdapter({ controller: CONTROLLER });
   await controlled.adapter.executePolicyUpdate(TREASURY, POLICY_ID, CONTROLLER);
-  expect(controlled.sendTransaction).toHaveBeenCalledTimes(1);
+  expect(controlled.relayed()).toHaveLength(1);
   expect(controlled.simulateContract).not.toHaveBeenCalled();
 
   // Same agent manager, but this deployment has no CONTROLLER_ADDRESS: there is nothing to relay
   // through, so it goes direct (and would fail on-chain — loudly, which is the point).
   const unconfigured = makeAdapter();
   await unconfigured.adapter.executePolicyUpdate(TREASURY, POLICY_ID, CONTROLLER);
-  expect(unconfigured.sendTransaction).not.toHaveBeenCalled();
+  expect(unconfigured.relayed()).toHaveLength(0);
   expect(unconfigured.simulateContract).toHaveBeenCalledTimes(1);
 });
 
 test("createEntity routes on the manager being minted, not on the deployment", async () => {
   // The doors force the controller in controller mode, so this relays...
-  const relayed = makeAdapter({ controller: CONTROLLER });
-  await relayed.adapter.broadcastCreateEntity(createParams);
-  expect(relayed.sendTransaction).toHaveBeenCalledTimes(1);
+  const relayedAdapter = makeAdapter({ controller: CONTROLLER });
+  await relayedAdapter.adapter.broadcastCreateEntity(createParams);
+  expect(relayedAdapter.relayed()).toHaveLength(1);
 
   // ...and a spec that somehow carries a different manager goes DIRECT, where the factory's M4
   // check (`ManagerMustBeOwner`) rejects it, instead of being quietly relayed into the namespace.
-  const direct = makeAdapter({ controller: CONTROLLER });
-  await direct.adapter.broadcastCreateEntity({ ...createParams, manager: LEGACY_MANAGER });
-  expect(direct.sendTransaction).not.toHaveBeenCalled();
-  expect(direct.simulateContract.mock.calls[0]![0].functionName).toBe("createEntity");
+  const directAdapter = makeAdapter({ controller: CONTROLLER });
+  await directAdapter.adapter.broadcastCreateEntity({ ...createParams, manager: LEGACY_MANAGER });
+  expect(directAdapter.relayed()).toHaveLength(0);
+  expect(directAdapter.simulateContract.mock.calls[0]![0].functionName).toBe("createEntity");
 });
 
 // ── resume across the flip ───────────────────────────────────────────────
@@ -471,7 +564,7 @@ function buildLogs(manager: Address) {
 // ── preflight failures: revert vs transport ──────────────────────────────
 
 test("a reverting relay preflight names the target + function and never sends the tx", async () => {
-  const { adapter, estimateGas, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, estimateGas, relayed } = makeAdapter({ controller: CONTROLLER });
   // The controller bubbles the vault's revert verbatim; estimateGas carries it as raw bytes.
   estimateGas.mockRejectedValueOnce(
     new BaseError("execution reverted", { cause: new RawContractError({ data: "0x1a2b3c4d" }) }),
@@ -479,7 +572,7 @@ test("a reverting relay preflight names the target + function and never sends th
   await expect(adapter.executePolicyUpdate(TREASURY, POLICY_ID, CONTROLLER)).rejects.toThrow(
     /relay executePolicyUpdate -> .*reverted in simulation/i,
   );
-  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(relayed()).toHaveLength(0);
 });
 
 test("a bubbled vault custom error is DECODED against the target ABI (debuggable relay failures)", async () => {
@@ -535,12 +628,12 @@ test("TargetNotBound (the M5 pin refusing a target) decodes by name", async () =
 });
 
 test("a TRANSPORT failure is rethrown untouched — an RPC timeout is not a revert", async () => {
-  const { adapter, estimateGas, sendTransaction } = makeAdapter({ controller: CONTROLLER });
+  const { adapter, estimateGas, relayed } = makeAdapter({ controller: CONTROLLER });
   const outage = new Error("socket hang up");
   estimateGas.mockRejectedValueOnce(outage);
   // Identity, not just message: nothing wrapped it, so no operator goes hunting a contract bug.
   await expect(adapter.executePolicyUpdate(TREASURY, POLICY_ID, CONTROLLER)).rejects.toBe(outage);
-  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(relayed()).toHaveLength(0);
 });
 
 // ── the named-account guard ──────────────────────────────────────────────
@@ -559,7 +652,7 @@ test("an account-less manager wallet is refused before any chain I/O, in BOTH mo
 // ── Regression: with no controller configured, nothing about the five sites may change. ──
 
 test("legacy mode: every relayed site still simulates against its TARGET and writes the request", async () => {
-  const { adapter, simulateContract, writeContract, sendTransaction } = makeAdapter();
+  const { adapter, simulateContract, direct, relayed } = makeAdapter();
   await adapter.broadcastCreateEntity(createParams);
   await adapter.setAgentWallet({
     agentId: 1n,
@@ -576,7 +669,7 @@ test("legacy mode: every relayed site still simulates against its TARGET and wri
   });
   await adapter.executePolicyUpdate(TREASURY, POLICY_ID);
 
-  expect(sendTransaction).not.toHaveBeenCalled();
+  expect(relayed()).toHaveLength(0);
   expect(simulateContract.mock.calls.map((c) => [c[0].address, c[0].functionName])).toEqual([
     [FACTORY, "createEntity"],
     [REGISTRY, "setAgentWallet"],
@@ -586,8 +679,51 @@ test("legacy mode: every relayed site still simulates against its TARGET and wri
   ]);
   // Every one signs as the platform account and forwards the SIMULATED request unmodified.
   for (const c of simulateContract.mock.calls) expect(c[0].account?.address).toBe(EXECUTOR);
-  expect(writeContract.mock.calls).toHaveLength(5);
-  for (const c of writeContract.mock.calls) expect(c[0]).toEqual({ marker: "sim-request" });
+  expect(direct()).toHaveLength(5);
+  // Each site sends the call it simulated, to the target it simulated it against, at the nonce
+  // this process assigned it — consecutive, because one key sends one at a time.
+  const expectedLegacy = [
+    { to: FACTORY, data: createCalldata(CONTROLLER) },
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setAgentWallet",
+        args: [1n, PAYOUT, 1n, "0x00"],
+      }),
+    },
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setMetadata",
+        args: [1n, "ens", "0x00"],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "schedulePolicyUpdate",
+        args: [1n, 1n, true, PAYOUT],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "executePolicyUpdate",
+        args: [POLICY_ID],
+      }),
+    },
+  ];
+  for (const [i, tx] of direct().entries()) {
+    expect(tx.to).toBe(expectedLegacy[i]!.to.toLowerCase());
+    expect(tx.data).toBe(expectedLegacy[i]!.data);
+    expect(tx.value).toBeUndefined();
+    expect(tx.gas).toBe(PREPARED_GAS);
+    expect(tx.nonce).toBe(i);
+  }
 });
 
 test("legacy mode never opens a relay preflight", async () => {

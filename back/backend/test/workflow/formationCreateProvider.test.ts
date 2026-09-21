@@ -81,6 +81,8 @@ function makeFakeArc() {
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
     // The saga signs, records, sends and then confirms (the hash must be ours — and written down —
     // before anything is on the wire); `fundTreasury` stays for the CLI and the anvil tests.
+    // Prepared before the send lock is taken; the signature happens inside it.
+    prepareFundTreasury: vi.fn(async (p: unknown) => p),
     signFundTreasury: vi.fn(async () => ({
       rawTx: "0xrawfund" as `0x${string}`,
       txHash: "0xfund" as `0x${string}`,

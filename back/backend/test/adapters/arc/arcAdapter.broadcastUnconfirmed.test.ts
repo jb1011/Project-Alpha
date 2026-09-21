@@ -32,18 +32,25 @@ const rpc429 = () =>
 
 function makeAdapter() {
   const simulateContract = vi.fn().mockResolvedValue({ request: { fake: "request" } });
-  const writeContract = vi.fn().mockResolvedValue(FAKE_HASH);
   const waitForTransactionReceipt = vi.fn().mockResolvedValue({ status: "success" });
   const getTransactionReceipt = vi.fn();
+  // The send path: prepare (outside the lock) -> sign offline -> raw broadcast (see senderLock.ts).
+  const prepareTransactionRequest = vi.fn(async (r: Record<string, unknown>) => ({ ...r }));
+  const signTransaction = vi.fn().mockResolvedValue("0xsignedbytes");
+  const sendRawTransaction = vi.fn().mockResolvedValue(FAKE_HASH);
 
   const publicClient = {
     simulateContract,
     waitForTransactionReceipt,
     getTransactionReceipt,
+    // Every platform send picks its nonce from this read (see senderLock.ts).
+    getTransactionCount: vi.fn().mockResolvedValue(0),
+    sendRawTransaction,
   } as unknown as PublicClient;
   const managerWallet = {
-    account: { address: "0x000000000000000000000000000000000000000B" },
-    writeContract,
+    account: { address: "0x000000000000000000000000000000000000000B", signTransaction },
+    chain: { id: 1 },
+    prepareTransactionRequest,
   } as unknown as WalletClient;
 
   const adapter = new ArcAdapter({
@@ -56,7 +63,7 @@ function makeAdapter() {
   return {
     adapter,
     simulateContract,
-    writeContract,
+    sendRawTransaction,
     waitForTransactionReceipt,
     getTransactionReceipt,
   };
@@ -94,13 +101,13 @@ test("…and the public message names the hash instead of claiming nothing was s
 test("a REFUSED send (simulate reverts, no hash) is untouched — nothing was sent is true there", async () => {
   // The 2026-09-14 shape: `simulateContract` runs FIRST, so an empty platform wallet fails before
   // any broadcast. That error must keep its own message and never be dressed as unconfirmed.
-  const { adapter, simulateContract, writeContract } = makeAdapter();
+  const { adapter, simulateContract, sendRawTransaction } = makeAdapter();
   simulateContract.mockRejectedValue(
     new Error("execution reverted: ERC20: transfer amount exceeds balance"),
   );
 
   await expect(fund(adapter)).rejects.not.toBeInstanceOf(BroadcastUnconfirmedError);
-  expect(writeContract).not.toHaveBeenCalled();
+  expect(sendRawTransaction).not.toHaveBeenCalled();
 });
 
 test("a REVERTED receipt is a failure, not a funded treasury", async () => {

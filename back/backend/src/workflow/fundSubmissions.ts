@@ -125,6 +125,11 @@ export async function resolveSubmissions(
     if (row.rawTx) {
       // Rule 5. A failure here changes nothing — the submission is already recorded and the next
       // pass will try again — so it must not turn into the caller's error.
+      //
+      // It goes out on the bounded send transport (short timeout, no retries — see
+      // `adapters/arc/clients.ts`), which is the right trade for a re-broadcast: the bytes are the
+      // same ones the node may already hold, so the send is idempotent, and a refusal is picked up
+      // by the next attempt or the boot sweep. Failing fast beats waiting on a sick endpoint.
       try {
         await deps.arc.sendRawFundTreasury(row.rawTx as Hex);
         log("fund_submission_rebroadcast", { entity: key, txHash });

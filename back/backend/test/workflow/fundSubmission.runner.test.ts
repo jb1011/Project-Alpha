@@ -108,6 +108,9 @@ function makeFakeArc(
       nonce: (opts.nonce ?? 7) + signed++,
     };
   });
+  // Prepared before the send lock is taken (the pre-flight, the gas, the fees); the signature
+  // below is what the saga then does inside it.
+  const prepareFundTreasury = vi.fn(async (p: unknown) => p);
   const sendRawFundTreasury = vi.fn(async (rawTx: `0x${string}`) => {
     if (opts.send === "throws") throw receiptThrottled();
     return `0x${rawTx.slice(5)}` as `0x${string}`;
@@ -144,6 +147,7 @@ function makeFakeArc(
     setAgentWallet: vi.fn(async () => "0xbind" as const),
     walletSetDeadline: vi.fn(async () => 9_999_999_999n),
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
+    prepareFundTreasury,
     signFundTreasury,
     sendRawFundTreasury,
     confirmFundTreasury,
