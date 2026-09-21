@@ -94,7 +94,7 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
   // The footgun fix has to hold on the path that actually funds agents. `fundTreasury` above is now
   // only the CLI's; the saga signs locally (so the hash exists before anything is sent), and
   // `prepareTransactionRequest` estimates exactly like `writeContract` would unless gas is given.
-  const prepareTransactionRequest = vi.fn().mockResolvedValue({ nonce: 11, marker: "prepared" });
+  const prepareTransactionRequest = vi.fn().mockResolvedValue({ marker: "prepared" });
   const signTransaction = vi.fn().mockResolvedValue("0xsignedbytes" as Hex);
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
   const managerWallet = {
@@ -105,7 +105,7 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
   const adapter = new ArcAdapter({
     publicClient: {
       simulateContract,
-      getTransactionCount: vi.fn().mockResolvedValue(0),
+      getTransactionCount: vi.fn().mockResolvedValue(11),
     } as unknown as PublicClient,
     managerWallet,
     chainId: 5042002,
@@ -113,15 +113,15 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
     identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
   });
 
-  // Under the sender lock, because on this path the nonce-critical window is the CALLER's: sign,
-  // persist, send (the saga's step 7). Picking a nonce outside it is refused.
-  const signed = await withSenderLock(PLATFORM, () =>
-    adapter.signFundTreasury({
-      usdc: USDC,
-      treasury: TREASURY,
-      amount: 500_000n,
-    }),
-  );
+  // Prepared OUTSIDE the lock (the pre-flight, the gas, the fees), signed inside it: on this path
+  // the nonce-critical window is the CALLER's — sign, persist, send (the saga's step 7) — and
+  // picking a nonce outside it is refused.
+  const readyToSign = await adapter.prepareFundTreasury({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 500_000n,
+  });
+  const signed = await withSenderLock(PLATFORM, () => adapter.signFundTreasury(readyToSign));
 
   const prepared = prepareTransactionRequest.mock.calls[0]![0] as { gas?: bigint; to?: Address };
   expect(typeof prepared.gas).toBe("bigint");
@@ -134,32 +134,39 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
   expect(simulateContract.mock.calls[0]![0].functionName).toBe("transfer");
   // The hash is derived from the signed bytes, not from a node's answer.
   expect(signed.txHash).toMatch(/^0x[0-9a-f]{64}$/);
-  expect(signed.nonce).toBe(11);
+  expect(signed.nonce).toBe(11); // the ledger's, from the node's pending count
   expect(signed.rawTx).toBe("0xsignedbytes");
 });
 
 test("signFundTreasury refuses to persist a hole where the nonce should be", async () => {
-  // An unrecorded nonce would make "pending or dropped?" unanswerable later, and quietly.
+  // An unrecorded nonce would make "pending or dropped?" unanswerable later, and quietly. The
+  // number now comes from the ledger, so the hole to refuse is a node that answers the count with
+  // something that is not one.
+  const signTransaction = vi.fn();
   const managerWallet = {
-    account: { address: PLATFORM, signTransaction: vi.fn() },
+    account: { address: PLATFORM, signTransaction },
     chain: { id: 5042002 },
-    prepareTransactionRequest: vi.fn().mockResolvedValue({ marker: "no-nonce" }),
+    prepareTransactionRequest: vi.fn().mockResolvedValue({ marker: "prepared" }),
   } as unknown as WalletClient;
   const adapter = new ArcAdapter({
     publicClient: {
       simulateContract: vi.fn().mockResolvedValue({ request: {} }),
-      getTransactionCount: vi.fn().mockResolvedValue(0),
+      getTransactionCount: vi.fn().mockResolvedValue(undefined),
     } as unknown as PublicClient,
     managerWallet,
     chainId: 5042002,
     factory: "0x0000000000000000000000000000000000000001" as Address,
     identityRegistry: "0x0000000000000000000000000000000000000002" as Address,
   });
+  const readyToSign = await adapter.prepareFundTreasury({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 1n,
+  });
   await expect(
-    withSenderLock(PLATFORM, () =>
-      adapter.signFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
-    ),
-  ).rejects.toThrow(/no nonce/);
+    withSenderLock(PLATFORM, () => adapter.signFundTreasury(readyToSign)),
+  ).rejects.toThrow(/nonce/);
+  expect(signTransaction).not.toHaveBeenCalled();
 });
 
 test("operatorTransferUsdc still simulates (eth_call) + waits for the receipt", async () => {

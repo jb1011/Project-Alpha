@@ -28,7 +28,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ArcAdapter } from "../../src/adapters/arc/arcAdapter";
-import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
+import { resetSenderNonces, senderLockHeld } from "../../src/adapters/arc/senderLock";
 import type { OperatorSigner } from "../../src/adapters/turnkey/signer";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
@@ -85,7 +85,7 @@ const fakeSigner = {
  * replica serving the second read has not seen the first transaction. Under it, a nonce taken from
  * the node alone is the SAME nonce twice.
  */
-function fakeNode(opts: { stale?: boolean } = {}) {
+function fakeNode(opts: { stale?: boolean; receipt?: "throws" | "absent" } = {}) {
   const accepted: { nonce: number; hash: Hex }[] = [];
   /** Every send, so a test can prove nothing was broadcast twice. */
   const raw: Hex[] = [];
@@ -122,6 +122,10 @@ function fakeNode(opts: { stale?: boolean } = {}) {
       }
       case "eth_getTransactionReceipt": {
         const hash = (params as Hex[])[0]!;
+        // The documented prod condition: the transfer is broadcast, then the receipt read breaks
+        // (or the chain has nothing to say about it yet).
+        if (opts.receipt === "throws") throw new Error("rate limit exceeded");
+        if (opts.receipt === "absent") return null;
         if (!accepted.some((a) => a.hash === hash)) return null;
         return {
           transactionHash: hash,
@@ -296,4 +300,80 @@ test("a fund racing a MANAGER CALL from the same key: distinct nonces, neither r
 
   expect(node.accepted.map((x) => x.nonce).sort()).toEqual([0, 1]);
   expect(repo.findByIdempotencyKey(a)?.status).toBe("funded");
+});
+
+// ── The preparation happens first, and it is allowed to fail ───────────────────────────────────
+
+test("a failure while PREPARING is a clean refusal: nothing signed, recorded, sent or locked", async () => {
+  // The 2026-09-14 shape (an empty platform wallet reverts the pre-flight), now raised one step
+  // earlier because the pre-flight moved out of the lock. Everything about the refusal must be
+  // what it was: a recorded failure, no `submitted` row, no nonce consumed, and — since nothing
+  // was signed — the sentence may still say so.
+  const [a] = await onboardTwo();
+  const node = fakeNode();
+  const failing = {
+    ...node.adapter,
+    prepareFundTreasury: vi.fn(async () => {
+      throw new Error("execution reverted: ERC20: transfer amount exceeds balance");
+    }),
+    signFundTreasury: vi.fn(),
+    sendRawFundTreasury: vi.fn(),
+    platformAddress: node.adapter.platformAddress,
+  } as unknown as ArcAdapter & { signFundTreasury: ReturnType<typeof vi.fn> };
+  const runner = makeRunner(() => failing);
+
+  runner.fund({ id: a, tenantId: TENANT, amount: AMOUNT });
+  await runner.settled();
+
+  const row = repo.findByIdempotencyKey(a)!;
+  expect(row.status).toBe("bound"); // not funded, not failed-as-a-status: still fundable
+  // The public sentence for this revert, unchanged by the move: it is about the wallet, and it
+  // does not leak the RPC's prose.
+  expect(row.error).toContain("platform funding wallet cannot cover this transfer");
+  expect(row.error).not.toContain("ERC20");
+  expect(row.fundTxHash).toBeNull();
+  // The failure is recorded, and it is the only fund event: no submission was ever opened.
+  const events = repo.listEvents(a).filter((e) => e.step === "fundTreasury");
+  expect(events.map((e) => e.status)).toEqual(["failed"]);
+  expect(repo.listUnresolvedFundSubmissions(a)).toHaveLength(0);
+  // Nothing was signed, nothing reached the node, and the ledger never moved.
+  expect(failing.signFundTreasury).not.toHaveBeenCalled();
+  expect(node.accepted).toHaveLength(0);
+  expect(senderLockHeld(account.address)).toBe(false);
+
+  // …and the next attempt is a normal first attempt: nonce 0, funded.
+  const healthy = makeRunner(() => node.adapter);
+  healthy.fund({ id: a, tenantId: TENANT, amount: AMOUNT });
+  await healthy.settled();
+  expect(nonces(node.raw)).toEqual([0]);
+  expect(repo.findByIdempotencyKey(a)?.status).toBe("funded");
+});
+
+test("an UNRESOLVED prior transfer refuses before anything is prepared", async () => {
+  // Resolution comes first, always (gate N1). A prepare before it would be a wasted round trip and
+  // — worse — a simulate whose revert would be read as a verdict on THIS attempt, when the honest
+  // answer is that the previous transfer has not settled yet.
+  const [a] = await onboardTwo();
+
+  // Attempt one: broadcast lands, the receipt read never resolves it.
+  const first = fakeNode({ receipt: "throws" });
+  const r1 = makeRunner(() => first.adapter);
+  r1.fund({ id: a, tenantId: TENANT, amount: AMOUNT });
+  await r1.settled();
+  expect(repo.listUnresolvedFundSubmissions(a)).toHaveLength(1);
+
+  // Attempt two, against a chain that still cannot say what happened.
+  const second = fakeNode({ receipt: "absent" });
+  const spy = vi.spyOn(second.adapter, "prepareFundTreasury");
+  const r2 = makeRunner(() => second.adapter);
+  r2.fund({ id: a, tenantId: TENANT, amount: AMOUNT });
+  await r2.settled();
+
+  expect(spy).not.toHaveBeenCalled();
+  // Whatever reached the node on this pass was the SAME signed transaction (rule 5 re-broadcasts
+  // the recorded bytes); no second nonce was ever claimed.
+  expect(nonces(second.raw).every((n) => n === 0)).toBe(true);
+  expect(second.raw.every((raw) => raw === first.raw[0])).toBe(true);
+  expect(repo.findByIdempotencyKey(a)?.error).toContain("has not been confirmed yet");
+  expect(repo.findByIdempotencyKey(a)?.error).toContain("nothing new was sent");
 });

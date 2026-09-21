@@ -78,6 +78,21 @@ type PreparedPlatformTx = Omit<
 >;
 
 /**
+ * A treasury top-up with everything fetched except its nonce — the result of
+ * {ArcAdapter.prepareFundTreasury} and the input to {ArcAdapter.signFundTreasury}.
+ *
+ * A SUPERSET of the transfer it was asked for: the caller records the amount that moved, and it
+ * should read it off the same object it signs rather than carrying two copies of one fact.
+ */
+export interface PreparedFundTransfer {
+  usdc: Address;
+  treasury: Address;
+  amount: bigint;
+  /** The viem request: to, data, gas, fees, chain id. No nonce — that is the locked step. */
+  request: PreparedPlatformTx;
+}
+
+/**
  * The two calls that happen INSIDE the send lock, and all this adapter asks of the bounded client.
  *
  * Typed structurally rather than as viem's `PublicClient` for the reason `hedera/registry.ts` gives
@@ -680,7 +695,62 @@ export class ArcAdapter {
   }
 
   /**
-   * SIGN the treasury top-up locally. Nothing is sent, and the hash is ours before anything is.
+   * EVERYTHING THE TOP-UP NEEDS BEFORE IT CAN BE NUMBERED — the pre-flight, the gas, the fees, the
+   * chain id. No signature, no nonce, nothing recorded, and NO LOCK.
+   *
+   * It is a separate call from {signFundTreasury} for one reason: the saga holds the send lock
+   * across sign → persist → send, and every RPC inside that window is one every other platform
+   * send waits behind. All of this is slow and none of it is nonce-critical, so it happens first.
+   *
+   * ⚠ WHO PAYS. The account is `managerWallet`'s, in controller mode too: a treasury top-up is a
+   * plain ERC-20 `transfer` from the platform wallet, NOT a role-gated manager call, so it never
+   * goes through `sendManagerCall`'s relay. In controller mode that wallet is the executor — the
+   * account that actually holds and spends the USDC — which is precisely the one that must sign.
+   *
+   * ⚠ EXPLICIT GAS, still. `USDC_TRANSFER_GAS` is passed so `prepareTransactionRequest` does not
+   * estimate: on Arc the gas token IS USDC, and an estimate against a nearly-full balance reserves
+   * the whole of it and fails the transfer (the 2026-07 footgun, fixed once and kept fixed here).
+   *
+   * `simulateContract` runs first and its revert is raised BEFORE anything is signed or recorded —
+   * an empty platform wallet (2026-09-14) fails HERE, which is what keeps "nothing was sent" true
+   * for the one case where it is true.
+   *
+   * The result carries the transfer it was asked for as well as the prepared transaction, so a
+   * caller that records the amount reads it back from the same object it signs.
+   */
+  async prepareFundTreasury(p: {
+    usdc: Address;
+    treasury: Address;
+    amount: bigint;
+  }): Promise<PreparedFundTransfer> {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to sign as the zero address",
+      );
+    await this.d.publicClient.simulateContract({
+      address: p.usdc,
+      abi: erc20TransferAbi,
+      functionName: "transfer",
+      args: [p.treasury, p.amount],
+      account,
+    });
+    const request = await this.prepareAsPlatform({
+      account,
+      to: p.usdc,
+      data: encodeFunctionData({
+        abi: erc20TransferAbi,
+        functionName: "transfer",
+        args: [p.treasury, p.amount],
+      }),
+      gas: USDC_TRANSFER_GAS,
+    });
+    return { ...p, request };
+  }
+
+  /**
+   * SIGN the prepared treasury top-up locally. Nothing is sent, and the hash is ours before
+   * anything is. One RPC: the nonce.
    *
    * The last window (gate N4): persisting after the SEND still lost a transfer whose
    * `eth_sendRawTransaction` response never came back — the node had accepted it, we had no hash,
@@ -694,70 +764,36 @@ export class ArcAdapter {
    *  - `txHash` — `keccak256(rawTx)`, which is what the chain will call it;
    *  - `nonce` — the only way to tell "still pending" from "dropped" later.
    *
-   * ⚠ WHO PAYS. The account is `managerWallet`'s, in controller mode too: a treasury top-up is a
-   * plain ERC-20 `transfer` from the platform wallet, NOT a role-gated manager call, so it never
-   * goes through `sendManagerCall`'s relay. In controller mode that wallet is the executor — the
-   * account that actually holds and spends the USDC — which is precisely the one that must sign.
-   *
-   * ⚠ EXPLICIT GAS, still. `USDC_TRANSFER_GAS` is passed so `prepareTransactionRequest` does not
-   * estimate: on Arc the gas token IS USDC, and an estimate against a nearly-full balance reserves
-   * the whole of it and fails the transfer (the 2026-07 footgun, fixed once and kept fixed here).
-   *
-   * `simulateContract` runs first and its revert is raised BEFORE anything is signed or recorded,
-   * which is what keeps "nothing was sent" true for the one case where it is true.
-   *
    * ⚠ THE CALLER HOLDS THE SENDER LOCK. This is the one platform send whose nonce-critical window
    * is not a single call — it is sign → persist → send, and the persist is what makes the signature
    * recoverable, so the lock has to span all three (`workflow/onboarding.ts` step 7). The nonce
-   * picker refuses outside it rather than trusting a convention.
+   * picker refuses outside it rather than trusting a convention. It takes a PREPARED transfer so
+   * that everything else the signature needs was fetched before that lock was taken.
    */
-  async signFundTreasury(p: {
-    usdc: Address;
-    treasury: Address;
-    amount: bigint;
-  }): Promise<{ rawTx: Hex; txHash: Hex; nonce: number }> {
+  async signFundTreasury(
+    prepared: PreparedFundTransfer,
+  ): Promise<{ rawTx: Hex; txHash: Hex; nonce: number }> {
     const account = this.d.managerWallet.account;
     if (!account)
       throw new Error(
         "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to sign as the zero address",
       );
-    // Pre-flight, and deliberately before the signature: an empty platform wallet (2026-09-14)
-    // reverts here, with nothing sent and nothing recorded.
-    await this.d.publicClient.simulateContract({
-      address: p.usdc,
-      abi: erc20TransferAbi,
-      functionName: "transfer",
-      args: [p.treasury, p.amount],
-      account,
-    });
-    // viem's bare `WalletClient` is a union over "account known" and "account per call", and
-    // neither `prepareTransactionRequest` nor `signTransaction` is callable on that union — the
-    // AgentBook registrar annotates its client for the same reason. Ours always carries an account
-    // (checked above).
-    const wallet = this.d.managerWallet as WalletClient<Transport, Chain, Account>;
-    const request = await wallet.prepareTransactionRequest({
-      account,
-      chain: wallet.chain,
-      to: p.usdc,
-      data: encodeFunctionData({
-        abi: erc20TransferAbi,
-        functionName: "transfer",
-        args: [p.treasury, p.amount],
-      }),
-      gas: USDC_TRANSFER_GAS,
-      // EXPLICIT, from the same ledger every other platform send draws on. Left to viem this is a
-      // fresh `eth_getTransactionCount(pending)` — which is exactly the read that answers the same
-      // number twice when the node has not caught up, or when two funds are in flight at once.
-      nonce: await nextSenderNonce(account.address, () => this.pendingNonce(account.address)),
-    });
+    // EXPLICIT, from the same ledger every other platform send draws on. Left to viem this is a
+    // fresh `eth_getTransactionCount(pending)` — which is exactly the read that answers the same
+    // number twice when the node has not caught up, or when two funds are in flight at once.
+    const nonce = await nextSenderNonce(account.address, () => this.pendingNonce(account.address));
     // The nonce is the whole reason this is visible before anything is broadcast: it is recorded,
-    // so "pending" and "dropped" can be told apart later. A quietly missing one would make that
-    // impossible — better to fail here than to persist a hole (the registrar's rule, verbatim).
-    if (request.nonce === undefined)
-      throw new Error("signFundTreasury: prepared request has no nonce");
+    // so "pending" and "dropped" can be told apart later. A hole where the number should be would
+    // make that unanswerable, and quietly — a node that answers the count with anything but an
+    // integer gets us a `NaN`, which persists as nothing at all. Better to fail here (the
+    // registrar's rule, verbatim).
+    if (!Number.isInteger(nonce))
+      throw new Error(`signFundTreasury: no usable nonce for this transfer (got ${nonce})`);
+    const request = { ...prepared.request, nonce };
     // Signed by the ACCOUNT, not through the wallet action, which would ask the node for the chain
     // id first — one more call inside the caller's lock, for a value the request already carries.
     // See {sendAsPlatform}, which does the same for every other platform send.
+    const wallet = this.d.managerWallet as PlatformWallet;
     const sign = wallet.account.signTransaction;
     if (!sign)
       throw new Error(

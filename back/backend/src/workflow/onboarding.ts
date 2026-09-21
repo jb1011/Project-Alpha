@@ -732,18 +732,21 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
       //    a lock held across it would stop every other platform send for as long as the chain
       //    takes, and forever on a dropped transaction.
       //
-      //    Everything `signFundTreasury` raises happens BEFORE the signature: an empty platform
-      //    wallet reverts in its simulate, nothing was sent, and that sentence stays true.
+      //    ...and so does the PREPARATION. `prepareFundTreasury` is the pre-flight, the gas and the
+      //    fees: slow, not nonce-critical, and inside the lock it would be time every other
+      //    platform send spends waiting on this one's RPC. Everything it raises happens before the
+      //    signature — an empty platform wallet reverts in its simulate, nothing was sent, and that
+      //    sentence stays true.
       // Read off the record BEFORE the section: `rec` is reassigned as the saga advances, and the
       // transfer must be the one this attempt decided on.
-      const transfer = {
+      const prepared = await d.arc.prepareFundTreasury({
         usdc: rec.treasuryConfig!.usdc,
         treasury: rec.treasury! as Address,
         amount: d.fundAmount,
-      };
+      });
       const signed = await withSenderLock(d.arc.platformAddress, async () => {
-        const signed = await d.arc.signFundTreasury(transfer);
-        recordSubmission(d, key, signed, transfer.amount);
+        const signed = await d.arc.signFundTreasury(prepared);
+        recordSubmission(d, key, signed, prepared.amount);
         // ⚠ PAST THIS LINE NOTHING MAY SAY "NOTHING WAS SENT". The transaction is signed, recorded
         // and about to be — or already — on the wire; a send that throws may still have been
         // accepted, which is exactly the case this ordering exists for. The `submitted` row stands,

@@ -69,6 +69,8 @@ function makeFakeArc(
   } = {},
 ) {
   // The seam the saga uses: the hash is ours (and recorded) before anything is sent.
+  // Prepared before the send lock is taken; the signature happens inside it.
+  const prepareFundTreasury = vi.fn(async (p: unknown) => p);
   const signFundTreasury = vi.fn(async () => ({
     rawTx: "0xrawtx" as `0x${string}`,
     txHash: opts.hash ?? FUND_TX,
@@ -96,6 +98,7 @@ function makeFakeArc(
     setAgentWallet: vi.fn(async () => "0xbind" as const),
     walletSetDeadline: vi.fn(async () => 9_999_999_999n),
     eip712Domain: vi.fn(async () => ({ name: "Reg", version: "1" })),
+    prepareFundTreasury,
     signFundTreasury,
     sendRawFundTreasury,
     confirmFundTreasury,

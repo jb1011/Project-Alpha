@@ -167,40 +167,44 @@ test("broadcastFundTreasury holds the lock for exactly the nonce read and the ra
   expect(t.inLock()).toEqual(THE_WINDOW);
 });
 
-test("the SAGA's fund window — MEASURED, and still wider than the other four", async () => {
-  // ⚠ THE ONE PATH NOT YET DOWN TO TWO CALLS, recorded here rather than left to be rediscovered.
-  //
-  // The saga holds the lock across sign → persist → send (`workflow/onboarding.ts` step 7), so
-  // everything `signFundTreasury` does is inside it — including the revert pre-flight and the fee
-  // estimation. Moving those out needs the saga to prepare the transfer BEFORE it takes the lock,
-  // i.e. one more adapter call on that path, and the decision to add one is not this test's to
-  // take. What the lock does bound is the two calls it shares with every other send: they go
-  // through the bounded client, while these four still use the app-wide transport.
-  //
-  // `eth_fillTransaction` is a probe viem makes once per client and then remembers, so in a
-  // long-lived process it costs the first fund only.
+test("the SAGA's fund window holds the lock for exactly the nonce read and the raw send", async () => {
+  // The saga's shape (`workflow/onboarding.ts` step 7): prepare the transfer, THEN take the lock
+  // across sign → persist → send. The revert pre-flight and the fee estimation belong to the
+  // preparation, so a throttled endpoint delays this fund and not the whole queue.
   const t = traced();
   const persisted: string[] = [];
+  const prepared = await t.adapter.prepareFundTreasury({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 5n,
+  });
   await withSenderLock(account.address, async () => {
-    const signed = await t.adapter.signFundTreasury({
-      usdc: USDC,
-      treasury: TREASURY,
-      amount: 5n,
-    });
+    const signed = await t.adapter.signFundTreasury(prepared);
     persisted.push(signed.txHash); // the synchronous SQLite write, in place
     await t.adapter.sendRawFundTreasury(signed.rawTx);
   });
-  expect(t.inLock()).toEqual([
-    "eth_call", // the revert pre-flight: nothing is signed or recorded if it fails
-    "eth_getTransactionCount", // bounded
-    "eth_fillTransaction", // once per client, then remembered
-    "eth_getBlockByNumber", // fees
-    "eth_maxPriorityFeePerGas", // fees
-    "eth_sendRawTransaction", // bounded
-  ]);
-  // The chain-id call every one of these used to make is gone: signing is offline.
-  expect(t.inLock()).not.toContain("eth_chainId");
+  expect(t.inLock()).toEqual(THE_WINDOW);
   expect(persisted).toHaveLength(1);
+  // The pre-flight ran, and it ran before the lock was taken.
+  expect(t.calls.filter((c) => c.method === "eth_call").every((c) => !c.locked)).toBe(true);
+});
+
+test("the prepared transfer still carries the Arc gas and the transfer itself", async () => {
+  // The prepared object is a superset of what the signature needs: the caller can still read the
+  // transfer it asked for off it, which is what the saga records.
+  const t = traced();
+  const prepared = await t.adapter.prepareFundTreasury({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 5n,
+  });
+  expect(prepared).toMatchObject({ usdc: USDC, treasury: TREASURY, amount: 5n });
+  const signed = await withSenderLock(account.address, () => t.adapter.signFundTreasury(prepared));
+  const tx = parseTransaction(signed.rawTx);
+  expect(tx.to?.toLowerCase()).toBe(USDC.toLowerCase());
+  expect(tx.gas).toBe(USDC_TRANSFER_GAS);
+  expect(tx.nonce).toBe(0);
+  expect(signed.txHash).toBe(keccak256(signed.rawTx));
 });
 
 test("nothing about the SIGNED BYTES changes: gas, fees, target, calldata, value, nonce", async () => {

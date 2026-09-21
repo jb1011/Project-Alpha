@@ -245,22 +245,27 @@ test("signFundTreasury refuses to pick a nonce outside the lock", async () => {
   // The saga's fund window spans sign -> persist -> send, so the LOCK IS THE CALLER'S. A signature
   // taken unlocked has already claimed a nonce another send can claim too.
   const { adapter } = makeAdapter();
-  await expect(
-    adapter.signFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
-  ).rejects.toThrow(/sender lock/i);
+  const prepared = await adapter.prepareFundTreasury({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 1n,
+  });
+  await expect(adapter.signFundTreasury(prepared)).rejects.toThrow(/sender lock/i);
 });
 
 test("the fund window numbers its transactions from the same ledger as every other send", async () => {
   const { adapter, broadcasts, preparedInLock } = makeAdapter({ pending: [0] });
   // One atomic send first, so the floor is 1 and the node's stale 0 must not be believed.
   await adapter.sendNativeAsPlatform(TREASURY, 1n);
-  const signed = await withSenderLock(EXECUTOR, () =>
-    adapter.signFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
-  );
+  const prepared = await adapter.prepareFundTreasury({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 1n,
+  });
+  const signed = await withSenderLock(EXECUTOR, () => adapter.signFundTreasury(prepared));
   expect(signed.nonce).toBe(1);
-  // ⚠ The saga's window is the one that still PREPARES inside the lock — measured, and explained,
-  // in arcAdapter.lockWindow.test.ts.
-  expect(preparedInLock).toEqual([false, true]);
+  // Both preparations happened outside the lock — the saga's fund window included.
+  expect(preparedInLock).toEqual([false, false]);
   expect(broadcasts().map((s) => s.nonce)).toEqual([0]); // signing broadcasts nothing
 });
 
