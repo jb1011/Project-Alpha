@@ -36,7 +36,17 @@ export interface X402DemoDeps {
 }
 
 /**
- * Resolve the demo-seller deps from config, or `undefined` when the flag is off.
+ * Resolve the demo-seller deps from config, or `undefined` when the flag is off OR the payout
+ * address is missing.
+ *
+ * The second case is not a degraded mode, it is an absent dependency, and it is treated like the
+ * flag being off for one reason: `payTo` is where a stranger's USDC lands, and until this config
+ * stopped deriving it, forgetting `X402_DEMO_PAYTO` resolved it to the platform account's own
+ * address — a public paywall collecting revenue into the governance key's wallet, chosen by
+ * nobody. There is no safe substitute for an unspecified payout target, so nothing is mounted and
+ * the routes 404 (the boot invariant in `env.ts` refuses the combination outright in production,
+ * and `main.ts` says so on any other deployment).
+ *
  * Only reads the fields it needs so it stays trivially unit-testable.
  */
 export function buildX402DemoDeps(
@@ -54,6 +64,8 @@ export function buildX402DemoDeps(
   >,
 ): X402DemoDeps | undefined {
   if (!cfg.enableX402Demo) return undefined;
+  if (!cfg.x402DemoPayTo) return undefined;
+  const payTo = cfg.x402DemoPayTo;
   return {
     // Resolved HERE, not beside the World config (final pass C3): the policy used to be assigned
     // only inside main.ts's `cfg.worldChain` block, so a box that lost its World credentials while
@@ -64,7 +76,7 @@ export function buildX402DemoDeps(
     // The API's own origin when the deployment names one; otherwise the base every other public
     // url here is built on, which keeps a single-host deployment behaving exactly as before.
     publicApiUrl: cfg.publicApiUrl ?? cfg.metadataBaseUrl,
-    payTo: cfg.x402DemoPayTo,
+    payTo,
     asset: cfg.usdc,
     network: `eip155:${cfg.chainId}`,
     price: usdToUnits(cfg.x402DemoPriceUsdc),

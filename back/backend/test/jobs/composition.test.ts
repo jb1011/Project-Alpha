@@ -3,6 +3,7 @@
  * and returns the expected interface. No chain calls are made.
  */
 import Database from "better-sqlite3";
+import { privateKeyToAccount } from "viem/accounts";
 import { expect, test } from "vitest";
 import type { Config } from "../../src/config/env";
 import { buildJobDeps } from "../../src/jobs/composition";
@@ -11,9 +12,14 @@ import type { DocumentStore } from "../../src/persistence/documentStore";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { makeFakeDocStore } from "../helpers/runJobDeps";
 
-// Two distinct valid secp256k1 private keys (these are Anvil test keys — safe for tests)
+// Four DISTINCT valid secp256k1 private keys (these are Anvil test keys — safe for tests).
+// Distinct on purpose: a fixture that reused the platform key for the job client or the customer
+// would be asserting exactly the arrangement this config no longer allows.
 const PLATFORM_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as const;
 const EVALUATOR_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" as const;
+const JOB_CLIENT_KEY =
+  "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6" as const;
+const CUSTOMER_KEY = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a" as const;
 
 function makeConfig(): Config {
   return {
@@ -41,7 +47,7 @@ function makeConfig(): Config {
     maxInflightJobsPerTenant: 3,
     maxTreasuryFund: 25_000_000n,
     maxTreasuryFundedPerTenant: 100_000_000n,
-    customerPrivateKey: PLATFORM_KEY,
+    customerPrivateKey: CUSTOMER_KEY,
     authJwtSecret: "dev-insecure-secret-change-me-please",
     authJwtTtlSec: 3600,
     webOrigin: "*",
@@ -49,7 +55,7 @@ function makeConfig(): Config {
     passkeyRpId: "localhost",
     jobContract: "0x0747EEf0706327138c69792bF28Cd525089e4583",
     reputationRegistry: "0x8004B663056A597Dffe9eCcC1965A193B7388713",
-    jobClientPrivateKey: PLATFORM_KEY,
+    jobClientPrivateKey: JOB_CLIENT_KEY,
     jobEvaluatorPrivateKey: EVALUATOR_KEY,
     jobSweepToTreasury: false,
     mcpPublicUrl: "http://localhost:8789/mcp",
@@ -85,8 +91,8 @@ test("buildJobDeps returns the expected interface without network calls", () => 
   const deps = buildJobDeps(cfg, db, entities, fakeDocStore);
 
   // Core function shapes
-  expect(typeof deps.jobRunner.start).toBe("function");
-  expect(typeof deps.jobRunner.reconcileInFlight).toBe("function");
+  expect(typeof deps.jobRunner?.start).toBe("function");
+  expect(typeof deps.jobRunner?.reconcileInFlight).toBe("function");
   expect(typeof deps.runJob).toBe("function");
 
   // Address format
@@ -94,7 +100,15 @@ test("buildJobDeps returns the expected interface without network calls", () => 
   expect(deps.jobEvaluatorAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
 
   // With distinct evaluator key, addresses should differ
-  expect(deps.jobClientAddress.toLowerCase()).not.toBe(deps.jobEvaluatorAddress.toLowerCase());
+  expect(deps.jobClientAddress?.toLowerCase()).not.toBe(deps.jobEvaluatorAddress?.toLowerCase());
+
+  // The configured job client is its own identity, never the platform governance key.
+  expect(deps.jobClientAddress?.toLowerCase()).toBe(
+    privateKeyToAccount(JOB_CLIENT_KEY).address.toLowerCase(),
+  );
+  expect(deps.jobClientAddress?.toLowerCase()).not.toBe(
+    privateKeyToAccount(PLATFORM_KEY).address.toLowerCase(),
+  );
 
   // Adapters and runner are present
   expect(deps.jobs).toBeDefined();
@@ -112,5 +126,32 @@ test("buildJobDeps falls back evaluator address to client address when no evalua
 
   expect(deps.jobClientAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
   // Without distinct evaluator key, addresses must be equal
-  expect(deps.jobClientAddress.toLowerCase()).toBe(deps.jobEvaluatorAddress.toLowerCase());
+  expect(deps.jobClientAddress?.toLowerCase()).toBe(deps.jobEvaluatorAddress?.toLowerCase());
+});
+
+/**
+ * No job client key: the composition root builds the READ half and nothing that signs.
+ *
+ * The key funds the escrow, so the only two things it could do with a missing var are refuse or
+ * pay out of the platform governance key. It refuses, here, once — and the job repository still
+ * comes back, because reading jobs already recorded needs SQLite and no credential at all.
+ */
+test("buildJobDeps builds no client wallet — and never the platform key's — with no job client key", () => {
+  const cfg = { ...makeConfig(), jobClientPrivateKey: undefined };
+  const db = makeDb();
+  const entities = new SqliteEntityRepository(db);
+
+  const deps = buildJobDeps(cfg, db, entities, fakeDocStore);
+
+  expect(deps.jobs).toBeDefined();
+  expect(deps.jobClientAddress).toBeUndefined();
+  expect(deps.jobEvaluatorAddress).toBeUndefined();
+  expect(deps.runJob).toBeUndefined();
+  expect(deps.jobRunner).toBeUndefined();
+  expect(deps.jobAdapter).toBeUndefined();
+  expect(deps.reputationAdapter).toBeUndefined();
+  // The whole point: nothing here is the platform account, by any route.
+  const platform = privateKeyToAccount(PLATFORM_KEY).address.toLowerCase();
+  expect(deps.jobClientAddress).not.toBe(platform);
+  expect(deps.jobEvaluatorAddress).not.toBe(platform);
 });

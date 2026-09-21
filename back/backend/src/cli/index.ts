@@ -185,6 +185,15 @@ export function buildCli(
     .option("-d, --description <text>", "job description (default: demo job)")
     .action(async (opts) => {
       const ctx = await makeContext();
+      // The job client creates the job and funds the escrow. With no key there is nothing to run
+      // one as, and the platform governance key is not a stand-in for it.
+      if (!ctx.jobDeps.runJob) {
+        console.error(
+          "set JOB_CLIENT_PRIVATE_KEY to run a job: it pays the escrow budget and the gas, from its own funded address",
+        );
+        process.exitCode = 1;
+        return;
+      }
       const jobKey = `${opts.entity}:${Date.now()}-${randomUUID().slice(0, 8)}`;
       const rec = await ctx.jobDeps.runJob({
         jobKey,

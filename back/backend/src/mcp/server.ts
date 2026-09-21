@@ -75,9 +75,12 @@ export interface McpToolDeps extends EntityViewDeps {
    *  deployments without POCKET_MASTER_SEED/Turnkey configured leave this undefined and the tool
    *  reports "pocket funding unavailable" instead of the server failing to boot. */
   pocketFunding?: PocketFundingFn;
-  jobRunner: JobRunner;
-  jobClientAddress: string;
-  jobEvaluatorAddress: string;
+  /** The job CLIENT half, optional exactly like `pocketFunding` above and mirroring `ApiDeps`:
+   *  present iff `JOB_CLIENT_PRIVATE_KEY` is configured. Absent -> `run_job` reports the feature
+   *  unavailable naming the var, while `get_job`/`list_jobs` keep answering off `jobs`. */
+  jobRunner?: JobRunner;
+  jobClientAddress?: string;
+  jobEvaluatorAddress?: string;
   /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
    *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
   maxJobBudget: bigint;
@@ -633,6 +636,21 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     async ({ id, budgetUsdc }) => {
       if (!hasCapability(scope, "earn"))
         return { content: [{ type: "text", text: "not found" }], isError: true };
+      // No job client configured, no job — the same refusal the REST twin gives. The client
+      // creates the job and funds the escrow, and the key it used to borrow when
+      // JOB_CLIENT_PRIVATE_KEY was unset was the platform governance key. Checked after the
+      // capability gate so an unauthorized caller still learns nothing about this deployment.
+      const { jobRunner, jobClientAddress, jobEvaluatorAddress } = deps;
+      if (!jobRunner || !jobClientAddress || !jobEvaluatorAddress)
+        return {
+          content: [
+            {
+              type: "text",
+              text: "jobs unavailable: set JOB_CLIENT_PRIVATE_KEY (its own funded address — it pays the job escrow and gas)",
+            },
+          ],
+          isError: true,
+        };
       const rec = repo.findByIdempotencyKey(id);
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "not found" }], isError: true };
@@ -660,14 +678,14 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           isError: true,
         };
       const jobKey = `${rec.idempotencyKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
-      const { status } = deps.jobRunner.start({
+      const { status } = jobRunner.start({
         jobKey,
         entityKey: rec.idempotencyKey,
         tenantId,
         budget,
         description: "agent job (mcp)",
-        clientAddress: deps.jobClientAddress,
-        evaluatorAddress: deps.jobEvaluatorAddress,
+        clientAddress: jobClientAddress,
+        evaluatorAddress: jobEvaluatorAddress,
         providerAddress: rec.operator ?? "0x",
       });
       return { content: [{ type: "text", text: JSON.stringify({ jobKey, status }) }] };

@@ -8,6 +8,17 @@ import { toJobView } from "../jobViews";
 
 export function mountJobRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   app.post("/entities/:id/jobs", async (c) => {
+    // No job client configured, no job. The client creates the job and funds the escrow, so a
+    // deployment without JOB_CLIENT_PRIVATE_KEY has no identity to run one as — and the one it
+    // used to borrow was the platform governance key. Refused before the entity lookup, so the
+    // answer does not depend on who is asking about what.
+    const { jobRunner, jobClientAddress, jobEvaluatorAddress } = deps;
+    if (!jobRunner || !jobClientAddress || !jobEvaluatorAddress)
+      throw new ApiError(
+        "unavailable",
+        503,
+        "jobs unavailable: set JOB_CLIENT_PRIVATE_KEY (its own funded address — it pays the job escrow and gas)",
+      );
     const tenantId = c.get("tenantId");
     const entity = deps.repo.findByIdempotencyKey(c.req.param("id"));
     if (!entity || entity.ownerTenantId !== tenantId)
@@ -30,14 +41,14 @@ export function mountJobRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps
     if (inflight >= deps.maxInflightJobsPerTenant)
       throw new ApiError("rate_limited", 429, "too many jobs in flight");
     const jobKey = `${entity.idempotencyKey}:${Date.now()}-${randomUUID().slice(0, 8)}`; // entity.idempotencyKey already = `${tenantId}:${userKey}`
-    const { status } = deps.jobRunner.start({
+    const { status } = jobRunner.start({
       jobKey,
       entityKey: entity.idempotencyKey,
       tenantId,
       budget,
       description,
-      clientAddress: deps.jobClientAddress,
-      evaluatorAddress: deps.jobEvaluatorAddress,
+      clientAddress: jobClientAddress,
+      evaluatorAddress: jobEvaluatorAddress,
       providerAddress: entity.operator ?? "0x",
     });
     return c.json({ jobKey, status }, 202);

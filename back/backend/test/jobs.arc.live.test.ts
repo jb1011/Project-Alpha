@@ -7,10 +7,11 @@
  * Pre-reqs:
  *   (1) A `bound` (or `funded`) agent already onboarded in the DB with
  *       operator + turnkeySubOrgId + agentId set.
- *   (2) The job CLIENT key (JOB_CLIENT_PRIVATE_KEY, falls back to
- *       PLATFORM_PRIVATE_KEY) funded with Arc-testnet USDC — this key
- *       pays the escrow budget (0.10 USDC) and gas for createJob +
- *       approveAndFund.
+ *   (2) JOB_CLIENT_PRIVATE_KEY set and funded with Arc-testnet USDC — this
+ *       key pays the escrow budget (0.10 USDC) and gas for createJob +
+ *       approveAndFund. There is no fallback: unset, buildJobDeps returns
+ *       no runner at all and this test refuses rather than spending as the
+ *       platform governance key.
  *   (3) The provider/operator EOA (the Turnkey enclave key bound to the
  *       agent) gas-seeded with enough testnet ETH/native token for the
  *       setBudget transaction.
@@ -59,6 +60,13 @@ run("live ERC-8183 job loop", () => {
     const repo = new SqliteEntityRepository(db);
     const docStore = new FileDocumentStore(cfg.docStoreDir);
     const jobDeps = buildJobDeps(cfg, db, repo, docStore);
+    // Pre-req (2): no job client key, no run. Asserted rather than assumed — the alternative this
+    // config used to offer was spending the platform governance key's USDC on the escrow.
+    const runJob = jobDeps.runJob;
+    if (!runJob)
+      throw new Error(
+        "set JOB_CLIENT_PRIVATE_KEY: it pays the escrow budget (0.10 USDC) and the gas for createJob + approveAndFund",
+      );
     const publicClient = publicClientFor(cfg);
 
     // ── 2. Pick a usable agent ─────────────────────────────────────────────
@@ -98,7 +106,7 @@ run("live ERC-8183 job loop", () => {
 
     console.log(`[live] starting job ${jobKey}`);
 
-    const rec = await jobDeps.runJob({
+    const rec = await runJob({
       jobKey,
       entityKey: entity.idempotencyKey,
       budget: usdToUnits("0.10"),

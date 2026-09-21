@@ -642,8 +642,19 @@ async function main() {
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
 
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
-  const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
-  if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
+  // Credential-less boot: a deployment with no JOB_CLIENT_PRIVATE_KEY still starts, and jobs are
+  // simply unavailable. Said out loud here because there is no jobs enable flag to hang a boot
+  // refusal on — the routes are mounted on every deployment, so an operator who forgot the var
+  // would otherwise first learn about it from a 503 in front of a user.
+  if (!jobDeps.jobRunner) {
+    console.warn(
+      "⚠ jobs UNAVAILABLE: JOB_CLIENT_PRIVATE_KEY is not set, so there is no escrow payer — " +
+        "creating or running a job answers 503; reading jobs already recorded still works",
+    );
+  } else {
+    const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
+    if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
+  }
 
   const x402Demo = buildX402DemoDeps(cfg);
   // World gate on the demo seller: authorize human-backed agents (AgentBook on World Chain)
@@ -680,6 +691,15 @@ async function main() {
       console.warn(
         "⚠ x402 seller policy: LEGAL-BODIES-ONLY — only agents a registered legal body in good standing stands behind are served (403 otherwise)",
       );
+  } else if (cfg.enableX402Demo) {
+    // The flag is on and the deps came back empty, which can only be the missing payout address.
+    // Said out loud because the alternative to this line is an operator who set the flag, gets a
+    // 404 on the demo, and concludes the flag did not take. Production refuses to boot on this
+    // combination (env.ts); everywhere else the demo is simply not mounted.
+    console.warn(
+      "⚠ x402 demo seller NOT mounted: ENABLE_X402_DEMO is on but X402_DEMO_PAYTO is unset — " +
+        "there is no payout address, and the platform account's is not a substitute for one",
+    );
   }
 
   // AgentBook (design 2026-08-25 v3), in two halves.

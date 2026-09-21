@@ -86,10 +86,15 @@ export interface ApiDeps extends EntityViewDeps {
   apiKeys: import("../persistence/apiKeyStore").ApiKeyStore;
   passkeys: import("../persistence/passkeyStore").PasskeyStore;
   challenges: import("../persistence/challengeStore").ChallengeStore;
+  /** The job ROWS — always wired: reading jobs already recorded needs SQLite and no key. */
   jobs: import("../jobs/jobRepository").JobRepository;
-  jobRunner: import("../jobs/jobRunner").JobRunner;
-  jobClientAddress: string;
-  jobEvaluatorAddress: string;
+  /** The three below are the job CLIENT half, optional exactly like `pocketFunding`: present iff
+   *  `JOB_CLIENT_PRIVATE_KEY` is configured, because the client creates the job and funds the
+   *  escrow and there is no other identity that may stand in for it. Absent -> POST
+   *  /entities/:id/jobs answers 503 naming the var, while the read-only job routes keep working. */
+  jobRunner?: import("../jobs/jobRunner").JobRunner;
+  jobClientAddress?: string;
+  jobEvaluatorAddress?: string;
   /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
    *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
   maxJobBudget: bigint;

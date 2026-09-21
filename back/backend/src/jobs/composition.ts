@@ -28,17 +28,27 @@ import { JobRunner, type RunJobFn } from "./jobRunner";
 import { type ProviderJobOps, runJob as runJobSaga } from "./runJob";
 import { TrivialWorker } from "./worker";
 
+/**
+ * The job seam, in two halves.
+ *
+ * `jobs` is the READ half and is always present: the rows are SQLite and outlive any credential.
+ * Everything else needs the job CLIENT — the identity that creates the job and funds the escrow —
+ * and is therefore present exactly when `JOB_CLIENT_PRIVATE_KEY` is configured. They are all
+ * absent together or all present together; a deployment without the key still boots, and every
+ * caller that would start or resume a job reports the feature unavailable instead.
+ */
 export interface JobDeps {
   jobs: JobRepository;
-  jobRunner: JobRunner;
-  jobAdapter: JobAdapter;
-  reputationAdapter: ReputationAdapter;
-  jobClientAddress: Address;
+  /** Absent with no `JOB_CLIENT_PRIVATE_KEY` — there is no escrow payer to run a saga as. */
+  jobRunner?: JobRunner;
+  jobAdapter?: JobAdapter;
+  reputationAdapter?: ReputationAdapter;
+  jobClientAddress?: Address;
   /** Falls back to jobClientAddress when no distinct evaluator key is configured.
    * NOTE: a distinct evaluator key is required for live runs — complete() on-chain
    * requires a non-client evaluator in the general case. */
-  jobEvaluatorAddress: Address;
-  runJob: RunJobFn;
+  jobEvaluatorAddress?: Address;
+  runJob?: RunJobFn;
 }
 
 export function buildJobDeps(
@@ -49,6 +59,12 @@ export function buildJobDeps(
   circleApi?: CircleWalletsApi,
 ): JobDeps {
   const jobs = new SqliteJobRepository(db);
+  // No job client key, no signing half. Returning early (rather than building the wallet from
+  // some other key) is the whole point: the client FUNDS THE ESCROW, so the only alternatives to
+  // refusing were paying job budgets out of the platform governance key or failing at the first
+  // `createJob` with a confusing revert. The read half still comes back.
+  if (!cfg.jobClientPrivateKey) return { jobs };
+
   const jobOpAttempts = new SqliteJobOpAttempts(db);
   // S5: job budgets are platform client-wallet outflows — same rolling-window brake as funding.
   const outflows = buildOutflowMeter(db, {
