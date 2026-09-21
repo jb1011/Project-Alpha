@@ -454,7 +454,10 @@ export interface Config {
   gasSeedFloorUsdc: string;
   gasSeedTargetUsdc: string;
   enableX402Demo: boolean;
-  x402DemoPayTo: Address;
+  /** Where a stranger's USDC LANDS when the demo seller settles. Absent = the demo seller is not
+   *  mounted; it must never fall back to the platform account's address, which would make the
+   *  governance key the payout target of a public wall by omission. A receive-only address. */
+  x402DemoPayTo: Address | undefined;
   x402DemoPriceUsdc: string;
   /** Optional in the type (test fixtures build Config literals); loadConfig always sets them. */
   x402TrustPolicy?: "open" | "accountable-only" | "legal-bodies-only";
@@ -766,8 +769,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     x402BuyerTrustPolicy: e.X402_BUYER_TRUST_POLICY,
     worldRateWindowHours: e.WORLD_RATE_WINDOW_HOURS,
     x402ProofAgentKey: e.X402_PROOF_AGENT_KEY,
-    x402DemoPayTo:
-      e.X402_DEMO_PAYTO ?? (privateKeyToAccount(e.PLATFORM_PRIVATE_KEY).address as Address),
+    x402DemoPayTo: e.X402_DEMO_PAYTO,
     x402DemoPriceUsdc: e.X402_DEMO_PRICE_USDC,
     ens: e.ENS_GATEWAY_SIGNER_KEY
       ? {

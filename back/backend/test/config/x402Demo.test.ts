@@ -17,11 +17,15 @@ test("ENABLE_X402_DEMO accepts '1' and 'true'", () => {
   expect(loadConfig({ ...baseEnv, ENABLE_X402_DEMO: "no" }).enableX402Demo).toBe(false);
 });
 
-test("payTo defaults to the platform account address, overridable", () => {
+// No fallback: the payTo is where a stranger's USDC LANDS. Defaulting it to the platform
+// account's address made the demo seller pay revenue into the governance key's wallet whenever
+// the var was forgotten — a silent payout target, chosen by omission.
+test("payTo is undefined when unset, never the platform address, and is overridable", () => {
   const cfg = loadConfig(baseEnv);
-  expect(cfg.x402DemoPayTo).toBe(privateKeyToAccount(PK).address);
+  expect(cfg.x402DemoPayTo).toBeUndefined();
+  expect(cfg.x402DemoPayTo).not.toBe(privateKeyToAccount(PK).address);
   const override = "0x00000000000000000000000000000000000000ab";
-  expect(loadConfig({ ...baseEnv, X402_DEMO_PAYTO: override }).x402DemoPayTo.toLowerCase()).toBe(
+  expect(loadConfig({ ...baseEnv, X402_DEMO_PAYTO: override }).x402DemoPayTo?.toLowerCase()).toBe(
     override,
   );
 });

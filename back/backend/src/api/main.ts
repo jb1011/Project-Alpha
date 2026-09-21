@@ -691,6 +691,15 @@ async function main() {
       console.warn(
         "⚠ x402 seller policy: LEGAL-BODIES-ONLY — only agents a registered legal body in good standing stands behind are served (403 otherwise)",
       );
+  } else if (cfg.enableX402Demo) {
+    // The flag is on and the deps came back empty, which can only be the missing payout address.
+    // Said out loud because the alternative to this line is an operator who set the flag, gets a
+    // 404 on the demo, and concludes the flag did not take. Production refuses to boot on this
+    // combination (env.ts); everywhere else the demo is simply not mounted.
+    console.warn(
+      "⚠ x402 demo seller NOT mounted: ENABLE_X402_DEMO is on but X402_DEMO_PAYTO is unset — " +
+        "there is no payout address, and the platform account's is not a substitute for one",
+    );
   }
 
   // AgentBook (design 2026-08-25 v3), in two halves.
