@@ -198,7 +198,12 @@ test("the prepared transfer still carries the Arc gas and the transfer itself", 
     treasury: TREASURY,
     amount: 5n,
   });
-  expect(prepared).toMatchObject({ usdc: USDC, treasury: TREASURY, amount: 5n });
+  expect(Object.keys(prepared).sort()).toEqual(["amount", "request", "treasury", "usdc"]);
+  expect({ usdc: prepared.usdc, treasury: prepared.treasury, amount: prepared.amount }).toEqual({
+    usdc: USDC,
+    treasury: TREASURY,
+    amount: 5n,
+  });
   const signed = await withSenderLock(account.address, () => t.adapter.signFundTreasury(prepared));
   const tx = parseTransaction(signed.rawTx);
   expect(tx.to?.toLowerCase()).toBe(USDC.toLowerCase());

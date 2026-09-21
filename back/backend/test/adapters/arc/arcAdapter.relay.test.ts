@@ -23,6 +23,8 @@ import {
   encodeErrorResult,
   encodeEventTopics,
   encodeFunctionData,
+  parseTransaction,
+  serializeTransaction,
   size,
   slice,
 } from "viem";
@@ -55,6 +57,8 @@ const PROXY = "0x00000000000000000000000000000000000000fa" as Address;
 const OA_HASH = "0xabcdef00000000000000000000000000000000000000000000000000000000ff" as Hex;
 const FAKE_HASH = "0xdeadbeef00000000000000000000000000000000000000000000000000000003" as Hex;
 const GAS = 123_456n;
+/** What the fake `prepareTransactionRequest` estimates when the caller passes no explicit gas. */
+const PREPARED_GAS = 90_000n;
 
 function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
@@ -62,11 +66,31 @@ function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
   const estimateGas = vi.fn().mockResolvedValue(GAS);
   const waitForTransactionReceipt = vi.fn().mockResolvedValue({});
   // Every platform send is now prepare (outside the lock) -> sign offline -> raw broadcast, so
-  // what used to be asserted on `writeContract`/`sendTransaction` is asserted on the request that
-  // was SIGNED: it carries the same to/data/gas/account, plus the nonce the ledger assigned.
-  const prepareTransactionRequest = vi.fn(async (r: Record<string, unknown>) => ({ ...r }));
-  const signTransaction = vi.fn().mockResolvedValue("0xsignedbytes");
-  const sendRawTransaction = vi.fn().mockResolvedValue(FAKE_HASH);
+  // what used to be asserted on the `writeContract`/`sendTransaction` argument is asserted on the
+  // BYTES: this fake serialises for real (no key — an unsigned EIP-1559 payload round-trips
+  // through `parseTransaction` just as well), so the tests read to/data/gas/value/nonce back out
+  // of the wire format, which is where they now live.
+  const prepareTransactionRequest = vi.fn(async (r: Record<string, unknown>) => ({
+    ...r,
+    // What viem's own prepare fills in and the serialiser needs.
+    chainId: 5042002,
+    type: "eip1559",
+    maxFeePerGas: 2n,
+    maxPriorityFeePerGas: 1n,
+    gas: r.gas ?? PREPARED_GAS,
+  }));
+  const signRequests: Record<string, unknown>[] = [];
+  const signTransaction = vi.fn(async (tx: Record<string, unknown>) => {
+    signRequests.push(tx);
+    return serializeTransaction(tx as never);
+  });
+  const raw: Hex[] = [];
+  const sendRawTransaction = vi.fn(
+    async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+      raw.push(serializedTransaction);
+      return FAKE_HASH;
+    },
+  );
   const publicClient = {
     simulateContract,
     call,
@@ -89,15 +113,17 @@ function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
     identityRegistry: REGISTRY,
     controller: opts.controller,
   });
-  /** What the platform signed, in order: the prepared request plus its nonce. */
-  const signed = () => signTransaction.mock.calls.map((c) => c[0] as Record<string, unknown>);
+  /** What the platform actually put on the wire, decoded. */
+  const signed = () => raw.map((r) => parseTransaction(r));
   return {
     adapter,
     simulateContract,
     call,
     estimateGas,
+    managerWallet,
     prepareTransactionRequest,
     signTransaction,
+    signRequests,
     sendRawTransaction,
     waitForTransactionReceipt,
     signed,
@@ -151,12 +177,11 @@ const createCalldata = (manager: Address) =>
 /** The relay contract: to == controller, data == <direct calldata> ++ <20-byte target>. */
 function assertRelayed(tx: unknown, expected: { data: Hex; target: Address }) {
   const sent = tx as { to?: Address; data?: Hex; gas?: bigint; account?: { address?: Address } };
-  expect(sent.to).toBe(CONTROLLER);
+  expect(sent.to?.toLowerCase()).toBe(CONTROLLER.toLowerCase());
   const data = sent.data as Hex;
   expect(size(data)).toBe(size(expected.data) + 20);
   expect(slice(data, 0, size(expected.data))).toBe(expected.data); // prefix == the direct calldata
   expect(slice(data, size(data) - 20)).toBe(expected.target.toLowerCase()); // 20-byte suffix
-  expect(sent.account?.address ?? sent.account).toBeDefined(); // still signed BY the executor key
   expect(typeof (sent as { nonce?: number }).nonce).toBe("number"); // numbered by the ledger
   expect(sent.gas).toBe(GAS); // the preflight's estimate rides along as the limit
 }
@@ -164,7 +189,7 @@ function assertRelayed(tx: unknown, expected: { data: Hex; target: Address }) {
 // ── the relayed shape, per call site ─────────────────────────────────────
 
 test("createEntity relays to the controller with the FACTORY appended", async () => {
-  const { adapter, estimateGas, relayed, simulateContract } = makeAdapter({
+  const { adapter, estimateGas, relayed, simulateContract, managerWallet } = makeAdapter({
     controller: CONTROLLER,
   });
   const hash = await adapter.broadcastCreateEntity(createParams);
@@ -179,7 +204,8 @@ test("createEntity relays to the controller with the FACTORY appended", async ()
   expect(estimateGas).toHaveBeenCalledTimes(1);
   expect(estimateGas.mock.calls[0]![0].to).toBe(CONTROLLER);
   expect(estimateGas.mock.calls[0]![0].data).toBe(relayed()[0]!.data);
-  expect(estimateGas.mock.calls[0]![0].account?.address).toBe(EXECUTOR);
+  // The executor account itself, not a copy of its address: the same object the wallet carries.
+  expect(estimateGas.mock.calls[0]![0].account).toBe(managerWallet.account);
   expect(simulateContract).not.toHaveBeenCalled(); // the direct-mode path must not also run
 });
 
@@ -381,14 +407,54 @@ test("legacy agent in CONTROLLER mode takes the direct path, byte-identical to l
     [TREASURY, "schedulePolicyUpdate", EXECUTOR],
     [TREASURY, "executePolicyUpdate", EXECUTOR],
   ]);
-  // Byte-identical means the WIRE fields: same target, same calldata, same gas, same numbering.
-  // (The account object itself differs between two adapters only by which spy it carries.)
-  const wire = (txs: Record<string, unknown>[]) =>
-    txs.map((t) => ({ to: t.to, data: t.data, gas: t.gas, value: t.value, nonce: t.nonce }));
-  expect(wire(controlled.direct())).toEqual(wire(legacyDeployment.direct()));
-  // The simulated request, forwarded unmodified but for the nonce this process assigned it.
-  for (const [i, tx] of controlled.direct().entries())
-    expect(tx).toMatchObject({ to: expect.any(String), nonce: i });
+  // Byte-identical means exactly that: the serialised transactions match, field for field.
+  expect(controlled.direct()).toEqual(legacyDeployment.direct());
+  // ...and each one carries the call it was asked for, at the nonce this process assigned it.
+  const expectedDirect = [
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setAgentWallet",
+        args: [1n, PAYOUT, 1n, "0x00"],
+      }),
+    },
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setMetadata",
+        args: [1n, "ens", "0x00"],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "schedulePolicyUpdate",
+        args: [1n, 1n, true, PAYOUT],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "executePolicyUpdate",
+        args: [POLICY_ID],
+      }),
+    },
+  ];
+  expect(controlled.direct()).toHaveLength(expectedDirect.length);
+  for (const [i, tx] of controlled.direct().entries()) {
+    expect(tx.to).toBe(expectedDirect[i]!.to.toLowerCase());
+    expect(tx.data).toBe(expectedDirect[i]!.data);
+    expect(tx.value).toBeUndefined(); // a manager call moves no native value
+    expect(tx.gas).toBe(PREPARED_GAS);
+    expect(tx.nonce).toBe(i);
+  }
+  // Signed as the executor on both deployments — the sender is not a field of the wire format.
+  for (const req of controlled.signRequests)
+    expect((req.account as { address?: Address }).address).toBe(EXECUTOR);
 });
 
 test("controller-managed agent in controller mode relays; the same agent has no relay pre-flip", async () => {
@@ -614,8 +680,50 @@ test("legacy mode: every relayed site still simulates against its TARGET and wri
   // Every one signs as the platform account and forwards the SIMULATED request unmodified.
   for (const c of simulateContract.mock.calls) expect(c[0].account?.address).toBe(EXECUTOR);
   expect(direct()).toHaveLength(5);
-  // Unmodified but for the nonce, which is consecutive because one key sends one at a time.
-  for (const [i, tx] of direct().entries()) expect(tx).toMatchObject({ nonce: i });
+  // Each site sends the call it simulated, to the target it simulated it against, at the nonce
+  // this process assigned it — consecutive, because one key sends one at a time.
+  const expectedLegacy = [
+    { to: FACTORY, data: createCalldata(CONTROLLER) },
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setAgentWallet",
+        args: [1n, PAYOUT, 1n, "0x00"],
+      }),
+    },
+    {
+      to: REGISTRY,
+      data: encodeFunctionData({
+        abi: iIdentityRegistryAbi,
+        functionName: "setMetadata",
+        args: [1n, "ens", "0x00"],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "schedulePolicyUpdate",
+        args: [1n, 1n, true, PAYOUT],
+      }),
+    },
+    {
+      to: TREASURY,
+      data: encodeFunctionData({
+        abi: agentTreasuryAbi,
+        functionName: "executePolicyUpdate",
+        args: [POLICY_ID],
+      }),
+    },
+  ];
+  for (const [i, tx] of direct().entries()) {
+    expect(tx.to).toBe(expectedLegacy[i]!.to.toLowerCase());
+    expect(tx.data).toBe(expectedLegacy[i]!.data);
+    expect(tx.value).toBeUndefined();
+    expect(tx.gas).toBe(PREPARED_GAS);
+    expect(tx.nonce).toBe(i);
+  }
 });
 
 test("legacy mode never opens a relay preflight", async () => {

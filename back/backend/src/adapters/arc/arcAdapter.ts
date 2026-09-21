@@ -218,6 +218,11 @@ export class ArcAdapter {
     const wallet = this.d.managerWallet as PlatformWallet;
     const sign = wallet.account.signTransaction;
     if (!sign)
+      // ⚠ ASSUMES AN IN-PROCESS KEY. The platform account is a `privateKeyToAccount`, so signing is
+      // arithmetic: no round trip, and the lock is held for the two RPCs on either side of it. An
+      // account whose `signTransaction` talks to a remote signer would put that round trip back
+      // inside the lock — for such a signer the signature would have to move OUT of the locked
+      // section, which needs a different nonce strategy (the nonce is claimed by the signature).
       throw new Error(
         "ArcAdapter: the platform account cannot sign locally — a remote signer would put a network call inside the send lock",
       );
@@ -796,6 +801,11 @@ export class ArcAdapter {
     const wallet = this.d.managerWallet as PlatformWallet;
     const sign = wallet.account.signTransaction;
     if (!sign)
+      // ⚠ ASSUMES AN IN-PROCESS KEY. The platform account is a `privateKeyToAccount`, so signing is
+      // arithmetic: no round trip, and the lock is held for the two RPCs on either side of it. An
+      // account whose `signTransaction` talks to a remote signer would put that round trip back
+      // inside the lock — for such a signer the signature would have to move OUT of the locked
+      // section, which needs a different nonce strategy (the nonce is claimed by the signature).
       throw new Error(
         "ArcAdapter: the platform account cannot sign locally — a remote signer would put a network call inside the send lock",
       );

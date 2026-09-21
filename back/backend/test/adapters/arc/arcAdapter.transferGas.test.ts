@@ -3,9 +3,18 @@
  * explicit gas to writeContract so viem does not run eth_estimateGas WITH EIP-1559 fee fields (which
  * reserves ~the sender's whole balance and reverts a near-full-balance USDC transfer). No Anvil.
  */
-import type { Address, Hex, PublicClient, WalletClient } from "viem";
+import {
+  type Address,
+  type Hex,
+  type PublicClient,
+  type WalletClient,
+  encodeFunctionData,
+  parseTransaction,
+  serializeTransaction,
+} from "viem";
 import { beforeEach, expect, test, vi } from "vitest";
 import { ArcAdapter } from "../../../src/adapters/arc/arcAdapter";
+import { USDC_TRANSFER_GAS } from "../../../src/adapters/arc/gas";
 import { resetSenderNonces, withSenderLock } from "../../../src/adapters/arc/senderLock";
 
 /** The platform signer these fakes send as — and therefore the lock the saga's path must hold. */
@@ -22,10 +31,25 @@ const FAKE_HASH = "0xdeadbeef000000000000000000000000000000000000000000000000000
 function makeAdapter() {
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
   const operatorWrite = vi.fn().mockResolvedValue(FAKE_HASH);
-  // The platform's send path: prepare (outside the lock) -> sign offline -> raw broadcast.
-  const managerPrepare = vi.fn(async (r: Record<string, unknown>) => ({ ...r }));
-  const managerSign = vi.fn().mockResolvedValue("0xsignedbytes");
-  const sendRawTransaction = vi.fn().mockResolvedValue(FAKE_HASH);
+  // The platform's send path: prepare (outside the lock) -> sign offline -> raw broadcast. The
+  // fake serialises for real, so the transfer that goes out can be decoded and checked.
+  const managerPrepare = vi.fn(async (r: Record<string, unknown>) => ({
+    ...r,
+    chainId: 5042002,
+    type: "eip1559",
+    maxFeePerGas: 2n,
+    maxPriorityFeePerGas: 1n,
+  }));
+  const managerSign = vi.fn(async (tx: Record<string, unknown>) =>
+    serializeTransaction(tx as never),
+  );
+  const raw: Hex[] = [];
+  const sendRawTransaction = vi.fn(
+    async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+      raw.push(serializedTransaction);
+      return FAKE_HASH;
+    },
+  );
   const waitForTransactionReceipt = vi.fn().mockResolvedValue({});
   const publicClient = {
     simulateContract,
@@ -58,6 +82,8 @@ function makeAdapter() {
     managerPrepare,
     managerSign,
     waitForTransactionReceipt,
+    /** What went on the wire, decoded. */
+    sent: () => raw.map((r) => parseTransaction(r)),
   };
 }
 
@@ -78,16 +104,39 @@ test("operatorTransferUsdc passes an explicit gas (skips the fee-fielded estimat
 });
 
 test("fundTreasury passes an explicit gas (same footgun class)", async () => {
-  const { adapter, managerPrepare, managerSign } = makeAdapter();
+  const { adapter, managerPrepare, sent } = makeAdapter();
   const hash = await adapter.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n });
   expect(hash).toBe(FAKE_HASH);
-  // The gas is explicit in what is PREPARED, so viem never estimates — and it survives into the
-  // bytes that are signed, which is the only place it matters.
+  // The gas is explicit in what is PREPARED, so viem never estimates it...
   const prepared = managerPrepare.mock.calls[0]![0] as { gas?: bigint; to?: Address };
   expect(typeof prepared.gas).toBe("bigint");
-  expect(prepared.gas).toBeGreaterThanOrEqual(60_000n);
+  expect(prepared.gas).toBeGreaterThanOrEqual(60_000n); // headroom over a ~50k transfer
   expect(prepared.to).toBe(USDC);
-  expect(managerSign.mock.calls[0]![0]).toMatchObject({ gas: prepared.gas, nonce: 0 });
+  // ...and the transfer that actually goes out carries it, with the call and the nonce.
+  expect(sent()).toHaveLength(1);
+  const tx = sent()[0]!;
+  expect({ to: tx.to, data: tx.data, value: tx.value, gas: tx.gas, nonce: tx.nonce }).toEqual({
+    to: USDC.toLowerCase(),
+    data: encodeFunctionData({
+      abi: [
+        {
+          type: "function",
+          name: "transfer",
+          stateMutability: "nonpayable",
+          inputs: [
+            { name: "to", type: "address" },
+            { name: "amount", type: "uint256" },
+          ],
+          outputs: [{ name: "", type: "bool" }],
+        },
+      ],
+      functionName: "transfer",
+      args: [TREASURY, 500_000n],
+    }),
+    value: undefined, // a USDC transfer moves no native value
+    gas: USDC_TRANSFER_GAS,
+    nonce: 0,
+  });
 });
 
 test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", async () => {
