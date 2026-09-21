@@ -223,7 +223,7 @@ whatever it was pinned to, forever.
 
 `FORMATION_MAX_PER_TENANT` (default 3) and `FORMATION_DAILY_CEILING` (default 10) are checked
 before any row is minted, **whenever a company would be created** — on every deployment,
-`required` or not. An opt-in filing costs the same $100–150 as a mandatory one.
+`required` or not. An opt-in filing costs the same per-filing fee as a mandatory one.
 
 Since A1 the two count different things, on purpose:
 

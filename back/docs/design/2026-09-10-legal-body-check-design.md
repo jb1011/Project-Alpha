@@ -15,7 +15,7 @@ Novi legal body in good standing? Three deliverables make that real without Worl
 2. a drop-in checker object a seller hands to AgentKit's hooks in place of the AgentBook reader;
 3. a third trust policy in our own x402 seller, `legal-bodies-only`, with a three-leg demo.
 
-Mateo (World) confirmed 2026-09-09 that this is "just what we are looking for".
+The World team's early feedback on the idea (2026-09-09) was positive.
 
 ## 2. What exists (verified in code)
 

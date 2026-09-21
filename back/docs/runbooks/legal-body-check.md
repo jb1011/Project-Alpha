@@ -142,10 +142,10 @@ cd back/backend && npx vitest run test/payments/sellerTrust.test.ts
 
 ## Deploy
 
-ONE env addition on the box, then the usual deploy (`ssh novi-prod`, pull, build) and a restart:
+ONE env addition on the box, then the usual deploy (pull, build) and a restart:
 
 ```bash
-# as novi, in /home/novi/Project-Alpha/back/backend
+# in the backend directory, as the service user
 echo 'PUBLIC_API_URL=https://api.novicorpus.com' >> .env
 sudo systemctl restart legalbody-api
 ```
