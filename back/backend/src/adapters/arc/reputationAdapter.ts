@@ -6,7 +6,9 @@ import {
   encodeFunctionData,
 } from "viem";
 import { reputationRegistryAbi } from "../../abis/generated";
+import { ChainTxRevertedError } from "../../errors";
 import { type LocalSendClient, prepareLocalTx, sendFromLocalAccount } from "./localSend";
+import { awaitSuccessfulReceipt } from "./receipts";
 
 /** Named in a refusal, so the sentence says WHICH key could not sign (see `localSend.ts`). */
 const RECORDER = "ReputationAdapter: the recorder account";
@@ -80,7 +82,13 @@ export class ReputationAdapter {
       who: RECORDER,
     });
     // Outside the lock: a lock held across a receipt wait stops every other send from this key.
-    await this.d.publicClient.waitForTransactionReceipt({ hash: h });
+    // And the receipt is READ, not merely awaited — a reverted feedback is not a recorded one
+    // (`receipts.ts`), and the saga's step 5 stores what comes back here.
+    await awaitSuccessfulReceipt(
+      this.d.publicClient,
+      h,
+      (x) => new ChainTxRevertedError("giveFeedback", x),
+    );
     return h;
   }
 }

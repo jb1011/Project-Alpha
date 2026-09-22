@@ -13,7 +13,9 @@ const FAKE_HASH = "0xdeadbeef000000000000000000000000000000000000000000000000000
 
 test("transferUsdc passes an explicit gas to writeContract (near-full-balance sweep footgun)", async () => {
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
-  const waitForTransactionReceipt = vi.fn().mockResolvedValue({});
+  // A receipt that says the sweep SUCCEEDED: the adapter now reads `status`, and a reverted one is
+  // refused rather than returned as a hash (`adapters/arc/receipts.ts`).
+  const waitForTransactionReceipt = vi.fn().mockResolvedValue({ status: "success" });
   const writeContract = vi.fn().mockResolvedValue(FAKE_HASH);
   const publicClient = { simulateContract, waitForTransactionReceipt } as unknown as PublicClient;
   const wallet = {
