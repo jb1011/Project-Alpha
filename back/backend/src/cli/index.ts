@@ -11,11 +11,50 @@ import { legacyDoorRefusalMessage, legacyDoorRefused } from "../formation";
 import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import { runOnboarding } from "../workflow/onboarding";
+import { OnboardingRunner } from "../workflow/runner";
 import { type CliContext, buildContext } from "./context";
 
 /** Deps that can be injected for testing — bypasses live Anthropic + chain calls. */
 export interface AgentDeps {
   runDemo: (query: string) => Promise<DemoResult>;
+}
+
+/**
+ * The fund door's runner: the same class, the same saga and the same rules as `api/main.ts`, wired
+ * from the CLI's own context.
+ *
+ * Formation and ENS are deliberately absent, exactly as in `create-entity`: this door has no way to
+ * carry a `partyId`, and an entity it touches owes no filing it could make. Everything the FUND
+ * step needs — the repository, the adapter, the document store, the anchor history and the S5 meter
+ * — is already on the context.
+ */
+function fundRunner(ctx: CliContext): OnboardingRunner {
+  return new OnboardingRunner({
+    repo: ctx.repo,
+    fundCaps: {
+      perCall: ctx.cfg.maxTreasuryFund,
+      perTenantTotal: ctx.cfg.maxTreasuryFundedPerTenant,
+    },
+    // S5: the check happens in `fund()`, before the saga spawns; the saga records the outflow with
+    // the transfer's hash once it is on the wire. The operator door is metered like every other.
+    outflows: ctx.outflows,
+    runSaga: (i) =>
+      runOnboarding({
+        spec: i.spec,
+        idempotencyKey: i.idempotencyKey,
+        repo: ctx.repo,
+        docStore: ctx.docStore,
+        arc: ctx.arc,
+        operatorSigner: ctx.operatorSigner,
+        usdc: ctx.cfg.usdc,
+        metadataBaseUrl: ctx.cfg.metadataBaseUrl,
+        ownerTenantId: i.tenantId || undefined,
+        specJson: i.specJson,
+        fundAmount: i.fundAmount,
+        anchors: ctx.anchors,
+        outflows: ctx.outflows,
+      }),
+  });
 }
 
 /** Build the commander program. `makeContext` is injectable so tests pass an anvil-backed context. */
@@ -154,6 +193,30 @@ export function buildCli(
       );
     });
 
+  /**
+   * THE OPERATOR'S FUND DOOR, THROUGH THE RECORDED PATH.
+   *
+   * It used to call the adapter's combined `fundTreasury` — broadcast, then await the receipt —
+   * and write nothing until both had returned. So there was no `submitted` row and no hash on disk
+   * before the wait, which is precisely the loss #140 removed from the API path: a crash, a deploy
+   * or a lost `eth_sendRawTransaction` response inside that wait left a transfer that had happened
+   * and no record of it anywhere. Nor an S5 outflow entry, and nothing serialised its send against
+   * the platform key's other transactions.
+   *
+   * So it now goes through the SAME runner and saga as the wizard's `POST /entities/:id/fund`
+   * ({fundRunner}), and every rule that path has comes with it: resolve-before-send, sign → persist
+   * → send under the send lock, the `submitted`/`funded` events, the S5 outflow record, the per-call
+   * and per-tenant caps, and a failure recorded on the row in the PUBLIC sentence rather than
+   * raised as a raw RPC error.
+   *
+   * The command then does what the wizard does: wait for the attempt to finish and read the entity
+   * back. `settled()` is the in-process form of the wizard's poll — one process, one saga, nothing
+   * to poll across — and the row it prints is the same one the API would have served.
+   *
+   * ⚠ A non-zero exit when `error` is set. The runner clears the previous attempt's error before
+   * this one starts, so an error on the row afterwards belongs to this command, and a script
+   * driving it must not read a recorded failure as success.
+   */
   program
     .command("fund-treasury")
     .argument("<key>", "idempotency key")
@@ -161,20 +224,47 @@ export function buildCli(
     .action(async (key, usd) => {
       const ctx = await makeContext();
       const rec = ctx.repo.findByIdempotencyKey(key);
-      if (!rec?.treasury || !rec.treasuryConfig)
-        throw new Error(`entity ${key} has no treasury yet`);
-      // S5: the trusted operator keeps direct signing, but no path is unmetered — same
-      // rolling-window brake and record as every other platform outflow (audit correction 4).
-      const amount = usdToUnits(usd);
-      ctx.outflows.check(amount);
-      const txHash = await ctx.arc.fundTreasury({
-        usdc: rec.treasuryConfig.usdc,
-        treasury: rec.treasury,
-        amount,
-      });
-      ctx.outflows.record("cli_fund", amount, txHash);
-      ctx.repo.upsert({ ...rec, status: "funded", fundTxHash: txHash });
-      console.log(JSON.stringify({ key, funded: usd, txHash }, null, 2));
+      if (!rec) {
+        console.error(`not found: ${key}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (!rec.treasury || !rec.treasuryConfig) {
+        console.error(`entity ${key} has no treasury yet`);
+        process.exitCode = 1;
+        return;
+      }
+      const runner = fundRunner(ctx);
+      // THE ROW'S OWN TENANT. This door is the trusted operator's and carries no tenant of its own,
+      // so it acts AS the owner of the entity it was pointed at — which is what the runner's
+      // ownership check compares against. A CLI-minted entity may have no tenant at all
+      // (`create-entity` records none), and the check is an equality, so the value to pass is
+      // whatever the row holds.
+      //
+      // WHICH CAPS BIND, exactly: for a row WITH a tenant, all three — the per-call maximum, that
+      // tenant's lifetime quota and the platform outflow ceiling. For a TENANT-LESS row the quota
+      // sums nothing (`sumFundedByTenant(null)` matches no row, so it reads 0), leaving the
+      // per-call maximum and the ceiling as the two that bind. A row with no tenant is an operator
+      // artefact of this door; whether it should have one is not this command's question.
+      runner.fund({ id: key, tenantId: rec.ownerTenantId as string, amount: usdToUnits(usd) });
+      await runner.settled();
+      const after = ctx.repo.findByIdempotencyKey(key)!;
+      console.log(
+        JSON.stringify(
+          {
+            key,
+            requested: usd,
+            status: after.status,
+            txHash: after.fundTxHash,
+            // The public sentence, or nothing. Never a viem diagnostic: one of those carried an
+            // RPC key onto a screen on 2026-09-16.
+            error: after.error,
+          },
+          null,
+          2,
+        ),
+      );
+      if (after.error) process.exitCode = 1;
     });
 
   program

@@ -24,8 +24,17 @@ import {
 import { BroadcastUnconfirmedError } from "../../errors";
 import type { TreasuryConfig } from "../../types";
 import { USDC_TRANSFER_GAS } from "./gas";
+import {
+  type LocalSendClient,
+  type LocalWallet,
+  type PreparedLocalTx,
+  localSigner,
+  pendingNonceOf,
+  prepareLocalTx,
+  sendFromLocalAccount,
+} from "./localSend";
 import { appendRelayTarget, relayRevertError } from "./relay";
-import { nextSenderNonce, noteSenderBroadcast, sendFromSender } from "./senderLock";
+import { nextSenderNonce, noteSenderBroadcast } from "./senderLock";
 
 /**
  * How long a manager-call receipt is waited for before the caller is told to come back later.
@@ -69,13 +78,10 @@ const EIP712_DOMAIN_ABI = [
 ] as const;
 
 /** A wallet client that is known to carry the platform account — the shape the sign path needs. */
-type PlatformWallet = WalletClient<Transport, Chain, Account>;
+type PlatformWallet = LocalWallet;
 
 /** A platform transaction request with everything but the nonce filled in. */
-type PreparedPlatformTx = Omit<
-  Awaited<ReturnType<PlatformWallet["prepareTransactionRequest"]>>,
-  "nonce"
->;
+type PreparedPlatformTx = PreparedLocalTx;
 
 /**
  * A treasury top-up with everything fetched except its nonce — the result of
@@ -92,17 +98,8 @@ export interface PreparedFundTransfer {
   request: PreparedPlatformTx;
 }
 
-/**
- * The two calls that happen INSIDE the send lock, and all this adapter asks of the bounded client.
- *
- * Typed structurally rather than as viem's `PublicClient` for the reason `hedera/registry.ts` gives
- * for its own clients: these two methods are the whole contract, a real viem client satisfies it,
- * and a test can supply one without inventing a chain.
- */
-export interface PlatformSendClient {
-  getTransactionCount(args: { address: Address; blockTag: "pending" }): Promise<number>;
-  sendRawTransaction(args: { serializedTransaction: Hex }): Promise<Hex>;
-}
+/** The two calls that happen INSIDE the send lock (`localSend.ts`), under the platform's name. */
+export type PlatformSendClient = LocalSendClient;
 
 export interface ArcAdapterDeps {
   publicClient: PublicClient;
@@ -179,16 +176,7 @@ export class ArcAdapter {
     value?: bigint;
     gas?: bigint;
   }): Promise<PreparedPlatformTx> {
-    const wallet = this.d.managerWallet as PlatformWallet;
-    return wallet.prepareTransactionRequest({
-      account: p.account,
-      chain: wallet.chain,
-      to: p.to,
-      data: p.data,
-      value: p.value,
-      gas: p.gas,
-      parameters: ["blobVersionedHashes", "chainId", "fees", "gas", "type"],
-    }) as Promise<PreparedPlatformTx>;
+    return prepareLocalTx(this.d.managerWallet, p);
   }
 
   /**
@@ -215,33 +203,20 @@ export class ArcAdapter {
    * which is why no method in this class calls another method's send.
    */
   private sendAsPlatform(sender: Address, prepared: PreparedPlatformTx): Promise<Hex> {
-    const wallet = this.d.managerWallet as PlatformWallet;
-    const sign = wallet.account.signTransaction;
-    if (!sign)
-      // ⚠ ASSUMES AN IN-PROCESS KEY. The platform account is a `privateKeyToAccount`, so signing is
-      // arithmetic: no round trip, and the lock is held for the two RPCs on either side of it. An
-      // account whose `signTransaction` talks to a remote signer would put that round trip back
-      // inside the lock — for such a signer the signature would have to move OUT of the locked
-      // section, which needs a different nonce strategy (the nonce is claimed by the signature).
-      throw new Error(
-        "ArcAdapter: the platform account cannot sign locally — a remote signer would put a network call inside the send lock",
-      );
-    return sendFromSender(
+    // ⚠ ASSUMES AN IN-PROCESS KEY — `localSend.ts` refuses anything else, and says why there.
+    return sendFromLocalAccount({
+      wallet: this.d.managerWallet,
+      via: this.sendVia,
       sender,
-      () => this.pendingNonce(sender),
-      async (nonce) => {
-        const rawTx = await sign.call(wallet.account, { ...prepared, nonce } as never, {
-          serializer: wallet.chain?.serializers?.transaction,
-        });
-        return this.sendVia.sendRawTransaction({ serializedTransaction: rawTx });
-      },
-    );
+      prepared,
+      who: "ArcAdapter: the platform account",
+    });
   }
 
   /** What a NEW transaction from this sender would be numbered, before our own floor is applied.
    *  `pending`, so it counts transactions of ours the chain has accepted but not yet mined. */
   private pendingNonce(sender: Address): Promise<number> {
-    return this.sendVia.getTransactionCount({ address: sender, blockTag: "pending" });
+    return pendingNonceOf(this.sendVia, sender);
   }
 
   /**
@@ -290,7 +265,7 @@ export class ArcAdapter {
    * gas, AND its result is the gas limit we send with — one node round-trip doing both jobs, where
    * an `eth_call` preflight had viem execute the transaction a second time to estimate.
    *
-   * NOT for signer-direct calls: fundTreasury (a plain USDC transfer) and the liveRunner gas seeds
+   * NOT for signer-direct calls: the treasury top-up (a plain USDC transfer) and the liveRunner gas seeds
    * are not role-gated and must keep coming straight from the signing key.
    */
   private async sendManagerCall(p: {
@@ -363,7 +338,7 @@ export class ArcAdapter {
   /**
    * {sendManagerCall} + await the receipt — the tail four of the five relayed sites repeat.
    *
-   * Goes through the same `confirmed()` as `fundTreasury` (R1). A rule that told the truth about
+   * Goes through the same `confirmed()` as `confirmFundTreasury` (R1). A rule that told the truth about
    * one receipt and not about the other four would be the next review finding: a bind, a metadata
    * write and a policy execute all have a post-broadcast window, and a caller that is told
    * "nothing was sent" about a mined bind resumes into a state it cannot explain.
@@ -797,21 +772,11 @@ export class ArcAdapter {
     const request = { ...prepared.request, nonce };
     // Signed by the ACCOUNT, not through the wallet action, which would ask the node for the chain
     // id first — one more call inside the caller's lock, for a value the request already carries.
-    // See {sendAsPlatform}, which does the same for every other platform send.
-    const wallet = this.d.managerWallet as PlatformWallet;
-    const sign = wallet.account.signTransaction;
-    if (!sign)
-      // ⚠ ASSUMES AN IN-PROCESS KEY. The platform account is a `privateKeyToAccount`, so signing is
-      // arithmetic: no round trip, and the lock is held for the two RPCs on either side of it. An
-      // account whose `signTransaction` talks to a remote signer would put that round trip back
-      // inside the lock — for such a signer the signature would have to move OUT of the locked
-      // section, which needs a different nonce strategy (the nonce is claimed by the signature).
-      throw new Error(
-        "ArcAdapter: the platform account cannot sign locally — a remote signer would put a network call inside the send lock",
-      );
-    const rawTx = await sign.call(wallet.account, request as never, {
-      serializer: wallet.chain?.serializers?.transaction,
-    });
+    // See `localSend.ts`, which does the same for every other send from a local key.
+    const rawTx = await localSigner(
+      this.d.managerWallet,
+      "ArcAdapter: the platform account",
+    )(request);
     return { rawTx, txHash: keccak256(rawTx), nonce: Number(request.nonce) };
   }
 
@@ -915,13 +880,13 @@ export class ArcAdapter {
     return this.confirmed(txHash, "fundTreasury");
   }
 
-  /**
-   * Broadcast + confirm, for callers with nothing to persist between the two (the CLI, the anvil
-   * integration tests). The SAGA must not use this: it has to record the hash in between.
-   */
-  async fundTreasury(p: { usdc: Address; treasury: Address; amount: bigint }): Promise<Hex> {
-    return this.confirmFundTreasury(await this.broadcastFundTreasury(p));
-  }
+  /* There is deliberately NO broadcast-and-confirm convenience here any more.
+   *
+   * One existed for "callers with nothing to persist between the two", and the last such caller was
+   * the CLI's fund door — which did have something to persist and simply was not doing it: no
+   * `submitted` row, so a crash inside the receipt wait lost the hash of a transfer that had already
+   * happened (the gap #140 closed for the API path). It now funds through the same saga
+   * (`cli/index.ts`), and a caller that wants both halves writes the hash down between them. */
 
   /**
    * Await a broadcast transaction's receipt and insist it SUCCEEDED.

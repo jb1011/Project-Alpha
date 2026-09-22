@@ -63,7 +63,8 @@ function makeAdapter() {
     writeContract: operatorWrite,
   } as unknown as WalletClient;
   const managerWallet = {
-    account: { address: PLATFORM, signTransaction: managerSign },
+    // The in-process key `localSend.ts` insists on, spelled as viem spells it.
+    account: { address: PLATFORM, source: "privateKey", signTransaction: managerSign },
     chain: { id: 5042002 },
     prepareTransactionRequest: managerPrepare,
   } as unknown as WalletClient;
@@ -103,9 +104,11 @@ test("operatorTransferUsdc passes an explicit gas (skips the fee-fielded estimat
   assertExplicitGas(operatorWrite.mock.calls[0]![0]);
 });
 
-test("fundTreasury passes an explicit gas (same footgun class)", async () => {
+test("a treasury top-up passes an explicit gas (same footgun class)", async () => {
   const { adapter, managerPrepare, sent } = makeAdapter();
-  const hash = await adapter.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n });
+  const hash = await adapter.confirmFundTreasury(
+    await adapter.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n }),
+  );
   expect(hash).toBe(FAKE_HASH);
   // The gas is explicit in what is PREPARED, so viem never estimates it...
   const prepared = managerPrepare.mock.calls[0]![0] as { gas?: bigint; to?: Address };
@@ -147,7 +150,7 @@ test("signFundTreasury — THE SAGA'S PATH — passes an explicit gas too", asyn
   const signTransaction = vi.fn().mockResolvedValue("0xsignedbytes" as Hex);
   const simulateContract = vi.fn().mockResolvedValue({ request: { marker: "sim-request" } });
   const managerWallet = {
-    account: { address: PLATFORM, signTransaction },
+    account: { address: PLATFORM, source: "privateKey", signTransaction },
     chain: { id: 5042002 },
     prepareTransactionRequest,
   } as unknown as WalletClient;
@@ -193,7 +196,9 @@ test("signFundTreasury refuses to persist a hole where the nonce should be", asy
   // something that is not one.
   const signTransaction = vi.fn();
   const managerWallet = {
-    account: { address: PLATFORM, signTransaction },
+    // A local key, as viem labels one: the refusal this test is about is the missing nonce, and it
+    // must not be reached by being mistaken for a remote signer instead.
+    account: { address: PLATFORM, source: "privateKey", signTransaction },
     chain: { id: 5042002 },
     prepareTransactionRequest: vi.fn().mockResolvedValue({ marker: "prepared" }),
   } as unknown as WalletClient;

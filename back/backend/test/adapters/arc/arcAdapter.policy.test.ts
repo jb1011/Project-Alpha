@@ -69,7 +69,13 @@ function makeAdapter() {
   } as unknown as PublicClient;
 
   const managerWallet = {
-    account: { address: "0x000000000000000000000000000000000000000B", signTransaction },
+    // `source` is how `localSend.ts` tells an in-process key from a remote signer; this fake
+    // stands in for a `privateKeyToAccount`, so it says the same thing viem's does.
+    account: {
+      address: "0x000000000000000000000000000000000000000B",
+      source: "privateKey",
+      signTransaction,
+    },
     chain: { id: 1 },
     prepareTransactionRequest,
   } as unknown as WalletClient;

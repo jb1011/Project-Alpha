@@ -101,7 +101,11 @@ function makeAdapter(opts: { controller?: Address; noAccount?: boolean } = {}) {
     sendRawTransaction,
   } as unknown as PublicClient;
   const managerWallet = {
-    account: opts.noAccount ? undefined : { address: EXECUTOR, signTransaction },
+    // `source: "privateKey"` is what viem's `privateKeyToAccount` reports, and what
+    // `localSend.ts` requires before it will sign inside the send lock.
+    account: opts.noAccount
+      ? undefined
+      : { address: EXECUTOR, source: "privateKey", signTransaction },
     chain: { id: 5042002 },
     prepareTransactionRequest,
   } as unknown as WalletClient;
@@ -351,11 +355,11 @@ test("relayed writes still await the receipt (except the three broadcast-only on
   expect(a2.relayed()).toHaveLength(1);
 });
 
-test("fundTreasury is NOT relayed in controller mode — it is a plain USDC transfer by the signer", async () => {
+test("a treasury top-up is NOT relayed in controller mode — it is a plain USDC transfer by the signer", async () => {
   const { adapter, simulateContract, direct, relayed } = makeAdapter({
     controller: CONTROLLER,
   });
-  await adapter.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n });
+  await adapter.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n });
   expect(relayed()).toHaveLength(0);
   expect(simulateContract.mock.calls[0]![0].address).toBe(USDC);
   expect(direct()).toHaveLength(1);

@@ -79,6 +79,9 @@ function makeAdapter(
   const managerWallet = {
     account: {
       address: EXECUTOR,
+      // What viem's `privateKeyToAccount` reports, and what `localSend.ts` requires before it
+      // will sign inside the lock: a remote signer's round trip may not happen in there.
+      source: "privateKey",
       // Signing is offline and inside the lock — and it is where the nonce becomes part of the
       // transaction, so this is the other place the invariant has to hold.
       signTransaction: vi.fn(async (r: { nonce?: number }) => {
@@ -175,10 +178,6 @@ const sendPaths: { name: string; run: (a: ArcAdapter) => Promise<unknown> }[] = 
   {
     name: "broadcastFundTreasury",
     run: (a) => a.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n }),
-  },
-  {
-    name: "fundTreasury",
-    run: (a) => a.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
   },
   { name: "sendNativeAsPlatform", run: (a) => a.sendNativeAsPlatform(TREASURY, 10n) },
 ];

@@ -8,7 +8,7 @@ import type Database from "better-sqlite3";
 import { http, createWalletClient } from "viem";
 import type { Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { publicClientFor } from "../adapters/arc/clients";
+import { publicClientFor, sendClientFor } from "../adapters/arc/clients";
 import { JobAdapter } from "../adapters/arc/jobAdapter";
 import { ReputationAdapter } from "../adapters/arc/reputationAdapter";
 import type { CircleWalletsApi } from "../adapters/circle/circleWallets";
@@ -74,6 +74,10 @@ export function buildJobDeps(
 
   // Viem clients — no network calls at construction
   const publicClient = publicClientFor(cfg);
+  // The two calls that happen inside the send lock, on their own bounded transport (8 s, no retry
+  // — `clients.ts` says why the lock cannot afford the app-wide retry budget). Shared by both
+  // adapters below, because the lock is keyed by SIGNER and they share the evaluator key.
+  const sendClient = sendClientFor(cfg);
   const chain = chainFor(cfg.chainId, cfg.rpcUrl);
   const transport = http(cfg.rpcUrl);
 
@@ -95,6 +99,7 @@ export function buildJobDeps(
     publicClient,
     clientWallet,
     evaluatorWallet,
+    sendClient,
     jobContract: cfg.jobContract,
   });
 
@@ -103,6 +108,7 @@ export function buildJobDeps(
   const reputationAdapter = new ReputationAdapter({
     publicClient,
     recorderWallet: evaluatorWallet ?? clientWallet,
+    sendClient,
     registry: cfg.reputationRegistry,
   });
 

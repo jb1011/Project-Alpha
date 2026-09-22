@@ -308,3 +308,36 @@ test("a send for ANOTHER signer nests without complaint", async () => {
     withSenderLock(A, () => sendFromSender(B, node.pendingNonce, async (n) => hashFor(n))),
   ).resolves.toBe(hashFor(2));
 });
+
+test("A RESTARTED CHAIN: the floors have to be dropped, or the next send is numbered into a hole", async () => {
+  // The CI flake of 2026-09-22, as a unit. `test/helpers/anvilJob.ts` starts one anvil PER TEST and
+  // hands each chain the SAME deterministic accounts, so a floor raised against chain A applies to
+  // chain B — where the transactions that raised it do not exist, and never will. `max(node, floor)`
+  // then numbers the first send behind nonces nothing can fill: the node queues it, the receipt
+  // never comes, and the test times out. Locally the 60 s TTL usually expired between two slow
+  // anvil spawns and hid it; in CI a spawn takes milliseconds.
+  const chainA = fakeNode(0);
+  for (let i = 0; i < 3; i++) {
+    await sendFromSender(A, chainA.pendingNonce, async (n) => hashFor(n));
+    chainA.advance();
+  }
+
+  // The hazard, stated: a fresh chain at 2, with the old floor still believed.
+  const chainB = fakeNode(2);
+  const stale: number[] = [];
+  await sendFromSender(A, chainB.pendingNonce, async (n) => {
+    stale.push(n);
+    return hashFor(n);
+  });
+  expect(stale).toEqual([3]); // three nonces ahead of a chain that has seen two transactions
+
+  // …and the fix `startAnvil` now applies: forget the floors, and the new node is the authority.
+  resetSenderNonces();
+  const fresh: number[] = [];
+  await sendFromSender(A, fakeNode(2).pendingNonce, async (n) => {
+    fresh.push(n);
+    return hashFor(n);
+  });
+  expect(fresh).toEqual([2]);
+  expect(trackedSenderCount()).toBe(1); // only this chain's floor is tracked now
+});
