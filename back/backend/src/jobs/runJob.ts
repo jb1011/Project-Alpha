@@ -15,7 +15,7 @@
 import type { Address, Hex } from "viem";
 import type { JobAdapter } from "../adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../adapters/arc/reputationAdapter";
-import { JobFundRevertedError } from "../errors";
+import { JobFundRevertedError, JobFundUnconfirmedError } from "../errors";
 import { providerOf, requireCircleWallets } from "../payments/provider";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
@@ -217,6 +217,17 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
       // operator can look up. The runner marks the row `failed` with this error's public message.
       if (e instanceof JobFundRevertedError)
         d.jobs.recordEvent(d.jobKey, "fund", "failed", e.txHash, JSON.stringify({ step: e.step }));
+      // A DIFFERENT FACT, and the trail has to keep them apart: the transaction was sent and may
+      // still fund the escrow, so this is the hash an operator checks before anyone re-runs the
+      // job. Nothing is booked either way — booking requires knowing.
+      if (e instanceof JobFundUnconfirmedError)
+        d.jobs.recordEvent(
+          d.jobKey,
+          "fund",
+          "unconfirmed",
+          e.txHash,
+          JSON.stringify({ step: e.step }),
+        );
       throw e;
     }
     d.outflows?.record("job_fund", d.budget, fundTxHash);

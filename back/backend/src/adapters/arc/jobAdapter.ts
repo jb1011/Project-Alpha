@@ -6,11 +6,16 @@ import {
   encodeFunctionData,
 } from "viem";
 import { iErc8183JobAbi } from "../../abis/generated";
-import { ChainTxRevertedError, JobFundRevertedError } from "../../errors";
+import {
+  ChainTxRevertedError,
+  ChainTxUnconfirmedError,
+  JobFundRevertedError,
+  JobFundUnconfirmedError,
+} from "../../errors";
 import { withKeyedLock } from "../../payments/keyedMutex";
 import { USDC_TRANSFER_GAS } from "./gas";
 import { type LocalSendClient, prepareLocalTx, sendFromLocalAccount } from "./localSend";
-import { awaitSuccessfulReceipt } from "./receipts";
+import { RECEIPT_TIMEOUT_MS, type ReceiptOutcome, awaitSuccessfulReceipt } from "./receipts";
 
 /** Minimal ERC-20 approve fragment for the approveAndFund flow. */
 const erc20ApproveAbi = [
@@ -98,6 +103,9 @@ export interface JobAdapterDeps {
    *  in `clients.ts`. Every composition that SENDS passes it; a read-only one needs none. */
   sendClient?: LocalSendClient;
   jobContract: Address;
+  /** How long a receipt wait may take before it is reported unconfirmed (`receipts.ts`). The
+   *  production bound is {RECEIPT_TIMEOUT_MS}; tests shorten it so a timeout is not a minute. */
+  receiptTimeoutMs?: number;
 }
 
 export interface JobResult {
@@ -248,10 +256,19 @@ export class JobAdapter {
    * a message from the node.
    */
   private mined(txHash: Hex, step: string): Promise<void> {
+    return this.receipt(txHash, {
+      reverted: (h) => new ChainTxRevertedError(step, h),
+      unconfirmed: (h) => new ChainTxUnconfirmedError(step, h),
+    });
+  }
+
+  /** Every receipt wait in this class, bounded by the same clock. */
+  private receipt(txHash: Hex, outcome: ReceiptOutcome): Promise<void> {
     return awaitSuccessfulReceipt(
       this.d.publicClient,
       txHash,
-      (h) => new ChainTxRevertedError(step, h),
+      outcome,
+      this.d.receiptTimeoutMs ?? RECEIPT_TIMEOUT_MS,
     );
   }
 
@@ -309,11 +326,10 @@ export class JobAdapter {
         args: [this.d.jobContract, amount],
       }),
     });
-    await awaitSuccessfulReceipt(
-      this.d.publicClient,
-      approveHash,
-      (h) => new JobFundRevertedError("approve", h, jobId),
-    );
+    await this.receipt(approveHash, {
+      reverted: (h) => new JobFundRevertedError("approve", h, jobId),
+      unconfirmed: (h) => new JobFundUnconfirmedError("approve", h, jobId),
+    });
     // Step 2: fund the job (pulls USDC via transferFrom into escrow). Simulated only now: before
     // the approve is mined it would revert on the allowance.
     await this.d.publicClient.simulateContract({
@@ -339,11 +355,10 @@ export class JobAdapter {
       to: this.d.jobContract,
       data: encodeFunctionData({ abi: iErc8183JobAbi, functionName: "fund", args: [jobId, "0x"] }),
     });
-    await awaitSuccessfulReceipt(
-      this.d.publicClient,
-      h,
-      (x) => new JobFundRevertedError("fund", x, jobId),
-    );
+    await this.receipt(h, {
+      reverted: (x) => new JobFundRevertedError("fund", x, jobId),
+      unconfirmed: (x) => new JobFundUnconfirmedError("fund", x, jobId),
+    });
     return h;
   }
 

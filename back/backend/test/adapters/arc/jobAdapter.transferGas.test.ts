@@ -6,6 +6,7 @@
 import type { Address, Hex, PublicClient, WalletClient } from "viem";
 import { expect, test, vi } from "vitest";
 import { JobAdapter } from "../../../src/adapters/arc/jobAdapter";
+import { RECEIPT_TIMEOUT_MS } from "../../../src/adapters/arc/receipts";
 
 const USDC = "0x3600000000000000000000000000000000000000" as Address;
 const TREASURY = "0x00000000000000000000000000000000000000dd" as Address;
@@ -34,5 +35,10 @@ test("transferUsdc passes an explicit gas to writeContract (near-full-balance sw
   expect(typeof arg.gas).toBe("bigint");
   expect(arg.gas).toBeGreaterThanOrEqual(60_000n);
   expect(arg.marker).toBe("sim-request");
-  expect(waitForTransactionReceipt).toHaveBeenCalledWith({ hash: FAKE_HASH });
+  // The bound came with the status check (`adapters/arc/receipts.ts`): the same hash as before,
+  // and now an explicit deadline, because the escrow unit holds a lock across waits like this one.
+  expect(waitForTransactionReceipt).toHaveBeenCalledWith({
+    hash: FAKE_HASH,
+    timeout: RECEIPT_TIMEOUT_MS,
+  });
 });

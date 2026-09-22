@@ -102,6 +102,11 @@ export interface UsdcJobNodeOptions {
    * incident's shape, and the one thing only a receipt can report. The steal happens once.
    */
   stealAllowanceOnFund?: boolean;
+  /**
+   * Accept the first `approve` (or `fund`) and then never produce its receipt — the transaction is
+   * on the chain and we cannot read what it did. Withheld ONCE, so a later job still gets answers.
+   */
+  withholdReceipt?: "approve" | "fund";
 }
 
 export function usdcJobNode(opts: UsdcJobNodeOptions) {
@@ -116,6 +121,7 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
   const sends: { hash: Hex; from: Address; nonce: number; to: Address }[] = [];
   let jobCounter = 0n;
   let stolen = false;
+  let withheld = false;
 
   const pairKey = (owner: string, spender: string) =>
     `${owner.toLowerCase()}:${spender.toLowerCase()}`;
@@ -229,15 +235,23 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         const action = execute(from, tx.to as Address, tx.data);
         actions.push(action);
         const hash = keccak256(raw);
-        receipts.set(hash, action.status === "success" ? "0x1" : "0x0");
+        if (opts.withholdReceipt === action.call && !withheld) withheld = true;
+        else receipts.set(hash, action.status === "success" ? "0x1" : "0x0");
         sends.push({ hash, from, nonce, to: tx.to as Address });
         return hash;
       }
+      // A node knows nothing about a hash it never accepted, and says so by answering null. The
+      // default used to be "success", which is a way to write a green test about a transaction
+      // that never existed.
+      case "eth_getTransactionByHash":
+        return null;
       case "eth_getTransactionReceipt": {
         const hash = (params as Hex[])[0]!;
+        const status = receipts.get(hash);
+        if (!status) return null;
         return {
           transactionHash: hash,
-          status: receipts.get(hash) ?? "0x1",
+          status,
           blockNumber: "0x1",
           blockHash: `0x${"11".repeat(32)}`,
           transactionIndex: "0x0",
@@ -312,7 +326,14 @@ export interface BookedOutflow {
 }
 
 export function jobFundHarness(
-  opts: { revertApprove?: boolean; stealAllowanceOnFund?: boolean; approveSets?: bigint } = {},
+  opts: {
+    revertApprove?: boolean;
+    stealAllowanceOnFund?: boolean;
+    approveSets?: bigint;
+    withholdReceipt?: "approve" | "fund";
+    /** The adapter's bound on a receipt wait. Milliseconds, so a timeout test is not a minute. */
+    receiptTimeoutMs?: number;
+  } = {},
 ) {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = OFF");
@@ -327,6 +348,7 @@ export function jobFundHarness(
     revertApprove: opts.revertApprove,
     stealAllowanceOnFund: opts.stealAllowanceOnFund,
     approveSets: opts.approveSets,
+    withholdReceipt: opts.withholdReceipt,
   });
 
   const adapter = new JobAdapter({
@@ -335,6 +357,7 @@ export function jobFundHarness(
     evaluatorWallet: node.walletFor(evaluatorAccount),
     sendClient: node.sendClient,
     jobContract: JOB_CONTRACT,
+    receiptTimeoutMs: opts.receiptTimeoutMs,
   });
 
   const outflows: BookedOutflow[] = [];

@@ -135,3 +135,53 @@ export class JobFundRevertedError extends Error {
     this.name = "JobFundRevertedError";
   }
 }
+
+/**
+ * A TRANSACTION WE SENT, WHOSE FATE WE DO NOT KNOW — and which is NOT a revert.
+ *
+ * The receipt wait is bounded (`adapters/arc/receipts.ts`), because the escrow funding holds one
+ * lock per client key across both of its waits and viem's default is three minutes per wait. When
+ * the bound is reached the honest report is the opposite of {ChainTxRevertedError}: the bytes are
+ * with the node, the transaction may still be mined, and whatever it does will have happened
+ * whether or not we were listening.
+ *
+ * So the message never says "reverted", and it forbids the re-send that a "nothing happened"
+ * sentence would invite — the same distinction, for the same reason, as
+ * {BroadcastUnconfirmedError} one layer down.
+ */
+export class ChainTxUnconfirmedError extends Error {
+  constructor(
+    readonly step: string,
+    readonly txHash: `0x${string}`,
+  ) {
+    super(
+      `${step} was sent (${txHash}) but we could not confirm it in time — it may still be mined; do not re-send until it is resolved`,
+    );
+    this.name = "ChainTxUnconfirmedError";
+  }
+}
+
+/**
+ * THE ESCROW FUNDING WAS SENT AND WE COULD NOT CONFIRM IT.
+ *
+ * {JobFundRevertedError}'s twin, and deliberately a different type: a revert means the money did
+ * not move and the job may be abandoned, while this means the escrow MAY be funded right now. Both
+ * book nothing — booking requires knowing — but only one of them may be described to a founder as
+ * a transfer that did not happen, and re-running a job on this one could fund the same escrow
+ * twice.
+ *
+ * `runJob` records it as a `fund`/`unconfirmed` event carrying the hash, which is where an
+ * operator starts when the question is "did job 7 take my 0.5 USDC?".
+ */
+export class JobFundUnconfirmedError extends Error {
+  constructor(
+    readonly step: "approve" | "fund",
+    readonly txHash: `0x${string}`,
+    readonly jobId: bigint,
+  ) {
+    super(
+      `the escrow funding for job ${jobId} was sent at the ${step} step (${txHash}) but we could not confirm it in time — it may still land. Nothing was booked; do not re-run this job until the transaction is resolved.`,
+    );
+    this.name = "JobFundUnconfirmedError";
+  }
+}
