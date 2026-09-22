@@ -1,10 +1,12 @@
 import { describe, expect, test, vi } from "vitest";
+import { CircleRequestError } from "../../src/adapters/circle/circleError";
 import {
   CircleTxFailedError,
   CircleTxTimeoutError,
   deterministicIdempotencyKey,
   submitAndConfirm,
 } from "../../src/adapters/circle/circleExec";
+import { publicErrorMessage } from "../../src/workflow/publicError";
 
 const INPUT = {
   walletId: "w1",
@@ -118,5 +120,78 @@ describe("submitAndConfirm", () => {
       submitAndConfirm(api, INPUT, { pollDelayMs: 0, sleep: async () => {} }),
     ).rejects.toThrow(/no tx id/);
     expect(api.getTransaction).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A SYNCHRONOUS rejection: Circle refused the request, so no transaction exists and nothing can
+ * have moved. Distinct from the two terminal/in-flight errors above, which are about a
+ * transaction Circle accepted — their semantics are untouched by this.
+ */
+describe("submitAndConfirm — a refusal says why", () => {
+  const FAKE_BEARER = "fake-bearer-AAAAAAAAAAAAAAAAAAAAAAAA";
+
+  function refusingApi() {
+    const rejection = new Error("Request failed with status code 400") as Error &
+      Record<string, unknown>;
+    rejection.response = {
+      status: 400,
+      data: {
+        code: 2,
+        message: "API parameter invalid",
+        errors: [{ location: "refId", message: "must be at most 100 characters" }],
+      },
+    };
+    // The config the SDK hangs on every axios error — api key and entity secret included.
+    rejection.config = { headers: { Authorization: `Bearer ${FAKE_BEARER}` } };
+    return {
+      createContractExecutionTransaction: vi.fn(async () => {
+        throw rejection;
+      }),
+      getTransaction: vi.fn(),
+    };
+  }
+
+  test("carries the status, code, message and errors[], plus our own field lengths", async () => {
+    const api = refusingApi();
+    const err = await submitAndConfirm(
+      api,
+      { ...INPUT, refId: "r".repeat(101) },
+      { pollDelayMs: 0, sleep: async () => {} },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(CircleRequestError);
+    expect(err.message).toContain("createContractExecutionTransaction");
+    expect(err.message).toContain("HTTP 400");
+    expect(err.message).toContain("code 2");
+    expect(err.message).toContain("API parameter invalid");
+    expect(err.message).toContain("[refId] must be at most 100 characters");
+    expect(err.message).toContain("walletId w1");
+    expect(err.message).toMatch(/refId 101 chars/);
+    expect(err.message).toMatch(/callData 10 chars/);
+    // Refused ⇒ no transaction to poll.
+    expect(api.getTransaction).not.toHaveBeenCalled();
+  });
+
+  test("never the api key, and the operator's sentence survives publicErrorMessage intact", async () => {
+    const api = refusingApi();
+    const err = await submitAndConfirm(api, INPUT, {
+      pollDelayMs: 0,
+      sleep: async () => {},
+    }).catch((e) => e);
+    expect(err.message).not.toContain(FAKE_BEARER);
+    expect(err.message).not.toContain("Bearer");
+    const shown = publicErrorMessage(err);
+    expect(shown).toContain("API parameter invalid");
+    expect(shown).toContain("[refId] must be at most 100 characters");
+  });
+
+  test("is NOT a CircleTxFailedError: nothing was accepted, so no key was burned", async () => {
+    const api = refusingApi();
+    const err = await submitAndConfirm(api, INPUT, {
+      pollDelayMs: 0,
+      sleep: async () => {},
+    }).catch((e) => e);
+    expect(err).not.toBeInstanceOf(CircleTxFailedError);
+    expect(err).not.toBeInstanceOf(CircleTxTimeoutError);
   });
 });

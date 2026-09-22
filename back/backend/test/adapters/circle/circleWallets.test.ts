@@ -102,6 +102,34 @@ describe("provisionCircleWallets — one SCA operator + one EOA pocket per agent
     }
   });
 
+  test("a REFUSED createWallets carries Circle's answer and the lengths we sent, never the key", async () => {
+    // The 2026-08-13 incident: a metadata NAME a few characters too long, answered with a bare
+    // "API parameter invalid" and no field. The lengths are what the operator needs.
+    const FAKE_BEARER = "fake-bearer-AAAAAAAAAAAAAAAAAAAAAAAA";
+    const rejection = new Error("Request failed with status code 400") as Error &
+      Record<string, unknown>;
+    rejection.response = { status: 400, data: { code: 2, message: "API parameter invalid" } };
+    rejection.config = { headers: { Authorization: `Bearer ${FAKE_BEARER}` } };
+    const { api } = mockApi();
+    (api.createWallets as ReturnType<typeof vi.fn>).mockRejectedValueOnce(rejection);
+    const err = await provisionCircleWallets(api as never, {
+      walletSetId: "ws-1",
+      blockchain: "ARC-TESTNET",
+      entityKey: "0x172B7952b0F711b8B372410E81d51Dcba7D4BB02:f251041a-4128-4674-9eab-eb6fb2503bd9",
+    }).then(
+      () => new Error("provision resolved, but createWallets was refused"),
+      (e: Error) => e,
+    );
+    expect(err.name).toBe("CircleRequestError");
+    expect(err.message).toContain("createWallets");
+    expect(err.message).toContain("HTTP 400");
+    expect(err.message).toContain("API parameter invalid");
+    expect(err.message).toMatch(/metadata name \d+ chars/);
+    expect(err.message).toMatch(/refId 79 chars/);
+    expect(err.message).not.toContain(FAKE_BEARER);
+    expect(err.message).not.toContain("Bearer");
+  });
+
   test("a response missing the wallet is a loud error, never a half-provisioned agent", async () => {
     const { api } = mockApi();
     (api.createWallets as ReturnType<typeof vi.fn>).mockResolvedValueOnce({

@@ -4,6 +4,7 @@ import { encodeFunctionData } from "viem";
 import { opsLog } from "../../observability/opsLog";
 import type { Address, Hex } from "../../types";
 import type { AgentkitSigner } from "../worldid/agentkitSigner";
+import { circleRequestError } from "./circleError";
 import type { SubmitAndConfirmOptions } from "./circleExec";
 import { submitAndConfirm } from "./circleExec";
 
@@ -207,13 +208,22 @@ export async function provisionCircleWallets(
   const label = (role: string) =>
     p.entityKey.length <= 40 ? `${role}:${p.entityKey}` : `${role}:${p.entityKey.slice(-12)}`;
   const create = async (accountType: "SCA" | "EOA", role: string): Promise<CircleWalletRef> => {
-    const res = await api.createWallets({
-      accountType,
-      blockchains: [p.blockchain],
-      count: 1,
-      walletSetId: p.walletSetId,
-      metadata: [{ name: label(role), refId: p.entityKey }],
-    });
+    const name = label(role);
+    const refId = p.entityKey;
+    const res = await api
+      .createWallets({
+        accountType,
+        blockchains: [p.blockchain],
+        count: 1,
+        walletSetId: p.walletSetId,
+        metadata: [{ name, refId }],
+      })
+      // The 2026-08-13 lesson, made permanent: a bare "API parameter invalid" here names no
+      // field, so the rejection carries Circle's answer plus the two lengths that have been
+      // at fault.
+      .catch((e: unknown) => {
+        throw circleRequestError(e, { call: "createWallets", refId, metadataName: name });
+      });
     const w = res.data?.wallets?.[0];
     if (!w?.id || !w?.address)
       throw new Error(
