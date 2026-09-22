@@ -7,6 +7,7 @@ import type { AgentkitSigner } from "../worldid/agentkitSigner";
 import { circleRequestError } from "./circleError";
 import type { SubmitAndConfirmOptions } from "./circleExec";
 import { submitAndConfirm } from "./circleExec";
+import { circleRefId } from "./circleRefId";
 
 /**
  * Tier-0 Circle DevC adapter (P1b) — docs/design/2026-08-03-tier0-circle-wallet-migration.md.
@@ -185,7 +186,7 @@ export async function activateCircleSca(
         args: [p.gatewayWallet as Address, 0n],
       }),
       idempotencySeed: `activate:${p.operatorWalletId}`,
-      refId: `${p.entityKey}:activate`,
+      refId: circleRefId([p.entityKey, "activate"]),
     },
     {
       ...p.confirm,
@@ -209,7 +210,7 @@ export async function provisionCircleWallets(
     p.entityKey.length <= 40 ? `${role}:${p.entityKey}` : `${role}:${p.entityKey.slice(-12)}`;
   const create = async (accountType: "SCA" | "EOA", role: string): Promise<CircleWalletRef> => {
     const name = label(role);
-    const refId = p.entityKey;
+    const refId = circleRefId([p.entityKey]);
     const res = await api
       .createWallets({
         accountType,

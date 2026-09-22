@@ -6,6 +6,7 @@ import {
   deterministicIdempotencyKey,
   submitAndConfirm,
 } from "../../src/adapters/circle/circleExec";
+import { CircleRefIdTooLongError } from "../../src/adapters/circle/circleRefId";
 import { publicErrorMessage } from "../../src/workflow/publicError";
 
 const INPUT = {
@@ -156,7 +157,7 @@ describe("submitAndConfirm — a refusal says why", () => {
     const api = refusingApi();
     const err = await submitAndConfirm(
       api,
-      { ...INPUT, refId: "r".repeat(101) },
+      { ...INPUT, refId: "r".repeat(100) },
       { pollDelayMs: 0, sleep: async () => {} },
     ).catch((e) => e);
     expect(err).toBeInstanceOf(CircleRequestError);
@@ -166,7 +167,7 @@ describe("submitAndConfirm — a refusal says why", () => {
     expect(err.message).toContain("API parameter invalid");
     expect(err.message).toContain("[refId] must be at most 100 characters");
     expect(err.message).toContain("walletId w1");
-    expect(err.message).toMatch(/refId 101 chars/);
+    expect(err.message).toMatch(/refId 100 chars/);
     expect(err.message).toMatch(/callData 10 chars/);
     // Refused ⇒ no transaction to poll.
     expect(api.getTransaction).not.toHaveBeenCalled();
@@ -183,6 +184,23 @@ describe("submitAndConfirm — a refusal says why", () => {
     const shown = publicErrorMessage(err);
     expect(shown).toContain("API parameter invalid");
     expect(shown).toContain("[refId] must be at most 100 characters");
+  });
+
+  test("an over-long refId never leaves the process: the exit is guarded too", async () => {
+    // Belt and braces for `circleRefId`'s "one rule, one place": a caller that hand-rolls a refId
+    // instead of building one is caught HERE, before Circle answers "API parameter invalid".
+    const api = {
+      createContractExecutionTransaction: vi.fn(async () => ({ data: { id: "tx-0" } })),
+      getTransaction: vi.fn(),
+    };
+    await expect(
+      submitAndConfirm(
+        api,
+        { ...INPUT, refId: "r".repeat(101) },
+        { pollDelayMs: 0, sleep: async () => {} },
+      ),
+    ).rejects.toThrow(CircleRefIdTooLongError);
+    expect(api.createContractExecutionTransaction).not.toHaveBeenCalled();
   });
 
   test("is NOT a CircleTxFailedError: nothing was accepted, so no key was burned", async () => {

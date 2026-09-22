@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Hex } from "../../types";
 import { withDeadline } from "../../util/deadline";
 import { circleRequestError } from "./circleError";
+import { assertCircleRefId } from "./circleRefId";
 import type { CircleWalletsApi } from "./circleWallets";
 
 /**
@@ -137,6 +138,9 @@ export async function submitAndConfirm(
   opts: SubmitAndConfirmOptions = {},
 ): Promise<{ circleTxId: string; txHash: Hex }> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // The exit guard: callers build their refId with `circleRefId`, and this is where a
+  // hand-rolled one is caught instead of coming back as "API parameter invalid".
+  if (input.refId !== undefined) assertCircleRefId(input.refId);
 
   const res = await withDeadline(
     timeoutMs,
