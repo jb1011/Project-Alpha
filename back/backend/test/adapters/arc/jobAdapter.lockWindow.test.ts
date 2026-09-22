@@ -274,7 +274,12 @@ test("a job send and a platform send from a DIFFERENT key do not block each othe
   expect(n.inLock(platform.address as Address)).toEqual(THE_WINDOW);
   expect(n.txs()).toHaveLength(0); // parked: the node has taken nothing yet
 
-  await expect(createJob(n)).resolves.toMatchObject({ jobId: 1n });
+  // The WHOLE resolved value, and the hash computed from the bytes the node took rather than
+  // accepted as whatever came back: `keccak256(raw)` is how a node names a transaction, so the
+  // test can say which one this call returned.
+  const created = await createJob(n);
+  expect(n.sent).toHaveLength(1);
+  expect(created).toEqual({ jobId: 1n, txHash: keccak256(n.sent[0]!) });
   expect(n.inLock(jobClient.address as Address)).toEqual(THE_WINDOW);
 
   n.releasePlatformSend();

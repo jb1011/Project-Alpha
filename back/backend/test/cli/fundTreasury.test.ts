@@ -161,11 +161,14 @@ async function fund(arc: ReturnType<typeof fakeArc>, usd = "2.00") {
   const block = logs.find((l) => l.startsWith("{\n"));
   return {
     stdout: logs.join("\n"),
+    // The shape the command prints, in full: the assertions below compare the WHOLE block, so a
+    // field added to the operator's output has to be accounted for here.
     payload: JSON.parse(block ?? "{}") as {
-      key?: string;
-      status?: string;
-      txHash?: string | null;
-      error?: string | null;
+      key: string;
+      requested: string;
+      status: string;
+      txHash: string | null;
+      error: string | null;
     },
   };
 }
@@ -212,8 +215,14 @@ test("a CLI fund leaves the same trail the API path does: submitted, then funded
     treasury: TREASURY,
     amount: 2_000_000n,
   });
-  // The operator is told the hash and the verdict, not just "done".
-  expect(payload).toMatchObject({ key: KEY, status: "funded", txHash: TX });
+  // The operator is told the hash and the verdict, not just "done" — and nothing else.
+  expect(payload).toEqual({
+    key: KEY,
+    requested: "2.00",
+    status: "funded",
+    txHash: TX,
+    error: null,
+  });
   expect(process.exitCode).toBeUndefined();
 });
 
@@ -233,7 +242,15 @@ test("a broadcast that never answers is RECORDED, not thrown as a raw RPC error"
   expect(row.error).toContain("Do not retry");
   expect(row.error).not.toContain("SECRETKEY123456");
   expect(stdout).not.toContain("SECRETKEY123456");
-  expect(payload.error).toBe(row.error);
+  expect(payload).toEqual({
+    key: KEY,
+    requested: "2.00",
+    status: "bound",
+    txHash: null,
+    // The row's sentence and the printed one are the same string, or the operator and the wizard
+    // are reading two different accounts of one transfer.
+    error: row.error,
+  });
   // The submission stands, with its hash: the next attempt (or the boot sweep) resolves it by
   // receipt. ⚠ And no `failed` row, which is what made a retry double-send before #140.
   expect(fundEvents()).toEqual([`submitted:${TX}`]);
