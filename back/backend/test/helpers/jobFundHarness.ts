@@ -93,6 +93,11 @@ export interface UsdcJobNodeOptions {
   /** Mine the next `approve` as REVERTED: the allowance is never set. */
   revertApprove?: boolean;
   /**
+   * What an `approve` actually SETS, whatever it asked for — a mis-set allowance, the state the
+   * fund's own read of the chain is there to catch before anything is sent.
+   */
+  approveSets?: bigint;
+  /**
    * Zero the allowance in the instant between the fund's pre-flight and its inclusion — the
    * incident's shape, and the one thing only a receipt can report. The steal happens once.
    */
@@ -157,7 +162,7 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       const [spender, amount] = decoded.args as [Address, bigint];
       if (opts.revertApprove) return { call: "approve", from, status: "reverted" };
       // SETS, never adds — the rule the two concurrent jobs fell over.
-      allowances.set(pairKey(from, spender), amount);
+      allowances.set(pairKey(from, spender), opts.approveSets ?? amount);
       return { call: "approve", from, status: "success" };
     }
     if (to.toLowerCase() !== opts.jobContract.toLowerCase())
@@ -307,7 +312,7 @@ export interface BookedOutflow {
 }
 
 export function jobFundHarness(
-  opts: { revertApprove?: boolean; stealAllowanceOnFund?: boolean } = {},
+  opts: { revertApprove?: boolean; stealAllowanceOnFund?: boolean; approveSets?: bigint } = {},
 ) {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = OFF");
@@ -321,6 +326,7 @@ export function jobFundHarness(
     budget: BUDGET,
     revertApprove: opts.revertApprove,
     stealAllowanceOnFund: opts.stealAllowanceOnFund,
+    approveSets: opts.approveSets,
   });
 
   const adapter = new JobAdapter({

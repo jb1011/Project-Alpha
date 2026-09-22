@@ -66,6 +66,10 @@ const chain = defineChain({
 });
 
 const TRUE_WORD = `0x${"0".repeat(63)}1` as Hex;
+/** `allowance(address,address)` — the one read the fund step makes before it spends the grant. */
+const ALLOWANCE_SELECTOR = "0xdd62ed3e";
+/** What this node answers that read with: more than any budget asked for below. */
+const ALLOWANCE_WORD = `0x${"f".repeat(64)}` as Hex;
 /** THE WINDOW: two calls, in this order, and nothing else. */
 const THE_WINDOW = ["eth_getTransactionCount", "eth_sendRawTransaction"];
 
@@ -106,8 +110,14 @@ function node(opts: { holdPlatformSend?: boolean } = {}) {
         return "0x1";
       case "eth_estimateGas":
         return "0xdbba0";
-      case "eth_call":
+      case "eth_call": {
+        const [{ to, data }] = params as [{ to?: Address; data?: Hex }];
+        // The allowance read happens OUTSIDE the send lock, like every other pre-flight here —
+        // which is what the in-lock assertions below go on proving.
+        if (to?.toLowerCase() === USDC.toLowerCase() && data?.startsWith(ALLOWANCE_SELECTOR))
+          return ALLOWANCE_WORD;
         return TRUE_WORD;
+      }
       case "eth_getTransactionCount": {
         const address = ((params as string[])[0] ?? "").toLowerCase();
         return `0x${(accepted.get(address) ?? 0).toString(16)}`;
