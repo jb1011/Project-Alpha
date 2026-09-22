@@ -103,9 +103,11 @@ test("operatorTransferUsdc passes an explicit gas (skips the fee-fielded estimat
   assertExplicitGas(operatorWrite.mock.calls[0]![0]);
 });
 
-test("fundTreasury passes an explicit gas (same footgun class)", async () => {
+test("a treasury top-up passes an explicit gas (same footgun class)", async () => {
   const { adapter, managerPrepare, sent } = makeAdapter();
-  const hash = await adapter.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n });
+  const hash = await adapter.confirmFundTreasury(
+    await adapter.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n }),
+  );
   expect(hash).toBe(FAKE_HASH);
   // The gas is explicit in what is PREPARED, so viem never estimates it...
   const prepared = managerPrepare.mock.calls[0]![0] as { gas?: bigint; to?: Address };

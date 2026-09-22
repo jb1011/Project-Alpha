@@ -2,7 +2,7 @@
  * R1 (Critical, 2026-09-17 review): the adapter is the only layer that knows whether a hash
  * exists, so it is the layer that has to say so.
  *
- * `fundTreasury` simulates, SENDS, and then awaits the receipt. viem rejects a receipt-poll
+ * A treasury top-up simulates, SENDS, and then awaits the receipt. viem rejects a receipt-poll
  * failure verbatim (`waitForTransactionReceipt`'s catch-all `emit.reject(err)`), so the identical
  * `HttpRequestError{status:429}` reaches the saga from both sides of the broadcast — and the old
  * public sentence said "Nothing was sent" for both. With the wizard's new Retry button that
@@ -69,8 +69,12 @@ function makeAdapter() {
   };
 }
 
-const fund = (a: ArcAdapter) =>
-  a.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1_000_000n });
+/** A treasury top-up, both halves: broadcast, then await the receipt — which is what the saga and
+ *  the CLI's fund door each do, with their own recording in between. */
+const fund = async (a: ArcAdapter) =>
+  a.confirmFundTreasury(
+    await a.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1_000_000n }),
+  );
 
 test("a 429 during the RECEIPT WAIT becomes BroadcastUnconfirmedError carrying the hash", async () => {
   const { adapter, waitForTransactionReceipt } = makeAdapter();

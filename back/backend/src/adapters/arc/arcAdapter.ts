@@ -265,7 +265,7 @@ export class ArcAdapter {
    * gas, AND its result is the gas limit we send with — one node round-trip doing both jobs, where
    * an `eth_call` preflight had viem execute the transaction a second time to estimate.
    *
-   * NOT for signer-direct calls: fundTreasury (a plain USDC transfer) and the liveRunner gas seeds
+   * NOT for signer-direct calls: the treasury top-up (a plain USDC transfer) and the liveRunner gas seeds
    * are not role-gated and must keep coming straight from the signing key.
    */
   private async sendManagerCall(p: {
@@ -338,7 +338,7 @@ export class ArcAdapter {
   /**
    * {sendManagerCall} + await the receipt — the tail four of the five relayed sites repeat.
    *
-   * Goes through the same `confirmed()` as `fundTreasury` (R1). A rule that told the truth about
+   * Goes through the same `confirmed()` as `confirmFundTreasury` (R1). A rule that told the truth about
    * one receipt and not about the other four would be the next review finding: a bind, a metadata
    * write and a policy execute all have a post-broadcast window, and a caller that is told
    * "nothing was sent" about a mined bind resumes into a state it cannot explain.
@@ -880,13 +880,13 @@ export class ArcAdapter {
     return this.confirmed(txHash, "fundTreasury");
   }
 
-  /**
-   * Broadcast + confirm, for callers with nothing to persist between the two (the CLI, the anvil
-   * integration tests). The SAGA must not use this: it has to record the hash in between.
-   */
-  async fundTreasury(p: { usdc: Address; treasury: Address; amount: bigint }): Promise<Hex> {
-    return this.confirmFundTreasury(await this.broadcastFundTreasury(p));
-  }
+  /* There is deliberately NO broadcast-and-confirm convenience here any more.
+   *
+   * One existed for "callers with nothing to persist between the two", and the last such caller was
+   * the CLI's fund door — which did have something to persist and simply was not doing it: no
+   * `submitted` row, so a crash inside the receipt wait lost the hash of a transfer that had already
+   * happened (the gap #140 closed for the API path). It now funds through the same saga
+   * (`cli/index.ts`), and a caller that wants both halves writes the hash down between them. */
 
   /**
    * Await a broadcast transaction's receipt and insist it SUCCEEDED.

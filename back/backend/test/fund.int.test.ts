@@ -73,14 +73,16 @@ beforeAll(async () => {
     account: manager,
     chain: anvilChain,
   });
-  // A hash is not a balance: fundTreasury estimates gas against mined state, and a newer
+  // A hash is not a balance: the top-up estimates gas against mined state, and a newer
   // anvil no longer guarantees the mint is in a block by the time writeContract returns.
   await pub.waitForTransactionReceipt({ hash: mintHash });
 }, 40_000);
 afterAll(() => anvil?.stop());
 
-test("fundTreasury transfers USDC to the treasury vault", async () => {
-  await adapter.fundTreasury({ usdc: stack.usdc, treasury, amount: 2_000_000n });
+test("a treasury top-up transfers USDC to the treasury vault", async () => {
+  await adapter.confirmFundTreasury(
+    await adapter.broadcastFundTreasury({ usdc: stack.usdc, treasury, amount: 2_000_000n }),
+  );
   const bal = await pub.readContract({
     address: stack.usdc,
     abi: mockUsdcAbi,

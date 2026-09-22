@@ -176,10 +176,6 @@ const sendPaths: { name: string; run: (a: ArcAdapter) => Promise<unknown> }[] = 
     name: "broadcastFundTreasury",
     run: (a) => a.broadcastFundTreasury({ usdc: USDC, treasury: TREASURY, amount: 500_000n }),
   },
-  {
-    name: "fundTreasury",
-    run: (a) => a.fundTreasury({ usdc: USDC, treasury: TREASURY, amount: 1n }),
-  },
   { name: "sendNativeAsPlatform", run: (a) => a.sendNativeAsPlatform(TREASURY, 10n) },
 ];
 
