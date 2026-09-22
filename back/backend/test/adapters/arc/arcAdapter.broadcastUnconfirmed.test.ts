@@ -48,7 +48,13 @@ function makeAdapter() {
     sendRawTransaction,
   } as unknown as PublicClient;
   const managerWallet = {
-    account: { address: "0x000000000000000000000000000000000000000B", signTransaction },
+    // `source: "privateKey"` is what viem's `privateKeyToAccount` reports, and what `localSend.ts`
+    // requires before it will sign inside the send lock.
+    account: {
+      address: "0x000000000000000000000000000000000000000B",
+      source: "privateKey",
+      signTransaction,
+    },
     chain: { id: 1 },
     prepareTransactionRequest,
   } as unknown as WalletClient;

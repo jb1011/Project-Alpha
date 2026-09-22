@@ -25,8 +25,9 @@ export class ApiError extends Error {
  * A TRANSACTION WAS BROADCAST AND WE DO NOT KNOW WHAT HAPPENED TO IT.
  *
  * The single most dangerous thing this system can get wrong about money, and until the 2026-09-17
- * review it got it wrong by default. `ArcAdapter.fundTreasury` sends the transfer and THEN awaits
- * the receipt, and viem rejects a receipt-poll failure verbatim — so the very same
+ * review it got it wrong by default. A treasury top-up sends the transfer
+ * (`ArcAdapter.broadcastFundTreasury`, or the saga's own sign → persist → send) and THEN awaits the
+ * receipt, and viem rejects a receipt-poll failure verbatim — so the very same
  * `HttpRequestError{status:429}` that means "the broadcast was refused" also arrives *after* a
  * successful broadcast. The old public message said "Nothing was sent" in both worlds, and with
  * the wizard's new Retry button that invited a SECOND transfer of platform funds (uncounted by the

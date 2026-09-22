@@ -71,6 +71,19 @@ export function prepareLocalTx(
 }
 
 /**
+ * What an account has to BE for its signature to belong inside the lock: viem's
+ * `privateKeyToAccount`, whose `signTransaction` is arithmetic over a key already in this process.
+ *
+ * viem 2.52 is explicit about this (`accounts/privateKeyToAccount.ts`: the returned object spreads
+ * `toAccount(...)` and then sets `source: \'privateKey\'`), and just as explicit about the other
+ * side: `accounts/toAccount.ts` stamps `source: \'custom\'` on anything built from a custom signer,
+ * which is what an enclave-backed account (`@turnkey/viem`) is. `hdKeyToAccount` says `\'hd\'` —
+ * also an in-process key, but this repository builds no account that way, so it is not on the
+ * allowlist rather than being assumed equivalent.
+ */
+const IN_PROCESS_ACCOUNT_SOURCE = "privateKey";
+
+/**
  * The account's own `signTransaction`, or a refusal naming the caller.
  *
  * STRAIGHT TO THE ACCOUNT rather than through `walletClient.signTransaction`, which asks the node
@@ -85,7 +98,11 @@ export function localSigner(
 ): (request: PreparedLocalTx & { nonce: number }) => Promise<Hex> {
   const w = wallet as LocalWallet;
   const sign = w.account?.signTransaction;
-  if (!sign)
+  // ⚠ THE PRESENCE OF `signTransaction` PROVES NOTHING. Every remote signer has one — that is the
+  // point of viem's account interface — and its version is a network round trip, which inside the
+  // lock is paid for by every send from this key behind it. So the account must SAY it is an
+  // in-process key, and only `privateKeyToAccount` does.
+  if (!sign || (w.account as { source?: string } | undefined)?.source !== IN_PROCESS_ACCOUNT_SOURCE)
     throw new Error(
       `${who} cannot sign locally — a remote signer would put a network call inside the send lock`,
     );

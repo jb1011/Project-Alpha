@@ -14,8 +14,10 @@
  *  - a transaction with no explicit nonce, which is a nonce viem read outside our ledger, where the
  *    floor that protects us from a stale node answer can never see it.
  *
- * So this file fails for any job/recorder send that forgets the chokepoint, including one added
- * later. No chain: the node is a counter per address, the receipt is a resolved promise.
+ * So this file fails for any job/recorder send that forgets the chokepoint — for every send in the
+ * `sendPaths` table below, which is what a new send path has to be ADDED TO to be covered. The
+ * table is the guard; a method that never appears in it is not watched by this file.
+ * No chain: the node is a counter per address, the receipt is a resolved promise.
  *
  * ⚠ NOT COVERED, deliberately: `setBudget`, `submit` and `transferUsdc` take the wallet from their
  * CALLER (the per-agent Turnkey enclave, or Circle). Those accounts sign over a network, and a
@@ -61,6 +63,9 @@ function makeAdapters() {
     ({
       account: {
         address,
+        // The in-process key `localSend.ts` requires: a remote signer's `signTransaction` is a
+        // network call, and the lock must not be held across one.
+        source: "privateKey",
         // Signing is offline and inside the lock — and it is where the nonce becomes part of the
         // transaction, so this is one of the two places the invariant has to hold.
         signTransaction: vi.fn(async (r: { nonce?: number }) => {

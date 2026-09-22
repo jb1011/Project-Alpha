@@ -200,8 +200,8 @@ export function buildCli(
    * and write nothing until both had returned. So there was no `submitted` row and no hash on disk
    * before the wait, which is precisely the loss #140 removed from the API path: a crash, a deploy
    * or a lost `eth_sendRawTransaction` response inside that wait left a transfer that had happened
-   * and no record of it anywhere. It also marked the entity `funded` on a hash whose receipt it had
-   * only awaited, not checked for a revert.
+   * and no record of it anywhere. Nor an S5 outflow entry, and nothing serialised its send against
+   * the platform key's other transactions.
    *
    * So it now goes through the SAME runner and saga as the wizard's `POST /entities/:id/fund`
    * ({fundRunner}), and every rule that path has comes with it: resolve-before-send, sign → persist
@@ -239,7 +239,13 @@ export function buildCli(
       // so it acts AS the owner of the entity it was pointed at — which is what the runner's
       // ownership check compares against. A CLI-minted entity may have no tenant at all
       // (`create-entity` records none), and the check is an equality, so the value to pass is
-      // whatever the row holds. The per-tenant quota then sums that same tenant's funded events.
+      // whatever the row holds.
+      //
+      // WHICH CAPS BIND, exactly: for a row WITH a tenant, all three — the per-call maximum, that
+      // tenant's lifetime quota and the platform outflow ceiling. For a TENANT-LESS row the quota
+      // sums nothing (`sumFundedByTenant(null)` matches no row, so it reads 0), leaving the
+      // per-call maximum and the ceiling as the two that bind. A row with no tenant is an operator
+      // artefact of this door; whether it should have one is not this command's question.
       runner.fund({ id: key, tenantId: rec.ownerTenantId as string, amount: usdToUnits(usd) });
       await runner.settled();
       const after = ctx.repo.findByIdempotencyKey(key)!;
