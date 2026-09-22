@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { decodeFunctionData, parseAbi } from "viem";
 import { describe, expect, test, vi } from "vitest";
 import { deterministicIdempotencyKey } from "../../src/adapters/circle/circleExec";
+import { CIRCLE_REF_ID_MAX, CircleRefIdTooLongError } from "../../src/adapters/circle/circleRefId";
 import { BridgeInFlightError, runCircleBridge } from "../../src/payments/circleBridge";
 import type { CircleBridgeDeps } from "../../src/payments/circleBridge";
 import { SqliteBridgeLegRepository } from "../../src/persistence/bridgeLegRepository";
@@ -29,6 +30,7 @@ function makeApi(overrides?: {
     contractAddress: string;
     callData: `0x${string}`;
     idempotencyKey: string;
+    refId?: string;
   }[] = [];
   const polls: string[] = [];
   const served = new Map<string, number>();
@@ -86,6 +88,29 @@ function makeDeps(
 }
 
 describe("runCircleBridge", () => {
+  test("every leg refId fits Circle's 100-character ceiling for a wizard-length entity key", async () => {
+    const KEY = "0x172B7952b0F711b8B372410E81d51Dcba7D4BB02:f251041a-4128-4674-9eab-eb6fb2503bd9";
+    const legs = makeLegs();
+    const api = makeApi();
+    await runCircleBridge(makeDeps(api, legs, { entityKey: KEY }), 1_000_000n);
+    expect(api.submits.map((s) => s.refId)).toEqual([
+      `${KEY}:fund_operator`,
+      `${KEY}:approve`,
+      `${KEY}:deposit_for`,
+    ]);
+    for (const s of api.submits)
+      expect((s.refId ?? "").length).toBeLessThanOrEqual(CIRCLE_REF_ID_MAX);
+  });
+
+  test("an entity key too long to make a legal refId is refused locally, before any leg is sent", async () => {
+    const legs = makeLegs();
+    const api = makeApi();
+    await expect(
+      runCircleBridge(makeDeps(api, legs, { entityKey: "k".repeat(95) }), 1_000_000n),
+    ).rejects.toThrow(CircleRefIdTooLongError);
+    expect(api.createContractExecutionTransaction).not.toHaveBeenCalled();
+  });
+
   test("happy path: three legs in order, real calldata, confirmed hashes returned", async () => {
     const legs = makeLegs();
     const api = makeApi();

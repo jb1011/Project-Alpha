@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { Hex } from "../../types";
 import { withDeadline } from "../../util/deadline";
+import { circleRequestError } from "./circleError";
+import { assertCircleRefId } from "./circleRefId";
 import type { CircleWalletsApi } from "./circleWallets";
 
 /**
@@ -136,18 +138,33 @@ export async function submitAndConfirm(
   opts: SubmitAndConfirmOptions = {},
 ): Promise<{ circleTxId: string; txHash: Hex }> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // The exit guard: callers build their refId with `circleRefId`, and this is where a
+  // hand-rolled one is caught instead of coming back as "API parameter invalid".
+  if (input.refId !== undefined) assertCircleRefId(input.refId);
 
   const res = await withDeadline(
     timeoutMs,
     () =>
-      api.createContractExecutionTransaction({
-        walletId: input.walletId,
-        contractAddress: input.contractAddress,
-        callData: input.callData,
-        fee: { type: "level", config: { feeLevel: "MEDIUM" } },
-        idempotencyKey: deterministicIdempotencyKey(input.idempotencySeed),
-        refId: input.refId,
-      }),
+      api
+        .createContractExecutionTransaction({
+          walletId: input.walletId,
+          contractAddress: input.contractAddress,
+          callData: input.callData,
+          fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+          idempotencyKey: deterministicIdempotencyKey(input.idempotencySeed),
+          refId: input.refId,
+        })
+        // A REFUSAL, not a failure: Circle never accepted a transaction, so nothing moved and no
+        // idempotency key was burned. Circle's own words plus our field lengths, because
+        // "API parameter invalid" on its own has twice cost a day (see circleError.ts).
+        .catch((e: unknown) => {
+          throw circleRequestError(e, {
+            call: "createContractExecutionTransaction",
+            walletId: input.walletId,
+            refId: input.refId,
+            callData: input.callData,
+          });
+        }),
     () =>
       new Error(
         `circle createContractExecutionTransaction timed out after ${timeoutMs}ms — safe to retry (deterministic idempotency key replays)`,
