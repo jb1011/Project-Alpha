@@ -16,9 +16,9 @@ legally required, KYC'd controller-of-record — see the legal model note below.
 - **`LegalManager`** (upgradeable, beacon proxy, one per agent) — holds the operating-agreement hash,
   links the identity, and enforces rule amendments + dissolution via a timelocked, guardian-vetoable
   process.
-- **`AgentTreasury`** (immutable, one per agent) — the non-custodial vault: holds USDC and enforces
+- **`AgentTreasury`** (immutable, one per agent) — the agent's treasury vault: holds USDC and enforces
   the on-chain spending policy (rolling cap + allowlist).
-- **Operator key** — the agent's bound `agentWallet`, a **non-custodial Turnkey enclave key** that
+- **Operator key** — the agent's bound `agentWallet`, a **Turnkey enclave key** that
   *signs* spends but never holds custody; the human is the on-chain **guardian/controller**.
 - Reuses Arc's live **ERC-8004** (identity/reputation) and **ERC-8183** (agent jobs).
 

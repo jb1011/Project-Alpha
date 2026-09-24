@@ -8,7 +8,7 @@
 | [ENS](https://docs.ens.domains/) | ENSIP-10 wildcard, EIP-3668 CCIP-Read, ENSIP-25 agent registration |
 | ERC-8004 / ERC-8183 | Identity, reputation, jobs on Arc |
 | [The Graph](https://thegraph.com/) | Arc testnet subgraph (minimal today) |
-| [Turnkey](https://www.turnkey.com/) | Passkey rooted, non custodial operator keys |
+| [Turnkey](https://www.turnkey.com/) | Passkey rooted operator keys in an enclave |
 | [Circle](https://www.circle.com/) | USDC, Gateway, optional MPC smart accounts |
 | [doola](https://www.doola.com/) | Wyoming company formation API |
 | Next.js 16 | `interface/` |
