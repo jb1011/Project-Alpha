@@ -7,6 +7,56 @@ export interface AnvilHandle {
 }
 
 /**
+ * Does something on this port already answer JSON-RPC?
+ *
+ * One `eth_chainId`, the cheapest question a node will answer. A refused connection (nothing
+ * there) is the answer we want, so a throw is `false` — this asks "is the port TAKEN", and the
+ * only way to say yes is to have been answered.
+ */
+async function portAnswers(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How long a port may go on answering after we stopped the chain that was on it.
+ *
+ * `stop()` sends SIGTERM and returns immediately, and files like `helpers/anvilJob.ts` start one
+ * chain per test on the same port — so the port is routinely still answering for a few
+ * milliseconds when the next `startAnvil` asks. This grace is for that, and only that: a chain
+ * nobody stopped never goes quiet, so it still hits the refusal below.
+ */
+const PORT_RELEASE_TIMEOUT_MS = 5_000;
+
+/**
+ * REFUSE A PORT SOMEBODY ELSE IS ON.
+ *
+ * A second anvil cannot bind a taken port, and the readiness poll below cannot tell the chain it
+ * asked for from the one that was already there — so without this check a stale process left by
+ * another session silently became every later test's chain, complete with its old contracts,
+ * balances and nonces. Green tests about state nobody wrote is the one outcome worse than a
+ * failing suite, so this is loud and it happens BEFORE anything is spawned.
+ */
+async function requireFreePort(port: number): Promise<void> {
+  const deadline = Date.now() + PORT_RELEASE_TIMEOUT_MS;
+  while (await portAnswers(port)) {
+    if (Date.now() > deadline)
+      throw new Error(
+        `startAnvil: something is already listening on 127.0.0.1:${port} and answering eth_chainId. Refusing to spawn: a second anvil cannot take the port, so these tests would silently run against a chain this suite did not start. Stop the leftover process (or free the port) and run again.`,
+      );
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+/**
  * Spawn a local anvil and resolve once it is listening. Caller must stop() in afterAll.
  *
  * A FRESH CHAIN FORGETS EVERY NONCE, SO THIS PROCESS HAS TO FORGET ITS FLOORS. The send lock keeps
@@ -20,7 +70,8 @@ export interface AnvilHandle {
  * the node is the only authority. Resetting here covers every anvil-based file at once, which is
  * why it lives in the spawner rather than in each `beforeAll`.
  */
-export function startAnvil(port = 8545): Promise<AnvilHandle> {
+export async function startAnvil(port = 8545): Promise<AnvilHandle> {
+  await requireFreePort(port);
   return new Promise((resolvePromise, reject) => {
     const proc: ChildProcess = spawn("anvil", ["--port", String(port), "--silent"], {
       stdio: ["ignore", "pipe", "pipe"],

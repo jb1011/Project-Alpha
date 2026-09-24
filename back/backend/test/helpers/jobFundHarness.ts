@@ -36,7 +36,7 @@ import { type PrivateKeyAccount, privateKeyToAccount } from "viem/accounts";
 import { iErc8183JobAbi } from "../../src/abis/generated";
 import { JobAdapter } from "../../src/adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../../src/adapters/arc/reputationAdapter";
-import { ChainTxRevertedError } from "../../src/errors";
+import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../../src/errors";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { JobRunner } from "../../src/jobs/jobRunner";
 import { type RecoverOutcome, recoverEscrow } from "../../src/jobs/refund";
@@ -434,6 +434,16 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
     /** What `sender` put on the wire, in order. */
     sendsFrom: (sender: Address) =>
       sends.filter((s) => s.from.toLowerCase() === sender.toLowerCase()),
+    /**
+     * The hashes of the sends that performed `call`, in order.
+     *
+     * `actions` and `sends` are appended together for every accepted transaction, so the i-th of
+     * one is the i-th of the other. A test that wants "the two fund hashes" should say that rather
+     * than count positions in `sends`: once a saga sends anything else (a refund, say), a position
+     * is a fact about interleaving rather than about the transaction it meant to name.
+     */
+    hashesOf: (call: NodeAction["call"]) =>
+      sends.filter((_, i) => actions[i]?.call === call).map((s) => s.hash),
     allowanceOf,
     escrowOf: (jobId: bigint) => escrow.get(jobId.toString()) ?? 0n,
     balanceOf,
@@ -521,22 +531,14 @@ export function jobFundHarness(
      *  - `worker` (the default) — the deliverable step throws, which is the shape the funding
      *    tests were written against and what keeps them measuring the funding boundary alone.
      *  - `submit` — the provider's remote-signed submit reverts on chain.
+     *  - `submit-unconfirmed` — the submit was SENT and its receipt never came: a different fact,
+     *    and the trail has to keep it apart from a revert (`errors.ts`).
      *  - `complete` — submit lands and the evaluator's complete reverts instead.
      */
-    failAt?: "worker" | "submit" | "complete";
+    failAt?: "worker" | "submit" | "submit-unconfirmed" | "complete";
     /** Mine the FIRST of the recovery's rejects as reverted: the escrow stays put, with a
      *  receipt. The attempt after it is allowed to work, which is what the next boot does. */
     revertReject?: boolean;
-    /**
-     * WIRE THE ESCROW RECOVERY INTO THE SAGA, as `jobs/composition.ts` always does in production.
-     *
-     * OFF by default, and deliberately: the funding tests stop their saga with a worker that
-     * throws, and a recovery firing there would rewrite what they measure (the escrow after a
-     * fund) into something else (the escrow after a refund). The tests that are ABOUT the
-     * recovery turn it on; what holds PRODUCTION to wiring it is
-     * `test/jobs/composition.test.ts`, not a default in a test helper.
-     */
-    recoverEscrow?: boolean;
     /** The chain's clock in seconds, shared by the node and the recovery's expiry decision. */
     now?: () => number;
   } = {},
@@ -626,6 +628,8 @@ export function jobFundHarness(
         // that, a refund decision would read Funded for a job the contract has at Submitted.
         if (opts.failAt === "submit")
           throw new ChainTxRevertedError("submit", SUBMIT_REVERT_TX_HASH);
+        if (opts.failAt === "submit-unconfirmed")
+          throw new ChainTxUnconfirmedError("submit", SUBMIT_REVERT_TX_HASH);
         node.markSubmitted(jobId);
         return `0x${"cc".repeat(32)}` as Hex;
       },
@@ -635,7 +639,9 @@ export function jobFundHarness(
       },
     }),
     sweepToTreasury: false,
-    recoverEscrow: opts.recoverEscrow ? refundJob : undefined,
+    // ALWAYS wired, as `jobs/composition.ts` wires it: a funded job that dies gets its escrow
+    // back, and a harness that could leave that out would be measuring a product we do not ship.
+    recoverEscrow: refundJob,
   });
 
   /** The composition's `runJob`: the saga, serialised per ENTITY. */
@@ -645,7 +651,7 @@ export function jobFundHarness(
   const runner = new JobRunner({
     jobs,
     runJob: (input) => runJob(input),
-    recoverEscrow: opts.recoverEscrow ? refundJob : undefined,
+    recoverEscrow: refundJob,
   });
 
   /** A bound agent plus a job already on-chain at `created`, ready for the funding step. */
@@ -655,6 +661,12 @@ export function jobFundHarness(
     jobId: bigint;
     /** When the on-chain job expires, in seconds. Default: far beyond any test's clock. */
     expiredAt?: bigint;
+    /**
+     * The job's on-chain EVALUATOR. Defaults to this harness's evaluator, which is the ordinary
+     * case; pass another address for the job created before the evaluator key existed, whose
+     * evaluator is the client and which no key of ours may reject.
+     */
+    evaluator?: Address;
   }) => {
     seedBoundEntity(entities, p.entityKey, { operator: FAKE_PROVIDER_ADDRESS });
     // The contract's side of the same job, at Open with its budget set — the state a real
@@ -663,7 +675,7 @@ export function jobFundHarness(
       id: p.jobId,
       client: jobClientAccount.address as Address,
       provider: FAKE_PROVIDER_ADDRESS,
-      evaluator: evaluatorAddress,
+      evaluator: p.evaluator ?? evaluatorAddress,
       description: "demo",
       budget: BUDGET,
       expiredAt: p.expiredAt ?? DEFAULT_EXPIRES_AT,
@@ -677,7 +689,9 @@ export function jobFundHarness(
       ownerTenantId: undefined,
       status: "created",
       clientAddress: jobClientAccount.address as Address,
-      evaluatorAddress,
+      // The ROW's evaluator is the job's, not this process's — they differ exactly in the case
+      // the recovery has to notice.
+      evaluatorAddress: p.evaluator ?? evaluatorAddress,
       providerAddress: FAKE_PROVIDER_ADDRESS,
       budgetAmount: BUDGET.toString(),
       description: "demo",

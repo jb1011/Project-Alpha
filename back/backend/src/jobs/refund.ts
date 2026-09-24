@@ -7,8 +7,9 @@
  * we shipped could retrieve it.
  *
  * The contract offers two ways out, and each is gated on facts only the chain has:
- *   `reject(jobId, reason, "")` — the CLIENT may reject an Open job, the EVALUATOR a Funded or
- *      Submitted one. Either refunds the client; the job ends Rejected.
+ *   `reject(jobId, reason, "")` — the CLIENT may reject an Open job, and THE JOB'S OWN EVALUATOR
+ *      (pinned at creation, not whichever evaluator key we hold today) a Funded or Submitted one.
+ *      Either refunds the client; the job ends Rejected.
  *   `claimRefund(jobId)`       — ANYONE may expire a Funded or Submitted job once `expiredAt` has
  *      passed. The refund goes to the client whoever sends it; the job ends Expired.
  *
@@ -25,7 +26,7 @@
  * `escrowed`, so the next boot tries again.
  */
 
-import { type Hex, keccak256, stringToBytes } from "viem";
+import { type Address, type Hex, keccak256, stringToBytes } from "viem";
 import type { JobAdapter } from "../adapters/arc/jobAdapter";
 import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../errors";
 import type { JobRepository } from "./jobRepository";
@@ -96,8 +97,9 @@ export interface RecoverEscrowDeps {
  *
  * By chain status:
  *   Open (0)              nothing escrowed        → `escrow_state = 'none'`,     no transaction
- *   Funded (1)            evaluator configured?   → `reject` as the evaluator
- *   Submitted (2)         else past `expiredAt`?  → `claimRefund` as the client
+ *   Funded (1)            our key IS this job's   → `reject` as the evaluator
+ *   Submitted (2)           evaluator?
+ *                         else past `expiredAt`?  → `claimRefund` as the client
  *                         else                    → `escrow_state = 'escrowed'`, no transaction
  *   Completed (3)         paid to the provider    → `escrow_state = 'released'`, no transaction
  *   Rejected (4)          refunded by someone     → `escrow_state = 'refunded'`, refund hash NULL
@@ -124,7 +126,7 @@ export async function recoverEscrow(d: RecoverEscrowDeps, jobKey: string): Promi
       return settle(d, jobKey, "refunded", null, { outcome: "refunded-elsewhere" });
     case JobStatusOnChain.funded:
     case JobStatusOnChain.submitted:
-      return refund(d, jobKey, jobId, chain.expiredAt);
+      return refund(d, jobKey, jobId, chain);
     default:
       // A status we do not model: refuse to act rather than send a transaction on a guess.
       return { outcome: "unknown-status", status: chain.status };
@@ -136,27 +138,30 @@ async function refund(
   d: RecoverEscrowDeps,
   jobKey: string,
   jobId: bigint,
-  expiredAt: bigint,
+  chain: { expiredAt: bigint; evaluator: Address },
 ): Promise<RecoverOutcome> {
+  // ⚠ THE RIGHT TO REJECT BELONGS TO THE JOB'S EVALUATOR, not to whoever holds an evaluator key.
+  // The contract pins the evaluator at creation, so a job created before this key was configured
+  // names the CLIENT (`jobs/composition.ts` falls back to it) — and a reject from any other
+  // address reverts. Asking only "do we have a key" would therefore have sent a doomed
+  // transaction on every boot, for ever, while the expiry path below sat unused.
   const evaluator = d.job.evaluatorWallet;
-  // ⚠ KNOWN EDGE, not an oversight: this asks whether THIS PROCESS has an evaluator key, not
-  // whether that key is the evaluator OF THIS JOB. A job created before the key was configured
-  // carries the client as its evaluator, so a reject of it reverts — recorded as `refund-failed`,
-  // escrow still `escrowed`, retried on the next boot, and never falling through to the expiry
-  // path below. Deciding it properly needs the job's `evaluator` address, which is not among the
-  // four facts `escrowState` returns; flagged rather than widened here.
-  if (evaluator)
+  const ours = evaluator?.account?.address;
+  if (evaluator && ours && ours.toLowerCase() === chain.evaluator.toLowerCase())
     return send(d, jobKey, "reject", () => d.job.reject(jobId, SAGA_FAILED_REASON, evaluator));
 
-  // With no distinct evaluator key the evaluator address IS the client's
-  // (`jobs/composition.ts`), and a client may only reject an OPEN job — so the only way left is
-  // the permissionless expiry, once the deadline the saga set has passed.
+  // Not our job to reject: the only way left is the permissionless expiry, once the deadline the
+  // saga set has passed. Anyone may take it, and the money goes to the client either way.
   const nowSec = BigInt(d.now ? d.now() : Math.floor(Date.now() / 1000));
-  if (nowSec > expiredAt) return send(d, jobKey, "claimRefund", () => d.job.claimRefund(jobId));
+  if (nowSec > chain.expiredAt)
+    return send(d, jobKey, "claimRefund", () => d.job.claimRefund(jobId));
 
   // Not yet. Record that the money is still in there, which is what puts this row in
   // `listEscrowedUnrefunded()` for the next boot to pick up.
-  return settle(d, jobKey, "escrowed", null, { outcome: "waiting-expiry", expiredAt });
+  return settle(d, jobKey, "escrowed", null, {
+    outcome: "waiting-expiry",
+    expiredAt: chain.expiredAt,
+  });
 }
 
 /** One refund send, and the three things its receipt can mean. */

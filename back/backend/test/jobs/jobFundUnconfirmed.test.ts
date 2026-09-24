@@ -14,7 +14,7 @@
  */
 import { beforeEach, expect, test } from "vitest";
 import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
-import { jobClientAccount, jobFundHarness } from "../helpers/jobFundHarness";
+import { OPENING_BALANCE, jobClientAccount, jobFundHarness } from "../helpers/jobFundHarness";
 
 beforeEach(() => resetSenderNonces());
 
@@ -83,20 +83,26 @@ test("the allowance unit is released after a timeout, so the next job funds norm
     h.runJob({ jobKey: "t:next", entityKey: "t:agent-b" }),
   ]);
 
+  // The two approves and the one fund, and then the refund of the escrow that fund filled: the
+  // second job got past funding, so its worker throwing is a post-funding failure like any other.
   expect(h.node.actions.map((a) => `${a.call}:${a.status}`)).toEqual([
     "approve:success",
     "approve:success",
     "fund:success",
+    "reject:success",
   ]);
-  // The stuck job sent one transaction, booked nothing, and left the hash on the trail.
+  // The stuck job sent one transaction, booked nothing, and left the hash on the trail. It never
+  // funded, so there is nothing to recover and no refund line of its own.
   expect(h.jobs.findByKey("t:stuck")!.fundTxHash).toBe(null);
   expect(h.eventsFor("t:stuck")).toEqual([
     { step: "fund", status: "unconfirmed", tx_hash: h.node.sends[0]!.hash },
   ]);
-  // The next one was not held up by it.
+  expect(h.jobs.findByKey("t:stuck")!.escrowState).toBe(null);
+  // The next one was not held up by it: it funded, and got its budget back.
   expect(h.jobs.findByKey("t:next")!.status).toBe("funded");
-  expect(h.node.escrowOf(7n)).toBe(500_000n);
-  expect(h.outflows).toEqual([
-    { path: "job_fund", amountAtomic: 500_000n, ref: h.node.sends[2]!.hash },
-  ]);
+  const [fundHash] = h.node.hashesOf("fund");
+  expect(h.node.escrowOf(7n)).toBe(0n);
+  expect(h.node.balanceOf(jobClientAccount.address)).toBe(OPENING_BALANCE);
+  expect(h.jobs.findByKey("t:next")!.escrowState).toBe("refunded");
+  expect(h.outflows).toEqual([{ path: "job_fund", amountAtomic: 500_000n, ref: fundHash }]);
 });

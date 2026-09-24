@@ -118,14 +118,14 @@ test("buildJobDeps returns the expected interface without network calls", () => 
 });
 
 /**
- * THE ESCROW RECOVERY IS WIRED IN PRODUCTION, not only in the tests that are about it.
+ * ONE RECOVERY, SHARED BY EVERY CALLER.
  *
- * `runJob` and `JobRunner` both take the recovery as an OPTIONAL dependency, because most test
- * compositions stop at the funding boundary and have no escrow to get back. An optional
- * dependency the composition root forgets is a feature that silently does not exist on the box,
- * so this is the test that holds it: the callable surface (`refundJob`, for the MCP tool and the
- * CLI) and the boot walk (the runner's own copy) are both present, and they are the SAME
- * function — a second, differently-wired copy is how two callers come to disagree.
+ * `runJob` and `JobRunner` both take the recovery as an OPTIONAL dependency (the fake-deps test
+ * compositions have no escrow to get back and pass none), and an optional dependency the
+ * composition root forgets is a feature that silently does not exist on the box. So this holds
+ * both halves of the real wiring: the callable surface (`refundJob`, behind the MCP tool and the
+ * CLI) exists, and the boot walk's copy is the SAME function — two differently-wired copies is
+ * how two callers come to disagree about where a job's money went.
  */
 test("buildJobDeps wires the escrow recovery into the runner and exposes it as refundJob", async () => {
   const cfg = makeConfig();

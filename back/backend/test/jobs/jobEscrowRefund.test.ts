@@ -17,6 +17,7 @@
  * statuses and deadline the deployed contract does, and then ask two questions: what was sent,
  * and what was written down.
  */
+import type { Address } from "viem";
 import { beforeEach, expect, test } from "vitest";
 import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
 import {
@@ -39,7 +40,7 @@ const calls = (h: ReturnType<typeof jobFundHarness>) =>
   h.node.actions.map((a) => `${a.call}:${a.status}`);
 
 test("a submit that reverts is refunded by the evaluator, and the client gets its budget back", async () => {
-  const h = jobFundHarness({ failAt: "submit", recoverEscrow: true });
+  const h = jobFundHarness({ failAt: "submit" });
   h.seedCreatedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 3n });
 
   h.runner.reconcileInFlight();
@@ -67,15 +68,42 @@ test("a submit that reverts is refunded by the evaluator, and the client gets it
   // erased the only record of why the job died.
   expect(row.error).toBe(revertedMessage("submit", SUBMIT_REVERT_TX_HASH));
 
+  // The trail reads in the order it happened: the step that died, then what we did about the
+  // money — and the dead step keeps the hash an operator can look up.
   expect(h.eventsFor("t:k")).toEqual([
     { step: "fund", status: "funded", tx_hash: fundHash },
+    { step: "submit", status: "failed", tx_hash: SUBMIT_REVERT_TX_HASH },
     { step: "refund", status: "refunded", tx_hash: rejectHash },
   ]);
   expect(h.recoveries).toEqual([{ outcome: "refunded", via: "reject", txHash: rejectHash }]);
 });
 
+test("a submit we could not confirm is recorded as unconfirmed, not as a failure", async () => {
+  // "It reverted" and "it was sent and we cannot read it" are opposite claims about the chain,
+  // and the trail must not flatten one into the other: the hash of an unconfirmed submit is the
+  // thing an operator looks up before anyone touches the job again (`receipts.ts`, #145's rule
+  // for the funding step, applied to the step after it).
+  const h = jobFundHarness({ failAt: "submit-unconfirmed" });
+  h.seedCreatedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 12n });
+
+  h.runner.reconcileInFlight();
+  await h.runner.settled();
+
+  const [fundHash] = h.node.hashesOf("fund");
+  const [rejectHash] = h.node.hashesOf("reject");
+  expect(h.eventsFor("t:k")).toEqual([
+    { step: "fund", status: "funded", tx_hash: fundHash },
+    { step: "submit", status: "unconfirmed", tx_hash: SUBMIT_REVERT_TX_HASH },
+    { step: "refund", status: "refunded", tx_hash: rejectHash },
+  ]);
+  // The escrow still comes back: whether that submit lands or not, the client's money is not
+  // meant to stay in the contract, and the reject is valid against Funded and Submitted alike.
+  expect(h.jobs.findByKey("t:k")!.escrowState).toBe("refunded");
+  expect(h.node.balanceOf(jobClientAccount.address)).toBe(OPENING_BALANCE);
+});
+
 test("a complete that reverts is refunded the same way, from the Submitted job", async () => {
-  const h = jobFundHarness({ failAt: "complete", recoverEscrow: true });
+  const h = jobFundHarness({ failAt: "complete" });
   h.seedCreatedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 3n });
 
   h.runner.reconcileInFlight();
@@ -105,6 +133,7 @@ test("a complete that reverts is refunded the same way, from the Submitted job",
   expect(h.eventsFor("t:k")).toEqual([
     { step: "fund", status: "funded", tx_hash: fundHash },
     { step: "submit", status: "submitted", tx_hash: `0x${"cc".repeat(32)}` },
+    { step: "complete", status: "failed", tx_hash: completeHash },
     { step: "refund", status: "refunded", tx_hash: rejectHash },
   ]);
 });
@@ -117,7 +146,6 @@ test("with no evaluator key the escrow waits for its deadline, and the next boot
   const h = jobFundHarness({
     evaluator: false,
     failAt: "submit",
-    recoverEscrow: true,
     now: () => nowSec,
   });
   h.seedCreatedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 4n, expiredAt: 5_000n });
@@ -163,6 +191,7 @@ test("with no evaluator key the escrow waits for its deadline, and the next boot
   expect(refunded.error).toBe(revertedMessage("submit", SUBMIT_REVERT_TX_HASH));
   expect(h.eventsFor("t:k")).toEqual([
     { step: "fund", status: "funded", tx_hash: fundHash },
+    { step: "submit", status: "failed", tx_hash: SUBMIT_REVERT_TX_HASH },
     { step: "refund", status: "refunded", tx_hash: claimHash },
   ]);
   expect(h.recoveries).toEqual([
@@ -173,10 +202,48 @@ test("with no evaluator key the escrow waits for its deadline, and the next boot
   expect(h.jobs.listEscrowedUnrefunded()).toEqual([]);
 });
 
+test("an evaluator key that is not THIS job's evaluator waits for the expiry instead", async () => {
+  // The rotation case, and the reason "do we hold an evaluator key" is the wrong question: a job
+  // created BEFORE the key was configured carries the client as its evaluator, and the contract
+  // refuses a reject from anyone else. Sending one anyway would be a reverted transaction and a
+  // gas bill on every boot, for ever, while the expiry path sat there unused.
+  let nowSec = 1_000;
+  const h = jobFundHarness({ failAt: "submit", now: () => nowSec });
+  h.seedCreatedJob({
+    jobKey: "t:k",
+    entityKey: "t:agent",
+    jobId: 11n,
+    expiredAt: 5_000n,
+    // Our evaluator key exists (the harness configures one by default) and is NOT this one.
+    evaluator: jobClientAccount.address as Address,
+  });
+
+  h.runner.reconcileInFlight();
+  await h.runner.settled();
+
+  expect(calls(h)).toEqual(["approve:success", "fund:success"]);
+  expect(h.node.sendsFrom(evaluatorAccount.address)).toEqual([]);
+  expect(h.recoveries).toEqual([{ outcome: "waiting-expiry", expiredAt: 5_000n }]);
+  expect(h.jobs.findByKey("t:k")!.escrowState).toBe("escrowed");
+  expect(h.node.escrowOf(11n)).toBe(BUDGET);
+
+  // Past the deadline it takes the permissionless path, as if no evaluator key existed at all.
+  nowSec = 5_001;
+  h.runner.reconcileInFlight();
+  await h.runner.settled();
+
+  expect(calls(h)).toEqual(["approve:success", "fund:success", "claimRefund:success"]);
+  const claimHash = h.node.sends[2]!.hash;
+  expect(h.jobs.findByKey("t:k")!.refundTxHash).toBe(claimHash);
+  expect(h.jobs.findByKey("t:k")!.escrowState).toBe("refunded");
+  expect(h.node.balanceOf(jobClientAccount.address)).toBe(OPENING_BALANCE);
+  expect(h.node.chainJob(11n)!.status).toBe(5); // Expired
+});
+
 test("a job the chain says is Completed is released money, and nothing is sent", async () => {
   // The escrow paid the provider after we had already given up on the row. There is nothing to
   // refund, and a reject would only have reverted.
-  const h = jobFundHarness({ recoverEscrow: true });
+  const h = jobFundHarness({});
   h.seedFailedFundedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 5n, chainStatus: 3 });
 
   expect(await h.refundJob("t:k")).toEqual({ outcome: "released" });
@@ -199,7 +266,7 @@ test.each([
   async ({ chainStatus }) => {
     // `claimRefund` is permissionless, so the refund can happen without us: the money is back
     // with the client either way, and the row should say so — with no transaction of ours.
-    const h = jobFundHarness({ recoverEscrow: true });
+    const h = jobFundHarness({});
     h.seedFailedFundedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 6n, chainStatus });
 
     expect(await h.refundJob("t:k")).toEqual({ outcome: "refunded-elsewhere" });
@@ -216,7 +283,7 @@ test.each([
 test("a job the chain never heard of has nothing escrowed", async () => {
   // A row whose `jobId` names no job on this contract: the zero record, status Open, no budget.
   // Nothing to send, and nothing owed.
-  const h = jobFundHarness({ recoverEscrow: true });
+  const h = jobFundHarness({});
   h.seedFailedFundedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 8n, chainStatus: 3 });
   const row = h.jobs.findByKey("t:k")!;
   h.jobs.upsert({ ...row, jobId: "404" });
@@ -233,7 +300,7 @@ test("a reject that reverts leaves the escrow where it is, and the next boot tri
   // would write `refunded` over an escrow that is still full — the 2026-09-22 mistake, one step
   // along. So the state stays `escrowed`, the hash goes on the trail as a failure, and the row
   // remains in the set the boot reconcile walks.
-  const h = jobFundHarness({ failAt: "submit", revertReject: true, recoverEscrow: true });
+  const h = jobFundHarness({ failAt: "submit", revertReject: true });
   h.seedCreatedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 7n });
 
   h.runner.reconcileInFlight();
@@ -254,6 +321,7 @@ test("a reject that reverts leaves the escrow where it is, and the next boot tri
   expect(stuck.error).toBe(revertedMessage("submit", SUBMIT_REVERT_TX_HASH));
   expect(h.eventsFor("t:k")).toEqual([
     { step: "fund", status: "funded", tx_hash: fundHash },
+    { step: "submit", status: "failed", tx_hash: SUBMIT_REVERT_TX_HASH },
     { step: "refund", status: "failed", tx_hash: failedRejectHash },
   ]);
   expect(h.recoveries).toEqual([
@@ -286,7 +354,6 @@ test("the deadline the saga puts on a job is the one the recovery waits for", as
   const h = jobFundHarness({
     evaluator: false,
     failAt: "submit",
-    recoverEscrow: true,
     now: () => nowSec,
   });
   h.seedCreatedJob({

@@ -474,18 +474,31 @@ export class JobAdapter {
   }
 
   /**
-   * escrowState — the four facts a refund decision needs, read from the chain.
+   * escrowState — the five facts a refund decision needs, read from the chain.
    *
    * THE CHAIN IS THE RECORD, not our row: a job row that says `failed` says nothing about where
    * the money is, and the same escrow may have been rejected, expired or completed by somebody
    * else since. `status` decides what may be sent, `expiredAt` decides whether `claimRefund` is
-   * open yet, `budget` and `client` are what is at stake and who gets it.
+   * open yet, `budget` and `client` are what is at stake and who gets it — and `evaluator` is WHO
+   * MAY REJECT IT, which is not the same question as which evaluator key this process happens to
+   * hold: a job created before that key existed names the client, and a reject from anyone else
+   * reverts (`jobs/refund.ts`).
    */
-  async escrowState(
-    jobId: bigint,
-  ): Promise<{ status: number; budget: bigint; expiredAt: bigint; client: Address }> {
+  async escrowState(jobId: bigint): Promise<{
+    status: number;
+    budget: bigint;
+    expiredAt: bigint;
+    client: Address;
+    evaluator: Address;
+  }> {
     const j = await this.getJob(jobId);
-    return { status: j.status, budget: j.budget, expiredAt: j.expiredAt, client: j.client };
+    return {
+      status: j.status,
+      budget: j.budget,
+      expiredAt: j.expiredAt,
+      client: j.client,
+      evaluator: j.evaluator,
+    };
   }
 
   /**

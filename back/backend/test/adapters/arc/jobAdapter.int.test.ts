@@ -114,6 +114,8 @@ describe("JobAdapter refunds", () => {
         budget: 500_000n,
         expiredAt: 9_999_999_999n,
         client: env.clientAddr,
+        // WHO WAS ENTITLED to reject it, read from the chain rather than assumed from our config.
+        evaluator: env.evaluatorAddr,
       });
       // Back where it came from, to the last unit — and not to the evaluator who sent it.
       expect(await env.usdcBalanceOf(env.clientAddr)).toBe(1_000_000n);

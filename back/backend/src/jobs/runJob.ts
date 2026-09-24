@@ -15,7 +15,12 @@
 import type { Address, Hex } from "viem";
 import type { JobAdapter } from "../adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../adapters/arc/reputationAdapter";
-import { JobFundRevertedError, JobFundUnconfirmedError } from "../errors";
+import {
+  ChainTxRevertedError,
+  ChainTxUnconfirmedError,
+  JobFundRevertedError,
+  JobFundUnconfirmedError,
+} from "../errors";
 import { opsLog } from "../observability/opsLog";
 import { providerOf, requireCircleWallets } from "../payments/provider";
 import type { DocumentStore } from "../persistence/documentStore";
@@ -367,6 +372,18 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
     // Only a job whose row got as far as `funded` has an escrow to recover. Anything that threw
     // earlier never moved money (#145), and a `completed` row has already released it.
     if (rec?.status === "funded" || rec?.status === "submitted") {
+      // THE TRAIL NAMES THE STEP THAT DIED, before it names what we did about the money — so it
+      // reads `submit`/`failed` → `refund`/`refunded` rather than starting at the refund and
+      // leaving an operator to guess what the refund was for. The step is the saga phase the row
+      // is in, in the same words its success writes (`submit` from `funded`, `complete` from
+      // `submitted`), and the hash is there whenever the failure carried one: a reverted step has
+      // a transaction an operator can look up, and an UNCONFIRMED one is a different fact that
+      // the trail must not flatten into a failure (`errors.ts`, `receipts.ts`).
+      const step = rec.status === "funded" ? "submit" : "complete";
+      const unconfirmed = e instanceof ChainTxUnconfirmedError;
+      const txHash =
+        e instanceof ChainTxRevertedError || e instanceof ChainTxUnconfirmedError ? e.txHash : null;
+      d.jobs.recordEvent(d.jobKey, step, unconfirmed ? "unconfirmed" : "failed", txHash, null);
       try {
         await d.recoverEscrow?.(d.jobKey);
       } catch (recoveryFailure) {

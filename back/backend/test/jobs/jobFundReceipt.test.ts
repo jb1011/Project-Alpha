@@ -15,7 +15,12 @@
  */
 import { beforeEach, expect, test } from "vitest";
 import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
-import { jobClientAccount, jobFundHarness } from "../helpers/jobFundHarness";
+import {
+  OPENING_BALANCE,
+  evaluatorAccount,
+  jobClientAccount,
+  jobFundHarness,
+} from "../helpers/jobFundHarness";
 
 beforeEach(() => resetSenderNonces());
 
@@ -84,17 +89,31 @@ test("a funding that succeeds is booked once, and the row carries the fund hash"
   h.runner.reconcileInFlight();
   await h.runner.settled();
 
+  // The approve and the fund both took, unchanged — and then the harness's worker throws, which
+  // is a post-funding failure, so the escrow recovery gives the budget back (the escrow assertions
+  // below follow it through). That is the shipped saga: `jobs/composition.ts` always wires it.
   expect(h.node.actions).toEqual([
     { call: "approve", from: jobClientAccount.address, status: "success" },
     { call: "fund", from: jobClientAccount.address, status: "success" },
+    { call: "reject", from: evaluatorAccount.address, status: "success" },
   ]);
   const fundHash = h.node.sends[1]!.hash;
+  const rejectHash = h.node.sends[2]!.hash;
 
   const row = h.jobs.findByKey("t:k")!;
   expect(row.fundTxHash).toBe(fundHash);
   expect(h.outflows).toEqual([{ path: "job_fund", amountAtomic: 500_000n, ref: fundHash }]);
-  expect(h.eventsFor("t:k")).toEqual([{ step: "fund", status: "funded", tx_hash: fundHash }]);
-  expect(h.node.escrowOf(9n)).toBe(500_000n);
+  expect(h.eventsFor("t:k")).toEqual([
+    { step: "fund", status: "funded", tx_hash: fundHash },
+    { step: "submit", status: "failed", tx_hash: null },
+    { step: "refund", status: "refunded", tx_hash: rejectHash },
+  ]);
+  // The fund DID fill the escrow — the reject is what emptied it again, and the client's balance
+  // is the round trip: BUDGET out on the fund, BUDGET back on the refund.
+  expect(h.node.escrowOf(9n)).toBe(0n);
+  expect(h.node.balanceOf(jobClientAccount.address)).toBe(OPENING_BALANCE);
+  expect(row.escrowState).toBe("refunded");
+  expect(row.refundTxHash).toBe(rejectHash);
   // The budget was pulled through the allowance, which is therefore spent.
   expect(h.node.allowanceOf(jobClientAccount.address, h.adapter.jobContract)).toBe(0n);
 });
