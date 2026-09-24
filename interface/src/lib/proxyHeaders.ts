@@ -22,7 +22,12 @@ export const FORWARDED_REQUEST_HEADERS = [
   "mcp-protocol-version",
   "last-event-id",
   // x402 requires this end-to-end (the seller re-issues its 402 challenge without it).
+  // BOTH spellings: `x-payment` is v1's, `payment-signature` is v2's, and the seller behind this
+  // proxy reads either (`@x402/hono` takes `payment-signature` first and falls back to
+  // `x-payment`). Dropping the v2 name made every v2 buyer look unpaid — it was re-quoted the
+  // same 402 forever, having signed a payment the seller never saw.
   "x-payment",
+  "payment-signature",
   // AgentKit sends its human-backing proof in a header named exactly `agentkit`; dropping it
   // made every external agent look anonymous to the seller, which refused them all.
   "agentkit",
@@ -40,6 +45,15 @@ export const FORWARDED_RESPONSE_HEADERS = [
   "mcp-session-id",
   // x402 settlement id, returned to the buyer.
   "x-payment-response",
+  // x402 v2, and `payment-required` is the one that matters most: v2 carries the whole 402
+  // challenge — price, asset, payee, nonce — in this HEADER, where v1 put it in the body. A buyer
+  // that lost it read a 402 with an empty body and had nothing to pay against. `payment-response`
+  // is v2's settlement receipt, the same fact `x-payment-response` above carries for v1.
+  //
+  // Not `settlement-overrides`: that one travels from the backend's route handler to its own
+  // payment middleware, which deletes it before answering. It means nothing to a browser.
+  "payment-required",
+  "payment-response",
   // AgentKit outcome: who the seller judged to be backing the agent, and its remaining budget.
   // Without these an authorized agent cannot read its own standing.
   "x-agentkit-human",

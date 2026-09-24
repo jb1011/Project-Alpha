@@ -16,16 +16,16 @@ legally required, KYC'd controller-of-record — see the legal model note below.
 - **`LegalManager`** (upgradeable, beacon proxy, one per agent) — holds the operating-agreement hash,
   links the identity, and enforces rule amendments + dissolution via a timelocked, guardian-vetoable
   process.
-- **`AgentTreasury`** (immutable, one per agent) — the non-custodial vault: holds USDC and enforces
+- **`AgentTreasury`** (immutable, one per agent) — the agent's treasury vault: holds USDC and enforces
   the on-chain spending policy (rolling cap + allowlist).
-- **Operator key** — the agent's bound `agentWallet`, a **non-custodial Turnkey enclave key** that
+- **Operator key** — the agent's bound `agentWallet`, a **Turnkey enclave key** that
   *signs* spends but never holds custody; the human is the on-chain **guardian/controller**.
 - Reuses Arc's live **ERC-8004** (identity/reputation) and **ERC-8183** (agent jobs).
 
 The novel piece is the **law → code translator**: plain operating-agreement terms ("≤ $X per period to
 approved counterparties") become enforced on-chain rules, with the signed agreement's hash anchored
-on-chain. Custody is non-custodial by design — that's also what keeps the platform clear of
-money-transmitter licensing.
+on-chain. The treasury is an on-chain contract the human guardian governs: the agent's operator key
+spends only inside the caps and allowlist the contract enforces.
 
 ## Repository layout
 ```
@@ -56,8 +56,7 @@ docs/                  all specs, designs, plans, research — see docs/README.m
 **Real vs. mocked (transparent):** everything on-chain + Circle is real on testnet. The *legal layer*
 (Wyoming filing, EIN, KYC, counsel-reviewed documents) is stubbed for the demo and becomes real with
 funding + counsel; the scoped path is [Doola's Company Formation API](https://www.doola.com/business-solutions/company-formation-api/)
-behind the backend's formation step (research: [docs/research/LEGAL_OPERATIONS.md](./docs/research/LEGAL_OPERATIONS.md)).
-Production-hardening items are tracked in [docs/V2_HARDENING_BACKLOG.md](./docs/V2_HARDENING_BACKLOG.md).
+behind the backend's formation step.
 
 ## ⚖️ Legal model (important — read before pitching)
 The original framing was a "Bayern mechanism / zero-member LLC" (a fully human-less entity). Research
@@ -66,8 +65,7 @@ controller-of-record is mandatory** — triple-locked by Wyoming DAO LLC statute
 FinCEN CDD control prong, and Circle's own terms. The real, defensible model is
 **human-controller + agent-bounded-operator**, which is exactly what the architecture already implements
 (the human is the on-chain guardian/controller; the agent is the bounded operator). Lead with that —
-not "no human / fully autonomous." Details: [docs/research/LEGAL_OPERATIONS.md](./docs/research/LEGAL_OPERATIONS.md)
-(Bayern remains the origin/context, not the production claim).
+not "no human / fully autonomous." (Bayern remains the origin/context, not the production claim).
 
 ## Deployed addresses — Arc testnet (chain ID 5042002)
 **Our contracts** (live, 2026-06-12):

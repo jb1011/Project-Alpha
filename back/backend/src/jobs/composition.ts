@@ -8,7 +8,7 @@ import type Database from "better-sqlite3";
 import { http, createWalletClient } from "viem";
 import type { Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { publicClientFor } from "../adapters/arc/clients";
+import { publicClientFor, sendClientFor } from "../adapters/arc/clients";
 import { JobAdapter } from "../adapters/arc/jobAdapter";
 import { ReputationAdapter } from "../adapters/arc/reputationAdapter";
 import type { CircleWalletsApi } from "../adapters/circle/circleWallets";
@@ -25,20 +25,42 @@ import type { EntityRecord } from "../types";
 import { circleJobOps } from "./circleJobOps";
 import { type JobRepository, SqliteJobRepository } from "./jobRepository";
 import { JobRunner, type RunJobFn } from "./jobRunner";
+import { type RecoverOutcome, recoverEscrow } from "./refund";
 import { type ProviderJobOps, runJob as runJobSaga } from "./runJob";
 import { TrivialWorker } from "./worker";
 
+/**
+ * The job seam, in two halves.
+ *
+ * `jobs` is the READ half and is always present: the rows are SQLite and outlive any credential.
+ * Everything else needs the job CLIENT — the identity that creates the job and funds the escrow —
+ * and is therefore present exactly when `JOB_CLIENT_PRIVATE_KEY` is configured. They are all
+ * absent together or all present together; a deployment without the key still boots, and every
+ * caller that would start or resume a job reports the feature unavailable instead.
+ */
 export interface JobDeps {
   jobs: JobRepository;
-  jobRunner: JobRunner;
-  jobAdapter: JobAdapter;
-  reputationAdapter: ReputationAdapter;
-  jobClientAddress: Address;
+  /** Absent with no `JOB_CLIENT_PRIVATE_KEY` — there is no escrow payer to run a saga as. */
+  jobRunner?: JobRunner;
+  jobAdapter?: JobAdapter;
+  reputationAdapter?: ReputationAdapter;
+  jobClientAddress?: Address;
   /** Falls back to jobClientAddress when no distinct evaluator key is configured.
    * NOTE: a distinct evaluator key is required for live runs — complete() on-chain
    * requires a non-client evaluator in the general case. */
-  jobEvaluatorAddress: Address;
-  runJob: RunJobFn;
+  jobEvaluatorAddress?: Address;
+  runJob?: RunJobFn;
+  /**
+   * Get one job's escrow back (`jobs/refund.ts`) — the callable surface behind the `refund_job`
+   * MCP tool and the `refund-job` CLI command. Absent with the rest of the signing half: a
+   * refund is a transaction, and with no job client key there is no key to send it with.
+   *
+   * ⚠ UNLOCKED, and every caller owes it `withKeyedLock(rec.entityKey)`. It reads the chain,
+   * decides and sends, so two callers inside that window both send a refund and the loser's row
+   * write lands on the winner's. The lock is not taken in here because the saga calls this same
+   * recovery while already holding that key, and the mutex is not re-entrant.
+   */
+  refundJob?: (jobKey: string) => Promise<RecoverOutcome>;
 }
 
 export function buildJobDeps(
@@ -49,6 +71,12 @@ export function buildJobDeps(
   circleApi?: CircleWalletsApi,
 ): JobDeps {
   const jobs = new SqliteJobRepository(db);
+  // No job client key, no signing half. Returning early (rather than building the wallet from
+  // some other key) is the whole point: the client FUNDS THE ESCROW, so the only alternatives to
+  // refusing were paying job budgets out of the platform governance key or failing at the first
+  // `createJob` with a confusing revert. The read half still comes back.
+  if (!cfg.jobClientPrivateKey) return { jobs };
+
   const jobOpAttempts = new SqliteJobOpAttempts(db);
   // S5: job budgets are platform client-wallet outflows — same rolling-window brake as funding.
   const outflows = buildOutflowMeter(db, {
@@ -58,6 +86,10 @@ export function buildJobDeps(
 
   // Viem clients — no network calls at construction
   const publicClient = publicClientFor(cfg);
+  // The two calls that happen inside the send lock, on their own bounded transport (8 s, no retry
+  // — `clients.ts` says why the lock cannot afford the app-wide retry budget). Shared by both
+  // adapters below, because the lock is keyed by SIGNER and they share the evaluator key.
+  const sendClient = sendClientFor(cfg);
   const chain = chainFor(cfg.chainId, cfg.rpcUrl);
   const transport = http(cfg.rpcUrl);
 
@@ -79,6 +111,7 @@ export function buildJobDeps(
     publicClient,
     clientWallet,
     evaluatorWallet,
+    sendClient,
     jobContract: cfg.jobContract,
   });
 
@@ -87,6 +120,7 @@ export function buildJobDeps(
   const reputationAdapter = new ReputationAdapter({
     publicClient,
     recorderWallet: evaluatorWallet ?? clientWallet,
+    sendClient,
     registry: cfg.reputationRegistry,
   });
 
@@ -132,6 +166,18 @@ export function buildJobDeps(
   // A real distinct evaluator key (JOB_EVALUATOR_PRIVATE_KEY) is required for live on-chain runs.
   const jobEvaluatorAddress: Address = evaluatorWallet?.account?.address ?? jobClientAddress;
 
+  /**
+   * ONE recovery function, shared by every caller.
+   *
+   * The saga calls it when a step after funding throws, the boot reconcile calls it for every
+   * failed job whose escrow is still unaccounted for, and the `refund_job` tool and the
+   * `refund-job` CLI command call it on demand. Built once and passed around rather than
+   * constructed per caller, so there is no way for two of them to be wired differently
+   * (`test/jobs/composition.test.ts` asserts they are the same function).
+   */
+  const refundJob = (jobKey: string): Promise<RecoverOutcome> =>
+    recoverEscrow({ jobs, job: jobAdapter }, jobKey);
+
   // Per-entity serialization SPANNING funding and jobs (Tier-0 audit item 6): the saga sends as
   // the operator (EOA or SCA — the SCA may only allow one in-flight tx), and the funding bridge
   // uses the same key space, so a concurrent fund_pocket + run_job for one agent queue instead of
@@ -154,10 +200,11 @@ export function buildJobDeps(
         docStore,
         providerOpsFor,
         sweepToTreasury: cfg.jobSweepToTreasury,
+        recoverEscrow: refundJob,
       }),
     );
 
-  const jobRunner = new JobRunner({ jobs, runJob });
+  const jobRunner = new JobRunner({ jobs, runJob, recoverEscrow: refundJob });
 
   return {
     jobs,
@@ -167,5 +214,6 @@ export function buildJobDeps(
     jobClientAddress,
     jobEvaluatorAddress,
     runJob,
+    refundJob,
   };
 }

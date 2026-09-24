@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-// Note: expiry (expiredAt) and cancel/dispute paths are intentionally not enforced in this test double.
+// Note: `expiredAt` is enforced by `claimRefund` ONLY — no other entry point here reads the
+// deadline, and `submit`/`complete` accept a job whose window has passed. The dispute paths the
+// real contract carries beyond `reject` (hooks, provider reassignment) are still not implemented.
 
 interface IERC20 { function transferFrom(address,address,uint256) external returns (bool); function transfer(address,uint256) external returns (bool); }
 
@@ -30,6 +32,8 @@ contract MockERC8183Job {
     event JobCreated(uint256 indexed jobId, address indexed provider, address indexed evaluator);
     event Submitted(uint256 indexed jobId, bytes32 deliverable);
     event Completed(uint256 indexed jobId, address indexed provider, uint256 amount);
+    event Rejected(uint256 indexed jobId, address indexed client, uint256 amount);
+    event Expired(uint256 indexed jobId, address indexed client, uint256 amount);
 
     constructor(address _usdc) { usdc = IERC20(_usdc); }
 
@@ -84,6 +88,40 @@ contract MockERC8183Job {
         j.status = 3; // Completed
         require(usdc.transfer(j.provider, j.budget), "payout");
         emit Completed(jobId, j.provider, j.budget);
+    }
+
+    /// @dev The role decides WHICH statuses may be rejected (verified against the deployed
+    ///      implementation's semantics): the client owns the Open job, the evaluator the funded
+    ///      one. A reject after the money moved into escrow sends it back to the client.
+    function reject(uint256 jobId, bytes32, bytes calldata) external {
+        Job storage j = jobs[jobId];
+        if (msg.sender == j.client) {
+            require(j.status == 0, "client: not open"); // Open
+        } else if (msg.sender == j.evaluator) {
+            require(j.status == 1 || j.status == 2, "evaluator: not funded or submitted");
+        } else {
+            revert("not client or evaluator");
+        }
+        uint8 was = j.status;
+        j.status = 4; // Rejected
+        // Only a job whose budget actually reached escrow has something to give back.
+        if (was == 1 || was == 2) {
+            require(usdc.transfer(j.client, j.budget), "refund");
+            emit Rejected(jobId, j.client, j.budget);
+        } else {
+            emit Rejected(jobId, j.client, 0);
+        }
+    }
+
+    /// @dev Permissionless once the deadline has passed — the refund always goes to the CLIENT,
+    ///      never to `msg.sender`, so a third party gains nothing by calling it.
+    function claimRefund(uint256 jobId) external {
+        Job storage j = jobs[jobId];
+        require(j.status == 1 || j.status == 2, "not funded or submitted");
+        require(block.timestamp > j.expiredAt, "not expired");
+        j.status = 5; // Expired
+        require(usdc.transfer(j.client, j.budget), "refund");
+        emit Expired(jobId, j.client, j.budget);
     }
 
     function getJob(uint256 jobId) external view returns (Job memory) {

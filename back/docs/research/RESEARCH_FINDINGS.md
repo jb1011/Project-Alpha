@@ -195,6 +195,9 @@ Arc settlement**, exposed via MCP.
   verified** in this pass — the secondary aggregators (capitalaidaily, etc.) and the No Priors YouTube
   weren't transcribed. The *theme* (Allaire bullish on agentic economy + Arc for agents) is
   well-attested; **verify exact quotes before putting them in a deck.**
+  *Update 2026-08-14:* the quote we use publicly ("Calling @Arc Architects — I would love to back a
+  team building this with Circle Agent Stack and Arc.") is verified against the original post:
+  https://x.com/jerallaire/status/2055795970466512937 (2026-05-16). The other quotes above are not used.
 
 ---
 

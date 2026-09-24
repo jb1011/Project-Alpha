@@ -52,7 +52,7 @@ scope**:
 | Capability   | Grants |
 |--------------|--------|
 | `read`       | the read tools only |
-| `earn`       | read + `run_job` |
+| `earn`       | read + `run_job`, `refund_job` |
 | `spend`      | read + earn + `pay` |
 | `provision`  | spend + platform-funded provisioning (`fund_treasury`, `onboard_agent`) |
 
@@ -104,6 +104,12 @@ a tool argument) and return a uniform "not found" on any ownership/scope miss.
 **Earn** (`earn`+):
 - `run_job(id, budgetUsdc?)` — the agent earns USDC + reputation by running an ERC-8183 job (self-contained
   v1: the platform stands in for the client + evaluator). Returns `{ jobKey, status }`; poll `get_job`.
+- `refund_job(jobKey)` — recover the escrow of a job of yours that funded and then failed. The saga already
+  attempts this by itself, and every API boot retries the jobs still owed one, so this is for the case
+  neither covered yet (an expiry that had not arrived, a refund that reverted). It reads the chain first and
+  sends nothing when there is nothing to recover, so calling it twice is safe; the outcome names what was
+  found (`refunded`, `released`, `waiting-expiry`, `nothing-escrowed`). `get_job` then shows `escrowState`
+  and `refundTxHash`.
 
 **Spend** (`spend`):
 - `pay(id, to, amountUsdc, idempotencyKey)` — pay an **x402 resource URL** with USDC, within the treasury's
@@ -129,7 +135,7 @@ a tool argument) and return a uniform "not found" on any ownership/scope miss.
   on-chain by the `AgentTreasury` contract before it settles. Caps and the allowlist bound the blast radius.
 - **Autonomous within guardrails, not approve-each-transaction.** The agent decides + initiates without a
   human approving each spend; your control is upfront (the rules) plus an **instant guardian freeze**.
-- **Non-custodial.** Funds live in the on-chain treasury you govern; the platform can't seize them, and in
+- **Governed on-chain.** Funds live in the on-chain treasury you govern, and in
   the default model the agent holds no signing key (a bounded operator signs within the on-chain caps).
 - **Least privilege.** Scope keys to a single entity + the minimum capability; keys are revocable; the raw
   key is shown once and served `no-store`.
@@ -143,5 +149,4 @@ a tool argument) and return a uniform "not found" on any ownership/scope miss.
 - **Custody options.** Evaluating Circle Developer-Controlled Wallets as a Circle-native signer for the
   default model, and Circle Agent Wallets for the self-sovereign mode.
 
-See `docs/design/2026-07-01-bring-your-own-agent-model-a-design.md` for the full design + security model, and
-the `back/docs/plans/2026-07-*-byoa-*` plans for the per-slice implementation detail.
+See the `back/docs/plans/2026-07-*-byoa-*` plans for the per-slice implementation detail.

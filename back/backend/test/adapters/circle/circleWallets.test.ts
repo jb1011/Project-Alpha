@@ -1,6 +1,10 @@
 import { describe, expect, test, vi } from "vitest";
 import { deterministicIdempotencyKey } from "../../../src/adapters/circle/circleExec";
 import { withCircleRateLimit } from "../../../src/adapters/circle/circleRateLimit";
+import {
+  CIRCLE_REF_ID_MAX,
+  CircleRefIdTooLongError,
+} from "../../../src/adapters/circle/circleRefId";
 import type { CircleWalletsApi } from "../../../src/adapters/circle/circleWallets";
 import {
   activateCircleSca,
@@ -102,6 +106,46 @@ describe("provisionCircleWallets — one SCA operator + one EOA pocket per agent
     }
   });
 
+  test("an entity key too long to make a legal metadata refId is refused locally", async () => {
+    const { api } = mockApi();
+    await expect(
+      provisionCircleWallets(api as never, {
+        walletSetId: "ws-1",
+        blockchain: "ARC-TESTNET",
+        entityKey: "k".repeat(101),
+      }),
+    ).rejects.toThrow(CircleRefIdTooLongError);
+    expect(api.createWallets).not.toHaveBeenCalled();
+  });
+
+  test("a REFUSED createWallets carries Circle's answer and the lengths we sent, never the key", async () => {
+    // The 2026-08-13 incident: a metadata NAME a few characters too long, answered with a bare
+    // "API parameter invalid" and no field. The lengths are what the operator needs.
+    const FAKE_BEARER = "fake-bearer-AAAAAAAAAAAAAAAAAAAAAAAA";
+    const rejection = new Error("Request failed with status code 400") as Error &
+      Record<string, unknown>;
+    rejection.response = { status: 400, data: { code: 2, message: "API parameter invalid" } };
+    rejection.config = { headers: { Authorization: `Bearer ${FAKE_BEARER}` } };
+    const { api } = mockApi();
+    (api.createWallets as ReturnType<typeof vi.fn>).mockRejectedValueOnce(rejection);
+    const err = await provisionCircleWallets(api as never, {
+      walletSetId: "ws-1",
+      blockchain: "ARC-TESTNET",
+      entityKey: "0x172B7952b0F711b8B372410E81d51Dcba7D4BB02:f251041a-4128-4674-9eab-eb6fb2503bd9",
+    }).then(
+      () => new Error("provision resolved, but createWallets was refused"),
+      (e: Error) => e,
+    );
+    expect(err.name).toBe("CircleRequestError");
+    expect(err.message).toContain("createWallets");
+    expect(err.message).toContain("HTTP 400");
+    expect(err.message).toContain("API parameter invalid");
+    expect(err.message).toMatch(/metadata name \d+ chars/);
+    expect(err.message).toMatch(/refId 79 chars/);
+    expect(err.message).not.toContain(FAKE_BEARER);
+    expect(err.message).not.toContain("Bearer");
+  });
+
   test("a response missing the wallet is a loud error, never a half-provisioned agent", async () => {
     const { api } = mockApi();
     (api.createWallets as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -187,15 +231,18 @@ describe("activateCircleSca — P2 probe-A fix (deploy the SCA before any signat
 
   function makeExecApi(states: string[] = ["CONFIRMED"]) {
     let call = 0;
-    const submits: { idempotencyKey: string; contractAddress: string; callData: string }[] = [];
+    const submits: {
+      idempotencyKey: string;
+      contractAddress: string;
+      callData: string;
+      refId?: string;
+    }[] = [];
     return {
       submits,
-      createContractExecutionTransaction: vi.fn(
-        async (input: { idempotencyKey: string; contractAddress: string; callData: string }) => {
-          submits.push(input);
-          return { data: { id: `tx-${submits.length}` } };
-        },
-      ),
+      createContractExecutionTransaction: vi.fn(async (input: (typeof submits)[number]) => {
+        submits.push(input);
+        return { data: { id: `tx-${submits.length}` } };
+      }),
       getTransaction: vi.fn(async ({ id }: { id: string }) => ({
         data: {
           transaction: {
@@ -231,6 +278,35 @@ describe("activateCircleSca — P2 probe-A fix (deploy the SCA before any signat
     expect(api.submits[0]!.idempotencyKey).toBe(deterministicIdempotencyKey("activate:op-1"));
     // S5 parity: the sponsored fee is observed (0.009188 USDC → 9188 atomic).
     expect(fees).toEqual([[9188n, "tx-1"]]);
+  });
+
+  test("the activation refId fits Circle's 100-character ceiling for a wizard-length entity key", async () => {
+    const KEY = "0x172B7952b0F711b8B372410E81d51Dcba7D4BB02:f251041a-4128-4674-9eab-eb6fb2503bd9";
+    const api = makeExecApi();
+    await activateCircleSca(api, {
+      operatorWalletId: "op-1",
+      entityKey: KEY,
+      usdc: USDC,
+      gatewayWallet: GATEWAY,
+      confirm: { pollDelayMs: 0, timeoutMs: 5_000, sleep: async () => {} },
+    });
+    expect(api.submits[0]!.refId).toBe(`${KEY}:activate`);
+    expect(api.submits[0]!.refId).toHaveLength(88);
+    expect((api.submits[0]!.refId ?? "").length).toBeLessThanOrEqual(CIRCLE_REF_ID_MAX);
+  });
+
+  test("an entity key too long to make a legal refId is refused locally, before Circle sees it", async () => {
+    const api = makeExecApi();
+    await expect(
+      activateCircleSca(api, {
+        operatorWalletId: "op-1",
+        entityKey: "k".repeat(95),
+        usdc: USDC,
+        gatewayWallet: GATEWAY,
+        confirm: { pollDelayMs: 0, timeoutMs: 5_000, sleep: async () => {} },
+      }),
+    ).rejects.toThrow(CircleRefIdTooLongError);
+    expect(api.createContractExecutionTransaction).not.toHaveBeenCalled();
   });
 
   test("a terminal FAILED activation propagates (provisioning must not persist a half-activated agent)", async () => {

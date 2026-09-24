@@ -14,6 +14,7 @@ import {
   managerWalletClient,
   platformManagerAddress as platformManagerAddressOf,
   publicClientFor,
+  sendClientFor,
   walletClientForKey,
 } from "../adapters/arc/clients";
 import { readUsdcDomain } from "../adapters/arc/usdcToken";
@@ -87,6 +88,7 @@ import { TaskTracker } from "../util/taskTracker";
 import { reconcileAgentBook } from "../workflow/agentBookReconcile";
 import { processDoolaEvent } from "../workflow/formationProcessor";
 import { FormationSweeper } from "../workflow/formationSweeper";
+import { sweepUnresolvedFunding } from "../workflow/fundSubmissions";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
@@ -179,6 +181,8 @@ async function main() {
   const arc = new ArcAdapter({
     publicClient,
     managerWallet: managerWalletClient(cfg),
+    // The two calls that happen inside the send lock, on their own bounded transport.
+    sendClient: sendClientFor(cfg),
     chainId: cfg.chainId,
     factory: factoryAddress,
     identityRegistry: cfg.identityRegistry,
@@ -641,8 +645,19 @@ async function main() {
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
 
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
-  const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
-  if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
+  // Credential-less boot: a deployment with no JOB_CLIENT_PRIVATE_KEY still starts, and jobs are
+  // simply unavailable. Said out loud here because there is no jobs enable flag to hang a boot
+  // refusal on — the routes are mounted on every deployment, so an operator who forgot the var
+  // would otherwise first learn about it from a 503 in front of a user.
+  if (!jobDeps.jobRunner) {
+    console.warn(
+      "⚠ jobs UNAVAILABLE: JOB_CLIENT_PRIVATE_KEY is not set, so there is no escrow payer — " +
+        "creating or running a job answers 503; reading jobs already recorded still works",
+    );
+  } else {
+    const resumedJobs = jobDeps.jobRunner.reconcileInFlight();
+    if (resumedJobs) console.log(`Resumed ${resumedJobs} in-flight job(s)`);
+  }
 
   const x402Demo = buildX402DemoDeps(cfg);
   // World gate on the demo seller: authorize human-backed agents (AgentBook on World Chain)
@@ -679,6 +694,15 @@ async function main() {
       console.warn(
         "⚠ x402 seller policy: LEGAL-BODIES-ONLY — only agents a registered legal body in good standing stands behind are served (403 otherwise)",
       );
+  } else if (cfg.enableX402Demo) {
+    // The flag is on and the deps came back empty, which can only be the missing payout address.
+    // Said out loud because the alternative to this line is an operator who set the flag, gets a
+    // 404 on the demo, and concludes the flag did not take. Production refuses to boot on this
+    // combination (env.ts); everywhere else the demo is simply not mounted.
+    console.warn(
+      "⚠ x402 demo seller NOT mounted: ENABLE_X402_DEMO is on but X402_DEMO_PAYTO is unset — " +
+        "there is no payout address, and the platform account's is not a substitute for one",
+    );
   }
 
   // AgentBook (design 2026-08-25 v3), in two halves.
@@ -851,6 +875,7 @@ async function main() {
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
+    refundJob: jobDeps.refundJob,
     maxJobBudget: cfg.maxJobBudget,
     maxInflightJobsPerTenant: cfg.maxInflightJobsPerTenant,
     agentRuns,
@@ -932,6 +957,24 @@ async function main() {
     formationSweeper.start();
     console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
   }
+
+  // ── Unresolved TREASURY TRANSFERS at boot (gate N2), after the socket for the reason C4 gives.
+  //
+  //    A fund broadcasts, records the hash, and then waits for a receipt — viem's default patience
+  //    is 180 seconds. A deploy, an OOM kill or a `systemctl restart` inside that window leaves a
+  //    `fundTreasury`/`submitted` row that nothing else would ever look at: `listInFlight` selects
+  //    only the pre-`bound` statuses, so `reconcileInFlight` does not see a mid-fund entity. The
+  //    entity would sit there, its treasury possibly funded, until a human pressed Retry.
+  //
+  //    One pass, one receipt read per outstanding transfer, and a no-op (with no RPC call at all)
+  //    in the normal case where nothing is outstanding.
+  //    `busy` is the runner's per-entity lock: the socket is already open, so a fund can arrive
+  //    mid-sweep, and the sweep must never resolve a submission a saga is confirming.
+  const funding = await sweepUnresolvedFunding({ repo, arc, busy: (key) => runner.isBusy(key) });
+  if (funding.checked)
+    console.log(
+      `Funding sweep at boot: ${funding.checked} checked, ${funding.finalised} finalised, ${funding.reverted} reverted, ${funding.dropped} dropped, ${funding.skipped} skipped (busy), ${funding.unresolved} still unresolved`,
+    );
 
   // AgentBook reconcile at boot (D12), and AFTER the socket is listening for the same reason C4
   // moved the formation reconcile down here: every in-flight row costs a World Chain round trip

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { encodeFunctionData } from "viem";
 import type { SubmitAndConfirmOptions } from "../adapters/circle/circleExec";
 import { confirmTransaction, submitAndConfirm } from "../adapters/circle/circleExec";
+import { circleRefId } from "../adapters/circle/circleRefId";
 import type { CircleWalletsApi } from "../adapters/circle/circleWallets";
 import type {
   BridgeLegName,
@@ -225,7 +226,7 @@ export async function runCircleBridge(d: CircleBridgeDeps, amount: bigint): Prom
                 contractAddress,
                 callData,
                 idempotencySeed: `${leg.bridgeKey}:${leg.leg}:${attempt}`,
-                refId: `${d.entityKey}:${leg.leg}`,
+                refId: circleRefId([d.entityKey, leg.leg]),
               },
               confirmOpts,
             );

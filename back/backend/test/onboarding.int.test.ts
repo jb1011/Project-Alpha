@@ -177,10 +177,14 @@ test("optional fundAmount runs the fund step: status 'funded' and treasury holds
   });
 
   expect(rec.status).toBe("funded");
-  expect(repo.listEvents(key).map((e) => e.step)).toEqual([
-    "createEntity",
-    "setAgentWallet",
-    "fundTreasury",
+  // A transfer is TWO facts now, and the trail says both: `submitted` the moment the broadcast has
+  // a hash (before anything waits on a receipt, so a restart cannot lose it), then `funded` once
+  // the receipt confirms. Asserting the statuses as well as the steps pins the pair.
+  expect(repo.listEvents(key).map((e) => `${e.step}/${e.status}`)).toEqual([
+    "createEntity/created",
+    "setAgentWallet/bound",
+    "fundTreasury/submitted",
+    "fundTreasury/funded",
   ]);
   const bal = await pub.readContract({
     address: stack.usdc,
@@ -231,11 +235,15 @@ test("re-funding an already-funded entity moves more USDC (audit fix B-safe: re-
   });
   expect(second.status).toBe("funded");
   expect(second.fundTxHash).not.toBe(first.fundTxHash);
-  expect(repo.listEvents(key).map((e) => e.step)).toEqual([
-    "createEntity",
-    "setAgentWallet",
-    "fundTreasury",
-    "fundTreasury",
+  // The top-up is a second submission and a second confirmation, and the FIRST pair is settled —
+  // which is what stops the reconcile from re-litigating an old hash on every later fund.
+  expect(repo.listEvents(key).map((e) => `${e.step}/${e.status}`)).toEqual([
+    "createEntity/created",
+    "setAgentWallet/bound",
+    "fundTreasury/submitted",
+    "fundTreasury/funded",
+    "fundTreasury/submitted",
+    "fundTreasury/funded",
   ]);
 
   const bal = await pub.readContract({

@@ -49,6 +49,24 @@ test("buildX402DemoDeps returns undefined when the flag is off", () => {
   expect(buildX402DemoDeps(cfg)).toBeUndefined();
 });
 
+// The flag ON with no payTo is the case that used to resolve to the platform account's address:
+// a demo seller quietly collecting strangers' USDC into the governance key's wallet. It is a
+// MISSING DEPENDENCY, handled the way this builder already handles one — nothing is mounted, so
+// the routes 404 rather than advertising a wall whose payout nobody chose.
+test("buildX402DemoDeps returns undefined when the flag is ON but X402_DEMO_PAYTO is unset", () => {
+  const cfg = {
+    enableX402Demo: true,
+    x402DemoPayTo: undefined,
+    usdc: DEPS.asset,
+    chainId: 5042002,
+    x402DemoPriceUsdc: "0.01",
+    gatewayFacilitatorUrl: DEPS.facilitatorUrl,
+    metadataBaseUrl: "https://example.test/backend",
+    platformPrivateKey: `0x${"1".repeat(64)}`,
+  } as unknown as Config;
+  expect(buildX402DemoDeps(cfg)).toBeUndefined();
+});
+
 test("buildX402DemoDeps builds Arc deps from config when on", () => {
   const cfg = {
     enableX402Demo: true,

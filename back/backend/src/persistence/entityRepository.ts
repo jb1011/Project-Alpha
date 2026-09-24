@@ -10,6 +10,25 @@ export interface EventRow {
   createdAt: string;
 }
 
+/** One treasury transfer that was broadcast and never settled. See
+ *  `EntityRepository.listUnresolvedFundSubmissions`. */
+export interface FundSubmissionRow {
+  idempotencyKey: string;
+  txHash: string;
+  /** The atomic amount, as it was written on the `submitted` event. Null only if that row was
+   *  written without one, which no current writer does. */
+  amount: string | null;
+  /** The SIGNED BYTES. What makes a re-broadcast the same transaction rather than a second one at
+   *  a new nonce. Null on rows written before the sign-then-persist design. */
+  rawTx: string | null;
+  /** The nonce those bytes were signed at — the only way to tell "still pending" from "dropped".
+   *  Null on rows written before the sign-then-persist design. */
+  nonce: number | null;
+  /** When the submission was recorded (SQLite UTC, "YYYY-MM-DD HH:MM:SS"). The age gate reads it:
+   *  below ten minutes, "no receipt" is just a transaction waiting to be mined. */
+  createdAt: string | null;
+}
+
 export interface EntityRepository {
   upsert(record: EntityRecord): void;
   /**
@@ -69,8 +88,53 @@ export interface EntityRepository {
   setHederaIdentity(key: string, id: { agentId: string; registerTx: string; uaid: string }): void;
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
   transaction<T>(fn: () => T): T;
-  /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
+  /**
+   * Total atomic USDC this tenant's funding has committed: confirmed transfers PLUS unresolved
+   * submissions.
+   *
+   * ⚠ "Presumed moved until proven reverted" (verification gate, 2026-09-18). It used to count
+   * `funded` events only, which meant a broadcast whose receipt we could not read — money that
+   * has very probably left the platform wallet — consumed no quota at all, and none ever if
+   * nobody retried. The lifetime cap is a brake on platform funds, so it has to count the money
+   * we can no longer account for; a `reverted` event is what removes it again.
+   */
   sumFundedByTenant(tenantId: string): bigint;
+  /**
+   * Broadcast treasury transfers whose fate is still unknown: a `fundTreasury`/`submitted` event
+   * with no `funded` or `reverted` event carrying the SAME hash.
+   *
+   * ⚠ Keyed by HASH, never by recency (gate N1). The previous rule — "the last fundTreasury
+   * event" — was silently defeated by the runner appending a `failed` row after the submission,
+   * and the reconcile then never ran, so a retry sent a second real transfer. Any number of
+   * unrelated rows may sit after a submission; only a settlement of the same hash closes it.
+   *
+   * Without `key`, every entity: that is the boot sweep's work queue.
+   */
+  listUnresolvedFundSubmissions(key?: string): FundSubmissionRow[];
+  /**
+   * Write a `fundTreasury` RESOLUTION for this hash — `funded`, `reverted` or `dropped` — unless
+   * this hash already has one that outranks it.
+   *
+   * ⚠ ONE asymmetry, and it is the point (gate N11): `dropped` is an INFERENCE of ours (two
+   * definitive absences plus an advanced nonce past the age gate), while `funded` and `reverted`
+   * are the CHAIN ANSWERING. So a receipt may supersede a `dropped` — the guard for `funded` asks
+   * only about `funded`/`reverted` rows — but nothing may supersede a receipt, and an inference may
+   * never overwrite anything.
+   *
+   * One statement, so the check and the write cannot be separated by a race. The boot sweep runs
+   * while the API is serving, so it and a live fund saga can reach the same transfer at the same
+   * moment; two `funded` rows for one transfer charge the tenant's lifetime cap twice and tell the
+   * audit trail the treasury was funded twice (gate N5), and two `dropped`/`reverted` rows are the
+   * same defect one column along (gate N10). A hash gets ONE verdict, whoever writes it first.
+   *
+   * Returns whether a row was written.
+   */
+  recordFundResolutionOnce(
+    key: string,
+    txHash: string,
+    status: "funded" | "reverted" | "dropped",
+    detail: string,
+  ): boolean;
   /** Entities with an on-chain ERC-8004 identity that finished the on-chain leg of onboarding
    *  (created/bound/funded) — the rows the public transparency surface may enumerate. Selected
    *  directly (not via EntityRecord) because the surface needs created_at, which toRecord does
@@ -513,16 +577,85 @@ export class SqliteEntityRepository implements EntityRepository {
     return this.db.transaction(fn)();
   }
 
-  /** Total atomic USDC ever moved platform->treasuries for this tenant (successful funds only). */
+  /**
+   * Confirmed transfers PLUS unresolved submissions — see the interface for why.
+   *
+   * The two halves cannot double-count: a success writes its `funded` event with the SAME hash as
+   * its `submitted` one, which resolves the submission and removes it from the second half.
+   */
   sumFundedByTenant(tenantId: string): bigint {
     const row = this.db
       .prepare(`
-        SELECT COALESCE(SUM(CAST(json_extract(e.detail, '$.amount') AS INTEGER)), 0) AS total
-        FROM events e JOIN entities t ON t.idempotency_key = e.idempotency_key
-        WHERE e.step = 'fundTreasury' AND e.status = 'funded' AND t.owner_tenant_id = ?
+        SELECT COALESCE(SUM(amount), 0) AS total FROM (
+          SELECT CAST(json_extract(e.detail, '$.amount') AS INTEGER) AS amount
+          FROM events e JOIN entities t ON t.idempotency_key = e.idempotency_key
+          WHERE e.step = 'fundTreasury' AND e.status = 'funded' AND t.owner_tenant_id = ?
+          UNION ALL
+          SELECT CAST(json_extract(s.detail, '$.amount') AS INTEGER) AS amount
+          FROM events s JOIN entities t2 ON t2.idempotency_key = s.idempotency_key
+          WHERE s.step = 'fundTreasury' AND s.status = 'submitted' AND s.tx_hash IS NOT NULL
+            AND t2.owner_tenant_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM events r
+              WHERE r.idempotency_key = s.idempotency_key AND r.step = 'fundTreasury'
+                AND r.status IN ('funded', 'reverted', 'dropped') AND r.tx_hash = s.tx_hash
+            )
+        )
       `)
-      .get(tenantId) as { total: number | bigint };
+      .get(tenantId, tenantId) as { total: number | bigint };
     return BigInt(row.total);
+  }
+
+  listUnresolvedFundSubmissions(key?: string): FundSubmissionRow[] {
+    return this.db
+      .prepare(`
+        SELECT s.idempotency_key AS idempotencyKey, s.tx_hash AS txHash,
+               json_extract(s.detail, '$.amount') AS amount,
+               json_extract(s.detail, '$.rawTx') AS rawTx,
+               json_extract(s.detail, '$.nonce') AS nonce,
+               s.created_at AS createdAt
+        FROM events s
+        WHERE s.step = 'fundTreasury' AND s.status = 'submitted' AND s.tx_hash IS NOT NULL
+          AND (? IS NULL OR s.idempotency_key = ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM events r
+            WHERE r.idempotency_key = s.idempotency_key AND r.step = 'fundTreasury'
+              AND r.status IN ('funded', 'reverted', 'dropped') AND r.tx_hash = s.tx_hash
+          )
+        ORDER BY s.id
+      `)
+      .all(key ?? null, key ?? null) as FundSubmissionRow[];
+  }
+
+  recordFundResolutionOnce(
+    key: string,
+    txHash: string,
+    status: "funded" | "reverted" | "dropped",
+    detail: string,
+  ): boolean {
+    // INSERT ... SELECT ... WHERE NOT EXISTS: the guard and the write are ONE statement, so no
+    // interleaving can produce a second verdict for the same transfer. (A partial UNIQUE index was
+    // the alternative; it would have to be added by a migration that fails at boot on any database
+    // already holding a duplicate, and this needs no migration at all.)
+    //
+    // WHICH existing verdicts block this one: a receipt (`funded`) is blocked only by another
+    // receipt, so it can still be written over a `dropped` we inferred; an inference is blocked by
+    // any verdict at all. Expressed as data rather than as two statements so the guard and the
+    // write stay one statement.
+    const blockers =
+      status === "funded" ? ["funded", "reverted"] : ["funded", "reverted", "dropped"];
+    const info = this.db
+      .prepare(`
+        INSERT INTO events (idempotency_key, step, status, tx_hash, detail)
+        SELECT ?, 'fundTreasury', ?, ?, ?
+        WHERE NOT EXISTS (
+          SELECT 1 FROM events
+          WHERE idempotency_key = ? AND step = 'fundTreasury'
+            AND status IN (${blockers.map(() => "?").join(", ")}) AND tx_hash = ?
+        )
+      `)
+      .run(key, status, txHash, detail, key, ...blockers, txHash);
+    return info.changes > 0;
   }
 
   listPublicOnChain(): PublicEntityRow[] {

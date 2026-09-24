@@ -130,6 +130,8 @@ function seedJob(entityKey: string, status: JobStatus) {
     completeTxHash: null,
     sweepTxHash: null,
     reputationTxHash: null,
+    refundTxHash: null,
+    escrowState: null,
     error: null,
   });
 }

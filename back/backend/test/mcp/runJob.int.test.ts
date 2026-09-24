@@ -42,6 +42,8 @@ const baseJob: JobRecord = {
   completeTxHash: null,
   sweepTxHash: null,
   reputationTxHash: null,
+  refundTxHash: null,
+  escrowState: null,
   error: null,
 };
 
@@ -278,6 +280,94 @@ test("run_job defaults the budget to 1.00 USDC (1_000_000n) when budgetUsdc is o
     expect(res.isError).toBeFalsy();
     expect(startCalls).toHaveLength(1);
     expect(startCalls[0]!.budget).toBe(1_000_000n);
+  } finally {
+    await close();
+  }
+});
+
+// --- No job client configured: the escrow payer is a var, never the platform key ---
+
+test("run_job reports unavailable naming JOB_CLIENT_PRIVATE_KEY when no job client is configured", async () => {
+  const entityId = repoSeed(TENANT, "agent1");
+  // Same app, the job-client half of the wiring absent — `JOB_CLIENT_PRIVATE_KEY` unset, so
+  // `buildJobDeps` built no client wallet and there is no escrow payer to start a saga with.
+  const noClientApp = buildApiApp({
+    webOrigin: "*",
+    nonceStore: new SqliteNonceStore(db),
+    siweDomain: "wizard.local",
+    chainId: 5042002,
+    jwtSecret: "s",
+    jwtTtlSec: 3600,
+    repo,
+    runner: new OnboardingRunner({
+      repo,
+      runSaga: async (i: { idempotencyKey: string }) =>
+        repo.findByIdempotencyKey(i.idempotencyKey)!,
+      fundCaps: TEST_FUND_CAPS,
+    }),
+    passkeyRpId: "wizard.local",
+    apiKeys,
+    passkeys: new SqlitePasskeyStore(db),
+    jobs,
+    jobRunner: undefined,
+    jobClientAddress: undefined,
+    jobEvaluatorAddress: undefined,
+    maxJobBudget: MAX_JOB_BUDGET,
+    maxInflightJobsPerTenant: MAX_INFLIGHT_JOBS_PER_TENANT,
+  } as never);
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(noClientApp, key);
+  try {
+    const res = await client.callTool({ name: "run_job", arguments: { id: entityId } });
+    expect(res.isError).toBe(true);
+    expect((res.content as { text: string }[])[0]!.text).toContain("JOB_CLIENT_PRIVATE_KEY");
+    expect(startCalls).toHaveLength(0);
+  } finally {
+    await close();
+  }
+});
+
+test("get_job and list_jobs keep answering with no job client configured", async () => {
+  const entityId = repoSeed(TENANT, "agent1");
+  jobs.upsert({ ...baseJob, jobKey: `${entityId}:old`, entityKey: entityId, status: "completed" });
+  const noClientApp = buildApiApp({
+    webOrigin: "*",
+    nonceStore: new SqliteNonceStore(db),
+    siweDomain: "wizard.local",
+    chainId: 5042002,
+    jwtSecret: "s",
+    jwtTtlSec: 3600,
+    repo,
+    runner: new OnboardingRunner({
+      repo,
+      runSaga: async (i: { idempotencyKey: string }) =>
+        repo.findByIdempotencyKey(i.idempotencyKey)!,
+      fundCaps: TEST_FUND_CAPS,
+    }),
+    passkeyRpId: "wizard.local",
+    apiKeys,
+    passkeys: new SqlitePasskeyStore(db),
+    jobs,
+    jobRunner: undefined,
+    jobClientAddress: undefined,
+    jobEvaluatorAddress: undefined,
+    maxJobBudget: MAX_JOB_BUDGET,
+    maxInflightJobsPerTenant: MAX_INFLIGHT_JOBS_PER_TENANT,
+  } as never);
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(noClientApp, key);
+  try {
+    const one = await client.callTool({
+      name: "get_job",
+      arguments: { jobKey: `${entityId}:old` },
+    });
+    expect(one.isError).toBeFalsy();
+    expect(JSON.parse((one.content as { text: string }[])[0]!.text).jobKey).toBe(`${entityId}:old`);
+    const list = await client.callTool({ name: "list_jobs", arguments: { id: entityId } });
+    expect(list.isError).toBeFalsy();
+    expect(JSON.parse((list.content as { text: string }[])[0]!.text)).toHaveLength(1);
   } finally {
     await close();
   }

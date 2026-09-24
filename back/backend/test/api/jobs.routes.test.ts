@@ -69,6 +69,36 @@ function makeApp() {
   return { app, jobRunner };
 }
 
+/**
+ * The same app on a deployment with NO job client configured — `JOB_CLIENT_PRIVATE_KEY` unset, so
+ * `buildJobDeps` never built a client wallet and the composition root has no runner or client
+ * address to hand over. The job REPOSITORY is still wired: reading jobs needs SQLite, not a key.
+ */
+function makeAppWithoutJobClient() {
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
+  });
+  return buildApiApp({
+    webOrigin: "*",
+    nonceStore: new SqliteNonceStore(db),
+    siweDomain: DOMAIN,
+    chainId: CHAIN,
+    jwtSecret: "s",
+    jwtTtlSec: 3600,
+    repo,
+    runner,
+    passkeyRpId: "wizard.local",
+    jobs,
+    jobRunner: undefined,
+    jobClientAddress: undefined,
+    jobEvaluatorAddress: undefined,
+    maxJobBudget: MAX_JOB_BUDGET,
+    maxInflightJobsPerTenant: MAX_INFLIGHT_JOBS_PER_TENANT,
+  } as never);
+}
+
 async function login(app: ReturnType<typeof buildApiApp>, acct: typeof account = account) {
   const nonce = (await (await app.request("/auth/nonce")).json()).nonce as string;
   const message = createSiweMessage({
@@ -233,6 +263,69 @@ test("no auth → GET /jobs/anything → 401", async () => {
   const { app } = makeApp();
   const res = await app.request("/jobs/anything");
   expect(res.status).toBe(401);
+});
+
+// --- No job client configured: the escrow payer is a var, never the platform key ---
+
+test("POST /entities/:id/jobs answers 503 naming JOB_CLIENT_PRIVATE_KEY when no job client is configured", async () => {
+  const app = makeAppWithoutJobClient();
+  const token = await login(app);
+  const entityId = seedEntity(account.address, "agent1");
+
+  const res = await app.request(`/entities/${encodeURIComponent(entityId)}/jobs`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ budget: "1.00", description: "no client" }),
+  });
+  expect(res.status).toBe(503);
+  const body = await res.json();
+  expect(body.error.message).toContain("JOB_CLIENT_PRIVATE_KEY");
+  // Refused at the door: nothing was written, so no job can later be resumed against no client.
+  expect(jobs.listByEntity(entityId)).toHaveLength(0);
+});
+
+test("read-only job routes keep working with no job client configured", async () => {
+  const app = makeAppWithoutJobClient();
+  const token = await login(app);
+  const entityId = seedEntity(account.address, "agent1");
+  // A job from before the key went missing — the rows outlive the credential.
+  jobs.upsert({
+    jobKey: `${entityId}:old`,
+    jobId: null,
+    entityKey: entityId,
+    ownerTenantId: account.address,
+    status: "completed",
+    clientAddress: CLIENT_ADDR,
+    evaluatorAddress: EVALUATOR_ADDR,
+    providerAddress: "0x000000000000000000000000000000000000000B",
+    budgetAmount: "1000000",
+    description: "historic job",
+    deliverableHash: null,
+    deliverablePath: null,
+    createTxHash: null,
+    fundTxHash: null,
+    submitTxHash: null,
+    completeTxHash: null,
+    sweepTxHash: null,
+    reputationTxHash: null,
+    refundTxHash: null,
+    escrowState: null,
+    error: null,
+    createdAt: null,
+    updatedAt: null,
+  });
+
+  const one = await app.request(`/jobs/${encodeURIComponent(`${entityId}:old`)}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(one.status).toBe(200);
+  expect((await one.json()).description).toBe("historic job");
+
+  const list = await app.request(`/entities/${encodeURIComponent(entityId)}/jobs`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(list.status).toBe(200);
+  expect(await list.json()).toHaveLength(1);
 });
 
 // --- Audit fix A: run_job budget + per-tenant in-flight caps (REST twin) ---

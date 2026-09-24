@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { type Address, hexToString, toHex } from "viem";
 import type { ArcAdapter } from "../adapters/arc/arcAdapter";
+import { withSenderLock } from "../adapters/arc/senderLock";
 import { buildWalletSetTypedData } from "../adapters/arc/walletSet";
 import type { DoolaApi } from "../adapters/doola/doolaClient";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { GuardianPasskey } from "../adapters/turnkey/provisioner";
 import type { OperatorSigner } from "../adapters/turnkey/signer";
+import { BroadcastUnconfirmedError, PriorTransferUnconfirmedError } from "../errors";
 import type { MetadataAnchor } from "../oa/generator";
 import { computeOaHash, renderMetadata, renderOperatingAgreement } from "../oa/generator";
 import {
@@ -27,6 +29,13 @@ import { assertOperatorDistinct, translate } from "../policy/translator";
 import { usdToUnits } from "../policy/units";
 import type { EntityRecord, FormationPin, Hex } from "../types";
 import { runFormationCreateProvider } from "./formationProvider";
+import {
+  finaliseFunded,
+  priorTransferError,
+  recordSubmission,
+  resolveSubmissions,
+} from "./fundSubmissions";
+import { publicErrorMessage } from "./publicError";
 
 /** Result of provisioning a per-agent Turnkey vault (the saga only needs these three fields). */
 export interface ProvisionedVault {
@@ -65,6 +74,8 @@ export interface OnboardingDeps {
   /** Validated AgentSpec JSON; persisted so the reconciler/fund can re-run the saga. */
   specJson?: string;
   fundAmount?: bigint; // optional: top up the treasury after binding (status -> funded)
+  /** Clock the funding age gate reads (tests inject it). Default `Date.now`. */
+  now?: () => number;
   /** S5: records the platform->treasury outflow on success (check happens in runner.fund). */
   outflows?: { record(path: "fund_treasury", amountAtomic: bigint, ref: string | null): void };
   // ── Per-agent Turnkey vault (Step 0). When BOTH `provision` and `guardianPasskey` are present, the
@@ -677,24 +688,82 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
   //    so this must actually move USDC on a re-run instead of silently skipping it). Skip only if no
   //    amount was requested or the entity isn't funded/fundable yet.
   if (d.fundAmount && d.fundAmount > 0n && (rec.status === "bound" || rec.status === "funded")) {
-    const txHash = await d.arc.fundTreasury({
-      usdc: rec.treasuryConfig!.usdc,
-      treasury: rec.treasury! as Address,
-      amount: d.fundAmount,
-    });
-    d.outflows?.record("fund_treasury", d.fundAmount, txHash);
-    const funded: EntityRecord = { ...rec, status: "funded", fundTxHash: txHash };
-    rec = funded;
-    d.repo.transaction(() => {
-      d.repo.upsert(funded);
-      d.repo.recordEvent(
-        key,
-        "fundTreasury",
-        "funded",
-        txHash,
-        JSON.stringify({ amount: d.fundAmount?.toString() }),
-      );
-    });
+    // ── RESOLVE FIRST, ALWAYS (gate N1). Every broadcast this entity has made and never settled
+    //    is asked about before a single new one is considered. `resolveSubmissions` keys on the
+    //    transaction HASH, so no row appended afterwards — a runner `failed`, a `sagaTail`, a
+    //    future writer's anything — can make an outstanding transfer look settled.
+    let resolution: Awaited<ReturnType<typeof resolveSubmissions>>;
+    try {
+      resolution = await resolveSubmissions(d, key);
+    } catch (e) {
+      // The receipt read BROKE while this entity has money in flight (gate N8). Anything we say
+      // about the chain here would be a guess, and the one sentence we must never reach is the
+      // rate-limit one — it ends "Nothing was sent", which is false while a submission is open.
+      // So: refuse, naming the transfer, and keep the original error as the cause so the operator
+      // diagnostic still carries the 429.
+      const open = d.repo.listUnresolvedFundSubmissions(key)[0];
+      if (open) throw new PriorTransferUnconfirmedError(open.txHash as Hex, { cause: e });
+      throw e;
+    }
+    // EVERY landed submission is adopted, not just the first (gate N7): each one is a real
+    // transfer, and leaving one unrecorded under-counts the tenant's quota by its whole amount.
+    for (const landed of resolution.landed)
+      rec = finaliseFunded(d.repo, rec, landed.txHash, landed.amount ?? d.fundAmount, true);
+    if (resolution.unresolved)
+      // Neither mined nor settled. Finalising would invent a transfer; sending would risk a second
+      // one. Refusing is the only honest answer, and the caller is told not to retry yet.
+      throw priorTransferError(resolution.unresolved);
+
+    if (resolution.landed.length === 0) {
+      // ── SIGN → PERSIST → SEND, ALL THREE UNDER THE PLATFORM KEY'S SEND LOCK.
+      //
+      //    The order is the whole of gates N2 and N4, and it is the sequence this repository
+      //    already proved for AgentBook registrations (`api/routes/agentBook.ts`): sign locally so
+      //    the hash is ours before anything is on the wire, write it down, and only then broadcast.
+      //    Persisting after the send left one window open — an `eth_sendRawTransaction` whose
+      //    response was lost after the node accepted the transaction produced no hash at all, and
+      //    the retry sent a second transfer.
+      //
+      //    The LOCK spans all three because the nonce is claimed by the SIGNATURE and spent by the
+      //    send: two entities funded in the same moment used to sign the same nonce, and one of the
+      //    two transfers was then rejected or replaced. The persist belongs inside — it is a
+      //    synchronous SQLite write, and it is what makes the claimed nonce recoverable — exactly
+      //    as `submitRegister` does it for the AgentBook submitter. The receipt wait stays OUTSIDE:
+      //    a lock held across it would stop every other platform send for as long as the chain
+      //    takes, and forever on a dropped transaction.
+      //
+      //    ...and so does the PREPARATION. `prepareFundTreasury` is the pre-flight, the gas and the
+      //    fees: slow, not nonce-critical, and inside the lock it would be time every other
+      //    platform send spends waiting on this one's RPC. Everything it raises happens before the
+      //    signature — an empty platform wallet reverts in its simulate, nothing was sent, and that
+      //    sentence stays true.
+      // Read off the record BEFORE the section: `rec` is reassigned as the saga advances, and the
+      // transfer must be the one this attempt decided on.
+      const prepared = await d.arc.prepareFundTreasury({
+        usdc: rec.treasuryConfig!.usdc,
+        treasury: rec.treasury! as Address,
+        amount: d.fundAmount,
+      });
+      const signed = await withSenderLock(d.arc.platformAddress, async () => {
+        const signed = await d.arc.signFundTreasury(prepared);
+        recordSubmission(d, key, signed, prepared.amount);
+        // ⚠ PAST THIS LINE NOTHING MAY SAY "NOTHING WAS SENT". The transaction is signed, recorded
+        // and about to be — or already — on the wire; a send that throws may still have been
+        // accepted, which is exactly the case this ordering exists for. The `submitted` row stands,
+        // and the next attempt (or the boot sweep) resolves it by receipt.
+        try {
+          await d.arc.sendRawFundTreasury(signed.rawTx);
+        } catch (e) {
+          throw new BroadcastUnconfirmedError(signed.txHash, "fundTreasury", { cause: e });
+        }
+        return signed;
+      });
+      // A failure to READ the receipt throws `BroadcastUnconfirmedError` and leaves the row
+      // standing; a REVERTED receipt throws a plain error, and the `reverted` row is written by
+      // whoever resolves the submission next.
+      await d.arc.confirmFundTreasury(signed.txHash);
+      rec = finaliseFunded(d.repo, rec, signed.txHash, d.fundAmount, false);
+    }
   }
 
   // ── Step 8 (optional): ENSIP-25 reverse binding. Write the agent's ENS name onto the registry
@@ -721,7 +790,10 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         "setEnsMetadata",
         rec.status,
         null,
-        `ens binding skipped: ${(e as Error).message}`,
+        // Sanitised (review R7): `events.detail` is persisted and goes through `redactPii` only,
+        // which is blind to credentials by its own comment. This is the same raw viem message that
+        // carried the RPC key on 2026-09-16, one column along.
+        `ens binding skipped: ${publicErrorMessage(e)}`,
       );
     }
   }
@@ -759,7 +831,8 @@ export async function runOnboarding(d: OnboardingDeps): Promise<EntityRecord> {
         "formationCreate",
         rec.status,
         null,
-        `formation create skipped: ${(e as Error).message}`,
+        // Sanitised for the reason the ENS catch above is (review R7).
+        `formation create skipped: ${publicErrorMessage(e)}`,
       );
     }
   }

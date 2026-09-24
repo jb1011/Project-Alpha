@@ -15,10 +15,18 @@
 import type { Address, Hex } from "viem";
 import type { JobAdapter } from "../adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../adapters/arc/reputationAdapter";
+import {
+  ChainTxRevertedError,
+  ChainTxUnconfirmedError,
+  JobFundRevertedError,
+  JobFundUnconfirmedError,
+} from "../errors";
+import { opsLog } from "../observability/opsLog";
 import { providerOf, requireCircleWallets } from "../payments/provider";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { EntityRecord } from "../types";
+import { publicErrorMessage } from "../workflow/publicError";
 import type { JobRepository } from "./jobRepository";
 import type { JobRecord } from "./types";
 import type { JobWorker } from "./worker";
@@ -79,6 +87,16 @@ export interface RunJobDeps {
   providerOpsFor: (entity: EntityRecord, jobKey: string) => ProviderJobOps;
   /** If true, sweep USDC to treasury after the job completes (Step 5, Task 6.3). */
   sweepToTreasury: boolean;
+  /**
+   * Get this job's escrow back when a step AFTER funding fails (`jobs/refund.ts`).
+   *
+   * Optional only because most test compositions stop at the funding boundary and have no escrow
+   * to recover. `jobs/composition.ts` always passes it — the very function it also hands the
+   * runner's boot walk and the `refund_job` tool, which `test/jobs/composition.test.ts` asserts
+   * is one and the same. Absent = a funded job that dies leaves its budget in the contract,
+   * which is the behaviour this dependency exists to end.
+   */
+  recoverEscrow?: (jobKey: string) => Promise<unknown>;
   /** Seconds until the on-chain job expires (default: 3600 = 1 hour). */
   expiryWindowSec?: number;
   /** Override current unix timestamp (seconds); useful in tests. */
@@ -153,6 +171,8 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
       completeTxHash: null,
       sweepTxHash: null,
       reputationTxHash: null,
+      refundTxHash: null,
+      escrowState: null,
       error: null,
     };
     d.jobs.upsert(rec);
@@ -201,7 +221,33 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
     const ops = d.providerOpsFor(entity, d.jobKey);
 
     await ops.setBudget(BigInt(rec.jobId!), d.budget);
-    const fundTxHash = await d.job.approveAndFund(BigInt(rec.jobId!), d.usdc, d.budget);
+    // BOOK ONLY WHAT MOVED. `approveAndFund` returns a hash only once BOTH receipts came back
+    // successful (`adapters/arc/jobAdapter.ts`, `receipts.ts`), so everything below this line —
+    // the outflow against the S5 ceiling, the `funded` row, the `funded` event — is written about
+    // a transfer the chain actually made. Before 2026-09-22 it was written about a hash: a `fund`
+    // mined at `status: 0x0` (the allowance was spent by a job on another entity) booked 0.5 USDC
+    // as money that had left, and the next step then failed against a job still at Open.
+    let fundTxHash: Hex;
+    try {
+      fundTxHash = await d.job.approveAndFund(BigInt(rec.jobId!), d.usdc, d.budget);
+    } catch (e) {
+      // A funding that reverted is a recorded failure, not a silence: the trail keeps the hash an
+      // operator can look up. The runner marks the row `failed` with this error's public message.
+      if (e instanceof JobFundRevertedError)
+        d.jobs.recordEvent(d.jobKey, "fund", "failed", e.txHash, JSON.stringify({ step: e.step }));
+      // A DIFFERENT FACT, and the trail has to keep them apart: the transaction was sent and may
+      // still fund the escrow, so this is the hash an operator checks before anyone re-runs the
+      // job. Nothing is booked either way — booking requires knowing.
+      if (e instanceof JobFundUnconfirmedError)
+        d.jobs.recordEvent(
+          d.jobKey,
+          "fund",
+          "unconfirmed",
+          e.txHash,
+          JSON.stringify({ step: e.step }),
+        );
+      throw e;
+    }
     d.outflows?.record("job_fund", d.budget, fundTxHash);
 
     const updated: JobRecord = {
@@ -218,96 +264,149 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
     rec = updated;
   }
 
-  // --- Step 3: work + submit (provider = the agent's enclave operator) ---
-  if (rec.status === "funded") {
-    const { content, deliverableHash } = await d.worker.produceDeliverable({
-      jobKey: d.jobKey,
-      description: d.description,
-    });
-    const put = d.docStore.put(`job-${d.jobKey}.txt`, content);
-    const submitTx = await d
-      .providerOpsFor(entity, d.jobKey)
-      .submit(BigInt(rec.jobId!), deliverableHash);
+  // ── STEPS 3 ONWARD: EVERYTHING THAT HAPPENS WITH THE MONEY ALREADY IN THE ESCROW ─────────
+  //
+  // ⚠ A FAILURE PAST THIS LINE LEAVES THE BUDGET IN THE CONTRACT. The runner will mark this row
+  // `failed`, which is terminal and correct about the saga — and says nothing about the money. So
+  // the escrow recovery runs here, BEFORE the throw goes up, while we still know that this job
+  // funded and then died (`jobs/refund.ts` reads the chain and decides what may be sent).
+  //
+  // ⚠ THE ORIGINAL ERROR IS WHAT THE RUNNER STORES. A recovery that itself fails must never
+  // become the explanation of why the job died, so nothing it throws leaves this block.
+  // WHICH PHASE IS RUNNING, for the trail line the failure below writes. Inferring it from the
+  // row's status put `submit/failed` on the trail for a deliverable that never reached a submit —
+  // an operator reading that goes looking for a transaction nobody sent.
+  let phase: "deliverable" | "submit" | "complete" = "deliverable";
+  try {
+    // --- Step 3: work + submit (provider = the agent's enclave operator) ---
+    if (rec.status === "funded") {
+      phase = "deliverable";
+      const { content, deliverableHash } = await d.worker.produceDeliverable({
+        jobKey: d.jobKey,
+        description: d.description,
+      });
+      const put = d.docStore.put(`job-${d.jobKey}.txt`, content);
+      phase = "submit";
+      const submitTx = await d
+        .providerOpsFor(entity, d.jobKey)
+        .submit(BigInt(rec.jobId!), deliverableHash);
 
-    const submitted: JobRecord = {
-      ...rec,
-      status: "submitted",
-      deliverableHash,
-      deliverablePath: put.path,
-      submitTxHash: submitTx,
-    };
-    d.jobs.transaction(() => {
-      d.jobs.upsert(submitted);
-      d.jobs.recordEvent(d.jobKey, "submit", "submitted", submitTx, null);
-    });
-    rec = submitted;
-  }
+      const submitted: JobRecord = {
+        ...rec,
+        status: "submitted",
+        deliverableHash,
+        deliverablePath: put.path,
+        submitTxHash: submitTx,
+      };
+      d.jobs.transaction(() => {
+        d.jobs.upsert(submitted);
+        d.jobs.recordEvent(d.jobKey, "submit", "submitted", submitTx, null);
+      });
+      rec = submitted;
+    }
 
-  // --- Step 4: evaluator complete → USDC released to provider ---
-  if (rec.status === "submitted") {
-    const completeTx = await d.job.complete(BigInt(rec.jobId!), `0x${"00".repeat(32)}` as Hex);
+    // --- Step 4: evaluator complete → USDC released to provider ---
+    if (rec.status === "submitted") {
+      phase = "complete";
+      const completeTx = await d.job.complete(BigInt(rec.jobId!), `0x${"00".repeat(32)}` as Hex);
 
-    const completed: JobRecord = {
-      ...rec,
-      status: "completed",
-      completeTxHash: completeTx,
-    };
-    d.jobs.transaction(() => {
-      d.jobs.upsert(completed);
-      d.jobs.recordEvent(d.jobKey, "complete", "completed", completeTx, null);
-    });
-    rec = completed;
-  }
+      const completed: JobRecord = {
+        ...rec,
+        status: "completed",
+        completeTxHash: completeTx,
+      };
+      d.jobs.transaction(() => {
+        d.jobs.upsert(completed);
+        d.jobs.recordEvent(d.jobKey, "complete", "completed", completeTx, null);
+      });
+      rec = completed;
+    }
 
-  // --- Step 4.5 (optional): sweep earnings operator → treasury (best-effort, never blocks Step 5) ---
-  if (rec.status === "completed" && d.sweepToTreasury && !rec.sweepTxHash && entity.treasury) {
-    try {
-      // Read the operator's actual current USDC balance rather than the static budget.
-      // After paying for setBudget/submit gas in USDC, the operator balance is strictly
-      // less than `budget`; using the static amount would always revert on-chain.
-      const bal = await d.job.usdcBalanceOf(d.usdc, entity.operator as Address);
-      // Keep a small gas reserve so the sweep tx itself can pay its own USDC gas. (On the circle
-      // path Gas Station sponsors the fee, so the reserve is merely conservative, not load-bearing.)
-      const SWEEP_GAS_RESERVE = 10_000n; // 0.01 USDC
-      const sweepAmount = bal > SWEEP_GAS_RESERVE ? bal - SWEEP_GAS_RESERVE : 0n;
-      if (sweepAmount > 0n) {
-        const sweepTx = await d
-          .providerOpsFor(entity, d.jobKey)
-          .sweepToTreasury(d.usdc, entity.treasury as Address, sweepAmount);
-        rec = { ...rec, sweepTxHash: sweepTx };
-        d.jobs.transaction(() => {
-          d.jobs.upsert(rec!);
-          d.jobs.recordEvent(d.jobKey, "sweep", "completed", sweepTx, null);
-        });
-      } else {
-        // Balance too low to sweep after reserving gas — skip, leave sweepTxHash null.
-        rec = { ...rec, error: "sweep skipped: operator balance ≤ gas reserve" };
+    // --- Step 4.5 (optional): sweep earnings operator → treasury (best-effort, never blocks Step 5) ---
+    if (rec.status === "completed" && d.sweepToTreasury && !rec.sweepTxHash && entity.treasury) {
+      try {
+        // Read the operator's actual current USDC balance rather than the static budget.
+        // After paying for setBudget/submit gas in USDC, the operator balance is strictly
+        // less than `budget`; using the static amount would always revert on-chain.
+        const bal = await d.job.usdcBalanceOf(d.usdc, entity.operator as Address);
+        // Keep a small gas reserve so the sweep tx itself can pay its own USDC gas. (On the circle
+        // path Gas Station sponsors the fee, so the reserve is merely conservative, not load-bearing.)
+        const SWEEP_GAS_RESERVE = 10_000n; // 0.01 USDC
+        const sweepAmount = bal > SWEEP_GAS_RESERVE ? bal - SWEEP_GAS_RESERVE : 0n;
+        if (sweepAmount > 0n) {
+          const sweepTx = await d
+            .providerOpsFor(entity, d.jobKey)
+            .sweepToTreasury(d.usdc, entity.treasury as Address, sweepAmount);
+          rec = { ...rec, sweepTxHash: sweepTx };
+          d.jobs.transaction(() => {
+            d.jobs.upsert(rec!);
+            d.jobs.recordEvent(d.jobKey, "sweep", "completed", sweepTx, null);
+          });
+        } else {
+          // Balance too low to sweep after reserving gas — skip, leave sweepTxHash null.
+          rec = { ...rec, error: "sweep skipped: operator balance ≤ gas reserve" };
+          d.jobs.upsert(rec);
+        }
+      } catch (e) {
+        // Sweep failure is retryable — status stays `completed`, fall through to Step 5.
+        rec = { ...rec, error: `sweep pending: ${(e as Error).message}` };
         d.jobs.upsert(rec);
       }
-    } catch (e) {
-      // Sweep failure is retryable — status stays `completed`, fall through to Step 5.
-      rec = { ...rec, error: `sweep pending: ${(e as Error).message}` };
-      d.jobs.upsert(rec);
     }
-  }
 
-  // --- Step 5: reputation (best-effort; never unwinds settlement) ---
-  if (rec.status === "completed") {
-    try {
-      const repTx = await d.reputation.record({
-        agentId: BigInt(entity.agentId!),
-        value: 5,
-        feedbackHash: rec.deliverableHash as Hex,
-      });
-      rec = { ...rec, status: "reputed", reputationTxHash: repTx, error: null };
-      d.jobs.transaction(() => {
-        d.jobs.upsert(rec!);
-        d.jobs.recordEvent(d.jobKey, "reputation", "reputed", repTx, null);
-      });
-    } catch (e) {
-      rec = { ...rec, error: `reputation pending: ${(e as Error).message}` };
-      d.jobs.upsert(rec); // stays 'completed' — retryable
+    // --- Step 5: reputation (best-effort; never unwinds settlement) ---
+    if (rec.status === "completed") {
+      try {
+        const repTx = await d.reputation.record({
+          agentId: BigInt(entity.agentId!),
+          value: 5,
+          feedbackHash: rec.deliverableHash as Hex,
+        });
+        rec = { ...rec, status: "reputed", reputationTxHash: repTx, error: null };
+        d.jobs.transaction(() => {
+          d.jobs.upsert(rec!);
+          d.jobs.recordEvent(d.jobKey, "reputation", "reputed", repTx, null);
+        });
+      } catch (e) {
+        // Sanitised (review R7, same class): this is a persisted, caller-visible `error` field on
+        // the JOB record, written from a raw chain error — the exact shape that put an RPC key on
+        // screen on 2026-09-16, one table along.
+        rec = { ...rec, error: `reputation pending: ${publicErrorMessage(e)}` };
+        d.jobs.upsert(rec); // stays 'completed' — retryable
+      }
     }
+  } catch (e) {
+    // Only a job whose row got as far as `funded` has an escrow to recover. Anything that threw
+    // earlier never moved money (#145), and a `completed` row has already released it.
+    if (rec?.status === "funded" || rec?.status === "submitted") {
+      // THE TRAIL NAMES THE STEP THAT DIED, before it names what we did about the money — so it
+      // reads `submit`/`failed` → `refund`/`refunded` rather than starting at the refund and
+      // leaving an operator to guess what the refund was for. The step is the saga phase the row
+      // is in, in the same words its success writes (`submit`, `complete`) or the name of the
+      // phase that has no transaction of its own (`deliverable`). The hash is there whenever the
+      // failure carried one: a reverted step has a transaction an operator can look up, and an
+      // UNCONFIRMED one is a different fact that the trail must not flatten into a failure
+      // (`errors.ts`, `receipts.ts`).
+      const unconfirmed = e instanceof ChainTxUnconfirmedError;
+      const txHash =
+        e instanceof ChainTxRevertedError || e instanceof ChainTxUnconfirmedError ? e.txHash : null;
+      d.jobs.recordEvent(d.jobKey, phase, unconfirmed ? "unconfirmed" : "failed", txHash, null);
+      try {
+        await d.recoverEscrow?.(d.jobKey);
+      } catch (recoveryFailure) {
+        // Swallowed on purpose: see above. NOT silently, though — a refund that could not even
+        // be attempted is a money-path event, and this catch is the only place it exists. A
+        // reverted or unconfirmed refund is not here: `recoverEscrow` reports those as outcomes
+        // and puts them on the job's own event trail.
+        opsLog("job_escrow_recovery", {
+          jobKey: d.jobKey,
+          entityKey: d.entityKey,
+          outcome: "error",
+          error: publicErrorMessage(recoveryFailure),
+        });
+      }
+    }
+    throw e;
   }
 
   return rec;

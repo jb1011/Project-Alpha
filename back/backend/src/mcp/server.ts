@@ -30,6 +30,7 @@ import { mirrorTxId } from "../hedera/mirror";
 import { HEDERA_CAIP2, hederaPolicyInput } from "../hedera/policy";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
+import { type RecoverOutcome, outcomeJson } from "../jobs/refund";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
 import { withKeyedLock } from "../payments/keyedMutex";
@@ -46,6 +47,7 @@ import {
   requoteFormationPayment,
   settleFormationPayment,
 } from "../workflow/formationPayment";
+import { publicErrorMessage } from "../workflow/publicError";
 import type { OnboardingRunner } from "../workflow/runner";
 import { entityInScope, hasCapability } from "./scope";
 
@@ -75,9 +77,14 @@ export interface McpToolDeps extends EntityViewDeps {
    *  deployments without POCKET_MASTER_SEED/Turnkey configured leave this undefined and the tool
    *  reports "pocket funding unavailable" instead of the server failing to boot. */
   pocketFunding?: PocketFundingFn;
-  jobRunner: JobRunner;
-  jobClientAddress: string;
-  jobEvaluatorAddress: string;
+  /** The job CLIENT half, optional exactly like `pocketFunding` above and mirroring `ApiDeps`:
+   *  present iff `JOB_CLIENT_PRIVATE_KEY` is configured. Absent -> `run_job` reports the feature
+   *  unavailable naming the var, while `get_job`/`list_jobs` keep answering off `jobs`. */
+  jobRunner?: JobRunner;
+  jobClientAddress?: string;
+  jobEvaluatorAddress?: string;
+  /** The escrow recovery behind `refund_job`, present with the rest of the signing half. */
+  refundJob?: (jobKey: string) => Promise<RecoverOutcome>;
   /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
    *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
   maxJobBudget: bigint;
@@ -144,6 +151,7 @@ export const MCP_TOOL_DEP_KEYS = [
   "jobRunner",
   "jobClientAddress",
   "jobEvaluatorAddress",
+  "refundJob",
   "maxJobBudget",
   "maxInflightJobsPerTenant",
   "linkCodes",
@@ -633,6 +641,21 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
     async ({ id, budgetUsdc }) => {
       if (!hasCapability(scope, "earn"))
         return { content: [{ type: "text", text: "not found" }], isError: true };
+      // No job client configured, no job — the same refusal the REST twin gives. The client
+      // creates the job and funds the escrow, and the key it used to borrow when
+      // JOB_CLIENT_PRIVATE_KEY was unset was the platform governance key. Checked after the
+      // capability gate so an unauthorized caller still learns nothing about this deployment.
+      const { jobRunner, jobClientAddress, jobEvaluatorAddress } = deps;
+      if (!jobRunner || !jobClientAddress || !jobEvaluatorAddress)
+        return {
+          content: [
+            {
+              type: "text",
+              text: "jobs unavailable: set JOB_CLIENT_PRIVATE_KEY (its own funded address — it pays the job escrow and gas)",
+            },
+          ],
+          isError: true,
+        };
       const rec = repo.findByIdempotencyKey(id);
       if (!rec || rec.ownerTenantId !== tenantId || !entityInScope(scope, id))
         return { content: [{ type: "text", text: "not found" }], isError: true };
@@ -660,14 +683,14 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           isError: true,
         };
       const jobKey = `${rec.idempotencyKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
-      const { status } = deps.jobRunner.start({
+      const { status } = jobRunner.start({
         jobKey,
         entityKey: rec.idempotencyKey,
         tenantId,
         budget,
         description: "agent job (mcp)",
-        clientAddress: deps.jobClientAddress,
-        evaluatorAddress: deps.jobEvaluatorAddress,
+        clientAddress: jobClientAddress,
+        evaluatorAddress: jobEvaluatorAddress,
         providerAddress: rec.operator ?? "0x",
       });
       return { content: [{ type: "text", text: JSON.stringify({ jobKey, status }) }] };
@@ -686,6 +709,69 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== scope.tenantId || !entityInScope(scope, rec.entityKey))
         return { content: [{ type: "text", text: "job not found" }], isError: true };
       return { content: [{ type: "text", text: JSON.stringify(toJobView(rec)) }] };
+    },
+  );
+
+  /**
+   * refund_job — get a dead job's escrow back, on demand.
+   *
+   * The saga already does this by itself when a step after funding fails, and the boot reconcile
+   * walks every job still owed one. This is the third door, for the case neither covers: a refund
+   * that could not be made at the time (no evaluator key, an expiry that had not arrived, a
+   * reject that reverted) and that an operator or the agent itself wants retried now.
+   *
+   * ⚠ Owner-scoped like `get_job` — the job must be the caller's — and gated on `earn` like
+   * `run_job`, because it SENDS a transaction from the platform's job keys. It is idempotent by
+   * construction: the recovery reads the chain first, so calling it on a job that has already
+   * been refunded reports that and sends nothing.
+   */
+  server.registerTool(
+    "refund_job",
+    {
+      title: "Refund job",
+      description:
+        "Recover the USDC escrow of a job of yours that funded and then failed. Reads the chain " +
+        "first and sends nothing when there is nothing to recover; safe to call more than once. " +
+        "The outcome names what was found: refunded, released, waiting-expiry, nothing-escrowed.",
+      inputSchema: { jobKey: z.string() },
+    },
+    async ({ jobKey }) => {
+      // Capability BEFORE existence, exactly as `run_job` does it: an unauthorized caller learns
+      // nothing about this deployment's jobs.
+      if (!hasCapability(scope, "earn"))
+        return { content: [{ type: "text", text: "not found" }], isError: true };
+      if (!deps.refundJob)
+        return {
+          content: [
+            {
+              type: "text",
+              text: "jobs unavailable: set JOB_CLIENT_PRIVATE_KEY (its own funded address — it pays the job escrow and gas)",
+            },
+          ],
+          isError: true,
+        };
+      const rec = deps.jobs.findByKey(jobKey);
+      if (!rec || rec.ownerTenantId !== scope.tenantId || !entityInScope(scope, rec.entityKey))
+        return { content: [{ type: "text", text: "job not found" }], isError: true };
+      try {
+        // ⚠ UNDER THE ENTITY LOCK, the same key the saga and the boot walk hold
+        // (`jobs/composition.ts`, `jobs/jobRunner.ts`). `recoverEscrow` reads the chain, decides
+        // and sends, so two unlocked callers both read Funded and both send a refund: one is
+        // mined, the other is burnt gas and a failure on the trail describing nothing real. The
+        // lock goes HERE rather than inside `recoverEscrow`, because the saga already holds this
+        // key when it calls it and the mutex is not re-entrant.
+        const outcome = await withKeyedLock(rec.entityKey, () => deps.refundJob!(jobKey));
+        return {
+          content: [{ type: "text", text: JSON.stringify({ jobKey, ...outcomeJson(outcome) }) }],
+        };
+      } catch (e) {
+        // Sanitised for the same reason the job row's `error` is (`workflow/publicError.ts`):
+        // this string reaches a client's transcript and its logs.
+        return {
+          content: [{ type: "text", text: publicErrorMessage(e) }],
+          isError: true,
+        };
+      }
     },
   );
 

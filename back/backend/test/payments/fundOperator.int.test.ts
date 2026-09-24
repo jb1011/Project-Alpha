@@ -74,7 +74,9 @@ beforeAll(async () => {
   // (a timing-dependent CI flake, not a real failure).
   await pub.waitForTransactionReceipt({ hash: mintHash });
   // fund the treasury so it has USDC to push to the operator
-  await adapter.fundTreasury({ usdc, treasury, amount: 500_000n });
+  await adapter.confirmFundTreasury(
+    await adapter.broadcastFundTreasury({ usdc, treasury, amount: 500_000n }),
+  );
 }, 60_000);
 afterAll(() => anvil?.stop());
 

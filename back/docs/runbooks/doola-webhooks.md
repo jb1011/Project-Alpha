@@ -81,8 +81,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 ### 2. Configure the endpoint in doola's partner portal
 
 The portal holds the **URL and the event subscriptions only**. The signing secret is issued and
-rotated by doola over email — it is not self-served (fact-check correction to the original
-design prose).
+rotated by doola on request.
 
 Subscribe at minimum to: `company_formation_completed`, `company_formation_failed`,
 `company_ein_issued`, and the `document_*_uploaded` family. Unsubscribed events cost nothing —
@@ -181,7 +180,7 @@ Or, less obviously: no `doola_webhook_received` lines for 24h while formations a
    the box had the new secret is the usual cause). No lines at all means the failures were 5xx or
    connection errors — check whether the API process was down or the TLS certificate expired.
 3. Fix the cause. Re-run the step-1 curl and confirm `401`.
-4. **Re-enable the endpoint by hand in doola's partner portal.** There is no API for this.
+4. **Re-enable the endpoint by hand in doola's partner portal.**
 5. Confirm recovery: trigger a playground event and look for `doola_webhook_received`.
 
 A backlog delivered right after a re-enable may be more than 48h old. Those answer 200 and log

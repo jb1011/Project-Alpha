@@ -54,9 +54,10 @@ const HEDERA = {
   },
 } as const;
 
-/** The facilitator's `/supported`, in Blocky402's shape. Wiring `hedera` mounts `/verify` beside
- *  the profile, and that fetches this once in the background at mount time — stubbed so this file
- *  never reaches the network. */
+/** The facilitator's `/supported`, in the Hedera testnet facilitator's shape. Wiring `hedera`
+ *  mounts `/verify` beside the profile; that no longer touches the facilitator at mount, and a
+ *  profile request never reaches `/verify` at all — stubbed anyway so this file cannot reach the
+ *  network by any route. */
 const SUPPORTED = {
   kinds: [
     {

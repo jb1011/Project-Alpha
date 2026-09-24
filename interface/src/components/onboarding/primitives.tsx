@@ -142,7 +142,7 @@ export const Textarea = forwardRef<
 });
 
 /* ------------------------------------------------------------------ */
-/* Callout — used heavily for the non-custodial messaging             */
+/* Callout — used for the custody messaging                           */
 /* ------------------------------------------------------------------ */
 
 export function Callout({

@@ -378,6 +378,8 @@ test("TIER-0 AUDIT FIX: resuming a job after operator rotation is REFUSED, not m
     completeTxHash: null,
     sweepTxHash: null,
     reputationTxHash: null,
+    refundTxHash: null,
+    escrowState: null,
     error: null,
   };
   jobs.upsert(rec as never);

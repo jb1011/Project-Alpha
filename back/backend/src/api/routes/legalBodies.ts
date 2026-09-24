@@ -113,9 +113,10 @@ const NO_STORE = "no-store";
  * `null`, i.e. our own agents refused by every seller using it. A small budget per caller means a
  * scanner exhausts ITS OWN allowance first.
  *
- * Keyed by the first `X-Forwarded-For` entry because that is what the reverse proxy in front of
- * this API sets. It is spoofable and this is best-effort by construction: the shared bucket below
- * is the backstop that holds whatever the key does not.
+ * Keyed by the LAST `X-Forwarded-For` entry, which is the one the reverse proxy in front of this
+ * API appended; every entry before it is whatever the request arrived carrying, so keying on the
+ * first let a caller mint a fresh allowance per request by writing a fresh fake one. It is still
+ * best-effort — the shared bucket below is the backstop that holds whatever the key does not.
  */
 const CLIENT_BURST = 10;
 const CLIENT_REFILL_PER_SECOND = 0.5;
@@ -167,9 +168,16 @@ const clientLimiters = new WeakMap<ApiDeps, (c: HeaderBearing) => TokenBucket>()
 /**
  * The per-client limiter (R2): hand it a request, get that caller's bucket.
  *
- * Who is asking, as well as this can know: the first `X-Forwarded-For` entry the proxy put there,
- * or `"direct"` for a request that reached the process without one (localhost, a health check, a
- * misconfigured proxy) — one shared bucket for all of those, deliberately.
+ * Who is asking, as well as this can know: the LAST `X-Forwarded-For` entry, or `"direct"` for a
+ * request that reached the process without one (localhost, a health check, a misconfigured proxy)
+ * — one shared bucket for all of those, deliberately.
+ *
+ * LAST rather than first, and the difference is whether the limit binds at all: every entry
+ * before the last is a value the request arrived carrying, so a caller rotating a fake first
+ * entry was handed a fresh bucket on every request and this allowance never refused it. The last
+ * entry is the one appended by the proxy that received the connection, which is the only entry in
+ * the header nobody upstream of it could have chosen. (The bounded map below still caps memory
+ * either way — memory was never the thing keying on the first entry cost us.)
  */
 export function createClientLimiter(deps: ApiDeps): (c: HeaderBearing) => TokenBucket {
   const existing = clientLimiters.get(deps);
@@ -178,8 +186,18 @@ export function createClientLimiter(deps: ApiDeps): (c: HeaderBearing) => TokenB
   /** One bucket per caller (R2), bounded and least-recently-used-first. */
   const clients = new Map<string, TokenBucket>();
   const limiter = (c: HeaderBearing): TokenBucket => {
-    const first = c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
-    const key = first ? first : "direct";
+    // The last NON-EMPTY entry. Trimmed and lowercased so one caller cannot hold two buckets by
+    // spelling itself two ways — and non-empty because a trailing comma is legal here and is what
+    // a proxy appending to an empty inbound value leaves behind. Read literally, that empty tail
+    // became the key, which is falsy, so those callers fell through to the shared `direct` bucket
+    // and pooled one allowance between them. Only a header with nothing in it at all is `direct`.
+    const appended = c.req
+      .header("x-forwarded-for")
+      ?.split(",")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry !== "")
+      .pop();
+    const key = appended ?? "direct";
     const found = clients.get(key);
     // Re-inserted on every use, so insertion order IS least-recently-used order and the entry
     // evicted below is the coldest one — never the scanner's own exhausted bucket.

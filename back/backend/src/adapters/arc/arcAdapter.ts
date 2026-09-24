@@ -1,12 +1,19 @@
 import {
   type Abi,
+  type Account,
   type Address,
+  BaseError,
+  type Chain,
   type Hex,
   type PublicClient,
+  TransactionReceiptNotFoundError,
+  type Transport,
   type WalletClient,
   encodeFunctionData,
   isAddressEqual,
+  keccak256,
   parseEventLogs,
+  parseTransaction,
 } from "viem";
 import {
   agentTreasuryAbi,
@@ -14,9 +21,20 @@ import {
   legalManagerAbi,
   legalManagerFactoryAbi,
 } from "../../abis/generated";
+import { BroadcastUnconfirmedError } from "../../errors";
 import type { TreasuryConfig } from "../../types";
 import { USDC_TRANSFER_GAS } from "./gas";
+import {
+  type LocalSendClient,
+  type LocalWallet,
+  type PreparedLocalTx,
+  localSigner,
+  pendingNonceOf,
+  prepareLocalTx,
+  sendFromLocalAccount,
+} from "./localSend";
 import { appendRelayTarget, relayRevertError } from "./relay";
+import { nextSenderNonce, noteSenderBroadcast } from "./senderLock";
 
 /**
  * How long a manager-call receipt is waited for before the caller is told to come back later.
@@ -59,9 +77,36 @@ const EIP712_DOMAIN_ABI = [
   },
 ] as const;
 
+/** A wallet client that is known to carry the platform account — the shape the sign path needs. */
+type PlatformWallet = LocalWallet;
+
+/** A platform transaction request with everything but the nonce filled in. */
+type PreparedPlatformTx = PreparedLocalTx;
+
+/**
+ * A treasury top-up with everything fetched except its nonce — the result of
+ * {ArcAdapter.prepareFundTreasury} and the input to {ArcAdapter.signFundTreasury}.
+ *
+ * A SUPERSET of the transfer it was asked for: the caller records the amount that moved, and it
+ * should read it off the same object it signs rather than carrying two copies of one fact.
+ */
+export interface PreparedFundTransfer {
+  usdc: Address;
+  treasury: Address;
+  amount: bigint;
+  /** The viem request: to, data, gas, fees, chain id. No nonce — that is the locked step. */
+  request: PreparedPlatformTx;
+}
+
+/** The two calls that happen INSIDE the send lock (`localSend.ts`), under the platform's name. */
+export type PlatformSendClient = LocalSendClient;
+
 export interface ArcAdapterDeps {
   publicClient: PublicClient;
   managerWallet: WalletClient; // signs/sends as the manager (Factory owner)
+  /** The bounded client for the two in-lock calls — `sendClientFor(cfg)` in `clients.ts`. Every
+   *  composition that SENDS as the platform passes it; read-only adapters need none. */
+  sendClient?: PlatformSendClient;
   operatorWallet?: WalletClient; // signs/sends as the operator (the enclave); required for fundOperator/spend
   chainId: number; // reserved for the M4 setAgentWallet EIP-712 domain (see walletSet.ts)
   factory: Address;
@@ -103,6 +148,90 @@ export class ArcAdapter {
   }
 
   /**
+   * The address that signs and pays for every platform send, or undefined when this adapter was
+   * built for READS ONLY (several compositions pass no manager wallet at all).
+   *
+   * It is the sender lock's key, exposed because the funding saga's nonce-critical window spans
+   * three calls — sign, persist, send — so the lock there is the CALLER's (see {signFundTreasury}).
+   */
+  get platformAddress(): Address | undefined {
+    return this.d.managerWallet?.account?.address;
+  }
+
+  /**
+   * A platform transaction with everything decided EXCEPT its nonce.
+   *
+   * This is the slow half, and it is deliberately outside the lock: gas estimation, fee estimation
+   * and the chain id are node round trips, and while the lock is held every other platform send
+   * waits on them. `parameters` is viem's default list MINUS `nonce` — picking the nonce is the
+   * locked step, and asking for it here would both waste a call and pick it in the wrong place.
+   *
+   * An explicit `gas` (the Arc `USDC_TRANSFER_GAS` footgun fix, and the relay's estimate) is passed
+   * straight through, so viem skips the estimate exactly as it did before.
+   */
+  private prepareAsPlatform(p: {
+    account: Account;
+    to: Address;
+    data?: Hex;
+    value?: bigint;
+    gas?: bigint;
+  }): Promise<PreparedPlatformTx> {
+    return prepareLocalTx(this.d.managerWallet, p);
+  }
+
+  /**
+   * THE CHOKEPOINT: the only place a platform transaction is numbered and put on the wire.
+   *
+   * One send at a time per signing key, each with a nonce from one ledger (see senderLock.ts): two
+   * sends that read the node's count independently get the same answer and claim the same nonce,
+   * and one of them is then rejected or silently replaced.
+   *
+   * INSIDE the lock, three things and exactly two RPCs: read the pending nonce, sign (offline — the
+   * platform account is a local key), hand the bytes to the node. Everything else is outside it —
+   * the simulate/estimate preflight and the whole of {prepareAsPlatform} before, the receipt wait
+   * after — because the lock is head-of-line blocking for every platform send, so its worst case is
+   * everyone's worst case. Both RPCs go through the bounded client (`clients.ts`) for the same
+   * reason.
+   *
+   * The signature goes STRAIGHT TO THE ACCOUNT rather than through `walletClient.signTransaction`,
+   * which asks the node for the chain id first — unconditionally, before it looks at whether it
+   * needs it (viem 2.52 `actions/wallet/signTransaction.ts`) — and that would be a third call
+   * inside the window. The prepared request already carries `chainId`, and the chain's own
+   * serializer is handed over exactly as the wallet action would.
+   *
+   * ⚠ LEAF ONLY. The lock is not reentrant, so nothing here may take it again for the same signer —
+   * which is why no method in this class calls another method's send.
+   */
+  private sendAsPlatform(sender: Address, prepared: PreparedPlatformTx): Promise<Hex> {
+    // ⚠ ASSUMES AN IN-PROCESS KEY — `localSend.ts` refuses anything else, and says why there.
+    return sendFromLocalAccount({
+      wallet: this.d.managerWallet,
+      via: this.sendVia,
+      sender,
+      prepared,
+      who: "ArcAdapter: the platform account",
+    });
+  }
+
+  /** What a NEW transaction from this sender would be numbered, before our own floor is applied.
+   *  `pending`, so it counts transactions of ours the chain has accepted but not yet mined. */
+  private pendingNonce(sender: Address): Promise<number> {
+    return pendingNonceOf(this.sendVia, sender);
+  }
+
+  /**
+   * The client the in-lock calls use: bounded transport, no retries (`clients.ts`).
+   *
+   * Falls back to the ordinary client when a composition does not supply one — the read-only
+   * adapters, and the tests that never reach a send. Every composition that DOES send passes it,
+   * because the fallback carries the app-wide retry budget and that budget is what the lock cannot
+   * afford.
+   */
+  private get sendVia(): PlatformSendClient {
+    return this.d.sendClient ?? this.d.publicClient;
+  }
+
+  /**
    * PER-AGENT relay routing. The controller is the manager of agents created THROUGH it; every
    * agent minted before the cutover still has the old EOA as its immutable `manager`, and a vault
    * only ever obeys its own manager. So "controller mode" is not a global switch — it is a
@@ -125,8 +254,8 @@ export class ArcAdapter {
    * about the controller. Returns the broadcast tx hash WITHOUT awaiting a receipt (callers that
    * need confirmation await it themselves, exactly as they did before).
    *
-   * Direct path (no controller, or a legacy agent — see {relayTargetFor}): unchanged —
-   * simulateContract against the target, then write the simulated request.
+   * Direct path (no controller, or a legacy agent — see {relayTargetFor}): simulateContract against
+   * the target for the decoded revert, then the same call, encoded, prepared and sent.
    *
    * Relayed path: the same calldata is encoded, the 20-byte target is appended (Euler relay
    * encoding — see relay.ts) and the whole thing is sent as a RAW transaction to the controller,
@@ -136,7 +265,7 @@ export class ArcAdapter {
    * gas, AND its result is the gas limit we send with — one node round-trip doing both jobs, where
    * an `eth_call` preflight had viem execute the transaction a second time to estimate.
    *
-   * NOT for signer-direct calls: fundTreasury (a plain USDC transfer) and the liveRunner gas seeds
+   * NOT for signer-direct calls: the treasury top-up (a plain USDC transfer) and the liveRunner gas seeds
    * are not role-gated and must keep coming straight from the signing key.
    */
   private async sendManagerCall(p: {
@@ -156,22 +285,28 @@ export class ArcAdapter {
         "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send/simulate as the zero address",
       );
 
+    const calldata = encodeFunctionData({
+      abi: p.abi,
+      functionName: p.functionName,
+      args: p.args,
+    });
     const controller = this.relayTargetFor(p.agentManager);
     if (!controller) {
-      const { request } = await this.d.publicClient.simulateContract({
+      // The preflight, and the only reason a revert reaches the caller decoded. Its returned
+      // `request` is no longer forwarded verbatim — the transaction is built from the same encoded
+      // call below — because `writeContract` would estimate gas and fees INSIDE the lock.
+      await this.d.publicClient.simulateContract({
         address: p.target,
         abi: p.abi,
         functionName: p.functionName,
         args: p.args,
         account,
       });
-      return this.d.managerWallet.writeContract(request);
+      const prepared = await this.prepareAsPlatform({ account, to: p.target, data: calldata });
+      return this.sendAsPlatform(account.address, prepared);
     }
 
-    const data = appendRelayTarget(
-      encodeFunctionData({ abi: p.abi, functionName: p.functionName, args: p.args }),
-      p.target,
-    );
+    const data = appendRelayTarget(calldata, p.target);
     let gas: bigint;
     try {
       gas = await this.d.publicClient.estimateGas({ account, to: controller, data });
@@ -180,16 +315,34 @@ export class ArcAdapter {
       // untouched so an RPC outage never reads as "reverted in simulation" (see relay.ts).
       throw relayRevertError(err, { ...p, controller });
     }
-    return this.d.managerWallet.sendTransaction({
-      to: controller,
-      data,
-      gas,
-      account,
-      chain: this.d.managerWallet.chain,
-    });
+    const prepared = await this.prepareAsPlatform({ account, to: controller, data, gas });
+    return this.sendAsPlatform(account.address, prepared);
   }
 
-  /** {sendManagerCall} + await the receipt — the tail four of the five relayed sites repeat. */
+  /**
+   * Send native value (on Arc the gas token IS USDC) as the platform — the live runner's gas seeds.
+   *
+   * Here rather than at the call site so it shares the one chokepoint: a seed and a treasury top-up
+   * come from the same key, so they compete for the same nonces.
+   */
+  async sendNativeAsPlatform(to: Address, value: bigint): Promise<Hex> {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send as the zero address",
+      );
+    const prepared = await this.prepareAsPlatform({ account, to, value });
+    return this.sendAsPlatform(account.address, prepared);
+  }
+
+  /**
+   * {sendManagerCall} + await the receipt — the tail four of the five relayed sites repeat.
+   *
+   * Goes through the same `confirmed()` as `confirmFundTreasury` (R1). A rule that told the truth about
+   * one receipt and not about the other four would be the next review finding: a bind, a metadata
+   * write and a policy execute all have a post-broadcast window, and a caller that is told
+   * "nothing was sent" about a mined bind resumes into a state it cannot explain.
+   */
   private async sendManagerCallConfirmed(p: {
     target: Address;
     abi: Abi;
@@ -197,9 +350,7 @@ export class ArcAdapter {
     args: readonly unknown[];
     agentManager?: Address;
   }): Promise<Hex> {
-    const hash = await this.sendManagerCall(p);
-    await this.d.publicClient.waitForTransactionReceipt({ hash });
-    return hash;
+    return this.confirmed(await this.sendManagerCall(p), p.functionName);
   }
 
   /**
@@ -260,7 +411,16 @@ export class ArcAdapter {
    * mint on resume rather than broadcasting a second one.
    */
   async confirmCreateEntity(txHash: Hex, agentManager?: Address): Promise<CreateEntityResult> {
-    const receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    // R1, the same window one step earlier and with higher stakes: the agent NFT may already be
+    // minted. A receipt-read failure here is `BroadcastUnconfirmedError` rather than a bare 429,
+    // so nothing above it can say "nothing was sent" about a mint that is on chain — and the
+    // resume path this function's own comment describes stays the honest instruction.
+    let receipt: Awaited<ReturnType<typeof this.d.publicClient.waitForTransactionReceipt>>;
+    try {
+      receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    } catch (e) {
+      throw new BroadcastUnconfirmedError(txHash, "createEntity", { cause: e });
+    }
 
     // Controller mode puts other contracts' logs in this receipt (the controller's own `Relayed`,
     // plus anything the relayed call touches), and EntityCreated(uint256,address,address) is not a
@@ -514,20 +674,281 @@ export class ArcAdapter {
     return meta[2];
   }
 
-  /** Optional v1 step: top up the treasury vault with ERC-20 USDC from the manager wallet. */
-  async fundTreasury(p: { usdc: Address; treasury: Address; amount: bigint }): Promise<Hex> {
-    const { request } = await this.d.publicClient.simulateContract({
+  /**
+   * EVERYTHING THE TOP-UP NEEDS BEFORE IT CAN BE NUMBERED — the pre-flight, the gas, the fees, the
+   * chain id. No signature, no nonce, nothing recorded, and NO LOCK.
+   *
+   * It is a separate call from {signFundTreasury} for one reason: the saga holds the send lock
+   * across sign → persist → send, and every RPC inside that window is one every other platform
+   * send waits behind. All of this is slow and none of it is nonce-critical, so it happens first.
+   *
+   * ⚠ WHO PAYS. The account is `managerWallet`'s, in controller mode too: a treasury top-up is a
+   * plain ERC-20 `transfer` from the platform wallet, NOT a role-gated manager call, so it never
+   * goes through `sendManagerCall`'s relay. In controller mode that wallet is the executor — the
+   * account that actually holds and spends the USDC — which is precisely the one that must sign.
+   *
+   * ⚠ EXPLICIT GAS, still. `USDC_TRANSFER_GAS` is passed so `prepareTransactionRequest` does not
+   * estimate: on Arc the gas token IS USDC, and an estimate against a nearly-full balance reserves
+   * the whole of it and fails the transfer (the 2026-07 footgun, fixed once and kept fixed here).
+   *
+   * `simulateContract` runs first and its revert is raised BEFORE anything is signed or recorded —
+   * an empty platform wallet (2026-09-14) fails HERE, which is what keeps "nothing was sent" true
+   * for the one case where it is true.
+   *
+   * The result carries the transfer it was asked for as well as the prepared transaction, so a
+   * caller that records the amount reads it back from the same object it signs.
+   */
+  async prepareFundTreasury(p: {
+    usdc: Address;
+    treasury: Address;
+    amount: bigint;
+  }): Promise<PreparedFundTransfer> {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to sign as the zero address",
+      );
+    await this.d.publicClient.simulateContract({
       address: p.usdc,
       abi: erc20TransferAbi,
       functionName: "transfer",
       args: [p.treasury, p.amount],
-      account: this.d.managerWallet.account!,
+      account,
+    });
+    const request = await this.prepareAsPlatform({
+      account,
+      to: p.usdc,
+      data: encodeFunctionData({
+        abi: erc20TransferAbi,
+        functionName: "transfer",
+        args: [p.treasury, p.amount],
+      }),
+      gas: USDC_TRANSFER_GAS,
+    });
+    return { ...p, request };
+  }
+
+  /**
+   * SIGN the prepared treasury top-up locally. Nothing is sent, and the hash is ours before
+   * anything is. One RPC: the nonce.
+   *
+   * The last window (gate N4): persisting after the SEND still lost a transfer whose
+   * `eth_sendRawTransaction` response never came back — the node had accepted it, we had no hash,
+   * and the public sentence said nothing was sent. The fix is the sequence this repository already
+   * proved for AgentBook registrations (`api/routes/agentBook.ts`, "SIGN → PERSIST → BROADCAST",
+   * whose comment says exactly why: "the raw tx is persisted, so the reconciler re-broadcasts it").
+   *
+   * Three things come back and all three are persisted before the send:
+   *  - `rawTx` — the signed bytes, so a re-broadcast is the SAME transaction rather than a second
+   *    one at a new nonce;
+   *  - `txHash` — `keccak256(rawTx)`, which is what the chain will call it;
+   *  - `nonce` — the only way to tell "still pending" from "dropped" later.
+   *
+   * ⚠ THE CALLER HOLDS THE SENDER LOCK. This is the one platform send whose nonce-critical window
+   * is not a single call — it is sign → persist → send, and the persist is what makes the signature
+   * recoverable, so the lock has to span all three (`workflow/onboarding.ts` step 7). The nonce
+   * picker refuses outside it rather than trusting a convention. It takes a PREPARED transfer so
+   * that everything else the signature needs was fetched before that lock was taken.
+   */
+  async signFundTreasury(
+    prepared: PreparedFundTransfer,
+  ): Promise<{ rawTx: Hex; txHash: Hex; nonce: number }> {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to sign as the zero address",
+      );
+    // EXPLICIT, from the same ledger every other platform send draws on. Left to viem this is a
+    // fresh `eth_getTransactionCount(pending)` — which is exactly the read that answers the same
+    // number twice when the node has not caught up, or when two funds are in flight at once.
+    const nonce = await nextSenderNonce(account.address, () => this.pendingNonce(account.address));
+    // The nonce is the whole reason this is visible before anything is broadcast: it is recorded,
+    // so "pending" and "dropped" can be told apart later. A hole where the number should be would
+    // make that unanswerable, and quietly — a node that answers the count with anything but an
+    // integer gets us a `NaN`, which persists as nothing at all. Better to fail here (the
+    // registrar's rule, verbatim).
+    if (!Number.isInteger(nonce))
+      throw new Error(`signFundTreasury: no usable nonce for this transfer (got ${nonce})`);
+    const request = { ...prepared.request, nonce };
+    // Signed by the ACCOUNT, not through the wallet action, which would ask the node for the chain
+    // id first — one more call inside the caller's lock, for a value the request already carries.
+    // See `localSend.ts`, which does the same for every other send from a local key.
+    const rawTx = await localSigner(
+      this.d.managerWallet,
+      "ArcAdapter: the platform account",
+    )(request);
+    return { rawTx, txHash: keccak256(rawTx), nonce: Number(request.nonce) };
+  }
+
+  /**
+   * Put signed bytes on the wire. Idempotent by construction: re-sending the same transaction is
+   * at worst a no-op the node already knows about, which is what makes a re-broadcast safe.
+   *
+   * Takes NO lock of its own, deliberately: on the saga's path the caller holds it (the window
+   * started at the signature), and the reconciler's re-broadcast picks no nonce at all — the bytes
+   * already carry theirs. A lock here would deadlock the first and buy the second nothing.
+   */
+  async sendRawFundTreasury(rawTx: Hex): Promise<Hex> {
+    // The bounded client (`clients.ts`): on the saga's path this call happens inside the lock.
+    const hash = await this.sendVia.sendRawTransaction({ serializedTransaction: rawTx });
+    // The node took it, so its nonce is spent: raise the floor for the next send from this key.
+    // Read from the BYTES, which cannot disagree with what was sent, and never at the cost of the
+    // send — past this line nothing may turn an accepted transfer into an error (gate N4).
+    try {
+      const sender = this.platformAddress;
+      const nonce = parseTransaction(rawTx).nonce;
+      if (sender && nonce !== undefined) noteSenderBroadcast(sender, nonce);
+    } catch {
+      // Unparseable bytes say nothing about a transaction the node has already accepted. The floor
+      // stays where it is; the next send falls back to the node's own count.
+    }
+    return hash;
+  }
+
+  /**
+   * The platform account's MINED transaction count at `latest`.
+   *
+   * Never the pending count — that one includes our own unmined transaction, so it could never
+   * tell us the chain had moved past it. A count HIGHER than a submission's nonce means the chain
+   * advanced without that transaction, which (after a second receipt read) is what makes it
+   * `dropped` rather than merely slow. Same rule, same reason, as `submitterNonce()` in the
+   * AgentBook registrar.
+   */
+  async platformNonce(): Promise<number> {
+    const account = this.d.managerWallet.account;
+    if (!account) throw new Error("ArcAdapter: manager wallet has no account");
+    return this.d.publicClient.getTransactionCount({
+      address: account.address,
+      blockTag: "latest",
+    });
+  }
+
+  /**
+   * BROADCAST the treasury top-up and return its hash. Does NOT wait for the receipt.
+   *
+   * The split exists for one reason (verification gate N2): the hash has to reach the database
+   * BEFORE anything waits on it. It used to be written only in the saga's catch, so a deploy, an
+   * OOM kill or a `systemctl restart` anywhere inside the receipt wait — viem's default is 180
+   * seconds — lost the hash entirely, and the next attempt broadcast a second transfer.
+   *
+   * This mirrors the `broadcastCreateEntity` / `confirmCreateEntity` pair a few methods up, which
+   * exists for exactly the same reason and whose comment says so: "re-reading the same mined tx
+   * yields the same agentId, which is what the saga relies on to adopt an in-flight mint on resume
+   * rather than broadcasting a second one." Money deserves at least the guarantee a mint gets.
+   *
+   * Everything here is PRE-broadcast: a simulate revert (the 2026-09-14 empty-wallet shape) throws
+   * before any hash exists, and "nothing was sent" is true of every failure this method raises.
+   */
+  async broadcastFundTreasury(p: {
+    usdc: Address;
+    treasury: Address;
+    amount: bigint;
+  }): Promise<Hex> {
+    const account = this.d.managerWallet.account!;
+    await this.d.publicClient.simulateContract({
+      address: p.usdc,
+      abi: erc20TransferAbi,
+      functionName: "transfer",
+      args: [p.treasury, p.amount],
+      account,
     });
     // Explicit gas (see USDC_TRANSFER_GAS): the manager wallet is well-funded today, but this keeps
     // the near-full-balance estimateGas footgun from biting if it ever runs low.
-    const txHash = await this.d.managerWallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    const prepared = await this.prepareAsPlatform({
+      account,
+      to: p.usdc,
+      data: encodeFunctionData({
+        abi: erc20TransferAbi,
+        functionName: "transfer",
+        args: [p.treasury, p.amount],
+      }),
+      gas: USDC_TRANSFER_GAS,
+    });
+    return this.sendAsPlatform(account.address, prepared);
+  }
+
+  /**
+   * CONFIRM a broadcast treasury top-up. Everything it raises happens after the money left.
+   *
+   * `waitForTransactionReceipt` rejects a poll failure verbatim, so the identical
+   * `HttpRequestError{status:429}` that means "the send was refused" also arrives here, where it
+   * means the opposite. This is the only layer that can tell the two apart — it holds the hash —
+   * so it is the layer that says so, and `publicErrorMessage` keys off the TYPE rather than trying
+   * to recover a fact that was never in the text.
+   */
+  async confirmFundTreasury(txHash: Hex): Promise<Hex> {
+    return this.confirmed(txHash, "fundTreasury");
+  }
+
+  /* There is deliberately NO broadcast-and-confirm convenience here any more.
+   *
+   * One existed for "callers with nothing to persist between the two", and the last such caller was
+   * the CLI's fund door — which did have something to persist and simply was not doing it: no
+   * `submitted` row, so a crash inside the receipt wait lost the hash of a transfer that had already
+   * happened (the gap #140 closed for the API path). It now funds through the same saga
+   * (`cli/index.ts`), and a caller that wants both halves writes the hash down between them. */
+
+  /**
+   * Await a broadcast transaction's receipt and insist it SUCCEEDED.
+   *
+   * Two failures, told apart because the difference is whether a retry is safe:
+   *  - the receipt could not be READ → `BroadcastUnconfirmedError` (the transaction may be mined;
+   *    nobody may re-send, and the saga reconciles it by hash later);
+   *  - the receipt says `reverted` → a plain failure naming the hash. The transaction is settled
+   *    and it moved nothing, so a retry is fine.
+   *
+   * The revert check is new with R1 and closes a gap nobody had named: `waitForTransactionReceipt`
+   * RESOLVES for a reverted transaction, so `fundTreasury` used to return a hash for a transfer
+   * that moved nothing and step 7 marked the entity `funded`. The reconcile path treats `reverted`
+   * as "send again", and the send path must not be blind to the same fact.
+   */
+  private async confirmed(txHash: Hex, operation: string): Promise<Hex> {
+    let receipt: { status?: string };
+    try {
+      receipt = await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    } catch (e) {
+      throw new BroadcastUnconfirmedError(txHash, operation, { cause: e });
+    }
+    if (receipt.status === "reverted")
+      throw new Error(`${operation}: transaction ${txHash} reverted on chain`);
     return txHash;
+  }
+
+  /**
+   * What became of a transaction we already broadcast — asked ONCE, never waited on.
+   *
+   * `getTransactionReceipt` rather than `waitForTransactionReceipt` on purpose: a saga resuming an
+   * old attempt must not block for viem's 180-second default on a transaction that may have been
+   * dropped weeks ago.
+   *
+   * ⚠ `absent` MEANS ONE THING: the chain definitively has no receipt for this hash. It does NOT
+   * mean "we could not ask".
+   *
+   * This distinction is a Critical finding (gate N8), and it was introduced the moment `absent`
+   * stopped merely meaning "wait" and started being able to lead — with an advanced nonce — to
+   * `dropped`, which authorises a NEW transfer. A `catch` that swallowed everything then read an
+   * Arc RPC 429 on `eth_getTransactionReceipt` (the documented, recurring prod condition this whole
+   * branch exists for) as "the transaction is gone", and sent the money a second time.
+   *
+   * So: `TransactionReceiptNotFoundError` and nothing else, matched BY TYPE rather than by its
+   * prose — several other viem errors ("Block at number … could not be found", any wrapper
+   * carrying that text) also read as "not found" and mean the read BROKE. `walk` because a
+   * transport or a caller's client may have wrapped it. Everything else RETHROWS, and the caller
+   * refuses rather than guessing.
+   *
+   * Byte-for-byte the rule `agentBookRegistrar.receiptStatus` already applies, for the same reason
+   * its comment gives: parking a broken read in the pending branch waits forever on a receipt
+   * nobody is fetching — and, here, spends money on one.
+   */
+  async receiptOutcome(txHash: Hex): Promise<"success" | "reverted" | "absent"> {
+    try {
+      const receipt = await this.d.publicClient.getTransactionReceipt({ hash: txHash });
+      return receipt.status === "success" ? "success" : "reverted";
+    } catch (e) {
+      if (e instanceof BaseError && e.walk((x) => x instanceof TransactionReceiptNotFoundError))
+        return "absent";
+      throw e;
+    }
   }
 
   /** Operator pushes USDC from the treasury to the operator's own EOA, within the cap (onlyOperator). */

@@ -257,7 +257,7 @@ const EnvSchema = z.object({
    *  the provider makes formation mandatory without a second switch. "true"/"1" forces it on. */
   FORMATION_REQUIRED: z.string().optional(),
   FORMATION_SWEEP_MS: z.coerce.number().int().positive().default(60_000),
-  /** Lifetime formation quota per tenant (formation is real money in production: $100–150 each). */
+  /** Lifetime formation quota per tenant (formation is real money in production). */
   FORMATION_MAX_PER_TENANT: z.coerce.number().int().positive().default(3),
   /** Rolling-24h formation count across the whole deployment (platform_outflows twin). */
   FORMATION_DAILY_CEILING: z.coerce.number().int().positive().default(10),
@@ -430,7 +430,9 @@ export interface Config {
   maxTreasuryFundedPerTenant: bigint;
   platformOutflowCeiling: bigint;
   platformOutflowWindowMs: number;
-  customerPrivateKey: Hex;
+  /** The live runner's simulated customer signer. Absent = the runner refuses; it must never
+   *  fall back to the platform governance key, which would sign customer payments as the platform. */
+  customerPrivateKey: Hex | undefined;
   authJwtSecret: string;
   authJwtTtlSec: number;
   webOrigin: string;
@@ -438,7 +440,11 @@ export interface Config {
   passkeyRpId: string;
   jobContract: Address;
   reputationRegistry: Address;
-  jobClientPrivateKey: Hex;
+  /** The ERC-8183 job client: it creates the job and FUNDS THE ESCROW, so it is a spending
+   *  identity with its own funded address. Absent = jobs are unavailable and every path that
+   *  would start one refuses; it must never fall back to the platform governance key, which would
+   *  make every job budget an outflow signed by the most powerful key on the box. */
+  jobClientPrivateKey: Hex | undefined;
   jobEvaluatorPrivateKey?: Hex;
   jobSweepToTreasury: boolean;
   mcpPublicUrl: string;
@@ -448,7 +454,10 @@ export interface Config {
   gasSeedFloorUsdc: string;
   gasSeedTargetUsdc: string;
   enableX402Demo: boolean;
-  x402DemoPayTo: Address;
+  /** Where a stranger's USDC LANDS when the demo seller settles. Absent = the demo seller is not
+   *  mounted; it must never fall back to the platform account's address, which would make the
+   *  governance key the payout target of a public wall by omission. A receive-only address. */
+  x402DemoPayTo: Address | undefined;
   x402DemoPriceUsdc: string;
   /** Optional in the type (test fixtures build Config literals); loadConfig always sets them. */
   x402TrustPolicy?: "open" | "accountable-only" | "legal-bodies-only";
@@ -739,7 +748,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     maxTreasuryFundedPerTenant: usdToUnits(e.MAX_TREASURY_FUNDED_PER_TENANT_USDC),
     platformOutflowCeiling: usdToUnits(e.PLATFORM_OUTFLOW_CEILING_USDC),
     platformOutflowWindowMs: e.PLATFORM_OUTFLOW_WINDOW_HOURS * 3_600_000,
-    customerPrivateKey: e.CUSTOMER_PRIVATE_KEY ?? e.PLATFORM_PRIVATE_KEY,
+    customerPrivateKey: e.CUSTOMER_PRIVATE_KEY,
     authJwtSecret: e.AUTH_JWT_SECRET,
     authJwtTtlSec: e.AUTH_JWT_TTL_SEC,
     webOrigin: e.WEB_ORIGIN,
@@ -747,7 +756,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     passkeyRpId: e.PASSKEY_RP_ID,
     jobContract: e.JOB_CONTRACT_ADDRESS,
     reputationRegistry: e.REPUTATION_REGISTRY_ADDRESS,
-    jobClientPrivateKey: e.JOB_CLIENT_PRIVATE_KEY ?? e.PLATFORM_PRIVATE_KEY,
+    jobClientPrivateKey: e.JOB_CLIENT_PRIVATE_KEY,
     jobEvaluatorPrivateKey: e.JOB_EVALUATOR_PRIVATE_KEY,
     jobSweepToTreasury: e.JOB_SWEEP_TO_TREASURY,
     mcpPublicUrl: e.MCP_PUBLIC_URL,
@@ -760,8 +769,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     x402BuyerTrustPolicy: e.X402_BUYER_TRUST_POLICY,
     worldRateWindowHours: e.WORLD_RATE_WINDOW_HOURS,
     x402ProofAgentKey: e.X402_PROOF_AGENT_KEY,
-    x402DemoPayTo:
-      e.X402_DEMO_PAYTO ?? (privateKeyToAccount(e.PLATFORM_PRIVATE_KEY).address as Address),
+    x402DemoPayTo: e.X402_DEMO_PAYTO,
     x402DemoPriceUsdc: e.X402_DEMO_PRICE_USDC,
     ens: e.ENS_GATEWAY_SIGNER_KEY
       ? {
@@ -1234,6 +1242,50 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     );
   }
 
+  // ── A PUBLISHED PAYWALL MUST NAME ITS OWN PAYOUT ADDRESS ───────────────────────────────────
+  //
+  // The demo seller takes USDC from strangers. Until this config stopped deriving it, a missing
+  // X402_DEMO_PAYTO resolved to the platform account's own address, so forgetting one var pointed
+  // a public wall's revenue at the governance key's wallet. The derivation is gone, and
+  // `buildX402DemoDeps` now declines to mount an unaddressed seller — but a production deployment
+  // that asked for the demo and would silently not get it is itself the misconfiguration, so it
+  // refuses here. Non-production boots: the seller is not mounted and main.ts says why.
+  if (isProd && cfg.enableX402Demo && !cfg.x402DemoPayTo) {
+    throw new Error(
+      "Invalid config: ENABLE_X402_DEMO is on but X402_DEMO_PAYTO is missing — the demo seller settles a stranger's USDC and must name a receive-only payout address (it no longer defaults to the PLATFORM_PRIVATE_KEY address; unset ENABLE_X402_DEMO for a deployment that publishes no wall)",
+    );
+  }
+
+  // ── AND NO OPTIONAL SIGNER MAY *BE* THE PLATFORM KEY ──────────────────────────────────────
+  //
+  // `customerPrivateKey` and `jobClientPrivateKey` used to DEFAULT to the platform governance key
+  // when their var was unset. Dropping the defaults closes the silent path into that arrangement;
+  // this closes the deliberate one, where an operator reading "there is no fallback any more"
+  // pastes the platform key into the var and reproduces it on purpose. Both keys SPEND — one
+  // funds job escrow, one signs a customer's side of a live run — and the harm is the same either
+  // way: the most powerful key in the system doing routine work, with its outflows indistinguish-
+  // able from governance.
+  //
+  // Read off `signingKeys` (the list the revenue/submitter/attestation separation checks already
+  // use) rather than a third list, and NARROWED to those two names on purpose: they are the vars
+  // that had a fallback, so they are the ones with a bypass to close. The other entries are
+  // checked against each other elsewhere; widening this to all of them is a separate decision
+  // about existing deployments, not a consequence of removing a default.
+  //
+  // Outside production a dev box may deliberately run one key — it just may never do so quietly.
+  const platformKeyLower = cfg.platformPrivateKey.toLowerCase();
+  for (const [name, key] of signingKeys) {
+    if (name !== "CUSTOMER_PRIVATE_KEY" && name !== "JOB_CLIENT_PRIVATE_KEY") continue;
+    if (!key || key.toLowerCase() !== platformKeyLower) continue;
+    if (isProd)
+      throw new Error(
+        `Invalid config: ${name} must not equal PLATFORM_PRIVATE_KEY — it is a spending identity and needs its own funded address, or every payment it makes goes out as the platform governance key`,
+      );
+    console.warn(
+      `⚠ ${name} equals PLATFORM_PRIVATE_KEY: this identity is spending as the platform governance key. Refused in production — give it its own funded address`,
+    );
+  }
+
   if (cfg.platformOutflowCeiling < cfg.maxTreasuryFund) {
     throw new Error(
       "Invalid config: PLATFORM_OUTFLOW_CEILING_USDC must be >= MAX_TREASURY_FUND_USDC (a single legal fund call must never be auto-blocked)",
@@ -1287,7 +1339,7 @@ export function redact(cfg: Config): Record<string, unknown> {
     maxTreasuryFundedPerTenant: cfg.maxTreasuryFundedPerTenant.toString(),
     platformOutflowCeiling: cfg.platformOutflowCeiling.toString(),
     platformPrivateKey: "REDACTED",
-    customerPrivateKey: "REDACTED",
+    customerPrivateKey: cfg.customerPrivateKey ? "REDACTED" : undefined,
     authJwtSecret: "REDACTED",
     operatorPrivateKey: cfg.operatorPrivateKey ? "REDACTED" : undefined,
     pocketMasterSeed: cfg.pocketMasterSeed ? "REDACTED" : undefined,
@@ -1298,7 +1350,7 @@ export function redact(cfg: Config): Record<string, unknown> {
     anthropicApiKey: cfg.anthropicApiKey ? "REDACTED" : undefined,
     // A Discord/Slack webhook URL embeds its own token — posting to it needs no other credential.
     alertWebhookUrl: cfg.alertWebhookUrl ? "REDACTED" : undefined,
-    jobClientPrivateKey: "REDACTED",
+    jobClientPrivateKey: cfg.jobClientPrivateKey ? "REDACTED" : undefined,
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
     x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
     // The World Chain submitter key: gas-only, but still key material and never a log line. The
