@@ -148,6 +148,13 @@ export interface UsdcJobNodeOptions {
   /** Mine the FIRST `reject` as reverted: the escrow stays where it is, with a receipt to prove
    *  it. Once, like {withholdReceipt}, so the next attempt can be the one that works. */
   revertReject?: boolean;
+  /**
+   * Refuse every `reject` at the GAS ESTIMATE, which is where a real chain refuses one.
+   *
+   * `prepareTransactionRequest` estimates before anything is signed, so the refusal arrives as a
+   * viem error with no transaction and no hash — not as one of ours off a receipt.
+   */
+  rejectPreflightFails?: boolean;
   /** Mine every `complete` as REVERTED — the second way a funded job dies after its money moved. */
   revertComplete?: boolean;
 }
@@ -356,8 +363,13 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         };
       case "eth_maxPriorityFeePerGas":
         return "0x1";
-      case "eth_estimateGas":
+      case "eth_estimateGas": {
+        const [{ data }] = params as [{ data?: Hex }];
+        // The chain's own refusal, in the place a real one arrives: before a signature exists.
+        if (opts.rejectPreflightFails && decode(data)?.functionName === "reject")
+          throw new Error("execution reverted: not client or evaluator");
         return "0xdbba0";
+      }
       case "eth_call": {
         const [{ to, data }] = params as [{ to?: Address; data?: Hex }];
         return call(to, data);
@@ -539,6 +551,8 @@ export function jobFundHarness(
     /** Mine the FIRST of the recovery's rejects as reverted: the escrow stays put, with a
      *  receipt. The attempt after it is allowed to work, which is what the next boot does. */
     revertReject?: boolean;
+    /** Refuse the recovery's rejects at the gas estimate — a revert with no hash to record. */
+    rejectPreflightFails?: boolean;
     /** The chain's clock in seconds, shared by the node and the recovery's expiry decision. */
     now?: () => number;
   } = {},
@@ -559,6 +573,7 @@ export function jobFundHarness(
     withholdReceipt: opts.withholdReceipt,
     now: opts.now,
     revertReject: opts.revertReject,
+    rejectPreflightFails: opts.rejectPreflightFails,
     revertComplete: opts.failAt === "complete",
   });
   // The client pays the escrow out of its own USDC, so it has to have some: a refund is measured
@@ -583,6 +598,18 @@ export function jobFundHarness(
     const outcome = await recoverEscrow({ jobs, job: adapter, now: opts.now }, jobKey);
     recoveries.push(outcome);
     return outcome;
+  };
+  /**
+   * THE ON-DEMAND DOOR, built the way the two real ones are built.
+   *
+   * `refund_job` (MCP) and `refund-job` (CLI) look the row up, then call the recovery inside
+   * `withKeyedLock(entityKey)` — the same key the saga and the boot walk hold. Reproduced here so
+   * a test can race a manual refund against the boot walk over a real chain and count the
+   * transactions, which is the thing that goes wrong when a door forgets the lock.
+   */
+  const refundViaDoor = async (jobKey: string): Promise<RecoverOutcome> => {
+    const rec = jobs.findByKey(jobKey)!;
+    return withKeyedLock(rec.entityKey, () => refundJob(jobKey));
   };
 
   const outflows: BookedOutflow[] = [];
@@ -782,8 +809,10 @@ export function jobFundHarness(
     seedFailedFundedJob,
     eventsFor,
     evaluatorAddress,
-    /** Call the recovery by hand — what the MCP tool and the CLI do. */
+    /** The recovery itself, with no lock — what the saga and the boot walk call from inside one. */
     refundJob,
+    /** The recovery behind the lock, as the MCP tool and the CLI call it. */
+    refundViaDoor,
     /** Every outcome the recovery reported, in the order it reported them. */
     recoveries,
   };

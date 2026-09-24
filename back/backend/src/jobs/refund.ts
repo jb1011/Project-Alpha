@@ -29,6 +29,7 @@
 import { type Address, type Hex, keccak256, stringToBytes } from "viem";
 import type { JobAdapter } from "../adapters/arc/jobAdapter";
 import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../errors";
+import { publicErrorMessage } from "../workflow/publicError";
 import type { JobRepository } from "./jobRepository";
 import type { EscrowState } from "./types";
 
@@ -64,8 +65,9 @@ export type RecoverOutcome =
   | { outcome: "refunded"; via: RefundVia; txHash: Hex }
   /** Still escrowed: no evaluator to reject with, and the expiry has not arrived. */
   | { outcome: "waiting-expiry"; expiredAt: bigint }
-  /** Our refund was mined and rolled back. The money is still in the escrow. */
-  | { outcome: "refund-failed"; via: RefundVia; txHash: Hex }
+  /** Our refund failed — mined and rolled back, or refused before it was ever sent (no hash
+   *  then). The money is still in the escrow either way. */
+  | { outcome: "refund-failed"; via: RefundVia; txHash: Hex | null }
   /** Our refund was sent and we could not confirm it. It may still land. */
   | { outcome: "refund-unconfirmed"; via: RefundVia; txHash: Hex }
   /** A status this interface does not know. Nothing is sent and nothing is written. */
@@ -122,8 +124,13 @@ export async function recoverEscrow(d: RecoverEscrowDeps, jobKey: string): Promi
       return settle(d, jobKey, "released", null, { outcome: "released" });
     case JobStatusOnChain.rejected:
     case JobStatusOnChain.expired:
-      // Refunded without us. The state is still the truth; the hash is not ours to claim.
-      return settle(d, jobKey, "refunded", null, { outcome: "refunded-elsewhere" });
+      // Refunded — by somebody else, or by US on an earlier call (this tool is safe to call
+      // twice, and the second call lands here). So the hash the row already carries is passed
+      // through rather than overwritten: `refund_tx_hash = null` MEANS "somebody else did it" in
+      // this module's vocabulary, and writing it over our own hash would make the row say
+      // something false about a job whose money is home — with nothing left to correct it, since
+      // a `refunded` row is out of `listEscrowedUnrefunded()` for good.
+      return settle(d, jobKey, "refunded", rec.refundTxHash, { outcome: "refunded-elsewhere" });
     case JobStatusOnChain.funded:
     case JobStatusOnChain.submitted:
       return refund(d, jobKey, jobId, chain);
@@ -203,16 +210,43 @@ async function send(
         txHash: e.txHash,
       });
     }
+    // A REVERT THAT ARRIVED BEFORE A TRANSACTION DID. On a real chain this is the ordinary shape:
+    // `prepareTransactionRequest` estimates gas first, so a refund the contract would refuse
+    // throws there — as a viem error, with no hash, and nothing of it reached the job's trail.
+    // The escrow is still in the contract, so the row keeps saying so and the next boot retries;
+    // the sentence is sanitised because `job_events.detail` is persisted and served
+    // (`workflow/publicError.ts`).
+    d.jobs.recordEvent(
+      jobKey,
+      "refund",
+      "failed",
+      null,
+      JSON.stringify({ via, error: publicErrorMessage(e) }),
+    );
+    settle(d, jobKey, "escrowed", null, { outcome: "refund-failed", via, txHash: null });
+    // Rethrown, unlike the two typed failures above: this is a failure nobody classified, and the
+    // callers that swallow it (the saga, the boot walk) each keep their own record of it.
     throw e;
   }
 }
 
+/** The two states a job's escrow never comes back from: the money has left the contract. */
+const SETTLED: EscrowState[] = ["refunded", "released"];
+
 /**
- * Write the escrow's whereabouts onto the row, off a FRESH read.
+ * Write the escrow's whereabouts onto the row, off a FRESH read — and NEVER BACKWARDS.
  *
- * Never off the record this function was handed: the saga writes the same row on its way down
- * (and the runner writes `failed` after us), so a stale copy saved here would take a column of
- * somebody else's work with it.
+ * Off a fresh read because the saga writes the same row on its way down (and the runner writes
+ * `failed` after us), so a stale copy saved here would take a column of somebody else's work
+ * with it.
+ *
+ * ⚠ MONOTONIC, which is the belt to the doors' braces. `refunded` and `released` are facts about
+ * money that has LEFT the contract, and nothing that happens afterwards can make them untrue: a
+ * second refund attempt that loses a race reads the chain a moment too early, decides `escrowed`,
+ * and would otherwise overwrite the winner's `refunded` — leaving `get_job` reporting an escrow
+ * still in the contract, and a null hash, for a job whose budget is already home. The same rule
+ * covers the hash on its own: a non-null `refund_tx_hash` is the transaction that moved the
+ * money, and null does not get to replace it.
  */
 function settle(
   d: RecoverEscrowDeps,
@@ -222,6 +256,12 @@ function settle(
   outcome: RecoverOutcome,
 ): RecoverOutcome {
   const cur = d.jobs.findByKey(jobKey);
-  if (cur) d.jobs.upsert({ ...cur, escrowState, refundTxHash });
+  if (!cur) return outcome;
+  const settled = cur.escrowState !== null && SETTLED.includes(cur.escrowState);
+  d.jobs.upsert({
+    ...cur,
+    escrowState: settled ? cur.escrowState : escrowState,
+    refundTxHash: refundTxHash ?? cur.refundTxHash,
+  });
   return outcome;
 }

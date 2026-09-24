@@ -9,6 +9,7 @@ import { toJobView } from "../api/jobViews";
 import { loadConfig } from "../config/env";
 import { legacyDoorRefusalMessage, legacyDoorRefused } from "../formation";
 import { outcomeJson } from "../jobs/refund";
+import { withKeyedLock } from "../payments/keyedMutex";
 import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import { runOnboarding } from "../workflow/onboarding";
@@ -325,12 +326,16 @@ export function buildCli(
         process.exitCode = 1;
         return;
       }
-      if (!ctx.jobDeps.jobs.findByKey(jobKey)) {
+      const rec = ctx.jobDeps.jobs.findByKey(jobKey);
+      if (!rec) {
         console.error(`not found: ${jobKey}`);
         process.exitCode = 1;
         return;
       }
-      const outcome = await ctx.jobDeps.refundJob(jobKey);
+      // ⚠ UNDER THE ENTITY LOCK, exactly as the MCP twin does it: an operator running this while
+      // the API is booting is two callers deciding about one escrow, and the second refund is a
+      // doomed transaction whose failure then overwrites the first one's row.
+      const outcome = await withKeyedLock(rec.entityKey, () => ctx.jobDeps.refundJob!(jobKey));
       // The outcome AND the row it left behind: "refunded" is worth little without the hash and
       // the escrow state an operator is about to be asked for.
       console.log(

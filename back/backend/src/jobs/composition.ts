@@ -54,6 +54,11 @@ export interface JobDeps {
    * Get one job's escrow back (`jobs/refund.ts`) — the callable surface behind the `refund_job`
    * MCP tool and the `refund-job` CLI command. Absent with the rest of the signing half: a
    * refund is a transaction, and with no job client key there is no key to send it with.
+   *
+   * ⚠ UNLOCKED, and every caller owes it `withKeyedLock(rec.entityKey)`. It reads the chain,
+   * decides and sends, so two callers inside that window both send a refund and the loser's row
+   * write lands on the winner's. The lock is not taken in here because the saga calls this same
+   * recovery while already holding that key, and the mutex is not re-entrant.
    */
   refundJob?: (jobKey: string) => Promise<RecoverOutcome>;
 }

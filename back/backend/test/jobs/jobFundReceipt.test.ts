@@ -105,7 +105,10 @@ test("a funding that succeeds is booked once, and the row carries the fund hash"
   expect(h.outflows).toEqual([{ path: "job_fund", amountAtomic: 500_000n, ref: fundHash }]);
   expect(h.eventsFor("t:k")).toEqual([
     { step: "fund", status: "funded", tx_hash: fundHash },
-    { step: "submit", status: "failed", tx_hash: null },
+    // The DELIVERABLE step is what threw here (the harness's worker), and the trail says so: no
+    // submit was attempted, no transaction exists, and `submit/failed` would send an operator
+    // looking for one on a block explorer.
+    { step: "deliverable", status: "failed", tx_hash: null },
     { step: "refund", status: "refunded", tx_hash: rejectHash },
   ]);
   // The fund DID fill the escrow — the reject is what emptied it again, and the client's balance

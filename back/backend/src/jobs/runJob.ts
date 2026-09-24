@@ -273,14 +273,20 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
   //
   // ⚠ THE ORIGINAL ERROR IS WHAT THE RUNNER STORES. A recovery that itself fails must never
   // become the explanation of why the job died, so nothing it throws leaves this block.
+  // WHICH PHASE IS RUNNING, for the trail line the failure below writes. Inferring it from the
+  // row's status put `submit/failed` on the trail for a deliverable that never reached a submit —
+  // an operator reading that goes looking for a transaction nobody sent.
+  let phase: "deliverable" | "submit" | "complete" = "deliverable";
   try {
     // --- Step 3: work + submit (provider = the agent's enclave operator) ---
     if (rec.status === "funded") {
+      phase = "deliverable";
       const { content, deliverableHash } = await d.worker.produceDeliverable({
         jobKey: d.jobKey,
         description: d.description,
       });
       const put = d.docStore.put(`job-${d.jobKey}.txt`, content);
+      phase = "submit";
       const submitTx = await d
         .providerOpsFor(entity, d.jobKey)
         .submit(BigInt(rec.jobId!), deliverableHash);
@@ -301,6 +307,7 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
 
     // --- Step 4: evaluator complete → USDC released to provider ---
     if (rec.status === "submitted") {
+      phase = "complete";
       const completeTx = await d.job.complete(BigInt(rec.jobId!), `0x${"00".repeat(32)}` as Hex);
 
       const completed: JobRecord = {
@@ -375,15 +382,15 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
       // THE TRAIL NAMES THE STEP THAT DIED, before it names what we did about the money — so it
       // reads `submit`/`failed` → `refund`/`refunded` rather than starting at the refund and
       // leaving an operator to guess what the refund was for. The step is the saga phase the row
-      // is in, in the same words its success writes (`submit` from `funded`, `complete` from
-      // `submitted`), and the hash is there whenever the failure carried one: a reverted step has
-      // a transaction an operator can look up, and an UNCONFIRMED one is a different fact that
-      // the trail must not flatten into a failure (`errors.ts`, `receipts.ts`).
-      const step = rec.status === "funded" ? "submit" : "complete";
+      // is in, in the same words its success writes (`submit`, `complete`) or the name of the
+      // phase that has no transaction of its own (`deliverable`). The hash is there whenever the
+      // failure carried one: a reverted step has a transaction an operator can look up, and an
+      // UNCONFIRMED one is a different fact that the trail must not flatten into a failure
+      // (`errors.ts`, `receipts.ts`).
       const unconfirmed = e instanceof ChainTxUnconfirmedError;
       const txHash =
         e instanceof ChainTxRevertedError || e instanceof ChainTxUnconfirmedError ? e.txHash : null;
-      d.jobs.recordEvent(d.jobKey, step, unconfirmed ? "unconfirmed" : "failed", txHash, null);
+      d.jobs.recordEvent(d.jobKey, phase, unconfirmed ? "unconfirmed" : "failed", txHash, null);
       try {
         await d.recoverEscrow?.(d.jobKey);
       } catch (recoveryFailure) {

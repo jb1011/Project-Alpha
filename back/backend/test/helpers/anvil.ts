@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { connect } from "node:net";
 import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
 
 export interface AnvilHandle {
@@ -7,34 +8,45 @@ export interface AnvilHandle {
 }
 
 /**
- * Does something on this port already answer JSON-RPC?
+ * Does anything ACCEPT a TCP connection on this port?
  *
- * One `eth_chainId`, the cheapest question a node will answer. A refused connection (nothing
- * there) is the answer we want, so a throw is `false` — this asks "is the port TAKEN", and the
- * only way to say yes is to have been answered.
+ * The question is deliberately not "does it answer JSON-RPC". A probe that asked that had two
+ * holes, both measured: one transient non-200 from the squatter read as "nothing there" (and the
+ * suite then ran against the squatter's chain), and a process that accepts the socket without
+ * ever replying made the probe wait for ever. A completed TCP handshake is the whole answer —
+ * anvil cannot bind a port somebody else is holding, whatever that somebody chooses to say.
+ *
+ * Bounded twice over: the socket's own timeout and a hard timer, so a half-open connection cannot
+ * park this. Anything other than a completed connection counts as free.
  */
-async function portAnswers(port: number): Promise<boolean> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+function portAccepts(port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect({ port, host: "127.0.0.1" });
+    let settled = false;
+    const done = (taken: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(taken);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
 }
 
 /**
- * How long a port may go on answering after we stopped the chain that was on it.
+ * How long the WHOLE probe may take before it calls the port taken.
  *
  * `stop()` sends SIGTERM and returns immediately, and files like `helpers/anvilJob.ts` start one
- * chain per test on the same port — so the port is routinely still answering for a few
- * milliseconds when the next `startAnvil` asks. This grace is for that, and only that: a chain
- * nobody stopped never goes quiet, so it still hits the refusal below.
+ * chain per test on the same port — so a port we just stopped is routinely still accepting for a
+ * few milliseconds. Waiting that out is all the grace anyone needs: a port that stops accepting
+ * ends the wait on the spot, and one that never stops is refused here rather than hours later in
+ * whichever test first reads state it did not write.
  */
-const PORT_RELEASE_TIMEOUT_MS = 5_000;
+const PROBE_TIMEOUT_MS = 2_000;
 
 /**
  * REFUSE A PORT SOMEBODY ELSE IS ON.
@@ -46,11 +58,11 @@ const PORT_RELEASE_TIMEOUT_MS = 5_000;
  * failing suite, so this is loud and it happens BEFORE anything is spawned.
  */
 async function requireFreePort(port: number): Promise<void> {
-  const deadline = Date.now() + PORT_RELEASE_TIMEOUT_MS;
-  while (await portAnswers(port)) {
-    if (Date.now() > deadline)
+  const deadline = Date.now() + PROBE_TIMEOUT_MS;
+  while (await portAccepts(port, 500)) {
+    if (Date.now() >= deadline)
       throw new Error(
-        `startAnvil: something is already listening on 127.0.0.1:${port} and answering eth_chainId. Refusing to spawn: a second anvil cannot take the port, so these tests would silently run against a chain this suite did not start. Stop the leftover process (or free the port) and run again.`,
+        `startAnvil: something is already listening on 127.0.0.1:${port}. Refusing to spawn: a second anvil cannot take the port, so these tests would silently run against a chain this suite did not start. Stop the leftover process (or free the port) and run again.`,
       );
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -80,6 +92,18 @@ export async function startAnvil(port = 8545): Promise<AnvilHandle> {
     let settled = false;
     /** Ready, and the floors from any previous chain dropped before a caller can send. */
     const ready = () => {
+      // ⚠ OUR child, or somebody else's? If the process we spawned is already gone it failed to
+      // bind, and whatever just answered on this port is not the chain we are handing back. The
+      // probe above makes this nearly unreachable; it is here because "nearly" is what the
+      // original hole was made of.
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        reject(
+          new Error(
+            `startAnvil: the anvil spawned for 127.0.0.1:${port} exited immediately — the port is held by something else`,
+          ),
+        );
+        return;
+      }
       resetSenderNonces();
       resolvePromise({ rpcUrl, stop: () => proc.kill("SIGTERM") });
     };

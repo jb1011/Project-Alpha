@@ -200,6 +200,50 @@ test("refund_job renders a bigint deadline as a string rather than throwing", as
   }
 });
 
+test("two refund_job calls on one job never run the recovery at the same time", async () => {
+  // THE DOOR TAKES THE SAME LOCK AS EVERYTHING ELSE. `recoverEscrow` reads the chain, decides and
+  // sends; two callers inside that window both read Funded and both send a reject. One is mined,
+  // the other reverts — burnt gas, a `refund/failed` on the trail describing nothing real, and
+  // the loser's write landing on top of the winner's. The saga and the boot walk serialise on
+  // `withKeyedLock(entityKey)`; this door has to be on the same key.
+  const entityA1 = seedEntity(TENANT, "agent1");
+  jobs.upsert({
+    ...baseJob,
+    jobKey: "jobA1",
+    entityKey: entityA1,
+    ownerTenantId: TENANT,
+    status: "failed",
+    fundTxHash: `0x${"f7".repeat(32)}`,
+  });
+
+  // A recovery that would overlap with itself if nothing held it apart: it parks for a tick in
+  // the middle, exactly where the real one is reading the chain and sending.
+  let inside = 0;
+  let maxInside = 0;
+  const refundJob = async () => {
+    inside += 1;
+    maxInside = Math.max(maxInside, inside);
+    await new Promise((r) => setTimeout(r, 20));
+    inside -= 1;
+    return { outcome: "refunded", via: "reject", txHash: REFUND_HASH };
+  };
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(appWithRefund(refundJob), key);
+  try {
+    const [a, b] = await Promise.all([
+      client.callTool({ name: "refund_job", arguments: { jobKey: "jobA1" } }),
+      client.callTool({ name: "refund_job", arguments: { jobKey: "jobA1" } }),
+    ]);
+    expect(a.isError).toBeFalsy();
+    expect(b.isError).toBeFalsy();
+    // Both calls were served, one after the other — never together.
+    expect(maxInside).toBe(1);
+  } finally {
+    await close();
+  }
+});
+
 test("refund_job hides another tenant's job, and does not touch its escrow", async () => {
   const entityB1 = seedEntity(OTHER_TENANT, "x");
   jobs.upsert({ ...baseJob, jobKey: "jobB1", entityKey: entityB1, ownerTenantId: OTHER_TENANT });

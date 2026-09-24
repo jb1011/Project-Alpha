@@ -240,6 +240,138 @@ test("an evaluator key that is not THIS job's evaluator waits for the expiry ins
   expect(h.node.chainJob(11n)!.status).toBe(5); // Expired
 });
 
+test("a second refund of a job WE refunded keeps our hash, and sends nothing", async () => {
+  // The MCP tool's description says it is safe to call twice, and it is — but the row has to
+  // survive the second call. `refund_tx_hash = null` means "somebody else refunded this" in this
+  // module's own vocabulary, so writing it over our own hash turns the row into a lie about a job
+  // whose money is already home, and nothing ever puts it back: the row is no longer in
+  // `listEscrowedUnrefunded()`.
+  const h = jobFundHarness({ failAt: "submit" });
+  h.seedCreatedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 13n });
+
+  h.runner.reconcileInFlight();
+  await h.runner.settled();
+  const [rejectHash] = h.node.hashesOf("reject");
+  const sendsAfterFirst = h.node.sends.length;
+  expect(h.jobs.findByKey("t:k")!.refundTxHash).toBe(rejectHash);
+
+  // The second call reads the chain, finds Rejected, and has nothing to do.
+  expect(await h.refundJob("t:k")).toEqual({ outcome: "refunded-elsewhere" });
+
+  expect(h.node.sends).toHaveLength(sendsAfterFirst);
+  const row = h.jobs.findByKey("t:k")!;
+  expect(row.escrowState).toBe("refunded");
+  expect(row.refundTxHash).toBe(rejectHash);
+  // …and a third call does not erode it either.
+  await h.refundJob("t:k");
+  expect(h.jobs.findByKey("t:k")!.refundTxHash).toBe(rejectHash);
+});
+
+test("a refund that dies at the pre-flight still lands on the trail", async () => {
+  // THE USUAL SHAPE OF A REVERT ON A REAL CHAIN. `prepareTransactionRequest` estimates gas before
+  // anything is signed, so a reject the contract would refuse throws there — with no hash, and as
+  // a viem error rather than one of ours. Rethrowing it silently left the job's own trail empty
+  // and the ops log as the only record.
+  const h = jobFundHarness({ failAt: "submit", rejectPreflightFails: true });
+  h.seedCreatedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 14n });
+
+  h.runner.reconcileInFlight();
+  await h.runner.settled();
+
+  // Nothing was signed: the estimate refused before a transaction existed.
+  expect(h.node.hashesOf("reject")).toEqual([]);
+  const [fundHash] = h.node.hashesOf("fund");
+  expect(h.eventsFor("t:k")).toEqual([
+    { step: "fund", status: "funded", tx_hash: fundHash },
+    { step: "submit", status: "failed", tx_hash: SUBMIT_REVERT_TX_HASH },
+    { step: "refund", status: "failed", tx_hash: null },
+  ]);
+  const row = h.jobs.findByKey("t:k")!;
+  // The money is still in the contract and the row says so, so the next boot tries again.
+  expect(row.escrowState).toBe("escrowed");
+  expect(row.refundTxHash).toBe(null);
+  expect(h.node.escrowOf(14n)).toBe(BUDGET);
+  expect(h.jobs.listEscrowedUnrefunded().map((r) => r.jobKey)).toEqual(["t:k"]);
+  // The ORIGINAL failure is still the row's error — a refund that could not even be attempted
+  // does not get to explain why the job died.
+  expect(row.error).toBe(revertedMessage("submit", SUBMIT_REVERT_TX_HASH));
+});
+
+test("a manual refund racing the boot walk sends exactly one refund", async () => {
+  // Two doors onto the same money. `recoverEscrow` reads the chain, decides and sends, so two
+  // callers inside that window both see Funded and both send a reject: one is mined, the other is
+  // burnt gas and a `refund/failed` on the trail that describes nothing real. The lock is per
+  // ENTITY and the boot walk already holds it; the manual door has to be on the same key.
+  const h = jobFundHarness({});
+  h.seedFailedFundedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 15n, chainStatus: 1 });
+
+  // The boot walk and an operator's `refund-job`, in the same moment.
+  h.runner.reconcileInFlight();
+  await Promise.all([h.runner.settled(), h.refundViaDoor("t:k")]);
+
+  const rejects = h.node.hashesOf("reject");
+  expect(rejects).toHaveLength(1);
+  expect(h.node.actions.map((a) => `${a.call}:${a.status}`)).toEqual(["reject:success"]);
+  expect(h.eventsFor("t:k")).toEqual([
+    { step: "refund", status: "refunded", tx_hash: rejects[0]! },
+  ]);
+  const row = h.jobs.findByKey("t:k")!;
+  expect(row.escrowState).toBe("refunded");
+  expect(row.refundTxHash).toBe(rejects[0]!);
+  expect(h.node.escrowOf(15n)).toBe(0n);
+});
+
+test("two manual refunds of one job race no better than one", async () => {
+  const h = jobFundHarness({});
+  h.seedFailedFundedJob({ jobKey: "t:k", entityKey: "t:agent", jobId: 16n, chainStatus: 1 });
+
+  await Promise.all([h.refundViaDoor("t:k"), h.refundViaDoor("t:k")]);
+
+  // The second caller reads the chain AFTER the first has finished, finds Rejected, and sends
+  // nothing — which is only true because it waited.
+  expect(h.node.hashesOf("reject")).toHaveLength(1);
+  expect(h.recoveries.map((r) => r.outcome)).toEqual(["refunded", "refunded-elsewhere"]);
+  const row = h.jobs.findByKey("t:k")!;
+  expect(row.escrowState).toBe("refunded");
+  expect(row.refundTxHash).toBe(h.node.hashesOf("reject")[0]!);
+});
+
+test("a row that already reads refunded never goes back to escrowed", async () => {
+  // The loser's write, on its own and with no race to produce it: a caller that read the chain a
+  // moment before the winner's reject landed decides `escrowed`, and that decision must not
+  // overwrite the fact the winner recorded. Belt to the doors' braces — the lock stops the second
+  // transaction, this stops the second WRITE, and `get_job` never reports an escrow still in the
+  // contract for a job whose budget is home.
+  const winnerHash = `0x${"77".repeat(32)}` as const;
+  // Held before the deadline throughout: past it this caller would correctly send a claimRefund
+  // (the chain says the escrow is there), and this test is about the WRITE, not the chain.
+  const h = jobFundHarness({ evaluator: false, now: () => 1_000 });
+  h.seedFailedFundedJob({
+    jobKey: "t:k",
+    entityKey: "t:agent",
+    jobId: 17n,
+    chainStatus: 1, // the chain still says Funded to this reader
+    expiredAt: 5_000n,
+  });
+  const winner = h.jobs.findByKey("t:k")!;
+  h.jobs.upsert({ ...winner, escrowState: "refunded", refundTxHash: winnerHash });
+
+  // No evaluator key and the deadline has not passed, so this caller's verdict is `escrowed`.
+  expect(await h.refundJob("t:k")).toEqual({ outcome: "waiting-expiry", expiredAt: 5_000n });
+
+  const row = h.jobs.findByKey("t:k")!;
+  expect(row.escrowState).toBe("refunded");
+  expect(row.refundTxHash).toBe(winnerHash);
+  // …and it stays out of the boot walk's set, so nothing re-reads the chain for it for ever.
+  expect(h.jobs.listEscrowedUnrefunded()).toEqual([]);
+  // The same holds for a `released` row, the other end-state.
+  h.jobs.upsert({ ...winner, escrowState: "released", refundTxHash: null });
+  expect(await h.refundJob("t:k")).toEqual({ outcome: "waiting-expiry", expiredAt: 5_000n });
+  expect(h.jobs.findByKey("t:k")!.escrowState).toBe("released");
+  // Nothing was sent for either of them: this test is about the WRITE, not the chain.
+  expect(h.node.sends).toEqual([]);
+});
+
 test("a job the chain says is Completed is released money, and nothing is sent", async () => {
   // The escrow paid the provider after we had already given up on the row. There is nothing to
   // refund, and a reject would only have reverted.

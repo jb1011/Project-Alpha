@@ -754,7 +754,13 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
       if (!rec || rec.ownerTenantId !== scope.tenantId || !entityInScope(scope, rec.entityKey))
         return { content: [{ type: "text", text: "job not found" }], isError: true };
       try {
-        const outcome = await deps.refundJob(jobKey);
+        // ⚠ UNDER THE ENTITY LOCK, the same key the saga and the boot walk hold
+        // (`jobs/composition.ts`, `jobs/jobRunner.ts`). `recoverEscrow` reads the chain, decides
+        // and sends, so two unlocked callers both read Funded and both send a refund: one is
+        // mined, the other is burnt gas and a failure on the trail describing nothing real. The
+        // lock goes HERE rather than inside `recoverEscrow`, because the saga already holds this
+        // key when it calls it and the mutex is not re-entrant.
+        const outcome = await withKeyedLock(rec.entityKey, () => deps.refundJob!(jobKey));
         return {
           content: [{ type: "text", text: JSON.stringify({ jobKey, ...outcomeJson(outcome) }) }],
         };
