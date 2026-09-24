@@ -98,6 +98,14 @@ function makeAdapters() {
   const publicClient = {
     // `result` is the jobId createJob reads back; `request` is what the old path forwarded.
     simulateContract: vi.fn(async () => ({ result: 3n, request: { marker: "sim-request" } })),
+    // The fund step's allowance read: an ordinary contract read, outside the lock (the
+    // `sendClient` below is the only thing allowed inside it), and generous enough that the
+    // refusal it guards never fires in this file.
+    readContract: vi.fn(async () => {
+      if (senderLockHeld(CLIENT))
+        throw new Error(`the allowance for ${CLIENT} was read inside the lock`);
+      return 2n ** 255n;
+    }),
     waitForTransactionReceipt: vi.fn(async () => {
       receiptWaitsInLock.push(
         [CLIENT, EVALUATOR].find((a) => senderLockHeld(a)) as Address | undefined,

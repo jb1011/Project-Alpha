@@ -1,4 +1,5 @@
 import { ApiError } from "../api/errors";
+import { publicErrorMessage } from "../workflow/publicError";
 import type { JobRepository } from "./jobRepository";
 import type { JobRecord, JobStatus } from "./types";
 
@@ -107,7 +108,14 @@ export class JobRunner {
           this.deps.jobs.upsert({
             ...cur,
             status: "failed",
-            error: e instanceof Error ? e.message : String(e),
+            // SANITISED, because `job.error` is served by the API, the MCP tools and the CLI, and
+            // the saga's chain calls throw viem diagnostics — which quote back the RPC URL with
+            // the provider key in its path, the request body and the whole raw signed transaction.
+            // That is the 2026-09-16 leak, one table along (`workflow/publicError.ts`), and the
+            // funding path reaches it: the escrow unit's allowance read is an ordinary contract
+            // read, and a broken endpoint makes it throw one of those. The typed failures the
+            // saga raises are already written for a stranger and come back word for word.
+            error: publicErrorMessage(e),
           });
       } finally {
         this.inFlight.delete(jobKey);

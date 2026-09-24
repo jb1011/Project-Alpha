@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
+import { HttpRequestError } from "viem";
 import { expect, test } from "vitest";
+import { JobFundRevertedError } from "../../src/errors";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { JobRunner } from "../../src/jobs/jobRunner";
 import { migrate } from "../../src/persistence/db";
@@ -125,4 +127,61 @@ test("reconcileInFlight resumes non-terminal records", async () => {
   await runner.settled();
   expect(count).toBe(1);
   expect(jobs.findByKey("t:resume")?.status).toBe("reputed");
+});
+
+/**
+ * WHAT THE RUNNER STORES IS SERVED TO STRANGERS.
+ *
+ * `job.error` is rendered by the API, the MCP tools and the CLI. The runner used to store the raw
+ * `e.message` of whatever the saga threw, and the saga's chain calls throw viem diagnostics — which
+ * quote back the RPC URL WITH the provider key in its path, the request body and the whole raw
+ * signed transaction. That is the exact shape that put a provider key on screen on 2026-09-16, one
+ * table along (`workflow/publicError.ts`), and the job funding path reaches it: the allowance read
+ * added for the escrow unit is an ordinary contract read, and a throttled or broken endpoint makes
+ * it throw one of those.
+ */
+test("a chain diagnostic never reaches job.error with its credentials intact", async () => {
+  const db = makeDb();
+  const jobs = new SqliteJobRepository(db);
+  const POISONED =
+    'HTTP request failed.\nURL: https://rpc.example/v2/SECRETKEY123456\nRequest body: {"method":"eth_call"}\nRaw: 0x02f8720182015785012a05f200850';
+  const runJobFn = async () => {
+    throw new HttpRequestError({
+      body: { method: "eth_call" },
+      details: POISONED,
+      status: 500,
+      url: "https://rpc.example/v2/SECRETKEY123456",
+    });
+  };
+  const runner = new JobRunner({ jobs, runJob: runJobFn });
+  const { jobKey } = runner.start({ ...baseParams });
+  await runner.settled();
+
+  const stored = jobs.findByKey(jobKey)!;
+  expect(stored.status).toBe("failed");
+  // The fixture really is poisoned…
+  expect(POISONED.includes("SECRETKEY123456")).toBe(true);
+  // …and none of it is in the database.
+  expect(stored.error!.includes("SECRETKEY123456")).toBe(false);
+  expect(stored.error!.includes("rpc.example/v2")).toBe(false);
+  expect(stored.error!.includes("0x02f8720182015785012a05f200850")).toBe(false);
+  expect(stored.error).toBe("HTTP request failed.");
+});
+
+test("a typed failure from the saga is stored word for word", async () => {
+  // The other half: the sanitiser must not paraphrase a sentence that was already written for a
+  // founder — the escrow failures name their step and their hash, and both have to survive.
+  const db = makeDb();
+  const jobs = new SqliteJobRepository(db);
+  const hash = `0x${"77".repeat(32)}` as const;
+  const runJobFn = async () => {
+    throw new JobFundRevertedError("fund", hash, 42n);
+  };
+  const runner = new JobRunner({ jobs, runJob: runJobFn });
+  const { jobKey } = runner.start({ ...baseParams });
+  await runner.settled();
+
+  expect(jobs.findByKey(jobKey)!.error).toBe(
+    `the escrow funding for job 42 failed at the fund step (${hash}): the transaction reverted on chain. The job was not funded and nothing was charged.`,
+  );
 });

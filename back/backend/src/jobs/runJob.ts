@@ -15,6 +15,7 @@
 import type { Address, Hex } from "viem";
 import type { JobAdapter } from "../adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../adapters/arc/reputationAdapter";
+import { JobFundRevertedError, JobFundUnconfirmedError } from "../errors";
 import { providerOf, requireCircleWallets } from "../payments/provider";
 import type { DocumentStore } from "../persistence/documentStore";
 import type { EntityRepository } from "../persistence/entityRepository";
@@ -202,7 +203,33 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
     const ops = d.providerOpsFor(entity, d.jobKey);
 
     await ops.setBudget(BigInt(rec.jobId!), d.budget);
-    const fundTxHash = await d.job.approveAndFund(BigInt(rec.jobId!), d.usdc, d.budget);
+    // BOOK ONLY WHAT MOVED. `approveAndFund` returns a hash only once BOTH receipts came back
+    // successful (`adapters/arc/jobAdapter.ts`, `receipts.ts`), so everything below this line —
+    // the outflow against the S5 ceiling, the `funded` row, the `funded` event — is written about
+    // a transfer the chain actually made. Before 2026-09-22 it was written about a hash: a `fund`
+    // mined at `status: 0x0` (the allowance was spent by a job on another entity) booked 0.5 USDC
+    // as money that had left, and the next step then failed against a job still at Open.
+    let fundTxHash: Hex;
+    try {
+      fundTxHash = await d.job.approveAndFund(BigInt(rec.jobId!), d.usdc, d.budget);
+    } catch (e) {
+      // A funding that reverted is a recorded failure, not a silence: the trail keeps the hash an
+      // operator can look up. The runner marks the row `failed` with this error's public message.
+      if (e instanceof JobFundRevertedError)
+        d.jobs.recordEvent(d.jobKey, "fund", "failed", e.txHash, JSON.stringify({ step: e.step }));
+      // A DIFFERENT FACT, and the trail has to keep them apart: the transaction was sent and may
+      // still fund the escrow, so this is the hash an operator checks before anyone re-runs the
+      // job. Nothing is booked either way — booking requires knowing.
+      if (e instanceof JobFundUnconfirmedError)
+        d.jobs.recordEvent(
+          d.jobKey,
+          "fund",
+          "unconfirmed",
+          e.txHash,
+          JSON.stringify({ step: e.step }),
+        );
+      throw e;
+    }
     d.outflows?.record("job_fund", d.budget, fundTxHash);
 
     const updated: JobRecord = {

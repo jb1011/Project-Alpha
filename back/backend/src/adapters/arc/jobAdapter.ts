@@ -6,8 +6,16 @@ import {
   encodeFunctionData,
 } from "viem";
 import { iErc8183JobAbi } from "../../abis/generated";
+import {
+  ChainTxRevertedError,
+  ChainTxUnconfirmedError,
+  JobFundRevertedError,
+  JobFundUnconfirmedError,
+} from "../../errors";
+import { withKeyedLock } from "../../payments/keyedMutex";
 import { USDC_TRANSFER_GAS } from "./gas";
 import { type LocalSendClient, prepareLocalTx, sendFromLocalAccount } from "./localSend";
+import { RECEIPT_TIMEOUT_MS, type ReceiptOutcome, awaitSuccessfulReceipt } from "./receipts";
 
 /** Minimal ERC-20 approve fragment for the approveAndFund flow. */
 const erc20ApproveAbi = [
@@ -22,6 +30,41 @@ const erc20ApproveAbi = [
     outputs: [{ type: "bool" }],
   },
 ] as const;
+
+/** Minimal ERC-20 allowance fragment — what the fund step reads before it spends it. */
+const erc20AllowanceAbi = [
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+] as const;
+
+/**
+ * ONE ALLOWANCE UNIT PER CLIENT KEY (`payments/keyedMutex.ts`).
+ *
+ * An ERC-20 allowance is a single number per (owner, spender) pair, and `approve` SETS it. So
+ * "approve then fund" is not two independent transactions: it is a read-modify-write on shared
+ * state, and two of them interleaved is the 2026-09-22 incident — approve A, approve B (which
+ * overwrote A's), fund A (which spent all of it), fund B (mined at `status: 0x0`).
+ *
+ * Keyed by the CLIENT ADDRESS, because the allowance belongs to the address, not to the job or
+ * the entity: `runJob` is serialised per entity (`jobs/composition.ts`), which is the right lock
+ * for the agent's operator key and no lock at all for this — the two jobs were on two different
+ * entities and shared one client key.
+ *
+ * ⚠ A DIFFERENT KEY from the per-signer send lock, which is `sender:<address>`
+ * (`senderLock.ts`). Nothing nests on the same key: this unit is the outer one, and the individual
+ * broadcasts inside it each take the sender lock at the leaf, as every other send does. It is also
+ * the reason the two `simulateContract` pre-flights below mean anything at all — they now run
+ * inside the window whose state they are checking.
+ */
+const allowanceLockKey = (client: Address) => `job-allowance:${client.toLowerCase()}`;
 
 /** Minimal ERC-20 balanceOf fragment for the sweep flow. */
 const erc20BalanceOfAbi = [
@@ -60,6 +103,9 @@ export interface JobAdapterDeps {
    *  in `clients.ts`. Every composition that SENDS passes it; a read-only one needs none. */
   sendClient?: LocalSendClient;
   jobContract: Address;
+  /** How long a receipt wait may take before it is reported unconfirmed (`receipts.ts`). The
+   *  production bound is {RECEIPT_TIMEOUT_MS}; tests shorten it so a timeout is not a minute. */
+  receiptTimeoutMs?: number;
 }
 
 export interface JobResult {
@@ -199,8 +245,31 @@ export class JobAdapter {
         ],
       }),
     });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: txHash });
+    await this.mined(txHash, "createJob");
     return { jobId: result as bigint, txHash };
+  }
+
+  /**
+   * Await the receipt and REFUSE one that reverted (`receipts.ts`).
+   *
+   * Every send in this class ends here, and the step is the name that reaches the caller — never
+   * a message from the node.
+   */
+  private mined(txHash: Hex, step: string): Promise<void> {
+    return this.receipt(txHash, {
+      reverted: (h) => new ChainTxRevertedError(step, h),
+      unconfirmed: (h) => new ChainTxUnconfirmedError(step, h),
+    });
+  }
+
+  /** Every receipt wait in this class, bounded by the same clock. */
+  private receipt(txHash: Hex, outcome: ReceiptOutcome): Promise<void> {
+    return awaitSuccessfulReceipt(
+      this.d.publicClient,
+      txHash,
+      outcome,
+      this.d.receiptTimeoutMs ?? RECEIPT_TIMEOUT_MS,
+    );
   }
 
   /**
@@ -219,7 +288,7 @@ export class JobAdapter {
       account: providerWallet.account!,
     });
     const h = await providerWallet.writeContract(request);
-    await this.d.publicClient.waitForTransactionReceipt({ hash: h });
+    await this.mined(h, "setBudget");
     return h;
   }
 
@@ -227,8 +296,20 @@ export class JobAdapter {
    * approveAndFund — client approves the job contract to pull `amount` USDC, then calls fund().
    * Uses clientWallet throughout, and therefore the job client's send lock: TWO transactions, each
    * numbered inside its own locked window, with the approve's receipt awaited between them.
+   *
+   * ⚠ BOTH RECEIPTS ARE READ, not merely awaited. A reverted transaction gets a receipt too, and
+   * the caller books an outflow off the value this returns — see `receipts.ts` and `runJob.ts`.
+   *
+   * ⚠ THE TWO SENDS ARE ONE UNIT, per client key — see {allowanceLockKey}. Two jobs funding at
+   * once are two writers to one allowance, and interleaving them is what reverted a fund.
    */
   async approveAndFund(jobId: bigint, usdc: Address, amount: bigint): Promise<Hex> {
+    const client = this.d.clientWallet.account!.address as Address;
+    return withKeyedLock(allowanceLockKey(client), () => this.approveThenFund(jobId, usdc, amount));
+  }
+
+  /** The unit itself: approve, then fund what the approve granted. Never called unlocked. */
+  private async approveThenFund(jobId: bigint, usdc: Address, amount: bigint): Promise<Hex> {
     // Step 1: approve job contract to spend USDC
     await this.d.publicClient.simulateContract({
       address: usdc,
@@ -237,15 +318,17 @@ export class JobAdapter {
       args: [this.d.jobContract, amount],
       account: this.d.clientWallet.account!,
     });
-    await this.d.publicClient.waitForTransactionReceipt({
-      hash: await this.sendAsLocalKey(this.d.clientWallet, JOB_CLIENT, {
-        to: usdc,
-        data: encodeFunctionData({
-          abi: erc20ApproveAbi,
-          functionName: "approve",
-          args: [this.d.jobContract, amount],
-        }),
+    const approveHash = await this.sendAsLocalKey(this.d.clientWallet, JOB_CLIENT, {
+      to: usdc,
+      data: encodeFunctionData({
+        abi: erc20ApproveAbi,
+        functionName: "approve",
+        args: [this.d.jobContract, amount],
       }),
+    });
+    await this.receipt(approveHash, {
+      reverted: (h) => new JobFundRevertedError("approve", h, jobId),
+      unconfirmed: (h) => new JobFundUnconfirmedError("approve", h, jobId),
     });
     // Step 2: fund the job (pulls USDC via transferFrom into escrow). Simulated only now: before
     // the approve is mined it would revert on the allowance.
@@ -256,11 +339,26 @@ export class JobAdapter {
       args: [jobId, "0x"],
       account: this.d.clientWallet.account!,
     });
+    // BELT AND BRACES, and cheap: the allowance this fund is about to spend, read from the chain
+    // rather than assumed from the approve above. A mis-set or already-spent allowance then costs
+    // a refusal instead of a reverted transaction — the pre-flight cannot be trusted to catch it,
+    // because the incident's allowance was still there when the pre-flight ran.
+    const allowance = (await this.d.publicClient.readContract({
+      address: usdc,
+      abi: erc20AllowanceAbi,
+      functionName: "allowance",
+      args: [this.d.clientWallet.account!.address as Address, this.d.jobContract],
+    })) as bigint;
+    if (allowance < amount)
+      throw new JobFundRevertedError("approve", approveHash, jobId, "allowance");
     const h = await this.sendAsLocalKey(this.d.clientWallet, JOB_CLIENT, {
       to: this.d.jobContract,
       data: encodeFunctionData({ abi: iErc8183JobAbi, functionName: "fund", args: [jobId, "0x"] }),
     });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: h });
+    await this.receipt(h, {
+      reverted: (x) => new JobFundRevertedError("fund", x, jobId),
+      unconfirmed: (x) => new JobFundUnconfirmedError("fund", x, jobId),
+    });
     return h;
   }
 
@@ -278,7 +376,7 @@ export class JobAdapter {
       account: providerWallet.account!,
     });
     const h = await providerWallet.writeContract(request);
-    await this.d.publicClient.waitForTransactionReceipt({ hash: h });
+    await this.mined(h, "submit");
     return h;
   }
 
@@ -305,7 +403,7 @@ export class JobAdapter {
         args: [jobId, reason, "0x"],
       }),
     });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: h });
+    await this.mined(h, "complete");
     return h;
   }
 
@@ -344,7 +442,7 @@ export class JobAdapter {
     // Explicit gas (see USDC_TRANSFER_GAS): sweeps ~the provider EOA's entire USDC balance, so viem's
     // fee-fielded estimateGas would otherwise reserve it all and revert.
     const h = await wallet.writeContract({ ...request, gas: USDC_TRANSFER_GAS });
-    await this.d.publicClient.waitForTransactionReceipt({ hash: h });
+    await this.mined(h, "transferUsdc");
     return h;
   }
 

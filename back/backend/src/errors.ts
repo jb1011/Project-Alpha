@@ -78,3 +78,110 @@ export class PriorTransferUnconfirmedError extends Error {
     this.name = "PriorTransferUnconfirmedError";
   }
 }
+
+/**
+ * A TRANSACTION WE SENT WAS MINED, AND IT REVERTED.
+ *
+ * `waitForTransactionReceipt` resolves for a reverted transaction: viem returns the receipt with
+ * `status: "reverted"` and throws nothing, because "the chain answered" and "the call worked" are
+ * two different questions. Every adapter here awaited the receipt and read only the hash, so a
+ * reverted send was indistinguishable from a successful one to everything above it.
+ *
+ * The message is written for a stranger: the step, the hash an operator can look up, and no text
+ * that came back from an RPC. That matters because it is stored and rendered — the same path that
+ * put a provider key on screen on 2026-09-16 (`workflow/publicError.ts`).
+ */
+export class ChainTxRevertedError extends Error {
+  constructor(
+    /** The call that reverted, in the words the adapter uses for it: `setBudget`, `submit`, … */
+    readonly step: string,
+    readonly txHash: `0x${string}`,
+  ) {
+    super(
+      `${step} reverted on chain (${txHash}) — the transaction was mined and its effects were rolled back`,
+    );
+    this.name = "ChainTxRevertedError";
+  }
+}
+
+/**
+ * THE ESCROW FUNDING DID NOT HAPPEN — and the job must not be recorded as funded.
+ *
+ * Its own type, separate from {ChainTxRevertedError}, because the saga acts on it: `runJob` books
+ * the outflow and writes `funded` only once `approveAndFund` has RETURNED, and turns this failure
+ * into a `fund`/`failed` event carrying the hash. Two ways to get here, and a caller that reads
+ * `step` can tell them apart:
+ *
+ *  - a receipt that says the approve or the fund reverted (2026-09-22: two jobs from one client
+ *    key, each `approve` SETTING the shared allowance, the second `fund` mined at `status: 0x0`);
+ *  - an allowance that is not there to spend, read from the chain before the fund is sent — the
+ *    belt-and-braces check, so a mis-set allowance never reaches the chain as a revert at all.
+ */
+export class JobFundRevertedError extends Error {
+  constructor(
+    readonly step: "approve" | "fund",
+    readonly txHash: `0x${string}`,
+    readonly jobId: bigint,
+    /** What went wrong: a receipt that reverted, or an allowance that did not cover the budget. */
+    readonly reason: "reverted" | "allowance" = "reverted",
+  ) {
+    super(
+      `the escrow funding for job ${jobId} failed at the ${step} step (${txHash}): ${
+        reason === "reverted"
+          ? "the transaction reverted on chain"
+          : "the USDC allowance no longer covers the budget"
+      }. The job was not funded and nothing was charged.`,
+    );
+    this.name = "JobFundRevertedError";
+  }
+}
+
+/**
+ * A TRANSACTION WE SENT, WHOSE FATE WE DO NOT KNOW — and which is NOT a revert.
+ *
+ * The receipt wait is bounded (`adapters/arc/receipts.ts`), because the escrow funding holds one
+ * lock per client key across both of its waits and viem's default is three minutes per wait. When
+ * the bound is reached the honest report is the opposite of {ChainTxRevertedError}: the bytes are
+ * with the node, the transaction may still be mined, and whatever it does will have happened
+ * whether or not we were listening.
+ *
+ * So the message never says "reverted", and it forbids the re-send that a "nothing happened"
+ * sentence would invite — the same distinction, for the same reason, as
+ * {BroadcastUnconfirmedError} one layer down.
+ */
+export class ChainTxUnconfirmedError extends Error {
+  constructor(
+    readonly step: string,
+    readonly txHash: `0x${string}`,
+  ) {
+    super(
+      `${step} was sent (${txHash}) but we could not confirm it in time — it may still be mined; do not re-send until it is resolved`,
+    );
+    this.name = "ChainTxUnconfirmedError";
+  }
+}
+
+/**
+ * THE ESCROW FUNDING WAS SENT AND WE COULD NOT CONFIRM IT.
+ *
+ * {JobFundRevertedError}'s twin, and deliberately a different type: a revert means the money did
+ * not move and the job may be abandoned, while this means the escrow MAY be funded right now. Both
+ * book nothing — booking requires knowing — but only one of them may be described to a founder as
+ * a transfer that did not happen, and re-running a job on this one could fund the same escrow
+ * twice.
+ *
+ * `runJob` records it as a `fund`/`unconfirmed` event carrying the hash, which is where an
+ * operator starts when the question is "did job 7 take my 0.5 USDC?".
+ */
+export class JobFundUnconfirmedError extends Error {
+  constructor(
+    readonly step: "approve" | "fund",
+    readonly txHash: `0x${string}`,
+    readonly jobId: bigint,
+  ) {
+    super(
+      `the escrow funding for job ${jobId} was sent at the ${step} step (${txHash}) but we could not confirm it in time — it may still land. Nothing was booked; do not re-run this job until the transaction is resolved.`,
+    );
+    this.name = "JobFundUnconfirmedError";
+  }
+}
