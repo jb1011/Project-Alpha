@@ -155,6 +155,8 @@ export async function runJob(d: RunJobDeps): Promise<JobRecord> {
       completeTxHash: null,
       sweepTxHash: null,
       reputationTxHash: null,
+      refundTxHash: null,
+      escrowState: null,
       error: null,
     };
     d.jobs.upsert(rec);

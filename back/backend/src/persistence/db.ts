@@ -401,6 +401,10 @@ export function migrate(db: Database.Database): void {
       deliverable_hash TEXT, deliverable_path TEXT,
       create_tx_hash TEXT, fund_tx_hash TEXT, submit_tx_hash TEXT, complete_tx_hash TEXT, sweep_tx_hash TEXT, reputation_tx_hash TEXT,
       error TEXT,
+      -- Where the escrow of this job ended up, and the transaction that sent it back if we sent
+      -- one. 'none' | 'escrowed' | 'refunded' | 'released'; NULL = nobody has read the chain for
+      -- this row yet (see the guarded ADD COLUMN below, which is how existing boxes get these).
+      refund_tx_hash TEXT, escrow_state TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (entity_key) REFERENCES entities(idempotency_key)
@@ -946,6 +950,21 @@ export function migrate(db: Database.Database): void {
     (c) => c.name,
   );
   if (!pkCols.includes("revoked_at")) db.exec("ALTER TABLE passkeys ADD COLUMN revoked_at INTEGER");
+
+  // WHERE THE ESCROW OF A DEAD JOB IS. Two columns, added the only way this schema adds one: a
+  // guarded ADD COLUMN, never a rebuild — `jobs` is the table that holds the failed rows whose
+  // budget is still in the contract, and those are the rows this feature exists to repay.
+  //
+  // NULL is the right value for every row written before this change: nobody has read the chain
+  // for them yet, so "unknown" is the truth, and `listEscrowedUnrefunded` treats NULL and
+  // 'escrowed' alike for exactly that reason. The status CHECK list is deliberately NOT touched:
+  // a refund is a property of a `failed` row, not a status of its own.
+  const jobCols = (db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!jobCols.includes("refund_tx_hash"))
+    db.exec("ALTER TABLE jobs ADD COLUMN refund_tx_hash TEXT");
+  if (!jobCols.includes("escrow_state")) db.exec("ALTER TABLE jobs ADD COLUMN escrow_state TEXT");
 
   const plCols = (db.prepare("PRAGMA table_info(payments_ledger)").all() as { name: string }[]).map(
     (c) => c.name,

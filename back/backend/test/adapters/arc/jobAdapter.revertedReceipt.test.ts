@@ -133,6 +133,11 @@ const receiptSites: { name: string; step: string; run: (a: Adapters) => Promise<
     step: "transferUsdc",
     run: (a) => a.job.transferUsdc(a.providerWallet, USDC, TREASURY, 250_000n),
   },
+  // The refund sends. A reject or a claimRefund that reverted is money still sitting in the
+  // escrow, and the recovery path writes `escrow_state` off what these throw — so believing an
+  // unread receipt here would record a refund that never happened.
+  { name: "reject", step: "reject", run: (a) => a.job.reject(3n, REASON, a.job.evaluatorWallet!) },
+  { name: "claimRefund", step: "claimRefund", run: (a) => a.job.claimRefund(3n) },
   {
     name: "the reputation record",
     step: "giveFeedback",

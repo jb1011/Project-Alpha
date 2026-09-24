@@ -42,6 +42,8 @@ const baseJob: JobRecord = {
   completeTxHash: null,
   sweepTxHash: null,
   reputationTxHash: null,
+  refundTxHash: null,
+  escrowState: null,
   error: null,
 };
 

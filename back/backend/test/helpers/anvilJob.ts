@@ -79,10 +79,15 @@ async function deployContract(
 }
 
 export interface MockJobEnv {
+  /** The chain's endpoint — the refund tests move its CLOCK, which needs a raw anvil RPC. */
+  rpcUrl: string;
   publicClient: PublicClient;
   clientWallet: WalletClient;
   providerWallet: WalletClient;
   evaluatorWallet: WalletClient;
+  /** An account that is neither the client nor the evaluator: the wrong signer for a reject. */
+  strangerWallet: WalletClient;
+  strangerAddr: Address;
   clientAddr: Address;
   providerAddr: Address;
   evaluatorAddr: Address;
@@ -118,6 +123,12 @@ export async function deployMockJob(): Promise<MockJobEnv> {
     chain: anvilChain,
     transport,
   });
+  const strangerAccount = ACCT(3);
+  const strangerWallet = createWalletClient({
+    account: strangerAccount,
+    chain: anvilChain,
+    transport,
+  });
 
   const usdcAddr = await deployContract(clientWallet, publicClient, "MockUSDC");
   const jobAddr = await deployContract(clientWallet, publicClient, "MockERC8183Job", [usdcAddr]);
@@ -144,10 +155,13 @@ export async function deployMockJob(): Promise<MockJobEnv> {
   };
 
   return {
+    rpcUrl: anvil.rpcUrl,
     publicClient,
     clientWallet,
     providerWallet,
     evaluatorWallet,
+    strangerWallet,
+    strangerAddr: strangerAccount.address,
     clientAddr: clientAccount.address,
     providerAddr: providerAccount.address,
     evaluatorAddr: evaluatorAccount.address,

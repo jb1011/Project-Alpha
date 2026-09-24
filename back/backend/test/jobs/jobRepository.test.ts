@@ -23,6 +23,8 @@ const base: JobRecord = {
   completeTxHash: null,
   sweepTxHash: null,
   reputationTxHash: null,
+  refundTxHash: null,
+  escrowState: null,
   error: null,
 };
 
@@ -110,4 +112,77 @@ test("transaction rolls back on error", () => {
   }).toThrow("rollback");
 
   expect(repo.findByKey("t:k")).toBeUndefined();
+});
+
+// ── THE ESCROW COLUMNS ────────────────────────────────────────────────────────────────────────
+//
+// A `failed` row says the saga stopped. It says nothing about the money, and the money is the
+// point: a job that funded and then died left its budget in the contract. These two columns are
+// the only record of where it went, so they have to survive a round trip, and the query that
+// finds the jobs still owed a refund has to be exact about which rows those are.
+
+test("a refund hash and an escrow state round-trip", () => {
+  const db = makeDb();
+  const repo = new SqliteJobRepository(db);
+  const hash = `0x${"ab".repeat(32)}` as const;
+
+  repo.upsert(base);
+  // Unknown until somebody reads the chain — which is what a row written before this change is.
+  expect(repo.findByKey("t:k")?.refundTxHash).toBe(null);
+  expect(repo.findByKey("t:k")?.escrowState).toBe(null);
+
+  repo.upsert({ ...base, status: "failed", escrowState: "refunded", refundTxHash: hash });
+  expect(repo.findByKey("t:k")?.refundTxHash).toBe(hash);
+  expect(repo.findByKey("t:k")?.escrowState).toBe("refunded");
+});
+
+test("an escrow refunded by somebody else is recorded with no hash of ours", () => {
+  const db = makeDb();
+  const repo = new SqliteJobRepository(db);
+
+  // Anyone may expire a funded job on chain, so the refund can happen without us sending
+  // anything. The state is still `refunded`; the hash is not ours to claim.
+  repo.upsert({ ...base, status: "failed", escrowState: "refunded", refundTxHash: null });
+  expect(repo.findByKey("t:k")?.escrowState).toBe("refunded");
+  expect(repo.findByKey("t:k")?.refundTxHash).toBe(null);
+});
+
+test("listEscrowedUnrefunded is the failed jobs whose funded escrow is still unaccounted for", () => {
+  const db = makeDb();
+  const repo = new SqliteJobRepository(db);
+  const fund = `0x${"f7".repeat(32)}` as const;
+
+  // Owed: it funded, it died, and nobody has read the chain for it (NULL) …
+  repo.upsert({ ...base, jobKey: "t:unknown", status: "failed", fundTxHash: fund });
+  // … or the chain was read and the money is still in there.
+  repo.upsert({
+    ...base,
+    jobKey: "t:escrowed",
+    status: "failed",
+    fundTxHash: fund,
+    escrowState: "escrowed",
+  });
+  // Not owed: never funded, so there is nothing in the contract to get back.
+  repo.upsert({ ...base, jobKey: "t:unfunded", status: "failed", fundTxHash: null });
+  // Not owed: already refunded, by us or by anyone.
+  repo.upsert({
+    ...base,
+    jobKey: "t:refunded",
+    status: "failed",
+    fundTxHash: fund,
+    escrowState: "refunded",
+  });
+  // Not owed: the provider was paid — the escrow was released, not lost.
+  repo.upsert({
+    ...base,
+    jobKey: "t:released",
+    status: "failed",
+    fundTxHash: fund,
+    escrowState: "released",
+  });
+  // Not owed: not a failure at all. A job still working, and a job that finished.
+  repo.upsert({ ...base, jobKey: "t:funded", status: "funded", fundTxHash: fund });
+  repo.upsert({ ...base, jobKey: "t:reputed", status: "reputed", fundTxHash: fund });
+
+  expect(repo.listEscrowedUnrefunded().map((r) => r.jobKey)).toEqual(["t:unknown", "t:escrowed"]);
 });

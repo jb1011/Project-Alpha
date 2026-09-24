@@ -57,6 +57,8 @@ const job = (over: Partial<JobRecord>): JobRecord => ({
   completeTxHash: null,
   sweepTxHash: null,
   reputationTxHash: null,
+  refundTxHash: null,
+  escrowState: null,
   error: null,
   createdAt: null,
   updatedAt: null,

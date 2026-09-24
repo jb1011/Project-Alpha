@@ -56,6 +56,8 @@ const USDC = "0x3600000000000000000000000000000000000000" as Address;
 const PROVIDER = "0x00000000000000000000000000000000000000d1" as Address;
 const SEED_TO = "0x00000000000000000000000000000000000000dd" as Address;
 const REASON = `0x${"00".repeat(32)}` as Hex;
+/** A bytes32 reason that is not the zero word, so the bytes assertion below cannot pass by luck. */
+const REFUND_REASON = `0x${"5a".repeat(32)}` as Hex;
 const FEEDBACK = `0x${"ab".repeat(32)}` as Hex;
 
 const chain = defineChain({
@@ -193,6 +195,8 @@ function node(opts: { holdPlatformSend?: boolean } = {}) {
     job,
     reputation,
     arc,
+    /** The evaluator's own local key, as a wallet — what `reject` is handed by the refund path. */
+    evaluatorWalletClient: createWalletClient({ account: evaluator, chain, transport }),
     calls,
     sent,
     /** The RPC methods issued while THIS signer's lock was held, in order. */
@@ -239,6 +243,20 @@ const kinds: {
     signer: evaluator.address as Address,
     sends: 1,
     run: (n) => n.reputation.record({ agentId: 7n, value: 100, feedbackHash: FEEDBACK }),
+  },
+  // The two ways the escrow comes BACK. `reject` is the evaluator's, `claimRefund` the client's,
+  // and both are local keys in this process — so both owe the window the same two calls.
+  {
+    name: "reject",
+    signer: evaluator.address as Address,
+    sends: 1,
+    run: (n) => n.job.reject(3n, REFUND_REASON, n.evaluatorWalletClient),
+  },
+  {
+    name: "claimRefund",
+    signer: jobClient.address as Address,
+    sends: 1,
+    run: (n) => n.job.claimRefund(3n),
   },
 ];
 
@@ -384,6 +402,32 @@ test("complete signs exactly the transaction the unlocked path signed", async ()
       functionName: "complete",
       args: [3n, REASON, "0x"],
     }),
+  });
+});
+
+test("reject signs exactly the transaction the evaluator's key was asked for", async () => {
+  const n = node();
+  await n.job.reject(3n, REFUND_REASON, n.evaluatorWalletClient);
+  expect(decoded(n.txs()[0]!)).toEqual({
+    ...base,
+    nonce: 0,
+    to: JOB_CONTRACT.toLowerCase(),
+    data: encodeFunctionData({
+      abi: iErc8183JobAbi,
+      functionName: "reject",
+      args: [3n, REFUND_REASON, "0x"],
+    }),
+  });
+});
+
+test("claimRefund signs exactly the transaction the client's key was asked for", async () => {
+  const n = node();
+  await n.job.claimRefund(3n);
+  expect(decoded(n.txs()[0]!)).toEqual({
+    ...base,
+    nonce: 0,
+    to: JOB_CONTRACT.toLowerCase(),
+    data: encodeFunctionData({ abi: iErc8183JobAbi, functionName: "claimRefund", args: [3n] }),
   });
 });
 

@@ -1,3 +1,4 @@
+import type { EscrowState } from "../jobs/types";
 import type { Address, Hex, JobRecord, JobStatus } from "../jobs/types";
 
 /** Secret-free projection of a JobRecord for API responses. */
@@ -20,6 +21,10 @@ export interface JobView {
   completeTxHash: Hex | null;
   sweepTxHash: Hex | null;
   reputationTxHash: Hex | null;
+  /** Where this job's escrow ended up, and the transaction that sent it back if it was ours.
+   *  Served to every caller: a refund nobody can see is one an operator has to go and find. */
+  refundTxHash: Hex | null;
+  escrowState: EscrowState | null;
   error: string | null;
 }
 
@@ -43,6 +48,8 @@ export function toJobView(r: JobRecord): JobView {
     completeTxHash: r.completeTxHash,
     sweepTxHash: r.sweepTxHash,
     reputationTxHash: r.reputationTxHash,
+    refundTxHash: r.refundTxHash,
+    escrowState: r.escrowState,
     error: r.error ?? null,
   };
 }
