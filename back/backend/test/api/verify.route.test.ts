@@ -51,7 +51,8 @@ const FEE_PAYER = "0.0.7162784";
 const TX = "0.0.7162784@1788998489.006924053";
 const UNKNOWN_ID = "11111111-2222-3333-4444-555555555555";
 
-/** The facilitator's `/supported`, exactly the shape Blocky402 testnet answers with. The Hedera
+/** The facilitator's `/supported`, exactly the shape the Hedera testnet facilitator answers with.
+ *  The Hedera
  *  scheme copies `extra.feePayer` out of it into every requirement, and a resource server that
  *  never saw it throws on the first request — which is why every test here stubs this path. */
 const SUPPORTED = {

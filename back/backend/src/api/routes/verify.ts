@@ -13,6 +13,7 @@ import { buildAttestation, signAttestation } from "../../hedera/attestation";
 import { opsLog } from "../../observability/opsLog";
 import { isPublicOnChain } from "../../payments/legalBody";
 import type { EntityRecord } from "../../types";
+import { withDeadline } from "../../util/deadline";
 import type { ApiDeps } from "../app";
 import { createClientLimiter, sharedReadBudget } from "./legalBodies";
 
@@ -53,20 +54,23 @@ type VerifyVars = AuthVars & { verifyEntity: EntityRecord };
 const HANDSHAKE_RETRY_MS = 10_000;
 
 /**
- * How long any one facilitator request may take before we give up on it.
+ * How long the HANDSHAKE may take before a caller is told "not now" — and why it is the handshake
+ * that is bounded rather than the facilitator client.
  *
- * `HTTPFacilitatorClient` defaults to THIRTY SECONDS, and this client's handshake is shared: a
- * facilitator that accepts the connection and then says nothing held every `/verify` caller at
- * once for half a minute, and longer still where `getSupported` retried. A caller is better told
- * "not now" in five seconds than made to wait out a third party's socket.
+ * The client's own `timeoutMs` would have been one line, and it is the wrong line: one
+ * `HTTPFacilitatorClient` serves the handshake, `verify()` and `settle()` alike, so any ceiling
+ * on it is also a ceiling on SETTLEMENT. A settle that times out is an indeterminate outcome by
+ * the library's own documentation — the facilitator may have completed it — so a client-level
+ * bound would turn a slow but successful payment into "failed" while the money had moved. That is
+ * the class of lie the funding path has already paid to remove once, and it is not worth
+ * reintroducing here to shorten a handshake. The client keeps its 30-second default.
  *
- * ⚠ The bound applies to `verify()` and `settle()` too, because the resource server has one
- * client for all three. A settle that times out is an INDETERMINATE outcome by the library's own
- * documentation — the facilitator may still have completed it — so this number is the ceiling on
- * how long a settlement may take before the buyer is told it did not happen. Five seconds is the
- * agreed value; raise it here, in one place, if a real settlement is ever seen to need more.
+ * What genuinely needed bounding is only this: the handshake is SHARED, so a facilitator that
+ * accepts the connection and then says nothing held every `/verify` caller at once — for the full
+ * default, and longer where `getSupported` retried. Bounding the attempt rather than the transport
+ * costs a caller five seconds and costs a settlement nothing.
  */
-const FACILITATOR_TIMEOUT_MS = 5_000;
+const HANDSHAKE_TIMEOUT_MS = 5_000;
 
 /** The ONE sentence a caller is told while the handshake has not succeeded. It names no host, no
  *  URL and no third party: none of that is something a buyer can act on, and all of it is
@@ -135,26 +139,38 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
    *  takes ten seconds to fail does not open the window the moment it answers. */
   let nextAttemptAt = 0;
 
-  const openPaidLayer = async (): Promise<MiddlewareHandler> => {
-    const facilitator = new HTTPFacilitatorClient({
-      url: h.cfg.facilitatorUrl,
-      timeoutMs: FACILITATOR_TIMEOUT_MS,
-    });
-    const server = new x402ResourceServer(facilitator).register(
-      "hedera:*",
-      new ExactHederaScheme(),
+  const openPaidLayer = (): Promise<MiddlewareHandler> =>
+    withDeadline(
+      HANDSHAKE_TIMEOUT_MS,
+      () => {
+        const facilitator = new HTTPFacilitatorClient({ url: h.cfg.facilitatorUrl });
+        const server = new x402ResourceServer(facilitator).register(
+          "hedera:*",
+          new ExactHederaScheme(),
+        );
+        const httpServer = new x402HTTPResourceServer(server, routes);
+        // The handshake, awaited where we can answer for it: `/supported`, plus the library's own
+        // check that the facilitator advertises the scheme and network this route quotes. Then
+        // `syncFacilitatorOnStart` FALSE, which is safe only because `initialize()` above did the
+        // initialising — and is the point of doing it there. With the default (true) this call
+        // starts a second handshake and hands its failure to the fatal-startup handler that exits
+        // the process; with false and no `initialize()` of our own, the resource server would
+        // have no supported kinds and every request would 500 (design Pre-cleared ✎, audit B8).
+        const ready = httpServer
+          .initialize()
+          .then(() => paymentMiddlewareFromHTTPServer(httpServer, undefined, undefined, false));
+        // The library takes no `AbortSignal`, so the deadline bounds OUR ANSWER and not its
+        // socket: `initialize()` goes on running under the client's own 30-second default. The
+        // wrapper's rejection is this attempt's outcome and promises settle once, so a late
+        // success resolves nothing and can never install a layer whose handshake we already
+        // declared failed. This `catch` is what keeps that ignored outcome from surfacing as an
+        // unhandled rejection.
+        ready.catch(() => undefined);
+        return ready;
+      },
+      () =>
+        new Error(`the facilitator handshake did not complete within ${HANDSHAKE_TIMEOUT_MS}ms`),
     );
-    const httpServer = new x402HTTPResourceServer(server, routes);
-    // The handshake, awaited where we can answer for it: `/supported`, plus the library's own
-    // check that the facilitator advertises the scheme and network this route quotes.
-    await httpServer.initialize();
-    // `syncFacilitatorOnStart` FALSE, which is safe only because the line above did the
-    // initialising — and is the point of doing it there. With the default (true) this call starts
-    // a second handshake and hands its failure to the fatal-startup handler that exits the
-    // process; with false and no `initialize()` of our own, the resource server would have no
-    // supported kinds and every request would 500 (design Pre-cleared ✎, audit B8).
-    return paymentMiddlewareFromHTTPServer(httpServer, undefined, undefined, false);
-  };
 
   const paidLayer = async (c: Context): Promise<MiddlewareHandler> => {
     if (paid) return paid;

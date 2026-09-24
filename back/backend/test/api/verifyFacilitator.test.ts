@@ -22,6 +22,29 @@
  * `process.exit` is spied on in every test here rather than asserted in one: a regression that
  * reintroduces the fatal handler must fail the test that provoked it, not a neighbour.
  */
+/**
+ * Every config `HTTPFacilitatorClient` was constructed with, in order.
+ *
+ * The only way to assert the ABSENCE of an option, and absence is the point here: a `timeoutMs`
+ * on this client would silently become a ceiling on settlement. Hoisted because `vi.mock` below
+ * is hoisted above the imports; the subclass records and then delegates, so the real client does
+ * the real work.
+ */
+const facilitatorConfigs = vi.hoisted(() => [] as Record<string, unknown>[]);
+
+vi.mock("@x402/core/server", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@x402/core/server")>();
+  return {
+    ...actual,
+    HTTPFacilitatorClient: class extends actual.HTTPFacilitatorClient {
+      constructor(config: Record<string, unknown>) {
+        facilitatorConfigs.push(config);
+        super(config as never);
+      }
+    },
+  };
+});
+
 import { decodePaymentRequiredHeader } from "@x402/core/http";
 import type Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -49,6 +72,7 @@ const HEDERA_CFG = {
 
 const NETWORK = "hedera:testnet";
 const FEE_PAYER = "0.0.7162784";
+const TX = "0.0.7162784@1788998489.006924053";
 
 /** The facilitator's `/supported` as the Hedera testnet facilitator answers it — the WORKING
  *  handshake. */
@@ -83,8 +107,11 @@ let exited: (number | undefined)[];
 /** What `/supported` answers on the NEXT call, so a test can bring the facilitator back. */
 let supported: () => Response;
 /** A facilitator that accepts the connection and then says nothing at all, ever. It answers only
- *  when the client gives up on it, which is the case the client's own timeout has to bound. */
+ *  when it is aborted, which is the case the handshake's own deadline has to bound. */
 let hanging: boolean;
+/** How long `/settle` takes to answer SUCCESSFULLY. The point of the test that sets it is that a
+ *  slow settlement is still a settlement, so nothing above may put a ceiling on it. */
+let settleDelayMs: number;
 /** The `opslog` event names production code wrote, in order. */
 let ops: string[];
 /** The app's clock, which the backoff reads. Advanced by `tick`. */
@@ -102,13 +129,21 @@ const json = (body: unknown) =>
 beforeEach(() => {
   seen = [];
   ops = [];
+  facilitatorConfigs.length = 0;
   hanging = false;
+  settleDelayMs = 0;
   clock = 1_789_100_000_000; // 2026-09-10, the design date, as the shared scaffold uses it
   supported = () => json(SUPPORTED);
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const url =
       typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    seen.push(new URL(url).pathname);
+    const path = new URL(url).pathname;
+    seen.push(path);
+    if (path === "/verify") return json({ isValid: true, payer: "0.0.10450558" });
+    if (path === "/settle") {
+      if (settleDelayMs) await new Promise((resolve) => setTimeout(resolve, settleDelayMs));
+      return json({ success: true, transaction: TX, network: NETWORK });
+    }
     if (!hanging) return supported();
     // Never resolves on its own. The only thing that ends it is the client's own abort signal,
     // so what this measures is whether the client HAS one.
@@ -172,8 +207,19 @@ function setup() {
 
 type App = ReturnType<typeof hederaApp>;
 /** Each caller its own forwarded-for, so a loop never spends one client's whole allowance. */
-const get = (app: App, client = "9.9.9.9") =>
-  app.request(`/verify/${PUBLIC_ID}`, { headers: { "x-forwarded-for": client } });
+const get = (app: App, client = "9.9.9.9", headers: Record<string, string> = {}) =>
+  app.request(`/verify/${PUBLIC_ID}`, { headers: { "x-forwarded-for": client, ...headers } });
+
+/** A well-formed v2 payload for the requirements the server just quoted, built from the quote
+ *  itself rather than hand-written because `findMatchingRequirements` deep-equals the two. */
+async function paidHeader(app: App, client: string): Promise<string> {
+  const quote = await get(app, client);
+  const required = decodePaymentRequiredHeader(quote.headers.get("PAYMENT-REQUIRED") ?? "");
+  const accepted = (required as { accepts: unknown[] }).accepts[0];
+  return Buffer.from(
+    JSON.stringify({ x402Version: 2, accepted, payload: { signedTransaction: "0xdeadbeef" } }),
+  ).toString("base64");
+}
 
 // ── the boot ────────────────────────────────────────────────────────────────────────────────────
 
@@ -345,6 +391,37 @@ test("a handshake that succeeded is never repeated", async () => {
   expect(seen).toEqual(["/supported"]);
   expect(exited).toEqual([]);
 });
+
+test("the client keeps the library's own timeout — the bound is the HANDSHAKE's alone", async () => {
+  // THE BOUND BELONGS TO THE HANDSHAKE, NOT TO THE CLIENT, and this is the assertion that says
+  // so. One `HTTPFacilitatorClient` serves the handshake, `verify()` and `settle()` alike, so a
+  // `timeoutMs` on it — the one-line way to stop a hung handshake — is also a ceiling on
+  // SETTLEMENT. A settle that times out is an indeterminate outcome by the library's own
+  // documentation: the facilitator may have completed it. Capping it would turn a slow but
+  // successful payment into "failed" while the money had moved, which is the class of lie the
+  // funding path has already paid to remove once. So: a url, and nothing else.
+  const app = setup();
+  // Built on first use, like everything else in this layer.
+  expect(facilitatorConfigs).toEqual([]);
+  expect((await get(app, "19.0.0.1")).status).toBe(402);
+  expect(facilitatorConfigs).toEqual([{ url: HEDERA_CFG.facilitatorUrl }]);
+});
+
+test("a settlement the facilitator is slow to confirm is still a settlement", async () => {
+  // The paid flow through the LAZILY built layer, with a settle that does not answer at once.
+  // Deliberately short: past a few seconds the outcome of a held response starts to depend on
+  // when a garbage collection happens to run, and an assertion that turns on that is not one to
+  // put in CI. What proves the bound is the client-config assertion above, which is exact.
+  const app = setup();
+  const header = await paidHeader(app, "20.0.0.1");
+  settleDelayMs = 1_500;
+  const res = await get(app, "20.0.0.2", { "PAYMENT-SIGNATURE": header });
+  expect(res.status).toBe(200);
+  expect((await res.json()).standing).toBe("active");
+  // One handshake, then the paid request's two facilitator calls, in that order.
+  expect(seen).toEqual(["/supported", "/verify", "/settle"]);
+  expect(ops).toEqual([]);
+}, 20_000);
 
 // ── what a refused handshake must not cost ──────────────────────────────────────────────────────
 
