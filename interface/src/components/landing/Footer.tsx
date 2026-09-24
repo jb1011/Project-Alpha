@@ -25,6 +25,7 @@ const columns: { title: string; links: { label: string; href: string }[] }[] = [
       { label: "How it works", href: "#how" },
       { label: "Wyoming jurisdiction", href: "#how" },
       { label: "Transparency", href: "/transparency" },
+      { label: "Brand kit", href: "/brand" },
     ],
   },
   {
