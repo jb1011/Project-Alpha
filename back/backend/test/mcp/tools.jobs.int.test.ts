@@ -40,6 +40,8 @@ const baseJob: JobRecord = {
   completeTxHash: null,
   sweepTxHash: null,
   reputationTxHash: null,
+  refundTxHash: null,
+  escrowState: null,
   error: null,
 };
 
@@ -98,6 +100,158 @@ beforeEach(() => {
   } as never);
 });
 afterEach(() => db.close());
+
+/**
+ * The same app, plus the escrow recovery — the half that only exists where a job client key does.
+ *
+ * `refund_job` is the on-demand door to `jobs/refund.ts` (the saga and the boot reconcile are the
+ * other two). Everything interesting about it here is the GATE, so the recovery itself is a fake
+ * that records the jobKey it was asked about: a tool that refuses must not have called it.
+ */
+function appWithRefund(refundJob?: (jobKey: string) => Promise<unknown>) {
+  const runner = new OnboardingRunner({
+    repo,
+    runSaga: async (i: { idempotencyKey: string }) => repo.findByIdempotencyKey(i.idempotencyKey)!,
+    fundCaps: TEST_FUND_CAPS,
+  });
+  return buildApiApp({
+    webOrigin: "*",
+    nonceStore: new SqliteNonceStore(db),
+    siweDomain: "wizard.local",
+    chainId: 5042002,
+    jwtSecret: "s",
+    jwtTtlSec: 3600,
+    repo,
+    runner,
+    passkeyRpId: "wizard.local",
+    apiKeys,
+    passkeys: new SqlitePasskeyStore(db),
+    jobs,
+    refundJob,
+  } as never);
+}
+
+const REFUND_HASH = `0x${"ab".repeat(32)}`;
+
+/** A recovery that always succeeds, and the list of jobKeys it was asked about. */
+function fakeRefund() {
+  const asked: string[] = [];
+  return {
+    asked,
+    refundJob: async (jobKey: string) => {
+      asked.push(jobKey);
+      return { outcome: "refunded", via: "reject", txHash: REFUND_HASH };
+    },
+  };
+}
+
+const textOf = (res: unknown) => (res as { content: { text: string }[] }).content[0]!.text;
+
+test("refund_job recovers the caller's own job and reports what happened", async () => {
+  const entityA1 = seedEntity(TENANT, "agent1");
+  jobs.upsert({
+    ...baseJob,
+    jobKey: "jobA1",
+    entityKey: entityA1,
+    ownerTenantId: TENANT,
+    status: "failed",
+    fundTxHash: `0x${"f7".repeat(32)}`,
+  });
+  const fake = fakeRefund();
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(appWithRefund(fake.refundJob), key);
+  try {
+    const res = await client.callTool({ name: "refund_job", arguments: { jobKey: "jobA1" } });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(textOf(res))).toEqual({
+      jobKey: "jobA1",
+      outcome: "refunded",
+      via: "reject",
+      txHash: REFUND_HASH,
+    });
+    expect(fake.asked).toEqual(["jobA1"]);
+  } finally {
+    await close();
+  }
+});
+
+test("refund_job renders a bigint deadline as a string rather than throwing", async () => {
+  // `waiting-expiry` carries `expiredAt` as a bigint, which `JSON.stringify` refuses. Serving a
+  // TypeError to an agent asking where its money is would be the worst possible moment for one.
+  const entityA1 = seedEntity(TENANT, "agent1");
+  jobs.upsert({ ...baseJob, jobKey: "jobA1", entityKey: entityA1, ownerTenantId: TENANT });
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(
+    appWithRefund(async () => ({ outcome: "waiting-expiry", expiredAt: 5_000n })),
+    key,
+  );
+  try {
+    const res = await client.callTool({ name: "refund_job", arguments: { jobKey: "jobA1" } });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(textOf(res))).toEqual({
+      jobKey: "jobA1",
+      outcome: "waiting-expiry",
+      expiredAt: "5000",
+    });
+  } finally {
+    await close();
+  }
+});
+
+test("refund_job hides another tenant's job, and does not touch its escrow", async () => {
+  const entityB1 = seedEntity(OTHER_TENANT, "x");
+  jobs.upsert({ ...baseJob, jobKey: "jobB1", entityKey: entityB1, ownerTenantId: OTHER_TENANT });
+  const fake = fakeRefund();
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(appWithRefund(fake.refundJob), key);
+  try {
+    const res = await client.callTool({ name: "refund_job", arguments: { jobKey: "jobB1" } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toBe("job not found");
+    // The refusal reached no chain: somebody else's escrow is not ours to move.
+    expect(fake.asked).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
+test("refund_job needs the earn capability, exactly like run_job", async () => {
+  const entityA1 = seedEntity(TENANT, "agent1");
+  jobs.upsert({ ...baseJob, jobKey: "jobA1", entityKey: entityA1, ownerTenantId: TENANT });
+  const fake = fakeRefund();
+
+  // A read-only key: the same uniform refusal `run_job` gives, teaching nothing about the job.
+  const { key } = apiKeys.mint(TENANT, { capability: "read" });
+  const { client, close } = await startMcpTestClient(appWithRefund(fake.refundJob), key);
+  try {
+    const res = await client.callTool({ name: "refund_job", arguments: { jobKey: "jobA1" } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toBe("not found");
+    expect(fake.asked).toEqual([]);
+  } finally {
+    await close();
+  }
+});
+
+test("with no job client key, refund_job says so and names the variable", async () => {
+  const entityA1 = seedEntity(TENANT, "agent1");
+  jobs.upsert({ ...baseJob, jobKey: "jobA1", entityKey: entityA1, ownerTenantId: TENANT });
+
+  const { key } = apiKeys.mint(TENANT, { capability: "earn" });
+  const { client, close } = await startMcpTestClient(appWithRefund(undefined), key);
+  try {
+    const res = await client.callTool({ name: "refund_job", arguments: { jobKey: "jobA1" } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toBe(
+      "jobs unavailable: set JOB_CLIENT_PRIVATE_KEY (its own funded address — it pays the job escrow and gas)",
+    );
+  } finally {
+    await close();
+  }
+});
 
 test("tenant-wide key: get_job returns the view and list_jobs returns the entity's jobs", async () => {
   const entityA1 = seedEntity(TENANT, "agent1");

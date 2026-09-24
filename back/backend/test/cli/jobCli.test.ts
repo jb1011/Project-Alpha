@@ -31,18 +31,24 @@ function makeFakeRecord(overrides: Partial<JobRecord> = {}): JobRecord {
     completeTxHash: null,
     sweepTxHash: null,
     reputationTxHash: null,
+    refundTxHash: null,
+    escrowState: null,
     error: null,
     ...overrides,
   };
 }
 
-function makeFakeCtx(): { ctx: CliContext; runJobSpy: ReturnType<typeof vi.fn> } {
-  const fakeRecord = makeFakeRecord();
+function makeFakeCtx(over: { refundJob?: JobDeps["refundJob"]; record?: JobRecord } = {}): {
+  ctx: CliContext;
+  runJobSpy: ReturnType<typeof vi.fn>;
+} {
+  const fakeRecord = over.record ?? makeFakeRecord();
 
   const runJobSpy = vi.fn().mockResolvedValue(fakeRecord);
 
-  const fakeJobDeps: Pick<JobDeps, "runJob" | "jobs"> = {
+  const fakeJobDeps: Pick<JobDeps, "runJob" | "jobs" | "refundJob"> = {
     runJob: runJobSpy,
+    refundJob: over.refundJob,
     jobs: {
       findByKey: vi.fn().mockReturnValue(fakeRecord),
       listByEntity: vi.fn().mockReturnValue([fakeRecord]),
@@ -51,6 +57,7 @@ function makeFakeCtx(): { ctx: CliContext; runJobSpy: ReturnType<typeof vi.fn> }
       upsert: vi.fn(),
       listByTenant: vi.fn().mockReturnValue([]),
       listInFlight: vi.fn().mockReturnValue([]),
+      listEscrowedUnrefunded: vi.fn().mockReturnValue([]),
       recordEvent: vi.fn(),
       transaction: <T>(fn: () => T): T => fn(),
     },
@@ -225,4 +232,87 @@ test("F10: anchor-ack refuses a cycle that is not held, and says why", async () 
   expect(out.note).toMatch(/only `vetoed` or `failed`/);
   expect(process.exitCode).toBe(1);
   process.exitCode = 0;
+});
+
+// ── refund-job ────────────────────────────────────────────────────────────────────────────────
+//
+// The operator's door to the escrow recovery: the same function the saga and the boot reconcile
+// call (`jobs/refund.ts`), for the job that is still owed its money now.
+
+test("refund-job: prints the outcome AND the row it left behind", async () => {
+  const refunded = makeFakeRecord({
+    status: "failed",
+    escrowState: "refunded",
+    refundTxHash: `0x${"ab".repeat(32)}`,
+  });
+  const refundJob = vi.fn().mockResolvedValue({
+    outcome: "refunded",
+    via: "reject",
+    txHash: `0x${"ab".repeat(32)}`,
+  });
+  const { ctx } = makeFakeCtx({ refundJob, record: refunded });
+  const logs: string[] = [];
+  vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+
+  await buildCli(async () => ctx).parseAsync(["node", "cli", "refund-job", "t:agent:1234567890"]);
+  // Asserted BEFORE the spies are restored: `vi.restoreAllMocks()` resets a `vi.fn()`, history
+  // and all, so a call count read after it is always zero.
+  expect(refundJob).toHaveBeenCalledWith("t:agent:1234567890");
+
+  vi.restoreAllMocks();
+  const printed = JSON.parse(logs.join(""));
+  expect(printed.jobKey).toBe("t:agent:1234567890");
+  expect(printed.outcome).toBe("refunded");
+  expect(printed.via).toBe("reject");
+  expect(printed.txHash).toBe(`0x${"ab".repeat(32)}`);
+  // The row, through the same projection every other job surface uses.
+  expect(printed.job.escrowState).toBe("refunded");
+  expect(printed.job.refundTxHash).toBe(`0x${"ab".repeat(32)}`);
+});
+
+test("refund-job: a bigint deadline is printed as a decimal string, not a crash", async () => {
+  // `waiting-expiry` carries `expiredAt` as a bigint, and JSON.stringify throws on one — which
+  // would be a TypeError at the exact moment an operator is asking where their money is.
+  const refundJob = vi.fn().mockResolvedValue({ outcome: "waiting-expiry", expiredAt: 5_000n });
+  const { ctx } = makeFakeCtx({ refundJob });
+  const logs: string[] = [];
+  vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+
+  await buildCli(async () => ctx).parseAsync(["node", "cli", "refund-job", "t:agent:1234567890"]);
+
+  vi.restoreAllMocks();
+  const printed = JSON.parse(logs.join(""));
+  expect(printed.outcome).toBe("waiting-expiry");
+  expect(printed.expiredAt).toBe("5000");
+});
+
+test("refund-job: with no job client key it refuses and names the variable", async () => {
+  const { ctx } = makeFakeCtx(); // no refundJob: the signing half is absent
+  const errLogs: string[] = [];
+  vi.spyOn(console, "error").mockImplementation((m) => errLogs.push(String(m)));
+  const prev = process.exitCode;
+
+  await buildCli(async () => ctx).parseAsync(["node", "cli", "refund-job", "t:agent:1234567890"]);
+
+  vi.restoreAllMocks();
+  expect(errLogs.join("\n")).toContain("set JOB_CLIENT_PRIVATE_KEY to refund a job");
+  expect(process.exitCode).toBe(1);
+  process.exitCode = prev;
+});
+
+test("refund-job: an unknown jobKey is a refusal, and nothing is sent", async () => {
+  const refundJob = vi.fn();
+  const { ctx } = makeFakeCtx({ refundJob });
+  (ctx.jobDeps.jobs.findByKey as ReturnType<typeof vi.fn>).mockReturnValue(undefined);
+  const errLogs: string[] = [];
+  vi.spyOn(console, "error").mockImplementation((m) => errLogs.push(String(m)));
+  const prev = process.exitCode;
+
+  await buildCli(async () => ctx).parseAsync(["node", "cli", "refund-job", "does-not-exist"]);
+  expect(refundJob).not.toHaveBeenCalled();
+
+  vi.restoreAllMocks();
+  expect(errLogs.join("\n")).toContain("not found");
+  expect(process.exitCode).toBe(1);
+  process.exitCode = prev;
 });

@@ -25,6 +25,7 @@ import type { EntityRecord } from "../types";
 import { circleJobOps } from "./circleJobOps";
 import { type JobRepository, SqliteJobRepository } from "./jobRepository";
 import { JobRunner, type RunJobFn } from "./jobRunner";
+import { type RecoverOutcome, recoverEscrow } from "./refund";
 import { type ProviderJobOps, runJob as runJobSaga } from "./runJob";
 import { TrivialWorker } from "./worker";
 
@@ -49,6 +50,12 @@ export interface JobDeps {
    * requires a non-client evaluator in the general case. */
   jobEvaluatorAddress?: Address;
   runJob?: RunJobFn;
+  /**
+   * Get one job's escrow back (`jobs/refund.ts`) — the callable surface behind the `refund_job`
+   * MCP tool and the `refund-job` CLI command. Absent with the rest of the signing half: a
+   * refund is a transaction, and with no job client key there is no key to send it with.
+   */
+  refundJob?: (jobKey: string) => Promise<RecoverOutcome>;
 }
 
 export function buildJobDeps(
@@ -154,6 +161,18 @@ export function buildJobDeps(
   // A real distinct evaluator key (JOB_EVALUATOR_PRIVATE_KEY) is required for live on-chain runs.
   const jobEvaluatorAddress: Address = evaluatorWallet?.account?.address ?? jobClientAddress;
 
+  /**
+   * ONE recovery function, shared by every caller.
+   *
+   * The saga calls it when a step after funding throws, the boot reconcile calls it for every
+   * failed job whose escrow is still unaccounted for, and the `refund_job` tool and the
+   * `refund-job` CLI command call it on demand. Built once and passed around rather than
+   * constructed per caller, so there is no way for two of them to be wired differently
+   * (`test/jobs/composition.test.ts` asserts they are the same function).
+   */
+  const refundJob = (jobKey: string): Promise<RecoverOutcome> =>
+    recoverEscrow({ jobs, job: jobAdapter }, jobKey);
+
   // Per-entity serialization SPANNING funding and jobs (Tier-0 audit item 6): the saga sends as
   // the operator (EOA or SCA — the SCA may only allow one in-flight tx), and the funding bridge
   // uses the same key space, so a concurrent fund_pocket + run_job for one agent queue instead of
@@ -176,10 +195,11 @@ export function buildJobDeps(
         docStore,
         providerOpsFor,
         sweepToTreasury: cfg.jobSweepToTreasury,
+        recoverEscrow: refundJob,
       }),
     );
 
-  const jobRunner = new JobRunner({ jobs, runJob });
+  const jobRunner = new JobRunner({ jobs, runJob, recoverEscrow: refundJob });
 
   return {
     jobs,
@@ -189,5 +209,6 @@ export function buildJobDeps(
     jobClientAddress,
     jobEvaluatorAddress,
     runJob,
+    refundJob,
   };
 }

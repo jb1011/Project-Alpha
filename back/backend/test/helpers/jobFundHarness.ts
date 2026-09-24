@@ -27,6 +27,7 @@ import {
   custom,
   decodeFunctionData,
   defineChain,
+  encodeFunctionResult,
   keccak256,
   parseTransaction,
   recoverTransactionAddress,
@@ -35,10 +36,12 @@ import { type PrivateKeyAccount, privateKeyToAccount } from "viem/accounts";
 import { iErc8183JobAbi } from "../../src/abis/generated";
 import { JobAdapter } from "../../src/adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../../src/adapters/arc/reputationAdapter";
+import { ChainTxRevertedError } from "../../src/errors";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { JobRunner } from "../../src/jobs/jobRunner";
+import { type RecoverOutcome, recoverEscrow } from "../../src/jobs/refund";
 import { type RunJobDeps, runJob as runJobSaga } from "../../src/jobs/runJob";
-import type { JobWorker } from "../../src/jobs/worker";
+import { type JobWorker, TrivialWorker } from "../../src/jobs/worker";
 import { withKeyedLock } from "../../src/payments/keyedMutex";
 import { migrate } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
@@ -66,6 +69,13 @@ const erc20Abi = [
     ],
     outputs: [{ type: "uint256" }],
   },
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
 ] as const;
 
 export const fakeChain = defineChain({
@@ -75,14 +85,36 @@ export const fakeChain = defineChain({
   rpcUrls: { default: { http: ["http://node.invalid"] } },
 });
 
+export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as Address;
+
 /** A 32-byte word — how a node returns a `uint256` or a `bool`. */
 const word = (v: bigint): Hex => `0x${v.toString(16).padStart(64, "0")}`;
 
 /** One state-changing call the node executed, in the order it executed them. */
 export interface NodeAction {
-  call: "approve" | "fund" | "createJob" | "complete" | "other";
+  call: "approve" | "fund" | "createJob" | "complete" | "reject" | "claimRefund" | "other";
   from: Address;
   status: "success" | "reverted";
+}
+
+/**
+ * ONE JOB AS THE CONTRACT HOLDS IT — the record a refund decision is actually made from.
+ *
+ * `getJob` used to answer nothing here (the node returned `0x` for every job-contract read), which
+ * was enough while every test stopped at the funding boundary. It is not enough for a refund: the
+ * whole point of the recovery is that the CHAIN says where the money is, so the node has to keep
+ * a status, a budget and a deadline, and move them the way the contract moves them.
+ */
+interface ChainJob {
+  id: bigint;
+  client: Address;
+  provider: Address;
+  evaluator: Address;
+  description: string;
+  budget: bigint;
+  expiredAt: bigint;
+  status: number;
+  hook: Address;
 }
 
 export interface UsdcJobNodeOptions {
@@ -107,11 +139,27 @@ export interface UsdcJobNodeOptions {
    * on the chain and we cannot read what it did. Withheld ONCE, so a later job still gets answers.
    */
   withholdReceipt?: "approve" | "fund";
+  /**
+   * The chain's clock, in SECONDS — what the node answers as the block timestamp and what
+   * `claimRefund` measures `expiredAt` against. A function, so a test can warp past an expiry
+   * between two calls instead of rebuilding the node.
+   */
+  now?: () => number;
+  /** Mine the FIRST `reject` as reverted: the escrow stays where it is, with a receipt to prove
+   *  it. Once, like {withholdReceipt}, so the next attempt can be the one that works. */
+  revertReject?: boolean;
+  /** Mine every `complete` as REVERTED — the second way a funded job dies after its money moved. */
+  revertComplete?: boolean;
 }
 
 export function usdcJobNode(opts: UsdcJobNodeOptions) {
   const allowances = new Map<string, bigint>();
   const escrow = new Map<string, bigint>();
+  /** USDC held per address. The client's opening balance is what a refund has to give back. */
+  const balances = new Map<string, bigint>();
+  /** The job records this contract holds, by id — see {ChainJob}. */
+  const chainJobs = new Map<string, ChainJob>();
+  const nowSec = () => opts.now?.() ?? 1;
   /** What a node's `pending` count actually counts: transactions it has accepted, per address. */
   const acceptedCount = new Map<string, number>();
   /** `${address}:${nonce}` — a repeat is the collision the send lock exists to prevent. */
@@ -122,11 +170,23 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
   let jobCounter = 0n;
   let stolen = false;
   let withheld = false;
+  let rejectReverted = false;
 
   const pairKey = (owner: string, spender: string) =>
     `${owner.toLowerCase()}:${spender.toLowerCase()}`;
   const allowanceOf = (owner: string, spender: string): bigint =>
     allowances.get(pairKey(owner, spender)) ?? 0n;
+  const balanceOf = (owner: string): bigint => balances.get(owner.toLowerCase()) ?? 0n;
+  const credit = (owner: string, amount: bigint) =>
+    balances.set(owner.toLowerCase(), balanceOf(owner) + amount);
+  const debit = (owner: string, amount: bigint) =>
+    balances.set(owner.toLowerCase(), balanceOf(owner) - amount);
+  const jobOf = (jobId: bigint): ChainJob | undefined => chainJobs.get(jobId.toString());
+  /** The escrow's whole movement in one place: out of the contract, back to the client. */
+  const repayClient = (j: ChainJob) => {
+    escrow.set(j.id.toString(), (escrow.get(j.id.toString()) ?? 0n) - j.budget);
+    credit(j.client, j.budget);
+  };
 
   const decode = (data: Hex | undefined) => {
     if (!data || data === "0x") return undefined;
@@ -150,9 +210,30 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         const [owner, spender] = decoded.args as [Address, Address];
         return word(allowanceOf(owner, spender));
       }
+      if (decoded?.functionName === "balanceOf") {
+        const [owner] = decoded.args as [Address];
+        return word(balanceOf(owner));
+      }
     }
     if (target === opts.jobContract.toLowerCase()) {
       if (decoded?.functionName === "createJob") return word(jobCounter + 1n);
+      // THE READ THE REFUND DECISION IS MADE FROM. An unknown id answers the zero job, which is
+      // what a contract with no such record answers: status 0, budget 0, nobody's client.
+      if (decoded?.functionName === "getJob") {
+        const [jobId] = decoded.args as [bigint];
+        const j = jobOf(jobId) ?? {
+          id: jobId,
+          client: ZERO_ADDRESS,
+          provider: ZERO_ADDRESS,
+          evaluator: ZERO_ADDRESS,
+          description: "",
+          budget: 0n,
+          expiredAt: 0n,
+          status: 0,
+          hook: ZERO_ADDRESS,
+        };
+        return encodeFunctionResult({ abi: iErc8183JobAbi, functionName: "getJob", result: j });
+      }
       // `fund`, `setBudget`, `submit` and `complete` all return nothing. The fund pre-flight
       // passes while the allowance is there, which is exactly why it proves nothing about the
       // receipt: the incident's allowance disappeared after it.
@@ -175,6 +256,26 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       return { call: "other", from, status: "success" };
     if (decoded?.functionName === "createJob") {
       jobCounter += 1n;
+      const [provider, evaluator, expiredAt, description, hook] = decoded.args as [
+        Address,
+        Address,
+        bigint,
+        string,
+        Address,
+      ];
+      chainJobs.set(jobCounter.toString(), {
+        id: jobCounter,
+        client: from,
+        provider,
+        evaluator,
+        description,
+        // The provider's `setBudget` is signed by a remote key and faked off-chain in this
+        // harness, so the budget arrives with the job rather than in its own transaction.
+        budget: opts.budget,
+        expiredAt,
+        status: 0,
+        hook,
+      });
       return { call: "createJob", from, status: "success" };
     }
     if (decoded?.functionName === "fund") {
@@ -190,9 +291,50 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         allowanceOf(from, opts.jobContract) - opts.budget,
       );
       escrow.set(jobId.toString(), (escrow.get(jobId.toString()) ?? 0n) + opts.budget);
+      debit(from, opts.budget);
+      const funded = jobOf(jobId);
+      if (funded) funded.status = 1; // Funded
       return { call: "fund", from, status: "success" };
     }
-    if (decoded?.functionName === "complete") return { call: "complete", from, status: "success" };
+    if (decoded?.functionName === "complete") {
+      if (opts.revertComplete) return { call: "complete", from, status: "reverted" };
+      const [jobId] = decoded.args as [bigint, Hex, Hex];
+      const j = jobOf(jobId);
+      if (j) {
+        j.status = 3; // Completed
+        escrow.set(j.id.toString(), (escrow.get(j.id.toString()) ?? 0n) - j.budget);
+        credit(j.provider, j.budget);
+      }
+      return { call: "complete", from, status: "success" };
+    }
+    // ── The two refunds, with the contract's own rules (see `test/mocks/MockERC8183Job.sol`) ──
+    if (decoded?.functionName === "reject") {
+      if (opts.revertReject && !rejectReverted) {
+        rejectReverted = true;
+        return { call: "reject", from, status: "reverted" };
+      }
+      const [jobId] = decoded.args as [bigint, Hex, Hex];
+      const j = jobOf(jobId);
+      if (!j) return { call: "reject", from, status: "reverted" };
+      const sender = from.toLowerCase();
+      const isClient = sender === j.client.toLowerCase();
+      const isEvaluator = sender === j.evaluator.toLowerCase();
+      if (isClient ? j.status !== 0 : !(isEvaluator && (j.status === 1 || j.status === 2)))
+        return { call: "reject", from, status: "reverted" };
+      const was = j.status;
+      j.status = 4; // Rejected
+      if (was === 1 || was === 2) repayClient(j);
+      return { call: "reject", from, status: "success" };
+    }
+    if (decoded?.functionName === "claimRefund") {
+      const [jobId] = decoded.args as [bigint];
+      const j = jobOf(jobId);
+      if (!j || (j.status !== 1 && j.status !== 2) || BigInt(nowSec()) <= j.expiredAt)
+        return { call: "claimRefund", from, status: "reverted" };
+      j.status = 5; // Expired
+      repayClient(j);
+      return { call: "claimRefund", from, status: "success" };
+    }
     return { call: "other", from, status: "success" };
   };
 
@@ -206,7 +348,12 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       case "eth_blockNumber":
         return "0x1";
       case "eth_getBlockByNumber":
-        return { number: "0x1", baseFeePerGas: "0x1", timestamp: "0x1", transactions: [] };
+        return {
+          number: "0x1",
+          baseFeePerGas: "0x1",
+          timestamp: `0x${nowSec().toString(16)}`,
+          transactions: [],
+        };
       case "eth_maxPriorityFeePerGas":
         return "0x1";
       case "eth_estimateGas":
@@ -289,6 +436,30 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       sends.filter((s) => s.from.toLowerCase() === sender.toLowerCase()),
     allowanceOf,
     escrowOf: (jobId: bigint) => escrow.get(jobId.toString()) ?? 0n,
+    balanceOf,
+    /** Put USDC in an address's hands — the client's opening balance, before it funds anything. */
+    mint: (owner: Address, amount: bigint) => credit(owner, amount),
+    /** The chain's own record for one job, or undefined if this contract has never heard of it. */
+    chainJob: (jobId: bigint) => jobOf(jobId),
+    /**
+     * Put one job on the chain directly, for a saga that starts from a row already `created` —
+     * or for the row a previous process left behind. A job seeded at Funded or Submitted also
+     * gets its MONEY seeded: the escrow holds the budget and the client is that much poorer,
+     * because the whole question a refund answers is where that budget is.
+     */
+    seedChainJob: (j: ChainJob) => {
+      chainJobs.set(j.id.toString(), j);
+      if (j.id > jobCounter) jobCounter = j.id;
+      if (j.status === 1 || j.status === 2) {
+        escrow.set(j.id.toString(), (escrow.get(j.id.toString()) ?? 0n) + j.budget);
+        debit(j.client, j.budget);
+      }
+    },
+    /** What the provider's remote-signed `submit` does to the chain, without signing anything. */
+    markSubmitted: (jobId: bigint) => {
+      const j = jobOf(jobId);
+      if (j) j.status = 2; // Submitted
+    },
   };
 }
 
@@ -317,6 +488,12 @@ export const USDC = "0x3600000000000000000000000000000000000000" as Address;
 export const JOB_CONTRACT = "0x0000000000000000000000000000000000000004" as Address;
 /** 0.5 USDC — the budget both jobs in the incident carried. */
 export const BUDGET = 500_000n;
+/** What the job client starts with: enough for several budgets, so a refund is visible as a sum. */
+export const OPENING_BALANCE = 10_000_000n;
+/** The default on-chain deadline, far past the node's clock: expiry is opt-in, per test. */
+export const DEFAULT_EXPIRES_AT = 9_999_999_999n;
+/** The hash a reverted provider `submit` reports — a fixed value a test can name. */
+export const SUBMIT_REVERT_TX_HASH = `0x${"51".repeat(32)}` as Hex;
 
 /** One booked outflow, as `payments/outflowMeter.ts` records it. */
 export interface BookedOutflow {
@@ -333,6 +510,35 @@ export function jobFundHarness(
     withholdReceipt?: "approve" | "fund";
     /** The adapter's bound on a receipt wait. Milliseconds, so a timeout test is not a minute. */
     receiptTimeoutMs?: number;
+    /**
+     * Configure a DISTINCT evaluator key (the default). `false` is the deployment with no
+     * `JOB_EVALUATOR_PRIVATE_KEY`, where the evaluator address IS the client's and "the evaluator
+     * rejects" is impossible on chain — so the only refund left is the expiry one.
+     */
+    evaluator?: boolean;
+    /**
+     * WHERE THE SAGA DIES, AFTER THE MONEY IS ALREADY IN THE ESCROW.
+     *  - `worker` (the default) — the deliverable step throws, which is the shape the funding
+     *    tests were written against and what keeps them measuring the funding boundary alone.
+     *  - `submit` — the provider's remote-signed submit reverts on chain.
+     *  - `complete` — submit lands and the evaluator's complete reverts instead.
+     */
+    failAt?: "worker" | "submit" | "complete";
+    /** Mine the FIRST of the recovery's rejects as reverted: the escrow stays put, with a
+     *  receipt. The attempt after it is allowed to work, which is what the next boot does. */
+    revertReject?: boolean;
+    /**
+     * WIRE THE ESCROW RECOVERY INTO THE SAGA, as `jobs/composition.ts` always does in production.
+     *
+     * OFF by default, and deliberately: the funding tests stop their saga with a worker that
+     * throws, and a recovery firing there would rewrite what they measure (the escrow after a
+     * fund) into something else (the escrow after a refund). The tests that are ABOUT the
+     * recovery turn it on; what holds PRODUCTION to wiring it is
+     * `test/jobs/composition.test.ts`, not a default in a test helper.
+     */
+    recoverEscrow?: boolean;
+    /** The chain's clock in seconds, shared by the node and the recovery's expiry decision. */
+    now?: () => number;
   } = {},
 ) {
   const db = new Database(":memory:");
@@ -349,16 +555,33 @@ export function jobFundHarness(
     stealAllowanceOnFund: opts.stealAllowanceOnFund,
     approveSets: opts.approveSets,
     withholdReceipt: opts.withholdReceipt,
+    now: opts.now,
+    revertReject: opts.revertReject,
+    revertComplete: opts.failAt === "complete",
   });
+  // The client pays the escrow out of its own USDC, so it has to have some: a refund is measured
+  // by this balance coming back.
+  node.mint(jobClientAccount.address as Address, OPENING_BALANCE);
 
   const adapter = new JobAdapter({
     publicClient: node.publicClient,
     clientWallet: node.walletFor(jobClientAccount),
-    evaluatorWallet: node.walletFor(evaluatorAccount),
+    // No distinct evaluator key = the composition's fallback, where the evaluator is the client.
+    evaluatorWallet: opts.evaluator === false ? undefined : node.walletFor(evaluatorAccount),
     sendClient: node.sendClient,
     jobContract: JOB_CONTRACT,
     receiptTimeoutMs: opts.receiptTimeoutMs,
   });
+  const evaluatorAddress = (
+    opts.evaluator === false ? jobClientAccount.address : evaluatorAccount.address
+  ) as Address;
+  /** Every outcome the recovery reported, in order — one per call, as the reconcile logs them. */
+  const recoveries: RecoverOutcome[] = [];
+  const refundJob = async (jobKey: string): Promise<RecoverOutcome> => {
+    const outcome = await recoverEscrow({ jobs, job: adapter, now: opts.now }, jobKey);
+    recoveries.push(outcome);
+    return outcome;
+  };
 
   const outflows: BookedOutflow[] = [];
   /** Every provider-signed call the saga made, in order — the steps a remote signer owns. */
@@ -374,13 +597,16 @@ export function jobFundHarness(
     entities,
     job: adapter,
     reputation: { record: async () => `0x${"ee".repeat(32)}` } as unknown as ReputationAdapter,
-    // Stops the saga at the funding boundary, which is what these tests are about: whatever
-    // happened to the escrow is already persisted by the time this throws.
-    worker: {
-      produceDeliverable: async () => {
-        throw new Error("stop after fund");
-      },
-    } as unknown as JobWorker,
+    // Stops the saga at the funding boundary, which is what most of these tests are about:
+    // whatever happened to the escrow is already persisted by the time this throws. `failAt`
+    // moves the failure further down, to the two steps that fail AFTER the money moved.
+    worker: (opts.failAt && opts.failAt !== "worker"
+      ? new TrivialWorker()
+      : {
+          produceDeliverable: async () => {
+            throw new Error("stop after fund");
+          },
+        }) as unknown as JobWorker,
     docStore: makeFakeDocStore(),
     outflows: {
       check: () => undefined,
@@ -393,8 +619,14 @@ export function jobFundHarness(
         providerCalls.push("setBudget");
         return `0x${"bb".repeat(32)}` as Hex;
       },
-      submit: async () => {
+      submit: async (jobId) => {
         providerCalls.push("submit");
+        // The real thing is signed by a remote key (the enclave or Circle) and this harness does
+        // not sign it — but it DOES move the chain, so the double moves the chain too. Without
+        // that, a refund decision would read Funded for a job the contract has at Submitted.
+        if (opts.failAt === "submit")
+          throw new ChainTxRevertedError("submit", SUBMIT_REVERT_TX_HASH);
+        node.markSubmitted(jobId);
         return `0x${"cc".repeat(32)}` as Hex;
       },
       sweepToTreasury: async () => {
@@ -403,17 +635,41 @@ export function jobFundHarness(
       },
     }),
     sweepToTreasury: false,
+    recoverEscrow: opts.recoverEscrow ? refundJob : undefined,
   });
 
   /** The composition's `runJob`: the saga, serialised per ENTITY. */
   const runJob = (input: { jobKey: string; entityKey: string }) =>
     withKeyedLock(input.entityKey, () => runJobSaga(deps(input)));
 
-  const runner = new JobRunner({ jobs, runJob: (input) => runJob(input) });
+  const runner = new JobRunner({
+    jobs,
+    runJob: (input) => runJob(input),
+    recoverEscrow: opts.recoverEscrow ? refundJob : undefined,
+  });
 
   /** A bound agent plus a job already on-chain at `created`, ready for the funding step. */
-  const seedCreatedJob = (p: { jobKey: string; entityKey: string; jobId: bigint }) => {
+  const seedCreatedJob = (p: {
+    jobKey: string;
+    entityKey: string;
+    jobId: bigint;
+    /** When the on-chain job expires, in seconds. Default: far beyond any test's clock. */
+    expiredAt?: bigint;
+  }) => {
     seedBoundEntity(entities, p.entityKey, { operator: FAKE_PROVIDER_ADDRESS });
+    // The contract's side of the same job, at Open with its budget set — the state a real
+    // `createJob` + provider `setBudget` leaves behind.
+    node.seedChainJob({
+      id: p.jobId,
+      client: jobClientAccount.address as Address,
+      provider: FAKE_PROVIDER_ADDRESS,
+      evaluator: evaluatorAddress,
+      description: "demo",
+      budget: BUDGET,
+      expiredAt: p.expiredAt ?? DEFAULT_EXPIRES_AT,
+      status: 0,
+      hook: ZERO_ADDRESS,
+    });
     jobs.upsert({
       jobKey: p.jobKey,
       jobId: p.jobId.toString(),
@@ -421,7 +677,7 @@ export function jobFundHarness(
       ownerTenantId: undefined,
       status: "created",
       clientAddress: jobClientAccount.address as Address,
-      evaluatorAddress: evaluatorAccount.address as Address,
+      evaluatorAddress,
       providerAddress: FAKE_PROVIDER_ADDRESS,
       budgetAmount: BUDGET.toString(),
       description: "demo",
@@ -433,7 +689,62 @@ export function jobFundHarness(
       completeTxHash: null,
       sweepTxHash: null,
       reputationTxHash: null,
+      refundTxHash: null,
+      escrowState: null,
       error: null,
+    });
+  };
+
+  /**
+   * THE ROW A PREVIOUS PROCESS LEFT BEHIND: `failed`, funded, and never refunded.
+   *
+   * This is what the boot reconcile finds, and the only way to write a test about a chain state
+   * our own saga cannot produce in one run — an escrow somebody else already rejected, or a job
+   * the evaluator completed after we gave up on it.
+   */
+  const seedFailedFundedJob = (p: {
+    jobKey: string;
+    entityKey: string;
+    jobId: bigint;
+    /** The status the CONTRACT has this job at. Our row says nothing about it. */
+    chainStatus: number;
+    expiredAt?: bigint;
+    error?: string;
+  }) => {
+    seedBoundEntity(entities, p.entityKey, { operator: FAKE_PROVIDER_ADDRESS });
+    node.seedChainJob({
+      id: p.jobId,
+      client: jobClientAccount.address as Address,
+      provider: FAKE_PROVIDER_ADDRESS,
+      evaluator: evaluatorAddress,
+      description: "demo",
+      budget: BUDGET,
+      expiredAt: p.expiredAt ?? DEFAULT_EXPIRES_AT,
+      status: p.chainStatus,
+      hook: ZERO_ADDRESS,
+    });
+    jobs.upsert({
+      jobKey: p.jobKey,
+      jobId: p.jobId.toString(),
+      entityKey: p.entityKey,
+      ownerTenantId: undefined,
+      status: "failed",
+      clientAddress: jobClientAccount.address as Address,
+      evaluatorAddress,
+      providerAddress: FAKE_PROVIDER_ADDRESS,
+      budgetAmount: BUDGET.toString(),
+      description: "demo",
+      deliverableHash: null,
+      deliverablePath: null,
+      createTxHash: `0x${"aa".repeat(32)}` as Hex,
+      fundTxHash: `0x${"f7".repeat(32)}` as Hex,
+      submitTxHash: null,
+      completeTxHash: null,
+      sweepTxHash: null,
+      reputationTxHash: null,
+      refundTxHash: null,
+      escrowState: null,
+      error: p.error ?? "died after funding",
     });
   };
 
@@ -454,6 +765,12 @@ export function jobFundHarness(
     outflows,
     providerCalls,
     seedCreatedJob,
+    seedFailedFundedJob,
     eventsFor,
+    evaluatorAddress,
+    /** Call the recovery by hand — what the MCP tool and the CLI do. */
+    refundJob,
+    /** Every outcome the recovery reported, in the order it reported them. */
+    recoveries,
   };
 }

@@ -875,6 +875,7 @@ async function main() {
     jobRunner: jobDeps.jobRunner,
     jobClientAddress: jobDeps.jobClientAddress,
     jobEvaluatorAddress: jobDeps.jobEvaluatorAddress,
+    refundJob: jobDeps.refundJob,
     maxJobBudget: cfg.maxJobBudget,
     maxInflightJobsPerTenant: cfg.maxInflightJobsPerTenant,
     agentRuns,

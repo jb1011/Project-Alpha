@@ -8,6 +8,7 @@ import { buildLiveAgentRunner } from "../agent/liveRunner";
 import { toJobView } from "../api/jobViews";
 import { loadConfig } from "../config/env";
 import { legacyDoorRefusalMessage, legacyDoorRefused } from "../formation";
+import { outcomeJson } from "../jobs/refund";
 import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import { runOnboarding } from "../workflow/onboarding";
@@ -307,6 +308,38 @@ export function buildCli(
         return;
       }
       console.log(JSON.stringify(toJobView(rec), null, 2));
+    });
+
+  program
+    .command("refund-job")
+    .description("Recover the USDC escrow of a job that funded and then failed; prints the outcome")
+    .argument("<jobKey>", "job key")
+    .action(async (jobKey) => {
+      const ctx = await makeContext();
+      // The escrow goes back to the client that paid it, and the refund is signed by one of the
+      // job keys. With no job client key there is neither a payer nor a signer.
+      if (!ctx.jobDeps.refundJob) {
+        console.error(
+          "set JOB_CLIENT_PRIVATE_KEY to refund a job: the escrow goes back to the client address that paid it",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      if (!ctx.jobDeps.jobs.findByKey(jobKey)) {
+        console.error(`not found: ${jobKey}`);
+        process.exitCode = 1;
+        return;
+      }
+      const outcome = await ctx.jobDeps.refundJob(jobKey);
+      // The outcome AND the row it left behind: "refunded" is worth little without the hash and
+      // the escrow state an operator is about to be asked for.
+      console.log(
+        JSON.stringify(
+          { jobKey, ...outcomeJson(outcome), job: toJobView(ctx.jobDeps.jobs.findByKey(jobKey)!) },
+          null,
+          2,
+        ),
+      );
     });
 
   program
