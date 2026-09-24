@@ -1,9 +1,16 @@
-import { HTTPFacilitatorClient, type RoutesConfig, x402ResourceServer } from "@x402/core/server";
+import {
+  HTTPFacilitatorClient,
+  type RoutesConfig,
+  x402HTTPResourceServer,
+  x402ResourceServer,
+} from "@x402/core/server";
 import { ExactHederaScheme } from "@x402/hedera/exact/server";
-import { paymentMiddleware } from "@x402/hono";
-import type { Hono } from "hono";
+import { paymentMiddlewareFromHTTPServer } from "@x402/hono";
+import type { Hono, MiddlewareHandler } from "hono";
 import type { AuthVars } from "../../auth/middleware";
+import { ApiError } from "../../errors";
 import { buildAttestation, signAttestation } from "../../hedera/attestation";
+import { opsLog } from "../../observability/opsLog";
 import { isPublicOnChain } from "../../payments/legalBody";
 import type { EntityRecord } from "../../types";
 import type { ApiDeps } from "../app";
@@ -40,6 +47,18 @@ const DESCRIPTION =
  *  the database twice — and never disagrees with the row the price was quoted against. */
 type VerifyVars = AuthVars & { verifyEntity: EntityRecord };
 
+/** At most one facilitator handshake per this long, however many callers ask in between. This
+ *  route is public and unauthenticated, so without a window every request to it while the
+ *  facilitator is down would be another round trip to the facilitator. */
+const HANDSHAKE_RETRY_MS = 10_000;
+
+/** The ONE sentence a caller is told while the handshake has not succeeded. It names no host, no
+ *  URL and no third party: none of that is something a buyer can act on, and all of it is
+ *  deployment topology that a public 503 has no business publishing. */
+const UNAVAILABLE = "the paid standing check is temporarily unavailable; try again shortly";
+
+const unavailable = () => new ApiError("facilitator_unavailable", 503, UNAVAILABLE);
+
 export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
   const h = deps.hedera;
   const lb = deps.legalBody;
@@ -50,8 +69,7 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
 
   const limiter = createClientLimiter(deps);
   const shared = sharedReadBudget(deps);
-  const facilitator = new HTTPFacilitatorClient({ url: h.cfg.facilitatorUrl });
-  const server = new x402ResourceServer(facilitator).register("hedera:*", new ExactHederaScheme());
+  const now = () => (deps.now ?? Date.now)();
   const routes: RoutesConfig = {
     "GET /verify/:publicId": {
       accepts: {
@@ -66,6 +84,69 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   };
 
   const typed = app as unknown as Hono<{ Variables: VerifyVars }>;
+
+  /**
+   * LAYER 2, BUILT ON THE FIRST REQUEST — and the reason it is not built at mount.
+   *
+   * `paymentMiddleware(routes, server)` used to be called right here, while the app was being
+   * assembled, and `@x402/hono` starts the facilitator's `/supported` handshake inside that call.
+   * A facilitator that answered 200 without `exact` on this network therefore made
+   * `x402HTTPResourceServer.initialize()` raise `RouteConfigurationError` during boot — and
+   * `@x402/core` treats that as a FATAL startup error, so its background-init handler answered it
+   * with `process.exit(1)`. The whole API died, `/healthz` included, because one third-party
+   * sidecar was pointed at the wrong chain. A facilitator that was merely unreachable left the
+   * process up but answered this route with a bare 500 from inside the library.
+   *
+   * So the handshake is ours: nothing touches the facilitator until a request actually needs it,
+   * the built middleware is cached once it succeeds, and a failure is a 503 in this API's envelope
+   * that the next request retries — at most one attempt per `HANDSHAKE_RETRY_MS`. No other route
+   * in this process can be affected by it, which is the property that was missing.
+   */
+  let paid: MiddlewareHandler | undefined;
+  /** The attempt in flight, so concurrent callers share ONE handshake instead of one each. */
+  let attempt: Promise<MiddlewareHandler> | undefined;
+  /** The earliest the next attempt may start. Set when an attempt BEGINS, so a facilitator that
+   *  takes ten seconds to fail does not open the window the moment it answers. */
+  let nextAttemptAt = 0;
+
+  const openPaidLayer = async (): Promise<MiddlewareHandler> => {
+    const facilitator = new HTTPFacilitatorClient({ url: h.cfg.facilitatorUrl });
+    const server = new x402ResourceServer(facilitator).register(
+      "hedera:*",
+      new ExactHederaScheme(),
+    );
+    const httpServer = new x402HTTPResourceServer(server, routes);
+    // The handshake, awaited where we can answer for it: `/supported`, plus the library's own
+    // check that the facilitator advertises the scheme and network this route quotes.
+    await httpServer.initialize();
+    // `syncFacilitatorOnStart` FALSE, which is safe only because the line above did the
+    // initialising — and is the point of doing it there. With the default (true) this call starts
+    // a second handshake and hands its failure to the fatal-startup handler that exits the
+    // process; with false and no `initialize()` of our own, the resource server would have no
+    // supported kinds and every request would 500 (design Pre-cleared ✎, audit B8).
+    return paymentMiddlewareFromHTTPServer(httpServer, undefined, undefined, false);
+  };
+
+  const paidLayer = async (): Promise<MiddlewareHandler> => {
+    if (paid) return paid;
+    if (!attempt) {
+      if (now() < nextAttemptAt) throw unavailable();
+      nextAttemptAt = now() + HANDSHAKE_RETRY_MS;
+      attempt = openPaidLayer();
+    }
+    try {
+      paid = await attempt;
+      return paid;
+    } catch (err) {
+      attempt = undefined;
+      // One line per attempt, so the window above bounds the logging too. WHAT failed, never
+      // where: the reason is the library's sentence, which names the scheme and the status code.
+      opsLog("verify_facilitator_handshake_failed", {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      throw unavailable();
+    }
+  };
 
   // Layer 1: the limiter and the 404 guard, BEFORE any 402 is issued (D9).
   typed.use("/verify/:publicId", async (c, next) => {
@@ -113,12 +194,10 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
     await next();
   });
 
-  // Layer 2: the x402 middleware (402, verify, settle; it discards our body on a failed settle).
-  // `syncFacilitatorOnStart` stays at its DEFAULT (true): with false the middleware never
-  // initializes, and the resource server then throws on every request, which answers 500
-  // (design Pre-cleared ✎, audit B8). Mounting fetches the facilitator's `/supported` once, in
-  // the background; a failure there is retried by the middleware on the first request.
-  typed.use("/verify/:publicId", paymentMiddleware(routes, server));
+  // Layer 2: the x402 middleware (402, verify, settle; it discards our body on a failed settle),
+  // behind the handshake above. Mounted AFTER layer 1, so a 404 or a throttled caller is answered
+  // without the facilitator being asked anything at all — with the facilitator up or down.
+  typed.use("/verify/:publicId", async (c, next) => (await paidLayer())(c, next));
 
   // Layer 3: the handler.
   typed.get("/verify/:publicId", async (c) => {
