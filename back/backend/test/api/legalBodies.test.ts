@@ -105,9 +105,16 @@ const get = (
 /** A distinct valid lowercase address per index — the memo and the per-client budget are both
  *  keyed on real input, so exercising them needs real, different addresses. */
 const addr = (i: number) => `0x${i.toString(16).padStart(40, "0")}`;
-/** Each caller its OWN forwarded-for, so a test that means "many requests" does not accidentally
- *  mean "one client's whole budget". */
-const from = (client: string) => ({ "x-forwarded-for": `${client}, 10.0.0.1` });
+/**
+ * Each caller its OWN forwarded-for, so a test that means "many requests" does not accidentally
+ * mean "one client's whole budget".
+ *
+ * The caller is the LAST entry, which is why it is written second here. Everything before it is
+ * whatever the request arrived carrying — a value nobody can vouch for — and `10.0.0.1` stands
+ * for exactly that: one fixed unverifiable entry, identical for every caller below, so a test
+ * that distinguishes callers is distinguishing them by the only entry that can be trusted.
+ */
+const from = (client: string) => ({ "x-forwarded-for": `10.0.0.1, ${client}` });
 
 // ── the answer itself ───────────────────────────────────────────────────────────────────────
 
@@ -400,6 +407,78 @@ test("a request with no X-Forwarded-For shares one bucket, and is not an error",
   const statuses: number[] = [];
   for (let i = 1; i <= 11; i += 1) statuses.push((await get(app, addr(i))).status);
   expect(statuses[9]).toBe(200);
+  expect(statuses[10]).toBe(429);
+});
+
+test("a scanner rotating the FIRST entry still spends one single bucket", async () => {
+  // The per-caller limit used to key on the first `X-Forwarded-For` entry, and the first entry is
+  // whatever the request arrived carrying. A scanner that wrote a fresh fake one on every request
+  // therefore got a fresh allowance on every request, and the limit it is standing in front of
+  // never bound it: eleven requests, eleven answers. The entry our own reverse proxy appended is
+  // the last one, so that is the one this bucket is keyed on — and the eleventh is refused.
+  const app = makeApp({ answers: body(), readBudget: new TokenBucket(5_000, 0) });
+  const statuses: number[] = [];
+  for (let i = 1; i <= 11; i += 1)
+    statuses.push(
+      (await get(app, addr(i), { "x-forwarded-for": `203.0.113.${i}, 198.51.100.7` })).status,
+    );
+  expect(statuses.slice(0, 10)).toEqual(Array(10).fill(200));
+  expect(statuses[10]).toBe(429);
+});
+
+test("a caller keeps its own bucket however long a chain it claims to have crossed", async () => {
+  // The same point from the other side: a forged chain of any length cannot dilute the key, and
+  // two genuinely different callers behind the same forged prefix are still two callers.
+  const app = makeApp({ answers: body(), readBudget: new TokenBucket(5_000, 0) });
+  const long = "10.0.0.1, 172.16.0.2, 192.168.0.3";
+  for (let i = 1; i <= 10; i += 1)
+    expect((await get(app, addr(i), { "x-forwarded-for": `${long}, 198.51.100.8` })).status).toBe(
+      200,
+    );
+  expect((await get(app, addr(11), { "x-forwarded-for": `${long}, 198.51.100.8` })).status).toBe(
+    429,
+  );
+  // A different last entry is a different caller, and its allowance is untouched.
+  expect((await get(app, addr(12), { "x-forwarded-for": `${long}, 198.51.100.9` })).status).toBe(
+    200,
+  );
+});
+
+test("a trailing comma is a caller, not a missing header", async () => {
+  // A proxy appending to an empty inbound value leaves `"<something>, "`, and reading the last
+  // entry literally made that empty tail the key — which is falsy, so the caller fell through to
+  // the shared `direct` bucket and pooled its allowance with every header-less request on the
+  // box. The last NON-EMPTY entry is the caller, whatever punctuation follows it.
+  const app = makeApp({ answers: body(), readBudget: new TokenBucket(5_000, 0) });
+  for (let i = 1; i <= 10; i += 1)
+    expect((await get(app, addr(i), { "x-forwarded-for": "10.0.0.1, 1.2.3.4, " })).status).toBe(
+      200,
+    );
+  // …and it is the SAME bucket the tidy spelling gets, not a second one.
+  expect((await get(app, addr(11), { "x-forwarded-for": "10.0.0.1, 1.2.3.4" })).status).toBe(429);
+  // A header-less request is still its own bucket, untouched by all of that.
+  expect((await get(app, addr(12))).status).toBe(200);
+});
+
+test("a header with no entry at all is `direct`, and shares that one bucket", async () => {
+  const app = makeApp({ answers: body(), readBudget: new TokenBucket(5_000, 0) });
+  for (let i = 1; i <= 10; i += 1)
+    expect((await get(app, addr(i), { "x-forwarded-for": " , " })).status).toBe(200);
+  // Nothing in it to key on, so it is the same allowance a request with no header at all draws.
+  expect((await get(app, addr(11))).status).toBe(429);
+});
+
+test("the key is trimmed and lowercased, so one caller is never two buckets", async () => {
+  // Whitespace after the comma is normal in this header, and a hex IPv6 address can be written in
+  // either case. Either difference, left in the key, is a second free allowance for one caller.
+  const app = makeApp({ answers: body(), readBudget: new TokenBucket(5_000, 0) });
+  const spellings = ["10.0.0.1,2001:DB8::1", "10.0.0.1,   2001:db8::1", "10.0.0.1, 2001:Db8::1 "];
+  const statuses: number[] = [];
+  for (let i = 1; i <= 11; i += 1)
+    statuses.push(
+      (await get(app, addr(i), { "x-forwarded-for": spellings[i % spellings.length]! })).status,
+    );
+  expect(statuses.slice(0, 10)).toEqual(Array(10).fill(200));
   expect(statuses[10]).toBe(429);
 });
 
