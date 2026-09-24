@@ -6,7 +6,7 @@ import {
 } from "@x402/core/server";
 import { ExactHederaScheme } from "@x402/hedera/exact/server";
 import { paymentMiddlewareFromHTTPServer } from "@x402/hono";
-import type { Hono, MiddlewareHandler } from "hono";
+import type { Context, Hono, MiddlewareHandler } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { ApiError } from "../../errors";
 import { buildAttestation, signAttestation } from "../../hedera/attestation";
@@ -52,12 +52,38 @@ type VerifyVars = AuthVars & { verifyEntity: EntityRecord };
  *  facilitator is down would be another round trip to the facilitator. */
 const HANDSHAKE_RETRY_MS = 10_000;
 
+/**
+ * How long any one facilitator request may take before we give up on it.
+ *
+ * `HTTPFacilitatorClient` defaults to THIRTY SECONDS, and this client's handshake is shared: a
+ * facilitator that accepts the connection and then says nothing held every `/verify` caller at
+ * once for half a minute, and longer still where `getSupported` retried. A caller is better told
+ * "not now" in five seconds than made to wait out a third party's socket.
+ *
+ * ⚠ The bound applies to `verify()` and `settle()` too, because the resource server has one
+ * client for all three. A settle that times out is an INDETERMINATE outcome by the library's own
+ * documentation — the facilitator may still have completed it — so this number is the ceiling on
+ * how long a settlement may take before the buyer is told it did not happen. Five seconds is the
+ * agreed value; raise it here, in one place, if a real settlement is ever seen to need more.
+ */
+const FACILITATOR_TIMEOUT_MS = 5_000;
+
 /** The ONE sentence a caller is told while the handshake has not succeeded. It names no host, no
  *  URL and no third party: none of that is something a buyer can act on, and all of it is
  *  deployment topology that a public 503 has no business publishing. */
 const UNAVAILABLE = "the paid standing check is temporarily unavailable; try again shortly";
 
-const unavailable = () => new ApiError("facilitator_unavailable", 503, UNAVAILABLE);
+/**
+ * The refusal, and the one place that decides it is not reusable.
+ *
+ * `Cache-Control: no-store` for the same reason the 404 and the 429 in layer 1 carry it: nothing a
+ * caller is refused may be held by a shared cache. An intermediary that kept this one would go on
+ * refusing buyers out of its own copy long after the facilitator came back.
+ */
+const unavailable = (c: { header(name: string, value: string): void }): ApiError => {
+  c.header("Cache-Control", "no-store");
+  return new ApiError("facilitator_unavailable", 503, UNAVAILABLE);
+};
 
 export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
   const h = deps.hedera;
@@ -110,7 +136,10 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   let nextAttemptAt = 0;
 
   const openPaidLayer = async (): Promise<MiddlewareHandler> => {
-    const facilitator = new HTTPFacilitatorClient({ url: h.cfg.facilitatorUrl });
+    const facilitator = new HTTPFacilitatorClient({
+      url: h.cfg.facilitatorUrl,
+      timeoutMs: FACILITATOR_TIMEOUT_MS,
+    });
     const server = new x402ResourceServer(facilitator).register(
       "hedera:*",
       new ExactHederaScheme(),
@@ -127,24 +156,34 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
     return paymentMiddlewareFromHTTPServer(httpServer, undefined, undefined, false);
   };
 
-  const paidLayer = async (): Promise<MiddlewareHandler> => {
+  const paidLayer = async (c: Context): Promise<MiddlewareHandler> => {
     if (paid) return paid;
     if (!attempt) {
-      if (now() < nextAttemptAt) throw unavailable();
+      if (now() < nextAttemptAt) throw unavailable(c);
       nextAttemptAt = now() + HANDSHAKE_RETRY_MS;
-      attempt = openPaidLayer();
+      const started = openPaidLayer();
+      // ONE line per ATTEMPT, which is why it is attached HERE, to the attempt itself, and not in
+      // the catch below: fifty callers waiting on one handshake would each have written their own
+      // copy of the same failure, so the journal filled in proportion to traffic against a route
+      // whose problem is that the traffic cannot be served. The window above then bounds the
+      // logging exactly as it bounds the round trips.
+      //
+      // WHAT failed, never where: the reason is the library's own sentence, which names the
+      // scheme and the status code. This `catch` also makes the rejection handled, so an attempt
+      // nobody is left awaiting cannot surface as an unhandled rejection.
+      started.catch((err: unknown) => {
+        opsLog("verify_facilitator_handshake_failed", {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      });
+      attempt = started;
     }
     try {
       paid = await attempt;
       return paid;
-    } catch (err) {
+    } catch {
       attempt = undefined;
-      // One line per attempt, so the window above bounds the logging too. WHAT failed, never
-      // where: the reason is the library's sentence, which names the scheme and the status code.
-      opsLog("verify_facilitator_handshake_failed", {
-        reason: err instanceof Error ? err.message : String(err),
-      });
-      throw unavailable();
+      throw unavailable(c);
     }
   };
 
@@ -197,7 +236,7 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   // Layer 2: the x402 middleware (402, verify, settle; it discards our body on a failed settle),
   // behind the handshake above. Mounted AFTER layer 1, so a 404 or a throttled caller is answered
   // without the facilitator being asked anything at all — with the facilitator up or down.
-  typed.use("/verify/:publicId", async (c, next) => (await paidLayer())(c, next));
+  typed.use("/verify/:publicId", async (c, next) => (await paidLayer(c))(c, next));
 
   // Layer 3: the handler.
   typed.get("/verify/:publicId", async (c) => {

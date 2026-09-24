@@ -444,6 +444,30 @@ test("a caller keeps its own bucket however long a chain it claims to have cross
   );
 });
 
+test("a trailing comma is a caller, not a missing header", async () => {
+  // A proxy appending to an empty inbound value leaves `"<something>, "`, and reading the last
+  // entry literally made that empty tail the key — which is falsy, so the caller fell through to
+  // the shared `direct` bucket and pooled its allowance with every header-less request on the
+  // box. The last NON-EMPTY entry is the caller, whatever punctuation follows it.
+  const app = makeApp({ answers: body(), readBudget: new TokenBucket(5_000, 0) });
+  for (let i = 1; i <= 10; i += 1)
+    expect((await get(app, addr(i), { "x-forwarded-for": "10.0.0.1, 1.2.3.4, " })).status).toBe(
+      200,
+    );
+  // …and it is the SAME bucket the tidy spelling gets, not a second one.
+  expect((await get(app, addr(11), { "x-forwarded-for": "10.0.0.1, 1.2.3.4" })).status).toBe(429);
+  // A header-less request is still its own bucket, untouched by all of that.
+  expect((await get(app, addr(12))).status).toBe(200);
+});
+
+test("a header with no entry at all is `direct`, and shares that one bucket", async () => {
+  const app = makeApp({ answers: body(), readBudget: new TokenBucket(5_000, 0) });
+  for (let i = 1; i <= 10; i += 1)
+    expect((await get(app, addr(i), { "x-forwarded-for": " , " })).status).toBe(200);
+  // Nothing in it to key on, so it is the same allowance a request with no header at all draws.
+  expect((await get(app, addr(11))).status).toBe(429);
+});
+
 test("the key is trimmed and lowercased, so one caller is never two buckets", async () => {
   // Whitespace after the comma is normal in this header, and a hex IPv6 address can be written in
   // either case. Either difference, left in the key, is a second free allowance for one caller.

@@ -50,7 +50,8 @@ const HEDERA_CFG = {
 const NETWORK = "hedera:testnet";
 const FEE_PAYER = "0.0.7162784";
 
-/** The facilitator's `/supported` as Blocky402 testnet answers it — the WORKING handshake. */
+/** The facilitator's `/supported` as the Hedera testnet facilitator answers it — the WORKING
+ *  handshake. */
 const SUPPORTED = {
   kinds: [{ x402Version: 2, scheme: "exact", network: NETWORK, extra: { feePayer: FEE_PAYER } }],
   extensions: [],
@@ -81,6 +82,11 @@ let seen: string[];
 let exited: (number | undefined)[];
 /** What `/supported` answers on the NEXT call, so a test can bring the facilitator back. */
 let supported: () => Response;
+/** A facilitator that accepts the connection and then says nothing at all, ever. It answers only
+ *  when the client gives up on it, which is the case the client's own timeout has to bound. */
+let hanging: boolean;
+/** The `opslog` event names production code wrote, in order. */
+let ops: string[];
 /** The app's clock, which the backoff reads. Advanced by `tick`. */
 let clock: number;
 const tick = (ms: number) => {
@@ -95,13 +101,33 @@ const json = (body: unknown) =>
 
 beforeEach(() => {
   seen = [];
+  ops = [];
+  hanging = false;
   clock = 1_789_100_000_000; // 2026-09-10, the design date, as the shared scaffold uses it
   supported = () => json(SUPPORTED);
-  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const url =
       typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     seen.push(new URL(url).pathname);
-    return supported();
+    if (!hanging) return supported();
+    // Never resolves on its own. The only thing that ends it is the client's own abort signal,
+    // so what this measures is whether the client HAS one.
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const abort = new Error("the facilitator never answered");
+        abort.name = "TimeoutError";
+        reject(abort);
+      });
+    });
+  });
+  // `opsLog` writes one JSON line per event to stdout; captured so "how many lines" is assertable.
+  vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+    try {
+      const parsed = JSON.parse(String(line)) as { opslog?: unknown };
+      if (typeof parsed.opslog === "string") ops.push(parsed.opslog);
+    } catch {
+      // Not an ops line. Nothing in this file asserts on those.
+    }
   });
   // The failure this file exists to prevent. Left as a spy, never as a mock that swallows a real
   // exit: if production code calls it, `exited` records the code and the assertions below fail.
@@ -206,10 +232,6 @@ test("the refusal names no host, no URL and no third party", async () => {
 // ── the backoff ─────────────────────────────────────────────────────────────────────────────────
 
 test("a failed handshake is retried at most once every ten seconds", async () => {
-  const ops: string[] = [];
-  vi.spyOn(console, "log").mockImplementation((line: string) => {
-    ops.push(String(JSON.parse(line).opslog));
-  });
   supported = () => new Response("boom", { status: 500 });
   const app = setup();
   expect((await get(app, "10.0.0.1")).status).toBe(503);
@@ -246,6 +268,45 @@ test("concurrent callers share one handshake rather than one each", async () => 
   for (const res of answers) expect(res.status).toBe(503);
   expect(seen).toEqual(["/supported"]);
 });
+
+test("fifty callers sharing one handshake share its ONE ops line", async () => {
+  // The line is attached to the ATTEMPT, not to each caller waiting on it. Logged per awaiter it
+  // was fifty identical lines for one failure — a journal filling up in proportion to the traffic
+  // against a route whose whole problem is that the traffic can no longer be served.
+  supported = () => new Response("boom", { status: 500 });
+  const app = setup();
+  const callers = Array.from({ length: 50 }, (_, i) => get(app, `16.0.0.${i + 1}`));
+  for (const res of await Promise.all(callers)) expect(res.status).toBe(503);
+  expect(seen).toEqual(["/supported"]);
+  expect(ops).toEqual(["verify_facilitator_handshake_failed"]);
+});
+
+test("the 503 is no more cacheable than the 404 and the 429 beside it", async () => {
+  // Nothing a caller is refused may be reused by a shared cache. An intermediary that held this
+  // one would go on refusing buyers out of its own cache after the facilitator came back.
+  supported = () => new Response("boom", { status: 500 });
+  const app = setup();
+  const res = await get(app, "17.0.0.1");
+  expect(res.status).toBe(503);
+  expect(res.headers.get("cache-control")).toBe("no-store");
+});
+
+test("a facilitator that never answers gives the caller its 503 in seconds, not half a minute", async () => {
+  // The handshake is SHARED, so the library's 30-second default was a caller-visible hang for
+  // every /verify request at once — and `getSupported` retries, so the wait could be longer than
+  // the default itself. The client is given a bound of its own; this measures that it has one.
+  hanging = true;
+  const app = setup();
+  const startedAt = Date.now();
+  const res = await get(app, "18.0.0.1");
+  const elapsed = Date.now() - startedAt;
+  expect(res.status).toBe(503);
+  expect(await res.json()).toEqual(UNAVAILABLE);
+  expect(elapsed).toBeLessThan(10_000);
+  // One attempt, abandoned rather than retried: a timeout is not a 429.
+  expect(seen).toEqual(["/supported"]);
+  expect(ops).toEqual(["verify_facilitator_handshake_failed"]);
+}, 20_000);
 
 // ── the recovery ────────────────────────────────────────────────────────────────────────────────
 

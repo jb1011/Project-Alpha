@@ -186,10 +186,18 @@ export function createClientLimiter(deps: ApiDeps): (c: HeaderBearing) => TokenB
   /** One bucket per caller (R2), bounded and least-recently-used-first. */
   const clients = new Map<string, TokenBucket>();
   const limiter = (c: HeaderBearing): TokenBucket => {
-    const chain = c.req.header("x-forwarded-for")?.split(",");
-    const appended = chain?.[chain.length - 1]?.trim().toLowerCase();
-    // Trimmed and lowercased so one caller cannot hold two buckets by spelling itself two ways.
-    const key = appended ? appended : "direct";
+    // The last NON-EMPTY entry. Trimmed and lowercased so one caller cannot hold two buckets by
+    // spelling itself two ways — and non-empty because a trailing comma is legal here and is what
+    // a proxy appending to an empty inbound value leaves behind. Read literally, that empty tail
+    // became the key, which is falsy, so those callers fell through to the shared `direct` bucket
+    // and pooled one allowance between them. Only a header with nothing in it at all is `direct`.
+    const appended = c.req
+      .header("x-forwarded-for")
+      ?.split(",")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry !== "")
+      .pop();
+    const key = appended ?? "direct";
     const found = clients.get(key);
     // Re-inserted on every use, so insertion order IS least-recently-used order and the entry
     // evicted below is the coldest one — never the scanner's own exhausted bucket.
