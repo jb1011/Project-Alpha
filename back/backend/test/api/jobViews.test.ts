@@ -22,6 +22,8 @@ test("toJobView maps JobRecord to JobView with all fields", () => {
     completeTxHash: "0x1111111111111111111111111111111111111111111111111111111111111111",
     sweepTxHash: "0x2222222222222222222222222222222222222222222222222222222222222222",
     reputationTxHash: "0x3333333333333333333333333333333333333333333333333333333333333333",
+    refundTxHash: "0x4444444444444444444444444444444444444444444444444444444444444444",
+    escrowState: "refunded",
     error: null,
   };
 
@@ -58,6 +60,12 @@ test("toJobView maps JobRecord to JobView with all fields", () => {
     "0x3333333333333333333333333333333333333333333333333333333333333333",
   );
   expect(view.error).toBe(null);
+  // Where the money is, on the surface a caller actually reads. A refund nobody can see is a
+  // refund an operator has to go and find on a block explorer.
+  expect(view.refundTxHash).toBe(
+    "0x4444444444444444444444444444444444444444444444444444444444444444",
+  );
+  expect(view.escrowState).toBe("refunded");
 });
 
 test("toJobView handles optional fields (ownerTenantId, error undefined)", () => {
@@ -79,6 +87,8 @@ test("toJobView handles optional fields (ownerTenantId, error undefined)", () =>
     completeTxHash: null,
     sweepTxHash: null,
     reputationTxHash: null,
+    refundTxHash: null,
+    escrowState: null,
   };
 
   const view = toJobView(record);
@@ -90,4 +100,7 @@ test("toJobView handles optional fields (ownerTenantId, error undefined)", () =>
   expect(view.deliverableHash).toBe(null);
   expect(view.createTxHash).toBe(null);
   expect(view.reputationTxHash).toBe(null);
+  // A pending job has an escrow nobody has decided anything about yet.
+  expect(view.refundTxHash).toBe(null);
+  expect(view.escrowState).toBe(null);
 });

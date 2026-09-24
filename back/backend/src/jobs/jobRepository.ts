@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { JobRecord, JobStatus } from "./types";
+import type { EscrowState, JobRecord, JobStatus } from "./types";
 
 export interface JobRepository {
   upsert(r: JobRecord): void;
@@ -8,6 +8,8 @@ export interface JobRepository {
   listByEntity(entityKey: string): JobRecord[];
   listByTenant(tenantId: string): JobRecord[];
   listInFlight(): JobRecord[];
+  /** The failed jobs whose funded escrow is still, as far as we know, in the contract. */
+  listEscrowedUnrefunded(): JobRecord[];
   recordEvent(
     jobKey: string,
     step: string,
@@ -37,6 +39,8 @@ interface Row {
   complete_tx_hash: string | null;
   sweep_tx_hash: string | null;
   reputation_tx_hash: string | null;
+  refund_tx_hash: string | null;
+  escrow_state: EscrowState | null;
   error: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -62,6 +66,8 @@ function toRecord(r: Row): JobRecord {
     completeTxHash: r.complete_tx_hash as JobRecord["completeTxHash"],
     sweepTxHash: r.sweep_tx_hash as JobRecord["sweepTxHash"],
     reputationTxHash: r.reputation_tx_hash as JobRecord["reputationTxHash"],
+    refundTxHash: r.refund_tx_hash as JobRecord["refundTxHash"],
+    escrowState: r.escrow_state ?? null,
     error: r.error ?? null,
     createdAt: r.created_at ?? null,
     updatedAt: r.updated_at ?? null,
@@ -80,6 +86,7 @@ export class SqliteJobRepository implements JobRepository {
           budget_amount, description,
           deliverable_hash, deliverable_path,
           create_tx_hash, fund_tx_hash, submit_tx_hash, complete_tx_hash, sweep_tx_hash, reputation_tx_hash,
+          refund_tx_hash, escrow_state,
           error, updated_at
         ) VALUES (
           @job_key, @job_id, @entity_key, @owner_tenant_id, @status,
@@ -87,6 +94,7 @@ export class SqliteJobRepository implements JobRepository {
           @budget_amount, @description,
           @deliverable_hash, @deliverable_path,
           @create_tx_hash, @fund_tx_hash, @submit_tx_hash, @complete_tx_hash, @sweep_tx_hash, @reputation_tx_hash,
+          @refund_tx_hash, @escrow_state,
           @error, CURRENT_TIMESTAMP
         )
         ON CONFLICT(job_key) DO UPDATE SET
@@ -107,6 +115,8 @@ export class SqliteJobRepository implements JobRepository {
           complete_tx_hash=excluded.complete_tx_hash,
           sweep_tx_hash=excluded.sweep_tx_hash,
           reputation_tx_hash=excluded.reputation_tx_hash,
+          refund_tx_hash=excluded.refund_tx_hash,
+          escrow_state=excluded.escrow_state,
           error=excluded.error,
           updated_at=CURRENT_TIMESTAMP
       `)
@@ -129,6 +139,8 @@ export class SqliteJobRepository implements JobRepository {
         complete_tx_hash: rec.completeTxHash,
         sweep_tx_hash: rec.sweepTxHash,
         reputation_tx_hash: rec.reputationTxHash,
+        refund_tx_hash: rec.refundTxHash,
+        escrow_state: rec.escrowState,
         error: rec.error ?? null,
       });
   }
@@ -162,6 +174,30 @@ export class SqliteJobRepository implements JobRepository {
     return (
       this.db
         .prepare("SELECT * FROM jobs WHERE status NOT IN ('reputed','failed') ORDER BY rowid")
+        .all() as Row[]
+    ).map(toRecord);
+  }
+
+  /**
+   * The jobs that are owed their money back: FAILED, FUNDED, and not accounted for.
+   *
+   * `fund_tx_hash IS NOT NULL` is the whole test for "something reached the escrow" — it is only
+   * ever written from a fund whose receipt came back successful (`adapters/arc/jobAdapter.ts`).
+   * `escrow_state IS NULL` is in the set on purpose: it is what every row written before this
+   * column existed says, and those rows are exactly the ones whose budget is still sitting there.
+   *
+   * ⚠ Ordered by rowid, so the walk is the order the jobs were created — the oldest debt first.
+   */
+  listEscrowedUnrefunded(): JobRecord[] {
+    return (
+      this.db
+        .prepare(`
+          SELECT * FROM jobs
+          WHERE status = 'failed'
+            AND fund_tx_hash IS NOT NULL
+            AND (escrow_state IS NULL OR escrow_state = 'escrowed')
+          ORDER BY rowid
+        `)
         .all() as Row[]
     ).map(toRecord);
   }

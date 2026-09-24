@@ -408,6 +408,100 @@ export class JobAdapter {
   }
 
   /**
+   * The evaluator's local key, when this deployment configured one.
+   *
+   * The escrow recovery path (`jobs/refund.ts`) has to know whether "the evaluator rejects" is
+   * possible AT ALL before it decides anything: with no distinct evaluator key the recorder falls
+   * back to the client (`jobs/composition.ts`), and a client cannot reject a funded job on chain.
+   * So the answer is the wallet itself rather than a boolean — the same object {reject} is handed.
+   */
+  get evaluatorWallet(): WalletClient | undefined {
+    return this.d.evaluatorWallet;
+  }
+
+  /** The job client's local key — the only identity that may `claimRefund` money back to itself. */
+  get clientWallet(): WalletClient {
+    return this.d.clientWallet;
+  }
+
+  /**
+   * reject — send the escrow back to the client and close the job as Rejected (status 4).
+   *
+   * ⚠ WHO SIGNS DECIDES WHAT IS ALLOWED, and the contract enforces it: the CLIENT may reject only
+   * an Open job (nothing is escrowed yet), the EVALUATOR only a Funded or Submitted one. That is
+   * why the wallet is a parameter and not read off the deps — the caller has already read the
+   * chain's status and knows which of the two it is entitled to use (`jobs/refund.ts`).
+   *
+   * Both wallets are LOCAL keys, so this is the ordinary lock-and-number path every platform send
+   * takes. No pre-flight simulate: the decision was made from a fresh `escrowState` read, and a
+   * simulate here would only re-ask a question whose answer is already in hand.
+   */
+  async reject(jobId: bigint, reason: Hex, wallet: WalletClient): Promise<Hex> {
+    const who =
+      wallet.account?.address?.toLowerCase() ===
+      this.d.evaluatorWallet?.account?.address?.toLowerCase()
+        ? JOB_EVALUATOR
+        : JOB_CLIENT;
+    const h = await this.sendAsLocalKey(wallet, who, {
+      to: this.d.jobContract,
+      data: encodeFunctionData({
+        abi: iErc8183JobAbi,
+        functionName: "reject",
+        args: [jobId, reason, "0x"],
+      }),
+    });
+    await this.mined(h, "reject");
+    return h;
+  }
+
+  /**
+   * claimRefund — expire a Funded or Submitted job once `expiredAt` has passed, which refunds the
+   * client. Permissionless on chain, and the refund goes to the job's CLIENT whoever sends it, so
+   * we send it as the client: the key that paid the escrow is the one that gets it back, and no
+   * other key of ours gains anything by paying that gas.
+   */
+  async claimRefund(jobId: bigint): Promise<Hex> {
+    const h = await this.sendAsLocalKey(this.d.clientWallet, JOB_CLIENT, {
+      to: this.d.jobContract,
+      data: encodeFunctionData({
+        abi: iErc8183JobAbi,
+        functionName: "claimRefund",
+        args: [jobId],
+      }),
+    });
+    await this.mined(h, "claimRefund");
+    return h;
+  }
+
+  /**
+   * escrowState — the five facts a refund decision needs, read from the chain.
+   *
+   * THE CHAIN IS THE RECORD, not our row: a job row that says `failed` says nothing about where
+   * the money is, and the same escrow may have been rejected, expired or completed by somebody
+   * else since. `status` decides what may be sent, `expiredAt` decides whether `claimRefund` is
+   * open yet, `budget` and `client` are what is at stake and who gets it — and `evaluator` is WHO
+   * MAY REJECT IT, which is not the same question as which evaluator key this process happens to
+   * hold: a job created before that key existed names the client, and a reject from anyone else
+   * reverts (`jobs/refund.ts`).
+   */
+  async escrowState(jobId: bigint): Promise<{
+    status: number;
+    budget: bigint;
+    expiredAt: bigint;
+    client: Address;
+    evaluator: Address;
+  }> {
+    const j = await this.getJob(jobId);
+    return {
+      status: j.status,
+      budget: j.budget,
+      expiredAt: j.expiredAt,
+      client: j.client,
+      evaluator: j.evaluator,
+    };
+  }
+
+  /**
    * usdcBalanceOf — read the current USDC balance of `owner` on-chain.
    * Used in Step 4.5 of the runJob saga to sweep the operator's actual balance
    * rather than the static budget (which may have been partially consumed by gas).

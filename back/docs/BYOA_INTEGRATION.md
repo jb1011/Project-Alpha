@@ -52,7 +52,7 @@ scope**:
 | Capability   | Grants |
 |--------------|--------|
 | `read`       | the read tools only |
-| `earn`       | read + `run_job` |
+| `earn`       | read + `run_job`, `refund_job` |
 | `spend`      | read + earn + `pay` |
 | `provision`  | spend + platform-funded provisioning (`fund_treasury`, `onboard_agent`) |
 
@@ -104,6 +104,12 @@ a tool argument) and return a uniform "not found" on any ownership/scope miss.
 **Earn** (`earn`+):
 - `run_job(id, budgetUsdc?)` — the agent earns USDC + reputation by running an ERC-8183 job (self-contained
   v1: the platform stands in for the client + evaluator). Returns `{ jobKey, status }`; poll `get_job`.
+- `refund_job(jobKey)` — recover the escrow of a job of yours that funded and then failed. The saga already
+  attempts this by itself, and every API boot retries the jobs still owed one, so this is for the case
+  neither covered yet (an expiry that had not arrived, a refund that reverted). It reads the chain first and
+  sends nothing when there is nothing to recover, so calling it twice is safe; the outcome names what was
+  found (`refunded`, `released`, `waiting-expiry`, `nothing-escrowed`). `get_job` then shows `escrowState`
+  and `refundTxHash`.
 
 **Spend** (`spend`):
 - `pay(id, to, amountUsdc, idempotencyKey)` — pay an **x402 resource URL** with USDC, within the treasury's

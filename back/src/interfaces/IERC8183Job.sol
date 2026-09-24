@@ -36,4 +36,18 @@ interface IERC8183Job {
     function fund(uint256 jobId, bytes calldata optParams) external;
     function submit(uint256 jobId, bytes32 deliverable, bytes calldata optParams) external;
     function complete(uint256 jobId, bytes32 reason, bytes calldata optParams) external;
+
+    // ── The two ways an escrow goes BACK to the client ───────────────────────────────────────
+    //
+    // Both selectors verified present in the deployed implementation's bytecode (2026-09-24):
+    // reject(uint256,bytes32,bytes) = 0x41dd26f5, claimRefund(uint256) = 0x5b7baf64. The
+    // `string`-reason overload of reject is NOT there, so this is the only shape that exists.
+
+    /// @dev The CLIENT may reject an Open job; the EVALUATOR a Funded or Submitted one. A
+    ///      Funded/Submitted reject refunds the client and sets status Rejected=4.
+    function reject(uint256 jobId, bytes32 reason, bytes calldata optParams) external;
+
+    /// @dev Permissionless: ANYONE may expire a Funded or Submitted job once `expiredAt` has
+    ///      passed. The budget goes back to the CLIENT (never to the caller); status Expired=5.
+    function claimRefund(uint256 jobId) external;
 }

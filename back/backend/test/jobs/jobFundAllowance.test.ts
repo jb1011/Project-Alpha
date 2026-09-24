@@ -17,7 +17,12 @@
  */
 import { beforeEach, expect, test } from "vitest";
 import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
-import { jobClientAccount, jobFundHarness } from "../helpers/jobFundHarness";
+import {
+  OPENING_BALANCE,
+  evaluatorAccount,
+  jobClientAccount,
+  jobFundHarness,
+} from "../helpers/jobFundHarness";
 
 beforeEach(() => resetSenderNonces());
 
@@ -34,34 +39,53 @@ test("two concurrent jobs on two entities take the one allowance in turn, and bo
   ]);
 
   // THE SEQUENCE. Not approve, approve, fund, fund — and no revert anywhere.
-  expect(h.node.actions.map((a) => `${a.call}:${a.status}`)).toEqual([
-    "approve:success",
-    "fund:success",
-    "approve:success",
-    "fund:success",
+  //
+  // Filtered to the FUNDING calls, because each saga also gets its escrow back once the harness's
+  // worker throws, and the two rejects race each other: A's refund is sent while B is still
+  // inside the allowance unit, so their position in this list is not a fact about the product.
+  // Their count is, and it is asserted right below.
+  expect(
+    h.node.actions.filter((a) => a.call !== "reject").map((a) => `${a.call}:${a.status}`),
+  ).toEqual(["approve:success", "fund:success", "approve:success", "fund:success"]);
+  expect(h.node.actions.filter((a) => a.call === "reject").map((a) => a.status)).toEqual([
+    "success",
+    "success",
   ]);
   // Four sends from the one client key, numbered consecutively: the send lock still owns the
-  // nonces, and the allowance lock did not cost a single extra transaction.
-  expect(h.node.sends).toHaveLength(4);
+  // nonces, and the allowance lock did not cost a single extra transaction. The two refunds are
+  // the EVALUATOR's key, which is its own nonce space.
+  expect(h.node.sendsFrom(jobClientAccount.address)).toHaveLength(4);
   expect(h.node.sendsFrom(jobClientAccount.address).map((s) => s.nonce)).toEqual([0, 1, 2, 3]);
+  expect(h.node.sendsFrom(evaluatorAccount.address).map((s) => s.nonce)).toEqual([0, 1]);
+  expect(h.node.sends).toHaveLength(6);
 
-  // Both jobs funded, and each contract escrow holds its own budget.
+  // Both jobs funded — and then refunded, because nothing here gets past the worker. Each escrow
+  // was filled by its own fund (the sequence above) and emptied by its own reject, and the
+  // client's balance is the round trip: two budgets out, two budgets back.
   expect(h.jobs.findByKey("t:a")!.status).toBe("funded");
   expect(h.jobs.findByKey("t:b")!.status).toBe("funded");
-  expect(h.node.escrowOf(1n)).toBe(500_000n);
-  expect(h.node.escrowOf(2n)).toBe(500_000n);
+  expect(h.jobs.findByKey("t:a")!.escrowState).toBe("refunded");
+  expect(h.jobs.findByKey("t:b")!.escrowState).toBe("refunded");
+  expect(h.node.escrowOf(1n)).toBe(0n);
+  expect(h.node.escrowOf(2n)).toBe(0n);
+  expect(h.node.balanceOf(jobClientAccount.address)).toBe(OPENING_BALANCE);
   // The allowance is spent to the last unit: each fund pulled exactly what its approve granted.
   expect(h.node.allowanceOf(jobClientAccount.address, h.adapter.jobContract)).toBe(0n);
 
-  // Booked twice, once per transfer that actually happened, against the two fund hashes.
+  // Booked twice, once per transfer that actually happened, against the two fund hashes — named
+  // as the funds they are, not as positions in a list the refunds also appear in.
+  const [fundA, fundB] = h.node.hashesOf("fund");
   expect(h.outflows).toEqual([
-    { path: "job_fund", amountAtomic: 500_000n, ref: h.node.sends[1]!.hash },
-    { path: "job_fund", amountAtomic: 500_000n, ref: h.node.sends[3]!.hash },
+    { path: "job_fund", amountAtomic: 500_000n, ref: fundA },
+    { path: "job_fund", amountAtomic: 500_000n, ref: fundB },
   ]);
   // …and each row carries the hash of the fund that filled ITS escrow.
   expect([h.jobs.findByKey("t:a")!.fundTxHash, h.jobs.findByKey("t:b")!.fundTxHash].sort()).toEqual(
-    [h.node.sends[1]!.hash, h.node.sends[3]!.hash].sort(),
+    [fundA, fundB].sort(),
   );
+  // Nothing was booked BACK: the outflow meter has no reversal, and a refund deliberately leaves
+  // the rolling brake more conservative than the truth rather than inventing a credit.
+  expect(h.outflows).toHaveLength(2);
 });
 
 test("an allowance that does not cover the budget stops the fund before it is sent", async () => {

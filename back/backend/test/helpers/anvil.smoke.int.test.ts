@@ -1,3 +1,4 @@
+import { createServer } from "node:net";
 import { http, createPublicClient, createWalletClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, expect, test } from "vitest";
@@ -30,6 +31,40 @@ test("a fresh chain starts with NO nonce floors — the 2026-09-22 CI timeout", 
   // drops every floor as it resolves, and this is the line that fails if that ever goes away.
   expect(floorsAfterStart).toBe(0);
 });
+
+/**
+ * A PORT THAT IS ALREADY ANSWERING IS SOMEBODY ELSE'S CHAIN, AND THE SUITE MUST SAY SO.
+ *
+ * The spawner used to resolve as soon as ANYTHING on the port answered `eth_chainId`. A second
+ * anvil cannot bind a taken port, so a stale process left behind by another session (or a crashed
+ * run) silently became every later test's chain — with its old contracts, its old balances and
+ * its old nonces, and nothing in the output to say the tests were not running against a fresh
+ * one. The failure mode is the worst kind: green tests about state nobody wrote.
+ */
+test("startAnvil refuses a port that is already in use, and names it", async () => {
+  // `anvil` from beforeAll is live on 8545, which is exactly the situation being refused.
+  await expect(startAnvil(8545)).rejects.toThrow(/already .*127\.0\.0\.1:8545/);
+}, 30_000);
+
+test("startAnvil refuses a port held by a process that never answers, and does not hang", async () => {
+  // The hole a JSON-RPC probe leaves: something can hold the port, accept the connection and
+  // never reply (a wedged node, a tunnel, a debugger). `fetch` then waits for ever and the guard
+  // never gets to speak. One transient non-200 did the same damage in reverse — the probe read it
+  // as "nothing there" and handed back a chain the squatter was answering. So the question is
+  // TCP: if the connection is accepted, the port is taken, whatever comes back.
+  const silent = createServer(() => {
+    /* accept the socket and never answer */
+  });
+  await new Promise<void>((r) => silent.listen(8547, "127.0.0.1", r));
+  try {
+    const started = Date.now();
+    await expect(startAnvil(8547)).rejects.toThrow(/already .*127\.0\.0\.1:8547/);
+    // Bounded: the refusal arrives, it does not wait out a chain that will never answer.
+    expect(Date.now() - started).toBeLessThan(10_000);
+  } finally {
+    await new Promise<void>((r) => silent.close(() => r()));
+  }
+}, 30_000);
 
 test("anvil starts and the full stack deploys", async () => {
   const transport = http(anvil.rpcUrl);

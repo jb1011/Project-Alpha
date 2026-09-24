@@ -95,6 +95,9 @@ export interface ApiDeps extends EntityViewDeps {
   jobRunner?: import("../jobs/jobRunner").JobRunner;
   jobClientAddress?: string;
   jobEvaluatorAddress?: string;
+  /** Get one job's escrow back (`jobs/refund.ts`) — the same optional half: a refund is a
+   *  transaction, so with no job client key there is no key to send it with. */
+  refundJob?: (jobKey: string) => Promise<import("../jobs/refund").RecoverOutcome>;
   /** Audit fix A: caps on run_job to stop an earn-capability agent from draining the platform's
    *  job-funding wallet via a loop of large-budget or many-in-flight jobs. */
   maxJobBudget: bigint;

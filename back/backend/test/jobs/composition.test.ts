@@ -117,6 +117,36 @@ test("buildJobDeps returns the expected interface without network calls", () => 
   expect(deps.jobRunner).toBeDefined();
 });
 
+/**
+ * ONE RECOVERY, SHARED BY EVERY CALLER.
+ *
+ * `runJob` and `JobRunner` both take the recovery as an OPTIONAL dependency (the fake-deps test
+ * compositions have no escrow to get back and pass none), and an optional dependency the
+ * composition root forgets is a feature that silently does not exist on the box. So this holds
+ * both halves of the real wiring: the callable surface (`refundJob`, behind the MCP tool and the
+ * CLI) exists, and the boot walk's copy is the SAME function — two differently-wired copies is
+ * how two callers come to disagree about where a job's money went.
+ */
+test("buildJobDeps wires the escrow recovery into the runner and exposes it as refundJob", async () => {
+  const cfg = makeConfig();
+  const db = makeDb();
+  const entities = new SqliteEntityRepository(db);
+
+  const deps = buildJobDeps(cfg, db, entities, fakeDocStore);
+
+  expect(typeof deps.refundJob).toBe("function");
+  // Reaching into the runner's own dependency is deliberate: the alternative is trusting that a
+  // field nobody can observe was passed, which is the thing that goes wrong.
+  const runnerDeps = (
+    deps.jobRunner as unknown as { deps: { recoverEscrow?: (k: string) => unknown } }
+  ).deps;
+  expect(runnerDeps.recoverEscrow).toBe(deps.refundJob);
+
+  // And it is the real recovery, bound to THIS database: asked about a job that is not there, it
+  // says so rather than reaching for a chain.
+  await expect(deps.refundJob?.("t:nope")).rejects.toThrow("recoverEscrow: job t:nope not found");
+});
+
 test("buildJobDeps falls back evaluator address to client address when no evaluator key", () => {
   const cfg = { ...makeConfig(), jobEvaluatorPrivateKey: undefined };
   const db = makeDb();
@@ -150,6 +180,8 @@ test("buildJobDeps builds no client wallet — and never the platform key's — 
   expect(deps.jobRunner).toBeUndefined();
   expect(deps.jobAdapter).toBeUndefined();
   expect(deps.reputationAdapter).toBeUndefined();
+  // No client key, no refund either: the refund is a send, and there is no key to send it with.
+  expect(deps.refundJob).toBeUndefined();
   // The whole point: nothing here is the platform account, by any route.
   const platform = privateKeyToAccount(PLATFORM_KEY).address.toLowerCase();
   expect(deps.jobClientAddress).not.toBe(platform);

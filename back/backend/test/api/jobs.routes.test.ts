@@ -308,6 +308,8 @@ test("read-only job routes keep working with no job client configured", async ()
     completeTxHash: null,
     sweepTxHash: null,
     reputationTxHash: null,
+    refundTxHash: null,
+    escrowState: null,
     error: null,
     createdAt: null,
     updatedAt: null,
