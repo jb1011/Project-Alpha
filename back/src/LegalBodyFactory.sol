@@ -222,7 +222,10 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     ///         this chain; it names a body this factory created; that body names this agentId
     ///         and is Active; and the identity still belongs to the owner who signed the link.
     ///         The pointer is written by the identity owner, so it can hold any bytes: this
-    ///         function decodes by hand and never reverts, whatever it finds.
+    ///         function decodes by hand and never reverts on anything the identity owner can
+    ///         write under the pointer key. It does rely on the registry itself returning
+    ///         well-formed data: a registry that answered with undecodable return data could
+    ///         still make it revert.
     function linkedLegalBody(uint256 agentId) external view returns (address) {
         bytes memory pointer;
         try identityRegistry.getMetadata(agentId, POINTER_KEY) returns (bytes memory p) {
