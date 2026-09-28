@@ -65,6 +65,13 @@ abstract contract LegalBodyFactoryTestBase is Test {
         body = factory.createLegalBody(agentId, guardian, DELAY, OA, deadline, sig);
     }
 
+    /// @dev Gives `account` the code an EIP-7702 delegation leaves on an EOA: the designator
+    ///      0xef0100 followed by the delegate's address. The delegate here has no ERC-1271.
+    function _delegate7702(address account) internal {
+        vm.etch(account, abi.encodePacked(hex"ef0100", makeAddr("batchDelegate")));
+        assertEq(account.code.length, 23);
+    }
+
     function _expectCreateRevert(
         bytes memory err,
         address g,
@@ -376,6 +383,29 @@ contract LegalBodyFactoryCreateTest is LegalBodyFactoryTestBase {
         factory.createLegalBody(walletAgent, guardian, DELAY, OA, d2, sig2);
     }
 
+    /// An EIP-7702 delegated owner signs the link with its own EOA key, as the identity
+    /// registry already accepts for it.
+    function test_create_eip7702OwnerSignsWithItsKey() public {
+        uint256 pk7702 = 0x7702;
+        address owner7702 = vm.addr(pk7702);
+        vm.prank(owner7702); // registered while still a plain EOA: the mint's receiver check needs no code
+        uint256 id = registry.register("ipfs://7702");
+        _delegate7702(owner7702);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _sign(pk7702, factory.linkDigest(id, guardian, DELAY, OA, deadline));
+        vm.prank(novi);
+        address body = factory.createLegalBody(id, guardian, DELAY, OA, deadline, sig);
+        assertEq(factory.identityOwnerAtCreation(body), owner7702);
+
+        // Another key still cannot sign for it.
+        uint256 d2 = block.timestamp + 2 hours;
+        bytes memory bad = _sign(0xBAD, factory.linkDigest(id, guardian, DELAY, OA, d2));
+        vm.prank(novi);
+        vm.expectRevert(LegalBodyFactory.BadSignature.selector);
+        factory.createLegalBody(id, guardian, DELAY, OA, d2, bad);
+    }
+
     function test_create_unknownAgentIdReverts() public {
         uint256 deadline = block.timestamp + 1 hours;
         bytes memory sig = _signLink(ownerPk, 999, guardian, DELAY, OA, deadline);
@@ -606,6 +636,27 @@ contract LegalBodyFactoryAmendmentTest is LegalBodyFactoryTestBase {
     function test_executeZeroHashReverts() public {
         vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotPendingAmendment.selector, bytes32(0)));
         factory.executeOperatingAgreementUpdate(body, bytes32(0));
+    }
+
+    /// An EIP-7702 delegated guardian approves an amendment with its own EOA key.
+    function test_eip7702GuardianSignsAmendment() public {
+        uint256 pk7702 = 0x7702;
+        address guardian7702 = vm.addr(pk7702);
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory link = _signLink(ownerPk, agentId, guardian7702, DELAY, OA, deadline);
+        vm.prank(novi);
+        address gBody = factory.createLegalBody(agentId, guardian7702, DELAY, OA, deadline, link);
+        _delegate7702(guardian7702);
+
+        bytes memory bad = _sign(0xBAD, factory.amendmentDigest(gBody, NEW, 0, deadline));
+        vm.prank(novi);
+        vm.expectRevert(LegalBodyFactory.BadSignature.selector);
+        factory.scheduleOperatingAgreementUpdate(gBody, NEW, deadline, bad);
+
+        bytes memory sig = _sign(pk7702, factory.amendmentDigest(gBody, NEW, 0, deadline));
+        vm.prank(novi);
+        factory.scheduleOperatingAgreementUpdate(gBody, NEW, deadline, sig);
+        assertEq(factory.pendingAmendment(gBody), NEW);
     }
 
     function test_erc1271Guardian() public {

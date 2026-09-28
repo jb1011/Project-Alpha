@@ -6,6 +6,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {LegalManager} from "./LegalManager.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
@@ -122,7 +123,7 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
 
         address identityOwner = identityRegistry.ownerOf(agentId);
         bytes32 digest = linkDigest(agentId, guardian, amendmentDelay, operatingAgreementHash, deadline);
-        if (!SignatureChecker.isValidSignatureNow(identityOwner, digest, signature)) revert BadSignature();
+        if (!_isValidSignature(identityOwner, digest, signature)) revert BadSignature();
 
         address predicted = predictLegalBody(digest);
         if (predicted.code.length != 0) revert LegalBodyExists(predicted);
@@ -156,7 +157,7 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
         uint256 nonce = amendmentNonce[legalBody];
         address guardian = LegalManager(payable(legalBody)).guardian();
         bytes32 digest = amendmentDigest(legalBody, newHash, nonce, deadline);
-        if (!SignatureChecker.isValidSignatureNow(guardian, digest, guardianSignature)) revert BadSignature();
+        if (!_isValidSignature(guardian, digest, guardianSignature)) revert BadSignature();
         amendmentNonce[legalBody] = nonce + 1;
         pendingAmendment[legalBody] = newHash;
         LegalManager(payable(legalBody)).scheduleOperatingAgreementUpdate(newHash);
@@ -283,6 +284,18 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
                 revert NotImplementation(implementation_);
             }
         }
+    }
+
+    /// @dev ECDSA first, then ERC-1271: the same rule the ERC-8004 identity registry uses. A
+    ///      plain ECDSA signature from `signer`'s own key is accepted even when `signer` has
+    ///      code, which is what an EIP-7702 delegated account looks like; its own key controls
+    ///      it. This is safe for ordinary contracts, because no one holds a key for a contract
+    ///      address. Otherwise a contract signer is asked through ERC-1271.
+    function _isValidSignature(address signer, bytes32 digest, bytes calldata signature) internal view returns (bool) {
+        (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
+        if (err == ECDSA.RecoverError.NoError && recovered == signer) return true;
+        if (signer.code.length != 0) return SignatureChecker.isValidERC1271SignatureNow(signer, digest, signature);
+        return false;
     }
 
     function _checkDeadline(uint256 deadline) internal view {
