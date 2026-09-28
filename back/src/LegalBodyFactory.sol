@@ -29,6 +29,9 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
         "LegalBodyLink(uint256 agentId,address guardian,uint256 amendmentDelay,bytes32 operatingAgreementHash,uint256 deadline)"
     );
 
+    bytes32 public constant AMENDMENT_TYPEHASH =
+        keccak256("OperatingAgreementUpdate(address legalBody,bytes32 newHash,uint256 nonce,uint256 deadline)");
+
     /// @notice Amendments and dissolutions wait at least this long, so the guardian always has
     ///         two days to react.
     uint256 public constant MIN_AMENDMENT_DELAY = 48 hours;
@@ -45,6 +48,9 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     ///         factory created the body.
     mapping(address => address) public identityOwnerAtCreation;
 
+    /// @notice body => the nonce the guardian's next amendment signature must carry.
+    mapping(address => uint256) public amendmentNonce;
+
     event LegalBodyCreated(
         uint256 indexed agentId,
         address indexed legalBody,
@@ -59,6 +65,7 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     error BadSignature();
     error LegalBodyExists(address legalBody);
     error NotContract(address account);
+    error NotLegalBody(address account);
     error OwnershipRenounceDisabled();
 
     /// @param implementation_   the deployed LegalManager logic contract every body clones
@@ -109,6 +116,48 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
         );
         identityOwnerAtCreation[legalBody] = identityOwner;
         emit LegalBodyCreated(agentId, legalBody, identityOwner, guardian, digest);
+    }
+
+    // ------------------------------------------------------------------
+    // Amendments: guardian-signed, platform-recorded, guardian-vetoable
+    // ------------------------------------------------------------------
+
+    /// @notice Schedule an operating-agreement amendment the body's guardian signed.
+    /// @dev    Both parties are needed. The platform alone cannot amend (it needs the
+    ///         guardian's signature), and the guardian alone cannot either (only the owner
+    ///         schedules), so the anchored agreement changes only when both agree. The body
+    ///         still enforces its delay, and the guardian can still veto during it.
+    function scheduleOperatingAgreementUpdate(
+        address legalBody,
+        bytes32 newHash,
+        uint256 deadline,
+        bytes calldata guardianSignature
+    ) external onlyOwner {
+        if (!isLegalBody(legalBody)) revert NotLegalBody(legalBody);
+        _checkDeadline(deadline);
+        uint256 nonce = amendmentNonce[legalBody];
+        address guardian = LegalManager(payable(legalBody)).guardian();
+        bytes32 digest = amendmentDigest(legalBody, newHash, nonce, deadline);
+        if (!SignatureChecker.isValidSignatureNow(guardian, digest, guardianSignature)) revert BadSignature();
+        amendmentNonce[legalBody] = nonce + 1;
+        LegalManager(payable(legalBody)).scheduleOperatingAgreementUpdate(newHash);
+    }
+
+    /// @notice Execute a scheduled amendment once its delay has passed. Callable by anyone:
+    ///         the body only executes a hash that was scheduled, not vetoed, and has waited out
+    ///         the delay, so nobody can hold back a guardian-approved amendment.
+    function executeOperatingAgreementUpdate(address legalBody, bytes32 newHash) external {
+        if (!isLegalBody(legalBody)) revert NotLegalBody(legalBody);
+        LegalManager(payable(legalBody)).executeOperatingAgreementUpdate(newHash);
+    }
+
+    /// @notice The EIP-712 digest the guardian signs to approve an amendment.
+    function amendmentDigest(address legalBody, bytes32 newHash, uint256 nonce, uint256 deadline)
+        public
+        view
+        returns (bytes32)
+    {
+        return _hashTypedDataV4(keccak256(abi.encode(AMENDMENT_TYPEHASH, legalBody, newHash, nonce, deadline)));
     }
 
     // ------------------------------------------------------------------

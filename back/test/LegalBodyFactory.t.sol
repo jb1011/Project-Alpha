@@ -7,6 +7,7 @@ import {LegalManager} from "../src/LegalManager.sol";
 import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 import {MockERC1271Wallet} from "./mocks/MockERC1271Wallet.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 abstract contract LegalBodyFactoryTestBase is Test {
     MockIdentityRegistry internal registry;
@@ -344,5 +345,200 @@ contract LegalBodyFactoryCreateTest is LegalBodyFactoryTestBase {
         factory.createLegalBody(agentId, guardian, DELAY, OA, deadline, sig);
         uint256 used = before - gasleft();
         assertLt(used, 320_000, "createLegalBody grew; re-measure and justify");
+    }
+}
+
+contract LegalBodyFactoryAmendmentTest is LegalBodyFactoryTestBase {
+    address internal body;
+    bytes32 internal constant NEW = keccak256("oa-manifest-v2");
+
+    function setUp() public override {
+        super.setUp();
+        body = _create();
+    }
+
+    function _signAmendment(uint256 pk, address lb, bytes32 h, uint256 nonce, uint256 deadline)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return _sign(pk, factory.amendmentDigest(lb, h, nonce, deadline));
+    }
+
+    function _schedule(bytes32 h) internal {
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _signAmendment(guardianPk, body, h, factory.amendmentNonce(body), deadline);
+        vm.prank(novi);
+        factory.scheduleOperatingAgreementUpdate(body, h, deadline, sig);
+    }
+
+    function test_amendmentDigest_matchesIndependentEncoding() public view {
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 typeHash =
+            keccak256("OperatingAgreementUpdate(address legalBody,bytes32 newHash,uint256 nonce,uint256 deadline)");
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("Novi LegalBodyFactory")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(factory)
+            )
+        );
+        bytes32 structHash = keccak256(abi.encode(typeHash, body, NEW, uint256(0), deadline));
+        assertEq(
+            factory.amendmentDigest(body, NEW, 0, deadline),
+            keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash))
+        );
+        assertEq(factory.AMENDMENT_TYPEHASH(), typeHash);
+    }
+
+    function test_schedule_thenStrangerExecutesAfterDelay() public {
+        _schedule(NEW);
+        assertEq(factory.amendmentNonce(body), 1);
+        assertEq(LegalManager(payable(body)).scheduledAt(NEW), block.timestamp + DELAY);
+
+        vm.prank(stranger);
+        vm.expectRevert(LegalManager.TooEarly.selector);
+        factory.executeOperatingAgreementUpdate(body, NEW);
+
+        vm.warp(block.timestamp + DELAY);
+        vm.prank(stranger); // permissionless: nobody can sit on a guardian-approved amendment
+        factory.executeOperatingAgreementUpdate(body, NEW);
+        (,, bytes32 oaHash,) = LegalManager(payable(body)).meta();
+        assertEq(oaHash, NEW);
+    }
+
+    function test_schedule_onlyOwner() public {
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _signAmendment(guardianPk, body, NEW, 0, deadline);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sig);
+    }
+
+    function test_schedule_requiresGuardianSignature() public {
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256[2] memory wrongKeys = [ownerPk, uint256(0xBAD)];
+        for (uint256 i = 0; i < wrongKeys.length; i++) {
+            bytes memory sig = _signAmendment(wrongKeys[i], body, NEW, 0, deadline);
+            vm.prank(novi);
+            vm.expectRevert(LegalBodyFactory.BadSignature.selector);
+            factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sig);
+        }
+        // Signed for a different hash, nonce or body.
+        bytes memory otherHash = _signAmendment(guardianPk, body, keccak256("x"), 0, deadline);
+        bytes memory otherNonce = _signAmendment(guardianPk, body, NEW, 1, deadline);
+        address otherBody = _createWith(block.timestamp + 2 hours);
+        bytes memory forOtherBody = _signAmendment(guardianPk, otherBody, NEW, 0, deadline);
+        bytes[3] memory sigs = [otherHash, otherNonce, forOtherBody];
+        for (uint256 i = 0; i < sigs.length; i++) {
+            vm.prank(novi);
+            vm.expectRevert(LegalBodyFactory.BadSignature.selector);
+            factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sigs[i]);
+        }
+    }
+
+    function test_schedule_signatureCannotBeReplayed() public {
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _signAmendment(guardianPk, body, NEW, 0, deadline);
+        vm.prank(novi);
+        factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sig);
+        vm.prank(novi);
+        vm.expectRevert(LegalBodyFactory.BadSignature.selector); // nonce moved to 1
+        factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sig);
+    }
+
+    function test_schedule_deadlineWindow() public {
+        uint256 tooFar = block.timestamp + 24 hours + 1;
+        bytes memory sig = _signAmendment(guardianPk, body, NEW, 0, tooFar);
+        vm.prank(novi);
+        vm.expectRevert(LegalBodyFactory.BadDeadline.selector);
+        factory.scheduleOperatingAgreementUpdate(body, NEW, tooFar, sig);
+    }
+
+    function test_schedule_andExecute_refuseForeignBodies() public {
+        LegalManager foreign = LegalManager(payable(Clones_clone(address(impl))));
+        foreign.initialize(address(factory), guardian, DELAY, agentId, "", 0, OA); // look-alike naming us as manager
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _signAmendment(guardianPk, address(foreign), NEW, 0, deadline);
+        vm.prank(novi);
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotLegalBody.selector, address(foreign)));
+        factory.scheduleOperatingAgreementUpdate(address(foreign), NEW, deadline, sig);
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotLegalBody.selector, address(foreign)));
+        factory.executeOperatingAgreementUpdate(address(foreign), NEW);
+    }
+
+    function test_guardianVetoAfterScheduleBlocksExecute() public {
+        _schedule(NEW);
+        vm.prank(guardian);
+        LegalManager(payable(body)).cancelOperatingAgreementUpdate(NEW);
+        vm.warp(block.timestamp + DELAY);
+        vm.expectRevert(LegalManager.NotScheduled.selector);
+        factory.executeOperatingAgreementUpdate(body, NEW);
+        // A vetoed hash cannot be scheduled again, even with a fresh guardian signature...
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory sig = _signAmendment(guardianPk, body, NEW, factory.amendmentNonce(body), deadline);
+        vm.prank(novi);
+        vm.expectRevert(LegalManager.Vetoed.selector);
+        factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sig);
+        // ...until the guardian lifts the veto; then a signature for the current nonce works.
+        vm.prank(guardian);
+        LegalManager(payable(body)).liftVeto(NEW);
+        vm.prank(novi);
+        factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sig);
+    }
+
+    function test_erc1271Guardian() public {
+        uint256 walletSignerPk = 0xD00D;
+        MockERC1271Wallet gWallet = new MockERC1271Wallet(vm.addr(walletSignerPk));
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory link = _signLink(ownerPk, agentId, address(gWallet), DELAY, OA, deadline);
+        vm.prank(novi);
+        address wBody = factory.createLegalBody(agentId, address(gWallet), DELAY, OA, deadline, link);
+        bytes memory sig = _sign(walletSignerPk, factory.amendmentDigest(wBody, NEW, 0, deadline));
+        vm.prank(novi);
+        factory.scheduleOperatingAgreementUpdate(wBody, NEW, deadline, sig);
+        assertEq(factory.amendmentNonce(wBody), 1);
+    }
+
+    function test_factoryExposesNoDissolutionSweepOrVetoPath() public {
+        string memory json = vm.readFile("out/LegalBodyFactory.sol/LegalBodyFactory.json");
+        string[] memory sigs = vm.parseJsonKeys(json, ".methodIdentifiers");
+        for (uint256 i = 0; i < sigs.length; i++) {
+            bytes memory s = bytes(sigs[i]);
+            assertFalse(_contains(s, "issolution"), sigs[i]);
+            assertFalse(_contains(s, "weep"), sigs[i]);
+            assertFalse(_contains(s, "eto"), sigs[i]);
+            assertFalse(_contains(s, "cancel"), sigs[i]);
+        }
+        // Behavioural half: the body's manager-only dissolution powers are unreachable.
+        vm.prank(novi);
+        vm.expectRevert(LegalManager.NotAuthorized.selector);
+        LegalManager(payable(body)).initiateDissolution();
+        vm.prank(guardian);
+        LegalManager(payable(body)).initiateDissolution();
+        vm.prank(guardian); // the initiator cannot cancel, and the manager (the factory) never will
+        vm.expectRevert(LegalManager.NotAuthorized.selector);
+        LegalManager(payable(body)).cancelDissolution();
+    }
+
+    function _contains(bytes memory hay, bytes memory needle) internal pure returns (bool) {
+        if (needle.length > hay.length) return false;
+        for (uint256 i = 0; i <= hay.length - needle.length; i++) {
+            bool m = true;
+            for (uint256 j = 0; j < needle.length; j++) {
+                if (hay[i + j] != needle[j]) {
+                    m = false;
+                    break;
+                }
+            }
+            if (m) return true;
+        }
+        return false;
+    }
+
+    function Clones_clone(address implementation_) internal returns (address) {
+        return Clones.clone(implementation_);
     }
 }
