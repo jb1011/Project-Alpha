@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {ControllerRelayHarness} from "./helpers/ControllerRelayHarness.sol";
+import {ControllerSelectors} from "../src/libraries/ControllerSelectors.sol";
 import {NoviController} from "../src/NoviController.sol";
 import {BreakGlassOneShot} from "../src/BreakGlassOneShot.sol";
 import {AgentTreasury} from "../src/AgentTreasury.sol";
@@ -739,12 +740,16 @@ contract NoviControllerDisjointnessTest is ControllerTestBase {
     function _relayedSelectors() internal pure returns (bytes4[] memory s) {
         bytes4[] memory granted = _grantedSelectors();
         bytes4[] memory bg = _breakGlassSelectors();
-        s = new bytes4[](granted.length + bg.length);
+        bytes4[] memory minimal = ControllerSelectors.minimalGrants();
+        s = new bytes4[](granted.length + bg.length + minimal.length);
         for (uint256 i = 0; i < granted.length; i++) {
             s[i] = granted[i];
         }
         for (uint256 i = 0; i < bg.length; i++) {
             s[granted.length + i] = bg[i];
+        }
+        for (uint256 i = 0; i < minimal.length; i++) {
+            s[granted.length + bg.length + i] = minimal[i];
         }
     }
 
@@ -756,7 +761,10 @@ contract NoviControllerDisjointnessTest is ControllerTestBase {
         // Counts are derived, never pinned: the local set is whatever the artifact says the
         // controller's ABI is, and the relayed set is the two design §3 lists concatenated.
         assertGt(local.length, 0, "controller artifact carried no methodIdentifiers");
-        assertEq(relayed.length, _grantedSelectors().length + _breakGlassSelectors().length);
+        assertEq(
+            relayed.length,
+            _grantedSelectors().length + _breakGlassSelectors().length + ControllerSelectors.minimalGrants().length
+        );
         for (uint256 i = 0; i < local.length; i++) {
             for (uint256 j = 0; j < relayed.length; j++) {
                 assertTrue(local[i] != relayed[j], "local/relayed selector collision");

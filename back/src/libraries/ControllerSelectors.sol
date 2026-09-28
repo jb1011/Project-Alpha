@@ -5,6 +5,7 @@ import {AgentTreasury} from "../AgentTreasury.sol";
 import {LegalManager} from "../LegalManager.sol";
 import {LegalManagerFactory} from "../LegalManagerFactory.sol";
 import {IIdentityRegistry} from "../interfaces/IIdentityRegistry.sol";
+import {LegalBodyFactory} from "../LegalBodyFactory.sol";
 
 /// @title ControllerSelectors
 /// @notice THE definition of the NoviController executor's standing grant set (design §3).
@@ -22,5 +23,16 @@ library ControllerSelectors {
         s[4] = LegalManagerFactory.createEntity.selector;
         s[5] = IIdentityRegistry.setAgentWallet.selector;
         s[6] = IIdentityRegistry.setMetadata.selector;
+    }
+
+    /// @notice The executor's grants for legal bodies whose identities the customer owns. Both
+    ///         are pinned to the LegalBodyFactory (setBoundTarget) BEFORE they are granted, so
+    ///         there is never a moment where they are relayable to another target. They are
+    ///         added by an admin ceremony after the factory is deployed, so they are not part
+    ///         of `granted()`, which is the controller's constructor set.
+    function minimalGrants() internal pure returns (bytes4[] memory s) {
+        s = new bytes4[](2);
+        s[0] = LegalBodyFactory.createLegalBody.selector;
+        s[1] = LegalBodyFactory.scheduleOperatingAgreementUpdate.selector;
     }
 }
