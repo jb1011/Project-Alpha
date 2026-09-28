@@ -13,7 +13,7 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 
 /// @title LegalBodyFactory
 /// @notice Creates a legal body for an ERC-8004 identity that its customer owns and keeps.
-///         Each body is an immutable EIP-1167 clone of the audited LegalManager implementation,
+///         Each body is an immutable EIP-1167 clone of the existing LegalManager implementation,
 ///         with no treasury. The identity owner authorises the creation with an EIP-712
 ///         `LegalBodyLink`, and later writes a pointer to the body in their own identity's
 ///         metadata. This contract never holds, moves or is approved for any identity.

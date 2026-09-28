@@ -104,7 +104,7 @@ abstract contract ControllerRelayHarness is Test {
         return ret;
     }
 
-    /// @dev The legal-body factory ceremony, in the runbook's order: pin every selector to the
+    /// @dev The legal-body factory ceremony, pins first, then grants: pin every selector to the
     ///      factory first, then grant it to the executor.
     function _minimalCeremony(address factory_) internal {
         bytes4[] memory s = ControllerSelectors.minimalGrants();
