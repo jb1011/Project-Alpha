@@ -49,6 +49,14 @@ contract LegalBodyFactoryRelayTest is ControllerRelayHarness {
         body = abi.decode(_relayOk(executor, address(factory), _createCall(block.timestamp + 1 hours)), (address));
     }
 
+    /// @dev The deploy script labels the printed ceremony by position, so this order is load-bearing.
+    function test_minimalGrantsOrder() public pure {
+        bytes4[] memory s = ControllerSelectors.minimalGrants();
+        assertEq(s.length, 2);
+        assertEq(s[0], LegalBodyFactory.createLegalBody.selector);
+        assertEq(s[1], LegalBodyFactory.scheduleOperatingAgreementUpdate.selector);
+    }
+
     function test_ceremony_pinsAndGrants() public view {
         bytes4[] memory s = ControllerSelectors.minimalGrants();
         for (uint256 i = 0; i < s.length; i++) {
