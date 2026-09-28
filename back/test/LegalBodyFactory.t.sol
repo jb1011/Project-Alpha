@@ -672,15 +672,52 @@ contract LegalBodyFactoryAmendmentTest is LegalBodyFactoryTestBase {
         assertEq(factory.amendmentNonce(wBody), 1);
     }
 
+    /// The factory's whole external surface, exactly. Anything added (a dissolution, sweep,
+    /// veto or cancel path, or anything else) fails this test until it is reviewed and listed.
+    function _expectedSignatures() internal pure returns (string[27] memory) {
+        return [
+            "AMENDMENT_TYPEHASH()",
+            "LINK_TYPEHASH()",
+            "MAX_AMENDMENT_DELAY()",
+            "MAX_SIGNATURE_WINDOW()",
+            "MIN_AMENDMENT_DELAY()",
+            "POINTER_KEY()",
+            "POINTER_VERSION()",
+            "acceptOwnership()",
+            "amendmentDigest(address,bytes32,uint256,uint256)",
+            "amendmentNonce(address)",
+            "createLegalBody(uint256,address,uint256,bytes32,uint256,bytes)",
+            "eip712Domain()",
+            "encodePointer(address)",
+            "executeOperatingAgreementUpdate(address,bytes32)",
+            "identityOwnerAtCreation(address)",
+            "identityRegistry()",
+            "implementation()",
+            "isLegalBody(address)",
+            "linkDigest(uint256,address,uint256,bytes32,uint256)",
+            "linkedLegalBody(uint256)",
+            "owner()",
+            "pendingAmendment(address)",
+            "pendingOwner()",
+            "predictLegalBody(bytes32)",
+            "renounceOwnership()",
+            "scheduleOperatingAgreementUpdate(address,bytes32,uint256,bytes)",
+            "transferOwnership(address)"
+        ];
+    }
+
     function test_factoryExposesNoDissolutionSweepOrVetoPath() public {
         string memory json = vm.readFile("out/LegalBodyFactory.sol/LegalBodyFactory.json");
-        string[] memory sigs = vm.parseJsonKeys(json, ".methodIdentifiers");
-        for (uint256 i = 0; i < sigs.length; i++) {
-            bytes memory s = bytes(sigs[i]);
-            assertFalse(_contains(s, "issolution"), sigs[i]);
-            assertFalse(_contains(s, "weep"), sigs[i]);
-            assertFalse(_contains(s, "eto"), sigs[i]);
-            assertFalse(_contains(s, "cancel"), sigs[i]);
+        string[] memory actual = vm.parseJsonKeys(json, ".methodIdentifiers");
+        string[27] memory expected = _expectedSignatures();
+        // Same size, and every expected signature present exactly once: the two sets are equal.
+        assertEq(actual.length, expected.length, "the factory's external surface changed");
+        for (uint256 i = 0; i < expected.length; i++) {
+            uint256 hits;
+            for (uint256 j = 0; j < actual.length; j++) {
+                if (keccak256(bytes(actual[j])) == keccak256(bytes(expected[i]))) hits++;
+            }
+            assertEq(hits, 1, expected[i]);
         }
         // Behavioural half: the body's manager-only dissolution powers are unreachable.
         vm.prank(novi);
@@ -691,21 +728,6 @@ contract LegalBodyFactoryAmendmentTest is LegalBodyFactoryTestBase {
         vm.prank(guardian); // the initiator cannot cancel, and the manager (the factory) never will
         vm.expectRevert(LegalManager.NotAuthorized.selector);
         LegalManager(payable(body)).cancelDissolution();
-    }
-
-    function _contains(bytes memory hay, bytes memory needle) internal pure returns (bool) {
-        if (needle.length > hay.length) return false;
-        for (uint256 i = 0; i <= hay.length - needle.length; i++) {
-            bool m = true;
-            for (uint256 j = 0; j < needle.length; j++) {
-                if (hay[i + j] != needle[j]) {
-                    m = false;
-                    break;
-                }
-            }
-            if (m) return true;
-        }
-        return false;
     }
 
     function Clones_clone(address implementation_) internal returns (address) {
