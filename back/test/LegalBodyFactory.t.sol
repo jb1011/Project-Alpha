@@ -489,6 +489,78 @@ contract LegalBodyFactoryAmendmentTest is LegalBodyFactoryTestBase {
         factory.scheduleOperatingAgreementUpdate(body, NEW, deadline, sig);
     }
 
+    function _oa() internal view returns (bytes32 h) {
+        (,, h,) = LegalManager(payable(body)).meta();
+    }
+
+    /// The guardian approves A, then approves B to replace it and never vetoes A. Once B has run,
+    /// A must never run, however long anyone waits.
+    function test_supersededAmendmentNeverExecutes() public {
+        bytes32 a = keccak256("oa-v2-with-typo");
+        bytes32 b = keccak256("oa-v2-fixed");
+        _schedule(a);
+        assertEq(factory.pendingAmendment(body), a);
+        vm.warp(block.timestamp + 1 hours);
+        _schedule(b);
+        assertEq(factory.pendingAmendment(body), b, "a new schedule supersedes the older one");
+        vm.warp(block.timestamp + DELAY);
+        factory.executeOperatingAgreementUpdate(body, b);
+        assertEq(_oa(), b);
+
+        vm.warp(block.timestamp + 90 days);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotPendingAmendment.selector, a));
+        factory.executeOperatingAgreementUpdate(body, a);
+        assertEq(_oa(), b, "the agreement never rolls back");
+    }
+
+    /// Both approvals matured at once: nobody can pick the order; only the last one runs.
+    function test_onlyLastScheduledAmendmentExecutes() public {
+        bytes32 a = keccak256("older");
+        bytes32 b = keccak256("newer");
+        _schedule(a);
+        vm.warp(block.timestamp + 1 hours);
+        _schedule(b);
+        vm.warp(block.timestamp + DELAY);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotPendingAmendment.selector, a));
+        factory.executeOperatingAgreementUpdate(body, a);
+        vm.prank(stranger);
+        factory.executeOperatingAgreementUpdate(body, b);
+        assertEq(_oa(), b);
+    }
+
+    function test_executedAmendmentCannotExecuteAgain() public {
+        _schedule(NEW);
+        vm.warp(block.timestamp + DELAY);
+        factory.executeOperatingAgreementUpdate(body, NEW);
+        assertEq(factory.pendingAmendment(body), bytes32(0), "cleared on execution");
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotPendingAmendment.selector, NEW));
+        factory.executeOperatingAgreementUpdate(body, NEW);
+    }
+
+    /// A veto of the pending hash blocks it; the next signed schedule of another hash works.
+    function test_vetoedPendingAmendment_thenNewScheduleWorks() public {
+        _schedule(NEW);
+        vm.prank(guardian);
+        LegalManager(payable(body)).cancelOperatingAgreementUpdate(NEW);
+        vm.warp(block.timestamp + DELAY);
+        vm.expectRevert(LegalManager.NotScheduled.selector);
+        factory.executeOperatingAgreementUpdate(body, NEW);
+
+        bytes32 other = keccak256("oa-manifest-v3");
+        _schedule(other);
+        assertEq(factory.pendingAmendment(body), other);
+        vm.warp(block.timestamp + DELAY);
+        factory.executeOperatingAgreementUpdate(body, other);
+        assertEq(_oa(), other);
+    }
+
+    function test_executeZeroHashReverts() public {
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotPendingAmendment.selector, bytes32(0)));
+        factory.executeOperatingAgreementUpdate(body, bytes32(0));
+    }
+
     function test_erc1271Guardian() public {
         uint256 walletSignerPk = 0xD00D;
         MockERC1271Wallet gWallet = new MockERC1271Wallet(vm.addr(walletSignerPk));

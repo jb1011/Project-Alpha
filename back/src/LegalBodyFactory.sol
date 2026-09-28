@@ -24,6 +24,10 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 ///         Bodies are deterministic clones salted by the link digest: one signature can create
 ///         at most one body. Several bodies may exist for one identity over time. The live one
 ///         is the body the identity owner's pointer names (see `linkedLegalBody`).
+///         Only the amendment scheduled last may execute, and only once: a new schedule
+///         supersedes any older pending one. The body itself never forgets a scheduled hash,
+///         so without this rule anyone could execute a superseded amendment later and roll the
+///         anchored agreement back.
 contract LegalBodyFactory is Ownable2Step, EIP712 {
     bytes32 public constant LINK_TYPEHASH = keccak256(
         "LegalBodyLink(uint256 agentId,address guardian,uint256 amendmentDelay,bytes32 operatingAgreementHash,uint256 deadline)"
@@ -56,6 +60,10 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     /// @notice body => the nonce the guardian's next amendment signature must carry.
     mapping(address => uint256) public amendmentNonce;
 
+    /// @notice body => the only amendment that may execute: the one scheduled last. A new
+    ///         schedule supersedes any older pending one, and executing it clears this slot.
+    mapping(address => bytes32) public pendingAmendment;
+
     event LegalBodyCreated(
         uint256 indexed agentId,
         address indexed legalBody,
@@ -71,6 +79,7 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     error LegalBodyExists(address legalBody);
     error NotContract(address account);
     error NotLegalBody(address account);
+    error NotPendingAmendment(bytes32 newHash);
     error OwnershipRenounceDisabled();
 
     /// @param implementation_   the deployed LegalManager logic contract every body clones
@@ -116,9 +125,8 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
         if (predicted.code.length != 0) revert LegalBodyExists(predicted);
 
         legalBody = Clones.cloneDeterministic(implementation, digest);
-        LegalManager(payable(legalBody)).initialize(
-            address(this), guardian, amendmentDelay, agentId, "", 0, operatingAgreementHash
-        );
+        LegalManager(payable(legalBody))
+            .initialize(address(this), guardian, amendmentDelay, agentId, "", 0, operatingAgreementHash);
         identityOwnerAtCreation[legalBody] = identityOwner;
         emit LegalBodyCreated(agentId, legalBody, identityOwner, guardian, digest);
     }
@@ -131,7 +139,9 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     /// @dev    Both parties are needed. The platform alone cannot amend (it needs the
     ///         guardian's signature), and the guardian alone cannot either (only the owner
     ///         schedules), so the anchored agreement changes only when both agree. The body
-    ///         still enforces its delay, and the guardian can still veto during it.
+    ///         still enforces its delay, and the guardian can still veto during it. This hash
+    ///         becomes the body's only pending amendment and supersedes any older one, which
+    ///         can then never execute.
     function scheduleOperatingAgreementUpdate(
         address legalBody,
         bytes32 newHash,
@@ -145,14 +155,20 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
         bytes32 digest = amendmentDigest(legalBody, newHash, nonce, deadline);
         if (!SignatureChecker.isValidSignatureNow(guardian, digest, guardianSignature)) revert BadSignature();
         amendmentNonce[legalBody] = nonce + 1;
+        pendingAmendment[legalBody] = newHash;
         LegalManager(payable(legalBody)).scheduleOperatingAgreementUpdate(newHash);
     }
 
-    /// @notice Execute a scheduled amendment once its delay has passed. Callable by anyone:
+    /// @notice Execute the pending amendment once its delay has passed. Callable by anyone:
     ///         the body only executes a hash that was scheduled, not vetoed, and has waited out
     ///         the delay, so nobody can hold back a guardian-approved amendment.
+    /// @dev    Only `pendingAmendment[legalBody]`, the hash scheduled last, may execute, and
+    ///         only once. A superseded or already executed hash reverts, so no one can choose
+    ///         the order of two approvals or replay an old one to roll the agreement back.
     function executeOperatingAgreementUpdate(address legalBody, bytes32 newHash) external {
         if (!isLegalBody(legalBody)) revert NotLegalBody(legalBody);
+        if (newHash == bytes32(0) || pendingAmendment[legalBody] != newHash) revert NotPendingAmendment(newHash);
+        delete pendingAmendment[legalBody];
         LegalManager(payable(legalBody)).executeOperatingAgreementUpdate(newHash);
     }
 

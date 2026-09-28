@@ -133,6 +133,33 @@ contract LegalBodyFactoryForkTest is ControllerRelayHarness {
         assertEq(oa, h);
     }
 
+    /// The guardian approves A, then B to replace it; B runs. A stranger can never run A later
+    /// to roll the agreement back, on live implementation bytecode through the live controller.
+    function test_fork_supersededAmendmentCannotRollBack() public onlyFork {
+        address body = _createViaLiveController();
+        bytes32[2] memory hs = [keccak256("oa-v2-with-typo"), keccak256("oa-v2-fixed")];
+        for (uint256 i = 0; i < hs.length; i++) {
+            uint256 deadline = block.timestamp + 1 hours;
+            bytes memory gsig = _sig(guardianPk, factory.amendmentDigest(body, hs[i], i, deadline));
+            _relayOk(
+                executor,
+                address(factory),
+                abi.encodeCall(LegalBodyFactory.scheduleOperatingAgreementUpdate, (body, hs[i], deadline, gsig))
+            );
+            vm.warp(block.timestamp + 1 hours);
+        }
+        vm.warp(block.timestamp + DELAY);
+        factory.executeOperatingAgreementUpdate(body, hs[1]);
+
+        vm.warp(block.timestamp + 90 days);
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotPendingAmendment.selector, hs[0]));
+        factory.executeOperatingAgreementUpdate(body, hs[0]);
+        (,, bytes32 oa,) = LegalManager(payable(body)).meta();
+        assertEq(oa, hs[1]);
+    }
+
     function test_fork_liveAdminWithWildcardCannotDissolve() public onlyFork {
         address body = _createViaLiveController();
         bytes32 wildcard = controller.WILDCARD_ROLE(); // read BEFORE the prank
