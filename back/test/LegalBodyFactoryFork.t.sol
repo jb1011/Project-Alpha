@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Test} from "forge-std/Test.sol";
 import {ControllerRelayHarness} from "./helpers/ControllerRelayHarness.sol";
+import {DeployLegalBodyFactory} from "../script/DeployLegalBodyFactory.s.sol";
 import {NoviController} from "../src/NoviController.sol";
 import {LegalBodyFactory} from "../src/LegalBodyFactory.sol";
 import {LegalManager} from "../src/LegalManager.sol";
@@ -160,6 +162,22 @@ contract LegalBodyFactoryForkTest is ControllerRelayHarness {
         assertEq(oa, hs[1]);
     }
 
+    function test_fork_liveImplementationConstructs() public onlyFork {
+        LegalBodyFactory f = new LegalBodyFactory(liveImpl, LIVE_REGISTRY, LIVE_CONTROLLER);
+        assertEq(f.implementation(), liveImpl);
+    }
+
+    /// A live full-product body is a BeaconProxy behind the live, upgradeable beacon. Used as
+    /// the implementation, it would make every clone upgradeable by the beacon's owner.
+    function test_fork_liveFullProductBodyRefusedAsImplementation() public onlyFork {
+        uint256 n = LegalManagerFactory(LIVE_FULL_FACTORY).entitiesCount();
+        require(n > 0, "no live full-product body");
+        address liveBody = LegalManagerFactory(LIVE_FULL_FACTORY).entities(0);
+        assertGt(liveBody.code.length, 0);
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotImplementation.selector, liveBody));
+        new LegalBodyFactory(liveBody, LIVE_REGISTRY, LIVE_CONTROLLER);
+    }
+
     function test_fork_liveAdminWithWildcardCannotDissolve() public onlyFork {
         address body = _createViaLiveController();
         bytes32 wildcard = controller.WILDCARD_ROLE(); // read BEFORE the prank
@@ -177,5 +195,68 @@ contract LegalBodyFactoryForkTest is ControllerRelayHarness {
             _relay(executor, body, abi.encodeCall(LegalManager.scheduleOperatingAgreementUpdate, (keccak256("x"))));
         assertFalse(ok);
         assertEq(ret, abi.encodeWithSelector(LegalManager.NotManager.selector));
+    }
+}
+
+/// @dev Exposes the deploy script's metadata-stripping helper to tests.
+contract DeployLegalBodyFactoryHarness is DeployLegalBodyFactory {
+    function stripMetadata(bytes memory code) external pure returns (bytes memory) {
+        return _stripMetadata(code);
+    }
+}
+
+/// @notice The deploy script's implementation check: runtime code equal to this repo's compiled
+///         LegalManager once the CBOR metadata is dropped. The live comparison only holds for a
+///         build with the repo's own EVM version (foundry.toml), because that is what the live
+///         implementation was compiled for. A build for a newer EVM (the fork suites run under
+///         one) produces different code, so the live comparison skips there.
+contract LegalBodyFactoryDeployCheckForkTest is Test {
+    address internal constant LIVE_FULL_FACTORY = 0x83D529E813Fe825b84250034A7A63f460A2ECA77;
+    address internal constant LIVE_IMPL = 0xc2e89ABf562f2EB366e4dde42325af16EeF542a6;
+
+    DeployLegalBodyFactoryHarness internal script;
+
+    function setUp() public {
+        script = new DeployLegalBodyFactoryHarness();
+        vm.makePersistent(address(script)); // survives the fork switch below
+    }
+
+    function _supportsPush0() internal returns (bool ok) {
+        bytes memory initcode = hex"5f";
+        address probe;
+        assembly {
+            probe := create(0, add(initcode, 0x20), mload(initcode))
+        }
+        ok = probe != address(0);
+    }
+
+    function test_stripMetadata_dropsTheCborTail() public view {
+        // 3 code bytes, then a 4-byte "CBOR" block and its 2-byte big-endian length (4).
+        bytes memory code = hex"6001ff" hex"a1b2c3d4" hex"0004";
+        assertEq(script.stripMetadata(code), hex"6001ff");
+        // Only the metadata differs: equal after stripping.
+        assertEq(script.stripMetadata(hex"6001ff" hex"a1b2" hex"0002"), script.stripMetadata(code));
+    }
+
+    function test_stripMetadata_guardsLengthsLongerThanTheCode() public view {
+        assertEq(script.stripMetadata(hex"ffff"), hex"ffff", "L + 2 > length: unchanged");
+        assertEq(script.stripMetadata(hex"00"), hex"00", "shorter than the length field: unchanged");
+        assertEq(script.stripMetadata(hex"0000"), hex"", "L = 0 drops just the length field");
+    }
+
+    function test_fork_liveImplementationIsThisRepoLegalManager() public {
+        string memory url = vm.envOr("ARC_TESTNET_RPC_URL", string(""));
+        if (bytes(url).length == 0) {
+            require(!vm.envOr("FORK_TESTS_REQUIRED", false), "fork tests required but would skip");
+            vm.skip(true);
+        }
+        // A build for a newer EVM than the deploy target cannot match the live bytecode.
+        vm.skip(_supportsPush0());
+        vm.createSelectFork(url);
+        bytes memory live = LIVE_IMPL.code;
+        bytes memory ours = vm.getDeployedCode("LegalManager.sol:LegalManager");
+        assertGt(live.length, 0, "live implementation missing");
+        assertTrue(keccak256(live) != keccak256(ours), "metadata differs, so the raw codes differ");
+        assertEq(script.stripMetadata(live), script.stripMetadata(ours), "live implementation is not this repo's");
     }
 }

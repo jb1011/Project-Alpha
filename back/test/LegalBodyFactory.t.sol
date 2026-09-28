@@ -8,6 +8,8 @@ import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 import {MockERC1271Wallet} from "./mocks/MockERC1271Wallet.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
+import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 
 abstract contract LegalBodyFactoryTestBase is Test {
     MockIdentityRegistry internal registry;
@@ -88,6 +90,51 @@ contract LegalBodyFactoryConstructionTest is LegalBodyFactoryTestBase {
         new LegalBodyFactory(address(0xBEEF), address(registry), novi);
         vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotContract.selector, address(0xBEEF)));
         new LegalBodyFactory(address(impl), address(0xBEEF), novi);
+    }
+
+    function test_constructor_acceptsLockedImplementation() public {
+        LegalManager locked = new LegalManager();
+        LegalBodyFactory f = new LegalBodyFactory(address(locked), address(registry), novi);
+        assertEq(f.implementation(), address(locked));
+    }
+
+    /// An existing full-product body is a BeaconProxy. Cloning it would forward every body to an
+    /// upgradeable beacon, so it must be refused.
+    function test_constructor_refusesInitialisedBeaconProxy() public {
+        UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), address(this));
+        bytes memory init = abi.encodeCall(
+            LegalManager.initialize, (makeAddr("platform"), makeAddr("fpGuardian"), 1 hours, 7, "", 0, bytes32(0))
+        );
+        address proxy = address(new BeaconProxy(address(beacon), init));
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotImplementation.selector, proxy));
+        new LegalBodyFactory(proxy, address(registry), novi);
+    }
+
+    /// An uninitialised proxy has an empty `manager` too; the initialisation probe catches it,
+    /// and the constructor's revert rolls the probe's initialisation back.
+    function test_constructor_refusesUninitialisedBeaconProxy() public {
+        UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), address(this));
+        address proxy = address(new BeaconProxy(address(beacon), ""));
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotImplementation.selector, proxy));
+        new LegalBodyFactory(proxy, address(registry), novi);
+        assertEq(LegalManager(payable(proxy)).manager(), address(0), "the probe left no trace");
+    }
+
+    function test_constructor_refusesUninitialisedClone() public {
+        address clone = Clones.clone(address(impl));
+        vm.expectRevert(abi.encodeWithSelector(LegalBodyFactory.NotImplementation.selector, clone));
+        new LegalBodyFactory(clone, address(registry), novi);
+    }
+
+    function test_constructor_refusesNonLegalManager() public {
+        vm.expectRevert(); // the registry has no manager(): the call itself reverts
+        new LegalBodyFactory(address(registry), address(registry), novi);
+    }
+
+    function test_constructor_refusesBeaconItself() public {
+        UpgradeableBeacon beacon = new UpgradeableBeacon(address(impl), address(this));
+        vm.expectRevert(); // a beacon has no manager(): the call itself reverts
+        new LegalBodyFactory(address(beacon), address(registry), novi);
     }
 
     function test_constructor_refusesZeroOwner() public {

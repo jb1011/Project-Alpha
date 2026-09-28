@@ -6,6 +6,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {LegalManager} from "./LegalManager.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 
@@ -78,11 +79,12 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     error BadSignature();
     error LegalBodyExists(address legalBody);
     error NotContract(address account);
+    error NotImplementation(address account);
     error NotLegalBody(address account);
     error NotPendingAmendment(bytes32 newHash);
     error OwnershipRenounceDisabled();
 
-    /// @param implementation_   the deployed LegalManager logic contract every body clones
+    /// @param implementation_   the deployed, locked LegalManager logic contract every body clones
     /// @param identityRegistry_ the ERC-8004 identity registry
     /// @param owner_            the platform controller; the only caller of the owner functions
     constructor(address implementation_, address identityRegistry_, address owner_)
@@ -91,6 +93,7 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     {
         if (implementation_.code.length == 0) revert NotContract(implementation_);
         if (identityRegistry_.code.length == 0) revert NotContract(identityRegistry_);
+        _requireLockedImplementation(implementation_);
         implementation = implementation_;
         identityRegistry = IIdentityRegistry(identityRegistry_);
     }
@@ -257,6 +260,30 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     // ------------------------------------------------------------------
     // Internals
     // ------------------------------------------------------------------
+
+    /// @dev Bodies are immutable clones, so cloning anything but the locked LegalManager
+    ///      implementation could never be repaired. A proxy, for example, would forward every
+    ///      body to an upgradeable beacon, and whoever controls that beacon could rewrite them.
+    ///      Two checks, both needed:
+    ///      1. `manager()` is empty. A proxy of a live body has a manager; a contract that is
+    ///         not a LegalManager at all reverts here, which also refuses it.
+    ///      2. `initialize` reverts with exactly `InvalidInitialization`, which proves the
+    ///         target's initialisers were disabled at construction. An uninitialised proxy or
+    ///         clone would accept the call instead; the revert below then undoes that
+    ///         initialisation along with this whole deployment, so the probe leaves no trace.
+    function _requireLockedImplementation(address implementation_) private {
+        LegalManager lm = LegalManager(payable(implementation_));
+        if (lm.manager() != address(0)) revert NotImplementation(implementation_);
+        try lm.initialize(address(1), address(2), MIN_AMENDMENT_DELAY, 0, "", 0, bytes32(0)) {
+            revert NotImplementation(implementation_);
+        } catch (bytes memory reason) {
+            // Truncating to the first 4 bytes is the point: it reads the error selector.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            if (reason.length < 4 || bytes4(reason) != Initializable.InvalidInitialization.selector) {
+                revert NotImplementation(implementation_);
+            }
+        }
+    }
 
     function _checkDeadline(uint256 deadline) internal view {
         if (deadline < block.timestamp || deadline > block.timestamp + MAX_SIGNATURE_WINDOW) revert BadDeadline();
