@@ -41,6 +41,11 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     /// @notice A signature may be used at most this long before its deadline.
     uint256 public constant MAX_SIGNATURE_WINDOW = 24 hours;
 
+    /// @notice The identity-metadata key the owner writes the pointer under.
+    string public constant POINTER_KEY = "legalBody";
+    uint8 public constant POINTER_VERSION = 1;
+    uint256 private constant POINTER_LENGTH = 96;
+
     address public immutable implementation;
     IIdentityRegistry public immutable identityRegistry;
 
@@ -184,6 +189,53 @@ contract LegalBodyFactory is Ownable2Step, EIP712 {
     /// @notice The address the body for this link digest has, or will have.
     function predictLegalBody(bytes32 linkDigest_) public view returns (address) {
         return Clones.predictDeterministicAddress(implementation, linkDigest_);
+    }
+
+    /// @notice The exact pointer value the identity owner writes under `POINTER_KEY`.
+    function encodePointer(address legalBody) external view returns (bytes memory) {
+        return abi.encode(POINTER_VERSION, block.chainid, legalBody);
+    }
+
+    /// @notice The legal body `agentId` is linked to right now, or address(0).
+    /// @dev    One predicate for everyone (this platform's backend and any third party). Linked
+    ///         means all of these hold: the owner's pointer is exactly the 96-byte encoding for
+    ///         this chain; it names a body this factory created; that body names this agentId
+    ///         and is Active; and the identity still belongs to the owner who signed the link.
+    ///         The pointer is written by the identity owner, so it can hold any bytes: this
+    ///         function decodes by hand and never reverts, whatever it finds.
+    function linkedLegalBody(uint256 agentId) external view returns (address) {
+        bytes memory pointer;
+        try identityRegistry.getMetadata(agentId, POINTER_KEY) returns (bytes memory p) {
+            pointer = p;
+        } catch {
+            return address(0);
+        }
+        if (pointer.length != POINTER_LENGTH) return address(0);
+        uint256 version;
+        uint256 chainId;
+        uint256 bodyWord;
+        assembly {
+            version := mload(add(pointer, 0x20))
+            chainId := mload(add(pointer, 0x40))
+            bodyWord := mload(add(pointer, 0x60))
+        }
+        if (version != POINTER_VERSION || chainId != block.chainid || bodyWord >> 160 != 0) return address(0);
+        // Safe: the line above returned early unless every bit above the low 160 is zero.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        address candidate = address(uint160(bodyWord));
+        address creator = identityOwnerAtCreation[candidate];
+        if (creator == address(0)) return address(0);
+
+        LegalManager lm = LegalManager(payable(candidate));
+        (,,, uint256 bodyAgentId) = lm.meta();
+        if (bodyAgentId != agentId || lm.status() != LegalManager.Status.Active) return address(0);
+
+        try identityRegistry.ownerOf(agentId) returns (address currentOwner) {
+            if (currentOwner != creator) return address(0);
+        } catch {
+            return address(0);
+        }
+        return candidate;
     }
 
     // ------------------------------------------------------------------

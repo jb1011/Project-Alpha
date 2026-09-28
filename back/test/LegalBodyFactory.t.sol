@@ -542,3 +542,90 @@ contract LegalBodyFactoryAmendmentTest is LegalBodyFactoryTestBase {
         return Clones.clone(implementation_);
     }
 }
+
+contract LegalBodyFactoryPredicateTest is LegalBodyFactoryTestBase {
+    address internal body;
+
+    function setUp() public override {
+        super.setUp();
+        body = _create();
+    }
+
+    function _point(bytes memory value) internal {
+        vm.prank(idOwner);
+        registry.setMetadata(agentId, "legalBody", value);
+    }
+
+    function test_encodePointer_isAbiTuple() public view {
+        bytes memory p = factory.encodePointer(body);
+        assertEq(p.length, 96);
+        assertEq(p, abi.encode(uint8(1), block.chainid, body));
+    }
+
+    function test_linked_whenOwnerPointsAtBody() public {
+        assertEq(factory.linkedLegalBody(agentId), address(0), "no pointer yet");
+        _point(factory.encodePointer(body));
+        assertEq(factory.linkedLegalBody(agentId), body);
+    }
+
+    function test_pointerDecidesBetweenSeveralBodies() public {
+        address second = _createWith(block.timestamp + 2 hours);
+        _point(factory.encodePointer(second));
+        assertEq(factory.linkedLegalBody(agentId), second);
+        _point(factory.encodePointer(body));
+        assertEq(factory.linkedLegalBody(agentId), body);
+    }
+
+    function test_malformedPointersNeverRevertAndNeverLink() public {
+        bytes[] memory bad = new bytes[](9);
+        bad[0] = "";
+        bad[1] = abi.encodePacked(uint8(1), uint64(block.chainid), body);              // packed 29 bytes
+        bad[2] = abi.encode(uint8(2), block.chainid, body);                            // wrong version
+        bad[3] = abi.encode(uint8(1), block.chainid + 1, body);                        // another chain
+        bad[4] = abi.encodePacked(abi.encode(uint8(1), block.chainid, body), uint8(0)); // 97 bytes
+        bad[5] = abi.encode(uint8(1), block.chainid, uint256(uint160(body)) | (uint256(1) << 200)); // dirty high bits
+        bad[6] = abi.encode(uint8(1), block.chainid, address(impl));                    // not made here
+        bad[7] = abi.encode(uint8(1), block.chainid, makeAddr("eoa"));                  // no code
+        bad[8] = abi.encode(uint256(1) << 8 | 1, block.chainid, body);                  // version word with extra bits
+        for (uint256 i = 0; i < bad.length; i++) {
+            _point(bad[i]);
+            assertEq(factory.linkedLegalBody(agentId), address(0));
+        }
+    }
+
+    function test_pointerCopiedOntoAnotherAgentDoesNotLink() public {
+        vm.prank(idOwner);
+        uint256 otherId = registry.register("ipfs://other");
+        bytes memory pointer = factory.encodePointer(body); // read before the prank, which the next call consumes
+        vm.prank(idOwner);
+        registry.setMetadata(otherId, "legalBody", pointer);
+        assertEq(factory.linkedLegalBody(otherId), address(0), "body names a different agentId");
+    }
+
+    function test_identityTransferBreaksLinkButPointerSurvives() public {
+        bytes memory p = factory.encodePointer(body);
+        _point(p);
+        address buyer = makeAddr("buyer");
+        vm.prank(idOwner);
+        registry.transferFrom(idOwner, buyer, agentId);
+        assertEq(registry.getMetadata(agentId, "legalBody"), p);
+        assertEq(factory.linkedLegalBody(agentId), address(0));
+    }
+
+    function test_dissolutionBreaksLink() public {
+        _point(factory.encodePointer(body));
+        vm.prank(guardian);
+        LegalManager(payable(body)).initiateDissolution();
+        assertEq(factory.linkedLegalBody(agentId), address(0), "winding down is not linked");
+    }
+
+    function test_clearedPointerUnlinks() public {
+        _point(factory.encodePointer(body));
+        _point("");
+        assertEq(factory.linkedLegalBody(agentId), address(0));
+    }
+
+    function test_unknownAgentIdReturnsZero() public view {
+        assertEq(factory.linkedLegalBody(424242), address(0));
+    }
+}
