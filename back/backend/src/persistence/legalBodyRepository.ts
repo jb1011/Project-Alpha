@@ -320,6 +320,14 @@ function canonicalAgentId(value: string): string | null {
 /** The live-state predicate, spelled exactly as the partial index's WHERE so SQLite can use it. */
 const LIVE_STATES_SQL = `binding_state IN (${LIVE_BINDING_STATES.map((s) => `'${s}'`).join(",")})`;
 
+/**
+ * How SQLite names each unique index in its violation message, which is how a lost race is told
+ * apart. A column index is named by its columns; an EXPRESSION index, like the body-address one
+ * on `lower(body_address)`, is named only by its index name. The schema tests pin both messages.
+ */
+const LIVE_AGENT_CONFLICT = "legal_bodies.chain_id, legal_bodies.agent_id";
+const BODY_ADDRESS_CONFLICT = "index 'idx_legal_bodies_body'";
+
 export class SqliteLegalBodyRepository implements LegalBodyRepository {
   private readonly stmts;
 
@@ -338,8 +346,13 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       findLiveByAgentId: db.prepare(
         `SELECT * FROM legal_bodies WHERE chain_id = ? AND agent_id = ? AND ${LIVE_STATES_SQL}`,
       ),
+      // Compares the checksummed form the repository writes. The lower() term changes no answer
+      // (it is implied by the exact one); it is there so SQLite can look the address up through
+      // the unique index, which is built on lower(body_address).
       findByBodyAddress: db.prepare(
-        "SELECT * FROM legal_bodies WHERE chain_id = ? AND body_address = ?",
+        `SELECT * FROM legal_bodies
+          WHERE chain_id = @chain_id AND lower(body_address) = lower(@address)
+            AND body_address = @address`,
       ),
       listByTenant: db.prepare(
         "SELECT * FROM legal_bodies WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC",
@@ -468,7 +481,7 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
   findByBodyAddress(chainId: number, body: Address): LegalBodyRecord | undefined {
     const address = checksummed(body);
     if (address === null) return undefined;
-    const r = this.stmts.findByBodyAddress.get(chainId, address) as Row | undefined;
+    const r = this.stmts.findByBodyAddress.get({ chain_id: chainId, address }) as Row | undefined;
     return r ? toRecord(r) : undefined;
   }
 
@@ -541,10 +554,13 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       // A live holder of the agentId wins the precedence, whichever index SQLite names. The body
       // address is derived from the signed link digest, so one tenant ordering twice for one
       // agent with the same agreement and deadline collides on BOTH indexes, and SQLite reports
-      // only one of them (in practice the body address).
-      if (message.includes("agent_id") || this.stmts.findLiveByAgentId.get(row.chain_id, agentId))
+      // only one of them (in practice the body index).
+      if (
+        message.includes(LIVE_AGENT_CONFLICT) ||
+        this.stmts.findLiveByAgentId.get(row.chain_id, agentId)
+      )
         return "agent_taken";
-      if (message.includes("body_address")) return "body_taken";
+      if (message.includes(BODY_ADDRESS_CONFLICT)) return "body_taken";
       throw e;
     }
   }
@@ -596,7 +612,7 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       if (
         (e as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE" &&
         e instanceof Error &&
-        e.message.includes("agent_id")
+        e.message.includes(LIVE_AGENT_CONFLICT)
       )
         return false;
       throw e;

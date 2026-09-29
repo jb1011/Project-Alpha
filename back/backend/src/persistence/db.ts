@@ -208,7 +208,9 @@ const COMPANIES_DDL = `
  *  - a `draft` holds no link fields, so it can never squat on an agentId or a body address;
  *    leaving `draft` requires every link field AND a frozen agreement, and `deployed` onwards
  *    requires the deploy facts (CHECKs);
- *  - one LIVE body per agentId per chain (a partial unique index), and one row per body address;
+ *  - one LIVE body per agentId per chain (a partial unique index), and one row per body address
+ *    per chain whatever its casing (a unique index on its lower-case form); a body address is a
+ *    well-formed 0x address: TEXT, `0x` then exactly 40 hex digits, no hidden bytes;
  *  - rows are never deleted, and the event log is append-only: no UPDATE, no DELETE, and no
  *    INSERT over an existing event id. Event ids are always positive (a CHECK), which that last
  *    guard relies on.
@@ -249,7 +251,9 @@ export const LEGAL_BODIES_DDL = `
     link_digest TEXT,
     link_deadline INTEGER CHECK (link_deadline IS NULL OR typeof(link_deadline) = 'integer'),
     link_signature TEXT,
-    body_address TEXT,
+    body_address TEXT CHECK (body_address IS NULL OR (typeof(body_address) = 'text'
+      AND length(CAST(body_address AS BLOB)) = 42 AND length(body_address) = 42
+      AND substr(body_address, 1, 2) = '0x' AND substr(body_address, 3) NOT GLOB '*[^0-9a-fA-F]*')),
     create_tx_hash TEXT,
     deployed_at INTEGER CHECK (deployed_at IS NULL OR typeof(deployed_at) = 'integer'),
     binding_state TEXT NOT NULL DEFAULT 'draft'
@@ -276,7 +280,7 @@ export const LEGAL_BODIES_DDL = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_live_agent
     ON legal_bodies(chain_id, agent_id) WHERE binding_state IN ('reserved','deployed','linked');
   CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_body
-    ON legal_bodies(chain_id, body_address) WHERE body_address IS NOT NULL;
+    ON legal_bodies(chain_id, lower(body_address)) WHERE body_address IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_legal_bodies_tenant ON legal_bodies(tenant_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_legal_bodies_company ON legal_bodies(company_id);
   CREATE INDEX IF NOT EXISTS idx_legal_bodies_binding_due

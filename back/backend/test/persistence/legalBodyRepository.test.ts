@@ -378,3 +378,18 @@ test("freezeAgreement refuses a version that is not a whole number, before writi
   expect(repo.findById(r.legalBodyId)?.oaManifestHash).toBeNull();
   expect(repo.listEvents(r.legalBodyId).map((e) => e.kind)).toEqual(["created"]);
 });
+
+test("reserve answers body_taken when the recorded address differs only in casing", () => {
+  // The repository writes the checksummed form, so another casing can only come from raw SQL.
+  const raw = newBody();
+  repo.freezeAgreement(raw.legalBodyId, { hash: H("a"), version: 1 });
+  db.prepare(
+    `UPDATE legal_bodies SET agent_id = '43', identity_owner = ?, link_digest = ?,
+       link_deadline = 1900000000, link_signature = '0x01', body_address = ?,
+       binding_state = 'reserved' WHERE legal_body_id = ?`,
+  ).run(OWNER, H("b"), BODY_A.toLowerCase(), raw.legalBodyId);
+  const b = newBody();
+  repo.freezeAgreement(b.legalBodyId, { hash: H("a"), version: 1 });
+  expect(repo.reserve(b.legalBodyId, link("44", BODY_A))).toBe("body_taken");
+  expect(repo.findById(b.legalBodyId)?.bindingState).toBe("draft");
+});

@@ -726,3 +726,63 @@ test("a legal body id is never NULL", () => {
   ).toThrow(/NOT NULL/);
   expect(db.prepare("SELECT COUNT(*) AS n FROM legal_bodies").get()).toEqual({ n: 0 });
 });
+
+test("one body address per chain, whatever its casing, and only a well-formed 0x address fits", () => {
+  insertDraft("lb_1", "p1");
+  freeze("lb_1");
+  reserve("lb_1", "42", BODY); // recorded in its checksummed form
+  let n = 0;
+  const reserveAs = (bodySql: string) => {
+    n += 1;
+    insertDraft(`lb_b${n}`, `pb${n}`);
+    freeze(`lb_b${n}`);
+    return () =>
+      db
+        .prepare(
+          `UPDATE legal_bodies SET agent_id = ?, identity_owner = ?, link_digest = ?,
+             link_deadline = 1900000000, link_signature = '0x01', body_address = ${bodySql},
+             binding_state = 'reserved' WHERE legal_body_id = ?`,
+        )
+        .run(String(100 + n), OWNER, H("b"), `lb_b${n}`);
+  };
+  // The same address in lower or upper case is the same address.
+  for (const variant of [BODY.toLowerCase(), `0x${BODY.slice(2).toUpperCase()}`])
+    expect(reserveAs(`'${variant}'`), variant).toThrow(
+      "UNIQUE constraint failed: index 'idx_legal_bodies_body'",
+    );
+  // Anything but 0x and exactly 40 hex digits, as TEXT with no hidden bytes, is refused. A NUL
+  // would otherwise hide a second spelling of the recorded address from length() and GLOB.
+  for (const [label, bodySql] of [
+    ["41 characters", `'${BODY.slice(0, 41)}'`],
+    ["43 characters", `'${BODY}0'`],
+    ["no 0x prefix", `'00${BODY.slice(2)}'`],
+    ["0X prefix", `'0X${BODY.slice(2)}'`],
+    ["a non-hex digit", `'${BODY.slice(0, 41)}g'`],
+    ["a BLOB", `CAST('${OTHER_BODY}' AS BLOB)`],
+    ["the recorded address, then a NUL and more", `'${BODY}' || char(0) || 'x'`],
+    ["the recorded address, then a NUL", `'${BODY}' || char(0)`],
+  ] as const)
+    expect(reserveAs(bodySql), label).toThrow(/CHECK/);
+  expect(
+    db.prepare("SELECT legal_body_id FROM legal_bodies WHERE body_address IS NOT NULL").all(),
+  ).toEqual([{ legal_body_id: "lb_1" }]);
+});
+
+test("each unique index names itself in its own way, which the repository's mapping relies on", () => {
+  for (const [id, pub] of [
+    ["lb_1", "p1"],
+    ["lb_2", "p2"],
+    ["lb_3", "p3"],
+  ]) {
+    insertDraft(id, pub);
+    freeze(id);
+  }
+  reserve("lb_1", "42", BODY);
+  // A column index is named by its columns; an expression index only by its name.
+  expect(() => reserve("lb_2", "42", OTHER_BODY)).toThrow(
+    "UNIQUE constraint failed: legal_bodies.chain_id, legal_bodies.agent_id",
+  );
+  expect(() => reserve("lb_3", "43", BODY)).toThrow(
+    "UNIQUE constraint failed: index 'idx_legal_bodies_body'",
+  );
+});
