@@ -38,6 +38,9 @@ const TARGETS: Record<string, string> = {
   // so relayed failures can decode the controller's OWN errors — NotAuthorized/TargetNotBound and
   // friends arrive as raw bytes from an eth_call/estimateGas that has no ABI attached.
   noviControllerAbi: "NoviController.sol/NoviController.json",
+  // The legal-body factory: the backend relays createLegalBody and the guardian-signed amendment
+  // schedule through the controller, and reads the on-chain link predicate from it.
+  legalBodyFactoryAbi: "LegalBodyFactory.sol/LegalBodyFactory.json",
   // Test-only doubles (used by anvil integration tests):
   mockIdentityRegistryAbi: "MockIdentityRegistry.sol/MockIdentityRegistry.json",
   mockUsdcAbi: "MockUSDC.sol/MockUSDC.json",
