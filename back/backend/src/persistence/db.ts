@@ -187,18 +187,25 @@ const COMPANIES_DDL = `
  * custody and no onboarding saga, so no existing agent query can ever mistake one for an agent.
  *
  * The table enforces its own invariants rather than trusting callers:
- *  - the guardian IS the tenant (the human's signed-in wallet), structurally;
+ *  - the guardian IS the tenant (the human's signed-in wallet), structurally, and a body is only
+ *    ever created under a company of that same tenant (a trigger; a company that does not exist
+ *    is refused by the foreign key);
  *  - the amendment delay is within the factory contract's bounds (48 hours .. 30 days);
+ *  - every number column holds an integer (a fractional value is refused, never stored as REAL),
+ *    and an agentId has one spelling: canonical decimal, no leading zero, at most 78 digits (the
+ *    width of a uint256). The one-live-body index compares agent_id as TEXT, so '042' would
+ *    otherwise be a second live body for agent 42;
  *  - rows are born `draft`, and an INSERT never lands on an existing row (a trigger). That is what
  *    stops `REPLACE INTO` from rewriting a body wholesale: REPLACE deletes the old row and inserts
  *    a new one, and no UPDATE guard below would ever see it;
- *  - identity, agreement and link fields are write-once (a trigger), so a future method, migration
- *    or operator cannot re-point a reservation or a deployed body at another agent, owner or
- *    agreement;
+ *  - identity, agreement and link fields are write-once (a trigger), and so are the deploy facts
+ *    once the body is deployed, so a future method, migration or operator cannot re-point a
+ *    reservation or a deployed body at another agent, owner, agreement or creating transaction;
  *  - binding_state only moves along the legal transitions (a trigger). The trigger also refuses a
  *    NULL target, which `UPDATE OR REPLACE` would otherwise quietly turn into the column default,
  *    `draft`, handing a live body's agentId back without a single legal move;
- *  - leaving `draft` requires every link field AND a frozen agreement, and `deployed` onwards
+ *  - a `draft` holds no link fields, so it can never squat on an agentId or a body address;
+ *    leaving `draft` requires every link field AND a frozen agreement, and `deployed` onwards
  *    requires the deploy facts (CHECKs);
  *  - one LIVE body per agentId per chain (a partial unique index), and one row per body address;
  *  - rows are never deleted, and the event log is append-only: no UPDATE, no DELETE, and no
@@ -213,9 +220,11 @@ const COMPANIES_DDL = `
  * written together with its `created` event, so what remains needs raw SQL against a row that
  * was itself created without the repository.
  *
- * `create_tx_hash` is deliberately NOT write-once: while the row is still `reserved`, a deploy
- * whose first transaction never lands is re-sent with a new nonce, and so a new hash. Every
- * submission is kept in the event log, so overwriting the column loses nothing.
+ * `create_tx_hash` is deliberately NOT write-once while the row is `reserved`: a deploy whose
+ * first transaction never lands is re-sent with a new nonce, and so a new hash. Every submission
+ * is kept in the event log, so overwriting the column loses nothing. Once the body is deployed,
+ * the hash of the transaction that created it is a fact, and it locks together with
+ * `deployed_at`.
  */
 export const LEGAL_BODIES_DDL = `
   CREATE TABLE IF NOT EXISTS legal_bodies (
@@ -223,28 +232,35 @@ export const LEGAL_BODIES_DDL = `
     public_id TEXT NOT NULL UNIQUE,
     tenant_id TEXT NOT NULL,
     company_id TEXT NOT NULL REFERENCES companies(company_id),
-    chain_id INTEGER NOT NULL,
+    chain_id INTEGER NOT NULL CHECK (typeof(chain_id) = 'integer'),
     factory TEXT NOT NULL,
     guardian TEXT NOT NULL,
-    amendment_delay INTEGER NOT NULL CHECK (amendment_delay BETWEEN 172800 AND 2592000),
+    amendment_delay INTEGER NOT NULL CHECK (typeof(amendment_delay) = 'integer')
+      CHECK (amendment_delay BETWEEN 172800 AND 2592000),
     oa_manifest_hash TEXT,
     oa_manifest_version INTEGER,
-    agent_id TEXT,
+    agent_id TEXT CHECK (agent_id IS NULL OR (length(agent_id) BETWEEN 1 AND 78
+      AND agent_id NOT GLOB '*[^0-9]*' AND (agent_id = '0' OR substr(agent_id, 1, 1) != '0'))),
     identity_owner TEXT,
     link_digest TEXT,
-    link_deadline INTEGER,
+    link_deadline INTEGER CHECK (link_deadline IS NULL OR typeof(link_deadline) = 'integer'),
     link_signature TEXT,
     body_address TEXT,
     create_tx_hash TEXT,
-    deployed_at INTEGER,
+    deployed_at INTEGER CHECK (deployed_at IS NULL OR typeof(deployed_at) = 'integer'),
     binding_state TEXT NOT NULL DEFAULT 'draft'
       CHECK (binding_state IN ('draft','reserved','deployed','linked','broken','lapsed','superseded')),
-    pointer_seen_at INTEGER,
-    next_binding_check_at INTEGER,
-    binding_check_interval_ms INTEGER,
+    pointer_seen_at INTEGER CHECK (pointer_seen_at IS NULL OR typeof(pointer_seen_at) = 'integer'),
+    next_binding_check_at INTEGER
+      CHECK (next_binding_check_at IS NULL OR typeof(next_binding_check_at) = 'integer'),
+    binding_check_interval_ms INTEGER
+      CHECK (binding_check_interval_ms IS NULL OR typeof(binding_check_interval_ms) = 'integer'),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (guardian = tenant_id),
+    CHECK (binding_state != 'draft' OR (agent_id IS NULL AND identity_owner IS NULL
+      AND link_digest IS NULL AND link_deadline IS NULL AND link_signature IS NULL
+      AND body_address IS NULL)),
     CHECK (binding_state = 'draft' OR (
       agent_id IS NOT NULL AND identity_owner IS NOT NULL AND link_digest IS NOT NULL
       AND link_deadline IS NOT NULL AND link_signature IS NOT NULL AND body_address IS NOT NULL
@@ -278,7 +294,8 @@ export const LEGAL_BODIES_DDL = `
         OR NEW.identity_owner IS NOT OLD.identity_owner OR NEW.link_digest IS NOT OLD.link_digest
         OR NEW.link_deadline IS NOT OLD.link_deadline OR NEW.link_signature IS NOT OLD.link_signature
         OR NEW.body_address IS NOT OLD.body_address))
-    OR (OLD.deployed_at IS NOT NULL AND NEW.deployed_at IS NOT OLD.deployed_at)
+    OR (OLD.deployed_at IS NOT NULL AND (NEW.deployed_at IS NOT OLD.deployed_at
+        OR NEW.create_tx_hash IS NOT OLD.create_tx_hash))
   BEGIN
     SELECT RAISE(ABORT, 'legal_bodies: identity, agreement, link and deploy fields are write-once');
   END;
@@ -302,6 +319,14 @@ export const LEGAL_BODIES_DDL = `
                 WHERE legal_body_id = NEW.legal_body_id OR public_id = NEW.public_id)
   BEGIN
     SELECT RAISE(ABORT, 'legal_bodies: rows are born draft and never replaced');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_company_tenant
+  BEFORE INSERT ON legal_bodies FOR EACH ROW
+  WHEN EXISTS (SELECT 1 FROM companies
+                WHERE company_id = NEW.company_id AND tenant_id IS NOT NEW.tenant_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: the company belongs to another tenant');
   END;
 
   CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_no_delete

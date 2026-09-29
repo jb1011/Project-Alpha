@@ -422,3 +422,148 @@ test("UPDATE OR REPLACE cannot send a body back to draft through a NULL state", 
     d.close();
   }
 });
+
+test("the deploy hash may be re-sent while reserved, and is locked once the body is deployed", () => {
+  insertDraft();
+  freeze();
+  reserve();
+  const submit = (h: string) =>
+    db
+      .prepare(
+        "UPDATE legal_bodies SET create_tx_hash = ? WHERE legal_body_id = 'lb_1' AND binding_state = 'reserved'",
+      )
+      .run(h);
+  expect(submit(H("1")).changes).toBe(1);
+  expect(submit(H("2")).changes).toBe(1); // re-sent with a new nonce, so a new hash
+  deploy(); // the transaction that landed: create_tx_hash = H("c")
+  for (const v of [H("9"), null])
+    expect(
+      () =>
+        db
+          .prepare("UPDATE legal_bodies SET create_tx_hash = ? WHERE legal_body_id = 'lb_1'")
+          .run(v),
+      String(v),
+    ).toThrow(/write-once/);
+  expect(db.prepare("SELECT create_tx_hash FROM legal_bodies").get()).toEqual({
+    create_tx_hash: H("c"),
+  });
+});
+
+test("a draft holds no link fields: it cannot squat on a body address or an agentId", () => {
+  insertDraft();
+  freeze();
+  for (const [col, v] of [
+    ["body_address", BODY],
+    ["agent_id", "42"],
+    ["identity_owner", OWNER],
+    ["link_digest", H("b")],
+    ["link_deadline", 1900000000],
+    ["link_signature", "0x01"],
+  ] as const)
+    expect(
+      () => db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = 'lb_1'`).run(v),
+      col,
+    ).toThrow(/CHECK/);
+  // Nor can a draft be born holding one.
+  expect(() =>
+    db
+      .prepare(
+        `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian,
+           amendment_delay, body_address)
+         VALUES ('lb_2', 'p2', ?, 'co_1', 5042002, ?, ?, 172800, ?)`,
+      )
+      .run(TENANT, FACTORY, TENANT, BODY),
+  ).toThrow(/CHECK/);
+  // So the address and the agentId are still free for a real reservation.
+  insertDraft("lb_3", "p3");
+  freeze("lb_3");
+  expect(() => reserve("lb_3", "42", BODY)).not.toThrow();
+});
+
+/** A distinct, well-formed body address per index, so reservations never collide on it. */
+const bodyN = (i: number) => `0x${i.toString(16).padStart(40, "0")}`;
+
+test("an agentId has one spelling at the database: canonical decimal, at most 78 digits", () => {
+  insertDraft("lb_1", "p1");
+  freeze("lb_1");
+  reserve("lb_1", "42", BODY);
+  let n = 0;
+  const reserveAs = (agent: string) => {
+    n += 1;
+    insertDraft(`lb_a${n}`, `pa${n}`);
+    freeze(`lb_a${n}`);
+    return () => reserve(`lb_a${n}`, agent, bodyN(n));
+  };
+  // '042' is agent 42 on chain but a different TEXT to the unique index: while '42' is live, it
+  // would otherwise slip past as a second live body for the same identity.
+  expect(reserveAs("042")).toThrow(/CHECK/);
+  for (const bad of ["00", "", " 42", "42 ", "4a", "-1", "4.2", "1e3", "1".repeat(79)])
+    expect(reserveAs(bad), JSON.stringify(bad)).toThrow(/CHECK/);
+  // agentId 0 exists on real registries, and a uint256 is at most 78 digits long.
+  for (const good of ["0", "7", "1".repeat(78)])
+    expect(reserveAs(good), JSON.stringify(good)).not.toThrow();
+});
+
+test("numbers are stored as integers: a fractional value is refused, never kept as REAL", () => {
+  const insert = (chainId: number, delay: number) =>
+    db
+      .prepare(
+        `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+         VALUES ('lb_r', 'pr', ?, 'co_1', ?, ?, ?, ?)`,
+      )
+      .run(TENANT, chainId, FACTORY, TENANT, delay);
+  expect(() => insert(5042002, 172800.5)).toThrow(/CHECK/);
+  expect(() => insert(5042002.5, 172800)).toThrow(/CHECK/);
+  insertDraft();
+  freeze();
+  expect(() =>
+    db
+      .prepare(
+        `UPDATE legal_bodies SET agent_id = '42', identity_owner = ?, link_digest = ?, link_deadline = 1900000000.5,
+           link_signature = '0x01', body_address = ?, binding_state = 'reserved' WHERE legal_body_id = 'lb_1'`,
+      )
+      .run(OWNER, H("b"), BODY),
+  ).toThrow(/CHECK/);
+  reserve();
+  expect(() =>
+    db
+      .prepare(
+        "UPDATE legal_bodies SET create_tx_hash = ?, deployed_at = 1800000000.5, binding_state = 'deployed' WHERE legal_body_id = 'lb_1'",
+      )
+      .run(H("c")),
+  ).toThrow(/CHECK/);
+  deploy();
+  expect(() =>
+    db
+      .prepare(
+        "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1.5 WHERE legal_body_id = 'lb_1'",
+      )
+      .run(),
+  ).toThrow(/CHECK/);
+  for (const col of ["next_binding_check_at", "binding_check_interval_ms"])
+    expect(
+      () => db.prepare(`UPDATE legal_bodies SET ${col} = 1.5 WHERE legal_body_id = 'lb_1'`).run(),
+      col,
+    ).toThrow(/CHECK/);
+  // Whole numbers, and NULL where a column allows it, are untouched.
+  db.prepare(
+    "UPDATE legal_bodies SET next_binding_check_at = 1800000000000, binding_check_interval_ms = 60000 WHERE legal_body_id = 'lb_1'",
+  ).run();
+  db.prepare(
+    "UPDATE legal_bodies SET next_binding_check_at = NULL, binding_check_interval_ms = NULL WHERE legal_body_id = 'lb_1'",
+  ).run();
+});
+
+test("a body is created only under a company of its own tenant", () => {
+  addCompany("co_2", OWNER);
+  const insert = (tenant: string) =>
+    db
+      .prepare(
+        `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+         VALUES ('lb_c', 'pc', ?, 'co_2', 5042002, ?, ?, 172800)`,
+      )
+      .run(tenant, FACTORY, tenant);
+  expect(() => insert(TENANT)).toThrow(/another tenant/);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_bodies").get()).toEqual({ n: 0 });
+  expect(() => insert(OWNER)).not.toThrow(); // the company's own tenant can
+});

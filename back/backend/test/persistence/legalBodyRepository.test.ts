@@ -245,3 +245,45 @@ test("an event detail the redactor made unparseable reads back as text, without 
   repo.recordEvent(r.legalBodyId, "note", "system", null, { block: 123456789 });
   expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toBe('{"block":[redacted]}');
 });
+
+test("a deploy re-sent while reserved keeps every submission; the landed hash is then locked", () => {
+  const id = toReserved();
+  expect(repo.recordDeploySubmission(id, { txHash: H("1"), rawTx: "0x01", nonce: 7 })).toBe(true);
+  expect(repo.recordDeploySubmission(id, { txHash: H("2"), rawTx: "0x02", nonce: 8 })).toBe(true);
+  expect(repo.findById(id)?.createTxHash).toBe(H("2"));
+  expect(
+    repo
+      .listEvents(id)
+      .filter((e) => e.kind === "deploy_submitted")
+      .map((e) => e.txHash),
+  ).toEqual([H("1"), H("2")]);
+  expect(repo.markDeployed(id, { txHash: H("2"), deployedAt: 1_800_000_000 })).toBe(true);
+  expect(() =>
+    db
+      .prepare("UPDATE legal_bodies SET create_tx_hash = ? WHERE legal_body_id = ?")
+      .run(H("9"), id),
+  ).toThrow(/write-once/);
+});
+
+test("create refuses a fractional amendment delay before writing anything", () => {
+  for (const amendmentDelay of [172800.5, Number.NaN])
+    expect(
+      () =>
+        repo.create({
+          tenantId: TENANT,
+          companyId: "co_1",
+          chainId: 5042002,
+          factory: FACTORY,
+          amendmentDelay,
+        }),
+      String(amendmentDelay),
+    ).toThrow(/amendmentDelay/);
+  expect(repo.listByTenant(TENANT)).toEqual([]);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_body_events").get()).toEqual({ n: 0 });
+});
+
+test("create refuses a company that belongs to another tenant, and writes nothing", () => {
+  expect(() => newBody(TENANT, "co_2")).toThrow(/another tenant/);
+  expect(repo.listByCompany("co_2")).toEqual([]);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_body_events").get()).toEqual({ n: 0 });
+});

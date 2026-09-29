@@ -96,7 +96,11 @@ export interface LegalBodyEvent {
 export type ReserveOutcome = "reserved" | "agent_taken" | "body_taken" | "not_draft" | "not_frozen";
 
 export interface LegalBodyRepository {
-  /** A new `draft`, guarded by its tenant, with its `created` event, in one write. */
+  /**
+   * A new `draft`, guarded by its tenant, with its `created` event, in one write. Throws for an
+   * amendment delay that is not a whole number of seconds, and (the database's own refusal) for
+   * a company that belongs to another tenant.
+   */
   create(p: {
     tenantId: Address;
     companyId: string;
@@ -373,6 +377,10 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     factory: Address;
     amendmentDelay: number;
   }): LegalBodyRecord {
+    // Refused here, before anything is written, with a message that names the field: the table
+    // refuses a fractional delay too, but as a bare CHECK failure.
+    if (!Number.isInteger(p.amendmentDelay))
+      throw new Error(`amendmentDelay must be a whole number of seconds, got ${p.amendmentDelay}`);
     const tenantId = getAddress(p.tenantId);
     const legalBodyId = `lb_${randomUUID()}`;
     return this.db.transaction(() => {
