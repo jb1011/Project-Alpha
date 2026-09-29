@@ -21,7 +21,7 @@ import { SqliteMonitorStore } from "./store";
  * reads the chain, reads legalbody.db READ-ONLY, writes only its own monitor.db, and shouts.
  *
  * It does read the platform key's ADDRESS (`managerAccount(cfg).address`) — the executor identity.
- * That is needed to tell the seven permanent standing grants apart from a break-glass grant that
+ * That is needed to tell the permanent standing grants apart from a break-glass grant that
  * outlived its ceremony; without it rule 2 would either page forever on the standing set or go
  * blind on grants to an attacker's address. The key material never leaves this function.
  */

@@ -1,6 +1,7 @@
-import type { Address } from "viem";
+import { type Address, pad, toFunctionSelector } from "viem";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { noviControllerAbi } from "../../src/abis/generated";
+import { LEGAL_BODY_GRANTED_SELECTORS, selectorRole } from "../../src/adapters/arc/bootVerify";
 import type { Alert, AlertSink } from "../../src/monitor/alerts";
 import type { EntityLookup, MonitoredEntity } from "../../src/monitor/entityLookup";
 import { EntityLookupError } from "../../src/monitor/errors";
@@ -490,6 +491,94 @@ describe("grant tracking and the TTL sweep", () => {
     }).tick();
     expect(store.listOpenGrants()).toHaveLength(0);
     expect(alerts.filter((a) => a.rule === "controller_grant_ttl_exceeded")).toHaveLength(0);
+  });
+});
+
+describe("TTL sweep: rows whose role became standing after they were opened", () => {
+  // The live shape: a legal-body grant to the executor was stored while the monitor did not yet
+  // count the legal-body roles as standing. The executor never revokes a standing grant, so unless
+  // the sweep closes the row it pages CRITICAL once per TTL interval, forever.
+  const LEGAL_BODY_ROLE = selectorRole(LEGAL_BODY_GRANTED_SELECTORS[0]!.selector).toLowerCase();
+  const UNKNOWN_ROLE = pad(toFunctionSelector("function upgradeTo(address)"), {
+    dir: "right",
+    size: 32,
+  }).toLowerCase();
+  // Checksummed, as the monitor's config carries it; the store keeps accounts lowercased.
+  const EXECUTOR = "0x069f4ADEabcBEd3ffFe2cB6Aaf9e7a66E8731456" as Address;
+  const CFG: MonitorConfig = { ...BASE_CFG, executor: EXECUTOR };
+  const TTL = BASE_CFG.grantTtlMs;
+
+  let store: SqliteMonitorStore;
+  beforeEach(() => {
+    store = SqliteMonitorStore.open(":memory:");
+    store.setCursor(999n);
+  });
+
+  function open(role: string, account: string, alertedCount = 0): void {
+    store.openGrant({ role, account: account.toLowerCase(), grantedAtBlock: 1n, grantedAtTs: 0 });
+    if (alertedCount > 0) store.setGrantAlertedCount(role, account, alertedCount);
+  }
+
+  function sweeper(now: number) {
+    const { sink, alerts } = collectingSink();
+    const lines: { event: string; fields?: Record<string, unknown> }[] = [];
+    const monitor = new Monitor({
+      rpc: rpcStub({ head: 1000n }),
+      store,
+      entities: lookup(),
+      sink,
+      cfg: CFG,
+      now: () => now,
+      log: (event, fields) => void lines.push({ event, fields }),
+    });
+    const nowStanding = () => lines.filter((l) => l.event === "monitor_grant_now_standing");
+    return { monitor, alerts, nowStanding };
+  }
+
+  test("a legal-body role held by the executor is closed by the sweep, with no page", async () => {
+    open(LEGAL_BODY_ROLE, EXECUTOR, 24); // it has already paged for 24 intervals
+    const { monitor, alerts, nowStanding } = sweeper(30 * TTL);
+    await monitor.tick();
+    await monitor.tick();
+    expect(store.listOpenGrants()).toHaveLength(0);
+    expect(alerts.filter((a) => a.severity === "CRITICAL")).toHaveLength(0);
+    expect(alerts).toHaveLength(0);
+    // One trail line, not one per tick: the row is gone after the first sweep.
+    expect(nowStanding()).toEqual([
+      {
+        event: "monitor_grant_now_standing",
+        fields: { role: LEGAL_BODY_ROLE, account: EXECUTOR.toLowerCase() },
+      },
+    ]);
+  });
+
+  test("the same role held by any other account still pages, in the same sweep", async () => {
+    open(LEGAL_BODY_ROLE, EXECUTOR);
+    open(LEGAL_BODY_ROLE, ADDR.attacker);
+    const { monitor, alerts, nowStanding } = sweeper(TTL + 60_000);
+    await monitor.tick();
+    const ttl = alerts.filter((a) => a.rule === "controller_grant_ttl_exceeded");
+    expect(ttl).toHaveLength(1);
+    expect(ttl[0]?.severity).toBe("CRITICAL");
+    expect(ttl[0]?.detail.account).toBe(ADDR.attacker.toLowerCase());
+    expect(store.listOpenGrants().map((g) => [g.account, g.alertedCount])).toEqual([
+      [ADDR.attacker.toLowerCase(), 1],
+    ]);
+    expect(nowStanding()).toHaveLength(1);
+  });
+
+  test("a role outside the standing set still pages, even when the executor holds it", async () => {
+    open(UNKNOWN_ROLE, EXECUTOR);
+    open(WILDCARD_ROLE.toLowerCase(), EXECUTOR);
+    const { monitor, alerts, nowStanding } = sweeper(TTL + 60_000);
+    await monitor.tick();
+    const ttl = alerts.filter((a) => a.rule === "controller_grant_ttl_exceeded");
+    expect(ttl.map((a) => a.severity)).toEqual(["CRITICAL", "CRITICAL"]);
+    expect(new Set(ttl.map((a) => a.detail.role))).toEqual(
+      new Set([UNKNOWN_ROLE, WILDCARD_ROLE.toLowerCase()]),
+    );
+    expect(store.listOpenGrants()).toHaveLength(2);
+    expect(nowStanding()).toHaveLength(0);
   });
 });
 

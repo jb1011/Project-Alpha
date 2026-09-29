@@ -4,6 +4,7 @@ import {
   type Hex,
   decodeEventLog,
   getAddress,
+  isAddress,
   isAddressEqual,
   zeroAddress,
 } from "viem";
@@ -200,12 +201,15 @@ function controllerRule(
         ),
       );
 
-    // Rule 2 bookkeeping. Two classes are deliberately NOT tracked for TTL:
-    //  - DEFAULT_ADMIN_ROLE: permanent by design (never renounce — design §8).
-    //  - a standing selector role held by the EXECUTOR: the exact pairing bootVerify asserts
-    //    on-chain at every API boot.
+    // Rule 2 bookkeeping. Two classes are deliberately NOT tracked for TTL (`isPermanentGrant`):
+    //  - DEFAULT_ADMIN_ROLE, whoever holds it: permanent by design, the controller is never left
+    //    without an admin. A change of holder pages through rules 4 and 5 instead.
+    //  - a standing selector role held by the EXECUTOR. What re-checks that pairing on chain
+    //    differs by set: bootVerify asserts the seven controller grants at every API boot, but the
+    //    two legal-body grants only when LEGAL_BODY_FACTORY_ADDRESS is set. When it is unset, their
+    //    grant is seen once (the WARN above) and nothing re-checks it on chain.
     // Everything else is a ceremony grant that is supposed to be revoked in the same transaction.
-    const permanent = isAdmin || (isStanding && isAddressEqual(account, ctx.executor));
+    const permanent = isPermanentGrant(roleHex, account, ctx);
     const grants: GrantOp[] = permanent
       ? []
       : [
@@ -788,6 +792,29 @@ function legalManagerRule(
 }
 
 // --- Rule 2: the open-grant TTL sweep ----------------------------------------------------------
+
+/**
+ * Rule 2's single definition of a grant that is permanent by design and so never TTL-tracked:
+ * DEFAULT_ADMIN_ROLE whoever holds it, or a standing selector role held by the executor. The
+ * RoleGranted rule uses it to decide whether to open a row; the sweep uses it to close a row that
+ * was opened before its role joined the standing set.
+ *
+ * Total on purpose: an `account` that is not an address is simply not the executor. The sweep
+ * walks stored rows, and a throw there would stop it paging on every other row.
+ */
+export function isPermanentGrant(
+  role: string,
+  account: string,
+  ctx: Pick<RuleContext, "executor" | "standingRoles">,
+): boolean {
+  const roleHex = role.toLowerCase();
+  if (roleHex === DEFAULT_ADMIN_ROLE) return true;
+  return (
+    ctx.standingRoles.has(roleHex) &&
+    isAddress(account, { strict: false }) &&
+    isAddressEqual(account, ctx.executor)
+  );
+}
 
 export interface TtlEscalation {
   alert: Alert;

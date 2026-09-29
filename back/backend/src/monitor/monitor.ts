@@ -6,7 +6,13 @@ import type { EntityIndex, EntityLookup, MonitoredEntity } from "./entityLookup"
 import { indexEntities } from "./entityLookup";
 import { standingRoles } from "./events";
 import type { MonitorRpc } from "./rpc";
-import { type GrantOp, type RuleContext, evaluateLog, ttlEscalations } from "./rules";
+import {
+  type GrantOp,
+  type RuleContext,
+  evaluateLog,
+  isPermanentGrant,
+  ttlEscalations,
+} from "./rules";
 import {
   MAX_LOG_RANGE,
   chunkRange,
@@ -15,7 +21,7 @@ import {
   isRangeTooLargeError,
   shrinkRange,
 } from "./scan";
-import type { MonitorStore } from "./store";
+import type { MonitorStore, OpenGrant } from "./store";
 
 /**
  * The watcher loop.
@@ -148,7 +154,7 @@ export class Monitor {
     const ctx = this.buildContext(index);
 
     await this.scan(ctx, index);
-    await this.sweepGrantTtl();
+    await this.sweepGrantTtl(ctx);
   }
 
   private async scan(ctx: RuleContext, index: EntityIndex): Promise<void> {
@@ -298,14 +304,21 @@ export class Monitor {
     }
   }
 
-  private async sweepGrantTtl(): Promise<void> {
+  private async sweepGrantTtl(ctx: RuleContext): Promise<void> {
     const { store, cfg, sink } = this.deps;
-    const escalations = ttlEscalations(
-      store.listOpenGrants(),
-      this.now(),
-      cfg.grantTtlMs,
-      cfg.controller,
-    );
+    // A row can become permanent after it was opened: the standing set grows with a release (the
+    // two legal-body grants joined it this way), and a grant made while an older build was running
+    // was stored as a ceremony grant. The executor never revokes a standing grant, and a revoke is
+    // the only other thing that closes a row, so such a row would page CRITICAL every interval,
+    // forever. Close it instead, with one trail line and no alert.
+    const open: OpenGrant[] = [];
+    for (const g of store.listOpenGrants()) {
+      if (isPermanentGrant(g.role, g.account, ctx)) {
+        store.closeGrant(g.role, g.account);
+        this.log("monitor_grant_now_standing", { role: g.role, account: g.account });
+      } else open.push(g);
+    }
+    const escalations = ttlEscalations(open, this.now(), cfg.grantTtlMs, cfg.controller);
     for (const e of escalations) {
       await sink.emit(e.alert);
       store.setGrantAlertedCount(e.role, e.account, e.alertedCount);
