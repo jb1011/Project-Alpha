@@ -122,7 +122,8 @@ export interface LegalBodyRepository {
   listByTenant(tenantId: string): LegalBodyRecord[];
   /** Newest first. */
   listByCompany(companyId: string): LegalBodyRecord[];
-  /** Freeze the operating agreement: once, and only while `draft`. */
+  /** Freeze the operating agreement: once, and only while `draft`. Throws for a version that is
+   *  not a whole number. */
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean;
   /**
    * Accept the identity owner's signed link: `draft` (agreement frozen) → `reserved`.
@@ -482,6 +483,10 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
   }
 
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean {
+    // Refused here, before anything is written, with a message that names the field: the table
+    // refuses it too, but as a bare CHECK failure.
+    if (!Number.isInteger(a.version))
+      throw new Error(`the agreement version must be a whole number, got ${a.version}`);
     return this.move(
       legalBodyId,
       () => this.stmts.freeze.run(a.hash, a.version, legalBodyId),

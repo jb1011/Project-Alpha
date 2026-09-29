@@ -654,3 +654,75 @@ test("an event id is always positive, so one bad row can never block every later
     n: 3,
   });
 });
+
+test("an agentId is TEXT with no hidden bytes: a BLOB or an embedded NUL cannot spell agent 42 again", () => {
+  // length() stops at the first NUL, and GLOB and substr read a BLOB as text, while the unique
+  // index compares full bytes and storage class: each of these was a second live row for 42.
+  insertDraft("lb_1", "p1");
+  freeze("lb_1");
+  reserve("lb_1", "42", BODY);
+  let n = 0;
+  for (const [label, agentSql] of [
+    ["BLOB '42'", "X'3432'"],
+    ["BLOB '042'", "X'303432'"],
+    ["'42' + NUL + 'x'", "'42' || char(0) || 'x'"],
+    ["'0' + NUL + '42'", "'0' || char(0) || '42'"],
+  ]) {
+    n += 1;
+    insertDraft(`lb_x${n}`, `px${n}`);
+    freeze(`lb_x${n}`);
+    expect(
+      () =>
+        db
+          .prepare(
+            `UPDATE legal_bodies SET agent_id = ${agentSql}, identity_owner = ?, link_digest = ?,
+               link_deadline = 1900000000, link_signature = '0x01', body_address = ?,
+               binding_state = 'reserved' WHERE legal_body_id = ?`,
+          )
+          .run(OWNER, H("b"), bodyN(n), `lb_x${n}`),
+      label,
+    ).toThrow(/CHECK/);
+  }
+  expect(
+    db
+      .prepare(
+        "SELECT legal_body_id, agent_id FROM legal_bodies WHERE binding_state IN ('reserved','deployed','linked')",
+      )
+      .all(),
+  ).toEqual([{ legal_body_id: "lb_1", agent_id: "42" }]);
+});
+
+test("the agreement version is an integer", () => {
+  insertDraft();
+  for (const v of [1.5, "v1"])
+    expect(
+      () =>
+        db
+          .prepare(
+            "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = ? WHERE legal_body_id = 'lb_1'",
+          )
+          .run(H("a"), v),
+      String(v),
+    ).toThrow(/CHECK/);
+  freeze();
+  expect(
+    db
+      .prepare(
+        "SELECT oa_manifest_version AS v, typeof(oa_manifest_version) AS t FROM legal_bodies",
+      )
+      .get(),
+  ).toEqual({ v: 1, t: "integer" });
+});
+
+test("a legal body id is never NULL", () => {
+  // SQLite lets a non-INTEGER PRIMARY KEY hold NULL (a legacy behaviour), unless it says NOT NULL.
+  expect(() =>
+    db
+      .prepare(
+        `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+         VALUES (NULL, 'pn', ?, 'co_1', 5042002, ?, ?, 172800)`,
+      )
+      .run(TENANT, FACTORY, TENANT),
+  ).toThrow(/NOT NULL/);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_bodies").get()).toEqual({ n: 0 });
+});

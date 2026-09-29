@@ -192,9 +192,10 @@ const COMPANIES_DDL = `
  *    is refused by the foreign key);
  *  - the amendment delay is within the factory contract's bounds (48 hours .. 30 days);
  *  - every number column holds an integer (a fractional value is refused, never stored as REAL),
- *    and an agentId has one spelling: canonical decimal, no leading zero, at most 78 digits (the
- *    width of a uint256). The one-live-body index compares agent_id as TEXT, so '042' would
- *    otherwise be a second live body for agent 42;
+ *    and an agentId has one spelling: TEXT with no hidden bytes, canonical decimal, no leading
+ *    zero, at most 78 digits (the width of a uint256). The one-live-body index compares full
+ *    bytes and storage class, so '042', a BLOB '42' or '42' followed by a NUL would otherwise
+ *    each be a second live body for agent 42;
  *  - rows are born `draft`, and an INSERT never lands on an existing row (a trigger). That is what
  *    stops `REPLACE INTO` from rewriting a body wholesale: REPLACE deletes the old row and inserts
  *    a new one, and no UPDATE guard below would ever see it;
@@ -229,7 +230,7 @@ const COMPANIES_DDL = `
  */
 export const LEGAL_BODIES_DDL = `
   CREATE TABLE IF NOT EXISTS legal_bodies (
-    legal_body_id TEXT PRIMARY KEY,
+    legal_body_id TEXT PRIMARY KEY NOT NULL,
     public_id TEXT NOT NULL UNIQUE,
     tenant_id TEXT NOT NULL,
     company_id TEXT NOT NULL REFERENCES companies(company_id),
@@ -239,8 +240,10 @@ export const LEGAL_BODIES_DDL = `
     amendment_delay INTEGER NOT NULL CHECK (typeof(amendment_delay) = 'integer')
       CHECK (amendment_delay BETWEEN 172800 AND 2592000),
     oa_manifest_hash TEXT,
-    oa_manifest_version INTEGER,
-    agent_id TEXT CHECK (agent_id IS NULL OR (length(agent_id) BETWEEN 1 AND 78
+    oa_manifest_version INTEGER
+      CHECK (oa_manifest_version IS NULL OR typeof(oa_manifest_version) = 'integer'),
+    agent_id TEXT CHECK (agent_id IS NULL OR (typeof(agent_id) = 'text'
+      AND length(CAST(agent_id AS BLOB)) = length(agent_id) AND length(agent_id) BETWEEN 1 AND 78
       AND agent_id NOT GLOB '*[^0-9]*' AND (agent_id = '0' OR substr(agent_id, 1, 1) != '0'))),
     identity_owner TEXT,
     link_digest TEXT,

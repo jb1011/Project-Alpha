@@ -367,3 +367,14 @@ test("a raw event with a non-positive id is refused, and every later write still
     "note",
   ]);
 });
+
+test("freezeAgreement refuses a version that is not a whole number, before writing", () => {
+  const r = newBody();
+  for (const version of [1.5, "v1" as unknown as number])
+    expect(
+      () => repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version }),
+      String(version),
+    ).toThrow(/version/);
+  expect(repo.findById(r.legalBodyId)?.oaManifestHash).toBeNull();
+  expect(repo.listEvents(r.legalBodyId).map((e) => e.kind)).toEqual(["created"]);
+});
