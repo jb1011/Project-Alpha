@@ -293,8 +293,8 @@ const stateOf = (d: Database.Database) =>
     }
   ).binding_state;
 
-/** A fresh database holding `lb_1` (with its `created` event), walked legally into `state`. */
-function bodyIn(state: State): Database.Database {
+/** A fresh, migrated database with the tenant's company `co_1`. */
+function freshDb(): Database.Database {
   const d = new Database(":memory:");
   d.pragma("foreign_keys = ON");
   migrate(d);
@@ -302,16 +302,28 @@ function bodyIn(state: State): Database.Database {
     `INSERT INTO companies (company_id, tenant_id, status, provider, environment, name_options, business_purpose, industry_label)
      VALUES ('co_1', ?, 'ready', 'customer', 'sandbox', '["Acme LLC"]', 'existing', 'existing')`,
   ).run(TENANT);
+  return d;
+}
+
+/** A frozen draft `id` in `d`, with its `created` event unless `withEvent` is false. */
+function frozenDraftIn(d: Database.Database, id: string, withEvent = true) {
   d.prepare(
     `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
-     VALUES ('lb_1', 'pub-1', ?, 'co_1', 5042002, ?, ?, 172800)`,
-  ).run(TENANT, FACTORY, TENANT);
+     VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+  ).run(id, `pub-${id}`, TENANT, FACTORY, TENANT);
+  if (withEvent)
+    d.prepare(
+      "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES (?, 'created', 'system')",
+    ).run(id);
   d.prepare(
-    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'created', 'system')",
-  ).run();
-  d.prepare(
-    "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = 'lb_1'",
-  ).run(H("a"));
+    "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = ?",
+  ).run(H("a"), id);
+}
+
+/** A fresh database holding `lb_1` (with its `created` event), walked legally into `state`. */
+function bodyIn(state: State): Database.Database {
+  const d = freshDb();
+  frozenDraftIn(d, "lb_1");
   for (const s of PATH[state]) moveTo(d, s);
   expect(stateOf(d)).toBe(state);
   return d;
@@ -785,4 +797,76 @@ test("each unique index names itself in its own way, which the repository's mapp
   expect(() => reserve("lb_3", "43", BODY)).toThrow(
     "UNIQUE constraint failed: index 'idx_legal_bodies_body'",
   );
+});
+
+test("the residual, exactly as documented: an OR REPLACE move evicts only a row with no event", () => {
+  // SQLite deletes the row an OR REPLACE conflict evicts without firing its delete trigger. What
+  // protects every row the repository creates is the events foreign key (each has its `created`
+  // event); only a row written around the repository, with no event, can be evicted.
+  const reserveSet = (agent: string, body: string) =>
+    `agent_id = '${agent}', identity_owner = '${OWNER}', link_digest = '${H("b")}',
+     link_deadline = 1900000000, link_signature = '0x01', body_address = '${body}',
+     binding_state = 'reserved'`;
+  for (const holderHasEvent of [true, false]) {
+    // A reservation onto the agentId a live holder has.
+    {
+      const d = freshDb();
+      frozenDraftIn(d, "holder", holderHasEvent);
+      d.prepare(
+        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = 'holder'`,
+      ).run();
+      frozenDraftIn(d, "mover");
+      const evict = () =>
+        d
+          .prepare(
+            `UPDATE OR REPLACE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = 'mover'`,
+          )
+          .run();
+      if (holderHasEvent) expect(evict).toThrow(/FOREIGN KEY/);
+      else expect(evict().changes).toBe(1);
+      const ids = d.prepare("SELECT legal_body_id FROM legal_bodies ORDER BY 1").all();
+      expect(ids, `reserve, holder event: ${holderHasEvent}`).toEqual(
+        holderHasEvent
+          ? [{ legal_body_id: "holder" }, { legal_body_id: "mover" }]
+          : [{ legal_body_id: "mover" }],
+      );
+      d.close();
+    }
+    // A re-link of a broken body while a new holder has its agentId live.
+    {
+      const d = freshDb();
+      frozenDraftIn(d, "mover");
+      d.prepare(
+        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = 'mover'`,
+      ).run();
+      d.prepare(
+        `UPDATE legal_bodies SET ${DEPLOY_SET}, binding_state = 'deployed' WHERE legal_body_id = 'mover'`,
+      ).run();
+      d.prepare(
+        "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1 WHERE legal_body_id = 'mover'",
+      ).run();
+      d.prepare(
+        "UPDATE legal_bodies SET binding_state = 'broken' WHERE legal_body_id = 'mover'",
+      ).run();
+      frozenDraftIn(d, "holder", holderHasEvent);
+      d.prepare(
+        `UPDATE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = 'holder'`,
+      ).run();
+      const evict = () =>
+        d
+          .prepare(
+            "UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 2 WHERE legal_body_id = 'mover'",
+          )
+          .run();
+      if (holderHasEvent) expect(evict).toThrow(/FOREIGN KEY/);
+      else expect(evict().changes).toBe(1);
+      const ids = d.prepare("SELECT legal_body_id FROM legal_bodies ORDER BY 1").all();
+      expect(ids, `re-link, holder event: ${holderHasEvent}`).toEqual(
+        holderHasEvent
+          ? [{ legal_body_id: "holder" }, { legal_body_id: "mover" }]
+          : [{ legal_body_id: "mover" }],
+      );
+      d.close();
+    }
+  }
 });

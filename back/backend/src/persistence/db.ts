@@ -186,43 +186,53 @@ const COMPANIES_DDL = `
  * event log. Kept apart from `entities` on purpose: a legal body has no treasury, no operator, no
  * custody and no onboarding saga, so no existing agent query can ever mistake one for an agent.
  *
- * The table enforces its own invariants rather than trusting callers:
- *  - the guardian IS the tenant (the human's signed-in wallet), structurally, and a body is only
- *    ever created under a company of that same tenant (a trigger; a company that does not exist
- *    is refused by the foreign key);
- *  - the amendment delay is within the factory contract's bounds (48 hours .. 30 days);
- *  - every number column holds an integer (a fractional value is refused, never stored as REAL),
- *    and an agentId has one spelling: TEXT with no hidden bytes, canonical decimal, no leading
- *    zero, at most 78 digits (the width of a uint256). The one-live-body index compares full
- *    bytes and storage class, so '042', a BLOB '42' or '42' followed by a NUL would otherwise
- *    each be a second live body for agent 42;
- *  - rows are born `draft`, and an INSERT never lands on an existing row (a trigger). That is what
+ * The tables enforce their own invariants rather than trusting callers. The foreign keys below
+ * hold on a connection with foreign keys on, as `openDatabase` opens every one.
+ *  - The guardian IS the tenant (the human's signed-in wallet), structurally (a CHECK), and a body
+ *    can only be created under a company of that same tenant (checked on INSERT, by a trigger; a
+ *    company that does not exist is refused by the foreign key).
+ *  - The amendment delay is within the factory contract's bounds, 48 hours to 30 days inclusive.
+ *  - Every number column holds an integer: anything else (a fraction, text such as 'v1', a BLOB)
+ *    is refused rather than stored as REAL or TEXT.
+ *  - An agentId has one spelling: TEXT with no hidden bytes, decimal digits only, no leading zero
+ *    except '0' itself, at most 78 digits (the width of a uint256). The one-live-body index
+ *    compares full bytes and storage class, so '042', a BLOB '42' or '42' followed by a NUL would
+ *    otherwise each be a second live body for agent 42.
+ *  - A body address is TEXT with no hidden bytes: `0x`, then exactly 40 hex digits.
+ *  - Rows are born `draft`, and an INSERT never lands on an existing row (a trigger). That is what
  *    stops `REPLACE INTO` from rewriting a body wholesale: REPLACE deletes the old row and inserts
- *    a new one, and no UPDATE guard below would ever see it;
- *  - identity, agreement and link fields are write-once (a trigger), and so are the deploy facts
- *    once the body is deployed, so a future method, migration or operator cannot re-point a
- *    reservation or a deployed body at another agent, owner, agreement or creating transaction;
- *  - binding_state only moves along the legal transitions (a trigger). The trigger also refuses a
- *    NULL target, which `UPDATE OR REPLACE` would otherwise quietly turn into the column default,
- *    `draft`, handing a live body's agentId back without a single legal move;
- *  - a `draft` holds no link fields, so it can never squat on an agentId or a body address;
- *    leaving `draft` requires every link field AND a frozen agreement, and `deployed` onwards
- *    requires the deploy facts (CHECKs);
- *  - one LIVE body per agentId per chain (a partial unique index), and one row per body address
- *    per chain whatever its casing (a unique index on its lower-case form); a body address is a
- *    well-formed 0x address: TEXT, `0x` then exactly 40 hex digits, no hidden bytes;
- *  - rows are never deleted, and the event log is append-only: no UPDATE, no DELETE, and no
- *    INSERT over an existing event id. Event ids are always positive (a CHECK), which that last
- *    guard relies on.
+ *    a new one, and no UPDATE guard would ever see it.
+ *  - Each group of facts is write-once from the step that sets it (a trigger): the identity
+ *    fields from the INSERT, the agreement (hash and version) from the freeze, the link fields
+ *    from the reservation, the deploy facts (deployed_at and create_tx_hash) from the deploy. So
+ *    no future method, migration or operator can re-point a reservation or a deployed body at
+ *    another agent, owner, agreement or creating transaction.
+ *  - binding_state only moves along the legal transitions (a trigger), and a NULL target is
+ *    refused too: `UPDATE OR REPLACE` would otherwise quietly turn it into the column default,
+ *    `draft`, which no transition reaches.
+ *  - A `draft` holds no link fields, so it can never squat on an agentId or a body address;
+ *    leaving `draft` requires every link field and a frozen agreement; `deployed`, `linked`,
+ *    `broken` and `superseded` require the deploy facts, and `linked` a sighting of the pointer
+ *    (CHECKs).
+ *  - At most one LIVE body (reserved, deployed or linked) per agentId per chain (a partial unique
+ *    index), and at most one row per body address per chain, whatever its casing (a unique index
+ *    on its lower-case form).
+ *  - No DELETE removes a legal body (a trigger); the one way SQLite removes a row without a DELETE
+ *    is described below. The event log is append-only: no UPDATE, no DELETE, no INSERT over an
+ *    existing event id, and every event id is positive (a CHECK), which that last guard relies on.
  *
- * What the triggers cannot see: when `UPDATE OR REPLACE` resolves a unique-index conflict, SQLite
- * deletes the conflicting row WITHOUT firing its delete triggers (they fire only with
- * `recursive_triggers` on, which is a per-connection setting that would change trigger behaviour
- * on every table, so it stays off). A raw `UPDATE OR REPLACE` that reserves an agentId or a body
- * address another row holds could therefore evict that row. The events foreign key refuses the
- * eviction of any row that has at least one event, and every row the repository creates is
- * written together with its `created` event, so what remains needs raw SQL against a row that
- * was itself created without the repository.
+ * What the triggers cannot see: when an `OR REPLACE` write resolves a unique-index conflict,
+ * SQLite deletes the conflicting row WITHOUT firing its delete triggers (they fire only with
+ * `recursive_triggers` on, a per-connection setting that would change trigger behaviour on every
+ * table, so it stays off). So any raw `OR REPLACE` write that gets past the triggers and collides
+ * on a unique index can evict a row that has no events. An INSERT never gets that far: it is
+ * refused before any collision, because rows are born draft, never over an existing row, and a
+ * draft holds nothing the partial indexes see. What remains is an `UPDATE OR REPLACE` that
+ * reserves an agentId or a body address another row holds, or that re-links a broken body while
+ * another row holds its agentId live. The events foreign key refuses to evict any row that has at
+ * least one event, and every row the repository creates is written together with its `created`
+ * event. So the eviction needs raw SQL against a row that was itself created without the
+ * repository.
  *
  * `create_tx_hash` is deliberately NOT write-once while the row is `reserved`: a deploy whose
  * first transaction never lands is re-sent with a new nonce, and so a new hash. Every submission

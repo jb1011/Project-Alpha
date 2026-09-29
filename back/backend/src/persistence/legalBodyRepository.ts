@@ -130,8 +130,9 @@ export interface LegalBodyRepository {
    *
    * Losing a race is an answer, never an exception: `agent_taken` when another body holds the
    * agentId live on this chain (it takes precedence when the body address collides too),
-   * `body_taken` when another row already recorded the body address. Throws only for input no
-   * row may hold: an agentId that is not a uint256 in decimal, or an address that is not one.
+   * `body_taken` when another row already recorded the body address, in any casing. Throws only
+   * for input no row may hold: an agentId that is not a uint256 in decimal, an address that is
+   * not one, or a deadline that is not a whole number (the table's CHECK).
    */
   reserve(
     legalBodyId: string,
