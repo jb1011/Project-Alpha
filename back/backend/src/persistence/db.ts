@@ -209,7 +209,8 @@ const COMPANIES_DDL = `
  *    requires the deploy facts (CHECKs);
  *  - one LIVE body per agentId per chain (a partial unique index), and one row per body address;
  *  - rows are never deleted, and the event log is append-only: no UPDATE, no DELETE, and no
- *    INSERT over an existing event id.
+ *    INSERT over an existing event id. Event ids are always positive (a CHECK), which that last
+ *    guard relies on.
  *
  * What the triggers cannot see: when `UPDATE OR REPLACE` resolves a unique-index conflict, SQLite
  * deletes the conflicting row WITHOUT firing its delete triggers (they fire only with
@@ -336,7 +337,7 @@ export const LEGAL_BODIES_DDL = `
   END;
 
   CREATE TABLE IF NOT EXISTS legal_body_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id > 0),
     legal_body_id TEXT NOT NULL REFERENCES legal_bodies(legal_body_id),
     kind TEXT NOT NULL,
     actor TEXT NOT NULL,
@@ -355,6 +356,9 @@ export const LEGAL_BODIES_DDL = `
   BEGIN
     SELECT RAISE(ABORT, 'legal_body_events is append-only');
   END;
+  -- This trigger relies on no stored id ever being <= 0, which the CHECK on id guarantees: for an
+  -- auto-generated id, SQLite's NEW.id in a BEFORE INSERT trigger is a placeholder (-1), not a
+  -- real id, so a stored -1 would make every ordinary append look like a REPLACE.
   CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_replace
   BEFORE INSERT ON legal_body_events FOR EACH ROW
   WHEN EXISTS (SELECT 1 FROM legal_body_events WHERE id = NEW.id)

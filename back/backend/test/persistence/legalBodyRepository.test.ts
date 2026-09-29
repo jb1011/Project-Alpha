@@ -348,3 +348,22 @@ test("create refuses a company that belongs to another tenant, and writes nothin
   expect(repo.listByCompany("co_2")).toEqual([]);
   expect(db.prepare("SELECT COUNT(*) AS n FROM legal_body_events").get()).toEqual({ n: 0 });
 });
+
+test("a raw event with a non-positive id is refused, and every later write still appends", () => {
+  const r = newBody();
+  expect(() =>
+    db
+      .prepare(
+        "INSERT INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (-1, ?, 'note', 'operator:x')",
+      )
+      .run(r.legalBodyId),
+  ).toThrow(/CHECK/);
+  expect(repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version: 1 })).toBe(true);
+  repo.recordEvent(r.legalBodyId, "note", "system", null, null);
+  expect(newBody().bindingState).toBe("draft");
+  expect(repo.listEvents(r.legalBodyId).map((e) => e.kind)).toEqual([
+    "created",
+    "agreement_frozen",
+    "note",
+  ]);
+});

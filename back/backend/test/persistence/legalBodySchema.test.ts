@@ -610,3 +610,47 @@ test("the transition matrix: exactly the legal edges move; every other pair, and
   }
   expect(moved.sort()).toEqual([...LEGAL].sort());
 });
+
+test("an event id is always positive, so one bad row can never block every later append", () => {
+  insertDraft();
+  // The premise: SQLite shows a BEFORE INSERT trigger an auto-generated id as a placeholder that
+  // is not a real id (-1 today), and the no-replace trigger looks that value up. A stored id of -1
+  // would therefore make every ordinary append look like an INSERT over an existing event.
+  db.exec(`CREATE TEMP TABLE seen_ids (id INTEGER);
+    CREATE TEMP TRIGGER log_new_id BEFORE INSERT ON legal_body_events
+    BEGIN INSERT INTO seen_ids VALUES (NEW.id); END;`);
+  const append = (id = "lb_1") =>
+    db
+      .prepare(
+        "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES (?, 'note', 'system')",
+      )
+      .run(id);
+  append();
+  expect((db.prepare("SELECT id FROM seen_ids").get() as { id: number }).id).toBeLessThanOrEqual(0);
+  for (const id of [-1, 0])
+    expect(
+      () =>
+        db
+          .prepare(
+            "INSERT INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (?, 'lb_1', 'note', 'operator:x')",
+          )
+          .run(id),
+      String(id),
+    ).toThrow(/CHECK/);
+  // Ordinary appends keep working, for this body and for a new body's first event.
+  expect(append().changes).toBe(1);
+  insertDraft("lb_2", "p2");
+  expect(append("lb_2").changes).toBe(1);
+  // REPLACE over an existing id is still refused.
+  expect(() =>
+    db
+      .prepare(
+        "REPLACE INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (1, 'lb_1', 'note', 'operator:x')",
+      )
+      .run(),
+  ).toThrow(/append-only/);
+  expect(db.prepare("SELECT MIN(id) AS lo, COUNT(*) AS n FROM legal_body_events").get()).toEqual({
+    lo: 1,
+    n: 3,
+  });
+});
