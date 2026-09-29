@@ -88,7 +88,7 @@ export interface LegalBodyEvent {
   kind: LegalBodyEventKind;
   actor: LegalBodyActor;
   txHash: Hex | null;
-  /** The recorded detail, PII-redacted at the write. See `parseDetail` for its one irregularity. */
+  /** The recorded detail, its strings PII-redacted at the write (see `recordEvent`). */
   detail: unknown;
   createdAt: string;
 }
@@ -150,6 +150,13 @@ export interface LegalBodyRepository {
   ): boolean;
   markDeployed(legalBodyId: string, d: { txHash: Hex; deployedAt: number }): boolean;
   lapse(legalBodyId: string, reason: string): boolean;
+  /**
+   * `deployed` | `broken` → `linked`. False when the body is in neither state, AND when another
+   * body holds the same agentId live: `broken` is not a live state, so a new reservation can take
+   * the agentId while this body is broken, and linking this one again would make two live bodies
+   * for one identity. The caller must resolve that collision; which body keeps the agentId is the
+   * binding sweeper's policy, not this repository's. Nothing is recorded either way.
+   */
   markLinked(legalBodyId: string, seenAt: number): boolean;
   markBroken(legalBodyId: string, detail: Record<string, unknown>): boolean;
   supersede(legalBodyId: string, bySupersedingId: string): boolean;
@@ -157,7 +164,12 @@ export interface LegalBodyRepository {
   scheduleBindingCheck(legalBodyId: string, nextAt: number | null, intervalMs: number | null): void;
   /** Rows whose next binding check is due at `now`, soonest first. */
   listBindingDue(now: number, limit: number): LegalBodyRecord[];
-  /** Append one event. `detail` is PII-redacted before it is written. */
+  /**
+   * Append one event. Every string in `detail` (values and keys, at any depth) is PII-redacted
+   * before it is written; numbers, booleans and null are stored exactly. So numeric facts
+   * (nonces, block numbers, amounts, timestamps) must be written as JSON numbers: a nine-digit
+   * value written as a STRING is SSN-shaped to the redactor, and is redacted.
+   */
   recordEvent(
     legalBodyId: string,
     kind: LegalBodyEventKind,
@@ -238,12 +250,39 @@ function toRecord(r: Row): LegalBodyRecord {
 }
 
 /**
+ * Every string in a JSON tree, values and keys alike, through the PII redactor; numbers,
+ * booleans and null untouched.
+ *
+ * Redacting the serialized blob instead would treat a nine-digit NUMBER as an SSN, since the
+ * redactor sees digits, not types. It would turn `{"nonce":123456789}` into `{"nonce":[redacted]}`,
+ * destroying a block number or a nonce and leaving text that is no longer JSON. Keys are redacted
+ * too because they are text like any other: the blob redaction this replaces covered them.
+ */
+function redactStrings(value: unknown): unknown {
+  if (typeof value === "string") return redactPii(value);
+  if (Array.isArray(value)) return value.map(redactStrings);
+  if (value !== null && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value).map(([key, inner]) => [redactPii(key), redactStrings(inner)]),
+    );
+  return value;
+}
+
+/**
+ * The detail as it is stored. First it becomes plain JSON data, exactly what `JSON.stringify`
+ * makes of it: a Date becomes its ISO string and an undefined field is dropped. Then its strings
+ * are redacted. The result is always valid JSON.
+ */
+function serializeDetail(detail: Record<string, unknown>): string {
+  return JSON.stringify(redactStrings(JSON.parse(JSON.stringify(detail))));
+}
+
+/**
  * The stored detail, parsed back; null stays null.
  *
- * One irregularity, on purpose: the PII redactor rewrites a nine-digit NUMBER (it is SSN-shaped)
- * to an unquoted `[redacted]`, and what is left is no longer JSON. That detail comes back as the
- * stored text rather than throwing, because one unreadable event must never make a legal body's
- * whole history unreadable, and the text is what an operator needs from it anyway.
+ * Everything `recordEvent` writes is valid JSON. A row written around it, by raw SQL, might not
+ * be, and that detail comes back as the stored text rather than throwing: one unreadable event
+ * must never make a legal body's whole history unreadable.
  */
 function parseDetail(raw: string | null): unknown {
   if (raw === null) return null;
@@ -535,15 +574,28 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
   }
 
   markLinked(legalBodyId: string, seenAt: number): boolean {
-    // `seenAt` goes into the event too: the column is overwritten by every re-link, the log keeps
-    // each sighting.
-    return this.move(
-      legalBodyId,
-      () => this.stmts.markLinked.run(seenAt, legalBodyId),
-      "linked",
-      null,
-      { seenAt },
-    );
+    try {
+      // `seenAt` goes into the event too: the column is overwritten by every re-link, the log
+      // keeps each sighting.
+      return this.move(
+        legalBodyId,
+        () => this.stmts.markLinked.run(seenAt, legalBodyId),
+        "linked",
+        null,
+        { seenAt },
+      );
+    } catch (e) {
+      // The one refusal that is an answer: another body holds this agentId live (the partial
+      // unique index on live agentIds). The move and its event were rolled back together, so
+      // nothing is recorded. Anything else is a real failure, and it propagates.
+      if (
+        (e as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE" &&
+        e instanceof Error &&
+        e.message.includes("agent_id")
+      )
+        return false;
+      throw e;
+    }
   }
 
   markBroken(legalBodyId: string, detail: Record<string, unknown>): boolean {
@@ -584,13 +636,13 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     // Redacted at the write, the rule the entity event log follows, so no producer has to
     // remember: detail may one day carry a provider's error text or a customer's words, and an
     // SSN that reached this append-only table could never be taken out again. The redactor
-    // leaves hashes and addresses alone.
+    // leaves hashes and addresses alone, and only strings are given to it (see redactStrings).
     this.stmts.insertEvent.run(
       legalBodyId,
       kind,
       actor,
       txHash,
-      detail === null ? null : redactPii(JSON.stringify(detail)),
+      detail === null ? null : serializeDetail(detail),
     );
   }
 

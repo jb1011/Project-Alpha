@@ -238,12 +238,69 @@ test("an agentId has one spelling: leading zeros are normalized, anything else i
   expect(repo.findById(b.legalBodyId)?.bindingState).toBe("draft");
 });
 
-test("an event detail the redactor made unparseable reads back as text, without the digits", () => {
-  // A nine-digit NUMBER is SSN-shaped, and the redactor rewrites it to an unquoted `[redacted]`,
-  // which is no longer JSON. Reading the history must not throw because of it.
+test("a detail written by raw SQL that is not JSON reads back as text instead of throwing", () => {
+  // recordEvent always writes valid JSON; this is the defence against a row written around it.
   const r = newBody();
-  repo.recordEvent(r.legalBodyId, "note", "system", null, { block: 123456789 });
+  db.prepare(
+    "INSERT INTO legal_body_events (legal_body_id, kind, actor, detail) VALUES (?, 'note', 'system', ?)",
+  ).run(r.legalBodyId, '{"block":[redacted]}');
   expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toBe('{"block":[redacted]}');
+});
+
+const storedDetail = (legalBodyId: string) =>
+  (
+    db
+      .prepare("SELECT detail FROM legal_body_events WHERE legal_body_id = ? ORDER BY id DESC")
+      .get(legalBodyId) as { detail: string }
+  ).detail;
+
+test("event detail keeps every number exactly: redaction touches strings only", () => {
+  // A nine-digit NUMBER is SSN-shaped to the redactor, and Arc block numbers pass 100,000,000:
+  // redacting the serialized blob would destroy them, and leave text that is no longer JSON.
+  const r = newBody();
+  const detail = { nonce: 123456789, observedAtBlock: 100000001, amount: 150000000 };
+  repo.recordEvent(r.legalBodyId, "note", "system", null, detail);
+  expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toEqual(detail);
+  expect(JSON.parse(storedDetail(r.legalBodyId))).toEqual(detail);
+});
+
+test("event detail redacts every string, however deeply nested, and keys too", () => {
+  const r = newBody();
+  repo.recordEvent(r.legalBodyId, "note", "operator:x", null, { text: "SSN 123-45-6789" });
+  expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toEqual({ text: "SSN [redacted]" });
+  repo.recordEvent(r.legalBodyId, "note", "operator:x", null, {
+    a: { b: ["123-45-6789", 123456789, true, null] },
+  });
+  expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toEqual({
+    a: { b: ["[redacted]", 123456789, true, null] },
+  });
+  // A key is text the redactor must see as well: the whole-blob redaction this replaces did.
+  repo.recordEvent(r.legalBodyId, "note", "operator:x", null, { "123-45-6789": "on file" });
+  expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toEqual({ "[redacted]": "on file" });
+  expect(storedDetail(r.legalBodyId)).not.toContain("6789");
+  // Every stored detail parses: nothing recordEvent writes needs the text fallback.
+  const raw = db.prepare("SELECT detail FROM legal_body_events WHERE detail IS NOT NULL").all() as {
+    detail: string;
+  }[];
+  for (const { detail } of raw) expect(() => JSON.parse(detail), detail).not.toThrow();
+});
+
+test("markLinked answers false, and records nothing, when another body holds the agentId live", () => {
+  // `broken` is not a live state, so a new body can reserve the agentId in the meantime; when the
+  // pointer then comes back to the old body, re-linking it would break the one-live-body index.
+  const old = toDeployed("42", BODY_A);
+  expect(repo.markLinked(old, 1_800_000_100)).toBe(true);
+  expect(repo.markBroken(old, { why: "pointer cleared" })).toBe(true);
+  const fresh = newBody();
+  repo.freezeAgreement(fresh.legalBodyId, { hash: H("a"), version: 1 });
+  expect(repo.reserve(fresh.legalBodyId, link("42", BODY_B))).toBe("reserved");
+  const eventsBefore = repo.listEvents(old);
+  expect(repo.markLinked(old, 1_800_000_200)).toBe(false);
+  expect(repo.findById(old)?.bindingState).toBe("broken");
+  expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_100);
+  expect(repo.listEvents(old)).toEqual(eventsBefore);
+  // Only that collision is an answer: any other refusal still throws.
+  expect(() => repo.markLinked(old, 1.5)).toThrow(/CHECK/);
 });
 
 test("a deploy re-sent while reserved keeps every submission; the landed hash is then locked", () => {
