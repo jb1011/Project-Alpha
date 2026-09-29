@@ -7,10 +7,12 @@ import {
   isAddressEqual,
   pad,
   toFunctionSelector,
+  zeroAddress,
 } from "viem";
 import {
   agentTreasuryAbi,
   iIdentityRegistryAbi,
+  legalBodyFactoryAbi,
   legalManagerAbi,
   legalManagerFactoryAbi,
   noviControllerAbi,
@@ -85,6 +87,27 @@ export const CONTROLLER_GRANTED_SELECTORS: readonly GrantedSelector[] = [
 /** The two selectors M5 pins to the identity registry (design §3). */
 export const CONTROLLER_PINNED_SELECTORS: readonly GrantedSelector[] =
   CONTROLLER_GRANTED_SELECTORS.filter((s) => s.name.startsWith("IdentityRegistry."));
+
+/**
+ * The executor's two grants on the legal-body factory: create a body with the identity owner's
+ * signature, and schedule an amendment the body's guardian signed. Derived from the generated ABI,
+ * never hardcoded. Both are pinned to the factory (setBoundTarget) before they are granted, so they
+ * can never be relayed at another contract.
+ */
+export const LEGAL_BODY_GRANTED_SELECTORS: readonly GrantedSelector[] = [
+  {
+    name: "LegalBodyFactory.createLegalBody",
+    selector: selectorOf(legalBodyFactoryAbi, "LegalBodyFactory", "createLegalBody"),
+  },
+  {
+    name: "LegalBodyFactory.scheduleOperatingAgreementUpdate",
+    selector: selectorOf(
+      legalBodyFactoryAbi,
+      "LegalBodyFactory",
+      "scheduleOperatingAgreementUpdate",
+    ),
+  },
+] as const;
 
 /**
  * `role id = bytes32(bytes4 selector)` — the selector LEFT-aligned in a bytes32 (the Euler shape
@@ -183,6 +206,90 @@ export async function assertControllerWiring(
         .join(
           ", ",
         )} — an unpinned registry selector may be relayed at any contract; set it via controller.setBoundTarget from the admin`,
+    );
+}
+
+/**
+ * Legal-body mode: prove the factory belongs to the controller with no handover pending, reads the
+ * configured identity registry, and that both executor grants exist and are pinned to it. Every
+ * mismatch otherwise surfaces at a customer's first order as an opaque relay revert.
+ */
+export async function assertLegalBodyFactoryWiring(
+  publicClient: PublicClient,
+  p: { factory: Address; controller: Address; identityRegistry: Address; executor: Address },
+): Promise<void> {
+  let owner: Address;
+  let pendingOwner: Address;
+  let registry: Address;
+  let pins: readonly Address[];
+  let grants: readonly boolean[];
+  try {
+    [owner, pendingOwner, registry, pins, grants] = await Promise.all([
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "owner",
+      }) as Promise<Address>,
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "pendingOwner",
+      }) as Promise<Address>,
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "identityRegistry",
+      }) as Promise<Address>,
+      Promise.all(
+        LEGAL_BODY_GRANTED_SELECTORS.map(
+          (s) =>
+            publicClient.readContract({
+              address: p.controller,
+              abi: noviControllerAbi,
+              functionName: "boundTarget",
+              args: [s.selector],
+            }) as Promise<Address>,
+        ),
+      ),
+      Promise.all(
+        LEGAL_BODY_GRANTED_SELECTORS.map(
+          (s) =>
+            publicClient.readContract({
+              address: p.controller,
+              abi: noviControllerAbi,
+              functionName: "hasRole",
+              args: [selectorRole(s.selector), p.executor],
+            }) as Promise<boolean>,
+        ),
+      ),
+    ]);
+  } catch (err) {
+    throw unreadable(`the legal-body factory wiring (factory ${p.factory})`, err);
+  }
+
+  if (!isAddressEqual(owner, p.controller))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} is owned by ${owner}, not by CONTROLLER_ADDRESS ${p.controller} — this is not the controller's legal-body factory`,
+    );
+  if (!isAddressEqual(pendingOwner, zeroAddress))
+    throw new Error(
+      `boot: an ownership handover of LEGAL_BODY_FACTORY_ADDRESS ${p.factory} to ${pendingOwner} is pending — refusing to boot until it is accepted or cancelled (the executor's grants would stop reaching it)`,
+    );
+  if (!isAddressEqual(registry, p.identityRegistry))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} reads identity registry ${registry}, not IDENTITY_REGISTRY ${p.identityRegistry}`,
+    );
+  const badPins = LEGAL_BODY_GRANTED_SELECTORS.filter(
+    (_, i) => !pins[i] || !isAddressEqual(pins[i]!, p.factory),
+  );
+  if (badPins.length > 0)
+    throw new Error(
+      `boot: ${badPins.map((s) => `${s.name} (${s.selector})`).join(", ")} not pinned to LEGAL_BODY_FACTORY_ADDRESS ${p.factory} on CONTROLLER_ADDRESS ${p.controller} — pin each selector to the factory (setBoundTarget) before granting it`,
+    );
+  const missing = LEGAL_BODY_GRANTED_SELECTORS.filter((_, i) => !grants[i]);
+  if (missing.length > 0)
+    throw new Error(
+      `boot: executor ${p.executor} (the address of PLATFORM_PRIVATE_KEY) is missing ${missing.map((s) => `${s.name} (${s.selector})`).join(", ")} on CONTROLLER_ADDRESS ${p.controller} — grant it from the controller admin`,
     );
 }
 

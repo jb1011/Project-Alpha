@@ -50,7 +50,7 @@ export interface RuleContext {
   /** The platform signing key's ADDRESS. Needed to tell the permanent standing grant apart from a
    *  ceremony grant; the monitor never holds the key itself (see main.ts). */
   executor: Address;
-  /** lowercased role ids of the seven standing executor selectors. */
+  /** lowercased role ids of the standing executor selectors. */
   standingRoles: ReadonlySet<string>;
   entities: EntityIndex;
 }
@@ -157,8 +157,8 @@ function controllerRule(
     const isAdmin = roleHex === DEFAULT_ADMIN_ROLE;
     const isStanding = ctx.standingRoles.has(roleHex);
     // Rule 1. WARN is the floor — even a legitimate break-glass grant is worth seeing. CRITICAL the
-    // moment the grant is WILDCARD (relay anything at anything) or a role outside the seven the
-    // deploy pinned, because those two shapes have no routine cause.
+    // moment the grant is WILDCARD (relay anything at anything) or a role outside the standing set,
+    // because those two shapes have no routine cause.
     const severity: Severity = isWildcard || !isStanding ? "CRITICAL" : "WARN";
     const alerts: Alert[] = [
       alert(

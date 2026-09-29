@@ -10,7 +10,11 @@ import {
   toHex,
 } from "viem";
 import { legalManagerAbi } from "../abis/generated";
-import { CONTROLLER_GRANTED_SELECTORS, selectorRole } from "../adapters/arc/bootVerify";
+import {
+  CONTROLLER_GRANTED_SELECTORS,
+  LEGAL_BODY_GRANTED_SELECTORS,
+  selectorRole,
+} from "../adapters/arc/bootVerify";
 
 /**
  * Every event topic the monitor keys off, in one place.
@@ -124,12 +128,15 @@ export const DEFAULT_ADMIN_ROLE: Hex = pad("0x00", { size: 32 });
 export const WILDCARD_ROLE: Hex = pad("0x01", { size: 32 });
 
 /**
- * The seven standing executor roles, derived from the SAME generated-ABI selector list bootVerify
- * asserts on-chain at every API boot. Never hardcoded: a signature change moves the boot check and
- * the monitor together, so "expected grant" can never drift from "verified grant".
+ * The standing executor roles: the seven granted at the controller's deploy, plus the two
+ * legal-body grants added by the factory ceremony. Derived from the SAME generated-ABI selector
+ * lists bootVerify asserts on-chain, never hardcoded, so "expected grant" cannot drift from
+ * "verified grant". A grant of anything else still pages as CRITICAL.
  */
 export function standingRoles(): Set<Hex> {
   return new Set(
-    CONTROLLER_GRANTED_SELECTORS.map((s) => selectorRole(s.selector).toLowerCase() as Hex),
+    [...CONTROLLER_GRANTED_SELECTORS, ...LEGAL_BODY_GRANTED_SELECTORS].map(
+      (s) => selectorRole(s.selector).toLowerCase() as Hex,
+    ),
   );
 }

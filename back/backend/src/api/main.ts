@@ -6,8 +6,10 @@ import { ArcAdapter } from "../adapters/arc/arcAdapter";
 import {
   CONTROLLER_GRANTED_SELECTORS,
   CONTROLLER_PINNED_SELECTORS,
+  LEGAL_BODY_GRANTED_SELECTORS,
   assertControllerWiring,
   assertLegacyFactoryOwner,
+  assertLegalBodyFactoryWiring,
 } from "../adapters/arc/bootVerify";
 import {
   managerAccount,
@@ -176,6 +178,17 @@ async function main() {
       factory: factoryAddress,
       signer: executor.address,
     });
+  }
+  if (cfg.legalBodyFactory && cfg.controllerAddress) {
+    await assertLegalBodyFactoryWiring(publicClient, {
+      factory: cfg.legalBodyFactory,
+      controller: cfg.controllerAddress,
+      identityRegistry: cfg.identityRegistry,
+      executor: executor.address,
+    });
+    console.log(
+      `[boot] legal-body factory wiring verified on-chain: owner, registry, ${LEGAL_BODY_GRANTED_SELECTORS.length} pinned executor grants`,
+    );
   }
 
   const arc = new ArcAdapter({
