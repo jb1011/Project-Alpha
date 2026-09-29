@@ -567,3 +567,46 @@ test("a body is created only under a company of its own tenant", () => {
   expect(db.prepare("SELECT COUNT(*) AS n FROM legal_bodies").get()).toEqual({ n: 0 });
   expect(() => insert(OWNER)).not.toThrow(); // the company's own tenant can
 });
+
+test("the transition matrix: exactly the legal edges move; every other pair, and NULL, is refused", () => {
+  const LEGAL = new Set([
+    "draft>reserved",
+    "reserved>deployed",
+    "reserved>lapsed",
+    "deployed>linked",
+    "deployed>superseded",
+    "linked>broken",
+    "broken>linked",
+    "broken>superseded",
+  ]);
+  const moved: string[] = [];
+  for (const from of STATES) {
+    for (const to of STATES) {
+      // Each pair on a fresh row, walked legally into `from`; the move sets every column the
+      // target's CHECKs need (see NEEDS), so a refusal can only be the transition rule's.
+      const d = bodyIn(from);
+      const pair = `${from}>${to}`;
+      if (from === to) {
+        // Keeping the state is not a transition: the rule lets it through.
+        expect(moveTo(d, to).changes, pair).toBe(1);
+      } else if (LEGAL.has(pair)) {
+        expect(moveTo(d, to).changes, pair).toBe(1);
+        moved.push(pair);
+      } else {
+        expect(() => moveTo(d, to), pair).toThrow(/illegal binding_state transition/);
+      }
+      expect(stateOf(d), pair).toBe(LEGAL.has(pair) ? to : from);
+      d.close();
+    }
+    // A NULL target is refused from every state, plainly and through OR REPLACE.
+    for (const verb of ["UPDATE", "UPDATE OR REPLACE"]) {
+      const d = bodyIn(from);
+      expect(() => moveTo(d, null, verb), `${from}>NULL (${verb})`).toThrow(
+        /illegal binding_state transition/,
+      );
+      expect(stateOf(d), `${from}>NULL (${verb})`).toBe(from);
+      d.close();
+    }
+  }
+  expect(moved.sort()).toEqual([...LEGAL].sort());
+});

@@ -200,12 +200,16 @@ test("listByTenant is newest first and tenant-scoped", () => {
   const a = newBody();
   const b = newBody();
   newBody(OTHER_TENANT, "co_2");
-  expect(
-    repo
-      .listByTenant(TENANT)
-      .map((r) => r.legalBodyId)
-      .sort(),
-  ).toEqual([a.legalBodyId, b.legalBodyId].sort());
+  // The exact order. Both rows almost always share a created_at second, so this also pins the
+  // rowid DESC tie-break (and listByCompany keeps the same order).
+  expect(repo.listByTenant(TENANT).map((r) => r.legalBodyId)).toEqual([
+    b.legalBodyId,
+    a.legalBodyId,
+  ]);
+  expect(repo.listByCompany("co_1").map((r) => r.legalBodyId)).toEqual([
+    b.legalBodyId,
+    a.legalBodyId,
+  ]);
 });
 
 test("a second order whose link collides on BOTH the agentId and the body address is agent_taken", () => {
