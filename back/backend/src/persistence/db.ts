@@ -182,6 +182,133 @@ const COMPANIES_DDL = `
 `;
 
 /**
+ * Legal bodies for identities their customers own (one row per body order), and their append-only
+ * event log. Kept apart from `entities` on purpose: a legal body has no treasury, no operator, no
+ * custody and no onboarding saga, so no existing agent query can ever mistake one for an agent.
+ *
+ * The table enforces its own invariants rather than trusting callers:
+ *  - the guardian IS the tenant (the human's signed-in wallet), structurally;
+ *  - the amendment delay is within the factory contract's bounds (48 hours .. 30 days);
+ *  - identity, agreement and link fields are write-once (a trigger), so a future method, migration
+ *    or operator cannot re-point a reservation or a deployed body at another agent, owner or
+ *    agreement;
+ *  - binding_state only moves along the legal transitions (a trigger);
+ *  - leaving `draft` requires every link field AND a frozen agreement, and `deployed` onwards
+ *    requires the deploy facts (CHECKs);
+ *  - one LIVE body per agentId per chain (a partial unique index), and one row per body address;
+ *  - rows are never deleted, and the event log is append-only.
+ *
+ * `create_tx_hash` is deliberately NOT write-once: while the row is still `reserved`, a deploy
+ * whose first transaction never lands is re-sent with a new nonce, and so a new hash. Every
+ * submission is kept in the event log, so overwriting the column loses nothing.
+ */
+export const LEGAL_BODIES_DDL = `
+  CREATE TABLE IF NOT EXISTS legal_bodies (
+    legal_body_id TEXT PRIMARY KEY,
+    public_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL,
+    company_id TEXT NOT NULL REFERENCES companies(company_id),
+    chain_id INTEGER NOT NULL,
+    factory TEXT NOT NULL,
+    guardian TEXT NOT NULL,
+    amendment_delay INTEGER NOT NULL CHECK (amendment_delay BETWEEN 172800 AND 2592000),
+    oa_manifest_hash TEXT,
+    oa_manifest_version INTEGER,
+    agent_id TEXT,
+    identity_owner TEXT,
+    link_digest TEXT,
+    link_deadline INTEGER,
+    link_signature TEXT,
+    body_address TEXT,
+    create_tx_hash TEXT,
+    deployed_at INTEGER,
+    binding_state TEXT NOT NULL DEFAULT 'draft'
+      CHECK (binding_state IN ('draft','reserved','deployed','linked','broken','lapsed','superseded')),
+    pointer_seen_at INTEGER,
+    next_binding_check_at INTEGER,
+    binding_check_interval_ms INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (guardian = tenant_id),
+    CHECK (binding_state = 'draft' OR (
+      agent_id IS NOT NULL AND identity_owner IS NOT NULL AND link_digest IS NOT NULL
+      AND link_deadline IS NOT NULL AND link_signature IS NOT NULL AND body_address IS NOT NULL
+      AND oa_manifest_hash IS NOT NULL)),
+    CHECK (binding_state NOT IN ('deployed','linked','broken','superseded')
+      OR (create_tx_hash IS NOT NULL AND deployed_at IS NOT NULL)),
+    CHECK (binding_state != 'linked' OR pointer_seen_at IS NOT NULL)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_live_agent
+    ON legal_bodies(chain_id, agent_id) WHERE binding_state IN ('reserved','deployed','linked');
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_body
+    ON legal_bodies(chain_id, body_address) WHERE body_address IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_legal_bodies_tenant ON legal_bodies(tenant_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_legal_bodies_company ON legal_bodies(company_id);
+  CREATE INDEX IF NOT EXISTS idx_legal_bodies_binding_due
+    ON legal_bodies(next_binding_check_at) WHERE next_binding_check_at IS NOT NULL;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_write_once
+  BEFORE UPDATE ON legal_bodies FOR EACH ROW
+  WHEN NEW.legal_body_id IS NOT OLD.legal_body_id
+    OR NEW.public_id IS NOT OLD.public_id
+    OR NEW.tenant_id IS NOT OLD.tenant_id
+    OR NEW.company_id IS NOT OLD.company_id
+    OR NEW.chain_id IS NOT OLD.chain_id
+    OR NEW.factory IS NOT OLD.factory
+    OR NEW.guardian IS NOT OLD.guardian
+    OR NEW.amendment_delay IS NOT OLD.amendment_delay
+    OR (OLD.oa_manifest_hash IS NOT NULL AND (NEW.oa_manifest_hash IS NOT OLD.oa_manifest_hash
+        OR NEW.oa_manifest_version IS NOT OLD.oa_manifest_version))
+    OR (OLD.agent_id IS NOT NULL AND (NEW.agent_id IS NOT OLD.agent_id
+        OR NEW.identity_owner IS NOT OLD.identity_owner OR NEW.link_digest IS NOT OLD.link_digest
+        OR NEW.link_deadline IS NOT OLD.link_deadline OR NEW.link_signature IS NOT OLD.link_signature
+        OR NEW.body_address IS NOT OLD.body_address))
+    OR (OLD.deployed_at IS NOT NULL AND NEW.deployed_at IS NOT OLD.deployed_at)
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: identity, agreement, link and deploy fields are write-once');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_transitions
+  BEFORE UPDATE OF binding_state ON legal_bodies FOR EACH ROW
+  WHEN NEW.binding_state IS NOT OLD.binding_state AND NOT (
+       (OLD.binding_state = 'draft' AND NEW.binding_state = 'reserved')
+    OR (OLD.binding_state = 'reserved' AND NEW.binding_state IN ('deployed','lapsed'))
+    OR (OLD.binding_state = 'deployed' AND NEW.binding_state IN ('linked','superseded'))
+    OR (OLD.binding_state = 'linked' AND NEW.binding_state = 'broken')
+    OR (OLD.binding_state = 'broken' AND NEW.binding_state IN ('linked','superseded')))
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: illegal binding_state transition');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_no_delete
+  BEFORE DELETE ON legal_bodies
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies rows are never deleted');
+  END;
+
+  CREATE TABLE IF NOT EXISTS legal_body_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    legal_body_id TEXT NOT NULL REFERENCES legal_bodies(legal_body_id),
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    tx_hash TEXT,
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_legal_body_events_body ON legal_body_events(legal_body_id, id);
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_update
+  BEFORE UPDATE ON legal_body_events
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_delete
+  BEFORE DELETE ON legal_body_events
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events is append-only');
+  END;
+`;
+
+/**
  * FORMATION PAYMENTS (design 2026-08-26 §2/§6) — shipped in A1, WRITTEN by B1.
  *
  * The table lands with the schema rather than with the feature so the derived-paying predicate
@@ -974,6 +1101,10 @@ export function migrate(db: Database.Database): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_payments_ledger_entity ON payments_ledger(entity_key, status)",
   );
+
+  // Legal bodies: their own tables (see LEGAL_BODIES_DDL), created last so the companies table
+  // their foreign key points at exists on every database shape.
+  db.exec(LEGAL_BODIES_DDL);
 }
 
 /** Marker for the one-shot 2026-08-26 re-key (design §2 steps 1-5). */
