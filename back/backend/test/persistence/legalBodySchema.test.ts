@@ -238,3 +238,187 @@ test("the new tables leave entities untouched", () => {
   expect(cols).not.toContain("kind");
   expect(cols).not.toContain("binding_state");
 });
+
+// ── The guards against SQLite's REPLACE conflict resolution, and every state reached legally ──
+
+type State = "draft" | "reserved" | "deployed" | "linked" | "broken" | "lapsed" | "superseded";
+const STATES: readonly State[] = [
+  "draft",
+  "reserved",
+  "deployed",
+  "linked",
+  "broken",
+  "lapsed",
+  "superseded",
+];
+
+// The columns each state's CHECKs require, as SET clauses holding exactly the values `bodyIn`
+// writes: a move that sets them again changes no write-once field, so when such a move is
+// refused, it is the transition rule that refused it, never a missing column.
+const LINK_SET = `agent_id = '42', identity_owner = '${OWNER}', link_digest = '${H("b")}',
+  link_deadline = 1900000000, link_signature = '0x01', body_address = '${BODY}'`;
+const DEPLOY_SET = `create_tx_hash = '${H("c")}', deployed_at = 1800000000`;
+const NEEDS: Record<State, string> = {
+  draft: "",
+  reserved: LINK_SET,
+  lapsed: LINK_SET,
+  deployed: `${LINK_SET}, ${DEPLOY_SET}`,
+  superseded: `${LINK_SET}, ${DEPLOY_SET}`,
+  broken: `${LINK_SET}, ${DEPLOY_SET}`,
+  linked: `${LINK_SET}, ${DEPLOY_SET}, pointer_seen_at = 1800000100`,
+};
+/** The legal path from a frozen draft to each state. */
+const PATH: Record<State, State[]> = {
+  draft: [],
+  reserved: ["reserved"],
+  deployed: ["reserved", "deployed"],
+  linked: ["reserved", "deployed", "linked"],
+  broken: ["reserved", "deployed", "linked", "broken"],
+  lapsed: ["reserved", "lapsed"],
+  superseded: ["reserved", "deployed", "superseded"],
+};
+
+/** Move `lb_1` to `to` (NULL included), setting what the target's CHECKs need in one UPDATE. */
+const moveTo = (d: Database.Database, to: State | null, verb = "UPDATE") =>
+  d
+    .prepare(
+      `${verb} legal_bodies SET binding_state = ?${to && NEEDS[to] ? `, ${NEEDS[to]}` : ""}
+        WHERE legal_body_id = 'lb_1'`,
+    )
+    .run(to);
+const stateOf = (d: Database.Database) =>
+  (
+    d.prepare("SELECT binding_state FROM legal_bodies WHERE legal_body_id = 'lb_1'").get() as {
+      binding_state: State;
+    }
+  ).binding_state;
+
+/** A fresh database holding `lb_1` (with its `created` event), walked legally into `state`. */
+function bodyIn(state: State): Database.Database {
+  const d = new Database(":memory:");
+  d.pragma("foreign_keys = ON");
+  migrate(d);
+  d.prepare(
+    `INSERT INTO companies (company_id, tenant_id, status, provider, environment, name_options, business_purpose, industry_label)
+     VALUES ('co_1', ?, 'ready', 'customer', 'sandbox', '["Acme LLC"]', 'existing', 'existing')`,
+  ).run(TENANT);
+  d.prepare(
+    `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+     VALUES ('lb_1', 'pub-1', ?, 'co_1', 5042002, ?, ?, 172800)`,
+  ).run(TENANT, FACTORY, TENANT);
+  d.prepare(
+    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'created', 'system')",
+  ).run();
+  d.prepare(
+    "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = 'lb_1'",
+  ).run(H("a"));
+  for (const s of PATH[state]) moveTo(d, s);
+  expect(stateOf(d)).toBe(state);
+  return d;
+}
+
+const addCompany = (id: string, tenant: string) =>
+  db
+    .prepare(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment, name_options, business_purpose, industry_label)
+       VALUES (?, ?, 'ready', 'customer', 'sandbox', '["Other LLC"]', 'existing', 'existing')`,
+    )
+    .run(id, tenant);
+const OTHER_BODY = "0x01392702dA9487a1E3B49BeC9c6Fb1DD676fF6F1";
+
+test("REPLACE INTO cannot rewrite an existing body: rows are never replaced", () => {
+  // Without an INSERT guard, REPLACE deletes the old row (firing no delete trigger) and inserts
+  // the new one, and none of the UPDATE guards ever sees it.
+  addCompany("co_2", OWNER);
+  insertDraft();
+  db.prepare(
+    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'created', 'system')",
+  ).run();
+  freeze();
+  reserve();
+  deploy();
+  const before = db.prepare("SELECT * FROM legal_bodies").all();
+  // Same primary key; a new tenant, guardian, company, agent and body, born straight into linked.
+  expect(() =>
+    db
+      .prepare(
+        `REPLACE INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian,
+           amendment_delay, oa_manifest_hash, oa_manifest_version, agent_id, identity_owner, link_digest,
+           link_deadline, link_signature, body_address, create_tx_hash, deployed_at, binding_state, pointer_seen_at)
+         VALUES ('lb_1', 'pub-1', ?, 'co_2', 5042002, ?, ?, 172800, ?, 9, '99', ?, ?, 1, '0x09', ?, ?, 1, 'linked', 1)`,
+      )
+      .run(OWNER, FACTORY, OWNER, H("f"), TENANT, H("e"), OTHER_BODY, H("d")),
+  ).toThrow(/born draft and never replaced/);
+  // Not even a well-formed draft may land on an existing primary key or public id.
+  for (const [id, pub] of [
+    ["lb_1", "pub-new"],
+    ["lb_new", "pub-1"],
+  ])
+    expect(
+      () =>
+        db
+          .prepare(
+            `REPLACE INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+             VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+          )
+          .run(id, pub, TENANT, FACTORY, TENANT),
+      `${id} / ${pub}`,
+    ).toThrow(/born draft and never replaced/);
+  expect(db.prepare("SELECT * FROM legal_bodies").all()).toEqual(before);
+});
+
+test("a row is born draft: an INSERT straight into any other state, or NULL, is refused", () => {
+  for (const s of ["reserved", "deployed", "linked", "broken", "lapsed", "superseded", null])
+    expect(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian,
+               amendment_delay, oa_manifest_hash, oa_manifest_version, agent_id, identity_owner, link_digest,
+               link_deadline, link_signature, body_address, create_tx_hash, deployed_at, binding_state,
+               pointer_seen_at)
+             VALUES ('lb_9', 'p9', ?, 'co_1', 5042002, ?, ?, 172800, ?, 1, '42', ?, ?, 1900000000, '0x01', ?, ?,
+               1800000000, ?, 1800000100)`,
+          )
+          .run(TENANT, FACTORY, TENANT, H("a"), OWNER, H("b"), BODY, H("c"), s),
+      String(s),
+    ).toThrow(/born draft and never replaced/);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_bodies").get()).toEqual({ n: 0 });
+});
+
+test("REPLACE INTO cannot rewrite an event: no INSERT lands on an existing event id", () => {
+  insertDraft();
+  db.prepare(
+    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'created', 'system')",
+  ).run();
+  const before = db.prepare("SELECT * FROM legal_body_events").all() as { id: number }[];
+  expect(() =>
+    db
+      .prepare(
+        `REPLACE INTO legal_body_events (id, legal_body_id, kind, actor, detail)
+         VALUES (?, 'lb_1', 'note', 'operator:x', 'rewritten')`,
+      )
+      .run(before[0]?.id),
+  ).toThrow(/append-only/);
+  expect(db.prepare("SELECT * FROM legal_body_events").all()).toEqual(before);
+  // Appending is untouched.
+  db.prepare(
+    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'note', 'system')",
+  ).run();
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_body_events").get()).toEqual({ n: 2 });
+});
+
+test("UPDATE OR REPLACE cannot send a body back to draft through a NULL state", () => {
+  // OR REPLACE turns a NOT NULL violation into the column default, 'draft', so the transition
+  // rule has to refuse the NULL target itself, before that substitution can happen.
+  for (const from of ["reserved", "deployed", "linked", "broken"] as const) {
+    const d = bodyIn(from);
+    expect(() => moveTo(d, null, "UPDATE OR REPLACE"), from).toThrow(
+      /illegal binding_state transition/,
+    );
+    expect(
+      d.prepare("SELECT binding_state, agent_id, body_address FROM legal_bodies").get(),
+    ).toEqual({ binding_state: from, agent_id: "42", body_address: BODY });
+    d.close();
+  }
+});

@@ -189,14 +189,29 @@ const COMPANIES_DDL = `
  * The table enforces its own invariants rather than trusting callers:
  *  - the guardian IS the tenant (the human's signed-in wallet), structurally;
  *  - the amendment delay is within the factory contract's bounds (48 hours .. 30 days);
+ *  - rows are born `draft`, and an INSERT never lands on an existing row (a trigger). That is what
+ *    stops `REPLACE INTO` from rewriting a body wholesale: REPLACE deletes the old row and inserts
+ *    a new one, and no UPDATE guard below would ever see it;
  *  - identity, agreement and link fields are write-once (a trigger), so a future method, migration
  *    or operator cannot re-point a reservation or a deployed body at another agent, owner or
  *    agreement;
- *  - binding_state only moves along the legal transitions (a trigger);
+ *  - binding_state only moves along the legal transitions (a trigger). The trigger also refuses a
+ *    NULL target, which `UPDATE OR REPLACE` would otherwise quietly turn into the column default,
+ *    `draft`, handing a live body's agentId back without a single legal move;
  *  - leaving `draft` requires every link field AND a frozen agreement, and `deployed` onwards
  *    requires the deploy facts (CHECKs);
  *  - one LIVE body per agentId per chain (a partial unique index), and one row per body address;
- *  - rows are never deleted, and the event log is append-only.
+ *  - rows are never deleted, and the event log is append-only: no UPDATE, no DELETE, and no
+ *    INSERT over an existing event id.
+ *
+ * What the triggers cannot see: when `UPDATE OR REPLACE` resolves a unique-index conflict, SQLite
+ * deletes the conflicting row WITHOUT firing its delete triggers (they fire only with
+ * `recursive_triggers` on, which is a per-connection setting that would change trigger behaviour
+ * on every table, so it stays off). A raw `UPDATE OR REPLACE` that reserves an agentId or a body
+ * address another row holds could therefore evict that row. The events foreign key refuses the
+ * eviction of any row that has at least one event, and every row the repository creates is
+ * written together with its `created` event, so what remains needs raw SQL against a row that
+ * was itself created without the repository.
  *
  * `create_tx_hash` is deliberately NOT write-once: while the row is still `reserved`, a deploy
  * whose first transaction never lands is re-sent with a new nonce, and so a new hash. Every
@@ -270,14 +285,23 @@ export const LEGAL_BODIES_DDL = `
 
   CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_transitions
   BEFORE UPDATE OF binding_state ON legal_bodies FOR EACH ROW
-  WHEN NEW.binding_state IS NOT OLD.binding_state AND NOT (
+  WHEN NEW.binding_state IS NOT OLD.binding_state AND NOT IFNULL((
        (OLD.binding_state = 'draft' AND NEW.binding_state = 'reserved')
     OR (OLD.binding_state = 'reserved' AND NEW.binding_state IN ('deployed','lapsed'))
     OR (OLD.binding_state = 'deployed' AND NEW.binding_state IN ('linked','superseded'))
     OR (OLD.binding_state = 'linked' AND NEW.binding_state = 'broken')
-    OR (OLD.binding_state = 'broken' AND NEW.binding_state IN ('linked','superseded')))
+    OR (OLD.binding_state = 'broken' AND NEW.binding_state IN ('linked','superseded'))), 0)
   BEGIN
     SELECT RAISE(ABORT, 'legal_bodies: illegal binding_state transition');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_insert
+  BEFORE INSERT ON legal_bodies FOR EACH ROW
+  WHEN NEW.binding_state IS NOT 'draft'
+    OR EXISTS (SELECT 1 FROM legal_bodies
+                WHERE legal_body_id = NEW.legal_body_id OR public_id = NEW.public_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: rows are born draft and never replaced');
   END;
 
   CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_no_delete
@@ -303,6 +327,12 @@ export const LEGAL_BODIES_DDL = `
   END;
   CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_delete
   BEFORE DELETE ON legal_body_events
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_replace
+  BEFORE INSERT ON legal_body_events FOR EACH ROW
+  WHEN EXISTS (SELECT 1 FROM legal_body_events WHERE id = NEW.id)
   BEGIN
     SELECT RAISE(ABORT, 'legal_body_events is append-only');
   END;
