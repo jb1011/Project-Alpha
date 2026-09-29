@@ -27,6 +27,17 @@ approved counterparties") become enforced on-chain rules, with the signed agreem
 on-chain. The treasury is an on-chain contract the human guardian governs: the agent's operator key
 spends only inside the caps and allowlist the contract enforces.
 
+### LegalBodyFactory (legal body only)
+
+For agents whose ERC-8004 identity the customer owns. The factory creates an immutable clone of
+`LegalManager` (no treasury) when the identity owner signs an EIP-712 `LegalBodyLink`, and is the
+manager of every body it creates. Its only power over a body is to schedule an operating-agreement
+amendment that the body's guardian has signed; it cannot dissolve, cancel a dissolution or sweep.
+The owner links the body by writing `encodePointer(body)` under the `legalBody` metadata key of
+their identity; `linkedLegalBody(agentId)` returns the linked body or `address(0)`. Deploy with
+`script/DeployLegalBodyFactory.s.sol`, then pin and grant the two selectors in
+`ControllerSelectors.minimalGrants()` on the controller.
+
 ## Repository layout
 ```
 .                      Foundry project (Solidity contracts) at the root

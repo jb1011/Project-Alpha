@@ -14,6 +14,8 @@ on:
     paths:
       - "back/test/IdentityRegistryFork.t.sol"
       - "back/test/NoviControllerFork.t.sol"
+      - "back/test/LegalBodyFactoryFork.t.sol"
+      - "back/src/LegalBodyFactory.sol"
       - "back/src/NoviController.sol"
       - "back/src/LegalManagerFactory.sol"
       - ".github/workflows/fork-tests.yml"
