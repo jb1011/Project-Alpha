@@ -64,6 +64,7 @@ describe("rule 1 — controller RoleGranted", () => {
     );
     expect(out.alerts.map((a) => a.severity)).toEqual(["WARN"]);
     expect(out.alerts[0]?.detail.standingExecutorRole).toBe(true);
+    expect(out.alerts[0]?.detail.roleLabel).toBe("LegalBodyFactory.createLegalBody");
     expect(out.grants).toHaveLength(0);
   });
 
@@ -565,6 +566,17 @@ describe("roleLabel", () => {
     expect(roleLabel(WILDCARD_ROLE)).toBe("WILDCARD_ROLE");
     expect(roleLabel(STANDING_ROLE)).toBe(CONTROLLER_GRANTED_SELECTORS[0]?.name);
     expect(roleLabel(UNKNOWN_ROLE)).toBe("UNKNOWN_SELECTOR_ROLE");
+  });
+
+  test("names the two legal-body roles", () => {
+    // Role ids built from the function signatures, independently of the list roleLabel reads.
+    const role = (sig: string) => pad(toFunctionSelector(sig), { dir: "right", size: 32 });
+    expect(roleLabel(role("createLegalBody(uint256,address,uint256,bytes32,uint256,bytes)"))).toBe(
+      "LegalBodyFactory.createLegalBody",
+    );
+    expect(roleLabel(role("scheduleOperatingAgreementUpdate(address,bytes32,uint256,bytes)"))).toBe(
+      "LegalBodyFactory.scheduleOperatingAgreementUpdate",
+    );
   });
 });
 

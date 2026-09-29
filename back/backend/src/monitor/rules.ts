@@ -14,7 +14,11 @@ import {
   legalManagerFactoryAbi,
   noviControllerAbi,
 } from "../abis/generated";
-import { CONTROLLER_GRANTED_SELECTORS, selectorRole } from "../adapters/arc/bootVerify";
+import {
+  CONTROLLER_GRANTED_SELECTORS,
+  LEGAL_BODY_GRANTED_SELECTORS,
+  selectorRole,
+} from "../adapters/arc/bootVerify";
 import type { Alert, Severity } from "./alerts";
 import type { EntityIndex, MonitoredEntity } from "./entityLookup";
 import {
@@ -84,12 +88,13 @@ function isoFromSeconds(seconds: bigint): string {
   return new Date(Number(seconds) * 1000).toISOString();
 }
 
-/** "AgentTreasury.schedulePolicyUpdate" for a standing selector role; a label for the specials. */
+/** "AgentTreasury.schedulePolicyUpdate" for a standing selector role (the controller's seven or
+ *  the two legal-body grants); a label for the specials. */
 export function roleLabel(role: Hex): string {
   const lower = role.toLowerCase();
   if (lower === DEFAULT_ADMIN_ROLE) return "DEFAULT_ADMIN_ROLE";
   if (lower === WILDCARD_ROLE) return "WILDCARD_ROLE";
-  const known = CONTROLLER_GRANTED_SELECTORS.find(
+  const known = [...CONTROLLER_GRANTED_SELECTORS, ...LEGAL_BODY_GRANTED_SELECTORS].find(
     (g) => selectorRole(g.selector).toLowerCase() === lower,
   );
   return known ? known.name : "UNKNOWN_SELECTOR_ROLE";
