@@ -943,3 +943,25 @@ test("nested transaction() calls are savepoints: an inner failure undoes the inn
   expect(repo.findById(id)?.nextBindingCheckAt).toBeNull();
   expect(db.inTransaction).toBe(false);
 });
+
+test("a value only the table refuses throws its CHECK failure, and nothing is written", () => {
+  // The repository checks the shape of each value; two rules compare a value with the row itself
+  // or with the clock's unit, and the table is what enforces them.
+  const r = newBody();
+  repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version: 1 });
+  const before = { row: repo.findById(r.legalBodyId), events: repo.listEvents(r.legalBodyId) };
+  for (const bodyAddress of [`0x${"0".repeat(40)}`, FACTORY, FACTORY.toLowerCase()])
+    expect(
+      () => repo.reserve(r.legalBodyId, link("42", bodyAddress)),
+      `body ${bodyAddress}`,
+    ).toThrow(/CHECK/);
+  expect(repo.findById(r.legalBodyId)).toEqual(before.row);
+  expect(repo.listEvents(r.legalBodyId)).toEqual(before.events);
+
+  const id = toDeployed("43", BODY_B);
+  const deployed = { row: repo.findById(id), events: repo.listEvents(id) };
+  for (const seenAt of [0, 1.5, 1_800_000_100_000])
+    expect(() => repo.markLinked(id, seenAt), `seenAt ${seenAt}`).toThrow(/CHECK/);
+  expect(repo.findById(id)).toEqual(deployed.row);
+  expect(repo.listEvents(id)).toEqual(deployed.events);
+});

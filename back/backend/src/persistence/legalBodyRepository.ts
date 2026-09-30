@@ -6,7 +6,7 @@ import { redactPii } from "../formation/pii";
 /**
  * LEGAL BODIES: the legal wrapper ordered for an agent identity its customer already owns, one row
  * per body order, in tables of their own (`LEGAL_BODIES_DDL` in db.ts lists the invariants the
- * database itself enforces, whoever writes).
+ * database itself enforces, and their scope).
  *
  * The lifecycle, and the one method that makes each move:
  *
@@ -19,7 +19,9 @@ import { redactPii } from "../formation/pii";
  * Every move is ONE compare-and-set UPDATE whose WHERE names the states it may leave, and the
  * caller learns whether IT made the move from whether that UPDATE changed a row, so two callers
  * racing for the same move cannot both win. The move and its event are written in one
- * transaction: the log never records a move that did not happen, or misses one that did.
+ * transaction, and the event only when the UPDATE changed the row: a method never logs a move it
+ * did not make, and never makes one it does not log. Input that could match a row without moving
+ * it (an agreement with no hash) is refused before the UPDATE runs.
  */
 
 export type BindingState =
@@ -82,7 +84,7 @@ export interface LegalBodyRecord {
   /** Unix seconds: the time of the block that created the body. */
   deployedAt: number | null;
   bindingState: BindingState;
-  /** Unix seconds: the first sighting of the pointer in the current linked stretch. */
+  /** Unix seconds: the sighting of the pointer that opened the latest linked stretch. */
   pointerSeenAt: number | null;
   /** Unix MILLISECONDS, unlike the chain times above: the process clock schedules the checks. */
   nextBindingCheckAt: number | null;
@@ -196,7 +198,8 @@ export interface LegalBodyRepository {
    * live states, so a new reservation can take the agentId in the meantime, and linking this body
    * again would make two live bodies for one identity. The caller must resolve that collision;
    * which body keeps the agentId is the binding sweeper's policy, not this repository's. Nothing
-   * is recorded either way.
+   * is recorded either way. `seenAt` is in unix SECONDS; a value the table refuses (a fraction, a
+   * time in milliseconds) throws the table's own CHECK failure, and nothing is written.
    */
   markLinked(legalBodyId: string, seenAt: number): boolean;
   markBroken(legalBodyId: string, detail: Record<string, unknown>): boolean;
@@ -590,8 +593,9 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     factory: Address;
     amendmentDelay: number;
   }): LegalBodyRecord {
-    // Refused here, before anything is written, with a message that names the field: the table
-    // refuses each of these too, but as a bare CHECK failure.
+    // Refused here, before anything is written, with a message that names the field. The table
+    // has CHECKs of its own, but they fail without naming the mistake, and a number passed as
+    // text would be converted by the column rather than refused.
     if (typeof p.amendmentDelay !== "number" || !Number.isInteger(p.amendmentDelay))
       throw new LegalBodyInputError(
         `amendmentDelay must be a whole number of seconds, got ${String(p.amendmentDelay)}`,
@@ -664,8 +668,8 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
 
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean {
     // No agreement, no freeze: a missing or malformed hash or version is answered like any other
-    // freeze that did not happen, before the UPDATE runs. A NULL hash would otherwise match the
-    // draft, change the row without freezing anything, and leave a false event in the log.
+    // freeze that did not happen, before the UPDATE runs, so nothing is written and nothing is
+    // logged. The table refuses such a value too, but as a bare CHECK failure.
     const hash = lowerHash(a.hash);
     if (hash === null || !isIntegerWithin(a.version, 1, Number.MAX_SAFE_INTEGER)) return false;
     return this.move(

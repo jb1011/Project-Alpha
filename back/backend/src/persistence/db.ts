@@ -205,7 +205,8 @@ const sqlIsSeconds = (column: string) =>
  * custody and no onboarding saga, so no existing agent query can ever mistake one for an agent.
  *
  * The tables enforce their own invariants rather than trusting callers. The foreign keys below
- * hold on a connection with foreign keys on, as `openDatabase` opens every one.
+ * hold on a connection with foreign keys on, and foreign keys are on for every connection the
+ * application opens.
  *  - The guardian IS the tenant (the human's signed-in wallet), structurally (a CHECK), and a body
  *    can only be created under a company of that same tenant (checked on INSERT, by a trigger; a
  *    company that does not exist is refused by the foreign key).
@@ -226,13 +227,14 @@ const sqlIsSeconds = (column: string) =>
  *    signature is `0x` and one or more whole bytes of lower-case hex.
  *  - The agreement hash and its version are set together or not at all, and the version is at
  *    least 1.
- *  - Every time column has one unit, and a range that refuses the other unit:
+ *  - Every time column has one unit:
  *      - `amendment_delay` is a duration in SECONDS;
  *      - `link_deadline`, `deployed_at` and `pointer_seen_at` are unix SECONDS, the unit of a
  *        block timestamp, between 1 and 99999999999 (a value in milliseconds does not fit);
- *      - `next_binding_check_at` is unix MILLISECONDS and `binding_check_interval_ms` a positive
- *        duration in MILLISECONDS, the units of the process clock that schedules the checks; they
- *        are set together or not at all;
+ *      - `next_binding_check_at` is unix MILLISECONDS, zero or more, and
+ *        `binding_check_interval_ms` a positive duration in MILLISECONDS, the units of the process
+ *        clock that schedules the checks. They are set together or not at all. No range can tell
+ *        a time in seconds apart here, so the unit is the caller's to mind;
  *      - `created_at` and `updated_at`, here and in the event log, are UTC text as SQLite's
  *        CURRENT_TIMESTAMP writes it (`YYYY-MM-DD HH:MM:SS`).
  *  - `deployed_at` is set only by the deploy: no `draft`, `reserved`, `lapsed` or `abandoned` row
@@ -243,10 +245,10 @@ const sqlIsSeconds = (column: string) =>
  *    rewriting a body wholesale: REPLACE deletes the old row and inserts a new one, and no UPDATE
  *    guard would ever see it.
  *  - Each group of facts is write-once from the step that sets it (a trigger): the identity
- *    fields, the rowid and `created_at` from the INSERT, the agreement (hash and version) from the freeze, the link fields
- *    from the reservation, the deploy facts (deployed_at and create_tx_hash) from the deploy. So
- *    no future method, migration or operator can re-point a reservation or a deployed body at
- *    another agent, owner, agreement or creating transaction.
+ *    fields, the rowid and `created_at` from the INSERT, the agreement (hash and version) from the
+ *    freeze, the link fields from the reservation, the deploy facts (deployed_at and
+ *    create_tx_hash) from the deploy. So no UPDATE can re-point a reservation at another agent,
+ *    owner or agreement, or a deployed body at another creating transaction.
  *  - binding_state only moves along the legal transitions (a trigger), and a NULL target is
  *    refused too: `UPDATE OR REPLACE` would otherwise quietly turn it into the column default,
  *    `draft`, which no transition reaches.
@@ -262,24 +264,20 @@ const sqlIsSeconds = (column: string) =>
  *    on its lower-case form).
  *  - A rowid is positive (a CHECK). The insert guard relies on it: for an automatic rowid SQLite
  *    shows a BEFORE INSERT trigger a placeholder (-1), which must never match a stored row.
- *  - No DELETE removes a legal body (a trigger); the one way SQLite removes a row without a DELETE
- *    is described below. The event log is append-only: no UPDATE, no DELETE, no INSERT over an
- *    existing event id, and every event id is positive (a CHECK), which that last guard relies on.
- *    An event id written out by hand is at most the next one (a trigger), so ids stay in order
- *    and one row cannot use up the ids that remain.
+ *  - No DELETE removes a legal body (a trigger), and the event log's foreign key holds in place
+ *    every body that has an event. The repository writes each body together with its `created`
+ *    event.
+ *  - The event log is append-only: no UPDATE, no DELETE, no INSERT over an existing event id, and
+ *    every event id is positive (a CHECK), which that last guard relies on. An event id written
+ *    out by hand is at most the next one (a trigger), so ids stay in order and one row cannot use
+ *    up the ids that remain.
  *
- * What the triggers cannot see: when an `OR REPLACE` write resolves a unique-index conflict,
- * SQLite deletes the conflicting row WITHOUT firing its delete triggers (they fire only with
- * `recursive_triggers` on, a per-connection setting that would change trigger behaviour on every
- * table, so it stays off). So any raw `OR REPLACE` write that gets past the triggers and collides
- * on a unique index can evict a row that has no events. An INSERT never gets that far: it is
- * refused before any collision, because rows are born draft, never over an existing row, and a
- * draft holds nothing the partial indexes see. What remains is an `UPDATE OR REPLACE` that
- * reserves an agentId or a body address another row holds, or that re-links a broken body while
- * another row holds its agentId live. The events foreign key refuses to evict any row that has at
- * least one event, and every row the repository creates is written together with its `created`
- * event. So the eviction needs raw SQL against a row that was itself created without the
- * repository.
+ * Scope. These guards hold for every write the application makes, and for plain INSERT, UPDATE
+ * and DELETE statements from anyone else. They are not a defence against someone with direct
+ * write access to the database file.
+ *
+ * A database that already ran this DDL takes an edit to it only through its version: see
+ * `LEGAL_BODIES_SCHEMA_VERSION`, which is raised with every edit to this constant.
  *
  * `create_tx_hash` is deliberately NOT write-once while the row is `reserved`: a deploy whose
  * first transaction never lands is re-sent with a new nonce, and so a new hash. Every submission

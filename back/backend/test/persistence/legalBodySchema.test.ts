@@ -365,8 +365,8 @@ const addCompany = (id: string, tenant: string) =>
 const OTHER_BODY = "0x00000000000000000000000000000000000000b2";
 
 test("REPLACE INTO cannot rewrite an existing body: rows are never replaced", () => {
-  // Without an INSERT guard, REPLACE deletes the old row (firing no delete trigger) and inserts
-  // the new one, and none of the UPDATE guards ever sees it.
+  // REPLACE swaps the old row for a new one rather than updating it, so the UPDATE guards never
+  // see it: the INSERT guard is what refuses it.
   addCompany("co_2", OWNER);
   insertDraft();
   db.prepare(
@@ -838,76 +838,125 @@ test("each unique index names itself in its own way, which the repository's mapp
   );
 });
 
-test("the residual, exactly as documented: an OR REPLACE move evicts only a row with no event", () => {
-  // SQLite deletes the row an OR REPLACE conflict evicts without firing its delete trigger. What
-  // protects every row the repository creates is the events foreign key (each has its `created`
-  // event); only a row written around the repository, with no event, can be evicted.
+test("a body that has events stays in place: no conflict-resolving write removes or replaces it", () => {
+  // The holder is a linked body with its history, as the repository writes every body: together
+  // with its `created` event. Each write below would have to remove the holder to succeed.
   const reserveSet = (agent: string, body: string) =>
     `agent_id = '${agent}', identity_owner = '${OWNER}', link_digest = '${H("b")}',
      link_deadline = 1900000000, link_signature = '0x01', body_address = '${body}',
      binding_state = 'reserved'`;
-  for (const holderHasEvent of [true, false]) {
-    // A reservation onto the agentId a live holder has.
-    {
-      const d = freshDb();
-      frozenDraftIn(d, lb("holder"), holderHasEvent);
-      d.prepare(
-        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = '${lb("holder")}'`,
-      ).run();
-      frozenDraftIn(d, lb("mover"));
-      const evict = () =>
+  const holder = lb("holder");
+  const mover = lb("mover");
+  const setUp = () => {
+    const d = freshDb();
+    frozenDraftIn(d, holder);
+    d.prepare(`UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = ?`).run(
+      holder,
+    );
+    d.prepare(
+      `UPDATE legal_bodies SET ${DEPLOY_SET}, binding_state = 'deployed' WHERE legal_body_id = ?`,
+    ).run(holder);
+    d.prepare(
+      "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000100 WHERE legal_body_id = ?",
+    ).run(holder);
+    frozenDraftIn(d, mover);
+    return d;
+  };
+  const holderRowid = (d: Database.Database) =>
+    (
+      d.prepare("SELECT rowid AS r FROM legal_bodies WHERE legal_body_id = ?").get(holder) as {
+        r: number;
+      }
+    ).r;
+  const writes: readonly (readonly [string, RegExp, (d: Database.Database) => unknown])[] = [
+    [
+      "a reservation of the agentId it holds",
+      /FOREIGN KEY/,
+      (d) =>
         d
           .prepare(
-            `UPDATE OR REPLACE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = '${lb("mover")}'`,
+            `UPDATE OR REPLACE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = ?`,
           )
-          .run();
-      if (holderHasEvent) expect(evict).toThrow(/FOREIGN KEY/);
-      else expect(evict().changes).toBe(1);
-      const ids = d.prepare("SELECT legal_body_id FROM legal_bodies ORDER BY 1").all();
-      expect(ids, `reserve, holder event: ${holderHasEvent}`).toEqual(
-        holderHasEvent
-          ? [{ legal_body_id: lb("mover") }, { legal_body_id: lb("holder") }]
-          : [{ legal_body_id: lb("mover") }],
-      );
-      d.close();
-    }
-    // A re-link of a broken body while a new holder has its agentId live.
-    {
-      const d = freshDb();
-      frozenDraftIn(d, lb("mover"));
-      d.prepare(
-        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = '${lb("mover")}'`,
-      ).run();
-      d.prepare(
-        `UPDATE legal_bodies SET ${DEPLOY_SET}, binding_state = 'deployed' WHERE legal_body_id = '${lb("mover")}'`,
-      ).run();
-      d.prepare(
-        `UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1 WHERE legal_body_id = '${lb("mover")}'`,
-      ).run();
-      d.prepare(
-        `UPDATE legal_bodies SET binding_state = 'broken' WHERE legal_body_id = '${lb("mover")}'`,
-      ).run();
-      frozenDraftIn(d, lb("holder"), holderHasEvent);
-      d.prepare(
-        `UPDATE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = '${lb("holder")}'`,
-      ).run();
-      const evict = () =>
+          .run(mover),
+    ],
+    [
+      "a reservation of its body address",
+      /FOREIGN KEY/,
+      (d) =>
         d
           .prepare(
-            `UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 2 WHERE legal_body_id = '${lb("mover")}'`,
+            `UPDATE OR REPLACE legal_bodies SET ${reserveSet("43", BODY)} WHERE legal_body_id = ?`,
           )
-          .run();
-      if (holderHasEvent) expect(evict).toThrow(/FOREIGN KEY/);
-      else expect(evict().changes).toBe(1);
-      const ids = d.prepare("SELECT legal_body_id FROM legal_bodies ORDER BY 1").all();
-      expect(ids, `re-link, holder event: ${holderHasEvent}`).toEqual(
-        holderHasEvent
-          ? [{ legal_body_id: lb("mover") }, { legal_body_id: lb("holder") }]
-          : [{ legal_body_id: lb("mover") }],
-      );
-      d.close();
-    }
+          .run(mover),
+    ],
+    [
+      "a move onto its rowid",
+      /write-once/,
+      (d) =>
+        d
+          .prepare("UPDATE OR REPLACE legal_bodies SET rowid = ? WHERE legal_body_id = ?")
+          .run(holderRowid(d), mover),
+    ],
+    [
+      "a new row that names its rowid",
+      /born draft and never replaced/,
+      (d) =>
+        d
+          .prepare(
+            `INSERT OR REPLACE INTO legal_bodies (rowid, legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+             VALUES (?, ?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+          )
+          .run(holderRowid(d), lb("new"), pub("new"), TENANT, FACTORY, TENANT),
+    ],
+    [
+      "a new row that names its id",
+      /born draft and never replaced/,
+      (d) =>
+        d
+          .prepare(
+            `REPLACE INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+             VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+          )
+          .run(holder, pub("new"), TENANT, FACTORY, TENANT),
+    ],
+  ];
+  for (const [label, refusal, write] of writes) {
+    const d = setUp();
+    const before = {
+      bodies: d.prepare("SELECT rowid, * FROM legal_bodies ORDER BY rowid").all(),
+      events: d.prepare("SELECT * FROM legal_body_events ORDER BY id").all(),
+    };
+    expect(() => write(d), label).toThrow(refusal);
+    expect(
+      {
+        bodies: d.prepare("SELECT rowid, * FROM legal_bodies ORDER BY rowid").all(),
+        events: d.prepare("SELECT * FROM legal_body_events ORDER BY id").all(),
+      },
+      label,
+    ).toEqual(before);
+    d.close();
   }
+  // The same holds for a re-link: a broken body is not linked again over the body that now
+  // holds its agentId live.
+  const d = setUp();
+  d.prepare("UPDATE legal_bodies SET binding_state = 'broken' WHERE legal_body_id = ?").run(holder);
+  d.prepare(`UPDATE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = ?`).run(
+    mover,
+  );
+  expect(() =>
+    d
+      .prepare(
+        "UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000200 WHERE legal_body_id = ?",
+      )
+      .run(holder),
+  ).toThrow(/FOREIGN KEY/);
+  expect(
+    d.prepare("SELECT legal_body_id, binding_state FROM legal_bodies ORDER BY rowid").all(),
+  ).toEqual([
+    { legal_body_id: holder, binding_state: "broken" },
+    { legal_body_id: mover, binding_state: "reserved" },
+  ]);
+  d.close();
 });
 
 test("a draft can be closed: abandoned is reached only from draft, and nothing leaves it", () => {
@@ -1307,7 +1356,7 @@ test("nothing legitimate is refused: the whole lifecycle, with agentId 0, the la
 // ── The rowid and the creation time are part of a row's identity ──
 
 test("the rowid is pinned: no INSERT names an existing one, no UPDATE moves it, and none is zero or negative", () => {
-  // Two rows with no event, so nothing but the guards on legal_bodies itself protects them.
+  // Two plain rows: what refuses each write below is a guard on legal_bodies itself.
   insertDraft(lb("1"), pub("1"));
   insertDraft(lb("2"), pub("2"));
   const rowidOf = (id: string) =>
