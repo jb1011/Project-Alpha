@@ -241,7 +241,15 @@ test("the new tables leave entities untouched", () => {
 
 // ── The guards against SQLite's REPLACE conflict resolution, and every state reached legally ──
 
-type State = "draft" | "reserved" | "deployed" | "linked" | "broken" | "lapsed" | "superseded";
+type State =
+  | "draft"
+  | "reserved"
+  | "deployed"
+  | "linked"
+  | "broken"
+  | "lapsed"
+  | "superseded"
+  | "abandoned";
 const STATES: readonly State[] = [
   "draft",
   "reserved",
@@ -250,6 +258,7 @@ const STATES: readonly State[] = [
   "broken",
   "lapsed",
   "superseded",
+  "abandoned",
 ];
 
 // The columns each state's CHECKs require, as SET clauses holding exactly the values `bodyIn`
@@ -260,6 +269,7 @@ const LINK_SET = `agent_id = '42', identity_owner = '${OWNER}', link_digest = '$
 const DEPLOY_SET = `create_tx_hash = '${H("c")}', deployed_at = 1800000000`;
 const NEEDS: Record<State, string> = {
   draft: "",
+  abandoned: "",
   reserved: LINK_SET,
   lapsed: LINK_SET,
   deployed: `${LINK_SET}, ${DEPLOY_SET}`,
@@ -276,6 +286,7 @@ const PATH: Record<State, State[]> = {
   broken: ["reserved", "deployed", "linked", "broken"],
   lapsed: ["reserved", "lapsed"],
   superseded: ["reserved", "deployed", "superseded"],
+  abandoned: ["abandoned"],
 };
 
 /** Move `lb_1` to `to` (NULL included), setting what the target's CHECKs need in one UPDATE. */
@@ -380,7 +391,16 @@ test("REPLACE INTO cannot rewrite an existing body: rows are never replaced", ()
 });
 
 test("a row is born draft: an INSERT straight into any other state, or NULL, is refused", () => {
-  for (const s of ["reserved", "deployed", "linked", "broken", "lapsed", "superseded", null])
+  for (const s of [
+    "reserved",
+    "deployed",
+    "linked",
+    "broken",
+    "lapsed",
+    "superseded",
+    "abandoned",
+    null,
+  ])
     expect(
       () =>
         db
@@ -583,6 +603,7 @@ test("a body is created only under a company of its own tenant", () => {
 test("the transition matrix: exactly the legal edges move; every other pair, and NULL, is refused", () => {
   const LEGAL = new Set([
     "draft>reserved",
+    "draft>abandoned",
     "reserved>deployed",
     "reserved>lapsed",
     "deployed>linked",
@@ -590,6 +611,7 @@ test("the transition matrix: exactly the legal edges move; every other pair, and
     "linked>broken",
     "broken>linked",
     "broken>superseded",
+    "superseded>linked",
   ]);
   const moved: string[] = [];
   for (const from of STATES) {
@@ -869,4 +891,53 @@ test("the residual, exactly as documented: an OR REPLACE move evicts only a row 
       d.close();
     }
   }
+});
+
+test("a draft can be closed: abandoned is reached only from draft, and nothing leaves it", () => {
+  for (const frozen of [false, true]) {
+    const d = freshDb();
+    d.prepare(
+      `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+       VALUES ('lb_1', 'pub-1', ?, 'co_1', 5042002, ?, ?, 172800)`,
+    ).run(TENANT, FACTORY, TENANT);
+    if (frozen)
+      d.prepare(
+        "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = 'lb_1'",
+      ).run(H("a"));
+    expect(moveTo(d, "abandoned").changes, `frozen: ${frozen}`).toBe(1);
+    for (const to of STATES.filter((s) => s !== "abandoned"))
+      expect(() => moveTo(d, to), `abandoned>${to}`).toThrow(/illegal binding_state transition/);
+    expect(stateOf(d)).toBe("abandoned");
+    d.close();
+  }
+});
+
+test("an abandoned row holds no link fields, like a draft", () => {
+  insertDraft();
+  freeze();
+  // Not on the way in...
+  expect(() =>
+    db
+      .prepare(
+        `UPDATE legal_bodies SET binding_state = 'abandoned', ${LINK_SET} WHERE legal_body_id = 'lb_1'`,
+      )
+      .run(),
+  ).toThrow(/CHECK/);
+  expect(moveTo(db, "abandoned").changes).toBe(1);
+  // ...and not afterwards: it can never squat on an agentId or a body address.
+  for (const [col, v] of [
+    ["body_address", BODY],
+    ["agent_id", "42"],
+    ["identity_owner", OWNER],
+    ["link_digest", H("b")],
+    ["link_deadline", 1900000000],
+    ["link_signature", "0x01"],
+  ] as const)
+    expect(
+      () => db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = 'lb_1'`).run(v),
+      col,
+    ).toThrow(/CHECK/);
+  insertDraft("lb_2", "p2");
+  freeze("lb_2");
+  expect(() => reserve("lb_2", "42", BODY)).not.toThrow();
 });

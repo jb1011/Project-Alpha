@@ -210,10 +210,13 @@ const COMPANIES_DDL = `
  *  - binding_state only moves along the legal transitions (a trigger), and a NULL target is
  *    refused too: `UPDATE OR REPLACE` would otherwise quietly turn it into the column default,
  *    `draft`, which no transition reaches.
- *  - A `draft` holds no link fields, so it can never squat on an agentId or a body address;
- *    leaving `draft` requires every link field and a frozen agreement; `deployed`, `linked`,
- *    `broken` and `superseded` require the deploy facts, and `linked` a sighting of the pointer
- *    (CHECKs).
+ *  - A `draft` holds no link fields, so it can never squat on an agentId or a body address, and
+ *    neither does an `abandoned` row, which is a draft closed for good. Every other state requires
+ *    every link field and a frozen agreement; `deployed`, `linked`, `broken` and `superseded`
+ *    require the deploy facts, and `linked` a sighting of the pointer (CHECKs).
+ *  - `superseded` is not final: the chain decides which body an identity's owner names, and a
+ *    body that was set aside can be named again, so `superseded` may return to `linked`. The
+ *    final states are `lapsed` and `abandoned`.
  *  - At most one LIVE body (reserved, deployed or linked) per agentId per chain (a partial unique
  *    index), and at most one row per body address per chain, whatever its casing (a unique index
  *    on its lower-case form).
@@ -267,7 +270,8 @@ export const LEGAL_BODIES_DDL = `
     create_tx_hash TEXT,
     deployed_at INTEGER CHECK (deployed_at IS NULL OR typeof(deployed_at) = 'integer'),
     binding_state TEXT NOT NULL DEFAULT 'draft'
-      CHECK (binding_state IN ('draft','reserved','deployed','linked','broken','lapsed','superseded')),
+      CHECK (binding_state IN ('draft','reserved','deployed','linked','broken','lapsed','superseded',
+                               'abandoned')),
     pointer_seen_at INTEGER CHECK (pointer_seen_at IS NULL OR typeof(pointer_seen_at) = 'integer'),
     next_binding_check_at INTEGER
       CHECK (next_binding_check_at IS NULL OR typeof(next_binding_check_at) = 'integer'),
@@ -276,10 +280,10 @@ export const LEGAL_BODIES_DDL = `
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (guardian = tenant_id),
-    CHECK (binding_state != 'draft' OR (agent_id IS NULL AND identity_owner IS NULL
+    CHECK (binding_state NOT IN ('draft','abandoned') OR (agent_id IS NULL AND identity_owner IS NULL
       AND link_digest IS NULL AND link_deadline IS NULL AND link_signature IS NULL
       AND body_address IS NULL)),
-    CHECK (binding_state = 'draft' OR (
+    CHECK (binding_state IN ('draft','abandoned') OR (
       agent_id IS NOT NULL AND identity_owner IS NOT NULL AND link_digest IS NOT NULL
       AND link_deadline IS NOT NULL AND link_signature IS NOT NULL AND body_address IS NOT NULL
       AND oa_manifest_hash IS NOT NULL)),
@@ -321,11 +325,12 @@ export const LEGAL_BODIES_DDL = `
   CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_transitions
   BEFORE UPDATE OF binding_state ON legal_bodies FOR EACH ROW
   WHEN NEW.binding_state IS NOT OLD.binding_state AND NOT IFNULL((
-       (OLD.binding_state = 'draft' AND NEW.binding_state = 'reserved')
+       (OLD.binding_state = 'draft' AND NEW.binding_state IN ('reserved','abandoned'))
     OR (OLD.binding_state = 'reserved' AND NEW.binding_state IN ('deployed','lapsed'))
     OR (OLD.binding_state = 'deployed' AND NEW.binding_state IN ('linked','superseded'))
     OR (OLD.binding_state = 'linked' AND NEW.binding_state = 'broken')
-    OR (OLD.binding_state = 'broken' AND NEW.binding_state IN ('linked','superseded'))), 0)
+    OR (OLD.binding_state = 'broken' AND NEW.binding_state IN ('linked','superseded'))
+    OR (OLD.binding_state = 'superseded' AND NEW.binding_state = 'linked')), 0)
   BEGIN
     SELECT RAISE(ABORT, 'legal_bodies: illegal binding_state transition');
   END;

@@ -12,8 +12,9 @@ import { redactPii } from "../formation/pii";
  *
  *   draft ──freezeAgreement──▶ draft (agreement frozen) ──reserve──▶ reserved
  *   reserved ──markDeployed──▶ deployed          reserved ──lapse──▶ lapsed
- *   deployed | broken ──markLinked──▶ linked     linked ──markBroken──▶ broken
- *   deployed | broken ──supersede──▶ superseded
+ *   deployed | broken | superseded ──markLinked──▶ linked
+ *   linked ──markBroken──▶ broken                deployed | broken ──supersede──▶ superseded
+ *   draft ──abandon──▶ abandoned (closed for good: it never held an agentId or a body address)
  *
  * Every move is ONE compare-and-set UPDATE whose WHERE names the states it may leave, and the
  * caller learns whether IT made the move from whether that UPDATE changed a row, so two callers
@@ -28,7 +29,8 @@ export type BindingState =
   | "linked"
   | "broken"
   | "lapsed"
-  | "superseded";
+  | "superseded"
+  | "abandoned";
 
 /**
  * The states that hold an agentId: at most one row per (chain, agentId) is in one of them, which
@@ -46,6 +48,7 @@ export type LegalBodyEventKind =
   | "broken"
   | "lapsed"
   | "superseded"
+  | "abandoned"
   | "revoked"
   | "statement_signed"
   | "note";
@@ -153,14 +156,27 @@ export interface LegalBodyRepository {
   markDeployed(legalBodyId: string, d: { txHash: Hex; deployedAt: number }): boolean;
   lapse(legalBodyId: string, reason: string): boolean;
   /**
-   * `deployed` | `broken` → `linked`. False when the body is in neither state, AND when another
-   * body holds the same agentId live: `broken` is not a live state, so a new reservation can take
-   * the agentId while this body is broken, and linking this one again would make two live bodies
-   * for one identity. The caller must resolve that collision; which body keeps the agentId is the
-   * binding sweeper's policy, not this repository's. Nothing is recorded either way.
+   * Close a `draft` for good: `draft` → `abandoned`, frozen agreement or not. A draft's company,
+   * delay and agreement are write-once and rows are never deleted, so an order opened by mistake,
+   * or never signed, is closed rather than corrected. Nothing leaves `abandoned`.
+   */
+  abandon(legalBodyId: string, reason: string): boolean;
+  /**
+   * `deployed` | `broken` | `superseded` → `linked`. False when the body is in none of these
+   * states, AND when another body holds the same agentId live: `broken` and `superseded` are not
+   * live states, so a new reservation can take the agentId in the meantime, and linking this body
+   * again would make two live bodies for one identity. The caller must resolve that collision;
+   * which body keeps the agentId is the binding sweeper's policy, not this repository's. Nothing
+   * is recorded either way.
    */
   markLinked(legalBodyId: string, seenAt: number): boolean;
   markBroken(legalBodyId: string, detail: Record<string, unknown>): boolean;
+  /**
+   * `deployed` | `broken` → `superseded`: the body gives its agentId up, which frees it for a new
+   * link. Not final. Which body an identity's owner names is decided on chain, where a body that
+   * was set aside can be named again, so `markLinked` takes a superseded body back to `linked`
+   * once the agentId is free.
+   */
   supersede(legalBodyId: string, bySupersedingId: string): boolean;
   /** Not a state change, so no event. Null, null takes the row off the schedule. */
   scheduleBindingCheck(legalBodyId: string, nextAt: number | null, intervalMs: number | null): void;
@@ -394,10 +410,14 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
         `UPDATE legal_bodies SET binding_state = 'lapsed', updated_at = CURRENT_TIMESTAMP
           WHERE legal_body_id = ? AND binding_state = 'reserved'`,
       ),
+      abandon: db.prepare(
+        `UPDATE legal_bodies SET binding_state = 'abandoned', updated_at = CURRENT_TIMESTAMP
+          WHERE legal_body_id = ? AND binding_state = 'draft'`,
+      ),
       markLinked: db.prepare(
         `UPDATE legal_bodies
             SET binding_state = 'linked', pointer_seen_at = ?, updated_at = CURRENT_TIMESTAMP
-          WHERE legal_body_id = ? AND binding_state IN ('deployed','broken')`,
+          WHERE legal_body_id = ? AND binding_state IN ('deployed','broken','superseded')`,
       ),
       markBroken: db.prepare(
         `UPDATE legal_bodies SET binding_state = 'broken', updated_at = CURRENT_TIMESTAMP
@@ -591,6 +611,12 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
 
   lapse(legalBodyId: string, reason: string): boolean {
     return this.move(legalBodyId, () => this.stmts.lapse.run(legalBodyId), "lapsed", null, {
+      reason,
+    });
+  }
+
+  abandon(legalBodyId: string, reason: string): boolean {
+    return this.move(legalBodyId, () => this.stmts.abandon.run(legalBodyId), "abandoned", null, {
       reason,
     });
   }

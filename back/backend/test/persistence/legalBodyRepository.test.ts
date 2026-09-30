@@ -393,3 +393,89 @@ test("reserve answers body_taken when the recorded address differs only in casin
   expect(repo.reserve(b.legalBodyId, link("44", BODY_A))).toBe("body_taken");
   expect(repo.findById(b.legalBodyId)?.bindingState).toBe("draft");
 });
+
+test("abandon closes a draft, frozen or not, with its reason in the log; and only a draft", () => {
+  for (const frozen of [false, true]) {
+    const r = newBody();
+    if (frozen) repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version: 1 });
+    expect(repo.abandon(r.legalBodyId, "ordered under the wrong company")).toBe(true);
+    expect(repo.findById(r.legalBodyId)?.bindingState).toBe("abandoned");
+    const last = repo.listEvents(r.legalBodyId).at(-1);
+    expect(last?.kind).toBe("abandoned");
+    expect(last?.actor).toBe("system");
+    expect(last?.detail).toEqual({ reason: "ordered under the wrong company" });
+    // Compare-and-set: a second call made no move, and records nothing.
+    const events = repo.listEvents(r.legalBodyId);
+    expect(repo.abandon(r.legalBodyId, "again")).toBe(false);
+    expect(repo.listEvents(r.legalBodyId)).toEqual(events);
+  }
+  const reserved = toReserved("42", BODY_A);
+  expect(repo.abandon(reserved, "too late")).toBe(false);
+  expect(repo.findById(reserved)?.bindingState).toBe("reserved");
+  expect(repo.abandon("lb_unknown", "no such body")).toBe(false);
+});
+
+test("abandoned is terminal: no method moves the row again, and it holds nothing", () => {
+  const r = newBody();
+  repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version: 1 });
+  expect(repo.abandon(r.legalBodyId, "never signed")).toBe(true);
+  const events = repo.listEvents(r.legalBodyId);
+  expect(repo.freezeAgreement(r.legalBodyId, { hash: H("d"), version: 2 })).toBe(false);
+  expect(repo.reserve(r.legalBodyId, link("42", BODY_A))).toBe("not_draft");
+  expect(
+    repo.recordDeploySubmission(r.legalBodyId, { txHash: H("c"), rawTx: "0x02", nonce: 1 }),
+  ).toBe(false);
+  expect(repo.markDeployed(r.legalBodyId, { txHash: H("c"), deployedAt: 1_800_000_000 })).toBe(
+    false,
+  );
+  expect(repo.lapse(r.legalBodyId, "x")).toBe(false);
+  expect(repo.markLinked(r.legalBodyId, 1_800_000_100)).toBe(false);
+  expect(repo.markBroken(r.legalBodyId, {})).toBe(false);
+  expect(repo.supersede(r.legalBodyId, "lb_other")).toBe(false);
+  expect(repo.findById(r.legalBodyId)?.bindingState).toBe("abandoned");
+  expect(repo.listEvents(r.legalBodyId)).toEqual(events);
+  // The agentId and the body address it never held are free for a real order.
+  expect(toReserved("42", BODY_A)).toMatch(/^lb_/);
+});
+
+test("a superseded body can be linked again: the chain, not this table, decides which body is named", () => {
+  // The old body is set aside for a newer one; its owner then names the old one again on chain.
+  const old = toDeployed("42", BODY_A);
+  expect(repo.markLinked(old, 1_800_000_100)).toBe(true);
+  expect(repo.markBroken(old, { why: "pointer cleared" })).toBe(true);
+  const newer = toDeployed("43", BODY_B);
+  expect(repo.supersede(old, newer)).toBe(true);
+  expect(repo.findLiveByAgentId(5042002, "42")).toBeUndefined();
+  // The agentId is free, so the cached state follows the chain.
+  expect(repo.markLinked(old, 1_800_000_200)).toBe(true);
+  const row = repo.findById(old);
+  expect(row?.bindingState).toBe("linked");
+  expect(row?.pointerSeenAt).toBe(1_800_000_200);
+  expect(repo.findLiveByAgentId(5042002, "42")?.legalBodyId).toBe(old);
+  expect(repo.listEvents(old).map((e) => e.kind)).toEqual([
+    "created",
+    "agreement_frozen",
+    "link_accepted",
+    "deployed",
+    "linked",
+    "broken",
+    "superseded",
+    "linked",
+  ]);
+  expect(repo.listEvents(old).at(-1)?.detail).toEqual({ seenAt: 1_800_000_200 });
+});
+
+test("a superseded body is not linked again while another body holds its agentId live", () => {
+  const old = toDeployed("42", BODY_A);
+  const replacement = newBody();
+  repo.freezeAgreement(replacement.legalBodyId, { hash: H("a"), version: 1 });
+  expect(repo.supersede(old, replacement.legalBodyId)).toBe(true);
+  expect(repo.reserve(replacement.legalBodyId, link("42", BODY_B))).toBe("reserved");
+  const before = { row: repo.findById(old), events: repo.listEvents(old) };
+  expect(repo.markLinked(old, 1_800_000_200)).toBe(false);
+  expect(repo.findById(old)).toEqual(before.row);
+  expect(repo.listEvents(old)).toEqual(before.events);
+  // Once the replacement gives the agentId up, the old body can follow the chain again.
+  expect(repo.lapse(replacement.legalBodyId, "deadline passed")).toBe(true);
+  expect(repo.markLinked(old, 1_800_000_300)).toBe(true);
+});
