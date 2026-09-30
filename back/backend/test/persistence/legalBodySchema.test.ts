@@ -1307,6 +1307,76 @@ test("the deploy time is set only by the deploy: no row before it, or closed wit
   ).toBe(1);
 });
 
+test("a deploy hash needs a reservation, and a pointer sighting needs a link: no row before them holds one", () => {
+  const insertDraftWith = (column: string, value: string | number) =>
+    db
+      .prepare(
+        `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay, ${column})
+         VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800, ?)`,
+      )
+      .run(lb("h"), pub("h"), TENANT, FACTORY, TENANT, value);
+  const held = (id: string) =>
+    db
+      .prepare(
+        "SELECT binding_state AS state, create_tx_hash AS hash, pointer_seen_at AS seen FROM legal_bodies WHERE legal_body_id = ?",
+      )
+      .get(id);
+  const HASH = `create_tx_hash = '${H("c")}'`;
+  const SEEN = "pointer_seen_at = 1800000100";
+
+  // A draft, and a draft closed for good, hold neither.
+  expect(() => insertDraftWith("create_tx_hash", H("c")), "born with a hash").toThrow(/CHECK/);
+  expect(() => insertDraftWith("pointer_seen_at", 1800000100), "born with a sighting").toThrow(
+    /CHECK/,
+  );
+  const draft = frozenDraft();
+  for (const fact of [HASH, SEEN]) {
+    expect(() => setRaw(draft, fact), `draft: ${fact}`).toThrow(/CHECK/);
+    expect(
+      () => setRaw(draft, `binding_state = 'abandoned', ${fact}`),
+      `abandoned on the way in: ${fact}`,
+    ).toThrow(/CHECK/);
+  }
+  setRaw(draft, "binding_state = 'abandoned'");
+  for (const fact of [HASH, SEEN])
+    expect(() => setRaw(draft, fact), `abandoned: ${fact}`).toThrow(/CHECK/);
+  expect(held(draft)).toEqual({ state: "abandoned", hash: null, seen: null });
+
+  // A reserved row holds the hash of a deploy that was sent, and keeps it if it lapses; neither
+  // holds a sighting.
+  const lapsing = frozenDraft();
+  reserveRaw(lapsing);
+  expect(() => setRaw(lapsing, SEEN), "reserved").toThrow(/CHECK/);
+  expect(setRaw(lapsing, HASH).changes).toBe(1);
+  expect(() => setRaw(lapsing, `binding_state = 'lapsed', ${SEEN}`), "lapsed on the way in").toThrow(
+    /CHECK/,
+  );
+  setRaw(lapsing, "binding_state = 'lapsed'");
+  expect(() => setRaw(lapsing, SEEN), "lapsed").toThrow(/CHECK/);
+  expect(held(lapsing)).toEqual({ state: "lapsed", hash: H("c"), seen: null });
+
+  // A deployed row has not been seen yet. From the link on, the sighting stays with the row.
+  const body = frozenDraft();
+  reserveRaw(body);
+  const DEPLOY = `${HASH}, deployed_at = 1800000000, binding_state = 'deployed'`;
+  expect(() => setRaw(body, `${DEPLOY}, ${SEEN}`), "deployed on the way in").toThrow(/CHECK/);
+  setRaw(body, DEPLOY);
+  expect(() => setRaw(body, SEEN), "deployed").toThrow(/CHECK/);
+  setRaw(body, `binding_state = 'linked', ${SEEN}`);
+  for (const state of ["broken", "superseded"]) {
+    setRaw(body, `binding_state = '${state}'`);
+    expect(held(body), state).toEqual({ state, hash: H("c"), seen: 1800000100 });
+  }
+  setRaw(body, "binding_state = 'linked', pointer_seen_at = 1800000200");
+  expect(held(body)).toEqual({ state: "linked", hash: H("c"), seen: 1800000200 });
+  // A body set aside before it was ever linked has no sighting, and takes one only by linking.
+  const aside = frozenDraft();
+  reserveRaw(aside);
+  setRaw(aside, DEPLOY);
+  setRaw(aside, "binding_state = 'superseded'");
+  expect(held(aside)).toEqual({ state: "superseded", hash: H("c"), seen: null });
+});
+
 test("nothing legitimate is refused: the whole lifecycle, with agentId 0, the largest agentId and version 1", () => {
   const state = (id: string) =>
     (

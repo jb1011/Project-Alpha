@@ -240,6 +240,9 @@ const sqlIsSeconds = (column: string) =>
  *  - `deployed_at` is set only by the deploy: no `draft`, `reserved`, `lapsed` or `abandoned` row
  *    holds one. The deploy facts are write-once, so a row that held one early could never be
  *    deployed.
+ *  - A deploy hash needs a reservation: no `draft` or `abandoned` row holds a `create_tx_hash`.
+ *    A sighting of the pointer needs a link: only a `linked`, `broken` or `superseded` row holds a
+ *    `pointer_seen_at`.
  *  - Rows are born `draft`, and an INSERT never lands on an existing row, whether it names that
  *    row's id, its public id or its rowid (a trigger). That is what stops `REPLACE INTO` from
  *    rewriting a body wholesale: REPLACE deletes the old row and inserts a new one, and no UPDATE
@@ -342,7 +345,9 @@ export const LEGAL_BODIES_DDL = `
     CHECK (binding_state NOT IN ('deployed','linked','broken','superseded')
       OR (create_tx_hash IS NOT NULL AND deployed_at IS NOT NULL)),
     CHECK (deployed_at IS NULL OR binding_state IN ('deployed','linked','broken','superseded')),
-    CHECK (binding_state != 'linked' OR pointer_seen_at IS NOT NULL)
+    CHECK (create_tx_hash IS NULL OR binding_state NOT IN ('draft','abandoned')),
+    CHECK (binding_state != 'linked' OR pointer_seen_at IS NOT NULL),
+    CHECK (pointer_seen_at IS NULL OR binding_state IN ('linked','broken','superseded'))
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_live_agent
     ON legal_bodies(chain_id, agent_id) WHERE binding_state IN ('reserved','deployed','linked');
