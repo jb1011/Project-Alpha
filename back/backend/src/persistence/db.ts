@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { DEFAULT_DESCRIPTION, DEFAULT_INDUSTRY, companyNameOptions } from "../formation/intake";
+import { opsLog } from "../observability/opsLog";
 
 /** Open (and create dirs for) a SQLite db. Use ":memory:" in tests. */
 export function openDatabase(path: string): Database.Database {
@@ -454,6 +455,150 @@ export const LEGAL_BODIES_DDL = `
     SELECT RAISE(ABORT, 'legal_body_events: ids are assigned in order');
   END;
 `;
+
+/**
+ * The version of `LEGAL_BODIES_DDL`. RAISE IT BY ONE WITH EVERY EDIT TO THAT CONSTANT.
+ *
+ * Every statement of the DDL is `IF NOT EXISTS`, so on its own an edit would reach new databases
+ * only: a database that already ran the old text would keep its old trigger, index or CHECK, and
+ * every test, which starts from a fresh database, would still pass. The version is what carries an
+ * edit to the databases that exist (see `applyLegalBodySchema`). A test pins the DDL text to the
+ * version, so an edit without a bump fails the suite.
+ */
+export const LEGAL_BODIES_SCHEMA_VERSION = 1;
+
+/** Where the version of the schema a database holds is stored, in the `meta` table. */
+const LEGAL_BODIES_SCHEMA_VERSION_KEY = "legal_bodies_schema_version";
+
+interface SchemaObject {
+  type: string;
+  name: string;
+  sql: string;
+}
+
+/** The two tables with their indexes and triggers, without the indexes SQLite makes by itself. */
+const LEGAL_BODY_SCHEMA_OBJECTS_SQL = `
+  SELECT type, name, sql FROM sqlite_master
+   WHERE tbl_name IN ('legal_bodies','legal_body_events') AND substr(name, 1, 7) != 'sqlite_'
+   ORDER BY name, type`;
+
+function legalBodySchemaObjects(db: Database.Database): SchemaObject[] {
+  return db.prepare(LEGAL_BODY_SCHEMA_OBJECTS_SQL).all() as SchemaObject[];
+}
+
+/** What the code's DDL defines: it is run in a scratch in-memory database and read back. */
+function expectedLegalBodySchema(): SchemaObject[] {
+  const scratch = new Database(":memory:");
+  try {
+    scratch.exec(LEGAL_BODIES_DDL);
+    return legalBodySchemaObjects(scratch);
+  } finally {
+    scratch.close();
+  }
+}
+
+/**
+ * Bring the legal-body tables of `db` to the schema this build defines, or refuse to.
+ *
+ * It compares what the database holds with what `LEGAL_BODIES_DDL` defines, object by object
+ * (same names, same SQL text), and reads the schema version the database stored last time. Then:
+ *
+ *  - Nothing there yet: create everything, and store the version.
+ *  - Same definitions: nothing to do, except to store the version if it is missing or lower.
+ *  - Different definitions, and the stored version is HIGHER than this build's: a newer build
+ *    owns this schema. Nothing is changed (a schema is never downgraded) and one line goes to the
+ *    operations log.
+ *  - Different definitions at the SAME version: the DDL was edited without raising
+ *    `LEGAL_BODIES_SCHEMA_VERSION`, or the schema was changed by hand. It throws, naming what
+ *    differs, and the process does not start.
+ *  - Different definitions, and the stored version is lower or missing: an upgrade.
+ *      - Both tables are empty: they are dropped and created again from the DDL.
+ *      - A row exists: the triggers are dropped and created again from the DDL, because a
+ *        trigger holds no data. A table or an index that differs cannot be corrected that way,
+ *        so it throws `legal-body schema needs a written migration: <names>`, and the process
+ *        does not start until that migration is written.
+ *    Then the version is stored.
+ *
+ * All of it runs in ONE immediate transaction. Two processes starting together therefore cannot
+ * interleave, and a failure part-way, a refusal included, leaves the schema exactly as it was:
+ * never a table without its triggers.
+ *
+ * `migrate` runs it last, once the `meta` and `companies` tables exist.
+ */
+export function applyLegalBodySchema(db: Database.Database): void {
+  const expected = expectedLegalBodySchema();
+  const keyOf = (o: SchemaObject) => `${o.type} ${o.name}`;
+  const storeVersion = () =>
+    db
+      .prepare(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      )
+      .run(LEGAL_BODIES_SCHEMA_VERSION_KEY, String(LEGAL_BODIES_SCHEMA_VERSION));
+
+  db.transaction(() => {
+    const actual = legalBodySchemaObjects(db);
+    if (actual.length === 0) {
+      db.exec(LEGAL_BODIES_DDL);
+      storeVersion();
+      return;
+    }
+
+    const stored = db
+      .prepare("SELECT value FROM meta WHERE key = ?")
+      .get(LEGAL_BODIES_SCHEMA_VERSION_KEY) as { value: string } | undefined;
+    if (stored !== undefined && !/^(0|[1-9][0-9]*)$/.test(stored.value))
+      throw new Error(
+        `meta.${LEGAL_BODIES_SCHEMA_VERSION_KEY} is not a whole number: ${JSON.stringify(stored.value)}. Refusing to guess which legal-body schema this database holds.`,
+      );
+    const storedVersion = stored === undefined ? null : Number(stored.value);
+
+    const expectedSql = new Map(expected.map((o) => [keyOf(o), o.sql]));
+    const actualSql = new Map(actual.map((o) => [keyOf(o), o.sql]));
+    const differing = [...expected, ...actual.filter((o) => !expectedSql.has(keyOf(o)))]
+      .filter((o) => expectedSql.get(keyOf(o)) !== actualSql.get(keyOf(o)))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    const names = (objects: SchemaObject[]) => objects.map((o) => o.name).join(", ");
+
+    if (differing.length === 0) {
+      if (storedVersion === null || storedVersion < LEGAL_BODIES_SCHEMA_VERSION) storeVersion();
+      return;
+    }
+    if (storedVersion !== null && storedVersion > LEGAL_BODIES_SCHEMA_VERSION) {
+      opsLog("legal_body_schema_newer_than_code", {
+        storedVersion,
+        codeVersion: LEGAL_BODIES_SCHEMA_VERSION,
+        differing: names(differing),
+      });
+      return;
+    }
+    if (storedVersion === LEGAL_BODIES_SCHEMA_VERSION)
+      throw new Error(
+        `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}: ${names(differing)}. Either LEGAL_BODIES_DDL was edited without raising LEGAL_BODIES_SCHEMA_VERSION, or the schema was changed by hand.`,
+      );
+
+    // An upgrade: the stored version is lower, or was never stored.
+    const holdsRows = ["legal_bodies", "legal_body_events"].some(
+      (table) =>
+        actual.some((o) => o.type === "table" && o.name === table) &&
+        db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get() !== undefined,
+    );
+    if (!holdsRows) {
+      // The events table first: it references the other.
+      db.exec("DROP TABLE IF EXISTS legal_body_events; DROP TABLE IF EXISTS legal_bodies;");
+      db.exec(LEGAL_BODIES_DDL);
+    } else {
+      const needMigration = differing.filter((o) => o.type !== "trigger");
+      if (needMigration.length > 0)
+        throw new Error(`legal-body schema needs a written migration: ${names(needMigration)}`);
+      // Every trigger on the two tables, not only the differing ones, so the set that results is
+      // exactly the DDL's: one the DDL no longer defines goes, one it added arrives.
+      for (const o of actual.filter((a) => a.type === "trigger"))
+        db.exec(`DROP TRIGGER "${o.name.replaceAll('"', '""')}"`);
+      for (const o of expected.filter((e) => e.type === "trigger")) db.exec(o.sql);
+    }
+    storeVersion();
+  }).immediate();
+}
 
 /**
  * FORMATION PAYMENTS (design 2026-08-26 §2/§6) — shipped in A1, WRITTEN by B1.
@@ -1250,8 +1395,9 @@ export function migrate(db: Database.Database): void {
   );
 
   // Legal bodies: their own tables (see LEGAL_BODIES_DDL), created last so the companies table
-  // their foreign key points at exists on every database shape.
-  db.exec(LEGAL_BODIES_DDL);
+  // their foreign key points at exists on every database shape. Not a bare exec of the DDL: a
+  // database that ran an earlier version of it is brought up to this one, or refused.
+  applyLegalBodySchema(db);
 }
 
 /** Marker for the one-shot 2026-08-26 re-key (design §2 steps 1-5). */
