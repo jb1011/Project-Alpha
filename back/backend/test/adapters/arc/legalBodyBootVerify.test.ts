@@ -1,6 +1,11 @@
 import {
+  type Abi,
   type Address,
+  ContractFunctionExecutionError,
+  ContractFunctionRevertedError,
+  ContractFunctionZeroDataError,
   type Hex,
+  HttpRequestError,
   type PublicClient,
   isAddressEqual,
   toFunctionSelector,
@@ -20,6 +25,7 @@ const LB_FACTORY = "0x069f4ADEabcBEd3ffFe2cB6Aaf9e7a66E8731456" as Address;
 const REGISTRY = "0x8004A818BFB912233c491871b3d84c89A494BD9e" as Address;
 const EXECUTOR = "0x000000000000000000000000000000000000000b" as Address;
 const OTHER = "0x00000000000000000000000000000000000000ff" as Address;
+const NO_CODE = "0x00000000000000000000000000000000000dead1" as Address;
 
 test("the legal-body grant set is exactly the factory's two relayed functions, in order", () => {
   expect(LEGAL_BODY_GRANTED_SELECTORS.map((s) => s.name)).toEqual([
@@ -73,8 +79,9 @@ const grantKey = (role: string, account: string) =>
 
 /**
  * A small chain with two contracts. The factory's reads answer only at the factory address and
- * the controller's only at the controller address; anything else throws, as a call to the wrong
- * contract would. Pins are looked up by selector and grants by (role, account).
+ * the controller's only at the controller address. Anything else fails the way the real client
+ * does: "returned no data" at an address with no code, "reverted" at a contract that has no such
+ * function. Pins are looked up by selector and grants by (role, account).
  */
 function chain(over: Partial<World> = {}): PublicClient {
   const world: World = {
@@ -90,6 +97,7 @@ function chain(over: Partial<World> = {}): PublicClient {
   );
   const readContract = async (call: {
     address: Address;
+    abi: Abi;
     functionName: string;
     args?: readonly unknown[];
   }) => {
@@ -111,7 +119,14 @@ function chain(over: Partial<World> = {}): PublicClient {
         case "hasRole":
           return granted.has(grantKey(args[0] as string, args[1] as string));
       }
-    throw new Error(`no ${call.functionName}() at ${call.address}`);
+    const { abi, functionName } = call;
+    const hasCode = [LB_FACTORY, CONTROLLER].some((a) => isAddressEqual(a, call.address));
+    throw new ContractFunctionExecutionError(
+      hasCode
+        ? new ContractFunctionRevertedError({ abi, functionName })
+        : new ContractFunctionZeroDataError({ functionName }),
+      { abi, functionName, args: call.args, contractAddress: call.address },
+    );
   };
   return { readContract } as unknown as PublicClient;
 }
@@ -209,6 +224,40 @@ test("the grants are read for the configured executor, whichever account that is
   ).resolves.toBeUndefined();
 });
 
+test("a factory address with no code is a wrong address, not an RPC outage", async () => {
+  const message = await refusal({}, { ...wiring, factory: NO_CODE });
+  expect(message).toContain(
+    `LEGAL_BODY_FACTORY_ADDRESS ${NO_CODE} does not answer as a legal-body factory on this chain`,
+  );
+  expect(message).toContain("returned no data");
+  expect(message).not.toMatch(/could not verify|RPC read failed/);
+});
+
+test("a contract that is not a legal-body factory is a wrong address, not an RPC outage", async () => {
+  // The controller is a real contract, but it has no owner() to answer with.
+  const message = await refusal({}, { ...wiring, factory: CONTROLLER });
+  expect(message).toContain(
+    `LEGAL_BODY_FACTORY_ADDRESS ${CONTROLLER} does not answer as a legal-body factory on this chain`,
+  );
+  expect(message).toContain("reverted");
+  expect(message).not.toMatch(/could not verify|RPC read failed/);
+});
+
+test("a controller address that does not answer is named as the controller, not as the factory", async () => {
+  const message = await refusal({}, { ...wiring, controller: NO_CODE });
+  expect(message).toContain(`CONTROLLER_ADDRESS ${NO_CODE} does not answer as the controller`);
+  expect(message).not.toMatch(/could not verify|does not answer as a legal-body factory/);
+});
+
 test("an RPC failure is reported as 'could not verify', never as misconfiguration", async () => {
-  expect(await refusal({ down: new Error("socket hang up") })).toMatch(/could not verify/);
+  // The shape the real client throws when the transport fails, and a bare error for good measure.
+  const transport = new ContractFunctionExecutionError(
+    new HttpRequestError({ url: "http://127.0.0.1:1", details: "fetch failed" }),
+    { abi: [], functionName: "owner", contractAddress: LB_FACTORY },
+  );
+  for (const down of [transport, new Error("socket hang up")]) {
+    const message = await refusal({ down });
+    expect(message).toMatch(/could not verify.*RPC read failed/s);
+    expect(message).not.toContain("does not answer");
+  }
 });

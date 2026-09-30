@@ -1,6 +1,10 @@
 import {
   type Abi,
   type Address,
+  BaseError,
+  ContractFunctionExecutionError,
+  ContractFunctionRevertedError,
+  ContractFunctionZeroDataError,
   type Hex,
   type PublicClient,
   getAbiItem,
@@ -124,6 +128,30 @@ function unreadable(what: string, err: unknown): Error {
     `boot: could not verify ${what} on-chain (RPC read failed against ARC_TESTNET_RPC_URL) — the deployment may be fine, but it cannot be confirmed; fix connectivity and restart`,
     { cause: err },
   );
+}
+
+/**
+ * Tell "the contract refused the read" apart from "the read never got there". A call that comes
+ * back empty (no code at the address) or reverted (a contract with no such function) was answered
+ * by the chain: the ADDRESS is wrong, and telling the operator to fix connectivity sends them the
+ * wrong way. Returns which address refused and how, or undefined for anything else (a transport
+ * failure, a timeout), which stays a verification outage.
+ */
+function contractRefusal(err: unknown): { address?: Address; reason: string } | undefined {
+  if (!(err instanceof BaseError)) return undefined;
+  const refused = err.walk(
+    (e) => e instanceof ContractFunctionZeroDataError || e instanceof ContractFunctionRevertedError,
+  );
+  if (!(refused instanceof BaseError)) return undefined;
+  const call = err.walk((e) => e instanceof ContractFunctionExecutionError);
+  const signature =
+    refused instanceof ContractFunctionRevertedError && refused.signature
+      ? ` ${refused.signature}`
+      : "";
+  return {
+    address: call instanceof ContractFunctionExecutionError ? call.contractAddress : undefined,
+    reason: `${refused.shortMessage}${signature}`,
+  };
 }
 
 /**
@@ -264,7 +292,19 @@ export async function assertLegalBodyFactoryWiring(
       ),
     ]);
   } catch (err) {
-    throw unreadable(`the legal-body factory wiring (factory ${p.factory})`, err);
+    const refused = contractRefusal(err);
+    if (!refused) throw unreadable(`the legal-body factory wiring (factory ${p.factory})`, err);
+    // The two controller reads (pins and grants) are the only ones not made at the factory.
+    const atController =
+      refused.address !== undefined &&
+      isAddressEqual(refused.address, p.controller) &&
+      !isAddressEqual(p.controller, p.factory);
+    throw new Error(
+      atController
+        ? `boot: CONTROLLER_ADDRESS ${p.controller} does not answer as the controller of LEGAL_BODY_FACTORY_ADDRESS ${p.factory} on this chain (${refused.reason})`
+        : `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} does not answer as a legal-body factory on this chain (${refused.reason})`,
+      { cause: err },
+    );
   }
 
   if (!isAddressEqual(owner, p.controller))
