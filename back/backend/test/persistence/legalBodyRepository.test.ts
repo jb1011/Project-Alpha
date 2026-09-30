@@ -6,12 +6,12 @@ import {
   SqliteLegalBodyRepository,
 } from "../../src/persistence/legalBodyRepository";
 
-const TENANT = "0x172B7952b0F711b8B372410E81d51Dcba7D4BB02";
-const OTHER_TENANT = "0x26b2f179Db35D912C141A71de547d21bF8665D0E";
-const OWNER = "0x48191Ac42649274C4b3cbeBd16a76B8178e6F6e0";
-const FACTORY = "0x069f4ADEabcBEd3ffFe2cB6Aaf9e7a66E8731456";
-const BODY_A = "0x079cE31a43867Bcb4DBF80764c1da9c32515BfD4";
-const BODY_B = "0x01392702dA9487a1E3B49BeC9c6Fb1DD676fF6F1";
+const TENANT = "0x00000000000000000000000000000000000000A1";
+const OTHER_TENANT = "0x00000000000000000000000000000000000000A2";
+const OWNER = "0x00000000000000000000000000000000000000A3";
+const FACTORY = "0x00000000000000000000000000000000000000f1";
+const BODY_A = "0x00000000000000000000000000000000000000B1";
+const BODY_B = "0x00000000000000000000000000000000000000b2";
 const H = (c: string) => `0x${c.repeat(64)}` as `0x${string}`;
 
 let db: Database.Database;
@@ -159,7 +159,7 @@ test("supersede frees the agentId for a new link, only from deployed or broken",
   expect(repo.reserve(second.legalBodyId, link("42", BODY_B))).toBe("agent_taken");
   expect(repo.supersede(first, second.legalBodyId)).toBe(true);
   expect(repo.reserve(second.legalBodyId, link("42", BODY_B))).toBe("reserved");
-  const reservedOnly = toReserved("44", "0x000000000000000000000000000000000000dEaD");
+  const reservedOnly = toReserved("44", "0x00000000000000000000000000000000000000C1");
   expect(repo.supersede(reservedOnly, second.legalBodyId)).toBe(false);
 });
 
@@ -184,7 +184,7 @@ test("binding checks: schedule and due listing", () => {
 
 test("test_recordEvent_redactsPii", () => {
   const r = newBody();
-  repo.recordEvent(r.legalBodyId, "note", "operator:martin", null, { text: "SSN 123-45-6789" });
+  repo.recordEvent(r.legalBodyId, "note", "operator:alice", null, { text: "SSN 123-45-6789" });
   const ev = repo.listEvents(r.legalBodyId).at(-1);
   expect(JSON.stringify(ev?.detail)).not.toContain("123-45-6789");
 });

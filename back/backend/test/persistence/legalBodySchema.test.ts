@@ -2,11 +2,14 @@ import Database from "better-sqlite3";
 import { beforeEach, expect, test } from "vitest";
 import { migrate } from "../../src/persistence/db";
 
-const TENANT = "0x172B7952b0F711b8B372410E81d51Dcba7D4BB02";
-const OWNER = "0x26b2f179Db35D912C141A71de547d21bF8665D0E";
-const FACTORY = "0x069f4ADEabcBEd3ffFe2cB6Aaf9e7a66E8731456";
-const BODY = "0x079cE31a43867Bcb4DBF80764c1da9c32515BfD4";
+const TENANT = "0x00000000000000000000000000000000000000A1";
+const OWNER = "0x00000000000000000000000000000000000000A2";
+const FACTORY = "0x00000000000000000000000000000000000000f1";
+const BODY = "0x00000000000000000000000000000000000000B1";
 const H = (c: string) => `0x${c.repeat(64)}`;
+/** Well-formed ids for rows written by raw SQL: `lb_` and 36 characters; a 36-character public id. */
+const lb = (label: string | number) => `lb_${String(label).padStart(36, "0")}`;
+const pub = (label: string | number) => String(label).padStart(36, "0");
 
 let db: Database.Database;
 beforeEach(() => {
@@ -19,26 +22,26 @@ beforeEach(() => {
   ).run(TENANT);
 });
 
-function insertDraft(id = "lb_1", pub = "pub-1") {
+function insertDraft(id = lb("1"), publicId = pub("1")) {
   db.prepare(
     `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
      VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
-  ).run(id, pub, TENANT, FACTORY, TENANT);
+  ).run(id, publicId, TENANT, FACTORY, TENANT);
 }
-const freeze = (id = "lb_1") =>
+const freeze = (id = lb("1")) =>
   db
     .prepare(
       "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = ?",
     )
     .run(H("a"), id);
-const reserve = (id = "lb_1", agent = "42", body = BODY) =>
+const reserve = (id = lb("1"), agent = "42", body = BODY) =>
   db
     .prepare(
       `UPDATE legal_bodies SET agent_id = ?, identity_owner = ?, link_digest = ?, link_deadline = 1900000000,
          link_signature = '0x01', body_address = ?, binding_state = 'reserved' WHERE legal_body_id = ?`,
     )
     .run(agent, OWNER, H("b"), body, id);
-const deploy = (id = "lb_1") =>
+const deploy = (id = lb("1")) =>
   db
     .prepare(
       "UPDATE legal_bodies SET create_tx_hash = ?, deployed_at = 1800000000, binding_state = 'deployed' WHERE legal_body_id = ?",
@@ -67,7 +70,7 @@ test("guardian must equal tenant, structurally", () => {
     db
       .prepare(
         `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
-         VALUES ('lb_x', 'p', ?, 'co_1', 5042002, ?, ?, 172800)`,
+         VALUES ('${lb("x")}', '${pub("x")}', ?, 'co_1', 5042002, ?, ?, 172800)`,
       )
       .run(TENANT, FACTORY, OWNER),
   ).toThrow(/CHECK/);
@@ -81,7 +84,7 @@ test("amendment delay outside 48 hours .. 30 days is refused", () => {
           `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
            VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, ?)`,
         )
-        .run(`lb_${d}`, `p${d}`, TENANT, FACTORY, TENANT, d),
+        .run(lb(`${d}`), pub(`${d}`), TENANT, FACTORY, TENANT, d),
     ).toThrow(/CHECK/);
 });
 
@@ -90,7 +93,7 @@ test("a company that does not exist is refused (foreign key)", () => {
     db
       .prepare(
         `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
-         VALUES ('lb_y', 'py', ?, 'co_missing', 5042002, ?, ?, 172800)`,
+         VALUES ('${lb("y")}', '${pub("y")}', ?, 'co_missing', 5042002, ?, ?, 172800)`,
       )
       .run(TENANT, FACTORY, TENANT),
   ).toThrow(/FOREIGN KEY/);
@@ -109,7 +112,9 @@ test("deployed requires the deploy facts", () => {
   reserve();
   expect(() =>
     db
-      .prepare("UPDATE legal_bodies SET binding_state = 'deployed' WHERE legal_body_id = 'lb_1'")
+      .prepare(
+        `UPDATE legal_bodies SET binding_state = 'deployed' WHERE legal_body_id = '${lb("1")}'`,
+      )
       .run(),
   ).toThrow(/CHECK/);
   expect(() => deploy()).not.toThrow();
@@ -119,7 +124,9 @@ test("illegal state transitions are refused by the database", () => {
   insertDraft();
   freeze();
   const to = (s: string) =>
-    db.prepare("UPDATE legal_bodies SET binding_state = ? WHERE legal_body_id = 'lb_1'").run(s);
+    db
+      .prepare(`UPDATE legal_bodies SET binding_state = ? WHERE legal_body_id = '${lb("1")}'`)
+      .run(s);
   expect(() => to("deployed")).toThrow(/illegal binding_state transition|CHECK/);
   reserve();
   expect(() => to("linked")).toThrow(/illegal binding_state transition/);
@@ -127,7 +134,7 @@ test("illegal state transitions are refused by the database", () => {
   deploy();
   expect(() => to("reserved")).toThrow(/illegal binding_state transition/);
   db.prepare(
-    "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000100 WHERE legal_body_id = 'lb_1'",
+    `UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000100 WHERE legal_body_id = '${lb("1")}'`,
   ).run();
   expect(() => to("superseded")).toThrow(/illegal binding_state transition/);
   expect(() => to("broken")).not.toThrow();
@@ -154,7 +161,8 @@ test("identity, agreement and link fields are write-once", () => {
   ] as const) {
     if (col === "company_id") continue; // same value: allowed by construction
     expect(
-      () => db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = 'lb_1'`).run(v),
+      () =>
+        db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = '${lb("1")}'`).run(v),
       col,
     ).toThrow(/write-once/);
   }
@@ -171,7 +179,7 @@ test("the write-once fields the loop above cannot reach are pinned too", () => {
   reserve();
   deploy();
   for (const [col, v] of [
-    ["legal_body_id", "lb_other"],
+    ["legal_body_id", lb("other")],
     ["company_id", "co_2"],
     ["oa_manifest_version", 2],
     ["link_deadline", 1900000001],
@@ -184,7 +192,8 @@ test("the write-once fields the loop above cannot reach are pinned too", () => {
     ["deployed_at", null],
   ] as const) {
     expect(
-      () => db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = 'lb_1'`).run(v),
+      () =>
+        db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = '${lb("1")}'`).run(v),
       `${col} = ${v}`,
     ).toThrow(/write-once/);
   }
@@ -200,24 +209,28 @@ test("rows are never deleted", () => {
 });
 
 test("one live body per agentId per chain; a lapsed one frees the agentId", () => {
-  insertDraft("lb_1", "p1");
-  insertDraft("lb_2", "p2");
-  freeze("lb_1");
-  freeze("lb_2");
-  reserve("lb_1", "42", BODY);
-  expect(() => reserve("lb_2", "42", OWNER)).toThrow(/UNIQUE/);
-  db.prepare("UPDATE legal_bodies SET binding_state = 'lapsed' WHERE legal_body_id = 'lb_1'").run();
-  expect(() => reserve("lb_2", "42", OWNER)).not.toThrow();
+  insertDraft(lb("1"), pub("1"));
+  insertDraft(lb("2"), pub("2"));
+  freeze(lb("1"));
+  freeze(lb("2"));
+  reserve(lb("1"), "42", BODY);
+  expect(() => reserve(lb("2"), "42", OWNER)).toThrow(/UNIQUE/);
+  db.prepare(
+    `UPDATE legal_bodies SET binding_state = 'lapsed' WHERE legal_body_id = '${lb("1")}'`,
+  ).run();
+  expect(() => reserve(lb("2"), "42", OWNER)).not.toThrow();
 });
 
 test("one row per deployed body address per chain", () => {
-  insertDraft("lb_1", "p1");
-  insertDraft("lb_2", "p2");
-  freeze("lb_1");
-  freeze("lb_2");
-  reserve("lb_1", "42", BODY);
-  db.prepare("UPDATE legal_bodies SET binding_state = 'lapsed' WHERE legal_body_id = 'lb_1'").run();
-  expect(() => reserve("lb_2", "43", BODY)).toThrow(/UNIQUE/);
+  insertDraft(lb("1"), pub("1"));
+  insertDraft(lb("2"), pub("2"));
+  freeze(lb("1"));
+  freeze(lb("2"));
+  reserve(lb("1"), "42", BODY);
+  db.prepare(
+    `UPDATE legal_bodies SET binding_state = 'lapsed' WHERE legal_body_id = '${lb("1")}'`,
+  ).run();
+  expect(() => reserve(lb("2"), "43", BODY)).toThrow(/UNIQUE/);
 });
 
 test("the event log is append-only and bound to an existing legal body", () => {
@@ -225,8 +238,8 @@ test("the event log is append-only and bound to an existing legal body", () => {
   const ins = db.prepare(
     "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES (?, 'created', 'system')",
   );
-  ins.run("lb_1");
-  expect(() => ins.run("lb_missing")).toThrow(/FOREIGN KEY/);
+  ins.run(lb("1"));
+  expect(() => ins.run(lb("missing"))).toThrow(/FOREIGN KEY/);
   expect(() => db.prepare("UPDATE legal_body_events SET kind = 'x'").run()).toThrow(/append-only/);
   expect(() => db.prepare("DELETE FROM legal_body_events").run()).toThrow(/append-only/);
 });
@@ -289,17 +302,19 @@ const PATH: Record<State, State[]> = {
   abandoned: ["abandoned"],
 };
 
-/** Move `lb_1` to `to` (NULL included), setting what the target's CHECKs need in one UPDATE. */
+/** Move body `lb("1")` to `to` (NULL included), setting what the target's CHECKs need in one UPDATE. */
 const moveTo = (d: Database.Database, to: State | null, verb = "UPDATE") =>
   d
     .prepare(
       `${verb} legal_bodies SET binding_state = ?${to && NEEDS[to] ? `, ${NEEDS[to]}` : ""}
-        WHERE legal_body_id = 'lb_1'`,
+        WHERE legal_body_id = '${lb("1")}'`,
     )
     .run(to);
 const stateOf = (d: Database.Database) =>
   (
-    d.prepare("SELECT binding_state FROM legal_bodies WHERE legal_body_id = 'lb_1'").get() as {
+    d
+      .prepare(`SELECT binding_state FROM legal_bodies WHERE legal_body_id = '${lb("1")}'`)
+      .get() as {
       binding_state: State;
     }
   ).binding_state;
@@ -321,7 +336,7 @@ function frozenDraftIn(d: Database.Database, id: string, withEvent = true) {
   d.prepare(
     `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
      VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
-  ).run(id, `pub-${id}`, TENANT, FACTORY, TENANT);
+  ).run(id, id.slice(3), TENANT, FACTORY, TENANT);
   if (withEvent)
     d.prepare(
       "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES (?, 'created', 'system')",
@@ -331,10 +346,10 @@ function frozenDraftIn(d: Database.Database, id: string, withEvent = true) {
   ).run(H("a"), id);
 }
 
-/** A fresh database holding `lb_1` (with its `created` event), walked legally into `state`. */
+/** A fresh database holding body `lb("1")` (with its `created` event), walked legally into `state`. */
 function bodyIn(state: State): Database.Database {
   const d = freshDb();
-  frozenDraftIn(d, "lb_1");
+  frozenDraftIn(d, lb("1"));
   for (const s of PATH[state]) moveTo(d, s);
   expect(stateOf(d)).toBe(state);
   return d;
@@ -347,7 +362,7 @@ const addCompany = (id: string, tenant: string) =>
        VALUES (?, ?, 'ready', 'customer', 'sandbox', '["Other LLC"]', 'existing', 'existing')`,
     )
     .run(id, tenant);
-const OTHER_BODY = "0x01392702dA9487a1E3B49BeC9c6Fb1DD676fF6F1";
+const OTHER_BODY = "0x00000000000000000000000000000000000000b2";
 
 test("REPLACE INTO cannot rewrite an existing body: rows are never replaced", () => {
   // Without an INSERT guard, REPLACE deletes the old row (firing no delete trigger) and inserts
@@ -355,7 +370,7 @@ test("REPLACE INTO cannot rewrite an existing body: rows are never replaced", ()
   addCompany("co_2", OWNER);
   insertDraft();
   db.prepare(
-    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'created', 'system')",
+    `INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('${lb("1")}', 'created', 'system')`,
   ).run();
   freeze();
   reserve();
@@ -368,14 +383,14 @@ test("REPLACE INTO cannot rewrite an existing body: rows are never replaced", ()
         `REPLACE INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian,
            amendment_delay, oa_manifest_hash, oa_manifest_version, agent_id, identity_owner, link_digest,
            link_deadline, link_signature, body_address, create_tx_hash, deployed_at, binding_state, pointer_seen_at)
-         VALUES ('lb_1', 'pub-1', ?, 'co_2', 5042002, ?, ?, 172800, ?, 9, '99', ?, ?, 1, '0x09', ?, ?, 1, 'linked', 1)`,
+         VALUES ('${lb("1")}', '${pub("1")}', ?, 'co_2', 5042002, ?, ?, 172800, ?, 9, '99', ?, ?, 1, '0x09', ?, ?, 1, 'linked', 1)`,
       )
       .run(OWNER, FACTORY, OWNER, H("f"), TENANT, H("e"), OTHER_BODY, H("d")),
   ).toThrow(/born draft and never replaced/);
   // Not even a well-formed draft may land on an existing primary key or public id.
-  for (const [id, pub] of [
-    ["lb_1", "pub-new"],
-    ["lb_new", "pub-1"],
+  for (const [id, publicId] of [
+    [lb("1"), pub("new")],
+    [lb("new"), pub("1")],
   ])
     expect(
       () =>
@@ -384,8 +399,8 @@ test("REPLACE INTO cannot rewrite an existing body: rows are never replaced", ()
             `REPLACE INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
              VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
           )
-          .run(id, pub, TENANT, FACTORY, TENANT),
-      `${id} / ${pub}`,
+          .run(id, publicId, TENANT, FACTORY, TENANT),
+      `${id} / ${publicId}`,
     ).toThrow(/born draft and never replaced/);
   expect(db.prepare("SELECT * FROM legal_bodies").all()).toEqual(before);
 });
@@ -409,7 +424,7 @@ test("a row is born draft: an INSERT straight into any other state, or NULL, is 
                amendment_delay, oa_manifest_hash, oa_manifest_version, agent_id, identity_owner, link_digest,
                link_deadline, link_signature, body_address, create_tx_hash, deployed_at, binding_state,
                pointer_seen_at)
-             VALUES ('lb_9', 'p9', ?, 'co_1', 5042002, ?, ?, 172800, ?, 1, '42', ?, ?, 1900000000, '0x01', ?, ?,
+             VALUES ('${lb("9")}', '${pub("9")}', ?, 'co_1', 5042002, ?, ?, 172800, ?, 1, '42', ?, ?, 1900000000, '0x01', ?, ?,
                1800000000, ?, 1800000100)`,
           )
           .run(TENANT, FACTORY, TENANT, H("a"), OWNER, H("b"), BODY, H("c"), s),
@@ -421,21 +436,21 @@ test("a row is born draft: an INSERT straight into any other state, or NULL, is 
 test("REPLACE INTO cannot rewrite an event: no INSERT lands on an existing event id", () => {
   insertDraft();
   db.prepare(
-    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'created', 'system')",
+    `INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('${lb("1")}', 'created', 'system')`,
   ).run();
   const before = db.prepare("SELECT * FROM legal_body_events").all() as { id: number }[];
   expect(() =>
     db
       .prepare(
         `REPLACE INTO legal_body_events (id, legal_body_id, kind, actor, detail)
-         VALUES (?, 'lb_1', 'note', 'operator:x', 'rewritten')`,
+         VALUES (?, '${lb("1")}', 'note', 'operator:x', 'rewritten')`,
       )
       .run(before[0]?.id),
   ).toThrow(/append-only/);
   expect(db.prepare("SELECT * FROM legal_body_events").all()).toEqual(before);
   // Appending is untouched.
   db.prepare(
-    "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('lb_1', 'note', 'system')",
+    `INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES ('${lb("1")}', 'note', 'system')`,
   ).run();
   expect(db.prepare("SELECT COUNT(*) AS n FROM legal_body_events").get()).toEqual({ n: 2 });
 });
@@ -462,7 +477,7 @@ test("the deploy hash may be re-sent while reserved, and is locked once the body
   const submit = (h: string) =>
     db
       .prepare(
-        "UPDATE legal_bodies SET create_tx_hash = ? WHERE legal_body_id = 'lb_1' AND binding_state = 'reserved'",
+        `UPDATE legal_bodies SET create_tx_hash = ? WHERE legal_body_id = '${lb("1")}' AND binding_state = 'reserved'`,
       )
       .run(h);
   expect(submit(H("1")).changes).toBe(1);
@@ -472,7 +487,7 @@ test("the deploy hash may be re-sent while reserved, and is locked once the body
     expect(
       () =>
         db
-          .prepare("UPDATE legal_bodies SET create_tx_hash = ? WHERE legal_body_id = 'lb_1'")
+          .prepare(`UPDATE legal_bodies SET create_tx_hash = ? WHERE legal_body_id = '${lb("1")}'`)
           .run(v),
       String(v),
     ).toThrow(/write-once/);
@@ -493,7 +508,8 @@ test("a draft holds no link fields: it cannot squat on a body address or an agen
     ["link_signature", "0x01"],
   ] as const)
     expect(
-      () => db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = 'lb_1'`).run(v),
+      () =>
+        db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = '${lb("1")}'`).run(v),
       col,
     ).toThrow(/CHECK/);
   // Nor can a draft be born holding one.
@@ -502,29 +518,29 @@ test("a draft holds no link fields: it cannot squat on a body address or an agen
       .prepare(
         `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian,
            amendment_delay, body_address)
-         VALUES ('lb_2', 'p2', ?, 'co_1', 5042002, ?, ?, 172800, ?)`,
+         VALUES ('${lb("2")}', '${pub("2")}', ?, 'co_1', 5042002, ?, ?, 172800, ?)`,
       )
       .run(TENANT, FACTORY, TENANT, BODY),
   ).toThrow(/CHECK/);
   // So the address and the agentId are still free for a real reservation.
-  insertDraft("lb_3", "p3");
-  freeze("lb_3");
-  expect(() => reserve("lb_3", "42", BODY)).not.toThrow();
+  insertDraft(lb("3"), pub("3"));
+  freeze(lb("3"));
+  expect(() => reserve(lb("3"), "42", BODY)).not.toThrow();
 });
 
 /** A distinct, well-formed body address per index, so reservations never collide on it. */
 const bodyN = (i: number) => `0x${i.toString(16).padStart(40, "0")}`;
 
 test("an agentId has one spelling at the database: canonical decimal, at most 78 digits", () => {
-  insertDraft("lb_1", "p1");
-  freeze("lb_1");
-  reserve("lb_1", "42", BODY);
+  insertDraft(lb("1"), pub("1"));
+  freeze(lb("1"));
+  reserve(lb("1"), "42", BODY);
   let n = 0;
   const reserveAs = (agent: string) => {
     n += 1;
-    insertDraft(`lb_a${n}`, `pa${n}`);
-    freeze(`lb_a${n}`);
-    return () => reserve(`lb_a${n}`, agent, bodyN(n));
+    insertDraft(lb(`a${n}`), pub(`a${n}`));
+    freeze(lb(`a${n}`));
+    return () => reserve(lb(`a${n}`), agent, bodyN(n));
   };
   // '042' is agent 42 on chain but a different TEXT to the unique index: while '42' is live, it
   // would otherwise slip past as a second live body for the same identity.
@@ -541,7 +557,7 @@ test("numbers are stored as integers: a fractional value is refused, never kept 
     db
       .prepare(
         `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
-         VALUES ('lb_r', 'pr', ?, 'co_1', ?, ?, ?, ?)`,
+         VALUES ('${lb("r")}', '${pub("r")}', ?, 'co_1', ?, ?, ?, ?)`,
       )
       .run(TENANT, chainId, FACTORY, TENANT, delay);
   expect(() => insert(5042002, 172800.5)).toThrow(/CHECK/);
@@ -552,7 +568,7 @@ test("numbers are stored as integers: a fractional value is refused, never kept 
     db
       .prepare(
         `UPDATE legal_bodies SET agent_id = '42', identity_owner = ?, link_digest = ?, link_deadline = 1900000000.5,
-           link_signature = '0x01', body_address = ?, binding_state = 'reserved' WHERE legal_body_id = 'lb_1'`,
+           link_signature = '0x01', body_address = ?, binding_state = 'reserved' WHERE legal_body_id = '${lb("1")}'`,
       )
       .run(OWNER, H("b"), BODY),
   ).toThrow(/CHECK/);
@@ -560,7 +576,7 @@ test("numbers are stored as integers: a fractional value is refused, never kept 
   expect(() =>
     db
       .prepare(
-        "UPDATE legal_bodies SET create_tx_hash = ?, deployed_at = 1800000000.5, binding_state = 'deployed' WHERE legal_body_id = 'lb_1'",
+        `UPDATE legal_bodies SET create_tx_hash = ?, deployed_at = 1800000000.5, binding_state = 'deployed' WHERE legal_body_id = '${lb("1")}'`,
       )
       .run(H("c")),
   ).toThrow(/CHECK/);
@@ -568,21 +584,22 @@ test("numbers are stored as integers: a fractional value is refused, never kept 
   expect(() =>
     db
       .prepare(
-        "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1.5 WHERE legal_body_id = 'lb_1'",
+        `UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1.5 WHERE legal_body_id = '${lb("1")}'`,
       )
       .run(),
   ).toThrow(/CHECK/);
   for (const col of ["next_binding_check_at", "binding_check_interval_ms"])
     expect(
-      () => db.prepare(`UPDATE legal_bodies SET ${col} = 1.5 WHERE legal_body_id = 'lb_1'`).run(),
+      () =>
+        db.prepare(`UPDATE legal_bodies SET ${col} = 1.5 WHERE legal_body_id = '${lb("1")}'`).run(),
       col,
     ).toThrow(/CHECK/);
   // Whole numbers, and NULL where a column allows it, are untouched.
   db.prepare(
-    "UPDATE legal_bodies SET next_binding_check_at = 1800000000000, binding_check_interval_ms = 60000 WHERE legal_body_id = 'lb_1'",
+    `UPDATE legal_bodies SET next_binding_check_at = 1800000000000, binding_check_interval_ms = 60000 WHERE legal_body_id = '${lb("1")}'`,
   ).run();
   db.prepare(
-    "UPDATE legal_bodies SET next_binding_check_at = NULL, binding_check_interval_ms = NULL WHERE legal_body_id = 'lb_1'",
+    `UPDATE legal_bodies SET next_binding_check_at = NULL, binding_check_interval_ms = NULL WHERE legal_body_id = '${lb("1")}'`,
   ).run();
 });
 
@@ -592,7 +609,7 @@ test("a body is created only under a company of its own tenant", () => {
     db
       .prepare(
         `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
-         VALUES ('lb_c', 'pc', ?, 'co_2', 5042002, ?, ?, 172800)`,
+         VALUES ('${lb("c")}', '${pub("c")}', ?, 'co_2', 5042002, ?, ?, 172800)`,
       )
       .run(tenant, FACTORY, tenant);
   expect(() => insert(TENANT)).toThrow(/another tenant/);
@@ -653,7 +670,7 @@ test("an event id is always positive, so one bad row can never block every later
   db.exec(`CREATE TEMP TABLE seen_ids (id INTEGER);
     CREATE TEMP TRIGGER log_new_id BEFORE INSERT ON legal_body_events
     BEGIN INSERT INTO seen_ids VALUES (NEW.id); END;`);
-  const append = (id = "lb_1") =>
+  const append = (id = lb("1")) =>
     db
       .prepare(
         "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES (?, 'note', 'system')",
@@ -666,20 +683,20 @@ test("an event id is always positive, so one bad row can never block every later
       () =>
         db
           .prepare(
-            "INSERT INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (?, 'lb_1', 'note', 'operator:x')",
+            `INSERT INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (?, '${lb("1")}', 'note', 'operator:x')`,
           )
           .run(id),
       String(id),
     ).toThrow(/CHECK/);
   // Ordinary appends keep working, for this body and for a new body's first event.
   expect(append().changes).toBe(1);
-  insertDraft("lb_2", "p2");
-  expect(append("lb_2").changes).toBe(1);
+  insertDraft(lb("2"), pub("2"));
+  expect(append(lb("2")).changes).toBe(1);
   // REPLACE over an existing id is still refused.
   expect(() =>
     db
       .prepare(
-        "REPLACE INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (1, 'lb_1', 'note', 'operator:x')",
+        `REPLACE INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (1, '${lb("1")}', 'note', 'operator:x')`,
       )
       .run(),
   ).toThrow(/append-only/);
@@ -692,9 +709,9 @@ test("an event id is always positive, so one bad row can never block every later
 test("an agentId is TEXT with no hidden bytes: a BLOB or an embedded NUL cannot spell agent 42 again", () => {
   // length() stops at the first NUL, and GLOB and substr read a BLOB as text, while the unique
   // index compares full bytes and storage class: each of these was a second live row for 42.
-  insertDraft("lb_1", "p1");
-  freeze("lb_1");
-  reserve("lb_1", "42", BODY);
+  insertDraft(lb("1"), pub("1"));
+  freeze(lb("1"));
+  reserve(lb("1"), "42", BODY);
   let n = 0;
   for (const [label, agentSql] of [
     ["BLOB '42'", "X'3432'"],
@@ -703,8 +720,8 @@ test("an agentId is TEXT with no hidden bytes: a BLOB or an embedded NUL cannot 
     ["'0' + NUL + '42'", "'0' || char(0) || '42'"],
   ]) {
     n += 1;
-    insertDraft(`lb_x${n}`, `px${n}`);
-    freeze(`lb_x${n}`);
+    insertDraft(lb(`x${n}`), pub(`x${n}`));
+    freeze(lb(`x${n}`));
     expect(
       () =>
         db
@@ -713,7 +730,7 @@ test("an agentId is TEXT with no hidden bytes: a BLOB or an embedded NUL cannot 
                link_deadline = 1900000000, link_signature = '0x01', body_address = ?,
                binding_state = 'reserved' WHERE legal_body_id = ?`,
           )
-          .run(OWNER, H("b"), bodyN(n), `lb_x${n}`),
+          .run(OWNER, H("b"), bodyN(n), lb(`x${n}`)),
       label,
     ).toThrow(/CHECK/);
   }
@@ -723,7 +740,7 @@ test("an agentId is TEXT with no hidden bytes: a BLOB or an embedded NUL cannot 
         "SELECT legal_body_id, agent_id FROM legal_bodies WHERE binding_state IN ('reserved','deployed','linked')",
       )
       .all(),
-  ).toEqual([{ legal_body_id: "lb_1", agent_id: "42" }]);
+  ).toEqual([{ legal_body_id: lb("1"), agent_id: "42" }]);
 });
 
 test("the agreement version is an integer", () => {
@@ -733,7 +750,7 @@ test("the agreement version is an integer", () => {
       () =>
         db
           .prepare(
-            "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = ? WHERE legal_body_id = 'lb_1'",
+            `UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = ? WHERE legal_body_id = '${lb("1")}'`,
           )
           .run(H("a"), v),
       String(v),
@@ -754,7 +771,7 @@ test("a legal body id is never NULL", () => {
     db
       .prepare(
         `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
-         VALUES (NULL, 'pn', ?, 'co_1', 5042002, ?, ?, 172800)`,
+         VALUES (NULL, '${pub("n")}', ?, 'co_1', 5042002, ?, ?, 172800)`,
       )
       .run(TENANT, FACTORY, TENANT),
   ).toThrow(/NOT NULL/);
@@ -762,14 +779,14 @@ test("a legal body id is never NULL", () => {
 });
 
 test("one body address per chain, whatever its casing, and only a well-formed 0x address fits", () => {
-  insertDraft("lb_1", "p1");
-  freeze("lb_1");
-  reserve("lb_1", "42", BODY); // recorded in its checksummed form
+  insertDraft(lb("1"), pub("1"));
+  freeze(lb("1"));
+  reserve(lb("1"), "42", BODY); // recorded in its checksummed form
   let n = 0;
   const reserveAs = (bodySql: string) => {
     n += 1;
-    insertDraft(`lb_b${n}`, `pb${n}`);
-    freeze(`lb_b${n}`);
+    insertDraft(lb(`b${n}`), pub(`b${n}`));
+    freeze(lb(`b${n}`));
     return () =>
       db
         .prepare(
@@ -777,7 +794,7 @@ test("one body address per chain, whatever its casing, and only a well-formed 0x
              link_deadline = 1900000000, link_signature = '0x01', body_address = ${bodySql},
              binding_state = 'reserved' WHERE legal_body_id = ?`,
         )
-        .run(String(100 + n), OWNER, H("b"), `lb_b${n}`);
+        .run(String(100 + n), OWNER, H("b"), lb(`b${n}`));
   };
   // The same address in lower or upper case is the same address.
   for (const variant of [BODY.toLowerCase(), `0x${BODY.slice(2).toUpperCase()}`])
@@ -799,24 +816,24 @@ test("one body address per chain, whatever its casing, and only a well-formed 0x
     expect(reserveAs(bodySql), label).toThrow(/CHECK/);
   expect(
     db.prepare("SELECT legal_body_id FROM legal_bodies WHERE body_address IS NOT NULL").all(),
-  ).toEqual([{ legal_body_id: "lb_1" }]);
+  ).toEqual([{ legal_body_id: lb("1") }]);
 });
 
 test("each unique index names itself in its own way, which the repository's mapping relies on", () => {
-  for (const [id, pub] of [
-    ["lb_1", "p1"],
-    ["lb_2", "p2"],
-    ["lb_3", "p3"],
+  for (const [id, publicId] of [
+    [lb("1"), pub("1")],
+    [lb("2"), pub("2")],
+    [lb("3"), pub("3")],
   ]) {
-    insertDraft(id, pub);
+    insertDraft(id, publicId);
     freeze(id);
   }
-  reserve("lb_1", "42", BODY);
+  reserve(lb("1"), "42", BODY);
   // A column index is named by its columns; an expression index only by its name.
-  expect(() => reserve("lb_2", "42", OTHER_BODY)).toThrow(
+  expect(() => reserve(lb("2"), "42", OTHER_BODY)).toThrow(
     "UNIQUE constraint failed: legal_bodies.chain_id, legal_bodies.agent_id",
   );
-  expect(() => reserve("lb_3", "43", BODY)).toThrow(
+  expect(() => reserve(lb("3"), "43", BODY)).toThrow(
     "UNIQUE constraint failed: index 'idx_legal_bodies_body'",
   );
 });
@@ -833,15 +850,15 @@ test("the residual, exactly as documented: an OR REPLACE move evicts only a row 
     // A reservation onto the agentId a live holder has.
     {
       const d = freshDb();
-      frozenDraftIn(d, "holder", holderHasEvent);
+      frozenDraftIn(d, lb("holder"), holderHasEvent);
       d.prepare(
-        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = 'holder'`,
+        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = '${lb("holder")}'`,
       ).run();
-      frozenDraftIn(d, "mover");
+      frozenDraftIn(d, lb("mover"));
       const evict = () =>
         d
           .prepare(
-            `UPDATE OR REPLACE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = 'mover'`,
+            `UPDATE OR REPLACE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = '${lb("mover")}'`,
           )
           .run();
       if (holderHasEvent) expect(evict).toThrow(/FOREIGN KEY/);
@@ -849,35 +866,35 @@ test("the residual, exactly as documented: an OR REPLACE move evicts only a row 
       const ids = d.prepare("SELECT legal_body_id FROM legal_bodies ORDER BY 1").all();
       expect(ids, `reserve, holder event: ${holderHasEvent}`).toEqual(
         holderHasEvent
-          ? [{ legal_body_id: "holder" }, { legal_body_id: "mover" }]
-          : [{ legal_body_id: "mover" }],
+          ? [{ legal_body_id: lb("mover") }, { legal_body_id: lb("holder") }]
+          : [{ legal_body_id: lb("mover") }],
       );
       d.close();
     }
     // A re-link of a broken body while a new holder has its agentId live.
     {
       const d = freshDb();
-      frozenDraftIn(d, "mover");
+      frozenDraftIn(d, lb("mover"));
       d.prepare(
-        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = 'mover'`,
+        `UPDATE legal_bodies SET ${reserveSet("42", BODY)} WHERE legal_body_id = '${lb("mover")}'`,
       ).run();
       d.prepare(
-        `UPDATE legal_bodies SET ${DEPLOY_SET}, binding_state = 'deployed' WHERE legal_body_id = 'mover'`,
+        `UPDATE legal_bodies SET ${DEPLOY_SET}, binding_state = 'deployed' WHERE legal_body_id = '${lb("mover")}'`,
       ).run();
       d.prepare(
-        "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1 WHERE legal_body_id = 'mover'",
+        `UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1 WHERE legal_body_id = '${lb("mover")}'`,
       ).run();
       d.prepare(
-        "UPDATE legal_bodies SET binding_state = 'broken' WHERE legal_body_id = 'mover'",
+        `UPDATE legal_bodies SET binding_state = 'broken' WHERE legal_body_id = '${lb("mover")}'`,
       ).run();
-      frozenDraftIn(d, "holder", holderHasEvent);
+      frozenDraftIn(d, lb("holder"), holderHasEvent);
       d.prepare(
-        `UPDATE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = 'holder'`,
+        `UPDATE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = '${lb("holder")}'`,
       ).run();
       const evict = () =>
         d
           .prepare(
-            "UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 2 WHERE legal_body_id = 'mover'",
+            `UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 2 WHERE legal_body_id = '${lb("mover")}'`,
           )
           .run();
       if (holderHasEvent) expect(evict).toThrow(/FOREIGN KEY/);
@@ -885,8 +902,8 @@ test("the residual, exactly as documented: an OR REPLACE move evicts only a row 
       const ids = d.prepare("SELECT legal_body_id FROM legal_bodies ORDER BY 1").all();
       expect(ids, `re-link, holder event: ${holderHasEvent}`).toEqual(
         holderHasEvent
-          ? [{ legal_body_id: "holder" }, { legal_body_id: "mover" }]
-          : [{ legal_body_id: "mover" }],
+          ? [{ legal_body_id: lb("mover") }, { legal_body_id: lb("holder") }]
+          : [{ legal_body_id: lb("mover") }],
       );
       d.close();
     }
@@ -898,11 +915,11 @@ test("a draft can be closed: abandoned is reached only from draft, and nothing l
     const d = freshDb();
     d.prepare(
       `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
-       VALUES ('lb_1', 'pub-1', ?, 'co_1', 5042002, ?, ?, 172800)`,
+       VALUES ('${lb("1")}', '${pub("1")}', ?, 'co_1', 5042002, ?, ?, 172800)`,
     ).run(TENANT, FACTORY, TENANT);
     if (frozen)
       d.prepare(
-        "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = 'lb_1'",
+        `UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = '${lb("1")}'`,
       ).run(H("a"));
     expect(moveTo(d, "abandoned").changes, `frozen: ${frozen}`).toBe(1);
     for (const to of STATES.filter((s) => s !== "abandoned"))
@@ -919,7 +936,7 @@ test("an abandoned row holds no link fields, like a draft", () => {
   expect(() =>
     db
       .prepare(
-        `UPDATE legal_bodies SET binding_state = 'abandoned', ${LINK_SET} WHERE legal_body_id = 'lb_1'`,
+        `UPDATE legal_bodies SET binding_state = 'abandoned', ${LINK_SET} WHERE legal_body_id = '${lb("1")}'`,
       )
       .run(),
   ).toThrow(/CHECK/);
@@ -934,10 +951,11 @@ test("an abandoned row holds no link fields, like a draft", () => {
     ["link_signature", "0x01"],
   ] as const)
     expect(
-      () => db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = 'lb_1'`).run(v),
+      () =>
+        db.prepare(`UPDATE legal_bodies SET ${col} = ? WHERE legal_body_id = '${lb("1")}'`).run(v),
       col,
     ).toThrow(/CHECK/);
-  insertDraft("lb_2", "p2");
-  freeze("lb_2");
-  expect(() => reserve("lb_2", "42", BODY)).not.toThrow();
+  insertDraft(lb("2"), pub("2"));
+  freeze(lb("2"));
+  expect(() => reserve(lb("2"), "42", BODY)).not.toThrow();
 });
