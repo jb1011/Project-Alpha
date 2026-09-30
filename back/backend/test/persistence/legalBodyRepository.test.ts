@@ -644,3 +644,128 @@ test("a superseded body is not linked again while another body holds its agentId
   expect(repo.lapse(replacement.legalBodyId, "deadline passed")).toBe(true);
   expect(repo.markLinked(old, 1_800_000_300)).toBe(true);
 });
+
+// ── The check schedule ──
+
+const scheduleOf = (id: string) => {
+  const r = repo.findById(id);
+  return [r?.nextBindingCheckAt, r?.bindingCheckIntervalMs];
+};
+
+test("scheduleBindingCheck takes a time and an interval together, or null and null, and nothing else", () => {
+  const id = toDeployed();
+  expect(repo.scheduleBindingCheck(id, 1_000, 60_000)).toBe(true);
+  for (const [nextAt, intervalMs] of [
+    [1_000, null],
+    [null, 60_000],
+    [-1, 60_000],
+    [1_000, 0],
+    [1_000, -1],
+    [1.5, 1],
+    [1, 1.5],
+    // A NaN out of a caller's arithmetic must not quietly take the row off the schedule.
+    [Number.NaN, 60_000],
+    [60_000, Number.NaN],
+    [Number.POSITIVE_INFINITY, 1],
+    [1e20, 1],
+    ["1000", "5"],
+    [1_000n, 5n],
+    [undefined, undefined],
+    [undefined, 60_000],
+  ])
+    expect(
+      () => repo.scheduleBindingCheck(id, as(nextAt), as(intervalMs)),
+      `${String(nextAt)}, ${String(intervalMs)}`,
+    ).toThrow(LegalBodyInputError);
+  expect(scheduleOf(id)).toEqual([1_000, 60_000]);
+  // Time zero and the shortest interval are the boundaries, and null with null clears.
+  expect(repo.scheduleBindingCheck(id, 0, 1)).toBe(true);
+  expect(scheduleOf(id)).toEqual([0, 1]);
+  expect(repo.scheduleBindingCheck(id, null, null)).toBe(true);
+  expect(scheduleOf(id)).toEqual([null, null]);
+});
+
+test("scheduleBindingCheck says whether it scheduled a row: never a draft, an abandoned or a lapsed one", () => {
+  expect(repo.scheduleBindingCheck("lb_unknown", 1_000, 60_000)).toBe(false);
+  const draft = newBody().legalBodyId;
+  const abandoned = newBody().legalBodyId;
+  repo.abandon(abandoned, "never signed");
+  const lapsed = toReserved("41", "0x00000000000000000000000000000000000000C1");
+  repo.lapse(lapsed, "deadline passed");
+  for (const id of [draft, abandoned, lapsed]) {
+    expect(repo.scheduleBindingCheck(id, 1_000, 60_000), repo.findById(id)?.bindingState).toBe(
+      false,
+    );
+    expect(scheduleOf(id)).toEqual([null, null]);
+  }
+  expect(repo.listBindingDue(9_000, 10)).toEqual([]);
+  // Every state a body can still be checked in takes a schedule.
+  const id = toReserved("42", BODY_A);
+  const states: string[] = [];
+  const scheduled = () => {
+    states.push(repo.findById(id)?.bindingState ?? "?");
+    return repo.scheduleBindingCheck(id, 1_000 + states.length, 60_000);
+  };
+  expect(scheduled()).toBe(true);
+  repo.markDeployed(id, { txHash: H("c"), deployedAt: 1_800_000_000 });
+  expect(scheduled()).toBe(true);
+  repo.markLinked(id, 1_800_000_100);
+  expect(scheduled()).toBe(true);
+  repo.markBroken(id, { why: "pointer cleared" });
+  expect(scheduled()).toBe(true);
+  repo.supersede(id, "lb_other");
+  expect(scheduled()).toBe(true);
+  expect(states).toEqual(["reserved", "deployed", "linked", "broken", "superseded"]);
+  expect(repo.listBindingDue(9_000, 10).map((r) => r.legalBodyId)).toEqual([id]);
+  // Scheduling is not a state change: it leaves no event.
+  expect(repo.listEvents(id).map((e) => e.kind)).toEqual([
+    "created",
+    "agreement_frozen",
+    "link_accepted",
+    "deployed",
+    "linked",
+    "broken",
+    "superseded",
+  ]);
+});
+
+test("listBindingDue takes a time of zero or more and a limit of one or more, and nothing else", () => {
+  const a = toDeployed("42", BODY_A);
+  const b = toDeployed("43", BODY_B);
+  repo.scheduleBindingCheck(a, 1_000, 60_000);
+  repo.scheduleBindingCheck(b, 1_000, 60_000);
+  // A negative limit would otherwise mean "no limit" to SQLite.
+  for (const limit of [
+    0,
+    -1,
+    -5,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    null,
+    undefined,
+    "2",
+    2n,
+  ])
+    expect(() => repo.listBindingDue(9_000, as(limit)), `limit ${String(limit)}`).toThrow(
+      LegalBodyInputError,
+    );
+  for (const now of [
+    -1,
+    9_000.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    null,
+    undefined,
+    "9000",
+    9_000n,
+  ])
+    expect(() => repo.listBindingDue(as(now), 10), `now ${String(now)}`).toThrow(
+      LegalBodyInputError,
+    );
+  expect(repo.listBindingDue(0, 10)).toEqual([]);
+  // Due at exactly `now` counts; ties are broken by id; the limit cuts.
+  expect(repo.listBindingDue(1_000, 10).map((r) => r.legalBodyId)).toEqual([a, b].sort());
+  expect(repo.listBindingDue(999, 10)).toEqual([]);
+  expect(repo.listBindingDue(1_000, 1).map((r) => r.legalBodyId)).toEqual([[a, b].sort()[0]]);
+});

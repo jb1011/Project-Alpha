@@ -206,9 +206,26 @@ export interface LegalBodyRepository {
    * once the agentId is free.
    */
   supersede(legalBodyId: string, bySupersedingId: string): boolean;
-  /** Not a state change, so no event. Null, null takes the row off the schedule. */
-  scheduleBindingCheck(legalBodyId: string, nextAt: number | null, intervalMs: number | null): void;
-  /** Rows whose next binding check is due at `now`, soonest first. */
+  /**
+   * Set the next binding check: `nextAt` in unix MILLISECONDS (zero or more) with `intervalMs`
+   * (one or more), or null with null to take the row off the schedule. Anything else, a NaN out
+   * of a caller's arithmetic included, throws a `LegalBodyInputError`.
+   *
+   * Answers whether a row was updated. A `draft`, an `abandoned` and a `lapsed` row are never
+   * updated, and nor is an unknown id: there is nothing on chain to check for them. So a row is
+   * taken off the schedule BEFORE it lapses; once it has lapsed, its schedule no longer changes.
+   * Not a state change, so no event.
+   */
+  scheduleBindingCheck(
+    legalBodyId: string,
+    nextAt: number | null,
+    intervalMs: number | null,
+  ): boolean;
+  /**
+   * Rows whose next binding check is due at `now` (unix MILLISECONDS, zero or more), soonest
+   * first, at most `limit` (one or more) of them. Throws a `LegalBodyInputError` for anything
+   * else: to SQLite a negative limit means no limit at all.
+   */
   listBindingDue(now: number, limit: number): LegalBodyRecord[];
   /**
    * Append one event. Every string in `detail` (values and keys, at any depth) is PII-redacted
@@ -518,7 +535,7 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       ),
       scheduleBindingCheck: db.prepare(
         `UPDATE legal_bodies SET next_binding_check_at = ?, binding_check_interval_ms = ?
-          WHERE legal_body_id = ?`,
+          WHERE legal_body_id = ? AND binding_state NOT IN ('draft','abandoned','lapsed')`,
       ),
       listBindingDue: db.prepare(
         `SELECT * FROM legal_bodies
@@ -776,11 +793,30 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     legalBodyId: string,
     nextAt: number | null,
     intervalMs: number | null,
-  ): void {
-    this.stmts.scheduleBindingCheck.run(nextAt, intervalMs, legalBodyId);
+  ): boolean {
+    const cleared = nextAt === null && intervalMs === null;
+    if (
+      !cleared &&
+      !(
+        isIntegerWithin(nextAt, 0, Number.MAX_SAFE_INTEGER) &&
+        isIntegerWithin(intervalMs, 1, Number.MAX_SAFE_INTEGER)
+      )
+    )
+      throw new LegalBodyInputError(
+        `a binding check is a time in unix milliseconds (zero or more) with an interval in milliseconds (one or more), or null with null; got ${String(nextAt)}, ${String(intervalMs)}`,
+      );
+    return this.stmts.scheduleBindingCheck.run(nextAt, intervalMs, legalBodyId).changes === 1;
   }
 
   listBindingDue(now: number, limit: number): LegalBodyRecord[] {
+    if (!isIntegerWithin(now, 0, Number.MAX_SAFE_INTEGER))
+      throw new LegalBodyInputError(
+        `now must be a time in unix milliseconds, zero or more, got ${String(now)}`,
+      );
+    if (!isIntegerWithin(limit, 1, Number.MAX_SAFE_INTEGER))
+      throw new LegalBodyInputError(
+        `limit must be a whole number, one or more, got ${String(limit)}`,
+      );
     return (this.stmts.listBindingDue.all(now, limit) as Row[]).map(toRecord);
   }
 
