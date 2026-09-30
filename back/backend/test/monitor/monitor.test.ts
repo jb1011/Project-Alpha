@@ -504,7 +504,7 @@ describe("TTL sweep: rows whose role became standing after they were opened", ()
     size: 32,
   }).toLowerCase();
   // Checksummed, as the monitor's config carries it; the store keeps accounts lowercased.
-  const EXECUTOR = "0x069f4ADEabcBEd3ffFe2cB6Aaf9e7a66E8731456" as Address;
+  const EXECUTOR = "0x00000000000000000000000000000000000e1E1E" as Address;
   const CFG: MonitorConfig = { ...BASE_CFG, executor: EXECUTOR };
   const TTL = BASE_CFG.grantTtlMs;
 

@@ -150,7 +150,7 @@ describe("rule 3 — controller RoleRevoked", () => {
 describe("isPermanentGrant — the one definition rule 2 and the TTL sweep share", () => {
   // Mixed-case on purpose: the executor comes from config checksummed, while the monitor store
   // keeps every account lowercased. The two must still match.
-  const EXECUTOR = "0x069f4ADEabcBEd3ffFe2cB6Aaf9e7a66E8731456" as const;
+  const EXECUTOR = "0x00000000000000000000000000000000000e1E1E" as const;
   const ctx = ruleContext({ executor: EXECUTOR });
 
   test("DEFAULT_ADMIN_ROLE is permanent whoever holds it", () => {
