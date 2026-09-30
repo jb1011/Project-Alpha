@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { beforeEach, expect, test } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import {
   LIVE_BINDING_STATES,
@@ -964,4 +964,39 @@ test("a value only the table refuses throws its CHECK failure, and nothing is wr
     expect(() => repo.markLinked(id, seenAt), `seenAt ${seenAt}`).toThrow(/CHECK/);
   expect(repo.findById(id)).toEqual(deployed.row);
   expect(repo.listEvents(id)).toEqual(deployed.events);
+});
+
+test("every lookup the repository runs on a hot path is answered through an index", () => {
+  // The statements are read back from the repository itself, so this follows any edit to them.
+  const sources: string[] = [];
+  const prepare = db.prepare.bind(db);
+  const spy = vi.spyOn(db, "prepare").mockImplementation((sql: string) => {
+    sources.push(sql);
+    return prepare(sql);
+  });
+  new SqliteLegalBodyRepository(db);
+  spy.mockRestore();
+  const planOf = (fragment: string, params: unknown) => {
+    const sql = sources.find((s) => s.startsWith("SELECT") && s.includes(fragment));
+    expect(sql, fragment).toBeDefined();
+    return (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(params) as { detail: string }[])
+      .map((r) => r.detail)
+      .join(" | ");
+  };
+  expect(planOf("lower(body_address)", { chain_id: 5042002, address: BODY_A })).toContain(
+    "USING INDEX idx_legal_bodies_body",
+  );
+  expect(planOf("agent_id = ?", [5042002, "42"])).toContain(
+    "USING INDEX idx_legal_bodies_live_agent",
+  );
+  expect(planOf("next_binding_check_at <= ?", [1, 1])).toContain(
+    "USING INDEX idx_legal_bodies_binding_due",
+  );
+  expect(planOf("WHERE tenant_id = ?", [TENANT])).toContain("USING INDEX idx_legal_bodies_tenant");
+  expect(planOf("WHERE company_id = ?", ["co_1"])).toContain(
+    "USING INDEX idx_legal_bodies_company",
+  );
+  expect(planOf("FROM legal_body_events WHERE legal_body_id = ?", ["lb_x"])).toContain(
+    "USING INDEX idx_legal_body_events_body",
+  );
 });

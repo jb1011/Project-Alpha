@@ -508,10 +508,12 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       ),
       // Compares the lower-case form, exactly as the unique index on (chain_id,
       // lower(body_address)) does: the lookup and the index then agree on every row, whatever
-      // casing it was stored in, and SQLite answers the lookup through that index.
+      // casing it was stored in. The IS NOT NULL term changes no answer; it repeats the WHERE of
+      // that partial index, which SQLite must see in the query before it will use the index.
       findByBodyAddress: db.prepare(
         `SELECT * FROM legal_bodies
-          WHERE chain_id = @chain_id AND lower(body_address) = lower(@address)`,
+          WHERE chain_id = @chain_id AND lower(body_address) = lower(@address)
+            AND body_address IS NOT NULL`,
       ),
       listByTenant: db.prepare(
         "SELECT * FROM legal_bodies WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC",
