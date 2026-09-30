@@ -467,6 +467,23 @@ export const LEGAL_BODIES_DDL = `
  * every test, which starts from a fresh database, would still pass. The version is what carries an
  * edit to the databases that exist (see `applyLegalBodySchema`). A test pins the DDL text to the
  * version, so an edit without a bump fails the suite.
+ *
+ * TO CHANGE THIS SCHEMA LATER:
+ *  - Edit the DDL, raise this number by one, and add the hash of the new text to the pin in the
+ *    test, next to the hashes already there.
+ *  - Before the first row exists, nothing else is needed: empty tables are dropped and created
+ *    again from the DDL.
+ *  - Once a row exists, a changed trigger still needs nothing else: triggers hold no data and are
+ *    created again from the DDL. A changed TABLE or INDEX is made by a written migration, run by
+ *    `migrate` before `applyLegalBodySchema`, that REBUILDS the table from the DDL text (a new
+ *    table with that body, the rows copied, the old table dropped, the new one renamed) and
+ *    creates its indexes as the DDL writes them. The step checks the result: the definitions must
+ *    match the DDL's once normalised, and until they do it refuses to start.
+ *  - A rebuild of `companies` reaches this schema too. SQLite rewrites the references to a table
+ *    that is renamed, so renaming `companies` re-points the foreign key of `legal_bodies` and its
+ *    company trigger at the new name. That migration must leave both naming `companies` again.
+ *    While the foreign key names another table the step refuses to start, which is the intended
+ *    signal; the trigger it creates again from the DDL, like any other.
  */
 export const LEGAL_BODIES_SCHEMA_VERSION = 1;
 
@@ -500,107 +517,264 @@ function expectedLegalBodySchema(): SchemaObject[] {
   }
 }
 
+const PLAIN_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const IDENTIFIER_CHARACTER = /[A-Za-z0-9_]/;
+const WHITESPACE = /\s/;
+
 /**
- * Bring the legal-body tables of `db` to the schema this build defines, or refuse to.
+ * The stored text of a table or an index, without what may differ between two texts of the same
+ * definition:
+ *  - every run of whitespace becomes one space, and the ends are trimmed;
+ *  - identifier quoting is removed, whichever of the three styles it uses (`"name"`, `[name]` or
+ *    backticks). A name that is only a name inside its quotes keeps them, as `"name"`.
  *
- * It compares what the database holds with what `LEGAL_BODIES_DDL` defines, object by object
- * (same names, same SQL text), and reads the schema version the database stored last time. Then:
+ * SQLite itself rewrites a table's stored text when the table is renamed: it puts the name in
+ * double quotes. So a table rebuilt from the same definition does not read back byte for byte.
  *
- *  - Nothing there yet: create everything, and store the version.
- *  - Same definitions: nothing to do, except to store the version if it is missing or lower.
- *  - Different definitions, and the stored version is HIGHER than this build's: a newer build
- *    owns this schema. Nothing is changed (a schema is never downgraded) and one line goes to the
- *    operations log.
- *  - Different definitions at the SAME version: the DDL was edited without raising
- *    `LEGAL_BODIES_SCHEMA_VERSION`, or the schema was changed by hand. It throws, naming what
- *    differs, and the process does not start.
- *  - Different definitions, and the stored version is lower or missing: an upgrade.
- *      - Both tables are empty: they are dropped and created again from the DDL.
- *      - A row exists: the triggers are dropped and created again from the DDL, because a
- *        trigger holds no data. A table or an index that differs cannot be corrected that way,
- *        so it throws `legal-body schema needs a written migration: <names>`, and the process
- *        does not start until that migration is written.
- *    Then the version is stored.
- *
- * All of it runs in ONE immediate transaction. Two processes starting together therefore cannot
- * interleave, and a failure part-way, a refusal included, leaves the schema exactly as it was:
- * never a table without its triggers.
- *
- * `migrate` runs it last, once the `meta` and `companies` tables exist.
+ * A string and a comment are copied exactly as written. A string is data: `'a  b'` and `'a b'` are
+ * two values, and a bracket or a quote inside one (`GLOB '*[^0-9]*'`) is not identifier quoting. A
+ * comment may hold a quote of its own, which must not be read as the start of a string.
  */
-export function applyLegalBodySchema(db: Database.Database): void {
-  const expected = expectedLegalBodySchema();
+export function normalizeSchemaSql(sql: string): string {
+  let out = "";
+  let i = 0;
+  /** Copies `sql[i..end)` exactly, and moves past it. */
+  const copyTo = (end: number) => {
+    out += sql.slice(i, end);
+    i = end;
+  };
+  while (i < sql.length) {
+    const c = sql.charAt(i);
+    if (c === "'") {
+      // A string, to its closing quote; a doubled quote inside it is one quote of the text.
+      let j = i + 1;
+      while (j < sql.length && (sql.charAt(j) !== "'" || sql.charAt(j + 1) === "'"))
+        j += sql.charAt(j) === "'" ? 2 : 1;
+      copyTo(Math.min(j + 1, sql.length));
+    } else if (c === "-" && sql.charAt(i + 1) === "-") {
+      // A line comment, with the line end that closes it. That line end is the only whitespace
+      // that must stay, so the run after it is dropped.
+      const lineEnd = sql.indexOf("\n", i);
+      copyTo(lineEnd === -1 ? sql.length : lineEnd + 1);
+      while (i < sql.length && WHITESPACE.test(sql.charAt(i))) i += 1;
+    } else if (c === "/" && sql.charAt(i + 1) === "*") {
+      const close = sql.indexOf("*/", i + 2);
+      copyTo(close === -1 ? sql.length : close + 2);
+    } else if (c === '"' || c === "`" || c === "[") {
+      // A quoted identifier, to its closing quote; `"` and the backtick are doubled to stand for
+      // themselves inside the name.
+      const close = c === "[" ? "]" : c;
+      let name = "";
+      let j = i + 1;
+      while (j < sql.length) {
+        const d = sql.charAt(j);
+        if (d === close) {
+          if (close === "]" || sql.charAt(j + 1) !== close) break;
+          j += 1;
+        }
+        name += d;
+        j += 1;
+      }
+      const after = sql.charAt(j + 1);
+      if (PLAIN_IDENTIFIER.test(name)) {
+        // The bare name, kept apart from a word it touched only through its quotes.
+        const before = out.slice(-1);
+        out += `${IDENTIFIER_CHARACTER.test(before) ? " " : ""}${name}${IDENTIFIER_CHARACTER.test(after) ? " " : ""}`;
+      } else out += `"${name.replaceAll('"', '""')}"`;
+      i = Math.min(j + 1, sql.length);
+    } else if (WHITESPACE.test(c)) {
+      while (i < sql.length && WHITESPACE.test(sql.charAt(i))) i += 1;
+      out += " ";
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out.trim();
+}
+
+/**
+ * What one run of `applyLegalBodySchema` has to do, decided from what the database holds. Deciding
+ * only reads; `none`, `report_newer` and `refuse` write nothing.
+ */
+type LegalBodySchemaPlan =
+  | { action: "none" }
+  | { action: "report_newer"; storedVersion: number; differing: string }
+  | { action: "refuse"; message: string }
+  | { action: "create" }
+  | { action: "store_version" }
+  | { action: "recreate" }
+  | {
+      action: "restore_triggers";
+      /** Every trigger that differs, by name. */
+      triggers: string;
+      /** Those the database holds, to drop. */
+      drop: string[];
+      /** The DDL's statement for those it defines, to run. */
+      create: string[];
+      atSameVersion: boolean;
+    };
+
+function planLegalBodySchema(db: Database.Database, expected: SchemaObject[]): LegalBodySchemaPlan {
+  const actual = legalBodySchemaObjects(db);
+  if (actual.length === 0) return { action: "create" };
+
+  const stored = db
+    .prepare("SELECT value FROM meta WHERE key = ?")
+    .get(LEGAL_BODIES_SCHEMA_VERSION_KEY) as { value: string } | undefined;
+  if (stored !== undefined && !/^(0|[1-9][0-9]*)$/.test(stored.value))
+    return {
+      action: "refuse",
+      message: `meta.${LEGAL_BODIES_SCHEMA_VERSION_KEY} is not a whole number: ${JSON.stringify(stored.value)}. Refusing to guess which legal-body schema this database holds.`,
+    };
+  const storedVersion = stored === undefined ? null : Number(stored.value);
+
+  // A trigger is compared by its exact text; a table or an index after normalising.
   const keyOf = (o: SchemaObject) => `${o.type} ${o.name}`;
-  const storeVersion = () =>
-    db
-      .prepare(
-        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      )
-      .run(LEGAL_BODIES_SCHEMA_VERSION_KEY, String(LEGAL_BODIES_SCHEMA_VERSION));
+  const textOf = (o: SchemaObject) => (o.type === "trigger" ? o.sql : normalizeSchemaSql(o.sql));
+  const expectedText = new Map(expected.map((o) => [keyOf(o), textOf(o)]));
+  const actualText = new Map(actual.map((o) => [keyOf(o), textOf(o)]));
+  // Missing, not defined by the DDL, or defined differently.
+  const differing = [...expected, ...actual.filter((o) => !expectedText.has(keyOf(o)))]
+    .filter((o) => expectedText.get(keyOf(o)) !== actualText.get(keyOf(o)))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const names = (objects: SchemaObject[]) => objects.map((o) => o.name).join(", ");
 
-  db.transaction(() => {
-    const actual = legalBodySchemaObjects(db);
-    if (actual.length === 0) {
-      db.exec(LEGAL_BODIES_DDL);
-      storeVersion();
-      return;
-    }
+  if (differing.length === 0)
+    return storedVersion === null || storedVersion < LEGAL_BODIES_SCHEMA_VERSION
+      ? { action: "store_version" }
+      : { action: "none" };
+  if (storedVersion !== null && storedVersion > LEGAL_BODIES_SCHEMA_VERSION)
+    return { action: "report_newer", storedVersion, differing: names(differing) };
 
-    const stored = db
-      .prepare("SELECT value FROM meta WHERE key = ?")
-      .get(LEGAL_BODIES_SCHEMA_VERSION_KEY) as { value: string } | undefined;
-    if (stored !== undefined && !/^(0|[1-9][0-9]*)$/.test(stored.value))
-      throw new Error(
-        `meta.${LEGAL_BODIES_SCHEMA_VERSION_KEY} is not a whole number: ${JSON.stringify(stored.value)}. Refusing to guess which legal-body schema this database holds.`,
-      );
-    const storedVersion = stored === undefined ? null : Number(stored.value);
-
-    const expectedSql = new Map(expected.map((o) => [keyOf(o), o.sql]));
-    const actualSql = new Map(actual.map((o) => [keyOf(o), o.sql]));
-    const differing = [...expected, ...actual.filter((o) => !expectedSql.has(keyOf(o)))]
-      .filter((o) => expectedSql.get(keyOf(o)) !== actualSql.get(keyOf(o)))
-      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    const names = (objects: SchemaObject[]) => objects.map((o) => o.name).join(", ");
-
-    if (differing.length === 0) {
-      if (storedVersion === null || storedVersion < LEGAL_BODIES_SCHEMA_VERSION) storeVersion();
-      return;
-    }
-    if (storedVersion !== null && storedVersion > LEGAL_BODIES_SCHEMA_VERSION) {
-      opsLog("legal_body_schema_newer_than_code", {
-        storedVersion,
-        codeVersion: LEGAL_BODIES_SCHEMA_VERSION,
-        differing: names(differing),
-      });
-      return;
-    }
-    if (storedVersion === LEGAL_BODIES_SCHEMA_VERSION)
-      throw new Error(
-        `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}: ${names(differing)}. Either LEGAL_BODIES_DDL was edited without raising LEGAL_BODIES_SCHEMA_VERSION, or the schema was changed by hand.`,
-      );
-
+  const tablesAndIndexes = differing.filter((o) => o.type !== "trigger");
+  const atSameVersion = storedVersion === LEGAL_BODIES_SCHEMA_VERSION;
+  if (atSameVersion && tablesAndIndexes.length > 0)
+    return {
+      action: "refuse",
+      message: `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}: ${names(differing)}. Either LEGAL_BODIES_DDL was edited without raising LEGAL_BODIES_SCHEMA_VERSION, or the schema was changed by hand.`,
+    };
+  if (!atSameVersion) {
     // An upgrade: the stored version is lower, or was never stored.
     const holdsRows = ["legal_bodies", "legal_body_events"].some(
       (table) =>
         actual.some((o) => o.type === "table" && o.name === table) &&
         db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get() !== undefined,
     );
-    if (!holdsRows) {
-      // The events table first: it references the other.
-      db.exec("DROP TABLE IF EXISTS legal_body_events; DROP TABLE IF EXISTS legal_bodies;");
-      db.exec(LEGAL_BODIES_DDL);
-    } else {
-      const needMigration = differing.filter((o) => o.type !== "trigger");
-      if (needMigration.length > 0)
-        throw new Error(`legal-body schema needs a written migration: ${names(needMigration)}`);
-      // Every trigger on the two tables, not only the differing ones, so the set that results is
-      // exactly the DDL's: one the DDL no longer defines goes, one it added arrives.
-      for (const o of actual.filter((a) => a.type === "trigger"))
-        db.exec(`DROP TRIGGER "${o.name.replaceAll('"', '""')}"`);
-      for (const o of expected.filter((e) => e.type === "trigger")) db.exec(o.sql);
+    if (!holdsRows) return { action: "recreate" };
+    if (tablesAndIndexes.length > 0)
+      return {
+        action: "refuse",
+        message: `legal-body schema needs a written migration: ${names(tablesAndIndexes)}`,
+      };
+  }
+  // Only triggers differ, and every table they stand on is as the DDL defines it.
+  return {
+    action: "restore_triggers",
+    triggers: names(differing),
+    drop: differing.filter((o) => actualText.has(keyOf(o))).map((o) => o.name),
+    create: expected.filter((o) => differing.some((d) => d.name === o.name)).map((o) => o.sql),
+    atSameVersion,
+  };
+}
+
+/**
+ * Bring the legal-body tables of `db` to the schema this build defines, or refuse to.
+ *
+ * It compares what the database holds with what `LEGAL_BODIES_DDL` defines, object by object, and
+ * reads the schema version the database stored last time. A trigger is compared by its exact
+ * text. A table or an index is compared after normalising both texts (see `normalizeSchemaSql`),
+ * so that a table a migration rebuilt from the same definition reads as the same table. Then:
+ *
+ *  - Nothing there yet: create everything, and store the version.
+ *  - Same definitions: nothing to do, except to store the version if it is missing or lower.
+ *  - Different definitions, and the stored version is HIGHER than this build's: a newer build
+ *    owns this schema. Nothing is changed (a schema is never downgraded) and one line goes to the
+ *    operations log.
+ *  - Different definitions, the stored version is lower or missing (an upgrade), and both tables
+ *    are empty: they are dropped and created again from the DDL, and the version is stored.
+ *  - Different definitions otherwise: at the SAME version, or in an upgrade with a row present.
+ *      - A TABLE or an INDEX differs. It is never corrected in place, and the process does not
+ *        start.
+ *          - At the SAME version: the DDL was edited without raising
+ *            `LEGAL_BODIES_SCHEMA_VERSION`, or the schema was changed by hand. It throws, naming
+ *            everything that differs.
+ *          - In an upgrade: it throws `legal-body schema needs a written migration: <names>`,
+ *            until that migration is written (`LEGAL_BODIES_SCHEMA_VERSION` says what it must
+ *            do).
+ *      - Only TRIGGERS differ. They are brought back to the DDL's: one that is missing or whose
+ *        text differs is dropped and created again from the DDL, and one the DDL does not define
+ *        is dropped. A trigger holds no data, so this loses nothing, and a difference in triggers
+ *        alone never stops the process from starting. In an upgrade the version is then stored.
+ *        At the SAME version it means someone changed a trigger by hand, or rebuilt a table
+ *        without its triggers, and one line in the operations log names the triggers restored.
+ *
+ * Locking. The first comparison only reads: a start that finds the schema in sync takes no write
+ * lock, and does not wait for a process that holds it. Only when something must be written does
+ * the step open an immediate transaction, and it compares AGAIN inside it, because another process
+ * may have done the work in between. Every write happens in that ONE transaction. Two processes
+ * starting together therefore cannot interleave, and a failure part-way leaves the schema exactly
+ * as it was: never a table without its triggers. A refusal writes nothing.
+ *
+ * `migrate` runs it last, once the `meta` and `companies` tables exist.
+ */
+export function applyLegalBodySchema(db: Database.Database): void {
+  const expected = expectedLegalBodySchema();
+  const storeVersion = () =>
+    db
+      .prepare(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      )
+      .run(LEGAL_BODIES_SCHEMA_VERSION_KEY, String(LEGAL_BODIES_SCHEMA_VERSION));
+  const carryOut = (plan: LegalBodySchemaPlan) => {
+    switch (plan.action) {
+      case "create":
+        db.exec(LEGAL_BODIES_DDL);
+        storeVersion();
+        break;
+      case "store_version":
+        storeVersion();
+        break;
+      case "recreate":
+        // The events table first: it references the other.
+        db.exec("DROP TABLE IF EXISTS legal_body_events; DROP TABLE IF EXISTS legal_bodies;");
+        db.exec(LEGAL_BODIES_DDL);
+        storeVersion();
+        break;
+      case "restore_triggers":
+        for (const name of plan.drop) db.exec(`DROP TRIGGER "${name.replaceAll('"', '""')}"`);
+        for (const sql of plan.create) db.exec(sql);
+        if (!plan.atSameVersion) storeVersion();
+        break;
     }
-    storeVersion();
-  }).immediate();
+  };
+  const writes = (plan: LegalBodySchemaPlan) =>
+    plan.action !== "none" && plan.action !== "report_newer" && plan.action !== "refuse";
+
+  // The first look is one read transaction: the objects and the version come from one snapshot.
+  let plan = db.transaction(() => planLegalBodySchema(db, expected)).deferred();
+  if (writes(plan))
+    plan = db
+      .transaction(() => {
+        const decided = planLegalBodySchema(db, expected);
+        carryOut(decided);
+        return decided;
+      })
+      .immediate();
+
+  if (plan.action === "refuse") throw new Error(plan.message);
+  if (plan.action === "report_newer")
+    opsLog("legal_body_schema_newer_than_code", {
+      storedVersion: plan.storedVersion,
+      codeVersion: LEGAL_BODIES_SCHEMA_VERSION,
+      differing: plan.differing,
+    });
+  if (plan.action === "restore_triggers" && plan.atSameVersion)
+    opsLog("legal_body_schema_triggers_restored", {
+      level: "warn",
+      version: LEGAL_BODIES_SCHEMA_VERSION,
+      triggers: plan.triggers,
+    });
 }
 
 /**

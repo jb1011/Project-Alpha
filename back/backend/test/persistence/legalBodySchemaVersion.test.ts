@@ -9,6 +9,7 @@ import {
   LEGAL_BODIES_SCHEMA_VERSION,
   applyLegalBodySchema,
   migrate,
+  normalizeSchemaSql,
   openDatabase,
 } from "../../src/persistence/db";
 
@@ -113,6 +114,53 @@ const illegalMove = (db: Database.Database) =>
     .prepare("UPDATE legal_bodies SET binding_state = 'lapsed' WHERE legal_body_id = ?")
     .run(BODY_ID);
 
+/** Runs `fn` and returns the lines it wrote to the operations log about this schema. */
+function opsLinesOf(fn: () => void): Record<string, unknown>[] {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  try {
+    fn();
+    return log.mock.calls
+      .map((c) => String(c[0]))
+      .filter((l) => l.includes("legal_body"))
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  } finally {
+    log.mockRestore();
+  }
+}
+const sqlOf = (objects: SchemaObject[], name: string) =>
+  objects.find((o) => o.name === name)?.sql ?? "";
+const triggersOf = (objects: SchemaObject[]) => objects.filter((o) => o.type === "trigger");
+const TRIGGERS_ON_LEGAL_BODIES = definedByTheCode()
+  .filter((o) => o.type === "trigger" && o.name.startsWith("trg_legal_bodies_"))
+  .map((o) => o.name);
+
+/**
+ * Rebuild `legal_bodies` the way a written migration does: a new table with the body the DDL
+ * defines, the rows copied, the old table dropped, the new one renamed. Dropping the old table
+ * takes its indexes and triggers with it; the migration recreates the indexes, either on the new
+ * table before the rename or under the final name after it.
+ */
+function rebuildLegalBodies(db: Database.Database, indexes: "before" | "after") {
+  const defined = definedByTheCode();
+  const create = (o: SchemaObject, table: string) =>
+    db.exec(o.sql.replace(/\blegal_bodies\b/, table));
+  const indexesOfTheTable = defined.filter(
+    (o) => o.type === "index" && o.name.startsWith("idx_legal_bodies_"),
+  );
+  // The event log references the table that is dropped, so foreign keys are off for the rebuild.
+  db.pragma("foreign_keys = OFF");
+  db.transaction(() => {
+    for (const o of defined.filter((d) => d.type === "table" && d.name === "legal_bodies"))
+      create(o, "legal_bodies_new");
+    db.exec("INSERT INTO legal_bodies_new SELECT * FROM legal_bodies");
+    db.exec("DROP TABLE legal_bodies");
+    if (indexes === "before") for (const o of indexesOfTheTable) create(o, "legal_bodies_new");
+    db.exec("ALTER TABLE legal_bodies_new RENAME TO legal_bodies");
+    if (indexes === "after") for (const o of indexesOfTheTable) db.exec(o.sql);
+  })();
+  db.pragma("foreign_keys = ON");
+}
+
 test("a fresh database gets every object of the DDL and the schema version", () => {
   const db = migrated();
   const objects = objectsOf(db);
@@ -190,7 +238,8 @@ test("an older trigger with rows present: the triggers are reconciled and every 
     db.exec("DROP TRIGGER trg_legal_body_events_no_update;");
     storeVersion(db, stored);
     const rows = rowsOf(db);
-    migrate(db);
+    // An upgrade is expected to change triggers: it does not report them as changed by hand.
+    expect(opsLinesOf(() => migrate(db))).toEqual([]);
     expect(objectsOf(db)).toEqual(definedByTheCode());
     expect(rowsOf(db)).toEqual(rows);
     expect(storedVersion(db)).toBe(String(LEGAL_BODIES_SCHEMA_VERSION));
@@ -264,6 +313,196 @@ test("a schema that differs at the SAME version is refused, naming what differs"
   }
 });
 
+// ── What a correct migration, or a hand on the database, leaves behind at the SAME version ──
+
+test("a table rebuilt from the same definition, with a row present, is accepted: at the same version, and as the upgrade a migration prepared", () => {
+  const same = String(LEGAL_BODIES_SCHEMA_VERSION);
+  for (const indexes of ["before", "after"] as const)
+    for (const stored of [same, "0", null]) {
+      const label = `indexes ${indexes} the rename, stored version ${stored}`;
+      const db = migrated();
+      addBody(db);
+      const rows = rowsOf(db);
+      rebuildLegalBodies(db, indexes);
+      storeVersion(db, stored);
+      // SQLite wrote the renamed table's name in quotes: the stored text is no longer the DDL's.
+      const rebuilt = objectsOf(db);
+      const defined = definedByTheCode();
+      expect(sqlOf(rebuilt, "legal_bodies"), label).toMatch(/^CREATE TABLE "legal_bodies"/);
+      expect(sqlOf(rebuilt, "legal_bodies"), label).not.toBe(sqlOf(defined, "legal_bodies"));
+      if (indexes === "before")
+        expect(sqlOf(rebuilt, "idx_legal_bodies_company")).toContain('ON "legal_bodies"(');
+      expect(triggersOf(rebuilt).map((o) => o.name)).not.toContain("trg_legal_bodies_transitions");
+
+      const lines = opsLinesOf(() => migrate(db));
+      // The table and its indexes are left as the rebuild wrote them, and the rows with them.
+      const after = objectsOf(db);
+      expect(
+        after.filter((o) => o.type !== "trigger"),
+        label,
+      ).toEqual(rebuilt.filter((o) => o.type !== "trigger"));
+      expect(rowsOf(db), label).toEqual(rows);
+      expect(storedVersion(db), label).toBe(same);
+      // The triggers the rebuild dropped with the old table are back, and enforced.
+      expect(triggersOf(after), label).toEqual(triggersOf(defined));
+      expect(() => illegalMove(db), label).toThrow(/illegal binding_state transition/);
+      // Restoring triggers is only worth a line when nothing announced it: at the same version.
+      if (stored === same) {
+        expect(lines, label).toHaveLength(1);
+        expect(lines[0], label).toMatchObject({
+          opslog: "legal_body_schema_triggers_restored",
+          version: LEGAL_BODIES_SCHEMA_VERSION,
+          triggers: [...TRIGGERS_ON_LEGAL_BODIES].sort().join(", "),
+        });
+      } else expect(lines, label).toEqual([]);
+      // The next start finds nothing to do, and says nothing.
+      expect(
+        opsLinesOf(() => migrate(db)),
+        label,
+      ).toEqual([]);
+      expect(objectsOf(db), label).toEqual(after);
+    }
+});
+
+test("a trigger dropped by hand at the same version is created again: the row is kept, and the operations log names it", () => {
+  for (const withRows of [true, false]) {
+    const db = migrated();
+    if (withRows) addBody(db);
+    db.exec(
+      "DROP TRIGGER trg_legal_bodies_transitions; DROP TRIGGER trg_legal_body_events_no_update;",
+    );
+    const rows = rowsOf(db);
+    const lines = opsLinesOf(() => migrate(db));
+    expect(objectsOf(db)).toEqual(definedByTheCode());
+    expect(rowsOf(db)).toEqual(rows);
+    expect(storedVersion(db)).toBe(String(LEGAL_BODIES_SCHEMA_VERSION));
+    if (withRows) expect(() => illegalMove(db)).toThrow(/illegal binding_state transition/);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      opslog: "legal_body_schema_triggers_restored",
+      version: LEGAL_BODIES_SCHEMA_VERSION,
+      triggers: "trg_legal_bodies_transitions, trg_legal_body_events_no_update",
+    });
+    expect(opsLinesOf(() => migrate(db))).toEqual([]);
+  }
+});
+
+test("a trigger altered by hand at the same version is restored from the DDL, and one the DDL does not define is removed", () => {
+  const db = migrated();
+  addBody(db);
+  db.exec(OLDER_TRIGGER); // same name, another body: it lets every move through
+  db.exec(
+    "CREATE TRIGGER trg_legal_bodies_by_hand BEFORE UPDATE ON legal_bodies BEGIN SELECT 1; END;",
+  );
+  // A trigger that only differs in its layout was still not written by the DDL.
+  const noDelete = sqlOf(definedByTheCode(), "trg_legal_bodies_no_delete");
+  db.exec(`DROP TRIGGER trg_legal_bodies_no_delete; ${noDelete.replace(/\s+/g, " ")}`);
+  const untouched = sqlOf(objectsOf(db), "trg_legal_bodies_write_once");
+  const rows = rowsOf(db);
+  const lines = opsLinesOf(() => migrate(db));
+  expect(objectsOf(db)).toEqual(definedByTheCode());
+  expect(sqlOf(objectsOf(db), "trg_legal_bodies_write_once")).toBe(untouched);
+  expect(rowsOf(db)).toEqual(rows);
+  expect(() => illegalMove(db)).toThrow(/illegal binding_state transition/);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toMatchObject({
+    opslog: "legal_body_schema_triggers_restored",
+    triggers: "trg_legal_bodies_by_hand, trg_legal_bodies_no_delete, trg_legal_bodies_transitions",
+  });
+});
+
+test("an index or a table altered at the same version: migrate refuses, names it, and changes nothing", () => {
+  for (const withRows of [true, false])
+    for (const [altered, names] of [
+      [OLDER_INDEX, "idx_legal_bodies_tenant"],
+      ["DROP INDEX idx_legal_bodies_company;", "idx_legal_bodies_company"],
+      ["CREATE INDEX idx_legal_bodies_extra ON legal_bodies(factory);", "idx_legal_bodies_extra"],
+      ["ALTER TABLE legal_body_events ADD COLUMN note TEXT;", "legal_body_events"],
+      // A trigger that differs as well is named, and is not restored while the start is refused.
+      [
+        `${OLDER_INDEX} DROP TRIGGER trg_legal_bodies_no_delete;`,
+        "idx_legal_bodies_tenant, trg_legal_bodies_no_delete",
+      ],
+    ] as const) {
+      const db = migrated();
+      if (withRows) addBody(db);
+      db.exec(altered);
+      const before = { objects: objectsOf(db), rows: rowsOf(db) };
+      let thrown: unknown;
+      const lines = opsLinesOf(() => {
+        try {
+          migrate(db);
+        } catch (e) {
+          thrown = e;
+        }
+      });
+      expect(String(thrown), altered).toContain(
+        `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}: ${names}.`,
+      );
+      expect({ objects: objectsOf(db), rows: rowsOf(db) }, altered).toEqual(before);
+      expect(lines, altered).toEqual([]);
+      expect(db.inTransaction).toBe(false);
+    }
+});
+
+test("a table or an index is compared without its layout and its identifier quoting, and nothing else is overlooked", () => {
+  // Through the step itself: an index written with other spacing and the three quoting styles is
+  // the same index...
+  const db = migrated();
+  addBody(db);
+  db.exec(`DROP INDEX idx_legal_bodies_company;
+    CREATE   INDEX "idx_legal_bodies_company"
+      ON [legal_bodies](\`company_id\`)  ;`);
+  expect(sqlOf(objectsOf(db), "idx_legal_bodies_company")).not.toBe(
+    sqlOf(definedByTheCode(), "idx_legal_bodies_company"),
+  );
+  expect(opsLinesOf(() => migrate(db))).toEqual([]);
+  // ...and one whose text differs inside a string is not.
+  db.exec(`DROP INDEX idx_legal_bodies_live_agent;
+    CREATE UNIQUE INDEX idx_legal_bodies_live_agent
+      ON legal_bodies(chain_id, agent_id) WHERE binding_state IN ('reserved','deployed','"linked"');`);
+  expect(() => migrate(db)).toThrow(/differs from its definition.*idx_legal_bodies_live_agent/s);
+
+  // The comparison itself. Runs of whitespace become one space; the ends are trimmed.
+  expect(normalizeSchemaSql("  CREATE TABLE t (\n    a TEXT,\r\n\tb  INTEGER\n  )\n")).toBe(
+    "CREATE TABLE t ( a TEXT, b INTEGER )",
+  );
+  // The three ways to quote an identifier read as the bare name.
+  for (const quoted of ['"legal_bodies"', "[legal_bodies]", "`legal_bodies`"])
+    expect(normalizeSchemaSql(`CREATE INDEX i ON ${quoted}(a)`), quoted).toBe(
+      "CREATE INDEX i ON legal_bodies(a)",
+    );
+  expect(normalizeSchemaSql('CREATE TABLE"t"(a)')).toBe("CREATE TABLE t(a)");
+  // A name that is only a name inside its quotes keeps them, in one spelling.
+  for (const quoted of ['"my table"', "[my table]", "`my table`"])
+    expect(normalizeSchemaSql(`CREATE INDEX i ON ${quoted}(a)`), quoted).toBe(
+      'CREATE INDEX i ON "my table"(a)',
+    );
+  // A string is data: its spacing, and any quote or bracket inside it, is kept as written.
+  for (const text of [
+    "CHECK (a NOT GLOB '*[^0-9a-f]*')",
+    "CHECK (a != 'two  spaces')",
+    "CHECK (a != 'it''s \"quoted\" and `ticked`')",
+    "CHECK (a != '')",
+  ])
+    expect(normalizeSchemaSql(text), text).toBe(text);
+  expect(normalizeSchemaSql("CHECK (a != 'x  y')")).not.toBe(
+    normalizeSchemaSql("CHECK (a != 'x y')"),
+  );
+  // So is a comment, which may hold a quote of its own.
+  expect(normalizeSchemaSql("a TEXT, -- the owner's  name\n   b TEXT /* [sic]  */  )")).toBe(
+    "a TEXT, -- the owner's  name\nb TEXT /* [sic]  */ )",
+  );
+  // Anything else that differs still differs.
+  for (const [one, other] of [
+    ["CHECK (a > 0)", "CHECK (a >= 0)"],
+    ["a TEXT NOT NULL", "a TEXT"],
+    ["CHECK (a IN ('draft'))", "CHECK (a IN ('Draft'))"],
+    ["REFERENCES companies(company_id)", 'REFERENCES "companies_old"(company_id)'],
+  ] as const)
+    expect(normalizeSchemaSql(one), one).not.toBe(normalizeSchemaSql(other));
+});
+
 test("a stored version that is not a whole number is refused rather than guessed at", () => {
   for (const junk of ["", "one", "1.5", "-1", " 1"]) {
     const db = migrated();
@@ -300,26 +539,121 @@ test("applyLegalBodySchema is what migrate runs: it can be run again on its own"
   expect({ objects: objectsOf(db), rows: rowsOf(db), version: storedVersion(db) }).toEqual(before);
 });
 
-test("the schema step takes the write lock before it looks: two processes cannot interleave in it", () => {
-  // Two connections to one file stand for two processes starting together. While one of them is
-  // writing, the other must not even compare the schema: what it read could be stale by the time
-  // it acted on it. It waits for the lock instead (here, with no wait allowed, it is refused).
+// ── Locking: two connections to one file stand for two processes ──
+
+/** A temp database file, migrated, and removed with its directory when `fn` is done. */
+function withDatabaseFile(
+  journal: "wal" | "rollback",
+  fn: (first: Database.Database, open: (timeout: number) => Database.Database) => void,
+) {
   const dir = mkdtempSync(join(tmpdir(), "legal-body-schema-"));
   const path = join(dir, "bodies.db");
   const connections: Database.Database[] = [];
+  const track = (db: Database.Database) => {
+    connections.push(db);
+    return db;
+  };
   try {
-    const first = openDatabase(path);
-    connections.push(first);
+    const first = track(journal === "wal" ? openDatabase(path) : new Database(path));
+    first.pragma("foreign_keys = ON");
     migrate(first);
-    const second = new Database(path, { timeout: 0 });
-    connections.push(second);
-    first.exec("BEGIN IMMEDIATE");
-    expect(() => applyLegalBodySchema(second)).toThrow(/database is locked/);
-    first.exec("COMMIT");
-    expect(() => applyLegalBodySchema(second)).not.toThrow();
-    expect(objectsOf(second)).toEqual(definedByTheCode());
+    fn(first, (timeout) => track(new Database(path, { timeout })));
   } finally {
     for (const c of connections) c.close();
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+test("a start that finds the schema in sync takes no write lock: it does not wait for a writer", () => {
+  for (const journal of ["wal", "rollback"] as const)
+    withDatabaseFile(journal, (first, open) => {
+      addBody(first);
+      const second = open(50);
+      // Another process is in the middle of a write, and stays there.
+      first.exec("BEGIN IMMEDIATE");
+      first.prepare("UPDATE legal_bodies SET updated_at = '2030-01-01 00:00:00'").run();
+      expect(() => second.exec("BEGIN IMMEDIATE"), journal).toThrow(/database is locked/);
+      expect(() => migrate(second), journal).not.toThrow();
+      expect(() => applyLegalBodySchema(second), journal).not.toThrow();
+      expect(second.inTransaction).toBe(false);
+      first.exec("COMMIT");
+      expect(objectsOf(second)).toEqual(definedByTheCode());
+    });
+});
+
+test("a start that must change the schema takes the write lock first, and waits its turn for it", () => {
+  for (const [label, change] of [
+    ["a trigger to restore", "DROP TRIGGER trg_legal_bodies_transitions;"],
+    ["a version to store", `DELETE FROM meta WHERE key = '${VERSION_KEY}';`],
+  ] as const)
+    withDatabaseFile("wal", (first, open) => {
+      addBody(first);
+      first.exec(change);
+      const second = open(0);
+      const before = { objects: objectsOf(first), version: storedVersion(first) };
+      first.exec("BEGIN IMMEDIATE");
+      // With no wait allowed, waiting its turn shows as a refusal; nothing was changed.
+      expect(() => applyLegalBodySchema(second), label).toThrow(/database is locked/);
+      first.exec("COMMIT");
+      expect({ objects: objectsOf(first), version: storedVersion(first) }, label).toEqual(before);
+      opsLinesOf(() => applyLegalBodySchema(second));
+      expect(objectsOf(first), label).toEqual(definedByTheCode());
+      expect(storedVersion(first), label).toBe(String(LEGAL_BODIES_SCHEMA_VERSION));
+    });
+});
+
+test("the change is made under the write lock from its first read: no other process writes in between", () => {
+  withDatabaseFile("wal", (first, open) => {
+    addBody(first);
+    first.exec("DROP TRIGGER trg_legal_bodies_transitions;");
+    first.pragma("busy_timeout = 0");
+    const second = open(0);
+    // Just before the step's first statement that changes the schema, the other process tries to
+    // start a write of its own.
+    const attempts: string[] = [];
+    const exec = second.exec.bind(second);
+    vi.spyOn(second, "exec").mockImplementation((sql: string) => {
+      try {
+        first.exec("BEGIN IMMEDIATE; ROLLBACK;");
+        attempts.push("the other process got the write lock");
+      } catch (e) {
+        attempts.push((e as { code?: string }).code ?? String(e));
+      }
+      return exec(sql);
+    });
+    opsLinesOf(() => applyLegalBodySchema(second));
+    expect(attempts.length).toBeGreaterThan(0);
+    expect(new Set(attempts)).toEqual(new Set(["SQLITE_BUSY"]));
+    expect(objectsOf(first)).toEqual(definedByTheCode());
+  });
+});
+
+test("once it holds the write lock the step compares again: work another process did meanwhile is not redone", () => {
+  withDatabaseFile("wal", (first, open) => {
+    // An older schema with empty tables and no stored version: the step would drop the tables and
+    // create them again.
+    first.exec(OLDER_INDEX);
+    storeVersion(first, null);
+    const second = open(0);
+    // Between the second process's first look and its turn at the lock, the first process
+    // upgrades the schema and writes a body. The step asks for two transactions, the look and
+    // the change; the other process gets in before the second one starts.
+    let asked = 0;
+    const transaction = second.transaction.bind(second);
+    vi.spyOn(second, "transaction").mockImplementation(((fn: () => unknown) => {
+      asked += 1;
+      if (asked === 2) {
+        applyLegalBodySchema(first);
+        addBody(first);
+      }
+      return transaction(fn);
+    }) as typeof second.transaction);
+    applyLegalBodySchema(second);
+    expect(asked).toBe(2);
+    expect(objectsOf(second)).toEqual(definedByTheCode());
+    expect(storedVersion(second)).toBe(String(LEGAL_BODIES_SCHEMA_VERSION));
+    // The body the other process wrote is still there.
+    expect(rowsOf(second).bodies).toHaveLength(1);
+    expect(rowsOf(second).events).toHaveLength(1);
+  });
 });
