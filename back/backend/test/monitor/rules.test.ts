@@ -19,7 +19,13 @@ import {
   registryMetadataSetEvent,
   registryTransferEvent,
 } from "../../src/monitor/events";
-import { evaluateLog, isPermanentGrant, roleLabel, ttlEscalations } from "../../src/monitor/rules";
+import {
+  evaluateLog,
+  grantNowStandingAlert,
+  isPermanentGrant,
+  roleLabel,
+  ttlEscalations,
+} from "../../src/monitor/rules";
 import type { OpenGrant } from "../../src/monitor/store";
 import { ADDR, entity, makeLog, ruleContext, ruleDeps } from "./helpers";
 
@@ -174,6 +180,24 @@ describe("isPermanentGrant — the one definition rule 2 and the TTL sweep share
   test("an account that is not an address is not the executor, and does not throw", () => {
     // The sweep walks stored rows; one bad row must not stop it from paging on the others.
     expect(isPermanentGrant(LEGAL_BODY_ROLE, "not-an-address", ctx)).toBe(false);
+  });
+});
+
+describe("grantNowStandingAlert — the record of a row the sweep closed", () => {
+  test("INFO, keyed by the grant alone, with the role named", () => {
+    const role = LEGAL_BODY_ROLE.toLowerCase();
+    const account = ADDR.executor.toLowerCase();
+    const a = grantNowStandingAlert({ role, account }, ADDR.controller, 1_700_000_000_000);
+    expect(a).toEqual({
+      severity: "INFO",
+      rule: "controller_grant_now_standing",
+      subject: ADDR.controller,
+      detail: { role, roleLabel: "LegalBodyFactory.createLegalBody", account },
+      ts: 1_700_000_000_000,
+      // No clock and no interval in the key: a grant becomes standing once.
+      dedupKey: `controller_grant_now_standing:${role}:${account}`,
+    });
+    expect(() => JSON.stringify(a.detail)).not.toThrow();
   });
 });
 

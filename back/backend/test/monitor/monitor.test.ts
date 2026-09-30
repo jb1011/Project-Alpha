@@ -555,14 +555,59 @@ describe("TTL sweep: rows whose role became standing after they were opened", ()
     await monitor.tick();
     await monitor.tick();
     expect(store.listOpenGrants()).toHaveLength(0);
-    expect(alerts.filter((a) => a.severity === "CRITICAL")).toHaveLength(0);
-    expect(alerts).toHaveLength(0);
+    // Nothing that pages. The one alert is the INFO record of the close, emitted once.
+    expect(alerts).toEqual([
+      {
+        severity: "INFO",
+        rule: "controller_grant_now_standing",
+        subject: ADDR.controller,
+        detail: {
+          role: LEGAL_BODY_ROLE,
+          roleLabel: "LegalBodyFactory.createLegalBody",
+          account: EXECUTOR.toLowerCase(),
+        },
+        ts: 30 * TTL,
+        dedupKey: `controller_grant_now_standing:${LEGAL_BODY_ROLE}:${EXECUTOR.toLowerCase()}`,
+      },
+    ]);
     // One trail line, not one per tick: the row is gone after the first sweep.
     expect(nowStanding()).toEqual([
       {
         event: "monitor_grant_now_standing",
         fields: { role: LEGAL_BODY_ROLE, account: EXECUTOR.toLowerCase() },
       },
+    ]);
+  });
+
+  test("the close is recorded as an INFO alert, and nothing about it reaches the webhook", async () => {
+    open(LEGAL_BODY_ROLE, EXECUTOR, 24);
+    open(LEGAL_BODY_ROLE, ADDR.attacker); // the control: this one must reach the webhook
+    const paged: { severity: string; rule: string }[] = [];
+    const sink = buildAlertSink({
+      store,
+      webhookUrl: "http://webhook.invalid/x",
+      fetchImpl: async (_url, init) => {
+        paged.push(JSON.parse(init.body));
+        return { ok: true, status: 200 };
+      },
+      writeLine: () => {},
+    });
+    const { monitor } = sweeper(30 * TTL, { sink });
+    await monitor.tick();
+    await monitor.tick();
+    const recorded = store.listAlerts().filter((a) => a.rule === "controller_grant_now_standing");
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({
+      severity: "INFO",
+      subject: ADDR.controller,
+      detail: {
+        role: LEGAL_BODY_ROLE,
+        roleLabel: "LegalBodyFactory.createLegalBody",
+        account: EXECUTOR.toLowerCase(),
+      },
+    });
+    expect(paged.map((a) => `${a.severity} ${a.rule}`)).toEqual([
+      "CRITICAL controller_grant_ttl_exceeded",
     ]);
   });
 
@@ -592,6 +637,8 @@ describe("TTL sweep: rows whose role became standing after they were opened", ()
     expect(ttl.map((a) => [a.severity, a.detail.account])).toEqual([
       ["CRITICAL", ADDR.attacker.toLowerCase()],
     ]);
+    // A row that was not closed is not recorded as closed.
+    expect(alerts.filter((a) => a.rule === "controller_grant_now_standing")).toHaveLength(0);
     // The failure is named, and the row is left for the next tick to try again.
     const failed = lines.filter((l) => l.event === "monitor_grant_now_standing_failed");
     expect(failed).toHaveLength(1);

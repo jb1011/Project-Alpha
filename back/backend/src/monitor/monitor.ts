@@ -10,6 +10,7 @@ import {
   type GrantOp,
   type RuleContext,
   evaluateLog,
+  grantNowStandingAlert,
   isPermanentGrant,
   ttlEscalations,
 } from "./rules";
@@ -310,7 +311,7 @@ export class Monitor {
     // two legal-body grants joined it this way), and a grant made while an older build was running
     // was stored as a ceremony grant. The executor never revokes a standing grant, and a revoke is
     // the only other thing that closes a row, so such a row would page CRITICAL every interval,
-    // forever. It is closed instead, with one trail line and no page.
+    // forever. It is closed instead, with one trail line and an INFO record, and no page.
     const permanent: OpenGrant[] = [];
     const open: OpenGrant[] = [];
     for (const g of store.listOpenGrants())
@@ -325,11 +326,13 @@ export class Monitor {
     }
 
     // Only then the housekeeping, one row at a time: a close that fails is logged and the row is
-    // left in place, so the next tick tries again and the other rows are still closed.
+    // left in place, so the next tick tries again and the other rows are still closed. The INFO
+    // alert is what stays in the alert log to explain why the TTL pages for this grant stopped.
     for (const g of permanent) {
       try {
         store.closeGrant(g.role, g.account);
         this.log("monitor_grant_now_standing", { role: g.role, account: g.account });
+        await sink.emit(grantNowStandingAlert(g, cfg.controller, this.now()));
       } catch (err) {
         this.log("monitor_grant_now_standing_failed", {
           role: g.role,

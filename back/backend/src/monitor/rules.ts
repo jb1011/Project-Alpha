@@ -821,6 +821,27 @@ export function isPermanentGrant(
   );
 }
 
+/**
+ * The durable record of a row the sweep closed because its grant is now permanent. INFO: it is
+ * written to the alert log and never sent to the webhook, so it pages nobody. Without it the log
+ * would show a run of TTL pages for the grant that simply stops, with nothing to say why.
+ */
+export function grantNowStandingAlert(
+  g: Pick<OpenGrant, "role" | "account">,
+  controller: Address,
+  now: number,
+): Alert {
+  return alert(
+    "INFO",
+    "controller_grant_now_standing",
+    controller,
+    { role: g.role, roleLabel: roleLabel(g.role as Hex), account: g.account },
+    now,
+    // The grant alone, no interval: a grant becomes standing once.
+    `controller_grant_now_standing:${g.role}:${g.account}`,
+  );
+}
+
 export interface TtlEscalation {
   alert: Alert;
   /** New alertedCount to persist, so the next interval fires exactly once more. */
