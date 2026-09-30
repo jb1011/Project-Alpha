@@ -662,7 +662,7 @@ test("the transition matrix: exactly the legal edges move; every other pair, and
   expect(moved.sort()).toEqual([...LEGAL].sort());
 });
 
-test("an event id is always positive, so one bad row can never block every later append", () => {
+test("an event id is always positive: zero and negative ids are refused, and appends keep working", () => {
   insertDraft();
   // The premise: SQLite shows a BEFORE INSERT trigger an auto-generated id as a placeholder that
   // is not a real id (-1 today), and the no-replace trigger looks that value up. A stored id of -1
@@ -1345,9 +1345,15 @@ test("the rowid is pinned: no INSERT names an existing one, no UPDATE moves it, 
   for (const rowid of [0, -1])
     expect(() => insertAt("INSERT", "rowid", rowid, "z"), `rowid ${rowid}`).toThrow(/CHECK/);
   expect(snapshot()).toEqual(before);
+  // The premise of the insert guard: SQLite shows a BEFORE INSERT trigger an automatic rowid as a
+  // placeholder that is not a real rowid (-1 today), and no stored rowid is ever zero or negative.
+  db.exec(`CREATE TEMP TABLE seen_rowids (r INTEGER);
+    CREATE TEMP TRIGGER log_new_rowid BEFORE INSERT ON legal_bodies
+    BEGIN INSERT INTO seen_rowids VALUES (NEW.rowid); END;`);
   // An ordinary insert is untouched, and takes the next rowid.
   insertDraft(lb("3"), pub("3"));
   expect(rowidOf(lb("3"))).toBe(rowidOf(lb("2")) + 1);
+  expect((db.prepare("SELECT r FROM seen_rowids").get() as { r: number }).r).toBeLessThanOrEqual(0);
 });
 
 test("created_at is write-once: it dates the record and orders the listings", () => {
@@ -1366,4 +1372,41 @@ test("created_at is write-once: it dates the record and orders the listings", ()
   expect(
     db.prepare("UPDATE legal_bodies SET updated_at = '2030-01-01 00:00:00'").run().changes,
   ).toBe(1);
+});
+
+test("an explicit event id is at most the next one, so event ids stay in order", () => {
+  insertDraft();
+  const append = () =>
+    db
+      .prepare(
+        "INSERT INTO legal_body_events (legal_body_id, kind, actor) VALUES (?, 'note', 'system')",
+      )
+      .run(lb("1"));
+  const insertAt = (idSql: string, verb = "INSERT") =>
+    db
+      .prepare(
+        `${verb} INTO legal_body_events (id, legal_body_id, kind, actor) VALUES (${idSql}, ?, 'note', 'operator:x')`,
+      )
+      .run(lb("1"));
+  // On an empty log, and again once it holds rows.
+  for (const round of ["empty log", "three events"]) {
+    for (const idSql of [
+      "9223372036854775807",
+      "(SELECT IFNULL(MAX(id), 0) + 1000 FROM legal_body_events)",
+      "(SELECT IFNULL(MAX(id), 0) + 2 FROM legal_body_events)",
+    ])
+      for (const verb of ["INSERT", "INSERT OR REPLACE", "INSERT OR IGNORE"])
+        expect(() => insertAt(idSql, verb), `${round}: ${verb} ${idSql}`).toThrow(
+          /ids are assigned in order/,
+        );
+    // The natural next id may be written out, and ordinary appends follow it.
+    expect(insertAt("(SELECT IFNULL(MAX(id), 0) + 1 FROM legal_body_events)").changes).toBe(1);
+    expect(append().changes).toBe(1);
+    expect(append().changes).toBe(1);
+  }
+  // An INSERT over an existing id is still refused.
+  expect(() => insertAt("1", "REPLACE")).toThrow(/append-only/);
+  expect(db.prepare("SELECT group_concat(id) AS ids FROM legal_body_events").get()).toEqual({
+    ids: "1,2,3,4,5,6",
+  });
 });

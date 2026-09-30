@@ -264,6 +264,8 @@ const sqlIsSeconds = (column: string) =>
  *  - No DELETE removes a legal body (a trigger); the one way SQLite removes a row without a DELETE
  *    is described below. The event log is append-only: no UPDATE, no DELETE, no INSERT over an
  *    existing event id, and every event id is positive (a CHECK), which that last guard relies on.
+ *    An event id written out by hand is at most the next one (a trigger), so ids stay in order
+ *    and one row cannot use up the ids that remain.
  *
  * What the triggers cannot see: when an `OR REPLACE` write resolves a unique-index conflict,
  * SQLite deletes the conflicting row WITHOUT firing its delete triggers (they fire only with
@@ -441,6 +443,15 @@ export const LEGAL_BODIES_DDL = `
   WHEN EXISTS (SELECT 1 FROM legal_body_events WHERE id = NEW.id)
   BEGIN
     SELECT RAISE(ABORT, 'legal_body_events is append-only');
+  END;
+  -- An id written out by hand is at most the next one: ids are handed out in increasing order and
+  -- never reused, so a row far ahead of the others would waste every id in between. An automatic
+  -- id shows here as the placeholder described above, so ordinary appends pass.
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_next_id
+  BEFORE INSERT ON legal_body_events FOR EACH ROW
+  WHEN NEW.id > (SELECT IFNULL(MAX(id), 0) FROM legal_body_events) + 1
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events: ids are assigned in order');
   END;
 `;
 
