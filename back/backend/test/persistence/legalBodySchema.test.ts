@@ -959,3 +959,347 @@ test("an abandoned row holds no link fields, like a draft", () => {
   freeze(lb("2"));
   expect(() => reserve(lb("2"), "42", BODY)).not.toThrow();
 });
+
+// ── The shape of every stored value, enforced by the table itself ──
+
+const ZERO_ADDRESS = `0x${"0".repeat(40)}`;
+const UINT256_MAX = (2n ** 256n - 1n).toString();
+
+let shapeSeq = 0;
+/** A new frozen draft under its own id. */
+function frozenDraft(): string {
+  shapeSeq += 1;
+  const id = lb(`s${shapeSeq}`);
+  insertDraft(id, pub(`s${shapeSeq}`));
+  freeze(id);
+  return id;
+}
+/**
+ * A raw reservation of `id`. Every column holds a well-formed value (an agentId and a body address
+ * of its own, so no two reservations collide) unless `over` replaces it with an SQL expression.
+ */
+function reserveRaw(id: string, over: Record<string, string> = {}) {
+  shapeSeq += 1;
+  const columns: Record<string, string> = {
+    agent_id: `'${5000 + shapeSeq}'`,
+    identity_owner: `'${OWNER}'`,
+    link_digest: `'${H("b")}'`,
+    link_deadline: "1900000000",
+    link_signature: "'0x01'",
+    body_address: `'${bodyN(5000 + shapeSeq)}'`,
+    ...over,
+  };
+  const set = Object.entries(columns)
+    .map(([column, sql]) => `${column} = ${sql}`)
+    .join(", ");
+  return db
+    .prepare(`UPDATE legal_bodies SET ${set}, binding_state = 'reserved' WHERE legal_body_id = ?`)
+    .run(id);
+}
+const setRaw = (id: string, set: string) =>
+  db.prepare(`UPDATE legal_bodies SET ${set} WHERE legal_body_id = ?`).run(id);
+
+/** Spellings that are not a lower-case 32-byte hash, as SQL expressions. */
+const BAD_HASHES: readonly (readonly [string, string])[] = [
+  ["empty", "''"],
+  ["not hex", "'not hex'"],
+  ["upper-case hex", `'0x${"A".repeat(64)}'`],
+  ["one upper-case digit", `'0x${"a".repeat(63)}A'`],
+  ["63 digits", `'0x${"a".repeat(63)}'`],
+  ["65 digits", `'0x${"a".repeat(65)}'`],
+  ["no 0x prefix", `'${"a".repeat(66)}'`],
+  ["0X prefix", `'0X${"a".repeat(64)}'`],
+  ["a non-hex digit", `'0x${"a".repeat(63)}g'`],
+  ["a BLOB", `CAST('${H("a")}' AS BLOB)`],
+  ["an integer", "7"],
+  ["a NUL inside", `'0x${"a".repeat(63)}' || char(0)`],
+  ["a NUL and more after it", `'${H("a")}' || char(0) || 'x'`],
+];
+/** Spellings that are not a 0x address, as SQL expressions. */
+const BAD_ADDRESSES: readonly (readonly [string, string])[] = [
+  ["empty", "''"],
+  ["a word", "'junk'"],
+  ["39 digits", `'0x${"a".repeat(39)}'`],
+  ["41 digits", `'0x${"a".repeat(41)}'`],
+  ["no 0x prefix", `'${"a".repeat(42)}'`],
+  ["0X prefix", `'0X${"a".repeat(40)}'`],
+  ["a non-hex digit", `'0x${"a".repeat(39)}g'`],
+  ["a BLOB", `CAST('0x${"a".repeat(40)}' AS BLOB)`],
+  ["a NUL inside", `'0x${"a".repeat(39)}' || char(0)`],
+  ["a NUL and more after it", `'0x${"a".repeat(40)}' || char(0) || 'x'`],
+];
+
+test("the agreement is a lower-case 32-byte hash with a version of at least 1, set together", () => {
+  insertDraft();
+  const id = lb("1");
+  for (const [label, hashSql] of BAD_HASHES)
+    expect(
+      () => setRaw(id, `oa_manifest_hash = ${hashSql}, oa_manifest_version = 1`),
+      `hash: ${label}`,
+    ).toThrow(/CHECK/);
+  for (const [label, set] of [
+    ["a version with no hash", "oa_manifest_version = 1"],
+    ["a hash with no version", `oa_manifest_hash = '${H("a")}'`],
+    ["a hash with a NULL version", `oa_manifest_hash = '${H("a")}', oa_manifest_version = NULL`],
+    ["version 0", `oa_manifest_hash = '${H("a")}', oa_manifest_version = 0`],
+    ["version -1", `oa_manifest_hash = '${H("a")}', oa_manifest_version = -1`],
+  ] as const)
+    expect(() => setRaw(id, set), label).toThrow(/CHECK/);
+  expect(
+    db.prepare("SELECT oa_manifest_hash AS h, oa_manifest_version AS v FROM legal_bodies").get(),
+  ).toEqual({ h: null, v: null });
+  // Version 1 is the first version, and it is accepted.
+  expect(setRaw(id, `oa_manifest_hash = '${H("a")}', oa_manifest_version = 1`).changes).toBe(1);
+});
+
+test("the link digest and the deploy hash are lower-case 32-byte hashes; the signature is lower-case hex bytes", () => {
+  for (const [label, sql] of BAD_HASHES)
+    expect(() => reserveRaw(frozenDraft(), { link_digest: sql }), `digest: ${label}`).toThrow(
+      /CHECK/,
+    );
+  for (const [label, sql] of [
+    ["empty", "''"],
+    ["0x and no byte", "'0x'"],
+    ["half a byte", "'0x1'"],
+    ["a byte and a half", "'0x012'"],
+    ["no 0x prefix", "'0101'"],
+    ["0X prefix", "'0X01'"],
+    ["upper-case hex", "'0xAB'"],
+    ["a non-hex digit", "'0x0g'"],
+    ["a BLOB", "CAST('0x01' AS BLOB)"],
+    ["an integer", "1"],
+    ["a NUL inside", "'0x01' || char(0) || '1'"],
+    ["a NUL and more after it", "'0x01' || char(0) || 'ff'"],
+  ] as const)
+    expect(() => reserveRaw(frozenDraft(), { link_signature: sql }), `signature: ${label}`).toThrow(
+      /CHECK/,
+    );
+  // A signature has no fixed length: one byte, 65 bytes and a long contract signature all fit.
+  for (const bytes of [1, 65, 700])
+    expect(
+      reserveRaw(frozenDraft(), { link_signature: `'0x${"ab".repeat(bytes)}'` }).changes,
+      `${bytes} bytes`,
+    ).toBe(1);
+  // The deploy hash is checked from its first submission, while the row is still reserved.
+  const id = frozenDraft();
+  reserveRaw(id);
+  for (const [label, sql] of BAD_HASHES)
+    expect(() => setRaw(id, `create_tx_hash = ${sql}`), `deploy hash: ${label}`).toThrow(/CHECK/);
+  expect(setRaw(id, `create_tx_hash = '${H("1")}'`).changes).toBe(1);
+});
+
+test("the tenant, the factory and the identity owner are 0x addresses", () => {
+  let n = 0;
+  for (const [label, sql] of BAD_ADDRESSES) {
+    n += 1;
+    // The tenant: under a company of that same tenant, so only the shape can refuse it.
+    db.exec(
+      `INSERT INTO companies (company_id, tenant_id, status, provider, environment, name_options, business_purpose, industry_label)
+       VALUES ('co_bad${n}', ${sql}, 'ready', 'customer', 'sandbox', '["Acme LLC"]', 'existing', 'existing')`,
+    );
+    expect(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+             VALUES (?, ?, ${sql}, 'co_bad${n}', 5042002, ?, ${sql}, 172800)`,
+          )
+          .run(lb(`t${n}`), pub(`t${n}`), FACTORY),
+      `tenant: ${label}`,
+    ).toThrow(/CHECK/);
+    expect(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+             VALUES (?, ?, ?, 'co_1', 5042002, ${sql}, ?, 172800)`,
+          )
+          .run(lb(`f${n}`), pub(`f${n}`), TENANT, TENANT),
+      `factory: ${label}`,
+    ).toThrow(/CHECK/);
+    expect(
+      () => reserveRaw(frozenDraft(), { identity_owner: sql }),
+      `identity owner: ${label}`,
+    ).toThrow(/CHECK/);
+  }
+  expect(
+    db.prepare("SELECT COUNT(*) AS n FROM legal_bodies WHERE agent_id IS NOT NULL").get(),
+  ).toEqual({ n: 0 });
+});
+
+test("a legal body id is lb_ and 36 characters, a public id 36 characters, and a chain id is positive", () => {
+  const insert = (idSql: string, publicIdSql: string, chainId: number) =>
+    db
+      .prepare(
+        `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+         VALUES (${idSql}, ${publicIdSql}, ?, 'co_1', ?, ?, ?, 172800)`,
+      )
+      .run(TENANT, chainId, FACTORY, TENANT);
+  const goodId = `'${lb("g")}'`;
+  const goodPublicId = `'${pub("g")}'`;
+  for (const [label, sql] of [
+    ["empty", "''"],
+    ["too short", "'lb_1'"],
+    ["35 characters after the prefix", `'lb_${"a".repeat(35)}'`],
+    ["37 characters after the prefix", `'lb_${"a".repeat(37)}'`],
+    ["another prefix", `'xx_${"a".repeat(36)}'`],
+    ["an upper-case prefix", `'LB_${"a".repeat(36)}'`],
+    ["a BLOB", `CAST('${lb("b")}' AS BLOB)`],
+    ["an integer", "7"],
+    ["a NUL inside", `'lb_${"a".repeat(35)}' || char(0)`],
+    ["a NUL and more after it", `'${lb("n")}' || char(0) || 'x'`],
+  ] as const)
+    expect(() => insert(sql, goodPublicId, 5042002), `id: ${label}`).toThrow(/CHECK/);
+  for (const [label, sql] of [
+    ["empty", "''"],
+    ["35 characters", `'${"a".repeat(35)}'`],
+    ["37 characters", `'${"a".repeat(37)}'`],
+    ["a BLOB", `CAST('${pub("b")}' AS BLOB)`],
+    ["an integer", "7"],
+    ["a NUL inside", `'${"a".repeat(35)}' || char(0)`],
+    ["a NUL and more after it", `'${pub("n")}' || char(0) || 'x'`],
+  ] as const)
+    expect(() => insert(goodId, sql, 5042002), `public id: ${label}`).toThrow(/CHECK/);
+  for (const chainId of [0, -1])
+    expect(() => insert(goodId, goodPublicId, chainId)).toThrow(/CHECK/);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_bodies").get()).toEqual({ n: 0 });
+  expect(insert(goodId, goodPublicId, 1).changes).toBe(1);
+});
+
+test("a body address is never the zero address, nor the factory that would create it", () => {
+  for (const [label, address] of [
+    ["the zero address", ZERO_ADDRESS],
+    ["the factory", FACTORY],
+    ["the factory in lower case", FACTORY.toLowerCase()],
+    ["the factory in upper case", `0x${FACTORY.slice(2).toUpperCase()}`],
+  ] as const)
+    expect(() => reserveRaw(frozenDraft(), { body_address: `'${address}'` }), label).toThrow(
+      /CHECK/,
+    );
+  expect(
+    db.prepare("SELECT COUNT(*) AS n FROM legal_bodies WHERE body_address IS NOT NULL").get(),
+  ).toEqual({ n: 0 });
+});
+
+test("a time in seconds is between 1 and 99999999999, so a value in milliseconds is refused", () => {
+  const BAD_SECONDS = [0, -5, 100_000_000_000, 1_900_000_000_000];
+  for (const v of BAD_SECONDS)
+    expect(
+      () => reserveRaw(frozenDraft(), { link_deadline: String(v) }),
+      `link_deadline ${v}`,
+    ).toThrow(/CHECK/);
+  const id = frozenDraft();
+  reserveRaw(id, { link_deadline: "99999999999" }); // the upper bound fits
+  for (const v of BAD_SECONDS)
+    expect(
+      () =>
+        setRaw(id, `create_tx_hash = '${H("c")}', deployed_at = ${v}, binding_state = 'deployed'`),
+      `deployed_at ${v}`,
+    ).toThrow(/CHECK/);
+  setRaw(id, `create_tx_hash = '${H("c")}', deployed_at = 1, binding_state = 'deployed'`); // and the lower
+  for (const v of BAD_SECONDS)
+    expect(
+      () => setRaw(id, `binding_state = 'linked', pointer_seen_at = ${v}`),
+      `pointer_seen_at ${v}`,
+    ).toThrow(/CHECK/);
+  expect(setRaw(id, "binding_state = 'linked', pointer_seen_at = 1800000100").changes).toBe(1);
+});
+
+test("the check schedule is a time in milliseconds and a positive interval, set together", () => {
+  const id = frozenDraft();
+  reserveRaw(id);
+  for (const set of [
+    "next_binding_check_at = -1, binding_check_interval_ms = 60000",
+    "next_binding_check_at = 1000, binding_check_interval_ms = 0",
+    "next_binding_check_at = 1000, binding_check_interval_ms = -5",
+    "next_binding_check_at = 1000",
+    "binding_check_interval_ms = 60000",
+    "next_binding_check_at = 1000, binding_check_interval_ms = NULL",
+    "next_binding_check_at = NULL, binding_check_interval_ms = 60000",
+  ])
+    expect(() => setRaw(id, set), set).toThrow(/CHECK/);
+  for (const set of [
+    "next_binding_check_at = 0, binding_check_interval_ms = 1",
+    "next_binding_check_at = 1800000000000, binding_check_interval_ms = 60000",
+    "next_binding_check_at = NULL, binding_check_interval_ms = NULL",
+  ])
+    expect(setRaw(id, set).changes, set).toBe(1);
+});
+
+test("the deploy time is set only by the deploy: no row before it, or closed without it, holds one", () => {
+  // A row that held one early could never be deployed: the deploy facts are write-once.
+  expect(() =>
+    db
+      .prepare(
+        `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay, deployed_at)
+         VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800, 1800000000)`,
+      )
+      .run(lb("d"), pub("d"), TENANT, FACTORY, TENANT),
+  ).toThrow(/CHECK/);
+  const draft = frozenDraft();
+  expect(() => setRaw(draft, "deployed_at = 1800000000"), "draft").toThrow(/CHECK/);
+  const reserved = frozenDraft();
+  reserveRaw(reserved);
+  expect(() => setRaw(reserved, "deployed_at = 1800000000"), "reserved").toThrow(/CHECK/);
+  expect(
+    () => setRaw(reserved, "binding_state = 'lapsed', deployed_at = 1800000000"),
+    "lapsed",
+  ).toThrow(/CHECK/);
+  expect(
+    () => setRaw(draft, "binding_state = 'abandoned', deployed_at = 1800000000"),
+    "abandoned",
+  ).toThrow(/CHECK/);
+  // The reserved row is untouched, and deploys normally.
+  expect(
+    setRaw(
+      reserved,
+      `create_tx_hash = '${H("c")}', deployed_at = 1800000000, binding_state = 'deployed'`,
+    ).changes,
+  ).toBe(1);
+});
+
+test("nothing legitimate is refused: the whole lifecycle, with agentId 0, the largest agentId and version 1", () => {
+  const state = (id: string) =>
+    (
+      db.prepare("SELECT binding_state FROM legal_bodies WHERE legal_body_id = ?").get(id) as {
+        binding_state: string;
+      }
+    ).binding_state;
+  // Agent 0: reserved, deployed, linked, broken, linked again, broken, set aside, linked again.
+  const zero = frozenDraft(); // frozen at version 1
+  reserveRaw(zero, { agent_id: "'0'", body_address: `'${BODY}'` });
+  setRaw(zero, `create_tx_hash = '${H("1")}'`);
+  setRaw(zero, `create_tx_hash = '${H("2")}'`);
+  setRaw(
+    zero,
+    `create_tx_hash = '${H("2")}', deployed_at = 1800000000, binding_state = 'deployed'`,
+  );
+  setRaw(zero, "next_binding_check_at = 1800000000000, binding_check_interval_ms = 60000");
+  setRaw(zero, "binding_state = 'linked', pointer_seen_at = 1800000100");
+  setRaw(zero, "binding_state = 'broken'");
+  setRaw(zero, "binding_state = 'linked', pointer_seen_at = 1800000200");
+  setRaw(zero, "binding_state = 'broken'");
+  setRaw(zero, "binding_state = 'superseded'");
+  setRaw(zero, "binding_state = 'linked', pointer_seen_at = 1800000300");
+  setRaw(zero, "next_binding_check_at = NULL, binding_check_interval_ms = NULL");
+  expect(state(zero)).toBe("linked");
+  // The largest uint256: reserved, then lapsed.
+  const max = frozenDraft();
+  reserveRaw(max, { agent_id: `'${UINT256_MAX}'`, body_address: `'${OTHER_BODY}'` });
+  setRaw(max, "binding_state = 'lapsed'");
+  expect(state(max)).toBe("lapsed");
+  // A deployed body that is never linked, then set aside; and a draft that is closed.
+  const aside = frozenDraft();
+  reserveRaw(aside);
+  setRaw(aside, `create_tx_hash = '${H("3")}', deployed_at = 1, binding_state = 'deployed'`);
+  setRaw(aside, "binding_state = 'superseded'");
+  expect(state(aside)).toBe("superseded");
+  const closed = frozenDraft();
+  setRaw(closed, "binding_state = 'abandoned'");
+  expect(state(closed)).toBe("abandoned");
+  expect(
+    db
+      .prepare("SELECT agent_id, oa_manifest_version FROM legal_bodies WHERE legal_body_id = ?")
+      .get(max),
+  ).toEqual({ agent_id: UINT256_MAX, oa_manifest_version: 1 });
+});

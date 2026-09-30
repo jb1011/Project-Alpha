@@ -182,6 +182,23 @@ const COMPANIES_DDL = `
 `;
 
 /**
+ * The shape CHECKs the DDL below repeats, as SQL over one column. Each accepts only TEXT whose
+ * byte length equals its character length: `length()` stops at the first NUL, and GLOB and
+ * `substr` read a BLOB as text, so without those two terms a BLOB, or a value with an embedded
+ * NUL, could pass as a second spelling of a value that is already stored.
+ */
+const sqlIsAddress = (column: string) =>
+  `typeof(${column}) = 'text' AND length(CAST(${column} AS BLOB)) = 42 AND length(${column}) = 42
+      AND substr(${column}, 1, 2) = '0x' AND substr(${column}, 3) NOT GLOB '*[^0-9a-fA-F]*'`;
+/** `0x` and 64 lower-case hex digits: one spelling per hash, so stored hashes compare as text. */
+const sqlIsHash = (column: string) =>
+  `typeof(${column}) = 'text' AND length(CAST(${column} AS BLOB)) = 66 AND length(${column}) = 66
+      AND substr(${column}, 1, 2) = '0x' AND substr(${column}, 3) NOT GLOB '*[^0-9a-f]*'`;
+/** Unix SECONDS. The upper bound is far in the future and refuses a value in milliseconds. */
+const sqlIsSeconds = (column: string) =>
+  `typeof(${column}) = 'integer' AND ${column} BETWEEN 1 AND 99999999999`;
+
+/**
  * Legal bodies for identities their customers own (one row per body order), and their append-only
  * event log. Kept apart from `entities` on purpose: a legal body has no treasury, no operator, no
  * custody and no onboarding saga, so no existing agent query can ever mistake one for an agent.
@@ -193,12 +210,33 @@ const COMPANIES_DDL = `
  *    company that does not exist is refused by the foreign key).
  *  - The amendment delay is within the factory contract's bounds, 48 hours to 30 days inclusive.
  *  - Every number column holds an integer: anything else (a fraction, text such as 'v1', a BLOB)
- *    is refused rather than stored as REAL or TEXT.
+ *    is refused rather than stored as REAL or TEXT. A chain id is positive.
+ *  - A legal body id is `lb_` and 36 characters, a public id 36 characters, both TEXT with no
+ *    hidden bytes.
  *  - An agentId has one spelling: TEXT with no hidden bytes, decimal digits only, no leading zero
  *    except '0' itself, at most 78 digits (the width of a uint256). The one-live-body index
  *    compares full bytes and storage class, so '042', a BLOB '42' or '42' followed by a NUL would
  *    otherwise each be a second live body for agent 42.
- *  - A body address is TEXT with no hidden bytes: `0x`, then exactly 40 hex digits.
+ *  - An address (the tenant, the factory, the identity owner, the body) is TEXT with no hidden
+ *    bytes: `0x`, then exactly 40 hex digits. A body address is never the zero address, nor the
+ *    row's own factory, in any casing.
+ *  - A hash (the agreement hash, the link digest, the deploy transaction hash) is `0x` and 64
+ *    LOWER-CASE hex digits, so a stored hash has one spelling and compares as text. The link
+ *    signature is `0x` and one or more whole bytes of lower-case hex.
+ *  - The agreement hash and its version are set together or not at all, and the version is at
+ *    least 1.
+ *  - Every time column has one unit, and a range that refuses the other unit:
+ *      - `amendment_delay` is a duration in SECONDS;
+ *      - `link_deadline`, `deployed_at` and `pointer_seen_at` are unix SECONDS, the unit of a
+ *        block timestamp, between 1 and 99999999999 (a value in milliseconds does not fit);
+ *      - `next_binding_check_at` is unix MILLISECONDS and `binding_check_interval_ms` a positive
+ *        duration in MILLISECONDS, the units of the process clock that schedules the checks; they
+ *        are set together or not at all;
+ *      - `created_at` and `updated_at`, here and in the event log, are UTC text as SQLite's
+ *        CURRENT_TIMESTAMP writes it (`YYYY-MM-DD HH:MM:SS`).
+ *  - `deployed_at` is set only by the deploy: no `draft`, `reserved`, `lapsed` or `abandoned` row
+ *    holds one. The deploy facts are write-once, so a row that held one early could never be
+ *    deployed.
  *  - Rows are born `draft`, and an INSERT never lands on an existing row (a trigger). That is what
  *    stops `REPLACE INTO` from rewriting a body wholesale: REPLACE deletes the old row and inserts
  *    a new one, and no UPDATE guard would ever see it.
@@ -245,41 +283,50 @@ const COMPANIES_DDL = `
  */
 export const LEGAL_BODIES_DDL = `
   CREATE TABLE IF NOT EXISTS legal_bodies (
-    legal_body_id TEXT PRIMARY KEY NOT NULL,
-    public_id TEXT NOT NULL UNIQUE,
-    tenant_id TEXT NOT NULL,
+    legal_body_id TEXT PRIMARY KEY NOT NULL CHECK (typeof(legal_body_id) = 'text'
+      AND length(CAST(legal_body_id AS BLOB)) = 39 AND length(legal_body_id) = 39
+      AND substr(legal_body_id, 1, 3) = 'lb_'),
+    public_id TEXT NOT NULL UNIQUE CHECK (typeof(public_id) = 'text'
+      AND length(CAST(public_id AS BLOB)) = 36 AND length(public_id) = 36),
+    tenant_id TEXT NOT NULL CHECK (${sqlIsAddress("tenant_id")}),
     company_id TEXT NOT NULL REFERENCES companies(company_id),
-    chain_id INTEGER NOT NULL CHECK (typeof(chain_id) = 'integer'),
-    factory TEXT NOT NULL,
+    chain_id INTEGER NOT NULL CHECK (typeof(chain_id) = 'integer' AND chain_id > 0),
+    factory TEXT NOT NULL CHECK (${sqlIsAddress("factory")}),
     guardian TEXT NOT NULL,
     amendment_delay INTEGER NOT NULL CHECK (typeof(amendment_delay) = 'integer')
       CHECK (amendment_delay BETWEEN 172800 AND 2592000),
-    oa_manifest_hash TEXT,
-    oa_manifest_version INTEGER
-      CHECK (oa_manifest_version IS NULL OR typeof(oa_manifest_version) = 'integer'),
+    oa_manifest_hash TEXT CHECK (oa_manifest_hash IS NULL OR (${sqlIsHash("oa_manifest_hash")})),
+    oa_manifest_version INTEGER CHECK (oa_manifest_version IS NULL
+      OR (typeof(oa_manifest_version) = 'integer' AND oa_manifest_version >= 1)),
     agent_id TEXT CHECK (agent_id IS NULL OR (typeof(agent_id) = 'text'
       AND length(CAST(agent_id AS BLOB)) = length(agent_id) AND length(agent_id) BETWEEN 1 AND 78
       AND agent_id NOT GLOB '*[^0-9]*' AND (agent_id = '0' OR substr(agent_id, 1, 1) != '0'))),
-    identity_owner TEXT,
-    link_digest TEXT,
-    link_deadline INTEGER CHECK (link_deadline IS NULL OR typeof(link_deadline) = 'integer'),
-    link_signature TEXT,
-    body_address TEXT CHECK (body_address IS NULL OR (typeof(body_address) = 'text'
-      AND length(CAST(body_address AS BLOB)) = 42 AND length(body_address) = 42
-      AND substr(body_address, 1, 2) = '0x' AND substr(body_address, 3) NOT GLOB '*[^0-9a-fA-F]*')),
-    create_tx_hash TEXT,
-    deployed_at INTEGER CHECK (deployed_at IS NULL OR typeof(deployed_at) = 'integer'),
+    identity_owner TEXT CHECK (identity_owner IS NULL OR (${sqlIsAddress("identity_owner")})),
+    link_digest TEXT CHECK (link_digest IS NULL OR (${sqlIsHash("link_digest")})),
+    link_deadline INTEGER CHECK (link_deadline IS NULL OR (${sqlIsSeconds("link_deadline")})),
+    link_signature TEXT CHECK (link_signature IS NULL OR (typeof(link_signature) = 'text'
+      AND length(CAST(link_signature AS BLOB)) = length(link_signature)
+      AND length(link_signature) >= 4 AND length(link_signature) % 2 = 0
+      AND substr(link_signature, 1, 2) = '0x' AND substr(link_signature, 3) NOT GLOB '*[^0-9a-f]*')),
+    body_address TEXT CHECK (body_address IS NULL OR (${sqlIsAddress("body_address")})),
+    create_tx_hash TEXT CHECK (create_tx_hash IS NULL OR (${sqlIsHash("create_tx_hash")})),
+    deployed_at INTEGER CHECK (deployed_at IS NULL OR (${sqlIsSeconds("deployed_at")})),
     binding_state TEXT NOT NULL DEFAULT 'draft'
       CHECK (binding_state IN ('draft','reserved','deployed','linked','broken','lapsed','superseded',
                                'abandoned')),
-    pointer_seen_at INTEGER CHECK (pointer_seen_at IS NULL OR typeof(pointer_seen_at) = 'integer'),
-    next_binding_check_at INTEGER
-      CHECK (next_binding_check_at IS NULL OR typeof(next_binding_check_at) = 'integer'),
-    binding_check_interval_ms INTEGER
-      CHECK (binding_check_interval_ms IS NULL OR typeof(binding_check_interval_ms) = 'integer'),
+    pointer_seen_at INTEGER CHECK (pointer_seen_at IS NULL OR (${sqlIsSeconds("pointer_seen_at")})),
+    next_binding_check_at INTEGER CHECK (next_binding_check_at IS NULL
+      OR (typeof(next_binding_check_at) = 'integer' AND next_binding_check_at >= 0)),
+    binding_check_interval_ms INTEGER CHECK (binding_check_interval_ms IS NULL
+      OR (typeof(binding_check_interval_ms) = 'integer' AND binding_check_interval_ms > 0)),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (guardian = tenant_id),
+    CHECK ((oa_manifest_hash IS NULL) = (oa_manifest_version IS NULL)),
+    CHECK ((next_binding_check_at IS NULL) = (binding_check_interval_ms IS NULL)),
+    CHECK (body_address IS NULL
+      OR (lower(body_address) != '0x0000000000000000000000000000000000000000'
+          AND lower(body_address) != lower(factory))),
     CHECK (binding_state NOT IN ('draft','abandoned') OR (agent_id IS NULL AND identity_owner IS NULL
       AND link_digest IS NULL AND link_deadline IS NULL AND link_signature IS NULL
       AND body_address IS NULL)),
@@ -289,6 +336,7 @@ export const LEGAL_BODIES_DDL = `
       AND oa_manifest_hash IS NOT NULL)),
     CHECK (binding_state NOT IN ('deployed','linked','broken','superseded')
       OR (create_tx_hash IS NOT NULL AND deployed_at IS NOT NULL)),
+    CHECK (deployed_at IS NULL OR binding_state IN ('deployed','linked','broken','superseded')),
     CHECK (binding_state != 'linked' OR pointer_seen_at IS NOT NULL)
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_live_agent
