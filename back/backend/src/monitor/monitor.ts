@@ -310,18 +310,33 @@ export class Monitor {
     // two legal-body grants joined it this way), and a grant made while an older build was running
     // was stored as a ceremony grant. The executor never revokes a standing grant, and a revoke is
     // the only other thing that closes a row, so such a row would page CRITICAL every interval,
-    // forever. Close it instead, with one trail line and no alert.
+    // forever. It is closed instead, with one trail line and no page.
+    const permanent: OpenGrant[] = [];
     const open: OpenGrant[] = [];
-    for (const g of store.listOpenGrants()) {
-      if (isPermanentGrant(g.role, g.account, ctx)) {
-        store.closeGrant(g.role, g.account);
-        this.log("monitor_grant_now_standing", { role: g.role, account: g.account });
-      } else open.push(g);
-    }
+    for (const g of store.listOpenGrants())
+      (isPermanentGrant(g.role, g.account, ctx) ? permanent : open).push(g);
+
+    // Page FIRST. Closing a row is a write, and a store that cannot be written (a full disk, a
+    // read-only remount) must not be able to stop a page for a grant that is still overdue.
     const escalations = ttlEscalations(open, this.now(), cfg.grantTtlMs, cfg.controller);
     for (const e of escalations) {
       await sink.emit(e.alert);
       store.setGrantAlertedCount(e.role, e.account, e.alertedCount);
+    }
+
+    // Only then the housekeeping, one row at a time: a close that fails is logged and the row is
+    // left in place, so the next tick tries again and the other rows are still closed.
+    for (const g of permanent) {
+      try {
+        store.closeGrant(g.role, g.account);
+        this.log("monitor_grant_now_standing", { role: g.role, account: g.account });
+      } catch (err) {
+        this.log("monitor_grant_now_standing_failed", {
+          role: g.role,
+          account: g.account,
+          message: (err as Error).message,
+        });
+      }
     }
   }
 

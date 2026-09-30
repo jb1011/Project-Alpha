@@ -2,13 +2,13 @@ import { type Address, pad, toFunctionSelector } from "viem";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { noviControllerAbi } from "../../src/abis/generated";
 import { LEGAL_BODY_GRANTED_SELECTORS, selectorRole } from "../../src/adapters/arc/bootVerify";
-import type { Alert, AlertSink } from "../../src/monitor/alerts";
+import { type Alert, type AlertSink, buildAlertSink } from "../../src/monitor/alerts";
 import type { EntityLookup, MonitoredEntity } from "../../src/monitor/entityLookup";
 import { EntityLookupError } from "../../src/monitor/errors";
 import { WILDCARD_ROLE } from "../../src/monitor/events";
 import { Monitor, type MonitorConfig } from "../../src/monitor/monitor";
 import type { LogQuery, MonitorRpc, RawLog } from "../../src/monitor/rpc";
-import { SqliteMonitorStore } from "../../src/monitor/store";
+import { type MonitorStore, SqliteMonitorStore } from "../../src/monitor/store";
 import { ADDR, entity, makeLog } from "./helpers";
 
 const BASE_CFG: MonitorConfig = {
@@ -519,20 +519,34 @@ describe("TTL sweep: rows whose role became standing after they were opened", ()
     if (alertedCount > 0) store.setGrantAlertedCount(role, account, alertedCount);
   }
 
-  function sweeper(now: number) {
+  function sweeper(now: number, over: { store?: MonitorStore; sink?: AlertSink } = {}) {
     const { sink, alerts } = collectingSink();
     const lines: { event: string; fields?: Record<string, unknown> }[] = [];
     const monitor = new Monitor({
       rpc: rpcStub({ head: 1000n }),
-      store,
+      store: over.store ?? store,
       entities: lookup(),
-      sink,
+      sink: over.sink ?? sink,
       cfg: CFG,
       now: () => now,
       log: (event, fields) => void lines.push({ event, fields }),
     });
     const nowStanding = () => lines.filter((l) => l.event === "monitor_grant_now_standing");
-    return { monitor, alerts, nowStanding };
+    return { monitor, alerts, lines, nowStanding };
+  }
+
+  /** The store, with the named writes failing the way a full disk or a read-only remount does. */
+  function failingWrites(methods: readonly (keyof MonitorStore)[]): MonitorStore {
+    return new Proxy(store, {
+      get(target, prop) {
+        if ((methods as readonly (string | symbol)[]).includes(prop))
+          return () => {
+            throw new Error("attempt to write a readonly database");
+          };
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
   }
 
   test("a legal-body role held by the executor is closed by the sweep, with no page", async () => {
@@ -565,6 +579,61 @@ describe("TTL sweep: rows whose role became standing after they were opened", ()
       [ADDR.attacker.toLowerCase(), 1],
     ]);
     expect(nowStanding()).toHaveLength(1);
+  });
+
+  test("a close that fails does not silence the pages of the same sweep", async () => {
+    open(LEGAL_BODY_ROLE, EXECUTOR);
+    open(WILDCARD_ROLE.toLowerCase(), ADDR.attacker);
+    const { monitor, alerts, lines } = sweeper(TTL + 60_000, {
+      store: failingWrites(["closeGrant"]),
+    });
+    await monitor.tick(); // and the tick itself survives
+    const ttl = alerts.filter((a) => a.rule === "controller_grant_ttl_exceeded");
+    expect(ttl.map((a) => [a.severity, a.detail.account])).toEqual([
+      ["CRITICAL", ADDR.attacker.toLowerCase()],
+    ]);
+    // The failure is named, and the row is left for the next tick to try again.
+    const failed = lines.filter((l) => l.event === "monitor_grant_now_standing_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.fields).toMatchObject({
+      role: LEGAL_BODY_ROLE,
+      account: EXECUTOR.toLowerCase(),
+      message: "attempt to write a readonly database",
+    });
+    expect(store.listOpenGrants().map((g) => [g.account, g.alertedCount])).toEqual([
+      [EXECUTOR.toLowerCase(), 0],
+      [ADDR.attacker.toLowerCase(), 1],
+    ]);
+  });
+
+  test("with every store write failing, an overdue grant still reaches the webhook each tick", async () => {
+    open(LEGAL_BODY_ROLE, EXECUTOR);
+    open(WILDCARD_ROLE.toLowerCase(), ADDR.attacker);
+    const broken = failingWrites([
+      "closeGrant",
+      "setGrantAlertedCount",
+      "recordAlert",
+      "openGrant",
+    ]);
+    const paged: { severity: string; rule: string }[] = [];
+    const sink = buildAlertSink({
+      store: broken,
+      webhookUrl: "http://webhook.invalid/x",
+      fetchImpl: async (_url, init) => {
+        paged.push(JSON.parse(init.body));
+        return { ok: true, status: 200 };
+      },
+      writeLine: () => {},
+    });
+    const { monitor } = sweeper(TTL + 60_000, { store: broken, sink });
+    // The sweep cannot persist that it paged, so each tick ends in an error; the loop that drives
+    // the monitor catches it and schedules the next one.
+    for (let i = 0; i < 3; i++) await monitor.tick().catch(() => {});
+    expect(paged.map((a) => `${a.severity} ${a.rule}`)).toEqual([
+      "CRITICAL controller_grant_ttl_exceeded",
+      "CRITICAL controller_grant_ttl_exceeded",
+      "CRITICAL controller_grant_ttl_exceeded",
+    ]);
   });
 
   test("a role outside the standing set still pages, even when the executor holds it", async () => {
