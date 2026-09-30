@@ -1348,9 +1348,10 @@ test("a deploy hash needs a reservation, and a pointer sighting needs a link: no
   reserveRaw(lapsing);
   expect(() => setRaw(lapsing, SEEN), "reserved").toThrow(/CHECK/);
   expect(setRaw(lapsing, HASH).changes).toBe(1);
-  expect(() => setRaw(lapsing, `binding_state = 'lapsed', ${SEEN}`), "lapsed on the way in").toThrow(
-    /CHECK/,
-  );
+  expect(
+    () => setRaw(lapsing, `binding_state = 'lapsed', ${SEEN}`),
+    "lapsed on the way in",
+  ).toThrow(/CHECK/);
   setRaw(lapsing, "binding_state = 'lapsed'");
   expect(() => setRaw(lapsing, SEEN), "lapsed").toThrow(/CHECK/);
   expect(held(lapsing)).toEqual({ state: "lapsed", hash: H("c"), seen: null });
