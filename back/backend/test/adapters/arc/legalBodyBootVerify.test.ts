@@ -1,5 +1,12 @@
-import { type Address, type PublicClient, toFunctionSelector, zeroAddress } from "viem";
-import { expect, test, vi } from "vitest";
+import {
+  type Address,
+  type Hex,
+  type PublicClient,
+  isAddressEqual,
+  toFunctionSelector,
+  zeroAddress,
+} from "viem";
+import { expect, test } from "vitest";
 import {
   CONTROLLER_GRANTED_SELECTORS,
   LEGAL_BODY_GRANTED_SELECTORS,
@@ -41,36 +48,74 @@ test("the monitor treats the two legal-body grants as standing roles (WARN, not 
     expect(roles.has(selectorRole(s.selector).toLowerCase() as `0x${string}`)).toBe(true);
 });
 
-/** A client answering the factory's and the controller's reads from a scripted world. */
-function client(world: {
-  owner?: Address;
-  pendingOwner?: Address;
-  registry?: Address;
-  pins?: (Address | undefined)[];
-  grants?: boolean[];
-  throws?: Error;
-}) {
-  let pin = 0;
-  let grant = 0;
-  const readContract = vi.fn(async ({ functionName }: { functionName: string }) => {
-    if (world.throws) throw world.throws;
-    switch (functionName) {
-      case "owner":
-        return world.owner ?? CONTROLLER;
-      case "pendingOwner":
-        return world.pendingOwner ?? zeroAddress;
-      case "identityRegistry":
-        return world.registry ?? REGISTRY;
-      case "boundTarget":
-        return world.pins ? world.pins[pin++] : LB_FACTORY;
-      case "hasRole":
-        return world.grants ? world.grants[grant++] : true;
-      default:
-        throw new Error(`unexpected read ${functionName}`);
-    }
-  });
+const CREATE = LEGAL_BODY_GRANTED_SELECTORS[0]!;
+const SCHEDULE = LEGAL_BODY_GRANTED_SELECTORS[1]!;
+
+/**
+ * What the chain holds. The boot check is a security gate, so the double has to be able to tell
+ * WHICH contract, account and selector it was asked about: a check that read the owner from the
+ * wrong contract, asked about the wrong account, or read one pin twice must fail these tests.
+ */
+interface World {
+  owner: Address;
+  pendingOwner: Address;
+  registry: Address;
+  /** selector -> the contract it is pinned to on the controller. Absent = never pinned. */
+  pins: ReadonlyMap<Hex, Address>;
+  /** The (selector, account) grants the controller holds. */
+  grants: readonly (readonly [selector: Hex, account: Address])[];
+  /** Every read fails with this, as a dead RPC would. */
+  down?: Error;
+}
+
+const grantKey = (role: string, account: string) =>
+  `${role.toLowerCase()}:${account.toLowerCase()}`;
+
+/**
+ * A small chain with two contracts. The factory's reads answer only at the factory address and
+ * the controller's only at the controller address; anything else throws, as a call to the wrong
+ * contract would. Pins are looked up by selector and grants by (role, account).
+ */
+function chain(over: Partial<World> = {}): PublicClient {
+  const world: World = {
+    owner: CONTROLLER,
+    pendingOwner: zeroAddress,
+    registry: REGISTRY,
+    pins: new Map(LEGAL_BODY_GRANTED_SELECTORS.map((s) => [s.selector, LB_FACTORY])),
+    grants: LEGAL_BODY_GRANTED_SELECTORS.map((s) => [s.selector, EXECUTOR] as const),
+    ...over,
+  };
+  const granted = new Set(
+    world.grants.map(([selector, account]) => grantKey(selectorRole(selector), account)),
+  );
+  const readContract = async (call: {
+    address: Address;
+    functionName: string;
+    args?: readonly unknown[];
+  }) => {
+    if (world.down) throw world.down;
+    const args = call.args ?? [];
+    if (isAddressEqual(call.address, LB_FACTORY))
+      switch (call.functionName) {
+        case "owner":
+          return world.owner;
+        case "pendingOwner":
+          return world.pendingOwner;
+        case "identityRegistry":
+          return world.registry;
+      }
+    if (isAddressEqual(call.address, CONTROLLER))
+      switch (call.functionName) {
+        case "boundTarget":
+          return world.pins.get((args[0] as string).toLowerCase() as Hex) ?? zeroAddress;
+        case "hasRole":
+          return granted.has(grantKey(args[0] as string, args[1] as string));
+      }
+    throw new Error(`no ${call.functionName}() at ${call.address}`);
+  };
   return { readContract } as unknown as PublicClient;
 }
+
 const wiring = {
   factory: LB_FACTORY,
   controller: CONTROLLER,
@@ -78,45 +123,92 @@ const wiring = {
   executor: EXECUTOR,
 };
 
+/** The message the boot check refuses with. Fails if it does not refuse. */
+async function refusal(world: Partial<World>, p = wiring): Promise<string> {
+  try {
+    await assertLegalBodyFactoryWiring(chain(world), p);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  throw new Error("expected the boot check to refuse, but it passed");
+}
+
 test("a fully wired legal-body factory verifies clean", async () => {
-  await expect(assertLegalBodyFactoryWiring(client({}), wiring)).resolves.toBeUndefined();
+  await expect(assertLegalBodyFactoryWiring(chain(), wiring)).resolves.toBeUndefined();
 });
 
 test("a factory the controller does not own is refused, naming both env vars", async () => {
-  await expect(assertLegalBodyFactoryWiring(client({ owner: OTHER }), wiring)).rejects.toThrow(
+  expect(await refusal({ owner: OTHER })).toMatch(
     /LEGAL_BODY_FACTORY_ADDRESS.*owned by.*CONTROLLER_ADDRESS/s,
   );
 });
 
 test("a pending ownership handover is refused: the executor would lose its grants' target", async () => {
-  await expect(
-    assertLegalBodyFactoryWiring(client({ pendingOwner: OTHER }), wiring),
-  ).rejects.toThrow(/ownership handover.*pending/s);
-});
-
-test("a factory bound to another identity registry is refused", async () => {
-  await expect(assertLegalBodyFactoryWiring(client({ registry: OTHER }), wiring)).rejects.toThrow(
-    /identity registry.*IDENTITY_REGISTRY/s,
+  expect(await refusal({ pendingOwner: OTHER })).toMatch(
+    /ownership handover of LEGAL_BODY_FACTORY_ADDRESS.*pending/s,
   );
 });
 
-test("an unpinned or mis-pinned legal-body selector is refused and named", async () => {
-  await expect(
-    assertLegalBodyFactoryWiring(client({ pins: [LB_FACTORY, zeroAddress] }), wiring),
-  ).rejects.toThrow(/scheduleOperatingAgreementUpdate.*pinned/s);
-  await expect(
-    assertLegalBodyFactoryWiring(client({ pins: [OTHER, LB_FACTORY] }), wiring),
-  ).rejects.toThrow(/createLegalBody.*pinned/s);
+test("a factory bound to another identity registry is refused", async () => {
+  expect(await refusal({ registry: OTHER })).toMatch(
+    /LEGAL_BODY_FACTORY_ADDRESS.*identity registry.*IDENTITY_REGISTRY/s,
+  );
 });
 
-test("a missing executor grant is refused, naming the selector and the key", async () => {
+test("a pin set on only the first selector is refused, and the message names only the second", async () => {
+  const message = await refusal({ pins: new Map([[CREATE.selector, LB_FACTORY]]) });
+  expect(message).toMatch(/not pinned to LEGAL_BODY_FACTORY_ADDRESS/);
+  expect(message).toContain(SCHEDULE.name);
+  expect(message).not.toContain(CREATE.name);
+});
+
+test("a pin set on only the second selector is refused, and the message names only the first", async () => {
+  const message = await refusal({ pins: new Map([[SCHEDULE.selector, LB_FACTORY]]) });
+  expect(message).toMatch(/not pinned to LEGAL_BODY_FACTORY_ADDRESS/);
+  expect(message).toContain(CREATE.name);
+  expect(message).not.toContain(SCHEDULE.name);
+});
+
+test("a selector pinned to another contract is refused and named", async () => {
+  const message = await refusal({
+    pins: new Map([
+      [CREATE.selector, OTHER],
+      [SCHEDULE.selector, LB_FACTORY],
+    ]),
+  });
+  expect(message).toMatch(/not pinned to LEGAL_BODY_FACTORY_ADDRESS/);
+  expect(message).toContain(CREATE.name);
+  expect(message).not.toContain(SCHEDULE.name);
+});
+
+test("a missing executor grant is refused, naming only that selector and the key", async () => {
+  const message = await refusal({ grants: [[CREATE.selector, EXECUTOR]] });
+  expect(message).toMatch(/PLATFORM_PRIVATE_KEY.*is missing.*CONTROLLER_ADDRESS/s);
+  expect(message).toContain(SCHEDULE.name);
+  expect(message).not.toContain(CREATE.name);
+});
+
+test("grants held by another account are refused", async () => {
+  // Whoever else holds them (a stranger, the factory, the controller itself), the executor does
+  // not, and the executor is the account that sends the relayed calls.
+  for (const holder of [OTHER, LB_FACTORY, CONTROLLER]) {
+    const message = await refusal({
+      grants: LEGAL_BODY_GRANTED_SELECTORS.map((s) => [s.selector, holder] as const),
+    });
+    expect(message).toMatch(/PLATFORM_PRIVATE_KEY.*is missing/s);
+    expect(message).toContain(EXECUTOR);
+    expect(message).toContain(CREATE.name);
+    expect(message).toContain(SCHEDULE.name);
+  }
+});
+
+test("the grants are read for the configured executor, whichever account that is", async () => {
+  const grants = LEGAL_BODY_GRANTED_SELECTORS.map((s) => [s.selector, OTHER] as const);
   await expect(
-    assertLegalBodyFactoryWiring(client({ grants: [true, false] }), wiring),
-  ).rejects.toThrow(/PLATFORM_PRIVATE_KEY.*scheduleOperatingAgreementUpdate/s);
+    assertLegalBodyFactoryWiring(chain({ grants }), { ...wiring, executor: OTHER }),
+  ).resolves.toBeUndefined();
 });
 
 test("an RPC failure is reported as 'could not verify', never as misconfiguration", async () => {
-  await expect(
-    assertLegalBodyFactoryWiring(client({ throws: new Error("socket hang up") }), wiring),
-  ).rejects.toThrow(/could not verify/);
+  expect(await refusal({ down: new Error("socket hang up") })).toMatch(/could not verify/);
 });
