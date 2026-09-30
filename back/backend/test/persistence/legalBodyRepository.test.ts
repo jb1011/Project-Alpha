@@ -1,6 +1,9 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { beforeEach, expect, test } from "vitest";
-import { migrate } from "../../src/persistence/db";
+import { migrate, openDatabase } from "../../src/persistence/db";
 import {
   LIVE_BINDING_STATES,
   LegalBodyInputError,
@@ -844,4 +847,99 @@ test("findByBodyAddress finds a row whatever the casing it was stored in, as the
   expect(repo.findByBodyAddress(1, BODY_A)).toBeUndefined();
   expect(repo.findByBodyAddress(5042002, BODY_B)).toBeUndefined();
   expect(repo.findByBodyAddress(5042002, "nope" as `0x${string}`)).toBeUndefined();
+});
+
+// ── transaction(): a unit of several reads and writes ──
+
+test("transaction() holds the write lock from its first statement: a unit that reads, then moves, is not overtaken", () => {
+  // Two connections to one database file stand for two processes. With a lock taken only at the
+  // first WRITE, another writer could commit between this unit's read and its move, and the move
+  // would then fail at once: its snapshot is stale, and no wait can make it current again.
+  const dir = mkdtempSync(join(tmpdir(), "legal-body-tx-"));
+  const path = join(dir, "bodies.db");
+  const connections: Database.Database[] = [];
+  try {
+    const first = openDatabase(path);
+    connections.push(first);
+    migrate(first);
+    first
+      .prepare(
+        `INSERT INTO companies (company_id, tenant_id, status, provider, environment, name_options, business_purpose, industry_label)
+         VALUES ('co_1', ?, 'ready', 'customer', 'sandbox', '["Acme LLC"]', 'existing', 'existing')`,
+      )
+      .run(TENANT);
+    // The other writer does not wait for a lock: in one thread, nobody could release it meanwhile.
+    const second = new Database(path, { timeout: 0 });
+    connections.push(second);
+    const unit = new SqliteLegalBodyRepository(first);
+    const other = new SqliteLegalBodyRepository(second);
+    const deployed = (agentId: string, body: string) => {
+      const r = unit.create({
+        tenantId: TENANT,
+        companyId: "co_1",
+        chainId: 5042002,
+        factory: FACTORY,
+        amendmentDelay: 172800,
+      });
+      unit.freezeAgreement(r.legalBodyId, { hash: H("a"), version: 1 });
+      unit.reserve(r.legalBodyId, link(agentId, body));
+      unit.markDeployed(r.legalBodyId, { txHash: H("c"), deployedAt: 1_800_000_000 });
+      return r.legalBodyId;
+    };
+    const x = deployed("42", BODY_A);
+    const y = deployed("43", BODY_B);
+
+    let otherWriter = "did not run";
+    const result = unit.transaction(() => {
+      const seen = unit.findById(x)?.bindingState; // the unit reads first, to decide what to do
+      try {
+        other.scheduleBindingCheck(y, 1_000, 60_000); // another writer, in the middle of the unit
+        otherWriter = "committed";
+      } catch (e) {
+        otherWriter = (e as { code?: string }).code ?? String(e);
+      }
+      return [seen, unit.markLinked(x, 1_800_000_100)]; // then the unit moves
+    });
+    expect(result).toEqual(["deployed", true]);
+    // The other writer had to wait its turn, and takes it once the unit is done.
+    expect(otherWriter).toBe("SQLITE_BUSY");
+    expect(other.scheduleBindingCheck(y, 1_000, 60_000)).toBe(true);
+    expect(other.findById(x)?.bindingState).toBe("linked");
+  } finally {
+    for (const c of connections) c.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("nested transaction() calls are savepoints: an inner failure undoes the inner unit only", () => {
+  const id = toDeployed();
+  repo.transaction(() => {
+    expect(repo.markLinked(id, 1_800_000_100)).toBe(true);
+    expect(() =>
+      repo.transaction(() => {
+        repo.markBroken(id, { why: "undone below" });
+        throw new Error("inner unit failed");
+      }),
+    ).toThrow("inner unit failed");
+    expect(repo.findById(id)?.bindingState).toBe("linked");
+  });
+  expect(repo.findById(id)?.bindingState).toBe("linked");
+  expect(repo.listEvents(id).map((e) => e.kind)).toEqual([
+    "created",
+    "agreement_frozen",
+    "link_accepted",
+    "deployed",
+    "linked",
+  ]);
+  // An outer failure undoes everything inside it, nested units included.
+  expect(() =>
+    repo.transaction(() => {
+      repo.markBroken(id, { why: "undone below" });
+      repo.transaction(() => repo.scheduleBindingCheck(id, 1_000, 60_000));
+      throw new Error("outer unit failed");
+    }),
+  ).toThrow("outer unit failed");
+  expect(repo.findById(id)?.bindingState).toBe("linked");
+  expect(repo.findById(id)?.nextBindingCheckAt).toBeNull();
+  expect(db.inTransaction).toBe(false);
 });

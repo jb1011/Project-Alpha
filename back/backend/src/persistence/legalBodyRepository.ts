@@ -253,7 +253,12 @@ export interface LegalBodyRepository {
   ): void;
   /** Oldest first. */
   listEvents(legalBodyId: string): LegalBodyEvent[];
-  /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
+  /**
+   * Run fn inside a single SQLite transaction (atomic; rolls back if fn throws), which holds the
+   * write lock from its first statement. A unit that reads and then moves is therefore never
+   * overtaken by another process between the two: that process waits for its turn instead.
+   * Called inside another `transaction`, it is a savepoint of the outer one.
+   */
   transaction<T>(fn: () => T): T;
 }
 
@@ -882,7 +887,10 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
   }
 
   transaction<T>(fn: () => T): T {
-    return this.db.transaction(fn)();
+    // IMMEDIATE, not the default deferred: a deferred transaction takes the write lock at its
+    // first write, and if another connection has committed since this one's first READ, that
+    // write fails at once with a stale-snapshot error no busy timeout can wait out.
+    return this.db.transaction(fn).immediate();
   }
 
   /**
