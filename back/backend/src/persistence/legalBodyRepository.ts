@@ -498,13 +498,12 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       findLiveByAgentId: db.prepare(
         `SELECT * FROM legal_bodies WHERE chain_id = ? AND agent_id = ? AND ${LIVE_STATES_SQL}`,
       ),
-      // Compares the checksummed form the repository writes. The lower() term changes no answer
-      // (it is implied by the exact one); it is there so SQLite can look the address up through
-      // the unique index, which is built on lower(body_address).
+      // Compares the lower-case form, exactly as the unique index on (chain_id,
+      // lower(body_address)) does: the lookup and the index then agree on every row, whatever
+      // casing it was stored in, and SQLite answers the lookup through that index.
       findByBodyAddress: db.prepare(
         `SELECT * FROM legal_bodies
-          WHERE chain_id = @chain_id AND lower(body_address) = lower(@address)
-            AND body_address = @address`,
+          WHERE chain_id = @chain_id AND lower(body_address) = lower(@address)`,
       ),
       listByTenant: db.prepare(
         "SELECT * FROM legal_bodies WHERE tenant_id = ? ORDER BY created_at DESC, rowid DESC",

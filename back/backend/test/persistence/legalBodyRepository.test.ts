@@ -824,3 +824,24 @@ test("the redactor reads 0x and exactly nine decimal digits as SSN-shaped; longe
     asNumber: 0x123456789,
   });
 });
+
+test("findByBodyAddress finds a row whatever the casing it was stored in, as the unique index sees it", () => {
+  // The repository writes the checksummed form; another casing can only come from raw SQL. The
+  // index that makes the address unique compares its lower-case form, and so must the lookup:
+  // otherwise reserve would answer body_taken for an address the lookup says nobody holds.
+  const raw = newBody();
+  repo.freezeAgreement(raw.legalBodyId, { hash: H("a"), version: 1 });
+  db.prepare(
+    `UPDATE legal_bodies SET agent_id = '43', identity_owner = ?, link_digest = ?,
+       link_deadline = 1900000000, link_signature = '0x01', body_address = ?,
+       binding_state = 'reserved' WHERE legal_body_id = ?`,
+  ).run(OWNER, H("b"), BODY_A.toLowerCase(), raw.legalBodyId);
+  for (const spelling of [BODY_A, BODY_A.toLowerCase(), `0x${BODY_A.slice(2).toUpperCase()}`])
+    expect(repo.findByBodyAddress(5042002, spelling as `0x${string}`)?.legalBodyId, spelling).toBe(
+      raw.legalBodyId,
+    );
+  // Still per chain, and still nothing for another address or for a value that is not one.
+  expect(repo.findByBodyAddress(1, BODY_A)).toBeUndefined();
+  expect(repo.findByBodyAddress(5042002, BODY_B)).toBeUndefined();
+  expect(repo.findByBodyAddress(5042002, "nope" as `0x${string}`)).toBeUndefined();
+});
