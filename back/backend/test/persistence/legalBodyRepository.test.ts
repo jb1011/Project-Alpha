@@ -183,7 +183,7 @@ test("binding checks: schedule and due listing", () => {
   expect(repo.listBindingDue(9_000, 10).map((r) => r.legalBodyId)).toEqual([b]);
 });
 
-test("test_recordEvent_redactsPii", () => {
+test("recordEvent redacts an SSN-shaped number out of the detail", () => {
   const r = newBody();
   repo.recordEvent(r.legalBodyId, "note", "operator:alice", null, { text: "SSN 123-45-6789" });
   const ev = repo.listEvents(r.legalBodyId).at(-1);
@@ -768,4 +768,59 @@ test("listBindingDue takes a time of zero or more and a limit of one or more, an
   expect(repo.listBindingDue(1_000, 10).map((r) => r.legalBodyId)).toEqual([a, b].sort());
   expect(repo.listBindingDue(999, 10)).toEqual([]);
   expect(repo.listBindingDue(1_000, 1).map((r) => r.legalBodyId)).toEqual([[a, b].sort()[0]]);
+});
+
+// ── Event detail written by chain code ──
+
+test("a bigint in event detail is stored as a number when it is exact, and refused when it is not", () => {
+  // Chain libraries return block numbers as bigint.
+  const r = newBody();
+  repo.recordEvent(r.legalBodyId, "note", "system", null, {
+    observedAtBlock: 123_456_789n,
+    nested: { list: [1n, -2n, 0n] },
+    largest: BigInt(Number.MAX_SAFE_INTEGER),
+  });
+  expect(storedDetail(r.legalBodyId)).toBe(
+    `{"observedAtBlock":123456789,"nested":{"list":[1,-2,0]},"largest":${Number.MAX_SAFE_INTEGER}}`,
+  );
+  expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toEqual({
+    observedAtBlock: 123456789,
+    nested: { list: [1, -2, 0] },
+    largest: Number.MAX_SAFE_INTEGER,
+  });
+  const events = repo.listEvents(r.legalBodyId);
+  for (const unsafe of [2n ** 53n, -(2n ** 53n), 2n ** 256n - 1n])
+    expect(
+      () => repo.recordEvent(r.legalBodyId, "note", "system", null, { nested: [{ wei: unsafe }] }),
+      String(unsafe),
+    ).toThrow(LegalBodyInputError);
+  expect(repo.listEvents(r.legalBodyId)).toEqual(events);
+});
+
+test("a move whose detail cannot be stored is rolled back together with its event", () => {
+  const id = toDeployed();
+  expect(repo.markLinked(id, 1_800_000_100)).toBe(true);
+  const before = { row: repo.findById(id), events: repo.listEvents(id) };
+  expect(() => repo.markBroken(id, { observedAtBlock: 2n ** 60n })).toThrow(LegalBodyInputError);
+  expect(repo.findById(id)).toEqual(before.row);
+  expect(repo.listEvents(id)).toEqual(before.events);
+  // The same move with a block number that is exact goes through.
+  expect(repo.markBroken(id, { observedAtBlock: 100_000_001n })).toBe(true);
+  expect(repo.listEvents(id).at(-1)?.detail).toEqual({ observedAtBlock: 100000001 });
+});
+
+test("the redactor reads 0x and exactly nine decimal digits as SSN-shaped; longer hex is untouched", () => {
+  const r = newBody();
+  repo.recordEvent(r.legalBodyId, "note", "system", null, {
+    shortHex: "0x123456789",
+    hash: H("1"),
+    address: BODY_A,
+    asNumber: 0x123456789,
+  });
+  expect(repo.listEvents(r.legalBodyId).at(-1)?.detail).toEqual({
+    shortHex: "0x[redacted]",
+    hash: H("1"),
+    address: BODY_A,
+    asNumber: 0x123456789,
+  });
 });

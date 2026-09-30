@@ -99,7 +99,8 @@ export interface LegalBodyEvent {
   kind: LegalBodyEventKind;
   actor: LegalBodyActor;
   txHash: Hex | null;
-  /** The recorded detail, its strings PII-redacted at the write (see `recordEvent`). */
+  /** The recorded detail. SSN-shaped numbers in its strings were redacted at the write, and
+   *  nothing else was (see `recordEvent`). */
   detail: unknown;
   createdAt: string;
 }
@@ -228,10 +229,20 @@ export interface LegalBodyRepository {
    */
   listBindingDue(now: number, limit: number): LegalBodyRecord[];
   /**
-   * Append one event. Every string in `detail` (values and keys, at any depth) is PII-redacted
-   * before it is written; numbers, booleans and null are stored exactly. So numeric facts
-   * (nonces, block numbers, amounts, timestamps) must be written as JSON numbers: a nine-digit
-   * value written as a STRING is SSN-shaped to the redactor, and is redacted.
+   * Append one event.
+   *
+   * EVENT DETAIL MUST NOT CARRY PERSONAL DATA. The log is append-only and has no erasure path: a
+   * name, an email address, a date of birth or a provider's error text that quotes one would stay
+   * for good. The only safety net is narrow: SSN-shaped numbers are redacted from every string in
+   * `detail` (values and keys, at any depth) before it is written. Nothing else is recognised or
+   * removed, so keep detail to ids, hashes, addresses, numbers and wording of our own.
+   *
+   * Numbers, booleans and null are stored exactly, so numeric facts (nonces, block numbers,
+   * amounts, timestamps) must be written as numbers: a nine-digit value written as a STRING is
+   * SSN-shaped to the redactor, and is redacted. So is the string `0x` followed by exactly nine
+   * decimal digits; hashes, addresses and raw transactions are left alone. A `bigint` is stored as
+   * a number when it is within the safe integer range, and throws a `LegalBodyInputError` when it
+   * is not (nothing is written, and a move that was being recorded is rolled back with it).
    */
   recordEvent(
     legalBodyId: string,
@@ -313,8 +324,8 @@ function toRecord(r: Row): LegalBodyRecord {
 }
 
 /**
- * Every string in a JSON tree, values and keys alike, through the PII redactor; numbers,
- * booleans and null untouched.
+ * Every string in a JSON tree, values and keys alike, through the redactor of SSN-shaped numbers;
+ * numbers, booleans and null untouched.
  *
  * Redacting the serialized blob instead would treat a nine-digit NUMBER as an SSN, since the
  * redactor sees digits, not types. It would turn `{"nonce":123456789}` into `{"nonce":[redacted]}`,
@@ -332,12 +343,30 @@ function redactStrings(value: unknown): unknown {
 }
 
 /**
- * The detail as it is stored. First it becomes plain JSON data, exactly what `JSON.stringify`
- * makes of it: a Date becomes its ISO string and an undefined field is dropped. Then its strings
- * are redacted. The result is always valid JSON.
+ * A bigint as the JSON number it stands for. Chain libraries return block numbers, nonces and
+ * timestamps as bigint, and `JSON.stringify` refuses the type outright. Outside the safe integer
+ * range a number would be silently rounded, so that is refused instead.
+ */
+function exactNumber(value: bigint): number {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER))
+    throw new LegalBodyInputError(
+      "event detail holds a bigint outside the safe integer range, which a JSON number cannot hold exactly",
+    );
+  return Number(value);
+}
+
+/**
+ * The detail as it is stored. First it becomes plain JSON data, what `JSON.stringify` makes of
+ * it: a Date becomes its ISO string, an undefined field is dropped, and a bigint becomes a number
+ * (see `exactNumber`). Then its strings are redacted. The result is always valid JSON.
  */
 function serializeDetail(detail: Record<string, unknown>): string {
-  return JSON.stringify(redactStrings(JSON.parse(JSON.stringify(detail))));
+  const plain: unknown = JSON.parse(
+    JSON.stringify(detail, (_key, value: unknown) =>
+      typeof value === "bigint" ? exactNumber(value) : value,
+    ),
+  );
+  return JSON.stringify(redactStrings(plain));
 }
 
 /**
@@ -827,9 +856,10 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     txHash: Hex | null,
     detail: Record<string, unknown> | null,
   ): void {
-    // Redacted at the write, the rule the entity event log follows, so no producer has to
-    // remember: detail may one day carry a provider's error text or a customer's words, and an
-    // SSN that reached this append-only table could never be taken out again. The redactor
+    // SSN-shaped numbers are redacted at the write, the rule the entity event log follows, so no
+    // producer has to remember: an SSN that reached this append-only table could never be taken
+    // out again. That is all the redactor removes. The rule that keeps every other kind of
+    // personal data out is the one on the interface: detail must not carry any. The redactor
     // leaves hashes and addresses alone, and only strings are given to it (see redactStrings).
     this.stmts.insertEvent.run(
       legalBodyId,
