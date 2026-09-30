@@ -732,6 +732,81 @@ test("scheduleBindingCheck says whether it scheduled a row: never a draft, an ab
   ]);
 });
 
+/** A distinct placeholder body address per index. */
+const bodyN = (i: number) => `0x${i.toString(16).padStart(40, "0")}`;
+/** A schedule written straight into the columns, which the table allows in every state. */
+const scheduleRaw = (id: string) =>
+  db
+    .prepare(
+      "UPDATE legal_bodies SET next_binding_check_at = 1000, binding_check_interval_ms = 60000 WHERE legal_body_id = ?",
+    )
+    .run(id);
+/** One body in each state, reached through the repository. */
+function bodyInEachState(): Record<string, string> {
+  const draft = newBody().legalBodyId;
+  const abandoned = newBody().legalBodyId;
+  repo.abandon(abandoned, "never signed");
+  const reserved = toReserved("101", bodyN(0x101));
+  const lapsed = toReserved("102", bodyN(0x102));
+  repo.lapse(lapsed, "deadline passed");
+  const deployed = toDeployed("103", bodyN(0x103));
+  const linked = toDeployed("104", bodyN(0x104));
+  repo.markLinked(linked, 1_800_000_100);
+  const broken = toDeployed("105", bodyN(0x105));
+  repo.markLinked(broken, 1_800_000_100);
+  repo.markBroken(broken, { why: "pointer cleared" });
+  const superseded = toDeployed("106", bodyN(0x106));
+  repo.supersede(superseded, "lb_other");
+  const bodies = { draft, abandoned, reserved, lapsed, deployed, linked, broken, superseded };
+  for (const [state, id] of Object.entries(bodies))
+    expect(repo.findById(id)?.bindingState, state).toBe(state);
+  return bodies;
+}
+
+test("a row scheduled while reserved leaves the schedule when it lapses", () => {
+  const id = toReserved();
+  expect(repo.scheduleBindingCheck(id, 1_000, 60_000)).toBe(true);
+  expect(repo.listBindingDue(9_000, 10).map((r) => r.legalBodyId)).toEqual([id]);
+  expect(repo.lapse(id, "deadline passed")).toBe(true);
+  // The lapse itself cleared the schedule: nobody has to remember to do it first.
+  expect(scheduleOf(id)).toEqual([null, null]);
+  expect(repo.listBindingDue(9_000, 10)).toEqual([]);
+  // And a lapsed row takes no new schedule.
+  expect(repo.scheduleBindingCheck(id, 1_000, 60_000)).toBe(false);
+  expect(scheduleOf(id)).toEqual([null, null]);
+  // A lapse that did not happen clears nothing.
+  const deployed = toDeployed("43", BODY_B);
+  expect(repo.scheduleBindingCheck(deployed, 1_000, 60_000)).toBe(true);
+  expect(repo.lapse(deployed, "not reserved any more")).toBe(false);
+  expect(scheduleOf(deployed)).toEqual([1_000, 60_000]);
+});
+
+test("scheduleBindingCheck takes a row off the schedule in every state, and says whether there was a row", () => {
+  const bodies = bodyInEachState();
+  for (const [state, id] of Object.entries(bodies)) {
+    scheduleRaw(id);
+    expect(scheduleOf(id), state).toEqual([1_000, 60_000]);
+    const events = repo.listEvents(id);
+    expect(repo.scheduleBindingCheck(id, null, null), state).toBe(true);
+    expect(scheduleOf(id), state).toEqual([null, null]);
+    expect(repo.findById(id)?.bindingState, state).toBe(state);
+    expect(repo.listEvents(id), state).toEqual(events);
+    // A row that is already off the schedule is still a row.
+    expect(repo.scheduleBindingCheck(id, null, null), state).toBe(true);
+  }
+  expect(repo.scheduleBindingCheck("lb_unknown", null, null)).toBe(false);
+  expect(repo.listBindingDue(9_000, 10)).toEqual([]);
+});
+
+test("listBindingDue never lists a draft, an abandoned or a lapsed row, whatever its schedule columns hold", () => {
+  const bodies = bodyInEachState();
+  for (const id of Object.values(bodies)) scheduleRaw(id);
+  const listed = repo.listBindingDue(9_000, 10).map((r) => r.bindingState);
+  expect(listed.sort()).toEqual(["broken", "deployed", "linked", "reserved", "superseded"]);
+  // The limit counts the rows that are listed, not the ones that are skipped.
+  expect(repo.listBindingDue(9_000, 5)).toHaveLength(5);
+});
+
 test("listBindingDue takes a time of zero or more and a limit of one or more, and nothing else", () => {
   const a = toDeployed("42", BODY_A);
   const b = toDeployed("43", BODY_B);

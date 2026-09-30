@@ -185,6 +185,11 @@ export interface LegalBodyRepository {
    * writing, for a malformed hash or a time that is not in seconds.
    */
   markDeployed(legalBodyId: string, d: { txHash: Hex; deployedAt: number }): boolean;
+  /**
+   * `reserved` → `lapsed`: the reservation is closed without a deploy, and no longer holds its
+   * agentId. The same write clears the row's check schedule, so no caller has to take it off
+   * first.
+   */
   lapse(legalBodyId: string, reason: string): boolean;
   /**
    * Close a `draft` for good: `draft` → `abandoned`, frozen agreement or not. A draft's company,
@@ -215,10 +220,9 @@ export interface LegalBodyRepository {
    * (one or more), or null with null to take the row off the schedule. Anything else, a NaN out
    * of a caller's arithmetic included, throws a `LegalBodyInputError`.
    *
-   * Answers whether a row was updated. A `draft`, an `abandoned` and a `lapsed` row are never
-   * updated, and nor is an unknown id: there is nothing on chain to check for them. So a row is
-   * taken off the schedule BEFORE it lapses; once it has lapsed, its schedule no longer changes.
-   * Not a state change, so no event.
+   * Answers whether a row was updated. Setting a time never updates a `draft`, an `abandoned` or
+   * a `lapsed` row: there is nothing on chain to check for them. Taking a row off the schedule
+   * works in every state. An unknown id is never updated. Not a state change, so no event.
    */
   scheduleBindingCheck(
     legalBodyId: string,
@@ -227,8 +231,9 @@ export interface LegalBodyRepository {
   ): boolean;
   /**
    * Rows whose next binding check is due at `now` (unix MILLISECONDS, zero or more), soonest
-   * first, at most `limit` (one or more) of them. Throws a `LegalBodyInputError` for anything
-   * else: to SQLite a negative limit means no limit at all.
+   * first, at most `limit` (one or more) of them. Never a `draft`, an `abandoned` or a `lapsed`
+   * row, whatever its schedule columns hold. Throws a `LegalBodyInputError` for anything else: to
+   * SQLite a negative limit means no limit at all.
    */
   listBindingDue(now: number, limit: number): LegalBodyRecord[];
   /**
@@ -481,6 +486,12 @@ function canonicalAgentId(value: string): string | null {
 const LIVE_STATES_SQL = `binding_state IN (${LIVE_BINDING_STATES.map((s) => `'${s}'`).join(",")})`;
 
 /**
+ * The states a binding check applies to: every state but `draft`, `abandoned` and `lapsed`, which
+ * have nothing on chain to check. Setting a check and listing the due ones both filter on it.
+ */
+const CHECKED_STATES_SQL = "binding_state NOT IN ('draft','abandoned','lapsed')";
+
+/**
  * How SQLite names each unique index in its violation message, which is how a lost race is told
  * apart. A column index is named by its columns; an EXPRESSION index, like the body-address one
  * on `lower(body_address)`, is named only by its index name. The schema tests pin both messages.
@@ -550,8 +561,11 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
                 updated_at = CURRENT_TIMESTAMP
           WHERE legal_body_id = ? AND binding_state = 'reserved'`,
       ),
+      // A lapsed row is never on the check schedule, so the lapse clears it in the same write.
       lapse: db.prepare(
-        `UPDATE legal_bodies SET binding_state = 'lapsed', updated_at = CURRENT_TIMESTAMP
+        `UPDATE legal_bodies
+            SET binding_state = 'lapsed', next_binding_check_at = NULL,
+                binding_check_interval_ms = NULL, updated_at = CURRENT_TIMESTAMP
           WHERE legal_body_id = ? AND binding_state = 'reserved'`,
       ),
       abandon: db.prepare(
@@ -573,11 +587,17 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       ),
       scheduleBindingCheck: db.prepare(
         `UPDATE legal_bodies SET next_binding_check_at = ?, binding_check_interval_ms = ?
-          WHERE legal_body_id = ? AND binding_state NOT IN ('draft','abandoned','lapsed')`,
+          WHERE legal_body_id = ? AND ${CHECKED_STATES_SQL}`,
+      ),
+      // Taking a row off the schedule is allowed in every state.
+      clearBindingCheck: db.prepare(
+        `UPDATE legal_bodies SET next_binding_check_at = NULL, binding_check_interval_ms = NULL
+          WHERE legal_body_id = ?`,
       ),
       listBindingDue: db.prepare(
         `SELECT * FROM legal_bodies
           WHERE next_binding_check_at IS NOT NULL AND next_binding_check_at <= ?
+            AND ${CHECKED_STATES_SQL}
           ORDER BY next_binding_check_at, legal_body_id LIMIT ?`,
       ),
       insertEvent: db.prepare(
@@ -844,7 +864,10 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       throw new LegalBodyInputError(
         `a binding check is a time in unix milliseconds (zero or more) with an interval in milliseconds (one or more), or null with null; got ${String(nextAt)}, ${String(intervalMs)}`,
       );
-    return this.stmts.scheduleBindingCheck.run(nextAt, intervalMs, legalBodyId).changes === 1;
+    const { changes } = cleared
+      ? this.stmts.clearBindingCheck.run(legalBodyId)
+      : this.stmts.scheduleBindingCheck.run(nextAt, intervalMs, legalBodyId);
+    return changes === 1;
   }
 
   listBindingDue(now: number, limit: number): LegalBodyRecord[] {
