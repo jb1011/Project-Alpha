@@ -143,6 +143,7 @@ test("the binding transitions are compare-and-set", () => {
   expect(repo.markLinked(id, 1_800_000_100)).toBe(true);
   expect(repo.markLinked(id, 1_800_000_200)).toBe(false); // already linked
   expect(repo.markBroken(id, { why: "pointer cleared" })).toBe(true);
+  expect(repo.findById(id)?.pointerSeenAt).toBe(1_800_000_100); // a broken row keeps its sighting
   expect(repo.markLinked(id, 1_800_000_300)).toBe(true); // re-pointed
   expect(repo.findById(id)?.pointerSeenAt).toBe(1_800_000_300);
   expect(repo.listEvents(id).map((e) => e.kind)).toEqual([
@@ -307,8 +308,11 @@ test("markLinked answers false, and records nothing, when another body holds the
   expect(repo.findById(old)?.bindingState).toBe("broken");
   expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_100);
   expect(repo.listEvents(old)).toEqual(eventsBefore);
-  // Only that collision is an answer: any other refusal still throws.
-  expect(() => repo.markLinked(old, 1.5)).toThrow(/CHECK/);
+  // Only that collision is an answer: any other refusal of the write still throws.
+  db.exec(`CREATE TEMP TRIGGER refuse_every_update BEFORE UPDATE ON legal_bodies
+    BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;`);
+  expect(() => repo.markLinked(old, 1_800_000_200)).toThrow("refused by the test");
+  expect(repo.listEvents(old)).toEqual(eventsBefore);
 });
 
 test("a deploy re-sent while reserved keeps every submission; the landed hash is then locked", () => {
@@ -463,8 +467,18 @@ test("reserve throws a LegalBodyInputError for a malformed link, and writes noth
     ["deadline in milliseconds", { linkDeadline: 1_900_000_000_000 }],
     ["deadline 1e20", { linkDeadline: 1e20 }],
     ["agentId not decimal", { agentId: "0x2a" }],
+    // A string only: a JavaScript number cannot hold every uint256 exactly.
+    ["agentId as a number", { agentId: 42 }],
+    ["agentId as a number past 2^53", { agentId: 2 ** 60 }],
+    ["agentId as a bigint", { agentId: 42n }],
+    ["agentId missing", { agentId: undefined }],
+    ["agentId null", { agentId: null }],
     ["identity owner not an address", { identityOwner: "0x123" }],
     ["body not an address", { bodyAddress: "nope" }],
+    ["body is the zero address", { bodyAddress: `0x${"0".repeat(40)}` }],
+    ["body is the factory", { bodyAddress: FACTORY }],
+    ["body is the factory in lower case", { bodyAddress: FACTORY.toLowerCase() }],
+    ["body is the factory in upper case", { bodyAddress: `0x${FACTORY.slice(2).toUpperCase()}` }],
   ] as const)
     expect(() => repo.reserve(r.legalBodyId, as({ ...link(), ...over })), label).toThrow(
       LegalBodyInputError,
@@ -613,6 +627,7 @@ test("a superseded body can be linked again: the chain, not this table, decides 
   expect(repo.markBroken(old, { why: "pointer cleared" })).toBe(true);
   const newer = toDeployed("43", BODY_B);
   expect(repo.supersede(old, newer)).toBe(true);
+  expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_100); // kept while set aside
   expect(repo.findLiveByAgentId(5042002, "42")).toBeUndefined();
   // The agentId is free, so the cached state follows the chain.
   expect(repo.markLinked(old, 1_800_000_200)).toBe(true);
@@ -1019,26 +1034,62 @@ test("nested transaction() calls are savepoints: an inner failure undoes the inn
   expect(db.inTransaction).toBe(false);
 });
 
-test("a value only the table refuses throws its CHECK failure, and nothing is written", () => {
-  // The repository checks the shape of each value; two rules compare a value with the row itself
-  // or with the clock's unit, and the table is what enforces them.
+test("reserve refuses the factory as a body address whatever the row's state, and only that row's factory", () => {
+  // The factory is a fact of the row, so this is checked once the row is read.
+  const reserved = toReserved("42", BODY_A);
+  const before = { row: repo.findById(reserved), events: repo.listEvents(reserved) };
+  expect(() => repo.reserve(reserved, link("43", FACTORY))).toThrow(LegalBodyInputError);
+  expect(repo.findById(reserved)).toEqual(before.row);
+  expect(repo.listEvents(reserved)).toEqual(before.events);
+  // No row, no factory to compare with: the answer is the one for an unknown body.
+  expect(repo.reserve("lb_unknown", link("43", FACTORY))).toBe("not_draft");
+  // The comparison ignores casing, as the table's does. The repository stores the checksummed
+  // form, so a factory in another casing can only come from raw SQL.
+  const rawId = `lb_${"f".padStart(36, "0")}`;
+  const otherCasing = `0x${FACTORY.slice(2).toUpperCase()}`;
+  db.prepare(
+    `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+     VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+  ).run(rawId, "f".padStart(36, "0"), TENANT, otherCasing, TENANT);
+  expect(() => repo.reserve(rawId, link("43", FACTORY))).toThrow(LegalBodyInputError);
+  // Another address in the place of the factory is an ordinary body address.
   const r = newBody();
   repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version: 1 });
-  const before = { row: repo.findById(r.legalBodyId), events: repo.listEvents(r.legalBodyId) };
-  for (const bodyAddress of [`0x${"0".repeat(40)}`, FACTORY, FACTORY.toLowerCase()])
-    expect(
-      () => repo.reserve(r.legalBodyId, link("42", bodyAddress)),
-      `body ${bodyAddress}`,
-    ).toThrow(/CHECK/);
-  expect(repo.findById(r.legalBodyId)).toEqual(before.row);
-  expect(repo.listEvents(r.legalBodyId)).toEqual(before.events);
+  expect(repo.reserve(r.legalBodyId, link("43", OTHER_TENANT))).toBe("reserved");
+});
 
+test("markLinked throws a LegalBodyInputError for a sighting that is not a time in seconds, and writes nothing", () => {
   const id = toDeployed("43", BODY_B);
-  const deployed = { row: repo.findById(id), events: repo.listEvents(id) };
-  for (const seenAt of [0, 1.5, 1_800_000_100_000])
-    expect(() => repo.markLinked(id, seenAt), `seenAt ${seenAt}`).toThrow(/CHECK/);
-  expect(repo.findById(id)).toEqual(deployed.row);
-  expect(repo.listEvents(id)).toEqual(deployed.events);
+  const before = { row: repo.findById(id), events: repo.listEvents(id) };
+  for (const seenAt of [
+    0,
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    100_000_000_000,
+    1_800_000_100_000, // a time in milliseconds
+    2 ** 60,
+    "1800000100",
+    1_800_000_100n,
+    null,
+    undefined,
+  ]) {
+    expect(() => repo.markLinked(id, as(seenAt)), `seenAt ${String(seenAt)}`).toThrow(
+      LegalBodyInputError,
+    );
+    // A caller bug is reported even when the row could not have moved anyway.
+    expect(() => repo.markLinked("lb_unknown", as(seenAt)), `seenAt ${String(seenAt)}`).toThrow(
+      LegalBodyInputError,
+    );
+  }
+  expect(repo.findById(id)).toEqual(before.row);
+  expect(repo.listEvents(id)).toEqual(before.events);
+  // Both ends of the range are times in seconds.
+  expect(repo.markLinked(id, 1)).toBe(true);
+  expect(repo.markBroken(id, { why: "pointer cleared" })).toBe(true);
+  expect(repo.markLinked(id, 99_999_999_999)).toBe(true);
+  expect(repo.findById(id)?.pointerSeenAt).toBe(99_999_999_999);
 });
 
 test("every lookup the repository runs on a hot path is answered through an index", () => {

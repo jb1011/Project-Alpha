@@ -153,11 +153,12 @@ export interface LegalBodyRepository {
    * `body_taken` when another row already recorded the body address, in any casing.
    *
    * Throws a `LegalBodyInputError`, before anything is written and whatever the body's state, for
-   * input no row may hold: an agentId that is not a uint256 in decimal, an owner or a body that
-   * is not an address, a digest that is not a 32-byte hash, a signature that is not one or more
-   * whole bytes of hex, or a deadline that is not a whole number of unix SECONDS. The digest and
-   * the signature are stored lower-case. A body address the table refuses (the zero address, the
-   * factory itself) surfaces as the table's own CHECK failure.
+   * input no row may hold: an agentId that is not a STRING holding a uint256 in decimal (a number
+   * or a bigint is refused, because a JavaScript number cannot hold every uint256), an owner or a
+   * body that is not an address, a body that is the zero address or the factory of this row, a
+   * digest that is not a 32-byte hash, a signature that is not one or more whole bytes of hex, or
+   * a deadline that is not a whole number of unix SECONDS. The digest and the signature are
+   * stored lower-case.
    */
   reserve(
     legalBodyId: string,
@@ -203,8 +204,8 @@ export interface LegalBodyRepository {
    * live states, so a new reservation can take the agentId in the meantime, and linking this body
    * again would make two live bodies for one identity. The caller must resolve that collision;
    * which body keeps the agentId is the binding sweeper's policy, not this repository's. Nothing
-   * is recorded either way. `seenAt` is in unix SECONDS; a value the table refuses (a fraction, a
-   * time in milliseconds) throws the table's own CHECK failure, and nothing is written.
+   * is recorded either way. `seenAt` is a whole number of unix SECONDS; anything else (a
+   * fraction, a time in milliseconds) throws a `LegalBodyInputError` before anything is written.
    */
   markLinked(legalBodyId: string, seenAt: number): boolean;
   markBroken(legalBodyId: string, detail: Record<string, unknown>): boolean;
@@ -469,6 +470,8 @@ function isIntegerWithin(value: unknown, min: number, max: number): value is num
 
 const UINT256_MAX = 2n ** 256n - 1n;
 
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
 /**
  * An agentId in the one spelling rows store it: a uint256 in decimal without leading zeros.
  *
@@ -714,6 +717,12 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       bodyAddress: Address;
     },
   ): ReserveOutcome {
+    // A string only. A number would be read as its decimal spelling, and past 2^53 that spelling
+    // is no longer the id the caller meant; so the type is refused, not the range.
+    if (typeof l.agentId !== "string")
+      throw new LegalBodyInputError(
+        `agentId must be a string holding a uint256 in decimal, got a ${typeof l.agentId}`,
+      );
     const agentId = canonicalAgentId(l.agentId);
     if (agentId === null)
       throw new LegalBodyInputError(
@@ -721,11 +730,16 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       );
     const identityOwner = requireAddress("identityOwner", l.identityOwner);
     const bodyAddress = requireAddress("bodyAddress", l.bodyAddress);
+    if (bodyAddress.toLowerCase() === ZERO_ADDRESS)
+      throw new LegalBodyInputError("bodyAddress must not be the zero address");
     const linkDigest = requireHash("linkDigest", l.linkDigest);
     const linkSignature = requireBytes("linkSignature", l.linkSignature);
     const linkDeadline = requireSeconds("linkDeadline", l.linkDeadline);
 
     const row = this.stmts.findById.get(legalBodyId) as Row | undefined;
+    // The factory is a fact of the row, so this one refusal waits for the row to be read.
+    if (row && row.factory.toLowerCase() === bodyAddress.toLowerCase())
+      throw new LegalBodyInputError("bodyAddress must not be the factory that creates the body");
     if (!row || row.binding_state !== "draft") return "not_draft";
     if (row.oa_manifest_hash === null) return "not_frozen";
 
@@ -808,15 +822,16 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
   }
 
   markLinked(legalBodyId: string, seenAt: number): boolean {
+    const at = requireSeconds("seenAt", seenAt);
     try {
       // `seenAt` goes into the event too: the column is overwritten by every re-link, the log
       // keeps each sighting.
       return this.move(
         legalBodyId,
-        () => this.stmts.markLinked.run(seenAt, legalBodyId),
+        () => this.stmts.markLinked.run(at, legalBodyId),
         "linked",
         null,
-        { seenAt },
+        { seenAt: at },
       );
     } catch (e) {
       // The one refusal that is an answer: another body holds this agentId live (the partial
