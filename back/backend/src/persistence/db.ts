@@ -279,8 +279,9 @@ const sqlIsSeconds = (column: string) =>
  * and DELETE statements from anyone else. They are not a defence against someone with direct
  * write access to the database file.
  *
- * A database that already ran this DDL takes an edit to it only through its version: see
- * `LEGAL_BODIES_SCHEMA_VERSION`, which is raised with every edit to this constant.
+ * A database that already ran this DDL takes an edit to it through `applyLegalBodySchema`, which
+ * goes by the schema version: see `LEGAL_BODIES_SCHEMA_VERSION`, which is raised with every edit
+ * to this constant.
  *
  * `create_tx_hash` is deliberately NOT write-once while the row is `reserved`: a deploy whose
  * first transaction never lands is re-sent with a new nonce, and so a new hash. Every submission
@@ -465,8 +466,10 @@ export const LEGAL_BODIES_DDL = `
  * Every statement of the DDL is `IF NOT EXISTS`, so on its own an edit would reach new databases
  * only: a database that already ran the old text would keep its old trigger, index or CHECK, and
  * every test, which starts from a fresh database, would still pass. The version is what carries an
- * edit to the databases that exist (see `applyLegalBodySchema`). A test pins the DDL text to the
- * version, so an edit without a bump fails the suite.
+ * edit to the databases that exist (see `applyLegalBodySchema`). Without a bump, a database at
+ * this version refuses to start when the definition of a table or an index changed, and takes a
+ * changed trigger for one that was altered by hand. A test pins the DDL text to the version, so an
+ * edit without a bump fails the suite.
  *
  * TO CHANGE THIS SCHEMA LATER:
  *  - Edit the DDL, raise this number by one, and add the hash of the new text to the pin in the

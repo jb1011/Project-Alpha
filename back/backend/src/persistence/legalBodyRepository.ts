@@ -232,9 +232,9 @@ export interface LegalBodyRepository {
   ): boolean;
   /**
    * Rows whose next binding check is due at `now` (unix MILLISECONDS, zero or more), soonest
-   * first, at most `limit` (one or more) of them. Never a `draft`, an `abandoned` or a `lapsed`
-   * row, whatever its schedule columns hold. Throws a `LegalBodyInputError` for anything else: to
-   * SQLite a negative limit means no limit at all.
+   * first, at most `limit` (one or more) of them. Any other `now` or `limit` throws a
+   * `LegalBodyInputError`: to SQLite a negative limit means no limit at all. A `draft`, an
+   * `abandoned` or a `lapsed` row is never listed, whatever its schedule columns hold.
    */
   listBindingDue(now: number, limit: number): LegalBodyRecord[];
   /**
