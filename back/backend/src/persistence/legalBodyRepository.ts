@@ -66,21 +66,29 @@ export interface LegalBodyRecord {
   guardian: Address;
   /** Seconds, within the factory's bounds (48 hours .. 30 days). */
   amendmentDelay: number;
+  /** Hashes are stored lower-case: this one, the link digest and the deploy hash. */
   oaManifestHash: Hex | null;
+  /** 1 or more; set together with the hash. */
   oaManifestVersion: number | null;
   /** The ERC-8004 agentId, a uint256 in canonical decimal. */
   agentId: string | null;
   identityOwner: Address | null;
   linkDigest: Hex | null;
+  /** Unix seconds. */
   linkDeadline: number | null;
   linkSignature: Hex | null;
   bodyAddress: Address | null;
   createTxHash: Hex | null;
+  /** Unix seconds: the time of the block that created the body. */
   deployedAt: number | null;
   bindingState: BindingState;
+  /** Unix seconds: the first sighting of the pointer in the current linked stretch. */
   pointerSeenAt: number | null;
+  /** Unix MILLISECONDS, unlike the chain times above: the process clock schedules the checks. */
   nextBindingCheckAt: number | null;
+  /** Milliseconds. */
   bindingCheckIntervalMs: number | null;
+  /** UTC, `YYYY-MM-DD HH:MM:SS`, like `updatedAt`. */
   createdAt: string;
   updatedAt: string;
 }
@@ -100,9 +108,11 @@ export type ReserveOutcome = "reserved" | "agent_taken" | "body_taken" | "not_dr
 
 export interface LegalBodyRepository {
   /**
-   * A new `draft`, guarded by its tenant, with its `created` event, in one write. Throws for an
-   * amendment delay that is not a whole number of seconds, and (the database's own refusal) for
-   * a company that belongs to another tenant.
+   * A new `draft`, guarded by its tenant, with its `created` event, in one write. Throws a
+   * `LegalBodyInputError`, before writing, for an amendment delay that is not a whole number of
+   * seconds, a chain id that is not a positive whole number, or a tenant or factory that is not
+   * an address. Throws the database's own refusal for a delay outside the contract's bounds and
+   * for a company that is missing or belongs to another tenant.
    */
   create(p: {
     tenantId: Address;
@@ -125,17 +135,26 @@ export interface LegalBodyRepository {
   listByTenant(tenantId: string): LegalBodyRecord[];
   /** Newest first. */
   listByCompany(companyId: string): LegalBodyRecord[];
-  /** Freeze the operating agreement: once, and only while `draft`. Throws for a version that is
-   *  not a whole number. */
+  /**
+   * Freeze the operating agreement: once, and only while `draft`. The hash is a 32-byte hash,
+   * stored lower-case; the version a whole number, 1 or more. False, with nothing written and
+   * nothing logged, when the body is not an unfrozen draft AND when the hash or the version is
+   * missing or malformed: no agreement, no freeze.
+   */
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean;
   /**
    * Accept the identity owner's signed link: `draft` (agreement frozen) → `reserved`.
    *
    * Losing a race is an answer, never an exception: `agent_taken` when another body holds the
    * agentId live on this chain (it takes precedence when the body address collides too),
-   * `body_taken` when another row already recorded the body address, in any casing. Throws only
-   * for input no row may hold: an agentId that is not a uint256 in decimal, an address that is
-   * not one, or a deadline that is not a whole number (the table's CHECK).
+   * `body_taken` when another row already recorded the body address, in any casing.
+   *
+   * Throws a `LegalBodyInputError`, before anything is written and whatever the body's state, for
+   * input no row may hold: an agentId that is not a uint256 in decimal, an owner or a body that
+   * is not an address, a digest that is not a 32-byte hash, a signature that is not one or more
+   * whole bytes of hex, or a deadline that is not a whole number of unix SECONDS. The digest and
+   * the signature are stored lower-case. A body address the table refuses (the zero address, the
+   * factory itself) surfaces as the table's own CHECK failure.
    */
   reserve(
     legalBodyId: string,
@@ -148,11 +167,20 @@ export interface LegalBodyRepository {
       bodyAddress: Address;
     },
   ): ReserveOutcome;
-  /** Record a deploy transaction as sent (while `reserved` only), raw bytes in the event log. */
+  /**
+   * Record a deploy transaction as sent (while `reserved` only), raw bytes in the event log.
+   * Throws a `LegalBodyInputError`, before writing, for a hash that is not a 32-byte hash, raw
+   * bytes that are not whole bytes of hex, or a nonce that is not a whole number, zero or more.
+   */
   recordDeploySubmission(
     legalBodyId: string,
     s: { txHash: Hex; rawTx: Hex; nonce: number },
   ): boolean;
+  /**
+   * `reserved` → `deployed`, with the hash of the transaction that created the body (stored
+   * lower-case) and the time of its block in unix SECONDS. Throws a `LegalBodyInputError`, before
+   * writing, for a malformed hash or a time that is not in seconds.
+   */
   markDeployed(legalBodyId: string, d: { txHash: Hex; deployedAt: number }): boolean;
   lapse(legalBodyId: string, reason: string): boolean;
   /**
@@ -319,6 +347,67 @@ function checksummed(value: string): Address | null {
   return isAddress(value, { strict: false }) ? getAddress(value) : null;
 }
 
+/**
+ * A value handed to the repository that no row may hold: a hash that is not one, a time in the
+ * wrong unit, a chain id of zero. It is a bug in the caller, never the outcome of a race, so it is
+ * thrown, before anything is written, rather than answered.
+ */
+export class LegalBodyInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LegalBodyInputError";
+  }
+}
+
+/** The address in the form rows store it, or a `LegalBodyInputError` naming the field. */
+function requireAddress(field: string, value: unknown): Address {
+  const address = typeof value === "string" ? checksummed(value) : null;
+  if (address === null) throw new LegalBodyInputError(`${field} must be a 0x address`);
+  return address;
+}
+
+const HASH_32 = /^0x[0-9a-fA-F]{64}$/;
+const HEX_BYTES = /^0x(?:[0-9a-fA-F]{2})+$/;
+
+/**
+ * A 32-byte hash in the one spelling rows store it: lower-case, so a stored hash compares as text
+ * with the same hash read from anywhere else. Null when the value is not a 32-byte hash at all.
+ */
+function lowerHash(value: unknown): Hex | null {
+  return typeof value === "string" && HASH_32.test(value) ? (value.toLowerCase() as Hex) : null;
+}
+
+function requireHash(field: string, value: unknown): Hex {
+  const hash = lowerHash(value);
+  if (hash === null)
+    throw new LegalBodyInputError(`${field} must be 0x and 64 hex digits (a 32-byte hash)`);
+  return hash;
+}
+
+/** One or more whole bytes of hex, lower-cased. */
+function requireBytes(field: string, value: unknown): Hex {
+  if (typeof value !== "string" || !HEX_BYTES.test(value))
+    throw new LegalBodyInputError(`${field} must be 0x and one or more whole bytes of hex`);
+  return value.toLowerCase() as Hex;
+}
+
+/** The largest time the seconds columns hold. A time in milliseconds is past it for centuries. */
+const MAX_UNIX_SECONDS = 99_999_999_999;
+
+/** A time in unix SECONDS, the unit of a block timestamp. */
+function requireSeconds(field: string, value: unknown): number {
+  if (!isIntegerWithin(value, 1, MAX_UNIX_SECONDS))
+    throw new LegalBodyInputError(
+      `${field} must be a whole number of unix seconds (1 to ${MAX_UNIX_SECONDS}), got ${String(value)}`,
+    );
+  return value;
+}
+
+/** A JS number that is an exact integer in [min, max]: not a string, a bigint, NaN or a fraction. */
+function isIntegerWithin(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+
 const UINT256_MAX = 2n ** 256n - 1n;
 
 /**
@@ -452,10 +541,17 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     amendmentDelay: number;
   }): LegalBodyRecord {
     // Refused here, before anything is written, with a message that names the field: the table
-    // refuses a fractional delay too, but as a bare CHECK failure.
-    if (!Number.isInteger(p.amendmentDelay))
-      throw new Error(`amendmentDelay must be a whole number of seconds, got ${p.amendmentDelay}`);
-    const tenantId = getAddress(p.tenantId);
+    // refuses each of these too, but as a bare CHECK failure.
+    if (typeof p.amendmentDelay !== "number" || !Number.isInteger(p.amendmentDelay))
+      throw new LegalBodyInputError(
+        `amendmentDelay must be a whole number of seconds, got ${String(p.amendmentDelay)}`,
+      );
+    if (!isIntegerWithin(p.chainId, 1, Number.MAX_SAFE_INTEGER))
+      throw new LegalBodyInputError(
+        `chainId must be a positive whole number, got ${String(p.chainId)}`,
+      );
+    const tenantId = requireAddress("tenantId", p.tenantId);
+    const factory = requireAddress("factory", p.factory);
     const legalBodyId = `lb_${randomUUID()}`;
     return this.db.transaction(() => {
       this.stmts.insert.run({
@@ -464,7 +560,7 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
         tenant_id: tenantId,
         company_id: p.companyId,
         chain_id: p.chainId,
-        factory: getAddress(p.factory),
+        factory,
         guardian: tenantId,
         amendment_delay: p.amendmentDelay,
       });
@@ -517,13 +613,14 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
   }
 
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean {
-    // Refused here, before anything is written, with a message that names the field: the table
-    // refuses it too, but as a bare CHECK failure.
-    if (!Number.isInteger(a.version))
-      throw new Error(`the agreement version must be a whole number, got ${a.version}`);
+    // No agreement, no freeze: a missing or malformed hash or version is answered like any other
+    // freeze that did not happen, before the UPDATE runs. A NULL hash would otherwise match the
+    // draft, change the row without freezing anything, and leave a false event in the log.
+    const hash = lowerHash(a.hash);
+    if (hash === null || !isIntegerWithin(a.version, 1, Number.MAX_SAFE_INTEGER)) return false;
     return this.move(
       legalBodyId,
-      () => this.stmts.freeze.run(a.hash, a.version, legalBodyId),
+      () => this.stmts.freeze.run(hash, a.version, legalBodyId),
       "agreement_frozen",
       null,
       { version: a.version },
@@ -543,9 +640,14 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
   ): ReserveOutcome {
     const agentId = canonicalAgentId(l.agentId);
     if (agentId === null)
-      throw new Error(`agentId must be a uint256 in decimal, got ${JSON.stringify(l.agentId)}`);
-    const identityOwner = getAddress(l.identityOwner);
-    const bodyAddress = getAddress(l.bodyAddress);
+      throw new LegalBodyInputError(
+        `agentId must be a uint256 in decimal, got ${JSON.stringify(l.agentId)}`,
+      );
+    const identityOwner = requireAddress("identityOwner", l.identityOwner);
+    const bodyAddress = requireAddress("bodyAddress", l.bodyAddress);
+    const linkDigest = requireHash("linkDigest", l.linkDigest);
+    const linkSignature = requireBytes("linkSignature", l.linkSignature);
+    const linkDeadline = requireSeconds("linkDeadline", l.linkDeadline);
 
     const row = this.stmts.findById.get(legalBodyId) as Row | undefined;
     if (!row || row.binding_state !== "draft") return "not_draft";
@@ -557,9 +659,9 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
           legal_body_id: legalBodyId,
           agent_id: agentId,
           identity_owner: identityOwner,
-          link_digest: l.linkDigest,
-          link_deadline: l.linkDeadline,
-          link_signature: l.linkSignature,
+          link_digest: linkDigest,
+          link_deadline: linkDeadline,
+          link_signature: linkSignature,
           body_address: bodyAddress,
         });
         // Zero rows: another caller moved this body out of draft between the read and the write.
@@ -590,21 +692,29 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     legalBodyId: string,
     s: { txHash: Hex; rawTx: Hex; nonce: number },
   ): boolean {
+    const txHash = requireHash("txHash", s.txHash);
+    const rawTx = requireBytes("rawTx", s.rawTx);
+    if (!isIntegerWithin(s.nonce, 0, Number.MAX_SAFE_INTEGER))
+      throw new LegalBodyInputError(
+        `nonce must be a whole number, zero or more, got ${String(s.nonce)}`,
+      );
     return this.move(
       legalBodyId,
-      () => this.stmts.recordDeploySubmission.run(s.txHash, legalBodyId),
+      () => this.stmts.recordDeploySubmission.run(txHash, legalBodyId),
       "deploy_submitted",
-      s.txHash,
-      { rawTx: s.rawTx, nonce: s.nonce },
+      txHash,
+      { rawTx, nonce: s.nonce },
     );
   }
 
   markDeployed(legalBodyId: string, d: { txHash: Hex; deployedAt: number }): boolean {
+    const txHash = requireHash("txHash", d.txHash);
+    const deployedAt = requireSeconds("deployedAt", d.deployedAt);
     return this.move(
       legalBodyId,
-      () => this.stmts.markDeployed.run(d.txHash, d.deployedAt, legalBodyId),
+      () => this.stmts.markDeployed.run(txHash, deployedAt, legalBodyId),
       "deployed",
-      d.txHash,
+      txHash,
       null,
     );
   }

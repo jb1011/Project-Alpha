@@ -3,6 +3,7 @@ import { beforeEach, expect, test } from "vitest";
 import { migrate } from "../../src/persistence/db";
 import {
   LIVE_BINDING_STATES,
+  LegalBodyInputError,
   SqliteLegalBodyRepository,
 } from "../../src/persistence/legalBodyRepository";
 
@@ -368,15 +369,179 @@ test("a raw event with a non-positive id is refused, and every later write still
   ]);
 });
 
-test("freezeAgreement refuses a version that is not a whole number, before writing", () => {
+// ── Malformed input is refused before anything is written ──
+
+/** A value of the wrong type, as a caller without type checking could pass it. */
+const as = <T>(value: unknown) => value as T;
+
+test("freezeAgreement answers false for a missing or malformed hash or version: nothing is frozen, nothing logged", () => {
   const r = newBody();
-  for (const version of [1.5, "v1" as unknown as number])
+  for (const hash of [
+    undefined,
+    null,
+    "",
+    "not hex",
+    `0x${"a".repeat(63)}`,
+    `0x${"a".repeat(65)}`,
+    "a".repeat(66),
+    `0X${"a".repeat(64)}`,
+    `0x${"a".repeat(63)}g`,
+    5,
+  ])
     expect(
-      () => repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version }),
-      String(version),
-    ).toThrow(/version/);
-  expect(repo.findById(r.legalBodyId)?.oaManifestHash).toBeNull();
+      repo.freezeAgreement(r.legalBodyId, { hash: as(hash), version: 1 }),
+      `hash ${JSON.stringify(hash)}`,
+    ).toBe(false);
+  for (const version of [0, -1, 1.5, Number.NaN, 2 ** 60, "1", "v1", null, undefined])
+    expect(
+      repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version: as(version) }),
+      `version ${String(version)}`,
+    ).toBe(false);
+  const row = repo.findById(r.legalBodyId);
+  expect(row?.oaManifestHash).toBeNull();
+  expect(row?.oaManifestVersion).toBeNull();
   expect(repo.listEvents(r.legalBodyId).map((e) => e.kind)).toEqual(["created"]);
+  // The draft is still unfrozen, to every reader.
+  expect(repo.reserve(r.legalBodyId, link())).toBe("not_frozen");
+});
+
+test("a valid hash in any casing is stored lower-case: the agreement, the link digest, the deploy hash", () => {
+  const r = newBody();
+  const upper = (c: string) => `0x${c.toUpperCase().repeat(64)}` as `0x${string}`;
+  expect(repo.freezeAgreement(r.legalBodyId, { hash: upper("a"), version: 1 })).toBe(true);
+  expect(
+    repo.reserve(r.legalBodyId, { ...link(), linkDigest: upper("b"), linkSignature: "0xAB01" }),
+  ).toBe("reserved");
+  expect(
+    repo.recordDeploySubmission(r.legalBodyId, { txHash: upper("c"), rawTx: "0x02", nonce: 0 }),
+  ).toBe(true);
+  expect(repo.findById(r.legalBodyId)?.createTxHash).toBe(H("c"));
+  expect(repo.markDeployed(r.legalBodyId, { txHash: upper("d"), deployedAt: 1_800_000_000 })).toBe(
+    true,
+  );
+  const row = repo.findById(r.legalBodyId);
+  expect(row?.oaManifestHash).toBe(H("a"));
+  expect(row?.linkDigest).toBe(H("b"));
+  expect(row?.linkSignature).toBe("0xab01");
+  expect(row?.createTxHash).toBe(H("d"));
+  expect(
+    repo
+      .listEvents(r.legalBodyId)
+      .filter((e) => e.txHash !== null)
+      .map((e) => [e.kind, e.txHash]),
+  ).toEqual([
+    ["deploy_submitted", H("c")],
+    ["deployed", H("d")],
+  ]);
+});
+
+test("reserve throws a LegalBodyInputError for a malformed link, and writes nothing", () => {
+  const r = newBody();
+  repo.freezeAgreement(r.legalBodyId, { hash: H("a"), version: 1 });
+  const before = { row: repo.findById(r.legalBodyId), events: repo.listEvents(r.legalBodyId) };
+  for (const [label, over] of [
+    ["digest missing", { linkDigest: undefined }],
+    ["digest null", { linkDigest: null }],
+    ["digest empty", { linkDigest: "" }],
+    ["digest not hex", { linkDigest: "zz" }],
+    ["digest 31 bytes", { linkDigest: `0x${"b".repeat(62)}` }],
+    ["signature missing", { linkSignature: undefined }],
+    ["signature null", { linkSignature: null }],
+    ["signature empty", { linkSignature: "" }],
+    ["signature 0x and no byte", { linkSignature: "0x" }],
+    ["signature half a byte", { linkSignature: "0x1" }],
+    ["signature not hex", { linkSignature: "0xzz" }],
+    ["deadline 0", { linkDeadline: 0 }],
+    ["deadline negative", { linkDeadline: -5 }],
+    ["deadline fractional", { linkDeadline: 1.5 }],
+    ["deadline NaN", { linkDeadline: Number.NaN }],
+    ["deadline as text", { linkDeadline: "1900000000" }],
+    ["deadline as a bigint", { linkDeadline: 1_900_000_000n }],
+    ["deadline in milliseconds", { linkDeadline: 1_900_000_000_000 }],
+    ["deadline 1e20", { linkDeadline: 1e20 }],
+    ["agentId not decimal", { agentId: "0x2a" }],
+    ["identity owner not an address", { identityOwner: "0x123" }],
+    ["body not an address", { bodyAddress: "nope" }],
+  ] as const)
+    expect(() => repo.reserve(r.legalBodyId, as({ ...link(), ...over })), label).toThrow(
+      LegalBodyInputError,
+    );
+  expect(repo.findById(r.legalBodyId)).toEqual(before.row);
+  expect(repo.listEvents(r.legalBodyId)).toEqual(before.events);
+  // A caller bug is reported even when the row could not have moved anyway.
+  expect(() => repo.reserve("lb_unknown", as({ ...link(), linkDigest: "zz" }))).toThrow(
+    LegalBodyInputError,
+  );
+  // The boundaries of a deadline in seconds are accepted.
+  expect(repo.reserve(r.legalBodyId, { ...link(), linkDeadline: 99_999_999_999 })).toBe("reserved");
+});
+
+test("a deploy submission and a deploy throw a LegalBodyInputError for malformed facts, and write nothing", () => {
+  const id = toReserved();
+  const before = { row: repo.findById(id), events: repo.listEvents(id) };
+  const submission = { txHash: H("c"), rawTx: "0x02" as `0x${string}`, nonce: 7 };
+  for (const [label, over] of [
+    ["hash missing", { txHash: undefined }],
+    ["hash empty", { txHash: "" }],
+    ["hash not hex", { txHash: "0xzz" }],
+    ["hash 31 bytes", { txHash: `0x${"c".repeat(62)}` }],
+    ["raw transaction missing", { rawTx: undefined }],
+    ["raw transaction empty", { rawTx: "" }],
+    ["raw transaction 0x and no byte", { rawTx: "0x" }],
+    ["raw transaction half a byte", { rawTx: "0x1" }],
+    ["raw transaction not hex", { rawTx: "0xzz" }],
+    ["nonce negative", { nonce: -1 }],
+    ["nonce fractional", { nonce: 1.5 }],
+    ["nonce NaN", { nonce: Number.NaN }],
+    ["nonce as text", { nonce: "7" }],
+    ["nonce as a bigint", { nonce: 7n }],
+  ] as const)
+    expect(
+      () => repo.recordDeploySubmission(id, as({ ...submission, ...over })),
+      `submission: ${label}`,
+    ).toThrow(LegalBodyInputError);
+  for (const [label, d] of [
+    ["hash missing", { txHash: undefined, deployedAt: 1_800_000_000 }],
+    ["hash not hex", { txHash: "0xzz", deployedAt: 1_800_000_000 }],
+    ["time 0", { txHash: H("c"), deployedAt: 0 }],
+    ["time negative", { txHash: H("c"), deployedAt: -1 }],
+    ["time fractional", { txHash: H("c"), deployedAt: 1_800_000_000.5 }],
+    ["time NaN", { txHash: H("c"), deployedAt: Number.NaN }],
+    ["time missing", { txHash: H("c"), deployedAt: undefined }],
+    ["time in milliseconds", { txHash: H("c"), deployedAt: 1_800_000_000_000 }],
+  ] as const)
+    expect(() => repo.markDeployed(id, as(d)), `deploy: ${label}`).toThrow(LegalBodyInputError);
+  expect(repo.findById(id)).toEqual(before.row);
+  expect(repo.listEvents(id)).toEqual(before.events);
+  // Nonce 0 is a first transaction, and it is accepted.
+  expect(repo.recordDeploySubmission(id, { ...submission, nonce: 0 })).toBe(true);
+});
+
+test("create throws a LegalBodyInputError for a chain id or an address no row may hold, and writes nothing", () => {
+  const valid = {
+    tenantId: TENANT as `0x${string}`,
+    companyId: "co_1",
+    chainId: 5042002,
+    factory: FACTORY as `0x${string}`,
+    amendmentDelay: 172800,
+  };
+  for (const [label, over] of [
+    ["chain id 0", { chainId: 0 }],
+    ["chain id negative", { chainId: -1 }],
+    ["chain id fractional", { chainId: 1.5 }],
+    ["chain id NaN", { chainId: Number.NaN }],
+    ["chain id as text", { chainId: "5042002" }],
+    ["chain id missing", { chainId: undefined }],
+    ["tenant not an address", { tenantId: "0x123" }],
+    ["tenant missing", { tenantId: undefined }],
+    ["factory not an address", { factory: "nope" }],
+    ["factory missing", { factory: undefined }],
+    ["amendment delay as text", { amendmentDelay: "172800" }],
+  ] as const)
+    expect(() => repo.create(as({ ...valid, ...over })), label).toThrow(LegalBodyInputError);
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_bodies").get()).toEqual({ n: 0 });
+  expect(db.prepare("SELECT COUNT(*) AS n FROM legal_body_events").get()).toEqual({ n: 0 });
+  expect(repo.create({ ...valid, chainId: 1 }).chainId).toBe(1);
 });
 
 test("reserve answers body_taken when the recorded address differs only in casing", () => {
