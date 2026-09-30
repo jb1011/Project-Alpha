@@ -10,6 +10,7 @@ import {
   isAddressEqual,
   toFunctionSelector,
   zeroAddress,
+  zeroHash,
 } from "viem";
 import { expect, test } from "vitest";
 import {
@@ -26,6 +27,7 @@ const REGISTRY = "0x8004A818BFB912233c491871b3d84c89A494BD9e" as Address;
 const EXECUTOR = "0x000000000000000000000000000000000000000b" as Address;
 const OTHER = "0x00000000000000000000000000000000000000ff" as Address;
 const NO_CODE = "0x00000000000000000000000000000000000dead1" as Address;
+const CHAIN_ID = 5042002;
 
 test("the legal-body grant set is exactly the factory's two relayed functions, in order", () => {
   expect(LEGAL_BODY_GRANTED_SELECTORS.map((s) => s.name)).toEqual([
@@ -66,6 +68,8 @@ interface World {
   owner: Address;
   pendingOwner: Address;
   registry: Address;
+  /** The factory's typed-data domain, as `eip712Domain()` reports it. */
+  domain: { name: string; version: string; chainId: bigint; verifyingContract: Address };
   /** selector -> the contract it is pinned to on the controller. Absent = never pinned. */
   pins: ReadonlyMap<Hex, Address>;
   /** The (selector, account) grants the controller holds. */
@@ -88,6 +92,12 @@ function chain(over: Partial<World> = {}): PublicClient {
     owner: CONTROLLER,
     pendingOwner: zeroAddress,
     registry: REGISTRY,
+    domain: {
+      name: "Novi LegalBodyFactory",
+      version: "1",
+      chainId: BigInt(CHAIN_ID),
+      verifyingContract: LB_FACTORY,
+    },
     pins: new Map(LEGAL_BODY_GRANTED_SELECTORS.map((s) => [s.selector, LB_FACTORY])),
     grants: LEGAL_BODY_GRANTED_SELECTORS.map((s) => [s.selector, EXECUTOR] as const),
     ...over,
@@ -111,6 +121,17 @@ function chain(over: Partial<World> = {}): PublicClient {
           return world.pendingOwner;
         case "identityRegistry":
           return world.registry;
+        case "eip712Domain":
+          // (fields, name, version, chainId, verifyingContract, salt, extensions)
+          return [
+            "0x0f",
+            world.domain.name,
+            world.domain.version,
+            world.domain.chainId,
+            world.domain.verifyingContract,
+            zeroHash,
+            [],
+          ];
       }
     if (isAddressEqual(call.address, CONTROLLER))
       switch (call.functionName) {
@@ -123,7 +144,8 @@ function chain(over: Partial<World> = {}): PublicClient {
     const hasCode = [LB_FACTORY, CONTROLLER].some((a) => isAddressEqual(a, call.address));
     throw new ContractFunctionExecutionError(
       hasCode
-        ? new ContractFunctionRevertedError({ abi, functionName })
+        ? // A custom error the ABI does not know, as a contract without this function answers.
+          new ContractFunctionRevertedError({ abi, functionName, data: "0x972dd626" })
         : new ContractFunctionZeroDataError({ functionName }),
       { abi, functionName, args: call.args, contractAddress: call.address },
     );
@@ -136,6 +158,13 @@ const wiring = {
   controller: CONTROLLER,
   identityRegistry: REGISTRY,
   executor: EXECUTOR,
+  chainId: CHAIN_ID,
+};
+const DOMAIN = {
+  name: "Novi LegalBodyFactory",
+  version: "1",
+  chainId: BigInt(CHAIN_ID),
+  verifyingContract: LB_FACTORY,
 };
 
 /** The message the boot check refuses with. Fails if it does not refuse. */
@@ -168,6 +197,34 @@ test("a factory bound to another identity registry is refused", async () => {
   expect(await refusal({ registry: OTHER })).toMatch(
     /LEGAL_BODY_FACTORY_ADDRESS.*identity registry.*IDENTITY_REGISTRY/s,
   );
+});
+
+test("a factory on another chain than the configured one is refused, naming ARC_CHAIN_ID", async () => {
+  // The chain behind the RPC is not the one in the config: either side being wrong refuses.
+  const onChain = await refusal({ domain: { ...DOMAIN, chainId: 1n } });
+  expect(onChain).toMatch(/LEGAL_BODY_FACTORY_ADDRESS.*chain id 1\b.*ARC_CHAIN_ID 5042002/s);
+  const inConfig = await refusal({}, { ...wiring, chainId: 1 });
+  expect(inConfig).toMatch(/LEGAL_BODY_FACTORY_ADDRESS.*chain id 5042002\b.*ARC_CHAIN_ID 1\b/s);
+});
+
+test("a typed-data domain that verifies for another contract is refused", async () => {
+  const message = await refusal({ domain: { ...DOMAIN, verifyingContract: OTHER } });
+  expect(message).toMatch(/LEGAL_BODY_FACTORY_ADDRESS.*verifying contract/s);
+  expect(message).toContain(OTHER);
+});
+
+test("a typed-data domain with another name is refused", async () => {
+  const message = await refusal({ domain: { ...DOMAIN, name: "Novi LegalManagerFactory" } });
+  expect(message).toMatch(/LEGAL_BODY_FACTORY_ADDRESS.*domain name/s);
+  expect(message).toContain('"Novi LegalManagerFactory"');
+  expect(message).toContain('"Novi LegalBodyFactory"');
+});
+
+test("a typed-data domain with another version is refused", async () => {
+  const message = await refusal({ domain: { ...DOMAIN, version: "2" } });
+  expect(message).toMatch(/LEGAL_BODY_FACTORY_ADDRESS.*domain version/s);
+  expect(message).toContain('"2"');
+  expect(message).toContain('"1"');
 });
 
 test("a pin set on only the first selector is refused, and the message names only the second", async () => {
@@ -239,7 +296,9 @@ test("a contract that is not a legal-body factory is a wrong address, not an RPC
   expect(message).toContain(
     `LEGAL_BODY_FACTORY_ADDRESS ${CONTROLLER} does not answer as a legal-body factory on this chain`,
   );
-  expect(message).toContain("reverted");
+  // The cause is on one line, with the revert signature named once.
+  expect(message).toMatch(/\(The contract function "\w+" reverted[^\n]*0x972dd626\)$/);
+  expect(message.match(/0x972dd626/g)).toHaveLength(1);
   expect(message).not.toMatch(/could not verify|RPC read failed/);
 });
 

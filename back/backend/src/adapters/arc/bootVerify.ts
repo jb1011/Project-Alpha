@@ -144,13 +144,10 @@ function contractRefusal(err: unknown): { address?: Address; reason: string } | 
   );
   if (!(refused instanceof BaseError)) return undefined;
   const call = err.walk((e) => e instanceof ContractFunctionExecutionError);
-  const signature =
-    refused instanceof ContractFunctionRevertedError && refused.signature
-      ? ` ${refused.signature}`
-      : "";
   return {
     address: call instanceof ContractFunctionExecutionError ? call.contractAddress : undefined,
-    reason: `${refused.shortMessage}${signature}`,
+    // One line: a revert with an unknown error carries its signature on a second line.
+    reason: refused.shortMessage.replace(/\s+/g, " "),
   };
 }
 
@@ -238,21 +235,43 @@ export async function assertControllerWiring(
 }
 
 /**
+ * The typed-data domain the legal-body factory signs under (its name and version are fixed in the
+ * contract's constructor). Link and amendment signatures are built against exactly this domain.
+ */
+export const LEGAL_BODY_FACTORY_DOMAIN = { name: "Novi LegalBodyFactory", version: "1" } as const;
+
+/**
  * Legal-body mode: prove the factory belongs to the controller with no handover pending, reads the
- * configured identity registry, and that both executor grants exist and are pinned to it. Every
- * mismatch otherwise surfaces at a customer's first order as an opaque relay revert.
+ * configured identity registry, signs under the expected typed-data domain on the configured chain,
+ * and that both executor grants exist and are pinned to it. Every mismatch otherwise surfaces at a
+ * customer's first order as an opaque relay revert.
+ *
+ * Why the domain and the chain id: every legal-body record stores its chain id, write-once, and
+ * every link signature is bound to this domain (name, version, chain id, the factory's address).
+ * The factory reports the chain it actually runs on, so a chain id in the config that is not the
+ * chain behind the RPC is caught here. Left unchecked, it would surface at a customer's first
+ * order as a bad signature, after records carrying the wrong chain id had already been written.
  */
 export async function assertLegalBodyFactoryWiring(
   publicClient: PublicClient,
-  p: { factory: Address; controller: Address; identityRegistry: Address; executor: Address },
+  p: {
+    factory: Address;
+    controller: Address;
+    identityRegistry: Address;
+    executor: Address;
+    /** The configured chain id (ARC_CHAIN_ID). */
+    chainId: number;
+  },
 ): Promise<void> {
   let owner: Address;
   let pendingOwner: Address;
   let registry: Address;
+  // eip712Domain() returns (fields, name, version, chainId, verifyingContract, salt, extensions).
+  let domain: readonly [Hex, string, string, bigint, Address, Hex, readonly bigint[]];
   let pins: readonly Address[];
   let grants: readonly boolean[];
   try {
-    [owner, pendingOwner, registry, pins, grants] = await Promise.all([
+    [owner, pendingOwner, registry, domain, pins, grants] = await Promise.all([
       publicClient.readContract({
         address: p.factory,
         abi: legalBodyFactoryAbi,
@@ -268,6 +287,11 @@ export async function assertLegalBodyFactoryWiring(
         abi: legalBodyFactoryAbi,
         functionName: "identityRegistry",
       }) as Promise<Address>,
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "eip712Domain",
+      }) as Promise<typeof domain>,
       Promise.all(
         LEGAL_BODY_GRANTED_SELECTORS.map(
           (s) =>
@@ -318,6 +342,23 @@ export async function assertLegalBodyFactoryWiring(
   if (!isAddressEqual(registry, p.identityRegistry))
     throw new Error(
       `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} reads identity registry ${registry}, not IDENTITY_REGISTRY ${p.identityRegistry}`,
+    );
+  const [, domainName, domainVersion, domainChainId, verifyingContract] = domain;
+  if (domainChainId !== BigInt(p.chainId))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} signs for chain id ${domainChainId}, not ARC_CHAIN_ID ${p.chainId} — the configured chain id is not the chain this factory runs on; every legal-body record would store the wrong chain and every link signature would be refused`,
+    );
+  if (!isAddressEqual(verifyingContract, p.factory))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} names ${verifyingContract} as the verifying contract of its typed-data domain, not itself — link signatures built for this address would be refused`,
+    );
+  if (domainName !== LEGAL_BODY_FACTORY_DOMAIN.name)
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} has typed-data domain name ${JSON.stringify(domainName)}, not ${JSON.stringify(LEGAL_BODY_FACTORY_DOMAIN.name)} — this is not the legal-body factory this build signs for`,
+    );
+  if (domainVersion !== LEGAL_BODY_FACTORY_DOMAIN.version)
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} has typed-data domain version ${JSON.stringify(domainVersion)}, not ${JSON.stringify(LEGAL_BODY_FACTORY_DOMAIN.version)} — this build signs for another version of the factory`,
     );
   const badPins = LEGAL_BODY_GRANTED_SELECTORS.filter(
     (_, i) => !pins[i] || !isAddressEqual(pins[i]!, p.factory),

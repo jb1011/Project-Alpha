@@ -185,9 +185,10 @@ async function main() {
       controller: cfg.controllerAddress,
       identityRegistry: cfg.identityRegistry,
       executor: executor.address,
+      chainId: cfg.chainId,
     });
     console.log(
-      `[boot] legal-body factory wiring verified on-chain: owner, registry, ${LEGAL_BODY_GRANTED_SELECTORS.length} pinned executor grants`,
+      `[boot] legal-body factory wiring verified on-chain: owner, registry, typed-data domain on chain ${cfg.chainId}, ${LEGAL_BODY_GRANTED_SELECTORS.length} pinned executor grants`,
     );
   }
 
