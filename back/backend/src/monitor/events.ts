@@ -131,7 +131,8 @@ export const WILDCARD_ROLE: Hex = pad("0x01", { size: 32 });
  * The standing executor roles: the seven granted at the controller's deploy, plus the two
  * legal-body grants added by the factory ceremony. Derived from the SAME generated-ABI selector
  * lists bootVerify asserts on-chain, never hardcoded, so "expected grant" cannot drift from
- * "verified grant". A grant of anything else still pages as CRITICAL.
+ * "verified grant": always for the seven, and for the two legal-body grants when the legal-body
+ * factory is configured. A grant of anything else still pages as CRITICAL.
  */
 export function standingRoles(): Set<Hex> {
   return new Set(

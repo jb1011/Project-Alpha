@@ -207,8 +207,8 @@ function controllerRule(
       );
 
     // Rule 2 bookkeeping. Two classes are deliberately NOT tracked for TTL (`isPermanentGrant`):
-    //  - DEFAULT_ADMIN_ROLE, whoever holds it: permanent by design, the controller is never left
-    //    without an admin. A change of holder pages through rules 4 and 5 instead.
+    //  - DEFAULT_ADMIN_ROLE, whoever holds it: permanent by design, by policy the admin role is
+    //    never renounced. A change of holder pages through rules 4 and 5 instead.
     //  - a standing selector role held by the EXECUTOR. What re-checks that pairing on chain
     //    differs by set: bootVerify asserts the seven controller grants at every API boot, but the
     //    two legal-body grants only when LEGAL_BODY_FACTORY_ADDRESS is set. When it is unset, their

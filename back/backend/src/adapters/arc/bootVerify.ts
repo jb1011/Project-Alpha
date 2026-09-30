@@ -95,8 +95,8 @@ export const CONTROLLER_PINNED_SELECTORS: readonly GrantedSelector[] =
 /**
  * The executor's two grants on the legal-body factory: create a body with the identity owner's
  * signature, and schedule an amendment the body's guardian signed. Derived from the generated ABI,
- * never hardcoded. Both are pinned to the factory (setBoundTarget) before they are granted, so they
- * can never be relayed at another contract.
+ * never hardcoded. When the factory is configured, boot refuses to start unless both are pinned to
+ * the factory (setBoundTarget) and granted to the executor.
  */
 export const LEGAL_BODY_GRANTED_SELECTORS: readonly GrantedSelector[] = [
   {
