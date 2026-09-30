@@ -237,11 +237,12 @@ const sqlIsSeconds = (column: string) =>
  *  - `deployed_at` is set only by the deploy: no `draft`, `reserved`, `lapsed` or `abandoned` row
  *    holds one. The deploy facts are write-once, so a row that held one early could never be
  *    deployed.
- *  - Rows are born `draft`, and an INSERT never lands on an existing row (a trigger). That is what
- *    stops `REPLACE INTO` from rewriting a body wholesale: REPLACE deletes the old row and inserts
- *    a new one, and no UPDATE guard would ever see it.
+ *  - Rows are born `draft`, and an INSERT never lands on an existing row, whether it names that
+ *    row's id, its public id or its rowid (a trigger). That is what stops `REPLACE INTO` from
+ *    rewriting a body wholesale: REPLACE deletes the old row and inserts a new one, and no UPDATE
+ *    guard would ever see it.
  *  - Each group of facts is write-once from the step that sets it (a trigger): the identity
- *    fields from the INSERT, the agreement (hash and version) from the freeze, the link fields
+ *    fields, the rowid and `created_at` from the INSERT, the agreement (hash and version) from the freeze, the link fields
  *    from the reservation, the deploy facts (deployed_at and create_tx_hash) from the deploy. So
  *    no future method, migration or operator can re-point a reservation or a deployed body at
  *    another agent, owner, agreement or creating transaction.
@@ -258,6 +259,8 @@ const sqlIsSeconds = (column: string) =>
  *  - At most one LIVE body (reserved, deployed or linked) per agentId per chain (a partial unique
  *    index), and at most one row per body address per chain, whatever its casing (a unique index
  *    on its lower-case form).
+ *  - A rowid is positive (a CHECK). The insert guard relies on it: for an automatic rowid SQLite
+ *    shows a BEFORE INSERT trigger a placeholder (-1), which must never match a stored row.
  *  - No DELETE removes a legal body (a trigger); the one way SQLite removes a row without a DELETE
  *    is described below. The event log is append-only: no UPDATE, no DELETE, no INSERT over an
  *    existing event id, and every event id is positive (a CHECK), which that last guard relies on.
@@ -321,6 +324,7 @@ export const LEGAL_BODIES_DDL = `
       OR (typeof(binding_check_interval_ms) = 'integer' AND binding_check_interval_ms > 0)),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (rowid > 0),
     CHECK (guardian = tenant_id),
     CHECK ((oa_manifest_hash IS NULL) = (oa_manifest_version IS NULL)),
     CHECK ((next_binding_check_at IS NULL) = (binding_check_interval_ms IS NULL)),
@@ -350,7 +354,8 @@ export const LEGAL_BODIES_DDL = `
 
   CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_write_once
   BEFORE UPDATE ON legal_bodies FOR EACH ROW
-  WHEN NEW.legal_body_id IS NOT OLD.legal_body_id
+  WHEN NEW.rowid IS NOT OLD.rowid
+    OR NEW.legal_body_id IS NOT OLD.legal_body_id
     OR NEW.public_id IS NOT OLD.public_id
     OR NEW.tenant_id IS NOT OLD.tenant_id
     OR NEW.company_id IS NOT OLD.company_id
@@ -358,6 +363,7 @@ export const LEGAL_BODIES_DDL = `
     OR NEW.factory IS NOT OLD.factory
     OR NEW.guardian IS NOT OLD.guardian
     OR NEW.amendment_delay IS NOT OLD.amendment_delay
+    OR NEW.created_at IS NOT OLD.created_at
     OR (OLD.oa_manifest_hash IS NOT NULL AND (NEW.oa_manifest_hash IS NOT OLD.oa_manifest_hash
         OR NEW.oa_manifest_version IS NOT OLD.oa_manifest_version))
     OR (OLD.agent_id IS NOT NULL AND (NEW.agent_id IS NOT OLD.agent_id
@@ -387,7 +393,8 @@ export const LEGAL_BODIES_DDL = `
   BEFORE INSERT ON legal_bodies FOR EACH ROW
   WHEN NEW.binding_state IS NOT 'draft'
     OR EXISTS (SELECT 1 FROM legal_bodies
-                WHERE legal_body_id = NEW.legal_body_id OR public_id = NEW.public_id)
+                WHERE legal_body_id = NEW.legal_body_id OR public_id = NEW.public_id
+                   OR rowid = NEW.rowid)
   BEGIN
     SELECT RAISE(ABORT, 'legal_bodies: rows are born draft and never replaced');
   END;

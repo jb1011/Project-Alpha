@@ -1303,3 +1303,67 @@ test("nothing legitimate is refused: the whole lifecycle, with agentId 0, the la
       .get(max),
   ).toEqual({ agent_id: UINT256_MAX, oa_manifest_version: 1 });
 });
+
+// ── The rowid and the creation time are part of a row's identity ──
+
+test("the rowid is pinned: no INSERT names an existing one, no UPDATE moves it, and none is zero or negative", () => {
+  // Two rows with no event, so nothing but the guards on legal_bodies itself protects them.
+  insertDraft(lb("1"), pub("1"));
+  insertDraft(lb("2"), pub("2"));
+  const rowidOf = (id: string) =>
+    (
+      db.prepare("SELECT rowid AS r FROM legal_bodies WHERE legal_body_id = ?").get(id) as {
+        r: number;
+      }
+    ).r;
+  const first = rowidOf(lb("1"));
+  const snapshot = () => db.prepare("SELECT rowid, * FROM legal_bodies ORDER BY rowid").all();
+  const before = snapshot();
+  const insertAt = (verb: string, column: string, rowid: number, label: string) =>
+    db
+      .prepare(
+        `${verb} INTO legal_bodies (${column}, legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+         VALUES (?, ?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+      )
+      .run(rowid, lb(label), pub(label), TENANT, FACTORY, TENANT);
+  // A new row, with ids of its own, that names the rowid of an existing one.
+  for (const verb of ["INSERT OR REPLACE", "REPLACE", "INSERT OR IGNORE", "INSERT"])
+    for (const column of ["rowid", "_rowid_", "oid"])
+      expect(() => insertAt(verb, column, first, "n"), `${verb} (${column})`).toThrow(
+        /born draft and never replaced/,
+      );
+  // An existing row moved onto another row's rowid, or to a free one.
+  for (const verb of ["UPDATE", "UPDATE OR REPLACE", "UPDATE OR IGNORE"])
+    for (const target of [first, 777])
+      expect(
+        () =>
+          db
+            .prepare(`${verb} legal_bodies SET rowid = ? WHERE legal_body_id = ?`)
+            .run(target, lb("2")),
+        `${verb} -> ${target}`,
+      ).toThrow(/write-once/);
+  for (const rowid of [0, -1])
+    expect(() => insertAt("INSERT", "rowid", rowid, "z"), `rowid ${rowid}`).toThrow(/CHECK/);
+  expect(snapshot()).toEqual(before);
+  // An ordinary insert is untouched, and takes the next rowid.
+  insertDraft(lb("3"), pub("3"));
+  expect(rowidOf(lb("3"))).toBe(rowidOf(lb("2")) + 1);
+});
+
+test("created_at is write-once: it dates the record and orders the listings", () => {
+  insertDraft();
+  const createdAt = () =>
+    (db.prepare("SELECT created_at AS c FROM legal_bodies").get() as { c: string }).c;
+  const before = createdAt();
+  for (const verb of ["UPDATE", "UPDATE OR REPLACE"])
+    for (const v of ["1999-01-01 00:00:00", null])
+      expect(
+        () => db.prepare(`${verb} legal_bodies SET created_at = ?`).run(v),
+        `${verb} -> ${v}`,
+      ).toThrow(/write-once/);
+  expect(createdAt()).toBe(before);
+  // updated_at is the column that moves.
+  expect(
+    db.prepare("UPDATE legal_bodies SET updated_at = '2030-01-01 00:00:00'").run().changes,
+  ).toBe(1);
+});
