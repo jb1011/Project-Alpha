@@ -136,13 +136,50 @@ function decodeRevert(data: Hex, abi: Abi): { errorName: string; detail: string 
   }
 }
 
-/** viem carries the raw revert bytes in a RawContractError inside the cause chain; `walk` is
- *  viem's supported API for retrieving it (a hand-rolled traversal would silently break on a
- *  viem-internal nesting change and degrade every relay failure to an undecoded blob). */
+/** How far down a cause chain to look for revert bytes. Same bound as `decodedRevertName`. */
+const MAX_REVERT_HOPS = 8;
+
+/**
+ * The revert bytes somewhere in the cause chain, or undefined when there are none.
+ *
+ * Two carriers, because viem has two:
+ *  - a `RawContractError`, which viem builds for a call it decodes against an ABI;
+ *  - the NODE'S OWN ERROR, JSON-RPC code 3 with the bytes in `data`. This is the one a real
+ *    node's revert of `estimateGas` arrives as: viem never builds a `RawContractError` there, and
+ *    the code-3 error sits several wrappers down (`EstimateGasExecutionError` <-
+ *    `ExecutionRevertedError` <- `RpcRequestError`, with a `TransactionExecutionError` pair in
+ *    between when a local account has viem ask `eth_fillTransaction` first).
+ *
+ * ⚠ `ExecutionRevertedError` on its own is NOT a carrier: viem also gives that class to "gas
+ * required exceeds allowance", which is an unfunded sender, not a contract verdict. And a code-3
+ * error with no data stays "not a revert", for the reason `relayRevertError` gives.
+ *
+ * `walk` is viem's supported traversal (a hand-rolled one would silently break on a viem-internal
+ * nesting change and degrade every relay failure to an undecoded blob). It follows plain `cause`
+ * links too, and the hop bound stops it there: cause chains can be cyclic.
+ */
 function revertData(err: unknown): Hex | undefined {
   if (!(err instanceof BaseError)) return undefined;
-  const raw = err.walk((e) => e instanceof RawContractError) as RawContractError | null;
-  const d = raw?.data;
-  const data = typeof d === "object" && d !== null ? (d as { data?: unknown }).data : d;
-  return typeof data === "string" && isHex(data) && size(data) >= 4 ? data : undefined;
+  let found: Hex | undefined;
+  let hops = 0;
+  err.walk((e) => {
+    found = revertBytesOf(e);
+    return found !== undefined || ++hops >= MAX_REVERT_HOPS;
+  });
+  return found;
+}
+
+/** The revert bytes ONE error carries, if it is a carrier (see `revertData`). */
+function revertBytesOf(e: unknown): Hex | undefined {
+  if (e instanceof RawContractError) {
+    const d = e.data;
+    return asRevertBytes(typeof d === "object" && d !== null ? (d as { data?: unknown }).data : d);
+  }
+  const { code, data } = (e ?? {}) as { code?: unknown; data?: unknown };
+  return code === 3 ? asRevertBytes(data) : undefined;
+}
+
+/** At least a 4-byte selector of hex, or nothing. */
+function asRevertBytes(x: unknown): Hex | undefined {
+  return typeof x === "string" && isHex(x) && size(x) >= 4 ? x : undefined;
 }
