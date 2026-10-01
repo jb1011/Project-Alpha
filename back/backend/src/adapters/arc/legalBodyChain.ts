@@ -48,7 +48,7 @@ export interface LegalBodyChainDeps {
   /** Wall clock in milliseconds, for the head-age check. Defaults to `Date.now`. */
   now?: () => number;
   /** The oldest head, in seconds against `now()`, that {LegalBodyChain.head} believes. Unset: no
-   *  check. */
+   *  check. Set, it must be a finite number above 0: the constructor refuses anything else. */
   maxHeadAgeSeconds?: number;
 }
 
@@ -264,6 +264,11 @@ export class LegalBodyChain {
     if (d.chainId !== d.arc.chainId)
       throw new Error(
         `LegalBodyChain: chain id ${d.chainId} differs from the relay seam's ${d.arc.chainId}: refusing to read one chain and sign for another`,
+      );
+    const maxAge = d.maxHeadAgeSeconds;
+    if (maxAge !== undefined && !(Number.isFinite(maxAge) && maxAge > 0))
+      throw new Error(
+        `LegalBodyChain: maxHeadAgeSeconds must be a finite number of seconds above 0, not ${maxAge}`,
       );
   }
 
@@ -484,12 +489,15 @@ export class LegalBodyChain {
       // `record` gets a copy: what is sent is what was signed, whatever it does with its argument.
       const recorded: unknown = p.record({ txHash, rawTx, nonce });
       if (recorded === false) return { status: "not_recorded" };
-      if (recorded !== true)
+      if (recorded !== true) {
+        // A promise that rejects after this throw must not become an unhandled rejection.
+        if (isThenable(recorded)) (recorded as PromiseLike<unknown>).then(undefined, () => {});
         throw new Error(
           isThenable(recorded)
             ? "createLegalBody: record returned a promise; it must record synchronously and return true or false. Nothing was sent"
             : `createLegalBody: record returned ${String(recorded)}, not true or false. Nothing was sent`,
         );
+      }
       try {
         await this.d.arc.sendRawRelayedCall(rawTx);
       } catch (cause) {

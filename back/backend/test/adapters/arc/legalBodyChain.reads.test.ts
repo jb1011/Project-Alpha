@@ -149,6 +149,19 @@ describe("construction", () => {
     expect(chain.executor).toBe(LOCAL_TEST_ACCOUNT.address);
     expect(node.calls).toEqual([]);
   });
+
+  test("the constructor refuses a maxHeadAgeSeconds that is not a finite number above 0", () => {
+    const node = fakeRpcNode({ answer: () => undefined });
+    for (const maxHeadAgeSeconds of [Number.NaN, 0, -1, Number.POSITIVE_INFINITY])
+      expect(() => chainOver(node, { maxHeadAgeSeconds }), String(maxHeadAgeSeconds)).toThrow(
+        /maxHeadAgeSeconds/,
+      );
+    for (const maxHeadAgeSeconds of [undefined, 120])
+      expect(chainOver(node, { maxHeadAgeSeconds }), String(maxHeadAgeSeconds)).toBeInstanceOf(
+        LegalBodyChain,
+      );
+    expect(node.calls).toEqual([]);
+  });
 });
 
 describe("head", () => {

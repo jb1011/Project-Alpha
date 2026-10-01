@@ -359,6 +359,38 @@ describe("submitCreate", () => {
     expect(arc.sendRawRelayedCall).not.toHaveBeenCalled();
   });
 
+  test("record returns a promise that rejects later: submitCreate throws its own sentence, nothing is sent, and the rejection is not left unhandled", async () => {
+    const { chain, arc } = world();
+    let rejectRecord: ((reason: unknown) => void) | undefined;
+    const pending = new Promise<boolean>((_resolve, reject) => {
+      rejectRecord = reject;
+    });
+    // A plain function, not a mock: a mock attaches its own handler to a promise it returns.
+    let recordCalls = 0;
+    const record = () => {
+      recordCalls++;
+      return pending as unknown as boolean;
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await expect(
+        chain.submitCreate({ link: LINK, signature: SIGNATURE, record }),
+      ).rejects.toThrow(
+        "createLegalBody: record returned a promise; it must record synchronously and return true or false. Nothing was sent",
+      );
+      rejectRecord?.(new Error("the record could not be written"));
+      // Node reports an unhandled rejection once the microtasks have run: one macrotask is enough.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(recordCalls).toBe(1);
+    expect(arc.sendRawRelayedCall).not.toHaveBeenCalled();
+  });
+
   test("a prepared request with no fee field throws before the lock is taken", async () => {
     const { chain, arc, record, steps } = world({ fees: {} });
     await whileLockHeldElsewhere(async () => {
