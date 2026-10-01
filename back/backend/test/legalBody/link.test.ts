@@ -226,6 +226,19 @@ test("linkFromWire round-trips the served message and accepts the uint256 edges"
   });
 });
 
+test("linkFromWire returns the hash in lower case and the guardian checksummed", () => {
+  const message = {
+    ...linkTypedDataWire(p).message,
+    guardian: GUARDIAN.toLowerCase(),
+    operatingAgreementHash: `0x${"AB".repeat(32)}`,
+  };
+  const parsed = linkFromWire(message);
+  expect(parsed.operatingAgreementHash).toBe(`0x${"ab".repeat(32)}`);
+  expect(parsed.guardian).toBe(GUARDIAN);
+  expect(parsed.guardian).not.toBe(message.guardian);
+  expect(parsed).toEqual(link);
+});
+
 const servedMessage = linkTypedDataWire(p).message;
 const { deadline: _deadline, ...withoutDeadline } = servedMessage;
 test.each<[string, unknown]>([

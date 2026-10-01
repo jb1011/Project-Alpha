@@ -464,6 +464,26 @@ describe.each(MODES)("relay seam, $name", (mode) => {
       expect(await nextNonce()).toBe(51);
     },
   );
+
+  test.each(["sendRawRelayedCall", "sendRawFundTreasury"] as const)(
+    "%s of bytes the node accepts but that do not parse as a transaction resolves with the node's hash, and leaves the nonce floor where it was",
+    async (door) => {
+      const n = node();
+      const adapter = adapterOver(n, { controller: CONTROLLER });
+      /** The platform's next nonce when the node still says PENDING: the floor, if one is set. */
+      const nextNonce = () =>
+        withSenderLock(PLATFORM.address, () =>
+          nextSenderNonce(PLATFORM.address, async () => PENDING),
+        );
+      expect(await nextNonce()).toBe(PENDING);
+
+      // Once the node has taken the bytes, nothing may turn that send into an error.
+      const unparseable = "0x1234" as Hex;
+      await expect(adapter[door](unparseable)).resolves.toBe(keccak256(unparseable));
+      expect(n.raw).toEqual([unparseable]);
+      expect(await nextNonce()).toBe(PENDING);
+    },
+  );
 });
 
 test("a node that fills its own gas: the prepared and the signed gas are still the caller's", async () => {

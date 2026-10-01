@@ -44,12 +44,14 @@ export type LinkRefusalCode =
  * What {checkLink} decided.
  *
  * Accepted: `signature` is the one to send, `observedAtBlock` the head every read was pinned to,
- * and `gasLimit` the LIMIT {LinkChainPort.estimateCreate} returned.
+ * and `gasLimit` the LIMIT {LinkChainPort.estimateCreate} returned. `gasLimit` is informational:
+ * the create takes no gas figure from its caller, because it simulates again.
  *
  * Refused: an answer about the link at that block, with the facts established before the refusal.
- * `createdFor` is the identity owner the factory recorded as the body's creator, `errorName` the
- * contract error behind a `create_would_revert`, and `gasEstimate` the node's raw estimate, on
- * `gas_too_high` only.
+ * `createdFor` is the identity owner the factory recorded as the body's creator, present only when
+ * the pinned read found the body: a refusal that comes from the simulation carries none.
+ * `errorName` is the contract error behind a `create_would_revert`, and `gasEstimate` the node's
+ * raw estimate, on `gas_too_high` only.
  */
 export type LinkCheck =
   | {

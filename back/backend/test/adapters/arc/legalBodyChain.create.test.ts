@@ -205,6 +205,44 @@ function revertOf(data: Hex): ContractRevertError {
 
 const BAD_SIGNATURE = encodeErrorResult({ abi: legalBodyFactoryAbi, errorName: "BadSignature" });
 
+/** A value of each ABI type the declared errors take, to encode one of them with. */
+function sampleArg(type: string): unknown {
+  if (type === "address") return EXECUTOR;
+  if (type === "bytes4") return "0x12345678";
+  if (type === "bytes32") return `0x${"aa".repeat(32)}`;
+  if (type === "string") return "x";
+  if (/^uint\d+$/.test(type)) return 1n;
+  throw new Error(`no sample value for the ABI type ${type}`);
+}
+
+/** The revert bytes of the error `name`, as the factory's ABI or the controller's declares it. */
+function revertBytes(name: string): Hex {
+  for (const abi of [legalBodyFactoryAbi, noviControllerAbi] as Abi[]) {
+    const item = abi.find((x) => x.type === "error" && x.name === name);
+    if (item?.type === "error")
+      return encodeErrorResult({
+        abi: [item],
+        errorName: name,
+        args: item.inputs.map((input) => sampleArg(input.type)),
+      });
+  }
+  throw new Error(`neither ABI declares ${name}`);
+}
+
+/** The reverts that are a fault of the platform's setup: every error the controller declares, the
+ *  factory's ownership errors, and the errors of its deployment of a body. */
+const PLATFORM_FAULTS = [
+  ...(noviControllerAbi as Abi).flatMap((x) => (x.type === "error" ? [x.name] : [])),
+  "OwnableUnauthorizedAccount",
+  "OwnableInvalidOwner",
+  "FailedDeployment",
+  "InsufficientBalance",
+  "NotContract",
+  "NotImplementation",
+];
+/** The factory's refusals of the link itself. */
+const LINK_REFUSALS = ["BadSignature", "BadDeadline", "LegalBodyExists", "BadGuardian", "BadDelay"];
+
 describe("estimateCreate", () => {
   test("estimateCreate relays createLegalBody at the factory with the six arguments, and adds 25 %", async () => {
     const { chain, arc } = world();
@@ -285,6 +323,41 @@ describe("estimateCreate", () => {
     ]);
     for (const revert of [badSignature, notLegalBody, undecodable])
       await expect(estimating(revert)).resolves.toBe(revert);
+  });
+
+  test.each(PLATFORM_FAULTS)(
+    "%s from the simulation is a platform fault: LegalBodyChainFaultError with that name",
+    async (name) => {
+      const revert = revertOf(revertBytes(name));
+      expect(revert.errorName).toBe(name);
+      const fault = await failureOf(
+        world({ estimate: failing(revert) }).chain.estimateCreate(LINK, SIGNATURE),
+      );
+      expect(fault).toBeInstanceOf(LegalBodyChainFaultError);
+      expect(fault).not.toBeInstanceOf(ContractRevertError);
+      expect((fault as LegalBodyChainFaultError).errorName).toBe(name);
+      expect((fault as Error).cause).toBe(revert);
+    },
+  );
+
+  test.each(LINK_REFUSALS)(
+    "%s from the simulation stays the ContractRevertError, and is never a platform fault",
+    async (name) => {
+      const revert = revertOf(revertBytes(name));
+      expect(revert.errorName).toBe(name);
+      const refusal = await failureOf(
+        world({ estimate: failing(revert) }).chain.estimateCreate(LINK, SIGNATURE),
+      );
+      expect(refusal).toBe(revert);
+      expect(refusal).not.toBeInstanceOf(LegalBodyChainFaultError);
+    },
+  );
+
+  test("a failure of the simulation that is not a revert, a timeout, comes back as the same object", async () => {
+    const timeout = new TimeoutError({ body: { method: "eth_fillTransaction" }, url: NODE_URL });
+    await expect(
+      world({ estimate: failing(timeout) }).chain.estimateCreate(LINK, SIGNATURE),
+    ).rejects.toBe(timeout);
   });
 
   test("no error name appears in both legalBodyFactoryAbi and noviControllerAbi", () => {
@@ -454,6 +527,29 @@ describe("submitCreate", () => {
       expect(over.record).not.toHaveBeenCalled();
       expect(over.arc.sendRawRelayedCall).not.toHaveBeenCalled();
     }
+  });
+
+  test("a request with both fee fields is priced on maxFeePerGas, not on gasPrice", async () => {
+    // As above: a limit of 500,000, at which 500 gwei per gas is exactly the cap.
+    const AT_CAP = 500_000_000_000n;
+    const estimate = async () => 400_000n;
+
+    // At the cap by maxFeePerGas, above it by gasPrice: signed and sent.
+    const atCap = world({ estimate, fees: { maxFeePerGas: AT_CAP, gasPrice: AT_CAP + 1n } });
+    await expect(
+      atCap.chain.submitCreate({ link: LINK, signature: SIGNATURE, record: atCap.record }),
+    ).resolves.toMatchObject({ status: "sent" });
+
+    // Above the cap by maxFeePerGas, at it by gasPrice: refused, priced on maxFeePerGas.
+    const over = world({ estimate, fees: { maxFeePerGas: AT_CAP + 1n, gasPrice: AT_CAP } });
+    const err = await failureOf(
+      over.chain.submitCreate({ link: LINK, signature: SIGNATURE, record: over.record }),
+    );
+    expect(err).toBeInstanceOf(LegalBodyFeeTooHighError);
+    expect((err as LegalBodyFeeTooHighError).fee).toBe(500_000n * (AT_CAP + 1n));
+    expect(over.arc.signRelayedCall).not.toHaveBeenCalled();
+    expect(over.record).not.toHaveBeenCalled();
+    expect(over.arc.sendRawRelayedCall).not.toHaveBeenCalled();
   });
 
   test("a refusal from estimateCreate (a ContractRevertError) propagates from submitCreate; nothing is prepared", async () => {
@@ -710,6 +806,18 @@ describe("createOutcome", () => {
       created: creation(),
     });
     expect(created.waitForTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  test("createOutcome: a receipt status that is neither success nor reverted counts as reverted", async () => {
+    for (const status of [undefined, "pending"]) {
+      const { chain, getBlock } = onChain({
+        receipt: async () => ({ ...receipt("success", [createdLog()]), status }),
+      });
+      await expect(chain.createOutcome(SIGNED.txHash, EXPECTED), String(status)).resolves.toEqual({
+        status: "reverted",
+      });
+      expect(getBlock, String(status)).not.toHaveBeenCalled();
+    }
   });
 
   test("createOutcome: a successful receipt whose only LegalBodyCreated comes from another address throws", async () => {

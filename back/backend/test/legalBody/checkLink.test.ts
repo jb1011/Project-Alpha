@@ -191,6 +191,26 @@ test("the agreement hash is compared whatever its letter case", async () => {
   expect(upperSigned.ok).toBe(true);
 });
 
+test("a guardian that is the tenant in another letter case is accepted", async () => {
+  const lower = TENANT.toLowerCase() as Address;
+  expect(lower).not.toBe(TENANT);
+
+  const lowerLink = { ...link, guardian: lower };
+  const lowerGuardian = await checkLink(fakeChain(), {
+    link: lowerLink,
+    signature: await sign(owner, lowerLink),
+    expected,
+  });
+  expect(lowerGuardian.ok).toBe(true);
+
+  const lowerTenant = await checkLink(fakeChain(), {
+    link,
+    signature: await sign(),
+    expected: { ...expected, tenant: lower },
+  });
+  expect(lowerTenant.ok).toBe(true);
+});
+
 test("the deadline is judged against the head's time: 299 s left, 24 h + 1 s and already past are refused", async () => {
   for (const [what, deadline] of [
     ["299 s left", HEAD.timestamp + 299n],
