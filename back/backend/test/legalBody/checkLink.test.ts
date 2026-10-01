@@ -402,7 +402,7 @@ test("after a BadSignature, an owner with code is a bad signature, and so is a c
   expect(noCode.estimateCreate).toHaveBeenCalledWith(link, wrongKeyCompact);
 });
 
-test("test_checkLink_rpcFailureThrows: a port method that could not answer makes checkLink throw", async () => {
+test("a port method that could not answer makes checkLink throw", async () => {
   const failures = [
     () =>
       new HttpRequestError({
@@ -430,7 +430,7 @@ test("test_checkLink_rpcFailureThrows: a port method that could not answer makes
   }
 });
 
-test("test_checkLink_platformFaultThrows: a fault in the platform's setup throws and is never create_would_revert", async () => {
+test("a fault in the platform's setup throws and is never create_would_revert", async () => {
   const chain = fakeChain();
   const fault = new LegalBodyChainFaultError("NotAuthorized", {
     cause: new ContractRevertError("createLegalBody reverted: NotAuthorized()", "NotAuthorized"),

@@ -817,7 +817,7 @@ describe("faults, races and recovery of the create, on the same chain", () => {
     ).resolves.toBe("absent");
   });
 
-  test("a create whose owner refuses at mining time reverts, costs a bounded amount and leaves no body", async () => {
+  test("a create that reverts when it is mined costs a bounded amount and leaves no body", async () => {
     const wallet = await deployContract(walletOf(deployer), pub, "MockERC1271Wallet", [
       owner.address,
     ]);
@@ -828,13 +828,12 @@ describe("faults, races and recovery of the create, on the same chain", () => {
     );
     const before = await executorCounts();
 
+    // Automine off: the create is sent, then dropped from the pool; a state change is mined in a
+    // block of its own; the same signed bytes are sent again and mined in the next block.
     const sent = await withAutomineOff(async () => {
       const result = sentOf(
         await lb.submitCreate({ link, signature: check.signature, record: () => true }),
       );
-      // The owner's change must be mined before the create, and one block holding both would not
-      // say which runs first. So the create leaves the pool, the change is mined on its own, and
-      // the create's same signed bytes are sent again.
       await node.dropTransaction({ hash: result.txHash });
       const change = await walletOf(owner).writeContract({
         address: wallet,
@@ -907,7 +906,8 @@ describe("faults, races and recovery of the create, on the same chain", () => {
       });
 
     const sent = await withAutomineOff(async () => {
-      // Whichever takes the sender lock first gets the lower nonce.
+      // Both simulations pass because the simulation runs outside the sender lock, and the lock
+      // then gives the two creates consecutive nonces. Whichever takes it first gets the lower one.
       const both = (await Promise.all([create(), create()]))
         .map(sentOf)
         .sort((a, b) => a.nonce - b.nonce);
