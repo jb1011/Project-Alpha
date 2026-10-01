@@ -488,8 +488,9 @@ export const LEGAL_BODIES_DDL = `
  *        stored text then matches the DDL's. This holds for `legal_bodies`. It does not yet hold
  *        for `legal_body_events`, which has no table constraint: once normalised, its stored text
  *        reads `CURRENT_TIMESTAMP , note TEXT)` where a DDL laid out like this one reads
- *        `CURRENT_TIMESTAMP, note TEXT )`, and the step refuses the difference. There a new
- *        column is a rebuild, until the comparison ignores the spacing beside commas and brackets.
+ *        `CURRENT_TIMESTAMP, note TEXT )`, and the step refuses the difference. With a DDL laid
+ *        out like this one, a new column there is a rebuild, until the comparison ignores the
+ *        spacing beside commas and brackets.
  *      - A renamed column: one `ALTER TABLE ... RENAME COLUMN`.
  *      - An index: `DROP INDEX`, then `CREATE INDEX` as the DDL writes it.
  *      - A change to an existing column's definition, to a table-level CHECK or to the list of
