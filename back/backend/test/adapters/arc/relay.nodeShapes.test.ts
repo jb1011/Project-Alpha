@@ -205,6 +205,17 @@ describe.each(SHAPES)("node revert, $name", (shape) => {
     ],
     ["a code-3 revert with no data", { preflight: nodeRevert() }, "ExecutionRevertedError"],
     ["a code-3 revert with empty data", { preflight: nodeRevert("0x") }, "ExecutionRevertedError"],
+    [
+      "a code-3 revert with fewer than 4 bytes",
+      { preflight: nodeRevert("0x1234") },
+      "ExecutionRevertedError",
+    ],
+    [
+      // The code is what marks a revert: hex data on any other error is not a contract verdict.
+      "hex data on an error that is not code 3",
+      { preflight: { error: { code: -32000, message: "execution failed", data: "0xdeadbeef" } } },
+      "InvalidInputRpcError",
+    ],
     ["a timeout", { everyCall: { hang: true } }, "TimeoutError"],
   ])("%s is NOT a revert: returned untouched", async (_label, answer, inner) => {
     const node = nodeFor(answer);
