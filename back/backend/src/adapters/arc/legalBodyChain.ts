@@ -548,9 +548,12 @@ export class LegalBodyChain {
    * Wait for the create `txHash`, for at most {RECEIPT_TIMEOUT_MS}, and read from that one receipt
    * the body it created at `expected.bodyAddress`.
    *
-   * Running out of time throws ChainTxUnconfirmedError: the create may still be mined. A reverted
-   * receipt throws ChainTxRevertedError. A successful receipt without the factory's
-   * `LegalBodyCreated` for the body throws. Any other failure is rethrown untouched.
+   * Running out of time throws ChainTxUnconfirmedError: the create may still be mined. So does a
+   * receipt for another transaction: viem's wait follows a replacement at the same sender and
+   * nonce and resolves with ITS receipt, and the record never names a hash that is not the
+   * transaction it describes. A reverted receipt throws ChainTxRevertedError. A successful receipt
+   * without the factory's `LegalBodyCreated` for the body throws. Any other failure is rethrown
+   * untouched.
    */
   async confirmCreate(txHash: Hex, expected: { bodyAddress: Address }): Promise<LegalBodyCreated> {
     let receipt: TransactionReceipt;
@@ -564,6 +567,8 @@ export class LegalBodyChain {
         throw new ChainTxUnconfirmedError("createLegalBody", txHash);
       throw e;
     }
+    if (receipt.transactionHash.toLowerCase() !== txHash.toLowerCase())
+      throw new ChainTxUnconfirmedError("createLegalBody", txHash);
     if (receipt.status !== "success") throw new ChainTxRevertedError("createLegalBody", txHash);
     return this.creationIn(txHash, receipt, expected.bodyAddress);
   }

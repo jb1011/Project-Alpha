@@ -741,6 +741,25 @@ describe("confirmCreate", () => {
       onChain({ wait: failing(other) }).chain.confirmCreate(SIGNED.txHash, EXPECTED),
     ).rejects.toBe(other);
   });
+
+  test("confirmCreate: a receipt for another transaction, successful with the body's event or reverted, becomes ChainTxUnconfirmedError", async () => {
+    // viem's wait follows a replacement at the same sender and nonce, and resolves with the
+    // replacement's receipt: that receipt says nothing about the create that was asked about.
+    const ANOTHER_TX = `0x${"7b".repeat(32)}` as Hex;
+    for (const another of [
+      { ...receipt("success", [createdLog()]), transactionHash: ANOTHER_TX },
+      { ...receipt("reverted"), transactionHash: ANOTHER_TX },
+    ]) {
+      const { chain, getBlock } = onChain({ wait: async () => another });
+      const err = await failureOf(chain.confirmCreate(SIGNED.txHash, EXPECTED));
+      expect(err, another.status).toBeInstanceOf(ChainTxUnconfirmedError);
+      expect(err, another.status).toMatchObject({
+        step: "createLegalBody",
+        txHash: SIGNED.txHash,
+      });
+      expect(getBlock, another.status).not.toHaveBeenCalled();
+    }
+  });
 });
 
 describe("findCreation", () => {
