@@ -313,6 +313,71 @@ test("a schema that differs at the SAME version is refused, naming what differs"
   }
 });
 
+/** One legal body and its company, with no event: the event log stays empty. */
+function addBodyWithoutAnEvent(db: Database.Database) {
+  db.prepare(
+    `INSERT INTO companies (company_id, tenant_id, status, provider, environment, name_options, business_purpose, industry_label)
+     VALUES ('co_1', ?, 'ready', 'customer', 'sandbox', '["Acme LLC"]', 'existing', 'existing')`,
+  ).run(TENANT);
+  db.prepare(
+    `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+     VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+  ).run(BODY_ID, "1".padStart(36, "0"), TENANT, FACTORY, TENANT);
+}
+/** Every object the database holds, whichever table it belongs to. */
+const wholeSchemaOf = (db: Database.Database) =>
+  db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all();
+
+test("a legal-body table stored under another letter case is refused at every stored version, and its row is kept", () => {
+  // SQLite matches table names without regard to case, so a statement written for `legal_bodies`
+  // reaches a table stored as `Legal_Bodies`.
+  const definedTable = sqlOf(definedByTheCode(), "legal_bodies");
+  const underAnotherCase = definedTable.replace(
+    /^CREATE TABLE legal_bodies\b/,
+    "CREATE TABLE Legal_Bodies",
+  );
+  expect(underAnotherCase).not.toBe(definedTable);
+  for (const [shape, change] of [
+    ["created under that name", `DROP TABLE legal_bodies; ${underAnotherCase};`],
+    [
+      "renamed to that name through another one",
+      "ALTER TABLE legal_bodies RENAME TO legal_bodies_aside; ALTER TABLE legal_bodies_aside RENAME TO Legal_Bodies;",
+    ],
+  ] as const)
+    for (const stored of [
+      null,
+      "0",
+      String(LEGAL_BODIES_SCHEMA_VERSION),
+      String(LEGAL_BODIES_SCHEMA_VERSION + 1),
+    ]) {
+      const label = `${shape}, stored version ${stored}`;
+      const db = migrated();
+      db.exec(change);
+      // The body has no event: this table holds the only row, and the event log is empty.
+      addBodyWithoutAnEvent(db);
+      storeVersion(db, stored);
+      expect(
+        db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND lower(name) = ?")
+          .pluck()
+          .all("legal_bodies"),
+        label,
+      ).toEqual(["Legal_Bodies"]);
+      const before = { schema: wholeSchemaOf(db), rows: rowsOf(db), version: storedVersion(db) };
+      expect(before.rows.bodies, label).toHaveLength(1);
+      expect(before.rows.events, label).toHaveLength(0);
+
+      expect(() => migrate(db), label).toThrow(
+        /^legal-body schema holds a table whose name differs in letter case: "Legal_Bodies"\./,
+      );
+      expect(
+        { schema: wholeSchemaOf(db), rows: rowsOf(db), version: storedVersion(db) },
+        label,
+      ).toEqual(before);
+      expect(db.inTransaction, label).toBe(false);
+    }
+});
+
 // ── What a correct migration, or a hand on the database, leaves behind at the SAME version ──
 
 test("a table rebuilt from the same definition, with a row present, is accepted: at the same version, and as the upgrade a migration prepared", () => {

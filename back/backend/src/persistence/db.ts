@@ -496,13 +496,27 @@ const LEGAL_BODIES_SCHEMA_VERSION_KEY = "legal_bodies_schema_version";
 interface SchemaObject {
   type: string;
   name: string;
+  /** The table the object belongs to (for a table, its own name). */
+  tbl_name: string;
   sql: string;
 }
 
-/** The two tables with their indexes and triggers, without the indexes SQLite makes by itself. */
+/**
+ * The two tables, the event log first: it references the other, so it is dropped first. The step
+ * checks and drops a table only under one of these exact names.
+ */
+const LEGAL_BODY_TABLES = ["legal_body_events", "legal_bodies"] as const;
+const isLegalBodyTableName = (name: string) =>
+  (LEGAL_BODY_TABLES as readonly string[]).includes(name);
+
+/**
+ * The two tables with their indexes and triggers, without the indexes SQLite makes by itself.
+ * They are found whatever the letter case of the table name: SQLite matches table names without
+ * regard to case, so a table stored as `Legal_Bodies` is the one that `legal_bodies` names.
+ */
 const LEGAL_BODY_SCHEMA_OBJECTS_SQL = `
-  SELECT type, name, sql FROM sqlite_master
-   WHERE tbl_name IN ('legal_bodies','legal_body_events') AND substr(name, 1, 7) != 'sqlite_'
+  SELECT type, name, tbl_name, sql FROM sqlite_master
+   WHERE lower(tbl_name) IN ('legal_bodies','legal_body_events') AND substr(name, 1, 7) != 'sqlite_'
    ORDER BY name, type`;
 
 function legalBodySchemaObjects(db: Database.Database): SchemaObject[] {
@@ -606,7 +620,14 @@ type LegalBodySchemaPlan =
   | { action: "refuse"; message: string }
   | { action: "create" }
   | { action: "store_version" }
-  | { action: "recreate" }
+  | {
+      action: "recreate";
+      /**
+       * The tables to drop, the event log first: those found under their exact names, each
+       * checked empty by the same transaction that drops it.
+       */
+      drop: string[];
+    }
   | {
       action: "restore_triggers";
       /** Every trigger that differs, by name. */
@@ -620,6 +641,18 @@ type LegalBodySchemaPlan =
 
 function planLegalBodySchema(db: Database.Database, expected: SchemaObject[]): LegalBodySchemaPlan {
   const actual = legalBodySchemaObjects(db);
+  // A table stored under another letter case is reached by every statement written for the
+  // table, a DROP TABLE included. The step works only on tables stored under their exact names,
+  // and checks that before it decides anything else.
+  const misnamed = actual.filter(
+    (o) =>
+      o.type === "table" && !(isLegalBodyTableName(o.name) && isLegalBodyTableName(o.tbl_name)),
+  );
+  if (misnamed.length > 0)
+    return {
+      action: "refuse",
+      message: `legal-body schema holds a table whose name differs in letter case: ${misnamed.map((o) => JSON.stringify(o.name)).join(", ")}. The tables must be named exactly legal_bodies and legal_body_events; nothing was dropped or created.`,
+    };
   if (actual.length === 0) return { action: "create" };
 
   const stored = db
@@ -658,13 +691,15 @@ function planLegalBodySchema(db: Database.Database, expected: SchemaObject[]): L
       message: `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}: ${names(differing)}. Either LEGAL_BODIES_DDL was edited without raising LEGAL_BODIES_SCHEMA_VERSION, or the schema was changed by hand.`,
     };
   if (!atSameVersion) {
-    // An upgrade: the stored version is lower, or was never stored.
-    const holdsRows = ["legal_bodies", "legal_body_events"].some(
-      (table) =>
-        actual.some((o) => o.type === "table" && o.name === table) &&
-        db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get() !== undefined,
+    // An upgrade: the stored version is lower, or was never stored. Every table found is stored
+    // under its exact name (checked above); those are the tables checked here and dropped.
+    const tablesFound = LEGAL_BODY_TABLES.filter((table) =>
+      actual.some((o) => o.type === "table" && o.name === table),
     );
-    if (!holdsRows) return { action: "recreate" };
+    const holdsRows = tablesFound.some(
+      (table) => db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get() !== undefined,
+    );
+    if (!holdsRows) return { action: "recreate", drop: tablesFound };
     if (tablesAndIndexes.length > 0)
       return {
         action: "refuse",
@@ -689,6 +724,10 @@ function planLegalBodySchema(db: Database.Database, expected: SchemaObject[]): L
  * text. A table or an index is compared after normalising both texts (see `normalizeSchemaSql`),
  * so that a table a migration rebuilt from the same definition reads as the same table. Then:
  *
+ *  - A legal-body table stored under a name that differs in letter case (`Legal_Bodies`): SQLite
+ *    matches table names without regard to case, so every statement written for the table would
+ *    reach it. It throws, naming the stored name, whatever the stored version, before anything is
+ *    dropped or created. Every table the step checks or drops is stored under its exact name.
  *  - Nothing there yet: create everything, and store the version.
  *  - Same definitions: nothing to do, except to store the version if it is missing or lower.
  *  - Different definitions, and the stored version is HIGHER than this build's: a newer build
@@ -739,8 +778,8 @@ export function applyLegalBodySchema(db: Database.Database): void {
         storeVersion();
         break;
       case "recreate":
-        // The events table first: it references the other.
-        db.exec("DROP TABLE IF EXISTS legal_body_events; DROP TABLE IF EXISTS legal_bodies;");
+        // Only the tables the plan found and checked empty, in this transaction.
+        for (const table of plan.drop) db.exec(`DROP TABLE ${table}`);
         db.exec(LEGAL_BODIES_DDL);
         storeVersion();
         break;
