@@ -82,7 +82,11 @@ const EIP712_DOMAIN_ABI = [
 /** A wallet client that is known to carry the platform account — the shape the sign path needs. */
 type PlatformWallet = LocalWallet;
 
-/** A platform transaction request with everything but the nonce filled in. */
+/**
+ * A platform transaction request with everything decided except its nonce. A node that fills
+ * transactions (`eth_fillTransaction`) may leave a nonce of its own in it; the signer always
+ * replaces that with the nonce it picks inside the sender lock.
+ */
 export type PreparedPlatformTx = PreparedLocalTx;
 
 /**
@@ -96,7 +100,8 @@ export interface PreparedFundTransfer {
   usdc: Address;
   treasury: Address;
   amount: bigint;
-  /** The viem request: to, data, gas, fees, chain id. No nonce — that is the locked step. */
+  /** The viem request: to, data, gas, fees, chain id. Its nonce is decided later, in the locked
+   *  step (see {PreparedPlatformTx}). */
   request: PreparedPlatformTx;
 }
 
@@ -122,8 +127,8 @@ export interface PreparedRelayedCall {
   call: RelayedCall;
   /** The gas limit the caller decided on. */
   gas: bigint;
-  /** The viem request: to (the controller), data (the relay bytes), gas, fees, chain id. A
-   *  nonce a node filled in may be present; the signer replaces it with the one it picks. */
+  /** The viem request: to (the controller), data (the relay bytes), gas (always `gas`), fees,
+   *  chain id. Its nonce is decided later, in the locked step (see {PreparedPlatformTx}). */
   request: PreparedPlatformTx;
 }
 
@@ -409,24 +414,30 @@ export class ArcAdapter {
    * Everything the relayed call's transaction needs except its nonce — fees and chain id, with the
    * caller's `gas` — fetched with NO LOCK held, for the reason {prepareFundTreasury} gives.
    *
+   * THE GAS IS THE CALLER'S. It was estimated and capped before it got here, and it bounds what
+   * this one transaction can cost, so whatever gas the preparation came back with is overwritten
+   * with it: `request.gas` and the returned `gas` are always the same number.
+   *
    * No nonce is picked here: that is the locked step. A node that fills one anyway (an
    * `eth_fillTransaction` answer carries one) leaves it in the request, and {signRelayedCall}
    * replaces it with the nonce it picks inside the lock.
    */
   async prepareRelayedCall(call: RelayedCall, gas: bigint): Promise<PreparedRelayedCall> {
     const { account, controller, data } = this.relayRequest(call);
-    const request = await this.prepareAsPlatform({ account, to: controller, data, gas });
-    return { call, gas, request };
+    const prepared = await this.prepareAsPlatform({ account, to: controller, data, gas });
+    return { call, gas, request: { ...prepared, gas } };
   }
 
   /**
    * SIGN a prepared relayed call locally. Nothing is sent, and the hash is ours before anything
    * is. One RPC: the nonce.
    *
-   * Refuses, BEFORE signing, a request that is not the call it claims to be: one not addressed to
-   * the configured controller, or whose data is not the relay encoding of `prepared.call`. The
-   * prepared object passes through the caller's hands between the two halves, and the signature is
-   * the one step here that cannot be taken back.
+   * Refuses, BEFORE signing and before the nonce is read, a request that is not the call it claims
+   * to be: one not addressed to the configured controller; whose data is not the relay encoding of
+   * `prepared.call`; whose gas is not `prepared.gas`; that carries a value (a relayed call moves
+   * none, and a value here would move platform funds to the controller); or that names another
+   * chain than this adapter's. The prepared object passes through the caller's hands between the
+   * two halves, and the signature is the one step here that cannot be taken back.
    *
    * ⚠ THE CALLER HOLDS THE SENDER LOCK, across sign → record → send ({signFundTreasury} says why).
    * The nonce picker refuses outside it.
@@ -446,6 +457,18 @@ export class ArcAdapter {
     )
       throw new Error(
         `ArcAdapter: ${call.functionName}: the prepared transaction's data is not the relay encoding of ${call.functionName} to ${call.target} — refusing to sign it`,
+      );
+    if (request.gas !== prepared.gas)
+      throw new Error(
+        `ArcAdapter: ${call.functionName}: the prepared transaction's gas (${request.gas}) is not the gas limit it was prepared with (${prepared.gas}) — refusing to sign it`,
+      );
+    if (request.value !== undefined && request.value !== 0n)
+      throw new Error(
+        `ArcAdapter: ${call.functionName}: the prepared transaction carries a value (${request.value}), and a relayed call carries none — refusing to sign it`,
+      );
+    if (request.chainId !== undefined && request.chainId !== this.d.chainId)
+      throw new Error(
+        `ArcAdapter: ${call.functionName}: the prepared transaction is for chain ${request.chainId}, not this adapter's chain ${this.d.chainId} — refusing to sign it`,
       );
     return this.signPlatformTx(request, call.functionName);
   }

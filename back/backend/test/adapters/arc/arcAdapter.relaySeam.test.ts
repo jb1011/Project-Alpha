@@ -15,6 +15,7 @@ import {
   type Hex,
   RpcRequestError,
   type TransactionSerialized,
+  type WalletClient,
   concatHex,
   createPublicClient,
   createWalletClient,
@@ -113,19 +114,32 @@ const relayBytes = (target: Address): Hex =>
   ]);
 const RELAY_DATA = relayBytes(FACTORY);
 
-/** The real `ArcAdapter` over `node`, sending as `account` (the platform key unless told). */
+/**
+ * The real `ArcAdapter` over `node`, sending as `account` (the platform key unless told).
+ *
+ * `preparedGas` puts a gas of its own into every prepared request, after viem's preparation: the
+ * shape of any preparation step (a chain hook, a library change) that decides the gas itself.
+ */
 function adapterOver(
   node: FakeRpcNode,
-  opts: { controller?: Address; account?: Account | null } = {},
+  opts: { controller?: Address; account?: Account | null; preparedGas?: bigint } = {},
 ): ArcAdapter {
   const account = opts.account === null ? undefined : (opts.account ?? PLATFORM);
+  const wallet = createWalletClient({ account, chain: FAKE_NODE_CHAIN, transport: node.transport });
+  const preparedGas = opts.preparedGas;
+  const managerWallet: WalletClient =
+    preparedGas === undefined
+      ? wallet
+      : ({
+          ...wallet,
+          prepareTransactionRequest: async (args: never) => ({
+            ...(await wallet.prepareTransactionRequest(args)),
+            gas: preparedGas,
+          }),
+        } as unknown as WalletClient);
   return new ArcAdapter({
     publicClient: createPublicClient({ chain: FAKE_NODE_CHAIN, transport: node.transport }),
-    managerWallet: createWalletClient({
-      account,
-      chain: FAKE_NODE_CHAIN,
-      transport: node.transport,
-    }),
+    managerWallet,
     chainId: FAKE_NODE_CHAIN.id,
     factory: FACTORY,
     identityRegistry: REGISTRY,
@@ -316,6 +330,48 @@ describe.each(MODES)("relay seam, $name", (mode) => {
     expect(n.raw).toEqual([]);
   });
 
+  test("signRelayedCall refuses a request whose gas, value or chain id was altered", async () => {
+    const n = node();
+    const adapter = adapterOver(n, { controller: CONTROLLER });
+    const prepared = await adapter.prepareRelayedCall(CALL, GAS);
+    const withRequest = (change: Record<string, unknown>): PreparedRelayedCall => ({
+      ...prepared,
+      request: { ...prepared.request, ...change } as PreparedPlatformTx,
+    });
+    const asked = n.requests.length;
+
+    await withSenderLock(PLATFORM.address, async () => {
+      await expect(adapter.signRelayedCall(withRequest({ gas: GAS + 1n }))).rejects.toThrow(
+        /gas \(300001\) is not the gas limit it was prepared with \(300000\)/,
+      );
+      await expect(adapter.signRelayedCall(withRequest({ value: 1n }))).rejects.toThrow(
+        /carries a value \(1\)/,
+      );
+      await expect(
+        adapter.signRelayedCall(withRequest({ chainId: FAKE_NODE_CHAIN.id + 1 })),
+      ).rejects.toThrow(/is for chain 5042003, not this adapter's chain 5042002/);
+      // Refused before signing: not even the nonce was read.
+      expect(n.requests.length).toBe(asked);
+
+      // A value of zero is no value.
+      await expect(adapter.signRelayedCall(withRequest({ value: 0n }))).resolves.toMatchObject({
+        nonce: PENDING,
+      });
+    });
+    expect(n.raw).toEqual([]);
+  });
+
+  test("the gas prepared and signed is the caller's, whatever the preparation filled in", async () => {
+    const n = node();
+    const adapter = adapterOver(n, { controller: CONTROLLER, preparedGas: NODE_GAS_ESTIMATE });
+    const prepared = await adapter.prepareRelayedCall(CALL, GAS);
+    expect(prepared.gas).toBe(GAS);
+    expect(prepared.request.gas).toBe(GAS);
+
+    const signed = await withSenderLock(PLATFORM.address, () => adapter.signRelayedCall(prepared));
+    expect(parseTransaction(signed.rawTx).gas).toBe(GAS);
+  });
+
   test("inside the lock: sign, then send; the hash is known before anything is sent", async () => {
     const n = node();
     const adapter = adapterOver(n, { controller: CONTROLLER });
@@ -408,6 +464,24 @@ describe.each(MODES)("relay seam, $name", (mode) => {
       expect(await nextNonce()).toBe(51);
     },
   );
+});
+
+test("a node that fills its own gas: the prepared and the signed gas are still the caller's", async () => {
+  const n = fillLikeArc({
+    lockKey: PLATFORM.address,
+    pendingNonce: PENDING,
+    fillGas: NODE_GAS_ESTIMATE,
+  });
+  const adapter = adapterOver(n, { controller: CONTROLLER });
+  const prepared = await adapter.prepareRelayedCall(CALL, GAS);
+  // The node was told the caller's gas, and answers its own.
+  const fills = n.requests.filter((r) => r.method === "eth_fillTransaction");
+  expect(fills.map((r) => askedTx(r.params).gas)).toEqual([toHex(GAS)]);
+
+  expect(prepared.gas).toBe(GAS);
+  expect(prepared.request.gas).toBe(GAS);
+  const signed = await withSenderLock(PLATFORM.address, () => adapter.signRelayedCall(prepared));
+  expect(parseTransaction(signed.rawTx).gas).toBe(GAS);
 });
 
 test("the fund signer still refuses a nonce that is not a number, in the same words", async () => {

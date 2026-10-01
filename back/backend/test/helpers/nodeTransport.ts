@@ -5,8 +5,9 @@
  *  - {fillUnavailable}: the node has no `eth_fillTransaction` (it answers -32601), so viem falls
  *    back to the single calls: `eth_estimateGas`, the fee calls and `eth_getTransactionCount`.
  *  - {fillLikeArc}: the node answers `eth_fillTransaction` with `{ raw, tx }`, as Arc testnet does,
- *    so ONE call fills the gas, the fees and a nonce. A gas it was given is kept. viem multiplies
- *    the filled `maxFeePerGas` by 1.2, so no test may assert that the fee equals the node's.
+ *    so ONE call fills the gas, the fees and a nonce. A gas it was given is kept, unless `fillGas`
+ *    says the node answers its own. viem multiplies the filled `maxFeePerGas` by 1.2, so no test
+ *    may assert that the fee equals the node's.
  *
  * Both take a raw transaction once: the first time they answer its keccak, and the same bytes
  * again get the JSON-RPC error `already known`, as a real node's mempool does. Every raw
@@ -32,6 +33,8 @@ export interface NodeTransportOptions {
   preflight?: NodeAnswer;
   /** The PENDING count the node reports for any sender. It never moves on its own. Default 0. */
   pendingNonce?: number;
+  /** A gas the Arc-like node fills in WHATEVER gas it was given: a node with its own opinion. */
+  fillGas?: bigint;
   /** The signer whose send lock `requests[].locked` reports. */
   lockKey?: Address;
   /** The transport's per-request timeout. */
@@ -64,7 +67,7 @@ function presetNode(fills: boolean, opts: NodeTransportOptions): PresetNode {
         case "eth_fillTransaction":
           // Without fill support, the helper's own "method not found" answers.
           if (!fills) return undefined;
-          return opts.preflight ?? { result: arcFill(params[0] as RpcTxRequest) };
+          return opts.preflight ?? { result: arcFill(params[0] as RpcTxRequest, opts.fillGas) };
         case "eth_estimateGas":
           return opts.preflight ?? { result: toHex(NODE_GAS_ESTIMATE) };
         case "eth_getTransactionCount":
@@ -95,8 +98,11 @@ interface RpcTxRequest {
 }
 
 /** Arc's `eth_fillTransaction` answer: the unsigned bytes, and the transaction field by field. */
-function arcFill(request: RpcTxRequest): { raw: Hex; tx: Record<string, unknown> } {
-  const gas = request.gas ? BigInt(request.gas) : NODE_GAS_ESTIMATE;
+function arcFill(
+  request: RpcTxRequest,
+  fillGas: bigint | undefined,
+): { raw: Hex; tx: Record<string, unknown> } {
+  const gas = fillGas ?? (request.gas ? BigInt(request.gas) : NODE_GAS_ESTIMATE);
   const value = request.value ? BigInt(request.value) : 0n;
   const input = request.input ?? request.data ?? "0x";
   const raw = serializeTransaction({
