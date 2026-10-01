@@ -11,17 +11,21 @@
  * wrapped digest, or spend a set amount of gas.
  *
  * One chain and one stack for the whole file, deployed once in `beforeAll`. Every case registers
- * its own identity and signs its own link, so the cases share nothing but the contracts.
+ * its own identity and signs its own link, so the cases share nothing but the contracts. A case
+ * that changes a controller grant or switches automine off puts it back before it ends.
  */
 import {
   http,
+  type Abi,
   type Address,
   type Hex,
   type Log,
   type PrivateKeyAccount,
   type PublicClient,
+  type TestClient,
   type WalletClient,
   createPublicClient,
+  createTestClient,
   createWalletClient,
   encodeAbiParameters,
   encodeFunctionData,
@@ -36,6 +40,7 @@ import {
   serializeCompactSignature,
   signatureToCompactSignature,
   stringToHex,
+  toFunctionSelector,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
@@ -49,9 +54,12 @@ import { assertLegalBodyFactoryWiring } from "../../../src/adapters/arc/bootVeri
 import {
   CREATE_GAS_CEILING,
   CREATE_GAS_HEADROOM_PERCENT,
+  CREATE_MAX_FEE_WEI,
   LegalBodyChain,
+  LegalBodyChainFaultError,
   type LegalBodyCreated,
   LegalBodyGasTooHighError,
+  type SubmitCreateResult,
 } from "../../../src/adapters/arc/legalBodyChain";
 import { ContractRevertError } from "../../../src/adapters/arc/relay";
 import { anvilChain } from "../../../src/chains";
@@ -66,9 +74,12 @@ import {
 } from "../../../src/legalBody/link";
 import { type AnvilHandle, startAnvil } from "../../helpers/anvil";
 import {
+  LEGAL_BODY_FACTORY_SELECTORS,
   type LegalBodyStack,
   deployContract,
   deployLegalBodyStack,
+  grantSelector,
+  revokeSelector,
 } from "../../helpers/legalBodyStack";
 
 /** This file's own port: 8545–8552 belong to the other anvil-based files. */
@@ -124,6 +135,8 @@ const policyWalletAbi = parseAbi([
   "function setBurn(uint256 gas_)",
   "function setWrap(bool on)",
 ]);
+/** `MockERC1271Wallet`'s switch: when on, its check refuses every signature. */
+const refusingWalletAbi = parseAbi(["function setRefuseAll(bool v)"]);
 
 let anvil: AnvilHandle | undefined;
 let pub: PublicClient;
@@ -655,5 +668,344 @@ describe("the create, relayed through the real controller to the real factory", 
       code: "bad_signature",
       ...(await knownFacts(link, stranger.address)),
     });
+  });
+});
+
+describe("faults, races and recovery of the create, on the same chain", () => {
+  /** anvil's own controls: automine, mining a block, taking a transaction out of the pool. */
+  let node: TestClient;
+
+  beforeAll(() => {
+    if (!anvil) throw new Error("anvil is not running");
+    node = createTestClient({ chain: anvilChain, mode: "anvil", transport: http(anvil.rpcUrl) });
+  });
+
+  /**
+   * Run `fn` with automine off, so transactions wait in the pool until the case mines a block.
+   * Automine is always switched back on, and a block is mined if anything is still pending, so a
+   * case that failed half-way leaves nothing to the next one.
+   */
+  async function withAutomineOff<T>(fn: () => Promise<T>): Promise<T> {
+    await node.setAutomine(false);
+    try {
+      return await fn();
+    } finally {
+      await node.setAutomine(true);
+      if ((await node.getTxpoolStatus()).pending > 0) await node.mine({ blocks: 1 });
+    }
+  }
+
+  /** The controller grant of `selector` to the executor, as the admin gives or withdraws it. */
+  const executorGrant = (selector: Hex) => ({
+    admin: walletOf(admin),
+    pub,
+    controller: stack.controller,
+    selector,
+    account: executor.address,
+  });
+
+  /** A fresh identity owned by `owner`, and its link, signed by `owner` and accepted. */
+  async function acceptedKeyLink(): Promise<{ link: LegalBodyLink; check: Accepted }> {
+    const link = await newLink(await registerByKey(owner));
+    const check = accepted(
+      await checkLink(lb, { link, signature: await signLink(owner, link), expected }),
+    );
+    return { link, check };
+  }
+
+  function sentOf(result: SubmitCreateResult): Extract<SubmitCreateResult, { status: "sent" }> {
+    if (result.status !== "sent")
+      throw new Error(`expected the create to be sent, got ${result.status}`);
+    return result;
+  }
+
+  /** What a relay seam's revert names, after its "reverted in simulation: " prefix. */
+  function revertDetail(e: unknown): string {
+    if (!(e instanceof ContractRevertError)) throw new Error(`expected a revert, got ${String(e)}`);
+    const marker = "reverted in simulation: ";
+    const at = e.message.indexOf(marker);
+    if (at < 0) throw new Error(`a revert without its detail: ${e.message}`);
+    return e.message.slice(at + marker.length);
+  }
+
+  test("a missing grant is a fault of the platform, not a refusal of the link: with createLegalBody revoked from the executor, checkLink throws LegalBodyChainFaultError(NotAuthorized)", async () => {
+    const link = await newLink(await registerByKey(owner));
+    const signature = await signLink(owner, link);
+    const grant = executorGrant(LEGAL_BODY_FACTORY_SELECTORS.createLegalBody);
+
+    await revokeSelector(grant);
+    let fault: unknown;
+    try {
+      fault = await checkLink(lb, { link, signature, expected }).catch((e: unknown) => e);
+    } finally {
+      await grantSelector(grant);
+    }
+    expect(fault).toBeInstanceOf(LegalBodyChainFaultError);
+    expect((fault as LegalBodyChainFaultError).errorName).toBe("NotAuthorized");
+    // The refusal is the controller's, naming the selector and the executor.
+    expect(revertDetail((fault as LegalBodyChainFaultError).cause)).toBe(
+      `NotAuthorized(${LEGAL_BODY_FACTORY_SELECTORS.createLegalBody}, ${executor.address})`,
+    );
+
+    // With the grant back, the same link is accepted.
+    accepted(await checkLink(lb, { link, signature, expected }));
+  });
+
+  test("the executor cannot dissolve a body through the controller: without a grant the controller refuses, and with one the body refuses", async () => {
+    const { link, check } = await acceptedKeyLink();
+    const { created } = await createAccepted(link, check);
+    const dissolve = {
+      target: created.legalBody,
+      abi: legalManagerAbi as Abi,
+      functionName: "initiateDissolution",
+      args: [],
+    };
+    const selector = toFunctionSelector("initiateDissolution()");
+
+    // Both refusals are named NotAuthorized: the controller's carries the selector and the caller,
+    // the body's carries nothing. The message tells them apart, the name cannot.
+    const byController = await arc.estimateRelayedCall(dissolve).catch((e: unknown) => e);
+    expect(byController).toBeInstanceOf(ContractRevertError);
+    expect((byController as ContractRevertError).errorName).toBe("NotAuthorized");
+    expect(revertDetail(byController)).toBe(`NotAuthorized(${selector}, ${executor.address})`);
+
+    const grant = executorGrant(selector);
+    await grantSelector(grant);
+    let byBody: unknown;
+    try {
+      byBody = await arc.estimateRelayedCall(dissolve).catch((e: unknown) => e);
+    } finally {
+      await revokeSelector(grant);
+    }
+    expect(byBody).toBeInstanceOf(ContractRevertError);
+    expect((byBody as ContractRevertError).errorName).toBe("NotAuthorized");
+    expect(revertDetail(byBody)).toBe("NotAuthorized()");
+  });
+
+  test("an identity that changes hands after the check: submitCreate's own fresh simulation refuses the link, and nothing is recorded or sent", async () => {
+    const { link, check } = await acceptedKeyLink();
+    await mined(
+      await walletOf(owner).writeContract({
+        address: stack.registry,
+        abi: iIdentityRegistryAbi,
+        functionName: "transferFrom",
+        args: [owner.address, stranger.address, link.agentId],
+        account: owner,
+        chain: anvilChain,
+      }),
+    );
+    expect(await lb.identityOwner(link.agentId)).toBe(stranger.address);
+    const before = await executorCounts();
+
+    const recorded: unknown[] = [];
+    const refusal = await lb
+      .submitCreate({
+        link,
+        signature: check.signature,
+        record: (signed) => {
+          recorded.push(signed);
+          return true;
+        },
+      })
+      .catch((e: unknown) => e);
+    expect(refusal).toBeInstanceOf(ContractRevertError);
+    expect((refusal as ContractRevertError).errorName).toBe("BadSignature");
+    expect(recorded).toEqual([]);
+    expect(await executorCounts()).toEqual(before);
+    await expect(
+      lb.createdState({ bodyAddress: check.bodyAddress, identityOwner: owner.address }),
+    ).resolves.toBe("absent");
+  });
+
+  test("a create whose owner refuses at mining time reverts, costs a bounded amount and leaves no body", async () => {
+    const wallet = await deployContract(walletOf(deployer), pub, "MockERC1271Wallet", [
+      owner.address,
+    ]);
+    const agentId = await registerByWallet(wallet);
+    const link = await newLink(agentId);
+    const check = accepted(
+      await checkLink(lb, { link, signature: await signLink(owner, link), expected }),
+    );
+    const before = await executorCounts();
+
+    const sent = await withAutomineOff(async () => {
+      const result = sentOf(
+        await lb.submitCreate({ link, signature: check.signature, record: () => true }),
+      );
+      // The owner's change must be mined before the create, and one block holding both would not
+      // say which runs first. So the create leaves the pool, the change is mined on its own, and
+      // the create's same signed bytes are sent again.
+      await node.dropTransaction({ hash: result.txHash });
+      const change = await walletOf(owner).writeContract({
+        address: wallet,
+        abi: refusingWalletAbi,
+        functionName: "setRefuseAll",
+        args: [true],
+        account: owner,
+        chain: anvilChain,
+      });
+      await node.mine({ blocks: 1 });
+      expect((await pub.getTransactionReceipt({ hash: change })).status).toBe("success");
+      await lb.rebroadcastCreate(result.rawTx);
+      await node.mine({ blocks: 1 });
+      return result;
+    });
+
+    await expect(
+      lb.createOutcome(sent.txHash, { bodyAddress: check.bodyAddress }),
+    ).resolves.toEqual({ status: "reverted" });
+    await expect(
+      lb.createdState({ bodyAddress: check.bodyAddress, identityOwner: wallet }),
+    ).resolves.toBe("absent");
+
+    // One transaction, bounded by its gas limit and its fee cap.
+    const receipt = await pub.getTransactionReceipt({ hash: sent.txHash });
+    const tx = await pub.getTransaction({ hash: sent.txHash });
+    expect(tx.gas).toBeLessThanOrEqual(CREATE_GAS_CEILING);
+    expect(receipt.gasUsed).toBeLessThan(tx.gas);
+    expect(receipt.gasUsed * receipt.effectiveGasPrice).toBeLessThanOrEqual(CREATE_MAX_FEE_WEI);
+    expect(await lb.executorNonce()).toBe(before.mined + 1);
+  });
+
+  test("two creates for one link, one after the other: one body, and the second is refused by its own simulation with LegalBodyExists", async () => {
+    const { link, check } = await acceptedKeyLink();
+    await createAccepted(link, check);
+    const before = await executorCounts();
+
+    const recorded: unknown[] = [];
+    const second = await lb
+      .submitCreate({
+        link,
+        signature: check.signature,
+        record: (signed) => {
+          recorded.push(signed);
+          return true;
+        },
+      })
+      .catch((e: unknown) => e);
+    expect(second).toBeInstanceOf(ContractRevertError);
+    expect((second as ContractRevertError).errorName).toBe("LegalBodyExists");
+    expect(recorded).toEqual([]);
+    expect(await executorCounts()).toEqual(before);
+    await expect(
+      lb.createdState({ bodyAddress: check.bodyAddress, identityOwner: owner.address }),
+    ).resolves.toBe("created");
+  });
+
+  test("two creates for one link at the same time: both pass their simulation and are sent with consecutive nonces, and once mined one created the body and the other reverted", async () => {
+    const { link, check } = await acceptedKeyLink();
+    const before = await executorCounts();
+    const recorded: { txHash: Hex; rawTx: Hex; nonce: number }[] = [];
+    const create = () =>
+      lb.submitCreate({
+        link,
+        signature: check.signature,
+        record: (signed) => {
+          recorded.push(signed);
+          return true;
+        },
+      });
+
+    const sent = await withAutomineOff(async () => {
+      // Whichever takes the sender lock first gets the lower nonce.
+      const both = (await Promise.all([create(), create()]))
+        .map(sentOf)
+        .sort((a, b) => a.nonce - b.nonce);
+      expect(both.map((s) => s.nonce)).toEqual([before.pending, before.pending + 1]);
+      expect([...recorded].sort((a, b) => a.nonce - b.nonce)).toEqual(
+        both.map(({ txHash, rawTx, nonce }) => ({ txHash, rawTx, nonce })),
+      );
+      await node.mine({ blocks: 1 });
+      return both;
+    });
+
+    const outcomes = await Promise.all(
+      sent.map((s) => lb.createOutcome(s.txHash, { bodyAddress: check.bodyAddress })),
+    );
+    expect(outcomes.map((o) => o.status).sort()).toEqual(["created", "reverted"]);
+    const winner = outcomes.find((o) => o.status === "created");
+    expect(winner).toMatchObject({
+      created: { legalBody: check.bodyAddress, agentId: link.agentId },
+    });
+    await expect(
+      lb.createdState({ bodyAddress: check.bodyAddress, identityOwner: owner.address }),
+    ).resolves.toBe("created");
+    expect(await lb.executorNonce()).toBe(before.mined + 2);
+  });
+
+  test("a lost response: the same bytes sent again while pending are the same transaction, so there is one receipt and the executor's nonce moves by one", async () => {
+    const { link, check } = await acceptedKeyLink();
+    const before = await executorCounts();
+
+    const sent = await withAutomineOff(async () => {
+      const result = sentOf(
+        await lb.submitCreate({ link, signature: check.signature, record: () => true }),
+      );
+      await expect(
+        lb.createOutcome(result.txHash, { bodyAddress: check.bodyAddress }),
+      ).resolves.toEqual({ status: "absent" });
+      await expect(lb.rebroadcastCreate(result.rawTx)).resolves.toBeUndefined();
+      await node.mine({ blocks: 1 });
+      return result;
+    });
+
+    const receipt = await pub.getTransactionReceipt({ hash: sent.txHash });
+    expect(receipt.status).toBe("success");
+    const block = await pub.getBlock({ blockNumber: receipt.blockNumber });
+    expect(block.transactions).toEqual([sent.txHash]);
+    expect(await lb.executorNonce()).toBe(before.mined + 1);
+    await expect(
+      lb.createOutcome(sent.txHash, { bodyAddress: check.bodyAddress }),
+    ).resolves.toMatchObject({ status: "created", created: { legalBody: check.bodyAddress } });
+  });
+
+  test("a record that answers false: nothing is sent, and the executor's pending nonce is unchanged", async () => {
+    const { link, check } = await acceptedKeyLink();
+    const before = await executorCounts();
+
+    const handed: { txHash: Hex; rawTx: Hex; nonce: number }[] = [];
+    const result = await lb.submitCreate({
+      link,
+      signature: check.signature,
+      record: (signed) => {
+        handed.push(signed);
+        return false;
+      },
+    });
+    expect(result).toEqual({ status: "not_recorded" });
+    expect(handed).toHaveLength(1);
+    expect(handed[0]?.nonce).toBe(before.pending);
+    expect(await executorCounts()).toEqual(before);
+    await expect(
+      lb.createdState({ bodyAddress: check.bodyAddress, identityOwner: owner.address }),
+    ).resolves.toBe("absent");
+
+    // The nonce was not skipped: the next create from the executor takes it.
+    const next = sentOf(
+      await lb.submitCreate({ link, signature: check.signature, record: () => true }),
+    );
+    expect(next.nonce).toBe(before.pending);
+    await lb.confirmCreate(next.txHash, { bodyAddress: check.bodyAddress });
+  });
+
+  test("findCreation finds the creating transaction from the block the link was checked at, and returns undefined for a range before it", async () => {
+    const { link, check } = await acceptedKeyLink();
+    const { txHash, created } = await createAccepted(link, check);
+    expect(created.blockNumber).toBeGreaterThan(check.observedAtBlock);
+
+    const found = await lb.findCreation({
+      bodyAddress: check.bodyAddress,
+      fromBlock: BigInt(check.observedAtBlock),
+    });
+    expect(found).toEqual(created);
+    expect(found?.txHash).toBe(txHash);
+
+    await expect(
+      lb.findCreation({
+        bodyAddress: check.bodyAddress,
+        fromBlock: 0n,
+        toBlock: BigInt(created.blockNumber - 1),
+      }),
+    ).resolves.toBeUndefined();
   });
 });
