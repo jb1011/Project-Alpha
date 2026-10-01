@@ -14,8 +14,9 @@
  * it is testing the rule and not a convenient fiction.
  */
 import type Database from "better-sqlite3";
-import type { Hex } from "viem";
+import { type Address, type Hex, encodeErrorResult } from "viem";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { legalManagerAbi } from "../../src/abis/generated";
 import { MAX_ANCHOR_REVERT_ATTEMPTS } from "../../src/formation/schedule";
 import {
   buildManifestV1,
@@ -37,11 +38,20 @@ import { parseAgentSpec } from "../../src/policy/agentSpec";
 import { translate } from "../../src/policy/translator";
 import type { EntityRecord } from "../../src/types";
 import {
+  type AnchorChain,
   type AnchorLoopDeps,
   advanceAnchor,
   deriveLegalBlock,
   resetAnchorWarnings,
 } from "../../src/workflow/anchorLoop";
+import {
+  type FakeRpcNode,
+  NODE_REVERT_CHAIN,
+  causeChain,
+  fakeRpcNode,
+  nodeRevert,
+  relayingAdapter,
+} from "../helpers/fakeRpcNode";
 import {
   COMPANY_ID,
   COMPANY_KEY,
@@ -1047,6 +1057,147 @@ test("F5: `TooEarly` is the timelock, not a failure — no park, no burned attem
   // …and the moment block time catches up, the same cycle executes.
   chain.state.nowSeconds = Math.floor(clock / 1000);
   expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "executed" });
+});
+
+// ── F5 again, on the error a real node produces ────────────────────────────────────────────
+//
+// The F5 tests above hand the loop a ContractRevertError directly. These route the two
+// broadcasts through the REAL ArcAdapter, relayed, over a fake node that answers the preflight
+// the way a node does (`helpers/fakeRpcNode`), so the loop classifies exactly what the adapter
+// throws in production. The reads stay on the fake chain.
+
+/** The entity's persisted manager IS the controller, so the adapter relays its amendments. */
+const RELAY_CONTROLLER = formedEntity().manager as Address;
+
+function relayedThroughNode(node: FakeRpcNode): {
+  arc: AnchorChain;
+  node: FakeRpcNode;
+  /** Every error the adapter threw at the loop, as thrown. */
+  thrown: unknown[];
+} {
+  const adapter = relayingAdapter(node, { controller: RELAY_CONTROLLER });
+  const thrown: unknown[] = [];
+  const recorded =
+    (send: AnchorChain["scheduleOperatingAgreementUpdate"]) =>
+    async (proxy: Address, hash: Hex, agentManager?: Address) => {
+      try {
+        return await send(proxy, hash, agentManager);
+      } catch (e) {
+        thrown.push(e);
+        throw e;
+      }
+    };
+  return {
+    arc: {
+      ...chain.chain,
+      scheduleOperatingAgreementUpdate: recorded((p, h, m) =>
+        adapter.scheduleOperatingAgreementUpdate(p, h, m),
+      ),
+      executeOperatingAgreementUpdate: recorded((p, h, m) =>
+        adapter.executeOperatingAgreementUpdate(p, h, m),
+      ),
+    },
+    node,
+    thrown,
+  };
+}
+
+const legalManagerRevert = (errorName: "TooEarly" | "NotManager") =>
+  nodeRevert(encodeErrorResult({ abi: legalManagerAbi, errorName }));
+
+test("F5 (node shape): a node's TooEarly is 'not due', retried at the next tick, no attempt burned", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  // OUR clock says the amendment is due; the node's block time does not agree yet.
+  clock += 25 * 60 * 60 * 1000;
+  const relay = relayedThroughNode(fakeRpcNode({ preflight: legalManagerRevert("TooEarly") }));
+
+  const out = await advanceAnchor(deps({ arc: relay.arc }), ENTITY_KEY);
+  expect(out).toMatchObject({ version: 2, state: "scheduled", skipped: "not_due" });
+  // The fixture is the production shape, not a convenient one.
+  expect(causeChain(relay.thrown[0])).toEqual([
+    "ContractRevertError",
+    ...NODE_REVERT_CHAIN.localAccount,
+  ]);
+  let row = cycle(2)!;
+  expect(row.attempt).toBe(0);
+  expect(row.nextRetryAt).toBeNull();
+  expect(row.retryIntervalMs).toBeNull();
+
+  // No backoff: the very next tick asks the chain again.
+  clock += 60_000;
+  expect(await advanceAnchor(deps({ arc: relay.arc }), ENTITY_KEY)).toMatchObject({
+    skipped: "not_due",
+  });
+  expect(relay.node.calls.filter((m) => m === "eth_fillTransaction")).toHaveLength(2);
+  row = cycle(2)!;
+  expect(row.attempt).toBe(0);
+  expect(row.nextRetryAt).toBeNull();
+  expect(relay.node.calls).not.toContain("eth_sendRawTransaction");
+
+  // …and once block time catches up, the same cycle executes.
+  chain.state.nowSeconds = Math.floor(clock / 1000);
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "executed" });
+});
+
+test("F5 (node shape): a node's NotManager burns an attempt per pass and ends in the `failed` hold", async () => {
+  seedV1();
+  confirmFiling();
+  const relay = relayedThroughNode(fakeRpcNode({ preflight: legalManagerRevert("NotManager") }));
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+  try {
+    for (let i = 1; i <= MAX_ANCHOR_REVERT_ATTEMPTS; i++) {
+      await advanceAnchor(deps({ arc: relay.arc }), ENTITY_KEY);
+      const row = cycle(2)!;
+      expect(row.attempt).toBe(i);
+      expect(row.error).toMatch(/^NotManager: relay scheduleOperatingAgreementUpdate -> /);
+      clock = row.nextRetryAt ?? clock;
+    }
+  } finally {
+    spy.mockRestore();
+  }
+  expect(causeChain(relay.thrown[0])).toEqual([
+    "ContractRevertError",
+    ...NODE_REVERT_CHAIN.localAccount,
+  ]);
+  expect(relay.thrown).toHaveLength(MAX_ANCHOR_REVERT_ATTEMPTS);
+  expect(cycle(2)!.state).toBe("failed");
+  const exhausted = lines
+    .filter((l) => l.startsWith("{"))
+    .map((l) => JSON.parse(l) as { opslog?: string })
+    .filter((l) => l.opslog === "anchor_revert_exhausted");
+  expect(exhausted).toEqual([
+    expect.objectContaining({
+      severity: "CRITICAL",
+      revert: "NotManager",
+      attempt: MAX_ANCHOR_REVERT_ATTEMPTS,
+      version: 2,
+    }),
+  ]);
+  // Nothing was ever broadcast: every attempt died at the preflight.
+  expect(relay.node.calls).not.toContain("eth_sendRawTransaction");
+});
+
+test("F5 (node shape): a node that times out still parks with backoff and burns nothing", async () => {
+  seedV1();
+  confirmFiling();
+  const relay = relayedThroughNode(fakeRpcNode({ everyCall: { hang: true }, timeoutMs: 20 }));
+
+  await advanceAnchor(deps({ arc: relay.arc }), ENTITY_KEY);
+  expect(causeChain(relay.thrown[0])).toEqual(["EstimateGasExecutionError", "TimeoutError"]);
+  let row = cycle(2)!;
+  expect(row.state).toBe("pending");
+  expect(row.attempt).toBe(0);
+  expect(row.retryIntervalMs).toBe(2 * 60_000);
+  expect(row.nextRetryAt).toBe(clock + 2 * 60_000);
+
+  clock = row.nextRetryAt!;
+  await advanceAnchor(deps({ arc: relay.arc }), ENTITY_KEY);
+  row = cycle(2)!;
+  expect(row.attempt).toBe(0);
+  expect(row.retryIntervalMs).toBe(4 * 60_000);
 });
 
 // ── F6/F8/F9: the cheap gates, one history read, one warning ───────────────────────────────
