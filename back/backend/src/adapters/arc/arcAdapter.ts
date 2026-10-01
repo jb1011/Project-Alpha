@@ -7,6 +7,7 @@ import {
   type Hex,
   type PublicClient,
   TransactionReceiptNotFoundError,
+  type TransactionSerialized,
   type Transport,
   type WalletClient,
   encodeFunctionData,
@@ -14,6 +15,7 @@ import {
   keccak256,
   parseEventLogs,
   parseTransaction,
+  recoverTransactionAddress,
 } from "viem";
 import {
   agentTreasuryAbi,
@@ -81,7 +83,7 @@ const EIP712_DOMAIN_ABI = [
 type PlatformWallet = LocalWallet;
 
 /** A platform transaction request with everything but the nonce filled in. */
-type PreparedPlatformTx = PreparedLocalTx;
+export type PreparedPlatformTx = PreparedLocalTx;
 
 /**
  * A treasury top-up with everything fetched except its nonce — the result of
@@ -96,6 +98,43 @@ export interface PreparedFundTransfer {
   amount: bigint;
   /** The viem request: to, data, gas, fees, chain id. No nonce — that is the locked step. */
   request: PreparedPlatformTx;
+}
+
+/**
+ * A role-gated call to relay through the controller, as its TARGET sees it. The relay adds only
+ * the routing: the target's 20 bytes after the calldata (see relay.ts).
+ */
+export interface RelayedCall {
+  target: Address;
+  abi: Abi;
+  functionName: string;
+  args: readonly unknown[];
+}
+
+/**
+ * A relayed call with everything fetched except its nonce — the result of
+ * {ArcAdapter.prepareRelayedCall} and the input to {ArcAdapter.signRelayedCall}.
+ *
+ * It keeps the call it was prepared from, so the signer can check that the transaction it is
+ * about to sign is that call, sent to the controller, and nothing else.
+ */
+export interface PreparedRelayedCall {
+  call: RelayedCall;
+  /** The gas limit the caller decided on. */
+  gas: bigint;
+  /** The viem request: to (the controller), data (the relay bytes), gas, fees, chain id. A
+   *  nonce a node filled in may be present; the signer replaces it with the one it picks. */
+  request: PreparedPlatformTx;
+}
+
+/** The bytes the controller is sent for `call`: its calldata, then its target (relay.ts). */
+function relayEncoding(call: RelayedCall): Hex {
+  const calldata = encodeFunctionData({
+    abi: call.abi,
+    functionName: call.functionName,
+    args: call.args,
+  });
+  return appendRelayTarget(calldata, call.target);
 }
 
 /** The two calls that happen INSIDE the send lock (`localSend.ts`), under the platform's name. */
@@ -317,6 +356,110 @@ export class ArcAdapter {
     }
     const prepared = await this.prepareAsPlatform({ account, to: controller, data, gas });
     return this.sendAsPlatform(account.address, prepared);
+  }
+
+  // ── The relay seam: prepare with no lock held, then sign, record and send inside it ──────────
+  //
+  // {sendManagerCall} returns only once the node has accepted the transaction, so its caller has
+  // nothing to record before the bytes are on the wire. A relayed call that must be recorded
+  // FIRST takes the treasury top-up's sequence instead, through these four doors: estimate and
+  // prepare outside the lock, then — inside the caller's sender lock — sign, record, send.
+  // Relayed only: there is no direct path here, and the signer behind them stays private.
+
+  /**
+   * The relay bytes for `call`, and who sends them where. Refuses without an account (viem would
+   * substitute the zero address) and without a controller (there is nothing to relay through).
+   */
+  private relayRequest(call: RelayedCall): { account: Account; controller: Address; data: Hex } {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send/simulate as the zero address",
+      );
+    const controller = this.d.controller;
+    if (!controller)
+      throw new Error(
+        `ArcAdapter: ${call.functionName} is relayed through the controller, and no controller is configured`,
+      );
+    return { account, controller, data: relayEncoding(call) };
+  }
+
+  /**
+   * The gas the relayed call needs, from viem's `estimateGas` on the exact bytes that would be
+   * sent: from the executor, to the controller.
+   *
+   * It is also the simulation. A call the target or the controller refuses reverts HERE, before
+   * anything is signed, and the revert is decoded against the target's ABI and the controller's
+   * (`relayRevertError`). A transport failure is rethrown untouched, so an RPC outage never reads
+   * as a refusal by a contract.
+   *
+   * The number is the estimate and nothing more: the caller applies its own headroom and ceiling
+   * and hands the result to {prepareRelayedCall}.
+   */
+  async estimateRelayedCall(call: RelayedCall): Promise<bigint> {
+    const { account, controller, data } = this.relayRequest(call);
+    try {
+      return await this.d.publicClient.estimateGas({ account, to: controller, data });
+    } catch (err) {
+      throw relayRevertError(err, { ...call, controller });
+    }
+  }
+
+  /**
+   * Everything the relayed call's transaction needs except its nonce — fees and chain id, with the
+   * caller's `gas` — fetched with NO LOCK held, for the reason {prepareFundTreasury} gives.
+   *
+   * No nonce is picked here: that is the locked step. A node that fills one anyway (an
+   * `eth_fillTransaction` answer carries one) leaves it in the request, and {signRelayedCall}
+   * replaces it with the nonce it picks inside the lock.
+   */
+  async prepareRelayedCall(call: RelayedCall, gas: bigint): Promise<PreparedRelayedCall> {
+    const { account, controller, data } = this.relayRequest(call);
+    const request = await this.prepareAsPlatform({ account, to: controller, data, gas });
+    return { call, gas, request };
+  }
+
+  /**
+   * SIGN a prepared relayed call locally. Nothing is sent, and the hash is ours before anything
+   * is. One RPC: the nonce.
+   *
+   * Refuses, BEFORE signing, a request that is not the call it claims to be: one not addressed to
+   * the configured controller, or whose data is not the relay encoding of `prepared.call`. The
+   * prepared object passes through the caller's hands between the two halves, and the signature is
+   * the one step here that cannot be taken back.
+   *
+   * ⚠ THE CALLER HOLDS THE SENDER LOCK, across sign → record → send ({signFundTreasury} says why).
+   * The nonce picker refuses outside it.
+   */
+  async signRelayedCall(
+    prepared: PreparedRelayedCall,
+  ): Promise<{ rawTx: Hex; txHash: Hex; nonce: number }> {
+    const { call, request } = prepared;
+    const controller = this.d.controller;
+    if (!controller || !request.to || !isAddressEqual(request.to, controller))
+      throw new Error(
+        `ArcAdapter: ${call.functionName}: the prepared transaction is not addressed to the configured controller (to ${request.to}, controller ${controller}) — refusing to sign it`,
+      );
+    if (
+      typeof request.data !== "string" ||
+      request.data.toLowerCase() !== relayEncoding(call).toLowerCase()
+    )
+      throw new Error(
+        `ArcAdapter: ${call.functionName}: the prepared transaction's data is not the relay encoding of ${call.functionName} to ${call.target} — refusing to sign it`,
+      );
+    return this.signPlatformTx(request, call.functionName);
+  }
+
+  /**
+   * Put a signed relayed call on the wire. The same send as {sendRawFundTreasury}, and like it,
+   * takes NO lock of its own: the caller's window started at the signature.
+   *
+   * May throw for bytes the node already has (`already known`, `nonce too low`). A re-send of the
+   * same bytes is the same transaction, never a second one; what that error means is the caller's
+   * to decide.
+   */
+  async sendRawRelayedCall(rawTx: Hex): Promise<Hex> {
+    return this.sendRawPlatformTx(rawTx);
   }
 
   /**
@@ -753,6 +896,20 @@ export class ArcAdapter {
   async signFundTreasury(
     prepared: PreparedFundTransfer,
   ): Promise<{ rawTx: Hex; txHash: Hex; nonce: number }> {
+    return this.signPlatformTx(prepared.request, "signFundTreasury");
+  }
+
+  /**
+   * The signer behind {signFundTreasury} and {signRelayedCall}: number a prepared platform
+   * transaction from the ledger and sign it locally. THE CALLER HOLDS THE SENDER LOCK.
+   *
+   * Any nonce already in `request` is replaced: the only nonce that counts is the one picked here,
+   * inside the lock. `operation` names the caller in the refusal.
+   */
+  private async signPlatformTx(
+    request: PreparedPlatformTx,
+    operation: string,
+  ): Promise<{ rawTx: Hex; txHash: Hex; nonce: number }> {
     const account = this.d.managerWallet.account;
     if (!account)
       throw new Error(
@@ -768,16 +925,16 @@ export class ArcAdapter {
     // integer gets us a `NaN`, which persists as nothing at all. Better to fail here (the
     // registrar's rule, verbatim).
     if (!Number.isInteger(nonce))
-      throw new Error(`signFundTreasury: no usable nonce for this transfer (got ${nonce})`);
-    const request = { ...prepared.request, nonce };
+      throw new Error(`${operation}: no usable nonce for this transfer (got ${nonce})`);
+    const numbered = { ...request, nonce };
     // Signed by the ACCOUNT, not through the wallet action, which would ask the node for the chain
     // id first — one more call inside the caller's lock, for a value the request already carries.
     // See `localSend.ts`, which does the same for every other send from a local key.
     const rawTx = await localSigner(
       this.d.managerWallet,
       "ArcAdapter: the platform account",
-    )(request);
-    return { rawTx, txHash: keccak256(rawTx), nonce: Number(request.nonce) };
+    )(numbered);
+    return { rawTx, txHash: keccak256(rawTx), nonce: Number(numbered.nonce) };
   }
 
   /**
@@ -789,18 +946,34 @@ export class ArcAdapter {
    * already carry theirs. A lock here would deadlock the first and buy the second nothing.
    */
   async sendRawFundTreasury(rawTx: Hex): Promise<Hex> {
+    return this.sendRawPlatformTx(rawTx);
+  }
+
+  /**
+   * The sender behind {sendRawFundTreasury} and {sendRawRelayedCall}: hand signed bytes to the
+   * node, then raise the platform's nonce floor if — and only if — the platform key signed them.
+   */
+  private async sendRawPlatformTx(rawTx: Hex): Promise<Hex> {
     // The bounded client (`clients.ts`): on the saga's path this call happens inside the lock.
     const hash = await this.sendVia.sendRawTransaction({ serializedTransaction: rawTx });
     // The node took it, so its nonce is spent: raise the floor for the next send from this key.
     // Read from the BYTES, which cannot disagree with what was sent, and never at the cost of the
     // send — past this line nothing may turn an accepted transfer into an error (gate N4).
+    //
+    // The signer is read from the bytes too. Another key's transaction says nothing about this
+    // key's nonces, and raising our floor to its number would skip nonces nothing will fill.
     try {
       const sender = this.platformAddress;
       const nonce = parseTransaction(rawTx).nonce;
-      if (sender && nonce !== undefined) noteSenderBroadcast(sender, nonce);
+      if (sender && nonce !== undefined) {
+        const signer = await recoverTransactionAddress({
+          serializedTransaction: rawTx as TransactionSerialized,
+        });
+        if (isAddressEqual(signer, sender)) noteSenderBroadcast(sender, nonce);
+      }
     } catch {
-      // Unparseable bytes say nothing about a transaction the node has already accepted. The floor
-      // stays where it is; the next send falls back to the node's own count.
+      // Unparseable or unsigned bytes say nothing about a transaction the node has already
+      // accepted. The floor stays where it is; the next send falls back to the node's own count.
     }
     return hash;
   }
