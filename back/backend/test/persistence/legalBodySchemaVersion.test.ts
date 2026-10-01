@@ -192,7 +192,8 @@ test("an in-sync schema with no stored version, or a lower one, only has the ver
     expect({ objects: objectsOf(db), rows: rowsOf(db) }).toEqual(before);
     expect(storedVersion(db), String(stored)).toBe(String(LEGAL_BODIES_SCHEMA_VERSION));
   }
-  // A higher stored version is never lowered, even when the definitions are the same.
+  // When the tables exist, a newer stored version is left untouched, even when the definitions
+  // are the same.
   const db = migrated();
   storeVersion(db, String(LEGAL_BODIES_SCHEMA_VERSION + 1));
   migrate(db);
@@ -539,7 +540,7 @@ test("an index or a table altered at the same version: migrate refuses, names it
     }
 });
 
-test("a table or an index is compared without its layout and its identifier quoting, and nothing else is overlooked", () => {
+test("a table or an index is compared without its layout and its identifier quoting", () => {
   // Through the step itself: an index written with other spacing and the three quoting styles is
   // the same index...
   const db = migrated();

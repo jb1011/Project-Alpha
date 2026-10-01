@@ -275,9 +275,9 @@ const sqlIsSeconds = (column: string) =>
  *    out by hand is at most the next one (a trigger), so ids stay in order and one row cannot use
  *    up the ids that remain.
  *
- * Scope. These guards hold for every write the application makes, and for plain INSERT, UPDATE
- * and DELETE statements from anyone else. They are not a defence against someone with direct
- * write access to the database file.
+ * Scope. These guards hold, on a connection with foreign keys on, for every write the application
+ * makes, and for plain INSERT, UPDATE and DELETE statements from anyone else. They are not a
+ * defence against someone with direct write access to the database file.
  *
  * A database that already ran this DDL takes an edit to it through `applyLegalBodySchema`, which
  * goes by the schema version: see `LEGAL_BODIES_SCHEMA_VERSION`, which is raised with every edit
@@ -747,8 +747,8 @@ function planLegalBodySchema(db: Database.Database, expected: SchemaObject[]): L
  *  - Nothing there yet: create everything, and store the version.
  *  - Same definitions: nothing to do, except to store the version if it is missing or lower.
  *  - Different definitions, and the stored version is HIGHER than this build's: a newer build
- *    owns this schema. Nothing is changed (a schema is never downgraded) and one line goes to the
- *    operations log.
+ *    owns this schema. Nothing is changed (when the tables exist, a newer stored version is left
+ *    untouched) and one line goes to the operations log.
  *  - Different definitions, the stored version is lower or missing (an upgrade), and both tables
  *    are empty: they are dropped and created again from the DDL, and the version is stored.
  *  - Different definitions otherwise: at the SAME version, or in an upgrade with a row present.
