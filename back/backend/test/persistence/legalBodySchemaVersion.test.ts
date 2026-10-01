@@ -429,6 +429,35 @@ test("a table rebuilt from the same definition, with a row present, is accepted:
     }
 });
 
+test("a column added to legal_bodies by ALTER TABLE, with a row present, reads back as the DDL with that column declared last", () => {
+  const db = migrated();
+  addBody(db);
+  const rows = rowsOf(db);
+  // A nullable column, its CHECK written on the column; a column CHECK may name another column.
+  const column =
+    "reserved_at_block INTEGER CHECK (reserved_at_block IS NULL OR (typeof(reserved_at_block) = 'integer' AND reserved_at_block >= 0 AND binding_state != 'draft'))";
+  db.exec(`ALTER TABLE legal_bodies ADD COLUMN ${column}`);
+
+  // The DDL with the same column declared last among the columns, before the table constraints.
+  const lastColumn = "    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\n";
+  expect(LEGAL_BODIES_DDL.split(lastColumn)).toHaveLength(2);
+  const scratch = new Database(":memory:");
+  scratch.exec(LEGAL_BODIES_DDL.replace(lastColumn, `${lastColumn}    ${column},\n`));
+  const defined = sqlOf(objectsOf(scratch), "legal_bodies");
+  scratch.close();
+  expect(defined).toContain(column);
+
+  // Normalised as the schema step normalises a table, the two definitions are the same.
+  expect(normalizeSchemaSql(sqlOf(objectsOf(db), "legal_bodies"))).toBe(
+    normalizeSchemaSql(defined),
+  );
+  // The row is still there, with the new column empty.
+  expect(rowsOf(db)).toEqual({
+    bodies: rows.bodies.map((body) => ({ ...(body as object), reserved_at_block: null })),
+    events: rows.events,
+  });
+});
+
 test("a trigger dropped by hand at the same version is created again: the row is kept, and the operations log names it", () => {
   for (const withRows of [true, false]) {
     const db = migrated();

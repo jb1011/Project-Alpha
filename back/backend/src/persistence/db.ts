@@ -472,16 +472,32 @@ export const LEGAL_BODIES_DDL = `
  * edit without a bump fails the suite.
  *
  * TO CHANGE THIS SCHEMA LATER:
- *  - Edit the DDL, raise this number by one, and add the hash of the new text to the pin in the
- *    test, next to the hashes already there.
+ *  - Every edit to the DDL raises this number by one and adds the hash of the new text to the pin
+ *    in the test, next to the hashes already there.
  *  - Before the first row exists, nothing else is needed: empty tables are dropped and created
  *    again from the DDL.
- *  - Once a row exists, a changed trigger still needs nothing else: triggers hold no data and are
- *    created again from the DDL. A changed TABLE or INDEX is made by a written migration, run by
- *    `migrate` before `applyLegalBodySchema`, that REBUILDS the table from the DDL text (a new
- *    table with that body, the rows copied, the old table dropped, the new one renamed) and
- *    creates its indexes as the DDL writes them. The step checks the result: the definitions must
- *    match the DDL's once normalised, and until they do it refuses to start.
+ *  - A changed trigger needs nothing but that bump, rows or not: triggers hold no data and are
+ *    created again from the DDL.
+ *  - Once a row exists, a changed TABLE or INDEX is made by a written migration, run by `migrate`
+ *    before `applyLegalBodySchema`. The step checks the result: the definitions must match the
+ *    DDL's once normalised, and until they do it refuses to start. By change:
+ *      - A new nullable column: one `ALTER TABLE ... ADD COLUMN`. The DDL declares the column LAST
+ *        among the columns, before the table constraints, writes its CHECK on the column (such a
+ *        CHECK may name other columns), and words it as the ALTER statement does, line breaks and
+ *        indentation aside. SQLite stores an added column right after the last column, so the
+ *        stored text then matches the DDL's. This holds for `legal_bodies`. It does not yet hold
+ *        for `legal_body_events`, which has no table constraint: once normalised, its stored text
+ *        reads `CURRENT_TIMESTAMP , note TEXT)` where a DDL laid out like this one reads
+ *        `CURRENT_TIMESTAMP, note TEXT )`, and the step refuses the difference. There a new
+ *        column is a rebuild, until the comparison ignores the spacing beside commas and brackets.
+ *      - A renamed column: one `ALTER TABLE ... RENAME COLUMN`.
+ *      - An index: `DROP INDEX`, then `CREATE INDEX` as the DDL writes it.
+ *      - A change to an existing column's definition, to a table-level CHECK or to the list of
+ *        binding states: a REBUILD of the table from the DDL text (a new table with that body, the
+ *        rows copied, the old table dropped, the new one renamed, its indexes created as the DDL
+ *        writes them), with foreign keys off around it: `PRAGMA foreign_keys = OFF` before its
+ *        transaction and `ON` after it, since the pragma does nothing inside a transaction. The
+ *        step then creates again the triggers that went with the old table.
  *  - A rebuild of `companies` reaches this schema too. SQLite rewrites the references to a table
  *    that is renamed, so renaming `companies` re-points the foreign key of `legal_bodies` and its
  *    company trigger at the new name. That migration must leave both naming `companies` again.
