@@ -1,7 +1,32 @@
-import { BaseError, HttpRequestError, RpcRequestError } from "viem";
+import {
+  type Account,
+  type Address,
+  BaseError,
+  type Hex,
+  HttpRequestError,
+  RpcRequestError,
+  createPublicClient,
+  encodeErrorResult,
+  encodeFunctionData,
+} from "viem";
 import { expect, test } from "vitest";
+import { legalManagerAbi, noviControllerAbi } from "../../src/abis/generated";
+import { ContractRevertError, appendRelayTarget } from "../../src/adapters/arc/relay";
 import { BroadcastUnconfirmedError, PriorTransferUnconfirmedError } from "../../src/errors";
-import { errorRef, operatorDiagnostic, publicErrorMessage } from "../../src/workflow/publicError";
+import {
+  errorRef,
+  operatorDiagnostic,
+  publicErrorMessage,
+  publicFailure,
+} from "../../src/workflow/publicError";
+import {
+  FAKE_NODE_CHAIN,
+  LOCAL_TEST_ACCOUNT,
+  failureOf,
+  fakeRpcNode,
+  nodeRevert,
+  relayingAdapter,
+} from "../helpers/fakeRpcNode";
 
 /**
  * The 2026-09-16 incident, reproduced (brief §3).
@@ -354,4 +379,88 @@ test("Q4: the ref is stable per error text and differs across errors", () => {
   expect(a).toMatch(/^[0-9a-f]{8}$/);
   expect(errorRef(new Error("boom"))).toBe(a);
   expect(errorRef(new Error("bang"))).not.toBe(a);
+});
+
+/* ── A node's revert of a relayed manager call ──────────────────────────────────────────────── */
+
+const RELAY_CONTROLLER = "0x000000000000000000000000000000000000c07a" as Address;
+const RELAY_PROXY = "0x00000000000000000000000000000000000000fa" as Address;
+const OA_HASH = `0x${"ab".repeat(32)}` as Hex;
+
+const NODE_REVERTS = [
+  ["TooEarly", encodeErrorResult({ abi: legalManagerAbi, errorName: "TooEarly" })],
+  [
+    "NotAuthorized",
+    encodeErrorResult({
+      abi: noviControllerAbi,
+      errorName: "NotAuthorized",
+      args: ["0x12345678", LOCAL_TEST_ACCOUNT.address],
+    }),
+  ],
+  ["undecodable", "0xdeadbeef" as Hex],
+] as const;
+
+/**
+ * The same node revert, twice: as viem throws it from the relay's `estimateGas` preflight (what
+ * the relay rethrew while node reverts went unrecognised), and as the relayed adapter call throws
+ * it now.
+ */
+async function nodeRevertBothWays(data: Hex, account: Account | Address) {
+  const node = fakeRpcNode({ preflight: nodeRevert(data) });
+  const viemError = await failureOf(
+    createPublicClient({ chain: FAKE_NODE_CHAIN, transport: node.transport }).estimateGas({
+      account,
+      to: RELAY_CONTROLLER,
+      data: appendRelayTarget(
+        encodeFunctionData({
+          abi: legalManagerAbi,
+          functionName: "executeOperatingAgreementUpdate",
+          args: [OA_HASH],
+        }),
+        RELAY_PROXY,
+      ),
+    }),
+  );
+  const relayError = await failureOf(
+    relayingAdapter(node, {
+      controller: RELAY_CONTROLLER,
+      account,
+    }).executeOperatingAgreementUpdate(RELAY_PROXY, OA_HASH, RELAY_CONTROLLER),
+  );
+  return { viemError, relayError };
+}
+
+test.each(NODE_REVERTS)(
+  "a node's %s revert of a relayed call: the customer reads the same sentence as before it was recognised",
+  async (_name, data) => {
+    // Recognising the revert wraps viem's error in a ContractRevertError. That is for the anchor
+    // loop and the operator; it must not change a word of what a customer sees. (This pin holds
+    // on either side of that change, which is the point of it.)
+    for (const account of [LOCAL_TEST_ACCOUNT, LOCAL_TEST_ACCOUNT.address]) {
+      const { viemError, relayError } = await nodeRevertBothWays(data, account);
+      expect(publicErrorMessage(viemError)).toBe("Execution reverted for an unknown reason.");
+      expect(publicErrorMessage(relayError)).toBe("Execution reverted for an unknown reason.");
+      expect(publicFailure(relayError).error).toMatch(
+        /^Execution reverted for an unknown reason\. \(ref [0-9a-f]{8}\)$/,
+      );
+    }
+  },
+);
+
+test("a node's revert of a relayed call: the operator's line names the decoded error", async () => {
+  const { viemError, relayError } = await nodeRevertBothWays(
+    encodeErrorResult({ abi: legalManagerAbi, errorName: "TooEarly" }),
+    LOCAL_TEST_ACCOUNT,
+  );
+  // Unrecognised, the operator read viem's text and nothing that said WHICH revert it was.
+  expect(operatorDiagnostic(viemError)).not.toContain("TooEarly");
+  // Recognised, the line leads with it. `errorDetail` is what the runner stores for operators.
+  expect(relayError).toBeInstanceOf(ContractRevertError);
+  const detail = publicFailure(relayError).errorDetail;
+  expect(detail).toBe(operatorDiagnostic(relayError));
+  const lead = `ContractRevertError: relay executeOperatingAgreementUpdate -> ${RELAY_PROXY} via controller ${RELAY_CONTROLLER} reverted in simulation: TooEarly() | `;
+  expect(detail.slice(0, lead.length)).toBe(lead);
+  // …followed by viem's own chain, through the same sanitiser and budget as before.
+  expect(detail).toContain("EstimateGasExecutionError: Execution reverted for an unknown reason.");
+  expect(detail.length).toBeLessThanOrEqual(600);
 });
