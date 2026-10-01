@@ -4,13 +4,22 @@ import {
   BaseError,
   ContractFunctionRevertedError,
   type Hex,
+  type Log,
   type PublicClient,
+  type TransactionReceipt,
+  TransactionReceiptNotFoundError,
+  WaitForTransactionReceiptTimeoutError,
+  getAbiItem,
   isAddressEqual,
+  parseEventLogs,
   zeroAddress,
 } from "viem";
 import { iIdentityRegistryAbi, legalBodyFactoryAbi, noviControllerAbi } from "../../abis/generated";
+import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../../errors";
 import type { LegalBodyLink } from "../../legalBody/link";
+import { isRangeTooLargeError } from "../../monitor/scan";
 import type { ArcAdapter, PreparedRelayedCall, RelayedCall } from "./arcAdapter";
+import { RECEIPT_TIMEOUT_MS } from "./receipts";
 import { ContractRevertError } from "./relay";
 import { withSenderLock } from "./senderLock";
 
@@ -56,6 +65,12 @@ export const CREATE_GAS_CEILING = 600_000n;
 export const CREATE_MAX_FEE_WEI = 250_000_000_000_000_000n;
 /** How many blocks one search for a creation's log asks the node about. */
 export const CREATION_LOG_WINDOW_BLOCKS = 5_000n;
+/** The narrowest window a node's "range too large" answer halves {CREATION_LOG_WINDOW_BLOCKS} to.
+ *  A node that refuses this many blocks is not refusing the width. */
+const CREATION_LOG_WINDOW_FLOOR = 500n;
+
+/** The factory's event for a body it created. */
+const LEGAL_BODY_CREATED = getAbiItem({ abi: legalBodyFactoryAbi, name: "LegalBodyCreated" });
 
 /** The gas limit a create is sent with: the estimate plus {CREATE_GAS_HEADROOM_PERCENT}. */
 function createGasLimit(estimate: bigint): bigint {
@@ -127,11 +142,32 @@ const CREATE_FAULT_NAMES: ReadonlySet<string> = new Set([
   "NotImplementation",
 ]);
 
+/** A body the factory created, as its `LegalBodyCreated` log and that log's block tell it. */
+export interface LegalBodyCreated {
+  legalBody: Address;
+  agentId: bigint;
+  identityOwner: Address;
+  guardian: Address;
+  linkDigest: Hex;
+  /** The transaction that created it. */
+  txHash: Hex;
+  blockNumber: number;
+  /** The creating block's timestamp, in seconds. */
+  deployedAt: number;
+}
+
 /** What {LegalBodyChain.submitCreate} did with the create it signed. */
 export type SubmitCreateResult =
   | { status: "sent"; txHash: Hex; rawTx: Hex; nonce: number }
   | { status: "unconfirmed"; txHash: Hex; rawTx: Hex; nonce: number; cause: unknown }
   | { status: "not_recorded" };
+
+/** What the chain says, at the moment it is asked, about one create transaction
+ *  ({LegalBodyChain.createOutcome}). */
+export type CreateOutcome =
+  | { status: "created"; created: LegalBodyCreated }
+  | { status: "reverted" }
+  | { status: "absent" };
 
 /**
  * Refuse a prepared create whose fee could be above {CREATE_MAX_FEE_WEI}. The most the transaction
@@ -219,7 +255,9 @@ function isNonexistentToken(e: unknown): boolean {
  *
  * The create is a call relayed through the controller and sent by the executor. It is simulated
  * and bounded before it is signed, and its signed bytes are recorded before they are sent
- * ({submitCreate}).
+ * ({submitCreate}). Whether it created the body is the chain's to say, from its receipt
+ * ({createOutcome}, {confirmCreate}) or, with no transaction to ask about, from the factory's
+ * logs ({findCreation}).
  */
 export class LegalBodyChain {
   constructor(private readonly d: LegalBodyChainDeps) {
@@ -467,10 +505,12 @@ export class LegalBodyChain {
    *
    * A refusal that means the node already has these bytes, or that their nonce is spent, is
    * swallowed (see {nodeAlreadyHasBytes}): there is nothing more to send, and whether the body
-   * exists is the chain's to say. Any other failure throws.
+   * exists is the chain's to say. Any other failure throws. With no executor, it throws before
+   * taking any lock or sending.
    */
   async rebroadcastCreate(rawTx: Hex): Promise<void> {
-    await withSenderLock(this.executor, async () => {
+    const executor = this.requireExecutor();
+    await withSenderLock(executor, async () => {
       try {
         await this.d.arc.sendRawRelayedCall(rawTx);
       } catch (e) {
@@ -478,4 +518,179 @@ export class LegalBodyChain {
       }
     });
   }
+
+  /**
+   * What the chain says about the create `txHash`, asked once, without waiting:
+   * - `absent`: the node has no receipt for it (viem's TransactionReceiptNotFoundError, and only
+   *   that): not mined yet, or never;
+   * - `reverted`: mined, and reverted;
+   * - `created`: mined, with the factory's `LegalBodyCreated` for `expected.bodyAddress`.
+   *
+   * A successful receipt without that event throws, and so does any failure to read the receipt (a
+   * rate limit, a timeout): neither is an answer about the transaction.
+   */
+  async createOutcome(txHash: Hex, expected: { bodyAddress: Address }): Promise<CreateOutcome> {
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await this.d.publicClient.getTransactionReceipt({ hash: txHash });
+    } catch (e) {
+      if (e instanceof TransactionReceiptNotFoundError) return { status: "absent" };
+      throw e;
+    }
+    if (receipt.status !== "success") return { status: "reverted" };
+    return {
+      status: "created",
+      created: await this.creationIn(txHash, receipt, expected.bodyAddress),
+    };
+  }
+
+  /**
+   * Wait for the create `txHash`, for at most {RECEIPT_TIMEOUT_MS}, and read from that one receipt
+   * the body it created at `expected.bodyAddress`.
+   *
+   * Running out of time throws ChainTxUnconfirmedError: the create may still be mined. A reverted
+   * receipt throws ChainTxRevertedError. A successful receipt without the factory's
+   * `LegalBodyCreated` for the body throws. Any other failure is rethrown untouched.
+   */
+  async confirmCreate(txHash: Hex, expected: { bodyAddress: Address }): Promise<LegalBodyCreated> {
+    let receipt: TransactionReceipt;
+    try {
+      receipt = await this.d.publicClient.waitForTransactionReceipt({
+        hash: txHash,
+        timeout: RECEIPT_TIMEOUT_MS,
+      });
+    } catch (e) {
+      if (e instanceof WaitForTransactionReceiptTimeoutError)
+        throw new ChainTxUnconfirmedError("createLegalBody", txHash);
+      throw e;
+    }
+    if (receipt.status !== "success") throw new ChainTxRevertedError("createLegalBody", txHash);
+    return this.creationIn(txHash, receipt, expected.bodyAddress);
+  }
+
+  /**
+   * The factory's creation of `bodyAddress`, searched for in its `LegalBodyCreated` logs by the
+   * body's indexed topic, from `fromBlock` to `toBlock` (default: the head when called), forward,
+   * one window of blocks at a time.
+   *
+   * A window is {CREATION_LOG_WINDOW_BLOCKS} wide, inclusive at both ends. A node's "range too
+   * large" answer halves it for the rest of the search, down to {CREATION_LOG_WINDOW_FLOOR}; a
+   * refusal at the floor throws. Any other failure to read throws. `undefined` means the whole range
+   * was searched and the factory did not create the body in it. A log a reorg removed is ignored.
+   */
+  async findCreation(p: {
+    bodyAddress: Address;
+    fromBlock: bigint;
+    toBlock?: bigint;
+  }): Promise<LegalBodyCreated | undefined> {
+    const toBlock = p.toBlock ?? (await this.head()).number;
+    let window = CREATION_LOG_WINDOW_BLOCKS;
+    let cursor = p.fromBlock;
+    while (cursor <= toBlock) {
+      const windowEnd = cursor + window - 1n;
+      const end = windowEnd < toBlock ? windowEnd : toBlock;
+      let logs: Awaited<ReturnType<LegalBodyChain["creationLogs"]>>;
+      try {
+        logs = await this.creationLogs(p.bodyAddress, cursor, end);
+      } catch (e) {
+        if (!isRangeTooLargeError(e)) throw e;
+        if (window <= CREATION_LOG_WINDOW_FLOOR)
+          throw new Error(
+            `findCreation: the node refuses the factory's logs for blocks ${cursor} to ${end} as too wide a range, at the ${CREATION_LOG_WINDOW_FLOOR}-block floor: the search cannot go on`,
+            { cause: e },
+          );
+        const halved = window / 2n;
+        window = halved < CREATION_LOG_WINDOW_FLOOR ? CREATION_LOG_WINDOW_FLOOR : halved;
+        continue;
+      }
+      const log = this.factoryCreation(logs, p.bodyAddress);
+      if (log)
+        return this.creationRecord(log.args, {
+          txHash: log.transactionHash,
+          blockNumber: log.blockNumber,
+        });
+      cursor = end + 1n;
+    }
+    return undefined;
+  }
+
+  /** The factory's `LegalBodyCreated` logs for `bodyAddress` in blocks `fromBlock` to `toBlock`,
+   *  inclusive, by the body's indexed topic. */
+  private creationLogs(bodyAddress: Address, fromBlock: bigint, toBlock: bigint) {
+    return this.d.publicClient.getLogs({
+      address: this.d.factory,
+      event: LEGAL_BODY_CREATED,
+      args: { legalBody: bodyAddress },
+      fromBlock,
+      toBlock,
+    });
+  }
+
+  /**
+   * The factory's `LegalBodyCreated` for `bodyAddress` among `logs`, or `undefined`. Only a log
+   * the FACTORY emitted counts: any contract can emit an event with the same signature, and a
+   * relayed call's receipt holds other contracts' logs too. A log a reorg removed does not count.
+   */
+  private factoryCreation(logs: readonly Log<bigint, number, false>[], bodyAddress: Address) {
+    const fromFactory = logs.filter((l) => !l.removed && isAddressEqual(l.address, this.d.factory));
+    return parseEventLogs({
+      abi: legalBodyFactoryAbi,
+      eventName: "LegalBodyCreated",
+      logs: fromFactory,
+    }).find((l) => isAddressEqual(l.args.legalBody, bodyAddress));
+  }
+
+  /** The creation in a SUCCESSFUL receipt of the create `txHash`. Without the factory's event for
+   *  `bodyAddress`, it throws: the transaction succeeded and the chain does not say it created
+   *  that body. */
+  private async creationIn(
+    txHash: Hex,
+    receipt: TransactionReceipt,
+    bodyAddress: Address,
+  ): Promise<LegalBodyCreated> {
+    const log = this.factoryCreation(receipt.logs, bodyAddress);
+    if (!log)
+      throw new Error(
+        `createLegalBody ${txHash} succeeded, but the factory emitted no LegalBodyCreated for ${bodyAddress} in it`,
+      );
+    return this.creationRecord(log.args, { txHash, blockNumber: receipt.blockNumber });
+  }
+
+  /** A creation's record. `deployedAt` is the timestamp of the block it was mined in, read from
+   *  the node by number; a failed read throws. */
+  private async creationRecord(
+    event: Pick<
+      LegalBodyCreated,
+      "legalBody" | "agentId" | "identityOwner" | "guardian" | "linkDigest"
+    >,
+    at: { txHash: Hex; blockNumber: bigint },
+  ): Promise<LegalBodyCreated> {
+    const block = await this.d.publicClient.getBlock({ blockNumber: at.blockNumber });
+    return {
+      legalBody: event.legalBody,
+      agentId: event.agentId,
+      identityOwner: event.identityOwner,
+      guardian: event.guardian,
+      linkDigest: event.linkDigest,
+      txHash: at.txHash,
+      blockNumber: Number(at.blockNumber),
+      deployedAt: Number(block.timestamp),
+    };
+  }
 }
+
+/** What the create's caller needs of a LegalBodyChain. */
+export type CreateChainPort = Pick<
+  LegalBodyChain,
+  | "chainId"
+  | "factory"
+  | "executor"
+  | "head"
+  | "createdState"
+  | "executorNonce"
+  | "submitCreate"
+  | "rebroadcastCreate"
+  | "createOutcome"
+  | "confirmCreate"
+  | "findCreation"
+>;

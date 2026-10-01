@@ -1,21 +1,32 @@
 /**
- * LegalBodyChain's CREATE, the sending half: simulate the relayed create, bound its gas and its
- * fee, prepare it, then sign, record and send it inside the executor's sender lock.
+ * LegalBodyChain's CREATE. The sending half: simulate the relayed create, bound its gas and its
+ * fee, prepare it, then sign, record and send it inside the executor's sender lock. The confirming
+ * half: what the chain says about the create, from one receipt, or from the factory's logs.
  *
  * The relay seam is a plain object of mocks; the real ArcAdapter's half of this sequence has tests
  * of its own. The sender lock is the REAL one, and every fake notes whether it ran with the
- * executor's lock held, so the lock window is measured here, not assumed.
+ * executor's lock held, so the lock window is measured here, not assumed. The confirming half
+ * reads from a fake node whose `getLogs` filters by address, block range and topic, as a node does.
  */
 import {
   type Abi,
+  type AbiEvent,
   type Address,
   type Hex,
+  HttpRequestError,
   InvalidInputRpcError,
+  type Log,
   type PublicClient,
   RawContractError,
   RpcRequestError,
   TimeoutError,
+  TransactionReceiptNotFoundError,
+  WaitForTransactionReceiptTimeoutError,
+  encodeAbiParameters,
   encodeErrorResult,
+  encodeEventTopics,
+  getAbiItem,
+  isAddressEqual,
 } from "viem";
 import { describe, expect, test, vi } from "vitest";
 import { legalBodyFactoryAbi, noviControllerAbi } from "../../../src/abis/generated";
@@ -23,15 +34,19 @@ import type { PreparedRelayedCall, RelayedCall } from "../../../src/adapters/arc
 import {
   CREATE_GAS_CEILING,
   CREATE_MAX_FEE_WEI,
+  CREATION_LOG_WINDOW_BLOCKS,
   LegalBodyChain,
   LegalBodyChainFaultError,
+  type LegalBodyCreated,
   LegalBodyFeeTooHighError,
   LegalBodyGasTooHighError,
   type RelaySeam,
   type SubmitCreateResult,
 } from "../../../src/adapters/arc/legalBodyChain";
+import { RECEIPT_TIMEOUT_MS } from "../../../src/adapters/arc/receipts";
 import { ContractRevertError, relayRevertError } from "../../../src/adapters/arc/relay";
 import { senderLockHeld, withSenderLock } from "../../../src/adapters/arc/senderLock";
+import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../../../src/errors";
 import type { LegalBodyLink } from "../../../src/legalBody/link";
 import { failureOf } from "../../helpers/fakeRpcNode";
 
@@ -78,6 +93,8 @@ interface WorldOptions {
   send?: (rawTx: Hex) => Promise<Hex>;
   /** `null`: a relay seam with no platform account. */
   executor?: null;
+  /** The node the confirming half reads from (default: none; the sending half reads nothing). */
+  publicClient?: PublicClient;
 }
 
 /**
@@ -125,7 +142,7 @@ function world(opts: WorldOptions = {}) {
   });
   const chain = new LegalBodyChain({
     // Nothing in the create's sending half reads from the public client.
-    publicClient: {} as PublicClient,
+    publicClient: opts.publicClient ?? ({} as PublicClient),
     arc,
     chainId: CHAIN_ID,
     factory: FACTORY,
@@ -140,14 +157,18 @@ const failing = (e: unknown) => async (): Promise<never> => {
 };
 
 /**
- * Run `fn` while another section holds the executor's sender lock. A call that waits for the lock
- * cannot settle in here, so a call that does settle settled without taking it. One that waits
- * fails after a second instead, and the lock is released either way, so no later test inherits it.
+ * Run `fn` while another section holds the executor's sender lock (or `sender`'s: `undefined` is
+ * the lock a section with no named sender takes). A call that waits for the lock cannot settle in
+ * here, so a call that does settle settled without taking it. One that waits fails after a second
+ * instead, and the lock is released either way, so no later test inherits it.
  */
-async function whileLockHeldElsewhere<T>(fn: () => Promise<T>): Promise<T> {
+async function whileLockHeldElsewhere<T>(
+  fn: () => Promise<T>,
+  { sender }: { sender: Address | undefined } = { sender: EXECUTOR },
+): Promise<T> {
   let release: (() => void) | undefined;
   const holder = withSenderLock(
-    EXECUTOR,
+    sender,
     () =>
       new Promise<void>((resolve) => {
         release = resolve;
@@ -460,5 +481,415 @@ describe("rebroadcastCreate", () => {
       await expect(chain.rebroadcastCreate(SIGNED.rawTx)).rejects.toBe(error);
       expect(steps).toEqual([["send", true]]);
     }
+  });
+
+  test("with no executor, rebroadcastCreate throws before taking any lock, and sends nothing", async () => {
+    const { chain, arc } = world({ executor: null });
+    // A section with no named sender would take the shared lock for one: hold it, so a call that
+    // waited for it would fail here instead of settling.
+    const err = await whileLockHeldElsewhere(
+      () => failureOf(chain.rebroadcastCreate(SIGNED.rawTx)),
+      {
+        sender: undefined,
+      },
+    );
+    expect((err as Error).message).toMatch(/no executor/);
+    expect(arc.sendRawRelayedCall).not.toHaveBeenCalled();
+  });
+});
+
+/** The body the create is meant to make, and the identity owner whose signature makes it. */
+const BODY = "0x00000000000000000000000000000000000b0d11" as Address;
+const OWNER = "0x0000000000000000000000000000000000000B0b" as Address;
+/** A contract that is not the factory, and emits an event with the same signature. */
+const LOOKALIKE = "0x000000000000000000000000000000000000bad1" as Address;
+const DIGEST = `0x${"d1".repeat(32)}` as Hex;
+/** The block the create is mined in, and the node's head when a search is not given an end. */
+const CREATED_IN = 12_345n;
+const HEAD = 40_000n;
+
+/** Each block's time in seconds: half a second apart, as on Arc. */
+const timeOf = (blockNumber: bigint) => 1_900_000_000n + blockNumber / 2n;
+
+/** The `LegalBodyCreated` event, as the factory's ABI declares it. */
+const LEGAL_BODY_CREATED = getAbiItem({ abi: legalBodyFactoryAbi, name: "LegalBodyCreated" });
+
+/** A `LegalBodyCreated` log as a node returns it: by default the factory's, for BODY, in CREATED_IN. */
+function createdLog(
+  p: {
+    emitter?: Address;
+    body?: Address;
+    owner?: Address;
+    blockNumber?: bigint;
+    removed?: boolean;
+  } = {},
+): Log<bigint, number, false> {
+  return {
+    address: p.emitter ?? FACTORY,
+    topics: encodeEventTopics({
+      abi: legalBodyFactoryAbi,
+      eventName: "LegalBodyCreated",
+      args: { agentId: LINK.agentId, legalBody: p.body ?? BODY, identityOwner: p.owner ?? OWNER },
+    }) as [Hex, ...Hex[]],
+    data: encodeAbiParameters([{ type: "address" }, { type: "bytes32" }], [GUARDIAN, DIGEST]),
+    blockNumber: p.blockNumber ?? CREATED_IN,
+    blockHash: `0x${"b1".repeat(32)}`,
+    transactionHash: SIGNED.txHash,
+    transactionIndex: 0,
+    logIndex: 0,
+    removed: p.removed ?? false,
+  };
+}
+
+/** What the chain says the factory created for the default log mined in `blockNumber`. */
+function creation(blockNumber = CREATED_IN): LegalBodyCreated {
+  return {
+    legalBody: BODY,
+    agentId: LINK.agentId,
+    identityOwner: OWNER,
+    guardian: GUARDIAN,
+    linkDigest: DIGEST,
+    txHash: SIGNED.txHash,
+    blockNumber: Number(blockNumber),
+    deployedAt: Number(timeOf(blockNumber)),
+  };
+}
+
+/** The create's receipt, mined in CREATED_IN. */
+function receipt(status: "success" | "reverted", logs: Log<bigint, number, false>[] = []) {
+  return { status, logs, blockNumber: CREATED_IN, transactionHash: SIGNED.txHash };
+}
+
+/** A node's refusal of a `getLogs` range, in Arc's words, as viem raises it. */
+const rangeTooLarge = () =>
+  new RpcRequestError({
+    body: { method: "eth_getLogs" },
+    error: { code: -32012, message: "requested range too large" },
+    url: NODE_URL,
+  });
+
+interface NodeOptions {
+  /** The answer to `getTransactionReceipt`. */
+  receipt?: () => Promise<unknown>;
+  /** The answer to `waitForTransactionReceipt`. */
+  wait?: () => Promise<unknown>;
+  /** Every log on this chain; `getLogs` answers with those that match, as a node does. */
+  logs?: Log<bigint, number, false>[];
+  /** The widest range, in blocks, the node answers `getLogs` for. A wider one is refused. */
+  maxLogRange?: bigint;
+  /** A `getLogs` answer that is a failure, whatever the range. */
+  logsFail?: unknown;
+  /** The answer to `getBlock` for a numbered block (default: the block, at its time). */
+  block?: (blockNumber: bigint) => Promise<{ number: bigint; timestamp: bigint }>;
+}
+
+/** A node to read the create's fate from, and a LegalBodyChain that reads from it. */
+function onChain(opts: NodeOptions = {}) {
+  const unexpected = (method: string) => async (): Promise<never> => {
+    throw new Error(`unexpected ${method}`);
+  };
+  /** Every range `getLogs` was asked for, in order, refused or not. */
+  const ranges: [bigint, bigint][] = [];
+  const getLogs = vi.fn(
+    async (q: {
+      address: Address;
+      event: AbiEvent;
+      args: { legalBody: Address };
+      fromBlock: bigint;
+      toBlock: bigint;
+    }) => {
+      ranges.push([q.fromBlock, q.toBlock]);
+      if (opts.logsFail !== undefined) throw opts.logsFail;
+      if (opts.maxLogRange !== undefined && q.toBlock - q.fromBlock + 1n > opts.maxLogRange)
+        throw rangeTooLarge();
+      const [signature, , body] = encodeEventTopics({
+        abi: [q.event],
+        args: { legalBody: q.args.legalBody },
+      });
+      return (opts.logs ?? []).filter(
+        (l) =>
+          isAddressEqual(l.address, q.address) &&
+          l.blockNumber >= q.fromBlock &&
+          l.blockNumber <= q.toBlock &&
+          l.topics[0] === signature &&
+          l.topics[2] === body,
+      );
+    },
+  );
+  const getBlock = vi.fn(async (q: { blockNumber?: bigint; blockTag?: string }) => {
+    if (q.blockNumber === undefined) return { number: HEAD, timestamp: timeOf(HEAD) };
+    return (opts.block ?? (async (n: bigint) => ({ number: n, timestamp: timeOf(n) })))(
+      q.blockNumber,
+    );
+  });
+  const getTransactionReceipt = vi.fn(opts.receipt ?? unexpected("getTransactionReceipt"));
+  const waitForTransactionReceipt = vi.fn(opts.wait ?? unexpected("waitForTransactionReceipt"));
+  const publicClient = {
+    getLogs,
+    getBlock,
+    getTransactionReceipt,
+    waitForTransactionReceipt,
+  } as unknown as PublicClient;
+  const { chain } = world({ publicClient });
+  return { chain, getLogs, getBlock, getTransactionReceipt, waitForTransactionReceipt, ranges };
+}
+
+const EXPECTED = { bodyAddress: BODY };
+
+/** A failure that says nothing about the transaction: the node or the network had trouble. */
+const rateLimited = () =>
+  new HttpRequestError({ status: 429, url: NODE_URL, details: "Too Many Requests" });
+const timedOut = () => new TimeoutError({ body: { method: "eth_call" }, url: NODE_URL });
+
+describe("createOutcome", () => {
+  test("createOutcome asks once and never waits: absent only for TransactionReceiptNotFoundError; a 429 throws", async () => {
+    const notFound = onChain({
+      receipt: failing(new TransactionReceiptNotFoundError({ hash: SIGNED.txHash })),
+    });
+    await expect(notFound.chain.createOutcome(SIGNED.txHash, EXPECTED)).resolves.toEqual({
+      status: "absent",
+    });
+    expect(notFound.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(notFound.getTransactionReceipt).toHaveBeenCalledWith({ hash: SIGNED.txHash });
+    expect(notFound.waitForTransactionReceipt).not.toHaveBeenCalled();
+
+    // Matched by type: the same words in another error are not the node saying "no receipt".
+    const sameWords = new Error(
+      `Transaction receipt with hash "${SIGNED.txHash}" could not be found.`,
+    );
+    for (const failure of [rateLimited(), timedOut(), sameWords]) {
+      const { chain, getTransactionReceipt } = onChain({ receipt: failing(failure) });
+      await expect(chain.createOutcome(SIGNED.txHash, EXPECTED)).rejects.toBe(failure);
+      expect(getTransactionReceipt).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  test("createOutcome: a reverted receipt is reverted; the factory's LegalBodyCreated for the body is created", async () => {
+    await expect(
+      onChain({ receipt: async () => receipt("reverted") }).chain.createOutcome(
+        SIGNED.txHash,
+        EXPECTED,
+      ),
+    ).resolves.toEqual({ status: "reverted" });
+
+    const created = onChain({ receipt: async () => receipt("success", [createdLog()]) });
+    await expect(created.chain.createOutcome(SIGNED.txHash, EXPECTED)).resolves.toEqual({
+      status: "created",
+      created: creation(),
+    });
+    expect(created.waitForTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  test("createOutcome: a successful receipt whose only LegalBodyCreated comes from another address throws", async () => {
+    for (const logs of [
+      [createdLog({ emitter: LOOKALIKE })],
+      // The factory's event, but for another body: not the creation of the one expected.
+      [createdLog({ body: LOOKALIKE })],
+    ]) {
+      const { chain } = onChain({ receipt: async () => receipt("success", logs) });
+      await expect(chain.createOutcome(SIGNED.txHash, EXPECTED)).rejects.toThrow(
+        /no LegalBodyCreated/,
+      );
+    }
+  });
+});
+
+describe("confirmCreate", () => {
+  test("confirmCreate ignores a look-alike event from another contract, and makes exactly one receipt call", async () => {
+    // The look-alike comes first and names the same body, with another owner.
+    const lookalike = createdLog({ emitter: LOOKALIKE, owner: LOOKALIKE });
+    const { chain, waitForTransactionReceipt, getTransactionReceipt } = onChain({
+      wait: async () => receipt("success", [lookalike, createdLog()]),
+    });
+    await expect(chain.confirmCreate(SIGNED.txHash, EXPECTED)).resolves.toEqual(creation());
+    expect(waitForTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(waitForTransactionReceipt).toHaveBeenCalledWith({
+      hash: SIGNED.txHash,
+      timeout: RECEIPT_TIMEOUT_MS,
+    });
+    expect(getTransactionReceipt).not.toHaveBeenCalled();
+
+    const alone = onChain({ wait: async () => receipt("success", [lookalike]) });
+    await expect(alone.chain.confirmCreate(SIGNED.txHash, EXPECTED)).rejects.toThrow(
+      /no LegalBodyCreated/,
+    );
+    expect(alone.waitForTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(alone.getTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  test("confirmCreate: a timeout becomes ChainTxUnconfirmedError; a reverted receipt becomes ChainTxRevertedError", async () => {
+    const timeout = await failureOf(
+      onChain({
+        wait: failing(new WaitForTransactionReceiptTimeoutError({ hash: SIGNED.txHash })),
+      }).chain.confirmCreate(SIGNED.txHash, EXPECTED),
+    );
+    expect(timeout).toBeInstanceOf(ChainTxUnconfirmedError);
+    expect(timeout).toMatchObject({ step: "createLegalBody", txHash: SIGNED.txHash });
+
+    const reverted = await failureOf(
+      onChain({ wait: async () => receipt("reverted") }).chain.confirmCreate(
+        SIGNED.txHash,
+        EXPECTED,
+      ),
+    );
+    expect(reverted).toBeInstanceOf(ChainTxRevertedError);
+    expect(reverted).toMatchObject({ step: "createLegalBody", txHash: SIGNED.txHash });
+
+    // Any other failure is no verdict on the transaction, and goes back untouched.
+    const other = rateLimited();
+    await expect(
+      onChain({ wait: failing(other) }).chain.confirmCreate(SIGNED.txHash, EXPECTED),
+    ).rejects.toBe(other);
+  });
+});
+
+describe("findCreation", () => {
+  const FROM = 1_000n;
+
+  test("findCreation: found in the first window, by the factory's address, the event and the body's topic", async () => {
+    const { chain, getLogs, ranges } = onChain({ logs: [createdLog({ blockNumber: 3_000n })] });
+    await expect(
+      chain.findCreation({ bodyAddress: BODY, fromBlock: FROM, toBlock: 30_000n }),
+    ).resolves.toEqual(creation(3_000n));
+    expect(CREATION_LOG_WINDOW_BLOCKS).toBe(5_000n);
+    expect(ranges).toEqual([[FROM, 5_999n]]);
+    expect(getLogs).toHaveBeenCalledWith({
+      address: FACTORY,
+      event: LEGAL_BODY_CREATED,
+      args: { legalBody: BODY },
+      fromBlock: FROM,
+      toBlock: 5_999n,
+    });
+  });
+
+  test("findCreation: found in the third window, one window at a time", async () => {
+    const { chain, ranges } = onChain({ logs: [createdLog({ blockNumber: 11_042n })] });
+    await expect(
+      chain.findCreation({ bodyAddress: BODY, fromBlock: FROM, toBlock: 30_000n }),
+    ).resolves.toEqual(creation(11_042n));
+    expect(ranges).toEqual([
+      [FROM, 5_999n],
+      [6_000n, 10_999n],
+      [11_000n, 15_999n],
+    ]);
+  });
+
+  test("findCreation: a range too large answer halves the window, and the search still completes", async () => {
+    const TO = FROM + 4_999n;
+    const { chain, ranges } = onChain({
+      logs: [createdLog({ blockNumber: TO - 10n })],
+      maxLogRange: 1_500n,
+    });
+    await expect(
+      chain.findCreation({ bodyAddress: BODY, fromBlock: FROM, toBlock: TO }),
+    ).resolves.toEqual(creation(TO - 10n));
+    expect(ranges).toEqual([
+      [FROM, FROM + 4_999n], // 5,000: refused
+      [FROM, FROM + 2_499n], // 2,500: refused
+      [FROM, FROM + 1_249n], // 1,250: answered, and kept for the rest of the search
+      [FROM + 1_250n, FROM + 2_499n],
+      [FROM + 2_500n, FROM + 3_749n],
+      [FROM + 3_750n, TO],
+    ]);
+  });
+
+  test("findCreation: a range refusal at the 500-block floor throws", async () => {
+    const refused = rangeTooLarge();
+    const { chain, ranges } = onChain({ logsFail: refused });
+    const err = await failureOf(
+      chain.findCreation({ bodyAddress: BODY, fromBlock: FROM, toBlock: 30_000n }),
+    );
+    expect((err as Error).cause).toBe(refused);
+    // Halved down to the floor and no further: 5,000, 2,500, 1,250, 625, then 500.
+    expect(ranges.map(([from, to]) => to - from + 1n)).toEqual([
+      5_000n,
+      2_500n,
+      1_250n,
+      625n,
+      500n,
+    ]);
+    expect(ranges.every(([from]) => from === FROM)).toBe(true);
+  });
+
+  test("findCreation: fromBlock above toBlock returns undefined, and asks nothing", async () => {
+    const { chain, getLogs, getBlock } = onChain({ logs: [createdLog()] });
+    await expect(
+      chain.findCreation({ bodyAddress: BODY, fromBlock: 101n, toBlock: 100n }),
+    ).resolves.toBeUndefined();
+    expect(getLogs).not.toHaveBeenCalled();
+    expect(getBlock).not.toHaveBeenCalled();
+  });
+
+  test("findCreation: nothing found returns undefined, after searching up to the head", async () => {
+    // Logs that are not the body's creation: another body's, and a look-alike's for this body.
+    const { chain, getBlock, ranges } = onChain({
+      logs: [
+        createdLog({ body: LOOKALIKE, blockNumber: 2_000n }),
+        createdLog({ emitter: LOOKALIKE, blockNumber: 2_000n }),
+      ],
+    });
+    await expect(
+      chain.findCreation({ bodyAddress: BODY, fromBlock: 30_000n }),
+    ).resolves.toBeUndefined();
+    expect(getBlock).toHaveBeenCalledWith({ blockTag: "latest" });
+    expect(ranges).toEqual([
+      [30_000n, 34_999n],
+      [35_000n, 39_999n],
+      [HEAD, HEAD],
+    ]);
+  });
+
+  test("findCreation: a log with removed: true is ignored", async () => {
+    const { chain, ranges } = onChain({
+      logs: [
+        createdLog({ blockNumber: 2_000n, removed: true }),
+        createdLog({ blockNumber: 7_000n }),
+      ],
+    });
+    await expect(
+      chain.findCreation({ bodyAddress: BODY, fromBlock: FROM, toBlock: 30_000n }),
+    ).resolves.toEqual(creation(7_000n));
+    expect(ranges).toEqual([
+      [FROM, 5_999n],
+      [6_000n, 10_999n],
+    ]);
+  });
+
+  test("findCreation: an RPC failure throws, and is not retried as a range refusal", async () => {
+    for (const failure of [rateLimited(), timedOut()]) {
+      const { chain, ranges } = onChain({ logsFail: failure });
+      await expect(
+        chain.findCreation({ bodyAddress: BODY, fromBlock: FROM, toBlock: 30_000n }),
+      ).rejects.toBe(failure);
+      expect(ranges).toEqual([[FROM, 5_999n]]);
+    }
+  });
+});
+
+describe("deployedAt", () => {
+  test("deployedAt is the creating block's time, read by number; a failed read throws, in all three", async () => {
+    const at = onChain({
+      receipt: async () => receipt("success", [createdLog()]),
+      logs: [createdLog()],
+    });
+    await at.chain.createOutcome(SIGNED.txHash, EXPECTED);
+    await at.chain.findCreation({ bodyAddress: BODY, fromBlock: CREATED_IN, toBlock: CREATED_IN });
+    expect(at.getBlock.mock.calls).toEqual([
+      [{ blockNumber: CREATED_IN }],
+      [{ blockNumber: CREATED_IN }],
+    ]);
+
+    const failure = timedOut();
+    const broken = onChain({
+      receipt: async () => receipt("success", [createdLog()]),
+      wait: async () => receipt("success", [createdLog()]),
+      logs: [createdLog()],
+      block: failing(failure),
+    });
+    await expect(broken.chain.createOutcome(SIGNED.txHash, EXPECTED)).rejects.toBe(failure);
+    await expect(broken.chain.confirmCreate(SIGNED.txHash, EXPECTED)).rejects.toBe(failure);
+    await expect(
+      broken.chain.findCreation({ bodyAddress: BODY, fromBlock: CREATED_IN, toBlock: CREATED_IN }),
+    ).rejects.toBe(failure);
   });
 });
