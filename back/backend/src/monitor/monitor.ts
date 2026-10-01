@@ -6,7 +6,14 @@ import type { EntityIndex, EntityLookup, MonitoredEntity } from "./entityLookup"
 import { indexEntities } from "./entityLookup";
 import { standingRoles } from "./events";
 import type { MonitorRpc } from "./rpc";
-import { type GrantOp, type RuleContext, evaluateLog, ttlEscalations } from "./rules";
+import {
+  type GrantOp,
+  type RuleContext,
+  evaluateLog,
+  grantNowStandingAlert,
+  isPermanentGrant,
+  ttlEscalations,
+} from "./rules";
 import {
   MAX_LOG_RANGE,
   chunkRange,
@@ -15,7 +22,7 @@ import {
   isRangeTooLargeError,
   shrinkRange,
 } from "./scan";
-import type { MonitorStore } from "./store";
+import type { MonitorStore, OpenGrant } from "./store";
 
 /**
  * The watcher loop.
@@ -148,7 +155,7 @@ export class Monitor {
     const ctx = this.buildContext(index);
 
     await this.scan(ctx, index);
-    await this.sweepGrantTtl();
+    await this.sweepGrantTtl(ctx);
   }
 
   private async scan(ctx: RuleContext, index: EntityIndex): Promise<void> {
@@ -298,17 +305,41 @@ export class Monitor {
     }
   }
 
-  private async sweepGrantTtl(): Promise<void> {
+  private async sweepGrantTtl(ctx: RuleContext): Promise<void> {
     const { store, cfg, sink } = this.deps;
-    const escalations = ttlEscalations(
-      store.listOpenGrants(),
-      this.now(),
-      cfg.grantTtlMs,
-      cfg.controller,
-    );
+    // A row can become permanent after it was opened: the standing set grows with a release (the
+    // two legal-body grants joined it this way), and a grant made while an older build was running
+    // was stored as a ceremony grant. The executor never revokes a standing grant, and a revoke is
+    // the only other thing that closes a row, so such a row would page CRITICAL every interval,
+    // forever. It is closed instead, with one trail line and an INFO record, and no page.
+    const permanent: OpenGrant[] = [];
+    const open: OpenGrant[] = [];
+    for (const g of store.listOpenGrants())
+      (isPermanentGrant(g.role, g.account, ctx) ? permanent : open).push(g);
+
+    // Page FIRST. Closing a row is a write, and a store that cannot be written (a full disk, a
+    // read-only remount) must not be able to stop a page for a grant that is still overdue.
+    const escalations = ttlEscalations(open, this.now(), cfg.grantTtlMs, cfg.controller);
     for (const e of escalations) {
       await sink.emit(e.alert);
       store.setGrantAlertedCount(e.role, e.account, e.alertedCount);
+    }
+
+    // Only then the housekeeping, one row at a time: a close that fails is logged and the row is
+    // left in place, so the next tick tries again and the other rows are still closed. The INFO
+    // alert is what stays in the alert log to explain why the TTL pages for this grant stopped.
+    for (const g of permanent) {
+      try {
+        store.closeGrant(g.role, g.account);
+        this.log("monitor_grant_now_standing", { role: g.role, account: g.account });
+        await sink.emit(grantNowStandingAlert(g, cfg.controller, this.now()));
+      } catch (err) {
+        this.log("monitor_grant_now_standing_failed", {
+          role: g.role,
+          account: g.account,
+          message: (err as Error).message,
+        });
+      }
     }
   }
 

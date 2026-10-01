@@ -1,16 +1,22 @@
 import {
   type Abi,
   type Address,
+  BaseError,
+  ContractFunctionExecutionError,
+  ContractFunctionRevertedError,
+  ContractFunctionZeroDataError,
   type Hex,
   type PublicClient,
   getAbiItem,
   isAddressEqual,
   pad,
   toFunctionSelector,
+  zeroAddress,
 } from "viem";
 import {
   agentTreasuryAbi,
   iIdentityRegistryAbi,
+  legalBodyFactoryAbi,
   legalManagerAbi,
   legalManagerFactoryAbi,
   noviControllerAbi,
@@ -87,6 +93,27 @@ export const CONTROLLER_PINNED_SELECTORS: readonly GrantedSelector[] =
   CONTROLLER_GRANTED_SELECTORS.filter((s) => s.name.startsWith("IdentityRegistry."));
 
 /**
+ * The executor's two grants on the legal-body factory: create a body with the identity owner's
+ * signature, and schedule an amendment the body's guardian signed. Derived from the generated ABI,
+ * never hardcoded. When the factory is configured, boot refuses to start unless both are pinned to
+ * the factory (setBoundTarget) and granted to the executor.
+ */
+export const LEGAL_BODY_GRANTED_SELECTORS: readonly GrantedSelector[] = [
+  {
+    name: "LegalBodyFactory.createLegalBody",
+    selector: selectorOf(legalBodyFactoryAbi, "LegalBodyFactory", "createLegalBody"),
+  },
+  {
+    name: "LegalBodyFactory.scheduleOperatingAgreementUpdate",
+    selector: selectorOf(
+      legalBodyFactoryAbi,
+      "LegalBodyFactory",
+      "scheduleOperatingAgreementUpdate",
+    ),
+  },
+] as const;
+
+/**
  * `role id = bytes32(bytes4 selector)` — the selector LEFT-aligned in a bytes32 (the Euler shape
  * the controller uses). Right-padding is what makes the selector namespace disjoint from
  * DEFAULT_ADMIN_ROLE (0x00) and from the right-aligned WILDCARD_ROLE.
@@ -101,6 +128,27 @@ function unreadable(what: string, err: unknown): Error {
     `boot: could not verify ${what} on-chain (RPC read failed against ARC_TESTNET_RPC_URL) — the deployment may be fine, but it cannot be confirmed; fix connectivity and restart`,
     { cause: err },
   );
+}
+
+/**
+ * Tell "the contract refused the read" apart from "the read never got there". A call that comes
+ * back empty (no code at the address) or reverted (a contract with no such function) was answered
+ * by the chain: the ADDRESS is wrong, and telling the operator to fix connectivity sends them the
+ * wrong way. Returns which address refused and how, or undefined for anything else (a transport
+ * failure, a timeout), which stays a verification outage.
+ */
+function contractRefusal(err: unknown): { address?: Address; reason: string } | undefined {
+  if (!(err instanceof BaseError)) return undefined;
+  const refused = err.walk(
+    (e) => e instanceof ContractFunctionZeroDataError || e instanceof ContractFunctionRevertedError,
+  );
+  if (!(refused instanceof BaseError)) return undefined;
+  const call = err.walk((e) => e instanceof ContractFunctionExecutionError);
+  return {
+    address: call instanceof ContractFunctionExecutionError ? call.contractAddress : undefined,
+    // One line: a revert with an unknown error carries its signature on a second line.
+    reason: refused.shortMessage.replace(/\s+/g, " "),
+  };
 }
 
 /**
@@ -183,6 +231,146 @@ export async function assertControllerWiring(
         .join(
           ", ",
         )} — an unpinned registry selector may be relayed at any contract; set it via controller.setBoundTarget from the admin`,
+    );
+}
+
+/**
+ * The typed-data domain the legal-body factory signs under (its name and version are fixed in the
+ * contract's constructor). Link and amendment signatures are built against exactly this domain.
+ */
+export const LEGAL_BODY_FACTORY_DOMAIN = { name: "Novi LegalBodyFactory", version: "1" } as const;
+
+/**
+ * Legal-body mode: prove the factory belongs to the controller with no handover pending, reads the
+ * configured identity registry, signs under the expected typed-data domain on the configured chain,
+ * and that both executor grants exist and are pinned to it. Every mismatch otherwise surfaces at a
+ * customer's first order as an opaque relay revert.
+ *
+ * Why the domain and the chain id: every legal-body record stores its chain id, write-once, and
+ * every link signature is bound to this domain (name, version, chain id, the factory's address).
+ * The factory reports the chain it actually runs on, so a chain id in the config that is not the
+ * chain behind the RPC is caught here. Left unchecked, it would surface at a customer's first
+ * order as a bad signature, after records carrying the wrong chain id had already been written.
+ */
+export async function assertLegalBodyFactoryWiring(
+  publicClient: PublicClient,
+  p: {
+    factory: Address;
+    controller: Address;
+    identityRegistry: Address;
+    executor: Address;
+    /** The configured chain id (ARC_CHAIN_ID). */
+    chainId: number;
+  },
+): Promise<void> {
+  let owner: Address;
+  let pendingOwner: Address;
+  let registry: Address;
+  // eip712Domain() returns (fields, name, version, chainId, verifyingContract, salt, extensions).
+  let domain: readonly [Hex, string, string, bigint, Address, Hex, readonly bigint[]];
+  let pins: readonly Address[];
+  let grants: readonly boolean[];
+  try {
+    [owner, pendingOwner, registry, domain, pins, grants] = await Promise.all([
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "owner",
+      }) as Promise<Address>,
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "pendingOwner",
+      }) as Promise<Address>,
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "identityRegistry",
+      }) as Promise<Address>,
+      publicClient.readContract({
+        address: p.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "eip712Domain",
+      }) as Promise<typeof domain>,
+      Promise.all(
+        LEGAL_BODY_GRANTED_SELECTORS.map(
+          (s) =>
+            publicClient.readContract({
+              address: p.controller,
+              abi: noviControllerAbi,
+              functionName: "boundTarget",
+              args: [s.selector],
+            }) as Promise<Address>,
+        ),
+      ),
+      Promise.all(
+        LEGAL_BODY_GRANTED_SELECTORS.map(
+          (s) =>
+            publicClient.readContract({
+              address: p.controller,
+              abi: noviControllerAbi,
+              functionName: "hasRole",
+              args: [selectorRole(s.selector), p.executor],
+            }) as Promise<boolean>,
+        ),
+      ),
+    ]);
+  } catch (err) {
+    const refused = contractRefusal(err);
+    if (!refused) throw unreadable(`the legal-body factory wiring (factory ${p.factory})`, err);
+    // The two controller reads (pins and grants) are the only ones not made at the factory.
+    const atController =
+      refused.address !== undefined &&
+      isAddressEqual(refused.address, p.controller) &&
+      !isAddressEqual(p.controller, p.factory);
+    throw new Error(
+      atController
+        ? `boot: CONTROLLER_ADDRESS ${p.controller} does not answer as the controller of LEGAL_BODY_FACTORY_ADDRESS ${p.factory} on this chain (${refused.reason})`
+        : `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} does not answer as a legal-body factory on this chain (${refused.reason})`,
+      { cause: err },
+    );
+  }
+
+  if (!isAddressEqual(owner, p.controller))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} is owned by ${owner}, not by CONTROLLER_ADDRESS ${p.controller} — this is not the controller's legal-body factory`,
+    );
+  if (!isAddressEqual(pendingOwner, zeroAddress))
+    throw new Error(
+      `boot: an ownership handover of LEGAL_BODY_FACTORY_ADDRESS ${p.factory} to ${pendingOwner} is pending — refusing to boot until it is accepted or cancelled (the executor's grants would stop reaching it)`,
+    );
+  if (!isAddressEqual(registry, p.identityRegistry))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} reads identity registry ${registry}, not IDENTITY_REGISTRY ${p.identityRegistry}`,
+    );
+  const [, domainName, domainVersion, domainChainId, verifyingContract] = domain;
+  if (domainChainId !== BigInt(p.chainId))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} signs for chain id ${domainChainId}, not ARC_CHAIN_ID ${p.chainId} — the configured chain id is not the chain this factory runs on; every legal-body record would store the wrong chain and every link signature would be refused`,
+    );
+  if (!isAddressEqual(verifyingContract, p.factory))
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} names ${verifyingContract} as the verifying contract of its typed-data domain, not itself — link signatures built for this address would be refused`,
+    );
+  if (domainName !== LEGAL_BODY_FACTORY_DOMAIN.name)
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} has typed-data domain name ${JSON.stringify(domainName)}, not ${JSON.stringify(LEGAL_BODY_FACTORY_DOMAIN.name)} — this is not the legal-body factory this build signs for`,
+    );
+  if (domainVersion !== LEGAL_BODY_FACTORY_DOMAIN.version)
+    throw new Error(
+      `boot: LEGAL_BODY_FACTORY_ADDRESS ${p.factory} has typed-data domain version ${JSON.stringify(domainVersion)}, not ${JSON.stringify(LEGAL_BODY_FACTORY_DOMAIN.version)} — this build signs for another version of the factory`,
+    );
+  const badPins = LEGAL_BODY_GRANTED_SELECTORS.filter(
+    (_, i) => !pins[i] || !isAddressEqual(pins[i]!, p.factory),
+  );
+  if (badPins.length > 0)
+    throw new Error(
+      `boot: ${badPins.map((s) => `${s.name} (${s.selector})`).join(", ")} not pinned to LEGAL_BODY_FACTORY_ADDRESS ${p.factory} on CONTROLLER_ADDRESS ${p.controller} — pin each selector to the factory (setBoundTarget) before granting it`,
+    );
+  const missing = LEGAL_BODY_GRANTED_SELECTORS.filter((_, i) => !grants[i]);
+  if (missing.length > 0)
+    throw new Error(
+      `boot: executor ${p.executor} (the address of PLATFORM_PRIVATE_KEY) is missing ${missing.map((s) => `${s.name} (${s.selector})`).join(", ")} on CONTROLLER_ADDRESS ${p.controller} — grant it from the controller admin`,
     );
 }
 

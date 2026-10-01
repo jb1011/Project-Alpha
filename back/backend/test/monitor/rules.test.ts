@@ -6,7 +6,11 @@ import {
   legalManagerFactoryAbi,
   noviControllerAbi,
 } from "../../src/abis/generated";
-import { CONTROLLER_GRANTED_SELECTORS, selectorRole } from "../../src/adapters/arc/bootVerify";
+import {
+  CONTROLLER_GRANTED_SELECTORS,
+  LEGAL_BODY_GRANTED_SELECTORS,
+  selectorRole,
+} from "../../src/adapters/arc/bootVerify";
 import { indexEntities } from "../../src/monitor/entityLookup";
 import {
   DEFAULT_ADMIN_ROLE,
@@ -15,7 +19,13 @@ import {
   registryMetadataSetEvent,
   registryTransferEvent,
 } from "../../src/monitor/events";
-import { evaluateLog, roleLabel, ttlEscalations } from "../../src/monitor/rules";
+import {
+  evaluateLog,
+  grantNowStandingAlert,
+  isPermanentGrant,
+  roleLabel,
+  ttlEscalations,
+} from "../../src/monitor/rules";
 import type { OpenGrant } from "../../src/monitor/store";
 import { ADDR, entity, makeLog, ruleContext, ruleDeps } from "./helpers";
 
@@ -24,6 +34,7 @@ const UNKNOWN_ROLE = pad(toFunctionSelector("function upgradeTo(address)"), {
   dir: "right",
   size: 32,
 });
+const LEGAL_BODY_ROLE = selectorRole(LEGAL_BODY_GRANTED_SELECTORS[0]!.selector);
 
 function roleGrantedLog(args: { role: string; account: string; sender?: string }, over = {}) {
   return makeLog({
@@ -48,6 +59,18 @@ describe("rule 1 — controller RoleGranted", () => {
     expect(out.alerts[0]?.detail.roleLabel).toBe(CONTROLLER_GRANTED_SELECTORS[0]?.name);
     // The permanent, boot-verified pairing: paging on it every TTL would train the on-call to
     // ignore this rule.
+    expect(out.grants).toHaveLength(0);
+  });
+
+  test("a legal-body grant to the executor is WARN and is NOT TTL-tracked", async () => {
+    const out = await evaluateLog(
+      roleGrantedLog({ role: LEGAL_BODY_ROLE, account: ADDR.executor }),
+      ruleContext(),
+      ruleDeps(),
+    );
+    expect(out.alerts.map((a) => a.severity)).toEqual(["WARN"]);
+    expect(out.alerts[0]?.detail.standingExecutorRole).toBe(true);
+    expect(out.alerts[0]?.detail.roleLabel).toBe("LegalBodyFactory.createLegalBody");
     expect(out.grants).toHaveLength(0);
   });
 
@@ -127,6 +150,54 @@ describe("rule 3 — controller RoleRevoked", () => {
     expect(out.grants).toEqual([
       { kind: "close", role: WILDCARD_ROLE.toLowerCase(), account: ADDR.helper.toLowerCase() },
     ]);
+  });
+});
+
+describe("isPermanentGrant — the one definition rule 2 and the TTL sweep share", () => {
+  // Mixed-case on purpose: the executor comes from config checksummed, while the monitor store
+  // keeps every account lowercased. The two must still match.
+  const EXECUTOR = "0x00000000000000000000000000000000000e1E1E" as const;
+  const ctx = ruleContext({ executor: EXECUTOR });
+
+  test("DEFAULT_ADMIN_ROLE is permanent whoever holds it", () => {
+    expect(isPermanentGrant(DEFAULT_ADMIN_ROLE, EXECUTOR, ctx)).toBe(true);
+    expect(isPermanentGrant(DEFAULT_ADMIN_ROLE, ADDR.attacker, ctx)).toBe(true);
+  });
+
+  test("a standing role is permanent only in the executor's hands, in any casing", () => {
+    for (const role of [STANDING_ROLE, LEGAL_BODY_ROLE]) {
+      expect(isPermanentGrant(role, EXECUTOR, ctx)).toBe(true);
+      expect(isPermanentGrant(role.toLowerCase(), EXECUTOR.toLowerCase(), ctx)).toBe(true);
+      expect(isPermanentGrant(role, ADDR.attacker, ctx)).toBe(false);
+    }
+  });
+
+  test("a role outside the standing set is never permanent, even for the executor", () => {
+    expect(isPermanentGrant(UNKNOWN_ROLE, EXECUTOR, ctx)).toBe(false);
+    expect(isPermanentGrant(WILDCARD_ROLE, EXECUTOR, ctx)).toBe(false);
+  });
+
+  test("an account that is not an address is not the executor, and does not throw", () => {
+    // The sweep walks stored rows; one bad row must not stop it from paging on the others.
+    expect(isPermanentGrant(LEGAL_BODY_ROLE, "not-an-address", ctx)).toBe(false);
+  });
+});
+
+describe("grantNowStandingAlert — the record of a row the sweep closed", () => {
+  test("INFO, keyed by the grant alone, with the role named", () => {
+    const role = LEGAL_BODY_ROLE.toLowerCase();
+    const account = ADDR.executor.toLowerCase();
+    const a = grantNowStandingAlert({ role, account }, ADDR.controller, 1_700_000_000_000);
+    expect(a).toEqual({
+      severity: "INFO",
+      rule: "controller_grant_now_standing",
+      subject: ADDR.controller,
+      detail: { role, roleLabel: "LegalBodyFactory.createLegalBody", account },
+      ts: 1_700_000_000_000,
+      // No clock and no interval in the key: a grant becomes standing once.
+      dedupKey: `controller_grant_now_standing:${role}:${account}`,
+    });
+    expect(() => JSON.stringify(a.detail)).not.toThrow();
   });
 });
 
@@ -519,6 +590,17 @@ describe("roleLabel", () => {
     expect(roleLabel(WILDCARD_ROLE)).toBe("WILDCARD_ROLE");
     expect(roleLabel(STANDING_ROLE)).toBe(CONTROLLER_GRANTED_SELECTORS[0]?.name);
     expect(roleLabel(UNKNOWN_ROLE)).toBe("UNKNOWN_SELECTOR_ROLE");
+  });
+
+  test("names the two legal-body roles", () => {
+    // Role ids built from the function signatures, independently of the list roleLabel reads.
+    const role = (sig: string) => pad(toFunctionSelector(sig), { dir: "right", size: 32 });
+    expect(roleLabel(role("createLegalBody(uint256,address,uint256,bytes32,uint256,bytes)"))).toBe(
+      "LegalBodyFactory.createLegalBody",
+    );
+    expect(roleLabel(role("scheduleOperatingAgreementUpdate(address,bytes32,uint256,bytes)"))).toBe(
+      "LegalBodyFactory.scheduleOperatingAgreementUpdate",
+    );
   });
 });
 

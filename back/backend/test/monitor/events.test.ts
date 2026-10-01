@@ -1,6 +1,9 @@
 import { keccak256, toHex } from "viem";
 import { describe, expect, test } from "vitest";
-import { CONTROLLER_GRANTED_SELECTORS } from "../../src/adapters/arc/bootVerify";
+import {
+  CONTROLLER_GRANTED_SELECTORS,
+  LEGAL_BODY_GRANTED_SELECTORS,
+} from "../../src/adapters/arc/bootVerify";
 import {
   AGENT_WALLET_KEY,
   AGENT_WALLET_KEY_TOPIC,
@@ -79,10 +82,11 @@ describe("role constants", () => {
     expect(WILDCARD_ROLE).toBe(`0x${"00".repeat(31)}01`);
   });
 
-  test("the standing set is exactly the seven selectors bootVerify checks on-chain", () => {
+  test("the standing set is exactly the selectors bootVerify checks on-chain", () => {
     const roles = standingRoles();
-    expect(roles.size).toBe(7);
-    expect(roles.size).toBe(CONTROLLER_GRANTED_SELECTORS.length);
+    expect(roles.size).toBe(
+      CONTROLLER_GRANTED_SELECTORS.length + LEGAL_BODY_GRANTED_SELECTORS.length,
+    );
     // Selector roles are LEFT-aligned, so they can never collide with the two specials above.
     for (const r of roles) {
       expect(r).not.toBe(DEFAULT_ADMIN_ROLE);

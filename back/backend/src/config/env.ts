@@ -49,6 +49,11 @@ const EnvSchema = z.object({
   IDENTITY_REGISTRY: addressSchema.default("0x8004A818BFB912233c491871b3d84c89A494BD9e"),
   USDC_ADDRESS: addressSchema.default("0x3600000000000000000000000000000000000000"),
   FACTORY_ADDRESS: addressSchema.optional(),
+  /** The legal-body factory: creates legal bodies for identities their customers own and manages
+   *  them with no power beyond guardian-signed amendments. Set = the legal-body feature is on (its
+   *  wiring is verified on chain at boot). Requires controller mode: the factory's owner is the
+   *  controller, and the executor relays through it. */
+  LEGAL_BODY_FACTORY_ADDRESS: addressSchema.optional(),
   /** NoviController (docs/design/2026-08-13-novi-controller-design.md). When set, the platform
    *  manager IDENTITY is this contract — it is the immutable `manager` of every new agent's vaults,
    *  the factory/beacon owner and the holder of each agent's identity NFT — and PLATFORM_PRIVATE_KEY
@@ -396,6 +401,8 @@ export interface Config {
   /** NoviController address; present => controller mode (see CONTROLLER_ADDRESS). The platform
    *  manager identity is this contract and every role-gated manager call is relayed through it. */
   controllerAddress?: Address;
+  /** LegalBodyFactory address; undefined = the legal-body feature is off. */
+  legalBodyFactory?: Address;
   /** Explicit ENS apex target; absent => the platform signing key (today's behavior). */
   ensApexResolvesTo?: Address;
   guardianAddress?: Address;
@@ -718,6 +725,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     usdc: e.USDC_ADDRESS,
     factoryAddress: e.FACTORY_ADDRESS,
     controllerAddress: e.CONTROLLER_ADDRESS,
+    legalBodyFactory: e.LEGAL_BODY_FACTORY_ADDRESS,
     ensApexResolvesTo: e.ENS_APEX_RESOLVES_TO,
     guardianAddress: e.GUARDIAN_ADDRESS,
     operatorPrivateKey: e.OPERATOR_PRIVATE_KEY,
@@ -1227,6 +1235,20 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (cfg.controllerAddress && !cfg.factoryAddress) {
     throw new Error(
       "Invalid config: CONTROLLER_ADDRESS is set but FACTORY_ADDRESS is missing — controller mode requires the factory whose owner is the controller to be named explicitly",
+    );
+  }
+  if (cfg.legalBodyFactory && !cfg.controllerAddress) {
+    throw new Error(
+      "Invalid config: LEGAL_BODY_FACTORY_ADDRESS is set but CONTROLLER_ADDRESS is missing — the legal-body factory is owned by the controller and every call to it is relayed through the controller",
+    );
+  }
+  if (
+    cfg.legalBodyFactory &&
+    cfg.factoryAddress &&
+    cfg.legalBodyFactory.toLowerCase() === cfg.factoryAddress.toLowerCase()
+  ) {
+    throw new Error(
+      "Invalid config: LEGAL_BODY_FACTORY_ADDRESS equals FACTORY_ADDRESS — the legal-body factory and the full-product factory are different contracts",
     );
   }
 

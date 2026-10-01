@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { DEFAULT_DESCRIPTION, DEFAULT_INDUSTRY, companyNameOptions } from "../formation/intake";
+import { opsLog } from "../observability/opsLog";
 
 /** Open (and create dirs for) a SQLite db. Use ":memory:" in tests. */
 export function openDatabase(path: string): Database.Database {
@@ -180,6 +181,660 @@ const COMPANIES_DDL = `
     CREATE INDEX IF NOT EXISTS idx_companies_tenant_created
       ON companies(tenant_id, created_at DESC);
 `;
+
+/**
+ * The shape CHECKs the DDL below repeats, as SQL over one column. Each accepts only TEXT whose
+ * byte length equals its character length: `length()` stops at the first NUL, and GLOB and
+ * `substr` read a BLOB as text, so without those two terms a BLOB, or a value with an embedded
+ * NUL, could pass as a second spelling of a value that is already stored.
+ */
+const sqlIsAddress = (column: string) =>
+  `typeof(${column}) = 'text' AND length(CAST(${column} AS BLOB)) = 42 AND length(${column}) = 42
+      AND substr(${column}, 1, 2) = '0x' AND substr(${column}, 3) NOT GLOB '*[^0-9a-fA-F]*'`;
+/** `0x` and 64 lower-case hex digits: one spelling per hash, so stored hashes compare as text. */
+const sqlIsHash = (column: string) =>
+  `typeof(${column}) = 'text' AND length(CAST(${column} AS BLOB)) = 66 AND length(${column}) = 66
+      AND substr(${column}, 1, 2) = '0x' AND substr(${column}, 3) NOT GLOB '*[^0-9a-f]*'`;
+/** Unix SECONDS. The upper bound is far in the future and refuses a value in milliseconds. */
+const sqlIsSeconds = (column: string) =>
+  `typeof(${column}) = 'integer' AND ${column} BETWEEN 1 AND 99999999999`;
+
+/**
+ * Legal bodies for identities their customers own (one row per body order), and their append-only
+ * event log. Kept apart from `entities` on purpose: a legal body has no treasury, no operator, no
+ * custody and no onboarding saga, so no existing agent query can ever mistake one for an agent.
+ *
+ * The tables enforce their own invariants rather than trusting callers. The foreign keys below
+ * hold on a connection with foreign keys on, and foreign keys are on for every connection the
+ * application opens.
+ *  - The guardian IS the tenant (the human's signed-in wallet), structurally (a CHECK), and a body
+ *    can only be created under a company of that same tenant (checked on INSERT, by a trigger; a
+ *    company that does not exist is refused by the foreign key).
+ *  - The amendment delay is within the factory contract's bounds, 48 hours to 30 days inclusive.
+ *  - Every number column holds an integer: anything else (a fraction, text such as 'v1', a BLOB)
+ *    is refused rather than stored as REAL or TEXT. A chain id is positive.
+ *  - A legal body id is `lb_` and 36 characters, a public id 36 characters, both TEXT with no
+ *    hidden bytes.
+ *  - An agentId has one spelling: TEXT with no hidden bytes, decimal digits only, no leading zero
+ *    except '0' itself, at most 78 digits (the width of a uint256). The one-live-body index
+ *    compares full bytes and storage class, so '042', a BLOB '42' or '42' followed by a NUL would
+ *    otherwise each be a second live body for agent 42.
+ *  - An address (the tenant, the factory, the identity owner, the body) is TEXT with no hidden
+ *    bytes: `0x`, then exactly 40 hex digits. A body address is never the zero address, nor the
+ *    row's own factory, in any casing.
+ *  - A hash (the agreement hash, the link digest, the deploy transaction hash) is `0x` and 64
+ *    LOWER-CASE hex digits, so a stored hash has one spelling and compares as text. The link
+ *    signature is `0x` and one or more whole bytes of lower-case hex.
+ *  - The agreement hash and its version are set together or not at all, and the version is at
+ *    least 1.
+ *  - Every time column has one unit:
+ *      - `amendment_delay` is a duration in SECONDS;
+ *      - `link_deadline`, `deployed_at` and `pointer_seen_at` are unix SECONDS, the unit of a
+ *        block timestamp, between 1 and 99999999999 (a value in milliseconds does not fit);
+ *      - `next_binding_check_at` is unix MILLISECONDS, zero or more, and
+ *        `binding_check_interval_ms` a positive duration in MILLISECONDS, the units of the process
+ *        clock that schedules the checks. They are set together or not at all. No range can tell
+ *        a time in seconds apart here, so the unit is the caller's to mind;
+ *      - `created_at` and `updated_at`, here and in the event log, are UTC text as SQLite's
+ *        CURRENT_TIMESTAMP writes it (`YYYY-MM-DD HH:MM:SS`).
+ *  - `deployed_at` is set only by the deploy: no `draft`, `reserved`, `lapsed` or `abandoned` row
+ *    holds one. The deploy facts are write-once, so a row that held one early could never be
+ *    deployed.
+ *  - A deploy hash needs a reservation: no `draft` or `abandoned` row holds a `create_tx_hash`.
+ *    A sighting of the pointer needs a link: only a `linked`, `broken` or `superseded` row holds a
+ *    `pointer_seen_at`.
+ *  - Rows are born `draft`, and an INSERT never lands on an existing row, whether it names that
+ *    row's id, its public id or its rowid (a trigger). That is what stops `REPLACE INTO` from
+ *    rewriting a body wholesale: REPLACE deletes the old row and inserts a new one, and no UPDATE
+ *    guard would ever see it.
+ *  - Each group of facts is write-once from the step that sets it (a trigger): the identity
+ *    fields, the rowid and `created_at` from the INSERT, the agreement (hash and version) from the
+ *    freeze, the link fields from the reservation, the deploy facts (deployed_at and
+ *    create_tx_hash) from the deploy. So no UPDATE can re-point a reservation at another agent,
+ *    owner or agreement, or a deployed body at another creating transaction.
+ *  - binding_state only moves along the legal transitions (a trigger), and a NULL target is
+ *    refused too: `UPDATE OR REPLACE` would otherwise quietly turn it into the column default,
+ *    `draft`, which no transition reaches.
+ *  - A `draft` holds no link fields, so it can never squat on an agentId or a body address, and
+ *    neither does an `abandoned` row, which is a draft closed for good. Every other state requires
+ *    every link field and a frozen agreement; `deployed`, `linked`, `broken` and `superseded`
+ *    require the deploy facts, and `linked` a sighting of the pointer (CHECKs).
+ *  - `superseded` is not final: the chain decides which body an identity's owner names, and a
+ *    body that was set aside can be named again, so `superseded` may return to `linked`. The
+ *    final states are `lapsed` and `abandoned`.
+ *  - At most one LIVE body (reserved, deployed or linked) per agentId per chain (a partial unique
+ *    index), and at most one row per body address per chain, whatever its casing (a unique index
+ *    on its lower-case form).
+ *  - A rowid is positive (a CHECK). The insert guard relies on it: for an automatic rowid SQLite
+ *    shows a BEFORE INSERT trigger a placeholder (-1), which must never match a stored row.
+ *  - No DELETE removes a legal body (a trigger), and the event log's foreign key holds in place
+ *    every body that has an event. The repository writes each body together with its `created`
+ *    event.
+ *  - The event log is append-only: no UPDATE, no DELETE, no INSERT over an existing event id, and
+ *    every event id is positive (a CHECK), which that last guard relies on. An event id written
+ *    out by hand is at most the next one (a trigger), so ids stay in order and one row cannot use
+ *    up the ids that remain.
+ *
+ * Scope. These guards hold, on a connection with foreign keys on, for every write the application
+ * makes, and for plain INSERT, UPDATE and DELETE statements from anyone else. They are not a
+ * defence against someone with direct write access to the database file.
+ *
+ * A database that already ran this DDL takes an edit to it through `applyLegalBodySchema`, which
+ * goes by the schema version: see `LEGAL_BODIES_SCHEMA_VERSION`, which is raised with every edit
+ * to this constant.
+ *
+ * `create_tx_hash` is deliberately NOT write-once while the row is `reserved`: a deploy whose
+ * first transaction never lands is re-sent with a new nonce, and so a new hash. Every submission
+ * is kept in the event log, so overwriting the column loses nothing. Once the body is deployed,
+ * the hash of the transaction that created it is a fact, and it locks together with
+ * `deployed_at`.
+ */
+export const LEGAL_BODIES_DDL = `
+  CREATE TABLE IF NOT EXISTS legal_bodies (
+    legal_body_id TEXT PRIMARY KEY NOT NULL CHECK (typeof(legal_body_id) = 'text'
+      AND length(CAST(legal_body_id AS BLOB)) = 39 AND length(legal_body_id) = 39
+      AND substr(legal_body_id, 1, 3) = 'lb_'),
+    public_id TEXT NOT NULL UNIQUE CHECK (typeof(public_id) = 'text'
+      AND length(CAST(public_id AS BLOB)) = 36 AND length(public_id) = 36),
+    tenant_id TEXT NOT NULL CHECK (${sqlIsAddress("tenant_id")}),
+    company_id TEXT NOT NULL REFERENCES companies(company_id),
+    chain_id INTEGER NOT NULL CHECK (typeof(chain_id) = 'integer' AND chain_id > 0),
+    factory TEXT NOT NULL CHECK (${sqlIsAddress("factory")}),
+    guardian TEXT NOT NULL,
+    amendment_delay INTEGER NOT NULL CHECK (typeof(amendment_delay) = 'integer')
+      CHECK (amendment_delay BETWEEN 172800 AND 2592000),
+    oa_manifest_hash TEXT CHECK (oa_manifest_hash IS NULL OR (${sqlIsHash("oa_manifest_hash")})),
+    oa_manifest_version INTEGER CHECK (oa_manifest_version IS NULL
+      OR (typeof(oa_manifest_version) = 'integer' AND oa_manifest_version >= 1)),
+    agent_id TEXT CHECK (agent_id IS NULL OR (typeof(agent_id) = 'text'
+      AND length(CAST(agent_id AS BLOB)) = length(agent_id) AND length(agent_id) BETWEEN 1 AND 78
+      AND agent_id NOT GLOB '*[^0-9]*' AND (agent_id = '0' OR substr(agent_id, 1, 1) != '0'))),
+    identity_owner TEXT CHECK (identity_owner IS NULL OR (${sqlIsAddress("identity_owner")})),
+    link_digest TEXT CHECK (link_digest IS NULL OR (${sqlIsHash("link_digest")})),
+    link_deadline INTEGER CHECK (link_deadline IS NULL OR (${sqlIsSeconds("link_deadline")})),
+    link_signature TEXT CHECK (link_signature IS NULL OR (typeof(link_signature) = 'text'
+      AND length(CAST(link_signature AS BLOB)) = length(link_signature)
+      AND length(link_signature) >= 4 AND length(link_signature) % 2 = 0
+      AND substr(link_signature, 1, 2) = '0x' AND substr(link_signature, 3) NOT GLOB '*[^0-9a-f]*')),
+    body_address TEXT CHECK (body_address IS NULL OR (${sqlIsAddress("body_address")})),
+    create_tx_hash TEXT CHECK (create_tx_hash IS NULL OR (${sqlIsHash("create_tx_hash")})),
+    deployed_at INTEGER CHECK (deployed_at IS NULL OR (${sqlIsSeconds("deployed_at")})),
+    binding_state TEXT NOT NULL DEFAULT 'draft'
+      CHECK (binding_state IN ('draft','reserved','deployed','linked','broken','lapsed','superseded',
+                               'abandoned')),
+    pointer_seen_at INTEGER CHECK (pointer_seen_at IS NULL OR (${sqlIsSeconds("pointer_seen_at")})),
+    next_binding_check_at INTEGER CHECK (next_binding_check_at IS NULL
+      OR (typeof(next_binding_check_at) = 'integer' AND next_binding_check_at >= 0)),
+    binding_check_interval_ms INTEGER CHECK (binding_check_interval_ms IS NULL
+      OR (typeof(binding_check_interval_ms) = 'integer' AND binding_check_interval_ms > 0)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (rowid > 0),
+    CHECK (guardian = tenant_id),
+    CHECK ((oa_manifest_hash IS NULL) = (oa_manifest_version IS NULL)),
+    CHECK ((next_binding_check_at IS NULL) = (binding_check_interval_ms IS NULL)),
+    CHECK (body_address IS NULL
+      OR (lower(body_address) != '0x0000000000000000000000000000000000000000'
+          AND lower(body_address) != lower(factory))),
+    CHECK (binding_state NOT IN ('draft','abandoned') OR (agent_id IS NULL AND identity_owner IS NULL
+      AND link_digest IS NULL AND link_deadline IS NULL AND link_signature IS NULL
+      AND body_address IS NULL)),
+    CHECK (binding_state IN ('draft','abandoned') OR (
+      agent_id IS NOT NULL AND identity_owner IS NOT NULL AND link_digest IS NOT NULL
+      AND link_deadline IS NOT NULL AND link_signature IS NOT NULL AND body_address IS NOT NULL
+      AND oa_manifest_hash IS NOT NULL)),
+    CHECK (binding_state NOT IN ('deployed','linked','broken','superseded')
+      OR (create_tx_hash IS NOT NULL AND deployed_at IS NOT NULL)),
+    CHECK (deployed_at IS NULL OR binding_state IN ('deployed','linked','broken','superseded')),
+    CHECK (create_tx_hash IS NULL OR binding_state NOT IN ('draft','abandoned')),
+    CHECK (binding_state != 'linked' OR pointer_seen_at IS NOT NULL),
+    CHECK (pointer_seen_at IS NULL OR binding_state IN ('linked','broken','superseded'))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_live_agent
+    ON legal_bodies(chain_id, agent_id) WHERE binding_state IN ('reserved','deployed','linked');
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_body
+    ON legal_bodies(chain_id, lower(body_address)) WHERE body_address IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_legal_bodies_tenant ON legal_bodies(tenant_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_legal_bodies_company ON legal_bodies(company_id);
+  CREATE INDEX IF NOT EXISTS idx_legal_bodies_binding_due
+    ON legal_bodies(next_binding_check_at) WHERE next_binding_check_at IS NOT NULL;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_write_once
+  BEFORE UPDATE ON legal_bodies FOR EACH ROW
+  WHEN NEW.rowid IS NOT OLD.rowid
+    OR NEW.legal_body_id IS NOT OLD.legal_body_id
+    OR NEW.public_id IS NOT OLD.public_id
+    OR NEW.tenant_id IS NOT OLD.tenant_id
+    OR NEW.company_id IS NOT OLD.company_id
+    OR NEW.chain_id IS NOT OLD.chain_id
+    OR NEW.factory IS NOT OLD.factory
+    OR NEW.guardian IS NOT OLD.guardian
+    OR NEW.amendment_delay IS NOT OLD.amendment_delay
+    OR NEW.created_at IS NOT OLD.created_at
+    OR (OLD.oa_manifest_hash IS NOT NULL AND (NEW.oa_manifest_hash IS NOT OLD.oa_manifest_hash
+        OR NEW.oa_manifest_version IS NOT OLD.oa_manifest_version))
+    OR (OLD.agent_id IS NOT NULL AND (NEW.agent_id IS NOT OLD.agent_id
+        OR NEW.identity_owner IS NOT OLD.identity_owner OR NEW.link_digest IS NOT OLD.link_digest
+        OR NEW.link_deadline IS NOT OLD.link_deadline OR NEW.link_signature IS NOT OLD.link_signature
+        OR NEW.body_address IS NOT OLD.body_address))
+    OR (OLD.deployed_at IS NOT NULL AND (NEW.deployed_at IS NOT OLD.deployed_at
+        OR NEW.create_tx_hash IS NOT OLD.create_tx_hash))
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: identity, agreement, link and deploy fields are write-once');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_transitions
+  BEFORE UPDATE OF binding_state ON legal_bodies FOR EACH ROW
+  WHEN NEW.binding_state IS NOT OLD.binding_state AND NOT IFNULL((
+       (OLD.binding_state = 'draft' AND NEW.binding_state IN ('reserved','abandoned'))
+    OR (OLD.binding_state = 'reserved' AND NEW.binding_state IN ('deployed','lapsed'))
+    OR (OLD.binding_state = 'deployed' AND NEW.binding_state IN ('linked','superseded'))
+    OR (OLD.binding_state = 'linked' AND NEW.binding_state = 'broken')
+    OR (OLD.binding_state = 'broken' AND NEW.binding_state IN ('linked','superseded'))
+    OR (OLD.binding_state = 'superseded' AND NEW.binding_state = 'linked')), 0)
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: illegal binding_state transition');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_insert
+  BEFORE INSERT ON legal_bodies FOR EACH ROW
+  WHEN NEW.binding_state IS NOT 'draft'
+    OR EXISTS (SELECT 1 FROM legal_bodies
+                WHERE legal_body_id = NEW.legal_body_id OR public_id = NEW.public_id
+                   OR rowid = NEW.rowid)
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: rows are born draft and never replaced');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_company_tenant
+  BEFORE INSERT ON legal_bodies FOR EACH ROW
+  WHEN EXISTS (SELECT 1 FROM companies
+                WHERE company_id = NEW.company_id AND tenant_id IS NOT NEW.tenant_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies: the company belongs to another tenant');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS trg_legal_bodies_no_delete
+  BEFORE DELETE ON legal_bodies
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_bodies rows are never deleted');
+  END;
+
+  CREATE TABLE IF NOT EXISTS legal_body_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id > 0),
+    legal_body_id TEXT NOT NULL REFERENCES legal_bodies(legal_body_id),
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    tx_hash TEXT,
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_legal_body_events_body ON legal_body_events(legal_body_id, id);
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_update
+  BEFORE UPDATE ON legal_body_events
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_delete
+  BEFORE DELETE ON legal_body_events
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events is append-only');
+  END;
+  -- This trigger relies on no stored id ever being <= 0, which the CHECK on id guarantees: for an
+  -- auto-generated id, SQLite's NEW.id in a BEFORE INSERT trigger is a placeholder (-1), not a
+  -- real id, so a stored -1 would make every ordinary append look like a REPLACE.
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_no_replace
+  BEFORE INSERT ON legal_body_events FOR EACH ROW
+  WHEN EXISTS (SELECT 1 FROM legal_body_events WHERE id = NEW.id)
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events is append-only');
+  END;
+  -- An id written out by hand is at most the next one: ids are handed out in increasing order and
+  -- never reused, so a row far ahead of the others would waste every id in between. An automatic
+  -- id shows here as the placeholder described above, so ordinary appends pass.
+  CREATE TRIGGER IF NOT EXISTS trg_legal_body_events_next_id
+  BEFORE INSERT ON legal_body_events FOR EACH ROW
+  WHEN NEW.id > (SELECT IFNULL(MAX(id), 0) FROM legal_body_events) + 1
+  BEGIN
+    SELECT RAISE(ABORT, 'legal_body_events: ids are assigned in order');
+  END;
+`;
+
+/**
+ * The version of `LEGAL_BODIES_DDL`. RAISE IT BY ONE WITH EVERY EDIT TO THAT CONSTANT.
+ *
+ * Every statement of the DDL is `IF NOT EXISTS`, so on its own an edit would reach new databases
+ * only: a database that already ran the old text would keep its old trigger, index or CHECK, and
+ * every test, which starts from a fresh database, would still pass. The version is what carries an
+ * edit to the databases that exist (see `applyLegalBodySchema`). Without a bump, a database at
+ * this version refuses to start when the definition of a table or an index changed, and takes a
+ * changed trigger for one that was altered by hand. A test pins the DDL text to the version, so an
+ * edit without a bump fails the suite.
+ *
+ * TO CHANGE THIS SCHEMA LATER:
+ *  - Every edit to the DDL raises this number by one and adds the hash of the new text to the pin
+ *    in the test, next to the hashes already there.
+ *  - Before the first row exists, nothing else is needed: empty tables are dropped and created
+ *    again from the DDL.
+ *  - A changed trigger needs nothing but that bump, rows or not: triggers hold no data and are
+ *    created again from the DDL.
+ *  - Once a row exists, a changed TABLE or INDEX is made by a written migration, run by `migrate`
+ *    before `applyLegalBodySchema`. The step checks the result: the definitions must match the
+ *    DDL's once normalised, and until they do it refuses to start. By change:
+ *      - A new nullable column: one `ALTER TABLE ... ADD COLUMN`. The DDL declares the column LAST
+ *        among the columns, before the table constraints, writes its CHECK on the column (such a
+ *        CHECK may name other columns), and words it as the ALTER statement does, line breaks and
+ *        indentation aside. SQLite stores an added column right after the last column, so the
+ *        stored text then matches the DDL's. This holds for `legal_bodies`. It does not yet hold
+ *        for `legal_body_events`, which has no table constraint: once normalised, its stored text
+ *        reads `CURRENT_TIMESTAMP , note TEXT)` where a DDL laid out like this one reads
+ *        `CURRENT_TIMESTAMP, note TEXT )`, and the step refuses the difference. With a DDL laid
+ *        out like this one, a new column there is a rebuild, until the comparison ignores the
+ *        spacing beside commas and brackets.
+ *      - A renamed column: one `ALTER TABLE ... RENAME COLUMN`.
+ *      - An index: `DROP INDEX`, then `CREATE INDEX` as the DDL writes it.
+ *      - A change to an existing column's definition, to a table-level CHECK or to the list of
+ *        binding states: a REBUILD of the table from the DDL text (a new table with that body, the
+ *        rows copied, the old table dropped, the new one renamed, its indexes created as the DDL
+ *        writes them), with foreign keys off around it: `PRAGMA foreign_keys = OFF` before its
+ *        transaction and `ON` after it, since the pragma does nothing inside a transaction. The
+ *        step then creates again the triggers that went with the old table.
+ *  - A rebuild of `companies` reaches this schema too. SQLite rewrites the references to a table
+ *    that is renamed, so renaming `companies` re-points the foreign key of `legal_bodies` and its
+ *    company trigger at the new name. That migration must leave both naming `companies` again.
+ *    While the foreign key names another table the step refuses to start, which is the intended
+ *    signal; the trigger it creates again from the DDL, like any other.
+ */
+export const LEGAL_BODIES_SCHEMA_VERSION = 1;
+
+/** Where the version of the schema a database holds is stored, in the `meta` table. */
+const LEGAL_BODIES_SCHEMA_VERSION_KEY = "legal_bodies_schema_version";
+
+interface SchemaObject {
+  type: string;
+  name: string;
+  /** The table the object belongs to (for a table, its own name). */
+  tbl_name: string;
+  sql: string;
+}
+
+/**
+ * The two tables, the event log first: it references the other, so it is dropped first. The step
+ * checks and drops a table only under one of these exact names.
+ */
+const LEGAL_BODY_TABLES = ["legal_body_events", "legal_bodies"] as const;
+const isLegalBodyTableName = (name: string) =>
+  (LEGAL_BODY_TABLES as readonly string[]).includes(name);
+
+/**
+ * The two tables with their indexes and triggers, without the indexes SQLite makes by itself.
+ * They are found whatever the letter case of the table name: SQLite matches table names without
+ * regard to case, so a table stored as `Legal_Bodies` is the one that `legal_bodies` names.
+ */
+const LEGAL_BODY_SCHEMA_OBJECTS_SQL = `
+  SELECT type, name, tbl_name, sql FROM sqlite_master
+   WHERE lower(tbl_name) IN ('legal_bodies','legal_body_events') AND substr(name, 1, 7) != 'sqlite_'
+   ORDER BY name, type`;
+
+function legalBodySchemaObjects(db: Database.Database): SchemaObject[] {
+  return db.prepare(LEGAL_BODY_SCHEMA_OBJECTS_SQL).all() as SchemaObject[];
+}
+
+/** What the code's DDL defines: it is run in a scratch in-memory database and read back. */
+function expectedLegalBodySchema(): SchemaObject[] {
+  const scratch = new Database(":memory:");
+  try {
+    scratch.exec(LEGAL_BODIES_DDL);
+    return legalBodySchemaObjects(scratch);
+  } finally {
+    scratch.close();
+  }
+}
+
+const PLAIN_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const IDENTIFIER_CHARACTER = /[A-Za-z0-9_]/;
+const WHITESPACE = /\s/;
+
+/**
+ * The stored text of a table or an index, without what may differ between two texts of the same
+ * definition:
+ *  - every run of whitespace becomes one space, and the ends are trimmed;
+ *  - identifier quoting is removed, whichever of the three styles it uses (`"name"`, `[name]` or
+ *    backticks). A name that is only a name inside its quotes keeps them, as `"name"`.
+ *
+ * SQLite itself rewrites a table's stored text when the table is renamed: it puts the name in
+ * double quotes. So a table rebuilt from the same definition does not read back byte for byte.
+ *
+ * A string and a comment are copied exactly as written. A string is data: `'a  b'` and `'a b'` are
+ * two values, and a bracket or a quote inside one (`GLOB '*[^0-9]*'`) is not identifier quoting. A
+ * comment may hold a quote of its own, which must not be read as the start of a string.
+ */
+export function normalizeSchemaSql(sql: string): string {
+  let out = "";
+  let i = 0;
+  /** Copies `sql[i..end)` exactly, and moves past it. */
+  const copyTo = (end: number) => {
+    out += sql.slice(i, end);
+    i = end;
+  };
+  while (i < sql.length) {
+    const c = sql.charAt(i);
+    if (c === "'") {
+      // A string, to its closing quote; a doubled quote inside it is one quote of the text.
+      let j = i + 1;
+      while (j < sql.length && (sql.charAt(j) !== "'" || sql.charAt(j + 1) === "'"))
+        j += sql.charAt(j) === "'" ? 2 : 1;
+      copyTo(Math.min(j + 1, sql.length));
+    } else if (c === "-" && sql.charAt(i + 1) === "-") {
+      // A line comment, with the line end that closes it. That line end is the only whitespace
+      // that must stay, so the run after it is dropped.
+      const lineEnd = sql.indexOf("\n", i);
+      copyTo(lineEnd === -1 ? sql.length : lineEnd + 1);
+      while (i < sql.length && WHITESPACE.test(sql.charAt(i))) i += 1;
+    } else if (c === "/" && sql.charAt(i + 1) === "*") {
+      const close = sql.indexOf("*/", i + 2);
+      copyTo(close === -1 ? sql.length : close + 2);
+    } else if (c === '"' || c === "`" || c === "[") {
+      // A quoted identifier, to its closing quote; `"` and the backtick are doubled to stand for
+      // themselves inside the name.
+      const close = c === "[" ? "]" : c;
+      let name = "";
+      let j = i + 1;
+      while (j < sql.length) {
+        const d = sql.charAt(j);
+        if (d === close) {
+          if (close === "]" || sql.charAt(j + 1) !== close) break;
+          j += 1;
+        }
+        name += d;
+        j += 1;
+      }
+      const after = sql.charAt(j + 1);
+      if (PLAIN_IDENTIFIER.test(name)) {
+        // The bare name, kept apart from a word it touched only through its quotes.
+        const before = out.slice(-1);
+        out += `${IDENTIFIER_CHARACTER.test(before) ? " " : ""}${name}${IDENTIFIER_CHARACTER.test(after) ? " " : ""}`;
+      } else out += `"${name.replaceAll('"', '""')}"`;
+      i = Math.min(j + 1, sql.length);
+    } else if (WHITESPACE.test(c)) {
+      while (i < sql.length && WHITESPACE.test(sql.charAt(i))) i += 1;
+      out += " ";
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out.trim();
+}
+
+/**
+ * What one run of `applyLegalBodySchema` has to do, decided from what the database holds. Deciding
+ * only reads; `none`, `report_newer` and `refuse` write nothing.
+ */
+type LegalBodySchemaPlan =
+  | { action: "none" }
+  | { action: "report_newer"; storedVersion: number; differing: string }
+  | { action: "refuse"; message: string }
+  | { action: "create" }
+  | { action: "store_version" }
+  | {
+      action: "recreate";
+      /**
+       * The tables to drop, the event log first: those found under their exact names, each
+       * checked empty by the same transaction that drops it.
+       */
+      drop: string[];
+    }
+  | {
+      action: "restore_triggers";
+      /** Every trigger that differs, by name. */
+      triggers: string;
+      /** Those the database holds, to drop. */
+      drop: string[];
+      /** The DDL's statement for those it defines, to run. */
+      create: string[];
+      atSameVersion: boolean;
+    };
+
+function planLegalBodySchema(db: Database.Database, expected: SchemaObject[]): LegalBodySchemaPlan {
+  const actual = legalBodySchemaObjects(db);
+  // A table stored under another letter case is reached by every statement written for the
+  // table, a DROP TABLE included. The step works only on tables stored under their exact names,
+  // and checks that before it decides anything else.
+  const misnamed = actual.filter(
+    (o) =>
+      o.type === "table" && !(isLegalBodyTableName(o.name) && isLegalBodyTableName(o.tbl_name)),
+  );
+  if (misnamed.length > 0)
+    return {
+      action: "refuse",
+      message: `legal-body schema holds a table whose name differs in letter case: ${misnamed.map((o) => JSON.stringify(o.name)).join(", ")}. The tables must be named exactly legal_bodies and legal_body_events; nothing was dropped or created.`,
+    };
+  if (actual.length === 0) return { action: "create" };
+
+  const stored = db
+    .prepare("SELECT value FROM meta WHERE key = ?")
+    .get(LEGAL_BODIES_SCHEMA_VERSION_KEY) as { value: string } | undefined;
+  if (stored !== undefined && !/^(0|[1-9][0-9]*)$/.test(stored.value))
+    return {
+      action: "refuse",
+      message: `meta.${LEGAL_BODIES_SCHEMA_VERSION_KEY} is not a whole number: ${JSON.stringify(stored.value)}. Refusing to guess which legal-body schema this database holds.`,
+    };
+  const storedVersion = stored === undefined ? null : Number(stored.value);
+
+  // A trigger is compared by its exact text; a table or an index after normalising.
+  const keyOf = (o: SchemaObject) => `${o.type} ${o.name}`;
+  const textOf = (o: SchemaObject) => (o.type === "trigger" ? o.sql : normalizeSchemaSql(o.sql));
+  const expectedText = new Map(expected.map((o) => [keyOf(o), textOf(o)]));
+  const actualText = new Map(actual.map((o) => [keyOf(o), textOf(o)]));
+  // Missing, not defined by the DDL, or defined differently.
+  const differing = [...expected, ...actual.filter((o) => !expectedText.has(keyOf(o)))]
+    .filter((o) => expectedText.get(keyOf(o)) !== actualText.get(keyOf(o)))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const names = (objects: SchemaObject[]) => objects.map((o) => o.name).join(", ");
+
+  if (differing.length === 0)
+    return storedVersion === null || storedVersion < LEGAL_BODIES_SCHEMA_VERSION
+      ? { action: "store_version" }
+      : { action: "none" };
+  if (storedVersion !== null && storedVersion > LEGAL_BODIES_SCHEMA_VERSION)
+    return { action: "report_newer", storedVersion, differing: names(differing) };
+
+  const tablesAndIndexes = differing.filter((o) => o.type !== "trigger");
+  const atSameVersion = storedVersion === LEGAL_BODIES_SCHEMA_VERSION;
+  if (atSameVersion && tablesAndIndexes.length > 0)
+    return {
+      action: "refuse",
+      message: `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}: ${names(differing)}. Either LEGAL_BODIES_DDL was edited without raising LEGAL_BODIES_SCHEMA_VERSION, or the schema was changed by hand.`,
+    };
+  if (!atSameVersion) {
+    // An upgrade: the stored version is lower, or was never stored. Every table found is stored
+    // under its exact name (checked above); those are the tables checked here and dropped.
+    const tablesFound = LEGAL_BODY_TABLES.filter((table) =>
+      actual.some((o) => o.type === "table" && o.name === table),
+    );
+    const holdsRows = tablesFound.some(
+      (table) => db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get() !== undefined,
+    );
+    if (!holdsRows) return { action: "recreate", drop: tablesFound };
+    if (tablesAndIndexes.length > 0)
+      return {
+        action: "refuse",
+        message: `legal-body schema needs a written migration: ${names(tablesAndIndexes)}`,
+      };
+  }
+  // Only triggers differ, and every table they stand on is as the DDL defines it.
+  return {
+    action: "restore_triggers",
+    triggers: names(differing),
+    drop: differing.filter((o) => actualText.has(keyOf(o))).map((o) => o.name),
+    create: expected.filter((o) => differing.some((d) => d.name === o.name)).map((o) => o.sql),
+    atSameVersion,
+  };
+}
+
+/**
+ * Bring the legal-body tables of `db` to the schema this build defines, or refuse to.
+ *
+ * It compares what the database holds with what `LEGAL_BODIES_DDL` defines, object by object, and
+ * reads the schema version the database stored last time. A trigger is compared by its exact
+ * text. A table or an index is compared after normalising both texts (see `normalizeSchemaSql`),
+ * so that a table a migration rebuilt from the same definition reads as the same table. Then:
+ *
+ *  - A legal-body table stored under a name that differs in letter case (`Legal_Bodies`): SQLite
+ *    matches table names without regard to case, so every statement written for the table would
+ *    reach it. It throws, naming the stored name, whatever the stored version, before anything is
+ *    dropped or created. Every table the step checks or drops is stored under its exact name.
+ *  - Nothing there yet: create everything, and store the version.
+ *  - Same definitions: nothing to do, except to store the version if it is missing or lower.
+ *  - Different definitions, and the stored version is HIGHER than this build's: a newer build
+ *    owns this schema. Nothing is changed (when the tables exist, a newer stored version is left
+ *    untouched) and one line goes to the operations log.
+ *  - Different definitions, the stored version is lower or missing (an upgrade), and both tables
+ *    are empty: they are dropped and created again from the DDL, and the version is stored.
+ *  - Different definitions otherwise: at the SAME version, or in an upgrade with a row present.
+ *      - A TABLE or an INDEX differs. It is never corrected in place, and the process does not
+ *        start.
+ *          - At the SAME version: the DDL was edited without raising
+ *            `LEGAL_BODIES_SCHEMA_VERSION`, or the schema was changed by hand. It throws, naming
+ *            everything that differs.
+ *          - In an upgrade: it throws `legal-body schema needs a written migration: <names>`,
+ *            until that migration is written (`LEGAL_BODIES_SCHEMA_VERSION` says what it must
+ *            do).
+ *      - Only TRIGGERS differ. They are brought back to the DDL's: one that is missing or whose
+ *        text differs is dropped and created again from the DDL, and one the DDL does not define
+ *        is dropped. A trigger holds no data, so this loses nothing, and a difference in triggers
+ *        alone never stops the process from starting. In an upgrade the version is then stored.
+ *        At the SAME version it means someone changed a trigger by hand, or rebuilt a table
+ *        without its triggers, and one line in the operations log names the triggers restored.
+ *
+ * Locking. The first comparison only reads: a start that finds the schema in sync takes no write
+ * lock, and does not wait for a process that holds it. Only when something must be written does
+ * the step open an immediate transaction, and it compares AGAIN inside it, because another process
+ * may have done the work in between. Every write happens in that ONE transaction. Two processes
+ * starting together therefore cannot interleave, and a failure part-way leaves the schema exactly
+ * as it was: never a table without its triggers. A refusal writes nothing.
+ *
+ * `migrate` runs it last, once the `meta` and `companies` tables exist.
+ */
+export function applyLegalBodySchema(db: Database.Database): void {
+  const expected = expectedLegalBodySchema();
+  const storeVersion = () =>
+    db
+      .prepare(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      )
+      .run(LEGAL_BODIES_SCHEMA_VERSION_KEY, String(LEGAL_BODIES_SCHEMA_VERSION));
+  const carryOut = (plan: LegalBodySchemaPlan) => {
+    switch (plan.action) {
+      case "create":
+        db.exec(LEGAL_BODIES_DDL);
+        storeVersion();
+        break;
+      case "store_version":
+        storeVersion();
+        break;
+      case "recreate":
+        // Only the tables the plan found and checked empty, in this transaction.
+        for (const table of plan.drop) db.exec(`DROP TABLE ${table}`);
+        db.exec(LEGAL_BODIES_DDL);
+        storeVersion();
+        break;
+      case "restore_triggers":
+        for (const name of plan.drop) db.exec(`DROP TRIGGER "${name.replaceAll('"', '""')}"`);
+        for (const sql of plan.create) db.exec(sql);
+        if (!plan.atSameVersion) storeVersion();
+        break;
+    }
+  };
+  const writes = (plan: LegalBodySchemaPlan) =>
+    plan.action !== "none" && plan.action !== "report_newer" && plan.action !== "refuse";
+
+  // The first look is one read transaction: the objects and the version come from one snapshot.
+  let plan = db.transaction(() => planLegalBodySchema(db, expected)).deferred();
+  if (writes(plan))
+    plan = db
+      .transaction(() => {
+        const decided = planLegalBodySchema(db, expected);
+        carryOut(decided);
+        return decided;
+      })
+      .immediate();
+
+  if (plan.action === "refuse") throw new Error(plan.message);
+  if (plan.action === "report_newer")
+    opsLog("legal_body_schema_newer_than_code", {
+      storedVersion: plan.storedVersion,
+      codeVersion: LEGAL_BODIES_SCHEMA_VERSION,
+      differing: plan.differing,
+    });
+  if (plan.action === "restore_triggers" && plan.atSameVersion)
+    opsLog("legal_body_schema_triggers_restored", {
+      level: "warn",
+      version: LEGAL_BODIES_SCHEMA_VERSION,
+      triggers: plan.triggers,
+    });
+}
 
 /**
  * FORMATION PAYMENTS (design 2026-08-26 §2/§6) — shipped in A1, WRITTEN by B1.
@@ -974,6 +1629,11 @@ export function migrate(db: Database.Database): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_payments_ledger_entity ON payments_ledger(entity_key, status)",
   );
+
+  // Legal bodies: their own tables (see LEGAL_BODIES_DDL), created last so the companies table
+  // their foreign key points at exists on every database shape. Not a bare exec of the DDL: a
+  // database that ran an earlier version of it is brought up to this one, or refused.
+  applyLegalBodySchema(db);
 }
 
 /** Marker for the one-shot 2026-08-26 re-key (design §2 steps 1-5). */

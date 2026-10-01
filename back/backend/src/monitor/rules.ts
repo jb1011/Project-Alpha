@@ -4,6 +4,7 @@ import {
   type Hex,
   decodeEventLog,
   getAddress,
+  isAddress,
   isAddressEqual,
   zeroAddress,
 } from "viem";
@@ -13,7 +14,11 @@ import {
   legalManagerFactoryAbi,
   noviControllerAbi,
 } from "../abis/generated";
-import { CONTROLLER_GRANTED_SELECTORS, selectorRole } from "../adapters/arc/bootVerify";
+import {
+  CONTROLLER_GRANTED_SELECTORS,
+  LEGAL_BODY_GRANTED_SELECTORS,
+  selectorRole,
+} from "../adapters/arc/bootVerify";
 import type { Alert, Severity } from "./alerts";
 import type { EntityIndex, MonitoredEntity } from "./entityLookup";
 import {
@@ -50,7 +55,7 @@ export interface RuleContext {
   /** The platform signing key's ADDRESS. Needed to tell the permanent standing grant apart from a
    *  ceremony grant; the monitor never holds the key itself (see main.ts). */
   executor: Address;
-  /** lowercased role ids of the seven standing executor selectors. */
+  /** lowercased role ids of the standing executor selectors. */
   standingRoles: ReadonlySet<string>;
   entities: EntityIndex;
 }
@@ -83,12 +88,13 @@ function isoFromSeconds(seconds: bigint): string {
   return new Date(Number(seconds) * 1000).toISOString();
 }
 
-/** "AgentTreasury.schedulePolicyUpdate" for a standing selector role; a label for the specials. */
+/** "AgentTreasury.schedulePolicyUpdate" for a standing selector role (the controller's seven or
+ *  the two legal-body grants); a label for the specials. */
 export function roleLabel(role: Hex): string {
   const lower = role.toLowerCase();
   if (lower === DEFAULT_ADMIN_ROLE) return "DEFAULT_ADMIN_ROLE";
   if (lower === WILDCARD_ROLE) return "WILDCARD_ROLE";
-  const known = CONTROLLER_GRANTED_SELECTORS.find(
+  const known = [...CONTROLLER_GRANTED_SELECTORS, ...LEGAL_BODY_GRANTED_SELECTORS].find(
     (g) => selectorRole(g.selector).toLowerCase() === lower,
   );
   return known ? known.name : "UNKNOWN_SELECTOR_ROLE";
@@ -157,8 +163,8 @@ function controllerRule(
     const isAdmin = roleHex === DEFAULT_ADMIN_ROLE;
     const isStanding = ctx.standingRoles.has(roleHex);
     // Rule 1. WARN is the floor — even a legitimate break-glass grant is worth seeing. CRITICAL the
-    // moment the grant is WILDCARD (relay anything at anything) or a role outside the seven the
-    // deploy pinned, because those two shapes have no routine cause.
+    // moment the grant is WILDCARD (relay anything at anything) or a role outside the standing set,
+    // because those two shapes have no routine cause.
     const severity: Severity = isWildcard || !isStanding ? "CRITICAL" : "WARN";
     const alerts: Alert[] = [
       alert(
@@ -200,12 +206,15 @@ function controllerRule(
         ),
       );
 
-    // Rule 2 bookkeeping. Two classes are deliberately NOT tracked for TTL:
-    //  - DEFAULT_ADMIN_ROLE: permanent by design (never renounce — design §8).
-    //  - a standing selector role held by the EXECUTOR: the exact pairing bootVerify asserts
-    //    on-chain at every API boot.
+    // Rule 2 bookkeeping. Two classes are deliberately NOT tracked for TTL (`isPermanentGrant`):
+    //  - DEFAULT_ADMIN_ROLE, whoever holds it: permanent by design, by policy the admin role is
+    //    never renounced. A change of holder pages through rules 4 and 5 instead.
+    //  - a standing selector role held by the EXECUTOR. What re-checks that pairing on chain
+    //    differs by set: bootVerify asserts the seven controller grants at every API boot, but the
+    //    two legal-body grants only when LEGAL_BODY_FACTORY_ADDRESS is set. When it is unset, their
+    //    grant is seen once (the WARN above) and nothing re-checks it on chain.
     // Everything else is a ceremony grant that is supposed to be revoked in the same transaction.
-    const permanent = isAdmin || (isStanding && isAddressEqual(account, ctx.executor));
+    const permanent = isPermanentGrant(roleHex, account, ctx);
     const grants: GrantOp[] = permanent
       ? []
       : [
@@ -788,6 +797,50 @@ function legalManagerRule(
 }
 
 // --- Rule 2: the open-grant TTL sweep ----------------------------------------------------------
+
+/**
+ * Rule 2's single definition of a grant that is permanent by design and so never TTL-tracked:
+ * DEFAULT_ADMIN_ROLE whoever holds it, or a standing selector role held by the executor. The
+ * RoleGranted rule uses it to decide whether to open a row; the sweep uses it to close a row that
+ * was opened before its role joined the standing set.
+ *
+ * Total on purpose: an `account` that is not an address is simply not the executor. The sweep
+ * walks stored rows, and a throw there would stop it paging on every other row.
+ */
+export function isPermanentGrant(
+  role: string,
+  account: string,
+  ctx: Pick<RuleContext, "executor" | "standingRoles">,
+): boolean {
+  const roleHex = role.toLowerCase();
+  if (roleHex === DEFAULT_ADMIN_ROLE) return true;
+  return (
+    ctx.standingRoles.has(roleHex) &&
+    isAddress(account, { strict: false }) &&
+    isAddressEqual(account, ctx.executor)
+  );
+}
+
+/**
+ * The durable record of a row the sweep closed because its grant is now permanent. INFO: it is
+ * written to the alert log and never sent to the webhook, so it pages nobody. Without it the log
+ * would show a run of TTL pages for the grant that simply stops, with nothing to say why.
+ */
+export function grantNowStandingAlert(
+  g: Pick<OpenGrant, "role" | "account">,
+  controller: Address,
+  now: number,
+): Alert {
+  return alert(
+    "INFO",
+    "controller_grant_now_standing",
+    controller,
+    { role: g.role, roleLabel: roleLabel(g.role as Hex), account: g.account },
+    now,
+    // The grant alone, no interval: a grant becomes standing once.
+    `controller_grant_now_standing:${g.role}:${g.account}`,
+  );
+}
 
 export interface TtlEscalation {
   alert: Alert;
