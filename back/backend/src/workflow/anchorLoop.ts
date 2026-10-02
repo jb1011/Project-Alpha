@@ -1172,6 +1172,10 @@ function confirmScheduled(
   return { advanced: won, version: row.version, state: "scheduled" };
 }
 
+/** How far, in seconds, the chain's executable time may sit past the row's before a refresh is
+ *  logged as a warning rather than as an ordinary step. */
+const REFRESH_WARN_JUMP_SECONDS = 60;
+
 /** scheduled -> executed, once the timelock has elapsed. */
 async function executePhase(
   d: AnchorLoopDeps,
@@ -1251,8 +1255,23 @@ async function executePhase(
   //    carries — its error and its backoff memory — exactly as a `TooEarly` answer (the same
   //    observation, made by the node) leaves them. The backoff is already spent by construction:
   //    `driveCycle` does not reach this leg before `next_retry_at`.
+  //
+  //    The value is a uint256 and a JavaScript number cannot hold every one of them. One past
+  //    2^53 is no clock this leg will ever reach, and written back it would become a countdown
+  //    nobody can read: nothing is written, and the cycle parks like a bad read (a backoff, no
+  //    attempt burned) with one error line carrying the value the chain gave.
   let executableAt = row.executableAt;
   const chainAt = Number(scheduled.value!);
+  if (!Number.isSafeInteger(chainAt)) {
+    park(d, row, "the chain's executable time for this hash is not a usable timestamp");
+    logAnchor(key, row.version, "scheduled", {
+      code: "executable_at_unusable",
+      level: "error",
+      executableAt,
+      chainValue: scheduled.value!.toString(),
+    });
+    return NOTHING;
+  }
   if (chainAt > executableAt) {
     const refreshed = d.anchors.transitionAndProject(key, row.version, "scheduled", "scheduled", {
       executableAt: chainAt,
@@ -1263,6 +1282,9 @@ async function executePhase(
     if (!refreshed) return NOTHING; // lost the CAS; the winner owns this cycle
     logAnchor(key, row.version, "scheduled", {
       code: "executable_at_refreshed",
+      // A jump of a few seconds is the schedule leg's host-clock fallback meeting block time. A
+      // larger one means the hash was scheduled again by something this row never saw.
+      ...(chainAt - executableAt > REFRESH_WARN_JUMP_SECONDS ? { level: "warn" } : {}),
       previous: executableAt,
       executableAt: chainAt,
     });

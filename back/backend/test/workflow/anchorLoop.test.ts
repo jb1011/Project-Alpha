@@ -1329,9 +1329,15 @@ test("a LATER timelock on chain is written back, and the leg waits for it withou
   expect(cycle(2)!.executableAt).toBe(onChain);
   expect(entity().oaAmendmentExecutableAt).toBe(onChain);
   expectProjectionMatchesRows();
-  // …said once, with both values…
+  // …said once, with both values, as a WARNING: a jump of hours means the hash was scheduled
+  // again by something this row did not see…
   expect(pass.ops.filter((l) => l.code === "executable_at_refreshed")).toEqual([
-    expect.objectContaining({ version: 2, previous: recorded, executableAt: onChain }),
+    expect.objectContaining({
+      version: 2,
+      previous: recorded,
+      executableAt: onChain,
+      level: "warn",
+    }),
   ]);
   // …and nothing went to the node: no preflight, no transaction.
   expect(relay.node.calls).toEqual([]);
@@ -1453,6 +1459,8 @@ test("a refresh that is already due writes the chain's time back and executes in
   expect(refreshed).toEqual([
     expect.objectContaining({ version: 2, previous: recorded, executableAt: onChain }),
   ]);
+  // A jump of seconds is the fallback's skew, not news: an ordinary line, not a warning.
+  expect(refreshed[0]).not.toHaveProperty("level");
   // Written back BEFORE the execute was sent, not after.
   const codes = pass.ops.map((l) => l.code);
   expect(codes.indexOf("executable_at_refreshed")).toBeLessThan(codes.indexOf("execute_broadcast"));
@@ -1494,6 +1502,41 @@ test("an EARLIER timelock on chain is not acted on: the row's later time is the 
   expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "executed" });
   expect(writes).toEqual([]);
   expect(cycle(2)!.executableAt).toBe(recorded);
+});
+
+test("a timelock on chain that is not a usable timestamp is not written back: parked, nothing burned", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const hash = cycle(2)!.manifestHash;
+  const recorded = cycle(2)!.executableAt!;
+  // A uint256 no clock will ever reach, and no JavaScript number holds exactly.
+  const unusable = 2n ** 200n;
+  chain.state.scheduledAt.set(hash, unusable);
+  warpPastDelay();
+
+  const pass = await logged(() => advanceAnchor(deps(), ENTITY_KEY));
+  // Neither the row nor the guardian's countdown takes it.
+  const row = cycle(2)!;
+  expect(row.executableAt).toBe(recorded);
+  expect(entity().oaAmendmentExecutableAt).toBe(recorded);
+  expect(pass.value).toEqual({ advanced: false });
+  // Parked with a backoff, like a bad read: no attempt burned, nothing sent.
+  expect(row.state).toBe("scheduled");
+  expect(row.error).toBe("the chain's executable time for this hash is not a usable timestamp");
+  expect(row.attempt).toBe(0);
+  expect(row.retryIntervalMs).toBe(2 * 60_000);
+  expect(row.nextRetryAt).toBe(clock + 2 * 60_000);
+  expect(chain.calls.filter((c) => c.startsWith("execute:"))).toHaveLength(0);
+  // One error line, carrying the value the chain gave.
+  expect(pass.ops.filter((l) => l.level === "error")).toEqual([
+    expect.objectContaining({
+      code: "executable_at_unusable",
+      version: 2,
+      chainValue: unusable.toString(),
+    }),
+  ]);
+  expect(pass.ops.filter((l) => l.code === "executable_at_refreshed")).toEqual([]);
 });
 
 // ── F6/F8/F9: the cheap gates, one history read, one warning ───────────────────────────────
