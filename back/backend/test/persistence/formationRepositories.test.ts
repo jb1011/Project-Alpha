@@ -268,6 +268,76 @@ test("A-repo-3: acknowledgeHold is a CAS from the two HOLD states and nothing el
   expect(anchors.find("ent", 4)?.state).toBe("superseded");
 });
 
+/** One deterministic-revert park, the way the loop burns an attempt. */
+const burn = (version: number, state: "pending" | "scheduled") =>
+  anchors.parkWithAttempt("ent", version, state, {
+    error: "NotManager",
+    nextRetryAt: 1_800_000_000_000,
+    retryIntervalMs: 120_000,
+  });
+
+test("A-repo-4: the move from pending to scheduled gives the execute leg a fresh attempt count", () => {
+  anchors.claimVersion("ent", 2, "0x02");
+  // Four reverts on the schedule leg, one short of the hold…
+  for (let i = 1; i <= 4; i++) expect(burn(2, "pending")).toBe(i);
+  // …then the schedule lands. The execute leg runs days later and gets its own bound, not what
+  // the schedule leg left over.
+  expect(
+    anchors.transition("ent", 2, "pending", "scheduled", {
+      scheduleTx: "0xs",
+      executableAt: 1_800_000_000,
+    }),
+  ).toBe(true);
+  expect(anchors.find("ent", 2)?.attempt).toBe(0);
+  expect(burn(2, "scheduled")).toBe(1);
+
+  // A same-state park keeps the count, and so does the demotion back to the schedule leg: the
+  // chain losing its schedule is not progress.
+  anchors.transition("ent", 2, "scheduled", "scheduled", {
+    error: "rpc timeout",
+    nextRetryAt: 1_800_000_000_000,
+    retryIntervalMs: 240_000,
+  });
+  expect(anchors.find("ent", 2)?.attempt).toBe(1);
+  anchors.transition("ent", 2, "scheduled", "pending", {
+    error: "the chain has no schedule for this hash",
+    clearScheduleTx: true,
+    clearExecuteTx: true,
+  });
+  expect(anchors.find("ent", 2)?.attempt).toBe(1);
+  anchors.transition("ent", 2, "pending", "pending", {
+    error: "rpc timeout",
+    nextRetryAt: 1_800_000_000_000,
+    retryIntervalMs: 120_000,
+  });
+  expect(anchors.find("ent", 2)?.attempt).toBe(1);
+
+  // So do a guardian veto and its lift, in the projecting form the loop resumes a lifted veto
+  // with: the cycle goes back to `pending`, and being stopped and released is not progress.
+  anchors.transition("ent", 2, "pending", "vetoed", { error: "guardian veto" });
+  expect(anchors.find("ent", 2)?.attempt).toBe(1);
+  anchors.transitionAndProject("ent", 2, "vetoed", "pending", {
+    error: null,
+    clearScheduleTx: true,
+    clearExecuteTx: true,
+  });
+  expect(anchors.find("ent", 2)?.attempt).toBe(1);
+});
+
+test("A-repo-5: the projecting form of the same move resets the count too", () => {
+  // `transitionAndProject` is the form the anchor loop confirms a schedule with.
+  anchors.claimVersion("ent", 3, "0x03");
+  for (let i = 1; i <= 4; i++) expect(burn(3, "pending")).toBe(i);
+  expect(
+    anchors.transitionAndProject("ent", 3, "pending", "scheduled", {
+      scheduleTx: "0xs",
+      executableAt: 1_800_000_000,
+    }),
+  ).toBe(true);
+  expect(anchors.find("ent", 3)?.attempt).toBe(0);
+  expect(burn(3, "scheduled")).toBe(1);
+});
+
 // ── 2026-08-26 §3: the anchor scheduler under N:1 ──────────────────────────────────────────
 
 /**

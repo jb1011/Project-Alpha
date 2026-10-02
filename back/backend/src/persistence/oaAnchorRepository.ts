@@ -235,6 +235,8 @@ export interface OaAnchorRepository {
    * `NotActive`, a custom error — and retrying it forever is how a broken deployment stays
    * silently broken. A transport failure is the opposite (it says nothing about whether the
    * amendment is going through) and takes `transition`'s no-burn park instead.
+   *
+   * The count is per LEG: `transition` resets it when the cycle moves `pending -> scheduled`.
    */
   parkWithAttempt(
     entityKey: string,
@@ -342,6 +344,14 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
                 execute_tx    = CASE WHEN @clearExecuteTx = 1
                                      THEN NULL ELSE COALESCE(@executeTx, execute_tx) END,
                 executable_at = COALESCE(@executableAt, executable_at),
+                -- The revert bound belongs to a LEG. A schedule landing on chain is progress, and
+                -- the execute leg runs days later against a different call: reverts spent getting
+                -- the schedule through must not leave it one stray revert away from the hold.
+                -- Reset HERE, on the one move that means it, so no caller can forget to. Nothing
+                -- else resets it — not a same-state park, and not the demotion back to 'pending'
+                -- when the chain has lost the schedule (that is not progress).
+                attempt       = CASE WHEN @from = 'pending' AND @to = 'scheduled'
+                                     THEN 0 ELSE attempt END,
                 -- NOT coalesced: a successful pass must be able to CLEAR a stale backoff, and
                 -- "no schedule" is a value the column has to be able to hold again.
                 next_retry_at     = @nextRetryAt,
@@ -513,6 +523,9 @@ export class SqliteOaAnchorRepository implements OaAnchorRepository {
    * broadcast→persist→confirm split depends on `schedule_tx` surviving the execute transition,
    * because a crash resumes by ADOPTING the persisted tx rather than re-broadcasting. `clearXTx`
    * is the explicit exception; see `OaAnchorFields`.
+   *
+   * `pending -> scheduled` also resets `attempt` to 0: the execute leg gets its own revert bound
+   * (see the statement). `transitionAndProject` goes through here, so it does too.
    */
   transition(
     entityKey: string,
