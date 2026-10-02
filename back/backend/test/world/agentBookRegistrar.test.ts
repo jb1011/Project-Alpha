@@ -7,13 +7,17 @@ import {
   EstimateGasExecutionError,
   ExecutionRevertedError,
   InsufficientFundsError,
+  TransactionExecutionError,
   TransactionReceiptNotFoundError,
+  createPublicClient,
+  createWalletClient,
   decodeFunctionData,
   encodeErrorResult,
   toFunctionSelector,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { describe, expect, test } from "vitest";
+import { worldchain } from "viem/chains";
+import { describe, expect, test, vi } from "vitest";
 import { ContractRevertError } from "../../src/adapters/arc/relay";
 import {
   type RegistrarOptions,
@@ -22,6 +26,16 @@ import {
   encodeRegister,
 } from "../../src/adapters/worldid/agentBookRegistrar";
 import { AGENT_BOOK_ABI, AGENT_BOOK_ADDRESS } from "../../src/payments/agentBookReader";
+import {
+  FAKE_RPC_URL,
+  type FakeNodeOptions,
+  type FakeRpcNode,
+  type NodeAnswer,
+  causeChain,
+  failureOf,
+  fakeRpcNode,
+  nodeRevert,
+} from "../helpers/fakeRpcNode";
 
 const AGENT = "0x1111111111111111111111111111111111111111" as const;
 
@@ -297,7 +311,27 @@ describe("submitRegister", () => {
     // `prepareTransactionRequest`'s estimate reverts. That is deterministic: retrying cannot fix
     // it. Shaped the way viem raises it — the revert nested inside the estimate error.
     const registrar = registrarWith(
-      readClientThatRefusesToSend,
+      {
+        ...readClientThatRefusesToSend,
+        // An estimate's revert alone is not a verdict: the registrar asks the fee-less simulation
+        // of the same call, and it is the simulation reverting too that makes this one.
+        simulateContract: () =>
+          Promise.reject(
+            new ContractFunctionExecutionError(
+              new ContractFunctionRevertedError({
+                abi: [...AGENT_BOOK_ABI],
+                data: "0xdeadbeef",
+                functionName: "register",
+              }),
+              {
+                abi: [...AGENT_BOOK_ABI],
+                functionName: "register",
+                contractAddress: AGENT_BOOK_ADDRESS,
+                args: [],
+              },
+            ),
+          ),
+      },
       walletStub({
         prepareTransactionRequest: () =>
           Promise.reject(
@@ -326,6 +360,333 @@ describe("submitRegister", () => {
       walletStub({ prepareTransactionRequest: () => Promise.reject(broke) }),
     );
     await expect(registrar.submitRegister(REGISTER_ARGS, won)).rejects.toBe(broke);
+  });
+});
+
+/**
+ * The same classification against what a NODE says, with viem doing all of the wrapping.
+ *
+ * The tests above hand-build viem's errors, which encodes what their author believed viem
+ * produces. These put a fake node behind viem's real `http` transport (`helpers/fakeRpcNode`) and
+ * let viem build whatever it really builds.
+ *
+ * What they pin: the gas estimate is never the judge of the proof. It runs with fee fields, so the
+ * submitter's balance shapes its answer, and a sender that cannot pay can come back looking exactly
+ * like a revert: viem raises "gas required exceeds allowance" as `ExecutionRevertedError`, and some
+ * nodes answer a sender that can pay for most, not all, of the gas with a plain code-3 "execution
+ * reverted". So an estimate that fails as a revert only sends the registrar back to the fee-less
+ * simulation (`eth_call`), which the balance cannot touch, and only that simulation can reject.
+ *
+ * Three node shapes, because viem asks each one a different first question for a local account:
+ *  - a node that fills transactions: `eth_fillTransaction` is asked first and is where it fails;
+ *  - a node without it: viem falls back to the single calls, and the estimate is `eth_estimateGas`;
+ *  - a node that refuses `eth_fillTransaction` with an HTTP 401, as World Chain's default public
+ *    endpoint does: viem falls back exactly as it does for the second shape.
+ */
+const UNFUNDED: NodeAnswer = {
+  // geth's answer, word for word, to an estimate from a sender whose balance buys no gas. World
+  // Chain's default public endpoint answers a fresh, empty address exactly this way.
+  error: { code: -32000, message: "gas required exceeds allowance (0)" },
+};
+
+/** The fee-less simulation passing: `register` returns nothing. */
+const SIMULATION_PASSES: NodeAnswer = { result: "0x" };
+
+/** A node that could not serve the call: JSON-RPC -32603, words that say nothing of a revert. */
+const NODE_INTERNAL_ERROR: NodeAnswer = {
+  error: { code: -32603, message: "We are not able to process your request at this time" },
+};
+
+/** `Error(string)`, the one revert viem decodes against ANY ABI. */
+const SOLIDITY_ERROR = [
+  { type: "error", name: "Error", inputs: [{ name: "message", type: "string" }] },
+] as const;
+/** A revert reason: free text of the kind that must never leave the adapter. Only a NAME may. */
+const REASON = `nullifier ${REGISTER_ARGS.nullifierHash} already spent`;
+const NAMED_REVERT = encodeErrorResult({ abi: SOLIDITY_ERROR, errorName: "Error", args: [REASON] });
+
+/** A node that refuses `eth_fillTransaction`, as World Chain's default public endpoint does. */
+const PUBLIC_RPC_REFUSES_FILL: NodeAnswer = {
+  httpStatus: 401,
+  body: JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    error: { code: -32600, message: "Only core evm requests are allowed." },
+  }),
+};
+
+/** viem's traffic for a local account on a node that does not fill: it asks for a fill, is refused,
+ *  and falls back to the nonce, the block, the tip and the estimate, one call each. */
+const SINGLE_CALLS = [
+  "eth_fillTransaction",
+  "eth_getTransactionCount",
+  "eth_getBlockByNumber",
+  "eth_maxPriorityFeePerGas",
+  "eth_estimateGas",
+];
+
+interface NodeShape {
+  name: string;
+  node: Pick<FakeNodeOptions, "fillTransaction" | "answer">;
+  /** The RPC traffic of a submission whose estimate the node refuses, up to the estimate. */
+  preflightCalls: readonly string[];
+  /** The class viem throws for an estimate the node refuses. */
+  outer: typeof TransactionExecutionError | typeof EstimateGasExecutionError;
+  /** The cause chains viem builds, outermost first: around a code-3 revert, and around UNFUNDED
+   *  (whose -32000 viem first maps to `InvalidInputRpcError`, and only then reads the text of). */
+  revertChain: readonly string[];
+  unfundedChain: readonly string[];
+}
+
+const NODE_SHAPES: NodeShape[] = [
+  {
+    name: "a node that fills transactions",
+    node: { fillTransaction: true },
+    preflightCalls: ["eth_fillTransaction"],
+    outer: TransactionExecutionError,
+    revertChain: ["TransactionExecutionError", "ExecutionRevertedError", "RpcRequestError"],
+    unfundedChain: [
+      "TransactionExecutionError",
+      "ExecutionRevertedError",
+      "InvalidInputRpcError",
+      "RpcRequestError",
+    ],
+  },
+  {
+    name: "a node without eth_fillTransaction",
+    node: { fillTransaction: false },
+    preflightCalls: SINGLE_CALLS,
+    outer: EstimateGasExecutionError,
+    revertChain: ["EstimateGasExecutionError", "ExecutionRevertedError", "RpcRequestError"],
+    unfundedChain: [
+      "EstimateGasExecutionError",
+      "ExecutionRevertedError",
+      "InvalidInputRpcError",
+      "RpcRequestError",
+    ],
+  },
+  {
+    name: "a node that refuses eth_fillTransaction with an HTTP 401",
+    node: {
+      answer: (method) => (method === "eth_fillTransaction" ? PUBLIC_RPC_REFUSES_FILL : undefined),
+    },
+    preflightCalls: SINGLE_CALLS,
+    outer: EstimateGasExecutionError,
+    revertChain: ["EstimateGasExecutionError", "ExecutionRevertedError", "RpcRequestError"],
+    unfundedChain: [
+      "EstimateGasExecutionError",
+      "ExecutionRevertedError",
+      "InvalidInputRpcError",
+      "RpcRequestError",
+    ],
+  },
+];
+
+/** The real registrar, both of its clients on World Chain and on `node`. */
+function registrarOver(node: FakeRpcNode) {
+  return createAgentBookRegistrar({
+    submitterPrivateKey: TEST_KEY,
+    readRpcUrl: FAKE_RPC_URL,
+    writeRpcUrl: FAKE_RPC_URL,
+    clients: {
+      publicClient: createPublicClient({ chain: worldchain, transport: node.transport }),
+      walletClient: createWalletClient({
+        chain: worldchain,
+        transport: node.transport,
+        account: SUBMITTER,
+      }),
+    } as unknown as NonNullable<RegistrarOptions["clients"]>,
+  });
+}
+
+describe.each(NODE_SHAPES)("submitRegister against $name", (shape) => {
+  /** One submission against a node that answers as `o` says, and answers the fee-less simulation
+   *  (`eth_call`) with `simulation` when one is given. Every case here fails before persist. */
+  async function submitAgainst(o: FakeNodeOptions, simulation?: NodeAnswer) {
+    const node = fakeRpcNode({
+      ...shape.node,
+      ...o,
+      answer: (method, params) =>
+        method === "eth_call" && simulation ? simulation : shape.node.answer?.(method, params),
+    });
+    const persist = vi.fn(() => "won" as const);
+    const err = await failureOf(registrarOver(node).submitRegister(REGISTER_ARGS, persist));
+    return { err, node, persist };
+  }
+
+  test("a submitter that cannot pay for gas is NOT a revert, although viem gives it the revert class", async () => {
+    const { err, node, persist } = await submitAgainst({ preflight: UNFUNDED });
+    // The trap, exactly as viem builds it: the node's -32000 comes back as `ExecutionRevertedError`.
+    // Its text already says the failure is about the sender, so no simulation is even asked.
+    expect(node.calls).toEqual(shape.preflightCalls);
+    expect(causeChain(err)).toEqual(shape.unfundedChain);
+    expect((err as BaseError).walk((x) => x instanceof ExecutionRevertedError)).toBeInstanceOf(
+      ExecutionRevertedError,
+    );
+    // ...and it is re-thrown as viem threw it. A revert verdict here would end the guardian's
+    // session as failed, and a World proof cannot be replayed: the wallet only needs topping up.
+    expect(err).toBeInstanceOf(shape.outer);
+    expect(err).not.toBeInstanceOf(ContractRevertError);
+    expect(persist).not.toHaveBeenCalled();
+    expect(node.calls).not.toContain("eth_sendRawTransaction");
+  });
+
+  test.each<[string, NodeAnswer]>([
+    ["capitalised", { error: { code: -32000, message: "Gas required exceeds allowance (0)" } }],
+    [
+      "under JSON-RPC code 3",
+      { error: { code: 3, message: "gas required exceeds allowance (0)" } },
+    ],
+  ])(
+    "the same answer %s is NOT a revert either, and asks no simulation",
+    async (_label, answer) => {
+      const { err, node, persist } = await submitAgainst({ preflight: answer });
+      expect(node.calls).toEqual(shape.preflightCalls);
+      expect(causeChain(err)).toContain("ExecutionRevertedError");
+      expect(err).toBeInstanceOf(shape.outer);
+      expect(err).not.toBeInstanceOf(ContractRevertError);
+      expect(persist).not.toHaveBeenCalled();
+    },
+  );
+
+  test("an estimate that says 'execution reverted' while the fee-less simulation PASSES is not a revert", async () => {
+    // Some nodes answer a sender that can pay for most, but not all, of the gas this way: a plain
+    // code 3 with no data, which nothing in the answer tells apart from a real revert. The
+    // simulation, which the balance cannot touch, says the contract would accept the call.
+    const { err, node, persist } = await submitAgainst(
+      { preflight: nodeRevert() },
+      SIMULATION_PASSES,
+    );
+    // The estimate's own error, re-thrown as viem threw it: transport, so the session stays open.
+    expect(causeChain(err)).toEqual(shape.revertChain);
+    expect(err).toBeInstanceOf(shape.outer);
+    expect(err).not.toBeInstanceOf(ContractRevertError);
+    expect(node.calls).toEqual([...shape.preflightCalls, "eth_call"]);
+    expect(persist).not.toHaveBeenCalled();
+    expect(node.calls).not.toContain("eth_sendRawTransaction");
+  });
+
+  test("an estimate revert the simulation confirms is a ContractRevertError, with the name the simulation decoded", async () => {
+    const { err, node, persist } = await submitAgainst(
+      { preflight: nodeRevert("0xdeadbeef") },
+      nodeRevert(NAMED_REVERT),
+    );
+    // The SIMULATION's verdict: it had the ABI in hand, so it carries a name the estimate could not.
+    expect(causeChain(err).slice(0, 3)).toEqual([
+      "ContractRevertError",
+      "ContractFunctionExecutionError",
+      "ContractFunctionRevertedError",
+    ]);
+    expect(err).toBeInstanceOf(ContractRevertError);
+    expect((err as ContractRevertError).errorName).toBe("Error");
+    // Exact: the name is the only detail allowed out, never the reason string.
+    expect((err as Error).message).toBe("AgentBook.register reverted: Error");
+    expect(node.calls).toEqual([...shape.preflightCalls, "eth_call"]);
+    expect(persist).not.toHaveBeenCalled();
+    expect(node.calls).not.toContain("eth_sendRawTransaction");
+  });
+
+  test("an estimate revert confirmed by a simulation revert with NO data is a ContractRevertError with no name", async () => {
+    const { err, persist } = await submitAgainst({ preflight: nodeRevert() }, nodeRevert());
+    expect(err).toBeInstanceOf(ContractRevertError);
+    expect((err as ContractRevertError).errorName).toBeUndefined();
+    expect((err as Error).message).toBe("AgentBook.register reverted: unknown");
+    expect(persist).not.toHaveBeenCalled();
+  });
+
+  test.each<[string, NodeAnswer]>([
+    ["a timeout", { hang: true }],
+    ["an HTTP 429", { httpStatus: 429, body: "rate limited" }],
+    ["a node's internal error", NODE_INTERNAL_ERROR],
+  ])(
+    "an estimate revert whose simulation fails with %s is NOT a revert: the estimate's error is re-thrown",
+    async (_label, simulation) => {
+      const { err, node, persist } = await submitAgainst(
+        { preflight: nodeRevert("0xdeadbeef") },
+        simulation,
+      );
+      // The ORIGINAL error, untouched: a simulation that could not run judged nothing.
+      expect(causeChain(err)).toEqual(shape.revertChain);
+      expect(err).not.toBeInstanceOf(ContractRevertError);
+      expect(node.calls).toEqual([...shape.preflightCalls, "eth_call"]);
+      expect(persist).not.toHaveBeenCalled();
+      expect(node.calls).not.toContain("eth_sendRawTransaction");
+    },
+  );
+
+  test.each<[string, FakeNodeOptions, string]>([
+    [
+      "insufficient funds",
+      {
+        preflight: {
+          error: { code: -32000, message: "insufficient funds for gas * price + value" },
+        },
+      },
+      "InsufficientFundsError",
+    ],
+    [
+      // Some nodes answer a partly-funded sender this way.
+      "an out-of-gas rejection",
+      {
+        preflight: { error: { code: -32003, message: "out of gas: gas required exceeds: 52000" } },
+      },
+      "TransactionRejectedRpcError",
+    ],
+    ["an HTTP 429", { everyCall: { httpStatus: 429, body: "rate limited" } }, "HttpRequestError"],
+    ["a timeout", { everyCall: { hang: true } }, "TimeoutError"],
+  ])("%s is NOT a revert: re-thrown as viem threw it", async (_label, answer, inner) => {
+    const { err, node, persist } = await submitAgainst(answer);
+    expect(err).not.toBeInstanceOf(ContractRevertError);
+    expect(err).toBeInstanceOf(BaseError);
+    // ...and the case is the one it claims to be.
+    expect(causeChain(err)).toContain(inner);
+    expect(persist).not.toHaveBeenCalled();
+    expect(node.calls).not.toContain("eth_sendRawTransaction");
+  });
+});
+
+describe("simulateRegister against a node", () => {
+  test("a revert the ABI decodes is a ContractRevertError carrying the error NAME, and nothing else", async () => {
+    // `Error(string)`: its reason string is the kind of free text that must not leave the adapter.
+    const node = fakeRpcNode({
+      answer: (method) => (method === "eth_call" ? nodeRevert(NAMED_REVERT) : undefined),
+    });
+    const err = await failureOf(registrarOver(node).simulateRegister(REGISTER_ARGS));
+    expect(node.calls).toEqual(["eth_call"]);
+    expect(causeChain(err).slice(0, 3)).toEqual([
+      "ContractRevertError",
+      "ContractFunctionExecutionError",
+      "ContractFunctionRevertedError",
+    ]);
+    expect(err).toBeInstanceOf(ContractRevertError);
+    expect((err as ContractRevertError).errorName).toBe("Error");
+    expect((err as Error).message).toBe("AgentBook.register reverted: Error");
+  });
+
+  test("a node's internal error is NOT a revert, although viem builds the decoded revert class for it", async () => {
+    // viem builds `ContractFunctionRevertedError` for code 3 AND for -32603 with any message. With
+    // no revert bytes and no "execution reverted" in the node's words, nothing says the contract
+    // refused: a node that could not serve the call has judged nothing.
+    const node = fakeRpcNode({
+      answer: (method) => (method === "eth_call" ? NODE_INTERNAL_ERROR : undefined),
+    });
+    const err = await failureOf(registrarOver(node).simulateRegister(REGISTER_ARGS));
+    expect(node.calls).toEqual(["eth_call"]);
+    // The trap, exactly as viem builds it...
+    expect(causeChain(err)).toContain("ContractFunctionRevertedError");
+    // ...and re-thrown as viem threw it.
+    expect(causeChain(err)[0]).toBe("ContractFunctionExecutionError");
+    expect(err).not.toBeInstanceOf(ContractRevertError);
+  });
+
+  test("a code-3 revert with NO data, in the node's own words 'execution reverted', is still a ContractRevertError", async () => {
+    const node = fakeRpcNode({
+      answer: (method) => (method === "eth_call" ? nodeRevert() : undefined),
+    });
+    const err = await failureOf(registrarOver(node).simulateRegister(REGISTER_ARGS));
+    expect(err).toBeInstanceOf(ContractRevertError);
+    expect((err as ContractRevertError).errorName).toBeUndefined();
+    expect((err as Error).message).toBe("AgentBook.register reverted: unknown");
   });
 });
 

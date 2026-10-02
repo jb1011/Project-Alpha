@@ -277,9 +277,11 @@ export function mountAgentBookRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
      * The ONE place a write-path failure is turned into an answer.
      *
      * `simulateRegister` and `submitRegister` both raise `ContractRevertError` for a deterministic
-     * revert — the second is where a state change since the simulation shows up (its gas estimate
-     * runs against a later block), and it is every bit as certain as the first, so it gets the same
-     * 400 rather than a 500. Everything else is transport and says nothing about the proof.
+     * revert — the second is where a state change since the simulation shows up: its gas estimate
+     * runs against a later block, and when that estimate fails as a revert the registrar runs the
+     * same fee-less simulation again and raises only what that simulation says. So it is every bit
+     * as certain as the first and gets the same 400 rather than a 500. Everything else is transport
+     * and says nothing about the proof.
      *
      * NOTHING but the error NAME may leave here: a viem contract error prints the call arguments,
      * the call arguments are `agent, root, nonce, nullifierHash, proof[8]`, and a failed attempt's
