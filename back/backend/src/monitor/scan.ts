@@ -19,11 +19,29 @@ import type { MonitorRpc, RawLog } from "./rpc";
  * So we start at 90,000 and HALVE on a range rejection down to MIN_LOG_RANGE (see
  * `isRangeTooLargeError` and Monitor's `currentRange`). Self-tuning beats a config var nobody
  * knows to set.
+ *
+ * SECOND HARD CONSTRAINT: the node also caps how many addresses one `eth_getLogs` may filter on.
+ * Measured 2026-10-02: 20 addresses are served for up to 10,000 blocks; 21 are refused even for a
+ * single block. The node reports that refusal with the SAME `-32012 requested range too large` it
+ * uses for a window that is too wide, so the error alone cannot say which limit was hit. A topic
+ * OR-list (the registry Transfer query with many token ids) is not capped this way: 100 values
+ * were served.
+ *
+ * So our own contracts are read in chunks of at most MAX_LOG_ADDRESSES addresses, and the Monitor
+ * tells the two limits apart by the window that was refused: one wider than MIN_LOG_RANGE shrinks
+ * the block range, one already that small halves the address chunk instead (Monitor's
+ * `currentAddressChunk`).
  */
 export const MAX_LOG_RANGE = 90_000n;
 
 /** Floor for the adaptive shrink. Below this, the problem is not the window size. */
 export const MIN_LOG_RANGE = 1_000n;
+
+/**
+ * The most addresses one `eth_getLogs` may carry: the node served 20 and refused 21, whatever the
+ * block span. It reports the refusal with the range error, not with an error of its own.
+ */
+export const MAX_LOG_ADDRESSES = 20;
 
 /**
  * Is this failure "your window is too wide" rather than "the chain/RPC is unwell"? Matched on the
@@ -64,6 +82,17 @@ export function chunkRange(from: bigint, to: bigint, max: bigint = MAX_LOG_RANGE
   return out;
 }
 
+/** Split `addresses` into consecutive chunks of at most `max` addresses each, order kept. */
+export function chunkAddresses(addresses: readonly Address[], max: number): Address[][] {
+  // An integer check as well: a fractional or NaN size would yield chunks over the limit, or an
+  // empty chunk, and an empty address filter is no filter at all.
+  if (!Number.isInteger(max) || max <= 0)
+    throw new ScanError(`chunkAddresses: max must be a positive integer (got ${max})`);
+  const out: Address[][] = [];
+  for (let i = 0; i < addresses.length; i += max) out.push(addresses.slice(i, i + max));
+  return out;
+}
+
 /**
  * The first block of a cold start. Never genesis: the monitor is a live watcher, not an indexer,
  * and replaying 57M blocks would page the operator with every historical event at once.
@@ -83,22 +112,27 @@ export interface WatchTargets {
 }
 
 /**
- * One window's logs, from three queries.
+ * One window's logs: our own contracts' (one query per address chunk) and the shared registry's
+ * (two filtered queries).
  *
  * The split exists because the identity registry is not ours: it is a public, chain-wide contract,
  * and pulling every log it emits in a 90,000-block window would be both enormous and mostly other
  * people's agents. Both registry queries are therefore filtered SERVER-SIDE — by the indexed
  * metadata key for wallet binds, and by our own token ids for transfers.
+ *
+ * Our own addresses go out `addressChunk` at a time (see MAX_LOG_ADDRESSES), every chunk over the
+ * same block range, so the merged result is the same as one query over the whole list.
  */
 export async function fetchWindow(
   rpc: MonitorRpc,
   targets: WatchTargets,
   range: BlockRange,
+  addressChunk: number = MAX_LOG_ADDRESSES,
 ): Promise<RawLog[]> {
   const queries: Promise<RawLog[]>[] = [];
 
   if (targets.own.length > 0)
-    queries.push(rpc.getLogs({ address: targets.own, fromBlock: range.from, toBlock: range.to }));
+    queries.push(fetchOwnInSequence(rpc, chunkAddresses(targets.own, addressChunk), range));
 
   queries.push(
     rpc.getLogs({
@@ -136,6 +170,22 @@ export async function fetchWindow(
         : 1,
   );
   return logs;
+}
+
+/**
+ * One query per address chunk, ONE AFTER THE OTHER: the list grows by two addresses with every
+ * entity, and a public endpoint throttles a burst of parallel queries. The first refusal stops the
+ * walk and propagates, so the caller holds the cursor back for the whole window.
+ */
+async function fetchOwnInSequence(
+  rpc: MonitorRpc,
+  chunks: readonly Address[][],
+  range: BlockRange,
+): Promise<RawLog[]> {
+  const results: RawLog[][] = [];
+  for (const address of chunks)
+    results.push(await rpc.getLogs({ address, fromBlock: range.from, toBlock: range.to }));
+  return results.flat();
 }
 
 /** Stable per-log dedup key: a chain log is uniquely identified by its tx hash + log index. */

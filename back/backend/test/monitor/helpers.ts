@@ -30,6 +30,17 @@ export const ADDR = {
 } as const;
 
 /**
+ * `count` distinct placeholder addresses sharing a visible prefix (`0xaa…01`, `0xaa…02`, …), for
+ * tests that need a long watch list rather than a particular role.
+ */
+export function placeholderAddresses(count: number, prefix = "aa"): Address[] {
+  return Array.from(
+    { length: count },
+    (_, i) => `0x${prefix}${(i + 1).toString(16).padStart(40 - prefix.length, "0")}` as Address,
+  );
+}
+
+/**
  * Build a synthetic log the way the chain would: indexed args into topics, the rest ABI-encoded
  * into data. Encoding for real (rather than hand-writing topics) is what makes these tests able to
  * catch a wrong event signature.

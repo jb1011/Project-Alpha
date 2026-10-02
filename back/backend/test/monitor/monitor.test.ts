@@ -9,7 +9,7 @@ import { WILDCARD_ROLE } from "../../src/monitor/events";
 import { Monitor, type MonitorConfig } from "../../src/monitor/monitor";
 import type { LogQuery, MonitorRpc, RawLog } from "../../src/monitor/rpc";
 import { type MonitorStore, SqliteMonitorStore } from "../../src/monitor/store";
-import { ADDR, entity, makeLog } from "./helpers";
+import { ADDR, entity, makeLog, placeholderAddresses } from "./helpers";
 
 const BASE_CFG: MonitorConfig = {
   controller: ADDR.controller,
@@ -271,6 +271,170 @@ describe("chunked scanning", () => {
       new Monitor({ rpc, store, entities: lookup(), sink, cfg: BASE_CFG, log: () => {} }).tick(),
     ).resolves.toBeUndefined();
     expect(store.getCursor()).toBe(500n);
+  });
+});
+
+describe("a node that limits the addresses in one getLogs", () => {
+  // 65 watched addresses: the controller, one factory, one beacon, and a treasury plus a
+  // LegalManager proxy for each of 31 entities.
+  const TREASURIES = placeholderAddresses(31, "aa");
+  const PROXIES = placeholderAddresses(31, "bb");
+  const ENTITIES = TREASURIES.map((treasury, i) =>
+    entity({
+      idempotencyKey: `key-${i}`,
+      publicId: `pub-${i}`,
+      agentId: String(1000 + i),
+      treasury,
+      proxy: PROXIES[i]!,
+    }),
+  );
+  const CFG: MonitorConfig = { ...BASE_CFG, beacons: [ADDR.beacon] };
+  const REDUCED_REASON = "rpc rejected a small window: too many addresses in one query";
+
+  /**
+   * A node that refuses a getLogs carrying more than `maxAddresses` addresses, or (when set)
+   * spanning more than `maxBlocks` blocks, and reports BOTH with the same range error.
+   */
+  function strictNode(p: { head: bigint; maxAddresses: number; maxBlocks?: bigint }) {
+    const queries: LogQuery[] = [];
+    const rpc: MonitorRpc = {
+      getBlockNumber: async () => p.head,
+      getLogs: async (q) => {
+        queries.push(q);
+        const addresses = Array.isArray(q.address) ? q.address.length : q.address ? 1 : 0;
+        const blocks = q.toBlock - q.fromBlock + 1n;
+        if (addresses > p.maxAddresses || (p.maxBlocks !== undefined && blocks > p.maxBlocks))
+          throw new Error("requested range too large");
+        return [];
+      },
+      getBlockTimestamp: async () => 0n,
+      readContract: async () => ADDR.operator,
+    };
+    return { rpc, queries };
+  }
+
+  function watcher(rpc: MonitorRpc, store: MonitorStore) {
+    const lines: { event: string; fields?: Record<string, unknown> }[] = [];
+    const monitor = new Monitor({
+      rpc,
+      store,
+      entities: lookup(ENTITIES),
+      sink: collectingSink().sink,
+      cfg: CFG,
+      log: (event, fields) => void lines.push({ event, fields }),
+    });
+    const named = (event: string) => lines.filter((l) => l.event === event);
+    return { monitor, named };
+  }
+
+  const ownQueries = (queries: LogQuery[]) =>
+    queries.filter((q) => Array.isArray(q.address)).map((q) => q.address as Address[]);
+
+  test("at 20 addresses per query, 65 watched addresses are scanned on the FIRST tick", async () => {
+    const { rpc, queries } = strictNode({ head: 999_300n, maxAddresses: 20 });
+    const store = SqliteMonitorStore.open(":memory:");
+    store.setCursor(999_000n);
+    const { monitor, named } = watcher(rpc, store);
+
+    await monitor.tick();
+
+    expect(store.getCursor()).toBe(999_300n);
+    expect(named("monitor_address_chunk_reduced")).toHaveLength(0);
+    expect(named("monitor_range_reduced")).toHaveLength(0);
+    expect(monitor.logRange()).toBe(90_000n);
+    expect(ownQueries(queries).map((a) => a.length)).toEqual([20, 20, 20, 5]);
+    expect(named("monitor_scanned")[0]?.fields).toMatchObject({
+      watched: 65,
+      range: "90000",
+      addressChunk: 20,
+    });
+  });
+
+  test("a stricter node shrinks the ADDRESS chunk, not the block window, until a tick scans", async () => {
+    const { rpc, queries } = strictNode({ head: 999_300n, maxAddresses: 8 });
+    const store = SqliteMonitorStore.open(":memory:");
+    store.setCursor(999_000n);
+    const { monitor, named } = watcher(rpc, store);
+    const reduced = () => named("monitor_address_chunk_reduced").map((l) => l.fields);
+
+    await monitor.tick();
+    expect(reduced()).toEqual([{ addressChunk: 10, reason: REDUCED_REASON }]);
+    expect(monitor.logRange()).toBe(90_000n);
+    expect(store.getCursor()).toBe(999_000n);
+
+    await monitor.tick();
+    expect(reduced()).toEqual([
+      { addressChunk: 10, reason: REDUCED_REASON },
+      { addressChunk: 5, reason: REDUCED_REASON },
+    ]);
+    expect(monitor.logRange()).toBe(90_000n);
+    expect(store.getCursor()).toBe(999_000n);
+
+    const before = queries.length;
+    await monitor.tick();
+    expect(store.getCursor()).toBe(999_300n);
+    expect(reduced()).toHaveLength(2);
+    const scanned = ownQueries(queries.slice(before));
+    for (const a of scanned) expect(a.length).toBeLessThanOrEqual(5);
+    expect(new Set(scanned.flat()).size).toBe(65);
+    expect(named("monitor_scanned")[0]?.fields).toMatchObject({ addressChunk: 5 });
+
+    expect(named("monitor_range_reduced")).toHaveLength(0);
+    expect(monitor.logRange()).toBe(90_000n);
+  });
+
+  test("a WIDE window refused for its range still shrinks the range and leaves the address chunk alone", async () => {
+    // The measured node: 20 addresses at most, and 10,000 blocks at most.
+    const { rpc, queries } = strictNode({ head: 200_000n, maxAddresses: 20, maxBlocks: 10_000n });
+    const store = SqliteMonitorStore.open(":memory:");
+    store.setCursor(0n);
+    const { monitor, named } = watcher(rpc, store);
+
+    // 90k -> 45k -> 22.5k -> 11.25k -> 5625: the fifth tick walks the backlog.
+    for (let i = 0; i < 5; i++) await monitor.tick();
+
+    expect(named("monitor_range_reduced").map((l) => l.fields?.range)).toEqual([
+      "45000",
+      "22500",
+      "11250",
+      "5625",
+    ]);
+    expect(monitor.logRange()).toBe(5625n);
+    expect(store.getCursor()).toBe(200_000n);
+    expect(named("monitor_address_chunk_reduced")).toHaveLength(0);
+    for (const a of ownQueries(queries)) expect(a.length).toBeLessThanOrEqual(20);
+    expect(named("monitor_scanned")[0]?.fields).toMatchObject({
+      range: "5625",
+      addressChunk: 20,
+    });
+  });
+
+  test("an address chunk of 1 still refused on a small window is the floor, logged as an error", async () => {
+    // Refuses every query, whatever it carries.
+    const { rpc } = strictNode({ head: 999_300n, maxAddresses: 0 });
+    const store = SqliteMonitorStore.open(":memory:");
+    store.setCursor(999_000n);
+    const { monitor, named } = watcher(rpc, store);
+
+    // 20 -> 10 -> 5 -> 2 -> 1, one step per tick, and the floor is not reported on the way down.
+    for (let i = 0; i < 4; i++) await monitor.tick();
+    expect(named("monitor_address_chunk_reduced").map((l) => l.fields?.addressChunk)).toEqual([
+      10, 5, 2, 1,
+    ]);
+    expect(named("monitor_range_floor_reached")).toHaveLength(0);
+
+    await monitor.tick();
+    const floor = named("monitor_range_floor_reached");
+    expect(floor).toHaveLength(1);
+    expect(floor[0]?.fields).toMatchObject({
+      level: "error",
+      range: "90000",
+      message: "requested range too large",
+    });
+    expect(named("monitor_address_chunk_reduced")).toHaveLength(4);
+    expect(named("monitor_range_reduced")).toHaveLength(0);
+    expect(monitor.logRange()).toBe(90_000n);
+    expect(store.getCursor()).toBe(999_000n);
   });
 });
 

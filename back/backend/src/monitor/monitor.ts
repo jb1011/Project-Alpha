@@ -15,7 +15,9 @@ import {
   ttlEscalations,
 } from "./rules";
 import {
+  MAX_LOG_ADDRESSES,
   MAX_LOG_RANGE,
+  MIN_LOG_RANGE,
   chunkRange,
   coldStartFrom,
   fetchWindow,
@@ -67,9 +69,14 @@ export interface MonitorDeps {
 export class Monitor {
   private readonly now: () => number;
   private readonly log: (event: string, fields?: Record<string, unknown>) => void;
-  /** Adaptive: starts at the configured ceiling, halves whenever the RPC says the window is too
-   *  wide. Different Arc endpoints enforce different limits (see scan.ts). */
+  /** Adaptive: starts at the configured ceiling, halves whenever the RPC refuses a window wider
+   *  than MIN_LOG_RANGE. Different Arc endpoints enforce different limits (see scan.ts). */
   private currentRange: bigint;
+  /** Adaptive, for the node's other limit: how many of our addresses go in one getLogs. Starts at
+   *  MAX_LOG_ADDRESSES and halves (never below 1) when the node refuses a window already too small
+   *  to be the problem. Neither this nor `currentRange` grows back by itself: a restart resets
+   *  both. */
+  private currentAddressChunk: number = MAX_LOG_ADDRESSES;
   /** Beacons discovered from `factory.beacon()`, merged with the configured list. */
   private resolvedBeacons: Address[] = [];
   private beaconResolved = false;
@@ -188,23 +195,45 @@ export class Monitor {
     for (const range of chunkRange(from, latest, this.currentRange)) {
       let logs: Awaited<ReturnType<typeof fetchWindow>>;
       try {
-        logs = await fetchWindow(rpc, { own, registry: cfg.registry, agentIds }, range);
+        logs = await fetchWindow(
+          rpc,
+          { own, registry: cfg.registry, agentIds },
+          range,
+          this.currentAddressChunk,
+        );
       } catch (err) {
-        // "Window too wide" is not a chain problem, it is OUR request — shrink so the next tick
+        // "Query too large" is not a chain problem, it is OUR request — shrink it so the next tick
         // can actually make progress. Without this the monitor stays up, logs forever and never
         // advances its cursor, which looks exactly like a quiet chain.
+        //
+        // The node answers with the same error for two different limits: a block window that is
+        // too wide, and too many addresses in one query (see scan.ts). The window that was refused
+        // tells them apart, not `currentRange`: one wider than MIN_LOG_RANGE shrinks the window, as
+        // it always has; one already that small cannot be refused for its blocks, so the address
+        // chunk is halved instead. Shrinking the window there would walk it down to the floor
+        // without ever advancing. Either way the tick stops here and the cursor stays.
         if (isRangeTooLargeError(err)) {
-          const next = shrinkRange(this.currentRange);
-          if (next === undefined) {
-            this.log("monitor_range_floor_reached", {
-              range: this.currentRange.toString(),
-              message: (err as Error).message,
+          const width = range.to - range.from + 1n;
+          // A window wider than the floor implies `currentRange` is too, so this is never
+          // undefined when the window is wide.
+          const nextRange = width > MIN_LOG_RANGE ? shrinkRange(this.currentRange) : undefined;
+          if (nextRange !== undefined) {
+            this.currentRange = nextRange;
+            this.log("monitor_range_reduced", {
+              range: nextRange.toString(),
+              reason: "rpc rejected the block range",
+            });
+          } else if (this.currentAddressChunk > 1) {
+            this.currentAddressChunk = Math.max(1, Math.floor(this.currentAddressChunk / 2));
+            this.log("monitor_address_chunk_reduced", {
+              addressChunk: this.currentAddressChunk,
+              reason: "rpc rejected a small window: too many addresses in one query",
             });
           } else {
-            this.currentRange = next;
-            this.log("monitor_range_reduced", {
-              range: next.toString(),
-              reason: "rpc rejected the block range",
+            this.log("monitor_range_floor_reached", {
+              level: "error",
+              range: this.currentRange.toString(),
+              message: (err as Error).message,
             });
           }
           return;
@@ -246,6 +275,7 @@ export class Monitor {
       watched: own.length,
       agents: agentIds.length,
       range: this.currentRange.toString(),
+      addressChunk: this.currentAddressChunk,
     });
   }
 
