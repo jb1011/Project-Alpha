@@ -1238,6 +1238,39 @@ async function executePhase(
     return { advanced: true, version: row.version, state: "pending" };
   }
 
+  // ── The CHAIN's clock decides when this may execute (contract property 1). Scheduling the
+  //    same hash again resets its timelock, and nothing tells this row: `executable_at` is what
+  //    the chain promised when the schedule was confirmed. Trusting it meant a preflight that
+  //    answered `TooEarly` on every tick until the chain's time came, with the guardian's
+  //    countdown wrong all along. So a LATER chain time is written back — to the row and, in the
+  //    same transaction, to the projection — and the leg waits for it here, sending nothing; the
+  //    early gates then answer from the row until it arrives. An EARLIER chain time is not acted
+  //    on: the row's later one is the safe one to wait for.
+  //
+  //    The write corrects one fact and is not a verdict on the cycle, so it keeps what the row
+  //    carries — its error and its backoff memory — exactly as a `TooEarly` answer (the same
+  //    observation, made by the node) leaves them. The backoff is already spent by construction:
+  //    `driveCycle` does not reach this leg before `next_retry_at`.
+  let executableAt = row.executableAt;
+  const chainAt = Number(scheduled.value!);
+  if (chainAt > executableAt) {
+    const refreshed = d.anchors.transitionAndProject(key, row.version, "scheduled", "scheduled", {
+      executableAt: chainAt,
+      error: row.error,
+      ...(row.nextRetryAt !== null ? { nextRetryAt: row.nextRetryAt } : {}),
+      ...(row.retryIntervalMs !== null ? { retryIntervalMs: row.retryIntervalMs } : {}),
+    });
+    if (!refreshed) return NOTHING; // lost the CAS; the winner owns this cycle
+    logAnchor(key, row.version, "scheduled", {
+      code: "executable_at_refreshed",
+      previous: executableAt,
+      executableAt: chainAt,
+    });
+    executableAt = chainAt;
+  }
+  if (nowSeconds < executableAt)
+    return { advanced: false, version: row.version, state: "scheduled", skipped: "not_due" };
+
   const drive = await driveBroadcast(d, row, {
     priorTx: row.executeTx,
     leg: "execute",

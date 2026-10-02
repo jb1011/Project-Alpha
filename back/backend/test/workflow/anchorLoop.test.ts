@@ -1283,6 +1283,148 @@ test("five reverts on the execute leg alone still hold the entity, said ONCE", a
   );
 });
 
+// ── the execute leg takes the timelock from the CHAIN (contract property 1) ────────────────
+
+/** Record every anchor-row write that carries an `executableAt`. `transitionAndProject` goes
+ *  through `transition`, so wrapping the one sees both. */
+function executableAtWrites(): number[] {
+  const writes: number[] = [];
+  const original = anchors.transition.bind(anchors);
+  anchors.transition = ((...args: Parameters<typeof anchors.transition>) => {
+    const at = args[4]?.executableAt;
+    if (at !== undefined) writes.push(at);
+    return original(...args);
+  }) as typeof anchors.transition;
+  return writes;
+}
+
+test("a LATER timelock on chain is written back, and the leg waits for it without sending", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const hash = cycle(2)!.manifestHash;
+  const recorded = NOW_SECONDS + 86_400;
+  expect(cycle(2)!.executableAt).toBe(recorded);
+  stampStepsYesterday();
+
+  // The same hash was scheduled again six hours later, by a broadcast this row never learned
+  // about, and the contract reset its clock. The row still holds the first time.
+  const onChain = recorded + 6 * 60 * 60;
+  chain.state.scheduledAt.set(hash, BigInt(onChain));
+
+  // Both clocks pass the row's time, not the chain's. The node would answer an execute's
+  // preflight with TooEarly, so anything sent to it would show.
+  clock = (recorded + 60) * 1000;
+  chain.state.nowSeconds = recorded + 60;
+  const relay = relayedThroughNode(fakeRpcNode({ preflight: legalManagerRevert("TooEarly") }));
+
+  const pass = await logged(() => advanceAnchor(deps({ arc: relay.arc }), ENTITY_KEY));
+  expect(pass.value).toMatchObject({
+    advanced: false,
+    version: 2,
+    state: "scheduled",
+    skipped: "not_due",
+  });
+  // The row AND the guardian's countdown now carry the chain's time…
+  expect(cycle(2)!.executableAt).toBe(onChain);
+  expect(entity().oaAmendmentExecutableAt).toBe(onChain);
+  expectProjectionMatchesRows();
+  // …said once, with both values…
+  expect(pass.ops.filter((l) => l.code === "executable_at_refreshed")).toEqual([
+    expect.objectContaining({ version: 2, previous: recorded, executableAt: onChain }),
+  ]);
+  // …and nothing went to the node: no preflight, no transaction.
+  expect(relay.node.calls).toEqual([]);
+  // A refresh is not a failure: no attempt burned, no backoff.
+  expect(cycle(2)!.attempt).toBe(0);
+  expect(cycle(2)!.nextRetryAt).toBeNull();
+
+  // The next tick, still before the chain's time, is answered by the early gate: no chain call.
+  clock += 60_000;
+  chain.state.nowSeconds += 60;
+  const reads = chain.calls.length;
+  expect(await advanceAnchor(deps({ arc: relay.arc }), ENTITY_KEY)).toMatchObject({
+    version: 2,
+    state: "scheduled",
+    skipped: "not_due",
+  });
+  expect(chain.calls.length).toBe(reads);
+  expect(relay.node.calls).toEqual([]);
+
+  // Once the chain's time arrives, the same cycle executes.
+  clock = onChain * 1000;
+  chain.state.nowSeconds = onChain;
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "executed" });
+  expect(chain.state.current).toBe(hash);
+});
+
+test("a refresh keeps the row's error and backoff memory, as a TooEarly answer would", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const hash = cycle(2)!.manifestHash;
+  warpPastDelay();
+  // The execute leg's read of the schedule times out: parked with a backoff, nothing burned.
+  chain.state.failNextRead = "oaScheduledAt";
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const parked = cycle(2)!;
+  expect(parked.error).toMatch(/oaScheduledAt timed out/);
+  expect(parked.retryIntervalMs).toBe(2 * 60_000);
+
+  // By the time the backoff is spent, the chain's time for the hash has moved past ours.
+  const onChain = Math.floor(clock / 1000) + 60 * 60;
+  chain.state.scheduledAt.set(hash, BigInt(onChain));
+  clock = parked.nextRetryAt!;
+  chain.state.nowSeconds = Math.floor(clock / 1000);
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ skipped: "not_due" });
+
+  // One fact corrected; everything else the row knew is still there.
+  const row = cycle(2)!;
+  expect(row.executableAt).toBe(onChain);
+  expect(row.error).toBe(parked.error);
+  expect(row.retryIntervalMs).toBe(parked.retryIntervalMs);
+  expect(row.nextRetryAt).toBe(parked.nextRetryAt);
+  expect(row.attempt).toBe(0);
+});
+
+test("a timelock on chain EQUAL to the row's writes nothing, and the execute proceeds as before", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const hash = cycle(2)!.manifestHash;
+  expect(chain.state.scheduledAt.get(hash)).toBe(BigInt(cycle(2)!.executableAt!));
+  const writes = executableAtWrites();
+
+  warpPastDelay();
+  const pass = await logged(() => advanceAnchor(deps(), ENTITY_KEY));
+  expect(pass.value).toMatchObject({ version: 2, state: "executed" });
+  expect(writes).toEqual([]);
+  expect(pass.ops.filter((l) => l.code === "executable_at_refreshed")).toEqual([]);
+});
+
+test("an EARLIER timelock on chain is not acted on: the row's later time is the safe one", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const hash = cycle(2)!.manifestHash;
+  const recorded = cycle(2)!.executableAt!;
+  chain.state.scheduledAt.set(hash, BigInt(recorded - 60 * 60));
+  const writes = executableAtWrites();
+
+  // Between the two times: the chain would take an execute, the row says wait, and the row wins.
+  clock = (recorded - 30 * 60) * 1000;
+  chain.state.nowSeconds = recorded - 30 * 60;
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ skipped: "not_due" });
+  expect(chain.calls.filter((c) => c.startsWith("execute:"))).toHaveLength(0);
+
+  // Past both: it executes, and the row's time was never rewritten to the earlier one.
+  clock = (recorded + 60) * 1000;
+  chain.state.nowSeconds = recorded + 60;
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "executed" });
+  expect(writes).toEqual([]);
+  expect(cycle(2)!.executableAt).toBe(recorded);
+});
+
 // ── F6/F8/F9: the cheap gates, one history read, one warning ───────────────────────────────
 
 /** Put the formation steps a day in the past, where a real entity's are by the time an anchor
