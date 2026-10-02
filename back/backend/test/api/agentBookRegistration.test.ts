@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { getAddress } from "viem";
+import { createPublicClient, createWalletClient, getAddress } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { worldchain } from "viem/chains";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ContractRevertError } from "../../src/adapters/arc/relay";
-import type { SubmitClaim } from "../../src/adapters/worldid/agentBookRegistrar";
+import {
+  type RegistrarOptions,
+  type SubmitClaim,
+  createAgentBookRegistrar,
+} from "../../src/adapters/worldid/agentBookRegistrar";
 import { buildApiApp } from "../../src/api/app";
 import { TokenBucket } from "../../src/api/routes/agentBook";
 import { signSession } from "../../src/auth/session";
@@ -12,6 +18,14 @@ import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
 import type { EntityRecord } from "../../src/types";
+import {
+  FAKE_RPC_URL,
+  type NodeAnswer,
+  causeChain,
+  failureOf,
+  fakeRpcNode,
+  nodeRevert,
+} from "../helpers/fakeRpcNode";
 
 /**
  * The two write routes (design 2026-08-25 v3 §4.5, §4.7).
@@ -400,6 +414,128 @@ test("register: a transport failure while signing is 503, and the session stays 
     errorCode: null,
   });
   expect(logs.join("\n")).toContain("agentbook_write_unavailable");
+});
+
+/**
+ * What the REAL registrar throws when the node refuses its signing estimate as `preflight` says,
+ * and answers the fee-less simulation it may then ask (`eth_call`) as `simulation` says.
+ *
+ * The registrar runs over a fake node behind viem's real `http` transport (`helpers/fakeRpcNode`),
+ * so the error is exactly what viem builds and the registrar classifies — never a hand-built one,
+ * which would only encode what its author believed viem produces. The node has no
+ * `eth_fillTransaction`, so the estimate is `eth_estimateGas`.
+ */
+async function signingFailure(preflight: NodeAnswer, simulation?: NodeAnswer): Promise<unknown> {
+  const node = fakeRpcNode({
+    fillTransaction: false,
+    preflight,
+    answer: (method) => (method === "eth_call" ? simulation : undefined),
+  });
+  const real = createAgentBookRegistrar({
+    // A key that exists only in this file; nothing it signs ever leaves the fake node.
+    submitterPrivateKey: `0x${"ab".repeat(32)}`,
+    readRpcUrl: FAKE_RPC_URL,
+    writeRpcUrl: FAKE_RPC_URL,
+    clients: {
+      publicClient: createPublicClient({ chain: worldchain, transport: node.transport }),
+      walletClient: createWalletClient({
+        chain: worldchain,
+        transport: node.transport,
+        account: privateKeyToAccount(`0x${"ab".repeat(32)}`),
+      }),
+    } as unknown as NonNullable<RegistrarOptions["clients"]>,
+  });
+  const err = await failureOf(
+    real.submitRegister(
+      {
+        agent: getAddress(POCKET),
+        root: 1n,
+        nonce: 0n,
+        nullifierHash: 1n,
+        proof: Array.from({ length: 8 }, () => 1n),
+      },
+      () => {
+        throw new Error("persist reached: the node was meant to refuse the estimate");
+      },
+    ),
+  );
+  expect(node.calls).not.toContain("eth_sendRawTransaction");
+  return err;
+}
+
+test.each<[string, NodeAnswer, NodeAnswer | undefined]>([
+  [
+    "a submitter that cannot pay for gas",
+    // geth's answer to an estimate from a sender whose balance buys no gas. No simulation is asked:
+    // the text already says the failure is about the sender.
+    { error: { code: -32000, message: "gas required exceeds allowance (0)" } },
+    undefined,
+  ],
+  [
+    "a submitter that can pay for most of the gas, but not all",
+    // Some nodes answer that sender with a plain code-3 "execution reverted" from the estimate,
+    // while the fee-less simulation, which the balance cannot touch, passes.
+    { error: { code: 3, message: "execution reverted" } },
+    { result: "0x" },
+  ],
+])(
+  "register: %s is 503 and the session stays usable — the proof was never judged",
+  async (_label, preflight, simulation) => {
+    repo.upsert(entity());
+    verifyGuardian();
+    const failure = await signingFailure(preflight, simulation);
+    // viem raises both answers as `ExecutionRevertedError`, the class of a contract revert: the trap.
+    expect(causeChain(failure)).toContain("ExecutionRevertedError");
+    const reg = registrar();
+    reg.signRegister.mockRejectedValue(failure);
+    const app = makeApp(reg);
+    const { sessionId } = await (await call(app, "/session", {})).json();
+    const res = await call(app, "/register", proofBody(sessionId));
+    expect(res.status).toBe(503);
+    const text = await res.text();
+    expect(JSON.parse(text).error.code).toBe("unavailable");
+    // The contract decided nothing, so NOTHING is written. Ending the session `failed` here would
+    // spend a World proof that cannot be replayed on a wallet that only needs topping up.
+    expect(abRepo.findBySession(sessionId)).toMatchObject({
+      status: "pending",
+      attempt: 0,
+      errorCode: null,
+    });
+    expect(reg.broadcast).not.toHaveBeenCalled();
+    const log = logs.join("\n");
+    expect(log).toContain("agentbook_write_unavailable");
+    expect(log).not.toContain("agentbook_proof_rejected");
+    // The node's text was read to classify the failure, never copied: only the error NAME is out.
+    const nodeText = "error" in preflight ? preflight.error.message : "";
+    expect(log).not.toContain(nodeText);
+    expect(text).not.toContain(nodeText);
+  },
+);
+
+test("register: a real revert of the signing estimate, as viem builds it, is still proof_rejected", async () => {
+  repo.upsert(entity());
+  verifyGuardian();
+  // The estimate reverts, and so does the fee-less simulation the registrar then asks: a verdict.
+  const reverted = await signingFailure(nodeRevert("0xdeadbeef"), nodeRevert("0xdeadbeef"));
+  expect(reverted).toBeInstanceOf(ContractRevertError);
+  const reg = registrar();
+  reg.signRegister.mockRejectedValue(reverted);
+  const app = makeApp(reg);
+  const { sessionId } = await (await call(app, "/session", {})).json();
+  const res = await call(app, "/register", proofBody(sessionId));
+  expect(res.status).toBe(400);
+  // The bytes match no error in the ABI, so no name: the route records its generic "revert".
+  expect((await res.json()).error).toMatchObject({
+    code: "proof_rejected",
+    details: { errorName: "revert" },
+  });
+  expect(reg.broadcast).not.toHaveBeenCalled();
+  expect(abRepo.findBySession(sessionId)).toMatchObject({
+    status: "failed",
+    attempt: 1,
+    errorCode: "revert",
+  });
+  expect(logs.join("\n")).toContain("agentbook_proof_rejected");
 });
 
 test("register: a transport failure at SIMULATE writes nothing either (FR-B)", async () => {

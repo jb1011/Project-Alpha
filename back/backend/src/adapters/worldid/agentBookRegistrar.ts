@@ -32,6 +32,13 @@ export const AGENTBOOK_ACTION = "agentbook-registration";
 /** The registrar's lock key: one submitter EOA, one EVM nonce sequence, one writer at a time. */
 export const SUBMITTER_LOCK = "worldchain-submitter";
 
+/** A node's answer to a gas estimate the sender cannot fund, "gas required exceeds allowance (N)"
+ *  in geth's words, which viem raises as `ExecutionRevertedError` all the same (see `revertOf`). */
+const SENDER_CANNOT_PAY_FOR_GAS = /gas required exceeds allowance/i;
+
+/** A node's own words for a call the contract refused. */
+const EXECUTION_REVERTED = /execution reverted/i;
+
 /** `abi.encodePacked(address, uint256)`: 52 bytes. The padded 64-byte form type-checks, encodes,
  *  and reverts on-chain AFTER the guardian has done the work (design v3 §4.1). */
 export function buildSignal(agent: Address, nonce: bigint): Hex {
@@ -103,9 +110,11 @@ export interface AgentBookRegistrar {
    * The EVM nonce is taken inside `prepareTransactionRequest` and is only unique while nothing
    * else signs or sends on this account, so the persist step has to happen inside the same lock:
    * with it outside, two guardians vouching at once prepare on the same nonce and one proof is
-   * thrown away. Throws `ContractRevertError` when the estimate reverts (deterministic — the same
-   * classification `simulateRegister` makes), anything else for transport; a failed BROADCAST is
-   * not a failure at all (the raw tx is recorded) and comes back as `txHash: null`.
+   * thrown away. Throws `ContractRevertError` only when the fee-less simulation (the one
+   * `simulateRegister` runs) says the call reverts: an estimate that fails as a revert is asked
+   * again through that simulation and never judges the proof itself, because the submitter's
+   * balance shapes its answer. Anything else is transport; a failed BROADCAST is not a failure at
+   * all (the raw tx is recorded) and comes back as `txHash: null`.
    */
   submitRegister(
     args: RegisterArgs,
@@ -146,40 +155,94 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
     createWalletClient({ chain: worldchain, transport: http(opts.writeRpcUrl), account });
 
   /**
-   * A deterministic revert, or nothing.
+   * Does this error say the call REVERTED? A `ContractRevertError` if so, nothing otherwise.
    *
    * `simulateContract` decodes the revert bytes against the ABI we hand it, so viem hands us a
    * typed `ContractFunctionRevertedError` inside the thrown error's cause chain — relay.ts's
    * `relayRevertError` cannot be reused for it: that one needs the relay's target/controller pair
    * and folds `shortMessage` into the message, and NOTHING but the error NAME may leave this
    * adapter (an RPC's prose can carry the calldata, and the calldata carries the proof).
-   * Used by BOTH write paths — `simulateContract` and the gas estimate inside `submitRegister` —
-   * because the second is where a state change since simulation shows up. Anything that is neither
-   * a revert nor an estimate revert is transport, and transport says nothing about the contract.
+   *
+   * Asked of both write paths, with different weight. A revert found by `simulate` (the fee-less
+   * simulation) is the verdict on the proof. A revert found by the gas estimate inside
+   * `submitRegister` is not: `prepareAndSign` only takes it as the reason to ask `simulate` again.
+   * Anything that is not a revert is transport, and transport says nothing about the contract.
    */
   const revertOf = (e: unknown): ContractRevertError | undefined => {
     if (!(e instanceof BaseError)) return undefined;
     const named = e.walk((x) => x instanceof ContractFunctionRevertedError);
-    if (named instanceof ContractFunctionRevertedError)
+    if (named instanceof ContractFunctionRevertedError) {
+      // The decoded class is not evidence on its own: viem builds it for JSON-RPC code 3 AND for
+      // -32603, a node's internal error, whatever its message. So it counts as a revert only when
+      // something says the contract refused: revert bytes, or the node's own words "execution
+      // reverted" (left by viem in `details`, READ here and never copied). Without either, a node
+      // that could not serve the call has judged nothing: transport.
+      const bytes = named.raw !== undefined && named.raw !== "0x";
+      if (!bytes && !EXECUTION_REVERTED.test(named.details ?? "")) return undefined;
       return new ContractRevertError(
         `AgentBook.register reverted: ${named.data?.errorName ?? "unknown"}`,
         named.data?.errorName,
         { cause: e },
       );
-    // Gas estimation reverts too, and it does so with no ABI in hand: the node just says
-    // "execution reverted", which viem raises as `ExecutionRevertedError`. No name is recoverable,
-    // but the failure is every bit as deterministic as a decoded one — the class, not the name, is
-    // what the caller acts on. Only that class: an estimate can also fail for want of gas money or
-    // too little intrinsic gas, and viem wraps ALL of them in `EstimateGasExecutionError`. Those
-    // are the submitter's problem, not the proof's — matching the wrapper would tell the
-    // reconciler to stop retrying a registration that just needs the wallet topped up, so they
-    // stay transport-shaped and travel on unchanged.
+    }
+    // The gas estimate has no ABI in hand, so a node's refusal there carries no name: viem raises
+    // its "execution reverted" (JSON-RPC code 3, with or without revert data) as
+    // `ExecutionRevertedError`, and this branch counts that class as a revert, nameless. Found by
+    // the estimate, that is NOT a verdict on the proof. The estimate runs with fee fields, so the
+    // sender's balance shapes its answer, and some nodes answer a sender that can pay for most,
+    // not all, of the gas with this same plain code 3. An estimate's revert is only a reason to
+    // ask the fee-less simulation, which is the judge (`prepareAndSign`). A refusal of the
+    // simulation itself that viem did not decode lands here too, and there it is the verdict.
+    //
+    // viem gives the class to a second node answer too, "gas required exceeds allowance (N)",
+    // sometimes under code 3: the reply when the call runs out of gas at the most the estimate may
+    // use, a limit the node caps at what the SENDER's balance buys at the gas price it applies.
+    // That text already says the failure is about the sender, not the proof, so it is not a
+    // revert here and needs no simulation: it stays transport-shaped and travels on unchanged,
+    // whichever wrapper viem put round it (`EstimateGasExecutionError`, or
+    // `TransactionExecutionError` when it asked `eth_fillTransaction` first), like the estimates
+    // that fail for want of gas money (`InsufficientFundsError`) or of intrinsic gas, which viem
+    // raises as other classes. A revert verdict would end the guardian's session `failed` at the
+    // route, and a World proof cannot be replayed, for a registration that only needs the wallet
+    // topped up.
+    //
+    // The node's text is where viem leaves it, in the class's `details`. It is READ here, never
+    // copied: nothing but the error NAME leaves this adapter.
     const bare = e.walk((x) => x instanceof ExecutionRevertedError);
-    if (bare)
+    if (
+      bare instanceof ExecutionRevertedError &&
+      !SENDER_CANNOT_PAY_FOR_GAS.test(bare.details ?? "")
+    )
       return new ContractRevertError("AgentBook.register reverted: unknown", undefined, {
         cause: e,
       });
     return undefined;
+  };
+
+  /**
+   * The fee-less simulation of `register`: the ONE judge of a proof.
+   *
+   * An `eth_call` with no gas price or fee fields, so the node charges the sender nothing for gas
+   * and the submitter's balance plays no part in the answer. Resolves when the call passes; throws
+   * a `ContractRevertError` when it reverts, and anything else exactly as viem threw it.
+   * `simulateRegister` is this, and `prepareAndSign` asks it again when its estimate fails as a
+   * revert.
+   */
+  const simulate = async (args: RegisterArgs): Promise<void> => {
+    const proof = proof8(args.proof);
+    try {
+      await publicClient.simulateContract({
+        account,
+        address: contract,
+        abi: AGENT_BOOK_ABI,
+        functionName: "register",
+        args: [args.agent, args.root, args.nonce, args.nullifierHash, proof],
+      });
+    } catch (e) {
+      const revert = revertOf(e);
+      if (revert) throw revert;
+      throw e;
+    }
   };
 
   /**
@@ -203,12 +266,24 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
       const rawTx = await walletClient.signTransaction(request);
       return { rawTx, submitterNonce: Number(request.nonce) };
     } catch (e) {
-      // Simulation happened earlier and against a different block: by now someone else may have
-      // registered this agent, and the estimate inside `prepareTransactionRequest` is where we
-      // find out. Classify it exactly like a simulate revert.
-      const revert = revertOf(e);
-      if (revert) throw revert;
-      throw e;
+      // The estimate inside `prepareTransactionRequest` runs with fee fields, so the submitter's
+      // balance shapes its answer. A revert found there may be the contract (someone registered
+      // this agent since `simulateRegister`), or a sender that can pay for most, not all, of the
+      // gas, which some nodes answer with the same plain "execution reverted". Nothing in the
+      // answer tells the two apart, so the estimate never judges the proof: its revert is only the
+      // reason to ask the judge, the fee-less simulation of the same call, now, on the latest
+      // block. That costs one extra read, inside the submitter lock and on this failure path only.
+      if (!revertOf(e)) throw e;
+      let verdict: ContractRevertError | undefined;
+      try {
+        await simulate(args);
+      } catch (s) {
+        if (s instanceof ContractRevertError) verdict = s;
+      }
+      // A simulation that reverts is the verdict, carrying any name it could decode. One that
+      // passes, or that could not be run, leaves the estimate's failure saying nothing about the
+      // contract: that is transport, and it goes on as the ORIGINAL error, untouched.
+      throw verdict ?? e;
     }
   };
 
@@ -233,22 +308,7 @@ export function createAgentBookRegistrar(opts: RegistrarOptions): AgentBookRegis
       })) as bigint;
       return id === 0n ? null : toHex(id);
     },
-    async simulateRegister(args) {
-      const proof = proof8(args.proof);
-      try {
-        await publicClient.simulateContract({
-          account,
-          address: contract,
-          abi: AGENT_BOOK_ABI,
-          functionName: "register",
-          args: [args.agent, args.root, args.nonce, args.nullifierHash, proof],
-        });
-      } catch (e) {
-        const revert = revertOf(e);
-        if (revert) throw revert;
-        throw e;
-      }
-    },
+    simulateRegister: simulate,
     async submitRegister(args, persist) {
       return withKeyedLock(SUBMITTER_LOCK, async () => {
         const signed = await prepareAndSign(args);
