@@ -311,6 +311,17 @@ test("A-repo-4: the move from pending to scheduled gives the execute leg a fresh
     retryIntervalMs: 120_000,
   });
   expect(anchors.find("ent", 2)?.attempt).toBe(1);
+
+  // So do a guardian veto and its lift, in the projecting form the loop resumes a lifted veto
+  // with: the cycle goes back to `pending`, and being stopped and released is not progress.
+  anchors.transition("ent", 2, "pending", "vetoed", { error: "guardian veto" });
+  expect(anchors.find("ent", 2)?.attempt).toBe(1);
+  anchors.transitionAndProject("ent", 2, "vetoed", "pending", {
+    error: null,
+    clearScheduleTx: true,
+    clearExecuteTx: true,
+  });
+  expect(anchors.find("ent", 2)?.attempt).toBe(1);
 });
 
 test("A-repo-5: the projecting form of the same move resets the count too", () => {

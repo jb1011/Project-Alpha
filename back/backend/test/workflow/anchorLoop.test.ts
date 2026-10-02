@@ -1387,6 +1387,77 @@ test("a refresh keeps the row's error and backoff memory, as a TooEarly answer w
   expect(row.attempt).toBe(0);
 });
 
+test("a refresh that loses its compare-and-set stops the pass: nothing sent, nothing else written", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const hash = cycle(2)!.manifestHash;
+  const recorded = cycle(2)!.executableAt!;
+  // The chain's time is later than the row's AND already past, so a pass that carried on after
+  // losing the race would go straight to the execute.
+  chain.state.scheduledAt.set(hash, BigInt(recorded + 600));
+  clock = (recorded + 700) * 1000;
+  chain.state.nowSeconds = recorded + 700;
+
+  // Another driver moved the row first: the refresh's write finds it gone and answers false.
+  const projecting = anchors.transitionAndProject.bind(anchors);
+  let refreshes = 0;
+  anchors.transitionAndProject = ((...args: Parameters<typeof anchors.transitionAndProject>) => {
+    const [, , from, to, fields] = args;
+    if (from === "scheduled" && to === "scheduled" && fields?.executableAt !== undefined) {
+      refreshes++;
+      return false;
+    }
+    return projecting(...args);
+  }) as typeof anchors.transitionAndProject;
+  // Every other row write goes through `transition`, which this records.
+  const writes: string[] = [];
+  const plain = anchors.transition.bind(anchors);
+  anchors.transition = ((...args: Parameters<typeof anchors.transition>) => {
+    writes.push(`${args[2]}->${args[3]}`);
+    return plain(...args);
+  }) as typeof anchors.transition;
+  const before = cycle(2)!;
+  const countdown = entity().oaAmendmentExecutableAt;
+
+  const pass = await logged(() => advanceAnchor(deps(), ENTITY_KEY));
+  expect(pass.value).toEqual({ advanced: false });
+  expect(refreshes).toBe(1);
+  expect(chain.calls.filter((c) => c.startsWith("execute:"))).toHaveLength(0);
+  expect(writes).toEqual([]);
+  expect(cycle(2)).toEqual(before);
+  expect(entity().oaAmendmentExecutableAt).toBe(countdown);
+  expect(pass.ops.filter((l) => l.code === "executable_at_refreshed")).toEqual([]);
+});
+
+test("a refresh that is already due writes the chain's time back and executes in the same pass", async () => {
+  seedV1();
+  confirmFiling();
+  await advanceAnchor(deps(), ENTITY_KEY);
+  const hash = cycle(2)!.manifestHash;
+  const recorded = cycle(2)!.executableAt!;
+  // A few seconds apart, the shape the schedule leg's host-clock fallback leaves behind, and
+  // both clocks are past the two times.
+  const onChain = recorded + 30;
+  chain.state.scheduledAt.set(hash, BigInt(onChain));
+  const writes = executableAtWrites();
+  clock = (onChain + 60) * 1000;
+  chain.state.nowSeconds = onChain + 60;
+
+  const pass = await logged(() => advanceAnchor(deps(), ENTITY_KEY));
+  expect(pass.value).toMatchObject({ version: 2, state: "executed" });
+  expect(chain.state.current).toBe(hash);
+  expect(writes).toEqual([onChain]);
+  expect(cycle(2)!.executableAt).toBe(onChain);
+  const refreshed = pass.ops.filter((l) => l.code === "executable_at_refreshed");
+  expect(refreshed).toEqual([
+    expect.objectContaining({ version: 2, previous: recorded, executableAt: onChain }),
+  ]);
+  // Written back BEFORE the execute was sent, not after.
+  const codes = pass.ops.map((l) => l.code);
+  expect(codes.indexOf("executable_at_refreshed")).toBeLessThan(codes.indexOf("execute_broadcast"));
+});
+
 test("a timelock on chain EQUAL to the row's writes nothing, and the execute proceeds as before", async () => {
   seedV1();
   confirmFiling();
