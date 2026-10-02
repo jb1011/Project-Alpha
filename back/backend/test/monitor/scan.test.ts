@@ -1,9 +1,13 @@
+import type { Address } from "viem";
 import { describe, expect, test, vi } from "vitest";
+import { ScanError } from "../../src/monitor/errors";
 import { AGENT_WALLET_KEY } from "../../src/monitor/events";
 import type { LogQuery, MonitorRpc, RawLog } from "../../src/monitor/rpc";
 import {
+  MAX_LOG_ADDRESSES,
   MAX_LOG_RANGE,
   MIN_LOG_RANGE,
+  chunkAddresses,
   chunkRange,
   coldStartFrom,
   fetchWindow,
@@ -11,7 +15,7 @@ import {
   logKey,
   shrinkRange,
 } from "../../src/monitor/scan";
-import { ADDR } from "./helpers";
+import { ADDR, placeholderAddresses } from "./helpers";
 
 describe("chunkRange — the 100,000-block getLogs ceiling", () => {
   test("a window inside the cap is one query", () => {
@@ -46,6 +50,34 @@ describe("chunkRange — the 100,000-block getLogs ceiling", () => {
 
   test("a single block is a single one-block chunk", () => {
     expect(chunkRange(7n, 7n)).toEqual([{ from: 7n, to: 7n }]);
+  });
+});
+
+describe("chunkAddresses — the node's limit on addresses per getLogs", () => {
+  test("the limit is 20 addresses per query", () => {
+    expect(MAX_LOG_ADDRESSES).toBe(20);
+  });
+
+  test("65 addresses at 20 per query are four consecutive chunks: 20, 20, 20, 5", () => {
+    const addresses = placeholderAddresses(65);
+    const chunks = chunkAddresses(addresses, 20);
+    expect(chunks.map((c) => c.length)).toEqual([20, 20, 20, 5]);
+    // Order kept, nothing dropped, nothing repeated: an address missing here is a contract unwatched.
+    expect(chunks.flat()).toEqual(addresses);
+  });
+
+  test("exactly 20 addresses are one chunk", () => {
+    const addresses = placeholderAddresses(20);
+    expect(chunkAddresses(addresses, 20)).toEqual([addresses]);
+  });
+
+  test("no address is no chunk", () => {
+    expect(chunkAddresses([], 20)).toEqual([]);
+  });
+
+  test("a non-positive chunk size throws instead of looping forever", () => {
+    expect(() => chunkAddresses(placeholderAddresses(3), 0)).toThrow(ScanError);
+    expect(() => chunkAddresses(placeholderAddresses(3), -1)).toThrow(ScanError);
   });
 });
 
@@ -201,6 +233,112 @@ describe("fetchWindow", () => {
     await expect(
       fetchWindow(rpc, { own: [], registry: ADDR.registry, agentIds: [] }, { from: 1n, to: 2n }),
     ).rejects.toThrow(/range too large/);
+  });
+
+  test("65 own addresses are read in chunks of at most 20, one query after the other", async () => {
+    const own = placeholderAddresses(65);
+    const calls: LogQuery[] = [];
+    // Start and end of every own-address query, in the order they happen. Sequential means this
+    // reads start, end, start, end: no own query starts while another one is still in flight.
+    const timeline: string[] = [];
+    const rpc: MonitorRpc = {
+      getBlockNumber: vi.fn(async () => 0n),
+      getLogs: vi.fn(async (q: LogQuery) => {
+        calls.push(q);
+        if (!Array.isArray(q.address)) return [];
+        timeline.push("start");
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        timeline.push("end");
+        return [];
+      }),
+      getBlockTimestamp: vi.fn(async () => 0n),
+      readContract: vi.fn(async () => undefined),
+    };
+    await fetchWindow(
+      rpc,
+      { own, registry: ADDR.registry, agentIds: ["881938"] },
+      { from: 1n, to: 300n },
+    );
+
+    const ownQueries = calls.filter((c) => Array.isArray(c.address));
+    expect(ownQueries).toHaveLength(4);
+    for (const q of ownQueries) {
+      expect((q.address as Address[]).length).toBeLessThanOrEqual(20);
+      expect(q.event).toBeUndefined();
+      expect([q.fromBlock, q.toBlock]).toEqual([1n, 300n]);
+    }
+    // Every watched address is asked for exactly once.
+    expect(ownQueries.flatMap((q) => q.address as Address[])).toEqual(own);
+    expect(timeline).toEqual(["start", "end", "start", "end", "start", "end", "start", "end"]);
+
+    // The two registry queries are untouched: one each, filtered server-side, same window.
+    const registry = calls.filter((c) => !Array.isArray(c.address));
+    expect(registry).toHaveLength(2);
+    const metadata = registry.find((c) => c.args && "indexedMetadataKey" in c.args);
+    expect(metadata?.address).toBe(ADDR.registry);
+    expect(metadata?.args?.indexedMetadataKey).toBe(AGENT_WALLET_KEY);
+    expect([metadata?.fromBlock, metadata?.toBlock]).toEqual([1n, 300n]);
+    const transfer = registry.find((c) => c.args && "tokenId" in c.args);
+    expect(transfer?.address).toBe(ADDR.registry);
+    expect(transfer?.args?.tokenId).toEqual([881938n]);
+    expect([transfer?.fromBlock, transfer?.toBlock]).toEqual([1n, 300n]);
+  });
+
+  test("logs from different address chunks come back merged in on-chain order", async () => {
+    const own = placeholderAddresses(65);
+    const mk = (address: Address, blockNumber: bigint, logIndex: number): RawLog => ({
+      address,
+      topics: ["0x00"],
+      data: "0x",
+      blockNumber,
+      transactionHash: "0xaa",
+      logIndex,
+    });
+    // Each chunk answers for its own first address; the registry answers once.
+    const byChunkHead = new Map<Address, RawLog[]>([
+      [own[0]!, [mk(own[0]!, 7n, 1), mk(own[0]!, 2n, 0)]],
+      [own[20]!, [mk(own[20]!, 5n, 3)]],
+      [own[40]!, [mk(own[40]!, 2n, 4), mk(own[40]!, 9n, 0)]],
+      [own[60]!, [mk(own[60]!, 5n, 1)]],
+    ]);
+    const rpc: MonitorRpc = {
+      getBlockNumber: vi.fn(async () => 0n),
+      getLogs: vi.fn(async (q: LogQuery) =>
+        Array.isArray(q.address)
+          ? (byChunkHead.get(q.address[0]!) ?? [])
+          : [mk(ADDR.registry, 3n, 0)],
+      ),
+      getBlockTimestamp: vi.fn(async () => 0n),
+      readContract: vi.fn(async () => undefined),
+    };
+    const logs = await fetchWindow(
+      rpc,
+      { own, registry: ADDR.registry, agentIds: [] },
+      { from: 1n, to: 300n },
+    );
+    expect(logs.map((l) => [Number(l.blockNumber), l.logIndex])).toEqual([
+      [2, 0],
+      [2, 4],
+      [3, 0],
+      [5, 1],
+      [5, 3],
+      [7, 1],
+      [9, 0],
+    ]);
+  });
+
+  test("20 or fewer own addresses are still one own query", async () => {
+    const own = placeholderAddresses(20);
+    const { rpc, calls } = rpcSpy();
+    await fetchWindow(
+      rpc,
+      { own, registry: ADDR.registry, agentIds: ["881938"] },
+      { from: 1n, to: 300n },
+    );
+    const ownQueries = calls.filter((c) => Array.isArray(c.address));
+    expect(ownQueries).toHaveLength(1);
+    expect(ownQueries[0]?.address).toEqual(own);
+    expect(calls).toHaveLength(3);
   });
 });
 
