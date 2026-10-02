@@ -1200,6 +1200,89 @@ test("F5 (node shape): a node that times out still parks with backoff and burns 
   expect(row.retryIntervalMs).toBe(4 * 60_000);
 });
 
+// ── the revert bound belongs to a LEG, not to the cycle's whole life ───────────────────────
+
+type OpsLine = { opslog?: string; code?: string } & Record<string, unknown>;
+
+/** Run `fn` with the ops log captured: its result, and every line it printed, parsed. */
+async function logged<T>(fn: () => Promise<T>): Promise<{ value: T; ops: OpsLine[] }> {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+  try {
+    const value = await fn();
+    return {
+      value,
+      ops: lines.filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as OpsLine),
+    };
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+const exhaustedLines = (ops: OpsLine[]) =>
+  ops.filter((l) => l.opslog === "anchor_revert_exhausted");
+
+test("reverts spent on the schedule leg do not shorten the execute leg's bound", async () => {
+  seedV1();
+  confirmFiling();
+  const { ops } = await logged(async () => {
+    // One short of the hold on the schedule leg…
+    chain.state.revertBroadcast = "NotManager";
+    for (let i = 1; i < MAX_ANCHOR_REVERT_ATTEMPTS; i++) {
+      await advanceAnchor(deps(), ENTITY_KEY);
+      expect(cycle(2)!.attempt).toBe(i);
+      clock = cycle(2)!.nextRetryAt!;
+    }
+    // …then whatever was wrong is put right, and the schedule lands.
+    chain.state.revertBroadcast = undefined;
+    expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({
+      version: 2,
+      state: "scheduled",
+    });
+
+    // A day later the execute leg meets ONE stray revert.
+    warpPastDelay();
+    chain.state.revertBroadcast = "NotManager";
+    await advanceAnchor(deps(), ENTITY_KEY);
+  });
+
+  // It is the execute leg's first, not the cycle's fifth: the entity is NOT held.
+  const row = cycle(2)!;
+  expect(row.state).toBe("scheduled");
+  expect(row.attempt).toBe(1);
+  expect(exhaustedLines(ops)).toEqual([]);
+});
+
+test("five reverts on the execute leg alone still hold the entity, said ONCE", async () => {
+  seedV1();
+  confirmFiling();
+  expect(await advanceAnchor(deps(), ENTITY_KEY)).toMatchObject({ version: 2, state: "scheduled" });
+  warpPastDelay();
+  chain.state.revertBroadcast = "NotManager";
+
+  const { ops } = await logged(async () => {
+    for (let i = 1; i <= MAX_ANCHOR_REVERT_ATTEMPTS; i++) {
+      await advanceAnchor(deps(), ENTITY_KEY);
+      const row = cycle(2)!;
+      expect(row.attempt).toBe(i);
+      clock = row.nextRetryAt ?? clock;
+    }
+  });
+
+  expect(cycle(2)!.state).toBe("failed");
+  expect(exhaustedLines(ops)).toEqual([
+    expect.objectContaining({
+      severity: "CRITICAL",
+      revert: "NotManager",
+      attempt: MAX_ANCHOR_REVERT_ATTEMPTS,
+      version: 2,
+    }),
+  ]);
+  expect(chain.calls.filter((c) => c.startsWith("execute:"))).toHaveLength(
+    MAX_ANCHOR_REVERT_ATTEMPTS,
+  );
+});
+
 // ── F6/F8/F9: the cheap gates, one history read, one warning ───────────────────────────────
 
 /** Put the formation steps a day in the past, where a real entity's are by the time an anchor

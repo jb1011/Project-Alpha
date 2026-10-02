@@ -1401,7 +1401,9 @@ function classifyChainFailure(d: AnchorLoopDeps, row: OaAnchorRecord, err: unkno
   return burnRevert(d, row, revert, message);
 }
 
-/** Burn one attempt for a deterministic revert, and escalate to the hold when they run out. */
+/** Burn one attempt for a deterministic revert, and escalate to the hold when they run out.
+ *  The count is per LEG: the repository resets it when the schedule lands, so the execute leg
+ *  starts with its own `MAX_ANCHOR_REVERT_ATTEMPTS`, whatever the schedule leg spent. */
 function burnRevert(
   d: AnchorLoopDeps,
   row: OaAnchorRecord,
