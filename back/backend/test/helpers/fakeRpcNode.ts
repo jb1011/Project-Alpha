@@ -13,6 +13,8 @@
  * tests that use this helper are about.
  *
  * Every request is recorded by method, so a test can pin the exact RPC traffic viem generates.
+ * `requests` keeps the params as well, and whether the sender lock was held when the request
+ * left: the lock is visible here because `fetchFn` runs on the caller's async chain.
  */
 import {
   http,
@@ -25,6 +27,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { ArcAdapter } from "../../src/adapters/arc/arcAdapter";
+import { senderLockHeld } from "../../src/adapters/arc/senderLock";
 import { chainFor } from "../../src/chains";
 
 export const FAKE_RPC_URL = "http://node.invalid";
@@ -82,6 +85,11 @@ export const NODE_REVERT_CHAIN = {
 } as const;
 
 export interface FakeNodeOptions {
+  /**
+   * Asked FIRST, for every request, with the method and its params. `undefined` falls through to
+   * the answers below, so a caller overrides only the methods it cares about.
+   */
+  answer?: (method: string, params: unknown[]) => NodeAnswer | undefined;
   /** How the node answers the preflight calls (`eth_fillTransaction`, `eth_estimateGas`). */
   preflight?: NodeAnswer;
   /** How the node answers EVERY call: an endpoint that is throttling us, or has stopped answering. */
@@ -90,18 +98,36 @@ export interface FakeNodeOptions {
   fillTransaction?: boolean;
   /** The transport's per-request timeout, which is what turns a `hang` into viem's TimeoutError. */
   timeoutMs?: number;
+  /** The signer whose send lock `requests[].locked` reports. */
+  lockKey?: Address;
+}
+
+/** One request as the node received it. */
+export interface NodeRequest {
+  method: string;
+  params: unknown[];
+  /** Whether the caller held `lockKey`'s send lock when the request left. */
+  locked: boolean;
 }
 
 export interface FakeRpcNode {
   transport: Transport;
   /** Every JSON-RPC method the node was asked, in order. */
   calls: string[];
+  /** Every request, in order, with its params and whether the send lock was held for it. */
+  requests: NodeRequest[];
 }
 
+/** What a node without a configured preflight answer says to one: nothing useful, and loudly. */
+const NO_PREFLIGHT: NodeAnswer = {
+  error: { code: -32601, message: "fakeRpcNode: no preflight answer was configured" },
+};
+
 export function fakeRpcNode(opts: FakeNodeOptions): FakeRpcNode {
-  if (!opts.preflight && !opts.everyCall)
-    throw new Error("fakeRpcNode: say how the node answers (preflight or everyCall)");
+  if (!opts.answer && !opts.preflight && !opts.everyCall)
+    throw new Error("fakeRpcNode: say how the node answers (answer, preflight or everyCall)");
   const calls: string[] = [];
+  const requests: NodeRequest[] = [];
   const fillSupported = opts.fillTransaction ?? true;
 
   const answerFor = (method: string): NodeAnswer => {
@@ -109,10 +135,10 @@ export function fakeRpcNode(opts: FakeNodeOptions): FakeRpcNode {
     switch (method) {
       case "eth_fillTransaction":
         return fillSupported
-          ? opts.preflight!
+          ? (opts.preflight ?? NO_PREFLIGHT)
           : { error: { code: -32601, message: "the method eth_fillTransaction does not exist" } };
       case "eth_estimateGas":
-        return opts.preflight!;
+        return opts.preflight ?? NO_PREFLIGHT;
       case "eth_chainId":
         return { result: `0x${FAKE_NODE_CHAIN.id.toString(16)}` };
       case "eth_getTransactionCount":
@@ -136,9 +162,14 @@ export function fakeRpcNode(opts: FakeNodeOptions): FakeRpcNode {
   };
 
   const fetchFn = async (_url: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    const { id, method } = JSON.parse(String(init?.body)) as { id: number; method: string };
+    const { id, method, params } = JSON.parse(String(init?.body)) as {
+      id: number;
+      method: string;
+      params?: unknown[];
+    };
     calls.push(method);
-    const answer = answerFor(method);
+    requests.push({ method, params: params ?? [], locked: senderLockHeld(opts.lockKey) });
+    const answer = opts.answer?.(method, params ?? []) ?? answerFor(method);
     if ("hang" in answer)
       return new Promise<Response>((_resolve, reject) =>
         init?.signal?.addEventListener("abort", () =>
@@ -159,6 +190,7 @@ export function fakeRpcNode(opts: FakeNodeOptions): FakeRpcNode {
 
   return {
     calls,
+    requests,
     transport: http(FAKE_RPC_URL, {
       fetchFn,
       retryCount: 0,
