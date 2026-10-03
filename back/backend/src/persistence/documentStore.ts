@@ -36,8 +36,19 @@ export interface DocumentStore {
   getBytesAsync(id: string): Promise<Buffer>;
 }
 
+/**
+ * A store whose files can be removed. Only a customer's evidence uploads ever are: their bytes
+ * expire, while a provider's legal documents, hashed into anchored manifests, never do. A separate
+ * interface rather than a new method on `DocumentStore`, so every store that only reads and writes
+ * stays complete without it.
+ */
+export interface DeletableDocumentStore extends DocumentStore {
+  /** Removes a file. A missing file is not an error, so a delete that runs twice succeeds. */
+  delete(name: string): void;
+}
+
 /** Local-filesystem doc store. Interface allows S3 / Vercel Blob later (deferred). */
-export class FileDocumentStore implements DocumentStore {
+export class FileDocumentStore implements DeletableDocumentStore {
   private readonly root: string;
   constructor(root: string) {
     this.root = isAbsolute(root) ? root : resolve(process.cwd(), root);
@@ -140,6 +151,20 @@ export class FileDocumentStore implements DocumentStore {
     // `safePath` FIRST, and synchronously: the traversal guard must run before anything touches
     // the filesystem, exactly as it does on the sync path.
     return await readFile(this.safePath(id));
+  }
+
+  /**
+   * Removes a file, through the same containment guard as every read and write: a name that
+   * escapes the root is refused before anything touches the filesystem. A file that is not there
+   * is not an error; any other failure (a directory, a permission) is.
+   */
+  delete(name: string): void {
+    const path = this.safePath(name);
+    try {
+      unlinkSync(path);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
   }
 }
 

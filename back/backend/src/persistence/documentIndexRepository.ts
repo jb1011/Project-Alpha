@@ -16,8 +16,11 @@ import type Database from "better-sqlite3";
  * commits to those bytes and their hashes, so nothing may be re-derived — and are found through
  * the backfilled `company_id` COLUMN, never by recomputing an id.
  *
- * Documents are IMMUTABLE once indexed: doola may re-issue a document, and when it does it gets a
- * new provider document id, which is a new row. Nothing here updates.
+ * A provider's documents are IMMUTABLE once indexed: doola may re-issue a document, and when it
+ * does it gets a new provider document id, which is a new row. The one update is to a customer's
+ * evidence upload (`source = 'customer'`), whose bytes expire: its row records when they were
+ * deleted, and takes a new expiry when the same bytes come back. Its other columns never change,
+ * and its hash stays after its bytes have gone.
  */
 export interface DocumentIndexRecord {
   /** Our stable, URL-safe id — see `documentIndexId`. This is what the download route takes. */
@@ -35,7 +38,22 @@ export interface DocumentIndexRecord {
   /** Name inside the DocumentStore (not a filesystem path the caller may dictate). */
   path: string;
   createdAt: string | null;
+  /** Who supplied the bytes: the formation provider, or the customer as evidence for the
+   *  operator. A customer's upload has no provider to re-fetch it from. */
+  source: "provider" | "customer";
+  /** Unix seconds from which a customer upload's bytes may be deleted. Null on a provider's
+   *  document, whose bytes never expire. */
+  expiresAt: number | null;
+  /** Unix seconds the bytes were deleted, null while they are present. */
+  bytesDeletedAt: number | null;
 }
+
+/** What `insert` takes. Without `source` the row is a provider's document with no expiry, which is
+ *  how every caller that predates customer uploads writes one. */
+export type NewDocumentIndexRecord = Omit<
+  DocumentIndexRecord,
+  "createdAt" | "entityKey" | "source" | "expiresAt" | "bytesDeletedAt"
+> & { entityKey?: null; source?: "provider" | "customer"; expiresAt?: number | null };
 
 interface Row {
   id: string;
@@ -48,6 +66,9 @@ interface Row {
   provider_doc_id: string | null;
   path: string;
   created_at: string | null;
+  source: DocumentIndexRecord["source"];
+  expires_at: number | null;
+  bytes_deleted_at: number | null;
 }
 
 function toRecord(r: Row): DocumentIndexRecord {
@@ -62,7 +83,22 @@ function toRecord(r: Row): DocumentIndexRecord {
     providerDocId: r.provider_doc_id ?? "",
     path: r.path,
     createdAt: r.created_at,
+    source: r.source,
+    expiresAt: r.expires_at,
+    bytesDeletedAt: r.bytes_deleted_at,
   };
+}
+
+const SOURCES: readonly DocumentIndexRecord["source"][] = ["provider", "customer"];
+/** The largest time in unix seconds accepted. A time in milliseconds is past it for centuries. */
+const MAX_UNIX_SECONDS = 99_999_999_999;
+
+/** A refusal names the argument and the rule, never the value. */
+function assertUnixSeconds(field: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_UNIX_SECONDS)
+    throw new Error(
+      `document index: ${field} must be a whole number of unix seconds (1 to ${MAX_UNIX_SECONDS})`,
+    );
 }
 
 /**
@@ -119,8 +155,11 @@ export function documentFileName(docType: string): string {
 }
 
 export interface DocumentIndexRepository {
-  /** Index a stored document. Returns false when the row already existed (idempotent re-fetch). */
-  insert(rec: Omit<DocumentIndexRecord, "createdAt" | "entityKey"> & { entityKey?: null }): boolean;
+  /**
+   * Index a stored document. Returns false when the row already existed (idempotent re-fetch).
+   * `source` defaults to `provider` and `expiresAt` to none; a customer's upload passes both.
+   */
+  insert(rec: NewDocumentIndexRecord): boolean;
   listByCompany(companyId: string): DocumentIndexRecord[];
   /**
    * The same rows for MANY COMPANIES, in ONE statement — the list routes' N+1 (M5).
@@ -138,6 +177,33 @@ export interface DocumentIndexRepository {
   findByProviderDocId(companyId: string, providerDocId: string): DocumentIndexRecord | undefined;
   /** The doc types already stored for a company — what "are the required documents in?" reads. */
   storedTypes(companyId: string): string[];
+  /**
+   * The customer uploads whose bytes may be deleted now: at most `limit`, the most overdue first.
+   *
+   * The whole rule is in the SQL, so a row that cannot qualify never takes a place under the
+   * limit. An upload qualifies when its expiry has passed (`expires_at <= nowSeconds`), its bytes
+   * are present, and either
+   *  - its company is abandoned, or
+   *  - a check of its company was recorded after the upload, and the company's latest check is
+   *    neither `revoked` (the bytes are evidence in a dispute) nor `reinstated` (the re-check
+   *    needs them).
+   * So on a company that is not abandoned, an upload no check has followed waits however old it
+   * is, and one checked after its expiry goes at the next sweep. A check's time is its
+   * `created_at`, compared with the upload's at one-second resolution: a check recorded in the
+   * same second as the upload is not after it.
+   *
+   * Reads `company_checks` and `companies`, so it runs only on a migrated database.
+   */
+  listExpiredCustomerUploads(nowSeconds: number, limit: number): DocumentIndexRecord[];
+  /** Records that a customer upload's bytes were deleted. False unless the id is a customer upload
+   *  with its bytes present: a deletion time, once written, stands, and a provider's document is
+   *  never marked. */
+  markBytesDeleted(id: string, atSeconds: number): boolean;
+  /** The bytes of a customer upload are back: clears `bytes_deleted_at` and sets a new expiry.
+   *  False unless the id is a customer upload whose bytes were deleted. */
+  restoreBytes(id: string, expiresAt: number): boolean;
+  /** A company's customer uploads: those with their bytes present, and all of them. */
+  countCustomerUploads(companyId: string): { present: number; all: number };
 }
 
 export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
@@ -149,8 +215,10 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
       // agent has attached to yet, and inventing an entity for it would be a fact we do not have.
       insert: db.prepare(
         `INSERT OR IGNORE INTO documents
-           (id, company_id, doc_type, sha256, content_type, size, provider_doc_id, path)
-         VALUES (@id, @company_id, @doc_type, @sha256, @content_type, @size, @provider_doc_id, @path)`,
+           (id, company_id, doc_type, sha256, content_type, size, provider_doc_id, path, source,
+            expires_at)
+         VALUES (@id, @company_id, @doc_type, @sha256, @content_type, @size, @provider_doc_id, @path,
+                 @source, @expires_at)`,
       ),
       listByCompany: db.prepare(
         "SELECT * FROM documents WHERE company_id = ? ORDER BY created_at, doc_type, id",
@@ -162,10 +230,47 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
       storedTypes: db.prepare(
         "SELECT DISTINCT doc_type AS t FROM documents WHERE company_id = ? AND doc_type IS NOT NULL",
       ),
+      // The rule, clause by clause, is on the interface. The latest check is the one with the
+      // highest id, as everywhere else that reads `company_checks`.
+      listExpiredCustomerUploads: db.prepare(
+        `SELECT d.* FROM documents d
+           JOIN companies c ON c.company_id = d.company_id
+          WHERE d.source = 'customer'
+            AND d.bytes_deleted_at IS NULL
+            AND d.expires_at IS NOT NULL AND d.expires_at <= @now
+            AND (c.status = 'abandoned'
+                 OR (EXISTS (SELECT 1 FROM company_checks k
+                              WHERE k.company_id = d.company_id
+                                AND k.created_at > d.created_at)
+                     AND (SELECT l.result FROM company_checks l
+                           WHERE l.company_id = d.company_id
+                           ORDER BY l.check_id DESC LIMIT 1) NOT IN ('revoked', 'reinstated')))
+          ORDER BY d.expires_at, d.id
+          LIMIT @limit`,
+      ),
+      markBytesDeleted: db.prepare(
+        `UPDATE documents SET bytes_deleted_at = @at
+          WHERE id = @id AND source = 'customer' AND bytes_deleted_at IS NULL`,
+      ),
+      restoreBytes: db.prepare(
+        `UPDATE documents SET bytes_deleted_at = NULL, expires_at = @expires_at
+          WHERE id = @id AND source = 'customer' AND bytes_deleted_at IS NOT NULL`,
+      ),
+      countCustomerUploads: db.prepare(
+        `SELECT COUNT(CASE WHEN bytes_deleted_at IS NULL THEN 1 END) AS present,
+                COUNT(*) AS all_rows
+           FROM documents
+          WHERE company_id = ? AND source = 'customer'`,
+      ),
     };
   }
 
-  insert(rec: Omit<DocumentIndexRecord, "createdAt" | "entityKey">): boolean {
+  insert(rec: NewDocumentIndexRecord): boolean {
+    const source = rec.source ?? "provider";
+    if (!SOURCES.includes(source))
+      throw new Error(`document index: source must be one of ${SOURCES.join(", ")}`);
+    const expiresAt = rec.expiresAt ?? null;
+    if (expiresAt !== null) assertUnixSeconds("expiresAt", expiresAt);
     return (
       this.stmts.insert.run({
         id: rec.id,
@@ -176,6 +281,8 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
         size: rec.size,
         provider_doc_id: rec.providerDocId,
         path: rec.path,
+        source,
+        expires_at: expiresAt,
       }).changes === 1
     );
   }
@@ -220,5 +327,33 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
 
   storedTypes(companyId: string): string[] {
     return (this.stmts.storedTypes.all(companyId) as { t: string }[]).map((r) => r.t);
+  }
+
+  listExpiredCustomerUploads(nowSeconds: number, limit: number): DocumentIndexRecord[] {
+    assertUnixSeconds("nowSeconds", nowSeconds);
+    // Checked here because SQLite reads a negative LIMIT as no limit at all.
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      throw new Error("document index: limit must be a positive whole number");
+    return (this.stmts.listExpiredCustomerUploads.all({ now: nowSeconds, limit }) as Row[]).map(
+      toRecord,
+    );
+  }
+
+  markBytesDeleted(id: string, atSeconds: number): boolean {
+    assertUnixSeconds("atSeconds", atSeconds);
+    return this.stmts.markBytesDeleted.run({ id, at: atSeconds }).changes === 1;
+  }
+
+  restoreBytes(id: string, expiresAt: number): boolean {
+    assertUnixSeconds("expiresAt", expiresAt);
+    return this.stmts.restoreBytes.run({ id, expires_at: expiresAt }).changes === 1;
+  }
+
+  countCustomerUploads(companyId: string): { present: number; all: number } {
+    const r = this.stmts.countCustomerUploads.get(companyId) as {
+      present: number;
+      all_rows: number;
+    };
+    return { present: r.present, all: r.all_rows };
   }
 }

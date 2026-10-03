@@ -1626,6 +1626,17 @@ export function migrate(db: Database.Database): void {
   if (!docCols.includes("size")) db.exec("ALTER TABLE documents ADD COLUMN size INTEGER");
   if (!docCols.includes("provider_doc_id"))
     db.exec("ALTER TABLE documents ADD COLUMN provider_doc_id TEXT");
+  // A customer's evidence uploads share the index with the provider's documents, and `source`
+  // tells them apart: DEFAULT 'provider' is the truth for every row written before it existed.
+  // `expires_at` is when an upload's bytes may go and `bytes_deleted_at` when they went, both unix
+  // seconds; the row itself stays, with its hash. A provider document leaves both NULL, since its
+  // bytes never expire.
+  for (const [col, type] of [
+    ["source", "TEXT NOT NULL DEFAULT 'provider'"],
+    ["expires_at", "INTEGER"],
+    ["bytes_deleted_at", "INTEGER"],
+  ] as const)
+    if (!docCols.includes(col)) db.exec(`ALTER TABLE documents ADD COLUMN ${col} ${type}`);
 
   // formation_parties: PR 1's shape was keyed by entity_key with no tenant column, which cannot
   // express a party that exists BEFORE its entity does (the intake handle, design §5). Rebuild
