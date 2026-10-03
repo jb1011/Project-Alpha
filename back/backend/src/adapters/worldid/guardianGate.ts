@@ -15,8 +15,11 @@ const VERIFY_HOST = "https://developer.world.org";
 /** Credential identifiers acceptable for GUARDIANSHIP. A guardian is the legally accountable
  *  natural person, so we require Orb-grade uniqueness (v4 proof_of_human / v3 orb) or a
  *  government-document tier. Device/selfie tiers are rejected — they prove neither uniqueness
- *  nor identity strongly enough for a FinCEN-CDD-shaped role. */
-const ACCEPTED_CREDENTIALS = new Set([
+ *  nor identity strongly enough for a FinCEN-CDD-shaped role.
+ *
+ *  Exported because a declaration of a company needs a verified human, and `assertRealHuman`
+ *  reads this same set: the stored row must hold one of the credentials this path accepts. */
+export const ACCEPTED_CREDENTIALS: ReadonlySet<string> = new Set([
   "proof_of_human",
   "orb",
   "passport",
