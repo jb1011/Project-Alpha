@@ -181,12 +181,12 @@ export interface DocumentIndexRepository {
    * The customer uploads whose bytes may be deleted now: at most `limit`, the most overdue first.
    *
    * The whole rule is in the SQL, so a row that cannot qualify never takes a place under the
-   * limit. An upload qualifies when its expiry has passed (`expires_at <= nowSeconds`), its bytes
-   * are present, and either
-   *  - its company is abandoned, or
-   *  - a check of its company was recorded after the upload, and the company's latest check is
-   *    neither `revoked` (the bytes are evidence in a dispute) nor `reinstated` (the re-check
-   *    needs them).
+   * limit. An upload qualifies when
+   *  - its expiry has passed (`expires_at <= nowSeconds`) and its bytes are present;
+   *  - its company is abandoned, or a check of its company was recorded after the upload;
+   *  - and the company's latest check, if it has one, is neither `revoked` (the bytes are evidence
+   *    in a dispute) nor `reinstated` (the re-check needs them). This holds on an abandoned
+   *    company too: an operator can revoke one.
    * So on a company that is not abandoned, an upload no check has followed waits however old it
    * is, and one checked after its expiry goes at the next sweep. A check's time is its
    * `created_at`, compared with the upload's at one-second resolution: a check recorded in the
@@ -231,7 +231,8 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
         "SELECT DISTINCT doc_type AS t FROM documents WHERE company_id = ? AND doc_type IS NOT NULL",
       ),
       // The rule, clause by clause, is on the interface. The latest check is the one with the
-      // highest id, as everywhere else that reads `company_checks`.
+      // highest id, as everywhere else that reads `company_checks`; a company with no check has
+      // none to hold its uploads, hence the IFNULL.
       listExpiredCustomerUploads: db.prepare(
         `SELECT d.* FROM documents d
            JOIN companies c ON c.company_id = d.company_id
@@ -239,12 +240,12 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
             AND d.bytes_deleted_at IS NULL
             AND d.expires_at IS NOT NULL AND d.expires_at <= @now
             AND (c.status = 'abandoned'
-                 OR (EXISTS (SELECT 1 FROM company_checks k
-                              WHERE k.company_id = d.company_id
-                                AND k.created_at > d.created_at)
-                     AND (SELECT l.result FROM company_checks l
-                           WHERE l.company_id = d.company_id
-                           ORDER BY l.check_id DESC LIMIT 1) NOT IN ('revoked', 'reinstated')))
+                 OR EXISTS (SELECT 1 FROM company_checks k
+                             WHERE k.company_id = d.company_id
+                               AND k.created_at > d.created_at))
+            AND IFNULL((SELECT l.result FROM company_checks l
+                         WHERE l.company_id = d.company_id
+                         ORDER BY l.check_id DESC LIMIT 1), '') NOT IN ('revoked', 'reinstated')
           ORDER BY d.expires_at, d.id
           LIMIT @limit`,
       ),

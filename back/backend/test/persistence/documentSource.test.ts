@@ -276,10 +276,33 @@ test("the memory document store for tests deletes the same way", () => {
 });
 
 describe("listExpiredCustomerUploads", () => {
-  test("an expired upload on an abandoned company qualifies, with no check at all", () => {
-    company("co_abandoned", "abandoned");
-    const id = upload("co_abandoned", "a");
-    expect(expired()).toEqual([id]);
+  test("an expired upload on an abandoned company qualifies with no check at all, or when its latest check failed", () => {
+    company("co_no_check", "abandoned");
+    const noCheck = upload("co_no_check", "a");
+    company("co_failed", "abandoned");
+    check("co_failed", "failed");
+    // Arrives after the check, so abandonment is its only way out.
+    const failed = upload("co_failed", "a", { uploadedAt: NOW + DAY });
+    expect(expired(NOW + 60 * DAY).sort()).toEqual([noCheck, failed].sort());
+  });
+
+  test("a latest check that is revoked or reinstated keeps the uploads of an abandoned company too", () => {
+    for (const latest of ["revoked", "reinstated"] as const) {
+      const history: CompanyCheckResult[] =
+        latest === "revoked" ? ["passed", "revoked"] : ["passed", "revoked", "reinstated"];
+      // Checked after the upload, then abandoned: both ways out are held.
+      const after = `co_${latest}_after`;
+      company(after);
+      upload(after, "a");
+      for (const result of history) check(after, result);
+      expect(companies.setStatus(after, "draft", "abandoned")).toBe(true);
+      // Abandoned, and checked only before the upload: the one way out is held.
+      const before = `co_${latest}_before`;
+      company(before, "abandoned");
+      for (const result of history) check(before, result);
+      upload(before, "a", { uploadedAt: NOW + DAY });
+    }
+    expect(expired(NOW + 60 * DAY)).toEqual([]);
   });
 
   test("an expired upload qualifies at the first sweep after a check recorded after it, whatever the check found", () => {
