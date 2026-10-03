@@ -18,10 +18,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
 import type { Address } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
-import { type WorldIdDeps, buildWorldIdDeps } from "../../src/api/routes/worldId";
 import { toCompanyView } from "../../src/api/views";
 import { signSession } from "../../src/auth/session";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
@@ -36,38 +34,39 @@ import { SqliteCompanyCheckRepository } from "../../src/persistence/companyCheck
 import { SqliteCompanyDeclarationRepository } from "../../src/persistence/companyDeclarationRepository";
 import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
+import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
+import {
+  ANVIL_ACCOUNT_2,
+  ANVIL_ACCOUNT_3,
+  ANVIL_ACCOUNT_4,
+  APPROVED,
+  CHAIN_ID,
+  FACTORY,
+  FORMATION_PROVIDER,
+  SANDBOX_TYPED,
+  type Signer,
+  customerCompanyDeps,
+  recordHuman as recordHumanIn,
+  sandboxCustomerCompanyDeps,
+} from "../helpers/customerCompanyFixtures";
+import { DeletableMemoryDocumentStore } from "../helpers/deletableDocumentStore";
 import { startMcpTestClient } from "../mcp/helpers";
 
 /** anvil's published accounts #2, #3 and #4: test keys, never real wallets. */
-const owner = privateKeyToAccount(
-  "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
-);
-const stranger = privateKeyToAccount(
-  "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
-);
-const waived = privateKeyToAccount(
-  "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
-);
-type Signer = typeof owner;
+const owner = ANVIL_ACCOUNT_2;
+const stranger = ANVIL_ACCOUNT_3;
+const waived = ANVIL_ACCOUNT_4;
 
 const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
-const FACTORY = "0x00000000000000000000000000000000000fAc70" as Address;
-const CHAIN_ID = 31_337;
-const ACTION = "guardian-verification";
 /** The largest body the doors read, in bytes. */
 const MAX_BODY = 8 * 1024;
-/** Any provider but `customer` is a company filed through formation. */
-const FORMATION_PROVIDER = "example-formation-provider";
 
 const STATEMENT_MESSAGE = "/companies/customer/statement-message";
 const CREATE = "/companies/customer";
 const abandonPath = (companyId: string) => `/companies/${companyId}/abandon`;
-
-/** The draft wording, approved: what a production deployment serves once the wording is final. */
-const APPROVED: LegalText<StatementFields> = { ...STATEMENT_OF_AUTHORITY, status: "approved" };
 
 /** A declaration as a production caller types it. */
 const TYPED = {
@@ -75,12 +74,6 @@ const TYPED = {
   declarantTitle: "Authorised Signatory",
   companyName: "Example Holdings LLC",
   filingNumber: "TEST-0001",
-};
-/** A declaration as a sandbox caller sends it: the synthetic flag, and no declarant. */
-const SANDBOX_TYPED = {
-  companyName: "Example Holdings LLC",
-  filingNumber: "TEST-0001",
-  synthetic: true,
 };
 
 /** A formation company's list row, key for key: the set the formation tests pin. */
@@ -147,68 +140,22 @@ afterEach(() => {
 
 const nowSeconds = (): number => Math.floor(nowMs / 1000);
 
-/** A verification row, recorded as the verify route records one. */
-function recordHuman(tenantId: Address, nullifier: string, credential = "proof_of_human"): void {
-  expect(
-    store.recordVerification({
-      nullifier,
-      action: ACTION,
-      tenantId,
-      issuerSchemaId: 1,
-      credential,
-      environment: "production",
-      verifiedAt: nowMs,
-      expiresAtMin: null,
-    }),
-  ).toBe(true);
+/** A verification row, recorded as the verify route records one, at the doors' clock. */
+function recordHuman(tenantId: Address, nullifier: string, credential?: string): void {
+  recordHumanIn(store, tenantId, nullifier, nowMs, credential);
 }
 
-/** World ID through its one builder, with enforcement off: a declaration needs a real human
- *  whatever that switch says. */
-function worldFor(environment: "production" | "staging"): WorldIdDeps {
-  return buildWorldIdDeps(
-    {
-      appId: "app_test",
-      rpId: "rp_test",
-      rpSigningKey: `0x${"1".repeat(64)}`,
-      action: ACTION,
-      environment,
-      attestMinAge: 18,
-      requireGuardian: false,
-    },
-    store,
-  );
-}
+const stores = () => ({ db, companies, declarations, checks, store });
 
 /** The doors of a production deployment that charges, serving the approved wording. */
 function doors(over: Partial<CustomerCompanyDeps> = {}): CustomerCompanyDeps {
-  return {
-    companies,
-    declarations,
-    checks,
-    world: worldFor("production"),
-    chainId: CHAIN_ID,
-    factory: FACTORY,
-    environment: "production",
-    text: APPROVED,
-    maxOpenPerTenant: 3,
-    paymentRequired: true,
-    hasOpenLegalBody: () => false,
-    transaction: (fn) => db.transaction(fn)(),
-    now: () => nowMs,
-    ...over,
-  };
+  return customerCompanyDeps(stores(), () => nowMs, over);
 }
 
 /** The doors of a sandbox deployment: the draft wording, and a World configuration that is not
  *  production. */
 function sandboxDoors(over: Partial<CustomerCompanyDeps> = {}): CustomerCompanyDeps {
-  return doors({
-    environment: "sandbox",
-    text: STATEMENT_OF_AUTHORITY,
-    world: worldFor("staging"),
-    ...over,
-  });
+  return sandboxCustomerCompanyDeps(stores(), () => nowMs, over);
 }
 
 /** A wording that counts how often it is rendered, so a refusal can be shown to come first. */
@@ -231,18 +178,22 @@ function counting(base: LegalText<StatementFields>): {
 
 /**
  * The API over this test's database. The customer facts are wired whatever the doors, as the
- * composition root wires them; the doors only when `customerCompanies` is given. The MCP surface
- * reads the same object.
+ * composition root wires them; the doors only when `customerCompanies` is given, with the document
+ * index and store the document routes read. The MCP surface reads the same object.
  */
 function makeApp(customerCompanies?: CustomerCompanyDeps) {
+  const documents = new SqliteDocumentIndexRepository(db);
+  const docStore = new DeletableMemoryDocumentStore();
   const deps: Partial<ApiDeps> = {
     webOrigin: "*",
     jwtSecret: JWT_SECRET,
     chainId: CHAIN_ID,
     repo,
     companies,
+    documents,
+    docStore,
     customerFacts: { declarations, checks },
-    customerCompanies,
+    customerCompanies: customerCompanies && { ...customerCompanies, documents, docStore },
     apiKeys,
     passkeys: new SqlitePasskeyStore(db),
     jobs: new SqliteJobRepository(db),

@@ -11,6 +11,9 @@ import { toDocumentView } from "../views";
  * `GET /companies/:companyId/documents`         — the index (hashes, sizes, types)
  * `GET /companies/:companyId/documents/:docId`  — the PDF bytes
  *
+ * A customer's evidence uploads are listed and served here too, to their own tenant only. One whose
+ * bytes have expired keeps its row and answers 410.
+ *
  * **The entity-keyed paths are GONE, in the same change rather than kept as an alias.** A1
  * re-keyed the store itself (`documentIndexId(companyId, …)`, `listByCompany`,
  * `findOwned(companyId, id)`) and left the ROUTES going through an entity, which meant a company
@@ -52,6 +55,15 @@ export function mountDocumentRoutes(app: Hono<{ Variables: AuthVars }>, deps: Ap
     // 404 here even though it is a perfectly valid id somewhere else.
     const doc = deps.documents?.findOwned(company.companyId, c.req.param("docId"));
     if (!doc) throw new ApiError("not_found", 404, "document not found");
+    // A customer's evidence upload whose bytes were deleted once their retention allowed it. The
+    // row, hash included, stays, so the document is gone rather than unknown, and the row decides
+    // that before the store is read.
+    if (doc.bytesDeletedAt !== null)
+      throw new ApiError(
+        "gone",
+        410,
+        "this document's file was deleted at the end of its retention; its record and its hash are kept",
+      );
 
     let bytes: Buffer;
     try {

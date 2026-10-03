@@ -546,15 +546,17 @@ async function main() {
     : undefined;
 
   /**
-   * The CUSTOMER COMPANY doors' dependencies (declare an existing Wyoming LLC, abandon it), built
-   * ONCE and only where `customerDoorsEnabled`: the legal-body factory is set and, on a production
-   * deployment, the deployment charges, so a body could never read `active` for free. Absent, the
-   * doors are not mounted; the view facts (`customerFacts` in `entityViewDeps`) are wired
-   * regardless.
+   * The CUSTOMER COMPANY doors' dependencies (declare an existing Wyoming LLC, abandon it, upload
+   * its evidence), built ONCE and only where `customerDoorsEnabled`: the legal-body factory is set
+   * and, on a production deployment, the deployment charges, so a body could never read `active`
+   * for free. Absent, the doors are not mounted; the view facts (`customerFacts` in
+   * `entityViewDeps`) are wired regardless.
    *
    * The repositories are the SAME instances the views read, over the same db handle the
-   * transaction runs on. Whether a company stands behind an open legal body is answered `false`
-   * until legal bodies can be opened on customer companies.
+   * transaction runs on, and the document index and file store are the ones the document routes
+   * read, so a tenant downloads its upload where it downloads every document. Whether a company
+   * stands behind an open legal body is answered `false` until legal bodies can be opened on
+   * customer companies.
    */
   const customerCompanies =
     cfg.legalBodyFactory && customerDoorsEnabled(cfg)
@@ -574,6 +576,9 @@ async function main() {
           paymentRequired: formationPayment.required,
           hasOpenLegalBody: () => false,
           transaction: <T>(fn: () => T) => repo.transaction(fn),
+          // The evidence uploads, through the index and the file store the document routes read.
+          documents: formationDocuments,
+          docStore,
         }
       : undefined;
 

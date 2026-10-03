@@ -5,6 +5,7 @@ import type { AuthVars } from "../auth/middleware";
 import { requireAuth } from "../auth/middleware";
 import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
 import type { CustomerCompanyDeps } from "../legalBody/customerCompany";
+import type { EvidenceDeps } from "../legalBody/evidence";
 import { mountMcpRoute } from "../mcp/transport";
 import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
 import type { CompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
@@ -64,11 +65,15 @@ export interface ApiDeps extends EntityViewDeps {
    */
   customerFacts?: { declarations: CompanyDeclarationRepository; checks: CompanyCheckRepository };
   /**
-   * The customer company DOORS (declare, abandon). Present only where `customerDoorsEnabled(cfg)`:
-   * the legal-body factory is set and, on a production deployment, the deployment charges.
-   * Absent, the doors are not mounted at all.
+   * The customer company DOORS (declare, abandon, upload evidence). Present only where
+   * `customerDoorsEnabled(cfg)`: the legal-body factory is set and, on a production deployment, the
+   * deployment charges. Absent, the doors are not mounted at all.
+   *
+   * Its `documents` and `docStore` are the SAME instances as the `documents` and `docStore` of these
+   * deps: an upload is written through them and downloaded through the document routes, which read
+   * those.
    */
-  customerCompanies?: CustomerCompanyDeps;
+  customerCompanies?: CustomerCompanyDeps & EvidenceDeps;
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;

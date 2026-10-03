@@ -674,7 +674,12 @@ export function deriveLegalBlock(
     return null;
   }
 
-  const docs = documents ? documents() : d.documents.listByCompany(company.companyId);
+  // The provider's documents only. A customer's evidence upload shares the index, and it is neither
+  // a filing document nor anything a manifest may commit to; leaving it out also keeps the
+  // provider's documents in the order a re-derivation finds them, whatever a customer uploads.
+  const docs = (documents ? documents() : d.documents.listByCompany(company.companyId)).filter(
+    (r) => r.source === "provider",
+  );
   if (docs.length === 0) return null;
 
   return {

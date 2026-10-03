@@ -13,10 +13,8 @@
  */
 import type Database from "better-sqlite3";
 import { type Address, type Hex, keccak256, recoverAddress, stringToBytes } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ApiError } from "../../src/api/errors";
-import { type WorldIdDeps, buildWorldIdDeps } from "../../src/api/routes/worldId";
 import {
   CUSTOMER_COMPANIES_PER_TENANT_PER_DAY,
   CUSTOMER_COMPANY_PLACEHOLDER,
@@ -34,7 +32,7 @@ import {
   statementDigest,
   statementTypedDataWire,
 } from "../../src/legalBody/statement";
-import { type LegalText, LegalTextNotApprovedError } from "../../src/legalBody/texts/index";
+import { LegalTextNotApprovedError } from "../../src/legalBody/texts/index";
 import {
   STATEMENT_OF_AUTHORITY,
   type StatementFields,
@@ -50,31 +48,33 @@ import {
 } from "../../src/persistence/companyRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
+import {
+  ACTION,
+  ANVIL_ACCOUNT_2,
+  ANVIL_ACCOUNT_3,
+  ANVIL_ACCOUNT_4,
+  APPROVED,
+  CHAIN_ID,
+  FACTORY,
+  FORMATION_PROVIDER,
+  SANDBOX_TYPED,
+  type Signer,
+  customerCompanyDeps,
+  recordHuman as recordHumanIn,
+  sandboxCustomerCompanyDeps,
+  worldFor as worldOf,
+} from "../helpers/customerCompanyFixtures";
 
 /** anvil's published accounts #2, #3 and #4: test keys, never real wallets. */
-const owner = privateKeyToAccount(
-  "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
-);
-const second = privateKeyToAccount(
-  "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
-);
-const stranger = privateKeyToAccount(
-  "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
-);
-type Signer = typeof owner;
+const owner = ANVIL_ACCOUNT_2;
+const second = ANVIL_ACCOUNT_3;
+const stranger = ANVIL_ACCOUNT_4;
 
-const FACTORY = "0x00000000000000000000000000000000000fAc70" as Address;
 const OTHER_FACTORY = "0x00000000000000000000000000000000000A11cE" as Address;
-const CHAIN_ID = 31_337;
-const ACTION = "guardian-verification";
 const OWNER_NULLIFIER = "1001";
 const SECOND_NULLIFIER = "1002";
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
-const FORMATION_PROVIDER = "example-formation-provider";
-
-/** The draft wording, approved: what a production deployment serves once the wording is final. */
-const APPROVED: LegalText<StatementFields> = { ...STATEMENT_OF_AUTHORITY, status: "approved" };
 
 /** A declaration as a production caller types it. */
 const TYPED: CustomerStatementInput = {
@@ -82,12 +82,6 @@ const TYPED: CustomerStatementInput = {
   declarantTitle: "Manager",
   companyName: "Example Holdings LLC",
   filingNumber: "TEST-0001",
-};
-/** A declaration as a sandbox caller sends it: the synthetic flag, and no declarant. */
-const SANDBOX_TYPED: CustomerStatementInput = {
-  companyName: "Example Holdings LLC",
-  filingNumber: "TEST-0001",
-  synthetic: true,
 };
 
 let db: Database.Database;
@@ -119,70 +113,24 @@ afterEach(() => {
 
 const nowSeconds = (): bigint => BigInt(Math.floor(nowMs / 1000));
 
-/** A verification row, recorded as the verify route records one. */
-function recordHuman(tenantId: Address, nullifier: string, credential = "proof_of_human"): void {
-  expect(
-    store.recordVerification({
-      nullifier,
-      action: ACTION,
-      tenantId,
-      issuerSchemaId: 1,
-      credential,
-      environment: "production",
-      verifiedAt: nowMs,
-      expiresAtMin: null,
-    }),
-  ).toBe(true);
+/** A verification row, recorded as the verify route records one, at the tests' clock. */
+function recordHuman(tenantId: Address, nullifier: string, credential?: string): void {
+  recordHumanIn(store, tenantId, nullifier, nowMs, credential);
 }
 
-/** World ID wired through its one builder. Enforcement is off on purpose: a declaration needs a
- *  real human whatever that switch says. */
-function worldFor(
-  opts: { environment?: "production" | "staging"; maxCompaniesPerHuman?: number } = {},
-): WorldIdDeps {
-  return buildWorldIdDeps(
-    {
-      appId: "app_test",
-      rpId: "rp_test",
-      rpSigningKey: `0x${"1".repeat(64)}`,
-      action: ACTION,
-      environment: opts.environment ?? "production",
-      attestMinAge: 18,
-      maxCompaniesPerHuman: opts.maxCompaniesPerHuman,
-      requireGuardian: false,
-    },
-    store,
-  );
-}
+/** World ID over this test's store, with enforcement off. */
+const worldFor = (opts?: Parameters<typeof worldOf>[1]) => worldOf(store, opts);
+
+const stores = () => ({ db, companies, declarations, checks, store });
 
 /** A production deployment that charges, serving the approved wording. */
 function deps(over: Partial<CustomerCompanyDeps> = {}): CustomerCompanyDeps {
-  return {
-    companies,
-    declarations,
-    checks,
-    world: worldFor(),
-    chainId: CHAIN_ID,
-    factory: FACTORY,
-    environment: "production",
-    text: APPROVED,
-    maxOpenPerTenant: 3,
-    paymentRequired: true,
-    hasOpenLegalBody: () => false,
-    transaction: (fn) => db.transaction(fn)(),
-    now: () => nowMs,
-    ...over,
-  };
+  return customerCompanyDeps(stores(), () => nowMs, over);
 }
 
 /** A sandbox deployment: the draft wording, and a World configuration that is not production. */
 function sandboxDeps(over: Partial<CustomerCompanyDeps> = {}): CustomerCompanyDeps {
-  return deps({
-    environment: "sandbox",
-    text: STATEMENT_OF_AUTHORITY,
-    world: worldFor({ environment: "staging" }),
-    ...over,
-  });
+  return sandboxCustomerCompanyDeps(stores(), () => nowMs, over);
 }
 
 /** The fields the server builds from a declaration, written out here on their own. */
