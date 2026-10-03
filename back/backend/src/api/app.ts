@@ -4,13 +4,17 @@ import type { DoolaEnvironment } from "../adapters/doola/types";
 import type { AuthVars } from "../auth/middleware";
 import { requireAuth } from "../auth/middleware";
 import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
+import type { CustomerCompanyDeps } from "../legalBody/customerCompany";
 import { mountMcpRoute } from "../mcp/transport";
+import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
+import type { CompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
 import { apiOnError } from "./errors";
 import { mountAgentBookRoutes } from "./routes/agentBook";
 import { mountApiKeyRoutes } from "./routes/apiKeys";
 import { mountAuthRoutes } from "./routes/auth";
 import { mountComplianceRoutes } from "./routes/compliance";
 import { mountConnectionRoutes } from "./routes/connection";
+import { mountCustomerCompanyRoutes } from "./routes/customerCompanies";
 import { mountDocumentRoutes } from "./routes/documents";
 import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
@@ -52,6 +56,19 @@ export interface ApiDeps extends EntityViewDeps {
    *  it is plain SQL, not part of the doola CAPABILITY, because a box that has lost its
    *  credentials must still describe the filings it already made. */
   companies?: import("../persistence/companyRepository").CompanyRepository;
+  /**
+   * What a customer's own company is described by: its declaration and the operator's checks.
+   * Wired on every deployment, like `companies` and for the same reason: plain SQL over the same
+   * database, so a customer's company keeps its view when the legal-body feature is switched off.
+   * The company views read it for customer companies only.
+   */
+  customerFacts?: { declarations: CompanyDeclarationRepository; checks: CompanyCheckRepository };
+  /**
+   * The customer company DOORS (declare, abandon). Present only where `customerDoorsEnabled(cfg)`:
+   * the legal-body factory is set and, on a production deployment, the deployment charges.
+   * Absent, the doors are not mounted at all.
+   */
+  customerCompanies?: CustomerCompanyDeps;
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
@@ -392,6 +409,9 @@ export function buildApiApp(deps: ApiDeps) {
   mountApiKeyRoutes(app, deps);
   mountConnectionRoutes(app, deps);
   mountProtectedRoutes(app, deps);
+  // A customer's own company: under the `/companies/*` requireAuth above, and only where the
+  // deployment wires the doors.
+  if (deps.customerCompanies) mountCustomerCompanyRoutes(app, deps.customerCompanies);
   // After the `/companies/*` requireAuth line above, so both document routes inherit auth.
   mountDocumentRoutes(app, deps);
   // …and the compliance calendar, which is company-scoped for the same reason and inherits the

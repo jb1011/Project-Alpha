@@ -37,10 +37,12 @@ import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import {
+  DEFAULT_BYO_MAX_OPEN_PER_TENANT,
   WORLD_CHAIN_DEFAULTS,
   canFormEntities,
   canProvisionTurnkey,
   canRegisterAgentBook,
+  customerDoorsEnabled,
   legalBodyEnvironment,
   loadConfig,
 } from "../config/env";
@@ -50,6 +52,7 @@ import { newChainHeadCache } from "../formation/payment";
 import { formationSummary } from "../formation/status";
 import { HederaMirror } from "../hedera/mirror";
 import { buildJobDeps } from "../jobs/composition";
+import { STATEMENT_OF_AUTHORITY } from "../legalBody/texts/statementOfAuthority";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
 import { buildEntityPaymentService } from "../payments/entityPayment";
@@ -65,6 +68,8 @@ import { SqliteAgentRunStore } from "../persistence/agentRunStore";
 import { SqliteApiKeyStore } from "../persistence/apiKeyStore";
 import { SqliteBridgeLegRepository } from "../persistence/bridgeLegRepository";
 import { SqliteChallengeStore } from "../persistence/challengeStore";
+import { SqliteCompanyCheckRepository } from "../persistence/companyCheckRepository";
+import { SqliteCompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
 import { SqliteCompanyRepository } from "../persistence/companyRepository";
 import { migrate, openDatabase } from "../persistence/db";
 import { SqliteDocumentIndexRepository } from "../persistence/documentIndexRepository";
@@ -140,6 +145,11 @@ async function main() {
   // a box that has lost its doola block must still describe (and serve documents for) the filings
   // it already made.
   const companies = new SqliteCompanyRepository(db);
+  // Always constructed too, for the same reason: a customer's own company is described by its
+  // declaration and the operator's checks, and it keeps its view on a box where the customer doors
+  // are off. Same db handle: a declaration is written in the transaction that creates its company.
+  const companyDeclarations = new SqliteCompanyDeclarationRepository(db);
+  const companyChecks = new SqliteCompanyCheckRepository(db);
   // Same db handle, and for the sharpest version of the reason: the `quoted` row is inserted in
   // the SAME TRANSACTION as the company it belongs to (§6.1), so a second handle would make that
   // impossible to express. Always constructed, like `companies` and for the same reason — a box
@@ -535,6 +545,38 @@ async function main() {
       }
     : undefined;
 
+  /**
+   * The CUSTOMER COMPANY doors' dependencies (declare an existing Wyoming LLC, abandon it), built
+   * ONCE and only where `customerDoorsEnabled`: the legal-body factory is set and, on a production
+   * deployment, the deployment charges, so a body could never read `active` for free. Absent, the
+   * doors are not mounted; the view facts (`customerFacts` in `entityViewDeps`) are wired
+   * regardless.
+   *
+   * The repositories are the SAME instances the views read, over the same db handle the
+   * transaction runs on. Whether a company stands behind an open legal body is answered `false`
+   * until legal bodies can be opened on customer companies.
+   */
+  const customerCompanies =
+    cfg.legalBodyFactory && customerDoorsEnabled(cfg)
+      ? {
+          companies,
+          declarations: companyDeclarations,
+          checks: companyChecks,
+          world: worldId,
+          chainId: cfg.chainId,
+          // The statement's typed-data domain names this factory, so a statement signed for one
+          // deployment is worth nothing on another.
+          factory: cfg.legalBodyFactory,
+          environment: legalBodyEnvironment(cfg),
+          text: STATEMENT_OF_AUTHORITY,
+          maxOpenPerTenant: cfg.formation?.byoMaxOpenPerTenant ?? DEFAULT_BYO_MAX_OPEN_PER_TENANT,
+          // The switch of the payment config built above: charging, a new company lands `draft`.
+          paymentRequired: formationPayment.required,
+          hasOpenLegalBody: () => false,
+          transaction: <T>(fn: () => T) => repo.transaction(fn),
+        }
+      : undefined;
+
   const runSaga: RunSaga = (i) =>
     runOnboarding({
       spec: i.spec,
@@ -627,6 +669,9 @@ async function main() {
     // from `formationSummary` and never receive this object.
     companyAgents: companies,
     documents: formationDocuments,
+    // A customer company's view: its declaration and the operator's latest check, read for
+    // customer companies only. Wired whatever the configuration, like everything else here.
+    customerFacts: { declarations: companyDeclarations, checks: companyChecks },
   };
 
   const doolaTasks = new TaskTracker("doola_webhook_task");
@@ -871,6 +916,8 @@ async function main() {
         : undefined,
     // The view dependencies, as ONE object shared with the MCP surface below (C8).
     ...entityViewDeps,
+    // The customer company doors, where this deployment mounts them.
+    customerCompanies,
     // The inbound receiver (design §6). Present only with credentials: a box that cannot verify a
     // signature has no business owning the URL.
     doola:
