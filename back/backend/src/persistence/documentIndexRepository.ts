@@ -19,8 +19,9 @@ import type Database from "better-sqlite3";
  * A provider's documents are IMMUTABLE once indexed: doola may re-issue a document, and when it
  * does it gets a new provider document id, which is a new row. The one update is to a customer's
  * evidence upload (`source = 'customer'`), whose bytes expire: its row records when they were
- * deleted, and takes a new expiry when the same bytes come back. Its other columns never change,
- * and its hash stays after its bytes have gone.
+ * deleted, and when the same bytes come back it takes a new expiry and a new `created_at`, as the
+ * new upload it then is. Its other columns never change, and its hash stays after its bytes have
+ * gone.
  */
 export interface DocumentIndexRecord {
   /** Our stable, URL-safe id — see `documentIndexId`. This is what the download route takes. */
@@ -189,8 +190,8 @@ export interface DocumentIndexRepository {
    *    company too: an operator can revoke one.
    * So on a company that is not abandoned, an upload no check has followed waits however old it
    * is, and one checked after its expiry goes at the next sweep. A check's time is its
-   * `created_at`, compared with the upload's at one-second resolution: a check recorded in the
-   * same second as the upload is not after it.
+   * `created_at`, compared with the upload's (for restored bytes, the time of the restore) at
+   * one-second resolution: a check recorded in the same second as the upload is not after it.
    *
    * Reads `company_checks` and `companies`, so it runs only on a migrated database.
    */
@@ -199,8 +200,12 @@ export interface DocumentIndexRepository {
    *  with its bytes present: a deletion time, once written, stands, and a provider's document is
    *  never marked. */
   markBytesDeleted(id: string, atSeconds: number): boolean;
-  /** The bytes of a customer upload are back: clears `bytes_deleted_at` and sets a new expiry.
-   *  False unless the id is a customer upload whose bytes were deleted. */
+  /**
+   * The bytes of a customer upload are back: clears `bytes_deleted_at`, sets a new expiry, and
+   * moves `created_at` to the database's clock. The file then counts as a new upload, which waits
+   * for a check recorded after it, however old the first upload was. False unless the id is a
+   * customer upload whose bytes were deleted.
+   */
   restoreBytes(id: string, expiresAt: number): boolean;
   /** A company's customer uploads: those with their bytes present, and all of them. */
   countCustomerUploads(companyId: string): { present: number; all: number };
@@ -253,8 +258,10 @@ export class SqliteDocumentIndexRepository implements DocumentIndexRepository {
         `UPDATE documents SET bytes_deleted_at = @at
           WHERE id = @id AND source = 'customer' AND bytes_deleted_at IS NULL`,
       ),
+      // CURRENT_TIMESTAMP is what the column defaults to, so a restored row reads like a new one.
       restoreBytes: db.prepare(
-        `UPDATE documents SET bytes_deleted_at = NULL, expires_at = @expires_at
+        `UPDATE documents
+            SET bytes_deleted_at = NULL, expires_at = @expires_at, created_at = CURRENT_TIMESTAMP
           WHERE id = @id AND source = 'customer' AND bytes_deleted_at IS NOT NULL`,
       ),
       countCustomerUploads: db.prepare(

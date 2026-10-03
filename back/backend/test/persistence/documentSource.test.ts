@@ -367,6 +367,37 @@ describe("listExpiredCustomerUploads", () => {
     expect(expired()).toEqual([due]);
   });
 
+  test("a file uploaded again after its bytes were deleted waits for a check recorded after the restore", () => {
+    for (const first of ["passed", "failed"] as const) {
+      const companyId = `co_${first}`;
+      company(companyId);
+      const id = upload(companyId, "a");
+      check(companyId, first);
+      expect(expired()).toContain(id);
+      expect(documents.markBytesDeleted(id, NOW)).toBe(true);
+      expect(documents.restoreBytes(id, NOW + RETENTION)).toBe(true);
+      // The check came before the restore, so the new expiry passing is not enough.
+      expect(expired(NOW + RETENTION)).not.toContain(id);
+      expect(expired(NOW + RETENTION + 365 * DAY)).not.toContain(id);
+    }
+  });
+
+  test("once a check is recorded after the restore, the file is listed again past its new expiry", () => {
+    company("co_1");
+    const id = upload("co_1", "a");
+    // Its bytes were deleted once; the test above covers a check recorded before the restore.
+    expect(documents.markBytesDeleted(id, NOW)).toBe(true);
+    const uploadedAgainAt = NOW - DAY;
+    const due = uploadedAgainAt + RETENTION;
+    expect(documents.restoreBytes(id, due)).toBe(true);
+    // Uploaded again a day ago, so a check recorded now comes after it.
+    setCreatedAt(id, uploadedAgainAt);
+    expect(expired(due)).toEqual([]);
+    check("co_1", "passed");
+    expect(expired(due - 1)).toEqual([]);
+    expect(expired(due)).toEqual([id]);
+  });
+
   test("rows that can never qualify do not take up the limit; the most overdue come first", () => {
     company("co_waiting");
     for (let i = 0; i < 5; i++)
@@ -408,6 +439,23 @@ describe("the bytes of an upload", () => {
     expect(documents.findOwned("co_1", provider.id)?.bytesDeletedAt).toBeNull();
     expect(documents.markBytesDeleted("no-such-document", NOW)).toBe(false);
     expect(documents.restoreBytes("no-such-document", NOW)).toBe(false);
+  });
+
+  test("a restore moves created_at forward to the database's clock; deleting the bytes does not move it", () => {
+    company("co_1");
+    const id = upload("co_1", "a");
+    const firstUpload = sqliteUtcTimestamp(UPLOADED * 1000);
+    expect(documents.findOwned("co_1", id)?.createdAt).toBe(firstUpload);
+    expect(documents.markBytesDeleted(id, NOW)).toBe(true);
+    expect(documents.findOwned("co_1", id)?.createdAt).toBe(firstUpload);
+
+    const before = sqliteUtcTimestamp(Date.now());
+    expect(documents.restoreBytes(id, NOW + RETENTION)).toBe(true);
+    const after = sqliteUtcTimestamp(Date.now());
+    const restoredAt = documents.findOwned("co_1", id)?.createdAt ?? "";
+    expect(restoredAt).toMatch(SQLITE_UTC);
+    expect(restoredAt > firstUpload).toBe(true);
+    expect(restoredAt >= before && restoredAt <= after).toBe(true);
   });
 
   test("countCustomerUploads counts the uploads with bytes present and all uploads, separately", () => {
