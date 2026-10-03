@@ -353,7 +353,7 @@ describe("on a production deployment, with the wording approved", () => {
       provider: "customer",
       environment: "production",
       synthetic: false,
-      nameOptions: [{ name: "Example Holdings LLC", entityTypeEnding: "LLC", position: 1 }],
+      nameOptions: [{ name: "Example Holdings LLC", entityTypeEnding: "", position: 1 }],
       businessPurpose: CUSTOMER_COMPANY_PLACEHOLDER,
       industryLabel: CUSTOMER_COMPANY_PLACEHOLDER,
       intakeSynthesized: false,
@@ -392,6 +392,16 @@ describe("on a production deployment, with the wording approved", () => {
     ).toBe(owner.address);
     // No payment quote is written here.
     expect(rows("formation_payments")).toBe(0);
+  });
+
+  test("the company's one name option is the declared name, whole, with an empty ending", async () => {
+    // The declared name is the full registered name: its ending is already in it, in whatever
+    // spelling the registry holds, so none is stripped and none is added.
+    const typed = { ...TYPED, companyName: "Example Holdings, L.L.C." };
+    const { companyId } = await createCustomerCompany(deps(), owner.address, await signed(typed));
+    expect(companies.find(companyId)?.nameOptions).toEqual([
+      { name: "Example Holdings, L.L.C.", entityTypeEnding: "", position: 1 },
+    ]);
   });
 
   test("with payment not required, the company lands ready", async () => {
@@ -780,7 +790,7 @@ describe("the field rules", () => {
       statementText: APPROVED.render(normalised),
     });
     expect(companies.find(companyId)?.nameOptions).toEqual([
-      { name: "Example Holdings LLC", entityTypeEnding: "LLC", position: 1 },
+      { name: "Example Holdings LLC", entityTypeEnding: "", position: 1 },
     ]);
   });
 

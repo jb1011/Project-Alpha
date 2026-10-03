@@ -422,7 +422,9 @@ export async function createCustomerCompany(
       provider: CUSTOMER_PROVIDER,
       environment: deps.environment,
       synthetic,
-      nameOptions: [{ name: fields.companyName, entityTypeEnding: "LLC", position: 1 }],
+      // The declared name is the company's full registered name, its ending already in it, so the
+      // ending stays empty: a reader that joins the two shows the ending once.
+      nameOptions: [{ name: fields.companyName, entityTypeEnding: "", position: 1 }],
       businessPurpose: CUSTOMER_COMPANY_PLACEHOLDER,
       industryLabel: CUSTOMER_COMPANY_PLACEHOLDER,
       intakeSynthesized: false,
