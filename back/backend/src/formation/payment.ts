@@ -43,6 +43,9 @@ export interface FormationPaymentConfig {
   /** Whole USDC, for copy. `/config` serves this; the breakdown line ("includes the $100 Wyoming
    *  filing fee") is the interface's, because the state fee is outside doola's pack. */
   feeUsdc: number;
+  /** Atomic USDC (6 decimals) for a company a customer declares rather than forms. It has no
+   *  default, so it is absent unless this deployment set one. */
+  byoFeeAtomic?: bigint;
   /** The Ledger account. Never on `/config` — it rides the quote, on an authenticated route. */
   revenueAddress: Address;
   quoteTtlMs: number;

@@ -41,6 +41,7 @@ import {
   canFormEntities,
   canProvisionTurnkey,
   canRegisterAgentBook,
+  legalBodyEnvironment,
   loadConfig,
 } from "../config/env";
 import { resolveFormationDeployment } from "../formation";
@@ -405,6 +406,12 @@ async function main() {
     console.warn(
       `⚠ Identity attestation step-up ENABLED (action ${worldId.cfg.attestAction}, min age ${worldId.attestMinAge})`,
     );
+  // A customer company door needs a verified human behind the guardian. On testnet nothing else
+  // stops the doors being mounted with no World block, and then every one of them refuses.
+  if (cfg.legalBodyFactory && !cfg.world && legalBodyEnvironment(cfg) === "sandbox")
+    console.warn(
+      "⚠ LEGAL_BODY_FACTORY_ADDRESS is set but the World ID block is not (WORLD_APP_ID + WORLD_RP_ID + WORLD_RP_SIGNING_KEY): every customer company door will answer 503",
+    );
 
   // `loadConfig` always populates this block — zod supplies every default — and the type is
   // optional only so a test fixture can build a Config literal without it. Named once so no call
@@ -454,6 +461,7 @@ async function main() {
   const formationPayment = {
     required: formationCfg.payment.required,
     feeAtomic: formationCfg.payment.feeAtomic,
+    byoFeeAtomic: formationCfg.payment.byoFeeAtomic,
     feeUsdc: formationCfg.payment.feeUsdc,
     // Non-null WHEN REQUIRED, by the boot invariant in env.ts; the empty string is never read on
     // a deployment that does not charge, because nothing quotes.

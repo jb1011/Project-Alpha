@@ -35,6 +35,10 @@ const DEV_JWT_SECRET = "dev-insecure-secret-change-me-please";
  *  would sign real filings against test state (or the reverse) with nothing to catch it. */
 export const ARC_TESTNET_CHAIN_ID = 5042002;
 
+/** How many customer companies one tenant may hold open at once, when BYO_MAX_OPEN_PER_TENANT is
+ *  unset. Also the fallback for a config with no formation block. */
+export const DEFAULT_BYO_MAX_OPEN_PER_TENANT = 3;
+
 /** Fallbacks for `Config.worldChain` (optional in the type for test fixtures). */
 export const WORLD_CHAIN_DEFAULTS = {
   rpcUrl: "https://worldchain-mainnet.g.alchemy.com/public",
@@ -359,6 +363,23 @@ const EnvSchema = z.object({
     .int()
     .positive()
     .default(30 * 60 * 1000),
+
+  // --- CUSTOMER COMPANIES: an existing Wyoming LLC a customer declares as the company behind a
+  // legal body. Read only when LEGAL_BODY_FACTORY_ADDRESS is set. ---
+  /**
+   * What a customer's own company costs, in WHOLE USDC: a positive integer, like
+   * FORMATION_FEE_USDC.
+   *
+   * NO DEFAULT, on purpose: a price is set in as many words. A deployment that charges, with the
+   * legal-body feature on, refuses to boot without it (the invariant below).
+   */
+  BYO_ATTESTATION_FEE_USDC: z.coerce.number().int().positive().optional(),
+  /** How many customer companies one tenant may hold open (not abandoned) at once. */
+  BYO_MAX_OPEN_PER_TENANT: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(DEFAULT_BYO_MAX_OPEN_PER_TENANT),
 });
 
 /** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
@@ -555,6 +576,10 @@ export interface Config {
     dailyCeiling: number;
     /** How many agents may share ONE company's filing (§3). */
     maxAgentsPerCompany: number;
+    /** How many customer companies one tenant may hold open (not abandoned) at once. Optional in
+     *  the TYPE only (loadConfig always sets it); a reader falls back to
+     *  DEFAULT_BYO_MAX_OPEN_PER_TENANT. */
+    byoMaxOpenPerTenant?: number;
     /** Sandbox files with a labeled synthetic identity instead of a real natural person. */
     sandboxSyntheticPii: boolean;
     /**
@@ -581,6 +606,9 @@ export interface Config {
       feeUsdc: number;
       /** 6-decimal atomic USDC — the same number, in the unit the token speaks. */
       feeAtomic: bigint;
+      /** What a customer's own company costs, in 6-decimal atomic USDC. It has no default:
+       *  undefined unless BYO_ATTESTATION_FEE_USDC is set. */
+      byoFeeAtomic?: bigint;
       revenueAddress?: Address;
       /** The dedicated settle submitter's key. Optional in the TYPE and required by a boot
        *  invariant whenever `required` is true, so a deployment that charges always has a
@@ -646,6 +674,30 @@ export function canFormEntities(cfg: Pick<Config, "doola">): boolean {
  *  whether those deps exist — so the boot gate and the advertised availability cannot drift. */
 export function canRegisterAgentBook(cfg: Pick<Config, "agentBook" | "world">): boolean {
   return Boolean(cfg.agentBook && cfg.world);
+}
+
+/**
+ * The legal-body feature's environment: "production" exactly when the deployment is on Arc
+ * mainnet, "sandbox" otherwise (testnet, or a network left unset, which the config reads as
+ * testnet). The config has no other production flag; this is the one definition.
+ */
+export function legalBodyEnvironment(cfg: Pick<Config, "arcNetwork">): "sandbox" | "production" {
+  return cfg.arcNetwork === "mainnet" ? "production" : "sandbox";
+}
+
+/**
+ * Whether the customer doors are mounted.
+ *
+ * They need the legal-body feature (the factory set). On a sandbox deployment that is enough. A
+ * production deployment must also charge: on one that does not, a body would read `active` for
+ * free. A config with no formation block charges nothing, so a production deployment without one
+ * keeps the doors shut.
+ */
+export function customerDoorsEnabled(
+  cfg: Pick<Config, "arcNetwork" | "legalBodyFactory" | "formation">,
+): boolean {
+  if (!cfg.legalBodyFactory) return false;
+  return legalBodyEnvironment(cfg) === "sandbox" || cfg.formation?.payment.required === true;
 }
 
 /** Hedera rail (design 2026-09-10). All-or-nothing over the five required vars, testnet only. */
@@ -834,6 +886,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxPerTenant: e.FORMATION_MAX_PER_TENANT,
       dailyCeiling: e.FORMATION_DAILY_CEILING,
       maxAgentsPerCompany: e.FORMATION_MAX_AGENTS_PER_COMPANY,
+      byoMaxOpenPerTenant: e.BYO_MAX_OPEN_PER_TENANT,
       sandboxSyntheticPii: boolWithDerivedDefault(
         e.FORMATION_SANDBOX_SYNTHETIC_PII,
         e.DOOLA_ENVIRONMENT === "sandbox",
@@ -862,6 +915,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
         // ONE conversion, here, so no caller multiplies by 1e6 for itself. Exact: the fee is an
         // integer number of dollars, so this is integer arithmetic all the way down.
         feeAtomic: BigInt(e.FORMATION_FEE_USDC) * 1_000_000n,
+        // The same one conversion. No default: undefined unless the operator set a price.
+        byoFeeAtomic:
+          e.BYO_ATTESTATION_FEE_USDC === undefined
+            ? undefined
+            : BigInt(e.BYO_ATTESTATION_FEE_USDC) * 1_000_000n,
         revenueAddress: e.FORMATION_REVENUE_ADDRESS,
         submitterKey: e.FORMATION_SETTLE_SUBMITTER_KEY,
         quoteTtlMs: e.FORMATION_QUOTE_TTL_MS,
@@ -1251,6 +1309,18 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       "Invalid config: LEGAL_BODY_FACTORY_ADDRESS equals FACTORY_ADDRESS — the legal-body factory and the full-product factory are different contracts",
     );
   }
+  // A deployment that charges quotes every company it sells, and with the legal-body feature on
+  // that includes a customer's own company. That price has no default, so a box that would have to
+  // quote one without it refuses here rather than at the first such quote.
+  if (
+    cfg.legalBodyFactory &&
+    cfg.formation.payment.required &&
+    cfg.formation.payment.byoFeeAtomic === undefined
+  ) {
+    throw new Error(
+      "Invalid config: FORMATION_PAYMENT_REQUIRED is on and LEGAL_BODY_FACTORY_ADDRESS is set, but BYO_ATTESTATION_FEE_USDC is missing — a deployment that charges must also price a customer's own company, and that price has no default",
+    );
+  }
 
   // NoviController (design §5), the ENS half. With no explicit apex the gateway resolves the apex
   // to the platform SIGNING KEY — which, in controller mode, is exactly the address the design
@@ -1407,6 +1477,7 @@ export function redact(cfg: Config): Record<string, unknown> {
         ? {
             ...cfg.formation.payment,
             feeAtomic: cfg.formation.payment.feeAtomic.toString(),
+            byoFeeAtomic: cfg.formation.payment.byoFeeAtomic?.toString(),
             // …but the SUBMITTER KEY is key material, and the boot log is journald.
             submitterKey: cfg.formation.payment.submitterKey ? "REDACTED" : undefined,
           }
