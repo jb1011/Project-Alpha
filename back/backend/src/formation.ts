@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { type Config, canFormEntities } from "./config/env";
 import { describeIndustryLabels } from "./formation/naicsLabels";
 import { deriveFormationStatus, hasLivePayment } from "./formation/status";
+import { CUSTOMER_PROVIDER } from "./legalBody/provider";
 import { opsLog } from "./observability/opsLog";
 import type { FormationPin } from "./types";
 import { sqliteUtcTimestamp } from "./util/sqliteTime";
@@ -84,12 +85,16 @@ export function companyAgentCapMessage(max: number): string {
  * open derives `none`, and that is the happy path for both the shim and the hybrid flow. A
  * derived `failed` is refused because the agent would be attaching to a filing that will not
  * happen, and a live payment is refused because the company is not paid for yet.
+ *
+ * A customer's own company is refused before any of that, whatever its state: it stands behind a
+ * legal body, never behind an agent of the full product.
  */
 export function companyAcceptsAgents(
-  company: { status: "draft" | "ready" | "abandoned" },
+  company: { status: "draft" | "ready" | "abandoned"; provider: string },
   derivedStatus: import("./formation/status").FormationStatus,
   hasLivePayment: boolean,
 ): boolean {
+  if (company.provider === CUSTOMER_PROVIDER) return false;
   if (company.status !== "ready") return false;
   if (hasLivePayment) return false;
   return (

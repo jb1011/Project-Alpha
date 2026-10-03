@@ -3,6 +3,7 @@ import type { CompanyCheck, CompanyCheckRepository } from "../persistence/compan
 import type { CompanyDeclaration } from "../persistence/companyDeclarationRepository";
 import type { CompanyRepository } from "../persistence/companyRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
+import { CUSTOMER_PROVIDER } from "./provider";
 
 /**
  * A COMPANY'S STANDING, derived. Every answer here is a pure function of facts other modules own
@@ -15,9 +16,6 @@ import type { FormationRequestRecord } from "../persistence/formationRepository"
  *    operator's passed check of that declaration;
  *  - a company filed through formation, established once the state confirms the filing.
  */
-
-/** The provider value of a customer's own company. */
-const CUSTOMER = "customer";
 
 export type AttestationState = "pending" | "active" | "revoked";
 export type VerificationState = "awaiting_check" | "verified" | "failed" | "revoked";
@@ -55,8 +53,8 @@ export interface Attestation {
  * state, so a revoked body over a verified company still says what was verified, and when.
  */
 export function deriveAttestationState(f: AttestationFacts): Attestation {
-  const customerPassed = f.provider === CUSTOMER && f.latestCheck?.result === "passed";
-  const established = f.provider === CUSTOMER ? customerPassed : f.formationFiled;
+  const customerPassed = f.provider === CUSTOMER_PROVIDER && f.latestCheck?.result === "passed";
+  const established = f.provider === CUSTOMER_PROVIDER ? customerPassed : f.formationFiled;
   const revoked = f.bodyRevoked || f.latestCheck?.result === "revoked";
   return {
     state: revoked ? "revoked" : established && f.paid ? "active" : "pending",
@@ -102,7 +100,7 @@ export function attestationFactsFor(
     provider: company.provider,
     latestCheck: deps.checks.latest(companyId),
     formationFiled:
-      company.provider === CUSTOMER ? false : companyFiled(deps.formationSteps(companyId)),
+      company.provider === CUSTOMER_PROVIDER ? false : companyFiled(deps.formationSteps(companyId)),
     // On a deployment that does not charge, a company is `ready` from creation.
     paid: company.status === "ready",
     bodyRevoked,

@@ -128,6 +128,9 @@ export interface CompanyRepository {
    * Drafts are excluded: with payment on, a company can sit in draft for days before its create
    * fires, and counting those would let an abandoned form exhaust a real quota. The platform
    * DAILY ceiling stays on `create_provider` rows, where the fee is actually incurred.
+   *
+   * Formation companies only: a customer's own company (provider `customer`) has its own cap,
+   * `countCustomerOpenByTenant`, and does not use up the formation quota.
    */
   countChargeableByTenant(tenantId: string): number;
   /**
@@ -217,17 +220,20 @@ export class SqliteCompanyRepository implements CompanyRepository {
         "SELECT * FROM companies WHERE tenant_id = ? ORDER BY created_at DESC, company_id",
       ),
       // The quota reader. The EXISTS is the derived-paying predicate, written out once here and
-      // once in `livePaymentCount`, both against the same partial index.
+      // once in `livePaymentCount`, both against the same partial index. A customer's own company
+      // is left out of both arms: it has its own cap below.
+      //
+      // 'customer' is the provider value of a customer's own company, here and in the cap below
+      // (CUSTOMER_PROVIDER in legalBody/provider.ts).
       countChargeable: db.prepare(
         `SELECT COUNT(*) AS n FROM companies c
           WHERE c.tenant_id = ?
+            AND c.provider <> 'customer'
             AND (c.status = 'ready'
                  OR EXISTS (SELECT 1 FROM formation_payments p
                              WHERE p.company_id = c.company_id
                                AND p.status IN ('quoted','settling')))`,
       ),
-      // 'customer' is the provider value of a customer's own company (CUSTOMER_PROVIDER in
-      // legalBody/customerCompany.ts).
       countCustomerOpen: db.prepare(
         `SELECT COUNT(*) AS n FROM companies
           WHERE tenant_id = ? AND provider = 'customer' AND status IN ('draft','ready')`,

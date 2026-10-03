@@ -48,7 +48,7 @@ import {
   stripEntityEnding,
 } from "./intake";
 import { isKnownIndustryLabel } from "./naicsLabels";
-import { guardianOf, insertQuote, quoteOf } from "./payment";
+import { feeAtomicFor, guardianOf, insertQuote, quoteOf } from "./payment";
 import { type PiiKeyring, encryptSsn, isWellFormedSsn } from "./pii";
 import { eraseSsnLogged } from "./ssnErasure";
 import { findRestrictedWord } from "./wyRestrictedWords";
@@ -306,8 +306,14 @@ export function createCompany(
           throw new PartyBindLost();
       }
       // The quote, last and inside: a company that is `draft` because it owes a fee, and the row
-      // that says what the fee is, are one fact.
-      if (paying && deps.payment) paymentId = insertQuote(deps.payment, id, now());
+      // that says what the fee is, are one fact. Priced by the provider the row was just given.
+      if (paying && deps.payment)
+        paymentId = insertQuote(
+          deps.payment,
+          id,
+          now(),
+          feeAtomicFor(deps.payment, deps.pin.provider),
+        );
       return id;
     });
   } catch (e) {

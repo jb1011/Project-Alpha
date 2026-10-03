@@ -8,6 +8,7 @@ import type { CompanyDeclarationRepository } from "../persistence/companyDeclara
 import type { CompanyRepository } from "../persistence/companyRepository";
 import type { GuardianVerification } from "../persistence/worldStore";
 import { sqliteUtcTimestamp } from "../util/sqliteTime";
+import { CUSTOMER_PROVIDER } from "./provider";
 import {
   buildStatementMessage,
   statementDigest,
@@ -45,8 +46,8 @@ import type { StatementFields } from "./texts/statementOfAuthority";
  * check decides.
  */
 
-/** The provider value of a customer's own company. */
-export const CUSTOMER_PROVIDER = "customer";
+/** The provider value of a customer's own company, defined in `./provider`. */
+export { CUSTOMER_PROVIDER };
 /** The business purpose and the industry of a customer's company: both columns are required, and
  *  an existing company has no formation intake to take them from. */
 export const CUSTOMER_COMPANY_PLACEHOLDER = "not applicable: an existing company";
