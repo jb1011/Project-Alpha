@@ -19,7 +19,8 @@ import type { CompanyNameOption } from "../formation/intake";
  *
  * `status` is only what the company itself owns: `draft` (intake taken, not yet payable/fileable),
  * `ready` (fileable), `abandoned` (terminal, and it has exactly three writers — draft expiry, the
- * max-attempt path, and the operator CLI).
+ * max-attempt path, and the operator CLI — plus, for a customer's own declared company, its tenant:
+ * `abandonCustomerCompany`).
  */
 export type CompanyStatus = "draft" | "ready" | "abandoned";
 
@@ -129,8 +130,19 @@ export interface CompanyRepository {
    * DAILY ceiling stays on `create_provider` rows, where the fee is actually incurred.
    */
   countChargeableByTenant(tenantId: string): number;
+  /**
+   * A tenant's customer companies that are still open: provider `customer`, status `draft` or
+   * `ready`. The cap on a tenant's open declarations reads it, so an abandoned one has left it.
+   */
+  countCustomerOpenByTenant(tenantId: string): number;
   /** Live payment rows (`quoted`/`settling`) for one company. Zero until B1 writes any. */
   livePaymentCount(companyId: string): number;
+  /**
+   * Whether this company has a payment that is live or that moved money: a row `quoted`,
+   * `settling`, `settled` or `refunded`. Wider than `livePaymentCount` on purpose: a company that
+   * was paid for, or refunded, is not one its tenant may simply walk away from.
+   */
+  hasLiveOrSettledPayment(companyId: string): boolean;
   /** Entities attached to one company — the FORMATION_MAX_AGENTS_PER_COMPANY reader. */
   countAgents(companyId: string): number;
   /**
@@ -214,9 +226,20 @@ export class SqliteCompanyRepository implements CompanyRepository {
                              WHERE p.company_id = c.company_id
                                AND p.status IN ('quoted','settling')))`,
       ),
+      // 'customer' is the provider value of a customer's own company (CUSTOMER_PROVIDER in
+      // legalBody/customerCompany.ts).
+      countCustomerOpen: db.prepare(
+        `SELECT COUNT(*) AS n FROM companies
+          WHERE tenant_id = ? AND provider = 'customer' AND status IN ('draft','ready')`,
+      ),
       livePayments: db.prepare(
         `SELECT COUNT(*) AS n FROM formation_payments
           WHERE company_id = ? AND status IN ('quoted','settling')`,
+      ),
+      liveOrSettledPayment: db.prepare(
+        `SELECT EXISTS (SELECT 1 FROM formation_payments
+                         WHERE company_id = ?
+                           AND status IN ('quoted','settling','settled','refunded')) AS found`,
       ),
       countAgents: db.prepare("SELECT COUNT(*) AS n FROM entities WHERE company_id = ?"),
       setStatus: db.prepare(
@@ -314,8 +337,16 @@ export class SqliteCompanyRepository implements CompanyRepository {
     return (this.stmts.countChargeable.get(tenantId) as { n: number }).n;
   }
 
+  countCustomerOpenByTenant(tenantId: string): number {
+    return (this.stmts.countCustomerOpen.get(tenantId) as { n: number }).n;
+  }
+
   livePaymentCount(companyId: string): number {
     return (this.stmts.livePayments.get(companyId) as { n: number }).n;
+  }
+
+  hasLiveOrSettledPayment(companyId: string): boolean {
+    return (this.stmts.liveOrSettledPayment.get(companyId) as { found: number }).found === 1;
   }
 
   countAgents(companyId: string): number {

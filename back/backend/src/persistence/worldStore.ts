@@ -271,12 +271,20 @@ export class SqliteWorldStore implements WorldStore {
   countCompaniesForNullifier(nullifier: string, action: string): number {
     // Every company, whatever its status: a draft that was abandoned still consumed a slot's
     // worth of a human's attention, and the point of this ceiling is anti-sybil, not billing.
+    //
+    // One exception: a customer's own declared company ('customer') that was abandoned before the
+    // operator checked it. That is how a declaration with a typo is withdrawn, and it must not
+    // cost a lifetime slot. Once a check exists, the company counts, abandoned or not. The query
+    // reads `company_checks`, so it needs a migrated database.
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS n FROM companies
-         WHERE tenant_id IN (
+        `SELECT COUNT(*) AS n FROM companies c
+         WHERE c.tenant_id IN (
            SELECT tenant_id FROM guardian_verifications WHERE nullifier = ? AND action = ?
-         )`,
+         )
+           AND NOT (c.provider = 'customer' AND c.status = 'abandoned'
+                    AND NOT EXISTS (SELECT 1 FROM company_checks k
+                                     WHERE k.company_id = c.company_id))`,
       )
       .get(nullifier, action) as { n: number };
     return row.n;
