@@ -33,7 +33,7 @@ import { SqliteFormationPartyRepository } from "../../src/persistence/formationP
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
 import type { Hex } from "../../src/types";
-import { formationPaymentDeps, requoteFormationPayment } from "../../src/workflow/formationPayment";
+import { formationPaymentDeps } from "../../src/workflow/formationPayment";
 import { fakeChain, paymentCfg } from "../helpers/formationPayment";
 import { startMcpTestClient } from "../mcp/helpers";
 
@@ -46,6 +46,8 @@ const FORMATION_FEE = 399_000_000n;
 const CUSTOMER_FEE = 7_000_000n;
 /** What a customer's company is told while its latest check is anything but a pass. */
 const NOT_CHECKED = "this company has not passed its check yet";
+/** What a verified customer's company is told where no customer fee is configured. */
+const NO_CUSTOMER_PRICE = "this deployment has no price for a customer's own company";
 
 let db: Database.Database;
 let repo: SqliteEntityRepository;
@@ -85,10 +87,11 @@ function cfg(): FormationPaymentConfig {
 
 /**
  * The API over this test's database, charging, with the executor on the fake chain. The customer
- * facts are wired as the composition root wires them, unless a test leaves them out.
+ * facts are wired as the composition root wires them, unless a test leaves them out; so is the
+ * customer fee.
  */
-function app(opts: { customerFacts?: boolean } = {}) {
-  const payment = cfg();
+function app(opts: { customerFacts?: boolean; customerFee?: boolean } = {}) {
+  const payment = opts.customerFee === false ? paymentCfg(payments) : cfg();
   // Any provider but `customer` is a company filed through formation.
   const pin = { provider: "example-formation-provider", environment: "sandbox" } as const;
   const deps: Partial<ApiDeps> = {
@@ -380,17 +383,34 @@ test("formationPaymentDeps hands the payment functions the checks of the custome
   expect(formationPaymentDeps(base)?.checks).toBeUndefined();
 });
 
-test("a verified customer company on a deployment with no customer fee is never quoted: the requote throws and writes nothing", () => {
+test("a verified customer company on a deployment with no customer fee is never quoted: the requote is refused and writes nothing", async () => {
   const companyId = customerCompany();
   checks.append(passed(companyId));
-  const deps = formationPaymentDeps({
-    companies,
-    repo,
-    formation: { payment: paymentCfg(payments), paymentExecutor: chain.executor },
-    customerFacts: { checks },
-  })!;
+  const application = app({ customerFee: false });
   const before = rowsAtRest();
-  expect(() => requoteFormationPayment(deps, companies.find(companyId)!)).toThrow(/customer/);
+
+  const res = await post(application, requotePath(companyId));
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({
+    error: { code: "validation_error", message: NO_CUSTOMER_PRICE },
+  });
+
+  const mcp = await startMcpTestClient(
+    application,
+    apiKeys.mint(OWNER, { capability: "provision" }).key,
+  );
+  try {
+    const out = (await mcp.client.callTool({
+      name: "requote_company_payment",
+      arguments: { companyId },
+    })) as { content: { text: string }[]; isError?: boolean };
+    expect({ text: out.content[0]!.text, isError: Boolean(out.isError) }).toEqual({
+      text: NO_CUSTOMER_PRICE,
+      isError: true,
+    });
+  } finally {
+    await mcp.close();
+  }
   expect(rowsAtRest()).toEqual(before);
 });
 

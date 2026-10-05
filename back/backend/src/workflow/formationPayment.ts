@@ -752,7 +752,8 @@ export async function cancelFormationPayment(
  * live authorizations.
  *
  * A customer's own company is quoted only once its check has passed (`checkRefusal`, first), and
- * at its own fee: the amount is the fee of the company's provider (`feeAtomicFor`).
+ * at its own fee: the amount is the fee of the company's provider (`feeAtomicFor`). Where no
+ * customer fee is configured, it is refused rather than quoted.
  */
 export function requoteFormationPayment(
   deps: FormationPaymentDeps,
@@ -776,6 +777,11 @@ export function requoteFormationPayment(
   const current = deps.companies.find(company.companyId) ?? company;
   if (current.status !== "draft")
     return { ok: false, reason: "this company has nothing left to pay for" };
+  // Boot demands a customer fee only while the legal-body feature is on, and customer companies
+  // outlive the feature being switched off: a refusal for the caller here, where `feeAtomicFor`
+  // would throw (it stays fail-closed for any caller that skips this).
+  if (company.provider === CUSTOMER_PROVIDER && deps.payment.byoFeeAtomic === undefined)
+    return { ok: false, reason: "this deployment has no price for a customer's own company" };
 
   const paymentId = insertQuote(
     deps.payment,
