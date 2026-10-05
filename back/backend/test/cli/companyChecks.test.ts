@@ -657,6 +657,27 @@ describe("company:check --result passed", () => {
       expect(checks.list(companyId)).toEqual([]);
     });
 
+    test("registry text with a space other than a plain space, naming its flag, before any comparison", async () => {
+      const { companyId, control } = await ownerCompany();
+      const message = await refusal(
+        passedCheck(companyId, control, { "--registry-name": "Example\u00A0Holdings LLC" }),
+      );
+      expect(message).toMatch(/--registry-name holds a space other than a plain space: retype it/);
+      expect(message).not.toMatch(/name_mismatch/);
+      // A thin space and a line separator, in the two other registry texts.
+      expect(
+        await refusal(passedCheck(companyId, control, { "--registry-status": "Active\u2009" })),
+      ).toMatch(/--registry-status holds a space other than a plain space/);
+      expect(
+        await refusal(
+          passedCheck(companyId, control, {
+            "--registered-agent": "Example Registered\u2028Agent Co",
+          }),
+        ),
+      ).toMatch(/--registered-agent holds a space other than a plain space/);
+      expect(checks.list(companyId)).toEqual([]);
+    });
+
     test("a control hash that matches no upload of the company", async () => {
       const { companyId } = await ownerCompany();
       const { control: rivalControl } = await rivalCompany();

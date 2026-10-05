@@ -62,6 +62,10 @@ const SHA256_TYPED = /^(?:0[xX])?([0-9a-fA-F]{64})$/;
 const MAX_REASON_CODE_POINTS = 300;
 /** Control, format and other invisible characters, as the check rows refuse them. */
 const OTHER_CHARACTER = /\p{C}/u;
+/** A space other than the plain one (a non-breaking space, a thin space, a line separator). The
+ *  check rows admit it, but the company-name key collapses plain spaces only, so a registry text
+ *  pasted with one would never match what it says. */
+const NON_PLAIN_SPACE = /(?! )\p{Z}/u;
 /** The kind an upload was made under, from its provider document id `upload:<kind>:<sha256>`. */
 const UPLOAD_KIND = /^upload:([a-z]+):/;
 
@@ -81,6 +85,12 @@ const PASSED_ONLY: OptionTable = [
 const FAILED_ONLY: OptionTable = [
   ["reasonCode", "--reason-code"],
   ["reason", "--reason"],
+];
+/** The registry texts a passed check copies from the registry, as [option key, flag]. */
+const REGISTRY_TEXTS: OptionTable = [
+  ["registryName", "--registry-name"],
+  ["registryStatus", "--registry-status"],
+  ["registeredAgent", "--registered-agent"],
 ];
 
 /**
@@ -444,6 +454,10 @@ function checkCompany(companyId: string, opts: CheckOptions): void {
   const registryFilingId = opts.registryFilingId as string;
   if (!FILING_NUMBER.test(registryFilingId))
     refuse("--registry-filing-id must be 4 to 32 characters of A-Z, a-z, 0-9 and hyphens");
+  // Refused as a typing problem, never answered as a name that does not match.
+  for (const [key, flag] of REGISTRY_TEXTS)
+    if (NON_PLAIN_SPACE.test(opts[key] as string))
+      refuse(`${flag} holds a space other than a plain space: retype it`);
   const controlSha256 = parseSha256("--control-evidence", opts.controlEvidence as string);
   const row: NewCompanyCheck = {
     ...base,
