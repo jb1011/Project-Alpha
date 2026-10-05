@@ -7,7 +7,6 @@ import {
 } from "../adapters/arc/legalBodyChain";
 import { ContractRevertError } from "../adapters/arc/relay";
 import { assertRealHuman } from "../api/routes/worldId";
-import { ApiError } from "../errors";
 import { opsLog } from "../observability/opsLog";
 import { withKeyedLock } from "../payments/keyedMutex";
 import {
@@ -423,11 +422,14 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
  *    the order: the reservation is released at once (`lapsed`, `refused_before_send`), and the
  *    answer is `refused` with the code `checkLink` gives the same error. The order is over: the
  *    customer starts a new one;
- *  - a create cap: 429 `legal_body_attempts` (the tenant's) or 503 `busy` (the deployment's); the
- *    order stays `reserved`, and the resolver waits for room;
- *  - anything else (a platform fault, the fee cap, a revert with no name, a chain that could not
- *    answer): 503 `chain_unavailable`, after one line naming the order and the error's NAME. The
- *    order stays `reserved` with no submission; the resolver retries while the link allows.
+ *  - anything else (a create cap, a platform fault, the fee cap, a revert with no name, a chain
+ *    that could not answer): one line naming the order and the error's NAME, and the answer
+ *    `reserved`. The order stays `reserved` with no submission, on its resolve schedule, and the
+ *    resolver submits the create while the link allows.
+ *
+ * NEVER A 503 OR A 429 AFTER THE RESERVE. Those answers say that nothing changed; here the order
+ * was reserved and holds the identity, and a client told otherwise would ask for a new link and
+ * meet the order it already has. Every outcome that leaves the order `reserved` answers so.
  *
  * A create that was recorded, sent or perhaps sent, is read at most `DOOR_RECEIPT_READS` times,
  * `DOOR_RECEIPT_INTERVAL_MS` apart, each read through `chainCall`:
@@ -508,23 +510,19 @@ function submissionThrew(
   blockTime: number,
   err: unknown,
 ): LinkSubmitResult {
-  if (err instanceof ApiError) throw err;
-  if (err instanceof CreateCapError) {
-    if (err.kind === "tenant") throw refusal("legal_body_attempts", 429);
-    if (err.kind === "deployment") throw refusal("busy", 503);
-    // The order's own cap: it holds submissions already, and the resolver settles them.
-    return currentAnswer(deps, orderId);
-  }
   const errorName = err instanceof Error ? err.name : "not_an_error";
   const refused = createRefusalOf(err);
   if (refused === undefined) {
-    opsLog("legal_body_chain_unavailable", {
+    // Not a refusal of the link. The order stays reserved, and the resolver submits the create
+    // when it can: within its first interval after the reserve, or once a cap has room.
+    opsLog("legal_body_create_deferred", {
       level: "warn",
       orderId,
       stage: "submit_create",
       errorName,
+      ...(err instanceof CreateCapError ? { cap: err.kind } : {}),
     });
-    throw refusal("chain_unavailable", 503);
+    return currentAnswer(deps, orderId);
   }
   // The refusal ends the order only when nothing of it can still be mined: no submission is
   // recorded. Otherwise the order stays reserved, and the resolver settles what was sent.
@@ -570,8 +568,11 @@ function createRefusalOf(
 
 /**
  * The order as it is now, as the door's answer. A `lapsed` order is `refused`, with the refusal
- * given or else `order_lapsed`. A reserved row moves only to `deployed` or `lapsed`; any state
- * the door cannot answer is a 409 `order_closed`.
+ * given or else `order_lapsed`. A reserved row moves only to `deployed` or `lapsed`, and a
+ * deployed one only on from there: `broken` and `superseded` follow a creation, so they answer
+ * `deployed`, with the view carrying the state as it is. Never a refusal that says nothing
+ * changed: this order was reserved. A `draft` or `abandoned` row cannot follow a reserve, and
+ * throws.
  */
 function currentAnswer(
   deps: LegalBodyOrderDeps,
@@ -586,6 +587,9 @@ function currentAnswer(
     case "deployed":
     case "linked":
       return { status: row.bindingState, order };
+    case "broken":
+    case "superseded":
+      return { status: "deployed", order };
     case "lapsed":
       return {
         status: "refused",
@@ -594,7 +598,7 @@ function currentAnswer(
         detail: refused?.detail ?? {},
       };
     default:
-      throw refusal("order_closed", 409);
+      throw new Error(`legal body ${orderId} is ${row.bindingState} after its reserve`);
   }
 }
 

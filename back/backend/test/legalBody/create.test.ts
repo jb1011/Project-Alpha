@@ -24,7 +24,6 @@ import {
 } from "../../src/adapters/arc/legalBodyChain";
 import { ContractRevertError } from "../../src/adapters/arc/relay";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
-import { ApiError } from "../../src/errors";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import {
   CreateCapError,
@@ -231,25 +230,6 @@ function createdAs(txHash: Hex, bodyAddress: Address): CreateOutcome {
 /** The factory's refusal of a create, as the relayed create's simulation reports it. */
 const revert = (errorName: string | undefined) =>
   new ContractRevertError(`createLegalBody reverted: ${errorName ?? "unknown"}`, errorName);
-
-async function refusedAsync(
-  run: () => Promise<unknown>,
-  code: string,
-  status: number,
-): Promise<ApiError> {
-  let caught: unknown;
-  try {
-    await run();
-  } catch (e) {
-    caught = e;
-  }
-  expect(caught, `expected the refusal ${code}`).toBeInstanceOf(ApiError);
-  const err = caught as ApiError;
-  expect(err.code).toBe(code);
-  expect(err.status).toBe(status);
-  expect(err.message).toBe(LEGAL_BODY_SENTENCES[code]);
-  return err;
-}
 
 const opsLines = () =>
   lines.flatMap((line) => {
@@ -539,7 +519,7 @@ describe("a refusal of the create before anything was sent", () => {
 });
 
 describe("a fault after the reserve", () => {
-  test("a platform fault, the fee cap, a transport error, a revert with no name and any other throw are 503s: the order stays reserved, on its schedule, with no submission", async () => {
+  test("a platform fault, the fee cap, a transport error, a revert with no name and any other throw answer reserved, never a 503: the order stays reserved, on its schedule, with no submission", async () => {
     const cases: [string, Error][] = [
       ["a platform fault", new LegalBodyChainFaultError("NotAuthorized")],
       [
@@ -555,10 +535,11 @@ describe("a fault after the reserve", () => {
       chain.submitCreate.mockRejectedValueOnce(error);
       lines.length = 0;
 
-      const err = await refusedAsync(() => submitFor(row), "chain_unavailable", 503);
+      const result = await submitFor(row);
 
-      expect(JSON.stringify(err), what).not.toContain("http");
       const after = rowOf(row.legalBodyId);
+      expect(result, what).toEqual({ status: "reserved", order: toOrderView(after) });
+      expect(JSON.stringify(result), what).not.toContain("http");
       expect(after.bindingState, what).toBe("reserved");
       expect(after.nextBindingCheckAt, what).toBe(startedAt);
       expect(after.bindingCheckIntervalMs, what).toBe(30_000);
@@ -566,8 +547,9 @@ describe("a fault after the reserve", () => {
       expect(lines.join("\n"), what).not.toContain("http");
       expect(opsLines(), what).toEqual([
         expect.objectContaining({
-          opslog: "legal_body_chain_unavailable",
+          opslog: "legal_body_create_deferred",
           orderId: row.legalBodyId,
+          stage: "submit_create",
           errorName: error.name,
         }),
       ]);
@@ -645,23 +627,31 @@ describe("submitCreateFor", () => {
 });
 
 describe("createAfterReserve: a cap reached at the create", () => {
-  test("the tenant's cap is a 429 legal_body_attempts and the deployment's a 503 busy; the order stays reserved, and the chain is not called", async () => {
+  test("each cap answers reserved, never a 429 or a 503: the order stays reserved on its schedule, and the chain is not called", async () => {
     const earlier = reservedOrder();
-    recordSubmissions(earlier.legalBodyId, 1);
-    const cases: [string, number, Partial<LegalBodyOrderDeps>][] = [
-      ["legal_body_attempts", 429, { maxCreatesPerTenantPerDay: 1 }],
-      ["busy", 503, { maxCreatesPerDay: 1 }],
+    recordSubmissions(earlier.legalBodyId, MAX_CREATE_SUBMISSIONS_PER_ORDER);
+    const cases: [CreateCapError["kind"], LegalBodyRecord, Partial<LegalBodyOrderDeps>][] = [
+      ["order", earlier, {}],
+      ["tenant", reservedOrder(), { maxCreatesPerTenantPerDay: MAX_CREATE_SUBMISSIONS_PER_ORDER }],
+      ["deployment", reservedOrder(), { maxCreatesPerDay: MAX_CREATE_SUBMISSIONS_PER_ORDER }],
     ];
-    for (const [code, status, over] of cases) {
-      const row = reservedOrder();
-      await refusedAsync(
-        () => createAfterReserve(deps(over), row, Number(LINK_HEAD.timestamp)),
-        code,
-        status,
-      );
+    for (const [cap, row, over] of cases) {
+      lines.length = 0;
+
+      const result = await createAfterReserve(deps(over), row, Number(LINK_HEAD.timestamp));
+
       const after = rowOf(row.legalBodyId);
-      expect(after.bindingState, code).toBe("reserved");
-      expect(after.nextBindingCheckAt, code).toBe(startedAt);
+      expect(result, cap).toEqual({ status: "reserved", order: toOrderView(after) });
+      expect(after.bindingState, cap).toBe("reserved");
+      expect(after.nextBindingCheckAt, cap).toBe(startedAt);
+      expect(opsLines(), cap).toEqual([
+        expect.objectContaining({
+          opslog: "legal_body_create_deferred",
+          orderId: row.legalBodyId,
+          errorName: "CreateCapError",
+          cap,
+        }),
+      ]);
     }
     expect(chain.submitCreate).not.toHaveBeenCalled();
     expect(chain.createOutcome).not.toHaveBeenCalled();
@@ -782,28 +772,35 @@ describe("the link door on REST, with the create", () => {
     expect(res.body.order.state).toBe("lapsed");
   });
 
-  test("a fault after the reserve is a 503 chain_unavailable with no http, and the order stays reserved", async () => {
+  test("a fault from the submission after the reserve answers 202 with the order reserved, and the body holds no http", async () => {
     const app = makeApp(deps());
-    const row = draft();
-    chain.submitCreate.mockRejectedValueOnce(new TransportFailure());
+    const token = await sessionOf(ANVIL_ACCOUNT_2);
+    const faults: [string, Error][] = [
+      ["a transport error carrying a URL", new TransportFailure()],
+      ["a platform fault", new LegalBodyChainFaultError("NotAuthorized")],
+    ];
+    for (const [what, fault] of faults) {
+      const row = draft();
+      chain.submitCreate.mockRejectedValueOnce(fault);
+      lines.length = 0;
 
-    const res = await answerOf(
-      await call(
-        app,
-        "POST",
-        linkPath(row.legalBodyId),
-        await sessionOf(ANVIL_ACCOUNT_2),
-        await signedLink(linkFor(row)),
-      ),
-    );
+      const res = await answerOf(
+        await call(
+          app,
+          "POST",
+          linkPath(row.legalBodyId),
+          token,
+          await signedLink(linkFor(row, { agentId: BigInt(++agents) })),
+        ),
+      );
 
-    expect(res).toMatchObject({
-      status: 503,
-      body: {
-        error: { code: "chain_unavailable", message: LEGAL_BODY_SENTENCES.chain_unavailable },
-      },
-    });
-    expect(res.text).not.toContain("http");
-    expect(rowOf(row.legalBodyId).bindingState).toBe("reserved");
+      const after = rowOf(row.legalBodyId);
+      expect(res.status, what).toBe(202);
+      expect(res.body, what).toEqual(toOrderView(after));
+      expect(res.body.state, what).toBe("reserved");
+      expect(res.text, what).not.toContain("http");
+      expect(lines.join("\n"), what).not.toContain("http");
+      expect(s.repo.listDeploySubmissions(row.legalBodyId), what).toEqual([]);
+    }
   });
 });

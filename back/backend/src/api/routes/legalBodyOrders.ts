@@ -34,10 +34,10 @@ import { assertRealHuman } from "./worldId";
  *    message the identity's owner signs, and writes nothing;
  *  - `POST /legal-body-orders/:id/link` with `{ message, signature }` accepts the signed link and
  *    has the body created: 200 with the order once it is `deployed` or `linked`, 202 while it is
- *    `reserved` (the create is on its way, and is settled from the chain), 422 with
- *    `{ code, message, detail, order }` for a refusal of the link (before the reserve the draft is
- *    kept; after it the order is `lapsed`, and the message says so), 429 or 503 for a create cap,
- *    503 when the chain could not answer.
+ *    `reserved` (the create is on its way, or waits for the resolver after a fault or a cap, and
+ *    is settled from the chain), 422 with `{ code, message, detail, order }` for a refusal of the
+ *    link (before the reserve the draft is kept; after it the order is `lapsed`, and the message
+ *    says so). A 429 or a 503 comes only before the reserve, and means that nothing changed.
  *
  * Every rule lives in the domain (`legalBody/orders.ts`, `legalBody/linkDoor.ts`); these handlers
  * decide only what is a well-formed request. Every door starts with the real-human check (a
