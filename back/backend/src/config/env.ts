@@ -39,6 +39,22 @@ export const ARC_TESTNET_CHAIN_ID = 5042002;
  *  unset. Also the fallback for a config with no formation block. */
 export const DEFAULT_BYO_MAX_OPEN_PER_TENANT = 3;
 
+/** The legal-body flow's settings when unset: the amendment delay of every new legal body (48
+ *  hours, in seconds), then the caps on a tenant's open orders, its orders and its creates per 24
+ *  hours, and the deployment's creates per 24 hours. Also the fallback for a config with no
+ *  `legalBodyFlow` block. */
+export const LEGAL_BODY_FLOW_DEFAULTS = Object.freeze({
+  amendmentDelaySeconds: 172_800,
+  maxOpenPerTenant: 3,
+  maxOrdersPerTenantPerDay: 10,
+  maxCreatesPerTenantPerDay: 5,
+  maxCreatesPerDay: 100,
+});
+
+/** The amendment delays the legal-body factory accepts, in seconds: 48 hours to 30 days. */
+const LEGAL_BODY_AMENDMENT_DELAY_MIN_SECONDS = 172_800;
+const LEGAL_BODY_AMENDMENT_DELAY_MAX_SECONDS = 2_592_000;
+
 /** A setting written with no value (`NAME=`, or only spaces) reads as unset, for the settings that
  *  opt in: a line uncommented without a value must not be read as zero and refuse boot. */
 const blankAsUnset = (v: unknown): unknown =>
@@ -390,6 +406,48 @@ const EnvSchema = z.object({
     blankAsUnset,
     z.coerce.number().int().positive().default(DEFAULT_BYO_MAX_OPEN_PER_TENANT),
   ),
+
+  // --- THE LEGAL-BODY FLOW: ordering a legal body and creating it on chain. Used only when
+  // LEGAL_BODY_FACTORY_ADDRESS is set, but checked at every boot: a blank value is unset, and any
+  // other value outside its range refuses boot, the feature on or off. Defaults:
+  // LEGAL_BODY_FLOW_DEFAULTS. ---
+  /** The amendment delay every new legal body is created with, in whole seconds, within the
+   *  factory's own bounds. */
+  LEGAL_BODY_AMENDMENT_DELAY_SECONDS: z.preprocess(
+    blankAsUnset,
+    z.coerce
+      .number()
+      .int()
+      .min(LEGAL_BODY_AMENDMENT_DELAY_MIN_SECONDS, {
+        message: "must be at least 172800 seconds (48 hours)",
+      })
+      .max(LEGAL_BODY_AMENDMENT_DELAY_MAX_SECONDS, {
+        message: "must be at most 2592000 seconds (30 days)",
+      })
+      .default(LEGAL_BODY_FLOW_DEFAULTS.amendmentDelaySeconds),
+  ),
+  /** How many open orders one tenant may hold at once: a draft for 24 hours after its creation,
+   *  an order waiting for its create, and a body created in the last 7 days and not yet linked. */
+  LEGAL_BODY_MAX_OPEN_PER_TENANT: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().default(LEGAL_BODY_FLOW_DEFAULTS.maxOpenPerTenant),
+  ),
+  /** How many orders one tenant may place in 24 hours, abandoned ones included. */
+  LEGAL_BODY_MAX_ORDERS_PER_TENANT_PER_DAY: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().default(LEGAL_BODY_FLOW_DEFAULTS.maxOrdersPerTenantPerDay),
+  ),
+  /** How many create transactions may be sent for one tenant's orders in 24 hours, reverted and
+   *  re-sent ones included. */
+  LEGAL_BODY_MAX_CREATES_PER_TENANT_PER_DAY: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().default(LEGAL_BODY_FLOW_DEFAULTS.maxCreatesPerTenantPerDay),
+  ),
+  /** How many create transactions the whole deployment may send in 24 hours. */
+  LEGAL_BODY_MAX_CREATES_PER_DAY: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().default(LEGAL_BODY_FLOW_DEFAULTS.maxCreatesPerDay),
+  ),
 });
 
 /** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
@@ -434,6 +492,17 @@ export interface Config {
   controllerAddress?: Address;
   /** LegalBodyFactory address; undefined = the legal-body feature is off. */
   legalBodyFactory?: Address;
+  /** The legal-body flow's settings (see LEGAL_BODY_FLOW_DEFAULTS). Optional in the TYPE only, for
+   *  the same reason as `monitor`: test fixtures build Config literals. loadConfig always sets it,
+   *  and a reader falls back to LEGAL_BODY_FLOW_DEFAULTS. */
+  legalBodyFlow?: {
+    /** Seconds. */
+    amendmentDelaySeconds: number;
+    maxOpenPerTenant: number;
+    maxOrdersPerTenantPerDay: number;
+    maxCreatesPerTenantPerDay: number;
+    maxCreatesPerDay: number;
+  };
   /** Explicit ENS apex target; absent => the platform signing key (today's behavior). */
   ensApexResolvesTo?: Address;
   guardianAddress?: Address;
@@ -788,6 +857,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     factoryAddress: e.FACTORY_ADDRESS,
     controllerAddress: e.CONTROLLER_ADDRESS,
     legalBodyFactory: e.LEGAL_BODY_FACTORY_ADDRESS,
+    legalBodyFlow: {
+      amendmentDelaySeconds: e.LEGAL_BODY_AMENDMENT_DELAY_SECONDS,
+      maxOpenPerTenant: e.LEGAL_BODY_MAX_OPEN_PER_TENANT,
+      maxOrdersPerTenantPerDay: e.LEGAL_BODY_MAX_ORDERS_PER_TENANT_PER_DAY,
+      maxCreatesPerTenantPerDay: e.LEGAL_BODY_MAX_CREATES_PER_TENANT_PER_DAY,
+      maxCreatesPerDay: e.LEGAL_BODY_MAX_CREATES_PER_DAY,
+    },
     ensApexResolvesTo: e.ENS_APEX_RESOLVES_TO,
     guardianAddress: e.GUARDIAN_ADDRESS,
     operatorPrivateKey: e.OPERATOR_PRIVATE_KEY,
