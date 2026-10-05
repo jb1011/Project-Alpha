@@ -294,9 +294,10 @@ test("event detail redacts every string, however deeply nested, and keys too", (
   for (const { detail } of raw) expect(() => JSON.parse(detail), detail).not.toThrow();
 });
 
-test("markLinked answers false, and records nothing, when another body holds the agentId live", () => {
-  // `broken` is not a live state, so a new body can reserve the agentId in the meantime; when the
-  // pointer then comes back to the old body, re-linking it would break the one-live-body index.
+test("markLinked links a broken body again while a new order for its agentId is on its way", () => {
+  // `broken` is in neither agentId index, so a new body can reserve the agentId in the meantime;
+  // when the pointer then comes back to the old body, one linked body and one order on its way
+  // may hold the agentId together.
   const old = toDeployed("42", BODY_A);
   expect(repo.markLinked(old, 1_800_000_100)).toBe(true);
   expect(repo.markBroken(old, { why: "pointer cleared" })).toBe(true);
@@ -304,15 +305,16 @@ test("markLinked answers false, and records nothing, when another body holds the
   repo.freezeAgreement(fresh.legalBodyId, { hash: H("a"), version: 1 });
   expect(repo.reserve(fresh.legalBodyId, link("42", BODY_B))).toBe("reserved");
   const eventsBefore = repo.listEvents(old);
-  expect(repo.markLinked(old, 1_800_000_200)).toBe(false);
-  expect(repo.findById(old)?.bindingState).toBe("broken");
-  expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_100);
-  expect(repo.listEvents(old)).toEqual(eventsBefore);
-  // Only that collision is an answer: any other refusal of the write still throws.
+  // A refusal of the write throws, and records nothing.
   db.exec(`CREATE TEMP TRIGGER refuse_every_update BEFORE UPDATE ON legal_bodies
     BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;`);
   expect(() => repo.markLinked(old, 1_800_000_200)).toThrow("refused by the test");
   expect(repo.listEvents(old)).toEqual(eventsBefore);
+  db.exec("DROP TRIGGER temp.refuse_every_update");
+  expect(repo.markLinked(old, 1_800_000_200)).toBe(true);
+  expect(repo.findById(old)?.bindingState).toBe("linked");
+  expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_200);
+  expect(repo.findById(fresh.legalBodyId)?.bindingState).toBe("reserved");
 });
 
 test("a deploy re-sent while reserved keeps every submission; the landed hash is then locked", () => {
@@ -648,19 +650,16 @@ test("a superseded body can be linked again: the chain, not this table, decides 
   expect(repo.listEvents(old).at(-1)?.detail).toEqual({ seenAt: 1_800_000_200 });
 });
 
-test("a superseded body is not linked again while another body holds its agentId live", () => {
+test("a superseded body is linked again while its replacement is still on its way", () => {
   const old = toDeployed("42", BODY_A);
   const replacement = newBody();
   repo.freezeAgreement(replacement.legalBodyId, { hash: H("a"), version: 1 });
   expect(repo.supersede(old, replacement.legalBodyId)).toBe(true);
   expect(repo.reserve(replacement.legalBodyId, link("42", BODY_B))).toBe("reserved");
-  const before = { row: repo.findById(old), events: repo.listEvents(old) };
-  expect(repo.markLinked(old, 1_800_000_200)).toBe(false);
-  expect(repo.findById(old)).toEqual(before.row);
-  expect(repo.listEvents(old)).toEqual(before.events);
-  // Once the replacement gives the agentId up, the old body can follow the chain again.
-  expect(repo.lapse(replacement.legalBodyId, "deadline passed")).toBe(true);
-  expect(repo.markLinked(old, 1_800_000_300)).toBe(true);
+  // An order on its way does not stop the old body from following the chain.
+  expect(repo.markLinked(old, 1_800_000_200)).toBe(true);
+  expect(repo.findById(old)?.bindingState).toBe("linked");
+  expect(repo.findById(replacement.legalBodyId)?.bindingState).toBe("reserved");
 });
 
 // ── The check schedule ──
@@ -1111,9 +1110,6 @@ test("every lookup the repository runs on a hot path is answered through an inde
   };
   expect(planOf("lower(body_address)", { chain_id: 5042002, address: BODY_A })).toContain(
     "USING INDEX idx_legal_bodies_body",
-  );
-  expect(planOf("agent_id = ?", [5042002, "42"])).toContain(
-    "USING INDEX idx_legal_bodies_live_agent",
   );
   expect(planOf("next_binding_check_at <= ?", [1, 1])).toContain(
     "USING INDEX idx_legal_bodies_binding_due",

@@ -30,6 +30,7 @@ afterEach(() => {
  */
 const DDL_SHA256_BY_VERSION: Record<number, string> = {
   1: "56e84256a0c0d9992d087f1406adf36f4fae9244674e559ed46d3b28dc8237b4",
+  2: "108e8ca9a3f40a8aa793ed90c30085750aaad1a92c9627914cab1f93dcac114a",
 };
 
 test("the DDL text is pinned to its schema version", () => {
@@ -307,7 +308,10 @@ test("a schema that differs at the SAME version is refused, naming what differs"
     db.exec(OLDER_INDEX);
     const before = { objects: objectsOf(db), rows: rowsOf(db) };
     expect(() => migrate(db)).toThrow(
-      /legal-body schema differs from its definition at version 1.*idx_legal_bodies_tenant, trg_legal_bodies_transitions/s,
+      new RegExp(
+        `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}.*idx_legal_bodies_tenant, trg_legal_bodies_transitions`,
+        "s",
+      ),
     );
     expect({ objects: objectsOf(db), rows: rowsOf(db) }).toEqual(before);
     expect(storedVersion(db)).toBe(String(LEGAL_BODIES_SCHEMA_VERSION));
@@ -459,6 +463,39 @@ test("a column added to legal_bodies by ALTER TABLE, with a row present, reads b
   });
 });
 
+test("a column added to legal_body_events by ALTER TABLE, with a row present, reads back as the DDL with that column declared last", () => {
+  const db = migrated();
+  addBody(db);
+  const rows = rowsOf(db);
+  db.exec("ALTER TABLE legal_body_events ADD COLUMN note TEXT");
+  // The table has no table constraint, so SQLite writes the column just before the closing
+  // bracket, after the line break that preceded it: the stored text is laid out unlike the DDL's.
+  const stored = sqlOf(objectsOf(db), "legal_body_events");
+  expect(stored).toContain("CURRENT_TIMESTAMP\n  , note TEXT)");
+
+  // The DDL with the same column declared last.
+  const lastColumn = "    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\n  );";
+  expect(LEGAL_BODIES_DDL.split(lastColumn)).toHaveLength(2);
+  const scratch = new Database(":memory:");
+  scratch.exec(
+    LEGAL_BODIES_DDL.replace(
+      lastColumn,
+      "    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    note TEXT\n  );",
+    ),
+  );
+  const defined = sqlOf(objectsOf(scratch), "legal_body_events");
+  scratch.close();
+  expect(defined).toContain("CURRENT_TIMESTAMP,\n    note TEXT\n  )");
+
+  // Normalised as the schema step normalises a table, the two definitions are the same.
+  expect(normalizeSchemaSql(stored)).toBe(normalizeSchemaSql(defined));
+  // The rows are still there, with the new column empty.
+  expect(rowsOf(db)).toEqual({
+    bodies: rows.bodies,
+    events: rows.events.map((event) => ({ ...(event as object), note: null })),
+  });
+});
+
 test("a trigger dropped by hand at the same version is created again: the row is kept, and the operations log names it", () => {
   for (const withRows of [true, false]) {
     const db = migrated();
@@ -553,14 +590,17 @@ test("a table or an index is compared without its layout and its identifier quot
   );
   expect(opsLinesOf(() => migrate(db))).toEqual([]);
   // ...and one whose text differs inside a string is not.
-  db.exec(`DROP INDEX idx_legal_bodies_live_agent;
-    CREATE UNIQUE INDEX idx_legal_bodies_live_agent
-      ON legal_bodies(chain_id, agent_id) WHERE binding_state IN ('reserved','deployed','"linked"');`);
-  expect(() => migrate(db)).toThrow(/differs from its definition.*idx_legal_bodies_live_agent/s);
+  db.exec(`DROP INDEX idx_legal_bodies_inflight_agent;
+    CREATE UNIQUE INDEX idx_legal_bodies_inflight_agent
+      ON legal_bodies(chain_id, factory, agent_id) WHERE binding_state IN ('reserved','"deployed"');`);
+  expect(() => migrate(db)).toThrow(
+    /differs from its definition.*idx_legal_bodies_inflight_agent/s,
+  );
 
-  // The comparison itself. Runs of whitespace become one space; the ends are trimmed.
+  // The comparison itself. Runs of whitespace become one space, whitespace beside a bracket or a
+  // comma goes, and the ends are trimmed.
   expect(normalizeSchemaSql("  CREATE TABLE t (\n    a TEXT,\r\n\tb  INTEGER\n  )\n")).toBe(
-    "CREATE TABLE t ( a TEXT, b INTEGER )",
+    "CREATE TABLE t(a TEXT,b INTEGER)",
   );
   // The three ways to quote an identifier read as the bare name.
   for (const quoted of ['"legal_bodies"', "[legal_bodies]", "`legal_bodies`"])
@@ -575,10 +615,10 @@ test("a table or an index is compared without its layout and its identifier quot
     );
   // A string is data: its spacing, and any quote or bracket inside it, is kept as written.
   for (const text of [
-    "CHECK (a NOT GLOB '*[^0-9a-f]*')",
-    "CHECK (a != 'two  spaces')",
-    "CHECK (a != 'it''s \"quoted\" and `ticked`')",
-    "CHECK (a != '')",
+    "CHECK(a NOT GLOB '*[^0-9a-f]*')",
+    "CHECK(a != 'two  spaces')",
+    "CHECK(a != 'it''s \"quoted\" and `ticked`')",
+    "CHECK(a != '')",
   ])
     expect(normalizeSchemaSql(text), text).toBe(text);
   expect(normalizeSchemaSql("CHECK (a != 'x  y')")).not.toBe(
@@ -586,7 +626,7 @@ test("a table or an index is compared without its layout and its identifier quot
   );
   // So is a comment, which may hold a quote of its own.
   expect(normalizeSchemaSql("a TEXT, -- the owner's  name\n   b TEXT /* [sic]  */  )")).toBe(
-    "a TEXT, -- the owner's  name\nb TEXT /* [sic]  */ )",
+    "a TEXT,-- the owner's  name\nb TEXT /* [sic]  */)",
   );
   // Anything else that differs still differs.
   for (const [one, other] of [
@@ -596,6 +636,55 @@ test("a table or an index is compared without its layout and its identifier quot
     ["REFERENCES companies(company_id)", 'REFERENCES "companies_old"(company_id)'],
   ] as const)
     expect(normalizeSchemaSql(one), one).not.toBe(normalizeSchemaSql(other));
+});
+
+test("whitespace beside a bracket or a comma is not compared, unless it is inside a string; a real difference still is", () => {
+  // One definition, spaced in different ways around its brackets and commas, reads the same.
+  for (const [one, other] of [
+    ["a , b", "a, b"],
+    ["a , b", "a,b"],
+    ["( x )", "(x)"],
+    ["CREATE TABLE t ( a TEXT , b INTEGER )", "CREATE TABLE t(a TEXT,b INTEGER)"],
+    ["CHECK (a IN ('x', 'y'))", "CHECK(a IN('x','y'))"],
+    // Where SQLite writes an added column, and where a DDL laid out like this one declares it.
+    ["DEFAULT CURRENT_TIMESTAMP\n  , note TEXT)", "DEFAULT CURRENT_TIMESTAMP,\n    note TEXT\n  )"],
+  ] as const)
+    expect(normalizeSchemaSql(one), one).toBe(normalizeSchemaSql(other));
+  // Words stay apart: the space between two of them is still one space.
+  expect(normalizeSchemaSql("a TEXT , b")).toBe("a TEXT,b");
+  // Inside a string, the spacing beside a bracket or a comma is data, and is kept.
+  for (const [one, other] of [
+    ["CHECK (a != 'x , y')", "CHECK (a != 'x, y')"],
+    ["CHECK (a != '( x )')", "CHECK (a != '(x)')"],
+  ] as const)
+    expect(normalizeSchemaSql(one), one).not.toBe(normalizeSchemaSql(other));
+  // A changed CHECK and a missing column are still differences.
+  for (const [one, other] of [
+    [
+      "CREATE TABLE t (a INTEGER CHECK (length(a) >= 2), b TEXT)",
+      "CREATE TABLE t (a INTEGER CHECK (length(a) >= 4), b TEXT)",
+    ],
+    ["CREATE TABLE t (a INTEGER, b TEXT)", "CREATE TABLE t (a INTEGER)"],
+  ] as const)
+    expect(normalizeSchemaSql(one), one).not.toBe(normalizeSchemaSql(other));
+
+  // Through the step, with a row present at the same version: an index spaced that way is the
+  // same index, and nothing is reported...
+  const db = migrated();
+  addBody(db);
+  db.exec(`DROP INDEX idx_legal_bodies_tenant;
+    CREATE INDEX idx_legal_bodies_tenant ON legal_bodies ( tenant_id , created_at DESC );`);
+  expect(sqlOf(objectsOf(db), "idx_legal_bodies_tenant")).not.toBe(
+    sqlOf(definedByTheCode(), "idx_legal_bodies_tenant"),
+  );
+  expect(opsLinesOf(() => migrate(db))).toEqual([]);
+  // ...while a table that lost a column is refused, and named.
+  db.exec("ALTER TABLE legal_body_events DROP COLUMN detail;");
+  const before = { objects: objectsOf(db), rows: rowsOf(db) };
+  expect(() => migrate(db)).toThrow(
+    `legal-body schema differs from its definition at version ${LEGAL_BODIES_SCHEMA_VERSION}: legal_body_events.`,
+  );
+  expect({ objects: objectsOf(db), rows: rowsOf(db) }).toEqual(before);
 });
 
 test("a stored version that is not a whole number is refused rather than guessed at", () => {

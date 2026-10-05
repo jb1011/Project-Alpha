@@ -216,15 +216,16 @@ const sqlIsSeconds = (column: string) =>
  *  - A legal body id is `lb_` and 36 characters, a public id 36 characters, both TEXT with no
  *    hidden bytes.
  *  - An agentId has one spelling: TEXT with no hidden bytes, decimal digits only, no leading zero
- *    except '0' itself, at most 78 digits (the width of a uint256). The one-live-body index
- *    compares full bytes and storage class, so '042', a BLOB '42' or '42' followed by a NUL would
- *    otherwise each be a second live body for agent 42.
+ *    except '0' itself, at most 78 digits (the width of a uint256). The agentId indexes compare
+ *    full bytes and storage class, so '042', a BLOB '42' or '42' followed by a NUL would otherwise
+ *    each be a second order, or a second linked body, for agent 42.
  *  - An address (the tenant, the factory, the identity owner, the body) is TEXT with no hidden
  *    bytes: `0x`, then exactly 40 hex digits. A body address is never the zero address, nor the
  *    row's own factory, in any casing.
  *  - A hash (the agreement hash, the link digest, the deploy transaction hash) is `0x` and 64
  *    LOWER-CASE hex digits, so a stored hash has one spelling and compares as text. The link
- *    signature is `0x` and one or more whole bytes of lower-case hex.
+ *    signature is `0x` and zero or more whole bytes of lower-case hex: it may be empty, `0x`, since
+ *    a contract owner can approve the link digest on chain and sign nothing.
  *  - The agreement hash and its version are set together or not at all, and the version is at
  *    least 1.
  *  - Every time column has one unit:
@@ -262,9 +263,12 @@ const sqlIsSeconds = (column: string) =>
  *  - `superseded` is not final: the chain decides which body an identity's owner names, and a
  *    body that was set aside can be named again, so `superseded` may return to `linked`. The
  *    final states are `lapsed` and `abandoned`.
- *  - At most one LIVE body (reserved, deployed or linked) per agentId per chain (a partial unique
- *    index), and at most one row per body address per chain, whatever its casing (a unique index
- *    on its lower-case form).
+ *  - Per chain, factory and agentId: at most one order on its way (`reserved` or `deployed`), and
+ *    at most one `linked` body (two partial unique indexes). So a replacement can be ordered while
+ *    a body is linked, and a row under an old factory never blocks the identity under a new one.
+ *    There is no state for a dissolved body: it reads `broken`, with the reason in its event.
+ *  - At most one row per body address per chain, whatever its casing (a unique index on its
+ *    lower-case form).
  *  - A rowid is positive (a CHECK). The insert guard relies on it: for an automatic rowid SQLite
  *    shows a BEFORE INSERT trigger a placeholder (-1), which must never match a stored row.
  *  - No DELETE removes a legal body (a trigger), and the event log's foreign key holds in place
@@ -314,7 +318,7 @@ export const LEGAL_BODIES_DDL = `
     link_deadline INTEGER CHECK (link_deadline IS NULL OR (${sqlIsSeconds("link_deadline")})),
     link_signature TEXT CHECK (link_signature IS NULL OR (typeof(link_signature) = 'text'
       AND length(CAST(link_signature AS BLOB)) = length(link_signature)
-      AND length(link_signature) >= 4 AND length(link_signature) % 2 = 0
+      AND length(link_signature) >= 2 AND length(link_signature) % 2 = 0
       AND substr(link_signature, 1, 2) = '0x' AND substr(link_signature, 3) NOT GLOB '*[^0-9a-f]*')),
     body_address TEXT CHECK (body_address IS NULL OR (${sqlIsAddress("body_address")})),
     create_tx_hash TEXT CHECK (create_tx_hash IS NULL OR (${sqlIsHash("create_tx_hash")})),
@@ -350,8 +354,10 @@ export const LEGAL_BODIES_DDL = `
     CHECK (binding_state != 'linked' OR pointer_seen_at IS NOT NULL),
     CHECK (pointer_seen_at IS NULL OR binding_state IN ('linked','broken','superseded'))
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_live_agent
-    ON legal_bodies(chain_id, agent_id) WHERE binding_state IN ('reserved','deployed','linked');
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_inflight_agent
+    ON legal_bodies(chain_id, factory, agent_id) WHERE binding_state IN ('reserved','deployed');
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_linked_agent
+    ON legal_bodies(chain_id, factory, agent_id) WHERE binding_state = 'linked';
   CREATE UNIQUE INDEX IF NOT EXISTS idx_legal_bodies_body
     ON legal_bodies(chain_id, lower(body_address)) WHERE body_address IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_legal_bodies_tenant ON legal_bodies(tenant_id, created_at DESC);
@@ -478,34 +484,48 @@ export const LEGAL_BODIES_DDL = `
  *    again from the DDL.
  *  - A changed trigger needs nothing but that bump, rows or not: triggers hold no data and are
  *    created again from the DDL.
- *  - Once a row exists, a changed TABLE or INDEX is made by a written migration, run by `migrate`
- *    before `applyLegalBodySchema`. The step checks the result: the definitions must match the
- *    DDL's once normalised, and until they do it refuses to start. By change:
+ *  - Once a row exists, a changed TABLE or INDEX needs a written migration. There is no hook for
+ *    one yet. It goes inside `applyLegalBodySchema`, in the step's own immediate transaction: an
+ *    upgrade with rows present becomes a plan that writes, and that transaction runs the migration
+ *    from the stored version, then compares again. So the migration holds the write lock, and it
+ *    commits together with the new version or not at all. The step checks its result: the
+ *    definitions must match the DDL's once normalised, and until they do it refuses to start. That
+ *    refusal must be thrown INSIDE the transaction, so that it rolls the migration back; a plan
+ *    that refuses is thrown today only after its transaction has ended, which is right only while
+ *    that transaction has written nothing. By change:
  *      - A new nullable column: one `ALTER TABLE ... ADD COLUMN`. The DDL declares the column LAST
  *        among the columns, before the table constraints, writes its CHECK on the column (such a
  *        CHECK may name other columns), and words it as the ALTER statement does, line breaks and
- *        indentation aside. SQLite stores an added column right after the last column, so the
- *        stored text then matches the DDL's. This holds for `legal_bodies`. It does not yet hold
- *        for `legal_body_events`, which has no table constraint: once normalised, its stored text
- *        reads `CURRENT_TIMESTAMP , note TEXT)` where a DDL laid out like this one reads
- *        `CURRENT_TIMESTAMP, note TEXT )`, and the step refuses the difference. With a DDL laid
- *        out like this one, a new column there is a rebuild, until the comparison ignores the
- *        spacing beside commas and brackets.
+ *        indentation aside. SQLite stores an added column right after the last column, and the
+ *        comparison ignores whitespace beside brackets and commas (see `normalizeSchemaSql`), so
+ *        the stored text then matches the DDL's. This holds for both tables, `legal_body_events`
+ *        included, where SQLite writes the column on a line of its own, just before the closing
+ *        bracket.
  *      - A renamed column: one `ALTER TABLE ... RENAME COLUMN`.
  *      - An index: `DROP INDEX`, then `CREATE INDEX` as the DDL writes it.
  *      - A change to an existing column's definition, to a table-level CHECK or to the list of
- *        binding states: a REBUILD of the table from the DDL text (a new table with that body, the
- *        rows copied, the old table dropped, the new one renamed, its indexes created as the DDL
- *        writes them), with foreign keys off around it: `PRAGMA foreign_keys = OFF` before its
- *        transaction and `ON` after it, since the pragma does nothing inside a transaction. The
- *        step then creates again the triggers that went with the old table.
+ *        binding states: a REBUILD of the table. `PRAGMA foreign_keys` does nothing inside a
+ *        transaction, so foreign keys stay on, deferred to the commit by
+ *        `PRAGMA defer_foreign_keys = ON` (which ends with the transaction). The rows are copied
+ *        aside with their rowids; the table is dropped and created again UNDER ITS OWN NAME from
+ *        the DDL's CREATE TABLE statement alone (the DDL's insert trigger refuses a row that is not
+ *        born draft); the rows are copied back with their rowids; its indexes are created as the
+ *        DDL writes them. The step then creates again the triggers that went with the old table.
+ *        Under its own name, because each row copied back settles the deferred violations that its
+ *        events raised when the table was dropped; a new table renamed into place settles none of
+ *        them, and the commit fails.
  *  - A rebuild of `companies` reaches this schema too. SQLite rewrites the references to a table
  *    that is renamed, so renaming `companies` re-points the foreign key of `legal_bodies` and its
  *    company trigger at the new name. That migration must leave both naming `companies` again.
  *    While the foreign key names another table the step refuses to start, which is the intended
  *    signal; the trigger it creates again from the DDL, like any other.
+ *
+ * Version 2 (an empty signature fits; two agentId indexes that include the factory replace the one
+ * on live agentIds) has no written migration: nothing but tests created a legal-body row at version
+ * 1. Empty tables are created again; a version-1 database with a row is refused, naming what
+ * differs.
  */
-export const LEGAL_BODIES_SCHEMA_VERSION = 1;
+export const LEGAL_BODIES_SCHEMA_VERSION = 2;
 
 /** Where the version of the schema a database holds is stored, in the `meta` table. */
 const LEGAL_BODIES_SCHEMA_VERSION_KEY = "legal_bodies_schema_version";
@@ -554,20 +574,29 @@ function expectedLegalBodySchema(): SchemaObject[] {
 const PLAIN_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const IDENTIFIER_CHARACTER = /[A-Za-z0-9_]/;
 const WHITESPACE = /\s/;
+/** A bracket or a comma: SQL never needs whitespace beside one to read it. */
+const SPACING_FREE_PUNCTUATION = /[(),]/;
 
 /**
  * The stored text of a table or an index, without what may differ between two texts of the same
  * definition:
- *  - every run of whitespace becomes one space, and the ends are trimmed;
+ *  - whitespace beside a bracket or a comma goes: `a , b` reads `a,b`, and `( x )` reads `(x)`;
+ *  - every other run of whitespace becomes one space, and the ends are trimmed;
  *  - identifier quoting is removed, whichever of the three styles it uses (`"name"`, `[name]` or
  *    backticks). A name that is only a name inside its quotes keeps them, as `"name"`.
  *
  * SQLite itself rewrites a table's stored text when the table is renamed: it puts the name in
  * double quotes. So a table rebuilt from the same definition does not read back byte for byte.
+ * And it lays out a column added by `ALTER TABLE ... ADD COLUMN` its own way: on a table with no
+ * table constraint, the column goes just before the closing bracket, after the line break that
+ * preceded it (`CURRENT_TIMESTAMP\n  , note TEXT)`), where a DDL declares it after the comma
+ * (`CURRENT_TIMESTAMP,\n    note TEXT\n  )`). With the whitespace beside brackets and commas gone,
+ * the two read the same.
  *
  * A string and a comment are copied exactly as written. A string is data: `'a  b'` and `'a b'` are
- * two values, and a bracket or a quote inside one (`GLOB '*[^0-9]*'`) is not identifier quoting. A
- * comment may hold a quote of its own, which must not be read as the start of a string.
+ * two values, and so are `'a , b'` and `'a, b'`; a bracket or a quote inside one (`GLOB '*[^0-9]*'`)
+ * is not identifier quoting. A comment may hold a quote of its own, which must not be read as the
+ * start of a string.
  */
 export function normalizeSchemaSql(sql: string): string {
   let out = "";
@@ -618,7 +647,14 @@ export function normalizeSchemaSql(sql: string): string {
       i = Math.min(j + 1, sql.length);
     } else if (WHITESPACE.test(c)) {
       while (i < sql.length && WHITESPACE.test(sql.charAt(i))) i += 1;
-      out += " ";
+      // Beside a bracket or a comma the run goes entirely. The next character is read where the
+      // scan stands, outside any string, comment or quoted name. So was the last one written when
+      // it is a bracket or a comma: a string ends with its quote, a comment with `*/` or a line
+      // end, and a quoted name with a quote or a name character.
+      const besidePunctuation =
+        SPACING_FREE_PUNCTUATION.test(out.slice(-1)) ||
+        SPACING_FREE_PUNCTUATION.test(sql.charAt(i));
+      if (!besidePunctuation) out += " ";
     } else {
       out += c;
       i += 1;
@@ -759,8 +795,8 @@ function planLegalBodySchema(db: Database.Database, expected: SchemaObject[]): L
  *            `LEGAL_BODIES_SCHEMA_VERSION`, or the schema was changed by hand. It throws, naming
  *            everything that differs.
  *          - In an upgrade: it throws `legal-body schema needs a written migration: <names>`,
- *            until that migration is written (`LEGAL_BODIES_SCHEMA_VERSION` says what it must
- *            do).
+ *            until that migration is written (`LEGAL_BODIES_SCHEMA_VERSION` says what it must do,
+ *            and where it goes).
  *      - Only TRIGGERS differ. They are brought back to the DDL's: one that is missing or whose
  *        text differs is dropped and created again from the DDL, and one the DDL does not define
  *        is dropped. A trigger holds no data, so this loses nothing, and a difference in triggers
