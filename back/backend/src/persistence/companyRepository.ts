@@ -19,8 +19,8 @@ import type { CompanyNameOption } from "../formation/intake";
  *
  * `status` is only what the company itself owns: `draft` (intake taken, not yet payable/fileable),
  * `ready` (fileable), `abandoned` (terminal, and it has exactly three writers — draft expiry, the
- * max-attempt path, and the operator CLI — plus, for a customer's own declared company, its tenant:
- * `abandonCustomerCompany`).
+ * max-attempt path, and the operator CLI — plus, for a customer's own declared company, its tenant
+ * (`abandonCustomerCompany`) and the stale sweep (`expireStaleCustomerCompanies`)).
  */
 export type CompanyStatus = "draft" | "ready" | "abandoned";
 
@@ -138,6 +138,22 @@ export interface CompanyRepository {
    * `ready`. The cap on a tenant's open declarations reads it, so an abandoned one has left it.
    */
   countCustomerOpenByTenant(tenantId: string): number;
+  /**
+   * Customer companies that are stale, oldest first, at most `limit`: every condition of the rule
+   * but the open legal body, which the caller asks about itself. A company is stale when
+   *  - its provider is `customer` and its status `draft` or `ready`;
+   *  - it was created at or before `cutoffUtc`;
+   *  - it has no payment `quoted`, `settling`, `settled` or `refunded`;
+   *  - it has no check, or its latest check `failed` and was recorded before `cutoffUtc`;
+   *  - and no customer upload was made since its latest check (with no check, none at all).
+   * So a company with an upload no check has followed is waiting for the operator and is never
+   * stale, and neither is one whose latest check passed, revoked or reinstated it. Times are
+   * compared at one-second resolution, and a check recorded in the same second as an upload is not
+   * after it. `cutoffUtc` is the text the `created_at` columns hold (see `sqliteUtcTimestamp`).
+   */
+  listStaleCustomerCandidates(cutoffUtc: string, limit: number): CompanyRecord[];
+  /** The listing's rule, for one company: whether it is stale at `cutoffUtc`. */
+  isStaleCustomerCandidate(companyId: string, cutoffUtc: string): boolean;
   /** Live payment rows (`quoted`/`settling`) for one company. Zero until B1 writes any. */
   livePaymentCount(companyId: string): number;
   /**
@@ -202,8 +218,49 @@ export interface CompanyRepository {
   ): boolean;
 }
 
+/**
+ * The stale-customer rule (`listStaleCustomerCandidates`), as one WHERE clause over `companies c`
+ * taking `@cutoff`, so the listing and the one-company re-read cannot disagree. The latest check is
+ * the one with the highest id, as everywhere else that reads `company_checks`. With no check, the
+ * first subquery is NULL (stale so far) and the upload clause compares with '' (any upload keeps
+ * the company).
+ */
+const STALE_CUSTOMER_WHERE = `
+      c.provider = 'customer'
+  AND c.status IN ('draft','ready')
+  AND c.created_at <= @cutoff
+  AND NOT EXISTS (SELECT 1 FROM formation_payments p
+                   WHERE p.company_id = c.company_id
+                     AND p.status IN ('quoted','settling','settled','refunded'))
+  AND IFNULL((SELECT l.result = 'failed' AND l.created_at < @cutoff
+                FROM company_checks l
+               WHERE l.company_id = c.company_id
+               ORDER BY l.check_id DESC LIMIT 1), 1) = 1
+  AND NOT EXISTS (SELECT 1 FROM documents d
+                   WHERE d.company_id = c.company_id
+                     AND d.source = 'customer'
+                     AND d.created_at >= IFNULL((SELECT l.created_at FROM company_checks l
+                                                  WHERE l.company_id = c.company_id
+                                                  ORDER BY l.check_id DESC LIMIT 1), ''))`;
+
+/** What `CURRENT_TIMESTAMP` writes. An ISO instant (`2026-01-02T00:00:00Z`) sorts after every
+ *  stored time of its day, so a cutoff given in that form would take companies up to a day young. */
+const SQLITE_UTC_TEXT = /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/;
+
+function assertCutoff(cutoffUtc: string): void {
+  if (typeof cutoffUtc !== "string" || !SQLITE_UTC_TEXT.test(cutoffUtc))
+    throw new Error(
+      "companies: the cutoff is SQLite UTC text, YYYY-MM-DD HH:MM:SS (sqliteUtcTimestamp)",
+    );
+}
+
 export class SqliteCompanyRepository implements CompanyRepository {
   private readonly stmts;
+  /** The stale-customer statements, prepared on first use rather than here: they read
+   *  `company_checks`, which a database not yet migrated to hold the operator's checks lacks, and
+   *  an operator command that runs without the migration (`formation:abandon`) constructs this
+   *  repository too. */
+  private staleStmts?: { list: Database.Statement; one: Database.Statement };
 
   constructor(private readonly db: Database.Database) {
     this.stmts = {
@@ -345,6 +402,42 @@ export class SqliteCompanyRepository implements CompanyRepository {
 
   countCustomerOpenByTenant(tenantId: string): number {
     return (this.stmts.countCustomerOpen.get(tenantId) as { n: number }).n;
+  }
+
+  private stale(): { list: Database.Statement; one: Database.Statement } {
+    // 'customer' here too is CUSTOMER_PROVIDER.
+    this.staleStmts ??= {
+      list: this.db.prepare(
+        `SELECT c.* FROM companies c
+          WHERE ${STALE_CUSTOMER_WHERE}
+          ORDER BY c.created_at, c.company_id
+          LIMIT @limit`,
+      ),
+      one: this.db.prepare(
+        `SELECT EXISTS (SELECT 1 FROM companies c
+                         WHERE c.company_id = @company_id AND ${STALE_CUSTOMER_WHERE}) AS found`,
+      ),
+    };
+    return this.staleStmts;
+  }
+
+  listStaleCustomerCandidates(cutoffUtc: string, limit: number): CompanyRecord[] {
+    assertCutoff(cutoffUtc);
+    // Checked here because SQLite reads a negative LIMIT as no limit at all.
+    if (!Number.isSafeInteger(limit) || limit < 1)
+      throw new Error("companies: limit must be a positive whole number");
+    return (this.stale().list.all({ cutoff: cutoffUtc, limit }) as Row[]).map(toRecord);
+  }
+
+  isStaleCustomerCandidate(companyId: string, cutoffUtc: string): boolean {
+    assertCutoff(cutoffUtc);
+    return (
+      (
+        this.stale().one.get({ company_id: companyId, cutoff: cutoffUtc }) as {
+          found: number;
+        }
+      ).found === 1
+    );
   }
 
   livePaymentCount(companyId: string): number {

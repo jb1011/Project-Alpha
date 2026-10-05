@@ -505,3 +505,68 @@ export function abandonCustomerCompany(
       throw new Error(`company ${companyId}: its declaration could not be erased`);
   });
 }
+
+/** How long a customer company may wait with nothing for the operator to look at before it is
+ *  abandoned: 30 days from its creation, and from its latest check when that check failed. */
+export const STALE_CUSTOMER_SECONDS = 30 * 24 * 3600;
+
+/**
+ * Abandon stale customer companies. Returns how many.
+ *
+ * A company is stale when it is old, unpaid, and gives the operator nothing new to look at: the
+ * rule is the SQL of `listStaleCustomerCandidates`, plus no open legal body. The oldest come first,
+ * at most `limit` of them. For each, in one transaction: the rule and the legal body are read
+ * again, since the company may have changed since the listing (an upload, a check, a payment, its
+ * tenant's own abandonment); then the status moves to `abandoned` by compare-and-set from the one
+ * it has, and a company that changed or lost the compare-and-set is skipped. The declarant's
+ * personal fields are erased with it only when the company has no check at all: after a failed
+ * check, the declaration is the evidence of what was declared and checked, and it stays.
+ *
+ * A company whose transaction throws is left as it was and named in an ops line (its id only), and
+ * the others still run: one bad row must not hold back every later sweep.
+ *
+ * Nothing calls it on a schedule yet: a periodic sweep is to. It works the same on a deployment that
+ * does not charge, where a customer company is `ready` from its creation.
+ */
+export function expireStaleCustomerCompanies(
+  deps: {
+    companies: CompanyRepository;
+    declarations: CompanyDeclarationRepository;
+    checks: CompanyCheckRepository;
+    hasOpenLegalBody: (companyId: string) => boolean;
+    transaction: <T>(fn: () => T) => T;
+    now?: () => number;
+  },
+  limit: number,
+): number {
+  const nowMs = (deps.now ?? Date.now)();
+  const cutoff = sqliteUtcTimestamp(nowMs - STALE_CUSTOMER_SECONDS * 1000);
+  const atSeconds = Math.floor(nowMs / 1000);
+  let abandoned = 0;
+  for (const { companyId } of deps.companies.listStaleCustomerCandidates(cutoff, limit)) {
+    try {
+      const moved = deps.transaction((): boolean => {
+        if (!deps.companies.isStaleCustomerCandidate(companyId, cutoff)) return false;
+        if (deps.hasOpenLegalBody(companyId)) return false;
+        const company = deps.companies.find(companyId);
+        if (company === undefined) return false;
+        if (!deps.companies.setStatus(companyId, company.status, "abandoned")) return false;
+        // Thrown, so the status change rolls back with it: an abandoned company must not keep a
+        // declarant's personal data because its erasure failed.
+        if (
+          deps.checks.latest(companyId) === undefined &&
+          !deps.declarations.erasePii(companyId, atSeconds)
+        )
+          throw new Error(`company ${companyId}: its declaration could not be erased`);
+        return true;
+      });
+      if (moved) abandoned += 1;
+    } catch (err) {
+      opsLog("customer_company_expiry_failed", {
+        companyId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return abandoned;
+}
