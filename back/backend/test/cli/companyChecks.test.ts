@@ -747,6 +747,20 @@ describe("company:check --result passed", () => {
     expect(tenantVerification(rivalId)?.state).toBe("verified");
     expect(tenantVerification(companyId)?.state).toBe("revoked");
   });
+
+  test("a passed check may follow a revocation of the same company directly, with no reinstatement", async () => {
+    const { companyId, control } = await ownerCompany();
+    const revoked = await run<Recorded>(revokeCompany(companyId, "none"));
+    expect(tenantVerification(companyId)?.state).toBe("revoked");
+
+    const { output } = await run<Recorded>(
+      passedCheck(companyId, control, { "--expect-latest": String(revoked.output.check.checkId) }),
+    );
+
+    expect(output.check).toMatchObject({ companyId, result: "passed" });
+    expect(checks.list(companyId).map((c) => c.result)).toEqual(["revoked", "passed"]);
+    expect(tenantVerification(companyId)?.state).toBe("verified");
+  });
 });
 
 // ── --expect-latest ───────────────────────────────────────────────────────────────────────────
