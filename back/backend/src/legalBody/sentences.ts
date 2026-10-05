@@ -25,6 +25,10 @@ export const LEGAL_BODY_SENTENCES: Readonly<Record<string, string>> = Object.fre
   chain_unavailable:
     "The chain could not be read just now, and nothing was changed: try again in a moment.",
   rate_limited: "Too many requests: wait a few seconds and try again.",
+  payload_too_large: "The request body is too large: a legal-body door reads at most 8 KiB.",
+  agreement_unreadable:
+    "This order's stored agreement no longer reads back as the agreement it was frozen with, so it is not served.",
+  internal_error: "Something went wrong on our side: try again in a moment.",
 });
 
 /**
