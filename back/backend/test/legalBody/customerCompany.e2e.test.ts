@@ -619,6 +619,7 @@ test("production, charging: a declared company is uploaded, checked, paid, revok
   expect(
     expireEvidenceBytes({ documents: d.documents, docStore: d.docStore, now: () => later }, 100),
   ).toBe(0);
+  // Settled, so out of the stale sweep on that alone: the revocation's part is in the stale tests.
   expect(
     expireStaleCustomerCompanies(
       {
