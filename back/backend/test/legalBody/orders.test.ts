@@ -13,13 +13,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { Hono } from "hono";
-import { type Address, type Hex, getAddress, keccak256, toHex } from "viem";
+import type { Address, Hex } from "viem";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { LegalBodyChainPort } from "../../src/adapters/arc/legalBodyChain";
 import { apiOnError } from "../../src/api/errors";
 import { ApiError } from "../../src/errors";
 import { agreementDocNames, readVerifiedAgreement } from "../../src/legalBody/agreement";
-import { CUSTOMER_COMPANY_PLACEHOLDER } from "../../src/legalBody/customerCompany";
 import {
   type LegalBodyOrderDeps,
   abandonOrder,
@@ -31,19 +30,12 @@ import {
   takeDoorTokens,
   toOrderView,
 } from "../../src/legalBody/orders";
-import { CUSTOMER_PROVIDER } from "../../src/legalBody/provider";
 import { LEGAL_BODY_SENTENCES, refusal } from "../../src/legalBody/sentences";
 import { LEGAL_BODY_OPERATING_AGREEMENT } from "../../src/legalBody/texts/operatingAgreement";
 import { withKeyedLock } from "../../src/payments/keyedMutex";
-import {
-  type CompanyCheckResult,
-  SqliteCompanyCheckRepository,
-} from "../../src/persistence/companyCheckRepository";
-import { SqliteCompanyDeclarationRepository } from "../../src/persistence/companyDeclarationRepository";
-import { SqliteCompanyRepository } from "../../src/persistence/companyRepository";
+import type { CompanyCheckResult } from "../../src/persistence/companyCheckRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
-import { SqliteLegalBodyRepository } from "../../src/persistence/legalBodyRepository";
-import { SqliteWorldStore } from "../../src/persistence/worldStore";
+import type { SqliteLegalBodyRepository } from "../../src/persistence/legalBodyRepository";
 import {
   ANVIL_ACCOUNT_2,
   ANVIL_ACCOUNT_3,
@@ -52,9 +44,20 @@ import {
   FACTORY,
   FORMATION_PROVIDER,
   recordHuman,
-  worldFor,
 } from "../helpers/customerCompanyFixtures";
 import { MemoryDocumentStore } from "../helpers/formationFakes";
+import {
+  BODY,
+  DAY_MS,
+  H,
+  type LegalBodyStores,
+  OTHER_FACTORY,
+  REGISTRY,
+  TransportFailure,
+  customerCompany,
+  legalBodyOrderDeps,
+  openLegalBodyStores,
+} from "../helpers/legalBodyFixtures";
 
 /** Two verified humans, and one that never verified. */
 const tenant = ANVIL_ACCOUNT_2.address;
@@ -62,34 +65,9 @@ const otherTenant = ANVIL_ACCOUNT_3.address;
 const unverified = ANVIL_ACCOUNT_4.address;
 const NULLIFIERS: Record<string, string> = { [tenant]: "3001", [otherTenant]: "3002" };
 
-/** Placeholders: the identity registry the agreement names, and a factory of another deployment. */
-const REGISTRY = getAddress("0x0000000000000000000000000000000000008004");
-const OTHER_FACTORY = getAddress("0x00000000000000000000000000000000000fac71");
-const BODY = getAddress("0x00000000000000000000000000000000000b0d1e");
-const DAY_MS = 24 * 60 * 60 * 1000;
-const H = (c: string) => `0x${c.repeat(64)}` as Hex;
-
-interface Stack {
-  db: Database.Database;
-  companies: SqliteCompanyRepository;
-  declarations: SqliteCompanyDeclarationRepository;
-  checks: SqliteCompanyCheckRepository;
-  store: SqliteWorldStore;
-  repo: SqliteLegalBodyRepository;
-  docStore: MemoryDocumentStore;
-}
-
-function openStack(db: Database.Database, docStore = new MemoryDocumentStore()): Stack {
-  return {
-    db,
-    companies: new SqliteCompanyRepository(db),
-    declarations: new SqliteCompanyDeclarationRepository(db),
-    checks: new SqliteCompanyCheckRepository(db),
-    store: new SqliteWorldStore(db),
-    repo: new SqliteLegalBodyRepository(db),
-    docStore,
-  };
-}
+type Stack = LegalBodyStores;
+const openStack = (db: Database.Database, docStore?: MemoryDocumentStore): Stack =>
+  openLegalBodyStores(db, docStore);
 
 let s: Stack;
 beforeEach(() => {
@@ -107,75 +85,11 @@ afterEach(() => {
 /** The order deps of a sandbox deployment (the agreement's wording is a draft, which only a
  *  sandbox serves), with room in every throttle. The chain is never called here. */
 function orderDeps(over: Partial<LegalBodyOrderDeps> = {}, stack: Stack = s): LegalBodyOrderDeps {
-  return {
-    repo: stack.repo,
-    companies: stack.companies,
-    declarations: stack.declarations,
-    checks: stack.checks,
-    world: worldFor(stack.store),
-    chain: {} as LegalBodyChainPort,
-    docStore: stack.docStore,
-    deployment: { chainId: CHAIN_ID, factory: FACTORY },
-    identityRegistry: REGISTRY,
-    environment: "sandbox",
-    amendmentDelaySeconds: 172_800,
-    maxOpenPerTenant: 3,
-    maxOrdersPerTenantPerDay: 10,
-    maxCreatesPerTenantPerDay: 5,
-    maxCreatesPerDay: 100,
-    doorBudget: { take: () => true },
-    tenantBucket: () => ({ take: () => true }),
-    identityBucket: () => ({ take: () => true }),
-    transaction: (fn) => stack.repo.transaction(fn),
-    ...over,
-  };
+  return legalBodyOrderDeps(stack, { chain: {} as LegalBodyChainPort, ...over });
 }
 
-/** Appends a check with this result, as the operator records one. */
-function check(companyId: string, result: CompanyCheckResult, stack: Stack = s): void {
-  const common = {
-    companyId,
-    result,
-    operator: "ops.example",
-    operatorOsUser: "ops",
-    checkedAt: Math.floor(Date.now() / 1000),
-  };
-  stack.checks.append(
-    result === "passed"
-      ? {
-          ...common,
-          registryName: "Example Holdings LLC",
-          registryFilingId: "TEST-0001",
-          registryStatus: "Active",
-          formationDate: "2024-02-29",
-          registeredAgent: "Example Registered Agent LLC",
-          existenceEvidenceSha256: `0x${"e1".repeat(32)}`,
-          controlEvidenceSha256: `0x${"c1".repeat(32)}`,
-          controlEvidenceKind: "ein_letter",
-          reasonCode: null,
-          reason: null,
-        }
-      : {
-          ...common,
-          registryName: null,
-          registryFilingId: null,
-          registryStatus: null,
-          formationDate: null,
-          registeredAgent: null,
-          existenceEvidenceSha256: null,
-          controlEvidenceSha256: null,
-          controlEvidenceKind: null,
-          reasonCode: result === "failed" ? "filing_not_found" : null,
-          reason: "Recorded for a test.",
-        },
-  );
-}
-
-/**
- * A company of `owner`, with the checks given (one pass unless told otherwise). A customer company
- * carries its declaration, written straight to its table: the statement and its signature are
- * placeholders, since only the company's name and filing number are read here.
- */
+/** A company of `owner`, with the checks given (one pass unless told otherwise), declared by the
+ *  owner's own nullifier. */
 function company(
   owner: Address,
   opts: {
@@ -187,42 +101,7 @@ function company(
   } = {},
   stack: Stack = s,
 ): string {
-  const provider = opts.provider ?? CUSTOMER_PROVIDER;
-  const companyName = opts.companyName ?? "Example Holdings LLC";
-  const filingNumber = opts.filingNumber ?? "TEST-0001";
-  const companyId = stack.companies.create({
-    tenantId: owner,
-    status: opts.status ?? "ready",
-    provider,
-    environment: "sandbox",
-    synthetic: true,
-    nameOptions: [{ name: companyName, entityTypeEnding: "", position: 1 }],
-    businessPurpose: CUSTOMER_COMPANY_PLACEHOLDER,
-    industryLabel: CUSTOMER_COMPANY_PLACEHOLDER,
-    intakeSynthesized: false,
-  });
-  if (provider === CUSTOMER_PROVIDER)
-    stack.declarations.insert({
-      companyId,
-      tenantId: owner,
-      humanNullifier: NULLIFIERS[owner] ?? "3999",
-      declarantName: "Novi Sandbox Declarant",
-      declarantTitle: "Manager",
-      statementText: "An invented statement, written for a test.",
-      statementHash: keccak256(toHex(`statement:${companyId}`)),
-      statementDigest: keccak256(toHex(`digest:${companyId}`)),
-      signature: "0x01",
-      companyName,
-      jurisdiction: "WY",
-      filingNumber,
-      wordingVersion: "2026-10-draft-1",
-      chainId: CHAIN_ID,
-      factory: FACTORY,
-      issuedAt: Math.floor(Date.now() / 1000),
-      synthetic: true,
-    });
-  for (const result of opts.checks ?? ["passed"]) check(companyId, result, stack);
-  return companyId;
+  return customerCompany(stack, owner, { humanNullifier: NULLIFIERS[owner] ?? "3999", ...opts });
 }
 
 /** The refusal `run` threw, checked for its code, status and fixed sentence. */
@@ -726,15 +605,6 @@ describe("toOrderView", () => {
 });
 
 // ── chainCall ───────────────────────────────────────────────────────────────────────────────
-
-/** A transport failure as a node client throws one: a numeric status and the node's URL. */
-class TransportFailure extends Error {
-  readonly status = 429;
-  constructor() {
-    super("HTTP request failed. URL: https://rpc.example/v2/key-in-path Status: 429");
-    this.name = "HttpRequestError";
-  }
-}
 
 describe("chainCall", () => {
   let lines: string[];

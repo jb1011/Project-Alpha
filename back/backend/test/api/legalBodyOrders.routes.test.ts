@@ -11,18 +11,14 @@
  * published test accounts.
  */
 import type Database from "better-sqlite3";
-import { type Address, type Hex, getAddress, keccak256, toBytes, toHex } from "viem";
+import { type Address, type Hex, keccak256, toBytes } from "viem";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { LegalBodyChainPort } from "../../src/adapters/arc/legalBodyChain";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
 import { bucketsByKey } from "../../src/api/routes/legalBodyOrders";
-import { signSession } from "../../src/auth/session";
 import type { FormationPaymentConfig } from "../../src/formation/payment";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { agreementDocNames } from "../../src/legalBody/agreement";
-import { CUSTOMER_COMPANY_PLACEHOLDER } from "../../src/legalBody/customerCompany";
 import { type LegalBodyOrderDeps, toOrderView } from "../../src/legalBody/orders";
-import { CUSTOMER_PROVIDER } from "../../src/legalBody/provider";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { LEGAL_BODY_OPERATING_AGREEMENT } from "../../src/legalBody/texts/operatingAgreement";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
@@ -44,23 +40,27 @@ import {
   ANVIL_ACCOUNT_4,
   CHAIN_ID,
   FACTORY,
-  type Signer,
   recordHuman,
-  worldFor,
 } from "../helpers/customerCompanyFixtures";
 import { MemoryDocumentStore } from "../helpers/formationFakes";
 import { fakeChain, paymentCfg } from "../helpers/formationPayment";
+import {
+  BODY,
+  H,
+  JWT_SECRET,
+  TransportFailure,
+  answerOf,
+  call,
+  customerCompany,
+  legalBodyOrderDeps,
+  sessionOf,
+} from "../helpers/legalBodyFixtures";
 
 /** anvil's published accounts #2, #3 and #4: test keys, never real wallets. */
 const owner = ANVIL_ACCOUNT_2;
 const stranger = ANVIL_ACCOUNT_3;
 const waived = ANVIL_ACCOUNT_4;
 
-const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
-/** Placeholders: the identity registry the agreement names, and a body address. */
-const REGISTRY = getAddress("0x0000000000000000000000000000000000008004");
-const BODY = getAddress("0x00000000000000000000000000000000000b0d1e");
-const H = (c: string) => `0x${c.repeat(64)}` as Hex;
 /** An invented fee for a customer's company, in atomic USDC. */
 const CUSTOMER_FEE = 7_000_000n;
 /** What a customer's company is told while none of its legal bodies is linked. */
@@ -114,38 +114,14 @@ afterEach(() => {
   db.close();
 });
 
-/** A chain port every member of which throws: these doors never read the chain. */
-const noChain = new Proxy({} as LegalBodyChainPort, {
-  get: (_target, member) => {
-    throw new Error(`the chain was asked for ${String(member)}`);
-  },
-});
-
 /** The doors of a sandbox deployment (the agreement's wording is a draft, which only a sandbox
- *  serves), with room in every throttle. */
+ *  serves), with room in every throttle. Every member of the chain port throws: these doors never
+ *  read the chain. */
 function orderDeps(over: Partial<LegalBodyOrderDeps> = {}): LegalBodyOrderDeps {
-  return {
-    repo: legalBodies,
-    companies,
-    declarations,
-    checks,
-    world: worldFor(store),
-    chain: noChain,
-    docStore,
-    deployment: { chainId: CHAIN_ID, factory: FACTORY },
-    identityRegistry: REGISTRY,
-    environment: "sandbox",
-    amendmentDelaySeconds: 172_800,
-    maxOpenPerTenant: 3,
-    maxOrdersPerTenantPerDay: 10,
-    maxCreatesPerTenantPerDay: 5,
-    maxCreatesPerDay: 100,
-    doorBudget: { take: () => true },
-    tenantBucket: () => ({ take: () => true }),
-    identityBucket: () => ({ take: () => true }),
-    transaction: (fn) => legalBodies.transaction(fn),
-    ...over,
-  };
+  return legalBodyOrderDeps(
+    { db, companies, declarations, checks, store, repo: legalBodies, docStore },
+    over,
+  );
 }
 
 /**
@@ -212,88 +188,10 @@ function makeApp(opts: { legalBodyOrders?: LegalBodyOrderDeps; charging?: boolea
 }
 type App = ReturnType<typeof makeApp>;
 
-async function sessionOf(who: Signer): Promise<string> {
-  const { token } = await signSession(who.address, JWT_SECRET, 3600, Math.floor(Date.now() / 1000));
-  return token;
-}
-
-async function call(
-  app: App,
-  method: "GET" | "POST",
-  path: string,
-  token: string | undefined,
-  body?: string | object,
-): Promise<Response> {
-  return app.request(path, {
-    method,
-    headers: {
-      ...(body === undefined ? {} : { "content-type": "application/json" }),
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-    },
-    body: body === undefined || typeof body === "string" ? body : JSON.stringify(body),
-  });
-}
-
-// biome-ignore lint/suspicious/noExplicitAny: a JSON answer, read field by field
-type Json = any;
-
-/** The answer's status and JSON body, and its raw text, to show what it does not carry. */
-async function answerOf(res: Response): Promise<{ status: number; body: Json; text: string }> {
-  const text = await res.text();
-  return { status: res.status, body: text ? JSON.parse(text) : null, text };
-}
-
 /** A checked customer company of `who`: its declaration, written straight to its table (the
  *  statement and its signature are placeholders), and one passed check. */
 function checkedCompany(who: Address, status: "draft" | "ready" = "ready"): string {
-  const companyId = companies.create({
-    tenantId: who,
-    status,
-    provider: CUSTOMER_PROVIDER,
-    environment: "sandbox",
-    synthetic: true,
-    nameOptions: [{ name: "Example Holdings LLC", entityTypeEnding: "", position: 1 }],
-    businessPurpose: CUSTOMER_COMPANY_PLACEHOLDER,
-    industryLabel: CUSTOMER_COMPANY_PLACEHOLDER,
-    intakeSynthesized: false,
-  });
-  declarations.insert({
-    companyId,
-    tenantId: who,
-    humanNullifier: `nullifier-${companyId}`,
-    declarantName: "Novi Sandbox Declarant",
-    declarantTitle: "Manager",
-    statementText: "An invented statement, written for a test.",
-    statementHash: keccak256(toHex(`statement:${companyId}`)),
-    statementDigest: keccak256(toHex(`digest:${companyId}`)),
-    signature: "0x01",
-    companyName: "Example Holdings LLC",
-    jurisdiction: "WY",
-    filingNumber: "TEST-0001",
-    wordingVersion: "2026-10-draft-1",
-    chainId: CHAIN_ID,
-    factory: FACTORY,
-    issuedAt: Math.floor(Date.now() / 1000),
-    synthetic: true,
-  });
-  checks.append({
-    companyId,
-    result: "passed",
-    operator: "ops.example",
-    operatorOsUser: "ops",
-    checkedAt: Math.floor(Date.now() / 1000),
-    registryName: "Example Holdings LLC",
-    registryFilingId: "TEST-0001",
-    registryStatus: "Active",
-    formationDate: "2024-02-29",
-    registeredAgent: "Example Registered Agent LLC",
-    existenceEvidenceSha256: H("e"),
-    controlEvidenceSha256: H("c"),
-    controlEvidenceKind: "ein_letter",
-    reasonCode: null,
-    reason: null,
-  });
-  return companyId;
+  return customerCompany({ companies, declarations, checks }, who, { status });
 }
 
 /** An order placed through the door: its view. */
@@ -587,15 +485,6 @@ describe("each JSON door takes a body of at most 8 KiB", () => {
 });
 
 // ── What escapes a domain function ──────────────────────────────────────────────────────────
-
-/** A transport failure as a node client throws one: a numeric status and the node's URL. */
-class TransportFailure extends Error {
-  readonly status = 429;
-  constructor() {
-    super("HTTP request failed. URL: https://rpc.example/v2/key-in-path Status: 429");
-    this.name = "HttpRequestError";
-  }
-}
 
 describe("an error a door did not choose", () => {
   test("a plain error answers 500 internal_error with the fixed sentence on every door, and one line names the door and the error", async () => {

@@ -631,6 +631,19 @@ function draftCutoff(nowMs: number): string {
   return sqliteUtcTimestamp(nowMs - DRAFT_LIFETIME_MS);
 }
 
+/**
+ * Whether `row` is a draft created more than 24 hours before `nowMs` (unix MILLISECONDS): the very
+ * cutoff `listExpiredDrafts` and the open counts use, so a door and the housekeeping never disagree
+ * about one draft. A row in any other state is not an expired draft. A `nowMs` that is not a time
+ * in milliseconds throws a `LegalBodyInputError`.
+ */
+export function isDraftExpired(
+  row: Pick<LegalBodyRecord, "bindingState" | "createdAt">,
+  nowMs: number,
+): boolean {
+  return row.bindingState === "draft" && row.createdAt < draftCutoff(requireMillis("nowMs", nowMs));
+}
+
 const UINT256_MAX = 2n ** 256n - 1n;
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";

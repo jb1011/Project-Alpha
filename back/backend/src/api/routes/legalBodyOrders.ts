@@ -1,8 +1,10 @@
 import type { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
+import type { Hex } from "viem";
 import { ZodError } from "zod";
 import type { AuthVars } from "../../auth/middleware";
 import { readVerifiedAgreement } from "../../legalBody/agreement";
+import { type AfterReserve, linkMessage, submitLink } from "../../legalBody/linkDoor";
 import {
   type LegalBodyOrderDeps,
   abandonOrder,
@@ -10,7 +12,7 @@ import {
   requireOwnedOrder,
   toOrderView,
 } from "../../legalBody/orders";
-import { refusal } from "../../legalBody/sentences";
+import { refusal, sentenceFor } from "../../legalBody/sentences";
 import { opsLog } from "../../observability/opsLog";
 import { ApiError, readJson } from "../errors";
 import { TokenBucket } from "./agentBook";
@@ -26,11 +28,18 @@ import { assertRealHuman } from "./worldId";
  *  - `GET /legal-body-orders/:id/agreement` serves the agreement the link will anchor, from the
  *    stored bytes, re-verified: the caller can check keccak256 of `manifest` against the hash its
  *    link signs, and the manifest's `terms.hash` against keccak256 of `termsDoc`;
- *  - `POST /legal-body-orders/:id/abandon` closes a draft.
+ *  - `POST /legal-body-orders/:id/abandon` closes a draft;
+ *  - `POST /legal-body-orders/:id/link-message` with `{ agentId, ttlSeconds? }` serves the EIP-712
+ *    message the identity's owner signs, and writes nothing;
+ *  - `POST /legal-body-orders/:id/link` with `{ message, signature }` accepts the signed link: 200
+ *    with the order once it is `deployed` or `linked`, 202 while it is `reserved`, 422 with
+ *    `{ code, message, detail, order }` for a refusal of the link (the draft is kept), 503 when
+ *    the chain could not answer (nothing changed).
  *
- * Every rule lives in the domain (`legalBody/orders.ts`); these handlers decide only what is a
- * well-formed request. Every door starts with the real-human check (a verified credential, never a
- * waiver), the reads included; the order door's domain function makes that check first itself.
+ * Every rule lives in the domain (`legalBody/orders.ts`, `legalBody/linkDoor.ts`); these handlers
+ * decide only what is a well-formed request. Every door starts with the real-human check (a
+ * verified credential, never a waiver), the reads included; the domain functions of the order door
+ * and the two link doors make that check first themselves.
  * Mounted under their own session protection, and only where the deployment wires the feature.
  *
  * An error a door did not choose never reaches the caller as it was thrown: anything but an
@@ -169,4 +178,48 @@ export function mountLegalBodyOrderRoutes(
       return c.json(await abandonOrder(deps, tenantId, c.req.param("id")));
     }),
   );
+
+  // Both link doors check the real human first themselves, and read anything but the fields they
+  // define as missing: each field is then refused by its own rule.
+  app.post("/legal-body-orders/:id/link-message", limit, (c) =>
+    door("link_message", async () => {
+      const body = (await readJson(c)) as { agentId?: unknown; ttlSeconds?: unknown } | null;
+      return c.json(
+        await linkMessage(deps, c.get("tenantId"), c.req.param("id"), {
+          agentId: body?.agentId as string,
+          ttlSeconds: body?.ttlSeconds as number | undefined,
+        }),
+      );
+    }),
+  );
+
+  app.post("/legal-body-orders/:id/link", limit, (c) =>
+    door("link", async () => {
+      const body = (await readJson(c)) as { message?: unknown; signature?: unknown } | null;
+      const result = await submitLink(
+        deps,
+        c.get("tenantId"),
+        c.req.param("id"),
+        { message: body?.message, signature: body?.signature as Hex },
+        reservedOnly,
+      );
+      if (result.status === "refused")
+        return c.json(
+          {
+            code: result.code,
+            message: sentenceFor(result.code),
+            detail: result.detail,
+            order: result.order,
+          },
+          422,
+        );
+      return c.json(result.order, result.status === "reserved" ? 202 : 200);
+    }),
+  );
 }
+
+/** What the link door does once the row is reserved, until the create is wired: it answers
+ *  `reserved`, and the order stays reserved. */
+const reservedOnly: AfterReserve = {
+  create: async (row) => ({ status: "reserved", order: toOrderView(row) }),
+};

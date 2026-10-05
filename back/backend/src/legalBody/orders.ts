@@ -270,8 +270,8 @@ export function requireOwnedOrder(
   return row;
 }
 
-/** A row made under another factory or chain is read-only here. */
-function assertThisDeployment(deps: LegalBodyOrderDeps, row: LegalBodyRecord): void {
+/** A row made under another factory or chain is read-only here: 409 `other_deployment`. */
+export function assertThisDeployment(deps: LegalBodyOrderDeps, row: LegalBodyRecord): void {
   if (
     row.chainId !== deps.deployment.chainId ||
     row.factory.toLowerCase() !== deps.deployment.factory.toLowerCase()
