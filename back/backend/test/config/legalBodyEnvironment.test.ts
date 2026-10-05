@@ -146,3 +146,33 @@ test("BYO_MAX_OPEN_PER_TENANT defaults to 3 and takes a positive whole number", 
       /BYO_MAX_OPEN_PER_TENANT/,
     );
 });
+
+// ── A setting left blank ──
+
+test("a blank fee or a blank cap is unset: no fee, and the cap's default", () => {
+  for (const blank of ["", "  "]) {
+    const cfg = loadConfig({
+      ...BASE,
+      BYO_ATTESTATION_FEE_USDC: blank,
+      BYO_MAX_OPEN_PER_TENANT: blank,
+    });
+    expect(cfg.formation?.payment.byoFeeAtomic, JSON.stringify(blank)).toBeUndefined();
+    expect(cfg.formation?.byoMaxOpenPerTenant, JSON.stringify(blank)).toBe(3);
+  }
+  // Unset, a charging deployment with the feature on still refuses to boot without a fee.
+  const charging = { ...PAYING, ...CONTROLLER_MODE, LEGAL_BODY_FACTORY_ADDRESS: LB_FACTORY };
+  expect(() => loadConfig({ ...charging, BYO_ATTESTATION_FEE_USDC: "" })).toThrow(
+    /BYO_ATTESTATION_FEE_USDC is missing/,
+  );
+});
+
+test("a value that is not blank must still be a positive whole number, the feature on or off", () => {
+  for (const bad of ["0", "-7", "7.5"])
+    expect(() => loadConfig({ ...BASE, BYO_ATTESTATION_FEE_USDC: bad }), bad).toThrow(
+      /BYO_ATTESTATION_FEE_USDC/,
+    );
+  for (const bad of ["0", "-3", "1.5"])
+    expect(() => loadConfig({ ...BASE, BYO_MAX_OPEN_PER_TENANT: bad }), bad).toThrow(
+      /BYO_MAX_OPEN_PER_TENANT/,
+    );
+});

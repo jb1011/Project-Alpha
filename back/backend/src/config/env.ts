@@ -39,6 +39,11 @@ export const ARC_TESTNET_CHAIN_ID = 5042002;
  *  unset. Also the fallback for a config with no formation block. */
 export const DEFAULT_BYO_MAX_OPEN_PER_TENANT = 3;
 
+/** A setting written with no value (`NAME=`, or only spaces) reads as unset, for the settings that
+ *  opt in: a line uncommented without a value must not be read as zero and refuse boot. */
+const blankAsUnset = (v: unknown): unknown =>
+  typeof v === "string" && v.trim() === "" ? undefined : v;
+
 /** Fallbacks for `Config.worldChain` (optional in the type for test fixtures). */
 export const WORLD_CHAIN_DEFAULTS = {
   rpcUrl: "https://worldchain-mainnet.g.alchemy.com/public",
@@ -365,21 +370,26 @@ const EnvSchema = z.object({
     .default(30 * 60 * 1000),
 
   // --- CUSTOMER COMPANIES: an existing Wyoming LLC a customer declares as the company behind a
-  // legal body. Read only when LEGAL_BODY_FACTORY_ADDRESS is set. ---
+  // legal body. Used only when LEGAL_BODY_FACTORY_ADDRESS is set, but checked at every boot: a
+  // blank value is unset, and any other value that is not a positive whole number refuses boot,
+  // the feature on or off. ---
   /**
    * What a customer's own company costs, in WHOLE USDC: a positive integer, like
-   * FORMATION_FEE_USDC.
+   * FORMATION_FEE_USDC. Blank is unset.
    *
    * NO DEFAULT, on purpose: a price is set in as many words. A deployment that charges, with the
-   * legal-body feature on, refuses to boot without it (the invariant below).
+   * legal-body feature on, refuses to boot without it (the invariant below), blank included.
    */
-  BYO_ATTESTATION_FEE_USDC: z.coerce.number().int().positive().optional(),
-  /** How many customer companies one tenant may hold open (not abandoned) at once. */
-  BYO_MAX_OPEN_PER_TENANT: z.coerce
-    .number()
-    .int()
-    .positive()
-    .default(DEFAULT_BYO_MAX_OPEN_PER_TENANT),
+  BYO_ATTESTATION_FEE_USDC: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().optional(),
+  ),
+  /** How many customer companies one tenant may hold open (not abandoned) at once: a positive
+   *  whole number. Unset or blank, DEFAULT_BYO_MAX_OPEN_PER_TENANT (3). */
+  BYO_MAX_OPEN_PER_TENANT: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().default(DEFAULT_BYO_MAX_OPEN_PER_TENANT),
+  ),
 });
 
 /** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
