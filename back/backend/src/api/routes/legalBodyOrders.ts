@@ -4,9 +4,10 @@ import type { Hex } from "viem";
 import { ZodError } from "zod";
 import type { AuthVars } from "../../auth/middleware";
 import { readVerifiedAgreement } from "../../legalBody/agreement";
-import { type AfterReserve, linkMessage, submitLink } from "../../legalBody/linkDoor";
+import { linkMessage, submitLinkAndCreate } from "../../legalBody/linkDoor";
 import {
   type LegalBodyOrderDeps,
+  type LegalBodyOrderView,
   abandonOrder,
   createOrder,
   requireOwnedOrder,
@@ -31,10 +32,12 @@ import { assertRealHuman } from "./worldId";
  *  - `POST /legal-body-orders/:id/abandon` closes a draft;
  *  - `POST /legal-body-orders/:id/link-message` with `{ agentId, ttlSeconds? }` serves the EIP-712
  *    message the identity's owner signs, and writes nothing;
- *  - `POST /legal-body-orders/:id/link` with `{ message, signature }` accepts the signed link: 200
- *    with the order once it is `deployed` or `linked`, 202 while it is `reserved`, 422 with
- *    `{ code, message, detail, order }` for a refusal of the link (the draft is kept), 503 when
- *    the chain could not answer (nothing changed).
+ *  - `POST /legal-body-orders/:id/link` with `{ message, signature }` accepts the signed link and
+ *    has the body created: 200 with the order once it is `deployed` or `linked`, 202 while it is
+ *    `reserved` (the create is on its way, and is settled from the chain), 422 with
+ *    `{ code, message, detail, order }` for a refusal of the link (before the reserve the draft is
+ *    kept; after it the order is `lapsed`, and the message says so), 429 or 503 for a create cap,
+ *    503 when the chain could not answer.
  *
  * Every rule lives in the domain (`legalBody/orders.ts`, `legalBody/linkDoor.ts`); these handlers
  * decide only what is a well-formed request. Every door starts with the real-human check (a
@@ -196,18 +199,15 @@ export function mountLegalBodyOrderRoutes(
   app.post("/legal-body-orders/:id/link", limit, (c) =>
     door("link", async () => {
       const body = (await readJson(c)) as { message?: unknown; signature?: unknown } | null;
-      const result = await submitLink(
-        deps,
-        c.get("tenantId"),
-        c.req.param("id"),
-        { message: body?.message, signature: body?.signature as Hex },
-        reservedOnly,
-      );
+      const result = await submitLinkAndCreate(deps, c.get("tenantId"), c.req.param("id"), {
+        message: body?.message,
+        signature: body?.signature as Hex,
+      });
       if (result.status === "refused")
         return c.json(
           {
             code: result.code,
-            message: sentenceFor(result.code),
+            message: refusedSentence(result.code, result.order),
             detail: result.detail,
             order: result.order,
           },
@@ -218,8 +218,10 @@ export function mountLegalBodyOrderRoutes(
   );
 }
 
-/** What the link door does once the row is reserved, until the create is wired: it answers
- *  `reserved`, and the order stays reserved. */
-const reservedOnly: AfterReserve = {
-  create: async (row) => ({ status: "reserved", order: toOrderView(row) }),
-};
+/** A refusal's sentence; for an order that is `lapsed`, followed by the sentence that says so. */
+function refusedSentence(code: string, order: LegalBodyOrderView): string {
+  const sentence = sentenceFor(code);
+  return order.state === "lapsed" && code !== "order_lapsed"
+    ? `${sentence} ${sentenceFor("order_lapsed")}`
+    : sentence;
+}

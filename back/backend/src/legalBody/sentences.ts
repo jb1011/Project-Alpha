@@ -65,6 +65,8 @@ export const LEGAL_BODY_SENTENCES: Readonly<Record<string, string>> = Object.fre
   busy: "This deployment has created as many legal bodies in the last 24 hours as it may: try again later.",
   link_already_used:
     "Another order already holds the legal body this link would create: ask for a new link message.",
+  order_lapsed:
+    "This order has lapsed: it was closed without a legal body, and it can no longer be linked. Place a new order to start again.",
 });
 
 /** The fixed sentence of `code`. A code with no sentence is a bug in the caller, and throws. */

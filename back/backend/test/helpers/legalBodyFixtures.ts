@@ -92,7 +92,8 @@ export const noChain = new Proxy({} as LegalBodyChainPort, {
 });
 
 /** The order deps of a sandbox deployment (the agreement's wording is a draft, which only a
- *  sandbox serves), with room in every throttle. The chain is whatever `over` gives. */
+ *  sandbox serves), with room in every throttle and a sleep that returns at once, so a door's
+ *  wait for a receipt takes no real time. The chain is whatever `over` gives. */
 export function legalBodyOrderDeps(
   s: LegalBodyStores,
   over: Partial<LegalBodyOrderDeps> = {},
@@ -117,6 +118,7 @@ export function legalBodyOrderDeps(
     tenantBucket: () => ({ take: () => true }),
     identityBucket: () => ({ take: () => true }),
     transaction: (fn) => s.repo.transaction(fn),
+    sleep: async () => {},
     ...over,
   };
 }
@@ -242,7 +244,14 @@ export const LINK_HEAD = { number: 7_777n, timestamp: 1_800_000_000n };
 /** The gas limit a fake chain's simulation answers. */
 export const LINK_GAS_LIMIT = 362_500n;
 
-/** The members of a fake chain the link door reads, each a mock a test can steer. */
+/** A create as the fake chain signs it: a placeholder hash, bytes and nonce. */
+export const FAKE_SIGNED_CREATE = { txHash: H("5"), rawTx: "0x02" as Hex, nonce: 0 };
+
+/**
+ * The members of a fake chain the link door reads, and the create's two calls, each a mock a test
+ * can steer. By default the create is recorded (through the caller's `record`) and sent, and the
+ * node has no receipt for it yet, so the door answers `reserved`.
+ */
 export function fakeLinkChainMembers() {
   return {
     chainId: CHAIN_ID,
@@ -260,12 +269,18 @@ export function fakeLinkChainMembers() {
     ),
     bodyCreator: vi.fn<LinkChainPort["bodyCreator"]>(async () => undefined),
     estimateCreate: vi.fn<LinkChainPort["estimateCreate"]>(async () => LINK_GAS_LIMIT),
-  } satisfies LinkChainPort;
+    submitCreate: vi.fn<LegalBodyChainPort["submitCreate"]>(async (p) =>
+      p.record({ ...FAKE_SIGNED_CREATE })
+        ? { status: "sent", ...FAKE_SIGNED_CREATE }
+        : { status: "not_recorded" },
+    ),
+    createOutcome: vi.fn<LegalBodyChainPort["createOutcome"]>(async () => ({ status: "absent" })),
+  } satisfies LinkChainPort & Pick<LegalBodyChainPort, "submitCreate" | "createOutcome">;
 }
 export type FakeLinkChainMembers = ReturnType<typeof fakeLinkChainMembers>;
 
 /** The members above as the doors' chain port. Any other member throws when it is read, so a door
- *  that reaches past the link's reads fails loudly. */
+ *  that reaches past them fails loudly. */
 export function asChainPort(members: FakeLinkChainMembers): LegalBodyChainPort {
   return new Proxy(members, {
     get: (target, member) => {
