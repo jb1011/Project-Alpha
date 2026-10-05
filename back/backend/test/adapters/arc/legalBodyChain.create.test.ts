@@ -108,6 +108,7 @@ function world(opts: WorldOptions = {}) {
     chainId: CHAIN_ID,
     platformAddress: opts.executor === null ? undefined : EXECUTOR,
     platformNonce: vi.fn(async () => 0),
+    platformPendingNonce: vi.fn(async () => 0),
     estimateRelayedCall: vi.fn(async (_call: RelayedCall) => {
       note("estimate");
       return (opts.estimate ?? (async () => ESTIMATE))();
