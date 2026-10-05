@@ -179,8 +179,12 @@ function oneOf<T extends string>(field: string, value: unknown, allowed: readonl
   return value as T;
 }
 
-/** The check as it is stored: every field validated, and nothing a caller added besides. */
-function validated(c: NewCompanyCheck): NewCompanyCheck {
+/**
+ * The check as it is stored: every field validated, and nothing a caller added besides. Throws, as
+ * `append` does, on a bad shape. Exported so a caller can refuse a bad check before it writes
+ * anything, the operator's dry run among them.
+ */
+export function validateCompanyCheck(c: NewCompanyCheck): NewCompanyCheck {
   const operator = c.operator;
   if (typeof operator !== "string" || !OPERATOR_NAME.test(operator))
     refuse("operator", `must match ${OPERATOR_NAME.source}`);
@@ -246,7 +250,7 @@ export class SqliteCompanyCheckRepository implements CompanyCheckRepository {
   }
 
   append(c: NewCompanyCheck): CompanyCheck {
-    const v = validated(c);
+    const v = validateCompanyCheck(c);
     const row = this.stmts.append.get({
       company_id: v.companyId,
       result: v.result,

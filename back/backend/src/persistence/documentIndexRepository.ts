@@ -31,6 +31,11 @@ export interface DocumentIndexRecord {
   entityKey: string | null;
   /** doola's `documentType`, e.g. "ArticlesOfOrganization" | "OperatingAgreement" | "EinLetter". */
   docType: string;
+  /**
+   * Two spellings, by source: a customer's upload keeps `0x` and 64 lower-case hex digits (the
+   * form the operator's checks store), a provider's document 64 hex digits with no `0x`. Compare
+   * in the spelling of the row's source.
+   */
   sha256: string;
   contentType: string;
   size: number;

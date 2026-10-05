@@ -14,6 +14,7 @@ import { parseAgentSpec } from "../policy/agentSpec";
 import { usdToUnits } from "../policy/units";
 import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner } from "../workflow/runner";
+import { registerCompanyCheckCommands } from "./companyChecks";
 import { type CliContext, buildContext } from "./context";
 
 /** Deps that can be injected for testing — bypasses live Anthropic + chain calls. */
@@ -777,6 +778,10 @@ export function buildCli(
         `\nrecorded refund of ${row.amountUsdc} atomic USDC for payment ${row.paymentId} (tx ${opts.tx}). Nothing was moved by this command.`,
       );
     });
+
+  // ── company:* and legal-body:revoke — the operator's check of a customer's declaration ────────
+  // DB-only, like the formation commands: each opens the configured database itself.
+  registerCompanyCheckCommands(program);
 
   return program;
 }
