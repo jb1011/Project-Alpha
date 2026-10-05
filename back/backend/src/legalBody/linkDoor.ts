@@ -39,6 +39,7 @@ import {
   takeDoorTokens,
   toOrderView,
 } from "./orders";
+import { resolveOrder } from "./resolver";
 import { refusal } from "./sentences";
 import { LegalTextNotApprovedError, assertTextsServable } from "./texts/index";
 import { LEGAL_BODY_OPERATING_AGREEMENT } from "./texts/operatingAgreement";
@@ -431,14 +432,17 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
  * A create that was recorded, sent or perhaps sent, is read at most `DOOR_RECEIPT_READS` times,
  * `DOOR_RECEIPT_INTERVAL_MS` apart, each read through `chainCall`:
  *  - `created`: the order is deployed, and its binding check is scheduled from now, every minute;
- *  - `reverted`: the wait ends, and the order stays `reserved` for the sweeper to settle;
+ *  - `reverted`: the wait ends with one resolver pass (`resolveOrder`), run under the lock this
+ *    door already holds. It settles the order from the chain: it may submit the create again,
+ *    lapse the order, or leave it `reserved` on the resolve schedule;
  *  - `absent` after the last read: the order stays `reserved`;
  *  - a read that throws ends the wait the same way: never a 503, never the error's text.
  *
  * The answer is the order's state when the door answers, read again: `reserved` or `deployed`,
- * or `refused` for an order that is `lapsed` (by a refusal here, or meanwhile by another order's
- * give-way), with `order_lapsed` as its code when it has none of its own. A reserved row's
- * schedule is never cleared here: only a move to `deployed` or `lapsed` ends it.
+ * or `refused` for an order that is `lapsed` (by a refusal here, by the resolver's pass, or
+ * meanwhile by another order's give-way), with `order_lapsed` as its code when it has none of its
+ * own. A reserved row's schedule is never cleared here: only a move to `deployed` or `lapsed`
+ * ends it.
  */
 export async function createAfterReserve(
   deps: LegalBodyOrderDeps,
@@ -471,6 +475,11 @@ export async function createAfterReserve(
       break;
     }
     if (outcome.status === "absent") continue;
+    if (outcome.status === "reverted") {
+      // One resolver pass settles the order now, under the lock this door already holds.
+      await resolveOrder(deps, orderId);
+      break;
+    }
     if (outcome.status === "created") {
       const { created } = outcome;
       deps.transaction(() => {

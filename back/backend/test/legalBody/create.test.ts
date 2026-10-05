@@ -435,7 +435,7 @@ describe("the door's wait for the receipt", () => {
     expect(DOOR_RECEIPT_INTERVAL_MS).toBe(1_000);
   });
 
-  test("a reverted create ends the wait: the order stays reserved, for the sweeper to settle", async () => {
+  test("a reverted create ends the wait with one resolver pass: a pass the chain cannot answer leaves the order reserved, its schedule moved", async () => {
     const row = draft();
     chain.createOutcome.mockResolvedValueOnce({ status: "reverted" });
 
@@ -443,7 +443,7 @@ describe("the door's wait for the receipt", () => {
 
     const after = rowOf(row.legalBodyId);
     expect(result).toEqual({ status: "reserved", order: toOrderView(after) });
-    expect(after.nextBindingCheckAt).toBe(startedAt);
+    expect(after.nextBindingCheckAt).toBe(startedAt + 30_000);
     expect(chain.createOutcome).toHaveBeenCalledOnce();
     expect(sleep).not.toHaveBeenCalled();
   });
