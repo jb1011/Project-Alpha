@@ -12,7 +12,7 @@ import {
   requiredActionCodesOf,
 } from "../formation/status";
 import { type VerificationState, verificationStateOf } from "../legalBody/attestation";
-import { CUSTOMER_PROVIDER } from "../legalBody/customerCompany";
+import { CUSTOMER_PROVIDER } from "../legalBody/provider";
 import type {
   CheckReasonCode,
   CompanyCheck,
@@ -239,7 +239,9 @@ export interface CompanyListDeps {
 }
 
 /**
- * A tenant's companies, NEWEST FIRST, in FOUR queries however long the page is (M5).
+ * A tenant's companies, NEWEST FIRST, in FOUR queries however long the page is while every row is
+ * a formation company (M5). Each customer row adds two of its own: a declaration read and a
+ * latest-check read.
  *
  * Every row used to ask for its own steps, its own live-payment count and its own agent count:
  * 3N+1 queries per page view, on two authenticated surfaces. The ordering is the repository's,
