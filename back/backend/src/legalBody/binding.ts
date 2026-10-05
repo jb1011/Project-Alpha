@@ -10,18 +10,21 @@ import { type LegalBodyOrderDeps, assertThisDeployment } from "./orders";
  *
  * Once its body is created, an order is bound to its identity only while the identity's owner
  * keeps a pointer to that body in the identity's metadata, under `LEGAL_BODY_POINTER_KEY`. The
- * factory decides what counts as a pointer (`linkedLegalBody`), so the check asks the factory and
- * nothing else, and reads everything at ONE block: the head first, then the pointer at the head's
- * number and, when a linked body stops passing, the body's status at that same number. The row's
- * state is a cache of that answer, moved only by the repository's compare-and-set:
+ * factory decides what counts as a pointer (`linkedLegalBody`: among other things, the body must be
+ * active), so the check asks the factory and nothing else, and reads everything at ONE block: the
+ * head first, then the pointer at the head's number and, when a linked body stops passing, the
+ * body's status at that same number. The row's state is a cache of that answer, moved only by the
+ * repository's compare-and-set:
  *
  *   deployed | broken | superseded ──the pointer names the body──▶ linked
- *   linked ──the pointer names nothing or another body──▶ broken: `not_linked` while the body is
- *     active, `dissolved` once it is winding down or dissolved
+ *   linked ──the pointer names nothing or another body──▶ broken, with the reason the body's
+ *     status gives: `not_linked` while it is active, `winding_down` while its dissolution can
+ *     still be vetoed (a veto makes it active again), `dissolved` once that is final
  *
  * Linking a body breaks any other body linked for the same identity, in the same transaction
- * (`markLinked`, reason `replaced`). Nothing else moves here: a body never linked stays `deployed`
- * or `superseded` until its pointer is written, and a broken one stays `broken`.
+ * (`markLinked`, reason `replaced`), and starts each one's broken schedule over. Nothing else moves
+ * here: a body never linked stays `deployed` or `superseded` until its pointer is written, and a
+ * broken one stays `broken`.
  *
  * ONE WRITER PER ORDER: the caller holds the order's lock (`orderLockKey`), the sweeper or the
  * binding refresh door. This module takes no lock: the lock is not re-entrant.
@@ -39,9 +42,11 @@ import { type LegalBodyOrderDeps, assertThisDeployment } from "./orders";
  *    an hour, until 7 days after `deployedAt`;
  *  - `linked`: every 24 hours, for as long as it is linked;
  *  - broken (`broken`, or `superseded` after a pointer was seen): an hour, doubling to 24 hours,
- *    until 30 days after the row's last state move (`updatedAt`, which only a move changes);
- *  - a body found winding down or dissolved: no further check, and no pointer intent, since the
- *    factory does not count a pointer to it. A refresh still reads it.
+ *    until 30 days after the row's last state move (`updatedAt`, which only a move changes). A
+ *    body found winding down stays on this leg, so a veto is seen, but carries no pointer intent:
+ *    the factory does not count a pointer to it while it winds down;
+ *  - a body found dissolved: no further check and no pointer intent, since a dissolution, once
+ *    final, cannot be undone. A refresh still reads it.
  */
 
 /** The identity-metadata key the owner writes the pointer under, as the factory reads it. */
@@ -76,9 +81,17 @@ const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 
-/** The two reasons this check writes on a `broken` event. */
+/** The reasons this check writes on a `broken` event, one per status of the body. */
 const NOT_LINKED = "not_linked";
+const WINDING_DOWN = "winding_down";
 const DISSOLVED = "dissolved";
+const BREAK_REASONS = {
+  active: NOT_LINKED,
+  winding_down: WINDING_DOWN,
+  dissolved: DISSOLVED,
+} as const;
+/** The breaks a pointer cannot mend: the factory counts no pointer to such a body. */
+const NO_INTENT_REASONS: readonly string[] = [WINDING_DOWN, DISSOLVED];
 
 /** The states a binding check reads the chain for: a body exists, so a pointer can name it. */
 const CHECKABLE_STATES: readonly BindingState[] = ["deployed", "linked", "broken", "superseded"];
@@ -115,12 +128,15 @@ function legOf(row: LegalBodyRecord): Leg | undefined {
 }
 
 /**
- * Whether the row's body was found winding down or dissolved when its pointer last stopped
- * counting: a row that was linked once and is not linked now (`broken`, or `superseded` after a
- * pointer was seen) whose newest `broken` event says `dissolved`.
+ * The reason of the row's newest break, for a row that was linked once and is not linked now
+ * (`broken`, or `superseded` after a pointer was seen); undefined for any other row, which an
+ * older break no longer describes.
  */
-function bodyDissolved(row: LegalBodyRecord, latestBrokenReason: string | undefined): boolean {
-  return legOf(row) === "broken" && latestBrokenReason === DISSOLVED;
+function breakReason(
+  row: LegalBodyRecord,
+  latestBrokenReason: string | undefined,
+): string | undefined {
+  return legOf(row) === "broken" ? latestBrokenReason : undefined;
 }
 
 /** The instant the row's leg stops being checked, in unix milliseconds; none for `linked`. */
@@ -140,12 +156,18 @@ function legEndsAt(row: LegalBodyRecord, leg: Leg): number | undefined {
 }
 
 /** The pointer the owner should write for this order, or none: only a created body that is not
- *  linked now, and never one found winding down or dissolved, which the pointer could not link. */
+ *  linked now, and never one last found winding down or dissolved, which a pointer would not link
+ *  (a winding-down body that a veto made active again is linked by the check if its pointer
+ *  still names it). */
 export function pointerIntent(
   row: LegalBodyRecord,
   latestBrokenReason: string | undefined,
 ): PointerIntent | undefined {
-  if (!POINTABLE_STATES.includes(row.bindingState) || bodyDissolved(row, latestBrokenReason))
+  const reason = breakReason(row, latestBrokenReason);
+  if (
+    !POINTABLE_STATES.includes(row.bindingState) ||
+    (reason !== undefined && NO_INTENT_REASONS.includes(reason))
+  )
     return undefined;
   const { agentId, bodyAddress } = row;
   if (agentId === null || bodyAddress === null) return undefined;
@@ -164,7 +186,7 @@ export function nextBindingSchedule(
   latestBrokenReason: string | undefined,
 ): { nextAt: number; intervalMs: number } | undefined {
   const leg = legOf(row);
-  if (leg === undefined || bodyDissolved(row, latestBrokenReason)) return undefined;
+  if (leg === undefined || breakReason(row, latestBrokenReason) === DISSOLVED) return undefined;
   const endsAt = legEndsAt(row, leg);
   if (endsAt !== undefined && nowMs >= endsAt) return undefined;
   const { firstMs, capMs } = LEG_INTERVALS[leg];
@@ -193,7 +215,7 @@ export function toBindingView(
 type Reading =
   | { move: "none" }
   | { move: "link"; seenAt: number; block: number }
-  | { move: "break"; reason: typeof NOT_LINKED | typeof DISSOLVED; block: number };
+  | { move: "break"; reason: (typeof BREAK_REASONS)[keyof typeof BREAK_REASONS]; block: number };
 
 /** What this check moved. */
 type Moved =
@@ -211,10 +233,11 @@ type Moved =
  *     left as it is: the factory read here says nothing about a body another factory created.
  *  2. The head, then `linkedLegalBody(agentId, head.number)`: the factory's whole predicate.
  *  3. It names the row's body: a row not linked yet is marked linked, seen at the head's time
- *     (`linked`); a linked row is `unchanged`.
+ *     (`linked`), and each body that link replaced is checked again an hour later, with an
+ *     interval of an hour; a linked row is `unchanged`.
  *  4. It names nothing or another body: a linked row's body status is read at the same block, and
- *     the row is broken, `not_linked` while the body is active, `dissolved` otherwise (`broken`).
- *     Any other row is `unchanged`.
+ *     the row is broken with the reason that status gives: `not_linked` (active), `winding_down`
+ *     or `dissolved` (`broken`). Any other row is `unchanged`.
  *  5. The schedule is set from `nextBindingSchedule`, or cleared, in the transaction of the move.
  * A throw from the chain is `unknown`: nothing moves, and the schedule moves forward by its
  * interval. A throw from the database is not the chain's, and propagates.
@@ -253,7 +276,7 @@ export async function checkBinding(
     } else if (row.bindingState === "linked") {
       stage = "body_status";
       const status = await deps.chain.bodyStatus(bodyAddress, head.number);
-      reading = { move: "break", reason: status === "active" ? NOT_LINKED : DISSOLVED, block };
+      reading = { move: "break", reason: BREAK_REASONS[status], block };
     } else {
       reading = { move: "none" };
     }
@@ -296,9 +319,15 @@ function applyReading(deps: LegalBodyOrderDeps, id: string, reading: Reading): M
   switch (reading.move) {
     case "link": {
       const linked = deps.repo.markLinked(id, reading.seenAt);
-      return linked.outcome === "linked"
-        ? { outcome: "linked", replaced: linked.replaced, block: reading.block }
-        : { outcome: "unchanged" };
+      if (linked.outcome !== "linked") return { outcome: "unchanged" };
+      // Each body this link replaced is broken now, and its broken schedule starts at its first
+      // interval rather than at the day its linked schedule held. A schedule moves no state, so
+      // this write on another order's row needs no lock of its own.
+      const { firstMs } = LEG_INTERVALS.broken;
+      const nowMs = (deps.now ?? Date.now)();
+      for (const replacedId of linked.replaced)
+        deps.repo.scheduleBindingCheck(replacedId, nowMs + firstMs, firstMs);
+      return { outcome: "linked", replaced: linked.replaced, block: reading.block };
     }
     case "break":
       // A JSON number: the event writer redacts a string of nine digits or more.

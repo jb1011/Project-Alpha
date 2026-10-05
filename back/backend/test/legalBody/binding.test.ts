@@ -265,25 +265,63 @@ describe("checkBinding moves the row by what the pointer names", () => {
     expect(s.repo.latestBrokenReason(row.legalBodyId)).toBe("not_linked");
   });
 
-  test.each(["winding_down", "dissolved"] as const)(
-    "a linked body that is %s is broken with dissolved, leaves the schedule, and carries no intent",
-    async (status) => {
-      const row = linkedOrder();
-      chain.bodyStatus.mockResolvedValue(status);
+  test("a linked body that is dissolved is broken with dissolved, leaves the schedule for good, and carries no intent", async () => {
+    const row = linkedOrder();
+    chain.bodyStatus.mockResolvedValue("dissolved");
 
-      expect(await checkBinding(deps(), row.legalBodyId)).toBe("broken");
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("broken");
 
-      const after = rowOf(row.legalBodyId);
-      expect(after.bindingState).toBe("broken");
-      expect(brokenEvents(row.legalBodyId).map((e) => e.detail)).toEqual([
-        { reason: "dissolved", observedAtBlock: Number(HEAD_NUMBER) },
-      ]);
-      expect(after.nextBindingCheckAt).toBeNull();
-      expect(after.bindingCheckIntervalMs).toBeNull();
-      expect(s.repo.listBindingDue(after, clock + 365 * DAY, 5)).toEqual([]);
-      expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toBeNull();
-    },
-  );
+    const after = rowOf(row.legalBodyId);
+    expect(after.bindingState).toBe("broken");
+    expect(brokenEvents(row.legalBodyId).map((e) => e.detail)).toEqual([
+      { reason: "dissolved", observedAtBlock: Number(HEAD_NUMBER) },
+    ]);
+    expect(after.nextBindingCheckAt).toBeNull();
+    expect(after.bindingCheckIntervalMs).toBeNull();
+    expect(s.repo.listBindingDue(after, clock + 365 * DAY, 5)).toEqual([]);
+    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toBeNull();
+  });
+
+  test("a linked body that is winding down is broken with winding_down, checked again in an hour, and carries no intent", async () => {
+    const row = linkedOrder();
+    chain.bodyStatus.mockResolvedValue("winding_down");
+
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("broken");
+
+    const after = rowOf(row.legalBodyId);
+    expect(after.bindingState).toBe("broken");
+    expect(brokenEvents(row.legalBodyId).map((e) => e.detail)).toEqual([
+      { reason: "winding_down", observedAtBlock: Number(HEAD_NUMBER) },
+    ]);
+    expect(after.nextBindingCheckAt).toBe(clock + HOUR);
+    expect(after.bindingCheckIntervalMs).toBe(2 * HOUR);
+    expect(s.repo.listBindingDue(after, clock + HOUR, 5).map((r) => r.legalBodyId)).toEqual([
+      row.legalBodyId,
+    ]);
+    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toBeNull();
+  });
+
+  test("a body broken while winding down stays on the broken schedule, and once its dissolution is vetoed (active again, the pointer passing) the next check links it", async () => {
+    const row = linkedOrder();
+    chain.bodyStatus.mockResolvedValue("winding_down");
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("broken");
+
+    // Still winding down an hour later: the pointer does not pass, and the wait doubles.
+    clock = rowOf(row.legalBodyId).nextBindingCheckAt ?? 0;
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
+    expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBe(clock + 2 * HOUR);
+    expect(chain.bodyStatus).toHaveBeenCalledTimes(1);
+
+    // The guardian vetoes the dissolution: the body is active again and the pointer passes.
+    clock = rowOf(row.legalBodyId).nextBindingCheckAt ?? 0;
+    chain.linkedLegalBody.mockResolvedValue(bodyOf(row));
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("linked");
+
+    const after = rowOf(row.legalBodyId);
+    expect(after.bindingState).toBe("linked");
+    expect(after.pointerSeenAt).toBe(nowSeconds());
+    expect(after.nextBindingCheckAt).toBe(clock + DAY);
+  });
 
   test("a broken body the pointer names again becomes linked, seen at the new head's time", async () => {
     const row = brokenOrder();
@@ -311,8 +349,10 @@ describe("checkBinding moves the row by what the pointer names", () => {
     expect(after.nextBindingCheckAt).toBe(clock + DAY);
   });
 
-  test("a body the pointer names in place of a linked one: the new one is linked and the old one broken with replaced", async () => {
+  test("a body the pointer names in place of a linked one: the new one is linked, and the old one is broken with replaced and checked again in an hour", async () => {
     const old = linkedOrder({ agentId: "4242" });
+    expect(old.nextBindingCheckAt).toBe(clock);
+    expect(old.bindingCheckIntervalMs).toBe(DAY);
     const replacement = deployedOrder({ agentId: "4242" });
     chain.linkedLegalBody.mockResolvedValue(bodyOf(replacement));
 
@@ -321,6 +361,9 @@ describe("checkBinding moves the row by what the pointer names", () => {
     expect(rowOf(replacement.legalBodyId).bindingState).toBe("linked");
     expect(rowOf(old.legalBodyId).bindingState).toBe("broken");
     expect(s.repo.latestBrokenReason(old.legalBodyId)).toBe("replaced");
+    // The old body's broken schedule starts at its first interval, not at the day it held.
+    expect(rowOf(old.legalBodyId).nextBindingCheckAt).toBe(clock + HOUR);
+    expect(rowOf(old.legalBodyId).bindingCheckIntervalMs).toBe(HOUR);
     expect(opsLines()).toEqual([
       expect.objectContaining({
         opslog: "legal_body_binding",
@@ -350,16 +393,6 @@ describe("checkBinding moves the row by what the pointer names", () => {
     expect(s.repo.latestBrokenReason(old.legalBodyId)).toBe("replaced");
     expect(after.nextBindingCheckAt).toBe(clock + HOUR);
     expect(after.bindingCheckIntervalMs).toBe(2 * HOUR);
-  });
-
-  test("a body broken as dissolved whose pointer counts again (its dissolution was cancelled) is linked by a later check", async () => {
-    const row = brokenOrder("dissolved");
-    chain.linkedLegalBody.mockResolvedValue(bodyOf(row));
-
-    expect(await checkBinding(deps(), row.legalBodyId)).toBe("linked");
-
-    expect(rowOf(row.legalBodyId).bindingState).toBe("linked");
-    expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBe(clock + DAY);
   });
 });
 
@@ -704,6 +737,14 @@ describe("nextBindingSchedule", () => {
       const superseded = record({ bindingState: "superseded", pointerSeenAt: NOW_S - 2 * 3_600 });
       expect(nextBindingSchedule(superseded, NOW, false, "dissolved")).toBeUndefined();
     });
+
+    test("linked once and broken while winding down: the broken schedule goes on", () => {
+      const superseded = record({ bindingState: "superseded", pointerSeenAt: NOW_S - 2 * 3_600 });
+      expect(nextBindingSchedule(superseded, NOW, false, "winding_down")).toEqual({
+        nextAt: NOW + HOUR,
+        intervalMs: 2 * HOUR,
+      });
+    });
   });
 
   describe("a linked body", () => {
@@ -717,17 +758,18 @@ describe("nextBindingSchedule", () => {
           ).toEqual({ nextAt: NOW + DAY, intervalMs: DAY });
     });
 
-    test("is never taken off the schedule by age, nor by an old dissolution it came back from", () => {
+    test("is never taken off the schedule by age, nor by an old break it came back from", () => {
       const linked = record({
         bindingState: "linked",
         pointerSeenAt: NOW_S - 60,
         deployedAt: NOW_S - 400 * 24 * 3_600,
         updatedAt: sqliteUtcTimestamp(NOW - 400 * DAY),
       });
-      expect(nextBindingSchedule(linked, NOW, false, "dissolved")).toEqual({
-        nextAt: NOW + DAY,
-        intervalMs: DAY,
-      });
+      for (const reason of ["winding_down", "dissolved"])
+        expect(nextBindingSchedule(linked, NOW, false, reason), reason).toEqual({
+          nextAt: NOW + DAY,
+          intervalMs: DAY,
+        });
     });
   });
 
@@ -786,6 +828,29 @@ describe("nextBindingSchedule", () => {
     test("broken because it was dissolved: no further check, moved or not", () => {
       expect(nextBindingSchedule(broken, NOW, true, "dissolved")).toBeUndefined();
       expect(nextBindingSchedule(broken, NOW, false, "dissolved")).toBeUndefined();
+    });
+
+    test("broken while winding down: the broken schedule goes on, and stops 30 days after the move", () => {
+      expect(nextBindingSchedule(broken, NOW, true, "winding_down")).toEqual({
+        nextAt: NOW + HOUR,
+        intervalMs: 2 * HOUR,
+      });
+      expect(
+        nextBindingSchedule(
+          { ...broken, bindingCheckIntervalMs: 4 * HOUR },
+          NOW,
+          false,
+          "winding_down",
+        ),
+      ).toEqual({ nextAt: NOW + 4 * HOUR, intervalMs: 8 * HOUR });
+      expect(
+        nextBindingSchedule(
+          { ...broken, updatedAt: sqliteUtcTimestamp(NOW - 30 * DAY) },
+          NOW,
+          false,
+          "winding_down",
+        ),
+      ).toBeUndefined();
     });
 
     test("broken because it was replaced: the broken schedule goes on", () => {
@@ -859,11 +924,19 @@ describe("pointerIntent and toBindingView", () => {
     expect(toBindingView(row, "not_linked").pointerSeenAt).toBe(NOW_S - 600);
   });
 
-  test("a dissolved body carries no intent: a pointer to it could never link", () => {
-    for (const row of [rowIn("broken"), rowIn("superseded", { pointerSeenAt: NOW_S - 600 })]) {
-      expect(pointerIntent(row, "dissolved"), row.bindingState).toBeUndefined();
-      expect(toBindingView(row, "dissolved").intent, row.bindingState).toBeNull();
-    }
+  test("a body winding down or dissolved carries no intent: writing a pointer would not link it", () => {
+    for (const row of [rowIn("broken"), rowIn("superseded", { pointerSeenAt: NOW_S - 600 })])
+      for (const reason of ["winding_down", "dissolved"]) {
+        expect(pointerIntent(row, reason), `${row.bindingState} ${reason}`).toBeUndefined();
+        expect(toBindingView(row, reason), `${row.bindingState} ${reason}`).toEqual({
+          state: row.bindingState,
+          agentId: "42",
+          bodyAddress: BODY,
+          intent: null,
+          pointerSeenAt: NOW_S - 600,
+          nextCheckAt: NOW + MINUTE,
+        });
+      }
   });
 
   test("a linked body carries no intent, and shows when its pointer was seen", () => {
