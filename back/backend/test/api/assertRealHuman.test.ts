@@ -166,6 +166,39 @@ describe("assertRealHuman", () => {
     expect(refusal(() => assertRealHuman(world(), TENANT, "production"))).toBeNull();
   });
 
+  test("on production a verification recorded under a World environment that is not production is refused", () => {
+    // One tenant per row: the verification table holds one row per human.
+    const tenantOf = (i: number) => getAddress(`0x${(0xc0 + i).toString(16).padStart(40, "0")}`);
+    const recordedUnder = [
+      ["staging", 3001],
+      ["sandbox", 3002],
+      [null, 3003],
+    ] as const;
+    recordedUnder.forEach(([environment, nullifier], i) => {
+      verified("proof_of_human", {
+        tenantId: tenantOf(i),
+        nullifier: String(nullifier),
+        environment,
+      });
+      // A production deployment, with World's own configuration production too.
+      expect(
+        refusal(() => assertRealHuman(world(), tenantOf(i), "production")),
+        String(environment),
+      ).toEqual({
+        code: "guardian_not_verified",
+        status: 403,
+      });
+      // A sandbox deployment may rest on a verification that was not made under production.
+      expect(
+        refusal(() => assertRealHuman(world(), tenantOf(i), "sandbox")),
+        String(environment),
+      ).toBeNull();
+    });
+    // A verification recorded under production still passes.
+    const row = verified("proof_of_human", { tenantId: tenantOf(9), nullifier: "3009" });
+    expect(assertRealHuman(world(), tenantOf(9), "production")).toEqual(row);
+  });
+
   test("it applies no cap: the callers do", () => {
     verified("orb");
     const capped = world({ maxCompaniesPerHuman: 0, maxEntitiesPerHuman: 0 });
