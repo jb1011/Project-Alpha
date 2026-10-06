@@ -145,6 +145,8 @@ const COMPANY_NAME = "Example Holdings LLC";
 /** The identity-metadata key the factory reads the pointer under, and the pointer's version. */
 const POINTER_KEY = "legalBody";
 const POINTER_VERSION = 1n;
+/** A day, in the chain's unit. */
+const DAY_SECONDS = 24 * 3_600;
 
 const ORDERS = "/legal-body-orders";
 const orderPath = (id: string) => `${ORDERS}/${id}`;
@@ -998,8 +1000,8 @@ describe("an order becomes a linked body on a local chain", () => {
     expect(await readOrder(g, id)).toMatchObject({ state: "draft", agentId: null });
   });
 
-  // Last in the file: it moves the chain's clock a day forward, for good.
-  test("a linked body whose guardian starts its dissolution: the next check reads it broken with winding_down, keeps it on the schedule, and shows no intent", async () => {
+  // Last in the file: it moves the chain's clock forward by days, for good.
+  test("a dissolution of a linked body: while it winds down the next check reads it broken with winding_down, still checked and with no intent; once the guardian makes it final the next check reads it dissolved, with no intent and no further check", async () => {
     const g = await newGuardian();
     await node.setBalance({ address: g.address, value: parseEther("1") });
     const agentId = await identityOfKey();
@@ -1014,11 +1016,33 @@ describe("an order becomes a linked body on a local chain", () => {
     expect(linked.nextCheckAt).toBeGreaterThan(now());
     await moveTime(Math.ceil((linked.nextCheckAt - now()) / 1_000) + 60);
     await d.sweeper.tick();
-
     const windingDown = await binding(g, id);
     expect(windingDown).toMatchObject({ state: "broken", bodyAddress: body, intent: null });
     expect(windingDown.nextCheckAt).toBeGreaterThan(now());
     expect(d.legalBodies.latestBrokenReason(id)).toBe("winding_down");
     expect(await readOrder(g, id)).toMatchObject({ state: "broken" });
+
+    // Once its window has passed, the guardian makes the dissolution final.
+    const executableAt = await pub.readContract({
+      address: body,
+      abi: legalManagerAbi,
+      functionName: "dissolutionExecutableAt",
+    });
+    const { timestamp } = await lb.head();
+    expect(executableAt - timestamp).toBeLessThanOrEqual(BigInt(2 * DAY_SECONDS));
+    await moveTime(Number(executableAt - timestamp) + 60);
+    await asGuardian(g, body, "finalizeDissolution");
+    await expect(lb.bodyStatus(body)).resolves.toBe("dissolved");
+
+    // The next check.
+    expect(now()).toBeGreaterThan(windingDown.nextCheckAt);
+    await d.sweeper.tick();
+    expect(d.legalBodies.latestBrokenReason(id)).toBe("dissolved");
+    expect(await binding(g, id)).toMatchObject({
+      state: "broken",
+      bodyAddress: body,
+      intent: null,
+      nextCheckAt: null,
+    });
   });
 });
