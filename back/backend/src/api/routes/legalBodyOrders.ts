@@ -5,6 +5,7 @@ import { ZodError } from "zod";
 import type { AuthVars } from "../../auth/middleware";
 import { readVerifiedAgreement } from "../../legalBody/agreement";
 import { type BindingView, checkBinding, toBindingView } from "../../legalBody/binding";
+import { type GasSeedDeps, requestGasSeed } from "../../legalBody/gasSeed";
 import { linkMessage, submitLinkAndCreate } from "../../legalBody/linkDoor";
 import {
   type LegalBodyOrderDeps,
@@ -52,13 +53,19 @@ import { assertRealHuman } from "./worldId";
  *  - `POST /legal-body-orders/:id/binding/refresh` reads it again from the chain, under the
  *    order's lock: one resolver pass for a `reserved` order, one binding check for any other, and
  *    the same view as the read. A chain that could not answer is a 503 `chain_unavailable`, and
- *    no state moved.
+ *    no state moved;
+ *  - `POST /legal-body-orders/:id/gas-seed` sends the identity's owner of a `deployed` order a
+ *    small native amount to pay for its pointer transaction with, once per tenant, ever: 200 with
+ *    `{ status: "sent", txHash }`. Mounted where the deployment wires it; while its amount is 0 it
+ *    answers 409 `gas_seed_disabled`.
  *
  * Every rule lives in the domain (`legalBody/orders.ts`, `legalBody/linkDoor.ts`,
- * `legalBody/resolver.ts`, `legalBody/binding.ts`); these handlers decide only what is a
- * well-formed request, and the refresh which of the domain's two passes to run. Every door starts
- * with the real-human check (a verified credential, never a waiver), the reads included; the
- * domain functions of the order door and the two link doors make that check first themselves.
+ * `legalBody/resolver.ts`, `legalBody/binding.ts`, `legalBody/gasSeed.ts`); these handlers decide
+ * only what is a well-formed request, and the refresh which of the domain's two passes to run.
+ * Every door starts with the real-human check (a verified credential, never a waiver), the reads
+ * included; the domain functions of the order door and the two link doors make that check first
+ * themselves. The one exception is the gas seed: while it is off, it answers before that check,
+ * reading nothing and spending no token; on, `requestGasSeed` makes the check first.
  * Mounted under their own session protection, and only where the deployment wires the feature.
  *
  * An error a door did not choose never reaches the caller as it was thrown: anything but an
@@ -122,6 +129,7 @@ async function door<T>(name: string, run: () => T | Promise<T>): Promise<T> {
 export function mountLegalBodyOrderRoutes(
   app: Hono<{ Variables: AuthVars }>,
   deps: LegalBodyOrderDeps,
+  gasSeed?: GasSeedDeps,
 ): void {
   // On every POST door, the abandon and refresh doors included: they read no body, and still
   // bound what a caller may send them. A declared length over the limit is refused before a byte
@@ -248,6 +256,14 @@ export function mountLegalBodyOrderRoutes(
       return c.json(await refreshBinding(deps, tenantId, c.req.param("id")));
     }),
   );
+
+  // `requestGasSeed` makes every check itself, the off check first. It reads no body.
+  if (gasSeed)
+    app.post("/legal-body-orders/:id/gas-seed", limit, (c) =>
+      door("gas_seed", async () =>
+        c.json(await requestGasSeed(gasSeed, c.get("tenantId"), c.req.param("id"))),
+      ),
+    );
 }
 
 /** The order's binding as the API shows it, from the row as stored. */
