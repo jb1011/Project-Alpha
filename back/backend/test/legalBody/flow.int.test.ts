@@ -1,12 +1,12 @@
 /**
  * THE LEGAL-BODY FLOW ON A LOCAL CHAIN: an order becomes a body its identity points at.
  *
- * The real API app with its order, link and binding doors, the real repository over a database
- * file, the real sweeper, and the real chain adapter over anvil, where the real NoviController
- * relays each create to the real LegalBodyFactory. The identity registry is the mock registry the
- * factory reads; a contract owner is one of the two mock wallets. The guardian's human
- * verification is seeded in the World store, and its company is declared through the customer
- * company functions and checked as the operator records a check.
+ * The real API app with its order, link, binding and gas-seed doors and its MCP endpoint, the real
+ * repository over a database file, the real sweeper, and the real chain adapter over anvil, where
+ * the real NoviController relays each create to the real LegalBodyFactory. The identity registry
+ * is the mock registry the factory reads; a contract owner is one of the two mock wallets. The
+ * guardian's human verification is seeded in the World store, and its company is declared through
+ * the customer company functions and checked as the operator records a check.
  *
  * One chain for the file. One database, one document store, one app and one sweeper per case, so
  * a sweeper tick works the rows of its own case only. Each case:
@@ -17,15 +17,18 @@
  * over a row moves that clock past the row's next check, and moves the chain's clock with it. The
  * cases that move the chain's clock by hours or days run after the cases that do not.
  *
- * The first `describe` is the path; the second is what the path survives: a lost response, a
- * restart, a transfer of the identity, a gap in the platform key's nonces, and the payment quote
- * that waits for a linked body. The path's last case, which moves the clocks by days, comes after
- * both. Every answer a door gives in the file is checked as it arrives: no bigint, no node URL and
- * no text of a thrown error.
+ * The first `describe` is the path; the second is the path an agent takes through the MCP
+ * endpoint's tools, and the gas seed an owner that holds nothing pays for its pointer with; the
+ * third is what the path survives: a lost response, a restart, a transfer of the identity, a gap in
+ * the platform key's nonces, and the payment quote that waits for a linked body. The path's last
+ * case, which moves the clocks by days, comes after all three. Every answer a door or a tool gives
+ * in the file is checked as it arrives: no bigint, no node URL and no text of a thrown error.
  *
  * The app's throttles never refuse here; the caps are the deployment's defaults. Its formation
  * block and payment config are wired as a deployment that does not charge wires them, except in
- * the one case about the payment quote, which runs on a deployment that charges.
+ * the one case about the payment quote, which runs on a deployment that charges. Its gas seed is
+ * off, as a deployment's is by default, except in the one case about the seed, which runs on a
+ * deployment that sets one.
  *
  * Every key is derived from anvil's published test mnemonic, never a real wallet, and every name
  * and filing number is an invention.
@@ -84,6 +87,7 @@ import {
   prepareCustomerStatement,
 } from "../../src/legalBody/customerCompany";
 import { expireEvidenceBytes } from "../../src/legalBody/evidence";
+import type { GasSeedDeps } from "../../src/legalBody/gasSeed";
 import { linkFromWire } from "../../src/legalBody/link";
 import type { LegalBodyOrderDeps } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
@@ -93,6 +97,7 @@ import {
   LEGAL_BODY_SWEEP_MAX_PER_TICK,
   LegalBodySweeper,
 } from "../../src/legalBody/sweeper";
+import { buildOutflowMeter } from "../../src/payments/outflowMeter";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { SqliteCompanyCheckRepository } from "../../src/persistence/companyCheckRepository";
 import { SqliteCompanyDeclarationRepository } from "../../src/persistence/companyDeclarationRepository";
@@ -121,6 +126,7 @@ import {
   deployContract,
   deployLegalBodyStack,
 } from "../helpers/legalBodyStack";
+import { startMcpTestClient } from "../mcp/helpers";
 
 /** This file's own port: 8545 to 8553 belong to the other anvil-based files. */
 const PORT = 8554;
@@ -151,6 +157,9 @@ const deployer = keyAt(4);
 const buyer = keyAt(5);
 /** Each case's guardians take the next keys from here on. */
 const FIRST_GUARDIAN_INDEX = 10;
+/** An identity's owner that starts with nothing: anvil funds only the first ten keys, and no
+ *  guardian reaches this one. */
+const freshOwner = keyAt(1_000);
 
 const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
 const COMPANY_NAME = "Example Holdings LLC";
@@ -162,7 +171,19 @@ const DAY_SECONDS = 24 * 3_600;
 
 const ORDERS = "/legal-body-orders";
 const orderPath = (id: string) => `${ORDERS}/${id}`;
+const gasSeedPath = (id: string) => `${orderPath(id)}/gas-seed`;
 const requotePath = (companyId: string) => `/companies/${companyId}/payment/requote`;
+
+/** The gas seed of the one case that sets one: the largest a deployment may set, in USDC. */
+const SEED_USDC = "0.05";
+/** The same amount in the native unit's 18 decimals, as the seed's door sends it. */
+const SEED_WEI = parseEther(SEED_USDC);
+/** …and in 6-decimal USDC, as the platform's outflow meter counts it. */
+const SEED_MICRO_USDC = 50_000;
+/** The platform's outflow ceiling and window, a deployment's defaults: 200 USDC, in 6-decimal
+ *  units, over 24 hours. */
+const OUTFLOW_CEILING_ATOMIC = 200_000_000n;
+const OUTFLOW_WINDOW_MS = 24 * 3_600_000;
 
 /** A customer company's fee, in atomic units, on the deployment that charges: a placeholder. */
 const CUSTOMER_FEE = 7_000_000n;
@@ -179,6 +200,8 @@ let pub: PublicClient;
 /** anvil's own controls: mine a block, move the chain's clock, set a balance. */
 let node: TestClient;
 let stack: LegalBodyStack;
+/** The platform's adapter: every create, and the gas seed's native send, from the executor. */
+let arc: ArcAdapter;
 let lb: LegalBodyChain;
 
 /**
@@ -220,7 +243,7 @@ beforeAll(async () => {
     pub,
     executor: executor.address,
   });
-  const arc = new ArcAdapter({
+  arc = new ArcAdapter({
     publicClient: pub,
     managerWallet: walletOf(executor),
     sendClient: pub,
@@ -272,8 +295,13 @@ const open = () => ({ take: () => true });
  * customer company: the company waits as a draft for its payment, and the payment doors quote it.
  * Nothing in this file settles a payment, so the settlement's executor is the fake chain of the
  * payment fixture, and no payment ever reaches anvil.
+ *
+ * Its gas seed is off unless `gasSeedUsdc` sets one, and its deps are built as the composition root
+ * builds them: the amount in wei, the owner's code and balance read through the public client, the
+ * platform's outflow meter over this database, asked before a seed and fed after it on the
+ * `gas_seed` path, and the adapter's native send from the platform key.
  */
-function deploy(opts: { charging?: boolean } = {}): Deployment {
+function deploy(opts: { charging?: boolean; gasSeedUsdc?: string } = {}): Deployment {
   const charging = opts.charging === true;
   const db = openDatabase(join(dir, "legalbody.db"));
   migrate(db);
@@ -311,6 +339,20 @@ function deploy(opts: { charging?: boolean } = {}): Deployment {
     // The door's reads of a create's receipt follow each other at once: a 202 costs no real time.
     sleep: async () => {},
   };
+  const outflows = buildOutflowMeter(db, {
+    ceilingAtomic: OUTFLOW_CEILING_ATOMIC,
+    windowMs: OUTFLOW_WINDOW_MS,
+    now,
+  });
+  const gasSeed: GasSeedDeps = {
+    orders: orderDeps,
+    amountWei: parseEther(opts.gasSeedUsdc ?? "0"),
+    readCode: (address) => pub.getCode({ address }),
+    readBalance: (address) => pub.getBalance({ address }),
+    checkOutflow: (valueAtomic) => outflows.check(valueAtomic),
+    sendNative: (to, value) => arc.sendNativeAsPlatform(to, value),
+    recordOutflow: (valueAtomic, hash) => outflows.record("gas_seed", valueAtomic, hash),
+  };
   const customerDeps = sandboxCustomerCompanyDeps(
     { db, companies, declarations, checks, store },
     now,
@@ -343,6 +385,7 @@ function deploy(opts: { charging?: boolean } = {}): Deployment {
     },
     customerCompanies: { ...customerDeps, documents, docStore },
     legalBodyOrders: orderDeps,
+    legalBodyGasSeed: gasSeed,
     formation: {
       environment: pin.environment,
       required: true,
@@ -404,7 +447,7 @@ function deploy(opts: { charging?: boolean } = {}): Deployment {
  * that restarts opens them, with a new app and a new sweeper. The old database handle is closed
  * first, and the sender's nonce floors are forgotten, as a new process starts without them.
  */
-function redeploy(opts: { charging?: boolean } = {}): void {
+function redeploy(opts: { charging?: boolean; gasSeedUsdc?: string } = {}): void {
   d.db.close();
   resetSenderNonces();
   d = deploy(opts);
@@ -1140,6 +1183,227 @@ describe("an order becomes a linked body on a local chain", () => {
       expect.objectContaining({ orderId: id, stage: "head", errorName: "HttpRequestError" }),
     ]);
     expect(await readOrder(g, id)).toMatchObject({ state: "draft", agentId: null });
+  });
+});
+
+// ── The tools, as an agent calls them, and the gas seed ───────────────────────────────────────
+
+/** An agent connected to the MCP endpoint of the case's app with one API key. */
+type Agent = Awaited<ReturnType<typeof startMcpTestClient>>;
+
+/**
+ * One tool call, as the agent makes it. Its answer is checked as a door's is, and it must be an
+ * answer, not a refusal: a refusal fails the case with the tool's own text.
+ */
+async function useTool(agent: Agent, name: string, args: Record<string, unknown>): Promise<Json> {
+  const out = (await agent.client.callTool({ name, arguments: args })) as {
+    content: { type: string; text?: string }[];
+    isError?: boolean;
+  };
+  const text = out.content[0]?.text ?? "";
+  expect(out.isError === true, `${name} refused: ${text}`).toBe(false);
+  expectWireSafe({ method: "TOOL", path: name, status: 200, text });
+  return JSON.parse(text);
+}
+
+/** The platform's outflows recorded in the case's database, oldest first. */
+const outflowRows = () =>
+  d.db.prepare("SELECT path, amount, ref FROM platform_outflows ORDER BY id").all();
+
+describe("an agent that holds the identity owner's key, and the gas seed, on a local chain", () => {
+  test("an agent with a provision key of the guardian's tenant gets the link message, has the owner's key sign it as served, and submits it: the order is deployed, and get_binding answers the pointer intent, the factory's own pointer for the body", async () => {
+    const g = await newGuardian();
+    const agentId = await identityOfKey();
+
+    // The guardian places the order in the browser and gives its agent a provision key of its
+    // tenant. No tool call names a tenant: each tool reads it from the key.
+    const { id } = await order(g);
+    const { key } = new SqliteApiKeyStore(d.db).mint(g.address, { capability: "provision" });
+    const agent = await startMcpTestClient(d.app, key);
+    try {
+      const served = await useTool(agent, "get_link_message", {
+        orderId: id,
+        agentId: agentId.toString(),
+      });
+      expect(served.identityOwner).toBe(owner.address);
+      const { typedData } = served;
+      expect(typedData.domain).toMatchObject({
+        chainId: anvilChain.id,
+        verifyingContract: stack.factory,
+      });
+      expect(typedData.message).toMatchObject({
+        agentId: agentId.toString(),
+        guardian: g.address,
+        deadline: String(served.deadline),
+      });
+
+      // The owner's key signs the typed data exactly as the tool served it.
+      const signature = await owner.signTypedData(typedData);
+      const before = await executorCounts();
+      const submitted = await useTool(agent, "submit_link", {
+        orderId: id,
+        message: typedData.message,
+        signature,
+      });
+      expect(submitted).toMatchObject({
+        status: "deployed",
+        order: {
+          id,
+          state: "deployed",
+          agentId: agentId.toString(),
+          identityOwner: owner.address,
+          guardian: g.address,
+        },
+      });
+      const body: Address = submitted.order.bodyAddress;
+
+      // One create, sent by the executor and mined, at the address the factory predicts for the
+      // digest the owner signed, with the owner recorded as the identity's owner at creation.
+      expect(await executorCounts()).toEqual({
+        mined: before.mined + 1,
+        pending: before.pending + 1,
+      });
+      expect(await pub.getTransactionReceipt({ hash: submitted.order.createTxHash })).toMatchObject(
+        { status: "success" },
+      );
+      await expect(
+        pub.readContract({
+          address: stack.factory,
+          abi: legalBodyFactoryAbi,
+          functionName: "predictLegalBody",
+          args: [hashTypedData(typedData)],
+        }),
+      ).resolves.toBe(body);
+      await expect(
+        pub.readContract({
+          address: stack.factory,
+          abi: legalBodyFactoryAbi,
+          functionName: "identityOwnerAtCreation",
+          args: [body],
+        }),
+      ).resolves.toBe(owner.address);
+      // The guardian's browser reads the same order.
+      expect(await readOrder(g, id)).toEqual(submitted.order);
+
+      const bound = await useTool(agent, "get_binding", { orderId: id });
+      expect(bound).toEqual({
+        state: "deployed",
+        agentId: agentId.toString(),
+        bodyAddress: body,
+        intent: {
+          action: "setLegalBodyPointer",
+          agentId: agentId.toString(),
+          body,
+          chainId: anvilChain.id,
+        },
+        pointerSeenAt: null,
+        nextCheckAt: expect.any(Number),
+      });
+      expect(bound).toEqual(await binding(g, id));
+      // The pointer the intent describes is the factory's own pointer for the body.
+      await expect(lb.encodePointer(body)).resolves.toBe(pointerFrom(bound.intent));
+    } finally {
+      await agent.close();
+    }
+  });
+
+  test("the gas seed: the owner of an identity, holding nothing, is seeded once through the door and pays for its pointer transaction with the seed, and the body is linked; a second request by the same tenant is refused with gas_seed_used, and nothing is sent", async () => {
+    redeploy({ gasSeedUsdc: SEED_USDC });
+    const g = await newGuardian();
+
+    // An identity registered by the owner's key and transferred to an address with no balance
+    // and no code.
+    const agentId = await identityOfKey();
+    await mined(
+      await walletOf(owner).writeContract({
+        address: stack.registry,
+        abi: iIdentityRegistryAbi,
+        functionName: "transferFrom",
+        args: [owner.address, freshOwner.address, agentId],
+        account: owner,
+        chain: anvilChain,
+      }),
+    );
+    await expect(lb.identityOwner(agentId)).resolves.toBe(freshOwner.address);
+    expect(await pub.getBalance({ address: freshOwner.address })).toBe(0n);
+    expect(await pub.getCode({ address: freshOwner.address })).toBeUndefined();
+
+    // The guardian orders, and the new owner signs the link, which costs it nothing: the platform
+    // creates the body.
+    const { id } = await order(g);
+    const served = await linkMessage(g, id, agentId, 3_600);
+    expect(served.identityOwner).toBe(freshOwner.address);
+    const linked = await submitLink(
+      g,
+      id,
+      served.typedData,
+      await freshOwner.signTypedData(served.typedData),
+    );
+    expect(linked.status).toBe(200);
+    expect(linked.body).toMatchObject({ id, state: "deployed", identityOwner: freshOwner.address });
+    const body: Address = linked.body.bodyAddress;
+    expect(await pub.getBalance({ address: freshOwner.address })).toBe(0n);
+
+    // The seed, through the door: one transfer of the amount, from the executor to the owner,
+    // counted against the platform's outflow in 6-decimal USDC.
+    const before = await executorCounts();
+    const seeded = await api("POST", gasSeedPath(id), g);
+    expect(seeded.status).toBe(200);
+    expect(seeded.body).toEqual({
+      status: "sent",
+      txHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+    });
+    const seedHash: Hex = seeded.body.txHash;
+    const seedReceipt = await mined(seedHash);
+    expect(isAddressEqual(seedReceipt.from, executor.address)).toBe(true);
+    expect(seedReceipt.to && isAddressEqual(seedReceipt.to, freshOwner.address)).toBe(true);
+    expect((await pub.getTransaction({ hash: seedHash })).value).toBe(SEED_WEI);
+    expect(await pub.getBalance({ address: freshOwner.address })).toBe(SEED_WEI);
+    const afterSeed = { mined: before.mined + 1, pending: before.pending + 1 };
+    expect(await executorCounts()).toEqual(afterSeed);
+    expect(outflowRows()).toEqual([{ path: "gas_seed", amount: SEED_MICRO_USDC, ref: seedHash }]);
+
+    // The owner's pointer transaction, encoded from the binding door's intent and paid for with
+    // the seed: what the owner holds now is the seed less that transaction's fee.
+    const { intent } = await binding(g, id);
+    expect(intent).toMatchObject({ agentId: agentId.toString(), body });
+    const pointerReceipt = await mined(
+      await walletOf(freshOwner).writeContract({
+        address: stack.registry,
+        abi: iIdentityRegistryAbi,
+        functionName: "setMetadata",
+        args: [agentId, POINTER_KEY, pointerFrom(intent)],
+        account: freshOwner,
+        chain: anvilChain,
+      }),
+    );
+    expect(isAddressEqual(pointerReceipt.from, freshOwner.address)).toBe(true);
+    const left = SEED_WEI - pointerReceipt.gasUsed * pointerReceipt.effectiveGasPrice;
+    expect(await pub.getBalance({ address: freshOwner.address })).toBe(left);
+    await expect(lb.linkedLegalBody(agentId)).resolves.toBe(body);
+
+    // A second request by the same tenant, for the same order: the order is still deployed and
+    // its owner now holds less than a seed, so what answers it is the tenant's one seed, spent.
+    expect(await readOrder(g, id)).toMatchObject({ state: "deployed" });
+    expect(left).toBeLessThan(SEED_WEI);
+    const again = await api("POST", gasSeedPath(id), g);
+    expect(again).toMatchObject({
+      status: 409,
+      body: { error: { code: "gas_seed_used", message: LEGAL_BODY_SENTENCES.gas_seed_used } },
+    });
+    expect(await executorCounts()).toEqual(afterSeed);
+    expect(await pub.getBalance({ address: freshOwner.address })).toBe(left);
+    expect(outflowRows()).toHaveLength(1);
+    expect(d.legalBodies.countEventsByTenant(g.address, "gas_seed_requested")).toBe(1);
+    expect(d.legalBodies.countEventsByTenant(g.address, "gas_seeded")).toBe(1);
+
+    // The next tick reads the pointer the seed paid for: the body is linked.
+    await d.sweeper.tick();
+    expect(await binding(g, id)).toMatchObject({
+      state: "linked",
+      bodyAddress: body,
+      intent: null,
+    });
   });
 });
 
