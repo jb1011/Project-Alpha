@@ -8,7 +8,9 @@
  *  - a production deployment that charges, serving an approved wording under a production World ID
  *    configuration. Its declarant types a name and a title, so this is where the run shows where
  *    they go: into the declaration's table, the typed data the declarant asked to sign and the
- *    operator's `company:show`, and into no other answer, table, ops line or output;
+ *    operator's `company:show`, and into no other answer, table, ops line or output. A customer's
+ *    company is quoted only once one of its legal bodies is linked: here one is linked through the
+ *    legal-body repository before the quote;
  *  - a sandbox deployment that does not charge, where a passed check makes a company active at
  *    once. Its declarant is the sandbox fixture, never a name a caller typed.
  *
@@ -48,12 +50,14 @@ import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
+import { SqliteLegalBodyRepository } from "../../src/persistence/legalBodyRepository";
 import { SqlitePasskeyStore } from "../../src/persistence/passkeyStore";
 import { SqliteWorldStore } from "../../src/persistence/worldStore";
 import type { Hex } from "../../src/types";
 import { OnboardingRunner } from "../../src/workflow/runner";
 import {
   ANVIL_ACCOUNT_2,
+  FACTORY,
   FORMATION_PROVIDER,
   SANDBOX_TYPED,
   customerCompanyDeps,
@@ -169,6 +173,7 @@ function deploy(charging: boolean) {
   const parties = new SqliteFormationPartyRepository(db);
   const repo = new SqliteEntityRepository(db);
   const store = new SqliteWorldStore(db);
+  const legalBodies = new SqliteLegalBodyRepository(db);
   const chain = fakeChain();
   const stores = { db, companies, declarations, checks, store };
   // Production: the approved wording and a production World ID configuration (the fixture's
@@ -204,7 +209,11 @@ function deploy(charging: boolean) {
     documents,
     docStore,
     formationSteps: (id: string) => requests.stepsOf(id),
-    customerFacts: { declarations, checks },
+    customerFacts: {
+      declarations,
+      checks,
+      hasLinkedLegalBody: (companyId: string) => legalBodies.hasLinkedForCompany(companyId),
+    },
     customerCompanies: { ...doors, documents, docStore },
     formation: {
       environment: pin.environment,
@@ -241,11 +250,42 @@ function deploy(charging: boolean) {
     requests,
     repo,
     store,
+    legalBodies,
     chain,
     sagas,
   };
 }
 type Deployment = ReturnType<typeof deploy>;
+
+/**
+ * One legal body of the company, moved to `linked` through the legal-body repository, as the
+ * order, the create and the binding check move one. Its addresses and hashes are placeholders.
+ */
+function linkBody(d: Deployment, companyId: string): void {
+  const H = (c: string) => `0x${c.repeat(64)}` as Hex;
+  const id = d.legalBodies.create({
+    tenantId: guardian.address,
+    companyId,
+    chainId: CHAIN_ID,
+    factory: FACTORY,
+    amendmentDelay: 172_800,
+  }).legalBodyId;
+  expect(d.legalBodies.freezeAgreement(id, { hash: H("a"), version: 1 })).toBe(true);
+  expect(
+    d.legalBodies.reserve(id, {
+      agentId: "1",
+      identityOwner: guardian.address,
+      linkDigest: H("b"),
+      linkDeadline: Math.floor(Date.now() / 1000) + 3600,
+      linkSignature: "0x01",
+      bodyAddress: "0x00000000000000000000000000000000000b0d1e",
+      observedAtBlock: 1,
+      firstCheckAt: Date.now(),
+    }),
+  ).toBe("reserved");
+  expect(d.legalBodies.markDeployed(id, { txHash: H("c"), deployedAt: 1_800_000_000 })).toBe(true);
+  expect(d.legalBodies.markLinked(id, 1_800_000_100)).toMatchObject({ outcome: "linked" });
+}
 
 // ── The API, as a client calls it ─────────────────────────────────────────────────────────────
 
@@ -565,7 +605,9 @@ test("production, charging: a declared company is uploaded, checked, paid, revok
   });
   await attachRefused(d, token, companyId);
 
-  // The requote through the REST door writes the customer fee.
+  // One of its legal bodies is linked; only then is it quoted. The requote through the REST door
+  // writes the customer fee.
+  linkBody(d, companyId);
   const requoted = await call(d, "POST", requotePath(companyId), token);
   expect(requoted.status).toBe(201);
   const quote = requoted.body as ServedQuote;

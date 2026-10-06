@@ -14,8 +14,14 @@ import {
   parseEventLogs,
   zeroAddress,
 } from "viem";
-import { iIdentityRegistryAbi, legalBodyFactoryAbi, noviControllerAbi } from "../../abis/generated";
+import {
+  iIdentityRegistryAbi,
+  legalBodyFactoryAbi,
+  legalManagerAbi,
+  noviControllerAbi,
+} from "../../abis/generated";
 import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../../errors";
+import type { LinkChainPort } from "../../legalBody/checkLink";
 import type { LegalBodyLink } from "../../legalBody/link";
 import { isRangeTooLargeError } from "../../monitor/scan";
 import type { ArcAdapter, PreparedRelayedCall, RelayedCall } from "./arcAdapter";
@@ -25,7 +31,7 @@ import { withSenderLock } from "./senderLock";
 
 /**
  * The part of the ArcAdapter a LegalBodyChain uses: the relay seam a create goes through, the
- * executor that signs it and its mined nonce, and the chain it signs for.
+ * executor that signs it, its mined and pending nonces, and the chain it signs for.
  */
 export type RelaySeam = Pick<
   ArcAdapter,
@@ -35,6 +41,7 @@ export type RelaySeam = Pick<
   | "sendRawRelayedCall"
   | "platformAddress"
   | "platformNonce"
+  | "platformPendingNonce"
   | "chainId"
 >;
 
@@ -68,6 +75,10 @@ export const CREATION_LOG_WINDOW_BLOCKS = 5_000n;
 /** The narrowest window a node's "range too large" answer halves {CREATION_LOG_WINDOW_BLOCKS} to.
  *  A node that refuses this many blocks is not refusing the width. */
 const CREATION_LOG_WINDOW_FLOOR = 500n;
+
+/** A legal body's own `status()`: LegalManager's `Status` enum, by its value (Active, WindingDown,
+ *  Dissolved, in declaration order). */
+const BODY_STATUSES = ["active", "winding_down", "dissolved"] as const;
 
 /** The factory's event for a body it created. */
 const LEGAL_BODY_CREATED = getAbiItem({ abi: legalBodyFactoryAbi, name: "LegalBodyCreated" });
@@ -381,15 +392,38 @@ export class LegalBodyChain {
     return isAddressEqual(creator, p.identityOwner) ? "created" : "foreign";
   }
 
-  /** The body this agent is linked to right now, by the factory's own predicate, or `undefined`. */
-  async linkedLegalBody(agentId: bigint): Promise<Address | undefined> {
+  /** The body this agent is linked to, by the factory's own predicate, or `undefined`. */
+  async linkedLegalBody(agentId: bigint, blockNumber?: bigint): Promise<Address | undefined> {
     const body = await this.d.publicClient.readContract({
       address: this.d.factory,
       abi: legalBodyFactoryAbi,
       functionName: "linkedLegalBody",
       args: [agentId],
+      blockNumber,
     });
     return isAddressEqual(body, zeroAddress) ? undefined : body;
+  }
+
+  /**
+   * The body's lifecycle, from its own `status()`: `active`, `winding_down` or `dissolved`. A value
+   * outside the contract's enum throws: it is not a state this code knows.
+   */
+  async bodyStatus(
+    body: Address,
+    blockNumber?: bigint,
+  ): Promise<"active" | "winding_down" | "dissolved"> {
+    const value = await this.d.publicClient.readContract({
+      address: body,
+      abi: legalManagerAbi,
+      functionName: "status",
+      blockNumber,
+    });
+    const status = BODY_STATUSES[value];
+    if (status === undefined)
+      throw new Error(
+        `LegalBodyChain: the body at ${body} reports status ${value}, outside its contract's enum`,
+      );
+    return status;
   }
 
   /** The exact pointer bytes the identity owner writes to link the agent to `legalBody`. */
@@ -405,6 +439,12 @@ export class LegalBodyChain {
   /** The executor's MINED transaction count, never the pending one. */
   executorNonce(): Promise<number> {
     return this.d.arc.platformNonce();
+  }
+
+  /** The executor's PENDING transaction count: the node's own number, with no floor from this
+   *  process's sends (see {ArcAdapter.platformPendingNonce}). */
+  executorPendingNonce(): Promise<number> {
+    return this.d.arc.platformPendingNonce();
   }
 
   /** The executor, or a throw: a create is signed and paid for by it, under its sender lock. */
@@ -707,3 +747,12 @@ export type CreateChainPort = Pick<
   | "confirmCreate"
   | "findCreation"
 >;
+
+/**
+ * What the legal-body flow needs of a LegalBodyChain: the link check's reads, the create's calls,
+ * and the reads that settle an order and check its binding. Built from public members only, so a
+ * plain object satisfies it.
+ */
+export type LegalBodyChainPort = LinkChainPort &
+  CreateChainPort &
+  Pick<LegalBodyChain, "linkedLegalBody" | "bodyStatus" | "executorPendingNonce">;

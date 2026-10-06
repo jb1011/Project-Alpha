@@ -6,6 +6,11 @@
  * stays signable for its whole window, and a revocation inside that window must stop the money.
  * A formation company is quoted and settled exactly as before.
  *
+ * A customer's company is also quoted and settled only once one of its legal bodies is linked, a
+ * rule the legal-body order doors' tests cover. Every company a test here quotes or settles has
+ * one, linked through the legal-body repository. The check is asked before the link, so a company
+ * that has not passed its check is refused for the check, linked or not.
+ *
  * Through the doors: the REST payment doors and the MCP re-quote tool, over the shared payment
  * fixture (a fake chain, and the USDC domain as the token reports it). A customer's company is
  * written as the declaration door writes it, and its checks are appended as the operator's command
@@ -32,6 +37,7 @@ import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../../src/persistence/formationPartyRepository";
 import { SqliteFormationPaymentRepository } from "../../src/persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../../src/persistence/formationRepository";
+import { SqliteLegalBodyRepository } from "../../src/persistence/legalBodyRepository";
 import type { Hex } from "../../src/types";
 import { formationPaymentDeps } from "../../src/workflow/formationPayment";
 import { fakeChain, paymentCfg } from "../helpers/formationPayment";
@@ -57,6 +63,9 @@ let parties: SqliteFormationPartyRepository;
 let payments: SqliteFormationPaymentRepository;
 let declarations: SqliteCompanyDeclarationRepository;
 let checks: SqliteCompanyCheckRepository;
+let legalBodies: SqliteLegalBodyRepository;
+/** Legal bodies linked so far in this test: each gets its own agentId and body address. */
+let linkedBodies = 0;
 let apiKeys: SqliteApiKeyStore;
 let chain: ReturnType<typeof fakeChain>;
 
@@ -70,6 +79,8 @@ beforeEach(() => {
   payments = new SqliteFormationPaymentRepository(db);
   declarations = new SqliteCompanyDeclarationRepository(db);
   checks = new SqliteCompanyCheckRepository(db);
+  legalBodies = new SqliteLegalBodyRepository(db);
+  linkedBodies = 0;
   apiKeys = new SqliteApiKeyStore(db);
   chain = fakeChain();
   // Quotes and settlements write ops lines: kept off stdout here.
@@ -103,7 +114,15 @@ function app(opts: { customerFacts?: boolean; customerFee?: boolean } = {}) {
     formationSteps: (id: string) => requests.stepsOf(id),
     company: (id: string) => companies.find(id),
     companyAgents: companies,
-    ...(opts.customerFacts === false ? {} : { customerFacts: { declarations, checks } }),
+    ...(opts.customerFacts === false
+      ? {}
+      : {
+          customerFacts: {
+            declarations,
+            checks,
+            hasLinkedLegalBody: (companyId: string) => legalBodies.hasLinkedForCompany(companyId),
+          },
+        }),
     formation: {
       environment: "sandbox",
       required: true,
@@ -152,6 +171,40 @@ function customerCompany(): string {
 
 /** A 32-byte value: one byte, written as two hex digits, repeated. */
 const H = (byte: string) => `0x${byte.repeat(32)}` as Hex;
+
+/** A placeholder legal-body factory. */
+const LEGAL_BODY_FACTORY = getAddress("0x00000000000000000000000000000000000fac70");
+
+/**
+ * One legal body of the company, moved to `linked` through the legal-body repository, as the
+ * order, the create and the binding check move one. A customer's company is quoted and settled
+ * only once one of its legal bodies is linked.
+ */
+function linkBody(companyId: string): void {
+  linkedBodies += 1;
+  const id = legalBodies.create({
+    tenantId: OWNER,
+    companyId,
+    chainId: 5042002,
+    factory: LEGAL_BODY_FACTORY,
+    amendmentDelay: 172_800,
+  }).legalBodyId;
+  expect(legalBodies.freezeAgreement(id, { hash: H("a1"), version: 1 })).toBe(true);
+  expect(
+    legalBodies.reserve(id, {
+      agentId: String(linkedBodies),
+      identityOwner: OWNER,
+      linkDigest: H("b1"),
+      linkDeadline: 1_900_000_000,
+      linkSignature: "0x01",
+      bodyAddress: getAddress(`0x${(0xb0d100 + linkedBodies).toString(16).padStart(40, "0")}`),
+      observedAtBlock: 1,
+      firstCheckAt: 1_800_000_000_000,
+    }),
+  ).toBe("reserved");
+  expect(legalBodies.markDeployed(id, { txHash: H("c2"), deployedAt: 1_800_000_000 })).toBe(true);
+  expect(legalBodies.markLinked(id, 1_800_000_100)).toMatchObject({ outcome: "linked" });
+}
 
 function passed(companyId: string): NewCompanyCheck {
   return {
@@ -266,6 +319,7 @@ test("REST: a requote of a verified customer company answers 201 with the custom
   const application = app();
   const companyId = customerCompany();
   checks.append(passed(companyId));
+  linkBody(companyId);
 
   const res = await post(application, requotePath(companyId));
   expect(res.status).toBe(201);
@@ -372,6 +426,7 @@ test("MCP: requote_company_payment refuses a customer company before its pass, a
   expect(payments.findCurrent(companyId, "formation")).toBeUndefined();
 
   checks.append(passed(companyId));
+  linkBody(companyId);
   const after = await requote();
   expect(after.isError).toBe(false);
   expect(JSON.parse(after.text)).toMatchObject({ amountUsdc: CUSTOMER_FEE.toString() });
@@ -386,6 +441,7 @@ test("formationPaymentDeps hands the payment functions the checks of the custome
 test("a verified customer company on a deployment with no customer fee is never quoted: the requote is refused and writes nothing", async () => {
   const companyId = customerCompany();
   checks.append(passed(companyId));
+  linkBody(companyId);
   const application = app({ customerFee: false });
   const before = rowsAtRest();
 
@@ -426,6 +482,7 @@ test("the check is asked first: before the payment row in a settlement, before t
   // Quoted, then revoked: a requote names the check, not the live quote.
   const quoted = customerCompany();
   checks.append(passed(quoted));
+  linkBody(quoted);
   await requoted(application, quoted);
   checks.append(notPassed(quoted, "revoked"));
   const requote = await post(application, requotePath(quoted));
@@ -438,6 +495,7 @@ test("REST: a settlement of a verified customer company flips it from draft to r
   const application = app();
   const companyId = customerCompany();
   checks.append(passed(companyId));
+  linkBody(companyId);
   const quote = await requoted(application, companyId);
 
   const res = await post(application, settlePath(companyId), {
@@ -459,6 +517,7 @@ test("REST: a settlement of a customer company revoked after its quote is refuse
   const application = app();
   const companyId = customerCompany();
   checks.append(passed(companyId));
+  linkBody(companyId);
   const quote = await requoted(application, companyId);
   const signature = await signServed(quote.typedData);
   checks.append(notPassed(companyId, "revoked"));
@@ -474,6 +533,7 @@ test("REST: a settlement of a customer company revoked after its quote is refuse
 test("REST: with no checks to read, a settlement of a customer company is refused, and writes nothing", async () => {
   const companyId = customerCompany();
   checks.append(passed(companyId));
+  linkBody(companyId);
   const quote = await requoted(app(), companyId);
   const signature = await signServed(quote.typedData);
   const before = rowsAtRest();

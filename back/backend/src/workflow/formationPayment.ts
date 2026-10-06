@@ -63,6 +63,12 @@ export interface FormationPaymentDeps {
    * formation company never reads them.
    */
   checks?: Pick<CompanyCheckRepository, "latest">;
+  /**
+   * Whether one of a company's legal bodies is linked. A customer's own company is quoted and
+   * settled only while one is; without this read, it is refused. A formation company never reads
+   * it.
+   */
+  hasLinkedLegalBody?: (companyId: string) => boolean;
   /** The company status move and the payment status move commit together. */
   transaction: <T>(fn: () => T) => T;
   now?: () => number;
@@ -90,7 +96,7 @@ export type SettleResult =
  * Returns `undefined` where this deployment does not take payments, which each door turns into
  * its own kind of refusal: a 404 on REST, an `isError` on MCP.
  *
- * `customerFacts` is declared by its shape, the one read the payment gate makes, because this
+ * `customerFacts` is declared by its shape, the two reads the payment gate makes, because this
  * layer imports nothing from the API layer that defines the deps object both doors pass.
  */
 export function formationPaymentDeps(deps: {
@@ -100,7 +106,10 @@ export function formationPaymentDeps(deps: {
     payment?: FormationPaymentConfig;
     paymentExecutor?: FormationExecutorDeps;
   };
-  customerFacts?: { checks: Pick<CompanyCheckRepository, "latest"> };
+  customerFacts?: {
+    checks: Pick<CompanyCheckRepository, "latest">;
+    hasLinkedLegalBody?: (companyId: string) => boolean;
+  };
   now?: () => number;
 }): FormationPaymentDeps | undefined {
   const payment = deps.formation?.payment;
@@ -118,6 +127,8 @@ export function formationPaymentDeps(deps: {
     executor: { ...executor, receiptTimeoutMs: ROUTE_RECEIPT_TIMEOUT_MS },
     // The operator's checks, so a customer's own company is quoted and settled only after a pass.
     checks: deps.customerFacts?.checks,
+    // …and whether one of its legal bodies is linked, so it is quoted and settled only after that.
+    hasLinkedLegalBody: deps.customerFacts?.hasLinkedLegalBody,
     transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
     now: deps.now,
   };
@@ -127,21 +138,28 @@ const nowMs = (deps: FormationPaymentDeps) => (deps.now ?? Date.now)();
 const nowSec = (deps: FormationPaymentDeps) => Math.floor(nowMs(deps) / 1000);
 
 /**
- * THE OPERATOR'S CHECK, for a customer's own company: it is quoted and settled only while the
- * latest check of its declaration is a pass. No check yet, a failure, a revocation and a
+ * THE OPERATOR'S CHECK AND THE LINKED BODY, for a customer's own company: it is quoted and settled
+ * only while the latest check of its declaration is a pass AND one of its legal bodies is linked.
+ *
+ * The check is asked first, with its own reason. No check yet, a failure, a revocation and a
  * reinstatement (which waits for a new check) are all refused, and so is every customer company
- * when there are no checks to read: facts that cannot be read never pass.
+ * when there are no checks to read: facts that cannot be read never pass. Then the link: a company
+ * none of whose bodies is linked is refused with the second reason, and so is every customer
+ * company when there is no linked-body read, for the same reason.
  *
  * Returns the refusal, or `undefined` when the payment may go on. A formation company is never
  * refused here.
  */
 function checkRefusal(
-  deps: Pick<FormationPaymentDeps, "checks">,
+  deps: Pick<FormationPaymentDeps, "checks" | "hasLinkedLegalBody">,
   company: Pick<CompanyRecord, "companyId" | "provider">,
 ): { ok: false; reason: string } | undefined {
   if (company.provider !== CUSTOMER_PROVIDER) return undefined;
-  if (deps.checks?.latest(company.companyId)?.result === "passed") return undefined;
-  return { ok: false, reason: "this company has not passed its check yet" };
+  if (deps.checks?.latest(company.companyId)?.result !== "passed")
+    return { ok: false, reason: "this company has not passed its check yet" };
+  if (deps.hasLinkedLegalBody?.(company.companyId) !== true)
+    return { ok: false, reason: "this company has no linked legal body yet" };
+  return undefined;
 }
 
 /**
@@ -161,9 +179,10 @@ export const FINALITY_MARGIN_S = 120;
  *
  * The order is the design's, and every step of it is load-bearing:
  *
- *  0. a customer's own company must have passed its check, FIRST and at this moment rather than
- *     at quote time: a quote stays signable for its whole window and its grace, and a revocation
- *     inside that window must stop the settlement (`checkRefusal`);
+ *  0. a customer's own company must have passed its check and have a linked legal body, FIRST
+ *     and at this moment rather than at quote time: a quote stays signable for its whole window
+ *     and its grace, and a revocation inside that window must stop the settlement
+ *     (`checkRefusal`);
  *  1. the row must be LIVE and `quoted`. A `settling` row belongs to a broadcast the sweeper
  *     owns; accepting a second signature for it is the double charge;
  *  2. the clock, before anything expensive. A quote past `validBefore` cannot settle, and saying
@@ -751,8 +770,8 @@ export async function cancelFormationPayment(
  * terminal, so even a caller that ignored this rule gets a constraint violation rather than two
  * live authorizations.
  *
- * A customer's own company is quoted only once its check has passed (`checkRefusal`, first), and
- * at its own fee: the amount is the fee of the company's provider (`feeAtomicFor`). Where no
+ * A customer's own company is quoted only once its check has passed and one of its legal bodies
+ * is linked (`checkRefusal`, first), and at its own fee: the amount is the fee of the company's provider (`feeAtomicFor`). Where no
  * customer fee is configured, it is refused rather than quoted.
  */
 export function requoteFormationPayment(

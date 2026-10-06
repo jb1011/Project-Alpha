@@ -525,8 +525,8 @@ export const STALE_CUSTOMER_SECONDS = 30 * 24 * 3600;
  * A company whose transaction throws is left as it was and named in an ops line (its id only), and
  * the others still run: one bad row must not hold back every later sweep.
  *
- * Nothing calls it on a schedule yet: a periodic sweep is to. It works the same on a deployment that
- * does not charge, where a customer company is `ready` from its creation.
+ * The legal-body sweeper calls it on its first tick and every 120th after it. It works the same on
+ * a deployment that does not charge, where a customer company is `ready` from its creation.
  */
 export function expireStaleCustomerCompanies(
   deps: {

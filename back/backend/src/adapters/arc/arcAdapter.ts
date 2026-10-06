@@ -1020,6 +1020,23 @@ export class ArcAdapter {
   }
 
   /**
+   * The platform account's PENDING transaction count, as the node reports it: what it has mined
+   * plus what it holds for this account unmined. Set beside {platformNonce}, it says whether the
+   * node holds a transaction of ours that is not mined yet.
+   *
+   * The node's own number. The sender floor a send is numbered from (`senderLock.ts`) is NOT
+   * applied: this read numbers nothing, and takes no lock.
+   */
+  async platformPendingNonce(): Promise<number> {
+    const account = this.d.managerWallet.account;
+    if (!account) throw new Error("ArcAdapter: manager wallet has no account");
+    return this.d.publicClient.getTransactionCount({
+      address: account.address,
+      blockTag: "pending",
+    });
+  }
+
+  /**
    * BROADCAST the treasury top-up and return its hash. Does NOT wait for the receipt.
    *
    * The split exists for one reason (verification gate N2): the hash has to reach the database

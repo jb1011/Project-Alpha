@@ -19,6 +19,7 @@ import {
   sendClientFor,
   walletClientForKey,
 } from "../adapters/arc/clients";
+import { LegalBodyChain } from "../adapters/arc/legalBodyChain";
 import { readUsdcDomain } from "../adapters/arc/usdcToken";
 import { withCircleRateLimit } from "../adapters/circle/circleRateLimit";
 import {
@@ -38,6 +39,8 @@ import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import {
   DEFAULT_BYO_MAX_OPEN_PER_TENANT,
+  DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS,
+  LEGAL_BODY_FLOW_DEFAULTS,
   WORLD_CHAIN_DEFAULTS,
   canFormEntities,
   canProvisionTurnkey,
@@ -52,6 +55,13 @@ import { newChainHeadCache } from "../formation/payment";
 import { formationSummary } from "../formation/status";
 import { HederaMirror } from "../hedera/mirror";
 import { buildJobDeps } from "../jobs/composition";
+import { expireStaleCustomerCompanies } from "../legalBody/customerCompany";
+import { expireEvidenceBytes } from "../legalBody/evidence";
+import {
+  HOUSEKEEPING_BATCH,
+  LEGAL_BODY_SWEEP_MAX_PER_TICK,
+  LegalBodySweeper,
+} from "../legalBody/sweeper";
 import { STATEMENT_OF_AUTHORITY } from "../legalBody/texts/statementOfAuthority";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
@@ -79,6 +89,7 @@ import { SqliteEntityRepository } from "../persistence/entityRepository";
 import { SqliteFormationPartyRepository } from "../persistence/formationPartyRepository";
 import { SqliteFormationPaymentRepository } from "../persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../persistence/formationRepository";
+import { SqliteLegalBodyRepository } from "../persistence/legalBodyRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
@@ -102,6 +113,7 @@ import { OnboardingRunner, type RunSaga } from "../workflow/runner";
 import { buildApiApp } from "./app";
 import { ApiError } from "./errors";
 import { TokenBucket } from "./routes/agentBook";
+import { bucketsByKey } from "./routes/legalBodyOrders";
 import { buildWorldIdDeps } from "./routes/worldId";
 import { buildX402DemoDeps } from "./routes/x402Demo";
 import { installShutdownHandlers, shouldInstallSignalHandlers } from "./shutdown";
@@ -546,6 +558,55 @@ async function main() {
     : undefined;
 
   /**
+   * THE LEGAL-BODY FLOW's dependencies, built ONCE and only where the feature is on: the factory
+   * set, and the controller every call to it is relayed through (the config refuses the first
+   * without the second). Absent, the order doors are not mounted and no customer company is ever
+   * quoted (`customerFacts` below carries no linked-body read).
+   *
+   * One repository, over the same db handle as the company stores, whose own transaction an order
+   * is written in. One chain, over this process's `ArcAdapter` and public client, so a create goes
+   * out through the same platform key and send lock as every other platform transaction; it does
+   * not believe a head more than two minutes old. The doors' own budget is shared with nothing
+   * else, and the two bucket maps hold one bucket per tenant (5 in a burst, one more every 10
+   * seconds) and one per identity and tenant (3 in a burst, one more every 20 seconds).
+   */
+  const legalBodies =
+    cfg.legalBodyFactory && cfg.controllerAddress ? new SqliteLegalBodyRepository(db) : undefined;
+  const legalBodyFlow = cfg.legalBodyFlow ?? LEGAL_BODY_FLOW_DEFAULTS;
+  const legalBodyOrders =
+    legalBodies && cfg.legalBodyFactory
+      ? {
+          repo: legalBodies,
+          companies,
+          declarations: companyDeclarations,
+          checks: companyChecks,
+          world: worldId,
+          chain: new LegalBodyChain({
+            publicClient,
+            arc,
+            chainId: cfg.chainId,
+            factory: cfg.legalBodyFactory,
+            identityRegistry: cfg.identityRegistry,
+            maxHeadAgeSeconds: 120,
+          }),
+          // The agreements, in the file store every other document is in.
+          docStore,
+          deployment: { chainId: cfg.chainId, factory: cfg.legalBodyFactory },
+          identityRegistry: cfg.identityRegistry,
+          environment: legalBodyEnvironment(cfg),
+          amendmentDelaySeconds: legalBodyFlow.amendmentDelaySeconds,
+          maxOpenPerTenant: legalBodyFlow.maxOpenPerTenant,
+          maxOrdersPerTenantPerDay: legalBodyFlow.maxOrdersPerTenantPerDay,
+          maxCreatesPerTenantPerDay: legalBodyFlow.maxCreatesPerTenantPerDay,
+          maxCreatesPerDay: legalBodyFlow.maxCreatesPerDay,
+          doorBudget: new TokenBucket(20, 1),
+          tenantBucket: bucketsByKey(5, 1 / 10),
+          identityBucket: bucketsByKey(3, 1 / 20),
+          transaction: <T>(fn: () => T) => legalBodies.transaction(fn),
+        }
+      : undefined;
+
+  /**
    * The CUSTOMER COMPANY doors' dependencies (declare an existing Wyoming LLC, abandon it, upload
    * its evidence), built ONCE and only where `customerDoorsEnabled`: the legal-body factory is set
    * and, on a production deployment, the deployment charges, so a body could never read `active`
@@ -555,8 +616,7 @@ async function main() {
    * The repositories are the SAME instances the views read, over the same db handle the
    * transaction runs on, and the document index and file store are the ones the document routes
    * read, so a tenant downloads its upload where it downloads every document. Whether a company
-   * stands behind an open legal body is answered `false` until legal bodies can be opened on
-   * customer companies.
+   * stands behind an open legal body is read from the legal-body store above.
    */
   const customerCompanies =
     cfg.legalBodyFactory && customerDoorsEnabled(cfg)
@@ -574,7 +634,11 @@ async function main() {
           maxOpenPerTenant: cfg.formation?.byoMaxOpenPerTenant ?? DEFAULT_BYO_MAX_OPEN_PER_TENANT,
           // The switch of the payment config built above: charging, a new company lands `draft`.
           paymentRequired: formationPayment.required,
-          hasOpenLegalBody: () => false,
+          // A draft under 24 hours old, or a reserved, deployed or linked body. The store is there
+          // wherever these doors are (both need the factory); were it ever missing, every company
+          // would read as standing behind one, which only keeps it from being abandoned.
+          hasOpenLegalBody: (companyId: string) =>
+            legalBodies === undefined || legalBodies.hasOpenForCompany(companyId, Date.now()),
           transaction: <T>(fn: () => T) => repo.transaction(fn),
           // The evidence uploads, through the index and the file store the document routes read.
           documents: formationDocuments,
@@ -676,7 +740,16 @@ async function main() {
     documents: formationDocuments,
     // A customer company's view: its declaration and the operator's latest check, read for
     // customer companies only. Wired whatever the configuration, like everything else here.
-    customerFacts: { declarations: companyDeclarations, checks: companyChecks },
+    customerFacts: {
+      declarations: companyDeclarations,
+      checks: companyChecks,
+      // The one fact that is NOT wired whatever the configuration: whether one of the company's
+      // legal bodies is linked, which the payment doors require before they quote or settle a
+      // customer company. Only where the legal-body feature is on; absent, they never do.
+      ...(legalBodies
+        ? { hasLinkedLegalBody: (companyId: string) => legalBodies.hasLinkedForCompany(companyId) }
+        : {}),
+    },
   };
 
   const doolaTasks = new TaskTracker("doola_webhook_task");
@@ -715,6 +788,41 @@ async function main() {
     sweepIntervalMs: cfg.formation?.sweepMs ?? 60_000,
   };
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
+
+  /**
+   * THE LEGAL-BODY SWEEPER, where the feature is on: the order doors' own dependencies, so the
+   * loop settles orders through the same repository, chain and lock the doors use, and takes no
+   * token from their budgets. On its first tick and every 120th after it, it also runs the
+   * customer companies' housekeeping. The evidence bytes are deleted through the file store, which
+   * can delete, and the index the document routes read. A stale company is abandoned only when the
+   * legal-body store says no body or order of its own is open, inside that store's IMMEDIATE
+   * transaction: a write made meanwhile by another connection (an operator's command) is waited
+   * for, not turned into a skipped busy error.
+   */
+  const legalBodySweepMs = cfg.legalBodySweepIntervalMs ?? DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS;
+  const legalBodySweeper = legalBodyOrders
+    ? new LegalBodySweeper({
+        ...legalBodyOrders,
+        intervalMs: legalBodySweepMs,
+        maxPerTick: LEGAL_BODY_SWEEP_MAX_PER_TICK,
+        housekeeping: {
+          expireEvidence: () =>
+            expireEvidenceBytes({ documents: formationDocuments, docStore }, HOUSEKEEPING_BATCH),
+          expireStaleCompanies: () =>
+            expireStaleCustomerCompanies(
+              {
+                companies,
+                declarations: companyDeclarations,
+                checks: companyChecks,
+                hasOpenLegalBody: (companyId: string) =>
+                  legalBodyOrders.repo.hasOpenForCompany(companyId, Date.now()),
+                transaction: <T>(fn: () => T) => legalBodyOrders.repo.transaction(fn),
+              },
+              HOUSEKEEPING_BATCH,
+            ),
+        },
+      })
+    : undefined;
 
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
   // Credential-less boot: a deployment with no JOB_CLIENT_PRIVATE_KEY still starts, and jobs are
@@ -923,6 +1031,8 @@ async function main() {
     ...entityViewDeps,
     // The customer company doors, where this deployment mounts them.
     customerCompanies,
+    // The legal-body order doors, where the feature is on.
+    legalBodyOrders,
     // The inbound receiver (design §6). Present only with credentials: a box that cannot verify a
     // signature has no business owning the URL.
     doola:
@@ -1031,6 +1141,12 @@ async function main() {
     formationSweeper.start();
     console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
   }
+  // The same rule for the legal-body sweeper: its first tick, run by `start()` at once, is the
+  // reconcile of every order a restart interrupted, and a chain read must never hold up the port.
+  if (legalBodySweeper) {
+    legalBodySweeper.start();
+    console.log(`Legal-body sweeper started (every ${legalBodySweepMs}ms)`);
+  }
 
   // ── Unresolved TREASURY TRANSFERS at boot (gate N2), after the socket for the reason C4 gives.
   //
@@ -1069,7 +1185,12 @@ async function main() {
   // acked webhook work and an unattended timer. Guarded so importing this module under a test
   // runner never installs a handler that would exit the runner.
   if (shouldInstallSignalHandlers())
-    installShutdownHandlers({ sweeper: formationSweeper, tasks: doolaTasks, server });
+    installShutdownHandlers({
+      sweeper: formationSweeper,
+      sweepers: legalBodySweeper ? [legalBodySweeper] : [],
+      tasks: doolaTasks,
+      server,
+    });
 }
 
 main().catch((e) => {

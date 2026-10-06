@@ -5,7 +5,8 @@ import Database from "better-sqlite3";
 import { beforeEach, expect, test, vi } from "vitest";
 import { migrate, openDatabase } from "../../src/persistence/db";
 import {
-  LIVE_BINDING_STATES,
+  type Deployment,
+  IN_FLIGHT_BINDING_STATES,
   LegalBodyInputError,
   SqliteLegalBodyRepository,
 } from "../../src/persistence/legalBodyRepository";
@@ -17,6 +18,12 @@ const FACTORY = "0x00000000000000000000000000000000000000f1";
 const BODY_A = "0x00000000000000000000000000000000000000B1";
 const BODY_B = "0x00000000000000000000000000000000000000b2";
 const H = (c: string) => `0x${c.repeat(64)}` as `0x${string}`;
+/** The deployment every body below is created under. */
+const D: Deployment = { chainId: 5042002, factory: FACTORY };
+/** A time in unix MILLISECONDS, the unit of every schedule. */
+const T = 1_800_000_000_000;
+/** A lapse as the resolver records one. */
+const LAPSED = { reason: "deadline_passed", blockTime: 1_800_000_000 } as const;
 
 let db: Database.Database;
 let repo: SqliteLegalBodyRepository;
@@ -50,6 +57,8 @@ const link = (agentId = "42", body = BODY_A) => ({
   linkDeadline: 1_900_000_000,
   linkSignature: "0x01" as `0x${string}`,
   bodyAddress: body as `0x${string}`,
+  observedAtBlock: 100,
+  firstCheckAt: T,
 });
 const toReserved = (agentId = "42", body = BODY_A) => {
   const r = newBody();
@@ -100,13 +109,13 @@ test("test_reserve_secondLiveReservationForSameAgentIsRefused", () => {
   toReserved("42", BODY_A);
   const b = newBody();
   repo.freezeAgreement(b.legalBodyId, { hash: H("a"), version: 1 });
-  expect(repo.reserve(b.legalBodyId, link("42", BODY_B))).toBe("agent_taken");
+  expect(repo.reserve(b.legalBodyId, link("42", BODY_B))).toBe("agent_in_flight");
   expect(repo.findById(b.legalBodyId)?.bindingState).toBe("draft");
 });
 
 test("reserve refuses a body address already recorded", () => {
   const a = toReserved("42", BODY_A);
-  repo.lapse(a, "deadline passed");
+  repo.lapse(a, LAPSED);
   const b = newBody();
   repo.freezeAgreement(b.legalBodyId, { hash: H("a"), version: 1 });
   expect(repo.reserve(b.legalBodyId, link("43", BODY_A))).toBe("body_taken");
@@ -118,13 +127,19 @@ test("reserve twice is not_draft; the first link stands", () => {
   expect(repo.findById(id)?.agentId).toBe("42");
 });
 
-test("findLiveByAgentId sees only live states, per chain", () => {
+test("listInFlightByAgent sees only an order on its way, per chain; findLinkedByAgent a linked body", () => {
   const id = toReserved("42");
-  expect(repo.findLiveByAgentId(5042002, "42")?.legalBodyId).toBe(id);
-  expect(repo.findLiveByAgentId(1, "42")).toBeUndefined();
-  repo.lapse(id, "deadline passed");
-  expect(repo.findLiveByAgentId(5042002, "42")).toBeUndefined();
-  expect(LIVE_BINDING_STATES).toEqual(["reserved", "deployed", "linked"]);
+  expect(repo.listInFlightByAgent(D, "42").map((r) => r.legalBodyId)).toEqual([id]);
+  expect(repo.listInFlightByAgent({ ...D, chainId: 1 }, "42")).toEqual([]);
+  expect(repo.findLinkedByAgent(D, "42")).toBeUndefined();
+  repo.lapse(id, LAPSED);
+  expect(repo.listInFlightByAgent(D, "42")).toEqual([]);
+  expect(IN_FLIGHT_BINDING_STATES).toEqual(["reserved", "deployed"]);
+  const linked = toDeployed("43", BODY_B);
+  repo.markLinked(linked, 1_800_000_100);
+  expect(repo.findLinkedByAgent(D, "43")?.legalBodyId).toBe(linked);
+  expect(repo.findLinkedByAgent({ ...D, chainId: 1 }, "43")).toBeUndefined();
+  expect(repo.listInFlightByAgent(D, "43")).toEqual([]);
 });
 
 test("deploy submission is recorded with its raw transaction while reserved only", () => {
@@ -137,14 +152,18 @@ test("deploy submission is recorded with its raw transaction while reserved only
   expect(repo.recordDeploySubmission(id, { txHash: H("e"), rawTx: "0x03", nonce: 8 })).toBe(false);
 });
 
+/** What `markLinked` answers when it links a body and no other was linked for its agent. */
+const LINKED = { outcome: "linked", replaced: [] };
+const NOT_LINKABLE = { outcome: "not_linkable" };
+
 test("the binding transitions are compare-and-set", () => {
   const id = toDeployed();
   expect(repo.markBroken(id, { why: "never linked" })).toBe(false); // deployed -> broken is not legal
-  expect(repo.markLinked(id, 1_800_000_100)).toBe(true);
-  expect(repo.markLinked(id, 1_800_000_200)).toBe(false); // already linked
+  expect(repo.markLinked(id, 1_800_000_100)).toEqual(LINKED);
+  expect(repo.markLinked(id, 1_800_000_200)).toEqual(NOT_LINKABLE); // already linked
   expect(repo.markBroken(id, { why: "pointer cleared" })).toBe(true);
   expect(repo.findById(id)?.pointerSeenAt).toBe(1_800_000_100); // a broken row keeps its sighting
-  expect(repo.markLinked(id, 1_800_000_300)).toBe(true); // re-pointed
+  expect(repo.markLinked(id, 1_800_000_300)).toEqual(LINKED); // re-pointed
   expect(repo.findById(id)?.pointerSeenAt).toBe(1_800_000_300);
   expect(repo.listEvents(id).map((e) => e.kind)).toEqual([
     "created",
@@ -161,7 +180,7 @@ test("supersede frees the agentId for a new link, only from deployed or broken",
   const first = toDeployed("42", BODY_A);
   const second = newBody();
   repo.freezeAgreement(second.legalBodyId, { hash: H("a"), version: 1 });
-  expect(repo.reserve(second.legalBodyId, link("42", BODY_B))).toBe("agent_taken");
+  expect(repo.reserve(second.legalBodyId, link("42", BODY_B))).toBe("agent_in_flight");
   expect(repo.supersede(first, second.legalBodyId)).toBe(true);
   expect(repo.reserve(second.legalBodyId, link("42", BODY_B))).toBe("reserved");
   const reservedOnly = toReserved("44", "0x00000000000000000000000000000000000000C1");
@@ -170,21 +189,21 @@ test("supersede frees the agentId for a new link, only from deployed or broken",
 
 test("lapse only from reserved", () => {
   const id = toReserved();
-  expect(repo.lapse(id, "deadline passed")).toBe(true);
-  expect(repo.lapse(id, "again")).toBe(false);
+  expect(repo.lapse(id, LAPSED)).toBe(true);
+  expect(repo.lapse(id, LAPSED)).toBe(false);
   expect(repo.findById(id)?.bindingState).toBe("lapsed");
 });
 
 test("binding checks: schedule and due listing", () => {
   const a = toDeployed("42", BODY_A);
   const b = toDeployed("43", BODY_B);
-  repo.scheduleBindingCheck(a, 1_000, 60_000);
-  repo.scheduleBindingCheck(b, 5_000, 60_000);
-  expect(repo.listBindingDue(2_000, 10).map((r) => r.legalBodyId)).toEqual([a]);
-  expect(repo.listBindingDue(9_000, 10).map((r) => r.legalBodyId)).toEqual([a, b]);
-  expect(repo.listBindingDue(9_000, 1)).toHaveLength(1);
+  repo.scheduleBindingCheck(a, T + 1_000, 60_000);
+  repo.scheduleBindingCheck(b, T + 5_000, 60_000);
+  expect(repo.listBindingDue(D, T + 2_000, 10).map((r) => r.legalBodyId)).toEqual([a]);
+  expect(repo.listBindingDue(D, T + 9_000, 10).map((r) => r.legalBodyId)).toEqual([a, b]);
+  expect(repo.listBindingDue(D, T + 9_000, 1)).toHaveLength(1);
   repo.scheduleBindingCheck(a, null, null);
-  expect(repo.listBindingDue(9_000, 10).map((r) => r.legalBodyId)).toEqual([b]);
+  expect(repo.listBindingDue(D, T + 9_000, 10).map((r) => r.legalBodyId)).toEqual([b]);
 });
 
 test("recordEvent redacts an SSN-shaped number out of the detail", () => {
@@ -217,14 +236,14 @@ test("listByTenant is newest first and tenant-scoped", () => {
   ]);
 });
 
-test("a second order whose link collides on BOTH the agentId and the body address is agent_taken", () => {
+test("a second order whose link collides on BOTH the agentId and the body address is agent_in_flight", () => {
   // The body address is derived from the link digest, and one tenant ordering twice with the same
   // agreement and deadline signs the same digest: the write then breaks both unique indexes, and
-  // SQLite names only one of them. A live holder of the agentId is the answer that matters.
+  // SQLite names only one of them. An order on its way for the agentId is the answer that matters.
   toReserved("42", BODY_A);
   const b = newBody();
   repo.freezeAgreement(b.legalBodyId, { hash: H("a"), version: 1 });
-  expect(repo.reserve(b.legalBodyId, link("42", BODY_A))).toBe("agent_taken");
+  expect(repo.reserve(b.legalBodyId, link("42", BODY_A))).toBe("agent_in_flight");
   expect(repo.findById(b.legalBodyId)?.bindingState).toBe("draft");
   expect(repo.listEvents(b.legalBodyId).map((e) => e.kind)).toEqual([
     "created",
@@ -235,15 +254,15 @@ test("a second order whose link collides on BOTH the agentId and the body addres
 test("an agentId has one spelling: leading zeros are normalized, anything else is refused", () => {
   const id = toReserved("007");
   expect(repo.findById(id)?.agentId).toBe("7");
-  expect(repo.findLiveByAgentId(5042002, "0007")?.legalBodyId).toBe(id);
+  expect(repo.listInFlightByAgent(D, "0007").map((r) => r.legalBodyId)).toEqual([id]);
   const b = newBody();
   repo.freezeAgreement(b.legalBodyId, { hash: H("a"), version: 1 });
-  expect(repo.reserve(b.legalBodyId, link("07", BODY_B))).toBe("agent_taken");
+  expect(repo.reserve(b.legalBodyId, link("07", BODY_B))).toBe("agent_in_flight");
   for (const bad of ["", " 7", "0x07", "-7", "7.0", "7e0", (2n ** 256n).toString()])
     expect(() => repo.reserve(b.legalBodyId, link(bad, BODY_B)), JSON.stringify(bad)).toThrow(
       /agentId/,
     );
-  expect(repo.findLiveByAgentId(5042002, "0x07")).toBeUndefined();
+  expect(repo.listInFlightByAgent(D, "0x07")).toEqual([]);
   expect(repo.findById(b.legalBodyId)?.bindingState).toBe("draft");
 });
 
@@ -294,25 +313,27 @@ test("event detail redacts every string, however deeply nested, and keys too", (
   for (const { detail } of raw) expect(() => JSON.parse(detail), detail).not.toThrow();
 });
 
-test("markLinked answers false, and records nothing, when another body holds the agentId live", () => {
-  // `broken` is not a live state, so a new body can reserve the agentId in the meantime; when the
-  // pointer then comes back to the old body, re-linking it would break the one-live-body index.
+test("markLinked links a broken body again while a new order for its agentId is on its way", () => {
+  // `broken` is in neither agentId index, so a new body can reserve the agentId in the meantime;
+  // when the pointer then comes back to the old body, one linked body and one order on its way
+  // may hold the agentId together.
   const old = toDeployed("42", BODY_A);
-  expect(repo.markLinked(old, 1_800_000_100)).toBe(true);
+  expect(repo.markLinked(old, 1_800_000_100)).toEqual(LINKED);
   expect(repo.markBroken(old, { why: "pointer cleared" })).toBe(true);
   const fresh = newBody();
   repo.freezeAgreement(fresh.legalBodyId, { hash: H("a"), version: 1 });
   expect(repo.reserve(fresh.legalBodyId, link("42", BODY_B))).toBe("reserved");
   const eventsBefore = repo.listEvents(old);
-  expect(repo.markLinked(old, 1_800_000_200)).toBe(false);
-  expect(repo.findById(old)?.bindingState).toBe("broken");
-  expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_100);
-  expect(repo.listEvents(old)).toEqual(eventsBefore);
-  // Only that collision is an answer: any other refusal of the write still throws.
+  // A refusal of the write throws, and records nothing.
   db.exec(`CREATE TEMP TRIGGER refuse_every_update BEFORE UPDATE ON legal_bodies
     BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;`);
   expect(() => repo.markLinked(old, 1_800_000_200)).toThrow("refused by the test");
   expect(repo.listEvents(old)).toEqual(eventsBefore);
+  db.exec("DROP TRIGGER temp.refuse_every_update");
+  expect(repo.markLinked(old, 1_800_000_200)).toEqual(LINKED);
+  expect(repo.findById(old)?.bindingState).toBe("linked");
+  expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_200);
+  expect(repo.findById(fresh.legalBodyId)?.bindingState).toBe("reserved");
 });
 
 test("a deploy re-sent while reserved keeps every submission; the landed hash is then locked", () => {
@@ -455,7 +476,6 @@ test("reserve throws a LegalBodyInputError for a malformed link, and writes noth
     ["signature missing", { linkSignature: undefined }],
     ["signature null", { linkSignature: null }],
     ["signature empty", { linkSignature: "" }],
-    ["signature 0x and no byte", { linkSignature: "0x" }],
     ["signature half a byte", { linkSignature: "0x1" }],
     ["signature not hex", { linkSignature: "0xzz" }],
     ["deadline 0", { linkDeadline: 0 }],
@@ -610,8 +630,8 @@ test("abandoned is terminal: no method moves the row again, and it holds nothing
   expect(repo.markDeployed(r.legalBodyId, { txHash: H("c"), deployedAt: 1_800_000_000 })).toBe(
     false,
   );
-  expect(repo.lapse(r.legalBodyId, "x")).toBe(false);
-  expect(repo.markLinked(r.legalBodyId, 1_800_000_100)).toBe(false);
+  expect(repo.lapse(r.legalBodyId, LAPSED)).toBe(false);
+  expect(repo.markLinked(r.legalBodyId, 1_800_000_100)).toEqual(NOT_LINKABLE);
   expect(repo.markBroken(r.legalBodyId, {})).toBe(false);
   expect(repo.supersede(r.legalBodyId, "lb_other")).toBe(false);
   expect(repo.findById(r.legalBodyId)?.bindingState).toBe("abandoned");
@@ -623,18 +643,18 @@ test("abandoned is terminal: no method moves the row again, and it holds nothing
 test("a superseded body can be linked again: the chain, not this table, decides which body is named", () => {
   // The old body is set aside for a newer one; its owner then names the old one again on chain.
   const old = toDeployed("42", BODY_A);
-  expect(repo.markLinked(old, 1_800_000_100)).toBe(true);
+  expect(repo.markLinked(old, 1_800_000_100)).toEqual(LINKED);
   expect(repo.markBroken(old, { why: "pointer cleared" })).toBe(true);
   const newer = toDeployed("43", BODY_B);
   expect(repo.supersede(old, newer)).toBe(true);
   expect(repo.findById(old)?.pointerSeenAt).toBe(1_800_000_100); // kept while set aside
-  expect(repo.findLiveByAgentId(5042002, "42")).toBeUndefined();
-  // The agentId is free, so the cached state follows the chain.
-  expect(repo.markLinked(old, 1_800_000_200)).toBe(true);
+  expect(repo.findLinkedByAgent(D, "42")).toBeUndefined();
+  // The cached state follows the chain.
+  expect(repo.markLinked(old, 1_800_000_200)).toEqual(LINKED);
   const row = repo.findById(old);
   expect(row?.bindingState).toBe("linked");
   expect(row?.pointerSeenAt).toBe(1_800_000_200);
-  expect(repo.findLiveByAgentId(5042002, "42")?.legalBodyId).toBe(old);
+  expect(repo.findLinkedByAgent(D, "42")?.legalBodyId).toBe(old);
   expect(repo.listEvents(old).map((e) => e.kind)).toEqual([
     "created",
     "agreement_frozen",
@@ -648,19 +668,16 @@ test("a superseded body can be linked again: the chain, not this table, decides 
   expect(repo.listEvents(old).at(-1)?.detail).toEqual({ seenAt: 1_800_000_200 });
 });
 
-test("a superseded body is not linked again while another body holds its agentId live", () => {
+test("a superseded body is linked again while its replacement is still on its way", () => {
   const old = toDeployed("42", BODY_A);
   const replacement = newBody();
   repo.freezeAgreement(replacement.legalBodyId, { hash: H("a"), version: 1 });
   expect(repo.supersede(old, replacement.legalBodyId)).toBe(true);
   expect(repo.reserve(replacement.legalBodyId, link("42", BODY_B))).toBe("reserved");
-  const before = { row: repo.findById(old), events: repo.listEvents(old) };
-  expect(repo.markLinked(old, 1_800_000_200)).toBe(false);
-  expect(repo.findById(old)).toEqual(before.row);
-  expect(repo.listEvents(old)).toEqual(before.events);
-  // Once the replacement gives the agentId up, the old body can follow the chain again.
-  expect(repo.lapse(replacement.legalBodyId, "deadline passed")).toBe(true);
-  expect(repo.markLinked(old, 1_800_000_300)).toBe(true);
+  // An order on its way does not stop the old body from following the chain.
+  expect(repo.markLinked(old, 1_800_000_200)).toEqual(LINKED);
+  expect(repo.findById(old)?.bindingState).toBe("linked");
+  expect(repo.findById(replacement.legalBodyId)?.bindingState).toBe("reserved");
 });
 
 // ── The check schedule ──
@@ -672,22 +689,22 @@ const scheduleOf = (id: string) => {
 
 test("scheduleBindingCheck takes a time and an interval together, or null and null, and nothing else", () => {
   const id = toDeployed();
-  expect(repo.scheduleBindingCheck(id, 1_000, 60_000)).toBe(true);
+  expect(repo.scheduleBindingCheck(id, T + 1_000, 60_000)).toBe(true);
   for (const [nextAt, intervalMs] of [
-    [1_000, null],
+    [T + 1_000, null],
     [null, 60_000],
     [-1, 60_000],
-    [1_000, 0],
-    [1_000, -1],
-    [1.5, 1],
-    [1, 1.5],
+    [T + 1_000, 0],
+    [T + 1_000, -1],
+    [T + 1.5, 1],
+    [T, 1.5],
     // A NaN out of a caller's arithmetic must not quietly take the row off the schedule.
     [Number.NaN, 60_000],
-    [60_000, Number.NaN],
+    [T + 60_000, Number.NaN],
     [Number.POSITIVE_INFINITY, 1],
     [1e20, 1],
-    ["1000", "5"],
-    [1_000n, 5n],
+    [String(T), "5"],
+    [BigInt(T), 5n],
     [undefined, undefined],
     [undefined, 60_000],
   ])
@@ -695,34 +712,35 @@ test("scheduleBindingCheck takes a time and an interval together, or null and nu
       () => repo.scheduleBindingCheck(id, as(nextAt), as(intervalMs)),
       `${String(nextAt)}, ${String(intervalMs)}`,
     ).toThrow(LegalBodyInputError);
-  expect(scheduleOf(id)).toEqual([1_000, 60_000]);
-  // Time zero and the shortest interval are the boundaries, and null with null clears.
-  expect(repo.scheduleBindingCheck(id, 0, 1)).toBe(true);
-  expect(scheduleOf(id)).toEqual([0, 1]);
+  expect(scheduleOf(id)).toEqual([T + 1_000, 60_000]);
+  // The smallest time in milliseconds and the shortest interval are the boundaries, and null with
+  // null clears.
+  expect(repo.scheduleBindingCheck(id, 100_000_000_000, 1)).toBe(true);
+  expect(scheduleOf(id)).toEqual([100_000_000_000, 1]);
   expect(repo.scheduleBindingCheck(id, null, null)).toBe(true);
   expect(scheduleOf(id)).toEqual([null, null]);
 });
 
 test("scheduleBindingCheck says whether it scheduled a row: never a draft, an abandoned or a lapsed one", () => {
-  expect(repo.scheduleBindingCheck("lb_unknown", 1_000, 60_000)).toBe(false);
+  expect(repo.scheduleBindingCheck("lb_unknown", T + 1_000, 60_000)).toBe(false);
   const draft = newBody().legalBodyId;
   const abandoned = newBody().legalBodyId;
   repo.abandon(abandoned, "never signed");
   const lapsed = toReserved("41", "0x00000000000000000000000000000000000000C1");
-  repo.lapse(lapsed, "deadline passed");
+  repo.lapse(lapsed, LAPSED);
   for (const id of [draft, abandoned, lapsed]) {
-    expect(repo.scheduleBindingCheck(id, 1_000, 60_000), repo.findById(id)?.bindingState).toBe(
+    expect(repo.scheduleBindingCheck(id, T + 1_000, 60_000), repo.findById(id)?.bindingState).toBe(
       false,
     );
     expect(scheduleOf(id)).toEqual([null, null]);
   }
-  expect(repo.listBindingDue(9_000, 10)).toEqual([]);
+  expect(repo.listBindingDue(D, T + 9_000, 10)).toEqual([]);
   // Every state a body can still be checked in takes a schedule.
   const id = toReserved("42", BODY_A);
   const states: string[] = [];
   const scheduled = () => {
     states.push(repo.findById(id)?.bindingState ?? "?");
-    return repo.scheduleBindingCheck(id, 1_000 + states.length, 60_000);
+    return repo.scheduleBindingCheck(id, T + 1_000 + states.length, 60_000);
   };
   expect(scheduled()).toBe(true);
   repo.markDeployed(id, { txHash: H("c"), deployedAt: 1_800_000_000 });
@@ -734,7 +752,7 @@ test("scheduleBindingCheck says whether it scheduled a row: never a draft, an ab
   repo.supersede(id, "lb_other");
   expect(scheduled()).toBe(true);
   expect(states).toEqual(["reserved", "deployed", "linked", "broken", "superseded"]);
-  expect(repo.listBindingDue(9_000, 10).map((r) => r.legalBodyId)).toEqual([id]);
+  expect(repo.listBindingDue(D, T + 9_000, 10).map((r) => r.legalBodyId)).toEqual([id]);
   // Scheduling is not a state change: it leaves no event.
   expect(repo.listEvents(id).map((e) => e.kind)).toEqual([
     "created",
@@ -753,9 +771,9 @@ const bodyN = (i: number) => `0x${i.toString(16).padStart(40, "0")}`;
 const scheduleRaw = (id: string) =>
   db
     .prepare(
-      "UPDATE legal_bodies SET next_binding_check_at = 1000, binding_check_interval_ms = 60000 WHERE legal_body_id = ?",
+      "UPDATE legal_bodies SET next_binding_check_at = ?, binding_check_interval_ms = 60000 WHERE legal_body_id = ?",
     )
-    .run(id);
+    .run(T + 1_000, id);
 /** One body in each state, reached through the repository. */
 function bodyInEachState(): Record<string, string> {
   const draft = newBody().legalBodyId;
@@ -763,7 +781,7 @@ function bodyInEachState(): Record<string, string> {
   repo.abandon(abandoned, "never signed");
   const reserved = toReserved("101", bodyN(0x101));
   const lapsed = toReserved("102", bodyN(0x102));
-  repo.lapse(lapsed, "deadline passed");
+  repo.lapse(lapsed, LAPSED);
   const deployed = toDeployed("103", bodyN(0x103));
   const linked = toDeployed("104", bodyN(0x104));
   repo.markLinked(linked, 1_800_000_100);
@@ -780,27 +798,27 @@ function bodyInEachState(): Record<string, string> {
 
 test("a row scheduled while reserved leaves the schedule when it lapses", () => {
   const id = toReserved();
-  expect(repo.scheduleBindingCheck(id, 1_000, 60_000)).toBe(true);
-  expect(repo.listBindingDue(9_000, 10).map((r) => r.legalBodyId)).toEqual([id]);
-  expect(repo.lapse(id, "deadline passed")).toBe(true);
+  expect(repo.scheduleBindingCheck(id, T + 1_000, 60_000)).toBe(true);
+  expect(repo.listReserved(D, T + 9_000, 10).map((r) => r.legalBodyId)).toEqual([id]);
+  expect(repo.lapse(id, LAPSED)).toBe(true);
   // The lapse itself cleared the schedule: nobody has to remember to do it first.
   expect(scheduleOf(id)).toEqual([null, null]);
-  expect(repo.listBindingDue(9_000, 10)).toEqual([]);
+  expect(repo.listReserved(D, T + 9_000, 10)).toEqual([]);
   // And a lapsed row takes no new schedule.
-  expect(repo.scheduleBindingCheck(id, 1_000, 60_000)).toBe(false);
+  expect(repo.scheduleBindingCheck(id, T + 1_000, 60_000)).toBe(false);
   expect(scheduleOf(id)).toEqual([null, null]);
   // A lapse that did not happen clears nothing.
   const deployed = toDeployed("43", BODY_B);
-  expect(repo.scheduleBindingCheck(deployed, 1_000, 60_000)).toBe(true);
-  expect(repo.lapse(deployed, "not reserved any more")).toBe(false);
-  expect(scheduleOf(deployed)).toEqual([1_000, 60_000]);
+  expect(repo.scheduleBindingCheck(deployed, T + 1_000, 60_000)).toBe(true);
+  expect(repo.lapse(deployed, LAPSED)).toBe(false);
+  expect(scheduleOf(deployed)).toEqual([T + 1_000, 60_000]);
 });
 
 test("scheduleBindingCheck takes a row off the schedule in every state, and says whether there was a row", () => {
   const bodies = bodyInEachState();
   for (const [state, id] of Object.entries(bodies)) {
     scheduleRaw(id);
-    expect(scheduleOf(id), state).toEqual([1_000, 60_000]);
+    expect(scheduleOf(id), state).toEqual([T + 1_000, 60_000]);
     const events = repo.listEvents(id);
     expect(repo.scheduleBindingCheck(id, null, null), state).toBe(true);
     expect(scheduleOf(id), state).toEqual([null, null]);
@@ -810,23 +828,26 @@ test("scheduleBindingCheck takes a row off the schedule in every state, and says
     expect(repo.scheduleBindingCheck(id, null, null), state).toBe(true);
   }
   expect(repo.scheduleBindingCheck("lb_unknown", null, null)).toBe(false);
-  expect(repo.listBindingDue(9_000, 10)).toEqual([]);
+  expect(repo.listBindingDue(D, T + 9_000, 10)).toEqual([]);
+  expect(repo.listReserved(D, T + 9_000, 10)).toEqual([]);
 });
 
-test("listBindingDue never lists a draft, an abandoned or a lapsed row, whatever its schedule columns hold", () => {
+test("listBindingDue never lists a draft, an abandoned, a reserved or a lapsed row, whatever its schedule columns hold", () => {
   const bodies = bodyInEachState();
   for (const id of Object.values(bodies)) scheduleRaw(id);
-  const listed = repo.listBindingDue(9_000, 10).map((r) => r.bindingState);
-  expect(listed.sort()).toEqual(["broken", "deployed", "linked", "reserved", "superseded"]);
+  const listed = repo.listBindingDue(D, T + 9_000, 10).map((r) => r.bindingState);
+  expect(listed.sort()).toEqual(["broken", "deployed", "linked", "superseded"]);
   // The limit counts the rows that are listed, not the ones that are skipped.
-  expect(repo.listBindingDue(9_000, 5)).toHaveLength(5);
+  expect(repo.listBindingDue(D, T + 9_000, 4)).toHaveLength(4);
+  // A reserved row is resolved, not checked: it has a listing of its own.
+  expect(repo.listReserved(D, T + 9_000, 10).map((r) => r.bindingState)).toEqual(["reserved"]);
 });
 
 test("listBindingDue takes a time of zero or more and a limit of one or more, and nothing else", () => {
   const a = toDeployed("42", BODY_A);
   const b = toDeployed("43", BODY_B);
-  repo.scheduleBindingCheck(a, 1_000, 60_000);
-  repo.scheduleBindingCheck(b, 1_000, 60_000);
+  repo.scheduleBindingCheck(a, T + 1_000, 60_000);
+  repo.scheduleBindingCheck(b, T + 1_000, 60_000);
   // A negative limit would otherwise mean "no limit" to SQLite.
   for (const limit of [
     0,
@@ -840,7 +861,7 @@ test("listBindingDue takes a time of zero or more and a limit of one or more, an
     "2",
     2n,
   ])
-    expect(() => repo.listBindingDue(9_000, as(limit)), `limit ${String(limit)}`).toThrow(
+    expect(() => repo.listBindingDue(D, T + 9_000, as(limit)), `limit ${String(limit)}`).toThrow(
       LegalBodyInputError,
     );
   for (const now of [
@@ -853,14 +874,16 @@ test("listBindingDue takes a time of zero or more and a limit of one or more, an
     "9000",
     9_000n,
   ])
-    expect(() => repo.listBindingDue(as(now), 10), `now ${String(now)}`).toThrow(
+    expect(() => repo.listBindingDue(D, as(now), 10), `now ${String(now)}`).toThrow(
       LegalBodyInputError,
     );
-  expect(repo.listBindingDue(0, 10)).toEqual([]);
+  expect(repo.listBindingDue(D, 0, 10)).toEqual([]);
   // Due at exactly `now` counts; ties are broken by id; the limit cuts.
-  expect(repo.listBindingDue(1_000, 10).map((r) => r.legalBodyId)).toEqual([a, b].sort());
-  expect(repo.listBindingDue(999, 10)).toEqual([]);
-  expect(repo.listBindingDue(1_000, 1).map((r) => r.legalBodyId)).toEqual([[a, b].sort()[0]]);
+  expect(repo.listBindingDue(D, T + 1_000, 10).map((r) => r.legalBodyId)).toEqual([a, b].sort());
+  expect(repo.listBindingDue(D, T + 999, 10)).toEqual([]);
+  expect(repo.listBindingDue(D, T + 1_000, 1).map((r) => r.legalBodyId)).toEqual([
+    [a, b].sort()[0],
+  ]);
 });
 
 // ── Event detail written by chain code ──
@@ -892,7 +915,7 @@ test("a bigint in event detail is stored as a number when it is exact, and refus
 
 test("a move whose detail cannot be stored is rolled back together with its event", () => {
   const id = toDeployed();
-  expect(repo.markLinked(id, 1_800_000_100)).toBe(true);
+  expect(repo.markLinked(id, 1_800_000_100)).toEqual(LINKED);
   const before = { row: repo.findById(id), events: repo.listEvents(id) };
   expect(() => repo.markBroken(id, { observedAtBlock: 2n ** 60n })).toThrow(LegalBodyInputError);
   expect(repo.findById(id)).toEqual(before.row);
@@ -983,17 +1006,17 @@ test("transaction() holds the write lock from its first statement: a unit that r
     const result = unit.transaction(() => {
       const seen = unit.findById(x)?.bindingState; // the unit reads first, to decide what to do
       try {
-        other.scheduleBindingCheck(y, 1_000, 60_000); // another writer, in the middle of the unit
+        other.scheduleBindingCheck(y, T + 1_000, 60_000); // another writer, in the middle of the unit
         otherWriter = "committed";
       } catch (e) {
         otherWriter = (e as { code?: string }).code ?? String(e);
       }
       return [seen, unit.markLinked(x, 1_800_000_100)]; // then the unit moves
     });
-    expect(result).toEqual(["deployed", true]);
+    expect(result).toEqual(["deployed", LINKED]);
     // The other writer had to wait its turn, and takes it once the unit is done.
     expect(otherWriter).toBe("SQLITE_BUSY");
-    expect(other.scheduleBindingCheck(y, 1_000, 60_000)).toBe(true);
+    expect(other.scheduleBindingCheck(y, T + 1_000, 60_000)).toBe(true);
     expect(other.findById(x)?.bindingState).toBe("linked");
   } finally {
     for (const c of connections) c.close();
@@ -1004,7 +1027,7 @@ test("transaction() holds the write lock from its first statement: a unit that r
 test("nested transaction() calls are savepoints: an inner failure undoes the inner unit only", () => {
   const id = toDeployed();
   repo.transaction(() => {
-    expect(repo.markLinked(id, 1_800_000_100)).toBe(true);
+    expect(repo.markLinked(id, 1_800_000_100)).toEqual(LINKED);
     expect(() =>
       repo.transaction(() => {
         repo.markBroken(id, { why: "undone below" });
@@ -1025,12 +1048,12 @@ test("nested transaction() calls are savepoints: an inner failure undoes the inn
   expect(() =>
     repo.transaction(() => {
       repo.markBroken(id, { why: "undone below" });
-      repo.transaction(() => repo.scheduleBindingCheck(id, 1_000, 60_000));
+      repo.transaction(() => repo.scheduleBindingCheck(id, T + 1_000, 60_000));
       throw new Error("outer unit failed");
     }),
   ).toThrow("outer unit failed");
   expect(repo.findById(id)?.bindingState).toBe("linked");
-  expect(repo.findById(id)?.nextBindingCheckAt).toBeNull();
+  expect(repo.findById(id)?.nextBindingCheckAt).toBe(T); // the schedule the reservation set
   expect(db.inTransaction).toBe(false);
 });
 
@@ -1086,9 +1109,9 @@ test("markLinked throws a LegalBodyInputError for a sighting that is not a time 
   expect(repo.findById(id)).toEqual(before.row);
   expect(repo.listEvents(id)).toEqual(before.events);
   // Both ends of the range are times in seconds.
-  expect(repo.markLinked(id, 1)).toBe(true);
+  expect(repo.markLinked(id, 1)).toEqual(LINKED);
   expect(repo.markBroken(id, { why: "pointer cleared" })).toBe(true);
-  expect(repo.markLinked(id, 99_999_999_999)).toBe(true);
+  expect(repo.markLinked(id, 99_999_999_999)).toEqual(LINKED);
   expect(repo.findById(id)?.pointerSeenAt).toBe(99_999_999_999);
 });
 
@@ -1112,10 +1135,18 @@ test("every lookup the repository runs on a hot path is answered through an inde
   expect(planOf("lower(body_address)", { chain_id: 5042002, address: BODY_A })).toContain(
     "USING INDEX idx_legal_bodies_body",
   );
-  expect(planOf("agent_id = ?", [5042002, "42"])).toContain(
-    "USING INDEX idx_legal_bodies_live_agent",
+  const agent = { chain_id: 5042002, factory: FACTORY, agent_id: "42" };
+  expect(
+    planOf("agent_id = @agent_id AND binding_state IN ('reserved','deployed')", agent),
+  ).toContain("USING INDEX idx_legal_bodies_inflight_agent");
+  expect(planOf("agent_id = @agent_id AND binding_state = 'linked'", agent)).toContain(
+    "USING INDEX idx_legal_bodies_linked_agent",
   );
-  expect(planOf("next_binding_check_at <= ?", [1, 1])).toContain(
+  const due = { chain_id: 5042002, factory: FACTORY, now: 1, limit: 1 };
+  expect(planOf("binding_state = 'reserved' AND next_binding_check_at <= @now", due)).toContain(
+    "USING INDEX idx_legal_bodies_binding_due",
+  );
+  expect(planOf("'superseded') AND next_binding_check_at <= @now", due)).toContain(
     "USING INDEX idx_legal_bodies_binding_due",
   );
   expect(planOf("WHERE tenant_id = ?", [TENANT])).toContain("USING INDEX idx_legal_bodies_tenant");

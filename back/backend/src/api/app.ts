@@ -6,6 +6,7 @@ import { requireAuth } from "../auth/middleware";
 import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
 import type { CustomerCompanyDeps } from "../legalBody/customerCompany";
 import type { EvidenceDeps } from "../legalBody/evidence";
+import type { LegalBodyOrderDeps } from "../legalBody/orders";
 import { mountMcpRoute } from "../mcp/transport";
 import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
 import type { CompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
@@ -22,6 +23,7 @@ import { mountEnsGatewayRoutes } from "./routes/ensGateway";
 import { mountFormationRulesRoutes } from "./routes/formationRules";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountLegalBodyRoutes } from "./routes/legalBodies";
+import { mountLegalBodyOrderRoutes } from "./routes/legalBodyOrders";
 import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
@@ -62,8 +64,16 @@ export interface ApiDeps extends EntityViewDeps {
    * Wired on every deployment, like `companies` and for the same reason: plain SQL over the same
    * database, so a customer's company keeps its view when the legal-body feature is switched off.
    * The company views read it for customer companies only.
+   *
+   * `hasLinkedLegalBody` answers whether one of the company's legal bodies is linked. It is wired
+   * only where the legal-body feature is on, and the payment doors read it: a customer company is
+   * quoted and settled only once one of its legal bodies is linked, so without it, never.
    */
-  customerFacts?: { declarations: CompanyDeclarationRepository; checks: CompanyCheckRepository };
+  customerFacts?: {
+    declarations: CompanyDeclarationRepository;
+    checks: CompanyCheckRepository;
+    hasLinkedLegalBody?: (companyId: string) => boolean;
+  };
   /**
    * The customer company DOORS (declare, abandon, upload evidence). Present only where
    * `customerDoorsEnabled(cfg)`: the legal-body factory is set and, on a production deployment, the
@@ -74,6 +84,13 @@ export interface ApiDeps extends EntityViewDeps {
    * those.
    */
   customerCompanies?: CustomerCompanyDeps & EvidenceDeps;
+  /**
+   * The legal-body order doors (order, list, read, read the agreement, abandon). Present only
+   * where the legal-body feature is on: the factory set, and with it the controller every call to
+   * it is relayed through. Absent, the doors are not mounted and their prefix is not protected, so
+   * every one of them is a 404.
+   */
+  legalBodyOrders?: LegalBodyOrderDeps;
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
@@ -417,6 +434,12 @@ export function buildApiApp(deps: ApiDeps) {
   // A customer's own company: under the `/companies/*` requireAuth above, and only where the
   // deployment wires the doors.
   if (deps.customerCompanies) mountCustomerCompanyRoutes(app, deps.customerCompanies);
+  // The legal-body order doors: their protection and their routes together, and only where the
+  // deployment wires the feature.
+  if (deps.legalBodyOrders) {
+    protect("/legal-body-orders");
+    mountLegalBodyOrderRoutes(app, deps.legalBodyOrders);
+  }
   // After the `/companies/*` requireAuth line above, so both document routes inherit auth.
   mountDocumentRoutes(app, deps);
   // …and the compliance calendar, which is company-scoped for the same reason and inherits the

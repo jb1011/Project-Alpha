@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { type Address, type Hex, getAddress, isAddress } from "viem";
 import { redactPii } from "../formation/pii";
+import { sqliteUtcTimestamp } from "../util/sqliteTime";
 
 /**
  * LEGAL BODIES: the legal wrapper ordered for an agent identity its customer already owns, one row
@@ -22,6 +23,18 @@ import { redactPii } from "../formation/pii";
  * transaction, and the event only when the UPDATE changed the row: a method never logs a move it
  * did not make, and never makes one it does not log. Input that could match a row without moving
  * it (an agreement with no hash) is refused before the UPDATE runs.
+ *
+ * One move touches another row: `markLinked` first moves the body linked before it, for the same
+ * chain, factory and agentId, to `broken`, in the same transaction, since one deployment links at
+ * most one body per identity.
+ *
+ * One event records no move: `recordBrokenReason` appends a `broken` event to a row that is already
+ * broken, to record what its body was found to be since the break (`latestBrokenReason` reads the
+ * newest). It writes nothing to the row itself.
+ *
+ * Times: chain times (`linkDeadline`, `deployedAt`, `pointerSeenAt`, a block time) are unix
+ * SECONDS; a schedule (`nextBindingCheckAt`, `firstCheckAt`) and a `now` or `since` handed to a
+ * listing or a counter are unix MILLISECONDS; `createdAt` is SQLite UTC text.
  */
 
 export type BindingState =
@@ -35,10 +48,12 @@ export type BindingState =
   | "abandoned";
 
 /**
- * The states that hold an agentId: at most one row per (chain, agentId) is in one of them, which
- * the partial unique index `idx_legal_bodies_live_agent` enforces with this same list.
+ * The states of an order on its way: at most one row per (chain, factory, agentId) is in one of
+ * them, which the partial unique index `idx_legal_bodies_inflight_agent` enforces with this same
+ * list. A `linked` body is not on its way: the index `idx_legal_bodies_linked_agent` allows one
+ * more, so a replacement can be ordered while a body is linked.
  */
-export const LIVE_BINDING_STATES: readonly BindingState[] = ["reserved", "deployed", "linked"];
+export const IN_FLIGHT_BINDING_STATES = ["reserved", "deployed"] as const;
 
 export type LegalBodyEventKind =
   | "created"
@@ -53,7 +68,9 @@ export type LegalBodyEventKind =
   | "abandoned"
   | "revoked"
   | "statement_signed"
-  | "note";
+  | "note"
+  | "gas_seed_requested"
+  | "gas_seeded";
 
 export type LegalBodyActor = "system" | "tenant" | `operator:${string}`;
 
@@ -107,7 +124,41 @@ export interface LegalBodyEvent {
   createdAt: string;
 }
 
-export type ReserveOutcome = "reserved" | "agent_taken" | "body_taken" | "not_draft" | "not_frozen";
+export type ReserveOutcome =
+  | "reserved"
+  | "agent_in_flight"
+  | "body_taken"
+  | "not_draft"
+  | "not_frozen";
+
+/** Why a reservation was closed without a body. */
+export type LapseReason =
+  | "deadline_passed"
+  | "foreign_body"
+  | "owner_changed"
+  | "refused_before_send";
+
+const LAPSE_REASONS: readonly LapseReason[] = [
+  "deadline_passed",
+  "foreign_body",
+  "owner_changed",
+  "refused_before_send",
+];
+
+/** One create transaction as it was recorded before it was sent (a `deploy_submitted` event). */
+export interface DeploySubmission {
+  legalBodyId: string;
+  txHash: Hex;
+  rawTx: Hex;
+  nonce: number;
+  /** The id of the event that recorded it. */
+  eventId: number;
+}
+
+/** One factory on one chain: the rows a sweeper or a cap of this deployment looks at. */
+export type Deployment = { chainId: number; factory: Address };
+
+type MarkLinkedOutcome = { outcome: "linked"; replaced: string[] } | { outcome: "not_linkable" };
 
 export interface LegalBodyRepository {
   /**
@@ -129,9 +180,16 @@ export interface LegalBodyRepository {
    *  apart would make a route an existence oracle over other tenants' ids. */
   findOwned(tenantId: string, legalBodyId: string): LegalBodyRecord | undefined;
   findByPublicId(publicId: string): LegalBodyRecord | undefined;
-  /** The body holding `agentId` on `chainId` right now, if any (see LIVE_BINDING_STATES). Leading
-   *  zeros are normalized away; a value that is not a uint256 in decimal holds nothing. */
-  findLiveByAgentId(chainId: number, agentId: string): LegalBodyRecord | undefined;
+  /**
+   * The order on its way (`reserved` or `deployed`) for `agentId` under this deployment: at most
+   * one row, by the in-flight index. Leading zeros are normalized away; a value that is not a
+   * uint256 in decimal holds nothing. A deployment that no row may hold (a chain id that is not a
+   * positive whole number, a factory that is not an address) throws a `LegalBodyInputError`, here
+   * and in every method that takes one.
+   */
+  listInFlightByAgent(d: Deployment, agentId: string): LegalBodyRecord[];
+  /** The body linked for `agentId` under this deployment, if any; agentIds as above. */
+  findLinkedByAgent(d: Deployment, agentId: string): LegalBodyRecord | undefined;
   /** Any casing of the address matches; a value that is not an address matches nothing. */
   findByBodyAddress(chainId: number, body: Address): LegalBodyRecord | undefined;
   /** Newest first. */
@@ -146,19 +204,24 @@ export interface LegalBodyRepository {
    */
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean;
   /**
-   * Accept the identity owner's signed link: `draft` (agreement frozen) → `reserved`.
+   * Accept the identity owner's signed link: `draft` (agreement frozen) → `reserved`. The same
+   * write puts the row on the schedule, at `firstCheckAt` with an interval of 30 seconds, and its
+   * `link_accepted` event records `observedAtBlock`, as a number.
    *
-   * Losing a race is an answer, never an exception: `agent_taken` when another body holds the
-   * agentId live on this chain (it takes precedence when the body address collides too),
-   * `body_taken` when another row already recorded the body address, in any casing.
+   * Losing a race is an answer, never an exception: `agent_in_flight` when another order for the
+   * agentId is on its way under this row's chain and factory (it takes precedence when the body
+   * address collides too), `body_taken` when another row already recorded the body address, in
+   * any casing. A body linked for the agentId does not stop a reservation: it is its replacement.
    *
    * Throws a `LegalBodyInputError`, before anything is written and whatever the body's state, for
    * input no row may hold: an agentId that is not a STRING holding a uint256 in decimal (a number
    * or a bigint is refused, because a JavaScript number cannot hold every uint256), an owner or a
    * body that is not an address, a body that is the zero address or the factory of this row, a
-   * digest that is not a 32-byte hash, a signature that is not one or more whole bytes of hex, or
-   * a deadline that is not a whole number of unix SECONDS. The digest and the signature are
-   * stored lower-case.
+   * digest that is not a 32-byte hash, a signature that is not `0x` followed by whole bytes of hex
+   * (`0x` alone is a signature: an owner contract can approve the digest and sign nothing), a
+   * deadline that is not a whole number of unix SECONDS, a block that is not a whole number, zero
+   * or more, or a first check that is not a time in unix MILLISECONDS (see
+   * `scheduleBindingCheck`). The digest and the signature are stored lower-case.
    */
   reserve(
     legalBodyId: string,
@@ -169,6 +232,8 @@ export interface LegalBodyRepository {
       linkDeadline: number;
       linkSignature: Hex;
       bodyAddress: Address;
+      observedAtBlock: number;
+      firstCheckAt: number;
     },
   ): ReserveOutcome;
   /**
@@ -189,37 +254,56 @@ export interface LegalBodyRepository {
   /**
    * `reserved` → `lapsed`: the reservation is closed without a deploy, and no longer holds its
    * agentId. The same write clears the row's check schedule, so no caller has to take it off
-   * first.
+   * first. The event records the reason and the time of the block the decision was read at, in
+   * unix SECONDS, as a number. A reason that is not a `LapseReason`, or a block time that is not
+   * in seconds, throws a `LegalBodyInputError` before anything is written.
    */
-  lapse(legalBodyId: string, reason: string): boolean;
+  lapse(legalBodyId: string, p: { reason: LapseReason; blockTime: number }): boolean;
   /**
    * Close a `draft` for good: `draft` → `abandoned`, frozen agreement or not. A draft's company,
    * delay and agreement are write-once and rows are never deleted, so an order opened by mistake,
-   * or never signed, is closed rather than corrected. Nothing leaves `abandoned`.
+   * never signed or expired is closed rather than corrected. Nothing leaves `abandoned`. The
+   * event names `actor`, the system unless another is given.
    */
-  abandon(legalBodyId: string, reason: string): boolean;
+  abandon(legalBodyId: string, reason: string, actor?: LegalBodyActor): boolean;
   /**
-   * `deployed` | `broken` | `superseded` → `linked`. False when the body is in none of these
-   * states, AND when another body holds the same agentId live: `broken` and `superseded` are not
-   * live states, so a new reservation can take the agentId in the meantime, and linking this body
-   * again would make two live bodies for one identity. The caller must resolve that collision;
-   * which body keeps the agentId is the binding sweeper's policy, not this repository's. Nothing
-   * is recorded either way. `seenAt` is a whole number of unix SECONDS; anything else (a
-   * fraction, a time in milliseconds) throws a `LegalBodyInputError` before anything is written.
+   * `deployed` | `broken` | `superseded` → `linked`, for the body the chain names now.
+   *
+   * Mark linked. Any OTHER row recorded as linked for the same chain, factory and agent is moved
+   * to `broken` (detail { reason: "replaced", by }) first, in the same transaction. `replaced`
+   * lists those rows. `not_linkable`, with nothing written, when this body is in none of the
+   * three states (an unknown id included). The unit holds the write lock from its first read, so
+   * no other writer can link a body for the agent in between. `seenAt` is a whole number of unix
+   * SECONDS; anything else (a fraction, a time in milliseconds) throws a `LegalBodyInputError`
+   * before anything is written.
    */
-  markLinked(legalBodyId: string, seenAt: number): boolean;
+  markLinked(legalBodyId: string, seenAt: number): MarkLinkedOutcome;
   markBroken(legalBodyId: string, detail: Record<string, unknown>): boolean;
+  /**
+   * Record what a broken body was found to be since its break, with NO state move: one more
+   * `broken` event (actor `system`) on a row that was linked once and is not linked now, `broken`
+   * or `superseded` with a pointer seen, so `latestBrokenReason` reads it. The row itself is not
+   * written: its state, its schedule and its `updatedAt` stay as they were, so a time counted from
+   * the break still counts from the break. False, with nothing written, for any other row (an
+   * unknown id included). A reason that is not a non-empty string throws a `LegalBodyInputError`
+   * before anything is written. The detail follows `recordEvent`'s rules.
+   */
+  recordBrokenReason(
+    legalBodyId: string,
+    detail: { reason: string } & Record<string, unknown>,
+  ): boolean;
   /**
    * `deployed` | `broken` → `superseded`: the body gives its agentId up, which frees it for a new
    * link. Not final. Which body an identity's owner names is decided on chain, where a body that
-   * was set aside can be named again, so `markLinked` takes a superseded body back to `linked`
-   * once the agentId is free.
+   * was set aside can be named again, so `markLinked` takes a superseded body back to `linked`.
+   * The event names `actor`, the system unless another is given.
    */
-  supersede(legalBodyId: string, bySupersedingId: string): boolean;
+  supersede(legalBodyId: string, bySupersedingId: string, actor?: LegalBodyActor): boolean;
   /**
-   * Set the next binding check: `nextAt` in unix MILLISECONDS (zero or more) with `intervalMs`
-   * (one or more), or null with null to take the row off the schedule. Anything else, a NaN out
-   * of a caller's arithmetic included, throws a `LegalBodyInputError`.
+   * Set the next check: `nextAt` in unix MILLISECONDS (100,000,000,000 or more: anything below
+   * is a time in seconds, the unit of the chain) with `intervalMs` (one or more), or null with
+   * null to take the row off the schedule. Anything else, a NaN out of a caller's arithmetic
+   * included, throws a `LegalBodyInputError`.
    *
    * Answers whether a row was updated. Setting a time never updates a `draft`, an `abandoned` or
    * a `lapsed` row: there is nothing on chain to check for them. Taking a row off the schedule
@@ -231,12 +315,53 @@ export interface LegalBodyRepository {
     intervalMs: number | null,
   ): boolean;
   /**
-   * Rows whose next binding check is due at `now` (unix MILLISECONDS, zero or more), soonest
-   * first, at most `limit` (one or more) of them. Any other `now` or `limit` throws a
-   * `LegalBodyInputError`: to SQLite a negative limit means no limit at all. A `draft`, an
-   * `abandoned` or a `lapsed` row is never listed, whatever its schedule columns hold.
+   * Reserved rows of this deployment whose schedule is due at `nowMs` (unix MILLISECONDS, zero or
+   * more), soonest first (ties by id), at most `limit` (one or more) of them. Any other `nowMs`
+   * or `limit` throws a `LegalBodyInputError`: to SQLite a negative limit means no limit at all.
    */
-  listBindingDue(now: number, limit: number): LegalBodyRecord[];
+  listReserved(d: Deployment, nowMs: number, limit: number): LegalBodyRecord[];
+  /**
+   * Due rows of this deployment in a checkable state only: deployed, linked, broken, superseded.
+   * Ordered and bounded as `listReserved`. A `reserved` row is never listed here, whatever its
+   * schedule columns hold: it is resolved (`listReserved`), not checked.
+   */
+  listBindingDue(d: Deployment, nowMs: number, limit: number): LegalBodyRecord[];
+  /** Drafts created more than 24 hours before `nowMs`, oldest first, at most `limit`. */
+  listExpiredDrafts(nowMs: number, limit: number): LegalBodyRecord[];
+  /**
+   * The create transactions recorded for this body, newest first. An event written around the
+   * repository whose detail does not read as a submission is left out.
+   */
+  listDeploySubmissions(legalBodyId: string): DeploySubmission[];
+  /** The newest create this deployment recorded at that nonce: any order, in any state. */
+  deploySubmissionAtNonce(d: Deployment, nonce: number): DeploySubmission | undefined;
+  /** The block `reserve` observed the link at, from the `link_accepted` event. */
+  acceptedAtBlock(legalBodyId: string): number | undefined;
+  /** The `reason` of the newest `broken` event, when it holds one as text. */
+  latestBrokenReason(legalBodyId: string): string | undefined;
+  /** Whether a `revoked` event was ever recorded for this body. */
+  isRevoked(legalBodyId: string): boolean;
+  /**
+   * Whether the company has a body or an order for one: a draft under 24 hours old, or a
+   * `reserved`, `deployed` or `linked` row. A linked body counts here, and not in
+   * `countOpenByTenant`, on purpose: a company "has a body" while one is linked, and the cap on
+   * open orders stops counting a body once it is linked.
+   */
+  hasOpenForCompany(companyId: string, nowMs: number): boolean;
+  hasLinkedForCompany(companyId: string): boolean;
+  /**
+   * The tenant's open orders at `nowMs`: a draft under 24 hours old, a `reserved` row, and a
+   * `deployed` row for 7 days after its `deployedAt`. A value that is not an address owns none.
+   */
+  countOpenByTenant(tenantId: string, nowMs: number): number;
+  /** Rows the tenant created at or after `sinceMs`, in any state. */
+  countOrdersCreatedByTenant(tenantId: string, sinceMs: number): number;
+  /** Create transactions (`deploy_submitted` events) recorded for the tenant's rows since then. */
+  countCreatesByTenant(tenantId: string, sinceMs: number): number;
+  /** Create transactions recorded for this deployment's rows since then. */
+  countCreatesSince(d: Deployment, sinceMs: number): number;
+  /** Events of one kind across the tenant's rows, ever. */
+  countEventsByTenant(tenantId: string, kind: LegalBodyEventKind): number;
   /**
    * Append one event.
    *
@@ -428,6 +553,8 @@ function requireAddress(field: string, value: unknown): Address {
 
 const HASH_32 = /^0x[0-9a-fA-F]{64}$/;
 const HEX_BYTES = /^0x(?:[0-9a-fA-F]{2})+$/;
+/** A link signature: whole bytes of hex, or none at all (`0x`) for an owner that signs nothing. */
+const SIGNATURE_BYTES = /^0x(?:[0-9a-fA-F]{2})*$/;
 
 /**
  * A 32-byte hash in the one spelling rows store it: lower-case, so a stored hash compares as text
@@ -454,6 +581,25 @@ function requireBytes(field: string, value: unknown): Hex {
 /** The largest time the seconds columns hold. A time in milliseconds is past it for centuries. */
 const MAX_UNIX_SECONDS = 99_999_999_999;
 
+/**
+ * The smallest time a schedule takes, in unix MILLISECONDS: one past the largest time in seconds,
+ * so the two units never overlap. A schedule below it is a time in seconds, and would make the row
+ * due at once, on every tick.
+ */
+const MIN_SCHEDULE_MS = MAX_UNIX_SECONDS + 1;
+
+/** The largest time a `Date` holds, in milliseconds: a `now` or `since` is turned into one. */
+const MAX_DATE_MS = 8_640_000_000_000_000;
+
+/** The interval of the first check a reservation schedules. */
+const RESERVE_CHECK_INTERVAL_MS = 30_000;
+
+/** A draft can be linked for this long after its creation; after it, it is expired. */
+const DRAFT_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+/** A deployed body counts as an open order for this long after its block, and no longer. */
+const DEPLOYED_OPEN_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** A time in unix SECONDS, the unit of a block timestamp. */
 function requireSeconds(field: string, value: unknown): number {
   if (!isIntegerWithin(value, 1, MAX_UNIX_SECONDS))
@@ -468,6 +614,53 @@ function isIntegerWithin(value: unknown, min: number, max: number): value is num
   return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
 }
 
+/** A time in unix MILLISECONDS read by a listing or a counter: zero or more, within a `Date`. */
+function requireMillis(field: string, value: unknown): number {
+  if (!isIntegerWithin(value, 0, MAX_DATE_MS))
+    throw new LegalBodyInputError(
+      `${field} must be a time in unix milliseconds, zero or more, got ${String(value)}`,
+    );
+  return value;
+}
+
+/** A row count for LIMIT: one or more. To SQLite a negative limit means no limit at all. */
+function requireLimit(value: unknown): number {
+  if (!isIntegerWithin(value, 1, Number.MAX_SAFE_INTEGER))
+    throw new LegalBodyInputError(
+      `limit must be a whole number, one or more, got ${String(value)}`,
+    );
+  return value;
+}
+
+/** The deployment as rows store it: the factory checksummed, so a lookup matches any casing. */
+function requireDeployment(d: unknown): { chain_id: number; factory: Address } {
+  const { chainId, factory } = (d ?? {}) as { chainId?: unknown; factory?: unknown };
+  if (!isIntegerWithin(chainId, 1, Number.MAX_SAFE_INTEGER))
+    throw new LegalBodyInputError(
+      `a deployment's chainId must be a positive whole number, got ${String(chainId)}`,
+    );
+  return { chain_id: chainId, factory: requireAddress("a deployment's factory", factory) };
+}
+
+/** The `created_at` text a draft created at `nowMs` minus its lifetime carries: at or after it,
+ *  the draft is still open; before it, expired. One cutoff, so a draft is always one or the other. */
+function draftCutoff(nowMs: number): string {
+  return sqliteUtcTimestamp(nowMs - DRAFT_LIFETIME_MS);
+}
+
+/**
+ * Whether `row` is a draft created more than 24 hours before `nowMs` (unix MILLISECONDS): the very
+ * cutoff `listExpiredDrafts` and the open counts use, so a door and the housekeeping never disagree
+ * about one draft. A row in any other state is not an expired draft. A `nowMs` that is not a time
+ * in milliseconds throws a `LegalBodyInputError`.
+ */
+export function isDraftExpired(
+  row: Pick<LegalBodyRecord, "bindingState" | "createdAt">,
+  nowMs: number,
+): boolean {
+  return row.bindingState === "draft" && row.createdAt < draftCutoff(requireMillis("nowMs", nowMs));
+}
+
 const UINT256_MAX = 2n ** 256n - 1n;
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -475,9 +668,9 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 /**
  * An agentId in the one spelling rows store it: a uint256 in decimal without leading zeros.
  *
- * The one-live-body-per-agent index compares `agent_id` as TEXT, so "042" and "42" would be two
- * agents to it, and the same identity could hold two live bodies. Null when the value is not a
- * uint256 in decimal at all.
+ * The two agentId indexes compare `agent_id` as TEXT, so "042" and "42" would be two agents to
+ * them, and the same identity could hold two orders on their way, or two linked bodies. Null when
+ * the value is not a uint256 in decimal at all.
  */
 function canonicalAgentId(value: string): string | null {
   if (!/^[0-9]+$/.test(value)) return null;
@@ -485,21 +678,39 @@ function canonicalAgentId(value: string): string | null {
   return n <= UINT256_MAX ? n.toString() : null;
 }
 
-/** The live-state predicate, spelled exactly as the partial index's WHERE so SQLite can use it. */
-const LIVE_STATES_SQL = `binding_state IN (${LIVE_BINDING_STATES.map((s) => `'${s}'`).join(",")})`;
+/**
+ * An agentId as a lookup takes it: canonical, or null when the value cannot be one (a lookup
+ * finds nothing for it rather than throwing).
+ */
+function agentKey(value: unknown): string | null {
+  return typeof value === "string" ? canonicalAgentId(value) : null;
+}
+
+/** The in-flight predicate, spelled exactly as the partial index's WHERE so SQLite can use it. */
+const IN_FLIGHT_STATES_SQL = `binding_state IN (${IN_FLIGHT_BINDING_STATES.map((s) => `'${s}'`).join(",")})`;
 
 /**
- * The states a binding check applies to: every state but `draft`, `abandoned` and `lapsed`, which
- * have nothing on chain to check. Setting a check and listing the due ones both filter on it.
+ * The states a schedule applies to: every state but `draft`, `abandoned` and `lapsed`, which have
+ * nothing on chain to check. Setting a time filters on it: a reserved row is scheduled too, for
+ * its resolution.
  */
 const CHECKED_STATES_SQL = "binding_state NOT IN ('draft','abandoned','lapsed')";
 
+/** The states a binding check reads the chain for: a body exists, so a pointer can name it. */
+const BINDING_CHECK_STATES_SQL = "binding_state IN ('deployed','linked','broken','superseded')";
+
+/** The states `markLinked` moves a body out of. */
+const LINKABLE_STATES: readonly BindingState[] = ["deployed", "broken", "superseded"];
+
 /**
  * How SQLite names each unique index in its violation message, which is how a lost race is told
- * apart. A column index is named by its columns; an EXPRESSION index, like the body-address one
- * on `lower(body_address)`, is named only by its index name. The schema tests pin both messages.
+ * apart. A column index is named by its columns: both agentId indexes are on (chain_id, factory,
+ * agent_id), so their messages are the same text, and the state a write sets tells which one
+ * refused it (a reservation can only meet the in-flight one). An EXPRESSION index, like the
+ * body-address one on `lower(body_address)`, is named only by its index name. The schema tests
+ * pin both messages.
  */
-const LIVE_AGENT_CONFLICT = "legal_bodies.chain_id, legal_bodies.agent_id";
+const LIVE_AGENT_CONFLICT = "legal_bodies.chain_id, legal_bodies.factory, legal_bodies.agent_id";
 const BODY_ADDRESS_CONFLICT = "index 'idx_legal_bodies_body'";
 
 export class SqliteLegalBodyRepository implements LegalBodyRepository {
@@ -517,8 +728,19 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       findById: db.prepare("SELECT * FROM legal_bodies WHERE legal_body_id = ?"),
       findOwned: db.prepare("SELECT * FROM legal_bodies WHERE legal_body_id = ? AND tenant_id = ?"),
       findByPublicId: db.prepare("SELECT * FROM legal_bodies WHERE public_id = ?"),
-      findLiveByAgentId: db.prepare(
-        `SELECT * FROM legal_bodies WHERE chain_id = ? AND agent_id = ? AND ${LIVE_STATES_SQL}`,
+      // Each states predicate repeats the WHERE of its partial index, which SQLite must see in
+      // the query before it will use that index.
+      listInFlightByAgent: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE chain_id = @chain_id AND factory = @factory
+            AND agent_id = @agent_id AND ${IN_FLIGHT_STATES_SQL}
+          ORDER BY rowid`,
+      ),
+      findLinkedByAgent: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE chain_id = @chain_id AND factory = @factory
+            AND agent_id = @agent_id AND binding_state = 'linked'
+          ORDER BY rowid`,
       ),
       // Compares the lower-case form, exactly as the unique index on (chain_id,
       // lower(body_address)) does: the lookup and the index then agree on every row, whatever
@@ -548,6 +770,8 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
             SET agent_id = @agent_id, identity_owner = @identity_owner,
                 link_digest = @link_digest, link_deadline = @link_deadline,
                 link_signature = @link_signature, body_address = @body_address,
+                next_binding_check_at = @first_check_at,
+                binding_check_interval_ms = ${RESERVE_CHECK_INTERVAL_MS},
                 binding_state = 'reserved', updated_at = CURRENT_TIMESTAMP
           WHERE legal_body_id = @legal_body_id AND binding_state = 'draft'
             AND oa_manifest_hash IS NOT NULL`,
@@ -597,17 +821,86 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
         `UPDATE legal_bodies SET next_binding_check_at = NULL, binding_check_interval_ms = NULL
           WHERE legal_body_id = ?`,
       ),
+      // The two due listings: the IS NOT NULL term repeats the WHERE of the schedule's partial
+      // index, as above.
+      listReserved: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE binding_state = 'reserved' AND next_binding_check_at <= @now
+            AND next_binding_check_at IS NOT NULL
+            AND chain_id = @chain_id AND factory = @factory
+          ORDER BY next_binding_check_at, legal_body_id LIMIT @limit`,
+      ),
       listBindingDue: db.prepare(
         `SELECT * FROM legal_bodies
-          WHERE next_binding_check_at IS NOT NULL AND next_binding_check_at <= ?
-            AND ${CHECKED_STATES_SQL}
-          ORDER BY next_binding_check_at, legal_body_id LIMIT ?`,
+          WHERE ${BINDING_CHECK_STATES_SQL} AND next_binding_check_at <= @now
+            AND next_binding_check_at IS NOT NULL
+            AND chain_id = @chain_id AND factory = @factory
+          ORDER BY next_binding_check_at, legal_body_id LIMIT @limit`,
+      ),
+      listExpiredDrafts: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE binding_state = 'draft' AND created_at < @cutoff
+          ORDER BY created_at, rowid LIMIT @limit`,
+      ),
+      hasOpenForCompany: db.prepare(
+        `SELECT EXISTS (
+           SELECT 1 FROM legal_bodies
+            WHERE company_id = @company_id
+              AND (binding_state IN ('reserved','deployed','linked')
+                   OR (binding_state = 'draft' AND created_at >= @draft_cutoff))) AS found`,
+      ),
+      hasLinkedForCompany: db.prepare(
+        `SELECT EXISTS (
+           SELECT 1 FROM legal_bodies
+            WHERE company_id = @company_id AND binding_state = 'linked') AS found`,
+      ),
+      // `deployed_at` is in seconds and the cutoff in milliseconds: the product stays well inside
+      // SQLite's 64-bit integers, since the column is at most 99,999,999,999.
+      countOpenByTenant: db.prepare(
+        `SELECT COUNT(*) AS n FROM legal_bodies
+          WHERE tenant_id = @tenant_id
+            AND (binding_state = 'reserved'
+                 OR (binding_state = 'draft' AND created_at >= @draft_cutoff)
+                 OR (binding_state = 'deployed' AND deployed_at * 1000 > @deployed_cutoff))`,
+      ),
+      countOrdersCreatedByTenant: db.prepare(
+        `SELECT COUNT(*) AS n FROM legal_bodies
+          WHERE tenant_id = @tenant_id AND created_at >= @since`,
+      ),
+      countCreatesByTenant: db.prepare(
+        `SELECT COUNT(*) AS n FROM legal_bodies b
+           JOIN legal_body_events e ON e.legal_body_id = b.legal_body_id
+          WHERE b.tenant_id = @tenant_id AND e.kind = 'deploy_submitted' AND e.created_at >= @since`,
+      ),
+      countCreatesSince: db.prepare(
+        `SELECT COUNT(*) AS n FROM legal_bodies b
+           JOIN legal_body_events e ON e.legal_body_id = b.legal_body_id
+          WHERE b.chain_id = @chain_id AND b.factory = @factory
+            AND e.kind = 'deploy_submitted' AND e.created_at >= @since`,
+      ),
+      countEventsByTenant: db.prepare(
+        `SELECT COUNT(*) AS n FROM legal_bodies b
+           JOIN legal_body_events e ON e.legal_body_id = b.legal_body_id
+          WHERE b.tenant_id = @tenant_id AND e.kind = @kind`,
       ),
       insertEvent: db.prepare(
         `INSERT INTO legal_body_events (legal_body_id, kind, actor, tx_hash, detail)
          VALUES (?, ?, ?, ?, ?)`,
       ),
       listEvents: db.prepare("SELECT * FROM legal_body_events WHERE legal_body_id = ? ORDER BY id"),
+      eventsOfKind: db.prepare(
+        `SELECT * FROM legal_body_events
+          WHERE legal_body_id = @legal_body_id AND kind = @kind ORDER BY id DESC`,
+      ),
+      // A detail written around the repository may not be JSON, and json_extract THROWS on such a
+      // blob: the CASE reads it only when it is valid, so one bad row cannot fail the lookup.
+      deploySubmissionsAtNonce: db.prepare(
+        `SELECT e.* FROM legal_bodies b
+           JOIN legal_body_events e ON e.legal_body_id = b.legal_body_id
+          WHERE b.chain_id = @chain_id AND b.factory = @factory AND e.kind = 'deploy_submitted'
+            AND CASE WHEN json_valid(e.detail) THEN json_extract(e.detail, '$.nonce') END = @nonce
+          ORDER BY e.id DESC`,
+      ),
     };
   }
 
@@ -667,10 +960,22 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     return r ? toRecord(r) : undefined;
   }
 
-  findLiveByAgentId(chainId: number, agentId: string): LegalBodyRecord | undefined {
-    const agent = canonicalAgentId(agentId);
+  listInFlightByAgent(d: Deployment, agentId: string): LegalBodyRecord[] {
+    const deployment = requireDeployment(d);
+    const agent = agentKey(agentId);
+    if (agent === null) return [];
+    return (this.stmts.listInFlightByAgent.all({ ...deployment, agent_id: agent }) as Row[]).map(
+      toRecord,
+    );
+  }
+
+  findLinkedByAgent(d: Deployment, agentId: string): LegalBodyRecord | undefined {
+    const deployment = requireDeployment(d);
+    const agent = agentKey(agentId);
     if (agent === null) return undefined;
-    const r = this.stmts.findLiveByAgentId.get(chainId, agent) as Row | undefined;
+    const r = this.stmts.findLinkedByAgent.get({ ...deployment, agent_id: agent }) as
+      | Row
+      | undefined;
     return r ? toRecord(r) : undefined;
   }
 
@@ -715,6 +1020,8 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       linkDeadline: number;
       linkSignature: Hex;
       bodyAddress: Address;
+      observedAtBlock: number;
+      firstCheckAt: number;
     },
   ): ReserveOutcome {
     // A string only. A number would be read as its decimal spelling, and past 2^53 that spelling
@@ -733,8 +1040,22 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     if (bodyAddress.toLowerCase() === ZERO_ADDRESS)
       throw new LegalBodyInputError("bodyAddress must not be the zero address");
     const linkDigest = requireHash("linkDigest", l.linkDigest);
-    const linkSignature = requireBytes("linkSignature", l.linkSignature);
+    if (typeof l.linkSignature !== "string" || !SIGNATURE_BYTES.test(l.linkSignature))
+      throw new LegalBodyInputError(
+        "linkSignature must be 0x followed by whole bytes of hex (none at all for 0x)",
+      );
+    const linkSignature = l.linkSignature.toLowerCase() as Hex;
     const linkDeadline = requireSeconds("linkDeadline", l.linkDeadline);
+    if (!isIntegerWithin(l.observedAtBlock, 0, Number.MAX_SAFE_INTEGER))
+      throw new LegalBodyInputError(
+        `observedAtBlock must be a whole block number, zero or more, got ${String(l.observedAtBlock)}`,
+      );
+    const observedAtBlock = l.observedAtBlock;
+    if (!isIntegerWithin(l.firstCheckAt, MIN_SCHEDULE_MS, Number.MAX_SAFE_INTEGER))
+      throw new LegalBodyInputError(
+        `firstCheckAt must be a time in unix milliseconds (${MIN_SCHEDULE_MS} or more), got ${String(l.firstCheckAt)}`,
+      );
+    const firstCheckAt = l.firstCheckAt;
 
     const row = this.stmts.findById.get(legalBodyId) as Row | undefined;
     // The factory is a fact of the row, so this one refusal waits for the row to be read.
@@ -753,26 +1074,34 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
           link_deadline: linkDeadline,
           link_signature: linkSignature,
           body_address: bodyAddress,
+          first_check_at: firstCheckAt,
         });
         // Zero rows: another caller moved this body out of draft between the read and the write.
         if (changes !== 1) return "not_draft";
-        this.recordEvent(legalBodyId, "link_accepted", "system", null, null);
+        // A number, never a string: nine digits written as text would be redacted as SSN-shaped.
+        this.recordEvent(legalBodyId, "link_accepted", "system", null, { observedAtBlock });
         return "reserved";
       })();
     } catch (e) {
-      // The two unique indexes ARE the race guard: whoever loses a race for an agentId or a body
-      // address lands here, and gets an answer rather than an exception.
+      // The two unique indexes a reservation can meet ARE the race guard: whoever loses a race
+      // for an agentId or a body address lands here, and gets an answer rather than an exception.
+      // A reservation sets `reserved`, so of the two agentId indexes only the in-flight one can
+      // refuse it: a body linked for the agentId does not.
       if ((e as { code?: string }).code !== "SQLITE_CONSTRAINT_UNIQUE") throw e;
       const message = e instanceof Error ? e.message : String(e);
-      // A live holder of the agentId wins the precedence, whichever index SQLite names. The body
-      // address is derived from the signed link digest, so one tenant ordering twice for one
-      // agent with the same agreement and deadline collides on BOTH indexes, and SQLite reports
-      // only one of them (in practice the body index).
+      // An order on its way for the agentId wins the precedence, whichever index SQLite names.
+      // The body address is derived from the signed link digest, so one tenant ordering twice for
+      // one agent with the same agreement and deadline collides on BOTH indexes, and SQLite
+      // reports only one of them (in practice the body index).
       if (
         message.includes(LIVE_AGENT_CONFLICT) ||
-        this.stmts.findLiveByAgentId.get(row.chain_id, agentId)
+        this.stmts.listInFlightByAgent.get({
+          chain_id: row.chain_id,
+          factory: row.factory,
+          agent_id: agentId,
+        })
       )
-        return "agent_taken";
+        return "agent_in_flight";
       if (message.includes(BODY_ADDRESS_CONFLICT)) return "body_taken";
       throw e;
     }
@@ -809,40 +1138,68 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     );
   }
 
-  lapse(legalBodyId: string, reason: string): boolean {
+  lapse(legalBodyId: string, p: { reason: LapseReason; blockTime: number }): boolean {
+    const { reason, blockTime } = (p ?? {}) as { reason?: unknown; blockTime?: unknown };
+    if (!LAPSE_REASONS.includes(reason as LapseReason))
+      throw new LegalBodyInputError(
+        `a lapse reason must be one of ${LAPSE_REASONS.join(", ")}, got ${JSON.stringify(reason)}`,
+      );
+    const at = requireSeconds("blockTime", blockTime);
     return this.move(legalBodyId, () => this.stmts.lapse.run(legalBodyId), "lapsed", null, {
       reason,
+      blockTime: at,
     });
   }
 
-  abandon(legalBodyId: string, reason: string): boolean {
-    return this.move(legalBodyId, () => this.stmts.abandon.run(legalBodyId), "abandoned", null, {
-      reason,
-    });
+  abandon(legalBodyId: string, reason: string, actor: LegalBodyActor = "system"): boolean {
+    return this.move(
+      legalBodyId,
+      () => this.stmts.abandon.run(legalBodyId),
+      "abandoned",
+      null,
+      { reason },
+      actor,
+    );
   }
 
-  markLinked(legalBodyId: string, seenAt: number): boolean {
+  markLinked(legalBodyId: string, seenAt: number): MarkLinkedOutcome {
     const at = requireSeconds("seenAt", seenAt);
     try {
-      // `seenAt` goes into the event too: the column is overwritten by every re-link, the log
-      // keeps each sighting.
-      return this.move(
-        legalBodyId,
-        () => this.stmts.markLinked.run(at, legalBodyId),
-        "linked",
-        null,
-        { seenAt: at },
-      );
+      // Immediate: the unit holds the write lock from its first read, so the body linked for the
+      // agent cannot change between the read that finds it and the writes that replace it.
+      return this.db
+        .transaction((): MarkLinkedOutcome => {
+          const row = this.stmts.findById.get(legalBodyId) as Row | undefined;
+          if (!row || !LINKABLE_STATES.includes(row.binding_state))
+            return { outcome: "not_linkable" };
+          // One linked body per chain, factory and agentId (the linked index): the one the chain
+          // named before gives way first, or the link below would be refused.
+          const replaced: string[] = [];
+          const holders = this.stmts.findLinkedByAgent.all({
+            chain_id: row.chain_id,
+            factory: row.factory,
+            agent_id: row.agent_id,
+          }) as Row[];
+          for (const holder of holders) {
+            if (this.stmts.markBroken.run(holder.legal_body_id).changes !== 1)
+              throw new MoveNotMade();
+            this.recordEvent(holder.legal_body_id, "broken", "system", null, {
+              reason: "replaced",
+              by: legalBodyId,
+            });
+            replaced.push(holder.legal_body_id);
+          }
+          // `seenAt` goes into the event too: the column is overwritten by every re-link, the log
+          // keeps each sighting.
+          if (this.stmts.markLinked.run(at, legalBodyId).changes !== 1) throw new MoveNotMade();
+          this.recordEvent(legalBodyId, "linked", "system", null, { seenAt: at });
+          return { outcome: "linked", replaced };
+        })
+        .immediate();
     } catch (e) {
-      // The one refusal that is an answer: another body holds this agentId live (the partial
-      // unique index on live agentIds). The move and its event were rolled back together, so
-      // nothing is recorded. Anything else is a real failure, and it propagates.
-      if (
-        (e as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE" &&
-        e instanceof Error &&
-        e.message.includes(LIVE_AGENT_CONFLICT)
-      )
-        return false;
+      // A move the unit read as possible and then could not make: the replacements were rolled
+      // back with it, so nothing is recorded. Anything else is a real failure, and propagates.
+      if (e instanceof MoveNotMade) return { outcome: "not_linkable" };
       throw e;
     }
   }
@@ -857,10 +1214,44 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     );
   }
 
-  supersede(legalBodyId: string, bySupersedingId: string): boolean {
-    return this.move(legalBodyId, () => this.stmts.supersede.run(legalBodyId), "superseded", null, {
-      by: bySupersedingId,
-    });
+  recordBrokenReason(
+    legalBodyId: string,
+    detail: { reason: string } & Record<string, unknown>,
+  ): boolean {
+    const reason: unknown = detail?.reason;
+    if (typeof reason !== "string" || reason.length === 0)
+      throw new LegalBodyInputError(
+        `a broken reason is a non-empty string, got ${typeof reason === "string" ? "an empty string" : typeof reason}`,
+      );
+    // Immediate: the state is read and the event written under the write lock, so the row cannot
+    // be linked in between.
+    return this.db
+      .transaction((): boolean => {
+        const row = this.stmts.findById.get(legalBodyId) as Row | undefined;
+        const linkedOnceNotNow =
+          row !== undefined &&
+          (row.binding_state === "broken" ||
+            (row.binding_state === "superseded" && row.pointer_seen_at !== null));
+        if (!linkedOnceNotNow) return false;
+        this.recordEvent(legalBodyId, "broken", "system", null, detail);
+        return true;
+      })
+      .immediate();
+  }
+
+  supersede(
+    legalBodyId: string,
+    bySupersedingId: string,
+    actor: LegalBodyActor = "system",
+  ): boolean {
+    return this.move(
+      legalBodyId,
+      () => this.stmts.supersede.run(legalBodyId),
+      "superseded",
+      null,
+      { by: bySupersedingId },
+      actor,
+    );
   }
 
   scheduleBindingCheck(
@@ -872,12 +1263,12 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     if (
       !cleared &&
       !(
-        isIntegerWithin(nextAt, 0, Number.MAX_SAFE_INTEGER) &&
+        isIntegerWithin(nextAt, MIN_SCHEDULE_MS, Number.MAX_SAFE_INTEGER) &&
         isIntegerWithin(intervalMs, 1, Number.MAX_SAFE_INTEGER)
       )
     )
       throw new LegalBodyInputError(
-        `a binding check is a time in unix milliseconds (zero or more) with an interval in milliseconds (one or more), or null with null; got ${String(nextAt)}, ${String(intervalMs)}`,
+        `a check is a time in unix milliseconds (${MIN_SCHEDULE_MS} or more) with an interval in milliseconds (one or more), or null with null; got ${String(nextAt)}, ${String(intervalMs)}`,
       );
     const { changes } = cleared
       ? this.stmts.clearBindingCheck.run(legalBodyId)
@@ -885,16 +1276,107 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     return changes === 1;
   }
 
-  listBindingDue(now: number, limit: number): LegalBodyRecord[] {
-    if (!isIntegerWithin(now, 0, Number.MAX_SAFE_INTEGER))
+  listReserved(d: Deployment, nowMs: number, limit: number): LegalBodyRecord[] {
+    return this.listDue(this.stmts.listReserved, d, nowMs, limit);
+  }
+
+  listBindingDue(d: Deployment, nowMs: number, limit: number): LegalBodyRecord[] {
+    return this.listDue(this.stmts.listBindingDue, d, nowMs, limit);
+  }
+
+  listExpiredDrafts(nowMs: number, limit: number): LegalBodyRecord[] {
+    const cutoff = draftCutoff(requireMillis("nowMs", nowMs));
+    return (this.stmts.listExpiredDrafts.all({ cutoff, limit: requireLimit(limit) }) as Row[]).map(
+      toRecord,
+    );
+  }
+
+  listDeploySubmissions(legalBodyId: string): DeploySubmission[] {
+    const events = this.stmts.eventsOfKind.all({
+      legal_body_id: legalBodyId,
+      kind: "deploy_submitted",
+    }) as EventRow[];
+    return events.map(toSubmission).filter((s): s is DeploySubmission => s !== undefined);
+  }
+
+  deploySubmissionAtNonce(d: Deployment, nonce: number): DeploySubmission | undefined {
+    const deployment = requireDeployment(d);
+    if (!isIntegerWithin(nonce, 0, Number.MAX_SAFE_INTEGER))
       throw new LegalBodyInputError(
-        `now must be a time in unix milliseconds, zero or more, got ${String(now)}`,
+        `nonce must be a whole number, zero or more, got ${String(nonce)}`,
       );
-    if (!isIntegerWithin(limit, 1, Number.MAX_SAFE_INTEGER))
-      throw new LegalBodyInputError(
-        `limit must be a whole number, one or more, got ${String(limit)}`,
-      );
-    return (this.stmts.listBindingDue.all(now, limit) as Row[]).map(toRecord);
+    const events = this.stmts.deploySubmissionsAtNonce.all({ ...deployment, nonce }) as EventRow[];
+    for (const e of events) {
+      const submission = toSubmission(e);
+      if (submission !== undefined) return submission;
+    }
+    return undefined;
+  }
+
+  acceptedAtBlock(legalBodyId: string): number | undefined {
+    const block = this.latestDetail(legalBodyId, "link_accepted")?.observedAtBlock;
+    return isIntegerWithin(block, 0, Number.MAX_SAFE_INTEGER) ? block : undefined;
+  }
+
+  latestBrokenReason(legalBodyId: string): string | undefined {
+    const reason = this.latestDetail(legalBodyId, "broken")?.reason;
+    return typeof reason === "string" ? reason : undefined;
+  }
+
+  isRevoked(legalBodyId: string): boolean {
+    return (
+      this.stmts.eventsOfKind.get({ legal_body_id: legalBodyId, kind: "revoked" }) !== undefined
+    );
+  }
+
+  hasOpenForCompany(companyId: string, nowMs: number): boolean {
+    const draft_cutoff = draftCutoff(requireMillis("nowMs", nowMs));
+    const r = this.stmts.hasOpenForCompany.get({ company_id: companyId, draft_cutoff }) as {
+      found: number;
+    };
+    return r.found === 1;
+  }
+
+  hasLinkedForCompany(companyId: string): boolean {
+    const r = this.stmts.hasLinkedForCompany.get({ company_id: companyId }) as { found: number };
+    return r.found === 1;
+  }
+
+  countOpenByTenant(tenantId: string, nowMs: number): number {
+    const now = requireMillis("nowMs", nowMs);
+    const tenant = checksummed(tenantId);
+    if (tenant === null) return 0;
+    return this.count(this.stmts.countOpenByTenant, {
+      tenant_id: tenant,
+      draft_cutoff: draftCutoff(now),
+      deployed_cutoff: now - DEPLOYED_OPEN_MS,
+    });
+  }
+
+  countOrdersCreatedByTenant(tenantId: string, sinceMs: number): number {
+    const since = sqliteUtcTimestamp(requireMillis("sinceMs", sinceMs));
+    const tenant = checksummed(tenantId);
+    if (tenant === null) return 0;
+    return this.count(this.stmts.countOrdersCreatedByTenant, { tenant_id: tenant, since });
+  }
+
+  countCreatesByTenant(tenantId: string, sinceMs: number): number {
+    const since = sqliteUtcTimestamp(requireMillis("sinceMs", sinceMs));
+    const tenant = checksummed(tenantId);
+    if (tenant === null) return 0;
+    return this.count(this.stmts.countCreatesByTenant, { tenant_id: tenant, since });
+  }
+
+  countCreatesSince(d: Deployment, sinceMs: number): number {
+    const deployment = requireDeployment(d);
+    const since = sqliteUtcTimestamp(requireMillis("sinceMs", sinceMs));
+    return this.count(this.stmts.countCreatesSince, { ...deployment, since });
+  }
+
+  countEventsByTenant(tenantId: string, kind: LegalBodyEventKind): number {
+    const tenant = checksummed(tenantId);
+    if (tenant === null) return 0;
+    return this.count(this.stmts.countEventsByTenant, { tenant_id: tenant, kind });
   }
 
   recordEvent(
@@ -939,8 +1421,9 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
 
   /**
    * One compare-and-set move and, only if THIS call made it, its event, in one transaction.
-   * The transition methods take no actor: what they record is the system observing or making
-   * the move. Operator and tenant actions are written with `recordEvent`.
+   * What a move records is the system observing or making it, unless the caller names another
+   * actor: `abandon` and `supersede` take one, since a tenant or an operator can decide those.
+   * Other operator and tenant actions are written with `recordEvent`.
    */
   private move(
     legalBodyId: string,
@@ -948,11 +1431,60 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
     kind: LegalBodyEventKind,
     txHash: Hex | null,
     detail: Record<string, unknown> | null,
+    actor: LegalBodyActor = "system",
   ): boolean {
     return this.db.transaction(() => {
       if (update().changes !== 1) return false;
-      this.recordEvent(legalBodyId, kind, "system", txHash, detail);
+      this.recordEvent(legalBodyId, kind, actor, txHash, detail);
       return true;
     })();
   }
+
+  /** A due listing of one deployment: its arguments checked, then the statement run. */
+  private listDue(
+    stmt: Database.Statement,
+    d: Deployment,
+    nowMs: number,
+    limit: number,
+  ): LegalBodyRecord[] {
+    const deployment = requireDeployment(d);
+    const now = requireMillis("nowMs", nowMs);
+    return (stmt.all({ ...deployment, now, limit: requireLimit(limit) }) as Row[]).map(toRecord);
+  }
+
+  private count(stmt: Database.Statement, params: Record<string, unknown>): number {
+    return (stmt.get(params) as { n: number }).n;
+  }
+
+  /** The detail of the newest event of `kind` for this body, when it is a JSON object. */
+  private latestDetail(
+    legalBodyId: string,
+    kind: LegalBodyEventKind,
+  ): Record<string, unknown> | undefined {
+    const e = this.stmts.eventsOfKind.get({ legal_body_id: legalBodyId, kind }) as
+      | EventRow
+      | undefined;
+    const detail = e ? parseDetail(e.detail) : undefined;
+    return detail !== null && typeof detail === "object" && !Array.isArray(detail)
+      ? (detail as Record<string, unknown>)
+      : undefined;
+  }
+}
+
+/** Thrown inside a unit to roll it back when a move it read as possible could not be made. */
+class MoveNotMade extends Error {}
+
+/**
+ * A `deploy_submitted` event as the submission it records, or undefined when it does not read as
+ * one: `recordDeploySubmission` writes a 32-byte hash, raw bytes and a nonce, so only an event
+ * written around it can fail this.
+ */
+function toSubmission(e: EventRow): DeploySubmission | undefined {
+  const txHash = lowerHash(e.tx_hash);
+  const detail = parseDetail(e.detail);
+  if (txHash === null || detail === null || typeof detail !== "object") return undefined;
+  const { rawTx, nonce } = detail as { rawTx?: unknown; nonce?: unknown };
+  if (typeof rawTx !== "string" || !HEX_BYTES.test(rawTx)) return undefined;
+  if (!isIntegerWithin(nonce, 0, Number.MAX_SAFE_INTEGER)) return undefined;
+  return { legalBodyId: e.legal_body_id, txHash, rawTx: rawTx as Hex, nonce, eventId: e.id };
 }

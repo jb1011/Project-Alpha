@@ -208,7 +208,7 @@ test("rows are never deleted", () => {
   expect(() => db.prepare("DELETE FROM legal_bodies").run()).toThrow(/never deleted/);
 });
 
-test("one live body per agentId per chain; a lapsed one frees the agentId", () => {
+test("one order on its way per agentId, factory and chain; a lapsed one frees the agentId", () => {
   insertDraft(lb("1"), pub("1"));
   insertDraft(lb("2"), pub("2"));
   freeze(lb("1"));
@@ -831,22 +831,139 @@ test("each unique index names itself in its own way, which the repository's mapp
   reserve(lb("1"), "42", BODY);
   // A column index is named by its columns; an expression index only by its name.
   expect(() => reserve(lb("2"), "42", OTHER_BODY)).toThrow(
-    "UNIQUE constraint failed: legal_bodies.chain_id, legal_bodies.agent_id",
+    "UNIQUE constraint failed: legal_bodies.chain_id, legal_bodies.factory, legal_bodies.agent_id",
   );
   expect(() => reserve(lb("3"), "43", BODY)).toThrow(
     "UNIQUE constraint failed: index 'idx_legal_bodies_body'",
   );
 });
 
+// ── Which rows may hold one agentId at the same time ──
+
+/** What both agentId indexes are named by when they refuse a row. */
+const AGENT_CONFLICT =
+  "UNIQUE constraint failed: legal_bodies.chain_id, legal_bodies.factory, legal_bodies.agent_id";
+const OTHER_FACTORY = "0x00000000000000000000000000000000000000f2";
+const link = (id: string) =>
+  db
+    .prepare(
+      "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000100 WHERE legal_body_id = ?",
+    )
+    .run(id);
+
+test("raw SQL: two linked bodies for one agent under one factory are refused; a linked body and an order on its way are both kept", () => {
+  for (const [id, publicId] of [
+    [lb("1"), pub("1")],
+    [lb("2"), pub("2")],
+    [lb("3"), pub("3")],
+  ]) {
+    insertDraft(id, publicId);
+    freeze(id);
+  }
+  reserve(lb("1"), "42", BODY);
+  deploy(lb("1"));
+  link(lb("1"));
+  // A replacement is ordered, and created, while the first body is linked...
+  expect(() => reserve(lb("2"), "42", OTHER_BODY)).not.toThrow();
+  expect(() => deploy(lb("2"))).not.toThrow();
+  // ...but it is not a second linked body for the agent, and there is no second order on its way.
+  expect(() => link(lb("2"))).toThrow(AGENT_CONFLICT);
+  expect(() => reserve(lb("3"), "42", bodyN(3))).toThrow(AGENT_CONFLICT);
+  expect(
+    db.prepare("SELECT legal_body_id, binding_state FROM legal_bodies ORDER BY rowid").all(),
+  ).toEqual([
+    { legal_body_id: lb("1"), binding_state: "linked" },
+    { legal_body_id: lb("2"), binding_state: "deployed" },
+    { legal_body_id: lb("3"), binding_state: "draft" },
+  ]);
+  // Once the first body is no longer linked, the replacement can be.
+  db.prepare(`UPDATE legal_bodies SET binding_state = 'broken' WHERE legal_body_id = ?`).run(
+    lb("1"),
+  );
+  expect(() => link(lb("2"))).not.toThrow();
+});
+
+test("raw SQL: every pair of states for one agent, under one factory and under two", () => {
+  /** The states in which a row holds an agentId. */
+  const holding: readonly State[] = [
+    "reserved",
+    "deployed",
+    "linked",
+    "broken",
+    "superseded",
+    "lapsed",
+  ];
+  const inFlight = (s: State) => s === "reserved" || s === "deployed";
+  /** Body `id` under `factory`, frozen, then walked legally into `state` for agent 42. */
+  const walk = (d: Database.Database, id: string, factory: string, state: State, body: string) => {
+    d.prepare(
+      `INSERT INTO legal_bodies (legal_body_id, public_id, tenant_id, company_id, chain_id, factory, guardian, amendment_delay)
+       VALUES (?, ?, ?, 'co_1', 5042002, ?, ?, 172800)`,
+    ).run(id, id.slice(3), TENANT, factory, TENANT);
+    d.prepare(
+      "UPDATE legal_bodies SET oa_manifest_hash = ?, oa_manifest_version = 1 WHERE legal_body_id = ?",
+    ).run(H("a"), id);
+    for (const s of PATH[state]) {
+      const set =
+        s === "reserved"
+          ? `, agent_id = '42', identity_owner = '${OWNER}', link_digest = '${H("b")}',
+             link_deadline = 1900000000, link_signature = '0x01', body_address = '${body}'`
+          : s === "deployed"
+            ? `, ${DEPLOY_SET}`
+            : s === "linked"
+              ? ", pointer_seen_at = 1800000100"
+              : "";
+      d.prepare(`UPDATE legal_bodies SET binding_state = ?${set} WHERE legal_body_id = ?`).run(
+        s,
+        id,
+      );
+    }
+  };
+  // Rows in neither index are walked first, then a linked one, then one on its way: so the second
+  // row never meets the first in a state it only passes through on the way to its own.
+  const order = (s: State) => (inFlight(s) ? 2 : s === "linked" ? 1 : 0);
+  for (const first of holding)
+    for (const second of holding)
+      for (const factory of [FACTORY, OTHER_FACTORY]) {
+        const sameFactory = factory === FACTORY;
+        const refused =
+          sameFactory &&
+          ((inFlight(first) && inFlight(second)) || (first === "linked" && second === "linked"));
+        const label = `${first} and ${second}, ${sameFactory ? "one factory" : "two factories"}`;
+        const rows = [
+          { id: lb("1"), factory: FACTORY, state: first, body: bodyN(1) },
+          { id: lb("2"), factory, state: second, body: bodyN(2) },
+        ].sort((a, b) => order(a.state) - order(b.state));
+        const d = freshDb();
+        const [early, late] = rows as [(typeof rows)[0], (typeof rows)[0]];
+        walk(d, early.id, early.factory, early.state, early.body);
+        const walkLate = () => walk(d, late.id, late.factory, late.state, late.body);
+        if (refused) expect(walkLate, label).toThrow(AGENT_CONFLICT);
+        else {
+          expect(walkLate, label).not.toThrow();
+          expect(
+            d
+              .prepare("SELECT binding_state FROM legal_bodies ORDER BY legal_body_id")
+              .pluck()
+              .all(),
+            label,
+          ).toEqual([first, second]);
+        }
+        d.close();
+      }
+});
+
 test("a body that has events stays in place: no conflict-resolving write removes or replaces it", () => {
-  // The holder is a linked body with its history, as the repository writes every body: together
-  // with its `created` event. Each write below would have to remove the holder to succeed.
+  // The holder is a linked body, and the replacement an order for the same agentId on its way,
+  // each with its history, as the repository writes every body: together with its `created`
+  // event. Each write below would have to remove one of them to succeed.
   const reserveSet = (agent: string, body: string) =>
     `agent_id = '${agent}', identity_owner = '${OWNER}', link_digest = '${H("b")}',
      link_deadline = 1900000000, link_signature = '0x01', body_address = '${body}',
      binding_state = 'reserved'`;
   const holder = lb("holder");
   const mover = lb("mover");
+  const replacement = lb("replacement");
   const setUp = () => {
     const d = freshDb();
     frozenDraftIn(d, holder);
@@ -860,6 +977,13 @@ test("a body that has events stays in place: no conflict-resolving write removes
       "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000100 WHERE legal_body_id = ?",
     ).run(holder);
     frozenDraftIn(d, mover);
+    frozenDraftIn(d, replacement);
+    d.prepare(`UPDATE legal_bodies SET ${reserveSet("42", bodyN(3))} WHERE legal_body_id = ?`).run(
+      replacement,
+    );
+    d.prepare(
+      `UPDATE legal_bodies SET ${DEPLOY_SET}, binding_state = 'deployed' WHERE legal_body_id = ?`,
+    ).run(replacement);
     return d;
   };
   const holderRowid = (d: Database.Database) =>
@@ -870,7 +994,7 @@ test("a body that has events stays in place: no conflict-resolving write removes
     ).r;
   const writes: readonly (readonly [string, RegExp, (d: Database.Database) => unknown])[] = [
     [
-      "a reservation of the agentId it holds",
+      "a reservation of the agentId an order on its way holds",
       /FOREIGN KEY/,
       (d) =>
         d
@@ -878,6 +1002,16 @@ test("a body that has events stays in place: no conflict-resolving write removes
             `UPDATE OR REPLACE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = ?`,
           )
           .run(mover),
+    ],
+    [
+      "a second link of the agentId a linked body holds",
+      /FOREIGN KEY/,
+      (d) =>
+        d
+          .prepare(
+            "UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000200 WHERE legal_body_id = ?",
+          )
+          .run(replacement),
     ],
     [
       "a reservation of its body address",
@@ -936,17 +1070,17 @@ test("a body that has events stays in place: no conflict-resolving write removes
     ).toEqual(before);
     d.close();
   }
-  // The same holds for a re-link: a broken body is not linked again over the body that now
-  // holds its agentId live.
+  // The same holds for a re-link: a broken body is not linked again over the body that is now
+  // linked for its agentId.
   const d = setUp();
   d.prepare("UPDATE legal_bodies SET binding_state = 'broken' WHERE legal_body_id = ?").run(holder);
-  d.prepare(`UPDATE legal_bodies SET ${reserveSet("42", OTHER_BODY)} WHERE legal_body_id = ?`).run(
-    mover,
-  );
+  d.prepare(
+    "UPDATE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000200 WHERE legal_body_id = ?",
+  ).run(replacement);
   expect(() =>
     d
       .prepare(
-        "UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000200 WHERE legal_body_id = ?",
+        "UPDATE OR REPLACE legal_bodies SET binding_state = 'linked', pointer_seen_at = 1800000300 WHERE legal_body_id = ?",
       )
       .run(holder),
   ).toThrow(/FOREIGN KEY/);
@@ -954,7 +1088,8 @@ test("a body that has events stays in place: no conflict-resolving write removes
     d.prepare("SELECT legal_body_id, binding_state FROM legal_bodies ORDER BY rowid").all(),
   ).toEqual([
     { legal_body_id: holder, binding_state: "broken" },
-    { legal_body_id: mover, binding_state: "reserved" },
+    { legal_body_id: mover, binding_state: "draft" },
+    { legal_body_id: replacement, binding_state: "linked" },
   ]);
   d.close();
 });
@@ -1108,7 +1243,6 @@ test("the link digest and the deploy hash are lower-case 32-byte hashes; the sig
     );
   for (const [label, sql] of [
     ["empty", "''"],
-    ["0x and no byte", "'0x'"],
     ["half a byte", "'0x1'"],
     ["a byte and a half", "'0x012'"],
     ["no 0x prefix", "'0101'"],
@@ -1135,6 +1269,23 @@ test("the link digest and the deploy hash are lower-case 32-byte hashes; the sig
   for (const [label, sql] of BAD_HASHES)
     expect(() => setRaw(id, `create_tx_hash = ${sql}`), `deploy hash: ${label}`).toThrow(/CHECK/);
   expect(setRaw(id, `create_tx_hash = '${H("1")}'`).changes).toBe(1);
+});
+
+test("an empty signature 0x is stored and read back; half a byte is still refused", () => {
+  // A contract owner can approve the link digest on chain and sign nothing.
+  const id = frozenDraft();
+  expect(reserveRaw(id, { link_signature: "'0x'" }).changes).toBe(1);
+  expect(
+    db
+      .prepare("SELECT link_signature, binding_state FROM legal_bodies WHERE legal_body_id = ?")
+      .get(id),
+  ).toEqual({ link_signature: "0x", binding_state: "reserved" });
+  for (const [label, sql] of [
+    ["half a byte", "'0x1'"],
+    ["empty", "''"],
+    ["0x and a NUL", "'0x' || char(0)"],
+  ] as const)
+    expect(() => reserveRaw(frozenDraft(), { link_signature: sql }), label).toThrow(/CHECK/);
 });
 
 test("the tenant, the factory and the identity owner are 0x addresses", () => {

@@ -302,9 +302,11 @@ describe("the doors are mounted only with their dependencies", () => {
    * The composition root has no injectable seam for its own wiring (it boots against a chain), so
    * this reads the file, as the boot-order guard does. What it protects: the view facts are built
    * whatever the configuration, so a customer company keeps its view with the legal-body feature
-   * off, and the doors exist only behind their one predicate.
+   * off, and the doors exist only behind their one predicate. The two legal-body reads (is one of
+   * the company's bodies linked, is one open) come from the legal-body store, which exists only
+   * where the feature is on.
    */
-  test("the composition root wires the view facts always, and the doors only behind customerDoorsEnabled", () => {
+  test("the composition root wires the view facts always, and the doors only behind customerDoorsEnabled; the legal-body reads come from the legal-body store", () => {
     const main = readFileSync(
       join(import.meta.dirname, "..", "..", "src", "api", "main.ts"),
       "utf8",
@@ -316,12 +318,27 @@ describe("the doors are mounted only with their dependencies", () => {
     expect(main).toMatch(/^ {2}const companyChecks = new SqliteCompanyCheckRepository\(db\);$/m);
     const viewDepsAt = main.indexOf("const entityViewDeps = {");
     expect(viewDepsAt, "the view dependencies were not found").toBeGreaterThan(0);
-    // A property of the view dependencies in its own right, not a branch of a condition.
-    expect(main.slice(viewDepsAt, main.indexOf("};", viewDepsAt))).toMatch(
-      /^ {4}customerFacts: \{ declarations: companyDeclarations, checks: companyChecks \},$/m,
+    const viewDeps = main.slice(viewDepsAt, main.indexOf("};", viewDepsAt));
+    // A property of the view dependencies in its own right, not a branch of a condition, with its
+    // declarations and checks as its first two members.
+    expect(viewDeps).toMatch(
+      /^ {4}customerFacts: \{\n {6}declarations: companyDeclarations,\n {6}checks: companyChecks,$/m,
+    );
+    // Its linked-body read, only where the legal-body store is.
+    expect(viewDeps).toMatch(
+      /^ {6}\.\.\.\(legalBodies\n\s+\? \{ hasLinkedLegalBody: \(companyId: string\) => legalBodies\.hasLinkedForCompany\(companyId\) \}\n\s+: \{\}\),$/m,
+    );
+    // The store: only with the legal-body factory and the controller.
+    expect(main).toMatch(
+      /^ {2}const legalBodies =\s+cfg\.legalBodyFactory && cfg\.controllerAddress \? new SqliteLegalBodyRepository\(db\) : undefined;$/m,
     );
     expect(main).toMatch(
       /const customerCompanies =\s+cfg\.legalBodyFactory && customerDoorsEnabled\(cfg\)/,
+    );
+    // The doors ask the store whether a company stands behind an open legal body.
+    const doorsAt = main.indexOf("const customerCompanies =");
+    expect(main.slice(doorsAt, main.indexOf(": undefined;", doorsAt))).toMatch(
+      /hasOpenLegalBody: \(companyId: string\) =>\s+legalBodies === undefined \|\| legalBodies\.hasOpenForCompany\(companyId, Date\.now\(\)\),/,
     );
   });
 });

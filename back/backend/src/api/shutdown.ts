@@ -29,6 +29,8 @@ export interface SignalSource {
 export interface ShutdownDeps {
   /** Stopped FIRST, so no new work starts while the drain is running. */
   sweeper?: { stop(): void };
+  /** Every other sweeper, stopped right after `sweeper`, before the drain, for the same reason. */
+  sweepers?: { stop(): void }[];
   /** Awaited, with a bound. */
   tasks?: { settled(timeoutMs?: number): Promise<boolean> };
   /** Closed after the drain: in-flight requests finish, no new connections are accepted. */
@@ -56,7 +58,7 @@ export function shouldInstallSignalHandlers(
  * without a signal.
  *
  * Order matters and is the whole point:
- *   1. stop the sweeper — no NEW work while we are trying to finish the old;
+ *   1. stop the sweepers — no NEW work while we are trying to finish the old;
  *   2. drain tracked background tasks, bounded, so one wedged doola call cannot hang the deploy;
  *   3. close the HTTP server, letting in-flight requests finish;
  *   4. exit.
@@ -77,6 +79,7 @@ export function installShutdownHandlers(d: ShutdownDeps = {}): (signal: string) 
     opsLog("api_stop", { signal });
 
     d.sweeper?.stop();
+    for (const sweeper of d.sweepers ?? []) sweeper.stop();
 
     if (d.tasks) {
       const drained = await d.tasks.settled(drainMs);
