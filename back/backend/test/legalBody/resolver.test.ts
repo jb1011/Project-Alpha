@@ -452,6 +452,61 @@ describe("rule 1: the body exists, created by the row's owner", () => {
     // The kept block is written once.
     expect(systemNotes(row.legalBodyId)).toHaveLength(1);
   });
+
+  test("a creation no search can locate writes one error line over repeated passes, past the deadline too: the row stays reserved, and no hash is written", async () => {
+    const row = await reservedOrder();
+    const sub = recordSubmission(row.legalBodyId, 0);
+    chain.createdState.mockResolvedValue("created");
+    // The first search throws, as a node that cannot answer does; every later one finds nothing.
+    chain.findCreation.mockRejectedValueOnce(new TransportFailure());
+    const before = rowOf(row.legalBodyId);
+    const events = s.repo.listEvents(row.legalBodyId).length;
+
+    for (let pass = 1; pass <= 4; pass++) {
+      if (pass === 4) {
+        // Past the link's deadline: rule 1 comes first, so the row does not lapse.
+        clock = (DEADLINE + 100) * 1_000;
+        chain.head.mockResolvedValue({
+          number: LINK_HEAD.number + 50n,
+          timestamp: BigInt(DEADLINE + 100),
+        });
+      }
+      expect(await resolveOrder(deps(), row.legalBodyId), `pass ${pass}`).toBe("unknown");
+      const after = rowOf(row.legalBodyId);
+      expect(after.bindingState, `pass ${pass}`).toBe("reserved");
+      expect(after.createTxHash, `pass ${pass}`).toBe(before.createTxHash);
+      expect(after.deployedAt, `pass ${pass}`).toBeNull();
+      clock += 60_000;
+    }
+
+    // Only the search's kept block was written; nothing was sent.
+    expect(
+      s.repo
+        .listEvents(row.legalBodyId)
+        .slice(events)
+        .map((e) => e.kind),
+    ).toEqual(["note"]);
+    expect(s.repo.listDeploySubmissions(row.legalBodyId)).toEqual([sub]);
+    expect(chain.submitCreate).not.toHaveBeenCalled();
+    expect(chain.rebroadcastCreate).not.toHaveBeenCalled();
+    expect(opsLines()).toEqual([
+      expect.objectContaining({
+        opslog: "legal_body_resolve",
+        level: "warn",
+        orderId: row.legalBodyId,
+        outcome: "unknown",
+        stage: "find_creation",
+        errorName: "HttpRequestError",
+      }),
+      {
+        opslog: "legal_body_creation_unlocatable",
+        at: expect.any(String),
+        level: "error",
+        orderId: row.legalBodyId,
+        stage: "find_creation",
+      },
+    ]);
+  });
 });
 
 // ── Rules 2 and 3: the order lapses ─────────────────────────────────────────────────────────

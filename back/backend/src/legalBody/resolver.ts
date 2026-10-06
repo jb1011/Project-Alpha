@@ -50,6 +50,11 @@ import { type LegalBodyOrderDeps, companyEligible } from "./orders";
  * row's schedule (the resolve schedule), so a row that cannot be settled backs off instead of
  * staying due. A row is logged once per outcome, never once per pass, and a throw is a warning,
  * never a page.
+ *
+ * A BODY THE CHAIN CREATED WHOSE CREATION CANNOT BE LOCATED IS AN ERROR: the row answers `unknown`
+ * on every pass, past its deadline too, since rule 1 comes before rule 3, so it never lapses and
+ * its identity stays held. No hash is invented for it: one error line says so, for a person to
+ * look at.
  */
 
 export type ResolveOutcome =
@@ -70,6 +75,8 @@ export const RESOLVE_MAX_INTERVAL_MS = 600_000;
 const DEPLOYED_CHECK_INTERVAL_MS = 60_000;
 /** The `act` of the note that keeps the head the search for a creation stops at. */
 const CREATION_SEARCH_NOTE = "creation_search";
+/** The `why` of an `unknown` whose body exists but whose creation no search found. */
+const CREATION_NOT_FOUND = "creation_not_found";
 
 /** What one pass decided, with the facts its log line carries. */
 type Settled =
@@ -128,7 +135,8 @@ function reservedLink(row: LegalBodyRecord): ReservedLink {
  *  1. `created`: the hash is the chain's. `createOutcome` on each recorded hash, newest first,
  *     the first `created` winning; with none, the factory's log, from the block the link was
  *     accepted at to the head of the first pass that searched (kept in a `note`, so the search
- *     does not grow). Found: `deployed`. Not found: `unknown`, the row as it was.
+ *     does not grow). Found: `deployed`. Not found: `unknown`, the row as it was, with an error
+ *     line (`legal_body_creation_unlocatable`).
  *  2. `foreign`: `lapsed` (`foreign_body`), at the head's time.
  *  3. The head's time is past the deadline: `lapsed` (`deadline_passed`). Safe on a lagging node
  *     too: the factory refuses a link after its deadline, and every later block is later still.
@@ -271,7 +279,7 @@ async function adoptCreation(
     deps.chain.findCreation({ bodyAddress, fromBlock: BigInt(fromBlock), toBlock: BigInt(end) }),
   );
   if (found === undefined)
-    return { outcome: "unknown", stage: "find_creation", why: "creation_not_found" };
+    return { outcome: "unknown", stage: "find_creation", why: CREATION_NOT_FOUND };
   return deployed(deps, id, found, "factory_log");
 }
 
@@ -447,6 +455,8 @@ function logKey(settled: Settled): string {
       return settled.why === "executor_nonce_gap"
         ? `waiting:${settled.why}:${settled.facts?.pendingNonce}:${settled.facts?.submittedNonce}`
         : `waiting:${settled.why}`;
+    case "unknown":
+      return settled.why === CREATION_NOT_FOUND ? `unknown:${CREATION_NOT_FOUND}` : "unknown";
     default:
       return settled.outcome;
   }
@@ -456,7 +466,8 @@ function logKey(settled: Settled): string {
  * One line per row per outcome, never one per pass: a line is written when the row's outcome (and
  * what it is about) differs from the last one written for it. A settled row is forgotten. Lines
  * carry ids, nonces, hashes and error NAMES, never an error's message; a throw is a warning, not
- * a page. The one error line is a gap in the platform key's nonces that a pass could not fill.
+ * a page. Two answers are error lines, in place of their usual line: a gap in the platform key's
+ * nonces that a pass could not fill, and a body the chain created whose creation no search found.
  */
 function logOnChange(id: string, settled: Settled): void {
   if (settled.outcome === "not_reserved") {
@@ -477,6 +488,14 @@ function logOnChange(id: string, settled: Settled): void {
 function writeLine(orderId: string, settled: Settled): void {
   switch (settled.outcome) {
     case "unknown":
+      if (settled.why === CREATION_NOT_FOUND) {
+        opsLog("legal_body_creation_unlocatable", {
+          level: "error",
+          orderId,
+          stage: settled.stage,
+        });
+        return;
+      }
       opsLog("legal_body_resolve", {
         level: "warn",
         orderId,
