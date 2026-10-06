@@ -38,14 +38,15 @@ import { refusal } from "./sentences";
  *  6. ONE synchronous transaction: the tenant's requests are counted across all its orders (one is
  *     enough for 409 `gas_seed_used`), and this request is recorded;
  *  7. the send, inside the platform key's send lock: the nonce, the signature and the broadcast;
- *     then `gas_seeded` with its hash, then the outflow.
+ *     then `gas_seeded` with its hash, then the outflow. `gas_seeded` records the broadcast, not
+ *     the delivery.
  *
  * The request is recorded before the send, so a send that fails leaves the seed spent: the tenant
- * cannot ask again, and the operator sees why (a request with no `gas_seeded`, and the line that
- * names the order, the stage and the error). That is the side to fail on: the other could seed
- * twice. Its answer is 503 `gas_seed_unconfirmed`, never `chain_unavailable`, whose sentence says
- * that nothing changed. It still counts as an outflow, with no hash: the node may have taken the
- * transfer.
+ * cannot ask again, and the operator sees why (a request with no `gas_seeded`, the line that names
+ * the order, the stage and the error, and a line of its own, `legal_body_gas_seed_unconfirmed`).
+ * That is the side to fail on: the other could seed twice. Its answer is 503
+ * `gas_seed_unconfirmed`, never `chain_unavailable`, whose sentence says that nothing changed. It
+ * still counts as an outflow, with no hash: the node may have taken the transfer.
  *
  * Amounts: the native value is in wei (18 decimals). The meter and the recorded request count
  * millionths of a USDC, which on Arc is the native unit: the wei divided by 10^12. The request's
@@ -184,6 +185,7 @@ export async function requestGasSeed(
   //    node may have taken the transfer, it counts as an outflow, with no hash to name.
   const txHash = await chainCall(orderId, "gas_seed_send", () => d.sendPrepared(prepared)).catch(
     () => {
+      opsLog("legal_body_gas_seed_unconfirmed", { level: "warn", orderId });
       d.recordOutflow(microUsdc, null);
       throw refusal("gas_seed_unconfirmed", 503);
     },

@@ -662,7 +662,8 @@ describe("the outflow meter is asked first, and the request is recorded before t
     // The node may have taken the transfer: it counts as an outflow, with no hash to name.
     expect(d.recordOutflow).toHaveBeenCalledWith(SEED_MICRO_USDC, null);
     expect(outflowRows()).toEqual([{ path: "gas_seed", amount: 50_000, ref: null }]);
-    // For the operator: the order, the stage and the error's name, with no URL; then the outflow.
+    // For the operator: the order, the stage and the error's name, with no URL; then one line of
+    // its own naming the order, and no message; then the outflow.
     expect(opsLines()).toEqual([
       expect.objectContaining({
         opslog: "legal_body_chain_unavailable",
@@ -670,6 +671,12 @@ describe("the outflow meter is asked first, and the request is recorded before t
         stage: "gas_seed_send",
         errorName: "HttpRequestError",
       }),
+      {
+        opslog: "legal_body_gas_seed_unconfirmed",
+        at: expect.any(String),
+        level: "warn",
+        orderId: first.legalBodyId,
+      },
       expect.objectContaining({
         opslog: "outflow_recorded",
         path: "gas_seed",
