@@ -12,7 +12,18 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
-import { type Address, type Hex, getAddress, keccak256, parseEther, toHex } from "viem";
+import {
+  type Address,
+  EstimateGasExecutionError,
+  ExecutionRevertedError,
+  type Hex,
+  HttpRequestError,
+  TimeoutError,
+  getAddress,
+  keccak256,
+  parseEther,
+  toHex,
+} from "viem";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { PreparedPlatformTx } from "../../src/adapters/arc/arcAdapter";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
@@ -496,6 +507,75 @@ describe("refused", () => {
     expect(ownerChain.sendPrepared.mock.calls).toEqual([
       [preparedTransfer(owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT)],
     ]);
+  });
+
+  test("an estimate the node refuses for the recipient's own code answers 409 owner_pays_own_gas, after one line naming the error, and nothing is recorded", async () => {
+    const row = deployed(tenant);
+    // viem's estimate error whose cause is an execution failure.
+    ownerChain.estimateTransferGas.mockRejectedValueOnce(
+      new EstimateGasExecutionError(new ExecutionRevertedError({ message: "execution reverted" }), {
+        to: owner,
+        value: SEED_WEI,
+      }),
+    );
+    const d = seedDeps();
+    lines.length = 0;
+
+    await refused(() => requestGasSeed(d, tenant, row.legalBodyId), "owner_pays_own_gas", 409);
+
+    expect(opsLines()).toEqual([
+      {
+        opslog: "legal_body_gas_seed_estimate_refused",
+        at: expect.any(String),
+        level: "info",
+        orderId: row.legalBodyId,
+        errorName: "EstimateGasExecutionError",
+        causeName: "ExecutionRevertedError",
+      },
+    ]);
+    expect(lines.join("\n")).not.toContain("execution reverted");
+    expect(d.checkOutflow).not.toHaveBeenCalled();
+    expect(ownerChain.prepareTransfer).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
+    expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
+    expect(outflowRows()).toEqual([]);
+  });
+
+  test("an estimate that fails in transport, a 429 or a timeout as viem reports them, answers 503 chain_unavailable with no upstream text, and nothing is recorded", async () => {
+    const row = deployed(tenant);
+    const url = "https://rpc.example/v2/key-in-path";
+    const d = seedDeps();
+
+    for (const cause of [
+      new HttpRequestError({ url, status: 429 }),
+      new TimeoutError({ body: {}, url }),
+    ]) {
+      ownerChain.estimateTransferGas.mockRejectedValueOnce(
+        new EstimateGasExecutionError(cause, { to: owner, value: SEED_WEI }),
+      );
+      lines.length = 0;
+      const err = await requestGasSeed(d, tenant, row.legalBodyId).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err, cause.name).toBeInstanceOf(ApiError);
+      expect(err, cause.name).toMatchObject({
+        code: "chain_unavailable",
+        status: 503,
+        message: LEGAL_BODY_SENTENCES.chain_unavailable,
+      });
+      expect(opsLines(), cause.name).toEqual([
+        expect.objectContaining({
+          opslog: "legal_body_chain_unavailable",
+          stage: "gas_seed_estimate",
+          errorName: "EstimateGasExecutionError",
+        }),
+      ]);
+      expect(lines.join("\n"), cause.name).not.toContain("http");
+    }
+    expect(d.checkOutflow).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
+    expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
   });
 
   test("an estimate that throws answers 503 chain_unavailable, with no upstream text, and nothing is recorded", async () => {

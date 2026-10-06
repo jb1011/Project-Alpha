@@ -1,6 +1,7 @@
-import type { Address, Hex } from "viem";
+import { type Address, EstimateGasExecutionError, ExecutionRevertedError, type Hex } from "viem";
 import type { PreparedPlatformTx } from "../adapters/arc/arcAdapter";
 import { assertRealHuman } from "../api/routes/worldId";
+import { opsLog } from "../observability/opsLog";
 import { OutflowCeilingError } from "../payments/outflowMeter";
 import {
   type LegalBodyOrderDeps,
@@ -27,7 +28,8 @@ import { refusal } from "./sentences";
  *     EIP-7702 delegation (exactly 23 bytes: `0xef0100` and the delegate's address). Any other
  *     code is 409 `owner_pays_own_gas`, and a balance at or above the amount is 409 `not_needed`.
  *     The seed's gas is capped at `SEED_TRANSFER_GAS_LIMIT`: a transfer estimated above it is 409
- *     `owner_pays_own_gas` as well;
+ *     `owner_pays_own_gas` as well, and so is an estimate the node refuses for the recipient's own
+ *     code. Any other failure of a read is the usual 503 `chain_unavailable`;
  *  4. the platform's outflow meter, asked for the amount in 6-decimal USDC. Over its ceiling: 503
  *     `busy`, with nothing recorded, so a refusal of the meter does not spend the tenant's seed;
  *  5. the transfer is prepared before the seed is recorded: its fees and chain id, with the cap as
@@ -59,7 +61,7 @@ export interface GasSeedDeps {
   /** The address's native balance, in wei: the public client's `getBalance`. */
   readBalance(address: Address): Promise<bigint>;
   /** The gas of a transfer of `value` wei to `to` from the address the platform sends from: the
-   *  public client's `estimateGas`. */
+   *  public client's `estimateGas`, which throws viem's estimate error. */
   estimateTransferGas(to: Address, value: bigint): Promise<bigint>;
   /** The platform outflow meter's check, in 6-decimal USDC: throws `OutflowCeilingError` when the
    *  amount would take the window over its ceiling. */
@@ -96,6 +98,29 @@ function keyControlled(code: Hex | undefined): boolean {
   );
 }
 
+/**
+ * The transfer's gas, as the node estimates it. An estimate the node refuses for the recipient's
+ * own code (viem's estimate error whose cause is an execution failure) is 409
+ * `owner_pays_own_gas`, after one line naming the error and its cause, never their messages. Any
+ * other failure, a transport error among them, is thrown on for `chainCall` to answer 503.
+ */
+async function transferGas(d: GasSeedDeps, orderId: string, to: Address): Promise<bigint> {
+  try {
+    return await d.estimateTransferGas(to, d.amountWei);
+  } catch (err) {
+    if (!(err instanceof EstimateGasExecutionError)) throw err;
+    const failure = err.walk((cause) => cause instanceof ExecutionRevertedError);
+    if (failure === null) throw err;
+    opsLog("legal_body_gas_seed_estimate_refused", {
+      level: "info",
+      orderId,
+      errorName: err.name,
+      causeName: failure.name,
+    });
+    throw refusal("owner_pays_own_gas", 409);
+  }
+}
+
 /** Sends the tenant's one gas seed to the identity's owner of its deployed order `id`, by the rules
  *  above. Every refusal is an `ApiError` with its code's fixed sentence. */
 export async function requestGasSeed(
@@ -126,9 +151,7 @@ export async function requestGasSeed(
   if (!keyControlled(code)) throw refusal("owner_pays_own_gas", 409);
   const balance = await chainCall(orderId, "gas_seed_balance", () => d.readBalance(to));
   if (balance >= d.amountWei) throw refusal("not_needed", 409);
-  const gas = await chainCall(orderId, "gas_seed_estimate", () =>
-    d.estimateTransferGas(to, d.amountWei),
-  );
+  const gas = await chainCall(orderId, "gas_seed_estimate", () => transferGas(d, orderId, to));
   if (gas > SEED_TRANSFER_GAS_LIMIT) throw refusal("owner_pays_own_gas", 409);
 
   // 4.
