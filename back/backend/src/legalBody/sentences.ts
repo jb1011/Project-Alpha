@@ -79,8 +79,10 @@ export const LEGAL_BODY_SENTENCES: Readonly<Record<string, string>> = Object.fre
     "This deployment does not send gas to an identity's owner: the owner pays for its own pointer transaction.",
   gas_seed_used:
     "You have already had your one gas seed, and there is no second: the identity's owner pays for its own pointer transaction.",
+  // Answered for an owner with code that is not a delegation, and for a transfer estimated above
+  // the seed's gas cap.
   owner_pays_own_gas:
-    "Gas is sent only to an owner a key controls directly, and this identity's owner is a contract: it pays for its own pointer transaction.",
+    "A gas seed goes only to an owner a key controls directly, by a transfer within the seed's gas cap: this identity's owner pays for its own pointer transaction.",
   not_needed:
     "The identity's owner already holds at least the amount of a gas seed, so none is sent: it can pay for its own pointer transaction.",
   gas_seed_unconfirmed:

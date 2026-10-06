@@ -611,11 +611,12 @@ async function main() {
    * THE GAS SEED's dependencies, wherever the order doors' are, and over those same deps: a
    * one-time native amount an identity's owner pays its pointer transaction with. The amount is
    * LEGAL_BODY_GAS_SEED_USDC in wei (on Arc the native unit is USDC, with 18 decimals), 0 (off)
-   * when unset. The owner's code and balance are read through the public client. The platform's
-   * outflow meter is asked before a seed is recorded and fed once it is sent, on the `gas_seed`
-   * path the agent pockets' seeds count on too. The send is the adapter's native send, through the
-   * one chokepoint every platform-signed transaction shares, so a seed takes its nonce like any
-   * other.
+   * when unset. The owner's code and balance are read through the public client, and so is the
+   * transfer's gas, estimated from the platform key's address, the one the adapter sends from. The
+   * platform's outflow meter is asked before a seed is recorded and fed once it is sent, on the
+   * `gas_seed` path the agent pockets' seeds count on too. The send is the adapter's native send,
+   * with the gas limit the seed gives it, through the one chokepoint every platform-signed
+   * transaction shares, so a seed takes its nonce like any other.
    */
   const legalBodyGasSeed: GasSeedDeps | undefined = legalBodyOrders
     ? {
@@ -623,8 +624,10 @@ async function main() {
         amountWei: parseEther(cfg.legalBodyGasSeedUsdc ?? "0"),
         readCode: (address) => publicClient.getCode({ address }),
         readBalance: (address) => publicClient.getBalance({ address }),
+        estimateTransferGas: (to, value) =>
+          publicClient.estimateGas({ account: executor.address, to, value }),
         checkOutflow: (valueAtomic) => outflows.check(valueAtomic),
-        sendNative: (to, value) => arc.sendNativeAsPlatform(to, value),
+        sendNative: (to, value, gas) => arc.sendNativeAsPlatform(to, value, gas),
         recordOutflow: (valueAtomic, hash) => outflows.record("gas_seed", valueAtomic, hash),
       }
     : undefined;

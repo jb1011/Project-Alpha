@@ -486,18 +486,22 @@ export class ArcAdapter {
   }
 
   /**
-   * Send native value (on Arc the gas token IS USDC) as the platform — the live runner's gas seeds.
+   * Send native value (on Arc the gas token IS USDC) as the platform — the live runner's gas seeds,
+   * and the legal-body flow's.
    *
    * Here rather than at the call site so it shares the one chokepoint: a seed and a treasury top-up
    * come from the same key, so they compete for the same nonces.
+   *
+   * `gas`, when given, is the transaction's gas limit, passed straight through, so viem does not
+   * estimate one; without it, viem estimates, as it always has.
    */
-  async sendNativeAsPlatform(to: Address, value: bigint): Promise<Hex> {
+  async sendNativeAsPlatform(to: Address, value: bigint, gas?: bigint): Promise<Hex> {
     const account = this.d.managerWallet.account;
     if (!account)
       throw new Error(
         "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send as the zero address",
       );
-    const prepared = await this.prepareAsPlatform({ account, to, value });
+    const prepared = await this.prepareAsPlatform({ account, to, value, gas });
     return this.sendAsPlatform(account.address, prepared);
   }
 

@@ -21,15 +21,17 @@ import { refusal } from "./sentences";
  *  1. a real human (never a waiver), then the tenant's bucket and the doors' budget;
  *  2. the tenant's order (the uniform 404), of this deployment, and `deployed`: the link was
  *     verified and the body exists, and only the pointer is missing (else 409 `order_closed`);
- *  3. two reads of the recipient, the order's identity owner: its code, then its balance. Only an
- *     address a key controls directly is seeded: one with no code, or an EIP-7702 delegation
- *     (exactly 23 bytes: `0xef0100` and the delegate's address). Any other code is 409
- *     `owner_pays_own_gas`, and a balance at or above the amount is 409 `not_needed`;
+ *  3. three reads, for the recipient, the order's identity owner: its code, its balance, and the
+ *     transfer's gas. Only an address a key controls directly is seeded: one with no code, or an
+ *     EIP-7702 delegation (exactly 23 bytes: `0xef0100` and the delegate's address). Any other
+ *     code is 409 `owner_pays_own_gas`, and a balance at or above the amount is 409 `not_needed`.
+ *     The seed's gas is capped at `SEED_TRANSFER_GAS_LIMIT`: a transfer estimated above it is 409
+ *     `owner_pays_own_gas` as well;
  *  4. the platform's outflow meter, asked for the amount in 6-decimal USDC. Over its ceiling: 503
  *     `busy`, with nothing recorded, so a refusal of the meter does not spend the tenant's seed;
  *  5. ONE synchronous transaction: the tenant's requests are counted across all its orders (one is
  *     enough for 409 `gas_seed_used`), and this request is recorded;
- *  6. the send; then `gas_seeded` with its hash, then the outflow.
+ *  6. the send, with the cap as its gas limit; then `gas_seeded` with its hash, then the outflow.
  *
  * The request is recorded before the send, so a send that fails leaves the seed spent: the tenant
  * cannot ask again, and the operator sees why (a request with no `gas_seeded`, and the line that
@@ -50,14 +52,22 @@ export interface GasSeedDeps {
   readCode(address: Address): Promise<Hex | undefined>;
   /** The address's native balance, in wei: the public client's `getBalance`. */
   readBalance(address: Address): Promise<bigint>;
+  /** The gas of a transfer of `value` wei to `to` from the address the platform sends from: the
+   *  public client's `estimateGas`. */
+  estimateTransferGas(to: Address, value: bigint): Promise<bigint>;
   /** The platform outflow meter's check, in 6-decimal USDC: throws `OutflowCeilingError` when the
    *  amount would take the window over its ceiling. */
   checkOutflow(valueAtomic: bigint): void;
-  /** The platform's native send, in wei: `ArcAdapter.sendNativeAsPlatform`. */
-  sendNative(to: Address, value: bigint): Promise<Hex>;
+  /** The platform's native send, in wei, with `gas` as its gas limit:
+   *  `ArcAdapter.sendNativeAsPlatform`. */
+  sendNative(to: Address, value: bigint, gas: bigint): Promise<Hex>;
   /** Records the outflow on the meter's `gas_seed` path, in 6-decimal USDC. */
   recordOutflow(valueAtomic: bigint, hash: Hex): void;
 }
+
+/** The seed's gas cap: the most a transfer is estimated at and still sent, and the send's gas
+ *  limit. */
+export const SEED_TRANSFER_GAS_LIMIT = 60_000n;
 
 /** Wei in one millionth of a USDC: the native unit has 18 decimals, the meter counts 6. */
 const WEI_PER_MICRO_USDC = 10n ** 12n;
@@ -105,6 +115,10 @@ export async function requestGasSeed(
   if (!keyControlled(code)) throw refusal("owner_pays_own_gas", 409);
   const balance = await chainCall(orderId, "gas_seed_balance", () => d.readBalance(to));
   if (balance >= d.amountWei) throw refusal("not_needed", 409);
+  const gas = await chainCall(orderId, "gas_seed_estimate", () =>
+    d.estimateTransferGas(to, d.amountWei),
+  );
+  if (gas > SEED_TRANSFER_GAS_LIMIT) throw refusal("owner_pays_own_gas", 409);
 
   // 4.
   const microUsdc = d.amountWei / WEI_PER_MICRO_USDC;
@@ -129,7 +143,7 @@ export async function requestGasSeed(
   // 6. `chainCall` writes the operator's line for a send that throws. The seed is recorded by now,
   //    so whatever the send did, the answer to its failure says the seed is spent.
   const txHash = await chainCall(orderId, "gas_seed_send", () =>
-    d.sendNative(to, d.amountWei),
+    d.sendNative(to, d.amountWei, SEED_TRANSFER_GAS_LIMIT),
   ).catch(() => {
     throw refusal("gas_seed_unconfirmed", 503);
   });

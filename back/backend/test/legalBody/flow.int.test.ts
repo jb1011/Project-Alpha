@@ -87,7 +87,7 @@ import {
   prepareCustomerStatement,
 } from "../../src/legalBody/customerCompany";
 import { expireEvidenceBytes } from "../../src/legalBody/evidence";
-import type { GasSeedDeps } from "../../src/legalBody/gasSeed";
+import { type GasSeedDeps, SEED_TRANSFER_GAS_LIMIT } from "../../src/legalBody/gasSeed";
 import { linkFromWire } from "../../src/legalBody/link";
 import type { LegalBodyOrderDeps } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
@@ -297,9 +297,10 @@ const open = () => ({ take: () => true });
  * payment fixture, and no payment ever reaches anvil.
  *
  * Its gas seed is off unless `gasSeedUsdc` sets one, and its deps are built as the composition root
- * builds them: the amount in wei, the owner's code and balance read through the public client, the
- * platform's outflow meter over this database, asked before a seed and fed after it on the
- * `gas_seed` path, and the adapter's native send from the platform key.
+ * builds them: the amount in wei, the owner's code and balance read through the public client, and
+ * the transfer's gas estimated through it from the platform key's address, the platform's outflow
+ * meter over this database, asked before a seed and fed after it on the `gas_seed` path, and the
+ * adapter's native send from the platform key, with the gas limit the seed gives it.
  */
 function deploy(opts: { charging?: boolean; gasSeedUsdc?: string } = {}): Deployment {
   const charging = opts.charging === true;
@@ -349,8 +350,9 @@ function deploy(opts: { charging?: boolean; gasSeedUsdc?: string } = {}): Deploy
     amountWei: parseEther(opts.gasSeedUsdc ?? "0"),
     readCode: (address) => pub.getCode({ address }),
     readBalance: (address) => pub.getBalance({ address }),
+    estimateTransferGas: (to, value) => pub.estimateGas({ account: executor.address, to, value }),
     checkOutflow: (valueAtomic) => outflows.check(valueAtomic),
-    sendNative: (to, value) => arc.sendNativeAsPlatform(to, value),
+    sendNative: (to, value, gas) => arc.sendNativeAsPlatform(to, value, gas),
     recordOutflow: (valueAtomic, hash) => outflows.record("gas_seed", valueAtomic, hash),
   };
   const customerDeps = sandboxCustomerCompanyDeps(
@@ -1357,7 +1359,11 @@ describe("an agent that holds the identity owner's key, and the gas seed, on a l
     const seedReceipt = await mined(seedHash);
     expect(isAddressEqual(seedReceipt.from, executor.address)).toBe(true);
     expect(seedReceipt.to && isAddressEqual(seedReceipt.to, freshOwner.address)).toBe(true);
-    expect((await pub.getTransaction({ hash: seedHash })).value).toBe(SEED_WEI);
+    // The amount, sent with the seed's gas cap as its gas limit.
+    expect(await pub.getTransaction({ hash: seedHash })).toMatchObject({
+      value: SEED_WEI,
+      gas: SEED_TRANSFER_GAS_LIMIT,
+    });
     expect(await pub.getBalance({ address: freshOwner.address })).toBe(SEED_WEI);
     const afterSeed = { mined: before.mined + 1, pending: before.pending + 1 };
     expect(await executorCounts()).toEqual(afterSeed);
