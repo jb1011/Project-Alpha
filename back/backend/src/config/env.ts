@@ -51,6 +51,13 @@ export const LEGAL_BODY_FLOW_DEFAULTS = Object.freeze({
   maxCreatesPerDay: 100,
 });
 
+/** Milliseconds between two ticks of the legal-body sweeper when LEGAL_BODY_SWEEP_INTERVAL_MS is
+ *  unset. Also the fallback for a config with no `legalBodySweepIntervalMs`. */
+export const DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS = 30_000;
+
+/** The longest delay a Node timer holds, in milliseconds: a longer one fires after 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
+
 /** The amendment delays the legal-body factory accepts, in seconds: 48 hours to 30 days. */
 const LEGAL_BODY_AMENDMENT_DELAY_MIN_SECONDS = 172_800;
 const LEGAL_BODY_AMENDMENT_DELAY_MAX_SECONDS = 2_592_000;
@@ -448,6 +455,17 @@ const EnvSchema = z.object({
     blankAsUnset,
     z.coerce.number().int().positive().default(LEGAL_BODY_FLOW_DEFAULTS.maxCreatesPerDay),
   ),
+  /** Milliseconds between two ticks of the legal-body sweeper, which settles reserved orders and
+   *  checks bindings: a positive whole number a timer can hold. */
+  LEGAL_BODY_SWEEP_INTERVAL_MS: z.preprocess(
+    blankAsUnset,
+    z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(MAX_TIMER_MS, { message: `must be at most ${MAX_TIMER_MS} milliseconds` })
+      .default(DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS),
+  ),
 });
 
 /** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
@@ -503,6 +521,10 @@ export interface Config {
     maxCreatesPerTenantPerDay: number;
     maxCreatesPerDay: number;
   };
+  /** Milliseconds between two ticks of the legal-body sweeper. Optional in the TYPE only, like
+   *  `legalBodyFlow`: loadConfig always sets it, and a reader falls back to
+   *  DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS. */
+  legalBodySweepIntervalMs?: number;
   /** Explicit ENS apex target; absent => the platform signing key (today's behavior). */
   ensApexResolvesTo?: Address;
   guardianAddress?: Address;
@@ -864,6 +886,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxCreatesPerTenantPerDay: e.LEGAL_BODY_MAX_CREATES_PER_TENANT_PER_DAY,
       maxCreatesPerDay: e.LEGAL_BODY_MAX_CREATES_PER_DAY,
     },
+    legalBodySweepIntervalMs: e.LEGAL_BODY_SWEEP_INTERVAL_MS,
     ensApexResolvesTo: e.ENS_APEX_RESOLVES_TO,
     guardianAddress: e.GUARDIAN_ADDRESS,
     operatorPrivateKey: e.OPERATOR_PRIVATE_KEY,

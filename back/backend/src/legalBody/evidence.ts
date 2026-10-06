@@ -145,7 +145,7 @@ export function acceptEvidence(
  * leaves its row unmarked, for the next run to try again, and is named in an ops line: it does not
  * hold back the others.
  *
- * Nothing calls it on a schedule yet: a periodic sweep is to.
+ * The legal-body sweeper calls it on its first tick and every 120th after it.
  */
 export function expireEvidenceBytes(deps: EvidenceDeps, limit: number): number {
   const nowSeconds = Math.floor((deps.now ?? Date.now)() / 1000);

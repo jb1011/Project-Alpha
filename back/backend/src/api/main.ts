@@ -39,6 +39,7 @@ import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
 import {
   DEFAULT_BYO_MAX_OPEN_PER_TENANT,
+  DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS,
   LEGAL_BODY_FLOW_DEFAULTS,
   WORLD_CHAIN_DEFAULTS,
   canFormEntities,
@@ -54,6 +55,13 @@ import { newChainHeadCache } from "../formation/payment";
 import { formationSummary } from "../formation/status";
 import { HederaMirror } from "../hedera/mirror";
 import { buildJobDeps } from "../jobs/composition";
+import { expireStaleCustomerCompanies } from "../legalBody/customerCompany";
+import { expireEvidenceBytes } from "../legalBody/evidence";
+import {
+  HOUSEKEEPING_BATCH,
+  LEGAL_BODY_SWEEP_MAX_PER_TICK,
+  LegalBodySweeper,
+} from "../legalBody/sweeper";
 import { STATEMENT_OF_AUTHORITY } from "../legalBody/texts/statementOfAuthority";
 import { opsLog } from "../observability/opsLog";
 import { AGENT_BOOK_CAIP2, createAgentBookReader } from "../payments/agentBookReader";
@@ -781,6 +789,41 @@ async function main() {
   };
   const formationSweeper = formationDeps ? new FormationSweeper(formationDeps) : undefined;
 
+  /**
+   * THE LEGAL-BODY SWEEPER, where the feature is on: the order doors' own dependencies, so the
+   * loop settles orders through the same repository, chain and lock the doors use, and takes no
+   * token from their budgets. On its first tick and every 120th after it, it also runs the
+   * customer companies' housekeeping. The evidence bytes are deleted through the file store, which
+   * can delete, and the index the document routes read. A stale company is abandoned only when the
+   * legal-body store says no body or order of its own is open, inside that store's IMMEDIATE
+   * transaction: a write made meanwhile by another connection (an operator's command) is waited
+   * for, not turned into a skipped busy error.
+   */
+  const legalBodySweepMs = cfg.legalBodySweepIntervalMs ?? DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS;
+  const legalBodySweeper = legalBodyOrders
+    ? new LegalBodySweeper({
+        ...legalBodyOrders,
+        intervalMs: legalBodySweepMs,
+        maxPerTick: LEGAL_BODY_SWEEP_MAX_PER_TICK,
+        housekeeping: {
+          expireEvidence: () =>
+            expireEvidenceBytes({ documents: formationDocuments, docStore }, HOUSEKEEPING_BATCH),
+          expireStaleCompanies: () =>
+            expireStaleCustomerCompanies(
+              {
+                companies,
+                declarations: companyDeclarations,
+                checks: companyChecks,
+                hasOpenLegalBody: (companyId: string) =>
+                  legalBodyOrders.repo.hasOpenForCompany(companyId, Date.now()),
+                transaction: <T>(fn: () => T) => legalBodyOrders.repo.transaction(fn),
+              },
+              HOUSEKEEPING_BATCH,
+            ),
+        },
+      })
+    : undefined;
+
   const jobDeps = buildJobDeps(cfg, db, repo, docStore, circleApi);
   // Credential-less boot: a deployment with no JOB_CLIENT_PRIVATE_KEY still starts, and jobs are
   // simply unavailable. Said out loud here because there is no jobs enable flag to hang a boot
@@ -1098,6 +1141,12 @@ async function main() {
     formationSweeper.start();
     console.log(`Formation sweeper started (every ${formationDeps!.intervalMs}ms)`);
   }
+  // The same rule for the legal-body sweeper: its first tick, run by `start()` at once, is the
+  // reconcile of every order a restart interrupted, and a chain read must never hold up the port.
+  if (legalBodySweeper) {
+    legalBodySweeper.start();
+    console.log(`Legal-body sweeper started (every ${legalBodySweepMs}ms)`);
+  }
 
   // ── Unresolved TREASURY TRANSFERS at boot (gate N2), after the socket for the reason C4 gives.
   //
@@ -1136,7 +1185,12 @@ async function main() {
   // acked webhook work and an unattended timer. Guarded so importing this module under a test
   // runner never installs a handler that would exit the runner.
   if (shouldInstallSignalHandlers())
-    installShutdownHandlers({ sweeper: formationSweeper, tasks: doolaTasks, server });
+    installShutdownHandlers({
+      sweeper: formationSweeper,
+      sweepers: legalBodySweeper ? [legalBodySweeper] : [],
+      tasks: doolaTasks,
+      server,
+    });
 }
 
 main().catch((e) => {
