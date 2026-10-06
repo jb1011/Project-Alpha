@@ -67,6 +67,7 @@ import {
 } from "../../src/abis/generated";
 import { ArcAdapter } from "../../src/adapters/arc/arcAdapter";
 import { LegalBodyChain } from "../../src/adapters/arc/legalBodyChain";
+import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
 import { signSession } from "../../src/auth/session";
 import { anvilChain } from "../../src/chains";
@@ -307,6 +308,8 @@ function deploy(opts: { charging?: boolean } = {}): Deployment {
     identityBucket: open,
     transaction: (fn) => legalBodies.transaction(fn),
     now,
+    // The door's reads of a create's receipt follow each other at once: a 202 costs no real time.
+    sleep: async () => {},
   };
   const customerDeps = sandboxCustomerCompanyDeps(
     { db, companies, declarations, checks, store },
@@ -399,10 +402,11 @@ function deploy(opts: { charging?: boolean } = {}): Deployment {
 /**
  * The case's deployment built again over the same database file and document store, as a process
  * that restarts opens them, with a new app and a new sweeper. The old database handle is closed
- * first.
+ * first, and the sender's nonce floors are forgotten, as a new process starts without them.
  */
 function redeploy(opts: { charging?: boolean } = {}): void {
   d.db.close();
+  resetSenderNonces();
   d = deploy(opts);
 }
 
@@ -1127,19 +1131,12 @@ describe("an order becomes a linked body on a local chain", () => {
         error: { code: "chain_unavailable", message: LEGAL_BODY_SENTENCES.chain_unavailable },
       },
     });
-    for (const part of [url, "://", "127.0.0.1", String(PORT)]) {
+    // The port with its colon: an order id is random, and its digits can hold the port's.
+    for (const part of [url, "://", "127.0.0.1", `:${PORT}`]) {
       expect(res.text, part).not.toContain(part);
       expect(printed.join("\n"), part).not.toContain(part);
     }
-    const opsLines = printed.flatMap((line) => {
-      try {
-        const parsed = JSON.parse(line) as { opslog?: string };
-        return parsed.opslog === "legal_body_chain_unavailable" ? [parsed] : [];
-      } catch {
-        return [];
-      }
-    });
-    expect(opsLines).toEqual([
+    expect(opsLines("legal_body_chain_unavailable")).toEqual([
       expect.objectContaining({ orderId: id, stage: "head", errorName: "HttpRequestError" }),
     ]);
     expect(await readOrder(g, id)).toMatchObject({ state: "draft", agentId: null });
@@ -1160,12 +1157,13 @@ function onlySubmission(id: string) {
 describe("an order survives a lost response, a restart, a transfer and a nonce gap", () => {
   afterEach(async () => {
     // A case that stopped half-way must leave the next one a node that mines every transaction
-    // at once, with nothing left in its pool.
+    // at once, with nothing left in its pool, and no sender's nonce floor from what it sent.
     const pool = await node.getTxpoolContent();
     for (const bySender of [pool.pending, pool.queued])
       for (const transactions of Object.values(bySender))
         for (const tx of Object.values(transactions)) await node.dropTransaction({ hash: tx.hash });
     await node.setAutomine(true);
+    resetSenderNonces();
   });
 
   test("a lost response: the create is sent and not mined yet, so the link door answers 202 reserved; once a block mines it, the next tick marks the order deployed with the mined hash", async () => {
@@ -1282,7 +1280,7 @@ describe("an order survives a lost response, a restart, a transfer and a nonce g
     expect(await lb.executorNonce()).toBe(before.mined + 1);
   });
 
-  test("a gap in the platform key's nonces: the node drops order A's create, and order B, for another identity and linked within the same minute, answers 202 and cannot be mined; one tick sends A's recorded bytes again; once a block mines both, the next tick marks both deployed", async () => {
+  test("a gap in the platform key's nonces: the recorded bytes fill it, and both orders reach deployed", async () => {
     const g = await newGuardian();
     const agentA = await identityOfKey();
     const agentB = await identityOfKey();
@@ -1304,7 +1302,6 @@ describe("an order survives a lost response, a restart, a transfer and a nonce g
     const resB = await submitLink(g, b, forB.typedData, signedB);
     expect(resB).toMatchObject({ status: 202, body: { id: b, state: "reserved" } });
     const sentB = onlySubmission(b);
-    // B's create is numbered after A's, which the node no longer holds: the node queues it.
     expect(sentB.nonce).toBe(sentA.nonce + 1);
     expect(await node.getTxpoolStatus()).toEqual({ pending: 0, queued: 1 });
 
@@ -1394,7 +1391,7 @@ describe("an order survives a lost response, a restart, a transfer and a nonce g
   });
 
   // It moves the chain's clock past a link's deadline, an hour on.
-  test("the identity changes hands after the reserve and before the create is mined: the node drops the create, the owner transfers the identity; one tick sends the create again, and it is mined and reverts; the next tick waits; past the deadline a tick lapses the order, and the new owner orders, links and reaches deployed", async () => {
+  test("an identity transferred before its create is mined: the order lapses at its deadline, and the new owner can link", async () => {
     const g = await newGuardian();
     const agentId = await identityOfKey();
     const { id } = await order(g);
@@ -1427,7 +1424,7 @@ describe("an order survives a lost response, a restart, a transfer and a nonce g
     });
     expect(await executorCounts()).toEqual({ mined: sent.nonce, pending: sent.nonce });
 
-    // One tick: the recorded bytes go out again, are mined, and revert.
+    // One tick: the order's one recorded create is settled on chain, and the order stays reserved.
     await d.sweeper.tick();
     const reverted = await pub.getTransactionReceipt({ hash: sent.txHash });
     expect(reverted.status).toBe("reverted");
@@ -1524,7 +1521,7 @@ describe("an order survives a lost response, a restart, a transfer and a nonce g
  * shared clock forward by days, for good, and a draft's age is counted from the database's own
  * clock, which does not move. An order created after it would be past its 24 hours at once.
  */
-describe("an order becomes a linked body on a local chain", () => {
+describe("a linked body on a local chain, days on", () => {
   test("a dissolution of a linked body: while it winds down the next check reads it broken with winding_down, still checked and with no intent; once the guardian makes it final the next check reads it dissolved, with no intent and no further check", async () => {
     const g = await newGuardian();
     await node.setBalance({ address: g.address, value: parseEther("1") });
