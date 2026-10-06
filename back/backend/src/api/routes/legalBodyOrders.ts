@@ -4,17 +4,24 @@ import type { Hex } from "viem";
 import { ZodError } from "zod";
 import type { AuthVars } from "../../auth/middleware";
 import { readVerifiedAgreement } from "../../legalBody/agreement";
+import { type BindingView, checkBinding, toBindingView } from "../../legalBody/binding";
 import { linkMessage, submitLinkAndCreate } from "../../legalBody/linkDoor";
 import {
   type LegalBodyOrderDeps,
   type LegalBodyOrderView,
   abandonOrder,
+  assertThisDeployment,
   createOrder,
+  orderLockKey,
   requireOwnedOrder,
+  takeDoorTokens,
   toOrderView,
 } from "../../legalBody/orders";
+import { resolveOrder } from "../../legalBody/resolver";
 import { refusal, sentenceFor } from "../../legalBody/sentences";
 import { opsLog } from "../../observability/opsLog";
+import { withKeyedLock } from "../../payments/keyedMutex";
+import type { LegalBodyRecord } from "../../persistence/legalBodyRepository";
 import { ApiError, readJson } from "../errors";
 import { TokenBucket } from "./agentBook";
 import { assertRealHuman } from "./worldId";
@@ -37,12 +44,21 @@ import { assertRealHuman } from "./worldId";
  *    `reserved` (the create is on its way, or waits for the resolver after a fault or a cap, and
  *    is settled from the chain), 422 with `{ code, message, detail, order }` for a refusal of the
  *    link (before the reserve the draft is kept; after it the order is `lapsed`, and the message
- *    says so). A 429 or a 503 comes only before the reserve, and means that nothing changed.
+ *    says so). A 429 or a 503 comes only before the reserve, and means that nothing changed;
+ *  - `GET /legal-body-orders/:id/binding` reads the order's binding as stored (no chain read): its
+ *    state, its identity and body, and the pointer the identity's owner should write, as an intent
+ *    that names the action, the identity, the body and the chain. Never calldata: the caller
+ *    encodes the metadata write itself, from a pinned ABI;
+ *  - `POST /legal-body-orders/:id/binding/refresh` reads it again from the chain, under the
+ *    order's lock: one resolver pass for a `reserved` order, one binding check for any other, and
+ *    the same view as the read. A chain that could not answer is a 503 `chain_unavailable`, and
+ *    no state moved.
  *
- * Every rule lives in the domain (`legalBody/orders.ts`, `legalBody/linkDoor.ts`); these handlers
- * decide only what is a well-formed request. Every door starts with the real-human check (a
- * verified credential, never a waiver), the reads included; the domain functions of the order door
- * and the two link doors make that check first themselves.
+ * Every rule lives in the domain (`legalBody/orders.ts`, `legalBody/linkDoor.ts`,
+ * `legalBody/resolver.ts`, `legalBody/binding.ts`); these handlers decide only what is a
+ * well-formed request, and the refresh which of the domain's two passes to run. Every door starts
+ * with the real-human check (a verified credential, never a waiver), the reads included; the
+ * domain functions of the order door and the two link doors make that check first themselves.
  * Mounted under their own session protection, and only where the deployment wires the feature.
  *
  * An error a door did not choose never reaches the caller as it was thrown: anything but an
@@ -107,8 +123,9 @@ export function mountLegalBodyOrderRoutes(
   app: Hono<{ Variables: AuthVars }>,
   deps: LegalBodyOrderDeps,
 ): void {
-  // On both JSON doors, the abandon door included: it reads no body, and still bounds what a
-  // caller may send it. A declared length over the limit is refused before a byte is read.
+  // On every POST door, the abandon and refresh doors included: they read no body, and still
+  // bound what a caller may send them. A declared length over the limit is refused before a byte
+  // is read.
   const limit = bodyLimit({
     maxSize: LEGAL_BODY_DOOR_MAX_BODY_BYTES,
     onError: () => {
@@ -216,6 +233,54 @@ export function mountLegalBodyOrderRoutes(
       return c.json(result.order, result.status === "reserved" ? 202 : 200);
     }),
   );
+
+  app.get("/legal-body-orders/:id/binding", (c) =>
+    door("binding", () => {
+      const tenantId = realHuman(c.get("tenantId"));
+      return c.json(bindingViewOf(deps, requireOwnedOrder(deps, tenantId, c.req.param("id"))));
+    }),
+  );
+
+  app.post("/legal-body-orders/:id/binding/refresh", limit, (c) =>
+    door("binding_refresh", async () => {
+      const tenantId = realHuman(c.get("tenantId"));
+      takeDoorTokens(deps, tenantId);
+      return c.json(await refreshBinding(deps, tenantId, c.req.param("id")));
+    }),
+  );
+}
+
+/** The order's binding as the API shows it, from the row as stored. */
+function bindingViewOf(deps: LegalBodyOrderDeps, row: LegalBodyRecord): BindingView {
+  return toBindingView(row, deps.repo.latestBrokenReason(row.legalBodyId));
+}
+
+/**
+ * One refresh of the tenant's order, under the order's lock, the one the sweeper takes: one
+ * resolver pass for a `reserved` order, one binding check for any other (a row with no body is
+ * answered without a chain call), then the view of the row as that pass left it. Both passes
+ * answer `unknown` when the chain could not answer, having moved nothing but the row's schedule:
+ * that is the 503 `chain_unavailable`. A row of another factory or chain is read-only here: 409
+ * `other_deployment`, with no chain call.
+ */
+async function refreshBinding(
+  deps: LegalBodyOrderDeps,
+  tenantId: AuthVars["tenantId"],
+  id: string,
+): Promise<BindingView> {
+  // Read once before the lock: an id that is not the tenant's order never gets a lock of its own.
+  const owned = requireOwnedOrder(deps, tenantId, id);
+  const orderId = owned.legalBodyId;
+  return withKeyedLock(orderLockKey(orderId), async () => {
+    const row = requireOwnedOrder(deps, tenantId, orderId);
+    assertThisDeployment(deps, row);
+    const outcome =
+      row.bindingState === "reserved"
+        ? await resolveOrder(deps, orderId)
+        : await checkBinding(deps, orderId);
+    if (outcome === "unknown") throw refusal("chain_unavailable", 503);
+    return bindingViewOf(deps, requireOwnedOrder(deps, tenantId, orderId));
+  });
 }
 
 /** A refusal's sentence; for an order that is `lapsed`, followed by the sentence that says so. */
