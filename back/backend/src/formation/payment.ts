@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { CANCEL_AUTHORIZATION_TYPES } from "../adapters/arc/usdcToken";
+import { CUSTOMER_PROVIDER } from "../legalBody/provider";
 import {
   TRANSFER_WITH_AUTHORIZATION_TYPES,
   type TransferAuthorizationDomain,
@@ -43,6 +44,9 @@ export interface FormationPaymentConfig {
   /** Whole USDC, for copy. `/config` serves this; the breakdown line ("includes the $100 Wyoming
    *  filing fee") is the interface's, because the state fee is outside doola's pack. */
   feeUsdc: number;
+  /** Atomic USDC (6 decimals) for a company a customer declares rather than forms. It has no
+   *  default, so it is absent unless this deployment set one. */
+  byoFeeAtomic?: bigint;
   /** The Ledger account. Never on `/config` — it rides the quote, on an authenticated route. */
   revenueAddress: Address;
   quoteTtlMs: number;
@@ -298,10 +302,33 @@ export function paymentView(
 }
 
 /**
+ * The fee a company of this provider is quoted, in atomic USDC.
+ *
+ * A customer's own company has its own price, and that price has no default: with none configured
+ * this throws rather than quote it at a price nobody set. Every other provider is a formation
+ * company, quoted the formation fee.
+ */
+export function feeAtomicFor(
+  cfg: Pick<FormationPaymentConfig, "feeAtomic" | "byoFeeAtomic">,
+  provider: string,
+): bigint {
+  if (provider !== CUSTOMER_PROVIDER) return cfg.feeAtomic;
+  if (cfg.byoFeeAtomic === undefined)
+    throw new Error(
+      "no fee is configured for a customer's own company (BYO_ATTESTATION_FEE_USDC): it cannot be quoted",
+    );
+  return cfg.byoFeeAtomic;
+}
+
+/**
  * Insert the `quoted` row for a company. Called INSIDE the caller's transaction (§6.1).
  *
  * `validBefore` is computed from `now` in SECONDS, because that is the unit EIP-3009 speaks and
  * converting it later is a rounding bug waiting for a fee to depend on it.
+ *
+ * `amountAtomic` is what the row asks for, the formation fee unless the caller passes the fee of
+ * the company's provider (`feeAtomicFor`). Like the payee, it is copied onto the row here and
+ * never read from config again for this payment.
  */
 export function insertQuote(
   cfg: Pick<
@@ -310,13 +337,14 @@ export function insertQuote(
   >,
   companyId: string,
   nowMs: number,
+  amountAtomic: bigint = cfg.feeAtomic,
 ): string {
   const head = cfg.chainHead?.() ?? null;
   const ttlAt = Math.floor((nowMs + cfg.quoteTtlMs) / 1000);
   return cfg.payments.create({
     companyId,
     product: FORMATION_PRODUCT,
-    amountUsdc: cfg.feeAtomic,
+    amountUsdc: amountAtomic,
     nonce: newPaymentNonce(),
     // TWO deadlines (gate A4): the token's, which carries the grace, and the quote's.
     validBefore: ttlAt + Math.floor((cfg.settleGraceMs ?? 0) / 1000),

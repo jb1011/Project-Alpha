@@ -76,3 +76,13 @@ export function requireOwnedCompany(
   if (!rec) throw new ApiError("not_found", 404, "company not found");
   return rec;
 }
+
+/** The body, or the door's own 400 — a malformed JSON body is not a schema violation, and saying
+ *  so is more use to a caller than a list of missing fields. One reader for every route file. */
+export async function readJson(c: { req: { json(): Promise<unknown> } }): Promise<unknown> {
+  try {
+    return await c.req.json();
+  } catch {
+    throw new ApiError("validation_error", 400, "invalid JSON body");
+  }
+}

@@ -110,6 +110,9 @@ export interface McpToolDeps extends EntityViewDeps {
    *  the SAME objects ApiDeps carries, so MCP and REST cannot describe a company differently. */
   companies?: import("../api/app").ApiDeps["companies"];
   formationSteps?: import("../api/app").ApiDeps["formationSteps"];
+  /** A customer company's declaration and checks, for `list_companies` and `get_company`: the
+   *  SAME object ApiDeps carries, so a customer's company reads the same on both surfaces. */
+  customerFacts?: import("../api/app").ApiDeps["customerFacts"];
   /** The Hedera rail's config, mirror client, ledger and threshold. Absent = `HEDERA_ENABLED` is
    *  off and the three Hedera tools are not registered at all. */
   hedera?: import("../hedera/policy").HederaDeps;
@@ -160,6 +163,7 @@ export const MCP_TOOL_DEP_KEYS = [
   "formation",
   "companies",
   "formationSteps",
+  "customerFacts",
   "hedera",
   "legalBody",
   "now",

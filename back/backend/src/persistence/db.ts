@@ -930,6 +930,183 @@ const FORMATION_PAYMENTS_DDL = `
       ON formation_payments(status, valid_before);
 `;
 
+/**
+ * A CUSTOMER'S DECLARATION of an existing Wyoming LLC as the company behind a legal body: the
+ * statement of authority its guardian signed, one row per company (see
+ * `companyDeclarationRepository.ts`).
+ *
+ * The declarant's name and title are personal data, and so are the four values they could be read
+ * back from: the statement text, its hash, its digest and the signature. The CHECKs make the six
+ * present together or erased together, and `pii_erased_at` says when they went.
+ *
+ * No foreign key to `companies`, on purpose: a migration that rebuilds `companies` then re-points
+ * nothing here. The erasure trigger does read `companies`, and SQLite rewrites a table name inside
+ * every trigger body when it renames the table. So a migration that rebuilds `companies` must drop
+ * `trg_company_declarations_erase_only` and create it again from this text (IF NOT EXISTS keeps a
+ * rewritten one), or every erasure fails on a table that no longer exists.
+ *
+ * The triggers. Their scope is that of the legal-body guards: every write the application makes,
+ * and plain INSERT, UPDATE and DELETE statements from anyone else.
+ *  - No DELETE.
+ *  - No INSERT onto an existing row, whether it names that row's company, its statement digest or
+ *    its rowid. REPLACE deletes the row it collides with without firing the delete guard, and on the
+ *    digest that row belongs to ANOTHER company. A rowid is positive (checked after the insert,
+ *    since the table carries no CHECK on it): for an automatic rowid SQLite shows a BEFORE INSERT
+ *    trigger a placeholder (-1), which must never match a stored row.
+ *  - The only UPDATE is the erasure: the six personal columns set to NULL and `pii_erased_at` set,
+ *    on a row not erased yet, whose company is `abandoned`, with no other column changed (the rowid
+ *    included). Every other UPDATE aborts, one that changes nothing included. A NULL compares as
+ *    a change too, so `UPDATE OR REPLACE` cannot swap a column's default in for it.
+ */
+const COMPANY_DECLARATIONS_DDL = `
+  CREATE TABLE IF NOT EXISTS company_declarations (
+    company_id        TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL,
+    human_nullifier   TEXT NOT NULL,
+    declarant_name    TEXT,
+    declarant_title   TEXT,
+    statement_text    TEXT,
+    statement_hash    TEXT,
+    statement_digest  TEXT,
+    signature         TEXT,
+    company_name      TEXT NOT NULL,
+    jurisdiction      TEXT NOT NULL CHECK (jurisdiction = 'WY'),
+    filing_number     TEXT NOT NULL,
+    filing_key        TEXT NOT NULL,
+    wording_version   TEXT NOT NULL,
+    chain_id          INTEGER NOT NULL,
+    factory           TEXT NOT NULL,
+    issued_at         INTEGER NOT NULL,
+    synthetic         INTEGER NOT NULL CHECK (synthetic IN (0, 1)),
+    pii_erased_at     INTEGER,
+    created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK ((pii_erased_at IS NULL) = (declarant_name IS NOT NULL)),
+    CHECK ((declarant_name IS NULL) = (declarant_title IS NULL)),
+    CHECK ((declarant_name IS NULL) = (statement_text IS NULL)),
+    CHECK ((declarant_name IS NULL) = (statement_hash IS NULL)),
+    CHECK ((declarant_name IS NULL) = (statement_digest IS NULL)),
+    CHECK ((declarant_name IS NULL) = (signature IS NULL))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_company_declarations_digest
+    ON company_declarations(statement_digest) WHERE statement_digest IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_company_declarations_filing_key ON company_declarations(filing_key);
+  CREATE INDEX IF NOT EXISTS idx_company_declarations_tenant ON company_declarations(tenant_id, created_at);
+
+  CREATE TRIGGER IF NOT EXISTS trg_company_declarations_no_delete
+  BEFORE DELETE ON company_declarations
+  BEGIN
+    SELECT RAISE(ABORT, 'company_declarations rows are never deleted');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_company_declarations_no_replace
+  BEFORE INSERT ON company_declarations FOR EACH ROW
+  WHEN EXISTS (SELECT 1 FROM company_declarations
+                WHERE company_id = NEW.company_id OR statement_digest = NEW.statement_digest
+                   OR rowid = NEW.rowid)
+  BEGIN
+    SELECT RAISE(ABORT, 'company_declarations rows are never replaced');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_company_declarations_positive_rowid
+  AFTER INSERT ON company_declarations FOR EACH ROW
+  WHEN NEW.rowid < 1
+  BEGIN
+    SELECT RAISE(ABORT, 'company_declarations: a rowid is positive');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_company_declarations_erase_only
+  BEFORE UPDATE ON company_declarations FOR EACH ROW
+  WHEN NOT (OLD.pii_erased_at IS NULL AND NEW.pii_erased_at IS NOT NULL
+    AND NEW.declarant_name IS NULL AND NEW.declarant_title IS NULL
+    AND NEW.statement_text IS NULL AND NEW.statement_hash IS NULL
+    AND NEW.statement_digest IS NULL AND NEW.signature IS NULL
+    AND NEW.rowid IS OLD.rowid
+    AND NEW.company_id IS OLD.company_id
+    AND NEW.tenant_id IS OLD.tenant_id
+    AND NEW.human_nullifier IS OLD.human_nullifier
+    AND NEW.company_name IS OLD.company_name
+    AND NEW.jurisdiction IS OLD.jurisdiction
+    AND NEW.filing_number IS OLD.filing_number
+    AND NEW.filing_key IS OLD.filing_key
+    AND NEW.wording_version IS OLD.wording_version
+    AND NEW.chain_id IS OLD.chain_id
+    AND NEW.factory IS OLD.factory
+    AND NEW.issued_at IS OLD.issued_at
+    AND NEW.synthetic IS OLD.synthetic
+    AND NEW.created_at IS OLD.created_at
+    AND IFNULL((SELECT status FROM companies WHERE company_id = OLD.company_id) = 'abandoned', 0))
+  BEGIN
+    SELECT RAISE(ABORT, 'company_declarations: the only update is the erasure of the personal data of an abandoned company');
+  END;
+`;
+
+/**
+ * THE OPERATOR'S CHECKS of a declaration (see `companyCheckRepository.ts`), append-only: a pass, a
+ * failure, a revocation and a reinstatement are each a new row, and a company's standing is derived
+ * from its rows, never stored. A passed row carries what the operator found in the state registry
+ * and the hashes of both pieces of evidence; every other row carries a reason, and a failed row a
+ * reason code as well (CHECKs).
+ *
+ * The four triggers are those of `legal_body_events`: no UPDATE, no DELETE, no INSERT over an
+ * existing check id, and an id written out by hand is at most the next one. The no-replace guard
+ * relies on `CHECK (check_id > 0)`: for an automatic id SQLite shows a BEFORE INSERT trigger a
+ * placeholder (-1), which must never match a stored row. `check_id` is the rowid, so the guard
+ * covers the rowid too, and no other index is unique.
+ *
+ * No foreign key to `companies`, for the reason given at `company_declarations`.
+ */
+const COMPANY_CHECKS_DDL = `
+  CREATE TABLE IF NOT EXISTS company_checks (
+    check_id                  INTEGER PRIMARY KEY AUTOINCREMENT CHECK (check_id > 0),
+    company_id                TEXT NOT NULL,
+    result                    TEXT NOT NULL CHECK (result IN ('passed', 'failed', 'revoked', 'reinstated')),
+    operator                  TEXT NOT NULL,
+    operator_os_user          TEXT NOT NULL,
+    checked_at                INTEGER NOT NULL,
+    registry_name             TEXT,
+    registry_filing_id        TEXT,
+    filing_key                TEXT,
+    registry_status           TEXT,
+    formation_date            TEXT,
+    registered_agent          TEXT,
+    existence_evidence_sha256 TEXT,
+    control_evidence_sha256   TEXT,
+    control_evidence_kind     TEXT,
+    reason_code               TEXT,
+    reason                    TEXT,
+    created_at                TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (result != 'passed' OR (registry_name IS NOT NULL AND registry_filing_id IS NOT NULL
+      AND filing_key IS NOT NULL AND registry_status IS NOT NULL AND formation_date IS NOT NULL
+      AND registered_agent IS NOT NULL AND existence_evidence_sha256 IS NOT NULL
+      AND control_evidence_sha256 IS NOT NULL AND control_evidence_kind IS NOT NULL)),
+    CHECK (result = 'passed' OR reason IS NOT NULL),
+    CHECK (result != 'failed' OR reason_code IS NOT NULL)
+  );
+  CREATE INDEX IF NOT EXISTS idx_company_checks_company ON company_checks(company_id, check_id);
+  CREATE INDEX IF NOT EXISTS idx_company_checks_filing_key
+    ON company_checks(filing_key) WHERE filing_key IS NOT NULL;
+
+  CREATE TRIGGER IF NOT EXISTS trg_company_checks_no_update
+  BEFORE UPDATE ON company_checks
+  BEGIN
+    SELECT RAISE(ABORT, 'company_checks is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_company_checks_no_delete
+  BEFORE DELETE ON company_checks
+  BEGIN
+    SELECT RAISE(ABORT, 'company_checks is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_company_checks_no_replace
+  BEFORE INSERT ON company_checks FOR EACH ROW
+  WHEN EXISTS (SELECT 1 FROM company_checks WHERE check_id = NEW.check_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'company_checks is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_company_checks_next_id
+  BEFORE INSERT ON company_checks FOR EACH ROW
+  WHEN NEW.check_id > (SELECT IFNULL(MAX(check_id), 0) FROM company_checks) + 1
+  BEGIN
+    SELECT RAISE(ABORT, 'company_checks: ids are assigned in order');
+  END;
+`;
+
 /** Create tables if absent. Idempotent. */
 export function migrate(db: Database.Database): void {
   db.exec(`
@@ -1295,6 +1472,9 @@ export function migrate(db: Database.Database): void {
 
     ${COMPANIES_DDL}
     ${FORMATION_PAYMENTS_DDL}
+    -- A customer's declaration of an existing company, and the operator's checks of it.
+    ${COMPANY_DECLARATIONS_DDL}
+    ${COMPANY_CHECKS_DDL}
 
     -- Anchor cycles: one row PER MANIFEST VERSION. Deliberately NOT keyed like bridge_legs
     -- (entity, step) — a bridge has exactly one of each leg, whereas an entity accumulates
@@ -1446,6 +1626,17 @@ export function migrate(db: Database.Database): void {
   if (!docCols.includes("size")) db.exec("ALTER TABLE documents ADD COLUMN size INTEGER");
   if (!docCols.includes("provider_doc_id"))
     db.exec("ALTER TABLE documents ADD COLUMN provider_doc_id TEXT");
+  // A customer's evidence uploads share the index with the provider's documents, and `source`
+  // tells them apart: DEFAULT 'provider' is the truth for every row written before it existed.
+  // `expires_at` is when an upload's bytes may go and `bytes_deleted_at` when they went, both unix
+  // seconds; the row itself stays, with its hash. A provider document leaves both NULL, since its
+  // bytes never expire.
+  for (const [col, type] of [
+    ["source", "TEXT NOT NULL DEFAULT 'provider'"],
+    ["expires_at", "INTEGER"],
+    ["bytes_deleted_at", "INTEGER"],
+  ] as const)
+    if (!docCols.includes(col)) db.exec(`ALTER TABLE documents ADD COLUMN ${col} ${type}`);
 
   // formation_parties: PR 1's shape was keyed by entity_key with no tenant column, which cannot
   // express a party that exists BEFORE its entity does (the intake handle, design §5). Rebuild

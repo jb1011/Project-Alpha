@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Hono } from "hono";
 import {
+  ACCEPTED_CREDENTIALS,
   type WorldIdConfig,
   WorldIdError,
   makeRpContext,
@@ -9,7 +10,7 @@ import {
   verifyProof,
 } from "../../adapters/worldid/guardianGate";
 import { type AuthVars, requireAuth } from "../../auth/middleware";
-import type { WorldStore } from "../../persistence/worldStore";
+import type { GuardianVerification, WorldStore } from "../../persistence/worldStore";
 import type { ApiDeps } from "../app";
 import { ApiError } from "../errors";
 
@@ -491,4 +492,64 @@ export function assertGuardianAllowed(
       403,
       `this human already controls ${used} legal entities (max ${world.maxEntitiesPerHuman})`,
     );
+}
+
+/**
+ * A verified human, not a waiver. Ignores `requireGuardian`. Returns the verification row.
+ *
+ * Stricter than `assertGuardianAllowed`, for an act that rests on a person's word, such as the
+ * declaration of a company: it applies whatever the enforcement switch says, and only a credential
+ * the verification path accepts counts. A waiver row (`credential = "waiver"`) and a row with no
+ * credential are refused.
+ *
+ * The checks, in order: World ID is wired (else 503 `unavailable`); on a production deployment,
+ * World's own configuration is production too (else 503 `unavailable`: a staging verification is
+ * not a real human's); the tenant has a verification row for the guardian action (else 403
+ * `guardian_not_verified`); its credential is an accepted one (else 403 `waiver_not_accepted`);
+ * on a production deployment, the row itself was recorded under World's production environment
+ * (else 403 `guardian_not_verified`: a row recorded under staging, or under no environment, is
+ * not a real human's either, whatever the configuration says today). A sandbox deployment skips
+ * both environment checks. It applies no cap: the callers do.
+ */
+export function assertRealHuman(
+  world: WorldIdDeps | undefined,
+  tenantId: string,
+  environment: "sandbox" | "production",
+): GuardianVerification {
+  if (!world)
+    throw new ApiError(
+      "unavailable",
+      503,
+      "human verification is not configured on this deployment",
+    );
+  // Only a sandbox deployment may rest on a World configuration that is not production. Any other
+  // value is held to the production rule.
+  if (environment !== "sandbox" && world.cfg.environment !== "production")
+    throw new ApiError(
+      "unavailable",
+      503,
+      "human verification on this deployment is not configured for production",
+    );
+  const v = world.store.findByTenant(tenantId, world.cfg.action);
+  if (!v)
+    throw new ApiError(
+      "guardian_not_verified",
+      403,
+      "the guardian must complete World ID verification first",
+    );
+  if (v.credential === null || !ACCEPTED_CREDENTIALS.has(v.credential))
+    throw new ApiError(
+      "waiver_not_accepted",
+      403,
+      "a waiver, or a credential below the accepted tiers, does not count as a verified human here",
+    );
+  // The row's own environment, beside the configuration's: a verification made while World was
+  // configured for staging stays a staging verification after the configuration moves on.
+  if (environment !== "sandbox" && v.environment !== "production")
+    throw new ApiError(
+      "guardian_not_verified",
+      403,
+      "the guardian's World ID verification was not made under production: verify again",
+    );
+  return v;
 }

@@ -11,6 +11,17 @@ import {
   providerRefOf,
   requiredActionCodesOf,
 } from "../formation/status";
+import { type VerificationState, verificationStateOf } from "../legalBody/attestation";
+import { CUSTOMER_PROVIDER } from "../legalBody/provider";
+import type {
+  CheckReasonCode,
+  CompanyCheck,
+  CompanyCheckRepository,
+} from "../persistence/companyCheckRepository";
+import type {
+  CompanyDeclaration,
+  CompanyDeclarationRepository,
+} from "../persistence/companyDeclarationRepository";
 import type { CompanyRecord } from "../persistence/companyRepository";
 import {
   type DocumentIndexRecord,
@@ -164,6 +175,57 @@ export interface CompanyView {
    * Converted here, once, by the same parser the sweeper reads these columns with.
    */
   createdAt: number;
+  /**
+   * A CUSTOMER'S OWN COMPANY carries three keys more: this one, `declared` and `verification`. A
+   * company filed through formation has none of the three, so its key set is exactly what it
+   * always was.
+   */
+  provider?: typeof CUSTOMER_PROVIDER;
+  /**
+   * What the guardian declared: the company and its filing, as typed, and the version of the
+   * wording they signed. Never the declarant's name or title. Still the declarant's word until the
+   * operator's check passes, which is why it is served on the tenant's own authenticated view and
+   * nowhere else. Null when the declaration could not be read.
+   */
+  declared?: { companyName: string; filingNumber: string; wordingVersion: string } | null;
+  /**
+   * The operator's latest check of the declaration: its derived state, when it was made (unix
+   * SECONDS, like `filedAt`) and its reason code. The free-text reason stays with the operator.
+   * Null when this surface was given no way to read the checks, never "not checked yet": that is
+   * `awaiting_check`.
+   */
+  verification?: {
+    state: VerificationState;
+    checkedAt: number | null;
+    reasonCode: CheckReasonCode | null;
+  } | null;
+}
+
+/** The facts a customer's company is described by: its declaration and the operator's latest
+ *  check. Either may be missing. */
+export interface CustomerCompanyFacts {
+  declaration: CompanyDeclaration | undefined;
+  latestCheck: CompanyCheck | undefined;
+}
+
+/** Where a view reads those facts, narrowed to the two reads it makes. Wired on every deployment
+ *  by the composition root, so a customer's company keeps its view when its doors are off. */
+export interface CustomerFactsLookup {
+  declarations: Pick<CompanyDeclarationRepository, "find">;
+  checks: Pick<CompanyCheckRepository, "latest">;
+}
+
+/** One company's customer facts, read for a customer's company only: a formation company costs no
+ *  query. Undefined when the surface holds no lookup. */
+function customerFactsOf(
+  lookup: CustomerFactsLookup | undefined,
+  company: CompanyRecord,
+): CustomerCompanyFacts | undefined {
+  if (lookup === undefined || company.provider !== CUSTOMER_PROVIDER) return undefined;
+  return {
+    declaration: lookup.declarations.find(company.companyId),
+    latestCheck: lookup.checks.latest(company.companyId),
+  };
 }
 
 /** What a company list needs beyond the rows themselves. */
@@ -172,10 +234,14 @@ export interface CompanyListDeps {
   /** The batched steps lookup. Absent, each row falls back to its own read. */
   formationStepsMany?: (companyIds: string[]) => Map<string, FormationRequestRecord[]>;
   formationSteps?: FormationStepsLookup;
+  /** Read for the customer rows of the page only. */
+  customerFacts?: CustomerFactsLookup;
 }
 
 /**
- * A tenant's companies, NEWEST FIRST, in FOUR queries however long the page is (M5).
+ * A tenant's companies, NEWEST FIRST, in FOUR queries however long the page is while every row is
+ * a formation company (M5). Each customer row adds two of its own: a declaration read and a
+ * latest-check read.
  *
  * Every row used to ask for its own steps, its own live-payment count and its own agent count:
  * 3N+1 queries per page view, on two authenticated surfaces. The ordering is the repository's,
@@ -198,6 +264,8 @@ export function listCompanyViews(deps: CompanyListDeps, tenantId: string): Compa
       rowSteps,
       paying(company.companyId),
       agents.get(company.companyId) ?? 0,
+      // Two reads per customer row, and none for a formation row.
+      customerFactsOf(deps.customerFacts, company),
     );
   });
 }
@@ -214,14 +282,20 @@ export function listCompanyViews(deps: CompanyListDeps, tenantId: string): Compa
  * `paying` and `agents` are arguments rather than lookups because the two callers count them
  * differently and both are right: the list batches one query for the whole page, and the detail
  * counts the agent rows it is already about to render.
+ *
+ * `customer` is a customer company's declaration and latest check. The three customer keys are
+ * decided by the company's PROVIDER, never by whether facts were passed: a formation company never
+ * grows them, and a customer company always says what it is, with nulls where its facts could not
+ * be read.
  */
 export function toCompanyView(
   company: CompanyRecord,
   steps: FormationRequestRecord[],
   paying: boolean,
   agents: number,
+  customer?: CustomerCompanyFacts,
 ): CompanyView {
-  return {
+  const view: CompanyView = {
     companyId: company.companyId,
     environment: company.environment,
     nameOptions: company.nameOptions,
@@ -233,6 +307,29 @@ export function toCompanyView(
     filingNumber: company.filingNumber,
     agents,
     createdAt: parseSqliteUtc(company.createdAt),
+  };
+  if (company.provider !== CUSTOMER_PROVIDER) return view;
+  const declaration = customer?.declaration;
+  const latest = customer?.latestCheck;
+  return {
+    ...view,
+    provider: CUSTOMER_PROVIDER,
+    // The public half of the declaration: these three survive the erasure of an abandoned
+    // company's personal fields, and the declarant's name and title are never read here.
+    declared: declaration
+      ? {
+          companyName: declaration.companyName,
+          filingNumber: declaration.filingNumber,
+          wordingVersion: declaration.wordingVersion,
+        }
+      : null,
+    verification: customer
+      ? {
+          state: verificationStateOf(latest),
+          checkedAt: latest?.checkedAt ?? null,
+          reasonCode: latest?.reasonCode ?? null,
+        }
+      : null,
   };
 }
 
@@ -586,6 +683,8 @@ export interface CompanyDetailDeps {
       "ssnState"
     >;
   };
+  /** A customer company's declaration and checks; read for a customer company only. */
+  customerFacts?: CustomerFactsLookup;
 }
 
 export function toCompanyDetailView(
@@ -605,7 +704,13 @@ export function toCompanyDetailView(
     // rather than by somebody remembering to add it twice. `agents` is this page's
     // `attachedAgents.length`: one number, counted from the rows it names rather than from a
     // second query that could disagree with them.
-    ...toCompanyView(company, steps, paying, attachedAgents.length),
+    ...toCompanyView(
+      company,
+      steps,
+      paying,
+      attachedAgents.length,
+      customerFactsOf(deps.customerFacts, company),
+    ),
     status: company.status,
     synthetic: company.synthetic,
     formationStatus: deriveFormationStatus(steps),

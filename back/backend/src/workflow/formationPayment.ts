@@ -4,10 +4,12 @@ import {
   FORMATION_PRODUCT,
   type FormationPaymentConfig,
   type FormationQuote,
+  feeAtomicFor,
   guardianOf,
   insertQuote,
   quoteOf,
 } from "../formation/payment";
+import { CUSTOMER_PROVIDER } from "../legalBody/provider";
 import { opsLog } from "../observability/opsLog";
 import {
   type BroadcastOutcome,
@@ -24,6 +26,7 @@ import {
   verifySignature,
   verifyTransferAuthorization,
 } from "../payments/transferAuthorization";
+import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
 import type { CompanyRecord, CompanyRepository } from "../persistence/companyRepository";
 import type { EntityRepository } from "../persistence/entityRepository";
 import type { FormationPaymentRecord } from "../persistence/formationPaymentRepository";
@@ -54,6 +57,12 @@ export interface FormationPaymentDeps {
   entities?: EntityRepository;
   payment: FormationPaymentConfig;
   executor: FormationExecutorDeps;
+  /**
+   * The operator's checks of customers' declarations. A customer's own company is quoted and
+   * settled only while its latest check is a pass; with no checks to read, it is refused. A
+   * formation company never reads them.
+   */
+  checks?: Pick<CompanyCheckRepository, "latest">;
   /** The company status move and the payment status move commit together. */
   transaction: <T>(fn: () => T) => T;
   now?: () => number;
@@ -80,6 +89,9 @@ export type SettleResult =
  *
  * Returns `undefined` where this deployment does not take payments, which each door turns into
  * its own kind of refusal: a 404 on REST, an `isError` on MCP.
+ *
+ * `customerFacts` is declared by its shape, the one read the payment gate makes, because this
+ * layer imports nothing from the API layer that defines the deps object both doors pass.
  */
 export function formationPaymentDeps(deps: {
   companies?: CompanyRepository;
@@ -88,6 +100,7 @@ export function formationPaymentDeps(deps: {
     payment?: FormationPaymentConfig;
     paymentExecutor?: FormationExecutorDeps;
   };
+  customerFacts?: { checks: Pick<CompanyCheckRepository, "latest"> };
   now?: () => number;
 }): FormationPaymentDeps | undefined {
   const payment = deps.formation?.payment;
@@ -103,6 +116,8 @@ export function formationPaymentDeps(deps: {
     // complete — the client polls this company's payment every 4 seconds and the sweeper is the
     // backstop — and holding a connection open for a minute only makes it feel broken.
     executor: { ...executor, receiptTimeoutMs: ROUTE_RECEIPT_TIMEOUT_MS },
+    // The operator's checks, so a customer's own company is quoted and settled only after a pass.
+    checks: deps.customerFacts?.checks,
     transaction: <T>(fn: () => T) => deps.repo.transaction(fn),
     now: deps.now,
   };
@@ -110,6 +125,24 @@ export function formationPaymentDeps(deps: {
 
 const nowMs = (deps: FormationPaymentDeps) => (deps.now ?? Date.now)();
 const nowSec = (deps: FormationPaymentDeps) => Math.floor(nowMs(deps) / 1000);
+
+/**
+ * THE OPERATOR'S CHECK, for a customer's own company: it is quoted and settled only while the
+ * latest check of its declaration is a pass. No check yet, a failure, a revocation and a
+ * reinstatement (which waits for a new check) are all refused, and so is every customer company
+ * when there are no checks to read: facts that cannot be read never pass.
+ *
+ * Returns the refusal, or `undefined` when the payment may go on. A formation company is never
+ * refused here.
+ */
+function checkRefusal(
+  deps: Pick<FormationPaymentDeps, "checks">,
+  company: Pick<CompanyRecord, "companyId" | "provider">,
+): { ok: false; reason: string } | undefined {
+  if (company.provider !== CUSTOMER_PROVIDER) return undefined;
+  if (deps.checks?.latest(company.companyId)?.result === "passed") return undefined;
+  return { ok: false, reason: "this company has not passed its check yet" };
+}
 
 /**
  * How far past `validBefore` the CHAIN's clock must be before an authorization is called dead
@@ -128,6 +161,9 @@ export const FINALITY_MARGIN_S = 120;
  *
  * The order is the design's, and every step of it is load-bearing:
  *
+ *  0. a customer's own company must have passed its check, FIRST and at this moment rather than
+ *     at quote time: a quote stays signable for its whole window and its grace, and a revocation
+ *     inside that window must stop the settlement (`checkRefusal`);
  *  1. the row must be LIVE and `quoted`. A `settling` row belongs to a broadcast the sweeper
  *     owns; accepting a second signature for it is the double charge;
  *  2. the clock, before anything expensive. A quote past `validBefore` cannot settle, and saying
@@ -146,6 +182,8 @@ export async function settleFormationPayment(
   company: CompanyRecord,
   body: { signature: Hex; from: Address },
 ): Promise<SettleResult> {
+  const unchecked = checkRefusal(deps, company);
+  if (unchecked) return unchecked;
   const row = deps.payment.payments.findLive(company.companyId, FORMATION_PRODUCT);
   if (!row) return { ok: false, reason: "no live payment for this company" };
   // Non-null wherever an action door is reachable: `payment.required` implies the domain was read
@@ -712,11 +750,17 @@ export async function cancelFormationPayment(
  * The live-rows unique index is the backstop: a new row is insertable only once the old one is
  * terminal, so even a caller that ignored this rule gets a constraint violation rather than two
  * live authorizations.
+ *
+ * A customer's own company is quoted only once its check has passed (`checkRefusal`, first), and
+ * at its own fee: the amount is the fee of the company's provider (`feeAtomicFor`). Where no
+ * customer fee is configured, it is refused rather than quoted.
  */
 export function requoteFormationPayment(
   deps: FormationPaymentDeps,
   company: CompanyRecord,
 ): { ok: true; quote: FormationQuote } | { ok: false; reason: string } {
+  const unchecked = checkRefusal(deps, company);
+  if (unchecked) return unchecked;
   const live = deps.payment.payments.findLive(company.companyId, FORMATION_PRODUCT);
   if (live)
     return {
@@ -733,8 +777,18 @@ export function requoteFormationPayment(
   const current = deps.companies.find(company.companyId) ?? company;
   if (current.status !== "draft")
     return { ok: false, reason: "this company has nothing left to pay for" };
+  // Boot demands a customer fee only while the legal-body feature is on, and customer companies
+  // outlive the feature being switched off: a refusal for the caller here, where `feeAtomicFor`
+  // would throw (it stays fail-closed for any caller that skips this).
+  if (company.provider === CUSTOMER_PROVIDER && deps.payment.byoFeeAtomic === undefined)
+    return { ok: false, reason: "this deployment has no price for a customer's own company" };
 
-  const paymentId = insertQuote(deps.payment, company.companyId, nowMs(deps));
+  const paymentId = insertQuote(
+    deps.payment,
+    company.companyId,
+    nowMs(deps),
+    feeAtomicFor(deps.payment, company.provider),
+  );
   const row = deps.payment.payments.find(paymentId);
   if (!row) return { ok: false, reason: "could not create a quote" };
   opsLog("formation_payment_quoted", {
