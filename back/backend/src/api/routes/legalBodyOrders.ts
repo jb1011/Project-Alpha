@@ -9,7 +9,6 @@ import { type GasSeedDeps, requestGasSeed } from "../../legalBody/gasSeed";
 import { linkMessage, submitLinkAndCreate } from "../../legalBody/linkDoor";
 import {
   type LegalBodyOrderDeps,
-  type LegalBodyOrderView,
   abandonOrder,
   assertThisDeployment,
   createOrder,
@@ -19,7 +18,7 @@ import {
   toOrderView,
 } from "../../legalBody/orders";
 import { resolveOrder } from "../../legalBody/resolver";
-import { refusal, sentenceFor } from "../../legalBody/sentences";
+import { refusal, refusedLinkSentence } from "../../legalBody/sentences";
 import { opsLog } from "../../observability/opsLog";
 import { withKeyedLock } from "../../payments/keyedMutex";
 import type { LegalBodyRecord } from "../../persistence/legalBodyRepository";
@@ -232,7 +231,7 @@ export function mountLegalBodyOrderRoutes(
         return c.json(
           {
             code: result.code,
-            message: refusedSentence(result.code, result.order),
+            message: refusedLinkSentence(result.code, result.order),
             detail: result.detail,
             order: result.order,
           },
@@ -297,12 +296,4 @@ async function refreshBinding(
     if (outcome === "unknown") throw refusal("chain_unavailable", 503);
     return bindingViewOf(deps, requireOwnedOrder(deps, tenantId, orderId));
   });
-}
-
-/** A refusal's sentence; for an order that is `lapsed`, followed by the sentence that says so. */
-function refusedSentence(code: string, order: LegalBodyOrderView): string {
-  const sentence = sentenceFor(code);
-  return order.state === "lapsed" && code !== "order_lapsed"
-    ? `${sentence} ${sentenceFor("order_lapsed")}`
-    : sentence;
 }

@@ -1,5 +1,6 @@
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError } from "../errors";
+import type { BindingState } from "../persistence/legalBodyRepository";
 
 /**
  * One fixed sentence for every code the legal-body flow answers.
@@ -106,4 +107,16 @@ export function refusal(
   details?: Record<string, string>,
 ): ApiError {
   return new ApiError(code, status, sentenceFor(code), details);
+}
+
+/**
+ * The sentence of a refused link, as the link door and the agent's tool both answer it: the
+ * refusal's own sentence and, for an order the refusal left `lapsed`, followed by the sentence
+ * that says so.
+ */
+export function refusedLinkSentence(code: string, order: { state: BindingState }): string {
+  const sentence = sentenceFor(code);
+  return order.state === "lapsed" && code !== "order_lapsed"
+    ? `${sentence} ${sentenceFor("order_lapsed")}`
+    : sentence;
 }

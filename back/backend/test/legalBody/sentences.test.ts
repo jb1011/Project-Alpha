@@ -24,7 +24,7 @@ import { ANVIL_ACCOUNT_2 } from "../helpers/customerCompanyFixtures";
 const SRC = join(import.meta.dirname, "..", "..", "src");
 
 /** The modules that answer a code of the flow, relative to `src`: the domain modules, the link
- *  check and the doors' route file. */
+ *  check, the doors' route file and the MCP server, whose tools answer the same codes. */
 const ANSWERING_MODULES = [
   "legalBody/orders.ts",
   "legalBody/linkDoor.ts",
@@ -34,6 +34,7 @@ const ANSWERING_MODULES = [
   "legalBody/checkLink.ts",
   "legalBody/gasSeed.ts",
   "api/routes/legalBodyOrders.ts",
+  "mcp/server.ts",
 ];
 
 /** Every member of `LinkRefusalCode`: a member missing here, or a key that is not one, does not
