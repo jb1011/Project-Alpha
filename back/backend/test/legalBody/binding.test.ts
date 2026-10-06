@@ -666,19 +666,33 @@ describe("a chain that cannot answer", () => {
     });
   });
 
-  test("a pointer read that throws leaves a linked body linked, checked again in a day", async () => {
-    const row = linkedOrder();
+  test("a pointer read that throws leaves a linked body linked and checks it again within the hour, its day kept for the check after; a broken body keeps its own interval", async () => {
+    const linked = linkedOrder();
+    const broken = brokenOrder();
     chain.linkedLegalBody.mockRejectedValue(new TransportFailure());
 
-    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unknown");
+    for (const row of [linked, broken])
+      expect(await checkBinding(deps(), row.legalBodyId), row.bindingState).toBe("unknown");
 
-    const after = rowOf(row.legalBodyId);
-    expect(after.bindingState).toBe("linked");
-    expect(after.nextBindingCheckAt).toBe(clock + DAY);
+    const l = rowOf(linked.legalBodyId);
+    expect(l.bindingState).toBe("linked");
+    expect(l.nextBindingCheckAt).toBe(clock + HOUR);
+    expect(l.bindingCheckIntervalMs).toBe(DAY);
+    const b = rowOf(broken.legalBodyId);
+    expect(b.bindingState).toBe("broken");
+    expect(b.nextBindingCheckAt).toBe(clock + 2 * HOUR);
+    expect(b.bindingCheckIntervalMs).toBe(4 * HOUR);
     expect(chain.bodyStatus).not.toHaveBeenCalled();
+
+    // The read answers an hour later, the pointer still naming the body: back to every day.
+    clock += HOUR;
+    chain.linkedLegalBody.mockResolvedValue(bodyOf(linked));
+    expect(await checkBinding(deps(), linked.legalBodyId)).toBe("unchanged");
+    expect(rowOf(linked.legalBodyId).nextBindingCheckAt).toBe(clock + DAY);
+    expect(rowOf(linked.legalBodyId).bindingCheckIntervalMs).toBe(DAY);
   });
 
-  test("a status read that throws leaves a linked body linked, with no broken event", async () => {
+  test("a status read that throws leaves a linked body linked, with no broken event, checked again within the hour", async () => {
     const row = linkedOrder();
     chain.bodyStatus.mockRejectedValue(new TransportFailure());
 
@@ -686,7 +700,8 @@ describe("a chain that cannot answer", () => {
 
     expect(rowOf(row.legalBodyId).bindingState).toBe("linked");
     expect(brokenEvents(row.legalBodyId)).toEqual([]);
-    expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBe(clock + DAY);
+    expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBe(clock + HOUR);
+    expect(rowOf(row.legalBodyId).bindingCheckIntervalMs).toBe(DAY);
     expect(opsLines()[0]).toMatchObject({ outcome: "unknown", stage: "body_status" });
   });
 });

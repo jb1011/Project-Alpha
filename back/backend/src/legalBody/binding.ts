@@ -37,7 +37,9 @@ import { type LegalBodyOrderDeps, assertThisDeployment } from "./orders";
  *
  * A CHAIN THAT CANNOT ANSWER IS `unknown`: no state moves, the schedule moves forward by its
  * interval, so one failing row does not stay due, and one line names the stage and the error's
- * NAME, never its message (a transport error's message can carry the node's URL).
+ * NAME, never its message (a transport error's message can carry the node's URL). A `linked` row
+ * is the exception: it is checked again within the hour, its interval kept, so one failed read
+ * does not leave a pointer cleared meanwhile unseen for another day.
  *
  * THE SCHEDULE (`nextBindingSchedule`), in unix milliseconds. As in the resolve schedule, the
  * row's interval is the wait its NEXT check applies (the deploy leaves the row due at once with an
@@ -46,7 +48,8 @@ import { type LegalBodyOrderDeps, assertThisDeployment } from "./orders";
  * leg's first interval. The legs:
  *  - never linked (`deployed`, or `superseded` with no pointer ever seen): a minute, doubling to
  *    an hour, until 7 days after `deployedAt`;
- *  - `linked`: every 24 hours, for as long as it is linked;
+ *  - `linked`: every 24 hours, for as long as it is linked (within the hour after a check the
+ *    chain could not answer);
  *  - broken (`broken`, or `superseded` after a pointer was seen): an hour, doubling to 24 hours,
  *    until 30 days after the row's last state move (`updatedAt`, which only a move changes). A
  *    body found winding down stays on this leg, so a veto or a final dissolution is seen, but
@@ -113,6 +116,8 @@ const LEG_INTERVALS: Record<Leg, { firstMs: number; capMs: number }> = {
   linked: { firstMs: DAY_MS, capMs: DAY_MS },
   broken: { firstMs: HOUR_MS, capMs: DAY_MS },
 };
+/** The longest a `linked` row waits after a check the chain could not answer. */
+const LINKED_RETRY_AFTER_UNKNOWN_MS = HOUR_MS;
 /** How long a body never linked is checked, from its creation. */
 const NEVER_LINKED_CHECKED_FOR_MS = 7 * DAY_MS;
 /** How long a broken body is checked, from its last state move. */
@@ -252,7 +257,8 @@ type Moved =
  *     `unchanged`.
  *  5. The schedule is set from `nextBindingSchedule`, or cleared, in the transaction of the move.
  * A throw from the chain is `unknown`: nothing moves, and the schedule moves forward by its
- * interval. A throw from the database is not the chain's, and propagates.
+ * interval, or for a `linked` row by an hour at most, its interval kept. A throw from the database
+ * is not the chain's, and propagates.
  */
 export async function checkBinding(
   deps: LegalBodyOrderDeps,
@@ -308,7 +314,7 @@ export async function checkBinding(
       stage,
       errorName: err instanceof Error ? err.name : "not_an_error",
     });
-    deps.transaction(() => reschedule(deps, row));
+    deps.transaction(() => reschedule(deps, row, { unanswered: true }));
     return "unknown";
   }
 
@@ -370,20 +376,36 @@ function applyReading(deps: LegalBodyOrderDeps, id: string, reading: Reading): M
 /**
  * The row's next check, from the row as it is now. `moved` compares its state with the one the
  * check began with, so a move made by another order's transaction meanwhile (a replacement)
- * starts the new leg over too.
+ * starts the new leg over too. After a check the chain could not answer (`unanswered`), a row
+ * that is `linked` now waits its leg's interval or an hour, whichever is shorter, and keeps its
+ * stored interval, so the check after an answered one waits its day again.
  */
-function reschedule(deps: LegalBodyOrderDeps, before: LegalBodyRecord): void {
+function reschedule(
+  deps: LegalBodyOrderDeps,
+  before: LegalBodyRecord,
+  opts: { unanswered?: boolean } = {},
+): void {
   const id = before.legalBodyId;
   const row = deps.repo.findById(id);
   if (row === undefined) throw new Error(`legal body ${id} vanished during its binding check`);
+  const nowMs = (deps.now ?? Date.now)();
   const next = nextBindingSchedule(
     row,
-    (deps.now ?? Date.now)(),
+    nowMs,
     row.bindingState !== before.bindingState,
     deps.repo.latestBrokenReason(id),
   );
-  if (next !== undefined) deps.repo.scheduleBindingCheck(id, next.nextAt, next.intervalMs);
-  else if (row.nextBindingCheckAt !== null) deps.repo.scheduleBindingCheck(id, null, null);
+  if (next === undefined) {
+    if (row.nextBindingCheckAt !== null) deps.repo.scheduleBindingCheck(id, null, null);
+  } else if (opts.unanswered === true && row.bindingState === "linked") {
+    const waitMs = Math.min(next.nextAt - nowMs, LINKED_RETRY_AFTER_UNKNOWN_MS);
+    // The schema holds a next check and an interval together: a row with none takes its leg's.
+    deps.repo.scheduleBindingCheck(
+      id,
+      nowMs + waitMs,
+      row.bindingCheckIntervalMs ?? next.intervalMs,
+    );
+  } else deps.repo.scheduleBindingCheck(id, next.nextAt, next.intervalMs);
 }
 
 /** One line per move or recorded reason; an unchanged binding writes none. */
