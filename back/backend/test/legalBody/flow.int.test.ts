@@ -15,10 +15,17 @@
  *  - signs the links for one identity with different lifetimes, so no two of them share a digest.
  * The doors, the sweeper and the chain adapter read one clock. A case that needs a second pass
  * over a row moves that clock past the row's next check, and moves the chain's clock with it. The
- * one case that moves the chain's clock runs last.
+ * cases that move the chain's clock by hours or days run after the cases that do not.
+ *
+ * The first `describe` is the path; the second is what the path survives: a lost response, a
+ * restart, a transfer of the identity, a gap in the platform key's nonces, and the payment quote
+ * that waits for a linked body. The path's last case, which moves the clocks by days, comes after
+ * both. Every answer a door gives in the file is checked as it arrives: no bigint, no node URL and
+ * no text of a thrown error.
  *
  * The app's throttles never refuse here; the caps are the deployment's defaults. Its formation
- * block and payment config are wired as a deployment that does not charge wires them.
+ * block and payment config are wired as a deployment that does not charge wires them, except in
+ * the one case about the payment quote, which runs on a deployment that charges.
  *
  * Every key is derived from anvil's published test mnemonic, never a real wallet, and every name
  * and filing number is an invention.
@@ -68,6 +75,7 @@ import {
   LEGAL_BODY_FLOW_DEFAULTS,
 } from "../../src/config/env";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
+import { checkLink } from "../../src/legalBody/checkLink";
 import {
   type CustomerCompanyDeps,
   createCustomerCompany,
@@ -75,6 +83,7 @@ import {
   prepareCustomerStatement,
 } from "../../src/legalBody/customerCompany";
 import { expireEvidenceBytes } from "../../src/legalBody/evidence";
+import { linkFromWire } from "../../src/legalBody/link";
 import type { LegalBodyOrderDeps } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { buildStatementMessage, statementTypedDataWire } from "../../src/legalBody/statement";
@@ -104,7 +113,7 @@ import {
   sandboxCustomerCompanyDeps,
   worldFor,
 } from "../helpers/customerCompanyFixtures";
-import { paymentCfg } from "../helpers/formationPayment";
+import { fakeChain, paymentCfg } from "../helpers/formationPayment";
 import { type Json, answerOf, call } from "../helpers/legalBodyFixtures";
 import {
   type LegalBodyStack,
@@ -137,6 +146,8 @@ const owner = keyAt(2);
 const stranger = keyAt(3);
 /** Deploys the contracts, so the executor's nonce moves only for creates. */
 const deployer = keyAt(4);
+/** The identity's next owner, once the owner transfers it. */
+const buyer = keyAt(5);
 /** Each case's guardians take the next keys from here on. */
 const FIRST_GUARDIAN_INDEX = 10;
 
@@ -150,6 +161,12 @@ const DAY_SECONDS = 24 * 3_600;
 
 const ORDERS = "/legal-body-orders";
 const orderPath = (id: string) => `${ORDERS}/${id}`;
+const requotePath = (companyId: string) => `/companies/${companyId}/payment/requote`;
+
+/** A customer company's fee, in atomic units, on the deployment that charges: a placeholder. */
+const CUSTOMER_FEE = 7_000_000n;
+/** The payment door's refusal of a customer company with no linked legal body. */
+const NOT_LINKED = "this company has no linked legal body yet";
 
 const contractWalletAbi = parseAbi([
   "function execute(address target, bytes data) returns (bytes)",
@@ -233,6 +250,7 @@ interface Deployment {
   checks: SqliteCompanyCheckRepository;
   store: SqliteWorldStore;
   legalBodies: SqliteLegalBodyRepository;
+  payments: SqliteFormationPaymentRepository;
   customerDeps: CustomerCompanyDeps;
   app: ReturnType<typeof buildApiApp>;
   sweeper: LegalBodySweeper;
@@ -247,9 +265,15 @@ let nextGuardian = FIRST_GUARDIAN_INDEX;
 /** A throttle that always has a token: the caps under test are the deployment's own. */
 const open = () => ({ take: () => true });
 
-/** The deployment as the composition root wires it where the legal-body feature is on, over this
- *  case's database and document store, on the shared clock. */
-function deploy(): Deployment {
+/**
+ * The deployment as the composition root wires it where the legal-body feature is on, over this
+ * case's database and document store, on the shared clock. With `charging`, it charges for a
+ * customer company: the company waits as a draft for its payment, and the payment doors quote it.
+ * Nothing in this file settles a payment, so the settlement's executor is the fake chain of the
+ * payment fixture, and no payment ever reaches anvil.
+ */
+function deploy(opts: { charging?: boolean } = {}): Deployment {
+  const charging = opts.charging === true;
   const db = openDatabase(join(dir, "legalbody.db"));
   migrate(db);
   const companies = new SqliteCompanyRepository(db);
@@ -290,11 +314,13 @@ function deploy(): Deployment {
     {
       chainId: anvilChain.id,
       factory: stack.factory,
-      paymentRequired: false,
+      paymentRequired: charging,
       world,
     },
   );
-  const payment = paymentCfg(payments, { required: false });
+  const payment = charging
+    ? paymentCfg(payments, { byoFeeAtomic: CUSTOMER_FEE })
+    : paymentCfg(payments, { required: false });
   const pin = { provider: FORMATION_PROVIDER, environment: "sandbox" } as const;
   const formationLimits = { sandboxSyntheticPii: false, maxPerTenant: 3, dailyCeiling: 10 };
   const deps: Partial<ApiDeps> = {
@@ -326,7 +352,7 @@ function deploy(): Deployment {
       companyDeps: { companies, parties, requests, pin, ...formationLimits, payment },
       payment,
       feeUsdc: payment.feeUsdc,
-      paymentExecutor: undefined,
+      paymentExecutor: charging ? fakeChain().executor : undefined,
     },
     apiKeys: new SqliteApiKeyStore(db),
     passkeys: new SqlitePasskeyStore(db),
@@ -363,10 +389,21 @@ function deploy(): Deployment {
     checks,
     store,
     legalBodies,
+    payments,
     customerDeps,
     app: buildApiApp(deps as ApiDeps),
     sweeper,
   };
+}
+
+/**
+ * The case's deployment built again over the same database file and document store, as a process
+ * that restarts opens them, with a new app and a new sweeper. The old database handle is closed
+ * first.
+ */
+function redeploy(opts: { charging?: boolean } = {}): void {
+  d.db.close();
+  d = deploy(opts);
 }
 
 beforeEach(async () => {
@@ -562,10 +599,118 @@ async function moveTime(seconds: number): Promise<void> {
   clockOffsetMs += seconds * 1_000;
 }
 
+/** Move both clocks past the latest next check of these orders, so a tick finds each one due. */
+async function pastNextCheck(...ids: string[]): Promise<void> {
+  const due = ids.map((id) => {
+    const at = d.legalBodies.findById(id)?.nextBindingCheckAt;
+    if (at === null || at === undefined) throw new Error(`order ${id} has no next check`);
+    return at;
+  });
+  await moveTime(Math.max(1, Math.ceil((Math.max(...due) - now()) / 1_000) + 1));
+}
+
+/** The ops lines named `event` this case printed, parsed. */
+function opsLines(event: string): Json[] {
+  return printed.flatMap((line) => {
+    try {
+      const parsed = JSON.parse(line) as { opslog?: string };
+      return parsed.opslog === event ? [parsed] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
 // ── The doors, as the guardian's client calls them ────────────────────────────────────────────
 
+/** The marks the text of a thrown error leaves: viem's, the node's, and a stack's. */
+const THROWN_TEXT_MARKS = [
+  "Version: viem",
+  "Details:",
+  "Request body:",
+  "Request Arguments:",
+  "Raw Call Arguments:",
+  "Contract Call:",
+  "execution reverted",
+  "already imported",
+  "nonce too low",
+  "could not be found",
+  "Error:",
+  "\n    at ",
+];
+
+/** Calls `visit` with every key and value of a parsed JSON answer, at any depth. */
+function walkJson(value: unknown, visit: (key: string, value: unknown) => void, key = ""): void {
+  visit(key, value);
+  if (Array.isArray(value)) for (const item of value) walkJson(item, visit, key);
+  else if (value !== null && typeof value === "object")
+    for (const [k, v] of Object.entries(value)) walkJson(v, visit, k);
+}
+
+/** The fixed sentences a door's message may be: the legal-body doors' (a lapsed order's refusal
+ *  carries the lapse's sentence after its own), and the payment door's refusal above. */
+function fixedSentences(): Set<string> {
+  const sentences = Object.values(LEGAL_BODY_SENTENCES);
+  return new Set([
+    ...sentences,
+    ...sentences.map((s) => `${s} ${LEGAL_BODY_SENTENCES.order_lapsed}`),
+    NOT_LINKED,
+  ]);
+}
+
+/** The factory's own error names: the only names a refusal's detail may repeat. */
+const FACTORY_ERRORS: ReadonlySet<string> = new Set(
+  legalBodyFactoryAbi.flatMap((item) => (item.type === "error" ? [item.name] : [])),
+);
+
+/**
+ * An answer as a door may give it: not a 500; neither the node's URL nor the marks of a thrown
+ * error's text; no bigint (a JSON number is a safe integer or no integer at all, and no string is
+ * a bigint's literal); every message a fixed sentence; and a refusal's detail made of hex,
+ * decimals and the factory's own error names.
+ */
+function expectWireSafe(answer: { method: string; path: string; status: number; text: string }) {
+  const where = `${answer.method} ${answer.path}: ${answer.status}`;
+  expect(answer.status, where).not.toBe(500);
+  const url = anvil?.rpcUrl;
+  if (!url) throw new Error("anvil is not running");
+  for (const part of [url, "127.0.0.1", "localhost", `:${PORT}`])
+    expect(answer.text, `${where} holds ${part}`).not.toContain(part);
+  for (const mark of THROWN_TEXT_MARKS)
+    expect(answer.text, `${where} holds ${JSON.stringify(mark)}`).not.toContain(mark);
+
+  const fixed = fixedSentences();
+  walkJson(answer.text ? JSON.parse(answer.text) : null, (key, value) => {
+    if (typeof value === "number")
+      expect(
+        Number.isFinite(value) && (!Number.isInteger(value) || Number.isSafeInteger(value)),
+        `${where}: ${key} = ${value}`,
+      ).toBe(true);
+    if (typeof value === "string") expect(value, `${where}: ${key}`).not.toMatch(/^-?[0-9]+n$/);
+    if (key === "message" && typeof value === "string")
+      expect(fixed.has(value), `${where}: message ${JSON.stringify(value)}`).toBe(true);
+    if (key === "detail" && value !== null && typeof value === "object")
+      for (const [field, fact] of Object.entries(value))
+        expect(
+          typeof fact === "string" &&
+            (/^0x[0-9a-fA-F]*$/.test(fact) ||
+              /^(?:0|[1-9][0-9]*)$/.test(fact) ||
+              FACTORY_ERRORS.has(fact)),
+          `${where}: detail.${field} = ${JSON.stringify(fact)}`,
+        ).toBe(true);
+  });
+}
+
+/** Every answer a door gave in this file, in order. */
+const answers: { method: string; path: string; status: number; text: string }[] = [];
+
+/** One request to a door. Its answer is kept, and checked as every answer in this file is. */
 async function api(method: "GET" | "POST", path: string, g: Guardian, body?: object) {
-  return answerOf(await call(d.app, method, path, g.token, body));
+  const answer = await answerOf(await call(d.app, method, path, g.token, body));
+  const kept = { method, path, status: answer.status, text: answer.text };
+  answers.push(kept);
+  expectWireSafe(kept);
+  return answer;
 }
 
 /** The guardian orders a body for its company: a draft, its agreement frozen. */
@@ -999,8 +1144,387 @@ describe("an order becomes a linked body on a local chain", () => {
     ]);
     expect(await readOrder(g, id)).toMatchObject({ state: "draft", agentId: null });
   });
+});
 
-  // Last in the file: it moves the chain's clock forward by days, for good.
+// ── What the path survives ────────────────────────────────────────────────────────────────────
+
+/** The order's one recorded create: its hash, its raw bytes and its nonce. */
+function onlySubmission(id: string) {
+  const submissions = d.legalBodies.listDeploySubmissions(id);
+  expect(submissions).toHaveLength(1);
+  const [submission] = submissions;
+  if (submission === undefined) throw new Error(`order ${id} recorded no create`);
+  return submission;
+}
+
+describe("an order survives a lost response, a restart, a transfer and a nonce gap", () => {
+  afterEach(async () => {
+    // A case that stopped half-way must leave the next one a node that mines every transaction
+    // at once, with nothing left in its pool.
+    const pool = await node.getTxpoolContent();
+    for (const bySender of [pool.pending, pool.queued])
+      for (const transactions of Object.values(bySender))
+        for (const tx of Object.values(transactions)) await node.dropTransaction({ hash: tx.hash });
+    await node.setAutomine(true);
+  });
+
+  test("a lost response: the create is sent and not mined yet, so the link door answers 202 reserved; once a block mines it, the next tick marks the order deployed with the mined hash", async () => {
+    const g = await newGuardian();
+    const agentId = await identityOfKey();
+    const { id } = await order(g);
+    const { typedData } = await linkMessage(g, id, agentId, 3_600);
+    const signature = await owner.signTypedData(typedData);
+    const before = await executorCounts();
+
+    await node.setAutomine(false);
+    const res = await submitLink(g, id, typedData, signature);
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({
+      id,
+      state: "reserved",
+      agentId: agentId.toString(),
+      identityOwner: owner.address,
+      deployedAt: null,
+    });
+    const sent = onlySubmission(id);
+    expect(sent.nonce).toBe(before.pending);
+    // In the node's pool, in no block.
+    expect(await executorCounts()).toEqual({ mined: before.mined, pending: before.pending + 1 });
+
+    await node.mine({ blocks: 1 });
+    const block = await pub.getBlock({ blockTag: "latest" });
+    expect(block.transactions).toEqual([sent.txHash]);
+    expect(await readOrder(g, id)).toMatchObject({ state: "reserved" });
+
+    await d.sweeper.tick();
+    expect(await readOrder(g, id)).toMatchObject({
+      state: "deployed",
+      bodyAddress: res.body.bodyAddress,
+      createTxHash: sent.txHash,
+      deployedAt: Number(block.timestamp),
+    });
+    expect(await pub.getTransactionReceipt({ hash: sent.txHash })).toMatchObject({
+      status: "success",
+      blockNumber: block.number,
+    });
+    expect(await lb.executorNonce()).toBe(before.mined + 1);
+    expect((await binding(g, id)).intent).toMatchObject({ body: res.body.bodyAddress });
+  });
+
+  test("a restart between the reserve and the send: the order is reserved and no create was submitted; the first tick of a new sweeper submits it, and the order reaches deployed", async () => {
+    const g = await newGuardian();
+    const agentId = await identityOfKey();
+    const { id } = await order(g);
+    const { typedData } = await linkMessage(g, id, agentId, 3_600);
+    const signature = await owner.signTypedData(typedData);
+
+    // The link door's check and reserve, written as the door writes them, and nothing after: the
+    // process stops before the create is submitted.
+    const draft = d.legalBodies.findById(id);
+    if (!draft?.oaManifestHash) throw new Error(`order ${id} has no agreement`);
+    const link = linkFromWire(typedData.message);
+    const check = await checkLink(lb, {
+      link,
+      signature,
+      expected: {
+        tenant: g.address,
+        operatingAgreementHash: draft.oaManifestHash,
+        amendmentDelay: BigInt(draft.amendmentDelay),
+      },
+    });
+    if (!check.ok) throw new Error(`the link was refused: ${check.code}`);
+    expect(
+      d.legalBodies.reserve(id, {
+        agentId: agentId.toString(),
+        identityOwner: check.identityOwner,
+        linkDigest: check.linkDigest,
+        linkDeadline: Number(link.deadline),
+        linkSignature: check.signature,
+        bodyAddress: check.bodyAddress,
+        observedAtBlock: check.observedAtBlock,
+        firstCheckAt: now(),
+      }),
+    ).toBe("reserved");
+    expect(d.legalBodies.listDeploySubmissions(id)).toEqual([]);
+    const before = await executorCounts();
+
+    // The process starts again: a new app and a new sweeper over the same database.
+    redeploy();
+    await d.sweeper.tick();
+    const sent = onlySubmission(id);
+    expect(sent.nonce).toBe(before.pending);
+    const receipt = await pub.getTransactionReceipt({ hash: sent.txHash });
+    expect(receipt.status).toBe("success");
+    expect(await executorCounts()).toEqual({
+      mined: before.mined + 1,
+      pending: before.pending + 1,
+    });
+    expect(opsLines("legal_body_resolve")).toEqual([
+      expect.objectContaining({
+        orderId: id,
+        outcome: "resubmitted",
+        txHash: sent.txHash,
+        nonce: sent.nonce,
+      }),
+    ]);
+    expect(await readOrder(g, id)).toMatchObject({ state: "reserved" });
+
+    await pastNextCheck(id);
+    await d.sweeper.tick();
+    const block = await pub.getBlock({ blockNumber: receipt.blockNumber });
+    expect(await readOrder(g, id)).toMatchObject({
+      state: "deployed",
+      bodyAddress: check.bodyAddress,
+      createTxHash: sent.txHash,
+      deployedAt: Number(block.timestamp),
+    });
+    expect(onlySubmission(id)).toEqual(sent);
+    expect(await lb.executorNonce()).toBe(before.mined + 1);
+  });
+
+  test("a gap in the platform key's nonces: the node drops order A's create, and order B, for another identity and linked within the same minute, answers 202 and cannot be mined; one tick sends A's recorded bytes again; once a block mines both, the next tick marks both deployed", async () => {
+    const g = await newGuardian();
+    const agentA = await identityOfKey();
+    const agentB = await identityOfKey();
+    const a = (await order(g)).id as string;
+    const b = (await order(g)).id as string;
+    const forA = await linkMessage(g, a, agentA, 3_600);
+    const forB = await linkMessage(g, b, agentB, 3_600);
+    const signedA = await owner.signTypedData(forA.typedData);
+    const signedB = await owner.signTypedData(forB.typedData);
+    const before = await executorCounts();
+
+    await node.setAutomine(false);
+    const resA = await submitLink(g, a, forA.typedData, signedA);
+    expect(resA).toMatchObject({ status: 202, body: { id: a, state: "reserved" } });
+    const sentA = onlySubmission(a);
+    expect(sentA.nonce).toBe(before.pending);
+    await node.dropTransaction({ hash: sentA.txHash });
+
+    const resB = await submitLink(g, b, forB.typedData, signedB);
+    expect(resB).toMatchObject({ status: 202, body: { id: b, state: "reserved" } });
+    const sentB = onlySubmission(b);
+    // B's create is numbered after A's, which the node no longer holds: the node queues it.
+    expect(sentB.nonce).toBe(sentA.nonce + 1);
+    expect(await node.getTxpoolStatus()).toEqual({ pending: 0, queued: 1 });
+
+    // A block: B cannot be mined, and stays reserved.
+    await node.mine({ blocks: 1 });
+    await expect(
+      lb.createOutcome(sentB.txHash, { bodyAddress: resB.body.bodyAddress }),
+    ).resolves.toEqual({ status: "absent" });
+    expect(await lb.executorNonce()).toBe(before.mined);
+    expect(await readOrder(g, b)).toMatchObject({ state: "reserved" });
+
+    // One tick sends A's recorded bytes again, and the gap is filled: both are ready to be mined.
+    // No create is signed for either order.
+    await d.sweeper.tick();
+    expect(opsLines("legal_body_resolve")).toContainEqual(
+      expect.objectContaining({ orderId: a, outcome: "rebroadcast", nonce: sentA.nonce }),
+    );
+    expect(opsLines("legal_body_executor_nonce_gap")).toEqual([]);
+    expect(await pub.getTransaction({ hash: sentA.txHash })).toMatchObject({
+      nonce: sentA.nonce,
+      blockNumber: null,
+    });
+    expect(await node.getTxpoolStatus()).toEqual({ pending: 2, queued: 0 });
+    expect(onlySubmission(a)).toEqual(sentA);
+    expect(onlySubmission(b)).toEqual(sentB);
+
+    // A block mines both, in nonce order.
+    await node.mine({ blocks: 1 });
+    const receiptA = await pub.getTransactionReceipt({ hash: sentA.txHash });
+    const receiptB = await pub.getTransactionReceipt({ hash: sentB.txHash });
+    expect(receiptA.status).toBe("success");
+    expect(receiptB.status).toBe("success");
+    expect(receiptB.blockNumber).toBe(receiptA.blockNumber);
+    expect(receiptB.transactionIndex).toBeGreaterThan(receiptA.transactionIndex);
+    expect(await lb.executorNonce()).toBe(before.mined + 2);
+
+    // The next tick marks both deployed, each with its own mined hash.
+    await pastNextCheck(a, b);
+    await d.sweeper.tick();
+    const block = await pub.getBlock({ blockNumber: receiptA.blockNumber });
+    expect(await readOrder(g, a)).toMatchObject({
+      state: "deployed",
+      bodyAddress: resA.body.bodyAddress,
+      createTxHash: sentA.txHash,
+      deployedAt: Number(block.timestamp),
+    });
+    expect(await readOrder(g, b)).toMatchObject({
+      state: "deployed",
+      bodyAddress: resB.body.bodyAddress,
+      createTxHash: sentB.txHash,
+      deployedAt: Number(block.timestamp),
+    });
+    expect(onlySubmission(a)).toEqual(sentA);
+    expect(onlySubmission(b)).toEqual(sentB);
+  });
+
+  test("a customer company's payment quote, on a deployment that charges: refused while none of its legal bodies is linked, its deployed body included; given once the body is linked", async () => {
+    redeploy({ charging: true });
+    const g = await newGuardian();
+    const quote = () => api("POST", requotePath(g.companyId), g);
+    const refused = {
+      status: 400,
+      body: { error: { code: "validation_error", message: NOT_LINKED } },
+    };
+
+    // No order yet.
+    expect(await quote()).toMatchObject(refused);
+
+    // A body created, not linked.
+    const agentId = await identityOfKey();
+    const { id, body } = await deployedOrder(g, agentId, 3_600);
+    expect(await quote()).toMatchObject(refused);
+    expect(d.payments.findLive(g.companyId, "formation")).toBeUndefined();
+
+    // The owner points the identity at it, and a tick finds it linked.
+    await setPointer(agentId, pointerFrom((await binding(g, id)).intent));
+    await d.sweeper.tick();
+    expect(await binding(g, id)).toMatchObject({ state: "linked", bodyAddress: body });
+
+    const quoted = await quote();
+    expect(quoted.status).toBe(201);
+    expect(quoted.body).toMatchObject({ amountUsdc: CUSTOMER_FEE.toString() });
+    expect(d.payments.findLive(g.companyId, "formation")).toMatchObject({
+      status: "quoted",
+      amountUsdc: CUSTOMER_FEE,
+    });
+  });
+
+  // It moves the chain's clock past a link's deadline, an hour on.
+  test("the identity changes hands after the reserve and before the create is mined: the node drops the create, the owner transfers the identity; one tick sends the create again, and it is mined and reverts; the next tick waits; past the deadline a tick lapses the order, and the new owner orders, links and reaches deployed", async () => {
+    const g = await newGuardian();
+    const agentId = await identityOfKey();
+    const { id } = await order(g);
+    const { typedData, deadline } = await linkMessage(g, id, agentId, 3_600);
+    const signature = await owner.signTypedData(typedData);
+
+    await node.setAutomine(false);
+    const res = await submitLink(g, id, typedData, signature);
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({ id, state: "reserved", identityOwner: owner.address });
+    const body: Address = res.body.bodyAddress;
+    const sent = onlySubmission(id);
+
+    // The node drops the create; the owner transfers the identity; a block; automine again.
+    await node.dropTransaction({ hash: sent.txHash });
+    const transfer = await walletOf(owner).writeContract({
+      address: stack.registry,
+      abi: iIdentityRegistryAbi,
+      functionName: "transferFrom",
+      args: [owner.address, buyer.address, agentId],
+      account: owner,
+      chain: anvilChain,
+    });
+    await node.mine({ blocks: 1 });
+    await mined(transfer);
+    await node.setAutomine(true);
+    await expect(lb.identityOwner(agentId)).resolves.toBe(buyer.address);
+    await expect(lb.createOutcome(sent.txHash, { bodyAddress: body })).resolves.toEqual({
+      status: "absent",
+    });
+    expect(await executorCounts()).toEqual({ mined: sent.nonce, pending: sent.nonce });
+
+    // One tick: the recorded bytes go out again, are mined, and revert.
+    await d.sweeper.tick();
+    const reverted = await pub.getTransactionReceipt({ hash: sent.txHash });
+    expect(reverted.status).toBe("reverted");
+    expect(isAddressEqual(reverted.from, executor.address)).toBe(true);
+    expect(opsLines("legal_body_resolve")).toEqual([
+      expect.objectContaining({
+        orderId: id,
+        outcome: "rebroadcast",
+        why: "lost_bytes",
+        nonce: sent.nonce,
+      }),
+    ]);
+    expect(await readOrder(g, id)).toMatchObject({ state: "reserved" });
+    expect(onlySubmission(id)).toEqual(sent);
+    const afterRevert = await executorCounts();
+    expect(afterRevert).toEqual({ mined: sent.nonce + 1, pending: sent.nonce + 1 });
+
+    // The next tick checks the link again: the identity's owner did not sign it. The order waits,
+    // and nothing is sent.
+    await pastNextCheck(id);
+    await d.sweeper.tick();
+    expect(opsLines("legal_body_resolve").slice(1)).toEqual([
+      expect.objectContaining({
+        orderId: id,
+        outcome: "waiting",
+        why: "link_refused",
+        code: "bad_signature",
+      }),
+    ]);
+    expect(await readOrder(g, id)).toMatchObject({ state: "reserved" });
+    expect(onlySubmission(id)).toEqual(sent);
+    expect(await executorCounts()).toEqual(afterRevert);
+
+    // The chain's time passes the link's deadline, and the order is due again: the next tick
+    // lapses it.
+    const { timestamp } = await lb.head();
+    await moveTime(deadline - Number(timestamp) + 1);
+    expect((await lb.head()).timestamp).toBeGreaterThan(BigInt(deadline));
+    expect(now()).toBeGreaterThan(d.legalBodies.findById(id)?.nextBindingCheckAt ?? Number.NaN);
+    await d.sweeper.tick();
+    expect(await readOrder(g, id)).toMatchObject({ state: "lapsed", createTxHash: sent.txHash });
+    const lapses = d.legalBodies
+      .listEvents(id)
+      .filter((e) => e.kind === "lapsed")
+      .map((e) => e.detail as { reason: string; blockTime: number });
+    expect(lapses).toEqual([{ reason: "deadline_passed", blockTime: expect.any(Number) }]);
+    expect(lapses[0]?.blockTime).toBeGreaterThan(deadline);
+    await expect(lb.bodyCreator(body)).resolves.toBeUndefined();
+    expect(await executorCounts()).toEqual(afterRevert);
+
+    // The new owner's turn: a guardian orders, the new owner signs, and the body is created.
+    const next = await newGuardian();
+    const { id: nextId } = await order(next);
+    const served = await linkMessage(next, nextId, agentId, 3_700);
+    expect(served.identityOwner).toBe(buyer.address);
+    const linked = await submitLink(
+      next,
+      nextId,
+      served.typedData,
+      await buyer.signTypedData(served.typedData),
+    );
+    expect(linked.status).toBe(200);
+    expect(linked.body).toMatchObject({
+      id: nextId,
+      state: "deployed",
+      agentId: agentId.toString(),
+      identityOwner: buyer.address,
+    });
+    await expect(
+      pub.readContract({
+        address: stack.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "identityOwnerAtCreation",
+        args: [linked.body.bodyAddress],
+      }),
+    ).resolves.toBe(buyer.address);
+    expect(await readOrder(g, id)).toMatchObject({ state: "lapsed" });
+  });
+
+  // It reads the answers of the cases before it. `api` checks each answer as it arrives, the
+  // answers of the case after this one included.
+  test("no answer a door gave in this file holds a bigint, the node's URL or the text of a thrown error", () => {
+    const statuses = new Set(answers.map((a) => a.status));
+    for (const status of [200, 201, 202, 400, 422, 429, 503])
+      expect(statuses.has(status), `an answer with status ${status}`).toBe(true);
+    for (const answer of answers) expectWireSafe(answer);
+  });
+});
+
+// ── The path's last case, days on ─────────────────────────────────────────────────────────────
+
+/**
+ * Last in the file, after every case that creates an order: it moves the chain's clock and the
+ * shared clock forward by days, for good, and a draft's age is counted from the database's own
+ * clock, which does not move. An order created after it would be past its 24 hours at once.
+ */
+describe("an order becomes a linked body on a local chain", () => {
   test("a dissolution of a linked body: while it winds down the next check reads it broken with winding_down, still checked and with no intent; once the guardian makes it final the next check reads it dissolved, with no intent and no further check", async () => {
     const g = await newGuardian();
     await node.setBalance({ address: g.address, value: parseEther("1") });
