@@ -106,10 +106,10 @@ test("shutdown stops both the formation sweeper and a running legal-body sweeper
 /**
  * The composition root boots against a chain and has no injectable seam for its own wiring, so
  * this reads the file, as the boot-order guard does. What it protects: the legal-body sweeper
- * exists only where the feature is on (the order doors' dependencies exist), runs C3's two expiry
- * calls with the file store (which can delete) and the legal-body store's open-body read and
- * IMMEDIATE transaction, starts after `serve()` with nothing awaiting it, and is stopped by
- * shutdown beside the formation sweeper.
+ * exists only where the feature is on (the order doors' dependencies exist), runs the customer
+ * companies' two expiry calls with the file store (which can delete) and the legal-body store's
+ * open-body read and IMMEDIATE transaction, starts after `serve()` with nothing awaiting it, and
+ * is stopped by shutdown beside the formation sweeper.
  */
 test("the composition root builds the legal-body sweeper only with the feature, starts it after serve(), and hands it to shutdown beside the formation sweeper", () => {
   const main = readFileSync(join(import.meta.dirname, "..", "..", "src", "api", "main.ts"), "utf8");
