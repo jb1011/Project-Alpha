@@ -1,9 +1,10 @@
 import { type Address, isAddressEqual } from "viem";
+import { assertRealHuman } from "../api/routes/worldId";
 import { ApiError } from "../errors";
 import { opsLog } from "../observability/opsLog";
 import type { BindingState, LegalBodyRecord } from "../persistence/legalBodyRepository";
 import { parseSqliteUtc } from "../util/sqliteTime";
-import { type LegalBodyOrderDeps, assertThisDeployment } from "./orders";
+import { type LegalBodyOrderDeps, assertThisDeployment, requireOwnedOrder } from "./orders";
 
 /**
  * THE BINDING CHECK: whether the identity's pointer names an order's body, and what follows.
@@ -220,6 +221,17 @@ export function toBindingView(
     pointerSeenAt: row.pointerSeenAt,
     nextCheckAt: row.nextBindingCheckAt,
   };
+}
+
+/**
+ * The binding of the tenant's order `id`, as stored: the one read behind the binding door, the
+ * refresh door's answer and the `get_binding` tool. A real human (never a waiver), then the
+ * tenant's order (the uniform 404), then its view. No chain read, no lock and no token.
+ */
+export function readBinding(deps: LegalBodyOrderDeps, tenantId: Address, id: string): BindingView {
+  assertRealHuman(deps.world, tenantId, deps.environment);
+  const row = requireOwnedOrder(deps, tenantId, id);
+  return toBindingView(row, deps.repo.latestBrokenReason(row.legalBodyId));
 }
 
 /** What the chain said, read at one block, and the move it calls for. */

@@ -4,7 +4,7 @@ import { type Address, type Hex, hexToString } from "viem";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
-import { assertGuardianAllowed, assertRealHuman } from "../api/routes/worldId";
+import { assertGuardianAllowed } from "../api/routes/worldId";
 import {
   type EntityViewDeps,
   listCompanyViews,
@@ -32,14 +32,13 @@ import { HEDERA_CAIP2, hederaPolicyInput } from "../hedera/policy";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { type RecoverOutcome, outcomeJson } from "../jobs/refund";
-import { LEGAL_BODY_POINTER_KEY, toBindingView } from "../legalBody/binding";
+import { LEGAL_BODY_POINTER_KEY, readBinding } from "../legalBody/binding";
 import { DEFAULT_LINK_TTL_SECONDS, MAX_SERVED_LINK_TTL_SECONDS } from "../legalBody/link";
 import {
   MIN_SERVED_LINK_TTL_SECONDS,
   linkMessage,
   submitLinkAndCreate,
 } from "../legalBody/linkDoor";
-import { requireOwnedOrder } from "../legalBody/orders";
 import { LEGAL_BODY_SENTENCES, refusedLinkSentence, sentenceFor } from "../legalBody/sentences";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
@@ -1886,12 +1885,9 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
         const denied = requireReadTenantWide(scope);
         if (denied) return denied;
         try {
-          // The binding door's read: the real human, which that door checks itself, then the
-          // tenant's order, then its binding as stored. No chain read, no lock and no token, as
-          // on the door.
-          assertRealHuman(orders.world, tenant, orders.environment);
-          const row = requireOwnedOrder(orders, tenant, orderId);
-          return json(toBindingView(row, orders.repo.latestBrokenReason(row.legalBodyId)));
+          // The binding door's own read: the real human, then the tenant's order, then its
+          // binding as stored. No chain read, no lock and no token, as on the door.
+          return json(readBinding(orders, tenant, orderId));
         } catch (err) {
           return legalBodyToolRefusal("get_binding", err);
         }

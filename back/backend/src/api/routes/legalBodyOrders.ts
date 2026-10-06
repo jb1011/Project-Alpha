@@ -4,7 +4,7 @@ import type { Hex } from "viem";
 import { ZodError } from "zod";
 import type { AuthVars } from "../../auth/middleware";
 import { readVerifiedAgreement } from "../../legalBody/agreement";
-import { type BindingView, checkBinding, toBindingView } from "../../legalBody/binding";
+import { type BindingView, checkBinding, readBinding } from "../../legalBody/binding";
 import { type GasSeedDeps, requestGasSeed } from "../../legalBody/gasSeed";
 import { linkMessage, submitLinkAndCreate } from "../../legalBody/linkDoor";
 import {
@@ -21,7 +21,6 @@ import { resolveOrder } from "../../legalBody/resolver";
 import { refusal, refusedLinkSentence } from "../../legalBody/sentences";
 import { opsLog } from "../../observability/opsLog";
 import { withKeyedLock } from "../../payments/keyedMutex";
-import type { LegalBodyRecord } from "../../persistence/legalBodyRepository";
 import { ApiError, readJson } from "../errors";
 import { TokenBucket } from "./agentBook";
 import { assertRealHuman } from "./worldId";
@@ -62,9 +61,10 @@ import { assertRealHuman } from "./worldId";
  * `legalBody/resolver.ts`, `legalBody/binding.ts`, `legalBody/gasSeed.ts`); these handlers decide
  * only what is a well-formed request, and the refresh which of the domain's two passes to run.
  * Every door starts with the real-human check (a verified credential, never a waiver), the reads
- * included; the domain functions of the order door and the two link doors make that check first
- * themselves. The one exception is the gas seed: while it is off, it answers before that check,
- * reading nothing and spending no token; on, `requestGasSeed` makes the check first.
+ * included; the domain functions of the order door, the two link doors and the binding door
+ * (`readBinding`, which the `get_binding` tool calls too) make that check first themselves. The
+ * one exception is the gas seed: while it is off, it answers before that check, reading nothing
+ * and spending no token; on, `requestGasSeed` makes the check first.
  * Mounted under their own session protection, and only where the deployment wires the feature.
  *
  * An error a door did not choose never reaches the caller as it was thrown: anything but an
@@ -241,11 +241,9 @@ export function mountLegalBodyOrderRoutes(
     }),
   );
 
+  // `readBinding` makes the real-human check first itself.
   app.get("/legal-body-orders/:id/binding", (c) =>
-    door("binding", () => {
-      const tenantId = realHuman(c.get("tenantId"));
-      return c.json(bindingViewOf(deps, requireOwnedOrder(deps, tenantId, c.req.param("id"))));
-    }),
+    door("binding", () => c.json(readBinding(deps, c.get("tenantId"), c.req.param("id")))),
   );
 
   app.post("/legal-body-orders/:id/binding/refresh", limit, (c) =>
@@ -263,11 +261,6 @@ export function mountLegalBodyOrderRoutes(
         c.json(await requestGasSeed(gasSeed, c.get("tenantId"), c.req.param("id"))),
       ),
     );
-}
-
-/** The order's binding as the API shows it, from the row as stored. */
-function bindingViewOf(deps: LegalBodyOrderDeps, row: LegalBodyRecord): BindingView {
-  return toBindingView(row, deps.repo.latestBrokenReason(row.legalBodyId));
 }
 
 /**
@@ -294,6 +287,6 @@ async function refreshBinding(
         ? await resolveOrder(deps, orderId)
         : await checkBinding(deps, orderId);
     if (outcome === "unknown") throw refusal("chain_unavailable", 503);
-    return bindingViewOf(deps, requireOwnedOrder(deps, tenantId, orderId));
+    return readBinding(deps, tenantId, orderId);
   });
 }
