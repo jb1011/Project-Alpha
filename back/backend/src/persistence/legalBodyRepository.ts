@@ -28,6 +28,10 @@ import { sqliteUtcTimestamp } from "../util/sqliteTime";
  * chain, factory and agentId, to `broken`, in the same transaction, since one deployment links at
  * most one body per identity.
  *
+ * One event records no move: `recordBrokenReason` appends a `broken` event to a row that is already
+ * broken, to record what its body was found to be since the break (`latestBrokenReason` reads the
+ * newest). It writes nothing to the row itself.
+ *
  * Times: chain times (`linkDeadline`, `deployedAt`, `pointerSeenAt`, a block time) are unix
  * SECONDS; a schedule (`nextBindingCheckAt`, `firstCheckAt`) and a `now` or `since` handed to a
  * listing or a counter are unix MILLISECONDS; `createdAt` is SQLite UTC text.
@@ -275,6 +279,19 @@ export interface LegalBodyRepository {
    */
   markLinked(legalBodyId: string, seenAt: number): MarkLinkedOutcome;
   markBroken(legalBodyId: string, detail: Record<string, unknown>): boolean;
+  /**
+   * Record what a broken body was found to be since its break, with NO state move: one more
+   * `broken` event (actor `system`) on a row that was linked once and is not linked now, `broken`
+   * or `superseded` with a pointer seen, so `latestBrokenReason` reads it. The row itself is not
+   * written: its state, its schedule and its `updatedAt` stay as they were, so a time counted from
+   * the break still counts from the break. False, with nothing written, for any other row (an
+   * unknown id included). A reason that is not a non-empty string throws a `LegalBodyInputError`
+   * before anything is written. The detail follows `recordEvent`'s rules.
+   */
+  recordBrokenReason(
+    legalBodyId: string,
+    detail: { reason: string } & Record<string, unknown>,
+  ): boolean;
   /**
    * `deployed` | `broken` → `superseded`: the body gives its agentId up, which frees it for a new
    * link. Not final. Which body an identity's owner names is decided on chain, where a body that
@@ -1195,6 +1212,31 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       null,
       detail,
     );
+  }
+
+  recordBrokenReason(
+    legalBodyId: string,
+    detail: { reason: string } & Record<string, unknown>,
+  ): boolean {
+    const reason: unknown = detail?.reason;
+    if (typeof reason !== "string" || reason.length === 0)
+      throw new LegalBodyInputError(
+        `a broken reason is a non-empty string, got ${typeof reason === "string" ? "an empty string" : typeof reason}`,
+      );
+    // Immediate: the state is read and the event written under the write lock, so the row cannot
+    // be linked in between.
+    return this.db
+      .transaction((): boolean => {
+        const row = this.stmts.findById.get(legalBodyId) as Row | undefined;
+        const linkedOnceNotNow =
+          row !== undefined &&
+          (row.binding_state === "broken" ||
+            (row.binding_state === "superseded" && row.pointer_seen_at !== null));
+        if (!linkedOnceNotNow) return false;
+        this.recordEvent(legalBodyId, "broken", "system", null, detail);
+        return true;
+      })
+      .immediate();
   }
 
   supersede(

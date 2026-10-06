@@ -26,6 +26,12 @@ import { type LegalBodyOrderDeps, assertThisDeployment } from "./orders";
  * here: a body never linked stays `deployed` or `superseded` until its pointer is written, and a
  * broken one stays `broken`.
  *
+ * A body last found winding down has its status read again on every check, at the same block,
+ * after the pointer: once its dissolution is final the row records `dissolved`, and once a veto
+ * makes it active again the row records `not_linked`, which serves its pointer intent again. Such
+ * a record is one more `broken` event with no state move (`recordBrokenReason`), so the row's last
+ * state move, which its broken schedule counts from, stays the break.
+ *
  * ONE WRITER PER ORDER: the caller holds the order's lock (`orderLockKey`), the sweeper or the
  * binding refresh door. This module takes no lock: the lock is not re-entrant.
  *
@@ -43,8 +49,8 @@ import { type LegalBodyOrderDeps, assertThisDeployment } from "./orders";
  *  - `linked`: every 24 hours, for as long as it is linked;
  *  - broken (`broken`, or `superseded` after a pointer was seen): an hour, doubling to 24 hours,
  *    until 30 days after the row's last state move (`updatedAt`, which only a move changes). A
- *    body found winding down stays on this leg, so a veto is seen, but carries no pointer intent:
- *    the factory does not count a pointer to it while it winds down;
+ *    body found winding down stays on this leg, so a veto or a final dissolution is seen, but
+ *    carries no pointer intent: the factory does not count a pointer to it while it winds down;
  *  - a body found dissolved: no further check and no pointer intent, since a dissolution, once
  *    final, cannot be undone. A refresh still reads it.
  */
@@ -157,8 +163,8 @@ function legEndsAt(row: LegalBodyRecord, leg: Leg): number | undefined {
 
 /** The pointer the owner should write for this order, or none: only a created body that is not
  *  linked now, and never one last found winding down or dissolved, which a pointer would not link
- *  (a winding-down body that a veto made active again is linked by the check if its pointer
- *  still names it). */
+ *  (a check that finds a winding-down body active again records `not_linked`, and the intent
+ *  comes back). */
 export function pointerIntent(
   row: LegalBodyRecord,
   latestBrokenReason: string | undefined,
@@ -215,12 +221,14 @@ export function toBindingView(
 type Reading =
   | { move: "none" }
   | { move: "link"; seenAt: number; block: number }
-  | { move: "break"; reason: (typeof BREAK_REASONS)[keyof typeof BREAK_REASONS]; block: number };
+  | { move: "break"; reason: (typeof BREAK_REASONS)[keyof typeof BREAK_REASONS]; block: number }
+  | { move: "reason"; reason: typeof NOT_LINKED | typeof DISSOLVED; block: number };
 
 /** What this check moved. */
 type Moved =
   | { outcome: "linked"; replaced: string[]; block: number }
   | { outcome: "broken"; reason: string; block: number }
+  | { outcome: "reason_changed"; reason: string; block: number }
   | { outcome: "unchanged" };
 
 /**
@@ -237,7 +245,11 @@ type Moved =
  *     interval of an hour; a linked row is `unchanged`.
  *  4. It names nothing or another body: a linked row's body status is read at the same block, and
  *     the row is broken with the reason that status gives: `not_linked` (active), `winding_down`
- *     or `dissolved` (`broken`). Any other row is `unchanged`.
+ *     or `dissolved` (`broken`). A row last broken with `winding_down` (`broken`, or `superseded`
+ *     after a pointer was seen) has its status read at the same block too: `dissolved` or
+ *     `active` is recorded as that row's new reason (`dissolved`, or `not_linked`), with no state
+ *     move, and still `winding_down` records nothing. All of these, and any other row, are
+ *     `unchanged`.
  *  5. The schedule is set from `nextBindingSchedule`, or cleared, in the transaction of the move.
  * A throw from the chain is `unknown`: nothing moves, and the schedule moves forward by its
  * interval. A throw from the database is not the chain's, and propagates.
@@ -259,6 +271,7 @@ export async function checkBinding(
   if (agentId === null || bodyAddress === null)
     throw new Error(`legal body ${id} is ${row.bindingState} without its identity or body`);
   const agent = BigInt(agentId);
+  const lastBreak = breakReason(row, deps.repo.latestBrokenReason(id));
 
   // 2. to 4.: the chain's answer, at one block.
   let reading: Reading;
@@ -277,6 +290,13 @@ export async function checkBinding(
       stage = "body_status";
       const status = await deps.chain.bodyStatus(bodyAddress, head.number);
       reading = { move: "break", reason: BREAK_REASONS[status], block };
+    } else if (lastBreak === WINDING_DOWN) {
+      stage = "body_status";
+      const status = await deps.chain.bodyStatus(bodyAddress, head.number);
+      reading =
+        status === "winding_down"
+          ? { move: "none" }
+          : { move: "reason", reason: BREAK_REASONS[status], block };
     } else {
       reading = { move: "none" };
     }
@@ -299,7 +319,8 @@ export async function checkBinding(
     return made;
   });
   logMove(id, moved);
-  return moved.outcome;
+  // A reason recorded since the break is no state move.
+  return moved.outcome === "reason_changed" ? "unchanged" : moved.outcome;
 }
 
 /** A row of this deployment, by the one rule the doors apply (`assertThisDeployment`). */
@@ -334,6 +355,13 @@ function applyReading(deps: LegalBodyOrderDeps, id: string, reading: Reading): M
       return deps.repo.markBroken(id, { reason: reading.reason, observedAtBlock: reading.block })
         ? { outcome: "broken", reason: reading.reason, block: reading.block }
         : { outcome: "unchanged" };
+    case "reason":
+      return deps.repo.recordBrokenReason(id, {
+        reason: reading.reason,
+        observedAtBlock: reading.block,
+      })
+        ? { outcome: "reason_changed", reason: reading.reason, block: reading.block }
+        : { outcome: "unchanged" };
     case "none":
       return { outcome: "unchanged" };
   }
@@ -358,7 +386,7 @@ function reschedule(deps: LegalBodyOrderDeps, before: LegalBodyRecord): void {
   else if (row.nextBindingCheckAt !== null) deps.repo.scheduleBindingCheck(id, null, null);
 }
 
-/** One line per move; an unchanged binding writes none. */
+/** One line per move or recorded reason; an unchanged binding writes none. */
 function logMove(orderId: string, moved: Moved): void {
   switch (moved.outcome) {
     case "linked":
@@ -371,10 +399,11 @@ function logMove(orderId: string, moved: Moved): void {
       });
       return;
     case "broken":
+    case "reason_changed":
       opsLog("legal_body_binding", {
         level: "info",
         orderId,
-        outcome: "broken",
+        outcome: moved.outcome,
         reason: moved.reason,
         block: moved.block,
       });

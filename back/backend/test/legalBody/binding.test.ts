@@ -306,13 +306,16 @@ describe("checkBinding moves the row by what the pointer names", () => {
     chain.bodyStatus.mockResolvedValue("winding_down");
     expect(await checkBinding(deps(), row.legalBodyId)).toBe("broken");
 
-    // Still winding down an hour later: the pointer does not pass, and the wait doubles.
+    // Still winding down an hour later: the pointer does not pass, the status is read again and
+    // has not changed, and the wait doubles.
     clock = rowOf(row.legalBodyId).nextBindingCheckAt ?? 0;
     expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
     expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBe(clock + 2 * HOUR);
-    expect(chain.bodyStatus).toHaveBeenCalledTimes(1);
+    expect(chain.bodyStatus).toHaveBeenCalledTimes(2);
+    expect(brokenEvents(row.legalBodyId)).toHaveLength(1);
 
-    // The guardian vetoes the dissolution: the body is active again and the pointer passes.
+    // The guardian vetoes the dissolution: the body is active again and the pointer passes, so
+    // the row links, with no status read.
     clock = rowOf(row.legalBodyId).nextBindingCheckAt ?? 0;
     chain.linkedLegalBody.mockResolvedValue(bodyOf(row));
     expect(await checkBinding(deps(), row.legalBodyId)).toBe("linked");
@@ -321,6 +324,7 @@ describe("checkBinding moves the row by what the pointer names", () => {
     expect(after.bindingState).toBe("linked");
     expect(after.pointerSeenAt).toBe(nowSeconds());
     expect(after.nextBindingCheckAt).toBe(clock + DAY);
+    expect(chain.bodyStatus).toHaveBeenCalledTimes(2);
   });
 
   test("a broken body the pointer names again becomes linked, seen at the new head's time", async () => {
@@ -441,13 +445,14 @@ describe("checkBinding leaves the row's state when the pointer has not moved", (
     expect(chain.bodyStatus).not.toHaveBeenCalled();
   });
 
-  test("a body broken because it was dissolved, checked again, stays off the schedule", async () => {
+  test("a body broken because it was dissolved, checked again, stays off the schedule, with no status read", async () => {
     const row = brokenOrder("dissolved");
 
     expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
 
     expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBeNull();
     expect(rowOf(row.legalBodyId).bindingCheckIntervalMs).toBeNull();
+    expect(chain.bodyStatus).not.toHaveBeenCalled();
   });
 
   test("a deployed body never linked within 7 days of its creation leaves the schedule", async () => {
@@ -469,6 +474,138 @@ describe("checkBinding leaves the row's state when the pointer has not moved", (
     expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
 
     expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBeNull();
+  });
+});
+
+/** A body broken when it was found winding down, checked every two hours, with its last state
+ *  move a day back, so a write that moved the row would show. */
+function windingDownOrder(p: { superseded?: boolean } = {}): LegalBodyRecord {
+  const id = brokenOrder("winding_down").legalBodyId;
+  if (p.superseded)
+    expect(s.repo.supersede(id, "lb_replacement_order_placeholder_0002")).toBe(true);
+  db.prepare("UPDATE legal_bodies SET updated_at = ? WHERE legal_body_id = ?").run(
+    sqliteUtcTimestamp(clock - DAY),
+    id,
+  );
+  return rowOf(id);
+}
+
+describe("a body last found winding down has its status read again, at the same block", () => {
+  test("dissolved since: dissolved is recorded with no state move, and the row leaves the schedule with no intent", async () => {
+    const row = windingDownOrder();
+    chain.bodyStatus.mockResolvedValue("dissolved");
+
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
+
+    const after = rowOf(row.legalBodyId);
+    expect(after.bindingState).toBe("broken");
+    expect(after.updatedAt).toBe(row.updatedAt);
+    expect(brokenEvents(row.legalBodyId).map((e) => e.detail)).toEqual([
+      { reason: "winding_down", observedAtBlock: 8_500 },
+      { reason: "dissolved", observedAtBlock: Number(HEAD_NUMBER) },
+    ]);
+    expect(after.nextBindingCheckAt).toBeNull();
+    expect(after.bindingCheckIntervalMs).toBeNull();
+    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toBeNull();
+
+    expect(chain.head).toHaveBeenCalledTimes(1);
+    expect(chain.linkedLegalBody).toHaveBeenCalledWith(BigInt(agentOf(row)), HEAD_NUMBER);
+    expect(chain.bodyStatus).toHaveBeenCalledTimes(1);
+    expect(chain.bodyStatus).toHaveBeenCalledWith(bodyOf(row), HEAD_NUMBER);
+    expect(chain.linkedLegalBody.mock.invocationCallOrder[0] ?? 0).toBeLessThan(
+      chain.bodyStatus.mock.invocationCallOrder[0] ?? 0,
+    );
+    expect(opsLines()).toEqual([
+      expect.objectContaining({
+        opslog: "legal_body_binding",
+        orderId: row.legalBodyId,
+        outcome: "reason_changed",
+        reason: "dissolved",
+        block: Number(HEAD_NUMBER),
+      }),
+    ]);
+  });
+
+  test("active again (a veto) while the pointer does not pass: not_linked is recorded, the intent is served again, and the broken schedule goes on", async () => {
+    const row = windingDownOrder();
+    chain.bodyStatus.mockResolvedValue("active");
+
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
+
+    const after = rowOf(row.legalBodyId);
+    expect(after.bindingState).toBe("broken");
+    expect(after.updatedAt).toBe(row.updatedAt);
+    expect(s.repo.latestBrokenReason(row.legalBodyId)).toBe("not_linked");
+    expect(brokenEvents(row.legalBodyId).map((e) => e.detail)).toEqual([
+      { reason: "winding_down", observedAtBlock: 8_500 },
+      { reason: "not_linked", observedAtBlock: Number(HEAD_NUMBER) },
+    ]);
+    // Not started over: the row waits its two hours and doubles them.
+    expect(after.nextBindingCheckAt).toBe(clock + 2 * HOUR);
+    expect(after.bindingCheckIntervalMs).toBe(4 * HOUR);
+    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toEqual({
+      action: "setLegalBodyPointer",
+      agentId: agentOf(row),
+      body: bodyOf(row),
+      chainId: CHAIN_ID,
+    });
+  });
+
+  test("still winding down: nothing is recorded, and the wait doubles", async () => {
+    const row = windingDownOrder();
+    chain.bodyStatus.mockResolvedValue("winding_down");
+
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
+
+    const after = rowOf(row.legalBodyId);
+    expect(brokenEvents(row.legalBodyId)).toHaveLength(1);
+    expect(after.nextBindingCheckAt).toBe(clock + 2 * HOUR);
+    expect(after.bindingCheckIntervalMs).toBe(4 * HOUR);
+    expect(chain.bodyStatus).toHaveBeenCalledWith(bodyOf(row), HEAD_NUMBER);
+    expect(opsLines()).toEqual([]);
+  });
+
+  test("a superseded body that was linked once and last found winding down is read the same way", async () => {
+    const row = windingDownOrder({ superseded: true });
+    expect(row.bindingState).toBe("superseded");
+    chain.bodyStatus.mockResolvedValue("dissolved");
+
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
+
+    const after = rowOf(row.legalBodyId);
+    expect(after.bindingState).toBe("superseded");
+    expect(s.repo.latestBrokenReason(row.legalBodyId)).toBe("dissolved");
+    expect(after.nextBindingCheckAt).toBeNull();
+    expect(toBindingView(after, "dissolved").intent).toBeNull();
+  });
+
+  test("a reason recorded since the break does not move it: the 30 days still count from the break", async () => {
+    const row = windingDownOrder();
+    db.prepare("UPDATE legal_bodies SET updated_at = ? WHERE legal_body_id = ?").run(
+      sqliteUtcTimestamp(clock - 30 * DAY),
+      row.legalBodyId,
+    );
+    chain.bodyStatus.mockResolvedValue("active");
+
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unchanged");
+
+    expect(s.repo.latestBrokenReason(row.legalBodyId)).toBe("not_linked");
+    expect(rowOf(row.legalBodyId).updatedAt).toBe(sqliteUtcTimestamp(clock - 30 * DAY));
+    expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBeNull();
+  });
+
+  test("a status read that throws is unknown: nothing is recorded, and the schedule moves forward", async () => {
+    const row = windingDownOrder();
+    chain.bodyStatus.mockRejectedValue(new TransportFailure());
+
+    expect(await checkBinding(deps(), row.legalBodyId)).toBe("unknown");
+
+    expect(brokenEvents(row.legalBodyId)).toHaveLength(1);
+    expect(rowOf(row.legalBodyId).nextBindingCheckAt).toBe(clock + 2 * HOUR);
+    expect(lines.join("\n")).not.toMatch(/rpc\.example|key-in-path|HTTP request failed/);
+    expect(opsLines()).toEqual([
+      expect.objectContaining({ outcome: "unknown", stage: "body_status" }),
+    ]);
   });
 });
 
