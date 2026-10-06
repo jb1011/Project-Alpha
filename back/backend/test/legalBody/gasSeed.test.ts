@@ -4,8 +4,8 @@
  * identity's pointer to its legal body.
  *
  * The database is real (in memory), and so is the platform's outflow meter over it. The owner's
- * code and balance and the send are fakes each test steers; the order deps' chain port throws on
- * any member, since the seed reads none of it. The door's tests go through the app with a real
+ * code and balance, the transfer's estimate, its preparation and its send are fakes each test
+ * steers; the order deps' chain port throws on any member, since the seed reads none of it. The door's tests go through the app with a real
  * session. Every name, company and filing number is an invention, and every key is one of anvil's
  * published test accounts.
  */
@@ -14,6 +14,7 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { type Address, type Hex, getAddress, keccak256, parseEther, toHex } from "viem";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { PreparedPlatformTx } from "../../src/adapters/arc/arcAdapter";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
 import { loadConfig } from "../../src/config/env";
 import { ApiError } from "../../src/errors";
@@ -94,15 +95,22 @@ const nowSeconds = () => Math.floor(Date.now() / 1_000);
 /** The gas a plain transfer to an address with no code takes. */
 const PLAIN_TRANSFER_GAS = 21_000n;
 
-/** The owner's two reads, the transfer's estimate and the send, each a mock a test can steer. By
- *  default the owner has no code and no balance, the transfer takes a plain transfer's gas, and
- *  the send answers `SEED_TX`. */
+/** A transfer as the fake prepares it: what it was asked for, and nothing else. */
+const preparedTransfer = (to: Address, value: bigint, gas: bigint) =>
+  ({ to, value, gas }) as unknown as PreparedPlatformTx;
+
+/** The owner's two reads, the transfer's estimate, its preparation and its send, each a mock a
+ *  test can steer. By default the owner has no code and no balance, the transfer takes a plain
+ *  transfer's gas, and the send answers `SEED_TX`. */
 function fakeOwnerChain() {
   return {
     readCode: vi.fn<GasSeedDeps["readCode"]>(async () => undefined),
     readBalance: vi.fn<GasSeedDeps["readBalance"]>(async () => 0n),
     estimateTransferGas: vi.fn<GasSeedDeps["estimateTransferGas"]>(async () => PLAIN_TRANSFER_GAS),
-    sendNative: vi.fn<GasSeedDeps["sendNative"]>(async () => SEED_TX),
+    prepareTransfer: vi.fn<GasSeedDeps["prepareTransfer"]>(async (to, value, gas) =>
+      preparedTransfer(to, value, gas),
+    ),
+    sendPrepared: vi.fn<GasSeedDeps["sendPrepared"]>(async () => SEED_TX),
   };
 }
 type OwnerChain = ReturnType<typeof fakeOwnerChain>;
@@ -149,7 +157,8 @@ function seedDeps(
     readBalance: ownerChain.readBalance,
     estimateTransferGas: ownerChain.estimateTransferGas,
     checkOutflow: vi.fn((valueAtomic: bigint) => meter.check(valueAtomic)),
-    sendNative: ownerChain.sendNative,
+    prepareTransfer: ownerChain.prepareTransfer,
+    sendPrepared: ownerChain.sendPrepared,
     recordOutflow: vi.fn((valueAtomic: bigint, hash: Hex | null) =>
       meter.record("gas_seed", valueAtomic, hash),
     ),
@@ -248,7 +257,8 @@ function nothingTouched(d: GasSeedDeps): void {
   expect(ownerChain.readBalance).not.toHaveBeenCalled();
   expect(ownerChain.estimateTransferGas).not.toHaveBeenCalled();
   expect(d.checkOutflow).not.toHaveBeenCalled();
-  expect(ownerChain.sendNative).not.toHaveBeenCalled();
+  expect(ownerChain.prepareTransfer).not.toHaveBeenCalled();
+  expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
   expect(outflowRows()).toEqual([]);
 }
 
@@ -268,7 +278,12 @@ describe("a key-controlled owner below the amount", () => {
     expect(ownerChain.readBalance.mock.calls).toEqual([[owner]]);
     expect(ownerChain.estimateTransferGas.mock.calls).toEqual([[owner, SEED_WEI]]);
     // The send carries the seed's gas cap as its gas limit.
-    expect(ownerChain.sendNative.mock.calls).toEqual([[owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT]]);
+    expect(ownerChain.prepareTransfer.mock.calls).toEqual([
+      [owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT],
+    ]);
+    expect(ownerChain.sendPrepared.mock.calls).toEqual([
+      [preparedTransfer(owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT)],
+    ]);
     // The meter counts 6-decimal USDC: the native value divided by 10^12.
     expect(d.checkOutflow).toHaveBeenCalledWith(SEED_MICRO_USDC);
     expect(d.recordOutflow).toHaveBeenCalledWith(SEED_MICRO_USDC, SEED_TX);
@@ -286,7 +301,7 @@ describe("a key-controlled owner below the amount", () => {
     // Once per tenant, ever: neither another of its orders nor the same one is seeded again.
     for (const row of [second, first])
       await refused(() => requestGasSeed(d, tenant, row.legalBodyId), "gas_seed_used", 409);
-    expect(ownerChain.sendNative).toHaveBeenCalledTimes(1);
+    expect(ownerChain.sendPrepared).toHaveBeenCalledTimes(1);
     expect(seedEvents(second.legalBodyId)).toEqual([]);
     expect(seedCounts(tenant)).toEqual({ requested: 1, seeded: 1 });
     expect(outflowRows()).toHaveLength(1);
@@ -330,7 +345,7 @@ describe("a key-controlled owner below the amount", () => {
     expect(losers).toHaveLength(1);
     expect(losers[0]?.reason).toBeInstanceOf(ApiError);
     expect(losers[0]?.reason).toMatchObject({ code: "gas_seed_used", status: 409 });
-    expect(ownerChain.sendNative).toHaveBeenCalledTimes(1);
+    expect(ownerChain.sendPrepared).toHaveBeenCalledTimes(1);
     expect(seedCounts(tenant)).toEqual({ requested: 1, seeded: 1 });
     expect(outflowRows()).toEqual([{ path: "gas_seed", amount: 50_000, ref: SEED_TX }]);
   });
@@ -415,7 +430,7 @@ describe("refused", () => {
     expect(ownerChain.readBalance).not.toHaveBeenCalled();
     expect(ownerChain.estimateTransferGas).not.toHaveBeenCalled();
     expect(d.checkOutflow).not.toHaveBeenCalled();
-    expect(ownerChain.sendNative).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
     expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
   });
 
@@ -435,7 +450,7 @@ describe("refused", () => {
       status: "sent",
       txHash: SEED_TX,
     });
-    expect(ownerChain.sendNative).toHaveBeenCalledTimes(2);
+    expect(ownerChain.sendPrepared).toHaveBeenCalledTimes(2);
   });
 
   test("an owner holding the amount or more answers 409 not_needed, and a refusal spends nothing: one wei below, the same tenant is seeded", async () => {
@@ -448,7 +463,7 @@ describe("refused", () => {
     }
     expect(ownerChain.estimateTransferGas).not.toHaveBeenCalled();
     expect(d.checkOutflow).not.toHaveBeenCalled();
-    expect(ownerChain.sendNative).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
     expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
 
     ownerChain.readBalance.mockResolvedValueOnce(SEED_WEI - 1n);
@@ -466,7 +481,7 @@ describe("refused", () => {
     await refused(() => requestGasSeed(d, tenant, row.legalBodyId), "owner_pays_own_gas", 409);
     expect(ownerChain.estimateTransferGas.mock.calls).toEqual([[owner, SEED_WEI]]);
     expect(d.checkOutflow).not.toHaveBeenCalled();
-    expect(ownerChain.sendNative).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
     expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
     expect(outflowRows()).toEqual([]);
 
@@ -475,7 +490,12 @@ describe("refused", () => {
       status: "sent",
       txHash: SEED_TX,
     });
-    expect(ownerChain.sendNative.mock.calls).toEqual([[owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT]]);
+    expect(ownerChain.prepareTransfer.mock.calls).toEqual([
+      [owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT],
+    ]);
+    expect(ownerChain.sendPrepared.mock.calls).toEqual([
+      [preparedTransfer(owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT)],
+    ]);
   });
 
   test("an estimate that throws answers 503 chain_unavailable, with no upstream text, and nothing is recorded", async () => {
@@ -496,7 +516,7 @@ describe("refused", () => {
     ]);
     expect(lines.join("\n")).not.toContain("http");
     expect(d.checkOutflow).not.toHaveBeenCalled();
-    expect(ownerChain.sendNative).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
     expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
     expect(outflowRows()).toEqual([]);
   });
@@ -523,8 +543,9 @@ describe("the outflow meter is asked first, and the request is recorded before t
     await refused(() => requestGasSeed(d, tenant, row.legalBodyId), "busy", 503);
 
     expect(checkOutflow.mock.calls).toEqual([[SEED_MICRO_USDC]]);
+    expect(ownerChain.prepareTransfer).not.toHaveBeenCalled();
     expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
-    expect(ownerChain.sendNative).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
     expect(recordOutflow).not.toHaveBeenCalled();
 
     // An hour later the earlier outflow has left the window, and the tenant's seed is still there.
@@ -545,7 +566,7 @@ describe("the outflow meter is asked first, and the request is recorded before t
     const first = deployed(tenant);
     const second = deployed(tenant);
     let requestedAtSend: number | undefined;
-    ownerChain.sendNative.mockImplementation(async () => {
+    ownerChain.sendPrepared.mockImplementation(async () => {
       requestedAtSend = s.repo.countEventsByTenant(tenant, "gas_seed_requested");
       throw new TransportFailure();
     });
@@ -580,7 +601,7 @@ describe("the outflow meter is asked first, and the request is recorded before t
 
     // The seed is spent: the tenant's next request is refused, and nothing is sent again.
     await refused(() => requestGasSeed(d, tenant, second.legalBodyId), "gas_seed_used", 409);
-    expect(ownerChain.sendNative).toHaveBeenCalledTimes(1);
+    expect(ownerChain.sendPrepared).toHaveBeenCalledTimes(1);
   });
 
   test("a seed whose send threw counts against the platform's outflow ceiling as a sent one does", async () => {
@@ -594,7 +615,7 @@ describe("the outflow meter is asked first, and the request is recorded before t
       checkOutflow: (valueAtomic) => tight.check(valueAtomic),
       recordOutflow: (valueAtomic, hash) => tight.record("gas_seed", valueAtomic, hash),
     });
-    ownerChain.sendNative.mockRejectedValueOnce(new TransportFailure());
+    ownerChain.sendPrepared.mockRejectedValueOnce(new TransportFailure());
     const mine = deployed(tenant);
     const theirs = deployed(other);
 
@@ -604,7 +625,37 @@ describe("the outflow meter is asked first, and the request is recorded before t
     // Another tenant's seed would take the window over its ceiling: refused, and its seed is kept.
     await refused(() => requestGasSeed(d, other, theirs.legalBodyId), "busy", 503);
     expect(seedCounts(other)).toEqual({ requested: 0, seeded: 0 });
-    expect(ownerChain.sendNative).toHaveBeenCalledTimes(1);
+    expect(ownerChain.sendPrepared).toHaveBeenCalledTimes(1);
+  });
+
+  test("the transfer is prepared before the seed is recorded: a prepare that throws answers 503 chain_unavailable and records nothing, and the tenant's next request is seeded", async () => {
+    const row = deployed(tenant);
+    ownerChain.prepareTransfer.mockRejectedValueOnce(new TransportFailure());
+    const d = seedDeps();
+    lines.length = 0;
+
+    await refused(() => requestGasSeed(d, tenant, row.legalBodyId), "chain_unavailable", 503);
+
+    expect(opsLines()).toEqual([
+      expect.objectContaining({
+        opslog: "legal_body_chain_unavailable",
+        orderId: row.legalBodyId,
+        stage: "gas_seed_prepare",
+        errorName: "HttpRequestError",
+      }),
+    ]);
+    expect(lines.join("\n")).not.toContain("http");
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
+    expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
+    expect(outflowRows()).toEqual([]);
+
+    // Nothing was spent: the same tenant asks again, and is seeded.
+    expect(await requestGasSeed(d, tenant, row.legalBodyId)).toEqual({
+      status: "sent",
+      txHash: SEED_TX,
+    });
+    expect(seedCounts(tenant)).toEqual({ requested: 1, seeded: 1 });
+    expect(outflowRows()).toEqual([{ path: "gas_seed", amount: 50_000, ref: SEED_TX }]);
   });
 });
 
@@ -661,7 +712,12 @@ describe("the door, POST /legal-body-orders/:id/gas-seed", () => {
     );
     expect(sent).toMatchObject({ status: 200, body: { status: "sent", txHash: SEED_TX } });
     expect(Object.keys(sent.body).sort()).toEqual(["status", "txHash"]);
-    expect(ownerChain.sendNative.mock.calls).toEqual([[owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT]]);
+    expect(ownerChain.prepareTransfer.mock.calls).toEqual([
+      [owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT],
+    ]);
+    expect(ownerChain.sendPrepared.mock.calls).toEqual([
+      [preparedTransfer(owner, SEED_WEI, SEED_TRANSFER_GAS_LIMIT)],
+    ]);
   });
 
   test("a waiver tenant is refused with 403, another tenant's order is the uniform 404, a caller with no session is a 401, and nobody is seeded", async () => {
@@ -692,7 +748,7 @@ describe("the door, POST /legal-body-orders/:id/gas-seed", () => {
     expect((await call(app, "POST", gasSeedPath(row.legalBodyId), undefined)).status).toBe(401);
 
     expect(ownerChain.readCode).not.toHaveBeenCalled();
-    expect(ownerChain.sendNative).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
     for (const who of [tenant, other, waived.address])
       expect(seedCounts(who)).toEqual({ requested: 0, seeded: 0 });
   });
@@ -724,7 +780,7 @@ describe("the door, POST /legal-body-orders/:id/gas-seed", () => {
     ]);
     expect(lines.join("\n")).not.toContain("http");
     expect(seedCounts(tenant)).toEqual({ requested: 0, seeded: 0 });
-    expect(ownerChain.sendNative).not.toHaveBeenCalled();
+    expect(ownerChain.sendPrepared).not.toHaveBeenCalled();
   });
 });
 
@@ -735,8 +791,8 @@ describe("the door, POST /legal-body-orders/:id/gas-seed", () => {
  * What it protects: the seed exists wherever the order doors do, over the same order deps; its
  * amount is the configured one, 0 (off) when unset; its two reads and the transfer's estimate are
  * the public client's, the estimate made from the platform key's address; the meter is asked and
- * fed on the `gas_seed` path; the send is the platform's one native send, with the gas limit the
- * seed gives it; and the API is handed the seed beside the doors.
+ * fed on the `gas_seed` path; the send is the platform's native send in its two halves, prepared
+ * with the gas limit the seed gives it; and the API is handed the seed beside the doors.
  */
 test("the composition root builds the seed's deps beside the order doors' and hands them to the API", () => {
   const main = readFileSync(join(import.meta.dirname, "..", "..", "src", "api", "main.ts"), "utf8");
@@ -752,9 +808,12 @@ test("the composition root builds the seed's deps beside the order doors' and ha
     /estimateTransferGas: \(to, value\) =>\s+publicClient\.estimateGas\(\{ account: executor\.address, to, value \}\),/,
   );
   expect(built).toMatch(/checkOutflow: \(valueAtomic\) => outflows\.check\(valueAtomic\),/);
+  // The send in its two halves: the transfer prepared with no lock held, then numbered, signed and
+  // broadcast in the platform key's send lock.
   expect(built).toMatch(
-    /sendNative: \(to, value, gas\) => arc\.sendNativeAsPlatform\(to, value, gas\),/,
+    /prepareTransfer: \(to, value, gas\) => arc\.prepareNativeAsPlatform\(to, value, gas\),/,
   );
+  expect(built).toMatch(/sendPrepared: \(prepared\) => arc\.sendPreparedAsPlatform\(prepared\),/);
   expect(built).toMatch(
     /recordOutflow: \(valueAtomic, hash\) =>\s+outflows\.record\("gas_seed", valueAtomic, hash\),/,
   );

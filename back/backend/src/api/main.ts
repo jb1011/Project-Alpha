@@ -614,9 +614,10 @@ async function main() {
    * when unset. The owner's code and balance are read through the public client, and so is the
    * transfer's gas, estimated from the platform key's address, the one the adapter sends from. The
    * platform's outflow meter is asked before a seed is recorded and fed once it is sent, on the
-   * `gas_seed` path the agent pockets' seeds count on too. The send is the adapter's native send,
-   * with the gas limit the seed gives it, through the one chokepoint every platform-signed
-   * transaction shares, so a seed takes its nonce like any other.
+   * `gas_seed` path the agent pockets' seeds count on too. The send is the adapter's native send
+   * in its two halves: the transfer prepared with the gas limit the seed gives it and no lock
+   * held, before the seed is recorded; then numbered, signed and broadcast through the one
+   * chokepoint every platform-signed transaction shares, so a seed takes its nonce like any other.
    */
   const legalBodyGasSeed: GasSeedDeps | undefined = legalBodyOrders
     ? {
@@ -627,7 +628,8 @@ async function main() {
         estimateTransferGas: (to, value) =>
           publicClient.estimateGas({ account: executor.address, to, value }),
         checkOutflow: (valueAtomic) => outflows.check(valueAtomic),
-        sendNative: (to, value, gas) => arc.sendNativeAsPlatform(to, value, gas),
+        prepareTransfer: (to, value, gas) => arc.prepareNativeAsPlatform(to, value, gas),
+        sendPrepared: (prepared) => arc.sendPreparedAsPlatform(prepared),
         recordOutflow: (valueAtomic, hash) => outflows.record("gas_seed", valueAtomic, hash),
       }
     : undefined;

@@ -277,3 +277,20 @@ test("the platform address is what the lock is keyed on", async () => {
     await expect(nextSenderNonce(adapter.platformAddress!, async () => 4)).resolves.toBe(4);
   });
 });
+
+test("a native transfer in two halves: the prepare fetches with no lock held and sends nothing; the send numbers, signs and broadcasts it under the lock", async () => {
+  const { adapter, sent, broadcasts, preparedInLock } = makeAdapter();
+
+  const prepared = await adapter.prepareNativeAsPlatform(TREASURY, 10n, 60_000n);
+  // The transfer asked for, with the caller's gas limit, and nothing signed or sent yet.
+  expect(prepared).toMatchObject({ to: TREASURY, value: 10n, gas: 60_000n });
+  expect(sent).toEqual([]);
+  expect(preparedInLock).toEqual([false]);
+
+  await expect(adapter.sendPreparedAsPlatform(prepared)).resolves.toMatch(/^0x/);
+  // One signature and one broadcast, both under the lock, with the assigned nonce, and no second
+  // preparation.
+  expect(sent.map((x) => x.via)).toEqual(["signTransaction", "sendRawTransaction"]);
+  expect(broadcasts()[0]!.nonce).toBe(0);
+  expect(preparedInLock).toEqual([false]);
+});

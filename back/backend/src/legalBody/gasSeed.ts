@@ -1,4 +1,5 @@
 import type { Address, Hex } from "viem";
+import type { PreparedPlatformTx } from "../adapters/arc/arcAdapter";
 import { assertRealHuman } from "../api/routes/worldId";
 import { OutflowCeilingError } from "../payments/outflowMeter";
 import {
@@ -29,9 +30,13 @@ import { refusal } from "./sentences";
  *     `owner_pays_own_gas` as well;
  *  4. the platform's outflow meter, asked for the amount in 6-decimal USDC. Over its ceiling: 503
  *     `busy`, with nothing recorded, so a refusal of the meter does not spend the tenant's seed;
- *  5. ONE synchronous transaction: the tenant's requests are counted across all its orders (one is
+ *  5. the transfer is prepared before the seed is recorded: its fees and chain id, with the cap as
+ *     its gas limit, and no lock held. A failure here puts nothing on the wire, so it is the usual
+ *     503 with nothing recorded, and the tenant can ask again;
+ *  6. ONE synchronous transaction: the tenant's requests are counted across all its orders (one is
  *     enough for 409 `gas_seed_used`), and this request is recorded;
- *  6. the send, with the cap as its gas limit; then `gas_seeded` with its hash, then the outflow.
+ *  7. the send, inside the platform key's send lock: the nonce, the signature and the broadcast;
+ *     then `gas_seeded` with its hash, then the outflow.
  *
  * The request is recorded before the send, so a send that fails leaves the seed spent: the tenant
  * cannot ask again, and the operator sees why (a request with no `gas_seeded`, and the line that
@@ -59,9 +64,13 @@ export interface GasSeedDeps {
   /** The platform outflow meter's check, in 6-decimal USDC: throws `OutflowCeilingError` when the
    *  amount would take the window over its ceiling. */
   checkOutflow(valueAtomic: bigint): void;
-  /** The platform's native send, in wei, with `gas` as its gas limit:
-   *  `ArcAdapter.sendNativeAsPlatform`. */
-  sendNative(to: Address, value: bigint, gas: bigint): Promise<Hex>;
+  /** The first half of the platform's native send: the transfer of `value` wei to `to`, with `gas`
+   *  as its gas limit, prepared with no lock held. Nothing is signed or sent:
+   *  `ArcAdapter.prepareNativeAsPlatform`. */
+  prepareTransfer(to: Address, value: bigint, gas: bigint): Promise<PreparedPlatformTx>;
+  /** The second half: the prepared transfer numbered, signed and broadcast inside the platform
+   *  key's send lock, answering the node's hash: `ArcAdapter.sendPreparedAsPlatform`. */
+  sendPrepared(prepared: PreparedPlatformTx): Promise<Hex>;
   /** Records the outflow on the meter's `gas_seed` path, in 6-decimal USDC: with the send's hash,
    *  or with none for a send that threw, which the node may still have taken. */
   recordOutflow(valueAtomic: bigint, hash: Hex | null): void;
@@ -131,7 +140,12 @@ export async function requestGasSeed(
     throw err;
   }
 
-  // 5. The write lock is held from the count to the record, so a second request, for this order
+  // 5. Nothing is recorded yet, so a failure here costs the tenant nothing.
+  const prepared = await chainCall(orderId, "gas_seed_prepare", () =>
+    d.prepareTransfer(to, d.amountWei, SEED_TRANSFER_GAS_LIMIT),
+  );
+
+  // 6. The write lock is held from the count to the record, so a second request, for this order
   //    or another of the tenant's, counts this one.
   deps.transaction(() => {
     if (deps.repo.countEventsByTenant(tenantId, "gas_seed_requested") >= 1)
@@ -142,15 +156,15 @@ export async function requestGasSeed(
     });
   });
 
-  // 6. `chainCall` writes the operator's line for a send that throws. The seed is recorded by now,
+  // 7. `chainCall` writes the operator's line for a send that throws. The seed is recorded by now,
   //    so whatever the send did, the answer to its failure says the seed is spent; and since the
   //    node may have taken the transfer, it counts as an outflow, with no hash to name.
-  const txHash = await chainCall(orderId, "gas_seed_send", () =>
-    d.sendNative(to, d.amountWei, SEED_TRANSFER_GAS_LIMIT),
-  ).catch(() => {
-    d.recordOutflow(microUsdc, null);
-    throw refusal("gas_seed_unconfirmed", 503);
-  });
+  const txHash = await chainCall(orderId, "gas_seed_send", () => d.sendPrepared(prepared)).catch(
+    () => {
+      d.recordOutflow(microUsdc, null);
+      throw refusal("gas_seed_unconfirmed", 503);
+    },
+  );
   deps.repo.recordEvent(orderId, "gas_seeded", "system", txHash, null);
   d.recordOutflow(microUsdc, txHash);
   return { status: "sent", txHash };

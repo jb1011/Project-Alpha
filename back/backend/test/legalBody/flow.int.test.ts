@@ -300,7 +300,8 @@ const open = () => ({ take: () => true });
  * builds them: the amount in wei, the owner's code and balance read through the public client, and
  * the transfer's gas estimated through it from the platform key's address, the platform's outflow
  * meter over this database, asked before a seed and fed after it on the `gas_seed` path, and the
- * adapter's native send from the platform key, with the gas limit the seed gives it.
+ * adapter's native send from the platform key in its two halves: the transfer prepared with the
+ * gas limit the seed gives it, then numbered, signed and broadcast in the send lock.
  */
 function deploy(opts: { charging?: boolean; gasSeedUsdc?: string } = {}): Deployment {
   const charging = opts.charging === true;
@@ -352,7 +353,8 @@ function deploy(opts: { charging?: boolean; gasSeedUsdc?: string } = {}): Deploy
     readBalance: (address) => pub.getBalance({ address }),
     estimateTransferGas: (to, value) => pub.estimateGas({ account: executor.address, to, value }),
     checkOutflow: (valueAtomic) => outflows.check(valueAtomic),
-    sendNative: (to, value, gas) => arc.sendNativeAsPlatform(to, value, gas),
+    prepareTransfer: (to, value, gas) => arc.prepareNativeAsPlatform(to, value, gas),
+    sendPrepared: (prepared) => arc.sendPreparedAsPlatform(prepared),
     recordOutflow: (valueAtomic, hash) => outflows.record("gas_seed", valueAtomic, hash),
   };
   const customerDeps = sandboxCustomerCompanyDeps(
