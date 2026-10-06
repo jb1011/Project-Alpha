@@ -533,7 +533,7 @@ describe("who may use the tools", () => {
     expect(snapshot(w)).toEqual(before);
   });
 
-  test("the real-human check's codes are a closed list, the very codes that check throws, each answered with the message the door answers", async () => {
+  test("the real-human check's codes are a closed list, the very codes that check throws, each with its message written as one string literal and answered with the message the door answers", async () => {
     expect([...REAL_HUMAN_CHECK_CODES].sort()).toEqual([
       "guardian_not_verified",
       "unavailable",
@@ -550,6 +550,18 @@ describe("who may use the tools", () => {
       [...check.matchAll(/new ApiError\(\s*"([a-z_]+)"/g)].map((m) => m[1] as string),
     );
     expect([...thrown].sort()).toEqual([...REAL_HUMAN_CHECK_CODES].sort());
+    // Each of those refusals carries its message as one string literal, written in the check: no
+    // variable, no template and no concatenation. That is what makes it safe for a tool to pass
+    // the message on as it is.
+    const refusals = check.match(/new ApiError\(/g) ?? [];
+    const literal = [
+      ...check.matchAll(/new ApiError\(\s*"([a-z_]+)",\s*\d{3},\s*"[^"\\\n]*",?\s*\)/g),
+    ];
+    expect(refusals.length).toBeGreaterThanOrEqual(REAL_HUMAN_CHECK_CODES.size);
+    expect(literal, "a refusal whose message is not one string literal").toHaveLength(
+      refusals.length,
+    );
+    expect(new Set(literal.map((m) => m[1]))).toEqual(thrown);
 
     const cases: [string, World, Address][] = [
       ["unavailable", world({ over: { world: undefined } }), guardian.address],
