@@ -150,7 +150,7 @@ function seedDeps(
     estimateTransferGas: ownerChain.estimateTransferGas,
     checkOutflow: vi.fn((valueAtomic: bigint) => meter.check(valueAtomic)),
     sendNative: ownerChain.sendNative,
-    recordOutflow: vi.fn((valueAtomic: bigint, hash: Hex) =>
+    recordOutflow: vi.fn((valueAtomic: bigint, hash: Hex | null) =>
       meter.record("gas_seed", valueAtomic, hash),
     ),
     ...over,
@@ -541,7 +541,7 @@ describe("the outflow meter is asked first, and the request is recorded before t
     expect(seedCounts(tenant)).toEqual({ requested: 1, seeded: 1 });
   });
 
-  test("a send that throws leaves the request recorded and no gas_seeded, answers 503 gas_seed_unconfirmed, and the seed is spent", async () => {
+  test("a send that throws leaves the request recorded and no gas_seeded, still counts the outflow with no hash, and answers 503 gas_seed_unconfirmed; the seed is spent", async () => {
     const first = deployed(tenant);
     const second = deployed(tenant);
     let requestedAtSend: number | undefined;
@@ -554,13 +554,14 @@ describe("the outflow meter is asked first, and the request is recorded before t
 
     await refused(() => requestGasSeed(d, tenant, first.legalBodyId), "gas_seed_unconfirmed", 503);
 
-    // Recorded before the send, and never followed by a seeded event or an outflow.
+    // Recorded before the send, and never followed by a seeded event.
     expect(requestedAtSend).toBe(1);
     expect(seedEvents(first.legalBodyId).map((e) => e.kind)).toEqual(["gas_seed_requested"]);
     expect(seedCounts(tenant)).toEqual({ requested: 1, seeded: 0 });
-    expect(d.recordOutflow).not.toHaveBeenCalled();
-    expect(outflowRows()).toEqual([]);
-    // One line for the operator: the order, the stage and the error's name, and no URL.
+    // The node may have taken the transfer: it counts as an outflow, with no hash to name.
+    expect(d.recordOutflow).toHaveBeenCalledWith(SEED_MICRO_USDC, null);
+    expect(outflowRows()).toEqual([{ path: "gas_seed", amount: 50_000, ref: null }]);
+    // For the operator: the order, the stage and the error's name, with no URL; then the outflow.
     expect(opsLines()).toEqual([
       expect.objectContaining({
         opslog: "legal_body_chain_unavailable",
@@ -568,11 +569,41 @@ describe("the outflow meter is asked first, and the request is recorded before t
         stage: "gas_seed_send",
         errorName: "HttpRequestError",
       }),
+      expect.objectContaining({
+        opslog: "outflow_recorded",
+        path: "gas_seed",
+        amount: "50000",
+        ref: null,
+      }),
     ]);
     expect(lines.join("\n")).not.toContain("http");
 
     // The seed is spent: the tenant's next request is refused, and nothing is sent again.
     await refused(() => requestGasSeed(d, tenant, second.legalBodyId), "gas_seed_used", 409);
+    expect(ownerChain.sendNative).toHaveBeenCalledTimes(1);
+  });
+
+  test("a seed whose send threw counts against the platform's outflow ceiling as a sent one does", async () => {
+    // A ceiling of 0.09 USDC: one seed of 0.05 fits in it, and a second does not.
+    const tight = buildOutflowMeter(db, {
+      ceilingAtomic: 90_000n,
+      windowMs: HOUR,
+      now: () => meterClock,
+    });
+    const d = seedDeps({
+      checkOutflow: (valueAtomic) => tight.check(valueAtomic),
+      recordOutflow: (valueAtomic, hash) => tight.record("gas_seed", valueAtomic, hash),
+    });
+    ownerChain.sendNative.mockRejectedValueOnce(new TransportFailure());
+    const mine = deployed(tenant);
+    const theirs = deployed(other);
+
+    await refused(() => requestGasSeed(d, tenant, mine.legalBodyId), "gas_seed_unconfirmed", 503);
+    expect(tight.windowSum()).toBe(SEED_MICRO_USDC);
+
+    // Another tenant's seed would take the window over its ceiling: refused, and its seed is kept.
+    await refused(() => requestGasSeed(d, other, theirs.legalBodyId), "busy", 503);
+    expect(seedCounts(other)).toEqual({ requested: 0, seeded: 0 });
     expect(ownerChain.sendNative).toHaveBeenCalledTimes(1);
   });
 });

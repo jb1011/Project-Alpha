@@ -37,7 +37,8 @@ import { refusal } from "./sentences";
  * cannot ask again, and the operator sees why (a request with no `gas_seeded`, and the line that
  * names the order, the stage and the error). That is the side to fail on: the other could seed
  * twice. Its answer is 503 `gas_seed_unconfirmed`, never `chain_unavailable`, whose sentence says
- * that nothing changed.
+ * that nothing changed. It still counts as an outflow, with no hash: the node may have taken the
+ * transfer.
  *
  * Amounts: the native value is in wei (18 decimals). The meter and the recorded request count
  * millionths of a USDC, which on Arc is the native unit: the wei divided by 10^12. The request's
@@ -61,8 +62,9 @@ export interface GasSeedDeps {
   /** The platform's native send, in wei, with `gas` as its gas limit:
    *  `ArcAdapter.sendNativeAsPlatform`. */
   sendNative(to: Address, value: bigint, gas: bigint): Promise<Hex>;
-  /** Records the outflow on the meter's `gas_seed` path, in 6-decimal USDC. */
-  recordOutflow(valueAtomic: bigint, hash: Hex): void;
+  /** Records the outflow on the meter's `gas_seed` path, in 6-decimal USDC: with the send's hash,
+   *  or with none for a send that threw, which the node may still have taken. */
+  recordOutflow(valueAtomic: bigint, hash: Hex | null): void;
 }
 
 /** The seed's gas cap: the most a transfer is estimated at and still sent, and the send's gas
@@ -141,10 +143,12 @@ export async function requestGasSeed(
   });
 
   // 6. `chainCall` writes the operator's line for a send that throws. The seed is recorded by now,
-  //    so whatever the send did, the answer to its failure says the seed is spent.
+  //    so whatever the send did, the answer to its failure says the seed is spent; and since the
+  //    node may have taken the transfer, it counts as an outflow, with no hash to name.
   const txHash = await chainCall(orderId, "gas_seed_send", () =>
     d.sendNative(to, d.amountWei, SEED_TRANSFER_GAS_LIMIT),
   ).catch(() => {
+    d.recordOutflow(microUsdc, null);
     throw refusal("gas_seed_unconfirmed", 503);
   });
   deps.repo.recordEvent(orderId, "gas_seeded", "system", txHash, null);
