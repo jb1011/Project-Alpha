@@ -1674,6 +1674,27 @@ export function migrate(db: Database.Database): void {
   ] as const)
     if (!docCols.includes(col)) db.exec(`ALTER TABLE documents ADD COLUMN ${col} ${type}`);
 
+  // The last annual report the Wyoming registry showed at the operator's check: its report year,
+  // and the date it was filed on. Each column CHECKs its own shape (SQLite accepts a column CHECK
+  // added to a table that holds rows: every existing row is NULL, which it allows); the rules
+  // across fields are the check repository's. A check written before them stays NULL for good (the
+  // no-update trigger), which reads as "not recorded".
+  const checkCols = (
+    db.prepare("PRAGMA table_info(company_checks)").all() as { name: string }[]
+  ).map((c) => c.name);
+  for (const [col, definition] of [
+    [
+      "last_report_period",
+      "INTEGER CHECK (last_report_period IS NULL OR last_report_period BETWEEN 1990 AND 2200)",
+    ],
+    [
+      "last_report_filed_on",
+      "TEXT CHECK (last_report_filed_on IS NULL OR (length(last_report_filed_on) = 10 AND last_report_filed_on GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'))",
+    ],
+  ] as const)
+    if (!checkCols.includes(col))
+      db.exec(`ALTER TABLE company_checks ADD COLUMN ${col} ${definition}`);
+
   // formation_parties: PR 1's shape was keyed by entity_key with no tenant column, which cannot
   // express a party that exists BEFORE its entity does (the intake handle, design §5). Rebuild
   // rather than ALTER: PR 1 shipped no writer for this table — the endpoint that produces rows
