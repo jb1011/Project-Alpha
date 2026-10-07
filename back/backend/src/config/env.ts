@@ -62,6 +62,19 @@ const MAX_TIMER_MS = 2_147_483_647;
 const LEGAL_BODY_AMENDMENT_DELAY_MIN_SECONDS = 172_800;
 const LEGAL_BODY_AMENDMENT_DELAY_MAX_SECONDS = 2_592_000;
 
+/** The largest gas seed a deployment may set, in 6-decimal atomic USDC: 0.05 USDC. */
+const LEGAL_BODY_GAS_SEED_MAX_ATOMIC = 50_000n;
+
+/** A gas seed as LEGAL_BODY_GAS_SEED_USDC takes it: a plain decimal with at most 6 decimals, from 0
+ *  to 0.05. */
+function isGasSeedAmount(value: string): boolean {
+  try {
+    return usdToUnits(value) <= LEGAL_BODY_GAS_SEED_MAX_ATOMIC;
+  } catch {
+    return false;
+  }
+}
+
 /** A setting written with no value (`NAME=`, or only spaces) reads as unset, for the settings that
  *  opt in: a line uncommented without a value must not be read as zero and refuse boot. */
 const blankAsUnset = (v: unknown): unknown =>
@@ -466,6 +479,15 @@ const EnvSchema = z.object({
       .max(MAX_TIMER_MS, { message: `must be at most ${MAX_TIMER_MS} milliseconds` })
       .default(DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS),
   ),
+  /** The gas seed: a native amount the platform sends once per tenant, ever, to an identity's
+   *  owner, so that the owner can pay for its pointer transaction. In USDC, Arc's native unit: a
+   *  plain decimal from 0 to 0.05 with at most 6 decimals. 0 is off. */
+  LEGAL_BODY_GAS_SEED_USDC: z.preprocess(
+    blankAsUnset,
+    z.string().trim().default("0").refine(isGasSeedAmount, {
+      message: "must be a decimal from 0 to 0.05 (USDC) with at most 6 decimals",
+    }),
+  ),
 });
 
 /** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
@@ -525,6 +547,11 @@ export interface Config {
    *  `legalBodyFlow`: loadConfig always sets it, and a reader falls back to
    *  DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS. */
   legalBodySweepIntervalMs?: number;
+  /** The gas seed in USDC, Arc's native unit: a plain decimal from 0 to 0.05 with at most 6
+   *  decimals, checked at load; "0" is off. A string like the agent pockets' gas-seed amounts, made
+   *  wei where it is used. Optional in the TYPE only, like `legalBodyFlow`: loadConfig always sets
+   *  it, and a reader falls back to "0". */
+  legalBodyGasSeedUsdc?: string;
   /** Explicit ENS apex target; absent => the platform signing key (today's behavior). */
   ensApexResolvesTo?: Address;
   guardianAddress?: Address;
@@ -887,6 +914,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       maxCreatesPerDay: e.LEGAL_BODY_MAX_CREATES_PER_DAY,
     },
     legalBodySweepIntervalMs: e.LEGAL_BODY_SWEEP_INTERVAL_MS,
+    legalBodyGasSeedUsdc: e.LEGAL_BODY_GAS_SEED_USDC,
     ensApexResolvesTo: e.ENS_APEX_RESOLVES_TO,
     guardianAddress: e.GUARDIAN_ADDRESS,
     operatorPrivateKey: e.OPERATOR_PRIVATE_KEY,

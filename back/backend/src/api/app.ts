@@ -6,6 +6,7 @@ import { requireAuth } from "../auth/middleware";
 import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
 import type { CustomerCompanyDeps } from "../legalBody/customerCompany";
 import type { EvidenceDeps } from "../legalBody/evidence";
+import type { GasSeedDeps } from "../legalBody/gasSeed";
 import type { LegalBodyOrderDeps } from "../legalBody/orders";
 import { mountMcpRoute } from "../mcp/transport";
 import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
@@ -91,6 +92,12 @@ export interface ApiDeps extends EntityViewDeps {
    * every one of them is a 404.
    */
   legalBodyOrders?: LegalBodyOrderDeps;
+  /**
+   * The gas seed's door, beside the order doors and mounted with them: present wherever
+   * `legalBodyOrders` is, and its `orders` is that same object (the composition root builds both).
+   * Its amount is 0, and the door answers 409 `gas_seed_disabled`, unless the deployment sets one.
+   */
+  legalBodyGasSeed?: GasSeedDeps;
   webOrigin: string;
   nonceStore: import("../auth/nonceStore").NonceStore;
   siweDomain: string;
@@ -438,7 +445,7 @@ export function buildApiApp(deps: ApiDeps) {
   // deployment wires the feature.
   if (deps.legalBodyOrders) {
     protect("/legal-body-orders");
-    mountLegalBodyOrderRoutes(app, deps.legalBodyOrders);
+    mountLegalBodyOrderRoutes(app, deps.legalBodyOrders, deps.legalBodyGasSeed);
   }
   // After the `/companies/*` requireAuth line above, so both document routes inherit auth.
   mountDocumentRoutes(app, deps);

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { hexToString } from "viem";
+import { type Address, type Hex, hexToString } from "viem";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { toJobView } from "../api/jobViews";
@@ -13,6 +13,7 @@ import {
   toEntityViews,
 } from "../api/views";
 import { custodyUnavailableMessage } from "../custody";
+import { ApiError } from "../errors";
 import {
   createFormationParty,
   formationDoorRefusal,
@@ -31,6 +32,14 @@ import { HEDERA_CAIP2, hederaPolicyInput } from "../hedera/policy";
 import type { JobRepository } from "../jobs/jobRepository";
 import type { JobRunner } from "../jobs/jobRunner";
 import { type RecoverOutcome, outcomeJson } from "../jobs/refund";
+import { LEGAL_BODY_POINTER_KEY, readBinding } from "../legalBody/binding";
+import { DEFAULT_LINK_TTL_SECONDS, MAX_SERVED_LINK_TTL_SECONDS } from "../legalBody/link";
+import {
+  MIN_SERVED_LINK_TTL_SECONDS,
+  linkMessage,
+  submitLinkAndCreate,
+} from "../legalBody/linkDoor";
+import { LEGAL_BODY_SENTENCES, refusedLinkSentence, sentenceFor } from "../legalBody/sentences";
 import { opsLog } from "../observability/opsLog";
 import type { EntityPaymentService } from "../payments/entityPayment";
 import { withKeyedLock } from "../payments/keyedMutex";
@@ -120,6 +129,9 @@ export interface McpToolDeps extends EntityViewDeps {
    *  `check_policy` needs to say whether the legal body is spendable. The SAME object `ApiDeps`
    *  holds, so a suspension cannot mean one thing on the lookup and another on the Hedera rail. */
   legalBody?: import("../api/app").ApiDeps["legalBody"];
+  /** The legal-body order flow: the SAME object the order doors are mounted with, present only
+   *  where the feature is on. Absent, the flow's three tools are not registered at all. */
+  legalBodyOrders?: import("../api/app").ApiDeps["legalBodyOrders"];
   /** Injectable clock (ms) for tests; defaults to Date.now. */
   now?: () => number;
 }
@@ -166,6 +178,7 @@ export const MCP_TOOL_DEP_KEYS = [
   "customerFacts",
   "hedera",
   "legalBody",
+  "legalBodyOrders",
   "now",
   // The `EntityViewDeps` half — inherited, and listed here too because this list is about what
   // the TRANSPORT copies, and a view dep that reached REST and not MCP is the bug that started
@@ -316,6 +329,16 @@ function requireProvisionTenantWide(scope: VerifiedKey): ToolRefusal | null {
 }
 
 /**
+ * THE LEGAL-BODY READS' RUNG: the read capability, and a TENANT-WIDE key. A legal-body order
+ * belongs to a tenant, not to an entity, so a key narrowed to one entity reads no order, as it
+ * provisions none. The same answer as the provisioning rung's. `null` = allowed.
+ */
+function requireReadTenantWide(scope: VerifiedKey): ToolRefusal | null {
+  if (!hasCapability(scope, "read") || scope.entityId !== null) return refuse("not authorized");
+  return null;
+}
+
+/**
  * ⚠ AN `ssn` ARGUMENT IS REFUSED, on every tool that declares one (§4.1).
  *
  * The field is declared IN ORDER TO BE REFUSED: an undeclared field is not rejected by the SDK,
@@ -353,6 +376,77 @@ function onceOnNetwork(insert: () => number): number | null {
     throw e;
   }
 }
+
+/**
+ * THE REAL-HUMAN CHECK'S CODES, a closed list: the codes `assertRealHuman` throws, each with a
+ * fixed message written beside it there, which the doors answer as it is. The legal-body tools
+ * answer those messages too, for these three codes and for no other code outside the flow's table.
+ * A code the check gains later is answered `internal_error` by the tools until it is listed here;
+ * a test holds this list to the codes the check throws.
+ */
+export const REAL_HUMAN_CHECK_CODES: ReadonlySet<string> = new Set([
+  "unavailable",
+  "guardian_not_verified",
+  "waiver_not_accepted",
+]);
+
+/** A legal-body tool's refusal: its code and its fixed sentence, as one JSON object. */
+const codeRefusal = (code: string, message: string): ToolRefusal =>
+  refuse(JSON.stringify({ code, message }));
+
+/**
+ * What a legal-body tool answers for anything thrown: a code and its fixed sentence. Left to
+ * itself, the SDK would answer a throw with the error's message, and a transport error's message
+ * can carry the node's URL. So:
+ *  - a code of the flow's table answers the table's sentence, built from the code, never read off
+ *    the error;
+ *  - a code of the real-human check answers that check's own fixed message, as the doors do;
+ *  - anything else answers `internal_error`, after one line that names the tool and the error's
+ *    NAME, never its message.
+ */
+function legalBodyToolRefusal(tool: string, err: unknown): ToolRefusal {
+  if (err instanceof ApiError) {
+    if (Object.hasOwn(LEGAL_BODY_SENTENCES, err.code))
+      return codeRefusal(err.code, sentenceFor(err.code));
+    if (REAL_HUMAN_CHECK_CODES.has(err.code)) return codeRefusal(err.code, err.message);
+  }
+  opsLog("legal_body_tool_failed", {
+    level: "error",
+    tool,
+    errorName: err instanceof Error ? err.name : "not_an_error",
+  });
+  return codeRefusal("internal_error", sentenceFor("internal_error"));
+}
+
+/**
+ * THE LEGAL-BODY TOOLS' DESCRIPTIONS, an agent's one discovery surface for them. The order each
+ * one acts on was placed by its guardian in the browser: no tool places one.
+ */
+const GET_LINK_MESSAGE_DESCRIPTION = [
+  "Get the message the owner of an agent's ERC-8004 identity signs to have a legal body created for an order and linked to that identity.",
+  "orderId is an order your tenant placed in the browser: no tool places an order.",
+  "agentId is the identity's id, as a decimal string.",
+  `ttlSeconds, if given, is how long the message stays signable: a whole number of seconds from ${MIN_SERVED_LINK_TTL_SECONDS} to ${MAX_SERVED_LINK_TTL_SECONDS} (${DEFAULT_LINK_TTL_SECONDS} if omitted).`,
+  "The answer is typedData, the EIP-712 typed data to sign (the three uint256 fields of its message are decimal strings); identityOwner, the address that must sign it, which the identity registry names as the owner now; and deadline, in unix seconds of chain time.",
+  "It writes nothing.",
+  "Sign typedData with the identity owner's key, then pass typedData.message and the signature to submit_link.",
+  "A signer built on ethers must drop types.EIP712Domain before signing: ethers derives the domain's type itself and refuses an explicit one. A signer that takes the whole typed data signs it as served.",
+].join(" ");
+
+const SUBMIT_LINK_DESCRIPTION = [
+  "Submit the identity owner's signature of the message from get_link_message: the platform then creates the order's legal body, once, and the identity's owner points the identity at it (see get_binding).",
+  "orderId is the order the message was served for; message is typedData.message exactly as served; signature is the owner's signature of typedData, as 0x-prefixed hex.",
+  "Requires the provision capability.",
+  "The answer's status is reserved (the identity is held for this order and its body's creation is on its way: poll get_binding), deployed (the body exists, and its pointer comes next) or linked, with the order. Calling again answers the order's state and changes nothing.",
+  "A refused link answers status refused, with a code, a fixed message that says what to do next, a detail of hex and decimals, and the order.",
+].join(" ");
+
+const GET_BINDING_DESCRIPTION = [
+  "Read an order's binding as stored, with no chain read: its state, the identity's agentId, the legal body's address, and the pointer the identity's owner should write, as an intent: the action setLegalBodyPointer, the agentId, the body and the chain id.",
+  `The intent holds no calldata: the identity's owner encodes the pointer itself, and writes it in the identity's metadata under the key "${LEGAL_BODY_POINTER_KEY}".`,
+  "The intent is null when there is nothing to write: a draft, a body still being created, an order closed without a body, a linked body, or a body winding down or dissolved.",
+  "pointerSeenAt is when the pointer was seen, in unix seconds; nextCheckAt is when the platform next reads the chain for this order, in unix milliseconds.",
+].join(" ");
 
 /** Build a fresh, tenant-scoped MCP server. scope is closed over — never taken from a tool arg. */
 export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer {
@@ -1683,6 +1777,119 @@ export function buildMcpServer(scope: VerifiedKey, deps: McpToolDeps): McpServer
           );
         } catch (e) {
           return { content: [{ type: "text", text: (e as Error).message }], isError: true };
+        }
+      },
+    );
+  }
+
+  // ── The legal-body flow ──────────────────────────────────────────────────────────────────────
+  //
+  // Three tools for an agent that holds the key of an identity's owner: the message that owner
+  // signs, the signed link, and the binding. Registered only where the feature is on, over the
+  // SAME deps the order doors are mounted with, and each calls what its door calls: `linkMessage`,
+  // `submitLinkAndCreate` (the reserve AND the create, never the reserve alone) and the binding
+  // door's read. So the doors' rules hold here as they are: a verified human and never a waiver,
+  // the doors' throttles, the tenant's own order. The tenant is the key's, never an argument's.
+  // They act only on an order its guardian placed in the browser: none places an order, or
+  // declares a company. An order is not an entity, so an entity-scoped key is refused by all three.
+  //
+  // The arguments a domain rule judges are declared `unknown`, as the door reads its body: each
+  // is refused by its own rule, with its own code, rather than by the schema with the schema's
+  // text. Every throw is answered by `legalBodyToolRefusal`.
+  if (deps.legalBodyOrders) {
+    const orders = deps.legalBodyOrders;
+    // A key's tenant is the session address the key was minted for.
+    const tenant = tenantId as Address;
+
+    server.registerTool(
+      "get_link_message",
+      {
+        title: "Get the link message",
+        description: GET_LINK_MESSAGE_DESCRIPTION,
+        inputSchema: {
+          orderId: z.string(),
+          agentId: z
+            .unknown()
+            .describe("Required: the identity's ERC-8004 id, as a decimal string."),
+          ttlSeconds: z
+            .unknown()
+            .describe("Optional: how long the message stays signable, in whole seconds."),
+        },
+      },
+      async ({ orderId, agentId, ttlSeconds }) => {
+        const denied = requireReadTenantWide(scope);
+        if (denied) return denied;
+        try {
+          return json(
+            await linkMessage(orders, tenant, orderId, {
+              agentId: agentId as string,
+              ttlSeconds: ttlSeconds as number | undefined,
+            }),
+          );
+        } catch (err) {
+          return legalBodyToolRefusal("get_link_message", err);
+        }
+      },
+    );
+
+    server.registerTool(
+      "submit_link",
+      {
+        title: "Submit the signed link",
+        description: SUBMIT_LINK_DESCRIPTION,
+        inputSchema: {
+          orderId: z.string(),
+          message: z
+            .unknown()
+            .describe("Required: typedData.message, exactly as get_link_message served it."),
+          signature: z
+            .unknown()
+            .describe("Required: the identity owner's signature of typedData, as 0x-prefixed hex."),
+        },
+      },
+      async ({ orderId, message, signature }) => {
+        const denied = requireProvisionTenantWide(scope);
+        if (denied) return denied;
+        try {
+          const result = await submitLinkAndCreate(orders, tenant, orderId, {
+            message,
+            signature: signature as Hex,
+          });
+          // A refused link is the door's 422: its code, the door's sentence, its detail and the
+          // order.
+          if (result.status === "refused")
+            return refuse(
+              JSON.stringify({
+                status: result.status,
+                code: result.code,
+                message: refusedLinkSentence(result.code, result.order),
+                detail: result.detail,
+                order: result.order,
+              }),
+            );
+          return json(result);
+        } catch (err) {
+          return legalBodyToolRefusal("submit_link", err);
+        }
+      },
+    );
+
+    server.registerTool(
+      "get_binding",
+      {
+        title: "Get the binding",
+        description: GET_BINDING_DESCRIPTION,
+        inputSchema: { orderId: z.string() },
+      },
+      async ({ orderId }) => {
+        const denied = requireReadTenantWide(scope);
+        if (denied) return denied;
+        try {
+          // The binding door's own read: the real human, then the tenant's order, then its
+          // binding as stored. No chain read, no lock and no token, as on the door.
+          return json(readBinding(orders, tenant, orderId));
+        } catch (err) {
+          return legalBodyToolRefusal("get_binding", err);
         }
       },
     );

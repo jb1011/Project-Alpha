@@ -1,5 +1,6 @@
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { ApiError } from "../errors";
+import type { BindingState } from "../persistence/legalBodyRepository";
 
 /**
  * One fixed sentence for every code the legal-body flow answers.
@@ -67,11 +68,25 @@ export const LEGAL_BODY_SENTENCES: Readonly<Record<string, string>> = Object.fre
     "Another order for this identity, signed by its current owner, is on its way: it settles within seconds, or lapses at its deadline.",
   legal_body_attempts:
     "You have started as many legal-body creations in the last 24 hours as you may: try again later.",
-  busy: "This deployment has created as many legal bodies in the last 24 hours as it may: try again later.",
+  // Answered for two limits of the whole deployment: its creates in the last 24 hours, and the
+  // platform's outflow ceiling, which a gas seed is counted against.
+  busy: "This deployment has reached one of its limits for now: try again later.",
   link_already_used:
     "Another order already holds the legal body this link would create: ask for a new link message.",
   order_lapsed:
     "This order has lapsed: it was closed without a legal body, and it can no longer be linked. Place a new order to start again.",
+  gas_seed_disabled:
+    "This deployment does not send gas to an identity's owner: the owner pays for its own pointer transaction.",
+  gas_seed_used:
+    "You have already had your one gas seed, and there is no second: the identity's owner pays for its own pointer transaction.",
+  // Answered for an owner with code that is not a delegation, for a transfer estimated above the
+  // seed's gas cap, and for an estimate the node refuses for the recipient's own code.
+  owner_pays_own_gas:
+    "A gas seed goes only to an owner a key controls directly, by a transfer within the seed's gas cap: this identity's owner pays for its own pointer transaction.",
+  not_needed:
+    "The identity's owner already holds at least the amount of a gas seed, so none is sent: it can pay for its own pointer transaction.",
+  gas_seed_unconfirmed:
+    "Your gas seed request was recorded, but its transfer could not be confirmed, and it counts as your one seed: check the owner's balance before you write the pointer.",
 });
 
 /** The fixed sentence of `code`. A code with no sentence is a bug in the caller, and throws. */
@@ -94,4 +109,16 @@ export function refusal(
   details?: Record<string, string>,
 ): ApiError {
   return new ApiError(code, status, sentenceFor(code), details);
+}
+
+/**
+ * The sentence of a refused link, as the link door and the agent's tool both answer it: the
+ * refusal's own sentence and, for an order the refusal left `lapsed`, followed by the sentence
+ * that says so.
+ */
+export function refusedLinkSentence(code: string, order: { state: BindingState }): string {
+  const sentence = sentenceFor(code);
+  return order.state === "lapsed" && code !== "order_lapsed"
+    ? `${sentence} ${sentenceFor("order_lapsed")}`
+    : sentence;
 }

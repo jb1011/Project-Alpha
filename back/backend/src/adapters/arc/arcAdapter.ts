@@ -486,18 +486,49 @@ export class ArcAdapter {
   }
 
   /**
-   * Send native value (on Arc the gas token IS USDC) as the platform — the live runner's gas seeds.
+   * Send native value (on Arc the gas token IS USDC) as the platform — the live runner's gas seeds:
+   * {prepareNativeAsPlatform}, then {sendPreparedAsPlatform}.
    *
    * Here rather than at the call site so it shares the one chokepoint: a seed and a treasury top-up
    * come from the same key, so they compete for the same nonces.
+   *
+   * `gas`, when given, is the transaction's gas limit, passed straight through, so viem does not
+   * estimate one; without it, viem estimates, as it always has.
    */
-  async sendNativeAsPlatform(to: Address, value: bigint): Promise<Hex> {
+  async sendNativeAsPlatform(to: Address, value: bigint, gas?: bigint): Promise<Hex> {
+    return this.sendPreparedAsPlatform(await this.prepareNativeAsPlatform(to, value, gas));
+  }
+
+  /**
+   * The first half of a native transfer from the platform: everything its transaction needs except
+   * its nonce (fees and chain id, and `gas` as its gas limit when given), fetched with NO LOCK held,
+   * for the reason {prepareAsPlatform} gives. Nothing is signed and nothing is sent, so a failure
+   * here leaves nothing on the wire. The legal-body flow's gas seed prepares its transfer with
+   * this before it records the seed.
+   */
+  async prepareNativeAsPlatform(
+    to: Address,
+    value: bigint,
+    gas?: bigint,
+  ): Promise<PreparedPlatformTx> {
     const account = this.d.managerWallet.account;
     if (!account)
       throw new Error(
         "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send as the zero address",
       );
-    const prepared = await this.prepareAsPlatform({ account, to, value });
+    return this.prepareAsPlatform({ account, to, value, gas });
+  }
+
+  /**
+   * The second half: number a prepared platform transaction from the ledger, sign it and hand it to
+   * the node, inside the sender lock, through THE CHOKEPOINT ({sendAsPlatform}). Returns the hash.
+   */
+  async sendPreparedAsPlatform(prepared: PreparedPlatformTx): Promise<Hex> {
+    const account = this.d.managerWallet.account;
+    if (!account)
+      throw new Error(
+        "ArcAdapter: manager wallet has no account (hoist an account on the WalletClient) — refusing to send as the zero address",
+      );
     return this.sendAsPlatform(account.address, prepared);
   }
 
