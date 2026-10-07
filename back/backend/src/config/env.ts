@@ -197,8 +197,11 @@ const EnvSchema = z.object({
     .regex(/^0\.0\.\d+$/)
     .optional(),
   HEDERA_VERIFY_PRICE_USDC: z.string().default("0.001"),
-  /** PR 3: signs /verify statements. Absent = the route serves the unsigned body. Never equal to
-   *  the platform key or any other signing key on this box (invariant below, design 2026-09-10 D6). */
+  /** The attestation key: it signs the public legal-body statements and the Hedera rail's /verify
+   *  statements, on any network, and holds no other role. Absent = no legal-body statement is
+   *  signed, /verify serves its unsigned body, and a mainnet deployment with the legal-body factory
+   *  refuses to boot. Never equal to the platform key or any other signing key on this box
+   *  (invariant below, design 2026-09-10 D6). */
   NOVI_ATTESTATION_KEY: privKeySchema.optional(),
   /** Seller trust policy. "open" = today's behavior (AgentKit authorizes within the allowance,
    *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
@@ -644,6 +647,11 @@ export interface Config {
     /** Age threshold proven by the attestation (never a birthdate). */
     attestMinAge: number;
   };
+  /** The attestation key (NOVI_ATTESTATION_KEY) and its EIP-55 address. Present whenever the key is
+   *  set, on any network and whatever HEDERA_ENABLED says. It signs the public legal-body
+   *  statements and the Hedera rail's statements, and holds no other role on this box. The
+   *  address is public: it is what a reader checks a statement's signature against. */
+  attestation?: { key: Hex; address: Address };
   /** Hedera rail (design 2026-09-10). Present only when HEDERA_ENABLED and the block is whole. */
   hedera?: {
     network: "testnet";
@@ -653,7 +661,8 @@ export interface Config {
     payToAccountId: string;
     verifyPriceUsdc: string;
     verifyPriceAtomic: bigint;
-    /** PR 3: signs /verify. Absent = the route serves the unsigned body. */
+    /** The same key as `attestation.key`, for the rail: it signs /verify. Absent = the route
+     *  serves the unsigned body. */
     attestationKey?: Hex;
   };
   /** AgentBook read config — independent of `world` so the seller check can run standalone.
@@ -828,6 +837,21 @@ export function customerDoorsEnabled(
   return legalBodyEnvironment(cfg) === "sandbox" || cfg.formation?.payment.required === true;
 }
 
+/**
+ * A mainnet deployment with the legal-body feature on (the factory set) must hold the attestation
+ * key: on mainnet a legal body is stated only by a signed statement, so a deployment that could
+ * sign none refuses to boot. On testnet, or a network left unset, it never throws: the deployment
+ * boots with the statements off, and says so at boot.
+ */
+export function assertLegalBodyAttestationConfig(
+  cfg: Pick<Config, "arcNetwork" | "legalBodyFactory" | "attestation">,
+): void {
+  if (cfg.arcNetwork === "mainnet" && cfg.legalBodyFactory && !cfg.attestation)
+    throw new Error(
+      "Invalid config: LEGAL_BODY_FACTORY_ADDRESS on mainnet needs NOVI_ATTESTATION_KEY: a legal body is stated only by a signed statement",
+    );
+}
+
 /** Hedera rail (design 2026-09-10). All-or-nothing over the five required vars, testnet only. */
 function buildHedera(e: Env): Config["hedera"] {
   if (!e.HEDERA_ENABLED) return undefined;
@@ -993,6 +1017,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
             attestMinAge: e.WORLD_ATTEST_MIN_AGE,
           }
         : undefined,
+    // Built whenever the key is set, whatever HEDERA_ENABLED says. `buildHedera` copies the same
+    // key into the rail's own block: one variable, one key.
+    attestation: e.NOVI_ATTESTATION_KEY
+      ? {
+          key: e.NOVI_ATTESTATION_KEY,
+          address: privateKeyToAccount(e.NOVI_ATTESTATION_KEY).address,
+        }
+      : undefined,
     hedera: buildHedera(e),
     worldChain: {
       rpcUrl: e.WORLD_CHAIN_RPC,
@@ -1294,12 +1326,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   // ── THE ATTESTATION KEY (design 2026-09-10 D6) ───────────────────────────────────────────────
   //
-  // NOVI_ATTESTATION_KEY signs /verify statements and holds no other role on this box. Reusing
-  // the platform key, any other signing key, or the formation settle submitter would let a
-  // compromise of the attestation surface reach money or governance — so every collision refuses
-  // at boot, the same way the revenue/submitter separation above does.
-  if (cfg.hedera?.attestationKey) {
-    const attester = privateKeyToAccount(cfg.hedera.attestationKey).address.toLowerCase();
+  // NOVI_ATTESTATION_KEY signs the public legal-body statements and the Hedera rail's /verify
+  // statements, and holds no other role on this box. Reusing the platform key, any other signing
+  // key, or the formation settle submitter would let a compromise of the attestation surface reach
+  // money or governance — so every collision refuses at boot, the same way the revenue/submitter
+  // separation above does. Keyed on `cfg.attestation`, which exists whenever the key is set, so
+  // the rule holds with the Hedera rail off too.
+  if (cfg.attestation) {
+    const attester = cfg.attestation.address.toLowerCase();
     const platform = privateKeyToAccount(cfg.platformPrivateKey).address.toLowerCase();
     if (attester === platform)
       throw new Error(
@@ -1458,6 +1492,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       "Invalid config: FORMATION_PAYMENT_REQUIRED is on and LEGAL_BODY_FACTORY_ADDRESS is set, but BYO_ATTESTATION_FEE_USDC is missing — a deployment that charges must also price a customer's own company, and that price has no default",
     );
   }
+  // And on mainnet, the feature needs the key that signs its statements.
+  assertLegalBodyAttestationConfig(cfg);
 
   // NoviController (design §5), the ENS half. With no explicit apex the gateway resolves the apex
   // to the platform SIGNING KEY — which, in controller mode, is exactly the address the design
@@ -1630,6 +1666,10 @@ export function redact(cfg: Config): Record<string, unknown> {
     },
     ens: cfg.ens ? { ...cfg.ens, signerKey: "REDACTED" } : undefined,
     world: cfg.world ? { ...cfg.world, rpSigningKey: "REDACTED" } : undefined,
+    // The attestation key is key material, never a log line. Its address is public and stays.
+    attestation: cfg.attestation
+      ? { key: "REDACTED", address: cfg.attestation.address }
+      : undefined,
     // The verify price as a STRING (the `maxJobBudget` rule) and the attestation key, if any —
     // it signs statements and is key material, never a log line.
     hedera: cfg.hedera

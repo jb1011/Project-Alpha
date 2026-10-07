@@ -573,6 +573,11 @@ async function main() {
    */
   const legalBodies =
     cfg.legalBodyFactory && cfg.controllerAddress ? new SqliteLegalBodyRepository(db) : undefined;
+  // The attestor's address is public: it is what a reader checks a statement's signature against.
+  // With the legal-body feature on and no key, no statement can be signed (on mainnet the config
+  // refuses to boot in that shape), and the boot says so.
+  if (cfg.attestation) opsLog("attestation_key_loaded", { attestor: cfg.attestation.address });
+  else if (legalBodies) opsLog("legal_body_statements_off", { reason: "no_attestation_key" });
   const legalBodyFlow = cfg.legalBodyFlow ?? LEGAL_BODY_FLOW_DEFAULTS;
   const legalBodyOrders =
     legalBodies && cfg.legalBodyFactory
