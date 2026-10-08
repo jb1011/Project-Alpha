@@ -488,8 +488,9 @@ export async function signStatement(
 
 const ENVELOPE_KEYS = ["domain", "primaryType", "message", "attestor", "signature"] as const;
 const DOMAIN_KEYS = ["name", "version", "chainId"] as const;
-/** A signature as a signer writes it: r, s and v, 65 bytes in hex. */
-const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
+/** A signature as a signer writes it: r, s and v, 65 bytes in lower-case hex (viem also reads
+ *  upper case, which would be another valid text of the same signature). */
+const SIGNATURE = /^0x[0-9a-f]{130}$/;
 /** n/2 of secp256k1, rounded down: the largest `s` of a canonical signature (EIP-2). */
 const SECP256K1_HALF_N = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
 

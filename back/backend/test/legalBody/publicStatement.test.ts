@@ -1100,6 +1100,12 @@ describe("signing and verifying", () => {
         );
         await expect(verify({ ...signed, signature }), name).resolves.toBe(false);
       }
+      // The same signature in upper-case hex: viem reads it, the verifier refuses the other text.
+      const upper = `0x${signed.signature.slice(2).toUpperCase()}` as const;
+      await expect(signatureCovers({ ...signed, signature: upper }, signed.message)).resolves.toBe(
+        true,
+      );
+      await expect(verify({ ...signed, signature: upper })).resolves.toBe(false);
     }
   });
 

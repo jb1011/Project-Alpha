@@ -179,7 +179,7 @@ Both routes share the same rate limits, one per client and one for all callers t
 
 ### The transparency list
 
-On a deployment that serves statements, the API's `GET /transparency` also lists, under `legalBodies`, each linked legal body whose statement would read `active`, with its name, its filing number and `links.statement`. `stats.legalBodies` counts them. When the chain could not be read, the list is empty and `legalBodiesAvailable` is `false`. The list is not signed and can be a few seconds old; a body linked moments ago is listed once the binding check has recorded the link. Follow `links.statement` for a signed, current answer.
+On a deployment that serves statements, the API's `GET /transparency` also lists, under `legalBodies`, each linked legal body whose statement would read `active`, with its name, its filing number and `links.statement`. `stats.legalBodies` counts them. When the chain could not be read, the list is empty and `legalBodiesAvailable` is `false`. The list is not signed and can be up to about half a minute old; a body linked moments ago is listed once the binding check has recorded the link. Follow `links.statement` for a signed, current answer.
 
 ## The signed statement
 
@@ -393,7 +393,7 @@ if (!valid) throw new Error("not a valid statement");
 console.log(answer.statement.message.standing);
 ```
 
-A signature covers values, not how they are written: viem also accepts `"042"` for agent 42, or an address in lower case, under the same signature. So one signature can verify over more than one text: never use the text of a message as its identity. The reference verifier, `verifyPublicStatement` in [publicStatement.ts](https://github.com/jb1011/Project-Alpha/blob/main/back/backend/src/legalBody/publicStatement.ts), in Novi's public repository, refuses every spelling but the one the answers use. It also accepts only the canonical signature, the form the answers carry: a low `s` (at most half the order of secp256k1) and `v` 27 or 28.
+A signature covers values, not how they are written: viem also accepts `"042"` for agent 42, or an address in lower case, under the same signature. So one signature can verify over more than one text: never use the text of a message as its identity. The reference verifier, `verifyPublicStatement` in [publicStatement.ts](https://github.com/jb1011/Project-Alpha/blob/main/back/backend/src/legalBody/publicStatement.ts), in Novi's public repository, refuses every spelling but the one the answers use. It also accepts only the canonical signature, the form the answers carry: lower-case hex, a low `s` (at most half the order of secp256k1) and `v` 27 or 28. viem alone accepts other spellings of the same signature too, so never use a signature's text as an identity either.
 
 ## Contract accounts
 
