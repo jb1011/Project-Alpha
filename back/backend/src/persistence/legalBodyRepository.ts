@@ -396,6 +396,33 @@ export interface LegalBodyRepository {
   transaction<T>(fn: () => T): T;
 }
 
+/**
+ * The read-only finders behind a public answer about a legal body: the rows an agent's answer can
+ * be about, the agents an address was recorded as owning, and the bodies recorded as linked. They
+ * only SELECT, and what they return is the database's record, never a reading of the chain.
+ *
+ * Kept apart from `LegalBodyRepository` on purpose: test fakes implement that interface, and a
+ * member added to it would break every one of them.
+ *
+ * The rules they share. A deployment that no row may hold throws a `LegalBodyInputError`, as in
+ * every method that takes one, and so does a `limit` that is not a whole number from 1 to 100;
+ * both are checked first, so a bad one throws even when nothing would be found. An agent id that
+ * is not a uint256 in decimal finds nothing, and leading zeros are normalized away, as
+ * `findLinkedByAgent` does ("042" is agent 42). An owner that is not an address finds nothing.
+ */
+export interface LegalBodyPublicFinders {
+  /** Rows of this deployment for the agent in deployed, linked, broken or superseded. Order: the
+   *  `deployed` row first (at most one per agent: the in-flight index), then pointer_seen_at
+   *  descending (NULL last), then rowid descending. The currently linked row always has the
+   *  highest pointer_seen_at (it is rewritten on every move to linked), so a limit of 4 keeps it. */
+  listPublicByAgent(d: Deployment, agentId: string, limit: number): LegalBodyRecord[];
+  /** Distinct agent ids of rows in those four states whose identity_owner equals `owner`, any
+   *  case, newest first. */
+  listAgentIdsByIdentityOwner(d: Deployment, owner: Address, limit: number): string[];
+  /** Rows of this deployment in `linked`, newest pointer_seen_at first. */
+  listLinked(d: Deployment, limit: number): LegalBodyRecord[];
+}
+
 interface Row {
   legal_body_id: string;
   public_id: string;
@@ -632,6 +659,18 @@ function requireLimit(value: unknown): number {
   return value;
 }
 
+/** The most rows one call of a public finder returns. */
+const MAX_PUBLIC_LIMIT = 100;
+
+/** A public finder's row count for LIMIT: a whole number from 1 to `MAX_PUBLIC_LIMIT`. */
+function requirePublicLimit(value: unknown): number {
+  if (!isIntegerWithin(value, 1, MAX_PUBLIC_LIMIT))
+    throw new LegalBodyInputError(
+      `limit must be a whole number from 1 to ${MAX_PUBLIC_LIMIT}, got ${String(value)}`,
+    );
+  return value;
+}
+
 /** The deployment as rows store it: the factory checksummed, so a lookup matches any casing. */
 function requireDeployment(d: unknown): { chain_id: number; factory: Address } {
   const { chainId, factory } = (d ?? {}) as { chainId?: unknown; factory?: unknown };
@@ -699,6 +738,13 @@ const CHECKED_STATES_SQL = "binding_state NOT IN ('draft','abandoned','lapsed')"
 /** The states a binding check reads the chain for: a body exists, so a pointer can name it. */
 const BINDING_CHECK_STATES_SQL = "binding_state IN ('deployed','linked','broken','superseded')";
 
+/**
+ * The states a public answer can be about: the body's creation is recorded (the table's CHECKs
+ * require `deployed_at` in these four and refuse it in every other). The same four a binding check
+ * reads, named apart: the two lists answer different questions and need not change together.
+ */
+const PUBLIC_STATES_SQL = "binding_state IN ('deployed','linked','broken','superseded')";
+
 /** The states `markLinked` moves a body out of. */
 const LINKABLE_STATES: readonly BindingState[] = ["deployed", "broken", "superseded"];
 
@@ -713,7 +759,7 @@ const LINKABLE_STATES: readonly BindingState[] = ["deployed", "broken", "superse
 const LIVE_AGENT_CONFLICT = "legal_bodies.chain_id, legal_bodies.factory, legal_bodies.agent_id";
 const BODY_ADDRESS_CONFLICT = "index 'idx_legal_bodies_body'";
 
-export class SqliteLegalBodyRepository implements LegalBodyRepository {
+export class SqliteLegalBodyRepository implements LegalBodyRepository, LegalBodyPublicFinders {
   private readonly stmts;
 
   constructor(private readonly db: Database.Database) {
@@ -756,6 +802,39 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       ),
       listByCompany: db.prepare(
         "SELECT * FROM legal_bodies WHERE company_id = ? ORDER BY created_at DESC, rowid DESC",
+      ),
+      // The public finders (`LegalBodyPublicFinders`). No index serves this first one: the two
+      // agentId indexes are partial, one over the order on its way and one over the linked body,
+      // and a broken or superseded row is in neither. So it scans the table, as the next one does.
+      listPublicByAgent: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE chain_id = @chain_id AND factory = @factory
+            AND agent_id = @agent_id AND ${PUBLIC_STATES_SQL}
+          ORDER BY binding_state = 'deployed' DESC, pointer_seen_at IS NULL,
+                   pointer_seen_at DESC, rowid DESC
+          LIMIT @limit`,
+      ),
+      // There is no index on identity_owner: adding one changes the legal-body schema, which takes
+      // a written migration. Each side is compared lower-case, since the column's CHECK takes an
+      // address in any casing. An agent's place is that of its newest row among those the WHERE
+      // keeps, by rowid: rows are never deleted, so rowid is the order they were created in.
+      listAgentIdsByIdentityOwner: db
+        .prepare(
+          `SELECT agent_id FROM legal_bodies
+            WHERE chain_id = @chain_id AND factory = @factory
+              AND lower(identity_owner) = lower(@owner) AND ${PUBLIC_STATES_SQL}
+            GROUP BY agent_id
+            ORDER BY MAX(rowid) DESC
+            LIMIT @limit`,
+        )
+        .pluck(),
+      // The state term repeats the WHERE of the linked index, which SQLite must see in the query
+      // before it will use that index.
+      listLinked: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE chain_id = @chain_id AND factory = @factory AND binding_state = 'linked'
+          ORDER BY pointer_seen_at DESC, rowid DESC
+          LIMIT @limit`,
       ),
       // Each move below sets EVERY column its target state requires in the same statement: the
       // table's CHECKs are evaluated on the row an UPDATE produces, so a move split across two
@@ -994,6 +1073,34 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
 
   listByCompany(companyId: string): LegalBodyRecord[] {
     return (this.stmts.listByCompany.all(companyId) as Row[]).map(toRecord);
+  }
+
+  listPublicByAgent(d: Deployment, agentId: string, limit: number): LegalBodyRecord[] {
+    const deployment = requireDeployment(d);
+    const n = requirePublicLimit(limit);
+    const agent = agentKey(agentId);
+    if (agent === null) return [];
+    return (
+      this.stmts.listPublicByAgent.all({ ...deployment, agent_id: agent, limit: n }) as Row[]
+    ).map(toRecord);
+  }
+
+  listAgentIdsByIdentityOwner(d: Deployment, owner: Address, limit: number): string[] {
+    const deployment = requireDeployment(d);
+    const n = requirePublicLimit(limit);
+    const address = typeof owner === "string" ? checksummed(owner) : null;
+    if (address === null) return [];
+    return this.stmts.listAgentIdsByIdentityOwner.all({
+      ...deployment,
+      owner: address,
+      limit: n,
+    }) as string[];
+  }
+
+  listLinked(d: Deployment, limit: number): LegalBodyRecord[] {
+    const deployment = requireDeployment(d);
+    const n = requirePublicLimit(limit);
+    return (this.stmts.listLinked.all({ ...deployment, limit: n }) as Row[]).map(toRecord);
   }
 
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean {
