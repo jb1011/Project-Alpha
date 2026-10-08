@@ -19,7 +19,7 @@
  * plus the agent id the lookup returned, if you want to name it. Never "verified company", never
  * "KYC'd", never "licensed", never "audited", never "in good standing": nothing behind the answer
  * carries any of that. A standing of "unknown" is a read that failed or, for a Minimal legal body,
- * a fact Novi cannot state as active from — show it as unknown, never as a yes and never as a no.
+ * facts that do not let Novi state it as active: show it as unknown, never as a yes or a no.
  * And nothing here says WHO vouched for the agent: the human identifier is anonymous by
  * construction.
  *
