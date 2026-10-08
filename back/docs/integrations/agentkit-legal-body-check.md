@@ -133,10 +133,10 @@ statement's:
 - `pending`: something to establish is still missing (the operator's check of the LLC, or the
   payment). Not a yes.
 - `inactive`: a recorded fact says no: the body is winding down or dissolved, the agent's identity no
-  longer points at it, or Novi revoked it.
+  longer points at it or changed hands, or Novi revoked it.
 - `unknown`: Novi cannot state `active` from the facts it holds (an agreement hash on chain that
-  differs from the frozen one, or filing facts that are missing or more than 60 days overdue). Not a
-  yes.
+  differs from the frozen one, a missing formation date, or a report more than 60 days past due with
+  none recorded). Not a yes.
 
 Every answer that carries a signed statement is definitive, whatever its standing: memoised for 15
 seconds and served `public, max-age=15`, a statement that reads `unknown` included. When the chain
@@ -148,8 +148,8 @@ not the identity's owner is found only once a statement has been made for that a
 until then the address answers `legalBody: false`.
 
 The same statement is served by agent id, with no address:
-`GET <lookupBaseUrl>/legal-bodies/by-agent/<agentId>`. It shares this route's memo window and both
-token buckets, so a client's allowance is one for the two routes. Its answers are on
+`GET <lookupBaseUrl>/legal-bodies/by-agent/<agentId>`. It has its own 15-second memo, and shares
+both token buckets, so a client's allowance is one for the two routes. Its answers are on
 [the statement's page](../../../docs/identity/legal-body-statement.md).
 
 ## What you may say

@@ -32,7 +32,7 @@ It does not say:
 | `active` | Every fact holds: the body is active on chain, the agent's identity points at it, the agreement hash on chain is the frozen one, a Novi operator's check of the LLC passed, the legal body is paid for, nothing is revoked, and no annual report is more than 60 days past due without a recorded filing. |
 | `pending` | Something to establish is still missing: the operator's check of the LLC has not passed (or must be made again), or the legal body is not paid for yet. |
 | `unknown` | Novi cannot state `active` from what it holds: the agreement hash on chain differs from the frozen one, there is no formation date to count annual reports from, or a report is more than 60 days past due with no filing recorded. |
-| `inactive` | A recorded fact says no: the body is winding down or dissolved, the agent's identity no longer points at it, or Novi has revoked it. |
+| `inactive` | A recorded fact says no: the body is winding down or dissolved, the agent's identity no longer points at it or changed hands, or Novi has revoked it. |
 
 When several apply, `inactive` comes before `pending`, and `pending` before `unknown`. Missing evidence never reads `inactive`.
 
@@ -97,7 +97,7 @@ No statement could be made just now, because the chain could not be read:
 GET /legal-bodies/<address>
 ```
 
-`address` is all lower case or EIP-55. For a legal body on this page, the address must be the agent's wallet: the wallet the identity registry returns for the agent, read when you ask, and again at the block the statement is read at. The same route also answers for agents onboarded with a Novi treasury; those answers carry no statement, and the repository's `back/docs/integrations/agentkit-legal-body-check.md` describes them.
+`address` is all lower case or EIP-55. For a legal body on this page, the address must be the agent's wallet: the wallet the identity registry returns for the agent, read when you ask, and again at the block the statement is read at. The same route also answers for agents onboarded with a Novi treasury; those answers carry no statement. [The AgentKit integration guide](https://github.com/jb1011/Project-Alpha/blob/main/back/docs/integrations/agentkit-legal-body-check.md), in Novi's public repository, describes them: it shows a seller on World's AgentKit how to ask, in one call, whether a verified human vouches for an address and whether a Novi legal body stands behind it, and gives every answer of this route.
 
 No legal body Novi states for this address:
 
@@ -318,10 +318,11 @@ interface SignedStatement {
   signature: Hex;
 }
 
-/** True only for a statement signed by `attestor`, about your chain and factory, not expired. */
+/** True only for a statement signed by `attestor`, about your chain, factory and identity
+ *  registry, not expired. */
 async function isValidStatement(
   s: SignedStatement,
-  expected: { attestor: Address; chainId: number; factory: Address },
+  expected: { attestor: Address; chainId: number; factory: Address; identityRegistry: Address },
 ): Promise<boolean> {
   const domain = { name: "Novi Corpus Attestation", version: "2", chainId: expected.chainId };
   try {
@@ -333,6 +334,7 @@ async function isValidStatement(
       return false;
     if (m.chainId !== String(expected.chainId)) return false;
     if (!isAddressEqual(m.factory as Address, expected.factory)) return false;
+    if (!isAddressEqual(m.identityRegistry as Address, expected.identityRegistry)) return false;
     const issuedAt = BigInt(m.issuedAt as string);
     const expiresAt = BigInt(m.expiresAt as string);
     const now = BigInt(Math.floor(Date.now() / 1000));
@@ -361,6 +363,7 @@ import { sepolia } from "viem/chains";
 const API = "https://…"; // the API of the Novi deployment you ask
 const CHAIN_ID = 5042002; // the chain you expect statements for: Arc testnet here
 const FACTORY: Address = "0x…"; // the legal-body factory you pin for that deployment
+const IDENTITY_REGISTRY: Address = "0x…"; // the ERC-8004 identity registry you expect the agent in
 const AGENT_ID = "42";
 
 // 1. The attestor, from ENS: Novi's gateway answers it through CCIP-Read.
@@ -378,7 +381,12 @@ if (answer.statement === null) throw new Error("no statement just now: ask again
 // 3. The checks, then what it says.
 const valid =
   answer.statement.message.agentId === AGENT_ID &&
-  (await isValidStatement(answer.statement, { attestor, chainId: CHAIN_ID, factory: FACTORY }));
+  (await isValidStatement(answer.statement, {
+    attestor,
+    chainId: CHAIN_ID,
+    factory: FACTORY,
+    identityRegistry: IDENTITY_REGISTRY,
+  }));
 if (!valid) throw new Error("not a valid statement");
 console.log(answer.statement.message.standing);
 ```

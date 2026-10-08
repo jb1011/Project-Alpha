@@ -1,7 +1,8 @@
 # Runbook — the legal-body check
 
-A seller on World's AgentKit can ask whether a verified unique human vouches for the address about to pay it; this
-ships the second question, "is that the payment address of a Novi legal body in good standing?", as a public lookup, a
+A seller on World's AgentKit can ask whether a verified unique human vouches for the address
+about to pay it; this ships the second question, "does a registered legal body stand behind
+that address, and does Novi state its standing as active?", as a public lookup, a
 seller policy and a demo (design 2026-09-10, D1–D8). The configured seller is untouched: the wall pins its own.
 
 ## The public lookup
@@ -62,9 +63,9 @@ also be `pending`, `name` is the statement's `legalName` (empty until it may be 
 `formation` are null, and `links.statement` is the by-agent URL. A signed statement is memoised and served
 `public, max-age=15` whatever its standing, a signed `unknown` included. A chain failure answers `unknown` with
 `statement: null` and `agentId: null`: `no-store`, never memoised, no statement-log row. It can rest on candidates the
-chain could not confirm, so it is not a yes. The 503 still means the local database. The by-agent route shares the
-memo window, the per-client buckets and the shared budget: one token from each per miss, however many reads the miss
-makes. Its 400 is
+chain could not confirm, so it is not a yes. The 503 still means the local database. The by-agent route has its own
+15-second memo, and shares both token buckets: one token from each per miss, however many reads the miss makes. Its
+400 is
 `{"error":"validation_error","message":"agentId must be a decimal token id of at most 78 digits, without leading zeros"}`.
 A wallet that is not the identity owner is found by address only after a by-agent miss has logged it, and after the
 address's own 15-second memo of `legalBody: false` has passed.
@@ -124,7 +125,8 @@ neither money nor budget — no `settle`, its own rate key (`…#legal-bodies-ru
 never turn leg 2 into a 429 and the real wall keeps `WORLD_ALLOWANCE_PER_HUMAN` (3 per 24 h). Record it any time.
 
 **Leg 3, the payment that goes through — from the product.** Use agent 843704 (TestMB2): AgentBook-registered AND a
-Novi legal body in good standing. There is no dashboard button; the payment surface is the MCP tool `pay`, and the
+Novi legal body whose lookup answers yes: "a registered legal body stands behind this address, and Novi states
+its standing as active". There is no dashboard button; the payment surface is the MCP tool `pay`, and the
 pocket needs Gateway float (`fund_pocket`) first:
 
 ```
