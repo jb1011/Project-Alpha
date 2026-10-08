@@ -24,32 +24,37 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, test } from "vitest";
 import type { AgentSnapshot, BodySnapshot, CodeKind } from "../../src/adapters/arc/legalBodyChain";
-import type { Attestation } from "../../src/legalBody/attestation";
-import { type FilingFacts, filingFacts } from "../../src/legalBody/filings";
+import { ATTESTATION_STATES, type Attestation } from "../../src/legalBody/attestation";
+import { FILING_STATUSES, type FilingFacts, filingFacts } from "../../src/legalBody/filings";
 import {
   LEGAL_BODY_STATEMENT_TYPES,
   LEGAL_BODY_STATEMENT_TYPE_STRING,
   type LegalBodyStatement,
   type LegalBodyStatementJson,
-  STATEMENT_DOMAIN_NAME,
-  STATEMENT_DOMAIN_VERSION,
-  STATEMENT_ENTITY_TYPE,
-  STATEMENT_JURISDICTION,
-  STATEMENT_PRIMARY_TYPE,
-  STATEMENT_TTL_SECONDS,
+  PUBLIC_STATEMENT_DOMAIN_NAME,
+  PUBLIC_STATEMENT_DOMAIN_VERSION,
+  PUBLIC_STATEMENT_ENTITY_TYPE,
+  PUBLIC_STATEMENT_JURISDICTION,
+  PUBLIC_STATEMENT_PRIMARY_TYPE,
+  PUBLIC_STATEMENT_TTL_SECONDS,
   type SignedStatementJson,
   type StatementInputs,
   StatementIntegrityError,
   assembleStatement,
   claimsHash,
+  publicStatementDomain,
   signStatement,
-  statementDomain,
   statementFromJson,
   statementJson,
   statementMessage,
-  verifyStatement,
+  verifyPublicStatement,
 } from "../../src/legalBody/publicStatement";
-import type { Standing, StandingReason } from "../../src/legalBody/standing";
+import {
+  PUBLIC_BINDING_STATES,
+  STANDINGS,
+  type Standing,
+  type StandingReason,
+} from "../../src/legalBody/standing";
 import { canonicalizeJcs } from "../../src/oa/manifest";
 
 /** anvil's published account 0: the golden vector's signer. */
@@ -307,7 +312,7 @@ const verify = (
   signed: unknown,
   over: Partial<{ attestor: Address; expectedChainId: number; nowSeconds: number }> = {},
 ) =>
-  verifyStatement(signed, {
+  verifyPublicStatement(signed, {
     attestor: ANVIL_0.address,
     expectedChainId: CHAIN_ID,
     nowSeconds: ISSUED_AT + 10,
@@ -373,21 +378,25 @@ function refusal(j: unknown): unknown {
 
 describe("the type and the domain", () => {
   test("the constants", () => {
-    expect(STATEMENT_DOMAIN_NAME).toBe("Novi Corpus Attestation");
-    expect(STATEMENT_DOMAIN_VERSION).toBe("2");
-    expect(STATEMENT_PRIMARY_TYPE).toBe("LegalBodyStatement");
-    expect(STATEMENT_TTL_SECONDS).toBe(300);
-    expect(STATEMENT_JURISDICTION).toBe("WY");
-    expect(STATEMENT_ENTITY_TYPE).toBe("LLC");
+    expect(PUBLIC_STATEMENT_DOMAIN_NAME).toBe("Novi Corpus Attestation");
+    expect(PUBLIC_STATEMENT_DOMAIN_VERSION).toBe("2");
+    expect(PUBLIC_STATEMENT_PRIMARY_TYPE).toBe("LegalBodyStatement");
+    expect(PUBLIC_STATEMENT_TTL_SECONDS).toBe(300);
+    expect(PUBLIC_STATEMENT_JURISDICTION).toBe("WY");
+    expect(PUBLIC_STATEMENT_ENTITY_TYPE).toBe("LLC");
   });
 
   test("the domain: the name, version 2 and the chain id, and no verifying contract", () => {
-    expect(statementDomain(CHAIN_ID)).toStrictEqual({
+    expect(publicStatementDomain(CHAIN_ID)).toStrictEqual({
       name: "Novi Corpus Attestation",
       version: "2",
       chainId: 5042002,
     });
-    expect(Object.keys(statementDomain(OTHER_CHAIN_ID))).toEqual(["name", "version", "chainId"]);
+    expect(Object.keys(publicStatementDomain(OTHER_CHAIN_ID))).toEqual([
+      "name",
+      "version",
+      "chainId",
+    ]);
   });
 
   test("one primary type of 33 fields in their fixed order, which produce the exact type string", () => {
@@ -763,6 +772,13 @@ describe("assembleStatement", () => {
 });
 
 describe("the JSON form", () => {
+  test("the lists kept beside the unions hold exactly the values each enumeration allows", () => {
+    expect(STANDINGS).toEqual(ENUMERATIONS.standing);
+    expect(PUBLIC_BINDING_STATES).toEqual(ENUMERATIONS.bindingState);
+    expect(ATTESTATION_STATES).toEqual(ENUMERATIONS.attestationState);
+    expect(FILING_STATUSES).toEqual(ENUMERATIONS.filingStatus);
+  });
+
   test("every uint256 a canonical decimal string, addresses EIP-55, bytes32 lower case", () => {
     expect(statementJson(GOLDEN)).toStrictEqual(GOLDEN_JSON);
     const json = statementJson({
@@ -923,7 +939,7 @@ describe("signing and verifying", () => {
       "primaryType",
       "signature",
     ]);
-    expect(signed.domain).toStrictEqual(statementDomain(CHAIN_ID));
+    expect(signed.domain).toStrictEqual(publicStatementDomain(CHAIN_ID));
     expect(signed.primaryType).toBe("LegalBodyStatement");
     expect(signed.message).toStrictEqual(statementJson(GOLDEN));
     expect(signed.attestor).toBe(ANVIL_0.address);
@@ -978,7 +994,7 @@ describe("signing and verifying", () => {
       ...wire,
       message: statementJson(elsewhere),
       signature: await ANVIL_0.signTypedData({
-        domain: statementDomain(CHAIN_ID),
+        domain: publicStatementDomain(CHAIN_ID),
         types: LEGAL_BODY_STATEMENT_TYPES,
         primaryType: "LegalBodyStatement",
         message: statementMessage(elsewhere),
@@ -994,6 +1010,15 @@ describe("signing and verifying", () => {
     await expect(verify(wire, { nowSeconds: ISSUED_AT + 300 })).resolves.toBe(true);
     await expect(verify(wire, { nowSeconds: ISSUED_AT + 301 })).resolves.toBe(false);
     await expect(verify(wire, { nowSeconds: ISSUED_AT - 1 })).resolves.toBe(false);
+  });
+
+  test("a time with a fraction of a second, as Date.now() / 1000 gives, counts as its whole second", async () => {
+    const wire = wireOf(await signStatement(GOLDEN, ANVIL_0));
+    await expect(verify(wire, { nowSeconds: ISSUED_AT + 0.5 })).resolves.toBe(true);
+    // Rounded down, never to the nearest second: half a second before issue is not yet issued,
+    // and the last half second of the window is still inside it.
+    await expect(verify(wire, { nowSeconds: ISSUED_AT - 0.5 })).resolves.toBe(false);
+    await expect(verify(wire, { nowSeconds: ISSUED_AT + 300.5 })).resolves.toBe(true);
   });
 
   test("a lifetime other than 300 seconds fails, even when signed so", async () => {
@@ -1073,7 +1098,8 @@ describe("signing and verifying", () => {
       },
     });
     await expect(verify(throwing)).resolves.toBe(false);
-    await expect(verify(wire, { nowSeconds: ISSUED_AT + 0.5 })).resolves.toBe(false);
+    for (const nowSeconds of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])
+      await expect(verify(wire, { nowSeconds }), String(nowSeconds)).resolves.toBe(false);
     await expect(verify(wire, { expectedChainId: Number.NaN })).resolves.toBe(false);
     await expect(verify(wire, { attestor: "0x1234" as Address })).resolves.toBe(false);
   });

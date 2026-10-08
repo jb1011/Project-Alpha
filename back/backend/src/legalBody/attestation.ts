@@ -17,7 +17,10 @@ import { CUSTOMER_PROVIDER } from "./provider";
  *  - a company filed through formation, established once the state confirms the filing.
  */
 
-export type AttestationState = "pending" | "active" | "revoked";
+/** Every attestation state, in a fixed order: the one list {@link AttestationState} is read from,
+ *  so a reader that checks a state against it accepts every value the type allows. */
+export const ATTESTATION_STATES = ["pending", "active", "revoked"] as const;
+export type AttestationState = (typeof ATTESTATION_STATES)[number];
 export type VerificationState = "awaiting_check" | "verified" | "failed" | "revoked";
 
 export interface AttestationFacts {

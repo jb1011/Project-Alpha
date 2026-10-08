@@ -12,11 +12,16 @@ import type { FilingFacts } from "./filings";
  * chain or an operator recorded: a status other than Active, a broken binding, a revocation.
  */
 
-export type Standing = "pending" | "active" | "unknown" | "inactive";
+/** Every standing, in a fixed order: the one list {@link Standing} is read from, so a reader that
+ *  checks a standing against it accepts every value the type allows. */
+export const STANDINGS = ["pending", "active", "unknown", "inactive"] as const;
+export type Standing = (typeof STANDINGS)[number];
 
+/** Every binding state: the one list {@link PublicBindingState} is read from. */
+export const PUBLIC_BINDING_STATES = ["linked", "broken"] as const;
 /** Whether the agent's pointer, read on chain, names the body: `broken` covers a cleared pointer,
  *  one to another body, and a body the factory no longer returns. */
-export type PublicBindingState = "linked" | "broken";
+export type PublicBindingState = (typeof PUBLIC_BINDING_STATES)[number];
 
 export type StandingReason =
   | "status_not_active"

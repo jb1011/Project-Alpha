@@ -16,6 +16,15 @@ import { addDays, isCalendarDate, yearOf } from "../util/wyomingCalendar";
  */
 export const REPORT_GRACE_DAYS = 60;
 
+/** Every filing status, in a fixed order: the one list {@link FilingStatus} is read from, so a
+ *  reader that checks a status against it accepts every value the type allows. */
+export const FILING_STATUSES = [
+  "not_yet_due",
+  "filed",
+  "past_due_unverified",
+  "unverified",
+] as const;
+
 /**
  * - `not_yet_due`: no due date has passed;
  * - `filed`: a report recorded at the check covers the last due date passed;
@@ -24,7 +33,7 @@ export const REPORT_GRACE_DAYS = 60;
  * - `unverified`: no formation date that due dates can be counted from: none recorded, one that is
  *   not a calendar date, or one after today.
  */
-export type FilingStatus = "not_yet_due" | "filed" | "past_due_unverified" | "unverified";
+export type FilingStatus = (typeof FILING_STATUSES)[number];
 
 /** The filing fields of a statement. `""` and `0` stand for "none" and "unknown". */
 export interface FilingFacts {

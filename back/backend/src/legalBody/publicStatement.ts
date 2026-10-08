@@ -13,11 +13,13 @@ import {
 import type { AgentSnapshot, BodySnapshot, CodeKind } from "../adapters/arc/legalBodyChain";
 import { canonicalizeJcs } from "../oa/manifest";
 import { isCalendarDate } from "../util/wyomingCalendar";
-import type { Attestation, AttestationState } from "./attestation";
-import type { FilingFacts, FilingStatus } from "./filings";
+import { ATTESTATION_STATES, type Attestation, type AttestationState } from "./attestation";
+import { FILING_STATUSES, type FilingFacts, type FilingStatus } from "./filings";
 import { CUSTOMER_PROVIDER } from "./provider";
 import {
+  PUBLIC_BINDING_STATES,
   type PublicBindingState,
+  STANDINGS,
   type Standing,
   type StandingReason,
   computeStanding,
@@ -29,7 +31,7 @@ import {
  *
  * What binds it: the domain names the chain and no contract; the message names the chain again,
  * the identity registry, the factory, the body and the agent, so a statement says nothing about
- * another deployment; and it expires STATEMENT_TTL_SECONDS after it was issued.
+ * another deployment; and it expires PUBLIC_STATEMENT_TTL_SECONDS after it was issued.
  *
  * FLAT, like the v1 attestation (`src/hedera/attestation.ts`): a Solidity verifier hashes it with
  * no nested struct. A field that can be absent has a sentinel the real field never takes: the zero
@@ -40,13 +42,13 @@ import {
  * flattener builds the message for the signer and the verifier alike, so the two cannot drift.
  */
 
-export const STATEMENT_DOMAIN_NAME = "Novi Corpus Attestation";
-export const STATEMENT_DOMAIN_VERSION = "2";
-export const STATEMENT_PRIMARY_TYPE = "LegalBodyStatement";
+export const PUBLIC_STATEMENT_DOMAIN_NAME = "Novi Corpus Attestation";
+export const PUBLIC_STATEMENT_DOMAIN_VERSION = "2";
+export const PUBLIC_STATEMENT_PRIMARY_TYPE = "LegalBodyStatement";
 /** How long a statement is good for, in seconds from its issue. */
-export const STATEMENT_TTL_SECONDS = 300;
-export const STATEMENT_JURISDICTION = "WY";
-export const STATEMENT_ENTITY_TYPE = "LLC";
+export const PUBLIC_STATEMENT_TTL_SECONDS = 300;
+export const PUBLIC_STATEMENT_JURISDICTION = "WY";
+export const PUBLIC_STATEMENT_ENTITY_TYPE = "LLC";
 
 type FieldType = "uint256" | "address" | "bytes32" | "bool" | "string";
 
@@ -106,12 +108,12 @@ export const LEGAL_BODY_STATEMENT_TYPES: {
 
 /** The domain: the name, version "2" and the chain id. No verifying contract: no contract reads the
  *  signature, and the factory the statement is about is in the message. */
-export function statementDomain(chainId: number): {
+export function publicStatementDomain(chainId: number): {
   name: string;
   version: string;
   chainId: number;
 } {
-  return { name: STATEMENT_DOMAIN_NAME, version: STATEMENT_DOMAIN_VERSION, chainId };
+  return { name: PUBLIC_STATEMENT_DOMAIN_NAME, version: PUBLIC_STATEMENT_DOMAIN_VERSION, chainId };
 }
 
 export interface LegalBodyStatement {
@@ -160,7 +162,7 @@ export interface LegalBodyStatement {
   observedAtBlock: bigint;
   /** Unix seconds. */
   issuedAt: bigint;
-  /** `issuedAt` + STATEMENT_TTL_SECONDS. */
+  /** `issuedAt` + PUBLIC_STATEMENT_TTL_SECONDS. */
   expiresAt: bigint;
 }
 
@@ -285,8 +287,8 @@ export function assembleStatement(p: StatementInputs): {
       agentWalletIsContract: hasWallet && p.walletCode === "contract",
       standing,
       attestationState: p.attestation.state,
-      jurisdiction: STATEMENT_JURISDICTION,
-      entityType: STATEMENT_ENTITY_TYPE,
+      jurisdiction: PUBLIC_STATEMENT_JURISDICTION,
+      entityType: PUBLIC_STATEMENT_ENTITY_TYPE,
       legalName: names?.legalName ?? "",
       filingNumber: names?.filingNumber ?? "",
       source: "customer",
@@ -306,7 +308,7 @@ export function assembleStatement(p: StatementInputs): {
       guardianHumanVerified: p.guardianHumanVerified,
       observedAtBlock: p.observedAtBlock,
       issuedAt,
-      expiresAt: issuedAt + BigInt(STATEMENT_TTL_SECONDS),
+      expiresAt: issuedAt + BigInt(PUBLIC_STATEMENT_TTL_SECONDS),
     },
     reasons,
   };
@@ -350,20 +352,40 @@ const UINT256_MAX = 2n ** 256n - 1n;
 const CANONICAL_DECIMAL = /^(0|[1-9][0-9]{0,77})$/;
 const LOWER_BYTES32 = /^0x[0-9a-f]{64}$/;
 
-/** The values each enumerated field allows. */
-const ENUMERATIONS: {
-  readonly [K in keyof LegalBodyStatement]?: readonly LegalBodyStatement[K][];
-} = {
-  bindingState: ["linked", "broken"],
-  standing: ["pending", "active", "unknown", "inactive"],
-  attestationState: ["pending", "active", "revoked"],
-  jurisdiction: [STATEMENT_JURISDICTION],
-  entityType: [STATEMENT_ENTITY_TYPE],
+/**
+ * The values each enumerated field allows. The unions kept in other modules come with their own
+ * lists, read here, so a value added to one of them is allowed here at once.
+ */
+const ENUMERATIONS = {
+  bindingState: PUBLIC_BINDING_STATES,
+  standing: STANDINGS,
+  attestationState: ATTESTATION_STATES,
+  jurisdiction: [PUBLIC_STATEMENT_JURISDICTION],
+  entityType: [PUBLIC_STATEMENT_ENTITY_TYPE],
   source: ["customer", "novi"],
   environment: ["sandbox", "production"],
-  filingStatus: ["not_yet_due", "filed", "past_due_unverified", "unverified"],
+  filingStatus: FILING_STATUSES,
   lastFiledConfirmedBy: ["", "operator"],
+} as const satisfies {
+  readonly [K in keyof LegalBodyStatement]?: readonly LegalBodyStatement[K][];
 };
+
+/** For each enumerated field, the values of its type that its list leaves out. */
+type Unlisted = {
+  [K in keyof typeof ENUMERATIONS]: Exclude<
+    LegalBodyStatement[K],
+    (typeof ENUMERATIONS)[K][number]
+  >;
+}[keyof typeof ENUMERATIONS];
+/** Compiles only for `never`. */
+type MustBeNever<T extends never> = T;
+// Each list holds every value of its field's type, and nothing else (the `satisfies` above). A value
+// added to a field's type but not to its list stops this line compiling, and the error names it:
+// otherwise statements carrying it would be signed, then refused by every verifier.
+type _EveryValueListed = MustBeNever<Unlisted>;
+
+/** The same lists, looked up by any field's name. */
+const ALLOWED: { readonly [K in keyof LegalBodyStatement]?: readonly string[] } = ENUMERATIONS;
 
 /** The fields that hold a Wyoming calendar date, or "". */
 const DATE_FIELDS: ReadonlySet<keyof LegalBodyStatement> = new Set([
@@ -417,7 +439,7 @@ function fieldFromJson(name: keyof LegalBodyStatement, type: FieldType, v: unkno
       return v;
     case "string": {
       if (typeof v !== "string") throw new Error(`statement: ${name} is not a string`);
-      const allowed = ENUMERATIONS[name] as readonly string[] | undefined;
+      const allowed = ALLOWED[name];
       if (allowed !== undefined && !allowed.includes(v))
         throw new Error(`statement: ${name} is not one of its values`);
       if (DATE_FIELDS.has(name) && v !== "" && !isCalendarDate(v))
@@ -448,16 +470,16 @@ export async function signStatement(
   s: LegalBodyStatement,
   signer: LocalAccount,
 ): Promise<SignedStatementJson> {
-  const domain = statementDomain(Number(s.chainId));
+  const domain = publicStatementDomain(Number(s.chainId));
   const signature = await signer.signTypedData({
     domain,
     types: LEGAL_BODY_STATEMENT_TYPES,
-    primaryType: STATEMENT_PRIMARY_TYPE,
+    primaryType: PUBLIC_STATEMENT_PRIMARY_TYPE,
     message: statementMessage(s),
   });
   return {
     domain,
-    primaryType: STATEMENT_PRIMARY_TYPE,
+    primaryType: PUBLIC_STATEMENT_PRIMARY_TYPE,
     message: statementJson(s),
     attestor: signer.address,
     signature,
@@ -480,21 +502,23 @@ function hasExactly(v: unknown, keys: readonly string[]): v is Record<string, un
  * `nowSeconds`. FALSE, and never a throw, unless every one of these holds:
  *  - the envelope has exactly its five keys and the domain exactly its three (a
  *    `verifyingContract` answers false), and the message reads strictly ({@link statementFromJson});
- *  - the domain is `statementDomain(expectedChainId)` and the message names the same chain;
- *  - `issuedAt <= nowSeconds <= expiresAt`, and `expiresAt - issuedAt` is STATEMENT_TTL_SECONDS;
+ *  - the domain is `publicStatementDomain(expectedChainId)` and the message names the same chain;
+ *  - `nowSeconds` is a finite number, and its whole second (a fraction is rounded down, so
+ *    `Date.now() / 1000` works) is from `issuedAt` to `expiresAt`, both included;
+ *  - `expiresAt - issuedAt` is PUBLIC_STATEMENT_TTL_SECONDS;
  *  - the signature recovers to `opts.attestor`, by plain ECDSA.
  *
  * The attestor is the CALLER'S, taken from ENS or the published docs. The envelope's own `attestor`
  * must be an address and is never used: a forged statement can name any signer it likes.
  */
-export async function verifyStatement(
+export async function verifyPublicStatement(
   signed: unknown,
   opts: { attestor: Address; expectedChainId: number; nowSeconds: number },
 ): Promise<boolean> {
   try {
     if (!hasExactly(signed, ENVELOPE_KEYS)) return false;
     const { domain, primaryType, message, attestor, signature } = signed;
-    const expected = statementDomain(opts.expectedChainId);
+    const expected = publicStatementDomain(opts.expectedChainId);
     if (!hasExactly(domain, DOMAIN_KEYS)) return false;
     if (
       domain.name !== expected.name ||
@@ -502,19 +526,20 @@ export async function verifyStatement(
       domain.chainId !== expected.chainId
     )
       return false;
-    if (primaryType !== STATEMENT_PRIMARY_TYPE) return false;
+    if (primaryType !== PUBLIC_STATEMENT_PRIMARY_TYPE) return false;
     if (typeof attestor !== "string" || !isAddress(attestor)) return false;
     if (typeof signature !== "string" || !SIGNATURE.test(signature)) return false;
     const s = statementFromJson(message);
     if (s.chainId !== BigInt(opts.expectedChainId)) return false;
-    const now = BigInt(opts.nowSeconds);
+    if (!Number.isFinite(opts.nowSeconds)) return false;
+    const now = BigInt(Math.floor(opts.nowSeconds));
     if (now < s.issuedAt || now > s.expiresAt) return false;
-    if (s.expiresAt - s.issuedAt !== BigInt(STATEMENT_TTL_SECONDS)) return false;
+    if (s.expiresAt - s.issuedAt !== BigInt(PUBLIC_STATEMENT_TTL_SECONDS)) return false;
     return await verifyTypedData({
       address: opts.attestor,
       domain: expected,
       types: LEGAL_BODY_STATEMENT_TYPES,
-      primaryType: STATEMENT_PRIMARY_TYPE,
+      primaryType: PUBLIC_STATEMENT_PRIMARY_TYPE,
       message: statementMessage(s),
       signature: signature as Hex,
     });
