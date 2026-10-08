@@ -418,6 +418,35 @@ describe("company:check --result passed records the last annual report", () => {
       expect(checks.list(companyId)).toEqual([]);
     });
   });
+
+  test("a report filed before the formation date is refused in the dry run as in the write; one filed on the formation date itself is recorded", async () => {
+    const { companyId, control } = await ownerCompany();
+    // Formed on LONG_AGO: the first report, said to be filed the day before.
+    for (const yes of [false, true])
+      expect(
+        await refusal(
+          passedCheck(
+            companyId,
+            control,
+            { "--last-report-period": "2021", "--last-report-filed": addDays(LONG_AGO, -1) },
+            yes,
+          ),
+        ),
+      ).toMatch(/^company check: lastReportFiledOn is before the formation date$/);
+    expect(checks.list(companyId)).toEqual([]);
+
+    const onFormation = { "--last-report-period": "2021", "--last-report-filed": LONG_AGO };
+    const dry = await run<DryRun>(passedCheck(companyId, control, onFormation, false));
+    expect(dry.wouldRecord).toMatchObject({ lastReportPeriod: 2021, lastReportFiledOn: LONG_AGO });
+    expect(checks.list(companyId)).toEqual([]);
+    const written = await run<Recorded>(passedCheck(companyId, control, onFormation));
+    expect(written.check).toMatchObject({
+      formationDate: LONG_AGO,
+      lastReportPeriod: 2021,
+      lastReportFiledOn: LONG_AGO,
+    });
+    expect(checks.list(companyId)).toEqual([written.check]);
+  });
 });
 
 describe("company:check --result failed", () => {

@@ -220,8 +220,8 @@ describe("the two fields", () => {
 });
 
 describe("the columns hold their own shape against raw SQL", () => {
-  test("a period outside 1990 to 2200 is refused, and the bounds are kept", () => {
-    for (const period of [1989, 2201, -1, 0])
+  test("a period that is not a whole number from 1990 to 2200 is refused, and the bounds are kept", () => {
+    for (const period of [1989, 2201, -1, 0, 2025.5])
       expect(() => rawPassed({ last_report_period: period }), String(period)).toThrow(/CHECK/);
     expect(reportColumns()).toEqual([]);
     expect(rawPassed({ last_report_period: 1990 }).changes).toBe(1);
@@ -323,6 +323,15 @@ describe("the rules of append, each refusal naming its field and writing nothing
       /^company check: lastReportFiledOn is after the date of the check$/,
     ],
     [
+      "a filed date before the formation date",
+      passed({
+        formationDate: "2023-03-10",
+        lastReportPeriod: 2024,
+        lastReportFiledOn: "2023-03-09",
+      }),
+      /^company check: lastReportFiledOn is before the formation date$/,
+    ],
+    [
       "a formation date one day after the check",
       passed({ formationDate: UTC_DAY }),
       /^company check: formationDate is after the date of the check$/,
@@ -361,6 +370,19 @@ describe("the rules of append, each refusal naming its field and writing nothing
         .lastReportPeriod,
     ).toBe(1990);
     expect(checks.list("co_1")).toHaveLength(4);
+  });
+
+  test("accepts a report filed on the formation date itself", () => {
+    const onFormation = {
+      formationDate: "2023-03-10",
+      lastReportPeriod: 2024,
+      lastReportFiledOn: "2023-03-10",
+    };
+    expect(validateCompanyCheck(passed(onFormation))).toMatchObject(onFormation);
+    expect(checks.append(passed(onFormation))).toMatchObject(onFormation);
+    expect(reportColumns()).toEqual([
+      { last_report_period: 2024, last_report_filed_on: "2023-03-10" },
+    ]);
   });
 
   test("a revocation and a failure without the fields are recorded as before", () => {

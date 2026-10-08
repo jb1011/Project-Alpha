@@ -1769,7 +1769,7 @@ export function migrate(db: Database.Database): void {
   for (const [col, definition] of [
     [
       "last_report_period",
-      "INTEGER CHECK (last_report_period IS NULL OR last_report_period BETWEEN 1990 AND 2200)",
+      "INTEGER CHECK (last_report_period IS NULL OR (typeof(last_report_period) = 'integer' AND last_report_period BETWEEN 1990 AND 2200))",
     ],
     [
       "last_report_filed_on",

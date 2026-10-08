@@ -253,8 +253,8 @@ function optionalReportPeriod(value: unknown): number | null {
  *
  * The report year, and the date the report was filed on, are recorded on a passed check only, and
  * the date only with the year. The year runs from the first report year, the year after formation,
- * to the year of the check; the date is not after the day of the check. The day of the check is
- * Wyoming's.
+ * to the year of the check; the date is neither after the day of the check nor before the
+ * formation date. The day of the check is Wyoming's.
  */
 function lastReportOf(
   v: NewCompanyCheck,
@@ -273,6 +273,9 @@ function lastReportOf(
   if (year > yearOf(checkDay)) refuse("lastReportPeriod", "is after the year of the check");
   if (filed === null) return { lastReportPeriod: year };
   if (filed > checkDay) refuse("lastReportFiledOn", "is after the date of the check");
+  // Both are calendar dates written YYYY-MM-DD, so they compare as text.
+  if (v.formationDate !== null && filed < v.formationDate)
+    refuse("lastReportFiledOn", "is before the formation date");
   return { lastReportPeriod: year, lastReportFiledOn: filed };
 }
 
