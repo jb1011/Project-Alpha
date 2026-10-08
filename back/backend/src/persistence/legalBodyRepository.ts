@@ -1,8 +1,22 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { type Address, type Hex, getAddress, isAddress } from "viem";
+import type { Address, Hex } from "viem";
 import { redactPii } from "../formation/pii";
 import { sqliteUtcTimestamp } from "../util/sqliteTime";
+import {
+  LegalBodyInputError,
+  MAX_UNIX_SECONDS,
+  ZERO_ADDRESS,
+  canonicalAgentId,
+  checksummed,
+  isIntegerWithin,
+  lowerHash,
+  requireAddress,
+  requireDeployment,
+  requireHash,
+  requirePublicLimit,
+  requireSeconds,
+} from "./legalBodyInput";
 
 /**
  * LEGAL BODIES: the legal wrapper ordered for an agent identity its customer already owns, one row
@@ -551,52 +565,13 @@ function parseDetail(raw: string | null): unknown {
   }
 }
 
-/**
- * An address in the one form rows store it: checksummed, so a lookup matches whatever casing the
- * caller holds. Null when the value is not an address at all, which no row can hold.
- */
-function checksummed(value: string): Address | null {
-  return isAddress(value, { strict: false }) ? getAddress(value) : null;
-}
+// `LegalBodyInputError` is defined with the input rules it enforces (`legalBodyInput.ts`, shared
+// with the statement log), and exported from here as well, where its callers have always found it.
+export { LegalBodyInputError };
 
-/**
- * A value handed to the repository that no row may hold: a hash that is not one, a time in the
- * wrong unit, a chain id of zero. It is a bug in the caller, never the outcome of a race, so it is
- * thrown, before anything is written, rather than answered.
- */
-export class LegalBodyInputError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "LegalBodyInputError";
-  }
-}
-
-/** The address in the form rows store it, or a `LegalBodyInputError` naming the field. */
-function requireAddress(field: string, value: unknown): Address {
-  const address = typeof value === "string" ? checksummed(value) : null;
-  if (address === null) throw new LegalBodyInputError(`${field} must be a 0x address`);
-  return address;
-}
-
-const HASH_32 = /^0x[0-9a-fA-F]{64}$/;
 const HEX_BYTES = /^0x(?:[0-9a-fA-F]{2})+$/;
 /** A link signature: whole bytes of hex, or none at all (`0x`) for an owner that signs nothing. */
 const SIGNATURE_BYTES = /^0x(?:[0-9a-fA-F]{2})*$/;
-
-/**
- * A 32-byte hash in the one spelling rows store it: lower-case, so a stored hash compares as text
- * with the same hash read from anywhere else. Null when the value is not a 32-byte hash at all.
- */
-function lowerHash(value: unknown): Hex | null {
-  return typeof value === "string" && HASH_32.test(value) ? (value.toLowerCase() as Hex) : null;
-}
-
-function requireHash(field: string, value: unknown): Hex {
-  const hash = lowerHash(value);
-  if (hash === null)
-    throw new LegalBodyInputError(`${field} must be 0x and 64 hex digits (a 32-byte hash)`);
-  return hash;
-}
 
 /** One or more whole bytes of hex, lower-cased. */
 function requireBytes(field: string, value: unknown): Hex {
@@ -604,9 +579,6 @@ function requireBytes(field: string, value: unknown): Hex {
     throw new LegalBodyInputError(`${field} must be 0x and one or more whole bytes of hex`);
   return value.toLowerCase() as Hex;
 }
-
-/** The largest time the seconds columns hold. A time in milliseconds is past it for centuries. */
-const MAX_UNIX_SECONDS = 99_999_999_999;
 
 /**
  * The smallest time a schedule takes, in unix MILLISECONDS: one past the largest time in seconds,
@@ -627,20 +599,6 @@ const DRAFT_LIFETIME_MS = 24 * 60 * 60 * 1000;
 /** A deployed body counts as an open order for this long after its block, and no longer. */
 const DEPLOYED_OPEN_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** A time in unix SECONDS, the unit of a block timestamp. */
-function requireSeconds(field: string, value: unknown): number {
-  if (!isIntegerWithin(value, 1, MAX_UNIX_SECONDS))
-    throw new LegalBodyInputError(
-      `${field} must be a whole number of unix seconds (1 to ${MAX_UNIX_SECONDS}), got ${String(value)}`,
-    );
-  return value;
-}
-
-/** A JS number that is an exact integer in [min, max]: not a string, a bigint, NaN or a fraction. */
-function isIntegerWithin(value: unknown, min: number, max: number): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
-}
-
 /** A time in unix MILLISECONDS read by a listing or a counter: zero or more, within a `Date`. */
 function requireMillis(field: string, value: unknown): number {
   if (!isIntegerWithin(value, 0, MAX_DATE_MS))
@@ -657,28 +615,6 @@ function requireLimit(value: unknown): number {
       `limit must be a whole number, one or more, got ${String(value)}`,
     );
   return value;
-}
-
-/** The most rows one call of a public finder returns. */
-const MAX_PUBLIC_LIMIT = 100;
-
-/** A public finder's row count for LIMIT: a whole number from 1 to `MAX_PUBLIC_LIMIT`. */
-function requirePublicLimit(value: unknown): number {
-  if (!isIntegerWithin(value, 1, MAX_PUBLIC_LIMIT))
-    throw new LegalBodyInputError(
-      `limit must be a whole number from 1 to ${MAX_PUBLIC_LIMIT}, got ${String(value)}`,
-    );
-  return value;
-}
-
-/** The deployment as rows store it: the factory checksummed, so a lookup matches any casing. */
-function requireDeployment(d: unknown): { chain_id: number; factory: Address } {
-  const { chainId, factory } = (d ?? {}) as { chainId?: unknown; factory?: unknown };
-  if (!isIntegerWithin(chainId, 1, Number.MAX_SAFE_INTEGER))
-    throw new LegalBodyInputError(
-      `a deployment's chainId must be a positive whole number, got ${String(chainId)}`,
-    );
-  return { chain_id: chainId, factory: requireAddress("a deployment's factory", factory) };
 }
 
 /** The `created_at` text a draft created at `nowMs` minus its lifetime carries: at or after it,
@@ -698,23 +634,6 @@ export function isDraftExpired(
   nowMs: number,
 ): boolean {
   return row.bindingState === "draft" && row.createdAt < draftCutoff(requireMillis("nowMs", nowMs));
-}
-
-const UINT256_MAX = 2n ** 256n - 1n;
-
-const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
-
-/**
- * An agentId in the one spelling rows store it: a uint256 in decimal without leading zeros.
- *
- * The two agentId indexes compare `agent_id` as TEXT, so "042" and "42" would be two agents to
- * them, and the same identity could hold two orders on their way, or two linked bodies. Null when
- * the value is not a uint256 in decimal at all.
- */
-function canonicalAgentId(value: string): string | null {
-  if (!/^[0-9]+$/.test(value)) return null;
-  const n = BigInt(value);
-  return n <= UINT256_MAX ? n.toString() : null;
 }
 
 /**

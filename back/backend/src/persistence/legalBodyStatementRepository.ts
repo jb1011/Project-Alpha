@@ -1,6 +1,18 @@
 import type Database from "better-sqlite3";
-import { type Address, type Hex, getAddress, isAddress } from "viem";
-import { type Deployment, LegalBodyInputError } from "./legalBodyRepository";
+import type { Address, Hex } from "viem";
+import {
+  LegalBodyInputError,
+  ZERO_ADDRESS,
+  canonicalAgentId,
+  checksummed,
+  isIntegerWithin,
+  requireAddress,
+  requireDeployment,
+  requireHash,
+  requirePublicLimit,
+  requireSeconds,
+} from "./legalBodyInput";
+import type { Deployment } from "./legalBodyRepository";
 
 /**
  * THE STATEMENT LOG: one row for each DISTINCT set of claims Novi signed about a legal body, kept
@@ -17,8 +29,9 @@ import { type Deployment, LegalBodyInputError } from "./legalBodyRepository";
  * The evidence holds ids, enums and booleans only: never a name, a filing number or an address of
  * a person. The agent's wallet is kept beside it, for the lookup by wallet.
  *
- * Like the legal-body repository, it throws a `LegalBodyInputError`, before anything is written,
- * for a value no row may hold: that is a bug in the caller, never the outcome of a race.
+ * Like the legal-body repository, and by the same rules (`legalBodyInput.ts`), it throws a
+ * `LegalBodyInputError`, before anything is written, for a value no row may hold: that is a bug in
+ * the caller, never the outcome of a race.
  */
 
 /** What a statement's claims rested on: ids, enums and booleans, stored as JSON numbers, strings
@@ -128,45 +141,16 @@ const COMPANY_STATUSES: readonly StatementEvidence["companyStatus"][] = [
   "abandoned",
 ];
 
-/** The most agent ids one lookup by wallet returns. */
-const MAX_AGENT_IDS = 100;
-
-/** The largest time the seconds column holds. A time in milliseconds is past it for centuries. */
-const MAX_UNIX_SECONDS = 99_999_999_999;
-
-const UINT256_MAX = 2n ** 256n - 1n;
-
-const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
-
-const HASH_32 = /^0x[0-9a-fA-F]{64}$/;
-
-/** A JS number that is an exact integer in [min, max]: not a string, a bigint, NaN or a fraction. */
-function isIntegerWithin(value: unknown, min: number, max: number): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
-}
-
-/** The address checksummed, the one form rows store it in, or a `LegalBodyInputError`. */
-function requireAddress(field: string, value: unknown): Address {
-  if (typeof value !== "string" || !isAddress(value, { strict: false }))
-    throw new LegalBodyInputError(`${field} must be a 0x address`);
-  return getAddress(value);
-}
-
-/** A 32-byte hash, lower-cased: one spelling per hash, so stored hashes compare as text. */
-function requireHash(field: string, value: unknown): Hex {
-  if (typeof value !== "string" || !HASH_32.test(value))
-    throw new LegalBodyInputError(`${field} must be 0x and 64 hex digits (a 32-byte hash)`);
-  return value.toLowerCase() as Hex;
-}
-
 /**
- * An agentId in the one spelling rows store it: a uint256 in decimal without leading zeros. A
- * string only: a JavaScript number cannot hold every uint256.
+ * The agent id in the one spelling `legal_bodies` stores it (`canonicalAgentId`), so the agents a
+ * wallet lookup returns are found there. A string only: a JavaScript number cannot hold every
+ * uint256.
  */
 function requireAgentId(value: unknown): string {
-  if (typeof value !== "string" || !/^[0-9]+$/.test(value) || BigInt(value) > UINT256_MAX)
+  const agentId = typeof value === "string" ? canonicalAgentId(value) : null;
+  if (agentId === null)
     throw new LegalBodyInputError("agentId must be a string holding a uint256 in decimal");
-  return BigInt(value).toString();
+  return agentId;
 }
 
 /** An id of another table's row (a check, an event), positive, or null when there is none. */
@@ -195,17 +179,11 @@ function requireEvidence(value: unknown): StatementEvidence {
   return { checkId, revocationEventId, companyStatus, humanVerified: e.humanVerified };
 }
 
-/** The deployment as rows store it: the factory checksummed, so a lookup matches any casing. */
-function requireDeployment(d: unknown): { chain_id: number; factory: Address } {
-  const { chainId, factory } = (d ?? {}) as { chainId?: unknown; factory?: unknown };
-  if (!isIntegerWithin(chainId, 1, Number.MAX_SAFE_INTEGER))
-    throw new LegalBodyInputError(
-      `a deployment's chainId must be a positive whole number, got ${String(chainId)}`,
-    );
-  return { chain_id: chainId, factory: requireAddress("a deployment's factory", factory) };
-}
-
-/** The statement as a row, every field checked and in the form rows store it. */
+/**
+ * The statement as a row, every field checked and in the form rows store it. The deployment, the
+ * agent id, the addresses, the hash and the time follow the legal-body tables' own rules
+ * (`legalBodyInput.ts`), the values the two tables are read together by.
+ */
 function toNewRow(s: NewStatementRecord): NewRow {
   if (!isIntegerWithin(s.chainId, 1, Number.MAX_SAFE_INTEGER))
     throw new LegalBodyInputError(
@@ -217,10 +195,7 @@ function toNewRow(s: NewStatementRecord): NewRow {
     throw new LegalBodyInputError(
       `observedAtBlock must be a positive whole block number, got ${String(s.observedAtBlock)}`,
     );
-  if (!isIntegerWithin(s.issuedAt, 1, MAX_UNIX_SECONDS))
-    throw new LegalBodyInputError(
-      `issuedAt must be a whole number of unix seconds (1 to ${MAX_UNIX_SECONDS}), got ${String(s.issuedAt)}`,
-    );
+  const issuedAt = requireSeconds("issuedAt", s.issuedAt);
   return {
     legal_body_id: s.legalBodyId,
     chain_id: s.chainId,
@@ -231,7 +206,7 @@ function toNewRow(s: NewStatementRecord): NewRow {
     standing: s.standing,
     claims_hash: requireHash("claimsHash", s.claimsHash),
     observed_at_block: s.observedAtBlock,
-    issued_at: s.issuedAt,
+    issued_at: issuedAt,
     evidence: JSON.stringify(requireEvidence(s.evidence)),
   };
 }
@@ -292,15 +267,13 @@ export class SqliteLegalBodyStatementRepository implements LegalBodyStatementRep
 
   agentIdsByWallet(d: Deployment, wallet: Address, limit: number): string[] {
     const deployment = requireDeployment(d);
-    if (!isIntegerWithin(limit, 1, MAX_AGENT_IDS))
-      throw new LegalBodyInputError(
-        `limit must be a whole number from 1 to ${MAX_AGENT_IDS}, got ${String(limit)}`,
-      );
-    if (typeof wallet !== "string" || !isAddress(wallet, { strict: false })) return [];
-    const lower = wallet.toLowerCase();
+    const n = requirePublicLimit(limit);
+    const address = typeof wallet === "string" ? checksummed(wallet) : null;
+    if (address === null) return [];
+    const lower = address.toLowerCase();
     if (lower === ZERO_ADDRESS) return [];
     return (
-      this.stmts.agentIdsByWallet.all({ ...deployment, wallet: lower, limit }) as {
+      this.stmts.agentIdsByWallet.all({ ...deployment, wallet: lower, limit: n }) as {
         agent_id: string;
       }[]
     ).map((r) => r.agent_id);
