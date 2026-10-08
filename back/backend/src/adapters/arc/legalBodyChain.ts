@@ -2,6 +2,7 @@ import {
   type Abi,
   type Address,
   BaseError,
+  type ContractFunctionParameters,
   ContractFunctionRevertedError,
   type Hex,
   type Log,
@@ -57,6 +58,10 @@ export interface LegalBodyChainDeps {
   /** The oldest head, in seconds against `now()`, that {LegalBodyChain.head} believes. Unset: no
    *  check. Set, it must be a finite number above 0: the constructor refuses anything else. */
   maxHeadAgeSeconds?: number;
+  /** The Multicall3 contract {LegalBodyChain.readStatementSnapshot} reads through. Unset: the
+   *  snapshot reads each fact with a call of its own, every one at the same block. The other reads
+   *  ignore it. */
+  multicall3?: Address;
 }
 
 /** Headroom added to the node's estimate to get the gas limit a create is sent with. */
@@ -79,6 +84,17 @@ const CREATION_LOG_WINDOW_FLOOR = 500n;
 /** A legal body's own `status()`: LegalManager's `Status` enum, by its value (Active, WindingDown,
  *  Dissolved, in declaration order). */
 const BODY_STATUSES = ["active", "winding_down", "dissolved"] as const;
+
+/** The name of the `status()` value a body reports. A value outside the contract's enum throws: it
+ *  is not a state this code knows. */
+function bodyStatusName(body: Address, value: number): (typeof BODY_STATUSES)[number] {
+  const status = BODY_STATUSES[value];
+  if (status === undefined)
+    throw new Error(
+      `LegalBodyChain: the body at ${body} reports status ${value}, outside its contract's enum`,
+    );
+  return status;
+}
 
 /** The factory's event for a body it created. */
 const LEGAL_BODY_CREATED = getAbiItem({ abi: legalBodyFactoryAbi, name: "LegalBodyCreated" });
@@ -253,6 +269,131 @@ function isNonexistentToken(e: unknown): boolean {
   return reverted.raw?.toLowerCase().startsWith(NONEXISTENT_TOKEN_SELECTOR) === true;
 }
 
+/** What an address holds at a block: no code, an EIP-7702 delegation, or a contract. */
+export type CodeKind = "none" | "delegated" | "contract";
+
+/** The code of an EIP-7702 delegated account: this prefix, then the delegate's 20 bytes. */
+const DELEGATION_PREFIX = "0xef0100";
+const DELEGATION_CODE_BYTES = 23;
+
+/** "delegated" is code of exactly 23 bytes starting 0xef0100 (an EIP-7702 delegation): a key
+ *  controls that address. */
+export function codeKindOf(code: Hex | undefined): CodeKind {
+  if (code === undefined || code === "0x") return "none";
+  return code.length === 2 + 2 * DELEGATION_CODE_BYTES &&
+    code.toLowerCase().startsWith(DELEGATION_PREFIX)
+    ? "delegated"
+    : "contract";
+}
+
+/** One agent of a statement snapshot, with the bodies to read for it. */
+export interface SnapshotRequest {
+  agentId: bigint;
+  bodies: readonly Address[];
+}
+
+/** One body, as the chain stood at the snapshot's block. */
+export interface BodySnapshot {
+  body: Address;
+  /** `factory.identityOwnerAtCreation(body)`; the zero address is `undefined`. */
+  creator: Address | undefined;
+  status: "active" | "winding_down" | "dissolved";
+  /** `meta().agentId`: the agent the body names itself. */
+  metaAgentId: bigint;
+  /** `meta().operatingAgreementHash`, in lower case. */
+  oaHash: Hex;
+}
+
+/** One agent, as the chain stood at the snapshot's block. */
+export interface AgentSnapshot {
+  agentId: bigint;
+  /** `factory.linkedLegalBody(agentId)`; the zero address is `undefined`. */
+  linked: Address | undefined;
+  /** `registry.getAgentWallet(agentId)`: the zero address when the agent has none. */
+  agentWallet: Address;
+  /** The requested bodies, in the request's order. */
+  bodies: BodySnapshot[];
+}
+
+/** Every chain fact of a statement, read at one block. */
+export interface StatementSnapshot {
+  blockNumber: bigint;
+  blockTimestamp: bigint;
+  /** The requested agents, in the requests' order. */
+  agents: AgentSnapshot[];
+}
+
+/** A body's `meta()`, as viem decodes its four values, in the contract's order. */
+type BodyMeta = readonly [
+  ein: string,
+  formationDate: bigint,
+  operatingAgreementHash: Hex,
+  agentId: bigint,
+];
+
+/** The most agents one snapshot reads. */
+const SNAPSHOT_MAX_AGENTS = 100;
+/** The most bodies one snapshot reads for one agent. */
+const SNAPSHOT_MAX_BODIES_PER_AGENT = 4;
+/** The most bodies one snapshot reads in all. */
+const SNAPSHOT_MAX_BODIES = 100;
+/** Through Multicall3, the most sub-call data, in bytes, one `aggregate3` carries (viem's
+ *  `batchSize`): beyond it, viem starts another `eth_call`, at the same block. */
+const SNAPSHOT_MULTICALL_BATCH_BYTES = 4096;
+/** Without Multicall3, the most reads in flight at once. A snapshot of 100 bodies is 500 reads,
+ *  which a rate-limited node would refuse if they all went at once. */
+const SNAPSHOT_READS_IN_FLIGHT = 20;
+
+/** Refuse a snapshot outside its bounds, before anything is read: 1 to {SNAPSHOT_MAX_AGENTS}
+ *  agents, at most {SNAPSHOT_MAX_BODIES_PER_AGENT} bodies per agent and {SNAPSHOT_MAX_BODIES} in
+ *  all. */
+function checkSnapshotBounds(requests: readonly SnapshotRequest[]): void {
+  if (requests.length < 1 || requests.length > SNAPSHOT_MAX_AGENTS)
+    throw new Error(
+      `LegalBodyChain: a statement snapshot reads 1 to ${SNAPSHOT_MAX_AGENTS} agents, not ${requests.length}`,
+    );
+  let bodies = 0;
+  for (const r of requests) {
+    if (r.bodies.length > SNAPSHOT_MAX_BODIES_PER_AGENT)
+      throw new Error(
+        `LegalBodyChain: a statement snapshot reads at most ${SNAPSHOT_MAX_BODIES_PER_AGENT} bodies per agent, not ${r.bodies.length} for agent ${r.agentId}`,
+      );
+    bodies += r.bodies.length;
+  }
+  if (bodies > SNAPSHOT_MAX_BODIES)
+    throw new Error(
+      `LegalBodyChain: a statement snapshot reads at most ${SNAPSHOT_MAX_BODIES} bodies in all, not ${bodies}`,
+    );
+}
+
+/**
+ * `read` applied to each item, at most `limit` at once, the results in the items' order. The first
+ * failure rejects, and no read starts after it: reads already in flight finish, and their answers
+ * are not used.
+ */
+async function mapInFlight<T, R>(
+  items: readonly T[],
+  limit: number,
+  read: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = [];
+  let next = 0;
+  let failed = false;
+  const worker = async (): Promise<void> => {
+    while (!failed && next < items.length) {
+      const i = next++;
+      try {
+        results[i] = await read(items[i] as T);
+      } catch (e) {
+        failed = true;
+        throw e;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 /**
  * The backend's reads of the LegalBodyFactory and of the ERC-8004 identity registry it reads
  * owners from.
@@ -418,12 +559,112 @@ export class LegalBodyChain {
       functionName: "status",
       blockNumber,
     });
-    const status = BODY_STATUSES[value];
-    if (status === undefined)
-      throw new Error(
-        `LegalBodyChain: the body at ${body} reports status ${value}, outside its contract's enum`,
-      );
-    return status;
+    return bodyStatusName(body, value);
+  }
+
+  /**
+   * Every chain fact a statement rests on, read at ONE block: the head's, read once and refused
+   * when stale, as {head} refuses it. Per agent, the factory's `linkedLegalBody` and the
+   * registry's `getAgentWallet`; per body, the factory's `identityOwnerAtCreation` and the body's
+   * own `status()` and `meta()`. The identity's owner is not read on its own: `linkedLegalBody`
+   * names a body only while the identity still belongs to the body's creator, the factory
+   * comparing the two on chain.
+   *
+   * With `multicall3` set, the calls go through it, which viem cuts into `aggregate3` calls of at
+   * most {SNAPSHOT_MULTICALL_BATCH_BYTES} bytes of sub-call data. Without it, each call is a read
+   * of its own, at most {SNAPSHOT_READS_IN_FLIGHT} in flight at once. Either way every call is at
+   * the head's block, and the answers are decoded the same way.
+   *
+   * The requests are bounded before anything is read (see {checkSnapshotBounds}). Any call that
+   * fails throws, and so does a status outside the body's enum: nothing becomes an answer.
+   */
+  async readStatementSnapshot(requests: readonly SnapshotRequest[]): Promise<StatementSnapshot> {
+    checkSnapshotBounds(requests);
+    const head = await this.head();
+
+    // Each fact's position in `calls`, which is its position in the answers. Agent by agent, in
+    // the requests' order: its two reads, then its bodies' three each.
+    const calls: ContractFunctionParameters[] = [];
+    const slot = (call: ContractFunctionParameters): number => calls.push(call) - 1;
+    const slots = requests.map(({ agentId, bodies }) => ({
+      agentId,
+      linked: slot({
+        address: this.d.factory,
+        abi: legalBodyFactoryAbi,
+        functionName: "linkedLegalBody",
+        args: [agentId],
+      }),
+      agentWallet: slot({
+        address: this.d.identityRegistry,
+        abi: iIdentityRegistryAbi,
+        functionName: "getAgentWallet",
+        args: [agentId],
+      }),
+      bodies: bodies.map((body) => ({
+        body,
+        creator: slot({
+          address: this.d.factory,
+          abi: legalBodyFactoryAbi,
+          functionName: "identityOwnerAtCreation",
+          args: [body],
+        }),
+        status: slot({ address: body, abi: legalManagerAbi, functionName: "status" }),
+        meta: slot({ address: body, abi: legalManagerAbi, functionName: "meta" }),
+      })),
+    }));
+
+    const answers = await this.readAtBlock(calls, head.number);
+
+    const agents = slots.map((agent): AgentSnapshot => {
+      const linked = answers[agent.linked] as Address;
+      return {
+        agentId: agent.agentId,
+        linked: isAddressEqual(linked, zeroAddress) ? undefined : linked,
+        agentWallet: answers[agent.agentWallet] as Address,
+        bodies: agent.bodies.map((b): BodySnapshot => {
+          const creator = answers[b.creator] as Address;
+          const [, , oaHash, metaAgentId] = answers[b.meta] as BodyMeta;
+          return {
+            body: b.body,
+            creator: isAddressEqual(creator, zeroAddress) ? undefined : creator,
+            status: bodyStatusName(b.body, answers[b.status] as number),
+            metaAgentId,
+            oaHash: oaHash.toLowerCase() as Hex,
+          };
+        }),
+      };
+    });
+    return { blockNumber: head.number, blockTimestamp: head.timestamp, agents };
+  }
+
+  /**
+   * Each call's answer, in the calls' order, at `blockNumber`: through Multicall3 when one is set,
+   * otherwise a read per call, at most {SNAPSHOT_READS_IN_FLIGHT} in flight. Any failed call
+   * throws: through Multicall3, viem sends every sub-call allowed to fail, and, told to allow no
+   * failure, throws on the first one that failed.
+   */
+  private async readAtBlock(
+    calls: ContractFunctionParameters[],
+    blockNumber: bigint,
+  ): Promise<readonly unknown[]> {
+    const multicallAddress = this.d.multicall3;
+    if (multicallAddress)
+      return this.d.publicClient.multicall({
+        contracts: calls,
+        blockNumber,
+        allowFailure: false,
+        multicallAddress,
+        batchSize: SNAPSHOT_MULTICALL_BATCH_BYTES,
+      });
+    return mapInFlight(calls, SNAPSHOT_READS_IN_FLIGHT, (call) =>
+      this.d.publicClient.readContract({ ...call, blockNumber }),
+    );
+  }
+
+  /** What `address` holds at `blockNumber`: no code, an EIP-7702 delegation, or a contract (see
+   *  {codeKindOf}). A failed read throws. */
+  async codeKind(address: Address, blockNumber: bigint): Promise<CodeKind> {
+    return codeKindOf(await this.d.publicClient.getCode({ address, blockNumber }));
   }
 
   /** The exact pointer bytes the identity owner writes to link the agent to `legalBody`. */
@@ -756,3 +997,13 @@ export type CreateChainPort = Pick<
 export type LegalBodyChainPort = LinkChainPort &
   CreateChainPort &
   Pick<LegalBodyChain, "linkedLegalBody" | "bodyStatus" | "executorPendingNonce">;
+
+/**
+ * What a public statement about a legal body needs of a LegalBodyChain: the chain and factory it
+ * reads, one block's facts, and the kind of code an address holds. Built from public members only,
+ * so a plain object satisfies it.
+ */
+export type StatementChainPort = Pick<
+  LegalBodyChain,
+  "chainId" | "factory" | "readStatementSnapshot" | "codeKind"
+>;
