@@ -20,10 +20,12 @@ Every chain fact in a statement is read at one block, `observedAtBlock`, which w
 
 It does not say:
 
-* who the guardian is, who owns or manages the LLC, who its registered agent is, or its EIN;
+* who owns or manages the LLC, who its registered agent is, or its EIN;
 * anything about money the agent holds, or limits on its spending;
 * anything about what the agent does, or how well;
 * that the LLC is in good standing with the state of Wyoming. An annual report counts as filed only when a Novi operator saw it on the registry.
+
+It does not name the guardian: `identityOwnerAtCreation` is the identity's owner as the chain records it, which may be the guardian's own wallet.
 
 ## Standing
 
@@ -177,7 +179,7 @@ Both routes share the same rate limits, one per client and one for all callers t
 
 ### The transparency list
 
-On a deployment that serves statements, the API's `GET /transparency` also lists, under `legalBodies`, each linked legal body whose statement would read `active`, with its name, its filing number and `links.statement`. `stats.legalBodies` counts them. When the chain could not be read, the list is empty and `legalBodiesAvailable` is `false`. The list is not signed and can be a few minutes old: follow `links.statement` for a signed, current answer.
+On a deployment that serves statements, the API's `GET /transparency` also lists, under `legalBodies`, each linked legal body whose statement would read `active`, with its name, its filing number and `links.statement`. `stats.legalBodies` counts them. When the chain could not be read, the list is empty and `legalBodiesAvailable` is `false`. The list is not signed and can be a few seconds old; a body linked moments ago is listed once the binding check has recorded the link. Follow `links.statement` for a signed, current answer.
 
 ## The signed statement
 
@@ -391,7 +393,7 @@ if (!valid) throw new Error("not a valid statement");
 console.log(answer.statement.message.standing);
 ```
 
-A signature covers values, not how they are written: viem also accepts `"042"` for agent 42, or an address in lower case, under the same signature. So one signature can verify over more than one text: never use the text of a message as its identity. The reference verifier in the repository, `verifyPublicStatement` in `back/backend/src/legalBody/publicStatement.ts`, refuses every spelling but the one the answers use.
+A signature covers values, not how they are written: viem also accepts `"042"` for agent 42, or an address in lower case, under the same signature. So one signature can verify over more than one text: never use the text of a message as its identity. The reference verifier, `verifyPublicStatement` in [publicStatement.ts](https://github.com/jb1011/Project-Alpha/blob/main/back/backend/src/legalBody/publicStatement.ts), in Novi's public repository, refuses every spelling but the one the answers use. It also accepts only the canonical signature, the form the answers carry: a low `s` (at most half the order of secp256k1) and `v` 27 or 28.
 
 ## Contract accounts
 
