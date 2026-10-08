@@ -40,14 +40,38 @@ only when `legalStatus == 0` and the treasury is not paused, `inactive` on a def
 read failed — never guessed, never memoised.
 
 **Throttling, freshness, 503, 404.** Two token buckets, both spent on a memo MISS only (a hit reads no chain): a
-per-client `TokenBucket(10, 0.5)` keyed by the first `X-Forwarded-For` entry (`"direct"` if none; 2000 keys), in front
-of one process-wide `TokenBucket(30, 1)`. Either refuses identically —
+per-client `TokenBucket(10, 0.5)` keyed by the LAST `X-Forwarded-For` entry, the one the proxy in front of the API
+appended (`"direct"` if none; 2000 keys), in front of one process-wide `TokenBucket(30, 1)`. Either refuses identically —
 `{"error":"rate_limited","message":"try again in a few seconds"}`, 429 — so a caller never learns which, and one ops
 line per 60 s names it. A definitive 200 carries `Cache-Control: public, max-age=15`, matching the 15-second
 per-address memo; `standing: "unknown"`, the 400, the 429 and the 503 carry `no-store`. The 503 —
 `{"error":"unavailable","message":"could not check right now; try again shortly"}` — comes only from the local
 database read; every chain failure is `unknown`, not a throw. A deployment with NO resolver wired never mounts the
 route, so it answers 404 — a fourth non-200, read as `null` by the checker like the other three.
+
+**A Minimal legal body** (one the legal-body factory created for an ERC-8004 agent whose owner brought an existing
+Wyoming LLC). The branch exists only where the legal-body feature is on (`LEGAL_BODY_FACTORY_ADDRESS` and
+`CONTROLLER_ADDRESS`) AND `NOVI_ATTESTATION_KEY` is set: `main.ts` builds `legalBodyStatements` from those. Without it
+the address route answers exactly as above and `GET /legal-bodies/by-agent/:agentId` is a 404. It is asked only for an
+address the full-product resolver does not know, so every full-product answer is unchanged. Its candidates are the
+agents whose legal-body rows record the address as the identity owner, then those whose logged statements record it
+as the agent's wallet (at most 5); one snapshot reads their wallets, and only an agent whose `getAgentWallet` is that
+address, read fresh and again at the statement's own block, gets a statement (the first 3 confirmed; an `active` one
+is preferred). The answer then carries the signed statement (`docs/identity/legal-body-statement.md`): `standing` may
+also be `pending`, `name` is the statement's `legalName` (empty until it may be shown), `links.metadata` and
+`formation` are null, and `links.statement` is the by-agent URL. A signed statement is memoised and served
+`public, max-age=15` whatever its standing, a signed `unknown` included. A chain failure answers `unknown` with
+`statement: null` and `agentId: null`: `no-store`, never memoised, no statement-log row. It can rest on candidates the
+chain could not confirm, so it is not a yes. The 503 still means the local database. The by-agent route shares the
+memo window, the per-client buckets and the shared budget: one token from each per miss, however many reads the miss
+makes. Its 400 is
+`{"error":"validation_error","message":"agentId must be a decimal token id of at most 78 digits, without leading zeros"}`.
+A wallet that is not the identity owner is found by address only after a by-agent miss has logged it, and after the
+address's own 15-second memo of `legalBody: false` has passed.
+
+```bash
+curl -s https://api.novicorpus.com/legal-bodies/by-agent/<agentId> | jq '.legalBody, .standing, .statement.message.bindingState'
+```
 
 ## The seller policy
 
@@ -158,8 +182,24 @@ the `www/backend` hop. Then run the acceptance legs.
 
 ## What to watch — `journalctl -u legalbody-api -f | grep opslog`
 
-- `legal_body_lookup` — one JSON line per memo MISS: `{"matchedBy":"pocket"|"treasury"|"none","standing":…}`. Never the address.
+- `legal_body_lookup` — one JSON line per memo MISS: `{"matchedBy":"pocket"|"treasury"|"statement"|"none","standing":…}`
+  (`statement` for a Minimal legal body). Never the address.
 - `legal_body_lookup_throttled` — `{"bucket":"client"|"shared"}`, at most once per 60 s whatever the volume.
+- `attestation_key_loaded`: once at boot, `{"attestor":"0x…"}`, the attestor's public address; compare it with the ENS
+  record `com.novicorpus.attestor`. `legal_body_statements_off` `{"reason":"no_attestation_key"}` instead: the
+  legal-body feature is on and no statement can be signed.
+- `legal_body_statement`: one line per signed statement, `{"agentId","standing","bindingState"}`.
+- `legal_body_statement_unavailable`: `{"stage":"snapshot"|"code"|"sign","errorName"}`, a chain read or the signature
+  failed, so the answer was an unsigned `unknown` (or `/transparency` could not read its legal-body section).
+  Repeating: a node problem.
+- `legal_body_statement_integrity` (`{"legalBodyId","problem"}`: the chain disagrees with a row, or the row is not one
+  this deployment states) and `legal_body_statement_unlisted_body` (`{"agentId"}`: the chain links a body with no
+  public row here): no statement is made. Both are worth an alarm.
+- `legal_body_statement_log_failed`: `{"legalBodyId","errorName"}`, the statement was served and its log row not
+  written.
+- `legal_body_statement_throttled`: the by-agent route's throttle line, `{"bucket"}`, at most once per 60 s.
+- `legal_body_statement_db_failed`: `{"errorName"}`, a database read of the statement failed: the 503 of the by-agent
+  route, or of the address route's Minimal branch (the full-product resolver's own 503 writes no line).
 - The seller logs nothing per request. It warns ONCE at boot (`console.warn`, same unit log) when
   `legal-bodies-only` has no `agentkit` config or no resolver: "every request is refused 503", and it is.
 
