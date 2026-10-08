@@ -1,9 +1,10 @@
 /**
- * The three read-only finders a public answer about a legal body reads, kept apart from the
- * repository's own interface: the public rows of an agent (deployed, linked, broken or superseded:
- * a body exists on chain), the agent ids of an identity owner, and the linked rows of a deployment.
- * Every row is brought to its state through the repository's own moves, except one written around
- * it on purpose, to store an owner in another casing. Addresses and hashes are placeholders.
+ * The read-only finders a public answer about a legal body reads, kept apart from the repository's
+ * own interface: the public rows of an agent (deployed, linked, broken or superseded: a body exists
+ * on chain), the agent ids of an identity owner, the linked rows of a deployment, and a body's
+ * first revocation. Every row is brought to its state through the repository's own moves, except
+ * one written around it on purpose, to store an owner in another casing. Addresses and hashes are
+ * placeholders.
  */
 import Database from "better-sqlite3";
 import { type Address, getAddress } from "viem";
@@ -383,14 +384,73 @@ describe("listLinked", () => {
   });
 });
 
+describe("firstRevocationEventId", () => {
+  /** Records a revocation of the body, as an operator's revoke does. */
+  const revoke = (legalBodyId: string) =>
+    repo.recordEvent(legalBodyId, "revoked", "operator:ops.example", null, {
+      reason: "Recorded for a test.",
+    });
+  /** The ids of the body's `revoked` events, oldest first. */
+  const revocations = (legalBodyId: string) =>
+    repo
+      .listEvents(legalBodyId)
+      .filter((e) => e.kind === "revoked")
+      .map((e) => e.id);
+
+  test("a body never revoked: null, whatever other events it has", () => {
+    const row = rowIn("broken");
+    expect(repo.listEvents(row.legalBodyId).length).toBeGreaterThan(0);
+    expect(finders.firstRevocationEventId(row.legalBodyId)).toBeNull();
+  });
+
+  test("one revocation: its event's id", () => {
+    const row = rowIn("linked");
+    revoke(row.legalBodyId);
+    const [only] = revocations(row.legalBodyId);
+    expect(only).toBeDefined();
+    expect(finders.firstRevocationEventId(row.legalBodyId)).toBe(only);
+  });
+
+  test("two revocations, with other events around them: the first one's id", () => {
+    const row = rowIn("linked");
+    revoke(row.legalBodyId);
+    repo.recordEvent(row.legalBodyId, "note", "system", null, { note: "between the two" });
+    revoke(row.legalBodyId);
+    repo.recordEvent(row.legalBodyId, "note", "system", null, { note: "after them" });
+    const [first, second] = revocations(row.legalBodyId);
+    expect(second).toBeGreaterThan(first as number);
+    expect(finders.firstRevocationEventId(row.legalBodyId)).toBe(first);
+  });
+
+  test("another body's revocation is not this body's; a body that does not exist has none", () => {
+    const revoked = rowIn("linked", { agentId: "7" });
+    const other = rowIn("linked", { agentId: "8" });
+    revoke(revoked.legalBodyId);
+    expect(finders.firstRevocationEventId(other.legalBodyId)).toBeNull();
+    revoke(other.legalBodyId);
+    expect(finders.firstRevocationEventId(other.legalBodyId)).toBe(
+      revocations(other.legalBodyId)[0],
+    );
+    expect(finders.firstRevocationEventId(revoked.legalBodyId)).toBe(
+      revocations(revoked.legalBodyId)[0],
+    );
+    expect(finders.firstRevocationEventId("lb_no_such_body")).toBeNull();
+  });
+});
+
 test("the finders only read: no row of the database changes", () => {
   rowIn("linked");
-  rowIn("deployed", { agentId: "43" });
+  const revoked = rowIn("deployed", { agentId: "43" });
+  repo.recordEvent(revoked.legalBodyId, "revoked", "operator:ops.example", null, {
+    reason: "Recorded for a test.",
+  });
   const totalChanges = () => db.prepare("SELECT total_changes()").pluck().get();
   const rows = () => db.prepare("SELECT * FROM legal_bodies ORDER BY rowid").all();
-  const before = { changes: totalChanges(), rows: rows() };
+  const events = () => db.prepare("SELECT * FROM legal_body_events ORDER BY id").all();
+  const before = { changes: totalChanges(), rows: rows(), events: events() };
   finders.listPublicByAgent(D, "42", 4);
   finders.listAgentIdsByIdentityOwner(D, OWNER, 5);
   finders.listLinked(D, 100);
-  expect({ changes: totalChanges(), rows: rows() }).toEqual(before);
+  finders.firstRevocationEventId(revoked.legalBodyId);
+  expect({ changes: totalChanges(), rows: rows(), events: events() }).toEqual(before);
 });

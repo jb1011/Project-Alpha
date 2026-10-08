@@ -412,8 +412,9 @@ export interface LegalBodyRepository {
 
 /**
  * The read-only finders behind a public answer about a legal body: the rows an agent's answer can
- * be about, the agents an address was recorded as owning, and the bodies recorded as linked. They
- * only SELECT, and what they return is the database's record, never a reading of the chain.
+ * be about, the agents an address was recorded as owning, the bodies recorded as linked, and a
+ * body's first revocation. They only SELECT, and what they return is the database's record, never
+ * a reading of the chain.
  *
  * Kept apart from `LegalBodyRepository` on purpose: test fakes implement that interface, and a
  * member added to it would break every one of them.
@@ -435,6 +436,10 @@ export interface LegalBodyPublicFinders {
   listAgentIdsByIdentityOwner(d: Deployment, owner: Address, limit: number): string[];
   /** Rows of this deployment in `linked`, newest pointer_seen_at first. */
   listLinked(d: Deployment, limit: number): LegalBodyRecord[];
+  /** The id of the body's oldest `revoked` event, or null when it has none (or no such body
+   *  exists). One query on the events' index that stops at the first match: the body's event log
+   *  is never loaded. */
+  firstRevocationEventId(legalBodyId: string): number | null;
 }
 
 interface Row {
@@ -658,11 +663,20 @@ const CHECKED_STATES_SQL = "binding_state NOT IN ('draft','abandoned','lapsed')"
 const BINDING_CHECK_STATES_SQL = "binding_state IN ('deployed','linked','broken','superseded')";
 
 /**
- * The states a public answer can be about: the body's creation is recorded (the table's CHECKs
- * require `deployed_at` in these four and refuse it in every other). The same four a binding check
- * reads, named apart: the two lists answer different questions and need not change together.
+ * The states of a row a public answer can be about: the body's creation is recorded (the table's
+ * CHECKs require `deployed_at` in these four and refuse it in every other). The same four a binding
+ * check reads, named apart: the two lists answer different questions and need not change together.
+ * The one list: the public finders select by it, and the statement service checks a row by it.
  */
-const PUBLIC_STATES_SQL = "binding_state IN ('deployed','linked','broken','superseded')";
+export const PUBLIC_ROW_STATES: readonly BindingState[] = [
+  "deployed",
+  "linked",
+  "broken",
+  "superseded",
+];
+
+/** The public-state predicate, spelled from that list. */
+const PUBLIC_STATES_SQL = `binding_state IN (${PUBLIC_ROW_STATES.map((s) => `'${s}'`).join(",")})`;
 
 /** The states `markLinked` moves a body out of. */
 const LINKABLE_STATES: readonly BindingState[] = ["deployed", "broken", "superseded"];
@@ -755,6 +769,16 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository, LegalBody
           ORDER BY pointer_seen_at DESC, rowid DESC
           LIMIT @limit`,
       ),
+      // Walks the body's events in id order through the (legal_body_id, id) index and stops at the
+      // first revocation.
+      firstRevocationEventId: db
+        .prepare(
+          `SELECT id FROM legal_body_events
+            WHERE legal_body_id = ? AND kind = 'revoked'
+            ORDER BY id
+            LIMIT 1`,
+        )
+        .pluck(),
       // Each move below sets EVERY column its target state requires in the same statement: the
       // table's CHECKs are evaluated on the row an UPDATE produces, so a move split across two
       // statements would be refused halfway.
@@ -1020,6 +1044,10 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository, LegalBody
     const deployment = requireDeployment(d);
     const n = requirePublicLimit(limit);
     return (this.stmts.listLinked.all({ ...deployment, limit: n }) as Row[]).map(toRecord);
+  }
+
+  firstRevocationEventId(legalBodyId: string): number | null {
+    return (this.stmts.firstRevocationEventId.get(legalBodyId) as number | undefined) ?? null;
   }
 
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean {

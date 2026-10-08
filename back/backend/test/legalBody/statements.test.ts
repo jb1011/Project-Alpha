@@ -547,6 +547,7 @@ describe("the facts", () => {
       company: vi.spyOn(s.companies, "find"),
       check: vi.spyOn(s.checks, "latest"),
       checks: vi.spyOn(s.checks, "list"),
+      revocation: vi.spyOn(s.repo, "firstRevocationEventId"),
       events: vi.spyOn(s.repo, "listEvents"),
       isRevoked: vi.spyOn(s.repo, "isRevoked"),
       declaration: vi.spyOn(s.declarations, "find"),
@@ -561,7 +562,9 @@ describe("the facts", () => {
       company: 1,
       check: 1,
       checks: 0,
-      events: 1,
+      // The first revocation only: never the body's whole event list.
+      revocation: 1,
+      events: 0,
       isRevoked: 0,
       declaration: 1,
       human: 1,
@@ -841,7 +844,7 @@ describe("when the chain or the signer fails", () => {
       () => vi.spyOn(s.repo, "listPublicByAgent").mockImplementation(failing),
       () => vi.spyOn(s.companies, "find").mockImplementation(failing),
       () => vi.spyOn(s.checks, "latest").mockImplementation(failing),
-      () => vi.spyOn(s.repo, "listEvents").mockImplementation(failing),
+      () => vi.spyOn(s.repo, "firstRevocationEventId").mockImplementation(failing),
       () => vi.spyOn(s.declarations, "find").mockImplementation(failing),
       // The World ID store: a failed read says nothing about the guardian, so it is never a
       // false flag.
@@ -1138,6 +1141,63 @@ describe("by address", () => {
     expect(opsLines("legal_body_statement_unavailable")).toEqual([
       { stage: "snapshot", errorName: "HttpRequestError" },
     ]);
+  });
+
+  test("a candidates' snapshot that does not hold exactly the agents asked for: unknown, with no agent id, never none", async () => {
+    // The owner's agents come newest first: agent 7, whose wallet is another address, then agent
+    // 8, whose wallet is the address.
+    linkedBody({ agentId: "8" });
+    chain.link(bodyIn("linked", s, checkedCompany(), { agentId: "7" }), { wallet: WALLET });
+    const asked = [
+      { agentId: 7n, bodies: [] },
+      { agentId: 8n, bodies: [] },
+    ];
+    const { signer, signed } = countingSigner();
+    type Agents = Awaited<ReturnType<StatementChainPort["readStatementSnapshot"]>>["agents"];
+    const faults: Record<string, (agents: Agents) => Agents> = {
+      // Were the missing agent read as one the chain does not confirm, this would answer `none`.
+      "the agent whose wallet is the address missing": (agents) =>
+        agents.filter((a) => a.agentId !== 8n),
+      "no agent": () => [],
+      "another agent": (agents) => agents.map((a) => ({ ...a, agentId: 43n })),
+      "an agent too many": (agents) => [...agents, ...agents.slice(0, 1)],
+      "the agents in another order": (agents) => [...agents].reverse(),
+    };
+    for (const [fault, alter] of Object.entries(faults)) {
+      chain.snapshots.length = 0;
+      printed.length = 0;
+      // Only the candidates' snapshot is altered: a statement made after it would read the chain
+      // as it is.
+      const faulty: StatementChainPort = {
+        chainId: chain.chainId,
+        factory: chain.factory,
+        codeKind: (address, blockNumber) => chain.codeKind(address, blockNumber),
+        readStatementSnapshot: async (requests) => {
+          const snap = await chain.readStatementSnapshot(requests);
+          return chain.snapshots.length === 1 ? { ...snap, agents: alter(snap.agents) } : snap;
+        },
+      };
+      await expect(
+        statementForAddress(statementDeps(s, faulty, { signer }), OWNER),
+        fault,
+      ).resolves.toEqual({
+        kind: "unknown",
+        agentId: null,
+        stage: "snapshot",
+        errorName: "IncompleteSnapshotError",
+      });
+      // No statement is attempted after it.
+      expect(chain.snapshots, fault).toEqual([asked]);
+      expect(opsLines("legal_body_statement_unavailable"), fault).toEqual([
+        { stage: "snapshot", errorName: "IncompleteSnapshotError" },
+      ]);
+    }
+    expect(signed()).toBe(0);
+    expect(logRows()).toEqual([]);
+
+    // The same chain, read as it is: agent 8's statement.
+    const out = expectStatement(await statementForAddress(statementDeps(s, chain), OWNER));
+    expect(out).toMatchObject({ agentId: "8", standing: "active" });
   });
 
   test("an address with no candidate, or no address at all: none, with no chain read", async () => {

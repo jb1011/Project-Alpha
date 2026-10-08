@@ -18,12 +18,12 @@ import { opsLog } from "../observability/opsLog";
 import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
 import type { CompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
 import type { CompanyRepository } from "../persistence/companyRepository";
-import type {
-  BindingState,
-  Deployment,
-  LegalBodyPublicFinders,
-  LegalBodyRecord,
-  LegalBodyRepository,
+import {
+  type Deployment,
+  type LegalBodyPublicFinders,
+  type LegalBodyRecord,
+  type LegalBodyRepository,
+  PUBLIC_ROW_STATES,
 } from "../persistence/legalBodyRepository";
 import type {
   LegalBodyStatementRepository,
@@ -117,9 +117,6 @@ const ROWS_PER_AGENT = 4;
 const IDS_PER_ADDRESS = 5;
 /** The most of them a statement is made for. */
 const STATED_PER_ADDRESS = 3;
-/** The states of a row a public answer can be about: those in which its body's creation is
- *  recorded (the table's CHECKs). */
-const PUBLIC_STATES: readonly BindingState[] = ["deployed", "linked", "broken", "superseded"];
 
 const UINT256_MAX = 2n ** 256n - 1n;
 /** A decimal of at most 78 digits, with no sign, no space and no leading zero. */
@@ -212,12 +209,13 @@ function publicRow(r: LegalBodyRecord): PublicRow {
   return { ...r, bodyAddress, agentId, identityOwner, oaManifestHash, oaManifestVersion };
 }
 
-/** A row of this chain and factory in a public state. */
+/** A row of this chain and factory in a public state (`PUBLIC_ROW_STATES`, the list the public
+ *  finders select by). */
 function isPublicRowOf(d: Deployment, r: LegalBodyRecord): boolean {
   return (
     r.chainId === d.chainId &&
     isAddressEqual(r.factory, d.factory) &&
-    PUBLIC_STATES.includes(r.bindingState)
+    PUBLIC_ROW_STATES.includes(r.bindingState)
   );
 }
 
@@ -419,7 +417,7 @@ interface RecordedFacts {
  *  - the company: refused when missing (`company_missing`), or when it is not a customer's own
  *    (`unsupported_provider`), before anything more is read;
  *  - its latest check;
- *  - the body's events: the first `revoked` one, if any;
+ *  - the body's first `revoked` event, if any: that one row, never the body's whole event log;
  *  - the attestation, from those reads, as the attestation's own rule derives it for a customer's
  *    company (never filed through formation; paid once the company is `ready`);
  *  - the names a public surface may show, from the declaration and that same check;
@@ -435,8 +433,7 @@ function recordedFacts(deps: LegalBodyStatementDeps, row: PublicRow): RecordedFa
   if (company.provider !== CUSTOMER_PROVIDER)
     throw new RowRefused(row.legalBodyId, "unsupported_provider");
   const latest = deps.checks.latest(row.companyId);
-  const revocation = deps.repo.listEvents(row.legalBodyId).find((e) => e.kind === "revoked");
-  const revocationEventId = revocation?.id ?? null;
+  const revocationEventId = deps.repo.firstRevocationEventId(row.legalBodyId);
   const attestation = deriveAttestationState({
     provider: company.provider,
     latestCheck: latest,
@@ -521,7 +518,8 @@ function assembled(
  *     whose logged statements record it as the agent's wallet; each once, at most 5, in that order.
  *     None: `none`, with no chain read. A value that is not an address reads nothing at all.
  *  2. One snapshot of their wallets. Confirmed: the candidates whose wallet is the address, in any
- *     letter case. A failed read: `unknown`, with no agent id.
+ *     letter case. A failed read, or a snapshot that does not hold exactly the candidates asked
+ *     for (`snapshotAt`, as by agent): `unknown`, with no agent id.
  *  3. None confirmed: `none`.
  *  4. A statement for each of the first 3 confirmed, in order, kept only if the wallet it states,
  *     read at its own block, is still the address. An `unknown` ends the loop.
@@ -544,18 +542,21 @@ export async function statementForAddress(
     if (ids.length < IDS_PER_ADDRESS && !ids.includes(id)) ids.push(id);
   if (ids.length === 0) return { kind: "none" };
 
-  let confirmed: string[];
+  let snap: StatementSnapshot;
   try {
-    const snap = await deps.chain.readStatementSnapshot(
-      ids.map((id) => ({ agentId: BigInt(id), bodies: [] })),
+    snap = await snapshotAt(
+      deps.chain,
+      ids.map((id) => ({ agentId: id, bodies: [] })),
     );
-    confirmed = ids.filter((id) => {
-      const agent = snap.agents.find((a) => a.agentId === BigInt(id));
-      return agent !== undefined && isAddressEqual(agent.agentWallet, address);
-    });
   } catch (e) {
-    return unavailable(null, "snapshot", e);
+    if (!(e instanceof StageFailed)) throw e;
+    return unavailable(null, e.stage, e.cause);
   }
+  // `snapshotAt` answered: the snapshot holds every candidate, in the candidates' order, so an
+  // agent missing from it is a failed read above, never an agent the chain does not confirm.
+  const confirmed = ids.filter((_, i) =>
+    isAddressEqual((snap.agents[i] as AgentSnapshot).agentWallet, address),
+  );
   if (confirmed.length === 0) return { kind: "none" };
 
   const kept: Extract<StatementOutcome, { kind: "statement" }>[] = [];

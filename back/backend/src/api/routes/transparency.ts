@@ -4,6 +4,7 @@ import { formationSummary } from "../../formation/status";
 import { activeLegalBodies } from "../../legalBody/statements";
 import type { PublicEntityRow } from "../../persistence/entityRepository";
 import type { ApiDeps } from "../app";
+import { FRESH_CACHE_CONTROL, NO_STORE } from "./legalBodies";
 import { metadataBaseOf } from "./metadata";
 
 /** A job is "settled" once escrowed USDC has paid out on-chain. `reputed` is a settled job that
@@ -12,6 +13,23 @@ const SETTLED = new Set(["completed", "reputed"]);
 
 /** The most legal bodies the section lists: one snapshot of the chain reads them all. */
 const LEGAL_BODIES_LISTED = 100;
+
+/** What this surface has always told caches, and still tells them where no legal-body section is
+ *  wired. */
+const CACHE_CONTROL = "public, max-age=300";
+
+/**
+ * How long a cache between the caller and this process may keep a body. A body carries
+ * `legalBodiesAvailable` exactly when the legal-body section is wired. Without it: five minutes, as
+ * always. With it, the statement routes' own exposure, since a body revoked or no longer active
+ * must not stay listed in an HTTP cache for five minutes: `public, max-age=15` for a section that
+ * read the chain, and `no-store` for one that could not (`legalBodiesAvailable: false`), which is
+ * no answer for a cache to keep.
+ */
+function cacheControlOf(body: Record<string, unknown>): string {
+  if (!("legalBodiesAvailable" in body)) return CACHE_CONTROL;
+  return body.legalBodiesAvailable === true ? FRESH_CACHE_CONTROL : NO_STORE;
+}
 
 /**
  * The Hedera facts a row may carry, or nothing at all.
@@ -57,8 +75,9 @@ function hederaFactsOf(deps: ApiDeps, e: PublicEntityRow, base: string | null) {
  *  out from one snapshot of the chain (`activeLegalBodies`), with their count in `stats`. When the
  *  chain could not be read the list is empty and `legalBodiesAvailable` is false. A listed body
  *  carries what its statement states and nothing about the people behind it: no human reference,
- *  no credential, no tenant, no guardian address. Without the statement the body is exactly what it
- *  was. */
+ *  no credential, no tenant, no guardian address. Such a body is cached downstream no longer than
+ *  a statement (`cacheControlOf`). Without the statement the body, and its header, are exactly what
+ *  they were. */
 export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   /**
    * A very short in-process cache (M5).
@@ -67,9 +86,9 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
    * UNAUTHENTICATED — it is the one surface where request volume is not bounded by how many
    * tenants exist. Ten seconds is chosen to be shorter than anything a human would notice and
    * long enough that a burst (a link doing the rounds, a crawler, a status page polling) costs
-   * one pass rather than one per request. The response already advertises `max-age=300` to
-   * intermediaries, so the freshness contract is unchanged; this only stops the process doing the
-   * work again for a browser that ignored it.
+   * one pass rather than one per request. The response advertises its own freshness to
+   * intermediaries (`cacheControlOf`), so this only stops the process doing the work again for a
+   * browser that ignored it.
    *
    * It holds the computation FROM ITS START, not from its answer: the legal-body section reads the
    * chain, and concurrent requests on a cold cache all wait for the one computation running instead
@@ -93,9 +112,10 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
       });
     }
     // Awaited before the header is set: a failure reaches the error handler with no cache header,
-    // so an error is never advertised as cacheable.
+    // so an error is never advertised as cacheable. The header is read off the body served, so an
+    // answer kept here carries the same header on every request that is served it.
     const body = await entry.body;
-    c.header("Cache-Control", "public, max-age=300");
+    c.header("Cache-Control", cacheControlOf(body));
     return c.json(body);
   });
 

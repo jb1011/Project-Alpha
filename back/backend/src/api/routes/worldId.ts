@@ -555,6 +555,12 @@ export function assertRealHuman(
         403,
         "the guardian's World ID verification was not made under production: verify again",
       );
+    default: {
+      // A reason outside the type throws instead of returning nothing; a reason added to the type
+      // without its case here stops this line compiling.
+      const unreachable: never = state.reason;
+      throw new Error(`unhandled real-human reason ${String(unreachable)}`);
+    }
   }
 }
 

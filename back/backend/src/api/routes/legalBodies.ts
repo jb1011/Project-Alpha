@@ -29,10 +29,16 @@ import { TokenBucket } from "./agentBook";
  * the one new association — `/transparency` never publishes a pocket address — and it costs the
  * caller the address to obtain, which is an address AgentBook already binds in public.
  *
- * What this route DOES NOT answer, and must never (D7): who the guardian is, whether a human
- * vouched, anything from AgentBook, the EIN, the filing number, the tenant. The legal-body
+ * What a full-product answer DOES NOT carry, and must never (D7): who the guardian is, whether a
+ * human vouched, anything from AgentBook, the EIN, the filing number, the tenant. The legal-body
  * question only — and in the vocabulary the chain actually carries: "a registered legal body in
  * good standing", never "verified company", "KYC'd" or "licensed".
+ *
+ * A Minimal legal body's answer carries the signed statement instead, under the statement's own
+ * rules (`legalBody/publicStatement.ts`): its `filingNumber` and `legalName` only by the names rule
+ * of `assembleStatement` (a passed check, a linked binding, nothing revoked), and
+ * `guardianHumanVerified`, a flag. It never says who the guardian is, and never carries the tenant
+ * or the EIN.
  */
 
 /** The lookup's own dependencies. Optional on `ApiDeps` as a whole, so a deployment that never
@@ -133,6 +139,20 @@ export const THROTTLE_LOG_WINDOW_MS = 60_000;
 /** Bounded so a walk over random addresses cannot grow this map without limit. Oldest first —
  *  insertion order, re-inserted on every refresh, so the entry evicted is the coldest one. */
 export const MEMO_MAX_ENTRIES = 1000;
+/**
+ * The two refusals of the public legal-body routes, in their flat shape. Public contract texts,
+ * written once for this route and the statement route by agent beside it. The 429 is the same
+ * whichever budget ran out. The 503 is a failed DATABASE read only: a chain that cannot be read is
+ * `unknown`, never a 503.
+ */
+export const RATE_LIMITED_BODY = {
+  error: "rate_limited",
+  message: "try again in a few seconds",
+} as const;
+export const UNAVAILABLE_BODY = {
+  error: "unavailable",
+  message: "could not check right now; try again shortly",
+} as const;
 
 /** The filing facts this surface reports (D1: reported, never gating). */
 export interface FormationFacts {
@@ -403,17 +423,14 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       opsLog("legal_body_lookup_throttled", { bucket });
     }
     c.header("Cache-Control", NO_STORE);
-    return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
+    return c.json(RATE_LIMITED_BODY, 429);
   };
 
   /** A DATABASE read failed, so we cannot tell whether the address is one of ours at all: the
    *  route's flat 503, never memoised and never reused. */
   const unavailable = (c: Context) => {
     c.header("Cache-Control", NO_STORE);
-    return c.json(
-      { error: "unavailable", message: "could not check right now; try again shortly" },
-      503,
-    );
+    return c.json(UNAVAILABLE_BODY, 503);
   };
 
   app.get("/legal-bodies/:address", async (c) => {

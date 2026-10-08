@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type { Address, Hex } from "viem";
+import { STANDINGS, type Standing } from "../legalBody/standing";
 import {
   LegalBodyInputError,
   ZERO_ADDRESS,
@@ -56,7 +57,8 @@ export interface NewStatementRecord {
   agentWallet: Address;
   /** The address of the key that signed the statement. */
   attestor: Address;
-  standing: "pending" | "active" | "unknown" | "inactive";
+  /** One of the statement's own standings (`STANDINGS`); the table's CHECK writes the same four. */
+  standing: Standing;
   /** 32 bytes; stored lower-case. */
   claimsHash: Hex;
   /** The block the first statement with these claims was read at. */
@@ -129,12 +131,6 @@ function toRecord(r: Row): StatementRecord {
   };
 }
 
-const STANDINGS: readonly NewStatementRecord["standing"][] = [
-  "pending",
-  "active",
-  "unknown",
-  "inactive",
-];
 const COMPANY_STATUSES: readonly StatementEvidence["companyStatus"][] = [
   "draft",
   "ready",

@@ -15,7 +15,9 @@ import {
   MEMO_MAX_ENTRIES,
   MEMO_TTL_MS,
   NO_STORE,
+  RATE_LIMITED_BODY,
   THROTTLE_LOG_WINDOW_MS,
+  UNAVAILABLE_BODY,
   createClientLimiter,
 } from "./legalBodies";
 
@@ -86,7 +88,7 @@ export function mountLegalBodyStatementRoutes(
       opsLog("legal_body_statement_throttled", { bucket });
     }
     c.header("Cache-Control", NO_STORE);
-    return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
+    return c.json(RATE_LIMITED_BODY, 429);
   };
 
   app.get("/legal-bodies/by-agent/:agentId", async (c) => {
@@ -121,10 +123,7 @@ export function mountLegalBodyStatementRoutes(
       // legal body at all, which no answer here has a value for.
       opsLog("legal_body_statement_db_failed", { errorName: errorNameOf(e) });
       c.header("Cache-Control", NO_STORE);
-      return c.json(
-        { error: "unavailable", message: "could not check right now; try again shortly" },
-        503,
-      );
+      return c.json(UNAVAILABLE_BODY, 503);
     }
     const checkedAt = new Date(now()).toISOString();
 

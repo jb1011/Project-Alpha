@@ -46,7 +46,13 @@ const STATEMENT_BASE = "https://api.example.test/legal-bodies/by-agent/";
 /** The first sighting of every linked row made here: three days before the clock, plus the agent's
  *  id in seconds, so a higher agent id is a more recent sighting. */
 const SEEN_FROM = CLOCK_S - 3 * 86_400;
-const FRESH = "public, max-age=300";
+/** A section that read the chain: the statement routes' own exposure, so a revoked body is not
+ *  kept listed in an HTTP cache for minutes. */
+const FRESH = "public, max-age=15";
+/** A section that could not read the chain: not an answer a cache may keep. */
+const NO_STORE = "no-store";
+/** Without the statement's dependencies: the header the route has always served. */
+const UNCHANGED = "public, max-age=300";
 
 let s: StatementStores;
 let chain: FakeStatementChain;
@@ -242,13 +248,14 @@ describe("activeLegalBodies", () => {
     expect(opsLines("legal_body_statement")).toEqual([]);
   });
 
-  test("each row's company, check, events, declaration and guardian are read once, as a statement reads them", async () => {
+  test("each row's company, check, first revocation, declaration and guardian are read once, as a statement reads them", async () => {
     linkedBody("1");
     linkedBody("2");
     const reads = {
       company: vi.spyOn(s.companies, "find"),
       check: vi.spyOn(s.checks, "latest"),
       checks: vi.spyOn(s.checks, "list"),
+      revocation: vi.spyOn(s.repo, "firstRevocationEventId"),
       events: vi.spyOn(s.repo, "listEvents"),
       isRevoked: vi.spyOn(s.repo, "isRevoked"),
       declaration: vi.spyOn(s.declarations, "find"),
@@ -262,7 +269,8 @@ describe("activeLegalBodies", () => {
       company: 2,
       check: 2,
       checks: 0,
-      events: 2,
+      revocation: 2,
+      events: 0,
       isRevoked: 0,
       declaration: 2,
       human: 2,
@@ -424,7 +432,7 @@ describe("activeLegalBodies", () => {
     for (const fail of [
       () => vi.spyOn(s.companies, "find").mockImplementation(locked),
       () => vi.spyOn(s.checks, "latest").mockImplementation(locked),
-      () => vi.spyOn(s.repo, "listEvents").mockImplementation(locked),
+      () => vi.spyOn(s.repo, "firstRevocationEventId").mockImplementation(locked),
       () => vi.spyOn(s.declarations, "find").mockImplementation(locked),
       () => vi.spyOn(s.store, "findByTenant").mockImplementation(locked),
     ]) {
@@ -518,12 +526,15 @@ function fullProductPart(): void {
   new SqliteJobRepository(s.db).upsert(SETTLED_JOB);
 }
 
-/** The app over the stores, on the clock; the statement's dependencies wired unless told not. */
-function makeApp(o: { statements?: boolean; over?: Partial<LegalBodyStatementDeps> } = {}) {
+/** The app over the stores, on the clock (the app's own reads of it through `now`, when given);
+ *  the statement's dependencies wired unless told not. */
+function makeApp(
+  o: { statements?: boolean; over?: Partial<LegalBodyStatementDeps>; now?: () => number } = {},
+) {
   return buildApiApp({
     webOrigin: "https://www.example.test",
     jwtSecret: "s",
-    now: () => clock,
+    now: o.now ?? (() => clock),
     repo: new SqliteEntityRepository(s.db),
     jobs: new SqliteJobRepository(s.db),
     legalBodyStatements:
@@ -619,7 +630,7 @@ describe("GET /transparency", () => {
     };
     const res = await makeApp().request("/transparency");
     expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe(FRESH);
+    expect(res.headers.get("cache-control")).toBe(NO_STORE);
     const body: Json = await res.json();
     expect(body.legalBodies).toEqual([]);
     expect(body.legalBodiesAvailable).toBe(false);
@@ -642,7 +653,7 @@ describe("GET /transparency", () => {
     const listing = vi.spyOn(s.repo, "listLinked");
     const res = await makeApp({ statements: false }).request("/transparency");
     expect(res.status).toBe(200);
-    expect(res.headers.get("cache-control")).toBe(FRESH);
+    expect(res.headers.get("cache-control")).toBe(UNCHANGED);
     const body: Json = await res.json();
     expect(body).toEqual({
       stats: { entities: 1, jobsSettled: 1, usdcSettledAtomic: "1500000" },
@@ -670,8 +681,34 @@ describe("GET /transparency", () => {
     expect(listing).not.toHaveBeenCalled();
   });
 
+  test("the cache header follows the section: 15 seconds when it read the chain, no-store when it could not, five minutes as before without it", async () => {
+    fullProductPart();
+    linkedBody("42");
+    const read = await makeApp().request("/transparency");
+    expect((await read.json()).legalBodiesAvailable).toBe(true);
+    expect(read.headers.get("cache-control")).toBe("public, max-age=15");
+
+    chain.beforeSnapshot = () => {
+      throw new TransportFailure();
+    };
+    const app = makeApp();
+    for (const at of [0, 5_000]) {
+      // The second request, within the ten seconds, is served the kept answer: the same header.
+      clock = CLOCK_MS + at;
+      const unread = await app.request("/transparency");
+      expect((await unread.json()).legalBodiesAvailable, `at +${at} ms`).toBe(false);
+      expect(unread.headers.get("cache-control"), `at +${at} ms`).toBe("no-store");
+    }
+    expect(chain.snapshots).toHaveLength(2);
+
+    const without = await makeApp({ statements: false }).request("/transparency");
+    expect(Object.keys(await without.json())).toEqual(["stats", "entities"]);
+    expect(without.headers.get("cache-control")).toBe("public, max-age=300");
+  });
+
   test("twenty concurrent requests on a cold cache share ONE computation and ONE snapshot", async () => {
     linkedBody("42");
+    const asked = gate();
     const held = gate();
     let snapshotsAsked = 0;
     const slow: StatementChainPort = {
@@ -680,16 +717,30 @@ describe("GET /transparency", () => {
       codeKind: (address, blockNumber) => chain.codeKind(address, blockNumber),
       readStatementSnapshot: async (requests) => {
         snapshotsAsked += 1;
+        // Asked, and held until the test opens `held`.
+        asked.open();
         await held.promise;
         return chain.readStatementSnapshot(requests);
       },
     };
+    // The route reads the app's clock once per request, as the request reaches it: the twentieth
+    // read is the last of the twenty arriving.
+    const arrived = gate();
+    let arrivals = 0;
     const listing = vi.spyOn(s.repo, "listLinked");
-    const app = makeApp({ over: { chain: slow } });
+    const app = makeApp({
+      over: { chain: slow },
+      now: () => {
+        arrivals += 1;
+        if (arrivals === 20) arrived.open();
+        return clock;
+      },
+    });
 
     const pending = Array.from({ length: 20 }, () => app.request("/transparency"));
     // Every request has reached the route while the one snapshot is still being read.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await Promise.all([arrived.promise, asked.promise]);
+    expect(arrivals).toBe(20);
     expect(snapshotsAsked).toBe(1);
     held.open();
     const answers = await Promise.all(pending);
@@ -735,6 +786,8 @@ describe("GET /transparency", () => {
 
   test("an older computation that fails after a newer one started leaves the newer one in place", async () => {
     linkedBody("42");
+    /** Snapshot n opens `asked[n]` when it is asked, then waits for `holds[n]`. */
+    const asked = [gate(), gate()];
     const holds = [gate(), gate()];
     let snapshotsAsked = 0;
     const slow: StatementChainPort = {
@@ -742,9 +795,10 @@ describe("GET /transparency", () => {
       factory: chain.factory,
       codeKind: (address, blockNumber) => chain.codeKind(address, blockNumber),
       readStatementSnapshot: async (requests) => {
-        const held = holds[snapshotsAsked];
+        const n = snapshotsAsked;
         snapshotsAsked += 1;
-        await held?.promise;
+        asked[n]?.open();
+        await holds[n]?.promise;
         return chain.readStatementSnapshot(requests);
       },
     };
@@ -756,14 +810,14 @@ describe("GET /transparency", () => {
     });
     const app = makeApp({ over: { chain: slow } });
 
-    const reachRoute = () => new Promise((resolve) => setTimeout(resolve, 20));
     const older = app.request("/transparency");
-    await reachRoute();
+    // The older computation is reading the chain.
+    await asked[0]?.promise;
     expect(snapshotsAsked).toBe(1);
     // The older computation is past its window and still reading: the next request starts anew.
     clock += 10_000;
     const newer = app.request("/transparency");
-    await reachRoute();
+    await asked[1]?.promise;
     expect(snapshotsAsked).toBe(2);
 
     holds[0]?.open();
