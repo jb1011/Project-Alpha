@@ -37,8 +37,9 @@ import { TokenBucket } from "./agentBook";
  * A Minimal legal body's answer carries the signed statement instead, under the statement's own
  * rules (`legalBody/publicStatement.ts`): its `filingNumber` and `legalName` only by the names rule
  * of `assembleStatement` (a passed check, a linked binding, nothing revoked), and
- * `guardianHumanVerified`, a flag. It never says who the guardian is, and never carries the tenant
- * or the EIN.
+ * `guardianHumanVerified`, a flag. It does not name the guardian: `identityOwnerAtCreation` is the
+ * identity's owner as the chain records it, which may be the guardian's own wallet. It never
+ * carries the EIN.
  */
 
 /** The lookup's own dependencies. Optional on `ApiDeps` as a whole, so a deployment that never
@@ -400,8 +401,9 @@ function minimalAnswer(
   };
 }
 
-/** The one thing of an error an ops line carries: its message can quote a value we hold. */
-const errorNameOf = (e: unknown): string => (e instanceof Error ? e.name : "not_an_error");
+/** The one thing of an error an ops line carries: its message can quote a value we hold. Shared
+ *  with the statement route by agent. */
+export const errorNameOf = (e: unknown): string => (e instanceof Error ? e.name : "not_an_error");
 
 export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
   const lb = deps.legalBody;

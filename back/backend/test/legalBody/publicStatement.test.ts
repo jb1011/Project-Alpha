@@ -330,6 +330,29 @@ const signatureCovers = (wire: SignedStatementJson, message: Record<string, unkn
     signature: wire.signature,
   });
 
+/** The order of secp256k1's group (SEC 2). A signature's `s` and n - s, each with its own `v`,
+ *  recover the same signer from the same digest. */
+const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+
+/** A 65-byte signature's `s` (bytes 32 to 63, big-endian) and `v` (its last byte). */
+const sAndV = (signature: Hex): { s: bigint; v: number } => ({
+  s: BigInt(`0x${signature.slice(66, 130)}`),
+  v: Number.parseInt(signature.slice(130), 16),
+});
+
+/** The same signature's `r`, with another `s` and `v`. */
+const respelled = (signature: Hex, s: bigint, v: number): Hex =>
+  `0x${signature.slice(2, 66)}${s.toString(16).padStart(64, "0")}${v.toString(16).padStart(2, "0")}`;
+
+/** The golden statement at the first block from its own whose signature ends in `v`. */
+async function signedEndingIn(v: 27 | 28): Promise<SignedStatementJson> {
+  for (let block = GOLDEN.observedAtBlock; block < GOLDEN.observedAtBlock + 16n; block += 1n) {
+    const signed = wireOf(await signStatement({ ...GOLDEN, observedAtBlock: block }, ANVIL_0));
+    if (sAndV(signed.signature).v === v) return signed;
+  }
+  throw new Error(`no signature ending in v ${v} within 16 blocks`);
+}
+
 /** Another value for a field of the golden JSON form, in its canonical form for the field's type.
  *  The jurisdiction and the entity type allow one value each: theirs is outside the list. */
 function another(name: string, type: string, value: unknown): unknown {
@@ -1050,6 +1073,33 @@ describe("signing and verifying", () => {
     ] as const) {
       await expect(signatureCovers(wire, message), name).resolves.toBe(true);
       await expect(verify({ ...wire, message }), name).resolves.toBe(false);
+    }
+  });
+
+  test("the signature is read in its canonical form only, a low s and v 27 or 28: the signer's other forms over the same digest fail", async () => {
+    const golden = wireOf(await signStatement(GOLDEN, ANVIL_0));
+    expect(golden.signature).toBe(GOLDEN_SIGNATURE);
+    expect(sAndV(golden.signature).v).toBe(27);
+    // A signature that ends in v 28 as well, so that v written 1 is tried over a low s too.
+    const endingIn28 = await signedEndingIn(28);
+    for (const signed of [golden, endingIn28]) {
+      const { s, v } = sAndV(signed.signature);
+      // What signStatement writes, and what verifies: s at most n/2.
+      expect(s <= SECP256K1_N / 2n).toBe(true);
+      await expect(verify(signed)).resolves.toBe(true);
+      for (const [name, signature] of [
+        [
+          `the twin: n - s, v ${v} written ${55 - v}`,
+          respelled(signed.signature, SECP256K1_N - s, 55 - v),
+        ],
+        [`v ${v} written ${v - 27}`, respelled(signed.signature, s, v - 27)],
+      ] as const) {
+        // viem alone recovers the same signer from it: the refusal is the verifier's own rule.
+        await expect(signatureCovers({ ...signed, signature }, signed.message), name).resolves.toBe(
+          true,
+        );
+        await expect(verify({ ...signed, signature }), name).resolves.toBe(false);
+      }
     }
   });
 

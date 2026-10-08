@@ -490,6 +490,20 @@ const ENVELOPE_KEYS = ["domain", "primaryType", "message", "attestor", "signatur
 const DOMAIN_KEYS = ["name", "version", "chainId"] as const;
 /** A signature as a signer writes it: r, s and v, 65 bytes in hex. */
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
+/** n/2 of secp256k1, rounded down: the largest `s` of a canonical signature (EIP-2). */
+const SECP256K1_HALF_N = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
+
+/**
+ * Whether a signature of SIGNATURE's shape is written in its one canonical form, the form
+ * `signStatement` writes: `s` (bytes 32 to 63, big-endian) at most n/2, and `v` (the last byte)
+ * 27 or 28. viem's `verifyTypedData` also accepts n - s with the other `v`, and `v` written 0 or
+ * 1, which would give one statement several valid signature texts.
+ */
+function isCanonicalSignature(signature: string): boolean {
+  const v = Number.parseInt(signature.slice(130, 132), 16);
+  const s = BigInt(`0x${signature.slice(66, 130)}`);
+  return (v === 27 || v === 28) && s <= SECP256K1_HALF_N;
+}
 
 /** `v` is an object, not an array, whose own keys are exactly `keys`. */
 function hasExactly(v: unknown, keys: readonly string[]): v is Record<string, unknown> {
@@ -506,6 +520,8 @@ function hasExactly(v: unknown, keys: readonly string[]): v is Record<string, un
  *  - `nowSeconds` is a finite number, and its whole second (a fraction is rounded down, so
  *    `Date.now() / 1000` works) is from `issuedAt` to `expiresAt`, both included;
  *  - `expiresAt - issuedAt` is PUBLIC_STATEMENT_TTL_SECONDS;
+ *  - the signature is in its canonical form, a low `s` and `v` 27 or 28
+ *    ({@link isCanonicalSignature});
  *  - the signature recovers to `opts.attestor`, by plain ECDSA.
  *
  * The attestor is the CALLER'S, taken from ENS or the published docs. The envelope's own `attestor`
@@ -529,6 +545,7 @@ export async function verifyPublicStatement(
     if (primaryType !== PUBLIC_STATEMENT_PRIMARY_TYPE) return false;
     if (typeof attestor !== "string" || !isAddress(attestor)) return false;
     if (typeof signature !== "string" || !SIGNATURE.test(signature)) return false;
+    if (!isCanonicalSignature(signature)) return false;
     const s = statementFromJson(message);
     if (s.chainId !== BigInt(opts.expectedChainId)) return false;
     if (!Number.isFinite(opts.nowSeconds)) return false;

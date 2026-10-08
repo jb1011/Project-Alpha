@@ -19,6 +19,7 @@ import {
   THROTTLE_LOG_WINDOW_MS,
   UNAVAILABLE_BODY,
   createClientLimiter,
+  errorNameOf,
 } from "./legalBodies";
 
 /**
@@ -61,9 +62,6 @@ type ByAgentAnswer =
       checkedAt: string;
       statement: SignedStatementJson;
     };
-
-/** The one thing of an error an ops line carries: its message can quote a value we hold. */
-const errorNameOf = (e: unknown): string => (e instanceof Error ? e.name : "not_an_error");
 
 /** Mounts nothing without `deps.legalBodyStatements`: the route is then a 404. */
 export function mountLegalBodyStatementRoutes(
