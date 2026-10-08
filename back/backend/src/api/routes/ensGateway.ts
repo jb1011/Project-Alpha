@@ -27,6 +27,8 @@ const SEL_TEXT = "0x59d1d43c"; // text(bytes32,string)
 const ARC_COINTYPE = 2152525650n; // ENSIP-11 for Arc testnet (0x80000000 | 5042002)
 const ETH_COINTYPE = 60n;
 const TTL_SEC = 300n;
+/** The apex's text record that names the attestor of the public legal-body statements. */
+const ATTESTOR_TEXT_KEY = "com.novicorpus.attestor";
 
 export interface EnsGatewayDeps {
   /** Fresh EOA whose key lives only in env; signs response digests, never holds funds. */
@@ -41,6 +43,9 @@ export interface EnsGatewayDeps {
   chainId: number;
   /** Deployed OffchainResolver address (informational; the URL `:sender` is authoritative). */
   resolverAddress?: Address;
+  /** The attestor of the public legal-body statements: the attestation key's ADDRESS, never the
+   *  key. Answered on the apex as `com.novicorpus.attestor`; unset, that record is empty. */
+  attestor?: Address;
   /** Optional vanity labels -> publicId, e.g. { demo: "b46fd15c-…" }. Lets a memorable name point
    *  at an existing agent without rewriting its publicId, which is baked into its on-chain
    *  metadataURI and could not be changed without a registry write. */
@@ -144,13 +149,18 @@ function agentContext(deps: ApiDeps, ent: EntityLike, metaUrl: string): string {
   ].join("\n");
 }
 
-/** Text records: repo-sourced + live legal-status (Arc), ENSIP-25 agent-registration, ENSIP-26 agent-context. */
+/** Text records: repo-sourced + live legal-status (Arc), ENSIP-25 agent-registration, ENSIP-26
+ *  agent-context; on the apex, the attestor of the public legal-body statements. */
 async function textFor(deps: ApiDeps, target: Target, key: string): Promise<string> {
   const ens = deps.ens!;
   if (target.kind === "apex") {
     if (key === "description") return "Novi Corpus — legal bodies for AI agents";
     if (key === "url") return ens.metadataBaseUrl;
     if (key === "agent-endpoint[web]") return deps.webOrigin;
+    // CAIP-10: the deployment's chain, the one whose statements the attestor signs, then its
+    // EIP-55 address.
+    if (key === ATTESTOR_TEXT_KEY)
+      return ens.attestor ? `eip155:${ens.chainId}:${getAddress(ens.attestor)}` : "";
     return "";
   }
   if (target.kind !== "agent") return "";

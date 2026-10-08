@@ -11,6 +11,7 @@ import type {
   BodySnapshot,
   CodeKind,
   StatementChainPort,
+  StatementSnapshot,
 } from "../adapters/arc/legalBodyChain";
 import { type WorldIdDeps, realHumanState } from "../api/routes/worldId";
 import { opsLog } from "../observability/opsLog";
@@ -182,6 +183,11 @@ function unavailable(agentId: string | null, stage: Stage, failure: unknown): St
   return { kind: "unknown", agentId, stage, errorName };
 }
 
+/** The ops line of a row no statement is made about: the row's id and the problem's code. */
+function refusedLine(e: RowRefused): void {
+  opsLog("legal_body_statement_integrity", { legalBodyId: e.legalBodyId, problem: e.problem });
+}
+
 /** A row in a public state, with the fields the table's CHECKs require there. */
 type PublicRow = LegalBodyRecord & {
   bodyAddress: Address;
@@ -215,26 +221,42 @@ function isPublicRowOf(d: Deployment, r: LegalBodyRecord): boolean {
   );
 }
 
-/** The agent and the bodies, read at one block. The answer must hold exactly that agent and those
- *  bodies, in order; anything else is a failed read. */
-function snapshotOf(
+/** The agents, each a canonical decimal id, and the bodies to read for each, read at one block.
+ *  The answer must hold exactly those agents and those bodies, in order; anything else is a failed
+ *  read. */
+function snapshotAt(
+  chain: StatementChainPort,
+  asked: readonly { agentId: string; bodies: readonly Address[] }[],
+): Promise<StatementSnapshot> {
+  return attempt("snapshot", async () => {
+    const snap = await chain.readStatementSnapshot(
+      asked.map((a) => ({ agentId: BigInt(a.agentId), bodies: a.bodies })),
+    );
+    const holdsAll =
+      snap.agents.length === asked.length &&
+      asked.every((a, i) => {
+        const agent = snap.agents[i];
+        return (
+          agent !== undefined &&
+          agent.agentId === BigInt(a.agentId) &&
+          agent.bodies.length === a.bodies.length &&
+          agent.bodies.every((b, j) => isAddressEqual(b.body, a.bodies[j] as Address))
+        );
+      });
+    if (!holdsAll) throw new IncompleteSnapshotError();
+    return snap;
+  });
+}
+
+/** One agent and its bodies, read at one block (see `snapshotAt`). */
+async function snapshotOf(
   chain: StatementChainPort,
   agentId: string,
   bodies: readonly Address[],
 ): Promise<{ blockNumber: bigint; agent: AgentSnapshot }> {
-  return attempt("snapshot", async () => {
-    const snap = await chain.readStatementSnapshot([{ agentId: BigInt(agentId), bodies }]);
-    const agent = snap.agents[0];
-    if (
-      snap.agents.length !== 1 ||
-      agent === undefined ||
-      agent.agentId !== BigInt(agentId) ||
-      agent.bodies.length !== bodies.length ||
-      !agent.bodies.every((b, i) => isAddressEqual(b.body, bodies[i] as Address))
-    )
-      throw new IncompleteSnapshotError();
-    return { blockNumber: snap.blockNumber, agent };
-  });
+  const snap = await snapshotAt(chain, [{ agentId, bodies }]);
+  // `snapshotAt` answered: the snapshot holds exactly the one agent asked for.
+  return { blockNumber: snap.blockNumber, agent: snap.agents[0] as AgentSnapshot };
 }
 
 /**
@@ -271,7 +293,7 @@ export async function statementForAgent(
   } catch (e) {
     if (e instanceof StageFailed) return unavailable(agentId, e.stage, e.cause);
     if (e instanceof RowRefused) {
-      opsLog("legal_body_statement_integrity", { legalBodyId: e.legalBodyId, problem: e.problem });
+      refusedLine(e);
       return { kind: "none" };
     }
     throw e;
@@ -550,4 +572,121 @@ export async function statementForAddress(
       kept.push(out);
   }
   return kept.find((k) => k.standing === "active") ?? unknown ?? kept[0] ?? { kind: "none" };
+}
+
+/** One linked legal body whose statement reads `active`, as `/transparency` lists it. */
+export interface TransparencyLegalBody {
+  agentId: string;
+  publicId: string;
+  legalBody: Address;
+  chainId: number;
+  legalName: string;
+  filingNumber: string;
+  jurisdiction: "WY";
+  entityType: "LLC";
+  source: "customer";
+  environment: "sandbox" | "production";
+  standing: "active";
+  /** ISO 8601: when the binding check first saw the current link. */
+  linkedSince: string;
+  links: { statement: string };
+}
+
+/** A linked row: a public row with the sighting that opened its current linked stretch. */
+type LinkedRow = PublicRow & { pointerSeenAt: number };
+
+/** The linked row, narrowed; refused as `row_incomplete` when a field the table's CHECKs require
+ *  of a linked row is missing (unreachable while they hold). */
+function linkedRow(r: LegalBodyRecord): LinkedRow {
+  const row = publicRow(r);
+  const { pointerSeenAt } = row;
+  if (pointerSeenAt === null) throw new RowRefused(r.legalBodyId, "row_incomplete");
+  return { ...row, pointerSeenAt };
+}
+
+/**
+ * The deployment's linked legal bodies whose statement would read `active`, for `/transparency`,
+ * worked out as a statement is and never signed.
+ *
+ *  1. The rows of this deployment recorded as linked, the most recent sighting first, at most
+ *     `limit` (the repository allows 1 to 100). None: an empty list, with no chain read. A row
+ *     missing a field its state requires is skipped (`row_incomplete`).
+ *  2. ONE snapshot: every row's agent and body, at one block.
+ *  3. For each row, its recorded facts (`recordedFacts`) and its statement, assembled unsigned
+ *     (`assembled`) with no code read: the two flags the codes set do not move the standing, and
+ *     are not listed. A row is listed exactly when that statement reads `active`, with the body
+ *     and the names it states, so the statement's integrity refusals and its names rule decide
+ *     here too. A refused row is skipped, with the statement's ops line.
+ *
+ * No signature, no code read, no row of the statement log. A chain read that fails answers
+ * "unavailable", with the statement's ops line. A database read that fails throws.
+ *
+ * A body the chain links before the binding check has recorded the link is listed once it has: only
+ * rows recorded as linked are read.
+ */
+export async function activeLegalBodies(
+  deps: LegalBodyStatementDeps,
+  limit: number,
+): Promise<TransparencyLegalBody[] | "unavailable"> {
+  const rows: LinkedRow[] = [];
+  for (const record of deps.repo.listLinked(deps.deployment, limit)) {
+    try {
+      rows.push(linkedRow(record));
+    } catch (e) {
+      if (!(e instanceof RowRefused)) throw e;
+      refusedLine(e);
+    }
+  }
+  if (rows.length === 0) return [];
+
+  let snap: StatementSnapshot;
+  try {
+    snap = await snapshotAt(
+      deps.chain,
+      rows.map((r) => ({ agentId: r.agentId, bodies: [r.bodyAddress] })),
+    );
+  } catch (e) {
+    if (!(e instanceof StageFailed)) throw e;
+    // The ops line of any statement whose chain read failed; a listing has no outcome to carry.
+    unavailable(null, e.stage, e.cause);
+    return "unavailable";
+  }
+
+  const listed: TransparencyLegalBody[] = [];
+  for (const [i, row] of rows.entries()) {
+    // `snapshotAt` answered: the snapshot holds every row's agent and body, in the rows' order.
+    const agent = snap.agents[i] as AgentSnapshot;
+    const body = agent.bodies[0] as BodySnapshot;
+    let statement: LegalBodyStatement;
+    try {
+      const facts = recordedFacts(deps, row);
+      statement = assembled(
+        deps,
+        row,
+        { blockNumber: snap.blockNumber, agent, body, ownerCode: "none", walletCode: "none" },
+        facts,
+      );
+    } catch (e) {
+      if (!(e instanceof RowRefused)) throw e;
+      refusedLine(e);
+      continue;
+    }
+    if (statement.standing !== "active") continue;
+    listed.push({
+      agentId: row.agentId,
+      publicId: row.publicId,
+      legalBody: statement.legalBody,
+      chainId: deps.chain.chainId,
+      legalName: statement.legalName,
+      filingNumber: statement.filingNumber,
+      jurisdiction: statement.jurisdiction,
+      entityType: statement.entityType,
+      source: "customer",
+      environment: statement.environment,
+      standing: "active",
+      linkedSince: new Date(row.pointerSeenAt * 1000).toISOString(),
+      links: { statement: `${deps.links.statementBase}${row.agentId}` },
+    });
+  }
+  return listed;
 }

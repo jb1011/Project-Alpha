@@ -1,6 +1,7 @@
 import type { Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { formationSummary } from "../../formation/status";
+import { activeLegalBodies } from "../../legalBody/statements";
 import type { PublicEntityRow } from "../../persistence/entityRepository";
 import type { ApiDeps } from "../app";
 import { metadataBaseOf } from "./metadata";
@@ -8,6 +9,9 @@ import { metadataBaseOf } from "./metadata";
 /** A job is "settled" once escrowed USDC has paid out on-chain. `reputed` is a settled job that
  *  also earned reputation — same canonical definition as routes/reputation.ts. */
 const SETTLED = new Set(["completed", "reputed"]);
+
+/** The most legal bodies the section lists: one snapshot of the chain reads them all. */
+const LEGAL_BODIES_LISTED = 100;
 
 /**
  * The Hedera facts a row may carry, or nothing at all.
@@ -46,7 +50,15 @@ function hederaFactsOf(deps: ApiDeps, e: PublicEntityRow, base: string | null) {
  *  the partyId that would let one be looked up) together with the EIN and the filing number. The
  *  EIN is the entity owner's tax identifier and is served only to an authenticated owner; the
  *  formation block below carries a derived status and the environment, which are exactly the two
- *  facts the honesty invariant requires a stranger to be able to see. */
+ *  facts the honesty invariant requires a stranger to be able to see.
+ *
+ *  Where the public legal-body statement is wired (`deps.legalBodyStatements`), the body also lists
+ *  `legalBodies`: the deployment's linked legal bodies whose statement would read `active`, worked
+ *  out from one snapshot of the chain (`activeLegalBodies`), with their count in `stats`. When the
+ *  chain could not be read the list is empty and `legalBodiesAvailable` is false. A listed body
+ *  carries what its statement states and nothing about the people behind it: no human reference,
+ *  no credential, no tenant, no guardian address. Without the statement the body is exactly what it
+ *  was. */
 export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps) {
   /**
    * A very short in-process cache (M5).
@@ -58,16 +70,38 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
    * one pass rather than one per request. The response already advertises `max-age=300` to
    * intermediaries, so the freshness contract is unchanged; this only stops the process doing the
    * work again for a browser that ignored it.
+   *
+   * It holds the computation FROM ITS START, not from its answer: the legal-body section reads the
+   * chain, and concurrent requests on a cold cache all wait for the one computation running instead
+   * of each starting a read of its own. A computation that fails (a database read) is not kept: the
+   * requests that shared it fail with it, and the next request computes afresh. An answer whose
+   * section could not read the chain is still an answer, kept like any other, so a chain outage
+   * costs one snapshot per ten seconds, not one per request.
    */
   const CACHE_TTL_MS = 10_000;
-  let cached: { at: number; body: unknown } | undefined;
+  let cached: { at: number; body: Promise<Record<string, unknown>> } | undefined;
 
-  app.get("/transparency", (c) => {
+  app.get("/transparency", async (c) => {
     const now = (deps.now ?? Date.now)();
-    if (cached && now - cached.at < CACHE_TTL_MS) {
-      c.header("Cache-Control", "public, max-age=300");
-      return c.json(cached.body as Record<string, unknown>);
+    let entry = cached;
+    if (!entry || now - entry.at >= CACHE_TTL_MS) {
+      const computing = { at: now, body: transparencyBody() };
+      cached = computing;
+      entry = computing;
+      computing.body.catch(() => {
+        if (cached === computing) cached = undefined;
+      });
     }
+    // Awaited before the header is set: a failure reaches the error handler with no cache header,
+    // so an error is never advertised as cacheable.
+    const body = await entry.body;
+    c.header("Cache-Control", "public, max-age=300");
+    return c.json(body);
+  });
+
+  /** The body, computed afresh: what this surface always served, then the legal-body section where
+   *  the statement is wired. A database read that fails rejects. */
+  async function transparencyBody(): Promise<Record<string, unknown>> {
     const entities = deps.repo.listPublicOnChain();
     const jobs = deps.jobs.list();
 
@@ -145,16 +179,21 @@ export function mountTransparencyRoutes(app: Hono<{ Variables: AuthVars }>, deps
       };
     });
 
-    const body = {
-      stats: {
-        entities: rows.length,
-        jobsSettled,
-        usdcSettledAtomic: usdcSettledAtomic.toString(),
-      },
-      entities: rows,
+    const stats = {
+      entities: rows.length,
+      jobsSettled,
+      usdcSettledAtomic: usdcSettledAtomic.toString(),
     };
-    cached = { at: now, body };
-    c.header("Cache-Control", "public, max-age=300");
-    return c.json(body);
-  });
+    const statements = deps.legalBodyStatements;
+    if (!statements) return { stats, entities: rows };
+
+    const listed = await activeLegalBodies(statements, LEGAL_BODIES_LISTED);
+    const legalBodies = listed === "unavailable" ? [] : listed;
+    return {
+      stats: { ...stats, legalBodies: legalBodies.length },
+      entities: rows,
+      legalBodies,
+      legalBodiesAvailable: listed !== "unavailable",
+    };
+  }
 }

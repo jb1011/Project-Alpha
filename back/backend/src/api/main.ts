@@ -979,6 +979,8 @@ async function main() {
         chainId: cfg.chainId,
         resolverAddress: cfg.ens.resolverAddress,
         labelAliases: cfg.ens.labelAliases,
+        // Published on the apex: the address that signs the public statements, never its key.
+        attestor: cfg.attestation?.address,
       }
     : undefined;
   if (ens) console.warn(`⚠ ENS gateway ENABLED at /ensgateway (parent ${ens.parentName})`);
