@@ -8,6 +8,7 @@ import type { CustomerCompanyDeps } from "../legalBody/customerCompany";
 import type { EvidenceDeps } from "../legalBody/evidence";
 import type { GasSeedDeps } from "../legalBody/gasSeed";
 import type { LegalBodyOrderDeps } from "../legalBody/orders";
+import type { LegalBodyStatementDeps } from "../legalBody/statements";
 import { mountMcpRoute } from "../mcp/transport";
 import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
 import type { CompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
@@ -25,6 +26,7 @@ import { mountFormationRulesRoutes } from "./routes/formationRules";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountLegalBodyRoutes } from "./routes/legalBodies";
 import { mountLegalBodyOrderRoutes } from "./routes/legalBodyOrders";
+import { mountLegalBodyStatementRoutes } from "./routes/legalBodyStatements";
 import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
@@ -282,6 +284,16 @@ export interface ApiDeps extends EntityViewDeps {
    */
   legalBody?: import("./routes/legalBodies").LegalBodyLookupDeps;
   /**
+   * The public legal-body STATEMENT: `GET /legal-bodies/by-agent/:agentId`, and the lookup's
+   * answer for a Minimal legal body by address. Present only where the legal-body feature is on
+   * (the factory and the controller) AND the attestation key is set. Absent, the by-agent route is
+   * not mounted (404) and the lookup answers exactly as it does without it.
+   *
+   * Its `readBudget` is the lookup's shared read budget, the same instance, and both routes draw
+   * on the one per-client limiter of these deps.
+   */
+  legalBodyStatements?: LegalBodyStatementDeps;
+  /**
    * The Hedera rail (design 2026-09-10). Present exactly when `HEDERA_ENABLED` produced a whole
    * `cfg.hedera` block; absent, the three MCP tools are NOT REGISTERED at all — not registered
    * and refusing, which would still advertise a capability this deployment does not have.
@@ -397,6 +409,9 @@ export function buildApiApp(deps: ApiDeps) {
   // Public and unauthenticated for the same reason `/transparency` is, and mounted here so it is
   // outside `protect()` below: the caller is a seller that has never heard of us.
   mountLegalBodyRoutes(app, deps);
+  // The signed statement by agent, beside the lookup by address and public for the same reason.
+  // Mounted only where the statement is wired.
+  mountLegalBodyStatementRoutes(app, deps);
   // The PAID standing check, settled on Hedera (task 6). Public and unauthenticated for the same
   // reason the free lookup above is, and mounted beside it so both sit outside `protect()`.
   mountVerifyRoutes(app, deps);

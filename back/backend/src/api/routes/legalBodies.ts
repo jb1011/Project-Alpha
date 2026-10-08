@@ -2,6 +2,9 @@ import type { Context, Hono } from "hono";
 import { getAddress, isAddress } from "viem";
 import type { AuthVars } from "../../auth/middleware";
 import type { FormationSummary } from "../../formation/status";
+import type { SignedStatementJson } from "../../legalBody/publicStatement";
+import type { Standing } from "../../legalBody/standing";
+import { type StatementOutcome, statementForAddress } from "../../legalBody/statements";
 import { opsLog } from "../../observability/opsLog";
 import type {
   LegalBodyChainReads,
@@ -89,8 +92,10 @@ export interface LegalBodyLookupDeps {
  * but a guardian suspension has to become visible fast, so the window is seconds and not minutes.
  * `unknown` is NEVER stored (D8): a read that failed is not an answer, and remembering it would
  * turn one RPC blip into fifteen seconds of "we cannot tell" for an address that is fine.
+ *
+ * The statement route by agent keeps a memo of its own on the same window and bound.
  */
-const MEMO_TTL_MS = 15_000;
+export const MEMO_TTL_MS = 15_000;
 /**
  * …and the SAME window stated on the wire (R1).
  *
@@ -102,8 +107,8 @@ const MEMO_TTL_MS = 15_000;
  * cost D3's window was chosen against. Everything that is NOT a definitive answer — `unknown`, a
  * 400, a 429, a 503 — is `no-store`: none of them may be reused for anything.
  */
-const FRESH_CACHE_CONTROL = "public, max-age=15";
-const NO_STORE = "no-store";
+export const FRESH_CACHE_CONTROL = "public, max-age=15";
+export const NO_STORE = "no-store";
 /**
  * The PER-CLIENT budget, in front of the shared one (R2).
  *
@@ -124,10 +129,10 @@ const CLIENT_REFILL_PER_SECOND = 0.5;
 const CLIENT_MAX_KEYS = 2000;
 /** A throttle is an ops signal, not a per-request log line: one line per window, whatever the
  *  volume, so a scanner cannot turn journald into its second victim. */
-const THROTTLE_LOG_WINDOW_MS = 60_000;
+export const THROTTLE_LOG_WINDOW_MS = 60_000;
 /** Bounded so a walk over random addresses cannot grow this map without limit. Oldest first —
  *  insertion order, re-inserted on every refresh, so the entry evicted is the coldest one. */
-const MEMO_MAX_ENTRIES = 1000;
+export const MEMO_MAX_ENTRIES = 1000;
 
 /** The filing facts this surface reports (D1: reported, never gating). */
 export interface FormationFacts {
@@ -152,7 +157,79 @@ type LookupAnswer =
       links: { transparency: string; metadata: string | null };
       formation: FormationFacts | null;
       checkedAt: string;
+    }
+  | MinimalAnswer;
+
+/**
+ * The answer for a Minimal legal body: the full product's shape, with the signed statement beside
+ * it. A Minimal body has no metadata document and no filing of ours, so both of those are null.
+ */
+type MinimalAnswer =
+  | {
+      // No statement could be made just now (a chain read failed): nothing is signed and no agent
+      // is named, since an address names an agent only through a statement made about it.
+      address: string;
+      legalBody: true;
+      standing: "unknown";
+      agentId: null;
+      publicId: null;
+      name: "";
+      network: "testnet" | "mainnet";
+      links: { transparency: string; metadata: null };
+      formation: null;
+      checkedAt: string;
+      statement: null;
+    }
+  | {
+      address: string;
+      legalBody: true;
+      standing: Standing;
+      agentId: string;
+      publicId: string;
+      name: string;
+      network: "testnet" | "mainnet";
+      links: { transparency: string; metadata: null; statement: string };
+      formation: null;
+      checkedAt: string;
+      statement: SignedStatementJson;
     };
+
+/**
+ * The memo of a public legal-body route: the last DEFINITIVE answer per key, for `ttlMs`.
+ * Deciding what is definitive is the caller's: `unknown` is never handed to it.
+ *
+ * A plain `Map`, in the order of first writes. An answer read after its window is deleted by that
+ * read. A hit is not re-inserted, so reading an answer neither renews its window nor moves its
+ * place. A key written again while live keeps its first slot, with a window from the new write.
+ * Above `maxEntries` the oldest write is evicted: the key is the caller's, and a walk over random
+ * keys must not grow the map without limit.
+ */
+export class AnswerMemo<T> {
+  private readonly entries = new Map<string, { at: number; answer: T }>();
+
+  constructor(
+    private readonly ttlMs: number,
+    private readonly maxEntries: number,
+    private readonly now: () => number,
+  ) {}
+
+  get(key: string): T | undefined {
+    const hit = this.entries.get(key);
+    if (hit === undefined) return undefined;
+    if (this.now() - hit.at < this.ttlMs) return hit.answer;
+    this.entries.delete(key);
+    return undefined;
+  }
+
+  set(key: string, answer: T): void {
+    this.entries.set(key, { at: this.now(), answer });
+    while (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
+  }
+}
 
 /** Anything with a request header bag — a Hono `Context`, and nothing more than that. */
 type HeaderBearing = { req: { header(name: string): string | undefined } };
@@ -257,11 +334,60 @@ export function formationOf(lb: LegalBodyLookupDeps, e: EntityRecord): Formation
   };
 }
 
+/**
+ * The lookup's answer for a Minimal legal body, from what the statement service made of the
+ * address. `network` and the transparency link are the lookup's, as on every answer of this
+ * route; the statement link is the statement route's, for the agent stated.
+ */
+function minimalAnswer(
+  lb: LegalBodyLookupDeps,
+  statementBase: string,
+  address: string,
+  outcome: Exclude<StatementOutcome, { kind: "none" }>,
+  checkedAt: string,
+): MinimalAnswer {
+  if (outcome.kind === "unknown")
+    return {
+      address,
+      legalBody: true,
+      standing: "unknown",
+      agentId: null,
+      publicId: null,
+      name: "",
+      network: lb.network,
+      links: { transparency: lb.links.transparency, metadata: null },
+      formation: null,
+      checkedAt,
+      statement: null,
+    };
+  return {
+    address,
+    legalBody: true,
+    standing: outcome.standing,
+    agentId: outcome.agentId,
+    publicId: outcome.publicId,
+    // The name the statement carries: empty unless the statement may show it.
+    name: outcome.statement.message.legalName,
+    network: lb.network,
+    links: {
+      transparency: lb.links.transparency,
+      metadata: null,
+      statement: `${statementBase}${outcome.agentId}`,
+    },
+    formation: null,
+    checkedAt,
+    statement: outcome.statement,
+  };
+}
+
+/** The one thing of an error an ops line carries: its message can quote a value we hold. */
+const errorNameOf = (e: unknown): string => (e instanceof Error ? e.name : "not_an_error");
+
 export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiDeps): void {
   const lb = deps.legalBody;
   if (!lb) return;
   const now = () => (deps.now ?? Date.now)();
-  const memo = new Map<string, { at: number; answer: LookupAnswer }>();
+  const memo = new AnswerMemo<LookupAnswer>(MEMO_TTL_MS, MEMO_MAX_ENTRIES, now);
   const clientBucket = createClientLimiter(deps);
   const readBudget = sharedReadBudget(deps);
   /** When the last throttle line was written, so a sustained drain costs one line per minute. */
@@ -278,6 +404,16 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     }
     c.header("Cache-Control", NO_STORE);
     return c.json({ error: "rate_limited", message: "try again in a few seconds" }, 429);
+  };
+
+  /** A DATABASE read failed, so we cannot tell whether the address is one of ours at all: the
+   *  route's flat 503, never memoised and never reused. */
+  const unavailable = (c: Context) => {
+    c.header("Cache-Control", NO_STORE);
+    return c.json(
+      { error: "unavailable", message: "could not check right now; try again shortly" },
+      503,
+    );
   };
 
   app.get("/legal-bodies/:address", async (c) => {
@@ -300,15 +436,12 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     const key = address.toLowerCase();
 
     const hit = memo.get(key);
-    if (hit) {
-      if (now() - hit.at < MEMO_TTL_MS) {
-        // A memo hit is a definitive answer by construction (`unknown` is never stored), so it
-        // carries the same freshness as the read that produced it — and it costs a token from
-        // NEITHER bucket, which is what lets a refreshing page ride the memo instead of a 429.
-        c.header("Cache-Control", FRESH_CACHE_CONTROL);
-        return c.json(hit.answer);
-      }
-      memo.delete(key);
+    if (hit !== undefined) {
+      // A memo hit is a definitive answer by construction (`unknown` is never stored), so it
+      // carries the same freshness as the read that produced it — and it costs a token from
+      // NEITHER bucket, which is what lets a refreshing page ride the memo instead of a 429.
+      c.header("Cache-Control", FRESH_CACHE_CONTROL);
+      return c.json(hit);
     }
     // Both budgets are spent on a MISS ONLY, like the AgentBook status route's read budget: they
     // exist to bound the CHAIN READS, and a memo hit makes none. The caller's own allowance is
@@ -325,56 +458,70 @@ export function mountLegalBodyRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       // we cannot tell whether the address is one of ours at all — which `standing` has no value
       // for, and `legalBody: false` would be a lie. 503, in this route's flat error shape rather
       // than the house envelope a thrown error would have produced.
-      c.header("Cache-Control", NO_STORE);
-      return c.json(
-        { error: "unavailable", message: "could not check right now; try again shortly" },
-        503,
-      );
+      return unavailable(c);
+    }
+    // A MINIMAL legal body: asked only for an address the full product does not know, and only
+    // where the statement is wired, so every full-product answer stays exactly as it was. The
+    // statement service answers a failed chain read with `unknown` and lets a failed database
+    // read throw, which is this route's 503 like the resolver's.
+    const statements = deps.legalBodyStatements;
+    let minimal: StatementOutcome = { kind: "none" };
+    if (resolved.kind === "none" && statements) {
+      try {
+        minimal = await statementForAddress(statements, address);
+      } catch (e) {
+        opsLog("legal_body_statement_db_failed", { errorName: errorNameOf(e) });
+        return unavailable(c);
+      }
     }
     const checkedAt = new Date(now()).toISOString();
     const answer: LookupAnswer =
-      resolved.kind === "none"
-        ? { address, legalBody: false, standing: null, checkedAt }
-        : {
-            address,
-            legalBody: true,
-            standing: resolved.standing,
-            // A DECIMAL STRING, as every other public surface serves it (`/transparency`,
-            // `/metadata`): an agent id is a uint256 token id, and a JSON number silently loses
-            // precision above 2^53. The design sketch's unquoted `843704` would have been a lie
-            // for any id big enough to matter.
-            agentId: resolved.entity.agentId ?? null,
-            publicId: resolved.entity.publicId ?? null,
-            name: resolved.entity.name,
-            network: lb.network,
-            links: {
-              transparency: lb.links.transparency,
-              metadata: resolved.entity.publicId
-                ? `${lb.links.metadataBase.replace(/\/+$/, "")}/metadata/${resolved.entity.publicId}`
-                : null,
-            },
-            formation: formationOf(lb, resolved.entity),
-            checkedAt,
-          };
+      statements && minimal.kind !== "none"
+        ? minimalAnswer(lb, statements.links.statementBase, address, minimal, checkedAt)
+        : resolved.kind === "none"
+          ? { address, legalBody: false, standing: null, checkedAt }
+          : {
+              address,
+              legalBody: true,
+              standing: resolved.standing,
+              // A DECIMAL STRING, as every other public surface serves it (`/transparency`,
+              // `/metadata`): an agent id is a uint256 token id, and a JSON number silently loses
+              // precision above 2^53. The design sketch's unquoted `843704` would have been a lie
+              // for any id big enough to matter.
+              agentId: resolved.entity.agentId ?? null,
+              publicId: resolved.entity.publicId ?? null,
+              name: resolved.entity.name,
+              network: lb.network,
+              links: {
+                transparency: lb.links.transparency,
+                metadata: resolved.entity.publicId
+                  ? `${lb.links.metadataBase.replace(/\/+$/, "")}/metadata/${resolved.entity.publicId}`
+                  : null,
+              },
+              formation: formationOf(lb, resolved.entity),
+              checkedAt,
+            };
 
     // DEFINITIVE answers only (D8). "Not one of ours" is definitive too — it is a local read that
-    // asked the chain nothing — so it is memoised like the rest; `unknown` never is.
-    const definitive = !(resolved.kind === "body" && resolved.standing === "unknown");
-    if (definitive) {
-      memo.set(key, { at: now(), answer });
-      while (memo.size > MEMO_MAX_ENTRIES) {
-        const oldest = memo.keys().next().value;
-        if (oldest === undefined) break;
-        memo.delete(oldest);
-      }
-    }
+    // asked the chain nothing — so it is memoised like the rest; `unknown` never is. A Minimal
+    // body's signed statement is definitive whatever standing it states: only the unsigned
+    // `unknown` of a failed chain read is not an answer.
+    const definitive =
+      !(resolved.kind === "body" && resolved.standing === "unknown") && minimal.kind !== "unknown";
+    if (definitive) memo.set(key, answer);
 
     // One line per MISS (a hit costs nothing and says nothing new). No address: this is a
     // high-volume public route and the two fields that matter for ops — which index matched and
-    // what the chain said — keep the line short and greppable.
+    // what the chain said — keep the line short and greppable. A Minimal body is matched by its
+    // statement.
     opsLog("legal_body_lookup", {
-      matchedBy: resolved.kind === "body" ? resolved.matchedBy : "none",
-      standing: resolved.kind === "body" ? resolved.standing : null,
+      matchedBy:
+        resolved.kind === "body"
+          ? resolved.matchedBy
+          : minimal.kind === "none"
+            ? "none"
+            : "statement",
+      standing: answer.standing,
     });
     // `unknown` is not an answer anything may reuse — it is the absence of one (D8).
     c.header("Cache-Control", definitive ? FRESH_CACHE_CONTROL : NO_STORE);
