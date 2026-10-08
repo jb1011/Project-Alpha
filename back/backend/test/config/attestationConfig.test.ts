@@ -36,7 +36,7 @@ const CONTROLLER_MODE = {
 };
 const LB_FACTORY = "0x3333333333333333333333333333333333333333" as const;
 
-/** Arc mainnet's chain id is not published yet; any id other than the testnet's names mainnet. */
+/** Any chain id other than the testnet's names mainnet here. */
 const MAINNET_CHAIN_ID = "8004";
 
 /** A mainnet deployment that boots: a production provider with the identity and SSN-key floors,
