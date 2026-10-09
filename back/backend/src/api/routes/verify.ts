@@ -101,6 +101,9 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   const limiter = createClientLimiter(deps);
   const shared = sharedReadBudget(deps);
   const now = () => (deps.now ?? Date.now)();
+  /** This API's public origin without its trailing slashes, where the deployment names one: the
+   *  address the quote names is built on it (layer 2). */
+  const publicOrigin = deps.publicApiUrl?.replace(/\/+$/, "");
   const routes: RoutesConfig = {
     "GET /verify/:publicId": {
       accepts: {
@@ -253,7 +256,22 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   // Layer 2: the x402 middleware (402, verify, settle; it discards our body on a failed settle),
   // behind the handshake above. Mounted AFTER layer 1, so a 404 or a throttled caller is answered
   // without the facilitator being asked anything at all — with the facilitator up or down.
-  typed.use("/verify/:publicId", async (c, next) => (await paidLayer(c))(c, next));
+  //
+  // The quote's resource address is the request URL, which behind the TLS proxy reads http. So
+  // where the deployment names its public origin, the middleware reads the request at that origin,
+  // with the same path, query, method and headers; a payment is matched on the requirements it
+  // accepted, never on this address. Only for a GET, the one method quoted: no Request can be
+  // built for a TRACE, which stays a 404.
+  typed.use("/verify/:publicId", async (c, next) => {
+    if (publicOrigin && c.req.method === "GET") {
+      const { pathname, search } = new URL(c.req.url);
+      c.req.raw = new Request(`${publicOrigin}${pathname}${search}`, {
+        method: c.req.method,
+        headers: c.req.raw.headers,
+      });
+    }
+    return (await paidLayer(c))(c, next);
+  });
 
   // Layer 3: the handler.
   typed.get("/verify/:publicId", async (c) => {

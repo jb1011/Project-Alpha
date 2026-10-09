@@ -47,6 +47,10 @@ export const PUBLIC_STATEMENT_DOMAIN_VERSION = "2";
 export const PUBLIC_STATEMENT_PRIMARY_TYPE = "LegalBodyStatement";
 /** How long a statement is good for, in seconds from its issue. */
 export const PUBLIC_STATEMENT_TTL_SECONDS = 300;
+/** How far a verifier's clock may run behind the attestor's, in seconds: a statement is accepted
+ *  from this many seconds before its `issuedAt`. Never after its `expiresAt`, so its lifetime does
+ *  not grow. */
+export const PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS = 60;
 export const PUBLIC_STATEMENT_JURISDICTION = "WY";
 export const PUBLIC_STATEMENT_ENTITY_TYPE = "LLC";
 
@@ -519,7 +523,8 @@ function hasExactly(v: unknown, keys: readonly string[]): v is Record<string, un
  *    `verifyingContract` answers false), and the message reads strictly ({@link statementFromJson});
  *  - the domain is `publicStatementDomain(expectedChainId)` and the message names the same chain;
  *  - `nowSeconds` is a finite number, and its whole second (a fraction is rounded down, so
- *    `Date.now() / 1000` works) is from `issuedAt` to `expiresAt`, both included;
+ *    `Date.now() / 1000` works) is from `issuedAt` minus PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS to
+ *    `expiresAt`, both included;
  *  - `expiresAt - issuedAt` is PUBLIC_STATEMENT_TTL_SECONDS;
  *  - the signature is in its canonical form, a low `s` and `v` 27 or 28
  *    ({@link isCanonicalSignature});
@@ -551,7 +556,8 @@ export async function verifyPublicStatement(
     if (s.chainId !== BigInt(opts.expectedChainId)) return false;
     if (!Number.isFinite(opts.nowSeconds)) return false;
     const now = BigInt(Math.floor(opts.nowSeconds));
-    if (now < s.issuedAt || now > s.expiresAt) return false;
+    if (now < s.issuedAt - BigInt(PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS) || now > s.expiresAt)
+      return false;
     if (s.expiresAt - s.issuedAt !== BigInt(PUBLIC_STATEMENT_TTL_SECONDS)) return false;
     return await verifyTypedData({
       address: opts.attestor,

@@ -291,7 +291,7 @@ On a sandbox deployment (`environment: "sandbox"`), `guardianHumanVerified` can 
 
 1. **Take the attestor from ENS, never from the answer.** Read the text record `com.novicorpus.attestor` of `novicorpus.eth` (on Ethereum Sepolia, see [ENS names](ens.md)). Its value is CAIP-10, `eip155:<chainId>:<address>`: check that the chain id is the chain you expect statements for. An empty record means the deployment publishes no attestor. The record is served by Novi's gateway and signed by its key, so it is a convenience and not a source independent of Novi's servers.
 2. **Check what the statement is about.** `primaryType` is `LegalBodyStatement`. The domain is exactly the one above, with your chain id and no `verifyingContract`. `message.chainId` is the same chain, `message.factory` is the legal-body factory you pin for that deployment, and `message.identityRegistry` is the registry you expect. Asked by agent, `message.agentId` is your agent; asked by address, `message.agentWallet` is your address.
-3. **Check the time.** `issuedAt <= now <= expiresAt`, and `expiresAt - issuedAt` is 300.
+3. **Check the time.** `issuedAt - 60 <= now <= expiresAt`, and `expiresAt - issuedAt` is 300. The 60 seconds absorb a clock that runs a little behind Novi's: without them, a verifier whose clock is one second slow refuses a statement it has just fetched. Never accept a statement after `expiresAt`.
 4. **Check the signature with plain ECDSA.** Recover the signer of the EIP-712 hash and compare it with the attestor from step 1. The attestor is a key, not a contract.
 
 Only a statement that passes all four says anything. The `statement` of either route is checked the same way.
@@ -340,7 +340,8 @@ async function isValidStatement(
     const issuedAt = BigInt(m.issuedAt as string);
     const expiresAt = BigInt(m.expiresAt as string);
     const now = BigInt(Math.floor(Date.now() / 1000));
-    if (now < issuedAt || now > expiresAt || expiresAt - issuedAt !== 300n) return false;
+    // 60 seconds of grace for a clock behind Novi's; none after expiresAt.
+    if (now < issuedAt - 60n || now > expiresAt || expiresAt - issuedAt !== 300n) return false;
     // Your own domain, never the served one.
     return await verifyTypedData({
       address: expected.attestor,

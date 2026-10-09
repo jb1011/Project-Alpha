@@ -11,6 +11,8 @@
  * The order of the layers is the whole point (D9): the 404 guard and the rate limiter run BEFORE
  * any 402 is issued, so a caller is never quoted a price for a body we do not have.
  */
+import { request as httpRequest } from "node:http";
+import { type ServerType, serve } from "@hono/node-server";
 import { decodePaymentRequiredHeader } from "@x402/core/http";
 import type Database from "better-sqlite3";
 import { privateKeyToAccount } from "viem/accounts";
@@ -120,6 +122,9 @@ function setup(
     /** Set = the deployment holds `NOVI_ATTESTATION_KEY`; absent = it does not, which is the
      *  state every test above this option runs in. */
     attestationKey?: Hex;
+    /** Set = the deployment names its public origin (`PUBLIC_API_URL`); absent = it does not,
+     *  which is the state every other test runs in. */
+    publicApiUrl?: string;
   } = {},
 ) {
   const { db, repo } = hederaDb(o.over);
@@ -146,6 +151,7 @@ function setup(
       network: "testnet" as const,
     },
     worldId: "worldId" in o ? o.worldId : WORLD,
+    publicApiUrl: o.publicApiUrl,
   });
   return { app, repo };
 }
@@ -166,6 +172,48 @@ async function paidHeader(app: App, publicId: string, client: string): Promise<s
     JSON.stringify({ x402Version: 2, accepted, payload: { signedTransaction: "0xdeadbeef" } }),
   ).toString("base64");
 }
+
+/** The address a 402's quote names: `resource.url` in its PAYMENT-REQUIRED header. */
+const quotedUrl = (header: string | null): string =>
+  decodePaymentRequiredHeader(header ?? "").resource.url;
+
+/**
+ * The app served by a real `@hono/node-server` on a free loopback port, the server production
+ * runs, closed once `run` is done. Its request object is that server's own, not the `Request`
+ * that `app.request` builds.
+ */
+async function served<T>(app: App, run: (origin: string) => Promise<T>): Promise<T> {
+  // Once it listens: with a host name to bind, the port is known only then.
+  const { server, port } = await new Promise<{ server: ServerType; port: number }>((resolve) => {
+    const server = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" }, (info) =>
+      resolve({ server, port: info.port }),
+    );
+  });
+  try {
+    return await run(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((err) => (err ? reject(err) : resolve())),
+    );
+  }
+}
+
+/** One request over its own connection, closed after the answer (so the server can close), with
+ *  any method: `fetch` refuses to send a TRACE. */
+const overHttp = (url: string, method: string, headers: Record<string, string>) =>
+  new Promise<{ status: number; headers: Headers }>((resolve, reject) => {
+    const req = httpRequest(url, { method, headers, agent: false }, (res) => {
+      res.resume();
+      res.on("end", () => {
+        const answered = new Headers();
+        for (const [name, value] of Object.entries(res.headers))
+          if (typeof value === "string") answered.set(name, value);
+        resolve({ status: res.statusCode ?? 0, headers: answered });
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
 
 // ── the flag, and the two 404s that come before any price ───────────────────────────────────────
 
@@ -235,6 +283,89 @@ test("the quote's description never claims more than a registered legal body who
   );
   for (const forbidden of ["verified company", "KYC", "licensed", "good standing"])
     expect(description).not.toContain(forbidden);
+});
+
+// ── the quote's address ─────────────────────────────────────────────────────────────────────────
+
+test("with the public origin set, the quote names the public https address, not the http one this server was asked on", async () => {
+  const { app } = setup({ publicApiUrl: "https://api.example.test" });
+  // What the box sees behind the TLS proxy: plain http, on its own host and port.
+  const res = await app.request(`http://internal.example.test:8789/verify/${PUBLIC_ID}`, {
+    headers: { "x-forwarded-for": "13.0.0.1" },
+  });
+  expect(res.status).toBe(402);
+  expect(quotedUrl(res.headers.get("PAYMENT-REQUIRED"))).toBe(
+    `https://api.example.test/verify/${PUBLIC_ID}`,
+  );
+  // The query the caller sent stays on it.
+  const withQuery = await app.request(
+    `http://internal.example.test:8789/verify/${PUBLIC_ID}?ref=docs`,
+    { headers: { "x-forwarded-for": "13.0.0.1" } },
+  );
+  expect(quotedUrl(withQuery.headers.get("PAYMENT-REQUIRED"))).toBe(
+    `https://api.example.test/verify/${PUBLIC_ID}?ref=docs`,
+  );
+});
+
+test("a public origin written with a trailing slash names the same address, with no double slash", async () => {
+  const { app } = setup({ publicApiUrl: "https://api.example.test/" });
+  const res = await get(app, PUBLIC_ID);
+  expect(res.status).toBe(402);
+  expect(quotedUrl(res.headers.get("PAYMENT-REQUIRED"))).toBe(
+    `https://api.example.test/verify/${PUBLIC_ID}`,
+  );
+});
+
+test("with no public origin, the quote names the request URL as this server saw it, as before", async () => {
+  const { app } = setup();
+  const sent = `http://internal.example.test:8789/verify/${PUBLIC_ID}`;
+  const res = await app.request(sent, { headers: { "x-forwarded-for": "13.0.0.3" } });
+  expect(res.status).toBe(402);
+  expect(quotedUrl(res.headers.get("PAYMENT-REQUIRED"))).toBe(sent);
+});
+
+test("with the public origin set, a payment that carries the https address back still settles and buys the attestation", async () => {
+  const { app } = setup({ publicApiUrl: "https://api.example.test" });
+  const quote = await get(app, PUBLIC_ID, { "x-forwarded-for": "13.0.0.4" });
+  const required = decodePaymentRequiredHeader(quote.headers.get("PAYMENT-REQUIRED") ?? "");
+  expect(required.resource.url).toBe(`https://api.example.test/verify/${PUBLIC_ID}`);
+  // As `@x402/core`'s client builds a payment: the requirements it accepted, and the quote's
+  // resource beside them.
+  const header = Buffer.from(
+    JSON.stringify({
+      x402Version: 2,
+      resource: required.resource,
+      accepted: required.accepts[0],
+      payload: { signedTransaction: "0xdeadbeef" },
+    }),
+  ).toString("base64");
+  const res = await get(app, PUBLIC_ID, {
+    "x-forwarded-for": "13.0.0.4",
+    "PAYMENT-SIGNATURE": header,
+  });
+  expect(res.status).toBe(200);
+  expect(res.headers.get("PAYMENT-RESPONSE")).toBeTruthy();
+  expect((await res.json()).subject.publicId).toBe(PUBLIC_ID);
+  expect(seen).toContain("/settle");
+});
+
+test("served by a real Node server, the one production runs, the quote names the public https address", async () => {
+  const { app } = setup({ publicApiUrl: "https://api.example.test" });
+  const res = await served(app, (origin) =>
+    overHttp(`${origin}/verify/${PUBLIC_ID}`, "GET", { "x-forwarded-for": "13.0.0.5" }),
+  );
+  expect(res.status).toBe(402);
+  expect(quotedUrl(res.headers.get("PAYMENT-REQUIRED"))).toBe(
+    `https://api.example.test/verify/${PUBLIC_ID}`,
+  );
+});
+
+test("served by a real Node server, a TRACE to a known id is still a 404 with the public origin set: only a GET is rebuilt", async () => {
+  const { app } = setup({ publicApiUrl: "https://api.example.test" });
+  const res = await served(app, (origin) =>
+    overHttp(`${origin}/verify/${PUBLIC_ID}`, "TRACE", { "x-forwarded-for": "13.0.0.6" }),
+  );
+  expect(res.status).toBe(404);
 });
 
 // ── the limits, which come before the price ─────────────────────────────────────────────────────

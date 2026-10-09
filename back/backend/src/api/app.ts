@@ -153,6 +153,9 @@ export interface ApiDeps extends EntityViewDeps {
   arc: import("../adapters/arc/arcAdapter").ArcAdapter;
   agentRuns: import("../persistence/agentRunStore").AgentRunStore;
   mcpPublicUrl: string;
+  /** This API's own public origin (PUBLIC_API_URL), for links a stranger's x402 client is given:
+   *  the paid check's quote names its address on it. Absent, the request's own URL is used. */
+  publicApiUrl?: string;
   /** Tier-0 custody: the platform default for new agents ("turnkey" until P4) + whether circle
    *  provisioning is configured on this deployment (credentials + wallet set). The /onboard
    *  route and the MCP onboard_agent tool refuse a circle request when unavailable. */

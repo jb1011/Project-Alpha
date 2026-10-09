@@ -31,6 +31,7 @@ import {
   LEGAL_BODY_STATEMENT_TYPE_STRING,
   type LegalBodyStatement,
   type LegalBodyStatementJson,
+  PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS,
   PUBLIC_STATEMENT_DOMAIN_NAME,
   PUBLIC_STATEMENT_DOMAIN_VERSION,
   PUBLIC_STATEMENT_ENTITY_TYPE,
@@ -405,6 +406,7 @@ describe("the type and the domain", () => {
     expect(PUBLIC_STATEMENT_DOMAIN_VERSION).toBe("2");
     expect(PUBLIC_STATEMENT_PRIMARY_TYPE).toBe("LegalBodyStatement");
     expect(PUBLIC_STATEMENT_TTL_SECONDS).toBe(300);
+    expect(PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS).toBe(60);
     expect(PUBLIC_STATEMENT_JURISDICTION).toBe("WY");
     expect(PUBLIC_STATEMENT_ENTITY_TYPE).toBe("LLC");
   });
@@ -1027,20 +1029,24 @@ describe("signing and verifying", () => {
     await expect(verify(handSigned)).resolves.toBe(false);
   });
 
-  test("the window: from issuedAt to expiresAt, both included; a statement expired or not yet issued fails", async () => {
+  test("the window: from 60 seconds before issuedAt to expiresAt, both included; a time after expiresAt, or more than 60 seconds before issuedAt, fails", async () => {
     const wire = wireOf(await signStatement(GOLDEN, ANVIL_0));
+    // The 60 seconds are for a verifier whose clock runs behind the attestor's; none after expiry.
+    await expect(verify(wire, { nowSeconds: ISSUED_AT - 61 })).resolves.toBe(false);
+    await expect(verify(wire, { nowSeconds: ISSUED_AT - 60 })).resolves.toBe(true);
     await expect(verify(wire, { nowSeconds: ISSUED_AT })).resolves.toBe(true);
     await expect(verify(wire, { nowSeconds: ISSUED_AT + 300 })).resolves.toBe(true);
     await expect(verify(wire, { nowSeconds: ISSUED_AT + 301 })).resolves.toBe(false);
-    await expect(verify(wire, { nowSeconds: ISSUED_AT - 1 })).resolves.toBe(false);
   });
 
   test("a time with a fraction of a second, as Date.now() / 1000 gives, counts as its whole second", async () => {
     const wire = wireOf(await signStatement(GOLDEN, ANVIL_0));
     await expect(verify(wire, { nowSeconds: ISSUED_AT + 0.5 })).resolves.toBe(true);
-    // Rounded down, never to the nearest second: half a second before issue is not yet issued,
-    // and the last half second of the window is still inside it.
-    await expect(verify(wire, { nowSeconds: ISSUED_AT - 0.5 })).resolves.toBe(false);
+    // Rounded down, never to the nearest second: 60.5 seconds before issue counts as 61 and is
+    // outside the window, 59.5 counts as 60 and is inside it, and the last half second of the
+    // window is still inside it.
+    await expect(verify(wire, { nowSeconds: ISSUED_AT - 60.5 })).resolves.toBe(false);
+    await expect(verify(wire, { nowSeconds: ISSUED_AT - 59.5 })).resolves.toBe(true);
     await expect(verify(wire, { nowSeconds: ISSUED_AT + 300.5 })).resolves.toBe(true);
   });
 
