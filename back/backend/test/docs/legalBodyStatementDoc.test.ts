@@ -1,15 +1,18 @@
 /**
  * The public page a third party reads to check a legal-body statement must give the type and the
- * domain exactly as the code signs them: a verifier copies them from there. A change to either, in
- * the code or on the page, fails here until the two agree again.
+ * domain exactly as the code signs them, and the time window as the code checks it: a verifier
+ * copies them from there. A change to any of them, in the code or on the page, fails here until the
+ * two agree again.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import {
   LEGAL_BODY_STATEMENT_TYPE_STRING,
+  PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS,
   PUBLIC_STATEMENT_DOMAIN_NAME,
   PUBLIC_STATEMENT_DOMAIN_VERSION,
+  PUBLIC_STATEMENT_TTL_SECONDS,
 } from "../../src/legalBody/publicStatement";
 
 /** The page, found from this file: back/backend/test/docs, up to the repository's docs/identity. */
@@ -39,4 +42,11 @@ test("the page writes the domain as the code builds it: its name, its version, t
   expect(page()).toContain(
     `{ name: "${PUBLIC_STATEMENT_DOMAIN_NAME}", version: "${PUBLIC_STATEMENT_DOMAIN_VERSION}", chainId }`,
   );
+});
+
+test("the page states the time window with the code's numbers: the grace before issuedAt and the lifetime, in the rule and in its example", () => {
+  const text = page();
+  expect(text).toContain(`issuedAt - ${PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS} <= now <= expiresAt`);
+  expect(text).toContain(`issuedAt - ${PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS}n`);
+  expect(text).toContain(`expiresAt - issuedAt !== ${PUBLIC_STATEMENT_TTL_SECONDS}n`);
 });
