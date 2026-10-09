@@ -49,4 +49,5 @@ test("the page states the time window with the code's numbers: the grace before 
   expect(text).toContain(`issuedAt - ${PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS} <= now <= expiresAt`);
   expect(text).toContain(`issuedAt - ${PUBLIC_STATEMENT_CLOCK_SKEW_SECONDS}n`);
   expect(text).toContain(`expiresAt - issuedAt !== ${PUBLIC_STATEMENT_TTL_SECONDS}n`);
+  expect(text).toContain(`\`expiresAt - issuedAt\` is ${PUBLIC_STATEMENT_TTL_SECONDS}`);
 });
