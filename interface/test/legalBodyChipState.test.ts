@@ -2,7 +2,7 @@
  * The second question's claims ceiling, as a table.
  *
  * The AgentBook chip beside this one says whether a verified human vouched. This one says whether
- * Novi's own registry holds a legal body in good standing for the same address — a different
+ * Novi's own registry holds an active legal body for the same address — a different
  * source, a different fact, and the pair is only useful while neither is rendered as evidence for
  * the other. So the assertions here are as much about what the chip may NOT say as about what it
  * does: no claim when there is nothing to look up, no claim built out of a failed read, and none
@@ -113,10 +113,10 @@ test("`standing: \"unknown\"` is not a negative", () => {
 
 test("the titles are the ones the design fixed, verbatim", () => {
   expect(legalBodyChipState(body("active"))?.title).toBe(
-    "A registered legal body in good standing on Arc: its LegalManager is active and its treasury is not paused. Novi's registry, read from the chain.",
+    "A registered legal body on Arc whose standing Novi states as active: its LegalManager is active and its treasury is not paused. Novi's registry, read from the chain.",
   );
   expect(legalBodyChipState(body("inactive"))?.title).toBe(
-    "The legal body exists but is not in good standing right now: its treasury is paused or its LegalManager is not active.",
+    "The legal body exists but its standing is not active right now: its treasury is paused or its LegalManager is not active.",
   );
 });
 

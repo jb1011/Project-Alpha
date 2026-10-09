@@ -313,7 +313,7 @@ export type PublicMetadata = {
  * The public legal-body lookup (GET /legal-bodies/:address, design 2026-09-10 D3).
  *
  * The question a seller asks about an address that is about to pay it: is this the payment
- * address of a Novi legal body, and is that body in good standing? Unauthenticated, because the
+ * address of a Novi legal body, and is its standing active? Unauthenticated, because the
  * caller is a stranger holding nothing but the address — which is why the dashboard reads exactly
  * the same surface a seller would, rather than an owner-only view of the same fact.
  *
