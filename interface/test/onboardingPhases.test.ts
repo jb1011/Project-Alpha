@@ -23,7 +23,14 @@ const withFormation = visiblePhases(true);
 const withoutFormation = visiblePhases(false);
 
 test("landing step count matches the formation walk to a live company", () => {
-  expect(PHASES.filter((p) => p.id !== "dashboard")).toHaveLength(
+  // The landing promises "the same eight screens you walk in onboarding": the walk on a
+  // deployment that forms companies and does not charge, which is every deployment during the
+  // beta (`visiblePhases(true)` is that shape and the default, see the payment-step tests below).
+  // `PHASES` is not that list: it also holds the `payment` phase, which the wizard shows only
+  // where `/config.formationPaymentRequired` is true. The day a deployment charges, the landing
+  // needs a fee card and `ONBOARDING_STEP_COUNT` moves with it; that flag is runtime, so this
+  // test cannot say so by itself.
+  expect(withFormation.filter((p) => p.id !== "dashboard")).toHaveLength(
     ONBOARDING_STEP_COUNT,
   );
 });
