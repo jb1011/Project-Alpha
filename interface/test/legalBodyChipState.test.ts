@@ -6,7 +6,8 @@
  * source, a different fact, and the pair is only useful while neither is rendered as evidence for
  * the other. So the assertions here are as much about what the chip may NOT say as about what it
  * does: no claim when there is nothing to look up, no claim built out of a failed read, and none
- * of D7's forbidden vocabulary ("verified company", "KYC", "licensed") anywhere at all.
+ * of the forbidden vocabulary ("verified company", "KYC", "licensed", "good standing") anywhere
+ * at all.
  */
 import { describe, expect, test } from "vitest";
 import { legalBodyChipState, type LegalBodyView } from "@/lib/legalBody/chipState";
@@ -140,6 +141,7 @@ test("nothing claims more than the chain carries, and nothing mentions AgentBook
       "verified company",
       "kyc",
       "licensed",
+      "good standing",
       "human-backed",
       "guarantee",
       // The two sources are separate on purpose: this chip must never imply AgentBook shows it.

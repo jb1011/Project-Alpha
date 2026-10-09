@@ -381,7 +381,7 @@ export function buildPaywall(cfg: PaywallConfig) {
           charge();
           return c.json(await legalRefusal("legal-body-inactive", outcome.agentAddress), 403);
         }
-        // Standing is good, so this request will be quoted or served. A paying one keeps its
+        // Standing is active, so this request will be quoted or served. A paying one keeps its
         // charge deferred (it is spent below unless the payment actually settles) and reports
         // where the human stands; every other one spends its unit here.
         if (paying) c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);

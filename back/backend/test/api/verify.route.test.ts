@@ -233,7 +233,7 @@ test("the quote's description never claims more than a registered legal body who
   expect(description).toBe(
     "Novi Corpus legal-standing check: is this a registered legal body whose standing Novi states as active?",
   );
-  for (const forbidden of ["verified company", "KYC", "licensed"])
+  for (const forbidden of ["verified company", "KYC", "licensed", "good standing"])
     expect(description).not.toContain(forbidden);
 });
 
