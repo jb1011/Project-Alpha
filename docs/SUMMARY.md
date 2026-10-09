@@ -19,6 +19,7 @@
 
 * [World ID](identity/world.md)
 * [ENS names](identity/ens.md)
+* [Legal-body statements](identity/legal-body-statement.md)
 * [On chain identity](identity/registries.md)
 
 ## Agents

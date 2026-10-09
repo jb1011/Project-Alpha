@@ -43,6 +43,18 @@ A vanity alias (for example `demo`) can map to a public id that is already in on
 
 The apex `novicorpus.eth` resolves to a configured address. It is not the `NoviController` contract.
 
+## Apex records
+
+| Record | Meaning |
+| --- | --- |
+| `addr` | The configured address above. Coin types: Arc (`2152525650`) and ETH (`60`). |
+| `description` | One line about Novi Corpus. |
+| `url` | Base URL of the agents' metadata JSON. |
+| `agent-endpoint[web]` | App origin. |
+| `com.novicorpus.attestor` | The address that signs [legal-body statements](legal-body-statement.md), in CAIP-10 form: `eip155:<chainId>:<EIP-55 address>`, where `chainId` is the chain the statements are about. Empty when the deployment has no attestation key. |
+
+The attestor record is served by Novi's gateway and signed by its key, like every record of this name. It is a convenience: it is not independent of Novi's servers.
+
 ## ENSIP-25
 
 Checked in both directions:

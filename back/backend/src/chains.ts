@@ -1,4 +1,14 @@
-import { type Chain, defineChain } from "viem";
+import { type Address, type Chain, defineChain } from "viem";
+
+/**
+ * Multicall3, by chain id: the canonical deployment's address, listed only for a chain whose code
+ * there was checked byte for byte against the canonical runtime code (3,808 bytes, keccak256
+ * `0xd5c15df687b16f2ff992fc8d767b4216323184a2bbc6ee2f9c398c318e770891`). A chain that is not
+ * listed reads with separate calls instead, each pinned to the same block.
+ */
+export const MULTICALL3_BY_CHAIN: Readonly<Record<number, Address>> = {
+  5042002: "0xcA11bde05977b3631167028862bE2a173976CA11",
+};
 
 /** Arc testnet. Native gas IS USDC (18-decimal native units); the ERC-20 USDC is 6-decimal. */
 export const arcTestnet: Chain = defineChain({

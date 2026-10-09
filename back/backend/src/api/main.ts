@@ -37,6 +37,7 @@ import { createAgentBookRegistrar } from "../adapters/worldid/agentBookRegistrar
 import { arcBatchingConfig } from "../adapters/x402/pocket";
 import { derivePocketKey } from "../adapters/x402/pocketDerivation";
 import { SqliteNonceStore } from "../auth/nonceStore";
+import { MULTICALL3_BY_CHAIN } from "../chains";
 import {
   DEFAULT_BYO_MAX_OPEN_PER_TENANT,
   DEFAULT_LEGAL_BODY_SWEEP_INTERVAL_MS,
@@ -58,6 +59,7 @@ import { buildJobDeps } from "../jobs/composition";
 import { expireStaleCustomerCompanies } from "../legalBody/customerCompany";
 import { expireEvidenceBytes } from "../legalBody/evidence";
 import type { GasSeedDeps } from "../legalBody/gasSeed";
+import type { LegalBodyStatementDeps } from "../legalBody/statements";
 import {
   HOUSEKEEPING_BATCH,
   LEGAL_BODY_SWEEP_MAX_PER_TICK,
@@ -91,6 +93,7 @@ import { SqliteFormationPartyRepository } from "../persistence/formationPartyRep
 import { SqliteFormationPaymentRepository } from "../persistence/formationPaymentRepository";
 import { SqliteFormationRepository } from "../persistence/formationRepository";
 import { SqliteLegalBodyRepository } from "../persistence/legalBodyRepository";
+import { SqliteLegalBodyStatementRepository } from "../persistence/legalBodyStatementRepository";
 import { SqliteLinkCodeStore } from "../persistence/linkCodeStore";
 import { SqliteOaAnchorRepository } from "../persistence/oaAnchorRepository";
 import { SqlitePasskeyStore } from "../persistence/passkeyStore";
@@ -573,23 +576,39 @@ async function main() {
    */
   const legalBodies =
     cfg.legalBodyFactory && cfg.controllerAddress ? new SqliteLegalBodyRepository(db) : undefined;
+  // The attestor's address is public: it is what a reader checks a statement's signature against.
+  // With the legal-body feature on and no key, no statement can be signed (on mainnet the config
+  // refuses to boot in that shape), and the boot says so.
+  if (cfg.attestation) opsLog("attestation_key_loaded", { attestor: cfg.attestation.address });
+  else if (legalBodies) opsLog("legal_body_statements_off", { reason: "no_attestation_key" });
   const legalBodyFlow = cfg.legalBodyFlow ?? LEGAL_BODY_FLOW_DEFAULTS;
-  const legalBodyOrders =
+  /**
+   * The ONE chain of the legal-body feature, for the order doors and the public statement alike.
+   * Neither believes a head more than two minutes old: a create is not sent on a stale view, and
+   * a statement never signs one. A statement's snapshot reads through the Multicall3 listed for
+   * this chain, if one is; every other read ignores it.
+   */
+  const legalBodyChain =
     legalBodies && cfg.legalBodyFactory
+      ? new LegalBodyChain({
+          publicClient,
+          arc,
+          chainId: cfg.chainId,
+          factory: cfg.legalBodyFactory,
+          identityRegistry: cfg.identityRegistry,
+          maxHeadAgeSeconds: 120,
+          multicall3: MULTICALL3_BY_CHAIN[cfg.chainId],
+        })
+      : undefined;
+  const legalBodyOrders =
+    legalBodies && cfg.legalBodyFactory && legalBodyChain
       ? {
           repo: legalBodies,
           companies,
           declarations: companyDeclarations,
           checks: companyChecks,
           world: worldId,
-          chain: new LegalBodyChain({
-            publicClient,
-            arc,
-            chainId: cfg.chainId,
-            factory: cfg.legalBodyFactory,
-            identityRegistry: cfg.identityRegistry,
-            maxHeadAgeSeconds: 120,
-          }),
+          chain: legalBodyChain,
           // The agreements, in the file store every other document is in.
           docStore,
           deployment: { chainId: cfg.chainId, factory: cfg.legalBodyFactory },
@@ -960,6 +979,8 @@ async function main() {
         chainId: cfg.chainId,
         resolverAddress: cfg.ens.resolverAddress,
         labelAliases: cfg.ens.labelAliases,
+        // Published on the apex: the address that signs the public statements, never its key.
+        attestor: cfg.attestation?.address,
       }
     : undefined;
   if (ens) console.warn(`⚠ ENS gateway ENABLED at /ensgateway (parent ${ens.parentName})`);
@@ -1000,6 +1021,53 @@ async function main() {
       onboardUrl: "https://www.novicorpus.com/",
       transparencyUrl: transparencyLink,
     };
+
+  /**
+   * The SHARED public read budget of the two public legal-body routes, the lookup by address and
+   * the statement by agent: 30 burst, 1 per second sustained, and spent only on a memo MISS. ONE
+   * instance for both, so switching routes buys no second allowance on the RPC.
+   *
+   * Smaller than the AgentBook status budget on purpose: both routes are UNAUTHENTICATED, so
+   * nothing else bounds how often they are asked, and every miss reads the chain over the same
+   * RPC the trust dials and the sweeper share. A judge refreshing a page rides the memo.
+   */
+  const publicReadBudget = new TokenBucket(30, 1);
+
+  /**
+   * The public legal-body STATEMENT's dependencies (`GET /legal-bodies/by-agent/:agentId`, and the
+   * lookup's answer for a Minimal legal body), only where the legal-body feature is on (its store
+   * and its chain exist) AND the attestation key is set. Without the key no statement can be
+   * signed, so there is no statement door at all, and the lookup answers as it does without it.
+   *
+   * The stores and World are the instances the customer company and order doors use, and the
+   * chain is the order doors' own. The statement is signed with the attestation key, which holds
+   * no other role on this box. It links to the transparency page the lookup links to, names the
+   * lookup's network, and builds its own link on the API's public origin, as the lookup's paid
+   * link is built.
+   */
+  const legalBodyStatements: LegalBodyStatementDeps | undefined =
+    legalBodies && legalBodyChain && cfg.attestation
+      ? {
+          repo: legalBodies,
+          statements: new SqliteLegalBodyStatementRepository(db),
+          companies,
+          checks: companyChecks,
+          declarations: companyDeclarations,
+          world: worldId,
+          chain: legalBodyChain,
+          // The order doors' deployment: this chain id and the factory the chain reads.
+          deployment: { chainId: cfg.chainId, factory: legalBodyChain.factory },
+          identityRegistry: cfg.identityRegistry,
+          environment: legalBodyEnvironment(cfg),
+          signer: privateKeyToAccount(cfg.attestation.key),
+          readBudget: publicReadBudget,
+          network: agentBook.network,
+          links: {
+            transparency: transparencyLink,
+            statementBase: `${(cfg.publicApiUrl ?? cfg.metadataBaseUrl).replace(/\/+$/, "")}/legal-bodies/by-agent/`,
+          },
+        }
+      : undefined;
 
   const app = buildApiApp({
     webOrigin: cfg.webOrigin,
@@ -1063,6 +1131,8 @@ async function main() {
     legalBodyOrders,
     // …and the gas seed's door beside them.
     legalBodyGasSeed,
+    // The public statement, where the feature is on and the attestation key is set.
+    legalBodyStatements,
     // The inbound receiver (design §6). Present only with credentials: a box that cannot verify a
     // signature has no business owning the URL.
     doola:
@@ -1117,14 +1187,8 @@ async function main() {
         legalStatus: (proxy) => arc.legalStatus(proxy),
         treasuryPaused: (treasury) => arc.treasuryPaused(treasury),
       },
-      /**
-       * 30 burst, 1 per second sustained, and spent only on a memo MISS.
-       *
-       * Smaller than the AgentBook status budget on purpose: this route is UNAUTHENTICATED, so
-       * nothing else bounds how often it is asked, and every miss is two Arc reads on the same
-       * RPC the trust dials and the sweeper share. A judge refreshing a page rides the memo.
-       */
-      readBudget: new TokenBucket(30, 1),
+      // The shared public read budget (above): the statement by agent spends the same one.
+      readBudget: publicReadBudget,
       links: {
         transparency: transparencyLink,
         // The base the on-chain `metadataURI` is built from (workflow/onboarding.ts), so the link

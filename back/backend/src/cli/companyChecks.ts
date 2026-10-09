@@ -6,6 +6,7 @@ import type { Command } from "commander";
 import { config as loadDotenv } from "dotenv";
 import type { Hex } from "viem";
 import { loadConfig } from "../config/env";
+import { dueDates } from "../legalBody/filings";
 import { CUSTOMER_PROVIDER } from "../legalBody/provider";
 import { opsLog } from "../observability/opsLog";
 import {
@@ -26,6 +27,7 @@ import { openDatabase } from "../persistence/db";
 import { SqliteDocumentIndexRepository } from "../persistence/documentIndexRepository";
 import { type DocumentStore, FileDocumentStore } from "../persistence/documentStore";
 import { SqliteLegalBodyRepository } from "../persistence/legalBodyRepository";
+import { isCalendarDate, wyomingDate } from "../util/wyomingCalendar";
 
 /**
  * THE OPERATOR'S COMMANDS over a customer's declaration: see it, record the check of it (passed or
@@ -86,6 +88,14 @@ const FAILED_ONLY: OptionTable = [
   ["reasonCode", "--reason-code"],
   ["reason", "--reason"],
 ];
+/** The options a passed check MAY take, as [option key, flag]: the last annual report the registry
+ *  shows. A failed check refuses them, as it refuses a passed check's own. */
+const PASSED_OPTIONAL: OptionTable = [
+  ["lastReportPeriod", "--last-report-period"],
+  ["lastReportFiled", "--last-report-filed"],
+];
+/** A report year as the operator types it. */
+const REPORT_YEAR = /^[0-9]{4}$/;
 /** The registry texts a passed check copies from the registry, as [option key, flag]. */
 const REGISTRY_TEXTS: OptionTable = [
   ["registryName", "--registry-name"],
@@ -280,12 +290,16 @@ function recordCheck<F>(p: {
   row: NewCompanyCheck;
   expected: number | null;
   yes: boolean;
+  /** Advice for the operator: the `warning` field of the output, in the dry run and the write
+   *  alike, and never a line of its own. It refuses nothing. */
+  warning?: string;
   /** Refusals that read only the company. What it returns is handed to `stateRules`. */
   companyRules: (company: CompanyRecord) => F;
   /** Refusals that read the latest check too, once it is the one the operator expected. */
   stateRules?: (facts: F, latest: CompanyCheck | undefined) => void;
 }): void {
   const { s, row, expected, yes } = p;
+  const advice = p.warning === undefined ? {} : { warning: p.warning };
   // The shape first, so a dry run refuses whatever the append would.
   validateCompanyCheck(row);
   const found = s.db
@@ -309,6 +323,7 @@ function recordCheck<F>(p: {
       },
       latestCheck: found.latest ?? null,
       wouldRecord: row,
+      ...advice,
       next: "nothing was written: run the same command with --yes to record this",
     });
     return;
@@ -321,7 +336,7 @@ function recordCheck<F>(p: {
     reasonCode: check.reasonCode,
     operator: check.operator,
   });
-  print({ recorded: true, check });
+  print({ recorded: true, check, ...advice });
 }
 
 // ── company:show ─────────────────────────────────────────────────────────────────────────────
@@ -400,7 +415,22 @@ interface CheckOptions {
   controlEvidenceKind?: string;
   reasonCode?: string;
   reason?: string;
+  lastReportPeriod?: string;
+  lastReportFiled?: string;
   yes?: boolean;
+}
+
+/**
+ * The advice a passed check gets when it records no annual report and one has come due by the day
+ * of the check: once its grace period has passed, the company's legal bodies read `unknown`.
+ * Undefined when none has come due, and for a formation date that is not a calendar date, which
+ * the check's own rules refuse.
+ */
+function missingReportWarning(formationDate: string, checkedAt: number): string | undefined {
+  if (!isCalendarDate(formationDate)) return undefined;
+  const { lastDuePassed } = dueDates(formationDate, wyomingDate(checkedAt));
+  if (lastDuePassed === "") return undefined;
+  return `an annual report was due on ${lastDuePassed}: without --last-report-period this company's legal bodies read unknown once the grace period has passed`;
 }
 
 function checkCompany(companyId: string, opts: CheckOptions): void {
@@ -409,7 +439,9 @@ function checkCompany(companyId: string, opts: CheckOptions): void {
   const passed = opts.result === "passed";
   const operator = parseOperator(opts.operator);
   const expected = parseExpectLatest(opts.expectLatest, true);
-  const [own, other] = passed ? [PASSED_ONLY, FAILED_ONLY] : [FAILED_ONLY, PASSED_ONLY];
+  const [own, other] = passed
+    ? [PASSED_ONLY, FAILED_ONLY]
+    : [FAILED_ONLY, [...PASSED_ONLY, ...PASSED_OPTIONAL]];
   for (const [key, flag] of other)
     if (opts[key] !== undefined) refuse(`${flag} is not taken with --result ${opts.result}`);
   const missing = own.filter(([key]) => opts[key] === undefined).map(([, flag]) => flag);
@@ -459,6 +491,10 @@ function checkCompany(companyId: string, opts: CheckOptions): void {
     if (NON_PLAIN_SPACE.test(opts[key] as string))
       refuse(`${flag} holds a space other than a plain space: retype it`);
   const controlSha256 = parseSha256("--control-evidence", opts.controlEvidence as string);
+  if (opts.lastReportFiled !== undefined && opts.lastReportPeriod === undefined)
+    refuse("--last-report-filed is taken only with --last-report-period");
+  if (opts.lastReportPeriod !== undefined && !REPORT_YEAR.test(opts.lastReportPeriod))
+    refuse("--last-report-period must be a year written YYYY");
   const row: NewCompanyCheck = {
     ...base,
     result: "passed",
@@ -472,7 +508,16 @@ function checkCompany(companyId: string, opts: CheckOptions): void {
     controlEvidenceKind: opts.controlEvidenceKind as ControlEvidenceKind,
     reasonCode: null,
     reason: null,
+    // Only when given, so a check without them prints exactly as one did before they existed.
+    ...(opts.lastReportPeriod === undefined
+      ? {}
+      : { lastReportPeriod: Number(opts.lastReportPeriod) }),
+    ...(opts.lastReportFiled === undefined ? {} : { lastReportFiledOn: opts.lastReportFiled }),
   };
+  const warning =
+    opts.lastReportPeriod === undefined
+      ? missingReportWarning(row.formationDate as string, row.checkedAt)
+      : undefined;
   withDatabase((db, docStoreDir) => {
     const s = storesOf(db);
     const docStore = new FileDocumentStore(docStoreDir);
@@ -481,6 +526,7 @@ function checkCompany(companyId: string, opts: CheckOptions): void {
       row,
       expected,
       yes: opts.yes === true,
+      warning,
       companyRules: (company): CompanyDeclaration => {
         assertDeclared(company);
         if (company.status === "abandoned") refuse(`company ${companyId} is abandoned`);
@@ -658,6 +704,14 @@ export function registerCompanyCheckCommands(program: Command): void {
     .option(
       "--control-evidence-kind <ein_letter|articles_and_resolution|other>",
       "passed: what the control upload is",
+    )
+    .option(
+      "--last-report-period <YYYY>",
+      "passed, optional: the year of the last annual report the registry shows as filed",
+    )
+    .option(
+      "--last-report-filed <YYYY-MM-DD>",
+      "passed, optional, only with --last-report-period: the date the registry shows that report filed on",
     )
     .option(
       "--reason-code <code>",

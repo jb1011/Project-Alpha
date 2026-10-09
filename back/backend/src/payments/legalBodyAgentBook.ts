@@ -3,22 +3,25 @@
  *
  * AgentKit's hooks take any object with `lookupHuman(address): Promise<string | null>` and treat a
  * non-null answer as "a verified unique human vouches for this address". Wrap the real AgentBook
- * verifier in this and the same object answers a stricter question: is there a human AND is this
- * address the payment address of a Novi legal body in good standing? Anything less is `null`,
- * because `null` is the only refusal shape AgentKit understands.
+ * verifier in this and the same object answers a stricter question: is there a human AND does a
+ * registered Novi legal body stand behind this address, with its standing stated as active?
+ * Anything less is `null`, because `null` is the only refusal shape AgentKit understands.
  *
  * THIS FILE IS MEANT TO BE COPIED. It imports nothing — not from this backend, not from npm — and
  * uses only the global `fetch` (injectable for tests). Drop it into any seller and it works.
  *
  * WHAT YOU MAY SAY WHEN THIS RETURNS AN ID (the claims ceiling, design 2026-09-10 D7). The lookup
- * reports what the chain says and nothing more, so the honest sentence is:
+ * reports what the chain and Novi's own records say, and nothing more, so the honest sentence, for
+ * either kind of Novi legal body, is:
  *
- *     "a registered legal body in good standing stands behind this address"
+ *     "a registered legal body stands behind this address, and Novi states its standing as active"
  *
  * plus the agent id the lookup returned, if you want to name it. Never "verified company", never
- * "KYC'd", never "licensed", never "audited": the on-chain status carries none of that. A standing
- * of "unknown" is a read that failed — show it as unknown, never as a yes and never as a no. And
- * nothing here says WHO vouched for the agent: the human identifier is anonymous by construction.
+ * "KYC'd", never "licensed", never "audited", never "in good standing": nothing behind the answer
+ * carries any of that. A standing of "unknown" is a read that failed or, for a Minimal legal body,
+ * facts that do not let Novi state it as active: show it as unknown, never as a yes or a no.
+ * And nothing here says WHO vouched for the agent: the human identifier is anonymous by
+ * construction.
  *
  * SPOOFING. This proves a property of an ADDRESS, so only ask it about an address someone has just
  * proved they control — the signer recovered from the AgentKit proof. That is what AgentKit hands
@@ -97,7 +100,8 @@ export function createLegalBodyAgentBook(opts: LegalBodyAgentBookOptions): {
 
   return {
     /**
-     * The human id, but only for an address a legal body in good standing stands behind.
+     * The human id, but only for an address a registered legal body stands behind, with its
+     * standing stated as active.
      * Never throws: every doubt — no human, a failed AgentBook read, a non-200, an unparseable
      * body, a timeout, a network error — is `null`, and AgentKit refuses fail-closed.
      */

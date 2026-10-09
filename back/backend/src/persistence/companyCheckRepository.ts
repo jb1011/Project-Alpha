@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import type { Hex } from "viem";
+import { isCalendarDate, wyomingDate, yearOf } from "../util/wyomingCalendar";
 import { filingKeyOf } from "./companyDeclarationRepository";
 
 /**
@@ -40,9 +41,21 @@ export interface CompanyCheck {
   controlEvidenceKind: ControlEvidenceKind | null;
   reasonCode: CheckReasonCode | null;
   reason: string | null;
+  /**
+   * The year of the last annual report the registry showed as filed, seen at a passed check.
+   * Present only when the check recorded it: a check without it, written before the field existed
+   * or not, has no such key, and reads, compares and prints exactly as it did before.
+   */
+  lastReportPeriod?: number;
+  /** YYYY-MM-DD, the date the registry showed that report filed on. Present only when recorded. */
+  lastReportFiledOn?: string;
 }
 
-export type NewCompanyCheck = Omit<CompanyCheck, "checkId" | "filingKey">;
+/** A check to append. The two report fields may be left out, or null: either records nothing. */
+export type NewCompanyCheck = Omit<
+  CompanyCheck,
+  "checkId" | "filingKey" | "lastReportPeriod" | "lastReportFiledOn"
+> & { lastReportPeriod?: number | null; lastReportFiledOn?: string | null };
 
 export interface CompanyCheckRepository {
   /**
@@ -77,6 +90,8 @@ interface Row {
   control_evidence_kind: ControlEvidenceKind | null;
   reason_code: CheckReasonCode | null;
   reason: string | null;
+  last_report_period: number | null;
+  last_report_filed_on: string | null;
 }
 
 function toCheck(r: Row): CompanyCheck {
@@ -98,6 +113,9 @@ function toCheck(r: Row): CompanyCheck {
     controlEvidenceKind: r.control_evidence_kind,
     reasonCode: r.reason_code,
     reason: r.reason,
+    // A NULL column leaves its key out, so a check without them reads as it did before they existed.
+    ...(r.last_report_period === null ? {} : { lastReportPeriod: r.last_report_period }),
+    ...(r.last_report_filed_on === null ? {} : { lastReportFiledOn: r.last_report_filed_on }),
   };
 }
 
@@ -118,8 +136,10 @@ const REASON_CODES: readonly CheckReasonCode[] = [
 const OPERATOR_NAME = /^[a-z0-9._-]{2,40}$/;
 /** One spelling per hash, so a stored hash compares as text with the same hash from anywhere. */
 const SHA256 = /^0x[0-9a-f]{64}$/;
-const CALENDAR_DATE = /^([0-9]{4})-([0-9]{2})-([0-9]{2})$/;
 const MAX_TEXT_CODE_POINTS = 300;
+/** The report years a check may record, the bounds the column holds too. */
+const MIN_REPORT_PERIOD = 1990;
+const MAX_REPORT_PERIOD = 2200;
 /** Control, format, surrogate, private-use and unassigned characters: line breaks, tabs, NULs,
  *  zero-width and direction-changing characters among them. */
 const OTHER_CHARACTER = /\p{C}/u;
@@ -156,16 +176,7 @@ function optionalHash(field: string, value: unknown): Hex | null {
   return value as Hex;
 }
 
-/** A real date of the Gregorian calendar, written YYYY-MM-DD: no 30 February, no year 0. */
-function isCalendarDate(value: string): boolean {
-  const parts = CALENDAR_DATE.exec(value);
-  if (!parts) return false;
-  const [year, month, day] = [Number(parts[1]), Number(parts[2]), Number(parts[3])];
-  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
-  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
-  return year >= 1 && daysInMonth !== undefined && day >= 1 && day <= daysInMonth;
-}
-
+/** Null, or a real date of the Gregorian calendar written YYYY-MM-DD: no 30 February, no year 0. */
 function optionalDate(field: string, value: unknown): string | null {
   if (value === null) return null;
   if (typeof value !== "string" || !isCalendarDate(value))
@@ -191,7 +202,7 @@ export function validateCompanyCheck(c: NewCompanyCheck): NewCompanyCheck {
   const checkedAt = c.checkedAt;
   if (!Number.isSafeInteger(checkedAt) || checkedAt < 1 || checkedAt > MAX_UNIX_SECONDS)
     refuse("checkedAt", `must be a whole number of unix seconds (1 to ${MAX_UNIX_SECONDS})`);
-  return {
+  const v: NewCompanyCheck = {
     companyId: requiredText("companyId", c.companyId),
     result: oneOf("result", c.result, RESULTS),
     operator,
@@ -211,6 +222,61 @@ export function validateCompanyCheck(c: NewCompanyCheck): NewCompanyCheck {
     reasonCode: c.reasonCode === null ? null : oneOf("reasonCode", c.reasonCode, REASON_CODES),
     reason: optionalText("reason", c.reason),
   };
+  // A company is not checked before it was formed: the day of the check is Wyoming's.
+  if (v.result === "passed" && v.formationDate !== null && v.formationDate > wyomingDate(checkedAt))
+    refuse("formationDate", "is after the date of the check");
+  return {
+    ...v,
+    ...lastReportOf(v, c.lastReportPeriod ?? null, c.lastReportFiledOn ?? null),
+  };
+}
+
+/** Null, or a whole report year from 1990 to 2200. */
+function optionalReportPeriod(value: unknown): number | null {
+  if (value === null) return null;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < MIN_REPORT_PERIOD ||
+    value > MAX_REPORT_PERIOD
+  )
+    refuse(
+      "lastReportPeriod",
+      `must be a whole number from ${MIN_REPORT_PERIOD} to ${MAX_REPORT_PERIOD}`,
+    );
+  return value;
+}
+
+/**
+ * The last annual report a check records: only the fields recorded come back, so a check without
+ * them keeps its shape.
+ *
+ * The report year, and the date the report was filed on, are recorded on a passed check only, and
+ * the date only with the year. The year runs from the first report year, the year after formation,
+ * to the year of the check; the date is neither after the day of the check nor before the
+ * formation date. The day of the check is Wyoming's.
+ */
+function lastReportOf(
+  v: NewCompanyCheck,
+  period: unknown,
+  filedOn: unknown,
+): Pick<NewCompanyCheck, "lastReportPeriod" | "lastReportFiledOn"> {
+  const year = optionalReportPeriod(period);
+  const filed = optionalDate("lastReportFiledOn", filedOn);
+  if (filed !== null && year === null)
+    refuse("lastReportFiledOn", "is recorded only with lastReportPeriod");
+  if (year === null) return {};
+  if (v.result !== "passed") refuse("lastReportPeriod", "is recorded on a passed check only");
+  const checkDay = wyomingDate(v.checkedAt);
+  if (v.formationDate !== null && year < yearOf(v.formationDate) + 1)
+    refuse("lastReportPeriod", "is before the first report year, the year after formation");
+  if (year > yearOf(checkDay)) refuse("lastReportPeriod", "is after the year of the check");
+  if (filed === null) return { lastReportPeriod: year };
+  if (filed > checkDay) refuse("lastReportFiledOn", "is after the date of the check");
+  // Both are calendar dates written YYYY-MM-DD, so they compare as text.
+  if (v.formationDate !== null && filed < v.formationDate)
+    refuse("lastReportFiledOn", "is before the formation date");
+  return { lastReportPeriod: year, lastReportFiledOn: filed };
 }
 
 export class SqliteCompanyCheckRepository implements CompanyCheckRepository {
@@ -223,11 +289,12 @@ export class SqliteCompanyCheckRepository implements CompanyCheckRepository {
            (company_id, result, operator, operator_os_user, checked_at, registry_name,
             registry_filing_id, filing_key, registry_status, formation_date, registered_agent,
             existence_evidence_sha256, control_evidence_sha256, control_evidence_kind,
-            reason_code, reason)
+            reason_code, reason, last_report_period, last_report_filed_on)
          VALUES (@company_id, @result, @operator, @operator_os_user, @checked_at, @registry_name,
                  @registry_filing_id, @filing_key, @registry_status, @formation_date,
                  @registered_agent, @existence_evidence_sha256, @control_evidence_sha256,
-                 @control_evidence_kind, @reason_code, @reason)
+                 @control_evidence_kind, @reason_code, @reason, @last_report_period,
+                 @last_report_filed_on)
          RETURNING *`,
       ),
       latest: db.prepare(
@@ -268,6 +335,8 @@ export class SqliteCompanyCheckRepository implements CompanyCheckRepository {
       control_evidence_kind: v.controlEvidenceKind,
       reason_code: v.reasonCode,
       reason: v.reason,
+      last_report_period: v.lastReportPeriod ?? null,
+      last_report_filed_on: v.lastReportFiledOn ?? null,
     }) as Row;
     return toCheck(row);
   }

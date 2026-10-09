@@ -510,46 +510,99 @@ export function assertGuardianAllowed(
  * (else 403 `guardian_not_verified`: a row recorded under staging, or under no environment, is
  * not a real human's either, whatever the configuration says today). A sandbox deployment skips
  * both environment checks. It applies no cap: the callers do.
+ *
+ * The checks themselves are made by `realHumanState`, below; this turns the first one that failed
+ * into its refusal.
  */
 export function assertRealHuman(
   world: WorldIdDeps | undefined,
   tenantId: string,
   environment: "sandbox" | "production",
 ): GuardianVerification {
-  if (!world)
-    throw new ApiError(
-      "unavailable",
-      503,
-      "human verification is not configured on this deployment",
-    );
+  const state = realHumanState(world, tenantId, environment);
+  if (state.ok) return state.verification;
+  // Each refusal stays written out here, its message one string literal: the doors answer it and
+  // the legal-body tools pass it on as it is, and a test reads this function to hold every refusal
+  // to that form. Hence a switch, and no table of messages elsewhere.
+  switch (state.reason) {
+    case "unavailable":
+      throw new ApiError(
+        "unavailable",
+        503,
+        "human verification is not configured on this deployment",
+      );
+    case "not_production":
+      throw new ApiError(
+        "unavailable",
+        503,
+        "human verification on this deployment is not configured for production",
+      );
+    case "not_verified":
+      throw new ApiError(
+        "guardian_not_verified",
+        403,
+        "the guardian must complete World ID verification first",
+      );
+    case "waiver":
+      throw new ApiError(
+        "waiver_not_accepted",
+        403,
+        "a waiver, or a credential below the accepted tiers, does not count as a verified human here",
+      );
+    case "row_not_production":
+      throw new ApiError(
+        "guardian_not_verified",
+        403,
+        "the guardian's World ID verification was not made under production: verify again",
+      );
+    default: {
+      // A reason outside the type throws instead of returning nothing; a reason added to the type
+      // without its case here stops this line compiling.
+      const unreachable: never = state.reason;
+      throw new Error(`unhandled real-human reason ${String(unreachable)}`);
+    }
+  }
+}
+
+/** What `realHumanState` answers: the verification row of a real human, or the first check that
+ *  failed. A refusal carries its reason and nothing else. */
+export type RealHumanState =
+  | { ok: true; verification: GuardianVerification }
+  | {
+      ok: false;
+      reason: "unavailable" | "not_production" | "not_verified" | "waiver" | "row_not_production";
+    };
+
+/**
+ * The checks of `assertRealHuman`, in the same order, answered instead of thrown: for a reader that
+ * states whether the guardian is a verified human rather than refusing anything, such as a public
+ * statement about a legal body. The reason names the first check that failed:
+ *  - `unavailable`: World ID is not wired;
+ *  - `not_production`: on a production deployment, World's configuration is not production;
+ *  - `not_verified`: the tenant has no verification row for the guardian action;
+ *  - `waiver`: the row's credential is not an accepted one (a waiver, none, or a lower tier);
+ *  - `row_not_production`: on a production deployment, the row was not recorded under production.
+ * A sandbox deployment skips both environment checks. Like `assertRealHuman`, it ignores
+ * `requireGuardian` and applies no cap. It reads the store at most once and writes nothing; a
+ * failed read still throws, since that says nothing about the guardian.
+ */
+export function realHumanState(
+  world: WorldIdDeps | undefined,
+  tenantId: string,
+  environment: "sandbox" | "production",
+): RealHumanState {
+  if (!world) return { ok: false, reason: "unavailable" };
   // Only a sandbox deployment may rest on a World configuration that is not production. Any other
   // value is held to the production rule.
   if (environment !== "sandbox" && world.cfg.environment !== "production")
-    throw new ApiError(
-      "unavailable",
-      503,
-      "human verification on this deployment is not configured for production",
-    );
+    return { ok: false, reason: "not_production" };
   const v = world.store.findByTenant(tenantId, world.cfg.action);
-  if (!v)
-    throw new ApiError(
-      "guardian_not_verified",
-      403,
-      "the guardian must complete World ID verification first",
-    );
+  if (!v) return { ok: false, reason: "not_verified" };
   if (v.credential === null || !ACCEPTED_CREDENTIALS.has(v.credential))
-    throw new ApiError(
-      "waiver_not_accepted",
-      403,
-      "a waiver, or a credential below the accepted tiers, does not count as a verified human here",
-    );
+    return { ok: false, reason: "waiver" };
   // The row's own environment, beside the configuration's: a verification made while World was
   // configured for staging stays a staging verification after the configuration moves on.
   if (environment !== "sandbox" && v.environment !== "production")
-    throw new ApiError(
-      "guardian_not_verified",
-      403,
-      "the guardian's World ID verification was not made under production: verify again",
-    );
-  return v;
+    return { ok: false, reason: "row_not_production" };
+  return { ok: true, verification: v };
 }

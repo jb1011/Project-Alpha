@@ -1143,6 +1143,90 @@ const COMPANY_CHECKS_DDL = `
   END;
 `;
 
+/**
+ * An agentId in the one spelling `legal_bodies` stores it (whose CHECK writes the same rule
+ * inline): TEXT with no hidden bytes, decimal digits only, no leading zero except '0' itself, at
+ * most 78 digits (the width of a uint256).
+ */
+const sqlIsAgentId = (column: string) =>
+  `typeof(${column}) = 'text' AND length(CAST(${column} AS BLOB)) = length(${column})
+      AND length(${column}) BETWEEN 1 AND 78 AND ${column} NOT GLOB '*[^0-9]*'
+      AND (${column} = '0' OR substr(${column}, 1, 1) != '0')`;
+
+/**
+ * THE STATEMENT LOG (see `legalBodyStatementRepository.ts`): one row for each DISTINCT set of
+ * claims signed about a legal body, with the attestor that signed them, append-only. A row keeps
+ * the block and the time of the FIRST statement with its claims, and its evidence (ids, enums and
+ * booleans only, as JSON) says what the claims rested on.
+ *
+ * Its own table, outside `LEGAL_BODIES_DDL`: the legal-body schema step compares, drops and
+ * creates only its two tables, so it never sees this one, and `migrate` creates this one right
+ * after that step, once `legal_bodies` exists. The step drops `legal_bodies` only while both of
+ * its tables are empty, and then this one is empty too: its foreign key holds in place every body
+ * that has a row here. A written migration that rebuilds `legal_bodies` must do so under the
+ * table's own name, as `LEGAL_BODIES_SCHEMA_VERSION` says: SQLite re-points the foreign keys that
+ * name a table it renames, this table's as well as those of `legal_body_events`. The name does not
+ * share the `legal_bod` prefix of the two legal-body tables, so a listing of those tables by that
+ * prefix finds exactly them.
+ *
+ * The four triggers are those of `company_checks`: no UPDATE, no DELETE, no INSERT over an
+ * existing id, and an id written out by hand is at most the next one. The no-replace guard relies
+ * on `CHECK (id > 0)`: for an automatic id SQLite shows a BEFORE INSERT trigger a placeholder
+ * (-1), which must never match a stored row.
+ *
+ * The shapes are those of the legal-body tables: every number column holds an integer (a fraction
+ * or text is refused rather than stored as REAL or TEXT), an address is `0x` and 40 hex digits,
+ * the claims hash `0x` and 64 LOWER-CASE hex digits, the agent id as `sqlIsAgentId` spells it, and
+ * `issued_at` unix SECONDS. The agent's wallet is the zero address when the agent has none. The
+ * wallet index leaves that address out: a lookup by wallet never matches it, and repeats the
+ * index's condition, which SQLite must see in the query before it will use the index.
+ */
+const STATEMENT_LOG_DDL = `
+  CREATE TABLE IF NOT EXISTS statement_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id > 0),
+    legal_body_id     TEXT NOT NULL REFERENCES legal_bodies(legal_body_id),
+    chain_id          INTEGER NOT NULL CHECK (typeof(chain_id) = 'integer' AND chain_id > 0),
+    factory           TEXT NOT NULL CHECK (${sqlIsAddress("factory")}),
+    agent_id          TEXT NOT NULL CHECK (${sqlIsAgentId("agent_id")}),
+    agent_wallet      TEXT NOT NULL CHECK (${sqlIsAddress("agent_wallet")}),
+    attestor          TEXT NOT NULL CHECK (${sqlIsAddress("attestor")}),
+    standing          TEXT NOT NULL CHECK (standing IN ('pending','active','unknown','inactive')),
+    claims_hash       TEXT NOT NULL CHECK (${sqlIsHash("claims_hash")}),
+    observed_at_block INTEGER NOT NULL
+      CHECK (typeof(observed_at_block) = 'integer' AND observed_at_block > 0),
+    issued_at         INTEGER NOT NULL CHECK (${sqlIsSeconds("issued_at")}),
+    evidence          TEXT NOT NULL CHECK (json_valid(evidence)),
+    created_at        TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_statement_log_body ON statement_log(legal_body_id, id);
+  CREATE INDEX IF NOT EXISTS idx_statement_log_wallet
+    ON statement_log(chain_id, factory, lower(agent_wallet))
+    WHERE agent_wallet <> '0x0000000000000000000000000000000000000000';
+
+  CREATE TRIGGER IF NOT EXISTS trg_statement_log_no_update
+  BEFORE UPDATE ON statement_log
+  BEGIN
+    SELECT RAISE(ABORT, 'statement_log is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_statement_log_no_delete
+  BEFORE DELETE ON statement_log
+  BEGIN
+    SELECT RAISE(ABORT, 'statement_log is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_statement_log_no_replace
+  BEFORE INSERT ON statement_log FOR EACH ROW
+  WHEN EXISTS (SELECT 1 FROM statement_log WHERE id = NEW.id)
+  BEGIN
+    SELECT RAISE(ABORT, 'statement_log is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS trg_statement_log_next_id
+  BEFORE INSERT ON statement_log FOR EACH ROW
+  WHEN NEW.id > (SELECT IFNULL(MAX(id), 0) FROM statement_log) + 1
+  BEGIN
+    SELECT RAISE(ABORT, 'statement_log: ids are assigned in order');
+  END;
+`;
+
 /** Create tables if absent. Idempotent. */
 export function migrate(db: Database.Database): void {
   db.exec(`
@@ -1674,6 +1758,27 @@ export function migrate(db: Database.Database): void {
   ] as const)
     if (!docCols.includes(col)) db.exec(`ALTER TABLE documents ADD COLUMN ${col} ${type}`);
 
+  // The last annual report the Wyoming registry showed at the operator's check: its report year,
+  // and the date it was filed on. Each column CHECKs its own shape (SQLite accepts a column CHECK
+  // added to a table that holds rows: every existing row is NULL, which it allows); the rules
+  // across fields are the check repository's. A check written before them stays NULL for good (the
+  // no-update trigger), which reads as "not recorded".
+  const checkCols = (
+    db.prepare("PRAGMA table_info(company_checks)").all() as { name: string }[]
+  ).map((c) => c.name);
+  for (const [col, definition] of [
+    [
+      "last_report_period",
+      "INTEGER CHECK (last_report_period IS NULL OR (typeof(last_report_period) = 'integer' AND last_report_period BETWEEN 1990 AND 2200))",
+    ],
+    [
+      "last_report_filed_on",
+      "TEXT CHECK (last_report_filed_on IS NULL OR (length(last_report_filed_on) = 10 AND last_report_filed_on GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'))",
+    ],
+  ] as const)
+    if (!checkCols.includes(col))
+      db.exec(`ALTER TABLE company_checks ADD COLUMN ${col} ${definition}`);
+
   // formation_parties: PR 1's shape was keyed by entity_key with no tenant column, which cannot
   // express a party that exists BEFORE its entity does (the intake handle, design §5). Rebuild
   // rather than ALTER: PR 1 shipped no writer for this table — the endpoint that produces rows
@@ -1857,10 +1962,13 @@ export function migrate(db: Database.Database): void {
     "CREATE INDEX IF NOT EXISTS idx_payments_ledger_entity ON payments_ledger(entity_key, status)",
   );
 
-  // Legal bodies: their own tables (see LEGAL_BODIES_DDL), created last so the companies table
+  // Legal bodies: their own tables (see LEGAL_BODIES_DDL), created late so the companies table
   // their foreign key points at exists on every database shape. Not a bare exec of the DDL: a
   // database that ran an earlier version of it is brought up to this one, or refused.
   applyLegalBodySchema(db);
+  // The statement log references `legal_bodies`, so it comes once they exist. Outside the
+  // legal-body schema step, which compares and recreates only its own two tables.
+  db.exec(STATEMENT_LOG_DDL);
 }
 
 /** Marker for the one-shot 2026-08-26 re-key (design §2 steps 1-5). */

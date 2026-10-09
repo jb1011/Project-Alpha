@@ -1,8 +1,22 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import { type Address, type Hex, getAddress, isAddress } from "viem";
+import type { Address, Hex } from "viem";
 import { redactPii } from "../formation/pii";
 import { sqliteUtcTimestamp } from "../util/sqliteTime";
+import {
+  LegalBodyInputError,
+  MAX_UNIX_SECONDS,
+  ZERO_ADDRESS,
+  canonicalAgentId,
+  checksummed,
+  isIntegerWithin,
+  lowerHash,
+  requireAddress,
+  requireDeployment,
+  requireHash,
+  requirePublicLimit,
+  requireSeconds,
+} from "./legalBodyInput";
 
 /**
  * LEGAL BODIES: the legal wrapper ordered for an agent identity its customer already owns, one row
@@ -396,6 +410,38 @@ export interface LegalBodyRepository {
   transaction<T>(fn: () => T): T;
 }
 
+/**
+ * The read-only finders behind a public answer about a legal body: the rows an agent's answer can
+ * be about, the agents an address was recorded as owning, the bodies recorded as linked, and a
+ * body's first revocation. They only SELECT, and what they return is the database's record, never
+ * a reading of the chain.
+ *
+ * Kept apart from `LegalBodyRepository` on purpose: test fakes implement that interface, and a
+ * member added to it would break every one of them.
+ *
+ * The rules they share. A deployment that no row may hold throws a `LegalBodyInputError`, as in
+ * every method that takes one, and so does a `limit` that is not a whole number from 1 to 100;
+ * both are checked first, so a bad one throws even when nothing would be found. An agent id that
+ * is not a uint256 in decimal finds nothing, and leading zeros are normalized away, as
+ * `findLinkedByAgent` does ("042" is agent 42). An owner that is not an address finds nothing.
+ */
+export interface LegalBodyPublicFinders {
+  /** Rows of this deployment for the agent in deployed, linked, broken or superseded. Order: the
+   *  `deployed` row first (at most one per agent: the in-flight index), then pointer_seen_at
+   *  descending (NULL last), then rowid descending. The currently linked row always has the
+   *  highest pointer_seen_at (it is rewritten on every move to linked), so a limit of 4 keeps it. */
+  listPublicByAgent(d: Deployment, agentId: string, limit: number): LegalBodyRecord[];
+  /** Distinct agent ids of rows in those four states whose identity_owner equals `owner`, any
+   *  case, newest first. */
+  listAgentIdsByIdentityOwner(d: Deployment, owner: Address, limit: number): string[];
+  /** Rows of this deployment in `linked`, newest pointer_seen_at first. */
+  listLinked(d: Deployment, limit: number): LegalBodyRecord[];
+  /** The id of the body's oldest `revoked` event, or null when it has none (or no such body
+   *  exists). One query on the events' index that stops at the first match: the body's event log
+   *  is never loaded. */
+  firstRevocationEventId(legalBodyId: string): number | null;
+}
+
 interface Row {
   legal_body_id: string;
   public_id: string;
@@ -524,52 +570,13 @@ function parseDetail(raw: string | null): unknown {
   }
 }
 
-/**
- * An address in the one form rows store it: checksummed, so a lookup matches whatever casing the
- * caller holds. Null when the value is not an address at all, which no row can hold.
- */
-function checksummed(value: string): Address | null {
-  return isAddress(value, { strict: false }) ? getAddress(value) : null;
-}
+// `LegalBodyInputError` is defined with the input rules it enforces (`legalBodyInput.ts`, shared
+// with the statement log), and exported from here as well, where its callers have always found it.
+export { LegalBodyInputError };
 
-/**
- * A value handed to the repository that no row may hold: a hash that is not one, a time in the
- * wrong unit, a chain id of zero. It is a bug in the caller, never the outcome of a race, so it is
- * thrown, before anything is written, rather than answered.
- */
-export class LegalBodyInputError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "LegalBodyInputError";
-  }
-}
-
-/** The address in the form rows store it, or a `LegalBodyInputError` naming the field. */
-function requireAddress(field: string, value: unknown): Address {
-  const address = typeof value === "string" ? checksummed(value) : null;
-  if (address === null) throw new LegalBodyInputError(`${field} must be a 0x address`);
-  return address;
-}
-
-const HASH_32 = /^0x[0-9a-fA-F]{64}$/;
 const HEX_BYTES = /^0x(?:[0-9a-fA-F]{2})+$/;
 /** A link signature: whole bytes of hex, or none at all (`0x`) for an owner that signs nothing. */
 const SIGNATURE_BYTES = /^0x(?:[0-9a-fA-F]{2})*$/;
-
-/**
- * A 32-byte hash in the one spelling rows store it: lower-case, so a stored hash compares as text
- * with the same hash read from anywhere else. Null when the value is not a 32-byte hash at all.
- */
-function lowerHash(value: unknown): Hex | null {
-  return typeof value === "string" && HASH_32.test(value) ? (value.toLowerCase() as Hex) : null;
-}
-
-function requireHash(field: string, value: unknown): Hex {
-  const hash = lowerHash(value);
-  if (hash === null)
-    throw new LegalBodyInputError(`${field} must be 0x and 64 hex digits (a 32-byte hash)`);
-  return hash;
-}
 
 /** One or more whole bytes of hex, lower-cased. */
 function requireBytes(field: string, value: unknown): Hex {
@@ -577,9 +584,6 @@ function requireBytes(field: string, value: unknown): Hex {
     throw new LegalBodyInputError(`${field} must be 0x and one or more whole bytes of hex`);
   return value.toLowerCase() as Hex;
 }
-
-/** The largest time the seconds columns hold. A time in milliseconds is past it for centuries. */
-const MAX_UNIX_SECONDS = 99_999_999_999;
 
 /**
  * The smallest time a schedule takes, in unix MILLISECONDS: one past the largest time in seconds,
@@ -600,20 +604,6 @@ const DRAFT_LIFETIME_MS = 24 * 60 * 60 * 1000;
 /** A deployed body counts as an open order for this long after its block, and no longer. */
 const DEPLOYED_OPEN_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** A time in unix SECONDS, the unit of a block timestamp. */
-function requireSeconds(field: string, value: unknown): number {
-  if (!isIntegerWithin(value, 1, MAX_UNIX_SECONDS))
-    throw new LegalBodyInputError(
-      `${field} must be a whole number of unix seconds (1 to ${MAX_UNIX_SECONDS}), got ${String(value)}`,
-    );
-  return value;
-}
-
-/** A JS number that is an exact integer in [min, max]: not a string, a bigint, NaN or a fraction. */
-function isIntegerWithin(value: unknown, min: number, max: number): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
-}
-
 /** A time in unix MILLISECONDS read by a listing or a counter: zero or more, within a `Date`. */
 function requireMillis(field: string, value: unknown): number {
   if (!isIntegerWithin(value, 0, MAX_DATE_MS))
@@ -630,16 +620,6 @@ function requireLimit(value: unknown): number {
       `limit must be a whole number, one or more, got ${String(value)}`,
     );
   return value;
-}
-
-/** The deployment as rows store it: the factory checksummed, so a lookup matches any casing. */
-function requireDeployment(d: unknown): { chain_id: number; factory: Address } {
-  const { chainId, factory } = (d ?? {}) as { chainId?: unknown; factory?: unknown };
-  if (!isIntegerWithin(chainId, 1, Number.MAX_SAFE_INTEGER))
-    throw new LegalBodyInputError(
-      `a deployment's chainId must be a positive whole number, got ${String(chainId)}`,
-    );
-  return { chain_id: chainId, factory: requireAddress("a deployment's factory", factory) };
 }
 
 /** The `created_at` text a draft created at `nowMs` minus its lifetime carries: at or after it,
@@ -659,23 +639,6 @@ export function isDraftExpired(
   nowMs: number,
 ): boolean {
   return row.bindingState === "draft" && row.createdAt < draftCutoff(requireMillis("nowMs", nowMs));
-}
-
-const UINT256_MAX = 2n ** 256n - 1n;
-
-const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
-
-/**
- * An agentId in the one spelling rows store it: a uint256 in decimal without leading zeros.
- *
- * The two agentId indexes compare `agent_id` as TEXT, so "042" and "42" would be two agents to
- * them, and the same identity could hold two orders on their way, or two linked bodies. Null when
- * the value is not a uint256 in decimal at all.
- */
-function canonicalAgentId(value: string): string | null {
-  if (!/^[0-9]+$/.test(value)) return null;
-  const n = BigInt(value);
-  return n <= UINT256_MAX ? n.toString() : null;
 }
 
 /**
@@ -699,6 +662,22 @@ const CHECKED_STATES_SQL = "binding_state NOT IN ('draft','abandoned','lapsed')"
 /** The states a binding check reads the chain for: a body exists, so a pointer can name it. */
 const BINDING_CHECK_STATES_SQL = "binding_state IN ('deployed','linked','broken','superseded')";
 
+/**
+ * The states of a row a public answer can be about: the body's creation is recorded (the table's
+ * CHECKs require `deployed_at` in these four and refuse it in every other). The same four a binding
+ * check reads, named apart: the two lists answer different questions and need not change together.
+ * The one list: the public finders select by it, and the statement service checks a row by it.
+ */
+export const PUBLIC_ROW_STATES: readonly BindingState[] = [
+  "deployed",
+  "linked",
+  "broken",
+  "superseded",
+];
+
+/** The public-state predicate, spelled from that list. */
+const PUBLIC_STATES_SQL = `binding_state IN (${PUBLIC_ROW_STATES.map((s) => `'${s}'`).join(",")})`;
+
 /** The states `markLinked` moves a body out of. */
 const LINKABLE_STATES: readonly BindingState[] = ["deployed", "broken", "superseded"];
 
@@ -713,7 +692,7 @@ const LINKABLE_STATES: readonly BindingState[] = ["deployed", "broken", "superse
 const LIVE_AGENT_CONFLICT = "legal_bodies.chain_id, legal_bodies.factory, legal_bodies.agent_id";
 const BODY_ADDRESS_CONFLICT = "index 'idx_legal_bodies_body'";
 
-export class SqliteLegalBodyRepository implements LegalBodyRepository {
+export class SqliteLegalBodyRepository implements LegalBodyRepository, LegalBodyPublicFinders {
   private readonly stmts;
 
   constructor(private readonly db: Database.Database) {
@@ -757,6 +736,49 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
       listByCompany: db.prepare(
         "SELECT * FROM legal_bodies WHERE company_id = ? ORDER BY created_at DESC, rowid DESC",
       ),
+      // The public finders (`LegalBodyPublicFinders`). No index serves this first one: the two
+      // agentId indexes are partial, one over the order on its way and one over the linked body,
+      // and a broken or superseded row is in neither. So it scans the table, as the next one does.
+      listPublicByAgent: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE chain_id = @chain_id AND factory = @factory
+            AND agent_id = @agent_id AND ${PUBLIC_STATES_SQL}
+          ORDER BY binding_state = 'deployed' DESC, pointer_seen_at IS NULL,
+                   pointer_seen_at DESC, rowid DESC
+          LIMIT @limit`,
+      ),
+      // There is no index on identity_owner: adding one changes the legal-body schema, which takes
+      // a written migration. Each side is compared lower-case, since the column's CHECK takes an
+      // address in any casing. An agent's place is that of its newest row among those the WHERE
+      // keeps, by rowid: rows are never deleted, so rowid is the order they were created in.
+      listAgentIdsByIdentityOwner: db
+        .prepare(
+          `SELECT agent_id FROM legal_bodies
+            WHERE chain_id = @chain_id AND factory = @factory
+              AND lower(identity_owner) = lower(@owner) AND ${PUBLIC_STATES_SQL}
+            GROUP BY agent_id
+            ORDER BY MAX(rowid) DESC
+            LIMIT @limit`,
+        )
+        .pluck(),
+      // The state term repeats the WHERE of the linked index, which SQLite must see in the query
+      // before it will use that index.
+      listLinked: db.prepare(
+        `SELECT * FROM legal_bodies
+          WHERE chain_id = @chain_id AND factory = @factory AND binding_state = 'linked'
+          ORDER BY pointer_seen_at DESC, rowid DESC
+          LIMIT @limit`,
+      ),
+      // Walks the body's events in id order through the (legal_body_id, id) index and stops at the
+      // first revocation.
+      firstRevocationEventId: db
+        .prepare(
+          `SELECT id FROM legal_body_events
+            WHERE legal_body_id = ? AND kind = 'revoked'
+            ORDER BY id
+            LIMIT 1`,
+        )
+        .pluck(),
       // Each move below sets EVERY column its target state requires in the same statement: the
       // table's CHECKs are evaluated on the row an UPDATE produces, so a move split across two
       // statements would be refused halfway.
@@ -994,6 +1016,38 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository {
 
   listByCompany(companyId: string): LegalBodyRecord[] {
     return (this.stmts.listByCompany.all(companyId) as Row[]).map(toRecord);
+  }
+
+  listPublicByAgent(d: Deployment, agentId: string, limit: number): LegalBodyRecord[] {
+    const deployment = requireDeployment(d);
+    const n = requirePublicLimit(limit);
+    const agent = agentKey(agentId);
+    if (agent === null) return [];
+    return (
+      this.stmts.listPublicByAgent.all({ ...deployment, agent_id: agent, limit: n }) as Row[]
+    ).map(toRecord);
+  }
+
+  listAgentIdsByIdentityOwner(d: Deployment, owner: Address, limit: number): string[] {
+    const deployment = requireDeployment(d);
+    const n = requirePublicLimit(limit);
+    const address = typeof owner === "string" ? checksummed(owner) : null;
+    if (address === null) return [];
+    return this.stmts.listAgentIdsByIdentityOwner.all({
+      ...deployment,
+      owner: address,
+      limit: n,
+    }) as string[];
+  }
+
+  listLinked(d: Deployment, limit: number): LegalBodyRecord[] {
+    const deployment = requireDeployment(d);
+    const n = requirePublicLimit(limit);
+    return (this.stmts.listLinked.all({ ...deployment, limit: n }) as Row[]).map(toRecord);
+  }
+
+  firstRevocationEventId(legalBodyId: string): number | null {
+    return (this.stmts.firstRevocationEventId.get(legalBodyId) as number | undefined) ?? null;
   }
 
   freezeAgreement(legalBodyId: string, a: { hash: Hex; version: number }): boolean {
