@@ -4,7 +4,7 @@ import { createLegalBodyResolver } from "../../src/payments/legalBody";
 import type { Address, EntityRecord } from "../../src/types";
 
 /**
- * The ONE definition of "a Novi legal body in good standing" (design 2026-09-10 D1/D2/D8).
+ * The ONE definition of "a Novi legal body whose standing is active".
  *
  * Every test here counts the calls it depends on: a resolver that silently stopped reading the
  * chain, or stopped asking the repository, would still return plausible answers — which is the

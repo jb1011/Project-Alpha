@@ -90,7 +90,7 @@ paused. The four refusal bodies, verbatim (`payments/seller.ts`):
   `{"error":"human_backing_required","detail":"this seller trades only with agents a verified unique human answers for","reason":"no-proof-presented","how":{"register":"npx @worldcoin/agentkit-cli register <your-agent-address>","agentBook":"<configured AgentBook address>","chain":"world-chain"},"extensions":{…}}`
 - **429** the per-human budget, unchanged: `{"error":"rate-capped","detail":"per-human request budget exhausted for this window"}`, with `X-AGENTKIT-HUMAN` set.
 - **403** human-backed, no legal body:
-  `{"error":"legal_body_required","detail":"this seller trades only with agents that a registered legal body in good standing stands behind","reason":"not-legal-body","how":{"lookup":"https://api.novicorpus.com/legal-bodies/<checked address>","onboard":"https://www.novicorpus.com/","transparency":"https://www.novicorpus.com/transparency"},"extensions":{…}}`
+  `{"error":"legal_body_required","detail":"this seller trades only with agents that a registered legal body stands behind, one whose standing Novi states as active","reason":"not-legal-body","how":{"lookup":"https://api.novicorpus.com/legal-bodies/<checked address>","onboard":"https://www.novicorpus.com/","transparency":"https://www.novicorpus.com/transparency"},"extensions":{…}}`
   — `reason` is `legal-body-inactive` for a suspended body; everything else is identical, and
   `how.lookup` is `<PUBLIC_API_URL or METADATA_BASE_URL>/legal-bodies/<the proof's signer>`.
 - **503** the check could not be MADE (fail closed, nothing remembered):
@@ -147,7 +147,7 @@ interface at HEAD is live.
 
 **What a failed leg 3 looks like.** A second 403 (proof in hand, no body behind the payer) is terminal and `pay`
 quotes the seller:
-`{"ok":false,"txOrTransferId":null,"reason":"resource-403-after-proof: legal_body_required (not-legal-body): this seller trades only with agents that a registered legal body in good standing stands behind"}`.
+`{"ok":false,"txOrTransferId":null,"reason":"resource-403-after-proof: legal_body_required (not-legal-body): this seller trades only with agents that a registered legal body stands behind, one whose standing Novi states as active"}`.
 Nothing was signed, so the claim is released and the key retries once the agent has a body. A bare `resource-403`
 means no usable challenge (or no World layer: no signer, no recovery); `challenge-origin-mismatch`, a challenge naming
 another site; `resource-503`, that the check could not be made — retry, it costs no allowance.

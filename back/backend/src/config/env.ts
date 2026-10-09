@@ -206,7 +206,7 @@ const EnvSchema = z.object({
   /** Seller trust policy. "open" = today's behavior (AgentKit authorizes within the allowance,
    *  everyone else pays). "accountable-only" = agents no verified human answers for are refused
    *  outright (403); human-backed agents still pay. "legal-bodies-only" = accountable-only PLUS a
-   *  registered Novi legal body in good standing behind the payer address (design 2026-09-10 D4);
+   *  registered Novi legal body behind the payer address, one whose standing Novi states as active;
    *  it needs a legal-body resolver wired, and refuses 503 rather than serving without one. */
   X402_TRUST_POLICY: z.enum(["open", "accountable-only", "legal-bodies-only"]).default("open"),
   /** Buyer-side trust dial: "verified-sellers-only" refuses to pay any address AgentBook does not

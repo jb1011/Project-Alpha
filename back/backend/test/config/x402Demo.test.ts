@@ -41,8 +41,8 @@ test("X402_TRUST_POLICY accepts the three policies, and nothing else", () => {
   expect(loadConfig({ ...baseEnv, X402_TRUST_POLICY: "accountable-only" }).x402TrustPolicy).toBe(
     "accountable-only",
   );
-  // The legal-body tier (design 2026-09-10 D4): accountable-only PLUS a registered Novi legal
-  // body in good standing behind the payer address.
+  // The legal-body tier: accountable-only PLUS a registered Novi legal body behind the payer
+  // address, one whose standing Novi states as active.
   expect(loadConfig({ ...baseEnv, X402_TRUST_POLICY: "legal-bodies-only" }).x402TrustPolicy).toBe(
     "legal-bodies-only",
   );

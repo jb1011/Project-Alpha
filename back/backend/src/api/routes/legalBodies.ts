@@ -16,8 +16,8 @@ import type { ApiDeps } from "../app";
 import { TokenBucket } from "./agentBook";
 
 /**
- * GET /legal-bodies/:address — "is this address the payment address of a Novi legal body in good
- * standing?" (design 2026-09-10 D3).
+ * GET /legal-bodies/:address — "is this address the payment address of a Novi legal body whose
+ * standing Novi states as active?".
  *
  * PUBLIC and unauthenticated by design: the caller is a seller on someone else's stack who has
  * never heard of us and holds nothing but the address that is about to pay it. AgentBook answers
@@ -31,8 +31,9 @@ import { TokenBucket } from "./agentBook";
  *
  * What a full-product answer DOES NOT carry, and must never (D7): who the guardian is, whether a
  * human vouched, anything from AgentBook, the EIN, the filing number, the tenant. The legal-body
- * question only — and in the vocabulary the chain actually carries: "a registered legal body in
- * good standing", never "verified company", "KYC'd" or "licensed".
+ * question only — and in the vocabulary the chain actually carries: "a registered legal body
+ * stands behind this address, and Novi states its standing as active", never "verified company",
+ * "KYC'd" or "licensed".
  *
  * A Minimal legal body's answer carries the signed statement instead, under the statement's own
  * rules (`legalBody/publicStatement.ts`): its `filingNumber` and `legalName` only by the names rule

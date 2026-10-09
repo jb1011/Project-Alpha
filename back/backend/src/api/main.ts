@@ -251,8 +251,8 @@ async function main() {
       `⚠ NoviController mode: manager identity = ${platformManagerAddress}, executor (signing key) = ${executor.address}, factory = ${factoryAddress}`,
     );
 
-  // The ONE resolver for "is this address a Novi legal body in good standing?" (design
-  // 2026-09-10 D1): built once, here, from the repository and the SAME two Arc reads the buyer
+  // The ONE resolver for the question "is this address a Novi legal body whose standing is
+  // active?": built once, here, from the repository and the SAME two Arc reads the buyer
   // dial has always used, and shared by every surface that asks the question — the buyer dial
   // below today, the public lookup and the `legal-bodies-only` seller policy next. It holds no
   // state and caches nothing (D8), so sharing it costs nothing and guarantees that a suspension
@@ -919,7 +919,7 @@ async function main() {
       console.warn("⚠ x402 seller policy: ACCOUNTABLE-ONLY — anonymous agents are refused (403)");
     if (x402Demo.trustPolicy === "legal-bodies-only")
       console.warn(
-        "⚠ x402 seller policy: LEGAL-BODIES-ONLY — only agents a registered legal body in good standing stands behind are served (403 otherwise)",
+        "⚠ x402 seller policy: LEGAL-BODIES-ONLY — only agents that a registered legal body stands behind, one whose standing Novi states as active, are served (403 otherwise)",
       );
   } else if (cfg.enableX402Demo) {
     // The flag is on and the deps came back empty, which can only be the missing payout address.

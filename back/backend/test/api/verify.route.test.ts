@@ -225,13 +225,13 @@ test("a known entity with no payment header is quoted in the PAYMENT-REQUIRED he
   expect(onlySupported()).toEqual([]);
 });
 
-test("the quote's description never claims more than a registered legal body in good standing", async () => {
+test("the quote's description never claims more than a registered legal body whose standing Novi states as active", async () => {
   const { app } = setup();
   const res = await get(app, PUBLIC_ID);
   const required = decodePaymentRequiredHeader(res.headers.get("PAYMENT-REQUIRED") ?? "");
   const description = (required as { resource?: { description?: string } }).resource?.description;
   expect(description).toBe(
-    "Novi Corpus legal-standing check: is this a registered legal body in good standing?",
+    "Novi Corpus legal-standing check: is this a registered legal body whose standing Novi states as active?",
   );
   for (const forbidden of ["verified company", "KYC", "licensed"])
     expect(description).not.toContain(forbidden);

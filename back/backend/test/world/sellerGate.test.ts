@@ -672,7 +672,7 @@ describe("legal-bodies-only trust policy", () => {
     };
     expect(body.error).toBe("legal_body_required");
     expect(body.detail).toBe(
-      "this seller trades only with agents that a registered legal body in good standing stands behind",
+      "this seller trades only with agents that a registered legal body stands behind, one whose standing Novi states as active",
     );
     expect(body.reason).toBe("not-legal-body");
     // The address CHECKED is the proof's signer — and it is the address the refusal tells the

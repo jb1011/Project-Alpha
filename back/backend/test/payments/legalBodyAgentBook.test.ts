@@ -95,7 +95,7 @@ describe("createLegalBodyAgentBook", () => {
     expect(fetchImpl.calls().length).toBe(0);
   });
 
-  test("200 with a legal body in good standing -> the human id", async () => {
+  test("200 with an active legal body -> the human id", async () => {
     const fetchImpl = fakeFetch(async () => res(200, { ...activeBody, standing: "active" }));
     const { subject } = checker({ fetchImpl });
     await expect(subject.lookupHuman(ADDRESS)).resolves.toBe(HUMAN);
