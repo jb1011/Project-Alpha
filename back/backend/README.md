@@ -179,7 +179,8 @@ refuses to boot rather than start half-configured.
 
 ### How `/verify` is paid
 
-`GET /verify/:publicId` is public and unauthenticated, but paid. A request without a payment
+`GET /verify/:publicId` is public and unauthenticated, but paid. The route answers GET only: any
+other method is refused with 405 and `Allow: GET`. A request without a payment
 header gets a 402 with the price and payment requirements in the `PAYMENT-REQUIRED` header. Your
 client signs a payment with its own Hedera key and resubmits; the facilitator verifies and settles
 the USDC transfer on Hedera testnet and pays the network fee, so the float account needs no HBAR.
