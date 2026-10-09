@@ -96,6 +96,9 @@ export function hederaApp(o: {
   ens?: unknown;
   now?: () => number;
   formationSummary?: (companyId: string) => FormationSummary | null;
+  /** The API's own public origin (PUBLIC_API_URL). Left undefined by default, as on a deployment
+   *  that names none. */
+  publicApiUrl?: string;
 }) {
   return buildApiApp({
     webOrigin: WEB,
@@ -117,6 +120,7 @@ export function hederaApp(o: {
     },
     worldId: o.worldId,
     ens: o.ens,
+    publicApiUrl: o.publicApiUrl,
   } as never);
 }
 

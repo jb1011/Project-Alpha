@@ -1164,6 +1164,10 @@ async function main() {
     maxInflightJobsPerTenant: cfg.maxInflightJobsPerTenant,
     agentRuns,
     mcpPublicUrl: cfg.mcpPublicUrl,
+    // The API's own public origin, only as the deployment names it: the paid check's quote names
+    // its address on it. No fallback to METADATA_BASE_URL, which in production is a proxy that
+    // drops the x402 headers and CORS; unset, the quote keeps the request's own URL, as before.
+    publicApiUrl: cfg.publicApiUrl,
     linkCodes: new SqliteLinkCodeStore(db),
     payments,
     pocketFunding,

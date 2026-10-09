@@ -178,7 +178,8 @@ sudo systemctl restart legalbody-api
 
 It is optional — unset, every public link falls back to `METADATA_BASE_URL` (the www proxy) and nothing fails to boot
 — but without it `how.lookup` and the advertised wall point at the hop that strips CORS, `Cache-Control` and
-`X-NOVI-LEGAL-BODY`. The wall mints its challenges for whatever base it advertises. `X402_TRUST_POLICY` stays `open`
+`X-NOVI-LEGAL-BODY`, and the paid `/verify` quote names the request's own `http://` address. The wall mints its
+challenges for whatever base it advertises. `X402_TRUST_POLICY` stays `open`
 (the demo wall pins its own), and **redeploy the interface too** (Vercel): only that lets `X-NOVI-LEGAL-BODY` survive
 the `www/backend` hop. Then run the acceptance legs.
 
