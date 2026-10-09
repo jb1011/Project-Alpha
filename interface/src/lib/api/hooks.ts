@@ -234,8 +234,8 @@ export function useEntityJobsQuery(entityId: string, refetchInterval = 5000) {
 }
 
 /**
- * "Is this address a Novi legal body in good standing?" — the PUBLIC lookup (design 2026-09-10
- * D3), asked about the agent's own payment address.
+ * "Is this address a Novi legal body whose standing Novi states as active?" — the PUBLIC lookup,
+ * asked about the agent's own payment address.
  *
  * No token, and no poll. Standing changes only when a guardian pauses the treasury or the legal
  * status moves on chain — both of which this dashboard either performs itself (and invalidates

@@ -161,7 +161,7 @@ const humanRefusal = (extensions: unknown) => ({
 const legalBodyRefusal = (extensions: unknown) => ({
   error: "legal_body_required",
   detail:
-    "this seller trades only with agents that a registered legal body in good standing stands behind",
+    "this seller trades only with agents that a registered legal body stands behind, one whose standing Novi states as active",
   reason: "not-legal-body",
   how: {
     lookup: "https://api.novicorpus.com/legal-bodies/0x0000000000000000000000000000000000000001",
@@ -356,7 +356,9 @@ test("a legal-bodies-only wall's refusal surfaces its error and remediation in t
   expect((err as Error).message).toContain("resource-403-after-proof");
   expect((err as Error).message).toContain("legal_body_required");
   expect((err as Error).message).toContain("not-legal-body");
-  expect((err as Error).message).toContain("registered legal body in good standing");
+  expect((err as Error).message).toContain(
+    "registered legal body stands behind, one whose standing Novi states as active",
+  );
   expect(fetchImpl).toHaveBeenCalledTimes(2);
   expect(authorize).not.toHaveBeenCalled();
 });

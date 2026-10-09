@@ -10,7 +10,7 @@ import type { Address, EntityRecord, Hex } from "../types";
  * The attestation body `GET /verify/:publicId` serves once a payment has settled (design D9).
  *
  * ONE rule about every string in here: the claims ceiling. This document answers "is this a
- * registered legal body in good standing?" and nothing beyond it — never "verified company",
+ * registered legal body whose standing is active?" and nothing more — never "verified company",
  * never "KYC'd", never "licensed". Which is also why `standing` is the SAME `readStanding` every
  * other surface resolves through (D1): a body suspended on Arc cannot read as active on a
  * document someone paid for.

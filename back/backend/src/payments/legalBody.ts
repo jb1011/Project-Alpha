@@ -1,7 +1,7 @@
 import type { Address, EntityRecord, EntityStatus } from "../types";
 
 /**
- * "Is this address the payment address of a Novi legal body in good standing?"
+ * "Is this address the payment address of a Novi legal body whose standing is active?"
  *
  * ONE definition of standing for every surface (design 2026-09-10 D1): the buyer-side dial
  * (`payments/sellerTrust.ts`), the public lookup and the `legal-bodies-only` seller policy all

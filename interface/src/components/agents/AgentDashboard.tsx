@@ -50,7 +50,7 @@ const CHIP_SHAPE =
  * It MAY be positive where the AgentBook chip may not, and the difference is what each one is a
  * statement about. AgentBook's is a claim about a person, so it stays neutral whatever the answer
  * (D9). This one is two on-chain reads — a LegalManager status and a treasury pause flag — and
- * "in good standing" is exactly what they say, so `active` wears the same accent the rest of the
+ * an active standing is exactly what they say, so `active` wears the same accent the rest of the
  * card uses for a live on-chain fact. `inactive` takes the amber the paused pill takes, because
  * it is usually the same pause seen from the other side, and `unknown` takes AgentBook's neutral:
  * a read that failed looks like the other things we could not check.
@@ -329,8 +329,8 @@ export function AgentDashboard({
                 </span>
               ))}
             {/* The second question, beside the first and never folded into it: AgentBook says
-                whether a human vouched, this says whether Novi's registry holds a legal body in
-                good standing. Two sources, two chips (design 2026-09-10 §1). */}
+                whether a human vouched, this says whether Novi's registry holds a legal body
+                whose standing is active. Two sources, two chips (design 2026-09-10 §1). */}
             {legalBodyChip && <LegalBodyChip state={legalBodyChip} />}
             {ensName(entity) && (
               <a

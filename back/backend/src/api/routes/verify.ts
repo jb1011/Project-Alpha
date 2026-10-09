@@ -40,9 +40,10 @@ import { createClientLimiter, sharedReadBudget } from "./legalBodies";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The description travels ON THE WIRE, in the 402's `PAYMENT-REQUIRED` header, so it is a served
- *  string and the claims ceiling (D9) binds it: good standing, never "verified", never "KYC'd". */
+ *  string and the claims ceiling binds it: a registered legal body whose standing Novi states as
+ *  active, never "verified", never "KYC'd". */
 const DESCRIPTION =
-  "Novi Corpus legal-standing check: is this a registered legal body in good standing?";
+  "Novi Corpus legal-standing check: is this a registered legal body whose standing Novi states as active?";
 
 /** The entity the 404 guard already resolved, handed to the handler so the paid path never reads
  *  the database twice — and never disagrees with the row the price was quoted against. */

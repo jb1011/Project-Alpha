@@ -11,8 +11,9 @@ import { readStanding } from "./legalBody";
  *   - `verified-sellers-only`      — World's AgentBook: "a verified unique human vouches for
  *                                    this address". Cached (1 h positive / 1 min negative).
  *   - `verified-legal-bodies-only` — the Novi registry + Arc on-chain status: "this address is
- *                                    the treasury of a registered legal body in good standing".
- *                                    NEVER cached: a suspension must take effect immediately.
+ *                                    the treasury of a registered legal body whose standing
+ *                                    is active". NEVER cached: a suspension must take effect
+ *                                    immediately.
  * `open` skips the check entirely. The EFFECTIVE policy is resolved per entity by the caller
  * (`entity.trustPolicy ?? globalPolicy`) — the guardian's per-agent dial beats the platform
  * default in both directions.
@@ -51,8 +52,8 @@ export interface LegalBodyLookup {
   treasuryPaused(treasury: Address): Promise<boolean>;
 }
 
-/** standing -> this dial's vocabulary. The mapping is the whole refactor (design 2026-09-10 D1):
- *  "in good standing" is defined once, in payments/legalBody.ts, and named differently here. */
+/** standing -> this dial's vocabulary. The mapping is the whole refactor: standing is defined
+ *  once, in payments/legalBody.ts, and named differently here. */
 const STANDING_OUTCOME: Record<LegalBodyStanding, SellerTrustOutcome> = {
   active: "verified",
   inactive: "legal-body-inactive",

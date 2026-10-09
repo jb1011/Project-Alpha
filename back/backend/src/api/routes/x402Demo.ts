@@ -342,7 +342,7 @@ export function mountX402DemoRoutes(
         resource: wallResourceUrl,
         runUrl,
         statement:
-          "this seller trades only with agents that a registered legal body in good standing stands behind",
+          "this seller trades only with agents that a registered legal body stands behind, one whose standing Novi states as active",
         legs,
         expected: {
           anonymous: {

@@ -118,8 +118,9 @@ export interface PaywallConfig extends SellerConfig {
   /** Whom this seller trades with. "open" (default) = today's behavior. "accountable-only" =
    *  agents no verified human answers for are REFUSED (403) — their payment is not wanted;
    *  human-backed agents proceed to the normal payment path. "legal-bodies-only" = the same, plus
-   *  a registered Novi legal body in good standing behind the payer address. Both strict policies
-   *  require `agentkit`; "legal-bodies-only" additionally requires `legalBody`. */
+   *  a registered Novi legal body behind the payer address, one whose standing Novi states as
+   *  active. Both strict policies require `agentkit`; "legal-bodies-only" additionally requires
+   *  `legalBody`. */
   trustPolicy?: SellerTrustPolicy;
   /** Required by `legal-bodies-only`, ignored by every other policy. ABSENT under that policy is
    *  a misconfiguration, not a permission: every request is refused 503 (D8 — fail closed), so a
@@ -189,15 +190,16 @@ export function buildPaywall(cfg: PaywallConfig) {
    *  agent can go and get. `how.lookup` names the address we actually checked (the proof's
    *  signer), so following the link asks the very question this refusal answered.
    *
-   *  The vocabulary is fixed (D7): "a registered legal body in good standing", never "verified
-   *  company", "KYC'd" or "licensed" — the chain carries a status, not a guarantee. */
+   *  The vocabulary is fixed: "a registered legal body stands behind this address, and Novi
+   *  states its standing as active", never "verified company", "KYC'd" or "licensed" — the chain
+   *  carries a status, not a guarantee. */
   const legalRefusal = async (reason: string, agentAddress: string) => {
     // Safe: every caller is inside `legalGate` past the cfg.legalBody guard.
     const lb = cfg.legalBody as SellerLegalBodyConfig;
     return {
       error: "legal_body_required",
       detail:
-        "this seller trades only with agents that a registered legal body in good standing stands behind",
+        "this seller trades only with agents that a registered legal body stands behind, one whose standing Novi states as active",
       reason,
       how: {
         lookup: `${lb.lookupBaseUrl.replace(/\/+$/, "")}/legal-bodies/${agentAddress}`,
@@ -379,7 +381,7 @@ export function buildPaywall(cfg: PaywallConfig) {
           charge();
           return c.json(await legalRefusal("legal-body-inactive", outcome.agentAddress), 403);
         }
-        // Standing is good, so this request will be quoted or served. A paying one keeps its
+        // Standing is active, so this request will be quoted or served. A paying one keeps its
         // charge deferred (it is spent below unless the payment actually settles) and reports
         // where the human stands; every other one spends its unit here.
         if (paying) c.header("X-AGENTKIT-AUTHORIZATION", `${outcome.used}/${outcome.limit}`);
