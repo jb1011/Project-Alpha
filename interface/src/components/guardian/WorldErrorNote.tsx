@@ -35,7 +35,7 @@ export function WorldErrorNote({ error }: { error: string }) {
     return (
       <Callout tone="warn" title="Your credential can't prove that">
         The age check needs a document credential — an NFC passport added in World App. An Orb
-        verification alone doesn't carry it, and document support currently covers about a dozen
+        verification alone doesn&apos;t carry it, and document support currently covers about a dozen
         countries.
       </Callout>
     );

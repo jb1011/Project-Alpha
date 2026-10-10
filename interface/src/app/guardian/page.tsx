@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { IDKitRequestWidget, identityCheck } from "@worldcoin/idkit";
+import { IDKitRequestWidget, identityCheck, type RpContext } from "@worldcoin/idkit";
 import { guardianConstraints } from "@/lib/worldid";
 import type { WorldIdAttestContext, WorldIdContext } from "@/lib/api/types";
 import {
@@ -99,8 +99,7 @@ function GuardianVerification() {
           onOpenChange={setOpen}
           app_id={ctx.appId as `app_${string}`}
           action={ctx.action}
-          // biome-ignore lint/suspicious/noExplicitAny: rp_context shape is defined by the API response.
-          rp_context={ctx.rpContext as any}
+          rp_context={ctx.rpContext as RpContext}
           allow_legacy_proofs
           environment={ctx.environment}
           constraints={guardianConstraints(ctx.signal)}
@@ -128,8 +127,7 @@ function GuardianVerification() {
           onOpenChange={setAttestOpen}
           app_id={attestCtx.appId as `app_${string}`}
           action={attestCtx.action}
-          // biome-ignore lint/suspicious/noExplicitAny: rp_context shape is defined by the API response.
-          rp_context={attestCtx.rpContext as any}
+          rp_context={attestCtx.rpContext as RpContext}
           allow_legacy_proofs={false}
           environment={attestCtx.environment}
           preset={identityCheck({

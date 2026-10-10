@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useAccount, useSignTypedData } from "wagmi";
 import {
   useCancelCompanyPaymentMutation,
@@ -50,6 +50,11 @@ export interface FormationPaymentController {
   requote: () => Promise<void>;
 }
 
+/** How often the settling clock is re-read. The payment itself is polled every 4 s, but a poll
+ *  whose answer has not changed re-renders nothing, and the cancel button has to appear on
+ *  wall-clock time rather than on a change in the data. */
+const SETTLING_TICK_MS = 1_000;
+
 export function useFormationPayment(companyId: string | null): FormationPaymentController {
   const { address } = useAccount();
   const { data: payment, isLoading, isError, error, refetch } = useCompanyPaymentQuery(companyId);
@@ -66,12 +71,30 @@ export function useFormationPayment(companyId: string | null): FormationPaymentC
    * appeared yet, and a persisted timestamp would offer that button instantly on a reload — to
    * somebody whose transfer is one second old and about to confirm. Re-starting the clock on a
    * reload errs towards waiting, which is the safe direction.
+   *
+   * State, with a clock beside it, because `action` is computed during render and nothing else
+   * re-renders a payment that sits in `settling`: a poll whose answer has not changed produces no
+   * render, so a ref read here would surface the cancel button at whatever render happened to
+   * come next, or never. The clock ticks only while the payment is settling. The stamp is taken
+   * when the payment is first seen settling and recorded on the first tick, so the first second
+   * reads as "wait", which it is; it is forgotten when the payment leaves `settling`, so a later
+   * attempt waits its own full turn.
    */
-  const settlingSince = useRef<number | null>(null);
+  const paymentSettling = payment?.status === "settling";
+  const [settlingSinceMs, setSettlingSinceMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
-    if (payment?.status === "settling") settlingSince.current ??= Date.now();
-    else settlingSince.current = null;
-  }, [payment?.status]);
+    if (!paymentSettling) return;
+    const sinceMs = Date.now();
+    const id = setInterval(() => {
+      setSettlingSinceMs(sinceMs);
+      setNowMs(Date.now());
+    }, SETTLING_TICK_MS);
+    return () => {
+      clearInterval(id);
+      setSettlingSinceMs(null);
+    };
+  }, [paymentSettling]);
 
   const run = async (fn: () => Promise<unknown>) => {
     setProblem(null);
@@ -91,10 +114,7 @@ export function useFormationPayment(companyId: string | null): FormationPaymentC
     isError,
     error,
     refetch: () => void refetch(),
-    action: paymentAction(payment, {
-      nowMs: Date.now(),
-      settlingSinceMs: settlingSince.current ?? undefined,
-    }),
+    action: paymentAction(payment, { nowMs, settlingSinceMs: settlingSinceMs ?? undefined }),
     busy: settle.isPending || cancelPayment.isPending || requotePayment.isPending,
     settling: settle.isPending,
     cancelling: cancelPayment.isPending,
@@ -118,8 +138,7 @@ export function useFormationPayment(companyId: string | null): FormationPaymentC
         // nothing live to cancel, or where the deployment no longer charges.
         const td = payment?.cancelTypedData;
         if (!td || !address) return;
-        // biome-ignore lint/suspicious/noExplicitAny: a served EIP-712 request, typed at the wire
-        const signature = await signTypedDataAsync(td as any);
+        const signature = await signTypedDataAsync(td);
         await cancelPayment.mutateAsync({ signature });
       }),
     requote: () => run(() => requotePayment.mutateAsync()),

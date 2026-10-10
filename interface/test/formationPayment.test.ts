@@ -134,6 +134,16 @@ test("a payment stuck long enough offers CANCEL — a second signature, not a re
   ).toBe("cancel");
 });
 
+test("the cancel appears strictly AFTER the wait: at the limit it is still a wait", () => {
+  // The clock that drives this ticks once a second while the payment settles, so the limit is a
+  // moment a guardian actually meets, and the edge has to fall on the waiting side.
+  const settling = payment({ status: "settling", quote: undefined });
+  expect(paymentAction(settling, { nowMs: NOW, settlingSinceMs: NOW - STUCK_AFTER_MS })).toBe("wait");
+  expect(
+    paymentAction(settling, { nowMs: NOW, settlingSinceMs: NOW - STUCK_AFTER_MS - 1 }),
+  ).toBe("cancel");
+});
+
 test("a `quoted` row with NO quote offers CANCEL — the clock, not the status (gate A4)", () => {
   // The backend withholds the typed data past the QUOTE's TTL even before the sweeper moves the
   // row. Offering a sign button off the STATUS alone would walk a guardian through a wallet
