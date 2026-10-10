@@ -4,10 +4,11 @@ name: Interface
 # this branch is the first to put load-bearing claims copy behind a test suite (the AgentBook chip
 # says, in five permitted labels, whether a real person vouched for an address).
 #
+# Lint runs here since the error baseline reached zero. Warnings do not fail it: eslint exits 0 on
+# warnings, and the ones that remain are a separate, optional pass. Keep it that way until that
+# pass lands, since a job that is red on arrival teaches everyone to ignore it.
+#
 # Deliberately NOT here:
-#   - `npm run lint` — 21 findings (13 errors) predate this workflow, all in components no branch
-#     has touched. A job that is red on arrival teaches everyone to ignore it. Add it in the PR
-#     that clears the baseline.
 #   - `next build` — needs the deployment's env to render; Vercel builds every push already.
 
 permissions:
@@ -32,7 +33,7 @@ concurrency:
 
 jobs:
   interface:
-    name: Interface (tsc + vitest)
+    name: Interface (tsc + lint + vitest)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -51,6 +52,9 @@ jobs:
 
       - name: Typecheck
         run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
 
       - name: Test
         run: npx vitest run

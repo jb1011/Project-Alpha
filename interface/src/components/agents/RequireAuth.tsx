@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Button, Callout, Card, Spinner } from "@/components/onboarding/primitives";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { authPanelState } from "./authPanel";
@@ -9,15 +9,18 @@ import { shortenErr } from "@/lib/errors";
 export function RequireAuth({ children }: { children: ReactNode }) {
   const { session, isConnected, isConnecting, isLoggingIn, connectWallet, login } =
     useAuth();
-  const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Session lives in sessionStorage; the server always sees "logged out". Wait for the
-  // client snapshot before branching, or React throws a hydration mismatch on /guardian,
-  // /agents, etc. when a session already exists.
-  useEffect(() => {
-    setReady(true);
-  }, []);
+  // Session lives in sessionStorage; the server always sees "logged out". So the server and the
+  // hydration pass render the loading state, and the branch below is taken only once the client
+  // has hydrated: false on the server and while hydrating, true from the first client render
+  // after that, with nothing to subscribe to. Branching earlier would show a signed-in guardian
+  // the sign-in panel until hydration caught up.
+  const hydrated = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
 
   const panel = authPanelState({ isConnected, isConnecting, isLoggingIn });
 
@@ -39,7 +42,7 @@ export function RequireAuth({ children }: { children: ReactNode }) {
     [],
   );
 
-  if (!ready) {
+  if (!hydrated) {
     return <LoadingState />;
   }
 
