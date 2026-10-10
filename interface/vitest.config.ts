@@ -22,6 +22,8 @@ import { defineConfig } from "vitest/config";
  * worth asserting here is a pure function that a component calls — which is itself the constraint
  * that keeps the logic testable, and the constraint that turned three inline UI decisions
  * (`legalBodyBranch`, `resumePhase`, `companyPill`) into functions with tests.
+ * `react-dom/server` is fine: the auth gate's hydration contract is a statement about the string
+ * the server returns.
  */
 export default defineConfig({
   test: {
