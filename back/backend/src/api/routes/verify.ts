@@ -28,9 +28,11 @@ import { createClientLimiter, sharedReadBudget } from "./legalBodies";
  *
  * THREE LAYERS, in this order, and the order is the design:
  *
- *   1. the rate limiter and the 404 guard, BEFORE any price is quoted (D9). Quoting for an
- *      entity we do not have would turn this route into an existence oracle that charges for the
- *      answer, and would let a walk over random UUIDs cost us a facilitator round trip each.
+ *   1. the method check, the rate limiter and the 404 guard, BEFORE any price is quoted.
+ *      The route sells a GET and answers only that; every other method is refused first, so
+ *      nothing below is read or spent for it. Quoting for an entity we do not have would turn
+ *      this route into an existence oracle that charges for the answer, and would let a walk
+ *      over random UUIDs cost us a facilitator round trip each.
  *   2. `@x402/hono`'s payment middleware: it issues the 402, verifies, and settles AFTER the
  *      handler — a settlement that fails replaces our body with the facilitator's 402, so the
  *      attestation is never served for a payment that did not land.
@@ -207,10 +209,19 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
     }
   };
 
-  // Layer 1: the limiter and the 404 guard, BEFORE any 402 is issued (D9).
+  // Layer 1: the method check, the limiter and the 404 guard, BEFORE any 402 is issued.
   typed.use("/verify/:publicId", async (c, next) => {
     // Nothing a caller is refused may be reused by a shared cache — not a throttle, not a 404.
     const noStore = () => c.header("Cache-Control", "no-store");
+    // The paid check answers GET only: the one method the route quotes and sells, and an unpaid
+    // GET is how the price is asked for. Every other method, HEAD included, is refused here,
+    // ahead of the limiter and the lookup, and told which method the route answers. (A preflight
+    // never reaches this line: the CORS layer answers OPTIONS before any route.)
+    if (c.req.method !== "GET") {
+      noStore();
+      c.header("Allow", "GET");
+      return c.json({ error: "method_not_allowed" }, 405);
+    }
     // The PER-CLIENT allowance first, and it is the SAME instance `/legal-bodies/:address` spends
     // (audit C9): a caller cannot walk from one public read surface to the other to double it.
     if (!limiter(c).take()) {
@@ -260,8 +271,9 @@ export function mountVerifyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   // The quote's resource address is the request URL, which behind the TLS proxy reads http. So
   // where the deployment names its public origin, the middleware reads the request at that origin,
   // with the same path, query, method and headers; a payment is matched on the requirements it
-  // accepted, never on this address. Only for a GET, the one method quoted: no Request can be
-  // built for a TRACE, which stays a 404.
+  // accepted, never on this address. Only for a GET, the one method quoted and the only one layer
+  // 1 lets through; the condition stays here as well, since a Request cannot be built for every
+  // method (a TRACE, for one).
   typed.use("/verify/:publicId", async (c, next) => {
     if (publicOrigin && c.req.method === "GET") {
       const { pathname, search } = new URL(c.req.url);

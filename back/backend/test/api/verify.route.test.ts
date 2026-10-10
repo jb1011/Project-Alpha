@@ -125,6 +125,8 @@ function setup(
     /** Set = the deployment names its public origin (`PUBLIC_API_URL`); absent = it does not,
      *  which is the state every other test runs in. */
     publicApiUrl?: string;
+    /** Set = the scaffold's Arc reads, counted: the proof that the handler did or did not run. */
+    chainReads?: ReturnType<typeof arcReads>;
   } = {},
 ) {
   const { db, repo } = hederaDb(o.over);
@@ -145,7 +147,7 @@ function setup(
           },
     legalBody: {
       resolver: { resolve: async () => ({ kind: "none" }) },
-      chainReads: arcReads(),
+      chainReads: o.chainReads ?? arcReads(),
       readBudget: o.readBudget ?? new TokenBucket(30, 1),
       links: { transparency: `${WEB}/transparency`, metadataBase: METADATA_BASE },
       network: "testnet" as const,
@@ -177,6 +179,24 @@ async function paidHeader(app: App, publicId: string, client: string): Promise<s
 const quotedUrl = (header: string | null): string =>
   decodePaymentRequiredHeader(header ?? "").resource.url;
 
+/** The scaffold's Arc reads with a counter: the handler is the only thing that makes them. */
+function countedReads() {
+  const base = arcReads();
+  let n = 0;
+  return {
+    reads: () => n,
+    legalStatus: async () => {
+      n++;
+      return base.legalStatus();
+    },
+    treasuryPaused: async () => {
+      n++;
+      return base.treasuryPaused();
+    },
+    treasuryAllowlistEnabled: base.treasuryAllowlistEnabled,
+  };
+}
+
 /**
  * The app served by a real `@hono/node-server` on a free loopback port, the server production
  * runs, closed once `run` is done. Its request object is that server's own, not the `Request`
@@ -199,16 +219,19 @@ async function served<T>(app: App, run: (origin: string) => Promise<T>): Promise
 }
 
 /** One request over its own connection, closed after the answer (so the server can close), with
- *  any method: `fetch` refuses to send a TRACE. */
+ *  any method: `fetch` refuses to send a TRACE. The body is counted, not kept. */
 const overHttp = (url: string, method: string, headers: Record<string, string>) =>
-  new Promise<{ status: number; headers: Headers }>((resolve, reject) => {
+  new Promise<{ status: number; headers: Headers; bodyBytes: number }>((resolve, reject) => {
     const req = httpRequest(url, { method, headers, agent: false }, (res) => {
-      res.resume();
+      let bodyBytes = 0;
+      res.on("data", (chunk: Buffer) => {
+        bodyBytes += chunk.length;
+      });
       res.on("end", () => {
         const answered = new Headers();
         for (const [name, value] of Object.entries(res.headers))
           if (typeof value === "string") answered.set(name, value);
-        resolve({ status: res.statusCode ?? 0, headers: answered });
+        resolve({ status: res.statusCode ?? 0, headers: answered, bodyBytes });
       });
     });
     req.on("error", reject);
@@ -360,12 +383,129 @@ test("served by a real Node server, the one production runs, the quote names the
   );
 });
 
-test("served by a real Node server, a TRACE to a known id is still a 404 with the public origin set: only a GET is rebuilt", async () => {
-  const { app } = setup({ publicApiUrl: "https://api.example.test" });
-  const res = await served(app, (origin) =>
-    overHttp(`${origin}/verify/${PUBLIC_ID}`, "TRACE", { "x-forwarded-for": "13.0.0.6" }),
-  );
-  expect(res.status).toBe(404);
+// ── the method: the route answers GET only ──────────────────────────────────────────────────────
+
+test("a HEAD on a known id is refused 405 with Allow: GET and no body, before anything is read or quoted", async () => {
+  const reads = countedReads();
+  const { app } = setup({ chainReads: reads });
+  const res = await app.request(`/verify/${PUBLIC_ID}`, {
+    method: "HEAD",
+    headers: { "x-forwarded-for": "15.0.0.1" },
+  });
+  expect(res.status).toBe(405);
+  expect(res.headers.get("Allow")).toBe("GET");
+  expect(res.headers.get("Cache-Control")).toBe("no-store");
+  expect(res.headers.get("PAYMENT-REQUIRED")).toBeNull();
+  expect(await res.text()).toBe("");
+  expect(reads.reads()).toBe(0);
+  // Not even the facilitator handshake: the refusal comes before the paid layer is asked for.
+  expect(seen).toEqual([]);
+});
+
+test("POST, PUT, PATCH and DELETE on a known id are refused the same way, with the JSON body", async () => {
+  const reads = countedReads();
+  const { app } = setup({ chainReads: reads });
+  for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+    const res = await app.request(`/verify/${PUBLIC_ID}`, {
+      method,
+      headers: { "x-forwarded-for": "15.0.1.1" },
+    });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("Allow")).toBe("GET");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(await res.json()).toEqual({ error: "method_not_allowed" });
+  }
+  expect(reads.reads()).toBe(0);
+  expect(seen).toEqual([]);
+});
+
+test("a payment header on a refused method buys nothing and spends nothing: no facilitator call, and the shared budget is untouched", async () => {
+  // One token, no refill: had any refusal below spent it, the paid GET at the end could not be
+  // served.
+  const { app } = setup({ readBudget: new TokenBucket(1, 0) });
+  const header = await paidHeader(app, PUBLIC_ID, "15.0.2.1");
+  seen = [];
+  for (const method of ["HEAD", "POST"]) {
+    for (const pay of [header, "not-base64-json"]) {
+      const res = await app.request(`/verify/${PUBLIC_ID}`, {
+        method,
+        headers: { "x-forwarded-for": "15.0.2.2", "PAYMENT-SIGNATURE": pay },
+      });
+      expect(res.status).toBe(405);
+    }
+  }
+  expect(seen).toEqual([]);
+  const res = await get(app, PUBLIC_ID, {
+    "x-forwarded-for": "15.0.2.1",
+    "PAYMENT-SIGNATURE": header,
+  });
+  expect(res.status).toBe(200);
+});
+
+test("a HEAD on an unknown id is the same 405: the method is refused before the id is looked up", async () => {
+  const { app } = setup();
+  const res = await app.request(`/verify/${UNKNOWN_ID}`, {
+    method: "HEAD",
+    headers: { "x-forwarded-for": "15.0.3.1" },
+  });
+  expect(res.status).toBe(405);
+  expect(res.headers.get("Allow")).toBe("GET");
+  expect(seen).toEqual([]);
+});
+
+test("a refused method does not spend the caller's allowance: ten HEADs, then the same client's GET is still quoted", async () => {
+  const { app } = setup();
+  for (let i = 0; i < 10; i++)
+    expect(
+      (
+        await app.request(`/verify/${PUBLIC_ID}`, {
+          method: "HEAD",
+          headers: { "x-forwarded-for": "15.0.4.1" },
+        })
+      ).status,
+    ).toBe(405);
+  const res = await get(app, PUBLIC_ID, { "x-forwarded-for": "15.0.4.1" });
+  expect(res.status).toBe(402);
+  expect(res.headers.get("PAYMENT-REQUIRED")).toBeTruthy();
+});
+
+test("a CORS preflight is answered before the route, as before: 204 and no Allow", async () => {
+  const reads = countedReads();
+  const { app } = setup({ chainReads: reads });
+  const res = await app.request(`/verify/${PUBLIC_ID}`, {
+    method: "OPTIONS",
+    headers: {
+      "x-forwarded-for": "15.0.5.1",
+      origin: WEB,
+      "access-control-request-method": "GET",
+      "access-control-request-headers": "payment-signature",
+    },
+  });
+  expect(res.status).toBe(204);
+  expect(res.headers.get("Access-Control-Allow-Origin")).toBe(WEB);
+  expect(res.headers.get("Allow")).toBeNull();
+  expect(reads.reads()).toBe(0);
+  expect(seen).toEqual([]);
+});
+
+test("served by a real Node server, a HEAD and a TRACE on a known id are refused 405 with Allow: GET, and the HEAD carries no body", async () => {
+  const reads = countedReads();
+  const { app } = setup({ chainReads: reads, publicApiUrl: "https://api.example.test" });
+  await served(app, async (origin) => {
+    const head = await overHttp(`${origin}/verify/${PUBLIC_ID}`, "HEAD", {
+      "x-forwarded-for": "13.0.0.6",
+    });
+    expect(head.status).toBe(405);
+    expect(head.headers.get("allow")).toBe("GET");
+    expect(head.bodyBytes).toBe(0);
+    const trace = await overHttp(`${origin}/verify/${PUBLIC_ID}`, "TRACE", {
+      "x-forwarded-for": "13.0.0.6",
+    });
+    expect(trace.status).toBe(405);
+    expect(trace.headers.get("allow")).toBe("GET");
+  });
+  expect(reads.reads()).toBe(0);
+  expect(seen).toEqual([]);
 });
 
 // ── the limits, which come before the price ─────────────────────────────────────────────────────
