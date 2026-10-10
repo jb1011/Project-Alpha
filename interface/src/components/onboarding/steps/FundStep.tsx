@@ -88,8 +88,12 @@ export function FundStep({
   // ONE place decides what the poll means, and it is a pure function with a table test
   // (`fundPollOutcome`). The three ways this used to end — confirmed, failed, or never — are now
   // four, and the fourth is the one that stops the spinner honestly.
-  useEffect(() => {
-    if (!pollFunding || pollStartedAt === null) return;
+  //
+  // Decided during render rather than in an effect, under a guard that is false again as soon as
+  // it has fired: recording the outcome turns `pollFunding` off, so an attempt ends exactly once,
+  // and React re-renders straight away rather than committing a frame that still shows the poll
+  // alive.
+  if (pollFunding && pollStartedAt !== null) {
     // ⚠ `answerForAttempt` first (review I-R1). React Query serves the PREVIOUS attempt's body the
     // instant polling is re-enabled — the key is the entity, not the attempt — so without this the
     // retry reports the old failure one frame after it starts, and stops polling.
@@ -97,19 +101,20 @@ export function FundStep({
       answerForAttempt(fundPoll.data, fundPoll.dataUpdatedAt, pollStartedAt),
       now - pollStartedAt,
     );
-    if (outcome === "keep-polling") return;
-    setPollFunding(false);
-    if (outcome === "confirmed") {
-      setStatus("confirmed");
-      setError(null);
-    } else if (outcome === "timeout") {
-      setStatus("timeout");
-      setError(null);
-    } else {
-      setStatus("error");
-      setError(outcome.error);
+    if (outcome !== "keep-polling") {
+      setPollFunding(false);
+      if (outcome === "confirmed") {
+        setStatus("confirmed");
+        setError(null);
+      } else if (outcome === "timeout") {
+        setStatus("timeout");
+        setError(null);
+      } else {
+        setStatus("error");
+        setError(outcome.error);
+      }
     }
-  }, [fundPoll.data, fundPoll.dataUpdatedAt, now, pollFunding, pollStartedAt]);
+  }
 
   const treasury = entity?.treasury;
   const amountNum = Number(amount);
