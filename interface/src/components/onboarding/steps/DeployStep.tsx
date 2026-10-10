@@ -8,6 +8,7 @@ import { useEntityPollQuery } from "@/lib/api/hooks";
 import type { EntityStatus, EntityView } from "@/lib/api/types";
 import { arcTestnet, txUrl } from "@/lib/chain";
 import { wireAllowlistEntries } from "@/lib/treasury/allowlist";
+import { deployPollError } from "@/lib/onboarding/deployError";
 import type { AgentConfig } from "../types";
 import {
   Button,
@@ -98,17 +99,10 @@ export function DeployStep({
     if (entityQuery.data) onEntity(entityQuery.data);
   }, [entityQuery.data, onEntity]);
 
-  useEffect(() => {
-    if (entity?.status === "failed") {
-      setError(entity.error ?? "Onboarding failed.");
-    } else if (entityQuery.error) {
-      setError(
-        entityQuery.error instanceof Error
-          ? entityQuery.error.message
-          : "Failed to poll entity status.",
-      );
-    }
-  }, [entity, entityQuery.error]);
+  // What the poll says went wrong, read off the query rather than copied into state: a failed
+  // onboarding first, then a poll that could not be read. `error` is the allowlist wiring's own,
+  // and outranks it while set.
+  const shownError = error ?? deployPollError(entity, entityQuery.error);
 
   const polling =
     !!entityId &&
@@ -215,7 +209,7 @@ export function DeployStep({
 
       {hasFailure && (
         <Callout tone="warn" className="mt-6" title="Deployment failed">
-          {error ?? entity?.error ?? "An error occurred during onboarding."}
+          {shownError ?? "An error occurred during onboarding."}
         </Callout>
       )}
 
@@ -239,9 +233,9 @@ export function DeployStep({
         </Callout>
       )}
 
-      {error && !hasFailure && (
+      {shownError && !hasFailure && (
         <Callout tone="warn" className="mt-6" title="Error">
-          {error}
+          {shownError}
         </Callout>
       )}
 
