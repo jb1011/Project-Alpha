@@ -118,8 +118,7 @@ export function useFormationPayment(companyId: string | null): FormationPaymentC
         // nothing live to cancel, or where the deployment no longer charges.
         const td = payment?.cancelTypedData;
         if (!td || !address) return;
-        // biome-ignore lint/suspicious/noExplicitAny: a served EIP-712 request, typed at the wire
-        const signature = await signTypedDataAsync(td as any);
+        const signature = await signTypedDataAsync(td);
         await cancelPayment.mutateAsync({ signature });
       }),
     requote: () => run(() => requotePayment.mutateAsync()),
