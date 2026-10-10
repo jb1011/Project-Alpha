@@ -30,6 +30,10 @@ import {
 } from "@/components/onboarding/primitives";
 import { formatUsdc, isAddress, shortAddress } from "@/components/onboarding/types";
 
+/** How often the timelock is re-read while a scheduled policy change is waiting. The delay is
+ *  hours long; a second is close enough, and is what the other clocks in this interface tick at. */
+const TIMELOCK_TICK_MS = 1_000;
+
 type PendingPolicy = {
   policyId: `0x${string}`;
   cap: bigint;
@@ -49,12 +53,19 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   const executePolicyUpdate = useExecutePolicyUpdateMutation(entityId);
 
   const entity = entityQuery.data ?? null;
-  const [error, setError] = useState<string | null>(
-    entityQuery.error instanceof Error ? entityQuery.error.message : null,
-  );
+  /** What the load itself says went wrong, read off the query rather than copied into state, so
+   *  it clears by itself when a refetch succeeds. `error` below is the actions' own. */
+  const loadError = entityQuery.error
+    ? entityQuery.error instanceof Error
+      ? entityQuery.error.message
+      : "Failed to load agent."
+    : null;
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<PendingPolicy | null>(null);
   const [formInitialized, setFormInitialized] = useState(false);
+  /** The clock the timelock is read against, ticking only while a scheduled change waits. */
+  const [now, setNow] = useState(() => Date.now());
 
   const [perTxCap, setPerTxCap] = useState("");
   const [trustPolicy, setTrustPolicy] = useState<string>("inherit");
@@ -77,22 +88,24 @@ export function AgentSettings({ entityId }: { entityId: string }) {
 
   const refreshEntity = entityQuery.refetch;
 
-  useEffect(() => {
-    if (!entity || formInitialized) return;
+  // The form is seeded from the stored agent once, the first time it is on hand, and never again:
+  // a refetch after a save must not overwrite what the guardian is typing. Seeded during render
+  // under a guard the seeding itself turns off, so the first frame that has the agent already
+  // shows its values rather than an empty form an effect fills a frame later.
+  if (entity && !formInitialized) {
     if (entity.perTxCap) setPerTxCap(String(Number(entity.perTxCap) / 1e6));
     setTrustPolicy(entity.trustPolicy ?? "inherit");
     setFormInitialized(true);
-  }, [entity, formInitialized]);
+  }
 
+  // The timelock clock, alive only while a scheduled change is waiting. A poll whose answer has
+  // not changed re-renders nothing, so without it the execute button would wait for whatever
+  // render came next.
   useEffect(() => {
-    if (entityQuery.error) {
-      setError(
-        entityQuery.error instanceof Error
-          ? entityQuery.error.message
-          : "Failed to load agent.",
-      );
-    }
-  }, [entityQuery.error]);
+    if (!pending) return;
+    const id = setInterval(() => setNow(Date.now()), TIMELOCK_TICK_MS);
+    return () => clearInterval(id);
+  }, [pending]);
 
   useEffect(() => {
     if (!pending?.policyId || !treasury || !publicClient) return;
@@ -255,10 +268,14 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   }
 
   const executableAt = pending ? Number(pending.executableAt) * 1000 : 0;
-  const canExecute = pending && Date.now() >= executableAt;
+  const canExecute = pending !== null && now >= executableAt;
 
   if (!entity) {
-    return <div className="py-12 text-[13px] text-muted">Loading settings…</div>;
+    return loadError ? (
+      <div className="py-12 text-[12px] text-[#ff8a84]">{loadError}</div>
+    ) : (
+      <div className="py-12 text-[13px] text-muted">Loading settings…</div>
+    );
   }
 
   return (
@@ -454,7 +471,9 @@ export function AgentSettings({ entityId }: { entityId: string }) {
         </div>
       </Card>
 
-      {error && <p className="text-[12px] text-[#ff8a84]">{error}</p>}
+      {(error ?? loadError) && (
+        <p className="text-[12px] text-[#ff8a84]">{error ?? loadError}</p>
+      )}
     </div>
   );
 }
