@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 type Props = {
   className?: string;
   tone?: "ink" | "paper";
@@ -27,7 +29,7 @@ function Mark({ tone = "ink" }: { tone?: "ink" | "paper" }) {
 export function Wordmark({ className = "", tone = "ink" }: Props) {
   const ink = tone === "ink";
   return (
-    <a
+    <Link
       href="/"
       className={`group inline-flex items-center gap-2.5 ${className}`}
       aria-label="Novi Corpus home"
@@ -42,7 +44,7 @@ export function Wordmark({ className = "", tone = "ink" }: Props) {
           Novi Corpus
         </span>
       </span>
-    </a>
+    </Link>
   );
 }
 
