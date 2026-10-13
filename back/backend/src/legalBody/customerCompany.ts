@@ -542,9 +542,10 @@ function conflict(message: string): ApiError {
 /**
  * The tenant abandons its own customer company, while nobody has checked it, no payment is live or
  * settled and no legal body stands open on it. A sandbox's automatic check is evidence of nothing,
- * so it does not keep a company; any check after it does. In one transaction, the status moves to
- * `abandoned` by compare-and-set from the one it has, and the declarant's personal data is erased;
- * if either fails, neither happens.
+ * so it does not keep a company; any check after it does. Whether a check is the automatic one is
+ * read on the company's own environment, never the deployment's. In one transaction, the status
+ * moves to `abandoned` by compare-and-set from the one it has, and the declarant's personal data
+ * is erased; if either fails, neither happens.
  *
  * An unknown company and another tenant's get one answer, 404: telling them apart would make this
  * an existence oracle over company ids. Every other refusal is a 409 `conflict`.
@@ -563,7 +564,7 @@ export function abandonCustomerCompany(
     if (company.status !== "draft" && company.status !== "ready")
       throw conflict("this company is already abandoned");
     const latest = deps.checks.latest(companyId);
-    if (latest !== undefined && !isAutomaticSandboxCheck(latest, deps.environment))
+    if (latest !== undefined && !isAutomaticSandboxCheck(latest, company.environment))
       throw conflict("the operator has checked this company's declaration, so it is kept");
     if (deps.companies.hasLiveOrSettledPayment(companyId))
       throw conflict("this company has a payment, so it is kept");

@@ -262,7 +262,7 @@ A field that can be absent then holds a value it can never really take: the zero
 | `identityOwnerIsContract` | `identityOwnerAtCreation` holds contract code at `observedAtBlock`. See [Contract accounts](#contract-accounts). | `false` |
 | `agentWalletIsContract` | The same for `agentWallet`. | `false` |
 | `standing` | `pending`, `active`, `unknown` or `inactive`: see [Standing](#standing). | |
-| `attestationState` | Novi's own record of the LLC: `active` when an operator's check passed and the legal body is paid for, `revoked` when Novi revoked the legal body or its check of the LLC, `pending` otherwise. | |
+| `attestationState` | Novi's own record of the LLC: `active` when an operator's check passed (on a sandbox deployment the check is automatic; see the sandbox note below) and the legal body is paid for, `revoked` when Novi revoked the legal body or its check of the LLC, `pending` otherwise. | |
 | `jurisdiction` | `WY`. | |
 | `entityType` | `LLC`. | |
 | `legalName` | The LLC's name, as declared to Novi and checked by an operator against the Wyoming registry. Shown only while that check stands, the binding is `linked` and nothing is revoked. | `""` |

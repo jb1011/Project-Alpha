@@ -1,8 +1,8 @@
 /**
  * On a sandbox deployment the operator's check of the LLC is automatic and examines nothing, so
  * the public page a third party reads must say so wherever a sandbox statement could pass for a
- * checked company: in the standing table's `active` row, in the `controlVerified` row, and in a note
- * naming every field that rests on that check.
+ * checked company: in the standing table's `active` row, in the `attestationState` and
+ * `controlVerified` rows, and in a note naming every field that rests on that check.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -63,9 +63,9 @@ test("the page says that on a sandbox the operator's check is automatic and chec
   expect(page()).toContain(AUTOMATIC);
 });
 
-test("the standing table's active row and the controlVerified row each speak of the sandbox", () => {
+test("the standing table's active row, and the attestationState and controlVerified rows, each speak of the sandbox", () => {
   const text = page();
-  for (const name of ["active", "controlVerified"])
+  for (const name of ["active", "attestationState", "controlVerified"])
     expect(rowOf(text, name), name).toContain("sandbox");
 });
 

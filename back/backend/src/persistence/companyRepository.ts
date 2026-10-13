@@ -147,7 +147,8 @@ export interface CompanyRepository {
    *  - it has no payment `quoted`, `settling`, `settled` or `refunded`;
    *  - it has no check, or its latest check `failed` and was recorded before `cutoffUtc`;
    *  - and no customer upload was made since its latest check (with no check, none at all).
-   * A latest check that is a sandbox's automatic one examined nothing: those two read it as none.
+   * A latest check that is a sandbox's automatic one examined nothing: those two read it as none,
+   * unless the company ever had a deployed body (then it was used, and is kept).
    * So a company with an upload no check has followed is waiting for the operator and is never
    * stale, and neither is one whose latest check passed, revoked or reinstated it. Times are
    * compared at one-second resolution, and a check recorded in the same second as an upload is not
@@ -221,11 +222,16 @@ export interface CompanyRepository {
 }
 
 /**
- * The latest check `l` of company `c` is a sandbox's automatic one: its operator is
- * `@automatic_operator` (SANDBOX_AUTOMATIC_OPERATOR) and the company is a sandbox one, the two-part
- * test of `isAutomaticSandboxCheck`. The operator's name alone proves nothing on production.
+ * The latest check `l` of company `c` reads as no check: it is a sandbox's automatic one (its
+ * operator is `@automatic_operator`, SANDBOX_AUTOMATIC_OPERATOR, and the company is a sandbox one,
+ * the two-part test of `isAutomaticSandboxCheck`; the name alone proves nothing on production), and
+ * the company never had a deployed body. A body that deployed (`deployed_at` set: deployed, linked,
+ * broken or superseded, and write-once) means the company was used: a broken or superseded body
+ * can be linked again, so its company is not swept as an unused declaration.
  */
-const LATEST_IS_AUTOMATIC = "c.environment = 'sandbox' AND l.operator = @automatic_operator";
+const LATEST_READS_AS_NO_CHECK = `c.environment = 'sandbox' AND l.operator = @automatic_operator
+  AND NOT EXISTS (SELECT 1 FROM legal_bodies b
+                   WHERE b.company_id = c.company_id AND b.deployed_at IS NOT NULL)`;
 
 /**
  * The stale-customer rule (`listStaleCustomerCandidates`), as one WHERE clause over `companies c`
@@ -233,7 +239,7 @@ const LATEST_IS_AUTOMATIC = "c.environment = 'sandbox' AND l.operator = @automat
  * disagree. The latest check is the one with the highest id, as everywhere else that reads
  * `company_checks`. With no check, the first subquery is NULL (stale so far) and the upload clause
  * compares with '' (any upload keeps the company). A latest check that is a sandbox's automatic
- * one examined nothing, and both read it as no check.
+ * one examined nothing, and both read it as no check while the company never had a deployed body.
  */
 const STALE_CUSTOMER_WHERE = `
       c.provider = 'customer'
@@ -242,7 +248,7 @@ const STALE_CUSTOMER_WHERE = `
   AND NOT EXISTS (SELECT 1 FROM formation_payments p
                    WHERE p.company_id = c.company_id
                      AND p.status IN ('quoted','settling','settled','refunded'))
-  AND IFNULL((SELECT CASE WHEN ${LATEST_IS_AUTOMATIC} THEN NULL
+  AND IFNULL((SELECT CASE WHEN ${LATEST_READS_AS_NO_CHECK} THEN NULL
                           ELSE l.result = 'failed' AND l.created_at < @cutoff END
                 FROM company_checks l
                WHERE l.company_id = c.company_id
@@ -250,8 +256,8 @@ const STALE_CUSTOMER_WHERE = `
   AND NOT EXISTS (SELECT 1 FROM documents d
                    WHERE d.company_id = c.company_id
                      AND d.source = 'customer'
-                     AND d.created_at >= IFNULL((SELECT CASE WHEN ${LATEST_IS_AUTOMATIC} THEN NULL
-                                                             ELSE l.created_at END
+                     AND d.created_at >= IFNULL((SELECT CASE WHEN ${LATEST_READS_AS_NO_CHECK}
+                                                             THEN NULL ELSE l.created_at END
                                                    FROM company_checks l
                                                   WHERE l.company_id = c.company_id
                                                   ORDER BY l.check_id DESC LIMIT 1), ''))`;

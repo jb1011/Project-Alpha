@@ -455,6 +455,27 @@ describe("abandoning a company", () => {
     ).toMatchObject({ code: "conflict", status: 409, message: KEPT });
     expect(s.companies.find(companyId)?.status).toBe("draft");
   });
+
+  test("the company's own environment decides, never the deployment's: a sandbox company is abandoned under production doors, a production one kept under sandbox doors", async () => {
+    const onSandbox = await declare(sandbox(), owner, SANDBOX_TYPED);
+    abandonCustomerCompany(production(), owner.address, onSandbox);
+    expect(s.companies.find(onSandbox)?.status).toBe("abandoned");
+
+    const onProduction = await declare(production(), owner, PRODUCTION_TYPED);
+    s.checks.append(
+      automaticSandboxCheck({
+        companyId: onProduction,
+        companyName: PRODUCTION_TYPED.companyName,
+        filingNumber: PRODUCTION_TYPED.filingNumber,
+        checkedAt: nowSeconds(),
+        osUser: "ops",
+      }),
+    );
+    expect(
+      refusalOf(() => abandonCustomerCompany(sandbox(), owner.address, onProduction)),
+    ).toMatchObject({ code: "conflict", status: 409, message: KEPT });
+    expect(s.companies.find(onProduction)?.status).toBe("draft");
+  });
 });
 
 describe("isAutomaticSandboxCheck", () => {
@@ -520,6 +541,21 @@ describe("the stale sweep reads the automatic check as no check", () => {
     const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
     appendCheck(s.checks, companyId, "passed");
     expect(staleAt(companyId, cutoffAfterCreation())).toBe(false);
+  });
+
+  test.each(["broken", "superseded"] as const)(
+    "a sandbox company with only its automatic check is not stale once it had a deployed body, now %s",
+    async (state) => {
+      const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+      bodyIn(state, s, companyId, { tenant: owner.address });
+      expect(staleAt(companyId, cutoffAfterCreation())).toBe(false);
+    },
+  );
+
+  test("a body that never deployed does not spare it: with only an order's draft, it is stale", async () => {
+    const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+    createOrder(legalBodyOrderDeps(s), owner.address, { companyId });
+    expect(staleAt(companyId, cutoffAfterCreation())).toBe(true);
   });
 
   test("a production company whose check passed is not stale, even under the automatic operator's name; an unchecked one is", async () => {
