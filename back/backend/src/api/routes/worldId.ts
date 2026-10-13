@@ -417,11 +417,21 @@ export function mountWorldIdRoutes(app: Hono<{ Variables: AuthVars }>, deps: Api
   app.get("/world-id/me", requireAuth(deps.jwtSecret), (c) => {
     const tenantId = c.get("tenantId");
     const attestAvailable = Boolean(world.cfg.attestAction);
+    // `realHuman`: whether the legal-body doors' real-human gate accepts this row, by that gate's
+    // own predicate on those doors' environment, so a browser can tell before it spends a door.
+    // Absent where neither of those doors is mounted: the predicate then guards nothing.
+    const environment = deps.legalBodyOrders?.environment ?? deps.customerCompanies?.environment;
+    const gate =
+      environment === undefined
+        ? {}
+        : { realHuman: realHumanState(world, tenantId, environment).ok };
     const v = world.store.findByTenant(tenantId, world.cfg.action);
-    if (!v) return c.json({ verified: false, required: world.requireGuardian, attestAvailable });
+    if (!v)
+      return c.json({ verified: false, required: world.requireGuardian, attestAvailable, ...gate });
     return c.json({
       verified: true,
       required: world.requireGuardian,
+      ...gate,
       credential: v.credential,
       verifiedAt: v.verifiedAt,
       // The caller's own pseudonym. Safe to show them: it is scoped to this app and identifies
