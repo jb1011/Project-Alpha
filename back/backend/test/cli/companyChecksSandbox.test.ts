@@ -28,6 +28,7 @@ import { verificationStateOf } from "../../src/legalBody/attestation";
 import {
   type CustomerCompanyDeps,
   type CustomerStatementInput,
+  abandonCustomerCompany,
   createCustomerCompany,
   prepareCustomerStatement,
 } from "../../src/legalBody/customerCompany";
@@ -409,6 +410,8 @@ describe("company:reinstate on a sandbox deployment", () => {
     expect(output.recorded).toBe(true);
     expect(output.automaticPass).toBe(true);
     expect(output.check).toMatchObject({ result: "reinstated", operator: OPERATOR });
+    // The write prints the reinstated row and the flag, and nothing more.
+    expect(Object.keys(output).sort()).toEqual(["automaticPass", "check", "recorded"]);
     const list = checks.list(companyId);
     expect(list.map((c) => c.result)).toEqual(["passed", "revoked", "reinstated", "passed"]);
     expect(list.slice(0, 3)).toEqual([automatic, revoked, output.check]);
@@ -504,6 +507,26 @@ describe("company:reinstate on a sandbox deployment", () => {
       result: "passed",
       operator: SANDBOX_AUTOMATIC_OPERATOR,
     });
+  });
+
+  test("an abandoned sandbox customer company is reinstated alone: no automatic pass, no flag", async () => {
+    const companyId = await declare(sandboxDoors(), owner, SANDBOX_A);
+    const automatic = latestOf(companyId);
+    abandonCustomerCompany(sandboxDoors(), owner.address, companyId);
+    expect(companies.find(companyId)?.status).toBe("abandoned");
+    const revoked = await run<Recorded>(revokeCompany(companyId, String(automatic.checkId)));
+    const id = String(revoked.output.check.checkId);
+
+    const dry = await run<NotRecorded>(reinstateCompany(companyId, id, OPERATOR, false));
+    expect(dry.output.recorded).toBe(false);
+    expect(dry.output).not.toHaveProperty("automaticPass");
+
+    const { output, ops } = await run<Recorded>(reinstateCompany(companyId, id));
+    expect(output.recorded).toBe(true);
+    expect(output).not.toHaveProperty("automaticPass");
+    expect(checks.list(companyId)).toEqual([automatic, revoked.output.check, output.check]);
+    expect(latestOf(companyId).result).toBe("reinstated");
+    expect(ops).toHaveLength(1);
   });
 
   test("a company pinned to production is reinstated alone: no automatic pass, no flag", async () => {

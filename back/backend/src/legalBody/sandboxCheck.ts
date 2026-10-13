@@ -10,8 +10,9 @@ import { wyomingDate } from "../util/wyomingCalendar";
  * transaction: the company is orderable from its first read. The check examines nothing, and every
  * field says so: the operator is SANDBOX_AUTOMATIC_OPERATOR, the registry status and the registered
  * agent read `sandbox`, the control evidence is of kind `other`, and both evidence hashes are the
- * hash of one fixed sentence, never of a document. Its formation date is the Wyoming day of the
- * declaration, so the filing facts count the first annual report from that day.
+ * hash of one fixed sentence, never of a document. Its formation date is the Wyoming day the check
+ * is written (the declaration's day, or a reinstatement's), so the filing facts count the first
+ * annual report from that day.
  *
  * No column says "automatic": the operator's name is the one marker, and it means something only on
  * a sandbox deployment. On production that name proves nothing.

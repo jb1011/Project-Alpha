@@ -656,12 +656,14 @@ function revokeOrReinstate(
 
 /**
  * The automatic pass a reinstatement writes on a sandbox deployment: only for a company pinned to
- * the sandbox that has a declaration, i.e. a customer's company. Any other company waits for a
+ * the sandbox that has a declaration, i.e. a customer's company, and is not abandoned (an
+ * abandoned company takes no pass, as company:check refuses one). Any other company waits for a
  * new check, as on production. Like the declaration's own pass, it holds the company's test
  * number, so it is refused while another company holds a passed check for that number: once this
  * company was revoked, another may have declared it.
  */
 function automaticPassAgain(s: Stores, company: CompanyRecord): NewCompanyCheck | undefined {
+  if (company.status === "abandoned") return undefined;
   if (company.environment !== "sandbox") return undefined;
   const declaration = s.declarations.find(company.companyId);
   if (declaration === undefined) return undefined;
