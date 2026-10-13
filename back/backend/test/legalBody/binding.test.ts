@@ -14,6 +14,7 @@ import { type Address, type Hex, getAddress, keccak256, toHex } from "viem";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { LegalBodyChainPort } from "../../src/adapters/arc/legalBodyChain";
 import {
+  type BindingViewFacts,
   LEGAL_BODY_POINTER_KEY,
   checkBinding,
   nextBindingSchedule,
@@ -22,7 +23,11 @@ import {
 } from "../../src/legalBody/binding";
 import { type LegalBodyOrderDeps, createOrder } from "../../src/legalBody/orders";
 import { migrate, openDatabase } from "../../src/persistence/db";
-import type { BindingState, LegalBodyRecord } from "../../src/persistence/legalBodyRepository";
+import type {
+  BindingState,
+  BrokenReason,
+  LegalBodyRecord,
+} from "../../src/persistence/legalBodyRepository";
 import { sqliteUtcTimestamp } from "../../src/util/sqliteTime";
 import {
   ANVIL_ACCOUNT_2,
@@ -38,6 +43,7 @@ import {
   OTHER_FACTORY,
   TransportFailure,
   asChainPort,
+  bindingViewOf,
   customerCompany,
   fakeLinkChainMembers,
   legalBodyOrderDeps,
@@ -245,7 +251,7 @@ describe("checkBinding moves the row by what the pointer names", () => {
     // The broken schedule starts over: an hour, then doubling.
     expect(after.nextBindingCheckAt).toBe(clock + HOUR);
     expect(after.bindingCheckIntervalMs).toBe(2 * HOUR);
-    expect(toBindingView(after, "not_linked").intent).not.toBeNull();
+    expect(bindingViewOf(deps(), after).intent).not.toBeNull();
     expect(opsLines()).toEqual([
       expect.objectContaining({
         opslog: "legal_body_binding",
@@ -279,7 +285,7 @@ describe("checkBinding moves the row by what the pointer names", () => {
     expect(after.nextBindingCheckAt).toBeNull();
     expect(after.bindingCheckIntervalMs).toBeNull();
     expect(s.repo.listBindingDue(after, clock + 365 * DAY, 5)).toEqual([]);
-    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toBeNull();
+    expect(bindingViewOf(deps(), after).intent).toBeNull();
   });
 
   test("a linked body that is winding down is broken with winding_down, checked again in an hour, and carries no intent", async () => {
@@ -298,7 +304,7 @@ describe("checkBinding moves the row by what the pointer names", () => {
     expect(s.repo.listBindingDue(after, clock + HOUR, 5).map((r) => r.legalBodyId)).toEqual([
       row.legalBodyId,
     ]);
-    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toBeNull();
+    expect(bindingViewOf(deps(), after).intent).toBeNull();
   });
 
   test("a body broken while winding down stays on the broken schedule, and once its dissolution is vetoed (active again, the pointer passing) the next check links it", async () => {
@@ -506,7 +512,7 @@ describe("a body last found winding down has its status read again, at the same 
     ]);
     expect(after.nextBindingCheckAt).toBeNull();
     expect(after.bindingCheckIntervalMs).toBeNull();
-    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toBeNull();
+    expect(bindingViewOf(deps(), after).intent).toBeNull();
 
     expect(chain.head).toHaveBeenCalledTimes(1);
     expect(chain.linkedLegalBody).toHaveBeenCalledWith(BigInt(agentOf(row)), HEAD_NUMBER);
@@ -543,7 +549,7 @@ describe("a body last found winding down has its status read again, at the same 
     // Not started over: the row waits its two hours and doubles them.
     expect(after.nextBindingCheckAt).toBe(clock + 2 * HOUR);
     expect(after.bindingCheckIntervalMs).toBe(4 * HOUR);
-    expect(toBindingView(after, s.repo.latestBrokenReason(row.legalBodyId)).intent).toEqual({
+    expect(bindingViewOf(deps(), after).intent).toEqual({
       action: "setLegalBodyPointer",
       agentId: agentOf(row),
       body: bodyOf(row),
@@ -576,7 +582,7 @@ describe("a body last found winding down has its status read again, at the same 
     expect(after.bindingState).toBe("superseded");
     expect(s.repo.latestBrokenReason(row.legalBodyId)).toBe("dissolved");
     expect(after.nextBindingCheckAt).toBeNull();
-    expect(toBindingView(after, "dissolved").intent).toBeNull();
+    expect(bindingViewOf(deps(), after).intent).toBeNull();
   });
 
   test("a reason recorded since the break does not move it: the 30 days still count from the break", async () => {
@@ -1047,6 +1053,15 @@ function rowIn(bindingState: BindingState, over: Partial<LegalBodyRecord> = {}):
 
 const INTENT = { action: "setLegalBodyPointer", agentId: "42", body: BODY, chainId: CHAIN_ID };
 
+/** The facts a view of a row above is built with: the latest break as the test gives it, no
+ *  revocation, and no order in its place. */
+const facts = (brokenReason: BrokenReason | undefined): BindingViewFacts => ({
+  brokenReason: brokenReason ?? null,
+  revoked: false,
+  supersededBy: null,
+  replacedBy: null,
+});
+
 describe("pointerIntent and toBindingView", () => {
   test("the pointer's key is legalBody", () => {
     expect(LEGAL_BODY_POINTER_KEY).toBe("legalBody");
@@ -1060,33 +1075,41 @@ describe("pointerIntent and toBindingView", () => {
   ] as const)("a %s body (latest break: %s) carries the intent to point at it", (state, reason) => {
     const row = rowIn(state);
     expect(pointerIntent(row, reason)).toEqual(INTENT);
-    expect(toBindingView(row, reason)).toEqual({
+    expect(toBindingView(row, facts(reason))).toEqual({
       state,
       agentId: "42",
       bodyAddress: BODY,
       intent: INTENT,
       pointerSeenAt: row.pointerSeenAt,
       nextCheckAt: NOW + MINUTE,
+      brokenReason: reason ?? null,
+      revoked: false,
+      supersededBy: null,
+      replacedBy: null,
     });
   });
 
   test("a superseded body that was linked once carries the intent too", () => {
     const row = rowIn("superseded", { pointerSeenAt: NOW_S - 600 });
     expect(pointerIntent(row, "not_linked")).toEqual(INTENT);
-    expect(toBindingView(row, "not_linked").pointerSeenAt).toBe(NOW_S - 600);
+    expect(toBindingView(row, facts("not_linked")).pointerSeenAt).toBe(NOW_S - 600);
   });
 
   test("a body winding down or dissolved carries no intent: writing a pointer would not link it", () => {
     for (const row of [rowIn("broken"), rowIn("superseded", { pointerSeenAt: NOW_S - 600 })])
-      for (const reason of ["winding_down", "dissolved"]) {
+      for (const reason of ["winding_down", "dissolved"] as const) {
         expect(pointerIntent(row, reason), `${row.bindingState} ${reason}`).toBeUndefined();
-        expect(toBindingView(row, reason), `${row.bindingState} ${reason}`).toEqual({
+        expect(toBindingView(row, facts(reason)), `${row.bindingState} ${reason}`).toEqual({
           state: row.bindingState,
           agentId: "42",
           bodyAddress: BODY,
           intent: null,
           pointerSeenAt: NOW_S - 600,
           nextCheckAt: NOW + MINUTE,
+          brokenReason: reason,
+          revoked: false,
+          supersededBy: null,
+          replacedBy: null,
         });
       }
   });
@@ -1094,13 +1117,17 @@ describe("pointerIntent and toBindingView", () => {
   test("a linked body carries no intent, and shows when its pointer was seen", () => {
     const row = rowIn("linked");
     expect(pointerIntent(row, undefined)).toBeUndefined();
-    expect(toBindingView(row, undefined)).toEqual({
+    expect(toBindingView(row, facts(undefined))).toEqual({
       state: "linked",
       agentId: "42",
       bodyAddress: BODY,
       intent: null,
       pointerSeenAt: NOW_S - 600,
       nextCheckAt: NOW + MINUTE,
+      brokenReason: null,
+      revoked: false,
+      supersededBy: null,
+      replacedBy: null,
     });
   });
 
@@ -1109,26 +1136,34 @@ describe("pointerIntent and toBindingView", () => {
     (state) => {
       const row = rowIn(state);
       expect(pointerIntent(row, undefined)).toBeUndefined();
-      expect(toBindingView(row, undefined)).toEqual({
+      expect(toBindingView(row, facts(undefined))).toEqual({
         state,
         agentId: row.agentId,
         bodyAddress: row.bodyAddress,
         intent: null,
         pointerSeenAt: null,
         nextCheckAt: row.nextBindingCheckAt,
+        brokenReason: null,
+        revoked: false,
+        supersededBy: null,
+        replacedBy: null,
       });
     },
   );
 
-  test("the view holds exactly its six fields, and serialises as it is", () => {
-    const view = toBindingView(rowIn("deployed"), undefined);
+  test("the view holds exactly its ten fields, and serialises as it is", () => {
+    const view = toBindingView(rowIn("deployed"), facts(undefined));
     expect(Object.keys(view).sort()).toEqual([
       "agentId",
       "bodyAddress",
+      "brokenReason",
       "intent",
       "nextCheckAt",
       "pointerSeenAt",
+      "replacedBy",
+      "revoked",
       "state",
+      "supersededBy",
     ]);
     expect(JSON.parse(JSON.stringify(view))).toEqual(view);
   });

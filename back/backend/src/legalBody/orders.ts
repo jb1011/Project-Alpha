@@ -10,7 +10,10 @@ import type { CompanyRepository } from "../persistence/companyRepository";
 import type { DocumentStore } from "../persistence/documentStore";
 import type {
   BindingState,
+  BrokenReason,
   Deployment,
+  LapseReason,
+  LegalBodyReasonReads,
   LegalBodyRecord,
   LegalBodyRepository,
 } from "../persistence/legalBodyRepository";
@@ -32,14 +35,15 @@ import { LEGAL_BODY_OPERATING_AGREEMENT } from "./texts/operatingAgreement";
  *  - the one boundary between a door and the chain (`chainCall`);
  *  - the doors' throttles (`takeDoorTokens`);
  *  - the one rule of which company may stand behind a body (`companyEligible`);
- *  - the order's view, which serialises as it is (no bigint).
+ *  - the order's view, which serialises as it is (no bigint), and the facts it carries beside the
+ *    row (`orderViewFacts`).
  *
  * A row made under another factory or chain than this deployment's is read-only here: it is
  * served, and every action on it answers 409 `other_deployment`.
  */
 
 export interface LegalBodyOrderDeps {
-  repo: LegalBodyRepository;
+  repo: LegalBodyRepository & LegalBodyReasonReads;
   companies: CompanyRepository;
   declarations: CompanyDeclarationRepository;
   checks: CompanyCheckRepository;
@@ -108,8 +112,62 @@ export function takeDoorTokens(deps: LegalBodyOrderDeps, tenantId: string): void
     throw refusal("rate_limited", 429);
 }
 
-/** An order as the API shows it: ids, hex, decimals and numbers, never a bigint. */
-export interface LegalBodyOrderView {
+/**
+ * What the event log and the company's declaration say about an order, beside its row: why it is
+ * in its state, and which company it is for. Each fact is read only for the states it can
+ * describe (`orderViewFacts`).
+ */
+export interface OrderViewFacts {
+  /** Why the reservation was closed without a body, for a `lapsed` order; null otherwise. */
+  lapseReason: LapseReason | null;
+  /**
+   * The reason of the latest break, for a body that is broken, or that was superseded after a
+   * break; null otherwise, and null for a stored reason this version does not know.
+   */
+  brokenReason: BrokenReason | null;
+  /** Whether an operator revoked the body. A revocation is never undone. */
+  revoked: boolean;
+  /** The id of the order that superseded this one, for a `superseded` order; null otherwise. */
+  supersededBy: string | null;
+  /** The id of the order whose body was linked in this one's place, when the latest break is
+   *  `replaced`; null otherwise. */
+  replacedBy: string | null;
+  /** The company name its declaration states; null when the declaration is missing. */
+  companyName: string | null;
+}
+
+/**
+ * The facts of `row`, read by state: the lapse only for `lapsed`, the latest break for `broken`
+ * and `superseded` (a superseded body that never broke has no break to read), the superseding
+ * order only for `superseded`; the revocation and the declaration always. So at most three reads
+ * of the event log and one of the declarations per row, which keeps a tenant's list cheap.
+ */
+export function orderViewFacts(
+  deps: {
+    repo: LegalBodyRepository & LegalBodyReasonReads;
+    declarations: CompanyDeclarationRepository;
+  },
+  row: LegalBodyRecord,
+): OrderViewFacts {
+  const id = row.legalBodyId;
+  const state = row.bindingState;
+  const lastBreak =
+    state === "broken" || state === "superseded" ? deps.repo.brokenDetail(id) : null;
+  return {
+    lapseReason: state === "lapsed" ? deps.repo.lapseReason(id) : null,
+    brokenReason: lastBreak?.reason ?? null,
+    revoked: deps.repo.isRevoked(id),
+    supersededBy: state === "superseded" ? deps.repo.supersededBy(id) : null,
+    replacedBy: lastBreak?.reason === "replaced" ? lastBreak.by : null,
+    companyName: deps.declarations.find(row.companyId)?.companyName ?? null,
+  };
+}
+
+/**
+ * An order as the API shows it: ids, hex, decimals and numbers, never a bigint. The facts
+ * (`OrderViewFacts`) follow `createdAt`, in their own order.
+ */
+export interface LegalBodyOrderView extends OrderViewFacts {
   id: string;
   publicId: string;
   companyId: string;
@@ -133,7 +191,8 @@ export interface LegalBodyOrderView {
   createdAt: string;
 }
 
-export function toOrderView(row: LegalBodyRecord): LegalBodyOrderView {
+/** The view of `row` with the facts given: the builder reads nothing itself. */
+export function toOrderView(row: LegalBodyRecord, facts: OrderViewFacts): LegalBodyOrderView {
   return {
     id: row.legalBodyId,
     publicId: row.publicId,
@@ -156,6 +215,14 @@ export function toOrderView(row: LegalBodyRecord): LegalBodyOrderView {
     pointerSeenAt: row.pointerSeenAt,
     // The stored text is UTC with no zone marker, which a reader would take for local time.
     createdAt: `${row.createdAt.replace(" ", "T")}Z`,
+    // Named one by one, not spread, so the view holds exactly these fields whatever object the
+    // facts come in.
+    lapseReason: facts.lapseReason,
+    brokenReason: facts.brokenReason,
+    revoked: facts.revoked,
+    supersededBy: facts.supersededBy,
+    replacedBy: facts.replacedBy,
+    companyName: facts.companyName,
   };
 }
 
@@ -255,7 +322,7 @@ export function createOrder(
     if (frozen === undefined) throw new Error(`legal body ${id} vanished inside its own order`);
     return frozen;
   });
-  return toOrderView(row);
+  return toOrderView(row, orderViewFacts(deps, row));
 }
 
 /** The tenant's order, or the uniform 404: unknown and not-yours get one answer, so no door is an
@@ -300,6 +367,6 @@ export async function abandonOrder(
       throw refusal("order_closed", 409);
     const abandoned = deps.repo.findById(row.legalBodyId);
     if (abandoned === undefined) throw new Error(`legal body ${row.legalBodyId} vanished`);
-    return toOrderView(abandoned);
+    return toOrderView(abandoned, orderViewFacts(deps, abandoned));
   });
 }

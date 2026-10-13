@@ -13,6 +13,7 @@ import {
   assertThisDeployment,
   createOrder,
   orderLockKey,
+  orderViewFacts,
   requireOwnedOrder,
   takeDoorTokens,
   toOrderView,
@@ -159,14 +160,20 @@ export function mountLegalBodyOrderRoutes(
   app.get("/legal-body-orders", (c) =>
     door("list", () => {
       const tenantId = realHuman(c.get("tenantId"));
-      return c.json({ orders: deps.repo.listByTenant(tenantId).map(toOrderView) });
+      // Each row's facts take at most three reads of its events and one of its declaration.
+      return c.json({
+        orders: deps.repo
+          .listByTenant(tenantId)
+          .map((row) => toOrderView(row, orderViewFacts(deps, row))),
+      });
     }),
   );
 
   app.get("/legal-body-orders/:id", (c) =>
     door("read", () => {
       const tenantId = realHuman(c.get("tenantId"));
-      return c.json(toOrderView(requireOwnedOrder(deps, tenantId, c.req.param("id"))));
+      const row = requireOwnedOrder(deps, tenantId, c.req.param("id"));
+      return c.json(toOrderView(row, orderViewFacts(deps, row)));
     }),
   );
 

@@ -22,12 +22,7 @@ import { ContractRevertError } from "../../src/adapters/arc/relay";
 import { linkOfRow } from "../../src/legalBody/create";
 import { offChainLinkDigest } from "../../src/legalBody/link";
 import { submitLinkAndCreate } from "../../src/legalBody/linkDoor";
-import {
-  type LegalBodyOrderDeps,
-  createOrder,
-  orderLockKey,
-  toOrderView,
-} from "../../src/legalBody/orders";
+import { type LegalBodyOrderDeps, createOrder, orderLockKey } from "../../src/legalBody/orders";
 import {
   RESOLVE_FIRST_INTERVAL_MS,
   RESOLVE_MAX_INTERVAL_MS,
@@ -55,6 +50,7 @@ import {
   legalBodyOrderDeps,
   linkFor,
   openLegalBodyStores,
+  orderViewOf,
   signedLink,
 } from "../helpers/legalBodyFixtures";
 
@@ -1055,7 +1051,7 @@ describe("a create that reverts on the door's second read", () => {
     const result = await submitThroughDoor(row);
 
     const after = rowOf(row.legalBodyId);
-    expect(result).toEqual({ status: "reserved", order: toOrderView(after) });
+    expect(result).toEqual({ status: "reserved", order: orderViewOf(deps(), after) });
     expect(s.repo.listDeploySubmissions(row.legalBodyId).map((sub) => sub.nonce)).toEqual([1, 0]);
     expect(chain.createOutcome).toHaveBeenCalledTimes(3);
     expect(chain.createdState).toHaveBeenCalledOnce();
@@ -1076,7 +1072,7 @@ describe("a create that reverts on the door's second read", () => {
     expect(result).toEqual({
       status: "refused",
       code: "order_lapsed",
-      order: toOrderView(after),
+      order: orderViewOf(deps(), after),
       detail: {},
     });
   });

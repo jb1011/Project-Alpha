@@ -4,7 +4,13 @@ import { ApiError } from "../errors";
 import { opsLog } from "../observability/opsLog";
 import type { BindingState, LegalBodyRecord } from "../persistence/legalBodyRepository";
 import { parseSqliteUtc } from "../util/sqliteTime";
-import { type LegalBodyOrderDeps, assertThisDeployment, requireOwnedOrder } from "./orders";
+import {
+  type LegalBodyOrderDeps,
+  type OrderViewFacts,
+  assertThisDeployment,
+  orderViewFacts,
+  requireOwnedOrder,
+} from "./orders";
 
 /**
  * THE BINDING CHECK: whether the identity's pointer names an order's body, and what follows.
@@ -74,8 +80,16 @@ export interface PointerIntent {
   chainId: number;
 }
 
-/** An order's binding as the API shows it: no bigint, no text read from the chain. */
-export interface BindingView {
+/** The facts of an order (`OrderViewFacts`) its binding carries: why it broke, and what took its
+ *  place. */
+export type BindingViewFacts = Pick<
+  OrderViewFacts,
+  "brokenReason" | "revoked" | "supersededBy" | "replacedBy"
+>;
+
+/** An order's binding as the API shows it: no bigint, no text read from the chain. The facts
+ *  (`BindingViewFacts`) follow `nextCheckAt`. */
+export interface BindingView extends BindingViewFacts {
   state: BindingState;
   /** A uint256 in decimal. */
   agentId: string | null;
@@ -209,17 +223,21 @@ export function nextBindingSchedule(
   return { nextAt: nowMs + waitMs, intervalMs: Math.min(waitMs * 2, capMs) };
 }
 
-export function toBindingView(
-  row: LegalBodyRecord,
-  latestBrokenReason: string | undefined,
-): BindingView {
+/** The binding of `row` with the facts given: the builder reads nothing itself. The pointer intent
+ *  reads the latest break from them. */
+export function toBindingView(row: LegalBodyRecord, facts: BindingViewFacts): BindingView {
   return {
     state: row.bindingState,
     agentId: row.agentId,
     bodyAddress: row.bodyAddress,
-    intent: pointerIntent(row, latestBrokenReason) ?? null,
+    intent: pointerIntent(row, facts.brokenReason ?? undefined) ?? null,
     pointerSeenAt: row.pointerSeenAt,
     nextCheckAt: row.nextBindingCheckAt,
+    // Named one by one, not spread: the facts may come as a whole `OrderViewFacts`.
+    brokenReason: facts.brokenReason,
+    revoked: facts.revoked,
+    supersededBy: facts.supersededBy,
+    replacedBy: facts.replacedBy,
   };
 }
 
@@ -231,7 +249,7 @@ export function toBindingView(
 export function readBinding(deps: LegalBodyOrderDeps, tenantId: Address, id: string): BindingView {
   assertRealHuman(deps.world, tenantId, deps.environment);
   const row = requireOwnedOrder(deps, tenantId, id);
-  return toBindingView(row, deps.repo.latestBrokenReason(row.legalBodyId));
+  return toBindingView(row, orderViewFacts(deps, row));
 }
 
 /** What the chain said, read at one block, and the move it calls for. */

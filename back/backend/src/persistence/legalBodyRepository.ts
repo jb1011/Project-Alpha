@@ -159,6 +159,16 @@ const LAPSE_REASONS: readonly LapseReason[] = [
   "refused_before_send",
 ];
 
+/**
+ * Why a linked body broke, as its `broken` event records it: the binding check writes the first
+ * three, one per status of the body, and `markLinked` writes `replaced` for the body it breaks.
+ */
+export const BROKEN_REASONS = ["not_linked", "winding_down", "dissolved", "replaced"] as const;
+export type BrokenReason = (typeof BROKEN_REASONS)[number];
+
+const isBrokenReason = (value: unknown): value is BrokenReason =>
+  (BROKEN_REASONS as readonly unknown[]).includes(value);
+
 /** One create transaction as it was recorded before it was sent (a `deploy_submitted` event). */
 export interface DeploySubmission {
   legalBodyId: string;
@@ -442,6 +452,23 @@ export interface LegalBodyPublicFinders {
   firstRevocationEventId(legalBodyId: string): number | null;
 }
 
+/**
+ * Read-only reads of the event log, for the views. A stored reason outside the union reads as none.
+ *
+ * Each reads the newest event of its kind, and only SELECTs. Kept apart from
+ * `LegalBodyRepository` for the reason `LegalBodyPublicFinders` is: a member added to that
+ * interface would have to be added to every implementation of it.
+ */
+export interface LegalBodyReasonReads {
+  /** The reason of the newest `lapsed` event, or null (none, or not a `LapseReason`). */
+  lapseReason(legalBodyId: string): LapseReason | null;
+  /** The newest `broken` event: its reason, and its `by` when that is text (else null). Null when
+   *  there is none, or when its reason is not a `BrokenReason`. */
+  brokenDetail(legalBodyId: string): { reason: BrokenReason; by: string | null } | null;
+  /** The `by` of the newest `superseded` event when it is text, or null. */
+  supersededBy(legalBodyId: string): string | null;
+}
+
 interface Row {
   legal_body_id: string;
   public_id: string;
@@ -692,7 +719,9 @@ const LINKABLE_STATES: readonly BindingState[] = ["deployed", "broken", "superse
 const LIVE_AGENT_CONFLICT = "legal_bodies.chain_id, legal_bodies.factory, legal_bodies.agent_id";
 const BODY_ADDRESS_CONFLICT = "index 'idx_legal_bodies_body'";
 
-export class SqliteLegalBodyRepository implements LegalBodyRepository, LegalBodyPublicFinders {
+export class SqliteLegalBodyRepository
+  implements LegalBodyRepository, LegalBodyPublicFinders, LegalBodyReasonReads
+{
   private readonly stmts;
 
   constructor(private readonly db: Database.Database) {
@@ -1381,6 +1410,22 @@ export class SqliteLegalBodyRepository implements LegalBodyRepository, LegalBody
     return (
       this.stmts.eventsOfKind.get({ legal_body_id: legalBodyId, kind: "revoked" }) !== undefined
     );
+  }
+
+  lapseReason(legalBodyId: string): LapseReason | null {
+    const reason = this.latestDetail(legalBodyId, "lapsed")?.reason;
+    return LAPSE_REASONS.includes(reason as LapseReason) ? (reason as LapseReason) : null;
+  }
+
+  brokenDetail(legalBodyId: string): { reason: BrokenReason; by: string | null } | null {
+    const detail = this.latestDetail(legalBodyId, "broken");
+    if (!isBrokenReason(detail?.reason)) return null;
+    return { reason: detail.reason, by: typeof detail.by === "string" ? detail.by : null };
+  }
+
+  supersededBy(legalBodyId: string): string | null {
+    const by = this.latestDetail(legalBodyId, "superseded")?.by;
+    return typeof by === "string" ? by : null;
   }
 
   hasOpenForCompany(companyId: string, nowMs: number): boolean {

@@ -16,7 +16,6 @@ import { type ApiDeps, buildApiApp } from "../../src/api/app";
 import { TokenBucket } from "../../src/api/routes/agentBook";
 import { bucketsByKey } from "../../src/api/routes/legalBodyOrders";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
-import { toBindingView } from "../../src/legalBody/binding";
 import { type LegalBodyOrderDeps, orderLockKey } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { withKeyedLock } from "../../src/payments/keyedMutex";
@@ -42,6 +41,7 @@ import {
   TransportFailure,
   answerOf,
   asChainPort,
+  bindingViewOf,
   call,
   customerCompany,
   fakeLinkChainMembers,
@@ -60,7 +60,18 @@ const MINUTE = 60_000;
 /** The block every fake head is at. */
 const HEAD_NUMBER = 9_000n;
 /** The fields of an order's binding as the API shows it, and of the pointer it invites. */
-const VIEW_KEYS = ["agentId", "bodyAddress", "intent", "nextCheckAt", "pointerSeenAt", "state"];
+const VIEW_KEYS = [
+  "agentId",
+  "bodyAddress",
+  "brokenReason",
+  "intent",
+  "nextCheckAt",
+  "pointerSeenAt",
+  "replacedBy",
+  "revoked",
+  "state",
+  "supersededBy",
+];
 const INTENT_KEYS = ["action", "agentId", "body", "chainId"];
 
 const bindingPath = (id: string) => `/legal-body-orders/${id}/binding`;
@@ -232,7 +243,7 @@ const agentOf = (row: LegalBodyRecord) => {
 };
 
 /** The view the doors should answer for the row as stored now. */
-const storedView = (id: string) => toBindingView(rowOf(id), s.repo.latestBrokenReason(id));
+const storedView = (id: string) => bindingViewOf(orderDeps(), rowOf(id));
 
 /** Every row and every event, to show that a request wrote nothing. */
 function snapshot() {
@@ -301,6 +312,10 @@ describe("the binding as stored", () => {
       },
       pointerSeenAt: null,
       nextCheckAt: row.nextBindingCheckAt,
+      brokenReason: null,
+      revoked: false,
+      supersededBy: null,
+      replacedBy: null,
     });
     expect(calledMembers()).toEqual([]);
   });

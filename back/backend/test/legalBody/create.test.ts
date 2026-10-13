@@ -39,7 +39,7 @@ import {
   createAfterReserve,
   submitLinkAndCreate,
 } from "../../src/legalBody/linkDoor";
-import { type LegalBodyOrderDeps, createOrder, toOrderView } from "../../src/legalBody/orders";
+import { type LegalBodyOrderDeps, createOrder } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -70,6 +70,7 @@ import {
   legalBodyOrderDeps,
   linkFor,
   openLegalBodyStores,
+  orderViewOf,
   sessionOf,
   signedLink,
 } from "../helpers/legalBodyFixtures";
@@ -326,7 +327,10 @@ describe("the order of effects, through a real LegalBodyChain", () => {
     expect(kinds.indexOf("link_accepted")).toBeGreaterThan(-1);
     expect(kinds.indexOf("link_accepted")).toBeLessThan(kinds.indexOf("deploy_submitted"));
     expect(kinds.indexOf("deploy_submitted")).toBeLessThan(kinds.indexOf("deployed"));
-    expect(result).toEqual({ status: "deployed", order: toOrderView(rowOf(row.legalBodyId)) });
+    expect(result).toEqual({
+      status: "deployed",
+      order: orderViewOf(deps(), rowOf(row.legalBodyId)),
+    });
   });
 
   test("a cap reached after the up-front count is caught inside record: nothing is recorded, nothing is sent, and the order stays reserved", async () => {
@@ -363,7 +367,7 @@ describe("the order of effects, through a real LegalBodyChain", () => {
       expect(s.repo.listDeploySubmissions(row.legalBodyId), cap).toEqual([]);
       expect(result, cap).toEqual({
         status: "reserved",
-        order: toOrderView(rowOf(row.legalBodyId)),
+        order: orderViewOf(deps(), rowOf(row.legalBodyId)),
       });
       expect(chain.createOutcome, cap).not.toHaveBeenCalled();
     }
@@ -387,7 +391,7 @@ describe("the door's wait for the receipt", () => {
     expect(after.deployedAt).toBe(DEPLOYED_AT);
     expect(after.nextBindingCheckAt).toBe(startedAt + DOOR_RECEIPT_INTERVAL_MS);
     expect(after.bindingCheckIntervalMs).toBe(60_000);
-    expect(result).toEqual({ status: "deployed", order: toOrderView(after) });
+    expect(result).toEqual({ status: "deployed", order: orderViewOf(deps(), after) });
     expect(sleep).toHaveBeenCalledOnce();
     expect(sleep).toHaveBeenCalledWith(DOOR_RECEIPT_INTERVAL_MS);
     expect(chain.createOutcome).toHaveBeenCalledTimes(2);
@@ -402,7 +406,7 @@ describe("the door's wait for the receipt", () => {
     const result = await submitFor(row);
 
     const after = rowOf(row.legalBodyId);
-    expect(result).toEqual({ status: "reserved", order: toOrderView(after) });
+    expect(result).toEqual({ status: "reserved", order: orderViewOf(deps(), after) });
     expect(after.bindingState).toBe("reserved");
     expect(s.repo.listDeploySubmissions(row.legalBodyId)).toHaveLength(1);
     expect(chain.createOutcome).toHaveBeenCalledTimes(DOOR_RECEIPT_READS);
@@ -422,7 +426,7 @@ describe("the door's wait for the receipt", () => {
     const result = await submitFor(row);
 
     const after = rowOf(row.legalBodyId);
-    expect(result).toEqual({ status: "reserved", order: toOrderView(after) });
+    expect(result).toEqual({ status: "reserved", order: orderViewOf(deps(), after) });
     expect(after.nextBindingCheckAt).toBe(startedAt + 30_000);
     expect(chain.createOutcome).toHaveBeenCalledOnce();
     expect(sleep).not.toHaveBeenCalled();
@@ -435,7 +439,7 @@ describe("the door's wait for the receipt", () => {
     const result = await submitFor(row);
 
     const after = rowOf(row.legalBodyId);
-    expect(result).toEqual({ status: "reserved", order: toOrderView(after) });
+    expect(result).toEqual({ status: "reserved", order: orderViewOf(deps(), after) });
     expect(JSON.stringify(result)).not.toContain("http");
     expect(lines.join("\n")).not.toContain("http");
     expect(opsLines()).toEqual([
@@ -478,7 +482,7 @@ describe("a refusal of the create before anything was sent", () => {
       expect(result, what).toEqual({
         status: "refused",
         code,
-        order: toOrderView(after),
+        order: orderViewOf(deps(), after),
         detail,
       });
       expect(result.order.state, what).toBe("lapsed");
@@ -510,7 +514,7 @@ describe("a refusal of the create before anything was sent", () => {
     expect(result).toEqual({
       status: "refused",
       code: "order_lapsed",
-      order: toOrderView(rowOf(row.legalBodyId)),
+      order: orderViewOf(deps(), rowOf(row.legalBodyId)),
       detail: {},
     });
     expect(s.repo.listDeploySubmissions(row.legalBodyId)).toEqual([]);
@@ -538,7 +542,7 @@ describe("a fault after the reserve", () => {
       const result = await submitFor(row);
 
       const after = rowOf(row.legalBodyId);
-      expect(result, what).toEqual({ status: "reserved", order: toOrderView(after) });
+      expect(result, what).toEqual({ status: "reserved", order: orderViewOf(deps(), after) });
       expect(JSON.stringify(result), what).not.toContain("http");
       expect(after.bindingState, what).toBe("reserved");
       expect(after.nextBindingCheckAt, what).toBe(startedAt);
@@ -641,7 +645,7 @@ describe("createAfterReserve: a cap reached at the create", () => {
       const result = await createAfterReserve(deps(over), row, Number(LINK_HEAD.timestamp));
 
       const after = rowOf(row.legalBodyId);
-      expect(result, cap).toEqual({ status: "reserved", order: toOrderView(after) });
+      expect(result, cap).toEqual({ status: "reserved", order: orderViewOf(deps(), after) });
       expect(after.bindingState, cap).toBe("reserved");
       expect(after.nextBindingCheckAt, cap).toBe(startedAt);
       expect(opsLines(), cap).toEqual([
@@ -721,7 +725,7 @@ describe("the link door on REST, with the create", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(toOrderView(rowOf(row.legalBodyId)));
+    expect(res.body).toEqual(orderViewOf(deps(), rowOf(row.legalBodyId)));
     expect(res.body.state).toBe("deployed");
   });
 
@@ -741,7 +745,7 @@ describe("the link door on REST, with the create", () => {
     );
 
     expect(res.status).toBe(202);
-    expect(res.body).toEqual(toOrderView(rowOf(row.legalBodyId)));
+    expect(res.body).toEqual(orderViewOf(deps(), rowOf(row.legalBodyId)));
     expect(res.body.state).toBe("reserved");
     expect(res.text).not.toContain("http");
     expect(lines.join("\n")).not.toContain("http");
@@ -767,7 +771,7 @@ describe("the link door on REST, with the create", () => {
       code: "bad_signature",
       message: `${LEGAL_BODY_SENTENCES.bad_signature} ${LEGAL_BODY_SENTENCES.order_lapsed}`,
       detail: {},
-      order: toOrderView(rowOf(row.legalBodyId)),
+      order: orderViewOf(deps(), rowOf(row.legalBodyId)),
     });
     expect(res.body.order.state).toBe("lapsed");
   });
@@ -796,7 +800,7 @@ describe("the link door on REST, with the create", () => {
 
       const after = rowOf(row.legalBodyId);
       expect(res.status, what).toBe(202);
-      expect(res.body, what).toEqual(toOrderView(after));
+      expect(res.body, what).toEqual(orderViewOf(deps(), after));
       expect(res.body.state, what).toBe("reserved");
       expect(res.text, what).not.toContain("http");
       expect(lines.join("\n"), what).not.toContain("http");
