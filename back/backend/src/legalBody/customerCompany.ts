@@ -9,6 +9,7 @@ import type { CompanyRepository } from "../persistence/companyRepository";
 import type { GuardianVerification } from "../persistence/worldStore";
 import { sqliteUtcTimestamp } from "../util/sqliteTime";
 import { CUSTOMER_PROVIDER } from "./provider";
+import { automaticSandboxCheck, isAutomaticSandboxCheck, processOsUser } from "./sandboxCheck";
 import {
   buildStatementMessage,
   statementDigest,
@@ -37,7 +38,9 @@ import type { StatementFields } from "./texts/statementOfAuthority";
  *  5. the human's company cap, when one is set;
  *  6. the tenant's caps: open customer companies, and declarations in the last 24 hours;
  *  7. the signature, checked by local recovery over the sentence the server renders itself.
- * Then ONE transaction writes the company and its declaration. It looks the statement up and counts
+ * Then ONE transaction writes the company and its declaration, and on a sandbox deployment the
+ * automatic check (`./sandboxCheck`): nobody is on duty there, so the declaration writes its own
+ * passed check, every field of which says it examined nothing. It looks the statement up and counts
  * the caps again first, because step 7 awaits and another request can have written meanwhile;
  * better-sqlite3 transactions are synchronous, so nothing else in this process runs between that
  * lookup and the inserts.
@@ -450,6 +453,18 @@ export async function createCustomerCompany(
       issuedAt: Number(issuedAt),
       synthetic,
     });
+    // A sandbox: the automatic check, in this same transaction, so the company is never read
+    // without it. Production writes nothing more: its operator checks the declaration.
+    if (deps.environment === "sandbox")
+      deps.checks.append(
+        automaticSandboxCheck({
+          companyId,
+          companyName: fields.companyName,
+          filingNumber: fields.filingNumber,
+          checkedAt: Math.floor(nowMs / 1000),
+          osUser: processOsUser(),
+        }),
+      );
     // No payment quote here: when one may be written is the payment flow's rule.
     return { companyId, created: true };
   });
@@ -471,9 +486,10 @@ function conflict(message: string): ApiError {
 
 /**
  * The tenant abandons its own customer company, while nobody has checked it, no payment is live or
- * settled and no legal body stands open on it. In one transaction, the status moves to `abandoned`
- * by compare-and-set from the one it has, and the declarant's personal data is erased; if either
- * fails, neither happens.
+ * settled and no legal body stands open on it. A sandbox's automatic check is evidence of nothing,
+ * so it does not keep a company; any check after it does. In one transaction, the status moves to
+ * `abandoned` by compare-and-set from the one it has, and the declarant's personal data is erased;
+ * if either fails, neither happens.
  *
  * An unknown company and another tenant's get one answer, 404: telling them apart would make this
  * an existence oracle over company ids. Every other refusal is a 409 `conflict`.
@@ -491,7 +507,8 @@ export function abandonCustomerCompany(
       throw conflict("only a declared company can be abandoned this way");
     if (company.status !== "draft" && company.status !== "ready")
       throw conflict("this company is already abandoned");
-    if (deps.checks.latest(companyId) !== undefined)
+    const latest = deps.checks.latest(companyId);
+    if (latest !== undefined && !isAutomaticSandboxCheck(latest, deps.environment))
       throw conflict("the operator has checked this company's declaration, so it is kept");
     if (deps.companies.hasLiveOrSettledPayment(companyId))
       throw conflict("this company has a payment, so it is kept");

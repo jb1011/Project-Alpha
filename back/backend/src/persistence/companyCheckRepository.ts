@@ -68,7 +68,7 @@ export interface CompanyCheckRepository {
   latest(companyId: string): CompanyCheck | undefined;
   /** Oldest first. */
   list(companyId: string): CompanyCheck[];
-  /** Another company whose LATEST check passed with this filing key. */
+  /** Another company, not abandoned, whose LATEST check passed with this filing key. */
   passedElsewhere(filingKey: string, exceptCompanyId: string): string | undefined;
 }
 
@@ -302,7 +302,9 @@ export class SqliteCompanyCheckRepository implements CompanyCheckRepository {
       ),
       list: db.prepare("SELECT * FROM company_checks WHERE company_id = ? ORDER BY check_id"),
       // A company counts only when the check carrying the key is its latest: one revoked, failed
-      // or reinstated since does not hold the filing any more.
+      // or reinstated since does not hold the filing any more. Nor does an abandoned company: a
+      // sandbox company abandoned with its automatic pass would otherwise hold its test number for
+      // ever. On production a company whose latest check passed is never abandoned.
       passedElsewhere: db.prepare(
         `SELECT c.company_id AS company_id FROM company_checks c
           WHERE c.filing_key = @filing_key
@@ -310,6 +312,8 @@ export class SqliteCompanyCheckRepository implements CompanyCheckRepository {
             AND c.company_id <> @except_company_id
             AND c.check_id = (SELECT MAX(l.check_id) FROM company_checks l
                                WHERE l.company_id = c.company_id)
+            AND NOT EXISTS (SELECT 1 FROM companies co
+                             WHERE co.company_id = c.company_id AND co.status = 'abandoned')
           ORDER BY c.check_id
           LIMIT 1`,
       ),

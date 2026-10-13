@@ -31,7 +31,7 @@ It does not name the guardian: `identityOwnerAtCreation` is the identity's owner
 
 | Value | Meaning |
 | --- | --- |
-| `active` | Every fact holds: the body is active on chain, the agent's identity points at it, the agreement hash on chain is the frozen one, a Novi operator's check of the LLC passed, the legal body is paid for, nothing is revoked, and no annual report is more than 60 days past due without a recorded filing. |
+| `active` | Every fact holds: the body is active on chain, the agent's identity points at it, the agreement hash on chain is the frozen one, a Novi operator's check of the LLC passed (on a sandbox deployment the check is automatic; see the sandbox note below), the legal body is paid for, nothing is revoked, and no annual report is more than 60 days past due without a recorded filing. |
 | `pending` | Something to establish is still missing: the operator's check of the LLC has not passed (or must be made again), or the legal body is not paid for yet. |
 | `unknown` | Novi cannot state `active` from what it holds: the agreement hash on chain differs from the frozen one, there is no formation date to count annual reports from, or a report is more than 60 days past due with no filing recorded. |
 | `inactive` | A recorded fact says no: the body is winding down or dissolved, the agent's identity no longer points at it or changed hands, or Novi has revoked it. |
@@ -269,7 +269,7 @@ A field that can be absent then holds a value it can never really take: the zero
 | `filingNumber` | The LLC's Wyoming filing number, on the same rule. | `""` |
 | `source` | `customer`: the owner brought an existing LLC. `novi`, for an LLC Novi formed, is in no statement today. | |
 | `environment` | `production` on a mainnet deployment, `sandbox` otherwise. A sandbox statement comes from a test deployment. | |
-| `controlVerified` | An operator saw evidence that the person who declared the LLC to Novi controls it. | `false` |
+| `controlVerified` | An operator saw evidence that the person who declared the LLC to Novi controls it (on a sandbox deployment the check is automatic; see the sandbox note below). | `false` |
 | `existenceCheckedAt` | When the operator's check that established the LLC was made, in unix seconds. | `0` |
 | `filedAt` | The LLC's formation date. | `""` |
 | `einIssued` | Always `false`: Novi does not check an EIN for an LLC its owner brought. | `false` |
@@ -286,6 +286,8 @@ A field that can be absent then holds a value it can never really take: the zero
 | `expiresAt` | `issuedAt + 300`. | |
 
 On a sandbox deployment (`environment: "sandbox"`), `guardianHumanVerified` can rest on a World ID verification made in a test environment.
+
+On a sandbox deployment the operator's check is automatic and checks nothing: `controlVerified`, `existenceCheckedAt`, `filedAt`, `filingStatus`, `lastFiledPeriod`, `lastFiledAt` and `nextDue` describe a test declaration, and `legalName` and `filingNumber` are what the declarant typed. A sandbox statement says nothing about any company.
 
 ## How to verify
 
