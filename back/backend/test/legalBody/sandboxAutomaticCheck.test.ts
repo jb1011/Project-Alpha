@@ -20,11 +20,14 @@ import {
   type CustomerCompanyDeps,
   type CustomerCompanyInput,
   type CustomerStatementInput,
+  STALE_CUSTOMER_SECONDS,
   SYNTHETIC_DECLARANT,
   abandonCustomerCompany,
   createCustomerCompany,
+  expireStaleCustomerCompanies,
   prepareCustomerStatement,
 } from "../../src/legalBody/customerCompany";
+import { acceptEvidence } from "../../src/legalBody/evidence";
 import { companyEligible, createOrder } from "../../src/legalBody/orders";
 import {
   SANDBOX_AUTOMATIC_OPERATOR,
@@ -41,8 +44,11 @@ import { statementForAgent } from "../../src/legalBody/statements";
 import { validateCompanyCheck } from "../../src/persistence/companyCheckRepository";
 import { filingKeyOf } from "../../src/persistence/companyDeclarationRepository";
 import { migrate, openDatabase } from "../../src/persistence/db";
+import { SqliteDocumentIndexRepository } from "../../src/persistence/documentIndexRepository";
+import { sqliteUtcTimestamp } from "../../src/util/sqliteTime";
 import { wyomingDate } from "../../src/util/wyomingCalendar";
 import {
+  ACTION,
   ANVIL_ACCOUNT_2,
   ANVIL_ACCOUNT_3,
   SANDBOX_TYPED,
@@ -51,6 +57,7 @@ import {
   recordHuman,
   sandboxCustomerCompanyDeps,
 } from "../helpers/customerCompanyFixtures";
+import { DeletableMemoryDocumentStore } from "../helpers/deletableDocumentStore";
 import {
   type LegalBodyStores,
   appendCheck,
@@ -474,5 +481,175 @@ describe("a filing number held by a passed check", () => {
     const next = await declare(sandbox(), second, SANDBOX_TYPED);
     expect(s.checks.passedElsewhere(key, "")).toBe(next);
     expect(s.checks.passedElsewhere(key, next)).toBeUndefined();
+  });
+});
+
+// ── The two other readers of "this company has a check" ────────────────────────────────────────
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** A cutoff a day after the test's clock: every company declared here was created before it. */
+const cutoffAfterCreation = (): string => sqliteUtcTimestamp(nowMs + DAY_MS);
+/** A cutoff a day before the test's clock: every company declared here was created after it. */
+const cutoffBeforeCreation = (): string => sqliteUtcTimestamp(nowMs - DAY_MS);
+
+/** Whether the stale rule takes the company at `cutoff`: in the listing, and in the one-company
+ *  re-read, which must agree. */
+function staleAt(companyId: string, cutoff: string): boolean {
+  const listed = s.companies
+    .listStaleCustomerCandidates(cutoff, 50)
+    .some((c) => c.companyId === companyId);
+  expect(s.companies.isStaleCustomerCandidate(companyId, cutoff), companyId).toBe(listed);
+  return listed;
+}
+
+/** The lifetime count of companies of the owner's human. */
+const ownerCount = (): number => s.store.countCompaniesForNullifier("1001", ACTION);
+
+describe("the stale sweep reads the automatic check as no check", () => {
+  test("a sandbox company with only its automatic check, created before the cutoff, is stale", async () => {
+    const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+    expect(staleAt(companyId, cutoffAfterCreation())).toBe(true);
+  });
+
+  test("the same company created after the cutoff is not stale", async () => {
+    const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+    expect(staleAt(companyId, cutoffBeforeCreation())).toBe(false);
+  });
+
+  test("a sandbox company whose latest check is an operator's pass is not stale", async () => {
+    const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+    appendCheck(s.checks, companyId, "passed");
+    expect(staleAt(companyId, cutoffAfterCreation())).toBe(false);
+  });
+
+  test("a production company whose check passed is not stale, even under the automatic operator's name; an unchecked one is", async () => {
+    const checked = await declare(production(), owner, PRODUCTION_TYPED);
+    appendCheck(s.checks, checked, "passed");
+    const named = await declare(production(), owner, {
+      ...PRODUCTION_TYPED,
+      filingNumber: "EX-0002",
+    });
+    s.checks.append(
+      automaticSandboxCheck({
+        companyId: named,
+        companyName: PRODUCTION_TYPED.companyName,
+        filingNumber: "EX-0002",
+        checkedAt: nowSeconds(),
+        osUser: "ops",
+      }),
+    );
+    const unchecked = await declare(production(), owner, {
+      ...PRODUCTION_TYPED,
+      filingNumber: "EX-0003",
+    });
+    const cutoff = cutoffAfterCreation();
+    expect(staleAt(checked, cutoff)).toBe(false);
+    expect(staleAt(named, cutoff)).toBe(false);
+    expect(staleAt(unchecked, cutoff)).toBe(true);
+  });
+
+  test("any upload keeps a sandbox company whose only check is automatic, as it keeps an unchecked one, even an upload older than that check", async () => {
+    const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+    const bytes = Buffer.from("%PDF-1.7\n% sandbox evidence\n%%EOF\n", "latin1");
+    const uploaded = acceptEvidence(
+      {
+        documents: new SqliteDocumentIndexRepository(db),
+        docStore: new DeletableMemoryDocumentStore(),
+      },
+      { companyId, kind: "existence", expectedSha256: sha256(bytes), bytes },
+    );
+    expect(uploaded.ok).toBe(true);
+    // Before the automatic check: had that check counted, no upload would have followed it.
+    db.prepare("UPDATE documents SET created_at = ? WHERE company_id = ?").run(
+      sqliteUtcTimestamp(nowMs - DAY_MS),
+      companyId,
+    );
+    expect(staleAt(companyId, cutoffAfterCreation())).toBe(false);
+  });
+
+  test("the sweep abandons an unused sandbox declaration and erases its declarant fields, as it does an unchecked one; after an operator's check the declaration stays", async () => {
+    const unused = await declare(sandbox(), owner, SANDBOX_TYPED);
+    // Another test number, made from the fixture's: each sandbox number has one holder.
+    const failed = await declare(sandbox(), second, {
+      ...SANDBOX_TYPED,
+      filingNumber: `${SANDBOX_TYPED.filingNumber}-2`,
+    });
+    appendCheck(s.checks, failed, "failed");
+    // A month and a day on: both are old, and the failed check is older than the cutoff.
+    const later = nowMs + STALE_CUSTOMER_SECONDS * 1000 + DAY_MS;
+    expect(
+      expireStaleCustomerCompanies(
+        {
+          companies: s.companies,
+          declarations: s.declarations,
+          checks: s.checks,
+          hasOpenLegalBody: () => false,
+          transaction: (fn) => db.transaction(fn)(),
+          now: () => later,
+        },
+        50,
+      ),
+    ).toBe(2);
+    expect(s.companies.find(unused)?.status).toBe("abandoned");
+    expect(s.declarations.find(unused)).toMatchObject({
+      declarantName: null,
+      signature: null,
+      piiErasedAt: Math.floor(later / 1000),
+    });
+    expect(s.companies.find(failed)?.status).toBe("abandoned");
+    expect(s.declarations.find(failed)).toMatchObject({
+      declarantName: SYNTHETIC_DECLARANT.name,
+      piiErasedAt: null,
+    });
+  });
+});
+
+describe("the lifetime count of a human's companies reads the automatic check as no check", () => {
+  test("a sandbox company abandoned with only its automatic check does not count", async () => {
+    const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+    abandonCustomerCompany(sandbox(), owner.address, companyId);
+    expect(ownerCount()).toBe(0);
+  });
+
+  test("a sandbox company abandoned after an operator's check counts", async () => {
+    const companyId = await declare(sandbox(), owner, SANDBOX_TYPED);
+    appendCheck(s.checks, companyId, "failed");
+    expect(s.companies.setStatus(companyId, "ready", "abandoned")).toBe(true);
+    expect(ownerCount()).toBe(1);
+  });
+
+  test("an open sandbox company counts", async () => {
+    await declare(sandbox(), owner, SANDBOX_TYPED);
+    expect(ownerCount()).toBe(1);
+  });
+
+  test("on production, as before: an abandoned company with a check counts, under any operator's name; one abandoned unchecked does not", async () => {
+    const checked = await declare(production(), owner, PRODUCTION_TYPED);
+    appendCheck(s.checks, checked, "failed");
+    expect(s.companies.setStatus(checked, "draft", "abandoned")).toBe(true);
+    expect(ownerCount()).toBe(1);
+
+    const named = await declare(production(), owner, {
+      ...PRODUCTION_TYPED,
+      filingNumber: "EX-0002",
+    });
+    s.checks.append(
+      automaticSandboxCheck({
+        companyId: named,
+        companyName: PRODUCTION_TYPED.companyName,
+        filingNumber: "EX-0002",
+        checkedAt: nowSeconds(),
+        osUser: "ops",
+      }),
+    );
+    expect(s.companies.setStatus(named, "draft", "abandoned")).toBe(true);
+    expect(ownerCount()).toBe(2);
+
+    const unchecked = await declare(production(), owner, {
+      ...PRODUCTION_TYPED,
+      filingNumber: "EX-0003",
+    });
+    abandonCustomerCompany(production(), owner.address, unchecked);
+    expect(ownerCount()).toBe(2);
   });
 });

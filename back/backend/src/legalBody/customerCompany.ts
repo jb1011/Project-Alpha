@@ -536,8 +536,9 @@ export const STALE_CUSTOMER_SECONDS = 30 * 24 * 3600;
  * again, since the company may have changed since the listing (an upload, a check, a payment, its
  * tenant's own abandonment); then the status moves to `abandoned` by compare-and-set from the one
  * it has, and a company that changed or lost the compare-and-set is skipped. The declarant's
- * personal fields are erased with it only when the company has no check at all: after a failed
- * check, the declaration is the evidence of what was declared and checked, and it stays.
+ * personal fields are erased with it only when the company has no check at all, a sandbox's
+ * automatic check counting as none (it examined nothing): after an operator's failed check, the
+ * declaration is the evidence of what was declared and checked, and it stays.
  *
  * A company whose transaction throws is left as it was and named in an ops line (its id only), and
  * the others still run: one bad row must not hold back every later sweep.
@@ -570,8 +571,9 @@ export function expireStaleCustomerCompanies(
         if (!deps.companies.setStatus(companyId, company.status, "abandoned")) return false;
         // Thrown, so the status change rolls back with it: an abandoned company must not keep a
         // declarant's personal data because its erasure failed.
+        const latest = deps.checks.latest(companyId);
         if (
-          deps.checks.latest(companyId) === undefined &&
+          (latest === undefined || isAutomaticSandboxCheck(latest, company.environment)) &&
           !deps.declarations.erasePii(companyId, atSeconds)
         )
           throw new Error(`company ${companyId}: its declaration could not be erased`);

@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { SANDBOX_AUTOMATIC_OPERATOR } from "../legalBody/sandboxCheck";
 
 /** A stored proof that a unique human verified for `action`. `nullifier` is the only identity
  *  datum World returns — stable per (human, rp, action), unlinkable across apps. */
@@ -274,19 +275,26 @@ export class SqliteWorldStore implements WorldStore {
     //
     // One exception: a customer's own declared company ('customer') that was abandoned before the
     // operator checked it. That is how a declaration with a typo is withdrawn, and it must not
-    // cost a lifetime slot. Once a check exists, the company counts, abandoned or not. The query
+    // cost a lifetime slot. Once a check exists, the company counts, abandoned or not. A sandbox's
+    // automatic check is not one: it examined nothing, so a company abandoned with no check but
+    // automatic ones is exempt too. A check is automatic when its operator is
+    // SANDBOX_AUTOMATIC_OPERATOR and the company's environment is 'sandbox' (the two-part test of
+    // `isAutomaticSandboxCheck`): the operator's name alone proves nothing on production. The query
     // reads `company_checks`, so it needs a migrated database.
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS n FROM companies c
          WHERE c.tenant_id IN (
-           SELECT tenant_id FROM guardian_verifications WHERE nullifier = ? AND action = ?
+           SELECT tenant_id FROM guardian_verifications
+            WHERE nullifier = @nullifier AND action = @action
          )
            AND NOT (c.provider = 'customer' AND c.status = 'abandoned'
                     AND NOT EXISTS (SELECT 1 FROM company_checks k
-                                     WHERE k.company_id = c.company_id))`,
+                                     WHERE k.company_id = c.company_id
+                                       AND NOT (c.environment = 'sandbox'
+                                                AND k.operator = @automatic_operator)))`,
       )
-      .get(nullifier, action) as { n: number };
+      .get({ nullifier, action, automatic_operator: SANDBOX_AUTOMATIC_OPERATOR }) as { n: number };
     return row.n;
   }
 
