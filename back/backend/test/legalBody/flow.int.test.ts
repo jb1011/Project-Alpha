@@ -162,7 +162,7 @@ const FIRST_GUARDIAN_INDEX = 10;
 const freshOwner = keyAt(1_000);
 
 const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
-const COMPANY_NAME = "Example Holdings LLC";
+const COMPANY_NAME = "Example Test Holdings LLC";
 /** The identity-metadata key the factory reads the pointer under, and the pointer's version. */
 const POINTER_KEY = "legalBody";
 const POINTER_VERSION = 1n;

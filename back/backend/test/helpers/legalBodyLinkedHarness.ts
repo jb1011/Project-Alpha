@@ -67,7 +67,7 @@ export function keyAt(addressIndex: number): PrivateKeyAccount {
 
 export const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
 /** The name every guardian here declares for its company. */
-export const COMPANY_NAME = "Example Holdings LLC";
+export const COMPANY_NAME = "Example Test Holdings LLC";
 /** The identity-metadata key the factory reads the pointer under, and the pointer's version. */
 const POINTER_KEY = "legalBody";
 const POINTER_VERSION = 1n;

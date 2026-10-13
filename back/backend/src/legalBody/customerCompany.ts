@@ -4,7 +4,10 @@ import { ApiError } from "../errors";
 import { NAME_CHARSET_SOURCE } from "../formation/intake";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
-import type { CompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
+import {
+  type CompanyDeclarationRepository,
+  filingKeyOf,
+} from "../persistence/companyDeclarationRepository";
 import type { CompanyRepository } from "../persistence/companyRepository";
 import type { GuardianVerification } from "../persistence/worldStore";
 import { sqliteUtcTimestamp } from "../util/sqliteTime";
@@ -35,18 +38,24 @@ import type { StatementFields } from "./texts/statementOfAuthority";
  *  4a. the same statement with the same signature, already used by this tenant, is answered with
  *     its company before any cap: a client that retries after a lost response must not be refused
  *     by the cap its own first request filled;
+ *  4b. on a sandbox, the test number is free: after 4a, so a retried request finds its own company
+ *     instead of being refused by the check its first request wrote, and with this same
+ *     statement's company left out, so a retry signed again goes on to the transaction's lookup;
  *  5. the human's company cap, when one is set;
  *  6. the tenant's caps: open customer companies, and declarations in the last 24 hours;
  *  7. the signature, checked by local recovery over the sentence the server renders itself.
  * Then ONE transaction writes the company and its declaration, and on a sandbox deployment the
  * automatic check (`./sandboxCheck`): nobody is on duty there, so the declaration writes its own
- * passed check, every field of which says it examined nothing. It looks the statement up and counts
- * the caps again first, because step 7 awaits and another request can have written meanwhile;
- * better-sqlite3 transactions are synchronous, so nothing else in this process runs between that
- * lookup and the inserts.
+ * passed check, every field of which says it examined nothing. It looks the statement up, checks
+ * the test number and counts the caps again first, because step 7 awaits and another request can
+ * have written meanwhile; better-sqlite3 transactions are synchronous, so nothing else in this
+ * process runs between that lookup and the inserts.
  *
- * The filing number is not unique here: two tenants may declare the same LLC, and the operator's
- * check decides.
+ * On production the filing number is not unique here: two tenants may declare the same LLC, and
+ * the operator's check decides. On a sandbox nobody decides, since the check is automatic, so a
+ * test number is declared once (step 4b, and at the statement door before anything is signed),
+ * and the company name must say it is a test, so a sandbox record cannot pass for a real
+ * company's.
  */
 
 /** The provider value of a customer's own company, defined in `./provider`. */
@@ -153,6 +162,12 @@ const COMPANY_NAME: TextRule = {
   chars: new RegExp(`^[${NAME_CHARSET_SOURCE}]+$`),
   charsProblem:
     "may hold only the characters a Wyoming entity name takes: A-Z, a-z, 0-9, spaces and & ' - , . ( ) +",
+};
+/** On a sandbox, a name that says it is a test, so a sandbox record cannot pass for a real
+ *  company's. */
+const SANDBOX_COMPANY_NAME: TextRule = {
+  ...COMPANY_NAME,
+  also: { pattern: /\btest\b/i, problem: "must say it is a test on this deployment" },
 };
 const FILING_NUMBER: TextRule = {
   min: 4,
@@ -274,7 +289,12 @@ function prepare<T>(
   const declarantTitle = sandbox
     ? SYNTHETIC_DECLARANT.title
     : applyTextRule("declarantTitle", body.declarantTitle, DECLARANT_TITLE, problems);
-  const companyName = applyTextRule("companyName", body.companyName, COMPANY_NAME, problems);
+  const companyName = applyTextRule(
+    "companyName",
+    body.companyName,
+    sandbox ? SANDBOX_COMPANY_NAME : COMPANY_NAME,
+    problems,
+  );
   const filingNumber = applyTextRule(
     "filingNumber",
     body.filingNumber,
@@ -310,13 +330,40 @@ function prepare<T>(
   };
 }
 
-/** Steps 1 to 4: the human, the texts, the synthetic rule, the fields. Used by both doors. */
+/**
+ * Step 4b. On a sandbox, a test number is declared once: refused while another company, not
+ * abandoned, holds a passed check for it as its latest. The sandbox's own automatic check is such
+ * a pass, so a sandbox company holds its number from its creation. Answered as a field refusal, so
+ * the person learns it before signing. Production refuses nothing here: its operator decides.
+ * `exceptCompanyId` is a company that does not count: the create door passes the company of this
+ * same statement, so a retry signed again is not refused by its own company's check.
+ */
+function assertSandboxNumberFree(
+  deps: CustomerCompanyDeps,
+  fields: StatementFields,
+  exceptCompanyId = "",
+): void {
+  if (deps.environment !== "sandbox") return;
+  if (deps.checks.passedElsewhere(filingKeyOf(fields.filingNumber), exceptCompanyId) === undefined)
+    return;
+  throw new ApiError("validation_error", 400, "some fields of the declaration are not valid", [
+    {
+      field: "filingNumber",
+      problem: "is already declared on this deployment: choose another test number",
+    },
+  ]);
+}
+
+/** Steps 1 to 4, then 4b: the human, the texts, the synthetic rule, the fields, and on a sandbox
+ *  the test number. The statement door; the create door runs the same steps, 4b after its
+ *  replay lookup. */
 export function prepareCustomerStatement(
   deps: CustomerCompanyDeps,
   tenantId: Address,
   input: CustomerStatementInput,
 ): { verification: GuardianVerification; fields: StatementFields } {
   const { verification, fields } = prepare(deps, tenantId, input, () => null);
+  assertSandboxNumberFree(deps, fields);
   return { verification, fields };
 }
 
@@ -385,6 +432,12 @@ export async function createCustomerCompany(
   if (replayed !== undefined && replayed.signature === signature)
     return { companyId: replayed.companyId, created: false };
 
+  // 4b. After the replay: a retried request must find its own company, not be refused by the
+  //     check its first request wrote. The same statement signed again (another signature string)
+  //     is not a replay here, so its company is left out: it goes on to step 7 and the
+  //     transaction's lookup, which answers that company.
+  assertSandboxNumberFree(deps, fields, replayed?.companyId ?? "");
+
   // 5 and 6.
   assertCaps(deps, tenantId, verification, nowMs);
 
@@ -419,6 +472,8 @@ export async function createCustomerCompany(
   const result = deps.transaction((): { companyId: string; created: boolean } => {
     const used = deps.declarations.findByDigest(tenantId, verdict.digest);
     if (used !== undefined) return { companyId: used.companyId, created: false };
+    // Again: two declarations of one number, both past 4b, must not both be written.
+    assertSandboxNumberFree(deps, fields);
     assertCaps(deps, tenantId, verification, nowMs);
     const companyId = deps.companies.create({
       tenantId,

@@ -53,7 +53,8 @@ export const APPROVED: LegalText<StatementFields> = {
 
 /** A declaration as a sandbox caller sends it: the synthetic flag, and no declarant. */
 export const SANDBOX_TYPED: CustomerStatementInput = {
-  companyName: "Example Holdings LLC",
+  // A sandbox name must say it is a test.
+  companyName: "Example Test Holdings LLC",
   filingNumber: "TEST-0001",
   synthetic: true,
 };

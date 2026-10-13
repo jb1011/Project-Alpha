@@ -432,7 +432,7 @@ describe("asking for the statement, signing it and creating the company", () => 
     expect(served.typedData.message).toMatchObject({
       declarantName: "Novi Sandbox Declarant",
       declarantTitle: "Manager",
-      companyName: "Example Holdings LLC",
+      companyName: "Example Test Holdings LLC",
       filingNumber: "TEST-0001",
     });
 
