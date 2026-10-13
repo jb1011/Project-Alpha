@@ -5,9 +5,10 @@ import type Database from "better-sqlite3";
 import type { Command } from "commander";
 import { config as loadDotenv } from "dotenv";
 import type { Hex } from "viem";
-import { loadConfig } from "../config/env";
+import { type Config, legalBodyEnvironment, loadConfig } from "../config/env";
 import { dueDates } from "../legalBody/filings";
 import { CUSTOMER_PROVIDER } from "../legalBody/provider";
+import { SANDBOX_AUTOMATIC_OPERATOR, automaticSandboxCheck } from "../legalBody/sandboxCheck";
 import { opsLog } from "../observability/opsLog";
 import {
   type CheckReasonCode,
@@ -42,9 +43,9 @@ import { isCalendarDate, wyomingDate } from "../util/wyomingCalendar";
  *  - `--expect-latest` names the company's latest check (or `none`), so a command typed against a
  *    view another operator has since changed, or replayed from the shell history, is refused;
  *  - the rules and the write run in ONE immediate transaction, so nothing lands between them;
- *  - the one ops line carries ids, the result, the reason code and the operator: never a name, a
- *    registry value or a reason's text. `company:show` writes no ops line at all, and is the only
- *    command that prints a declarant's name.
+ *  - each row written has one ops line, which carries ids, the result, the reason code and the
+ *    operator: never a name, a registry value or a reason's text. `company:show` writes no ops
+ *    line at all, and is the only command that prints a declarant's name.
  *
  * Check rows and legal-body events are kept for ever: a reason must hold no personal data, and the
  * registered agent is recorded by name only.
@@ -54,6 +55,8 @@ import { isCalendarDate, wyomingDate } from "../util/wyomingCalendar";
 const REASON_HELP = "why, at most 300 characters; kept for ever, so no personal data";
 const EXPECT_LATEST_HELP =
   "the company's latest check id, as company:show prints it, or none when it has no check";
+/** What `company:check` adds to it: a sandbox declaration is checked at once, so `none` is stale. */
+const CHECK_EXPECT_LATEST_HELP = `${EXPECT_LATEST_HELP}; on a sandbox deployment the latest check is the automatic one`;
 
 const OPERATOR_NAME = /^[a-z0-9._-]{2,40}$/;
 const CHECK_ID = /^[1-9][0-9]{0,15}$/;
@@ -120,8 +123,12 @@ function refuse(message: string): never {
   throw new Error(`refusing: ${message}`);
 }
 
+/** An operator's name. The sandbox's automatic check has a name of its own, which no operator
+ *  may type: a row under it would read as a check nobody made. */
 function parseOperator(value: string): string {
   if (!OPERATOR_NAME.test(value)) refuse(`--operator must match ${OPERATOR_NAME.source}`);
+  if (value === SANDBOX_AUTOMATIC_OPERATOR)
+    refuse(`--operator ${SANDBOX_AUTOMATIC_OPERATOR} is reserved for the sandbox's own check`);
   return value;
 }
 
@@ -183,14 +190,15 @@ interface Stores {
 
 /**
  * Opens the database the configuration names (never a path of its own: an operator who moved the
- * data directory must not open a different, empty database), runs `fn`, and closes it.
+ * data directory must not open a different, empty database), runs `fn`, and closes it. `fn` is
+ * handed the configuration too, for what the deployment decides.
  */
-function withDatabase<T>(fn: (db: Database.Database, docStoreDir: string) => T): T {
+function withDatabase<T>(fn: (db: Database.Database, docStoreDir: string, cfg: Config) => T): T {
   loadDotenv();
   const cfg = loadConfig();
   const db = openDatabase(cfg.dbPath);
   try {
-    return fn(db, cfg.docStoreDir);
+    return fn(db, cfg.docStoreDir, cfg);
   } finally {
     db.close();
   }
@@ -280,10 +288,29 @@ function assertControlEvidence(
     );
 }
 
+/** The refusal of a pass while another company holds a passed check for the same filing. */
+function refuseHeldElsewhere(elsewhere: string): never {
+  refuse(
+    `company ${elsewhere} holds a passed check for the same filing: resolve the dispute, and revoke one of the two (company:revoke) before this one can pass`,
+  );
+}
+
+/** The one ops line of a check written. Ids, the result, the reason code and the operator only. */
+function logRecorded(check: CompanyCheck): void {
+  opsLog("company_check_recorded", {
+    companyId: check.companyId,
+    checkId: check.checkId,
+    result: check.result,
+    reasonCode: check.reasonCode,
+    operator: check.operator,
+  });
+}
+
 /**
  * The shared body of the four check commands: in ONE immediate transaction, the company, the rules
  * that read only the company, the latest check against `--expect-latest`, the rules that read the
- * latest check, and (with `--yes`) the append. Then the ops line, and the output.
+ * latest check, the second row if any, and (with `--yes`) the append of the row, then of the second
+ * row. Then one ops line per row written, and the output.
  */
 function recordCheck<F>(p: {
   s: Stores;
@@ -297,6 +324,11 @@ function recordCheck<F>(p: {
   companyRules: (company: CompanyRecord) => F;
   /** Refusals that read the latest check too, once it is the one the operator expected. */
   stateRules?: (facts: F, latest: CompanyCheck | undefined) => void;
+  /** A second row, written right after the first in the same transaction: the sandbox's automatic
+   *  pass. Asked in the dry run too, after `stateRules`, and validated there, so a dry run refuses
+   *  whatever the write would; appended only with `--yes`. It may refuse. When it returns a row,
+   *  the output says `automaticPass: true`. */
+  alsoAppend?: (facts: F, latest: CompanyCheck | undefined) => NewCompanyCheck | undefined;
 }): void {
   const { s, row, expected, yes } = p;
   const advice = p.warning === undefined ? {} : { warning: p.warning };
@@ -309,11 +341,22 @@ function recordCheck<F>(p: {
       const latest = s.checks.latest(row.companyId);
       assertExpectedLatest(row.companyId, latest, expected);
       p.stateRules?.(facts, latest);
-      return { company, latest, appended: yes ? s.checks.append(row) : undefined };
+      const also = p.alsoAppend?.(facts, latest);
+      if (also !== undefined) validateCompanyCheck(also);
+      if (!yes) return { company, latest, also, appended: [] };
+      const first = s.checks.append(row);
+      return {
+        company,
+        latest,
+        also,
+        appended: also === undefined ? [first] : [first, s.checks.append(also)],
+      };
     })
     .immediate();
+  const automatic = found.also === undefined ? {} : { automaticPass: true };
 
-  if (found.appended === undefined) {
+  const [check, ...more] = found.appended;
+  if (check === undefined) {
     print({
       recorded: false,
       company: {
@@ -324,19 +367,14 @@ function recordCheck<F>(p: {
       latestCheck: found.latest ?? null,
       wouldRecord: row,
       ...advice,
+      ...automatic,
       next: "nothing was written: run the same command with --yes to record this",
     });
     return;
   }
-  const check = found.appended;
-  opsLog("company_check_recorded", {
-    companyId: check.companyId,
-    checkId: check.checkId,
-    result: check.result,
-    reasonCode: check.reasonCode,
-    operator: check.operator,
-  });
-  print({ recorded: true, check, ...advice });
+  logRecorded(check);
+  for (const extra of more) logRecorded(extra);
+  print({ recorded: true, check, ...advice, ...automatic });
 }
 
 // ── company:show ─────────────────────────────────────────────────────────────────────────────
@@ -549,10 +587,7 @@ function checkCompany(companyId: string, opts: CheckOptions): void {
           );
         assertControlEvidence(s, docStore, companyId, controlSha256);
         const elsewhere = s.checks.passedElsewhere(declaration.filingKey, companyId);
-        if (elsewhere !== undefined)
-          refuse(
-            `company ${elsewhere} holds a passed check for the same filing: resolve the dispute, and revoke one of the two (company:revoke) before this one can pass`,
-          );
+        if (elsewhere !== undefined) refuseHeldElsewhere(elsewhere);
       },
     });
   });
@@ -592,14 +627,15 @@ function revokeOrReinstate(
     reasonCode: null,
     reason: parseReason(opts.reason),
   };
-  withDatabase((db) =>
+  withDatabase((db, _docStoreDir, cfg) => {
+    const s = storesOf(db);
     recordCheck({
-      s: storesOf(db),
+      s,
       row,
       expected,
       yes: opts.yes === true,
       // Any provider: a company filed through formation can be revoked, and reinstated.
-      companyRules: () => undefined,
+      companyRules: (company) => company,
       stateRules:
         result === "reinstated"
           ? (_company, latest) => {
@@ -609,8 +645,35 @@ function revokeOrReinstate(
                 );
             }
           : undefined,
-    }),
-  );
+      // On a sandbox deployment nobody is on duty to check the company again, so a reinstated
+      // sandbox customer company passes again at once, as its declaration did.
+      ...(result === "reinstated" && legalBodyEnvironment(cfg) === "sandbox"
+        ? { alsoAppend: (company: CompanyRecord) => automaticPassAgain(s, company) }
+        : {}),
+    });
+  });
+}
+
+/**
+ * The automatic pass a reinstatement writes on a sandbox deployment: only for a company pinned to
+ * the sandbox that has a declaration, i.e. a customer's company. Any other company waits for a
+ * new check, as on production. Like the declaration's own pass, it holds the company's test
+ * number, so it is refused while another company holds a passed check for that number: once this
+ * company was revoked, another may have declared it.
+ */
+function automaticPassAgain(s: Stores, company: CompanyRecord): NewCompanyCheck | undefined {
+  if (company.environment !== "sandbox") return undefined;
+  const declaration = s.declarations.find(company.companyId);
+  if (declaration === undefined) return undefined;
+  const elsewhere = s.checks.passedElsewhere(declaration.filingKey, company.companyId);
+  if (elsewhere !== undefined) refuseHeldElsewhere(elsewhere);
+  return automaticSandboxCheck({
+    companyId: company.companyId,
+    companyName: declaration.companyName,
+    filingNumber: declaration.filingNumber,
+    checkedAt: nowSeconds(),
+    osUser: osUser(),
+  });
 }
 
 // ── legal-body:revoke ────────────────────────────────────────────────────────────────────────
@@ -684,7 +747,7 @@ export function registerCompanyCheckCommands(program: Command): void {
     )
     .requiredOption("--result <passed|failed>", "the outcome of the check")
     .requiredOption("--operator <name>", `who checked: ${OPERATOR_NAME.source}`)
-    .requiredOption("--expect-latest <checkId|none>", EXPECT_LATEST_HELP)
+    .requiredOption("--expect-latest <checkId|none>", CHECK_EXPECT_LATEST_HELP)
     .option("--registry-name <text>", "passed: the company's name as the registry shows it")
     .option("--registry-filing-id <text>", "passed: the filing id as the registry shows it")
     .option("--registry-status <text>", "passed: the status the registry shows")
