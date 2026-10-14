@@ -151,6 +151,8 @@ export function orderViewFacts(
 ): OrderViewFacts {
   const id = row.legalBodyId;
   const state = row.bindingState;
+  // Gated on the state where the binding gates on the leg (`pointerSeenAt`): the same rows, as only
+  // a row once linked holds a broken event and `pointer_seen_at` is never cleared.
   const lastBreak =
     state === "broken" || state === "superseded" ? deps.repo.brokenDetail(id) : null;
   return {

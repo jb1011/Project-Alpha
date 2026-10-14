@@ -400,7 +400,8 @@ export function buildApiApp(deps: ApiDeps) {
   // secrets, no addresses, nothing a caller couldn't learn by attempting an onboard.
   // The `legalBodies` section departs from this on purpose: it carries the chain id and two public
   // contract addresses, the identity registry and the factory, which every manifest and signed
-  // statement already carries, and nothing else: no key, no URL, no price, no attestor.
+  // statement already carries, and otherwise only booleans, the environment and the link window:
+  // no key, no URL, no price, no attestor.
   app.get("/config", (c) =>
     c.json({
       walletProviderDefault: deps.walletProviderDefault,

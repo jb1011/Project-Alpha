@@ -281,6 +281,24 @@ describe("orderViewFacts reads why from the event log", () => {
     });
   });
 
+  test("a lapsed event with a reason this version does not know reads as no lapse reason", () => {
+    const row = lapsed("deadline_passed");
+    expect(factsOf(row).lapseReason).toBe("deadline_passed");
+    // The lapse move refuses a reason it does not know, so the newer event is written as a later
+    // version would have stored it.
+    s.repo.recordEvent(row.legalBodyId, "lapsed", "system", null, {
+      reason: "struck_by_lightning",
+      blockTime: nowSeconds(),
+    });
+    expect(factsOf(rowOf(row.legalBodyId))).toMatchObject({ lapseReason: null });
+  });
+
+  test("a superseded event with a by that is not text reads as no superseding order", () => {
+    const row = deployed();
+    expect(s.repo.supersede(row.legalBodyId, 42 as unknown as string)).toBe(true);
+    expect(factsOf(rowOf(row.legalBodyId))).toMatchObject({ supersededBy: null });
+  });
+
   test("a superseded order carries the id of the order that superseded it, and no break when it never linked", () => {
     const newer = draft();
     const row = deployed();
