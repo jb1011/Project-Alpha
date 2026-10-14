@@ -19,8 +19,12 @@ import {
   acceptEvidence,
 } from "../../legalBody/evidence";
 import { CUSTOMER_PROVIDER } from "../../legalBody/provider";
-import { buildStatementMessage, statementTypedDataWire } from "../../legalBody/statement";
-import { LegalTextNotApprovedError } from "../../legalBody/texts/index";
+import {
+  type StatementTypedDataWire,
+  buildStatementMessage,
+  statementTypedDataWire,
+} from "../../legalBody/statement";
+import { LegalTextNotApprovedError, type LegalTextStatus } from "../../legalBody/texts/index";
 import type { CompanyRecord } from "../../persistence/companyRepository";
 import { readCappedStream } from "../../util/readStreamCapped";
 import type { ApiDeps } from "../app";
@@ -48,6 +52,14 @@ import { ApiError, readJson, requireOwnedCompany } from "../errors";
 /** The largest body a JSON door reads, in bytes. A declaration is a few hundred. The evidence door
  *  reads a file, not JSON, under its own cap, EVIDENCE_MAX_BYTES. */
 export const CUSTOMER_DOOR_MAX_BODY_BYTES = 8 * 1024;
+
+/** The statement-message door's answer: the statement to sign, as EIP-712 typed data in its
+ *  JSON-safe form, and the version and the status of its wording. */
+export interface StatementMessageAnswer {
+  typedData: StatementTypedDataWire;
+  wordingVersion: string;
+  textStatus: LegalTextStatus;
+}
 
 const EVIDENCE_KINDS: readonly EvidenceKind[] = ["existence", "control"];
 /** The sha256 parameter: 64 hexadecimal digits, with or without 0x, in either case. */
@@ -181,11 +193,12 @@ export function mountCustomerCompanyRoutes(
     // The server's clock, the one the create judges the statement's freshness by.
     const issuedAt = BigInt(Math.floor((cc.now ?? Date.now)() / 1000));
     const message = buildStatementMessage(fields, cc.text, issuedAt);
-    return c.json({
+    const answer: StatementMessageAnswer = {
       typedData: statementTypedDataWire(cc.chainId, cc.factory, message),
       wordingVersion: message.wordingVersion,
       textStatus: cc.text.status,
-    });
+    };
+    return c.json(answer);
   });
 
   /**
