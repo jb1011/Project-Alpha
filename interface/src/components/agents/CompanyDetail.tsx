@@ -44,7 +44,7 @@ export function CompanyDetail({ companyId }: { companyId: string }) {
           href="/agents/companies"
           className="text-[12px] text-muted transition-colors hover:text-ink"
         >
-          ← Legal bodies
+          ← Companies
         </Link>
       </div>
       {isPending && !message ? (

@@ -3,8 +3,8 @@
  *
  * On Arc, USDC is the gas token, and its native unit has 18 decimals on chain (the ERC-20 USDC
  * contract has 6; the native balance does not). wagmi hands this object to a wallet's
- * `wallet_addEthereumChain` when the wallet does not know the chain yet, and every native amount
- * the interface formats goes through the same `decimals`. A 6 here makes a wallet add the chain
+ * `wallet_addEthereumChain` when the wallet does not know the chain yet, and any native amount the
+ * interface formats would go through the same `decimals`. A 6 here makes a wallet add the chain
  * with the wrong unit, and turns one cent of gas into ten billion.
  */
 import { formatUnits } from "viem";

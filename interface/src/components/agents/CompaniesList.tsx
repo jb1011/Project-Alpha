@@ -41,11 +41,11 @@ export function CompaniesList() {
         <p className="py-12 text-center text-[13px] text-[#ff8a84]">{message}</p>
       ) : companies.length === 0 ? (
         <Card className="p-10 text-center">
-          <h2 className="text-[18px] font-medium text-ink">No legal bodies yet</h2>
+          <h2 className="text-[18px] font-medium text-ink">No companies yet</h2>
           <p className="mx-auto mt-2 max-w-md text-[13px] leading-[1.6] text-muted">
-            A company is created as part of onboarding an agent — the wizard&apos;s legal-body step
+            A company is created as part of onboarding an agent. The wizard&apos;s legal-body step
             collects the responsible person and files the LLC. Agents you add afterwards can attach
-            to the same company for free.
+            to the same company.
           </p>
           <Link
             href="/onboarding?new=1"

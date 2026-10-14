@@ -29,7 +29,7 @@ Other env vars (all optional, sensible testnet defaults in `src/lib/chain.ts` an
 `src/lib/api/config.ts`): `NEXT_PUBLIC_CHAIN_ID`, `NEXT_PUBLIC_ARC_RPC_URL`,
 `NEXT_PUBLIC_ARC_EXPLORER`, `NEXT_PUBLIC_SIWE_DOMAIN`, `NEXT_PUBLIC_MANAGER_ADDRESS`,
 `NEXT_PUBLIC_PUBLIC_API_ORIGIN` (the API's own origin for the two public legal-body reads;
-unset, they go through the proxy).
+unset, they follow `NEXT_PUBLIC_API_URL` (the proxy by default)).
 
 ## Layout
 

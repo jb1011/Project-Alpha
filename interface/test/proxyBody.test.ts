@@ -84,7 +84,8 @@ describe("the proxy forwards request bodies as bytes", () => {
       body: json,
       contentType: "application/json",
     });
-    expect(new TextDecoder().decode(seen.bytes)).toBe(json);
+    // Bytes, not decoded text: a decoder would silently drop a leading byte order mark.
+    expect(seen.bytes).toEqual(new TextEncoder().encode(json));
     expect(seen.contentType).toBe("application/json");
   });
 
