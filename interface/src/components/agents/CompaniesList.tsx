@@ -28,7 +28,7 @@ export function CompaniesList() {
     <>
       <div className="mb-6 flex flex-wrap items-baseline justify-between gap-3">
         <div>
-          <h1 className="text-[22px] font-medium text-ink">Legal bodies</h1>
+          <h1 className="text-[22px] font-medium text-ink">Companies</h1>
           <p className="mt-1 text-[13px] text-muted">
             The Wyoming LLCs your agents are filed under. One company can carry several agents.
           </p>

@@ -1,5 +1,12 @@
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "/backend";
 
+/**
+ * The API's own origin, for the two public legal-body reads only. They use it so the browser is
+ * its own caller to the public limiter, rather than the proxy calling for everyone at once.
+ * Everything authenticated keeps `API_URL`. Unset, this is `API_URL`.
+ */
+export const PUBLIC_API_ORIGIN = (process.env.NEXT_PUBLIC_PUBLIC_API_ORIGIN ?? API_URL).replace(/\/+$/, "");
+
 export const SIWE_DOMAIN =
   process.env.NEXT_PUBLIC_SIWE_DOMAIN ??
   (process.env.NODE_ENV === "production" ? "" : "localhost");
