@@ -169,7 +169,9 @@ export function isDocumentDownloadPath(joinedPath: string): boolean {
  * Paths whose responses must never be cached by anything between the backend and the browser.
  *
  * The connection package and the bootstrap response carry freshly minted credentials. Document
- * downloads carry legal documents belonging to one tenant. The backend already sets
+ * downloads carry legal documents belonging to one tenant. The legal-body order doors carry one
+ * tenant's orders and the typed data its person is about to sign, and the customer company doors
+ * carry a declaration and the statement message to be signed. The backend already sets
  * `Cache-Control: private, no-store` on documents; this is the second lock, because the proxy is
  * where an intermediary would otherwise be free to decide for itself.
  */
@@ -178,6 +180,10 @@ export function isNoStorePath(joinedPath: string): boolean {
     joinedPath === "connection-package" ||
     joinedPath === "bootstrap-connection" ||
     // companies/<companyId>/documents and companies/<companyId>/documents/<docId>
-    /^companies\/[^/]+\/documents(\/|$)/.test(joinedPath)
+    /^companies\/[^/]+\/documents(\/|$)/.test(joinedPath) ||
+    // legal-body-orders and everything under it: the list, one order, its link and its binding
+    /^legal-body-orders(\/|$)/.test(joinedPath) ||
+    // companies/customer and companies/customer/statement-message
+    /^companies\/customer(\/|$)/.test(joinedPath)
   );
 }

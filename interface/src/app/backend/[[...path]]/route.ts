@@ -50,7 +50,8 @@ async function proxy(
 
   const init: RequestInit = { method: req.method, headers };
   if (req.method !== "GET" && req.method !== "HEAD") {
-    init.body = await req.text();
+    // The bytes as they came: a text read decodes the body as UTF-8 and corrupts a binary upload.
+    init.body = await req.arrayBuffer();
   }
 
   // BOUNDED ON THE FIRST BYTE ONLY (2026-09-16). A backend that accepts the connection and then

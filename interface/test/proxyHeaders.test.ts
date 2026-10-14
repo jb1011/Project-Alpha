@@ -121,3 +121,18 @@ test("the reference route never picks up the DOCUMENT headers, or vice versa", (
   expect(isNoStorePath("companies/abc/documents/def")).toBe(true);
   expect(isNoStorePath("formation/rules")).toBe(false);
 });
+
+/* ── the legal-body doors ──────────────────────────────────────────────────── */
+
+test("no-store covers every legal-body order door and the customer company doors", () => {
+  // Tenant data, and typed data a person is about to sign: an intermediary must never hold either.
+  expect(isNoStorePath("legal-body-orders")).toBe(true);
+  expect(isNoStorePath("legal-body-orders/x")).toBe(true);
+  expect(isNoStorePath("legal-body-orders/x/binding/refresh")).toBe(true);
+  expect(isNoStorePath("companies/customer")).toBe(true);
+  expect(isNoStorePath("companies/customer/statement-message")).toBe(true);
+  // A company by id, the list, and the public by-agent read keep the ordinary policy.
+  expect(isNoStorePath("companies/x")).toBe(false);
+  expect(isNoStorePath("companies")).toBe(false);
+  expect(isNoStorePath("legal-bodies/by-agent/1")).toBe(false);
+});

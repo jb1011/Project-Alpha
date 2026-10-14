@@ -48,6 +48,18 @@ const BUDGETS: { method: string; pattern: RegExp; ms: number }[] = [
   { method: "POST", pattern: /^companies\/[^/]+\/payment\/(settle|cancel)$/, ms: BROADCAST_BUDGET_MS },
   { method: "POST", pattern: /^entities\/[^/]+\/agentbook\/register$/, ms: BROADCAST_BUDGET_MS },
   { method: "POST", pattern: /^entities\/[^/]+\/policy(\/execute)?$/, ms: RECEIPT_BUDGET_MS },
+  // The legal-body link door simulates on chain and then waits up to 5 seconds for a receipt; the
+  // binding refresh reads the chain; the gas seed broadcasts.
+  { method: "POST", pattern: /^legal-body-orders\/[^/]+\/link$/, ms: BROADCAST_BUDGET_MS },
+  {
+    method: "POST",
+    pattern: /^legal-body-orders\/[^/]+\/binding\/refresh$/,
+    ms: BROADCAST_BUDGET_MS,
+  },
+  { method: "POST", pattern: /^legal-body-orders\/[^/]+\/gas-seed$/, ms: BROADCAST_BUDGET_MS },
+  // An evidence upload is up to 4 MiB on what may be a slow uplink. Long, but finite: the backend
+  // answers only once the whole body is in, and `Infinity` would install no timer at all.
+  { method: "POST", pattern: /^companies\/[^/]+\/evidence$/, ms: RECEIPT_BUDGET_MS },
   // A document download hands back bytes and is the one call with no deadline: the budget exists
   // to end silent waits on a JSON API, not to cut a file off part-way.
   {

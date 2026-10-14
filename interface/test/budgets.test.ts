@@ -92,3 +92,36 @@ test("the CLIENT always waits longer than the proxy, so the proxy's answer is wh
   // Unbounded stays unbounded: Infinity + 5s is Infinity.
   expect(clientBudgetMs("GET", "companies/cmp_1/documents/doc_1")).toBe(Number.POSITIVE_INFINITY);
 });
+
+test("the legal-body link, binding refresh and gas seed get 60 seconds", () => {
+  // The link door simulates on chain and then waits for a receipt; the refresh reads the chain;
+  // the seed broadcasts.
+  expect(budgetMs("POST", "legal-body-orders/ord_1/link")).toBe(60_000);
+  expect(budgetMs("POST", "legal-body-orders/ord_1/binding/refresh")).toBe(60_000);
+  expect(budgetMs("POST", "legal-body-orders/ord_1/gas-seed")).toBe(60_000);
+});
+
+test("an evidence upload gets 240 seconds, a finite budget and never an unbounded one", () => {
+  // A 4 MiB upload on a slow uplink. Unbounded would install no timer at all.
+  expect(budgetMs("POST", "companies/cmp_1/evidence")).toBe(240_000);
+  expect(Number.isFinite(budgetMs("POST", "companies/cmp_1/evidence"))).toBe(true);
+});
+
+test("a GET on the legal-body and evidence paths keeps the default", () => {
+  for (const path of [
+    "legal-body-orders/ord_1/link",
+    "legal-body-orders/ord_1/binding/refresh",
+    "legal-body-orders/ord_1/gas-seed",
+    "companies/cmp_1/evidence",
+  ])
+    expect(budgetMs("GET", path), path).toBe(25_000);
+});
+
+test("the client waits 5 seconds longer on the legal-body and evidence paths too", () => {
+  expect(clientBudgetMs("POST", "legal-body-orders/ord_1/link")).toBe(65_000);
+  expect(clientBudgetMs("POST", "legal-body-orders/ord_1/binding/refresh")).toBe(65_000);
+  expect(clientBudgetMs("POST", "legal-body-orders/ord_1/gas-seed")).toBe(65_000);
+  expect(clientBudgetMs("POST", "companies/cmp_1/evidence")).toBe(245_000);
+  expect(clientBudgetMs("GET", "legal-body-orders/ord_1/link")).toBe(30_000);
+  expect(clientBudgetMs("GET", "companies/cmp_1/evidence")).toBe(30_000);
+});
