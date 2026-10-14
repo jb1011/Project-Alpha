@@ -737,7 +737,7 @@ test("production, charging: a declared company is uploaded, checked, paid, revok
   }
 });
 
-test("sandbox, not charging: a declared company is ready from its creation and active once its check passes; no agent attaches to it", async () => {
+test("sandbox, not charging: a declared company is ready and checked automatically from its creation, so it is active at once; no agent attaches to it", async () => {
   const d = deploy(false);
   recordHuman(d.store, guardian.address, "1001", Date.now());
   const token = await sessionOf();
@@ -756,21 +756,23 @@ test("sandbox, not charging: a declared company is ready from its creation and a
   expect((await call(d, "POST", requotePath(companyId), token)).status).toBe(404);
   await attachRefused(d, token, companyId);
 
-  const control = pdf("sandbox control evidence");
-  expect((await upload(d, token, companyId, "control", control)).status).toBe(201);
-  expect((await verificationSeen(d, token, companyId)).state).toBe("awaiting_check");
-  // Ready is not established: without a passed check the company is pending.
-  expect(standing(d, companyId)).toMatchObject({ state: "pending", established: false });
+  // The declaration wrote its own automatic check: verified from the first read, with no upload
+  // and no operator, and the check says what it is.
+  expect((await verificationSeen(d, token, companyId)).state).toBe("verified");
+  expect(standing(d, companyId)).toMatchObject({ state: "active", established: true });
 
   const shown = await operator(["company:show", companyId]);
   expect(shown.declaration).toMatchObject({
     declarantName: SYNTHETIC_DECLARANT.name,
     synthetic: true,
   });
-  const pass = await operator(passedCheck(companyId, shown.uploads[0].sha256, "none"));
-  expect(pass).toMatchObject({ recorded: true, check: { result: "passed" } });
-
-  expect((await verificationSeen(d, token, companyId)).state).toBe("verified");
-  expect(standing(d, companyId)).toMatchObject({ state: "active", established: true });
+  expect(shown.uploads).toEqual([]);
+  expect(shown.checks).toHaveLength(1);
+  expect(shown.checks[0]).toMatchObject({
+    result: "passed",
+    operator: "sandbox-automatic",
+    registryStatus: "sandbox",
+    registeredAgent: "sandbox",
+  });
   await attachRefused(d, token, companyId);
 });

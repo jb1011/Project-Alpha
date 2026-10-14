@@ -28,7 +28,6 @@ import {
   orderLockKey,
   requireOwnedOrder,
   takeDoorTokens,
-  toOrderView,
 } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES, refusal } from "../../src/legalBody/sentences";
 import { LEGAL_BODY_OPERATING_AGREEMENT } from "../../src/legalBody/texts/operatingAgreement";
@@ -57,6 +56,7 @@ import {
   customerCompany,
   legalBodyOrderDeps,
   openLegalBodyStores,
+  orderViewOf,
 } from "../helpers/legalBodyFixtures";
 
 /** Two verified humans, and one that never verified. */
@@ -180,7 +180,7 @@ describe("createOrder", () => {
     expect(row.amendmentDelay).toBe(172_800);
     expect(row.oaManifestHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(row.oaManifestVersion).toBe(1);
-    expect(view).toEqual(toOrderView(row));
+    expect(view).toEqual(orderViewOf(orderDeps(), row));
     expect(view.agreement).toEqual({ hash: row.oaManifestHash, version: 1 });
 
     // The move and the note: the system created and froze it, the tenant ordered it.
@@ -440,7 +440,7 @@ describe("abandonOrder", () => {
     const view = createOrder(deps, tenant, { companyId: company(tenant) });
     const after = await abandonOrder(deps, tenant, view.id);
     expect(after.state).toBe("abandoned");
-    expect(after).toEqual(toOrderView(rowOf(view.id)));
+    expect(after).toEqual(orderViewOf(deps, rowOf(view.id)));
     const last = s.repo.listEvents(view.id).at(-1);
     expect(last?.kind).toBe("abandoned");
     expect(last?.actor).toBe("tenant");
@@ -502,7 +502,7 @@ describe("abandonOrder", () => {
     });
     for (const row of [otherFactory, otherChain]) {
       const owned = requireOwnedOrder(deps, tenant, row.legalBodyId);
-      expect(toOrderView(owned).state).toBe("draft");
+      expect(orderViewOf(deps, owned).state).toBe("draft");
       const err = await refusedAsync(
         () => abandonOrder(deps, tenant, row.legalBodyId),
         "other_deployment",
@@ -552,7 +552,7 @@ describe("toOrderView", () => {
     reserve(view.id, 1_900_000_000);
     expect(s.repo.markDeployed(view.id, { txHash: H("c"), deployedAt: 1_800_000_000 })).toBe(true);
     const row = rowOf(view.id);
-    const deployed = toOrderView(row);
+    const deployed = orderViewOf(deps, row);
 
     for (const v of [view, deployed]) expect(JSON.parse(JSON.stringify(v))).toEqual(v);
     expect(Object.keys(deployed).sort()).toEqual(
@@ -574,6 +574,12 @@ describe("toOrderView", () => {
         "deployedAt",
         "pointerSeenAt",
         "createdAt",
+        "lapseReason",
+        "brokenReason",
+        "revoked",
+        "supersededBy",
+        "replacedBy",
+        "companyName",
       ].sort(),
     );
     expect(deployed).toMatchObject({

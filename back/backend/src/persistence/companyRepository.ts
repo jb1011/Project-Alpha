@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import type { DoolaEnvironment } from "../adapters/doola/types";
 import { INTAKE_FROZEN_SQL } from "../formation/freeze";
 import type { CompanyNameOption } from "../formation/intake";
+import { SANDBOX_AUTOMATIC_OPERATOR } from "../legalBody/sandboxCheck";
 
 /**
  * COMPANIES (design 2026-08-26 §2) — the row a filing belongs to, and the thing entities attach
@@ -146,6 +147,8 @@ export interface CompanyRepository {
    *  - it has no payment `quoted`, `settling`, `settled` or `refunded`;
    *  - it has no check, or its latest check `failed` and was recorded before `cutoffUtc`;
    *  - and no customer upload was made since its latest check (with no check, none at all).
+   * A latest check that is a sandbox's automatic one examined nothing: those two read it as none,
+   * unless the company ever had a deployed body (then it was used, and is kept).
    * So a company with an upload no check has followed is waiting for the operator and is never
    * stale, and neither is one whose latest check passed, revoked or reinstated it. Times are
    * compared at one-second resolution, and a check recorded in the same second as an upload is not
@@ -219,11 +222,24 @@ export interface CompanyRepository {
 }
 
 /**
+ * The latest check `l` of company `c` reads as no check: it is a sandbox's automatic one (its
+ * operator is `@automatic_operator`, SANDBOX_AUTOMATIC_OPERATOR, and the company is a sandbox one,
+ * the two-part test of `isAutomaticSandboxCheck`; the name alone proves nothing on production), and
+ * the company never had a deployed body. A body that deployed (`deployed_at` set: deployed, linked,
+ * broken or superseded, and write-once) means the company was used: a broken or superseded body
+ * can be linked again, so its company is not swept as an unused declaration.
+ */
+const LATEST_READS_AS_NO_CHECK = `c.environment = 'sandbox' AND l.operator = @automatic_operator
+  AND NOT EXISTS (SELECT 1 FROM legal_bodies b
+                   WHERE b.company_id = c.company_id AND b.deployed_at IS NOT NULL)`;
+
+/**
  * The stale-customer rule (`listStaleCustomerCandidates`), as one WHERE clause over `companies c`
- * taking `@cutoff`, so the listing and the one-company re-read cannot disagree. The latest check is
- * the one with the highest id, as everywhere else that reads `company_checks`. With no check, the
- * first subquery is NULL (stale so far) and the upload clause compares with '' (any upload keeps
- * the company).
+ * taking `@cutoff` and `@automatic_operator`, so the listing and the one-company re-read cannot
+ * disagree. The latest check is the one with the highest id, as everywhere else that reads
+ * `company_checks`. With no check, the first subquery is NULL (stale so far) and the upload clause
+ * compares with '' (any upload keeps the company). A latest check that is a sandbox's automatic
+ * one examined nothing, and both read it as no check while the company never had a deployed body.
  */
 const STALE_CUSTOMER_WHERE = `
       c.provider = 'customer'
@@ -232,14 +248,17 @@ const STALE_CUSTOMER_WHERE = `
   AND NOT EXISTS (SELECT 1 FROM formation_payments p
                    WHERE p.company_id = c.company_id
                      AND p.status IN ('quoted','settling','settled','refunded'))
-  AND IFNULL((SELECT l.result = 'failed' AND l.created_at < @cutoff
+  AND IFNULL((SELECT CASE WHEN ${LATEST_READS_AS_NO_CHECK} THEN NULL
+                          ELSE l.result = 'failed' AND l.created_at < @cutoff END
                 FROM company_checks l
                WHERE l.company_id = c.company_id
                ORDER BY l.check_id DESC LIMIT 1), 1) = 1
   AND NOT EXISTS (SELECT 1 FROM documents d
                    WHERE d.company_id = c.company_id
                      AND d.source = 'customer'
-                     AND d.created_at >= IFNULL((SELECT l.created_at FROM company_checks l
+                     AND d.created_at >= IFNULL((SELECT CASE WHEN ${LATEST_READS_AS_NO_CHECK}
+                                                             THEN NULL ELSE l.created_at END
+                                                   FROM company_checks l
                                                   WHERE l.company_id = c.company_id
                                                   ORDER BY l.check_id DESC LIMIT 1), ''))`;
 
@@ -426,14 +445,24 @@ export class SqliteCompanyRepository implements CompanyRepository {
     // Checked here because SQLite reads a negative LIMIT as no limit at all.
     if (!Number.isSafeInteger(limit) || limit < 1)
       throw new Error("companies: limit must be a positive whole number");
-    return (this.stale().list.all({ cutoff: cutoffUtc, limit }) as Row[]).map(toRecord);
+    return (
+      this.stale().list.all({
+        cutoff: cutoffUtc,
+        limit,
+        automatic_operator: SANDBOX_AUTOMATIC_OPERATOR,
+      }) as Row[]
+    ).map(toRecord);
   }
 
   isStaleCustomerCandidate(companyId: string, cutoffUtc: string): boolean {
     assertCutoff(cutoffUtc);
     return (
       (
-        this.stale().one.get({ company_id: companyId, cutoff: cutoffUtc }) as {
+        this.stale().one.get({
+          company_id: companyId,
+          cutoff: cutoffUtc,
+          automatic_operator: SANDBOX_AUTOMATIC_OPERATOR,
+        }) as {
           found: number;
         }
       ).found === 1

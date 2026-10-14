@@ -3,6 +3,7 @@ import { type Address, type Hex, getAddress, keccak256, toHex } from "viem";
 import { vi } from "vitest";
 import type { LegalBodyChainPort } from "../../src/adapters/arc/legalBodyChain";
 import { signSession } from "../../src/auth/session";
+import { type BindingView, toBindingView } from "../../src/legalBody/binding";
 import type { LinkChainPort } from "../../src/legalBody/checkLink";
 import { CUSTOMER_COMPANY_PLACEHOLDER } from "../../src/legalBody/customerCompany";
 import {
@@ -11,7 +12,12 @@ import {
   linkTypedDataWire,
   offChainLinkDigest,
 } from "../../src/legalBody/link";
-import type { LegalBodyOrderDeps } from "../../src/legalBody/orders";
+import {
+  type LegalBodyOrderDeps,
+  type LegalBodyOrderView,
+  orderViewFacts,
+  toOrderView,
+} from "../../src/legalBody/orders";
 import { CUSTOMER_PROVIDER } from "../../src/legalBody/provider";
 import {
   type CompanyCheckRepository,
@@ -121,6 +127,24 @@ export function legalBodyOrderDeps(
     sleep: async () => {},
     ...over,
   };
+}
+
+/** The order's view as a door answers it for the row as stored now, its facts read from the
+ *  stores. */
+export function orderViewOf(
+  deps: Pick<LegalBodyOrderDeps, "repo" | "declarations">,
+  row: LegalBodyRecord,
+): LegalBodyOrderView {
+  return toOrderView(row, orderViewFacts(deps, row));
+}
+
+/** The order's binding as a door answers it for the row as stored now, its facts read from the
+ *  stores. */
+export function bindingViewOf(
+  deps: Pick<LegalBodyOrderDeps, "repo" | "declarations">,
+  row: LegalBodyRecord,
+): BindingView {
+  return toBindingView(row, orderViewFacts(deps, row));
 }
 
 /** Appends a check with this result, as the operator records one. */

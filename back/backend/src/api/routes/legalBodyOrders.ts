@@ -13,12 +13,14 @@ import {
   assertThisDeployment,
   createOrder,
   orderLockKey,
+  orderViewFacts,
   requireOwnedOrder,
   takeDoorTokens,
   toOrderView,
 } from "../../legalBody/orders";
 import { resolveOrder } from "../../legalBody/resolver";
 import { refusal, refusedLinkSentence } from "../../legalBody/sentences";
+import type { LegalTextStatus } from "../../legalBody/texts/index";
 import { opsLog } from "../../observability/opsLog";
 import { withKeyedLock } from "../../payments/keyedMutex";
 import { ApiError, readJson } from "../errors";
@@ -75,6 +77,17 @@ import { assertRealHuman } from "./worldId";
 
 /** The largest body a JSON door reads, in bytes. An order is a few dozen. */
 export const LEGAL_BODY_DOOR_MAX_BODY_BYTES = 8 * 1024;
+
+/** The agreement door's answer: the stored terms and manifest, the hash the link signs, and the
+ *  id, version and status of the terms' wording. */
+export interface LegalBodyAgreementAnswer {
+  termsDoc: string;
+  manifest: string;
+  manifestHash: Hex;
+  textId: string;
+  textVersion: string;
+  textStatus: LegalTextStatus;
+}
 
 /** The most keys one of the doors' bucket maps holds before it forgets the least recently used. */
 export const DOOR_BUCKET_MAX_KEYS = 10_000;
@@ -159,14 +172,20 @@ export function mountLegalBodyOrderRoutes(
   app.get("/legal-body-orders", (c) =>
     door("list", () => {
       const tenantId = realHuman(c.get("tenantId"));
-      return c.json({ orders: deps.repo.listByTenant(tenantId).map(toOrderView) });
+      // Each row's facts take at most three reads of its events and one of its declaration.
+      return c.json({
+        orders: deps.repo
+          .listByTenant(tenantId)
+          .map((row) => toOrderView(row, orderViewFacts(deps, row))),
+      });
     }),
   );
 
   app.get("/legal-body-orders/:id", (c) =>
     door("read", () => {
       const tenantId = realHuman(c.get("tenantId"));
-      return c.json(toOrderView(requireOwnedOrder(deps, tenantId, c.req.param("id"))));
+      const row = requireOwnedOrder(deps, tenantId, c.req.param("id"));
+      return c.json(toOrderView(row, orderViewFacts(deps, row)));
     }),
   );
 
@@ -188,14 +207,15 @@ export function mountLegalBodyOrderRoutes(
       // manifest. A failure has already written its error line.
       const verified = readVerifiedAgreement(deps.docStore, row.legalBodyId, hash);
       if (verified === undefined) throw refusal("agreement_unreadable", 500);
-      return c.json({
+      const answer: LegalBodyAgreementAnswer = {
         termsDoc: verified.termsDoc,
         manifest: verified.manifest,
         manifestHash: hash,
         textId: verified.terms.textId,
         textVersion: verified.terms.textVersion,
         textStatus: verified.terms.textStatus,
-      });
+      };
+      return c.json(answer);
     }),
   );
 

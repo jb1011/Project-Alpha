@@ -18,7 +18,7 @@ import { bucketsByKey } from "../../src/api/routes/legalBodyOrders";
 import type { FormationPaymentConfig } from "../../src/formation/payment";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { agreementDocNames } from "../../src/legalBody/agreement";
-import { type LegalBodyOrderDeps, toOrderView } from "../../src/legalBody/orders";
+import type { LegalBodyOrderDeps, toOrderView } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { LEGAL_BODY_OPERATING_AGREEMENT } from "../../src/legalBody/texts/operatingAgreement";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
@@ -53,6 +53,7 @@ import {
   call,
   customerCompany,
   legalBodyOrderDeps,
+  orderViewOf,
   sessionOf,
 } from "../helpers/legalBodyFixtures";
 
@@ -275,7 +276,7 @@ describe("the doors", () => {
     const row = legalBodies.findById(res.body.id);
     expect(row).toBeDefined();
     if (!row) return;
-    expect(res.body).toEqual(toOrderView(row));
+    expect(res.body).toEqual(orderViewOf(orderDeps(), row));
     expect(res.body).toMatchObject({ companyId, state: "draft", guardian: owner.address });
     expect(res.body.agreement).toEqual({ hash: row.oaManifestHash, version: 1 });
   });
@@ -293,7 +294,7 @@ describe("the doors", () => {
       orders: [second.id, first.id].map((id) => {
         const row = legalBodies.findById(id);
         if (!row) throw new Error(`order ${id} is not stored`);
-        return toOrderView(row);
+        return orderViewOf(orderDeps(), row);
       }),
     });
   });
@@ -308,7 +309,7 @@ describe("the doors", () => {
     expect(res.status).toBe(200);
     const row = legalBodies.findById(view.id);
     if (!row) throw new Error("the order is not stored");
-    expect(res.body).toEqual(toOrderView(row));
+    expect(res.body).toEqual(orderViewOf(orderDeps(), row));
     expect(res.body.state).toBe("linked");
   });
 
@@ -373,7 +374,7 @@ describe("the doors", () => {
     expect(res.status).toBe(200);
     const row = legalBodies.findById(view.id);
     if (!row) throw new Error("the order is not stored");
-    expect(res.body).toEqual(toOrderView(row));
+    expect(res.body).toEqual(orderViewOf(orderDeps(), row));
     expect(res.body.state).toBe("abandoned");
     expect(legalBodies.listEvents(view.id).at(-1)).toMatchObject({
       kind: "abandoned",

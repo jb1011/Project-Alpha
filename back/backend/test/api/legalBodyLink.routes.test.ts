@@ -16,7 +16,7 @@ import {
 } from "../../src/adapters/arc/legalBodyChain";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
-import { type LegalBodyOrderDeps, toOrderView } from "../../src/legalBody/orders";
+import type { LegalBodyOrderDeps } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
 import { migrate, openDatabase } from "../../src/persistence/db";
@@ -48,6 +48,7 @@ import {
   legalBodyOrderDeps,
   linkFor,
   openLegalBodyStores,
+  orderViewOf,
   sessionOf,
   signedLink,
 } from "../helpers/legalBodyFixtures";
@@ -252,7 +253,7 @@ describe("the link doors", () => {
       }),
     );
     expect(linked.status).toBe(202);
-    expect(linked.body).toEqual(toOrderView(rowOf(row.legalBodyId)));
+    expect(linked.body).toEqual(orderViewOf(orderDeps(), rowOf(row.legalBodyId)));
     expect(linked.body.state).toBe("reserved");
     expect(rowOf(row.legalBodyId).linkSignature).toBe(signature.toLowerCase());
   });
@@ -282,7 +283,7 @@ describe("the link doors", () => {
         await call(app, "POST", linkPath(row.legalBodyId), token, signed),
       );
       expect(again.status).toBe(status);
-      expect(again.body).toEqual(toOrderView(rowOf(row.legalBodyId)));
+      expect(again.body).toEqual(orderViewOf(orderDeps(), rowOf(row.legalBodyId)));
       expect(snapshot()).toEqual(before);
     }
     expect(chain.estimateCreate).toHaveBeenCalledOnce();
@@ -307,7 +308,7 @@ describe("the link doors", () => {
         bodyAddress: expect.stringMatching(/^0x[0-9a-fA-F]{40}$/),
         gasEstimate: "30000000",
       },
-      order: toOrderView(row),
+      order: orderViewOf(orderDeps(), row),
     });
     expect(snapshot()).toEqual(before);
   });

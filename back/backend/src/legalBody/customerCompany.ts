@@ -4,11 +4,15 @@ import { ApiError } from "../errors";
 import { NAME_CHARSET_SOURCE } from "../formation/intake";
 import { opsLog } from "../observability/opsLog";
 import type { CompanyCheckRepository } from "../persistence/companyCheckRepository";
-import type { CompanyDeclarationRepository } from "../persistence/companyDeclarationRepository";
+import {
+  type CompanyDeclarationRepository,
+  filingKeyOf,
+} from "../persistence/companyDeclarationRepository";
 import type { CompanyRepository } from "../persistence/companyRepository";
 import type { GuardianVerification } from "../persistence/worldStore";
 import { sqliteUtcTimestamp } from "../util/sqliteTime";
 import { CUSTOMER_PROVIDER } from "./provider";
+import { automaticSandboxCheck, isAutomaticSandboxCheck, processOsUser } from "./sandboxCheck";
 import {
   buildStatementMessage,
   statementDigest,
@@ -34,16 +38,24 @@ import type { StatementFields } from "./texts/statementOfAuthority";
  *  4a. the same statement with the same signature, already used by this tenant, is answered with
  *     its company before any cap: a client that retries after a lost response must not be refused
  *     by the cap its own first request filled;
+ *  4b. on a sandbox, the test number is free: after 4a, so a retried request finds its own company
+ *     instead of being refused by the check its first request wrote, and with this same
+ *     statement's company left out, so a retry signed again goes on to the transaction's lookup;
  *  5. the human's company cap, when one is set;
  *  6. the tenant's caps: open customer companies, and declarations in the last 24 hours;
  *  7. the signature, checked by local recovery over the sentence the server renders itself.
- * Then ONE transaction writes the company and its declaration. It looks the statement up and counts
- * the caps again first, because step 7 awaits and another request can have written meanwhile;
- * better-sqlite3 transactions are synchronous, so nothing else in this process runs between that
- * lookup and the inserts.
+ * Then ONE transaction writes the company and its declaration, and on a sandbox deployment the
+ * automatic check (`./sandboxCheck`): nobody is on duty there, so the declaration writes its own
+ * passed check, every field of which says it examined nothing. It looks the statement up, checks
+ * the test number and counts the caps again first, because step 7 awaits and another request can
+ * have written meanwhile; better-sqlite3 transactions are synchronous, so nothing else in this
+ * process runs between that lookup and the inserts.
  *
- * The filing number is not unique here: two tenants may declare the same LLC, and the operator's
- * check decides.
+ * On production the filing number is not unique here: two tenants may declare the same LLC, and
+ * the operator's check decides. On a sandbox nobody decides, since the check is automatic, so a
+ * test number is declared once (step 4b, and at the statement door before anything is signed),
+ * and the company name must say it is a test, so a sandbox record cannot pass for a real
+ * company's.
  */
 
 /** The provider value of a customer's own company, defined in `./provider`. */
@@ -150,6 +162,12 @@ const COMPANY_NAME: TextRule = {
   chars: new RegExp(`^[${NAME_CHARSET_SOURCE}]+$`),
   charsProblem:
     "may hold only the characters a Wyoming entity name takes: A-Z, a-z, 0-9, spaces and & ' - , . ( ) +",
+};
+/** On a sandbox, a name that says it is a test, so a sandbox record cannot pass for a real
+ *  company's. */
+const SANDBOX_COMPANY_NAME: TextRule = {
+  ...COMPANY_NAME,
+  also: { pattern: /\btest\b/i, problem: "must say it is a test on this deployment" },
 };
 const FILING_NUMBER: TextRule = {
   min: 4,
@@ -271,7 +289,12 @@ function prepare<T>(
   const declarantTitle = sandbox
     ? SYNTHETIC_DECLARANT.title
     : applyTextRule("declarantTitle", body.declarantTitle, DECLARANT_TITLE, problems);
-  const companyName = applyTextRule("companyName", body.companyName, COMPANY_NAME, problems);
+  const companyName = applyTextRule(
+    "companyName",
+    body.companyName,
+    sandbox ? SANDBOX_COMPANY_NAME : COMPANY_NAME,
+    problems,
+  );
   const filingNumber = applyTextRule(
     "filingNumber",
     body.filingNumber,
@@ -307,13 +330,40 @@ function prepare<T>(
   };
 }
 
-/** Steps 1 to 4: the human, the texts, the synthetic rule, the fields. Used by both doors. */
+/**
+ * Step 4b. On a sandbox, a test number is declared once: refused while another company, not
+ * abandoned, holds a passed check for it as its latest. The sandbox's own automatic check is such
+ * a pass, so a sandbox company holds its number from its creation. Answered as a field refusal, so
+ * the person learns it before signing. Production refuses nothing here: its operator decides.
+ * `exceptCompanyId` is a company that does not count: the create door passes the company of this
+ * same statement, so a retry signed again is not refused by its own company's check.
+ */
+function assertSandboxNumberFree(
+  deps: CustomerCompanyDeps,
+  fields: StatementFields,
+  exceptCompanyId = "",
+): void {
+  if (deps.environment !== "sandbox") return;
+  if (deps.checks.passedElsewhere(filingKeyOf(fields.filingNumber), exceptCompanyId) === undefined)
+    return;
+  throw new ApiError("validation_error", 400, "some fields of the declaration are not valid", [
+    {
+      field: "filingNumber",
+      problem: "is already declared on this deployment: choose another test number",
+    },
+  ]);
+}
+
+/** Steps 1 to 4, then 4b: the human, the texts, the synthetic rule, the fields, and on a sandbox
+ *  the test number. The statement door; the create door runs the same steps, 4b after its
+ *  replay lookup. */
 export function prepareCustomerStatement(
   deps: CustomerCompanyDeps,
   tenantId: Address,
   input: CustomerStatementInput,
 ): { verification: GuardianVerification; fields: StatementFields } {
   const { verification, fields } = prepare(deps, tenantId, input, () => null);
+  assertSandboxNumberFree(deps, fields);
   return { verification, fields };
 }
 
@@ -382,6 +432,12 @@ export async function createCustomerCompany(
   if (replayed !== undefined && replayed.signature === signature)
     return { companyId: replayed.companyId, created: false };
 
+  // 4b. After the replay: a retried request must find its own company, not be refused by the
+  //     check its first request wrote. The same statement signed again (another signature string)
+  //     is not a replay here, so its company is left out: it goes on to step 7 and the
+  //     transaction's lookup, which answers that company.
+  assertSandboxNumberFree(deps, fields, replayed?.companyId ?? "");
+
   // 5 and 6.
   assertCaps(deps, tenantId, verification, nowMs);
 
@@ -416,6 +472,8 @@ export async function createCustomerCompany(
   const result = deps.transaction((): { companyId: string; created: boolean } => {
     const used = deps.declarations.findByDigest(tenantId, verdict.digest);
     if (used !== undefined) return { companyId: used.companyId, created: false };
+    // Again: two declarations of one number, both past 4b, must not both be written.
+    assertSandboxNumberFree(deps, fields);
     assertCaps(deps, tenantId, verification, nowMs);
     const companyId = deps.companies.create({
       tenantId,
@@ -450,6 +508,18 @@ export async function createCustomerCompany(
       issuedAt: Number(issuedAt),
       synthetic,
     });
+    // A sandbox: the automatic check, in this same transaction, so the company is never read
+    // without it. Production writes nothing more: its operator checks the declaration.
+    if (deps.environment === "sandbox")
+      deps.checks.append(
+        automaticSandboxCheck({
+          companyId,
+          companyName: fields.companyName,
+          filingNumber: fields.filingNumber,
+          checkedAt: Math.floor(nowMs / 1000),
+          osUser: processOsUser(),
+        }),
+      );
     // No payment quote here: when one may be written is the payment flow's rule.
     return { companyId, created: true };
   });
@@ -471,9 +541,11 @@ function conflict(message: string): ApiError {
 
 /**
  * The tenant abandons its own customer company, while nobody has checked it, no payment is live or
- * settled and no legal body stands open on it. In one transaction, the status moves to `abandoned`
- * by compare-and-set from the one it has, and the declarant's personal data is erased; if either
- * fails, neither happens.
+ * settled and no legal body stands open on it. A sandbox's automatic check is evidence of nothing,
+ * so it does not keep a company; any check after it does. Whether a check is the automatic one is
+ * read on the company's own environment, never the deployment's. In one transaction, the status
+ * moves to `abandoned` by compare-and-set from the one it has, and the declarant's personal data
+ * is erased; if either fails, neither happens.
  *
  * An unknown company and another tenant's get one answer, 404: telling them apart would make this
  * an existence oracle over company ids. Every other refusal is a 409 `conflict`.
@@ -491,7 +563,8 @@ export function abandonCustomerCompany(
       throw conflict("only a declared company can be abandoned this way");
     if (company.status !== "draft" && company.status !== "ready")
       throw conflict("this company is already abandoned");
-    if (deps.checks.latest(companyId) !== undefined)
+    const latest = deps.checks.latest(companyId);
+    if (latest !== undefined && !isAutomaticSandboxCheck(latest, company.environment))
       throw conflict("the operator has checked this company's declaration, so it is kept");
     if (deps.companies.hasLiveOrSettledPayment(companyId))
       throw conflict("this company has a payment, so it is kept");
@@ -519,8 +592,9 @@ export const STALE_CUSTOMER_SECONDS = 30 * 24 * 3600;
  * again, since the company may have changed since the listing (an upload, a check, a payment, its
  * tenant's own abandonment); then the status moves to `abandoned` by compare-and-set from the one
  * it has, and a company that changed or lost the compare-and-set is skipped. The declarant's
- * personal fields are erased with it only when the company has no check at all: after a failed
- * check, the declaration is the evidence of what was declared and checked, and it stays.
+ * personal fields are erased with it only when the company has no check at all, a sandbox's
+ * automatic check counting as none (it examined nothing): after an operator's failed check, the
+ * declaration is the evidence of what was declared and checked, and it stays.
  *
  * A company whose transaction throws is left as it was and named in an ops line (its id only), and
  * the others still run: one bad row must not hold back every later sweep.
@@ -553,8 +627,9 @@ export function expireStaleCustomerCompanies(
         if (!deps.companies.setStatus(companyId, company.status, "abandoned")) return false;
         // Thrown, so the status change rolls back with it: an abandoned company must not keep a
         // declarant's personal data because its erasure failed.
+        const latest = deps.checks.latest(companyId);
         if (
-          deps.checks.latest(companyId) === undefined &&
+          (latest === undefined || isAutomaticSandboxCheck(latest, company.environment)) &&
           !deps.declarations.erasePii(companyId, atSeconds)
         )
           throw new Error(`company ${companyId}: its declaration could not be erased`);

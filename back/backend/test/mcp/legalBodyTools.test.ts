@@ -22,7 +22,7 @@ import { ContractRevertError } from "../../src/adapters/arc/relay";
 import { type ApiDeps, buildApiApp } from "../../src/api/app";
 import { signSession } from "../../src/auth/session";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
-import { type LegalBodyOrderDeps, toOrderView } from "../../src/legalBody/orders";
+import type { LegalBodyOrderDeps } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { REAL_HUMAN_CHECK_CODES } from "../../src/mcp/server";
 import { type Capability, SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
@@ -57,6 +57,7 @@ import {
   legalBodyOrderDeps,
   linkFor,
   openLegalBodyStores,
+  orderViewOf,
   sessionOf,
   signedLink,
 } from "../helpers/legalBodyFixtures";
@@ -374,7 +375,12 @@ describe("each tool answers what its door answers for the same input", () => {
     expect(reserved.viaDoor.status).toBe(202);
     expect(reserved.viaTool.isError).toBe(false);
     expect(reserved.viaTool.body).toEqual({ status: "reserved", order: reserved.viaDoor.body });
-    expect(reserved.viaTool.body.order).toEqual(toOrderView(rowIn(reserved.tool, reserved.id)));
+    expect(reserved.viaTool.body.order).toEqual(
+      orderViewOf(
+        { repo: reserved.tool.s.repo, declarations: reserved.tool.s.declarations },
+        rowIn(reserved.tool, reserved.id),
+      ),
+    );
 
     const deployed = await linkedBothWays((chain) =>
       chain.createOutcome.mockImplementation(async (txHash, expected) =>
@@ -457,6 +463,10 @@ describe("each tool answers what its door answers for the same input", () => {
       },
       pointerSeenAt: null,
       nextCheckAt: deployed.nextBindingCheckAt,
+      brokenReason: null,
+      revoked: false,
+      supersededBy: null,
+      replacedBy: null,
     });
   });
 });

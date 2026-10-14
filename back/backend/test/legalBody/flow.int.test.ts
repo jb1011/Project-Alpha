@@ -162,7 +162,7 @@ const FIRST_GUARDIAN_INDEX = 10;
 const freshOwner = keyAt(1_000);
 
 const JWT_SECRET = "test-jwt-secret-that-is-long-enough-to-be-plausible";
-const COMPANY_NAME = "Example Holdings LLC";
+const COMPANY_NAME = "Example Test Holdings LLC";
 /** The identity-metadata key the factory reads the pointer under, and the pointer's version. */
 const POINTER_KEY = "legalBody";
 const POINTER_VERSION = 1n;
@@ -953,6 +953,10 @@ describe("an order becomes a linked body on a local chain", () => {
       },
       pointerSeenAt: null,
       nextCheckAt: expect.any(Number),
+      brokenReason: null,
+      revoked: false,
+      supersededBy: null,
+      replacedBy: null,
     });
     expect(deployed.nextCheckAt).toBeLessThanOrEqual(now());
 
@@ -1302,6 +1306,10 @@ describe("an agent that holds the identity owner's key, and the gas seed, on a l
         },
         pointerSeenAt: null,
         nextCheckAt: expect.any(Number),
+        brokenReason: null,
+        revoked: false,
+        supersededBy: null,
+        replacedBy: null,
       });
       expect(bound).toEqual(await binding(g, id));
       // The pointer the intent describes is the factory's own pointer for the body.

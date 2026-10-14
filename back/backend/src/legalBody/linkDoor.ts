@@ -34,6 +34,7 @@ import {
   chainCall,
   companyEligible,
   orderLockKey,
+  orderViewFacts,
   requireOwnedOrder,
   takeDoorTokens,
   toOrderView,
@@ -282,7 +283,7 @@ export async function submitLink(
     const orderId = row.legalBodyId;
     const state = row.bindingState;
     if (state === "reserved" || state === "deployed" || state === "linked")
-      return { status: state, order: toOrderView(row) };
+      return { status: state, order: toOrderView(row, orderViewFacts(deps, row)) };
     const agreementHash = assertLinkableDraft(deps, row, nowMs);
 
     // 3.
@@ -328,7 +329,7 @@ export async function submitLink(
       return {
         status: "refused",
         code: check.code,
-        order: toOrderView(row),
+        order: toOrderView(row, orderViewFacts(deps, row)),
         detail: detailOf(check),
       };
 
@@ -378,7 +379,7 @@ export async function submitLink(
           return {
             status: "refused",
             code: "agent_in_flight",
-            order: toOrderView(row),
+            order: toOrderView(row, orderViewFacts(deps, row)),
             detail: {},
           };
         case "body_taken":
@@ -581,7 +582,7 @@ function currentAnswer(
 ): LinkSubmitResult {
   const row = deps.repo.findById(orderId);
   if (row === undefined) throw new Error(`legal body ${orderId} vanished after its reserve`);
-  const order = toOrderView(row);
+  const order = toOrderView(row, orderViewFacts(deps, row));
   switch (row.bindingState) {
     case "reserved":
     case "deployed":

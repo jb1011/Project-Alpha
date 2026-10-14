@@ -40,7 +40,7 @@ import {
  */
 
 /** The three answers. The agent id is the canonical decimal the caller supplied. */
-type ByAgentAnswer =
+export type ByAgentAnswer =
   | { agentId: string; legalBody: false; standing: null; checkedAt: string }
   | {
       agentId: string;

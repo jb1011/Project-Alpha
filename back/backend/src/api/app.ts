@@ -7,6 +7,8 @@ import { COMPANY_REUSE_DISCLOSURE, PARK_COPY, SSN_COPY } from "../formation";
 import type { CustomerCompanyDeps } from "../legalBody/customerCompany";
 import type { EvidenceDeps } from "../legalBody/evidence";
 import type { GasSeedDeps } from "../legalBody/gasSeed";
+import { DEFAULT_LINK_TTL_SECONDS, MAX_SERVED_LINK_TTL_SECONDS } from "../legalBody/link";
+import { MIN_SERVED_LINK_TTL_SECONDS } from "../legalBody/linkDoor";
 import type { LegalBodyOrderDeps } from "../legalBody/orders";
 import type { LegalBodyStatementDeps } from "../legalBody/statements";
 import { mountMcpRoute } from "../mcp/transport";
@@ -315,6 +317,61 @@ export interface ApiDeps extends EntityViewDeps {
   };
 }
 
+/**
+ * What `/config` says about legal bodies on customer-owned identities: whether this deployment
+ * offers them, and the facts a client needs before sign-in to follow an order to its link.
+ *
+ * Every field is a projection of the deps that mount the doors, so the answer cannot offer a door
+ * that is not there. Public facts only: the chain id, and the identity registry and the factory,
+ * which every manifest and signed statement already carries. No key, no URL, no price, no attestor.
+ */
+export type LegalBodyConfig =
+  | { available: false }
+  | {
+      available: true;
+      /** The customer company doors (declare, abandon, upload evidence) are mounted. */
+      declarations: boolean;
+      /** The public statement by agent is mounted: it needs the attestation key. */
+      statements: boolean;
+      environment: "sandbox" | "production";
+      chainId: number;
+      identityRegistry: import("../types").Address;
+      factory: import("../types").Address;
+      /** The gas seed's amount is above zero. */
+      gasSeedOffered: boolean;
+      /** A new customer company lands `draft` and owes a payment. */
+      paymentRequired: boolean;
+      /** The link window a client may ask for, in seconds, counted from the chain's clock. */
+      linkTtl: { min: number; max: number; default: number };
+    };
+
+/** The `/config.legalBodies` answer of these deps. */
+export function legalBodyConfigOf(
+  deps: Pick<
+    ApiDeps,
+    "legalBodyOrders" | "customerCompanies" | "legalBodyStatements" | "legalBodyGasSeed"
+  >,
+): LegalBodyConfig {
+  const orders = deps.legalBodyOrders;
+  if (!orders) return { available: false };
+  return {
+    available: true,
+    declarations: Boolean(deps.customerCompanies),
+    statements: Boolean(deps.legalBodyStatements),
+    environment: orders.environment,
+    chainId: orders.deployment.chainId,
+    identityRegistry: orders.identityRegistry,
+    factory: orders.deployment.factory,
+    gasSeedOffered: (deps.legalBodyGasSeed?.amountWei ?? 0n) > 0n,
+    paymentRequired: deps.customerCompanies?.paymentRequired ?? false,
+    linkTtl: {
+      min: Number(MIN_SERVED_LINK_TTL_SECONDS),
+      max: Number(MAX_SERVED_LINK_TTL_SECONDS),
+      default: Number(DEFAULT_LINK_TTL_SECONDS),
+    },
+  };
+}
+
 /** Build the wizard REST API app: CORS + error envelope + /healthz. Routes mounted by later tasks. */
 export function buildApiApp(deps: ApiDeps) {
   const app = new Hono<{ Variables: AuthVars }>();
@@ -341,6 +398,10 @@ export function buildApiApp(deps: ApiDeps) {
   // cannot serve — without it, a UI defaulting to `circle` would 400 at submit on every
   // credential-less deployment (local dev, contributors, self-hosts). Booleans only: no
   // secrets, no addresses, nothing a caller couldn't learn by attempting an onboard.
+  // The `legalBodies` section departs from this on purpose: it carries the chain id and two public
+  // contract addresses, the identity registry and the factory, which every manifest and signed
+  // statement already carries, and otherwise only booleans, the environment and the link window:
+  // no key, no URL, no price, no attestor.
   app.get("/config", (c) =>
     c.json({
       walletProviderDefault: deps.walletProviderDefault,
@@ -393,6 +454,10 @@ export function buildApiApp(deps: ApiDeps) {
       // while a box with no key must not take the guardian through the whole World App flow and
       // then have nothing to broadcast.
       agentBookRegistrationAvailable: Boolean(deps.agentBook?.registrar),
+      // Whether and how this deployment offers legal bodies on customer-owned identities: a
+      // client learns the chain, the registry, the factory and the link window from here rather
+      // than from its own build. See `legalBodyConfigOf`.
+      legalBodies: legalBodyConfigOf(deps),
     }),
   );
   mountSchemaRoutes(app);

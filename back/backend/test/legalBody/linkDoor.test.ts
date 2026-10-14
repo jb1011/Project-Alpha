@@ -32,12 +32,7 @@ import {
   linkMessage,
   submitLink,
 } from "../../src/legalBody/linkDoor";
-import {
-  type LegalBodyOrderDeps,
-  createOrder,
-  orderLockKey,
-  toOrderView,
-} from "../../src/legalBody/orders";
+import { type LegalBodyOrderDeps, createOrder, orderLockKey } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import type { LegalText } from "../../src/legalBody/texts/index";
 import {
@@ -72,6 +67,7 @@ import {
   legalBodyOrderDeps,
   linkFor,
   openLegalBodyStores,
+  orderViewOf,
   signedLink,
 } from "../helpers/legalBodyFixtures";
 
@@ -179,7 +175,7 @@ function afterReserve() {
     create: vi.fn(
       async (row: LegalBodyRecord, _blockTime: number): Promise<LinkSubmitResult> => ({
         status: "reserved",
-        order: toOrderView(row),
+        order: orderViewOf(deps(), row),
       }),
     ),
   };
@@ -661,7 +657,7 @@ describe("submitLink: the accepted link", () => {
     // The block time is the head read after the check.
     expect(a.create).toHaveBeenCalledOnce();
     expect(a.create).toHaveBeenCalledWith(reserved, Number(LATER_HEAD.timestamp));
-    expect(result).toEqual({ status: "reserved", order: toOrderView(reserved) });
+    expect(result).toEqual({ status: "reserved", order: orderViewOf(deps(), reserved) });
   });
 
   test("a repeated submit on a reserved, deployed or linked order answers that state and reserves nothing", async () => {
@@ -697,7 +693,10 @@ describe("submitLink: the accepted link", () => {
         after: a,
         link: { deadline: LINK_HEAD.timestamp + 4_000n },
       });
-      expect(again, state).toEqual({ status: state, order: toOrderView(rowOf(row.legalBodyId)) });
+      expect(again, state).toEqual({
+        status: state,
+        order: orderViewOf(deps(), rowOf(row.legalBodyId)),
+      });
       expect(snapshot(), state).toEqual(before);
     }
     expect(a.create).toHaveBeenCalledOnce();
@@ -753,7 +752,7 @@ describe("submitLink: the accepted link", () => {
       submitLink(d, tenant, row.legalBodyId, signed, a),
       submitLink(d, tenant, row.legalBodyId, signed, a),
     ]);
-    const reserved = toOrderView(rowOf(row.legalBodyId));
+    const reserved = orderViewOf(deps(), rowOf(row.legalBodyId));
     expect(one).toEqual({ status: "reserved", order: reserved });
     expect(two).toEqual({ status: "reserved", order: reserved });
     expect(chain.estimateCreate).toHaveBeenCalledOnce();
@@ -786,7 +785,7 @@ describe("submitLink: the accepted link", () => {
 describe("submitLink: refusals before the reserve keep the draft", () => {
   test("each refusal of the check is answered with its code, the order and a detail of hex and decimals; the draft is kept and nothing is reserved", async () => {
     const row = draft();
-    const view = toOrderView(row);
+    const view = orderViewOf(deps(), row);
     const base = linkFor(row);
     const known = { identityOwner: owner.address, bodyAddress: predictedBody(base) };
     const cases: {
@@ -1131,7 +1130,7 @@ describe("submitLink: the give-way and the reserve, in one transaction", () => {
     expect(result).toEqual({
       status: "refused",
       code: "agent_in_flight",
-      order: toOrderView(mine),
+      order: orderViewOf(deps(), mine),
       detail: {},
     });
     expect(LEGAL_BODY_SENTENCES.agent_in_flight).toMatch(/^[A-Z].*\.$/);
