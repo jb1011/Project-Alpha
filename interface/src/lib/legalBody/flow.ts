@@ -114,8 +114,9 @@ export function isDraftExpired(order: LegalBodyOrderView, nowMs: number): boolea
 
 /**
  * An order the flow can still move: a draft under 24 hours, a body on its way, a body waiting for
- * its pointer, or a body whose pointer was cleared. A deployed body stays live past the backend's
- * 7-day open window: the pointer can still be written, and a refresh still links it.
+ * its pointer, or a body whose pointer was cleared and that was not revoked. A deployed body stays
+ * live past the backend's 7-day open window: the pointer can still be written, and a refresh
+ * still links it.
  */
 export function isLiveOrder(order: LegalBodyOrderView, nowMs: number): boolean {
   switch (order.state) {
@@ -126,7 +127,7 @@ export function isLiveOrder(order: LegalBodyOrderView, nowMs: number): boolean {
     case "deployed":
       return !order.revoked;
     case "broken":
-      return order.brokenReason === "not_linked";
+      return order.brokenReason === "not_linked" && !order.revoked;
     default:
       return false;
   }

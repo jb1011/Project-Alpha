@@ -1064,7 +1064,7 @@ export function apiErrorDetail(details: ApiErrorDetails | undefined): ApiErrorDe
 // test (`test/api/legalBodyInterfaceTypes.test.ts`) reads this file as text and compares each list
 // with the backend's own type, so keep each list's `export const NAME = [` opening and the
 // `] as const` that closes it. A key list is checked against the type here too: it cannot name a
-// key its view does not have.
+// key its view does not have, nor leave one out.
 // ---------------------------------------------------------------------------------------------
 
 /** An address as served, checksummed or not: compare addresses in lower case. */
@@ -1240,7 +1240,7 @@ export type LegalBodyOrderView = {
   createdAt: string;
   /** Why the reservation closed without a body, for a `lapsed` order; null otherwise. */
   lapseReason: LapseReason | null;
-  /** the reason of the latest break, for a body that is broken or was superseded after a break;
+  /** The reason of the latest break, for a body that is broken or was superseded after a break;
    *  the state decides what a screen does. Null otherwise. */
   brokenReason: BrokenReason | null;
   /** Whether an operator revoked the body. A revocation is never undone. */
@@ -1300,7 +1300,7 @@ export type BindingView = {
   pointerSeenAt: number | null;
   /** Unix MILLISECONDS: the next scheduled check (a schedule, not a chain time). */
   nextCheckAt: number | null;
-  /** the reason of the latest break, for a body that is broken or was superseded after a break;
+  /** The reason of the latest break, for a body that is broken or was superseded after a break;
    *  the state decides what a screen does. Null otherwise. */
   brokenReason: BrokenReason | null;
   revoked: boolean;
@@ -1511,3 +1511,15 @@ export const TRANSPARENCY_LEGAL_BODY_KEYS = [
   "linkedSince",
   "links",
 ] as const satisfies readonly (keyof TransparencyLegalBody)[];
+
+/** Fails `tsc` when a view has a key its runtime list leaves out (`satisfies` checks the other way). */
+type Exhaustive<Missing extends never> = Missing;
+export type LegalBodyKeyListsAreExhaustive = [
+  Exhaustive<Exclude<keyof LegalBodyOrderView, (typeof LEGAL_BODY_ORDER_VIEW_KEYS)[number]>>,
+  Exhaustive<Exclude<keyof BindingView, (typeof BINDING_VIEW_KEYS)[number]>>,
+  Exhaustive<Exclude<keyof Extract<LegalBodyConfig, { available: true }>, (typeof LEGAL_BODY_CONFIG_KEYS)[number]>>,
+  Exhaustive<Exclude<keyof StatementMessageAnswer, (typeof STATEMENT_MESSAGE_ANSWER_KEYS)[number]>>,
+  Exhaustive<Exclude<keyof LegalBodyAgreement, (typeof LEGAL_BODY_AGREEMENT_KEYS)[number]>>,
+  Exhaustive<Exclude<keyof LinkMessageResult, (typeof LINK_MESSAGE_RESULT_KEYS)[number]>>,
+  Exhaustive<Exclude<keyof TransparencyLegalBody, (typeof TRANSPARENCY_LEGAL_BODY_KEYS)[number]>>,
+];

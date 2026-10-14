@@ -247,6 +247,11 @@ describe("isDraftExpired and isLiveOrder", () => {
       view(BROKEN("not_linked")),
       { expired: false, live: true },
     ],
+    [
+      "a revoked broken body whose pointer was cleared",
+      view({ ...BROKEN("not_linked"), revoked: true }),
+      { expired: false, live: false },
+    ],
     ["a broken body replaced by a newer one", view(BROKEN("replaced")), { expired: false, live: false }],
     ["a broken body winding down", view(BROKEN("winding_down")), { expired: false, live: false }],
     ["a broken body dissolved", view(BROKEN("dissolved")), { expired: false, live: false }],
@@ -503,6 +508,11 @@ describe("deriveLegalBodyPhase: one row per state", () => {
       flow({ order: view(RESERVED), sessionAddress: lower(GUARDIAN) }),
       { phase: "link", branch: "browser", notice: { kind: "creating" } },
     ],
+    [
+      "reserved on a company whose check failed since: the order continues",
+      flow({ company: company({ verification: check("failed", "not_active") }), order: view(RESERVED) }),
+      { phase: "link", branch: "browser", notice: { kind: "creating" } },
+    ],
 
     // ── Deployed: the pointer ──────────────────────────────────────────────────────────────
     ["deployed, this wallet owns the identity: the pointer", flow({ order: view(DEPLOYED) }), { phase: "pointer", branch: "browser" }],
@@ -525,6 +535,11 @@ describe("deriveLegalBodyPhase: one row per state", () => {
       "a revoked deployed body: closed",
       flow({ order: view({ ...DEPLOYED, revoked: true }) }),
       { phase: "closed", notice: { kind: "order_revoked" } },
+    ],
+    [
+      "deployed on a company revoked since: still the pointer",
+      flow({ company: company({ verification: check("revoked") }), order: view(DEPLOYED) }),
+      { phase: "pointer", branch: "browser" },
     ],
 
     // ── Broken ─────────────────────────────────────────────────────────────────────────────
@@ -773,6 +788,14 @@ describe("selectLegalBodyThread: which company or order the page is about", () =
       { kind: "order", companyId: "a", orderId: "o1" },
     ],
     [
+      "a revoked broken body is not a thread; its company is",
+      pick({
+        companies: [co("a")],
+        orders: [view({ ...BROKEN("not_linked"), id: "o1", companyId: "a", revoked: true })],
+      }),
+      { kind: "company", companyId: "a" },
+    ],
+    [
       "an expired draft is not a thread; its company is",
       pick({ companies: [co("a")], orders: [view({ id: "o1", companyId: "a", createdAt: iso(NOW - 30 * HOUR) })] }),
       { kind: "company", companyId: "a" },
@@ -869,6 +892,15 @@ describe("selectLegalBodyThread: which company or order the page is about", () =
       pick({
         companies: [co("a")],
         orders: [view({ ...BROKEN("winding_down"), id: "o1", companyId: "a" })],
+        stored: { companyId: "a", orderId: "o1" },
+      }),
+      { kind: "done", companyId: "a", orderId: "o1" },
+    ],
+    [
+      "a stored revoked broken body: its done page",
+      pick({
+        companies: [co("a")],
+        orders: [view({ ...BROKEN("not_linked"), id: "o1", companyId: "a", revoked: true })],
         stored: { companyId: "a", orderId: "o1" },
       }),
       { kind: "done", companyId: "a", orderId: "o1" },
@@ -1035,6 +1067,11 @@ describe("pointerPreflight: the chain reads before any prompt or copy box", () =
     [
       "the creator differs from the current and recorded owner: the identity moved",
       { ...base, ownerAtCreation: THIRD_KEY },
+      { ok: false, reason: "identity_moved" },
+    ],
+    [
+      "the order's identity owner is not the chain's owner: the identity moved",
+      { ...base, identityOwner: OTHER_KEY },
       { ok: false, reason: "identity_moved" },
     ],
     [
