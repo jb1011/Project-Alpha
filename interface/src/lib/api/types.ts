@@ -228,6 +228,9 @@ export type PublicConfig = {
    *  flow is gated on this. Optional for deploy-order safety: absent means the backend predates
    *  the feature, i.e. unavailable. */
   agentBookRegistrationAvailable?: boolean;
+  /** Legal bodies on customer-owned identities. Optional for deploy-order safety: absent means
+   *  the backend predates it, i.e. not offered, exactly like `{ available: false }`. */
+  legalBodies?: LegalBodyConfig;
 };
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).
@@ -272,8 +275,13 @@ export type TransparencyHedera = {
 
 /** Public transparency surface: platform stats + the on-chain entity registry. */
 export type TransparencyView = {
-  stats: { entities: number; jobsSettled: number; usdcSettledAtomic: string };
+  /** `legalBodies` is present only where the deployment serves statements. */
+  stats: { entities: number; jobsSettled: number; usdcSettledAtomic: string; legalBodies?: number };
   entities: TransparencyEntity[];
+  /** Linked legal bodies whose statement reads `active`. Absent without statements; empty AND
+   *  `legalBodiesAvailable: false` when the chain could not be read. */
+  legalBodies?: TransparencyLegalBody[];
+  legalBodiesAvailable?: boolean;
 };
 
 /**
@@ -318,7 +326,9 @@ export type PublicMetadata = {
  * the same surface a seller would, rather than an owner-only view of the same fact.
  *
  * `standing` is a THREE-valued answer and the third value matters (D8): `unknown` is a chain read
- * that failed, not a negative. Never render it as one.
+ * that failed, not a negative. Never render it as one. A body with a signed statement may also
+ * read `pending` (its company not established yet), which the chip reads as it reads any word it
+ * does not name: could not check.
  *
  * Non-200s a caller must expect beside these shapes (§8): 400 (a malformed address), 404 (a
  * deployment with no resolver wired), 429 (either rate budget) and 503 (the local read failed).
@@ -345,7 +355,7 @@ export type LegalBodyLookup =
   | {
       address: string;
       legalBody: true;
-      standing: "active" | "inactive" | "unknown";
+      standing: Standing;
       /** A DECIMAL STRING: an agent id is a uint256 token id and a JSON number loses precision
        *  above 2^53. Null for a body that reached the chain before its id was recorded. */
       agentId: string | null;
@@ -568,6 +578,9 @@ export type WorldIdMe = {
   /** True when a live document-backed attestation is on file. */
   formationReady?: boolean;
   attestation?: { minAge: number; credential?: string | null; verifiedAt: number };
+  /** Whether the legal-body doors' real-human check accepts this guardian, by that check's own
+   *  rule. Absent where this deployment mounts no legal-body door. */
+  realHuman?: boolean;
 };
 
 /** Params for the identity-attestation widget (the step-up uses its own World action). */
@@ -833,6 +846,22 @@ export type CompanyView = {
   agents: number;
   /** EPOCH MILLISECONDS — what `formatDate` takes, with no reconstruction at the edge. */
   createdAt: number;
+  /**
+   * A customer's OWN company (declared, not filed through formation) carries three keys more;
+   * a formation company has none of them, so its key set is unchanged.
+   */
+  provider?: "customer";
+  /** What the guardian declared, as typed, and the version of the wording signed. Never the
+   *  declarant's name or title. Null when the declaration could not be read. */
+  declared?: { companyName: string; filingNumber: string; wordingVersion: string } | null;
+  /** The operator's latest check: `checkedAt` is unix SECONDS (like `filedAt`), not ms. Null
+   *  when this surface could not read the checks, never "not checked yet": that is
+   *  `awaiting_check`. */
+  verification?: {
+    state: VerificationState;
+    checkedAt: number | null;
+    reasonCode: CheckReasonCode | null;
+  } | null;
 };
 
 /** `GET /companies/:companyId` — the list row plus what a list has no room for. */
@@ -1024,3 +1053,461 @@ export type CompanyIntakeUpdate = Omit<CompanyIntakeInput, "partyId" | "syntheti
 export function apiErrorDetail(details: ApiErrorDetails | undefined): ApiErrorDetail | undefined {
   return details !== undefined && !Array.isArray(details) ? details : undefined;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Legal bodies on customer-owned identities: the customer company, the order, its binding, the
+// link, the public statement. Copied from the backend's own types, field by field: every uint256
+// is a canonical decimal string and every address or hash a `0x` string, so nothing here is a
+// bigint.
+//
+// Beside every union and every view stands a runtime list, its members or its keys. A backend
+// test (`test/api/legalBodyInterfaceTypes.test.ts`) reads this file as text and compares each list
+// with the backend's own type, so keep each list's `export const NAME = [` opening and the
+// `] as const` that closes it. A key list is checked against the type here too: it cannot name a
+// key its view does not have.
+// ---------------------------------------------------------------------------------------------
+
+/** An address as served, checksummed or not: compare addresses in lower case. */
+export type Address = `0x${string}`;
+/** A hex value: a hash, a signature. */
+export type Hex = `0x${string}`;
+
+/** The operator's check of a customer's company, as the tenant is told it. A reinstated company
+ *  reads `awaiting_check` until a check passes again. */
+export const VERIFICATION_STATES = ["awaiting_check", "verified", "failed", "revoked"] as const;
+export type VerificationState = (typeof VERIFICATION_STATES)[number];
+
+/** Why a check failed. The operator's free-text reason is never served. */
+export const CHECK_REASON_CODES = [
+  "name_mismatch",
+  "filing_not_found",
+  "not_active",
+  "control_not_shown",
+  "other",
+] as const;
+export type CheckReasonCode = (typeof CHECK_REASON_CODES)[number];
+
+/** The eight states of an order and its binding. */
+export const BINDING_STATES = [
+  "draft",
+  "reserved",
+  "deployed",
+  "linked",
+  "broken",
+  "lapsed",
+  "superseded",
+  "abandoned",
+] as const;
+export type BindingState = (typeof BINDING_STATES)[number];
+
+/** Why a reservation closed without a body. */
+export const LAPSE_REASONS = [
+  "deadline_passed",
+  "foreign_body",
+  "owner_changed",
+  "refused_before_send",
+] as const;
+export type LapseReason = (typeof LAPSE_REASONS)[number];
+
+/** Why a linked body broke: the binding check records the first three, one per status of the
+ *  body; `replaced` means a newer body of the same identity was linked, named by `replacedBy`. */
+export const BROKEN_REASONS = ["not_linked", "winding_down", "dissolved", "replaced"] as const;
+export type BrokenReason = (typeof BROKEN_REASONS)[number];
+
+/** The public standing of a legal body, in four words. `active` only when every fact behind it
+ *  holds; `unknown` is a read that could not be made, never a negative. */
+export const STANDINGS = ["pending", "active", "unknown", "inactive"] as const;
+export type Standing = (typeof STANDINGS)[number];
+
+/** The annual report, as far as the recorded facts show it: `past_due_unverified` means nobody
+ *  has confirmed a report that may well have been filed. */
+export const FILING_STATUSES = [
+  "not_yet_due",
+  "filed",
+  "past_due_unverified",
+  "unverified",
+] as const;
+export type FilingStatus = (typeof FILING_STATUSES)[number];
+
+/** `/config.legalBodies`: public facts only, each a projection of what mounts the doors, so the
+ *  answer cannot offer a door that is not there. */
+export type LegalBodyConfig =
+  | { available: false }
+  | {
+      available: true;
+      /** The customer company doors (declare, abandon, upload evidence) are mounted. */
+      declarations: boolean;
+      /** The public statement by agent is mounted. */
+      statements: boolean;
+      environment: "sandbox" | "production";
+      chainId: number;
+      identityRegistry: Address;
+      factory: Address;
+      /** The gas seed's amount is above zero. */
+      gasSeedOffered: boolean;
+      /** A new customer company lands `draft` and owes a payment. */
+      paymentRequired: boolean;
+      /** The link window a client may ask for, in seconds, counted from the chain's clock. */
+      linkTtl: { min: number; max: number; default: number };
+    };
+/** The keys of the available arm; the other arm is `{ available: false }` alone. */
+export const LEGAL_BODY_CONFIG_KEYS = [
+  "available",
+  "declarations",
+  "statements",
+  "environment",
+  "chainId",
+  "identityRegistry",
+  "factory",
+  "gasSeedOffered",
+  "paymentRequired",
+  "linkTtl",
+] as const satisfies readonly (keyof Extract<LegalBodyConfig, { available: true }>)[];
+
+/** `POST /companies/customer/statement-message` request; the create adds `issuedAt` and
+ *  `signature`. */
+export type CustomerStatementInput = {
+  /** Typed on a production deployment only: a sandbox refuses both and uses its fixed declarant. */
+  declarantName?: string;
+  declarantTitle?: string;
+  companyName: string;
+  filingNumber: string;
+  synthetic?: boolean;
+};
+export type CustomerCompanyInput = CustomerStatementInput & {
+  /** The `issuedAt` of the typed data that was signed: unix seconds, in decimal. */
+  issuedAt: string;
+  signature: Hex;
+};
+
+/** The statement of authority as served: `issuedAt` is a decimal string, `EIP712Domain` is
+ *  declared, and a wallet that signs it as it arrives signs the digest the server checks. */
+export type StatementTypedDataWire = {
+  domain: { name: string; version: string; chainId: number; verifyingContract: Address };
+  types: {
+    EIP712Domain: readonly { name: string; type: string }[];
+    StatementOfAuthority: readonly { name: string; type: string }[];
+  };
+  primaryType: "StatementOfAuthority";
+  message: {
+    statement: string;
+    declarantName: string;
+    declarantTitle: string;
+    companyName: string;
+    jurisdiction: "WY";
+    filingNumber: string;
+    guardian: Address;
+    wordingVersion: string;
+    /** Unix seconds, in decimal, by the server's clock. */
+    issuedAt: string;
+  };
+};
+
+/** `POST /companies/customer/statement-message` answer. */
+export type StatementMessageAnswer = {
+  typedData: StatementTypedDataWire;
+  wordingVersion: string;
+  textStatus: "draft" | "approved";
+};
+export const STATEMENT_MESSAGE_ANSWER_KEYS = [
+  "typedData",
+  "wordingVersion",
+  "textStatus",
+] as const satisfies readonly (keyof StatementMessageAnswer)[];
+
+/** An order as the API shows it. Times: `linkDeadline`, `deployedAt` and `pointerSeenAt` are unix
+ *  SECONDS; `createdAt` is ISO 8601 in UTC, marked with a `Z`. The six facts after `createdAt`
+ *  say why the order is in its state and which company it is for. */
+export type LegalBodyOrderView = {
+  id: string;
+  publicId: string;
+  companyId: string;
+  state: BindingState;
+  chainId: number;
+  factory: Address;
+  guardian: Address;
+  /** Seconds. */
+  amendmentDelay: number;
+  agreement: { hash: Hex; version: number } | null;
+  /** A uint256 in decimal. */
+  agentId: string | null;
+  identityOwner: Address | null;
+  bodyAddress: Address | null;
+  linkDeadline: number | null;
+  createTxHash: Hex | null;
+  deployedAt: number | null;
+  pointerSeenAt: number | null;
+  createdAt: string;
+  /** Why the reservation closed without a body, for a `lapsed` order; null otherwise. */
+  lapseReason: LapseReason | null;
+  /** the reason of the latest break, for a body that is broken or was superseded after a break;
+   *  the state decides what a screen does. Null otherwise. */
+  brokenReason: BrokenReason | null;
+  /** Whether an operator revoked the body. A revocation is never undone. */
+  revoked: boolean;
+  /** The order that superseded this one, for a `superseded` order; null otherwise. */
+  supersededBy: string | null;
+  /** The order whose body was linked in this one's place, when the latest break is `replaced`. */
+  replacedBy: string | null;
+  /** The company name its declaration states; null when the declaration is missing. */
+  companyName: string | null;
+};
+export const LEGAL_BODY_ORDER_VIEW_KEYS = [
+  "id",
+  "publicId",
+  "companyId",
+  "state",
+  "chainId",
+  "factory",
+  "guardian",
+  "amendmentDelay",
+  "agreement",
+  "agentId",
+  "identityOwner",
+  "bodyAddress",
+  "linkDeadline",
+  "createTxHash",
+  "deployedAt",
+  "pointerSeenAt",
+  "createdAt",
+  "lapseReason",
+  "brokenReason",
+  "revoked",
+  "supersededBy",
+  "replacedBy",
+  "companyName",
+] as const satisfies readonly (keyof LegalBodyOrderView)[];
+
+/** What the identity's owner should do: point the identity at its body. It holds no calldata: the
+ *  client encodes the pointer and the metadata write itself. */
+export type PointerIntent = {
+  action: "setLegalBodyPointer";
+  agentId: string;
+  body: Address;
+  chainId: number;
+};
+
+/** `GET /legal-body-orders/:id/binding` and the refresh's answer. The four facts after
+ *  `nextCheckAt` are the order view's. */
+export type BindingView = {
+  state: BindingState;
+  /** A uint256 in decimal. */
+  agentId: string | null;
+  bodyAddress: Address | null;
+  /** Null where no pointer is asked for, among them a body winding down or dissolved. */
+  intent: PointerIntent | null;
+  /** Unix SECONDS: the sighting of the pointer that opened the latest linked stretch. */
+  pointerSeenAt: number | null;
+  /** Unix MILLISECONDS: the next scheduled check (a schedule, not a chain time). */
+  nextCheckAt: number | null;
+  /** the reason of the latest break, for a body that is broken or was superseded after a break;
+   *  the state decides what a screen does. Null otherwise. */
+  brokenReason: BrokenReason | null;
+  revoked: boolean;
+  supersededBy: string | null;
+  replacedBy: string | null;
+};
+export const BINDING_VIEW_KEYS = [
+  "state",
+  "agentId",
+  "bodyAddress",
+  "intent",
+  "pointerSeenAt",
+  "nextCheckAt",
+  "brokenReason",
+  "revoked",
+  "supersededBy",
+  "replacedBy",
+] as const satisfies readonly (keyof BindingView)[];
+
+/** `GET /legal-body-orders/:id/agreement`: `keccak256(manifest) === manifestHash`. */
+export type LegalBodyAgreement = {
+  termsDoc: string;
+  manifest: string;
+  manifestHash: Hex;
+  textId: string;
+  textVersion: string;
+  textStatus: "draft" | "approved";
+};
+export const LEGAL_BODY_AGREEMENT_KEYS = [
+  "termsDoc",
+  "manifest",
+  "manifestHash",
+  "textId",
+  "textVersion",
+  "textStatus",
+] as const satisfies readonly (keyof LegalBodyAgreement)[];
+
+/** The five link fields, in the order of the contract's type string. */
+export const LINK_FIELDS = [
+  { name: "agentId", type: "uint256" },
+  { name: "guardian", type: "address" },
+  { name: "amendmentDelay", type: "uint256" },
+  { name: "operatingAgreementHash", type: "bytes32" },
+  { name: "deadline", type: "uint256" },
+] as const;
+/** `EIP712Domain` as the backend declares it in the typed data it serves. */
+export const EIP712_DOMAIN_FIELDS = [
+  { name: "name", type: "string" },
+  { name: "version", type: "string" },
+  { name: "chainId", type: "uint256" },
+  { name: "verifyingContract", type: "address" },
+] as const;
+
+/** The link typed data as served: every uint256 a decimal string, `EIP712Domain` declared. */
+export type LinkTypedDataWire = {
+  domain: { name: string; version: string; chainId: number; verifyingContract: Address };
+  types: { EIP712Domain: typeof EIP712_DOMAIN_FIELDS; LegalBodyLink: typeof LINK_FIELDS };
+  primaryType: "LegalBodyLink";
+  message: {
+    agentId: string;
+    guardian: Address;
+    amendmentDelay: string;
+    operatingAgreementHash: Hex;
+    deadline: string;
+  };
+};
+
+/** `POST /legal-body-orders/:id/link-message` answer. `deadline` is unix seconds in CHAIN time. */
+export type LinkMessageResult = {
+  typedData: LinkTypedDataWire;
+  identityOwner: Address;
+  deadline: number;
+};
+export const LINK_MESSAGE_RESULT_KEYS = [
+  "typedData",
+  "identityOwner",
+  "deadline",
+] as const satisfies readonly (keyof LinkMessageResult)[];
+
+/** The link door's flat 422, not the house error envelope: before the reservation the order is
+ *  still `draft`, after it `lapsed`. `detail` holds hex values and the factory's error names. */
+export type LinkRefusal = {
+  code: string;
+  message: string;
+  detail: Record<string, string>;
+  order: LegalBodyOrderView;
+};
+
+/** The client's own shape, not a backend one: what `POST /legal-body-orders/:id/link` answers
+ *  without an error, with its status (202 while the create is not confirmed yet). */
+export type LinkSubmitAnswer =
+  | { status: 200 | 202; body: LegalBodyOrderView }
+  | { status: 422; body: LinkRefusal };
+
+/** The signed statement's message in its JSON form: 33 fields, in the order of its type string,
+ *  every uint256 a decimal string. */
+export type LegalBodyStatementJson = {
+  chainId: string;
+  identityRegistry: Address;
+  factory: Address;
+  legalBody: Address;
+  agentId: string;
+  /** The zero address when the agent has no wallet. */
+  agentWallet: Address;
+  identityOwnerAtCreation: Address;
+  bindingState: "linked" | "broken";
+  identityOwnerIsContract: boolean;
+  agentWalletIsContract: boolean;
+  standing: Standing;
+  attestationState: "pending" | "active" | "revoked";
+  jurisdiction: "WY";
+  entityType: "LLC";
+  /** "" unless the names may be shown. */
+  legalName: string;
+  filingNumber: string;
+  source: "customer" | "novi";
+  environment: "sandbox" | "production";
+  controlVerified: boolean;
+  /** Unix seconds; "0" when no check established the company. */
+  existenceCheckedAt: string;
+  filedAt: string;
+  einIssued: boolean;
+  filingStatus: FilingStatus;
+  /** A year; "0" when no recorded report counts. */
+  lastFiledPeriod: string;
+  lastFiledAt: string;
+  lastFiledConfirmedBy: "" | "operator";
+  nextDue: string;
+  oaManifestHash: Hex;
+  oaManifestVersion: string;
+  guardianHumanVerified: boolean;
+  observedAtBlock: string;
+  /** Unix seconds. */
+  issuedAt: string;
+  expiresAt: string;
+};
+
+/** What is served: the typed data in JSON, the signer's address and the signature. A verifier
+ *  checks the signature against an attestor it took from elsewhere, never this field. */
+export type SignedStatementJson = {
+  domain: { name: string; version: string; chainId: number };
+  primaryType: "LegalBodyStatement";
+  message: LegalBodyStatementJson;
+  attestor: Address;
+  signature: Hex;
+};
+
+/** `GET /legal-bodies/by-agent/:agentId` (public, CORS `*`): no body, a body whose statement
+ *  could not be made just now, or a body with its signed statement. */
+export type LegalBodyByAgent =
+  | { agentId: string; legalBody: false; standing: null; checkedAt: string }
+  | {
+      agentId: string;
+      legalBody: true;
+      standing: "unknown";
+      publicId: null;
+      network: "testnet" | "mainnet";
+      links: { transparency: string };
+      checkedAt: string;
+      statement: null;
+    }
+  | {
+      agentId: string;
+      legalBody: true;
+      standing: Standing;
+      publicId: string;
+      network: "testnet" | "mainnet";
+      links: { transparency: string; statement: string };
+      checkedAt: string;
+      statement: SignedStatementJson;
+    };
+
+/** The public routes' flat refusal: `error` is a STRING here, not the house error envelope. */
+export type PublicRefusal = {
+  error: "rate_limited" | "unavailable" | "validation_error";
+  message: string;
+};
+
+/** One row of `/transparency`'s legal-bodies section. */
+export type TransparencyLegalBody = {
+  agentId: string;
+  publicId: string;
+  legalBody: Address;
+  chainId: number;
+  legalName: string;
+  filingNumber: string;
+  jurisdiction: "WY";
+  entityType: "LLC";
+  source: "customer";
+  environment: "sandbox" | "production";
+  standing: "active";
+  /** ISO 8601: when the binding check first saw the current link. */
+  linkedSince: string;
+  links: { statement: string };
+};
+export const TRANSPARENCY_LEGAL_BODY_KEYS = [
+  "agentId",
+  "publicId",
+  "legalBody",
+  "chainId",
+  "legalName",
+  "filingNumber",
+  "jurisdiction",
+  "entityType",
+  "source",
+  "environment",
+  "standing",
+  "linkedSince",
+  "links",
+] as const satisfies readonly (keyof TransparencyLegalBody)[];
