@@ -1,5 +1,5 @@
 import { budgetMs, clientBudgetMs } from "./budgets";
-import { API_URL } from "./config";
+import { API_URL, PUBLIC_API_ORIGIN } from "./config";
 import { fetchWithTimeout, readJsonBounded } from "./timeout";
 import type {
   AgentBookRegisterBody,
@@ -63,7 +63,7 @@ type RequestOpts = {
  * Returns the parsed body on success so `request` does not have to read the stream twice; the
  * download path ignores it and reads the bytes itself.
  */
-async function throwIfNotOk(res: Response): Promise<unknown> {
+export async function throwIfNotOk(res: Response): Promise<unknown> {
   if (res.ok) return undefined;
   const json = (await res.json().catch(() => null)) as ApiErrorBody | null;
   throw new ApiError(
@@ -78,7 +78,7 @@ async function throwIfNotOk(res: Response): Promise<unknown> {
   );
 }
 
-async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
+export async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
   const headers: Record<string, string> = {};
   if (opts.body !== undefined) headers["content-type"] = "application/json";
   if (opts.token) headers.authorization = `Bearer ${opts.token}`;
@@ -138,9 +138,22 @@ export async function getPublicConfig(): Promise<PublicConfig> {
   return request("/config");
 }
 
-/** Public transparency surface — no auth. Platform stats + the on-chain entity registry. */
+/**
+ * Public transparency surface, no auth: platform stats and the on-chain entity registry.
+ *
+ * Asked of the API's own origin (`PUBLIC_API_ORIGIN`) with no header, so the browser is its own
+ * caller to the public limiter. Fails like `request`: an `ApiError` for any non-2xx, so the page's
+ * one catch still shows it. Unset, the origin is `API_URL` and nothing changes.
+ */
 export async function getTransparency(): Promise<TransparencyView> {
-  return request("/transparency");
+  const path = "/transparency";
+  const res = await fetchWithTimeout(
+    `${PUBLIC_API_ORIGIN}${path}`,
+    { method: "GET" },
+    clientBudgetMs("GET", path),
+  );
+  await throwIfNotOk(res);
+  return (await readJsonBounded<TransparencyView>(res)) as TransparencyView;
 }
 
 /**
