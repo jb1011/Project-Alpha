@@ -215,8 +215,9 @@ export type BrowserPointerScreen =
  * What the step shows, in the order of the checks: the binding (on its way, unreadable, or asking
  * for no pointer: winding down or dissolved, with the notice's words); the allowlist, which
  * refuses a revoked, replaced or superseded body before any read counts; an intent that does not
- * say what the call writes; a chain read that failed; then `pointerStepState` over the factory's
- * encoding and the owners. Only `ready` carries a call, so only `ready` offers the button.
+ * say what the call writes; a factory encoding already known not to match; a chain read that
+ * failed; then `pointerStepState` over the factory's encoding and the owners. Only `ready` carries
+ * a call, so only `ready` offers the button.
  */
 export function browserPointerScreen(p: {
   binding: BindingView | null;
@@ -240,6 +241,9 @@ export function browserPointerScreen(p: {
   if (owner === null) return { kind: "refused", problem: "no_identity_owner" };
   if (!intentMatchesCall(intent, call, order)) return { kind: "refused", problem: "intent_mismatch" };
   const checks = browserPointerChecks({ call, identityOwner: owner, connected: p.connected, checks: p.checks });
+  // A mismatch already known is said first, as the order of the checks has it, even beside a read
+  // that failed.
+  if (checks.pointerOk === false) return { kind: "pointer_mismatch" };
   if (checks.unreadable) return { kind: "unreadable" };
   const state = pointerStepState({ binding, preflight: checks.preflight, pointerOk: checks.pointerOk });
   switch (state) {
@@ -340,9 +344,14 @@ export function pointerTxView(stage: PointerTxStage): { text: string; tone: "inf
   }
 }
 
-/** Whether the button is offered: before a send, and after one that failed on the chain. Not while
- *  one waits, once one is confirmed, or while one whose receipt never came is being checked. */
-export function sendOffered(stage: PointerTxStage | null): boolean {
+/**
+ * Whether the button is offered: before a send, after one that failed on the chain, and after one
+ * whose receipt never came once the checks have stopped with the body still not linked (the
+ * transaction may have been dropped). Not while one waits, once one is confirmed, or while one
+ * whose receipt never came is still being checked.
+ */
+export function sendOffered(stage: PointerTxStage | null, checking: boolean): boolean {
+  if (stage === "no_receipt") return !checking;
   return stage === null || stage === "reverted";
 }
 

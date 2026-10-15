@@ -20,6 +20,7 @@ const calls = vi.hoisted(() => ({
   refreshes: 0,
   seeds: 0,
   orderReads: 0,
+  balanceReads: 0,
   writeHooks: 0,
   sendHooks: 0,
 }));
@@ -85,7 +86,14 @@ vi.mock("wagmi", async (importOriginal) => ({
     return { data: chain.gas.data, isLoading: false, refetch: async () => ({}) };
   },
   useEstimateFeesPerGas: () => ({ data: chain.fees.data, isLoading: false }),
-  useBalance: () => ({ data: chain.balance.data, refetch: async () => ({}) }),
+  useBalance: () => ({
+    data: chain.balance.data,
+    isFetching: false,
+    refetch: async () => {
+      calls.balanceReads += 1;
+      return {};
+    },
+  }),
   usePublicClient: () => ({}),
   useConnection: () => ({ address: chain.connected, chainId: 5042002 }),
   useWriteContract: () => {
@@ -269,6 +277,7 @@ describe("the pointer step", () => {
       refreshes: 0,
       seeds: 0,
       orderReads: 0,
+      balanceReads: 0,
       writeHooks: 0,
       sendHooks: 0,
     });
@@ -300,6 +309,24 @@ describe("the pointer step", () => {
     expect(buttonAttributes(m, PT.send)).toMatch(DISABLED);
     expect(text(m)).toContain(PT.notEnough);
     expect(text(m)).toContain(PT.gas);
+  });
+
+  test("a short balance offers to check it again, a read the person asks for", () => {
+    everythingAgrees();
+    chain.balance.data = { value: BigInt(0) };
+    const m = markup(kit(deployed()));
+    expect(hasButton(m, PT.checkBalance)).toBe(true);
+    expect(buttonAttributes(m, PT.checkBalance)).not.toMatch(DISABLED);
+    expect(text(m)).toContain("the button turns on once the balance covers the gas");
+    // Offering it reads nothing: the read is the click's.
+    expect(calls.balanceReads).toBe(0);
+  });
+
+  test("a balance that covers the estimate, or one not read, offers no balance check", () => {
+    everythingAgrees();
+    expect(hasButton(markup(kit(deployed())), PT.checkBalance)).toBe(false);
+    chain.balance.data = undefined;
+    expect(hasButton(markup(kit(deployed())), PT.checkBalance)).toBe(false);
   });
 
   test("a balance that covers the estimate, or one not read, leaves the button offered", () => {
@@ -391,6 +418,31 @@ describe("the pointer step", () => {
 
   test("no order: nothing", () => {
     expect(markup(kit(null))).toBe("");
+  });
+});
+
+describe("nothing outlives the step", () => {
+  const code = readFileSync(
+    fileURLToPath(new URL("../src/components/legalBody/PointerStep.tsx", import.meta.url)),
+    "utf8",
+  );
+
+  test("every timer goes through the step's lifetime, which the effect's cleanup ends", () => {
+    expect(code).not.toContain("setTimeout");
+    expect(code).not.toContain("setInterval");
+    expect(code).toContain("stepLifetime()");
+    expect(code).toMatch(/return \(\) => \{\s*life\.end\(\);/);
+  });
+
+  test("after the wallet and after the receipt, the click goes on only while the step is on screen", () => {
+    const send = code.indexOf("await send(");
+    const receipt = code.indexOf("await client.waitForTransactionReceipt(");
+    expect(send).toBeGreaterThan(0);
+    expect(receipt).toBeGreaterThan(send);
+    const afterSend = code.slice(send, receipt);
+    expect(afterSend.split("if (!life.alive()) return;").length - 1).toBe(2);
+    const afterReceipt = code.slice(receipt, code.indexOf("pointerTxStage(receipt)"));
+    expect(afterReceipt).toContain("if (!life.alive()) return;");
   });
 });
 

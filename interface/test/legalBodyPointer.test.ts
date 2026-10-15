@@ -18,7 +18,7 @@
  * published account as the guardian, which owns the identity on this branch.
  */
 import { InsufficientFundsError, formatUnits, type Hex } from "viem";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { TIMEOUT_CODE, TIMEOUT_MESSAGE } from "@/lib/api/timeout";
 import {
   ApiError,
@@ -35,6 +35,7 @@ import type { PointerPreflight } from "@/lib/legalBody/flow";
 import { registerSendFailure } from "@/lib/legalBody/identity";
 import { noticeSentence } from "@/lib/legalBody/notice";
 import { pointerCallText, type PointerCallText, type PointerChecks } from "@/lib/legalBody/paste";
+import { stepLifetime, type Timers } from "@/lib/legalBody/lifetime";
 import { REFRESH_RETRY_MS } from "@/lib/legalBody/polling";
 import {
   BINDING_WATCH_MAX_MS,
@@ -592,6 +593,19 @@ describe("browserPointerScreen: binding, allowlist, factory, owners, in that ord
     ).toStrictEqual({ kind: "refused", problem: "intent_mismatch" });
   });
 
+  test("a known mismatch is said before a read that failed: the order of the checks", () => {
+    const another = `${LIVE_POINTER.slice(0, -2)}ff` as Hex;
+    expect(
+      browserPointerScreen({
+        ...base,
+        checks: agreeing({ factoryPointer: another, ownerOf: "unreadable" }),
+      }),
+    ).toStrictEqual({ kind: "pointer_mismatch" });
+    expect(
+      browserPointerScreen({ ...base, checks: agreeing({ factoryPointer: "unreadable", ownerOf: THIRD }) }),
+    ).toStrictEqual({ kind: "unreadable" });
+  });
+
   test("a read that failed: unreadable, with nothing to send", () => {
     expect(browserPointerScreen({ ...base, checks: agreeing({ ownerAtCreation: "unreadable" }) }).kind).toBe(
       "unreadable",
@@ -763,12 +777,16 @@ describe("the receipt", () => {
     expect(pointerTxView("no_receipt")).toStrictEqual({ text: PT.noReceipt, tone: "warn" });
   });
 
-  test("sendOffered: before a send and after one that failed on the chain only", () => {
-    expect(sendOffered(null)).toBe(true);
-    expect(sendOffered("reverted")).toBe(true);
-    expect(sendOffered("waiting")).toBe(false);
-    expect(sendOffered("confirmed")).toBe(false);
-    expect(sendOffered("no_receipt")).toBe(false);
+  test.each([
+    ["before any send", null, false, true],
+    ["after a send that failed on the chain", "reverted", false, true],
+    ["while the receipt is awaited", "waiting", false, false],
+    ["once confirmed, even when the checks have stopped", "confirmed", false, false],
+    ["once confirmed, while checked", "confirmed", true, false],
+    ["with no receipt, while Novi Corpus is still asked to check", "no_receipt", true, false],
+    ["with no receipt, once the checks stopped and the body is still not linked", "no_receipt", false, true],
+  ] as const)("sendOffered %s: %s, checking %s -> %s", (_name, stage, checking, offered) => {
+    expect(sendOffered(stage, checking)).toBe(offered);
   });
 });
 
@@ -914,5 +932,135 @@ describe("gasSeedSuccess", () => {
       hash: null,
     });
     expect(gasSeedSuccess(null)).toStrictEqual({ line: PT.seedSent, hash: null });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The step's lifetime: what a click starts goes on only while the step is on screen
+// ---------------------------------------------------------------------------------------------
+
+/** Timers that run only when told to, and can be told to forget a clear. */
+function manualTimers(p: { clears: boolean } = { clears: true }) {
+  const waiting = new Map<number, () => void>();
+  let next = 1;
+  const timers: Timers = {
+    set: (run) => {
+      const id = next;
+      next += 1;
+      waiting.set(id, run);
+      return id;
+    },
+    clear: (handle) => {
+      if (p.clears) waiting.delete(handle as number);
+    },
+  };
+  /** Runs every timer still waiting, as if its time had come. */
+  const fire = () => {
+    const due = [...waiting];
+    waiting.clear();
+    for (const [, run] of due) run();
+  };
+  return { timers, fire, waiting: () => waiting.size };
+}
+
+describe("stepLifetime", () => {
+  test("on screen from the start: a timer is set, and runs when its time comes", () => {
+    const t = manualTimers();
+    const life = stepLifetime(t.timers);
+    let ran = 0;
+    expect(life.alive()).toBe(true);
+    expect(life.later(() => (ran += 1), REFRESH_RETRY_MS)).toBe(true);
+    expect(t.waiting()).toBe(1);
+    t.fire();
+    expect(ran).toBe(1);
+  });
+
+  test("gone: every waiting timer is cleared, and nothing it held runs", () => {
+    const t = manualTimers();
+    const life = stepLifetime(t.timers);
+    let ran = 0;
+    life.later(() => (ran += 1), REFRESH_RETRY_MS);
+    life.later(() => (ran += 1), BINDING_WATCH_MAX_MS);
+    life.end();
+    expect(life.alive()).toBe(false);
+    expect(t.waiting()).toBe(0);
+    t.fire();
+    expect(ran).toBe(0);
+  });
+
+  test("gone: no timer is set any more, and the caller is told so", () => {
+    const t = manualTimers();
+    const life = stepLifetime(t.timers);
+    life.end();
+    let ran = 0;
+    expect(life.later(() => (ran += 1), REFRESH_RETRY_MS)).toBe(false);
+    expect(t.waiting()).toBe(0);
+    t.fire();
+    expect(ran).toBe(0);
+  });
+
+  test("a timer whose clear did not take still runs nothing once the step is gone", () => {
+    const t = manualTimers({ clears: false });
+    const life = stepLifetime(t.timers);
+    let ran = 0;
+    life.later(() => (ran += 1), REFRESH_RETRY_MS);
+    life.end();
+    t.fire();
+    expect(ran).toBe(0);
+  });
+
+  test("on screen again after a simulated unmount (StrictMode): timers work again", () => {
+    const t = manualTimers();
+    const life = stepLifetime(t.timers);
+    life.begin();
+    life.end();
+    life.begin();
+    let ran = 0;
+    expect(life.alive()).toBe(true);
+    expect(life.later(() => (ran += 1), REFRESH_RETRY_MS)).toBe(true);
+    t.fire();
+    expect(ran).toBe(1);
+  });
+
+  test("a click's continuation stops after its await once the step is gone", async () => {
+    // The shape the step's click follows: await the wallet, then go on only while on screen.
+    const t = manualTimers();
+    const life = stepLifetime(t.timers);
+    const sent: string[] = [];
+    let confirm: () => void = () => {};
+    const wallet = new Promise<void>((resolve) => {
+      confirm = resolve;
+    });
+    const click = (async () => {
+      await wallet;
+      if (!life.alive()) return;
+      sent.push("refresh");
+      life.later(() => sent.push("tick"), REFRESH_RETRY_MS);
+    })();
+    life.end();
+    confirm();
+    await click;
+    t.fire();
+    expect(sent).toStrictEqual([]);
+    expect(t.waiting()).toBe(0);
+  });
+
+  test("by default it uses the browser's timers", () => {
+    vi.useFakeTimers();
+    try {
+      const life = stepLifetime();
+      let ran = 0;
+      life.later(() => (ran += 1), REFRESH_RETRY_MS);
+      vi.advanceTimersByTime(REFRESH_RETRY_MS - 1);
+      expect(ran).toBe(0);
+      vi.advanceTimersByTime(1);
+      expect(ran).toBe(1);
+      life.later(() => (ran += 1), REFRESH_RETRY_MS);
+      life.end();
+      vi.advanceTimersByTime(REFRESH_RETRY_MS);
+      expect(ran).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

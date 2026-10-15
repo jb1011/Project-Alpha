@@ -454,6 +454,8 @@ export const LEGAL_BODY_COPY = {
       "The link served does not match your order, your identity, the agreement you read or this wallet ({problem}), so your wallet was not opened and nothing was signed.",
     ownerMoved:
       "This identity is no longer owned by this wallet, as the chain reads it now, so your wallet was not opened and nothing was signed. Pick the identity again.",
+    ownerMissing:
+      "The link came back without the identity's owner, so your wallet was not opened and nothing was signed. Sign again; if this repeats, reload the page.",
     declined: "Your wallet did not sign the link, so nothing was sent.",
     declinedOtherNetwork:
       "Your wallet did not sign the link, so nothing was sent. It is on another network than {network}, and a wallet may refuse to sign the link until it is switched there.",
@@ -585,7 +587,8 @@ export const LEGAL_BODY_COPY = {
     gasUnread:
       "The gas could not be estimated just now; your wallet shows its own estimate when it opens.",
     notEnough:
-      "That is less than the estimate, so the pointer cannot be sent yet: add a little native USDC to this wallet first, and the button comes back.",
+      "That is less than the estimate, so the pointer cannot be sent yet: add a little native USDC to this wallet, then check the balance again; the button turns on once the balance covers the gas.",
+    checkBalance: "Check the balance again",
     gasProduction: "Your wallet needs a little native USDC on Arc for gas.",
     seed: "Ask Novi Corpus for a little gas",
     seedSent: "A little native USDC was sent to this wallet.",
@@ -671,6 +674,8 @@ export const LEGAL_BODY_COPY = {
       "Anyone can open this address without an account and read the signed statement as it stands now.",
     environmentLabel: "environment",
     sayLabel: "What they may say, word for word",
+    sayLabelSandbox: "What they may say, with the word sandbox beside it",
+    sandboxPill: "sandbox",
     sayAsItIs:
       "Say the standing as it is, {standing}, and nothing more: the yes sentence is said only of an active standing.",
     sayTest: "A sandbox statement is a test: say so, and never present it as a filing.",

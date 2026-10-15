@@ -218,7 +218,7 @@ describe("parsePastedSignature", () => {
   });
 
   test("tabs, carriage returns and a no-break space at the ends are trimmed too", () => {
-    expect(parsePastedSignature(`\t\r\n ${SIG_65} \r\n`)).toBe(SIG_65);
+    expect(parsePastedSignature(`\t\r\n\u00A0${SIG_65}\u00A0\r\n`)).toBe(SIG_65);
   });
 
   test("an odd number of hex digits is not whole bytes", () => {

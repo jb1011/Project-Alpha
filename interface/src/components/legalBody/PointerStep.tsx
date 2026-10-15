@@ -31,6 +31,7 @@ import { LEGAL_BODY_COPY, fillCopy } from "@/lib/legalBody/copy";
 import { sameAddress } from "@/lib/legalBody/flow";
 import { isSignInRequired } from "@/lib/legalBody/gates";
 import { registerSendFailure } from "@/lib/legalBody/identity";
+import { stepLifetime } from "@/lib/legalBody/lifetime";
 import { pointerCallText, pointerChecksOf } from "@/lib/legalBody/paste";
 import {
   POINTER_RECEIPT_TIMEOUT_MS,
@@ -78,8 +79,8 @@ function stateOf(answer: unknown): BindingState | null {
     : null;
 }
 
-/** What the step needs from the flow: the deployment, the order, and the way back to sign-in. The
- *  legal body's own page can pass the same. */
+/** What the step needs from the flow: the deployment, the order, and the way back to sign-in. Any
+ *  page that shows the record and offers the pointer can pass the same. */
 export type PointerStepKit = Pick<LegalBodyStepKit, "config" | "order" | "routeSignIn">;
 
 /** The refresh plan after the receipt: its own clock, the refreshes made, and the state last read. */
@@ -109,7 +110,8 @@ type PlanRun = {
  * the binding is read at a slowing pace while the page is open. A refresh answering
  * `chain_unavailable` keeps the stored binding on screen and the plan goes on. Once the body reads
  * `linked`, the order is read again and the flow moves on to done. Nothing is sent from an
- * effect: the only effect drops the timers when the step goes.
+ * effect: the only effect marks the step on screen and gone, and once it is gone no timer runs and
+ * no continuation of a click goes on (`stepLifetime`).
  */
 export function PointerStep({ kit }: { kit: PointerStepKit }) {
   const order = kit.order;
@@ -198,7 +200,9 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
   const inFlight = useRef(false);
   const run = useRef<PlanRun | null>(null);
   const watch = useRef<{ reads: number } | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // On screen from the effect below, gone at its cleanup: timers and the work after an await go on
+  // only while the step is on screen.
+  const [life] = useState(() => stepLifetime());
   const [busy, setBusy] = useState<"sending" | "waiting" | null>(null);
   const [tx, setTx] = useState<{ hash: Hex; stage: PointerTxStage } | null>(null);
   // The sentence said when the transaction was sent, kept while the binding moves on.
@@ -216,24 +220,19 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
   const [seedLine, setSeedLine] = useState<{ text: string; tone: "info" | "warn" } | null>(null);
   const [seedHash, setSeedHash] = useState<Hex | null>(null);
 
-  // A cleanup only: a continuation still waiting when the step goes is dropped, so nothing is sent
-  // or read once the person has left. It starts nothing.
-  useEffect(
-    () => () => {
-      if (timer.current !== null) clearTimeout(timer.current);
-      timer.current = null;
+  // The step's lifetime, and nothing else: the body marks the step on screen (again after
+  // StrictMode's simulated unmount), the cleanup marks it gone. Once gone, every waiting timer is
+  // cleared, no new one is set, and a click's continuation stops after its next await, so nothing
+  // is sent or read once the person has left, even when the wallet or the receipt answers later.
+  // It starts nothing.
+  useEffect(() => {
+    life.begin();
+    return () => {
+      life.end();
       run.current = null;
       watch.current = null;
-    },
-    [],
-  );
-
-  function later(next: () => void, ms: number) {
-    timer.current = setTimeout(() => {
-      timer.current = null;
-      next();
-    }, ms);
-  }
+    };
+  }, [life]);
 
   /** The plan is over: the order is read again when the binding no longer waits; otherwise the
    *  binding is read at a slowing pace, reads only. */
@@ -248,7 +247,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
     setKeepChecking(true);
     const w = { reads: 0 };
     watch.current = w;
-    later(() => void watchRead(w), bindingWatchDelayMs(w.reads));
+    life.later(() => void watchRead(w), bindingWatchDelayMs(w.reads));
   }
 
   /** One read of the binding after the plan: the order again once it no longer waits. */
@@ -263,7 +262,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       void orderQuery.refetch();
       return;
     }
-    later(() => void watchRead(w), bindingWatchDelayMs(w.reads));
+    life.later(() => void watchRead(w), bindingWatchDelayMs(w.reads));
   }
 
   /** One tick of the plan: after the first, a free read of the binding; then a refresh when
@@ -303,7 +302,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       finish(r);
       return;
     }
-    later(() => void tick(false), REFRESH_RETRY_MS);
+    life.later(() => void tick(false), REFRESH_RETRY_MS);
   }
 
   /** "Write the pointer": the one transaction, its receipt, then one check now and the plan. */
@@ -326,6 +325,8 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       return;
     }
     inFlight.current = true;
+    // A send again after one whose receipt never came: the reads of the binding after it end.
+    watch.current = null;
     setBusy("sending");
     setTx(null);
     setChainUnread(false);
@@ -335,9 +336,12 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       try {
         sent = await send(req, { config, order });
       } catch (e) {
+        if (!life.alive()) return;
         setLines(pointerFailureLines(registerSendFailure(e), environment));
         return;
       }
+      // The person may have left while the wallet was open: nothing goes on for them then.
+      if (!life.alive()) return;
       if (!sent.ok) {
         setLines([pointerRefusalSentence(sent.problem, environment)]);
         return;
@@ -352,6 +356,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       } catch {
         receipt = null;
       }
+      if (!life.alive()) return;
       const stage = pointerTxStage(receipt);
       setTx({ hash, stage });
       setBusy(null);
@@ -383,7 +388,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       setSeedHash(sent.hash);
       // One seed per tenant, ever: asking again cannot change anything.
       setSeedFinal(true);
-      void balance.refetch();
+      if (life.alive()) void balance.refetch();
     } catch (e) {
       if (kit.routeSignIn(e)) return;
       const answer = gasSeedAnswer(e);
@@ -400,7 +405,8 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
     if (read.error && isSignInRequired(read.error)) kit.routeSignIn(read.error);
   }
 
-  const sentView = tx !== null && tx.stage !== "reverted";
+  // After a send, the checks' panel; the button again only as `sendOffered` says.
+  const sentView = tx !== null && !sendOffered(tx.stage, checking);
   const intro = sentView ? sentSentence : ready ? pointerSentence(ready.intent, environment) : null;
 
   return (
@@ -480,6 +486,14 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
                   ))}
                 </span>
               </Callout>
+              {gasBlocksSend(line) && (
+                <div className="mt-4">
+                  {/* A read only: the balance again, for a faucet used in another window. */}
+                  <Button variant="ghost" onClick={() => void balance.refetch()} loading={balance.isFetching}>
+                    {PT.checkBalance}
+                  </Button>
+                </div>
+              )}
 
               {seedOffered({ gasSeedOffered: config.gasSeedOffered, enough: line.enough, final: seedFinal }) && (
                 <div className="mt-4">
@@ -506,6 +520,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
                 <Callout tone={pointerTxView(tx.stage).tone} className="mt-6">
                   <span className="flex flex-col gap-2">
                     <span>{pointerTxView(tx.stage).text}</span>
+                    {keepChecking && <span>{PT.keepChecking}</span>}
                     <TxLink hash={tx.hash} />
                   </span>
                 </Callout>
@@ -525,7 +540,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
                 </div>
               )}
 
-              {sendOffered(tx?.stage ?? null) && (
+              {sendOffered(tx?.stage ?? null, checking) && (
                 <StepNav>
                   <Button
                     onClick={() => void onSend()}

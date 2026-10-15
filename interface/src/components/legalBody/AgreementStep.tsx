@@ -34,6 +34,8 @@ import { flowNowMs } from "@/lib/legalBody/resume";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 
 const A = LEGAL_BODY_COPY.agreement;
+/** No draft refused on this visit. */
+const NO_REFUSED: readonly string[] = [];
 
 /**
  * The agreement: the order is placed, and its frozen operating agreement is read.
@@ -56,7 +58,7 @@ export function AgreementStep({
   kit,
   onRead,
   onBackToCompany,
-  refusedDraftId,
+  refusedDraftIds,
 }: {
   kit: LegalBodyStepKit;
   /** In memory only: this order's agreement was read on this visit. */
@@ -64,8 +66,8 @@ export function AgreementStep({
   /** The order door said the company cannot stand behind a body: the shell reads the company
    *  again and carries the door's sentence back to the company step. */
   onBackToCompany: (sentence: string) => void;
-  /** A draft the link door refused on this visit: never offered again to continue. */
-  refusedDraftId?: string | null;
+  /** The drafts the link door refused on this visit: none is offered again to continue. */
+  refusedDraftIds?: readonly string[];
 }) {
   // The order just placed, until the thread names it: the list is read again before the click
   // settles, so this covers only a list that could not be read.
@@ -93,7 +95,7 @@ export function AgreementStep({
           kit={kit}
           onPlaced={setPlaced}
           onBackToCompany={onBackToCompany}
-          refusedDraftId={refusedDraftId ?? null}
+          refusedDraftIds={refusedDraftIds ?? NO_REFUSED}
         />
       )}
     </div>
@@ -106,12 +108,12 @@ function PlaceOrder({
   kit,
   onPlaced,
   onBackToCompany,
-  refusedDraftId,
+  refusedDraftIds,
 }: {
   kit: LegalBodyStepKit;
   onPlaced: (order: LegalBodyOrderView) => void;
   onBackToCompany: (sentence: string) => void;
-  refusedDraftId: string | null;
+  refusedDraftIds: readonly string[];
 }) {
   const { config, companyId } = kit;
   const createOrder = useCreateLegalBodyOrderMutation();
@@ -132,7 +134,7 @@ function PlaceOrder({
           companyId,
           where: { chainId: config.chainId, factory: config.factory },
           nowMs,
-          refused: refusedDraftId,
+          refused: refusedDraftIds,
         });
 
   /** The live draft, continued: the memory names it, with no owner chosen for it yet. */

@@ -46,7 +46,8 @@ export function railPhaseOf(derivation: LegalBodyDerivation): LegalBodyRailPhase
   return derivation.phase === "closed" ? "done" : derivation.phase;
 }
 
-/** A phase's name on the rail; `closed`, which the rail shows as its end, is named as the end. */
+/** A phase's name on the rail; an id the rail does not list is named as the end. A closed order's
+ *  screen shows no rail (`showRail`). */
 export function phaseLabel(phase: LegalBodyRailPhase): string {
   return LEGAL_BODY_PHASES.find((p) => p.id === phase)?.label ?? L.done;
 }

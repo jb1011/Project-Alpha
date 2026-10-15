@@ -8,6 +8,8 @@
  * the rows. Each row says its environment out loud (amber "sandbox"), and its statement link is
  * the row's own `links.statement`, shown as a link only over http or https.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
 import { describe, expect, test } from "vitest";
@@ -259,5 +261,17 @@ describe("the section as rendered", () => {
     );
     expect(html).not.toContain('href="javascript:');
     expect(html).toContain("javascript:alert(1)");
+  });
+});
+
+describe("the way in from the agents page", () => {
+  const code = readFileSync(fileURLToPath(new URL("../src/app/agents/page.tsx", import.meta.url)), "utf8");
+  /** A link to the flow whose words are the entry button's copy. */
+  const ENTRY_LINK = /<Link\s+href="\/legal-body"[^>]*>\s*\{LEGAL_BODY_COPY\.entry\.button\}\s*<\/Link>/g;
+
+  test("both places link to /legal-body with the entry button's words, and nowhere else", () => {
+    expect(code.match(ENTRY_LINK)?.length).toBe(2);
+    expect(code.split('href="/legal-body"').length - 1).toBe(2);
+    expect(LEGAL_BODY_COPY.entry.button).toBe("Get a legal body for an agent you already run");
   });
 });

@@ -15,14 +15,18 @@ const TONE_CLASS: Record<StandingPresentation["tone"], string> = {
   neutral: "border-line-strong bg-paper-2/70 text-muted",
 };
 
+/** Amber words: the sandbox said out loud. */
+const AMBER_TEXT = "text-[#f3cd72]";
+
 /**
  * A legal body's public record, as a stranger reads it: the standing in a few words, the facts of
  * the signed statement that matter, the statement's URL and the transparency page, and what a
  * counterparty can check.
  *
  * Every word and tone comes from `legalBodyRecordView`; this component reads nothing and decides
- * nothing. The done page renders it, and so does the legal body's own page. The caller reads the
- * public answer, and only for a linked order; Try again is the caller's read, on a click.
+ * nothing. The done page renders it, as can any page that shows the record; it says sandbox on its
+ * own, with an amber marker, for a page without the flow's banner. The caller reads the public
+ * answer, and only for a linked order; Try again is the caller's read, on a click.
  */
 export function LegalBodyRecord({
   read,
@@ -55,12 +59,16 @@ export function LegalBodyRecord({
           >
             {standing.label}
           </span>
+          {view.sandbox && <AmberPill size="sm">{D.sandboxPill}</AmberPill>}
         </div>
-        {standing.sentences.length > 0 && (
+        {view.standingLines.length > 0 && (
           <div className="mt-3 flex flex-col gap-1">
-            {standing.sentences.map((s) => (
-              <p key={s} className="text-[13px] leading-[1.6] text-muted">
-                {s}
+            {view.standingLines.map((line) => (
+              <p
+                key={line.text}
+                className={cx("text-[13px] leading-[1.6]", line.tone === "amber" ? AMBER_TEXT : "text-muted")}
+              >
+                {line.text}
               </p>
             ))}
           </div>
@@ -129,14 +137,21 @@ export function LegalBodyRecord({
               </span>
             )}
           </div>
+          {check.sayBefore && (
+            <p className={cx("mt-4 text-[13px] leading-[1.6]", check.sayTone === "amber" ? AMBER_TEXT : "text-muted")}>
+              {check.sayBefore}
+            </p>
+          )}
           {check.yesSentence && (
             <div className="mt-4">
-              <div className="text-[12px] text-muted-2">{D.sayLabel}</div>
+              <div className="text-[12px] text-muted-2">{check.sayLabel}</div>
               <p className="mt-1 text-[14px] leading-[1.6] text-accent-soft">{check.yesSentence}</p>
             </div>
           )}
-          {check.sayInstead && (
-            <p className="mt-3 text-[13px] leading-[1.6] text-muted">{check.sayInstead}</p>
+          {check.sayAfter && (
+            <p className={cx("mt-3 text-[13px] leading-[1.6]", check.sayTone === "amber" ? AMBER_TEXT : "text-muted")}>
+              {check.sayAfter}
+            </p>
           )}
         </Card>
       )}

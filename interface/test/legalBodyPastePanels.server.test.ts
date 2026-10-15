@@ -376,6 +376,17 @@ describe("the pointer panel", () => {
     expect(hasButton(m, P.sent)).toBe(true);
   });
 
+  test("every chain read, the watch of the pointer included, is never asked again on focus or reconnect", () => {
+    chainAgrees();
+    pointerMarkup(kit(POINTER, deployed()));
+    const names = chain.asked.map((r) => r.functionName);
+    expect(names).toContain("getMetadata");
+    for (const read of chain.asked) {
+      expect(read.query?.refetchOnWindowFocus).toBe(false);
+      expect(read.query?.refetchOnReconnect).toBe(false);
+    }
+  });
+
   test("rendering, effects included, asks for no check and prompts no wallet", () => {
     chainAgrees();
     const k = kit(POINTER, deployed());

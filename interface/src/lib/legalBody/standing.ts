@@ -10,7 +10,7 @@
  * made never turned into an answer, and the sandbox said out loud. There is no green tone: `active`
  * takes the accent.
  *
- * Every decision the done page and the legal body's own page make about the record is here; the
+ * Every decision the done page, or any page that shows the record, makes about it is here; the
  * screens only render the answers.
  */
 import type { PublicRead } from "@/lib/api/legalBodyClient";
@@ -176,7 +176,7 @@ export function counterpartyCheck(
  * The statement's facts a stranger cares about, in seven rows: identity, body, binding,
  * attestation, filing status, next due, environment. The rest (the owner at creation, the agent's
  * wallet, the registry and factory, the agreement's hash, the contract flags, the block and the
- * times, and the envelope's attestor) belongs to the tenant's own page.
+ * times, and the envelope's attestor) is not shown to a stranger.
  */
 export function statementFactsForStranger(s: LegalBodyStatementJson): { label: string; value: string }[] {
   const F = D.facts;
@@ -208,6 +208,12 @@ const shown = (url: string): ShownUrl => ({ text: url, href: linkableUrl(url) })
 
 export type LegalBodyRecordView = {
   standing: StandingPresentation;
+  /** The record says sandbox on its own, with an amber marker beside the standing: on a sandbox
+   *  deployment, or for a statement that says sandbox. A page that shows the record without the
+   *  flow's banner still says it. */
+  sandbox: boolean;
+  /** The standing's sentences as shown: the sandbox sentence in amber, the others muted. */
+  standingLines: { text: string; tone: "muted" | "amber" }[];
   /** A Try again under the standing: the read made no answer, or found no record yet. */
   retry: boolean;
   /** The statement's seven rows, when there is a signed statement. */
@@ -215,11 +221,17 @@ export type LegalBodyRecordView = {
   /** The links as served, when there is a legal body to link to. */
   links: { statement: ShownUrl | null; transparency: ShownUrl | null } | null;
   /** The counterparty's box, when there is a signed statement; the environment word is amber on
-   *  sandbox. */
+   *  sandbox. On an active sandbox statement the sandbox wording comes first (`sayBefore`) and the
+   *  label above the yes sentence does not say "word for word"; otherwise what to say instead
+   *  comes after the box (`sayAfter`), amber on sandbox. */
   check:
     | (ReturnType<typeof counterpartyCheck> & {
         href: string | null;
         environmentTone: "amber" | "neutral";
+        sayLabel: string;
+        sayBefore: string | null;
+        sayAfter: string | null;
+        sayTone: "amber" | "muted";
       })
     | null;
 };
@@ -228,6 +240,11 @@ export type LegalBodyRecordView = {
 export function legalBodyRecordView(p: Parameters<typeof standingPresentation>[0]): LegalBodyRecordView {
   const standing = standingPresentation(p);
   const read = heldAnswer(p.read, p.orderState);
+  const sandbox = sandboxLines(p.environment, statedOf(read)).length > 0;
+  const standingLines = standing.sentences.map((text) => ({
+    text,
+    tone: text === D.sandboxStatement ? ("amber" as const) : ("muted" as const),
+  }));
   const body = read?.kind === "answer" ? read.body : null;
   const retry =
     read !== null &&
@@ -240,18 +257,27 @@ export function legalBodyRecordView(p: Parameters<typeof standingPresentation>[0
           transparency: shown(body.links.transparency),
         }
       : null;
-  if (stated === null) return { standing, retry, facts: null, links, check: null };
+  if (stated === null) return { standing, sandbox, standingLines, retry, facts: null, links, check: null };
 
   const check = counterpartyCheck(stated);
+  const sandboxStatement = check.environment === "sandbox";
+  // On an active sandbox statement, the sandbox wording is said before the yes sentence.
+  const sandboxFirst = sandboxStatement && check.yesSentence !== "";
   return {
     standing,
+    sandbox,
+    standingLines,
     retry,
     facts: statementFactsForStranger(stated.statement.message),
     links,
     check: {
       ...check,
       href: linkableUrl(check.url),
-      environmentTone: check.environment === "sandbox" ? "amber" : "neutral",
+      environmentTone: sandboxStatement ? "amber" : "neutral",
+      sayLabel: sandboxStatement ? D.sayLabelSandbox : D.sayLabel,
+      sayBefore: sandboxFirst ? check.sayInstead : null,
+      sayAfter: sandboxFirst ? null : check.sayInstead,
+      sayTone: sandboxStatement ? "amber" : "muted",
     },
   };
 }

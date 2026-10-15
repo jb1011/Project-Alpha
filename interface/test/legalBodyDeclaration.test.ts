@@ -89,9 +89,9 @@ describe("validateDeclaration: the doors' field rules, mirrored", () => {
     ["a double quote", 'Example "Test" LLC', P.doubleQuote],
     ["a tab", "Example\tTest LLC", P.control],
     ["a line break", "Example\nTest LLC", P.control],
-    ["a zero-width space", "Example​Test LLC", P.control],
-    ["a non-breaking space", "Example Test LLC", P.otherSpace],
-    ["an ideographic space", "Example　Test LLC", P.otherSpace],
+    ["a zero-width space", "Example\u200BTest LLC", P.control],
+    ["a non-breaking space", "Example\u00A0Test LLC", P.otherSpace],
+    ["an ideographic space", "Example\u3000Test LLC", P.otherSpace],
   ];
   test.each(sandboxNames)("sandbox name: %s", (_name, companyName, problem) => {
     expect(sandbox({ companyName }).companyName).toBe(problem);

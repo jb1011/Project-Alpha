@@ -331,11 +331,11 @@ describe("identityOwnerCheck", () => {
     ["missing", undefined],
     ["null", null],
     ["a number", 42],
-  ])("a served owner that is %s is a stop on the browser branch", (_name, value) => {
+  ])("a served owner that is %s is a stop of its own on the browser branch, not a moved identity", (_name, value) => {
     const s = served(({ served: out }) => (out.identityOwner = value));
     expect(identityOwnerCheck(s, { branch: "browser", sessionAddress: GUARDIAN })).toEqual({
       ok: false,
-      problem: "identity_owner",
+      problem: "no_identity_owner",
     });
   });
 
@@ -730,6 +730,15 @@ describe("linkOutcomeView", () => {
     });
   });
 
+  test("a link served without its owner: a plain sentence of its own, and the identity is kept", () => {
+    expect(view({ kind: "stop", problem: "no_identity_owner" })).toEqual({
+      lines: [L.ownerMissing],
+      action: "sign",
+      sendBack: null,
+    });
+    expect(L.ownerMissing).not.toBe(L.ownerMoved);
+  });
+
   test("a decline on the link's network, and on another", () => {
     expect(view({ kind: "declined", walletChainId: CHAIN }).lines).toEqual([L.declined]);
     expect(view({ kind: "declined", walletChainId: undefined }).lines).toEqual([L.declined]);
@@ -753,6 +762,7 @@ describe("linkOutcomeView", () => {
       { kind: "no_answer", door: "submit" },
       { kind: "stop", problem: "deadline_window" },
       { kind: "stop", problem: "identity_owner" },
+      { kind: "stop", problem: "no_identity_owner" },
       { kind: "declined", walletChainId: 1 },
       { kind: "declined", walletChainId: CHAIN },
       { kind: "not_connected" },

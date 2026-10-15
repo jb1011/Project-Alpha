@@ -169,8 +169,9 @@ export function identityOwnerCheck(
 ): { ok: true } | Refusal {
   if (p.branch !== "browser") return { ok: true };
   const owner: unknown = served?.identityOwner;
-  if (typeof owner !== "string" || !sameAddress(owner, p.sessionAddress))
-    return { ok: false, problem: "identity_owner" };
+  // An answer that names no owner is not an identity that moved: a stop of its own.
+  if (typeof owner !== "string") return { ok: false, problem: "no_identity_owner" };
+  if (!sameAddress(owner, p.sessionAddress)) return { ok: false, problem: "identity_owner" };
   return { ok: true };
 }
 
@@ -409,6 +410,8 @@ export function linkOutcomeView(
           action: "sign",
           sendBack: { to: "identity", sentence: L.ownerMoved },
         };
+      // The answer named no owner: nothing says the identity moved, so it is kept.
+      if (outcome.problem === "no_identity_owner") return say([L.ownerMissing]);
       return say([fillCopy(L.refused, { problem: outcome.problem })]);
     case "declined":
       return say([

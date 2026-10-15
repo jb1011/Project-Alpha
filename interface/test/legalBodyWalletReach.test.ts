@@ -37,6 +37,9 @@ describe.each([
 
   test("the wallet's signature is asked for only as the gate helper's argument", () => {
     expect(callsOf(code, "signTypedDataAsync")).toBe(1);
+    // Every mention, not only calls: the one taken from the hook and the one handed to the gate. A
+    // bare reference or a renamed destructure changes the count.
+    expect(code.split("signTypedDataAsync").length - 1).toBe(2);
     expect(code.split(THROUGH_GATE).length - 1).toBe(1);
     expect(code).not.toContain("signTypedData(");
     expect(code).not.toContain("signMessage");

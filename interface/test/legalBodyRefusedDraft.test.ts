@@ -24,7 +24,7 @@ vi.mock("@/lib/api/legalBodyHooks", () => ({
 import { AgreementStep } from "@/components/legalBody/AgreementStep";
 import type { LegalBodyStepKit } from "@/components/legalBody/LegalBodyFlow";
 import type { LegalBodyConfig, LegalBodyOrderView } from "@/lib/api/types";
-import { draftOffer } from "@/lib/legalBody/agreement";
+import { draftOffer, withRefusedDraft } from "@/lib/legalBody/agreement";
 import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
 
 const A = LEGAL_BODY_COPY.agreement;
@@ -78,7 +78,7 @@ describe("draftOffer with a refused draft", () => {
   test("the refused draft, the only live one, is not offered: a new order is", () => {
     const refused = draft("lbo_refused", 2 * HOUR);
     expect(
-      draftOffer({ orders: [refused], companyId: "co_test", where: HERE, nowMs: NOW, refused: "lbo_refused" }),
+      draftOffer({ orders: [refused], companyId: "co_test", where: HERE, nowMs: NOW, refused: ["lbo_refused"] }),
     ).toBeNull();
   });
 
@@ -91,25 +91,62 @@ describe("draftOffer with a refused draft", () => {
         companyId: "co_test",
         where: HERE,
         nowMs: NOW,
-        refused: "lbo_refused",
+        refused: ["lbo_refused"],
       })?.order.id,
     ).toBe("lbo_other");
   });
 
-  test("with no refused draft, or a null one, the offer is unchanged", () => {
+  test("with no refused draft, or an empty list, the offer is unchanged", () => {
     const live = draft("lbo_live", 2 * HOUR);
     const plain = draftOffer({ orders: [live], companyId: "co_test", where: HERE, nowMs: NOW });
     expect(plain?.order.id).toBe("lbo_live");
     expect(
-      draftOffer({ orders: [live], companyId: "co_test", where: HERE, nowMs: NOW, refused: null }),
+      draftOffer({ orders: [live], companyId: "co_test", where: HERE, nowMs: NOW, refused: [] }),
     ).toEqual(plain);
   });
 
   test("a refused id that is no order of the list changes nothing", () => {
     const live = draft("lbo_live", 2 * HOUR);
     expect(
-      draftOffer({ orders: [live], companyId: "co_test", where: HERE, nowMs: NOW, refused: "lbo_gone" })?.order.id,
+      draftOffer({ orders: [live], companyId: "co_test", where: HERE, nowMs: NOW, refused: ["lbo_gone"] })?.order.id,
     ).toBe("lbo_live");
+  });
+});
+
+describe("two refused drafts never alternate", () => {
+  const a = draft("lbo_a", HOUR);
+  const b = draft("lbo_b", 3 * HOUR);
+  const offer = (refused: readonly string[]) =>
+    draftOffer({ orders: [a, b], companyId: "co_test", where: HERE, nowMs: NOW, refused })?.order.id ?? null;
+
+  test("one refused: the other is offered", () => {
+    expect(offer(["lbo_a"])).toBe("lbo_b");
+    expect(offer(["lbo_b"])).toBe("lbo_a");
+  });
+
+  test("both refused, in either order: neither is offered, a new order is", () => {
+    expect(offer(["lbo_a", "lbo_b"])).toBeNull();
+    expect(offer(["lbo_b", "lbo_a"])).toBeNull();
+  });
+
+  test("withRefusedDraft adds each refused id once, and keeps the earlier ones", () => {
+    expect(withRefusedDraft([], "lbo_a")).toEqual(["lbo_a"]);
+    expect(withRefusedDraft(["lbo_a"], "lbo_b")).toEqual(["lbo_a", "lbo_b"]);
+    expect(withRefusedDraft(["lbo_a", "lbo_b"], "lbo_a")).toEqual(["lbo_a", "lbo_b"]);
+  });
+
+  test("withRefusedDraft with no order named changes nothing, and returns the same list", () => {
+    const ids = ["lbo_a"];
+    expect(withRefusedDraft(ids, null)).toBe(ids);
+    expect(withRefusedDraft(ids, "lbo_a")).toBe(ids);
+  });
+
+  test("refusing one after the other: the list keeps both, so neither comes back", () => {
+    let ids: readonly string[] = [];
+    ids = withRefusedDraft(ids, "lbo_a");
+    expect(offer(ids)).toBe("lbo_b");
+    ids = withRefusedDraft(ids, "lbo_b");
+    expect(offer(ids)).toBeNull();
   });
 });
 
@@ -131,13 +168,13 @@ describe("the agreement step after a refused draft", () => {
   }
 
   /** The whole text of each button in the markup. */
-  function buttons(refusedDraftId: string | null | undefined, orders: LegalBodyOrderView[]): string[] {
+  function buttons(refusedDraftIds: readonly string[] | undefined, orders: LegalBodyOrderView[]): string[] {
     const html = renderToString(
       createElement(AgreementStep, {
         kit: kit(orders),
         onRead: vi.fn(),
         onBackToCompany: vi.fn(),
-        refusedDraftId,
+        refusedDraftIds,
       }),
     );
     return [...html.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/g)].map(([, inner]) =>
@@ -149,7 +186,7 @@ describe("the agreement step after a refused draft", () => {
   const refused = () => draft("lbo_refused", 2 * HOUR, Date.now());
 
   test("with the refused draft named, the step offers Place the order and no Continue", () => {
-    const shown = buttons("lbo_refused", [refused()]);
+    const shown = buttons(["lbo_refused"], [refused()]);
     expect(shown).toEqual([A.placeOrder]);
     expect(shown.some((b) => b.startsWith("Continue with the order placed"))).toBe(false);
   });

@@ -33,6 +33,7 @@ import {
   agreementReadAfterJump,
   sentenceOnArrival,
   withAgreementRead,
+  withRefusedDraft,
   type CarriedSentence,
 } from "@/lib/legalBody/agreement";
 import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
@@ -249,8 +250,8 @@ function LegalBodySession({
   // A door's sentence for the step it sends the person back to, until the next click that moves
   // the thread.
   const [carried, setCarried] = useState<CarriedSentence | null>(null);
-  // A draft the link door refused on this visit: never offered again as a draft to continue.
-  const [refusedDraftId, setRefusedDraftId] = useState<string | null>(null);
+  // The drafts the link door refused on this visit: none is offered again as a draft to continue.
+  const [refusedDraftIds, setRefusedDraftIds] = useState<readonly string[]>([]);
 
   // Reads only.
   const code = useBytecode({ address: tenant, chainId: arcTestnet.id });
@@ -404,7 +405,7 @@ function LegalBodySession({
         const refused = refs?.orderId ?? null;
         const read = await orderQuery.refetch();
         if (afterOrderRefused(read.data) === "rederive") return;
-        setRefusedDraftId(refused);
+        setRefusedDraftIds((ids) => withRefusedDraft(ids, refused));
         startAnother("new_order");
         setCarried({ to: "agreement", sentence });
         return;
@@ -514,7 +515,7 @@ function LegalBodySession({
             kit={kit}
             onRead={agreementRead}
             onBackToCompany={backToCompany}
-            refusedDraftId={refusedDraftId}
+            refusedDraftIds={refusedDraftIds}
           />
         );
       case "identity":

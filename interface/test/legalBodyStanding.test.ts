@@ -177,8 +177,15 @@ describe("standingPresentation: a signed statement, the four standings", () => {
     ),
   );
 
-  test("the table covers the four standings on both environments, charging or not", () => {
-    expect(rows).toHaveLength(16);
+  test("across the table every standing reads as its own label, on both environments", () => {
+    const labels = rows.map(
+      ([standing, environment, paymentRequired]) =>
+        standingPresentation(
+          input({ read: answer(stated(standing, { environment })), environment, paymentRequired }),
+        ).label,
+    );
+    expect(labels).toEqual(rows.map(([standing]) => standing));
+    expect(new Set(labels)).toEqual(new Set(STANDINGS));
   });
 
   test.each(rows)("%s on %s, paymentRequired %s", (standing, environment, paymentRequired) => {
@@ -325,11 +332,13 @@ describe("the tones", () => {
     }
   });
 
-  test("the tone type has no green", () => {
-    const tones: StandingPresentation["tone"][] = ["accent", "amber", "neutral"];
+  test("the tone type has no green, and every tone shown is one of the three", () => {
+    // The type is the check: assigning "green" does not compile.
     // @ts-expect-error there is no green tone
     const green: StandingPresentation["tone"] = "green";
-    expect(tones).not.toContain(green);
+    void green;
+    expect(SEEN.length).toBeGreaterThan(0);
+    for (const p of SEEN) expect(["accent", "amber", "neutral"]).toContain(p.tone);
   });
 
   test("no presentation carries the yes sentence: it belongs to the counterparty's box", () => {
@@ -487,7 +496,77 @@ describe("legalBodyRecordView", () => {
       ...counterpartyCheck(stated("active")),
       href: STATEMENT_URL,
       environmentTone: "amber",
+      sayLabel: D.sayLabelSandbox,
+      sayBefore: D.sayWithSandbox,
+      sayAfter: null,
+      sayTone: "amber",
     });
+  });
+
+  test("an active sandbox statement: the sandbox wording first, and no 'word for word' label", () => {
+    const check = legalBodyRecordView(input())?.check;
+    expect(check?.sayBefore).toBe(D.sayWithSandbox);
+    expect(check?.sayAfter).toBeNull();
+    expect(check?.sayLabel).toBe(D.sayLabelSandbox);
+    expect(check?.sayLabel).not.toContain("word for word");
+  });
+
+  test("an active production statement: the yes sentence word for word, nothing beside it", () => {
+    const check = legalBodyRecordView(
+      input({ environment: "production", read: answer(stated("active", { environment: "production" })) }),
+    ).check;
+    expect(check?.sayLabel).toBe(D.sayLabel);
+    expect(check?.sayBefore).toBeNull();
+    expect(check?.sayAfter).toBeNull();
+    expect(check?.sayTone).toBe("muted");
+  });
+
+  test.each(["pending", "unknown", "inactive"] as const)(
+    "a statement whose standing is %s: the standing as it is after the box, amber on sandbox only",
+    (standing) => {
+      const sandbox = legalBodyRecordView(input({ read: answer(stated(standing)) })).check;
+      expect(sandbox?.sayBefore).toBeNull();
+      expect(sandbox?.sayAfter).toBe(counterpartyCheck(stated(standing)).sayInstead);
+      expect(sandbox?.sayTone).toBe("amber");
+      const production = legalBodyRecordView(
+        input({ environment: "production", read: answer(stated(standing, { environment: "production" })) }),
+      ).check;
+      expect(production?.sayAfter).toBe(
+        counterpartyCheck(stated(standing, { environment: "production" })).sayInstead,
+      );
+      expect(production?.sayTone).toBe("muted");
+    },
+  );
+
+  test("the record says sandbox on its own: on a sandbox deployment, or for a sandbox statement", () => {
+    expect(legalBodyRecordView(input()).sandbox).toBe(true);
+    expect(legalBodyRecordView(input({ orderState: "deployed" })).sandbox).toBe(true);
+    expect(legalBodyRecordView(input({ read: failed("timeout") })).sandbox).toBe(true);
+    expect(
+      legalBodyRecordView(
+        input({ environment: "production", read: answer(stated("active", { environment: "production" })) }),
+      ).sandbox,
+    ).toBe(false);
+    expect(
+      legalBodyRecordView(input({ environment: "production", read: answer(stated("active")) })).sandbox,
+    ).toBe(true);
+  });
+
+  test("the standing's lines: the sandbox sentence in amber, the others muted", () => {
+    expect(legalBodyRecordView(input()).standingLines).toEqual([
+      { text: D.sandboxStatement, tone: "amber" },
+    ]);
+    expect(
+      legalBodyRecordView(input({ read: answer(stated("pending")), paymentRequired: true })).standingLines,
+    ).toEqual([
+      { text: D.notYetPaid, tone: "muted" },
+      { text: D.sandboxStatement, tone: "amber" },
+    ]);
+    expect(
+      legalBodyRecordView(
+        input({ environment: "production", read: answer(stated("pending", { environment: "production" })) }),
+      ).standingLines,
+    ).toEqual([{ text: D.checkNotStanding, tone: "muted" }]);
   });
 
   test("the environment word is amber on sandbox and neutral on production", () => {
@@ -563,6 +642,33 @@ describe("LegalBodyRecord, rendered", () => {
     expect(html).toContain(D.sayWithSandbox);
     expect(html).toContain(D.checkHeading);
     for (const label of Object.values(D.facts)) expect(html).toContain(label);
+  });
+
+  test("a sandbox record carries its own amber sandbox marker beside the standing", () => {
+    const html = render();
+    const standingCard = html.slice(0, html.indexOf(D.factsHeading));
+    expect(standingCard).toContain(D.sandboxPill);
+    expect(standingCard).toContain("#febc2e");
+    expect(standingCard).toMatch(new RegExp(`text-\\[#f3cd72\\][^>]*>${D.sandboxStatement.slice(0, 20)}`));
+  });
+
+  test("an active sandbox statement shows the sandbox wording before the yes sentence", () => {
+    const html = render();
+    expect(html.indexOf(D.sayWithSandbox)).toBeGreaterThan(0);
+    expect(html.indexOf(D.sayWithSandbox)).toBeLessThan(html.indexOf(YES));
+    expect(html).toContain(D.sayLabelSandbox);
+    expect(html).not.toContain("word for word");
+  });
+
+  test("an active production record has no amber anywhere, and the yes sentence word for word", () => {
+    const html = render({
+      environment: "production",
+      read: answer(stated("active", { environment: "production" })),
+    });
+    expect(html).not.toContain("#febc2e");
+    expect(html).not.toContain(D.sandboxPill + "<");
+    expect(html).toContain(D.sayLabel);
+    expect(html).toContain(YES);
   });
 
   test("never green", () => {
