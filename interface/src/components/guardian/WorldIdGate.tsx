@@ -126,7 +126,8 @@ export function useWorldIdGate({
  * The line that says what is on record: the check icon and one sentence. Emerald for a row the
  * gate accepts; amber for a waiver, accepted or not, and for any row the gate does not accept.
  * A flow that refuses rows (`requireRealHuman`) passes its own `notAcceptedSentence`; without
- * one, a refused row reads as the record it is, in amber. Renders nothing when there is no row.
+ * one, a refused row shows no record line at all, since the record line would read as a verified
+ * human the gate just refused. Renders nothing when there is no row.
  */
 export function WorldIdStatusRow({
   state,
@@ -153,7 +154,7 @@ export function WorldIdStatusRow({
       )}
     >
       <CheckIcon className="h-4 w-4" />
-      {notAccepted ? (notAcceptedSentence ?? recordLine) : recordLine}
+      {notAccepted ? notAcceptedSentence : recordLine}
     </div>
   );
 }
