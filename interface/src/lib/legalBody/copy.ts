@@ -623,6 +623,59 @@ export const LEGAL_BODY_COPY = {
     filingFactsMissing: "the filing facts are not recorded",
     anotherAgent: "Get a legal body for another agent",
     anotherCompany: "Declare another company",
+
+    title: "Your agent's legal body",
+    intro:
+      "What anyone can read about it, without an account: its standing, the facts a counterparty cares about, and the statement to check.",
+    /** The two labels that are not one of the API's four standing words. */
+    labels: {
+      couldNotCheck: "could not check",
+      notYetVisible: "not yet visible",
+    },
+    standingHeading: "Standing",
+    reading: "reading the public record",
+    notLinked: "the public record is read here only while the identity points at this body",
+    /** Why the public read made no answer, one per reason; none of them is a negative. */
+    couldNotCheckReasons: {
+      rate_limited: "the public record was asked too often just now; try again in a few seconds",
+      unavailable: "Novi Corpus could not check just now; try again shortly",
+      validation_error: "the public record did not take this agent id",
+      network: "the public record could not be reached from this browser",
+      timeout: "the public record did not answer in time",
+      malformed: "the public record's answer could not be read",
+    },
+    saysNothing: "this says nothing about the body's standing",
+    inactiveWords:
+      "the statement says attestationState {attestationState} and bindingState {bindingState}",
+    standingNotKnown:
+      "the statement gives a standing this page does not know, so it reads as unknown here",
+    sandboxStatement:
+      "sandbox: this statement is a test about a test declaration, and nothing in it is a filing",
+    retry: "Try again",
+    factsHeading: "What the statement says",
+    facts: {
+      identity: "Identity",
+      body: "Legal body",
+      binding: "Binding",
+      attestation: "Attestation",
+      filingStatus: "Filing status",
+      nextDue: "Next annual report due",
+      environment: "Environment",
+    },
+    notRecorded: "not recorded",
+    linksHeading: "Links",
+    statementLink: "The statement, to give a counterparty",
+    transparencyLink: "The transparency page",
+    checkHeading: "What a counterparty can check",
+    checkIntro:
+      "Anyone can open this address without an account and read the signed statement as it stands now.",
+    environmentLabel: "environment",
+    sayLabel: "What they may say, word for word",
+    sayAsItIs:
+      "Say the standing as it is, {standing}, and nothing more: the yes sentence is said only of an active standing.",
+    sayTest: "A sandbox statement is a test: say so, and never present it as a filing.",
+    sayWithSandbox:
+      "Say it with the word sandbox: a sandbox statement is a test, and nothing in it is a filing.",
   },
 
   entry: {

@@ -88,6 +88,7 @@ import { worldIdGateState, worldIdMeStatus } from "@/lib/legalBody/worldIdGate";
 import { AgreementStep } from "./AgreementStep";
 import { ClosedNotice } from "./ClosedNotice";
 import { CompanyStep } from "./CompanyStep";
+import { DoneStep } from "./DoneStep";
 import { HumanStep } from "./HumanStep";
 import { IdentityStep } from "./IdentityStep";
 import { LinkStep } from "./LinkStep";
@@ -545,6 +546,9 @@ function LegalBodySession({
         if (pointerScreen(derivation) === "paste")
           return <PastePointerPanel key={kit.orderId ?? "none"} kit={kit} />;
         return <PointerStep key={kit.orderId ?? "none"} kit={kit} />;
+      case "done":
+        // One page per order: the public read is keyed by the order's identity.
+        return <DoneStep key={kit.orderId ?? "none"} kit={kit} />;
       default:
         return <StepPlaceholder kit={kit} />;
     }
