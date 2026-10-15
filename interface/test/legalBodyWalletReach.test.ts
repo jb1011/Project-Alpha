@@ -50,6 +50,16 @@ describe.each([
   });
 });
 
+describe("CompanyStep.tsx asks only the session wallet", () => {
+  const code = source("CompanyStep.tsx");
+
+  test("the connected account is checked against the session before any door or prompt", () => {
+    const check = code.indexOf("statementWalletSentence(");
+    expect(check).toBeGreaterThan(0);
+    expect(check).toBeLessThan(code.indexOf("await declare("));
+  });
+});
+
 describe("IdentityStep.tsx sends only through the allowlist", () => {
   const code = source("IdentityStep.tsx");
 

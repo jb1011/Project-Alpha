@@ -61,8 +61,12 @@ import {
   pointerTxView,
   preflightSentence,
   refreshAnswer,
+  pointerStillChecking,
+  pointerWayOn,
   seedOffered,
+  sendAgainLine,
   sendOffered,
+  type BrowserPointerScreen,
 } from "@/lib/legalBody/pointer";
 
 const PT = LEGAL_BODY_COPY.pointer;
@@ -648,7 +652,7 @@ describe("the step's sentences", () => {
       expect(noIntentSentence(reason, "sandbox")).toStrictEqual(PT.noIntent);
   });
 
-  test("the identity changed hands: the design's sentence, word for word", () => {
+  test("the identity changed hands: the sentence, word for word", () => {
     expect(preflightSentence("identity_moved", { agentId: LIVE_AGENT, owner: GUARDIAN })).toBe(
       "The identity changed hands since the link; its current owner needs a new link, which makes a new body.",
     );
@@ -1062,5 +1066,66 @@ describe("stepLifetime", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// A pointer that cannot be written, and the button after a receipt that never came
+// ---------------------------------------------------------------------------------------------
+
+describe("pointerWayOn: a stop that no click here can lift offers a new order or a new company", () => {
+  const rows: [string, BrowserPointerScreen, boolean][] = [
+    ["no pointer asked for", { kind: "no_intent", title: "t", body: "b" }, true],
+    ["the call refused (a revoked or replaced body)", { kind: "refused", problem: "order_not_pointable" }, true],
+    ["the factory disagrees", { kind: "pointer_mismatch" }, true],
+    ["the identity changed hands", { kind: "preflight_refused", reason: "identity_moved" }, true],
+    ["no identity with this id any more", { kind: "preflight_refused", reason: "no_identity" }, true],
+    ["another wallet connected: connecting the owner lifts it", { kind: "preflight_refused", reason: "not_this_wallet" }, false],
+    ["loading", { kind: "loading" }, false],
+    ["the binding could not be read: Try again lifts it", { kind: "binding_unreadable" }, false],
+    ["a read failed: Try again lifts it", { kind: "unreadable" }, false],
+    ["ready", { kind: "ready", intent: INTENT, call: liveCall(), owner: GUARDIAN }, false],
+  ];
+  test.each(rows)("%s", (_name, screen, offered) => {
+    expect(pointerWayOn(screen)).toBe(offered);
+  });
+});
+
+describe("pointerStillChecking: a binding that no longer waits counts as still checking", () => {
+  test.each([
+    [false, "deployed", false],
+    [false, "broken", false],
+    [false, null, false],
+    [true, "deployed", true],
+    [false, "linked", true],
+    [false, "superseded", true],
+    [false, "lapsed", true],
+  ] as const)("checking %s, binding %s -> %s", (checking, bindingState, still) => {
+    expect(pointerStillChecking({ checking, bindingState })).toBe(still);
+  });
+
+  test("after a receipt that never came, a binding read as linked keeps the checks' panel, never the button", () => {
+    expect(sendOffered("no_receipt", pointerStillChecking({ checking: false, bindingState: "linked" }))).toBe(
+      false,
+    );
+    expect(sendOffered("no_receipt", pointerStillChecking({ checking: false, bindingState: "deployed" }))).toBe(
+      true,
+    );
+  });
+});
+
+describe("sendAgainLine", () => {
+  test("the button back after a receipt that never came: one line says when to use it", () => {
+    expect(sendAgainLine("no_receipt", true)).toBe(PT.sendAgain);
+    expect(PT.sendAgain).toContain("dropped");
+  });
+
+  test.each([
+    ["no receipt, still checking", "no_receipt", false],
+    ["reverted", "reverted", true],
+    ["confirmed", "confirmed", false],
+    ["before any send", null, true],
+  ] as const)("%s: no such line", (_name, stage, offered) => {
+    expect(sendAgainLine(stage, offered)).toBeNull();
   });
 });

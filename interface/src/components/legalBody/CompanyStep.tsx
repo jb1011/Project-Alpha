@@ -33,6 +33,7 @@ import {
   ownCompanyWithNumber,
   statementOnScreen,
   statementSubmitOutcome,
+  statementWalletSentence,
   stopSentence,
   validateDeclaration,
   type CompanyScreen,
@@ -124,7 +125,7 @@ function Declaration({ kit, notice }: { kit: LegalBodyStepKit; notice: NoticeSen
   const createCompany = useCreateCustomerCompanyMutation();
   const companiesQuery = useCompaniesQuery();
   const { signTypedDataAsync } = useSignTypedData();
-  const { chainId: walletChainId } = useConnection();
+  const { address: connected, chainId: walletChainId } = useConnection();
 
   function edit(field: keyof DeclarationForm, value: string) {
     setForm((f) => ({ ...f, [field]: value }));
@@ -155,6 +156,12 @@ function Declaration({ kit, notice }: { kit: LegalBodyStepKit; notice: NoticeSen
     setSaid(null);
     setContinueWith(null);
     if (hasProblems(local)) return;
+    // The statement names the wallet signed in as the guardian: only that wallet is asked for it.
+    const notSession = statementWalletSentence(connected, tenant);
+    if (notSession !== null) {
+      setSaid({ tone: "warn", text: notSession });
+      return;
+    }
     const input = declarationInput(form, environment);
     setBusy(true);
     try {

@@ -423,6 +423,13 @@ export function pastePointerState(p: {
   return { kind: "ready", call, owner: p.identityOwner };
 }
 
+/** Whether the panel offers the way on (a new order, or a new declaration): a stop no click here
+ *  can lift. A refused call, a factory that disagrees, an identity that changed hands or is gone.
+ *  Not a read to try again, and never while the call is shown. */
+export function pasteWayOn(state: PastePointerState): boolean {
+  return state.kind === "refused" || state.kind === "pointer_mismatch" || state.kind === "moved";
+}
+
 // ---------------------------------------------------------------------------------------------
 // The timed watch of the pointer: reads only
 // ---------------------------------------------------------------------------------------------

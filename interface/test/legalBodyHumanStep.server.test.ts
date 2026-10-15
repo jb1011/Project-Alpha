@@ -6,6 +6,9 @@
  * refused, offers Verify and never Continue. A deployment without World ID says so and offers no
  * button at all. The waiver is never offered here.
  */
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -30,9 +33,10 @@ vi.mock("@/lib/api/hooks", async (importOriginal) => ({
   useWorldIdMeQuery: () => ({ data: me.current.data, error: me.current.error, refetch: async () => undefined }),
 }));
 
+import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { WorldIdStatusRow } from "@/components/guardian/WorldIdGate";
 import { HumanStep } from "@/components/legalBody/HumanStep";
-import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
+import { LEGAL_BODY_COPY, PERSON_SENTENCES, fillCopy } from "@/lib/legalBody/copy";
 
 const H = LEGAL_BODY_COPY.human;
 
@@ -121,5 +125,84 @@ describe("HumanStep", () => {
     expect(out).toContain(H.unavailable);
     expect(out).not.toMatch(button(H.verify));
     expect(out).not.toMatch(button(H.continue));
+  });
+});
+
+/** U+2014, written as an escape. */
+const EM_DASH = "\u2014";
+
+const help = (props: { showWaiver?: boolean; defaultOpen?: boolean; comeBackSentence?: string }) =>
+  renderToString(
+    createElement(QueryClientProvider, { client: new QueryClient() }, createElement(GetWorldIdHelp, props)),
+  );
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+describe("the flow's human step reads without a dash", () => {
+  test.each([
+    ["accepted with the Orb", record()],
+    ["accepted with a passport", record({ credential: "passport" })],
+    ["accepted, the credential not named", record({ credential: undefined })],
+    ["a waiver on record", record({ credential: "waiver", realHuman: false })],
+    ["a credential the check refuses", record({ realHuman: false })],
+    ["nobody on record", record({ verified: false, credential: undefined, realHuman: false })],
+  ])("%s: nothing rendered carries an em dash", (_name, data) => {
+    expect(step(data)).not.toContain(EM_DASH);
+  });
+
+  test("the accepted row is the flow's own sentence, about the person", () => {
+    const out = step(record());
+    expect(out).toContain(fillCopy(H.verifiedAs, { credential: "orb" }));
+    expect(out).toContain("Verified human: orb");
+    expect(PERSON_SENTENCES).toContain(H.verifiedAs);
+  });
+
+  test("the help, opened with the props the step passes, carries no em dash and offers no waiver", () => {
+    const out = help({ showWaiver: false, defaultOpen: true, comeBackSentence: H.comeBack });
+    expect(out).toContain(H.comeBack);
+    expect(out).not.toContain(EM_DASH);
+    expect(out).not.toContain("<form");
+  });
+
+  test("the step passes the help its own sentence, and the row its own line", () => {
+    const code = readFileSync(
+      fileURLToPath(new URL("../src/components/legalBody/HumanStep.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(code).toContain("comeBackSentence={H.comeBack}");
+    expect(code).toMatch(/acceptedLine=\{\(credential\) => fillCopy\(H\.verifiedAs, \{ credential \}\)\}/);
+  });
+});
+
+describe("the onboarding wizard reads exactly as before", () => {
+  const ICON =
+    '<svg viewBox="0 0 16 16" fill="none" class="h-4 w-4" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>';
+  const row = (tone: string, line: string) =>
+    `<div class="flex items-center gap-2 text-[13px] ${tone}">${ICON}${line}</div>`;
+
+  test.each([
+    ["orb", row("text-emerald-300", `Verified human ${EM_DASH} orb`)],
+    ["passport", row("text-emerald-300", `Verified human ${EM_DASH} passport`)],
+    ["document", row("text-emerald-300", `Verified human ${EM_DASH} document`)],
+    ["waiver", row("text-amber-300", `Guardian waiver on record ${EM_DASH} not a verified human`)],
+    [null, row("text-emerald-300", `Verified human ${EM_DASH} proof of personhood`)],
+  ] as const)("the status row with credential %s, byte for byte", (credential, markup) => {
+    const state: WorldIdGateState = { kind: "accepted", credential };
+    expect(renderToString(createElement(WorldIdStatusRow, { state }))).toBe(markup);
+  });
+
+  test("the help, opened and closed, with and without the waiver, byte for byte", () => {
+    expect(sha256(help({ defaultOpen: true, showWaiver: true }))).toBe(
+      "c76d722b46dc862e0e3768d8519e74bdb185da10cc279e20afe9a90502642ace",
+    );
+    expect(sha256(help({ defaultOpen: true, showWaiver: false }))).toBe(
+      "b9155d801034662b2b0c29b7550c641eeabed28493a7cb3ac0c6764b7a7898bb",
+    );
+    for (const showWaiver of [true, false])
+      expect(sha256(help({ showWaiver }))).toBe(
+        "da771f03719227bf7cbff65b436b94486cace6e878462bf609339cd1fa5d8396",
+      );
+    expect(help({ defaultOpen: true })).toContain(
+      `Come back to this page once World App shows your World ID and tap Verify ${EM_DASH} we keep your place.`,
+    );
   });
 });

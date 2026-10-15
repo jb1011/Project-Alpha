@@ -7,7 +7,7 @@ import { useWorldIdGate, WorldIdStatusRow } from "@/components/guardian/WorldIdG
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { StepNav } from "@/components/onboarding/OnboardingFlow";
 import { Button, Callout, Card, Spinner, StepHeader } from "@/components/onboarding/primitives";
-import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
+import { LEGAL_BODY_COPY, fillCopy } from "@/lib/legalBody/copy";
 import { humanErrorSentence, humanStepView } from "@/lib/legalBody/gates";
 
 const H = LEGAL_BODY_COPY.human;
@@ -70,7 +70,11 @@ export function HumanStep({
               <p className="text-[12.5px] leading-[1.6] text-muted">{H.unreadable}</p>
             )}
             {view.line === "record" && (
-              <WorldIdStatusRow state={state} notAcceptedSentence={H.notAccepted} />
+              <WorldIdStatusRow
+                state={state}
+                notAcceptedSentence={H.notAccepted}
+                acceptedLine={(credential) => fillCopy(H.verifiedAs, { credential })}
+              />
             )}
 
             {view.points && (
@@ -80,7 +84,7 @@ export function HumanStep({
                     <Point key={point}>{point}</Point>
                   ))}
                 </ul>
-                <GetWorldIdHelp showWaiver={false} />
+                <GetWorldIdHelp showWaiver={false} comeBackSentence={H.comeBack} />
               </>
             )}
 

@@ -4,6 +4,10 @@ import { useState } from "react";
 import { useWorldIdWaiverMutation } from "@/lib/api/hooks";
 import { cx } from "@/components/onboarding/primitives";
 
+/** The line under the two routes, as the wizard has always shown it. */
+const COME_BACK =
+  "Come back to this page once World App shows your World ID and tap Verify \u2014 we keep your place.";
+
 /**
  * The path for someone who has no World ID yet.
  *
@@ -16,11 +20,15 @@ export function GetWorldIdHelp({
   className,
   defaultOpen = false,
   showWaiver = true,
+  comeBackSentence = COME_BACK,
 }: {
   className?: string;
   defaultOpen?: boolean;
   /** False where a waiver is not accepted, so none is offered. */
   showWaiver?: boolean;
+  /** A flow's own words for the line under the two routes. Without it, the line reads as it always
+   *  has. */
+  comeBackSentence?: string;
 }) {
   const [open, setOpen] = useState(defaultOpen);
 
@@ -57,10 +65,7 @@ export function GetWorldIdHelp({
             />
           </div>
 
-          <p className="text-[11.5px] text-muted-2">
-            Come back to this page once World App shows your World ID and tap Verify — we keep
-            your place.
-          </p>
+          <p className="text-[11.5px] text-muted-2">{comeBackSentence}</p>
 
           {/* Neither route exists everywhere (no Orb in France; ~12 countries of passports).
               The waiver is the honest fallback: admin-issued, single-use, and recorded as a

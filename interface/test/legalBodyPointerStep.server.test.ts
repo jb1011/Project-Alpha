@@ -192,7 +192,13 @@ const kit = (o: LegalBodyOrderView | null, cfg = config()): PointerStepKit => ({
   config: cfg,
   order: o,
   routeSignIn: vi.fn(() => false),
+  startAnother: vi.fn(),
 });
+
+const CL = LEGAL_BODY_COPY.closed;
+
+/** The way on a stop offers: a new order on the same company, and a new declaration. */
+const wayOnShown = (m: string) => hasButton(m, CL.newOrder) && hasButton(m, CL.newCompany);
 
 const markup = (k: PointerStepKit) => renderToString(createElement(PointerStep, { kit: k }));
 
@@ -352,46 +358,86 @@ describe("the pointer step", () => {
     expect(hasButton(m, PT.send)).toBe(false);
   });
 
-  test("a body winding down asks for no pointer: the notice, and no button", () => {
+  test("a body winding down asks for no pointer: the notice, no send, and the way on", () => {
     everythingAgrees();
     api.binding = { data: binding({ state: "broken", brokenReason: "winding_down", intent: null }), isError: false };
     const m = markup(kit(deployed({ state: "broken", brokenReason: "winding_down" })));
     const n = noticeSentence({ kind: "winding_down" }, "sandbox");
     expect(text(m)).toContain(n.title);
     expect(text(m)).toContain(n.body);
-    expect(m).not.toContain("<button");
+    expect(hasButton(m, PT.send)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
   });
 
-  test("a revoked order: the allowlist refuses it, no read is made and there is no button", () => {
+  test("no pointer asked for, for no reason given: the sentence, no send, and the way on", () => {
+    everythingAgrees();
+    api.binding = { data: binding({ intent: null }), isError: false };
+    const m = markup(kit(deployed()));
+    expect(text(m)).toContain(PT.noIntent.body);
+    expect(hasButton(m, PT.send)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
+  });
+
+  test("a revoked order: the allowlist refuses it, no read is made, no send, and the way on", () => {
     everythingAgrees();
     const m = markup(kit(deployed({ revoked: true })));
     expect(text(m)).toContain(fillCopy(PT.callRefused, { problem: "order_not_pointable" }));
-    expect(m).not.toContain("<button");
+    expect(hasButton(m, PT.send)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
     expect(chain.asked.length).toBeGreaterThan(0);
     for (const read of chain.asked) expect(read.enabled).toBe(false);
     expect(chain.gas.enabled).toBe(false);
   });
 
-  test("the factory encodes another value: the stop, and no button", () => {
+  test("the factory encodes another value: the stop, no send, and the way on", () => {
     everythingAgrees();
     chain.reads.encodePointer = { status: "success", data: `${LIVE_POINTER.slice(0, -2)}ff` };
     const m = markup(kit(deployed()));
     expect(text(m)).toContain(
       "Your wallet is not asked to send the pointer: the pointer could not be checked against the factory.",
     );
-    expect(m).not.toContain("<button");
+    expect(hasButton(m, PT.send)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
     expect(chain.gas.enabled).toBe(false);
   });
 
-  test("the identity changed hands: the sentence, and no button", () => {
+  test("the identity changed hands: the sentence, no send, and the way on", () => {
     everythingAgrees();
     chain.reads.ownerOf = { status: "success", data: THIRD };
     const m = markup(kit(deployed()));
     expect(text(m)).toContain(PT.identityMoved);
-    expect(m).not.toContain("<button");
+    expect(hasButton(m, PT.send)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
   });
 
-  test("another wallet connected: the owner is named, and no button", () => {
+  test("no identity with this id any more: the sentence, no send, and the way on", () => {
+    everythingAgrees();
+    chain.reads.ownerOf = {
+      status: "error",
+      error: Object.assign(new Error("reverted"), { name: "ContractFunctionRevertedError" }),
+    };
+    const m = markup(kit(deployed()));
+    expect(text(m)).toContain(fillCopy(LEGAL_BODY_COPY.paste.noIdentity, { agentId: LIVE_AGENT }));
+    expect(hasButton(m, PT.send)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
+  });
+
+  test("the way on is a click of the person's: rendering starts nothing", () => {
+    everythingAgrees();
+    chain.reads.ownerOf = { status: "success", data: THIRD };
+    const k = kit(deployed());
+    markup(k);
+    expect(k.startAnother).not.toHaveBeenCalled();
+  });
+
+  test("ready, or a read to try again: no way on, the step itself is the way", () => {
+    everythingAgrees();
+    expect(wayOnShown(markup(kit(deployed())))).toBe(false);
+    chain.reads.identityOwnerAtCreation = { status: "error", error: new Error("offline") };
+    expect(wayOnShown(markup(kit(deployed())))).toBe(false);
+  });
+
+  test("another wallet connected: the owner is named, and no button: connecting the owner is the way", () => {
     everythingAgrees();
     chain.connected = OTHER;
     const m = markup(kit(deployed()));
@@ -443,6 +489,19 @@ describe("nothing outlives the step", () => {
     expect(afterSend.split("if (!life.alive()) return;").length - 1).toBe(2);
     const afterReceipt = code.slice(receipt, code.indexOf("pointerTxStage(receipt)"));
     expect(afterReceipt).toContain("if (!life.alive()) return;");
+  });
+
+  test("a send again ends the watch and the old status only once the wallet sent it", () => {
+    const click = code.indexOf("async function onSend()");
+    const send = code.indexOf("await send(");
+    const refused = code.indexOf("if (!sent.ok)", send);
+    const receipt = code.indexOf("await client.waitForTransactionReceipt(");
+    const beforeSend = code.slice(click, send);
+    for (const reset of ["watch.current = null", "setTx(null)", "setKeepChecking(false)", "setChainUnread(false)"])
+      expect(beforeSend).not.toContain(reset);
+    const afterSent = code.slice(refused, receipt);
+    expect(afterSent).toContain("watch.current = null;");
+    expect(afterSent).toContain("setKeepChecking(false);");
   });
 });
 

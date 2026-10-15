@@ -17,7 +17,7 @@ import {
   type StatementMessageAnswer,
 } from "@/lib/api/types";
 import { LEGAL_BODY_COPY, fillCopy } from "./copy";
-import type { CompanyStep, LegalBodyNotice } from "./flow";
+import { sameAddress, type CompanyStep, type LegalBodyNotice } from "./flow";
 import { noticeSentence, type NoticeSentence } from "./notice";
 import { normaliseDeclaredText } from "./typedData";
 
@@ -262,6 +262,16 @@ export function declinedSentence(
   const { networkSandbox, networkProduction } = LEGAL_BODY_COPY.pointer;
   const network = config.environment === "sandbox" ? networkSandbox : networkProduction;
   return fillCopy(C.declinedOtherNetwork, { network });
+}
+
+/**
+ * Whether the wallet connected in this browser may be asked for the statement: only the wallet
+ * signed in, whatever its casing, since the statement names it as the guardian. Null when it is;
+ * otherwise the sentence to say, and the prompt does not open, as for the link, the registration
+ * and the pointer.
+ */
+export function statementWalletSentence(connected: string | undefined, session: string): string | null {
+  return sameAddress(connected, session) ? null : C.notConnected;
 }
 
 /** The abandon door's refusal as served; when no answer came back, a sentence that says so. */

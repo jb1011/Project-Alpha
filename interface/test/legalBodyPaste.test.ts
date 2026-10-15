@@ -37,6 +37,7 @@ import {
   pasteErrorOutcome,
   pasteOutcomeView,
   pastePointerState,
+  pasteWayOn,
   pasteSubmitPlan,
   pointerCallRows,
   pointerCallText,
@@ -886,3 +887,24 @@ describe("the words", () => {
       expect(s.toLowerCase()).not.toMatch(/(enter|paste|type) (your|an|the) api key/);
   });
 });
+
+describe("pasteWayOn: a stop no click here can lift offers a new order or a new company", () => {
+  test.each([
+    ["the call refused", { kind: "refused", problem: "order_not_pointable" }, true],
+    ["the factory disagrees", { kind: "pointer_mismatch" }, true],
+    ["the identity changed hands", { kind: "moved", reason: "identity_moved" }, true],
+    ["no identity with this id any more", { kind: "moved", reason: "no_identity" }, true],
+    ["loading", { kind: "loading" }, false],
+    ["a read failed: Try again lifts it", { kind: "unreadable" }, false],
+  ] as const)("%s", (_name, state, offered) => {
+    expect(pasteWayOn(state)).toBe(offered);
+  });
+
+  test("the call shown is not a stop", () => {
+    const call = pointerCallText(CONFIG_FOR_WAY_ON, deployed());
+    if ("ok" in call) throw new Error("refused");
+    expect(pasteWayOn({ kind: "ready", call, owner: OWNER })).toBe(false);
+  });
+});
+
+const CONFIG_FOR_WAY_ON = { chainId: CHAIN, identityRegistry: REGISTRY, factory: FACTORY } as const;

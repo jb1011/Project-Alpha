@@ -242,6 +242,10 @@ function hasButton(m: string, label: string): boolean {
   );
 }
 
+/** The way on a stop offers: a new order on the same company, and a new declaration. */
+const wayOnShown = (m: string) =>
+  hasButton(m, LEGAL_BODY_COPY.closed.newOrder) && hasButton(m, LEGAL_BODY_COPY.closed.newCompany);
+
 /** The text a person reads: the markup's tags dropped and its escapes undone. */
 function text(m: string): string {
   return m
@@ -470,12 +474,34 @@ describe("the pointer panel", () => {
     expect(text(m)).not.toContain(CALLDATA);
   });
 
-  test("a replaced order is refused before any read: no call, nothing to click", () => {
+  test("a replaced order is refused before any read: no call, nothing to send, the way on", () => {
     chainAgrees();
     const m = pointerMarkup(kit(POINTER, deployed({ state: "broken", brokenReason: "replaced" })));
     expect(text(m)).toContain(fillCopy(P.callRefused, { problem: "order_not_pointable" }));
     expect(chain.asked).toEqual([]);
-    expect(m).not.toContain("<button");
+    expect(hasButton(m, P.sent)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
+  });
+
+  test.each([
+    ["the factory encoding other bytes", () => (chain.reads.encodePointer = { status: "success", data: `${LIVE_POINTER.slice(0, -2)}ef` })],
+    ["the identity moved since the link", () => (chain.reads.ownerOf = { status: "success", data: THIRD })],
+    ["no identity with this id now", () => (chain.reads.ownerOf = { status: "error", error: revert })],
+  ])("%s: a stop that offers the way on, and nothing to send", (_name, bend) => {
+    chainAgrees();
+    bend();
+    const k = kit(POINTER, deployed());
+    const m = pointerMarkup(k);
+    expect(hasButton(m, P.sent)).toBe(false);
+    expect(wayOnShown(m)).toBe(true);
+    expect(k.startAnother).not.toHaveBeenCalled();
+  });
+
+  test("the call shown, or a read to try again: no way on", () => {
+    chainAgrees();
+    expect(wayOnShown(pointerMarkup(kit(POINTER, deployed())))).toBe(false);
+    chain.reads.identityOwnerAtCreation = { status: "error", error: new Error("offline") };
+    expect(wayOnShown(pointerMarkup(kit(POINTER, deployed())))).toBe(false);
   });
 });
 

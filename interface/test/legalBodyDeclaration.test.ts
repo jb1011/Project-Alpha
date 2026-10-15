@@ -22,6 +22,7 @@ import {
   companyScreen,
   declarationInput,
   declinedSentence,
+  statementWalletSentence,
   gateRefusalOutcome,
   isAlreadyDeclared,
   filingKeyOf,
@@ -83,7 +84,8 @@ describe("validateDeclaration: the doors' field rules, mirrored", () => {
     ["201 typed with a doubled space, 200 once collapsed", `Test  ${"A".repeat(195)}`, undefined],
     ["doubled spaces and spaces at the ends", "  Example  Test   Holdings LLC ", undefined],
     ["an accented letter", "Café Test LLC", C.nameCharset],
-    ["an accented letter typed as two code points", "Café Test LLC", C.nameCharset],
+    // "e" then U+0301, the combining acute accent, written as an escape so the two code points show.
+    ["an accented letter typed as two code points", "Cafe\u0301 Test LLC", C.nameCharset],
     ["a character outside the charset", "Test@Holdings LLC", C.nameCharset],
     ["every character of the charset", "Test & Co's (Holdings) - A, B. + 9", undefined],
     ["a double quote", 'Example "Test" LLC', P.doubleQuote],
@@ -139,8 +141,9 @@ describe("validateDeclaration: the doors' field rules, mirrored", () => {
     ["a name with an accented letter", { declarantName: "Zoë Example" }, "declarantName", undefined],
     ["a name with a digit", { declarantName: "Example 2" }, "declarantName", P.declarantNameCharset],
     ["a name of one letter", { declarantName: "É" }, "declarantName", length(2, 120)],
-    ["120 letters typed as two code points each", { declarantName: "é".repeat(120) }, "declarantName", undefined],
-    ["121 letters typed as two code points each", { declarantName: "é".repeat(121) }, "declarantName", length(2, 120)],
+    // Each letter is "e" then U+0301, the combining acute accent, written as an escape.
+    ["120 letters typed as two code points each", { declarantName: "e\u0301".repeat(120) }, "declarantName", undefined],
+    ["121 letters typed as two code points each", { declarantName: "e\u0301".repeat(121) }, "declarantName", length(2, 120)],
     ["a name with a tab", { declarantName: "Example\tDeclarant" }, "declarantName", P.control],
     ["a title with digits, a slash, an ampersand and a comma", { declarantTitle: "Manager/Member 1, R&D" }, "declarantTitle", undefined],
     ["a title with a hash", { declarantTitle: "Manager #1" }, "declarantTitle", P.declarantTitleCharset],
@@ -670,5 +673,22 @@ describe("abandonRefusalSentence", () => {
 
   test("no answer says so, about the abandon", () => {
     expect(abandonRefusalSentence(new TypeError("Failed to fetch"))).toBe(C.abandonNoAnswer);
+  });
+});
+
+describe("statementWalletSentence: the statement is signed only by the wallet signed in", () => {
+  const SESSION = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as const;
+  const OTHER = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as const;
+
+  test("the session wallet connected, in any casing: nothing to say, the prompt may open", () => {
+    expect(statementWalletSentence(SESSION, SESSION)).toBeNull();
+    expect(statementWalletSentence(SESSION.toLowerCase(), SESSION)).toBeNull();
+    expect(statementWalletSentence(`0x${SESSION.slice(2).toUpperCase()}`, SESSION)).toBeNull();
+  });
+
+  test("another account selected, or none connected: the not-connected sentence, and no prompt", () => {
+    expect(statementWalletSentence(OTHER, SESSION)).toBe(C.notConnected);
+    expect(statementWalletSentence(undefined, SESSION)).toBe(C.notConnected);
+    expect(statementWalletSentence("", SESSION)).toBe(C.notConnected);
   });
 });

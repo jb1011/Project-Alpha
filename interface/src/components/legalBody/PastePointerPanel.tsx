@@ -21,6 +21,7 @@ import {
 import { LEGAL_BODY_COPY, fillCopy } from "@/lib/legalBody/copy";
 import {
   pastePointerState,
+  pasteWayOn,
   pointerCallRows,
   pointerCallText,
   pointerChecksOf,
@@ -31,6 +32,7 @@ import {
   type PointerCallText,
 } from "@/lib/legalBody/paste";
 import { REFRESH_RETRY_MS, refreshPlan } from "@/lib/legalBody/polling";
+import { WayOn } from "./ClosedNotice";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 import { CopyBox, FieldRows, McpNote } from "./PasteLinkPanel";
 
@@ -72,7 +74,13 @@ export function PastePointerPanel({ kit }: { kit: LegalBodyStepKit }) {
         intro={order.agentId !== null ? fillCopy(P.pointerIntro, { agentId: order.agentId }) : undefined}
       />
       {"ok" in call ? (
-        <Callout tone="warn">{fillCopy(P.callRefused, { problem: call.problem })}</Callout>
+        <>
+          <Callout tone="warn">{fillCopy(P.callRefused, { problem: call.problem })}</Callout>
+          {/* The call can never be built for this order: the way on, as for any stop. */}
+          {pasteWayOn({ kind: "refused", problem: call.problem }) && (
+            <WayOn onWayOut={kit.startAnother} />
+          )}
+        </>
       ) : (
         <PointerChecks kit={kit} order={order} call={call} />
       )}
@@ -152,18 +160,29 @@ function PointerChecks({
         </>
       );
     case "refused":
-      return <Callout tone="warn">{fillCopy(P.callRefused, { problem: state.problem })}</Callout>;
+      return (
+        <>
+          <Callout tone="warn">{fillCopy(P.callRefused, { problem: state.problem })}</Callout>
+          {pasteWayOn(state) && <WayOn onWayOut={kit.startAnother} />}
+        </>
+      );
     case "pointer_mismatch":
       return (
-        <Callout tone="warn">{fillCopy(P.pointerStop, { reason: POINTER.factoryMismatch })}</Callout>
+        <>
+          <Callout tone="warn">{fillCopy(P.pointerStop, { reason: POINTER.factoryMismatch })}</Callout>
+          {pasteWayOn(state) && <WayOn onWayOut={kit.startAnother} />}
+        </>
       );
     case "moved":
       return (
-        <Callout tone="warn">
-          {state.reason === "no_identity"
-            ? fillCopy(P.noIdentity, { agentId: call.args[0] })
-            : POINTER.identityMoved}
-        </Callout>
+        <>
+          <Callout tone="warn">
+            {state.reason === "no_identity"
+              ? fillCopy(P.noIdentity, { agentId: call.args[0] })
+              : POINTER.identityMoved}
+          </Callout>
+          {pasteWayOn(state) && <WayOn onWayOut={kit.startAnother} />}
+        </>
       );
     case "ready":
       return <SendFromOwner kit={kit} order={order} call={state.call} owner={state.owner} body={body} />;

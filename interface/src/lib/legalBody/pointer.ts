@@ -261,6 +261,26 @@ export function browserPointerScreen(p: {
   }
 }
 
+/**
+ * Whether a stop offers the way on (a new order on the same company, or a new declaration): a stop
+ * no click on this step can lift. No pointer asked for, a call the allowlist refuses, a factory
+ * that disagrees, an identity that changed hands or is gone: the order can never point here, and
+ * a live deployed order would otherwise hold the person on this step. Not another wallet connected
+ * (connecting the owner lifts it), not a read to try again, and never while the call is offered.
+ */
+export function pointerWayOn(screen: BrowserPointerScreen): boolean {
+  switch (screen.kind) {
+    case "no_intent":
+    case "refused":
+    case "pointer_mismatch":
+      return true;
+    case "preflight_refused":
+      return screen.reason !== "not_this_wallet";
+    default:
+      return false;
+  }
+}
+
 /** Why no pointer is asked for: the body winds down or is dissolved, in the notices' words, or
  *  the binding asks for none just now. */
 export function noIntentSentence(
@@ -342,6 +362,20 @@ export function pointerTxView(stage: PointerTxStage): { text: string; tone: "inf
     case "no_receipt":
       return { text: PT.noReceipt, tone: "warn" };
   }
+}
+
+/**
+ * Whether the checks still count as running: the plan is on, or the binding no longer waits for
+ * the pointer (`linked` among them), in which case the order is being read again and the flow
+ * moves on. Either way the checks' panel stays, so nothing else shows for a moment before done.
+ */
+export function pointerStillChecking(p: { checking: boolean; bindingState: BindingState | null }): boolean {
+  return p.checking || bindingSettled(p.bindingState);
+}
+
+/** The line beside the button when it is back after a receipt that never came: when to use it. */
+export function sendAgainLine(stage: PointerTxStage | null, offered: boolean): string | null {
+  return stage === "no_receipt" && offered ? PT.sendAgain : null;
 }
 
 /**

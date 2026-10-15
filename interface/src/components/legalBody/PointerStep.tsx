@@ -48,15 +48,19 @@ import {
   pointerFailureLines,
   pointerRefusalSentence,
   pointerSentence,
+  pointerStillChecking,
   pointerTxStage,
   pointerTxView,
+  pointerWayOn,
   preflightSentence,
   refreshAnswer,
   seedOffered,
+  sendAgainLine,
   sendOffered,
   type PointerTxStage,
 } from "@/lib/legalBody/pointer";
 import { REFRESH_RETRY_MS, refreshPlan } from "@/lib/legalBody/polling";
+import { WayOn } from "./ClosedNotice";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 
 const PT = LEGAL_BODY_COPY.pointer;
@@ -79,9 +83,10 @@ function stateOf(answer: unknown): BindingState | null {
     : null;
 }
 
-/** What the step needs from the flow: the deployment, the order, and the way back to sign-in. Any
- *  page that shows the record and offers the pointer can pass the same. */
-export type PointerStepKit = Pick<LegalBodyStepKit, "config" | "order" | "routeSignIn">;
+/** What the step needs from the flow: the deployment, the order, the way back to sign-in, and the
+ *  way on (a new order or a new company) when the pointer can never be written here. Any page that
+ *  shows the record and offers the pointer can pass the same. */
+export type PointerStepKit = Pick<LegalBodyStepKit, "config" | "order" | "routeSignIn" | "startAnother">;
 
 /** The refresh plan after the receipt: its own clock, the refreshes made, and the state last read. */
 type PlanRun = {
@@ -325,12 +330,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       return;
     }
     inFlight.current = true;
-    // A send again after one whose receipt never came: the reads of the binding after it end.
-    watch.current = null;
     setBusy("sending");
-    setTx(null);
-    setChainUnread(false);
-    setKeepChecking(false);
     try {
       let sent: Awaited<ReturnType<typeof send>>;
       try {
@@ -346,6 +346,11 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
         setLines([pointerRefusalSentence(sent.problem, environment)]);
         return;
       }
+      // Sent: a send again after one whose receipt never came ends the reads of the binding after
+      // it, and the old status goes. A send that did not go through leaves both as they were.
+      watch.current = null;
+      setChainUnread(false);
+      setKeepChecking(false);
       const hash = sent.hash;
       setSentSentence(pointerSentence(ready.intent, environment));
       setTx({ hash, stage: "waiting" });
@@ -405,8 +410,15 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
     if (read.error && isSignInRequired(read.error)) kit.routeSignIn(read.error);
   }
 
-  // After a send, the checks' panel; the button again only as `sendOffered` says.
-  const sentView = tx !== null && !sendOffered(tx.stage, checking);
+  // After a send, the checks' panel; the button again only as `sendOffered` says. A binding that no
+  // longer waits counts as still checking, so nothing else shows for a moment before done.
+  const stillChecking = pointerStillChecking({
+    checking,
+    bindingState: bindingQuery.data?.state ?? null,
+  });
+  const offered = sendOffered(tx?.stage ?? null, stillChecking);
+  const sentView = tx !== null && !offered;
+  const sendAgain = sendAgainLine(tx?.stage ?? null, offered);
   const intro = sentView ? sentSentence : ready ? pointerSentence(ready.intent, environment) : null;
 
   return (
@@ -477,6 +489,8 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
               })}
             </Callout>
           )}
+          {/* A stop no click here can lift: the order can never point, so the way on is offered. */}
+          {pointerWayOn(screen) && <WayOn onWayOut={kit.startAnother} />}
           {ready && (
             <>
               <Callout tone={gasView.tone}>
@@ -521,6 +535,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
                   <span className="flex flex-col gap-2">
                     <span>{pointerTxView(tx.stage).text}</span>
                     {keepChecking && <span>{PT.keepChecking}</span>}
+                    {sendAgain && <span>{sendAgain}</span>}
                     <TxLink hash={tx.hash} />
                   </span>
                 </Callout>
@@ -540,7 +555,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
                 </div>
               )}
 
-              {sendOffered(tx?.stage ?? null, checking) && (
+              {offered && (
                 <StepNav>
                   <Button
                     onClick={() => void onSend()}

@@ -35,3 +35,19 @@ export function ClosedNotice({
     </div>
   );
 }
+
+/**
+ * The two ways on from an order that can no longer move here, though it is still open: a new order
+ * on the same company, or a new declaration. The pointer steps show it under a stop no click there
+ * can lift, so a deployed order whose pointer can never be written does not hold the person.
+ */
+export function WayOn({ onWayOut }: { onWayOut: (wayOut: "new_order" | "new_company") => void }) {
+  return (
+    <StepNav>
+      <Button variant="ghost" onClick={() => onWayOut("new_company")}>
+        {LEGAL_BODY_COPY.closed.newCompany}
+      </Button>
+      <Button onClick={() => onWayOut("new_order")}>{LEGAL_BODY_COPY.closed.newOrder}</Button>
+    </StepNav>
+  );
+}

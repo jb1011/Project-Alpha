@@ -22,6 +22,9 @@ const YES_SENTENCE =
 const PERSON_ON_RECORD =
   "World ID shows a verified person behind this account; every legal body on it relies on that record.";
 
+/** Said of the person whose record the human step accepted, never of a company. */
+const VERIFIED_AS = "Verified human: {credential}";
+
 const OPERATOR_CHECKS =
   "A Novi Corpus operator checks the declaration against the registry and your document. This is done by a person; it is not instant.";
 
@@ -109,6 +112,10 @@ export const LEGAL_BODY_COPY = {
     checking: "Reading the guardian record…",
     unreadable: "The guardian record could not be read just now.",
     verify: "Verify with World ID",
+    /** The accepted record line, said of the person: the credential World ID names. */
+    verifiedAs: VERIFIED_AS,
+    comeBack:
+      "Come back to this page once World App shows your World ID and tap Verify; we keep your place.",
     continue: "Continue",
     retry: "Try again",
     back: "Back",
@@ -278,6 +285,8 @@ export const LEGAL_BODY_COPY = {
     declined: "Your wallet did not sign, so nothing was sent.",
     declinedOtherNetwork:
       "Your wallet did not sign, so nothing was sent. It is on another network than {network}, and a wallet may refuse to sign this statement until it is switched there.",
+    notConnected:
+      "This wallet is not connected in this browser just now, or another account is selected in it. Connect the wallet you signed in with to sign; nothing was asked for and nothing was sent.",
     refused:
       "The statement served does not match what you typed or this deployment ({problem}), so your wallet was not opened and nothing was declared.",
     noAnswer:
@@ -589,6 +598,8 @@ export const LEGAL_BODY_COPY = {
     notEnough:
       "That is less than the estimate, so the pointer cannot be sent yet: add a little native USDC to this wallet, then check the balance again; the button turns on once the balance covers the gas.",
     checkBalance: "Check the balance again",
+    sendAgain:
+      "If the transaction was dropped and never reached the chain, you can send it again: it writes the same pointer, so a second one changes nothing.",
     gasProduction: "Your wallet needs a little native USDC on Arc for gas.",
     seed: "Ask Novi Corpus for a little gas",
     seedSent: "A little native USDC was sent to this wallet.",
@@ -718,7 +729,7 @@ export const CHECK_REASON_SENTENCES: Record<CheckReasonCode, string> = {
 };
 
 /** The only sentences allowed to say "verified": each is about the person on record. */
-export const PERSON_SENTENCES: readonly string[] = [PERSON_ON_RECORD];
+export const PERSON_SENTENCES: readonly string[] = [PERSON_ON_RECORD, VERIFIED_AS];
 
 /** The only sentences allowed to say "Novi" without "Corpus". */
 export const APPROVED_NOVI_SENTENCES: readonly string[] = [YES_SENTENCE];
