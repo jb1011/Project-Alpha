@@ -56,6 +56,7 @@ import {
 } from "@/lib/legalBody/gates";
 import { afterOrderRefused, linkScreen, type LinkSendBack } from "@/lib/legalBody/link";
 import { closedSentence, noticeSentence } from "@/lib/legalBody/notice";
+import { pointerScreen } from "@/lib/legalBody/paste";
 import {
   canJumpTo,
   phaseLabel,
@@ -90,6 +91,8 @@ import { CompanyStep } from "./CompanyStep";
 import { HumanStep } from "./HumanStep";
 import { IdentityStep } from "./IdentityStep";
 import { LinkStep } from "./LinkStep";
+import { PasteLinkPanel } from "./PasteLinkPanel";
+import { PastePointerPanel } from "./PastePointerPanel";
 import { SandboxBanner } from "./SandboxBanner";
 import { SignInStep } from "./SignInStep";
 import { ThreadChooser } from "./ThreadChooser";
@@ -511,9 +514,17 @@ function LegalBodySession({
         // One step per order: a new order never inherits another's typing or reads.
         return <IdentityStep key={kit.orderId ?? "none"} kit={kit} />;
       case "link":
-        // The panel for a key elsewhere is not on this page yet.
-        if (linkScreen(derivation) === "paste") return <StepPlaceholder kit={kit} />;
-        // One step per order: a click's state never carries over to another order.
+        // One step per order: a click's state never carries over to another order. Another key
+        // signs on its own panel, which never opens this browser's wallet.
+        if (linkScreen(derivation) === "paste")
+          return (
+            <PasteLinkPanel
+              key={kit.orderId ?? "none"}
+              kit={kit}
+              agentId={choices.agentId}
+              onSendBack={(to, sentence) => void sendBack(to, sentence)}
+            />
+          );
         return (
           <LinkStep
             key={kit.orderId ?? "none"}
@@ -522,6 +533,12 @@ function LegalBodySession({
             onSendBack={(to, sentence) => void sendBack(to, sentence)}
           />
         );
+      case "pointer":
+        // Another key sends the pointer on its own panel; this wallet's step is not on this page
+        // yet.
+        if (pointerScreen(derivation) === "paste")
+          return <PastePointerPanel key={kit.orderId ?? "none"} kit={kit} />;
+        return <StepPlaceholder kit={kit} />;
       default:
         return <StepPlaceholder kit={kit} />;
     }

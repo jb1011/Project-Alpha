@@ -464,11 +464,84 @@ export const LEGAL_BODY_COPY = {
       "The answer to the signed link could not be read, so whether it was taken is not known yet. Your order is read again; if it has not moved, sign again.",
   },
 
+  /** The identity is owned by another key: the link is signed and the pointer sent wherever that
+   *  key lives. Data only on these screens: typed data, a hex value, a decoded call. */
   paste: {
     signerNote:
       "sign this with the key that owns identity {agentId}, wherever it lives: your agent's signer, a hardware wallet, or circle wallet sign typed-data; a signer that takes whole typed data signs it as is; an ethers signer must drop types.EIP712Domain",
     sendFromOwner: "send this from the owner key",
     sent: "I sent it",
+
+    title: "Sign the link with the key that owns the identity",
+    intro:
+      "Identity {agentId} is owned by another key. That key signs the link wherever it lives, and you paste its signature back here; your wallet is not asked for anything on this step.",
+    howItWorks:
+      "When you click Get the link, this page asks for the link with a six-hour deadline, checks every field of it against your order, your identity, the agreement you read and this wallet as the guardian, and only then shows it to copy.",
+    getLink: "Get the link",
+    owner: "The identity's owner, as the link door read it: {owner}.",
+    typedDataHeading: "The typed data to sign, exactly as served",
+    copy: "Copy",
+    copied: "Copied",
+    copyByHand: "Select the text above and copy it.",
+    signatureLabel: "The signature",
+    signatureHint: "hex, with or without 0x, at most 2,048 bytes",
+    send: "Send the signature",
+    /** Said under the signature field; the field's label comes first. */
+    problems: {
+      empty: "is empty: paste the signature the owner key made",
+      not_hex: "holds a character that is not hex: only 0-9 and a-f, with or without 0x",
+      odd_length: "has an odd number of hex digits, so it is not whole bytes",
+      too_long: "is longer than 2,048 bytes",
+    },
+    refused:
+      "The link served does not match your order, your identity, the agreement you read or this wallet as the guardian ({problem}), so it is not shown and nothing should be signed.",
+    ttlAboveMax:
+      "This deployment serves links for less than six hours, so a link to sign elsewhere cannot be asked for here.",
+    stale:
+      "This link's deadline is too close to use, so the signature was not sent. Get the link again and sign the new one.",
+    tryAgainSoon: "Your order is kept: in a moment, send the same signature again.",
+    unreadableAnswer:
+      "The answer to the signature could not be read, so whether it was taken is not known yet. Your order is read again; if it has not moved, send the signature again.",
+    mcp: "An automated agent can take these steps with the MCP tools get_link_message, submit_link and get_binding instead. They need an API key, minted on /agents/connect as for any connection, and that key reaches further than one link: it acts for your whole account. This page never asks for one.",
+
+    pointerTitle: "Write the pointer from the key that owns the identity",
+    pointerIntro:
+      "Identity {agentId} is owned by another key, so that key sends the one transaction that points the identity at its legal body. This page shows the call to send; your wallet is not asked for anything on this step.",
+    checking: "Checking the pointer against the factory, and the identity's owner, on the chain…",
+    checksUnread: "The chain could not be read just now, so the call is not shown yet. Try again.",
+    callRefused:
+      "The call could not be built for this order ({problem}), so it is not shown and nothing should be sent.",
+    pointerStop: "The call is not shown, so nothing should be sent from the owner key: {reason}.",
+    noIdentity:
+      "The identity registry has no identity {agentId} now, so no pointer can be written for it.",
+    rows: {
+      from: "from",
+      to: "to",
+      function: "function",
+      agentId: "agentId",
+      key: "key",
+      value: "value",
+      nativeValue: "native value",
+    },
+    notes: {
+      from: "the identity's owner",
+      to: "the identity registry",
+      value:
+        "96 bytes: version 1, chain {chainId}, body {body}; the same bytes the factory encodes for this body",
+      nativeValue: "nothing is sent with the call",
+    },
+    calldataHeading: "The calldata",
+    gasSandbox:
+      "The owner key pays the gas: it needs a little native USDC on Arc testnet, which the Arc testnet faucet provides.",
+    gasProduction: "The owner key pays the gas: it needs a little native USDC on Arc.",
+    watching:
+      "This page reads the identity's pointer on the chain every 30 seconds for two minutes. Once the transaction is sent, click I sent it.",
+    seen: "The pointer is on the chain. Click I sent it, and Novi Corpus checks it now.",
+    watchEnded:
+      "This page has stopped reading the pointer. Once the transaction is sent, click I sent it.",
+    refreshing: "Asking Novi Corpus to check the pointer…",
+    refreshNoAnswer: "No answer came back from the check just now.",
+    retry: "Try again",
   },
 
   pointer: {
