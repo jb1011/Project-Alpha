@@ -422,8 +422,46 @@ export const LEGAL_BODY_COPY = {
     sign: "Sign",
     creating: "Novi Corpus is creating the body",
     placeNewOrder: "Place a new order",
-    tryAgainSoon: "try again in a moment",
-    buildFailed: "something went wrong building the link",
+    tryAgainSoon: "Your order is kept: try again in a moment, with Sign.",
+    buildFailed:
+      "Something went wrong building the link on this page, so the link door could not read it, and nothing was created. Sign again; if this repeats, reload the page.",
+    title: "Sign the link with this wallet",
+    intro:
+      "Your wallet signs one message, the link, which binds identity {agentId} to the legal body of this order. Signing sends nothing and approves nothing.",
+    howItWorks:
+      "When you click Sign, this page asks for the link, checks every field of it against your order, your identity, the agreement you read and this wallet, and only then opens your wallet.",
+    fieldsHeading: "The link you sign",
+    fields: {
+      agentId: "agentId",
+      guardian: "guardian",
+      amendmentDelay: "amendment delay",
+      agreementHash: "agreement hash",
+      deadline: "deadline",
+      domain: "domain",
+    },
+    yourWallet: "your wallet",
+    theOneYouRead: "the one you read",
+    deadlineIn: "in {left}",
+    lessThanAMinute: "less than a minute",
+    domainValue: "{name}, version {version}, chain {chainId}, verifying contract {contract}",
+    asking: "Asking for the link…",
+    inWallet: "Waiting for your wallet…",
+    sending: "Sending the signed link…",
+    retry: "Try again",
+    identityUnknown:
+      "The identity for this order is not known on this page. Go back to the identity step and pick it again.",
+    refused:
+      "The link served does not match your order, your identity, the agreement you read or this wallet ({problem}), so your wallet was not opened and nothing was signed.",
+    declined: "Your wallet did not sign the link, so nothing was sent.",
+    declinedOtherNetwork:
+      "Your wallet did not sign the link, so nothing was sent. It is on another network than {network}, and a wallet may refuse to sign the link until it is switched there.",
+    notConnected:
+      "This wallet is not connected in this browser just now. Connect it again to sign; nothing was asked for and nothing was sent.",
+    noAnswerMessage: "No answer came back for the link, so nothing was signed. Try again.",
+    noAnswerSubmit:
+      "No answer came back, so whether the link was taken is not known yet. Your order is read again; if it has not moved, try again, and the same signed link is sent.",
+    unreadableAnswer:
+      "The answer to the signed link could not be read, so whether it was taken is not known yet. Your order is read again; if it has not moved, sign again.",
   },
 
   paste: {

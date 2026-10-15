@@ -7,14 +7,18 @@
  * gate. So typed data the check refused has no path to the wallet at all, and a test pins it with
  * a spy in the wallet's place.
  *
- * The shape is generic: the statement of authority's gate is here, and the link's takes the same
- * shape.
+ * The shape is generic: both gates are here, the statement of authority's and the link's.
  */
-import type { Hex, StatementMessageAnswer } from "@/lib/api/types";
+import type { Hex, LinkMessageResult, StatementMessageAnswer } from "@/lib/api/types";
 import type { Refusal } from "./chain";
+import type { OwnerBranch } from "./flow";
+import { identityOwnerCheck } from "./link";
 import {
+  assertLinkTypedData,
   assertStatementTypedData,
+  toWagmiLinkTypedData,
   toWagmiStatementTypedData,
+  type WagmiLinkTypedData,
   type WagmiStatementTypedData,
 } from "./typedData";
 
@@ -33,6 +37,26 @@ export function statementSignGate(
   const checked = assertStatementTypedData(served, ctx);
   if (!checked.ok) return checked;
   return { ok: true, typedData: toWagmiStatementTypedData(served.typedData) };
+}
+
+/** What the link is checked against: the order, the agreement read, the wallet in session, the
+ *  identity picked, this browser's clock, the served ceiling, and who signs. */
+export type LinkGateContext = Parameters<typeof assertLinkTypedData>[1] & { branch: OwnerBranch };
+
+/**
+ * The link, checked field by field; then, on the browser branch, the identity's owner the door
+ * read against the wallet in session (the wallet that is about to sign); then converted for
+ * wagmi. The first refusal is the answer, and nothing is converted.
+ */
+export function linkSignGate(
+  served: LinkMessageResult,
+  ctx: LinkGateContext,
+): SignGate<WagmiLinkTypedData> {
+  const checked = assertLinkTypedData(served, ctx);
+  if (!checked.ok) return checked;
+  const owner = identityOwnerCheck(served, { branch: ctx.branch, sessionAddress: ctx.sessionAddress });
+  if (!owner.ok) return owner;
+  return { ok: true, typedData: toWagmiLinkTypedData(served.typedData) };
 }
 
 /**

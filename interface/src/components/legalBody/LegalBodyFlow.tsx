@@ -54,6 +54,7 @@ import {
   type GateView,
   type LegalBodyDoor,
 } from "@/lib/legalBody/gates";
+import { afterOrderRefused, linkScreen, type LinkSendBack } from "@/lib/legalBody/link";
 import { closedSentence, noticeSentence } from "@/lib/legalBody/notice";
 import {
   canJumpTo,
@@ -88,6 +89,7 @@ import { ClosedNotice } from "./ClosedNotice";
 import { CompanyStep } from "./CompanyStep";
 import { HumanStep } from "./HumanStep";
 import { IdentityStep } from "./IdentityStep";
+import { LinkStep } from "./LinkStep";
 import { SandboxBanner } from "./SandboxBanner";
 import { SignInStep } from "./SignInStep";
 import { ThreadChooser } from "./ThreadChooser";
@@ -267,6 +269,8 @@ function LegalBodySession({
   const orderQuery = useLegalBodyOrderQuery(refs?.orderId, { pollWhileReserved: true });
 
   const nowMs = flowNowMs(listNow, [companyQuery.dataUpdatedAt, orderQuery.dataUpdatedAt]);
+  // The draft's local choices, for this thread's order only.
+  const choices = thread ? draftChoices(memory, thread) : { ownerChoice: null, agentId: null };
   const company =
     companyQuery.data ?? companies.find((c) => c.companyId === refs?.companyId) ?? null;
   const order = orderQuery.data ?? orders.find((o) => o.id === refs?.orderId) ?? null;
@@ -282,7 +286,7 @@ function LegalBodySession({
               config.environment === "production" ? (companyQuery.data?.documents ?? null) : null,
             orders,
             order,
-            ...draftChoices(memory, thread),
+            ...choices,
           }),
           { order, readFor: agreementReadFor },
         )
@@ -383,6 +387,33 @@ function LegalBodySession({
     remember({});
   }
 
+  /** A link door's refusal sent the person elsewhere: go there, with the door's sentence. */
+  async function sendBack(to: LinkSendBack, sentence: string) {
+    switch (to) {
+      case "agreement": {
+        // The order read again decides: one that moved on (reserved from another tab, closed) is
+        // shown where it now is; a draft that cannot be linked needs a new order, from the
+        // agreement.
+        const read = await orderQuery.refetch();
+        if (afterOrderRefused(read.data) === "rederive") return;
+        startAnother("new_order");
+        setCarried({ to: "agreement", sentence });
+        return;
+      }
+      case "company":
+        backToCompany(sentence);
+        return;
+      case "identity":
+        remember({ agentId: null });
+        setCarried({ to: "identity", sentence });
+        return;
+      case "closed":
+        // The order read again is closed: its screen sits at the rail's end.
+        setCarried({ to: railPhaseOf({ phase: "closed" }), sentence });
+        return;
+    }
+  }
+
   const arrival = sentenceOnArrival(carried, current);
 
   function choose(ref: LegalBodyThreadRef) {
@@ -479,6 +510,18 @@ function LegalBodySession({
       case "identity":
         // One step per order: a new order never inherits another's typing or reads.
         return <IdentityStep key={kit.orderId ?? "none"} kit={kit} />;
+      case "link":
+        // The panel for a key elsewhere is not on this page yet.
+        if (linkScreen(derivation) === "paste") return <StepPlaceholder kit={kit} />;
+        // One step per order: a click's state never carries over to another order.
+        return (
+          <LinkStep
+            key={kit.orderId ?? "none"}
+            kit={kit}
+            agentId={choices.agentId}
+            onSendBack={(to, sentence) => void sendBack(to, sentence)}
+          />
+        );
       default:
         return <StepPlaceholder kit={kit} />;
     }
