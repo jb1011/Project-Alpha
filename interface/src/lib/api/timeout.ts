@@ -8,10 +8,8 @@ import { ApiError } from "./types";
  * (or a stalled proxy in front of it, or a laptop that slept mid-request) was a spinner that
  * would still be turning the next morning. There was no error to show because no error existed.
  *
- * Extracted from `client.ts` rather than written inline there for one reason: `request()` is
- * module-private, so the only way to reach this behaviour from a test is through a public call
- * with the real 30-second budget — which is not a test, it is a pause. Here the budget is an
- * argument, and the mapping is one exported function.
+ * Extracted from `client.ts` rather than written inline there so the behaviour has a test of its
+ * own: here the budget is an argument, and the mapping is one exported function.
  *
  * `AbortSignal.timeout` bounds the WHOLE exchange, headers and body, which is right for a JSON
  * API: `request()` reads the body immediately and a response that stops arriving half way is as

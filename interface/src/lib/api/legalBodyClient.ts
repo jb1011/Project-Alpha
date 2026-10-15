@@ -133,11 +133,10 @@ export async function submitLink(
 }
 
 function isFlatRefusal(value: unknown): value is LinkRefusal {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { code?: unknown }).code === "string"
-  );
+  if (typeof value !== "object" || value === null) return false;
+  const { code, order } = value as { code?: unknown; order?: unknown };
+  // The refusal carries the order it leaves behind; one without it is not an answer to read.
+  return typeof code === "string" && typeof order === "object" && order !== null;
 }
 
 export function getBinding(token: string, id: string): Promise<BindingView> {

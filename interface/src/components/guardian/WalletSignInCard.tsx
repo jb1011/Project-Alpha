@@ -4,67 +4,61 @@ import { useState, type ReactNode } from "react";
 import { Button, Card, CheckIcon, cx } from "@/components/onboarding/primitives";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { shortAddress } from "@/components/onboarding/types";
-
-type WalletState = "idle" | "connecting" | "connected" | "logged-in" | "error";
+import {
+  connectAttempt,
+  signInAttempt,
+  walletStateOf,
+  type WalletAttempt,
+} from "@/lib/walletSignIn";
 
 /**
  * The wallet sign-in card: connect a wallet, then sign in with it.
  *
  * It carries its own wallet state machine, so any flow that needs a signed-in guardian renders the
  * same card and gets the same behaviour. What the wallet becomes is the caller's sentence
- * (`body`). A caller that gates on sign-in reads `useAuth().session`.
+ * (`body`).
  *
- * `onError` receives the message of a failed connect or sign-in, and `null` when a new attempt
- * starts, so a message from an earlier attempt does not outlive it.
+ * `onAttempt` receives every change of the attempt (`connecting`, `error`, or `null` when none is
+ * under way or failed). A caller that gates on sign-in keeps it and reads
+ * `walletSignedIn(!!session, attempt)`, the same rule as the card's badge. `onError` receives the
+ * message of a failed connect or sign-in, and `null` when a new attempt starts, so a message from
+ * an earlier attempt does not outlive it.
  */
 export function WalletSignInCard({
   number = "1",
   body,
   onError,
+  onAttempt,
 }: {
   /** What the badge shows before sign-in; a check replaces it once signed in. */
   number?: ReactNode;
   body: ReactNode;
   onError?: (message: string | null) => void;
+  onAttempt?: (attempt: WalletAttempt) => void;
 }) {
   const { address, isConnected, isLoggingIn, connectWallet, login, session } = useAuth();
 
-  const [walletOverride, setWalletOverride] = useState<"connecting" | "error" | null>(
-    null,
-  );
+  const [walletOverride, setWalletOverride] = useState<WalletAttempt>(null);
 
-  const walletState: WalletState =
-    walletOverride === "connecting"
-      ? "connecting"
-      : walletOverride === "error"
-        ? "error"
-        : session
-          ? "logged-in"
-          : isConnected
-            ? "connected"
-            : "idle";
+  const walletState = walletStateOf(walletOverride, !!session, isConnected);
+
+  // Every change of the attempt goes to the caller too, in the same event: no effect mirrors it.
+  const report = {
+    attempt(next: WalletAttempt) {
+      setWalletOverride(next);
+      onAttempt?.(next);
+    },
+    error(message: string | null) {
+      onError?.(message);
+    },
+  };
 
   async function handleConnect() {
-    onError?.(null);
-    setWalletOverride("connecting");
-    try {
-      await connectWallet();
-      setWalletOverride(null);
-    } catch (e) {
-      setWalletOverride("error");
-      onError?.(e instanceof Error ? e.message : "Wallet connection failed.");
-    }
+    await connectAttempt(connectWallet, report);
   }
 
   async function handleLogin() {
-    onError?.(null);
-    setWalletOverride(null);
-    try {
-      await login();
-    } catch (e) {
-      setWalletOverride("error");
-      onError?.(e instanceof Error ? e.message : "Sign-in failed.");
-    }
+    await signInAttempt(login, report);
   }
 
   const walletDone = walletState === "logged-in";

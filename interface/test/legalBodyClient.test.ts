@@ -422,6 +422,16 @@ describe("submitLink reads the link door's own answers", () => {
     expect((err as InstanceType<typeof ApiError>).status).toBe(422);
   });
 
+  test("a flat 422 with a code but no order is an ApiError, never a refusal to read an order from", async () => {
+    const { calls, ApiError } = await load();
+    stubFetch(() =>
+      json(422, { code: "bad_signature", message: "The signature does not match.", detail: {} }),
+    );
+    const err = await submit(calls).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as InstanceType<typeof ApiError>).status).toBe(422);
+  });
+
   test("a 409 in the house envelope is an ApiError with code order_expired", async () => {
     const { calls, ApiError } = await load();
     stubFetch(() =>

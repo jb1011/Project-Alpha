@@ -18,6 +18,7 @@ import { usePasskeyChallengeMutation } from "@/lib/api/hooks";
 import { createGuardianPasskey } from "@/lib/api/passkey";
 import type { GuardianPasskey } from "@/lib/api/types";
 import { WalletSignInCard } from "@/components/guardian/WalletSignInCard";
+import { walletSignedIn, type WalletAttempt } from "@/lib/walletSignIn";
 
 type PasskeyState = "idle" | "pending" | "registered" | "error";
 
@@ -37,6 +38,9 @@ export function WelcomeStep({
     null,
   );
   const [error, setError] = useState<string | null>(null);
+  // The wallet card's attempt, as it reports it: the passkey card and Continue read the same
+  // rule as the card's badge.
+  const [walletAttempt, setWalletAttempt] = useState<WalletAttempt>(null);
 
   const passkeyState: PasskeyState =
     passkeyOverride === "pending"
@@ -67,8 +71,7 @@ export function WelcomeStep({
     }
   }
 
-  // Signed in means a session: what the passkey card and Continue gate on.
-  const walletDone = !!session;
+  const walletDone = walletSignedIn(!!session, walletAttempt);
   const passkeyDone = passkeyState === "registered";
 
   return (
@@ -83,6 +86,7 @@ export function WelcomeStep({
         <div className="flex flex-col gap-6">
           <WalletSignInCard
             onError={setError}
+            onAttempt={setWalletAttempt}
             body={
               <>
                 The wallet you sign in with becomes the agent&apos;s guardian — the
