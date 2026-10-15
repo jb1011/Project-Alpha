@@ -252,6 +252,59 @@ export const LEGAL_BODY_COPY = {
     waiting: OPERATOR_CHECKS,
     evidenceUnavailable: "The upload is not available on this screen yet.",
     newDeclaration: "Declare the company again",
+    title: "Declare your company",
+    introSandbox: "Name a test company and sign the statement of authority with this wallet.",
+    introProduction:
+      "Declare the Wyoming LLC behind your agent and sign the statement of authority with this wallet.",
+    labels: {
+      companyName: "Company name",
+      filingNumber: "Filing number",
+      declarantName: "Your legal name",
+      declarantTitle: "Your title in the company",
+    },
+    /** Shown on a sandbox only, where both are inventions that say they are a test. */
+    placeholdersSandbox: {
+      companyName: "Example Test Holdings LLC",
+      filingNumber: "TEST-0001",
+    },
+    numberHintProduction: "The number the Wyoming registry gave the company.",
+    sign: "Sign the declaration",
+    statementHeading: "The statement you sign",
+    wordingVersion: "wording {version}",
+    renewed:
+      "The statement was issued too long ago to be accepted, so a new one was asked for. Read it and sign again.",
+    declined: "Your wallet did not sign, so nothing was sent.",
+    declinedOtherNetwork:
+      "Your wallet did not sign, so nothing was sent. It is on another network than {network}, and a wallet may refuse to sign this statement until it is switched there.",
+    refused:
+      "The statement served does not match what you typed or this deployment ({problem}), so your wallet was not opened and nothing was declared.",
+    noAnswer:
+      "No answer came back, so whether the declaration was made is not known yet. Your companies are read again; if nothing changes, try again.",
+    alreadyYours: "You already declared a company with this number.",
+    continueWith: "Continue with that company",
+    evidenceTitle: "Evidence for the check",
+    abandon: "Abandon this company",
+    abandonConfirm: "Abandoning closes this company for good: it can take no order again.",
+    abandonYes: "Abandon it",
+    abandonKeep: "Keep it",
+    abandonNoAnswer:
+      "No answer came back, so whether the company was abandoned is not known yet; try again.",
+    /** The declaration doors' own problems, word for word, shown under the field they name. A
+     *  door's answer, when it comes, is shown instead. */
+    problems: {
+      required: "is required",
+      control: "holds a control or invisible character",
+      otherSpace: "holds a space other than a plain space",
+      doubleQuote: "holds a double quote",
+      length: "must be {min} to {max} characters long",
+      nameTest: "must say it is a test on this deployment",
+      numberCharset: "may hold only A-Z, a-z, 0-9 and hyphens",
+      numberTest:
+        "must be a test number on this deployment: TEST- then 4 to 27 of A-Z, 0-9 and hyphens",
+      declarantNameCharset: "may hold only letters, spaces, apostrophes, hyphens and full stops",
+      declarantTitleCharset:
+        "may hold only letters, digits, spaces, apostrophes, hyphens, full stops, &, / and commas",
+    },
   },
 
   agreement: {

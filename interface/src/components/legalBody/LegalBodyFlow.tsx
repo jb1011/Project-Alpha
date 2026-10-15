@@ -77,6 +77,7 @@ import {
 } from "@/lib/legalBody/storage";
 import { worldIdGateState, worldIdMeStatus } from "@/lib/legalBody/worldIdGate";
 import { ClosedNotice } from "./ClosedNotice";
+import { CompanyStep } from "./CompanyStep";
 import { HumanStep } from "./HumanStep";
 import { SandboxBanner } from "./SandboxBanner";
 import { SignInStep } from "./SignInStep";
@@ -422,7 +423,8 @@ function LegalBodySession({
         return declarationsClosed(config, derivation) ? (
           <StepPlaceholder kit={kit} sentence={LEGAL_BODY_COPY.company.declarationsOff} />
         ) : (
-          <StepPlaceholder kit={kit} />
+          // One form per thread: a new declaration never inherits another thread's typing.
+          <CompanyStep key={kit.companyId ?? "new"} kit={kit} />
         );
       default:
         return <StepPlaceholder kit={kit} />;
