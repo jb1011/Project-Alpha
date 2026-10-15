@@ -41,4 +41,18 @@ export const apiKeys = {
    * document (they should not) still share a cache entry, and a missing id never fetches.
    */
   publicMetadata: (publicId: string) => [...apiKeys.all, "publicMetadata", publicId] as const,
+  /* LEGAL-BODY ORDERS. Token-scoped like the companies: an order names a guardian, an identity
+   * and a body that belong to one session's tenant, and must not survive a sign-out. */
+  legalBodyOrders: (token: string) => [...apiKeys.all, "legalBodyOrders", token] as const,
+  legalBodyOrder: (token: string, id: string) =>
+    [...apiKeys.all, "legalBodyOrder", token, id] as const,
+  legalBodyAgreement: (token: string, id: string) =>
+    [...apiKeys.all, "legalBodyAgreement", token, id] as const,
+  legalBodyBinding: (token: string, id: string) =>
+    [...apiKeys.all, "legalBodyBinding", token, id] as const,
+  /** PUBLIC and token-free: `GET /legal-bodies/by-agent/:agentId` answers everyone the same. The
+   *  agent id is a decimal string as served, so one identity has one spelling. */
+  legalBodyByAgent: (agentId: string) => [...apiKeys.all, "legalBodyByAgent", agentId] as const,
+  /** PUBLIC and token-free: `GET /transparency`. */
+  transparency: () => [...apiKeys.all, "transparency"] as const,
 };

@@ -18,7 +18,7 @@ import { bucketsByKey } from "../../src/api/routes/legalBodyOrders";
 import type { FormationPaymentConfig } from "../../src/formation/payment";
 import { SqliteJobRepository } from "../../src/jobs/jobRepository";
 import { agreementDocNames } from "../../src/legalBody/agreement";
-import type { LegalBodyOrderDeps, toOrderView } from "../../src/legalBody/orders";
+import type { LegalBodyOrderDeps, LegalBodyOrderView } from "../../src/legalBody/orders";
 import { LEGAL_BODY_SENTENCES } from "../../src/legalBody/sentences";
 import { LEGAL_BODY_OPERATING_AGREEMENT } from "../../src/legalBody/texts/operatingAgreement";
 import { SqliteApiKeyStore } from "../../src/persistence/apiKeyStore";
@@ -199,7 +199,7 @@ function checkedCompany(who: Address, status: "draft" | "ready" = "ready"): stri
 async function ordered(app: App, token: string, companyId: string) {
   const res = await answerOf(await call(app, "POST", ORDERS, token, { companyId }));
   expect(res.status).toBe(201);
-  return res.body as ReturnType<typeof toOrderView>;
+  return res.body as LegalBodyOrderView;
 }
 
 /** An order of `id` moved through the repository to `linked`, as the link door, the create and
