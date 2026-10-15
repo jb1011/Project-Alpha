@@ -84,7 +84,9 @@ import type {
   WorldIdMe,
 } from "./types";
 
-function useAuthToken() {
+/** The session's bearer token, or undefined before sign-in. Exported so the legal-body hooks read
+ *  the same one: one token source for every authenticated key. */
+export function useAuthToken() {
   const { session } = useAuth();
   return session?.token;
 }
