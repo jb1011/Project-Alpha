@@ -29,6 +29,12 @@ import type {
   LegalBodyOrderView,
 } from "@/lib/api/types";
 import { arcTestnet } from "@/lib/chain";
+import {
+  agreementReadAfterJump,
+  sentenceOnArrival,
+  withAgreementRead,
+  type CarriedSentence,
+} from "@/lib/legalBody/agreement";
 import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
 import {
   deriveLegalBodyPhase,
@@ -76,6 +82,7 @@ import {
   type LegalBodyMemory,
 } from "@/lib/legalBody/storage";
 import { worldIdGateState, worldIdMeStatus } from "@/lib/legalBody/worldIdGate";
+import { AgreementStep } from "./AgreementStep";
 import { ClosedNotice } from "./ClosedNotice";
 import { CompanyStep } from "./CompanyStep";
 import { HumanStep } from "./HumanStep";
@@ -96,6 +103,10 @@ import { ThreadChooser } from "./ThreadChooser";
  *
  * Nothing here writes to the server on its own: every write is a click's. The only effects are the
  * memory's write once a thread is on screen, and the scroll to the top when the screen changes.
+ *
+ * Two facts live in this visit's memory only, never in the store: that a draft's agreement was
+ * read (so the draft moves on to the identity step, and a reload shows the agreement again), and
+ * a door's sentence carried back to the step it sends the person to.
  */
 
 type AvailableConfig = Extract<LegalBodyConfig, { available: true }>;
@@ -218,6 +229,11 @@ function LegalBodySession({
   const [memory, setMemory] = useState<LegalBodyMemory | null>(() => readLegalBodyMemory(tenant));
   const [intent, setIntent] = useState<LegalBodyIntent | null>(null);
   const [mountedAt] = useState(() => Date.now());
+  // The draft whose agreement was read on this visit: in memory only, so a reload shows it again.
+  const [agreementReadFor, setAgreementReadFor] = useState<string | null>(null);
+  // A door's sentence for the step it sends the person back to, until the next click that moves
+  // the thread.
+  const [carried, setCarried] = useState<CarriedSentence | null>(null);
 
   // Reads only.
   const code = useBytecode({ address: tenant, chainId: arcTestnet.id });
@@ -248,17 +264,20 @@ function LegalBodySession({
   const order = orderQuery.data ?? orders.find((o) => o.id === refs?.orderId) ?? null;
   const derivation: LegalBodyDerivation | null =
     thread && thread.kind !== "chooser"
-      ? deriveLegalBodyPhase({
-          config,
-          sessionAddress: tenant,
-          nowMs,
-          company,
-          documents:
-            config.environment === "production" ? (companyQuery.data?.documents ?? null) : null,
-          orders,
-          order,
-          ...draftChoices(memory, thread),
-        })
+      ? withAgreementRead(
+          deriveLegalBodyPhase({
+            config,
+            sessionAddress: tenant,
+            nowMs,
+            company,
+            documents:
+              config.environment === "production" ? (companyQuery.data?.documents ?? null) : null,
+            orders,
+            order,
+            ...draftChoices(memory, thread),
+          }),
+          { order, readFor: agreementReadFor },
+        )
       : null;
 
   const expired =
@@ -299,7 +318,22 @@ function LegalBodySession({
     const next = mergeLegalBodyMemory(tenant, toStore ?? memory, patch);
     writeLegalBodyMemory(next);
     setMemory(next);
+    setCarried(null);
     if (patchEndsIntent(patch)) setIntent(null);
+  }
+
+  /** Continue on the agreement: this draft's agreement was read. Nothing is recorded. */
+  function agreementRead(orderId: string) {
+    setAgreementReadFor(orderId);
+    setCarried(null);
+  }
+
+  /** The order door refused the company: read it again, and say the door's sentence on the
+   *  company step if the derivation goes back there. */
+  function backToCompany(sentence: string) {
+    setCarried({ to: "company", sentence });
+    if (refs?.companyId) void companyQuery.refetch();
+    void companiesQuery.refetch();
   }
 
   /** For a step's failed request: a refusal that means "sign in" goes to the sign-in step, and its
@@ -316,6 +350,8 @@ function LegalBodySession({
 
   function jump(target: LegalBodyRailPhase) {
     if (!canJumpTo(phases, current, target)) return;
+    setCarried(null);
+    setAgreementReadFor((readFor) => agreementReadAfterJump(target, readFor));
     if (target === "signin" || target === "human") {
       setView(target);
       return;
@@ -343,6 +379,8 @@ function LegalBodySession({
     // A closed order shown here is done with: this visit forgets it too.
     remember({});
   }
+
+  const arrival = sentenceOnArrival(carried, current);
 
   function choose(ref: LegalBodyThreadRef) {
     remember({ companyId: ref.companyId, orderId: ref.kind === "order" ? ref.orderId : null });
@@ -426,6 +464,16 @@ function LegalBodySession({
           // One form per thread: a new declaration never inherits another thread's typing.
           <CompanyStep key={kit.companyId ?? "new"} kit={kit} />
         );
+      case "agreement":
+        return (
+          // One step per company: a placed order is held across the moment the list names it.
+          <AgreementStep
+            key={kit.companyId ?? "none"}
+            kit={kit}
+            onRead={agreementRead}
+            onBackToCompany={backToCompany}
+          />
+        );
       default:
         return <StepPlaceholder kit={kit} />;
     }
@@ -433,6 +481,11 @@ function LegalBodySession({
 
   return (
     <FlowLayout config={config} current={current} onJump={jump}>
+      {arrival && (
+        <Callout tone="warn" className="mb-6">
+          {arrival}
+        </Callout>
+      )}
       {body()}
     </FlowLayout>
   );

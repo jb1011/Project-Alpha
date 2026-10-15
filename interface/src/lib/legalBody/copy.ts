@@ -314,6 +314,38 @@ export const LEGAL_BODY_COPY = {
     hashNote: "this is what your link will sign",
     readCheckbox: "I have read this draft",
     draftWording: "draft wording",
+    title: "Read the operating agreement",
+    introBefore:
+      "Placing the order freezes the operating agreement for it: the text, and the hash your link will sign. A draft order can be linked for 24 hours, and placing it sends nothing from your wallet.",
+    introAfter:
+      "This is the operating agreement of your order, frozen when the order was placed. Read it before you go on; nothing is recorded on this step.",
+    continueDraftOneHour: "Continue with the order placed 1 hour ago",
+    continueDraftRecent: "Continue with the order placed less than an hour ago",
+    draftOffered:
+      "This company already has a draft order that can still be linked, so it is offered instead of a new one.",
+    termsHeading: "The operating agreement",
+    wordingVersion: "wording {version}",
+    hashLabel: "Agreement hash",
+    delay:
+      "Amendment delay: {delay}. A change to this agreement takes effect only once this delay has passed since it was scheduled.",
+    expiry:
+      "This draft can be linked until {time}, {left} from now; after that it expires, and a new order is needed.",
+    reading: "Reading the agreement…",
+    unreadable: "The agreement could not be read just now.",
+    retry: "Try again",
+    continue: "Continue",
+    noAnswer:
+      "No answer came back, so whether the order was placed is not known yet. Your orders are read again; if nothing changes, try again.",
+    /** Durations in words, for the delay, the expiry and a draft's age. */
+    words: {
+      lessThanAnHour: "less than an hour",
+      hour: "1 hour",
+      hours: "{n} hours",
+      minute: "1 minute",
+      minutes: "{n} minutes",
+      second: "1 second",
+      seconds: "{n} seconds",
+    },
   },
 
   identity: {
