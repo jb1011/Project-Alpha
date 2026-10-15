@@ -559,6 +559,55 @@ export const LEGAL_BODY_COPY = {
     chainUnread: "could not read the chain just now",
     sevenDays:
       "Novi Corpus stops watching an unpointed body after 7 days and the order no longer counts against your open orders; the body stays where it is, and a refresh from this page links it.",
+
+    /* The browser branch's step: this wallet owns the identity and writes the pointer. */
+    title: "Write the pointer with this wallet",
+    loading: "Reading this order's binding…",
+    bindingUnread: "This order's binding could not be read just now. Try again.",
+    checksUnread: "The chain could not be read just now, so the pointer is not offered yet. Try again.",
+    retry: "Try again",
+    callRefused:
+      "The pointer transaction could not be built for this order ({problem}), so your wallet is not asked to send it.",
+    stop: "Your wallet is not asked to send the pointer: {reason}.",
+    notThisWallet:
+      "Identity {agentId} is owned by {owner}, which is not the wallet connected in this browser just now. Connect that wallet to write the pointer; nothing was sent.",
+    noIntent: {
+      title: "No pointer is asked for this order",
+      body: "Novi Corpus asks for no pointer for this order just now, so none is offered.",
+    },
+    gasEstimating: "Estimating the gas…",
+    gasEstimate: "Estimated gas: up to {amount} USDC.",
+    gasBalance: "This wallet holds {balance} USDC.",
+    gasUnread:
+      "The gas could not be estimated just now; your wallet shows its own estimate when it opens.",
+    notEnough:
+      "That is less than the estimate, so the transaction may fail: add a little native USDC to this wallet first.",
+    gasProduction: "Your wallet needs a little native USDC on Arc for gas.",
+    seed: "Ask Novi Corpus for a little gas",
+    seedSent: "A little native USDC was sent to this wallet.",
+    seedNoAnswer: "No answer came back for the gas just now.",
+    send: "Write the pointer",
+    inWallet: "Waiting for your wallet…",
+    waiting:
+      "Waiting for the pointer transaction to be confirmed on the chain. This can take up to 3 minutes.",
+    confirmed: "The pointer transaction is confirmed on the chain.",
+    reverted:
+      "The pointer transaction failed on the chain, so the identity does not point at the body. You can send it again.",
+    noReceipt:
+      "No receipt came back within 3 minutes, so whether the pointer landed is not known yet. Look at the transaction; Novi Corpus is asked to check the pointer either way.",
+    refreshing: "Asking Novi Corpus to check the pointer…",
+    chainUnreadLine:
+      "Novi Corpus {reason}, so this order stays as last read: {state}. The next check tries again.",
+    rejected: "Your wallet did not send the pointer, so nothing was written. It said: {message}",
+    rejectedNoWords: "Your wallet did not send the pointer, so nothing was written.",
+    otherNetwork:
+      "Your wallet is on another network than {network}. Switch it there and send again; nothing was sent.",
+    otherChain:
+      "This site sends to {network} only, and this deployment names another chain, so the pointer cannot be written here.",
+    refusedBeforeWallet:
+      "The pointer transaction was refused before your wallet opened ({problem}), so nothing was sent.",
+    notConnected:
+      "This wallet is not connected in this browser just now. Connect it again to write the pointer; nothing was sent.",
   },
 
   done: {

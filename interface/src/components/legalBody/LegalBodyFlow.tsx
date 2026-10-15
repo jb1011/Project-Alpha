@@ -93,6 +93,7 @@ import { IdentityStep } from "./IdentityStep";
 import { LinkStep } from "./LinkStep";
 import { PasteLinkPanel } from "./PasteLinkPanel";
 import { PastePointerPanel } from "./PastePointerPanel";
+import { PointerStep } from "./PointerStep";
 import { SandboxBanner } from "./SandboxBanner";
 import { SignInStep } from "./SignInStep";
 import { ThreadChooser } from "./ThreadChooser";
@@ -534,11 +535,11 @@ function LegalBodySession({
           />
         );
       case "pointer":
-        // Another key sends the pointer on its own panel; this wallet's step is not on this page
-        // yet.
+        // One step per order. Another key sends the pointer on its own panel, which never opens
+        // this browser's wallet; this wallet writes it on its own step.
         if (pointerScreen(derivation) === "paste")
           return <PastePointerPanel key={kit.orderId ?? "none"} kit={kit} />;
-        return <StepPlaceholder kit={kit} />;
+        return <PointerStep key={kit.orderId ?? "none"} kit={kit} />;
       default:
         return <StepPlaceholder kit={kit} />;
     }
