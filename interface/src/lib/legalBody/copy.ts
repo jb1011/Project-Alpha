@@ -74,7 +74,7 @@ export const LEGAL_BODY_COPY = {
   signIn: {
     title: "Sign in with the wallet that will answer for the legal body.",
     intro:
-      "This wallet becomes the guardian: it signs the company's declaration and the link, and it is the wallet Novi Corpus answers to.",
+      "This wallet becomes the guardian: it signs the company's declaration and the link, and it is the wallet that answers for the legal body.",
     body: "Connect the wallet you want as the guardian, then sign in with it. Signing in asks for a signature only: it sends nothing and approves nothing.",
     checking: "Reading this wallet on the chain…",
     checkFailedTitle: "This wallet could not be read",
@@ -146,6 +146,8 @@ export const LEGAL_BODY_COPY = {
   },
 
   closed: {
+    /** The closed screen's heading: the order is closed, not done. */
+    eyebrow: "This order",
     newOrder: "Place a new order",
     newCompany: "Declare a company",
     unknownTitle: "This order cannot move",
@@ -186,7 +188,7 @@ export const LEGAL_BODY_COPY = {
       body: "It can no longer move.",
     },
     order_revoked: {
-      title: "This legal body was revoked",
+      title: "This order was revoked",
       body: "A Novi Corpus operator revoked it, and a revocation is never undone.",
     },
     other_deployment: {
@@ -334,6 +336,8 @@ export const LEGAL_BODY_COPY = {
     unreadable: "The agreement could not be read just now.",
     retry: "Try again",
     continue: "Continue",
+    cannotContinue:
+      "The order is placed, but your orders could not be read again yet. Reload this page to continue with it.",
     noAnswer:
       "No answer came back, so whether the order was placed is not known yet. Your orders are read again; if nothing changes, try again.",
     /** Durations in words, for the delay, the expiry and a draft's age. */

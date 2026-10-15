@@ -70,6 +70,24 @@ export function railDone(
   return done;
 }
 
+/**
+ * The rail's done map for what is on screen. A closed order never got as far as the rail could
+ * claim: it may have lapsed before its body or expired before its link, so only the two gates it
+ * passed are ticked, never a step it may not have reached.
+ */
+export function railDoneOf(
+  phases: { id: LegalBodyRailPhase }[],
+  gate: RailGate,
+  derivation: LegalBodyDerivation | null,
+): Record<string, boolean> {
+  if (gate === "flow" && derivation?.phase === "closed") {
+    const done: Record<string, boolean> = {};
+    for (const p of phases) if (p.id === "signin" || p.id === "human") done[p.id] = true;
+    return done;
+  }
+  return railDone(phases, railCurrentOf(gate, derivation));
+}
+
 /** A jump goes back only: to a gate, or to an earlier shown phase of the thread. */
 export function canJumpTo(
   phases: { id: LegalBodyRailPhase }[],

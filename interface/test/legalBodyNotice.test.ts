@@ -1,9 +1,13 @@
 /**
  * The sixteen notices of the legal-body flow: each has a title and a body on both environments,
- * and each offers the way out the design gives it.
+ * and each offers its own way out: a new order, a new declaration, or nothing.
  */
+import { createElement } from "react";
+import { renderToString } from "react-dom/server";
 import { describe, expect, test } from "vitest";
-import { CHECK_REASON_SENTENCES } from "@/lib/legalBody/copy";
+import { ClosedNotice } from "@/components/legalBody/ClosedNotice";
+import type { CheckReasonCode, LapseReason } from "@/lib/api/types";
+import { CHECK_REASON_SENTENCES, LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
 import { closedSentence, noticeSentence } from "@/lib/legalBody/notice";
 import type { LegalBodyNotice } from "@/lib/legalBody/flow";
 
@@ -98,6 +102,27 @@ describe("noticeSentence", () => {
   });
 });
 
+describe("a reason this build does not know still reads", () => {
+  const N = LEGAL_BODY_COPY.notices;
+
+  test("a lapse reason from a newer backend: the reservation closed, no more", () => {
+    const n = { kind: "lapsed", reason: "a_newer_reason" as LapseReason } as const;
+    expect(noticeSentence(n, "sandbox").body).toBe(N.lapsed.reasons.unknown);
+  });
+
+  test("an inherited name is not a reason", () => {
+    const n = { kind: "lapsed", reason: "toString" as LapseReason } as const;
+    expect(noticeSentence(n, "sandbox").body).toBe(N.lapsed.reasons.unknown);
+  });
+
+  test("a check reason code from a newer backend: no reason recorded, and the way back", () => {
+    const n = { kind: "company_failed", reasonCode: "a_newer_code" as CheckReasonCode } as const;
+    expect(noticeSentence(n, "production").body).toBe(
+      `${N.company_failed.noReason} ${N.company_failed.wayBackProduction}`,
+    );
+  });
+});
+
 describe("closedSentence", () => {
   test("a closed phase with a notice says the notice", () => {
     expect(closedSentence({ kind: "expired" }, "sandbox")).toEqual(
@@ -110,5 +135,22 @@ describe("closedSentence", () => {
     expect(s.title.trim()).not.toBe("");
     expect(s.body.trim()).not.toBe("");
     expect(s.wayOut).toBe("none");
+  });
+});
+
+describe("ClosedNotice", () => {
+  const html = (n: Parameters<typeof closedSentence>[0]) =>
+    renderToString(createElement(ClosedNotice, { sentence: closedSentence(n, "sandbox"), onWayOut: () => {} }));
+
+  test("a closed order is never headed as done", () => {
+    const out = html({ kind: "expired" });
+    expect(out).toContain(LEGAL_BODY_COPY.closed.eyebrow);
+    expect(out).not.toContain(`>${LEGAL_BODY_COPY.rail.labels.done}<`);
+    expect(out).toContain(LEGAL_BODY_COPY.notices.expired.title);
+  });
+
+  test("its way out, when it has one, and none otherwise", () => {
+    expect(html({ kind: "expired" })).toContain(LEGAL_BODY_COPY.closed.newOrder);
+    expect(html(undefined)).not.toContain("<button");
   });
 });

@@ -15,6 +15,12 @@ export type NoticeSentence = { title: string; body: string; wayOut: NoticeWayOut
 
 const N = LEGAL_BODY_COPY.notices;
 
+/** `map[key]` when the key is the map's own, else `fallback`: a served value this build does not
+ *  know reads as no value, never as an empty sentence or an inherited name. */
+function ownSentence(map: Readonly<Record<string, string>>, key: string | null, fallback: string): string {
+  return key !== null && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : fallback;
+}
+
 /** The newer order's line, when the server names it. */
 function newerOrder(by: string | null): string {
   return by ? ` ${fillCopy(N.newerOrder, { by })}` : "";
@@ -30,7 +36,7 @@ export function noticeSentence(
     case "lapsed":
       return {
         title: N.lapsed.title,
-        body: N.lapsed.reasons[n.reason ?? "unknown"],
+        body: ownSentence(N.lapsed.reasons, n.reason, N.lapsed.reasons.unknown),
         wayOut: "new_order",
       };
     case "superseded":
@@ -44,7 +50,7 @@ export function noticeSentence(
     case "other_deployment":
       return { ...N.other_deployment, wayOut: "new_order" };
     case "company_failed": {
-      const reason = n.reasonCode ? CHECK_REASON_SENTENCES[n.reasonCode] : N.company_failed.noReason;
+      const reason = ownSentence(CHECK_REASON_SENTENCES, n.reasonCode, N.company_failed.noReason);
       const wayBack =
         environment === "sandbox" ? N.company_failed.wayBackSandbox : N.company_failed.wayBackProduction;
       return { title: N.company_failed.title, body: `${reason} ${wayBack}`, wayOut: "new_company" };

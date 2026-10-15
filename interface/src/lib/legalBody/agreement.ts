@@ -167,6 +167,30 @@ export function verifyAgreement(a: LegalBodyAgreement): AgreementCheck {
 }
 
 /**
+ * Whether the agreement served is this order's own: the hash the order froze when it was placed
+ * is the served manifest's hash. `verifyAgreement` proves the agreement agrees with itself; this
+ * proves it is the one this order's link will sign. An order with no frozen agreement has none.
+ */
+export function agreementOfOrder(order: LegalBodyOrderView, a: LegalBodyAgreement): boolean {
+  return (
+    order.agreement !== null &&
+    typeof a.manifestHash === "string" &&
+    a.manifestHash.toLowerCase() === order.agreement.hash.toLowerCase()
+  );
+}
+
+/** What stops the agreement step, or null: the agreement's own inconsistency first, then an
+ *  agreement that is not this order's (`order_hash`). */
+export function agreementProblem(
+  order: LegalBodyOrderView,
+  a: LegalBodyAgreement,
+): Extract<AgreementCheck, { ok: false }>["problem"] | "order_hash" | null {
+  const check = verifyAgreement(a);
+  if (!check.ok) return check.problem;
+  return agreementOfOrder(order, a) ? null : "order_hash";
+}
+
+/**
  * The wording's version, and whether it carries the draft badge. Only an approved wording goes
  * without the badge: a status this build does not know reads as a draft.
  */

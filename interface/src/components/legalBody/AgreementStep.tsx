@@ -20,6 +20,7 @@ import type { LegalBodyAgreement, LegalBodyOrderView } from "@/lib/api/types";
 import {
   agreementFacts,
   agreementOnScreen,
+  agreementProblem,
   agreementReadSentence,
   delayLine,
   draftOffer,
@@ -27,7 +28,6 @@ import {
   orderRefusalOutcome,
   placedOrder,
   termsParagraphs,
-  verifyAgreement,
 } from "@/lib/legalBody/agreement";
 import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
 import { flowNowMs } from "@/lib/legalBody/resume";
@@ -44,9 +44,10 @@ const A = LEGAL_BODY_COPY.agreement;
  * in an effect, since React runs effects twice in development and an effect would place two
  * orders against a cap. This component has no effect at all.
  *
- * Once the order exists, its agreement is read and checked against its hash in the browser
- * (`verifyAgreement`) before a word of it is shown; one that does not check is a stop, with no
- * Continue. The terms are shown as text, with the hash the link will sign, the draft badge, the
+ * Once the order exists, its agreement is read and checked in the browser before a word of it is
+ * shown (`agreementProblem`): against its own hashes, and against the hash this order froze, so an
+ * agreement that is consistent but another order's is refused too. One that does not check is a
+ * stop, with no Continue. The terms are shown as text, with the hash the link will sign, the draft badge, the
  * amendment delay and the draft's expiry. "I have read this draft" gates Continue, which records
  * nothing: it tells the shell, in memory, that this order's agreement was read (`onRead`), and the
  * shell moves on to the identity step. A reload shows the agreement again.
@@ -210,12 +211,13 @@ function OrderAgreement({
   const { data, error } = agreementQuery;
 
   if (data !== undefined) {
-    const check = verifyAgreement(data);
-    if (!check.ok) {
+    // Consistent in itself, and this order's own: anything else is a stop, before a word is shown.
+    const problem = agreementProblem(order, data);
+    if (problem !== null) {
       return (
         <Callout tone="warn">
           {A.unverifiable}{" "}
-          <span className="font-mono text-[11px] text-muted-2">({check.problem})</span>
+          <span className="font-mono text-[11px] text-muted-2">({problem})</span>
         </Callout>
       );
     }
@@ -254,8 +256,9 @@ function OrderAgreement({
   );
 }
 
-/** An agreement that checked against its hash, with every fact beside it. */
-function CheckedAgreement({
+/** An agreement that checked against its hash and is the order's own, with every fact beside
+ *  it. Exported for its render test only. */
+export function CheckedAgreement({
   agreement,
   order,
   canContinue,
@@ -316,6 +319,7 @@ function CheckedAgreement({
           {A.continue}
         </Button>
       </StepNav>
+      {!canContinue && <p className="mt-3 text-right text-[12px] text-muted-2">{A.cannotContinue}</p>}
     </>
   );
 }

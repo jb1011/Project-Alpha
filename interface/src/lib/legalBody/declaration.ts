@@ -301,11 +301,18 @@ export function isAlreadyDeclared(outcome: StatementSubmitOutcome): boolean {
   return typeof problem === "string" && problem.startsWith(ALREADY_DECLARED);
 }
 
+/** The once-only key the declaration doors hold a filing number under: the number as the doors
+ *  normalise it, in upper case, with its hyphens dropped. */
+export function filingKeyOf(filingNumber: string): string {
+  return normaliseDeclaredText(filingNumber).toUpperCase().replace(/-/g, "");
+}
+
 /**
  * On the "already declared" refusal, the tenant's own company that declared the typed number, if
- * there is one: a declared company, not abandoned, whose declared number equals the typed one,
- * both compared after the backend's normalisation. The first in the list, which the API serves
- * newest first. The screen offers to continue with it instead of only showing the sentence.
+ * there is one: a declared company, not abandoned, whose declared number has the typed number's
+ * once-only key (`filingKeyOf`), the key the doors refuse a second declaration by. Among several,
+ * the one whose check passed; otherwise the first in the list, which the API serves newest first.
+ * The screen offers to continue with it instead of only showing the sentence.
  */
 export function ownCompanyWithNumber(
   outcome: StatementSubmitOutcome,
@@ -313,16 +320,17 @@ export function ownCompanyWithNumber(
   companies: readonly CompanyView[],
 ): string | null {
   if (!isAlreadyDeclared(outcome)) return null;
-  const typed = normaliseDeclaredText(typedNumber);
-  const match = companies.find((c) => {
+  const typed = filingKeyOf(typedNumber);
+  const matches = companies.filter((c) => {
     const declared = c.declared?.filingNumber;
     return (
       c.provider === "customer" &&
       c.state !== "abandoned" &&
       typeof declared === "string" &&
-      normaliseDeclaredText(declared) === typed
+      filingKeyOf(declared) === typed
     );
   });
+  const match = matches.find((c) => c.verification?.state === "verified") ?? matches[0];
   return match?.companyId ?? null;
 }
 

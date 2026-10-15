@@ -19,7 +19,9 @@ import {
 } from "@/lib/api/types";
 import {
   agreementFacts,
+  agreementOfOrder,
   agreementOnScreen,
+  agreementProblem,
   agreementReadAfterJump,
   agreementReadSentence,
   continueDraftLabel,
@@ -339,6 +341,54 @@ describe("verifyAgreement: the manifest hashes to manifestHash, and the terms to
       const a = { ...agreement(), termsDoc: 7 } as unknown as LegalBodyAgreement;
       expect(verifyAgreement(a)).toEqual({ ok: false, problem: "terms_hash" });
     });
+  });
+});
+
+describe("agreementOfOrder: the agreement served is this order's own", () => {
+  test("the order's frozen hash is the served manifest's hash", () => {
+    const a = agreement();
+    expect(agreementOfOrder(order({ agreement: { hash: a.manifestHash, version: 1 } }), a)).toBe(true);
+  });
+
+  test("a hash's letter case is not information", () => {
+    const a = agreement();
+    const upper = `0x${a.manifestHash.slice(2).toUpperCase()}` as Hex;
+    expect(agreementOfOrder(order({ agreement: { hash: upper, version: 1 } }), a)).toBe(true);
+  });
+
+  test("another order's agreement, consistent in itself, is not this order's", () => {
+    const a = agreement();
+    expect(verifyAgreement(a)).toEqual({ ok: true });
+    expect(agreementOfOrder(order({ agreement: { hash: utf8Hash("another manifest"), version: 1 } }), a)).toBe(false);
+  });
+
+  test("an order with no frozen agreement has none to show", () => {
+    expect(agreementOfOrder(order({ agreement: null }), agreement())).toBe(false);
+  });
+
+  test("a served hash that is not a string never matches", () => {
+    const a = agreement();
+    const broken = { ...a, manifestHash: 42 as unknown as Hex };
+    expect(agreementOfOrder(order({ agreement: { hash: a.manifestHash, version: 1 } }), broken)).toBe(false);
+  });
+});
+
+describe("agreementProblem: what stops the step, if anything", () => {
+  test("an agreement consistent in itself and the order's own: nothing", () => {
+    const a = agreement();
+    expect(agreementProblem(order({ agreement: { hash: a.manifestHash, version: 1 } }), a)).toBeNull();
+  });
+
+  test("consistent in itself but not the order's: order_hash", () => {
+    expect(agreementProblem(order(), agreement())).toBe("order_hash");
+    expect(agreementProblem(order({ agreement: null }), agreement())).toBe("order_hash");
+  });
+
+  test("not consistent in itself: its own problem first", () => {
+    const a = agreement();
+    const ofOrder = order({ agreement: { hash: a.manifestHash, version: 1 } });
+    expect(agreementProblem(ofOrder, { ...a, termsDoc: `${a.termsDoc} ` })).toBe("terms_hash");
+    expect(agreementProblem(ofOrder, { ...a, manifest: a.manifest.trimEnd() })).toBe("manifest_hash");
   });
 });
 

@@ -24,6 +24,7 @@ import {
   declinedSentence,
   gateRefusalOutcome,
   isAlreadyDeclared,
+  filingKeyOf,
   ownCompanyWithNumber,
   statementOnScreen,
   statementSubmitOutcome,
@@ -421,6 +422,18 @@ const alreadyDeclared: StatementSubmitOutcome = {
   },
 };
 
+describe("filingKeyOf: the once-only key the doors hold a number under", () => {
+  test.each([
+    ["TEST-0001", "TEST0001"],
+    ["test-0001", "TEST0001"],
+    ["TEST-00-01", "TEST0001"],
+    ["  TEST-0001  ", "TEST0001"],
+    ["EXAMPLE-2021-000123456", "EXAMPLE2021000123456"],
+  ])("%j is held as %j", (typed, key) => {
+    expect(filingKeyOf(typed)).toBe(key);
+  });
+});
+
 describe("a number one of the tenant's own companies already declared", () => {
   test("the door's sentence starts with the words matched", () => {
     expect(ALREADY_DECLARED).toBe("is already declared on this deployment");
@@ -446,6 +459,37 @@ describe("a number one of the tenant's own companies already declared", () => {
       declared: { companyName: "Example Test LLC", filingNumber: "TEST-0001 ", wordingVersion: "w" },
     });
     expect(ownCompanyWithNumber(alreadyDeclared, "TEST-0001", [typedWithSpaces])).toBe("co_own");
+  });
+
+  test("the numbers are compared by the doors' once-only key: case and hyphens are not information", () => {
+    expect(ownCompanyWithNumber(alreadyDeclared, "TEST-00-01", [company()])).toBe("co_own");
+    expect(ownCompanyWithNumber(alreadyDeclared, "test-0001", [company()])).toBe("co_own");
+    const declaredOtherwise = company({
+      declared: { companyName: "Example Test LLC", filingNumber: "TEST-00-01", wordingVersion: "w" },
+    });
+    expect(ownCompanyWithNumber(alreadyDeclared, "TEST-0001", [declaredOtherwise])).toBe("co_own");
+  });
+
+  test("a different key is not the same number", () => {
+    expect(ownCompanyWithNumber(alreadyDeclared, "TEST-00011", [company()])).toBeNull();
+    expect(ownCompanyWithNumber(alreadyDeclared, "TEST-0002", [company()])).toBeNull();
+  });
+
+  test("among several companies with the number, the one whose check passed", () => {
+    const companies = [
+      company({ companyId: "co_failed", verification: { state: "failed", checkedAt: 1, reasonCode: "other" } }),
+      company({ companyId: "co_verified" }),
+      company({ companyId: "co_waiting", verification: { state: "awaiting_check", checkedAt: null, reasonCode: null } }),
+    ];
+    expect(ownCompanyWithNumber(alreadyDeclared, "TEST-0001", companies)).toBe("co_verified");
+  });
+
+  test("with none verified, the first match still is", () => {
+    const companies = [
+      company({ companyId: "co_failed", verification: { state: "failed", checkedAt: 1, reasonCode: "other" } }),
+      company({ companyId: "co_waiting", verification: { state: "awaiting_check", checkedAt: null, reasonCode: null } }),
+    ];
+    expect(ownCompanyWithNumber(alreadyDeclared, "TEST-0001", companies)).toBe("co_failed");
   });
 
   test("the first matching company of the list, which the API serves newest first", () => {

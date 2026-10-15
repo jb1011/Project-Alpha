@@ -19,7 +19,7 @@ export function ClosedNotice({
   const { wayOut } = sentence;
   return (
     <div>
-      <StepHeader eyebrow={LEGAL_BODY_COPY.rail.labels.done} title={sentence.title} />
+      <StepHeader eyebrow={LEGAL_BODY_COPY.closed.eyebrow} title={sentence.title} />
       <Card className="p-6">
         <p className="text-[13.5px] leading-[1.6] text-muted">{sentence.body}</p>
       </Card>

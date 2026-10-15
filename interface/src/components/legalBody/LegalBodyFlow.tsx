@@ -59,7 +59,7 @@ import {
   canJumpTo,
   phaseLabel,
   railCurrentOf,
-  railDone,
+  railDoneOf,
   railPhaseOf,
   visibleLegalBodyPhases,
   type LegalBodyRailPhase,
@@ -189,7 +189,12 @@ function LegalBodyOpen({ config }: { config: AvailableConfig }) {
 
   if (!session) {
     return (
-      <FlowLayout config={config} current="signin" onJump={() => {}}>
+      <FlowLayout
+        config={config}
+        current="signin"
+        done={railDoneOf(visibleLegalBodyPhases(config), "signin", null)}
+        onJump={() => {}}
+      >
         <SignInStep
           code={NO_CODE}
           expired={false}
@@ -363,11 +368,6 @@ function LegalBodySession({
     setView(null);
   }
 
-  function back() {
-    const at = phases.findIndex((p) => p.id === current);
-    if (at > 0) jump(phases[at - 1].id);
-  }
-
   function startAnother(kind: "new_order" | "new_company") {
     if (kind === "new_order" && refs?.companyId)
       setIntent({
@@ -451,7 +451,6 @@ function LegalBodySession({
           <PaymentStep
             eyebrow={label.payment}
             companyId={kit.companyId}
-            onBack={back}
             onComplete={() => {
               void companyQuery.refetch();
               void companiesQuery.refetch();
@@ -484,7 +483,12 @@ function LegalBodySession({
   }
 
   return (
-    <FlowLayout config={config} current={current} onJump={jump}>
+    <FlowLayout
+      config={config}
+      current={current}
+      done={railDoneOf(phases, gate, derivation)}
+      onJump={jump}
+    >
       {arrival && (
         <Callout tone="warn" className="mb-6">
           {arrival}
@@ -517,11 +521,14 @@ function useStoredThread(next: LegalBodyMemory | null) {
 function FlowLayout({
   config,
   current,
+  done,
   onJump,
   children,
 }: {
   config: AvailableConfig;
   current: LegalBodyRailPhase;
+  /** `railDoneOf`'s answer: a closed order ticks the gates only. */
+  done: Record<string, boolean>;
   onJump: (phase: LegalBodyRailPhase) => void;
   children: ReactNode;
 }) {
@@ -532,7 +539,7 @@ function FlowLayout({
         <Stepper<LegalBodyRailPhase>
           phases={phases}
           current={current}
-          done={railDone(phases, current)}
+          done={done}
           onJump={onJump}
           heading={LEGAL_BODY_COPY.rail.heading}
           footer={LEGAL_BODY_COPY.rail.footer}

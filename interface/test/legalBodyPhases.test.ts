@@ -9,6 +9,7 @@ import {
   phaseLabel,
   railCurrentOf,
   railDone,
+  railDoneOf,
   railPhaseOf,
   visibleLegalBodyPhases,
   type LegalBodyRailPhase,
@@ -33,7 +34,7 @@ const config = (over: Partial<AvailableConfig> = {}): AvailableConfig => ({
 });
 
 describe("the phases", () => {
-  test("all nine, in the design's order, with their labels", () => {
+  test("all nine, in the flow's order, with their labels", () => {
     expect(LEGAL_BODY_PHASES).toEqual([
       { id: "signin", label: "Sign in" },
       { id: "human", label: "Accountable human" },
@@ -138,6 +139,32 @@ describe("railDone", () => {
 
   test("a phase this deployment does not show marks nothing", () => {
     expect(railDone(phases, "payment")).toEqual({});
+  });
+});
+
+describe("railDoneOf: a closed order never shows as progress", () => {
+  const phases = visibleLegalBodyPhases(config());
+  const expired: LegalBodyDerivation = { phase: "closed", notice: { kind: "expired" } };
+
+  test("a closed order ticks the gates only: no step it never reached", () => {
+    expect(railDoneOf(phases, "flow", expired)).toEqual({ signin: true, human: true });
+    expect(railDoneOf(phases, "flow", { phase: "closed" })).toEqual({ signin: true, human: true });
+  });
+
+  test("on a charging deployment too", () => {
+    const charging = visibleLegalBodyPhases(config({ paymentRequired: true }));
+    expect(railDoneOf(charging, "flow", expired)).toEqual({ signin: true, human: true });
+  });
+
+  test("any other phase ticks every phase before it", () => {
+    expect(railDoneOf(phases, "flow", { phase: "link" })).toEqual(railDone(phases, "link"));
+    expect(railDoneOf(phases, "flow", { phase: "done" })).toEqual(railDone(phases, "done"));
+    expect(railDoneOf(phases, "flow", null)).toEqual(railDone(phases, "company"));
+  });
+
+  test("on a gate, the gate's own map, whatever the thread says", () => {
+    expect(railDoneOf(phases, "signin", expired)).toEqual({});
+    expect(railDoneOf(phases, "human", expired)).toEqual({ signin: true });
   });
 });
 

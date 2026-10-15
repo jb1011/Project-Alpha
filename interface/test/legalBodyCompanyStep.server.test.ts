@@ -111,9 +111,13 @@ function kit(
   };
 }
 
+function markup(k: LegalBodyStepKit): string {
+  return renderToString(createElement(CompanyStep, { kit: k }));
+}
+
 /** The text a person reads: the markup's tags dropped and its escapes undone. */
 function text(k: LegalBodyStepKit): string {
-  return renderToString(createElement(CompanyStep, { kit: k }))
+  return markup(k)
     .replace(/<[^>]*>/g, " ")
     .replace(/&#x27;/g, "'")
     .replace(/&quot;/g, '"')
@@ -191,15 +195,15 @@ describe("the sub-screens", () => {
   });
 
   test("revoked: the API's word, a new declaration and abandon", () => {
-    const page = text(
-      kit(
-        "sandbox",
-        { phase: "company", companyStep: "revoked", notice: { kind: "company_revoked" } },
-        company({ verification: { state: "revoked", checkedAt: 1, reasonCode: null } }),
-      ),
+    const k = kit(
+      "sandbox",
+      { phase: "company", companyStep: "revoked", notice: { kind: "company_revoked" } },
+      company({ verification: { state: "revoked", checkedAt: 1, reasonCode: null } }),
     );
+    const page = text(k);
     expect(page).toContain(N.company_revoked.title);
-    expect(page).toContain("revoked");
+    // The API's word, in the state-word pill: the title alone would also contain it.
+    expect(markup(k)).toMatch(/<span class="rounded-full[^"]*font-mono[^"]*">revoked<\/span>/);
     expect(page).toContain(C.newDeclaration);
     expect(page).toContain(C.abandon);
   });

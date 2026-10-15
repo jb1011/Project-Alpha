@@ -65,7 +65,7 @@ vi.mock("@/lib/api/legalBodyHooks", () => ({
   },
 }));
 
-import { AgreementStep } from "@/components/legalBody/AgreementStep";
+import { AgreementStep, CheckedAgreement } from "@/components/legalBody/AgreementStep";
 import type { LegalBodyStepKit } from "@/components/legalBody/LegalBodyFlow";
 import {
   ApiError,
@@ -161,6 +161,10 @@ function agreement(termsDoc = TERMS, over: Partial<LegalBodyAgreement> = {}): Le
   };
 }
 
+/** A draft whose frozen hash is the served agreement's: the agreement is this order's own. */
+const draftOf = (a: LegalBodyAgreement, ageMs: number): LegalBodyOrderView =>
+  draft(ageMs, { agreement: { hash: a.manifestHash, version: 1 } });
+
 const AGREEMENT: LegalBodyDerivation = { phase: "agreement" };
 
 function kit(order: LegalBodyOrderView | null, orders: LegalBodyOrderView[] = []): LegalBodyStepKit {
@@ -242,8 +246,8 @@ describe("before the click", () => {
 
 describe("the agreement of the order", () => {
   test("checked against its hash, then shown with every fact, and Continue gated by the checkbox", () => {
-    const order = draft(2 * HOUR);
     const a = agreement();
+    const order = draftOf(a, 2 * HOUR);
     read.current = { data: a, error: null };
     const html = markup(kit(order));
     const page = text(kit(order));
@@ -270,19 +274,24 @@ describe("the agreement of the order", () => {
   });
 
   test("each paragraph is its own block, its line breaks kept", () => {
-    read.current = { data: agreement(), error: null };
-    const html = markup(kit(draft(HOUR)));
+    const a = agreement();
+    read.current = { data: a, error: null };
+    const html = markup(kit(draftOf(a, HOUR)));
     expect(html).toContain("- (a) the Manager has signed the amendment;\n- (b) it was scheduled on chain.");
   });
 
   test("an approved wording goes without the draft badge", () => {
-    read.current = { data: agreement(TERMS, { textStatus: "approved" }), error: null };
-    expect(text(kit(draft(HOUR)))).not.toContain(A.draftWording);
+    const a = agreement(TERMS, { textStatus: "approved" });
+    read.current = { data: a, error: null };
+    const page = text(kit(draftOf(a, HOUR)));
+    expect(page).toContain(A.readCheckbox);
+    expect(page).not.toContain(A.draftWording);
   });
 
   test("markup in the terms is shown as text, never parsed", () => {
-    read.current = { data: agreement("Plain.\n\n<script>alert(1)</script>\n"), error: null };
-    const html = markup(kit(draft(HOUR)));
+    const a = agreement("Plain.\n\n<script>alert(1)</script>\n");
+    read.current = { data: a, error: null };
+    const html = markup(kit(draftOf(a, HOUR)));
     expect(html).not.toContain("<script>");
     expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
   });
@@ -297,6 +306,25 @@ describe("the agreement of the order", () => {
     expect(page).not.toContain(A.readCheckbox);
     expect(page).not.toContain("Status: draft.");
     expect(buttonAttributes(html, A.continue)).toBeNull();
+  });
+
+  test("an agreement consistent in itself but not the order's own is a stop: no checkbox, no Continue", () => {
+    read.current = { data: agreement(), error: null };
+    const order = draft(HOUR, { agreement: { hash: utf8Hash("another manifest"), version: 1 } });
+    const html = markup(kit(order));
+    const page = text(kit(order));
+    expect(page).toContain(A.unverifiable);
+    expect(page).toContain("order_hash");
+    expect(page).not.toContain(A.readCheckbox);
+    expect(page).not.toContain("Status: draft.");
+    expect(buttonAttributes(html, A.continue)).toBeNull();
+  });
+
+  test("an order with no frozen agreement shows none", () => {
+    read.current = { data: agreement(), error: null };
+    const page = text(kit(draft(HOUR, { agreement: null })));
+    expect(page).toContain("order_hash");
+    expect(page).not.toContain(A.readCheckbox);
   });
 
   test("while it is read, the step says so", () => {
@@ -330,5 +358,29 @@ describe("rendering writes nothing", () => {
     text(kit(draft(HOUR)));
     expect(calls.requests).toBe(0);
     expect(calls.effects).toBe(0);
+  });
+});
+
+describe("Continue, when the thread does not name the order yet", () => {
+  const html = (canContinue: boolean) => {
+    const a = agreement();
+    return renderToString(
+      createElement(CheckedAgreement, {
+        agreement: a,
+        order: draftOf(a, HOUR),
+        canContinue,
+        onContinue: vi.fn(),
+      }),
+    );
+  };
+
+  test("a line under the button says why it cannot be pressed", () => {
+    const out = html(false);
+    expect(buttonAttributes(out, A.continue)).toContain("disabled");
+    expect(out.replace(/&#x27;/g, "'")).toContain(A.cannotContinue);
+  });
+
+  test("no such line when the thread names the order", () => {
+    expect(html(true).replace(/&#x27;/g, "'")).not.toContain(A.cannotContinue);
   });
 });

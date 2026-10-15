@@ -23,7 +23,8 @@ import {
 type Props = {
   eyebrow: string;
   companyId: string | null;
-  onBack: () => void;
+  /** Absent where there is no earlier screen to go back to: no Back is shown. */
+  onBack?: () => void;
   onComplete: () => void;
 };
 
