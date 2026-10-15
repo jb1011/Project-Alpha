@@ -224,24 +224,20 @@ export function pointerCall(
 }
 
 /** The states whose body the owner may point at: `deployed`, and `broken` because the pointer was
- *  cleared. Never a replaced or superseded body: pointing back at it breaks its replacement. */
+ *  cleared. Never a replaced or superseded body: pointing back at it breaks its replacement. And
+ *  never a revoked one, which the flow does not offer either. */
 function pointable(order: LegalBodyOrderView): boolean {
+  if (order.revoked) return false;
   return (
     order.state === "deployed" || (order.state === "broken" && order.brokenReason === "not_linked")
   );
 }
 
-/**
- * Every wallet write request passes here. Accepts exactly `register()` and `register(string)` on
- * the registry of `/config`'s chain, and `setMetadata(agentId, "legalBody", pointer)` for the
- * selected order's own identity and body. Refuses with the first rule broken, in the order they
- * are written. Returns the calldata it checked, encoded over the pinned ABI, so a screen can show
- * it.
- */
-export function allowedCall(
-  req: WriteRequest,
-  ctx: CallContext,
-): { ok: true; data: Hex } | Refusal {
+/** What the allowlist accepted: the calldata, and the arguments it was encoded from. */
+type Checked = { ok: true; data: Hex; args: readonly unknown[] };
+
+/** The allowlist itself; `allowedCall` shows its answer, `sendAllowedCall` sends it. */
+function checkCall(req: WriteRequest, ctx: CallContext): Checked | Refusal {
   const { config } = ctx;
   if (req.value !== undefined && req.value !== BigInt(0)) return refuse("sends_value");
   if (req.chainId !== config.chainId) return refuse("wrong_chain");
@@ -256,6 +252,7 @@ export function allowedCall(
       return {
         ok: true,
         data: encodeFunctionData({ abi: identityRegistryAbi, functionName: "register", args: [] }),
+        args: [],
       };
     }
     const [uri] = args;
@@ -263,6 +260,7 @@ export function allowedCall(
       return {
         ok: true,
         data: encodeFunctionData({ abi: identityRegistryAbi, functionName: "register", args: [uri] }),
+        args: [uri],
       };
     }
     return refuse("register_args");
@@ -289,21 +287,38 @@ export function allowedCall(
         functionName: "setMetadata",
         args: [own.agentId, POINTER_KEY, expected],
       }),
+      args: [own.agentId, POINTER_KEY, expected],
     };
   }
 
   return refuse("not_allowed");
 }
 
-/** The request with the fields `allowedCall` read and nothing else: a key it did not read (a
- *  calldata suffix, a nonce) never reaches the wallet. `gas` passes through untouched. */
-function checkedFields(req: WriteRequest): WriteRequest {
+/**
+ * Every wallet write request passes here. Accepts exactly `register()` and `register(string)` on
+ * the registry of `/config`'s chain, and `setMetadata(agentId, "legalBody", pointer)` for the
+ * selected order's own identity and body. Refuses with the first rule broken, in the order they
+ * are written. Returns the calldata it checked, encoded over the pinned ABI, so a screen can show
+ * it.
+ */
+export function allowedCall(
+  req: WriteRequest,
+  ctx: CallContext,
+): { ok: true; data: Hex } | Refusal {
+  const checked = checkCall(req, ctx);
+  return checked.ok ? { ok: true, data: checked.data } : checked;
+}
+
+/** The request the wallet gets: the fields the allowlist read, with the arguments it checked
+ *  (a new array, never the caller's, which could still change), and nothing else: a key it did not
+ *  read (a calldata suffix, a nonce) never reaches the wallet. `gas` passes through untouched. */
+function forwarded(req: WriteRequest, args: readonly unknown[]): WriteRequest {
   const out: WriteRequest = {
     chainId: req.chainId,
     address: req.address,
-    abi: req.abi,
+    abi: identityRegistryAbi,
     functionName: req.functionName,
-    args: req.args,
+    args,
   };
   if (req.value !== undefined) out.value = req.value;
   if (req.gas !== undefined) out.gas = req.gas;
@@ -324,12 +339,12 @@ export async function sendAllowedCall(
     writeContract: (req: WriteRequest) => Promise<Hex>;
   },
 ): Promise<{ ok: true; hash: Hex; data: Hex } | Refusal> {
-  const allowed = allowedCall(req, ctx);
-  if (!allowed.ok) return allowed;
+  const checked = checkCall(req, ctx);
+  if (!checked.ok) return checked;
   if (!deps.configuredChainIds.includes(req.chainId)) return refuse("chain_not_configured");
   if (deps.walletChainId !== req.chainId) return refuse("wallet_on_another_chain");
-  const hash = await deps.writeContract(checkedFields(req));
-  return { ok: true, hash, data: allowed.data };
+  const hash = await deps.writeContract(forwarded(req, checked.args));
+  return { ok: true, hash, data: checked.data };
 }
 
 // ---------------------------------------------------------------------------------------------

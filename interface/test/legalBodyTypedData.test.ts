@@ -193,6 +193,22 @@ const statementCtx = (over: Partial<StatementCtx> = {}): StatementCtx => ({
 
 const refused = (problem: string) => ({ ok: false, problem });
 
+/** One rule broken: the problem it names and the bend that breaks it. */
+type Break = [problem: string, bend: (p: Parts) => void];
+
+/**
+ * Breaks every rule at once, then mends them one at a time from the first: each step must name the
+ * next rule, and the last, with nothing broken, passes. Swapping any two checks fails a step. The
+ * bends are applied last to first, so where two touch the same field the earlier rule's wins.
+ */
+function walk(breaks: Break[], check: (bend: (p: Parts) => void) => unknown) {
+  for (let i = 0; i <= breaks.length; i++) {
+    const active = breaks.slice(i).reverse();
+    const expected = i < breaks.length ? refused(breaks[i][0]) : { ok: true };
+    expect(check((p) => active.forEach(([, bend]) => bend(p))), `step ${i}`).toEqual(expected);
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The pinned values
 // ---------------------------------------------------------------------------------------------
@@ -368,6 +384,36 @@ describe("assertLinkTypedData", () => {
     ).toEqual(refused("agent_id"));
     expect(twice(({ message }) => (message.guardian = OTHER_WALLET), CHAIN_NOW + 10)).toEqual(refused("guardian"));
   });
+
+  test("walks every rule in its order: each one mended uncovers the next", () => {
+    walk(
+      [
+        ["primary_type", ({ typedData }) => (typedData.primaryType = "Permit")],
+        ["typed_data_keys", ({ typedData }) => (typedData.extra = 1)],
+        ["types_keys", ({ types }) => (types.Permit = [])],
+        ["link_fields", ({ types }) => (types.LegalBodyLink = linkFields().reverse())],
+        ["domain_fields", ({ types }) => (types.EIP712Domain = domainFields().slice(0, 3))],
+        ["domain_keys", ({ domain }) => (domain.salt = MANIFEST)],
+        ["domain_name", ({ domain }) => (domain.name = "Permit2")],
+        ["domain_chain", ({ domain }) => (domain.chainId = 1)],
+        ["domain_factory", ({ domain }) => (domain.verifyingContract = ANOTHER_FACTORY)],
+        ["message_keys", ({ message }) => (message.spender = OTHER_WALLET)],
+        ["agent_id", ({ message }) => (message.agentId = "1")],
+        ["guardian", ({ message }) => (message.guardian = OTHER_WALLET)],
+        ["agreement_hash", ({ message }) => (message.operatingAgreementHash = `0x${"00".repeat(32)}`)],
+        ["amendment_delay", ({ message }) => (message.amendmentDelay = "1")],
+        ["deadline", ({ message }) => (message.deadline = String(CHAIN_NOW + 11))],
+        [
+          "deadline_window",
+          ({ served, message }) => {
+            served.deadline = CHAIN_NOW + 10;
+            message.deadline = String(CHAIN_NOW + 10);
+          },
+        ],
+      ],
+      (bend) => assertLinkTypedData(linkServed(bend), linkCtx()),
+    );
+  });
 });
 
 describe("the link's deadline against this browser's clock", () => {
@@ -535,6 +581,33 @@ describe("assertStatementTypedData", () => {
     ).toEqual(refused("company_name"));
     expect(twice(({ message }) => (message.statement = "I approve."), SERVER_NOW - 700)).toEqual(refused("sentence"));
   });
+
+  test("walks every rule in its order: each one mended uncovers the next", () => {
+    walk(
+      [
+        ["primary_type", ({ typedData }) => (typedData.primaryType = "Permit")],
+        ["typed_data_keys", ({ typedData }) => (typedData.extra = 1)],
+        ["types_keys", ({ types }) => (types.Permit = [])],
+        ["statement_fields", ({ types }) => (types.StatementOfAuthority = statementFields().reverse())],
+        ["domain_fields", ({ types }) => (types.EIP712Domain = domainFields().slice(0, 3))],
+        ["domain_keys", ({ domain }) => (domain.salt = MANIFEST)],
+        ["domain_name", ({ domain }) => (domain.name = "Novi LegalBodyFactory")],
+        ["domain_chain", ({ domain }) => (domain.chainId = 1)],
+        ["domain_factory", ({ domain }) => (domain.verifyingContract = ANOTHER_FACTORY)],
+        ["message_keys", ({ message }) => (message.spender = OTHER_WALLET)],
+        ["guardian", ({ message }) => (message.guardian = OTHER_WALLET)],
+        ["company_name", ({ message }) => (message.companyName = "Other Test LLC")],
+        ["filing_number", ({ message }) => (message.filingNumber = "TEST-0002")],
+        ["declarant_name", ({ message }) => (message.declarantName = 7)],
+        ["declarant_title", ({ message }) => (message.declarantTitle = null)],
+        ["jurisdiction", ({ message }) => (message.jurisdiction = "DE")],
+        ["wording_version", ({ message }) => (message.wordingVersion = "2026-10-draft-2")],
+        ["sentence", ({ message }) => (message.statement = "I approve.")],
+        ["issued_at_window", ({ message }) => (message.issuedAt = String(SERVER_NOW - 700))],
+      ],
+      (bend) => assertStatementTypedData(statementServed(bend), statementCtx()),
+    );
+  });
 });
 
 describe("the statement's issuedAt against this browser's clock", () => {
@@ -575,8 +648,58 @@ describe("the declared text, typed against served", () => {
 
   test("normaliseDeclaredText: NFC, the plain spaces at the ends stripped, runs of them collapsed", () => {
     expect(normaliseDeclaredText("  Example   Test Holdings  LLC  ")).toBe("Example Test Holdings LLC");
-    expect(normaliseDeclaredText("Café")).toBe("Café");
+    // "Café" typed with a combining accent ("e" then U+0301) becomes the one character U+00E9.
+    const decomposed = "Cafe\u0301";
+    expect(decomposed).not.toBe("Café");
+    expect(normaliseDeclaredText(decomposed)).toBe("Caf\u00e9");
+    expect(normaliseDeclaredText(decomposed)).toBe("Café");
     expect(normaliseDeclaredText("TEST-0001")).toBe("TEST-0001");
+  });
+});
+
+describe("the declarant", () => {
+  const DECLARANT = "Avery Example";
+  const TITLE = "Managing Member";
+  /** The statement as a production deployment serves it: the declarant the person typed, in the
+   *  sentence as in its own two fields. */
+  const productionServed = (bend?: (p: Parts) => void) =>
+    statementServed((p) => {
+      p.message.declarantName = DECLARANT;
+      p.message.declarantTitle = TITLE;
+      p.message.statement = sentence(COMPANY, NUMBER, GUARDIAN).replace(
+        `"Novi Sandbox Declarant", "Manager"`,
+        `"${DECLARANT}", "${TITLE}"`,
+      );
+      bend?.(p);
+    });
+  /** What a person types on production: the declarant beside the company. */
+  const typedOnProduction = (declarantName: string, declarantTitle: string) =>
+    statementCtx({ typed: { declarantName, declarantTitle, companyName: COMPANY, filingNumber: NUMBER } });
+
+  test("a declarant typed with doubled spaces equals the served, collapsed one", () => {
+    expect(
+      assertStatementTypedData(productionServed(), typedOnProduction("Avery  Example", " Managing  Member ")),
+    ).toEqual({ ok: true });
+  });
+  test("another name than the one typed refuses", () => {
+    expect(assertStatementTypedData(productionServed(), typedOnProduction("Jordan Example", TITLE))).toEqual(
+      refused("declarant_name"),
+    );
+  });
+  test("another title than the one typed refuses", () => {
+    expect(assertStatementTypedData(productionServed(), typedOnProduction(DECLARANT, "Director"))).toEqual(
+      refused("declarant_title"),
+    );
+  });
+  test("a served declarant that is not text refuses, typed or not", () => {
+    const notText = productionServed(({ message }) => (message.declarantName = [DECLARANT]));
+    expect(assertStatementTypedData(notText, typedOnProduction(DECLARANT, TITLE))).toEqual(refused("declarant_name"));
+    expect(assertStatementTypedData(statementServed(({ message }) => (message.declarantName = 7)), statementCtx())).toEqual(
+      refused("declarant_name"),
+    );
+    expect(
+      assertStatementTypedData(statementServed(({ message }) => (message.declarantTitle = null)), statementCtx()),
+    ).toEqual(refused("declarant_title"));
   });
 });
 

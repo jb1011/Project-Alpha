@@ -5,8 +5,8 @@
  * The link binds an identity to its legal body; the statement of authority declares the company
  * behind it. The API serves both, and both are refused here unless every field is the one the
  * person chose: the deployment, the wallet in session, the identity, the agreement read, the
- * company and number typed, and a time inside its window. A refusal names the first rule broken; a
- * screen stops on it and never opens the wallet or shows a copy box.
+ * company, number and declarant typed, and a time inside its window. A refusal names the first rule
+ * broken; a screen stops on it and never opens the wallet or shows a copy box.
  *
  * The served value is read as untrusted JSON: a wrong shape is a refusal, never a throw.
  *
@@ -257,11 +257,25 @@ export function assertStatementTypedData(
   if (m.companyName !== companyName) return refuse("company_name");
   const filingNumber = normaliseDeclaredText(ctx.typed.filingNumber);
   if (m.filingNumber !== filingNumber) return refuse("filing_number");
+  // The declarant is typed on production only; a sandbox serves its fixed one. Text either way.
+  const { declarantName, declarantTitle } = ctx.typed;
+  if (
+    typeof m.declarantName !== "string" ||
+    (declarantName !== undefined && m.declarantName !== normaliseDeclaredText(declarantName))
+  )
+    return refuse("declarant_name");
+  if (
+    typeof m.declarantTitle !== "string" ||
+    (declarantTitle !== undefined && m.declarantTitle !== normaliseDeclaredText(declarantTitle))
+  )
+    return refuse("declarant_title");
   if (m.jurisdiction !== "WY") return refuse("jurisdiction");
   if (typeof m.wordingVersion !== "string" || m.wordingVersion !== served.wordingVersion)
     return refuse("wording_version");
   // The sentence carries what it is about: the company and the number between double quotes, as
   // the wording renders them, and the guardian's address.
+  // The address is matched as the message spells it: the server renders that exact string into
+  // the sentence, and the session was already compared with `sameAddress` above.
   const sentence = m.statement;
   if (
     typeof sentence !== "string" ||

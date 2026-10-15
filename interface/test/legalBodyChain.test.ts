@@ -353,6 +353,13 @@ describe("allowedCall refuses", () => {
       { config, order: order({ state: "superseded", brokenReason: "not_linked" }) },
       "order_not_pointable",
     ],
+    ["a pointer at a revoked body", good, { config, order: order({ revoked: true }) }, "order_not_pointable"],
+    [
+      "a pointer at a revoked body whose pointer was cleared",
+      good,
+      { config, order: order({ state: "broken", brokenReason: "not_linked", revoked: true }) },
+      "order_not_pointable",
+    ],
     ["a pointer for an order with no identity", good, { config, order: order({ agentId: null }) }, "order_has_no_body"],
     ["a pointer for an order with no body", good, { config, order: order({ bodyAddress: null }) }, "order_has_no_body"],
     [
@@ -538,6 +545,26 @@ describe("sendAllowedCall", () => {
     expect(out).toEqual({ ok: true, hash: "0xabc", data: "0x1aa3a008" });
     expect(writeContract).toHaveBeenCalledWith(reg);
     expect("gas" in writeContract.mock.calls[0][0]).toBe(false);
+  });
+
+  test("the wallet gets the arguments the allowlist checked, not the caller's array", async () => {
+    // wagmi reads the request's variables a tick later, after its own `onMutate`.
+    let seen: readonly unknown[] = [];
+    const writeContract = vi.fn<(r: WriteRequest) => Promise<Hex>>(async (r) => {
+      await Promise.resolve();
+      seen = [...r.args];
+      return "0xabc";
+    });
+    const args: unknown[] = [BigInt(LIVE_AGENT), "legalBody", LIVE_POINTER];
+    const pending = sendAllowedCall({ ...req, args }, ctx, {
+      walletChainId: CHAIN,
+      configuredChainIds: [CHAIN],
+      writeContract,
+    });
+    args[2] = encodePointer(CHAIN, ANOTHER_BODY);
+    expect((await pending).ok).toBe(true);
+    expect(seen).toEqual([BigInt(LIVE_AGENT), "legalBody", LIVE_POINTER]);
+    expect(writeContract.mock.calls[0][0].args).not.toBe(args);
   });
 
   test("only the checked fields reach the wallet", async () => {
