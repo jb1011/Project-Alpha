@@ -11,6 +11,7 @@ import {
   railDone,
   railDoneOf,
   railPhaseOf,
+  showRail,
   visibleLegalBodyPhases,
   type LegalBodyRailPhase,
 } from "@/lib/legalBody/phases";
@@ -165,6 +166,34 @@ describe("railDoneOf: a closed order never shows as progress", () => {
   test("on a gate, the gate's own map, whatever the thread says", () => {
     expect(railDoneOf(phases, "signin", expired)).toEqual({});
     expect(railDoneOf(phases, "human", expired)).toEqual({ signin: true });
+  });
+});
+
+describe("showRail: a closed order's screen is a terminal notice, with no rail", () => {
+  test("a closed order, with or without a notice, shows no rail", () => {
+    expect(showRail("flow", { phase: "closed", notice: { kind: "expired" } })).toBe(false);
+    expect(showRail("flow", { phase: "closed", notice: { kind: "lapsed", reason: null } })).toBe(false);
+    expect(showRail("flow", { phase: "closed" })).toBe(false);
+  });
+
+  test.each(["company", "agreement", "identity", "link", "pointer", "payment", "done"] as const)(
+    "%s shows the rail",
+    (phase) => {
+      expect(showRail("flow", { phase })).toBe(true);
+    },
+  );
+
+  test("the done phase with a notice still shows the rail: the body stands", () => {
+    expect(showRail("flow", { phase: "done", notice: { kind: "winding_down" } })).toBe(true);
+  });
+
+  test("no thread decided yet (loading, or a chooser) shows the rail", () => {
+    expect(showRail("flow", null)).toBe(true);
+  });
+
+  test("a gate shows the rail, whatever the thread says behind it", () => {
+    expect(showRail("signin", { phase: "closed" })).toBe(true);
+    expect(showRail("human", { phase: "closed" })).toBe(true);
   });
 });
 

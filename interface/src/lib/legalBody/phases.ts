@@ -88,6 +88,15 @@ export function railDoneOf(
   return railDone(phases, railCurrentOf(gate, derivation));
 }
 
+/**
+ * Whether the screen shows the rail. A closed order's screen is a terminal notice with its own way
+ * out: nothing on it is in progress and nothing past the gates is done, so it shows no rail at
+ * all. Every other screen, the gates and a thread still loading included, shows it.
+ */
+export function showRail(gate: RailGate, derivation: LegalBodyDerivation | null): boolean {
+  return !(gate === "flow" && derivation?.phase === "closed");
+}
+
 /** A jump goes back only: to a gate, or to an earlier shown phase of the thread. */
 export function canJumpTo(
   phases: { id: LegalBodyRailPhase }[],

@@ -61,6 +61,7 @@ import {
   railCurrentOf,
   railDoneOf,
   railPhaseOf,
+  showRail,
   visibleLegalBodyPhases,
   type LegalBodyRailPhase,
 } from "@/lib/legalBody/phases";
@@ -191,6 +192,7 @@ function LegalBodyOpen({ config }: { config: AvailableConfig }) {
     return (
       <FlowLayout
         config={config}
+        rail={showRail("signin", null)}
         current="signin"
         done={railDoneOf(visibleLegalBodyPhases(config), "signin", null)}
         onJump={() => {}}
@@ -485,6 +487,7 @@ function LegalBodySession({
   return (
     <FlowLayout
       config={config}
+      rail={showRail(gate, derivation)}
       current={current}
       done={railDoneOf(phases, gate, derivation)}
       onJump={jump}
@@ -520,12 +523,15 @@ function useStoredThread(next: LegalBodyMemory | null) {
 
 function FlowLayout({
   config,
+  rail,
   current,
   done,
   onJump,
   children,
 }: {
   config: AvailableConfig;
+  /** `showRail`'s answer: a closed order's terminal notice shows no rail. */
+  rail: boolean;
   current: LegalBodyRailPhase;
   /** `railDoneOf`'s answer: a closed order ticks the gates only. */
   done: Record<string, boolean>;
@@ -533,6 +539,19 @@ function FlowLayout({
   children: ReactNode;
 }) {
   const phases = visibleLegalBodyPhases(config);
+  const content = (
+    <div className="min-w-0">
+      <SandboxBanner lines={bannerLines(config)} />
+      <div key={current} className="anim-line" style={{ animationDuration: "0.4s" }}>
+        {children}
+      </div>
+    </div>
+  );
+  if (!rail) {
+    return (
+      <main className="mx-auto max-w-[820px] px-5 pb-24 pt-10 lg:px-8 lg:pt-14">{content}</main>
+    );
+  }
   return (
     <main className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
       <div className="lg:sticky lg:top-24 lg:self-start">
@@ -545,12 +564,7 @@ function FlowLayout({
           footer={LEGAL_BODY_COPY.rail.footer}
         />
       </div>
-      <div className="min-w-0">
-        <SandboxBanner lines={bannerLines(config)} />
-        <div key={current} className="anim-line" style={{ animationDuration: "0.4s" }}>
-          {children}
-        </div>
-      </div>
+      {content}
     </main>
   );
 }
