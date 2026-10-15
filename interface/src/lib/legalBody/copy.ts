@@ -365,7 +365,7 @@ export const LEGAL_BODY_COPY = {
     ownBody:
       "Enter its agent id. This page reads the identity's owner on the chain, and it must be this wallet.",
     registerBody:
-      "This wallet sends one transaction that registers a new identity it owns. It approves nothing and transfers nothing.",
+      "This wallet sends one transaction that registers a new identity it owns. It approves nothing and moves no funds.",
     elsewhereBody:
       "Enter its agent id. This page reads the identity's owner; that key signs the link wherever it lives, and you paste the signature back here.",
     chosen: "Chosen",
@@ -452,6 +452,8 @@ export const LEGAL_BODY_COPY = {
       "The identity for this order is not known on this page. Go back to the identity step and pick it again.",
     refused:
       "The link served does not match your order, your identity, the agreement you read or this wallet ({problem}), so your wallet was not opened and nothing was signed.",
+    ownerMoved:
+      "This identity is no longer owned by this wallet, as the chain reads it now, so your wallet was not opened and nothing was signed. Pick the identity again.",
     declined: "Your wallet did not sign the link, so nothing was sent.",
     declinedOtherNetwork:
       "Your wallet did not sign the link, so nothing was sent. It is on another network than {network}, and a wallet may refuse to sign the link until it is switched there.",
@@ -541,6 +543,8 @@ export const LEGAL_BODY_COPY = {
       "This page has stopped reading the pointer. Once the transaction is sent, click I sent it.",
     refreshing: "Asking Novi Corpus to check the pointer…",
     refreshNoAnswer: "No answer came back from the check just now.",
+    keepChecking:
+      "Novi Corpus has not seen the pointer yet. Once the transaction is confirmed, click I sent it again, and Novi Corpus checks it.",
     retry: "Try again",
   },
 
@@ -581,7 +585,7 @@ export const LEGAL_BODY_COPY = {
     gasUnread:
       "The gas could not be estimated just now; your wallet shows its own estimate when it opens.",
     notEnough:
-      "That is less than the estimate, so the transaction may fail: add a little native USDC to this wallet first.",
+      "That is less than the estimate, so the pointer cannot be sent yet: add a little native USDC to this wallet first, and the button comes back.",
     gasProduction: "Your wallet needs a little native USDC on Arc for gas.",
     seed: "Ask Novi Corpus for a little gas",
     seedSent: "A little native USDC was sent to this wallet.",

@@ -35,7 +35,12 @@ import { formatNative, pointerMatchesFactory, type Refusal } from "./chain";
 import { LEGAL_BODY_COPY, fillCopy } from "./copy";
 import { gasSeedOutcome } from "./doorOutcome";
 import { pointerPreflight, sameAddress, type PointerPreflight } from "./flow";
-import { REGISTER_RECEIPT_TIMEOUT_MS, networkName, type RegisterSendFailure } from "./identity";
+import {
+  REGISTER_RECEIPT_TIMEOUT_MS,
+  networkName,
+  noGasLine,
+  type RegisterSendFailure,
+} from "./identity";
 import { noticeSentence } from "./notice";
 import { refreshErrorLine, type PointerCallText, type PointerChecks } from "./paste";
 import { REFRESH_RETRY_MS } from "./polling";
@@ -107,6 +112,16 @@ export function gasLine(p: { estimateWei: bigint | null; balanceWei: bigint | nu
     balance: balanceWei === null ? null : formatNative(balanceWei),
     enough: estimateWei === null || balanceWei === null ? null : balanceWei >= estimateWei,
   };
+}
+
+/**
+ * Whether the pointer button is held back for gas: only when the balance is KNOWN to be below the
+ * estimate. A balance or an estimate that could not be read keeps it offered, since the wallet
+ * shows its own estimate when it opens. The gas line says what is short and where the native USDC
+ * comes from (`gasLines`).
+ */
+export function gasBlocksSend(line: { enough: boolean | null }): boolean {
+  return line.enough === false;
 }
 
 /**
@@ -276,10 +291,12 @@ export function preflightSentence(
 // ---------------------------------------------------------------------------------------------
 
 /** A failed send (`registerSendFailure` reads why): the wallet's no, with its words when it gave
- *  any; anything else is a wallet that can sign but cannot send, the plain sentence. */
-export function pointerFailureLines(f: RegisterSendFailure): string[] {
+ *  any; too little gas, where the native USDC comes from; anything else is a wallet that can sign
+ *  but cannot send, the plain sentence. */
+export function pointerFailureLines(f: RegisterSendFailure, environment: Environment): string[] {
   if (f.kind === "rejected")
     return [f.message === null ? PT.rejectedNoWords : fillCopy(PT.rejected, { message: f.message })];
+  if (f.kind === "no_gas") return [noGasLine(environment)];
   return [PT.cannotSend];
 }
 

@@ -96,16 +96,20 @@ export function continueDraftLabel(order: LegalBodyOrderView, nowMs: number): st
 /**
  * The draft the step offers instead of a new order, with its button's label: the live draft of
  * this company placed on this deployment. A draft made under another chain or factory cannot move
- * here, so it is not offered, and a new order is.
+ * here, so it is not offered, and a new order is. Nor is `refused`, a draft the link door refused
+ * on this visit: it is live by this browser's rules, and continuing it would meet the same
+ * refusal again.
  */
 export function draftOffer(p: {
   orders: LegalBodyOrderView[];
   companyId: string;
   where: { chainId: number; factory: Address };
   nowMs: number;
+  refused?: string | null;
 }): { order: LegalBodyOrderView; label: string } | null {
   const here = p.orders.filter(
-    (o) => o.chainId === p.where.chainId && sameAddress(o.factory, p.where.factory),
+    (o) =>
+      o.id !== p.refused && o.chainId === p.where.chainId && sameAddress(o.factory, p.where.factory),
   );
   const order = liveDraftFor(here, p.companyId, p.nowMs);
   return order ? { order, label: continueDraftLabel(order, p.nowMs) } : null;

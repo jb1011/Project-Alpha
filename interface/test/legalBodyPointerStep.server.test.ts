@@ -195,6 +195,16 @@ function hasButton(m: string, label: string): boolean {
   );
 }
 
+/** The `disabled` attribute itself, not the class names that style it. */
+const DISABLED = /\sdisabled=""/;
+
+/** The attributes of the button labelled exactly `label`, or null when there is none. */
+function buttonAttributes(m: string, label: string): string | null {
+  for (const [, attributes, inner] of m.matchAll(/<button([^>]*)>([\s\S]*?)<\/button>/g))
+    if (inner.replace(/<[^>]*>/g, "").trim() === label) return attributes;
+  return null;
+}
+
 /** The text a person reads: the markup's tags dropped and its escapes undone. */
 function text(m: string): string {
   return m
@@ -281,6 +291,24 @@ describe("the pointer step", () => {
     expect(hasButton(m, PT.seed)).toBe(true);
     expect(text(m)).toContain(PT.notEnough);
     expect(hasButton(markup(kit(deployed())), PT.seed)).toBe(false);
+  });
+
+  test("a balance known to be short holds the button back, with the faucet sentence", () => {
+    everythingAgrees();
+    chain.balance.data = { value: BigInt(0) };
+    const m = markup(kit(deployed()));
+    expect(buttonAttributes(m, PT.send)).toMatch(DISABLED);
+    expect(text(m)).toContain(PT.notEnough);
+    expect(text(m)).toContain(PT.gas);
+  });
+
+  test("a balance that covers the estimate, or one not read, leaves the button offered", () => {
+    everythingAgrees();
+    expect(buttonAttributes(markup(kit(deployed())), PT.send)).not.toMatch(DISABLED);
+    chain.balance.data = undefined;
+    const m = markup(kit(deployed()));
+    expect(buttonAttributes(m, PT.send)).not.toBeNull();
+    expect(buttonAttributes(m, PT.send)).not.toMatch(DISABLED);
   });
 
   test("the binding on its way: it says so, and nothing is offered", () => {

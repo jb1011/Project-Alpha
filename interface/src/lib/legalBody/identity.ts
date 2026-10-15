@@ -296,7 +296,13 @@ export function registrationView(stage: RegistrationStage): {
 const USER_REJECTED = 4001;
 const MAX_WALLET_WORDS = 200;
 
-export type RegisterSendFailure = { kind: "rejected"; message: string | null } | { kind: "cannot_send" };
+export type RegisterSendFailure =
+  | { kind: "rejected"; message: string | null }
+  | { kind: "no_gas" }
+  | { kind: "cannot_send" };
+
+/** viem's name for a send whose gas the account's native balance cannot pay. */
+const INSUFFICIENT_FUNDS = "InsufficientFundsError";
 
 /** A wallet's words, as one short line: the first line, its spaces squeezed, cut at 200. */
 function shortLine(words: unknown): string | null {
@@ -307,15 +313,21 @@ function shortLine(words: unknown): string | null {
 
 /**
  * Why the send threw: the wallet said no (EIP-1193 4001, or viem's `UserRejectedRequestError`),
- * with its own words when it gave any; or anything else, which this step reads as a wallet that
- * can sign but cannot send. The deepest rejection in the chain is the wallet's own; a viem error
- * speaks through its short message, never its long one.
+ * with its own words when it gave any; or the account's native balance cannot pay the gas (viem's
+ * `InsufficientFundsError` anywhere in the chain); or anything else, which this step reads as a
+ * wallet that can sign but cannot send. The wallet's no comes first: it is the wallet's own
+ * answer. The deepest rejection in the chain is the wallet's own; a viem error speaks through its
+ * short message, never its long one.
  */
 export function registerSendFailure(e: unknown): RegisterSendFailure {
-  const rejections = causesOf(e).filter(
+  const causes = causesOf(e);
+  const rejections = causes.filter(
     (x) => field(x, "code") === USER_REJECTED || field(x, "name") === "UserRejectedRequestError",
   );
-  if (rejections.length === 0) return { kind: "cannot_send" };
+  if (rejections.length === 0)
+    return causes.some((x) => field(x, "name") === INSUFFICIENT_FUNDS)
+      ? { kind: "no_gas" }
+      : { kind: "cannot_send" };
   for (const x of rejections.reverse()) {
     const short = field(x, "shortMessage");
     const words = shortLine(typeof short === "string" ? short : field(x, "message"));
@@ -324,11 +336,21 @@ export function registerSendFailure(e: unknown): RegisterSendFailure {
   return { kind: "rejected", message: null };
 }
 
-/** The lines for a failed send: the wallet's no with its message; otherwise the plain sentence
- *  that the wallet cannot send on Arc, and the way on. */
-export function registerFailureLines(f: RegisterSendFailure): string[] {
+/** The sentence for a wallet whose native balance cannot pay the gas: where the native USDC comes
+ *  from, the faucet on the testnet. Never the cannot-send sentence: the wallet can send. */
+export function noGasLine(environment: Environment): string {
+  return environment === "sandbox"
+    ? LEGAL_BODY_COPY.pointer.gas
+    : LEGAL_BODY_COPY.pointer.gasProduction;
+}
+
+/** The lines for a failed send: the wallet's no with its message; too little gas, where the
+ *  native USDC comes from; otherwise the plain sentence that the wallet cannot send on Arc, and
+ *  the way on. */
+export function registerFailureLines(f: RegisterSendFailure, environment: Environment): string[] {
   if (f.kind === "rejected")
     return [f.message === null ? I.rejectedNoWords : fillCopy(I.rejected, { message: f.message })];
+  if (f.kind === "no_gas") return [noGasLine(environment)];
   return [LEGAL_BODY_COPY.pointer.cannotSend, I.cannotSendWayOut];
 }
 

@@ -150,6 +150,11 @@ describe("the sentences carried verbatim", () => {
     expect(ALL).toContain(sentence);
   });
 
+  test("registering says it moves no funds, never that it transfers nothing: it mints a token and spends gas", () => {
+    expect(LEGAL_BODY_COPY.identity.registerBody).toContain("It approves nothing and moves no funds.");
+    expect(LEGAL_BODY_COPY.identity.registerBody).not.toContain("transfers nothing");
+  });
+
   test("the page and the rail are headed the same way", () => {
     expect(LEGAL_BODY_COPY.page.title).toBe("A legal body for your agent");
     expect(LEGAL_BODY_COPY.rail.heading).toBe("A legal body for your agent");

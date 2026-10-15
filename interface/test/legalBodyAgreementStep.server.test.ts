@@ -353,7 +353,7 @@ describe("rendering writes nothing", () => {
     text(kit(null));
     text(kit(null, [draft(HOUR)]));
     read.current = { data: agreement(), error: null };
-    text(kit(draft(HOUR)));
+    text(kit(draftOf(agreement(), HOUR)));
     read.current = { data: { ...agreement(), manifestHash: utf8Hash("other") }, error: null };
     text(kit(draft(HOUR)));
     expect(calls.requests).toBe(0);

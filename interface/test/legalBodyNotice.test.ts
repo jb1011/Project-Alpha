@@ -144,7 +144,7 @@ describe("ClosedNotice", () => {
 
   test("a closed order is never headed as done", () => {
     const out = html({ kind: "expired" });
-    expect(out).toContain(LEGAL_BODY_COPY.closed.eyebrow);
+    expect(out).toContain(`>${LEGAL_BODY_COPY.closed.eyebrow}<`);
     expect(out).not.toContain(`>${LEGAL_BODY_COPY.rail.labels.done}<`);
     expect(out).toContain(LEGAL_BODY_COPY.notices.expired.title);
   });

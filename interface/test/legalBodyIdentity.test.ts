@@ -11,6 +11,7 @@ import {
   ContractFunctionExecutionError,
   ContractFunctionZeroDataError,
   HttpRequestError,
+  InsufficientFundsError,
   RpcRequestError,
   TimeoutError,
   UserRejectedRequestError,
@@ -144,7 +145,7 @@ describe("parseAgentUri: optional, https only, at most 2048 characters", () => {
     ["2049 characters", https(2049), I.uriProblems.length],
     ["a space inside", "https://example.com/my agent.json", I.uriProblems.characters],
     ["a tab inside, which a URL parser would drop silently", "https://exa\tmple.com/agent.json", I.uriProblems.characters],
-    ["a zero-width character", "https://example.com/​agent.json", I.uriProblems.characters],
+    ["a zero-width character", "https://example.com/\u200bagent.json", I.uriProblems.characters],
   ])("refuses %s", (_name, input, problem) => {
     expect(parseAgentUri(input)).toStrictEqual({ problem });
   });
@@ -472,7 +473,7 @@ describe("registrationView: the sentence for each stage after the send", () => {
     expect(registrationView("waiting")).toStrictEqual({ text: I.waiting, tone: "info", manualEntry: false });
   });
 
-  test("a receipt that names no id: the sentence of the brief and a field for the id", () => {
+  test("a receipt that names no id: its sentence, and a field for the id", () => {
     expect(registrationView("unreadable")).toStrictEqual({
       text: I.receiptUnreadable,
       tone: "warn",
@@ -534,6 +535,17 @@ describe("registerSendFailure: a wallet's no, or a wallet that cannot send", () 
     ["a method the wallet does not support", sendError(providerError(4200, "Method not supported")), { kind: "cannot_send" }],
     ["a plain error", new Error("Connector not connected."), { kind: "cannot_send" }],
     ["a string", "boom", { kind: "cannot_send" }],
+    ["too little native USDC for the gas, as viem says it", new InsufficientFundsError(), { kind: "no_gas" }],
+    [
+      "too little native USDC for the gas, deep in the cause chain",
+      { name: "TransactionExecutionError", shortMessage: "Execution failed.", cause: sendError(new InsufficientFundsError()) },
+      { kind: "no_gas" },
+    ],
+    [
+      "a wallet's no stays the wallet's no, whatever lies under it",
+      Object.assign(new Error("User rejected the request."), { code: 4001, cause: new InsufficientFundsError() }),
+      { kind: "rejected", message: "User rejected the request." },
+    ],
   ])("%s", (_name, e, expected) => {
     expect(registerSendFailure(e)).toStrictEqual(expected);
   });
@@ -546,20 +558,33 @@ describe("registerSendFailure: a wallet's no, or a wallet that cannot send", () 
 
 describe("registerFailureLines", () => {
   test("a wallet's no: its message, after the sentence that nothing was registered", () => {
-    expect(registerFailureLines({ kind: "rejected", message: "User denied transaction signature." })).toStrictEqual([
+    expect(registerFailureLines({ kind: "rejected", message: "User denied transaction signature." }, "sandbox")).toStrictEqual([
       fillCopy(I.rejected, { message: "User denied transaction signature." }),
     ]);
   });
 
   test("a no with no words: the sentence alone", () => {
-    expect(registerFailureLines({ kind: "rejected", message: null })).toStrictEqual([I.rejectedNoWords]);
+    expect(registerFailureLines({ kind: "rejected", message: null }, "sandbox")).toStrictEqual([I.rejectedNoWords]);
   });
 
   test("any other failure: the plain cannot-send sentence, then the way on", () => {
-    const lines = registerFailureLines({ kind: "cannot_send" });
+    const lines = registerFailureLines({ kind: "cannot_send" }, "sandbox");
     expect(lines[0]).toBe(LEGAL_BODY_COPY.pointer.cannotSend);
     expect(lines[0].startsWith("Your wallet can sign but it cannot send a transaction on Arc")).toBe(true);
     expect(lines).toStrictEqual([LEGAL_BODY_COPY.pointer.cannotSend, I.cannotSendWayOut]);
+  });
+
+  test.each([
+    ["sandbox", LEGAL_BODY_COPY.pointer.gas],
+    ["production", LEGAL_BODY_COPY.pointer.gasProduction],
+  ] as const)("too little gas on %s: the gas sentence, never the cannot-send one", (environment, sentence) => {
+    const lines = registerFailureLines({ kind: "no_gas" }, environment);
+    expect(lines).toStrictEqual([sentence]);
+    expect(lines).not.toContain(LEGAL_BODY_COPY.pointer.cannotSend);
+  });
+
+  test("on the testnet the gas sentence names the faucet", () => {
+    expect(registerFailureLines({ kind: "no_gas" }, "sandbox")[0]).toContain("faucet");
   });
 });
 

@@ -262,7 +262,7 @@ describe("linkFieldRows", () => {
     ]);
   });
 
-  test("the words the plan names: guardian = your wallet, hash = the one you read, deadline in N minutes", () => {
+  test("the words beside the values: guardian = your wallet, hash = the one you read, deadline in N minutes", () => {
     const r = rows();
     expect(r[1].note).toBe("your wallet");
     expect(r[3].note).toBe("the one you read");
@@ -272,6 +272,28 @@ describe("linkFieldRows", () => {
   test("one minute, and less than one", () => {
     expect(rows(DEADLINE - 61)[4].note).toBe("in 1 minute");
     expect(rows(DEADLINE - 30)[4].note).toBe("in less than a minute");
+  });
+
+  test.each([
+    [21_600, "in 6 hours"],
+    [21_540, "in 5 hours"],
+    [7_200, "in 2 hours"],
+    [3_600, "in 1 hour"],
+    [3_599, "in 59 minutes"],
+    [61, "in 1 minute"],
+    [30, "in less than a minute"],
+  ])("on the paste branch %i s before the deadline reads %j: whole hours, minutes under one", (left, note) => {
+    const sixHours = served(undefined, CHAIN_NOW + 21_600);
+    const at = CHAIN_NOW + 21_600 - left;
+    expect(linkFieldRows(decodeLinkFields(sixHours.typedData, at), "paste")[4].note).toBe(note);
+  });
+
+  test("the browser branch keeps minutes, as before", () => {
+    const sixHours = served(undefined, CHAIN_NOW + 21_600);
+    expect(linkFieldRows(decodeLinkFields(sixHours.typedData, CHAIN_NOW + 60), "browser")[4].note).toBe(
+      "in 359 minutes",
+    );
+    expect(linkFieldRows(decodeLinkFields(sixHours.typedData, CHAIN_NOW + 60))[4].note).toBe("in 359 minutes");
   });
 
   test("no row is left with a template unfilled", () => {
@@ -693,10 +715,18 @@ describe("linkOutcomeView", () => {
   });
 
   test("the gate's stop names its problem, and says the wallet was not opened", () => {
-    expect(view({ kind: "stop", problem: "identity_owner" })).toEqual({
-      lines: [fillCopy(L.refused, { problem: "identity_owner" })],
+    expect(view({ kind: "stop", problem: "deadline_window" })).toEqual({
+      lines: [fillCopy(L.refused, { problem: "deadline_window" })],
       action: "sign",
       sendBack: null,
+    });
+  });
+
+  test("an identity owned by another key now goes back to the identity step, where another is picked", () => {
+    expect(view({ kind: "stop", problem: "identity_owner" })).toEqual({
+      lines: [L.ownerMoved],
+      action: "sign",
+      sendBack: { to: "identity", sentence: L.ownerMoved },
     });
   });
 
@@ -722,6 +752,7 @@ describe("linkOutcomeView", () => {
       { kind: "no_answer", door: "message" },
       { kind: "no_answer", door: "submit" },
       { kind: "stop", problem: "deadline_window" },
+      { kind: "stop", problem: "identity_owner" },
       { kind: "declined", walletChainId: 1 },
       { kind: "declined", walletChainId: CHAIN },
       { kind: "not_connected" },

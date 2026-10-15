@@ -10,7 +10,8 @@ import type { LegalBodyDerivation, LegalBodyPhase } from "@/lib/legalBody/flow";
  * never skips a door.
  */
 
-/** A phase on the rail. `closed` is a derivation's phase, never the rail's: it shows as `done`. */
+/** A phase on the rail. `closed` is a derivation's phase, never the rail's: a closed order's screen
+ *  shows no rail at all (`showRail`). */
 export type LegalBodyRailPhase = "signin" | "human" | LegalBodyPhase;
 
 /** Where the screen is past its data: a gate, or the thread's own step. */
@@ -38,8 +39,9 @@ export function visibleLegalBodyPhases(
   return LEGAL_BODY_PHASES.filter((p) => p.id !== "payment" || config.paymentRequired);
 }
 
-/** Where a derivation sits on the rail. A closed order's last phase is not known: it shows at the
- *  rail's end. */
+/** Where a derivation sits on the rail. A closed order's last phase is not known and its screen
+ *  shows no rail (`showRail`); it maps to the rail's end only so the screen has one position, which
+ *  a sentence carried to it names. */
 export function railPhaseOf(derivation: LegalBodyDerivation): LegalBodyRailPhase {
   return derivation.phase === "closed" ? "done" : derivation.phase;
 }

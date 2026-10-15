@@ -401,6 +401,13 @@ describe("the pointer panel", () => {
     expect(interval({ state: { data: LIVE_POINTER } })).toBe(false);
   });
 
+  test("the three checks are read once: no retry, and not again on focus or on reconnect", () => {
+    chainAgrees();
+    pointerMarkup(kit(POINTER, deployed()));
+    for (const read of chain.asked.slice(0, 3))
+      expect(read.query).toEqual({ retry: false, refetchOnWindowFocus: false, refetchOnReconnect: false });
+  });
+
   test("the pointer seen on the chain is said, and I sent it is still the click that checks it", () => {
     chainAgrees();
     chain.reads.getMetadata = { status: "success", data: LIVE_POINTER, dataUpdatedAt: Date.now() };
@@ -458,6 +465,18 @@ describe("the pointer panel", () => {
     expect(text(m)).toContain(fillCopy(P.callRefused, { problem: "order_not_pointable" }));
     expect(chain.asked).toEqual([]);
     expect(m).not.toContain("<button");
+  });
+});
+
+describe("after a round of checks that did not see the pointer", () => {
+  const panel = () =>
+    readFileSync(fileURLToPath(new URL("../src/components/legalBody/PastePointerPanel.tsx", import.meta.url)), "utf8");
+
+  test("the panel says its own line: the watch is off, so the next check is the person's click", () => {
+    expect(P.keepChecking).toContain("I sent it");
+    expect(P.keepChecking).not.toContain("updates when the pointer is seen");
+    expect(panel()).toContain("P.keepChecking");
+    expect(panel()).not.toContain("POINTER.keepChecking");
   });
 });
 

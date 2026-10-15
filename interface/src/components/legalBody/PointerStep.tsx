@@ -39,6 +39,7 @@ import {
   browserPointerScreen,
   chainUnreadLine,
   gasEstimateWei,
+  gasBlocksSend,
   gasLine,
   gasLines,
   gasSeedAnswer,
@@ -307,7 +308,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
 
   /** "Write the pointer": the one transaction, its receipt, then one check now and the plan. */
   async function onSend() {
-    if (inFlight.current || run.current !== null || ready === null) return;
+    if (inFlight.current || run.current !== null || ready === null || gasBlocksSend(line)) return;
     setLines([]);
     // The wallet that sends is the identity's owner, as the preflight read it.
     if (!connected || !sameAddress(connected, ready.owner)) {
@@ -334,7 +335,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
       try {
         sent = await send(req, { config, order });
       } catch (e) {
-        setLines(pointerFailureLines(registerSendFailure(e)));
+        setLines(pointerFailureLines(registerSendFailure(e), environment));
         return;
       }
       if (!sent.ok) {
@@ -526,7 +527,11 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
 
               {sendOffered(tx?.stage ?? null) && (
                 <StepNav>
-                  <Button onClick={() => void onSend()} loading={busy !== null}>
+                  <Button
+                    onClick={() => void onSend()}
+                    loading={busy !== null}
+                    disabled={gasBlocksSend(line)}
+                  >
                     {PT.send}
                   </Button>
                 </StepNav>

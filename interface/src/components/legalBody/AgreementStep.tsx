@@ -56,6 +56,7 @@ export function AgreementStep({
   kit,
   onRead,
   onBackToCompany,
+  refusedDraftId,
 }: {
   kit: LegalBodyStepKit;
   /** In memory only: this order's agreement was read on this visit. */
@@ -63,6 +64,8 @@ export function AgreementStep({
   /** The order door said the company cannot stand behind a body: the shell reads the company
    *  again and carries the door's sentence back to the company step. */
   onBackToCompany: (sentence: string) => void;
+  /** A draft the link door refused on this visit: never offered again to continue. */
+  refusedDraftId?: string | null;
 }) {
   // The order just placed, until the thread names it: the list is read again before the click
   // settles, so this covers only a list that could not be read.
@@ -86,7 +89,12 @@ export function AgreementStep({
           onRead={onRead}
         />
       ) : (
-        <PlaceOrder kit={kit} onPlaced={setPlaced} onBackToCompany={onBackToCompany} />
+        <PlaceOrder
+          kit={kit}
+          onPlaced={setPlaced}
+          onBackToCompany={onBackToCompany}
+          refusedDraftId={refusedDraftId ?? null}
+        />
       )}
     </div>
   );
@@ -98,10 +106,12 @@ function PlaceOrder({
   kit,
   onPlaced,
   onBackToCompany,
+  refusedDraftId,
 }: {
   kit: LegalBodyStepKit;
   onPlaced: (order: LegalBodyOrderView) => void;
   onBackToCompany: (sentence: string) => void;
+  refusedDraftId: string | null;
 }) {
   const { config, companyId } = kit;
   const createOrder = useCreateLegalBodyOrderMutation();
@@ -122,6 +132,7 @@ function PlaceOrder({
           companyId,
           where: { chainId: config.chainId, factory: config.factory },
           nowMs,
+          refused: refusedDraftId,
         });
 
   /** The live draft, continued: the memory names it, with no owner chosen for it yet. */

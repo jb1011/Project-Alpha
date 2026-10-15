@@ -215,7 +215,7 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
       try {
         sent = await send(registerCall(config, uri), { config, order: kit.order });
       } catch (e) {
-        setLines(registerFailureLines(registerSendFailure(e)));
+        setLines(registerFailureLines(registerSendFailure(e), environment));
         return;
       }
       if (!sent.ok) {

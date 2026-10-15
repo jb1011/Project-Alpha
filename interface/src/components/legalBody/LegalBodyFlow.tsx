@@ -248,6 +248,8 @@ function LegalBodySession({
   // A door's sentence for the step it sends the person back to, until the next click that moves
   // the thread.
   const [carried, setCarried] = useState<CarriedSentence | null>(null);
+  // A draft the link door refused on this visit: never offered again as a draft to continue.
+  const [refusedDraftId, setRefusedDraftId] = useState<string | null>(null);
 
   // Reads only.
   const code = useBytecode({ address: tenant, chainId: arcTestnet.id });
@@ -397,9 +399,11 @@ function LegalBodySession({
       case "agreement": {
         // The order read again decides: one that moved on (reserved from another tab, closed) is
         // shown where it now is; a draft that cannot be linked needs a new order, from the
-        // agreement.
+        // agreement, and the refused draft is not offered there again.
+        const refused = refs?.orderId ?? null;
         const read = await orderQuery.refetch();
         if (afterOrderRefused(read.data) === "rederive") return;
+        setRefusedDraftId(refused);
         startAnother("new_order");
         setCarried({ to: "agreement", sentence });
         return;
@@ -412,7 +416,7 @@ function LegalBodySession({
         setCarried({ to: "identity", sentence });
         return;
       case "closed":
-        // The order read again is closed: its screen sits at the rail's end.
+        // The order read again is closed: the sentence goes to the position a closed order maps to.
         setCarried({ to: railPhaseOf({ phase: "closed" }), sentence });
         return;
     }
@@ -509,6 +513,7 @@ function LegalBodySession({
             kit={kit}
             onRead={agreementRead}
             onBackToCompany={backToCompany}
+            refusedDraftId={refusedDraftId}
           />
         );
       case "identity":

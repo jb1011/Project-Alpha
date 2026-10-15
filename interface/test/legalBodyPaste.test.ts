@@ -729,9 +729,16 @@ describe("pastePointerState", () => {
     ).toEqual({ kind: "moved", reason: "no_identity" });
   });
 
-  test("the connected wallet does not matter on this branch", () => {
-    // The guardian is not the owner; the checks pass on the owner the order recorded alone.
-    expect(pastePointerState({ call: call(), identityOwner: OWNER, checks: checks() }).kind).toBe("ready");
+  test("the guardian's wallet counts for nothing on this branch: an identity it now owns has moved", () => {
+    // The order recorded another key as the owner; the guardian holding the identity now is a move,
+    // and the call is not shown for it.
+    expect(
+      pastePointerState({
+        call: call(),
+        identityOwner: OWNER,
+        checks: checks({ ownerOf: GUARDIAN, ownerAtCreation: OWNER }),
+      }),
+    ).toEqual({ kind: "moved", reason: "identity_moved" });
   });
 
   test("a refused call is a stop before any read counts", () => {

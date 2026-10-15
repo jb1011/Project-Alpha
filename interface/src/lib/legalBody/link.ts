@@ -28,7 +28,7 @@ import {
   type LinkTypedDataWire,
 } from "@/lib/api/types";
 import { TIMEOUT_CODE } from "@/lib/api/timeout";
-import { durationWords, utcMinute } from "./agreement";
+import { durationWords, hoursWords, utcMinute } from "./agreement";
 import type { Refusal } from "./chain";
 import { LEGAL_BODY_COPY, fillCopy } from "./copy";
 import { linkDoorRoute, linkSubmitOutcome } from "./doorOutcome";
@@ -115,12 +115,20 @@ function minutesWords(minutes: number): string {
   return fillCopy(W.minutes, { n: String(minutes) });
 }
 
+/** The time left in words: minutes in the browser, where a link lives an hour; on the paste
+ *  branch, whose link lives six, whole hours, rounded down, and minutes under the last hour. */
+function timeLeftWords(minutes: number, branch: OwnerBranch): string {
+  if (branch === "paste" && minutes >= 60) return hoursWords(Math.floor(minutes / 60));
+  return minutesWords(minutes);
+}
+
 /**
  * The rows the step shows, one per field in the link's order and then the domain: the guardian is
  * "your wallet" and the agreement hash "the one you read", since the gate has already found both
- * equal to this wallet and to the agreement checked on this order.
+ * equal to this wallet and to the agreement checked on this order. The deadline's time left is
+ * said in the unit that suits the branch's link life.
  */
-export function linkFieldRows(d: DecodedLink): LinkFieldRow[] {
+export function linkFieldRows(d: DecodedLink, branch: OwnerBranch = "browser"): LinkFieldRow[] {
   const deadlineAt = d.deadlineIso === "" ? null : utcMinute(Date.parse(d.deadlineIso));
   return [
     { label: L.fields.agentId, value: d.agentId, note: null },
@@ -130,7 +138,7 @@ export function linkFieldRows(d: DecodedLink): LinkFieldRow[] {
     {
       label: L.fields.deadline,
       value: deadlineAt ?? d.deadlineIso,
-      note: fillCopy(L.deadlineIn, { left: minutesWords(d.minutesLeft) }),
+      note: fillCopy(L.deadlineIn, { left: timeLeftWords(d.minutesLeft, branch) }),
     },
     {
       label: L.fields.domain,
@@ -393,6 +401,14 @@ export function linkOutcomeView(
     case "no_answer":
       return say([outcome.door === "message" ? L.noAnswerMessage : L.noAnswerSubmit], "retry");
     case "stop":
+      // The identity changed hands since it was picked: another identity, or its new owner, is
+      // picked on the identity step.
+      if (outcome.problem === "identity_owner")
+        return {
+          lines: [L.ownerMoved],
+          action: "sign",
+          sendBack: { to: "identity", sentence: L.ownerMoved },
+        };
       return say([fillCopy(L.refused, { problem: outcome.problem })]);
     case "declined":
       return say([

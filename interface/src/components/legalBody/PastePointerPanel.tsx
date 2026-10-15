@@ -37,8 +37,10 @@ import { CopyBox, FieldRows, McpNote } from "./PasteLinkPanel";
 const P = LEGAL_BODY_COPY.paste;
 const POINTER = LEGAL_BODY_COPY.pointer;
 
-/** A chain read asked once: a revert is an answer, and a failure has its own Try again. */
-const ONCE = { retry: false } as const;
+/** A chain read asked once: a revert is an answer, and a failure has its own Try again. Not asked
+ *  again on focus or on reconnect either: a failed read there would take the call off the screen
+ *  in the middle of a round. */
+const ONCE = { retry: false, refetchOnWindowFocus: false, refetchOnReconnect: false } as const;
 
 /** This browser's clock, read inside a click, its continuations and the watch's interval only. */
 const nowMs = () => Date.now();
@@ -352,7 +354,7 @@ function SendFromOwner({
             {lines.map((line) => (
               <span key={line}>{line}</span>
             ))}
-            {keepChecking && <span>{POINTER.keepChecking}</span>}
+            {keepChecking && <span>{P.keepChecking}</span>}
           </span>
         </Callout>
       )}

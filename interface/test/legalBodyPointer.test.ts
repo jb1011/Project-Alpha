@@ -17,7 +17,7 @@
  * 5042002, its public registry and factory, agent 897126 and its body), with anvil's first
  * published account as the guardian, which owns the identity on this branch.
  */
-import { formatUnits, type Hex } from "viem";
+import { InsufficientFundsError, formatUnits, type Hex } from "viem";
 import { describe, expect, test } from "vitest";
 import { TIMEOUT_CODE, TIMEOUT_MESSAGE } from "@/lib/api/timeout";
 import {
@@ -44,6 +44,7 @@ import {
   browserPointerChecks,
   browserPointerScreen,
   chainUnreadLine,
+  gasBlocksSend,
   gasEstimateWei,
   gasLine,
   gasLines,
@@ -666,21 +667,52 @@ describe("the step's sentences", () => {
 describe("pointerFailureLines", () => {
   test("the wallet said no, with its own words", () => {
     const f = registerSendFailure({ code: 4001, message: "User rejected the request." });
-    expect(pointerFailureLines(f)).toStrictEqual([
+    expect(pointerFailureLines(f, "sandbox")).toStrictEqual([
       "Your wallet did not send the pointer, so nothing was written. It said: User rejected the request.",
     ]);
   });
 
   test("the wallet said no, without words", () => {
-    expect(pointerFailureLines({ kind: "rejected", message: null })).toStrictEqual([PT.rejectedNoWords]);
+    expect(pointerFailureLines({ kind: "rejected", message: null }, "sandbox")).toStrictEqual([PT.rejectedNoWords]);
   });
 
   test("any other failure: the wallet can sign but cannot send, the plain sentence", () => {
     const f = registerSendFailure(new Error("method not supported"));
     expect(f).toStrictEqual({ kind: "cannot_send" });
-    expect(pointerFailureLines(f)).toStrictEqual([
+    expect(pointerFailureLines(f, "sandbox")).toStrictEqual([
       "Your wallet can sign but it cannot send a transaction on Arc, so it cannot write the pointer. The identity's owner must be a key that can send, or its sponsor must pay.",
     ]);
+  });
+});
+
+describe("too little gas for the pointer", () => {
+  test.each([
+    ["sandbox", PT.gas],
+    ["production", PT.gasProduction],
+  ] as const)("a send viem refuses for its funds on %s: the gas sentence, never the cannot-send one", (environment, sentence) => {
+    const f = registerSendFailure({ name: "TransactionExecutionError", cause: new InsufficientFundsError() });
+    expect(f).toStrictEqual({ kind: "no_gas" });
+    expect(pointerFailureLines(f, environment)).toStrictEqual([sentence]);
+    expect(pointerFailureLines(f, environment)).not.toContain(PT.cannotSend);
+  });
+
+  test.each<[string, bigint | null, bigint | null, boolean]>([
+    ["a balance known to be below the estimate", CENT, CENT - BigInt(1), true],
+    ["a balance of exactly the estimate", CENT, CENT, false],
+    ["a balance above the estimate", CENT, CENT * BigInt(2), false],
+    ["no balance read", CENT, null, false],
+    ["no estimate made", null, CENT, false],
+    ["neither", null, null, false],
+  ])("%s: the button is held back only on a shortfall that is known", (_name, estimateWei, balanceWei, blocked) => {
+    expect(gasBlocksSend(gasLine({ estimateWei, balanceWei }))).toBe(blocked);
+  });
+
+  test("a shortfall that is known says so, and where the native USDC comes from", () => {
+    const line = gasLine({ estimateWei: CENT, balanceWei: CENT - BigInt(1) });
+    const view = gasLines({ line, estimating: false, environment: "sandbox" });
+    expect(view.tone).toBe("warn");
+    expect(view.lines).toContain(PT.notEnough);
+    expect(view.lines).toContain(PT.gas);
   });
 });
 

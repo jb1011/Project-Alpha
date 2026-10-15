@@ -278,7 +278,9 @@ function PastePanel({
     }
   }
 
-  const rows = shown ? linkFieldRows(decodeLinkFields(shown.served.typedData, shown.at)) : null;
+  const rows = shown
+    ? linkFieldRows(decodeLinkFields(shown.served.typedData, shown.at), "paste")
+    : null;
   const owner: unknown = shown?.served.identityOwner;
 
   return (
