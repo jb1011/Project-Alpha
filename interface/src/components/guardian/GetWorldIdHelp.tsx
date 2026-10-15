@@ -15,9 +15,12 @@ import { cx } from "@/components/onboarding/primitives";
 export function GetWorldIdHelp({
   className,
   defaultOpen = false,
+  showWaiver = true,
 }: {
   className?: string;
   defaultOpen?: boolean;
+  /** False where a waiver is not accepted, so none is offered. */
+  showWaiver?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
 
@@ -62,7 +65,7 @@ export function GetWorldIdHelp({
           {/* Neither route exists everywhere (no Orb in France; ~12 countries of passports).
               The waiver is the honest fallback: admin-issued, single-use, and recorded as a
               waiver — never presented as proof of personhood. */}
-          <WaiverRedeem />
+          {showWaiver && <WaiverRedeem />}
         </div>
       )}
     </div>

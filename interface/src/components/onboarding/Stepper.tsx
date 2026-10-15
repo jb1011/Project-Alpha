@@ -1,24 +1,45 @@
 "use client";
 
-import { Phase, PhaseMeta } from "./types";
+import type { ReactNode } from "react";
+import type { Phase } from "./types";
 import { CheckIcon, cx } from "./primitives";
 
-type Props = {
+/** Generic over the phase id, so another flow with its own phases can use the same rail. */
+type Props<P extends string> = {
   /** The phases THIS deployment shows — not the full list. A deployment that forms no entities
    *  has no legal-identity step, and a rail advertising one would be describing another box. */
-  phases: PhaseMeta[];
-  current: Phase;
+  phases: { id: P; label: string }[];
+  current: P;
   done: Record<string, boolean>;
-  onJump: (phase: Phase) => void;
+  onJump: (phase: P) => void;
+  /** The rail's heading; the wizard's by default. */
+  heading?: ReactNode;
+  /** The note under the rail; the wizard's by default. */
+  footer?: ReactNode;
 };
 
-export function Stepper({ phases, current, done, onJump }: Props) {
+const DEFAULT_FOOTER = (
+  <>
+    <span className="text-muted">Guardian controlled.</span> SIWE sign-in,
+    passkey ceremony, and one guardian transaction per allowlist address.
+    Treasury funding needs no user signature.
+  </>
+);
+
+export function Stepper<P extends string = Phase>({
+  phases,
+  current,
+  done,
+  onJump,
+  heading = "Create your agent",
+  footer = DEFAULT_FOOTER,
+}: Props<P>) {
   const currentIndex = phases.findIndex((p) => p.id === current);
 
   return (
     <nav aria-label="Onboarding progress">
       <div className="mb-5 text-[11px] uppercase tracking-[0.2em] text-muted-2">
-        Create your agent
+        {heading}
       </div>
       <ol className="flex flex-col gap-1">
         {phases.map((p, i) => {
@@ -77,9 +98,7 @@ export function Stepper({ phases, current, done, onJump }: Props) {
       </ol>
 
       <div className="mt-7 rounded-xl hairline bg-paper-2/40 px-3.5 py-3 text-[11.5px] leading-[1.5] text-muted-2">
-        <span className="text-muted">Guardian controlled.</span> SIWE sign-in,
-        passkey ceremony, and one guardian transaction per allowlist address.
-        Treasury funding needs no user signature.
+        {footer}
       </div>
     </nav>
   );

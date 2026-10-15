@@ -17,9 +17,8 @@ import { useAuth } from "../AuthProvider";
 import { usePasskeyChallengeMutation } from "@/lib/api/hooks";
 import { createGuardianPasskey } from "@/lib/api/passkey";
 import type { GuardianPasskey } from "@/lib/api/types";
-import { shortAddress } from "../types";
+import { WalletSignInCard } from "@/components/guardian/WalletSignInCard";
 
-type WalletState = "idle" | "connecting" | "connected" | "logged-in" | "error";
 type PasskeyState = "idle" | "pending" | "registered" | "error";
 
 export function WelcomeStep({
@@ -31,35 +30,13 @@ export function WelcomeStep({
   onPasskey: (passkey: GuardianPasskey) => void;
   onComplete: () => void;
 }) {
-  const {
-    address,
-    isConnected,
-    isLoggingIn,
-    connectWallet,
-    login,
-    session,
-    ensureSession,
-  } = useAuth();
+  const { session, ensureSession } = useAuth();
   const passkeyChallenge = usePasskeyChallengeMutation();
 
-  const [walletOverride, setWalletOverride] = useState<"connecting" | "error" | null>(
-    null,
-  );
   const [passkeyOverride, setPasskeyOverride] = useState<"pending" | "error" | null>(
     null,
   );
   const [error, setError] = useState<string | null>(null);
-
-  const walletState: WalletState =
-    walletOverride === "connecting"
-      ? "connecting"
-      : walletOverride === "error"
-        ? "error"
-        : session
-          ? "logged-in"
-          : isConnected
-            ? "connected"
-            : "idle";
 
   const passkeyState: PasskeyState =
     passkeyOverride === "pending"
@@ -69,29 +46,6 @@ export function WelcomeStep({
         : guardianPasskey
           ? "registered"
           : "idle";
-
-  async function handleConnect() {
-    setError(null);
-    setWalletOverride("connecting");
-    try {
-      await connectWallet();
-      setWalletOverride(null);
-    } catch (e) {
-      setWalletOverride("error");
-      setError(e instanceof Error ? e.message : "Wallet connection failed.");
-    }
-  }
-
-  async function handleLogin() {
-    setError(null);
-    setWalletOverride(null);
-    try {
-      await login();
-    } catch (e) {
-      setWalletOverride("error");
-      setError(e instanceof Error ? e.message : "Sign-in failed.");
-    }
-  }
 
   async function startPasskey() {
     setPasskeyOverride("pending");
@@ -113,7 +67,8 @@ export function WelcomeStep({
     }
   }
 
-  const walletDone = walletState === "logged-in";
+  // Signed in means a session: what the passkey card and Continue gate on.
+  const walletDone = !!session;
   const passkeyDone = passkeyState === "registered";
 
   return (
@@ -126,48 +81,16 @@ export function WelcomeStep({
 
       <div className="grid grid-cols-1 gap-8 lg:grid-cols-[1fr_0.85fr] lg:gap-12">
         <div className="flex flex-col gap-6">
-          <Card className="p-6">
-            <div className="flex items-center gap-2.5">
-              <span
-                className={cx(
-                  "flex h-6 w-6 items-center justify-center rounded-full text-[11px]",
-                  walletDone
-                    ? "bg-accent text-paper"
-                    : "border hairline-strong text-muted-2",
-                )}
-              >
-                {walletDone ? <CheckIcon className="h-3.5 w-3.5" /> : "1"}
-              </span>
-              <h3 className="text-[14px] font-medium text-ink">Connect wallet</h3>
-            </div>
-            <p className="mt-3 text-[12.5px] leading-[1.5] text-muted">
-              The wallet you sign in with becomes the agent&apos;s guardian — the
-              human who can pause, veto, or recover funds on-chain. This is a
-              permanent role, not a throwaway login.
-            </p>
-
-            {address && (
-              <div className="mt-4 rounded-xl border hairline bg-paper px-4 py-3 font-mono text-[12.5px] text-ink">
-                {shortAddress(address)}
-              </div>
-            )}
-
-            <div className="mt-4 flex flex-wrap gap-3">
-              {!isConnected ? (
-                <Button onClick={handleConnect} loading={walletState === "connecting"}>
-                  Connect wallet
-                </Button>
-              ) : !session ? (
-                <Button onClick={handleLogin} loading={isLoggingIn}>
-                  Sign in with wallet
-                </Button>
-              ) : (
-                <span className="inline-flex items-center gap-2 text-[13px] text-accent-soft">
-                  <CheckIcon className="h-4 w-4" /> Signed in
-                </span>
-              )}
-            </div>
-          </Card>
+          <WalletSignInCard
+            onError={setError}
+            body={
+              <>
+                The wallet you sign in with becomes the agent&apos;s guardian — the
+                human who can pause, veto, or recover funds on-chain. This is a
+                permanent role, not a throwaway login.
+              </>
+            }
+          />
 
           <Card className={cx("p-6", !walletDone && "opacity-60")}>
             <div className="flex items-center gap-2.5">

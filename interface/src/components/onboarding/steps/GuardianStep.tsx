@@ -1,19 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { IDKitRequestWidget, type RpContext } from "@worldcoin/idkit";
-import { guardianConstraints } from "@/lib/worldid";
-import {
-  useWorldIdContextMutation,
-  useWorldIdMeQuery,
-  useWorldIdVerifyMutation,
-} from "@/lib/api/hooks";
-import { ApiError, type WorldIdContext } from "@/lib/api/types";
+import { useEffect, useRef, type ReactNode } from "react";
 import { GetWorldIdHelp } from "@/components/guardian/GetWorldIdHelp";
 import { PersonhoodSeal } from "@/components/guardian/PersonhoodSeal";
 import { WorldErrorNote } from "@/components/guardian/WorldErrorNote";
+import { useWorldIdGate, WorldIdStatusRow } from "@/components/guardian/WorldIdGate";
 import { useAuth } from "../AuthProvider";
-import { Button, Card, CheckIcon, Spinner, StepHeader, cx } from "../primitives";
+import { Button, Card, Spinner, StepHeader } from "../primitives";
 
 /**
  * Proof of personhood for the account's guardian.
@@ -31,13 +24,7 @@ export function GuardianStep({
   onComplete: () => void;
 }) {
   const { address } = useAuth();
-  const { data: me = null, error: meError, refetch } = useWorldIdMeQuery();
-  const worldIdContextMutation = useWorldIdContextMutation();
-  const worldIdVerifyMutation = useWorldIdVerifyMutation();
-  const [ctx, setCtx] = useState<WorldIdContext | null>(null);
-  const [open, setOpen] = useState(false);
-  const [struck, setStruck] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { state, me, begin, busy, error: displayError, widget, struck } = useWorldIdGate({});
   const skipped = useRef(false);
 
   const onCompleteRef = useRef(onComplete);
@@ -45,40 +32,16 @@ export function GuardianStep({
     onCompleteRef.current = onComplete;
   });
 
+  // No World ID on this deployment: the step completes itself, once.
   useEffect(() => {
-    if (meError instanceof ApiError && meError.status === 404 && !skipped.current) {
+    if (state.kind === "skip" && !skipped.current) {
       skipped.current = true;
       onCompleteRef.current();
     }
-  }, [meError]);
+  }, [state.kind]);
 
-  const queryError =
-    meError instanceof ApiError && meError.status === 404
-      ? null
-      : meError instanceof Error
-        ? meError.message
-        : meError
-          ? "Could not check the guardian record."
-          : null;
-  const displayError = error ?? queryError;
-
-  const busy = worldIdContextMutation.isPending;
-
-  async function begin() {
-    setError(null);
-    try {
-      setCtx(await worldIdContextMutation.mutateAsync());
-      setOpen(true);
-    } catch (e) {
-      setError((e as Error).message || "Could not start verification.");
-    }
-  }
-
-  async function handleVerify(proof: unknown) {
-    await worldIdVerifyMutation.mutateAsync(proof);
-  }
-
-  const verified = me?.verified ?? false;
+  // A row the gate accepts. The title and the actions key on this, never on `me.verified`.
+  const accepted = state.kind === "accepted";
   const required = me?.required ?? false;
   const loading = me === null && displayError === null;
 
@@ -86,9 +49,9 @@ export function GuardianStep({
     <div>
       <StepHeader
         eyebrow="Screen 2"
-        title={verified ? "A human is on record." : "Who is accountable for this agent?"}
+        title={accepted ? "A human is on record." : "Who is accountable for this agent?"}
         intro={
-          verified
+          accepted
             ? "Your agents inherit a named, verified controller. Nothing to do here — this carries over to every agent on this account."
             : "A Wyoming DAO LLC must have a real natural person behind it. World ID proves one unique human is here, without revealing who they are."
         }
@@ -99,7 +62,7 @@ export function GuardianStep({
           <div className="mx-auto h-[124px] w-[124px] shrink-0 sm:mx-0">
             <PersonhoodSeal
               seed={me?.nullifier ?? address ?? "novi-corpus"}
-              verified={verified}
+              verified={accepted}
               struck={struck}
             />
           </div>
@@ -109,19 +72,9 @@ export function GuardianStep({
               <div className="flex items-center gap-2 text-[12.5px] text-muted">
                 <Spinner className="h-3.5 w-3.5" /> Checking the guardian record…
               </div>
-            ) : verified ? (
+            ) : accepted ? (
               <>
-                <div
-                  className={cx(
-                    "flex items-center gap-2 text-[13px]",
-                    me?.credential === "waiver" ? "text-amber-300" : "text-emerald-300",
-                  )}
-                >
-                  <CheckIcon className="h-4 w-4" />
-                  {me?.credential === "waiver"
-                    ? "Guardian waiver on record — not a verified human"
-                    : `Verified human — ${me?.credential ?? "proof of personhood"}`}
-                </div>
+                <WorldIdStatusRow state={state} />
                 <p className="text-[12.5px] leading-[1.6] text-muted">
                   {me?.maxEntities != null
                     ? `You hold ${me.entitiesUsed ?? 0} of ${me.maxEntities} legal entities allowed on this account.`
@@ -162,12 +115,12 @@ export function GuardianStep({
           Back
         </Button>
         <div className="flex items-center gap-2">
-          {!verified && !required && !loading && (
+          {!accepted && !required && !loading && (
             <Button variant="subtle" onClick={onComplete}>
               Skip for now
             </Button>
           )}
-          {verified ? (
+          {accepted ? (
             <Button onClick={onComplete}>Continue</Button>
           ) : (
             <Button onClick={() => void begin()} loading={busy} disabled={loading}>
@@ -177,30 +130,7 @@ export function GuardianStep({
         </div>
       </div>
 
-      {ctx ? (
-        <IDKitRequestWidget
-          open={open}
-          onOpenChange={setOpen}
-          app_id={ctx.appId as `app_${string}`}
-          action={ctx.action}
-          rp_context={ctx.rpContext as RpContext}
-          allow_legacy_proofs
-          environment={ctx.environment}
-          constraints={guardianConstraints(ctx.signal)}
-          handleVerify={handleVerify}
-          onSuccess={() => {
-            setOpen(false);
-            setError(null);
-            setStruck(true);
-            void refetch();
-          }}
-          onError={(e: unknown) => {
-            const code = typeof e === "string" ? e : ((e as { code?: string })?.code ?? String(e));
-            setOpen(false);
-            setError(`world:${code}`);
-          }}
-        />
-      ) : null}
+      {widget}
     </div>
   );
 }
