@@ -355,6 +355,63 @@ export const LEGAL_BODY_COPY = {
     taken: "this identity already has a legal body; replacing it is not offered yet",
     receiptUnreadable:
       "the registration could not be read from the receipt: enter the agent id by hand",
+    title: "Which identity will the legal body stand behind?",
+    intro:
+      "Your agent's identity on the ERC-8004 identity registry of {network}. The key that owns it signs the link; this wallet stays the guardian either way.",
+    ownBody:
+      "Enter its agent id. This page reads the identity's owner on the chain, and it must be this wallet.",
+    registerBody:
+      "This wallet sends one transaction that registers a new identity it owns. It approves nothing and transfers nothing.",
+    elsewhereBody:
+      "Enter its agent id. This page reads the identity's owner; that key signs the link wherever it lives, and you paste the signature back here.",
+    chosen: "Chosen",
+    choose: "Choose",
+    agentIdLabel: "Agent id",
+    agentIdHint: "the number the identity registry gave your agent",
+    agentIdProblem:
+      "must be a whole number as the registry gave it: digits only, no sign, no leading zero, within uint256",
+    useIdentity: "Use this identity",
+    readOwner: "Read the owner",
+    reading: "Reading the identity's owner on the chain…",
+    ownerUnread:
+      "The chain could not be read just now, so the identity's owner is not known yet. Try again.",
+    noIdentity:
+      "There is no identity {agentId} on the identity registry of {network}. Check the number, or register a new identity.",
+    ownedHere:
+      "Identity {agentId} is owned by this wallet, so this wallet signs the link and writes the pointer here.",
+    notThisWallet:
+      "Identity {agentId} is owned by {owner}, not by this wallet. If that key signs for it, use the third card: the identity is owned by another key.",
+    ownedElsewhere:
+      "Identity {agentId} is owned by {owner}. That key signs the link wherever it lives and writes the pointer; this wallet stays the guardian.",
+    toThirdCard: "Use the third card",
+    continueHere: "Continue with this wallet",
+    continueElsewhere: "Continue with that key",
+    otherChain:
+      "This site reads {network} only, and this deployment names another chain, so the identity cannot be read or registered here.",
+    uriLabel: "Agent URI",
+    uriHint: "optional; where your agent's registration file lives",
+    uriProblems: {
+      length: "must be at most 2,048 characters long",
+      characters: "holds a space, a control or an invisible character",
+      https: "must be an https address",
+    },
+    register: "Register a new identity",
+    notConnected:
+      "This wallet is not connected in this browser just now. Connect it again to register; nothing was sent.",
+    waiting:
+      "Waiting for the registration to be confirmed on the chain. This can take up to 3 minutes.",
+    viewTransaction: "See the transaction",
+    reverted: "The registration transaction failed on the chain, so no identity was registered.",
+    noReceipt:
+      "No receipt came back within 3 minutes, so whether the registration landed is not known yet. Look at the transaction; once it is confirmed, enter the agent id by hand.",
+    rejected: "Your wallet did not send the registration, so nothing was registered. It said: {message}",
+    rejectedNoWords: "Your wallet did not send the registration, so nothing was registered.",
+    cannotSendWayOut:
+      "If another key that can send owns your agent's identity, use the third card.",
+    otherNetwork:
+      "Your wallet is on another network than {network}. Switch it there and register again; nothing was sent.",
+    refusedBeforeWallet:
+      "The registration was refused before your wallet opened ({problem}), so nothing was sent.",
   },
 
   link: {

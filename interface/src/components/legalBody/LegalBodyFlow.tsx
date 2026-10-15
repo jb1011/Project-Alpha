@@ -86,6 +86,7 @@ import { AgreementStep } from "./AgreementStep";
 import { ClosedNotice } from "./ClosedNotice";
 import { CompanyStep } from "./CompanyStep";
 import { HumanStep } from "./HumanStep";
+import { IdentityStep } from "./IdentityStep";
 import { SandboxBanner } from "./SandboxBanner";
 import { SignInStep } from "./SignInStep";
 import { ThreadChooser } from "./ThreadChooser";
@@ -474,6 +475,9 @@ function LegalBodySession({
             onBackToCompany={backToCompany}
           />
         );
+      case "identity":
+        // One step per order: a new order never inherits another's typing or reads.
+        return <IdentityStep key={kit.orderId ?? "none"} kit={kit} />;
       default:
         return <StepPlaceholder kit={kit} />;
     }
