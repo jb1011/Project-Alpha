@@ -683,11 +683,22 @@ export const LEGAL_BODY_COPY = {
   },
 
   transparency: {
+    heading: "Legal bodies",
     intro:
       "Legal bodies on customer-owned identities. On Arc testnet these are test declarations, checked automatically, and nothing here is a filing.",
     statTile: "Legal bodies on own identities",
     unavailable: "The legal-body list could not be read just now.",
     empty: "No legal body is linked yet.",
+    columns: {
+      agentId: "Agent ID",
+      legalName: "Legal name",
+      filingNumber: "Filing number",
+      body: "Body",
+      linkedSince: "Linked since",
+      environment: "Environment",
+      statement: "Statement",
+    },
+    statementLink: "Statement",
   },
 } as const;
 
