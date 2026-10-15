@@ -295,11 +295,11 @@ function checkCall(req: WriteRequest, ctx: CallContext): Checked | Refusal {
 }
 
 /**
- * Every wallet write request passes here. Accepts exactly `register()` and `register(string)` on
- * the registry of `/config`'s chain, and `setMetadata(agentId, "legalBody", pointer)` for the
- * selected order's own identity and body. Refuses with the first rule broken, in the order they
- * are written. Returns the calldata it checked, encoded over the pinned ABI, so a screen can show
- * it.
+ * The allowlist's answer, for a screen to show. Both doors, this one and `sendAllowedCall`, pass
+ * `checkCall`, which holds the rules, so there is one allowlist: exactly `register()` and
+ * `register(string)` on the registry of `/config`'s chain, and `setMetadata(agentId, "legalBody",
+ * pointer)` for the selected order's own identity and body. Refuses with the first rule broken, in
+ * the order they are written. Returns the calldata it checked, encoded over the pinned ABI.
  */
 export function allowedCall(
   req: WriteRequest,

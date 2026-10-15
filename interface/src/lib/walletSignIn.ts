@@ -4,8 +4,9 @@
  * An attempt is a connect or a sign-in that is under way (`connecting`) or that failed (`error`).
  * A stored session can meet a wallet that is locked or not yet rehydrated, so the card can offer
  * "Connect wallet" while a session exists. During that attempt, and after it failed, the card's
- * badge is not signed in, and a screen around the card must not be either: both read
- * `walletSignedIn`, which is exactly the card's "logged-in" state.
+ * badge is not signed in, and a screen around the card must not be either. The card's badge reads
+ * `walletStateOf(...) === "logged-in"` and the screen reads `walletSignedIn`; a test over all
+ * twelve combinations of attempt, session and connection proves the two equal.
  */
 
 export type WalletAttempt = "connecting" | "error" | null;

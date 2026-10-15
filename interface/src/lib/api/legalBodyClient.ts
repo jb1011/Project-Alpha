@@ -96,8 +96,9 @@ export function requestLinkMessage(
  *
  * 200 is the order with its body deployed, 202 the order still `reserved` while the create is not
  * confirmed; both are answers with the order as served. A 422 whose JSON carries a top-level
- * string `code` is the door's flat refusal, also an answer, with the order it carries. Anything
- * else that is not a success, a 422 in the house envelope included, is the house error.
+ * string `code` AND an `order` object (`isFlatRefusal`) is the door's flat refusal, also an answer,
+ * with the order it carries. Anything else that is not a success, a 422 in the house envelope or
+ * one without an order included, is the house error.
  */
 export async function submitLink(
   token: string,
