@@ -1022,6 +1022,13 @@ describe("identityHasBody: an identity with a body on its way or linked is refus
     ["a deployed body for the agentId", [view(DEPLOYED)], true],
     ["a linked body for the agentId", [view(LINKED)], true],
     ["a broken body for the agentId", [view(BROKEN("winding_down"))], false],
+    ["a live body whose pointer was cleared, for the agentId", [view(BROKEN("not_linked"))], true],
+    [
+      "a revoked body whose pointer was cleared, for the agentId",
+      [view({ ...BROKEN("not_linked"), revoked: true })],
+      false,
+    ],
+    ["a body replaced by a newer one, for the agentId", [view(BROKEN("replaced"))], false],
     ["a lapsed reservation for the agentId", [view({ ...RESERVED, state: "lapsed" })], false],
     ["a superseded order for the agentId", [view({ ...LINKED, state: "superseded" })], false],
     ["an abandoned order for the agentId", [view({ ...RESERVED, state: "abandoned" })], false],

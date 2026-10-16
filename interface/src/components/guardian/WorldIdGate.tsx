@@ -126,16 +126,21 @@ export function useWorldIdGate({
  * The line that says what is on record: the check icon and one sentence. Emerald for a row the
  * gate accepts; amber for a waiver, accepted or not, and for any row the gate does not accept.
  * A flow that refuses rows (`requireRealHuman`) passes its own `notAcceptedSentence`; without
- * one, a refused row reads as the record it is, in amber. Renders nothing when there is no row.
+ * one, a refused row shows no record line at all, since the record line would read as a verified
+ * human the gate just refused. Renders nothing when there is no row.
  */
 export function WorldIdStatusRow({
   state,
   waiverSentence = "Guardian waiver on record — not a verified human",
   notAcceptedSentence,
+  acceptedLine,
 }: {
   state: WorldIdGateState;
   waiverSentence?: string;
   notAcceptedSentence?: string;
+  /** A flow's own words for an accepted person, given the credential. Without it, the record line
+   *  reads as it always has. */
+  acceptedLine?: (credential: string) => string;
 }) {
   if (state.kind !== "accepted" && state.kind !== "not_accepted") return <></>;
 
@@ -144,6 +149,8 @@ export function WorldIdStatusRow({
     ? waiverSentence
     : `Verified human — ${state.credential ?? "proof of personhood"}`;
   const notAccepted = state.kind === "not_accepted";
+  const shownLine =
+    !waiver && acceptedLine ? acceptedLine(state.credential ?? "proof of personhood") : recordLine;
 
   return (
     <div
@@ -153,7 +160,7 @@ export function WorldIdStatusRow({
       )}
     >
       <CheckIcon className="h-4 w-4" />
-      {notAccepted ? (notAcceptedSentence ?? recordLine) : recordLine}
+      {notAccepted ? notAcceptedSentence : shownLine}
     </div>
   );
 }
