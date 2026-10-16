@@ -13,7 +13,7 @@ import {
 } from "@/lib/legalBody/chipState";
 import { useAgentDashboardQueries, usePublicConfigQuery } from "@/lib/api/hooks";
 import { apiKeys } from "@/lib/api/keys";
-import type { AgentRun, EntityView, TreasuryView } from "@/lib/api/types";
+import type { AgentRun, EntityView } from "@/lib/api/types";
 import { ENS_EXPLORER_URL, ENS_PARENT_NAME } from "@/lib/api/config";
 import { addressUrl, arcTestnet, txUrl } from "@/lib/chain";
 import { hashscanAccountUrl, hashscanTxUrl } from "@/lib/hedera/hashscan";
@@ -213,6 +213,8 @@ export function AgentDashboard({
     }
   };
 
+  const settingsHref = `/agents/${encodeURIComponent(entityId)}/settings`;
+
   if (loadError && !entity) {
     return (
       <div className="py-12 text-center text-[13px] text-[#ff8a84]">{loadError}</div>
@@ -220,8 +222,8 @@ export function AgentDashboard({
   }
 
   return (
-    <div className="anim-line" style={{ animationDuration: "0.45s" }}>
-      <div className="flex flex-wrap items-end justify-between gap-4">
+    <div className="anim-line flex flex-col gap-4" style={{ animationDuration: "0.45s" }}>
+      <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.2em] text-muted-2">
             <span className="font-mono text-muted">Agent dashboard</span>
@@ -245,9 +247,6 @@ export function AgentDashboard({
               />
               {paused ? "Paused" : "Operational"}
             </span>
-            {/* Tier-0 custody badge — only for rows that RECORDED a custody choice (review L3:
-                legacy null rows include pre-vault shared-key agents, so labeling them
-                "Passkey-rooted" would be a false claim). */}
             {entity?.walletProvider && (
               <span
                 className="inline-flex items-center rounded-full border hairline-strong bg-paper-2/60 px-3 py-1 text-[11.5px] font-normal tracking-normal text-muted"
@@ -261,411 +260,461 @@ export function AgentDashboard({
               </span>
             )}
           </h1>
-          <p className="mt-2 text-[14px] text-muted">
-            Monitor activity, treasury, and job track record. Edit rules in{" "}
-            <Link
-              href={`/agents/${encodeURIComponent(entityId)}/settings`}
-              className="text-accent-soft underline-offset-2 hover:underline"
-            >
+          <p className="mt-2 max-w-xl text-[14px] text-muted">
+            Monitor activity and treasury. Identity, rules, and connection details are below. Edit
+            rules in{" "}
+            <Link href={settingsHref} className="text-accent-soft underline-offset-2 hover:underline">
               Settings
             </Link>
             .
           </p>
         </div>
-        <div className="flex items-center gap-4">
-          <AgentTabs entityId={entityId} active="dashboard" />
-          {onRestart && (
-            <button
-              onClick={onRestart}
-              className="text-[12.5px] text-muted-2 underline-offset-2 hover:text-ink hover:underline"
+        <div className="flex flex-col items-stretch gap-3 sm:items-end">
+          <div className="flex items-center gap-4">
+            <AgentTabs entityId={entityId} active="dashboard" />
+            {onRestart && (
+              <button
+                onClick={onRestart}
+                className="text-[12.5px] text-muted-2 underline-offset-2 hover:text-ink hover:underline"
+              >
+                Reset onboarding
+              </button>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => void onTogglePause()}
+            disabled={pausing || !treasuryAddr}
+            className="flex items-center justify-between gap-4 rounded-xl border hairline-strong bg-paper px-4 py-3 text-left transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <div>
+              <div className="flex items-center gap-2 text-[13px] font-medium text-ink">
+                <ShieldIcon className="h-3.5 w-3.5 text-muted-2" />
+                {pausing ? "Confirm in wallet…" : paused ? "Resume agent" : "Pause agent"}
+              </div>
+              <div className="mt-0.5 text-[11px] text-muted-2">
+                {paused ? "Re-enable autonomous spending" : "Freeze all autonomous spending"}
+              </div>
+            </div>
+            <span
+              className={cx(
+                "relative h-5 w-9 shrink-0 rounded-full transition-colors",
+                paused ? "bg-[#febc2e]/40" : "bg-accent/50",
+              )}
             >
-              Reset onboarding
-            </button>
+              <span
+                className={cx(
+                  "absolute top-0.5 h-4 w-4 rounded-full bg-ink transition-all",
+                  paused ? "left-0.5" : "left-[18px]",
+                )}
+              />
+            </span>
+          </button>
+          <p className="max-w-[280px] text-[11px] leading-[1.45] text-muted-2 sm:text-right">
+            Your human safety brake — freeze all autonomous spending on-chain, signed by your wallet.
+          </p>
+          {pauseError && (
+            <p className="max-w-[280px] text-[11.5px] leading-[1.4] text-[#ff8a84] sm:text-right">
+              {pauseError}
+            </p>
           )}
         </div>
       </div>
 
-      {entity && (
-        <Card className="mt-6 p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">
-              On-chain identity
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-            {/* One neutral chip, one claim, whatever the answer is (design v3 §5.4, D9). The
-                wording and the order the answers are read in live in agentBookChipState. */}
-            {agentBookChip &&
-              (agentBookChip.href ? (
-                <a
-                  href={agentBookChip.href}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={agentBookChip.title}
-                  className={AGENTBOOK_CHIP_CLASS}
-                >
-                  {agentBookChip.label}
-                </a>
-              ) : (
-                <span title={agentBookChip.title} className={AGENTBOOK_CHIP_CLASS}>
-                  {agentBookChip.label}
-                </span>
-              ))}
-            {/* Linked only where there is a registration transaction to show. Same shape as the
-                AgentBook chip above: the claim is the chip, the link is a bonus. */}
-            {hederaChip &&
-              (hederaChip.href ? (
-                <a
-                  href={hederaChip.href}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={hederaChip.title}
-                  className={AGENTBOOK_CHIP_CLASS}
-                >
-                  {hederaChip.label}
-                </a>
-              ) : (
-                <span title={hederaChip.title} className={AGENTBOOK_CHIP_CLASS}>
-                  {hederaChip.label}
-                </span>
-              ))}
-            {/* The second question, beside the first and never folded into it: AgentBook says
-                whether a human vouched, this says whether Novi's registry holds a legal body
-                whose standing is active. Two sources, two chips (design 2026-09-10 §1). */}
-            {legalBodyChip && <LegalBodyChip state={legalBodyChip} />}
-            {ensName(entity) && (
-              <a
-                href={`${ENS_EXPLORER_URL}/${ensName(entity)}`}
-                target="_blank"
-                rel="noreferrer"
-                title="Resolve this agent in any ENS client — addr, legal status, registration"
-                className="group inline-flex max-w-full items-center gap-2 rounded-full border border-accent/30 bg-accent/[0.07] px-3 py-1.5 font-mono text-[12px] text-accent-soft transition-colors hover:bg-accent/[0.14] hover:text-ink"
-              >
-                <EnsGlobe className="h-3.5 w-3.5 shrink-0 opacity-80" />
-                <span className="truncate">{ensName(entity)}</span>
-                <span aria-hidden className="text-[10px] opacity-70">↗</span>
-              </a>
-            )}
-            {/* Gone, not disabled, once the registry answers yes: a control that says "you cannot
-                do this" about something the guardian has already done is noise beside the chip
-                that says they did it. */}
-            {vouchButtonVisible(agentBookChip) && (
-              <button
-                type="button"
-                disabled={vouchDisabledReason !== null}
-                title={vouchDisabledReason ?? "Vouch for this agent in AgentBook"}
-                onClick={() => setVouchOpen(true)}
-                className="rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-ink transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {agentBookChip?.kind === "disputed"
-                  ? "Vouch again in AgentBook"
-                  : "Vouch in AgentBook"}
-              </button>
-            )}
-            </div>
-          </div>
-          <VouchDialog
-            entityId={entityId}
-            agentId={entity.agentId ?? ""}
-            open={vouchOpen}
-            onClose={() => setVouchOpen(false)}
-          />
-          {/* Said out loud, not on hover: a submit we could not confirm is not a registration that
-              did not happen, and the chip has no room to say so (§5.2, verbatim). */}
-          {agentBookChip?.note && (
-            <p className="mt-3 max-w-[70ch] text-[11.5px] leading-[1.55] text-muted-2">
-              {agentBookChip.note}
-            </p>
-          )}
-          <dl className="mt-4 grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
-            {entity.agentId && <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />}
-            {entity.treasury && (
-              <OnChainRow
-                label="Treasury"
-                value={shortAddress(entity.treasury)}
-                href={addressUrl(entity.treasury)}
-              />
-            )}
-            {entity.operator && (
-              <OnChainRow label="Operator" value={shortAddress(entity.operator)} />
-            )}
-            {entity.guardian && (
-              <OnChainRow label="Guardian" value={shortAddress(entity.guardian)} />
-            )}
-            {entity.oaHash && (
-              // Two different things share one field, and the backend says which: with the
-              // manifest scheme the anchor commits to the whole OA BUNDLE — terms doc, legal
-              // documents, chain identity — so it is an "anchor" and its version is part of its
-              // name. For a legacy row it commits to the operating-agreement document alone, and
-              // calling that an anchor would overstate what is on chain.
-              <OnChainRow
-                label={oaAnchorLabel(entity)}
-                value={`${entity.oaHash.slice(0, 14)}…`}
-                chip={pendingAnchorChip(entity)}
-              />
-            )}
-            {hedera?.uaid && (
-              <OnChainRow
-                label="UAID"
-                value={shortUaid(hedera.uaid)}
-                title={hedera.uaid}
-              />
-            )}
-            {/* Which chain, in the label: these rows sit among Arc facts, and a bare "Hedera
-                agent" beside them would leave a reader to assume the network. The network is the
-                registration's own, never this file's guess, so an unknown chain names none. */}
-            {hedera?.hederaAgentId && (
-              <OnChainRow
-                label={`Hedera agent${hederaNet}`}
-                value={`#${hedera.hederaAgentId}`}
-                title={`Registered on ${hederaNetworkLabel(hedera.network)} as ERC-8004 agent ${hedera.hederaAgentId}.`}
-                href={hederaRegisterHref}
-              />
-            )}
-            {hedera?.accountId && (
-              <OnChainRow
-                label={`Hedera account${hederaNet}`}
-                value={hedera.accountId}
-                title={`The ${hederaNetworkLabel(hedera.network)} account this agent's key is linked to.`}
-                href={hashscanAccountUrl(hedera.network, hedera.accountId)}
-              />
-            )}
-            {hedera?.profileUrl && (
-              <OnChainRow
-                label={`Hedera profile${hederaNet}`}
-                value="HCS-11 profile"
-                title={`The HCS-11 profile document a ${hederaNetworkLabel(hedera.network)} reader resolves this company by.`}
-                href={httpsUrl(hedera.profileUrl)}
-              />
-            )}
-            {hedera?.verifyUrl && (
-              <OnChainRow
-                label="Paid standing check"
-                value="x402 /verify"
-                title={hedera.verifyUrl}
-              />
-            )}
-            {hedera?.attestor && (
-              // NOT a Hedera account, so it gets no HashScan link: this is the EIP-712 signing
-              // key's EVM address, published on the free document so a verifier knows WHICH key
-              // must have signed a paid attestation. Shown like Operator and Guardian beside it,
-              // which are addresses and not links either.
-              <OnChainRow
-                label="Attestor"
-                value={shortAddress(hedera.attestor)}
-                title="Address of the key that signs this company's paid standing attestations (EIP-712). Not a Hedera account."
-              />
-            )}
-          </dl>
-          <div className="mt-4 flex flex-wrap gap-3">
-            {entity.createTxHash && <TxLink hash={entity.createTxHash} label="Create tx" />}
-            {entity.bindTxHash && <TxLink hash={entity.bindTxHash} label="Bind tx" />}
-            {entity.fundTxHash && <TxLink hash={entity.fundTxHash} label="Fund tx" />}
-            {hederaRegisterHref && (
-              <a
-                href={hederaRegisterHref}
-                target="_blank"
-                rel="noreferrer"
-                title={`The registration transaction on ${hederaNetworkLabel(hedera?.network)}, on HashScan.`}
-                className="inline-flex items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft"
-              >
-                Hedera register
-                <ExternalIcon className="h-3 w-3" />
-              </a>
-            )}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <Card className="border-accent/20 bg-accent/[0.04] p-4">
+          <BoxTitle>Treasury</BoxTitle>
+          <div className="mt-2 flex items-baseline gap-1.5">
+            <span className="text-[26px] font-medium tabular-nums text-ink">
+              {balanceUsdc === null ? "—" : formatUsdc(balanceUsdc)}
+            </span>
+            <span className="text-[12px] text-muted-2">USDC</span>
           </div>
         </Card>
-      )}
-
-      <div className="mt-8 grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard
-          label="Treasury balance"
-          value={balanceUsdc === null ? "—" : formatUsdc(balanceUsdc)}
-          unit="USDC"
-          emphasis
-        />
-        <StatCard
-          label="Spent this period"
-          value={treasury ? formatUsdc(spentUsdc) : "—"}
-          unit={`/ ${formatUsdc(capUsdc)} cap`}
-        >
+        <Card className="p-4">
+          <BoxTitle>Spent this period</BoxTitle>
+          <div className="mt-2 flex items-baseline gap-1.5">
+            <span className="text-[26px] font-medium tabular-nums text-ink">
+              {treasury ? formatUsdc(spentUsdc) : "—"}
+            </span>
+            <span className="text-[12px] text-muted-2">/ {formatUsdc(capUsdc)}</span>
+          </div>
           <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-paper">
             <div
               className="h-full rounded-full bg-accent"
               style={{ width: `${capUsdc ? Math.min(100, (spentUsdc / capUsdc) * 100) : 0}%` }}
             />
           </div>
-        </StatCard>
-        <StatCard
-          label="Per-tx cap"
-          value={perTxUsdc === null ? "—" : formatUsdc(perTxUsdc)}
-          unit="USDC"
-        />
+        </Card>
+        <Card className="p-4">
+          <BoxTitle>Per transaction cap</BoxTitle>
+          <div className="mt-2 flex items-baseline gap-1.5">
+            <span className="text-[26px] font-medium tabular-nums text-ink">
+              {perTxUsdc === null ? "—" : formatUsdc(perTxUsdc)}
+            </span>
+            <span className="text-[12px] text-muted-2">USDC</span>
+          </div>
+        </Card>
       </div>
 
-      <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
-        <div className="flex flex-col gap-6">
-          <Card className="overflow-hidden">
-            <div className="flex items-center justify-between border-b hairline px-5 py-3.5">
-              <span className="text-[13px] font-medium text-ink">Activity</span>
-              <span className="text-[11.5px] text-muted-2">Agent jobs · x402</span>
-            </div>
-            {runs.length === 0 ? (
-              <div className="px-5 py-12 text-center text-[12.5px] text-muted-2">
-                No agent payments yet — this agent hasn&apos;t transacted.
-              </div>
-            ) : (
-              <ul>
-                {runs.map((run) => (
-                  <RunRow key={run.id} run={run} />
-                ))}
-              </ul>
-            )}
-          </Card>
+      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
+        <div className="flex flex-col gap-4">
           <JobsReputationCard entityId={entityId} />
-        </div>
-
-        <div className="flex flex-col gap-6">
-          {/* Only for entities that HAVE a formation block: a legacy or stub row has none,
-              forever, and a "not formed" card would describe an absence as a stage. */}
-          {entity?.formation && (
-            <FormationCard formation={entity.formation} />
-          )}
-
-          <Card className="p-5">
-            <div className="flex items-center justify-between">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">Active rules</div>
-              <Link
-                href={`/agents/${encodeURIComponent(entityId)}/settings`}
-                className="text-[11.5px] text-muted-2 hover:text-accent-soft"
-              >
-                Edit →
-              </Link>
-            </div>
-
-            <div className="mt-4 text-[11px] uppercase tracking-[0.18em] text-muted-2">
-              On-chain (enforced by the treasury contract)
-            </div>
-            <dl className="mt-3 flex flex-col gap-3 text-[12.5px]">
-              <RuleRow k="Period cap" v={`${formatUsdc(capUsdc)} USDC`} />
-              <RuleRow k="Period" v={periodHours ? `${periodHours}h rolling` : "—"} />
-              <RuleRow k="Guardian pause" v={paused ? "On" : "Off"} />
-              <RuleRow
-                k="Legal status"
-                v={
-                  legalActive === undefined || legalActive === null
-                    ? "—"
-                    : legalActive
-                      ? "Active"
-                      : "Suspended"
-                }
-              />
-              <RuleRow
-                k="Allowlist (direct spend)"
-                v={
-                  config?.allowlist.length
-                    ? `${config.allowlist.length} allowlisted`
-                    : "Any (within caps)"
-                }
-              />
+          {entity && (
+            <>
+          <VouchDialog
+            entityId={entityId}
+            agentId={entity.agentId ?? ""}
+            open={vouchOpen}
+            onClose={() => setVouchOpen(false)}
+          />
+<IdentityGroup title="This agent">
+            <dl className="grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
+              {entity.agentId && <OnChainRow label="Agent ID" value={`#${entity.agentId}`} />}
+              {entity.treasury && (
+                <OnChainRow
+                  label="Treasury"
+                  value={shortAddress(entity.treasury)}
+                  href={addressUrl(entity.treasury)}
+                />
+              )}
+              {entity.operator && (
+                <OnChainRow label="Operator" value={shortAddress(entity.operator)} />
+              )}
+              {entity.guardian && (
+                <OnChainRow label="Guardian" value={shortAddress(entity.guardian)} />
+              )}
             </dl>
-
-            <div className="mt-5 text-[11px] uppercase tracking-[0.18em] text-muted-2">
-              Software-enforced on x402 payments
-            </div>
-            <p className="mt-1.5 text-[11px] leading-[1.5] text-muted-2">
-              The backend checks each payment against fresh on-chain state — not guaranteed if the
-              backend is compromised.
-            </p>
-            <dl className="mt-3 flex flex-col gap-3 text-[12.5px]">
-              <RuleRow
-                k="Per-tx cap"
-                v={perTxUsdc === null ? "Not set" : `${formatUsdc(perTxUsdc)} USDC`}
-              />
-              <RuleRow k="Allowlist / threshold" v="Re-asserted before every payment" />
-              <RuleRow k="Pause + legal status" v="Re-checked before every payment" />
-              <RuleRow
-                k="Standing float total"
-                v={
-                  standingTotalUsdc === null
-                    ? "—"
-                    : `${formatUsdc(standingTotalUsdc)} USDC`
-                }
-              />
-              <RuleRow
-                k="Standing float ceiling"
-                v={ceilingUsdc === null ? "—" : `≤ ${formatUsdc(ceilingUsdc)} USDC`}
-              />
-              <RuleRow
-                k="Buyer trust policy"
-                v={
-                  entity?.trustPolicy
-                    ? entity.trustPolicy === "verified-legal-bodies-only"
-                      ? "Strictest — legal bodies only (own setting)"
-                      : entity.trustPolicy === "verified-sellers-only"
-                        ? "Strict — sellers vouched for in AgentBook (own setting)"
-                        : "Open (own setting)"
-                    : "Platform default"
-                }
-              />
-            </dl>
-
-            <p className="mt-4 border-t hairline pt-3 text-[11px] leading-[1.5] text-muted-2">
-              x402 payments enforce the same allowlist, per-tx and cap rules as direct on-chain
-              spends — in software, against live on-chain reads. The float ceiling keeps how much
-              sits beyond the guardian&apos;s reach small in normal operation; the on-chain period
-              cap is the hard backstop.
-            </p>
-          </Card>
-
-          <Card className="p-5">
-            <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-muted-2">
-              <ShieldIcon className="h-3.5 w-3.5" /> Guardian controls
-            </div>
-            <p className="mt-2 text-[11.5px] leading-[1.5] text-muted-2">
-              Your human safety brake — freeze all autonomous spending on-chain, signed by your wallet.
-            </p>
-            <div className="mt-4">
-              <button
-                onClick={() => void onTogglePause()}
-                disabled={pausing || !treasuryAddr}
-                className="flex w-full items-center justify-between rounded-xl border hairline-strong bg-paper px-4 py-3 text-left transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
+            {ensName(entity) && (
+              <a
+                href={`${ENS_EXPLORER_URL}/${ensName(entity)}`}
+                target="_blank"
+                rel="noreferrer"
+                title="Resolve this agent in any ENS client — addr, legal status, registration"
+                className="group mt-3 inline-flex max-w-full items-center gap-2 rounded-full border border-accent/30 bg-accent/[0.07] px-3 py-1.5 font-mono text-[12px] text-accent-soft transition-colors hover:bg-accent/[0.14] hover:text-ink"
               >
-                <div>
-                  <div className="text-[13px] font-medium text-ink">
-                    {pausing ? "Confirm in wallet…" : paused ? "Resume agent" : "Pause agent"}
-                  </div>
-                  <div className="text-[11px] text-muted-2">
-                    {paused ? "Re-enable autonomous spending" : "Freeze all autonomous spending"}
-                  </div>
-                </div>
-                <span
-                  className={cx(
-                    "relative h-5 w-9 shrink-0 rounded-full transition-colors",
-                    paused ? "bg-[#febc2e]/40" : "bg-accent/50",
-                  )}
+                <EnsGlobe className="h-3.5 w-3.5 shrink-0 opacity-80" />
+                <span className="truncate">{ensName(entity)}</span>
+                <span aria-hidden className="text-[10px] opacity-70">↗</span>
+              </a>
+            )}
+          </IdentityGroup>
+          <IdentityGroup id="standing" title="Standing">
+            <div className="flex flex-wrap items-center gap-2">
+              {agentBookChip &&
+                (agentBookChip.href ? (
+                  <a
+                    href={agentBookChip.href}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={agentBookChip.title}
+                    className={AGENTBOOK_CHIP_CLASS}
+                  >
+                    {agentBookChip.label}
+                  </a>
+                ) : (
+                  <span title={agentBookChip.title} className={AGENTBOOK_CHIP_CLASS}>
+                    {agentBookChip.label}
+                  </span>
+                ))}
+              {legalBodyChip && <LegalBodyChip state={legalBodyChip} />}
+              {vouchButtonVisible(agentBookChip) && (
+                <button
+                  type="button"
+                  disabled={vouchDisabledReason !== null}
+                  title={vouchDisabledReason ?? "Vouch for this agent in AgentBook"}
+                  onClick={() => setVouchOpen(true)}
+                  className="rounded-full border hairline-strong bg-paper-3/60 px-3 py-1.5 text-[11.5px] text-ink transition-colors hover:bg-paper-2 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  <span
-                    className={cx(
-                      "absolute top-0.5 h-4 w-4 rounded-full bg-ink transition-all",
-                      paused ? "left-0.5" : "left-[18px]",
-                    )}
-                  />
-                </span>
-              </button>
-              {pauseError && (
-                <p className="mt-2 text-[11.5px] leading-[1.4] text-[#ff8a84]">{pauseError}</p>
+                  {agentBookChip?.kind === "disputed"
+                    ? "Vouch again in AgentBook"
+                    : "Vouch in AgentBook"}
+                </button>
               )}
             </div>
-          </Card>
+            {agentBookChip?.note && (
+              <p className="mt-3 max-w-[70ch] text-[11.5px] leading-[1.55] text-muted-2">
+                {agentBookChip.note}
+              </p>
+            )}
+          </IdentityGroup>
+            </>
+          )}
+          <div id="activity" className="scroll-mt-24">
+            <Card className="overflow-hidden">
+              <div className="flex items-baseline justify-between gap-3 border-b hairline px-4 py-3">
+                <BoxTitle>Activity</BoxTitle>
+                <span className="shrink-0 text-[12px] text-muted-2">Agent jobs · x402</span>
+              </div>
+              {runs.length === 0 ? (
+                <div className="px-4 py-8 text-center text-[12.5px] text-muted-2">
+                  No agent payments yet — this agent hasn&apos;t transacted.
+                </div>
+              ) : (
+                <ul>
+                  {runs.map((run) => (
+                    <RunRow key={run.id} run={run} />
+                  ))}
+                </ul>
+              )}
+            </Card>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-4">
+      <div id="rules" className="scroll-mt-24">
+      <Card className="p-4">
+        <BoxTitle
+          aside={
+            <Link href={settingsHref} className="text-[13px] text-muted-2 hover:text-accent-soft">
+              Edit →
+            </Link>
+          }
+        >
+          Active rules
+        </BoxTitle>
+        <dl className="mt-3 flex flex-col gap-2 text-[12.5px]">
+          <RuleRow k="Period cap" v={`${formatUsdc(capUsdc)} USDC`} />
+          <RuleRow k="Period" v={periodHours ? `${periodHours}h rolling` : "—"} />
+          <RuleRow k="Guardian pause" v={paused ? "On" : "Off"} />
+          <RuleRow
+            k="Legal status"
+            v={
+              legalActive === undefined || legalActive === null
+                ? "—"
+                : legalActive
+                  ? "Active"
+                  : "Suspended"
+            }
+          />
+          <RuleRow
+            k="Allowlist (direct spend)"
+            v={
+              config?.allowlist.length
+                ? `${config.allowlist.length} allowlisted`
+                : "Any (within caps)"
+            }
+          />
+          <RuleRow
+            k="Per-tx cap"
+            v={perTxUsdc === null ? "Not set" : `${formatUsdc(perTxUsdc)} USDC`}
+          />
+          <RuleRow
+            k="Standing float total"
+            v={standingTotalUsdc === null ? "—" : `${formatUsdc(standingTotalUsdc)} USDC`}
+          />
+          <RuleRow
+            k="Standing float ceiling"
+            v={ceilingUsdc === null ? "—" : `≤ ${formatUsdc(ceilingUsdc)} USDC`}
+          />
+          <RuleRow
+            k="Buyer trust policy"
+            v={
+              entity?.trustPolicy
+                ? entity.trustPolicy === "verified-legal-bodies-only"
+                  ? "Strictest — legal bodies only (own setting)"
+                  : entity.trustPolicy === "verified-sellers-only"
+                    ? "Strict — sellers vouched for in AgentBook (own setting)"
+                    : "Open (own setting)"
+                : "Platform default"
+            }
+          />
+        </dl>
+        <p className="mt-4 border-t hairline pt-3 text-[11.5px] leading-[1.5] text-muted-2">
+          On-chain rules are the hard stop, and the payment service rechecks them before each x402
+          payment.
+        </p>
+        <details className="mt-3">
+          <summary className="cursor-pointer text-[11.5px] text-muted-2 hover:text-ink">
+            How these rules are enforced
+          </summary>
+          <div className="mt-3 text-[11px] uppercase tracking-[0.18em] text-muted-2">
+            On-chain (enforced by the treasury contract)
+          </div>
+          <p className="mt-1.5 text-[11.5px] leading-[1.5] text-muted-2">
+            Period cap, period, guardian pause, legal status, and the direct-spend allowlist.
+          </p>
+          <div className="mt-4 text-[11px] uppercase tracking-[0.18em] text-muted-2">
+            Software-enforced on x402 payments
+          </div>
+          <p className="mt-1.5 text-[11px] leading-[1.5] text-muted-2">
+            The backend checks each payment against fresh on-chain state — not guaranteed if the
+            backend is compromised.
+          </p>
+          <dl className="mt-3 flex flex-col gap-3 text-[12.5px]">
+            <RuleRow k="Allowlist / threshold" v="Re-asserted before every payment" />
+            <RuleRow k="Pause + legal status" v="Re-checked before every payment" />
+          </dl>
+          <p className="mt-4 text-[11px] leading-[1.5] text-muted-2">
+            x402 payments enforce the same allowlist, per-tx and cap rules as direct on-chain
+            spends — in software, against live on-chain reads. The float ceiling keeps how much
+            sits beyond the guardian&apos;s reach small in normal operation; the on-chain period
+            cap is the hard backstop.
+          </p>
+        </details>
+      </Card>
+      </div>
+
+
+          {entity?.formation && (
+            <div id="formation" className="scroll-mt-24">
+              <FormationCard formation={entity.formation} />
+            </div>
+          )}
+
+          {entity && (
+            <>
+
+
+          {(hederaChip ||
+            hedera?.uaid ||
+            hedera?.hederaAgentId ||
+            hedera?.accountId ||
+            hedera?.profileUrl ||
+            hedera?.verifyUrl ||
+            hedera?.attestor) && (
+            <IdentityGroup title="Hedera">
+              {hederaChip && (
+                <div className="mb-3">
+                  {hederaChip.href ? (
+                    <a
+                      href={hederaChip.href}
+                      target="_blank"
+                      rel="noreferrer"
+                      title={hederaChip.title}
+                      className={AGENTBOOK_CHIP_CLASS}
+                    >
+                      {hederaChip.label}
+                    </a>
+                  ) : (
+                    <span title={hederaChip.title} className={AGENTBOOK_CHIP_CLASS}>
+                      {hederaChip.label}
+                    </span>
+                  )}
+                </div>
+              )}
+              <dl className="grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
+                {hedera?.uaid && (
+                  <OnChainRow label="UAID" value={shortUaid(hedera.uaid)} title={hedera.uaid} />
+                )}
+                {hedera?.hederaAgentId && (
+                  <OnChainRow
+                    label={`Hedera agent${hederaNet}`}
+                    value={`#${hedera.hederaAgentId}`}
+                    title={`Registered on ${hederaNetworkLabel(hedera.network)} as ERC-8004 agent ${hedera.hederaAgentId}.`}
+                    href={hederaRegisterHref}
+                  />
+                )}
+                {hedera?.accountId && (
+                  <OnChainRow
+                    label={`Hedera account${hederaNet}`}
+                    value={hedera.accountId}
+                    title={`The ${hederaNetworkLabel(hedera.network)} account this agent's key is linked to.`}
+                    href={hashscanAccountUrl(hedera.network, hedera.accountId)}
+                  />
+                )}
+                {hedera?.profileUrl && (
+                  <OnChainRow
+                    label={`Hedera profile${hederaNet}`}
+                    value="HCS-11 profile"
+                    title={`The HCS-11 profile document a ${hederaNetworkLabel(hedera.network)} reader resolves this company by.`}
+                    href={httpsUrl(hedera.profileUrl)}
+                  />
+                )}
+                {hedera?.verifyUrl && (
+                  <OnChainRow
+                    label="Paid standing check"
+                    value="x402 /verify"
+                    title={hedera.verifyUrl}
+                  />
+                )}
+                {hedera?.attestor && (
+                  <OnChainRow
+                    label="Attestor"
+                    value={shortAddress(hedera.attestor)}
+                    title="Address of the key that signs this company's paid standing attestations (EIP-712). Not a Hedera account."
+                  />
+                )}
+              </dl>
+            </IdentityGroup>
+
+          )}
+
+          {(entity.oaHash ||
+            entity.createTxHash ||
+            entity.bindTxHash ||
+            entity.fundTxHash ||
+            hederaRegisterHref) && (
+            <IdentityGroup title="Records">
+              {entity.oaHash && (
+                <dl className="grid grid-cols-1 gap-3 text-[12px] sm:grid-cols-2">
+                  <OnChainRow
+                    label={oaAnchorLabel(entity)}
+                    value={`${entity.oaHash.slice(0, 14)}…`}
+                    chip={pendingAnchorChip(entity)}
+                  />
+                </dl>
+              )}
+              <div className="mt-4 flex flex-wrap gap-3">
+                {entity.createTxHash && <TxLink hash={entity.createTxHash} label="Create tx" />}
+                {entity.bindTxHash && <TxLink hash={entity.bindTxHash} label="Bind tx" />}
+                {entity.fundTxHash && <TxLink hash={entity.fundTxHash} label="Fund tx" />}
+                {hederaRegisterHref && (
+                  <a
+                    href={hederaRegisterHref}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={`The registration transaction on ${hederaNetworkLabel(hedera?.network)}, on HashScan.`}
+                    className="inline-flex items-center gap-1.5 rounded-full border hairline-strong px-3 py-1.5 text-[11.5px] text-muted transition-colors hover:text-accent-soft"
+                  >
+                    Hedera register
+                    <ExternalIcon className="h-3 w-3" />
+                  </a>
+                )}
+              </div>
+            </IdentityGroup>
+          )}
+            </>
+          )}
+          {entity && (
+            <div id="connect" className="scroll-mt-24">
+              <ConnectAgentPanel entity={entity} />
+            </div>
+          )}
         </div>
       </div>
 
-      {entity && (
-        <div className="mt-8">
-          <ConnectAgentPanel entity={entity} />
-        </div>
-      )}
     </div>
+  );
+}
+
+function BoxTitle({ children, aside }: { children: ReactNode; aside?: ReactNode }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3">
+      <h2 className="text-[20px] font-medium leading-tight tracking-[-0.02em] text-ink">{children}</h2>
+      {aside}
+    </div>
+  );
+}
+
+function IdentityGroup({
+  id,
+  title,
+  className,
+  children,
+}: {
+  id?: string;
+  title: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <Card className={cx("p-4", className)}>
+      <section id={id} className="scroll-mt-24">
+        <BoxTitle>{title}</BoxTitle>
+        <div className="mt-3">{children}</div>
+      </section>
+    </Card>
   );
 }
 
@@ -837,30 +886,6 @@ function TxLink({ hash, label }: { hash: string; label: string }) {
   );
 }
 
-function StatCard({
-  label,
-  value,
-  unit,
-  emphasis,
-  children,
-}: {
-  label: string;
-  value: string;
-  unit?: string;
-  emphasis?: boolean;
-  children?: ReactNode;
-}) {
-  return (
-    <Card className={cx("p-5", emphasis && "border-accent/20 bg-accent/[0.04]")}>
-      <div className="text-[11px] uppercase tracking-[0.16em] text-muted-2">{label}</div>
-      <div className="mt-2 flex items-baseline gap-1.5">
-        <span className="text-[26px] font-medium tabular-nums text-ink">{value}</span>
-        {unit && <span className="text-[12px] text-muted-2">{unit}</span>}
-      </div>
-      {children}
-    </Card>
-  );
-}
 
 function RuleRow({ k, v }: { k: string; v: string }) {
   return (

@@ -13,7 +13,7 @@ import {
 import { type EntityView, type FormationStatus } from "@/lib/api/types";
 import { filingTone, mayRenderConfirmed } from "@/lib/formation/honesty";
 import { formatDate } from "@/lib/format";
-import { AmberPill, Card, SectionTitle, cx } from "@/components/onboarding/primitives";
+import { AmberPill, Card, cx } from "@/components/onboarding/primitives";
 
 type Formation = NonNullable<EntityView["formation"]>;
 
@@ -75,9 +75,11 @@ export function FormationCard({ formation }: { formation: Formation }) {
   const requiredActions = formation.requiredActions ?? [];
 
   return (
-    <Card className={cx("p-5", !confirmedReal && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
+    <Card className={cx("p-4", !confirmedReal && "border-[#febc2e]/25 bg-[#febc2e]/[0.04]")}>
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <SectionTitle>Legal formation</SectionTitle>
+        <h2 className="text-[20px] font-medium leading-tight tracking-[-0.02em] text-ink">
+          Legal formation
+        </h2>
         {confirmedReal ? (
           <span className="inline-flex items-center gap-1.5 rounded-full border hairline-strong bg-paper-3/60 px-3 py-1 text-[11.5px] text-muted-2">
             Production filing
@@ -163,7 +165,9 @@ export function FormationCard({ formation }: { formation: Formation }) {
 
       <div className="mt-5 border-t hairline pt-4">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <SectionTitle>Legal documents{sandbox && " (demo)"}</SectionTitle>
+          <h3 className="text-[16px] font-medium leading-tight text-ink">
+            Legal documents{sandbox && " (demo)"}
+          </h3>
           {companyId && (
             <Link
               href={`/agents/companies/${encodeURIComponent(companyId)}`}
