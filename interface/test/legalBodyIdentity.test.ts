@@ -347,7 +347,7 @@ describe("cardOutcomeView: what the person reads, and what a pick writes", () =>
 });
 
 describe("identityStepOffer: what the identity step offers first", () => {
-  const SUGGESTED = "897352";
+  const SUGGESTED = "900001";
 
   test("no suggestion: the three cards, as before", () => {
     expect(identityStepOffer({ suggestedAgentId: null, orders: [], where: WHERE })).toStrictEqual({ kind: "cards" });
@@ -442,24 +442,24 @@ describe("suggestionCardOf: the card a suggestion's check is answered as", () =>
 describe("identityOnStep: the agent id the link and pointer steps show", () => {
   test("the order's own identity, once it has one, over the memory's", () => {
     expect(identityOnStep({ order: order({ state: "reserved" }), memoryAgentId: null })).toBe(AGENT);
-    expect(identityOnStep({ order: order({ state: "deployed" }), memoryAgentId: "897352" })).toBe(AGENT);
-    expect(identityOnStep({ order: order({ state: "draft" }), memoryAgentId: "897352" })).toBe(AGENT);
+    expect(identityOnStep({ order: order({ state: "deployed" }), memoryAgentId: "900001" })).toBe(AGENT);
+    expect(identityOnStep({ order: order({ state: "draft" }), memoryAgentId: "900001" })).toBe(AGENT);
   });
 
   test("a draft without one: the identity picked for it in this browser", () => {
-    expect(identityOnStep({ order: order({ state: "draft", agentId: null }), memoryAgentId: "897352" })).toBe(
-      "897352",
+    expect(identityOnStep({ order: order({ state: "draft", agentId: null }), memoryAgentId: "900001" })).toBe(
+      "900001",
     );
   });
 
   test("nothing known: nothing shown", () => {
     expect(identityOnStep({ order: order({ state: "draft", agentId: null }), memoryAgentId: null })).toBeNull();
-    expect(identityOnStep({ order: null, memoryAgentId: "897352" })).toBeNull();
+    expect(identityOnStep({ order: null, memoryAgentId: "900001" })).toBeNull();
   });
 
   test("an order past the draft without an identity never shows the memory's guess", () => {
     for (const state of ["reserved", "deployed", "linked"] as const) {
-      expect(identityOnStep({ order: order({ state, agentId: null }), memoryAgentId: "897352" })).toBeNull();
+      expect(identityOnStep({ order: order({ state, agentId: null }), memoryAgentId: "900001" })).toBeNull();
     }
   });
 });

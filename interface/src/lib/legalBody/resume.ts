@@ -180,22 +180,27 @@ export function jumpMemoryPatch(target: LegalBodyRailPhase): Partial<Memo> | nul
  *  - `registered`: a registration on the identity step minted this identity;
  *  - `picked`: the person picked this identity on the identity step;
  *  - `dropped`: the identity step found this identity taken;
- *  - `start_another`: a new order or a new company starts.
+ *  - `start_another`: a new order or a new company starts;
+ *  - `new_order_for`: the link door refused the draft and a new order starts for the same agent,
+ *    with the identity the memory held for the refused draft.
  */
 export type IdentitySuggestionEvent =
   | { kind: "jump"; target: LegalBodyRailPhase; agentId: string | null }
   | { kind: "registered"; agentId: string }
   | { kind: "picked"; agentId: string }
   | { kind: "dropped"; agentId: string }
-  | { kind: "start_another" };
+  | { kind: "start_another" }
+  | { kind: "new_order_for"; agentId: string | null };
 
 /**
  * The identity the identity step offers first, held in this visit's memory only, never in the
  * store. A jump that clears the identity (`jumpMemoryPatch`) keeps it as the suggestion, so going
  * back never shows the register card as the only way on; a jump with nothing to clear keeps the
  * suggestion already there. A registration offers its new identity. Picking another identity, an
- * identity found taken, and a new order or company end it. The suggestion is only an offer: the
- * step reads the identity's owner and the orders again before it is used.
+ * identity found taken, and a new order or company end it; a new order that replaces a draft the
+ * link door refused offers that draft's identity again, since the door refused the draft, never
+ * the identity. The suggestion is only an offer: the step reads the identity's owner and the
+ * orders again before it is used.
  */
 export function identitySuggestionAfter(
   event: IdentitySuggestionEvent,
@@ -215,6 +220,8 @@ export function identitySuggestionAfter(
       return event.agentId === current ? null : current;
     case "start_another":
       return null;
+    case "new_order_for":
+      return event.agentId ?? current;
   }
 }
 

@@ -271,14 +271,14 @@ describe("the agent id, where a person looks for it", () => {
   });
 
   test("the order's own identity once it has one, over the one picked in this browser", () => {
-    const page = text(kit(SIGN, order({ agentId: "897353" })), LIVE_AGENT);
-    expect(page).toContain(line("897353"));
+    const page = text(kit(SIGN, order({ agentId: "900002" })), LIVE_AGENT);
+    expect(page).toContain(line("900002"));
     expect(page).not.toContain(line(LIVE_AGENT));
   });
 
   test("while the body is created, the order's identity", () => {
-    const page = text(kit(CREATING, order({ state: "reserved", agentId: "897353" })), null);
-    expect(page).toContain(line("897353"));
+    const page = text(kit(CREATING, order({ state: "reserved", agentId: "900002" })), null);
+    expect(page).toContain(line("900002"));
   });
 
   test("no identity known: no line", () => {

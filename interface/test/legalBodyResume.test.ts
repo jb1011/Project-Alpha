@@ -290,8 +290,8 @@ describe("jumpMemoryPatch", () => {
 });
 
 describe("identitySuggestionAfter: the identity the identity step offers again, held in memory only", () => {
-  const FIRST = "897352";
-  const SECOND = "897353";
+  const FIRST = "900001";
+  const SECOND = "900002";
 
   test("a jump back to the identity takes the identity the jump clears", () => {
     expect(identitySuggestionAfter({ kind: "jump", target: "identity", agentId: FIRST }, null)).toBe(FIRST);
@@ -342,6 +342,16 @@ describe("identitySuggestionAfter: the identity the identity step offers again, 
   test("a new order or a new company starts with none", () => {
     expect(identitySuggestionAfter({ kind: "start_another" }, FIRST)).toBeNull();
     expect(identitySuggestionAfter({ kind: "start_another" }, null)).toBeNull();
+  });
+
+  test("a draft the link door refused: the new order for the same agent offers the draft's identity", () => {
+    expect(identitySuggestionAfter({ kind: "new_order_for", agentId: FIRST }, null)).toBe(FIRST);
+    expect(identitySuggestionAfter({ kind: "new_order_for", agentId: null }, null)).toBeNull();
+  });
+
+  test("the clear of the new order, then the re-offer, applied in order, leave the draft's identity", () => {
+    const cleared = identitySuggestionAfter({ kind: "start_another" }, SECOND);
+    expect(identitySuggestionAfter({ kind: "new_order_for", agentId: FIRST }, cleared)).toBe(FIRST);
   });
 });
 

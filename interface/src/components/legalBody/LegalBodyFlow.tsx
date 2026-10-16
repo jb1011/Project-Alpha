@@ -417,10 +417,15 @@ function LegalBodySession({
         // shown where it now is; a draft that cannot be linked needs a new order, from the
         // agreement, and the refused draft is not offered there again.
         const refused = refs?.orderId ?? null;
+        // Every refusal routed here is about the draft, never the identity: the new order offers
+        // the draft's identity first. Both updates are functional, so the new order's clear comes
+        // first and the re-offer after it.
+        const kept = choices.agentId;
         const read = await orderQuery.refetch();
         if (afterOrderRefused(read.data) === "rederive") return;
         setRefusedDraftIds((ids) => withRefusedDraft(ids, refused));
         startAnother("new_order");
+        noteIdentity({ kind: "new_order_for", agentId: kept });
         setCarried({ to: "agreement", sentence });
         return;
       }

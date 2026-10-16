@@ -174,7 +174,7 @@ describe("a deployment on a chain this site does not read", () => {
 });
 
 describe("the identity already chosen on this visit, offered first", () => {
-  const SUGGESTED = "897352";
+  const SUGGESTED = "900001";
   type Props = Parameters<typeof IdentityStep>[0];
 
   function markupWith(props: Props): string {
