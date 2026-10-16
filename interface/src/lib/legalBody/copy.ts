@@ -44,6 +44,8 @@ export const LEGAL_BODY_COPY = {
     heading: "A legal body for your agent",
     footer:
       "Two signatures and one or two transactions from your wallet. Never an approval or a transfer.",
+    /** Under the current phase; the done page has none. */
+    inProgress: "In progress",
     labels: {
       signin: "Sign in",
       human: "Accountable human",
@@ -425,6 +427,13 @@ export const LEGAL_BODY_COPY = {
       "Your wallet is on another network than {network}. Switch it there and register again; nothing was sent.",
     refusedBeforeWallet:
       "The registration was refused before your wallet opened ({problem}), so nothing was sent.",
+    /** The label beside the agent id: on the identity step's first card, and on the link and
+     *  pointer steps. */
+    yourIdentity: "Your agent's identity",
+    suggestionBody:
+      "The identity you picked or registered on this visit. Continuing reads its owner on the chain again first.",
+    continueWith: "Continue with {agentId}",
+    orChooseAnother: "Or choose another identity",
   },
 
   link: {

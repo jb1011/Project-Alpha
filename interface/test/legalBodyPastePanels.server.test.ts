@@ -540,3 +540,31 @@ describe("no wallet and no API key on this branch", () => {
     },
   );
 });
+
+describe("the agent id, where a person looks for it", () => {
+  const line = (agentId: string) => `${LEGAL_BODY_COPY.identity.yourIdentity} ${agentId}`;
+
+  test("the link panel: the identity picked for the draft, before what happens next", () => {
+    const page = text(linkMarkup(kit(LINK, order())));
+    expect(page).toContain(line(LIVE_AGENT));
+    expect(page.indexOf(line(LIVE_AGENT))).toBeLessThan(page.indexOf(P.howItWorks));
+  });
+
+  test("the link panel with no identity known: no line", () => {
+    expect(text(linkMarkup(kit(LINK, order()), null))).not.toContain(LEGAL_BODY_COPY.identity.yourIdentity);
+  });
+
+  test("the pointer panel: the order's identity, while the chain is read and once the call is shown", () => {
+    expect(text(pointerMarkup(kit(POINTER, deployed())))).toContain(line(LIVE_AGENT));
+    chainAgrees();
+    const page = text(pointerMarkup(kit(POINTER, deployed())));
+    expect(page).toContain(line(LIVE_AGENT));
+    expect(page.indexOf(line(LIVE_AGENT))).toBeLessThan(page.indexOf(P.sendFromOwner));
+  });
+
+  test("the pointer panel, a call refused before any read: the identity still shown", () => {
+    const page = text(pointerMarkup(kit(POINTER, deployed({ revoked: true }))));
+    expect(page).toContain(line(LIVE_AGENT));
+    nothingSent();
+  });
+});

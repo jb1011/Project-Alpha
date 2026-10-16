@@ -25,6 +25,7 @@ import type {
 import { agreementProblem, agreementReadSentence } from "@/lib/legalBody/agreement";
 import { LEGAL_BODY_COPY, fillCopy } from "@/lib/legalBody/copy";
 import { sameAddress } from "@/lib/legalBody/flow";
+import { identityOnStep } from "@/lib/legalBody/identity";
 import {
   decodeLinkFields,
   keepsSignedLink,
@@ -42,6 +43,7 @@ import {
 } from "@/lib/legalBody/link";
 import { noticeSentence } from "@/lib/legalBody/notice";
 import { linkSignGate, signThroughGate } from "@/lib/legalBody/signGate";
+import { IdentityLine } from "./IdentityLine";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 
 const L = LEGAL_BODY_COPY.link;
@@ -86,12 +88,14 @@ export function LinkStep({
   onSendBack: (to: LinkSendBack, sentence: string) => void;
 }) {
   const screen = linkScreen(kit.derivation);
+  const shownId = identityOnStep({ order: kit.order, memoryAgentId: agentId });
 
   if (screen === "creating") {
     const notice = noticeSentence({ kind: "creating" }, kit.config.environment);
     return (
       <div>
         <StepHeader eyebrow={LEGAL_BODY_COPY.rail.labels.link} title={L.creating} />
+        <IdentityLine agentId={shownId} />
         <Card className="p-6">
           <p className="flex items-center gap-2 text-[13.5px] leading-[1.6] text-muted">
             <Spinner className="h-3.5 w-3.5" /> {notice.body}
@@ -111,6 +115,7 @@ export function LinkStep({
         title={L.title}
         intro={agentId !== null ? fillCopy(L.intro, { agentId }) : undefined}
       />
+      <IdentityLine agentId={shownId} />
       {order === null || agentId === null ? (
         <Callout tone="warn">{L.identityUnknown}</Callout>
       ) : (

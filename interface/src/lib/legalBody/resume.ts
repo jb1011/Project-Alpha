@@ -175,6 +175,50 @@ export function jumpMemoryPatch(target: LegalBodyRailPhase): Partial<Memo> | nul
 }
 
 /**
+ * What changes the identity the identity step offers again (`identitySuggestionAfter`):
+ *  - `jump`: a jump on the rail, with the identity the memory held for this draft just before it;
+ *  - `registered`: a registration on the identity step minted this identity;
+ *  - `picked`: the person picked this identity on the identity step;
+ *  - `dropped`: the identity step found this identity taken;
+ *  - `start_another`: a new order or a new company starts.
+ */
+export type IdentitySuggestionEvent =
+  | { kind: "jump"; target: LegalBodyRailPhase; agentId: string | null }
+  | { kind: "registered"; agentId: string }
+  | { kind: "picked"; agentId: string }
+  | { kind: "dropped"; agentId: string }
+  | { kind: "start_another" };
+
+/**
+ * The identity the identity step offers first, held in this visit's memory only, never in the
+ * store. A jump that clears the identity (`jumpMemoryPatch`) keeps it as the suggestion, so going
+ * back never shows the register card as the only way on; a jump with nothing to clear keeps the
+ * suggestion already there. A registration offers its new identity. Picking another identity, an
+ * identity found taken, and a new order or company end it. The suggestion is only an offer: the
+ * step reads the identity's owner and the orders again before it is used.
+ */
+export function identitySuggestionAfter(
+  event: IdentitySuggestionEvent,
+  current: string | null,
+): string | null {
+  switch (event.kind) {
+    case "jump": {
+      const patch = jumpMemoryPatch(event.target);
+      const clears = patch !== null && Object.prototype.hasOwnProperty.call(patch, "agentId");
+      return clears ? (event.agentId ?? current) : current;
+    }
+    case "registered":
+      return event.agentId;
+    case "picked":
+      return event.agentId === current ? current : null;
+    case "dropped":
+      return event.agentId === current ? null : current;
+    case "start_another":
+      return null;
+  }
+}
+
+/**
  * The flow's clock: the latest of the moment the screen mounted and each read of the server. A
  * draft's 24 hours are measured against it, so the time moves with every read (polling, focus, a
  * click's refetch) and no timer runs for it.

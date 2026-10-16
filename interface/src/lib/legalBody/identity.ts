@@ -182,6 +182,52 @@ export function cardOutcomeView(p: {
   }
 }
 
+/**
+ * What the identity step offers first: the three cards alone; the identity already chosen on this
+ * visit (`suggestedAgentId`, from the shell), then the three cards; or, when the tenant's orders
+ * say that identity already has a body on this deployment, the taken sentence and the three cards.
+ * A suggestion that is not an agent id as the registry gives it is not offered.
+ */
+export type IdentityStepOffer =
+  | { kind: "cards" }
+  | { kind: "suggestion"; agentId: string }
+  | { kind: "taken"; agentId: string };
+
+export function identityStepOffer(p: {
+  suggestedAgentId: string | null | undefined;
+  orders: LegalBodyOrderView[];
+  where: { chainId: number; factory: Address };
+}): IdentityStepOffer {
+  const agentId = p.suggestedAgentId == null ? null : parseAgentId(p.suggestedAgentId);
+  if (agentId === null || agentId !== p.suggestedAgentId) return { kind: "cards" };
+  if (identityHasBody(p.orders, agentId, p.where)) return { kind: "taken", agentId };
+  return { kind: "suggestion", agentId };
+}
+
+/**
+ * The card a suggestion's check is answered as, once the chain and the orders have said
+ * (`identityCardOutcome`, as for a typed id): this wallet's card when this wallet owns it, so it
+ * is picked at once; the third card when another key owns it, so its owner is shown before the
+ * person continues with it. Taken and no identity read the same on either card.
+ */
+export function suggestionCardOf(outcome: IdentityCardOutcome): IdentityCard {
+  return outcome.kind === "elsewhere" ? "elsewhere" : "this-wallet";
+}
+
+/**
+ * The agent id the link and pointer steps show: the order's own once it has one; on a draft, the
+ * identity picked for it in this browser; otherwise none, never a guess.
+ */
+export function identityOnStep(p: {
+  order: Pick<LegalBodyOrderView, "agentId" | "state"> | null;
+  memoryAgentId: string | null;
+}): string | null {
+  const { order, memoryAgentId } = p;
+  if (order === null) return null;
+  if (order.agentId !== null) return order.agentId;
+  return order.state === "draft" ? memoryAgentId : null;
+}
+
 /** The identity the derivation refused because it already has a body: the screen keeps the
  *  refusal on screen and the memory forgets the identity, so the person picks another. */
 export function takenAgentIdOf(derivation: LegalBodyDerivation): string | null {

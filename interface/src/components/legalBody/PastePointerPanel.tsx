@@ -19,6 +19,7 @@ import {
   POINTER_KEY,
 } from "@/lib/legalBody/chain";
 import { LEGAL_BODY_COPY, fillCopy } from "@/lib/legalBody/copy";
+import { identityOnStep } from "@/lib/legalBody/identity";
 import {
   pastePointerState,
   pasteWayOn,
@@ -33,6 +34,7 @@ import {
 } from "@/lib/legalBody/paste";
 import { REFRESH_RETRY_MS, refreshPlan } from "@/lib/legalBody/polling";
 import { WayOn } from "./ClosedNotice";
+import { IdentityLine } from "./IdentityLine";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 import { CopyBox, FieldRows, McpNote } from "./PasteLinkPanel";
 
@@ -73,6 +75,7 @@ export function PastePointerPanel({ kit }: { kit: LegalBodyStepKit }) {
         title={P.pointerTitle}
         intro={order.agentId !== null ? fillCopy(P.pointerIntro, { agentId: order.agentId }) : undefined}
       />
+      <IdentityLine agentId={identityOnStep({ order, memoryAgentId: null })} />
       {"ok" in call ? (
         <>
           <Callout tone="warn">{fillCopy(P.callRefused, { problem: call.problem })}</Callout>

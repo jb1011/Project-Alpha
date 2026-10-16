@@ -10,12 +10,14 @@ import {
   railCurrentOf,
   railDone,
   railDoneOf,
+  railCurrentTag,
   railPhaseOf,
   showRail,
   visibleLegalBodyPhases,
   type LegalBodyRailPhase,
 } from "@/lib/legalBody/phases";
 import type { LegalBodyDerivation } from "@/lib/legalBody/flow";
+import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
 import type { LegalBodyConfig } from "@/lib/api/types";
 
 type AvailableConfig = Extract<LegalBodyConfig, { available: true }>;
@@ -159,13 +161,35 @@ describe("railDoneOf: a closed order never shows as progress", () => {
 
   test("any other phase ticks every phase before it", () => {
     expect(railDoneOf(phases, "flow", { phase: "link" })).toEqual(railDone(phases, "link"));
-    expect(railDoneOf(phases, "flow", { phase: "done" })).toEqual(railDone(phases, "done"));
     expect(railDoneOf(phases, "flow", null)).toEqual(railDone(phases, "company"));
+  });
+
+  test("the done page ticks every phase before it and itself: nothing on it is in progress", () => {
+    expect(railDoneOf(phases, "flow", { phase: "done" })).toEqual({ ...railDone(phases, "done"), done: true });
+    expect(railDoneOf(phases, "flow", { phase: "done", notice: { kind: "winding_down" } })).toEqual({
+      ...railDone(phases, "done"),
+      done: true,
+    });
+    const charging = visibleLegalBodyPhases(config({ paymentRequired: true }));
+    expect(railDoneOf(charging, "flow", { phase: "done" })).toEqual({ ...railDone(charging, "done"), done: true });
   });
 
   test("on a gate, the gate's own map, whatever the thread says", () => {
     expect(railDoneOf(phases, "signin", expired)).toEqual({});
     expect(railDoneOf(phases, "human", expired)).toEqual({ signin: true });
+  });
+});
+
+describe("railCurrentTag: the word under the current phase", () => {
+  test("the done page has none: it is not in progress", () => {
+    expect(railCurrentTag("done")).toBeNull();
+  });
+
+  test("every other phase is in progress, in the flow's own words", () => {
+    for (const { id } of LEGAL_BODY_PHASES.filter((p) => p.id !== "done")) {
+      expect(railCurrentTag(id)).toBe(LEGAL_BODY_COPY.rail.inProgress);
+    }
+    expect(LEGAL_BODY_COPY.rail.inProgress).toBe("In progress");
   });
 });
 

@@ -96,10 +96,25 @@ export function gasEstimateWei(p: {
   return p.gas * p.maxFeePerGas;
 }
 
+/** One millionth of a native USDC, in wei: the gas line shows six decimals at most. */
+const SHOWN_STEP_WEI = BigInt(10 ** 12);
+
 /**
- * The estimate and the wallet's balance as amounts of USDC, with Arc's 18 decimals (`formatNative`),
- * and whether the balance covers the estimate. What is not known is null, and so is `enough`
- * unless both are known.
+ * A native amount as the gas line shows it: Arc's 18 decimals (`formatNative`) cut to six at most,
+ * trailing zeros trimmed, rounded down (a balance is never shown as more than it is) or up (a cost
+ * is never shown as less than it is). The amounts are never negative.
+ */
+export function shownNative(wei: bigint, round: "down" | "up"): string {
+  const steps = wei / SHOWN_STEP_WEI;
+  const rest = wei % SHOWN_STEP_WEI;
+  const shown = round === "up" && rest > BigInt(0) ? steps + BigInt(1) : steps;
+  return formatNative(shown * SHOWN_STEP_WEI);
+}
+
+/**
+ * The estimate and the wallet's balance as amounts of USDC (`shownNative`: the estimate rounded
+ * up, the balance down), and whether the balance covers the estimate, decided on the exact
+ * amounts. What is not known is null, and so is `enough` unless both are known.
  */
 export function gasLine(p: { estimateWei: bigint | null; balanceWei: bigint | null }): {
   amount: string | null;
@@ -108,8 +123,8 @@ export function gasLine(p: { estimateWei: bigint | null; balanceWei: bigint | nu
 } {
   const { estimateWei, balanceWei } = p;
   return {
-    amount: estimateWei === null ? null : formatNative(estimateWei),
-    balance: balanceWei === null ? null : formatNative(balanceWei),
+    amount: estimateWei === null ? null : shownNative(estimateWei, "up"),
+    balance: balanceWei === null ? null : shownNative(balanceWei, "down"),
     enough: estimateWei === null || balanceWei === null ? null : balanceWei >= estimateWei,
   };
 }

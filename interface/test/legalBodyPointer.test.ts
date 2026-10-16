@@ -251,7 +251,7 @@ describe("gasLine: Arc's native unit has 18 decimals", () => {
   test("a balance below the estimate is not enough", () => {
     expect(gasLine({ estimateWei: CENT, balanceWei: CENT - BigInt(1) })).toStrictEqual({
       amount: "0.01",
-      balance: "0.009999999999999999",
+      balance: "0.009999",
       enough: false,
     });
     expect(gasLine({ estimateWei: CENT, balanceWei: BigInt(0) })).toStrictEqual({
@@ -280,6 +280,49 @@ describe("gasLine: Arc's native unit has 18 decimals", () => {
       balance: "0.01",
       enough: null,
     });
+  });
+});
+
+describe("gasLine: the amounts read short, and never in the person's favour", () => {
+  test("a long balance shows six decimals at most, rounded down", () => {
+    expect(gasLine({ estimateWei: null, balanceWei: wei("37848951842567135702") }).balance).toBe("37.848951");
+  });
+
+  test("a long estimate shows six decimals at most, rounded up", () => {
+    expect(gasLine({ estimateWei: wei("3695702000000000"), balanceWei: null }).amount).toBe("0.003696");
+  });
+
+  test("trailing zeros are trimmed, and a whole amount has no decimals", () => {
+    expect(gasLine({ estimateWei: wei("1500000000000000000"), balanceWei: wei("2000000000000000000") })).toStrictEqual({
+      amount: "1.5",
+      balance: "2",
+      enough: true,
+    });
+  });
+
+  test("an amount already at six decimals or fewer is shown as it is", () => {
+    expect(gasLine({ estimateWei: wei("3696000000000000"), balanceWei: wei("37848951000000000000") })).toStrictEqual({
+      amount: "0.003696",
+      balance: "37.848951",
+      enough: true,
+    });
+  });
+
+  test("one wei of cost shows as the smallest amount shown; one wei held shows as nothing", () => {
+    expect(gasLine({ estimateWei: wei("1"), balanceWei: wei("1") })).toStrictEqual({
+      amount: "0.000001",
+      balance: "0",
+      enough: true,
+    });
+  });
+
+  test("enough is decided on the exact amounts, not on what is shown", () => {
+    const estimate = wei("3695702000000000");
+    // One wei short: shown as 0.003695 against 0.003696, and not enough.
+    expect(gasLine({ estimateWei: estimate, balanceWei: estimate - BigInt(1) }).enough).toBe(false);
+    // One wei over: shown the same way, and enough, since the exact balance covers the exact cost.
+    const over = gasLine({ estimateWei: estimate, balanceWei: estimate + BigInt(1) });
+    expect(over).toStrictEqual({ amount: "0.003696", balance: "0.003695", enough: true });
   });
 });
 

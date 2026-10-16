@@ -25,6 +25,7 @@ import type {
 } from "@/lib/api/types";
 import { agreementProblem, agreementReadSentence } from "@/lib/legalBody/agreement";
 import { LEGAL_BODY_COPY, fillCopy } from "@/lib/legalBody/copy";
+import { identityOnStep } from "@/lib/legalBody/identity";
 import {
   decodeLinkFields,
   linkAnswerOutcome,
@@ -40,6 +41,7 @@ import {
   pasteSubmitPlan,
   type PasteOutcome,
 } from "@/lib/legalBody/paste";
+import { IdentityLine } from "./IdentityLine";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 
 const P = LEGAL_BODY_COPY.paste;
@@ -84,6 +86,7 @@ export function PasteLinkPanel({
         title={P.title}
         intro={agentId !== null ? fillCopy(P.intro, { agentId }) : undefined}
       />
+      <IdentityLine agentId={identityOnStep({ order, memoryAgentId: agentId })} />
       {order === null || agentId === null ? (
         <Callout tone="warn">{L.identityUnknown}</Callout>
       ) : (

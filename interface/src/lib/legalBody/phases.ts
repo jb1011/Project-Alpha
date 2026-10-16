@@ -88,7 +88,17 @@ export function railDoneOf(
     for (const p of phases) if (p.id === "signin" || p.id === "human") done[p.id] = true;
     return done;
   }
-  return railDone(phases, railCurrentOf(gate, derivation));
+  const current = railCurrentOf(gate, derivation);
+  const done = railDone(phases, current);
+  // The done page is the end: nothing on it is in progress, so it is ticked too.
+  if (current === "done") done.done = true;
+  return done;
+}
+
+/** The word under the current phase on the rail: "In progress", except on the done page, which
+ *  has none. */
+export function railCurrentTag(current: LegalBodyRailPhase): string | null {
+  return current === "done" ? null : LEGAL_BODY_COPY.rail.inProgress;
 }
 
 /**

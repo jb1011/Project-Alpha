@@ -7,11 +7,13 @@ import { describe, expect, test } from "vitest";
 import type { Address, CompanyView, LegalBodyOrderView } from "@/lib/api/types";
 import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
 import type { LegalBodyThread } from "@/lib/legalBody/flow";
+import { LEGAL_BODY_PHASES } from "@/lib/legalBody/phases";
 import type { LegalBodyMemory } from "@/lib/legalBody/storage";
 import {
   chooserRows,
   draftChoices,
   flowNowMs,
+  identitySuggestionAfter,
   jumpMemoryPatch,
   memoryAfterThread,
   mergeLegalBodyMemory,
@@ -284,6 +286,62 @@ describe("jumpMemoryPatch", () => {
     for (const phase of ["signin", "human", "company", "link", "pointer", "payment", "done"] as const) {
       expect(jumpMemoryPatch(phase)).toBeNull();
     }
+  });
+});
+
+describe("identitySuggestionAfter: the identity the identity step offers again, held in memory only", () => {
+  const FIRST = "897352";
+  const SECOND = "897353";
+
+  test("a jump back to the identity takes the identity the jump clears", () => {
+    expect(identitySuggestionAfter({ kind: "jump", target: "identity", agentId: FIRST }, null)).toBe(FIRST);
+  });
+
+  test("a jump back to the agreement takes it too", () => {
+    expect(identitySuggestionAfter({ kind: "jump", target: "agreement", agentId: FIRST }, null)).toBe(FIRST);
+  });
+
+  test("a jump with no identity left to clear keeps the one already offered", () => {
+    // From the identity step back to the agreement: the memory's identity was cleared by the
+    // first jump, and the suggestion must survive the second.
+    expect(identitySuggestionAfter({ kind: "jump", target: "agreement", agentId: null }, FIRST)).toBe(FIRST);
+    expect(identitySuggestionAfter({ kind: "jump", target: "identity", agentId: null }, null)).toBeNull();
+  });
+
+  test("a jump that clears no identity changes nothing", () => {
+    for (const target of ["signin", "human", "company", "link", "pointer", "payment", "done"] as const) {
+      expect(identitySuggestionAfter({ kind: "jump", target, agentId: SECOND }, FIRST)).toBe(FIRST);
+      expect(identitySuggestionAfter({ kind: "jump", target, agentId: SECOND }, null)).toBeNull();
+    }
+  });
+
+  test("the suggestion is taken exactly where the jump clears the identity", () => {
+    for (const { id } of LEGAL_BODY_PHASES) {
+      const clears = Object.prototype.hasOwnProperty.call(jumpMemoryPatch(id) ?? {}, "agentId");
+      const taken = identitySuggestionAfter({ kind: "jump", target: id, agentId: FIRST }, null);
+      expect(taken).toBe(clears ? FIRST : null);
+    }
+  });
+
+  test("a registration offers the new identity, over any earlier one", () => {
+    expect(identitySuggestionAfter({ kind: "registered", agentId: SECOND }, null)).toBe(SECOND);
+    expect(identitySuggestionAfter({ kind: "registered", agentId: SECOND }, FIRST)).toBe(SECOND);
+  });
+
+  test("picking the identity offered keeps it; picking another clears it", () => {
+    expect(identitySuggestionAfter({ kind: "picked", agentId: FIRST }, FIRST)).toBe(FIRST);
+    expect(identitySuggestionAfter({ kind: "picked", agentId: SECOND }, FIRST)).toBeNull();
+    expect(identitySuggestionAfter({ kind: "picked", agentId: SECOND }, null)).toBeNull();
+  });
+
+  test("an identity found taken is dropped when it is the one offered", () => {
+    expect(identitySuggestionAfter({ kind: "dropped", agentId: FIRST }, FIRST)).toBeNull();
+    expect(identitySuggestionAfter({ kind: "dropped", agentId: SECOND }, FIRST)).toBe(FIRST);
+  });
+
+  test("a new order or a new company starts with none", () => {
+    expect(identitySuggestionAfter({ kind: "start_another" }, FIRST)).toBeNull();
+    expect(identitySuggestionAfter({ kind: "start_another" }, null)).toBeNull();
   });
 });
 

@@ -30,7 +30,7 @@ import { identityRegistryAbi, legalBodyFactoryAbi, pointerCall } from "@/lib/leg
 import { LEGAL_BODY_COPY, fillCopy } from "@/lib/legalBody/copy";
 import { sameAddress } from "@/lib/legalBody/flow";
 import { isSignInRequired } from "@/lib/legalBody/gates";
-import { registerSendFailure } from "@/lib/legalBody/identity";
+import { identityOnStep, registerSendFailure } from "@/lib/legalBody/identity";
 import { stepLifetime } from "@/lib/legalBody/lifetime";
 import { pointerCallText, pointerChecksOf } from "@/lib/legalBody/paste";
 import {
@@ -61,6 +61,7 @@ import {
 } from "@/lib/legalBody/pointer";
 import { REFRESH_RETRY_MS, refreshPlan } from "@/lib/legalBody/polling";
 import { WayOn } from "./ClosedNotice";
+import { IdentityLine } from "./IdentityLine";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 
 const PT = LEGAL_BODY_COPY.pointer;
@@ -428,6 +429,7 @@ function PointerStepForOrder({ kit, order }: { kit: PointerStepKit; order: Legal
         title={PT.title}
         intro={intro ?? undefined}
       />
+      <IdentityLine agentId={identityOnStep({ order, memoryAgentId: null })} />
 
       {sentView ? (
         <SentPanel

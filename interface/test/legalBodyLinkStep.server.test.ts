@@ -260,3 +260,28 @@ describe("the other screens of the phase", () => {
     expect(markup(kit(), null)).not.toContain("<button");
   });
 });
+
+describe("the agent id, where a person looks for it", () => {
+  const line = (agentId: string) => `${LEGAL_BODY_COPY.identity.yourIdentity} ${agentId}`;
+
+  test("on the draft, the identity picked for it, near the top of the step", () => {
+    const page = text(kit());
+    expect(page).toContain(line(LIVE_AGENT));
+    expect(page.indexOf(line(LIVE_AGENT))).toBeLessThan(page.indexOf(L.howItWorks));
+  });
+
+  test("the order's own identity once it has one, over the one picked in this browser", () => {
+    const page = text(kit(SIGN, order({ agentId: "897353" })), LIVE_AGENT);
+    expect(page).toContain(line("897353"));
+    expect(page).not.toContain(line(LIVE_AGENT));
+  });
+
+  test("while the body is created, the order's identity", () => {
+    const page = text(kit(CREATING, order({ state: "reserved", agentId: "897353" })), null);
+    expect(page).toContain(line("897353"));
+  });
+
+  test("no identity known: no line", () => {
+    expect(text(kit(), null)).not.toContain(LEGAL_BODY_COPY.identity.yourIdentity);
+  });
+});

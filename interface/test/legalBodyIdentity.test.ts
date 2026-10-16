@@ -28,6 +28,8 @@ import {
   cardOutcomeView,
   identityCardOutcome,
   identityChainOutcome,
+  identityOnStep,
+  identityStepOffer,
   isRevert,
   parseAgentId,
   parseAgentUri,
@@ -37,6 +39,7 @@ import {
   registerRefusalSentence,
   registerSendFailure,
   registrationView,
+  suggestionCardOf,
   takenAgentIdOf,
   type IdentityCardOutcome,
 } from "@/lib/legalBody/identity";
@@ -340,6 +343,124 @@ describe("cardOutcomeView: what the person reads, and what a pick writes", () =>
     });
     expect(view.text).toBe(fillCopy(I.otherChain, { network: "Arc" }));
     expect(view.pick).toBeNull();
+  });
+});
+
+describe("identityStepOffer: what the identity step offers first", () => {
+  const SUGGESTED = "897352";
+
+  test("no suggestion: the three cards, as before", () => {
+    expect(identityStepOffer({ suggestedAgentId: null, orders: [], where: WHERE })).toStrictEqual({ kind: "cards" });
+    expect(identityStepOffer({ suggestedAgentId: undefined, orders: [], where: WHERE })).toStrictEqual({
+      kind: "cards",
+    });
+  });
+
+  test("a suggestion: the suggestion first, then the cards", () => {
+    expect(identityStepOffer({ suggestedAgentId: SUGGESTED, orders: [], where: WHERE })).toStrictEqual({
+      kind: "suggestion",
+      agentId: SUGGESTED,
+    });
+  });
+
+  test("a suggestion the orders say already has a body here: treated as taken", () => {
+    for (const taken of [
+      order({ agentId: SUGGESTED }),
+      order({ agentId: SUGGESTED, state: "reserved", bodyAddress: null }),
+      order({ agentId: SUGGESTED, state: "deployed", pointerSeenAt: null }),
+      order({ agentId: SUGGESTED, state: "broken", brokenReason: "not_linked" }),
+    ]) {
+      expect(identityStepOffer({ suggestedAgentId: SUGGESTED, orders: [taken], where: WHERE })).toStrictEqual({
+        kind: "taken",
+        agentId: SUGGESTED,
+      });
+    }
+  });
+
+  test("a body for another identity, or on another deployment, does not take the suggestion", () => {
+    const orders = [order({ agentId: AGENT }), order({ agentId: SUGGESTED, factory: ANOTHER_FACTORY })];
+    expect(identityStepOffer({ suggestedAgentId: SUGGESTED, orders, where: WHERE })).toStrictEqual({
+      kind: "suggestion",
+      agentId: SUGGESTED,
+    });
+  });
+
+  test("a draft or a closed order for the suggestion does not take it", () => {
+    const orders = [
+      order({ agentId: SUGGESTED, state: "draft", bodyAddress: null }),
+      order({ agentId: SUGGESTED, state: "lapsed", bodyAddress: null }),
+      order({ agentId: SUGGESTED, state: "broken", brokenReason: "not_linked", revoked: true }),
+    ];
+    expect(identityStepOffer({ suggestedAgentId: SUGGESTED, orders, where: WHERE }).kind).toBe("suggestion");
+  });
+
+  test("a suggestion that is not an agent id as the registry gives it: the three cards", () => {
+    for (const bad of ["", " ", "007", "-1", "1.5", "abc", TWO_TO_256]) {
+      expect(identityStepOffer({ suggestedAgentId: bad, orders: [], where: WHERE })).toStrictEqual({
+        kind: "cards",
+      });
+    }
+  });
+});
+
+describe("suggestionCardOf: the card a suggestion's check is answered as", () => {
+  const at = { agentId: AGENT, environment: "sandbox" as const };
+  const viewOf = (outcome: IdentityCardOutcome) =>
+    cardOutcomeView({ ...at, card: suggestionCardOf(outcome), outcome });
+
+  test("this wallet's identity: picked at once, as on this wallet's card", () => {
+    expect(suggestionCardOf({ kind: "this_wallet" })).toBe("this-wallet");
+    const view = viewOf({ kind: "this_wallet" });
+    expect(view.auto).toBe(true);
+    expect(view.pick).toStrictEqual({ ownerChoice: "this-wallet", agentId: AGENT });
+  });
+
+  test("another key's identity: the third card's path, the owner shown before the person continues", () => {
+    const outcome: IdentityCardOutcome = { kind: "elsewhere", owner: OTHER_KEY };
+    expect(suggestionCardOf(outcome)).toBe("elsewhere");
+    const view = viewOf(outcome);
+    expect(view.text).toBe(fillCopy(I.ownedElsewhere, { agentId: AGENT, owner: OTHER_KEY }));
+    expect(view.pick).toStrictEqual({ ownerChoice: "elsewhere", agentId: AGENT });
+    expect(view.auto).toBe(false);
+    expect(view.toThirdCard).toBe(false);
+  });
+
+  test("no identity: the no-identity sentence, and no pick", () => {
+    const view = viewOf({ kind: "no_identity" });
+    expect(view.text).toBe(fillCopy(I.noIdentity, { agentId: AGENT, network: "Arc testnet" }));
+    expect(view.pick).toBeNull();
+  });
+
+  test("taken: the taken sentence, and no pick", () => {
+    const view = viewOf({ kind: "taken" });
+    expect(view.title).toBe(LEGAL_BODY_COPY.notices.identity_taken.title);
+    expect(view.text).toContain(I.taken);
+    expect(view.pick).toBeNull();
+  });
+});
+
+describe("identityOnStep: the agent id the link and pointer steps show", () => {
+  test("the order's own identity, once it has one, over the memory's", () => {
+    expect(identityOnStep({ order: order({ state: "reserved" }), memoryAgentId: null })).toBe(AGENT);
+    expect(identityOnStep({ order: order({ state: "deployed" }), memoryAgentId: "897352" })).toBe(AGENT);
+    expect(identityOnStep({ order: order({ state: "draft" }), memoryAgentId: "897352" })).toBe(AGENT);
+  });
+
+  test("a draft without one: the identity picked for it in this browser", () => {
+    expect(identityOnStep({ order: order({ state: "draft", agentId: null }), memoryAgentId: "897352" })).toBe(
+      "897352",
+    );
+  });
+
+  test("nothing known: nothing shown", () => {
+    expect(identityOnStep({ order: order({ state: "draft", agentId: null }), memoryAgentId: null })).toBeNull();
+    expect(identityOnStep({ order: null, memoryAgentId: "897352" })).toBeNull();
+  });
+
+  test("an order past the draft without an identity never shows the memory's guess", () => {
+    for (const state of ["reserved", "deployed", "linked"] as const) {
+      expect(identityOnStep({ order: order({ state, agentId: null }), memoryAgentId: "897352" })).toBeNull();
+    }
   });
 });
 

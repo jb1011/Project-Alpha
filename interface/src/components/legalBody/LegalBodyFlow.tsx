@@ -6,7 +6,6 @@ import { useBytecode } from "wagmi";
 import { Wordmark } from "@/components/landing/Wordmark";
 import { AuthProvider, useAuth } from "@/components/onboarding/AuthProvider";
 import { StepNav } from "@/components/onboarding/OnboardingFlow";
-import { Stepper } from "@/components/onboarding/Stepper";
 import { Button, Callout, Card, Spinner, StepHeader } from "@/components/onboarding/primitives";
 import { PaymentStep } from "@/components/onboarding/steps/PaymentStep";
 import { Web3Provider } from "@/components/providers/Web3Provider";
@@ -72,12 +71,14 @@ import {
   chooserRows,
   draftChoices,
   flowNowMs,
+  identitySuggestionAfter,
   jumpMemoryPatch,
   memoryAfterThread,
   mergeLegalBodyMemory,
   patchEndsIntent,
   threadRefsOf,
   threadWithIntent,
+  type IdentitySuggestionEvent,
   type LegalBodyIntent,
 } from "@/lib/legalBody/resume";
 import {
@@ -92,6 +93,7 @@ import { CompanyStep } from "./CompanyStep";
 import { DoneStep } from "./DoneStep";
 import { HumanStep } from "./HumanStep";
 import { IdentityStep } from "./IdentityStep";
+import { LegalBodyRail } from "./LegalBodyRail";
 import { LinkStep } from "./LinkStep";
 import { PasteLinkPanel } from "./PasteLinkPanel";
 import { PastePointerPanel } from "./PastePointerPanel";
@@ -114,9 +116,11 @@ import { ThreadChooser } from "./ThreadChooser";
  * Nothing here writes to the server on its own: every write is a click's. The only effects are the
  * memory's write once a thread is on screen, and the scroll to the top when the screen changes.
  *
- * Two facts live in this visit's memory only, never in the store: that a draft's agreement was
- * read (so the draft moves on to the identity step, and a reload shows the agreement again), and
- * a door's sentence carried back to the step it sends the person to.
+ * Three facts live in this visit's memory only, never in the store: that a draft's agreement was
+ * read (so the draft moves on to the identity step, and a reload shows the agreement again); a
+ * door's sentence carried back to the step it sends the person to; and the identity already
+ * chosen on this visit, which the identity step offers first when the person comes back to it
+ * (`identitySuggestionAfter`), so going back never invites a second registration.
  */
 
 type AvailableConfig = Extract<LegalBodyConfig, { available: true }>;
@@ -252,6 +256,8 @@ function LegalBodySession({
   const [carried, setCarried] = useState<CarriedSentence | null>(null);
   // The drafts the link door refused on this visit: none is offered again as a draft to continue.
   const [refusedDraftIds, setRefusedDraftIds] = useState<readonly string[]>([]);
+  // The identity already chosen on this visit, offered first on the identity step: in memory only.
+  const [identitySuggestion, setIdentitySuggestion] = useState<string | null>(null);
 
   // Reads only.
   const code = useBytecode({ address: tenant, chainId: arcTestnet.id });
@@ -342,6 +348,11 @@ function LegalBodySession({
     if (patchEndsIntent(patch)) setIntent(null);
   }
 
+  /** A change to the identity the identity step offers again. Nothing is stored. */
+  function noteIdentity(event: IdentitySuggestionEvent) {
+    setIdentitySuggestion((current) => identitySuggestionAfter(event, current));
+  }
+
   /** Continue on the agreement: this draft's agreement was read. Nothing is recorded. */
   function agreementRead(orderId: string) {
     setAgreementReadFor(orderId);
@@ -376,7 +387,9 @@ function LegalBodySession({
       setView(target);
       return;
     }
-    // Back into the thread: only the local inputs change, then the derivation decides again.
+    // Back into the thread: only the local inputs change, then the derivation decides again. The
+    // identity the jump clears is kept as the identity step's suggestion.
+    noteIdentity({ kind: "jump", target, agentId: choices.agentId });
     const patch = jumpMemoryPatch(target);
     if (patch) remember(patch);
     setView(null);
@@ -391,6 +404,7 @@ function LegalBodySession({
       });
     if (kind === "new_company")
       setIntent({ kind: "another-company", known: companies.map((c) => c.companyId) });
+    noteIdentity({ kind: "start_another" });
     // A closed order shown here is done with: this visit forgets it too.
     remember({});
   }
@@ -519,8 +533,16 @@ function LegalBodySession({
           />
         );
       case "identity":
-        // One step per order: a new order never inherits another's typing or reads.
-        return <IdentityStep key={kit.orderId ?? "none"} kit={kit} />;
+        // One step per order: a new order never inherits another's typing or reads. The identity
+        // already chosen on this visit is offered first.
+        return (
+          <IdentityStep
+            key={kit.orderId ?? "none"}
+            kit={kit}
+            suggestedAgentId={identitySuggestion}
+            onIdentity={noteIdentity}
+          />
+        );
       case "link":
         // One step per order: a click's state never carries over to another order. Another key
         // signs on its own panel, which never opens this browser's wallet.
@@ -604,7 +626,7 @@ function FlowLayout({
   /** `showRail`'s answer: a closed order's terminal notice shows no rail. */
   rail: boolean;
   current: LegalBodyRailPhase;
-  /** `railDoneOf`'s answer: a closed order ticks the gates only. */
+  /** `railDoneOf`'s answer: a closed order ticks the gates only, the done page itself too. */
   done: Record<string, boolean>;
   onJump: (phase: LegalBodyRailPhase) => void;
   children: ReactNode;
@@ -626,14 +648,7 @@ function FlowLayout({
   return (
     <main className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
       <div className="lg:sticky lg:top-24 lg:self-start">
-        <Stepper<LegalBodyRailPhase>
-          phases={phases}
-          current={current}
-          done={done}
-          onJump={onJump}
-          heading={LEGAL_BODY_COPY.rail.heading}
-          footer={LEGAL_BODY_COPY.rail.footer}
-        />
+        <LegalBodyRail phases={phases} current={current} done={done} onJump={onJump} />
       </div>
       {content}
     </main>

@@ -526,3 +526,42 @@ describe("the wallet only through the allowlist", () => {
       expect(code).not.toContain(reach);
   });
 });
+
+describe("the agent id, where a person looks for it", () => {
+  const line = (agentId: string) => `${LEGAL_BODY_COPY.identity.yourIdentity} ${agentId}`;
+
+  test("shown near the top once every check passed, before the gas line", () => {
+    everythingAgrees();
+    const page = text(markup(kit(deployed())));
+    expect(page).toContain(line(LIVE_AGENT));
+    expect(page.indexOf(line(LIVE_AGENT))).toBeLessThan(page.indexOf("Estimated gas"));
+  });
+
+  test("shown while the binding is read, and on a stop", () => {
+    expect(text(markup(kit(deployed())))).toContain(line(LIVE_AGENT));
+    api.binding = { data: binding(), isError: false };
+    chain.reads = {
+      encodePointer: { status: "success", data: LIVE_POINTER },
+      ownerOf: { status: "success", data: THIRD },
+      identityOwnerAtCreation: { status: "success", data: GUARDIAN },
+    };
+    chain.connected = GUARDIAN;
+    expect(text(markup(kit(deployed())))).toContain(line(LIVE_AGENT));
+  });
+});
+
+describe("the amounts read short", () => {
+  test("a long balance rounded down and a long estimate rounded up, six decimals at most", () => {
+    everythingAgrees();
+    // 3,695,702 gas at 1 gwei: 0.003695702 USDC to spend.
+    chain.gas.data = BigInt(3_695_702);
+    chain.fees.data = { maxFeePerGas: BigInt(1_000_000_000) };
+    chain.balance.data = { value: BigInt("37848951842567135702") };
+    const m = markup(kit(deployed()));
+    const page = text(m);
+    expect(page).toContain("Estimated gas: up to 0.003696 USDC.");
+    expect(page).toContain("This wallet holds 37.848951 USDC.");
+    expect(page).not.toContain("37.848951842567135702");
+    expect(hasButton(m, PT.send)).toBe(true);
+  });
+});

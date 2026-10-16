@@ -8,6 +8,7 @@ import {
   Callout,
   Card,
   Field,
+  SectionTitle,
   Spinner,
   StepHeader,
   TextInput,
@@ -23,6 +24,7 @@ import {
   cardOutcomeView,
   identityCardOutcome,
   identityChainOutcome,
+  identityStepOffer,
   networkName,
   parseAgentId,
   parseAgentUri,
@@ -32,6 +34,7 @@ import {
   registerRefusalSentence,
   registerSendFailure,
   registrationView,
+  suggestionCardOf,
   takenAgentIdOf,
   type CardOutcomeView,
   type IdentityCard,
@@ -39,6 +42,8 @@ import {
   type RegistrationStage,
 } from "@/lib/legalBody/identity";
 import { noticeSentence } from "@/lib/legalBody/notice";
+import type { IdentitySuggestionEvent } from "@/lib/legalBody/resume";
+import type { OwnerChoice } from "@/lib/legalBody/storage";
 import type { LegalBodyStepKit } from "./LegalBodyFlow";
 
 const I = LEGAL_BODY_COPY.identity;
@@ -46,9 +51,16 @@ const I = LEGAL_BODY_COPY.identity;
 /** The chains this site reads: wagmi's config holds `arcTestnet` alone. */
 const SITE_CHAIN_IDS: readonly number[] = [arcTestnet.id];
 
-type Choice = IdentityCard | "register";
+type Choice = IdentityCard | "register" | "suggestion";
 type Checked = { card: IdentityCard; agentId: string; outcome: IdentityCardOutcome };
 type Busy = "reading" | "sending" | "waiting" | null;
+
+/** What the step tells the shell about the identity it offers again: a registration's new
+ *  identity, a pick, and an offered identity found taken. */
+export type IdentityStepEvent = Extract<
+  IdentitySuggestionEvent,
+  { kind: "registered" | "picked" | "dropped" }
+>;
 
 /**
  * Your agent's identity: which on-chain identity the legal body will stand behind.
@@ -63,15 +75,35 @@ type Busy = "reading" | "sending" | "waiting" | null;
  * receipt, and takes the minted id from it; when the receipt names no id, the transaction's link
  * and a field for the id by hand.
  *
+ * When the shell offers the identity already chosen on this visit (`suggestedAgentId`: picked or
+ * registered, then left by a jump back on the rail), it comes first, with "Continue with" and
+ * its id, and the three cards follow under "Or choose another identity" (`identityStepOffer`).
+ * "Continue with" is a click that runs the same reads and the same decision as a typed id
+ * (`suggestionCardOf` picks the card the answer is worded for): this wallet's identity is picked
+ * at once, another key's is shown with its owner first, and a taken one is said and no longer
+ * offered.
+ *
  * A pick writes the owner choice and the identity to the memory, and the derivation moves on to
- * the link. Every read and the one transaction are a click's; nothing is sent on mount. The one
- * effect forgets an identity the derivation refused as taken, so the person picks another; the
- * refusal stays on screen.
+ * the link; the step also tells the shell (`onIdentity`) of a pick, a registration and an offered
+ * identity found taken. Every read and the one transaction are a click's; nothing is sent on
+ * mount. The one effect forgets an identity the derivation refused as taken, so the person picks
+ * another; the refusal stays on screen.
  */
-export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
+export function IdentityStep({
+  kit,
+  suggestedAgentId,
+  onIdentity,
+}: {
+  kit: LegalBodyStepKit;
+  /** The identity already chosen on this visit, offered first; null or absent for none. */
+  suggestedAgentId?: string | null;
+  /** Tells the shell of a registration, a pick, and an offered identity found taken. */
+  onIdentity?: (event: IdentityStepEvent) => void;
+}) {
   const { config, tenant, remember } = kit;
   const environment = config.environment;
   const chainStop = identityChainOutcome(config.chainId, SITE_CHAIN_IDS);
+  const where = { chainId: config.chainId, factory: config.factory };
 
   const publicClient = usePublicClient({ chainId: config.chainId });
   const { address } = useConnection();
@@ -84,7 +116,15 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
   useEffect(() => {
     if (forget !== null) remember({ agentId: null });
   }, [forget, remember]);
-  const takenShown = forget ?? taken;
+  // An offered identity this step found taken: no longer offered here, whatever the shell says.
+  const [dropped, setDropped] = useState<string | null>(null);
+  const offer = identityStepOffer({
+    suggestedAgentId: suggestedAgentId === dropped ? null : suggestedAgentId,
+    orders: kit.orders,
+    where,
+  });
+  const suggested = offer.kind === "suggestion" ? offer.agentId : null;
+  const takenShown = forget ?? taken ?? (offer.kind === "taken" ? offer.agentId : null);
   const takenNotice = takenShown
     ? noticeSentence({ kind: "identity_taken", agentId: takenShown }, environment)
     : null;
@@ -108,6 +148,12 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
     ? cardOutcomeView({ ...checked, environment })
     : null;
 
+  /** A pick: the owner choice and the identity to the memory, and the shell told. */
+  function pick(next: { ownerChoice: OwnerChoice; agentId: string }) {
+    remember(next);
+    onIdentity?.({ kind: "picked", agentId: next.agentId });
+  }
+
   function choose(next: Choice) {
     if (inFlight.current) return;
     setChoice(next);
@@ -123,7 +169,7 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
     setChecked(null);
   }
 
-  /** The click on an identity card: the owner and the orders read, then the outcome. */
+  /** The click on an identity card: the typed id, then its reads and outcome. */
   async function onCheck(card: IdentityCard) {
     if (inFlight.current || chainStop) return;
     setChecked(null);
@@ -135,6 +181,24 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
       return;
     }
     setIdProblem(null);
+    await readIdentity(agentId, card);
+  }
+
+  /** The click on "Continue with": the offered identity, read and decided as a typed id. */
+  async function onContinueSuggested(agentId: string) {
+    if (inFlight.current || chainStop) return;
+    setChoice("suggestion");
+    setChecked(null);
+    setLines([]);
+    setTaken(null);
+    setIdProblem(null);
+    setUriProblem(null);
+    await readIdentity(agentId, "suggestion");
+  }
+
+  /** The owner and the orders read for an id, then the outcome, worded for the card it came from
+   *  (for the offered identity, the card its answer belongs to). */
+  async function readIdentity(agentId: string, from: IdentityCard | "suggestion") {
     const client = publicClient;
     if (!client) {
       setLines([I.ownerUnread]);
@@ -160,17 +224,27 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
         setLines([I.ownerUnread]);
         return;
       }
+      // The facts decide, not the card: the offered identity is read as this wallet's card would.
       const outcome = identityCardOutcome({
-        card,
+        card: from === "suggestion" ? "this-wallet" : from,
         agentId,
         ownerOf: owner,
         connected: tenant,
         orders: fresh.data?.orders ?? kit.orders,
-        where: { chainId: config.chainId, factory: config.factory },
+        where,
       });
+      if (from === "suggestion" && outcome.kind === "taken") {
+        // Said as the taken sentence, and no longer offered: the cards are the way on.
+        setTaken(agentId);
+        setDropped(agentId);
+        setChoice(null);
+        onIdentity?.({ kind: "dropped", agentId });
+        return;
+      }
+      const card = from === "suggestion" ? suggestionCardOf(outcome) : from;
       const next = cardOutcomeView({ card, agentId, outcome, environment });
       if (next.auto && next.pick) {
-        remember(next.pick);
+        pick(next.pick);
         return;
       }
       setChecked({ card, agentId, outcome });
@@ -241,6 +315,7 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
       });
       if (outcome.kind === "registered") {
         remember({ ownerChoice: "this-wallet", agentId: outcome.agentId });
+        onIdentity?.({ kind: "registered", agentId: outcome.agentId });
         return;
       }
       setRegistration({ stage: outcome.kind, hash });
@@ -289,6 +364,19 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
         </Callout>
       ) : (
         <div className="flex flex-col gap-4">
+          {suggested !== null && (
+            <>
+              <SuggestionCard
+                agentId={suggested}
+                chosen={choice === "suggestion"}
+                busy={busy}
+                onContinue={() => void onContinueSuggested(suggested)}
+              >
+                {result}
+              </SuggestionCard>
+              <SectionTitle className="mt-4">{I.orChooseAnother}</SectionTitle>
+            </>
+          )}
           <ChoiceCard
             title={I.ownCard}
             body={I.ownBody}
@@ -383,12 +471,45 @@ export function IdentityStep({ kit }: { kit: LegalBodyStepKit }) {
 
       {view?.pick && (
         <StepNav>
-          <Button onClick={() => view.pick && remember(view.pick)}>
+          <Button onClick={() => view.pick && pick(view.pick)}>
             {view.pick.ownerChoice === "this-wallet" ? I.continueHere : I.continueElsewhere}
           </Button>
         </StepNav>
       )}
     </div>
+  );
+}
+
+/** The identity already chosen on this visit, offered first: its id, and "Continue with" it. */
+function SuggestionCard({
+  agentId,
+  chosen,
+  busy,
+  onContinue,
+  children,
+}: {
+  agentId: string;
+  chosen: boolean;
+  busy: Busy;
+  onContinue: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <Card className={chosen ? "p-6 ring-1 ring-accent/40" : "p-6"}>
+      <div className="text-[14px] font-medium text-ink">{I.yourIdentity}</div>
+      <div className="mt-2 break-all font-mono text-[15px] text-ink">{agentId}</div>
+      <p className="mt-1 text-[12.5px] leading-[1.6] text-muted">{I.suggestionBody}</p>
+      <div className="mt-5">
+        <Button
+          onClick={onContinue}
+          loading={chosen && busy === "reading"}
+          disabled={busy !== null}
+        >
+          {fillCopy(I.continueWith, { agentId })}
+        </Button>
+      </div>
+      {chosen && children}
+    </Card>
   );
 }
 
