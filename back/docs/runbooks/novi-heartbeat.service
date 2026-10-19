@@ -1,0 +1,34 @@
+# Novi box heartbeat: a dead-man's switch for the box. Run by novi-heartbeat.timer.
+#
+# INSTALL: see docs/runbooks/controller-monitoring.md, "Dead-man's switch". In short: install the
+# script as /usr/local/bin/novi-heartbeat, this file and novi-heartbeat.timer in
+# /etc/systemd/system/, write /etc/novi/heartbeat.env, then
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now novi-heartbeat.timer
+#
+# Its settings live in their own file on purpose: the heartbeat must not read the backend's .env,
+# which holds keys. systemd reads EnvironmentFile itself before switching to User=, so the file can
+# stay root-only (0600) and the API and monitor, which also run as novi, never see the ping URL. It reads monitor.db read-only; DATA_DIR is not mounted read-only here because a
+# reader of a WAL database still needs its -shm file.
+
+[Unit]
+Description=Novi box heartbeat
+Documentation=https://github.com/jb1011/Project-Alpha/blob/main/back/docs/runbooks/controller-monitoring.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=novi
+Group=novi
+EnvironmentFile=/etc/novi/heartbeat.env
+# Keeps the monitor cursor seen by the previous run in /var/lib/novi-heartbeat.
+StateDirectory=novi-heartbeat
+ExecStart=/usr/local/bin/novi-heartbeat
+# The worst case with every network call timing out and retrying is about 2 minutes.
+TimeoutStartSec=180
+SyslogIdentifier=novi-heartbeat
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

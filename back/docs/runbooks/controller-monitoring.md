@@ -77,6 +77,20 @@ redacted from `redact()` and never logged. `chmod 600 .env`.
 
 Only `WARN` and `CRITICAL` are posted. `INFO` is recorded and logged only.
 
+After a restart, `journalctl -u legalbody-monitor -n 20 | grep monitor_start` shows
+`"webhook":"configured"`. Post one test message to the URL with `curl` and see it land.
+
+Two rules once the webhook is on:
+
+- **Deploy before you grant.** A role counts as standing only in a build that lists it. Grant a new
+  standing role on chain only after the monitor that knows it is running. Granted earlier, it is
+  treated as a ceremony grant and `controller_grant_ttl_exceeded` re-pages every TTL until that
+  build ships.
+- **Ceremony days page.** Planned CRITICALs (wallet binds, role grants, pins) still post. Say so in
+  the channel before you start. After a burst, read the `alerts` table in `monitor.db`, not the
+  channel: a post the chat service rate-limits is logged as `webhook_rejected` and not retried,
+  while the alert itself stays in the database.
+
 ### Config
 
 | Var | Default | Notes |
@@ -263,9 +277,9 @@ match never downgrades below WARN, and a missing record never silences the alert
 
 ### Ending an anchor HOLD — `anchor-ack`
 
-Two cycle states park an entity's whole anchor pipeline until a human acts, and both page as
-`anchor_held` (WARN, **once per entity per day** — the condition does not change on its own, so it
-is not repeated every tick):
+Two cycle states park an entity's whole anchor pipeline until a human acts, and both are logged as
+`anchor_held` in the API's journal (WARN, **once per entity per day**: the condition does not
+change on its own, so it is not repeated every tick). They do not reach the alert webhook:
 
 | `oa_anchors.state` | What happened | Ends by |
 |---|---|---|
@@ -345,13 +359,20 @@ sqlite3 data/monitor.db "SELECT last_scanned_block FROM cursor;"
   which grants were open.
 - **`getLogs` block-range caps differ per endpoint.** The token'd RPC the box once used accepted
   100,000. Arc's public RPC rejected 90,000 and 50,000 but served 5,000 (measured 2026-08-18 at its
-  old address `rpc.testnet.arc.network`); at its current address `rpc.testnet.arc.io` it rejects
-  10,000 and serves 5,000 (measured 2026-10-19). It also refuses a query that lists more than 20
-  addresses, with the same `requested range too large` error. The monitor starts at 90,000 and **halves on every `requested range too large`**
-  down to a 1,000-block floor, logging `monitor_range_reduced`. It needs one tick per halving, so
-  after a switch to a stricter endpoint expect a few minutes of `monitor_range_reduced` before
-  `monitor_scanned` resumes — that is the monitor tuning itself, not an outage. The cursor advances
-  per chunk, so a failed chunk is simply re-read.
+  old address `rpc.testnet.arc.network`). At its current address `rpc.testnet.arc.io`, Arc's docs
+  put the cap at 10,000 blocks per query: a 10,001-block window is refused and a 10,000-block one
+  served (measured
+  2026-10-19). It also refuses a query that lists more than 20 addresses, with the same
+  `requested range too large` error. The monitor starts at 90,000 and **halves on every
+  `requested range too large`** down to a 1,000-block floor, logging `monitor_range_reduced`. It
+  needs one tick per halving, so after a switch to a stricter endpoint expect a few minutes of
+  `monitor_range_reduced` before `monitor_scanned` resumes: that is the monitor tuning itself, not
+  an outage. The cursor advances per chunk, so a failed chunk is simply re-read.
+- **The public RPC rate-limits.** viem reports it as `Request exceeds defined limit` with the
+  detail `rate limit exceeded`. After any downtime the catch-up hits it: expect a burst of
+  `monitor_scan_failed` while the cursor keeps advancing, then `monitor_scanned` once a tick reaches
+  the head (on 2026-10-19, 31 failures over about 20 minutes for three days of blocks). The
+  heartbeat measures cursor progress, so a burst like that does not alert.
 - `monitor_range_floor_reached` means shrinking did not help: the endpoint is refusing even a
   1,000-block window. Check the RPC, do not wait it out.
 - **What is NOT tracked for TTL:** `DEFAULT_ADMIN_ROLE` (permanent by design — never renounce) and
@@ -359,12 +380,99 @@ sqlite3 data/monitor.db "SELECT last_scanned_block FROM cursor;"
   `bootVerify` asserts at every API boot). Anything else is treated as a ceremony grant.
 - **Silence is not proof.** If `monitor_scanned` stops appearing, the watcher is not watching:
   `systemctl status legalbody-monitor`. Persistent `monitor_scan_failed` /
-  `monitor_head_read_failed` lines mean the RPC is the problem, not the chain.
+  `monitor_head_read_failed` lines mean the RPC is the problem, not the chain. The heartbeat below
+  turns a frozen cursor into an alert.
+
+## Dead-man's switch
+
+The monitor cannot report its own death, nor the box's. Two checks from outside cover that.
+
+**1. The heartbeat.** `novi-heartbeat.sh`, run every 2 minutes by `novi-heartbeat.timer` as the
+`novi` user. When every check passes it pings a Healthchecks.io check. When one fails it writes the
+reasons to that check's event log (`/log`, which does not change the check's state) and skips the
+ping. The check is set to a period of 5 minutes and a grace of 5 minutes, so it goes down, and
+alerts, about 10 minutes after the last good run. A failure that clears inside that window never
+alerts.
+
+| Check | Fails when |
+|---|---|
+| `/transparency` over the public hostname | the API does not answer, DNS or TLS is broken, or it reports `"legalBodiesAvailable":false` (it cannot read the chain) |
+| Monitor progress | `last_scanned_block` in `monitor.db` has not moved since the previous run. It moves on every tick that reads a window, rate-limited catch-up included, and freezes when the chain head cannot be read. |
+| Units | `legalbody-api`, `legalbody-monitor` or `litestream` is not active |
+| Disk | the filesystem holding `DATA_DIR` is 90% full or more |
+| Certificate | the public certificate expires within 7 days |
+| Gas (optional) | a chosen address holds less native USDC than a floor |
+
+With no linked legal body, `/transparency` reports `true` without reading the chain; the monitor
+progress check still covers a dead RPC.
+
+**Reading a down alert.** Open the check in Healthchecks: the latest `log` events carry the
+reasons, one per line. Then go to the matching place: `systemctl status <unit>`, the RPC
+(`journalctl -u legalbody-monitor -n 50`), `df -h`. No recent `log` event at all means the script
+did not run or could not reach Healthchecks: the box, its network or the timer itself is down
+(`systemctl list-timers novi-heartbeat.timer`). The check comes back up, with a notice, on the
+first good run after the fix.
+
+**Tuning.** If rate-limit bursts after downtime ever last longer than 10 minutes, raise the grace,
+not the period. Before a planned stop longer than 10 minutes (an upgrade, a restore), pause the
+check in Healthchecks, and resume it after.
+
+**Create the check, once, in Healthchecks:** Simple schedule, period 5 minutes, grace 5 minutes.
+Add the chat and the email integrations with both the down and the up notifications on. Copy the
+check's ping URL. The defaults (a period of one day) would keep the switch silent for a day.
+
+**Install, once, on the box:**
+
+```bash
+sudo install -m 0755 <REPO_DIR>/back/docs/runbooks/novi-heartbeat.sh /usr/local/bin/novi-heartbeat
+sudo install -m 0644 <REPO_DIR>/back/docs/runbooks/novi-heartbeat.service \
+  <REPO_DIR>/back/docs/runbooks/novi-heartbeat.timer /etc/systemd/system/
+sudo install -d -m 0750 -o root -g root /etc/novi
+sudo install -m 0600 -o root -g root /dev/null /etc/novi/heartbeat.env
+sudoedit /etc/novi/heartbeat.env      # the settings below
+sudo systemctl daemon-reload
+sudo systemctl enable --now novi-heartbeat.timer
+sleep 5; journalctl -u novi-heartbeat -n 20
+```
+
+Enabling the timer runs the service at once. Expect no `heartbeat:` line in the journal; any line
+there names a real problem to fix first. To run it by hand later, `sudo systemctl start
+novi-heartbeat.service`, but not within 30 seconds of the previous run: the monitor polls every
+30 seconds, so a second run that soon reports the cursor stuck (and logs it, without alerting).
+
+Settings (`/etc/novi/heartbeat.env`, root only: systemd reads it before switching to `novi`, so
+the API and the monitor, which also run as `novi`, never see the ping URL):
+
+```bash
+HC_PING_URL=https://hc-ping.com/<check-uuid>   # secret: whoever holds it can keep the check green
+DATA_DIR=<REPO_DIR>/back/backend/data
+# Optional, all three or none:
+# GAS_ADDRESS=<an address that pays gas>
+# GAS_FLOOR_USDC=1
+# ARC_RPC_URL=https://rpc.testnet.arc.io
+```
+
+The heartbeat has its own settings file on purpose: it must not read the backend's `.env`, which
+holds keys. After an update of the script, run the `install` line for it again.
+
+**Acceptance test** (after install, and before any event where an outage would matter):
+`sudo systemctl stop legalbody-monitor`, wait about 12 minutes, see the alert arrive with the
+reasons in the event log, `sudo systemctl start legalbody-monitor`, see the recovery notice within
+a few minutes. Repeat once with `legalbody-api` at a quiet hour: it is a public outage of about
+12 minutes.
+
+**2. The outside keyword check.** A keyword monitor on `https://api.novicorpus.com/transparency`
+that alerts when `"legalBodiesAvailable":true` is missing, every 5 minutes. It watches the public
+path from outside the box, independently of the heartbeat script.
+
+Both send to the same chat channel as the webhook, with email as a second route, so a muted
+channel never hides an alert.
 
 ## Known gaps
 
-- No dead-man's switch: nothing pages when the MONITOR itself stops. Until one exists, treat the
-  absence of `monitor_scanned` as an alert and check the unit after any box restart.
+- The heartbeat checks that `litestream` is running, not that its replicas are fresh. Restore one
+  by hand (`sudo litestream restore -o /tmp/check.db <DATA_DIR>/legalbody.db`, then delete the
+  copy) before an event where data loss would matter.
 - No alerting on `AgentTreasury` `Paused`/`OperatorRotated`/`EmergencyWithdrawn`, or on
   `LegalManager` **dissolution** events (`DissolutionInitiated`, `DissolutionVetoed`, `Dissolved`,
   `AssetsSwept`, `NativeSwept`). The operating-agreement AMENDMENT gap named here is closed as of
