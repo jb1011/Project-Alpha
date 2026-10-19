@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Chain ID | `5042002` |
-| Explorer | [testnet.arcscan.app](https://testnet.arcscan.app) |
+| Explorer | [explorer.testnet.arc.io](https://explorer.testnet.arc.io) |
 | Native gas | USDC (6 decimals) at `0x3600000000000000000000000000000000000000` |
 | EURC | `0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a` |
 | Faucet | [faucet.circle.com](https://faucet.circle.com) |
@@ -16,9 +16,9 @@ Beacon owner and deployer started as a testnet key. Move beacon and factory owne
 
 | Contract | Address |
 | --- | --- |
-| `LegalManagerFactory` | [`0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902`](https://testnet.arcscan.app/address/0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902) |
-| `LegalManager` implementation | [`0xc2e89ABf562f2EB366e4dde42325af16EeF542a6`](https://testnet.arcscan.app/address/0xc2e89ABf562f2EB366e4dde42325af16EeF542a6) |
-| Upgrade beacon | [`0xCbE36eC37673805a185a6883f9597613ABB41c97`](https://testnet.arcscan.app/address/0xCbE36eC37673805a185a6883f9597613ABB41c97) |
+| `LegalManagerFactory` | [`0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902`](https://explorer.testnet.arc.io/address/0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902) |
+| `LegalManager` implementation | [`0xc2e89ABf562f2EB366e4dde42325af16EeF542a6`](https://explorer.testnet.arc.io/address/0xc2e89ABf562f2EB366e4dde42325af16EeF542a6) |
+| Upgrade beacon | [`0xCbE36eC37673805a185a6883f9597613ABB41c97`](https://explorer.testnet.arc.io/address/0xCbE36eC37673805a185a6883f9597613ABB41c97) |
 
 Machine readable copy: `back/addresses.arc-testnet.json`.
 

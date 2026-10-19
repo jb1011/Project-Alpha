@@ -109,7 +109,7 @@ const REP_ABI = [
 ] as const;
 
 async function fetchAbi(address: string) {
-  const url = `https://testnet.arcscan.app/api?module=contract&action=getabi&address=${address}`;
+  const url = `https://explorer.testnet.arc.io/api?module=contract&action=getabi&address=${address}`;
   const res = await fetch(url);
   const data = (await res.json()) as { message: string; result: string; status: string };
   if (data.status !== "1") {
@@ -122,7 +122,7 @@ async function fetchAbi(address: string) {
 async function fetchSource(
   address: string,
 ): Promise<{ ContractName: string; IsProxy: string; SourceCode: string } | undefined> {
-  const url = `https://testnet.arcscan.app/api?module=contract&action=getsourcecode&address=${address}`;
+  const url = `https://explorer.testnet.arc.io/api?module=contract&action=getsourcecode&address=${address}`;
   const res = await fetch(url);
   const data = (await res.json()) as { result: Array<Record<string, unknown>> };
   return data.result[0] as

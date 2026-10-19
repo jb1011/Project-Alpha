@@ -32,7 +32,7 @@ import type { Address, Hex } from "../src/types";
 const require_ = createRequire(import.meta.url);
 const dcw = require_("@circle-fin/developer-controlled-wallets");
 
-const RPC = process.env.ARC_TESTNET_RPC_URL ?? "https://rpc.testnet.arc.network";
+const RPC = process.env.ARC_TESTNET_RPC_URL ?? "https://rpc.testnet.arc.io";
 const CHAIN_ID = Number(process.env.ARC_CHAIN_ID ?? 5042002);
 const USDC = (process.env.USDC_ADDRESS ?? arcBatchingConfig.asset) as Address;
 const GATEWAY = arcBatchingConfig.verifyingContract;

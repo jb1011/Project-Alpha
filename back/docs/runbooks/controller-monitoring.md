@@ -343,9 +343,11 @@ sqlite3 data/monitor.db "SELECT last_scanned_block FROM cursor;"
 - **Deleting `monitor.db` is a cold start**, not a disaster: the monitor resumes from
   `latest - MONITOR_LOOKBACK_BLOCKS`. It will re-alert on anything in that window, and it forgets
   which grants were open.
-- **`getLogs` block-range caps differ per endpoint.** The box's token'd RPC accepts 100,000; the
-  public `rpc.testnet.arc.network` rejects 90,000 and 50,000 but serves 5,000 (measured
-  2026-08-18). The monitor starts at 90,000 and **halves on every `requested range too large`**
+- **`getLogs` block-range caps differ per endpoint.** The token'd RPC the box once used accepted
+  100,000. Arc's public RPC rejected 90,000 and 50,000 but served 5,000 (measured 2026-08-18 at its
+  old address `rpc.testnet.arc.network`); at its current address `rpc.testnet.arc.io` it rejects
+  10,000 and serves 5,000 (measured 2026-10-19). It also refuses a query that lists more than 20
+  addresses, with the same `requested range too large` error. The monitor starts at 90,000 and **halves on every `requested range too large`**
   down to a 1,000-block floor, logging `monitor_range_reduced`. It needs one tick per halving, so
   after a switch to a stricter endpoint expect a few minutes of `monitor_range_reduced` before
   `monitor_scanned` resumes — that is the monitor tuning itself, not an outage. The cursor advances

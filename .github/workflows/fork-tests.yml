@@ -61,7 +61,7 @@ jobs:
           # the public endpoint already in .env.example — plain env, not a secret; the
           # tests self-skip anywhere it is absent.
           FOUNDRY_EVM_VERSION: shanghai
-          ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.network
+          ARC_TESTNET_RPC_URL: https://rpc.testnet.arc.io
           # Tripwire: fail this step instead of silently skipping if the env above is ever dropped
           # (a missing RPC URL, or an EVM version without PUSH0). The suites read it with Foundry's
           # `vm.envOr("FORK_TESTS_REQUIRED", false)`, which parses a Solidity bool — so the value
