@@ -18,7 +18,7 @@ import { iIdentityRegistryAbi } from "../src/abis/generated";
 
 const NAME = process.env.NAME ?? "novicorpus.eth";
 const SEPOLIA = process.env.SEPOLIA_RPC_URL ?? "https://ethereum-sepolia-rpc.publicnode.com";
-const ARC_RPC = process.env.ARC_TESTNET_RPC_URL ?? "https://rpc.testnet.arc.network";
+const ARC_RPC = process.env.ARC_TESTNET_RPC_URL ?? "https://rpc.testnet.arc.io";
 const REGISTRY = (process.env.IDENTITY_REGISTRY ??
   "0x8004A818BFB912233c491871b3d84c89A494BD9e") as Address;
 const CHAIN_ID = Number(process.env.ARC_CHAIN_ID ?? 5042002);

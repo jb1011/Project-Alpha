@@ -9,7 +9,7 @@ import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
 import type { EntityRecord } from "../../src/types";
 
 const PROD_TRANSPARENCY_URL = "https://www.novicorpus.com/backend/transparency";
-const ARC_TESTNET_RPC_URL = "https://rpc.testnet.arc.network";
+const ARC_TESTNET_RPC_URL = "https://rpc.testnet.arc.io";
 
 /** The one shape buildSeedRecord needs out of a `/transparency` row. */
 export interface TransparencyEntity {

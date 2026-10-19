@@ -83,9 +83,9 @@ not "no human / fully autonomous." (Bayern remains the origin/context, not the p
 
 | Contract | Address |
 |---|---|
-| `LegalManagerFactory` — entry point; `createEntity()` | [`0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902`](https://testnet.arcscan.app/address/0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902) |
-| `LegalManager` implementation (shared via beacon) | [`0xc2e89ABf562f2EB366e4dde42325af16EeF542a6`](https://testnet.arcscan.app/address/0xc2e89ABf562f2EB366e4dde42325af16EeF542a6) |
-| Upgrade beacon | [`0xCbE36eC37673805a185a6883f9597613ABB41c97`](https://testnet.arcscan.app/address/0xCbE36eC37673805a185a6883f9597613ABB41c97) |
+| `LegalManagerFactory` — entry point; `createEntity()` | [`0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902`](https://explorer.testnet.arc.io/address/0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902) |
+| `LegalManager` implementation (shared via beacon) | [`0xc2e89ABf562f2EB366e4dde42325af16EeF542a6`](https://explorer.testnet.arc.io/address/0xc2e89ABf562f2EB366e4dde42325af16EeF542a6) |
+| Upgrade beacon | [`0xCbE36eC37673805a185a6883f9597613ABB41c97`](https://explorer.testnet.arc.io/address/0xCbE36eC37673805a185a6883f9597613ABB41c97) |
 
 Per-agent `LegalManager` + `AgentTreasury` instances are created **at runtime** by `createEntity` — not
 deployed up front. The beacon owner is currently the deployer (a testnet key); move it to a
@@ -95,7 +95,7 @@ multisig/timelock before production.
 `0x8004A818BFB912233c491871b3d84c89A494BD9e`, ReputationRegistry `0x8004B663…`, ValidationRegistry
 `0x8004Cb1B…`, ERC-8183 Job `0x0747EEf0…`, USDC (6 dec, native gas) `0x3600…0000`, EURC `0x89B50855…`.
 Full machine-readable copy: [`addresses.arc-testnet.json`](./addresses.arc-testnet.json) · Explorer:
-[testnet.arcscan.app](https://testnet.arcscan.app)
+[explorer.testnet.arc.io](https://explorer.testnet.arc.io)
 
 ## Getting started
 

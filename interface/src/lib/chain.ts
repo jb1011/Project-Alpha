@@ -9,19 +9,19 @@ export const arcTestnet = defineChain({
   nativeCurrency: { name: "USDC", symbol: "USDC", decimals: 18 },
   rpcUrls: {
     default: {
-      http: [process.env.NEXT_PUBLIC_ARC_RPC_URL ?? "https://rpc.testnet.arc.network"],
+      http: [process.env.NEXT_PUBLIC_ARC_RPC_URL ?? "https://rpc.testnet.arc.io"],
     },
   },
   blockExplorers: {
     default: {
       name: "Arcscan",
-      url: process.env.NEXT_PUBLIC_ARC_EXPLORER ?? "https://testnet.arcscan.app",
+      url: process.env.NEXT_PUBLIC_ARC_EXPLORER ?? "https://explorer.testnet.arc.io",
     },
   },
 });
 
 export const arcExplorer =
-  process.env.NEXT_PUBLIC_ARC_EXPLORER ?? "https://testnet.arcscan.app";
+  process.env.NEXT_PUBLIC_ARC_EXPLORER ?? "https://explorer.testnet.arc.io";
 
 export function txUrl(hash: string): string {
   return `${arcExplorer}/tx/${hash}`;

@@ -81,9 +81,11 @@ export const SCHEDULED_EVENT = getAbiItem({ abi: legalManagerAbi, name: "Amendme
 /**
  * Descending block windows to try after a full-history scan is refused.
  *
- * Public Arc RPC (`rpc.testnet.arc.network`) measured: `fromBlock: 0` answers
+ * Public Arc RPC measured (then at `rpc.testnet.arc.network`): `fromBlock: 0` answers
  * `pruned history unavailable`, 100k and 200k answer `requested range too large`, 1M answers
- * `rate limit exceeded`, and 10k answers with the logs. A SINGLE 200k fallback — which is what
+ * `rate limit exceeded`, and 10k answers with the logs. At its current address
+ * `rpc.testnet.arc.io` (measured 2026-10-19), 10k is refused as well and 5k answers, so the
+ * ladder's last step is the one that answers there. A SINGLE 200k fallback — which is what
  * this used to be — therefore failed on the exact RPC the app ships pointed at, and because that
  * one retry was unguarded its failure took the whole card down with it.
  *

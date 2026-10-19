@@ -15,7 +15,7 @@
  *   ENS_MANAGER_KEY | PLATFORM_PRIVATE_KEY   manager EOA private key (owns the agent NFTs)
  *   AGENT_ID                                  e.g. 845775
  *   ENS_NAME                                  e.g. <publicId>.novicorpus.eth
- *   ARC_TESTNET_RPC_URL   (default https://rpc.testnet.arc.network)
+ *   ARC_TESTNET_RPC_URL   (default https://rpc.testnet.arc.io)
  *   IDENTITY_REGISTRY     (default 0x8004A818BFB912233c491871b3d84c89A494BD9e)
  *
  *   cd back/backend && AGENT_ID=845775 ENS_NAME=abc.novicorpus.eth \
@@ -34,7 +34,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { iIdentityRegistryAbi } from "../src/abis/generated";
 
-const RPC = process.env.ARC_TESTNET_RPC_URL ?? "https://rpc.testnet.arc.network";
+const RPC = process.env.ARC_TESTNET_RPC_URL ?? "https://rpc.testnet.arc.io";
 const REGISTRY = (process.env.IDENTITY_REGISTRY ??
   "0x8004A818BFB912233c491871b3d84c89A494BD9e") as Address;
 const KEY = (process.env.ENS_MANAGER_KEY ?? process.env.PLATFORM_PRIVATE_KEY) as Hex | undefined;
