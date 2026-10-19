@@ -11,13 +11,13 @@
 #   HC_PING_URL     required. The check's ping URL. A secret: whoever holds it can keep the check
 #                   green. This script never prints it.
 #   DATA_DIR        required. The backend's data directory (monitor.db lives there).
-#   PUBLIC_API      default https://api.novicorpus.com
+#   PUBLIC_API      default https://api.novicorpus.com (an https:// URL)
 #   UNITS           default "legalbody-api legalbody-monitor litestream"
 #   DISK_MAX_PCT    default 90
 #   CERT_MIN_DAYS   default 7; 0 turns the certificate check off.
 #   GAS_ADDRESS, GAS_FLOOR_USDC, ARC_RPC_URL
 #                   optional, all three or none: fail when that address holds less native USDC
-#                   (Arc's gas) than the floor.
+#                   (Arc's gas) than the floor. A balance that cannot be read is only logged.
 #
 # It holds no keys, sends no transactions and opens monitor.db read-only.
 
@@ -55,9 +55,14 @@ if [[ "$cur" =~ ^[0-9]+$ ]]; then
   if [[ "$prev" =~ ^[0-9]+$ ]] && (( cur <= prev )); then
     fail "monitor cursor stuck at block $cur"
   fi
-  echo "$cur" > "$STATE_DIR/cursor" 2>/dev/null || fail "cannot save the monitor cursor in $STATE_DIR"
+  if ! echo "$cur" > "$STATE_DIR/cursor" 2>/dev/null; then
+    echo "heartbeat: cannot write $STATE_DIR/cursor" >&2
+    fail "cannot save the monitor cursor"
+  fi
 else
-  fail "monitor cursor unreadable: ${cur:0:160}"
+  # The detail (it can name local paths) goes to the journal only, not to the ping service.
+  echo "heartbeat: monitor cursor read failed: ${cur:0:200}" >&2
+  fail "monitor cursor unreadable"
 fi
 
 # (c) The services are running. One call per unit: `is-active` given several names succeeds when
@@ -99,7 +104,9 @@ if [[ -n "${GAS_ADDRESS:-}" ]]; then
         "$hex" "$GAS_FLOOR_USDC" 2>/dev/null)
       [[ "$low" == "0" ]] || fail "gas balance below $GAS_FLOOR_USDC USDC, or the floor is not a number"
     else
-      fail "gas balance unreadable"
+      # Not a reason: a dead or rate-limited RPC is already caught by checks (a) and (b), and this
+      # read shares the monitor's RPC, so failing here would only add pages during a catch-up.
+      echo "heartbeat: gas balance unreadable, check skipped this run" >&2
     fi
   fi
 fi

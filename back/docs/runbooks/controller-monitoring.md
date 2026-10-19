@@ -360,7 +360,8 @@ sqlite3 data/monitor.db "SELECT last_scanned_block FROM cursor;"
 - **`getLogs` block-range caps differ per endpoint.** The token'd RPC the box once used accepted
   100,000. Arc's public RPC rejected 90,000 and 50,000 but served 5,000 (measured 2026-08-18 at its
   old address `rpc.testnet.arc.network`). At its current address `rpc.testnet.arc.io`, Arc's docs
-  put the cap at 10,000 blocks per query, and a 10,001-block window is refused (measured
+  put the cap at 10,000 blocks per query: a 10,001-block window is refused and a 10,000-block one
+  served (measured
   2026-10-19). It also refuses a query that lists more than 20 addresses, with the same
   `requested range too large` error. The monitor starts at 90,000 and **halves on every
   `requested range too large`** down to a 1,000-block floor, logging `monitor_range_reduced`. It
@@ -407,8 +408,18 @@ progress check still covers a dead RPC.
 
 **Reading a down alert.** Open the check in Healthchecks: the latest `log` events carry the
 reasons, one per line. Then go to the matching place: `systemctl status <unit>`, the RPC
-(`journalctl -u legalbody-monitor -n 50`), `df -h`. The check comes back up, with a notice, on the
+(`journalctl -u legalbody-monitor -n 50`), `df -h`. No recent `log` event at all means the script
+did not run or could not reach Healthchecks: the box, its network or the timer itself is down
+(`systemctl list-timers novi-heartbeat.timer`). The check comes back up, with a notice, on the
 first good run after the fix.
+
+**Tuning.** If rate-limit bursts after downtime ever last longer than 10 minutes, raise the grace,
+not the period. Before a planned stop longer than 10 minutes (an upgrade, a restore), pause the
+check in Healthchecks, and resume it after.
+
+**Create the check, once, in Healthchecks:** Simple schedule, period 5 minutes, grace 5 minutes.
+Add the chat and the email integrations with both the down and the up notifications on. Copy the
+check's ping URL. The defaults (a period of one day) would keep the switch silent for a day.
 
 **Install, once, on the box:**
 
@@ -416,15 +427,21 @@ first good run after the fix.
 sudo install -m 0755 <REPO_DIR>/back/docs/runbooks/novi-heartbeat.sh /usr/local/bin/novi-heartbeat
 sudo install -m 0644 <REPO_DIR>/back/docs/runbooks/novi-heartbeat.service \
   <REPO_DIR>/back/docs/runbooks/novi-heartbeat.timer /etc/systemd/system/
-sudo install -d -m 0750 -o root -g novi /etc/novi
-sudo install -m 0640 -o root -g novi /dev/null /etc/novi/heartbeat.env
+sudo install -d -m 0750 -o root -g root /etc/novi
+sudo install -m 0600 -o root -g root /dev/null /etc/novi/heartbeat.env
 sudoedit /etc/novi/heartbeat.env      # the settings below
 sudo systemctl daemon-reload
 sudo systemctl enable --now novi-heartbeat.timer
-sudo systemctl start novi-heartbeat.service && journalctl -u novi-heartbeat -n 20
+sleep 5; journalctl -u novi-heartbeat -n 20
 ```
 
-Settings (`/etc/novi/heartbeat.env`, readable by `novi` only):
+Enabling the timer runs the service at once. Expect no `heartbeat:` line in the journal; any line
+there names a real problem to fix first. To run it by hand later, `sudo systemctl start
+novi-heartbeat.service`, but not within 30 seconds of the previous run: the monitor polls every
+30 seconds, so a second run that soon reports the cursor stuck (and logs it, without alerting).
+
+Settings (`/etc/novi/heartbeat.env`, root only: systemd reads it before switching to `novi`, so
+the API and the monitor, which also run as `novi`, never see the ping URL):
 
 ```bash
 HC_PING_URL=https://hc-ping.com/<check-uuid>   # secret: whoever holds it can keep the check green
@@ -440,7 +457,9 @@ holds keys. After an update of the script, run the `install` line for it again.
 
 **Acceptance test** (after install, and before any event where an outage would matter):
 `sudo systemctl stop legalbody-monitor`, wait about 12 minutes, see the alert arrive with the
-reasons in the event log, `sudo systemctl start legalbody-monitor`, see the recovery notice.
+reasons in the event log, `sudo systemctl start legalbody-monitor`, see the recovery notice within
+a few minutes. Repeat once with `legalbody-api` at a quiet hour: it is a public outage of about
+12 minutes.
 
 **2. The outside keyword check.** A keyword monitor on `https://api.novicorpus.com/transparency`
 that alerts when `"legalBodiesAvailable":true` is missing, every 5 minutes. It watches the public
@@ -452,8 +471,8 @@ channel never hides an alert.
 ## Known gaps
 
 - The heartbeat checks that `litestream` is running, not that its replicas are fresh. Restore one
-  by hand (`litestream restore -o /tmp/check.db <DATA_DIR>/legalbody.db`) before an event where data
-  loss would matter.
+  by hand (`sudo litestream restore -o /tmp/check.db <DATA_DIR>/legalbody.db`, then delete the
+  copy) before an event where data loss would matter.
 - No alerting on `AgentTreasury` `Paused`/`OperatorRotated`/`EmergencyWithdrawn`, or on
   `LegalManager` **dissolution** events (`DissolutionInitiated`, `DissolutionVetoed`, `Dissolved`,
   `AssetsSwept`, `NativeSwept`). The operating-agreement AMENDMENT gap named here is closed as of
