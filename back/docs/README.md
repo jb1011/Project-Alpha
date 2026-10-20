@@ -5,7 +5,7 @@ with the [root README](../../README.md) and [back/README.md](../README.md), then
 
 **Status:** *Guide* and *Reference* are meant to be read today. *Runbook* is a live operation,
 run by a person. *Done* is the design or plan of work that has shipped: it records why things are
-the way they are, and later changes may have moved past it. *Record* is the log of one run.
+the way they are, and later changes may have moved past it. *Record* is the log of one run or one probe.
 
 Some designs and plans are kept in the team's private repository, including everything written
 since mid-September 2026 (for example the bring-your-own legal body).
@@ -17,7 +17,7 @@ How to connect to, build on or integrate with Novi Corpus.
 | Document | Status | Last change | What it is |
 |---|---|---|---|
 | [BYOA_INTEGRATION.md](./BYOA_INTEGRATION.md) | Guide | 2026-09-24 | Bring your own agent: connect an existing agent over MCP or REST. |
-| [FRONTEND_INTEGRATION.md](./FRONTEND_INTEGRATION.md) | Guide | 2026-09-18 | How the web app talks to the backend. |
+| [FRONTEND_INTEGRATION.md](./FRONTEND_INTEGRATION.md) | Guide | 2026-09-18 | How the web app talks to the backend: sign-in, passkey, onboard and poll. Written 2026-06-22; the flow still holds, its section 6 is history. |
 | [integrations/agentkit-legal-body-check.md](./integrations/agentkit-legal-body-check.md) | Guide | 2026-10-09 | Asking AgentKit's "is there a human?" and Novi's "is there a legal body?" in one call. |
 
 ## Contracts and the legal body
@@ -49,8 +49,9 @@ The backend that runs onboarding, custody of the agents' wallets and company for
 | [plans/2026-06-21-grant-backend-roadmap.md](./plans/2026-06-21-grant-backend-roadmap.md) | Done | 2026-06-23 | The backend roadmap written for the Circle grant (tracks A, B, C). |
 | [design/2026-06-21-onboarding-wizard-api-design.md](./design/2026-06-21-onboarding-wizard-api-design.md) | Done | 2026-06-23 | The wizard's REST API (track A). |
 | [plans/2026-06-21-onboarding-wizard-api-implementation.md](./plans/2026-06-21-onboarding-wizard-api-implementation.md) | Done | 2026-06-23 | Plan for the wizard's REST API. |
-| [plans/2026-07-20-s2-float-ceiling.md](./plans/2026-07-20-s2-float-ceiling.md) | Done | 2026-07-29 | A ceiling on the platform's float per agent. |
 | [design/2026-08-01-v25-batch1.md](./design/2026-08-01-v25-batch1.md) | Done | 2026-08-01 | v2.5 batch 1: per-agent trust, the legal-bodies tier, server efficiency, guardian linkage. |
+| [design/2026-07-04-public-metadata-uri-design.md](./design/2026-07-04-public-metadata-uri-design.md) | Done | 2026-09-09 | A public HTTPS metadata URI for each agent. |
+| [plans/2026-07-04-public-metadata-uri.md](./plans/2026-07-04-public-metadata-uri.md) | Done | 2026-07-04 | Plan for the public metadata URI. |
 
 ## Payments
 
@@ -58,7 +59,7 @@ x402 payments, Circle Gateway, funding and the governed nanopayment agent.
 
 | Document | Status | Last change | What it is |
 |---|---|---|---|
-| [research/2026-06-16-x402-gateway-spike-findings.md](./research/2026-06-16-x402-gateway-spike-findings.md) | Done | 2026-06-23 | Spike findings: x402 and Circle Gateway on Arc testnet. |
+| [research/2026-06-16-x402-gateway-spike-findings.md](./research/2026-06-16-x402-gateway-spike-findings.md) | Record | 2026-06-23 | Spike findings: x402 and Circle Gateway on Arc testnet. |
 | [plans/2026-06-16-nanopayments-x402-agent-implementation.md](./plans/2026-06-16-nanopayments-x402-agent-implementation.md) | Done | 2026-06-23 | Plan for the governed nanopayment agent (phases 0 and 1). |
 | [plans/2026-06-18-nanopayments-x402-phase2-implementation.md](./plans/2026-06-18-nanopayments-x402-phase2-implementation.md) | Done | 2026-06-23 | Phase 2: spend, earn and governed funding. |
 | [plans/2026-06-18-nanopayments-x402-phase3-implementation.md](./plans/2026-06-18-nanopayments-x402-phase3-implementation.md) | Done | 2026-06-23 | Phase 3: the insight-agent loop. |
@@ -72,6 +73,7 @@ x402 payments, Circle Gateway, funding and the governed nanopayment agent.
 | [plans/2026-07-04-payment-funding-hardening.md](./plans/2026-07-04-payment-funding-hardening.md) | Done | 2026-07-04 | Plan for the payment and funding hardening. |
 | [design/2026-07-04-x402-demo-seller-leg3-design.md](./design/2026-07-04-x402-demo-seller-leg3-design.md) | Done | 2026-07-04 | An x402 demo seller as a smoke-test target. |
 | [plans/2026-07-04-x402-demo-seller-leg3.md](./plans/2026-07-04-x402-demo-seller-leg3.md) | Done | 2026-07-04 | Plan for the x402 demo seller. |
+| [plans/2026-07-20-s2-float-ceiling.md](./plans/2026-07-20-s2-float-ceiling.md) | Done | 2026-07-29 | The S2 interim fix: a ceiling on each agent's x402 standing float, and the legal-status gate on payments. |
 
 ## Agents: MCP, bring your own agent, jobs
 
@@ -79,7 +81,7 @@ The MCP server, connecting an agent the customer already runs, and ERC-8183 jobs
 
 | Document | Status | Last change | What it is |
 |---|---|---|---|
-| [research/2026-06-22-erc8183-reputation-findings.md](./research/2026-06-22-erc8183-reputation-findings.md) | Done | 2026-06-23 | Verified findings on Arc's ERC-8183 job contract and the ERC-8004 reputation registry. |
+| [research/2026-06-22-erc8183-reputation-findings.md](./research/2026-06-22-erc8183-reputation-findings.md) | Record | 2026-06-23 | Verified findings on Arc's ERC-8183 job contract and the ERC-8004 reputation registry. |
 | [design/2026-06-22-track-c-erc8183-proof-of-life-design.md](./design/2026-06-22-track-c-erc8183-proof-of-life-design.md) | Done | 2026-06-23 | An autonomous ERC-8183 job as proof of life (track C). |
 | [plans/2026-06-22-track-c-erc8183-proof-of-life-implementation.md](./plans/2026-06-22-track-c-erc8183-proof-of-life-implementation.md) | Done | 2026-06-23 | Plan for the ERC-8183 proof of life. |
 | [design/2026-06-27-mcp-server-design.md](./design/2026-06-27-mcp-server-design.md) | Done | 2026-06-28 | The MCP server (track B). |
@@ -101,8 +103,6 @@ The web app.
 |---|---|---|---|
 | [design/2026-07-04-interface-connections-reorg-design.md](./design/2026-07-04-interface-connections-reorg-design.md) | Done | 2026-07-05 | Reorganising connections and passkeys in the app. |
 | [plans/2026-07-04-interface-connections-reorg.md](./plans/2026-07-04-interface-connections-reorg.md) | Done | 2026-07-05 | Plan for that reorganisation. |
-| [design/2026-07-04-public-metadata-uri-design.md](./design/2026-07-04-public-metadata-uri-design.md) | Done | 2026-09-09 | A public HTTPS metadata URI for each agent. |
-| [plans/2026-07-04-public-metadata-uri.md](./plans/2026-07-04-public-metadata-uri.md) | Done | 2026-07-04 | Plan for the public metadata URI. |
 
 ## World and the legal-body check
 
@@ -125,7 +125,7 @@ A second payment rail on Hedera for the paid standing check (ETHOnline 2026).
 
 | Document | Status | Last change | What it is |
 |---|---|---|---|
-| [research/2026-09-09-hedera-signer-spike-findings.md](./research/2026-09-09-hedera-signer-spike-findings.md) | Done | 2026-09-09 | Signer spike: raw-digest signing, hollow accounts, the 1-of-2 leash. |
+| [research/2026-09-09-hedera-signer-spike-findings.md](./research/2026-09-09-hedera-signer-spike-findings.md) | Record | 2026-09-09 | Signer spike: raw-digest signing, hollow accounts, the 1-of-2 leash. |
 | [design/2026-09-10-hedera-rail-design.md](./design/2026-09-10-hedera-rail-design.md) | Done | 2026-09-11 | The Hedera rail: governed x402 payments, the paid standing check, portable identity. |
 | [plans/2026-09-10-hedera-rail.md](./plans/2026-09-10-hedera-rail.md) | Done | 2026-09-18 | Plan for the Hedera rail. |
 | [runbooks/hedera-demo.md](./runbooks/hedera-demo.md) | Runbook | 2026-09-12 | The five-leg Hedera demo on testnet. |
@@ -154,12 +154,13 @@ Background research behind the product.
 | Document | Status | Last change | What it is |
 |---|---|---|---|
 | [research/RESEARCH_FINDINGS.md](./research/RESEARCH_FINDINGS.md) | Reference | 2026-09-18 | Source-checked research on giving AI agents a legal body. Legal points are directional: check them with counsel. |
-| [research/STACK_REFERENCE.md](./research/STACK_REFERENCE.md) | Reference | 2026-06-23 | Circle and Arc engineering reference: endpoints, addresses, gotchas. |
+| [research/STACK_REFERENCE.md](./research/STACK_REFERENCE.md) | Reference | 2026-06-23 | Circle and Arc engineering reference, compiled 2026-05-29. The registry and job addresses still hold; the RPC and explorer hosts, the x402 packages and the "no mainnet" line are out of date, so read back/backend/src/chains.ts and config/env.ts first. |
 
 ## The legal model, in one line
 
 A fully human-less ("Bayern", zero-member) entity is not possible: a named natural person in
 control is required by the Wyoming DAO LLC statute, FinCEN's control test and Circle's terms. The
-model is an accountable person (the guardian, verified with World ID) plus a bounded agent, which
+model is an accountable person (the guardian, verified with World ID or, where World ID has no
+path, published as unverified) plus a bounded agent, which
 is what the contracts implement. Where an older doc leads with the zero-member idea, read it as
 the origin, not the product.
