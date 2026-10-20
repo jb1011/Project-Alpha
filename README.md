@@ -5,8 +5,8 @@
 Anyone can give an agent a wallet. Novi Corpus gives it a real company: a Wyoming LLC bound on chain
 to the agent's ERC-8004 identity, with a verified person who answers for it. The agent can act on
 its own for that company (accept terms, sign, invoice, get paid, hold its earnings) inside rules it
-cannot break, and anyone dealing with it can check, before they pay or sign, which company and which
-person stand behind it.
+cannot break, and anyone dealing with it can check, before they pay or sign, which company stands
+behind it and that a verified person answers for it.
 
 Novi Corpus runs on **Arc testnet** today. Real filings are not switched on yet.
 
@@ -32,9 +32,11 @@ Novi Corpus runs on **Arc testnet** today. Real filings are not switched on yet.
    with World ID stays accountable for the company and keeps the controls that matter.
 4. **Money under rules.** A USDC treasury whose cap, approved recipients and pause are enforced by
    the contract, and which stops spending if the legal body stops being in force.
-5. **A public, signed record.** The legal body's standing (`active`, `pending`, `unknown` or
-   `inactive`), its filing status and its next filing date, readable by agent number or wallet
-   address and signed by Novi Corpus, so anyone can check it before dealing with the agent.
+5. **A public record.** Anyone can look up an agent's wallet address and learn whether a Novi
+   legal body stands behind it and its standing, before dealing with the agent. For a
+   bring-your-own body the answer is a statement signed by Novi Corpus, by agent number or wallet
+   address: the standing (`active`, `pending`, `unknown` or `inactive`), the filing status and the
+   next filing date.
 
 The step that makes this more than paperwork is the **law to code translator**: plain
 operating-agreement terms ("at most $X per period, only to approved counterparties") become the
@@ -59,8 +61,9 @@ company is a test declaration with an automatic check.
 
 ## Built with World and ENS
 
-**World: who answers for this agent.** A Wyoming LLC must have a natural person in control; that
-is the law, not a product choice.
+**World: who answers for this agent.** A Wyoming DAO LLC must have a natural person in control (the
+statute, FinCEN's control test and Circle's terms require it); that is the law, not a product
+choice.
 - Becoming a guardian requires World ID at Orb grade or a government-document tier; device and
   selfie tiers are refused. We store one nullifier, which proves one unique human and identifies
   no one: one human, one account.
@@ -73,7 +76,8 @@ is the law, not a product choice.
 World proves someone is accountable; Novi Corpus is how you hold them to it.
 
 **ENS: the agent's public name.** Every full-product agent can be resolved as
-`<id>.novicorpus.eth` in ENS clients that support CCIP-Read, answered by a gateway that reads Arc:
+`<publicId>.novicorpus.eth` on Ethereum Sepolia, in ENS clients that support CCIP-Read, answered by
+a gateway that reads Arc:
 - `addr` is the agent's treasury, the address to pay;
 - `legal-status` reads the legal manager and the treasury on Arc: `Active` or `Suspended`;
 - an ENSIP-25 binding points the name at the agent's ERC-8004 registration, and the registration
