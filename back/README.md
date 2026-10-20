@@ -10,7 +10,7 @@ identity, with a verified person who answers for it. The agent acts on its own i
 cannot exceed; the person stays accountable and keeps the controls that matter (pause, veto,
 re-key, withdraw, dissolve).
 
-Everything here runs on **Arc testnet**. Real filings start with our mainnet launch.
+Everything here runs on **Arc testnet**. Real filings are not switched on yet.
 
 ## Two ways to get a legal body
 
@@ -21,15 +21,17 @@ an ERC-8004 identity, a `LegalManager` that anchors the operating agreement, and
 
 **2. A legal body on an identity you already own** ("bring your own"). The customer keeps their
 ERC-8004 identity and their own company; Novi Corpus creates a `LegalManager` clone bound to that
-identity, with no treasury. Created by `LegalBodyFactory`. On testnet the company is a test
-declaration with an automatic check; on production an operator checks it against the registry.
+identity, with no treasury. Created by `LegalBodyFactory`. On a sandbox deployment the company is
+a test declaration with an automatic check; on a production deployment an operator checks it
+against the registry.
 The browser flow is at `/legal-body` on the site.
 
 ## The contracts
 
 **`NoviController`**: the single governed root of platform authority. It is the immutable manager
-of every agent's `LegalManager` and `AgentTreasury`, the owner of the current factory, beacon and
-`LegalBodyFactory`, and the holder of each full-product agent's ERC-8004 identity. It is a
+of the `LegalManager` and `AgentTreasury` of every agent created through the current factory, the
+owner of that factory, its beacon and `LegalBodyFactory`, and the holder of each such agent's
+ERC-8004 identity. It is a
 selector-allowlisted relay: a cold admin manages roles, and the backend key may call only the
 selectors it was granted. Handing over the admin role takes 24 hours.
 
@@ -60,7 +62,7 @@ dissolution or sweep. The owner links the body by writing `encodePointer(body)` 
 `address(0)`. Deploy with `script/DeployLegalBodyFactory.s.sol`, then pin and grant the selectors
 of `ControllerSelectors.minimalGrants()` on the controller.
 
-**Reused Arc infrastructure**: the live ERC-8004 identity, reputation and validation registries,
+**Reused Arc infrastructure**: Arc testnet's ERC-8004 identity, reputation and validation registries,
 the ERC-8183 job contract, and USDC.
 
 The step that turns terms into code is the **law to code translator** (`backend/src/policy`):
@@ -74,7 +76,7 @@ checked against primary sources, ruled that out: a named natural person in contr
 by the Wyoming DAO LLC statute (W.S. 17-31-114), by FinCEN's beneficial-ownership control test
 and by Circle's terms. So the model is **an accountable person plus a bounded agent**, which is
 what the contracts implement: the person is the on-chain guardian, the agent is the operator
-inside its limits. The guardian is verified with World ID. The company is liable for what the
+inside its limits. The guardian is verified with World ID. The company answers for what the
 agent does on its behalf; the person stays accountable for the company.
 
 ## What runs today (Arc testnet)
@@ -86,8 +88,7 @@ agent does on its behalf; the person stays accountable for the company.
   with World ID; where World ID has no path, a waiver is possible and is published as unverified.
   The bring-your-own flow accepts no waiver.
 - **Company formation**: wired to [doola's Company Formation API](https://www.doola.com/business-solutions/company-formation-api/)
-  against doola's sandbox. Production filings and payment are not switched on yet; they come with
-  our mainnet launch.
+  against doola's sandbox. Production filings and payment are not switched on yet.
 - **Bring your own legal body**: the declared-company check, the signed link, the on-chain body
   and the identity pointer, end to end in the browser.
 - **The public record**: a lookup by wallet address or agent number, a signed statement of a
@@ -95,7 +96,8 @@ agent does on its behalf; the person stays accountable for the company.
   a paid standing check, paid with x402 and settled on Hedera.
 - **Agent surfaces**: a REST API for the wizard and an MCP server for agents, over the same
   backend, plus ERC-8183 jobs and x402 payments in testnet USDC.
-- **A monitor** that watches the controller's roles and the agents' contracts on chain.
+- **A monitor** that watches the controller's roles and relays, the beacon, the identity registry
+  and the agents' contracts on chain.
 
 ## Deployed addresses: Arc testnet (chain ID 5042002)
 
@@ -118,8 +120,9 @@ listed here.
 [`0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902`](https://explorer.testnet.arc.io/address/0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902)
 and its beacon
 [`0xCbE36eC37673805a185a6883f9597613ABB41c97`](https://explorer.testnet.arc.io/address/0xCbE36eC37673805a185a6883f9597613ABB41c97).
-They create no new agents; the beacon still serves the agents created before the controller
-(2026-08-17), with the same `LegalManager` implementation.
+They create no new agents. The beacon still serves the agents created before the controller
+(2026-08-17), with the same `LegalManager` implementation; those agents' manager and identity
+holder is the June key, not the controller.
 
 **Reused:** ERC-8004 IdentityRegistry `0x8004A818BFB912233c491871b3d84c89A494BD9e`,
 ReputationRegistry `0x8004B663…`, ValidationRegistry `0x8004Cb1B…`, ERC-8183 Job `0x0747EEf0…`,
@@ -133,7 +136,8 @@ RPC: `https://rpc.testnet.arc.io`.
 ```
 .                       Foundry project (Solidity) at the root
   src/                  LegalManager, AgentTreasury, LegalManagerFactory, NoviController,
-                        LegalBodyFactory, BreakGlassOneShot, ens/ (offchain resolver), interfaces
+                        LegalBodyFactory, BreakGlassOneShot, ens/ (offchain resolver), interfaces,
+                        libraries (ControllerSelectors)
   test/                 Foundry tests (unit, fuzz, invariant, fork, security)
   script/               deploy scripts (Deploy, DeployController, DeployLegalBodyFactory)
   addresses.arc-testnet.json   deployed addresses (machine-readable)
@@ -163,8 +167,9 @@ forge install OpenZeppelin/openzeppelin-contracts-upgradeable@v5.1.0 --no-git
 forge build && forge test
 ```
 
-> Arc requires `evm_version = "paris"` (no PUSH0), and the contracts compile with `via_ir`. Both
-> are set in `foundry.toml`: do not change them.
+> The contracts are compiled with `evm_version = "paris"` (no PUSH0, Arc's deploy guidance when
+> they were first deployed) and with `via_ir`. Both are set in `foundry.toml`: keep them, the
+> deployed bytecode was built that way.
 
 ### Backend (TypeScript, Node 20.18.2 or later)
 
