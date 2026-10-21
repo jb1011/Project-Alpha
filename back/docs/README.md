@@ -16,6 +16,7 @@ How to connect to, build on or integrate with Novi Corpus.
 
 | Document | Status | Last change | What it is |
 |---|---|---|---|
+| [AUDIT_CONTEXT.md](./AUDIT_CONTEXT.md) | Guide | 2026-10-21 | For security reviewers: scope, build and test, privileged roles, intended behaviours that may look risky, dependencies, prior reviews. |
 | [BYOA_INTEGRATION.md](./BYOA_INTEGRATION.md) | Guide | 2026-10-21 | Bring your own agent: connect an existing agent over MCP or REST, the capability ladder, and every MCP tool. |
 | [FRONTEND_INTEGRATION.md](./FRONTEND_INTEGRATION.md) | Guide | 2026-10-21 | How the web app talks to the backend for onboarding: sign-in, World ID, passkey, company, onboard, poll, fund. |
 | [integrations/agentkit-legal-body-check.md](./integrations/agentkit-legal-body-check.md) | Guide | 2026-10-09 | Asking AgentKit's "is there a human?" and Novi's "is there a legal body?" in one call. |

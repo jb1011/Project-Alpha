@@ -186,5 +186,6 @@ The integration tests need `anvil` (Foundry) on your PATH. CLI and live-run runb
 ## Documentation
 
 Start with **[docs/README.md](./docs/README.md)**, an index of the specs, designs, plans and
-research with the status of each. New engineers: read this README, then the docs index, then
+research with the status of each. Security reviewers: **[docs/AUDIT_CONTEXT.md](./docs/AUDIT_CONTEXT.md)**
+(scope, privileged roles, intended behaviours, dependencies, prior reviews). New engineers: read this README, then the docs index, then
 [backend/README.md](./backend/README.md).
