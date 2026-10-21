@@ -114,7 +114,8 @@ between 2026-09-28 and 2026-10-01, including a live test on Arc testnet.
 - **Login by email one-time code**, `circle wallet login you@example.com [--testnet]`. A session
   lasts **28 days** and cannot be refreshed; testnet and mainnet have separate logins. While a
   session lasts, the machine signs with no human step.
-- **Smart accounts** (Circle's single-owner modular account): signatures verify through ERC-1271,
+- **Smart accounts** (Circle's single-owner modular account, its owner key held under Circle's
+  2-of-2 MPC): signatures verify through ERC-1271,
   and the account must be deployed on a chain before it can sign there. Gas is sponsored by Circle.
 - **Policies** (transfer limits, allow and block lists): mainnet only, and not readable by a third
   party.
@@ -151,8 +152,10 @@ then `200` and the resource.
 ## 6. Agent Marketplace (`agents.circle.com`)
 
 Discover and pay for paid APIs in USDC through x402, with no sign-up, card or API key. About 2,777
-listings at the end of September 2026, none for legal or KYB checks. Listing is through a form
-linked from Circle's blog, for mainnet services.
+listings at the end of September 2026 (our count on agents.circle.com), none for legal or KYB
+checks. Listing is by an intake form linked from Circle's "Get listed" docs page; the stated
+prerequisites are a 402-answering endpoint, a published OpenAPI spec and a payout wallet, and a
+self-serve flow is announced.
 
 ---
 
@@ -215,8 +218,8 @@ Arc also has chain-level Elliptic and TRM screening.
 | The agent's operating wallet | **Developer-controlled wallets** (or Turnkey) | Run by Novi Corpus within the treasury's on-chain rules |
 | A customer's own wallet | **Agent Wallets** | Only as the customer's wallet, never operated by Novi Corpus |
 | Spending rules | Our `AgentTreasury` on chain | Cap, allowlist, pause, enforced by the contract |
-| Paying and earning | **x402**, Gateway nanopayments | Agents pay per call; our paid standing check sells over x402 |
-| Discovery | **Agent Marketplace** | Mainnet listing for the paid standing check |
+| Paying and earning | **x402**, Gateway nanopayments | Agents pay per call; our paid standing check sells over x402 (settled on Hedera testnet today) |
+| Discovery | **Agent Marketplace** | Where the paid standing check would be listed once it sells on a chain the marketplace settles on; nothing listed today |
 | Gas | USDC on Arc; Gas Station for SCAs | |
 | Cross-chain USDC | CCTP V2, Gateway, App Kit | Funding from other chains |
 | Deploying contracts | **Foundry** | `paris` build setting kept for our contracts |

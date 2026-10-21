@@ -61,8 +61,8 @@ their wallet to prove who they are.
 
 ### Step 3: prove you are a person (World ID)
 
-A legal body needs a natural person in control, so onboarding checks the guardian with World ID
-(Orb grade or a government-document credential; device and selfie tiers are refused). The routes
+A legal body needs a natural person in control, so onboarding checks the guardian with World ID where
+`WORLD_REQUIRE_GUARDIAN` is on (Orb grade or a government-document credential; device and selfie tiers are refused). The routes
 are under `/world-id/` (`GET /world-id/context`, `POST /world-id/request`, `POST /world-id/verify`,
 `GET /world-id/status/:requestId`, `GET /world-id/me`); the interface's `GuardianStep` runs the
 sequence, so copy it rather than rebuilding it. `GET /world-id/me` tells you where the guardian
@@ -178,8 +178,10 @@ Authenticated routes answer errors in one shape:
 ```
 
 For form validation (HTTP 400, `code: "validation_error"`), `details` is a list of
-`{ path, message }`: map each `path` onto its form field. The public reads use a flat
-`{ "error": "rate_limited" | "unavailable" | "validation_error", "message": ... }` instead.
+`{ path, message }`: map each `path` onto its form field. The public legal-body lookup
+(`/legal-bodies/:address`) uses a flat
+`{ "error": "rate_limited" | "unavailable" | "validation_error", "message": ... }` instead;
+`/metadata/...` answers in the nested shape.
 
 ---
 
@@ -228,7 +230,8 @@ Reshape the WebAuthn browser result into exactly this before sending it to `/onb
 
 - The MCP server and the ERC-8183 jobs shipped; agents use them directly (see
   [BYOA_INTEGRATION.md](./BYOA_INTEGRATION.md)).
-- Onboarding now requires a World ID verified guardian, and the passkey challenge requires login.
+- Onboarding requires a World ID verified guardian where `WORLD_REQUIRE_GUARDIAN` is on, and the
+  passkey challenge requires login.
 - Company formation runs through doola (sandbox), and an agent is attached to a company.
 - The agent's operating wallet can be a Circle developer-controlled smart account or a Turnkey
   vault (`custody`).

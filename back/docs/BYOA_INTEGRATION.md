@@ -32,7 +32,7 @@ deployment offers.
 For letting an agent onboard *and* operate from a prompt, with one browser step:
 
 1. Sign in (SIWE) and register a **guardian passkey** (`GET /passkey/challenge`, WebAuthn,
-   `POST /passkey`, which returns a `passkeyId`). The passkey identifies you as the guardian; with
+   `POST /passkey`, which returns `{ id }`, the `passkeyId` used below). The passkey identifies you as the guardian; with
    the Turnkey custody option it is also the root of the agent's key vault.
 2. Request an agent-first bootstrap:
    `POST /bootstrap-connection { "passkeyId": "<id>", "capability": "provision" }` returns
@@ -93,7 +93,7 @@ Code is the flagship** (first class, demoed, tested end to end):
 - **Codex**, **OpenClaw**, **Gemini CLI**: the same `mcpServers` JSON entry in their config
 - **Windsurf**: `~/.codeium/windsurf/mcp_config.json`
 - **Cline**: `cline_mcp_settings.json`
-- **Hermes**: the same `mcpServers` JSON entry (standard format)
+- **Hermes**: the same `mcpServers` JSON entry (assumed standard, not verified)
 - **VS Code**: `.vscode/mcp.json`, which uses `servers` (not `mcpServers`) with an explicit `"type": "http"`
 - **Claude Desktop**: its config file speaks stdio, so reach the remote server through the
   `mcp-remote` bridge (`npx -y mcp-remote <mcpUrl> --header "Authorization: Bearer <apiKey>"`), or
@@ -117,8 +117,8 @@ never from a tool argument) and answers a uniform "not found" on any ownership o
 - `treasury_status(id)`: available balance, cap, paused state, allowlist status.
 - `get_job(jobKey)`, `list_jobs(id)`: job progress.
 - `resolve_agent(name)`: resolve and verify an agent by its ENS name.
-- `list_companies`, `get_company`, `get_company_payment`: your companies and their formation
-  payment (where formation is on).
+- `list_companies`, `get_company`: your companies. `get_company_payment`: a company's formation
+  payment (where formation payments are configured).
 
 **Earn** (`earn` and up):
 - `run_job(id, budgetUsdc?)`: the agent earns USDC and reputation by running an ERC-8183 job
@@ -147,10 +147,10 @@ never from a tool argument) and answers a uniform "not found" on any ownership o
   Novi Corpus, gasless) or `turnkey` (a key vault rooted in your guardian passkey); omitted, the
   deployment's default applies. Where formation is on, `companyId` is required. Returns `pending`
   at once; poll `get_entity` until `bound`. Tenant-wide key only.
-- Formation (where it is on, tenant-wide key only): `create_formation_party`,
-  `update_company_party`, `create_company`, `submit_company_payment`, `requote_company_payment`,
-  `cancel_company_payment`. Formation runs through doola; never put personal data in an agent
-  spec.
+- Formation (tenant-wide key only): `create_formation_party`, `update_company_party`,
+  `create_company` (where formation is on); `submit_company_payment`, `requote_company_payment`,
+  `cancel_company_payment` (only where the deployment charges for formation). Formation runs
+  through doola; never put personal data in an agent spec.
 
 **Legal body on your own identity** (where it is on, tenant-wide key only):
 - `get_link_message(orderId, agentId, ttlSeconds?)` (read): the EIP-712 message the identity's
