@@ -16,8 +16,8 @@ How to connect to, build on or integrate with Novi Corpus.
 
 | Document | Status | Last change | What it is |
 |---|---|---|---|
-| [BYOA_INTEGRATION.md](./BYOA_INTEGRATION.md) | Guide | 2026-09-24 | Bring your own agent: connect an existing agent over MCP or REST. |
-| [FRONTEND_INTEGRATION.md](./FRONTEND_INTEGRATION.md) | Guide | 2026-09-18 | How the web app talks to the backend: sign-in, passkey, onboard and poll. Written 2026-06-22; the flow still holds, its section 6 is history. |
+| [BYOA_INTEGRATION.md](./BYOA_INTEGRATION.md) | Guide | 2026-10-21 | Bring your own agent: connect an existing agent over MCP or REST, the capability ladder, and every MCP tool. |
+| [FRONTEND_INTEGRATION.md](./FRONTEND_INTEGRATION.md) | Guide | 2026-10-21 | How the web app talks to the backend for onboarding: sign-in, World ID, passkey, company, onboard, poll, fund. |
 | [integrations/agentkit-legal-body-check.md](./integrations/agentkit-legal-body-check.md) | Guide | 2026-10-09 | Asking AgentKit's "is there a human?" and Novi's "is there a legal body?" in one call. |
 
 ## Contracts and the legal body
@@ -154,7 +154,7 @@ Background research behind the product.
 | Document | Status | Last change | What it is |
 |---|---|---|---|
 | [research/RESEARCH_FINDINGS.md](./research/RESEARCH_FINDINGS.md) | Reference | 2026-09-18 | Source-checked research on giving AI agents a legal body. Legal points are directional: check them with counsel. |
-| [research/STACK_REFERENCE.md](./research/STACK_REFERENCE.md) | Reference | 2026-06-23 | Circle and Arc engineering reference, compiled 2026-05-29. The registry and job addresses still hold; the RPC and explorer hosts, the x402 packages and the "no mainnet" line are out of date, so read back/backend/src/chains.ts and config/env.ts first. |
+| [research/STACK_REFERENCE.md](./research/STACK_REFERENCE.md) | Reference | 2026-10-21 | Circle and Arc engineering reference: networks and addresses (testnet and mainnet), wallets, Agent Wallets, x402, gotchas. |
 
 ## The legal model, in one line
 
