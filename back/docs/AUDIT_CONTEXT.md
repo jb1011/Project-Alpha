@@ -22,7 +22,7 @@ yet. The code of every contract in scope is identical to what is deployed.
 | `src/LegalManager.sol` | One agent's legal body: the operating-agreement hash, timelocked amendments with a guardian veto, and dissolution. Used behind the beacon (full product) and as EIP-1167 clones (bring your own). | implementation `0xc2e89ABf562f2EB366e4dde42325af16EeF542a6` |
 | `src/AgentTreasury.sol` | One agent's USDC vault: a rolling cap, an optional allowlist, guardian safety powers, timelocked policy changes. Immutable, one per agent. | one per agent, e.g. `0x11FCfd8d6DeB1BC820f7123989fD05EdA245a973` |
 | `src/LegalBodyFactory.sol` | Creates a legal body for an identity the customer owns and keeps: an immutable clone of the `LegalManager`, with no treasury, authorised by the identity owner's EIP-712 signature. | `0x069f4ADEabcBEd3ffFe2cB6Aaf9e7a66E8731456` |
-| `src/BreakGlassOneShot.sol` | A single-use helper for one admin action through the controller (grant, act and revoke in one transaction). | one instance, used once on 2026-08-17 |
+| `src/BreakGlassOneShot.sol` | A single-use helper for one admin action through the controller (grant, act and revoke in one transaction). | one instance (`0x17dfFf8963E18a731f7Ec1c74e49f9d427057Dd1`), used once on 2026-08-18 to accept the factory's ownership |
 | `src/libraries/ControllerSelectors.sol` | The selectors the executor is granted, derived from the ABIs. | (library) |
 | `src/interfaces/*.sol` | The ERC-8004 identity registry and ERC-8183 interfaces we call or describe. | (interfaces) |
 
@@ -44,17 +44,19 @@ forge install OpenZeppelin/openzeppelin-contracts-upgradeable@v5.1.0 --no-git
 forge build && forge test
 ```
 
-CI pins Foundry v1.5.1. The suite has unit, fuzz, invariant (`*Invariant.t.sol`), security and
+The main CI job pins Foundry v1.5.1 (the nightly fork-test workflow does not). The suite has unit, fuzz, invariant (`*Invariant.t.sol`), security and
 fork tests; the fork tests run against the live Arc testnet registry
-(`forge test --match-contract Fork`, with `FOUNDRY_EVM_VERSION=shanghai` because the live registry
-uses PUSH0). `slither.config.json` is the static-analysis configuration used before.
+(`ARC_TESTNET_RPC_URL=https://rpc.testnet.arc.io FOUNDRY_EVM_VERSION=shanghai forge test --match-contract Fork`;
+shanghai because the live registry uses PUSH0; without the RPC variable the fork tests skip instead
+of failing). `slither.config.json` is the static-analysis configuration used before.
 
 ## 3. How the pieces fit
 
 - **Full product:** the backend asks `NoviController` to relay `LegalManagerFactory.createEntity`.
   The factory registers the identity, deploys a `LegalManager` beacon proxy and an `AgentTreasury`,
-  and transfers the identity NFT to the controller. The controller is the immutable `manager` of
-  both contracts. The agent's wallet (the treasury's `operator`) spends within the treasury's rules.
+  and transfers the identity NFT to the controller. The controller is the `manager` of
+  both: immutable on the treasury; set once at initialisation, with no setter, on the legal body,
+  which sits behind the beacon (item 16). The agent's wallet (the treasury's `operator`) spends within the treasury's rules.
 - **Bring your own:** the identity stays with its owner. The owner signs a `LegalBodyLink`; the
   backend asks the controller to relay `LegalBodyFactory.createLegalBody`, which clones the
   `LegalManager` with the factory as its `manager`. The owner then writes a pointer to the body in
@@ -65,13 +67,13 @@ uses PUSH0). `slither.config.json` is the static-analysis configuration used bef
 
 | Role | Held by (testnet) | Can | Limited by |
 |---|---|---|---|
-| Controller admin (`DEFAULT_ADMIN_ROLE`) | `0x48191Ac42649274C4b3cbeBd16a76B8178e6F6e0`, a single key on testnet; a hardware wallet is planned for mainnet | Grant and revoke any selector role or `WILDCARD_ROLE` (to anyone, including itself), set target pins, start an admin handover | OpenZeppelin `AccessControlDefaultAdminRules`: a handover takes 24 hours (`defaultAdminDelay`); the controller cannot hold a role itself |
+| Controller admin (`DEFAULT_ADMIN_ROLE`) | `0x48191Ac42649274C4b3cbeBd16a76B8178e6F6e0`, a single key on testnet; a hardware wallet is planned for mainnet | Grant and revoke any selector role or `WILDCARD_ROLE` (to anyone, including itself), set target pins, start an admin handover | OpenZeppelin `AccessControlDefaultAdminRules`: handing the admin role over takes 24 hours (`defaultAdminDelay`); grants, revocations and pins take effect at once, so the delay protects the handover, not against a compromised admin key; the controller cannot hold a role itself |
 | Executor | `0xb43CbdA374e3CD2a3d67827683F81462BaCF703b`, the backend's key | Relay exactly its granted selectors: `AgentTreasury.schedulePolicyUpdate`, `executePolicyUpdate`; `LegalManager.scheduleOperatingAgreementUpdate`, `executeOperatingAgreementUpdate`; `LegalManagerFactory.createEntity`; the registry's `setAgentWallet`, `setMetadata`; `LegalBodyFactory.createLegalBody`, `scheduleOperatingAgreementUpdate` | The selector list; `setAgentWallet`/`setMetadata` are pinned to the identity registry and the two `LegalBodyFactory` selectors to that factory; it holds no role to upgrade, dissolve, sweep, withdraw or transfer ownership; nobody holds `WILDCARD_ROLE` |
-| Owner of `LegalManagerFactory`, the beacon, `LegalBodyFactory` | `NoviController` | Factory: `createEntity`. Beacon: `upgradeTo` (every full-product `LegalManager` at once). `LegalBodyFactory`: `createLegalBody`, `scheduleOperatingAgreementUpdate` | Only through the relay; `upgradeTo` and ownership transfers are not granted to the executor, so they need an admin ceremony; renouncing ownership is disabled on both factories |
+| Owner of `LegalManagerFactory`, the beacon, `LegalBodyFactory` | `NoviController` | Factory: `createEntity`. Beacon: `upgradeTo` (every full-product `LegalManager` at once). `LegalBodyFactory`: `createLegalBody`, `scheduleOperatingAgreementUpdate`. The controller also holds every full-product identity NFT (it accepts any ERC-721); moving one needs a `transferFrom` or `approve` grant the executor does not hold | Only through the relay; `upgradeTo` and ownership transfers are not granted to the executor, so they need an admin ceremony; renouncing ownership is disabled on both factories; the beacon is plain `Ownable` (single-step transfer, renounce allowed, which would freeze the implementation for good) |
 | Manager of a full-product `LegalManager` and `AgentTreasury` | `NoviController` (immutable on the treasury) | Schedule and execute policy and operating-agreement changes; initiate, cancel, sweep and finalize a dissolution | Every change waits out the delay and the guardian can veto it; the executor has no grant for the dissolution functions |
 | Manager of a bring-your-own body | `LegalBodyFactory` | Schedule an amendment the body's guardian signed; execute the last scheduled one | The factory exposes no dissolution or sweep function, so the platform cannot dissolve or sweep a body |
-| Guardian | A person verified with World ID, an EOA, one per agent | Treasury: `pause`, `unpause`, `setOperator`, `setAllowlistEntry`, `emergencyWithdraw` (to the fixed `payoutAddress`), `vetoPolicyUpdate`, `liftVeto`. Legal body: veto (`cancelOperatingAgreementUpdate`) and `liftVeto`; initiate, cancel, sweep and finalize a dissolution; sign amendments of a bring-your-own body | Roles must differ (constructor checks); the guardian cannot spend |
-| Operator | The agent's wallet, run by the platform: a Circle smart account or a Turnkey EOA | `spend` and `fundOperator`, within the rolling cap and, if on, the allowlist | Stops when paused or when the `LegalManager` is not Active; the guardian can rotate it |
+| Guardian | A person verified with World ID, an EOA today, one per agent | Treasury: `pause`, `unpause`, `setOperator`, `setAllowlistEntry`, `emergencyWithdraw` (to the current `payoutAddress`, which the manager can change through a timelocked, vetoable policy update, item 6), `vetoPolicyUpdate`, `liftVeto`. Legal body: veto (`cancelOperatingAgreementUpdate`) and `liftVeto`; initiate, cancel, sweep and finalize a dissolution; sign amendments of a bring-your-own body | Roles must differ (constructor checks); the guardian cannot spend; the guardian cannot be changed on either contract (immutable on the treasury, no setter on the legal body): there is no guardian recovery path, by design |
+| Operator | The agent's wallet, run by the platform: a Circle smart account or a Turnkey EOA | `spend`, within the rolling cap and, if on, the allowlist; `fundOperator` (to itself), within the same cap, allowlist not applied | Stops when paused or when the `LegalManager` is not Active; the guardian can rotate it |
 | Identity owner (bring your own) | The customer | Sign the `LegalBodyLink`; write and change the pointer in their own identity's metadata | A link names one identity, one guardian, one agreement hash and a deadline at most 24 hours ahead |
 
 ## 5. Intended behaviours that may look risky
@@ -104,7 +106,8 @@ uses PUSH0). `slither.config.json` is the static-analysis configuration used bef
    the body is finalized, and nothing moves until the window (the amendment delay) has passed; sweeping stays open after dissolution so late assets are never
    stranded and a lost key does not lock them. In the full product the executor holds no grant for
    these functions; in bring-your-own bodies the factory exposes none of them, so only the guardian
-   can dissolve.
+   can initiate, sweep and finalize, and a dissolution the guardian starts cannot be cancelled by
+   anyone.
 9. **A guardian veto is permanent for that hash or policy tuple** until the guardian lifts it, so a
    vetoed change cannot simply be scheduled again.
 10. **`LegalBodyFactory` is the manager of every body it creates, on purpose.** Its only power over a
@@ -162,11 +165,18 @@ comments are left as they are so the source keeps matching the deployed, verifie
 ## 7. Legacy generation (out of scope)
 
 The first factory (`0x91997dFcDE0046eA4AbE67a5De9E1DF54c9B6902`, June 2026) and its beacon
-(`0xCbE36eC37673805a185a6883f9597613ABB41c97`) predate the controller. They create no new agents;
-the beacon still serves the 35 test agents created before 2026-08-17, whose manager and identity
-holder is the June deployer key rather than the controller. Both beacons point at the same
-`LegalManager` implementation. The legacy factory's code is an earlier version of
-`LegalManagerFactory` (before the `manager == owner` rule); it is in git history, not in `src/`.
+(`0xCbE36eC37673805a185a6883f9597613ABB41c97`) predate the controller. The platform no longer
+creates agents with them, but they still govern the 35 test agents created before 2026-08-17:
+
+- the legacy factory's owner is the June key `0xb43CbdA374e3CD2a3d67827683F81462BaCF703b` (the
+  controller's executor today), and that key holds directly, with no selector limit, the manager
+  role of those agents' legal managers and treasuries, and their identity NFTs;
+- the legacy beacon is owned directly by the admin key `0x48191Ac42649274C4b3cbeBd16a76B8178e6F6e0`,
+  which can upgrade those 35 proxies without the relay.
+
+Both beacons point at the same `LegalManager` implementation. The legacy factory's code is the
+earlier version of `LegalManagerFactory` (before the `manager == owner` rule) in this repository's
+git history, not in `src/`.
 
 ## 8. Prior reviews
 
