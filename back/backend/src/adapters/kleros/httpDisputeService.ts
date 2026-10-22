@@ -418,8 +418,11 @@ export class HttpDisputeService implements KlerosDisputeService {
     try {
       return resultOf(text, id, label);
     } catch (e) {
-      if (!(e instanceof KlerosTransportError) || !CHAIN_WRITES.includes(label)) throw e;
-      throw this.#withServiceText(e, text);
+      if (!(e instanceof KlerosTransportError)) throw e;
+      // A JSON-RPC error's message is copied from the body, which an intermediary may have built
+      // from the request's headers: the message is scrubbed too, not only the appended body.
+      const clean = new KlerosTransportError(this.#scrub(e.message));
+      throw CHAIN_WRITES.includes(label) ? this.#withServiceText(clean, text) : clean;
     }
   }
 

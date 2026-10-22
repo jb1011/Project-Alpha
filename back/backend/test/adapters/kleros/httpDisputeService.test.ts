@@ -1499,6 +1499,24 @@ describe("the key", () => {
     }
   });
 
+  it.each([
+    ["a bare JSON 200", (m: object) => http(200, JSON.stringify(m))],
+    ["an SSE frame", (m: object) => sse(m)],
+  ])("is scrubbed from a JSON-RPC error message in %s, the retries unchanged", async (_n, as) => {
+    const answer = () =>
+      as({ jsonrpc: "2.0", id: 1, error: { code: -32000, message: `echo: Bearer ${KEY}` } });
+    const { svc, requests } = harness([answer(), ...times(3, answer)]);
+    const filed = await failure(svc.createDispute({ aliases: {} }));
+    expect(filed).toBeInstanceOf(KlerosTransportError);
+    expect(filed.message).toContain("JSON-RPC error -32000: echo: Bearer [key]");
+    expect(requests).toHaveLength(1);
+    const read = await failure(svc.getDispute({ chain: TESTNET, coreDisputeId: "186" }));
+    expect(read.message).toBe(
+      "Kleros dispute_get answered JSON-RPC error -32000: echo: Bearer [key]",
+    );
+    expect(requests).toHaveLength(4);
+  });
+
   // Every `failure()` in this file already checks its error at the point of catching; this test
   // provokes one error of each kind on both keys itself, so it holds when run alone.
   it("appears in no thrown error's message or own properties", async () => {
@@ -1510,10 +1528,13 @@ describe("the key", () => {
         errors.push(e);
       }
     };
-    for (const [deployment, apiKey, other] of [
-      ["testnet", KEY, ARBITRUM_ONE],
-      ["live", LIVE_KEY, TESTNET],
+    for (const [deployment, apiKey, own, other] of [
+      ["testnet", KEY, TESTNET, ARBITRUM_ONE],
+      ["live", LIVE_KEY, ARBITRUM_ONE, TESTNET],
     ] as const) {
+      const quoted = { code: -32000, message: `bad request: authorization: Bearer ${apiKey}` };
+      const bareError = () => http(200, JSON.stringify({ jsonrpc: "2.0", id: 1, error: quoted }));
+      const sseError = () => sse({ jsonrpc: "2.0", id: 1, error: quoted });
       const { svc } = harness(
         [
           http(401, '{"error":"unauthorized"}'),
@@ -1530,13 +1551,19 @@ describe("the key", () => {
             new Promise<Response>((_resolve, reject) => {
               req.signal?.addEventListener("abort", () => reject(new Error(apiKey)));
             }),
+          bareError(),
+          sseError(),
+          ...times(3, bareError),
+          ...times(3, sseError),
         ],
         { deployment, apiKey, deadlines: { createMs: 5 } },
       );
-      for (let i = 0; i < 11; i++) await catchAll(svc.createDispute({ aliases: {} }));
+      for (let i = 0; i < 13; i++) await catchAll(svc.createDispute({ aliases: {} }));
+      await catchAll(svc.getDispute({ chain: own, coreDisputeId: "186" }));
+      await catchAll(svc.getDispute({ chain: own, coreDisputeId: "186" }));
       await catchAll(svc.getDispute({ chain: other, coreDisputeId: "186" }));
     }
-    expect(errors).toHaveLength(24);
+    expect(errors).toHaveLength(32);
     for (const e of errors) expect(leaks(e)).toEqual([]);
   });
 });
