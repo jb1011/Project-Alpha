@@ -135,8 +135,10 @@ export const SUBMIT_NOT_SENT: readonly string[] = Object.freeze([
 ]);
 
 /**
- * evidence_pin: nothing was published. Everything else is "in doubt", which for a pin is safe to
- * retry: the same bytes give the same CID, and a pin spends nothing.
+ * evidence_pin: nothing was published. Outside this list a pin refusal is "in doubt", which for
+ * a pin is safe to retry (the same bytes give the same CID, and a pin spends nothing), with two
+ * exceptions `sentOf` reads as "no" on every write tool: `WRITE_IN_PROGRESS` (call again once the
+ * other write has returned) and `PRESET_SIMULATES`.
  */
 export const PIN_NOT_PUBLISHED: readonly string[] = Object.freeze([
   "ATTACHMENT_INVALID",
