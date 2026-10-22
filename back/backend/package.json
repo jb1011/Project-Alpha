@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20.18.2"
+    "node": ">=22"
   },
   "bin": {
     "legalbody": "src/cli/index.ts"

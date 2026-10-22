@@ -5,7 +5,7 @@ generate operating agreement → register ERC-8004 identity → deploy + wire Le
 via the Factory (one atomic tx) → bind the agent wallet → persist. CLI-driven, fully tested.
 
 ## Prerequisites
-- Node >= 20.18.2, npm. Foundry (forge/anvil) on PATH for integration tests.
+- Node >= 22, npm. Foundry (forge/anvil) on PATH for integration tests.
 - Contracts deployed to Arc testnet (see `../script/Deploy.s.sol` and `../addresses.arc-testnet.json`).
 
 ## Setup
