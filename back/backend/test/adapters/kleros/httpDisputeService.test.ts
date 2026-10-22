@@ -64,6 +64,7 @@ interface Sent {
   headers: Record<string, string>;
   body: unknown;
   signal: AbortSignal | undefined;
+  redirect: RequestRedirect | undefined;
   at: number;
 }
 
@@ -81,6 +82,7 @@ function harness(replies: Reply[], deps: Partial<HttpDisputeServiceDeps> = {}) {
       headers: { ...(init?.headers as Record<string, string>) },
       body: JSON.parse(String(init?.body)),
       signal: init?.signal ?? undefined,
+      redirect: init?.redirect,
       at: clock.t,
     };
     requests.push(req);
@@ -204,9 +206,40 @@ describe("parseSseFrame", () => {
     });
   });
 
+  it("accepts a bare JSON object body: an application/json answer", () => {
+    expect(parseSseFrame(' {"jsonrpc":"2.0","id":1,"result":{}}\n')).toEqual({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {},
+    });
+  });
+
+  it("takes the response frame, not a notification before it", () => {
+    const body = [
+      "event: message",
+      'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}',
+      "",
+      "event: message",
+      'data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}',
+      "",
+    ].join("\n");
+    expect(parseSseFrame(body)).toEqual({ jsonrpc: "2.0", id: 1, result: { ok: true } });
+  });
+
+  it("prefers the response with the request's id, skipping a data: line that is not JSON", () => {
+    const body = [
+      "data: {not json",
+      'data: {"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"stale"}}',
+      'data: {"jsonrpc":"2.0","id":2,"result":{"ok":true}}',
+    ].join("\n");
+    expect(parseSseFrame(body, 2)).toEqual({ jsonrpc: "2.0", id: 2, result: { ok: true } });
+    expect(parseSseFrame(body)).toMatchObject({ id: 1 });
+  });
+
   it.each([
     ["an empty body", ""],
-    ["a bare JSON body", '{"result":{}}'],
+    ["plain text", "upstream unavailable"],
+    ["a bare JSON array", '[{"result":{}}]'],
     ["a data: line that is not JSON", "event: message\ndata: {not json\n\n"],
   ])("throws a transport error on %s", (_name, body) => {
     expect(() => parseSseFrame(body)).toThrow(KlerosTransportError);
@@ -453,9 +486,30 @@ describe("the answer, in order: HTTP status, SSE frame, JSON-RPC, isError, paylo
     expect((e as KlerosHttpError).body).toHaveLength(500);
   });
 
-  it("a 200 without a data: line is a transport error", async () => {
-    const { svc } = harness([http(200, JSON.stringify({ result: { content: [] } }))]);
+  it("scrubs the key from an HTTP error body before keeping its first 500 characters", async () => {
+    const body = `${"p".repeat(490)}Bearer ${KEY} and more`;
+    const { svc } = harness([http(502, body)]);
+    const e = await failure(svc.createDispute({ aliases: {} }));
+    expect((e as KlerosHttpError).body).toBe(
+      `${"p".repeat(490)}Bearer [key] and more`.slice(0, 500),
+    );
+  });
+
+  it("a 200 that is neither an SSE frame nor a JSON object is a transport error", async () => {
+    const { svc } = harness([http(200, "upstream unavailable")]);
     expect(await failure(svc.createDispute({ aliases: {} }))).toBeInstanceOf(KlerosTransportError);
+  });
+
+  it("does not follow redirects: every request says redirect error", async () => {
+    const { svc, requests } = harness([
+      result({ tools: [] }),
+      tool(disputes(ITEM)),
+      tool(MINED_CREATE),
+    ]);
+    await svc.listTools();
+    await svc.getDispute({ chain: TESTNET, coreDisputeId: "186" });
+    await svc.createDispute({ aliases: {} });
+    expect(requests.map((r) => r.redirect)).toEqual(["error", "error", "error"]);
   });
 
   it("a JSON-RPC error member is a transport error carrying its code and message", async () => {
@@ -691,6 +745,14 @@ describe("a filing or a submission the client cannot read keeps the service's te
     },
   );
 
+  it("scrubs the key from the logged localDisputeID, then cuts it at 200 characters", async () => {
+    const raw = `x${KEY}${"y".repeat(500)}`;
+    const { svc } = harness([tool({ ...MINED_CREATE, localDisputeID: raw })]);
+    const lines = await opsLines(() => create(svc));
+    const logged = lines.find((l) => l.opslog === "kleros_local_dispute_id_unreadable");
+    expect(logged?.localDisputeID).toBe(`x[key]${"y".repeat(194)}`);
+  });
+
   it("logs nothing for a localDisputeIDUnavailable or a readable localDisputeID", async () => {
     const { localDisputeID: _drop, ...rest } = MINED_CREATE;
     const { svc } = harness([
@@ -705,6 +767,101 @@ describe("a filing or a submission the client cannot read keeps the service's te
   });
 });
 
+describe("a filing whose 200 answer is not the documented frame", () => {
+  const minedFrame = {
+    jsonrpc: "2.0",
+    id: 1,
+    result: { content: [{ type: "text", text: JSON.stringify(MINED_CREATE) }] },
+  };
+  const MINED = { status: "mined", coreDisputeId: "186", localDisputeId: "42", txHash: TX };
+
+  it("reads a bare JSON-RPC body (application/json) on a mined create", async () => {
+    const { svc } = harness([http(200, JSON.stringify(minedFrame))]);
+    expect(await svc.createDispute({ aliases: {} })).toEqual(MINED);
+  });
+
+  it("reads past a notification frame to the result on a mined create", async () => {
+    const body = [
+      "event: message",
+      'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"data":"filing"}}',
+      "",
+      "event: message",
+      `data: ${JSON.stringify(minedFrame)}`,
+      "",
+    ].join("\n");
+    const { svc } = harness([
+      new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    ]);
+    expect(await svc.createDispute({ aliases: {} })).toEqual(MINED);
+  });
+
+  it("keeps the core id of a mined create whose frame cannot be read", async () => {
+    const body = `event: message\ndata: ${JSON.stringify(minedFrame).slice(0, -3)}\n\n`;
+    const { svc, requests } = harness([http(200, body), tool(MINED_CREATE)]);
+    const e = await failure(svc.createDispute({ aliases: {} }));
+    expect(e).toBeInstanceOf(KlerosTransportError);
+    expect(e.message).toContain("not JSON");
+    expect(e.message).toContain('\\"coreDisputeID\\":\\"186\\"');
+    expect(e.message).toContain(TX);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("keeps the body of a create answered only by a notification", async () => {
+    const body =
+      'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"tx":"0xfeed"}}\n';
+    const { svc } = harness([http(200, body)]);
+    const e = await failure(svc.createDispute({ aliases: {} }));
+    expect(e.message).toContain("answered no result");
+    expect(e.message).toContain('"tx":"0xfeed"');
+  });
+
+  it("keeps the body of a submission answered in plain text", async () => {
+    const body = `Recorded in ${TX}; the summary could not be rendered.`;
+    const { svc } = harness([http(200, body)]);
+    const e = await failure(
+      svc.submitEvidence({ coreDisputeId: "186", name: "n", description: "d" }),
+    );
+    expect(e.message).toContain("no SSE data: line");
+    expect(e.message).toContain(`The service answered: ${body}`);
+  });
+
+  it("keeps a JSON-RPC error's whole body on a create", async () => {
+    const answer = {
+      jsonrpc: "2.0",
+      id: 1,
+      error: { code: -32603, message: "Internal error", data: { txHash: TX } },
+    };
+    const { svc } = harness([sse(answer)]);
+    const e = await failure(svc.createDispute({ aliases: {} }));
+    expect(e.message).toContain("-32603: Internal error");
+    expect(e.message).toContain(TX);
+  });
+
+  it("scrubs the key from the body before cutting it at 4,000 characters", async () => {
+    const body = `${"b".repeat(3_990)}Bearer ${KEY}${"z".repeat(6_000)}`;
+    const { svc } = harness([http(200, body)]);
+    const e = await failure(svc.createDispute({ aliases: {} }));
+    expect(e.message).toContain(`${`${"b".repeat(3_990)}Bearer [key]`.slice(0, 4_000)} [cut]`);
+    expect(e.message).not.toContain("z");
+  });
+
+  it("reads a bare JSON-RPC body on a read too", async () => {
+    const frame = {
+      jsonrpc: "2.0",
+      id: 1,
+      result: { content: [{ type: "text", text: JSON.stringify(disputes(ITEM)) }] },
+    };
+    const { svc } = harness([http(200, JSON.stringify(frame))]);
+    expect((await svc.getDispute({ chain: TESTNET, coreDisputeId: "186" })).ruling).toBe("1");
+  });
+
+  it("does not add the body to a read's frame errors", async () => {
+    const { svc } = harness(times(3, () => http(200, "upstream unavailable")));
+    const e = await failure(svc.getDispute({ chain: TESTNET, coreDisputeId: "186" }));
+    expect(e.message).toBe("Kleros dispute_get: the answer carries no SSE data: line");
+  });
+});
+
 describe("constructor", () => {
   it.each([
     ["createMs", 0],
@@ -712,10 +869,20 @@ describe("constructor", () => {
     ["submitMs", Number.NaN],
     ["pinMs", Number.POSITIVE_INFINITY],
     ["readMs", 0],
+    // Above the 32-bit limit setTimeout clamps the delay to 1 ms.
+    ["createMs", 2_147_483_648],
   ])("refuses a %s deadline of %s", (name, ms) => {
     expect(() => harness([], { deadlines: { [name]: ms } })).toThrow(
       `Kleros deadline ${name} must be a positive number of milliseconds`,
     );
+  });
+
+  it("accepts the longest deadline a timer can hold", () => {
+    expect(() => harness([], { deadlines: { createMs: 2_147_483_647 } })).not.toThrow();
+  });
+
+  it.each([[""], ["   "]])("refuses an empty apiKey (%j)", (apiKey) => {
+    expect(() => harness([], { apiKey })).toThrow("Kleros apiKey is empty");
   });
 
   it.each([[0], [-5], [1.5], [Number.NaN]])("refuses requestsPerMinute %s", (n) => {
@@ -893,6 +1060,29 @@ describe("dispute_get", () => {
     expect(e).toBeInstanceOf(KlerosTransportError);
     expect(e.message).toContain(`dispute not found on ${TESTNET}`);
   });
+
+  it.each([
+    ["another id", { ...ITEM, id: "999" }, `dispute 999 on ${TESTNET}`],
+    ["another chain", { ...ITEM, chain: ARBITRUM_ONE }, `dispute 186 on ${ARBITRUM_ONE}`],
+    ["another id, no chain", { ...ITEM, id: 7, chain: undefined }, "dispute 7 on (no chain)"],
+  ])("refuses an item for %s: never someone else's case", async (_n, item, answered) => {
+    const { svc } = harness(times(3, () => tool(disputes(item))));
+    const e = await failure(svc.getDispute({ chain: TESTNET, coreDisputeId: "186" }));
+    expect(e).toBeInstanceOf(KlerosTransportError);
+    expect(e.message).toBe(
+      `Kleros dispute_get answered ${answered}, not dispute 186 on ${TESTNET}`,
+    );
+  });
+
+  it("accepts an item naming neither its id nor its chain, or naming them as asked", async () => {
+    const { svc } = harness([
+      tool(disputes({ ...ITEM, id: undefined, chain: undefined })),
+      tool(disputes({ ...ITEM, id: 186 })),
+    ]);
+    const asked = { chain: TESTNET, coreDisputeId: "186" } as const;
+    expect((await svc.getDispute(asked)).status).toBe("Appeal");
+    expect((await svc.getDispute(asked)).status).toBe("Appeal");
+  });
 });
 
 describe("court_get", () => {
@@ -1030,14 +1220,27 @@ describe("rate limit", () => {
       (s: HttpDisputeService) =>
         s.submitEvidence({ coreDisputeId: "186", name: "n", description: "d" }),
     ],
-  ])("a 429 on %s is thrown, never retried", async (_tool, call) => {
+  ])("a 429 on %s is thrown, never retried, and logged", async (tool, call) => {
     const { svc, requests, sleeps } = harness(
       times(2, () => http(429, '{"error":"rate limit exceeded"}')),
     );
-    const e = await failure(call(svc));
+    let e: Error | undefined;
+    const lines = await opsLines(async () => {
+      e = await failure(call(svc));
+    });
     expect((e as KlerosHttpError).status).toBe(429);
     expect(requests).toHaveLength(1);
     expect(sleeps).toEqual([]);
+    const logged = lines.filter((l) => l.opslog === "kleros_write_rate_limited");
+    expect(logged).toEqual([
+      { opslog: "kleros_write_rate_limited", at: expect.any(String), deployment: "testnet", tool },
+    ]);
+  });
+
+  it("logs no write line for a 429 on a read", async () => {
+    const { svc } = harness([http(429, '{"error":"rate limit exceeded"}'), tool(disputes(ITEM))]);
+    const lines = await opsLines(() => svc.getDispute({ chain: TESTNET, coreDisputeId: "186" }));
+    expect(lines.filter((l) => l.opslog === "kleros_write_rate_limited")).toEqual([]);
   });
 });
 
@@ -1316,6 +1519,8 @@ describe("the key", () => {
           http(401, '{"error":"unauthorized"}'),
           netDown(),
           new TypeError(`fetch failed (authorization: Bearer ${apiKey})`),
+          http(502, `<html>bad gateway; request had authorization: Bearer ${apiKey}</html>`),
+          http(200, `not a frame, but it quotes Bearer ${apiKey}`),
           sse({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Invalid params" } }),
           refused("INSUFFICIENT_BALANCE: the wallet cannot cover the fee"),
           tool({ status: "simulated" }),
@@ -1328,10 +1533,10 @@ describe("the key", () => {
         ],
         { deployment, apiKey, deadlines: { createMs: 5 } },
       );
-      for (let i = 0; i < 9; i++) await catchAll(svc.createDispute({ aliases: {} }));
+      for (let i = 0; i < 11; i++) await catchAll(svc.createDispute({ aliases: {} }));
       await catchAll(svc.getDispute({ chain: other, coreDisputeId: "186" }));
     }
-    expect(errors).toHaveLength(20);
+    expect(errors).toHaveLength(24);
     for (const e of errors) expect(leaks(e)).toEqual([]);
   });
 });

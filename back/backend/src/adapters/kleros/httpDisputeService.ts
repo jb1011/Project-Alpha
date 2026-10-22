@@ -84,6 +84,8 @@ const HTTP_BODY_KEPT = 500;
 /** How much of the service's text a failed filing or submission carries in its error. */
 const SERVICE_TEXT_KEPT = 4_000;
 const LOCAL_ID_KEPT = 200;
+/** setTimeout holds at most a signed 32-bit delay; a longer one is clamped to 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
 /** The two writes that spend on a chain: a failure to read their answer must keep the answer. */
 const CHAIN_WRITES: readonly string[] = ["dispute_create", "evidence_submit"];
 const SIMULATED = `${PRESET_SIMULATES}: the key simulated the write; nothing was sent`;
@@ -113,6 +115,9 @@ export class HttpDisputeService implements KlerosDisputeService {
     this.deployment = d.deployment;
     this.#chain = deploymentFor(d.deployment).chain;
     this.#apiUrl = d.apiUrl;
+    if (typeof d.apiKey !== "string" || d.apiKey.trim() === "") {
+      throw new Error("Kleros apiKey is empty");
+    }
     this.#apiKey = d.apiKey;
     // The service runs one write at a time per key, so the lock is per key (not per instance),
     // named by a hash so the key itself never sits in the lock table.
@@ -136,8 +141,11 @@ export class HttpDisputeService implements KlerosDisputeService {
       submitMs: given.submitMs ?? DEFAULT_DEADLINES.submitMs,
     };
     for (const [name, ms] of Object.entries(this.#deadlines)) {
-      if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
-        throw new Error(`Kleros deadline ${name} must be a positive number of milliseconds`);
+      if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0 || ms > MAX_TIMER_MS) {
+        throw new Error(
+          `Kleros deadline ${name} must be a positive number of milliseconds, ` +
+            `at most ${MAX_TIMER_MS}`,
+        );
       }
     }
   }
@@ -200,7 +208,7 @@ export class HttpDisputeService implements KlerosDisputeService {
     const chain = this.#ownChain(p.chain);
     return this.#read(() =>
       this.#callTool("dispute_get", { id: p.coreDisputeId, chain }, this.#deadlines.readMs, (pl) =>
-        disputeReadOf(pl, chain),
+        disputeReadOf(pl, chain, p.coreDisputeId),
       ),
     );
   }
@@ -304,6 +312,8 @@ export class HttpDisputeService implements KlerosDisputeService {
           } else if (tool === "evidence_pin" && pinRetries < PIN_RETRIES && pinMayRetry(e)) {
             pinRetries++;
           } else {
+            // The window should keep every write under the meter, so a 429 here is worth a line.
+            if (e instanceof KlerosHttpError && e.status === 429) this.#noteWriteRateLimited(tool);
             throw e;
           }
         }
@@ -347,24 +357,36 @@ export class HttpDisputeService implements KlerosDisputeService {
       return map(payload, text);
     } catch (e) {
       if (!(e instanceof KlerosTransportError) || !CHAIN_WRITES.includes(tool)) throw e;
-      // Scrubbed before it is cut, so no part of a key survives at the cut.
-      const clean = this.#scrub(text);
-      const shown =
-        clean.length > SERVICE_TEXT_KEPT ? `${clean.slice(0, SERVICE_TEXT_KEPT)} [cut]` : clean;
-      throw new KlerosTransportError(
-        `${e.message}. The service answered: ${shown === "" ? "(no text)" : shown}`,
-      );
+      throw this.#withServiceText(e, text);
     }
+  }
+
+  /**
+   * The same transport error with the service's text appended, scrubbed before it is cut (so no
+   * part of a key survives at the cut) and cut at 4,000 characters.
+   */
+  #withServiceText(e: KlerosTransportError, text: string): KlerosTransportError {
+    const clean = this.#scrub(text);
+    const shown =
+      clean.length > SERVICE_TEXT_KEPT ? `${clean.slice(0, SERVICE_TEXT_KEPT)} [cut]` : clean;
+    return new KlerosTransportError(
+      `${e.message}. The service answered: ${shown === "" ? "(no text)" : shown}`,
+    );
   }
 
   /**
    * One POST, one JSON-RPC object (a batch is refused at any size), its JSON-RPC `result`. The
    * deadline covers the fetch and the body read, and its signal aborts the request. The status
-   * is read first: 401, 429 and 413 are plain JSON decided before JSON-RPC.
+   * is read first: 401, 429 and 413 are plain JSON decided before JSON-RPC. Redirects are not
+   * followed: a 307 or 308 would send a filing a second time inside one fetch.
+   *
+   * A filing or a submission whose 200 answer cannot be read keeps the body in the error, for the
+   * same reason `#callTool` keeps the tool's text: the dispute may exist and may have been paid.
    */
   async #post(label: string, method: string, params: unknown, ms: number): Promise<Payload> {
     await this.#admit();
-    const body = JSON.stringify({ jsonrpc: "2.0", id: this.#nextId++, method, params });
+    const id = this.#nextId++;
+    const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     const { status, text } = await withDeadline(
       ms,
       async (signal) => {
@@ -379,6 +401,7 @@ export class HttpDisputeService implements KlerosDisputeService {
             },
             body,
             signal,
+            redirect: "error",
           });
           return { status: res.status, text: await res.text() };
         } catch (e) {
@@ -389,26 +412,15 @@ export class HttpDisputeService implements KlerosDisputeService {
       },
       () => new KlerosTransportError(`Kleros ${label} did not answer within ${ms} ms`),
     );
-    if (status !== 200) throw new KlerosHttpError(status, text.slice(0, HTTP_BODY_KEPT));
-    let frame: unknown;
+    // Scrubbed before it is cut: a proxy's error page may echo the request's headers.
+    if (status !== 200)
+      throw new KlerosHttpError(status, this.#scrub(text).slice(0, HTTP_BODY_KEPT));
     try {
-      frame = parseSseFrame(text);
+      return resultOf(text, id, label);
     } catch (e) {
-      throw new KlerosTransportError(`Kleros ${label}: ${(e as Error).message}`);
+      if (!(e instanceof KlerosTransportError) || !CHAIN_WRITES.includes(label)) throw e;
+      throw this.#withServiceText(e, text);
     }
-    if (!isRecord(frame)) {
-      throw new KlerosTransportError(`Kleros ${label} answered a frame that is not JSON-RPC`);
-    }
-    if (frame.error !== undefined && frame.error !== null) {
-      const err = isRecord(frame.error) ? frame.error : {};
-      throw new KlerosTransportError(
-        `Kleros ${label} answered JSON-RPC error ${String(err.code)}: ${String(err.message)}`,
-      );
-    }
-    if (!isRecord(frame.result)) {
-      throw new KlerosTransportError(`Kleros ${label} answered no result`);
-    }
-    return frame.result;
   }
 
   /**
@@ -446,21 +458,71 @@ export class HttpDisputeService implements KlerosDisputeService {
     }
   }
 
+  #noteWriteRateLimited(tool: WriteTool): void {
+    try {
+      opsLog("kleros_write_rate_limited", { deployment: this.deployment, tool });
+    } catch {
+      // observe, never gate
+    }
+  }
+
   /** Error text from below the service (the network stack) is ours to keep the key out of. */
   #scrub(text: string): string {
     return this.#apiKey === "" ? text : text.split(this.#apiKey).join("[key]");
   }
 }
 
-/** The first `data:` line of an SSE frame, JSON-parsed. */
-export function parseSseFrame(body: string): unknown {
-  const line = body.split(/\r\n|\r|\n/).find((l) => l.startsWith("data:"));
-  if (line === undefined) throw new KlerosTransportError("the answer carries no SSE data: line");
+/**
+ * The JSON-RPC message of a 200 body. The documented answer is one SSE frame; the Streamable HTTP
+ * transport the service runs on may also answer `application/json` (one bare object) or send a
+ * notification frame before the response. So: among the `data:` lines, the response (a `result`
+ * or an `error` member), the one whose `id` is `id` first; else the first `data:` line,
+ * JSON-parsed; with no `data:` line at all, the body itself when it is a JSON object. Anything
+ * else is a `KlerosTransportError`.
+ */
+export function parseSseFrame(body: string, id?: number): unknown {
+  const lines = body
+    .split(/\r\n|\r|\n/)
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => l.slice("data:".length));
+  if (lines.length === 0) {
+    const whole = objectOrNull(body);
+    if (whole) return whole;
+    throw new KlerosTransportError("the answer carries no SSE data: line");
+  }
+  const responses = lines
+    .map(objectOrNull)
+    .filter((v): v is Payload => v !== null && ("result" in v || "error" in v));
+  const response = responses.find((v) => id !== undefined && v.id === id) ?? responses[0];
+  if (response) return response;
   try {
-    return JSON.parse(line.slice("data:".length));
+    return JSON.parse(lines[0]!);
   } catch {
     throw new KlerosTransportError("the SSE data: line is not JSON");
   }
+}
+
+/** The `result` of the JSON-RPC response in a 200 body, or a transport error saying why not. */
+function resultOf(text: string, id: number, label: string): Payload {
+  let frame: unknown;
+  try {
+    frame = parseSseFrame(text, id);
+  } catch (e) {
+    throw new KlerosTransportError(`Kleros ${label}: ${(e as Error).message}`);
+  }
+  if (!isRecord(frame)) {
+    throw new KlerosTransportError(`Kleros ${label} answered a frame that is not JSON-RPC`);
+  }
+  if (frame.error !== undefined && frame.error !== null) {
+    const err = isRecord(frame.error) ? frame.error : {};
+    throw new KlerosTransportError(
+      `Kleros ${label} answered JSON-RPC error ${String(err.code)}: ${String(err.message)}`,
+    );
+  }
+  if (!isRecord(frame.result)) {
+    throw new KlerosTransportError(`Kleros ${label} answered no result`);
+  }
+  return frame.result;
 }
 
 /**
@@ -595,7 +657,7 @@ function courtClockOf(payload: Payload, courtId: number): CourtClock {
  * be missing only when `unresolvedFields` names it, and is then empty (a mismatch downstream, so
  * nothing acts on it).
  */
-function disputeReadOf(payload: Payload, chain: KlerosChain): DisputeRead {
+function disputeReadOf(payload: Payload, chain: KlerosChain, coreDisputeId: string): DisputeRead {
   const tool = "dispute_get";
   if (!Array.isArray(payload.items)) throw noField(tool, "items");
   if (payload.items.length === 0) {
@@ -603,6 +665,15 @@ function disputeReadOf(payload: Payload, chain: KlerosChain): DisputeRead {
   }
   const item = payload.items[0];
   if (!isRecord(item)) throw noField(tool, "items[0]");
+  // The case a ruling is read from must be the one asked: never settle on someone else's case.
+  const id = item.id === undefined || item.id === null ? undefined : String(item.id);
+  const on = item.chain === undefined || item.chain === null ? undefined : String(item.chain);
+  if ((id !== undefined && id !== coreDisputeId) || (on !== undefined && on !== chain)) {
+    throw new KlerosTransportError(
+      `Kleros ${tool} answered dispute ${id ?? "(no id)"} on ${on ?? "(no chain)"}, ` +
+        `not dispute ${coreDisputeId} on ${chain}`,
+    );
+  }
   const status = item.status;
   if (typeof status !== "string" || !PERIODS.includes(status)) throw noField(tool, "status");
   const ruling =

@@ -893,18 +893,39 @@ describe("no network", () => {
   });
 
   /**
-   * Every module a source names: `from "m"` (imports and re-exports alike), a side-effect
-   * `import "m"`, and `import(...)` or `require(...)`, a non-literal argument shown as `<expr>`.
+   * Every module a source names, with whether the naming is a static `import type` statement
+   * (erased at build time, so it loads nothing): `from "m"` (imports and re-exports alike), a
+   * side-effect `import "m"`, and `import(...)` or `require(...)`, a non-literal argument shown
+   * as `<expr>`. Only a statement that starts at a line and ends in `from "m"` can be type-only.
    */
-  function modulesOf(source: string): string[] {
-    const found: string[] = [];
-    for (const m of source.matchAll(/\bfrom\s*["']([^"']+)["']/g)) found.push(m[1]!);
-    for (const m of source.matchAll(/^\s*import\s*["']([^"']+)["']/gm)) found.push(m[1]!);
+  function modulesOf(source: string): { module: string; typeOnly: boolean }[] {
+    const found: { module: string; typeOnly: boolean }[] = [];
+    const statements = [
+      ...source.matchAll(/^[ \t]*(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']/gm),
+    ];
+    const ends = new Set(statements.map((m) => m.index! + m[0].length));
+    for (const m of statements) {
+      found.push({ module: m[1]!, typeOnly: /^[ \t]*import\s+type\b/.test(m[0]) });
+    }
+    for (const m of source.matchAll(/\bfrom\s*["']([^"']+)["']/g)) {
+      if (!ends.has(m.index! + m[0].length)) found.push({ module: m[1]!, typeOnly: false });
+    }
+    for (const m of source.matchAll(/^\s*import\s*["']([^"']+)["']/gm)) {
+      found.push({ module: m[1]!, typeOnly: false });
+    }
     for (const m of source.matchAll(/\b(?:import|require)\s*\(\s*([^)]*?)\s*\)/g)) {
       const literal = /^["']([^"']+)["']$/.exec(m[1]!);
-      found.push(literal ? literal[1]! : `<${m[1]}>`);
+      found.push({ module: literal ? literal[1]! : `<${m[1]}>`, typeOnly: false });
     }
     return found;
+  }
+
+  /** What the fake may load: a hash and its own module's files. viem only for its types. */
+  const MAY_LOAD = ["node:crypto", "./deployments", "./disputeService", "./errors"];
+  function forbiddenIn(source: string): string[] {
+    return modulesOf(source)
+      .filter((n) => !MAY_LOAD.includes(n.module) && !(n.typeOnly && n.module === "viem"))
+      .map((n) => n.module);
   }
 
   it("the module scan finds every way a source can name a module", () => {
@@ -918,7 +939,11 @@ describe("no network", () => {
       'const b = require("node:tls");',
       "const c = await import(name);",
     ].join("\n");
-    expect(modulesOf(sample).sort()).toEqual(
+    expect(
+      modulesOf(sample)
+        .map((n) => n.module)
+        .sort(),
+    ).toEqual(
       [
         "<name>",
         "node:dgram",
@@ -930,6 +955,31 @@ describe("no network", () => {
         "viem",
       ].sort(),
     );
+    expect(modulesOf(sample).filter((n) => n.typeOnly)).toEqual([
+      { module: "viem", typeOnly: true },
+    ]);
+  });
+
+  it.each([
+    ['const v = await import("viem");'],
+    ['const v = require("viem");'],
+    ['import "viem";'],
+    ['import { http } from "viem";'],
+    ['import { type Hex, http } from "viem";'],
+    ['export { http } from "viem";'],
+    ['export type { Hex } from "viem";'],
+    ['const t = 1; import type { Hex } from "viem";'],
+  ])("the scan refuses viem loaded any other way than a static import type: %s", (planted) => {
+    expect(forbiddenIn(planted)).toEqual(["viem"]);
+  });
+
+  it.each([
+    ['import type { Hex } from "viem";'],
+    ['import type {\n  Address,\n  Hex,\n} from "viem";'],
+    ['import { createHash } from "node:crypto";'],
+    ['import type { KlerosReadChain } from "./deployments";'],
+  ])("the scan allows %s", (sample) => {
+    expect(forbiddenIn(sample)).toEqual([]);
   });
 
   it("imports nothing that can reach the network", () => {
@@ -937,14 +987,8 @@ describe("no network", () => {
       new URL("../../../src/adapters/kleros/fakeDisputeService.ts", import.meta.url),
       "utf8",
     );
-    const modules = modulesOf(source);
-    expect(modules.length).toBeGreaterThan(0);
-    for (const m of modules) {
-      expect(["node:crypto", "viem", "./deployments", "./disputeService", "./errors"]).toContain(m);
-    }
-    // viem for its types only: a value import would bring its transports with it.
-    const viem = source.match(/^(?:import|export)\b[^;]*?\bfrom\s*["']viem["']/gm) ?? [];
-    for (const statement of viem) expect(statement).toMatch(/^import type\b/);
+    expect(modulesOf(source).length).toBeGreaterThan(0);
+    expect(forbiddenIn(source)).toEqual([]);
     expect(source).not.toMatch(/\bfetch\s*\(/);
   });
 });
